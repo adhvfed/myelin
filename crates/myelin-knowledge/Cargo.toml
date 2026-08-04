@@ -5,8 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The service binary the harness runs (the "every service `main.rs`" of contract 1.1). Named
-# `knowledge` (= SERVICE_NAME) so the deployable matches the service/trace identifier.
 [[bin]]
 name = "knowledge"
 path = "src/main.rs"
@@ -14,220 +12,40 @@ path = "src/main.rs"
 [lib]
 path = "src/lib.rs"
 
-# THE Knowledge service SHELL crate (KN-P04 → P-294, M3). This prompt ships the BOOTABLE SHELL
-# ONLY: an AppSpec passed to serve(AppSpec) — boot → migrate → outbox relay (hook) → (consumer
-# seam, empty until KN-P06) → three ports → graceful drain, liveness ≠ readiness — plus the
-# hot-table-flag declaration (block / db_row / doc_op, contract 1.5) the high-write tables
-# KN-P05 will create are declared against, and the authenticate/check call-site SLOTS (4.1/4.2)
-# fail-closed until KN-P14/KN-P16 wire the per-op bodies. NOT a hand-rolled main.
-#
-# NAMED FOLLOW-ON FLOORS: the OLTP store + (tenant,region) partition + RLS land in KN-P05
-# (P-295); the transactional outbox table + the relay wiring + the consumer set land in KN-P06.
-# This shell carries the migration SKELETON those prompts extend (so the booting instance is
-# not-ready until migrations apply) and declares the hot tables — it does NOT create the high-
-# write tables itself (that is KN-P05's owned work).
-#
-# DAG POSITION (a documented, NAMED leaf consumer, like myelin-identity-service / myelin-notif /
-# myelin-git / myelin-issues / myelin-gdpr-service): it sits ABOVE the glue crates and the
-# harness — it depends on -content/-query (the frozen shapes Knowledge stores + executes),
-# -tenancy/-events/-identity (the carrier value types + the authenticate/check ABI), and
-# -substrate (the serve/AppSpec lifecycle); NOTHING in the production library DAG depends back on
-# it. It is therefore OUTSIDE the eleven-crate library DAG modelled by myelin-substrate::
-# crate_graph (substrate_is_root()/identity_is_sink() are preserved — a service main is the
-# graph's terminal consumer, not a node in it).
 [dependencies]
-# The harness: serve(AppSpec) + the three-surface topology (public/internal/metrics-health) +
-# liveness≠readiness + the outbox relay + graceful drain. The shell is an AppSpec this wires; it
-# is NOT a service that re-implements the lifecycle (contract 1.1, architecture 00 §3.1).
 myelin-substrate = { path = "../myelin-substrate" }
-# The frozen Identity & Access ABI (authenticate 4.1 / check 4.2 + the Principal/Decision/
-# Consistency types). KN-P04 wires the read/write entrypoint SLOTS against these signatures with
-# fail-closed stubs (the per-op Layer-2 check is KN-P14; full ABAC list_objects is KN-P16).
 myelin-identity = { path = "../myelin-identity" }
-# TenantId / Region / ArtifactRef value types (the verified Principal the entrypoints thread, the
-# subject ref a read/write names). The (tenant, region) partition the store enforces is KN-P05.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# The EventEnvelope tier (OutboxStore / OutboxSpec carriers). The outbox relay hook is declared
-# here; the doc/row/db state-change → emit bodies + the consumer set land in KN-P06.
 myelin-events = { path = "../myelin-events" }
-# The FROZEN block + inline taxonomy (contract 13.1). Knowledge LEADS + FREEZES it (KN-P01); the
-# shell depends on it so the crate that stores + executes the taxonomy compiles against the frozen
-# shapes — the block store over it lands in KN-P05/KN-P10.
 myelin-content = { path = "../myelin-content" }
-# The FROZEN FieldType/ViewSpec/QueryAst/order_key shapes (contract 13.3). Knowledge co-owns it
-# (KN-P02/P03); the shell depends on it so the flexible-database executor (KN-P09+) compiles
-# against the frozen query shapes. KN-P10 (P-300) CONSUMES the frozen LexoRank `OrderKey` for the
-# block-tree sibling ordering (it does NOT re-implement a parallel fractional index — EI-01 §7).
 myelin-query = { path = "../myelin-query" }
-# The Refs ONE `#sub` grammar + the 4-step tombstone ladder (contract 5.7). KN-P10 (P-300) registers
-# Knowledge's OWNED `b<id>`/`h<id>` stable-block-id `#sub` mints through this ONE codec (it does NOT
-# author the grammar — Refs owns it; Knowledge owns the stable opaque mint). The per-viewer
-# `project(ref, viewer)` resolver (the ladder calls) is the KN-P19 follow-on.
 myelin-refs = { path = "../myelin-refs" }
-# The ONE notification + humanise surface (contract 7.3 / 5.2). KN-P22 / P-312 (M3) ships the
-# Knowledge-side resolve-for-unfurls CONSUMER of the ONE humanise surface:
-# `myelin_knowledge::notif_resolve::KnowledgeRefResolver` is a REAL impl of the frozen
-# `RefResolvePort` (the 5.2 resolve seam humanise binds its slots to) over Knowledge's permission-
-# first `Projector` (5.6, project Display mode). A confidential page/block/row subject → for a
-# viewer lacking `read` the humanise render is a TOMBSTONE (`a restricted page`); the title NEVER
-# leaks (NOTIF-D4-class, 0 title leaks). This is the SAME sanctioned acyclic edge `myelin-git`
-# carries (GIT-P31 `git_resolve::GitRefResolver`): `myelin-notif` is a NAMED leaf consumer that
-# depends on NO subsystem crate (it depends only on -content/-refs/-identity/-tenancy), so a
-# producer service crate may depend on `myelin-notif` to wire its OWNED resolve seam — the DAG
-# stays acyclic; `myelin-notif` does NOT depend on `myelin-knowledge`. Knowledge registers NO
-# second template engine (OQ-L) — it feeds its Display projection into the ONE templating surface.
 myelin-notif = { path = "../myelin-notif" }
-# The Storage tier (KN-P05): the OLTP bounded pool (11.1, OltpPool), the (tenant, region)-first RLS
-# tenant-scoping guard (11.1/12.1, TenantScope/TenantQuery — the structural tenant-predicate floor),
-# and the fs-backed content-addressed BlobStore (11.2, the M1 media + CRDT-snapshot floor).
-# Knowledge CONSUMES these frozen primitives; it does NOT re-implement a parallel store/RLS/blob
-# path (EI-01 §7, one primitive). A leaf service consumer above the storage glue, like the others.
 myelin-storage = { path = "../myelin-storage" }
-# The Search feed (KN-P21 / P-311, M3): Knowledge OWNS its `declare_indexable` IndexSpecs (contract
-# 6.3 — the page + significant-block + db_row projections) and DRIVES the `query`/`semantic` Filter
-# conjoin (6.1/6.2) for the KN-D5 re-confirm gate. This is the SAME sanctioned acyclic edge `myelin-git`
-# carries (GIT-P5 `register_git_code_projection_spec`): Search is a LEAF consumer that owns the
-# `IndexSpec` TYPE + the query engine and does NOT depend back on any producer — so a producer service
-# crate may depend on `myelin-search` to register its owned spec + drive the conjoin gate (the DAG stays
-# acyclic; `myelin-search` does NOT depend on `myelin-knowledge`). Knowledge NEVER indexes itself — it
-# PROJECTS text (`page_search_projection`) and Search consumes off the bus (no cross-DB; external-
-# insights/04 §5). The `kn_*_index_spec` shapes are RE-HOMED here verbatim from `myelin-search`
-# (modelled there emitter-less at SRCH-P17 when KN had no service crate; the SHAPE does not change).
 myelin-search = { path = "../myelin-search" }
-# The FROZEN `PersonalDataHolder` trait (10.1) + the DSR core types (`SubjectRef`/`EraseScope`/the
-# per-op receipts) + the `#[personal_data(...)]` classify-derive (10.2). KN-P25 / P-315 (M3) ships
-# the Knowledge `gdpr` module: the H4 `PersonalDataHolder` locate/export/rectify/restrict body over
-# Knowledge's blocks/rows/history/mentions/authorship + the `#[personal_data]` tags on the Knowledge
-# schema (so the no-untagged-personal-data lint is green). This is the SAME sanctioned acyclic edge
-# `myelin-git` carries (GIT-P29 `holder::GitPersonalDataHolder` over `myelin_gdpr::PersonalDataHolder`):
-# `myelin-gdpr` is a compile-time contract carrier that depends ONLY on tenancy + identity + events —
-# it does NOT depend back on any producer service crate, so a producer may depend on it to wire its
-# OWNED holder body (the DAG stays acyclic). Knowledge OWNS its H4 fan-out because it cannot depend on
-# the GDPR SERVICE crate (the §2.9 DAG) — only on the frozen trait carrier here. The erase op (the
-# per-subject DEK crypto-shred structural floor) is the named KN-P26 follow-on.
 myelin-gdpr = { path = "../myelin-gdpr" }
-# serde_json — the references-not-payloads `knowledge.*` event payload the emit seam (KN-P06) builds
-# (the EventEnvelope.payload carries ids/refs, never an inline body — contract 2.7). The SAME shape
-# every other producer's payload uses; not a parallel serializer.
-# serde derive — the Export/Import service (KN-P24 / P-314) derives Serialize/Deserialize on the
-# Art. 20 lossless JSON bundle shapes (ExportDoc/ExportBlock/ExportFormat). The SAME workspace serde
-# every crate uses; not a parallel serializer.
 serde = { workspace = true }
 serde_json = { workspace = true }
-# Yrs (y-crdt) — KN-P29 / P-484 (M5): the Rust-native Yjs CRDT engine the Layer-3 merge promotes to
-# over the UNCHANGED resume-cursor transport (knowledge-platform 02 §3.3/§3.4). `crate::yrs_engine`
-# seeds a `yrs::Doc` deterministically from a quiesce-lite snapshot (block tree → move-CRDT list;
-# each block's inline string → `Y.Text`); after the `engine_promote` cutover the `doc_op.payload`
-# carries Yrs UPDATE BYTES (the transport, op_seq cursor and idempotent apply are unchanged — the
-# CRDT is a payload-only swap). In-process pure-Rust (like tantivy/git2); part of the default
-# DB-free build — NOT an `integration`-gated network backend.
 yrs = { workspace = true }
-# KN-P06: the REAL Postgres outbox co-commit proof behind the `integration` feature
-# (tests/integration_kn_d7_outbox.rs). The OPTIONAL sqlx dep is pulled ONLY by
-# `--features integration`; the default `cargo build --workspace` / `cargo test --workspace` stay
-# DB-free. EXTERNAL crates only — no new myelin edge; the test reads DATABASE_URL inline.
 sqlx = { workspace = true, optional = true }
-# MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
-# foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
-# (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
-# bridge requires) + `myelin-config` (the env-first durable config, fail-loud) are now regular
-# deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
 tokio = { workspace = true, features = ["signal"] }
 myelin-config = { path = "../myelin-config" }
 
 [features]
 default = []
-# MR-009b W3b.5 — gates the e2e_wedge/dogfood drill runners (they construct the now-gated
-# in-memory `OutboxStore::new()` double), forwarding to `myelin-events/test-support`. The
-# tests-dir drills (drill_kn_p33/p34) reach the gated modules via the SELF dev-dependency.
-# DEV/TEST only — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 test-support = ["myelin-events/test-support"]
-# KN-D7 (the silent-data-loss floor): the Knowledge outbox emit seam PROVEN against the live
-# dev-stack Postgres `outbox` table (the same-transaction co-commit; write → crash mid-relay →
-# recover → 0 ghost / 0 lost). Registered red-until-proven; flips green only with the real artifact.
-#
-# KN-D5 / P-306 (the 0-leak-incl-COUNT crux): the `list_objects` `SetExpr` push-down + the
-# permission-correct `COUNT(*)` PROVEN against the live dev-stack Postgres (the lowered InRelation →
-# `authz_visible` JOIN conjoined into ONE db-list query AND one COUNT aggregate; 0 leaked rows, 0
-# count-leak, no-cross-db/cross-tenant, revoke reflected). tests/integration_kn_d5_list_pushdown.rs.
-# Registered red-until-proven; flips green only with the real artifact.
-#
-# KN-D9 / P-307 (the flex-DB latency crux): the flexible database (JSONB property bag + GIN
-# `jsonb_path_ops` projection + the view filter conjoined with the `list_objects` `SetExpr` ACL)
-# PROVEN against the live dev-stack Postgres — the VIEW_QUERY lowers a `QueryAst` filter into JSONB
-# ops over `props` (the GIN-covered source of truth) AND conjoins the ACL JOIN over `db_row.id` into
-# ONE leak-free query AND the permission-correct COUNT (0 leak, 0 count-leak, no-cross-db/tenant).
-# tests/integration_kn_d9_flex_db.rs. Registered red-until-proven; flips green only with the real artifact.
-#
-# KN-D10 / P-308 (the read-time rollup permission crux): the read-time rollup engine's
-# permission-filtered conjoin PROVEN against the live dev-stack Postgres — a SUM/COUNT/MAX over the
-# `db_relation` `rollup_source` edges JOINED to `db_row` for the target value AND conjoined with the
-# `list_objects` SetExpr ACL (the authz_visible JOIN over db_row.id) into ONE query → a restricted
-# related row is never counted/summed (0 rollup leak, composing with KN-D5); the per-viewer conjoin
-# (not a blanket hide). Computed at READ TIME, never stored. tests/integration_kn_d10_rollup.rs.
-# Registered red-until-proven; flips green only with the real artifact.
-# KN-P31 / P-486 (the object-store BlobStore swap crux): the content-addressed put/get parity of
-# the S3-compatible object store (`myelin_storage::s3blob::S3BlobStore`, RustFS in dev) against the
-# fs-backed floor (`FsBlobStore`) PROVEN against the live dev-stack object store — same BLAKE3
-# address, byte-identical round-trip, residency-pinned per-tenant keyspace. The swap is a one-line
-# backing change behind the `BlobStore` trait (the compactor is already generic over `B: BlobStore`).
-# tests/integration_kn_p31_blob_swap.rs. Registered red-until-proven; flips green only with the real
-# artifact. Turns on `myelin-storage/integration` so the live `s3blob` module compiles.
-# (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
-# feature now pulls the raw-sqlx test harness + the live storage backends.)
 integration = [
     "dep:sqlx",
     "myelin-storage/integration",
 ]
 
 [dev-dependencies]
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
-# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
-# production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
-# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
-# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
-# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# MR-009b W3b.5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
-# tests/*.rs drill files (they drive the gated e2e_wedge/dogfood runners).
 myelin-knowledge = { path = ".", features = ["test-support"] }
-# The shell's boot self-test asserts against the same three-port / liveness≠readiness surface the
-# later drills read from. DEV-only — the harness never enters the knowledge production DAG.
 myelin-harness = { path = "../myelin-harness" }
-# DEV-only: the architecture-lint engine, so the KN-D13 CDC asserts the `tenant-predicate` lint is
-# RED on a deliberately tenant-less Knowledge query fixture and GREEN on a tenant-bound one (the
-# drill's compile-time half). The live workspace scan is in `myelin-lints` (this is the fixture).
-# KN-P06 also uses it for the `no-raw-publish` KNOWLEDGE-slice fixture pair (the lint is CENTRAL;
-# Knowledge attaches fixtures + asserts the verdict — the refs_lints.rs precedent).
 myelin-lints = { path = "../myelin-lints" }
-# DEV-only (KN-P16 / P-306): the REAL Identity namespace/list_objects engine, so the contract-4.3 CDC
-# pair drives the PRODUCER (Identity's `ListObjects` over the compiled Knowledge `database_row`
-# fragment, returning the frozen `Filter{set_expr}`) and the CONSUMER (Knowledge's `list_filter`
-# lowering it over its OWN `db_row.id` into ONE leak-free view + permission-correct COUNT query) — the
-# SAME shape both sides agree on, never a stub of the producer (the cdc_4_3_git_list_pushdown.rs
-# precedent). DEV-dependency ONLY — `myelin-identity-service` does NOT enter the Knowledge production
-# DAG (the production crate depends only on the frozen `myelin-identity` ABI; the DAG stays acyclic).
-# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
-# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
-# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-# DEV-only (KN-P27 / P-317): the Fabric's Knowledge ToolDef REGISTRATION
-# (`myelin_agent_service::knowledge_tools`, AG-P19 → P-268) — the contract-8.1 CDC pairs the KN-domain
-# SOURCE OF TRUTH (`myelin_knowledge::agent` — the tool identity + the `required_caps` from the frozen
-# `myelin-content` ReBAC carrier + the frozen §6.3 gate classification) against the registered ToolDefs
-# the Fabric consumes, so a rename/gate-drift on either side is a compile/test break (the SAME shape
-# both sides agree on, never a stub of the producer — the git_tools.rs/agent_author.rs precedent).
-# DEV-dependency ONLY: `myelin-agent-service` depends on `myelin-content`/`-git` but NOT on
-# `myelin-knowledge`, so this test-scope edge keeps the §2.9 DAG acyclic.
 myelin-agent-service = { path = "../myelin-agent-service" }
 myelin-agent = { path = "../myelin-agent" }
-# DEV-only (KN-P28 / P-318): the GDPR-service AG-7 trace-holder SEAM
-# (`myelin_gdpr_service::AGENT_TRACE_HOLDER_ID`, P-GA-26) — the contract-8.8 cross-check pins that the
-# Knowledge-side trace HOLDER id (`agent::trace::TRACE_HOLDER_ID`) IS the H17 `agent_fabric_trace` id
-# the seam registers (ONE name across the seam, no parallel id). DEV-dependency ONLY:
-# `myelin-gdpr-service` does NOT depend on `myelin-knowledge`, so this test-scope edge keeps the §2.9
-# DAG acyclic.
 myelin-gdpr-service = { path = "../myelin-gdpr-service" }

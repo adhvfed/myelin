@@ -1,149 +1,30 @@
-//! # `myelin-client` — the shared resilient inter-service client
-//!
-//! **Owning architecture doc:** `planning/05-refined-shared-systems-architecture/00-platform-substrate.md`
-//! §2.5 (`myelin-client` — the substrate-relevant seam) and §6 (the shared resilient
-//! inter-service client).
-//!
-//! **Contract-index cluster:** 1 — Bootstrap & service shell
-//! (`planning/05-refined-shared-systems-architecture/contract-index.md` row 1.9
-//! `ResilientClient::call`).
-//!
-//! ## What crosses the crate boundary here (the frozen surface)
-//! `ResilientClient::call(target, req, idem)` — the ONE client every outbound
-//! inter-service call goes through, so timeout/breaker/bulkhead/retry is correct in
-//! exactly one place. The four primitives (all mandatory, all on by default):
-//! per-call **timeout** (deadlines propagate), circuit **breaker** (never retry through a
-//! tripped breaker — the retry-storm amplifier), bounded-concurrency **bulkhead**
-//! (saturation fast-fails, never queues unboundedly), and jittered **retry** —
-//! **idempotent calls only** (full jitter, Brooker 2015; a `NonIdempotent` call is never
-//! retried). Our clients **MUST honour `Retry-After`** (§6.2) so shedding cannot become a
-//! retry storm.
-//!
-//! ## Frozen units (architecture §6.3, §2.10)
-//! Resilient-client timeouts = **milliseconds**; breaker thresholds = failure ratio over
-//! a rolling window + a minimum request count; bulkhead = integer concurrency cap;
-//! backoff base in ms with full jitter.
-//!
-//! ## What P-S16 ships (this prompt)
-//! The **four primitives' control logic**, all on by default, exercised over a downstream
-//! *operation* via [`ResilientClient::call_op`] — the testable core of `call`:
-//! - **timeout** — every operation runs under a per-call deadline; an operation that
-//!   overruns its `timeout_ms` budget is a [`CallError::Timeout`] and (for an
-//!   `Idempotent` call) is retried subject to the breaker;
-//! - **breaker** — a [`Breaker`] state machine (Closed → Open → HalfOpen) keyed per
-//!   target; once tripped, calls **fast-fail without invoking the downstream** and a retry
-//!   **never** goes through the tripped breaker (the textbook retry-storm amplifier);
-//! - **bulkhead** — a per-target integer-cap permit counter; when saturated a call
-//!   **fast-fails** ([`CallError::BulkheadFull`]) and never queues unboundedly;
-//! - **retry** — only `Idempotency::Idempotent` calls are retried, with **full jitter**
-//!   (`sleep ∈ [0, base * 2^attempt]`, capped at the deadline); a `NonIdempotent` call is
-//!   attempted **exactly once**.
-//!
-//! Breaker state + bulkhead-rejection count are exported as the contract-1.8 producer-side
-//! signals ([`ResilientClient::breaker_state`], [`ResilientClient::bulkhead_rejections`]).
-//!
-//! ## What P-S17 ships (this prompt — `Retry-After` honouring, SUB-D5)
-//! P-S16 left the retry primitive already taking a `retry_after_ms` *hint* on the downstream
-//! error and applying it as the **floor** of the full-jitter backoff (the arithmetic). P-S17
-//! completes contract row 1.9's `Retry-After` slice by wiring the **`Retry-After` HEADER →
-//! that hint**:
-//! - [`parse_retry_after`] maps a downstream's `Retry-After` header value (HTTP delta-seconds
-//!   form, RFC 9110 §10.2.3) onto the `retry_after_ms` hint. An unparseable / HTTP-date form
-//!   never silently degrades to "no floor" (EI process-quality §5: loud, never swallowed) — it
-//!   returns [`RetryAfter::Unparseable`], which the client treats as a conservative *whole*
-//!   open-window floor (fail-static, never fail-open into a retry storm).
-//! - the resilient client **honours** the parsed floor: a full-jitter backoff **never** goes
-//!   below it (`sleep = max(full_jitter, retry_after_ms)`), so shedding (§7) — which sheds the
-//!   batch/CI/agent lanes with `429 + Retry-After` — cannot become a retry storm and the
-//!   protected human lane holds. This is a hard requirement on the agent runtime + the CLI too
-//!   (they link this client).
-//! - two new **contract-1.8 producer signals** (the breaker-state / retry-storm family) make
-//!   the SUB-D5 survival properties observable: [`ResilientClient::retry_through_tripped`]
-//!   (must stay `0` — no retry ever passes through an open breaker) and
-//!   [`ResilientClient::retry_after_honoured`] (the count of backoffs floored by a downstream
-//!   `Retry-After` — the issuance/honour signal the drill reads `>= 1`).
-//!
-//! The **SUB-D5 drill** (trip a downstream breaker under load → callers fail fast, NO retry
-//! through the tripped breaker, honour `Retry-After`, no amplification) lives in the harness
-//! (`myelin-harness::drills`) and reads exactly these signals.
-//!
-//! ## Floors named (deferred → filling prompt)
-//! - **Real transport.** [`ResilientClient::call`] (the typed `call<R>` over a real
-//!   downstream socket — `tokio`/HTTP, deserialising `R` from the wire) is **not built in
-//!   M0**: there is no network substrate yet. `call` runs the four primitives over a
-//!   [`Transport`] whose production impl lands when the wire format + runtime exist. The
-//!   primitive *logic* (everything gateable here) is live and tested through `call_op`.
-//!   **Follow-on: the real transport is wired with the service shells (`serve`, P-S12 →
-//!   P-010, already merged) when the first real inter-service hop exists.** When that lands,
-//!   the transport reads the wire `Retry-After` header and feeds it through
-//!   [`parse_retry_after`] into the [`CallError::Downstream::retry_after_ms`] hint — the
-//!   honour arithmetic already shipped here does not change.
-//! - **HTTP-date `Retry-After`.** [`parse_retry_after`] handles the delta-seconds form (the
-//!   form our own surfaces issue — §7.2 sheds with a delta-seconds `429 + Retry-After`); an
-//!   HTTP-date value is parsed to [`RetryAfter::Unparseable`] (the conservative whole-window
-//!   floor) rather than mis-honoured. The HTTP-date → instant conversion needs a clock +
-//!   date parser that lands with the **real transport** floor above (no network/HTTP stack in
-//!   M0); named here so the deferral is explicit.
-//! - **Per-target tuned values (M0 floor — CLOSED in M5).** This crate ships ONE **default
-//!   per-target value set** ([`ResilientConfig::default`], the M0 floor). The per-target tuned
-//!   numbers (the auth hot path gets a tighter timeout than a batch indexer) were measured by the
-//!   surge/latency drills (SUB-D3, P-S32/P-433) and written into the thresholds file in **M5
-//!   (P-S36 / P-437)** — the floor is now CLOSED. The tuned values live in `thresholds.toml`'s
-//!   `[[resilient_client]]` rows, loaded via `myelin_substrate::thresholds::Thresholds`
-//!   (`resilient_config(target) -> ResilientConfig`), and a load-time gate
-//!   (`validate_resilient_targets`) rejects any timeout tuned looser than its measured latency
-//!   budget. The SHAPE of [`ResilientConfig`] is unchanged; only the per-target NUMBERS are tuned.
-
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
-/// The target of an inter-service call (architecture §6; contract 1.9). The per-target
-/// breaker/bulkhead are keyed on this.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Target(pub String);
 
-/// An outbound request (architecture §6; contract 1.9). Opaque in the skeleton; the typed
-/// request/response shape lands with the real transport floor (see crate docs).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Req(pub String);
 
-/// Whether a call is safe to retry (architecture §6; contract 1.9). A `NonIdempotent`
-/// call is **never** retried (full-jitter retry is idempotent-only).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Idempotency {
     Idempotent,
     NonIdempotent,
 }
 
-/// The taxonomy of resilient-client failures (architecture §6). Every variant is a **loud,
-/// non-swallowed** terminal outcome (EI process-quality §5: violations are loud, never
-/// silently swallowed — there is no `|| true` path).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallError {
-    /// The per-call deadline elapsed before the downstream answered (architecture §6 (1)).
     Timeout,
-    /// The breaker is open (or half-open and probing was refused): the call fast-fails
-    /// **without** invoking the downstream (architecture §6 (2); the retry-storm amplifier
-    /// guard). Carries the `Retry-After` floor the caller should respect.
     BreakerOpen {
-        /// The minimum backoff before the breaker will admit a probe again, in ms. The
-        /// `Retry-After` header maps onto this in P-S17.
         retry_after_ms: u64,
     },
-    /// The per-target bulkhead is saturated: the call fast-fails rather than queueing
-    /// unboundedly (architecture §6 (3); Little's-Law bound).
     BulkheadFull,
-    /// The downstream returned an error. Carries an optional `Retry-After` hint (the floor
-    /// of the next backoff; honoured in P-S17) and whether the breaker should count it as a
-    /// failure.
     Downstream {
-        /// A human-meaningful downstream cause (never swallowed).
         message: String,
-        /// The downstream's advertised `Retry-After`, if any (ms). The retry backoff is
-        /// `max(full_jitter, retry_after_ms)` once P-S17 wires the header through.
         retry_after_ms: Option<u64>,
     },
 }
@@ -175,44 +56,16 @@ impl std::fmt::Display for CallError {
 
 impl std::error::Error for CallError {}
 
-/// `Result` alias for the client surface.
 pub type Result<T> = core::result::Result<T, CallError>;
 
-/// The parsed value of a downstream `Retry-After` response header (RFC 9110 §10.2.3),
-/// mapped onto the client's backoff floor (contract 1.9, P-S17 — `Retry-After` honouring).
-///
-/// The header has two on-the-wire forms: a **delta-seconds** integer (`Retry-After: 120`) and
-/// an **HTTP-date** (`Retry-After: Wed, 21 Oct 2026 07:28:00 GMT`). Our own surfaces shed with
-/// the delta-seconds form (§7.2 — `429 + Retry-After`), so that is the form
-/// [`parse_retry_after`] resolves to a millisecond floor. Anything it cannot resolve to a
-/// concrete millisecond floor in M0 — an HTTP-date (needs a clock + date parser that lands
-/// with the real transport floor) or a malformed value — is [`RetryAfter::Unparseable`]:
-/// **never silently dropped to "no floor"** (that would let a retry storm through, EI
-/// process-quality §5), but treated as a conservative whole-open-window floor by the honour
-/// path (fail-static, never fail-open).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RetryAfter {
-    /// No `Retry-After` header was present: the backoff floor is `0` (pure full jitter).
     Absent,
-    /// A delta-seconds `Retry-After`, resolved to a concrete **millisecond** floor. The
-    /// next backoff is `max(full_jitter, this)`.
     DeltaMs(u64),
-    /// A present-but-unresolvable `Retry-After` (an HTTP-date form, or a malformed value).
-    /// **Not** treated as absent — the honour path floors the backoff at the breaker's whole
-    /// open window (the conservative, never-fail-open choice; the precise HTTP-date floor
-    /// lands with the real-transport clock, see the crate docs).
     Unparseable,
 }
 
 impl RetryAfter {
-    /// The millisecond backoff floor this `Retry-After` imposes, given the breaker's whole
-    /// open window `open_ms` as the conservative fallback for the [`RetryAfter::Unparseable`]
-    /// form. [`RetryAfter::Absent`] imposes no floor (`0`).
-    ///
-    /// This is the ONE place the parsed header becomes a number the backoff respects, so the
-    /// "never fail open into a retry storm" choice is single-sourced: an `Unparseable` value
-    /// floors at the FULL open window (not `0`), so an ambiguous downstream signal makes us
-    /// back off *more*, never *less*.
     pub fn floor_ms(self, open_ms: u64) -> u64 {
         match self {
             RetryAfter::Absent => 0,
@@ -221,43 +74,22 @@ impl RetryAfter {
         }
     }
 
-    /// `true` iff this value imposes a non-zero backoff floor (i.e. a `Retry-After` was
-    /// present and honoured). The producer-signal predicate behind
-    /// [`ResilientClient::retry_after_honoured`].
     pub fn is_present(self) -> bool {
         !matches!(self, RetryAfter::Absent)
     }
 }
 
-/// Parse a downstream `Retry-After` response-header value into a [`RetryAfter`] (RFC 9110
-/// §10.2.3) — the header → backoff-floor mapping that completes contract 1.9's `Retry-After`
-/// slice (P-S17).
-///
-/// - `None` (no header) → [`RetryAfter::Absent`].
-/// - a non-negative integer number of **seconds** (delta-seconds, the form our surfaces issue)
-///   → [`RetryAfter::DeltaMs`] (`secs * 1000`, saturating).
-/// - anything else (an HTTP-date, a sign, non-digits, empty/whitespace) →
-///   [`RetryAfter::Unparseable`] — **present but unresolved**, floored conservatively by the
-///   honour path, never silently dropped.
-///
-/// The value is trimmed of surrounding whitespace first (a wire header often carries it). A
-/// leading `+`/`-` or any non-ASCII-digit byte makes it `Unparseable` rather than guessing.
 pub fn parse_retry_after(header: Option<&str>) -> RetryAfter {
     let raw = match header {
         None => return RetryAfter::Absent,
         Some(s) => s.trim(),
     };
     if raw.is_empty() {
-        // A present-but-empty header is a malformed signal, not "no floor".
         return RetryAfter::Unparseable;
     }
-    // Delta-seconds is a bare run of ASCII digits (RFC 9110: `1*DIGIT`). Reject anything with a
-    // sign, a decimal point, letters (an HTTP-date), or interior whitespace.
     if raw.bytes().all(|b| b.is_ascii_digit()) {
         match raw.parse::<u64>() {
             Ok(secs) => RetryAfter::DeltaMs(secs.saturating_mul(1_000)),
-            // Overflow of a colossal all-digit value: still a concrete "back off a long time"
-            // signal — saturate to the max rather than dropping the floor.
             Err(_) => RetryAfter::DeltaMs(u64::MAX),
         }
     } else {
@@ -265,13 +97,6 @@ pub fn parse_retry_after(header: Option<&str>) -> RetryAfter {
     }
 }
 
-/// Resolve the [`RetryAfter`] a downstream error carries (P-S17). A
-/// [`CallError::Downstream`] carries the `retry_after_ms` hint the real transport populates
-/// from the wire header via [`parse_retry_after`]; an explicit `Some(ms)` is a concrete
-/// [`RetryAfter::DeltaMs`] floor, a `None` is [`RetryAfter::Absent`]. Other error variants
-/// never carry a `Retry-After` floor (a `BreakerOpen` is returned immediately and never
-/// backed off; a `BulkheadFull`/`Timeout` is not a downstream-issued shed). Keeping this
-/// mapping in ONE function makes the header → floor path single-sourced and mutation-testable.
 fn retry_after_of(last_err: &Option<CallError>) -> RetryAfter {
     match last_err {
         Some(CallError::Downstream {
@@ -282,40 +107,20 @@ fn retry_after_of(last_err: &Option<CallError>) -> RetryAfter {
     }
 }
 
-/// The default per-target value set (architecture §6.3 — the M0 floor; per-target tuning
-/// lands in M5/P-S36). Timeouts in **ms**; breaker as a failure ratio over a rolling window
-/// plus a minimum request count; bulkhead an integer concurrency cap; backoff base in ms
-/// with full jitter.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ResilientConfig {
-    /// Per-call deadline in **milliseconds** (§6.3 unit).
     pub timeout_ms: u64,
-    /// Maximum number of attempts for an `Idempotent` call (1 = no retry). A
-    /// `NonIdempotent` call is **always** attempted exactly once regardless.
     pub max_attempts: u32,
-    /// Full-jitter backoff base in **milliseconds** (§6.3): the nth retry sleeps a uniform
-    /// random duration in `[0, backoff_base_ms * 2^n]`.
     pub backoff_base_ms: u64,
-    /// Breaker trip threshold: the rolling-window failure **ratio** in `[0.0, 1.0]` above
-    /// which the breaker opens (§6.3).
     pub breaker_failure_ratio: f64,
-    /// Breaker minimum request count: the breaker never trips on fewer than this many
-    /// observations in the window (§6.3 — avoids tripping on a single early failure).
     pub breaker_min_requests: u32,
-    /// The rolling-window size (number of recent outcomes) the breaker ratio is computed
-    /// over.
     pub breaker_window: u32,
-    /// How long the breaker stays open before admitting a half-open probe, in **ms**.
     pub breaker_open_ms: u64,
-    /// The per-target bulkhead integer concurrency cap (§6.3).
     pub bulkhead_max_concurrency: u32,
 }
 
 impl Default for ResilientConfig {
     fn default() -> Self {
-        // The M0 default-per-target floor (architecture §6.3). These are deliberately
-        // conservative shape-correct defaults; the measured per-target numbers land in
-        // M5/P-S36 (the surge/latency drills write them into the thresholds file).
         ResilientConfig {
             timeout_ms: 2_000,
             max_attempts: 3,
@@ -329,22 +134,14 @@ impl Default for ResilientConfig {
     }
 }
 
-/// The breaker lifecycle (architecture §6 (2)): Closed → Open → HalfOpen. Encoded as the
-/// contract-1.8 `BreakerState` signal value (closed=0, half=1, open=2).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BreakerState {
-    /// Normal operation; calls pass through and outcomes feed the rolling window.
     Closed,
-    /// Tripped: calls fast-fail **without invoking the downstream** until the open window
-    /// elapses. A retry **never** goes through an open breaker (the retry-storm guard).
     Open,
-    /// Probing: a single trial call is admitted; success closes the breaker, failure
-    /// re-opens it.
     HalfOpen,
 }
 
 impl BreakerState {
-    /// The numeric encoding for the contract-1.8 `BreakerState` signal (§10.2 row 5).
     pub fn signal_value(self) -> i64 {
         match self {
             BreakerState::Closed => 0,
@@ -354,17 +151,11 @@ impl BreakerState {
     }
 }
 
-/// Abstract monotonic clock (injectable so the timeout + breaker-open windows are
-/// deterministically testable; production uses [`SystemTime`]).
 pub trait TimeSource: Send + Sync {
-    /// Milliseconds since an arbitrary fixed epoch (monotonic, non-decreasing).
     fn now_ms(&self) -> u64;
-    /// Sleep for `dur` (the retry backoff). The default is a real sleep; tests inject a
-    /// no-op + clock-advancing source.
     fn sleep(&self, dur: Duration);
 }
 
-/// The production wall clock.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SystemTime;
 
@@ -380,23 +171,16 @@ impl TimeSource for SystemTime {
     }
 }
 
-/// Abstract source of full-jitter randomness (injectable so backoff is deterministic in
-/// tests). `next_below(n)` returns a uniform value in `[0, n)`.
 pub trait Jitter: Send + Sync {
-    /// A uniform random `u64` in `[0, n)`. For `n == 0` returns 0.
     fn next_below(&self, n: u64) -> u64;
 }
 
-/// A small deterministic splitmix64 PRNG — the production default-jitter source. It needs
-/// no external `rand` dependency (the crate is dep-light at M0) and is seedable so tests are
-/// reproducible.
 #[derive(Debug)]
 pub struct SplitMix64 {
     state: AtomicU64,
 }
 
 impl SplitMix64 {
-    /// Seed the generator.
     pub fn new(seed: u64) -> Self {
         SplitMix64 {
             state: AtomicU64::new(seed),
@@ -406,8 +190,6 @@ impl SplitMix64 {
 
 impl Default for SplitMix64 {
     fn default() -> Self {
-        // Seed off the wall clock so independent clients do not synchronise their jitter
-        // (synchronised jitter defeats the purpose — Brooker 2015).
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
@@ -421,7 +203,6 @@ impl Jitter for SplitMix64 {
         if n == 0 {
             return 0;
         }
-        // splitmix64 — fetch_add the golden-ratio increment, then mix.
         let mut z = self
             .state
             .fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
@@ -433,20 +214,11 @@ impl Jitter for SplitMix64 {
     }
 }
 
-/// The per-target circuit breaker (architecture §6 (2)). A rolling window of the last
-/// `window` outcomes; once `>= min_requests` observations and the failure ratio exceeds
-/// `failure_ratio`, the breaker **opens** for `open_ms`. While open, every call fast-fails
-/// without touching the downstream. After `open_ms` one **half-open** probe is admitted:
-/// success closes, failure re-opens.
 #[derive(Debug)]
 struct Breaker {
     state: BreakerState,
-    /// The rolling window of recent outcomes (true = success).
     window: std::collections::VecDeque<bool>,
-    /// When the breaker opened (ms); the half-open probe is admitted at `opened_at +
-    /// open_ms`.
     opened_at_ms: u64,
-    /// True once a half-open probe is in flight (so only ONE probe is admitted).
     probe_in_flight: bool,
 }
 
@@ -460,16 +232,11 @@ impl Breaker {
         }
     }
 
-    /// Decide whether to admit a call now. Returns `Ok(())` to proceed, or `Err` (breaker
-    /// open) to fast-fail **without invoking the downstream**. This is the no-retry-through-a-
-    /// tripped-breaker guard.
     fn admit(&mut self, cfg: &ResilientConfig, now_ms: u64) -> Result<()> {
         match self.state {
             BreakerState::Closed => Ok(()),
             BreakerState::Open => {
                 if now_ms.saturating_sub(self.opened_at_ms) >= cfg.breaker_open_ms {
-                    // The open window has elapsed: transition to half-open and admit ONE
-                    // probe.
                     self.state = BreakerState::HalfOpen;
                     self.probe_in_flight = true;
                     Ok(())
@@ -483,7 +250,6 @@ impl Breaker {
             }
             BreakerState::HalfOpen => {
                 if self.probe_in_flight {
-                    // A probe is already in flight; reject concurrent calls.
                     Err(CallError::BreakerOpen {
                         retry_after_ms: cfg.breaker_open_ms,
                     })
@@ -495,27 +261,20 @@ impl Breaker {
         }
     }
 
-    /// Record the outcome of an admitted call and advance the state machine.
     fn record(&mut self, cfg: &ResilientConfig, success: bool, now_ms: u64) {
         match self.state {
             BreakerState::HalfOpen => {
                 self.probe_in_flight = false;
                 if success {
-                    // Probe succeeded: close and clear the window.
                     self.state = BreakerState::Closed;
                     self.window.clear();
                 } else {
-                    // Probe failed: re-open.
                     self.state = BreakerState::Open;
                     self.opened_at_ms = now_ms;
                 }
             }
             BreakerState::Closed => {
                 self.window.push_back(success);
-                // Trim the rolling window to its configured size. Bounded by the actual pop (the
-                // loop stops the instant `pop_front` yields `None`) so a mis-mutated length
-                // comparison can never spin on an already-empty deque — the substrate's bounded-
-                // everything posture even on a maintenance loop (contract 1.11).
                 while self.window.len() > cfg.breaker_window as usize {
                     if self.window.pop_front().is_none() {
                         break;
@@ -532,16 +291,11 @@ impl Breaker {
                 }
             }
             BreakerState::Open => {
-                // An outcome recorded while Open should not happen (admit() never returns
-                // Ok in Open without transitioning to HalfOpen first), but stay safe.
             }
         }
     }
 }
 
-/// The per-target bulkhead (architecture §6 (3)): a bounded permit counter. `try_acquire`
-/// fast-fails when saturated rather than queueing. A [`BulkheadGuard`] releases its permit
-/// on drop.
 #[derive(Debug)]
 struct Bulkhead {
     in_flight: u32,
@@ -554,41 +308,20 @@ impl Bulkhead {
     }
 }
 
-/// Per-target mutable resilience state (breaker + bulkhead), behind one lock per target.
 #[derive(Debug)]
 struct TargetState {
     breaker: Breaker,
     bulkhead: Bulkhead,
 }
 
-/// The shared resilient inter-service client (architecture §6; contract 1.9; ADR-16).
-/// One place where timeout + breaker + bulkhead + jittered-retry-idempotent-only is
-/// correct for every caller (services, CLI, agent runtime). Honours `Retry-After` (P-S17).
 pub struct ResilientClient {
     cfg: ResilientConfig,
     time: Box<dyn TimeSource>,
     jitter: Box<dyn Jitter>,
-    /// Per-target breaker + bulkhead state, created lazily on first call to a target.
     targets: Mutex<HashMap<Target, TargetState>>,
-    /// Contract-1.8 producer signal: total bulkhead rejections across all targets.
     bulkhead_rejections: AtomicU64,
-    /// Contract-1.8 producer signal (P-S17, the SUB-D5 / retry-storm family): the number of
-    /// retries that REACHED the downstream THROUGH an open breaker — the retry-storm amplifier.
-    /// The no-amplification invariant is that this stays **`0`**: `breaker_admit` returns
-    /// `BreakerOpen` before the downstream `op` is reached, so a retry never executes through a
-    /// tripped breaker. The SUB-D5 drill asserts `retry_through_tripped == 0`. (Held as an
-    /// atomic so a future regression that broke the guard would make it non-zero and red the
-    /// drill, rather than being an unconditional literal.)
     retry_through_tripped: AtomicU64,
-    /// Producer signal (P-S17): the number of retries the open breaker actively REFUSED — the
-    /// observable proof the no-amplification guard fired under load (distinct from the `== 0`
-    /// amplification signal above: this is `>= 1` in the SUB-D5 scenario, where the breaker
-    /// trips and then refuses the remaining retries).
     retry_admit_refusals: AtomicU64,
-    /// Contract-1.8 producer signal (P-S17, the retry-storm family): the number of backoffs
-    /// whose floor was raised by a downstream `Retry-After` — the "`Retry-After` issuance
-    /// honoured" signal the SUB-D5 drill reads `>= 1`. Incremented each time a retry's sleep
-    /// was floored by a present `Retry-After` (full jitter alone would have slept less).
     retry_after_honoured: AtomicU64,
 }
 
@@ -611,7 +344,6 @@ impl Default for ResilientClient {
 }
 
 impl ResilientClient {
-    /// Build a client with a config (production wall clock + default jitter source).
     pub fn new(cfg: ResilientConfig) -> Self {
         ResilientClient {
             cfg,
@@ -625,7 +357,6 @@ impl ResilientClient {
         }
     }
 
-    /// Build a client with injected time + jitter sources (deterministic tests).
     pub fn with_sources(
         cfg: ResilientConfig,
         time: Box<dyn TimeSource>,
@@ -643,15 +374,6 @@ impl ResilientClient {
         }
     }
 
-    /// Every call: per-call TIMEOUT, BULKHEAD (bounded concurrency), through the BREAKER.
-    /// Retry ONLY if idempotent, with full jitter, NEVER through a tripped breaker
-    /// (architecture §6; contract 1.9).
-    ///
-    /// **Floor (named in the crate docs):** the real wire transport — serialising `req`,
-    /// deserialising `R` from a downstream socket — is not built in M0 (no network
-    /// substrate yet). The four primitives' control logic is live and is exercised through
-    /// [`Self::call_op`]; `call` runs them over the production [`Transport`], whose body is
-    /// the deferred floor. The follow-on is named on [`Transport::send`].
     pub fn call<R>(&self, target: Target, req: Req, idem: Idempotency) -> Result<R>
     where
         R: Transport,
@@ -659,40 +381,19 @@ impl ResilientClient {
         self.call_op(&target, idem, || R::send(&target, &req))
     }
 
-    /// The **testable core**: run `op` (a fallible downstream operation) through all four
-    /// primitives. This is exactly the path `call` takes; tests drive it with a fake
-    /// downstream (the CDC provider side of 1.9).
-    ///
-    /// Ordering of the primitives per attempt: BULKHEAD permit (fast-fail if saturated) →
-    /// BREAKER admit (fast-fail if open, **no downstream call**) → TIMEOUT-bounded `op` →
-    /// record the outcome. Retry (idempotent only) sleeps full jitter, then re-checks the
-    /// breaker — a retry **never** passes through a tripped breaker.
     pub fn call_op<T, F>(&self, target: &Target, idem: Idempotency, mut op: F) -> Result<T>
     where
         F: FnMut() -> Result<T>,
     {
         let deadline_ms = self.time.now_ms().saturating_add(self.cfg.timeout_ms);
         let max_attempts = match idem {
-            // A NonIdempotent call is attempted EXACTLY once — never retried.
             Idempotency::NonIdempotent => 1,
             Idempotency::Idempotent => self.cfg.max_attempts.max(1),
         };
 
         let mut last_err: Option<CallError> = None;
-        // `attempts_done` counts completed downstream attempts; the loop runs once and then
-        // re-enters only while there is budget for a retry. Encoding the retry budget as a
-        // single `attempts_done < max_attempts` guard keeps the retry-count logic single-sourced.
-        //
-        // The loop is bounded by `max_attempts` iterations as a STRUCTURAL runaway guard (the
-        // substrate's bounded-everything doctrine, contract 1.11): the retry budget is the hard
-        // iteration ceiling, so no inner arithmetic error on `attempts_done` (a stuck increment,
-        // a flipped budget comparison) can ever spin the call forever — it exhausts the bound and
-        // returns the last error. The normal exit is still the `attempts_done >= max_attempts`
-        // return inside; this `for` is the belt-and-braces ceiling on top of it.
         let mut attempts_done: u32 = 0;
         for _iteration in 0..max_attempts {
-            // Between attempts (i.e. before every retry) sleep a full-jitter backoff unless
-            // it would overrun the deadline, in which case we stop with the last error.
             if attempts_done > 0 {
                 let sleep_ms = self.full_jitter_backoff(attempts_done - 1, &last_err);
                 if self.time.now_ms().saturating_add(sleep_ms) >= deadline_ms {
@@ -701,50 +402,26 @@ impl ResilientClient {
                 self.time.sleep(Duration::from_millis(sleep_ms));
             }
 
-            // Respect the per-call deadline across retries (deadlines propagate, §6 (1)).
             if self.time.now_ms() >= deadline_ms {
                 return Err(last_err.unwrap_or(CallError::Timeout));
             }
 
-            // (3) BULKHEAD: acquire a permit or fast-fail.
             let _permit = match self.acquire_permit(target) {
                 Some(p) => p,
                 None => {
                     self.bulkhead_rejections.fetch_add(1, Ordering::Relaxed);
-                    // Bulkhead saturation is NOT a downstream failure; it does not feed the
-                    // breaker window. It also is not retried in a tight loop — fast-fail.
                     return Err(CallError::BulkheadFull);
                 }
             };
 
-            // (2) BREAKER: admit or fast-fail WITHOUT invoking the downstream. A retry must
-            // NEVER pass through a tripped breaker, so a `BreakerOpen` error returns
-            // immediately (`?`) rather than looping back into the retry path.
-            //
-            // The `retry_through_tripped` signal (the SUB-D5 / no-amplification invariant) is
-            // the count of times a retry reached the downstream `op` THROUGH an open breaker —
-            // the retry-storm amplifier. `breaker_admit` enforces this STRUCTURALLY: an open
-            // breaker returns `BreakerOpen` here, before `op` is reached, so on the retry path
-            // (`attempts_done > 0`) a refused admit is the guard firing. We count those refused
-            // retries on `retry_through_tripped_admit_refusals` (proof the guard ACTIVELY fired,
-            // not that the downstream was simply never under load) while keeping the
-            // amplification signal itself — `retry_through_tripped` — at the `0` it must always
-            // read: the downstream is provably never invoked through an open breaker.
             let now = self.time.now_ms();
             if let Err(open) = self.breaker_admit(target, now) {
                 if attempts_done > 0 {
-                    // A retry was REFUSED by the open breaker — the guard fired (observable
-                    // proof of the no-amplification mechanism, distinct from the `== 0`
-                    // amplification signal below).
                     self.retry_admit_refusals.fetch_add(1, Ordering::Relaxed);
                 }
                 return Err(open);
             }
 
-            // (1) TIMEOUT-bounded downstream operation. With a synchronous op the timeout is
-            // a deadline check: if the op observed the deadline (a real transport sets the
-            // socket deadline from it) it returns Timeout; here we additionally enforce the
-            // deadline post-hoc so an op that overran is never counted as a success.
             let outcome = op();
             let now_after = self.time.now_ms();
             let timed_out = now_after >= deadline_ms;
@@ -763,34 +440,13 @@ impl ResilientClient {
                 }
             }
 
-            // Out of retry budget → return the last error (idempotent calls have
-            // `max_attempts` > 1; a NonIdempotent call has `max_attempts == 1` and so never
-            // re-enters the loop).
             if attempts_done >= max_attempts {
                 return Err(last_err.unwrap_or(CallError::Timeout));
             }
         }
-        // The `for` ceiling was reached without an inner return (only possible if the inner
-        // budget guard was bypassed) — return the last error rather than fall through. This is the
-        // structural runaway guard's terminal: bounded-everything, never an infinite call.
         Err(last_err.unwrap_or(CallError::Timeout))
     }
 
-    /// (4) Full-jitter backoff (Brooker 2015): a uniform value in `[0, base * 2^attempt]`,
-    /// **floored by the downstream's `Retry-After`** when present — the P-S17 honour primitive.
-    ///
-    /// The arithmetic is `sleep = max(full_jitter, retry_after_floor)`: the client respects
-    /// `Retry-After` as the FLOOR of its backoff (architecture §6.2 — our clients MUST honour
-    /// it so shedding cannot become a retry storm). The floor comes from the downstream error's
-    /// `retry_after_ms` hint, which the real transport populates by running the wire header
-    /// through [`parse_retry_after`]; here we resolve it via [`retry_after_of`] +
-    /// [`RetryAfter::floor_ms`] (an `Unparseable` value floors at the whole open window — the
-    /// conservative, never-fail-open choice).
-    ///
-    /// When the floor actually raised the sleep above the pure-jitter value (the `Retry-After`
-    /// was present and binding), increments the `retry_after_honoured` producer signal so the
-    /// SUB-D5 drill can read `>= 1`. A `BreakerOpen` error never reaches this path: `call_op`
-    /// returns it immediately (a retry must never pass through a tripped breaker).
     fn full_jitter_backoff(&self, attempt: u32, last_err: &Option<CallError>) -> u64 {
         let cap = self
             .cfg
@@ -800,15 +456,11 @@ impl ResilientClient {
         let retry_after = retry_after_of(last_err);
         let retry_after_floor = retry_after.floor_ms(self.cfg.breaker_open_ms);
         if retry_after.is_present() {
-            // A present `Retry-After` was honoured as the floor of this backoff (whether or not
-            // it bound this particular draw, the header WAS respected — the issuance/honour
-            // signal the drill reads). Count it once per floored retry.
             self.retry_after_honoured.fetch_add(1, Ordering::Relaxed);
         }
         jittered.max(retry_after_floor)
     }
 
-    /// Acquire a bulkhead permit for `target`, or `None` if saturated (fast-fail).
     fn acquire_permit(&self, target: &Target) -> Option<BulkheadGuard<'_>> {
         let mut targets = self.targets.lock().expect("targets lock poisoned");
         let st = targets
@@ -846,9 +498,6 @@ impl ResilientClient {
         }
     }
 
-    /// Contract-1.8 producer signal: the current breaker state for `target` (Closed if the
-    /// target has never been called). Maps onto `SignalName::BreakerState` (§10.2 row 5) via
-    /// [`BreakerState::signal_value`].
     pub fn breaker_state(&self, target: &Target) -> BreakerState {
         let targets = self.targets.lock().expect("targets lock poisoned");
         targets
@@ -857,51 +506,27 @@ impl ResilientClient {
             .unwrap_or(BreakerState::Closed)
     }
 
-    /// Contract-1.8 producer signal: total bulkhead rejections across all targets since the
-    /// client was built. Maps onto the shed/bulkhead-rejection signal of the §10.2 set.
     pub fn bulkhead_rejections(&self) -> u64 {
         self.bulkhead_rejections.load(Ordering::Relaxed)
     }
 
-    /// Contract-1.8 producer signal (P-S17, the SUB-D5 / retry-storm family): the number of
-    /// retries that REACHED the downstream while the breaker was open — the retry-storm
-    /// amplifier. The no-amplification invariant is that this is **`0`** (the breaker guard
-    /// returns `BreakerOpen` before a retry can execute through an open breaker). The SUB-D5
-    /// drill asserts `retry_through_tripped() == 0`.
-    ///
-    /// NOTE (mutation testing): the `replace … -> 0` mutant of this accessor is an **equivalent
-    /// mutant** — in correct code this counter is *always* `0` (the guard makes a non-zero value
-    /// structurally unreachable), so a constant-`0` body is observably indistinguishable from
-    /// the real read. We keep the live atomic read (not a literal `0`) so that a *future*
-    /// regression which let a retry slip through an open breaker would make it non-zero and red
-    /// the SUB-D5 `== 0` assertion. The equivalence is the property, not a gap.
     pub fn retry_through_tripped(&self) -> u64 {
         self.retry_through_tripped.load(Ordering::Relaxed)
     }
 
-    /// Producer signal (P-S17): the number of retries the open breaker actively REFUSED — the
-    /// observable proof the no-amplification guard fired (it is `>= 1` once a downstream breaker
-    /// has tripped under a retried load, complementing the `retry_through_tripped() == 0`
-    /// amplification signal).
     pub fn retry_admit_refusals(&self) -> u64 {
         self.retry_admit_refusals.load(Ordering::Relaxed)
     }
 
-    /// Contract-1.8 producer signal (P-S17, the retry-storm family): the number of backoffs
-    /// whose floor was raised by a downstream `Retry-After` — the "`Retry-After` issuance
-    /// honoured" signal. The SUB-D5 drill asserts `retry_after_honoured() >= 1` (the shed was
-    /// respected as the floor of backoff, so shedding did not become a retry storm).
     pub fn retry_after_honoured(&self) -> u64 {
         self.retry_after_honoured.load(Ordering::Relaxed)
     }
 
-    /// The configured per-target value set (the M0 floor).
     pub fn config(&self) -> &ResilientConfig {
         &self.cfg
     }
 }
 
-/// RAII permit for the bulkhead: decrements the in-flight count on drop.
 struct BulkheadGuard<'a> {
     client: &'a ResilientClient,
     target: Target,
@@ -916,18 +541,7 @@ impl Drop for BulkheadGuard<'_> {
     }
 }
 
-/// The wire-transport seam the typed `call<R>` rides over.
-///
-/// **Floor (deferred):** the production impl — serialise the [`Req`], open a socket to the
-/// [`Target`], deserialise `Self` from the response under the per-call deadline — is NOT
-/// built in M0 (there is no network substrate yet). The four resilient primitives that wrap
-/// it (timeout/breaker/bulkhead/retry) are fully live and tested via
-/// [`ResilientClient::call_op`]. **Follow-on:** the real `send` lands with the first real
-/// inter-service hop, once the service shells (`serve`, P-S12 → P-010) carry a wire format.
 pub trait Transport: Sized {
-    /// Perform one downstream attempt for `target` with `req`, returning the typed response
-    /// or a [`CallError`]. The resilient wrapper supplies all four primitives; an impl only
-    /// performs the single I/O attempt.
     fn send(target: &Target, req: &Req) -> Result<Self>;
 }
 
@@ -937,10 +551,6 @@ mod tests {
     use std::cell::Cell;
     use std::sync::atomic::AtomicU64;
 
-    /// A controllable test clock: `now_ms` is readable + advanceable; `sleep` advances it
-    /// (no real wall-clock wait, so the suite is fast and deterministic). The inner counter
-    /// is shared via `Arc` so a test can hold a handle and advance the clock the client
-    /// reads through.
     #[derive(Clone)]
     struct TestClock {
         now: std::sync::Arc<AtomicU64>,
@@ -964,8 +574,6 @@ mod tests {
         }
     }
 
-    /// A deterministic jitter that always returns `cap - 1` (the maximum), so the
-    /// full-jitter bound test is exact.
     struct MaxJitter;
     impl Jitter for MaxJitter {
         fn next_below(&self, n: u64) -> u64 {
@@ -973,8 +581,6 @@ mod tests {
         }
     }
 
-    /// A deterministic jitter that always returns 0 (no sleep), so retry-count tests do not
-    /// advance the clock through the deadline.
     struct ZeroJitter;
     impl Jitter for ZeroJitter {
         fn next_below(&self, _n: u64) -> u64 {
@@ -986,11 +592,10 @@ mod tests {
         ResilientClient::with_sources(cfg, Box::new(TestClock::new()), jitter)
     }
 
-    // ---- Primitive (2): a tripped breaker rejects WITHOUT calling through. ----
     #[test]
     fn tripped_breaker_rejects_without_calling_through() {
         let cfg = ResilientConfig {
-            max_attempts: 1, // isolate the breaker from the retry primitive
+            max_attempts: 1,
             breaker_min_requests: 3,
             breaker_failure_ratio: 0.5,
             breaker_window: 10,
@@ -1000,7 +605,6 @@ mod tests {
         let client = client_with(cfg, Box::new(ZeroJitter));
         let target = Target("auth".into());
 
-        // Drive enough downstream failures to trip the breaker.
         let calls = Cell::new(0u32);
         for _ in 0..3 {
             let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
@@ -1014,7 +618,6 @@ mod tests {
         assert_eq!(client.breaker_state(&target), BreakerState::Open);
         let calls_before = calls.get();
 
-        // The next call must fast-fail with BreakerOpen and NOT invoke the downstream.
         let res = client.call_op(&target, Idempotency::NonIdempotent, || {
             calls.set(calls.get() + 1);
             Ok::<(), CallError>(())
@@ -1027,11 +630,8 @@ mod tests {
         );
     }
 
-    // ---- Primitive (2)+(4): a retry NEVER passes through a tripped breaker. ----
     #[test]
     fn idempotent_retry_does_not_pass_through_tripped_breaker() {
-        // Window of recent failures already trips on the first observed call's failure
-        // because min_requests=1 and ratio>=1.0 trips immediately.
         let cfg = ResilientConfig {
             max_attempts: 5,
             breaker_min_requests: 1,
@@ -1052,8 +652,6 @@ mod tests {
                 retry_after_ms: None,
             })
         });
-        // First attempt fails and trips the breaker; every remaining "retry" is refused by
-        // the open breaker, so the downstream is invoked EXACTLY once despite max_attempts=5.
         assert_eq!(
             calls.get(),
             1,
@@ -1062,12 +660,11 @@ mod tests {
         assert!(res.is_err());
     }
 
-    // ---- Primitive (4): a NonIdempotent call is NEVER retried. ----
     #[test]
     fn non_idempotent_call_is_never_retried() {
         let cfg = ResilientConfig {
             max_attempts: 5,
-            breaker_min_requests: 100, // keep breaker closed so it never interferes
+            breaker_min_requests: 100,
             backoff_base_ms: 1,
             ..ResilientConfig::default()
         };
@@ -1090,12 +687,11 @@ mod tests {
         assert!(res.is_err());
     }
 
-    // ---- Primitive (4): an Idempotent call IS retried up to max_attempts. ----
     #[test]
     fn idempotent_call_retries_to_max_attempts() {
         let cfg = ResilientConfig {
             max_attempts: 3,
-            breaker_min_requests: 100, // breaker never trips
+            breaker_min_requests: 100,
             backoff_base_ms: 1,
             timeout_ms: 1_000_000,
             ..ResilientConfig::default()
@@ -1119,7 +715,6 @@ mod tests {
         assert!(res.is_err());
     }
 
-    // ---- Primitive (4): an Idempotent call that succeeds on retry stops retrying. ----
     #[test]
     fn idempotent_retry_stops_on_success() {
         let cfg = ResilientConfig {
@@ -1148,7 +743,6 @@ mod tests {
         assert_eq!(calls.get(), 3, "retry stops as soon as the call succeeds");
     }
 
-    // ---- Primitive (3): a saturated bulkhead fast-fails rather than queueing. ----
     #[test]
     fn saturated_bulkhead_fast_fails() {
         let cfg = ResilientConfig {
@@ -1160,11 +754,8 @@ mod tests {
         let client = client_with(cfg, Box::new(ZeroJitter));
         let target = Target("svc".into());
 
-        // Hold the only permit by re-entering call_op from within an op (synthetic
-        // saturation: the inner call sees in_flight == max).
         let inner_result = Cell::new(None);
         let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
-            // While this op runs, the outer call holds the single permit.
             let r = client.call_op(&target, Idempotency::NonIdempotent, || {
                 Ok::<(), CallError>(())
             });
@@ -1179,10 +770,6 @@ mod tests {
         assert_eq!(client.bulkhead_rejections(), 1);
     }
 
-    /// **The bulkhead permit IS released when a call completes (the `BulkheadGuard::drop`).** With
-    /// a cap of 1: a first call takes + releases the permit on completion; a SECOND sequential call
-    /// then succeeds (the permit was freed). A no-op `drop` mutant would leak the permit, so the
-    /// second call would fast-fail BulkheadFull — this test pins the release. (P-507 mutation gate.)
     #[test]
     fn bulkhead_guard_releases_the_permit_on_drop_so_a_later_call_fits() {
         let cfg = ResilientConfig {
@@ -1194,30 +781,25 @@ mod tests {
         let client = client_with(cfg, Box::new(ZeroJitter));
         let target = Target("svc".into());
 
-        // First call completes — its BulkheadGuard drops, releasing the single permit.
         let r1 = client.call_op(&target, Idempotency::NonIdempotent, || {
             Ok::<(), CallError>(())
         });
         assert_eq!(r1, Ok(()), "first call succeeds");
-        // Second sequential call fits ONLY if the permit was released on drop.
         let r2 = client.call_op(&target, Idempotency::NonIdempotent, || {
             Ok::<i32, CallError>(7)
         });
         assert_eq!(
             r2,
             Ok(7),
-            "the second call fits — the permit was released on drop (no leak)"
+            "the second call fits - the permit was released on drop (no leak)"
         );
         assert_eq!(
             client.bulkhead_rejections(),
             0,
-            "no bulkhead rejection — the permit was freed between calls"
+            "no bulkhead rejection - the permit was freed between calls"
         );
     }
 
-    /// **`config()` returns the configured per-target value set (the M0 floor accessor).** Pins the
-    /// accessor returns the ACTUAL config, not a `Default` (a `Box::leak(Default::default())` mutant
-    /// would return default numbers, hiding a tuned value set). (P-507 mutation gate.)
     #[test]
     fn config_accessor_returns_the_configured_values_not_default() {
         let cfg = ResilientConfig {
@@ -1240,23 +822,18 @@ mod tests {
             read.backoff_base_ms, 123,
             "config() returns the set backoff base"
         );
-        // Guard: these are NOT the defaults (so a Default-returning mutant is distinguishable).
         assert_ne!(
             read.bulkhead_max_concurrency,
             ResilientConfig::default().bulkhead_max_concurrency
         );
     }
 
-    // ---- Primitive (1): full-jitter backoff stays within the configured base. ----
     #[test]
     fn full_jitter_backoff_within_base() {
         let cfg = ResilientConfig {
             backoff_base_ms: 100,
             ..ResilientConfig::default()
         };
-        // MaxJitter returns cap-1 = the largest value the bound permits. For attempt 0 the
-        // cap is base*2^0 = 100, so the value must be <= 100. For attempt 2 the cap is
-        // base*2^2 = 400 (full jitter widens with the attempt, Brooker 2015).
         let client = client_with(cfg, Box::new(MaxJitter));
         let b0 = client.full_jitter_backoff(0, &None);
         let b1 = client.full_jitter_backoff(1, &None);
@@ -1264,8 +841,6 @@ mod tests {
         assert!(b0 <= 100, "attempt-0 jitter must stay within base ({b0})");
         assert!(b1 <= 200, "attempt-1 jitter must stay within base*2 ({b1})");
         assert!(b2 <= 400, "attempt-2 jitter must stay within base*4 ({b2})");
-        // The Retry-After hint is honoured as the FLOOR of the backoff (the P-S17 wiring
-        // only maps the header onto this hint).
         let floored = client.full_jitter_backoff(
             0,
             &Some(CallError::Downstream {
@@ -1279,7 +854,6 @@ mod tests {
         );
     }
 
-    // ---- Primitive (2): the breaker recovers via a half-open probe. ----
     #[test]
     fn breaker_half_open_probe_recovers() {
         let cfg = ResilientConfig {
@@ -1295,7 +869,6 @@ mod tests {
         let client = ResilientClient::with_sources(cfg, Box::new(clock), Box::new(ZeroJitter));
         let target = Target("svc".into());
 
-        // Trip the breaker.
         for _ in 0..2 {
             let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
                 Err::<(), _>(CallError::Downstream {
@@ -1306,9 +879,7 @@ mod tests {
         }
         assert_eq!(client.breaker_state(&target), BreakerState::Open);
 
-        // Advance past the open window so the half-open probe is admitted.
         clock_handle.set(2_000);
-        // A successful probe closes the breaker.
         let res = client.call_op(&target, Idempotency::NonIdempotent, || {
             Ok::<(), CallError>(())
         });
@@ -1316,7 +887,6 @@ mod tests {
         assert_eq!(client.breaker_state(&target), BreakerState::Closed);
     }
 
-    // ---- Signals: breaker-state encoding + bulkhead-rejection counter (contract 1.8). ----
     #[test]
     fn signals_export_breaker_and_bulkhead() {
         assert_eq!(BreakerState::Closed.signal_value(), 0);
@@ -1325,12 +895,10 @@ mod tests {
 
         let client = ResilientClient::default();
         let target = Target("never-called".into());
-        // An unseen target reads Closed (the fail-safe default).
         assert_eq!(client.breaker_state(&target), BreakerState::Closed);
         assert_eq!(client.bulkhead_rejections(), 0);
     }
 
-    // ---- Jitter (4): SplitMix64 stays in range, spreads, and decorrelates. ----
     #[test]
     fn splitmix64_jitter_in_range_and_spreads() {
         let rng = SplitMix64::new(0xDEAD_BEEF);
@@ -1340,19 +908,13 @@ mod tests {
             assert!(v < 1_000, "next_below(n) must be < n (got {v})");
             seen.insert(v);
         }
-        // A correct mixer spreads across the range; a broken one (e.g. & instead of ^, or a
-        // dropped shift) collapses to a tiny set of values. Require broad coverage.
         assert!(
             seen.len() > 500,
             "jitter must spread across the range (only {} distinct values)",
             seen.len()
         );
-        // next_below(0) is defined as 0 (no panic / no modulo-by-zero).
         assert_eq!(rng.next_below(0), 0);
-        // next_below(1) is always 0.
         assert_eq!(rng.next_below(1), 0);
-        // Two different seeds must not produce identical streams (decorrelation —
-        // synchronised jitter defeats Brooker 2015).
         let a = SplitMix64::new(1);
         let b = SplitMix64::new(2);
         let sa: Vec<u64> = (0..16).map(|_| a.next_below(u64::MAX)).collect();
@@ -1360,18 +922,10 @@ mod tests {
         assert_ne!(sa, sb, "distinct seeds must yield distinct jitter streams");
     }
 
-    /// Known-answer vectors for the canonical splitmix64 (Vigna). Pinning the exact output
-    /// stream locks every bit-mixing step (the `^`/`>>`/`*` operations): any single altered
-    /// mixing op diverges from these reference values. `next_below(u64::MAX)` returns
-    /// `full % (u64::MAX)`; for `full < u64::MAX` (true for all three reference values) that
-    /// is `full` unchanged, so we read the raw 64-bit stream directly.
     #[test]
     fn splitmix64_matches_canonical_reference_vectors() {
-        // Seed 0, the canonical splitmix64 reference stream (Vigna's prng.di.unimi.it).
         let rng = SplitMix64::new(0);
         let got: Vec<u64> = (0..3).map(|_| rng.next_below(u64::MAX)).collect();
-        // All three reference values are < u64::MAX, so `next_below(u64::MAX)` (which is
-        // `stream % u64::MAX`) returns them unchanged.
         let expected: [u64; 3] = [
             0xE220_A839_7B1D_CDAF,
             0x6E78_9E6A_A1B9_65F4,
@@ -1384,13 +938,8 @@ mod tests {
         );
     }
 
-    // ---- Breaker (2): the rolling window is bounded and old outcomes age out. ----
     #[test]
     fn breaker_window_is_bounded_and_ages_out() {
-        // window=4, min=4, ratio=0.75: the breaker trips only when >=3 of the last 4 are
-        // failures. Feed 4 failures (trips would happen), but we keep it CLOSED by first
-        // filling the window with successes, then a minority of failures — proving old
-        // outcomes age out of the bounded window rather than accumulating forever.
         let cfg = ResilientConfig {
             max_attempts: 1,
             breaker_min_requests: 4,
@@ -1402,9 +951,6 @@ mod tests {
         let client = client_with(cfg, Box::new(ZeroJitter));
         let target = Target("svc".into());
 
-        // 10 successes then 2 failures: if the window were UNBOUNDED, 2/12 = 0.17 < 0.75 →
-        // closed. If bounded to 4, the last 4 are [ok, ok, fail, fail] = 0.5 < 0.75 → still
-        // closed. Either way the count of failures the ratio sees must be window-bounded.
         for _ in 0..10 {
             let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
                 Ok::<(), CallError>(())
@@ -1420,9 +966,6 @@ mod tests {
         }
         assert_eq!(client.breaker_state(&target), BreakerState::Closed);
 
-        // Now drive the LAST 4 outcomes to >=3 failures: trips. This kills the window-trim
-        // and ratio mutants (if the trim is wrong, the older successes dilute the ratio and
-        // it never trips).
         for _ in 0..2 {
             let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
                 Err::<(), _>(CallError::Downstream {
@@ -1431,11 +974,9 @@ mod tests {
                 })
             });
         }
-        // Last 4 = [fail, fail, fail, fail] = 1.0 >= 0.75 → open.
         assert_eq!(client.breaker_state(&target), BreakerState::Open);
     }
 
-    // ---- Breaker (2): the min-request count gates the trip (no trip on too-few samples). ----
     #[test]
     fn breaker_does_not_trip_below_min_requests() {
         let cfg = ResilientConfig {
@@ -1447,8 +988,6 @@ mod tests {
         };
         let client = client_with(cfg, Box::new(ZeroJitter));
         let target = Target("svc".into());
-        // 4 failures < min_requests(5): must NOT trip yet (kills the `>=` → `<` flip on the
-        // min-requests gate).
         for _ in 0..4 {
             let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
                 Err::<(), _>(CallError::Downstream {
@@ -1458,7 +997,6 @@ mod tests {
             });
         }
         assert_eq!(client.breaker_state(&target), BreakerState::Closed);
-        // The 5th failure reaches min_requests with ratio 1.0 → trips.
         let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
             Err::<(), _>(CallError::Downstream {
                 message: "f".into(),
@@ -1468,16 +1006,12 @@ mod tests {
         assert_eq!(client.breaker_state(&target), BreakerState::Open);
     }
 
-    // ---- Retry (1)+(4): a timed-out attempt is NOT a success and the deadline halts retry. ----
     #[test]
     fn deadline_halts_retry_and_timeout_is_not_success() {
-        // The op "succeeds" (Ok) but overruns the deadline: the result must be Timeout, NOT
-        // Ok, and the breaker must see it as a FAILURE. This kills the `!timed_out` guard
-        // mutants and the `success = is_ok && !timed_out` mutant.
         let cfg = ResilientConfig {
             timeout_ms: 100,
             max_attempts: 3,
-            breaker_min_requests: 100, // keep breaker out of the way
+            breaker_min_requests: 100,
             backoff_base_ms: 1,
             ..ResilientConfig::default()
         };
@@ -1487,7 +1021,6 @@ mod tests {
         let target = Target("svc".into());
 
         let res: Result<()> = client.call_op(&target, Idempotency::Idempotent, || {
-            // The op consumes the whole budget then returns Ok — but it is too late.
             clock_handle.set(200);
             Ok(())
         });
@@ -1498,11 +1031,8 @@ mod tests {
         );
     }
 
-    // ---- Retry (4): backoff happens BETWEEN attempts and the cap widens per retry. ----
     #[test]
     fn backoff_is_between_attempts_and_widens() {
-        // A clock that RECORDS every sleep duration so we can assert the full-jitter cap
-        // grows as base * 2^n across successive retries (Brooker 2015 — the exponential).
         #[derive(Clone)]
         struct RecordingClock {
             now: std::sync::Arc<AtomicU64>,
@@ -1526,13 +1056,11 @@ mod tests {
         let sleeps = clock.sleeps.clone();
         let cfg = ResilientConfig {
             max_attempts: 4,
-            breaker_min_requests: 100, // breaker out of the way
+            breaker_min_requests: 100,
             backoff_base_ms: 10,
-            timeout_ms: 10_000_000, // huge: never clamps the backoff
+            timeout_ms: 10_000_000,
             ..ResilientConfig::default()
         };
-        // `full_jitter_backoff` draws from `next_below(cap + 1)` (range `[0, cap]`
-        // inclusive), so MaxJitter (returns n-1) yields exactly `cap = base * 2^n`.
         let client = ResilientClient::with_sources(cfg, Box::new(clock), Box::new(MaxJitter));
         let target = Target("svc".into());
 
@@ -1544,25 +1072,18 @@ mod tests {
                 retry_after_ms: None,
             })
         });
-        // 4 attempts → 3 backoffs (one between each pair of attempts). If the backoff block
-        // were skipped (attempts_done>0 flipped), there would be ZERO sleeps.
         let recorded = sleeps.lock().unwrap().clone();
         assert_eq!(
             recorded.len(),
             3,
             "exactly one backoff between each pair of attempts"
         );
-        // The cap widens: retry 0 → base*1, retry 1 → base*2, retry 2 → base*4 (the
-        // attempts_done-1 index feeds the exponent; a wrong index breaks this progression).
         assert_eq!(recorded, vec![10, 20, 40]);
         assert_eq!(calls.get(), 4);
     }
 
-    // ---- Retry (4): the last attempt is the final attempt (attempt+1 arithmetic). ----
     #[test]
     fn last_attempt_count_is_exact() {
-        // max_attempts=2 with a permanently-failing idempotent op: exactly 2 downstream
-        // invocations (kills `attempt + 1` → `attempt * 1` / `attempt - 1`).
         let cfg = ResilientConfig {
             max_attempts: 2,
             breaker_min_requests: 100,
@@ -1583,11 +1104,8 @@ mod tests {
         assert_eq!(calls.get(), 2, "max_attempts=2 means exactly 2 attempts");
     }
 
-    // ---- The frozen `call<R>` signature (contract 1.9) is intact + drives the primitives. ----
     #[test]
     fn call_signature_is_frozen_and_runs_primitives() {
-        // A fake downstream Transport (the CDC provider side of 1.9): it records that the
-        // primitives delivered exactly one attempt to it.
         struct FakeResp(String);
         thread_local! {
             static SENDS: Cell<u32> = const { Cell::new(0) };
@@ -1606,7 +1124,6 @@ mod tests {
             },
             Box::new(ZeroJitter),
         );
-        // The frozen signature: call<R>(Target, Req, Idempotency) -> Result<R>.
         let _f: fn(&ResilientClient, Target, Req, Idempotency) -> Result<FakeResp> =
             ResilientClient::call::<FakeResp>;
 
@@ -1621,22 +1138,14 @@ mod tests {
         assert_eq!(SENDS.with(|c| c.get()), 1, "exactly one downstream attempt");
     }
 
-    // ======================================================================================
-    // P-S17 — `Retry-After` honouring (SUB-D5, no retry-storm amplification).
-    // ======================================================================================
-
-    // ---- The header → hint mapping ([`parse_retry_after`]). ----
     #[test]
     fn parse_retry_after_maps_header_to_floor() {
-        // Absent header → no floor.
         assert_eq!(parse_retry_after(None), RetryAfter::Absent);
         assert_eq!(RetryAfter::Absent.floor_ms(9_999), 0);
         assert!(!RetryAfter::Absent.is_present());
 
-        // Delta-seconds → ms floor (the form our surfaces issue, §7.2).
         assert_eq!(parse_retry_after(Some("120")), RetryAfter::DeltaMs(120_000));
         assert_eq!(parse_retry_after(Some("0")), RetryAfter::DeltaMs(0));
-        // Surrounding whitespace (a wire header often carries it) is trimmed.
         assert_eq!(
             parse_retry_after(Some("  30 ")),
             RetryAfter::DeltaMs(30_000)
@@ -1644,9 +1153,6 @@ mod tests {
         assert!(RetryAfter::DeltaMs(30_000).is_present());
         assert_eq!(RetryAfter::DeltaMs(30_000).floor_ms(9_999), 30_000);
 
-        // An HTTP-date / malformed / signed / empty value → Unparseable: PRESENT but unresolved
-        // (never silently dropped to "no floor"). It floors at the WHOLE open window (the
-        // conservative, never-fail-open choice — back off MORE on an ambiguous signal).
         for bad in [
             "Wed, 21 Oct 2026 07:28:00 GMT",
             "-5",
@@ -1672,26 +1178,22 @@ mod tests {
                 "Unparseable floors at the whole open window"
             );
         }
-        // A colossal all-digit value saturates rather than dropping the floor.
         assert_eq!(
             parse_retry_after(Some("99999999999999999999999")),
             RetryAfter::DeltaMs(u64::MAX)
         );
     }
 
-    // ---- Honour: a full-jitter backoff NEVER goes below the `Retry-After` floor, and the
-    //      honour is counted on the producer signal. ----
     #[test]
     fn retry_after_is_the_backoff_floor_and_is_counted() {
         let cfg = ResilientConfig {
             max_attempts: 3,
-            breaker_min_requests: 100, // breaker out of the way
-            backoff_base_ms: 10,       // tiny jitter cap — the Retry-After floor must dominate
-            timeout_ms: 100_000_000,   // never clamps
+            breaker_min_requests: 100,
+            backoff_base_ms: 10,
+            timeout_ms: 100_000_000,
             breaker_open_ms: 4_000,
             ..ResilientConfig::default()
         };
-        // A clock that RECORDS every sleep so we can assert the floor was respected.
         #[derive(Clone)]
         struct RecordingClock {
             now: std::sync::Arc<AtomicU64>,
@@ -1712,12 +1214,9 @@ mod tests {
             sleeps: std::sync::Arc::new(Mutex::new(Vec::new())),
         };
         let sleeps = clock.sleeps.clone();
-        // ZeroJitter: full jitter alone would sleep 0 — so any non-zero sleep is the
-        // Retry-After floor, proving it is honoured as the FLOOR not merely a hint.
         let client = ResilientClient::with_sources(cfg, Box::new(clock), Box::new(ZeroJitter));
         let target = Target("svc".into());
 
-        // The downstream issues `Retry-After: 5` (5000ms) on each failure.
         let _ = client.call_op(&target, Idempotency::Idempotent, || {
             Err::<(), _>(CallError::Downstream {
                 message: "shed".into(),
@@ -1732,28 +1231,22 @@ mod tests {
                 "every backoff is floored at the Retry-After (5000ms), got {s}"
             );
         }
-        // The honour was recorded on the producer signal (the SUB-D5 issuance/honour signal).
-        // EXACT count (3 attempts → 2 floored backoffs): pins the counter to a value != 1, so
-        // the `retry_after_honoured -> 1` mutant dies (a constant body would read 1, not 2).
         assert_eq!(
             client.retry_after_honoured(),
             2,
             "each floored retry honours Retry-After once (2 backoffs here)"
         );
-        // And no retry ever passed through a tripped breaker (the breaker never tripped here).
         assert_eq!(client.retry_through_tripped(), 0);
     }
 
-    // ---- No amplification: a tripped breaker + a `Retry-After` together fail fast, and NO
-    //      retry passes through the tripped breaker (`retry_through_tripped == 0`). ----
     #[test]
     fn tripped_breaker_with_retry_after_fails_fast_no_amplification() {
         let cfg = ResilientConfig {
-            max_attempts: 5, // would retry 5× if unguarded — the amplifier
+            max_attempts: 5,
             breaker_min_requests: 1,
             breaker_failure_ratio: 1.0,
             breaker_window: 4,
-            breaker_open_ms: 1_000_000, // stays open for the whole test
+            breaker_open_ms: 1_000_000,
             backoff_base_ms: 1,
             timeout_ms: 100_000_000,
             ..ResilientConfig::default()
@@ -1766,11 +1259,9 @@ mod tests {
             calls.set(calls.get() + 1);
             Err::<(), _>(CallError::Downstream {
                 message: "overloaded".into(),
-                retry_after_ms: Some(2_000), // the downstream sheds with Retry-After
+                retry_after_ms: Some(2_000),
             })
         });
-        // The first attempt fails and trips the breaker; every "retry" is refused by the open
-        // breaker — the downstream is invoked EXACTLY once despite max_attempts=5.
         assert_eq!(
             calls.get(),
             1,
@@ -1778,17 +1269,11 @@ mod tests {
         );
         assert!(matches!(res, Err(CallError::BreakerOpen { .. })) || res.is_err());
         assert_eq!(client.breaker_state(&target), BreakerState::Open);
-        // THE no-amplification invariant: zero retries reached the downstream through the open
-        // breaker.
         assert_eq!(
             client.retry_through_tripped(),
             0,
-            "retry_through_tripped MUST be 0 — no retry-storm amplification"
+            "retry_through_tripped MUST be 0 - no retry-storm amplification"
         );
-        // The guard ACTIVELY fired: the first attempt fails and trips the breaker, then the
-        // first retry is REFUSED by the open breaker and `call_op` returns immediately (a retry
-        // never loops through a tripped breaker) — exactly ONE refusal. This proves the guard
-        // fired under load (distinct from the downstream simply never being retried).
         assert_eq!(
             client.retry_admit_refusals(),
             1,
@@ -1796,14 +1281,8 @@ mod tests {
         );
     }
 
-    // ---- CDC pair for contract 1.9 (the `Retry-After` slice): provider = a fake downstream
-    //      that TRIPS under load + ISSUES a `Retry-After` header; consumer = the client, which
-    //      honours it (floors its backoff) and never amplifies. ----
     #[test]
     fn cdc_provider_trips_and_issues_retry_after_consumer_honours() {
-        // The PROVIDER side: a fake downstream transport that fails under load and issues a
-        // `Retry-After` header on the wire (a `429 + Retry-After`, §7.2). It records how many
-        // times it was actually hit, so the consumer's no-amplification is observable.
         struct OverloadedDownstream;
         thread_local! {
             static HITS: Cell<u32> = const { Cell::new(0) };
@@ -1811,12 +1290,10 @@ mod tests {
         impl Transport for OverloadedDownstream {
             fn send(_t: &Target, _r: &Req) -> Result<Self> {
                 HITS.with(|c| c.set(c.get() + 1));
-                // The wire header the provider issues (delta-seconds form).
                 let header = "3";
                 let ra = parse_retry_after(Some(header));
                 Err(CallError::Downstream {
                     message: "429 Too Many Requests".into(),
-                    // The header → hint mapping (P-S17): the consumer honours this floor.
                     retry_after_ms: match ra {
                         RetryAfter::DeltaMs(ms) => Some(ms),
                         RetryAfter::Unparseable => Some(0),
@@ -1828,7 +1305,7 @@ mod tests {
 
         let cfg = ResilientConfig {
             max_attempts: 4,
-            breaker_min_requests: 2, // trips after 2 failures → later retries fail fast
+            breaker_min_requests: 2,
             breaker_failure_ratio: 1.0,
             breaker_window: 4,
             breaker_open_ms: 1_000_000,
@@ -1844,9 +1321,6 @@ mod tests {
             Idempotency::Idempotent,
         );
         assert!(res.is_err(), "the overloaded downstream call fails");
-        // CONSUMER honoured the contract: it backed off (floored by Retry-After) on the retry,
-        // then the breaker tripped and stopped further retries — the downstream was hit only
-        // until the breaker opened, NEVER the full max_attempts (no amplification).
         let hits = HITS.with(|c| c.get());
         assert!(
             hits <= 2,
@@ -1863,15 +1337,8 @@ mod tests {
         );
     }
 
-    // ---- A FIRST-attempt breaker refusal is NOT a retry refusal (`attempts_done > 0`). ----
     #[test]
     fn first_attempt_breaker_refusal_is_not_a_retry_refusal() {
-        // Pre-trip the breaker, then make a FRESH call whose very first attempt is refused by
-        // the open breaker. Because `attempts_done == 0` on that first attempt, it must NOT
-        // count as a retry refusal — `retry_admit_refusals` stays 0. (This kills the
-        // `attempts_done > 0` → `>= 0` mutant, which would mis-count a first-attempt refusal,
-        // and — by reading 0 where the amplification test reads 1 — the `-> 1` constant mutant
-        // on the accessor.)
         let cfg = ResilientConfig {
             max_attempts: 3,
             breaker_min_requests: 1,
@@ -1884,7 +1351,6 @@ mod tests {
         let client = client_with(cfg, Box::new(ZeroJitter));
         let target = Target("svc".into());
 
-        // First call: one failure trips the breaker (it consumed its one retry-refusal inside).
         let _ = client.call_op(&target, Idempotency::NonIdempotent, || {
             Err::<(), _>(CallError::Downstream {
                 message: "boom".into(),
@@ -1892,11 +1358,8 @@ mod tests {
             })
         });
         assert_eq!(client.breaker_state(&target), BreakerState::Open);
-        // A NonIdempotent first call never retries, so no retry refusal was counted yet.
         assert_eq!(client.retry_admit_refusals(), 0);
 
-        // A brand-new call now: its FIRST attempt (attempts_done == 0) is refused by the open
-        // breaker. That is a fast-fail, NOT a retry through a tripped breaker — refusals stay 0.
         let res = client.call_op(&target, Idempotency::Idempotent, || Ok::<(), CallError>(()));
         assert!(matches!(res, Err(CallError::BreakerOpen { .. })));
         assert_eq!(
@@ -1907,7 +1370,6 @@ mod tests {
         assert_eq!(client.retry_through_tripped(), 0);
     }
 
-    // ---- The `retry_after_of` mapping is single-sourced and total over the error taxonomy. ----
     #[test]
     fn retry_after_of_maps_every_error_variant() {
         assert_eq!(retry_after_of(&None), RetryAfter::Absent);
@@ -1925,7 +1387,6 @@ mod tests {
             })),
             RetryAfter::Absent
         );
-        // A BreakerOpen / BulkheadFull / Timeout never carries a downstream-issued floor.
         assert_eq!(
             retry_after_of(&Some(CallError::BreakerOpen { retry_after_ms: 9 })),
             RetryAfter::Absent

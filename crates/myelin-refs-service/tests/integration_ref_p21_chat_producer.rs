@@ -1,33 +1,3 @@
-//! **REF-P21 / P-337 — Refs serves Chat unfurls (the MAXIMAL producer) + the leak/IDOR invariant on
-//! the FULL five-producer corpus, PROVEN against the live dev-stack Postgres.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-refs-service --features integration \
-//!     --test integration_ref_p21_chat_producer -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires for REF-P21 — the Chat unfurl
-//! reference-edge corpus (the FINAL producer: mention/artifact_ref/embed over EVERY artifact class —
-//! Issues / Git / CI / Knowledge / Chat) executed against the REAL §3.2 `edge` table on real Postgres,
-//! on the most adversarial five-producer corpus. The drill is registered red-until-proven and flips
-//! green ONLY here, with real artifacts.
-//!
-//! **REF-D1 / REF-D2 (the leak / IDOR invariant) at the DATABASE layer on the FULL corpus:** the §3.2
-//! RLS isolates a tenant — a session pinned to tenant B reads ZERO of tenant A's edges (including the
-//! Chat unfurls). The cross-tenant leak invariant holds at the DATABASE layer, not just in the
-//! in-memory model.
-//!
-//! **The non-member-returns-0 ReBAC property at the DATABASE layer:** a backlink read filtered to the
-//! channel-member allow-set (the Chat `channel.read = member + parent_project->read` fragment lowered
-//! over `edge.source_root`) returns ONLY the member-readable chat backlinks — a non-member's lowered
-//! `source_root IN (<member set>)` admits 0 of the private channel's chat backlinks.
-//!
-//! **REF-D4 (reindex-from-cold byte-parity) over real Postgres on the Chat corpus:** we (1) build the
-//! LIVE table from the Chat producer's edges; (2) capture its byte-image; (3) WIPE the partition (no
-//! Chat-DB reload); (4) rebuild ONLY by re-driving the SAME producer edge extraction (the reindex
-//! re-emit path) → byte-parity.
 #![cfg(feature = "integration")]
 
 use myelin_content::InlineNode;
@@ -60,7 +30,6 @@ fn t() -> TenantId {
     TenantId("tenantA".into())
 }
 
-/// One edge row tuple for the upsert.
 struct Row {
     edge_id: String,
     source: String,
@@ -72,8 +41,6 @@ struct Row {
     actor: String,
 }
 
-/// The maximal Chat message body: it unfurls every artifact class (Issues / Git / CI / Knowledge /
-/// Chat) — five structured ref nodes → five reference edges, sourced from the Chat message root.
 fn chat_unfurl_rows(message_id: &str) -> Vec<Row> {
     let producer = ChatEdgeProducer;
     let source =
@@ -136,7 +103,6 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
     let suffix = std::process::id();
     let tbl = format!("edge_p337_{suffix}");
 
-    // ── Apply the REAL §3.2 schema (create + three indexes + RLS), suffixed for isolation. ──
     sqlx::query(&rename(CREATE_EDGE_TABLE_DDL, &tbl))
         .execute(&admin)
         .await
@@ -156,16 +122,12 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
         .await
         .expect("grant app");
 
-    // ── The Chat corpus: two messages in two channels both unfurl the same artifact classes. One
-    //    message (PUBLIC) is member-readable; the other (PRIVATE) is not — the non-member-returns-0
-    //    ReBAC corpus. Each message produces 5 reference edges (mention + 4 artifact unfurls). ──
     let public_msg = "01HPUBLIC";
     let private_msg = "01HPRIVATE";
     let mut corpus: Vec<Row> = Vec::new();
     corpus.extend(chat_unfurl_rows(public_msg));
     corpus.extend(chat_unfurl_rows(private_msg));
 
-    // Pin the session to tenantA (RLS).
     let mut conn = app.acquire().await.unwrap();
     sqlx::query("SELECT set_config('myelin.tenant_id','tenantA',false)")
         .execute(&mut *conn)
@@ -208,7 +170,6 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
         }
     }
 
-    // ── (1) Build the LIVE Chat edge table; capture its byte-image. ──
     rebuild(&mut conn, &upsert_sql, &corpus).await;
     let live_img: String = sqlx::query(&parity_sql)
         .fetch_one(&mut *conn)
@@ -224,7 +185,6 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
         live_count, 10,
         "two messages × five unfurl edges each = 10 reference edges"
     );
-    // Every Chat unfurl edge is reference-class (5.4 — Chat's mention/artifact_ref/embed are references).
     let ref_count: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {tbl} WHERE rel_class='reference'"
     ))
@@ -236,7 +196,6 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
         ref_count, 10,
         "every Chat unfurl edge is reference-class (5.4)"
     );
-    // Every edge is sourced from a Chat message root (the maximal producer).
     let chat_sourced: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {tbl} WHERE source_root LIKE 'myelin://tenantA/chat/message/%'"
     ))
@@ -249,17 +208,13 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
         "every unfurl is sourced from a Chat message"
     );
 
-    // ── The non-member-returns-0 ReBAC property at the DB layer: the channel-member allow-set lowered
-    //    over source_root. A non-member is a `member` of ONLY the PUBLIC channel's message — so the
-    //    member-filtered backlink read of the shared issue admits only the public channel's chat
-    //    backlink, 0 of the private channel's (the Chat `channel.read` fragment over source_root). ──
     let public_src = format!("myelin://tenantA/chat/message/{public_msg}");
     let nonmember_visible_chat_backlinks: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {tbl} \
          WHERE target='myelin://tenantA/issue/issue/ENG-1' AND rel='links' \
            AND source_root = ANY($1)"
     ))
-    .bind(vec![public_src.clone()]) // the non-member's member allow-set (public channel only)
+    .bind(vec![public_src.clone()])
     .fetch_one(&mut *conn)
     .await
     .unwrap()
@@ -268,7 +223,6 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
         nonmember_visible_chat_backlinks, 1,
         "the non-member sees ONLY the public channel's chat backlink (0 of the private channel's)"
     );
-    // Confirm the private channel's backlink EXISTS in the table (it is filtered out, not absent).
     let total_issue_backlinks: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {tbl} \
          WHERE target='myelin://tenantA/issue/issue/ENG-1' AND rel='links'"
@@ -279,10 +233,9 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
     .get("n");
     assert_eq!(
         total_issue_backlinks, 2,
-        "both channels link the issue — the private one is FILTERED OUT for the non-member, not absent"
+        "both channels link the issue - the private one is FILTERED OUT for the non-member, not absent"
     );
 
-    // ── REF-D1 / REF-D2 (IDOR / cross-tenant) at the DATABASE layer: a tenantB session reads 0. ──
     let mut conn_b = app.acquire().await.unwrap();
     sqlx::query("SELECT set_config('myelin.tenant_id','tenantB',false)")
         .execute(&mut *conn_b)
@@ -299,10 +252,9 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
         .get("n");
     assert_eq!(
         b_count, 0,
-        "RLS isolates tenants — tenantB reads 0 of tenantA's Chat unfurl edges (REF-D1/D2)"
+        "RLS isolates tenants - tenantB reads 0 of tenantA's Chat unfurl edges (REF-D1/D2)"
     );
 
-    // ── (2) WIPE the partition (the cold-rebuild precondition — NO Chat-DB reload). ──
     sqlx::query(&format!("DELETE FROM {tbl}"))
         .execute(&mut *conn)
         .await
@@ -314,7 +266,6 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
         .get("n");
     assert_eq!(after_wipe, 0, "the Chat edge partition is wiped");
 
-    // ── (3) Rebuild ONLY from the SAME producer edge extraction (the reindex re-emit path). ──
     let rebuilt_corpus: Vec<Row> = {
         let mut c = Vec::new();
         c.extend(chat_unfurl_rows(public_msg));
@@ -328,13 +279,11 @@ async fn chat_unfurls_ingest_reindex_and_idor_on_real_postgres() {
         .unwrap()
         .get("img");
 
-    // ── (4) The rebuilt Chat edge table byte-matches the live table (§4.7 reindex-parity). ──
     assert_eq!(
         rebuilt_img, live_img,
         "the rebuilt Chat edge index byte-matches the live index (cold == live)"
     );
 
-    // Cleanup (a NEW forward operation — test teardown, not a down-migration).
     sqlx::query(&format!("DROP TABLE {tbl}"))
         .execute(&admin)
         .await

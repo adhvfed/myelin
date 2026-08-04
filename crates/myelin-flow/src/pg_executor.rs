@@ -1,12 +1,3 @@
-//! PostgreSQL-backed durable workflow control surface.
-//!
-//! This module persists the externally visible control operations (`start`, `signal`, `describe`,
-//! and `cancel`) and the versioned definition registry. [`crate::pg_drive_store::PgFlowDriveStore`]
-//! now supplies the fenced PostgreSQL lease/load/commit boundary for journal, attempts, signals,
-//! timers, run state, and outbox. [`crate::pg_dispatcher::PgFlowWorker`] is the production adapter
-//! that turns a deterministic workflow body's staged commands into that durable commit batch; this
-//! control surface does not silently fall back to the in-memory engine.
-
 use crate::engine::run_state;
 use crate::executor::{
     canonicalize_signal_payload, partition_for_run_id, DurableExecutor, ExecutorError, RunId,
@@ -20,8 +11,6 @@ use sqlx::Row;
 use std::future::Future;
 use std::sync::Arc;
 
-/// Bridge the existing synchronous contract to sqlx. Production callers must drive this from a
-/// dedicated thread or a multi-thread Tokio runtime, matching the other durable store adapters.
 fn bridge<F: Future>(rt: &tokio::runtime::Handle, future: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(_) => tokio::task::block_in_place(|| rt.block_on(future)),
@@ -94,8 +83,6 @@ async fn persist_prepared_start(
     region: &str,
     prepared: PreparedStart,
 ) -> Result<RunId, PgError> {
-    // The idempotency anchor wins before definition lookup. A replay after a deploy returns the
-    // original handle even if that definition is now draining.
     if let Some(existing) = sqlx::query_scalar::<_, String>(
         "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 AND idem_key = $3",
     )
@@ -109,10 +96,6 @@ async fn persist_prepared_start(
         return Ok(RunId(existing));
     }
 
-    // `wf_definition` is the schema's one deliberate global-code registry: it contains only the
-    // immutable workflow type/version/hash/status tuple and has no tenant, region, or PII columns.
-    // Name that carve-out at the query construction site so it cannot be mistaken for a
-    // tenant-store read; every run lookup above and below remains `(tenant_id, region)` bound.
     let tenant_id_not_applicable = sqlx::query_scalar::<_, i32>(
         "SELECT version FROM wf_definition WHERE wf_type = $1 AND status = 'active' \
          /* global registry: tenant_id and region do not apply */ \
@@ -152,7 +135,6 @@ async fn persist_prepared_start(
         return Ok(prepared.minted);
     }
 
-    // A concurrent start under the same key is success and returns the winner.
     if let Some(existing) = sqlx::query_scalar::<_, String>(
         "SELECT run_id FROM workflow_run WHERE tenant_id = $1 AND region = $2 AND idem_key = $3",
     )
@@ -177,16 +159,12 @@ async fn persist_prepared_start(
     )))
 }
 
-/// Result of an in-transaction cancellation attempt after locking the exact workflow row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelOnConnOutcome {
-    /// This transaction changed an active workflow to `terminated`.
     Terminated,
-    /// The workflow was already terminal and was left byte-for-byte unchanged.
     TerminalNoOp,
 }
 
-/// Durable, tenant- and residency-scoped implementation of [`DurableExecutor`].
 #[derive(Clone)]
 pub struct PgFlowExecutor {
     pool: PgPool,
@@ -197,7 +175,6 @@ pub struct PgFlowExecutor {
 }
 
 impl PgFlowExecutor {
-    /// Bind the durable executor to one verified tenant and one residency cell.
     pub fn new(
         pool: PgPool,
         rt: tokio::runtime::Handle,
@@ -214,9 +191,6 @@ impl PgFlowExecutor {
         }
     }
 
-    /// Start a workflow on the caller's existing consumer transaction. The workflow row therefore
-    /// commits or rolls back with the event dedup mark and the caller's other durable effects. No
-    /// nested transaction is opened and a missing/type-mismatched co-commit handle fails closed.
     pub fn start_with_id_on_conn(
         &self,
         tx: &mut HandlerTx<'_>,
@@ -232,8 +206,6 @@ impl PgFlowExecutor {
         bridge(&self.rt, self.start_on_conn_async(conn, spec, run_id))
     }
 
-    /// Register immutable workflow code. Re-registering the exact hash is idempotent; reusing a
-    /// `(wf_type, version)` for different code fails closed because in-flight runs pin that version.
     pub fn register_definition(
         &self,
         wf_type: &str,
@@ -265,8 +237,6 @@ impl PgFlowExecutor {
             .begin()
             .await
             .map_err(|e| store_error("begin definition registration", e))?;
-        // Global code registry: tenant_id/region do not apply because definitions contain no tenant
-        // data. The explicit comment is also a loud architecture-lint marker, not a silent waiver.
         let tenant_id_not_applicable = sqlx::query(
             "INSERT INTO wf_definition (wf_type, version, code_hash, status) \
              VALUES ($1, $2, $3, 'active') ON CONFLICT (wf_type, version) DO NOTHING \
@@ -400,8 +370,6 @@ impl PgFlowExecutor {
         bounded("run_id", &spec.run.0, 256)?;
         bounded("signal_name", &spec.signal_name, 128)?;
         bounded("idem_key", &spec.idem_key, 512)?;
-        // A scoped-refs signal canonicalises to itself (validate_refs unchanged). The typed CI
-        // completion path (`signal_typed_async`) shares the same idempotent insert core below.
         let payload = canonicalize_signal_payload(
             &spec.signal_name,
             SignalPayload::ScopedRefs(spec.payload),
@@ -427,14 +395,6 @@ impl PgFlowExecutor {
             .await
     }
 
-    /// Buffer a typed signal on the caller's already-open PostgreSQL transaction.
-    ///
-    /// This is the completion-side counterpart to [`Self::start_with_id_on_conn`]: a caller that
-    /// owns another durable state transition (for example, consuming a CI runner's leased job)
-    /// can make that transition and the workflow signal one atomic commit. The connection MUST be
-    /// transaction-scoped to this executor's exact tenant and region. The method verifies both GUCs
-    /// before touching workflow state, so an unscoped/admin connection cannot accidentally turn the
-    /// explicit predicates into an authorization bypass.
     pub async fn signal_typed_on_conn(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -449,11 +409,6 @@ impl PgFlowExecutor {
             .map_err(|error| Self::map_signal_store_error(error, error_run_id))
     }
 
-    /// Terminate a workflow on the caller's already-open, exactly scoped transaction.
-    ///
-    /// Run-level owners use this to co-commit product lifecycle cancellation with Flow termination
-    /// and any adjacent accounting state. The row lock serializes with drive commits and signal
-    /// delivery; a terminal workflow is an exact no-op, while an unknown workflow is refused.
     pub async fn cancel_on_conn(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -503,10 +458,6 @@ impl PgFlowExecutor {
         bounded("run_id", &spec.run.0, 256)?;
         bounded("signal_name", &spec.signal_name, 128)?;
         bounded("idem_key", &spec.idem_key, 512)?;
-        // Canonicalise the typed payload (validating the CiJobDone grammar / result refs) to the
-        // durable string-array shape BEFORE the transaction, then buffer it through the same insert
-        // core — the stored `wf_signal.payload` row is byte-identical to a hand-encoded ScopedRefs
-        // delivery, so every downstream decode/projection/journal path stays shape-compatible.
         let payload = canonicalize_signal_payload(&spec.signal_name, spec.payload, &self.tenant)?;
         Ok((
             spec.run,
@@ -517,12 +468,6 @@ impl PgFlowExecutor {
         ))
     }
 
-    /// The idempotent `wf_signal` insert core shared by [`Self::signal_async`] and
-    /// [`Self::signal_typed_async`]. `payload_refs` is already canonicalised + validated. A verified
-    /// same-tenant delivery to a TERMINAL run is an acknowledged no-op ([`SignalOutcome::TerminalNoOp`])
-    /// — nothing is buffered and NO terminal history is mutated — so a late producer can settle its own
-    /// lease instead of retrying a rejection forever. An unknown run (outside this tenant/region scope)
-    /// is still surfaced as an error.
     async fn deliver_signal_async(
         &self,
         run: RunId,
@@ -573,8 +518,6 @@ impl PgFlowExecutor {
             SignalStoreError::Storage(PgError::Query(format!("encode signal payload refs: {e}")))
         })?;
         let spec_payload_key_ref = payload_key_ref;
-        // Serialise signal delivery against drive commits/cancellation and pin the lifecycle
-        // decision in the same transaction as insertion. Terminal history is immutable.
         let state = sqlx::query_scalar::<_, String>(
                     "SELECT state FROM workflow_run WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
                 )
@@ -590,18 +533,6 @@ impl PgFlowExecutor {
             return Err(SignalStoreError::UnknownRun);
         };
         if run_state::is_terminal(&state) {
-            // A VERIFIED same-tenant terminal run: acknowledge the late completion WITHOUT
-            // buffering (no row inserted) and WITHOUT mutating the immutable terminal history.
-            // The caller (e.g. the CI runner reporting `job.done` after a workflow timeout /
-            // termination) settles its own queue lease on this no-op rather than retrying a
-            // rejected delivery forever.
-            //
-            // BUT the divergent-redelivery guard still fires: a re-used idem_key carrying a
-            // DIFFERENT payload/key-ref is producer CORRUPTION (two distinct completions under
-            // one key), and terminality must not become a bypass for that check. If a row
-            // already exists under this exact key, compare it: identical → the acknowledged
-            // no-op; divergent → surfaced as InvalidInput exactly as for a live run. (A row can
-            // exist because the run buffered/consumed this signal BEFORE it went terminal.)
             let existing = sqlx::query(
                 "SELECT payload, payload_key_ref FROM wf_signal \
                          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
@@ -679,9 +610,6 @@ impl PgFlowExecutor {
             consumed_seq.is_none()
         };
 
-        // Signal insertion and waiting→running wake are one transaction: a crash cannot
-        // leave a new/pending durable signal parked behind a sleeping run. A duplicate
-        // already consumed by history is observational only and must never resurrect it.
         if should_wake {
             sqlx::query(
                         "UPDATE workflow_run SET state = 'running', updated_at = now() \

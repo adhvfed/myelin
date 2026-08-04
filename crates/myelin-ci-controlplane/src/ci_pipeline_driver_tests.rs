@@ -1,8 +1,3 @@
-//! DB-free unit tests for the CT-004d.2 culmination driver (chunks 2/3/5). The live-PG + real-`runsc`
-//! end-to-end is `tests/integration_ci_ct004d2_culmination.rs`; these prove the PURE, security-critical
-//! halves without a pool: the trust-tier/region forwarding, the deterministic job-id, and the
-//! verdict-vocabulary bridge reporter.
-
 use super::*;
 use myelin_flow::{JobKind, JobSpec as FlowJobSpec};
 use myelin_tenancy::TenantId;
@@ -49,9 +44,6 @@ fn ci_run_record(tenant_id: &str) -> CiRunRecord {
     }
 }
 
-/// A region-wide starter must route a durable row to a driver for that exact tenant. The check runs
-/// before plan registration/start, preventing the former fixed `ci-controlplane` tenant from being
-/// stamped onto arbitrary queued runs.
 #[test]
 fn driver_refuses_a_durable_run_from_another_tenant() {
     let record = ci_run_record("tenant-b");
@@ -72,13 +64,8 @@ fn driver_accepts_a_durable_run_for_its_exact_tenant() {
     validate_driver_tenant(&TenantId("acme".into()), &record).expect("same-tenant run is admitted");
 }
 
-/// **THE SECURITY INVARIANT (unit half): the enqueue's trust_tier + region come from the run's terms,
-/// forwarded UNCHANGED, and the spec's trust_tier is STAMPED to match — a builder that returns a WIDER
-/// tier is overwritten.** An `untrusted_fork` run enqueues an `untrusted_fork` stage behind an
-/// `untrusted_fork` gate, no matter what the spec builder tried to set.
 #[test]
 fn build_dispatch_forwards_trust_and_region_unchanged_and_overwrites_a_widened_spec() {
-    // The builder deliberately tries to WIDEN the tier to Trusted — dispatch must overwrite it.
     let widening_builder: StageSpecBuilder = fixed_command_spec_builder(
         "registry/x@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         vec!["true".into()],
@@ -92,7 +79,6 @@ fn build_dispatch_forwards_trust_and_region_unchanged_and_overwrites_a_widened_s
     )
     .expect("build the dispatch");
 
-    // trust_tier forwarded UNCHANGED from the run's terms (never the builder's Trusted).
     assert_eq!(
         enq.trust_tier,
         TrustTier::UntrustedFork,
@@ -101,19 +87,16 @@ fn build_dispatch_forwards_trust_and_region_unchanged_and_overwrites_a_widened_s
     assert_eq!(
         spec.trust_tier,
         TrustTier::UntrustedFork,
-        "the spec tier is STAMPED to the run's tier — the builder's widened Trusted is overwritten"
+        "the spec tier is STAMPED to the run's tier - the builder's widened Trusted is overwritten"
     );
-    // co_persist_dispatch's enq.trust_tier == spec.trust_tier holds BY CONSTRUCTION.
     assert_eq!(
         enq.trust_tier, spec.trust_tier,
         "the claim-gating tier == the executing spec's tier"
     );
-    // region forwarded UNCHANGED from the run's terms.
     assert_eq!(
         enq.region, "de-fra",
         "region = the run's residency pin, forwarded unchanged"
     );
-    // the echo idem_token is stamped on the spec (the runner echoes it on job.done).
     assert_eq!(spec.idem_token, IdemToken("run/ci.pipeline:0/job".into()));
     assert_eq!(
         enq.idem_token, "run/ci.pipeline:0/job",
@@ -121,7 +104,6 @@ fn build_dispatch_forwards_trust_and_region_unchanged_and_overwrites_a_widened_s
     );
 }
 
-/// A `Trusted` run forwards `Trusted` (the control that the gate is exact, not a blanket narrow).
 #[test]
 fn build_dispatch_forwards_a_trusted_run_as_trusted() {
     let builder = fixed_command_spec_builder(
@@ -141,8 +123,6 @@ fn build_dispatch_forwards_a_trusted_run_as_trusted() {
     assert_eq!(enq.region, "fr-par");
 }
 
-/// The durable `job_queue.job_id` is a real uuid, deterministic on the idem_token (the `(tenant,
-/// job_id)` PK idempotency anchor), and DISTINCT per stage (distinct idem_tokens → distinct rows).
 #[test]
 fn stage_job_id_is_a_deterministic_distinct_uuid() {
     let a = DurableJobRunner::stage_job_id("run/ci.pipeline:0/job");
@@ -159,14 +139,12 @@ fn stage_job_id_is_a_deterministic_distinct_uuid() {
     );
 }
 
-/// The dispatched flow spec's timeout beyond the store ceiling is clamped (a legitimate stage never
-/// trips the fail-closed TimeoutTooLong).
 #[test]
 fn build_dispatch_clamps_the_timeout_to_the_store_ceiling() {
     let builder = fixed_command_spec_builder(
         "registry/x@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         vec!["true".into()],
-        MAX_JOB_TIMEOUT_SECS + 10_000, // over the ceiling
+        MAX_JOB_TIMEOUT_SECS + 10_000,
     )
     .expect("pinned image");
     let (_enq, spec) = build_dispatch_parts(
@@ -181,13 +159,6 @@ fn build_dispatch_clamps_the_timeout_to_the_store_ceiling() {
     );
 }
 
-// =================================================================================================
-// The durable-completion-authority verification core (DB-free — the security half is provable with no
-// pool). The DB-backed signal proof + the forged-completion refusal end-to-end live in the live-PG
-// integration tests.
-// =================================================================================================
-
-/// A durable dispatch identity for a stage dispatched under `idem_token` in `run_id`.
 fn durable_identity(run_id: &str, idem_token: &str, stage: &str) -> ClaimedDispatchIdentity {
     ClaimedDispatchIdentity {
         run_id: run_id.into(),
@@ -197,8 +168,6 @@ fn durable_identity(run_id: &str, idem_token: &str, stage: &str) -> ClaimedDispa
     }
 }
 
-/// **The happy path: a completion whose claimed `(tenant, run, job_id, idem_token)` ALL match the
-/// durable dispatch record resolves the durable stage** — the verdict the reporter then signals.
 #[test]
 fn verify_admits_a_fully_matching_claim_and_returns_the_durable_stage() {
     let reporter_tenant = TenantId("acme".into());
@@ -223,8 +192,6 @@ fn verify_admits_a_fully_matching_claim_and_returns_the_durable_stage() {
     );
 }
 
-/// **A completion for another tenant is refused** (the reporter is tenant-bound; a region runner claims
-/// cross-tenant, but a mis-routed completion never signals the wrong tenant's run).
 #[test]
 fn verify_refuses_a_cross_tenant_claim() {
     let idem = "R/ci.pipeline:0/job";
@@ -241,8 +208,6 @@ fn verify_refuses_a_cross_tenant_claim() {
     assert!(matches!(err, ClaimRefusal::TenantMismatch { .. }));
 }
 
-/// Manifest job UUIDs are independent of Flow's idempotency token. The durable row, not a second
-/// derivation scheme, binds the two identities.
 #[test]
 fn verify_admits_an_exact_manifest_job_id_bound_by_the_durable_record() {
     let idem = "R/ci.pipeline:0/job";
@@ -259,8 +224,6 @@ fn verify_admits_an_exact_manifest_job_id_bound_by_the_durable_record() {
     assert_eq!(stage, "build");
 }
 
-/// **A completion with NO durable dispatch record is refused** — a fabricated `job.done` for a job that
-/// was never dispatched/claimed changes nothing durable.
 #[test]
 fn verify_refuses_a_completion_with_no_durable_dispatch_record() {
     let idem = "R/ci.pipeline:0/job";
@@ -277,13 +240,10 @@ fn verify_refuses_a_completion_with_no_durable_dispatch_record() {
     assert!(matches!(err, ClaimRefusal::NoDispatchRecord { .. }));
 }
 
-/// **A completion whose durable record names a DIFFERENT run (or a different idem_token) is refused** —
-/// the claim must match the exact dispatched identity.
 #[test]
 fn verify_refuses_a_run_or_idem_that_diverges_from_the_durable_record() {
     let idem = "R/ci.pipeline:0/job";
     let job_id = DurableJobRunner::stage_job_id(idem);
-    // durable record is for a DIFFERENT run.
     let run_err = verify_claimed_identity(
         &TenantId("acme".into()),
         &TenantId("acme".into()),
@@ -294,7 +254,6 @@ fn verify_refuses_a_run_or_idem_that_diverges_from_the_durable_record() {
     )
     .expect_err("a divergent durable run_id is refused");
     assert!(matches!(run_err, ClaimRefusal::RunMismatch { .. }));
-    // durable record carries a DIFFERENT idem_token.
     let idem_err = verify_claimed_identity(
         &TenantId("acme".into()),
         &TenantId("acme".into()),
@@ -598,9 +557,6 @@ fn tier_p_reservation_structurally_requires_its_exact_operational_settlement_pol
 
 #[test]
 fn tier_p_v2_reservation_gate_requires_the_same_exact_settlement_policy_as_v1() {
-    // CT-007 slice 5b.3-4a.1b: `v2` handles are still Tier-P operational -- same zero-markup
-    // pricing formula, only the reservation-amount topology differs -- so the gate must widen to
-    // recognize the `v2` prefix rather than silently skip validation for `v2`-handled jobs.
     let usage = ResourceUsage {
         cpu_seconds: 17,
         mem_byte_seconds: 3 * 1_073_741_824 + 1,
@@ -674,13 +630,6 @@ fn retry_attempt_accrual_is_fixed_size_and_projects_exact_usage() {
     );
 }
 
-/// The `sandbox_infrastructure` cause (added alongside `RetryableAttemptCause::
-/// SandboxInfrastructure`, the CT-007 gVisor launch-failure fix) must decode exactly like
-/// `output_persistence` — proving `decode_retry_attempts`'s validation was generalized from a
-/// single hardcoded literal to `RetryableAttemptCause::from_storage_token(...).is_some()` (Sol's
-/// review caught the original hardcoded-cause bug at the persist site; this proves the read-side
-/// validation was fixed too, not just the write side). An unrecognized cause token must still be
-/// rejected as corrupt, never silently accepted.
 #[test]
 fn retry_attempt_accrual_accepts_sandbox_infrastructure_and_rejects_an_unknown_cause() {
     let accrual_with = |cause: &str| {
@@ -717,13 +666,6 @@ fn retry_attempt_accrual_accepts_sandbox_infrastructure_and_rejects_an_unknown_c
     );
 }
 
-/// The write-side construction Sol's review caught hardcoding `OUTPUT_PERSISTENCE_CAUSE`
-/// regardless of `failure.cause` — this test would FAIL if that regressed, unlike the
-/// decode-only tests above (which would still pass against a hardcoded write side, since decoding
-/// never sees what the write side chose not to write). Proves `SandboxInfrastructure` produces
-/// `cause == "sandbox_infrastructure"` in the actual persisted record, and that its receipt
-/// genuinely differs from `OutputPersistence`'s for the identical claim/usage — i.e. the receipt
-/// hash really binds to the cause, not just to fields a hardcoded cause would leave unchanged.
 #[test]
 fn expected_retry_attempt_record_binds_the_actual_cause_not_a_hardcoded_one() {
     let claim = CompletionClaim {
@@ -760,16 +702,11 @@ fn expected_retry_attempt_record_binds_the_actual_cause_not_a_hardcoded_one() {
     assert_eq!(output_persistence.cause, "output_persistence");
     assert_ne!(
         sandbox_infra.receipt, output_persistence.receipt,
-        "the receipt must actually bind to the cause — a reverted hardcoded-cause bug would make \
+        "the receipt must actually bind to the cause - a reverted hardcoded-cause bug would make \
          every cause produce the SAME receipt for identical claim/usage"
     );
 }
 
-/// The canonical cause -> storage-token mapping is the ONE place this is defined (Sol's review
-/// caught a pre-existing bug where the persist site hardcoded `OUTPUT_PERSISTENCE_CAUSE`
-/// regardless of the actual `failure.cause`, silently mislabeling every non-output-persistence
-/// row). Round-tripping both known causes through `as_storage_token`/`from_storage_token` proves
-/// the mapping is bijective and an unknown token maps to `None`, never a default guess.
 #[test]
 fn retryable_attempt_cause_storage_token_round_trips_and_rejects_unknown_tokens() {
     for cause in [
@@ -914,12 +851,6 @@ fn secret_withhold_result_summary_persists_the_machine_reason() {
     );
 }
 
-/// **CT-007 slice 5b.3-6d STEP 4: the thirteen-field `CiJobTokenRequest` ↔ `PreparationReportClaim`
-/// mapping is EXACT (no drop, no reorder).** A canonical request with a DISTINCT value in every field
-/// round-trips through the admission-side projection (`preparation_report_claim`) and the reporter-side
-/// projection (`token_request_from_preparation_report_claim`) byte-identically — so a claim minted at
-/// admission reaches the durable preparation CAS unchanged. Distinct per-field values mean a swapped or
-/// dropped field would break equality.
 #[test]
 fn preparation_report_claim_round_trips_all_thirteen_token_request_fields() {
     let request = CiJobTokenRequest {
@@ -937,7 +868,6 @@ fn preparation_report_claim_round_trips_all_thirteen_token_request_fields() {
         claim_started_at_epoch_secs: 101,
         claim_expires_at_epoch_secs: 404,
     };
-    // Admission-side projection carries each of the thirteen fields UNCHANGED.
     let report_claim = crate::ci_checkout_composition::preparation_report_claim(&request);
     assert_eq!(report_claim.tenant_id, request.tenant_id);
     assert_eq!(report_claim.region, request.region);
@@ -951,7 +881,6 @@ fn preparation_report_claim_round_trips_all_thirteen_token_request_fields() {
     assert_eq!(report_claim.claim_nonce, request.claim_nonce);
     assert_eq!(report_claim.claim_started_at_epoch_secs, request.claim_started_at_epoch_secs);
     assert_eq!(report_claim.claim_expires_at_epoch_secs, request.claim_expires_at_epoch_secs);
-    // Reporter-side projection reconstructs the byte-identical request (round-trip).
     let back = token_request_from_preparation_report_claim(&report_claim);
     assert_eq!(back, request, "the thirteen-field mapping is an exact round-trip");
 }

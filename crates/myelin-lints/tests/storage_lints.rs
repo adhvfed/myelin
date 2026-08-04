@@ -1,19 +1,3 @@
-//! The TWO storage lints, the Storage-relevant slice (P-ST-04 → global P-020).
-//!
-//! P-S11 → P-018 first shipped `forward-only-migration` + `residency-pin` as the substrate-side
-//! generic scanners (the four fixtures `*_migration.{red,green}` / `residency_pin.{red,green}`,
-//! exercised by `fixture_matrix.rs`). The OLTP tier client those two lints CONSTRAIN landed in
-//! P-ST-01 → P-007 (`myelin-storage`). P-ST-04 is the Storage-relevant slice: it SHARPENS the
-//! residency-pin fingerprint to the REAL OLTP constructors (`OltpPool::open(` /
-//! `ColocatedOltp::open(`) and ships the storage-shaped red+green fixtures that prove BOTH lints
-//! reject the storage-specific bug fingerprint and admit the storage-specific correct shape.
-//!
-//! These tests ARE the P-ST-04 fixtures (the TESTS field: "the four fixtures (2 red + 2 green) ARE
-//! the tests"). They run loud over the storage fixtures and assert the exact verdict; the CI-wiring
-//! proof (a storage red fixture ⇒ the `lint-gate` binary exits non-zero, no `|| true` swallow) is
-//! the last test. No threshold is weakened: a lint is never softened to admit a red fixture
-//! (EI-01 §5).
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -30,7 +14,6 @@ fn read_fixture(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("missing fixture {path:?}: {e}"))
 }
 
-/// One storage-lint row: the lint + its storage red fixture + its storage green fixture.
 struct StorageRow {
     lint: fn() -> Lint,
     id: LintId,
@@ -57,7 +40,6 @@ fn storage_matrix() -> Vec<StorageRow> {
 
 #[test]
 fn the_two_storage_lints_reject_their_storage_red_fixtures() {
-    // 2/2 REJECT: each storage red fixture produces >= 1 violation, fired by THAT lint.
     for row in storage_matrix() {
         let lint = (row.lint)();
         let violations = lint.run(&read_fixture(row.red));
@@ -77,7 +59,6 @@ fn the_two_storage_lints_reject_their_storage_red_fixtures() {
 
 #[test]
 fn the_two_storage_lints_admit_their_storage_green_fixtures() {
-    // 2/2 ADMIT: each storage green fixture produces 0 violations from ITS lint.
     for row in storage_matrix() {
         let lint = (row.lint)();
         let violations = lint.run(&read_fixture(row.green));
@@ -93,8 +74,6 @@ fn the_two_storage_lints_admit_their_storage_green_fixtures() {
 
 #[test]
 fn each_storage_red_fixture_trips_exactly_its_own_lint() {
-    // Cross-lint isolation over the storage fixtures: a storage red fixture for lint X is caught by
-    // X and NO OTHER of the twelve (so the whole-set gate attributes the failure correctly).
     for row in storage_matrix() {
         let mut firing: Vec<LintId> = Vec::new();
         let red = read_fixture(row.red);
@@ -116,8 +95,6 @@ fn each_storage_red_fixture_trips_exactly_its_own_lint() {
 
 #[test]
 fn the_full_twelve_set_rejects_each_storage_red_and_admits_each_storage_green() {
-    // The set-level gate (the form CI runs): run() over ALL twelve lints is Err on each storage red
-    // fixture and Ok on each storage green fixture — loud, never swallowed.
     let all = all_twelve();
     for row in storage_matrix() {
         assert!(
@@ -135,9 +112,6 @@ fn the_full_twelve_set_rejects_each_storage_red_and_admits_each_storage_green() 
 
 #[test]
 fn residency_pin_is_sharpened_to_the_real_oltp_constructors() {
-    // The P-ST-04 sharpening proof: the lint now constrains the REAL `myelin-storage` constructors
-    // (`OltpPool::open(` / `ColocatedOltp::open(`), not the P-018 placeholder. A region-less caller
-    // open of either is rejected; pinning a `Region` admits it.
     let red_pool = "let p = OltpPool::open(cfg);";
     let red_coloc = "let db = ColocatedOltp::open(cfg, minter);";
     let green_pool = "let p = OltpPool::open(cfg.region(region));";
@@ -157,10 +131,6 @@ fn residency_pin_is_sharpened_to_the_real_oltp_constructors() {
 
 #[test]
 fn residency_pin_named_floor_waiver_is_loud_and_scoped() {
-    // The named M0-floor waiver (`@residency-cell-pinned`) is a LOUD, REVIEWED waiver (EI-01 §4),
-    // not a weakening. (1) A site-level marker in the comment block above the construction waives
-    // exactly that site. (2) A file-level `@residency-cell-pinned:file` marker waives the M0
-    // pool-model file. (3) A region-less open with NO marker still fires (the lint stays live).
     let site_waived =
         "// @residency-cell-pinned (M0 floor -> P-ST-15)\nlet p = OltpPool::open(cfg);";
     let file_waived =
@@ -182,8 +152,6 @@ fn residency_pin_named_floor_waiver_is_loud_and_scoped() {
 
 #[test]
 fn forward_only_migration_rejects_inplace_rewrite_admits_online_expand() {
-    // The storage migration-shape proof: an in-place `ALTER COLUMN` rewrite / `DROP COLUMN`
-    // contract-before-backfill is rejected; the expand->backfill->contract online shape is admitted.
     let red_inplace = "ALTER TABLE principals ALTER COLUMN email TYPE TEXT;";
     let red_drop = "DROP COLUMN email_old;";
     let green_expand = "ALTER TABLE principals ADD COLUMN email_v2 TEXT;";
@@ -203,10 +171,6 @@ fn forward_only_migration_rejects_inplace_rewrite_admits_online_expand() {
 
 #[test]
 fn ci_gate_exits_non_zero_on_a_storage_red_fixture_and_zero_on_green() {
-    // THE CI-WIRING PROOF (loud, never swallowed — EI-01 §5): the `lint-gate` binary the CI job
-    // runs exits NON-ZERO over a storage red fixture and ZERO over the storage green fixture. A
-    // process whose exit code IS the gate cannot be `|| true`-swallowed. `--no-exclude` disables the
-    // by-design `/fixtures/` exclusion so the fixture is actually scanned.
     let bin = env!("CARGO_BIN_EXE_lint-gate");
     let run_over = |name: &str| -> i32 {
         Command::new(bin)

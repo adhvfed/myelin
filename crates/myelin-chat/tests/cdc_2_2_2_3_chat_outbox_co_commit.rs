@@ -1,20 +1,3 @@
-//! **CHAT-P5 / P-399 — the CONSUMER-side CDC pair for the outbox co-commit Chat's message send
-//! rides: row 2.2 (`OutboxTx::emit` — the only emit path) + row 2.3 (the `outbox` table +
-//! per-aggregate ordering, `UNIQUE(aggregate, seq)`).**
-//!
-//! The PROVIDER is the Bus: the frozen `OutboxTx::emit(draft, cause)` co-commit surface
-//! (`myelin_events::OutboxStore` / `OutboxTransaction`) + the per-aggregate commit-order `seq`
-//! allocation. Chat is the CONSUMER: its `MessageStore::append` / `revise` / `tombstone` co-commit a
-//! real `chat.message.*` event onto the caller's transaction via `emit`, stamping
-//! `aggregate = conversation_id` so per-conversation events stay per-aggregate ordered (the 2.3
-//! ordering key Chat's CHAT-D2 total-order property builds on).
-//!
-//! This file carries BOTH a provider-side and a consumer-side marker (the contract-coverage
-//! scanner's CDC-pair requirement): the PROVIDER shape is the Bus outbox emit surface, exercised
-//! here as the CONSUMER (the chat store) drives it through a real message send. DB-free — the
-//! in-memory `OutboxStore` models the 2.3 table semantics byte-for-byte (the live-Postgres co-commit
-//! leg is `tests/integration_chat_p5_co_commit.rs`, behind the `integration` feature).
-
 use std::sync::Arc;
 
 use myelin_chat::store::{
@@ -66,10 +49,6 @@ fn new_msg(nonce: &str, body: &str) -> NewMessage {
     }
 }
 
-/// **PROVIDER (Bus 2.2) ⇄ CONSUMER (Chat store):** a Chat message send co-commits its
-/// `chat.message.created` event through the frozen `OutboxTx::emit` surface — the message persist
-/// and the event are ONE transaction (emit-iff-committed). The provider's emit surface accepts
-/// Chat's draft; the consumer (the store) is the only emit path (no raw publish).
 #[test]
 fn chat_send_co_commits_via_the_frozen_outbox_emit_surface() {
     let store = MemHotTier::new();
@@ -77,22 +56,16 @@ fn chat_send_co_commits_via_the_frozen_outbox_emit_surface() {
 
     let mut t = tx(&ob, &m);
     let id = store.append(&mut t, new_msg("n0", "hi")).unwrap();
-    // emit-iff-committed: before commit the provider has written nothing.
     assert_eq!(ob.outbox_depth(), 0);
     t.commit().unwrap();
 
     let rows = ob.committed_rows();
     assert_eq!(rows.len(), 1, "exactly one co-committed event");
-    // The CONSUMER stamped a registered durable chat token + the conversation aggregate (2.3).
     assert_eq!(rows[0].envelope.type_.0, "chat.message.created");
     assert_eq!(rows[0].aggregate.0, "01J0CONVCDC");
     assert!(rows[0].subject.0.contains(id.as_str()));
 }
 
-/// **PROVIDER (Bus 2.3) ⇄ CONSUMER (Chat store):** `aggregate = conversation_id`, so a chained
-/// send → edit → erase for one conversation carries monotonic, gap-free, per-aggregate seqs (the
-/// per-conversation total order, contract 2.3 / the CHAT-D2 / D-9 property). The provider allocates
-/// the seq at commit; the consumer supplies the conversation aggregate.
 #[test]
 fn per_conversation_events_are_per_aggregate_ordered() {
     let store = MemHotTier::new();

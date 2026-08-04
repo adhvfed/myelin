@@ -1,10 +1,3 @@
-//! Live PostgreSQL proof for the governed MCP HITL verdict lifecycle: exact-bound approval,
-//! one-shot consumption, approve/reject across fresh routers, and tenant RLS isolation.
-//!
-//! This deliberately uses a structural signer, memory S7/audit, test approvers, and a counting
-//! effect. A single production-composition test spanning secure-file PASETO authentication,
-//! durable delegation/S7, live ReBAC, filesystem Git, and durable outbox remains a named gap;
-//! those components are covered separately rather than overstated as one end-to-end proof here.
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -205,9 +198,6 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
     let now = Timestamp("2026-07-18T00:00:00Z".into());
     let applies = Arc::new(AtomicUsize::new(0));
 
-    // MCP's lazy expiry selector is exact-bound at the SQL mutation boundary. A due row owned by
-    // another shared gate producer must remain waiting while the exact MCP gate expires and emits
-    // its gate-identifying terminal audit.
     let expiry_run = "run:expiry-proof";
     let expiry_agent = "agent:mcp-expiry";
     let expiry_args = serde_json::json!({"repo":"alpha","number":99});
@@ -418,7 +408,6 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         "a consumed approval cannot mutate twice"
     );
 
-    // Two fresh processes racing the same approved durable gate get one authorization grant total.
     let concurrent_gate = match first.call(
         merge,
         &serde_json::json!({"repo":"alpha","number":3}),

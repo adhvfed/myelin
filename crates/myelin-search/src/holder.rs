@@ -1,90 +1,27 @@
-//! Search as a `PersonalDataHolder` (H7 `SearchIndex`) — the STUB surface + the harness
-//! auto-registration (SRCH-P02 / P-122; contract 10.1 + 1.4).
-//!
-//! **Architecture:** search-and-indexing.md §1 ("Search is a true holder whose `erase` is a real
-//! purge"), §3.4 (the per-tenant residency-pinned index tier — ONE index store), §4.8 (the holder
-//! surface `locate/export/rectify/restrict/erase`; the crypto-shred layering: the per-tenant index
-//! DEK is the tenant-decommission shred unit + the backup/immutable-segment backstop; the
-//! **PRIMARY** per-subject erasure is **purge + reindex**, landing in SRCH-P15). The exhaustive
-//! H1–H18 catalog ([`myelin_substrate::Holder`]) names Search **H7 (`SearchIndex`)**.
-//!
-//! ## The ONE Search store (the holder's surface)
-//! Search owns exactly ONE store — the **per-tenant index** (§3.4: full-text-inverted +
-//! structured/columnar + vector HNSW, all in one `(tenant, region)`-keyed, doc-id space). Its
-//! [`myelin_substrate::StoreKind::SearchIndex`] class classifies **structurally** to
-//! [`myelin_substrate::Holder::H7SearchIndex`] (gdpr §3.2: ONE platform-wide search-index holder —
-//! no per-store `StoreClassifier` declaration is needed, exactly like blob→H6 / cache→H9). Search
-//! holds **only derived, reconstructible** state (architecture §0/§1); the export source of truth
-//! is always the owning subsystem, never the index.
-//!
-//! ## Why a STUB surface here (the registration / empty-index path) + the REAL mechanism (SRCH-P15)
-//! This [`SearchIndexHolder`] is the **registration / empty-index** holder: it is what `serve` opens
-//! at boot (the per-tenant index store auto-registers as H7 through the harness's one door) BEFORE any
-//! tenant has an index. Over an empty surface its bodies are **empty-but-correct** (a tenant with no
-//! index has no located docs/vectors; `erase` is a well-defined no-op — nothing to purge).
-//!
-//! The **REAL erase mechanism** — `locate` → docs/fields/vectors referencing the subject; `erase` →
-//! **PURGE + REINDEX** (delete the docs, tombstone+compact the vectors via the live consumer path,
-//! §4.8); `restrict` → suppress indexing/RAG/notification; the **HYOK structural skip** — shipped in
-//! **SRCH-P15** ([`crate::erase::SearchEraseHolder`], P-178): it wraps a LIVE
-//! [`crate::indexer::IncrementalIndexer`] and is the holder the DSR fan-out reaches once a tenant has
-//! an index. The per-tenant index DEK that crypto-shreds the whole tenant index on decommission +
-//! backstops backups is reserved by [`crate::dek`]. The point of registering through THIS stub at
-//! boot: the M5 DSAR fan-out cannot silently miss Search (10.1 exhaustiveness), whether or not a
-//! given tenant has yet built an index.
-
 use myelin_gdpr::{
     EraseReceipt, EraseScope, LocateReport, Patch, PersonalDataHolder, PortableBundle, Receipt,
     RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef, TenantId,
 };
 use myelin_substrate::{classify_store, Holder, HolderRegistration, HolderRegistry, StoreKind};
 
-/// The stable, PII-free name of the Search **per-tenant index** store (the holder's H7 store).
-/// Frozen here so the SRCH-P03 index layout, the data-map (P-GA-09), and the DSR fan-out all
-/// address exactly this store. PII-free: a store identifier, never personal data.
 pub const SEARCH_INDEX_STORE: &str = "search_index";
 
-/// The typed receipt that the Search store was auto-registered as a [`PersonalDataHolder`] — the
-/// proof the registration fired (mirrors `myelin_substrate::HolderRegistration`). The harness
-/// collects these; the holder-registered architecture test reads them to assert the Search index
-/// did not escape registration. PII-free: a (kind, name) tag.
 pub type SearchHolderRegistration = HolderRegistration;
 
-/// **Register Search's (future) index store as a `PersonalDataHolder` through the harness
-/// auto-registration (contract 1.4).** Opens the per-tenant index store through the substrate
-/// [`HolderRegistry`] — the ONE door — so it is a registered holder by construction. Returns the
-/// registry (carrying the receipt) so a caller / test can assert exactly which store registered +
-/// that it classifies to its H-holder (H7 search index).
-///
-/// At M1 this is the REGISTRATION only — `serve` will open the real index store (re-running this
-/// exact classification) when the encrypted-from-birth layout lands (SRCH-P03+); registering now
-/// makes "the DSAR fan-out forgot Search" structurally impossible (10.1 exhaustiveness). The
-/// search index classifies STRUCTURALLY (kind=SearchIndex → H7), so no `StoreClassifier`
-/// declaration is required (gdpr §3.2 — one platform-wide search-index holder).
 pub fn register_search_holder() -> HolderRegistry {
     let mut registry = HolderRegistry::new();
-    // The per-tenant index store (H7) — classifies structurally by its SearchIndex kind.
     registry.open(StoreKind::SearchIndex, SEARCH_INDEX_STORE);
     registry
 }
 
-/// Search's **per-tenant index** AS a [`PersonalDataHolder`] (H7; contract 10.1). At M1 a STUB:
-/// no index exists, so `locate`/`export` return **empty-but-correct** receipts (a tenant with no
-/// index has no located docs/vectors), `restrict`/`rectify` are well-defined no-ops, and `erase`
-/// is a no-op (nothing to purge) — each returning a content-addressed receipt. The REAL bodies
-/// (purge + reindex; vectors compacted; restrict suppression) land in SRCH-P15 (§4.8).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct SearchIndexHolder;
 
 impl SearchIndexHolder {
-    /// Register this holder through the substrate registry (the `serve`-called auto-registration
-    /// seam), returning the receipt — the proof the index store registered as holder H7.
     pub fn register(&self, registry: &mut HolderRegistry) -> SearchHolderRegistration {
         registry.open(StoreKind::SearchIndex, SEARCH_INDEX_STORE)
     }
 
-    /// The opaque, PII-free subject id the receipt body keys on (the pseudonymous Principal id) —
-    /// never a name/email. This is the `<pseudonym>@<tenant>.noreply` posture (§4.8 / EI-04 §1).
     fn subject_id(subject: &SubjectRef) -> String {
         subject.principal.principal_id.0.clone()
     }
@@ -92,9 +29,6 @@ impl SearchIndexHolder {
 
 impl PersonalDataHolder for SearchIndexHolder {
     fn locate(&self, subject: &SubjectRef, tenant: TenantId) -> DsrResult<LocateReport> {
-        // EMPTY-BUT-CORRECT: no index exists, so the subject has no located Search data. The
-        // receipt attests the locate completed over an empty surface (NOT an error — the holder is
-        // a real, callable stub). The real doc/field/vector walk lands in SRCH-P15.
         Ok(LocateReport {
             receipt: Receipt::content_addressed(
                 "locate",
@@ -109,16 +43,13 @@ impl PersonalDataHolder for SearchIndexHolder {
     }
 
     fn export(&self, subject: &SubjectRef, tenant: TenantId) -> DsrResult<PortableBundle> {
-        // EMPTY-BUT-CORRECT: an empty portable bundle. The index is DERIVED + reconstructible
-        // (architecture §0/§1) — it is NEVER the export source of truth (the owning subsystem is);
-        // an export over the index is empty by design, here doubly so (no index exists yet).
         Ok(PortableBundle {
             receipt: Receipt::content_addressed(
                 "export",
                 SEARCH_INDEX_STORE,
                 &Self::subject_id(subject),
                 &tenant.0,
-                "empty-bundle (SRCH-P02 stub: index derived/reconstructible — never the export source)",
+                "empty-bundle (SRCH-P02 stub: index derived/reconstructible - never the export source)",
                 None,
                 0,
             ),
@@ -126,8 +57,6 @@ impl PersonalDataHolder for SearchIndexHolder {
     }
 
     fn rectify(&self, subject: &SubjectRef, _patch: Patch) -> DsrResult<RectifyReceipt> {
-        // The index is derived; rectification is via reindex-from-source over the corrected
-        // projection (§4.9), a no-op now (no index). The real rectify-by-reindex lands in SRCH-P15.
         Ok(RectifyReceipt {
             receipt: Receipt::content_addressed(
                 "rectify",
@@ -142,10 +71,6 @@ impl PersonalDataHolder for SearchIndexHolder {
     }
 
     fn restrict(&self, subject: &SubjectRef, on: bool) -> DsrResult<RestrictReceipt> {
-        // Restriction (Art. 18/21) suppresses indexing/RAG/analytics/notification for the subject
-        // pending erasure (§4.8 — the suppression the X-7 posture relies on). No index exists yet —
-        // a well-defined no-op now; the real suppression into the index lands in GA-D7 (P-152) /
-        // SRCH-P15 once the index exists.
         Ok(RestrictReceipt {
             receipt: Receipt::content_addressed(
                 "restrict",
@@ -160,12 +85,6 @@ impl PersonalDataHolder for SearchIndexHolder {
     }
 
     fn erase(&self, scope: EraseScope) -> DsrResult<EraseReceipt> {
-        // No-op purge over an EMPTY surface: this registration-path holder has no live index, so there
-        // is nothing to purge or compact. The REAL structural erasure — PURGE + REINDEX (delete
-        // docs/fields, tombstone+compact vectors via the live consumer path, §4.8) — is shipped in
-        // SRCH-P15 ([`crate::erase::SearchEraseHolder`]), which wraps a LIVE indexer. The per-tenant
-        // index DEK (crate::dek) crypto-shreds the whole tenant index on decommission + backstops
-        // backups; the per-subject PRIMARY erasure is the purge + reindex SearchEraseHolder performs.
         let (subject_id, tenant) = match &scope {
             EraseScope::Subject { subject, tenant } => {
                 (Self::subject_id(subject), tenant.0.clone())
@@ -186,12 +105,7 @@ impl PersonalDataHolder for SearchIndexHolder {
     }
 }
 
-/// The H-holder the Search index store classifies to (H7 `SearchIndex`) — a convenience over
-/// [`classify_store`] for the structural classification of the ONE Search store. Returns the
-/// holder (always `Some(H7SearchIndex)` for the SearchIndex kind, gdpr §3.2) so a caller can pin
-/// the classification without rebuilding an empty `StoreClassifier`.
 pub fn search_index_holder() -> Option<Holder> {
-    // SearchIndex classifies structurally — no per-store declaration needed (gdpr §3.2).
     classify_store(
         StoreKind::SearchIndex,
         SEARCH_INDEX_STORE,
@@ -217,9 +131,6 @@ mod tests {
         TenantId::from_token("acme")
     }
 
-    /// **Search registers its index store as a holder through the one door (contract 1.4).** The
-    /// per-tenant index is opened through the substrate registry, so it is a registered holder by
-    /// construction — 0 stores escape registration.
     #[test]
     fn search_registers_its_index_store_as_a_holder() {
         let registry = register_search_holder();
@@ -231,8 +142,6 @@ mod tests {
         );
     }
 
-    /// **Re-registration is idempotent** — `serve` re-running the registration on a restart records
-    /// the Search store exactly once (the registry is idempotent on (kind, name)).
     #[test]
     fn re_registration_is_idempotent() {
         let mut registry = register_search_holder();
@@ -244,10 +153,6 @@ mod tests {
         );
     }
 
-    /// **The Search store classifies to H7 — 0 orphans (contract 1.4 + gdpr §3.2).** The index
-    /// store maps structurally to **H7 (`SearchIndex`)** (kind=SearchIndex). The substrate
-    /// completeness assertion is GREEN — the Search store is inside the exhaustive H1–H18 list, so
-    /// the M5 DSAR fan-out cannot miss Search.
     #[test]
     fn search_store_classifies_to_h7_no_orphan() {
         let registry = register_search_holder();
@@ -256,19 +161,13 @@ mod tests {
             Some(Holder::H7SearchIndex),
             "the per-tenant index is holder H7"
         );
-        // An empty classifier suffices — the search index classifies structurally, never via a
-        // per-store OLTP declaration (gdpr §3.2). The completeness assertion is GREEN.
         assert_eq!(
             assert_holder_completeness(registry.registrations(), &Default::default()),
             Ok(()),
-            "the Search index store is in the exhaustive H1–H18 list — 0 orphan stores"
+            "the Search index store is in the exhaustive H1–H18 list - 0 orphan stores"
         );
     }
 
-    /// **The holder stub returns empty-but-correct `locate`/`export` for a tenant with no index
-    /// (the SRCH-P02 TESTS requirement).** No index exists, so the subject has no located Search
-    /// data — the holder responds with a content-addressed receipt over an EMPTY surface (NOT an
-    /// error; it is a real, callable stub). The bodies are deterministic + PII-free.
     #[test]
     fn holder_stub_returns_empty_but_correct_locate_and_export() {
         let holder = SearchIndexHolder;
@@ -290,10 +189,6 @@ mod tests {
         assert!(export.receipt.content_hash.starts_with("blake3:"));
     }
 
-    /// **`erase` is a well-defined no-op now (nothing to purge) returning a receipt — never a
-    /// panic.** The stub names its SRCH-P15 follow-on (purge+reindex, the PRIMARY erasure) in the
-    /// outcome (a named floor, not a hidden gap). Idempotent: the same scope yields the same
-    /// content-addressed receipt.
     #[test]
     fn holder_stub_erase_is_a_no_op_receipt_and_idempotent() {
         let holder = SearchIndexHolder;
@@ -315,8 +210,6 @@ mod tests {
         );
     }
 
-    /// **`restrict` is a well-defined no-op now** (no index to suppress) — the suppression the X-7
-    /// posture relies on (§4.8) lands in SRCH-P15 / GA-D7. Both `on` and `off` succeed.
     #[test]
     fn holder_stub_restrict_surface() {
         let holder = SearchIndexHolder;
@@ -331,8 +224,6 @@ mod tests {
         );
     }
 
-    /// **The holder is object-safe** — held behind `dyn PersonalDataHolder` exactly as the DSR
-    /// orchestrator / holder registry need (a heterogeneous holder set, contract 10.1).
     #[test]
     fn holder_is_object_safe() {
         let holders: Vec<Box<dyn PersonalDataHolder>> = vec![Box::new(SearchIndexHolder)];

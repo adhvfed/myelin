@@ -1,19 +1,3 @@
-//! # CDC: Knowledge's FULL `replay(scope)` reindex-from-source (contract 2.6) — KN-P20 / P-310, M3
-//!
-//! **Contract:** `contract-index.md` row **2.6** (`events::reindex(scope)` → owner `replay(scope,
-//! since)` emits `*.snapshot` via the OUTBOX through the LIVE consumer; sub-artifact-granular). The
-//! Bus's reference cold==live (BUS-D5) + the content-crate page/block body (P-246) are pinned by
-//! `myelin-content`'s `cdc_2_9_2_6_...`; this CDC pins the SERVICE crate's FULL surface (KN-D6): the
-//! `knowledge.row.snapshot` row leg + the `refs.edge.snapshot` TE-7 drift-correction (§3.1) the
-//! content crate could not ship, off the real service stores.
-//!
-//! **The contract pair:** PROVIDER (producer) = `myelin_knowledge::replay::KnowledgeReindexSource`
-//! (the owner's `replay`); CONSUMER = `myelin_events::DerivedStore::ingest` (the live consumer path Search/Refs/
-//! OLAP read-models are). The pair proves: (a) the rebuild uses the LIVE consumer path ONLY — never
-//! an owner-DB read; (b) cold == live byte-for-byte; (c) a re-run is idempotent on the deterministic
-//! `(aggregate, version)` id; (d) the `refs.edge.snapshot` token is the FROZEN wire string the Refs
-//! reindexer ingests.
-
 use myelin_events::{
     reindex, snapshot_event_id, validate_event_type, Actor, AggregateKey, CorrelationId,
     DerivedStore, EmitContextBase, EventEnvelope, OutboxStore, Region, ReindexSource,
@@ -66,7 +50,6 @@ fn snapshot_envelope(draft: &SnapshotDraft) -> EventEnvelope {
     }
 }
 
-/// A full Knowledge derived-state surface: a page (with blocks), rows, and TE-7 typed edges.
 fn full_source() -> KnowledgeReindexSource {
     let mut s = KnowledgeReindexSource::new();
     s.upsert_page(
@@ -110,22 +93,16 @@ fn full_source() -> KnowledgeReindexSource {
     s
 }
 
-/// **CDC 2.6 (a): the rebuild is THROUGH the live consumer path only, and cold == live byte-for-byte
-/// over the FULL surface (page+block+row+edge).** The producer's `replay` re-emits `*.snapshot`
-/// drafts; the consumer (`DerivedStore::ingest`) materialises them; a wiped store rebuilt ONLY from
-/// the reindex outbox re-emit matches the live projection byte-for-byte (the reindex-parity hash).
 #[test]
 fn cdc_2_6_full_surface_rebuilds_cold_equals_live_via_the_live_consumer_only() {
     let s = full_source();
     let scope = SnapshotScope::new("knowledge", "all");
 
-    // LIVE projection (the consumer ingesting the owner's events).
     let mut live = DerivedStore::new();
     for draft in s.replay(&scope, None) {
         live.ingest(&snapshot_envelope(&draft));
     }
 
-    // COLD: wiped, rebuilt ONLY from the reindex re-emit through the OUTBOX (the live path).
     let sources: &[&dyn ReindexSource] = &[&s];
     let mut outbox = OutboxStore::new();
     reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
@@ -144,13 +121,10 @@ fn cdc_2_6_full_surface_rebuilds_cold_equals_live_via_the_live_consumer_only() {
     assert_eq!(
         cold.parity_bytes(),
         live.parity_bytes(),
-        "CDC 2.6: cold == live (the reindex-parity hash matches) — one code path, no drift"
+        "CDC 2.6: cold == live (the reindex-parity hash matches) - one code path, no drift"
     );
 }
 
-/// **CDC 2.6 (b): the re-emit is idempotent on the deterministic `(aggregate, version)` id.** A
-/// second reindex of the same scope at the same versions emits 0 NEW snapshots (the outbox
-/// `UNIQUE(event_id)` no-ops the duplicate) — a partial reindex that is retried converges.
 #[test]
 fn cdc_2_6_reindex_rerun_is_idempotent() {
     let s = full_source();
@@ -175,11 +149,6 @@ fn cdc_2_6_reindex_rerun_is_idempotent() {
     );
 }
 
-/// **CDC 2.6 (c): the `refs.edge.snapshot` TE-7 drift-correction token is the FROZEN wire string the
-/// Refs reindexer ingests + grammatical.** Knowledge produces the SAME `refs.edge.snapshot` token
-/// `myelin_refs_service::reindex::REFS_EDGE_SNAPSHOT_TYPE` ingests — it does NOT author a second
-/// vocabulary. (The const is mirrored, not depended-on, per the refs_glue `REFS_EDGE_CREATED`
-/// precedent; this CDC pins the byte-equivalence.)
 #[test]
 fn cdc_2_6_refs_edge_snapshot_token_is_the_frozen_wire_string() {
     assert_eq!(
@@ -191,7 +160,6 @@ fn cdc_2_6_refs_edge_snapshot_token_is_the_frozen_wire_string() {
         "grammatical under the Bus §6 grammar"
     );
 
-    // The drift-correction re-emits the typed edges under this exact token.
     let s = full_source();
     let drafts = s.drift_correct_edges(None);
     assert_eq!(drafts.len(), 2, "both TE-7 typed edges re-emitted");
@@ -201,8 +169,6 @@ fn cdc_2_6_refs_edge_snapshot_token_is_the_frozen_wire_string() {
     );
 }
 
-/// **CDC 2.6 (d): the deterministic snapshot id is a pure function of `(aggregate, version)`** — the
-/// idempotency key both the outbox and the consumer dedup off, identical to the Bus seam's.
 #[test]
 fn cdc_2_6_snapshot_id_is_deterministic_matching_the_bus_seam() {
     let a = AggregateKey("myelin://acme/knowledge/row/task-1".into());

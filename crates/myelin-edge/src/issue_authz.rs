@@ -1,10 +1,3 @@
-//! Production composition adapter for the Issues authorization-bootstrap saga.
-//!
-//! Issues cannot depend on the Identity service crate without creating a subsystem/service cycle.
-//! The edge already composes both leaves, so this module binds the exact staged tuple intent to the
-//! durable Identity `TupleStore`. The synchronous Identity ABI is isolated on Tokio's blocking pool;
-//! no database/RPC bridge blocks an async request or recovery-worker executor thread.
-
 use myelin_events::Timestamp;
 use myelin_identity::{
     Consistency, ConsistencyMode, DataRole, Decision, IdentityService, ObjectId, Permission,
@@ -28,7 +21,6 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
-/// Required, explicit tenant partitions owned by this cell's Issues reconciler.
 pub const ISSUE_RECONCILE_TENANTS_ENV: &str = "MYELIN_ISSUES_RECONCILE_TENANTS";
 const ISSUE_RECONCILE_BATCH_ENV: &str = "MYELIN_ISSUES_RECONCILE_BATCH";
 const ISSUE_RECONCILE_INTERVAL_MS_ENV: &str = "MYELIN_ISSUES_RECONCILE_INTERVAL_MS";
@@ -37,11 +29,6 @@ const DEFAULT_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_MAX_BACKOFF_MS: u64 = 60_000;
 const MAX_TENANTS_PER_SWEEP: usize = 32;
 
-/// Production Issue authorization over the exact durable Identity engine composed by the edge.
-///
-/// Object checks are strong and admit only an explicit `Allow`. List authorization consumes
-/// the exact effective `issue:view` SetExpr. PgIssueStore binds that frozen shape to the durable
-/// projection watermark; this adapter never consults the process-local reverse index for lists.
 #[derive(Clone)]
 pub struct StoreBackedIssueAuthorizer {
     identity: StoreBackedCheck,
@@ -86,8 +73,6 @@ impl IssueAuthorizer for StoreBackedIssueAuthorizer {
     ) -> bool {
         let permission = match permission {
             IssuePermission::View => "view",
-            // Close is a lifecycle transition. The frozen Issues fragment admits an assignee or
-            // a project viewer; `manage` would incorrectly exclude the assignee-only arm.
             IssuePermission::Close => "transition",
         };
         self.allows(principal, permission, format!("issue:{issue_id}"))
@@ -98,7 +83,6 @@ impl IssueAuthorizer for StoreBackedIssueAuthorizer {
     }
 }
 
-/// Validated, bounded production cadence for the restart scanner.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueReconciliationConfig {
     tenants: Vec<TenantId>,
@@ -159,8 +143,6 @@ impl IssueReconciliationConfig {
         })
     }
 
-    /// Parse the production worker contract. The tenant list is deliberately required: the runtime
-    /// PostgreSQL role is FORCE-RLS constrained and may not discover or scan another tenant's rows.
     pub fn from_env(region: Region) -> Result<Self, String> {
         let raw = std::env::var(ISSUE_RECONCILE_TENANTS_ENV).map_err(|_| {
             format!(
@@ -212,7 +194,6 @@ fn parse_env_u64(name: &str, default: u64) -> Result<u64, String> {
         .map(|value| value.unwrap_or(default))
 }
 
-/// One bounded sweep's PII-free operational result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IssueReconciliationReport {
     pub pending_seen: u64,
@@ -241,8 +222,6 @@ impl IssueAuthorizationSweeper for PgIssueAuthorizationSweeper {
     fn sweep<'a>(&'a self) -> Pin<Box<dyn Future<Output = IssueReconciliationReport> + Send + 'a>> {
         Box::pin(async move {
             let mut report = IssueReconciliationReport::default();
-            // Bound both dimensions: at most 32 FORCE-RLS partitions and `batch_limit` rows from
-            // each. The rotating cursor keeps a busy first partition from starving later tenants.
             let tenant_count = self.workers.len();
             let partitions = tenant_count.min(MAX_TENANTS_PER_SWEEP);
             let start = self
@@ -301,7 +280,6 @@ impl IssueAuthorizationSweeper for PgIssueAuthorizationSweeper {
     }
 }
 
-/// Lock-free counters suitable for the edge's metrics/health adapter.
 #[derive(Default)]
 pub struct IssueReconciliationMetrics {
     sweeps: AtomicU64,
@@ -363,8 +341,6 @@ impl IssueReconciliationMetrics {
     }
 }
 
-/// Owned background task. Shutdown is explicit and awaited; dropping the handle also closes the
-/// watch channel, causing the task to exit at its next select point.
 pub struct IssueReconciliationHandle {
     shutdown: watch::Sender<bool>,
     join: JoinHandle<()>,
@@ -386,9 +362,6 @@ impl IssueReconciliationHandle {
     }
 }
 
-/// Spawn the production restart scanner. The first bounded sweep runs immediately at boot; later
-/// sweeps follow the configured cadence. Any failure backs off exponentially (bounded), while a
-/// clean sweep resets the normal cadence. Pending state remains durable and invisible throughout.
 pub fn spawn_issue_authorization_reconciler(
     store: Arc<PgIssueStore<StoreBackedIssueAuthorizer>>,
     identity: StoreBackedCheck,
@@ -498,7 +471,6 @@ fn next_reconciliation_delay(
     }
 }
 
-/// Concrete production adapter over the same durable tuple store used by Identity checks.
 #[derive(Clone)]
 pub struct IdentityIssueTupleWriter {
     tuples: TupleStore,
@@ -509,16 +481,11 @@ impl IdentityIssueTupleWriter {
         Self { tuples }
     }
 
-    /// Build from the live Identity engine so writes and authorization reads cannot accidentally
-    /// use parallel tuple stores.
     pub fn from_identity(identity: &StoreBackedCheck) -> Self {
         Self::new(identity.tuples().clone())
     }
 }
 
-/// Drive one bounded restart-recovery batch through the concrete Identity adapter. Individual
-/// failures remain pending and are returned to the caller for metrics/backoff; one unavailable
-/// object cannot prevent the rest of the tenant/region batch from converging.
 pub async fn reconcile_pending_issue_authorizations<A: IssueAuthorizer>(
     store: &PgIssueStore<A>,
     identity: &StoreBackedCheck,

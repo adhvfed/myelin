@@ -1,4 +1,3 @@
-//! Live PostgreSQL proof for the R4.4 fail-closed Issue/Identity authorization saga.
 #![cfg(feature = "integration")]
 
 use myelin_config::{Mode, MyelinConfig};
@@ -71,8 +70,6 @@ impl IssueAuthorizer for RebacAuthorizer {
         self.allows(principal, permission, format!("issue:{issue_id}"))
     }
 
-    // The test deliberately makes the SQL active-binding join, rather than an Identity allow-set,
-    // carry the list proof. Object reads above still use the real ReBAC engine.
     fn visible_issues(&self, _principal: &Principal) -> Result<VisibleIssues, String> {
         Ok(VisibleIssues::effective_issue_view_filter())
     }
@@ -222,7 +219,6 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .await
         .expect("admin inspection connection");
 
-    // The exact production transaction rolls back the row, prefix allocation, binding and outbox.
     assert!(store
         .create_then_abort_for_test(&creator, proposal("RBK", "must roll back"))
         .await
@@ -281,7 +277,6 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         "a restart scanner can recover every staged pending binding"
     );
 
-    // Persist only a machine class, never arbitrary RPC/Identity text.
     assert!(matches!(
         store
             .reconcile_authorization(&worker, &staged.id, &SecretFailureWriter)
@@ -299,7 +294,6 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     .unwrap();
     assert_eq!(last_error, "identity_tuple_write_failed");
 
-    // Crash after Identity commit: tuple exists, but product reads remain fail-closed until retry.
     assert!(store
         .reconcile_then_crash_for_test(&worker, &staged.id, &writer)
         .await
@@ -316,7 +310,6 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         Err(IssueStoreError::AuthorizationUnavailable(_))
     ));
 
-    // Reconstruct the store as a process restart would, then retry the exact persisted intent.
     let restarted = PgIssueStore::new(provider.clone(), kms, authorizer.clone());
     let activated = restarted
         .reconcile_authorization(&worker, &staged.id, &writer)
@@ -340,8 +333,6 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         staged.id
     );
 
-    // Persisted event IDs are canonical ULIDs, created is emitted once, PII-free, and attributes
-    // the original creator rather than the reconciliation worker.
     let binding = sqlx::query(
         "SELECT request_event_id, created_event_id FROM issue_authz_binding \
          WHERE tenant_id = $1 AND region = 'fr-par' AND issue_id = $2::uuid",
@@ -376,7 +367,6 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     .unwrap();
     assert_eq!(created_count, 1);
 
-    // Concurrent reconcilers may repeat the idempotent Identity Add, but only one CAS emits created.
     let raced = restarted
         .create(&creator, proposal("RCE", "concurrent bootstrap"))
         .await
@@ -428,7 +418,6 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     .unwrap();
     assert_eq!(race_created, 1);
 
-    // Rollout audit: a pre-existing row with no reviewed binding remains present but invisible.
     let legacy_id = sqlx::types::Uuid::new_v4();
     sqlx::query(
         "INSERT INTO issue (tenant_id, region, id, key, prefix, type_id, type_rank, state, \
@@ -466,7 +455,6 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .unwrap()
         .contains(&legacy_id.to_string()));
 
-    // Exact test-tenant cleanup; binding first because it references issue.
     for statement in [
         "DELETE FROM issue_authz_binding WHERE tenant_id = $1",
         "DELETE FROM issue WHERE tenant_id = $1",

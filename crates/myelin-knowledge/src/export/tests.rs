@@ -1,6 +1,3 @@
-//! Unit tests for the Export/Import service (KN-P24 / P-314) — the lossless JSON round-trip, the
-//! Markdown/HTML/PDF/CSV exporters, and the ADF lossy-map import report.
-
 use super::*;
 use crate::database::FieldDef;
 use myelin_content::{
@@ -17,8 +14,6 @@ fn para(md: &str) -> Block {
     }
 }
 
-/// A rich document exercising many of the frozen block variants + nested structure + inline marks +
-/// a structured node — the round-trip fixture.
 fn rich_doc() -> ExportDoc {
     let nodes = vec![InlineNode::ArtifactRefNode(ArtifactRef(
         "myelin://acme/issues/issue/PROJ-1".into(),
@@ -108,7 +103,6 @@ fn rich_doc() -> ExportDoc {
                 },
             ),
             ExportBlock::leaf("b9", Block::Divider),
-            // a paragraph carrying a structured ref node (positional bind)
             ExportBlock::leaf(
                 "b10",
                 Block::Paragraph {
@@ -118,8 +112,6 @@ fn rich_doc() -> ExportDoc {
         ],
     )
 }
-
-// ── lossless JSON (Art. 20, 10.1) ───────────────────────────────────────────────────────────
 
 #[test]
 fn lossless_json_roundtrips_byte_faithful() {
@@ -134,7 +126,6 @@ fn lossless_json_roundtrips_byte_faithful() {
 
 #[test]
 fn json_roundtrip_gate_is_green() {
-    // THE round-trip gate: structural identity AND render(parse(md))===md across the boundary.
     let doc = rich_doc();
     assert!(
         doc.json_roundtrips(),
@@ -146,7 +137,6 @@ fn json_roundtrip_gate_is_green() {
 fn structured_nodes_survive_the_json_roundtrip() {
     let doc = rich_doc();
     let back = ExportDoc::from_json_bundle(&doc.to_json_bundle()).unwrap();
-    // b10 carries one ArtifactRefNode; it must survive positionally.
     let b10 = back
         .all_blocks()
         .into_iter()
@@ -182,8 +172,6 @@ fn code_block_text_is_verbatim_across_roundtrip() {
     }
 }
 
-// ── the markdown exporter ───────────────────────────────────────────────────────────────────
-
 #[test]
 fn markdown_exporter_renders_blocks() {
     let md = rich_doc().to_markdown();
@@ -200,8 +188,6 @@ fn markdown_exporter_renders_blocks() {
     assert!(md.contains("| Name | Role |"), "table header: {md}");
     assert!(md.contains("---"), "divider/table separator: {md}");
 }
-
-// ── the HTML exporter ───────────────────────────────────────────────────────────────────────
 
 #[test]
 fn html_exporter_is_a_self_contained_document() {
@@ -223,7 +209,6 @@ fn html_exporter_is_a_self_contained_document() {
         html.contains("<pre><code class=\"language-rust\">"),
         "code block lang class"
     );
-    // code content is HTML-escaped (the `*` survives literally, no element injection)
     assert!(
         html.contains("let x = **not bold**;"),
         "code escaped verbatim: {html}"
@@ -251,8 +236,6 @@ fn html_escapes_dangerous_content() {
         "body escaped: {html}"
     );
 }
-
-// ── the PDF exporter ────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn pdf_exporter_emits_a_valid_pdf() {
@@ -289,8 +272,6 @@ fn pdf_escapes_parens_in_text() {
         "parens escaped in the title literal: missing in {s:?}"
     );
 }
-
-// ── the CSV exporter (flexible DB) ──────────────────────────────────────────────────────────
 
 fn schema() -> FieldSchema {
     FieldSchema::of(vec![
@@ -342,7 +323,6 @@ fn csv_quotes_special_characters_rfc4180() {
 fn csv_absent_field_is_empty_cell() {
     let mut props: BTreeMap<FieldId, FieldValue> = BTreeMap::new();
     props.insert(FieldId::new("name"), FieldValue::Text("Only".into()));
-    // count + active absent
     let r = DbRow::new("r", props, OrderKey::bisect(None, None));
     let csv = export_rows_to_csv(&schema(), &[r]);
     let data = csv.lines().nth(1).unwrap();
@@ -352,15 +332,13 @@ fn csv_absent_field_is_empty_cell() {
     );
 }
 
-// ── the ADF lossy-map import (13.2) ─────────────────────────────────────────────────────────
-
 #[test]
 fn adf_import_lossless_document_records_nothing() {
     let nodes = [
         ParsedAdfNode::resolved(AdfNode::Heading, "Title"),
         ParsedAdfNode::resolved(AdfNode::Paragraph, "Some body text"),
         ParsedAdfNode::resolved(AdfNode::BulletList, "an item"),
-        ParsedAdfNode::resolved(AdfNode::Expand, "details"), // → toggle, lossless
+        ParsedAdfNode::resolved(AdfNode::Expand, "details"),
     ];
     let result = import_adf("p1", "Imported", &nodes);
     assert!(
@@ -368,7 +346,6 @@ fn adf_import_lossless_document_records_nothing() {
         "a direct-equivalent import records no loss"
     );
     assert_eq!(result.doc.blocks.len(), 4, "every node becomes a block");
-    // the heading became a heading, the paragraph a paragraph
     assert!(matches!(result.doc.blocks[0].block, Block::Heading { .. }));
     assert!(matches!(
         result.doc.blocks[1].block,
@@ -380,10 +357,10 @@ fn adf_import_lossless_document_records_nothing() {
 #[test]
 fn adf_import_records_each_lossy_conversion() {
     let nodes = [
-        ParsedAdfNode::unresolved(AdfNode::Mention, "external-user"), // → plain text (recorded)
-        ParsedAdfNode::resolved(AdfNode::Status, "In Progress"),      // always → code (recorded)
-        ParsedAdfNode::resolved(AdfNode::Extension, "jira-macro"), // macro → callout+marker (recorded)
-        ParsedAdfNode::resolved(AdfNode::Paragraph, "ok"),         // lossless (not recorded)
+        ParsedAdfNode::unresolved(AdfNode::Mention, "external-user"),
+        ParsedAdfNode::resolved(AdfNode::Status, "In Progress"),
+        ParsedAdfNode::resolved(AdfNode::Extension, "jira-macro"),
+        ParsedAdfNode::resolved(AdfNode::Paragraph, "ok"),
     ];
     let result = import_adf("p1", "Imported", &nodes);
     assert_eq!(
@@ -398,7 +375,6 @@ fn adf_import_records_each_lossy_conversion() {
     );
     assert_eq!(result.report.conversions[1].node, AdfNode::Status);
     assert_eq!(result.report.conversions[2].node, AdfNode::Extension);
-    // the macro degraded to a callout(note) carrying the marker (named, not silent)
     match &result.doc.blocks[2].block {
         Block::Callout { tone, blocks } => {
             assert_eq!(*tone, CalloutTone::Note);
@@ -421,7 +397,6 @@ fn adf_import_records_each_lossy_conversion() {
 
 #[test]
 fn adf_import_conditional_node_is_lossless_when_resolved() {
-    // The SAME mention, when it resolves in-tenant, survives as a structured node (no loss).
     let resolved = import_adf(
         "p",
         "t",
@@ -446,8 +421,6 @@ fn adf_import_conditional_node_is_lossless_when_resolved() {
 
 #[test]
 fn adf_import_degraded_content_survives_not_dropped() {
-    // An unresolved mention degrades to plain text — the loss is recorded BUT the @name text is
-    // never silently dropped (EI-04 §4 named, never silent).
     let r = import_adf(
         "p",
         "t",
@@ -469,7 +442,6 @@ fn adf_import_degraded_content_survives_not_dropped() {
 
 #[test]
 fn adf_imported_doc_json_roundtrips() {
-    // An imported document is itself a lossless export bundle (the import → export pipeline).
     let nodes = [
         ParsedAdfNode::resolved(AdfNode::Heading, "Imported title"),
         ParsedAdfNode::unresolved(AdfNode::Mention, "x"),
@@ -481,8 +453,6 @@ fn adf_imported_doc_json_roundtrips() {
         "the imported doc round-trips losslessly as a bundle"
     );
 }
-
-// ── the format enum ─────────────────────────────────────────────────────────────────────────
 
 #[test]
 fn export_format_extensions() {

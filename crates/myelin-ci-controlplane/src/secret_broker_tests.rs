@@ -1,10 +1,3 @@
-//! Unit tests for the in-boundary secret broker (CI-P24 / P-367) — the fork-no-secrets boundary
-//! (CI-D7) + the trusted-tier DIRECT-NARROW scope + the OIDC short-lived mint.
-//!
-//! These are the security-load-bearing (mandatory-core) tests; they pin every branch of the broker so
-//! the `cargo-mutants` ≥ 90% floor (the module doc) is killable: the fork short-circuit, the
-//! `Decision::Allow` gate, the per-job scope filter, and the OIDC fork-refusal.
-
 use super::*;
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, ConsistencyMode, Credential, Decision,
@@ -48,12 +41,6 @@ fn launch_spec(tier: TrustTier) -> JobSpec {
     .unwrap()
 }
 
-// ---------------------------------------------------------------------------
-// Test doubles (the FROZEN consumed surfaces — never a second real impl).
-// ---------------------------------------------------------------------------
-
-/// A secret capability that resolves any KNOWN handle to a deterministic material; an unknown handle
-/// resolves to `None` (a stale/absent binding → withheld, never an error).
 struct FakeCapability {
     known: HashSet<String>,
 }
@@ -113,10 +100,6 @@ fn strict_secret_handles_round_trip_to_one_tenant_object_key() {
     }
 }
 
-/// An Identity gate that `Allow`s `read` ONLY for the secret objects in `granted` (the DIRECT NARROW
-/// `secret#direct_reader` grant). Everything else is `Deny` (fail-closed). It also records every
-/// `check` it received, so a test can prove a fork-tier resolution made ZERO authz calls (the
-/// structural short-circuit).
 struct FakeIdentity {
     granted: HashSet<String>,
     checks: std::sync::Mutex<Vec<String>>,
@@ -155,7 +138,6 @@ impl IdentityService for FakeIdentity {
             .lock()
             .unwrap()
             .push(s.principal_id.0.clone());
-        // The broker only ever asks for `read` on a secret object.
         assert_eq!(
             p.0, SECRET_READ_PERMISSION,
             "broker checks only `secret.read`"
@@ -221,10 +203,6 @@ impl IdentityService for FakeIdentity {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Fixtures.
-// ---------------------------------------------------------------------------
-
 fn subject() -> Principal {
     Principal::stub(
         PrincipalId("u:dev".into()),
@@ -240,7 +218,6 @@ fn at() -> Consistency {
     }
 }
 
-/// The job's referenced secrets (NAMES + opaque handles — never material).
 fn refs() -> Vec<SecretRef> {
     vec![
         SecretRef {
@@ -254,20 +231,12 @@ fn refs() -> Vec<SecretRef> {
     ]
 }
 
-/// Map a `SecretRef` to its `ci_secret` ArtifactRef (the gate object) — the per-job scope is the
-/// handle, so the object id is derived from it (deterministic).
 fn secret_object_of(r: &SecretRef) -> ArtifactRef {
     ArtifactRef(r.handle.clone())
 }
 
-// ---------------------------------------------------------------------------
-// DEFENCE #1 — the structural fork short-circuit (CI-D7).
-// ---------------------------------------------------------------------------
-
 #[test]
 fn fork_resolves_to_zero_secrets() {
-    // A fork run whose subject WOULD be granted both secrets if it were trusted — the grant is a
-    // misconfiguration the structural defence must survive.
     let cap = FakeCapability::with(&[
         "myelin://acme/ci/secret/registry",
         "myelin://acme/ci/secret/deploy",
@@ -288,7 +257,6 @@ fn fork_resolves_to_zero_secrets() {
         )
         .expect("resolution does not error");
 
-    // The quantified CI-D7 gate: 0 secrets resolved by a fork-tier run.
     assert_eq!(
         res.secret_count(),
         0,
@@ -296,7 +264,6 @@ fn fork_resolves_to_zero_secrets() {
     );
     assert!(res.is_empty());
     assert!(!res.all_resolved());
-    // Every referenced name is withheld with the structural reason.
     for o in &res.outcomes {
         assert!(matches!(
             o,
@@ -306,8 +273,6 @@ fn fork_resolves_to_zero_secrets() {
             }
         ));
     }
-    // The STRUCTURAL property: the fork never reached the authz gate at all (0 checks) — a
-    // misconfigured grant cannot leak because a fork never asks.
     assert_eq!(
         id.check_count(),
         0,
@@ -315,17 +280,12 @@ fn fork_resolves_to_zero_secrets() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// DEFENCE #2 — the trusted-tier DIRECT-NARROW authz gate.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn trusted_resolves_only_referenced_granted_names() {
     let cap = FakeCapability::with(&[
         "myelin://acme/ci/secret/registry",
         "myelin://acme/ci/secret/deploy",
     ]);
-    // Grant ONLY the registry secret (not the deploy key) — the DIRECT NARROW grant.
     let id = FakeIdentity::granting(&["myelin://acme/ci/secret/registry"]);
     let broker = SecretBroker::new(&cap, &id);
 
@@ -339,7 +299,6 @@ fn trusted_resolves_only_referenced_granted_names() {
         )
         .expect("resolution does not error");
 
-    // Exactly ONE secret resolves (the granted one); the ungranted one is withheld.
     assert_eq!(res.secret_count(), 1);
     let resolved: Vec<_> = res.resolved().collect();
     assert_eq!(resolved.len(), 1);
@@ -349,7 +308,6 @@ fn trusted_resolves_only_referenced_granted_names() {
         "material:myelin://acme/ci/secret/registry"
     );
 
-    // The ungranted deploy key is withheld (NotGranted), never leaked.
     assert!(matches!(
         res.outcomes[1],
         SecretOutcome::Withheld {
@@ -357,7 +315,6 @@ fn trusted_resolves_only_referenced_granted_names() {
             ..
         }
     ));
-    // The scope is EXACTLY the 2 referenced names — the broker never enumerated the project.
     assert_eq!(
         id.check_count(),
         2,
@@ -371,7 +328,6 @@ fn protected_without_grant_withholds_all() {
         "myelin://acme/ci/secret/registry",
         "myelin://acme/ci/secret/deploy",
     ]);
-    // No grants at all — a protected secret without an explicit DIRECT grant.
     let id = FakeIdentity::granting(&[]);
     let broker = SecretBroker::new(&cap, &id);
 
@@ -401,9 +357,7 @@ fn protected_without_grant_withholds_all() {
 
 #[test]
 fn granted_but_stale_handle_withholds_observably() {
-    // The subject IS granted, but the handle does not resolve (a stale binding) — withheld, never a
-    // panic or a silent leak.
-    let cap = FakeCapability::with(&[]); // no handle resolves
+    let cap = FakeCapability::with(&[]);
     let id = FakeIdentity::granting(&["myelin://acme/ci/secret/registry"]);
     let broker = SecretBroker::new(&cap, &id);
 
@@ -481,7 +435,6 @@ fn capability_resolution_refuses_foreign_handle_for_authorized_local_object() {
 
 #[test]
 fn self_hosted_is_trusted_for_secret_resolution() {
-    // A self-hosted member run is trusted CODE — it resolves its granted secrets (it is NOT a fork).
     let cap = FakeCapability::with(&[
         "myelin://acme/ci/secret/registry",
         "myelin://acme/ci/secret/deploy",
@@ -515,7 +468,6 @@ fn self_hosted_is_trusted_for_secret_resolution() {
 
 #[test]
 fn empty_refs_resolve_to_empty() {
-    // A job referencing no secrets resolves to an empty (vacuously 0) resolution.
     let cap = FakeCapability::with(&[]);
     let id = FakeIdentity::granting(&[]);
     let broker = SecretBroker::new(&cap, &id);
@@ -783,10 +735,6 @@ fn withheld_secret_rejects_launch_with_observable_reason() {
     ));
 }
 
-// ---------------------------------------------------------------------------
-// OIDC short-lived audience-scoped credentials (contract 4.7).
-// ---------------------------------------------------------------------------
-
 #[test]
 fn trusted_mints_audience_scoped_oidc() {
     let cap = FakeCapability::with(&[]);
@@ -810,7 +758,6 @@ fn fork_is_refused_an_oidc_credential() {
     let id = FakeIdentity::granting(&[]);
     let broker = SecretBroker::new(&cap, &id);
 
-    // The mint closure would succeed — but a fork never reaches it (the same boundary).
     let cred = broker.mint_oidc(
         TrustTier::UntrustedFork,
         "registry.fr-par",

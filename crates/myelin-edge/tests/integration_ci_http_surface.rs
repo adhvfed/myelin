@@ -1,8 +1,3 @@
-//! Live CT-005 proof through the production CI HTTP handlers and action policy.
-//!
-//! PROVIDER: CI's durable `log_segment` archive supplies monotone segment and byte coordinates.
-//! CONSUMER: Edge turns those coordinates into repository-authorized SSE resume pointers and
-//! rejects stale or discontinuous archives. This is the cross-service 3.5/11.8 CDC leg.
 #![cfg(feature = "integration")]
 
 use base64::Engine as _;
@@ -144,9 +139,6 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         .expect("grant fixture access");
 }
 
-/// A future combinator that catches a panic from the wrapped future without requiring it to be
-/// `Send`/`'static` (unlike `tokio::spawn`) — used only so `with_schema_cleanup` can run its cleanup
-/// even when the test body panics.
 struct CatchUnwind<F> {
     inner: std::pin::Pin<Box<F>>,
 }
@@ -167,10 +159,6 @@ impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
     }
 }
 
-/// Run `body`, then unconditionally drop `schema` from `pool` afterward — success, assertion
-/// failure, or panic all still clean up, unlike the old "only reset at the START of the next run"
-/// pattern that let schemas accumulate indefinitely on this host. A synchronous `Drop` impl can't
-/// safely do async cleanup, so this uses catch_unwind + always-cleanup + resume_unwind instead.
 async fn with_schema_cleanup<Fut>(pool: &PgPool, schema: &str, body: impl FnOnce() -> Fut)
 where
     Fut: std::future::Future<Output = ()>,
@@ -410,15 +398,6 @@ async fn insert_golden_ci_surface(
     .expect("insert shared golden CI surface");
 }
 
-/// Seed the `ci_job_spec` (+ `job_queue`) log route that `DurableLogPersist::resume_async` requires:
-/// its `ship_frame`/`finish` resume path joins `ci_job_spec` to `job_queue` on
-/// `(tenant, region, job_id, run_id)` to resolve `spec->>'ci_run_id'`, the canonical run id the
-/// `log_segment` archive is actually keyed on. Without a `ci_job_spec` row for the exact job/run,
-/// that join returns no rows and `resume_async` fails closed with "resolve canonical CI log run: ...
-/// no rows returned by a query that expected to return at least one row" — the same gap fixed in
-/// `integration_ci_ct004c2_runner_exec.rs`'s `seed_log_route` and matching
-/// `integration_ci_ct004f_durable_log_persist.rs`'s helper of the same name. This test has no separate
-/// workflow-run identity, so `run_id` co-keys `job_queue`/`ci_job_spec` AND `spec->>'ci_run_id'`.
 async fn seed_log_route(admin: &PgPool, tenant: &str, region: &str, job_id: &str, run_id: &str) {
     sqlx::query(
         "INSERT INTO job_queue \
@@ -1067,11 +1046,6 @@ async fn production_handlers_conjoin_repo_visibility_and_hide_denied_detail() {
         .expect("remove isolated git fixture");
 }
 
-/// CI-D11 through the composed production services: the runner-owned durable sink and the
-/// repository-authorized Edge stream share only PostgreSQL and the content-addressed blob store.
-/// Both service-side objects are destroyed mid-run, then reconstructed. The restarted producer
-/// appends after its durable head and the restarted viewer resumes strictly after its acknowledged
-/// pointer, so the archive remains byte exact with neither loss nor duplication.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_sink_and_edge_resume_exactly_after_both_services_are_severed() {
     const RUN: &str = "81000000-0000-4000-8000-000000000011";
@@ -1123,7 +1097,6 @@ async fn production_sink_and_edge_resume_exactly_after_both_services_are_severed
         );
         sink.ship_frame(RUN, JOB, &TenantId(TENANT.into()), FIRST)
             .expect("first production sink commits before service loss");
-        // Dropping the only sink models loss of the producer service before terminal finish.
     })
     .join()
     .expect("first producer service joins");
@@ -1139,8 +1112,6 @@ async fn production_sink_and_edge_resume_exactly_after_both_services_are_severed
     assert_eq!(first_data["byte_start"], 0);
     assert_eq!(first_data["byte_end"], FIRST.len() as i64);
 
-    // Destroy both the viewer-side connection and its production Gateway composition after pointer
-    // 1 was acknowledged. The resumed request below is served by a newly composed Edge instance.
     drop(live_rx);
     drop(gateway);
 
@@ -1257,11 +1228,6 @@ async fn production_sink_and_edge_resume_exactly_after_both_services_are_severed
         .expect("remove composed git fixture");
 }
 
-/// FRONTEND-CONTRACT: ci-read-dev-edge-parity
-///
-/// The production provider executes the same committed request/response vectors as the TypeScript
-/// dev Edge. Only the keyed cursor bytes are normalized; their scope-bound behavior remains part of
-/// the vectors. Golden artifact: `contracts/ci-read-dev-edge.golden.json`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn production_ci_reads_match_the_shared_dev_edge_golden_vectors() {
     const GOLDEN: &str = include_str!("../../../contracts/ci-read-dev-edge.golden.json");

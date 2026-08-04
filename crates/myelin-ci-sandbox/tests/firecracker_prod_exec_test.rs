@@ -1,31 +1,3 @@
-//! # The Firecracker PRODUCTION exec self-test (CT-002a → P-544, M2) — REAL microVM runs spec.command
-//!
-//! **Owning architecture (byte-authoritative):**
-//! `continuous-integration/architecture/02-internals-and-algorithms.md` §5.1 (Firecracker microVM —
-//! the production default for untrusted code) + §5.3 (the mandatory hardening profile). **Contract:**
-//! `contract-index.md` row 8.4 (the unified sandbox — the Firecracker half). **Doctrine:** EI-04 §5.1
-//! (a property not drilled on a real kernel is a CLAIM, not a fact — so this self-test REALLY boots);
-//! EI-01 §3 (prove-it: observability is part of the pass).
-//!
-//! ## What it proves (the CT-002a DONE bar)
-//! The DEFAULT backend's [`SandboxBackend::launch`](myelin_ci_sandbox::SandboxBackend::launch) now
-//! boots a REAL Firecracker microVM that RUNS the untrusted `spec.command` (NOT `init=/bin/true`) and
-//! captures its REAL outcome from the guest serial console:
-//!   1. `sh -c 'echo hello-stdout; echo oops 1>&2; exit 7'` ⇒ `exit_code == Some(7)`, stdout-capture
-//!      contains `hello-stdout`, stderr-capture contains `oops`.
-//!   2. A command that sleeps past `timeout_secs=2` ⇒ `timed_out == true`, `exit_code == None`, the
-//!      whole guest was killed (the run returns well under the sleep).
-//!   3. FORGE-RESISTANCE on a REAL kernel: a job that PRINTS a fake `__MYELIN_EXIT__:<guess>:0` to its
-//!      own stdout cannot spoof the captured exit code (it does not know the per-boot nonce) — the
-//!      REAL exit (5) is captured and the forged text appears only as captured-stdout DATA.
-//!
-//! ## Gating (CI without KVM still passes; THIS host must really boot)
-//! SKIPPED GRACEFULLY (returns early, NOT failed) when `/dev/kvm` is absent, `firecracker` is not on
-//! PATH, or the staged guest assets are missing — so CI without KVM stays green. With
-//! `MYELIN_REQUIRE_KVM=1` an absent capability is a HARD FAILURE (panic), never a vacuous green — the
-//! CT-002a DONE bar refuses a green that did not really boot a microVM. Run:
-//! `MYELIN_REQUIRE_KVM=1 cargo test -p myelin-ci-sandbox --features integration --test firecracker_prod_exec_test -- --nocapture`.
-
 #![cfg(feature = "integration")]
 
 use myelin_ci_sandbox::firecracker::{
@@ -55,8 +27,6 @@ impl SandboxOutputSink for LiveOutput {
     }
 }
 
-/// KVM + firecracker + staged-asset availability (the same preconditions the hardened-boot self-test
-/// gates on). Returns `false` ⇒ graceful skip (unless `MYELIN_REQUIRE_KVM=1`, which makes it a panic).
 fn preconditions() -> bool {
     let has_kvm = Path::new("/dev/kvm").exists();
     let has_fc = which_on_path("firecracker", "MYELIN_FC_BIN");
@@ -79,8 +49,6 @@ fn which_on_path(default_bin: &str, env_override: &str) -> bool {
     false
 }
 
-/// HARD-FAIL on an absent capability iff `MYELIN_REQUIRE_KVM=1` (the M2 exit gate refuses a vacuous
-/// green); otherwise GRACEFUL SKIP. Returns `true` if the caller should skip.
 fn skip_or_panic(test: &str) -> bool {
     if preconditions() {
         return false;
@@ -93,14 +61,12 @@ fn skip_or_panic(test: &str) -> bool {
         );
     }
     eprintln!(
-        "[{test}] SKIPPED: /dev/kvm or `firecracker` or the staged guest assets are absent — this \
+        "[{test}] SKIPPED: /dev/kvm or `firecracker` or the staged guest assets are absent - this \
          host cannot boot a microVM. (CI without KVM passes.)"
     );
     true
 }
 
-/// A trivial hardened CI JobSpec running `command`, with the given `timeout_secs` (default-deny
-/// egress ⇒ no NIC; read-only root; pids ceiling set).
 fn spec_running(command: Vec<String>, timeout_secs: u32) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
@@ -128,7 +94,6 @@ fn spec_running(command: Vec<String>, timeout_secs: u32) -> JobSpec {
     .unwrap()
 }
 
-/// The four-guarantee hooks, all accepting (so the launch reaches a real boot).
 fn ok_hooks() -> RunnerHooks {
     RunnerHooks::new(
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
@@ -356,34 +321,12 @@ fn real_microvm_atomically_reaps_a_session_escaped_forking_descendant() {
     backend.kill(&launch.handle).expect("teardown");
 }
 
-/// CT-002c host-side memory-DoS regression (REAL kernel). An untrusted workload emits 2 MiB of stdout
-/// which the in-init `base64` dump frames onto the serial console as ~2.8 MiB — exceeding BOTH the
-/// 2 MiB host `CONSOLE_CAPTURE_BOUND` and the ~64 KiB OS pipe buffer. The fix proves two properties:
-///   (a) BOUNDED HOST MEMORY — `result.stdout.len() <= SANDBOX_CAPTURE_BOUND`: the host drain thread
-///       head-captures at most the cap and DISCARDS the rest, so it never buffers the whole stream
-///       (the old `read_to_end`-then-truncate would have buffered the ENTIRE ~2.8 MiB — and for a
-///       guest writing GBs to its tmpfs, GBs — before truncating).
-///   (b) NO PIPE DEADLOCK / NO HANG — the guest's `base64` dump is far larger than the console pipe
-///       buffer; because the host KEEPS READING past the cap (drain-and-discard) the dump never
-///       blocks, so init reaches `reboot -f` and the VM exits ON ITS OWN — `timed_out == false` and
-///       `elapsed` is far below the timeout ceiling. A buggy "stop reading at the cap" would instead
-///       block `base64` at ~2 MiB written, hang the guest, and force `timed_out == true` at the
-///       ceiling. NOTE: `exit_code` is `None` here — the trusted exit marker is emitted by init AFTER
-///       the two stream blobs, so a >cap runaway stream pushes it beyond the host console cap (it is
-///       discarded with the overflow). That is the correct fail-closed outcome (a job spamming past
-///       the console cap is not a clean pass); the OLD code parsed it only by also buffering the whole
-///       unbounded console — exactly the DoS this closes. Legitimate runs (console <= 2 MiB, incl.
-///       both streams at their full 256 KiB head bound) keep their exit marker — see the exit-7 test.
 #[test]
 fn real_microvm_runaway_stdout_is_capped_without_deadlock() {
     if skip_or_panic("fc-prod-exec runaway-stdout-cap") {
         return;
     }
     let backend = FirecrackerBackend::new();
-    // Emit 2 MiB of 'x' to stdout (→ ~2.8 MiB base64 console, over the 2 MiB cap), then exit. dd,
-    // /dev/zero and tr are all present in the staged rootfs (used by the escape drill / forge test).
-    // timeout_secs=120 gives a >5x margin over the observed ~20s self-completion, so a `timed_out`
-    // here can ONLY mean a genuine drain-stopped pipe deadlock, never slow-but-progressing UART.
     let timeout_secs = 120u32;
     let spec = spec_running(
         vec![
@@ -412,19 +355,15 @@ fn real_microvm_runaway_stdout_is_capped_without_deadlock() {
         SANDBOX_CAPTURE_BOUND
     );
 
-    // (a) host memory stayed bounded: the captured head is <= the per-stream bound.
     assert!(
         result.stdout.len() <= SANDBOX_CAPTURE_BOUND,
         "captured stdout MUST be head-bounded to <= {SANDBOX_CAPTURE_BOUND}; got {} (a runaway guest \
          must not be able to force the host to buffer the whole stream)",
         result.stdout.len()
     );
-    // (b) NO deadlock/hang: the guest base64-dumped a >cap console and rebooted ON ITS OWN — the host
-    // kept draining past the cap so the dump never blocked. A drain that stopped at the cap would
-    // have hung the guest and forced the timeout-kill.
     assert!(
         !result.timed_out,
-        "a 2 MiB completing flood must NOT time out — the host must keep draining the >cap console so \
+        "a 2 MiB completing flood must NOT time out - the host must keep draining the >cap console so \
          the guest's base64 dump never blocks (a timeout here = the host stopped draining and the \
          guest deadlocked on a full console pipe)"
     );
@@ -444,7 +383,6 @@ fn real_microvm_command_past_timeout_is_whole_guest_killed() {
         return;
     }
     let backend = FirecrackerBackend::new();
-    // Sleep 30s with a 2s ceiling — the whole guest must be killed at ~2s.
     let spec = spec_running(vec!["sh".into(), "-c".into(), "sleep 30".into()], 2);
 
     let start = Instant::now();
@@ -467,7 +405,7 @@ fn real_microvm_command_past_timeout_is_whole_guest_killed() {
     );
     assert_eq!(
         result.exit_code, None,
-        "a timed-out (killed) guest has no trustworthy exit code — never fabricated as 0"
+        "a timed-out (killed) guest has no trustworthy exit code - never fabricated as 0"
     );
     assert!(!result.passed(), "a timed-out job is not a pass");
     assert!(
@@ -484,8 +422,6 @@ fn real_microvm_job_cannot_forge_the_exit_code() {
         return;
     }
     let backend = FirecrackerBackend::new();
-    // FORGE ATTEMPT on a REAL kernel: the job prints a fake exit marker (with a GUESSED nonce it
-    // cannot know) to its own stdout, then really exits 5. The real exit (5) must be captured.
     let spec = spec_running(
         vec![
             "sh".into(),
@@ -519,26 +455,12 @@ fn real_microvm_job_cannot_forge_the_exit_code() {
     backend.kill(&launch.handle).expect("teardown");
 }
 
-/// STRUCTURAL forge-resistance on a REAL kernel (CT-002a → P-548). The earlier forge test prints a
-/// fake marker with a GUESSED nonce; this one is the worst case the security probe confirmed: the
-/// untrusted payload READS the per-boot nonce in plaintext off `/dev/vdb` (the init script lives
-/// there) and tries to write a forged `__MYELIN_EXIT__:<REAL nonce>:0` directly to `/dev/console`.
-///
-/// The fix makes this STRUCTURALLY impossible (not merely unlikely): the payload runs NON-ROOT
-/// (`setpriv --reuid/--regid 65534`), and `/dev/console`/`/dev/ttyS0` are root-only (`crw-------`),
-/// so the console write is DENIED by the kernel regardless of whether the payload knows the nonce.
-/// The test asserts (a) the payload's own diagnostics report the console-write was DENIED, and
-/// (b) `launch` yields the REAL non-zero exit (3), never the forged 0 — locking the fix against
-/// regression (e.g. a future edit that drops the `--reuid` and reintroduces a root payload).
 #[test]
 fn real_microvm_nonroot_payload_cannot_forge_exit_via_console_write() {
     if skip_or_panic("fc-prod-exec structural-forge") {
         return;
     }
     let backend = FirecrackerBackend::new();
-    // The payload: (1) read the REAL nonce off /dev/vdb; (2) attempt to write a forged exit-0 marker
-    // bearing that real nonce to /dev/console; (3) report whether the write succeeded or was denied;
-    // (4) really exit 3. The forged 0 must NOT be captured, and the write must be DENIED.
     let attack = r#"
 N=$(tr -cd '[:print:]\n' < /dev/vdb 2>/dev/null | sed -n "s/^N='\([0-9a-f]*\)'.*/\1/p" | head -1)
 echo "id=$(id)"
@@ -561,7 +483,6 @@ exit 3
     );
     println!("captured stdout = {stdout:?}");
 
-    // (a) the kernel DENIED the non-root payload's /dev/console write (the structural boundary).
     assert!(
         stdout.contains("console-write: DENIED"),
         "the NON-ROOT payload must be DENIED writing the root-only /dev/console (the structural \
@@ -571,16 +492,14 @@ exit 3
         !stdout.contains("console-write: OK"),
         "the payload must NOT be able to write /dev/console. got stdout: {stdout:?}"
     );
-    // Confirm the payload is genuinely non-root (uid 65534), proving the boundary is in force.
     assert!(
         stdout.contains("uid=65534"),
         "the untrusted payload must run NON-ROOT (uid=65534). got stdout: {stdout:?}"
     );
-    // (b) the REAL exit (3) is captured; the forged `:0` it tried to inject never reaches the parser.
     assert_eq!(
         result.exit_code,
         Some(3),
-        "the forged exit-0 (even with the REAL nonce) cannot win — the non-root payload could not \
+        "the forged exit-0 (even with the REAL nonce) cannot win - the non-root payload could not \
          write the console at all, so the only exit line is init's trusted 3"
     );
     assert!(
@@ -589,7 +508,7 @@ exit 3
     );
     assert!(
         !result.passed(),
-        "a non-zero exit is not a pass — the forge did NOT flip it to a pass"
+        "a non-zero exit is not a pass - the forge did NOT flip it to a pass"
     );
 
     backend.kill(&launch.handle).expect("teardown");

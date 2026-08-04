@@ -5,12 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-substrate is the ROOT of the crate DAG, root-LAST (architecture 00 §2.9):
-# ... → client → substrate. It depends on ALL the glue crates and is depended on by
-# NONE of them (a service's main.rs is the only consumer). It is the harness home
-# (serve(AppSpec)) and the FailStatic<T> home, and it carries the crate-graph-acyclic
-# test (the build-layer realisation of the no-cross-sync-cycle lint, P-S10 ships the
-# real lint).
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
@@ -21,46 +15,17 @@ myelin-query = { path = "../myelin-query" }
 myelin-agent = { path = "../myelin-agent" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-client = { path = "../myelin-client" }
-# The storage SUBSTRATE (P-007): serve opens the bounded OLTP pool through it (§3.3) and
-# auto-registers the OLTP store as a PersonalDataHolder (§3.4). The crate_graph DAG already
-# models Substrate → Storage (root-last); this manifest edge realises it.
 myelin-storage = { path = "../myelin-storage" }
 serde.workspace = true
-# The versioned thresholds file (P-S22 / P-038): the single TOML source of truth every M0
-# drill reads its quantified threshold from. `toml` (de)serializes it.
 toml.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
-# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
-# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
-# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# Test-support ONLY: the hello-world serve test reads the contract-1.8 producer signals
-# serve exports back through the harness's telemetry-assertion library (the SAME SignalName
-# set). A dev-dependency so myelin-harness stays OUT of the production crate DAG
-# (architecture §2.9 — the harness is a leaf consumer; nothing in the DAG depends on it).
 myelin-harness = { path = "../myelin-harness" }
-# MR-009b W7.3 — the fs `FsBlobStore` floor is now a `test-support`-gated test double in
-# myelin-storage; the `drill_sub_d6_restore_verify*` cell-scale drills drive it via the `BlobStore`
-# trait, so enable `test-support` DEV-only. Never in the production DAG (cargo tree -e no-dev shows no
-# test-support edge) — the SAME idiom as the events test-support dev-dep above.
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 serde_json.workspace = true
 
 [features]
-# MR-009b W3b.4: gates the in-process outbox FLOOR (`OutboxSpec::default_inproc` + the `Default`
-# impl) so no production composition root silently picks up the per-process in-memory outbox
-# (SI-007). Production constructs `OutboxSpec::durable(store, transport)` over a durable-backed
-# `OutboxStore`; a downstream crate's DEV tests that still boot the in-proc floor enable this as a
-# dev-dependency feature (never in the runtime DAG — audited via `cargo tree -e no-dev`).
-# MR-009b W3b.5/.6: forwards to `myelin-events/test-support` — `default_inproc` constructs the
-# now-gated in-memory `OutboxStore::new()` double, so enabling the floor here enables it there.
 test-support = ["myelin-events/test-support"]
-# CT-007 gate-4: the opt-in host/perf test lane. When ON, wall-clock SLA-budget assertions
-# (`perf_budget_enforced()` == true) are enforced; when OFF (the default, incl. the hermetic
-# `cargo test --lib` CI lane under gVisor CPU contention) they are skipped as inherently flaky
-# while every CORRECTNESS assertion still runs. Never in `default` and never enabled by a
-# downstream crate's default features — the hermetic lane must keep these budgets disarmed.
 host-perf-tests = []

@@ -1,28 +1,3 @@
-//! # The CDC pair for the cross-subsystem reflex consumers (ISS-P28 / P-395, M4)
-//!
-//! **Contract-index rows consumed:** 2.4 (the `EventHandler` consumer template — a `*`-free
-//! `subjects()` whitelist + idempotent `handle`), 5.4 (the link/relates edges the reflexes stage), 5.9
-//! (the `ci.check.updated` → CI-red Done guard feed). The reflexes are the differentiator (VISION §2 —
-//! work flows between tools) shipped as CONSUMERS off the bus (EI-01 §7), never bespoke cross-subsystem
-//! calls — Issues imports NO producer crate (the acyclic-producer invariant, EI-02 §3): it whitelists
-//! the foreign subjects (`git.*` / `ci.check.updated` / `chat.message.created` / `identity.member.*`)
-//! as validated tokens.
-//!
-//! The **PRODUCER** side is **Issues authoring an [`EventHandler`]** ([`ReflexConsumer`]) whose
-//! `subjects()` whitelist is the FROZEN `*`-free `REFLEX_SUBJECTS` and whose `handle` is idempotent on
-//! `event_id`. The **CONSUMER** side is **the Bus runtime admitting + driving it**
-//! ([`myelin_events::consume`] → a live [`myelin_events::Consumer`]) — the only honest "accepted": the
-//! whitelist binds (no wildcard rejection) and the seven delivery rules drive `handle` to a terminal
-//! [`Delivered`]. Pinning both sides here fails CI in the same job on a drift (Issues widens to `*` or
-//! authors a non-idempotent handle; the Bus renames the template surface).
-//!
-//! This file ALSO carries the **chained-mutation e2e drill** (the ISS-P28 GATE artifacts proven over
-//! the LIVE Bus runtime, not just the in-module planner): a `git.pr.merged` → `closes` link +
-//! workflow-permitting auto-close, REPLAYED, asserts **0 duplicate** (the runtime dedups the redelivery
-//! → `Delivered::Deduplicated`, and the handler's staged-effect count is unchanged); and a CI-red merge
-//! is **blocked** through the FSM interpreter (the **0-governance-bypass** artifact — no Done is ever
-//! staged for a guarded merge the human path could not green).
-
 use myelin_events::{
     consume, Actor, AggregateKey, ArtifactRef, ConsumerName, ConsumerSpec, CorrelationId, DataRole,
     DedupLedger, Delivered, EventEnvelope, EventHandler, EventId, EventType, HandleOutcome,
@@ -70,8 +45,6 @@ fn ev(event_id: &str, type_: &str, payload: serde_json::Value) -> EventEnvelope 
     }
 }
 
-/// The 3-state CI-gated dev workflow the auto-transitions run through (the SAME guard the human path
-/// uses — ISS-P27): Todo →(branch)→ In Progress →(merge, CI-red Done guard)→ Done.
 fn dev_workflow() -> Workflow {
     Workflow {
         states: vec![
@@ -120,13 +93,6 @@ fn merge_event(id: &str, ci_state: &str) -> EventEnvelope {
     )
 }
 
-// =================================================================================================
-// PRODUCER side — Issues authors a `*`-free, idempotent EventHandler (contract 2.4).
-// =================================================================================================
-
-/// **PRODUCER: the reflex consumer binds the FROZEN `*`-free `REFLEX_SUBJECTS` whitelist (never `*`).**
-/// Pins the 2.4 promise — the handler whitelists exactly the foreign reflex subjects (no wildcard) and
-/// each is grammatical/foreign.
 #[test]
 fn producer_reflex_consumer_binds_a_star_free_foreign_whitelist() {
     let consumer = ReflexConsumer::new(dev_workflow());
@@ -147,25 +113,16 @@ fn producer_reflex_consumer_binds_a_star_free_foreign_whitelist() {
             "subject `{}` is on the frozen whitelist",
             s.0
         );
-        // each is a FOREIGN subject — Issues consumes, never originates it (acyclic-producer, EI-02 §3).
         assert!(
             !s.0.starts_with("issue."),
             "reflex subject `{}` must be FOREIGN (consumed)",
             s.0
         );
     }
-    // the handle returns a terminal outcome for a well-formed reflex event.
     let outcome = consumer.handle(&merge_event("p-1", "success"), &mut myelin_events::HandlerTx::none());
     assert_eq!(outcome, HandleOutcome::Done);
 }
 
-// =================================================================================================
-// CONSUMER side — the Bus runtime ADMITS + DRIVES the reflex consumer (the honest "accepted").
-// =================================================================================================
-
-/// **CONSUMER: the Bus runtime admits the reflex consumer (no wildcard rejection) + drives it to a
-/// terminal `Acked`.** The `*`-free whitelist binds into a live [`Consumer`]; a `git.pr.merged`
-/// delivers through the seven rules and acks (the handler staged the `closes` link + the auto-close).
 #[test]
 fn consumer_bus_admits_and_drives_the_reflex_consumer() {
     let consumer = ReflexConsumer::new(dev_workflow());
@@ -183,7 +140,6 @@ fn consumer_bus_admits_and_drives_the_reflex_consumer() {
         Delivered::Acked,
         "a well-formed git.pr.merged acks (Done)"
     );
-    // the handler staged the auto-close (a trusted-green merge → Done through the CI-gated FSM).
     assert_eq!(
         runtime.handler().staged_count(),
         1,
@@ -199,11 +155,6 @@ fn consumer_bus_admits_and_drives_the_reflex_consumer() {
     assert_eq!(runtime.lag(), 0, "no backlog after a clean ack");
 }
 
-/// **GATE (over the LIVE runtime): a replayed `git.pr.merged` is deduplicated by the Bus runtime → 0
-/// duplicate staged effects.** The first delivery acks (staging one effect); the SAME `event_id`
-/// redelivered hits the dedup ledger (`Delivered::Deduplicated`) — the handler is SKIPped and the
-/// staged-effect count is UNCHANGED. This is the ISS-P28 0-duplicate-on-replay artifact proven through
-/// the real consumer runtime (the dedup ledger rule 1), not just the in-module within-handler dedup.
 #[test]
 fn replayed_merge_is_deduplicated_by_the_runtime_zero_duplicate() {
     let consumer = ReflexConsumer::new(dev_workflow());
@@ -218,7 +169,6 @@ fn replayed_merge_is_deduplicated_by_the_runtime_zero_duplicate() {
     assert_eq!(runtime.deliver(&msg), Delivered::Acked);
     let after_first = runtime.handler().staged_count();
     assert_eq!(after_first, 1, "the merge staged one effect");
-    // REPLAY the same event_id: the runtime dedups (rule 1) → 0 duplicate.
     assert_eq!(
         runtime.deliver(&msg),
         Delivered::Deduplicated,
@@ -231,11 +181,6 @@ fn replayed_merge_is_deduplicated_by_the_runtime_zero_duplicate() {
     );
 }
 
-/// **GATE (the chained-mutation e2e over the runtime): branch → link + auto-advance, merge → link +
-/// auto-close, REPLAY both → 0 duplicate.** The full differentiator flow (a branch advances the issue,
-/// a merge closes it) driven through the Bus consumer; replaying the chain produces 0 duplicate
-/// links/transitions and every auto-transition went through the FSM interpreter (the staged Links carry
-/// the FIXED categories — no bypass).
 #[test]
 fn chained_branch_then_merge_e2e_is_idempotent_over_the_runtime() {
     let consumer = ReflexConsumer::new(dev_workflow());
@@ -252,7 +197,6 @@ fn chained_branch_then_merge_e2e_is_idempotent_over_the_runtime() {
         ),
     };
     assert_eq!(runtime.deliver(&branch), Delivered::Acked);
-    // a real consumer advances the projection off its own auto-transition; the drill seeds it.
     runtime.handler().set_state(ISSUE, AUTO_STATE_IN_PROGRESS);
     let merge = Message {
         subject: GIT_PR_MERGED.into(),
@@ -265,7 +209,6 @@ fn chained_branch_then_merge_e2e_is_idempotent_over_the_runtime() {
         "the branch link + the merge close are two staged effects"
     );
 
-    // REPLAY both: the runtime dedups each → 0 duplicate.
     assert_eq!(runtime.deliver(&branch), Delivered::Deduplicated);
     assert_eq!(runtime.deliver(&merge), Delivered::Deduplicated);
     assert_eq!(
@@ -274,7 +217,6 @@ fn chained_branch_then_merge_e2e_is_idempotent_over_the_runtime() {
         "replaying the chain produces 0 duplicate staged effects"
     );
 
-    // and both auto-transitions went through the FSM interpreter (the FIXED categories prove it).
     let staged = runtime.handler().staged();
     assert!(
         staged.iter().any(|e| matches!(
@@ -292,10 +234,6 @@ fn chained_branch_then_merge_e2e_is_idempotent_over_the_runtime() {
     );
 }
 
-/// **GATE (0-governance-bypass over the runtime): a CI-red merge LINKS but the auto-close is BLOCKED
-/// through the FSM interpreter — no Done is ever staged.** The `closes` link still lands (the PR↔issue
-/// link is a fact); the auto-close is blocked by the CI-red Done guard (5.9) → a loud
-/// `TransitionBlocked`, never a silent allow. A reflex can never green a Done the human path could not.
 #[test]
 fn ci_red_merge_blocks_the_auto_close_no_governance_bypass() {
     let consumer = ReflexConsumer::new(dev_workflow());
@@ -309,7 +247,6 @@ fn ci_red_merge_blocks_the_auto_close_no_governance_bypass() {
     };
     assert_eq!(runtime.deliver(&msg), Delivered::Acked);
     let staged = runtime.handler().staged();
-    // the `closes` link landed (with NO transition).
     assert!(
         staged.iter().any(|e| matches!(
             e,
@@ -321,14 +258,12 @@ fn ci_red_merge_blocks_the_auto_close_no_governance_bypass() {
         )),
         "the closes link lands even when the auto-close is blocked"
     );
-    // the block is LOUD.
     assert!(
         staged
             .iter()
             .any(|e| matches!(e, ReflexEffect::TransitionBlocked { .. })),
         "a CI-red merge surfaces a loud TransitionBlocked"
     );
-    // 0 governance bypass: NO Done transition was ever staged.
     assert!(
         !staged.iter().any(|e| matches!(
             e,
@@ -338,8 +273,6 @@ fn ci_red_merge_blocks_the_auto_close_no_governance_bypass() {
     );
 }
 
-/// A `*` subscription is REJECTED at bind (the structural BUS-3 guard) — the reflex consumer CANNOT be
-/// widened to a wildcard. The provider never asks for one; this pins the runtime would refuse if it did.
 #[test]
 fn a_wildcard_reflex_subscription_is_rejected() {
     let consumer = ReflexConsumer::new(dev_workflow());

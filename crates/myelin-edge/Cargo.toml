@@ -5,119 +5,40 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The product/edge API GATEWAY (MR-014 / E0.6, P-S14 transport): the ONE HTTP edge the UI/CLI/MCP
-# call. A LEAF CONSUMER above the glue crates + substrate (it depends on -identity / -identity-service
-# / -substrate / -storage / -tenancy) and NOT a node in the eleven-crate library DAG modelled by
-# crate_graph.rs — nothing in the production DAG depends back on it (substrate_is_root() preserved).
 [lib]
 path = "src/lib.rs"
 
-# The deployable edge binary the harness/launcher runs (a thin shim over `serve_edge`). Like the
-# other service mains it does nothing but bind the listener and hand requests to the gateway.
 [[bin]]
 name = "edge"
 path = "src/main.rs"
 
 [dependencies]
-# The frozen identity contract surface: Principal / Credential / AuthzError. The verified principal's
-# tenant/region is the request scope (ID-3, the cardinal IDOR rule).
 myelin-identity = { path = "../myelin-identity" }
-# The REAL Bearer-token verifier + the human-login refuse-not-mock path (MR-011/MR-012): the
-# CapabilityAuthenticator (PasetoCapabilityVerifier + DPoP + durable revocation + S1 lookup) and
-# HumanSsoAuthenticator::production. The edge AUTHENTICATES through these — it never re-implements auth
-# or admits mock crypto.
 myelin-identity-service = { path = "../myelin-identity-service" }
-# The PublicSurface request-lifecycle SHAPE this transport realises: topology::PublicSurface
-# (tenant-from-token + IDOR reject/audit), InjectedIdentity, the re-authorize-every-call Authorizer
-# seam. The edge EXTENDS this; it does not fork a parallel API.
 myelin-substrate = { path = "../myelin-substrate" }
-# TenantScope (the verified `(tenant, region)` scope) + with_tenant_tx (the MR-013/MR-022 tenant scope
-# the edge sets before dispatch — behind `integration`, the live-PG transaction). KmsEngine seeds the
-# S1 principal store in the proofs.
 myelin-storage = { path = "../myelin-storage" }
-# MR-009b Wave 2: the edge composition root now wires the DURABLE S1/S7 identity stores (`with_pg`)
-# over the MR-022 SubstrateProvider pool — the identity in-memory doubles moved behind `test-support`,
-# so the production edge binary boots durable-by-default. `myelin-config` is the env-first
-# `MyelinConfig` the provider connects from (the dev docker stack by default).
 myelin-config = { workspace = true }
-# TenantId / Region value types (the path-tenant the IDOR guard rejects; the residency dimension).
 myelin-tenancy = { path = "../myelin-tenancy" }
-# The Git SUBSYSTEM (MR-015): its endpoint grammar (`api::http_catalogue` — the route table the edge
-# re-roots under `/v1/git/...`) + its `web` ViewModels (the JSON data contract the edge serves). The
-# edge is the ONE composition/wiring point: it DEPENDS ON the subsystems it exposes (like a `main`),
-# and NOTHING in the production DAG depends back on `myelin-edge` — so `myelin-edge → myelin-git` is an
-# acyclic edge between two leaf consumers (neither is a node in the eleven-crate library DAG modelled
-# by `crate_graph.rs`; `substrate_is_root()`/`identity_is_sink()` are unaffected). The subsystem never
-# depends on its transport — the edge knows about Git, Git does not know about the edge.
 myelin-git = { path = "../myelin-git" }
-# Issues owns the fail-closed row/binding saga; the edge is the composition layer that may depend on
-# both the subsystem and Identity service, so it supplies the concrete async tuple-writer adapter.
 myelin-issues = { path = "../myelin-issues" }
-# Notification inbox reads are served by the same authenticated product edge. The subsystem owns
-# the durable repository, filter grammar, taxonomy tokens, and migrations; Edge only binds those
-# to the verified principal and projects the structured wire view.
 myelin-notif = { path = "../myelin-notif" }
-# GT-005: the BRAIN-AGNOSTIC PLAN-THEN-APPLY chokepoint (`EffectApi` / `RunCtx` / `ProposedEffect` /
-# `EffectResult`, §8.2). The edge is the composition point that binds a concrete `EffectApi` body to the
-# durable git backend, so a governed MCP `tools/call` (mint_run_token → EffectApi::apply, MR-021) lands
-# the real GT-003 git effect under the run's verified scope + the server-side merge gate. Value types
-# only — no agent runtime / no LLM (the `no-llm-in-platform` ratchet is unaffected).
 myelin-agent = { path = "../myelin-agent" }
-# GT-003: the durable git write path co-commits its `git.ref.updated` through the frozen
-# `myelin_events::OutboxStore` (the same emit-iff-committed substrate the receive-pack path uses) — the
-# edge composes `RefStore::open_durable` + the outbox + the id minter to make API writes persist.
-# Already in the tree (myelin-git depends on it) — promoting it adds ZERO new crate.
 myelin-events = { path = "../myelin-events" }
-# CT-006b (GT-006): the SANDBOXED git-wire capability the production `WireExecutor` calls into —
-# `GvisorBackend::launch_git_wire(&GitWireSpec, &hooks)` runs canonical `git upload-pack`/`receive-pack`
-# in the hardened gVisor sandbox (egress-deny, ro-root, caps dropped, non-root, bounded). The edge owns
-# the PRODUCTION `myelin_git::core::WireExecutor` impl (`GitWireExecutor`) so the git crate carries NO
-# host-exec fingerprint (the executor owns the sandboxed launch). The edge executor NEVER shells out
-# itself — it delegates to `launch_git_wire`. ACYCLIC: `myelin-ci-sandbox` is a leaf consumer (depends
-# only on the shared glue crates) and NOTHING in the production DAG depends back on `myelin-edge`, so
-# `myelin-edge → myelin-ci-sandbox` is a forward edge between two leaf consumers (neither a node in the
-# eleven-crate library DAG; ci-sandbox does NOT depend on edge). `myelin-git` is ci-sandbox's DEV-dep
-# only (the validator replica is drift-pinned by a committed test), so no production edge ci→git either.
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
-# CT-005: Edge binds CI's subsystem-owned durable run read authority to authenticated HTTP. The
-# control-plane crate remains transport-agnostic; Edge is the leaf composition root.
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
-# CI's complete migration set includes its durable Flow recovery index. Edge applies that exact
-# prerequisite before the CI schema so a fresh-cell public read surface has no boot-order dependency
-# on the Controlplane deployable.
 myelin-flow = { path = "../myelin-flow" }
 zeroize = "1"
-# The {error:{message,code?}} envelope + the JSON view-model/data contract are serde_json::Value (the
-# one workspace-pinned shape). Issues uses a deny-unknown-fields request carrier so duplicate,
-# surplus, or tenant-selecting fields fail before a durable mutation.
 serde = { workspace = true }
 serde_json = { workspace = true }
 
-# Decode URI path captures only after the router has matched literal segments. This crate is already
-# pinned in Cargo.lock through the HTTP stack; making it direct adds no dependency subtree.
 percent-encoding = "2.3"
 
-# base64 (0.22 — the SAME pin myelin-identity-service uses) decodes the git smart-HTTP `Authorization:
-# Basic base64(user:pass)` header on the WIRE routes only: `git push/clone http://…` sends Basic, and
-# the PASSWORD carries the capability-token material (R4.0 item C). Already in Cargo.lock via identity —
-# promoting it to a direct dep adds ZERO new crates.
 base64 = "0.22"
 
-# Repository-list continuation cursors bind their last visible slug to the verified tenant/region
-# and the durable catalogue namespace without carrying either scope value in cleartext.
 blake3.workspace = true
 
-# chrono (the SAME parse/format-only spec myelin-identity-service uses — already in the lock) formats
-# the RFC-3339 revocation instant the `edge revoke` operator subcommand records in the durable S7 store.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-# ----------------------------------------------------------------------------------------------
-# THE HTTP TRANSPORT — hyper 1.x DIRECTLY (no axum). Every crate below is ALREADY in Cargo.lock as a
-# transitive dep (via the aws-smithy / rustls / sqlx stacks), so promoting them to direct deps adds
-# ZERO new crates to the tree (the same "promote transitive, no new crate" discipline the identity
-# crate used for ring/hmac). axum is NOT in the lock and would pull a new subtree (axum / axum-core /
-# matchit / …) — rejected. The tiny router is hand-built (frontend canon §0: minimal deps).
-# ----------------------------------------------------------------------------------------------
 hyper = { version = "1", features = ["server", "client", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "http1", "server-graceful", "client-legacy"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "aws-lc-rs", "tls12"] }
@@ -125,53 +46,20 @@ rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", 
 http-body-util = "0.1"
 bytes = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "io-util", "sync", "time", "signal"] }
-# BroadcastStream — adapts the SSE hub's tokio broadcast channel into the streaming response body.
 tokio-stream = { version = "0.1", features = ["sync"] }
 
-# ----------------------------------------------------------------------------------------------
-# Live-PG path (the tenant scope set via with_tenant_tx). OPTIONAL: the default build/test compiles
-# none of it (stays DB-free; the auth/tenant/dispatch/SSE proofs run over the real hyper listener with
-# the in-memory PublicSurface scope). `--features integration` pulls the storage durable backings +
-# sqlx so the edge can prove the tenant scope is set in a real transaction.
-# ----------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
-# Secret-operator unit tests use CI's encrypted in-memory durable-store double. Production keeps the
-# feature-less dependency above and always wires `DurableCiSecretStore::with_pg`.
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane", features = ["test-support"] }
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
-# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
-# production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# MR-009b Wave 2: the edge's OWN tests (the gateway/git-edge `#[cfg(test)]` modules + tests/*) build
-# the identity in-memory doubles (PrincipalStore/RevocationStore `::new`), which moved behind
-# `#[cfg(any(test, feature = "test-support"))]`. Enable `test-support` for the TEST build only — the
-# production edge binary (src/main.rs) wires the DURABLE `with_pg` stores, so `cargo build` keeps the
-# in-memory doubles OUT of the edge runtime (durable-by-default preserved; resolver v2 does not leak a
-# dev-dependency feature into the normal build).
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-# MR-009b W3b.6: enable `test-support` so this crate's OWN `#[cfg(test)]` modules reach the events
-# in-memory `OutboxStore::new()` double (the durable `OutboxStore::durable` is the production
-# default the edge main wires). DEV-only — never in the production DAG.
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# Exposes only the exact served Issues list SQL to the live EXPLAIN proof; normal Edge builds keep
-# the production Issues dependency feature-free.
 myelin-issues = { path = "../myelin-issues", features = ["test-support"] }
-# MR-009b W3b.6 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
-# tests/*.rs files (they build `DurableGitBackend::rooted_inmem_for_test`, now gated).
 myelin-edge = { path = ".", features = ["test-support"] }
-# The Basic-auth git-wire oracle (R4.0 item C) forms `Authorization: Basic base64(user:token)` to
-# hand `git` via `http.extraHeader` (the exact bytes git would send natively). base64 (0.22) is the
-# same pin the crate itself uses.
 base64 = "0.22"
 
 [features]
 default = []
 integration = ["myelin-storage/integration", "dep:sqlx"]
-# MR-009b W3b.6 — gates `DurableGitBackend::rooted_inmem_for_test` (it constructs the now-gated
-# in-memory `OutboxStore::new()` double + the deterministic `MonotonicMinter`), forwarding to
-# `myelin-events/test-support`. DEV/TEST only — the downstream cli/mcp test suites enable it as a
-# dev-dependency feature; never in the production DAG.
 test-support = ["myelin-events/test-support"]

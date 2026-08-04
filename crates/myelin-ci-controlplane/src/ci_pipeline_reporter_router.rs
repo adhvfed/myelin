@@ -1,15 +1,3 @@
-//! Exact-tenant terminal-reporter routing for a region-wide CI runner.
-//!
-//! A hosted runner claims jobs across tenants in one region, while every
-//! [`crate::CiPipelineReporter`] is intentionally bound to one `(tenant, region)` RLS scope. This
-//! router constructs a fresh reporter from the claimed row's tenant, verifies that the factory
-//! returned exactly that scope, and only then delegates durable claim verification/accounting. The
-//! reporter still proves owner/epoch/nonce against PostgreSQL before any terminal mutation; routing
-//! does not weaken completion authority.
-//!
-//! @residency-cell-pinned:file — the router owns one validated [`myelin_tenancy::Region`] and passes
-//! it unchanged to every reporter factory call.
-
 use std::sync::Arc;
 
 use myelin_ci_sandbox::{
@@ -25,8 +13,6 @@ use crate::ci_pipeline_driver::{
 };
 use crate::CiPipelineReporter;
 
-/// Credential-free refusal from a reporter factory. Concrete construction errors stay inside the
-/// composition root and must never expose a DSN through the runner error path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CiPipelineReporterFactoryError;
 
@@ -38,14 +24,12 @@ impl std::fmt::Display for CiPipelineReporterFactoryError {
 
 impl std::error::Error for CiPipelineReporterFactoryError {}
 
-/// Construct one fully-accounted reporter for the exact claimed tenant and the router's region.
 pub type CiPipelineReporterFactory = Arc<
     dyn Fn(&TenantId, &Region) -> Result<CiPipelineReporter, CiPipelineReporterFactoryError>
         + Send
         + Sync,
 >;
 
-/// Invalid static router configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CiPipelineReporterRouterError;
 
@@ -57,7 +41,6 @@ impl std::fmt::Display for CiPipelineReporterRouterError {
 
 impl std::error::Error for CiPipelineReporterRouterError {}
 
-/// A region-pinned terminal reporter that routes every completion to its exact tenant scope.
 #[derive(Clone)]
 pub struct CiPipelineReporterRouter {
     region: Region,
@@ -79,10 +62,6 @@ impl CiPipelineReporterRouter {
         &self.region
     }
 
-    /// **CT-007 slice 5b.3-6d STEP 4: resolve + verify the exact-tenant reporter for a preparation
-    /// report.** Applies the SAME empty-tenant, factory-scope, and accounting-owner checks
-    /// [`Self::report_done`] applies before any durable access — a preparation report never weakens
-    /// completion authority. The claim's tenant (one of its twelve fields) is the routing key.
     fn preparation_reporter(&self, tenant_id: &str) -> Result<CiPipelineReporter, ExecutorError> {
         if tenant_id.trim().is_empty() {
             return Err(ExecutorError::InvalidInput(
@@ -110,8 +89,6 @@ impl CiPipelineReporterRouter {
 
 impl TerminalReporter for CiPipelineReporterRouter {
     fn completion_settlement_owner(&self) -> CompletionSettlementOwner {
-        // The factory type is production-only by contract: every constructed reporter carries
-        // durable accounting. Test-only bypass reporters are never a valid router composition.
         CompletionSettlementOwner::TerminalReporter
     }
 
@@ -178,9 +155,6 @@ impl TerminalReporter for CiPipelineReporterRouter {
         disposition: PreparationTerminalDisposition,
         diagnostic: Option<&str>,
     ) -> Result<SignalOutcome, ExecutorError> {
-        // CT-007 5b.3-6d STEP 4: route to the exact-tenant reporter, then map the sandbox reporting
-        // identity 1:1 onto the durable request and delegate to the inherent durable CAS. UFCS names
-        // the inherent method, never the reporter's trait method.
         let reporter = self.preparation_reporter(&claim.tenant_id)?;
         CiPipelineReporter::report_preparation_terminal_with_diagnostic(
             &reporter,

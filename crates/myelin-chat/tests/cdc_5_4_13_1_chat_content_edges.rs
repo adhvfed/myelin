@@ -1,24 +1,3 @@
-//! # The CDC pair for contracts 5.4 + 13.1 — Chat content-node reference edges (CHAT-P11 / P-405)
-//!
-//! **Contracts:**
-//! - **5.4** `refs.edge.created` — emitted by producers via the outbox; the `mention`/`artifact_ref`/
-//!   `embed` content nodes are the producers; **no standalone edge-write API**. Provider = Chat's
-//!   message-body producer ([`myelin_chat::content`]); consumer = the Refs edge-builder
-//!   (`myelin_refs_service::edge_builder::RefsEdgeBuilder`), modelled locally here.
-//! - **13.1** the `myelin-content` markdown-subset for the body content (`render(parse(md)) === md`) +
-//!   the three structured inline nodes + the strict Chat subset (EXCLUDES db_view/sync_block/toggle).
-//!   Provider = Knowledge (freezes the taxonomy); Chat CONSUMES the frozen subset for its message
-//!   bodies.
-//!
-//! **The seam this pair pins.** Chat is a producer LEAF and CANNOT depend on the Refs SERVICE crate
-//! (the §2.9 acyclic DAG). So the Chat-owned producer half ([`myelin_chat::content::emit_body_edges`])
-//! must emit the **byte-identical** `refs.edge.created` wire shape the Refs edge-builder consumes. This
-//! CDC models the CONSUMER half locally (the exact field reads + the deterministic `edge_id` derivation
-//! the Refs builder performs) and PROVES the provider's emitted envelope ingests through it with the
-//! correct edge identity — so a drift on either side fails this one CI job. (This mirrors
-//! `cdc_5_4_13_1_git_content_edges.rs`, which pins the same wire shape with a local consumer decoder
-//! for the same reason — one shape across producers, no second edge vocabulary.)
-
 use std::sync::Arc;
 
 use myelin_chat::content::{
@@ -36,18 +15,9 @@ use myelin_events::{
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
-// ── The CONSUMER half (the Refs edge-builder's field reads + the deterministic edge_id), modelled
-//    here so this crate need not depend on the Refs service crate (the §2.9 DAG one-directional edge).
-//    These MUST stay byte-identical to `myelin_refs_service::edge_builder::{edge_id, apply_created}`
-//    and to the Git CDC's local model (cdc_5_4_13_1_git_content_edges.rs). ───────────────────────────
-
-/// The deterministic `edge_id = hash(tenant, source, target, rel)` — byte-identical to
-/// `myelin_refs_service::edge_builder::edge_id` (FNV-1a 128-bit over the NUL-separated tuple). The
-/// consumer derives the idempotency key from the PROVIDER's payload triple; a replay of the same
-/// logical edge upserts the same row.
 fn consumer_edge_id(tenant: &str, source: &str, target: &str, rel: &str) -> String {
-    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d; // FNV-1a 128-bit offset basis.
-    const PRIME: u128 = 0x0000000001000000000000000000013b; // FNV-1a 128-bit prime.
+    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013b;
     let mut feed = |bytes: &[u8]| {
         for &b in bytes {
             h ^= b as u128;
@@ -63,9 +33,6 @@ fn consumer_edge_id(tenant: &str, source: &str, target: &str, rel: &str) -> Stri
     format!("{h:032x}")
 }
 
-/// The consumer's decoded edge row (exactly the fields `RefsEdgeBuilder::apply_created` reads off a
-/// `refs.edge.created` envelope). A decode failure names the missing field (fail-closed) — so the CDC
-/// also proves the provider never omits a required field.
 #[derive(Debug, PartialEq, Eq)]
 struct DecodedEdge {
     edge_id: String,
@@ -75,9 +42,6 @@ struct DecodedEdge {
     rel_class: String,
 }
 
-/// The CONSUMER decode: read `source`/`target`/`rel`/`rel_class` off the envelope payload + derive the
-/// deterministic `edge_id` from `(tenant, source, target, rel)` — exactly what the Refs edge-builder
-/// does on `*.created`. Returns `Err(field)` if a required field is missing (fail-closed).
 fn consumer_decode(env: &EventEnvelope) -> Result<DecodedEdge, String> {
     assert_eq!(
         env.type_.0, "refs.edge.created",
@@ -119,8 +83,6 @@ fn alice() -> Principal {
     )
 }
 
-/// The message's `chat.message.created` content event (the CAUSE) — constructed directly (the message
-/// write holds it in hand). The edges co-commit with the message row in the SAME transaction.
 fn content_event(source: &ArtifactRef) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId("01J-msg".into()),
@@ -145,14 +107,6 @@ fn content_event(source: &ArtifactRef) -> EventEnvelope {
     }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-// 5.4 — the PROVIDER (Chat body) emits the wire shape the CONSUMER (Refs edge-builder) ingests
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-
-/// **The Chat-emitted `refs.edge.created` decodes cleanly through the Refs edge-builder's reads, with
-/// the SAME deterministic `edge_id`, `rel`, and `reference` class.** This is the 5.4
-/// provider↔consumer equivalence: a chat message's structured nodes produce edges the Refs index
-/// ingests byte-compatibly.
 #[test]
 fn chat_body_edges_decode_through_the_refs_consumer_with_the_right_edge_id() {
     let outbox = OutboxStore::new();
@@ -171,12 +125,9 @@ fn chat_body_edges_decode_through_the_refs_consumer_with_the_right_edge_id() {
     let ids = emit_body_edges(&mut tx, &source, &nodes, &ce).unwrap();
     tx.commit().unwrap();
 
-    // the PROVIDER's view of the edge set (the same extraction the emit ran).
     let provider_edges = extract_body_edges(&source, &nodes);
     assert_eq!(provider_edges.len(), 3);
 
-    // every emitted envelope decodes through the CONSUMER, to the SAME edge_id the provider's triple
-    // would key, with rel_class = reference.
     for (id, p_edge) in ids.iter().zip(provider_edges.iter()) {
         let env = outbox.row(id).unwrap().envelope;
         let decoded = consumer_decode(&env).expect("the consumer decodes the Chat edge");
@@ -199,8 +150,6 @@ fn chat_body_edges_decode_through_the_refs_consumer_with_the_right_edge_id() {
     }
 }
 
-/// **The frozen X-2 uniform mapping is provider/consumer-agreed: mention→mentions, artifact_ref→links,
-/// embed→embeds.** Pinned at the wire level (the consumer-decoded `rel` per node kind).
 #[test]
 fn the_three_node_kinds_map_to_the_frozen_rels() {
     let outbox = OutboxStore::new();
@@ -237,8 +186,6 @@ fn the_three_node_kinds_map_to_the_frozen_rels() {
     }
 }
 
-/// **A plain-prose message body emits ZERO edges** — extraction is structured, never a regex over the
-/// prose. The no-op case (0 structured nodes → 0 `refs.edge.created`).
 #[test]
 fn plain_prose_message_emits_no_edges() {
     let outbox = OutboxStore::new();
@@ -247,9 +194,8 @@ fn plain_prose_message_emits_no_edges() {
     let ce = content_event(&source);
     let mut tx = outbox.begin(Arc::clone(&minter), ctx_base());
     tx.stage_state_change("plain message");
-    // a prose `@alice` + a prose URL — NOT structured nodes.
     let body = MessageBody::new(vec![Block::Paragraph {
-        inline: parse_inline("ping @alice — see myelin://acme/issue/ENG-1", &[]),
+        inline: parse_inline("ping @alice - see myelin://acme/issue/ENG-1", &[]),
     }])
     .unwrap();
     let nodes: Vec<InlineNode> = body.structured_nodes().into_iter().cloned().collect();
@@ -259,13 +205,6 @@ fn plain_prose_message_emits_no_edges() {
     assert_eq!(outbox.committed_count(), 0, "0 edge events committed");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-// 13.1 — the body content is the frozen Chat SUBSET (render(parse(md)) === md + excluded-node reject)
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-
-/// **The Chat body is the frozen `myelin-content` subset: `render(parse(md)) === md`** (13.1). A body
-/// mixing marks + structured nodes round-trips byte-identically through the ONE editor render path —
-/// Chat CONSUMES the frozen subset, it does not author a second content model.
 #[test]
 fn chat_body_is_the_frozen_content_subset_and_round_trips() {
     let body = MessageBody::new(vec![
@@ -275,7 +214,7 @@ fn chat_body_is_the_frozen_content_subset_and_round_trips() {
         },
         Block::Paragraph {
             inline: parse_inline(
-                &format!("ship it — see {OBJ} and `cargo test` per [doc](https://x.test/d)"),
+                &format!("ship it - see {OBJ} and `cargo test` per [doc](https://x.test/d)"),
                 &[InlineNode::Embed(ArtifactRef(
                     "myelin://acme/knowledge/page/7c2".into(),
                 ))],
@@ -296,9 +235,6 @@ fn chat_body_is_the_frozen_content_subset_and_round_trips() {
     );
 }
 
-/// **The Chat subset EXCLUDES db_view/sync_block/toggle (X-2): 0 excluded nodes accepted by the chat
-/// parser.** Each Knowledge-only block is rejected LOUDLY by [`validate_subtree`] / [`MessageBody::new`]
-/// — never a silent drop. A nested one (inside a table cell) is caught by the recursive walk.
 #[test]
 fn chat_subset_excludes_the_three_knowledge_only_nodes() {
     use myelin_query::{FieldId, ViewSpec};
@@ -334,7 +270,6 @@ fn chat_subset_excludes_the_three_knowledge_only_nodes() {
             MessageBody::new(vec![block.clone()]).is_err(),
             "MessageBody::new rejects `{name}`"
         );
-        // nested in a table cell — still rejected by the recursive walk (0 excluded nodes accepted).
         let nested = Block::Table {
             columns: vec![Column {
                 header: parse_inline("c", &[]),
@@ -347,13 +282,10 @@ fn chat_subset_excludes_the_three_knowledge_only_nodes() {
     }
 }
 
-/// **The round-trip is over the canonical form (serialize∘parse is a fixed point on the STORED AST).**
-/// A non-canonical source body is normalised by `parse_inline` at construction, so the stored AST
-/// always round-trips — the meaningful 13.1 correctness bar for an AST-storing document.
 #[test]
 fn stored_ast_round_trip_is_canonical() {
     let body = MessageBody::new(vec![Block::Paragraph {
-        inline: parse_inline("a*b", &[]), // a literal `*` that opens no mark — normalised to `a\*b`.
+        inline: parse_inline("a*b", &[]),
     }])
     .unwrap();
     assert!(

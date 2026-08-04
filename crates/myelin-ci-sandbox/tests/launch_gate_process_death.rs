@@ -1,4 +1,3 @@
-//! Process-level proof for the durable launch guard's runner-death cleanup.
 #![cfg(feature = "test-support")]
 
 use std::process::Command;
@@ -73,8 +72,6 @@ fn stopped_runner_cannot_pause_runtime_past_the_independent_deadline() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // SAFETY: helper.id() is the exact disposable child process. SIGSTOP suspends every runner
-    // thread, while the separately forked native watchdog remains runnable.
     assert_eq!(
         unsafe { libc::kill(helper.id() as i32, libc::SIGSTOP) },
         0,
@@ -85,7 +82,6 @@ fn stopped_runner_cannot_pause_runtime_past_the_independent_deadline() {
         !escaped.exists(),
         "runtime survived past its deadline while the owning runner was stopped"
     );
-    // Resume only to reap the parked helper; its runtime has already been killed by the watchdog.
     unsafe {
         libc::kill(helper.id() as i32, libc::SIGCONT);
     }

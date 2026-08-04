@@ -1,45 +1,3 @@
-//! # `myelin inbox list | show` — the read-surface CLI (NOTIF-P5 / P-183, M2)
-//!
-//! **Owning architecture doc:** `notifications.md` §1.3 (the ONE inbox; scoped views are filters),
-//! §1.4 (agents have inboxes too). **Contract:** **7.1** `list_inbox` (the read surface the CLI
-//! drives). The CLI is a thin presentation seam over [`list_inbox`](crate::list_inbox::list_inbox):
-//! it maps a named scoped view ([`CliView`]) to the frozen [`InboxFilter`], calls `list_inbox`, and
-//! renders the page as PII-free lines (an opaque `item_id`, the reason/class token, the subject
-//! ref — never a rendered string; humanise is per-viewer at read time, NOTIF-P9).
-//!
-//! ## What this ships
-//! - [`inbox_list`] — `myelin inbox list [--view my-work|activity|review-requests]`: the ONE inbox
-//!   (default `--view all`) or a named scoped view, paged, authorized.
-//! - [`inbox_show`] — `myelin inbox show <item_id>`: one item's read-surface detail (reason, class,
-//!   subject ref, read-state), for the principal (recipient-scoped + authorized through the SAME
-//!   `list_inbox` path, so `show` can never reveal an item `list` would not).
-//!
-//! ## What this ships (read-state added at NOTIF-P6 / P-184)
-//! - [`inbox_read`] — `myelin inbox read <item_id>`: mark the caller's item read (the ONE
-//!   read-state truth — it is read in every view at once). Recipient-scoped (you can only read your
-//!   own items).
-//! - [`inbox_snooze`] — `myelin inbox snooze <item_id> --until <ts>`: park the item until `<ts>`
-//!   (suppressed from the active inbox; the until recorded). The durable re-surface timer is
-//!   NOTIF-P14/P18 (named floor).
-//!
-//! ## FLOORS named
-//! - **The argv parse + the wired binary** (the actual `myelin` CLI command tree / the gateway
-//!   route) is the driver's (the CLI binary lands with the gateway wiring, P-S15+). Here the CLI is
-//!   the LIBRARY surface a binary calls — keeping `cargo build --workspace` DB-free and the read
-//!   logic unit-testable. The presentation (humanised per-viewer strings) is NOTIF-P9; here the CLI
-//!   renders the structured refs/tokens (the read surface, not the humanised render).
-//! - **The durable snooze re-surface TIMER** (the `myelin-flow` wheel that flips a due snooze back to
-//!   the active inbox) is **NOTIF-P14 / NOTIF-P18**; `inbox snooze` records the until only.
-//!
-//! ## What this ships (inbox watch added at NOTIF-P15 / P-193)
-//! - [`inbox_watch`] — `myelin inbox watch [--from <seq>]`: stream new items live over the FROZEN
-//!   firehose resume-cursor protocol (§7). Opens (or resumes from `<seq>`) a watch on the BOUNDED
-//!   `inbox:<principal>` scope; drains the ready frames as PII-free `WATCH <seq> <item_id>` lines; an
-//!   over-old cursor surfaces as the NAMED `resync_required` → fall back to `myelin inbox list`. The
-//!   wire mechanism (long-poll/SSE/WebSocket) is the connection tier's (a named floor). No bespoke
-//!   Notif transport — it consumes [`watch_open`](crate::watch::watch_open) /
-//!   [`watch_resume`](crate::watch::watch_resume).
-
 use myelin_identity::{Consistency, Principal};
 
 use crate::list_inbox::{list_inbox, InboxFilter, InboxPage, Page, ReadAuthorizePort, Subsystem};
@@ -50,24 +8,15 @@ use crate::watch::{watch_open, watch_resume, InboxFrame, WatchOutcome};
 use crate::{Class, NotifPrefs, Reason};
 use myelin_events::firehose::Firehose;
 
-/// **The named scoped view a `myelin inbox list --view <name>` selects** (the C-9 §1.3 surfaces).
-/// Each maps to a frozen [`InboxFilter`] — a filter over the ONE inbox, never a second store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CliView {
-    /// `--view all` (the default) — the unified ONE inbox (`filter = ∅`).
     All,
-    /// `--view my-work` — Issues "My Work" (`subsystem∈{issue} ∧ reason∈{assigned, …}`).
     MyWork,
-    /// `--view activity` — Chat "Activity / Mentions" (`subsystem∈{chat} ∧ reason∈{mentioned, …}`).
     Activity,
-    /// `--view review-requests` — Git "Review requests" (`subsystem∈{git} ∧ reason∈{review_requested, …}`).
     ReviewRequests,
 }
 
 impl CliView {
-    /// Parse the `--view` flag value into a [`CliView`] (`None` ⇒ the default `all`). An unknown
-    /// view name is `Err` (a typo'd view never silently degrades to the ALL inbox — that would over-
-    /// share; loud, never silent).
     pub fn parse(name: Option<&str>) -> Result<CliView, String> {
         match name {
             None | Some("all") => Ok(CliView::All),
@@ -80,7 +29,6 @@ impl CliView {
         }
     }
 
-    /// The frozen [`InboxFilter`] this view selects (the §1.3 mapping — a filter, not a store).
     pub fn filter(self) -> InboxFilter {
         match self {
             CliView::All => InboxFilter::all(),
@@ -91,11 +39,6 @@ impl CliView {
     }
 }
 
-/// **`myelin inbox list [--view <name>]` — list the ONE inbox (or a scoped view), paged.** Drives
-/// [`list_inbox`] for `principal` with the [`CliView`]'s frozen filter, returning the
-/// [`InboxPage`] (recipient-scoped, filtered, authorized, ordered). The caller renders it via
-/// [`render_list`]. The read goes through the ONE `list_inbox` path — a CLI view can never reveal
-/// an item the contract read would not.
 pub fn inbox_list(
     inbox: &InboxProjection,
     principal: &Principal,
@@ -107,11 +50,6 @@ pub fn inbox_list(
     list_inbox(inbox, principal, &view.filter(), page, authorize, at)
 }
 
-/// **`myelin inbox show <item_id>` — one item's read-surface detail.** Looks the item up THROUGH
-/// the unfiltered [`list_inbox`] path (recipient-scoped + authorized), so `show` can never reveal
-/// an item `list` would not (no back-door read): an item not in the caller's authorized inbox →
-/// `None` (held, not leaked). Returns the [`InboxShow`] structured detail (refs/tokens, never a
-/// rendered string — humanise is NOTIF-P9).
 pub fn inbox_show(
     inbox: &InboxProjection,
     principal: &Principal,
@@ -119,9 +57,6 @@ pub fn inbox_show(
     authorize: &dyn ReadAuthorizePort,
     at: &Consistency,
 ) -> Option<InboxShow> {
-    // Read the whole authorized inbox (bounded scan; the live OLTP form is a `WHERE item_id = $1`
-    // re-checked through the SAME authorize seam — same visibility, no back-door). A large limit so
-    // the item is found if present; the live form looks it up by key then authorizes it.
     let page = list_inbox(
         inbox,
         principal,
@@ -139,11 +74,6 @@ pub fn inbox_show(
         .map(InboxShow::from_row)
 }
 
-/// **`myelin inbox read <item_id>` — mark the caller's item read (the ONE read-state truth).** A
-/// thin seam over [`mark`]`(.., ReadState::Read)`: it flips the `state` of the calling principal's
-/// item to `read`, visible in the unified inbox AND every scoped view at once (one store). A row not
-/// addressed to the caller / a missing id is [`ReadStateError::NotFound`] (you can only read your own
-/// items; held, not leaked).
 pub fn inbox_read(
     inbox: &InboxProjection,
     principal: &Principal,
@@ -152,11 +82,6 @@ pub fn inbox_read(
     mark(inbox, principal, item_id, ReadState::Read)
 }
 
-/// **`myelin inbox snooze <item_id> --until <ts>` — park the caller's item until `<ts>`.** A thin
-/// seam over [`snooze`]: it sets the item to `snoozed` and records the `until`; the item is then
-/// suppressed from the active inbox. A row not addressed to the caller / a missing id is
-/// [`ReadStateError::NotFound`]. **FLOOR:** the durable re-surface timer is NOTIF-P14/P18 — here only
-/// the until is recorded.
 pub fn inbox_snooze(
     inbox: &InboxProjection,
     principal: &Principal,
@@ -166,18 +91,6 @@ pub fn inbox_snooze(
     snooze(inbox, principal, item_id, until)
 }
 
-/// **`myelin inbox watch` — stream new items live over the resume-cursor path (NOTIF-P15 / P-193).**
-/// A thin seam over the FROZEN firehose resume-cursor protocol ([`watch_open`] / [`watch_resume`],
-/// §7) — there is NO bespoke Notif live transport. Opens (or, with `last_seq`, RESUMES) a watch on
-/// the BOUNDED `inbox:<principal>` scope and drains the currently-ready frames into PII-free
-/// `WATCH <seq> <item_id>` lines (a frame carries ONLY the `item_id` pointer — refs-not-payloads;
-/// the humanised render is a per-viewer READ, NOTIF-P9). On reconnect with an over-old `last_seq` the
-/// transport returns `resync_required`; this surfaces it as the NAMED cold-rebuild signal so the
-/// caller falls back to a full `myelin inbox list` (the §7 cold rebuild — never a silent gap).
-///
-/// **FLOOR (named):** the WIRE mechanism (long-poll vs SSE vs WebSocket — the long-lived connection
-/// that keeps pulling) is the CONNECTION TIER's, NOT Notif's (§7); this library entry drains the
-/// frames ready at call time over the in-process protocol. The real streaming connection is Chat M4.
 pub fn inbox_watch(
     firehose: &mut Firehose,
     principal: &Principal,
@@ -188,8 +101,6 @@ pub fn inbox_watch(
         Some(last_seq) => watch_resume(firehose, principal, last_seq),
     };
     match outcome {
-        // a real principal always makes a bounded scope, so an Err here is a transport fault, not a
-        // user input error — surface it as a resync (the safe, NAMED recovery), never a silent drop.
         Err(_) => WatchView::ResyncRequired,
         Ok(WatchOutcome::ResyncRequired { .. }) => WatchView::ResyncRequired,
         Ok(WatchOutcome::Live(watch)) => {
@@ -202,28 +113,19 @@ pub fn inbox_watch(
     }
 }
 
-/// **The presentation view of `myelin inbox watch`.** Either the live frames drained at call time
-/// (with the resume cursor to present on the next reconnect) OR the NAMED `resync_required`
-/// cold-rebuild signal (the client falls back to `myelin inbox list`). PII-free.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatchView {
-    /// The watch is live: the frames ready now + the resume cursor (the `last_seq` to reconnect with).
     Live {
-        /// The resume cursor — the last delivered seq (present on the next reconnect).
         last_seq: u64,
-        /// The frames drained at call time (refs-not-payloads `item_id` pointers).
         frames: Vec<InboxFrame>,
     },
-    /// The cursor was over-old — the client must fall back to a full `myelin inbox list` cold rebuild
-    /// (the §7 cold-rebuild path, NAMED not silent).
     ResyncRequired,
 }
 
-/// Render a [`WatchView`] as PII-free lines (`WATCH <seq> <item_id>`; or the resync directive).
 pub fn render_watch(view: &WatchView) -> String {
     match view {
         WatchView::ResyncRequired => {
-            "RESYNC_REQUIRED cursor too old — run `myelin inbox list` to cold-rebuild".to_string()
+            "RESYNC_REQUIRED cursor too old - run `myelin inbox list` to cold-rebuild".to_string()
         }
         WatchView::Live { last_seq, frames } => {
             let mut out = format!("WATCHING cursor={last_seq}\n");
@@ -235,21 +137,10 @@ pub fn render_watch(view: &WatchView) -> String {
     }
 }
 
-// ===========================================================================================
-//  `myelin inbox prefs` / `myelin notify prefs|test` — the prefs CLI (NOTIF-P10 / P-188)
-// ===========================================================================================
-
-/// **`myelin inbox prefs` / `myelin notify prefs` — show the caller's prefs + quiet-hours.** A thin
-/// seam over [`get_prefs`] (contract 7.4); renders the routing matrix (channel ← matcher source),
-/// the quiet windows (in the recipient tz), and the pierce-classes as PII-free lines. Recipient-
-/// scoped (a principal reads only their own prefs). The caller renders via [`render_prefs`].
 pub fn notify_prefs(store: &PrefStore, principal: &Principal) -> PrefView {
     get_prefs(store, principal)
 }
 
-/// **`myelin notify prefs --set …` — UPSERT the caller's prefs + quiet-hours.** A thin seam over
-/// [`set_prefs`] (contract 7.4). The routing matchers are already cost-bounded frozen `QueryAst`s
-/// (an over-budget matcher could never have been built). Returns the stored [`PrefView`] to echo.
 pub fn notify_prefs_set(
     store: &PrefStore,
     principal: &Principal,
@@ -259,11 +150,6 @@ pub fn notify_prefs_set(
     set_prefs(store, principal, prefs, quiet)
 }
 
-/// **`myelin notify test --reason <r> --class <c> --subsystem <s> [--at <utc_min> --weekday <d>]` —
-/// preview the routing decision.** Shows which channels the caller's CURRENT prefs would deliver a
-/// hypothetical item on, AT a given instant (so a recipient can see "would a fyi at 03:00 reach my
-/// phone?"). Drives the SAME [`route`] decision the router uses (no second decision path) — the
-/// preview can never disagree with the real delivery. Returns the PII-free channel-token list.
 pub fn notify_test(
     store: &PrefStore,
     principal: &Principal,
@@ -288,13 +174,10 @@ pub fn notify_test(
     .collect()
 }
 
-/// Render a [`PrefView`] as PII-free CLI lines: the routing matrix (channel ← matcher source), the
-/// quiet windows (offset tz + minute ranges), and the pierce-classes. Never a rendered string.
 pub fn render_prefs(view: &PrefView) -> String {
     let mut out = String::new();
     out.push_str("routing:\n");
     for rule in &view.prefs.routing {
-        // The matcher's textual source (the P-235 parser surface) or its node-count if a built tree.
         let m = if rule.matcher.source().is_empty() {
             "<compiled matcher>".to_string()
         } else {
@@ -327,27 +210,17 @@ pub fn render_prefs(view: &PrefView) -> String {
     out
 }
 
-/// **One item's structured read-surface detail (`myelin inbox show`).** PII-free: the opaque
-/// `item_id`, the reason/class tokens, the subject ref, the read-state — NEVER a rendered string
-/// (the per-viewer humanised render is NOTIF-P9; the CLI presents the structured refs/tokens).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxShow {
-    /// The opaque inbox-item id (the read-state handle, contract 7.2).
     pub item_id: String,
-    /// The structured why-it-fired token (the C-9 filter basis) — e.g. `assigned`.
     pub reason: String,
-    /// The routing class token — e.g. `direct`.
     pub class: String,
-    /// The subject `ArtifactRef` (a ref, never a payload — humanise resolves it per-viewer, P9).
     pub subject: String,
-    /// The ONE read-state column value (unread|seen|read|…).
     pub state: String,
-    /// The "+N more" write-time-collapse counter.
     pub coalesce_count: i32,
 }
 
 impl InboxShow {
-    /// Project a [`RoutedInboxItem`] into the PII-free read-surface detail (tokens + refs only).
     fn from_row(row: RoutedInboxItem) -> InboxShow {
         InboxShow {
             item_id: row.item_id,
@@ -360,8 +233,6 @@ impl InboxShow {
     }
 }
 
-/// Render a [`InboxPage`] as PII-free CLI lines (`<item_id>  [<reason>/<class>]  <subject-ref>
-/// (<state>)`) — never a rendered string (humanise is NOTIF-P9). One line per item, stable order.
 pub fn render_list(page: &InboxPage) -> String {
     let mut out = String::new();
     for row in &page.items {
@@ -375,12 +246,11 @@ pub fn render_list(page: &InboxPage) -> String {
         ));
     }
     if page.cursor.0.is_some() {
-        out.push_str("… (more — pass the cursor to page)\n");
+        out.push_str("… (more - pass the cursor to page)\n");
     }
     out
 }
 
-/// The PII-free `reason` token for CLI/output (the serde snake_case wire token).
 fn reason_token(reason: crate::Reason) -> String {
     serde_json::to_value(reason)
         .ok()
@@ -388,7 +258,6 @@ fn reason_token(reason: crate::Reason) -> String {
         .unwrap_or_else(|| format!("{reason:?}"))
 }
 
-/// The PII-free `class` token for CLI/output (the serde snake_case wire token).
 fn class_token(class: crate::Class) -> String {
     serde_json::to_value(class)
         .ok()
@@ -460,8 +329,6 @@ mod tests {
         inbox
     }
 
-    /// **`--view` parses the named scoped views and rejects an unknown one** (a typo never silently
-    /// becomes the ALL inbox — that would over-share).
     #[test]
     fn view_parse_maps_names_and_rejects_unknown() {
         assert_eq!(CliView::parse(None).unwrap(), CliView::All);
@@ -478,8 +345,6 @@ mod tests {
         );
     }
 
-    /// **`inbox list --view my-work` drives `list_inbox` with the frozen My Work filter** — exactly
-    /// the issues row, never the chat/git rows (the CLI view is the contract view).
     #[test]
     fn inbox_list_my_work_selects_only_the_issues_row() {
         let inbox = seeded("u1");
@@ -499,8 +364,6 @@ mod tests {
         );
     }
 
-    /// **`inbox list` (the default view) is the unified ONE inbox** — all three rows for the
-    /// principal, recipient-scoped.
     #[test]
     fn inbox_list_default_is_the_one_inbox() {
         let inbox = seeded("u1");
@@ -519,8 +382,6 @@ mod tests {
         );
     }
 
-    /// **`inbox show <id>` returns the item's PII-free detail — refs/tokens, never a rendered
-    /// string.** The detail carries the subject REF (humanise is NOTIF-P9), not a title.
     #[test]
     fn inbox_show_returns_refs_not_payloads() {
         let inbox = seeded("u1");
@@ -545,9 +406,6 @@ mod tests {
         assert_eq!(show.state, "unread");
     }
 
-    /// **`inbox show` can NEVER reveal an item `list` would not** — it reads through the same
-    /// authorize seam. A denied item is `None` from `show` (no back-door read), and another
-    /// principal's item is `None` (recipient scope).
     #[test]
     fn inbox_show_obeys_authorize_and_recipient_scope_no_backdoor() {
         struct DenyAll;
@@ -557,12 +415,10 @@ mod tests {
             }
         }
         let inbox = seeded("u1");
-        // a denied item is not shown (held, not leaked — same as list).
         assert!(
             inbox_show(&inbox, &principal("u1"), "iss-1", &DenyAll, &strong()).is_none(),
             "denied → not shown"
         );
-        // another principal cannot show u1's item (recipient scope).
         assert!(
             inbox_show(
                 &inbox,
@@ -574,7 +430,6 @@ mod tests {
             .is_none(),
             "not my item → not shown"
         );
-        // a missing id is None.
         assert!(inbox_show(
             &inbox,
             &principal("u1"),
@@ -585,8 +440,6 @@ mod tests {
         .is_none());
     }
 
-    /// **`inbox read <id>` marks the caller's item read (the ONE read-state truth), recipient-
-    /// scoped.** After `read`, `show` reports `read`. u2 cannot read u1's item (NotFound).
     #[test]
     fn inbox_read_marks_read_recipient_scoped() {
         let inbox = seeded("u1");
@@ -600,20 +453,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(show.state, "read", "the item is read after `inbox read`");
-        // u2 cannot read u1's item.
         assert_eq!(
             inbox_read(&inbox, &principal("u2"), "iss-1"),
             Err(crate::read_state::ReadStateError::NotFound)
         );
-        // a missing id is NotFound.
         assert_eq!(
             inbox_read(&inbox, &principal("u1"), "no-such"),
             Err(crate::read_state::ReadStateError::NotFound)
         );
     }
 
-    /// **`inbox snooze <id> --until <ts>` records the until + parks the item.** After snooze, `show`
-    /// reports `snoozed`; the active inbox no longer contains it.
     #[test]
     fn inbox_snooze_records_until_and_parks() {
         let inbox = seeded("u1");
@@ -631,7 +480,6 @@ mod tests {
             show.state, "snoozed",
             "the item is snoozed after `inbox snooze`"
         );
-        // suppressed from the active inbox.
         let page = inbox_list(
             &inbox,
             &principal("u1"),
@@ -647,8 +495,6 @@ mod tests {
         );
     }
 
-    /// **`render_list` renders PII-free lines (item_id + reason/class token + subject ref + state),
-    /// never a rendered string.** The output carries the ref, never a humanised title (P9).
     #[test]
     fn render_list_is_pii_free_lines() {
         let inbox = seeded("u1");
@@ -664,23 +510,16 @@ mod tests {
         assert!(
             out.contains("iss-1  [assigned/direct]  myelin://acme/issue/issue/PROJ-1  (unread)")
         );
-        // the subject is a ref, never a title — there is no humanised string in the CLI output.
         assert!(out.contains("myelin://acme/git/pr/9"));
     }
 
-    /// **`myelin inbox watch` streams live frames + reports the resume cursor (NOTIF-P15).** Opening a
-    /// watch then publishing two frames yields the two `WATCH <seq> <item_id>` lines (refs-not-payloads)
-    /// and advances the cursor.
     #[test]
     fn inbox_watch_streams_live_frames_pii_free() {
         let mut fh = myelin_events::firehose::Firehose::new();
         let me = principal("u1");
-        // open a live watch, then two items arrive.
         let _open = inbox_watch(&mut fh, &me, None);
         crate::watch::publish_inbox_frame(&mut fh, &me, "itm-1").unwrap();
         crate::watch::publish_inbox_frame(&mut fh, &me, "itm-2").unwrap();
-        // a no-cursor `watch` opens a FRESH live view (the prior handle dropped); to see the two
-        // frames we resume from 0 (the connection-tier holds the live handle — here we drive a poll).
         let view = inbox_watch(&mut fh, &me, Some(0));
         let out = render_watch(&view);
         assert!(
@@ -691,7 +530,6 @@ mod tests {
             out.contains("WATCH 2 itm-2"),
             "the second live frame renders"
         );
-        // the cursor advanced to the head.
         if let WatchView::Live { last_seq, .. } = view {
             assert_eq!(last_seq, 2, "the resume cursor is the last delivered seq");
         } else {
@@ -699,9 +537,6 @@ mod tests {
         }
     }
 
-    /// **An over-old cursor surfaces as the NAMED resync directive (NOTIF-P15).** With a tiny window,
-    /// a stale cursor cannot backfill → `inbox watch` returns the resync view (fall back to `list`),
-    /// never a silent partial replay.
     #[test]
     fn inbox_watch_over_old_cursor_directs_a_cold_rebuild() {
         let mut fh = myelin_events::firehose::Firehose::with_limits(2, 1024);
@@ -709,7 +544,7 @@ mod tests {
         for i in 1..=5 {
             crate::watch::publish_inbox_frame(&mut fh, &me, &format!("itm-{i}")).unwrap();
         }
-        let view = inbox_watch(&mut fh, &me, Some(1)); // op 2 evicted → resync
+        let view = inbox_watch(&mut fh, &me, Some(1));
         assert_eq!(view, WatchView::ResyncRequired);
         assert!(
             render_watch(&view).contains("RESYNC_REQUIRED"),

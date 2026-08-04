@@ -1,24 +1,3 @@
-//! # CDC — contract 7.2 `mark / snooze / mark_all_read` (the ONE read-state truth) (P-184)
-//!
-//! **Architecture:** `notifications.md` §2.1 (ONE read-state store — the `state` column is the SAME
-//! row across every view; `snooze_until` records the snooze until), §1.3 (the C-9 read-state truth —
-//! read it in a scoped view, it is read in the unified inbox). **Contract:** **7.2**
-//! `mark / snooze / mark_all_read`.
-//!
-//! This CDC pins the 7.2 seam from BOTH sides:
-//!
-//! - **PROVIDER (Notif owns 7.2):** `mark`/`snooze`/`mark_all_read` flip the ONE read-state column;
-//!   the flip is visible in the unified inbox AND in every scoped view at once (one store, one
-//!   read-state — 0 divergence). `snooze` records the until + suppresses the item from the active
-//!   inbox. `mark_all_read(filter)` flips EXACTLY the filtered rows.
-//! - **CONSUMER (the inbox UI / the CLI):** marks read in one view and reads it back in another (the
-//!   one-read-state-truth wire), and snoozes through the CLI seam (the item leaves the active inbox).
-//!
-//! The two halves agree on the WIRE: the read-state column is ONE row (no second store), the snooze
-//! records the until + parks the item, and mark_all_read takes the SAME C-9 `InboxFilter` grammar as
-//! `list_inbox` (7.1). A drift on either side (a second read-state store, a snooze that does not
-//! suppress, a mark_all_read that hits unfiltered rows) breaks THIS build.
-
 use myelin_events::ArtifactRef;
 use myelin_identity::{
     Consistency, ConsistencyMode, Principal, PrincipalId, PrincipalKind, Zookie,
@@ -62,8 +41,6 @@ fn item(recipient: &str, id: &str, subject: &str, reason: Reason) -> RoutedInbox
     }
 }
 
-/// A mixed batch for `me`: an Issues "My Work" row, a non-My-Work issue, a Chat "Activity" row, a
-/// Git "Review" row.
 fn seeded(me: &str) -> InboxProjection {
     let inbox = InboxProjection::new();
     inbox.upsert_for_test(item(
@@ -116,19 +93,14 @@ fn state_in_view(
         .map(|r| r.state)
 }
 
-/// **PROVIDER + CONSUMER (the one-read-state truth): mark an item read in a SCOPED view → it is read
-/// in the unified inbox (and vice versa) — the `state` column is the SAME row.** Threshold: 1 state
-/// per item across all views; 0 divergence.
 #[test]
 fn read_state_is_one_truth_across_views_zero_divergence() {
     let me = "u1";
     let inbox = seeded(me);
     let p = principal(me);
 
-    // mark read (the CONSUMER side: a view marks it).
     mark(&inbox, &p, "iss-assigned", ReadState::Read).expect("mark my own item");
 
-    // it reads `read` in the scoped My Work view AND in the unified inbox — the SAME row (0 divergence).
     assert_eq!(
         state_in_view(&inbox, &p, &InboxFilter::issues_my_work(), "iss-assigned").as_deref(),
         Some("read"),
@@ -140,7 +112,6 @@ fn read_state_is_one_truth_across_views_zero_divergence() {
         "read in the unified inbox (same row)"
     );
 
-    // the inverse: mark a chat item read through the unified inbox → read in the Chat Activity view.
     mark(&inbox, &p, "chat-ment", ReadState::Read).unwrap();
     assert_eq!(
         state_in_view(&inbox, &p, &InboxFilter::chat_activity(), "chat-ment").as_deref(),
@@ -149,9 +120,6 @@ fn read_state_is_one_truth_across_views_zero_divergence() {
     );
 }
 
-/// **PROVIDER (the snooze-state test): `snooze(item, until)` → the item is suppressed from the
-/// active inbox; the until is recorded.** Threshold: snoozed item absent from the active inbox; until
-/// persisted.
 #[test]
 fn snooze_suppresses_from_active_inbox_and_records_until() {
     let me = "u1";
@@ -161,7 +129,6 @@ fn snooze_suppresses_from_active_inbox_and_records_until() {
 
     snooze(&inbox, &p, "git-review", until).expect("snooze my own item");
 
-    // the until is persisted on the SAME row.
     let row = inbox
         .snapshot_for_tenant(&tenant())
         .into_iter()
@@ -174,7 +141,6 @@ fn snooze_suppresses_from_active_inbox_and_records_until() {
         "the until is persisted (7.2)"
     );
 
-    // ABSENT from the active inbox (but still in the ONE store — not deleted).
     let full = list_inbox(
         &inbox,
         &p,
@@ -197,9 +163,6 @@ fn snooze_suppresses_from_active_inbox_and_records_until() {
     );
 }
 
-/// **PROVIDER (mark_all_read(filter)): flips EXACTLY the filtered rows — across views.** mark_all_read
-/// the My Work view flips the assigned issue; the chat/git rows + the non-My-Work issue are
-/// untouched. The flipped row reads `read` in the unified inbox too (one store).
 #[test]
 fn mark_all_read_flips_exactly_the_filtered_rows_across_views() {
     let me = "u1";
@@ -209,7 +172,6 @@ fn mark_all_read_flips_exactly_the_filtered_rows_across_views() {
     let n = mark_all_read(&inbox, &p, &InboxFilter::issues_my_work());
     assert_eq!(n, 1, "exactly the one My Work row flipped");
 
-    // read in BOTH the scoped view and the unified inbox.
     assert_eq!(
         state_in_view(&inbox, &p, &InboxFilter::issues_my_work(), "iss-assigned").as_deref(),
         Some("read")
@@ -220,7 +182,6 @@ fn mark_all_read_flips_exactly_the_filtered_rows_across_views() {
         "same row, read in the unified inbox"
     );
 
-    // everything outside the filter is untouched.
     assert_eq!(
         state_in_view(&inbox, &p, &InboxFilter::all(), "chat-ment").as_deref(),
         Some("unread")
@@ -235,16 +196,12 @@ fn mark_all_read_flips_exactly_the_filtered_rows_across_views() {
     );
 }
 
-/// **CONSUMER (the CLI seam): `inbox read` / `inbox snooze` drive the SAME read-state path.** The CLI
-/// is the consumer; it reads/snoozes through the contract, recipient-scoped (you can only touch your
-/// own items).
 #[test]
 fn cli_read_and_snooze_drive_the_read_state_contract() {
     let me = "u1";
     let inbox = seeded(me);
     let p = principal(me);
 
-    // CLI read.
     inbox_read(&inbox, &p, "iss-assigned").expect("read my own item");
     assert_eq!(
         cli::inbox_show(&inbox, &p, "iss-assigned", &AllowAllAuthorize, &strong())
@@ -253,7 +210,6 @@ fn cli_read_and_snooze_drive_the_read_state_contract() {
         "read"
     );
 
-    // CLI snooze — leaves the active inbox.
     inbox_snooze(&inbox, &p, "chat-ment", "2026-06-25T09:00:00Z").expect("snooze my own item");
     let page = cli::inbox_list(
         &inbox,
@@ -272,7 +228,6 @@ fn cli_read_and_snooze_drive_the_read_state_contract() {
         "the snoozed item left the active inbox"
     );
 
-    // recipient-scoped: u2 cannot read u1's item.
     assert_eq!(
         inbox_read(&inbox, &principal("u2"), "iss-assigned"),
         Err(ReadStateError::NotFound),
@@ -280,9 +235,6 @@ fn cli_read_and_snooze_drive_the_read_state_contract() {
     );
 }
 
-/// **THE CHAINED PROPERTY (EI-01 §4): ingest a batch → mark_all_read(filter) → re-list both the view
-/// AND the full inbox → assert read-state CONSISTENT across views.** The committed contract test the
-/// prompt requires.
 #[test]
 fn chained_ingest_mark_all_read_relist_consistent() {
     let me = "u1";
@@ -291,7 +243,6 @@ fn chained_ingest_mark_all_read_relist_consistent() {
 
     mark_all_read(&inbox, &p, &InboxFilter::issues_my_work());
 
-    // the view's row reads `read`.
     let view = list_inbox(
         &inbox,
         &p,
@@ -306,7 +257,6 @@ fn chained_ingest_mark_all_read_relist_consistent() {
     for r in &view.items {
         assert_eq!(r.state, "read", "every My Work row reads `read`");
     }
-    // the SAME row reads `read` in the full inbox; rows outside the view stay `unread` (0 divergence).
     let full = list_inbox(
         &inbox,
         &p,

@@ -1,240 +1,6 @@
-//! # `myelin-control-plane` — the PII-free control-plane registry + routing (CP-M1)
-//!
-//! Built across the CP-M1 prompts: **P-CP-05 / P-080** (the registry tables + the HARD placement
-//! invariant), **P-CP-06 / P-081** (`discover` — PII-free tenant-grain routing, off the hot path,
-//! client-cacheable fail-static), and **P-CP-07 / P-082** (`place(region, requested_tier)` +
-//! two-phase signup — PII born inside the cell; see [`place`]), and **P-CP-08 / P-084**
-//! (`placement_of(tenant_id)` — the routing answer + the gateway misroute-rejection, layer 4, CP-D2;
-//! see [`placement_of`]), and **P-CP-09 / P-085** (`residency_verify` — the no-global-pool signed
-//! attestation over the M1 store set; see [`residency_verify`]), and **P-CP-12 / P-096**
-//! (**the four-layer region-pinning enforced end-to-end** — the M1→M2 go/no-go: layers 1+2 (region
-//! immutable + the placement invariant) + layer 3 (the *runtime* `residency-pin` write boundary —
-//! every write asserts `row.region == cell.region`, the cell's region injected by the harness) +
-//! layer 4 (the gateway rejects a misroute), with **no cross-region query path for personal data**;
-//! see [`four_layer`]). The live store-layer twin (the Postgres RLS `WITH CHECK` on `region`) is
-//! proven against the dev stack in the storage `stor_d5_cross_region_egress` integration drill
-//! (CP-D3 + STOR-D5)), and **P-CP-13 / P-097** (**self-host parity** — the degenerate one-cell
-//! control plane [`DegenerateControlPlane`] runs the IDENTICAL `discover`/`place`/`placement_of`/
-//! `residency_verify` + four-layer code path over a one-row registry; the `residency-pin` lint holds
-//! and CP-D3 runs green on the degenerate cell; `residency_verify` is green on the install's own data;
-//! managed-fleet-only features are N/A by definition, not a gap; see [`self_host`]), and
-//! **P-CP-14 / P-098** (**the CP-outage blast-radius win, CP-D4** — hard-down the control plane and
-//! already-placed tenants KEEP SERVING entirely within their cells (routing is served fail-static
-//! from the client-cached [`DiscoveryCache`], contract 1.10); ONLY signup/provisioning degrades.
-//! [`cp_outage::DataPlane::serve`] routes a placed tenant fail-static through a hard-down
-//! [`cp_outage::ControlPlane`]; [`cp_outage::SignupPlane::signup`] is the ONLY thing that degrades;
-//! [`cp_outage::CpOutageReport`] is the measured `serving-uptime` (100%) + degrade-scope
-//! ([`cp_outage::DegradeScope::SignupAndProvisioningOnly`]). No new floor — a property assertion over
-//! the already-built discovery cache; see [`cp_outage`]).
-//!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/tenancy-and-control-plane.md`
-//! §3 (what lives ONLY in the control plane — the PII-free `tenant → {cell_id(s), region}` record,
-//! cell inventory, isolation tier, opaque routing token, aggregate utilisation, provisioning state;
-//! ZERO in-region personal data), §5.1 (the three PII-free tables + the per-cell `local_tenant`
-//! directory + the HARD placement invariant), §5.3 (the four-layer region-pinning defence).
-//!
-//! **Contract-index cluster 12 — Tenancy & control plane.** Owns: the **registry-schema half of
-//! 12.3** (the `tenant_placement` table the `place`/`placement_of` answers store in, + the
-//! invariant). Consumed: 12.1 (the partition key — [`myelin_tenancy::TenantId`] /
-//! [`myelin_tenancy::Region`] / [`myelin_tenancy::CellId`]); 1.1/1.4/1.8 (the harness boot /
-//! holder auto-registration / telemetry).
-//!
-//! ## What this prompt (P-CP-05 / P-080) ships
-//! 1. **The three PII-free registry tables** ([`schema::Cell`], [`schema::TenantPlacement`],
-//!    [`schema::CellProvisioning`]) + the per-cell [`schema::LocalTenant`] directory — EVERY column
-//!    opaque / region / status / non-personal slug / aggregate count, guarded by the
-//!    `control-plane-pii-free` lint (P-CP-04 / P-028) over the `@control-plane`-marked `schema.rs`.
-//! 2. **The HARD placement invariant** ([`registry::Registry::place_tenant`]) — a DB trigger (in
-//!    code on this floor; the Postgres DDL is the named Storage-driver floor) that rejects any
-//!    `tenant_placement` whose `{home_cell} ∪ member_cells` contains a cell in a different region:
-//!    **multi-cell is single-region by construction** (0 cross-region member cells admitted).
-//! 3. **The service boots from `serve(AppSpec)`** ([`control_plane_app_spec`]) and **auto-registers
-//!    the registry store as a holder** ([`holder::ControlPlaneHolder`]) via the harness's one door;
-//!    the registry-touching **`cell_utilisation`** telemetry signal is emitted
-//!    ([`cell_utilisation_signal`]).
-//! 4. **The CP-D1 registry leg** ([`holder::assert_no_personal_columns`]) — the data-map over the
-//!    LIVE registry schema asserts 0 `is_personal=true` columns (the static lint leg is P-CP-04).
-//!
-//! ## What P-CP-06 / P-081 adds ([`discover`])
-//! 5. **`discover(slug | tenant_id) → RouteTuple`** ([`Registry::discover`] / [`discover::RouteTuple`]
-//!    `{cell_id, region, cell_endpoint, ttl_seconds}`) — PII-free routing keyed by the opaque id /
-//!    non-personal slug, **never an authz answer** (routing ≠ authorization). It reads
-//!    `tenant_placement` JOINed to `cell`.
-//! 6. **The client-cacheable, fail-static [`DiscoveryCache`]** — wraps [`myelin_substrate::FailStatic`]
-//!    (contract 1.10) so a client caches the route with the returned TTL and, on a control-plane
-//!    outage, serves the last-known-good route **fail-static for routing** (bounded-staleness) rather
-//!    than failing closed (the CP-D4 blast-radius win seed, P-CP-14).
-//! 7. **The `discovery_cache_hit` + `misroute_count` telemetry** ([`discover::DiscoverySignals`]) —
-//!    aggregate PII-free counters; `discovery_cache_hit` increments on a cache serve, `misroute_count`
-//!    on a `discover` that resolves to no route (the gateway's correction signal).
-//!
-//! ## DAG POSITION (a NAMED extension of the §2.9 eleven-crate library DAG)
-//! This is a **SERVICE crate** — a leaf consumer ABOVE the glue crates (it depends on
-//! `myelin-substrate`/`-tenancy`/`-gdpr`), exactly like `myelin-identity-service` /
-//! `myelin-gdpr-service` / `myelin-git`. NOTHING in the production library DAG depends back on it,
-//! so it is OUTSIDE the eleven-crate library graph modelled by `myelin_substrate::crate_graph`
-//! (`substrate_is_root()` is preserved — a service is the graph's terminal consumer).
-//!
-//! ## What P-CP-19 / P-429 adds ([`cross_cell_bridge`]) — the `CrossCellPointer` bridge goes LIVE
-//! The frozen-not-live [`myelin_tenancy::CrossCellPointer`] frame gets its **resolution path**
-//! (architecture §6.2, always cell-local; contract 12.6 — now LIVE). [`CrossCellBridge::resolve`]
-//! dispatches a cross-cell resolve to the pointer's **home cell** through the [`CellLocalResolver`]
-//! seam (production: `myelin_refs_service::ResolveService`'s 5.2 `resolve(ref, viewer, mode)`); the
-//! resolve is **permission-checked IN the home cell** against ITS tuples, and **ONLY** the
-//! already-rendered, already-permission-filtered [`BridgeResolution`] (a [`BridgeProjection`] or a
-//! [`BridgeTombstone`]) crosses back — never raw rows, never PII that should stay in B. The bridge
-//! carries ONLY the four frozen frame fields across (`subject`/`type`/`correlation_id`/`home_cell`).
-//! [`CrossCellBridge::rollup`] lights up the **ISS cross-cell portfolio rollup** (aggregate
-//! projections, exclude tombstones); the per-pointer [`CrossCellBridge::resolve`] lights up **KN
-//! cross-cell collab + CHAT cross-org channels** (resolve membership/content in the home cell; an
-//! unauthorised viewer gets a tombstone). The CP-D8 zero — `cross_cell_raw_rows` — is pinned to 0 (the
-//! PII-free-bridge proof). **The single-cell-resolution floor (P-CP-05/P-CP-08) is PROMOTED.**
-//!
-//! ## What P-CP-20 / P-430 adds ([`multi_cell`]) — the deferred multi-cell sub-problems go live
-//! The §6.3 deferred sub-problems the M5 follow-on owed are now built, over the P-CP-19 bridge:
-//! (1) **the cross-cell DSR fan-out mechanism** ([`CrossCellDsrFanOut::fan_out`]) — iterate
-//! `member_cells ∪ home_cell` (contract 10.4) over the bridge transport, merging a COMPLETE
-//! [`MultiCellDsrReceiptSet`], **0 cells missed** (GA-D8); (2) **cross-cell zookie consistency** (the
-//! hardest sub-problem, named explicitly) — [`CrossCellZookieReader::read_through`] bounds a zookie
-//! minted in the home cell read in a member cell to the [`ZOOKIE_STALENESS_BUDGET_SECS`]
-//! bounded-staleness budget, REFUSING ([`ZookieStaleness::PastBound`]) a read past the bound (never a
-//! silent stale serve); (3) **multi-cell rebalancing** ([`Registry::rebalance_member_cell`]) — move a
-//! tenant's workload across member cells SAME region (a cross-region move is rejected by the placement
-//! invariant); (4) **`member_cells` PROMOTED to MULTI-ELEMENT** ([`Registry::add_member_cell`]) —
-//! `placement_of` now returns a multi-element `member_cells` set. **The single-cell `member_cells`
-//! floor (P-CP-08) is PROMOTED** (recorded). No NEW floor (the prompt's DELIVERABLE: "none new"); the
-//! `[OPEN — LEGAL]` bridge-residency proof is the P-CP-19 residual.
-//!
-//! ## Floors named (deferred bodies → filling prompt) — VISION §3 name-your-floors
-//! - **The bridge RESOLUTION is LIVE (P-CP-19 / P-429, [`cross_cell_bridge`]); the multi-cell sub-
-//!   problems are LIVE (P-CP-20 / P-430, [`multi_cell`]).** The `member_cells` MULTI-ELEMENT floor is
-//!   PROMOTED: `placement_of` returns a multi-element set, the DSR fan-out iterates it, and rebalancing
-//!   edits it (all single-region by the invariant). The schema `member_cells` field is a `Vec<CellId>`
-//!   (the shape was always frozen); P-CP-20 promotes the *capability*. What rides later: the
-//!   world-scale 30× cell-bulkhead surge (P-CP-21) + live tenant migration / measured sizing (P-CP-22).
-//! - **`[OPEN — LEGAL]` the cross-cell bridge residency proof** (counsel sign-off that
-//!   `subject`/`type`/`correlation_id` are not personal data for a tenant) ships REGARDLESS of
-//!   ratification — the bridge is PII-free by construction (the four-field frozen frame + a filtered
-//!   projection/tombstone, never a raw row), so the engineering floor is met today; the legal sign-off
-//!   is a parallel residual, named here in writing (architecture §6 / EI-04 §1).
-//! - **`placement_of` + the gateway misroute-reject (layer 4, CP-D2) are LIVE (P-CP-08 / P-084,
-//!   [`placement_of`]).** [`Registry::placement_of`] returns the frozen routing tuple `{region,
-//!   home_cell, member_cells, isolation_tier, status}` (`member_cells` single-element in v1 — the
-//!   floor); [`CellGateway::route`] REJECTS (does not proxy) + REDIRECTS + AUDITS a request for a
-//!   `tenant_id` a cell doesn't host, reading **0** cross-tenant/cross-cell rows (the CP-D2 zero) and
-//!   emitting `misroute_count`. The remaining attestation answer (`residency_verify`) is the next
-//!   prompt **P-CP-09**. `discover` is LIVE (P-CP-06 / P-081); `place` + two-phase signup is LIVE
-//!   (P-CP-07 / P-082, [`place`]) — it emits the `placement_count` + `provision_latency` routing
-//!   signals ([`place::PlacementSignals`]).
-//! - **`member_cells` single-element / resolution always same-cell in v1 (P-CP-08 floor).** The
-//!   gateway accepts a request IFF the tenant's `home_cell` is THIS cell; the multi-cell resolution
-//!   path (a member cell serving a slice, the `CrossCellPointer` bridge) goes live in **M5
-//!   (P-CP-19 / P-CP-20)**.
-//! - **`residency_verify` over the M1 store set AND the CI surfaces is LIVE (P-CP-09 / P-085 +
-//!   P-CP-17 / P-324, [`residency_verify`]).** [`residency_verify::residency_verify`] aggregates every
-//!   M1 store's region report (OLTP/blob/index/KMS) into a signed, PII-free
-//!   [`residency_verify::SignedAttestation`] (`every_store_region == tenant.region`);
-//!   [`residency_verify::residency_verify_ci`] (P-CP-17) extends the SAME mechanism over the **CI
-//!   runner pool + CI log tier + CI artifact store + CI cache namespaces**
-//!   ([`residency_verify::ResidencyStoreClass::CI_SET`]). A store — M1 or CI — reporting a wrong
-//!   region, or a silently-absent store, makes the attestation **FAIL** (not a silent pass). **The
-//!   P-CP-09 M1-only named partial is CLOSED:** the no-global-CI-pool property is now attestable
-//!   per-tenant (a CI runner that executed a tenant's job in the wrong region fails
-//!   `residency_verify`). The in-region runner-CLAIM enforcement is the sibling **P-CP-18**; the CP-D3
-//!   write-boundary runtime drill + STOR-D5 cross-region egress ride the four-layer enforcement
-//!   (P-CP-12), against the live stack.
-//! - **Residency-pinned runners are LIVE (P-CP-18 / P-325, [`runner_claim_pin`]).** P-CP-17 made the
-//!   no-global-CI-pool property ATTESTABLE (a wrong-region CI store FAILS `residency_verify`); P-CP-18
-//!   makes it ENFORCED at claim time. [`runner_claim_pin::RunnerClaimPin::admit_claim`] is the
-//!   control-plane region-pin assertion over the CI runner claim: an EU-resident tenant's CI run is
-//!   claimed ONLY by an in-region runner (an out-of-region runner is REJECTED, **0 out-of-region
-//!   claims**); [`runner_claim_pin::RunnerClaimPin::pin_ci_store_write`] runs the `residency-pin` leg
-//!   (1.6) over every CI-store write the run makes (logs/artifacts/caches never leave the region),
-//!   REUSING the four-layer [`four_layer::ResidencyWriteBoundary`] (P-CP-12). The CI subsystem owns the
-//!   runner-claim MECHANISM (`myelin_ci_sandbox::JobLeaseStore::claim_for_labels`, whose claim
-//!   predicate already skips out-of-region jobs); Tenancy owns the region-pin ASSERTION. No floor here
-//!   — this completes the CI residency posture begun in P-CP-17 (CI-R3 runner-claim leg).
-//! - **The GeoDNS/anycast discovery edge is `[OPEN → P4 (infra)]`** (architecture §7.3) — a latency
-//!   optimisation that fronts the PII-free discovery contract with a geo-routed edge. **v1 is
-//!   CP-lookup + client cache** ([`discover::DiscoveryCache`]); the edge is an infra follow-on, not a
-//!   band-gated engineering unit. The discovery *contract* ([`discover::RouteTuple`] + the client
-//!   cache + fail-static) is fully built and does not change shape when the edge lands.
-//! - **Repo-grain `discover` / `placement_of(repo)`** (C-1) is the M3 follow-on **P-CP-15**; this
-//!   crate's `discover` is **tenant-grain** only.
-//! - **The concrete Postgres execution** (the bounded pool + RLS the registry tables open through,
-//!   Storage **P-ST-01 / P-007**; the trigger DDL executed against the live pool, **P-S12**) is the
-//!   named Storage-driver floor — the invariant logic + the region-immutability discipline here are
-//!   real + tested now and do not change shape when the driver lands (mirrors how
-//!   `myelin-storage`'s migration runner validates in code while the DDL executes through the pool).
-//! - **The isolation-tier contract (12.5) is LIVE (P-CP-10 / P-086, [`isolation`]).**
-//!   [`isolation::IsolationTier`] enumerates the frozen `logical|schema|db|cell` mechanism set;
-//!   the **Pool tier ([`isolation::IsolationTier::Logical`]) is the v1 floor** (shared cell,
-//!   logical/RLS isolation — the `residency-pin` + the OLTP RLS guard it). The partition key
-//!   `(tenant, region)` is **identical at every tier** ([`isolation::partition_key`] /
-//!   [`isolation::PartitionKey`]): a store opens at the Pool tier ([`isolation::PoolStore`]) with
-//!   the SAME key Bridge/Dedicated would use. **FLOOR:** the Pool tier is the only v1-provisioned
-//!   tier; **Bridge** (DB-per-tenant) + **Dedicated** (cell-per-tenant) are **declared in the
-//!   contract but provisioned ON DEMAND** (enterprise / public-sector onboarding) — the partition-key
-//!   contract is identical across all three, so a promotion is a provisioning concern, not a
-//!   redesign (the higher-tier provisioning rides the gate path P-CP-11 + the Bridge-tier per-tenant
-//!   DB/index `[OPEN → P6 (Search/Storage)]` residual). The Pool tier's cross-tenant-read correctness
-//!   is the floor proven by CP-D2 (P-CP-08) + the four-layer enforcement (P-CP-12) — this prompt
-//!   confirms the partition key is tier-invariant.
-//! - **Cell-provisioning gating (CP-D6) is LIVE (P-CP-11 / P-083, [`provision`]).** A cell does not
-//!   go `Active` until it passes **restore-verify** (the storage [`myelin_storage::RestoreVerifyGate`],
-//!   contract 11.5) **+ readiness** (the cell's [`myelin_substrate::MetricsHealthSurface`]); a failing
-//!   cell stays `Provisioning` (0 traffic — the place path filters on `Active`). Tenant decommission
-//!   crypto-shreds the tenant KEK ([`myelin_storage::KmsEngine::destroy_kek`], 11.3). **The
-//!   scripted-provisioning floor is now PROMOTED** (P-CP-22 / P-431, [`migration`]): provisioning runs
-//!   as a DURABLE workflow ([`LiveMigration::provision_cell_durably`] over `myelin-flow`'s
-//!   `DurableExecutor`, contract 9.1) — the SAME gating (restore-verify + readiness), now crash-safe +
-//!   resumable + idempotent. The `cell_provisioning` log records each gating step.
-//!
-//! ## What P-CP-21 / P-432 adds ([`bulkhead`]) — the cell bulkhead under 30× surge (CP-D5)
-//! The world-scale hardening of the single-cell topology already built: **the cell is the unit of
-//! bulkhead** (architecture §1/§8). [`bulkhead::CellBulkhead`] models one cell as an INDEPENDENT
-//! bulkhead — its own bounded per-lane capacity envelope ([`myelin_substrate::BoundedQueue`] per
-//! [`myelin_substrate::RunClass`] lane, §7.1) + its own health switch
-//! ([`bulkhead::CellBulkhead::inject_fatal_fault`]). Cells share NOTHING on the hot path (§3/§8 — the
-//! only shared thing is the PII-free, off-hot-path, client-cached control plane), so a fatal fault /
-//! 30× surge in one cell ([`bulkhead::CellFleet::run_surge`]) is contained: the surged cell absorbs it
-//! by shedding its AGENT lane while its protected HUMAN lane HOLDS, and the OTHER cells are
-//! UNAFFECTED — **cross-cell impact 0** ([`bulkhead::CellFleetReport::is_cp_d5_win`]), a noisy tenant
-//! contained to its cell. The zero is a real tripwire: [`bulkhead::CellFleet::shared_queue_impact`]
-//! (the shared-hot-path-queue anti-pattern the architecture forbids) shows a NON-zero cross-cell
-//! impact (RED). **No new floor** — the per-cell isolation is already built; the measured sizing
-//! numbers that BOUND "30×" ride P-CP-22; the only legitimate remaining floor is the world-scale 30×
-//! load drill on real fleet hardware (named, not claimed-green). The E2E-1..E2E-4 wedge (Tenancy the
-//! partition under all four) runs green for the band (the per-system spines + the GA-D8 DSAR fan-out).
-//!
-//! ## What P-CP-22 / P-431 adds ([`migration`]) — live tenant migration + the floor promotions (M5)
-//! The avoid-migration-by-sizing floor (P-CP-05/P-CP-07) + the scripted-provisioning floor (P-CP-11)
-//! are **PROMOTED**: (1) **the online cell→cell move (SAME region)** ([`LiveMigration::migrate_tenant`])
-//! runs as a DURABLE workflow (contract 9.1) reusing **reindex-from-source + crypto-shred cut-over** —
-//! copy the source-of-truth to the target, reindex the target's DERIVED stores FROM SOURCE (never a
-//! derived backup, [`myelin_storage::ReindexFromSource`]), cut over [`Registry::place_tenant`] to the
-//! target ATOMICALLY (a cross-region target is REJECTED — the move lands IN-region), then crypto-shred
-//! the SOURCE ([`myelin_storage::KmsEngine::destroy_kek`]). **0 loss across-seam, source destroyed**
-//! (CP-D7). **Triggered by a MEASURED hot cell** ([`MigrationTrigger`]) that sealing cannot relieve
-//! (ADR-10). (2) **Repo relocation (C-1)** as the SAME durable workflow
-//! ([`LiveMigration::relocate_repo_durably`] over the P-CP-15 [`Registry::relocate_repo`] flip).
-//! (3) **Durable-workflow provisioning** ([`LiveMigration::provision_cell_durably`]) — the P-CP-11
-//! gating, now durable. (4) **The MEASURED sizing-band numbers** recorded in the thresholds-file
-//! `[cell_sizing]` row (the binding dimension MEASURED, never predicted, ADR-10;
-//! [`measured_hot_at`]). (5) **Restore-verify at cell scale (STOR-D2)** re-confirmed against the
-//! thresholds-file RPO/RTO bounds ([`restore_verify_at_cell_scale`]). No threshold weakened.
-
 pub mod bulkhead;
 pub mod cp_outage;
 pub mod cross_cell_bridge;
-// MR-009b W6c-cp: the PRODUCTION arm of `CellResolverRegistry` — a boot-time PROJECTION of the durable
-// `cell` table (each cell's PII-free routing `endpoint`) into the live cell-local resolver handles the
-// cross-cell bridge dispatches to. Compiled UNCONDITIONALLY (W6c-cp verifier finding: sqlx is
-// non-optional in myelin-storage post-W1 and this module needs no tokio bridge, so an `integration`
-// gate here would make the only durable projection builder UNREACHABLE in production builds — the
-// exact correct-but-latent shape MR-009b kills). The `cross_cell_bridge` seam stays DB-free behind
-// the `ResolverProjection` trait object. Boot wiring is W6d / W3b.4.
 pub mod cross_cell_bridge_durable;
 pub mod discover;
 pub mod dogfood;
@@ -249,11 +15,6 @@ pub mod placement_of;
 pub mod placement_of_repo;
 pub mod provision;
 pub mod registry;
-// MR-024 (SI-011/SI-028) → MR-009b W6d: the `Pg | Memory` backend enum that binds the placement
-// registry to real Postgres (durable cell/tenant_placement tables + the HARD-invariant DB TRIGGER +
-// the durable misroute audit sink in myelin_storage::placement_durable). Compiled UNCONDITIONALLY
-// as of W6d (the canonical `Registry` itself is now durable-by-default; this MR-024 binding's
-// `Memory(Registry)` arm is the `test-support`-gated double).
 pub mod registry_durable;
 pub mod residency_verify;
 pub mod runner_claim_pin;
@@ -270,7 +31,6 @@ pub use cross_cell_bridge::{
     BridgeTombstoneReason, CellLocalResolver, CellResolverRegistry, CrossCellBridge,
     ResolverProjection, ViewerId,
 };
-// MR-009b W6c-cp: the durable-cell-table projection constructor + factory/error (production arm).
 pub use cross_cell_bridge_durable::{ProjectionError, ResolverFactory};
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
 pub use dogfood::{
@@ -326,18 +86,8 @@ use myelin_substrate::{
     AppSpec, Config, Migration, Migrations, OutboxSpec, StoreKind, StoreManifest,
 };
 
-/// The service name (the PII-free telemetry/trace identifier the harness keys on).
 pub const SERVICE_NAME: &str = "control-plane";
 
-/// **The forward-only migration set that creates the three PII-free registry tables + the
-/// `local_tenant` directory + the placement-invariant trigger** (architecture §5.1). Each migration
-/// is forward-only (a region change is a NEW row, never an `ALTER`/`DROP`) and PII-free (no
-/// name/email/body column). The DDL executes against the live pool the harness opens (the driver is
-/// the named Storage floor, P-ST-01 / P-S12); the runner here freezes the ordered DDL set.
-///
-/// The trigger migration (`0005_placement_invariant`) installs the HARD placement invariant as a
-/// `BEFORE INSERT OR UPDATE` trigger on `tenant_placement` — the same predicate
-/// [`Registry::check_placement_invariant`] enforces in code (0 cross-region member cells admitted).
 pub fn control_plane_migrations() -> Migrations {
     Migrations::of([
         Migration::plain(
@@ -380,10 +130,6 @@ pub fn control_plane_migrations() -> Migrations {
                  active BOOLEAN NOT NULL, \
                  PRIMARY KEY (cell_id, tenant_id));",
         ),
-        // The HARD placement invariant as a DB trigger (architecture §5.1) — multi-cell single-
-        // region by construction. The trigger raises (rejecting the write) if any cell in
-        // {home_cell} ∪ member_cells is in a different region than the tenant. This is the SAME
-        // predicate Registry::check_placement_invariant enforces in code.
         Migration::plain(
             "0005_placement_invariant",
             "CREATE FUNCTION assert_placement_single_region() RETURNS trigger AS $$ \
@@ -404,36 +150,15 @@ pub fn control_plane_migrations() -> Migrations {
     ])
 }
 
-/// **The control-plane service's [`StoreManifest`]** — it declares the ONE registry store it owns
-/// (the OLTP-backed registry schema). The harness opens (and therefore auto-registers, contract
-/// 1.4) every declared store through its one door, so the `holder-registered` architecture test is
-/// green by construction. The registry store is PII-free (its holder's DSR surface is empty by
-/// construction — see [`ControlPlaneHolder`]), but it still registers so the one-door discipline
-/// covers it.
 pub fn control_plane_store_manifest() -> StoreManifest {
-    // `CONTROL_PLANE_STORE` is `&'static str`; the manifest takes a `&'static str` name.
     StoreManifest::of([myelin_substrate::DeclaredStore::new(
         StoreKind::Oltp,
         CONTROL_PLANE_STORE_NAME,
     )])
 }
 
-/// The `&'static str` form of [`CONTROL_PLANE_STORE`] the manifest / registry need (a manifest name
-/// is `&'static str`). Kept in lock-step with [`CONTROL_PLANE_STORE`] by the unit test below.
 pub const CONTROL_PLANE_STORE_NAME: &str = "control_plane_registry";
 
-/// **The control-plane [`AppSpec`] the harness wires** (boot → migrate → relay → consumers →
-/// ports → drain). It carries the registry [`control_plane_migrations`] + the
-/// [`control_plane_store_manifest`] (so the registry store auto-registers as a holder). The routing
-/// surfaces (`discover`/`place`/`placement_of`) land in P-CP-06..P-CP-08; here the spec stands up
-/// the registry the service is built on.
-///
-/// **MR-009b W3b.6 (the W3b.4 debt discharged):** the outbox relay spec is INJECTED — this
-/// builder constructs NO store. A production boot root (there is no control-plane service binary
-/// yet — the self-host path drives `DegenerateControlPlane`) must pass
-/// [`OutboxSpec::durable`](myelin_substrate::OutboxSpec::durable) (the W3b.4 provider-from-env,
-/// fail-loud pattern); a test/drill passes the `test-support`-gated
-/// `OutboxSpec::default_inproc()` double.
 pub fn control_plane_app_spec(config: Config, outbox: OutboxSpec) -> AppSpec {
     let mut spec = AppSpec::minimal(SERVICE_NAME, config, outbox);
     spec.migrations = control_plane_migrations();
@@ -441,21 +166,12 @@ pub fn control_plane_app_spec(config: Config, outbox: OutboxSpec) -> AppSpec {
     spec
 }
 
-/// **The `cell_utilisation` telemetry signal (architecture §4.1 / §14)** — the cell-level survival
-/// signal the registry emits (the routing signals `placement_count` / `provision_latency` /
-/// `misroute_count` / `discovery_cache_hit` land with `place`/`discover`, P-CP-06/P-CP-07/P-CP-08).
-/// Observability is part of the pass (EI-01 §3); this is the signal a sizing/rebalance drill reads.
-/// PII-free: a `(cell_id, utilisation)` aggregate pair, never per-subject data.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CellUtilisationSignal {
-    /// The cell this aggregate utilisation is for (opaque id, PII-free).
     pub cell_id: String,
-    /// The aggregate utilisation 0..=100 (aggregate-only, PII-free).
     pub utilisation: u8,
 }
 
-/// Emit the [`CellUtilisationSignal`] for a cell (the registry-touching telemetry the prompt names).
-/// Reads the aggregate `utilisation` off the inventory row — never any per-subject data.
 pub fn cell_utilisation_signal(cell: &Cell) -> CellUtilisationSignal {
     CellUtilisationSignal {
         cell_id: cell.cell_id.as_str().to_string(),
@@ -468,16 +184,11 @@ mod tests {
     use super::*;
     use myelin_substrate::{is_destructive, HolderRegistry, HotTables};
 
-    /// The store-name constant is in lock-step with the holder's (one PII-free store id, no drift).
     #[test]
     fn store_name_is_consistent() {
         assert_eq!(CONTROL_PLANE_STORE_NAME, CONTROL_PLANE_STORE);
     }
 
-    /// **The registry migrations are forward-only + PII-free.** No migration is destructive (a
-    /// region change is a NEW row, never a DROP/ALTER), and the DDL carries no PII column
-    /// (name/email/body) — the `control-plane-pii-free` lint guards the schema structs; this asserts
-    /// the DDL text is PII-free too.
     #[test]
     fn migrations_are_forward_only_and_pii_free() {
         let migrations = control_plane_migrations();
@@ -503,8 +214,6 @@ mod tests {
         }
     }
 
-    /// The placement-invariant trigger DDL is installed (architecture §5.1) — the trigger is the
-    /// DB-level half of the invariant `Registry::check_placement_invariant` enforces in code.
     #[test]
     fn placement_invariant_trigger_is_installed() {
         let migrations = control_plane_migrations();
@@ -520,39 +229,29 @@ mod tests {
         assert!(trigger.ddl.contains("RAISE EXCEPTION"));
     }
 
-    /// **The control-plane AppSpec boots from `serve(AppSpec)`** with the registry migrations + the
-    /// store manifest (so the registry store auto-registers as a holder). The migration runner
-    /// admits the registry DDL (forward-only, no hot table) — the boot path is exercisable.
     #[test]
     fn app_spec_carries_registry_and_store_manifest() {
         let spec = control_plane_app_spec(Config::default(), OutboxSpec::default_inproc());
         assert_eq!(spec.name, SERVICE_NAME);
         assert_eq!(spec.migrations.0.len(), 5);
-        // The control-plane registry store is declared (so opening it = registering it).
         let ids = spec.stores.holder_ids();
         assert!(
             ids.contains("oltp:control_plane_registry"),
             "registry store declared: {ids:?}"
         );
-        // The migration runner admits the registry DDL (no hot table, all forward-only).
         let mut runner = myelin_substrate::MigrationRunner::new();
         runner
             .run(&spec.migrations, &HotTables::none())
             .expect("registry migrations are admitted (forward-only, PII-free)");
     }
 
-    /// **The holder-registered property: opening the registry store through the harness's one door
-    /// registers it** (contract 1.4) — so a DSR fan-out reaches the control-plane holder. Joined
-    /// against the manifest, no declared store escapes registration.
     #[test]
     fn registry_store_auto_registers_as_a_holder() {
         let manifest = control_plane_store_manifest();
         let mut registry = HolderRegistry::new();
-        // The harness opens every declared store through its one door (open == register).
         for store in manifest.stores() {
             registry.open(store.kind, store.name);
         }
-        // No declared store escaped registration (the holder-registered architecture test verdict).
         let violations = myelin_substrate::holder_registered(&manifest, &registry);
         assert!(
             violations.is_empty(),
@@ -561,8 +260,6 @@ mod tests {
         assert!(registry.is_registered(StoreKind::Oltp, CONTROL_PLANE_STORE_NAME));
     }
 
-    /// **The `cell_utilisation` telemetry signal is emitted off the inventory row** (architecture
-    /// §4.1) — an aggregate `(cell_id, utilisation)` pair, PII-free.
     #[test]
     fn cell_utilisation_signal_is_aggregate_and_pii_free() {
         use myelin_tenancy::{CellId, Region};
@@ -590,22 +287,10 @@ mod tests {
         );
     }
 
-    /// **CDC pair for the registry-schema half of 12.3 (provider + consumer).** The PROVIDER side
-    /// is this crate's [`Registry`] storing/answering from the `tenant_placement` table (through the
-    /// placement invariant); the CONSUMER side stands in for a `place`/`placement_of` caller
-    /// (P-CP-07 / P-CP-08) — it writes a placement via the provider and reads back the exact stored
-    /// shape (`{region, home_cell, member_cells, isolation_tier, status}`). If the registry-schema
-    /// shape drifts (a field added/removed/retyped), this consumer stops compiling — the whole point
-    /// of a glue-crate CDC. The full `place`/`placement_of` ANSWERS (the routing tuple + the gateway
-    /// misroute-reject) are the named follow-on (P-CP-07/P-CP-08); this CDC exercises the SCHEMA the
-    /// answers store in.
     #[test]
     fn cdc_12_3_registry_schema_provider_consumer() {
         use myelin_tenancy::{CellId, Region, TenantId};
 
-        /// A stand-in `placement_of` consumer (the shape P-CP-08 builds): it reads a placement's
-        /// routing fields back from the registry-schema half of 12.3. It can ONLY read the frozen
-        /// `tenant_placement` columns — it cannot read a name/email (there is none).
         struct PlacementOfAnswer {
             region: Region,
             home_cell: CellId,
@@ -614,8 +299,6 @@ mod tests {
             status: PlacementStatus,
         }
         impl PlacementOfAnswer {
-            /// Build the answer from a stored `tenant_placement` row (the provider's table) — the
-            /// CDC's read side.
             fn from_row(row: &TenantPlacement) -> PlacementOfAnswer {
                 PlacementOfAnswer {
                     region: row.region.clone(),
@@ -627,7 +310,6 @@ mod tests {
             }
         }
 
-        // PROVIDER: write a placement through the registry (the invariant admits it).
         let mut registry = Registry::new();
         registry.insert_cell(Cell {
             cell_id: CellId::from_token("cell-w-1"),
@@ -656,42 +338,27 @@ mod tests {
             })
             .expect("the registry admits the single-region placement");
 
-        // CONSUMER: read the placement back through the frozen registry-schema shape.
         let row = registry
             .placement(&tenant)
             .expect("the placement is stored");
         let answer = PlacementOfAnswer::from_row(&row);
         assert_eq!(answer.region.as_str(), "eu-west");
         assert_eq!(answer.home_cell.as_str(), "cell-w-1");
-        assert_eq!(answer.member_cells.len(), 1); // v1 single-element floor.
+        assert_eq!(answer.member_cells.len(), 1);
         assert_eq!(answer.isolation_tier, IsolationKind::Pool);
         assert_eq!(answer.status, PlacementStatus::Active);
     }
 
-    /// **CDC pair for 12.2 tenant-grain `discover` (provider + consumer).** The PROVIDER is this
-    /// crate's [`Registry::discover`] answering a [`RouteTuple`] from `tenant_placement` JOINed to
-    /// `cell`. The CONSUMER stands in for a **gateway / git-wire** caller (architecture §7.3): it
-    /// takes the route, encodes the cell endpoint into the URL it routes to, and — load-bearing —
-    /// can read ONLY the routing fields (`cell_id`/`region`/`cell_endpoint`/`ttl_seconds`), NEVER an
-    /// authz answer (there is no grant/principal/permission field on `RouteTuple`). If the route shape
-    /// drifts, the consumer stops compiling — the point of a glue-crate CDC.
     #[test]
     fn cdc_12_2_discover_tenant_grain_provider_consumer() {
         use myelin_tenancy::{CellId, Region, TenantId};
 
-        /// A stand-in gateway / git-wire consumer: it routes a request to the discovered cell. It can
-        /// ONLY use the routing tuple — it has no way to obtain a grant from `discover` (routing ≠
-        /// authorization; the cell does its own fail-closed `check`).
         struct GatewayRoute {
-            /// The endpoint the gateway connects the request to (e.g. the git remote host).
             target_endpoint: String,
-            /// The region the gateway confirms the route stays inside (residency, §5.3).
             pinned_region: String,
-            /// The TTL the gateway caches the route for (off the hot path, §8).
             cache_ttl_secs: u64,
         }
         impl GatewayRoute {
-            /// Build the gateway's routing decision from a discovered [`RouteTuple`] (the read side).
             fn from_route(route: &RouteTuple) -> GatewayRoute {
                 GatewayRoute {
                     target_endpoint: route.cell_endpoint.clone(),
@@ -701,7 +368,6 @@ mod tests {
             }
         }
 
-        // PROVIDER: a placed tenant in eu-west.
         let mut registry = Registry::new();
         registry.insert_cell(Cell {
             cell_id: CellId::from_token("cell-w-1"),
@@ -729,7 +395,6 @@ mod tests {
             })
             .expect("the single-region placement is admitted");
 
-        // PROVIDER answers `discover`; CONSUMER routes through the frozen tuple shape.
         let route = registry
             .discover(&DiscoverKey::TenantId(TenantId::from_token("01J0ACME")), 30)
             .expect("the placed tenant resolves to a route");
@@ -738,8 +403,6 @@ mod tests {
         assert_eq!(gw.pinned_region, "eu-west");
         assert_eq!(gw.cache_ttl_secs, 30);
 
-        // The git-wire caller resolves the SAME route by the non-personal slug (the C-1 git-wire use,
-        // tenant-grain here; repo-grain is P-CP-15).
         let by_slug = registry
             .discover(&DiscoverKey::Slug("acme".into()), 30)
             .expect("the slug resolves to a route");
@@ -749,21 +412,10 @@ mod tests {
         );
     }
 
-    /// **CDC pair for the `placement_of` half of 12.3 (provider + consumer) — P-CP-08.** The PROVIDER
-    /// is this crate's [`Registry::placement_of`] answering the frozen routing tuple `{region,
-    /// home_cell, member_cells, isolation_tier, status}` from `tenant_placement`. The CONSUMER stands
-    /// in for a **cell gateway** (architecture §5.3 layer 4): it takes the answer and decides — purely
-    /// off the routing fields — whether it hosts the tenant, NEVER reading the tenant's data. It can
-    /// read ONLY the routing fields (there is no grant/principal/permission on [`PlacementOf`]); if the
-    /// `placement_of` shape drifts (a field added/removed/retyped) the consumer stops compiling — the
-    /// point of a glue-crate CDC.
     #[test]
     fn cdc_12_3_placement_of_provider_consumer() {
         use myelin_tenancy::{CellId, Region, TenantId};
 
-        /// A stand-in **cell gateway** consumer: it reads the `placement_of` routing answer and
-        /// decides whether THIS cell hosts the tenant — purely from the routing fields, never from the
-        /// tenant's data. This is the read side of the layer-4 misroute decision.
         struct GatewayHostsDecision {
             home_cell: CellId,
             region: Region,
@@ -781,13 +433,11 @@ mod tests {
                     status: a.status,
                 }
             }
-            /// The layer-4 decision: this cell hosts the tenant IFF its home cell is `this_cell`.
             fn this_cell_hosts(&self, this_cell: &CellId) -> bool {
                 &self.home_cell == this_cell
             }
         }
 
-        // PROVIDER: a placed tenant homed on cell-w-1, in eu-west.
         let mut registry = Registry::new();
         registry.insert_cell(Cell {
             cell_id: CellId::from_token("cell-w-1"),
@@ -815,7 +465,6 @@ mod tests {
             })
             .expect("the single-region placement is admitted");
 
-        // PROVIDER answers `placement_of`; CONSUMER decides hosting off the frozen routing tuple.
         let answer = registry
             .placement_of(&TenantId::from_token("01J0ACME"))
             .expect("the placed tenant resolves to a placement_of answer");
@@ -828,7 +477,6 @@ mod tests {
         );
         assert_eq!(decision.isolation_tier, IsolationKind::Pool);
         assert_eq!(decision.status, PlacementStatus::Active);
-        // The home cell hosts; a different cell does NOT (the layer-4 decision, off routing only).
         assert!(
             decision.this_cell_hosts(&CellId::from_token("cell-w-1")),
             "the home cell hosts"

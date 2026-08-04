@@ -1,31 +1,3 @@
-//! **REF-P17 / P-258 — Refs consumes the REAL Git producer edges, PROVEN against the live dev-stack
-//! Postgres.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-refs-service --features integration \
-//!     --test integration_ref_p17_git_producer -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires for REF-P17 — the Git producer edge
-//! ingest + the §4.7 reindex-from-source byte-parity executed against the REAL §3.2 `edge` table on
-//! real Postgres, on a production-shaped GIT edge corpus (a PR-link, a commit-trailer "Closes <issue>",
-//! a blob line-range embed). The drill is registered red-until-proven and flips green ONLY here, with a
-//! real artifact (the reindex-parity image).
-//!
-//! **REF-D1 (leak) re-confirmed on real Git edges over real Postgres:** the §3.2 RLS isolates a tenant
-//! — a session pinned to tenant B reads ZERO of tenant A's Git edges (the cross-tenant leak invariant
-//! holds at the DATABASE layer, not just in the in-memory model — REF-D2 / the IDOR floor).
-//!
-//! **REF-D4 (reindex-from-cold byte-parity, CI variant) over real Postgres on the Git corpus:** the
-//! only way a Git edge row lands in `edge` is the live consumer's upsert (the deterministic `edge_id` +
-//! `strip_sub` roots — the SAME production logic, the Git source URN carrying the `#sub`-precise blob
-//! line-range). We (1) build the LIVE table from the Git edge corpus; (2) capture its byte-image;
-//! (3) WIPE the partition (no Git-DB reload); (4) rebuild ONLY by re-driving the SAME upserts from the
-//! replayed Git snapshots (the reindex re-emit path — Refs' `ReindexSource::replay`); (5) assert the
-//! rebuilt table byte-matches the live one. The content-anchored blob line-range root (`#L1-L9` →
-//! `blob/<repo>:<ref>:<path>`) re-derives at the right grain — never a stale raw line number (§4.7).
 #![cfg(feature = "integration")]
 
 use myelin_events::{ReindexSource, SnapshotScope};
@@ -60,8 +32,6 @@ fn git_edge(agg: &str, source: &str, target: &str, rel: &str, actor: &str) -> So
         source: ArtifactRef(source.into()),
         target: ArtifactRef(target.into()),
         rel: rel.into(),
-        // A Git edge's origin_actor is the PSEUDONYMOUS commit author (erasure-safe; never the name —
-        // the floor: pseudonymous-by-default authors, GIT-P25). Refs holds only the opaque id.
         origin_actor: actor.into(),
         zookie: Some("zk-1".into()),
     }
@@ -85,7 +55,6 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
     let suffix = std::process::id();
     let tbl = format!("edge_p258_{suffix}");
 
-    // ── Apply the REAL §3.2 schema (create + three indexes + RLS), suffixed for isolation. ──
     sqlx::query(&rename(CREATE_EDGE_TABLE_DDL, &tbl))
         .execute(&admin)
         .await
@@ -105,9 +74,6 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
         .await
         .expect("grant app");
 
-    // ── A production-shaped GIT edge corpus (the REAL producer edges REF-P17 wires). ──
-    // A PR-link, a commit-trailer "Closes <issue>", a blob line-range embed (the #sub-precise blob root
-    // carries the content-anchored range; the stored root is the #sub-stripped blob).
     let mut truth = RefsReindexSource::new();
     truth.record(git_edge(
         "refs.edge:1",
@@ -131,7 +97,6 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
         "git-pseudonym-1",
     ));
 
-    // Pin the session to tenantA (RLS).
     let mut conn = app.acquire().await.unwrap();
     sqlx::query("SELECT set_config('myelin.tenant_id','tenantA',false)")
         .execute(&mut *conn)
@@ -190,8 +155,6 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
                 .to_string();
             let tenant = myelin_tenancy::TenantId("tenantA".into());
             let id = edge_id(&tenant, &source, &target, &rel);
-            // The blob line-range edge's stored target_root is the #sub-STRIPPED blob root — the
-            // content-anchored range re-derives at the blob grain (never a stale raw line number, §4.7).
             let source_root = strip_sub(&ArtifactRef(source.clone())).0;
             let target_root = strip_sub(&ArtifactRef(target.clone())).0;
             sqlx::query(upsert_sql)
@@ -209,7 +172,6 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
         }
     }
 
-    // ── (1) Build the LIVE Git edge table; capture its byte-image. ──
     rebuild(&mut conn, &upsert_sql, &truth, &scope).await;
     let live_img: String = sqlx::query(&parity_sql)
         .fetch_one(&mut *conn)
@@ -226,8 +188,6 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
         "the live Git edge table holds the 3 producer edges"
     );
 
-    // The blob line-range edge stored the #sub-STRIPPED blob root (the content-anchored range is on
-    // the FULL target; the index keys on the root) — assert the strip held over real Postgres.
     let blob_root: String =
         sqlx::query(&format!("SELECT target_root FROM {tbl} WHERE rel='embeds'"))
             .fetch_one(&mut *conn)
@@ -239,7 +199,6 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
         "the line-range embed's stored root is the #sub-stripped blob (the range re-derives, never stale)"
     );
 
-    // ── REF-D2 (IDOR / cross-tenant) at the DATABASE layer: a tenantB session reads 0 of these edges. ──
     let mut conn_b = app.acquire().await.unwrap();
     sqlx::query("SELECT set_config('myelin.tenant_id','tenantB',false)")
         .execute(&mut *conn_b)
@@ -256,10 +215,9 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
         .get("n");
     assert_eq!(
         b_count, 0,
-        "RLS isolates tenants — tenantB reads 0 of tenantA's Git edges (REF-D2)"
+        "RLS isolates tenants - tenantB reads 0 of tenantA's Git edges (REF-D2)"
     );
 
-    // ── (2) WIPE the partition (the cold-rebuild precondition — NO Git-DB reload). ──
     sqlx::query(&format!("DELETE FROM {tbl}"))
         .execute(&mut *conn)
         .await
@@ -271,7 +229,6 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
         .get("n");
     assert_eq!(after_wipe, 0, "the Git edge partition is wiped");
 
-    // ── (3) Rebuild ONLY from the replayed Git snapshots (the reindex re-emit path), SAME upsert. ──
     rebuild(&mut conn, &upsert_sql, &truth, &scope).await;
     let rebuilt_img: String = sqlx::query(&parity_sql)
         .fetch_one(&mut *conn)
@@ -279,13 +236,11 @@ async fn git_producer_edges_ingest_and_reindex_byte_match_on_real_postgres() {
         .unwrap()
         .get("img");
 
-    // ── (4) The rebuilt Git edge table byte-matches the live table (§4.7 reindex-parity, Git corpus). ──
     assert_eq!(
         rebuilt_img, live_img,
         "the rebuilt Git edge index byte-matches the live index (cold == live)"
     );
 
-    // Cleanup (a NEW forward operation — test teardown, not a down-migration).
     sqlx::query(&format!("DROP TABLE {tbl}"))
         .execute(&admin)
         .await

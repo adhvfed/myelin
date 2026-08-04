@@ -1,22 +1,3 @@
-//! # ISS-D8 — the event-driven incremental rollup consumer drill (ISS-P18 / P-384, M4)
-//!
-//! **The two ISS-D8 green artifacts (catalogue F4/rollup):**
-//! - **ISS-D8(a) — rollup freshness under a 10k-issue import → a BOUNDED number of ancestor recomputes
-//!   via the debounce-coalesce.** The green artifact is the DEBOUNCE BOUND: a 10,000-issue import under
-//!   a small ancestor set coalesces to a bounded recompute count (the number of distinct ancestors),
-//!   NOT 10,000. Initiative progress is correct within the window.
-//! - **ISS-D8(b) — reindex-from-source: `replay` rebuilds the rollup aggregate + the Refs edge
-//!   projection DRIFT-FREE vs live.** The green artifact is the REINDEX-PARITY (0 drift): the cold
-//!   rebuild byte-matches the live rollup — proving steady-state and recovery share ONE code path
-//!   (contract 2.6).
-//!
-//! This drill also carries the CHAINED-MUTATION e2e (import a subtree → assert bounded recomputes →
-//! replay → assert drift-free) the prompt's TESTS section names, and the 2.6 CDC pair (the replay
-//! drives the SAME consumer body the live path drives — cold == live).
-//!
-//! Off the bus, never in the write path: the consumer recomputes ancestors asynchronously; the write
-//! path is just "emit the event". The `input_hash` no-op suppression (AG-6) stops the loop storm.
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventHandler,
     EventId, EventType, HandleOutcome, ReindexSource, SnapshotScope, Timestamp, Visibility,
@@ -65,11 +46,6 @@ fn updated_event(event_id: &str, subject: &str) -> EventEnvelope {
     }
 }
 
-/// **ISS-D8(a) — rollup freshness under a 10k-issue import → a BOUNDED number of ancestor recomputes
-/// (the debounce bound is the green artifact).** Import 10,000 child issues under a SMALL ancestor set
-/// (one epic, three stories) and drive each through the consumer's `handle` (the off-the-bus delta).
-/// The coalesce collapses the 10,000 deltas into a recompute count equal to the number of distinct
-/// dirtied ancestors — BOUNDED, never 10,000.
 #[test]
 fn iss_d8a_10k_import_coalesces_to_a_bounded_recompute_count() {
     let consumer = RollupConsumer::new();
@@ -81,34 +57,27 @@ fn iss_d8a_10k_import_coalesces_to_a_bounded_recompute_count() {
         consumer.add_parent_edge(s, &epic);
     }
 
-    // Import 10,000 children, ~3,333 under each story (each child's parent walk reaches its story + the
-    // epic — two ancestors per leaf, but only 4 DISTINCT ancestors across the whole import).
     let n = 10_000usize;
     for i in 0..n {
         let child = r(&format!("myelin://acme/issue/issue/ENG-T{i}"));
         let story = &stories[i % stories.len()];
         consumer.add_parent_edge(&child, story);
         consumer.put_leaf(&child, LeafFact::new(Some(1), StateCategory::Started));
-        // The off-the-bus delta (one per imported child).
         let outcome = consumer.handle(&updated_event(&format!("imp-{i}"), &child.0), &mut myelin_events::HandlerTx::none());
         assert_eq!(outcome, HandleOutcome::Done);
     }
 
-    // THE DEBOUNCE BOUND (the green artifact): 10,000 deltas → a BOUNDED recompute count (the 4 distinct
-    // ancestors: the epic + the three stories), NOT 10,000.
     let bound = consumer.pending_recompute_count();
     assert_eq!(
         bound, 4,
         "ISS-D8(a): a 10k import coalesces to the 4 distinct ancestors (epic + 3 stories), \
-         not 10,000 recomputes — the debounce bound"
+         not 10,000 recomputes - the debounce bound"
     );
     assert!(
         bound < n,
         "ISS-D8(a) GREEN: recompute count {bound} << import size {n} (bounded, debounced)"
     );
 
-    // Initiative progress is correct within the window: flush, then the epic's rollup totals 10,000 live
-    // leaves (all Started → 0 done).
     let changed = consumer.flush();
     let epic_agg = changed
         .iter()
@@ -122,10 +91,6 @@ fn iss_d8a_10k_import_coalesces_to_a_bounded_recompute_count() {
     assert_eq!(epic_agg.done, 0, "all Started → 0 done");
 }
 
-/// **ISS-D8(b) — reindex-from-source rebuilds the rollup DRIFT-FREE vs live (the reindex-parity 0-drift
-/// green artifact).** Build a live rollup over a realistic subtree, wipe the derived aggregates, then
-/// reindex off the source (the `issue_relation` edges + the leaf facts) — the cold rebuild byte-matches
-/// the live rollup (steady-state and recovery share ONE code path, contract 2.6).
 #[test]
 fn iss_d8b_reindex_from_source_rebuilds_drift_free() {
     let consumer = RollupConsumer::new();
@@ -133,7 +98,6 @@ fn iss_d8b_reindex_from_source_rebuilds_drift_free() {
     let story = r("myelin://acme/issue/issue/ENG-STORY");
     consumer.add_parent_edge(&story, &epic);
 
-    // A mixed subtree: 3 completed, 2 started, 1 cancelled (excluded) under the story.
     for (i, cat) in [
         StateCategory::Completed,
         StateCategory::Completed,
@@ -152,16 +116,13 @@ fn iss_d8b_reindex_from_source_rebuilds_drift_free() {
     }
     let _ = consumer.flush();
     let live = aggregate_snapshot(&consumer);
-    // The story rolls up 5 live (cancelled excluded), 3 done.
     let story_agg = &live[&story.0];
     assert_eq!(story_agg.total, 5);
     assert_eq!(story_agg.done, 3);
 
-    // REINDEX-FROM-SOURCE: wipe + rebuild off the source of truth.
     let rebuilt = consumer.reindex_from();
     let cold = aggregate_snapshot(&consumer);
 
-    // THE REINDEX-PARITY (0 drift): the cold rebuild byte-matches the live rollup.
     assert_eq!(
         live, cold,
         "ISS-D8(b) GREEN: the cold rebuild byte-matches the live rollup (0-drift reindex-parity)"
@@ -169,9 +130,6 @@ fn iss_d8b_reindex_from_source_rebuilds_drift_free() {
     assert!(rebuilt >= 2, "the epic + the story are both rebuilt");
 }
 
-/// **The chained-mutation e2e (the prompt's named TEST): import a subtree → assert bounded recomputes →
-/// replay → assert drift-free.** One end-to-end pass exercising the whole loop: the off-the-bus deltas
-/// coalesce (bounded), the flush computes the live rollup, the reindex rebuilds it byte-identical.
 #[test]
 fn chained_mutation_e2e_import_bounded_replay_drift_free() {
     let consumer = RollupConsumer::new();
@@ -179,7 +137,6 @@ fn chained_mutation_e2e_import_bounded_replay_drift_free() {
     let story = r("myelin://acme/issue/issue/CHAIN-STORY");
     consumer.add_parent_edge(&story, &epic);
 
-    // Import 50 children under the story (chained mutations).
     for i in 0..50 {
         let t = r(&format!("myelin://acme/issue/issue/CHAIN-T{i}"));
         consumer.add_parent_edge(&t, &story);
@@ -191,7 +148,6 @@ fn chained_mutation_e2e_import_bounded_replay_drift_free() {
         consumer.put_leaf(&t, LeafFact::new(Some(1), cat));
         consumer.handle(&updated_event(&format!("chain-{i}"), &t.0), &mut myelin_events::HandlerTx::none());
     }
-    // BOUNDED: 50 deltas → 2 distinct ancestors (epic + story).
     assert_eq!(consumer.pending_recompute_count(), 2);
 
     let _ = consumer.flush();
@@ -199,7 +155,6 @@ fn chained_mutation_e2e_import_bounded_replay_drift_free() {
     assert_eq!(live[&story.0].total, 50);
     assert_eq!(live[&story.0].done, 25);
 
-    // REPLAY (reindex) → DRIFT-FREE.
     consumer.reindex_from();
     assert_eq!(
         live,
@@ -208,16 +163,8 @@ fn chained_mutation_e2e_import_bounded_replay_drift_free() {
     );
 }
 
-/// **The 2.6 CDC pair (replay) — the SAME consumer body the live path drives rebuilds off the
-/// `*.snapshot` re-emit (cold == live).** The PROVIDER (producer side) is Issues' [`IssueReindexSource`]
-/// re-emitting the rollup as `issue.rollup.snapshot` (sub-artifact-granular); the CONSUMER is the rollup
-/// rebuild reading the SAME source. Pins that the rollup is reindex-from-source-rebuildable (a DERIVED
-/// store with no second recovery path) and that its snapshot replay is deterministic (idempotent re-run).
 #[test]
 fn cdc_2_6_rollup_snapshot_replay_is_deterministic() {
-    // The PROVIDER (producer) side: a rollup aggregate is a re-emittable *.snapshot (contract 2.6 —
-    // the rollup is snapshot-emittable for OLAP convenience even though it is DERIVED; the edge truth
-    // is issue_relation).
     let mut src = IssueReindexSource::new();
     let agg = RollupAggregate {
         total: 10,

@@ -1,53 +1,10 @@
-//! # `redaction` — CT-004f sub-step 1: the boundary secret-redaction seam
-//!
-//! Boundary redaction masks the CI-managed secret values in a job's captured stdout/stderr at the
-//! sandbox boundary — inside the backend's capture→result step, BEFORE the bytes populate
-//! [`SandboxResult`](crate::SandboxResult) and cross back toward the durable log pipeline (CT-004f).
-//! It is the safety property that lets the live log sink seal captured output to durable storage
-//! without leaking a platform-injected secret into the content-addressed log store.
-//!
-//! ## Security model (precise — do not overclaim)
-//! Exact-value masking protects ONLY **known needles**: the CI-managed secret values the platform
-//! itself injects into a job. It does NOT — and by construction CANNOT — stop a job from printing a
-//! credential it found in its own source tree, a restored cache, customer data, or a literal typed
-//! into its own script. The guarantee this seam enforces is therefore:
-//!
-//! > "The durable logs contain no CI-managed secret plaintext, because every value the platform
-//! > injects is masked at the boundary."
-//!
-//! NOT "the logs contain nothing sensitive."
-//!
-//! ## Unbypassable choke point + inseparable injection plan
-//! [`ResolvedJobSecrets`] is the ephemeral, non-serializable launch value that couples every guest
-//! secret environment entry to its exact-value redaction needle. Its checked constructor derives
-//! both representations together through [`RedactionPlan::for_job`] and verifies exact coverage.
-//! The only way to attach secret material to a [`JobSpec`](crate::JobSpec) is through that checked
-//! constructor; the fields that feed OCI env and boundary redaction are private.
-//!
-//! - **A choke point that cannot be skipped:** every capture→result path takes a
-//!   `&RedactionPlan` and applies it as the final step, so no backend can forward un-redacted captured
-//!   bytes — a new backend cannot forget the step, it is a REQUIRED argument.
-//! - **Coverage is checked, not assumed:** [`ResolvedJobSecrets::validate_coverage`] compares the
-//!   injected values and plan needles exactly. A disagreement rejects launch before OCI composition.
-//!
-//! Exact plaintext matches are covered across capture-chunk boundaries. Encoded or workload-
-//! transformed values remain outside this exact-value guarantee; this module does not claim to be a
-//! general sensitive-data detector.
-//!
 use crate::JobSpec;
 use std::fmt;
 use zeroize::{Zeroize, Zeroizing};
 
-/// A set of exact-value needles to mask from a job's captured output at the sandbox boundary. See the
-/// module docs for the (precise, do-not-overclaim) security model and the choke-point rationale.
 #[derive(Clone, PartialEq, Eq)]
 pub struct RedactionPlan {
-    /// The exact byte values to mask, populated from the same resolved bindings as the guest env via
-    /// [`RedactionPlan::for_job`]. Needles are held as bytes (a secret is not necessarily UTF-8) and
-    /// never logged/serialized.
     needles: Vec<Vec<u8>>,
-    /// A per-plan marker made solely from a byte absent from every needle. That delimiter makes the
-    /// marker non-collidable and prevents adjacent markers or marker boundaries reconstructing one.
     marker: Vec<u8>,
 }
 
@@ -57,8 +14,6 @@ impl Default for RedactionPlan {
     }
 }
 
-/// Plan construction failed because no non-empty delimiter can separate redacted spans without
-/// itself containing (or joining into) a configured needle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RedactionPlanError;
 
@@ -81,7 +36,6 @@ impl fmt::Debug for RedactionPlan {
 }
 
 impl RedactionPlan {
-    /// The empty plan — "there are no CI-managed secret needles to mask for this job." A no-op mask.
     pub fn none() -> RedactionPlan {
         RedactionPlan {
             needles: Vec::new(),
@@ -89,9 +43,6 @@ impl RedactionPlan {
         }
     }
 
-    /// Derive the per-job plan from the SAME resolved bindings that become the guest environment.
-    /// This constructor is deliberately private to the module: callers attach material through
-    /// [`ResolvedJobSecrets::for_job`], which immediately checks exact coverage.
     fn for_job(
         _spec: &JobSpec,
         bindings: &[ResolvedSecretEnv],
@@ -103,9 +54,6 @@ impl RedactionPlan {
         )
     }
 
-    /// Build a plan from explicit needles. Empty needles are dropped (masking the empty string would
-    /// replace between every byte). Production injection rejects empty values before reaching this
-    /// helper; the filtering keeps direct masker callers safe too.
     pub fn for_needles(
         needles: impl IntoIterator<Item = Vec<u8>>,
     ) -> Result<RedactionPlan, RedactionPlanError> {
@@ -115,7 +63,6 @@ impl RedactionPlan {
         Ok(RedactionPlan { needles, marker })
     }
 
-    /// `true` iff there is nothing to mask.
     pub fn is_empty(&self) -> bool {
         self.needles.is_empty()
     }
@@ -134,9 +81,6 @@ impl RedactionPlan {
                 .all(|(needle, expected)| needle.as_slice() == expected)
     }
 
-    /// Mask every needle occurrence in `bytes`, replacing each with the plan's collision-free marker. The empty
-    /// plan returns the bytes unchanged. This is an exact-substring replacement; see the module's
-    /// deliberately narrow security model.
     pub fn redact(&self, bytes: &[u8]) -> Vec<u8> {
         if self.needles.is_empty() {
             return bytes.to_vec();
@@ -164,8 +108,6 @@ impl Drop for RedactionPlan {
     }
 }
 
-/// Per-stream exact-value masker. It retains at most `max_needle_len - 1` source bytes so a needle
-/// split across arbitrary pipe reads can never be emitted in plaintext to the durable sink.
 pub(crate) struct StreamingRedactor<'a> {
     plan: &'a RedactionPlan,
     pending: Vec<u8>,
@@ -220,10 +162,6 @@ impl Drop for StreamingRedactor<'_> {
     }
 }
 
-/// One broker-resolved secret binding before it is coupled to the job's redaction plan.
-///
-/// `Debug` never renders the material and `Drop` zeroizes it. This value is intentionally not
-/// serializable; durable specs carry only [`crate::SecretRef`].
 #[derive(Clone, PartialEq, Eq)]
 pub struct ResolvedSecretEnv {
     name: String,
@@ -231,7 +169,6 @@ pub struct ResolvedSecretEnv {
 }
 
 impl ResolvedSecretEnv {
-    /// Build one ephemeral binding from a broker outcome.
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -239,8 +176,6 @@ impl ResolvedSecretEnv {
         }
     }
 
-    /// Move already-zeroizing broker material into the sandbox binding without ever creating a
-    /// non-zeroizing plaintext `String` on the production resolution path.
     pub fn from_zeroizing(name: impl Into<String>, value: Zeroizing<String>) -> Self {
         Self {
             name: name.into(),
@@ -259,18 +194,12 @@ impl fmt::Debug for ResolvedSecretEnv {
     }
 }
 
-/// Why resolved secret material could not be attached to an ephemeral launch spec.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SecretInjectionError {
-    /// The resolved bindings were not exactly the job's declared refs, in declaration order.
     BindingSetMismatch,
-    /// An empty secret cannot have a meaningful exact-value redaction needle.
     EmptyValue { name: String },
-    /// A literal env entry and secret binding attempted to own the same variable name.
     EnvNameCollision { name: String },
-    /// The plan did not contain exactly one matching needle for every injected value.
     CoverageMismatch,
-    /// No non-empty marker can make exact-value replacement safe for this pathological needle set.
     UnsafeRedactionPlan,
 }
 
@@ -299,11 +228,6 @@ impl fmt::Display for SecretInjectionError {
 
 impl std::error::Error for SecretInjectionError {}
 
-/// The ONE ephemeral value from which both OCI secret env and boundary redaction are obtained.
-///
-/// Its fields are private, it has no serde implementation, and the checked constructor enforces the
-/// exact declared-ref set plus exact needle coverage. Consequently, a caller cannot attach a guest
-/// secret env entry without attaching its matching redaction needle.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct ResolvedJobSecrets {
     bindings: Vec<ResolvedSecretEnv>,
@@ -323,8 +247,6 @@ impl fmt::Debug for ResolvedJobSecrets {
 }
 
 impl ResolvedJobSecrets {
-    /// Couple the complete broker resolution to `spec`. Partial or reordered resolution is refused:
-    /// launch policy for a withhold is therefore decided in the control plane before this call.
     pub fn for_job(
         spec: &JobSpec,
         bindings: Vec<ResolvedSecretEnv>,
@@ -362,7 +284,6 @@ impl ResolvedJobSecrets {
         Ok(resolved)
     }
 
-    /// Reject any launch whose guest-secret values and redaction needles are not exactly equal.
     pub fn validate_coverage(&self) -> Result<(), SecretInjectionError> {
         if self.redaction.exactly_covers(&self.bindings) {
             Ok(())
@@ -396,12 +317,10 @@ impl ResolvedJobSecrets {
         self.validate_coverage()
     }
 
-    /// Number of secret env entries this launch will inject.
     pub fn len(&self) -> usize {
         self.bindings.len()
     }
 
-    /// Whether this launch injects no secret env entries.
     pub fn is_empty(&self) -> bool {
         self.bindings.is_empty()
     }
@@ -427,8 +346,6 @@ impl ResolvedJobSecrets {
     }
 }
 
-/// Replace every non-overlapping occurrence of `needle` in `haystack` with `with`. `needle` is assumed
-/// non-empty (enforced by [`RedactionPlan::for_needles`]).
 fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(haystack.len());
     let mut i = 0;
@@ -444,12 +361,6 @@ fn replace_all(haystack: &[u8], needle: &[u8], with: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Choose one delimiter byte absent from every needle and repeat it into a bounded, non-empty marker.
-/// Because no needle contains the delimiter at all, no needle can occur inside a marker, across two
-/// adjacent markers, or across a marker/plaintext boundary. Production secret values are UTF-8
-/// strings, so at least one invalid standalone UTF-8 byte is absent. An arbitrary-byte needle set
-/// that collectively covers all 256 byte values has no marker satisfying this proof and is rejected
-/// fail-closed instead of silently substituting the empty string.
 fn collision_free_marker(needles: &[Vec<u8>]) -> Result<Vec<u8>, RedactionPlanError> {
     if needles.is_empty() {
         return Ok(b"[myelin-redacted]".to_vec());

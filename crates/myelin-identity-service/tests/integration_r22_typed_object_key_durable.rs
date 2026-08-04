@@ -1,22 +1,3 @@
-//! # R2.2 — the type-qualified object key over the LIVE durable (PG) tuple store.
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo test` stays DB-free. Runs
-//! against the docker-compose dev stack:
-//!
-//!   DATABASE_URL=postgres://myelin_app:myelin_app_pw@localhost:5433/myelin \
-//!     cargo test -p myelin-identity-service --features integration \
-//!       --test integration_r22_typed_object_key_durable -- --nocapture
-//!
-//! The DB-free unit tests already pin the R2.2 keying on the in-memory double; this proves the SAME
-//! properties through the PRODUCTION `with_pg` path (the durable `rebac_tuple` edge set read back by
-//! a FRESH store instance — i.e. the canonicalisation is read-side and store-agnostic, so a durable
-//! grant behaves identically across restarts):
-//!   1. a DURABLE grant on `issue:<X>` does NOT authorize `repo:<X>` (cross-type confusion dead on
-//!      the durable path, in both the bare and the URN check spelling);
-//!   2. the bare (`issue:<X>`) and URN (`myelin://<t>/issues/issue/<X>`) spellings of the SAME
-//!      object both authorize off the ONE durable grant (write==read keying, zero migration);
-//!   3. a NAMESPACED slug grant (`repo:team/app` — the R2.1a git grammar) authorizes its own check
-//!      and does NOT alias onto `repo:app` (the R2.1a carry-forward, durable leg).
 #![cfg(feature = "integration")]
 
 use std::sync::Arc;
@@ -34,7 +15,6 @@ use myelin_storage::migration::HotTables;
 use myelin_storage::{identity_durable_migrations, DurableTupleBacking, SubstrateProvider};
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
-/// DDL runs as the migration/owner role (PG16 revokes `CREATE` on `public` for the app role).
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
     let mut c = cfg.clone();
     c.database_url = c
@@ -43,7 +23,6 @@ fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
     c
 }
 
-/// A per-run unique suffix so a fresh run uses fresh `(tenant)` partitions.
 fn uniq() -> String {
     format!(
         "{}_{}",
@@ -55,8 +34,6 @@ fn uniq() -> String {
     )
 }
 
-/// A per-store-unique minter (mirrors `integration_mr007_identity_durable.rs`): the co-committed
-/// `identity.tuple.written` rows need globally-unique event ids across suites sharing the live DB.
 struct UniqueMinter {
     base: String,
     n: std::sync::atomic::AtomicU64,
@@ -90,7 +67,6 @@ fn latest() -> Consistency {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
-    // Migrate (admin role), then run through the NOBYPASSRLS app role.
     let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
         Ok(p) => p,
         Err(_) => {
@@ -114,8 +90,6 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
     let suffix = uniq();
     let tenant = format!("r22-key-{suffix}");
 
-    // The verified subject (tenant-from-token: the check scope derives from alice's own
-    // tenant/region — the same partition the grant is written into).
     let alice = Principal::new(
         TenantId(tenant.clone()),
         Region(region.clone()),
@@ -126,7 +100,6 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
     );
     let scope = myelin_storage::TenantScope::from_verified_token(&alice, alice.region.clone());
 
-    // ---- Write the DURABLE grants through store instance #1 (the production with_pg path). ----
     let tstore1 = TupleStore::with_pg_minter(
         Arc::new(UniqueMinter::new(format!("{suffix}k1"))),
         DurableTupleBacking::new(app.clone()),
@@ -137,9 +110,7 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
             &scope,
             &alice,
             &[
-                // The grant under test: reader on the ISSUE X-1 (never the repo).
                 TupleDelta::Add(tuple("issue:X-1", "reader", "p:alice")),
-                // The R2.1a namespaced-slug grant.
                 TupleDelta::Add(tuple("repo:team/app", "reader", "p:alice")),
             ],
             None,
@@ -148,7 +119,6 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
         )
         .expect("durable grants write");
 
-    // ---- Check through a FRESH store instance over the SAME live pool (restart-shaped). ----
     let tstore2 = TupleStore::with_pg_minter(
         Arc::new(UniqueMinter::new(format!("{suffix}k2"))),
         DurableTupleBacking::new(app.clone()),
@@ -162,7 +132,6 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
             .expect("check evaluates")
     };
 
-    // (1) The durable issue grant authorizes the ISSUE — in BOTH spellings (write==read keying).
     assert_eq!(d("issue:X-1"), Decision::Allow, "bare spelling matches the durable grant");
     assert_eq!(
         d(&format!("myelin://{tenant}/issues/issue/X-1")),
@@ -170,7 +139,6 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
         "URN spelling matches the SAME durable grant (one canonical key)"
     );
 
-    // (2) The SAME trailing id on the REPO type is DENIED — cross-type confusion dead durably.
     assert_eq!(d("repo:X-1"), Decision::Deny, "durable issue:X grant must not authorize repo:X");
     assert_eq!(
         d(&format!("myelin://{tenant}/git/repo/X-1")),
@@ -178,8 +146,6 @@ async fn durable_grant_on_issue_x_does_not_authorize_repo_x() {
         "…nor the URN spelling of repo:X"
     );
 
-    // (3) The namespaced slug keys whole on the durable path: its own check admits; the collapse
-    //     target `repo:app` does not alias.
     assert_eq!(
         d("repo:team/app"),
         Decision::Allow,

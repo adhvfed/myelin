@@ -1,34 +1,3 @@
-//! # FLOW-D4 extended — the per-effect partial-approval drill across a restart + deploy (P-FLOW-12 → P-209)
-//!
-//! The headline drill the P-FLOW-12 GATE requires (architecture §8 / testing-strategy FLOW-D4 per-effect
-//! extended form): a gated workflow with a **multi-effect approval card** parks on the durable wait
-//! (`state=waiting`, holding NO runtime) across a worker **restart** + a **deploy**; the **partial
-//! approval** — `{card_id:0 = approve, card_id:1 = decline, card_id:2 = approve}` — arrives **days later**
-//! WITH a **double-click on "approve all"**; the resumed run applies/withholds EACH effect **EXACTLY
-//! ONCE**, the **declined effect never mutates** (AG-8), and the double-click is **absorbed** (0
-//! double-apply). The exact threshold (architecture §8): **3 per-effect ledger entries** (apply / decline
-//! / apply), a **0-double-apply** counter, and a **0-mutation-on-decline** assertion across the restart.
-//!
-//! **No new engine primitive.** This drills P-FLOW-10's per-effect `idem_key` rule
-//! ([`per_effect_idem_key`] + [`apply_approved_effects`], contract 9.1) together with P-FLOW-11's durable
-//! wait ([`WfCtx::wait_for_signal`], contract 9.4) under failure injection — exactly the F-4-extended
-//! assertion of architecture §8.b. A red drill is information — never weaken it to pass (EI-01 §3).
-//!
-//! **What "restart" + "deploy" model** (identical to the FLOW-D4 base drill,
-//! `tests/drills_flow_d4_multiday_hitl.rs`): the engine drives runs through a [`FlowDispatcher`] (one
-//! per-partition worker). A RESTART is a FRESH dispatcher over the SAME run store + journal + signal
-//! buffer + outbox (the durable state survives the worker death). A DEPLOY is a re-registration of the
-//! workflow body (here the SAME version 1 — a deploy that does not change the workflow shape; a deploy
-//! that DOES bump the version is the FLOW-D2 divergence guard, P-FLOW-07). The durability is the point:
-//! the partial approval arrives across both, days later, and each effect is still applied/withheld
-//! exactly once.
-//!
-//! **The per-effect ledger.** Each APPLIED effect emits an `agent.effect.applied` event via the outbox
-//! (one ledger row per apply); a DECLINED effect is WITHHELD — it emits NOTHING (0 mutation, AG-8). So
-//! the per-effect ledger across the run is exactly three entries — `apply` (effect 0), `decline` (effect
-//! 1, recorded as a withhold with NO emit), `apply` (effect 2) — and the outbox holds the card request +
-//! exactly TWO effect-applied emits.
-
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
     apply_approved_effects, partition_for_run_id, run_state, ApprovalCard, ApprovalDecision,
@@ -68,36 +37,19 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// The card identity gated by this drill — a three-effect batch card (the §6.4 multi-effect form: each
-/// effect keys on `card-7:0` / `card-7:1` / `card-7:2`).
 const CARD_ID: &str = "card-7";
-/// The signal name the body parks on for the human's "I have decided the whole card" wake. The per-effect
-/// decisions ride the separate [`APPROVAL_SIGNAL_NAME`] signal under the §6.4 per-effect `idem_key`s; this
-/// wake is what un-parks the run once the partial approval has been recorded.
 const CARD_DECISION_WAKE: &str = "card_decision";
-/// The FROZEN per-effect ledger event a single APPLIED effect emits via the outbox (one row per apply).
 const EFFECT_APPLIED_EVENT: &str = "agent.effect.applied";
 
-/// One entry in the per-effect ledger the drill asserts: `Apply(effect_ref)` (the effect mutated exactly
-/// once) or `Decline(effect_ref)` (WITHHELD — 0 mutation, AG-8). Across the three-effect card the ledger
-/// must be exactly `[Apply, Decline, Apply]`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum LedgerEntry {
     Apply(String),
     Decline(String),
 }
 
-/// The per-effect ledger the body records as it walks the card (shared with the test so it can assert the
-/// three entries). A real engine derives this from the emitted `agent.effect.applied` events + the
-/// withheld set; here we record it directly so the drill can assert apply/decline/apply.
 type Ledger = Rc<RefCell<Vec<LedgerEntry>>>;
-/// A double-apply tripwire: incremented by the `EffectApi::apply` closure on EVERY call. The gate asserts
-/// it equals the number of APPROVED effects (2) — never more (a double-click MUST NOT double-apply).
 type ApplyCount = Rc<RefCell<usize>>;
 
-/// The three-effect approval card the partial approval decides (approve 0, decline 1, approve 2 — the
-/// §8.b shape). The decisions on the card mirror what the human submits; the engine reads the BUFFERED
-/// per-effect signals as the truth.
 fn three_effect_card(run_id: &str) -> ApprovalCard {
     ApprovalCard {
         run_id: run_id.to_string(),
@@ -119,18 +71,12 @@ fn three_effect_card(run_id: &str) -> ApprovalCard {
     }
 }
 
-/// The gated multi-effect workflow body: emit the approval card request (once, replay-guarded), park on
-/// the durable wait, then on resume run the §6.4 gated loop over the three buffered per-effect signals —
-/// applying each APPROVED effect EXACTLY once (one `agent.effect.applied` emit per apply) and WITHHOLDING
-/// the DECLINED effect (no emit, 0 mutation, AG-8). Deterministic over its journal.
 fn gated_multi_effect_body(
     ledger: Ledger,
     apply_count: ApplyCount,
     signals: SignalStore,
 ) -> Box<WorkflowBody> {
     Box::new(move |ctx: &mut WfCtx| {
-        // 1. Emit the card request ONCE (guarded by an activity so a re-drive short-circuits, §4.1) — the
-        //    card gates three effects; Notif/Chat renders it (contract 7.3, NOT this engine).
         let emitted = RefCell::new(false);
         ctx.activity(
             myelin_flow::RetryPolicy { max_attempts: 1 },
@@ -157,15 +103,11 @@ fn gated_multi_effect_body(
             .map_err(|e| format!("{e:?}"))?;
         }
 
-        // 2. PARK on the durable wait until the human has decided the card (the `card_decision` wake). The
-        //    run holds NO runtime (state=waiting) across the restart + deploy, days later (FLOW-D4).
         let outcome = ctx
             .wait_for_signal(CARD_DECISION_WAKE, Some(7 * 86_400))
             .map_err(|e| format!("{e:?}"))?;
         match outcome {
-            // still parked (the wake has not arrived) — the run stays waiting.
             WaitOutcome::Parked => return Ok(vec![]),
-            // the auto-deny window elapsed → the whole card is withheld (0 mutation across all effects).
             WaitOutcome::TimedOut => {
                 for eff in &three_effect_card(ctx.run_id()).effects {
                     ledger
@@ -174,22 +116,15 @@ fn gated_multi_effect_body(
                 }
                 return Ok(vec![]);
             }
-            // 3. RESUMED — the wake arrived. Run the §6.4 gated loop over the buffered per-effect signals.
             WaitOutcome::Signalled { .. } => {}
         }
 
-        // 3a. Read the per-effect decisions off the buffered `approval` signals + record the ledger. The
-        //     apply closure is a pure recorder (it bumps the double-apply tripwire); the actual mutating
-        //     emit is done OUTSIDE the closure (it cannot borrow `ctx`, which the closure does not hold).
         let card = three_effect_card(ctx.run_id());
         let outcomes = apply_approved_effects(&signals, &tenant(), &card, &|eff: &ArtifactRef| {
             *apply_count.borrow_mut() += 1;
             Ok(format!("evt-for-{}", eff.0))
         });
 
-        // 3b. Emit ONE `agent.effect.applied` ledger event per APPLIED effect (the mutation); record the
-        //     ledger entry per effect (apply | decline). A DECLINED effect emits NOTHING (0 mutation,
-        //     AG-8). Each emit rides through the outbox (the ONLY emit path, §4.5).
         let mut applied_refs = Vec::new();
         for (idx, outcome) in outcomes.iter().enumerate() {
             let eff_ref = card.effects[idx].effect_ref.0.clone();
@@ -215,7 +150,6 @@ fn gated_multi_effect_body(
                     applied_refs.push(ArtifactRef(eff_ref));
                 }
                 Some(Ok(EffectOutcome::Withheld(_))) => {
-                    // WITHHELD (AG-8): NO emit, 0 mutation — the ledger records the decline.
                     ledger.borrow_mut().push(LedgerEntry::Decline(eff_ref));
                 }
                 Some(Err(e)) => return Err(format!("effect {idx} apply failed: {e:?}")),
@@ -226,8 +160,6 @@ fn gated_multi_effect_body(
     })
 }
 
-/// The shared durable substrate a worker drives over (run store + journal + signal buffer + outbox +
-/// telemetry). Restarts share THIS substrate (the durable state survives a worker death).
 struct Substrate {
     runs: RunStore,
     journal: WfJournal,
@@ -236,8 +168,6 @@ struct Substrate {
     tele: FlowTelemetry,
 }
 
-/// A FRESH dispatcher over the shared substrate (a "restart" / a "redeploy" — a new worker process), on
-/// the run's partition so its lease scan finds it. The deploy re-registers the SAME-version body.
 fn fresh_worker(
     sub: &Substrate,
     worker: &str,
@@ -251,10 +181,6 @@ fn fresh_worker(
         sub.outbox.clone(),
         sub.journal.clone(),
         sub.tele.clone(),
-        // A SHARED globally-unique ULID source across workers (production mints ULIDs from a
-        // process-global source; a restart/deploy never resets event-id uniqueness). Using one
-        // monotonic minter across both workers models that: the resume drive's effect-applied emits
-        // get FRESH event_ids, never colliding with the card request the prior worker committed.
         minter,
         ctx_base(),
         partition,
@@ -269,8 +195,6 @@ fn fresh_worker(
     disp
 }
 
-/// Deliver an APPROVE signal for effect `idx` of the three-effect card (the payload carries the effect
-/// ref; keyed on the §6.4 per-effect `card-7:idx`).
 fn approve(ex: &FlowExecutor, run: &myelin_flow::RunId, idx: usize) {
     let key = myelin_flow::per_effect_idem_key(CARD_ID, idx, 3);
     ex.signal(SignalSpec {
@@ -285,8 +209,6 @@ fn approve(ex: &FlowExecutor, run: &myelin_flow::RunId, idx: usize) {
     .expect("approve");
 }
 
-/// Deliver a DECLINE signal for effect `idx` (empty payload + the DECLINE_MARKER, §3.4 — keyed on
-/// `card-7:idx`).
 fn decline(ex: &FlowExecutor, run: &myelin_flow::RunId, idx: usize) {
     let key = myelin_flow::per_effect_idem_key(CARD_ID, idx, 3);
     ex.signal(SignalSpec {
@@ -299,7 +221,6 @@ fn decline(ex: &FlowExecutor, run: &myelin_flow::RunId, idx: usize) {
     .expect("decline");
 }
 
-/// Deliver the `card_decision` wake that un-parks the run once the partial approval has been recorded.
 fn wake_signal(ex: &FlowExecutor, run: &myelin_flow::RunId) -> myelin_flow::SignalOutcome {
     ex.signal(SignalSpec {
         run: run.clone(),
@@ -311,12 +232,6 @@ fn wake_signal(ex: &FlowExecutor, run: &myelin_flow::RunId) -> myelin_flow::Sign
     .expect("wake")
 }
 
-/// **FLOW-D4 EXTENDED — the per-effect partial-approval drill across a restart + deploy with a
-/// double-click (the P-FLOW-12 GATE).** A three-effect card parks on the durable wait across a worker
-/// restart + a deploy; the partial approval `{0=approve, 1=decline, 2=approve}` arrives days later WITH a
-/// double-click on "approve all"; the resumed run applies effects 0 and 2 EXACTLY once each and WITHHOLDS
-/// effect 1 (0 mutation). The threshold: 3 per-effect ledger entries (apply/decline/apply), a
-/// 0-double-apply counter, a 0-mutation-on-decline assertion across the restart.
 #[test]
 fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() {
     let ex = FlowExecutor::new(minter(), tenant(), region());
@@ -340,10 +255,8 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
     let ledger: Ledger = Rc::new(RefCell::new(Vec::new()));
     let apply_count: ApplyCount = Rc::new(RefCell::new(0));
     let part = partition_for_run_id(&run.0);
-    // One process-global ULID source shared across the restart/deploy (event-id uniqueness is global).
     let id_source = minter();
 
-    // WORKER 1 ticks: the body emits the three-effect card request + PARKS (state=waiting holds no runtime).
     let w1 = fresh_worker(
         &sub,
         "worker-1",
@@ -363,40 +276,33 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
     assert_eq!(
         sub.runs.get(&tenant(), &run.0).unwrap().state,
         run_state::WAITING,
-        "state=waiting — the multi-day HITL wait holds no runtime (FLOW-D4)"
+        "state=waiting - the multi-day HITL wait holds no runtime (FLOW-D4)"
     );
     assert_eq!(
         sub.outbox.committed_count(),
         1,
         "the agent.approval.requested card (gating 3 effects) was emitted once"
     );
-    // nothing applied yet — the partial approval has not arrived.
     assert_eq!(
         *apply_count.borrow(),
         0,
         "no effect applied while the run is parked"
     );
 
-    // --- WORKER 1 CRASHES (restart) + the service is REDEPLOYED while the run is parked (days pass). ---
     drop(w1);
 
-    // DAYS LATER: the human submits the PARTIAL approval — approve 0, decline 1, approve 2 — three
-    // independently-keyed per-effect signals (the §6.4 partial-approval shape).
     approve(&ex, &run, 0);
     decline(&ex, &run, 1);
     approve(&ex, &run, 2);
-    // THE DOUBLE-CLICK on "approve all": re-send the SAME per-effect APPROVE keys (0 and 2) → ON CONFLICT
-    // DO NOTHING → 0 new buffered signals (the double-click is absorbed).
     approve(&ex, &run, 0);
     approve(&ex, &run, 2);
     assert_eq!(
         sub.signals.count_for_run(&tenant(), &run.0),
         3,
-        "the partial approval + double-click buffered EXACTLY THREE per-effect signals (0/1/2) — the \
+        "the partial approval + double-click buffered EXACTLY THREE per-effect signals (0/1/2) - the \
          double-click on approve-all re-sent the same keys → ON CONFLICT DO NOTHING"
     );
 
-    // the human's submit posts the `card_decision` wake — also double-clicked; the wake buffers once.
     assert_eq!(
         wake_signal(&ex, &run),
         myelin_flow::SignalOutcome::Buffered,
@@ -407,10 +313,8 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
         myelin_flow::SignalOutcome::Duplicate,
         "the double-clicked wake is a no-op (ON CONFLICT DO NOTHING)"
     );
-    // the signal-wake flips the parked run waiting → running so the NEW worker re-leases it.
     sub.runs.wake(&tenant(), &run.0);
 
-    // --- WORKER 2 (the redeployed process) re-leases + resumes the run DAYS later. ---
     let w2 = fresh_worker(
         &sub,
         "worker-2",
@@ -429,12 +333,11 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
                 ArtifactRef("myelin://acme/agent/effect/merge-a".into()),
                 ArtifactRef("myelin://acme/agent/effect/merge-c".into()),
             ],
-            "the resumed run applied effects 0 and 2 (the approved ones) — effect 1 was WITHHELD"
+            "the resumed run applied effects 0 and 2 (the approved ones) - effect 1 was WITHHELD"
         ),
         other => panic!("expected the run to resume + complete, got {other:?}"),
     }
 
-    // THE THRESHOLD 1 — three per-effect ledger entries: apply / decline / apply.
     let ledger = ledger.borrow().clone();
     assert_eq!(
         ledger,
@@ -443,39 +346,32 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
             LedgerEntry::Decline("myelin://acme/agent/effect/merge-b".into()),
             LedgerEntry::Apply("myelin://acme/agent/effect/merge-c".into()),
         ],
-        "the per-effect ledger is exactly [apply, decline, apply] — each effect decided independently (§6.4)"
+        "the per-effect ledger is exactly [apply, decline, apply] - each effect decided independently (§6.4)"
     );
 
-    // THE THRESHOLD 2 — 0 double-apply: exactly TWO applies (effects 0 and 2), never four (the double-click
-    // was absorbed).
     assert_eq!(
         *apply_count.borrow(),
         2,
-        "exactly 2 applies (effects 0 and 2) — the double-click on approve-all did NOT double-apply (0 double-apply)"
+        "exactly 2 applies (effects 0 and 2) - the double-click on approve-all did NOT double-apply (0 double-apply)"
     );
 
-    // THE THRESHOLD 3 — 0 mutation on decline: the declined effect (1) emitted NOTHING. The outbox holds
-    // the card request (1) + exactly TWO effect-applied emits (effects 0 and 2) = 3 — never a third
-    // effect-applied row for the declined effect (AG-8).
     assert_eq!(
         sub.outbox.committed_count(),
         3,
-        "the outbox holds the card request + EXACTLY TWO effect-applied emits — the declined effect made \
+        "the outbox holds the card request + EXACTLY TWO effect-applied emits - the declined effect made \
          0 MUTATION (AG-8); no third effect-applied row"
     );
     assert!(
         !ledger.contains(&LedgerEntry::Apply(
             "myelin://acme/agent/effect/merge-b".into()
         )),
-        "the DECLINED effect 1 was NEVER applied — 0 mutation on decline across the restart (AG-8)"
+        "the DECLINED effect 1 was NEVER applied - 0 mutation on decline across the restart (AG-8)"
     );
 
-    // the per-effect approval signals were all consumed (the buffered approval depth dropped; the wake
-    // was consumed too). The run is terminal.
     assert_eq!(
         sub.runs.get(&tenant(), &run.0).unwrap().state,
         run_state::COMPLETED,
-        "the run completed (terminal) — it will never be driven again"
+        "the run completed (terminal) - it will never be driven again"
     );
 
     println!(
@@ -485,10 +381,6 @@ fn flow_d4_per_effect_partial_approval_across_restart_and_deploy_double_click() 
     );
 }
 
-/// **Unit: the partial-approval ledger has EXACTLY three entries (apply/decline/apply).** A focused
-/// assertion over [`apply_approved_effects`] (the §6.4 gated loop) — the engine half of the §8.b drill,
-/// independent of the dispatcher: three per-effect signals → three outcomes, exactly two applies, one
-/// withhold.
 #[test]
 fn partial_approval_ledger_has_exactly_three_entries() {
     let ex = FlowExecutor::new(minter(), tenant(), region());
@@ -518,7 +410,6 @@ fn partial_approval_ledger_has_exactly_three_entries() {
         Ok("evt".into())
     });
 
-    // exactly three outcomes — apply / decline (withheld) / apply.
     assert_eq!(outcomes.len(), 3);
     assert!(matches!(outcomes[0], Some(Ok(EffectOutcome::Applied(_)))));
     assert_eq!(
@@ -527,7 +418,6 @@ fn partial_approval_ledger_has_exactly_three_entries() {
         "effect 1 declined → WITHHELD (0 mutation, AG-8)"
     );
     assert!(matches!(outcomes[2], Some(Ok(EffectOutcome::Applied(_)))));
-    // the ledger has three entries; exactly two are applies.
     assert_eq!(
         *applies.borrow(),
         2,
@@ -535,9 +425,6 @@ fn partial_approval_ledger_has_exactly_three_entries() {
     );
 }
 
-/// **Unit: the double-click adds NO fourth apply.** Re-sending the same per-effect approve keys buffers no
-/// new signal (ON CONFLICT DO NOTHING); the loop over the buffered set applies each effect once — the
-/// double-click never produces a fourth apply.
 #[test]
 fn double_click_adds_no_fourth_apply() {
     let ex = FlowExecutor::new(minter(), tenant(), region());
@@ -551,17 +438,15 @@ fn double_click_adds_no_fourth_apply() {
         })
         .expect("start");
 
-    // partial approval: approve 0, decline 1, approve 2.
     approve(&ex, &run, 0);
     decline(&ex, &run, 1);
     approve(&ex, &run, 2);
-    // DOUBLE-CLICK on "approve all": re-send the same approve keys (0 and 2).
     approve(&ex, &run, 0);
     approve(&ex, &run, 2);
     assert_eq!(
         ex.signals().count_for_run(&tenant(), &run.0),
         3,
-        "the double-click buffered 0 new signals (ON CONFLICT DO NOTHING) — still three per-effect rows"
+        "the double-click buffered 0 new signals (ON CONFLICT DO NOTHING) - still three per-effect rows"
     );
 
     let applies = RefCell::new(0usize);
@@ -573,6 +458,6 @@ fn double_click_adds_no_fourth_apply() {
     assert_eq!(
         *applies.borrow(),
         2,
-        "exactly two applies — the double-click did NOT add a fourth apply (0 double-apply)"
+        "exactly two applies - the double-click did NOT add a fourth apply (0 double-apply)"
     );
 }

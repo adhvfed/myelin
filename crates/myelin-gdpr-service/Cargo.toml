@@ -8,76 +8,18 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
-# THE GDPR/Audit SERVICE crate (P-GA-19 → P-062): the tamper-evident audit log core — the
-# outbox-only audit CONSUMER + the per-tenant hash-chain + the Merkle leaves + the minimisation.
-#
-# DAG POSITION (a documented, NAMED extension of the §2.9 eleven-crate DAG, exactly like
-# `myelin-identity-service` and the leaf test-support crates). This is a SERVICE crate — it
-# is the GDPR/Audit subsystem's bootable home, the "every service `main.rs`" consumer the
-# contract-index row 1.1 names for GDPR/Audit. It sits ABOVE `myelin-events` as a leaf
-# consumer: it consumes the M0 outbox/EventEnvelope + the GDPR contract surface + the Identity
-# pseudonym grammar, and NOTHING in the production library DAG depends back on it. It is
-# therefore OUTSIDE the eleven-crate library DAG modelled by `crate_graph.rs`
-# (substrate_is_root() is preserved — a service is the graph's terminal consumer, not a node in
-# it). See the crate-level note in src/lib.rs.
 [dependencies]
-# The M0 bus substrate the audit consumer rides: the canonical EventEnvelope (2.1) the action
-# events arrive as, and the frozen EventHandler/HandleOutcome/SubjectPattern consumer template
-# (2.4) the audit consumer IS an instance of (written via the outbox only — the one sanctioned
-# emit path; the consumer is an infra subscription on it, contract 10.6 / 2.2 / EI-01 §5).
 myelin-events = { path = "../myelin-events" }
-# The GDPR contract surface (10.1): the `PersonalDataHolder` trait + the DSR core types
-# (`SubjectRef` / `EraseScope` / `Receipt` / the per-op reports) the GDPR-owned holders (H18/H16)
-# implement to their frozen shape (P-GA-05). gdpr-service is a LEAF service consumer ABOVE the
-# `myelin-gdpr` contract crate — it implements the trait the crate freezes; nothing in the
-# production library DAG depends back on the service.
 myelin-gdpr = { path = "../myelin-gdpr" }
-# The (tenant, region) partition key the per-tenant hash-chain is keyed on (the audit Merkle
-# tree is in-cell, tenant-partitioned — gdpr §7.1). ArtifactRef is the references-not-payloads
-# subject form (a `subject` is an ArtifactRef, never a payload).
 myelin-tenancy = { path = "../myelin-tenancy" }
-# The Principal/PrincipalId/PrincipalKind the action's actor is minimised FROM: the audit
-# `actor` is the pseudonymous `<pseudonym>@<tenant>.noreply` form (contract 4.8) derived from
-# the verified principal's opaque, PII-free `principal_id`, never a name/email payload.
 myelin-identity = { path = "../myelin-identity" }
-# BLAKE3 hash-on-append: the hash-chain link `H(prev || leaf)` and the Merkle leaf
-# `H(canonical(entry))` are BLAKE3 digests rendered `blake3:<hex>` (the same multihash
-# convention the BlobStore content-address uses — one hash family, no hand-rolled crypto).
 blake3 = { workspace = true }
 hex = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-# The auto-registration substrate the data-map generator (P-GA-09) walks: `HolderRegistration`
-# (the registry's record of every store the harness opened, contract 1.4) + the exhaustive
-# H1–H18 `Holder` catalog (gdpr §3.2). The generator joins these against the `#[personal_data]`
-# registry (from `myelin-gdpr`) so the map enumerates EVERY registered holder + EVERY tagged
-# field — a holder in the registry but absent from the map is a coverage failure (GA-D1's
-# "0 holders missed" is a property of the generated map). This crate already sits ABOVE
-# `myelin-substrate` in the §2.9-extension service tier (exactly like `myelin-identity-service`
-# and `myelin-control-plane`, which both depend on `myelin-substrate`); substrate depends only
-# on the `myelin-gdpr` CONTRACT crate (not the service), so there is no cycle.
 myelin-substrate = { path = "../myelin-substrate" }
 
 [dev-dependencies]
-# TEST-ONLY (P-GA-37 → P-511): the dogfood drill registers the every-incident repro into the harness
-# DrillRegistry (the T-3 `register_drill` hook) so it re-runs forever — the SAME posture every GDPR
-# drill + the storage dogfood drill (P-506) use. `myelin-harness` is the leaf test-support crate above
-# the substrate; this is a dev-dependency ONLY (nothing in the production DAG pulls it into the service
-# crate's runtime path). It supplies the DrillRegistry / DrillScenario / telemetry-assertion library
-# the dogfood integration drill drives the incident repro through. No cycle: the harness does not
-# depend on this leaf service crate.
 myelin-harness = { path = "../myelin-harness" }
-# TEST-ONLY (P-GA-28 → P-257): the GIT-D2 drill fires the P-GA-18 commit-identity architecture test
-# over Git's REAL commit codec (`myelin_git::commit::Commit` — pseudonymous-by-construction, GIT-P25).
-# This is a test-only edge: `myelin-git` depends on the `myelin-gdpr` CONTRACT crate (not this
-# service), so there is no production-DAG cycle (and nothing in the library DAG depends back on this
-# service — it is a leaf consumer). The dependency exists ONLY so the architecture test can scan the
-# author/committer lines lifted from `Commit::canonical_bytes` and assert they hold only the frozen
-# pseudonym form — the M3 enforcement P-GA-18 named (the verdict scaffold firing on the live codec).
 myelin-git = { path = "../myelin-git" }
-# TEST-ONLY (P-GA-31 → P-334): the GA-D7 worklog-leg drill reads the LIVE Issues schema tags
-# (`myelin_issues::schema::Issue` — the `worklog_seconds` / `story_points` restricted-by-default
-# fields) off the classify-derive registry, proving the OQ-H §2.4 restriction over the real tag, not
-# a fixture. `myelin-issues` depends on the `myelin-gdpr` CONTRACT crate (not this service), so there
-# is no production-DAG cycle (and nothing in the library DAG depends back on this leaf service).
 myelin-issues = { path = "../myelin-issues" }

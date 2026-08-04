@@ -1,12 +1,5 @@
-//! Durable effective-authorization projection substrate.
-//!
-//! Tuple writers invalidate a coarse `(tenant, region, projection)` watermark in the same
-//! transaction as every `rebac_tuple` change. Consumers may serve projected grants only when the
-//! applied revision equals the source revision; an absent, pending, or rebuilding row is fail-closed.
-
 use crate::migration::{Migration, Migrations};
 
-/// Durable source/applied watermark for a named effective-permission projection.
 pub const AUTHZ_PROJECTION_STATE_MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS authz_projection_state (
     tenant_id       text NOT NULL,
@@ -31,8 +24,6 @@ CREATE POLICY myelin_tenant_isolation ON authz_projection_state
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
               AND region = current_setting('myelin.region', true));"#;
 
-/// Shared invalidator used by both the tuple trigger and consumer-domain triggers. The first
-/// mutation creates a pending revision; every later mutation advances it monotonically.
 pub const AUTHZ_PROJECTION_INVALIDATOR_MIGRATION: &str = r#"
 CREATE OR REPLACE FUNCTION myelin_invalidate_issue_view_projection()
 RETURNS trigger
@@ -60,7 +51,6 @@ CREATE TRIGGER rebac_tuple_invalidate_issue_view
 AFTER INSERT OR UPDATE OR DELETE ON rebac_tuple
 FOR EACH ROW EXECUTE FUNCTION myelin_invalidate_issue_view_projection();"#;
 
-/// Aggregate ids follow the already-landed storage range `0061`–`0066`.
 pub fn authz_projection_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain(

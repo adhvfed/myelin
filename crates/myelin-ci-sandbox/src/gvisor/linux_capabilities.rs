@@ -1,9 +1,3 @@
-//! Linux capability ABI v3 primitives for the checkout host verifier.
-//!
-//! Keep this tiny implementation local instead of adding a capability crate to the sandbox's
-//! security-sensitive dependency surface. Capabilities are per-thread; the host verifier uses that
-//! property to make CAP_DAC_READ_SEARCH effective only around its two bounded, no-follow reads.
-
 use std::io;
 
 const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
@@ -33,8 +27,6 @@ pub(super) fn current_thread_capabilities() -> io::Result<[LinuxCapabilityData; 
         pid: 0,
     };
     let mut data = [LinuxCapabilityData::default(); 2];
-    // SAFETY: Linux capget ABI v3 consumes one valid header and exactly two data entries. pid=0
-    // names only the calling thread; both buffers live for the duration of the syscall.
     let result = unsafe {
         libc::syscall(
             libc::SYS_capget,
@@ -54,8 +46,6 @@ pub(super) fn set_current_thread_capabilities(data: &[LinuxCapabilityData; 2]) -
         version: LINUX_CAPABILITY_VERSION_3,
         pid: 0,
     };
-    // SAFETY: Linux capset ABI v3 consumes one valid header and exactly two data entries. pid=0
-    // changes only the calling thread; `data` remains live for the duration of the syscall.
     let result = unsafe {
         libc::syscall(
             libc::SYS_capset,
@@ -118,8 +108,6 @@ fn normalize_capability_sets(
 }
 
 pub(super) fn ambient_capability_is_set(capability: u32) -> io::Result<bool> {
-    // SAFETY: PR_CAP_AMBIENT/IS_SET is a read-only query for one numeric capability; unused prctl
-    // arguments are zero as required by the kernel API.
     let result = unsafe {
         libc::prctl(
             PR_CAP_AMBIENT,
@@ -136,22 +124,6 @@ pub(super) fn ambient_capability_is_set(capability: u32) -> io::Result<bool> {
     }
 }
 
-/// Normalize the host process's checkout-verification capability before any thread is created.
-///
-/// The service manager initially supplies `CAP_DAC_READ_SEARCH` in the ambient set because that is
-/// the only systemd mechanism that can place it in this unprivileged executable's permitted set
-/// without giving a shared binary a file capability. This function MUST run on the initial thread,
-/// before the Tokio runtime or any application thread is created. It immediately lowers the
-/// capability from the ambient set (so no later `exec`, including `runsc`, inherits it) and clears
-/// it from this thread's effective AND inheritable sets. When `retain_permitted` is true, it remains
-/// only as dormant permitted authority; threads created afterward inherit that permitted-only
-/// shape, and the host verifier temporarily enables it on its own runner thread solely around
-/// bounded `O_NOFOLLOW` reads. When false, it is removed from permitted too, so configurations that
-/// do not activate the checkout-workspace runner path retain no part of the capability at all.
-///
-/// `CAP_DAC_READ_SEARCH` bypasses DAC only for reads and directory traversal. This path never uses
-/// the broader `CAP_DAC_OVERRIDE`, never changes workspace ownership or modes, and never weakens
-/// the existing no-follow checks.
 pub fn prepare_checkout_host_verification_capability(retain_permitted: bool) -> Result<(), String> {
     let mut capabilities = current_thread_capabilities()
         .map_err(|error| format!("read initial thread capabilities: {error}"))?;
@@ -165,8 +137,6 @@ pub fn prepare_checkout_host_verification_capability(retain_permitted: bool) -> 
     if ambient_capability_is_set(CAP_DAC_READ_SEARCH_NUMBER)
         .map_err(|error| format!("query ambient CAP_DAC_READ_SEARCH: {error}"))?
     {
-        // SAFETY: PR_CAP_AMBIENT/LOWER only removes the named capability from the calling thread's
-        // ambient set. Unused prctl arguments are zero as required by the kernel API.
         let result = unsafe {
             libc::prctl(
                 PR_CAP_AMBIENT,

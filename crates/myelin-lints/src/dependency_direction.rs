@@ -1,5 +1,3 @@
-//! L2 dependency-direction enforcement for the frozen core crate layers.
-
 use std::collections::BTreeMap;
 use std::path::Path;
 

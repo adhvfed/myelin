@@ -1,25 +1,3 @@
-//! **GIT-P26 / P-288 — the leak-free `list_objects` `SetExpr` push-down for repo/PR lists, PROVEN
-//! against the live dev-stack Postgres (the GIT-D11 gate's REAL artifact).**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-git --features integration \
-//!     --test integration_git_p26_list_pushdown -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires (the prompt touches the §5.3
-//! `list_objects` DB read contract): the PR-list read — the lowered `SetExpr` (the `authz_visible`
-//! JOIN form) conjoined into the `pr` list scan over `pr.id` — runs as **ONE SQL query** against real
-//! Postgres and returns ONLY the rows the viewer may see (0 leak), with the tenant predicate
-//! isolating cross-tenant rows. The GIT-D11 drill is registered red-until-proven and flips green ONLY
-//! here, against the live stack — never mocked. Survival signals: **0 leak; 1 SQL query; revoke
-//! reflected.**
-//!
-//! The SQL the test runs is the lowered form Git's `list_filter` composes: it builds the
-//! `InRelation` → `authz_visible` JOIN clause via the REAL [`myelin_git::list_filter::lower_over_pr_id`]
-//! lowering (the SAME `LoweredFilter` the production read composes), then executes the one-query list
-//! against the seeded `pr` + `authz_visible` tables.
 #![cfg(feature = "integration")]
 
 use myelin_git::list_filter::{lower_over_pr_id, AUTHZ_VISIBLE_TABLE};
@@ -48,8 +26,6 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
     let pr_tbl = format!("pr_p288_{suffix}");
     let av_tbl = format!("authz_visible_p288_{suffix}");
 
-    // ── 1. A minimal `pr` table (the §5.3 columns the PR-list read touches) + an authz_visible reverse
-    //       index table (the JOIN target). Throwaway, suffixed for isolation. ─────────────────────────
     sqlx::query(&format!(
         "CREATE TABLE {pr_tbl} (\
            tenant_id text NOT NULL, region text NOT NULL, id text NOT NULL, \
@@ -67,8 +43,6 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
     .await
     .expect("create the authz_visible reverse index table");
 
-    // ── 2. Seed a tenant with several PRs the viewer can see, one SECRET PR (granted to someone else
-    //       — the leak witness), and a CROSS-TENANT PR in another tenant (must never be readable). ────
     for (tenant, id, title) in [
         ("acme", "pr:1", "visible one"),
         ("acme", "pr:2", "visible two"),
@@ -86,8 +60,6 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         .expect("seed a pr");
     }
 
-    // ── 3. Grant the viewer `view` of ONLY pr:1 + pr:2 in the reverse index (tenant acme). pr:secret is
-    //       granted to p:other (not the viewer); the cross-tenant pr:x is in evilcorp. ────────────────
     let viewer = Principal::stub(
         PrincipalId("p:viewer".into()),
         PrincipalKind::Human,
@@ -109,7 +81,6 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         .expect("grant view");
     }
 
-    // ── 4. Build the REAL lowered SetExpr (InRelation → the authz_visible JOIN over pr.id). ───────────
     let lowered = lower_over_pr_id(
         &SetExpr::InRelation {
             relation: RelName("view".into()),
@@ -122,19 +93,14 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         1,
         "the InRelation lowers to ONE JOIN (no N+1)"
     );
-    // Rebind the lowered JOIN clause onto the suffixed test tables + bind the viewer subject/relation
-    // (in production the table names are canonical + the driver binds the params; the SHAPE under test
-    // is the lowering's clause verbatim).
     let join_clause = lowered.joins[0]
         .clause
         .replace(AUTHZ_VISIBLE_TABLE, &av_tbl)
         .replace("pr.id", &format!("{pr_tbl}.id"))
         .replace(":subject_0", "'p:viewer'")
         .replace(":rel_for_view", "'view'");
-    let predicate = lowered.sql_predicate; // `av0.object_id IS NOT NULL`
+    let predicate = lowered.sql_predicate;
 
-    // ── 5. THE ONE PR-list query: the lowered JOIN + predicate conjoined into the pr scan, tenant-
-    //       scoped, ORDER BY id LIMIT :page (the §5.3 pre-filter, never post-filter). ─────────────────
     let list_sql = format!(
         "SELECT {pr_tbl}.id FROM {pr_tbl} {join_clause} \
          WHERE {pr_tbl}.tenant_id = 'acme' AND {pr_tbl}.region = 'fr-par' AND ({predicate}) \
@@ -145,7 +111,6 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         .await
         .unwrap_or_else(|e| panic!("the ONE PR-list query runs: {e}\nSQL: {list_sql}"));
 
-    // ── 6. PROVE leak-free: exactly the TWO authorized PRs; pr:secret + the cross-tenant PR ABSENT. ──
     let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
     assert_eq!(
         ids,
@@ -161,8 +126,6 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         "0 cross-tenant: the tenant predicate excluded evilcorp's PR"
     );
 
-    // ── 7. PROVE one query / no post-filter / no N+1: the read is ONE statement (a JOIN), EXPLAIN
-    //       confirms a single plan (no correlated per-row check subplan). ─────────────────────────────
     let plan = sqlx::query(&format!("EXPLAIN (FORMAT TEXT) {list_sql}"))
         .fetch_all(&admin)
         .await
@@ -178,8 +141,6 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         "the read is ONE join query (no per-row check loop): {plan_text}"
     );
 
-    // ── 8. REVOKE reflected: remove the viewer's grant on pr:1 from the reverse index; re-run the SAME
-    //       one query → pr:1 drops out (the zookie/read-your-writes guarantee, GIT-D11). ──────────────
     sqlx::query(&format!(
         "DELETE FROM {av_tbl} WHERE tenant_id = 'acme' AND subject = 'p:viewer' AND relation = 'view' AND object_id = 'pr:1'"
     ))
@@ -206,7 +167,6 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
          EXPLAIN shows one join plan, no per-row check); a revoke drops pr:1 from the SAME query."
     );
 
-    // ── 9. Cleanup (forward teardown). ──────────────────────────────────────────────────────────────
     sqlx::query(&format!("DROP TABLE {pr_tbl}"))
         .execute(&admin)
         .await

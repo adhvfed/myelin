@@ -1,20 +1,3 @@
-//! EB-12 (P-089) — the `(tenant, region)`-partitioned stream subject, PROVEN against the LIVE
-//! NATS JetStream dev stack.
-//!
-//! Gated behind the `integration` cargo feature so the default build stays broker-free. Run
-//! against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-events --features integration --test integration_eb12_partition -- --nocapture
-//!
-//! What this proves on REAL hardware (not the in-process fake):
-//!  1. The structured §2.2 subject `evt.<tenant>.<subsystem>.<aggregate_type>.<aggregate_id>.
-//!     <event_name>` derived from the envelope is the subject the broker actually stores — a
-//!     per-subject stream filter `<root>.evt.<tenant>.<subsystem>.>` captures it (the per-(tenant,
-//!     subsystem) routing split, §7.1).
-//!  2. Two DISTINCT tenants emitting the same subsystem/aggregate/event land under DISTINCT
-//!     structured subjects on the SAME root — the bulkhead property (the tenant is the blast-radius
-//!     unit): one tenant's per-(tenant, subsystem) filter never captures another tenant's message.
 #![cfg(feature = "integration")]
 
 use async_nats::jetstream;
@@ -54,8 +37,6 @@ fn envelope(tenant: &str, event_id: &str) -> EventEnvelope {
     }
 }
 
-/// The structured §2.2 subject reaches the real broker, and the per-(tenant, subsystem) filter
-/// isolates one tenant's events from another's on the same stream root (the bulkhead property).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
     let cfg = MyelinConfig::dev();
@@ -65,10 +46,9 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
     let js = jetstream::new(client);
 
     let suffix = std::process::id();
-    let root = format!("evt_eb12_{suffix}"); // a unique capture root per run
+    let root = format!("evt_eb12_{suffix}");
     let stream_name = format!("MYELIN_EB12_{suffix}");
 
-    // One cell-local stream captures the whole `<root>.>` subject space (the cell's stream).
     let stream = js
         .create_stream(jetstream::stream::Config {
             name: stream_name.clone(),
@@ -78,13 +58,11 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
         .await
         .expect("create JetStream stream");
 
-    // Build the structured §2.2 subjects for two tenants, same subsystem/aggregate/event.
     let env_acme = envelope("acme", &format!("acme-{suffix}"));
     let env_globex = envelope("globex", &format!("globex-{suffix}"));
     let subj_acme = StreamSubject::of(&env_acme).expect("acme subject");
     let subj_globex = StreamSubject::of(&env_globex).expect("globex subject");
 
-    // The §2.2 grammar, exactly — the partition key the streams are keyed under (contract 12.1).
     assert_eq!(
         subj_acme.to_subject(),
         "evt.acme.issue.issue.PROJ-1.created"
@@ -92,7 +70,6 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
     assert_eq!(PartitionKey::of(&env_acme).tenant, TenantId("acme".into()));
     assert_eq!(PartitionKey::of(&env_acme).region, Region("fr-par".into()));
 
-    // Publish each under the capture root (the transport's `<root>.<structured-subject>` shape).
     let wire_acme = format!("{root}.{}", subj_acme.to_subject());
     let wire_globex = format!("{root}.{}", subj_globex.to_subject());
     for (subject, id) in [
@@ -108,15 +85,13 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
             .expect("ack");
     }
 
-    // The cell stream stored both (one per tenant).
     let info = stream.get_info().await.expect("stream info");
     assert_eq!(
         info.state.messages, 2,
         "both tenants' events landed in the cell stream"
     );
 
-    // The bulkhead property: a per-(tenant, subsystem) filter consumer for ACME sees ONLY acme.
-    let acme_filter = format!("{root}.{}", subj_acme.stream_filter()); // ...evt.acme.issue.>
+    let acme_filter = format!("{root}.{}", subj_acme.stream_filter());
     let mut acme_consumer = stream
         .create_consumer(jetstream::consumer::pull::Config {
             durable_name: Some(format!("acme_{suffix}")),
@@ -129,10 +104,9 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
     assert_eq!(
         acme_info.num_pending, 1,
         "acme's per-(tenant, subsystem) filter must capture exactly acme's one event, never globex's \
-         (the bulkhead — the tenant is the blast-radius unit, §7.1)"
+         (the bulkhead - the tenant is the blast-radius unit, §7.1)"
     );
 
-    // Symmetrically, globex's filter never captures acme.
     let globex_filter = format!("{root}.{}", subj_globex.stream_filter());
     assert_ne!(
         acme_filter, globex_filter,
@@ -152,6 +126,5 @@ async fn structured_subject_partitions_per_tenant_on_the_live_broker() {
         "globex's filter captures exactly globex's one event"
     );
 
-    // Cleanup.
     js.delete_stream(&stream_name).await.expect("delete stream");
 }

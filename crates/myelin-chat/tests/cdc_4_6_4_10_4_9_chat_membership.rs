@@ -1,28 +1,3 @@
-//! # The CDC pair for contracts 4.6 / 4.10 / 4.9 — the **Chat** membership→`write_tuples`→zookie +
-//! the new-enemy guard + the channel.read fragment resolution (CHAT-P8 / P-402)
-//!
-//! **Contract-index rows:**
-//! - **4.6** `write_tuples([Δtuple], precondition?) → zookie` (atomic; emitted via the outbox) —
-//!   CONSUMED: the membership tuple write returns the zookie chat stamps.
-//! - **4.10** the zookie new-enemy stamp (read-your-writes; a strong, zookie-stamped read denies a
-//!   just-revoked grant) — CONSUMED: a `Remove` ADVANCES the revision/zookie, and a strong read at
-//!   the new watermark resolves against the post-revoke set.
-//! - **4.9** the Chat ReBAC fragment (`channel.read = member + parent_project->read`) — OWNED: the
-//!   runtime membership writes resolve against the declared fragment.
-//!
-//! The two sides are pinned here so a drift on either fails this test in the same CI job:
-//! - the **CONSUMER** is the Chat membership service ([`myelin_chat::membership::MembershipService`])
-//!   driving the membership→write_tuples→zookie→stamp→event flow over the
-//!   [`MembershipTupleWriter`] port — and the [`MembershipGate`] gating reads through `Id.check`.
-//! - the **PROVIDER** is Identity's REAL engine: `TupleStore::write_tuples` (the 4.6 write path that
-//!   advances the zookie + co-commits `identity.tuple.written`) + `StoreBackedCheck` (the 4.2 `check`
-//!   resolving the admitted Chat fragment's `channel.read = member + parent_project->read` rewrite).
-//!
-//! This proves the freeze CHAT-P8 ships is admissible AND resolves correctly against the LIVE engine
-//! today: a member reads (the `member` arm), a parent-project reader reads a public channel (the
-//! `+ parent_project->read` arm), a non-member is denied (fail-closed), and — the new-enemy guard —
-//! a `Remove` advances the zookie so a strong read at the new watermark denies the revoked member.
-
 use std::sync::{Arc, Mutex};
 
 use myelin_chat::conversation::{
@@ -64,9 +39,6 @@ fn subject(id: &str) -> Principal {
     p
 }
 
-/// The Chat fragment's frozen permission rewrites (§5) as the rich engine `FragmentDef` form (the
-/// shape the Chat M4 spine wires LIVE; here the CDC compiles it into the engine so `check` resolves).
-/// Identical to the `cdc_4_9` rich form — one fragment, no second spelling.
 fn chat_fragment_defs_rich() -> Vec<FragmentDef> {
     let rel = |n: &str| Userset::Relation(RelName(n.into()));
     let ttu = |tupleset: &str, computed: &str| Userset::TupleToUserset {
@@ -107,16 +79,10 @@ fn chat_fragment_defs_rich() -> Vec<FragmentDef> {
     ]
 }
 
-/// **The production-shaped `MembershipTupleWriter` binding: it adapts Identity's REAL
-/// `TupleStore::write_tuples` (the scope-carrying 4.6 write path) to the port.** This is the thin
-/// adapter the Chat service wires in production — the membership service calls the port, the port
-/// calls the live engine's write (advancing the zookie + co-committing `identity.tuple.written`). No
-/// second write language; the port carries the frozen `[TupleDelta]` + `Precondition` → `Zookie`.
 struct LiveTupleWriter {
     store: TupleStore,
     scope: TenantScope,
     actor: Principal,
-    /// A monotone clock for the `occurred_at` of each write (the floor's wall-clock stand-in).
     seq: Mutex<u64>,
 }
 
@@ -155,13 +121,9 @@ impl MembershipTupleWriter for LiveTupleWriter {
     }
 }
 
-/// Build the provider: the REAL `StoreBackedCheck` over a `TupleStore` with the core org/team/project
-/// hierarchy + the admitted Chat fragment, sharing the SAME `TupleStore` the membership writer writes
-/// to (so the gate's `check` reads the membership writer's tuples). Returns `(check_engine, writer)`.
 fn provider() -> (StoreBackedCheck, LiveTupleWriter) {
     let store = TupleStore::new(OutboxStore::new());
     let svc = StoreBackedCheck::new(store.clone());
-    // Admit the Chat fragment so `check` resolves `channel.read = member + parent_project->read`.
     for def in chat_fragment_defs_rich() {
         assert!(
             matches!(svc.admit_fragment_def(&def), FragmentAdmit::Admitted { .. }),
@@ -214,10 +176,6 @@ fn channel(store: &MemConversationStore, id: &str) -> ConversationId {
     cid
 }
 
-/// **CONSUMER → PROVIDER (4.6 / 4.9): a membership add writes the `member` tuple through the REAL
-/// `write_tuples`, returns a zookie chat stamps, and the channel.read fragment resolves the member
-/// arm.** Proves the runtime membership write resolves `channel.read = member + parent_project->read`
-/// against the LIVE engine — a member reads, a non-member is denied (fail-closed, no leak).
 #[test]
 fn cdc_4_6_4_9_membership_write_resolves_channel_read_member_arm() {
     let (svc, writer) = provider();
@@ -227,7 +185,6 @@ fn cdc_4_6_4_9_membership_write_resolves_channel_read_member_arm() {
     let ob = OutboxStore::new();
     let minter = Arc::new(myelin_events::MonotonicMinter::new());
 
-    // add alice → the REAL write_tuples advances the zookie; chat stamps it on the conversation.
     let mut t = tx(&ob, &minter);
     let zookie = membership
         .add_member(
@@ -237,7 +194,6 @@ fn cdc_4_6_4_9_membership_write_resolves_channel_read_member_arm() {
         )
         .expect("add_member co-commits over the live write_tuples");
     t.commit().unwrap();
-    // the conversation carries the LIVE zookie (non-empty — a real revision watermark).
     let stamped = conv_store.get(&cid).unwrap().acl_zookie.clone();
     assert_eq!(stamped.as_deref(), Some(zookie.0.as_str()));
     assert!(
@@ -245,7 +201,6 @@ fn cdc_4_6_4_9_membership_write_resolves_channel_read_member_arm() {
         "the live engine returns a real zookie"
     );
 
-    // the gate resolves channel.read through the admitted fragment over the membership tuple.
     let gate = MembershipGate::new(svc.clone());
     assert!(
         gate.check_channel(
@@ -269,14 +224,10 @@ fn cdc_4_6_4_9_membership_write_resolves_channel_read_member_arm() {
     );
 }
 
-/// **PROVIDER (4.9): the `+ parent_project->read` arm resolves over the live engine.** A reader of
-/// the channel's parent project reads a PUBLIC channel WITHOUT a membership tuple — the frozen
-/// inheritance arm. We seed the parent-project tuples directly through the live write path.
 #[test]
 fn cdc_4_9_channel_read_parent_project_arm_resolves_live() {
     let (svc, writer) = provider();
     let conv_store = MemConversationStore::new();
-    // a public channel parented to project:proj-web; bob reads the project.
     let cid = {
         let cid = conv_id("general");
         conv_store
@@ -297,9 +248,6 @@ fn cdc_4_9_channel_read_parent_project_arm_resolves_live() {
             .unwrap();
         cid
     };
-    // seed the parent-project inheritance tuples directly through the live write path (the membership
-    // add path writes the `member` arm; here we exercise the inheritance arm). The returned zookie is
-    // the real revision watermark a strong read reads at-or-after.
     let z_seed = writer
         .write_membership_tuples(
             &[
@@ -323,22 +271,16 @@ fn cdc_4_9_channel_read_parent_project_arm_resolves_live() {
     let z = conv_store.get(&cid).unwrap().acl_zookie;
 
     let gate = MembershipGate::new(svc.clone());
-    // bob (a project reader, NO membership) reads the public channel (the + parent_project->read arm).
     assert!(
         gate.check_channel(&subject("p:bob"), permissions::READ, &cid, z.as_deref())
             .is_ok(),
         "a project reader inherits read on a public channel (the + parent_project->read arm)"
     );
-    // carol (neither) cannot.
     assert!(gate
         .check_channel(&subject("p:carol"), permissions::READ, &cid, z.as_deref())
         .is_err());
 }
 
-/// **CONSUMER → PROVIDER (4.10): THE NEW-ENEMY GUARD over the live engine.** add → revoke → read:
-/// the `Remove` advances the live zookie; a strong read at the new watermark resolves against the
-/// post-revoke set → the revoked member is DENIED. The two zookies are distinct (a real revision
-/// advance), proving the watermark moved — 0 stale grants readable post-revoke.
 #[test]
 fn cdc_4_10_new_enemy_guard_revoke_advances_zookie_live() {
     let (svc, writer) = provider();
@@ -349,7 +291,6 @@ fn cdc_4_10_new_enemy_guard_revoke_advances_zookie_live() {
     let ob = OutboxStore::new();
     let minter = Arc::new(myelin_events::MonotonicMinter::new());
 
-    // ── add alice → she reads ──
     let mut t1 = tx(&ob, &minter);
     let z_add = membership
         .add_member(
@@ -369,7 +310,6 @@ fn cdc_4_10_new_enemy_guard_revoke_advances_zookie_live() {
         )
         .is_ok());
 
-    // ── revoke alice → the live zookie ADVANCES + restamps ──
     let mut t2 = tx(&ob, &minter);
     let z_revoke = membership
         .remove_member(
@@ -385,16 +325,13 @@ fn cdc_4_10_new_enemy_guard_revoke_advances_zookie_live() {
     let stamped_revoke = conv_store.get(&cid).unwrap().acl_zookie.clone();
     assert_ne!(
         z_add.0, z_revoke.0,
-        "the revoke advanced the zookie (a real revision move — the new-enemy watermark)"
+        "the revoke advanced the zookie (a real revision move - the new-enemy watermark)"
     );
     assert_eq!(stamped_revoke.as_deref(), Some(z_revoke.0.as_str()));
 
-    // ── the new-enemy read: alice reads at the post-revoke watermark → DENIED (0 stale grants) ──
     let conv = conv_store.get(&cid).unwrap();
     let strong = MembershipService::<LiveTupleWriter>::read_consistency(&conv);
     assert_eq!(strong.mode, ConsistencyMode::Strong);
-    // resolve through the live engine at the post-revoke watermark. The check object is the Id-side
-    // `channel:<id>` ObjectId form the membership tuples key on (the same spelling the gate uses).
     let object = myelin_tenancy::ArtifactRef(myelin_chat::membership::channel_object("secret"));
     let decision = svc.check(
         &subject("p:alice"),
@@ -408,9 +345,8 @@ fn cdc_4_10_new_enemy_guard_revoke_advances_zookie_live() {
     );
     assert!(
         !matches!(decision, Ok(Decision::Allow)),
-        "the revoked member reads against the post-revoke set (the new-enemy guard) — 0 stale grants"
+        "the revoked member reads against the post-revoke set (the new-enemy guard) - 0 stale grants"
     );
-    // and through the gate.
     assert!(gate
         .check_channel(
             &subject("p:alice"),

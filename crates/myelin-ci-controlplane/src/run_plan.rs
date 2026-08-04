@@ -1,10 +1,3 @@
-//! Strict loader for a queued CI run's immutable, tenant-scoped execution-plan snapshot.
-//!
-//! This is intentionally a preparation boundary, not an execution boundary. The wire contains only
-//! resolved DAG facts. Runtime authority (tokens, secrets, trust, mounts, egress, and resource
-//! grants) must be supplied later by policy-aware components and cannot be smuggled through the CAS
-//! document.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use myelin_ci_sandbox::gvisor::{CARGO_SOURCE_REPLACE_CONFIG, CARGO_VENDOR_DIRECTORY_CONFIG};
@@ -15,74 +8,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::ci_run_store::CiRunRecord;
 
-/// The legacy DAG-only schema version the current PostgreSQL starter can execute.
 pub const RUN_PLAN_SCHEMA_V1: u32 = 1;
-/// The resolved request schema that preserves authored stages and names the requested execution
-/// profile without granting any runtime authority.
 pub const RUN_PLAN_SCHEMA_V2: u32 = 2;
-/// Version of the execution-profile request nested in a version-2 run plan.
 pub const EXECUTION_REQUEST_SCHEMA_V1: u32 = 1;
-/// Frozen domain for the version-1 launch-request digest.
 pub const LAUNCH_REQUEST_DIGEST_V1_DOMAIN: &str = "myelin.ci.launch-request.v1";
-/// Maximum plaintext or stored snapshot size accepted by the execution boundary.
 pub const MAX_RUN_PLAN_BYTES: usize = 16 * 1024 * 1024;
-/// Maximum number of resolved jobs in one plan.
 pub const MAX_RUN_PLAN_JOBS: usize = 1_024;
-/// Maximum UTF-8 byte length of a resolved job name.
 pub const MAX_JOB_NAME_BYTES: usize = 128;
-/// Maximum UTF-8 byte length of an image reference.
 pub const MAX_IMAGE_BYTES: usize = 2_048;
-/// Maximum argv entries in one command, including argv[0].
 pub const MAX_COMMAND_ARGS: usize = 64;
-/// Maximum aggregate UTF-8 bytes across one command vector.
 pub const MAX_COMMAND_BYTES: usize = 32 * 1024;
-/// Maximum argv entries in a structured build request (the tool itself is platform-supplied).
 pub const MAX_STRUCTURED_BUILD_ARGS: usize = 16;
-/// Maximum UTF-8 byte length of one structured build argument.
 pub const MAX_STRUCTURED_BUILD_ARG_BYTES: usize = 256;
-/// Server-controlled Cargo home used by structured Cargo build jobs. It is writable because it
-/// lives under the sandbox's size-bounded `/tmp`; the server-owned `config.toml` inside it is a
-/// separate read-only bind mount installed by the gVisor launch boundary.
 pub const PLATFORM_CARGO_HOME: &str = myelin_ci_sandbox::gvisor::STRUCTURED_CARGO_HOME;
-/// Maximum matrix axes attached to a resolved job.
 pub const MAX_MATRIX_AXES: usize = 16;
-/// Maximum UTF-8 byte length of a matrix axis name.
 pub const MAX_MATRIX_KEY_BYTES: usize = 64;
-/// Maximum UTF-8 byte length of a matrix axis value.
 pub const MAX_MATRIX_VALUE_BYTES: usize = 128;
 
-/// Version-1 resolved run-plan wire. Field order is part of the canonical JSON representation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedRunPlanV1 {
-    /// Must equal [`RUN_PLAN_SCHEMA_V1`].
     pub schema_version: u32,
-    /// Resolved jobs, sorted strictly by `name`.
     pub jobs: Vec<ResolvedJobV1>,
 }
 
-/// One resolved job in the version-1 wire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedJobV1 {
-    /// Unique bounded machine-token DAG node name.
     pub name: String,
-    /// Digest-pinned image reference.
     pub image: String,
-    /// Exact argv. No shell or fallback executable is inferred.
     pub command: Vec<String>,
-    /// Existing DAG node names this job depends on, sorted strictly.
     pub needs: Vec<String>,
-    /// Dynamic generators are represented on the wire but refused until ingestion is implemented.
     pub is_generator: bool,
-    /// Deterministically ordered resolved matrix axes.
     pub matrix_key: BTreeMap<String, String>,
 }
 
-/// The execution profiles that a version-2 authored request can name.
-///
-/// This is a request, not a server grant: it carries no trust, token, secret, egress, workspace,
-/// resource, scheduling, metering, or check authority.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CiExecutionProfileV1 {
     #[serde(rename = "linux-small-v1")]
@@ -92,10 +52,6 @@ pub enum CiExecutionProfileV1 {
 }
 
 impl CiExecutionProfileV1 {
-    /// Parse a profile from its canonical `linux-<class>-v1` label (identical to the serde rename and
-    /// to the runner label the launch authority stamps); `None` for any unrecognized label. The
-    /// runner composition uses this to turn `MYELIN_CI_RUNNER_EXECUTION_PROFILES` into the profile set
-    /// it advertises labels for.
     pub fn from_label(label: &str) -> Option<Self> {
         match label {
             "linux-small-v1" => Some(Self::LinuxSmallV1),
@@ -105,76 +61,43 @@ impl CiExecutionProfileV1 {
     }
 }
 
-/// Versioned authored execution request nested in a version-2 resolved plan.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CiExecutionRequestV1 {
-    /// Must equal [`EXECUTION_REQUEST_SCHEMA_V1`].
     pub schema_version: u32,
-    /// Requested profile. Policy-aware control-plane code must still grant or refuse it later.
     pub profile: CiExecutionProfileV1,
 }
 
-/// Version-2 resolved run-plan wire. Field order is part of its canonical JSON representation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedRunPlanV2 {
-    /// Must equal [`RUN_PLAN_SCHEMA_V2`].
     pub schema_version: u32,
-    /// Authored profile request, never server launch authority.
     pub execution: CiExecutionRequestV1,
-    /// Resolved jobs, sorted strictly by concrete [`ResolvedJobV2::name`].
     pub jobs: Vec<ResolvedJobV2>,
 }
 
-/// One resolved version-2 DAG node.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResolvedJobV2 {
-    /// Authored DAG-stage name and check context. Matrix instances intentionally share it.
     pub stage: String,
-    /// Unique concrete matrix-expanded DAG-node name.
     pub name: String,
-    /// Digest-pinned image request.
     pub image: String,
-    /// Exact argv request. No shell or fallback executable is inferred.
     pub command: Vec<String>,
-    /// Optional platform-invoked build recipe. Legacy V2 producers omit this field, preserving their
-    /// canonical bytes exactly. Exactly one of a non-empty `command` or `build` is accepted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<StructuredBuildV1>,
-    /// The server-selected, digest-pinned Cargo vendor asset reference for this structured build,
-    /// chosen at resolve time by matching the repository's root `Cargo.lock` SHA-256 against the
-    /// registered (server-trusted) vendors. Present only on structured Cargo build jobs; legacy V2
-    /// producers and every non-build job omit it, preserving their canonical bytes exactly. The
-    /// control-plane lowering refuses a structured build that reaches launch without this selection,
-    /// and the sandbox independently re-validates the reference against its closed asset registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_cargo_vendor: Option<String>,
-    /// Concrete DAG-node dependencies, sorted strictly.
     pub needs: Vec<String>,
-    /// Reserved generator marker. Version 2 refuses `true` until fragment ingestion exists.
     pub is_generator: bool,
-    /// Deterministically ordered resolved matrix axes.
     pub matrix_key: BTreeMap<String, String>,
 }
 
-/// Bounded tool identifiers supported by the platform-owned structured build vehicle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StructuredBuildToolV1 {
     Cargo,
 }
 
-/// A tenant-authored build recipe whose executable, environment, and accepted argument grammar are
-/// owned by the platform. The Cargo grammar is a strict closed allowlist
-/// ([`CARGO_RECIPE_ALLOWLIST`]) of `--locked`, offline-safe recipes — `build`, unit `test --lib`
-/// (optionally `--workspace`), and `clippy --all-targets -- -D warnings` — so tenant options such as
-/// `--config` cannot reopen the Cargo boundary. [`Self::platform_argv`] inserts the server-owned
-/// source overrides (before any `--` driver separator);
-/// `[patch]`, `[replace]`, `paths`, and path/git dependencies can resolve only to code already in
-/// the tenant's own workspace while offline, so their acceptability is an attestation-policy
-/// concern rather than a dependency-fetch escape.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StructuredBuildV1 {
@@ -183,19 +106,10 @@ pub struct StructuredBuildV1 {
 }
 
 impl StructuredBuildV1 {
-    /// Validate this recipe against the platform's bounded, non-shell argument grammar.
     pub fn validate_for_job(&self, job_name: &str) -> Result<(), RunPlanError> {
         validate_structured_build(job_name, self)
     }
 
-    /// Construct the exact direct argv executed by the sandbox. No shell executable or `-c` program
-    /// is accepted from the tenant or inserted by this translation.
-    ///
-    /// The platform's two vendor `--config` pairs are inserted immediately BEFORE the first `--`
-    /// separator in the recipe, if any. A `--` in a Cargo recipe (e.g. `clippy ... -- -D warnings`)
-    /// forwards every following token to the compiler/driver, so appending `--config` after it would
-    /// hand the platform source overrides to `rustc` instead of Cargo. Recipes without a `--`
-    /// (`build`/`test`) keep the historical trailing-append output byte-for-byte.
     pub fn platform_argv(&self) -> Vec<String> {
         match self.tool {
             StructuredBuildToolV1::Cargo => {
@@ -224,16 +138,12 @@ impl StructuredBuildV1 {
     }
 }
 
-/// Public carrier for either canonical resolved-plan wire version.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VersionedResolvedRunPlan {
     V1(ResolvedRunPlanV1),
     V2(ResolvedRunPlanV2),
 }
 
-/// Derive the exact concrete DAG-node name from an authored stage and its sorted matrix identity.
-/// Empty matrix identities retain the stage byte-for-byte; matrix identities are length-framed and
-/// BLAKE3-bound so distinct assignments cannot alias.
 pub fn derive_concrete_job_name(stage: &str, matrix_key: &BTreeMap<String, String>) -> String {
     if matrix_key.is_empty() {
         return stage.to_string();
@@ -259,10 +169,6 @@ pub fn derive_concrete_job_name(stage: &str, matrix_key: &BTreeMap<String, Strin
 }
 
 impl ResolvedJobV1 {
-    /// Collision-safe, deterministic identity bytes for the matrix assignment.
-    ///
-    /// Each string is length-prefixed, so assignments such as `a=bc` and `ab=c` cannot collide.
-    /// The map's `BTreeMap` order makes the encoding stable across processes.
     pub fn matrix_identity(&self) -> Vec<u8> {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(&(self.matrix_key.len() as u64).to_be_bytes());
@@ -277,7 +183,6 @@ impl ResolvedJobV1 {
 }
 
 impl ResolvedJobV2 {
-    /// Collision-safe deterministic identity bytes for this resolved matrix assignment.
     pub fn matrix_identity(&self) -> Vec<u8> {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(&(self.matrix_key.len() as u64).to_be_bytes());
@@ -292,7 +197,6 @@ impl ResolvedJobV2 {
 }
 
 impl ResolvedRunPlanV1 {
-    /// Validate semantics and return the deterministic compact JSON representation.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, RunPlanError> {
         validate_plan(self)?;
         let bytes = serde_json::to_vec(self).map_err(|error| RunPlanError::WireMalformed {
@@ -309,16 +213,11 @@ impl ResolvedRunPlanV1 {
 }
 
 impl ResolvedRunPlanV2 {
-    /// Validate semantics and return the deterministic compact JSON representation.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, RunPlanError> {
         validate_plan_v2(self)?;
         canonical_json(self)
     }
 
-    /// Digest the complete ordered launch request without converting it into runtime authority.
-    ///
-    /// The BLAKE3 derive-key input is one `u64`-big-endian length-prefixed frame for the canonical
-    /// execution request followed by one frame for each canonical job in deterministic plan order.
     pub fn launch_request_digest_v1(&self) -> Result<String, RunPlanError> {
         validate_plan_v2(self)?;
         let mut hasher = blake3::Hasher::new_derive_key(LAUNCH_REQUEST_DIGEST_V1_DOMAIN);
@@ -384,8 +283,6 @@ fn update_digest_frame(hasher: &mut blake3::Hasher, frame: &[u8]) {
     hasher.update(frame);
 }
 
-/// A fully parsed and validated plan, still carrying its authoritative tenant and content address.
-/// Its fields are private so callers cannot accidentally replace validation with struct literals.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedRunPlan {
     tenant: TenantId,
@@ -393,8 +290,6 @@ pub struct PreparedRunPlan {
     plan: ResolvedRunPlanV1,
 }
 
-/// Validated version-2 launch request. This is still customer input, not authority: callers must
-/// combine it with a policy-produced launch grant before any job can be materialized.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedRunPlanV2 {
     tenant: TenantId,
@@ -417,57 +312,39 @@ impl PreparedRunPlanV2 {
 }
 
 impl PreparedRunPlan {
-    /// Authoritative tenant derived from [`CiRunRecord`], never from caller input.
     pub fn tenant(&self) -> &TenantId {
         &self.tenant
     }
 
-    /// Verified content address loaded from the tenant-scoped CAS keyspace.
     pub fn content_hash(&self) -> &ContentHash {
         &self.content_hash
     }
 
-    /// The validated DAG. This is not a sequential [`crate::ci_pipeline::PipelineRun`].
     pub fn plan(&self) -> &ResolvedRunPlanV1 {
         &self.plan
     }
 }
 
-/// Version failures that require the trigger to be re-dispatched through a current resolver.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RedispatchReason {
-    /// The historical document has no explicit schema version.
     LegacyUnversioned,
-    /// The document uses a schema this binary cannot safely interpret.
     UnsupportedVersion(u64),
 }
 
-/// Fail-closed preparation errors.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunPlanError {
-    /// The run record lacks a usable authoritative tenant or exact provenance-bearing CAS ref.
     ProvenanceRefused { detail: String },
-    /// The URI tenant does not equal the authoritative run-record tenant.
     TenantMismatch { record: String, reference: String },
-    /// A legacy or unsupported snapshot must be rebuilt by current dispatch.
     RedispatchRequired(RedispatchReason),
-    /// The current V1-only starter encountered a valid V2 request but launch authority is absent.
     LaunchAuthorityRequired { version: u32 },
-    /// The CAS metadata/read operation failed.
     Blob(BlobError),
-    /// The advertised or returned object is above the hard size ceiling.
     SnapshotTooLarge { actual: usize, maximum: usize },
-    /// The CAS metadata did not describe the requested address.
     MetadataAddressMismatch,
-    /// Version-1 JSON was malformed, non-canonical, or carried an unknown field.
     WireMalformed { detail: String },
-    /// A semantic plan invariant failed.
     InvalidPlan { detail: String },
 }
 
 impl RunPlanError {
-    /// Whether retrying the same snapshot can never make it executable and a fresh dispatch is
-    /// required.
     pub fn requires_redispatch(&self) -> bool {
         matches!(self, RunPlanError::RedispatchRequired(_))
     }
@@ -521,10 +398,6 @@ impl From<BlobError> for RunPlanError {
     }
 }
 
-/// Load and prepare the exact snapshot referenced by a durable [`CiRunRecord`].
-///
-/// URI and tenant provenance checks complete before `head`; `head` completes and its size is checked
-/// before `get`. The storage implementation then provides re-hash-on-read integrity verification.
 pub fn load_resolved_run_plan<B: BlobStore + ?Sized>(
     blobs: &B,
     run: &CiRunRecord,
@@ -546,9 +419,6 @@ pub fn load_resolved_run_plan<B: BlobStore + ?Sized>(
     })
 }
 
-/// Load the exact canonical V2 request for the launch-authority boundary. V1 remains a compatibility
-/// wire but cannot enter the manifest-backed production path because it lacks authored stage and
-/// execution-profile semantics.
 pub fn load_launch_run_plan_v2<B: BlobStore + ?Sized>(
     blobs: &B,
     run: &CiRunRecord,
@@ -680,7 +550,6 @@ fn valid_tenant_token(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
 }
 
-/// Decode either supported canonical plan wire without granting it execution authority.
 pub fn decode_resolved_run_plan(bytes: &[u8]) -> Result<VersionedResolvedRunPlan, RunPlanError> {
     if bytes.len() > MAX_RUN_PLAN_BYTES {
         return Err(RunPlanError::SnapshotTooLarge {
@@ -987,21 +856,6 @@ fn validate_structured_build(
     }
 }
 
-/// The exact, closed set of tenant-supplied Cargo recipes the platform will lower and run. Every
-/// entry is `--locked` (no network resolution), offline-safe under `--network=none`, and cannot
-/// reopen the Cargo source boundary: the tenant supplies only this leading recipe and
-/// [`StructuredBuildV1::platform_argv`] owns the vendor `--config` suffix. Widen ONLY by adding a
-/// fixed vector here; never by admitting free-form tokens, `--config`, `--target-dir`, path/patch
-/// options, or any tenant-chosen flag.
-///
-/// - `build --locked` — the original compile recipe (argv unchanged).
-/// - `test --locked --lib` — unit tests only. `--lib` is REQUIRED: integration/`--test` targets
-///   routinely need live network backends, which the `--network=none` sandbox blocks, so they are
-///   deliberately not admitted.
-/// - `test --locked --lib --workspace` — the same, fanned across every workspace member's lib tests.
-/// - `clippy --locked --all-targets -- -D warnings` — lint every target and fail on any warning. The
-///   `-- -D warnings` tail is a compiler-driver flag; `platform_argv` inserts the vendor `--config`
-///   pairs before the `--` so they reach Cargo, not `rustc`.
 const CARGO_RECIPE_ALLOWLIST: &[&[&str]] = &[
     &["build", "--locked"],
     &["test", "--locked", "--lib"],

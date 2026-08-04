@@ -5,21 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The `myelin-mcp` MCP server (E0.9 / MR-021): the JSON-RPC-2.0-over-stdio surface a LOCAL Claude
-# (Claude Code on the operator's machine) drives Myelin through as native MCP tools — under the SAME
-# governance a human is. It is the near-term answer to "agents, but not hosted yet": agent
-# GOVERNANCE (who/what did what, with what authority) is real from day one, even though agent
-# HOSTING (the real LlmAgentRuntime) stays deferred. Every call acts under a minted per-run token:
-# reads route to a permission-checked subsystem API; mutations route through EffectApi. Never a bare
-# human PAT or a direct mutation.
-#
-# A LEAF BINARY (like myelin-cli / myelin-edge): it depends on the subsystem tool catalogue
-# (myelin-git `api::agent_tools`), the agent-fabric governance contract (myelin-agent `EffectApi` /
-# `RunCtx` / `ProposedEffect`), and the per-run token minter (myelin-identity-service
-# `RunTokenMinter::mint_run_token`). NOTHING in the production crate DAG depends back on it; it is NOT
-# a node in the eleven-crate library DAG modelled by myelin-substrate::crate_graph
-# (substrate_is_root()/identity_is_sink() unaffected — an MCP server is a terminal consumer).
-
 [lib]
 path = "src/lib.rs"
 
@@ -28,76 +13,32 @@ name = "myelin-mcp"
 path = "src/main.rs"
 
 [dependencies]
-# REUSE git's frozen agent-tool catalogue (`api::agent_tools` / `AgentToolDef` — the MCP tool shape:
-# name + frozen `requires_approval` + the already-built handler). A NEW git tool added to
-# `agent_tools()` flows to the MCP server with NO re-declaration here (the tool-registration
-# convention). The MCP surface is a thin projection of this catalogue.
 myelin-git = { path = "../myelin-git" }
 
-# REUSE the agent-fabric governance contract surface (the BRAIN-AGNOSTIC mutation chokepoint):
-# `EffectApi` (PLAN-THEN-APPLY, §8.2) + `RunCtx` / `ProposedEffect` / `EffectResult`. MCP mutations
-# route through `EffectApi::apply` under a per-run `RunCtx`; read ToolDefs route directly to a
-# permission-checked subsystem adapter under the same run token. The concrete bodies are injected
-# by the composition root.
 myelin-agent = { path = "../myelin-agent" }
 
-# REUSE the per-run attenuated token minter (`RunTokenMinter::mint_run_token`, MR-011-real): a
-# `tools/call` mints a per-run capability token and acts under it (consulting durable revocation
-# before apply). The MCP server never re-implements token minting.
 myelin-identity-service = { path = "../myelin-identity-service" }
 
-# The frozen identity value types the mint + the RunCtx attribution key on: PrincipalId / Principal /
-# RunId / RunToken / FailStaticBound / DelegationCaveats.
 myelin-identity = { path = "../myelin-identity" }
-# TenantId / Region — the verified `(tenant, region)` scope the run token is minted under.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# TenantScope (the verified scope the mint registers the per-run TTL in).
 myelin-storage = { path = "../myelin-storage" }
-# Timestamp — the RFC-3339 mint instant + revocation-consult `now`.
 myelin-events = { path = "../myelin-events" }
-# The shared production Git mutation adapter and durable filesystem backend. MCP is a leaf binary;
-# myelin-edge does not depend on myelin-mcp, so this promotion is acyclic.
 myelin-edge = { path = "../myelin-edge" }
-# CI owns the shared ToolDefs projected into MCP and the durable run-store authority consumed by
-# the permission-checked Edge read adapter. Only `ci.read_run` / `ci.read_log` opt into MCP.
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
-# Fresh MCP deployments apply CI's Flow prerequisite before the CI schema, matching Edge's
-# production composition rather than assuming another deployable migrated first.
 myelin-flow = { path = "../myelin-flow" }
 myelin-config = { workspace = true }
 myelin-substrate = { path = "../myelin-substrate" }
 
-# The JSON-RPC 2.0 envelopes + the MCP message bodies are serde_json::Value (the ONE workspace-pinned
-# JSON shape — the same convention myelin-edge / myelin-cli use). MCP is JSON-RPC 2.0 over stdio;
-# there is NO MCP/rmcp SDK in Cargo.lock, so the protocol is HAND-BUILT on serde_json (minimal-deps
-# ethos — do not pull an unvetted MCP SDK).
 serde_json = { workspace = true }
 
-# Format the process wall clock as the RFC-3339 `Timestamp` consumed by the run-token mint and
-# revocation checks. Parsing/formatting only: no chrono clock feature is needed.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
 zeroize = "1"
 libc = "0.2"
 
 [dev-dependencies]
-# GT-005 integration: bind the concrete git `EffectApi` body (`myelin_edge::GitEffectApi`) to the
-# DURABLE GT-003 backend (`DurableGitBackend`) and inject it into the GovernedRouter — proving a
-# governed `tools/call` (mint_run_token → EffectApi::apply) lands the real durable git effect and
-# reflects the server-side merge gate. A dev-dependency only (the protocol shell never depends on the
-# edge in production; the composition root injects the body).
-# MR-009b W3b.6: + `test-support` — the tests build the edge in-memory git backend double
-# (`DurableGitBackend::rooted_inmem_for_test`), now gated with the events in-memory OutboxStore.
 myelin-edge = { path = "../myelin-edge", features = ["test-support"] }
-# MR-009b Wave 2: the MCP tests build the identity in-memory doubles (StoreBackedCheck `::new`), which
-# moved behind `#[cfg(any(test, feature = "test-support"))]`. Enable `test-support` for the TEST build
-# only — MCP's production shell depends on identity-service without it (durable-by-default preserved;
-# resolver v2 does not leak a dev-dependency feature into the normal build).
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-# R2.4: the MCP tests build the in-memory HITL verdict store double (`HitlVerdictStore::new`),
-# gated `#[cfg(any(test, feature = "test-support"))]` in myelin-storage. TEST build only — the
-# production shell uses the always-compiled durable arm (`HitlVerdictStore::with_pg` over the
-# `agent_hitl_gate` table, migration 0054), injected by the composition root.
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 sqlx = { workspace = true }
 blake3 = { workspace = true }

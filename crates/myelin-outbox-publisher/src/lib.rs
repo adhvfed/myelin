@@ -1,9 +1,3 @@
-//! Dedicated elected publisher for the shared PostgreSQL outbox.
-//!
-//! This is a terminal service leaf. Its database provider exposes only an elected relay, its NATS
-//! runtime adapter publishes only to an already-provisioned stream, and its health surface is a
-//! typed in-process snapshot. A real HTTP listener is intentionally a separate follow-up.
-
 use std::future::Future;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,8 +36,6 @@ impl core::fmt::Debug for PublisherDatabaseConfig {
     }
 }
 
-/// Publisher-local bounded configuration. Debug output never renders either NATS authority or a
-/// PostgreSQL credential.
 #[derive(Clone)]
 pub struct PublisherConfig {
     database: PublisherDatabaseConfig,
@@ -142,8 +134,6 @@ impl PublisherConfig {
         get: impl Fn(&str) -> Result<String, PublisherConfigError>,
     ) -> Result<Self, PublisherConfigError> {
         let publisher_url = get(PUBLISHER_DATABASE_URL_ENV)?;
-        // Parsed only for credential/server-identity comparison. The app DSN is never retained,
-        // connected, or exposed through the publisher provider.
         let runtime_url = get("DATABASE_URL")?;
         let publisher = PgConnectOptions::from_str(&publisher_url)
             .map_err(|_| PublisherConfigError::InvalidDatabaseAuthority)?;
@@ -208,9 +198,6 @@ impl PublisherConfig {
         let ack_budget = publish_ack_timeout
             .checked_mul(batch_count)
             .ok_or(PublisherConfigError::PassBudgetInfeasible)?;
-        // Conservative feasibility model: election + claim + commit, plus one quarantine/update
-        // statement per claimed row, and one full publish-ack timeout per row. The outer runtime
-        // timeout remains the absolute bound even when an operation finishes outside this model.
         let database_budget = statement_timeout
             .checked_mul(batch_count.saturating_add(3))
             .ok_or(PublisherConfigError::PassBudgetInfeasible)?;
@@ -412,7 +399,6 @@ impl core::fmt::Display for PublisherDbError {
 
 impl std::error::Error for PublisherDbError {}
 
-/// Validated one-connection provider that yields only an elected relay capability.
 pub struct PublisherDbProvider {
     pool: PgPool,
 }
@@ -426,8 +412,6 @@ impl PublisherDbProvider {
             .clone()
             .application_name("myelin:outbox-publisher")
             .options([("statement_timeout", timeout_ms.as_str())]);
-        // @residency-cell-pinned: this cell-local authority is required to match the application
-        // database identity; relay validation separately pins every envelope to `config.region`.
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(config.statement_timeout)
@@ -458,8 +442,6 @@ async fn validate_publisher_pool(
     pool: &PgPool,
     expected: &PublisherDatabaseConfig,
 ) -> Result<(), PublisherDbError> {
-    // @tenant-cross-scope: this authorization probe reads only PostgreSQL identity/catalog grants
-    // and named outbox capabilities; it never reads tenant-owned rows.
     let row = sqlx::query(
         "SELECT current_database()::text AS database,
                 session_user::text AS session_user,
@@ -733,8 +715,6 @@ impl<D: DrainPass> PublisherRuntime<D> {
         result
     }
 
-    /// Run bounded passes until shutdown. Shutdown never starts a new pass and never drains to
-    /// empty; it waits only for the already-started, batch/statement/ack-bounded pass.
     pub async fn serve_until(&self, stop: &AtomicBool) {
         while !stop.load(Ordering::SeqCst) {
             let result = self.run_pass().await;

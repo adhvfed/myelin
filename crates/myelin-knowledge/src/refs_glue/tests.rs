@@ -1,8 +1,3 @@
-//! Unit tests for the Knowledge Refs glue (KN-P19 / P-309): the inline-node `refs.edge.created`
-//! producer (5.4), the TE-7 typed-edge mirror (5.5), and the `project(ref, viewer)` 4-step tombstone
-//! ladder (5.6 / 5.7 / §2.1). The project-leak path is the mandatory-core leak surface — the
-//! permission-deny / erased / sub-gone tombstone tests are the mutation-floor anchors.
-
 use super::*;
 use crate::block_tree::PageTree;
 use crate::database::RelationStore;
@@ -15,8 +10,6 @@ use myelin_identity::{
     PrincipalStatus, Result as IdResult, RewriteTrace, SubjectTree, TupleDelta,
 };
 use std::sync::Arc;
-
-// ───────────────────────────── shared fixtures ─────────────────────────────
 
 fn tenant() -> TenantId {
     TenantId("acme".into())
@@ -41,8 +34,6 @@ fn z() -> Zookie {
     Zookie("z0".into())
 }
 
-/// A deterministic Id stub: a `read@object` allow-list (absent ⇒ Deny, fail-closed); a toggle forces a
-/// transport hiccup (the projector must then fail CLOSED to a tombstone).
 struct StubId {
     allow: HashSet<String>,
     hiccup: bool,
@@ -164,11 +155,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-// ════════════════════════════ 1. the inline-node refs.edge.created producer (5.4) ═══════════════
-
-/// **Each `mention`/`artifact_ref`/`embed` node emits ONE `refs.edge.created` (reference-class), NOT
-/// coalesced, with the references-not-payloads triple + the shared edge aggregate.** A `mention`
-/// targets the opaque principal URN (no inline PII).
 #[test]
 fn each_inline_node_emits_one_reference_edge() {
     let (store, minter) = store_and_minter();
@@ -185,10 +171,9 @@ fn each_inline_node_emits_one_reference_edge() {
 
     let mut tx = store.begin(Arc::clone(&minter), ctx_base());
     let ids = emit_content_edges(&mut tx, &tenant(), &source, &nodes, None).expect("emit edges");
-    assert_eq!(ids.len(), 3, "one edge per node — NOT coalesced");
+    assert_eq!(ids.len(), 3, "one edge per node - NOT coalesced");
     tx.commit().expect("commit the block persist + its edges");
 
-    // mention → mentions edge → the opaque principal URN.
     let m = store.row(&ids[0]).expect("mention edge row");
     assert_eq!(m.envelope.type_.0, "refs.edge.created");
     assert_eq!(m.envelope.payload["rel"], "mentions");
@@ -202,7 +187,6 @@ fn each_inline_node_emits_one_reference_edge() {
         "references-not-payloads: opaque principal id, no PII"
     );
 
-    // artifact_ref → references edge → the issue URN verbatim.
     let a = store.row(&ids[1]).expect("artifact_ref edge row");
     assert_eq!(a.envelope.payload["rel"], "references");
     assert_eq!(
@@ -210,7 +194,6 @@ fn each_inline_node_emits_one_reference_edge() {
         "myelin://acme/issue/issue/ENG-1"
     );
 
-    // embed → embeds edge → the embedded page URN; the aggregate is the shared edge convention.
     let e = store.row(&ids[2]).expect("embed edge row");
     assert_eq!(e.envelope.payload["rel"], "embeds");
     assert_eq!(
@@ -223,8 +206,6 @@ fn each_inline_node_emits_one_reference_edge() {
     assert_eq!(e.envelope.payload["source"], source.0);
 }
 
-/// **Emit-iff-committed (KN-D7): an aborted block persist drops the buffered edges (no edge without
-/// its committed node).**
 #[test]
 fn content_edges_are_emit_iff_committed() {
     let (store, minter) = store_and_minter();
@@ -235,7 +216,6 @@ fn content_edges_are_emit_iff_committed() {
     {
         let mut tx = store.begin(Arc::clone(&minter), ctx_base());
         emit_content_edges(&mut tx, &tenant(), &source, &nodes, None).expect("emit");
-        // tx dropped WITHOUT commit — the crash between the block commit and the relay.
     }
     assert_eq!(
         store.outbox_depth(),
@@ -244,15 +224,9 @@ fn content_edges_are_emit_iff_committed() {
     );
 }
 
-// ════════════════════════════ 2. the TE-7 typed-edge mirror (5.5) ═══════════════════════════════
-
-/// **A `page_parent` typed-row write emits `knowledge.page.parent_set` (lifecycle-class) in the SAME
-/// transaction (0 typed-row-without-edge).** The forward `parent` edge; the aggregate is the child
-/// page; Refs fixes the inverse `child`.
 #[test]
 fn te7_page_parent_set_mirrors_the_typed_row_in_the_same_tx() {
     let (store, minter) = store_and_minter();
-    // Write the page_parent typed row (the source of truth) + emit its mirror in ONE tx.
     let mut pages = PageTree::new();
     pages
         .set_parent(
@@ -292,12 +266,9 @@ fn te7_page_parent_set_mirrors_the_typed_row_in_the_same_tx() {
         row.envelope.payload["target"],
         "myelin://acme/knowledge/page/team"
     );
-    // the aggregate is the child page (per-page ordering).
     assert_eq!(row.aggregate.0, "myelin://acme/knowledge/page/project");
 }
 
-/// **A `db_relation` typed-row write emits `knowledge.relation.created`/`.removed` (lifecycle-class) in
-/// the SAME transaction; relate then unrelate emit on the SAME edge aggregate (ordered).**
 #[test]
 fn te7_db_relation_mirrors_created_and_removed() {
     let (store, minter) = store_and_minter();
@@ -308,7 +279,6 @@ fn te7_db_relation_mirrors_created_and_removed() {
         dst_ref: ArtifactRef("myelin://acme/knowledge/row/row9".into()),
         rel: RelationKind::Relates,
     };
-    // relate (the forward typed row is the source of truth) + emit its mirror.
     assert!(
         rels.relate(&tenant(), relation.clone()),
         "a new edge was created"
@@ -331,7 +301,6 @@ fn te7_db_relation_mirrors_created_and_removed() {
         "myelin://acme/knowledge/row/row9"
     );
 
-    // unrelate → relation.removed on the SAME edge aggregate (the create→remove sequence is ordered).
     let mut tx2 = store.begin(Arc::clone(&minter), ctx_base());
     let rid =
         emit_relation_edge(&mut tx2, &tenant(), &relation, false, None).expect("emit removed");
@@ -344,7 +313,6 @@ fn te7_db_relation_mirrors_created_and_removed() {
     );
 }
 
-/// **The rollup_source relation maps to its own lifecycle rel token.**
 #[test]
 fn te7_rollup_source_rel_token() {
     let (store, minter) = store_and_minter();
@@ -362,8 +330,6 @@ fn te7_rollup_source_rel_token() {
         "rollup_source"
     );
 }
-
-// ════════════════════════════ 3. project(ref, viewer) — the 4-step tombstone ladder (5.6/5.7) ═══
 
 fn seeded_projector(allow: bool) -> Projector<StubId> {
     let root = page_root("7c2");
@@ -383,8 +349,6 @@ fn seeded_projector(allow: bool) -> Projector<StubId> {
     Projector::new(id, store)
 }
 
-/// **Step 1 — an authorized viewer gets the page projection (the frozen `{title,state,icon,
-/// render_hint}` shape).**
 #[test]
 fn authorized_viewer_gets_the_page_projection() {
     let p = seeded_projector(true);
@@ -402,12 +366,9 @@ fn authorized_viewer_gets_the_page_projection() {
     }
 }
 
-/// **THE PROJECT-LEAK GATE (project-leak counter = 0): a confidential page → a tombstone CARRYING THE
-/// ROOT, never the title, for an unauthorized viewer.** Step 1 of the ladder — the deny path never
-/// reads the title.
 #[test]
 fn unauthorized_viewer_gets_a_tombstone_carrying_the_root_never_the_title() {
-    let p = seeded_projector(false); // the Id allows NOBODY → every check denies.
+    let p = seeded_projector(false);
     let got = p
         .project(&page_root("7c2"), &viewer("mallory"), z())
         .unwrap();
@@ -418,11 +379,10 @@ fn unauthorized_viewer_gets_a_tombstone_carrying_the_root_never_the_title() {
     assert_eq!(
         got.title(),
         None,
-        "0 title leak — the denied viewer never gets the title"
+        "0 title leak - the denied viewer never gets the title"
     );
     if let Projected::Tombstoned(t) = got {
         assert_eq!(t.reason, TombstoneReason::Denied);
-        // a tombstone ALWAYS carries the root (§2.1) — an opaque scope, never the title.
         assert_eq!(t.root, page_root("7c2"));
         assert!(
             !t.root.0.contains("Incident"),
@@ -432,7 +392,6 @@ fn unauthorized_viewer_gets_a_tombstone_carrying_the_root_never_the_title() {
     }
 }
 
-/// **An Id transport hiccup fails CLOSED to a tombstone (never a leak), even for an allowed viewer.**
 #[test]
 fn an_id_hiccup_fails_closed_to_a_tombstone() {
     let root = page_root("7c2");
@@ -453,8 +412,6 @@ fn an_id_hiccup_fails_closed_to_a_tombstone() {
     assert_eq!(got.title(), None);
 }
 
-/// **Step 4 (erased) — an erased page projects to an `Erased` tombstone carrying the root, even for an
-/// authorized viewer (the content is shredded).**
 #[test]
 fn an_erased_page_projects_to_an_erased_tombstone() {
     let root = page_root("7c2");
@@ -481,7 +438,6 @@ fn an_erased_page_projects_to_an_erased_tombstone() {
     }
 }
 
-/// **A restricted subject degrades to the same content-free tombstone (the GDPR suppression window).**
 #[test]
 fn a_restricted_subject_projects_to_a_tombstone() {
     let root = page_root("7c2");
@@ -500,8 +456,6 @@ fn a_restricted_subject_projects_to_a_tombstone() {
     assert_eq!(got.title(), None);
 }
 
-/// **Step 2 (root gone) — an authorized viewer of a non-existent root gets a `RootGone` tombstone
-/// carrying the (gone) root URN.**
 #[test]
 fn a_missing_root_projects_to_a_root_gone_tombstone() {
     let root = page_root("does-not-exist");
@@ -514,8 +468,6 @@ fn a_missing_root_projects_to_a_root_gone_tombstone() {
     }
 }
 
-/// **The full ladder for a `#sub` block anchor — LIVE / MOVED / OUTDATED each project a SubAnchor on
-/// the right rung; GONE tombstones carrying the root (the page resolves, the block is dead).**
 #[test]
 fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     let root = page_root("7c2");
@@ -536,23 +488,19 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     store.put_sub_state(&moved, SubState::Moved);
     store.put_sub_state(&outdated, SubState::Outdated);
     store.put_sub_state(&gone, SubState::Gone);
-    // allow_read on the ROOT — the sub inherits the parent permission (checked on the stripped root).
     let p = Projector::new(StubId::new().allow_read(&root), store);
 
-    // LIVE: a SubAnchor on the live rung, the stable block_id.
     let l = p.project(&live, &viewer("alice"), z()).unwrap();
     if let Projected::Visible(proj) = l {
         let a = proj.sub_anchor.expect("a #sub carries a sub_anchor");
         assert_eq!(a.kind, "b");
         assert_eq!(a.sub_id, "b9");
         assert_eq!(a.rung, LadderRung::Live);
-        // the parent-page title is the projection title.
         assert_eq!(proj.title, "Incident runbook");
     } else {
         panic!("LIVE block must be visible");
     }
 
-    // MOVED: the stable block_id still resolves (a tree move, not a 3-way diff).
     let m = p.project(&moved, &viewer("alice"), z()).unwrap();
     if let Projected::Visible(proj) = m {
         assert_eq!(proj.sub_anchor.unwrap().rung, LadderRung::Moved);
@@ -560,7 +508,6 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
         panic!("MOVED block must still resolve");
     }
 
-    // OUTDATED: resolves partially, flagged outdated.
     let o = p.project(&outdated, &viewer("alice"), z()).unwrap();
     if let Projected::Visible(proj) = o {
         assert_eq!(proj.sub_anchor.unwrap().rung, LadderRung::Outdated);
@@ -568,7 +515,6 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
         panic!("OUTDATED heading must resolve partially");
     }
 
-    // GONE: the root resolves, the block is dead → a SubGone tombstone carrying the root.
     let g = p.project(&gone, &viewer("alice"), z()).unwrap();
     assert!(g.is_tombstone());
     assert_eq!(g.title(), None);
@@ -581,8 +527,6 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     }
 }
 
-/// CI's nested commit/check subjects retain their full canonical identity when Knowledge projects
-/// them as generic check-family anchors; neither the commit nor the check context may be dropped.
 #[test]
 fn ci_subject_sub_ids_preserve_commit_and_context() {
     assert_eq!(
@@ -600,8 +544,6 @@ fn ci_subject_sub_ids_preserve_commit_and_context() {
     );
 }
 
-/// **A `#sub` block of a CONFIDENTIAL page is tombstoned (Denied) — the sub inherits the parent
-/// permission; the excerpt/title never leaks.** (A sub is never more visible than its root, §2.1.)
 #[test]
 fn a_sub_anchor_of_a_confidential_page_is_denied_carrying_the_root() {
     let root = page_root("7c2");
@@ -615,7 +557,6 @@ fn a_sub_anchor_of_a_confidential_page_is_denied_carrying_the_root() {
         },
     );
     store.put_sub_state(&block, SubState::Live);
-    // the Id allows NOBODY → the parent page is denied → the block sub is tombstoned.
     let p = Projector::new(StubId::new(), store);
     let got = p.project(&block, &viewer("mallory"), z()).unwrap();
     assert!(got.is_tombstone());
@@ -626,7 +567,6 @@ fn a_sub_anchor_of_a_confidential_page_is_denied_carrying_the_root() {
     }
 }
 
-/// **An un-tracked sub defaults to LIVE (a freshly-minted anchor the store has no state for yet).**
 #[test]
 fn an_untracked_sub_defaults_to_live() {
     let root = page_root("7c2");
@@ -648,8 +588,6 @@ fn an_untracked_sub_defaults_to_live() {
     }
 }
 
-/// **A non-Knowledge ref is a loud error, NOT a tombstone (a tombstone is for a hidden Knowledge
-/// artifact).**
 #[test]
 fn a_non_knowledge_ref_is_a_loud_error() {
     let git = ArtifactRef("myelin://acme/git/pr/repo:42".into());
@@ -660,8 +598,6 @@ fn a_non_knowledge_ref_is_a_loud_error() {
     ));
 }
 
-/// **The frozen rel-class tokens never alias (reference vs lifecycle); the lifecycle rel tokens match
-/// the Refs mirror vocabulary.**
 #[test]
 fn frozen_rel_class_and_rel_tokens() {
     assert_eq!(REFS_EDGE_CREATED, "refs.edge.created");
@@ -674,20 +610,15 @@ fn frozen_rel_class_and_rel_tokens() {
     );
 }
 
-/// **The ladder-rung tokens are the frozen `live`/`moved`/`outdated` (a mutation that blanks them is
-/// caught — the rung token is the consumer's render flag).**
 #[test]
 fn ladder_rung_tokens_are_frozen() {
     assert_eq!(LadderRung::Live.as_str(), "live");
     assert_eq!(LadderRung::Moved.as_str(), "moved");
     assert_eq!(LadderRung::Outdated.as_str(), "outdated");
-    // the three rungs are distinct (no two alias).
     assert_ne!(LadderRung::Live.as_str(), LadderRung::Moved.as_str());
     assert_ne!(LadderRung::Moved.as_str(), LadderRung::Outdated.as_str());
 }
 
-/// **`is_visible`/`is_tombstone` are exact complements over the two-variant result (a mutation that
-/// pins either to `true` is caught — a tombstone is NOT visible and vice-versa).**
 #[test]
 fn projected_predicates_are_exact_complements() {
     let p = seeded_projector(true);
@@ -705,9 +636,6 @@ fn projected_predicates_are_exact_complements() {
     assert!(!denied.is_visible(), "a tombstone is NOT visible");
 }
 
-/// **A RESTRICTED *sub-URN* (the root NOT restricted) still tombstones — the restriction check is an
-/// OR over (root, full-ref), not an AND.** This kills the `||`→`&&` mutant on the restriction guard: a
-/// sub-anchor whose specific URN is restricted must tombstone even when the parent page is not.
 #[test]
 fn a_restricted_sub_urn_tombstones_even_when_the_root_is_not() {
     let root = page_root("7c2");
@@ -721,7 +649,6 @@ fn a_restricted_sub_urn_tombstones_even_when_the_root_is_not() {
         },
     );
     store.put_sub_state(&block, SubState::Live);
-    // ONLY the sub-URN is restricted; the root is NOT.
     store.mark_restricted(&block);
     let p = Projector::new(StubId::new().allow_read(&root), store);
     let got = p.project(&block, &viewer("alice"), z()).unwrap();
@@ -732,8 +659,6 @@ fn a_restricted_sub_urn_tombstones_even_when_the_root_is_not() {
     assert_eq!(got.title(), None);
 }
 
-/// **An ERASED *sub-URN* (the root NOT erased) tombstones — the erasure check is an OR over (root,
-/// full-ref).** The companion to the restriction OR (the erasure guard's `||`).
 #[test]
 fn an_erased_sub_urn_tombstones_even_when_the_root_is_not() {
     let root = page_root("7c2");
@@ -747,7 +672,7 @@ fn an_erased_sub_urn_tombstones_even_when_the_root_is_not() {
         },
     );
     store.put_sub_state(&block, SubState::Live);
-    store.mark_erased(&block); // ONLY the sub-URN is erased.
+    store.mark_erased(&block);
     let p = Projector::new(StubId::new().allow_read(&root), store);
     let got = p.project(&block, &viewer("alice"), z()).unwrap();
     assert!(got.is_tombstone());
@@ -756,8 +681,6 @@ fn an_erased_sub_urn_tombstones_even_when_the_root_is_not() {
     }
 }
 
-/// **The `ProjectError` Display is non-empty + names the offending ref (a mutation that blanks the
-/// formatter is caught).**
 #[test]
 fn project_error_display_is_loud() {
     let e = ProjectError::NotAKnowledgeArtifact {
@@ -775,8 +698,6 @@ fn project_error_display_is_loud() {
     assert!(u.to_string().contains("widget"));
 }
 
-/// **`store_mut` returns a live borrow of the SAME store the projector reads (a seed through it is
-/// observed by `project`).** Kills the `store_mut -> Box::leak(default)` mutant.
 #[test]
 fn store_mut_borrows_the_live_store() {
     let root = page_root("seeded-via-mut");

@@ -5,10 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-refs is in the mid-tier of the DAG (architecture 00 §2.9):
-# events (+ refs, content, query). It depends on tenancy (ArtifactRef value type),
-# identity (Principal, for permission-filtered backlinks), and events. It MUST NOT
-# depend on -agent, -gdpr, -client, or -substrate (downstream).
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }

@@ -1,29 +1,3 @@
-//! Tenant/region-scoped durable Issue store (R4.4 data-plane increment).
-//!
-//! Every operation derives its scope from a verified [`Principal`], checks object authorization
-//! before touching PostgreSQL, and executes through [`SubstrateProvider::with_tenant_tx`] so FORCE
-//! RLS is a second, independent tenant boundary. Free-text titles are sealed under the creator's
-//! per-subject DEK before the insert; only nonce/ciphertext/`pii_key_ref` rest in PostgreSQL.
-//!
-//! This module intentionally does not provide an allow-all production authorizer or an in-memory
-//! store. The edge composition must inject the live Identity/ReBAC implementation.
-//!
-//! ## Atomic authorization visibility across the Issues -> Identity boundary
-//!
-//! Identity owns `rebac_tuple`; Issues never writes it directly and does not assume two service
-//! databases can share a transaction. Creation therefore uses a durable, fail-closed saga:
-//!
-//! 1. one Issues transaction inserts an **invisible** issue row, its exact `parent_project` tuple
-//!    intent in `issue_authz_binding`, and `issue.issue.authorization_requested` in the outbox;
-//! 2. a retryable worker calls [`IssueTupleWriter`] (the production adapter is Identity's scoped
-//!    `TupleStore::write_tuples`) to idempotently install the tuple;
-//! 3. only after that succeeds does one Issues transaction mark the binding `active` and co-emit
-//!    the externally visible `issue.issue.created` event.
-//!
-//! Every read joins an `active` binding. Thus a crash can leave internal pending state, but it can
-//! never expose an issue without its authorization tuple; retry converges without duplicate visible
-//! creation. This is the honest outbox/Saga equivalent of atomicity at a cross-service boundary.
-
 use crate::api::{
     decode_issue_page_cursor, encode_issue_page_cursor, normalize_issue_key_prefix, IssueListState,
 };
@@ -45,42 +19,25 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// Maximum issue title bytes accepted at the durable boundary.
 pub const MAX_TITLE_BYTES: usize = 512;
-/// Maximum page size; callers cannot request an unbounded tenant scan.
 pub const MAX_PAGE_SIZE: u32 = 100;
-/// Maximum materialised Identity allow-set accepted before any database transaction is opened.
-/// Larger sets must use Identity's push-down/filter representation rather than allocating a huge
-/// `ANY(uuid[])` parameter at the Issues boundary.
 pub const MAX_AUTHORIZED_ISSUE_IDS: usize = 10_000;
 
-/// Object permission checked before an issue read or transition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssuePermission {
-    /// Read/decrypt one issue.
     View,
-    /// Durably transition one issue to the completed category.
     Close,
 }
 
-/// Leak-free authorization result for a list query. `Ids` is pushed into SQL before rows/counts are
-/// read; it is never applied as a post-filter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum VisibleIssues {
-    /// No issue is reachable; the store returns an empty page without querying the issue table.
     None,
-    /// Every issue in the principal's verified tenant/region is reachable (explicit tenant-wide grant).
     All,
-    /// A bounded, pre-authorized issue-id set to conjoin with the tenant-scoped SQL query.
     Ids(Vec<String>),
-    /// Frozen effective-permission pushdown. PgIssueStore accepts only the exact `issue.id IN
-    /// issue:view` shape and binds it to its durable source/applied projection watermark.
     Filter { set_expr: SetExpr },
 }
 
 impl VisibleIssues {
-    /// The only production list shape. Subject, tenant, and region remain derived from the verified
-    /// principal; callers cannot smuggle them into this expression.
     pub fn effective_issue_view_filter() -> Self {
         Self::Filter {
             set_expr: SetExpr::InRelation {
@@ -94,50 +51,34 @@ impl VisibleIssues {
     }
 }
 
-/// Result of atomically rebuilding one tenant/region effective `issue:view` projection.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueViewProjectionRevision {
     pub revision: i64,
     pub effective_grants: u64,
 }
 
-/// Required production authorization seam. The live implementation is Identity/ReBAC; there is no
-/// permissive default. Every method receives the verified principal, never a body/path tenant.
 pub trait IssueAuthorizer: Send + Sync {
-    /// Authorize creation under the addressed project object before encryption/counter/row mutation.
     fn may_create(&self, principal: &Principal, project_id: &str) -> bool;
-    /// Strong project-view check before disclosing a creator-scoped authorization receipt.
     fn may_view_project(&self, principal: &Principal, project_id: &str) -> bool {
         self.may_create(principal, project_id)
     }
-    /// Authorize one issue object before its row is read or mutated.
     fn may_access(
         &self,
         principal: &Principal,
         issue_id: &str,
         permission: IssuePermission,
     ) -> bool;
-    /// Produce the leak-free prefilter for list. Errors fail closed and are surfaced loudly.
     fn visible_issues(&self, principal: &Principal) -> Result<VisibleIssues, String>;
 }
 
-/// A create proposal. Scope and creator are deliberately absent: both come from the verified
-/// principal passed separately to [`PgIssueStore::create`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateIssue {
-    /// Opaque project UUID; checked as `project:<uuid>` by the production authorizer.
     pub project_id: String,
-    /// Opaque issue-type UUID.
     pub type_id: String,
-    /// Human-key prefix (`ENG`, `OPS`, …), 2–10 uppercase ASCII bytes.
     pub prefix: String,
-    /// Free-text title, encrypted before the database transaction.
     pub title: String,
 }
 
-/// Durable receipt for an issue creation that is staged but deliberately not visible yet.
-/// Callers may return this as an asynchronous-creation receipt; they must not render the title or
-/// claim the issue is readable until [`PgIssueStore::reconcile_authorization`] succeeds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueCreationReceipt {
     pub id: String,
@@ -146,15 +87,12 @@ pub struct IssueCreationReceipt {
     pub authorization_request_event_id: String,
 }
 
-/// Creator-scoped status of the durable authorization saga. Failure internals are deliberately
-/// absent; retryable failures remain represented as `Pending`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IssueAuthorizationStatus {
     Pending(IssueCreationReceipt),
     Active(StoredIssue),
 }
 
-/// The exact Identity relationship intent committed with the pending issue row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueAuthorizationBinding {
     pub issue_id: String,
@@ -169,19 +107,12 @@ pub struct IssueAuthorizationBinding {
     pub attempts: u32,
 }
 
-/// Durable bootstrap state. Only `Active` rows participate in any Issue read query.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssueAuthorizationState {
     Pending,
     Active,
 }
 
-/// Scoped Identity/ReBAC tuple-write port used by the retry worker.
-///
-/// Implementations MUST make `ensure_parent_project` idempotent for the binding identity. The live
-/// adapter should call Identity's scoped `TupleStore::write_tuples` with an `Add` of
-/// `issue:<uuid>#parent_project@(project:<uuid>#view)`. A repeated `Add` must return success and a
-/// zookie; it must not widen the relation or write another tenant's partition.
 pub trait IssueTupleWriter: Send + Sync {
     fn ensure_parent_project<'a>(
         &'a self,
@@ -191,9 +122,6 @@ pub trait IssueTupleWriter: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<Zookie, String>> + Send + 'a>>;
 }
 
-/// Result of one reconciliation attempt. `newly_activated=false` means another worker already won
-/// the activation race; the returned issue is the same active row and no second `issue.created`
-/// event was emitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueAuthorizationOutcome {
     pub issue: StoredIssue,
@@ -216,26 +144,19 @@ impl BootstrapFailure {
     }
 }
 
-/// Bounded, filter-bound keyset page request. Product UX defaults to open work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssuePageRequest {
     pub state: IssueListState,
-    /// Normalized uppercase issue-key prefix only; titles remain encrypted and are never searched.
     pub key: Option<String>,
-    /// Requested rows, `1..=100`.
     pub limit: u32,
-    /// Exclusive opaque compound cursor (`updated_at DESC, id DESC`) bound to state/key.
     pub cursor: Option<String>,
 }
 
 impl IssuePageRequest {
-    /// Validate the default open-work page request.
     pub fn new(limit: u32, cursor: Option<String>) -> Result<Self, IssueStoreError> {
         Self::filtered(IssueListState::Open, None, limit, cursor)
     }
 
-    /// Validate a bounded authoritative list request, normalizing the key filter and strictly
-    /// decoding a filter-bound cursor before any database operation.
     pub fn filtered(
         state: IssueListState,
         key: Option<String>,
@@ -266,7 +187,6 @@ impl IssuePageRequest {
     }
 }
 
-/// Decrypted issue view returned only after authorization.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StoredIssue {
     pub id: String,
@@ -280,7 +200,6 @@ pub struct StoredIssue {
     pub updated_at: String,
 }
 
-/// A bounded issue page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssuePage {
     pub items: Vec<StoredIssue>,
@@ -288,11 +207,9 @@ pub struct IssuePage {
     pub limit: u32,
 }
 
-/// Loud typed store failure. No variant contains plaintext title or key material.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IssueStoreError {
     BadInput(String),
-    /// Uniform object denial/absence; callers must map this to the same 404 envelope.
     NotFound,
     AuthorizationUnavailable(String),
     Storage(String),
@@ -315,8 +232,6 @@ impl core::fmt::Display for IssueStoreError {
 
 impl std::error::Error for IssueStoreError {}
 
-/// Real PostgreSQL issue store. It is constructible only with a concrete authorization seam and a
-/// KMS engine; no in-memory or permissive production constructor exists.
 #[derive(Clone)]
 pub struct PgIssueStore<A: IssueAuthorizer> {
     provider: SubstrateProvider,
@@ -330,8 +245,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         Self::with_minter(provider, kms, authorizer, Arc::new(UlidMinter::new()))
     }
 
-    /// Construct with an explicit event-id source. Production roots should normally use [`Self::new`];
-    /// this seam exists so tests can pin the two IDs staged by one creation attempt.
     pub fn with_minter(
         provider: SubstrateProvider,
         kms: Arc<KmsEngine>,
@@ -357,9 +270,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         ))
     }
 
-    /// Authorize project creation and atomically stage the invisible row + exact Identity tuple
-    /// intent + authorization-request outbox event. No product read can observe the row until the
-    /// tuple has been durably written and [`Self::reconcile_authorization`] activates it.
     pub async fn create(
         &self,
         principal: &Principal,
@@ -369,9 +279,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    /// Failure-injection seam for the live rollback proof: run the exact production transaction,
-    /// then return an error after staging its outbox row so PostgreSQL must roll back the issue,
-    /// binding, prefix allocation, and event together.
     pub async fn create_then_abort_for_test(
         &self,
         principal: &Principal,
@@ -393,12 +300,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         }
 
         let tenant = principal.tenant.clone();
-        // The title is controller-authored free text, so its erasure subject is the verified creator.
-        // For an agent acting on behalf of a human, Identity's explicit `on_behalf_of` subject owns
-        // the title DEK; otherwise the stable opaque creator principal does. This gives a reachable
-        // individual crypto-shred lever without fabricating a reporter identity. A title that names
-        // some unrelated third party remains the platform-wide third-party-content residual; no
-        // single row key can infer every person mentioned inside opaque free text.
         let subject = SubjectId::new(title_dek_subject(principal));
         let sealed = encrypt_free_text(
             &self.kms,
@@ -422,8 +323,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let key_ref = sealed.key_ref.to_uri();
         let issue_object = issue_object(issue_id);
         let project_userset = project_userset(project_id);
-        // Mint both canonical event IDs before staging. Their persisted values are the saga's
-        // idempotency keys; retries never derive or replace either envelope identity.
         let request_event_id: EventId = self.minter.mint().into();
         let created_event_id: EventId = self.minter.mint().into();
         let request_envelope = authorization_request_envelope(
@@ -515,14 +414,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         })
     }
 
-    /// Reconcile one pending issue with Identity's scoped tuple writer.
-    ///
-    /// The Identity call intentionally happens outside the Issues transaction: holding a database
-    /// lock across an RPC would be unsafe and still would not make two databases atomic. Instead,
-    /// the exact `Add` is idempotent and activation is a compare-and-set under `FOR UPDATE`. If this
-    /// process dies after Identity commits but before activation, the row remains invisible; a retry
-    /// repeats the `Add`, then activates once. Concurrent workers may both call Identity, but only
-    /// one can emit `issue.issue.created`.
     pub async fn reconcile_authorization<W: IssueTupleWriter>(
         &self,
         worker: &Principal,
@@ -532,9 +423,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         self.reconcile_inner(worker, issue_id, writer, false).await
     }
 
-    /// Return a bounded, partition-scoped restart-recovery batch. A worker repeatedly scans this
-    /// list and calls [`Self::reconcile_authorization`]; legacy rows without a binding are excluded
-    /// and remain fail-closed until an explicit rollout backfill stages a reviewed tuple intent.
     pub async fn pending_authorization_ids(
         &self,
         worker: &Principal,
@@ -574,8 +462,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    /// Failure-injection seam for the restart proof: Identity commits the idempotent tuple, then the
-    /// simulated process dies before Issues activates the binding.
     pub async fn reconcile_then_crash_for_test<W: IssueTupleWriter>(
         &self,
         worker: &Principal,
@@ -594,9 +480,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
     ) -> Result<IssueAuthorizationOutcome, IssueStoreError> {
         let scope = self.scope(worker)?;
         let id = parse_uuid("issue_id", issue_id)?;
-        // Preflight the complete durable intent before crossing the database boundary. The tuple
-        // writer receives only canonical fields derived from the issue row, never mutable copies
-        // from issue_authz_binding.
         let binding = self
             .load_validated_authorization_binding(&scope, id)
             .await?;
@@ -836,7 +719,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         decode_row(&self.kms, region, row)
     }
 
-    /// Read and decrypt one issue only after the object-level `view` decision allows it.
     pub async fn view(
         &self,
         principal: &Principal,
@@ -867,9 +749,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         decode_row(&self.kms, &principal.region, row)
     }
 
-    /// Resolve a creator-scoped asynchronous authorization request. Tenant, region, and exact
-    /// creator are applied in SQL before a row is returned; strong project view gates both states,
-    /// and an active response additionally passes the ordinary strong issue-view authorization.
     pub async fn authorization_status(
         &self,
         principal: &Principal,
@@ -929,11 +808,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         }
     }
 
-    /// Leak-free list over the durable effective-permission projection.
-    ///
-    /// The one SQL statement returns a projection-status sentinel plus only rows joined to the
-    /// exact ready revision. Missing, pending, rebuilding, or revision-mismatched state therefore
-    /// returns `AuthorizationUnavailable`; it is never confused with an authorized empty page.
     pub async fn list(
         &self,
         principal: &Principal,
@@ -1029,12 +903,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         })
     }
 
-    /// Rebuild the effective `issue:view` rows for one verified tenant/region.
-    ///
-    /// The projection state row is locked before the source is read and remains locked through
-    /// publication. Tuple and issue triggers take the same row lock when advancing the source
-    /// revision, so a concurrent mutation either precedes this snapshot or commits afterward and
-    /// leaves it pending. A crash rolls the delete/insert/status transition back atomically.
     pub async fn rebuild_effective_issue_view(
         &self,
         worker: &Principal,
@@ -1043,7 +911,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    /// Deterministic race seam: pause only after the projection state row is locked.
     pub async fn rebuild_effective_issue_view_paused_for_test(
         &self,
         worker: &Principal,
@@ -1177,8 +1044,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             })
     }
 
-    /// Durable readiness/lag probe for the bounded reconciler. `None` is absent state and therefore
-    /// unavailable; `Some(0)` is serveable only when status is also `ready`.
     pub async fn effective_issue_view_lag(
         &self,
         worker: &Principal,
@@ -1215,8 +1080,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .map_err(|error| IssueStoreError::Storage(error.to_string()))
     }
 
-    /// Object-authorize, lock the row, and durably transition it to `completed`. Repeated closes are
-    /// idempotent: an already-completed row is returned without another version bump.
     pub async fn close(
         &self,
         principal: &Principal,
@@ -1233,8 +1096,6 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
         let actor = principal.clone();
-        // Mint before opening the transaction, just like create. An idempotent no-op close may
-        // discard this ID; a state-changing close persists it exactly once with the row update.
         let closed_event_id: EventId = self.minter.mint().into();
         let row = self
             .provider
@@ -1371,18 +1232,12 @@ FROM authorized
 ORDER BY sort_key ASC, updated_at_micros DESC NULLS FIRST, id DESC NULLS FIRST
 "#;
 
-/// Exact served list statement, exposed for production-plan verification against live PostgreSQL.
-/// Callers must not execute it outside the scoped store path; the Edge integration test only
-/// prefixes it with `EXPLAIN` and binds the same typed parameters.
 #[doc(hidden)]
 #[cfg(any(test, feature = "test-support"))]
 pub fn authoritative_issue_list_sql() -> &'static str {
     LIST_EFFECTIVE_ISSUE_VIEW_SQL
 }
 
-/// Resolve the fixed core org→team→project hierarchy plus direct-relation usersets. A userset that
-/// leaves those supported group types is surfaced as `supported=false`; rebuild then fails closed
-/// instead of silently under-materializing an unknown permission rewrite.
 const ISSUE_VIEW_WALK_CTE: &str = r#"
 WITH RECURSIVE roots(issue_id, arm, object_id, relation, depth, path, supported) AS (
   SELECT i.id::text, root.arm,
@@ -1687,7 +1542,6 @@ fn issue_created_envelope(
             }),
             data_role: DataRole::Controller,
             visibility: Visibility::Internal,
-            // IDs and refs only: the encrypted title is not copied into this envelope.
             contains_personal_data: false,
             pii_key_ref: None,
         },
@@ -1705,9 +1559,6 @@ fn issue_created_envelope(
     )
 }
 
-/// References-only close event committed in the exact transaction that changes the issue row.
-/// The encrypted title never enters the outbox. A repeated close never calls this helper because
-/// the locked row's completed category returns early, preserving one event for one transition.
 fn issue_closed_envelope(
     actor: &Principal,
     issue_id: Uuid,
@@ -1747,8 +1598,6 @@ fn issue_closed_envelope(
     )
 }
 
-/// Fail closed if the persisted request envelope no longer describes the exact tuple intent and
-/// partition staged with the issue. Activation never trusts worker-supplied provenance.
 #[allow(clippy::too_many_arguments)]
 fn validate_authorization_request(
     request: &EventEnvelope,
@@ -1925,7 +1774,6 @@ fn parse_uuid(field: &str, value: &str) -> Result<Uuid, IssueStoreError> {
     Uuid::parse_str(value).map_err(|_| IssueStoreError::BadInput(format!("{field} must be a UUID")))
 }
 
-/// Canonical uppercase Crockford ULID shape used by durable event ids.
 pub fn is_canonical_request_event_id(value: &str) -> bool {
     value.len() == 26
         && value.as_bytes()[0] <= b'7'

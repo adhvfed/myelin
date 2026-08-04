@@ -1,26 +1,3 @@
-//! **KN-P06 / P-296 — the Knowledge transactional-outbox EMIT seam (emit-iff-committed, KN-D7),
-//! PROVEN against the live dev-stack Postgres `outbox` table.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-knowledge --features integration \
-//!     --test integration_kn_d7_outbox -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires for KN-P06's emit side (the seam
-//! touches the `outbox` table co-commit contract, 2.2/2.3). The seam's [`emit_change`] runs through
-//! the REAL [`myelin_events::OutboxTransaction`] to derive the `knowledge.*` envelopes (per-doc
-//! aggregate = the page/db, §4), and those envelopes are inserted into the REAL frozen §2.3 `outbox`
-//! table (the SAME shape the relay drains, [`myelin_events::OUTBOX_MIGRATION`]) inside ONE Postgres
-//! transaction that ALSO writes the block/row state row — the same-transaction co-commit. We prove:
-//!
-//! - **N block changes committed → N `knowledge.block.updated` rows durable + relay-visible** (0
-//!   lost): the relay's `published_at IS NULL` unsent index would claim exactly these.
-//! - **The SAME state transaction ROLLED BACK → 0 event rows** (emit-iff-committed, KN-D7, 0 ghost):
-//!   no event without its block; the block row and its events roll back together.
-//!
-//! The KN-D7 drill is registered red-until-proven and flips green ONLY here, against the live stack.
 #![cfg(feature = "integration")]
 
 use myelin_events::{
@@ -61,7 +38,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// The three block changes of one page (per-doc aggregate = the page).
 fn block_changes() -> Vec<KnowledgeChange> {
     vec![
         KnowledgeChange::BlockCreated {
@@ -79,10 +55,6 @@ fn block_changes() -> Vec<KnowledgeChange> {
     ]
 }
 
-/// Derive the `knowledge.*` envelopes the seam emits (through the REAL OutboxTransaction so the
-/// `(aggregate, subject)` mapping + the envelope shape are correct-by-construction), returning the
-/// staged rows' `(event_id, aggregate, subject, envelope-json)` ready to insert into the real
-/// `outbox` table.
 fn staged_block_rows() -> Vec<(String, String, String, serde_json::Value)> {
     let store = OutboxStore::new();
     let minter = Arc::new(MonotonicMinter::new()) as Arc<dyn IdMinter>;
@@ -125,7 +97,6 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
     let outbox = format!("outbox_p296_{suffix}");
     let block_tbl = format!("block_p296_{suffix}");
 
-    // ── Apply the REAL frozen §2.3 outbox table (suffixed for isolation) + a block state table. ──
     let outbox_ddl = OUTBOX_MIGRATION
         .replace("EXISTS outbox (", &format!("EXISTS {outbox} ("))
         .replace("ON outbox (", &format!("ON {outbox} ("))
@@ -174,7 +145,6 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
         "INSERT INTO {outbox} (event_id, aggregate, seq, subject, envelope) VALUES ($1,$2,$3,$4,$5)"
     );
 
-    // ── (1) emit-iff-committed: the 3 block rows + the 3 event rows co-commit in ONE transaction. ─
     let mut tx = app
         .begin()
         .await
@@ -209,7 +179,6 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
         .await
         .expect("commit the blocks + events together");
 
-    // N blocks committed → N relay-visible (unsent) knowledge.block.updated/created rows (0 lost).
     let n: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {outbox} \
          WHERE published_at IS NULL AND envelope->>'type_' LIKE 'knowledge.block.%'"
@@ -222,7 +191,6 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
         n, 3,
         "3 block changes committed → 3 relay-visible knowledge.block.* rows (0 lost)"
     );
-    // the block state rows committed too (no block without its event; no event without its block).
     let c: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {block_tbl}"))
         .fetch_one(&app)
         .await
@@ -230,7 +198,6 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
         .get("n");
     assert_eq!(c, 3, "the block state rows co-committed");
 
-    // all three share the PAGE aggregate (per-doc ordering, §4) with contiguous seqs 0,1,2.
     let agg: String = sqlx::query(&format!("SELECT DISTINCT aggregate FROM {outbox}"))
         .fetch_one(&app)
         .await
@@ -241,7 +208,6 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
         "the aggregate is the PAGE (the doc, §4)"
     );
 
-    // ── (2) emit-iff-committed: the SAME state transaction ROLLED BACK → 0 events, 0 blocks. ──
     let mut tx2 = app.begin().await.expect("begin a second state transaction");
     sqlx::query(&format!(
         "INSERT INTO {block_tbl} (block_id, page_id, version) VALUES ('9', '7c2', 99)"
@@ -251,7 +217,6 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
     .expect("write a second block row");
     let rows2 = staged_block_rows();
     for (i, (event_id, aggregate, subject, envelope)) in rows2.iter().enumerate() {
-        // a fresh seq range so a UNIQUE(aggregate,seq) clash can never mask the rollback proof.
         sqlx::query(&insert_outbox)
             .bind(format!("{event_id}-tx2"))
             .bind(aggregate)
@@ -266,7 +231,6 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
         .await
         .expect("ABORT the state transaction (the crash before commit)");
 
-    // aborted state tx → still exactly the 3 committed events + 3 committed blocks (no new rows).
     let n_after: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {outbox} WHERE envelope->>'type_' LIKE 'knowledge.block.%'"
     ))
@@ -288,7 +252,6 @@ async fn emit_iff_committed_n_blocks_n_rows_and_rollback_zero_on_real_postgres()
         "the aborted block row rolled back too (no block without its event)"
     );
 
-    // Cleanup (a NEW forward operation — test teardown, not a down-migration).
     sqlx::query(&format!("DROP TABLE {outbox}"))
         .execute(&admin)
         .await

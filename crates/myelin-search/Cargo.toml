@@ -5,11 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# SRCH-P03 (P-166, M2): the Search service is a `serve(AppSpec)` shell (contract 1.1) — the binary
-# below is the "every service main.rs" the row names: it does nothing but hand the Search AppSpec to
-# the harness's one call (NOT a hand-rolled lifecycle). The library carries the shell builder
-# (`search_app_spec` / `run_search`), the encrypted-from-birth per-tenant index layout, the S1–S5
-# register, and the SRCH-P01/P02 anchors/holder/DEK.
 [[bin]]
 name = "search"
 path = "src/main.rs"
@@ -17,163 +12,45 @@ path = "src/main.rs"
 [lib]
 path = "src/lib.rs"
 
-# myelin-search is a CONSUMER crate (architecture §0/§1): it owns no contract crate and
-# holds only derived, reconstructible state. At M0 (SRCH-P01 → P-021) it carries ONLY the
-# index-document NAME ANCHORS aligned to the frozen EventEnvelope (contract 2.1) + ArtifactRef
-# (contract 5.1) — no mechanism. It therefore depends on:
-#   - myelin-events   → the frozen EventEnvelope field list the index doc aligns to (the
-#                       names/units anchor the drift test reconciles against), which also
-#                       re-exports ArtifactRef / Region / TenantId / DataRole / Visibility /
-#                       PiiKeyRef.
-#   - myelin-tenancy  → the ArtifactRef value type (the doc_id key) + the (tenant, region)
-#                       partition key, named directly so the anchor module reads from the
-#                       definition site.
-# It MUST NOT be depended on by -tenancy/-events/-identity (it is downstream in the §2.9 DAG).
-# The engine + index backends + the permission-aware query pipeline (the path the
-# search-requires-acl-filter lint guards) are the M2 follow-on (SRCH-P03..SRCH-P16); they pull
-# in myelin-query / myelin-identity / myelin-gdpr / myelin-content then, not at this M0 floor.
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-events = { path = "../myelin-events" }
 
-# SRCH-P02 (P-122, M1) consumer dependencies — Search registers into the platform GDPR/KMS/residency
-# substrate (holder registration + per-tenant index DEK + residency-pin confirmation). Like
-# myelin-refs-service (REF-P3/P4), Search is a LEAF CONSUMER above these glue crates and is OUTSIDE
-# the eleven-crate library DAG modelled by myelin-substrate::crate_graph (it is not a Crate::* node),
-# so adding these does NOT mutate the modelled DAG (substrate stays root; nothing depends back on
-# Search). The acyclicity holds: -gdpr/-storage/-substrate never depend on -search.
-#   - myelin-gdpr      → the PersonalDataHolder contract (10.1) + the receipt/scope/SubjectRef types
-#                        Search IMPLEMENTS as holder H7 (stub surface now; real purge+reindex SRCH-P15).
-#   - myelin-storage   → the KMS hierarchy (11.3/11.4: KmsEngine + KeyClass + PiiKeyRef) the Search
-#                        per-tenant index DEK is reserved in + the KeyOrigin/IndexAdmission HYOK gate.
-#   - myelin-substrate → the holder registry (StoreKind/HolderRegistry, contract 1.4) + the H1–H18
-#                        catalog (Holder::H7SearchIndex + classify_store + the completeness assertion).
-#   - myelin-identity  → Principal — the verified subject the holder's locate/erase key on (via
-#                        SubjectRef). (Promoted from dev-only: the holder surface now uses it in prod.)
 myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-substrate = { path = "../myelin-substrate" }
 myelin-identity = { path = "../myelin-identity" }
 
-# ------------------------------------------------------------------------------------------
-# SRCH-P04 (P-167, M2): the IndexBackend trait + the Tantivy v1 reference engine + the FT-inverted
-# and structured/columnar shapes (architecture §2.1/§2.2/§3.1/§3.2). NEW consumer edges, both
-# DAG-safe (Search stays a terminal leaf consumer; nothing depends back on it):
-#   - myelin-query  → the FROZEN FieldType enum (contract 13.3) the structured/columnar shape is
-#                     typed BYTE-IDENTICALLY over (FieldType/FieldValue/OrderKey) — the same enum
-#                     Issues'/Knowledge's compilers use. (myelin-query is mid-tier; Search is a
-#                     downstream consumer of it — the §2.9 edge holds.)
-#   - tantivy       → the in-process v1 reference search engine behind the IndexBackend trait. A
-#                     pure-Rust, single-binary library (NOT a network backend): it is part of the
-#                     default `cargo build --workspace` (the build stays DB-free — Tantivy writes a
-#                     local on-disk/RAM index directory, it is not the Postgres/S3/NATS data layer).
-#                     OpenSearch is the reserved per-cell upgrade behind the SAME trait (M5/§6.2).
 myelin-query = { path = "../myelin-query" }
 tantivy = { workspace = true }
 
-# SRCH-P06 (P-169, M2): the near-real-time incremental indexer reads the references-not-payloads
-# `EventEnvelope.payload` (a `serde_json::Value`) to extract the zookie/version/refs the index doc is
-# stamped from — so serde_json is now a PROD dependency (it was test-only before). No new myelin edge;
-# Search stays a terminal leaf consumer.
 serde_json = { workspace = true }
 
-# GIT-P5 (P-231): `IndexSpec` derives `Serialize` so a producer's owned spec half (git's
-# code-projection spec) can be proven byte-stable against the frozen contract-6.3 wire keys in its
-# CDC. The serialized shape IS the declare_indexable wire contract; serde derive is the mechanism.
 serde = { workspace = true }
 
-# SRCH-P17 (P-260, M3): Search wires the real KNOWLEDGE producer corpus into the index. The KN
-# declare_indexable IndexSpec + the block/page/row/field SearchProjection builder (`kn_projection`)
-# consume the FROZEN `myelin-content` taxonomy (contract 13.1) — the canonical `Block`/`Inline`
-# block + the three structured inline nodes (mention/artifact_ref/embed) Search indexes as dependable
-# facets, and `Block::CodeBlock.text` raw (X-2). This is the §0/§1 consumer edge the Search crate
-# docs always named ("it composes … `myelin-content`"). DAG-safe: Search is a terminal leaf consumer;
-# `myelin-content` is a mid-tier freeze crate that does NOT depend back on Search (no cycle). KN has
-# NO service crate yet (unlike git, whose code-projection spec lives in `myelin-git`), so KN's owned
-# IndexSpec is modelled HERE against the frozen taxonomy it consumes — the wiring the prompt's
-# DELIVERABLE places "in the myelin-search service crate". The engine is UNCHANGED.
 myelin-content = { path = "../myelin-content" }
 
-# SRCH-P19 (P-262, M3): Search indexes SUB-ARTIFACT-GRANULAR + CONTENT-ANCHORED projections (doc
-# blocks `b<id>`/`h<id>`, KN db rows/fields `row-`/`field-`, Git content-anchored line-ranges
-# `L<a>-L<b>`). The `#sub` grain is keyed off the ONE FROZEN grammar `myelin_refs::sub_kind`/`Sub`/
-# `SubKind` (contract 5.7) — Search does NOT re-implement the grammar (EI-01 §7: never a second
-# parser). `myelin-refs` is a leaf grammar crate (it depends only on -tenancy/-identity/-events and
-# NEVER back on Search), so this consumer edge is DAG-safe: Search stays a terminal leaf consumer.
-# Search keys the doc at the right grain + pins the ACL on the #sub-stripped parent; the owner's
-# `project` re-derives the content-anchored span (the index never stores a raw line number, §3.1/§4.9).
 myelin-refs = { path = "../myelin-refs" }
 
-# TEST-ONLY. The names/units drift test constructs a canonical EventEnvelope (which embeds a
-# Principal from myelin-identity, now a prod dep above) to read the REAL frozen field names off a
-# value, and confirms the search-requires-acl-filter lint (its home is the shared myelin-lints
-# ratchet crate; SRCH-P01 confirms it in place rather than duplicating it — EI-01 §7). The lint crate
-# is not a production dependency; it is the harness the lint proof runs against.
-
-# ------------------------------------------------------------------------------------------
-# SRCH-P03 (P-166, M2): the per-tenant index-directory forward-only migration (contract 1.5)
-# gets PROVEN against the live dev-stack Postgres in tests/integration_srch_p03_index_directory.rs
-# (the CREATE applies forward-only; the (tenant, region) PK keys per-tenant directories; the
-# migration is non-destructive). The OPTIONAL sqlx + tokio deps are pulled ONLY by
-# `--features integration` — the default `cargo build --workspace` / `cargo test --workspace` stay
-# DB-free. EXTERNAL crates only; no new myelin edge — Search stays a terminal leaf consumer. The
-# test reads DATABASE_URL inline (no myelin-config edge — same posture as refs-service/identity).
-# ------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
-# MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
-# foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
-# (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
-# bridge requires) is now a regular dep. Build stays DB-free: connecting happens at RUNTIME.
 tokio = { workspace = true, features = ["signal"] }
 
-# SRCH-P30 (P-463, M5): the object-store index backstop swap (the fs-backed BlobStore ->
-# object-store swap, contract 11.2) gets PROVEN against the LIVE dev-stack object store (RustFS /
-# Scaleway via `myelin_storage::s3blob::S3BlobStore`) in
-# tests/integration_srch_p30_object_store_backstop.rs. The OPTIONAL `myelin-config` (the dev S3
-# endpoint/creds) + `myelin-storage/integration` (the real `s3blob` module is `#[cfg(feature =
-# "integration")]` in storage) are pulled ONLY by `--features integration` — the default
-# `cargo build --workspace` stays DB-free. No new modelled-DAG edge: `myelin-config` is leaf config
-# and Search already depends on `myelin-storage` (Search stays a terminal leaf consumer).
-# (regular since W3b.4 — the durable main.rs reads the env-first durable config, fail-loud.)
 myelin-config = { path = "../myelin-config" }
 
 [features]
 default = []
-# MR-009b Wave 5 — the `test-support` cargo feature (alias `memory`). Gates this crate's in-process
-# E2E-wedge/dogfood drill runners (`run_e2e_3_spec_to_ship` / `run_e2e_4_dsar_fanout` /
-# `run_search_e2e_wedge` / `run_search_over_myelins_own_work`), which construct the in-memory
-# `KmsEngine` test double — so it forwards to `myelin-storage/test-support` (where the double
-# lives). DEV/TEST only — never enabled by a production dependency edge.
 test-support = ["myelin-storage/test-support"]
 memory = ["test-support"]
-# (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
-# feature now pulls the raw-sqlx test harness + the live storage backends.)
 integration = [
     "dep:sqlx",
     "myelin-storage/integration",
 ]
 
 [dev-dependencies]
-# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
-# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
-# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
-# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests. DEV-only.
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# MR-009b Wave 5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
-# tests-dir targets (the e2e-wedge/dogfood drills call the now-gated in-process runners). The same
-# posture as the myelin-identity-service self dev-dependency (Wave 2).
 myelin-search = { path = ".", features = ["test-support"] }
 myelin-lints = { path = "../myelin-lints" }
 serde_json = { workspace = true }
 
-# SRCH-P14 (P-177, M2): the telemetry-assertion library is the CONSUMER side of the contract-1.8
-# signal set — `myelin_harness::telemetry::SignalSource` reads each §4.11 signal back off the
-# SearchTelemetry snapshot and `assert_signal`/`assert_labelled`s it (a missing signal fails the
-# gate; observability is part of the pass, EI-01 §3). It is a DEV-only dependency: the harness is
-# the test-support failure-injection harness and must NEVER appear in a production crate's
-# [dependencies] (its own crate docs are explicit). The Search prod telemetry module is a
-# self-contained typed snapshot (the producer); this test wires the harness reader to it.
 myelin-harness = { path = "../myelin-harness" }

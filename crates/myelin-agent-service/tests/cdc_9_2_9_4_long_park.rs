@@ -1,21 +1,3 @@
-//! # The CDC pair for contracts 9.2 / 9.4 — the `SCHEDULE_AND_RUN_JOB` long-park idiom
-//! CONSUMED by the Agent-Fabric (AG-P16 → P-228, M2-C)
-//!
-//! **Contract:** `planning/05-refined-shared-systems-architecture/contract-index.md` rows 9.2
-//! (`WfCtx::schedule_and_run_job` — the long-park idiom: dispatch-and-return) + 9.4 (the `job.done`
-//! durable signal idempotent on `idem_token`). Owning architecture: `agent-fabric.md` §5.6 (a run is
-//! a durable workflow + the `SCHEDULE_AND_RUN_JOB` long-park idiom (C5) — *the Fabric CONSUMES this
-//! idiom; it does not reinvent durable waits*).
-//!
-//! The Agent-Fabric long-park ([`dispatch_long_compute`]) is the CONSUMER of the 9.2/9.4 idiom: it
-//! dispatches a long `kind=agent` `ToolHands::exec` job through the engine's `schedule_and_run_job`,
-//! the run PARKS holding no runtime, and a durable `job.done` signal resumes it. This pair stands the
-//! PRODUCER side (the runner that runs the job for hours and then delivers `job.done`) against the
-//! consumer and proves the **no-coordination dedup agreement**: the runner derives the SAME
-//! deterministic `idem_token` from `(run_id, command_id)` that the workflow keyed its wait on (via the
-//! exposed [`job_idem_token`]), echoes it on `job.done`, and a DOUBLE delivery wakes the run EXACTLY
-//! once. The parked run holds no runtime (the worker is freed between dispatch and completion).
-
 use myelin_agent::{Command, EffectKind, ToolDef, ToolName};
 use myelin_agent_service::escape_gate::{AgentExecGate, ProductionBackendId};
 use myelin_agent_service::{dispatch_long_compute, LongComputeProfile};
@@ -37,12 +19,6 @@ use myelin_tenancy::{Region, TenantId};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// **PRODUCER side of 9.2/9.4 (the unified-sandbox runner, async-dispatch role).** It accepts the
-/// hardened `kind=agent` job asynchronously (the dispatch returns immediately — the run parks) and
-/// RECORDS the dispatch `idem_token` the workflow stamped on it. The producer (the runner) and the
-/// consumer (the workflow) derive the SAME deterministic token from `(run_id, command_id)` WITHOUT a
-/// coordination round-trip — this fixture asserts the stamped token equals the one the workflow keys
-/// its `wait_for_signal` on. A real runner would run the guest for hours; here we record the accept.
 #[derive(Default)]
 struct UnifiedRunnerProducer {
     accepted_tokens: Mutex<Vec<String>>,
@@ -56,7 +32,6 @@ impl SandboxBackend for UnifiedRunnerProducer {
         _spec: &SandboxJobSpec,
         _hooks: &RunnerHooks,
     ) -> Result<SandboxLaunch, SandboxLaunchError<Self::Error>> {
-        // the in-line launch is unused on the long-park path.
         Ok(SandboxLaunch {
             handle: SandboxHandle {
                 guest_id: "unused".into(),
@@ -73,8 +48,6 @@ impl SandboxBackend for UnifiedRunnerProducer {
     }
     fn accept_async(&self, spec: &SandboxJobSpec) -> Result<(), Self::Error> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        // RECORD the dispatch idem_token the workflow stamped (the no-coordination dedup key the
-        // runner will echo on job.done).
         self.accepted_tokens
             .lock()
             .unwrap()
@@ -133,8 +106,6 @@ fn compute_def() -> ToolDef {
         exposed_over_mcp: false,
     }
 }
-/// A real GREEN AG-D4 gate (AG-P17 → P-229) — the structural fail-closed prerequisite the long-park
-/// dispatcher requires to exist at all. Minted from the corpus parser (never hardcoded).
 fn green_gate() -> AgentExecGate {
     let id = ProductionBackendId {
         backend: Backend::FirecrackerMicrovm,
@@ -188,10 +159,6 @@ fn profile() -> LongComputeProfile {
     }
 }
 
-/// **CONSUMER drives the 9.2 dispatch-and-return; the run PARKS holding no runtime (§5.6).** A long
-/// compute with no buffered `job.done` dispatches the hardened job onto the runner (one async accept)
-/// and the run parks (`state=waiting`) — the worker is freed (it did NOT block on the two-hour job).
-/// The runner RECORDED the deterministic dispatch `idem_token` the consumer will key its wait on.
 #[test]
 fn long_park_dispatches_and_parks_holding_no_runtime() {
     let outbox = OutboxStore::new();
@@ -226,8 +193,6 @@ fn long_park_dispatches_and_parks_holding_no_runtime() {
         "dispatched exactly once"
     );
 
-    // PRODUCER + CONSUMER agree on the deterministic dedup key WITHOUT coordination: the token the
-    // runner RECORDED equals the one the workflow keyed its wait on (derived from run_id+command_id).
     let consumer_token = job_idem_token("R1", "agent.run:0");
     let accepted = runner.accepted_tokens.lock().unwrap();
     assert_eq!(accepted.len(), 1, "one async dispatch");
@@ -237,11 +202,6 @@ fn long_park_dispatches_and_parks_holding_no_runtime() {
     );
 }
 
-/// **CONSUMER + PRODUCER prove 9.4 — a DOUBLY-delivered `job.done` wakes the long-parked run EXACTLY
-/// once (§5.6).** The runner finishes the (long) job and delivers `signal(run, "job.done", {result},
-/// idem_key = idem_token)` — delivered TWICE (at-least-once under the bus, both on the SAME
-/// deterministic token). The engine's `wf_signal` PK dedups to ONE buffered row; the consumer wakes
-/// EXACTLY once and consumes the result once. 1 wake per job, never two.
 #[test]
 fn a_doubly_delivered_job_done_wakes_the_long_parked_run_exactly_once() {
     let outbox = OutboxStore::new();
@@ -249,7 +209,6 @@ fn a_doubly_delivered_job_done_wakes_the_long_parked_run_exactly_once() {
     let signals = SignalStore::new();
     let runner = UnifiedRunnerProducer::default();
 
-    // The PRODUCER derives the SAME deterministic token (no coordination) and delivers job.done TWICE.
     let token = job_idem_token("R1", "agent.run:0");
     let result = vec![ArtifactRef("myelin://acme/agent/trace/green".into())];
     for _ in 0..2 {

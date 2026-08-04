@@ -1,38 +1,3 @@
-//! # Integration — SRCH-P20 (P-338, M4): Search indexes the REAL Issues corpus
-//!
-//! **Drill source:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` SRCH-D1 (F1 — the
-//! zero-escape leak: a confidential issue NEVER in any result incl. counts) + SRCH-D3 (F2 —
-//! cross-tenant IDOR = 0), the gate-invariant ratchet **re-confirmed on the REAL Issues corpus** (the
-//! M2 drills re-run on each new producer corpus). **Architecture:** `search-and-indexing.md` §3.1 (the
-//! FieldType-typed facets; the `order_key` LexoRank columnar fast-field for sort, byte-identical to
-//! Issues'/Knowledge's), §4.6.1 (the GIN-scan custom-field path + the measured projection-feeder
-//! promotion follow-on). **Contracts:** 6.3 (consume Issues' IndexSpec), 13.3 (the FieldType facets +
-//! order_key).
-//!
-//! ## What this proves (the dated green artifact, 2026-06-23)
-//! The REAL Issues corpus is projected through [`myelin_search::issue_search_projection`] (Issues'
-//! consumed 6.3 projection) into the LIVE [`IncrementalIndexer`] per-event pipeline (project-fetch →
-//! analyze → upsert), then queried back through the engine surface. The GATE:
-//!
-//! 1. **Issues indexing correctness** — a facet query returns the right issue (the typed columnar
-//!    equality); results sort by `order_key` (the LexoRank columnar fast-field, ascending byte order);
-//!    a board/custom-field query works via the GIN scan.
-//! 2. **SRCH-D1 (F1) on the Issues corpus** — a CONFIDENTIAL issue never appears in ANY result (FT or
-//!    structured facet) incl. counts, for an unauthorized viewer; a grant ⇒ it appears (the rejection
-//!    was the ACL firing, not a blanket deny).
-//! 3. **SRCH-D3 (F2) on the Issues corpus** — a viewer's tenant partitions the index; a cross-tenant
-//!    query sees 0 of the other tenant's issues (the per-tenant index, partition-keyed).
-//!
-//! The ENGINE is UNCHANGED — this is producer-corpus wiring (the prompt's DoD). No mutation-core
-//! module is added; the SRCH-P09 mutation floor still holds on the real Issues corpus (the SetExpr ACL
-//! conjoin decision logic is the same one those drills mutation-test; here it runs on Issues content).
-//!
-//! ## Floor named
-//! The GIN-indexed JSONB facet scan for the Issues board facets serves correctly here; the **measured
-//! projection-feeder promotion** to a generated index (per facet at > 5% of view executions, OQ-C) is
-//! the M5 follow-on **SRCH-P27** — promotion changes COST, never correctness. The Issues Tier-3
-//! board-escalation valve is the sibling slice **SRCH-P21**.
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -50,10 +15,6 @@ use myelin_search::{
     SearchProjection, ISSUE_FACET_PRIORITY, ISSUE_FACET_STATE_CATEGORY, ORDER_KEY_FIELD,
 };
 
-// ----------------------------------------------------------------------------------------------
-// fixtures — the REAL Issues corpus projected through Issues' consumed 6.3 spec
-// ----------------------------------------------------------------------------------------------
-
 fn tenant() -> TenantId {
     TenantId("acme".into())
 }
@@ -68,9 +29,6 @@ fn viewer(id: &str, t: &str) -> Principal {
     )
 }
 
-/// A scripted [`ProjectFetcher`] over a `ref → SearchProjection` map — the owner's `project(ref,
-/// viewer)` (5.6). The REAL Issues corpus is built by [`issue_search_projection`] over the typed
-/// issue inputs, so this fetcher serves Issues' genuine 6.3 projection (NOT a DB read).
 #[derive(Default)]
 struct IssueFetcher {
     projections: Mutex<BTreeMap<String, SearchProjection>>,
@@ -124,7 +82,6 @@ fn event_in(id: &str, type_: &str, subject: &str, t: &str) -> EventEnvelope {
     ev
 }
 
-/// Build the indexer over the REAL Issues spec (the `issue` declare_indexable shape).
 fn issue_indexer(fetcher: Arc<IssueFetcher>) -> IncrementalIndexer {
     IncrementalIndexer::new(
         issue_index_specs(),
@@ -133,8 +90,6 @@ fn issue_indexer(fetcher: Arc<IssueFetcher>) -> IncrementalIndexer {
     )
 }
 
-/// A typed issue projection input with the given board facets + body. The `rank` is the LexoRank
-/// fractional index (stamped under the order_key convention by the builder).
 #[allow(clippy::too_many_arguments)]
 fn issue_input(
     body: &str,
@@ -158,13 +113,6 @@ fn issue_input(
     }
 }
 
-// ----------------------------------------------------------------------------------------------
-// 1. Issues indexing correctness — typed facets + order_key sort + the GIN scan
-// ----------------------------------------------------------------------------------------------
-
-/// **A facet query returns the right issue (the typed columnar equality), and the body is searchable.**
-/// The REAL Issues corpus is projected through Issues' consumed 6.3 spec and indexed through the live
-/// per-event pipeline.
 #[test]
 fn issues_index_and_facet_query_returns_the_right_issue() {
     let started = "myelin://acme/issue/issue/ENG-1";
@@ -208,7 +156,6 @@ fn issues_index_and_facet_query_returns_the_right_issue() {
 
     let acl = AclFilter::ids([started, backlog]);
 
-    // FT: the body is searchable (a title/body term hits its issue).
     let ft = ix
         .search_ft(&tenant(), &region(), &acl, "deadlock", 10)
         .expect("ft search");
@@ -221,7 +168,6 @@ fn issues_index_and_facet_query_returns_the_right_issue() {
         "the body term does not find the unrelated backlog issue"
     );
 
-    // The structured facet equality: state_category == started → exactly the started issue.
     let by_state = ix
         .search_structured(
             &tenant(),
@@ -236,16 +182,11 @@ fn issues_index_and_facet_query_returns_the_right_issue() {
     assert_eq!(by_state[0].doc_id, started);
 }
 
-/// **Results sort by `order_key` (the LexoRank columnar fast-field), ascending byte order (§3.1).** A
-/// structured facet scan over a shared facet returns the matching issues in their board rank order —
-/// the columnar-fast-field-for-sort deliverable.
 #[test]
 fn issues_sort_by_order_key_columnar_fast_field() {
-    // Three issues in the SAME state (so the facet scan returns all three), with deliberately
-    // OUT-OF-ORDER insert order but DISTINCT LexoRank ranks. The scan must return them in rank order.
-    let last = OrderKey::bisect(None, None); // "U"-ish midpoint
-    let first = OrderKey::bisect(None, Some(&last)); // prepend before `last`
-    let middle = OrderKey::bisect(Some(&first), Some(&last)); // strictly between
+    let last = OrderKey::bisect(None, None);
+    let first = OrderKey::bisect(None, Some(&last));
+    let middle = OrderKey::bisect(Some(&first), Some(&last));
     assert!(
         first < middle && middle < last,
         "the three ranks are strictly ordered (LexoRank byte order)"
@@ -256,8 +197,6 @@ fn issues_sort_by_order_key_columnar_fast_field() {
     let r_last = "myelin://acme/issue/issue/ENG-102";
 
     let fetcher = Arc::new(IssueFetcher::default());
-    // Insert in a scrambled order (last, first, middle) — the SORT must come from the order_key, not
-    // the insert order.
     fetcher.put(
         r_last,
         issue_search_projection(&issue_input(
@@ -321,9 +260,6 @@ fn issues_sort_by_order_key_columnar_fast_field() {
     );
 }
 
-/// **A board/custom-field query works via the GIN scan (§4.6.1).** A structured equality on the
-/// `priority` facet returns exactly the matching issues. The GIN scan serves correctly; the measured
-/// projection-feeder promotion is the M5 follow-on (SRCH-P27).
 #[test]
 fn issues_board_facet_query_via_gin_scan() {
     let p1 = "myelin://acme/issue/issue/ENG-10";
@@ -375,7 +311,6 @@ fn issues_board_facet_query_via_gin_scan() {
         .expect("index p3");
 
     let acl = AclFilter::ids([p1, p2, p3]);
-    // The GIN-scan facet query: priority == P1 (1) → exactly the two P1 issues.
     let hits = ix
         .search_structured(
             &tenant(),
@@ -399,20 +334,11 @@ fn issues_board_facet_query_via_gin_scan() {
     );
 }
 
-// ----------------------------------------------------------------------------------------------
-// 2. SRCH-D1 (F1) — the zero-escape leak on the REAL Issues corpus (the confidential issue)
-// ----------------------------------------------------------------------------------------------
-
-/// **SRCH-D1 (F1) re-confirmed on the Issues corpus: a CONFIDENTIAL issue never appears in ANY result
-/// (FT or structured facet) incl. counts, for an unauthorized viewer — and a grant makes it appear
-/// (the rejection was the ACL firing, not a blanket deny).**
 #[test]
 fn srch_d1_confidential_issue_never_leaks() {
     let visible = "myelin://acme/issue/issue/ENG-50";
     let confidential = "myelin://acme/issue/issue/ENG-51";
     let fetcher = Arc::new(IssueFetcher::default());
-    // BOTH issues carry the SAME rare term + the SAME facet — so a leak would be exposed by
-    // FT/count/IDF inference OR by a facet-count leak.
     fetcher.put(
         visible,
         issue_search_projection(&issue_input(
@@ -448,12 +374,8 @@ fn srch_d1_confidential_issue_never_leaks() {
         "both issues are indexed"
     );
 
-    // The unauthorized viewer's reachable set is JUST the visible issue — the confidential issue is
-    // NOT in it (an issue's reachability is its ReBAC `view` MINUS the `- confidential` set-difference;
-    // here that resolves to the confidential issue being absent from the allow-set).
     let acl_unauth = AclFilter::ids([visible]);
 
-    // FT: the shared rare term `zarquon` — only the visible issue surfaces; the confidential one never.
     let ft = ix
         .search_ft(&tenant(), &region(), &acl_unauth, "zarquon", 10)
         .expect("ft");
@@ -468,7 +390,6 @@ fn srch_d1_confidential_issue_never_leaks() {
         "0 leak: the confidential issue never surfaces in FT"
     );
 
-    // Structured facet: even on the SHARED state_category facet, the confidential issue never surfaces.
     let by_state = ix
         .search_structured(
             &tenant(),
@@ -489,7 +410,6 @@ fn srch_d1_confidential_issue_never_leaks() {
         "0 leak: the confidential issue never surfaces in a structured facet scan"
     );
 
-    // The chained grant: the viewer is now granted the confidential issue → it becomes visible.
     let acl_granted = AclFilter::ids([visible, confidential]);
     let granted = ix
         .search_ft(&tenant(), &region(), &acl_granted, "zarquon", 10)
@@ -505,16 +425,8 @@ fn srch_d1_confidential_issue_never_leaks() {
     );
 }
 
-// ----------------------------------------------------------------------------------------------
-// 3. SRCH-D3 (F2) — cross-tenant IDOR = 0 on the REAL Issues corpus
-// ----------------------------------------------------------------------------------------------
-
-/// **SRCH-D3 (F2) re-confirmed on the Issues corpus: a viewer's tenant partitions the index — a query
-/// against a DIFFERENT tenant's index sees 0 of this tenant's issues (the per-tenant index, §3.4).**
 #[test]
 fn srch_d3_cross_tenant_issues_do_not_leak() {
-    // Two tenants index an issue under a COLLIDING doc-id namespace, so only the partition key
-    // (tenant, region) keeps them apart — not a lucky id difference.
     let acme_issue = "myelin://acme/issue/issue/ENG-1";
     let evil_issue = "myelin://evil/issue/issue/ENG-1";
     let fetcher = Arc::new(IssueFetcher::default());
@@ -551,7 +463,6 @@ fn srch_d3_cross_tenant_issues_do_not_leak() {
     let acme_t = TenantId("acme".into());
     let evil_t = TenantId("evil".into());
 
-    // Positive control: acme's viewer querying acme's index sees acme's issue.
     let acme_hits = ix
         .search_ft(
             &acme_t,
@@ -566,8 +477,6 @@ fn srch_d3_cross_tenant_issues_do_not_leak() {
         "acme sees its own issue"
     );
 
-    // The cross-tenant attack: even with an allow-set NAMING the evil issue's doc-id, querying ACME's
-    // partition returns 0 — the evil issue lives in a DIFFERENT (tenant, region) index entirely.
     let cross = ix
         .search_ft(
             &acme_t,
@@ -582,7 +491,6 @@ fn srch_d3_cross_tenant_issues_do_not_leak() {
         "0 cross-tenant: acme's index holds none of evil's issues"
     );
 
-    // And the evil tenant's index, conversely, holds only evil's issue.
     let evil_hits = ix
         .search_ft(
             &evil_t,
@@ -598,14 +506,6 @@ fn srch_d3_cross_tenant_issues_do_not_leak() {
     );
 }
 
-// ----------------------------------------------------------------------------------------------
-// 4. The order_key facet uses Search's columnar-sort convention (the documented `rank` mapping)
-// ----------------------------------------------------------------------------------------------
-
-/// **The projection stamps the LexoRank rank under the `order_key` convention (NOT the producer's
-/// `rank` board name).** This is the documented `rank`→`order_key` reconciliation: the engine sorts on
-/// the one dedicated `order_key` columnar fast-field, so the consumed projection emits the rank under
-/// that convention. The value/encoding/type are byte-identical LexoRank.
 #[test]
 fn issue_projection_emits_rank_under_order_key_convention() {
     let rank = OrderKey::bisect(None, None);

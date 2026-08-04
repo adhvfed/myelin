@@ -1,16 +1,3 @@
-//! Live-PostgreSQL proof for the CT-007 `ci.pipeline` definition CUTOVER FENCE.
-//!
-//! A version bump strands every non-terminal run pinned to the old version: a Flow worker claims
-//! only locally-registered `(wf_type, version)` keys, so a v3-only binary can never drive a v2 row.
-//! A preflight `SELECT` cannot prevent that — an old-binary starter transaction already in flight
-//! can commit a fresh v3 workflow after the snapshot. The fence closes it by reusing the lock the
-//! old binary ALREADY takes: `validate_definition_pin` holds `wf_definition@3 FOR SHARE` until its
-//! start transaction resolves, so the cutover's `FOR UPDATE` on that row is genuine mutual
-//! exclusion.
-//!
-//! The two barrier drills below are the load-bearing tests, run at the same rigor as the
-//! preparation/launch CAS race: real concurrent connections, a real `std::sync::Barrier`, and a
-//! positive proof that the loser is genuinely BLOCKED rather than merely slower.
 #![cfg(feature = "integration")]
 
 mod common;
@@ -28,8 +15,6 @@ use myelin_config::MyelinConfig;
 use myelin_tenancy::Region;
 use sqlx::{Acquire, Executor, PgPool, Row};
 
-/// Independent `PgMigrator` sequences against one live PostgreSQL deadlock on the migration
-/// advisory lock when run concurrently.
 static MIGRATION_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const TENANT: &str = "cutover-tenant";
@@ -77,10 +62,6 @@ fn schema_name(tag: &str) -> String {
     )
 }
 
-
-
-/// A schema carrying the real Flow + CI migration sets, with `ci.pipeline@3` seeded `active` — the
-/// pre-cutover registry state a rolling deploy actually starts from.
 async fn cutover_schema(tag: &str) -> (String, PgPool, PgPool) {
     let schema = schema_name(tag);
     let bootstrap = pinned_pool(&admin_url(), "public", 2).await;
@@ -118,16 +99,8 @@ async fn cutover_schema(tag: &str) -> (String, PgPool, PgPool) {
     )
     .await
     .unwrap();
-    // Install a SCHEMA-LOCAL copy of the database-wide probe from the SAME production DDL text,
-    // rewritten to this schema (the `.replace(...)` fixture convention this crate already uses for
-    // `job_queue`/`workflow_run`). Without it the probe would read `public.workflow_run` and be
-    // blind to every row these isolated tests seed. `cutover_definition` names the function
-    // unqualified, so the connection's `search_path` selects this copy.
     install_schema_local_probe(&admin, &schema).await;
     install_schema_local_readiness_probe(&admin, &schema).await;
-    // `ci_0022d` seeds the predecessor row as `retired` (the fresh-database sentinel). These tests
-    // model an EXISTING fleet mid-rolling-deploy, so promote it to the deployed-v3 shape: an active
-    // row carrying a real-looking legacy hash.
     sqlx::query(
         "INSERT INTO wf_definition (wf_type, version, code_hash, status)
          VALUES ('ci.pipeline', $1, 'blake3:legacy-v3-hash', 'active')
@@ -141,13 +114,6 @@ async fn cutover_schema(tag: &str) -> (String, PgPool, PgPool) {
     (schema, bootstrap, admin)
 }
 
-/// **The schema-local mirror of the production probe.** The production `ci_0020h` DDL is one
-/// transaction that VERIFIES operator provisioning and then creates the function in the real
-/// `myelin_ci_security` schema — neither of which an isolated per-test schema can satisfy. So the
-/// fixture builds the same function shape (same owner, volatility, security, `proconfig` and body,
-/// pointed at this schema's `workflow_run`) and the factory's test seam points the fence at it. The
-/// PRODUCTION shape itself is asserted separately, against the real `public`/`myelin_ci_security`
-/// objects, by `the_backlog_probe_is_executable_only_by_the_runtime_role`.
 async fn install_schema_local_probe(admin: &PgPool, schema: &str) {
     admin
         .execute(
@@ -171,8 +137,6 @@ async fn install_schema_local_probe(admin: &PgPool, schema: &str) {
         .expect("install the schema-local backlog probe as the fence role");
 }
 
-/// A pool whose connections carry a unique `application_name`, so `pg_stat_activity` can identify
-/// exactly which backend is lock-waiting rather than "some backend touching wf_definition".
 async fn tagged_pool(url: &str, schema: &str, application_name: &str, connections: u32) -> PgPool {
     let schema = schema.to_owned();
     let application_name = application_name.to_owned();
@@ -199,7 +163,6 @@ async fn tagged_pool(url: &str, schema: &str, application_name: &str, connection
         .expect("connect the tagged pool")
 }
 
-/// The production cutover factory, over the given pool.
 async fn cutover_factory(
     pool: &PgPool,
     schema: &str,
@@ -215,18 +178,12 @@ async fn cutover_factory(
         tokio::runtime::Handle::current(),
     )
     .unwrap()
-    // Production resolution stays `public.`-qualified (round-3 blocker 3). A schema-isolated
-    // fixture cannot see `public.workflow_run`, so it points the fence at its OWN schema's copy of
-    // the probe through the dedicated test seam rather than the production call being weakened.
     .with_backlog_probe_call_for_tests(format!(
         "SELECT {schema}.myelin_ci_pipeline_version_has_nonterminal_runs($1)"
     ))
     .replace_activation_readiness_probe_call_for_tests(schema_local_readiness_call(schema))
 }
 
-/// The scheduler-shaped diagnostic discovery these tests pass to the cutover. Real deployments pass
-/// `CiSchedulerDbProvider::region_run_discovery()`; the verdict authority is the global probe either
-/// way, so an admin-backed discovery is honest here.
 fn diagnostics(admin: &PgPool) -> myelin_ci_controlplane::CiRegionRunDiscovery {
     ci_region_run_discovery_test_support(admin.clone())
 }
@@ -257,8 +214,6 @@ async fn seed_workflow_run(admin: &PgPool, region: &str, run_id: &str, version: 
     .unwrap();
 }
 
-/// Is `pid` genuinely waiting on a lock right now? This is what turns "the other side hasn't
-/// finished yet" into a positive proof of blocking.
 async fn is_blocked_on_lock(observer: &PgPool, pid: i32) -> bool {
     sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (
@@ -279,10 +234,8 @@ async fn wait_until_blocked(observer: &PgPool, pid: i32) {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("connection {pid} never entered a lock wait — the fence is not actually exclusive");
+    panic!("connection {pid} never entered a lock wait - the fence is not actually exclusive");
 }
-
-// ═════════════ 1. old admission wins the lock ════════════════════════════════════════════════════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_its_workflow() {
@@ -290,7 +243,6 @@ async fn an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_it
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("old_wins").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // Connection A: the EXACT lock the old v3 starter takes, held open across a barrier.
         let mut old_admission = admin.acquire().await.unwrap();
         let mut old_tx = old_admission.begin().await.unwrap();
         let locked: Option<String> = sqlx::query_scalar(
@@ -307,9 +259,6 @@ async fn an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_it
             "the old binary sees v3 active and proceeds"
         );
 
-        // Connection B: attempt the cutover concurrently on a UNIQUELY TAGGED pool, so the
-        // lock-wait proof identifies THIS backend rather than accepting any concurrent activity on
-        // the shared dev database (round-3 finding 6).
         let cutover_tag = format!("myelin-cutover-old-wins-{}", std::process::id());
         let cutover_pool = tagged_pool(&admin_url(), &schema, &cutover_tag, 2).await;
         let factory = cutover_factory(&cutover_pool, &schema).await;
@@ -317,7 +266,6 @@ async fn an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_it
         let cutover =
             tokio::spawn(async move { factory.cutover_definition(&diagnostics_owned).await });
 
-        // Wait until a backend WITH THAT EXACT application_name is blocked on a lock.
         let observer = pinned_pool(&admin_url(), &schema, 2).await;
         let mut waiting_pid = None;
         for _ in 0..400 {
@@ -357,7 +305,6 @@ async fn an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_it
             "the cutover cannot have completed while the old admission holds the fence"
         );
 
-        // A now commits a fresh v3 workflow — exactly the race a preflight SELECT would have missed.
         sqlx::query(
             "INSERT INTO workflow_run (
                tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
@@ -372,7 +319,6 @@ async fn an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_it
         .unwrap();
         old_tx.commit().await.unwrap();
 
-        // B wakes, its post-lock snapshot SEES the committed v3 run, and it refuses.
         let refusal = cutover
             .await
             .unwrap()
@@ -382,7 +328,6 @@ async fn an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_it
             "expected a backlog refusal, got {refusal:?}"
         );
 
-        // v3 is untouched and v4 was never registered.
         assert_eq!(
             definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
                 .await
@@ -403,16 +348,12 @@ async fn an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_it
     .await;
 }
 
-// ═════════════ 2. cutover wins the lock ══════════════════════════════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v3_admission() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("cutover_wins").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // Connection B: take the cutover's own fence by hand so the barrier is deterministic, then
-        // perform exactly the transition the production path performs.
         let mut fence_conn = admin.acquire().await.unwrap();
         let mut fence = fence_conn.begin().await.unwrap();
         sqlx::query(
@@ -424,7 +365,6 @@ async fn a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v3_ad
         .await
         .unwrap();
 
-        // Connection A: a fresh old-binary admission now attempts its FOR SHARE and must BLOCK.
         let admission_pool = pinned_pool(&admin_url(), &schema, 2).await;
         let mut admission_conn = admission_pool.acquire().await.unwrap();
         let admission_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
@@ -441,7 +381,6 @@ async fn a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v3_ad
             .fetch_one(&mut *tx)
             .await
             .unwrap();
-            // This mirrors `validate_definition_pin`'s own eligibility rule for a FRESH start.
             let eligible = status == "active";
             tx.rollback().await.unwrap();
             (status, eligible)
@@ -454,7 +393,6 @@ async fn a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v3_ad
             "the fresh admission must be blocked behind the cutover fence"
         );
 
-        // The fence observes zero backlog and commits both halves atomically.
         let backlog: bool = sqlx::query_scalar(
             "SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)",
         )
@@ -482,17 +420,14 @@ async fn a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v3_ad
         .unwrap();
         fence.commit().await.unwrap();
 
-        // A wakes and sees `draining` — the exact status the deployed v3 binary refuses a fresh
-        // start on, before it writes a manifest, jobs, or a workflow.
         let (status, eligible) = admission.await.unwrap();
         assert_eq!(status, "draining");
         assert!(
             !eligible,
-            "a draining definition is not eligible for a FRESH start — this is the refusal the \
+            "a draining definition is not eligible for a FRESH start - this is the refusal the \
              already-deployed v3 binary reports as CorruptRun"
         );
 
-        // Nothing was admitted under v3.
         let v3_runs: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM workflow_run WHERE wf_type='ci.pipeline' AND wf_version=$1",
         )
@@ -517,15 +452,12 @@ async fn a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v3_ad
     .await;
 }
 
-// ═════════════ 3. probe failure rolls the fence back ═════════════════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_injected_probe_failure_rolls_the_cutover_back_and_leaves_v3_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("probe_fail").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // Shadow the SECURITY DEFINER probe with a raising one in the schema's own search path.
         admin
             .execute(
                 format!(
@@ -556,8 +488,6 @@ async fn an_injected_probe_failure_rolls_the_cutover_back_and_leaves_v3_active()
         );
         assert_eq!(definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await, None);
 
-        // With the real probe restored, the retried cutover succeeds — proving the refusal was the
-        // guard failing closed, not the cutover being broken.
         admin
             .execute(
                 format!(
@@ -583,8 +513,6 @@ async fn an_injected_probe_failure_rolls_the_cutover_back_and_leaves_v3_active()
     })
     .await;
 }
-
-// ═════════════ 4. a divergent pre-seeded v3 hash refuses ═════════════════════════════════════════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_divergent_preexisting_v3_hash_refuses_and_leaves_v3_active() {
@@ -624,8 +552,6 @@ async fn a_divergent_preexisting_v3_hash_refuses_and_leaves_v3_active() {
     .await;
 }
 
-// ═════════════ 5. idempotent reboot ══════════════════════════════════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_cutover_is_idempotent_across_reboots_and_never_reactivates_v3() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -662,15 +588,12 @@ async fn the_cutover_is_idempotent_across_reboots_and_never_reactivates_v3() {
     .await;
 }
 
-// ═════════════ 6. drain compatibility ════════════════════════════════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_existing_v3_run_keeps_draining_while_a_fresh_v3_start_is_refused() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("drain").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // Mark v3 draining directly — the post-cutover state — with an existing v3 run present.
         seed_workflow_run(&admin, REGION, "draining-run", CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION, "running").await;
         sqlx::query(
             "UPDATE wf_definition SET status='draining' WHERE wf_type='ci.pipeline' AND version=$1",
@@ -680,8 +603,6 @@ async fn an_existing_v3_run_keeps_draining_while_a_fresh_v3_start_is_refused() {
         .await
         .unwrap();
 
-        // `validate_definition_pin`'s rule: replay accepts `active | draining`; a fresh start
-        // requires `active`. Assert both halves against the durable status.
         let status: String = sqlx::query_scalar(
             "SELECT status FROM wf_definition WHERE wf_type='ci.pipeline' AND version=$1",
         )
@@ -698,7 +619,6 @@ async fn an_existing_v3_run_keeps_draining_while_a_fresh_v3_start_is_refused() {
             "a FRESH v2 start is refused once the definition drains"
         );
 
-        // And the run itself is untouched by the cutover — draining is not cancelling.
         let state: String =
             sqlx::query_scalar("SELECT state FROM workflow_run WHERE run_id='draining-run'")
                 .fetch_one(&admin)
@@ -711,16 +631,12 @@ async fn an_existing_v3_run_keeps_draining_while_a_fresh_v3_start_is_refused() {
     .await;
 }
 
-// ═════════════ 7. the fence is DATABASE-WIDE, not regional ═══════════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_backlog_in_another_region_still_refuses_the_database_global_cutover() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("global").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // A stranded v3 run in a DIFFERENT region. `wf_definition` has no region column, so
-        // draining v2 here would fence that region out too.
         seed_workflow_run(
             &admin,
             OTHER_REGION,
@@ -730,7 +646,6 @@ async fn a_backlog_in_another_region_still_refuses_the_database_global_cutover()
         )
         .await;
 
-        // The REGIONAL diagnostic sees nothing — which is exactly why it cannot be the authority.
         let discovery = ci_region_run_discovery_test_support(admin.clone());
         let local = discovery
             .superseded_definition_runs(REGION, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION, 16)
@@ -738,10 +653,9 @@ async fn a_backlog_in_another_region_still_refuses_the_database_global_cutover()
             .unwrap();
         assert!(
             local.is_empty(),
-            "the regional diagnostic is blind to the other region — by construction"
+            "the regional diagnostic is blind to the other region - by construction"
         );
 
-        // The DATABASE-WIDE probe sees it, and the cutover refuses.
         let global: bool = sqlx::query_scalar(
             "SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)",
         )
@@ -772,15 +686,12 @@ async fn a_backlog_in_another_region_still_refuses_the_database_global_cutover()
     .await;
 }
 
-// ═════════════ 8. the probe's least-privilege boundary ═══════════════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_backlog_probe_is_executable_only_by_the_runtime_role() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("privilege").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // PUBLIC must not hold EXECUTE, and the runtime role must.
         let public_execute: bool = sqlx::query_scalar(
             "SELECT has_function_privilege('public',
                'myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs(integer)', 'EXECUTE')",
@@ -812,7 +723,6 @@ async fn the_backlog_probe_is_executable_only_by_the_runtime_role() {
             "the scheduler capability has no business running the global registry fence"
         );
 
-        // Hardening: SECURITY DEFINER with a pinned search_path and no dynamic SQL.
         let (security_definer, config): (bool, Option<Vec<String>>) = sqlx::query_as(
             "SELECT p.prosecdef, p.proconfig
              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -833,9 +743,6 @@ async fn the_backlog_probe_is_executable_only_by_the_runtime_role() {
              hazard"
         );
 
-        // And the runtime role really can call it end to end. The row is seeded by admin; the point
-        // is that `myelin_app` — NOBYPASSRLS, and with NO tenant/region GUC set, so its own RLS
-        // scope would hide this row entirely — still gets a truthful global answer.
         seed_workflow_run(
             &admin,
             REGION,
@@ -854,7 +761,7 @@ async fn the_backlog_probe_is_executable_only_by_the_runtime_role() {
         .unwrap();
         assert_eq!(
             direct_read, 0,
-            "FORCE RLS hides the row from the runtime role's own read — which is exactly why the \
+            "FORCE RLS hides the row from the runtime role's own read - which is exactly why the \
              probe must be SECURITY DEFINER rather than an inline query"
         );
         let seen: bool = sqlx::query_scalar(
@@ -875,23 +782,13 @@ async fn the_backlog_probe_is_executable_only_by_the_runtime_role() {
     .await;
 }
 
-// ═════════════ 9. the production admission path still takes the fence ════════════════════════════
-
-/// **Source pin: fresh production `ci.pipeline` admission still locks the superseded definition row
-/// `FOR SHARE` before `start_with_id_on_conn`.** The whole fence rests on that lock existing in the
-/// old binary's path; if a refactor dropped or reordered it, the cutover would stop being mutually
-/// exclusive with admission and every race test above would silently become vacuous.
 #[test]
 fn production_admission_locks_the_definition_row_before_starting_the_workflow() {
     let starter = include_str!("../src/pg_pipeline_starter.rs");
-    // The lock itself still exists, on the exact pinned row, and is `FOR SHARE` (the mode the
-    // cutover's `FOR UPDATE` conflicts with).
     assert!(
         starter.contains("WHERE wf_type = $1 AND version = $2 FOR SHARE"),
         "fresh admission must lock the pinned definition row FOR SHARE"
     );
-    // And it is taken BEFORE the workflow start, inside the same admission transaction. Compare
-    // CALL SITES, not definition order: `validate_definition_pin` is defined far below its callers.
     let fresh_validate = starter
         .find("validate_definition_pin(&mut transaction, &self.definition, false)")
         .expect("a fresh (non-replay) start validates the definition pin");
@@ -903,7 +800,6 @@ fn production_admission_locks_the_definition_row_before_starting_the_workflow() 
         "the definition FOR SHARE lock must be taken BEFORE the workflow is started, or the \
          cutover fence is not mutually exclusive with admission"
     );
-    // Both run on the SAME transaction, so the lock is still held at insert time.
     assert!(
         starter.contains("HandlerTx::with_connection(&mut *transaction)"),
         "the workflow start must ride the same transaction that holds the definition lock"
@@ -912,7 +808,6 @@ fn production_admission_locks_the_definition_row_before_starting_the_workflow() 
         starter.contains("pinned workflow definition status `{status}` is not eligible for this start"),
         "the draining refusal the fenced-out old binary reports must stay in the admission path"
     );
-    // The test-support-only driver must never be a production admission path.
     let driver = include_str!("../src/ci_pipeline_driver.rs");
     let driver_start = driver
         .find("pub struct CiPipelineDriver")
@@ -924,25 +819,12 @@ fn production_admission_locks_the_definition_row_before_starting_the_workflow() 
     );
 }
 
-// ═════════════ 10. the clean-path diagnostic is index-eligible ═══════════════════════════════════
-
-/// **The superseded-run diagnostic must not seq-scan the durable workflow history.** The clean case
-/// — no backlog — is the one every restart takes, and `LIMIT` cannot help when no row matches: a
-/// sequential scan reads the whole table before returning nothing.
-///
-/// This asserts ELIGIBILITY, not the default plan: on a tiny fixture PostgreSQL will rationally
-/// prefer a seq scan regardless, so forcing `enable_seqscan = off` and requiring the planner to be
-/// ABLE to use `ci_workflow_active_region` is the honest question. The earlier `NOT IN (terminal
-/// states)` form fails this even with seq scans disabled, because the planner cannot prove that
-/// predicate implies the partial index's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_superseded_run_diagnostic_can_use_the_active_region_partial_index() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("explain").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // The partial index is created CONCURRENTLY by the migration; make sure the planner has
-        // statistics rather than an empty-relation default.
         for index in 0..64 {
             seed_workflow_run(
                 &admin,
@@ -976,8 +858,6 @@ async fn the_superseded_run_diagnostic_can_use_the_active_region_partial_index()
             "the diagnostic must be able to use the active-region partial index; plan was:\n{plan}"
         );
 
-        // The negative control: the predicate form this slice REPLACED cannot use the index even
-        // with sequential scans disabled — which is exactly why it was replaced.
         let negative_plan: Vec<String> = sqlx::query_scalar(&format!(
             "EXPLAIN SELECT tenant_id, run_id FROM workflow_run
              WHERE region = '{REGION}' AND wf_type = 'ci.pipeline'
@@ -1000,21 +880,12 @@ async fn the_superseded_run_diagnostic_can_use_the_active_region_partial_index()
     .await;
 }
 
-// ═════════════ 11. a missing predecessor row FAILS CLOSED ════════════════════════════════════════
-
-/// **Absence is never "nothing to fence" (round-3 blocker 1).** With no `ci.pipeline@3` row there is
-/// nothing to lock `FOR UPDATE`, so a concurrently-booting older binary could `register_definition`
-/// the superseded version against no conflicting lock and reopen late admission — and an orphaned
-/// non-terminal run under it would never be probed. The old code took `commit_activation(tx, None)`
-/// on this path and activated v3 anyway.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_missing_predecessor_row_refuses_instead_of_skipping_the_fence() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("no_predecessor").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // An orphaned non-terminal v3 run, and NO v3 definition row — the exact shape that used to
-        // activate v3 and strand it.
         seed_workflow_run(
             &admin,
             REGION,
@@ -1050,10 +921,9 @@ async fn a_missing_predecessor_row_refuses_instead_of_skipping_the_fence() {
         assert_eq!(
             definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await,
             None,
-            "v4 must NOT be activated over a missing fence — the orphaned v3 run would strand"
+            "v4 must NOT be activated over a missing fence - the orphaned v3 run would strand"
         );
 
-        // The migration's seed is what makes this unreachable on a real fresh database.
         admin
             .execute(myelin_ci_controlplane::SEED_CI_PIPELINE_V3_CUTOVER_FENCE_ROW_DDL)
             .await
@@ -1069,8 +939,6 @@ async fn a_missing_predecessor_row_refuses_instead_of_skipping_the_fence() {
             hash.starts_with("sentinel:"),
             "the seeded hash must never be mistakable for a real source-derived pin"
         );
-        // With the fence row present the backlog is still real, so the cutover still refuses — now
-        // for the right reason, with remediation ids.
         let refusal = factory
             .cutover_definition(&diagnostics(&admin))
             .await
@@ -1086,8 +954,6 @@ async fn a_missing_predecessor_row_refuses_instead_of_skipping_the_fence() {
     .await;
 }
 
-/// The seed is a strict no-op against an existing database — the property that makes it safe as an
-/// additive migration on a fleet that already has a deployed v2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_predecessor_seed_never_disturbs_an_existing_definition_row() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -1113,21 +979,12 @@ async fn the_predecessor_seed_never_disturbs_an_existing_definition_row() {
     .await;
 }
 
-// ═════════════ 12. the probe's OWNER carries the bypass authority ════════════════════════════════
-
-/// **A SECURITY DEFINER function's RLS authority is its OWNER's (round-3 blocker 2).** The intended
-/// production migration role is a non-superuser schema owner WITHOUT `BYPASSRLS`; owning this probe
-/// as that role would leave the `EXISTS` silently filtered — false despite a real backlog, a
-/// fail-OPEN cutover. So ownership, the owner's capability, and the `row_security=off` safety net
-/// are all asserted structurally.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_probe_owner_has_bypass_authority_and_a_non_bypass_owner_fails_loudly() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("owner").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // The PRODUCTION function's owner is the dedicated fence role, and that role really does
-        // carry bypass authority — asserted on the catalogue, not assumed from provisioning.
         let (owner, bypass, superuser, can_login): (String, bool, bool, bool) = sqlx::query_as(
             "SELECT owner.rolname, owner.rolbypassrls, owner.rolsuper, owner.rolcanlogin
              FROM pg_proc p
@@ -1153,9 +1010,6 @@ async fn the_probe_owner_has_bypass_authority_and_a_non_bypass_owner_fails_loudl
             "the bypass authority must not be a connectable identity"
         );
 
-        // The safety net: with `row_security = off` pinned, an owner WITHOUT bypass authority
-        // produces a LOUD error instead of a silent false negative. Prove it by re-owning the
-        // schema-local copy to a non-bypass role and calling it with a real backlog present.
         seed_workflow_run(
             &admin,
             REGION,
@@ -1164,9 +1018,6 @@ async fn the_probe_owner_has_bypass_authority_and_a_non_bypass_owner_fails_loudl
             "running",
         )
         .await;
-        // A DEDICATED throwaway non-bypass role, never a production capability role: granting a
-        // real capability role anything (even in a temporary schema) would trip the scheduler
-        // provider's excess-privilege probe in any concurrently-booting test.
         let substitute = format!("myelin_test_nobypass_{}", std::process::id());
         let admin_for_role = admin.clone();
         let substitute_for_body = substitute.clone();
@@ -1205,7 +1056,7 @@ async fn the_probe_owner_has_bypass_authority_and_a_non_bypass_owner_fails_loudl
         .fetch_one(&admin)
         .await;
         let error = loud.expect_err(
-            "a non-bypass owner must RAISE, never silently return false — a false negative here is \
+            "a non-bypass owner must RAISE, never silently return false - a false negative here is \
              a fail-open cutover",
         );
         assert!(
@@ -1213,7 +1064,6 @@ async fn the_probe_owner_has_bypass_authority_and_a_non_bypass_owner_fails_loudl
             "expected the row_security=off refusal, got: {error}"
         );
 
-        // And the cutover therefore fails CLOSED rather than draining v2 over a real backlog.
         let factory = cutover_factory(&admin, &schema).await;
         let refusal = factory
             .cutover_definition(&diagnostics(&admin))
@@ -1232,8 +1082,6 @@ async fn the_probe_owner_has_bypass_authority_and_a_non_bypass_owner_fails_loudl
         );
         assert_eq!(definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await, None);
 
-        // Re-own before the schema drops, so the throwaway role can be removed and leaves no
-        // lingering grant for any other test's privilege probe to see.
         admin
             .execute(
                 format!(
@@ -1254,18 +1102,12 @@ async fn the_probe_owner_has_bypass_authority_and_a_non_bypass_owner_fails_loudl
     .await;
 }
 
-// ═════════════ 13. the fence wait is bounded ═════════════════════════════════════════════════════
-
-/// **An abandoned admission transaction must not hang boot (round-3 finding 5).** PostgreSQL's
-/// default `lock_timeout` is 0 — wait forever. With the bounded transaction-local timeout the
-/// cutover reaches its typed fail-closed error instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_indefinitely_held_fence_times_the_cutover_out_and_leaves_v3_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("lock_timeout").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // A stalled admission holding the fence and never resolving.
         let holder_pool = pinned_pool(&admin_url(), &schema, 2).await;
         let mut holder_conn = holder_pool.acquire().await.unwrap();
         let mut holder = holder_conn.begin().await.unwrap();
@@ -1299,8 +1141,6 @@ async fn an_indefinitely_held_fence_times_the_cutover_out_and_leaves_v3_active()
                 .contains(&myelin_ci_controlplane::CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS.to_string()),
             "the refusal must state the bound it waited"
         );
-        // It genuinely waited (so the bound is real, not an instant failure) and genuinely stopped
-        // (so boot cannot hang).
         let bound = Duration::from_millis(myelin_ci_controlplane::CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS);
         assert!(
             elapsed >= bound.mul_f32(0.5),
@@ -1320,7 +1160,6 @@ async fn an_indefinitely_held_fence_times_the_cutover_out_and_leaves_v3_active()
         );
         assert_eq!(definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await, None);
 
-        // Once the holder resolves, the retry succeeds.
         holder.rollback().await.unwrap();
         drop(holder_conn);
         factory
@@ -1334,24 +1173,12 @@ async fn an_indefinitely_held_fence_times_the_cutover_out_and_leaves_v3_active()
     .await;
 }
 
-// ═════════════ 14. the migration-ledger crash window ═════════════════════════════════════════════
-
-/// **A crash between `ci_0020h`'s DDL commit and its ledger insert must be safely retryable.**
-/// The migration's DDL is atomic on its own — `PgMigrator` sends it as one Simple Query message, so
-/// PostgreSQL runs every statement in one IMPLICIT transaction and a `RAISE` rolls the whole prefix
-/// back (an explicit `BEGIN` there would instead leave the pooled connection in `25P02`). But the
-/// ledger row is a separate later statement, so the crash window between them is real. On retry the migration re-adopts the fence
-/// role, finds the function already present and EXACTLY as expected, adopts it without replacement,
-/// re-normalizes grants idempotently, and commits. The function's OID is unchanged, which is what
-/// proves it was adopted rather than dropped and recreated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_crash_between_ddl_commit_and_ledger_insert_retries_cleanly() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("crash_window").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // The real production DDL, applied to `public` by `cutover_schema`'s migration run. Read
-        // the committed identity before simulating the crash.
         let before: (i64, String, String, Vec<String>) = sqlx::query_as(
             "SELECT p.oid::bigint, pg_get_userbyid(p.proowner), btrim(p.prosrc), p.proconfig
                FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
@@ -1362,7 +1189,6 @@ async fn a_crash_between_ddl_commit_and_ledger_insert_retries_cleanly() {
         .await
         .expect("ci_0020h created the probe");
 
-        // THE CRASH: the DDL committed, the ledger insert did not.
         let deleted = sqlx::query(
             "DELETE FROM myelin_applied_migration WHERE id = 'ci_0020h_ci_pipeline_version_backlog_probe'",
         )
@@ -1371,7 +1197,6 @@ async fn a_crash_between_ddl_commit_and_ledger_insert_retries_cleanly() {
         .expect("simulate the crash window");
         assert_eq!(deleted.rows_affected(), 1, "the ledger row existed to delete");
 
-        // REBOOT: re-apply the complete set. This is the real migrator, not a hand-run script.
         PgMigrator::apply_validated(
             &admin,
             &myelin_ci_controlplane::ci_controlplane_migrations(),
@@ -1391,7 +1216,7 @@ async fn a_crash_between_ddl_commit_and_ledger_insert_retries_cleanly() {
         .unwrap();
         assert_eq!(
             after.0, before.0,
-            "the function must be ADOPTED, not dropped and recreated — a changed OID would mean \
+            "the function must be ADOPTED, not dropped and recreated - a changed OID would mean \
              the retry rewrote an object another operator may have been depending on"
         );
         assert_eq!(after.1, "myelin_ci_definition_fence");
@@ -1407,19 +1232,6 @@ async fn a_crash_between_ddl_commit_and_ledger_insert_retries_cleanly() {
         .unwrap();
         assert_eq!(ledger, 1, "exactly one restored ledger row");
 
-        // THE DIVERGENT NEGATIVE CONTROL LIVES IN THE DISPOSABLE DRILL, NOT HERE.
-        //
-        // `myelin_ci_security` is a GLOBAL schema (the migration qualifies it explicitly), so
-        // tampering with the probe to prove the adopt-or-create branch refuses would mutate a shared
-        // object. No restoration discipline makes that safe on a shared stack: a panic between the
-        // DROP and the re-apply strands every later test AND the dev stack with no probe and no
-        // `ci_0020h` ledger row, and `CI_PRIVILEGE_FIXTURE_LOCK` is only observed by cooperating
-        // tests — a production boot or an unrelated migrator never takes it.
-        //
-        // `integration_ci_definition_fence_fresh` runs that control against a throwaway container
-        // where tampering is free, and does so under the non-superuser migration posture as well.
-        // What stays here is only the NON-DESTRUCTIVE half: the crash-window retry above, which
-        // adopts the existing function without modifying it.
     })
     .await;
     })
@@ -1549,32 +1361,10 @@ async fn production_v3_to_v4_readiness_probe_failure_rolls_the_fence_back() {
     .await;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════
-//  SYNTHETIC v4→v5 CUTOVER SUITE (CT-007 slice 5b.3-6d step 5).
-//
-//  The cutover fence is now GENERALIZED over a typed `CutoverPlan{predecessor, current, hash}`. The
-//  production wrapper runs ONLY the v3→v4 plan — every test above exercises that production path.
-//  This suite drives the SAME generalized fence body over a synthetic
-//  v4→v5 plan, with the v4/v5 `wf_definition` rows seeded IN-TEST (slice 6e.2 ships the production
-//  v3→v4 activation + the retired-v3 fresh-DB sentinel migration; this suite proves the fence
-//  generalizes). The predecessor is v4, the current is a synthetic v5 that no production root runs.
-//
-//  Reuses the frozen fixtures above verbatim: `cutover_schema` (Flow + CI migrations, the version-
-//  parameterized schema-local backlog probe, the tagged/pinned pools, `pg_stat_activity` lock-wait
-//  hygiene, `with_privilege_fixture_lock` / `with_schema_cleanup`).
-// ═════════════════════════════════════════════════════════════════════════════════════════════════
-
-/// The synthetic predecessor of the v4→v5 pair — the current production version, which a v4→v5
-/// cutover would supersede. No production code runs this plan; it exists only in this suite.
 const V4V5_PREDECESSOR_VERSION: i32 = 4;
-/// The synthetic current version. Deliberately one past the production pin so nothing in this repo
-/// registers it outside these tests.
 const V4V5_CURRENT_VERSION: i32 = 5;
-/// The source-derived pin a real v5 binary would embed — synthetic here.
 const V4V5_CURRENT_HASH: &str = "blake3:synthetic-v5-current-code-hash";
 
-/// The (v4, v5) plan under test. Production never constructs this — only `CutoverPlan::for_tests`,
-/// the test-support seam, can build an arbitrary pair.
 fn v4_to_v5_plan() -> CutoverPlan {
     assert_eq!(
         V4V5_PREDECESSOR_VERSION,
@@ -1584,7 +1374,6 @@ fn v4_to_v5_plan() -> CutoverPlan {
     CutoverPlan::for_tests(V4V5_PREDECESSOR_VERSION, V4V5_CURRENT_VERSION, V4V5_CURRENT_HASH)
 }
 
-/// Seed (or overwrite) a `wf_definition` row for the synthetic suite.
 async fn upsert_definition_row(admin: &PgPool, version: i32, code_hash: &str, status: &str) {
     sqlx::query(
         "INSERT INTO wf_definition (wf_type, version, code_hash, status)
@@ -1600,20 +1389,11 @@ async fn upsert_definition_row(admin: &PgPool, version: i32, code_hash: &str, st
     .unwrap();
 }
 
-/// Seed the pre-cutover v5-active predecessor a mid-deploy v4→v5 fleet starts from. The fence never
-/// consults the predecessor hash — only its existence — so a synthetic legacy hash is honest.
 async fn seed_v4_predecessor(admin: &PgPool) {
     upsert_definition_row(admin, V4V5_PREDECESSOR_VERSION, "blake3:synthetic-v4-predecessor", "active")
         .await;
 }
 
-// ─── v4→v5 · 1. old admission wins the lock ──────────────────────────────────────────────────────
-
-/// The generalized-fence twin of `an_old_v2_admission_holding_the_share_lock…`: an in-flight v5
-/// admission holding `wf_definition@3 FOR SHARE` makes the v4→v5 cutover's OWN backend BLOCK on that
-/// row (proven via `pg_stat_activity`), commit a late v5 run, and the woken cutover then observes it
-/// under the fence and refuses. Proves the generalized factory takes `FOR UPDATE` on the PLAN's
-/// predecessor (v5), not a hard-coded v2.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_an_old_v4_admission_holding_the_share_lock_makes_the_cutover_observe_its_workflow() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -1622,7 +1402,6 @@ async fn v4v5_an_old_v4_admission_holding_the_share_lock_makes_the_cutover_obser
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         seed_v4_predecessor(&admin).await;
 
-        // Connection A: the exact lock a v5 starter takes on the PLAN's predecessor row.
         let mut old_admission = admin.acquire().await.unwrap();
         let mut old_tx = old_admission.begin().await.unwrap();
         let locked: Option<String> = sqlx::query_scalar(
@@ -1635,7 +1414,6 @@ async fn v4v5_an_old_v4_admission_holding_the_share_lock_makes_the_cutover_obser
         .unwrap();
         assert_eq!(locked.as_deref(), Some("active"), "the v5 binary sees v5 active and proceeds");
 
-        // Connection B: the generalized v4→v5 cutover on a uniquely tagged pool.
         let cutover_tag = format!("myelin-cutover-v4v5-old-wins-{}", std::process::id());
         let cutover_pool = tagged_pool(&admin_url(), &schema, &cutover_tag, 2).await;
         let factory = cutover_factory(&cutover_pool, &schema).await;
@@ -1676,7 +1454,6 @@ async fn v4v5_an_old_v4_admission_holding_the_share_lock_makes_the_cutover_obser
         assert!(blocked_on_definition, "the cutover must wait on the wf_definition fence");
         assert!(!cutover.is_finished(), "the cutover cannot complete while v5 holds the fence");
 
-        // A commits a fresh v5 workflow — the race a preflight SELECT would miss.
         sqlx::query(
             "INSERT INTO workflow_run (
                tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
@@ -1700,7 +1477,6 @@ async fn v4v5_an_old_v4_admission_holding_the_share_lock_makes_the_cutover_obser
             "expected a backlog refusal, got {refusal:?}"
         );
 
-        // v5 untouched, v5 never registered.
         assert_eq!(
             definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
             Some("active".into()),
@@ -1719,12 +1495,6 @@ async fn v4v5_an_old_v4_admission_holding_the_share_lock_makes_the_cutover_obser
     .await;
 }
 
-// ─── v4→v5 · 2. cutover wins the lock ────────────────────────────────────────────────────────────
-
-/// The generalized-fence twin of `a_cutover_holding_the_update_lock…`: with the fence held on v5 by
-/// hand (so the barrier is deterministic), a fresh v5 admission's `FOR SHARE` genuinely BLOCKS, and
-/// once the transition (drain v5, activate v5) commits it wakes to `draining` — the status the
-/// deployed v5 binary refuses a fresh start on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v4_admission() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -1769,7 +1539,6 @@ async fn v4v5_a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_
         wait_until_blocked(&observer, admission_pid).await;
         assert!(!admission.is_finished(), "the fresh v5 admission must block behind the fence");
 
-        // The exact transition the generalized fence performs for a (v5, v5) plan.
         let backlog: bool =
             sqlx::query_scalar("SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)")
                 .bind(V4V5_PREDECESSOR_VERSION)
@@ -1816,10 +1585,6 @@ async fn v4v5_a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_
     .await;
 }
 
-// ─── v4→v5 · 3. backlog refuses ──────────────────────────────────────────────────────────────────
-
-/// A non-terminal v5 run blocks v4→v5 activation: the version-parameterized backlog probe, bound to
-/// the PLAN's predecessor (3), sees it and the generalized fence fails closed with v5 left active.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_nonterminal_v4_run_blocks_activation_and_leaves_v4_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -1854,20 +1619,13 @@ async fn v4v5_a_nonterminal_v4_run_blocks_activation_and_leaves_v4_active() {
     .await;
 }
 
-// ─── v4→v5 · 4. missing predecessor fails closed ─────────────────────────────────────────────────
-
-/// No v5 row → nothing to lock `FOR UPDATE` → the generalized fence returns `PredecessorMissing`
-/// rather than vacuously activating v5 over an absent fence. Mirrors the v2→v5 blocker-1 proof for
-/// the PLAN's predecessor.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_missing_v4_predecessor_row_refuses_instead_of_skipping_the_fence() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
     common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
     let (schema, bootstrap, admin) = cutover_schema("v4v5_no_predecessor").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // An orphaned non-terminal v5 run and NO v5 definition row — the shape that would strand.
         seed_workflow_run(&admin, REGION, "orphaned_v4", V4V5_PREDECESSOR_VERSION, "running").await;
-        // `cutover_schema` seeds only the v2 predecessor; there is no v5 row to delete.
         assert_eq!(
             definition_row(&admin, V4V5_PREDECESSOR_VERSION).await,
             None,
@@ -1889,8 +1647,6 @@ async fn v4v5_a_missing_v4_predecessor_row_refuses_instead_of_skipping_the_fence
             "v5 must NOT be activated over a missing fence"
         );
 
-        // With the fence row present the orphaned run is now probed and the cutover refuses for the
-        // right reason.
         seed_v4_predecessor(&admin).await;
         let refusal = factory
             .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
@@ -1904,11 +1660,6 @@ async fn v4v5_a_missing_v4_predecessor_row_refuses_instead_of_skipping_the_fence
     .await;
 }
 
-// ─── v4→v5 · 5. divergent current hash refuses ───────────────────────────────────────────────────
-
-/// A pre-existing v5 row from a DIFFERENT source tree (wrong hash) makes the generalized fence refuse
-/// with `ActivationRefused`, rolling back with v5 still active — the plan's `current_code_hash` is
-/// the authority, not a hard-coded v5 pin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_divergent_preexisting_v5_hash_refuses_and_leaves_v4_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -1944,10 +1695,6 @@ async fn v4v5_a_divergent_preexisting_v5_hash_refuses_and_leaves_v4_active() {
     .await;
 }
 
-// ─── v4→v5 · 6. idempotent reboot ────────────────────────────────────────────────────────────────
-
-/// Re-running the v4→v5 cutover after it has committed is a no-op: v5 stays `draining` (never
-/// resurrected to active), and the v5 row is byte-identical to the plan across reboots.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_the_cutover_is_idempotent_across_reboots_and_never_reactivates_v4() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -1990,10 +1737,6 @@ async fn v4v5_the_cutover_is_idempotent_across_reboots_and_never_reactivates_v4(
     .await;
 }
 
-// ─── v4→v5 · 7. bounded fence wait times out ─────────────────────────────────────────────────────
-
-/// An indefinitely held lock on the PLAN's predecessor (v5) makes the generalized cutover reach its
-/// typed `FenceUnavailable` at the shared bound, then succeed once released — boot cannot hang.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_an_indefinitely_held_fence_times_the_cutover_out_and_leaves_v4_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -2050,14 +1793,6 @@ async fn v4v5_an_indefinitely_held_fence_times_the_cutover_out_and_leaves_v4_act
     .await;
 }
 
-// ─── v4→v5 · 8. commit ambiguity fails closed ────────────────────────────────────────────────────
-
-/// **The fail-closed-on-ambiguous-commit path.** A DEFERRED constraint trigger on `wf_definition`
-/// lets every in-transaction statement (drain v5, insert v5, all verification reads) succeed but
-/// makes the final `COMMIT` raise — exactly the ambiguous-commit window the fence guards. The
-/// generalized cutover must surface `ProbeFailed` ("state is ambiguous; re-run to observe it") and
-/// the aborted transaction must leave the registry in its complete OLD state (v5 active, v5 absent),
-/// never half-applied. With the trigger gone the retry commits cleanly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_an_ambiguous_commit_fails_closed_and_leaves_the_registry_whole() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -2066,8 +1801,6 @@ async fn v4v5_an_ambiguous_commit_fails_closed_and_leaves_the_registry_whole() {
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         seed_v4_predecessor(&admin).await;
 
-        // A deferred constraint trigger fires only at COMMIT, so the fence's own drain/insert/verify
-        // statements all succeed and only the commit raises.
         admin
             .execute(
                 format!(
@@ -2098,11 +1831,10 @@ async fn v4v5_an_ambiguous_commit_fails_closed_and_leaves_the_registry_whole() {
             "the refusal must flag the ambiguous-commit window; got: {refusal}"
         );
 
-        // The aborted transaction left the registry WHOLE: v5 still active, v5 never inserted.
         assert_eq!(
             definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
             Some("active".into()),
-            "a failed commit rolls the entire transition back — v5 stays active"
+            "a failed commit rolls the entire transition back - v5 stays active"
         );
         assert_eq!(
             definition_row(&admin, V4V5_CURRENT_VERSION).await,
@@ -2110,8 +1842,6 @@ async fn v4v5_an_ambiguous_commit_fails_closed_and_leaves_the_registry_whole() {
             "the cutover is atomic: no half-applied v5 row survives a failed commit"
         );
 
-        // Remove the trigger; the retry commits cleanly — proving it was the COMMIT that failed, not
-        // the transition itself.
         admin
             .execute(
                 format!(
@@ -2142,26 +1872,6 @@ async fn v4v5_an_ambiguous_commit_fails_closed_and_leaves_the_registry_whole() {
     .await;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════════════════════════
-//  v4→v5 · THE ACTIVATION-READINESS PREDICATE (CT-007 slice 5b.3-6e.1 — DORMANT).
-//
-//  The queue-safety half of the v4→v5 fence. A `CutoverPlan` may carry an optional readiness
-//  predicate that runs AFTER the FOR-UPDATE fence and the workflow-backlog probe, BEFORE drain. It
-//  counts, database-wide, the non-terminal `job_queue` rows that still lack a claim window or carry a
-//  reservation marker other than 2. A probe failure, a NULL result, or ANY unsafe row rolls the fence
-//  back with v5 still active. The production v2→v5 plan carries NO predicate, so those tests above are
-//  the byte/behavior-identical control: nothing here changes them.
-//
-//  These reuse the same `cutover_schema` fixture. Like the backlog probe, the readiness probe is
-//  installed schema-local (pointed at THIS schema's `job_queue`) and selected through the
-//  `ActivationReadinessProbe::with_call_for_tests` seam, so production resolution stays
-//  `myelin_ci_security.`-qualified.
-// ═════════════════════════════════════════════════════════════════════════════════════════════════
-
-/// Install a SCHEMA-LOCAL copy of the `ci_0022c` readiness probe, pointed at this schema's
-/// `job_queue`, built from the SAME hardened shape (fence-owned, `SECURITY DEFINER`, `row_security =
-/// off`). The PRODUCTION shape over `public.job_queue`/`myelin_ci_security` is asserted separately by
-/// the fresh-volume drill and the migration DDL-shape unit test.
 async fn install_schema_local_readiness_probe(admin: &PgPool, schema: &str) {
     admin
         .execute(
@@ -2184,12 +1894,10 @@ async fn install_schema_local_readiness_probe(admin: &PgPool, schema: &str) {
         .expect("install the schema-local readiness probe as the fence role");
 }
 
-/// The schema-local readiness call the fixtures point the plan at.
 fn schema_local_readiness_call(schema: &str) -> String {
     format!("SELECT {schema}.myelin_ci_v2_activation_readiness_unsafe_count()")
 }
 
-/// A v4→v5 plan carrying the schema-local readiness predicate.
 fn v4_to_v5_plan_with_readiness(schema: &str) -> CutoverPlan {
     v4_to_v5_plan()
         .with_activation_readiness(ActivationReadinessProbe::with_call_for_tests(
@@ -2197,9 +1905,6 @@ fn v4_to_v5_plan_with_readiness(schema: &str) -> CutoverPlan {
         ))
 }
 
-/// Seed one `job_queue` row with the given (claim_window_secs, reservation_write_version, state). The
-/// `= 2` marker CHECK is enforced on inserts, so an "unsafe marker" row is expressed as `NULL`
-/// (`IS DISTINCT FROM 2`), never a forbidden literal like 1.
 async fn seed_job_queue_row(
     admin: &PgPool,
     job_id: &str,
@@ -2216,7 +1921,7 @@ async fn seed_job_queue_row(
     .bind(TENANT)
     .bind(REGION)
     .bind(job_id)
-    .bind(job_id) // idem_token unique per row
+    .bind(job_id)
     .bind(state)
     .bind(claim_window_secs)
     .bind(reservation_write_version)
@@ -2224,8 +1929,6 @@ async fn seed_job_queue_row(
     .await
     .unwrap();
 }
-
-// ─── v4→v5 · readiness · a NULL-claim-window non-terminal row refuses ─────────────────────────────
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_readiness_refuses_on_a_nonterminal_null_claim_window_row() {
@@ -2235,7 +1938,6 @@ async fn v4v5_readiness_refuses_on_a_nonterminal_null_claim_window_row() {
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         seed_v4_predecessor(&admin).await;
         install_schema_local_readiness_probe(&admin, &schema).await;
-        // Unsafe: a non-terminal row with NO claim window (marker is a valid 2, isolating the cause).
         seed_job_queue_row(&admin, "11111111-1111-1111-1111-111111111111", None, Some(2), "queued")
             .await;
 
@@ -2248,7 +1950,6 @@ async fn v4v5_readiness_refuses_on_a_nonterminal_null_claim_window_row() {
             matches!(error, CiSupersededDefinitionGuardError::ActivationNotReady { unsafe_rows } if unsafe_rows == 1),
             "the readiness predicate refuses with the unsafe-row count, got {error:?}"
         );
-        // v5 stays active; v5 was never registered.
         assert_eq!(
             definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
             Some("active".into()),
@@ -2261,8 +1962,6 @@ async fn v4v5_readiness_refuses_on_a_nonterminal_null_claim_window_row() {
     .await;
 }
 
-// ─── v4→v5 · readiness · a non-terminal row with a marker other than 2 refuses ────────────────────
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_readiness_refuses_on_a_nonterminal_non_two_reservation_marker() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -2271,7 +1970,6 @@ async fn v4v5_readiness_refuses_on_a_nonterminal_non_two_reservation_marker() {
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         seed_v4_predecessor(&admin).await;
         install_schema_local_readiness_probe(&admin, &schema).await;
-        // Unsafe: a valid claim window but NO reservation marker (NULL `IS DISTINCT FROM 2`).
         seed_job_queue_row(&admin, "22222222-2222-2222-2222-222222222222", Some(600), None, "running")
             .await;
 
@@ -2296,8 +1994,6 @@ async fn v4v5_readiness_refuses_on_a_nonterminal_non_two_reservation_marker() {
     .await;
 }
 
-// ─── v4→v5 · readiness · a NULL probe result fails closed ─────────────────────────────────────────
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_readiness_fails_closed_on_a_null_probe_result() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -2305,7 +2001,6 @@ async fn v4v5_readiness_fails_closed_on_a_null_probe_result() {
     let (schema, bootstrap, admin) = cutover_schema("v4v5_ready_null").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         seed_v4_predecessor(&admin).await;
-        // A degenerate probe that returns NULL — a shadowing `SELECT NULL` must never read as "safe".
         let plan = v4_to_v5_plan().with_activation_readiness(
             ActivationReadinessProbe::with_call_for_tests("SELECT NULL::bigint"),
         );
@@ -2330,8 +2025,6 @@ async fn v4v5_readiness_fails_closed_on_a_null_probe_result() {
     .await;
 }
 
-// ─── v4→v5 · readiness · a probe FAILURE fails closed ─────────────────────────────────────────────
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_readiness_fails_closed_on_a_probe_error() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -2339,7 +2032,6 @@ async fn v4v5_readiness_fails_closed_on_a_probe_error() {
     let (schema, bootstrap, admin) = cutover_schema("v4v5_ready_err").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         seed_v4_predecessor(&admin).await;
-        // A probe naming a function that does not exist — a broken probe is never a passed probe.
         let plan = v4_to_v5_plan().with_activation_readiness(
             ActivationReadinessProbe::with_call_for_tests(
                 "SELECT myelin_ci_security.readiness_probe_that_does_not_exist()",
@@ -2365,8 +2057,6 @@ async fn v4v5_readiness_fails_closed_on_a_probe_error() {
     .await;
 }
 
-// ─── v4→v5 · readiness · a CLEAN queue activates ──────────────────────────────────────────────────
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_readiness_activates_over_a_safe_queue() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -2375,8 +2065,6 @@ async fn v4v5_readiness_activates_over_a_safe_queue() {
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         seed_v4_predecessor(&admin).await;
         install_schema_local_readiness_probe(&admin, &schema).await;
-        // Only SAFE rows: a non-terminal V2 row (window set, marker 2) and an already-terminal row
-        // (excluded regardless of its columns). The predicate must NOT block this activation.
         seed_job_queue_row(&admin, "33333333-3333-3333-3333-333333333333", Some(600), Some(2), "running")
             .await;
         seed_job_queue_row(&admin, "44444444-4444-4444-4444-444444444444", None, None, "terminal").await;
@@ -2400,11 +2088,6 @@ async fn v4v5_readiness_activates_over_a_safe_queue() {
     .await;
 }
 
-// ─── v4→v5 · readiness · a `None` plan IGNORES unsafe rows (production control) ───────────────────
-
-/// The byte/behavior-identical control: a plan with NO readiness predicate never runs the probe, so
-/// even an unsafe queue does not block it. This is exactly the production v2→v5 posture — the frozen
-/// fence — expressed on the synthetic pair so the two live side by side.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_none_readiness_plan_ignores_unsafe_rows() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -2412,7 +2095,6 @@ async fn v4v5_a_none_readiness_plan_ignores_unsafe_rows() {
     let (schema, bootstrap, admin) = cutover_schema("v4v5_ready_none").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         seed_v4_predecessor(&admin).await;
-        // An unsafe row that WOULD refuse a readiness-bearing plan.
         seed_job_queue_row(&admin, "55555555-5555-5555-5555-555555555555", None, None, "queued").await;
 
         let plan = v4_to_v5_plan();

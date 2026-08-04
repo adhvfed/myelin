@@ -1,20 +1,7 @@
-//! Live-backend integration tests (Stage 1 / infra).
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. These run ONLY against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-storage --features integration --test integration_backends -- --nocapture
-//!
-//! Endpoints come from the myelin-config dev defaults (the dev<->prod CONFIG SWAP seam), so the
-//! same tests run against Scaleway by exporting the prod env vars.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
 
-/// Proves the Postgres OLTP backend is reachable through DATABASE_URL and that the RLS
-/// conventions from the init script are in place: the app role is NOT superuser / NOT
-/// bypassrls, and the myelin_make_tenant_scoped helper exists.
 #[tokio::test]
 async fn postgres_oltp_reachable_and_rls_ready() {
     use sqlx::Row;
@@ -26,7 +13,6 @@ async fn postgres_oltp_reachable_and_rls_ready() {
         .await
         .expect("connect to dev Postgres (is the stack up?)");
 
-    // RUNTIME query (sqlx::query — NOT the compile-time query! macro), so the build is DB-free.
     let row = sqlx::query(
         "SELECT current_database() AS db, \
                 (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS super, \
@@ -40,11 +26,9 @@ async fn postgres_oltp_reachable_and_rls_ready() {
     let is_super: bool = row.get("super");
     let bypass: bool = row.get("bypass");
     assert_eq!(db, "myelin");
-    // The app role must NOT silently bypass RLS — the load-bearing isolation property.
     assert!(!is_super, "app role must not be superuser");
     assert!(!bypass, "app role must not have BYPASSRLS");
 
-    // The RLS convention helper installed by the init script is callable.
     let helper: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_proc WHERE proname = 'myelin_make_tenant_scoped'",
     )
@@ -54,9 +38,6 @@ async fn postgres_oltp_reachable_and_rls_ready() {
     assert_eq!(helper, 1, "myelin_make_tenant_scoped RLS helper must exist");
 }
 
-/// Proves a (tenant, region) RLS policy actually isolates rows end-to-end against real
-/// Postgres: a session set to tenant A sees ONLY tenant A's row. Exercises the
-/// myelin_make_tenant_scoped convention on a throwaway table.
 #[tokio::test]
 async fn postgres_rls_isolates_tenants() {
     use sqlx::Row;
@@ -68,12 +49,7 @@ async fn postgres_rls_isolates_tenants() {
         .await
         .expect("connect to dev Postgres");
 
-    // A unique table name so concurrent runs don't collide.
     let tbl = format!("rls_probe_{}", std::process::id());
-    // Owner-side DDL: the app role was granted default privileges, but creating the table as
-    // the admin owner is what production migrations do. Here the app role creates it (it has
-    // CREATE on public by default in PG16? no — so use admin via a separate connection).
-    // We run DDL with the same app pool; PG16 revokes public CREATE, so grant it for the test.
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(
@@ -97,7 +73,6 @@ async fn postgres_rls_isolates_tenants() {
         .execute(&admin)
         .await
         .unwrap();
-    // Seed two tenants' rows (as admin, who is FORCEd under RLS too — so set the GUCs).
     for (id, t) in [(1, "tenantA"), (2, "tenantB")] {
         let mut conn = admin.acquire().await.unwrap();
         sqlx::query("SELECT set_config('myelin.tenant_id', $1, false)")
@@ -119,7 +94,6 @@ async fn postgres_rls_isolates_tenants() {
         .unwrap();
     }
 
-    // As the app role with tenant_id=tenantA, only tenantA's row is visible.
     let mut conn = pool.acquire().await.unwrap();
     sqlx::query("SELECT set_config('myelin.tenant_id', 'tenantA', false)")
         .execute(&mut *conn)
@@ -137,15 +111,12 @@ async fn postgres_rls_isolates_tenants() {
     let seen: String = rows[0].get("tenant_id");
     assert_eq!(seen, "tenantA");
 
-    // Cleanup.
     sqlx::query(&format!("DROP TABLE {tbl}"))
         .execute(&admin)
         .await
         .unwrap();
 }
 
-/// Proves the S3-compatible object store (RustFS) is reachable through the S3_* config with a
-/// custom endpoint + path-style addressing: put an object, get it back, head it, delete it.
 #[tokio::test]
 async fn rustfs_s3_blob_roundtrip() {
     use aws_sdk_s3::primitives::ByteStream;
@@ -209,17 +180,6 @@ async fn rustfs_s3_blob_roundtrip() {
         .expect("delete_object");
 }
 
-/// **P-ST-22 (P-252) LIVE integration: the git pack tier against the REAL object store (RustFS).**
-///
-/// The local-disk-floor git pack tier rides the `BlobStore` trait (§3.5), so the object-store
-/// backing (`S3BlobStore`) is a backing SWAP — `GitPackTier<S3BlobStore>` is the same tier with the
-/// object store underneath, NO code change (the relocatability §3.5 decides now). This proves the
-/// seam against the live RustFS dev stack (the binding policy: a DB/object-store contract ships a
-/// real integration test green against the live stack — NOT a mock):
-///  1. a git loose object is put + got THROUGH the trait against the real bucket (content round-trip);
-///  2. the object's git SHA address is content-derived, not a node path (relocation-stable);
-///  3. STOR-D7 on packs: the real object store re-hashes on read and REFUSES a corrupt object
-///     (0 silent serve) — proven by overwriting the underlying S3 object with wrong bytes.
 #[tokio::test]
 async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption() {
     use myelin_storage::s3blob::S3BlobStore;
@@ -232,7 +192,6 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
     let cfg = MyelinConfig::dev();
     let handle = tokio::runtime::Handle::current();
     let bucket = cfg.s3.bucket.clone();
-    // A raw client for the corruption step (overwrite the stored object's bytes out-of-band).
     let raw = {
         let creds = aws_sdk_s3::config::Credentials::new(
             &cfg.s3.access_key,
@@ -251,15 +210,10 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
         aws_sdk_s3::Client::from_conf(conf)
     };
 
-    // The git pack tier + the corruption probe both run on a blocking thread (the sync BlobStore
-    // trait drives the async SDK via block_in_place; the corruption overwrite uses the raw client).
     let tenant = TenantId(format!("itest-git-{}", std::process::id()));
     let repo = RepoId::from_token("web");
     let content = b"fn main() { println!(\"git pack over real object store\"); }\n".to_vec();
 
-    // The whole flow runs on ONE blocking thread so the tier (and its in-memory git-SHA → native
-    // index) stays alive across put → clean get → out-of-band corrupt → refused get. The raw S3
-    // overwrite (the corruption) is driven on the runtime handle via `block_on`.
     let (refused, native_key) = {
         let handle = handle.clone();
         let tenant = tenant.clone();
@@ -280,7 +234,6 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
                     status: RepoPlacementStatus::Active,
                 },
             );
-            // (1) put + (2) get THROUGH the trait against the REAL bucket.
             let address = tier
                 .put_object(&repo, GitObjectKind::Blob, &content)
                 .expect("put object");
@@ -290,7 +243,6 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
                 "git object round-trips through the real object store"
             );
 
-            // The native (BLAKE3) key the framed object is stored under; reconstruct its S3 key.
             let native = tier
                 .native_addr_for_test(&repo, &address)
                 .expect("native addr");
@@ -298,9 +250,6 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
             let (fan, rest) = dh.split_at(2);
             let native_key = format!("{}/{}/{}/{}", tenant.0, native.algo.tag(), fan, rest);
 
-            // (3) STOR-D7 on packs over the REAL store: overwrite the stored object with WRONG bytes
-            // OUT-OF-BAND (the raw client, on the runtime), then prove the SAME tier's
-            // re-hash-on-read REFUSES it (0 silent serve).
             handle.block_on(async {
                 raw.put_object()
                     .bucket(&bucket)
@@ -326,7 +275,6 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
          (0 silent serve), never served silently"
     );
 
-    // Clean up the probe object.
     let _ = raw
         .delete_object()
         .bucket(&bucket)
@@ -335,21 +283,6 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
         .await;
 }
 
-/// **P-ST-30 (P-441) LIVE integration: the object-store BlobStore replica recovery against the
-/// REAL object store (RustFS).**
-///
-/// The fs→object swap is a BACKING change: [`ReplicatedBlobStore`] fronts a PRIMARY
-/// [`S3BlobStore`] with a REPLICA [`S3BlobStore`] (a second RustFS bucket), all behind the
-/// UNCHANGED `BlobStore` trait. This proves the STOR-D7 "recover from a replica" property on the
-/// REAL object store (the binding policy: an object-store contract ships a real integration test
-/// green against the live stack — NOT a mock):
-///  1. a put writes the SAME content-addressed bytes to the primary AND replica buckets;
-///  2. a clean get round-trips through the trait against the real buckets;
-///  3. the PRIMARY object is corrupted OUT-OF-BAND (overwritten with wrong bytes via the raw
-///     client) → the get re-hashes, detects the mismatch, RECOVERS the correct bytes from the
-///     REPLICA bucket (0 silent serve), heals the primary, and `blob_recovered_from_replica`
-///     fires;
-///  4. a second get serves cleanly from the HEALED primary (no further recovery).
 #[tokio::test]
 async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
     use myelin_storage::s3blob::S3BlobStore;
@@ -359,8 +292,6 @@ async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
     let cfg = MyelinConfig::dev();
     let handle = tokio::runtime::Handle::current();
 
-    // The replica lives in a SECOND bucket on the same RustFS (a distinct backing). Create it if
-    // absent (idempotent). The primary bucket is the dev default (already created by the stack).
     let primary_bucket = cfg.s3.bucket.clone();
     let replica_bucket = format!("{}-replica", cfg.s3.bucket);
 
@@ -381,7 +312,6 @@ async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
             .build();
         aws_sdk_s3::Client::from_conf(conf)
     };
-    // Idempotent replica-bucket create (ignore AlreadyOwned/AlreadyExists).
     let _ = raw.create_bucket().bucket(&replica_bucket).send().await;
 
     let tenant = TenantId(format!("itest-repl-{}", std::process::id()));
@@ -398,23 +328,18 @@ async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
         let primary_bucket = primary_bucket.clone();
         let raw = raw.clone();
         tokio::task::spawn_blocking(move || {
-            // Primary + replica S3 backings behind the UNCHANGED trait, fronted by the replicated
-            // store — the fs→object swap is the inner backing, the recovery code is unchanged.
             let store = ReplicatedBlobStore::new(
                 S3BlobStore::connect(&primary_s3, handle.clone()),
                 vec![S3BlobStore::connect(&replica_s3, handle.clone())],
             );
 
-            // (1)+(2) put writes both buckets; a clean get round-trips through the trait.
             let h = store.put(&tenant, &content).expect("replicated put");
             assert_eq!(store.get(&tenant, &h).expect("clean get"), content);
 
-            // The S3 key the bytes are stored under (same key in both buckets — content-addressed).
             let dh = &h.digest_hex;
             let (fan, rest) = dh.split_at(2);
             let native_key = format!("{}/{}/{}/{}", tenant.0, h.algo.tag(), fan, rest);
 
-            // (3) Corrupt ONLY the PRIMARY bucket's object out-of-band (the raw client).
             handle.block_on(async {
                 raw.put_object()
                     .bucket(&primary_bucket)
@@ -427,12 +352,10 @@ async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
                     .expect("overwrite the primary object with corrupt bytes");
             });
 
-            // The get RECOVERS the correct bytes from the replica bucket (0 silent serve).
             let recovered = store.get(&tenant, &h).expect("recovered from replica");
             let recovered_ok =
                 recovered == content && store.telemetry().blob_recovered_from_replica() == 1;
 
-            // (4) The primary was HEALED: a second get serves cleanly, no further recovery.
             let healed = store.get(&tenant, &h).expect("healed primary read");
             let healed_ok =
                 healed == content && store.telemetry().blob_recovered_from_replica() == 1;
@@ -453,7 +376,6 @@ async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
         "the primary MUST be healed from the replica (a second read serves without re-recovery)"
     );
 
-    // Clean up the probe objects in both buckets.
     let _ = raw
         .delete_object()
         .bucket(&primary_bucket)
@@ -468,19 +390,6 @@ async fn replicated_object_store_recovers_corrupt_primary_from_replica() {
         .await;
 }
 
-/// **P-ST-31 (P-442) LIVE integration: object-backed git packs against the REAL object store
-/// (RustFS) — the local-disk-packs follow-on, the explicit sequenced transition (EI-04 §3).**
-///
-/// Authoritative git bytes move from node-local disk onto the OBJECT tier: a
-/// `GitPackTier<ReplicatedBlobStore<S3BlobStore>>` puts/serves git objects through the UNCHANGED
-/// `BlobStore` trait, with a PRIMARY object bucket + a REPLICA object bucket underneath — a backing
-/// SWAP, the consumer (`GitPackTier`) untouched. This proves STOR-D7 stays green on the
-/// object-backed packs against the live RustFS dev stack (the binding policy: an object-store
-/// contract ships a real integration test green against the live stack — NOT a mock):
-///  1. a git object is put + got THROUGH the trait against the real object backing (content round-trip);
-///  2. the PRIMARY object bucket's copy is corrupted OUT-OF-BAND (overwritten via the raw client) →
-///     the git-object read re-hashes, detects the mismatch, RECOVERS the correct bytes from the
-///     REPLICA object bucket (0 silent serve), and `blob_recovered_from_replica` fires.
 #[tokio::test]
 async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary() {
     use myelin_storage::s3blob::S3BlobStore;
@@ -513,7 +422,6 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
             .build();
         aws_sdk_s3::Client::from_conf(conf)
     };
-    // Idempotent replica-bucket create (ignore AlreadyOwned/AlreadyExists).
     let _ = raw.create_bucket().bucket(&replica_bucket).send().await;
 
     let tenant = TenantId(format!("itest-objpack-{}", std::process::id()));
@@ -533,9 +441,6 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
         let primary_bucket = primary_bucket.clone();
         let raw = raw.clone();
         tokio::task::spawn_blocking(move || {
-            // The OBJECT-BACKED pack tier: GitPackTier over a ReplicatedBlobStore fronting primary +
-            // replica S3 object buckets, all behind the UNCHANGED trait — the fs→object swap is the
-            // inner backing, the consumer code is unchanged.
             let tier = object_backed_pack_tier(
                 tenant.clone(),
                 S3BlobStore::connect(&primary_s3, handle.clone()),
@@ -551,7 +456,6 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
                 },
             );
 
-            // (1) put + get THROUGH the trait against the REAL object backing (content round-trip).
             let address = tier
                 .put_object(&repo, GitObjectKind::Blob, &content)
                 .expect("put object through the object tier");
@@ -561,8 +465,6 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
                 "git object round-trips through the real object-backed tier"
             );
 
-            // The native (BLAKE3) key the framed object is stored under (same key in both buckets —
-            // content-addressed); reconstruct its S3 key to corrupt it out-of-band.
             let native = tier
                 .native_addr_for_test(&repo, &address)
                 .expect("native addr");
@@ -570,7 +472,6 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
             let (fan, rest) = dh.split_at(2);
             let native_key = format!("{}/{}/{}/{}", tenant.0, native.algo.tag(), fan, rest);
 
-            // (2) Corrupt ONLY the PRIMARY object bucket's copy out-of-band (the raw client).
             handle.block_on(async {
                 raw.put_object()
                     .bucket(&primary_bucket)
@@ -583,7 +484,6 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
                     .expect("overwrite the primary object with corrupt bytes");
             });
 
-            // The git-object read RECOVERS the correct bytes from the replica bucket (0 silent serve).
             let recovered = tier
                 .get_object(&repo, &address)
                 .expect("recovered from the replica object bucket");
@@ -602,7 +502,6 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
          recovered from the replica bucket (0 silent serve), with blob_recovered_from_replica == 1"
     );
 
-    // Clean up the probe objects in both buckets.
     let _ = raw
         .delete_object()
         .bucket(&primary_bucket)
@@ -617,22 +516,6 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
         .await;
 }
 
-/// **P-ST-28 (P-330) LIVE integration: the C4 trust-scoped CI cache namespaces against the REAL
-/// object store (RustFS).**
-///
-/// The C4 namespace (`CiCacheNamespace`) rides the `BlobStore` trait, so the dev<->prod backing is a
-/// SWAP — the SAME write-scope refusal runs with the real `S3BlobStore` underneath, NO code change.
-/// This proves the poisoned-cache defence against the live RustFS dev stack (the binding policy: an
-/// object-store-touching contract ships a real integration test green against the live stack — NOT a
-/// mock):
-///  1. a trusted run writes a build-cache entry into the `trusted` scope — its bytes land in the real
-///     bucket (a content-addressed blob);
-///  2. an `untrusted_fork` run may READ that trusted entry (a cache hit is fine) — proven against the
-///     real store;
-///  3. the fork's WRITE to the `trusted` scope is REFUSED by the blob client BEFORE any byte reaches
-///     the real bucket (0 cross-scope landings on the real store; `cache_scope_violation` fires);
-///  4. the fork's write to its OWN `fork:<pr_id>` scope round-trips against the real bucket and is
-///     INVISIBLE to a trusted read of the same name (the confinement holds end-to-end).
 #[tokio::test]
 async fn c4_trust_scoped_cache_namespaces_over_real_object_store() {
     use myelin_storage::s3blob::S3BlobStore;
@@ -643,13 +526,10 @@ async fn c4_trust_scoped_cache_namespaces_over_real_object_store() {
     let handle = tokio::runtime::Handle::current();
     let tenant = TenantId(format!("itest-c4-{}", std::process::id()));
 
-    // The whole flow runs on ONE blocking thread (the sync BlobStore trait drives the async SDK via
-    // block_in_place); the C4 namespace's in-memory scope index stays alive across the run.
     tokio::task::spawn_blocking(move || {
         let store = S3BlobStore::connect(&cfg.s3, handle.clone());
         let cache = CiCacheNamespace::over(tenant.clone(), &store);
 
-        // (1) A trusted run populates the trusted build cache — lands in the REAL bucket.
         cache
             .put(
                 TrustTier::Trusted,
@@ -660,7 +540,6 @@ async fn c4_trust_scoped_cache_namespaces_over_real_object_store() {
             )
             .expect("a trusted run writes the trusted scope (real bucket)");
 
-        // (2) A fork run READs the trusted scope — a cache hit is fine (read against the real store).
         assert_eq!(
             cache
                 .get(&CacheScope::Trusted, "deps")
@@ -668,7 +547,6 @@ async fn c4_trust_scoped_cache_namespaces_over_real_object_store() {
             b"resolved-deps-over-real-object-store"
         );
 
-        // (3) The fork's WRITE to the trusted scope is REFUSED before any byte hits the bucket.
         let poison = cache.put(
             TrustTier::UntrustedFork,
             "1337",
@@ -681,13 +559,11 @@ async fn c4_trust_scoped_cache_namespaces_over_real_object_store() {
             "the fork write to the trusted scope MUST be refused, got {poison:?}"
         );
         assert_eq!(cache.telemetry().cache_scope_violation(), 1);
-        // 0 cross-scope landing: the trusted "deps" is STILL the trusted run's bytes on the real store.
         assert_eq!(
             cache.get(&CacheScope::Trusted, "deps").unwrap(),
             b"resolved-deps-over-real-object-store"
         );
 
-        // (4) The fork writes its OWN scope (real bucket) — confined; invisible as trusted.
         let fork = CacheScope::Fork {
             pr_id: "1337".to_string(),
         };
@@ -710,19 +586,6 @@ async fn c4_trust_scoped_cache_namespaces_over_real_object_store() {
     .expect("blocking C4 cache task");
 }
 
-/// **MR-009b W7.3 — the `FsBlobStore`→S3 byte-durability flip, PROVEN on the LIVE object store.**
-/// (Census SI-014/015/029; P-ST-30.) The two production `BlobStore` holders (knowledge
-/// `KnowledgeStore` + chat `ColdSegments`) were re-pointed OFF the in-memory `FsBlobStore` floor onto
-/// the config-selected DURABLE backing `SubstrateProvider::blob_store()` returns — i.e.
-/// `backend::blob_store(Backend::Real, …)` = [`myelin_storage::s3blob::S3BlobStore`]. This proves the
-/// property the fs floor LACKED and the flip delivers: a blob PUT through that seam SURVIVES a fresh
-/// store reconstruction (a kill-9 equivalent — the `Mutex<HashMap>` floor would have lost it with the
-/// process), and the re-hash-on-read address verify still holds after reconstruction.
-///
-/// The integrity-REFUSAL-on-corruption half of STOR-D7 on the S3 arm is proven by
-/// [`git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption`] (above): a direct
-/// out-of-band S3 overwrite → `BlobError::IntegrityFail` on read. This test covers the DURABILITY
-/// half (survives reconstruction) through the exact selection seam the re-points now use.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn w7_3_blob_flip_survives_a_fresh_s3_store_reconstruction() {
     use myelin_storage::backend::{blob_store, Backend};
@@ -734,9 +597,6 @@ async fn w7_3_blob_flip_survives_a_fresh_s3_store_reconstruction() {
     let payload = b"a re-pointed knowledge/chat blob that MUST survive a process restart".to_vec();
     let endpoint = MyelinConfig::dev().s3.endpoint.clone();
 
-    // (1) PUT through the SAME durable selection seam the re-points select (`provider.blob_store()` →
-    //     `backend::blob_store(Backend::Real, …)` = `S3BlobStore`). Then DROP the store — the
-    //     "process" that wrote the bytes is gone (the kill-9 equivalent).
     let hash = {
         let tenant = tenant.clone();
         let payload = payload.clone();
@@ -751,8 +611,6 @@ async fn w7_3_blob_flip_survives_a_fresh_s3_store_reconstruction() {
         .expect("blocking put task")
     };
 
-    // (2) A brand-NEW store (a fresh `S3BlobStore` over the same bucket — the restarted process) reads
-    //     the bytes back: they SURVIVED the reconstruction, and re-hash-on-read verifies the address.
     let got = {
         let tenant = tenant.clone();
         let hash = hash.clone();
@@ -770,16 +628,14 @@ async fn w7_3_blob_flip_survives_a_fresh_s3_store_reconstruction() {
     assert_eq!(
         got, payload,
         "W7.3: bytes PUT through the durable Backend::Real seam SURVIVE a fresh store reconstruction \
-         (kill-9) — the property the in-memory FsBlobStore floor could NOT provide"
+         (kill-9) - the property the in-memory FsBlobStore floor could NOT provide"
     );
-    // Belt-and-braces: the surviving bytes re-hash to the SAME content address (address-verified serve).
     assert_eq!(
         ContentHash::blake3(&got),
         hash,
         "the reconstructed durable backing serves address-verified bytes (re-hash-on-read holds)"
     );
 
-    // Cleanup the probe object via one more fresh store (S3 delete is idempotent).
     let _ = tokio::task::spawn_blocking(move || {
         let s = blob_store(Backend::Real, &MyelinConfig::dev(), handle);
         let _ = s.delete(&tenant, &hash);
@@ -789,7 +645,7 @@ async fn w7_3_blob_flip_survives_a_fresh_s3_store_reconstruction() {
     println!(
         "[W7.3 INTEGRATION GREEN] FsBlobStore→S3 flip: a blob PUT through Backend::Real (the seam \
          provider.blob_store() + the knowledge/chat re-points select) SURVIVES a FRESH S3BlobStore \
-         reconstruction on the live dev stack ({endpoint}) — byte-durable, unlike the in-memory fs \
+         reconstruction on the live dev stack ({endpoint}) - byte-durable, unlike the in-memory fs \
          floor. Integrity-refusal on the S3 arm: git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption."
     );
 }

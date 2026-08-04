@@ -1,41 +1,3 @@
-//! # `ci-controlplane` — the CI Control Plane service binary (CI-P6 → P-349, M4)
-//!
-//! The "every service `main.rs`" the contract-index row 1.1 names: it composes the DURABLE
-//! composition root (MR-009b W3b.6, the W3b.4 pattern) and hands the CI Control Plane
-//! [`AppSpec`](myelin_ci_controlplane::controlplane_app_spec) to the harness's one call,
-//! [`run_controlplane_until_shutdown`](myelin_ci_controlplane::run_controlplane_until_shutdown) (a
-//! thin wrapper over `serve_until_shutdown`).
-//! The harness owns the whole lifecycle (boot → migrate → outbox relay → consumers → three ports
-//! → signal-driven graceful drain, with liveness ≠ readiness); this `main` composes durable workers
-//! around that harness-owned lifecycle and joins them during shutdown.
-//!
-//! On boot the CI Control Plane shell runs the complete forward-only data-model migrations (every CI
-//! Control-Plane table — `ci_run` … `cost_event` — `(tenant, region)`-first + RLS-on) and
-//! auto-registers its OLTP store as a `PersonalDataHolder`. A failed boot / incomplete drain returns
-//! non-zero (§3.1) — loud, never a silent success.
-//!
-//! **DURABLE-BY-DEFAULT (MR-009b W3b.6 / SI-007):** the outbox the relay drains is the PG-backed
-//! `outbox` table (`OutboxStore::durable(PgOutboxBacking)`) over the MR-022 `SubstrateProvider`
-//! runtime pool, after a privileged migration pool applies the complete schema and is destroyed —
-//! committed events survive a process restart. **FAIL LOUD on missing durable config** (the W3b.4
-//! service-main pattern): missing/distinct `DATABASE_URL`, `DATABASE_MIGRATION_URL`, and
-//! `MYELIN_CI_SCHEDULER_DATABASE_URL`, an unreachable pool, or a failed migration each exit
-//! non-zero — NEVER a silent in-memory fallback
-//! (the in-memory
-//! `OutboxStore::new()` is `test-support`-gated and does not even compile here).
-//!
-//! The runtime is multi-threaded (required): the sync `DurableOutboxBacking` verbs bridge to async
-//! sqlx via `block_in_place` + `block_on`, which panics on a current-thread runtime. It is built
-//! explicitly only AFTER the initial thread has normalized checkout verification's
-//! `CAP_DAC_READ_SEARCH`: ambient/effective/inheritable are always cleared, permitted is retained
-//! only for the enabled checkout-workspace runner, and every other configuration drops it entirely.
-//!
-//! The substrate AppSpec config still uses its validated default, while every production endpoint
-//! and all three PostgreSQL roles are explicit through `Mode::RequireEnv`. The per-table behaviour
-//! (the scheduler claim, check emitter, log index, and metering) is the CI-P12..CI-P24 surface.
-//! Runner execution is an exact opt-in (`MYELIN_CI_RUNNER=1`) and preflights the real gVisor
-//! executor before opening intake; unset / `0` keeps every runner-host lane dormant.
-
 use myelin_ci_controlplane::run_controlplane_until_shutdown;
 use myelin_config::{Mode, MyelinConfig};
 use myelin_events::OutboxStore;
@@ -52,24 +14,13 @@ enum StartupRefusal {
     InvalidRunnerSetting(String),
     NonUnicodeRunnerSetting(OsString),
     RunnerHostPreflight(String),
-    /// CT-007 slice 4: `MYELIN_CI_WORKSPACE_MODE` names neither `enabled`, `disabled`, nor is unset —
-    /// a typo such as `enable` must refuse loudly rather than silently downgrade to `Disabled`.
     InvalidWorkspaceMode(String),
     NonUnicodeWorkspaceMode(OsString),
-    /// **The rolling-upgrade floor (CT-004d.2 claim-bound completion).** The runner lane refuses to
-    /// activate while any non-terminal job's dispatched stage is NULL (a pre-rewire historical dispatch
-    /// the reporter must refuse without consuming). A checked invariant, not an assumption — a
-    /// healthy deploy (CI has never been production-activated) has zero such rows.
     NonTerminalNullStageBacklog {
         count: i64,
     },
-    /// CT-007 gate 2: `MYELIN_CI_RUNNER_EXECUTION_PROFILES` names a profile this binary does not
-    /// serve — refuse loudly rather than silently advertise a truncated label set (which would make
-    /// the intended profile's jobs unclaimable and strand them queued).
     UnknownRunnerExecutionProfile(String),
     NonUnicodeRunnerExecutionProfiles(OsString),
-    /// The variable is present but names no profile after trimming — refuse rather than advertise an
-    /// empty label set (a runner that claims nothing). Omit the variable for the default instead.
     EmptyRunnerExecutionProfiles,
 }
 
@@ -122,13 +73,6 @@ impl fmt::Display for StartupRefusal {
     }
 }
 
-/// The comma-separated set of execution profiles this runner host is provisioned to serve. Each
-/// entry is a [`myelin_ci_controlplane::CiExecutionProfileV1`] label; the runner advertises the
-/// sorted union of their scheduler labels (via
-/// [`myelin_ci_controlplane::runner_labels_for_profiles`]) and can then CLAIM a job iff the job's
-/// required labels are a subset of that set. Unset defaults to `linux-small-v1` alone, so an
-/// existing small-only runner is byte-unchanged; a build-capable host sets e.g.
-/// `linux-small-v1,linux-build-v1` (a build host has the cargo/clippy rootfs + build-sized RAM).
 const ENV_CI_RUNNER_EXECUTION_PROFILES: &str = "MYELIN_CI_RUNNER_EXECUTION_PROFILES";
 
 impl std::error::Error for StartupRefusal {}
@@ -147,11 +91,6 @@ fn verify_startup_activation(
     }
 }
 
-/// Resolve the runner's advertised execution-profile set from `MYELIN_CI_RUNNER_EXECUTION_PROFILES`.
-/// Pure (env `Result` passed in) so tests inject values. Unset → the default `[LinuxSmallV1]` (an
-/// existing runner is unchanged); present → parse each comma-separated label, deduplicating while
-/// preserving first-seen order, refusing on any unknown label or an all-empty value. The order of the
-/// returned profiles does not matter — the caller advertises the SORTED union of their labels.
 fn resolve_runner_execution_profiles(
     setting: Result<String, std::env::VarError>,
 ) -> Result<Vec<myelin_ci_controlplane::CiExecutionProfileV1>, StartupRefusal> {
@@ -190,34 +129,18 @@ fn checkout_workspace_capability_requested(
     )
 }
 
-/// CT-007 slice 4: the `runsc --root=`/helper-dir pair a caller must feed
-/// [`myelin_ci_sandbox::gvisor::preflight_explicit_userns_policy`] once `MYELIN_CI_WORKSPACE_MODE`
-/// requests the `Enabled` activation level.
 #[derive(Debug)]
 struct ExplicitUsernsPolicyPaths {
     helper_dir: std::path::PathBuf,
     runsc_root: std::path::PathBuf,
 }
 
-/// The owned outcome of parsing the CT-007 slice 4 workspace-activation env contract: the exact
-/// [`myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig`] to construct `GvisorBackend` with, plus (only
-/// for `Enabled`) the paths the explicit-userns preflight needs. Parsed ONCE in `main` and carried
-/// across the entire startup sequence into [`myelin_ci_controlplane::CiRunnerLoop::new`] — never
-/// re-read from the environment later, so a preflighted snapshot can never diverge from what the
-/// runner thread actually constructs against.
 #[derive(Debug)]
 struct ParsedWorkspaceActivation {
     workspace_config: myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig,
     explicit_policy: Option<ExplicitUsernsPolicyPaths>,
 }
 
-/// Sol's round-1 design review, tightened in round 2: every `Enabled`-only variable is received as
-/// a caller-supplied closure, so `Disabled`/unset mode structurally never READS them -- not merely
-/// "reads but ignores" (the original `Result`-argument shape evaluated `std::env::var` for all six
-/// variables in the caller before this function was even entered, which the poisoned-`Result` test
-/// could not distinguish from genuine non-observation). A test can now prove non-observation with a
-/// panicking closure: if `Disabled` mode ever called it, the test would panic instead of merely
-/// asserting on a value.
 #[allow(clippy::too_many_arguments)]
 fn parse_workspace_activation_given(
     mode: Result<String, std::env::VarError>,
@@ -290,8 +213,6 @@ fn parse_workspace_activation_given(
             ));
         }
     };
-    // Only `NotPresent` defaults to `/usr/bin` -- an explicitly empty value is treated as likely
-    // operator error (Sol's round-2 review), not silently coerced to the default.
     let helper_dir = match explicit_userns_helper_dir() {
         Err(std::env::VarError::NotPresent) => std::path::PathBuf::from("/usr/bin"),
         other => required_absolute_path(
@@ -304,12 +225,6 @@ fn parse_workspace_activation_given(
             base_dir,
             host_capacity_bytes,
             leases_dir,
-            // Fixed at 1 (Sol's design review): `RunnerAgent::run_one` performs exactly one
-            // synchronous launch at a time -- a launch fully binds and releases (or quarantines)
-            // its lease before the next claim starts, so the actual simultaneous-lease requirement
-            // is exactly one. A larger pool would be arbitrary slack, not real concurrency; if
-            // runner concurrency is ever introduced, derive this from that setting in the same
-            // change rather than picking a number here.
             min_pool_size: 1,
         },
         explicit_policy: Some(ExplicitUsernsPolicyPaths {
@@ -330,13 +245,6 @@ fn parse_workspace_activation() -> Result<ParsedWorkspaceActivation, StartupRefu
     )
 }
 
-/// The deterministic ordering seam behind [`prepare_runner_host`]: explicit-userns preflight (if
-/// `Enabled`) always runs BEFORE the rootless preflight (Sol's design review — the explicit-userns
-/// preflight pins/hardens the SAME `runsc` binary the rootless preflight goes on to execute, so it
-/// must run first), and a failure in the explicit-userns step must prevent the rootless step from
-/// ever running. Neither the real `parse_workspace_activation` nor either real preflight function is
-/// called from here directly, so a test can prove the ordering/short-circuit with fake closures that
-/// record call order, without touching the real environment or filesystem.
 fn prepare_runner_host_given(
     parsed: Result<ParsedWorkspaceActivation, StartupRefusal>,
     run_explicit_userns_preflight: impl FnOnce(&ExplicitUsernsPolicyPaths) -> Result<(), String>,
@@ -350,11 +258,6 @@ fn prepare_runner_host_given(
     Ok(parsed.workspace_config)
 }
 
-/// CT-007 slice 4: parse the complete workspace-activation contract, preflight it (explicit-userns
-/// first when `Enabled`, then the always-required rootless base), and return the OWNED
-/// [`myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig`] `main` carries into
-/// [`myelin_ci_controlplane::CiRunnerLoop::new`] — never re-derived later from a second environment
-/// read, so preflight can never validate one snapshot while construction uses another.
 fn prepare_runner_host() -> Result<myelin_ci_sandbox::gvisor::GvisorWorkspaceConfig, StartupRefusal>
 {
     prepare_runner_host_given(
@@ -385,8 +288,6 @@ fn prepare_runner_host() -> Result<myelin_ci_sandbox::gvisor::GvisorWorkspaceCon
     )
 }
 
-/// Stage-B Hop-A repository-root contract. There is deliberately no fallback: production runner
-/// activation requires an explicit absolute, existing, canonical directory.
 const ENV_CI_CHECKOUT_REPO_ROOT: &str = "MYELIN_CI_CHECKOUT_REPO_ROOT";
 
 fn prepare_checkout_config_given(
@@ -416,19 +317,10 @@ fn prepare_checkout_config(
 
 fn main() {
     myelin_events::install_payload_free_panic_hook("ci-controlplane");
-    // Runner execution is explicit opt-in. Unset / `0` keeps the runner host dormant; `1` composes
-    // the proven production claim, Identity, reservation, fenced launch, recovery, and reporter root.
-    // Every other value is refused before PostgreSQL bootstrap.
     let runner_setting = std::env::var("MYELIN_CI_RUNNER");
     let workspace_mode = std::env::var("MYELIN_CI_WORKSPACE_MODE");
     let checkout_workspace_runner_requested =
         checkout_workspace_capability_requested(&runner_setting, &workspace_mode);
-    // systemd delivers CAP_DAC_READ_SEARCH through AmbientCapabilities so the unprivileged binary
-    // can receive it in permitted. Normalize it on the initial thread for EVERY configuration,
-    // before validation can exit and before Tokio can create any worker: ambient, effective, and
-    // inheritable are always cleared. Only the exact enabled checkout-workspace runner path keeps
-    // dormant permitted authority for ScopedDacReadSearch; every other (including invalid or
-    // non-Unicode) configuration drops permitted too.
     if let Err(error) = myelin_ci_sandbox::gvisor::prepare_checkout_host_verification_capability(
         checkout_workspace_runner_requested,
     ) {
@@ -438,8 +330,6 @@ fn main() {
         );
         std::process::exit(1);
     }
-    // Read by borrow before validation consumes the setting so the complete host stays behind the
-    // same single activation decision.
     let runner_host_requested = matches!(&runner_setting, Ok(value) if value == "1");
     if let Err(e) = verify_startup_activation(runner_setting) {
         eprintln!("ci-controlplane: startup refused: {e}");
@@ -459,8 +349,6 @@ fn main() {
 }
 
 async fn run(runner_host_requested: bool) {
-    // Install OS signal handlers before database bootstrap or runner-host construction. A deploy
-    // signal that lands after intake starts must always enter the coordinated drain path.
     let shutdown_signals = match ShutdownSignals::install() {
         Ok(signals) => signals,
         Err(error) => {
@@ -468,9 +356,6 @@ async fn run(runner_host_requested: bool) {
             std::process::exit(1);
         }
     };
-    // Consume signals immediately, not only after bootstrap. Every intake owner subscribes to this
-    // same latch, so a signal received during preflight or migrations is already true at the first
-    // starter/workflow/runner instruction.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let signal_shutdown = shutdown_tx.clone();
     let signal_task = tokio::spawn(async move {
@@ -478,9 +363,6 @@ async fn run(runner_host_requested: bool) {
         let _ = signal_shutdown.send(true);
     });
     eprintln!("ci-controlplane: shutdown handlers armed; startup termination is intake-gated");
-    // CT-007 slice 4: parsed and preflighted ONCE here, before PostgreSQL bootstrap -- carried
-    // as this exact owned value all the way to `CiRunnerLoop::new` below, never re-derived from a
-    // second environment read (which could observe a different snapshot than what was preflighted).
     let gvisor_workspace_config = if runner_host_requested {
         match prepare_runner_host() {
             Ok(config) => Some(config),
@@ -504,9 +386,6 @@ async fn run(runner_host_requested: bool) {
         None
     };
 
-    // Production is strict: validate every endpoint plus three distinct PostgreSQL credentials
-    // before any DDL, durable store, reaper, or listener can be created. The scheduler credential
-    // is parsed here but is not connected until privileged migrations are complete.
     let platform_config = match MyelinConfig::from_env(Mode::RequireEnv) {
         Ok(config) => config,
         Err(e) => {
@@ -522,7 +401,6 @@ async fn run(runner_host_requested: bool) {
                 std::process::exit(1);
             }
         };
-    // `PgBootstrap` alone owns the privileged pool.
     let bootstrap = match PgBootstrap::connect(platform_config, DEFAULT_MAX_CONNECTIONS).await {
         Ok(bootstrap) => bootstrap,
         Err(e) => {
@@ -530,10 +408,6 @@ async fn run(runner_host_requested: bool) {
             std::process::exit(1);
         }
     };
-    // The substrate foundation tables (the frozen `outbox` + `consumer_dedup` DDL) must exist
-    // before the durable store binds — applied through the MR-022 migrator (idempotent,
-    // forward-only, advisory-locked). Only the foundation set is applied here: the tables THIS
-    // root's durable path needs, never a silently-widened migration surface.
     if let Err(e) = bootstrap.migrate_foundation().await {
         eprintln!(
             "ci-controlplane: cannot apply the substrate foundation migrations \
@@ -541,12 +415,6 @@ async fn run(runner_host_requested: bool) {
         );
         std::process::exit(1);
     }
-    // W7.2 (doc-18 Part 5) — THE BOOT-MIGRATIONS FIX: apply the FULL durable migration aggregate
-    // (identity 0010–0019, pseudonym 0020–0022, placement 0030–0039, kms 0040–0042, cost/erasure
-    // 0050–0053) after the foundation, so EVERY durable store bound at this main's boot has its
-    // tables on a fresh DB (doc-18: a main that migrated only a piecemeal subset left the stores it
-    // constructs writing to un-migrated tables). Idempotent + advisory-locked (safe on re-boot);
-    // FAIL LOUD, never a silent fallback.
     if let Err(e) = bootstrap
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
@@ -554,10 +422,6 @@ async fn run(runner_host_requested: bool) {
         eprintln!("ci-controlplane: cannot apply the durable migration aggregate (identity/pseudonym/placement/kms/cost/erasure): {e}");
         std::process::exit(1);
     }
-    // The CI runner owns durable `ci.pipeline` executions in Flow. Apply Flow's exact shared
-    // migration set before the CI follow-ons that add the active-run recovery index and constrained
-    // scheduler discovery policy. This is idempotent with a separately booted Flow service and
-    // removes any boot-order dependency on that service.
     if let Err(e) = bootstrap
         .migrate(
             &myelin_flow::migrations::migrations(),
@@ -568,9 +432,6 @@ async fn run(runner_host_requested: bool) {
         eprintln!("ci-controlplane: cannot apply the durable Flow prerequisite migrations: {e}");
         std::process::exit(1);
     }
-    // Apply the COMPLETE Controlplane-owned schema through the privileged pool. The AppSpec still
-    // declares this exact set for lifecycle/model checks, but production cannot defer real SQL until
-    // after cost stores or the reaper have already been constructed.
     if let Err(e) = bootstrap
         .migrate(
             &myelin_ci_controlplane::ci_controlplane_migrations(),
@@ -581,8 +442,6 @@ async fn run(runner_host_requested: bool) {
         eprintln!("ci-controlplane: cannot apply the complete Controlplane migrations: {e}");
         std::process::exit(1);
     }
-    // Re-probe the constrained runtime role, close the privileged pool, and erase its DSN before
-    // any runtime query/store/reaper/listener is created.
     let provider = match bootstrap.into_runtime().await {
         Ok(provider) => provider,
         Err(e) => {
@@ -590,9 +449,6 @@ async fn run(runner_host_requested: bool) {
             std::process::exit(1);
         }
     };
-    // The scheduler credential is opened only after privileged migrations and is validated against
-    // the authenticated runtime role and the server-owned region map. Its provider exposes no raw
-    // pool and can construct only the region claim/reap capability.
     let scheduler_provider = match myelin_ci_controlplane::CiSchedulerDbProvider::connect(
         scheduler_config,
         provider.db_pool(),
@@ -605,24 +461,14 @@ async fn run(runner_host_requested: bool) {
             std::process::exit(1);
         }
     };
-    // #11 — BOOT-TIME SHAPE ASSERTION on the money table. `CREATE TABLE IF NOT EXISTS` above no-ops on
-    // a pre-existing (possibly pre-CT-004m mis-shaped) `ci_cost_event`, so assert the columns/types are
-    // the CI metering-projection shape before the settle path can write money data. FAIL LOUD.
     if let Err(e) = myelin_ci_controlplane::verify_ci_cost_event_shape(provider.db_pool()).await {
         eprintln!("ci-controlplane: ci_cost_event shape assertion failed: {e}");
         std::process::exit(1);
     }
-    // The DURABLE outbox (SI-007): committed events live in Postgres, not a per-process mutex.
     let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
         provider.db_pool().clone(),
         tokio::runtime::Handle::current(),
     )));
-    // CT-004a: construct the REAL durable CI `ci_cost_event` projection store from the provider pool —
-    // proving the metering path is a production-callable store (not model-only). DORMANT at the shell
-    // (no consumer drives it yet); CT-004d attaches it to the `SCHEDULE_AND_RUN_JOB` dispatch settle
-    // bookend. CT-004m resolved the former `cost_event` table-name collision (CI's table is now
-    // `ci_cost_event`, created by the shared `ci_durable_migrations` applied above). Building it only
-    // wraps the pool — no query runs at boot.
     let _ci_cost_events = myelin_ci_controlplane::ci_cost_event_store(
         provider.db_pool().clone(),
         myelin_tenancy::Region(provider.config().region.clone()),
@@ -631,14 +477,6 @@ async fn run(runner_host_requested: bool) {
         provider.db_pool().clone(),
         myelin_tenancy::Region(provider.config().region.clone()),
     );
-    // CT-004c.1: construct the REAL durable `job_queue` store + spawn the dead-runner reaper loop onto
-    // the serve runtime (minimal-impact wiring — a bounded background task coordinated with the
-    // signal-driven lifecycle, NOT a new AppSpec schema field). The `job_queue` table it sweeps is created
-    // by the full `ci_controlplane_migrations` the `serve(AppSpec)` below applies at boot; the reaper
-    // delays its first sweep one interval so that boot-migrate has completed. It re-queues only work
-    // whose Flow/CI owner remains active; an expired launched job under a cancelled owner is instead
-    // terminalized through durable operational accounting. It launches NO untrusted code. The claim
-    // path is dormant unless the explicit runner-host activation below is requested.
     let region_queue_store = scheduler_provider.region_queue_store();
     let operational_ledger = myelin_storage::DurableCostLedger::new(provider.clone());
     let reaper = myelin_ci_controlplane::JobQueueReaper::new(
@@ -648,26 +486,7 @@ async fn run(runner_host_requested: bool) {
     )
     .with_cancelled_accounting(provider.db_pool().clone(), operational_ledger);
     let reaper_task = tokio::spawn(reaper.run_until_shutdown(shutdown_tx.subscribe()));
-    // CT-004 — compose the per-tenant `ci_run`-poll STARTER lane behind the SAME `MYELIN_CI_RUNNER`
-    // activation seam the runner uses. `ci_run_starter_factory` builds the REAL, production-callable
-    // `PgCiRunStarterFactory` from the runtime pool + cell region + blob CAS: it mints an exact-cell
-    // `PgCiPipelineStarter` for a queued run's AUTHORITATIVE tenant (read from `ci_run.tenant_id`), so a
-    // region-wide poller can never stamp one tenant's authority onto another's run. Constructing it wraps
-    // the pool + blob client only — NO query runs at boot, and NO fixed service identity is ever bound.
-    //
-    // Explicit opt-in only: `runner_host_requested` is true exactly for `MYELIN_CI_RUNNER=1`. The
-    // starter factory below carries the real fixed linux-small-v1 policy plus the PostgreSQL Tier-P
-    // operational reservation source. Its outstanding-reservation bound admits one largest valid
-    // run when the tenant has no prior live reservations; the scheduler separately limits
-    // leased/running work. Initial checks and the manifest-native DAG body are wired through this
-    // same coordinated host.
-    // The retained host below now owns coordinated start, failure propagation, and bounded shutdown
-    // for the starter, workflow recovery, and sandbox runner.
     let runner_host = if runner_host_requested {
-        // ROLLING-UPGRADE FLOOR (CT-004d.2): refuse activation while any non-terminal NULL-stage
-        // dispatch is still live — completion refuses such a job without consuming its claim, so the
-        // lane must not start until the backlog is repaired. A CHECKED invariant (a healthy never-activated
-        // deploy has zero).
         match region_queue_store
             .count_non_terminal_null_stage_jobs(&provider.config().region)
             .await
@@ -812,16 +631,6 @@ async fn run(runner_host_requested: bool) {
             gvisor_checkout_config
                 .expect("gvisor_checkout_config is Some whenever runner_host_requested is true"),
         );
-        // THE DEFINITION CUTOVER FENCE (CT-007 lease/topology reconciliation) — the LAST boot gate,
-        // deliberately after every fallible composition above. It is a single transaction that locks
-        // the superseded `wf_definition` row `FOR UPDATE` (the same row a fresh old-binary admission
-        // holds `FOR SHARE` until it commits), runs the database-wide backlog probe under that
-        // fence, and only then drains the old version and activates this one — atomically. A
-        // preflight SELECT could not close that race; see `cutover_definition`'s own doc.
-        //
-        // Placed here so a refusal cannot leave a half-composed process holding a committed
-        // registry transition, and so nothing has spawned that would admit work under the new
-        // version before the fence commits.
         if let Err(error) = runner_runtime
             .cutover_definition(&scheduler_provider.region_run_discovery())
             .await
@@ -843,14 +652,9 @@ async fn run(runner_host_requested: bool) {
     } else {
         None
     };
-    // The env-first `Config::from_env()` parse for the substrate AppSpec config is P-S15; the
-    // shell boots over the validated default today (the durable config is the provider's above).
     let runner_host_failures = runner_host
         .as_ref()
         .map(myelin_ci_controlplane::CiRunnerHostHandle::failure_receiver);
-    // This second observer deliberately outlives the service-shutdown future. The supervisor keeps
-    // owning every join after the deadline; if a lane never returns, only the process boundary can
-    // end it without detaching work inside a still-serving process.
     let runner_host_deadline_task = runner_host.as_ref().map(|host| {
         let failures = host.failure_receiver();
         tokio::spawn(async move {
@@ -909,7 +713,6 @@ async fn run(runner_host_requested: bool) {
     match service_result {
         Ok(()) => {}
         Err(e) => {
-            // A failed boot / incomplete drain returns non-zero (§3.1) — loud, never swallowed.
             eprintln!("ci-controlplane service failed: {e}");
             std::process::exit(1);
         }
@@ -980,8 +783,6 @@ mod tests {
     fn unset_runner_profiles_default_to_small_only_and_leave_labels_byte_unchanged() {
         let profiles = resolve_runner_execution_profiles(Err(VarError::NotPresent)).unwrap();
         assert_eq!(profiles, vec![CiExecutionProfileV1::LinuxSmallV1]);
-        // The advertised label set is EXACTLY the historical hardcoded set — an existing
-        // small-only runner is unchanged when the variable is absent.
         assert_eq!(
             runner_labels_for_profiles(&profiles),
             vec!["linux".to_owned(), "linux-small-v1".to_owned()]
@@ -1000,7 +801,6 @@ mod tests {
                 CiExecutionProfileV1::LinuxBuildV1
             ]
         );
-        // `linux` is shared and appears once; the set is sorted so it is a stable advertised set.
         assert_eq!(
             runner_labels_for_profiles(&profiles),
             vec![
@@ -1051,8 +851,6 @@ mod tests {
         );
     }
 
-    /// The `MYELIN_CI_RUNNER=1` request gates the complete host on the same validated setting.
-    /// Unset / `0` leave it dormant, while invalid values neither request activation nor boot.
     #[test]
     fn runner_host_request_activates_only_for_the_exact_valid_setting() {
         let requested = |setting: Result<String, VarError>| {
@@ -1141,8 +939,6 @@ mod tests {
             .contains("allowed values are `0`, `1`, or unset"));
     }
 
-    // ───────── CT-007 slice 4: workspace-activation parsing + preflight ordering ─────────
-
     use super::{
         parse_workspace_activation_given, prepare_runner_host_given, ExplicitUsernsPolicyPaths,
         ParsedWorkspaceActivation,
@@ -1152,19 +948,10 @@ mod tests {
 
     type EnvVarResult = Result<String, VarError>;
 
-    /// Wraps an already-computed value as the `FnOnce`-closure shape
-    /// `parse_workspace_activation_given` takes for every Enabled-only variable, so existing
-    /// owned/cloned `EnvVarResult` test fixtures don't need to change shape.
     fn fixed(value: EnvVarResult) -> impl FnOnce() -> EnvVarResult {
         move || value
     }
 
-    /// Panics if the parser ever calls it. Reused across every Disabled/unset-mode test case as
-    /// the closure for all five Enabled-only parameters: since a non-capturing fn item is `Copy`,
-    /// passing it five times moves nothing. If `parse_workspace_activation_given` ever read an
-    /// Enabled-only variable while `enabled == false`, the test would panic here rather than merely
-    /// asserting on an already-observed value (Sol's round-2 review: the original `Result`-argument
-    /// shape only proved the parser IGNORED already-read values, not that it never read them).
     fn panics_if_called() -> EnvVarResult {
         panic!("must not be read when MYELIN_CI_WORKSPACE_MODE is unset/disabled")
     }
@@ -1237,8 +1024,6 @@ mod tests {
     fn enabled_mode_requires_every_variable() {
         let (runsc_root, leases_dir, workspaces_dir, capacity, helper_dir) =
             valid_enabled_inputs();
-        // Each of the four required variables, omitted one at a time, must refuse -- with the rest
-        // valid, isolating exactly which variable's absence caused the refusal.
         let cases: [(&str, EnvVarResult, EnvVarResult, EnvVarResult, EnvVarResult); 4] = [
             (
                 myelin_ci_sandbox::gvisor::ENV_EXPLICIT_USERNS_RUNSC_ROOT,
@@ -1295,7 +1080,7 @@ mod tests {
             Ok("0".to_owned()),
             Ok("not-a-number".to_owned()),
             Ok("-1".to_owned()),
-            Ok("999999999999999999999999999999".to_owned()), // overflows u64
+            Ok("999999999999999999999999999999".to_owned()),
         ] {
             let refusal = parse_workspace_activation_given(
                 Ok("enabled".to_owned()),
@@ -1310,7 +1095,6 @@ mod tests {
                 .to_string()
                 .contains("MYELIN_CI_WORKSPACE_CAPACITY_BYTES"));
         }
-        // A genuinely valid positive integer must succeed.
         let ParsedWorkspaceActivation {
             workspace_config, ..
         } = parse_workspace_activation_given(
@@ -1339,7 +1123,7 @@ mod tests {
             || Ok("/var/lib/myelin/userns-leases".to_owned()),
             || Ok("/var/lib/myelin/ci-workspaces".to_owned()),
             || Ok("1073741824".to_owned()),
-            || Err(VarError::NotPresent), // helper_dir unset -> default
+            || Err(VarError::NotPresent),
         )
         .expect("a fully-specified Enabled configuration must parse");
         match parsed.workspace_config {
@@ -1384,10 +1168,6 @@ mod tests {
     fn relative_paths_are_refused_for_every_enabled_only_directory() {
         let (runsc_root, leases_dir, workspaces_dir, capacity, _) = valid_enabled_inputs();
         let valid_helper_dir: EnvVarResult = Ok("/usr/bin".to_owned());
-        // Each of the four Enabled-only directories, set to a relative path one at a time (the
-        // other three valid), must refuse -- proving the absolute-path check applies uniformly,
-        // including to the OPTIONAL, explicitly-configured helper directory (Sol's round-2 review:
-        // the prior version of this test only ever exercised `runsc_root`).
         let cases: [(&str, EnvVarResult, EnvVarResult, EnvVarResult, EnvVarResult); 4] = [
             (
                 "runsc root",

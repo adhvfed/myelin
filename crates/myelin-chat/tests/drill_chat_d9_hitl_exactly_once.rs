@@ -1,19 +1,3 @@
-//! # CHAT-D9 — the HITL approval-card exactly-once drill (CHAT-P18 → P-413, M4-C6)
-//!
-//! **Drill (testing-strategy/01 row CHAT-D9):** request an approval, KILL Chat + Workflow mid-wait,
-//! APPROVE days later → the gated tool runs EXACTLY ONCE; a double-click is ONE approval; DENY
-//! withholds with NO mutation; TIMEOUT auto-denies; the resume runs under a fresh token. CI; the
-//! duplicate-apply signal = 0, the pre-approval-mutation signal = 0.
-//!
-//! **A CHAINED scenario (EI-01 §4):** request → kill → approve later → assert exactly-once. The CHAT
-//! face of FLOW-D4 — chat is the card SURFACE; the durable exactly-once correctness across the kill
-//! is the ENGINE's (`myelin_flow`), here driven end-to-end with chat's card posting the decision.
-//!
-//! **Chat owns ONLY the card** (the click gate + the signal post); the durable wait / the kill /
-//! restart / the timer are the ENGINE's. This drill drives the REAL `myelin_flow` engine: the gated
-//! tool parks on the durable wait, chat's card posts the approval, the engine resumes + runs the tool
-//! EXACTLY ONCE across the kill.
-
 use myelin_chat::hitl::{
     build_card_signal, CardClick, CardDecision, CardSignal, ChatApprovalCard, SignalDelivery,
     SignalPort, SignalPostError, DECLINE_MARKER, TIMEOUT_REASON,
@@ -41,7 +25,6 @@ fn minter() -> Arc<dyn IdMinter> {
     Arc::new(MonotonicMinter::new())
 }
 
-/// chat's [`SignalPort`] over the REAL engine (the production wiring shape).
 struct FlowSignalPort {
     ex: FlowExecutor,
 }
@@ -98,9 +81,6 @@ fn approval_request_draft(refs: &[ArtifactRef]) -> EventDraft {
     }
 }
 
-/// The gated-tool body (the ENGINE's wait/withhold/resume logic — NOT chat's). It emits the card
-/// request + waits; on approve it runs the mutating activity (one effect); on decline/timeout it
-/// WITHHOLDS (returns no effect — 0 mutation, AG-8).
 fn gated_tool_body() -> Box<WorkflowBody> {
     Box::new(|ctx: &mut WfCtx| {
         let outcome = request_approval_and_wait(
@@ -117,11 +97,9 @@ fn gated_tool_body() -> Box<WorkflowBody> {
             } if payload_key_ref.as_deref() == Some(DECLINE_MARKER)
                 || payload_key_ref.as_deref() == Some(TIMEOUT_REASON) =>
             {
-                // DENY / TIMEOUT → WITHHELD: 0 mutation (AG-8). The tool does NOT run.
                 Ok(vec![])
             }
             WaitOutcome::Signalled { .. } => {
-                // APPROVE → run the tool (one mutating activity → one effect).
                 let eff = ctx
                     .activity(RetryPolicy { max_attempts: 1 }, |_i, _a| {
                         Ok(vec![ArtifactRef(
@@ -198,12 +176,6 @@ fn card(run: &FlowRunId) -> ChatApprovalCard {
     }
 }
 
-/// **CHAT-D9 core: request → KILL mid-wait → APPROVE days later → the gated tool runs EXACTLY ONCE;
-/// a double-click is ONE approval.** Drive 1 emits the card request + parks (the kill is modelled by
-/// dropping all in-memory drive state except the durable stores — the engine re-leases). Chat's card
-/// posts the approval; a DOUBLE-CLICK re-posts the same key (the engine dedups). Drive 2 (the
-/// restart) resumes, consumes the approval ONCE, runs the tool — the card request is NOT re-emitted
-/// and the tool runs exactly once.
 #[test]
 fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
     let ex = executor();
@@ -216,7 +188,6 @@ fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
     let body = gated_tool_body();
     let tele = myelin_flow::FlowTelemetry::new();
 
-    // DRIVE 1: emit the card request + park (state=waiting, holds no runtime — the kill window).
     let o1 = drive(
         &ex,
         &outbox,
@@ -239,18 +210,12 @@ fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
         "the run holds NO runtime while it waits (the multi-day kill window)"
     );
 
-    // --- KILL Chat + Workflow mid-wait (the durable stores survive; the in-memory drive is gone). ---
-
-    // DAYS LATER: a human clicks Approve in Chat → chat's card posts the approval signal. Modelled as
-    // chat's SignalPort over the real engine. NOTE: the engine's `request_approval_and_wait` waits on
-    // `approval:card-1`; chat posts under that name with the single-effect key `card-1`.
     let port = FlowSignalPort { ex: ex.clone() };
     let approve = CardClick {
         effect_idx: 0,
         decision: CardDecision::Approve,
         decline_reason: String::new(),
     };
-    // chat builds the signal under the engine's wait name (single-effect: idem_key == card_id).
     let mut sig = build_card_signal(&card(&run), &approve);
     sig.signal_name = approval_wait_name("card-1");
     let d1 = port.post_signal(&sig).unwrap();
@@ -259,7 +224,6 @@ fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
         SignalDelivery::Buffered,
         "the approval buffered (first click)"
     );
-    // DOUBLE-CLICK: re-post the SAME key → the engine dedups (one approval).
     let d2 = port.post_signal(&sig).unwrap();
     assert_eq!(
         d2,
@@ -267,7 +231,6 @@ fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
         "a double-click is ONE approval (0 double-apply)"
     );
 
-    // DRIVE 2 (the restart re-leases the run after the signal wake): resume, consume ONCE, run the tool.
     ex.runs().wake(&tenant(), &run.0);
     let run_row2 = ex.runs().get(&tenant(), &run.0).unwrap();
     let o2 = drive(
@@ -287,8 +250,6 @@ fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
         ),
         other => panic!("expected Completed, got {other:?}"),
     }
-    // the card request was emitted EXACTLY once (NOT re-emitted on the resume — the duplicate-apply
-    // signal = 0); the approval was consumed EXACTLY once.
     assert_eq!(
         outbox.committed_count(),
         1,
@@ -301,9 +262,6 @@ fn chat_d9_request_kill_approve_runs_exactly_once_double_click_is_one() {
     );
 }
 
-/// **CHAT-D9: DENY withholds with NO mutation (AG-8; pre-approval-mutation signal = 0).** The run
-/// parks; chat's card posts a DECLINE (empty payload + DECLINE_MARKER); the resume WITHHOLDS the tool
-/// — the merge activity NEVER runs (0 mutation past the card request).
 #[test]
 fn chat_d9_deny_withholds_zero_mutation() {
     let ex = executor();
@@ -327,7 +285,6 @@ fn chat_d9_deny_withholds_zero_mutation() {
     );
     let emits_after_park = outbox.committed_count();
 
-    // chat's card posts a DECLINE under the engine's wait name (empty payload + DECLINE_MARKER, AG-8).
     let port = FlowSignalPort { ex: ex.clone() };
     let decline = CardClick {
         effect_idx: 0,
@@ -354,17 +311,13 @@ fn chat_d9_deny_withholds_zero_mutation() {
         DriveOutcome::Completed(vec![]),
         "a DENY completes with NO effect (withheld)"
     );
-    // 0 mutation: the merge effect was NEVER emitted past the card request (AG-8).
     assert_eq!(
         outbox.committed_count(),
         emits_after_park,
-        "the declined tool made 0 mutation — the pre-approval-mutation signal = 0 (AG-8)"
+        "the declined tool made 0 mutation - the pre-approval-mutation signal = 0 (AG-8)"
     );
 }
 
-/// **CHAT-D9: TIMEOUT auto-denies with NO mutation.** The card posts a TIMEOUT auto-deny (the
-/// engine's durable timer fired first; chat surfaces it as a Decline with the TIMEOUT marker) → the
-/// tool is WITHHELD (0 mutation, AG-8). Chat does NOT own the timer — it renders the auto-deny.
 #[test]
 fn chat_d9_timeout_auto_denies_zero_mutation() {
     let ex = executor();
@@ -388,7 +341,6 @@ fn chat_d9_timeout_auto_denies_zero_mutation() {
     );
     let emits_after_park = outbox.committed_count();
 
-    // the durable timer fired (the engine's) → chat surfaces the auto-deny as a Decline(TIMEOUT).
     let port = FlowSignalPort { ex: ex.clone() };
     let click = myelin_chat::hitl::auto_deny_on_timeout(0);
     let mut sig = build_card_signal(&card(&run), &click);

@@ -1,13 +1,3 @@
-//! # HERMETIC drill — the reserve gate is a REAL "no balance → no run" gate (unified-wallet slice 3).
-//!
-//! Before slice 3 the hosted-run reserve gate read a hardcoded nominal `available`, disconnected from
-//! the prepaid balance — a broke tenant still dispatched (and only halted later at the per-turn
-//! debit). This drill proves the gate now reads the ACTUAL wallet balance minus the tenant's
-//! outstanding reservations: a tenant who cannot afford the reserve `estimate` is REFUSED at dispatch
-//! (the run never starts, nothing is billed), and a funded tenant dispatches and completes. No
-//! network, no DB — a `MockModelClient` brain + an in-memory wallet double, exactly the F1 core the
-//! live Luna drill exercises against real Luna + real Postgres.
-
 use std::sync::{Arc, Mutex};
 
 use myelin_agent_host::{
@@ -22,7 +12,6 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_storage::reserve_settle::{CostLedger, RunId};
 use myelin_tenancy::{Region, TenantId};
 
-/// A network-free, DB-free in-memory [`RunWallet`] double: a balance + a debit witness.
 struct MemWallet {
     balance: Mutex<u64>,
     debits: Mutex<Vec<(String, u64)>>,
@@ -99,17 +88,11 @@ fn brain() -> MockModelClient {
     })
 }
 
-/// **A tenant whose balance is below the reserve `estimate` is REFUSED at dispatch — the run never
-/// starts and nothing is billed.** The default `estimate` is `MicroUsd(100_000)`; a wallet holding
-/// `50_000` leaves `available = balance − outstanding = 50_000 − 0 = 50_000 < 100_000`, so the reserve
-/// refuses and the run is never dispatched (this is the real "no balance → no run" gate, not the later
-/// per-turn debit halt).
 #[test]
 fn insufficient_balance_is_refused_at_dispatch_run_never_starts() {
     let tenant = TenantId("01J0GATEBROKE".into());
     let region = Region("fr-par".into());
 
-    // Below the default estimate (100_000) — cannot even afford the reserve.
     let wallet = MemWallet::with_balance(50_000);
 
     let mut ledger = CostLedger::new();
@@ -140,29 +123,23 @@ fn insufficient_balance_is_refused_at_dispatch_run_never_starts() {
     )
     .expect_err("a tenant who cannot afford the estimate is refused at dispatch");
 
-    // Refused by the REAL reserve gate (no balance → no run), not the per-turn debit.
     let msg = err.to_string();
     assert!(
         msg.contains("no balance, no run") || msg.contains("dispatch refused"),
         "the reserve gate refused the dispatch: {msg}"
     );
 
-    // The run NEVER started: no reservation was written, and nothing was billed (no debit).
     assert!(
         wiring
             .ledger
             .state_of(&tenant, &RunId::new("Rrefuse-1"))
             .is_none(),
-        "a refused dispatch leaves NO reservation — the run never started"
+        "a refused dispatch leaves NO reservation - the run never started"
     );
     assert_eq!(wallet.balance(&tenant), MicroUsd(50_000), "balance untouched");
     assert_eq!(wallet.debit_rows("Rrefuse-1"), 0, "nothing was billed");
 }
 
-/// **A funded tenant dispatches and completes** — the same wiring, with a balance well above the
-/// reserve `estimate`, admits the run, drives it to a metered completion, and debits the per-turn
-/// charge. Proves the gate ADMITS when `balance − outstanding ≥ estimate` (the affordability check is
-/// real in both directions, not a blanket refusal).
 #[test]
 fn sufficient_balance_dispatches_and_completes() {
     let tenant = TenantId("01J0GATEFUNDED".into());
@@ -206,7 +183,6 @@ fn sufficient_balance_dispatches_and_completes() {
         "loop completed: {:?}",
         report.outcome
     );
-    // The run was admitted and billed once; the nominal reserve/settle ledger stayed balanced.
     assert!(report.charged_micro > 0, "the funded run was billed");
     assert_eq!(wallet.debit_rows("Rfunded-1"), 1, "one run-linked debit");
     assert!(report.telemetry.ledger_balanced(), "reserved == settled");

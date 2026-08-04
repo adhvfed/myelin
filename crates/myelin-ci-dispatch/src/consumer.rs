@@ -1,83 +1,3 @@
-//! **CT-004b (M4): the LIVE `ci-dispatch.trigger` bus consumer — the seam that makes CI dispatch
-//! actually FIRE on a push.**
-//!
-//! **Owning architecture doc (byte-authoritative):**
-//! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
-//! §1 (trigger → dispatch: match → dedup → trust-stamp → resolve → reserve/start) + §7.4 (the
-//! authored `.myelin/ci.*` config). This module is the CENSUS GAP the shell + the pure cores left
-//! open: CI-P6 shipped the `consumer_dedup` ledger SHAPE, CI-P10 shipped the matcher/dedup/trust
-//! cores ([`crate::dispatch`]), CI-P11 shipped the resolve/reserve cores ([`crate::resolve`]), and
-//! CT-004b (the parser, [`crate::config`]) turned a config FILE into a [`CiDefinition`]. NOTHING wired
-//! them onto the bus: `dispatch_app_spec` registered `consumers: Vec::new()`, so a push triggered NO
-//! run. This module closes that: a live [`EventHandler`] that, on a matching `git.ref.updated` (+ the
-//! PR triggers), reads the pushed repo's `.myelin/ci.*` at `new_oid`, parses + resolves it, and
-//! persists the DURABLE reserve/start bundle.
-//!
-//! ## The pipeline (in [`CiTriggerHandler::handle`], idempotent on `event_id`)
-//! 1. **Subject-match** `git.ref.updated` / `git.pr.opened` / `git.pr.synchronized` — a non-CI event
-//!    is a clean no-op ([`DispatchOutcome::Skip`]).
-//! 2. **Read** `.myelin/ci.toml` (then `.json`) at `new_oid` via the [`GitConfigReader`] seam. ABSENT
-//!    ⇒ a clean "no pipeline armed" skip (NOT an error). PRESENT ⇒ [`parse_ci_config`].
-//! 3. A [`CiConfigError`] is a **fail-closed, SURFACED skip** — a malformed config does NOT crash the
-//!    consumer, does NOT start a run, and is surfaced (a loud structured log via
-//!    [`SkipReason::ConfigError`], never a silent swallow — see the surfacing decision below).
-//! 4. **Compile** the armed trigger ([`compile_trigger`]) and ask: does THIS event match? No ⇒ skip.
-//! 5. **Stamp trust** ([`stamp_trust`]) — the [`TrustStamp`] rides the run + every check (X-1).
-//! 6. **Resolve** the CAS snapshot ([`resolve_snapshot`]) — a [`ResolveError`] (e.g. a floating tag)
-//!    is a fail-closed surfaced skip.
-//! 7. **Reserve/start** ([`reserve_and_start`]) → the ATOMIC bundle, persisted through the
-//!    [`ReserveStore`] seam (the `ci_run` row + `ci.run.started` + the first queued
-//!    `ci.check.updated` per context).
-//!
-//! ## The config-error SURFACING decision (the prompt DoD)
-//! A [`CiConfigError`] (or a [`ResolveError`]) is surfaced as a **loud, structured
-//! [`DispatchOutcome::Skip`] carrying the typed error**, and the handler returns
-//! [`HandleOutcome::Done`] (the message is ACKed — a malformed config is NOT poison to retry, and
-//! NOT a crash). This is "prefer surfacing over silent": the skip is observable (the returned
-//! outcome + the log), never a swallowed error, but it does NOT manufacture a spurious
-//! `ci.check.updated{config_error}` — a config error is not tied to a `(commit, context)` check
-//! seam (there is no armed run, so no context), so a synthetic check would fabricate a gate signal.
-//! The RICHER surface (a repo-level `ci.config.rejected` notification for `myelin ci validate`) is
-//! the named follow-on; this chunk surfaces the typed skip.
-//!
-//! ## What is DURABLE here vs the NAMED floors (be honest)
-//! - **Durable, dispatch-owned (shipped LIVE):** the `ci.run.started` + queued `ci.check.updated`
-//!   events, committed through the injected DURABLE [`OutboxStore`] ([`OutboxReserveStore`]) — the
-//!   production `main.rs` binds `OutboxStore::durable(PgOutboxBacking)`, so these events survive a
-//!   restart. The exactly-once effect rides the `Consumer` runtime's `consumer_dedup` ledger (one
-//!   triggering `event_id` = one effect) PLUS a deterministic `run_id` derived from the `event_id`
-//!   (so a redelivered trigger mints the SAME run — `ON CONFLICT DO NOTHING` at the `ci_run` PK).
-//! - **The `ci_run` ROW one-tx co-commit — SHIPPED LIVE (CT-004d.2 chunk 4).** The durable run-of-record
-//!   ROW now co-commits with the dedup mark in PRODUCTION: [`CoCommitReserveStore`] writes the `ci_run`
-//!   row on the consumer's co-commit `HandlerTx` connection via
-//!   [`myelin_ci_controlplane::CiRunStore::co_commit_reserve`] (which downcasts
-//!   `tx.connection::<sqlx::PgConnection>()` INSIDE ci-controlplane, where `sqlx` is nameable — the leaf
-//!   ci-dispatch crate only threads the type-erased `tx` through). So the ROW + the mark commit together
-//!   (runtime `Done`) or roll back together (`Retry`/failure) — a crash between leaves NEITHER, a
-//!   redelivery re-runs and lands both exactly once (`ON CONFLICT (tenant_id, run_id) DO NOTHING`). The
-//!   `ci_run` table is owned by `myelin-ci-controlplane` (its `CREATE_CI_RUN_DDL`); both CI mains create
-//!   it at boot via the shared `ci_durable_migrations()` writer subset. The writer lives in
-//!   ci-controlplane (NOT `myelin-storage`) because ci-dispatch already depends on it (acyclic — the
-//!   controlplane is a terminal leaf), so no new dependency edge is introduced.
-//! - **The queued fact is mechanically atomic with its authority.** [`CoCommitReserveStore`] asks
-//!   `CiRunStore` to insert the run, allocate the retry-stable monotonic attempts, and insert detached
-//!   canonical outbox rows on the SAME `HandlerTx` connection as the trigger dedup mark. A rollback
-//!   leaves none of them; redelivery rebuilds the same complete bundle. No hard-coded attempt can
-//!   escape and no old successful attempt stays green during a queued rerun.
-//! - **`DurableExecutor::start` (CT-004c/CT-004d — OUT OF SCOPE):** this consumer STOPS at the durable
-//!   reserve bundle. It does NOT call [`myelin_flow::StartSpec`]'s executor, does NOT register /
-//!   run the `ci.pipeline` body (`CI_PIPELINE_WF_TYPE`), and does NOT touch the scheduler/runner. The
-//!   `wf_run_id` the `ci_run` row carries is PRE-MINTED here (deterministic from the run) so
-//!   CT-004c/d starts the workflow with it; the ACTUAL start + the pipeline EXECUTION is that chunk.
-//! - **Cross-service delivery (deploy floor):** the git service emits `git.ref.updated` to ITS
-//!   outbox/NATS; whether this consumer receives it cross-cell over the structured
-//!   `evt.<tenant>.git.*` subject is a deploy-substrate floor. The integration test proves the
-//!   CONSUMER end-to-end by INJECTING a real `git.ref.updated` envelope (with a real repo + a
-//!   digest-pinned `.myelin/ci.toml` at `new_oid`) — the real cross-service NATS hop is named.
-//! - **The repo→(project, pipeline) registry (floor):** the `ci_run` row's `project_id`/`pipeline_id`
-//!   are deterministic placeholders derived from the repo ref here; the real registry that maps a
-//!   pushed repo to its CI project/pipeline is the named follow-on.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -99,7 +19,6 @@ use crate::resolve::{
     ResolveError, RunFacts, StartHandoff, VersionedCiDefinition,
 };
 
-/// A canonical, readable git storage root validated before broker intake is constructed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthoritativeGitRoot(std::path::PathBuf);
 
@@ -143,32 +62,7 @@ impl AuthoritativeGitRoot {
     }
 }
 
-// =================================================================================================
-// 1. The consumer subject whitelist (rule 3: a WHITELIST, never `*`).
-// =================================================================================================
-
-/// The `ci-dispatch.trigger` consumer's subject whitelist (contract 2.4 / BUS-3: a whitelist, NEVER
-/// `*`). The in-process `serve` harness routes on the envelope's `subject` `ArtifactRef`
-/// (`myelin://<tenant>/git/ref/<repo>:<ref>` for a push); a single `&'static` prefix cannot pin the
-/// tenant (it is the first path segment), so this coarse prefix is the TRANSPORT PREFILTER and the
-/// PRECISE arming is done in [`CiTriggerHandler::handle`] (the exact `event.type` match via
-/// [`compile_trigger`] — a non-git event is an O(1) no-op skip, never processed). It is deliberately
-/// NOT `*`/`>`/empty, so [`myelin_events::consumer::Subscription::bind`] accepts it and the
-/// head-of-line-block guard holds.
-///
-/// **Named deploy floor:** the production per-`(tenant, subsystem)` NATS routing key is the
-/// structured subject `evt.<tenant>.git.*` (`myelin_events::partition`); the cross-cell stream that
-/// filters git events for this consumer is the deploy-substrate follow-on. The prefilter here is the
-/// in-process/ArtifactRef form the `dispatch_app_spec` harness uses today.
 pub fn ci_trigger_subjects() -> &'static [SubjectPattern] {
-    // Peer-review finding 2026-07-16 #12: this was `SubjectPattern(String::new())` — an EMPTY prefix,
-    // and `Subscription::matches` is `subject.starts_with(&p.0)`, so an empty pattern MATCHES EVERY
-    // subject (match-all) — directly contradicting the doc above ("deliberately NOT */>/empty"). Any
-    // router iterating `EventHandler::subjects()` would treat it as a firehose subscription. Fixed to
-    // the SAME bounded `myelin://` prefix the live `Subscription` binds (`CI_TRIGGER_SUBJECT_STRS`),
-    // built via `OnceLock` (a non-empty `SubjectPattern` holds a `String`, not const-constructible in a
-    // plain `static` — the `myelin_git::check_status` precedent). The precise arming stays `handle`'s
-    // O(1) type match; this only bounds the transport-level whitelist so it is never over-broad.
     static SUBJECTS: OnceLock<Vec<SubjectPattern>> = OnceLock::new();
     SUBJECTS
         .get_or_init(|| {
@@ -180,23 +74,11 @@ pub fn ci_trigger_subjects() -> &'static [SubjectPattern] {
         .as_slice()
 }
 
-/// The `&str` subjects the live [`myelin_events::consumer::Subscription`] binds — the SOURCE OF TRUTH
-/// [`ci_trigger_subjects`] maps into `SubjectPattern`s, and the borrow the `Subscription::bind`
-/// constructor takes. `myelin://` is the bounded (non-`*`) transport prefix; the arming is `handle`'s type match.
 pub const CI_TRIGGER_SUBJECT_STRS: &[&str] = &["myelin://"];
 
-// =================================================================================================
-// 2. The git config-read seam (read `.myelin/ci.*` at the pushed ref).
-// =================================================================================================
-
-/// Why reading `.myelin/ci.*` at the pushed ref failed (a TRANSPORT/backend failure — distinct from
-/// "the file is simply absent", which is `Ok(None)`, a clean skip). A read error is fail-closed:
-/// the consumer does NOT start a run it cannot prove the definition of.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitReadError {
-    /// Backend, repository, or exact commit is temporarily unavailable. Redeliver.
     Unavailable(String),
-    /// The request/config object is permanently invalid (for example over the byte limit). DLQ.
     Invalid(String),
 }
 
@@ -219,14 +101,7 @@ impl std::fmt::Display for GitReadError {
 
 impl std::error::Error for GitReadError {}
 
-/// **The seam that reads ONE file from a repo at a ref (the myelin-git read backend, abstracted).**
-/// The consumer calls it through [`resolve_ci_config`] (which tries `.myelin/ci.toml` then
-/// `.json`). `Ok(None)` == the path is absent at that ref (a clean skip, NOT an error); `Ok(Some)` ==
-/// the raw file bytes. The production adapter ([`DurableGitConfigReader`]) wraps
-/// `myelin_git::durable`'s `read_blob_at_path`; a unit test uses [`MapGitConfigReader`].
 pub trait GitConfigReader: Send + Sync {
-    /// Read `path` at `oid` in `(tenant, region, repo)`. `Ok(None)` iff the path is absent at that
-    /// ref (a clean "no file" skip); `Err` iff the backend read itself failed (fail-closed).
     fn read_repo_file(
         &self,
         tenant: &str,
@@ -257,27 +132,15 @@ pub trait GitConfigReader: Send + Sync {
     }
 }
 
-/// The `.myelin/ci.*` paths tried, in priority order: TOML (the primary authored surface, arch 02
-/// §7.4) then JSON (the JSON-Schema'd core). YAML is deferred (no workspace YAML dep — see
-/// [`ConfigFormat`]); a repo authoring `.myelin/ci.yaml` therefore reads as "no config" here (a clean
-/// skip), the SAME named-defer the parser records.
 const CI_CONFIG_CANDIDATES: &[(&str, ConfigFormat)] = &[
     (".myelin/ci.toml", ConfigFormat::Toml),
     (".myelin/ci.json", ConfigFormat::Json),
 ];
 
-/// The repository-root `Cargo.lock` path read at the pushed ref to key the server-trusted Cargo
-/// vendor selection for a structured build (CT-007 gate 4, blocker 1).
 const ROOT_CARGO_LOCK_PATH: &str = "Cargo.lock";
 
-/// Hard ceiling on the root `Cargo.lock` bytes read for vendor selection. Far above any real lock
-/// (this workspace's 443-crate lock is well under 1 MiB) and bounded so a hostile push cannot force
-/// an unbounded read. A lock above this is refused fail-closed as an invalid read.
 const MAX_CARGO_LOCK_BYTES: usize = 8 * 1024 * 1024;
 
-/// **Resolve the pushed repo's `.myelin/ci.*` at `oid`** — try `.myelin/ci.toml`, then
-/// `.myelin/ci.json`. `Ok(None)` iff NEITHER exists (a clean "no pipeline armed" skip, NOT an error);
-/// `Ok(Some((bytes, format)))` for the first present candidate; `Err` iff a backend read failed.
 pub fn resolve_ci_config(
     reader: &dyn GitConfigReader,
     tenant: &str,
@@ -300,62 +163,29 @@ pub fn resolve_ci_config(
     Ok(None)
 }
 
-// =================================================================================================
-// 3. The reserve-persistence seam (persist the atomic bundle DURABLY).
-// =================================================================================================
-
-/// The extra `ci_run`-row facts the reserve bundle needs beyond the [`crate::resolve::CiRunWrite`]
-/// (the columns the `CREATE_CI_RUN_DDL` requires but the pure resolve core does not model): the
-/// residency region, the `(project, pipeline)` ids, the pre-minted `wf_run_id`, and the correlation.
-///
-/// `project_id`/`pipeline_id` are DETERMINISTIC PLACEHOLDERS from the repo ref (the real
-/// repo→pipeline registry is the named floor). `wf_run_id` is PRE-MINTED here (deterministic from the
-/// run) — CT-004c/d starts the `ci.pipeline` workflow WITH it (the `DurableExecutor::start` is out of
-/// scope). `correlation_id` is the triggering envelope's (real provenance).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReserveFacts {
-    /// The residency region (`ci_run.region`) — from the triggering envelope.
     pub region: String,
-    /// The CI project id (`ci_run.project_id`, uuid) — a deterministic placeholder from the repo ref
-    /// (the repo→project registry is the named floor).
     pub project_id: String,
-    /// The CI pipeline id (`ci_run.pipeline_id`, uuid) — a deterministic placeholder (named floor).
     pub pipeline_id: String,
-    /// The workflow run id (`ci_run.wf_run_id`, uuid) — PRE-MINTED here; CT-004c/d starts the
-    /// workflow with it (`DurableExecutor::start` is out of scope).
     pub wf_run_id: String,
-    /// The correlation id (`ci_run.correlation_id`) — the triggering envelope's correlation.
     pub correlation_id: String,
     pub repo_ref: String,
     pub commit_oid: String,
-    /// Canonical PR supersession identity derived from validated event provenance. `None` for
-    /// non-PR triggers.
     pub concurrency_group: Option<String>,
-    /// Producer-authored, transactionally serialized positive PR row generation. This is the
-    /// durable newest-head ordering authority; `None` is only for non-PR triggers.
     pub pr_head_generation: Option<i64>,
 }
 
-/// A fully-armed run ready to persist: the atomic [`StartHandoff`] bundle + the extra `ci_run` facts
-/// + the tenant/actor the durable write is scoped to. This is the value a [`ReserveStore`] commits.
 #[derive(Clone, Debug)]
 pub struct ArmedRun {
-    /// The atomic reserve/start bundle (the `ci_run` row + `ci.run.started` + the queued checks).
     pub handoff: StartHandoff,
-    /// The extra `ci_run`-row facts (region / ids / correlation).
     pub reserve: ReserveFacts,
-    /// The tenant the durable write is partitioned under.
     pub tenant: TenantId,
-    /// The acting principal (the pushing pseudonym) — the `ci_run.triggered_by` provenance.
     pub actor: Actor,
-    /// The triggering envelope's ambient emit context (tenant/region/actor/clock) the co-committed
-    /// events derive their causality + partition from.
     pub emit_ctx: EmitContextBase,
-    /// The triggering event retained as the immediate causal parent of every reserve/start event.
     pub cause: EventEnvelope,
 }
 
-/// Why persisting the reserve bundle failed (fail-closed — surfaced, never swallowed).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReserveError(pub String);
 
@@ -367,16 +197,7 @@ impl std::fmt::Display for ReserveError {
 
 impl std::error::Error for ReserveError {}
 
-/// **The seam that DURABLY persists the atomic reserve/start bundle.** Production rides the
-/// consumer-runtime co-commit connection, so `ci_run`, `check_attempt`, `ci.run.started`, queued
-/// `ci.check.updated`, and the trigger dedup mark commit or roll back together.
-///
-/// A unit test uses [`RecordingReserveStore`]. The trait is SYNC to match the [`EventHandler::handle`]
-/// body (the durable impls bridge to async at their own boundary, the `PgOutboxBacking` idiom).
 pub trait ReserveStore: Send + Sync {
-    /// Persist the armed run's atomic bundle. Idempotent on the run identity (a redelivered trigger
-    /// mints the SAME `run_id` + the SAME deterministic event ids). `tx` is the consumer-runtime
-    /// co-commit handle (#7/MR-023b); production fails closed if it carries no durable connection.
     fn persist(
         &self,
         armed: &ArmedRun,
@@ -384,8 +205,6 @@ pub trait ReserveStore: Send + Sync {
     ) -> Result<(), ReserveError>;
 }
 
-/// Historical events-only store retained only as a test fixture for deterministic absorb behavior.
-/// It is not production-reachable and may only stamp the first-attempt fixture shape.
 #[cfg(any(test, feature = "test-support", feature = "integration"))]
 pub struct OutboxReserveStore {
     outbox: OutboxStore,
@@ -394,8 +213,6 @@ pub struct OutboxReserveStore {
 
 #[cfg(any(test, feature = "test-support", feature = "integration"))]
 impl OutboxReserveStore {
-    /// Build the store over the service's DURABLE outbox (the `main.rs`
-    /// `OutboxStore::durable(PgOutboxBacking)`) + the shared ULID minter.
     pub fn new(outbox: OutboxStore, minter: Arc<dyn IdMinter>) -> OutboxReserveStore {
         OutboxReserveStore { outbox, minter }
     }
@@ -412,7 +229,7 @@ impl ReserveStore for OutboxReserveStore {
             .outbox
             .begin(Arc::clone(&self.minter), armed.emit_ctx.clone());
         tx.stage_state_change(format!(
-            "ci_run {} reserved (queued) — the durable ROW co-commit is CoCommitReserveStore (chunk 4)",
+            "ci_run {} reserved (queued) - the durable ROW co-commit is CoCommitReserveStore (chunk 4)",
             armed.handoff.run_write.run_id
         ));
         let attempts = queued_contexts(armed)?
@@ -420,30 +237,11 @@ impl ReserveStore for OutboxReserveStore {
             .map(|context| (context, 1))
             .collect();
         emit_reserve_events(&mut tx, armed, &attempts)?;
-        // **H1 — ABSORB-mode commit (not the reject-arm `commit`).** A crash-window redelivery (the
-        // dedup mark not yet committed) re-runs this whole method and re-emits the SAME deterministic
-        // ids; `commit_absorb` `ON CONFLICT (event_id) DO NOTHING`s the byte-identical re-emit instead
-        // of `Err`ing → `Retry` → the UNBOUNDED LIVELOCK the reject-arm `commit` caused (H1). The events
-        // stay present exactly once; a divergent-payload collision still rejects.
         tx.commit_absorb()
             .map_err(|e| ReserveError(format!("outbox commit_absorb: {e:?}")))
     }
 }
 
-/// **Emit the reserve bundle's two co-emitted EVENTS (`ci.run.started` + the queued `ci.check.updated`
-/// per context) into an open outbox tx, with DETERMINISTIC ids (the absorb-mode idempotency anchor).**
-/// The shared staging helper keeps deterministic id derivation authored once.
-///
-/// **Peer-review #8: DETERMINISTIC co-emitted event ids.** The `ci.run.started` + each queued
-/// `ci.check.updated` id is derived from the (deterministic) `run_id` + the event's stable subject, so
-/// a REDELIVERED trigger re-emits the SAME ids and `commit_absorb` `ON CONFLICT DO NOTHING`s them.
-///
-/// **H3 (peer-review #7) — the check id includes the run_id.** The check subject is
-/// `repo#commit-<oid>/check-<context>` with NO run_id; two DISTINCT triggers on the same
-/// (repo, commit, context) mint DISTINCT runs but would have minted the SAME check id with DIFFERENT
-/// payloads (a collision). Seeding with the run_id (`evt:<run_id>:<subject>`) makes a redelivery of the
-/// SAME run still dedup while distinct runs diverge. `run.started` already carries the run_id in its
-/// subject (`ci/run/<run_id>`), so it is per-run unique already.
 fn emit_reserve_events(
     tx: &mut myelin_events::OutboxTransaction,
     armed: &ArmedRun,
@@ -475,11 +273,6 @@ fn emit_reserve_events(
     Ok(())
 }
 
-/// **Map an [`ArmedRun`] to the durable [`CiRunInsert`] the [`CiRunStore`] writes.** The mapping lives
-/// HERE (ci-controlplane cannot name `ArmedRun` — that edge would be a cycle). Every NOT-NULL `ci_run`
-/// column is set from the atomic bundle; `state = "queued"` (the reserve state). Repository,
-/// commit, and triggering pseudonym provenance come from the authoritative trigger envelope, never
-/// authored config. `cause_event_id` carries the triggering event identity.
 pub fn ci_run_insert_from_armed(armed: &ArmedRun) -> myelin_ci_controlplane::CiRunInsert {
     let rw = &armed.handoff.run_write;
     myelin_ci_controlplane::CiRunInsert {
@@ -505,12 +298,6 @@ pub fn ci_run_insert_from_armed(armed: &ArmedRun) -> myelin_ci_controlplane::CiR
     }
 }
 
-/// **The PRODUCTION reserve store.** Run row, retry-stable monotonic check attempts, canonical queued
-/// events, and trigger dedup mark share the consumer's transaction. The event envelopes are staged
-/// through the frozen detached-outbox builder and inserted through `PgRelay` on that same connection.
-///
-/// Out of scope (named): `DurableExecutor::start` (chunk 3), the `ci.pipeline` body (chunk 2), the
-/// scheduler/runner (chunk 5). This store writes the reserve run-of-record + emits the reserve events.
 pub struct CoCommitReserveStore {
     ci_run: myelin_ci_controlplane::CiRunStore,
     minter: Arc<dyn IdMinter>,
@@ -518,8 +305,6 @@ pub struct CoCommitReserveStore {
 }
 
 impl CoCommitReserveStore {
-    /// Build the production reserve store from the durable CI writer, deterministic event-id source,
-    /// and runtime bridge.
     pub fn new(
         ci_run: myelin_ci_controlplane::CiRunStore,
         minter: Arc<dyn IdMinter>,
@@ -535,9 +320,6 @@ impl ReserveStore for CoCommitReserveStore {
         armed: &ArmedRun,
         tx: &mut myelin_events::HandlerTx<'_>,
     ) -> Result<(), ReserveError> {
-        // Allocate the monotonic attempt before the queued fact is materialised. The run row,
-        // check_attempt bump, queued facts, and consumer dedup mark all use the caller's transaction;
-        // a rerun can therefore never publish a stale hard-coded attempt or expose a green window.
         let row = ci_run_insert_from_armed(armed);
         let contexts = queued_contexts(armed)?;
         let minter = Arc::clone(&self.minter);
@@ -588,33 +370,15 @@ fn stage_reserve_events(
     tx.into_staged_rows().map_err(|error| error.0)
 }
 
-// =================================================================================================
-// 4. The dispatch plan (the pure pipeline core — testable per branch).
-// =================================================================================================
-
-/// Why a triggering event did NOT arm a run — every skip is a distinct, SURFACED reason (fail-closed,
-/// never a silent swallow). Clean/structural skips ACK; unavailable backing retries; permanently
-/// invalid Git reads dead-letter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SkipReason {
-    /// The event is not a CI trigger type (a non-git / non-armed event routed by the coarse prefix).
     NotATrigger(String),
-    /// The event payload lacked a required field (`repo` / `new_oid`) — malformed, fail-closed.
     MalformedPayload(String),
-    /// Envelope provenance is contradictory or invalid. This is permanent poison, never an
-    /// authored-config skip: subject/aggregate/payload disagreement reaches the durable DLQ.
     InvalidProvenance(String),
-    /// A backend read of `.myelin/ci.*` failed (fail-closed — no run without a proven definition).
     ReadFailed(GitReadError),
-    /// NO `.myelin/ci.*` at the pushed ref — a clean "no pipeline armed" skip (NOT an error).
     NoConfig,
-    /// The `.myelin/ci.*` was present but malformed — SURFACED, fail-closed (no run, no crash).
     ConfigError(CiConfigError),
-    /// The config parsed, but its armed trigger does NOT match THIS event (e.g. a `pull_request`
-    /// config on a push).
     TriggerNotMatched,
-    /// The definition failed to resolve (a floating tag / cycle / dangling need) — SURFACED,
-    /// fail-closed (the supply-chain control; no un-digested reference reaches a run).
     ResolveError(ResolveError),
 }
 
@@ -626,11 +390,11 @@ impl std::fmt::Display for SkipReason {
             SkipReason::InvalidProvenance(m) => write!(f, "invalid trigger provenance: {m}"),
             SkipReason::ReadFailed(e) => write!(f, "{e}"),
             SkipReason::NoConfig => {
-                write!(f, "no `.myelin/ci.*` at the pushed ref — no pipeline armed")
+                write!(f, "no `.myelin/ci.*` at the pushed ref - no pipeline armed")
             }
             SkipReason::ConfigError(e) => write!(f, "malformed `.myelin/ci.*` (fail-closed): {e}"),
             SkipReason::TriggerNotMatched => {
-                write!(f, "the armed trigger does not match this event — no run")
+                write!(f, "the armed trigger does not match this event - no run")
             }
             SkipReason::ResolveError(e) => {
                 write!(f, "the definition failed to resolve (fail-closed): {e}")
@@ -639,18 +403,12 @@ impl std::fmt::Display for SkipReason {
     }
 }
 
-/// The outcome of planning a dispatch for one triggering event: either an ARMED run (the atomic
-/// bundle ready to persist) or a SURFACED skip (with the typed reason). This is the pure pipeline —
-/// [`CiTriggerHandler::handle`] persists an `Arm` through the [`ReserveStore`] and logs a `Skip`.
 #[derive(Debug)]
 pub enum DispatchOutcome {
-    /// The event armed a run — the atomic bundle to persist.
     Arm(Box<ArmedRun>),
-    /// The event did not arm a run — the surfaced reason.
     Skip(SkipReason),
 }
 
-/// Canonical repository, immutable commit, and fork provenance from a triggering envelope.
 struct TriggerFacts {
     repo: String,
     new_oid: String,
@@ -659,12 +417,8 @@ struct TriggerFacts {
     pr_head_generation: Option<i64>,
 }
 
-/// Parse the triggering-event provenance from the envelope payload (arch 02 §1). `git.ref.updated`
-/// carries `{repo, ref, new_oid, ...}`; the PR events carry the head oid + a fork flag. Returns the
-/// facts, or the malformed-payload reason (fail-closed).
 fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
     let p = &ev.payload;
-    // `repo` is the repository ref the push landed on (the ci_run repo_ref + the git read key).
     let repo = p
         .get("repo")
         .and_then(|v| v.as_str())
@@ -675,8 +429,6 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         SkipReason::InvalidProvenance(format!("invalid payload repository {repo:?}: {error}"))
     })?;
 
-    // Subject, aggregate, and payload are mutually distrustful provenance inputs. All three must
-    // identify the same push/PR before any Git or CAS read is attempted.
     let (oid_field, concurrency_group, pr_head_generation) =
         if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
             let ref_name = p
@@ -736,18 +488,12 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
             ("head_oid", Some(group), Some(generation))
         };
 
-    // Only an immutable full SHA-1 oid is admitted. Refs, HEAD, revspecs, and abbreviations are
-    // permanently invalid and are refused before crossing the Git reader seam.
     let raw_oid = p
         .get(oid_field)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| SkipReason::MalformedPayload(format!("missing `{oid_field}`")))?;
     let new_oid = canonical_commit_oid(raw_oid)?;
-    // Fork provenance is trust input, not a best-effort hint. PR producers MUST provide an
-    // explicit boolean. Push producers predate the field, so absence remains a member push; any
-    // alias they do provide is nevertheless validated and preserved. If canonical + legacy aliases
-    // coexist they must agree, otherwise field ordering could choose which trust result wins.
     let requires_fork_evidence = ev.type_.0 == myelin_git::events::GIT_PR_OPENED
         || ev.type_.0 == myelin_git::events::GIT_PR_SYNCHRONIZED;
     let is_fork = parse_fork_evidence(p, requires_fork_evidence)?;
@@ -789,8 +535,6 @@ fn canonical_commit_oid(raw: &str) -> Result<String, SkipReason> {
     Ok(raw.to_ascii_lowercase())
 }
 
-/// Parse and reconcile canonical/legacy fork provenance without ever defaulting malformed trust
-/// input to a trusted member run. PR events require evidence; push events preserve legacy absence.
 fn parse_fork_evidence(payload: &serde_json::Value, required: bool) -> Result<bool, SkipReason> {
     let canonical = payload.get("is_fork");
     let legacy = payload.get("forked");
@@ -820,10 +564,6 @@ fn parse_fork_evidence(payload: &serde_json::Value, required: bool) -> Result<bo
     }
 }
 
-/// Which [`OnTrigger`] an event TYPE could arm (the reverse of [`OnTrigger::event_types`]). `None`
-/// for a non-CI-trigger type (a clean skip). Only `push` / `pull_request` are wired in this chunk;
-/// the other triggers (issue/manual/schedule/agent) are recognised but arm through their own
-/// producers (named — this consumer subscribes to the git push/PR seam).
 fn on_trigger_for_type(event_type: &str) -> Option<OnTrigger> {
     if event_type == myelin_git::events::GIT_REF_UPDATED {
         Some(OnTrigger::Push)
@@ -836,27 +576,10 @@ fn on_trigger_for_type(event_type: &str) -> Option<OnTrigger> {
     }
 }
 
-/// **The DETERMINISTIC `ci.check.updated` event id for a (run, check-subject) pair (H3 — peer-review
-/// #7 re-prosecution).** Seeded with the `run_id` so a REDELIVERY of the SAME run (same deterministic
-/// run_id) re-mints the SAME id (dedup/absorb), while two DISTINCT runs on the same
-/// `(repo, commit, context)` — a re-opened PR on the same head, the same commit on a second ref, two
-/// PRs sharing a head — diverge (distinct ids, no collision). The check SUBJECT alone omits the run_id
-/// (`repo#commit-<oid>/check-<context>`), so seeding on the subject ONLY (the pre-fix bug) made those
-/// distinct runs collide on the same id with DIFFERENT payloads.
-///
-/// LOW aside (named, not fixed): [`deterministic_uuid`] is a 2×-salted FNV-64 (non-cryptographic) over
-/// possibly attacker-authored job/context names; it guards a DEDUP boundary (a collision would merge
-/// two runs' checks), not an auth boundary. FNV is fine for the dedup role; if this ever gates trust,
-/// swap to a keyed/crypto hash. Documented here, not silently relied upon.
 pub fn check_event_id(run_id: &str, check_subject: &str) -> EventId {
     EventId(deterministic_uuid(&format!("evt:{run_id}:{check_subject}")))
 }
 
-/// **A deterministic uuid-shaped string from a seed (FNV-1a fill).** The `ci_run` `run_id` /
-/// `wf_run_id` / `project_id` / `pipeline_id` columns are `uuid`; deriving them deterministically
-/// from the triggering `event_id` (run/wf) or the repo ref (project/pipeline) makes a REDELIVERED
-/// trigger mint the SAME ids — the `ON CONFLICT (tenant_id, run_id) DO NOTHING` idempotency guard
-/// (exactly-once run under at-least-once delivery), and reproducible test assertions.
 pub fn deterministic_uuid(seed: &str) -> String {
     let fill = |salt: u64| -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ salt;
@@ -868,7 +591,6 @@ pub fn deterministic_uuid(seed: &str) -> String {
     };
     let a = fill(0);
     let b = fill(0x00ff_00ff_00ff_00ff);
-    // Render the 16 bytes as a canonical uuid string (8-4-4-4-12).
     let bytes = [a.to_be_bytes(), b.to_be_bytes()].concat();
     format!(
         "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
@@ -877,21 +599,15 @@ pub fn deterministic_uuid(seed: &str) -> String {
     )
 }
 
-/// **The pure dispatch pipeline (arch 02 §1): match → read → parse → trigger-match → trust-stamp →
-/// resolve → reserve.** Given a triggering envelope, the git reader, and the tenant's blob store,
-/// returns the ARMED bundle or a SURFACED skip. This is the testable core [`CiTriggerHandler::handle`]
-/// drives; every branch is a distinct [`SkipReason`] / an `Arm`.
 pub fn plan_dispatch(
     ev: &EventEnvelope,
     reader: &dyn GitConfigReader,
     blobs: &dyn BlobStore,
 ) -> DispatchOutcome {
-    // 1. Subject-match: is this a CI trigger type at all?
     let Some(on) = on_trigger_for_type(&ev.type_.0) else {
         return DispatchOutcome::Skip(SkipReason::NotATrigger(ev.type_.0.clone()));
     };
 
-    // 1b. Parse the triggering provenance (repo, head oid, fork flag).
     let facts = match trigger_facts(ev) {
         Ok(f) => f,
         Err(reason) => return DispatchOutcome::Skip(reason),
@@ -900,7 +616,6 @@ pub fn plan_dispatch(
     let tenant = ev.tenant.clone();
     let region = ev.region.0.clone();
 
-    // 2. Read `.myelin/ci.toml` (then `.json`) at the pushed ref.
     let config = match resolve_ci_config(reader, &tenant.0, &region, &facts.repo, &facts.new_oid) {
         Ok(Some(c)) => c,
         Ok(None) => return DispatchOutcome::Skip(SkipReason::NoConfig),
@@ -908,7 +623,6 @@ pub fn plan_dispatch(
     };
     let (bytes, format) = config;
 
-    // 3. Parse — a CiConfigError is a fail-closed, SURFACED skip (no crash, no run).
     let format_hint = match format {
         ConfigFormat::Toml => ".myelin/ci.toml",
         ConfigFormat::Json => ".myelin/ci.json",
@@ -918,16 +632,6 @@ pub fn plan_dispatch(
         Err(e) => return DispatchOutcome::Skip(SkipReason::ConfigError(e.into_legacy_surface())),
     };
 
-    // 4. Compile the armed trigger and ask: does THIS event match? The config's `on:` compiles to the
-    //    ONE `QueryAst` (CI-P10, contract 3.4 — NOT a CI DSL / CEL); a compile error is a fail-closed
-    //    skip. The MATCH DECISION is the TYPE-FAMILY equality: the arrived event type maps (via
-    //    [`on_trigger_for_type`]) back to `on`, and the config's armed trigger must be the SAME family
-    //    — so a repo whose config is `on = "pull_request"` does NOT arm on a push, and vice-versa.
-    //
-    //    (`EventMatcher::matches` is the RUN-object visibility gate keyed on a `run` subject — the
-    //    authz reverse-index over WHICH runs a viewer may arm; it is NOT the "does this push event's
-    //    type match" question, whose subject is a git ref, not a run. The two-halves seam: the type
-    //    predicate here, the run-object visibility at the authz layer — named.)
     if let Err(e) = compile_trigger(&def.on) {
         return DispatchOutcome::Skip(SkipReason::MalformedPayload(format!(
             "trigger compile: {e}"
@@ -937,10 +641,6 @@ pub fn plan_dispatch(
         return DispatchOutcome::Skip(SkipReason::TriggerNotMatched);
     }
 
-    // 5. Trust-stamp (X-1) — the single evaluation stamped onto BOTH the run + every check.
-    //    A member push is Trusted; a fork PR is UntrustedFork. The ReBAC `read & !is_untrusted_fork`
-    //    ABAC edge (contract 4.9) that cross-checks the structural flag is the named Identity seam;
-    //    here `read_excludes_fork = !is_fork` mirrors the structural provenance fail-closed.
     let provenance = RunProvenance {
         is_fork: facts.is_fork,
         targets_self_hosted: false,
@@ -948,11 +648,6 @@ pub fn plan_dispatch(
     };
     let stamp: TrustStamp = stamp_trust(&provenance);
 
-    // 6. Resolve the CAS snapshot — a ResolveError (floating tag / cycle) is a fail-closed skip.
-    //    A structured Cargo build additionally needs the server-trusted vendor tree selected from the
-    //    repo's ROOT Cargo.lock at THIS ref (the same ref the config was read from). Read the lock
-    //    ONLY when a structured build is present, so a non-Cargo pipeline never depends on a committed
-    //    lock; a backend read failure is the SAME fail-closed skip as a failed config read.
     let root_cargo_lock: Option<Vec<u8>> = if def.jobs.iter().any(|job| job.build.is_some()) {
         match reader.read_repo_file_bounded(
             &tenant.0,
@@ -979,8 +674,6 @@ pub fn plan_dispatch(
     };
     let snapshot = snapshot_ref(&tenant, &address);
 
-    // 7. Reserve/start — build the atomic bundle. The run_id is deterministic from the triggering
-    //    event_id (idempotent: a redelivery mints the SAME run). One check context per top-level job.
     let run_id = deterministic_uuid(&format!("run:{}", ev.event_id.0));
     let wf_run_id = deterministic_uuid(&format!("wf:{}", ev.event_id.0));
     let contexts: Vec<CheckContext> = def
@@ -1031,31 +724,15 @@ pub fn plan_dispatch(
     }))
 }
 
-// =================================================================================================
-// 5. The live EventHandler.
-// =================================================================================================
-
-/// **The live `ci-dispatch.trigger` bus consumer (the CT-004b deliverable).** On a matching
-/// `git.ref.updated` / PR event it drives [`plan_dispatch`] and, on an `Arm`, persists the atomic
-/// reserve bundle through the [`ReserveStore`]; every `Skip` is surfaced, then classified as a
-/// clean/structural ACK, transient retry, or permanent dead-letter. The
-/// `Consumer` runtime wraps this with the seven rules (rule-1 dedup on `event_id` via the durable
-/// `consumer_dedup` ledger, ack-after-enqueue, bounded prefetch, the lag metric) — this body is the
-/// trigger LOGIC only. Idempotent on `event_id` twice over: the runtime's dedup AND the deterministic
-/// `run_id` (`ON CONFLICT DO NOTHING`).
 pub struct CiTriggerHandler {
     reader: Arc<dyn GitConfigReader>,
     blobs: Arc<dyn BlobStore + Send + Sync>,
     reserve: Arc<dyn ReserveStore>,
     expected_region: Option<String>,
-    /// The last outcomes (surfaced skips + armed runs), bounded — the observability the drill reads
-    /// (a skip is NOT silent). Bounded so it cannot grow unboundedly under a busy consumer.
     trace: Mutex<Vec<String>>,
 }
 
 impl CiTriggerHandler {
-    /// Build the handler from the three seams: the git config reader, the tenant blob store (the CAS
-    /// snapshot sink), and the durable reserve store.
     pub fn new(
         reader: Arc<dyn GitConfigReader>,
         blobs: Arc<dyn BlobStore + Send + Sync>,
@@ -1070,7 +747,6 @@ impl CiTriggerHandler {
         }
     }
 
-    /// Bind production intake to the configured cell region.
     pub fn for_region(
         reader: Arc<dyn GitConfigReader>,
         blobs: Arc<dyn BlobStore + Send + Sync>,
@@ -1086,14 +762,10 @@ impl CiTriggerHandler {
         }
     }
 
-    /// The consumer's durable name (the `consumer_dedup` PK half — one stable name for the trigger
-    /// leg, so a triggering `event_id` dedups against exactly this consumer's prior effects).
     pub fn consumer_name(&self) -> &'static str {
         TRIGGER_CONSUMER
     }
 
-    /// The bounded outcome trace (the surfaced skips + armed-run ids) — the observability a drill
-    /// reads to assert a malformed config was a surfaced skip, not a silent swallow.
     pub fn trace(&self) -> Vec<String> {
         self.trace.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
@@ -1107,12 +779,6 @@ impl CiTriggerHandler {
     }
 }
 
-/// **Build the registered `ci-dispatch.trigger` [`ConsumerReg`] from the three seams.** The one
-/// construction site both `main.rs` (production wiring) and the integration test use: it binds the
-/// `*`-free whitelist ([`CI_TRIGGER_SUBJECT_STRS`]), wraps the [`CiTriggerHandler`] in the
-/// `Consumer` runtime (rule-1 dedup + ack-after-enqueue + bounded prefetch + the lag metric), and
-/// returns the `ConsumerReg` `dispatch_app_spec` carries. The `dedup` ledger is the runtime's
-/// exactly-once-effect guard (the durable `consumer_dedup` in production).
 pub fn build_trigger_consumer(
     reader: Arc<dyn GitConfigReader>,
     blobs: Arc<dyn BlobStore + Send + Sync>,
@@ -1143,8 +809,6 @@ fn pr_trigger_upcasters() -> UpcasterRegistry {
             myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2,
             |mut event| {
                 if let Some(payload) = event.payload.as_object_mut() {
-                    // V1 never defined this field. Opening the row creates git_pr.version=1, so the
-                    // only deterministic upcast is to overwrite any unknown legacy key with 1.
                     payload.insert("head_generation".into(), serde_json::json!(1));
                 }
                 event.schema_ver = myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2;
@@ -1158,9 +822,6 @@ fn pr_trigger_upcasters() -> UpcasterRegistry {
             1,
             myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2,
             |mut event| {
-                // A legacy synchronized event has no deterministic generation. Preserve a field if
-                // its producer supplied one, but never invent ordering authority when it is absent;
-                // the v2 handler will reject that event loudly.
                 event.schema_ver = myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2;
                 event
             },
@@ -1188,9 +849,6 @@ impl EventHandler for CiTriggerHandler {
             }
         }
         match plan_dispatch(ev, self.reader.as_ref(), self.blobs.as_ref()) {
-            // Thread the consumer-runtime co-commit handle (`tx`) into the reserve store: the true
-            // co-commit impl writes the bundle on the SAME tx as the dedup mark (#7); the production
-            // outbox impl ignores it and rides its own absorb-mode outbox (H1).
             DispatchOutcome::Arm(armed) => match self.reserve.persist(&armed, tx) {
                 Ok(()) => {
                     self.record(format!(
@@ -1201,18 +859,12 @@ impl EventHandler for CiTriggerHandler {
                     ));
                     HandleOutcome::Done
                 }
-                // A durable-write failure is RETRYABLE (a transient DB/broker hiccup): NOT poison,
-                // NOT a silent swallow — the message stays pending and redelivers (the dedup +
-                // deterministic run_id make the retry exactly-once).
                 Err(e) => {
                     self.record(format!("reserve FAILED (retry): {e}"));
                     HandleOutcome::Retry(myelin_events::Backoff { seconds: 5 })
                 }
             },
             DispatchOutcome::Skip(reason) => {
-                // Every skip is SURFACED. A NotATrigger/NoConfig clean skip is not recorded; backing
-                // unavailability retries without committing dedup, permanent Git invalidity poisons,
-                // and structural config/resolve skips are terminal ACKs.
                 match &reason {
                     SkipReason::NotATrigger(_) | SkipReason::NoConfig => {}
                     other => self.record(format!("skip: {other}")),
@@ -1220,8 +872,6 @@ impl EventHandler for CiTriggerHandler {
                 if matches!(&reason, SkipReason::ReadFailed(error) if error.is_retryable()) {
                     HandleOutcome::Retry(myelin_events::Backoff { seconds: 5 })
                 } else if matches!(reason, SkipReason::InvalidProvenance(_)) {
-                    // The detailed, attacker-controlled provenance stays only in the bounded
-                    // in-process trace above; the durable DLQ reason is deliberately PII-free.
                     HandleOutcome::NonRetryable(myelin_events::Reason(
                         "invalid trigger provenance".into(),
                     ))
@@ -1238,8 +888,6 @@ impl EventHandler for CiTriggerHandler {
                         backoff: myelin_events::Backoff { seconds: 5 },
                     }
                 } else if matches!(reason, SkipReason::ResolveError(ResolveError::BlobWrite(_))) {
-                    // Preserve explicit retry semantics for non-backend BlobStore write failures;
-                    // a missing snapshot is never flattened into Done/ACK.
                     HandleOutcome::Retry(myelin_events::Backoff { seconds: 5 })
                 } else {
                     HandleOutcome::Done
@@ -1249,13 +897,6 @@ impl EventHandler for CiTriggerHandler {
     }
 }
 
-// =================================================================================================
-// 6. Test doubles (unit-test-only; DB-free) + the durable git reader adapter.
-// =================================================================================================
-
-/// **A DB-free [`GitConfigReader`] test double: a map of `(repo, oid, path) → bytes`.** Absent keys
-/// read as `Ok(None)` (a clean skip); a key registered with an error-sentinel yields `Err` (the
-/// read-failed branch). Used by the unit tests to drive every pipeline branch DB-free.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct MapGitConfigReader {
@@ -1265,12 +906,10 @@ pub struct MapGitConfigReader {
 
 #[cfg(any(test, feature = "test-support"))]
 impl MapGitConfigReader {
-    /// A fresh, empty reader (every read is `Ok(None)` — the no-config skip).
     pub fn new() -> MapGitConfigReader {
         MapGitConfigReader::default()
     }
 
-    /// Register `bytes` at `(repo, oid, path)`.
     pub fn with_file(
         mut self,
         repo: &str,
@@ -1283,7 +922,6 @@ impl MapGitConfigReader {
         self
     }
 
-    /// Register a backend READ FAILURE at `(repo, oid, path)` (the fail-closed branch).
     pub fn with_failure(mut self, repo: &str, oid: &str, path: &str) -> MapGitConfigReader {
         self.fail.insert((repo.into(), oid.into(), path.into()));
         self
@@ -1310,10 +948,6 @@ impl GitConfigReader for MapGitConfigReader {
     }
 }
 
-/// **A DB-free [`ReserveStore`] test double: records the armed runs it was asked to persist.** Used
-/// by the unit tests to assert the atomic bundle the consumer produced (the `ci_run` row + the events)
-/// WITHOUT a live DB. NOT a durable store — it is a `#[cfg(test)]`-gated recorder, so the
-/// `no-in-memory-durable-store` lint (which strips test-gated doubles) does not fire.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub struct RecordingReserveStore {
@@ -1322,12 +956,10 @@ pub struct RecordingReserveStore {
 
 #[cfg(any(test, feature = "test-support"))]
 impl RecordingReserveStore {
-    /// A fresh recorder.
     pub fn new() -> RecordingReserveStore {
         RecordingReserveStore::default()
     }
 
-    /// The armed runs persisted so far (the atomic bundles the consumer produced).
     pub fn persisted(&self) -> Vec<ArmedRun> {
         self.persisted
             .lock()
@@ -1351,23 +983,11 @@ impl ReserveStore for RecordingReserveStore {
     }
 }
 
-/// **The production [`GitConfigReader`] adapter over the myelin-git durable read backend.** Wraps a
-/// `myelin_git::durable::DurableStore` (the on-disk repo store): `read_repo_file` opens the repo at
-/// `(tenant, region, repo)` and reads the blob at `oid`:`path` via `read_blob_at_path` (the SAME
-/// nested tree/blob navigation the repo-browser uses — never a reimplemented walk). A missing path /
-/// a path that resolves to a directory reads as `Ok(None)` (a clean skip); a backend error is
-/// `Err(GitReadError)` (fail-closed).
-///
-/// **Named cross-service floor:** in a split deployment the git repos live in the GIT service's
-/// storage, not the dispatch service's — reading blobs cross-service is a git-service read API
-/// (in-process `ReadBackend` or an RPC). This adapter is the in-cell/shared-storage form; the
-/// cross-cell git-read hop is the deploy follow-on.
 pub struct DurableGitConfigReader<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> {
     store: myelin_git::durable::DurableGitStore<P>,
 }
 
 impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> DurableGitConfigReader<P> {
-    /// Build the adapter over a durable repo store.
     pub fn new(store: myelin_git::durable::DurableGitStore<P>) -> DurableGitConfigReader<P> {
         DurableGitConfigReader { store }
     }
@@ -1418,7 +1038,6 @@ impl<P: myelin_git::gix_backend::RepoPathResolver + Send + Sync> GitConfigReader
                     oid.as_str()
                 )))
             }
-            // Absent or a directory at that name → no config file (a clean skip).
             myelin_git::durable::BlobPathLookup::Missing
             | myelin_git::durable::BlobPathLookup::IsDir => Ok(None),
         }
@@ -1451,7 +1070,6 @@ mod tests {
         )
     }
 
-    /// A `git.ref.updated` envelope for `repo` pushing `new_oid`, with the given payload extras.
     fn push_envelope(repo: &str, new_oid: &str) -> EventEnvelope {
         let ref_key = myelin_git::receive_pack::GitRefEventKey::new(
             repo,
@@ -1829,8 +1447,6 @@ mod tests {
         assert!(ledger.is_empty(), "S3 retry rolls back the dedup mark");
     }
 
-    /// **subjects() is a whitelist, NEVER `*` (BUS-3).** The coarse prefix is bounded (non-`*`), so
-    /// `Subscription::bind` accepts it and the head-of-line guard holds.
     #[test]
     fn subjects_is_a_whitelist_never_wildcard() {
         let sub = myelin_events::consumer::Subscription::bind(
@@ -1844,15 +1460,12 @@ mod tests {
             assert_ne!(*s, ">", "no `>` in the whitelist");
             assert!(!s.is_empty(), "no empty (over-broad) subject");
         }
-        // Finding #12: the `SubjectPattern` form a router iterating `subjects()` sees must ALSO be
-        // bounded — an empty pattern is `starts_with("")` = match-all. Assert non-empty + non-wildcard,
-        // and that it mirrors the `&str` whitelist exactly (one source of truth).
         let patterns = ci_trigger_subjects();
         assert!(!patterns.is_empty(), "subjects() is a non-empty whitelist");
         for p in patterns {
             assert!(
                 !p.0.is_empty(),
-                "no EMPTY (match-all) SubjectPattern in subjects() — finding #12"
+                "no EMPTY (match-all) SubjectPattern in subjects() - finding #12"
             );
             assert_ne!(p.0, "*");
             assert_ne!(p.0, ">");
@@ -1864,7 +1477,6 @@ mod tests {
         );
     }
 
-    /// **No `.myelin/ci.*` at the pushed ref → a clean NoConfig skip (NOT an error, no run).**
     #[test]
     fn no_config_is_a_clean_skip() {
         let ev = push_envelope("web", TEST_OID);
@@ -1875,7 +1487,6 @@ mod tests {
         ));
     }
 
-    /// **A malformed `.myelin/ci.toml` → a fail-closed, SURFACED ConfigError skip (no run, no crash).**
     #[test]
     fn a_malformed_config_is_a_surfaced_skip() {
         let ev = push_envelope("web", TEST_OID);
@@ -1891,7 +1502,6 @@ mod tests {
         ));
     }
 
-    /// **A backend read failure → a fail-closed ReadFailed skip (no run without a proven definition).**
     #[test]
     fn a_read_failure_is_fail_closed() {
         let ev = push_envelope("web", TEST_OID);
@@ -1917,7 +1527,6 @@ mod tests {
         ));
     }
 
-    /// **A non-matching trigger (a `pull_request` config on a push) → TriggerNotMatched skip.**
     #[test]
     fn a_non_matching_trigger_skips() {
         let ev = push_envelope("web", TEST_OID);
@@ -1939,7 +1548,6 @@ mod tests {
         ));
     }
 
-    /// **A floating-tag config → a fail-closed ResolveError skip (the supply-chain control).**
     #[test]
     fn a_floating_tag_is_a_surfaced_resolve_skip() {
         let ev = push_envelope("web", TEST_OID);
@@ -1956,7 +1564,6 @@ mod tests {
         ));
     }
 
-    /// **A missing `repo`/`new_oid` payload → a fail-closed MalformedPayload skip.**
     #[test]
     fn a_malformed_payload_skips() {
         let mut ev = push_envelope("web", TEST_OID);
@@ -2300,9 +1907,6 @@ mod tests {
         ));
     }
 
-    /// **The HAPPY PATH: a digest-pinned `.myelin/ci.toml` on a matching push → an ARMED run** with
-    /// the atomic bundle (the `ci_run` row queued + `ci.run.started` + the queued check), the
-    /// deterministic run_id, and the Trusted (member push) stamp.
     #[test]
     fn the_happy_path_arms_the_atomic_bundle() {
         let ev = push_envelope("web", TEST_OID);
@@ -2311,7 +1915,6 @@ mod tests {
         let DispatchOutcome::Arm(armed) = arm(&ev, &reader) else {
             panic!("the digest-pinned config on a matching push must arm a run");
         };
-        // The atomic bundle invariant holds (the prompt GATE).
         assert!(
             armed.handoff.is_atomic_bundle(),
             "the reserve bundle is atomic"
@@ -2323,13 +1926,11 @@ mod tests {
         );
         assert_eq!(armed.handoff.run_write.trigger_kind, "push");
         assert_eq!(armed.handoff.run_write.cause_event_id, "ev-push-1");
-        // One queued ci.check.updated per top-level job (build).
         assert_eq!(
             armed.handoff.queued_checks.len(),
             1,
             "one queued check per job"
         );
-        // The run_id is deterministic from the event_id (idempotency anchor).
         assert_eq!(
             armed.handoff.run_write.run_id,
             deterministic_uuid("run:ev-push-1")
@@ -2372,7 +1973,6 @@ mod tests {
         assert!(decoded.as_v2().is_some());
     }
 
-    /// **A fork PR (is_fork) → an UntrustedFork stamp on BOTH the row AND every check (X-1).**
     #[test]
     fn a_fork_pr_stamps_untrusted_fork() {
         let ev = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": true }));
@@ -2410,7 +2010,6 @@ mod tests {
                 "X-1: 0 divergence"
             );
         }
-        // Cross-check the pure classifier agrees.
         assert_eq!(
             stamp_trust(&RunProvenance {
                 is_fork: true,
@@ -2422,8 +2021,6 @@ mod tests {
         );
     }
 
-    /// **The handler persists an armed run through the ReserveStore + is idempotent on redelivery**
-    /// (the SAME event_id → the SAME deterministic run_id → one persisted run, even delivered twice).
     #[test]
     fn the_handler_persists_and_is_idempotent() {
         let ev = push_envelope("web", TEST_OID);
@@ -2447,37 +2044,27 @@ mod tests {
             "redelivery is handled"
         );
         let persisted = store.persisted();
-        // The ReserveStore itself is called twice (the runtime's consumer_dedup is what suppresses the
-        // second delivery in production; here we prove BOTH calls mint the SAME run_id — the second
-        // durable write is an ON CONFLICT DO NOTHING no-op, not a second run).
         assert_eq!(persisted.len(), 2, "the handler ran on both deliveries");
         assert_eq!(
             persisted[0].handoff.run_write.run_id, persisted[1].handoff.run_write.run_id,
             "the redelivery mints the SAME deterministic run_id (exactly-once run)"
         );
-        // The surfaced trace shows the armed run (never a silent swallow).
         assert!(handler
             .trace()
             .iter()
             .any(|l| l.starts_with("armed run_id=")));
     }
 
-    /// **H3: the check event id includes the run_id — distinct runs on the SAME (repo, commit,
-    /// context) do NOT collide, and a redelivery of the SAME run re-mints the SAME id.** The check
-    /// SUBJECT is run-agnostic (`repo#commit-<oid>/check-<context>`), so seeding on the subject alone
-    /// (the pre-fix bug) minted ONE id for two distinct runs with DIFFERENT payloads (a collision).
     #[test]
     fn check_event_id_diverges_across_runs_stable_within_a_run() {
         let subject = "myelin://acme/git/ref/web:refs/heads/main#commit-deadbeef/check-build";
         let run_a = deterministic_uuid("run:ev-A");
         let run_b = deterministic_uuid("run:ev-B");
-        // Same run + same subject → SAME id (a redelivery dedups/absorbs).
         assert_eq!(
             check_event_id(&run_a, subject),
             check_event_id(&run_a, subject),
             "same run + subject is stable (redelivery dedups)"
         );
-        // DISTINCT runs + same subject → DISTINCT ids (no collision across runs).
         assert_ne!(
             check_event_id(&run_a, subject),
             check_event_id(&run_b, subject),
@@ -2485,7 +2072,6 @@ mod tests {
         );
     }
 
-    /// **deterministic_uuid is a valid uuid shape + stable per seed + distinct across seeds.**
     #[test]
     fn deterministic_uuid_is_stable_and_shaped() {
         let a = deterministic_uuid("run:ev-1");

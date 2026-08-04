@@ -1,19 +1,3 @@
-//! # GT-005 — a governed MCP `tools/call` lands the REAL durable git effect (mint → EffectApi → GT-003).
-//!
-//! The MR-021 `GovernedRouter` is the chokepoint (`mint_run_token → revocation consult → HITL gate →
-//! EffectApi::apply`, audited). GT-005 connects it to the real git effect by injecting
-//! [`myelin_edge::GitEffectApi`] — the concrete `EffectApi` body bound to the DURABLE GT-003 backend
-//! ([`myelin_edge::DurableGitBackend`]) under the run's verified `(tenant, region)` scope. This drives
-//! the MCP server as a real JSON-RPC peer and proves, against the running protocol + an on-disk repo:
-//!
-//!  - `tools/call git.open_pr` (NOT requires_approval) → MINTS a per-run token, routes through
-//!    `EffectApi::apply`, and the PR PERSISTS on disk (a fresh durable read reflects it); the result is
-//!    attributed to the run token + principal + tool (audit).
-//!  - `tools/call git.merge` (requires_approval) → HITL-gated WITHOUT approval (withheld, NOT applied);
-//!    WITH approval it routes to `EffectApi::apply` → the GT-003 merge gate BLOCKS (the repo-owned
-//!    branch-protection policy is unmet) → a loud Denied carrying the gate reason. The MCP tool
-//!    REFLECTS the server gate; it never bypasses it (the PR stays open on disk).
-
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -67,17 +51,6 @@ fn temp_root(tag: &str) -> PathBuf {
     p
 }
 
-/// Delete every `outbox` row for `tenant` (and any `outbox_quarantine` row referencing one),
-/// tolerating the SAME documented shared-host race `myelin-storage`'s
-/// `tests/common::delete_outbox_for_aggregate` already covers: this dev DB's `outbox`/
-/// `outbox_quarantine` tables are shared with the real, live founder dogfood outbox-publisher
-/// process, which can claim and quarantine one of this tenant's own event_ids (real reason
-/// observed on this host: `wrong_relay_region` — this test's `REGION` differs from the live
-/// relay's own configured region) in the narrow gap between our own claim and cleanup. A single
-/// delete-quarantine-then-delete-outbox pass can lose that race; retrying a bounded number of
-/// times closes the window without pretending to fully serialize against an independent,
-/// concurrently-running production process (a bigger, separate concern than this test's own
-/// cleanup — same reasoning `myelin-storage`'s helper documents).
 #[cfg(feature = "integration")]
 async fn delete_outbox_for_tenant(pool: &sqlx::PgPool, tenant: &str) {
     for _ in 0..5 {
@@ -131,7 +104,6 @@ fn human_principal_in(id: &str, tenant: &str, region: &str) -> Principal {
     p
 }
 
-/// Build a governed MCP server whose `EffectApi` body is the REAL git effect over `backend`.
 fn governed_git_server(backend: Arc<DurableGitBackend>) -> McpServer {
     governed_git_server_with_grants(
         backend,
@@ -209,9 +181,6 @@ fn governed_git_server_with_grants_scoped_at(
         },
     };
 
-    // THE GT-005 INJECTION: the concrete git EffectApi body over the durable backend, bound to the
-    // run's verified (tenant, region) + acting principal. R2.4: + the server-side HITL verdict
-    // store (the in-memory double of the durable agent_hitl_gate arm) and the approver set.
     let effect = GitEffectApi::new(backend, tenant, region, agent, boundary_authorizer);
     let router = GovernedRouter::with_approver_policy(
         minter,
@@ -305,8 +274,6 @@ fn call_with_key(name: &str, args: serde_json::Value, idempotency_key: &str) -> 
     .to_string()
 }
 
-/// R2.4: a re-drive PRESENTS the server-issued opaque gate id — the router looks it up in the
-/// server-side verdict store (a caller-supplied `granted` boolean is inert and never sent here).
 fn call_with_gate(name: &str, args: serde_json::Value, gate_id: &str) -> String {
     serde_json::json!({
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
@@ -320,8 +287,6 @@ fn call_with_gate(name: &str, args: serde_json::Value, gate_id: &str) -> String 
     .to_string()
 }
 
-/// `git.open_pr` through the governed router lands a DURABLE PR (fresh read reflects it), attributed to
-/// the minted run token + principal + tool.
 #[test]
 fn open_pr_routes_through_effect_api_and_persists_durably() {
     let actor = agent_principal("agent:claude");
@@ -333,7 +298,6 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
 
     let server = governed_git_server(backend.clone());
 
-    // Pre-state: no PR yet.
     assert!(backend
         .get_pr(TENANT, REGION, "alpha", 1, &actor)
         .unwrap()
@@ -348,8 +312,6 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["isError"], false, "open_pr applied: {v}");
 
-    // Attribution: the effect routed THROUGH EffectApi under the minted run token (jti) + principal +
-    // tool — the event id is produced by GitEffectApi from the RunCtx it was handed.
     let jti = v["result"]["_meta"]["runToken"].as_str().unwrap();
     let event_id = v["result"]["_meta"]["eventId"].as_str().unwrap();
     assert!(
@@ -366,7 +328,6 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
     );
     assert!(event_id.contains("tool:git.open_pr"));
 
-    // THE DURABLE EFFECT: a FRESH read of the on-disk backend reflects the new PR.
     let rec = backend
         .get_pr(TENANT, REGION, "alpha", 1, &actor)
         .unwrap()
@@ -374,7 +335,6 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
     assert_eq!(rec.number, 1);
     assert_eq!(rec.author_pseudonym, "agent:claude@acme.noreply");
 
-    // A SECOND fresh backend instance over the SAME root (a simulated restart) still serves it.
     let fresh = DurableGitBackend::rooted_inmem_for_test(&root);
     assert!(
         fresh
@@ -438,8 +398,6 @@ fn caller_keys_distinguish_intentional_identical_calls() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A response-lost MCP re-drive under the same authenticated run reuses the exact operation digest:
-/// PostgreSQL contains one PR, one review, and one lifecycle event for each mutation.
 #[cfg(feature = "integration")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
@@ -620,8 +578,6 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     );
     let mut open_jtis = Vec::new();
     for timestamp in ["2026-06-29T00:00:00Z", "2026-06-29T00:00:01Z"] {
-        // A fresh server/router has no in-memory token state and therefore remints a new JTI. The
-        // caller-stable namespaced key is the only invocation identity carried across this restart.
         let server = governed_git_server_with_grants_scoped_at(
             backend.clone(),
             &[
@@ -649,9 +605,6 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     }
     assert_ne!(open_jtis[0], open_jtis[1], "restart reminted the run token");
 
-    // The key namespace is tenant/region-global, not repository-local. Reusing the open key with
-    // different arguments against another repository is rejected before that repository allocates
-    // a PR number, writes state, or emits an event.
     let cross_repo = call_with_key(
         "git.open_pr",
         serde_json::json!({
@@ -697,9 +650,6 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         .unwrap()
         .is_none());
 
-    // Reusing an invocation key for a different command in the same repository does not mint a
-    // different operation identity. The durable command ledger sees a divergent payload and
-    // rejects it loudly; no review/event is appended.
     let misused = call_with_key(
         "git.submit_review",
         serde_json::json!({"repo": slug, "number": 1, "verdict": "approve"}),
@@ -831,8 +781,6 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         "one digest-only command per logical MCP effect"
     );
 
-    // Seed both boot-recovery classes. First, a committed ref witness whose filesystem CAS did not
-    // run. Second, a durable pending merge intent/command whose locked target CAS still has to run.
     let recovery_ctx = EmitContextBase {
         tenant: TenantId(live_tenant.clone()),
         region: Region(REGION.into()),
@@ -1030,10 +978,6 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// `git.merge` is HITL-gated (frozen `requires_approval`): WITHOUT approval it is withheld (not
-/// applied); WITH approval it routes to `EffectApi::apply` → the GT-003 merge gate BLOCKS (unmet
-/// branch-protection policy) → Denied with the gate reason. The PR is NEVER merged (the gate is
-/// server-enforced; the MCP tool reflects it, never bypasses).
 #[test]
 fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
     let actor = agent_principal("agent:claude");
@@ -1042,7 +986,6 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
     backend
         .create_repo(TENANT, REGION, "alpha")
         .expect("create repo");
-    // Repo-owned branch protection: require a CI context that is never green → the merge gate must block.
     backend
         .set_branch_protection(
             TENANT,
@@ -1057,7 +1000,6 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
             }),
         )
         .expect("set branch protection");
-    // Open PR #1 (no green checks, no approvals) — the merge gate will block it.
     backend
         .open_pr(
             TENANT,
@@ -1070,8 +1012,6 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
 
     let server = governed_git_server(backend.clone());
 
-    // (1) WITHOUT approval → HITL-gated (withheld, NOT applied). No EffectApi::apply ran. The
-    //     gate id is the R2.4 opaque server-issued token backing a `waiting` verdict row.
     let gated = server
         .handle_line(&call(
             "git.merge",
@@ -1088,9 +1028,6 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
         "a gated merge did NOT apply"
     );
 
-    // (2) A DISTINCT human approves SERVER-SIDE (R2.4 — never a caller boolean), then the re-drive
-    //     presenting the gate id routes through EffectApi::apply → the server merge gate BLOCKS.
-    //     Denied, carrying the gate reason (the tool REFLECTS the gate, never bypasses).
     server
         .router()
         .unwrap()
@@ -1114,7 +1051,6 @@ fn merge_is_hitl_gated_then_reflects_the_server_gate_block() {
         "the gate reason is surfaced: {reason}"
     );
 
-    // THE GATE WAS NOT BYPASSED: the PR is still open on disk (never merged).
     let rec = backend
         .get_pr(TENANT, REGION, "alpha", 1, &actor)
         .unwrap()

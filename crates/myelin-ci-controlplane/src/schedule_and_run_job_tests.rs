@@ -1,11 +1,3 @@
-//! Unit tests for the `SCHEDULE_AND_RUN_JOB` dispatch handshake (CI-P16 → P-359, M4).
-//!
-//! These prove CI's HALF of the frozen handshake (arch 02 §3.3): the dispatch ENQUEUES into
-//! `job_queue` idempotently on the engine-minted `idem_token`, the scheduling terms ride the row, and
-//! the terminal `job.done` completion is idempotent. The engine half (the deterministic `idem_token`
-//! mint, the park, the `wf_signal` PK dedup) is proven in `myelin-flow/src/job.rs`; the END-TO-END
-//! effectively-once drill (kill runner + control plane mid-run) is `tests/drills_ci_p16_*.rs`.
-
 use super::*;
 use crate::scheduler::{ClaimRequest, JobState, Lane, SchedulerState, TrustTier};
 use myelin_flow::{JobKind, JobRunner, JobSpec};
@@ -28,7 +20,6 @@ fn runner() -> SchedulerJobRunner {
     )
 }
 
-/// A `JobSpec` as the engine hands it to the runner: the deterministic `idem_token` already stamped.
 fn dispatched_spec(idem_token: &str, target: &str) -> JobSpec {
     JobSpec {
         kind: JobKind::Ci,
@@ -37,9 +28,6 @@ fn dispatched_spec(idem_token: &str, target: &str) -> JobSpec {
     }
 }
 
-/// **A dispatch ENQUEUES one `job_queue` row with the run's scheduling terms (arch §3.3 step 1).** The
-/// engine-minted `idem_token` is BOTH the `job_id` and the `jq_idem` key; the lane/trust/fair-key ride
-/// the row (the claim orders/filters on them).
 #[test]
 fn dispatch_enqueues_one_job_queue_row_with_the_scheduling_terms() {
     let r = runner();
@@ -71,9 +59,6 @@ fn dispatch_enqueues_one_job_queue_row_with_the_scheduling_terms() {
     assert_eq!(job.state, JobState::Queued, "the job is claimable");
 }
 
-/// **The effectively-once floor: a RE-DISPATCH on the SAME `idem_token` is ONE row (the `jq_idem`
-/// unique, arch §3.3 step 4 / CI-D1).** A control-plane replay re-derives the SAME deterministic
-/// `idem_token` and re-dispatches; the enqueue is idempotent → still exactly one job (0 double-run).
 #[test]
 fn a_re_dispatch_on_the_same_idem_token_is_one_row() {
     let r = runner();
@@ -82,11 +67,8 @@ fn a_re_dispatch_on_the_same_idem_token_is_one_row() {
         "pipeline://acme/ci/pr-7#build",
     );
 
-    // First dispatch: inserts.
     r.dispatch(&spec).expect("dispatch 1");
-    // Control-plane replay re-dispatches the SAME idem_token (the engine re-derived it).
     r.dispatch(&spec).expect("dispatch 2 (replay)");
-    // A redundant third (the activity retry under at-least-once).
     r.dispatch(&spec).expect("dispatch 3 (retry)");
 
     let sched = r.scheduler().lock().unwrap();
@@ -97,10 +79,6 @@ fn a_re_dispatch_on_the_same_idem_token_is_one_row() {
     );
 }
 
-/// **A reaper RE-QUEUE + a redundant `SCHEDULE_AND_RUN_JOB` re-dispatch is ONE row (arch §3.3 step
-/// 4).** The runner died mid-job (its lease expired); the reaper re-queues the row; the workflow (on
-/// resume) redundantly re-dispatches the SAME `idem_token` — the `jq_idem` unique collapses it. The
-/// job is claimable exactly once (0 duplicate publish).
 #[test]
 fn a_reaper_requeue_plus_a_re_dispatch_is_one_row() {
     let r = runner();
@@ -112,7 +90,6 @@ fn a_reaper_requeue_plus_a_re_dispatch_is_one_row() {
 
     {
         let mut sched = r.scheduler().lock().unwrap();
-        // A runner claims + leases the job, then DIES (the lease expires).
         let claim = ClaimRequest {
             cell_region: "fr-par".into(),
             runner_labels: vec![],
@@ -122,7 +99,6 @@ fn a_reaper_requeue_plus_a_re_dispatch_is_one_row() {
         };
         let claimed = sched.claim(&claim).expect("the job claims");
         assert_eq!(claimed.job_id, "run-pr-7/ci.pipeline:0/job");
-        // The runner dies: advance past the lease + reap.
         sched.advance(20);
         let reaped = sched.reap();
         assert_eq!(reaped.len(), 1, "the dead runner's lease was reaped");
@@ -133,19 +109,15 @@ fn a_reaper_requeue_plus_a_re_dispatch_is_one_row() {
         );
     }
 
-    // The workflow resumes and redundantly re-dispatches the SAME idem_token.
     r.dispatch(&spec).expect("the resume re-dispatch");
     let sched = r.scheduler().lock().unwrap();
     assert_eq!(
         sched.jobs().len(),
         1,
-        "reaper re-queue + re-dispatch = ONE row (the job runs once, never twice — CI-D1)"
+        "reaper re-queue + re-dispatch = ONE row (the job runs once, never twice - CI-D1)"
     );
 }
 
-/// **The terminal `job.done` completion is IDEMPOTENT (arch §3.3 step 3 / CI-D1).** The runner reports
-/// `job.done`; `complete_job` moves the row to `terminal` ONCE. A double-delivered `job.done`
-/// (at-least-once) re-completes a no-op → the row terminates once (0 double-effect).
 #[test]
 fn the_terminal_job_done_completion_is_idempotent() {
     let r = runner();
@@ -155,16 +127,14 @@ fn the_terminal_job_done_completion_is_idempotent() {
     );
     r.dispatch(&spec).expect("dispatch");
 
-    // First job.done: terminates the row.
     let first =
         complete_job(r.scheduler(), "acme", "run-pr-7/ci.pipeline:0/job").expect("complete");
     assert!(first, "the first job.done moves the row to terminal");
-    // Double-delivered job.done (at-least-once): a no-op.
     let second =
         complete_job(r.scheduler(), "acme", "run-pr-7/ci.pipeline:0/job").expect("re-complete");
     assert!(
         !second,
-        "a double-delivered job.done re-completes a no-op (the row terminates ONCE — CI-D1)"
+        "a double-delivered job.done re-completes a no-op (the row terminates ONCE - CI-D1)"
     );
 
     let sched = r.scheduler().lock().unwrap();
@@ -175,9 +145,6 @@ fn the_terminal_job_done_completion_is_idempotent() {
     );
 }
 
-/// **A completed job is NEVER re-queued by the reaper (the `job.done` ↔ reaper interplay, CI-D1).** A
-/// job that completed (`job.done` delivered) is `terminal`; even with an expired lease cleared, the
-/// reaper does not touch a terminal row — so a completed job's effect is never re-run.
 #[test]
 fn a_completed_job_is_never_re_queued_by_the_reaper() {
     let r = runner();
@@ -196,13 +163,12 @@ fn a_completed_job_is_never_re_queued_by_the_reaper() {
         lease_ttl: 10,
     };
     sched.claim(&claim).expect("claim");
-    // The runner COMPLETES the job (job.done), then we advance past where its lease WOULD have expired.
     assert!(sched.complete_job("acme", "run-pr-7/ci.pipeline:0/job"));
     sched.advance(100);
     let reaped = sched.reap();
     assert!(
         reaped.is_empty(),
-        "the reaper does NOT re-queue a COMPLETED job (0 double-run on a finished job — CI-D1)"
+        "the reaper does NOT re-queue a COMPLETED job (0 double-run on a finished job - CI-D1)"
     );
     assert_eq!(
         sched.state_of("acme", "run-pr-7/ci.pipeline:0/job"),
@@ -211,9 +177,6 @@ fn a_completed_job_is_never_re_queued_by_the_reaper() {
     );
 }
 
-/// **The scheduling terms derive from the snapshot (the labels + concurrency group ride the row).** A
-/// `deploy:%` concurrency group + affinity labels are stamped on the enqueued row (the claim
-/// serializes deploys + filters affinity on them).
 #[test]
 fn the_snapshot_scheduling_terms_ride_the_enqueued_row() {
     let terms = JobScheduleTerms::new(
@@ -244,10 +207,6 @@ fn the_snapshot_scheduling_terms_ride_the_enqueued_row() {
     assert_eq!(job.fair_key, "acme:web");
 }
 
-/// **A `pr:%` concurrency group enqueues SUPERSEDING (the prior head is cancelled, arch §2.3).** Two
-/// PR heads with the same `pr:web:42` group: the second supersedes the first (only the latest head is
-/// tested). Distinct `idem_token`s (distinct dispatch positions), so they are distinct rows; the
-/// supersession cancels the OLD one.
 #[test]
 fn a_pr_group_enqueues_superseding_the_prior_head() {
     let scheduler = std::sync::Arc::new(std::sync::Mutex::new(SchedulerState::new()));
@@ -297,9 +256,6 @@ fn a_pr_group_enqueues_superseding_the_prior_head() {
     );
 }
 
-/// **A `kind=agent` job is REJECTED — CI's runner enqueues kind=ci into `job_queue` only (arch §3.1
-/// boundary).** An agent job dispatches into the agent runner, not CI's `job_queue`; a mis-routed
-/// kind is a LOUD error (never silently enqueued onto the wrong runner).
 #[test]
 fn a_kind_agent_job_is_rejected() {
     let r = runner();

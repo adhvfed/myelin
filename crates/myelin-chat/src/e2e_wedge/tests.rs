@@ -1,13 +1,4 @@
-//! Unit tests for Chat's whole-system E2E wedge participation (CHAT-P27 / P-501, M5).
-//!
-//! These assert chat's three E2E legs each reach the EARNED green (E2E-1 the unfurl/live-update pane,
-//! E2E-2 the flagship terminal surface, E2E-4 the DSAR holder named in the 0-holders-missed certificate)
-//! — the master M5 exit gate cites E2E-1/E2E-2/E2E-4 green. A red leg is a dated scorecard row, never a
-//! weakened assertion (the gate must be able to go RED — proven by the negative assertions on each leg).
-
 use super::*;
-
-// ───────────────────────── E2E-1 — the unfurl/live-update pane (CHAT-D7) ─────────────────────────
 
 #[test]
 fn e2e_1_unfurl_pane_is_green_and_zero_leak() {
@@ -23,11 +14,8 @@ fn e2e_1_unfurl_pane_is_green_and_zero_leak() {
 
 #[test]
 fn e2e_1_freshness_budget_is_the_named_threshold() {
-    // The freshness budget is a named threshold, not a stray literal — a re-read at age 0 satisfies it.
     assert_eq!(e2e_pane::FRESHNESS_BUDGET_SECS, 5);
 }
-
-// ───────────────────────── E2E-2 — the flagship terminal surface ─────────────────────────
 
 #[test]
 fn e2e_2_flagship_terminates_green_in_chat() {
@@ -40,8 +28,6 @@ fn e2e_2_flagship_terminates_green_in_chat() {
     );
     assert_eq!(art.leaks, 0);
 }
-
-// ───────────────────────── E2E-4 — the DSAR holder (0 holders missed) ─────────────────────────
 
 #[test]
 fn e2e_4_dsar_holder_is_green_zero_recoverable_pii() {
@@ -57,8 +43,6 @@ fn e2e_4_dsar_holder_is_green_zero_recoverable_pii() {
         "0 recoverable PII across hot + cold + backups (the E2E-4 zero)"
     );
 }
-
-// ───────────────────────── the whole wedge ─────────────────────────
 
 #[test]
 fn run_chat_e2e_wedge_emits_three_green_artifacts() {
@@ -79,8 +63,6 @@ fn run_chat_e2e_wedge_emits_three_green_artifacts() {
 
 #[test]
 fn the_green_predicate_requires_both_earned_and_zero_leak() {
-    // The artifact is green ONLY iff the scenario earned it AND 0 leak — a leak forces red even if the
-    // scenario predicate held (the gate cannot be greened by a weakened assertion).
     let leaky = ChatE2eArtifact {
         scenario: "E2E-1",
         green: true,

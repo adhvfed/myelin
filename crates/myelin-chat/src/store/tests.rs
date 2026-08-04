@@ -1,7 +1,3 @@
-//! Unit tests for the CHAT-P4 `MessageStore` trait + tiers (the DB-free, behaviour-identical
-//! floor). The PG hot tier proves the SAME surface against the live dev stack in
-//! `tests/integration_chat_p4_message_store.rs` (the 0-divergence GATE's PG leg).
-
 use std::sync::Arc;
 
 use myelin_events::{Actor, CausedBy, EmitContextBase, OutboxStore, OutboxTransaction, Timestamp};
@@ -65,8 +61,6 @@ fn append(
     id
 }
 
-// ── ULID: lexical order == mint order (k-sortable; the per-conversation total order) ────────────
-
 #[test]
 fn ulid_lexical_order_equals_mint_order() {
     let src = MonotonicUlidSource::new();
@@ -74,26 +68,20 @@ fn ulid_lexical_order_equals_mint_order() {
     for _ in 0..1000 {
         ids.push(src.mint());
     }
-    // Each minted id sorts strictly after the previous one (0 out-of-order ids).
     for w in ids.windows(2) {
         assert!(w[0] < w[1], "ULID order broke: {:?} !< {:?}", w[0], w[1]);
     }
-    // The rendered form is the canonical 26-char ULID width.
     assert!(ids.iter().all(|id| id.as_str().len() == 26));
 }
 
 #[test]
 fn system_ulid_source_is_monotone_under_burst() {
-    // The wall-clock source's monotonic guard: even when many mints land in the same ms, order is
-    // never violated.
     let src = SystemUlidSource::new();
     let ids: Vec<MessageId> = (0..5000).map(|_| src.mint()).collect();
     for w in ids.windows(2) {
         assert!(w[0] < w[1], "system ULID order broke under burst");
     }
 }
-
-// ── append → range round-trip, ULID monotone per conversation ───────────────────────────────────
 
 #[test]
 fn append_then_range_is_ulid_ordered() {
@@ -108,12 +96,10 @@ fn append_then_range_is_ulid_ordered() {
             new_msg(&format!("n{i}"), "alice", &format!("msg {i}")),
         ));
     }
-    // resync from the very start sees every message, gap-free, in mint order.
     let all = store.range(&conv(), RangeCursor::Recent, 1000).unwrap();
     assert_eq!(all.len(), 50);
     let got: Vec<MessageId> = all.iter().map(|m| m.message_id.clone()).collect();
     assert_eq!(got, ids, "range order must equal append (ULID) order");
-    // 0 out-of-order ids within the conversation.
     for w in got.windows(2) {
         assert!(w[0] < w[1]);
     }
@@ -134,28 +120,23 @@ fn range_recent_before_after_cursors() {
         })
         .collect();
 
-    // Recent-N: the last 5.
     let recent = store.range(&conv(), RangeCursor::Recent, 5).unwrap();
     assert_eq!(recent.len(), 5);
     assert_eq!(recent.first().unwrap().message_id, ids[15]);
     assert_eq!(recent.last().unwrap().message_id, ids[19]);
 
-    // Before(ids[10]): scroll-back page of 5 ending just before ids[10] → ids[5..10].
     let before = store
         .range(&conv(), RangeCursor::Before(ids[10].clone()), 5)
         .unwrap();
     let got: Vec<MessageId> = before.iter().map(|m| m.message_id.clone()).collect();
     assert_eq!(got, ids[5..10].to_vec());
 
-    // After(ids[10]): the resume gap → everything strictly after.
     let after = store
         .range(&conv(), RangeCursor::After(ids[10].clone()), 1000)
         .unwrap();
     let got: Vec<MessageId> = after.iter().map(|m| m.message_id.clone()).collect();
     assert_eq!(got, ids[11..].to_vec());
 }
-
-// ── resync_from: the resume backbone, gap-free, ordered ─────────────────────────────────────────
 
 #[test]
 fn resync_from_is_gap_free_after_cursor() {
@@ -180,8 +161,6 @@ fn resync_from_is_gap_free_after_cursor() {
     );
 }
 
-// ── idempotent send: a retried nonce returns the existing id (no second row) ─────────────────────
-
 #[test]
 fn idempotent_send_on_client_nonce() {
     let store = MemHotTier::new();
@@ -198,18 +177,6 @@ fn idempotent_send_on_client_nonce() {
     );
 }
 
-// =================================================================================================
-// CHAT-P5 (P-399) — the outbox CO-COMMIT + idempotent send + per-conversation total order. The
-// silent-data-loss floor: a message persist and its `chat.message.created` event are ONE
-// transaction (BUS-2, emit-iff-committed); a retried nonce co-commits exactly one message + one
-// event; a burst keeps per-conversation total order with `aggregate = conversation_id`.
-// =================================================================================================
-
-/// **The co-commit happy path (CHAT-P5, contract 2.2 / arch §9).** `append` persists the message AND
-/// emits a REAL `chat.message.created` outbox row in the SAME transaction — both durable on commit.
-/// The event's `aggregate = conversation_id` (contract 2.3), its `type` is the registered durable
-/// token, its `subject` is the stable `message-<id>` #sub anchor, and the payload is
-/// references-only (the body bytes NEVER ride the bus).
 #[test]
 fn append_co_commits_a_real_chat_message_created_event() {
     let store = MemHotTier::new();
@@ -219,7 +186,6 @@ fn append_co_commits_a_real_chat_message_created_event() {
     let id = store
         .append(&mut t, new_msg("n0", "alice", "hello world"))
         .unwrap();
-    // Before commit: nothing durable (emit-iff-committed) — outbox depth still 0.
     assert_eq!(
         ob.outbox_depth(),
         0,
@@ -227,7 +193,6 @@ fn append_co_commits_a_real_chat_message_created_event() {
     );
     t.commit().unwrap();
 
-    // After commit: exactly ONE outbox row — the `chat.message.created` event — co-committed.
     let rows = ob.committed_rows();
     assert_eq!(
         rows.len(),
@@ -241,14 +206,13 @@ fn append_co_commits_a_real_chat_message_created_event() {
     );
     assert_eq!(
         row.aggregate.0, "01J0CONV",
-        "aggregate = conversation_id (contract 2.3 — the CHAT-D2 ordering key)"
+        "aggregate = conversation_id (contract 2.3 - the CHAT-D2 ordering key)"
     );
     assert!(
         row.subject.0.contains("#message-") && row.subject.0.contains(id.as_str()),
         "subject is the stable message-<id> #sub anchor: {}",
         row.subject.0
     );
-    // References-not-payloads: the body bytes are NOT on the event payload.
     let payload = row.envelope.payload.to_string();
     assert!(
         !payload.contains("hello world"),
@@ -258,18 +222,12 @@ fn append_co_commits_a_real_chat_message_created_event() {
         payload.contains(id.as_str()) && payload.contains("alice"),
         "the payload carries the message + author refs only: {payload}"
     );
-    // The state-change half is staged in the SAME transaction (the no-dual-write co-commit).
     assert!(
         !row.envelope.contains_personal_data,
         "the event is references-only (no inline PII envelope)"
     );
 }
 
-/// **CHAT-D13 (the co-commit proof, in-process): an ABORTED transaction writes NEITHER the message
-/// NOR its event.** A crash between `append` (which buffers the persist + the event onto the tx) and
-/// `commit` leaves 0 orphan messages AND 0 phantom events — there is no path that durably writes one
-/// without the other (emit-iff-committed, BUS-D4). The whole-system carriage drill lives in
-/// `myelin-events::drills_eb27_chat_d1_d13`; THIS is the Chat-side `append`-path proof.
 #[test]
 fn chat_d13_aborted_append_writes_neither_message_nor_event() {
     let store = MemHotTier::new();
@@ -280,10 +238,7 @@ fn chat_d13_aborted_append_writes_neither_message_nor_event() {
         let _id = store
             .append(&mut t, new_msg("n0", "alice", "doomed"))
             .unwrap();
-        // The message is in the hot tier's in-memory log, BUT the event is only BUFFERED on the
-        // (uncommitted) transaction. t is dropped here WITHOUT commit — the crash point.
     }
-    // 0 phantom events: the aborted transaction published nothing to the durable outbox.
     assert_eq!(
         ob.outbox_depth(),
         0,
@@ -291,24 +246,14 @@ fn chat_d13_aborted_append_writes_neither_message_nor_event() {
     );
     assert_eq!(ob.committed_count(), 0, "CHAT-D13: no ghost outbox row");
     assert_eq!(ob.dead_letter_count(), 0);
-    // Both-or-neither: because the durable EVENT did not commit, the message must be treated as
-    // not-sent too. In the real OLTP binding the message INSERT and the outbox row are ONE PG
-    // transaction, so an abort rolls back the row as well; the in-memory hot tier is the floor
-    // model, so we assert the AUTHORITATIVE side (the durable outbox) is empty — the property the
-    // relay + every consumer observes. (The PG leg proves the row also rolls back, integration.)
 }
 
-/// **CHAT-D14 (idempotent send → exactly ONE message AND ONE event).** A retried send with the SAME
-/// `client_nonce` (flaky mobile/agent) co-commits NOTHING new: the second `append` returns the
-/// existing id and emits NO second `chat.message.created` event. message-count = 1, event-count = 1.
 #[test]
 fn chat_d14_retried_nonce_co_commits_exactly_one_message_and_one_event() {
     let store = MemHotTier::new();
     let (ob, m) = outbox();
 
-    // First send: one message, one event.
     let first = append(&store, &ob, &m, new_msg("retry-nonce", "alice", "hello"));
-    // The retry (same nonce) — a separate transaction, as a real redelivery would be.
     let again = append(
         &store,
         &ob,
@@ -328,7 +273,6 @@ fn chat_d14_retried_nonce_co_commits_exactly_one_message_and_one_event() {
         1,
         "CHAT-D14: message-count = 1"
     );
-    // Exactly ONE durable event — the retry emitted NO phantom second event.
     let created: Vec<_> = ob
         .committed_rows()
         .into_iter()
@@ -341,11 +285,6 @@ fn chat_d14_retried_nonce_co_commits_exactly_one_message_and_one_event() {
     );
 }
 
-/// **CHAT-D2 (per-conversation total order from MANY gateways).** N concurrent senders each open
-/// their own transaction, append to the ONE hot conversation, and commit — modeling N stateless
-/// gateways racing one hot channel. The per-aggregate `seq` (allocated at commit under the outbox
-/// lock, `aggregate = conversation_id`) is exactly the contiguous set {0..N}: total order, gap-free,
-/// no dup (0 ordering violations). The full QPS-scale drill (BUS-D9) is the M5 follow-on.
 #[test]
 fn chat_d2_burst_from_many_gateways_preserves_per_conversation_total_order() {
     use std::sync::Arc;
@@ -371,7 +310,6 @@ fn chat_d2_burst_from_many_gateways_preserves_per_conversation_total_order() {
         h.join().unwrap();
     }
 
-    // Every send co-committed exactly one event for the one conversation aggregate.
     let mut seqs: Vec<u64> = ob
         .committed_rows()
         .into_iter()
@@ -385,7 +323,6 @@ fn chat_d2_burst_from_many_gateways_preserves_per_conversation_total_order() {
         "CHAT-D2: the per-conversation seqs are the contiguous {{0..N}} set (0 ordering violations)"
     );
 
-    // The MESSAGE log is itself ULID-ordered and gap-free (the intrinsic per-conversation order).
     let all = store.range(&conv(), RangeCursor::Recent, 1000).unwrap();
     assert_eq!(all.len(), N, "every burst send persisted exactly once");
     for w in all.windows(2) {
@@ -396,10 +333,6 @@ fn chat_d2_burst_from_many_gateways_preserves_per_conversation_total_order() {
     }
 }
 
-/// **CHAT-D2 (out-of-order client ops reconcile to the stable `message_id` order).** An edit that
-/// arrives interleaved with later sends still co-commits its `chat.message.edited` against the
-/// SAME conversation aggregate, and the durable read re-orders to the intrinsic ULID order — the
-/// client's arrival order does not perturb the per-conversation total order (arch §2.2).
 #[test]
 fn chat_d2_out_of_order_edit_reconciles_to_stable_id_order() {
     let store = MemHotTier::new();
@@ -407,15 +340,12 @@ fn chat_d2_out_of_order_edit_reconciles_to_stable_id_order() {
 
     let a = append(&store, &ob, &m, new_msg("a", "alice", "first"));
     let _b = append(&store, &ob, &m, new_msg("b", "bob", "second"));
-    // An edit to the FIRST message arrives after the second send (out-of-order client op).
     let mut t = tx(&ob, &m);
     store
         .revise(&mut t, &a, b"first (edited)".to_vec(), Vec::new(), 0)
         .unwrap();
     t.commit().unwrap();
 
-    // The durable read is reconciled to the stable ULID order: a precedes b regardless of the edit
-    // arriving later.
     let all = store.range(&conv(), RangeCursor::Recent, 100).unwrap();
     assert_eq!(all[0].message_id, a);
     assert_eq!(all[0].body_inline, b"first (edited)");
@@ -424,7 +354,6 @@ fn chat_d2_out_of_order_edit_reconciles_to_stable_id_order() {
         "stable id order holds"
     );
 
-    // Both the created + the edited events are co-committed against the one conversation aggregate.
     let types: Vec<String> = ob
         .committed_rows()
         .into_iter()
@@ -435,8 +364,6 @@ fn chat_d2_out_of_order_edit_reconciles_to_stable_id_order() {
     assert!(types.contains(&"chat.message.edited".to_string()));
 }
 
-/// `revise` co-commits `chat.message.edited`; `tombstone` co-commits `chat.message.erased` (the
-/// `*.erased` cross-cutting token, contract 2.7). Both against `aggregate = conversation_id`.
 #[test]
 fn revise_and_tombstone_co_commit_their_lifecycle_events() {
     let store = MemHotTier::new();
@@ -471,14 +398,11 @@ fn revise_and_tombstone_co_commit_their_lifecycle_events() {
     );
 }
 
-/// A failed CAS on `revise` co-commits NOTHING (no `chat.message.edited` phantom) — a refused
-/// clobber is not a silent state change AND not a phantom event.
 #[test]
 fn failed_cas_revise_co_commits_no_event() {
     let store = MemHotTier::new();
     let (ob, m) = outbox();
     let id = append(&store, &ob, &m, new_msg("n", "alice", "v0"));
-    // baseline: one created event.
     assert_eq!(ob.committed_count(), 1);
 
     let mut t = tx(&ob, &m);
@@ -486,8 +410,6 @@ fn failed_cas_revise_co_commits_no_event() {
         .revise(&mut t, &id, b"clobber".to_vec(), Vec::new(), 99)
         .unwrap_err();
     assert!(matches!(err, StoreError::CasConflict { .. }));
-    // The transaction has buffered NO event (the revise erred before emitting); even if committed,
-    // nothing new lands.
     t.commit().unwrap();
     assert_eq!(
         ob.committed_count(),
@@ -495,8 +417,6 @@ fn failed_cas_revise_co_commits_no_event() {
         "a refused CAS emits no chat.message.edited phantom"
     );
 }
-
-// ── revise: CAS-on-edit, stable id, refused clobber ─────────────────────────────────────────────
 
 #[test]
 fn revise_bumps_edited_seq_under_cas_and_keeps_id() {
@@ -516,7 +436,6 @@ fn revise_bumps_edited_seq_under_cas_and_keeps_id() {
     assert_eq!(msg.body_inline, b"v1");
     assert_eq!(msg.state, MessageState::Edited);
 
-    // A stale expect_seq is a refused clobber (CAS conflict), not a silent overwrite.
     let mut t2 = tx(&ob, &m);
     let err = store
         .revise(&mut t2, &id, b"v2".to_vec(), Vec::new(), 0)
@@ -530,8 +449,6 @@ fn revise_bumps_edited_seq_under_cas_and_keeps_id() {
         }
     );
 }
-
-// ── tombstone: keep the fact, drop the body ─────────────────────────────────────────────────────
 
 #[test]
 fn tombstone_keeps_the_record_clears_the_body() {
@@ -551,15 +468,13 @@ fn tombstone_keeps_the_record_clears_the_body() {
     assert!(all[0].body_inline.is_empty(), "the body is dropped");
 }
 
-// ── partition / residency-pin: a write lands ONLY in its (tenant, region) partition ─────────────
-
 #[test]
 fn writes_are_partitioned_by_tenant_region_zero_cross_region() {
     let store = MemHotTier::new();
     let (ob, m) = outbox();
 
     let fr = ConversationId::new("acme", "fr-par", "01J0CONV");
-    let de = ConversationId::new("acme", "de-fra", "01J0CONV"); // same conv id, DIFFERENT region
+    let de = ConversationId::new("acme", "de-fra", "01J0CONV");
 
     let mut t = tx(&ob, &m);
     store
@@ -573,12 +488,9 @@ fn writes_are_partitioned_by_tenant_region_zero_cross_region() {
         .unwrap();
     t.commit().unwrap();
 
-    // The de-fra partition is a DIFFERENT partition key → 0 rows (the residency-pin holds: a write
-    // never crosses regions; a read in another region sees none of it).
     assert_eq!(store.range(&de, RangeCursor::Recent, 100).unwrap().len(), 0);
     assert_eq!(store.range(&fr, RangeCursor::Recent, 100).unwrap().len(), 1);
 
-    // A different tenant is a different partition too (0 cross-tenant).
     let other_tenant = ConversationId::new("globex", "fr-par", "01J0CONV");
     assert_eq!(
         store
@@ -588,8 +500,6 @@ fn writes_are_partitioned_by_tenant_region_zero_cross_region() {
         0
     );
 }
-
-// ── the cold tier: seal a prefix, reads stay IDENTICAL (transparent cold reads) ─────────────────
 
 #[test]
 fn cold_seal_is_transparent_to_range_and_resync() {
@@ -606,22 +516,17 @@ fn cold_seal_is_transparent_to_range_and_resync() {
         })
         .collect();
 
-    // The full ordered view BEFORE sealing.
     let before_seal = store.range(&conv(), RangeCursor::Recent, 1000).unwrap();
 
-    // Seal the first 10 to the cold object segment (the detach job).
     let sealed = store.seal_before(&conv(), &ids[10]).unwrap();
     assert_eq!(sealed, 10);
 
-    // The trait surface is IDENTICAL whether messages are hot or cold (0 behavioural divergence):
-    // the same ordered view, the same resync, the same recent-N.
     let after_seal = store.range(&conv(), RangeCursor::Recent, 1000).unwrap();
     assert_eq!(
         before_seal, after_seal,
-        "cold reads are transparent — the view is identical"
+        "cold reads are transparent - the view is identical"
     );
 
-    // resync across the cold/hot seam is still gap-free and ordered.
     let gap = store.resync_from(&conv(), &ids[4]).unwrap();
     let got: Vec<MessageId> = gap.iter().map(|m| m.message_id.clone()).collect();
     assert_eq!(
@@ -630,15 +535,12 @@ fn cold_seal_is_transparent_to_range_and_resync() {
         "resync spans the cold/hot seam gap-free"
     );
 
-    // a scroll-back page that straddles the seam returns the cold rows transparently.
     let page = store
         .range(&conv(), RangeCursor::Before(ids[12].clone()), 5)
         .unwrap();
     let got: Vec<MessageId> = page.iter().map(|m| m.message_id.clone()).collect();
     assert_eq!(got, ids[7..12].to_vec());
 }
-
-// ── the cold segment round-trips the body bytes verbatim (the store is body-opaque) ─────────────
 
 #[test]
 fn cold_segment_round_trips_body_verbatim() {
@@ -663,10 +565,6 @@ fn cold_segment_round_trips_body_verbatim() {
     assert_eq!(read[0].author_kind, AuthorKind::Agent);
 }
 
-// ── the object-store BlobStore swap (contract 11.2; CHAT-P28 / P-502) ────────────────────────────
-
-/// Build a representative cold-segment batch of stored `Message` rows (already ULID-ordered) so the
-/// parity oracle seals a realistic segment (mixed author kinds + non-trivial body bytes).
 fn sample_cold_batch() -> Vec<Message> {
     (0..8u128)
         .map(|i| Message {
@@ -683,7 +581,7 @@ fn sample_cold_batch() -> Vec<Message> {
                 1 => AuthorKind::Agent,
                 _ => AuthorKind::Service,
             },
-            body_inline: format!("cold segment body {i} — the quick brown fox").into_bytes(),
+            body_inline: format!("cold segment body {i} - the quick brown fox").into_bytes(),
             body_nodes: vec![i as u8, 0xAB, 0xCD],
             client_nonce: format!("nonce-{i}"),
             edited_seq: (i % 2) as i32,
@@ -692,11 +590,6 @@ fn sample_cold_batch() -> Vec<Message> {
         .collect()
 }
 
-/// **The CI parity proof (fs↔fs) for the cold-segment object-store swap (contract 11.2 / CHAT-P28).**
-/// The `--features integration` test (`tests/integration_chat_p28_blob_swap.rs`) runs the SAME oracle
-/// fs↔S3 against the live dev-stack RustFS. Here both backings are the fs floor, so the proof is
-/// deterministic + DB-free: the content address + the decoded rows must be IDENTICAL — the swap is
-/// behaviour-preserving (a one-line backing change behind the `BlobStore` trait, not a code change).
 #[test]
 fn chat_cold_blob_store_swap_is_byte_identical_fs_to_fs() {
     let fs_a = myelin_storage::FsBlobStore::new();
@@ -708,25 +601,17 @@ fn chat_cold_blob_store_swap_is_byte_identical_fs_to_fs() {
         super::chat_cold_blob_store_parity(&fs_a, &fs_b, &tenant, &batch).expect("parity runs");
     assert_eq!(
         verdict.fs_address, verdict.object_address,
-        "BLAKE3-of-the-encoded-segment is backing-independent — the content address is identical"
+        "BLAKE3-of-the-encoded-segment is backing-independent - the content address is identical"
     );
     assert!(
         verdict.byte_identical,
         "the cold-segment object-store swap is byte-identical to the fs floor (same address, same \
-         decoded rows back from both backings) — the swap is behaviour-preserving (11.2)"
+         decoded rows back from both backings) - the swap is behaviour-preserving (11.2)"
     );
 }
 
-/// **The cold tier is generic over the `BlobStore` backing — `with_blob_store` is the swap entry
-/// point (CHAT-P28 / P-502).** Sealing through a `ColdSegments` built over an EXPLICIT backing reads
-/// back IDENTICALLY to the default fs floor: the seal/read code is unchanged across the swap. (Both
-/// sides use an `FsBlobStore` here — the DB-free floor; the live object-store backing is the
-/// integration test. The point proven: `ColdSegments<B>` is backing-parametric, the prod object
-/// store drops in at construction time.)
 #[test]
 fn cold_segments_is_generic_over_the_blob_store_backing() {
-    // The default-backing cold tier (FsBlobStore) and an explicit-backing one (also FsBlobStore,
-    // standing in for S3BlobStore in prod) seal the SAME batch and read back the SAME rows.
     let default_tier: ColdSegments<myelin_storage::FsBlobStore> = ColdSegments::new();
     let explicit_tier: ColdSegments<myelin_storage::FsBlobStore> =
         ColdSegments::with_blob_store(myelin_storage::FsBlobStore::new());
@@ -739,7 +624,7 @@ fn cold_segments_is_generic_over_the_blob_store_backing() {
     let from_explicit = explicit_tier.read(&conv()).unwrap();
     assert_eq!(
         from_default, from_explicit,
-        "the cold tier reads identically regardless of the BlobStore backing — the swap is a \
+        "the cold tier reads identically regardless of the BlobStore backing - the swap is a \
          construction-time backing change, not a code change"
     );
     assert_eq!(
@@ -748,17 +633,10 @@ fn cold_segments_is_generic_over_the_blob_store_backing() {
     );
 }
 
-/// A test-only [`BlobStore`] wrapper that injects ONE divergence so each `byte_identical` conjunct
-/// in [`super::chat_cold_blob_store_parity`] is proven LOAD-BEARING (a mutated `&&`→`||` is caught).
-/// `bad_address` returns a WRONG content address from `put` (flips `address_identical`);
-/// `bad_bytes` returns CORRUPT bytes from `get` (flips the round-trip conjunct).
 struct DivergentBlob {
     inner: myelin_storage::FsBlobStore,
     bad_address: bool,
     bad_bytes: bool,
-    /// The last real address `put` stored under — so `get` can serve the bytes even when `put`
-    /// REPORTED a divergent address (the `bad_address` case isolates the address conjunct, not the
-    /// round-trip one).
     last_real: std::sync::Mutex<Option<myelin_storage::ContentHash>>,
 }
 
@@ -771,7 +649,6 @@ impl myelin_storage::BlobStore for DivergentBlob {
         let real = self.inner.put(tenant, bytes)?;
         *self.last_real.lock().unwrap() = Some(real.clone());
         if self.bad_address {
-            // A deliberately WRONG address (not what these bytes hash to) — flips address_identical.
             Ok(myelin_storage::ContentHash::blake3(
                 b"a different payload entirely",
             ))
@@ -784,8 +661,6 @@ impl myelin_storage::BlobStore for DivergentBlob {
         tenant: &TenantId,
         hash: &myelin_storage::ContentHash,
     ) -> myelin_storage::blob::Result<Vec<u8>> {
-        // Serve the REAL stored object (under the bad-address case the requested `hash` is the wrong
-        // one `put` reported, so look up the real address we recorded) — isolating each conjunct.
         let lookup = if self.bad_address {
             self.last_real
                 .lock()
@@ -797,9 +672,6 @@ impl myelin_storage::BlobStore for DivergentBlob {
         };
         let real = self.inner.get(tenant, &lookup)?;
         if self.bad_bytes {
-            // A VALID-but-DIFFERENT segment (decodes cleanly to a single, different row) so the
-            // round-trip conjunct (`object_rows == messages`) is what FAILS — not a decode error.
-            // (A truly corrupt read is refused loudly by decode; this isolates the parity conjunct.)
             Ok(super::encode_segment(&[Message {
                 message_id: super::MessageId::from_u128(999),
                 conv: conv(),
@@ -832,17 +704,12 @@ impl myelin_storage::BlobStore for DivergentBlob {
     }
 }
 
-/// **The parity verdict is NOT vacuously true — each conjunct is load-bearing (the mutation floor
-/// for `chat_cold_blob_store_parity`).** A backing that assigns a divergent ADDRESS makes the swap
-/// NOT byte-identical; a backing that returns CORRUPT bytes on read makes it NOT byte-identical.
-/// Both must yield `byte_identical == false` — so a mutated `&&`→`||` in the verdict is caught.
 #[test]
 fn cold_blob_parity_verdict_is_load_bearing_per_conjunct() {
     let tenant = TenantId("acme".into());
     let batch = sample_cold_batch();
     let fs = myelin_storage::FsBlobStore::new();
 
-    // Honest backing → byte-identical.
     let honest = DivergentBlob {
         inner: myelin_storage::FsBlobStore::new(),
         bad_address: false,
@@ -856,7 +723,6 @@ fn cold_blob_parity_verdict_is_load_bearing_per_conjunct() {
         "an honest backing is byte-identical"
     );
 
-    // A divergent ADDRESS breaks the address_identical conjunct.
     let bad_addr = DivergentBlob {
         inner: myelin_storage::FsBlobStore::new(),
         bad_address: true,
@@ -870,7 +736,6 @@ fn cold_blob_parity_verdict_is_load_bearing_per_conjunct() {
         "a divergent content address makes the swap NOT byte-identical (the conjunct is load-bearing)"
     );
 
-    // CORRUPT read bytes break the object-roundtrip conjunct.
     let bad_read = DivergentBlob {
         inner: myelin_storage::FsBlobStore::new(),
         bad_address: false,
@@ -885,22 +750,12 @@ fn cold_blob_parity_verdict_is_load_bearing_per_conjunct() {
     );
 }
 
-// ── the ScyllaDB hot-tier promotion is a NAMED FLOOR — the trigger has NOT fired (EI-04 §4) ──────
-
-/// **The ScyllaDB hot-tier promotion is honestly NAMED as a floor, not silently built (CHAT-P28 /
-/// P-502).** The promotion is triggered by measured per-cell write/partition volume crossing the
-/// hot-tier budget; no such signal has been measured (the surge family measured the gateway SHED
-/// budgets), so `SCYLLA_HOT_TIER_PROMOTED == false` and the v1 Postgres hot tier is retained. The
-/// trigger signal + landing prompt are recorded in code so the gap is VISIBLE, not implied.
 #[test]
 fn scylla_hot_tier_promotion_is_a_named_floor_with_its_trigger() {
-    // Read the published constant through a runtime binding (not a bare `assert!` on a const) so the
-    // check asserts the EXPORTED API value the rest of the platform reads, and equals the honest
-    // floor state: NOT promoted (the measured trigger has not fired — measure-before-shard, ADR-10).
     let promoted = std::hint::black_box(super::SCYLLA_HOT_TIER_PROMOTED);
     assert!(
         !promoted,
-        "the Scylla hot-tier promotion is a NAMED FLOOR — its measured trigger has not fired; the \
+        "the Scylla hot-tier promotion is a NAMED FLOOR - its measured trigger has not fired; the \
          v1 Postgres-partitioned hot tier is retained"
     );
     assert!(

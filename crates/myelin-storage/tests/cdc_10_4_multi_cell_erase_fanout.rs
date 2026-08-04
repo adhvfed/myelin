@@ -1,20 +1,3 @@
-//! Contract 10.4 CDC pair — the **multi-cell DSR erase fan-out** (P-ST-33 / global P-445; "the DSR
-//! fan-out iterates `member_cells`").
-//!
-//! Row 10.4's multi-cell leg has TWO grains that MUST agree on the same load-bearing zero:
-//!   - the **PROVIDER** = `myelin-storage` — [`MultiCellEraseFanOut::fan_out`] runs the real
-//!     crypto-shred erase IN each cell and reports `cells_missed` over `{home_cell} ∪ member_cells`;
-//!   - the **CONSUMER** = `myelin-control-plane` — its generic [`MultiCellDsrReceiptSet`] (global
-//!     P-430) merges the per-cell receipts the storage leg lowers to opaque `CellDsrReceipt` tokens
-//!     and reports ITS `cells_missed`.
-//!
-//! This CDC pair pins that the storage leg lowers to the control-plane receipt set WITHOUT re-deriving
-//! completeness: the two `cells_missed` zeros (and the two `is_complete` readings) AGREE. If the
-//! storage fan-out's cell set, its receipt-per-cell shape, or its missed-cell accounting drifts from
-//! what the control-plane orchestrator expects, this stops passing. The control plane is a
-//! dev-dependency of storage (the cross-subsystem seam, coherence EI-01 §7) — so the bridge lives
-//! here, never in storage's production graph.
-
 use myelin_control_plane::{CellDsrReceipt, MultiCellDsrReceiptSet};
 use myelin_events::Timestamp;
 use myelin_gdpr::ErasureMethod;
@@ -99,11 +82,6 @@ fn ok_holders(ledger: &Ledger) -> EraseHolders<'_> {
     }
 }
 
-/// **The CONSUMER's lowering: the storage per-cell receipt set → the control-plane
-/// [`MultiCellDsrReceiptSet`].** The storage `ErasureReceipt` lowers to an opaque, content-addressed
-/// `CellDsrReceipt` token (never raw rows / PII) — exactly what the cross-cell orchestrator merges.
-/// The control plane re-derives its OWN `cells_missed` from this set; the CDC assertion is that it
-/// agrees with the storage leg's.
 fn lower_to_control_plane(set: &MultiCellEraseReceiptSet) -> MultiCellDsrReceiptSet {
     let subject = OpaqueSubjectId::from_ref(ArtifactRef(set.subject.artifact_ref().0.clone()));
     let receipts = set
@@ -112,8 +90,6 @@ fn lower_to_control_plane(set: &MultiCellEraseReceiptSet) -> MultiCellDsrReceipt
         .map(|r| CellDsrReceipt {
             cell: r.cell.clone(),
             subject: subject.clone(),
-            // The storage receipt lowers to an opaque per-cell receipt token (PII-free): the cell +
-            // the per-subject-DEK-destroy proof + the 0-recoverable reading.
             receipt: format!(
                 "storage-erase:{}:{}:destroyed={}:recoverable={}",
                 r.cell.as_str(),
@@ -132,9 +108,6 @@ fn lower_to_control_plane(set: &MultiCellEraseReceiptSet) -> MultiCellDsrReceipt
     }
 }
 
-/// **GREEN: the storage leg's completeness lowers to the control-plane orchestrator's, unchanged.** A
-/// complete storage fan-out (3 cells, 0 missed) lowers to a complete control-plane receipt set (3
-/// cells, 0 missed) — the two `cells_missed` zeros agree, the two `is_complete` readings agree.
 #[test]
 fn cdc_10_4_storage_fan_out_lowers_to_control_plane_with_agreeing_zeros() {
     let tenant = TenantId::from_token("01J0ACME");
@@ -169,7 +142,6 @@ fn cdc_10_4_storage_fan_out_lowers_to_control_plane_with_agreeing_zeros() {
     );
     let cp_set = lower_to_control_plane(&storage_set);
 
-    // The PROVIDER (storage) and CONSUMER (control plane) agree on the load-bearing zero.
     assert_eq!(
         storage_set.cells_missed(),
         cp_set.cells_missed(),
@@ -193,10 +165,6 @@ fn cdc_10_4_storage_fan_out_lowers_to_control_plane_with_agreeing_zeros() {
     );
 }
 
-/// **RED-on-both-sides: a missed cell trips BOTH legs.** A storage fan-out with an unreachable member
-/// cell (`cells_missed == 1`) lowers to a control-plane set that ALSO reads `cells_missed == 1` — the
-/// completeness tripwire is consistent across the seam (a partial erase cannot read complete on either
-/// side).
 #[test]
 fn cdc_10_4_a_missed_cell_reads_red_on_both_legs() {
     let tenant = TenantId::from_token("01J0ACME");
@@ -209,7 +177,6 @@ fn cdc_10_4_a_missed_cell_reads_red_on_both_legs() {
         cell("cell-b"),
         CellEraseContext::new(CryptoShredErase::new(&kms_b, region()), ok_holders(&led_b)),
     );
-    // cell-c unregistered → MISSED on the storage leg.
     let storage_set = fanout.fan_out(&subj, &tenant, &cell("cell-b"), &[cell("cell-c")], 1);
     let cp_set = lower_to_control_plane(&storage_set);
 
@@ -222,6 +189,6 @@ fn cdc_10_4_a_missed_cell_reads_red_on_both_legs() {
     assert!(!storage_set.is_complete());
     assert!(
         !cp_set.is_complete(),
-        "RED lowers to RED — the tripwire is consistent"
+        "RED lowers to RED - the tripwire is consistent"
     );
 }

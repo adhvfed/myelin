@@ -1,5 +1,3 @@
-//! CT-007 slice 5b.3-6e.2 Stage A: the git-wire test-support substrate (fakes + wire fixtures).
-
 use super::git_wire_codec::pkt_line_encode;
 use super::*;
 use crate::{ImageRef, JobSpec, LaunchPermit, ResourceUsage, SandboxResult};
@@ -7,12 +5,10 @@ use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
-/// A 40-hex SHA-1-shaped commit oid built from a single repeated byte.
 pub(crate) fn sha1_oid(byte: u8) -> String {
     format!("{:02x}", byte).repeat(20)
 }
 
-/// Assemble a pkt-line `upload-pack` advertisement (first ref line + optional extra refs + flush).
 pub(crate) fn advertisement(first_line: &str, extra_refs: &[&str]) -> Vec<u8> {
     let mut buf = pkt_line_encode(first_line);
     for line in extra_refs {
@@ -22,7 +18,6 @@ pub(crate) fn advertisement(first_line: &str, extra_refs: &[&str]) -> Vec<u8> {
     buf
 }
 
-/// Assemble a fetch response: optional shallow lines, a flush, a negotiation line, then the pack.
 pub(crate) fn fetch_response(shallow_lines: &[String], negotiation: &str, pack: &[u8]) -> Vec<u8> {
     let mut buf = Vec::new();
     for line in shallow_lines {
@@ -34,14 +29,12 @@ pub(crate) fn fetch_response(shallow_lines: &[String], negotiation: &str, pack: 
     buf
 }
 
-/// A minimal well-formed pack: the `PACK` magic followed by an arbitrary payload.
 pub(crate) fn fake_pack(payload: &[u8]) -> Vec<u8> {
     let mut pack = b"PACK".to_vec();
     pack.extend_from_slice(payload);
     pack
 }
 
-/// A directly-advertised advertisement for `oid` with the required capabilities.
 pub(crate) fn advertisement_bytes(oid: &str) -> Vec<u8> {
     advertisement(
         &format!("{oid} refs/heads/main\0no-progress ofs-delta shallow\n"),
@@ -49,13 +42,10 @@ pub(crate) fn advertisement_bytes(oid: &str) -> Vec<u8> {
     )
 }
 
-/// A NAK fetch response carrying a `PACK`-wrapped payload, no shallow line.
 pub(crate) fn fetch_response_bytes(payload: &[u8]) -> Vec<u8> {
     fetch_response(&[], "NAK", &fake_pack(payload))
 }
 
-/// A canned, always-fine teardown proof for the auto-wrapped `Finalized` case —
-/// `RuntimeNamespaceQuiescence::Rootless` since git-wire's `prepared_mode` is always `Rootless`.
 pub(crate) fn fake_quiescence_evidence() -> RuntimeQuiescenceEvidence {
     RuntimeQuiescenceEvidence::assert_for_tests(
         "5b3-3-test-container".to_string(),
@@ -64,11 +54,8 @@ pub(crate) fn fake_quiescence_evidence() -> RuntimeQuiescenceEvidence {
     )
 }
 
-/// A single scripted Hop-A step: the simple pre-finalization outcome the recording executor
-/// auto-wraps into a `RuntimeFinalization::Finalized`.
 pub(crate) type ScriptedStep = Box<dyn FnOnce() -> Result<(ContainerRun, bool), RunFailure> + Send>;
 
-/// A boxed stand-in for [`GitWireHopExecutor`] — call sites pass `&*executor`.
 pub(crate) type BoxedHopExecutor = Box<
     dyn Fn(
         &JobSpec,
@@ -83,7 +70,6 @@ pub(crate) type BoxedHopExecutor = Box<
     ),
 >;
 
-/// A deterministic stand-in for the spawned `runsc` child: `kill`/`wait` are clean no-op successes.
 pub(crate) struct FakeRunsc;
 impl RunscChild for FakeRunsc {
     fn kill(&mut self) -> Result<(), String> {
@@ -94,10 +80,6 @@ impl RunscChild for FakeRunsc {
     }
 }
 
-/// A canned [`ContainerRun`] carrying `stdout`/`usage` — a clean exit-0 result, a fake child, and a
-/// REAL (freshly-staged, unique) bundle dir so the git-wire hop's CHECKED post-run bundle removal
-/// proves clean (a non-existent dir would make the checked teardown fail → `TeardownUnproven`). The
-/// test-support analog of `checkout_transport_5b3_3::fake_hop_container_run`.
 pub(crate) fn fake_git_wire_run(stdout: Vec<u8>, usage: ResourceUsage) -> ContainerRun {
     let bundle_dir = std::env::temp_dir().join(format!(
         "myelin-git-wire-test-support-bundle-{}-{}",
@@ -119,9 +101,6 @@ pub(crate) fn fake_git_wire_run(stdout: Vec<u8>, usage: ResourceUsage) -> Contai
     }
 }
 
-/// An executor that COMMITS every permit it is handed and records `(run-token JTI, committed)` per
-/// call — so a test can prove each leg spawned under its OWN credential and its OWN durable phase
-/// permit. Scripts exactly `steps.len()` calls; panics if invoked more times than scripted.
 #[allow(clippy::type_complexity)]
 pub(crate) fn permit_recording_executor(
     steps: Vec<ScriptedStep>,
@@ -159,14 +138,10 @@ pub(crate) fn permit_recording_executor(
 pub(crate) const CHECKOUT_TENANT: &str = "acme";
 pub(crate) const CHECKOUT_REGION: &str = "fr-par";
 pub(crate) const CHECKOUT_REPO: &str = "widgets";
-/// The exact 40-hex commit the [`checkout_spec_for_backend`] job advertises — the driver scripts an
-/// advertisement/fetch for THIS oid, and the orchestrator derives its `ExpectedGitCommitId` from it.
 pub(crate) fn checkout_commit_oid() -> String {
     sha1_oid(0xC7)
 }
 
-/// Stage the bare-repo directory both Hop A resolutions require: `root/<tenant>/<region>/<repo>.git`,
-/// a REAL directory (never a symlink), matching `resolve_bare_repo_path`/`assert_repo_under_root`.
 pub fn stage_checkout_repo_root(root: &Path) -> std::path::PathBuf {
     std::fs::create_dir_all(
         root.join(CHECKOUT_TENANT)
@@ -177,12 +152,6 @@ pub fn stage_checkout_repo_root(root: &Path) -> std::path::PathBuf {
     root.to_path_buf()
 }
 
-/// Build a deterministic **Enabled** [`GvisorBackend`] under `root` — a real-digest registry binding
-/// (a staged empty rootfs hashed with the SAME `canonical_tree_sha256_hex` the registry uses, so the
-/// pin genuinely resolves) plus a deterministic-directory workspace manager and a fixture-`subuid`
-/// userns allocator. Struct-literal construction: this submodule is a descendant of the `gvisor`
-/// module, so it may name `GvisorBackend`'s private fields. Returns the backend + the resolvable
-/// [`ImageRef`] a matching checkout spec must carry. No Btrfs / `/etc/subuid` / KVM / runsc.
 pub fn deterministic_enabled_backend_for_tests(root: &Path) -> (GvisorBackend, ImageRef) {
     let rootfs = root.join("rootfs");
     std::fs::create_dir_all(&rootfs).expect("stage the workload rootfs dir");
@@ -221,10 +190,6 @@ pub fn deterministic_enabled_backend_for_tests(root: &Path) -> (GvisorBackend, I
     (backend, image)
 }
 
-/// A checkout-bearing CI [`JobSpec`] for the deterministic Enabled backend: `image` is the backend's
-/// resolvable rootfs pin, the workspace carries the repo ref + [`checkout_commit_oid`], and the
-/// run-token authorization is a `CiJob` context whose `region` the orchestrator threads into the Hop
-/// A bare-repo path.
 pub fn checkout_spec_for_backend(image: ImageRef) -> crate::JobSpec {
     let mut spec = crate::JobSpec::new(
         crate::JobKind::Ci,

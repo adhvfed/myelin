@@ -1,14 +1,3 @@
-//! Shutdown-aware routing from region-wide queued-run discovery to exact-tenant CI starters.
-//!
-//! Discovery returns only the authoritative tenant id. Each pass then asks
-//! [`crate::PgCiRunStarterFactory`] for a fresh starter bound to that tenant and the factory's one
-//! region. The discovery read is intentionally not a claim: the exact queued-row lock in
-//! [`crate::PgCiPipelineStarter::run_once`] remains the single-winner authority when pollers race.
-//! Batches are bounded so a permanently busy CI lane cannot starve lifecycle work or shutdown.
-//!
-//! @residency-cell-pinned:file — every discovery binds the exact region captured by the validated
-//! starter factory; each routed starter is constructed with that same [`myelin_tenancy::Region`].
-
 use std::time::Duration;
 
 use crate::{
@@ -16,17 +5,14 @@ use crate::{
     PgCiStarterError, StartQueuedOutcome,
 };
 
-/// Maximum queued runs one poller tick may start before yielding to lifecycle control.
 pub const MAX_CI_RUN_START_BATCH: usize = 64;
 
-/// Result of one bounded starter-poller pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CiRunStarterBatch {
     pub started: usize,
     pub saturated: bool,
 }
 
-/// Fail-closed starter-poller errors. No variant contains database credentials.
 #[derive(Debug)]
 pub enum CiRunStarterPollerError {
     InvalidConfig,
@@ -48,7 +34,6 @@ impl std::fmt::Display for CiRunStarterPollerError {
 
 impl std::error::Error for CiRunStarterPollerError {}
 
-/// Region-wide discovery plus exact-tenant starter routing.
 #[derive(Clone)]
 pub struct PgCiRunStarterPoller {
     discovery: CiRegionRunDiscovery,
@@ -69,7 +54,6 @@ impl PgCiRunStarterPoller {
         }
     }
 
-    /// Discover one queued tenant and drive its exact-cell starter once.
     pub async fn run_once(&self) -> Result<StartQueuedOutcome, CiRunStarterPollerError> {
         let Some(tenant) = self
             .discovery
@@ -87,7 +71,6 @@ impl PgCiRunStarterPoller {
             .map_err(CiRunStarterPollerError::Starter)
     }
 
-    /// Drive until discovery is idle or the explicit fairness bound is reached.
     pub async fn run_until_idle(
         &self,
         max_starts: usize,
@@ -131,8 +114,6 @@ impl PgCiRunStarterPoller {
                     started += 1;
                     processed += 1;
                 }
-                // A stale row was durably consumed, so the bounded loop made progress even though
-                // no workflow started. Do not count it as a start, but continue discovery.
                 StartQueuedOutcome::Superseded { .. } => processed += 1,
             }
         }
@@ -142,7 +123,6 @@ impl PgCiRunStarterPoller {
         })
     }
 
-    /// Run bounded passes until explicit shutdown or sender closure.
     pub async fn run_until_shutdown(
         &self,
         mut shutdown: tokio::sync::watch::Receiver<bool>,

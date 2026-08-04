@@ -1,11 +1,3 @@
-//! PostgreSQL persistence boundary for one deterministic workflow drive.
-//!
-//! A claim, replay load, and commit are intentionally separate operations, but every mutation is
-//! fenced by `(tenant_id, region, run_id, lease_owner, lease_epoch, cursor, live lease)`. The epoch
-//! prevents a stale drive from becoming valid when a process reuses the same worker name after an
-//! expiry. A commit writes journal rows, attempt rows, timer arms, exact signal consumption, staged
-//! outbox rows, and the run settlement in one tenant-scoped PostgreSQL transaction.
-
 use crate::engine::run_state;
 use crate::wfctx::{
     ParkCondition, WAIT_EXPECTED_IDEM_PREFIX, WAIT_EXPECTED_NAME_PREFIX, WAIT_IDEM_PREFIX,
@@ -37,8 +29,6 @@ const HISTORY_KINDS: &[&str] = &[
 ];
 const ATTEMPT_STATES: &[&str] = &["scheduled", "running", "succeeded", "failed", "retrying"];
 
-/// A fail-closed drive-storage error. Invariant errors are separate from database errors so a
-/// dispatcher can distinguish retryable infrastructure failure from work that has lost authority.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DriveStoreError {
     InvalidInput(String),
@@ -96,8 +86,6 @@ fn refs_from_json(
     serde_json::from_value(value).map_err(|e| db(&format!("decode {label} ArtifactRefs"), e))
 }
 
-/// A claimed, version-pinned workflow run. `lease_epoch` is the fencing token and must travel with
-/// every load, renewal, release, and commit.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DriveLease {
     pub tenant: TenantId,
@@ -116,12 +104,9 @@ pub struct DriveLease {
     pub lease_owner: String,
     pub lease_epoch: i64,
     pub lease_expires_unix_ms: i64,
-    /// Stable run-creation timestamp used as the detached outbox envelope clock. Replaying the
-    /// same deterministic drive therefore derives byte-identical rows for exact absorption.
     pub created_at_rfc3339: String,
 }
 
-/// One ordered durable journal row loaded for replay.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LoadedHistory {
     pub seq: i64,
@@ -131,7 +116,6 @@ pub struct LoadedHistory {
     pub result_key_ref: Option<String>,
 }
 
-/// One exact unconsumed signal candidate. Consumption later names all key dimensions again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingSignal {
     pub signal_name: String,
@@ -141,8 +125,6 @@ pub struct PendingSignal {
     pub received_unix_ms: i64,
 }
 
-/// The immutable drive input: the pinned run plus its journal in sequence order and its pending
-/// signals in receive order.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DriveSnapshot {
     pub run: DriveLease,
@@ -150,8 +132,6 @@ pub struct DriveSnapshot {
     pub pending_signals: Vec<PendingSignal>,
 }
 
-/// A staged journal write. `consume_signal`, when present, is valid only for `signal_received` and
-/// binds the receipt to the exact durable signal row consumed by this commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryWrite {
     pub seq: i64,
@@ -162,14 +142,12 @@ pub struct HistoryWrite {
     pub consume_signal: Option<SignalKey>,
 }
 
-/// Exact `wf_signal` key (tenant/region/run are supplied by the lease).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SignalKey {
     pub signal_name: String,
     pub idem_key: String,
 }
 
-/// A durable activity-attempt ledger write for the leased run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActivityAttemptWrite {
     pub command_id: String,
@@ -181,7 +159,6 @@ pub struct ActivityAttemptWrite {
     pub ended_unix_ms: Option<i64>,
 }
 
-/// A timer armed by the leased run. A workflow drive may only arm a timer for itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TimerArm {
     pub timer_id: String,
@@ -190,7 +167,6 @@ pub struct TimerArm {
     pub partition: i16,
 }
 
-/// Everything made durable by one deterministic drive transaction.
 #[derive(Clone, Debug)]
 pub struct DriveCommit {
     pub drive_id: String,
@@ -201,15 +177,6 @@ pub struct DriveCommit {
     pub timers: Vec<TimerArm>,
     pub timer_disarms: Vec<String>,
     pub outbox: Vec<OutboxRow>,
-    /// **The AWAITED park condition (the signal/park race fix).** `Some` iff `next_state == waiting`:
-    /// a [`ParkCondition::Signal`] whose exact `(name, idem_key)` is re-checked against the buffer
-    /// UNDER the run-row lock at commit — a matching PENDING signal (one that landed while this drive
-    /// was mid-flight, buffering but finding the run `running` so it could not wake it) settles the run
-    /// RUNNABLE (`running`) instead of stranding it `waiting`. `None` (or [`ParkCondition::Timer`]) skips
-    /// the re-check (the wheel wakes a timer park). It IS part of the drive fingerprint (versioned: a
-    /// `None` park hashes byte-identically to the pre-park material, a `Some` park appends the
-    /// descriptor), so re-entering the same `drive_id` with a DIFFERENT park descriptor fails closed
-    /// rather than being wrongly accepted as `AlreadyCommitted`.
     pub park: Option<ParkCondition>,
 }
 
@@ -226,7 +193,6 @@ pub struct FiredTimer {
     pub command_id: String,
 }
 
-/// Production PostgreSQL drive store pinned to one verified tenant and one residency region.
 #[derive(Clone)]
 pub struct PgFlowDriveStore {
     pool: PgPool,
@@ -243,8 +209,6 @@ impl PgFlowDriveStore {
         }
     }
 
-    /// Claim one runnable row with a bounded lease. The candidate row lock is skipped rather than
-    /// waited on, allowing many partition workers without convoying.
     pub async fn claim_runnable(
         &self,
         partition: i16,
@@ -298,9 +262,6 @@ impl PgFlowDriveStore {
         .await
     }
 
-    /// Claim one runnable row for an exact locally registered definition. Production dispatchers
-    /// use this form so a worker never leases a workflow type/version whose body is absent from the
-    /// process. Unsupported definitions remain untouched for their owning adapter.
     pub async fn claim_runnable_definition(
         &self,
         partition: i16,
@@ -362,19 +323,6 @@ impl PgFlowDriveStore {
         .await
     }
 
-    /// **Claim-side repair for the signal/park race (belt-and-braces).** Atomically claims one
-    /// `state='waiting'` run in this partition+definition that has been STRANDED — a run whose current
-    /// (still-`signal_waited`, not yet upgraded to `signal_received`) park descriptor is matched by an
-    /// unconsumed buffered signal, yet the run was never woken. This recovers rows stranded by OLDER
-    /// code (before the commit-side race fix) or by manual repair; the commit-side check
-    /// ([`Self::commit_drive`]) prevents NEW strandings.
-    ///
-    /// The descriptor is read from the journaled `signal_waited` markers (an EXACT wait records its
-    /// awaited `signal_name` + `idem_key` — the CI `job.done` long-park case, the one that strands). A
-    /// name-only wait journals no descriptor markers, so it is not repaired here (its strandings are
-    /// still prevented at commit-side). The claim flips `waiting → running` AND leases it in one fenced
-    /// statement (epoch incremented), so the caller drives it exactly like a normal claim; replay then
-    /// re-issues the wait, finds the buffered signal, and consumes it.
     pub async fn claim_stranded_signal_wait(
         &self,
         partition: i16,
@@ -449,7 +397,6 @@ impl PgFlowDriveStore {
         .await
     }
 
-    /// Renew only the exact still-live owner+epoch claim. An expired lease is never resurrected.
     pub async fn renew_lease(
         &self,
         lease: &DriveLease,
@@ -489,7 +436,6 @@ impl PgFlowDriveStore {
         .await
     }
 
-    /// Release only the exact owner+epoch claim. A stale process cannot clear a successor's lease.
     pub async fn release_lease(&self, lease: &DriveLease) -> Result<(), DriveStoreError> {
         self.validate_lease_scope(lease)?;
         let lease = lease.clone();
@@ -525,7 +471,6 @@ impl PgFlowDriveStore {
         .await
     }
 
-    /// Load the pinned run, ordered journal, and pending signals under the exact live lease fence.
     pub async fn load_drive(&self, lease: &DriveLease) -> Result<DriveSnapshot, DriveStoreError> {
         self.validate_lease_scope(lease)?;
         let lease = lease.clone();
@@ -615,8 +560,6 @@ impl PgFlowDriveStore {
         .await
     }
 
-    /// Atomically persist one drive and release its lease. Exact deterministic re-entry after a
-    /// successful commit returns `AlreadyCommitted`; every stale/different re-entry fails closed.
     pub async fn commit_drive(
         &self,
         lease: &DriveLease,
@@ -815,19 +758,6 @@ impl PgFlowDriveStore {
                         .map_err(DriveStoreError::from)?;
 
                     let next_cursor = actual_cursor + new_history;
-                    // **Close the signal/park race UNDER THE SAME run-row lock (FOR UPDATE above).** A
-                    // drive that settles `waiting` on a SIGNAL park re-checks the buffer here: a signal
-                    // that landed WHILE this drive ran (it observed the run `running`/`leased`, so it
-                    // buffered but could NOT fire the `waiting→running` wake) is now visible. Settling
-                    // `running` instead re-arms the run so the dispatcher re-drives + consumes it,
-                    // rather than stranding it `waiting` behind an unobserved signal. Race-free both
-                    // interleavings: the signal INSERT takes this SAME row `FOR UPDATE` (pg_executor),
-                    // so either this commit sees the pending signal, or the signal (committing after)
-                    // sees state `waiting` and wakes it. The check is descriptor-SCOPED (the exact
-                    // awaited name [+ idem_key]) — an UNRELATED unconsumed signal (e.g. a timed-out
-                    // `job.done` left buffered while the body parks on a later `finish` signal) does NOT
-                    // re-arm it, so there is no hot loop. A `Timer`/`None` park skips the re-check (the
-                    // timer wheel wakes a timer park).
                     let mut effective_state = commit.next_state.clone();
                     if effective_state == run_state::WAITING {
                         if let Some(ParkCondition::Signal { name, idem_key }) = &commit.park {
@@ -877,8 +807,6 @@ impl PgFlowDriveStore {
         .await
     }
 
-    /// Claim and fire one due timer atomically. The fired pivot, deterministic fire journal row,
-    /// cursor advance, and waiting→running wake commit together, so a restart observes all or none.
     pub async fn fire_due_timer(
         &self,
         partition: i16,
@@ -949,9 +877,6 @@ impl PgFlowDriveStore {
                             )));
                         }
                         if state != run_state::WAITING {
-                            // A signal may already have woken a running run, or cancellation/
-                            // completion may have made it terminal. In either case the timer is
-                            // obsolete: disarm it without touching history, cursor, or run state.
                             let changed = sqlx::query(
                                 "UPDATE wf_timer SET fired = true \
                                  WHERE tenant_id = $1 AND region = $2 AND timer_id = $3 AND NOT fired",
@@ -1238,10 +1163,6 @@ fn validate_commit(lease: &DriveLease, commit: &DriveCommit) -> Result<(), Drive
             "a terminal drive cannot arm new workflow timers".into(),
         ));
     }
-    // The park descriptor (the signal/park race fix) is a bounded machine token — validate its shape
-    // so nothing unbounded reaches the run-row-locked pending-signal re-check. A park descriptor on a
-    // non-`waiting` settlement is meaningless (a completed/failed run is not parked); reject it rather
-    // than silently ignore, so a caller mistake is loud.
     if let Some(park) = &commit.park {
         if commit.next_state != run_state::WAITING {
             return Err(DriveStoreError::InvalidInput(
@@ -1378,11 +1299,6 @@ async fn consume_exact_signal(
     Ok(())
 }
 
-/// Whether an UNCONSUMED `wf_signal` row matches the exact park descriptor `(signal_name [, idem_key])`.
-/// Called under the run-row lock at commit to close the signal/park race. Descriptor-scoped: a keyed
-/// wait matches only its exact `idem_key`; a name-only wait matches the first unconsumed row of that
-/// name. It NEVER treats an arbitrary unconsumed signal as a match, so a run parked on one signal is not
-/// re-armed by an unrelated buffered signal.
 async fn pending_signal_matches(
     conn: &mut sqlx::PgConnection,
     tenant: &str,
@@ -1631,14 +1547,6 @@ fn drive_fingerprint(commit: &DriveCommit) -> Result<String, DriveStoreError> {
         "timer_disarms": commit.timer_disarms,
         "outbox": outbox,
     });
-    // **Versioned park-descriptor inclusion.** The park descriptor STEERS the committed state
-    // (waiting vs runnable), so it MUST be part of the re-entry identity: the same `drive_id` with a
-    // DIFFERENT park descriptor is a different drive and must fail closed (`DuplicateDrive`), never be
-    // waved through as `AlreadyCommitted`. Inclusion is VERSIONED for legacy compatibility: `park:
-    // None` hashes EXACTLY as the pre-park material (no `park` key added), so every drive committed
-    // before this field re-computes its stored fingerprint byte-identically; `park: Some` appends the
-    // descriptor. The park derives deterministically from the journaled wait, so a genuine
-    // deterministic re-entry recomputes the identical descriptor and still matches.
     if let Some(park) = &commit.park {
         let park_json = match park {
             ParkCondition::Signal { name, idem_key } => {

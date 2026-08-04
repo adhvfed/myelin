@@ -1,4 +1,3 @@
-//! Live CT-005 proof for the durable CI run read authority.
 #![cfg(feature = "integration")]
 
 mod common;

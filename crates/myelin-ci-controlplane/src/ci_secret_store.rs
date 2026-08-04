@@ -1,10 +1,3 @@
-//! Durable, tenant-DEK-sealed CI secret material and the production broker capability.
-//!
-//! `secret_binding` remains names-and-handles only. The material lives in `ci_secret` exclusively as
-//! Storage's existing [`myelin_storage::EncryptedColumn`] envelope. Reads and writes use the shared
-//! tenant-scoped transaction convention, while the synchronous broker trait bridges onto the service
-//! runtime in the same way as the other durable stores.
-
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
@@ -133,9 +126,6 @@ const SELECT_BOUND_SECRET: &str = "SELECT secret.pii_key_ref, secret.nonce, secr
 
 const SECRET_AAD_DOMAIN: &[u8] = b"myelin-ci-secret-row:v1";
 
-/// Unambiguous, domain-separated AES-GCM AAD for one durable secret row. Length prefixes prevent
-/// tuple-boundary ambiguity; region is included so moving an envelope across any row-scope
-/// dimension fails authentication.
 fn secret_row_aad(tenant: &TenantId, region: &Region, secret_id: &str) -> Vec<u8> {
     let mut aad = Vec::with_capacity(
         SECRET_AAD_DOMAIN.len()
@@ -193,7 +183,6 @@ enum SecretStoreBackend {
     Memory(Arc<std::sync::Mutex<MemorySecretStore>>),
 }
 
-/// A material-free secret-store failure. No variant carries plaintext, ciphertext, or key material.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiSecretStoreError {
     InvalidScope,
@@ -219,8 +208,6 @@ impl std::fmt::Display for CiSecretStoreError {
 
 impl std::error::Error for CiSecretStoreError {}
 
-/// The durable `ci_secret` store. Production uses PostgreSQL; the in-memory backend is compiled only
-/// for unit tests and retains the exact same encrypted-row representation and tenant-DEK cipher.
 #[derive(Clone)]
 pub struct DurableCiSecretStore {
     backend: SecretStoreBackend,
@@ -282,8 +269,6 @@ impl DurableCiSecretStore {
             ));
     }
 
-    /// Minimal write/seal primitive: provision the tenant hierarchy, encrypt with the existing
-    /// tenant-DEK column cipher, then persist only the envelope (`pii_key_ref`, nonce, ciphertext).
     pub fn seal_secret(
         &self,
         tenant: &TenantId,
@@ -919,9 +904,6 @@ impl DurableCiSecretStore {
         Ok(())
     }
 
-    /// Open one exact `(tenant, secret_id)` row. Any absence, malformed envelope, wrong tenant key,
-    /// AEAD authentication failure, or invalid UTF-8 is a material-free error/absence for the
-    /// capability to convert into a terminal withhold.
     #[cfg(test)]
     fn resolve_secret(
         &self,
@@ -1090,10 +1072,6 @@ impl DurableCiSecretStore {
         }
     }
 
-    /// Load the ciphertext and its exact binding in one PostgreSQL statement/MVCC snapshot. A
-    /// delete/recreate can therefore expose either the old joined generation or the new joined
-    /// generation, never old ciphertext paired with a newly-created binding. A revoke committed
-    /// before this statement is observed; an overlapping revoke linearizes immediately afterward.
     fn resolve_bound_secret(
         &self,
         tenant: &TenantId,
@@ -1216,9 +1194,6 @@ fn bridge<F: std::future::Future>(runtime: &tokio::runtime::Handle, future: F) -
     }
 }
 
-/// A request-bound production capability. It deliberately repeats the broker's ReBAC check and
-/// tenant/object/handle equivalence before touching storage, so direct trait use cannot turn the
-/// durable store into a confused deputy.
 pub struct DurableSecretCapability<I: IdentityService> {
     store: Arc<DurableCiSecretStore>,
     identity: Arc<I>,
@@ -1293,9 +1268,6 @@ impl<I: IdentityService> SecretCapability for DurableSecretCapability<I> {
     }
 }
 
-/// Compose the production claim-time resolver over the durable encrypted store and the same
-/// Identity engine used for `secret.read`. The capability is bound to the claim-derived subject for
-/// each invocation, then the broker repeats the authorization at its normal boundary.
 pub fn durable_ci_job_secret_resolver<I>(
     store: Arc<DurableCiSecretStore>,
     identity: Arc<I>,

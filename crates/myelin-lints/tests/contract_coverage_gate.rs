@@ -1,19 +1,3 @@
-//! The contract-coverage meta-gate's CI-wiring + green-artifact test (P-S21 → P-037).
-//!
-//! Proves the `contract-coverage` binary — the thing the CI `contract-coverage` job runs — is
-//! wired LOUD and NEVER SWALLOWED (EI-01 §5):
-//!   1. it exits ZERO on the REAL workspace (the dated GREEN artifact: every contract-index row is
-//!      either covered by a real provider+consumer CDC pair or deferred with a named landing
-//!      prompt — 0 falsely-claimed);
-//!   2. it exits NON-ZERO on a deliberately RED manifest fixture (a row that CLAIMS coverage via a
-//!      missing CDC file + a deferred row with no landing prompt) — the gate cannot be `|| true`-
-//!      swallowed because the exit code IS the gate;
-//!   3. it exits ZERO on a green fixture (the scanner does not over-reject).
-//!
-//! Together (1)+(2) are the P-S21 GATE/DRILLS pass condition + the required red-fixture unit
-//! (the scanner must reject a deliberately-uncovered row; a row marked not-yet-implemented with its
-//! landing prompt passes).
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -34,21 +18,17 @@ fn run_scanner(args: &[&str]) -> i32 {
 
 #[test]
 fn contract_coverage_is_green_over_the_real_workspace() {
-    // The dated GREEN artifact: the scanner run with no args reconciles the REAL contract-index
-    // against the REAL contract-coverage.toml and exits zero (0 falsely-claimed rows).
     let code = run_scanner(&[]);
     assert_eq!(
         code, 0,
         "contract-coverage MUST be green over the real contract-index + manifest (0 \
          falsely-claimed rows). If this is red, ship the missing CDC pair or mark the row \
-         deferred with its landing prompt — NEVER weaken the gate."
+         deferred with its landing prompt - NEVER weaken the gate."
     );
 }
 
 #[test]
 fn contract_coverage_fails_loudly_on_the_red_manifest_fixture() {
-    // The red-fixture: a manifest claiming coverage of a non-existent CDC file + a deferred row
-    // with no landing prompt. The gate MUST exit non-zero — a non-zero exit cannot be swallowed.
     let index = fixtures_dir().join("contract_index.fixture.md");
     let manifest = fixtures_dir().join("contract_coverage.red.fixture.toml");
     let code = run_scanner(&[
@@ -66,8 +46,6 @@ fn contract_coverage_fails_loudly_on_the_red_manifest_fixture() {
 
 #[test]
 fn contract_coverage_passes_on_the_green_manifest_fixture() {
-    // The green fixture: a covered row with a real pair file + a deferred row with a landing
-    // prompt. The gate MUST exit zero — proving the scanner does not over-reject.
     let index = fixtures_dir().join("contract_index.fixture.md");
     let manifest = fixtures_dir().join("contract_coverage.green.fixture.toml");
     let code = run_scanner(&[

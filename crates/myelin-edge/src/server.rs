@@ -1,14 +1,3 @@
-//! # The real hyper listener — the thin transport adapter over [`Gateway`]
-//!
-//! This is the REAL HTTP listener the prompt calls for: it binds a TCP listener and, per connection,
-//! converts `hyper::Request` → [`EdgeRequest`], runs the gateway lifecycle, and converts the
-//! [`EdgeResponse`] back to a `hyper::Response` — rendering a finished JSON/error body OR streaming an
-//! SSE response. hyper 1.x is used directly (no axum); every type here is already in `Cargo.lock`.
-//!
-//! The adapter is deliberately thin: ALL the policy (auth, tenant-from-token, IDOR reject,
-//! authorization, error envelope, versioning, pagination, SSE scoping) lives in [`Gateway`], so the
-//! security properties hold identically whether driven over this socket or in-process.
-
 use crate::error::EdgeError;
 use crate::gateway::Gateway;
 use crate::request::{EdgeRequest, EdgeResponse};
@@ -32,24 +21,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_stream::wrappers::BroadcastStream;
 
-/// The response body type the adapter emits — a boxed body of [`Bytes`] frames (finished or
-/// streamed), with an `io::Error` error channel.
 type EdgeBody = BoxBody<Bytes, std::io::Error>;
 
-/// **The front-door request-body size ceiling (R0.5 / DELTA N3).**
-///
-/// `body.collect().await` on a hyper `Incoming` buffers the ENTIRE body into host RAM with no size
-/// limit — the comment that it was "bounded by hyper's defaults" was false, so a single large POST
-/// (e.g. to the `git-receive-pack` wire route, or ANY route) is a trivial memory-exhaustion DoS. The
-/// sandbox's 64 MiB stdin bound in `myelin-ci-sandbox` only applies AFTER this collection, so it
-/// never protects the edge process. We therefore bound the body AS IT STREAMS and reject oversize
-/// with a `413 Payload Too Large` without buffering past the cap.
-///
-/// **Tradeoff / choice of 64 MiB:** git pushes ship packfiles that can be large, so the ceiling must
-/// be generous enough for a legitimate `git-receive-pack` — but finite, so the front door has a hard
-/// DoS ceiling. The transport cap is exactly the sandbox's stdin cap: accepting more here would only
-/// buffer bytes that the executor must later reject. Only `git-receive-pack` receives that budget;
-/// every other route has a 1 MiB ceiling.
 const MAX_REQUEST_BODY_BYTES: usize = myelin_ci_sandbox::gvisor::WIRE_STDIN_BOUND;
 const MAX_JSON_REQUEST_BODY_BYTES: usize = 1024 * 1024;
 const MAX_CONNECTIONS: usize = 1024;
@@ -57,9 +30,6 @@ const MAX_CONCURRENT_GIT_WIRE_OPERATIONS: usize = 4;
 const MAX_CONCURRENT_REQUEST_BODIES: usize = 64;
 const MAX_CONCURRENT_GIT_PUSH_BODIES: usize = 2;
 const MAX_CONCURRENT_GATEWAY_DISPATCHES: usize = 64;
-/// Git wire and raw/download handlers may each materialize a large bounded response. Keep their
-/// aggregate bounded independently of the general dispatch pool, and retain each permit while the
-/// response body is being pulled under Hyper's backpressure.
 const MAX_CONCURRENT_LARGE_RESPONSES: usize = 2;
 const MAX_RESPONSE_FRAME_BYTES: usize = 64 * 1024;
 const MAX_REQUEST_HEADERS: usize = 64;
@@ -81,19 +51,14 @@ struct AdmissionSlots {
     large_response: Arc<Semaphore>,
 }
 
-/// Result of a requested listener shutdown. A forced result means the grace deadline expired and
-/// the remaining connection tasks were aborted; the count is the number active when draining began.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShutdownOutcome {
     Graceful { connections: usize },
     Forced { connections: usize },
 }
 
-/// Boxed asynchronous readiness check. The probe reports only a verdict; transport responses never
-/// expose connection strings, filesystem paths, or dependency error details.
 pub type ReadinessCheck<'a> = Pin<Box<dyn Future<Output = bool> + Send + 'a>>;
 
-/// Critical-dependency readiness seam used by the unauthenticated orchestration probe.
 pub trait ReadinessProbe: Send + Sync {
     fn check(&self) -> ReadinessCheck<'_>;
 }
@@ -107,29 +72,13 @@ impl ReadinessProbe for AlwaysReady {
     }
 }
 
-/// Why a bounded collect stopped short of returning the full body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BoundedCollectError {
-    /// The accumulated data frames exceeded [`MAX_REQUEST_BODY_BYTES`]; reading stopped at the cap
-    /// (the oversize buffer is never allocated) — maps to a `413` at the edge.
     TooLarge,
-    /// The transport yielded a read error mid-body. The caller returns a canonical `400` and closes
-    /// the HTTP/1 connection; a partial or broken body is never reinterpreted as an empty request.
     Read,
-    /// The route's absolute body-read deadline expired. An absolute deadline, rather than an idle
-    /// timeout, prevents a client from retaining capacity forever by trickling occasional bytes.
     TimedOut,
 }
 
-/// **Collect a request body frame-by-frame, bounded by `cap` (R0.5 / DELTA N3).**
-///
-/// Iterates the body one [`Frame`] at a time via [`BodyExt::frame`], accumulating ONLY data frames
-/// (trailers do not count toward the body) into a `Vec`. The moment the running total would exceed
-/// `cap`, it STOPS reading and returns [`BoundedCollectError::TooLarge`] — it does NOT keep buffering,
-/// so an oversize body never grows host memory past ~`cap`. The absolute `deadline` wraps the entire
-/// read, so periodic trickle bytes cannot keep the future alive forever. A transport read error
-/// returns [`BoundedCollectError::Read`]. Generic over any `Body<Data = Bytes>` so it is unit-testable
-/// with an in-memory body (no socket needed).
 async fn collect_bounded<B>(
     mut body: B,
     cap: usize,
@@ -142,9 +91,7 @@ where
         let mut acc: Vec<u8> = Vec::new();
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|_| BoundedCollectError::Read)?;
-            // Only DATA frames count toward the body; a trailers frame is skipped.
             if let Ok(data) = frame.into_data() {
-                // Reject BEFORE extending past the cap — never allocate the full oversize buffer.
                 if acc.len() + data.len() > cap {
                     return Err(BoundedCollectError::TooLarge);
                 }
@@ -157,8 +104,6 @@ where
     .map_err(|_| BoundedCollectError::TimedOut)?
 }
 
-/// **Serve the edge over a bound TCP listener.** Accepts connections forever, serving each over
-/// HTTP/1.1 with the gateway. Returns only on an accept error.
 pub async fn serve_edge(listener: TcpListener, gateway: Arc<Gateway>) -> std::io::Result<()> {
     serve_edge_until_shutdown(
         listener,
@@ -170,9 +115,6 @@ pub async fn serve_edge(listener: TcpListener, gateway: Arc<Gateway>) -> std::io
     Ok(())
 }
 
-/// Serve until `shutdown` resolves, then close the listener, gracefully finish active HTTP/1
-/// connections, and abort only those still open after `grace`. The shutdown future's output is
-/// returned to the owner so signal-handler failures remain distinguishable from transport failures.
 pub async fn serve_edge_until_shutdown<F, T>(
     listener: TcpListener,
     gateway: Arc<Gateway>,
@@ -192,7 +134,6 @@ where
     .await
 }
 
-/// Production variant of [`serve_edge_until_shutdown`] with an explicit dependency-readiness probe.
 pub async fn serve_edge_until_shutdown_with_probe<F, T>(
     listener: TcpListener,
     gateway: Arc<Gateway>,
@@ -271,7 +212,6 @@ where
         }
     };
 
-    // Dropping the listener happens here, before any drain wait, so no new socket can enter.
     drop(listener);
     let active = graceful.count();
     let outcome = if tokio::time::timeout(grace, graceful.shutdown())
@@ -298,7 +238,6 @@ where
     ))
 }
 
-/// Convert one hyper request → [`EdgeRequest`], run the gateway, convert the response back.
 async fn handle_connection(
     gw: Arc<Gateway>,
     readiness: Arc<dyn ReadinessProbe>,
@@ -385,14 +324,9 @@ async fn handle_connection_inner(
         .iter()
         .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
         .collect();
-    // Front-door body bound (R0.5 / DELTA N3): fast-path reject on a Content-Length header that
-    // already declares more than the cap — refuse before reading a single body byte.
     if content_length_over_cap(&parts.headers, body_cap) {
         return payload_too_large(body_cap);
     }
-    // Bound aggregate memory, not just each request. Only framed, non-empty bodies consume this
-    // capacity, so GET/read traffic remains independent. The permit is acquired before reading and
-    // remains owned by blocking dispatch, preventing completed bodies from piling up in a queue.
     let request_body_permit = if request_has_body(&parts.headers) {
         match admission.request_body.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
@@ -405,8 +339,6 @@ async fn handle_connection_inner(
     } else {
         None
     };
-    // At most two 64 MiB pushes may coexist within the general 64-body budget. A dedicated
-    // semaphore keeps slow uploads from consuming clone/read execution capacity.
     let git_push_body_permit = if is_git_push {
         match admission.git_push_body.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
@@ -419,9 +351,6 @@ async fn handle_connection_inner(
     } else {
         None
     };
-    // Collect the body bounded by MAX_REQUEST_BODY_BYTES, streaming frame-by-frame. Oversize → a 413
-    // WITHOUT buffering past the cap; a read error → a clean 400 + connection close — never a
-    // partial body and never a panic.
     let bytes = match collect_bounded(body, body_cap, body_deadline).await {
         Ok(b) => b,
         Err(BoundedCollectError::TooLarge) => return payload_too_large(body_cap),
@@ -429,9 +358,6 @@ async fn handle_connection_inner(
         Err(BoundedCollectError::TimedOut) => return request_timeout(body_deadline),
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
-    // Raw/download and Git wire requests may materialize their full bounded output. Admit them
-    // before the blocking handler runs, then transfer the permit to the response body so slow
-    // clients cannot accumulate large allocations behind the much wider general gateway pool.
     let large_response_permit =
         if requires_large_response_budget(&edge_req.method, &edge_req.path) {
             match admission.large_response.clone().try_acquire_owned() {
@@ -443,8 +369,6 @@ async fn handle_connection_inner(
         } else {
             None
         };
-    // Acquire expensive Git capacity only after the bounded body has arrived; unauthenticated
-    // trickle uploads cannot monopolize the four Git execution slots during their read deadline.
     let git_wire_permit = if is_git_wire {
         match admission.git_wire.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
@@ -458,9 +382,6 @@ async fn handle_connection_inner(
         Err(_) => return overloaded("the edge request service is at capacity; retry later"),
     };
 
-    // Every gateway handler is synchronous and may reach blocking filesystem/Git/database adapters.
-    // Keep all of it off Tokio workers. Move permits into the closure so request cancellation cannot
-    // release capacity while the blocking work continues in the background.
     let (edge_response, large_response_permit) = match tokio::task::spawn_blocking(move || {
         let _gateway_permit = gateway_permit;
         let _git_wire_permit = git_wire_permit;
@@ -621,8 +542,6 @@ fn overloaded(message: &str) -> Response<EdgeBody> {
 
 fn unread_body_overloaded(message: &str) -> Response<EdgeBody> {
     let mut response = overloaded(message);
-    // The request body has deliberately not been read. Closing prevents unread upload bytes from
-    // being mistaken for a subsequent HTTP/1 request on the same connection.
     response
         .headers_mut()
         .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
@@ -665,10 +584,6 @@ fn probe_response(status: u16, body: Vec<u8>) -> Response<EdgeBody> {
         .unwrap_or_else(|_| response_render_failure())
 }
 
-/// True iff a `Content-Length` header is present, parseable, and DECLARES more than `cap` bytes — the
-/// front-door fast-reject signal (R0.5 / DELTA N3). An absent/unparseable header is NOT over-cap here
-/// (the streaming bound in [`collect_bounded`] is the real enforcement; this is only the cheap
-/// pre-read shortcut for a client that honestly declares an oversize body).
 fn content_length_over_cap(headers: &hyper::HeaderMap, cap: usize) -> bool {
     headers
         .get(hyper::header::CONTENT_LENGTH)
@@ -686,22 +601,17 @@ fn request_has_body(headers: &hyper::HeaderMap) -> bool {
         || headers.contains_key(hyper::header::TRANSFER_ENCODING)
 }
 
-/// Render the `413 Payload Too Large` response through the existing error-envelope path, so its
-/// `{error:{message,code}}` shape matches every other edge error (R0.5 / DELTA N3).
 fn payload_too_large(cap: usize) -> Response<EdgeBody> {
     let err = EdgeError::PayloadTooLarge(format!(
         "request body exceeds the {cap}-byte route limit"
     ));
     let mut response = to_hyper(EdgeResponse::error(&err));
-    // Both the declared-length fast path and the streaming overflow path leave request bytes
-    // unread. Never reuse that HTTP/1 connection for a subsequent request.
     response
         .headers_mut()
         .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
     response
 }
 
-/// Render an [`EdgeResponse`] as a hyper response (finished body or streamed SSE).
 fn to_hyper(resp: EdgeResponse) -> Response<EdgeBody> {
     to_hyper_with_permit(resp, None)
 }
@@ -804,16 +714,12 @@ fn response_render_failure() -> Response<EdgeBody> {
     response
 }
 
-/// A finished body of `Bytes` (the JSON view-model / error envelope).
 fn full_body(bytes: Vec<u8>) -> EdgeBody {
     Full::new(Bytes::from(bytes))
         .map_err(|never: Infallible| match never {})
         .boxed()
 }
 
-/// A bounded finished response split into transport-sized frames. `bytes` retains the single
-/// backing allocation until Hyper drops the body, while the permit prevents another large-output
-/// handler from materializing its own maximum-sized response. Slicing is zero-copy.
 fn budgeted_bytes_body(bytes: Vec<u8>, permit: OwnedSemaphorePermit) -> EdgeBody {
     BudgetedBytesBody {
         bytes: Bytes::from(bytes),
@@ -859,9 +765,6 @@ impl Body for BudgetedBytesBody {
     }
 }
 
-/// A streaming SSE body fed by the subscription's broadcast receiver: each frame is written as one
-/// SSE event. A lagged receiver terminates immediately so the client observes a disconnect and
-/// resynchronizes; it must never cross an invisible event gap on an apparently healthy stream.
 fn sse_body(
     rx: tokio::sync::broadcast::Receiver<crate::sse::SseEvent>,
     expires_at_unix: i64,
@@ -894,8 +797,6 @@ impl tokio_stream::Stream for ExpiringSseStream {
         if this.done {
             return Poll::Ready(None);
         }
-        // Authentication is not a one-time permission to stream forever: poll the signed
-        // capability deadline before every event, including an event already waiting in the hub.
         if this.expiry.as_mut().poll(cx).is_ready() {
             this.done = true;
             return Poll::Ready(None);
@@ -904,8 +805,6 @@ impl tokio_stream::Stream for ExpiringSseStream {
             Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(Frame::data(Bytes::from(
                 event.frame(),
             ))))),
-            // Lagged streams close instead of skipping across an invisible event gap. Closure also
-            // ends permanently; `done` prevents a later poll from resuming either condition.
             Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
                 this.done = true;
                 Poll::Ready(None)
@@ -917,9 +816,6 @@ impl tokio_stream::Stream for ExpiringSseStream {
 
 #[cfg(test)]
 mod tests {
-    //! R0.5 / DELTA N3 — the front-door body bound. These prove: (a) an under-cap body collects fully
-    //! and correctly; (b) an over-cap body returns `TooLarge` and stops accumulating NEAR the cap (the
-    //! full oversize buffer is never allocated); (c) a Content-Length header over the cap fast-rejects.
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1034,7 +930,6 @@ mod tests {
         );
     }
 
-    /// (a) A body under the cap collects fully and byte-for-byte.
     #[tokio::test]
     async fn under_cap_collects_full_body() {
         let payload = b"the quick brown fox jumps over the lazy dog".to_vec();
@@ -1045,7 +940,6 @@ mod tests {
         assert_eq!(out, payload, "an under-cap body is returned exactly");
     }
 
-    /// A body exactly AT the cap is accepted (the boundary is inclusive).
     #[tokio::test]
     async fn exactly_at_cap_is_accepted() {
         let cap = 4096;
@@ -1056,14 +950,11 @@ mod tests {
         assert_eq!(out.len(), cap);
     }
 
-    /// (b) A body over the cap returns `TooLarge` AND stops reading near the cap — it does NOT pull the
-    /// whole oversize input. We count bytes actually pulled from the stream; only consumed frames
-    /// increment it, so the counter proves accumulation halted a frame past the cap, not at input end.
     #[tokio::test]
     async fn over_cap_rejects_without_buffering_full_input() {
         let cap = 4096usize;
         let chunk = 1024usize;
-        let total_chunks = 4096usize; // 4 MiB of input — 1000x the cap.
+        let total_chunks = 4096usize;
         let pulled = Arc::new(AtomicUsize::new(0));
         let counter = pulled.clone();
         let chunks: Vec<Bytes> = (0..total_chunks).map(|_| Bytes::from(vec![0u8; chunk])).collect();
@@ -1084,8 +975,6 @@ mod tests {
         );
     }
 
-    /// Trailers frames do not count toward the body: a data frame under the cap followed by trailers
-    /// still collects successfully and yields only the data bytes.
     #[tokio::test]
     async fn trailers_frame_is_not_counted_as_body() {
         let mut trailers = hyper::HeaderMap::new();
@@ -1101,7 +990,6 @@ mod tests {
         assert_eq!(out, b"hello", "only the data frame contributes to the body");
     }
 
-    /// A transport read error surfaces as `Read`, never as a partial or empty successful body.
     #[tokio::test]
     async fn read_error_surfaces_as_read_not_too_large() {
         let frames: Vec<Result<Frame<Bytes>, std::io::Error>> = vec![
@@ -1113,8 +1001,6 @@ mod tests {
         assert_eq!(res, Err(BoundedCollectError::Read), "a mid-body read error is Read, not TooLarge");
     }
 
-    /// A body that never finishes cannot retain a connection or Git push slot indefinitely. The
-    /// absolute deadline fires even though the stream itself never produces an error or EOF.
     #[tokio::test]
     async fn stalled_body_hits_the_absolute_read_deadline() {
         let body = StreamBody::new(tokio_stream::pending::<Result<Frame<Bytes>, std::io::Error>>());
@@ -1122,8 +1008,6 @@ mod tests {
         assert_eq!(res, Err(BoundedCollectError::TimedOut));
     }
 
-    /// (c) A Content-Length header declaring more than the cap fast-rejects; at/under the cap, or
-    /// absent/unparseable, does not.
     #[test]
     fn content_length_over_cap_fast_rejects() {
         let cap = 4096usize;
@@ -1142,8 +1026,6 @@ mod tests {
         );
     }
 
-    /// The 413 response carries the canonical `{error:{message,code}}` envelope with code
-    /// `payload_too_large` and HTTP status 413.
     #[test]
     fn payload_too_large_uses_the_canonical_413_envelope() {
         let resp = payload_too_large(MAX_REQUEST_BODY_BYTES);

@@ -5,34 +5,13 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-harness is the TEST-SUPPORT failure-injection harness (P-S02..P-S04;
-# architecture 00 §11, the failure-injection seam; doctrine EI-01 §3 "prove-it /
-# build the harness early"). It is NOT a node in the production crate DAG (architecture
-# §2.9) — it sits ABOVE myelin-substrate as a leaf consumer, the way a service's main.rs
-# does. It depends on the glue crates whose surfaces the drills tag/observe:
-#   - myelin-identity for PrincipalKind (the limiter reads Principal.kind, §7.2);
-#   - myelin-tenancy for TenantId (every request is tagged per-tenant so the assertion
-#     library, P-S04, can read RED/USE per principal-kind per tenant off contract 1.8).
-# Nothing depends on myelin-harness; it must never appear in a production crate's
-# [dependencies] (it would pull test-support into the substrate DAG). The substrate's
-# crate-graph-acyclic test continues to model the ten production crates only.
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
-# MR-005 (attested scorecards): blake3 is the workspace-standard content hash (the same
-# `blake3::hash(..).to_hex()` myelin-storage's ContentHash / pg_migrator use, P-047). The
-# make-it-real gate binds a green verdict to its captured proof output with this one hash —
-# never a hand-rolled digest (VISION §4 / EI-01 §7). serde_json serialises the attested
-# scorecard manifest (the machine-readable artifact the red-by-default gate re-validates).
 blake3.workspace = true
 serde_json.workspace = true
 
-# DEV-ONLY (P-S30 / P-319): the cross-language harness shim conformance suite records its 1.7
-# N/A against chat's REAL TE-21 connection-tier language pin (today: Rust → the shim is a NO-OP,
-# recorded loudly). chat is read ONLY by tests/shim_conformance_p_s30.rs — it is a dev-dependency,
-# NOT a runtime dependency, so the production harness dep set stays tiny and nothing pulls chat's
-# tree into the harness binary. (Nothing depends on myelin-harness, so this is not a DAG cycle.)
 [dev-dependencies]
 myelin-chat = { path = "../myelin-chat" }
 base64 = "0.22"

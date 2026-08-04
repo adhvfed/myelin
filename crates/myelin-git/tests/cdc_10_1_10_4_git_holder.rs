@@ -1,29 +1,3 @@
-//! # CDC 10.1 / 10.4 — the git side of `PersonalDataHolder{locate, export, rectify, restrict,
-//! erase}` + the DSR fan-out (GIT-P29 → P-290, M3-G7; GIT-D2 complete)
-//!
-//! **Contract:** index rows **10.1** (`PersonalDataHolder` — the five DSR operations) + **10.4**
-//! (the DSR state machine / fan-out). The SIGNATURE was frozen at P-GA-01 (`myelin-gdpr`); THIS file
-//! ships the **git side** of 10.1/10.4 — the H1 holder ([`GitPersonalDataHolder`]) IMPLEMENTING the
-//! five-operation contract over git + its hosting metadata, with the REAL §6.1 erasure fan-out
-//! (GIT-D2 complete: every holder hit, residual == the ONE posture, backups shredded). It is the
-//! provider+consumer CDC pair the contract-coverage scanner reads for the git holder seam.
-//!
-//! - **PROVIDER** = the git H1 holder ([`GitPersonalDataHolder`]) implementing the five-operation
-//!   10.1 contract. `locate`/`export`/`rectify`/`restrict` return content-addressed receipts; the
-//!   contract-shaped `erase(EraseScope)` REFUSES loud (the documented EI-01 §1 deviation — the frozen
-//!   signature carries no cross-holder seam bundle, so the honest body refuses rather than claim an
-//!   un-wired erase succeeded), pointing the caller at the real fan-out
-//!   [`GitPersonalDataHolder::erase_fanout`] which IS GIT-D2-green.
-//! - **CONSUMER** = a minimal DSR-orchestrator stand-in that holds the git holder behind
-//!   `dyn PersonalDataHolder`, fans `locate` out via the contract, and drives the real §6.1 fan-out
-//!   (the shape the real GDPR orchestrator P-GA-06/P-GA-11 takes when it fans a DSR out to H1).
-//!
-//! The dated green artifact: the consumer fans `locate(subject)` out to H1 (a content-addressed
-//! receipt over its git surface); the real `erase_fanout` reaches EVERY git holder (pseudonym map +
-//! per-subject DEK bodies + git structures + search + refs + bus + cache/CDN + ledger), with 0
-//! recoverable PII in any backup and the residual == the ONE platform posture (10.9 / X-7). If 10.1's
-//! body shape drifts, this stops compiling/passing — that is the contract.
-
 use myelin_gdpr::{EraseScope, LocateReport, PersonalDataHolder, SubjectRef, TenantId};
 use myelin_git::code_tools::{CacheInvalidator, CacheNamespace};
 use myelin_git::core::{GitCoreError, RepoLoc};
@@ -57,8 +31,6 @@ fn subject() -> SubjectRef {
 fn subject_id() -> SubjectId {
     SubjectId::new("p-opaque-ada")
 }
-
-// ── the cross-holder seams the DSR orchestrator wires (the real subsystem holders, stubbed here) ──
 
 #[derive(Default)]
 struct OkSeam {
@@ -132,10 +104,6 @@ fn engine() -> KmsEngine {
     kms
 }
 
-/// **The CONSUMER side (10.1): a DSR-orchestrator shape that fans out to H1 via the contract.** It
-/// holds the holder behind `dyn PersonalDataHolder` + calls the contract — it never reaches into a
-/// store. This is the shape the real GDPR orchestrator (P-GA-06/P-GA-11) takes when it fans a DSR out
-/// to the git H1 holder.
 struct DsrOrchestrator<'a> {
     holders: Vec<&'a dyn PersonalDataHolder>,
 }
@@ -151,10 +119,6 @@ impl<'a> DsrOrchestrator<'a> {
     }
 }
 
-/// **provider + consumer wired together (the 10.1 git CDC pair).** The orchestrator (consumer) fans
-/// `locate` out to the git H1 holder (provider); it returns a content-addressed receipt over its git
-/// surface — the frozen 10.1 contract is honoured. This is the dated green artifact for the git side
-/// of 10.1.
 #[test]
 fn dsr_orchestrator_fans_locate_out_to_the_git_h1_holder_via_the_contract() {
     let eng = engine();
@@ -187,9 +151,6 @@ fn dsr_orchestrator_fans_locate_out_to_the_git_h1_holder_via_the_contract() {
     );
 }
 
-/// **The contract-shaped `erase(EraseScope)` REFUSES loud (the documented EI-01 §1 deviation), never
-/// a false 'erased'.** The frozen 10.1 signature carries no cross-holder seam bundle, so the honest
-/// body refuses + points the caller at the real fan-out — never claims an un-wired erase succeeded.
 #[test]
 fn the_contract_erase_refuses_loud_and_points_at_the_real_fan_out() {
     let eng = engine();
@@ -216,10 +177,6 @@ fn the_contract_erase_refuses_loud_and_points_at_the_real_fan_out() {
     );
 }
 
-/// **The REAL §6.1 DSR fan-out reaches EVERY git holder (GIT-D2 complete) via the wired seams.** This
-/// is the shape the GDPR orchestrator drives: every git holder hit, 0 recoverable PII in any backup,
-/// every cache/CDN namespace invalidated, residual == the ONE platform posture (10.9 / X-7). If the
-/// holder set or the §6.1 ordering drifts, this stops passing — that is the 10.4 contract.
 #[test]
 fn the_real_dsr_fan_out_reaches_every_git_holder_git_d2_complete() {
     let eng = engine();
@@ -251,7 +208,6 @@ fn the_real_dsr_fan_out_reaches_every_git_holder_git_d2_complete() {
         .erase_fanout(&subject_id(), &tenant(), &bundle, 1_000)
         .expect("the real git DSR fan-out is GIT-D2-green");
 
-    // GIT-D2: every holder hit, residual == the posture, backups shredded.
     assert!(
         receipt.is_green(),
         "GIT-D2: erase reaches every holder + backups shredded"
@@ -274,19 +230,15 @@ fn the_real_dsr_fan_out_reaches_every_git_holder_git_d2_complete() {
         CacheNamespace::ALL.len()
     );
     assert_eq!(receipt.residual, GitResidualPosture::OnePlatformPosture);
-    // The §6.1 cross-holder seams actually ran (the fan-out is real).
     assert!(pseudonym.did_run() && search.did_run() && refs.did_run() && bus.did_run());
     assert!(
         ledger.is_erased(&subject_id(), &tenant()),
         "the erasure ledger recorded the subject"
     );
-    // The audit receipt is content-addressed (the hash-link; the Merkle seal is P-GA-20).
     assert_eq!(receipt.audit_receipt.operation, "erase");
     assert!(receipt.audit_receipt.content_hash.starts_with("blake3:"));
 }
 
-/// **`export`/`rectify`/`restrict` over the git surface return content-addressed receipts (the frozen
-/// 10.1 shape).** A real, callable holder — never a `todo!()`/panic.
 #[test]
 fn git_holder_export_rectify_restrict_return_content_addressed_receipts() {
     let eng = engine();

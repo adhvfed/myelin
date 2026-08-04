@@ -8,146 +8,41 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
-# The myelin-flow service binary (P-FLOW-02 → P-198, M2): the "every service `main.rs`" the
-# contract-index row 1.1 names. It does NOTHING but hand the flow `AppSpec` to the harness's one
-# call (`serve`) — the harness owns the whole lifecycle (boot → migrate → outbox relay →
-# consumers → three ports → graceful drain, liveness ≠ readiness). A four-line shim, never a
-# hand-rolled lifecycle.
 [[bin]]
 name = "myelin-flow"
 path = "src/main.rs"
 
-# THE durable-workflow substrate crate (P-FLOW-01 → P-197, M2). myelin-flow is a BUILD,
-# DBOS-class, Postgres-embedded engine (architecture durable-workflow.md §2, ADR-09) — NO new
-# datastore. It sits inside the myelin-flow service's own Postgres and inherits the M0
-# substrate's outbox / idempotent-consumer / crypto-shred / tenant-partition / fail-static
-# primitives.
-#
-# At P-FLOW-01 it carries the SCHEMA ONLY: the six-table data model (architecture §3 —
-# workflow_run / wf_history / wf_timer / wf_signal / wf_activity_attempt / wf_definition) as
-# forward-only `(tenant, region)`-first RLS migrations, plus the row TYPE carriers with the
-# `#[personal_data(...)]` classification tags on every PII-bearing column. No AppSpec wiring
-# (P-FLOW-02), no holder registration (P-FLOW-03), no algorithms (P-FLOW-04..08).
-#
-# DAG POSITION (a documented, NAMED leaf consumer, like myelin-notif / myelin-agent-service):
-# it sits ABOVE the glue crates — it depends on -tenancy (the (tenant, region) partition key),
-# -refs (the ArtifactRef value type the references-not-payloads `input`/`result` carry), -gdpr
-# (the #[derive(PersonalData)] classify-derive), and -substrate (the Migration/MigrationRunner
-# forward-only framework + is_destructive). NOTHING in the production library DAG depends back
-# on it. It is therefore OUTSIDE the eleven-crate library DAG modelled by
-# myelin-substrate::crate_graph (substrate_is_root()/identity_is_sink() are preserved — a
-# subsystem schema crate is the graph's terminal consumer, not a node in it).
 [dependencies]
-# The (tenant, region) partition key — every table LEADS with TenantId + Region (12.1, ADR-11).
 myelin-tenancy = { path = "../myelin-tenancy" }
-# Principal / Actor — the CI service principal the REAL ci.result producer (P-FLOW-23,
-# src/merge_queue.rs RealCiResultProducer) stamps on the per-context ci.check.updated envelopes it
-# feeds through CI's CheckSeamOrder before deriving the rollup. Identity is a foundational sink crate
-# (identity_is_sink() in the DAG); this edge is acyclic.
 myelin-identity = { path = "../myelin-identity" }
-# ArtifactRef — `workflow_run.input` + `wf_history.result` are references-not-payloads (the
-# workflow about a PR carries the PR's ArtifactRef, never the PR body — architecture §3.1/§3.2).
 myelin-refs = { path = "../myelin-refs" }
-# The #[derive(PersonalData)] + #[personal_data(...)] classification (contract 10.2) the six
-# data-model row types (src/schema.rs) carry on every PII-bearing column (the rare inline-PII
-# result/payload key refs) — the no-untagged-personal-data gate's compile-time half.
 myelin-gdpr = { path = "../myelin-gdpr" }
-# The forward-only migration framework: Migration / Migrations / MigrationRunner / HotTables /
-# is_destructive (contract 1.5). The migrations are built through it so the boot-time runner
-# applies them forward-only AND the forward-only-migration lint reads them at source-scan.
 myelin-substrate = { path = "../myelin-substrate" }
-# The transactional outbox (contract 2.2/2.3): OutboxStore / OutboxTransaction / OutboxTx::emit —
-# the ONLY emit path (BUS-2, §4.5). The WfCtx core (src/wfctx.rs, P-FLOW-04) journals its
-# wf_history row + emits its event in the SAME transaction (the FLOW-D5 co-commit), via this
-# crate's emit-iff-committed primitive. EventDraft / EventEnvelope / EmitContextBase / IdMinter
-# are the canonical substrate emit types the WfCtx surface consumes (NO second emit path).
 myelin-events = { path = "../myelin-events" }
-# serde_json — the EventDraft payload is a serde_json::Value (the WfCtx emit surface consumes it).
 serde_json = { workspace = true }
 blake3 = { workspace = true }
-# Workflow partition values are durable database state. This pins their historical SipHash-1-3
-# mapping independently of the standard library's explicitly-unspecified `DefaultHasher`.
 siphasher = { workspace = true }
-# The reserve/settle cost gate (contract 11.7 CONSUMED, storage.md §9): CostLedger / MicroUsd /
-# RunId / ReserveError / MeteredUnit / SettleOutcome — the durable per-tenant reserve/settle ledger
-# the BudgetGate bookend (src/budget.rs, P-FLOW-16) reserves-at-dispatch / settles-on-completion
-# against. myelin-flow is a TERMINAL DAG consumer (no production crate depends back on it), and
-# myelin-storage does NOT depend on myelin-flow, so this edge is acyclic. The storage default build
-# is DB-free (its Postgres backend is behind its own `integration` feature) — this dependency does
-# NOT pull a DB into `cargo build --workspace`.
 myelin-storage = { path = "../myelin-storage" }
 
-# MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
-# foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
-# (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
-# bridge requires) + `myelin-config` (the env-first durable config, fail-loud) are now regular
-# deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
 myelin-config = { path = "../myelin-config" }
 tokio = { workspace = true, features = ["signal"] }
-# The production durable-executor control surface is backed by Postgres. Queries remain runtime-
-# checked (`sqlx::query`, never compile-time macros), so builds do not require a live database.
 sqlx = { workspace = true }
-# UTC formatting for the production worker's journaled `ctx.now()` clock.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 zeroize = "1"
 
 [dev-dependencies]
-# MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
-# targets (the `src/budget.rs` unit tests + `tests/drills_flow_*` + `tests/*` that call the now-gated
-# `BudgetGate::new`). The sanctioned Cargo idiom (same as the storage/chat self dev-deps); it does NOT
-# affect the normal `cargo build`, which stays durable-by-default (`CostLedger` production = `with_pg`).
 myelin-flow = { path = ".", features = ["test-support"] }
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
-# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
-# production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# The committed-ratchet lint-fixture test (tests/lint_fixtures.rs): the FOUR schema gates this
-# prompt names (forward-only-migration / no-untagged-personal-data / tenant-predicate /
-# no-cross-db) run over RED/GREEN fixtures so a regression that lets a destructive migration / an
-# untagged-PII column / a tenant-less query / a cross-DB reach slip through fails THIS build.
 myelin-lints = { path = "../myelin-lints" }
-# The Actor/Principal the WfCtx co-commit tests (src/wfctx.rs) build the EmitContextBase actor
-# from — test-only (the production WfCtx takes a caller-supplied EmitContextBase; the principal
-# type is needed only to CONSTRUCT one in unit tests).
 myelin-identity = { path = "../myelin-identity" }
-# The M0 failure-injection harness (DependencyBreaker / SignalSource / Predicate / DrillRegistry):
-# the FLOW-D5 co-commit drill (tests/drills_flow_d5_cocommit.rs) rides the scoped-reversible
-# injector to inject the "crash between journal and emit" fault + reads the survival signals
-# (outbox_depth / dead_letter_count) — the inject → load → assert green unit-of-proof (EI-01 §4).
 myelin-harness = { path = "../myelin-harness" }
-# The Relay + InProcessBus that drain the co-committed outbox in the FLOW-D5 drill (so the drill
-# proves the journaled-AND-emitted step is delivered exactly-once, 0 ghost / 0 lost).
-# MR-009b Wave 3: test-support so DEV tests reach the events in-memory DedupLedger double (DEV-only).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# serde_json — the EventDraft payload in the drill/CDC fixtures.
 serde_json = { workspace = true }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-refs = { path = "../myelin-refs" }
-# The bus-automation CONSUMER of contract 9.1 (the `DurableExecutor::start` seam): the CDC pair
-# (tests/cdc_9_1_executor.rs) pairs the myelin-flow PROVIDER (FlowExecutor start/describe/cancel)
-# with the Automation engine's consumer fixture (action.kind = workflow → start). Dev-dep ONLY (the
-# production DAG is unchanged — myelin-query does NOT depend on myelin-flow, so no cycle; the CDC
-# test depends on BOTH ends of the seam to prove the agreement).
 myelin-query = { path = "../myelin-query" }
-# The Agent Fabric CONSUMER of the per-effect idem_key rule (contract 9.1 / §6.4): the CDC pair
-# (tests/cdc_9_1_per_effect.rs) pairs the myelin-flow PROVIDER (the per-effect key rule + the gated
-# loop over wf_signal, P-FLOW-10) with the Agent Fabric `EffectApi::apply` consumer fixture (each
-# approved effect → exactly one apply; a declined effect → withheld, AG-8). Dev-dep ONLY — the
-# production DAG is unchanged (myelin-agent does NOT depend on myelin-flow, so no cycle; the CDC
-# test depends on BOTH ends to prove the apply/withhold agreement).
 myelin-agent = { path = "../myelin-agent" }
 
 [features]
-# The live-PG integration test (tests/integration_flow_schema.rs). DB-free by default.
-# (tokio + myelin-config are regular deps since W3b.4 — the durable main.rs needs them; the
-# feature now only pulls the raw-sqlx test harness.)
 integration = []
-# MR-009b W6b2 — the `test-support` cargo feature. It gates `BudgetGate::new(wallet)` (which
-# constructs the now-`test-support`-gated in-memory `CostLedger::new()`) + the ci_pipeline test
-# helpers behind `#[cfg(any(test, feature = "test-support"))]`, so downstream crates (ci-controlplane)
-# can enable them as a DEV-dependency. Forwards to `myelin-storage/test-support` (the in-memory
-# `CostLedger` double lives there). DEV/TEST only — never in the production DAG.
-# MR-009b W3b.5/.6: also forwards to `myelin-events/test-support` — the gated dogfood /
-# restore_verify drill runners construct the now-gated in-memory `OutboxStore::new()` double.
 test-support = ["myelin-storage/test-support", "myelin-events/test-support"]

@@ -1,25 +1,3 @@
-//! **ISS-P14 / P-380 — the ISS-D2 `<1s` flexible-field latency gate, PROVEN against the live
-//! dev-stack Postgres (the REAL green artifact).**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-issues --features integration \
-//!     --test integration_iss_p14_cost_bounding -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires (the prompt touches the §3 board-read
-//! DB contract + the cost-bounding decision). ISS-D2: a board query over **1M+ issues** carrying **50+
-//! custom fields** each, with the `SetExpr` JOIN conjoined, stays under the **`<1s` keyboard budget**
-//! and the planner **NEVER emits a full JSONB scan** — the Tier-1 typed-core board scan rides the
-//! `issue_board` index range (the cost-bounder's `ServeOltp` outcome), while a cold ad-hoc JSONB facet
-//! WOULD seq-scan (so the cost-bounder ESCALATES it instead, never running it on OLTP). Survival
-//! signals: **p99 < 1s on the Tier-1 board scan; EXPLAIN shows an Index Scan (no Seq Scan) on the board
-//! path; the cold ad-hoc facet's EXPLAIN shows a Seq Scan → the cost-bounder escalates it.**
-//!
-//! The board SQL is the lowered form the Issues cost-bounder composes for a `ServeOltp` outcome (the
-//! ISS-P13 ACL pre-filter conjoined + the Tier-1 index range + pagination + statement timeout). The
-//! cold-facet escalation is the `plan_board_query` decision driven over the real cardinalities.
 #![cfg(feature = "integration")]
 
 use std::time::Instant;
@@ -37,9 +15,7 @@ fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// 1M+ — the ISS-D2 corpus size (the gate says "1M+ issues"). Server-side `generate_series` insert.
 const N_ISSUES: i64 = 1_000_000;
-/// 50+ — the custom-field count per issue (the gate says "50+ custom fields"); they ride the JSONB tail.
 const N_CUSTOM_FIELDS: i64 = 55;
 
 fn viewer() -> Principal {
@@ -63,8 +39,6 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
     let suffix = std::process::id();
     let issue_tbl = format!("issue_p380_{suffix}");
 
-    // ── 1. A board-shaped `issue` table: the typed-core columns (the Tier-1 index range) + a JSONB
-    //       `props` tail carrying 50+ custom fields per row (the flexible-field model). ──────────────────
     sqlx::query(&format!(
         "CREATE UNLOGGED TABLE {issue_tbl} (\
            tenant_id text NOT NULL, region text NOT NULL, id text NOT NULL, \
@@ -76,12 +50,7 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
     .await
     .expect("create the board issue table");
 
-    // ── 2. Seed 1M+ issues server-side. Each row gets a 55-key JSONB `props` tail (the 50+ custom
-    //       fields) built from generate_series, so the JSONB tail is genuinely wide. Tenant acme +
-    //       one cross-tenant row's worth in evilcorp (the partition predicate isolates it). ───────────────
     let t_seed = Instant::now();
-    // Build the 55-key JSONB tail via an aggregate over a field-index series (the 100-arg limit on
-    // jsonb_build_object rules out 55 literal pairs) — `field_<f>` → `g % 100` for each of 55 fields.
     sqlx::query(&format!(
         "INSERT INTO {issue_tbl} (tenant_id, region, id, project_id, state_category, rank, assignee, props) \
          SELECT 'acme', 'fr-par', 'ENG-' || g, 'proj-' || (g % 19), \
@@ -100,9 +69,6 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
         t_seed.elapsed()
     );
 
-    // ── 3. The Tier-1 board index (the hot board scan: tenant, project, state_category, rank) +
-    //       ANALYZE so the planner has real statistics. NO GIN on props here — a cold-facet scan MUST
-    //       seq-scan (the witness the cost-bounder escalates it rather than running it). ──────────────────
     sqlx::query(&format!(
         "CREATE INDEX {issue_tbl}_board ON {issue_tbl} (tenant_id, project_id, state_category, rank) WHERE deleted_at IS NULL"
     ))
@@ -114,12 +80,7 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
         .await
         .expect("ANALYZE for real statistics");
 
-    // ── 4. THE COST-BOUNDER DECIDES (the unit of the prompt). A typed-core board query (project +
-    //       state_category) over a bounded ACL → ServeOltp (Tier 1). The fan-out for one project ×
-    //       category is ~N/80 — well within budget. ────────────────────────────────────────────────────
-    let acl: SetExpr = SetExpr::All; // an admin board view for the latency probe (the JOIN shape is
-                                     // proven leak-free in the ISS-P13 integration test); here ISS-D2
-                                     // measures the index-range LATENCY of the Tier-1 path.
+    let acl: SetExpr = SetExpr::All;
     let board_ast = QueryAst::compiled(Predicate::And(vec![
         Predicate::Cmp {
             op: CmpOp::Eq,
@@ -142,22 +103,19 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
         &Zookie("".into()),
         &FacetCatalog::new(),
         &CostBudget::DEFAULT,
-        N_ISSUES as u64 / 80, // the planner's row estimate for one project × category
+        N_ISSUES as u64 / 80,
     );
     assert!(
         matches!(&outcome, PlanOutcome::ServeOltp(q) if q.tier == Tier::TypedCore),
         "the cost-bounder serves the typed-core board query on the Tier-1 index range"
     );
 
-    // ── 5. THE LATENCY GATE (ISS-D2 `<1s`). Run the real Tier-1 board scan (the index-range form the
-    //       cost-bounder serves) and measure p99 over repeated runs. The board scan is paginated. ───────
     let board_sql = format!(
         "SELECT id FROM {issue_tbl} \
          WHERE tenant_id = 'acme' AND region = 'fr-par' AND deleted_at IS NULL \
            AND project_id = 'proj-7' AND state_category = 'started' \
          ORDER BY rank LIMIT 50"
     );
-    // Statement timeout — the hard <1s backstop the cost-bounder carries (a runaway is killed).
     sqlx::query(&format!(
         "SET statement_timeout = {}",
         CostBudget::DEFAULT.statement_timeout_ms
@@ -187,7 +145,6 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
         "ISS-D2: the board query p99 ({p99:.2} ms) must be under the <1s keyboard budget"
     );
 
-    // ── 6. NO FULL SCAN on the board path (EXPLAIN shows an Index Scan, no Seq Scan). ────────────────
     let plan = sqlx::query(&format!("EXPLAIN (FORMAT TEXT) {board_sql}"))
         .fetch_all(&admin)
         .await
@@ -206,10 +163,6 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
         "ISS-D2 no-full-scan: the board path MUST NOT seq-scan: {plan_text}"
     );
 
-    // ── 7. THE COLD AD-HOC FACET WITNESS: a cold custom-field probe (no generated index, no GIN here)
-    //       WOULD seq-scan the JSONB tail — so the cost-bounder ESCALATES it (never runs it on OLTP).
-    //       Prove BOTH halves: (a) EXPLAIN of the raw cold-facet scan shows a Seq Scan; (b) the
-    //       cost-bounder, given the real (huge) fan-out, returns EscalateToSearch — not ServeOltp. ──────
     let cold_facet_sql = format!(
         "SELECT id FROM {issue_tbl} \
          WHERE tenant_id = 'acme' AND props ->> 'field_42' = '7' ORDER BY rank LIMIT 50"
@@ -228,11 +181,9 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
         "the cold ad-hoc JSONB facet WOULD seq-scan (the witness the cost-bounder must escalate it): {cold_plan_text}"
     );
 
-    // The cost-bounder, given the cold facet's real fan-out (a low-selectivity facet matches ~N/100
-    // rows), escalates rather than running the seq-scan.
     let cold_ast = QueryAst::compiled(Predicate::Cmp {
         op: CmpOp::Eq,
-        lhs: Expr::Var("field_42".into()), // a cold custom facet (Tier 2b / GIN posture; here no GIN)
+        lhs: Expr::Var("field_42".into()),
         rhs: Expr::Lit(myelin_identity::Literal::Int(7)),
     })
     .unwrap();
@@ -245,11 +196,11 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
         &Zookie("".into()),
         &FacetCatalog::new(),
         &CostBudget::DEFAULT,
-        N_ISSUES as u64 / 100, // the cold facet's real fan-out — × GIN weight 8 blows the budget
+        N_ISSUES as u64 / 100,
     );
     assert!(
         cold_outcome.is_escalate(),
-        "the cost-bounder ESCALATES the cold ad-hoc facet (it would seq-scan) — never runs it on OLTP"
+        "the cost-bounder ESCALATES the cold ad-hoc facet (it would seq-scan) - never runs it on OLTP"
     );
     assert!(cold_outcome.assert_no_unbounded_scan());
 
@@ -260,7 +211,6 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
          Search (never an unbounded JSONB scan)."
     );
 
-    // ── 8. Cleanup. ─────────────────────────────────────────────────────────────────────────────────
     sqlx::query(&format!("DROP TABLE {issue_tbl}"))
         .execute(&admin)
         .await

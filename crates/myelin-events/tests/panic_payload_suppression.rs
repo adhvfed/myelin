@@ -3,8 +3,6 @@ use std::process::Command;
 const CHILD_ENV: &str = "MYELIN_PANIC_HOOK_CHILD";
 const SENTINEL: &str = "PANIC_LEAK_SENTINEL_5c0b697a";
 
-/// Run the hook in a child test process so changing the process-global hook cannot interfere with
-/// other tests and the parent can inspect the real OS-level stderr stream.
 #[test]
 fn payload_free_hook_omits_secret_panic_material_from_stderr() {
     if std::env::var_os(CHILD_ENV).is_some() {

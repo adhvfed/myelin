@@ -1,9 +1,3 @@
-//! Production-path proof for the CI→Bus→Git check-status projection seam.
-//!
-//! CI's real producer assembles the event draft. The shared durable consumer runtime co-commits its
-//! dedup mark with Git's projection UPSERT on one Postgres transaction. The proof includes a failed
-//! first delivery, redelivery, deduplication, monotonic supersession, and envelope/payload
-//! provenance rejection.
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
@@ -161,8 +155,6 @@ async fn real_ci_draft_cocommits_into_git_projection_and_redelivers_without_loss
         envelope: first.clone(),
     };
 
-    // The projection table is intentionally absent. The handler retries and the same-transaction
-    // dedup mark rolls back, so the event remains replayable rather than becoming a ghost.
     assert_eq!(
         tokio::task::block_in_place(|| consumer.deliver(&first_message)),
         Delivered::Retried(2)

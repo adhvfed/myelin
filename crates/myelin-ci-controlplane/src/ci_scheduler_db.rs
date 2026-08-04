@@ -1,30 +1,14 @@
-//! Dedicated PostgreSQL provider for the cross-tenant, region-scoped CI scheduler.
-//!
-//! The ordinary runtime pool authenticates as the tenant application role and must never claim or
-//! reap across tenants. This module opens the separately configured scheduler credential only after
-//! migrations, validates its server-owned region mapping and exact least-privilege posture, and
-//! exposes the pool solely as [`crate::CiRegionQueueStore`] and
-//! [`crate::CiRegionRunDiscovery`].
-//!
-//! **Named lint exclusion.** This file's SQL reads only PostgreSQL identity, catalog, privilege, and
-//! server-owned scheduler-region metadata. Those are database/cell authorization facts spanning
-//! roles by design, not tenant-store reads, so no `TenantId` predicate exists to bind. The actual
-//! queue data path remains in `job_queue_region.rs` under its mapped-region RLS boundary, while all
-//! tenant mutation verbs remain fully linted in `job_queue_store.rs`.
-
 use myelin_config::MyelinConfig;
 use myelin_storage::connect_pool_with_reset;
 use sqlx::{PgPool, Row};
 
 use crate::{CiRegionQueueStore, CiRegionRunDiscovery};
 
-/// Required production credential for the constrained region scheduler login.
 pub const CI_SCHEDULER_DATABASE_URL_ENV: &str = "MYELIN_CI_SCHEDULER_DATABASE_URL";
 
 const SCHEDULER_CAPABILITY_ROLE: &str = "myelin_ci_region_scheduler";
 const SCHEDULER_MAX_CONNECTIONS: u32 = 8;
 
-/// Credential-bearing scheduler configuration. Debug output always redacts the DSN.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CiSchedulerDbConfig {
     database_url: String,
@@ -41,7 +25,6 @@ impl core::fmt::Debug for CiSchedulerDbConfig {
 }
 
 impl CiSchedulerDbConfig {
-    /// Read the required scheduler DSN and prove it is distinct from both platform credentials.
     pub fn from_env(platform: &MyelinConfig) -> Result<Self, CiSchedulerDbError> {
         let value = std::env::var_os(CI_SCHEDULER_DATABASE_URL_ENV)
             .ok_or(CiSchedulerDbError::MissingDatabaseUrl)?;
@@ -56,7 +39,6 @@ impl CiSchedulerDbConfig {
         )
     }
 
-    /// Explicit construction seam used by DB-free and live provider tests.
     pub fn from_parts(
         database_url: String,
         runtime_database_url: &str,
@@ -79,8 +61,6 @@ impl CiSchedulerDbConfig {
     }
 }
 
-/// Credential-redacted scheduler-provider refusal. No variant carries a DSN, database error, role
-/// name, or mapped/configured region value.
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum CiSchedulerDbError {
@@ -182,13 +162,11 @@ impl core::fmt::Display for CiSchedulerDbError {
 
 impl std::error::Error for CiSchedulerDbError {}
 
-/// Validated provider that can yield only scheduler capabilities, never a raw pool.
 pub struct CiSchedulerDbProvider {
     pool: PgPool,
 }
 
 impl CiSchedulerDbProvider {
-    /// Connect after migrations and validate the scheduler login against the active runtime pool.
     pub async fn connect(
         config: CiSchedulerDbConfig,
         runtime_pool: &PgPool,
@@ -207,12 +185,10 @@ impl CiSchedulerDbProvider {
         Ok(Self { pool })
     }
 
-    /// Produce the region-wide job claim/reap capability.
     pub fn region_queue_store(&self) -> CiRegionQueueStore {
         CiRegionQueueStore::with_pg(self.pool.clone())
     }
 
-    /// Produce the column-minimal queued-run discovery capability.
     pub fn region_run_discovery(&self) -> CiRegionRunDiscovery {
         CiRegionRunDiscovery::with_pg(self.pool.clone())
     }
@@ -249,15 +225,7 @@ struct SchedulerProbe {
     job_update_nonce: bool,
     job_update_claim_started_at: bool,
     job_update_claim_expires_at: bool,
-    /// CT-007 lease/topology reconciliation: an EXPLICIT negative. The claim window is immutable
-    /// dispatch authority written by the app role; the scheduler only reads it when sizing
-    /// `claim_expires_at`. The dynamic excess-column check below would also catch a stray grant, but
-    /// a named probe makes the intent unmissable to the next person adding a column grant.
     job_update_claim_window: bool,
-    /// **CT-007 slice 5b.3-6e.1: an EXPLICIT negative.** The operational-reservation write-version
-    /// marker is written ONLY by the app role's V2 reserve writer (6e.2); the scheduler never touches
-    /// it. The dynamic excess-column check below would also catch a stray UPDATE grant, but a named
-    /// probe makes the intent unmissable to the next person adding a column grant.
     job_update_reservation_write_version: bool,
     fair_select: bool,
     run_select_tenant: bool,
@@ -271,9 +239,6 @@ struct SchedulerProbe {
     workflow_select_run_id: bool,
     workflow_select_type: bool,
     workflow_select_state: bool,
-    /// CT-007 lease/topology reconciliation: the superseded-definition boot guard's one extra
-    /// column (`ci_0020g`). Column-scoped, read-only, and added to the excess-column allowlist by
-    /// exactly this one name.
     workflow_select_version: bool,
     workflow_select_partition: bool,
     workflow_select_created_at: bool,
@@ -281,11 +246,6 @@ struct SchedulerProbe {
     prelaunch_usage_select: bool,
     prelaunch_usage_update_status: bool,
     prelaunch_usage_update_resolved_at: bool,
-    /// **CT-007 phase-credential generations: an EXPLICIT negative.** The scheduler role must hold
-    /// NO privilege at all on `ci_job_credential_generation` — neither reaping nor renewal reads it,
-    /// and the credential log is the durable authority a phase gate consults. The dynamic
-    /// unrelated-table check below would also catch a stray grant, but a named probe makes the
-    /// intent unmissable to the next person adding a grant migration.
     credential_generation_privilege: bool,
     mapping_function_execute: bool,
     excess_privilege: bool,
@@ -399,18 +359,12 @@ fn validate_probe_before_mapping(
     {
         return Err(CiSchedulerDbError::InsufficientPrivileges);
     }
-    // CT-007 lease/topology reconciliation: the claim window is READ-ONLY to the scheduler. The
-    // dynamic excess-column check already covers it; this names it so the guarantee is explicit.
     if scheduler.job_update_claim_window {
         return Err(CiSchedulerDbError::ExcessPrivileges);
     }
-    // CT-007 slice 5b.3-6e.1: the reservation write-version marker is written only by the app role's
-    // V2 reserve writer; the scheduler must never hold UPDATE on it. Named alongside the dynamic
-    // excess-column check that already covers it.
     if scheduler.job_update_reservation_write_version {
         return Err(CiSchedulerDbError::ExcessPrivileges);
     }
-    // CT-007 phase-credential generations: the credential log is invisible to the scheduler role.
     if scheduler.credential_generation_privilege {
         return Err(CiSchedulerDbError::ExcessPrivileges);
     }

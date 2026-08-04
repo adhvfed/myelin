@@ -5,36 +5,13 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-query is in the mid-tier of the DAG (architecture 00 §2.9). It depends on
-# tenancy + identity + events (the `EventMatcher` predicate core shares the QueryAst, and
-# permission-aware queries compose with list_objects). It MUST NOT depend on -agent,
-# -gdpr, -client, or -substrate (downstream).
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
-# R2.2: the EventMatcher keys the envelope subject through the ONE canonical type-qualified
-# object-key grammar (`myelin_refs::object_key`) — the same function the identity check engine
-# keys tuples with — so a same-trailing-id, different-type/tenant subject is structurally
-# unmatched. refs sits beside query in the mid-tier (it depends only on identity + events and
-# does NOT depend on query), so this edge is acyclic.
 myelin-refs = { path = "../myelin-refs" }
 serde.workspace = true
-# The EventMatcher (matcher.rs, P-137) projects the EventEnvelope's `payload`
-# (`serde_json::Value`) into the bounded interpreter's variable namespace, so serde_json is a
-# NORMAL dependency now (the envelope payload type crosses into the matcher). It stays
-# DB-free — pure value projection, no I/O.
 serde_json = { workspace = true }
 
-# TEST-SUPPORT ONLY (dev-dependency, P-143 / EB-23). The BUS-D1 / BUS-D3 / BUS-D6 dispatch-tier
-# drills ride the P-S03 scoped-reversible dependency-break injector (Dependency::Broker — the
-# kill-consumer-+-sever-broker fault) and assert their verdicts off the FROZEN §10.2 harness
-# signal vocabulary (CausalDepthFirings / DispatchPoolDrops / ShedCount / BreakerState /
-# ConsumerLag), exactly as the events crate's drills do. This is a DEV-dependency, never a
-# normal one: myelin-harness is the leaf TEST-SUPPORT crate (it depends on -identity + -tenancy,
-# both BELOW query), and nothing in the production crate DAG (architecture §2.9) depends on it.
-# A dev-only edge query → harness pulls test machinery into the test build only and forms NO
-# production cycle (harness does not depend on query). The crate-graph-acyclic model continues to
-# model the production crates only.
 [dev-dependencies]
 myelin-harness = { path = "../myelin-harness" }

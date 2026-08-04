@@ -1,5 +1,3 @@
-//! Shared fixtures for the `gvisor` submodules' unit tests.
-
 use super::*;
 use crate::gvisor::checkout_transport_test_support::FakeRunsc;
 use crate::hardening::HardeningProfile;
@@ -34,7 +32,6 @@ impl SandboxOutputSink for RecordingOutput {
     }
 }
 
-/// A fresh, empty temp directory for a head/`Cargo.lock` verification fixture.
 pub(super) fn temp_dir_for(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "myelin-checkout-headcheck-{name}-{}-{}",
@@ -46,12 +43,6 @@ pub(super) fn temp_dir_for(name: &str) -> PathBuf {
     dir
 }
 
-/// A real, on-disk, empty fixture rootfs — hashed with the SAME pure-Rust
-/// [`crate::canonical_tar::canonical_tree_sha256_hex`] the registry itself uses — so [`spec`]'s
-/// image is a GENUINELY verifiable pin, not a fabricated placeholder digest a real registry
-/// lookup could never match. Shared (same fixed path) across every test in this module — they
-/// only ever READ it (construction-time hashing happens once, in [`test_registry`]), never
-/// mutate it, so sharing across parallel test threads within this one process is safe.
 pub(super) fn fixture_rootfs_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "myelin-gvisor-unit-test-fixture-rootfs-{}",
@@ -62,17 +53,12 @@ pub(super) fn fixture_rootfs_dir() -> PathBuf {
     dir
 }
 
-/// The digest-pinned [`ImageRef`] matching [`fixture_rootfs_dir`]'s REAL current content.
 pub(super) fn fixture_image() -> ImageRef {
     let digest = crate::canonical_tar::canonical_tree_sha256_hex(&fixture_rootfs_dir())
         .expect("hash the fixture rootfs dir");
     ImageRef::pinned(format!("test.local/fixture-rootfs@sha256:{digest}")).unwrap()
 }
 
-/// A registry mapping [`fixture_image`] to [`fixture_rootfs_dir`] — the registry every unit test
-/// in this module that calls `launch_with`/`launch` constructs its [`GvisorBackend`] with. These
-/// tests never run a real `runsc` (they inject a fake `run` closure), so all that matters is that
-/// construction genuinely verifies (once) before the fake closure runs.
 pub(super) fn test_registry() -> Arc<crate::asset_registry::GvisorAssetRegistry> {
     Arc::new(
         crate::asset_registry::GvisorAssetRegistry::from_bindings(vec![
@@ -271,12 +257,6 @@ pub(super) fn cargo_compute_registry(
     )
 }
 
-/// Writes a real, valid `subuid`/`subgid`-format file naming the CURRENT effective uid, with
-/// the given range, so tests never depend on this host's REAL `/etc/subuid`/`/etc/subgid`
-/// having an entry for this uid (mirroring `user_namespace.rs`'s own test helper of the same
-/// name/shape — Sol's round-2 review: relying on the real files left these tests conditionally
-/// skippable on any CI host lacking subordinate-id configuration, exactly the host dependency
-/// the builder seam exists to remove).
 pub(super) fn write_subordinate_file(path: &Path, start: u32, count: u32) {
     let uid = unsafe { libc::geteuid() };
     std::fs::write(path, format!("{uid}:{start}:{count}\n")).unwrap();
@@ -305,8 +285,6 @@ pub(super) fn outcome(stdout: &[u8], stderr: &[u8]) -> RunscOutcome {
     }
 }
 
-/// A canned [`ContainerRun`] for the fake path (no real `runsc`): a clean exit-0 result + a fake
-/// child + a non-existent bundle dir (its removal on teardown is a harmless no-op).
 pub(super) fn fake_run() -> ContainerRun {
     ContainerRun {
         child: Box::new(FakeRunsc),
@@ -319,12 +297,6 @@ pub(super) fn fake_run() -> ContainerRun {
     }
 }
 
-/// CT-007 slice 3, piece 7b: since `launch_with`'s `F` now returns a
-/// `RuntimeFinalization<Result<ContainerRun, RunFailure>>` envelope (not a bare
-/// `Result<ContainerRun, RunFailure>`), every fake test closure that used to return
-/// `Ok(fake_run())` needs a fabricated, already-`Finalized` envelope instead — these tests are
-/// exercising `launch_with`'s OWN dispatch logic (settle/reserve/hooks), not
-/// `finalize_runtime`'s teardown checks, so a canned `Rootless` evidence is all that's needed.
 pub(super) fn fake_finalization() -> RuntimeFinalization<Result<ContainerRun, RunFailure>> {
     RuntimeFinalization::Finalized(FinalizedRun {
         primary: Ok(fake_run()),
@@ -336,27 +308,10 @@ pub(super) fn fake_finalization() -> RuntimeFinalization<Result<ContainerRun, Ru
     })
 }
 
-// ───────── CT-007 slice 3, piece 7c: acquire/cleanup/settle Enabled matrix ─────────
-//
-// These tests use REAL (not fabricated) `WorkspaceManager`/`UserNamespaceAllocator` instances
-// — `ManagedWorkspace`/`CapacityLease`/`UserNamespaceLease` have no `#[cfg(test)]` bare
-// constructors (deliberately: minting one for real is the whole point of the capability
-// boundary), so exercising `acquire_enabled_workspace`/`cleanup_pre_bind_failure`/
-// `settle_enabled_workspace_and_lease` at all requires real objects. Unlike
-// `explicit_user_namespace_boots_through_the_real_production_run_path`, these do NOT depend on
-// `preflight_explicit_userns_policy` (the runsc-root/binary hardening check that skips on this
-// development host) — only on real Btrfs (this host has it) and a usable `/etc/subuid`/
-// `/etc/subgid` range (also present here) — so they are NOT expected to skip on this host.
-
-/// A real `WorkspaceManager` (open/lock/boot-reconciliation only — NO `create_workspace` call,
-/// so no `CAP_SYS_ADMIN`/qgroup privilege is required). Sufficient for tests that never reach
-/// past capacity acquisition (e.g. an exhausted-ceiling refusal).
 #[cfg(feature = "test-support")]
 pub(super) fn real_workspace_manager_without_qgroup_probe_for_tests(
     tag: &str,
 ) -> Option<(WorkspaceManager, PathBuf)> {
-    // `std::env::temp_dir()` (`/tmp`) is frequently a separate tmpfs mount, not Btrfs — use a
-    // `$HOME`-rooted path instead, matching `workspace_manager.rs`'s own `btrfs_test_base`.
     let mut base = std::env::home_dir().expect("HOME must be set for this test");
     base.push(format!(
         ".local/state/myelin-gvisor-piece7c-workspace-{tag}-{}-{}",
@@ -382,10 +337,6 @@ pub(super) fn real_workspace_manager_without_qgroup_probe_for_tests(
     }
 }
 
-/// A real `WorkspaceManager`, additionally probed for the `CAP_SYS_ADMIN` privilege every real
-/// `create_workspace` call needs (`btrfs qgroup limit`) — mirrors `workspace_manager.rs`'s own
-/// `ephemeral_disk_available` gate. Use this (not the qgroup-probe-free variant above) for any
-/// test that actually calls `acquire_enabled_workspace`/`create_workspace` to completion.
 #[cfg(feature = "test-support")]
 pub(super) fn real_workspace_manager_for_tests(tag: &str) -> Option<(WorkspaceManager, PathBuf)> {
     let mut base = std::env::home_dir().expect("HOME must be set for this test");
@@ -455,10 +406,6 @@ pub(super) fn real_userns_allocator_for_tests(
     }
 }
 
-// ───────── CT-007 slice 5b.3-6c: parent-attempt reservation mode (always-run) ─────────
-
-/// A minimal recording fake [`AttemptAuthority`] for the 6c continuation/orchestrator tests, with
-/// optional injected failures for the post-acquisition authority-failure matrix.
 pub(super) struct FakeAttemptAuthority {
     pub(super) ops: Mutex<Vec<String>>,
     should_requeue: bool,
@@ -564,8 +511,6 @@ impl crate::checkout_orchestration::AttemptAuthority for FakeAttemptAuthority {
     }
 }
 
-/// A well-formed preparation reporting identity for the routing tests (CT-007 5b.3-6d STEP 4). The
-/// dormant orchestrator/continuation carry it UNCHANGED into any preparation outcome.
 pub(super) fn report_claim() -> crate::runner::PreparationReportClaim {
     crate::runner::PreparationReportClaim {
         tenant_id: "acme".to_string(),
@@ -604,19 +549,6 @@ pub(super) fn fake_authorization_context() -> crate::RunTokenAuthorizationContex
     })
 }
 
-// ───────── CT-007 slice 5b.3-6a: the dispose_checkout_runtime BEHAVIORAL cleanup matrix ─────────
-//
-// Sol's r1 blocker 6: the pure `checkout_cleanup_plan` pin (above, always-run) proves the
-// disposition→action MAPPING; these privileged end-to-end tests prove its EXECUTION against a
-// REAL workspace+lease — after each disposition, the durable allocator/workspace state is exactly
-// what the plan promises (a released slot is REUSABLE; a quarantined slot is NOT reissued and the
-// workspace manager is poisoned for operator reconciliation). Gated on real Btrfs+qgroup and a
-// usable subuid range, like the acquire/settle matrix above; the pool size is 1, so "the slot was
-// released" is observable as "a second `lease()` now succeeds", and "quarantined" as "it fails".
-
-/// A checkout-bearing [`JobSpec`] whose workspace derives a valid [`CheckoutAuthorizationScope`]
-/// (`myelin://acme/git/repo/widgets` @ a 40-hex commit), so `AcquiredCheckoutRuntime::acquire`
-/// reaches a real acquisition.
 #[cfg(feature = "test-support")]
 pub(super) fn checkout_spec() -> JobSpec {
     JobSpec::new(
@@ -648,8 +580,6 @@ pub(super) fn checkout_spec() -> JobSpec {
     .unwrap()
 }
 
-/// Acquire a REAL capsule against fresh real managers (pool size 1). Returns the capsule plus the
-/// managers/dirs so the caller can dispose and then probe durable state. `None` = soft skip.
 #[cfg(feature = "test-support")]
 #[allow(clippy::type_complexity)]
 pub(super) fn acquire_real_checkout_capsule(
@@ -677,7 +607,6 @@ pub(super) fn acquire_real_checkout_capsule(
         None,
     )
     .expect("acquisition must succeed against a healthy real manager/allocator");
-    // Sanity: the acquisition already exhausted the size-1 pool.
     assert!(
         userns_allocator.lease().is_err(),
         "the size-1 pool is exhausted while the capsule holds its lease"
@@ -691,10 +620,6 @@ pub(super) fn acquire_real_checkout_capsule(
     ))
 }
 
-/// A registry mapping a fresh digest-pinned [`ImageRef`] to the REAL staged rootfs
-/// [`crate::resolved_gvisor_rootfs`] uses — so a spec naming this image resolves, through the
-/// real registry lookup `GvisorBackend::launch_with` performs, to the exact rootfs the drill
-/// above already proves is runnable.
 #[cfg(feature = "integration")]
 pub(super) fn real_userns_drill_registry(
     rootfs: &Path,
@@ -713,30 +638,12 @@ pub(super) fn real_userns_drill_registry(
     )
 }
 
-/// The env var naming a pre-provisioned `leases_dir` this drill may use for the STRICT
-/// production [`UserNamespaceAllocator::try_new`] path. Sol's round-3 review: production strict
-/// mode requires the leaf to ALREADY EXIST (owned by this process's euid, mode `0700` or
-/// stricter) with an ancestor chain NOT writable by us — no ordinary test process can either
-/// create that leaf itself (see `harden_and_verify_leases_dir`'s own doc) OR fabricate a
-/// non-writable-by-us ancestor without real privilege, so this MUST come from an operator's
-/// install step (e.g. `sudo install -d -m 0700 -o "$(whoami)" /opt/myelin-test/userns-leases`),
-/// never something this drill provisions itself.
 #[cfg(feature = "integration")]
 pub(super) const USERNS_DRILL_LEASES_DIR_ENV: &str = "MYELIN_USERNS_DRILL_LEASES_DIR";
 
-/// Sol's review (CT-007 slice 5b.2's live drill): this drill and the checkout-preparation live
-/// drill (`checkout_preparation_5b2::checkout_preparation_runs_end_to_end_through_real_git_wire_and_runsc`)
-/// share the SAME operator-provisioned `leases_dir` and may run concurrently under `cargo
-/// test`'s default parallelism — the allocator's own directory lock is a PER-PROCESS lifetime
-/// lock (see `UserNamespaceAllocator`'s own doc), not a per-call one, so two independent
-/// `UserNamespaceAllocator::try_new` calls against the same directory in the SAME test binary
-/// process would race nondeterministically. Both drills acquire this before touching
-/// `leases_dir` at all, so only one is ever mid-flight.
 #[cfg(feature = "integration")]
 pub(super) static USERNS_DRILL_LEASES_DIR_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// A [`RunscChild`] that records whether `kill()` was invoked, for
-/// `discard_container_run_after_teardown_failure`'s tests below.
 pub(super) struct CountingFakeRunsc {
     killed: Arc<AtomicBool>,
 }

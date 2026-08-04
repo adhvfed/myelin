@@ -1,7 +1,3 @@
-//! CT-005d — the compiled CLI consumes the same durable CI contract artifact as Rust Edge and the
-//! dev Edge. This is a client contract proof, not a second Edge implementation: it asserts the exact
-//! request target emitted by the binary and renders the artifact's already-gated response.
-
 use base64::Engine as _;
 use serde_json::Value;
 use std::process::Command;
@@ -132,7 +128,6 @@ async fn send_json(socket: &mut TcpStream, status: &str, value: Value) {
 }
 
 fn sse_wire(events: &[Value]) -> Vec<u8> {
-    // Match the actual dev Edge, which sends a legal comment before the first event.
     let mut body = String::from(": connected\n\n");
     for event in events {
         body.push_str("event: ");
@@ -176,8 +171,6 @@ async fn send_abrupt_sse(socket: &mut TcpStream, events: &[Value]) {
         .unwrap();
     socket.write_all(&body).await.unwrap();
     socket.write_all(b"\r\n10\r\npartial").await.unwrap();
-    // Dropping the socket before the declared chunk completes must surface as a body error, not a
-    // clean EOF. The CLI must resume from the last event whose archive bytes it acknowledged.
 }
 
 fn cli_command(address: std::net::SocketAddr, args: &[&str]) -> Command {
@@ -297,7 +290,7 @@ async fn compiled_cli_accepts_the_production_beyond_end_empty_range() {
 
     assert_eq!(code, 0, "{stderr}");
     assert!(stdout.contains("archived log bytes 100..100 of 18"));
-    assert!(!stdout.contains("more — run:"));
+    assert!(!stdout.contains("more - run:"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -1,24 +1,3 @@
-//! # CDC 10.1 (real erase) — the Search side of `PersonalDataHolder{locate, erase, restrict}` over a
-//! LIVE index (SRCH-P15 → P-178)
-//!
-//! **Contract:** index row 10.1 (`PersonalDataHolder` — the five DSR operations; the **real erase** —
-//! purge / crypto-shred / pseudonymise, never hide; `restrict` suppression). The signature was frozen
-//! at P-GA-01; the SRCH-P02 STUB CDC pair (`cdc_10_1_search_holder.rs`) proved the empty-surface
-//! holder. THIS file ships the **real-erase** Search side: the holder ([`SearchEraseHolder`])
-//! IMPLEMENTING 10.1 over a live per-tenant index, and a DSR-orchestrator stand-in (the CONSUMER)
-//! that fans `locate` + `erase` out to it via the contract and never reaches into the store.
-//!
-//! - **PROVIDER** = [`SearchEraseHolder`] (H7) implementing the five-operation 10.1 contract for real:
-//!   `locate` reports the docs referencing the subject; `erase` PURGES them (+ their vectors) via the
-//!   live consumer path and returns a receipt; `restrict` suppresses.
-//! - **CONSUMER** = a DSR-orchestrator shape that holds the holder behind `dyn PersonalDataHolder`,
-//!   fans `locate` then `erase` out, and asserts the contract is honoured — the shape the real
-//!   orchestrator (P-GA-11/P-GA-12) takes when it fans a DSR out to the Search holder.
-//!
-//! The dated green artifact: the consumer fans `locate(subject)` → a content-addressed receipt over
-//! the located set → `erase(subject)` → a content-addressed receipt recording the purge (0 recoverable
-//! incl. vectors). If 10.1's body shape drifts, this stops compiling/passing — that is the contract.
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -109,7 +88,6 @@ fn proj(text: &str, actor_id: &str) -> SearchProjection {
     }
 }
 
-/// Build the PROVIDER: a [`SearchEraseHolder`] over a live index holding a doc authored by `u-cdc`.
 fn provider() -> (SearchEraseHolder, Arc<IncrementalIndexer>) {
     let r = "myelin://acme/knowledge/page/cdc";
     let map: std::collections::HashMap<String, SearchProjection> =
@@ -132,10 +110,6 @@ fn provider() -> (SearchEraseHolder, Arc<IncrementalIndexer>) {
     (SearchEraseHolder::new(ix.clone(), pin, region()), ix)
 }
 
-/// **The CONSUMER side (10.1): a DSR-orchestrator shape that fans out to the Search holder via the
-/// contract.** Holds the holder behind `dyn PersonalDataHolder`; calls the contract — never reaches
-/// into the store. The property pinned: the orchestrator touches the Search store ONLY through the
-/// holder contract.
 struct DsrOrchestratorConsumer<'a> {
     holders: Vec<&'a dyn PersonalDataHolder>,
 }
@@ -163,17 +137,12 @@ impl<'a> DsrOrchestratorConsumer<'a> {
     }
 }
 
-/// **provider + consumer wired together (the 10.1 Search real-erase CDC pair).** The orchestrator
-/// (consumer) fans `locate` then `erase` out to the H7 index holder (provider) over a live index; the
-/// holder reports the located set, then PURGES it (the doc is gone after — not hidden), returning
-/// content-addressed receipts. This is the dated green artifact for the Search side of 10.1 (real erase).
 #[test]
 fn dsr_orchestrator_fans_locate_and_real_erase_out_to_the_search_holder() {
     let (holder, ix) = provider();
     let subj = subject("u-cdc");
     let consumer = DsrOrchestratorConsumer::new(vec![&holder]);
 
-    // locate: a content-addressed receipt over the located set (the doc referencing the subject).
     let reports = consumer.fan_out_locate(&subj, tenant());
     assert_eq!(
         reports.len(),
@@ -190,14 +159,12 @@ fn dsr_orchestrator_fans_locate_and_real_erase_out_to_the_search_holder() {
         "locate shreds no key"
     );
 
-    // The doc exists before the erase (the provider really holds it).
     assert_eq!(
         ix.live_count(&tenant(), &region()),
         1,
         "the subject's doc is indexed before erase"
     );
 
-    // erase: the real purge — the doc is GONE after, not hidden; a content-addressed receipt is returned.
     let receipts = consumer.fan_out_erase(EraseScope::Subject {
         subject: subj.clone(),
         tenant: tenant(),
@@ -217,7 +184,6 @@ fn dsr_orchestrator_fans_locate_and_real_erase_out_to_the_search_holder() {
         "a per-subject purge shreds no key (the primary mechanism is purge + reindex, not crypto-shred)"
     );
 
-    // The contract is honoured for real: the subject's doc is purged (0 recoverable).
     assert_eq!(
         ix.live_count(&tenant(), &region()),
         0,
@@ -225,8 +191,6 @@ fn dsr_orchestrator_fans_locate_and_real_erase_out_to_the_search_holder() {
     );
 }
 
-/// **A tenant offboard (`EraseScope::Tenant`) over the real holder is a crypto-shred recording the
-/// destroyed key epoch (the GD-4 lever's audit trail) — the contract's tenant-scope branch.**
 #[test]
 fn tenant_offboard_records_the_destroyed_key_epoch() {
     let (holder, _ix) = provider();

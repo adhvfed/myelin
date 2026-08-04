@@ -5,42 +5,14 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The Chat CONNECTION-TIER gateway (CHAT-P9 / P-403, M4-C2). The stateless Rust gateway sub-crate
-# (Rust default per TE-21): WS/SSE termination + presence + resume cursors ONLY — NO durable store,
-# NO outbox of its own (it calls the Message Service for any write). It composes the FROZEN pieces:
-#  - the firehose resume-cursor protocol (`myelin_events::Firehose` — subscribe/resume/scope, 3.5),
-#  - the `MessageStore::resync_from` snapshot fallback (`myelin_chat::store`, 2.6),
-#  - the membership read gate at connect (`myelin_chat::MembershipGate`, 4.2),
-#  - `authenticate(credential) -> Principal` (tenant-from-token, ID-3, 4.1),
-#  - the readiness gate (`myelin_substrate::metrics_health`, liveness != readiness, 1.3),
-#  - the cross-language harness shim no-op (1.7 — Rust default).
-# It is the SECOND committable unit of M4-C2; the firehose-only LIVE delivery body + the shed order
-# is CHAT-P10 (P-404). It is a leaf consumer of the chat subsystem crate + the shared glue crates;
-# NOTHING in the production library DAG depends back on it (the §2.9 graph stays acyclic).
 [dependencies]
-# The Bus-owned firehose resume-cursor protocol (contract 3.5): subscribe(stream, scope, cursor?) /
-# resume(stream, scope, last_seq) — the zero-loss-across-reconnect backplane + the FirehoseScope
-# `*`-rejecting chokepoint the gateway's bounded `channel:<id>` scope rides.
 myelin-events = { path = "../myelin-events" }
-# The Chat subsystem: the MessageStore trait + resync_from (the `resync_required -> *.snapshot`
-# fallback, contract 2.6), the MembershipGate (the connect-time read gate, 4.2), the frozen
-# `channel:<id>` scope shape (`glue::chat_channel_scope`) + the TE-21 pin (`glue::Te21LanguagePin`).
 myelin-chat = { path = "../myelin-chat" }
-# The frozen IdentityService ABI (contract 4.1 authenticate -> Principal; 4.2 check). The gateway
-# resolves a Principal and gates the connection — tenant from the verified token, never the path.
 myelin-identity = { path = "../myelin-identity" }
-# The (tenant, region) partition-key types the residency-pinned ConversationId is built from.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# The substrate liveness != readiness surface (contract 1.3): the gateway readiness-gates new
-# connections (a dead critical dependency -> not-ready -> shed; liveness never restart-storms).
 myelin-substrate = { path = "../myelin-substrate" }
 
 [dev-dependencies]
-# The Chat outbox/event primitives the drill harness drives a real send through (the chained
-# subscribe -> deliver -> sever -> resume -> assert 0 lost/0 dup scenario).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# The gateway drills use Chat's in-process hot-tier double; keep that surface dev-only.
 myelin-chat = { path = "../myelin-chat", features = ["test-support"] }
-# The P-S02 1×/10×/30× load generator (the F6 surge family spine): the CHAT-D3 surge drill DERIVES
-# its storm-frame count from a real generator run at the surge multiplier (never a hand-typed number).
 myelin-harness = { path = "../myelin-harness" }

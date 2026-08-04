@@ -1,16 +1,6 @@
-//! # `MockModelClient` — the deterministic, network-free [`ModelClient`] double.
-//!
-//! Lets [`crate::runtime::LlmAgentRuntime::step`] be unit-tested WITHOUT a socket: script a
-//! `Result<ModelResponse, ModelError>` and assert the mapped [`myelin_agent::StepOutcome`]. Behind
-//! the `test-support` feature (and always available in-crate under `cfg(test)`) so downstream
-//! service tests can construct an `LlmAgentRuntime` deterministically — the same in-memory-double
-//! discipline the other crates use.
-
 use crate::client::{ModelClient, ModelError, ModelRequest, ModelResponse};
 use std::sync::Mutex;
 
-/// A scripted [`ModelClient`]: every [`ModelClient::complete`] returns the scripted result (cloned),
-/// and the last request is captured for assertions. Never touches the network.
 #[derive(Debug)]
 pub struct MockModelClient {
     scripted: Result<ModelResponse, ModelError>,
@@ -18,7 +8,6 @@ pub struct MockModelClient {
 }
 
 impl MockModelClient {
-    /// Script a successful response.
     pub fn ok(response: ModelResponse) -> MockModelClient {
         MockModelClient {
             scripted: Ok(response),
@@ -26,7 +15,6 @@ impl MockModelClient {
         }
     }
 
-    /// Script a typed error (the HTTP/parse/transport failure path).
     pub fn err(error: ModelError) -> MockModelClient {
         MockModelClient {
             scripted: Err(error),
@@ -34,7 +22,6 @@ impl MockModelClient {
         }
     }
 
-    /// The most recent request the runtime built (for asserting the Conversation → request mapping).
     pub fn last_request(&self) -> Option<ModelRequest> {
         self.last_request.lock().expect("mock lock").clone()
     }

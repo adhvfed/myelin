@@ -1,25 +1,3 @@
-//! Live-Postgres integration test (Stage 1 / infra) — the Notif data-model `(tenant, region)` RLS
-//! cross-tenant DENIAL + the load-bearing inbox-item constraints, proven against REAL Postgres
-//! (NOTIF-P2 / P-180; the GATE: 0 cross-tenant rows readable; the dedup UNIQUE bites).
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free (the binding-policy floor — no DB at build). This runs
-//! ONLY against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-notif --features integration --test integration_notif_schema -- --nocapture
-//!
-//! Endpoints come from the myelin-config dev defaults (the dev<->prod CONFIG SWAP seam), so the same
-//! test runs against Scaleway (fr-par) by exporting the prod env vars — never a code change.
-//!
-//! It proves, against REAL Postgres, that:
-//!   1. The Notif `inbox_item` migration DDL + `myelin_make_tenant_scoped` RLS policy isolate rows
-//!      end-to-end: a session set to tenant A reads ONLY tenant A's inbox item — **0 cross-tenant
-//!      rows readable** (the §2 / EI-02 §1 no-cross-tenant-query-path invariant, in Postgres). The
-//!      app role is `NOSUPERUSER NOBYPASSRLS`, so the policy is actually in force.
-//!   2. The `UNIQUE(tenant_id, recipient, dedup_key)` write-time-collapse key BITES — a second insert
-//!      with the same `(recipient, dedup_key)` is rejected by Postgres (the storm-control collapse is
-//!      a real constraint, §3.2, not a convention).
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -30,13 +8,11 @@ async fn notif_inbox_item_rls_denies_cross_tenant_and_dedup_unique_bites() {
     use sqlx::Row;
 
     let cfg = MyelinConfig::dev();
-    // The app role (NOSUPERUSER NOBYPASSRLS) — the role under which RLS is actually enforced.
     let app = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect(&cfg.database_url)
         .await
         .expect("connect to dev Postgres as the app role (is the stack up?)");
-    // The owner/migration role runs the DDL (production migrations run as the owner).
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(
@@ -46,12 +22,9 @@ async fn notif_inbox_item_rls_denies_cross_tenant_and_dedup_unique_bites() {
         .await
         .expect("connect as admin");
 
-    // A unique table name per process so concurrent runs don't collide — the DDL is the REAL
-    // inbox_item shape (we substitute the table name so cleanup is safe + parallel runs isolate).
     let tbl = format!("notif_inbox_item_rls_probe_{}", std::process::id());
     let create = INBOX_ITEM_DDL.replacen("notif_inbox_item", &tbl, 1);
 
-    // Clean slate, then apply the REAL migration DDL + the REAL RLS-scope convention call.
     sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
         .execute(&admin)
         .await
@@ -69,7 +42,6 @@ async fn notif_inbox_item_rls_denies_cross_tenant_and_dedup_unique_bites() {
         .await
         .unwrap();
 
-    // Seed two tenants' inbox items (as admin, who is FORCEd under RLS too — set the GUCs first).
     for (item_id, t) in [("itm-A", "tenantA"), ("itm-B", "tenantB")] {
         let mut conn = admin.acquire().await.unwrap();
         sqlx::query("SELECT set_config('myelin.tenant_id', $1, false)")
@@ -96,7 +68,6 @@ async fn notif_inbox_item_rls_denies_cross_tenant_and_dedup_unique_bites() {
         .unwrap();
     }
 
-    // As the APP role set to tenant A: only tenant A's item is visible (RLS hides tenant B's).
     let mut conn = app.acquire().await.unwrap();
     sqlx::query("SELECT set_config('myelin.tenant_id', 'tenantA', false)")
         .execute(&mut *conn)
@@ -114,11 +85,10 @@ async fn notif_inbox_item_rls_denies_cross_tenant_and_dedup_unique_bites() {
     assert_eq!(
         rows.len(),
         1,
-        "RLS must hide the other tenant's inbox item — 0 cross-tenant rows"
+        "RLS must hide the other tenant's inbox item - 0 cross-tenant rows"
     );
     assert_eq!(rows[0].get::<String, _>("tenant_id"), "tenantA");
 
-    // The cross-tenant read is structurally 0 even with an explicit predicate naming tenant B.
     let cross: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {tbl} WHERE tenant_id = 'tenantB'"
     ))
@@ -130,8 +100,6 @@ async fn notif_inbox_item_rls_denies_cross_tenant_and_dedup_unique_bites() {
         "a tenant-A session must read 0 cross-tenant (tenantB) rows"
     );
 
-    // The dedup UNIQUE bites: a second insert with the SAME (recipient, dedup_key) under tenant A is
-    // rejected by Postgres (the storm-control write-time-collapse key is a real constraint, §3.2).
     let dup = sqlx::query(&format!(
         "INSERT INTO {tbl} \
            (tenant_id, region, item_id, recipient, subject, subject_root, reason, class, \

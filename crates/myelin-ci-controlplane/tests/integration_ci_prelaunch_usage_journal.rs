@@ -1,8 +1,3 @@
-//! Live proof of CT-007 slice 5b.3-4a.2's schema: `ci_job_parent_attempt` is insert-only, immutable,
-//! and FK-anchored; `ci_job_prelaunch_usage`'s transition-guard trigger enforces the legal
-//! `started -> measured`/`started -> sealed_ceiling` transitions, refuses reverting a terminal state,
-//! refuses identity/ceiling tampering, and forbids DELETE outright; and the dedicated region
-//! scheduler role can SELECT/seal what the reaper (CT-007 slice 5b.3-4b) needs and nothing more.
 #![cfg(feature = "integration")]
 
 mod common;
@@ -99,8 +94,6 @@ fn assert_check_violation(result: Result<PgQueryResult, sqlx::Error>, operation:
     assert_eq!(code.as_deref(), Some("23514"), "{operation}: {error}");
 }
 
-/// The transition-guard trigger refuses via `RAISE EXCEPTION` (SQLSTATE `P0001`), distinct from an
-/// actual `CHECK` constraint violation (`23514`).
 fn assert_trigger_refusal(result: Result<PgQueryResult, sqlx::Error>, operation: &str) {
     let error = result.expect_err(operation);
     let code = error
@@ -112,18 +105,6 @@ fn assert_trigger_refusal(result: Result<PgQueryResult, sqlx::Error>, operation:
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
-    // Unlike the other schema fixtures, this suite DELIBERATELY exercises the real
-    // `myelin_ci_region_scheduler` role against its isolated schema — it asserts exactly which
-    // journal columns that role may read and seal. Revoking those grants after migration (what the
-    // other fixtures do) would delete the thing under test, so this one takes the other branch:
-    // hold CI_PRIVILEGE_FIXTURE_LOCK across the WHOLE body, so the grants exist but no concurrent
-    // scheduler-boundary or production-boot probe can observe them.
-    //
-    // The sweep prefix and the inner `with_schema_cleanup` are what make that hold panic-safe. With
-    // only the happy-path DROP at the end, a panic anywhere in the body released the lock while a
-    // fully scheduler-granted schema was still standing — the exact state the lock exists to hide —
-    // and it stayed there for every later run. Cleanup now happens INSIDE the lock, and the prefix
-    // sweep collects whatever an earlier crashed run left behind.
     common::with_privilege_fixture_lock(&admin_url(), &["ci_prelaunch_usage_journal_"], || async {
     let schema = format!("ci_prelaunch_usage_journal_{}", std::process::id());
     let bootstrap = pinned_pool(&admin_url(), "public").await;
@@ -189,8 +170,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
 
     let app = app_pinned_pool(&app_url(), &schema, tenant).await;
 
-    // Insert one parent-attempt row per job -- job_a will exercise the checkout-phase journal,
-    // job_b exists only to prove a compute job (no phase rows at all) is a legal, independent row.
     for (job_id, lease_epoch, claim_nonce) in [
         (job_a, 1i64, "90000000-0000-0000-0000-000000000001"),
         (job_b, 1i64, "90000000-0000-0000-0000-000000000002"),
@@ -214,7 +193,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         assert!(inserted.is_ok(), "parent-attempt insert: {inserted:?}");
     }
 
-    // The parent-attempt journal is immutable: no UPDATE, no DELETE, ever.
     assert_permission_denied(
         sqlx::query(
             "UPDATE ci_job_parent_attempt SET lease_owner = 'other' WHERE job_id = $1::uuid",
@@ -232,7 +210,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         "DELETE FROM ci_job_parent_attempt",
     );
 
-    // A CHECK violation: `started` requires both exact usage columns to be NULL.
     assert_check_violation(
         sqlx::query(
             "INSERT INTO ci_job_prelaunch_usage (\
@@ -248,8 +225,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         "insert a started row with non-null exact usage",
     );
 
-    // Two phases: transport reaches `measured`; materialization reaches `sealed_ceiling` (the
-    // reaper's fallback), proving both terminal states independently.
     for phase in ["checkout_transport", "checkout_materialization"] {
         let inserted = sqlx::query(
             "INSERT INTO ci_job_prelaunch_usage (\
@@ -266,7 +241,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         assert!(inserted.is_ok(), "phase insert {phase}: {inserted:?}");
     }
 
-    // Legal transition: started -> measured, with exact usage now present.
     let measured = sqlx::query(
         "UPDATE ci_job_prelaunch_usage \
          SET status = 'measured', exact_cpu_seconds = 7, exact_mem_byte_seconds = 9, resolved_at = now() \
@@ -282,7 +256,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
     );
     assert_eq!(measured.unwrap().rows_affected(), 1);
 
-    // Illegal: reverting measured back to started must refuse.
     assert_trigger_refusal(
         sqlx::query(
             "UPDATE ci_job_prelaunch_usage \
@@ -296,7 +269,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         "measured cannot revert to started",
     );
 
-    // Legal transition: started -> sealed_ceiling (the reaper's fallback).
     let sealed = sqlx::query(
         "UPDATE ci_job_prelaunch_usage SET status = 'sealed_ceiling', resolved_at = now() \
          WHERE tenant_id = $1 AND job_id = $2::uuid AND phase = 'checkout_materialization'",
@@ -310,8 +282,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         "legal started->sealed_ceiling transition: {sealed:?}"
     );
 
-    // A late completion after sealing must refuse -- it can never replace a conservative ceiling
-    // with a (possibly lower) measurement.
     assert_trigger_refusal(
         sqlx::query(
             "UPDATE ci_job_prelaunch_usage \
@@ -325,7 +295,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         "sealed_ceiling cannot become measured",
     );
 
-    // Identity/ceiling tampering on the one legal transition must also refuse.
     let transport2 = sqlx::query(
         "INSERT INTO ci_job_prelaunch_usage (\
          tenant_id, region, job_id, lease_epoch, claim_nonce, phase, status, \
@@ -366,7 +335,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
     .await;
     assert!(expired_materialization.is_ok());
 
-    // DELETE is forbidden outright, resolved or not.
     assert_permission_denied(
         sqlx::query("DELETE FROM ci_job_prelaunch_usage WHERE job_id = $1::uuid")
             .bind(job_a)
@@ -375,9 +343,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         "DELETE FROM ci_job_prelaunch_usage",
     );
 
-    // The dedicated region scheduler role (the reaper's real production role) can SELECT both
-    // journal tables and seal an unresolved row through the exact column-scoped grant -- and
-    // nothing more.
     let scheduler = pinned_pool(&scheduler_url(), &schema).await;
     let visible_parent: i64 = sqlx::query_scalar("SELECT count(*) FROM ci_job_parent_attempt")
         .fetch_one(&scheduler)
@@ -450,9 +415,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         "the scheduler never gets write access to the immutable parent-attempt journal",
     );
 
-    // **CT-007 phase-credential generations: the scheduler role holds NO privilege at all on the
-    // credential log.** Neither reaping nor renewal reads it, and it is the durable authority every
-    // phase execution gate consults — so unlike the two journal tables above, even SELECT is denied.
     for statement in [
         "SELECT count(*) FROM ci_job_credential_generation",
         "SELECT generation_id FROM ci_job_credential_generation LIMIT 1",
@@ -494,8 +456,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
         "the scheduler role may not delete a credential generation",
     );
 
-    // 5b.3-5a compatibility proof: after the additive disposition/v4 migration, an immutable
-    // historical v3-only accounting row still inserts and replays byte-for-byte unchanged.
     let accounting = CiJobAccountingStore::with_pg(app.clone(), Region("fr-par".into()));
     let accounting_tenant = TenantId::from_token(tenant);
     let accounting_region = Region("fr-par".into());
@@ -584,10 +544,6 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
     scheduler.close().await;
     app.close().await;
     admin.close().await;
-    // The schema drop belongs to `with_schema_cleanup` above, which runs it on the panicking path
-    // too — and, critically, still inside CI_PRIVILEGE_FIXTURE_LOCK. `bootstrap` is deliberately NOT
-    // closed here: `cleanup_bootstrap` is a `.clone()` of the SAME underlying pool, and
-    // `PgPool::close()` shuts it down for every clone, which would break that drop silently.
     })
     .await;
     })

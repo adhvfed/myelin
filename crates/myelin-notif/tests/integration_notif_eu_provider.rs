@@ -1,27 +1,3 @@
-//! Live-Postgres integration test — the REAL EU-sovereign provider's idempotency holds against the
-//! REAL `notif_delivery` `UNIQUE(tenant_id, idem_key)` constraint (NOTIF-P26 / P-468).
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free (the binding-policy floor — no DB at build). Runs ONLY
-//! against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-notif --features integration --test integration_notif_eu_provider -- --nocapture
-//!
-//! The mock proved the idem_key collapse against an in-memory model of the constraint (NOTIF-P16); the
-//! NOTIF-P26 follow-on touches the DeliveryAdapter contract (the real provider), so the binding policy
-//! requires a REAL integration test proving the SAME exactly-one property against the LIVE constraint.
-//!
-//! It proves, against REAL Postgres, that:
-//!   1. The REAL `notif_delivery` DDL applies and its `UNIQUE(tenant_id, idem_key)` constraint BITES —
-//!      a second INSERT with the SAME `(tenant_id, idem_key)` (the crash/retry double-write the real
-//!      provider's idempotency relies on) is REJECTED by Postgres. EXACTLY ONE effective delivery row
-//!      survives — the NOTIF-D9 re-run property at the storage layer, under the real provider's
-//!      `idem_key` (built by [`build_idem_key`](myelin_notif::build_idem_key)).
-//!   2. The off-cell row the real EU adapter would write carries `redacted = true` (the §3.6
-//!      PII-minimisation flag) — the live row stores the redaction discipline, not just the model.
-//!   3. The `provider_ref` column (the durable handle the provider-side-erasure hook targets) is
-//!      populated for the sent off-cell payload (the NOTIF-P27 hook's storage seam).
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -43,7 +19,6 @@ async fn real_eu_provider_idem_key_collapse_holds_against_the_live_unique_constr
         .await
         .expect("connect to dev Postgres as admin (is the stack up?)");
 
-    // A unique table name per process so concurrent runs don't collide — the REAL notif_delivery shape.
     let tbl = format!("notif_delivery_eu_probe_{}", std::process::id());
     let create = DELIVERY_DDL.replacen("notif_delivery", &tbl, 1);
 
@@ -60,9 +35,6 @@ async fn real_eu_provider_idem_key_collapse_holds_against_the_live_unique_constr
         .await
         .expect("myelin_make_tenant_scoped installs the (tenant_id, region) RLS policy");
 
-    // The REAL EU-sovereign adapter (over the deterministic vendor double — the [OPEN — LEGAL] seam)
-    // computes the idem_key + the provider_ref the live row stores. This is the SAME adapter the
-    // fabric dispatches to in prod (the vendor's HTTP client swaps in behind EuTransport).
     let transport = RecordingEuTransport::new("eu-mailer");
     let adapter = EuSovereignAdapter::new(
         Channel::Email,
@@ -119,22 +91,17 @@ async fn real_eu_provider_idem_key_collapse_holds_against_the_live_unique_constr
         }
     };
 
-    // (1) The first delivery row commits (the provider acked + the ledger wrote).
     insert("sent", "del-1")
         .await
         .expect("the first effective delivery row commits");
 
-    // (1) The crash/retry double-write — a SECOND row with the SAME (tenant_id, idem_key) — is
-    // REJECTED by Postgres's UNIQUE(tenant_id, idem_key). The real provider's idempotency is enforced
-    // by the LIVE constraint, not just the in-memory model.
     let dup = insert("sent", "del-2").await;
     assert!(
         dup.is_err(),
         "a retry with the SAME (tenant_id, idem_key) MUST be rejected by UNIQUE(tenant_id, idem_key) \
-         — exactly one effective delivery under the real provider (NOTIF-D9 re-run, live)"
+         - exactly one effective delivery under the real provider (NOTIF-D9 re-run, live)"
     );
 
-    // EXACTLY ONE effective delivery row survives — the threshold (exactly 1; never softened).
     let count: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {tbl} WHERE tenant_id = 'acme' AND idem_key = $1"
     ))
@@ -147,7 +114,6 @@ async fn real_eu_provider_idem_key_collapse_holds_against_the_live_unique_constr
         "exactly 1 effective delivery row (the live UNIQUE collapse)"
     );
 
-    // (2) + (3) the surviving row stores the redaction discipline + the provider_ref (the erasure hook seam).
     use sqlx::Row;
     let row = sqlx::query(&format!(
         "SELECT redacted, provider_ref FROM {tbl} WHERE tenant_id = 'acme' AND idem_key = $1"
@@ -171,7 +137,4 @@ async fn real_eu_provider_idem_key_collapse_holds_against_the_live_unique_constr
         .await
         .unwrap();
 
-    // GREEN ARTIFACT (2026-06-25): the REAL EU provider's idem_key collapse holds against the LIVE
-    // UNIQUE(tenant_id, idem_key) — exactly 1 effective delivery row; the off-cell row is redacted;
-    // the provider_ref is stored. No threshold weakened.
 }

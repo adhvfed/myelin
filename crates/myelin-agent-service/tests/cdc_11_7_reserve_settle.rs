@@ -1,27 +1,3 @@
-//! # The CDC pair for contract 11.7 — reserve/settle, the AGENT-FABRIC consumer half (AG-P14 → P-227)
-//!
-//! **Contract:** `planning/05-refined-shared-systems-architecture/contract-index.md` row 11.7
-//! (`reserve`/`settle` — the cost gate: *reserve at dispatch → no balance → no run; settle on
-//! completion; NEVER interrupt in-flight; integer minor-units; wholesale ≠ markup; fronts every agent
-//! run + every CI run + every `SCHEDULE_AND_RUN_JOB`*). Owning architecture: `agent-fabric.md` §5.4.
-//!
-//! The PROVIDER is `myelin-storage` (the durable [`CostLedger`] + the dispatch-fronting
-//! [`AgentRunGate`] — Storage owns the ledger correctness; P-103/P-146). The CONSUMER is **the agent
-//! fabric's run loop** — the concrete shape AG-P14 ships: the SKELETON loop fronts EVERY run through
-//! reserve-at-dispatch, settles on completion, and has NO path that interrupts an in-flight run. The
-//! storage-side CDC (`myelin-storage/tests/cdc_11_7_reserve_settle.rs`) models the consumer
-//! ABSTRACTLY; THIS pair pins the surface the agent fabric ACTUALLY depends on (it stops compiling/
-//! passing if 11.7's reserve/settle surface drifts under the agent fabric's feet). No duplication —
-//! a distinct consumer at a distinct tier.
-//!
-//! The frozen 11.7 surface this consumer relies on:
-//! 1. `gate.dispatch(ledger, tenant, run, estimate, available)` → `InFlightRun` on a funded reserve;
-//!    `Err(NoBalance)` on an exhausted wallet (no balance → no run; no handle minted).
-//! 2. `in_flight.settle(ledger, &units)` → one cost event per metered unit (wholesale ≠ markup);
-//!    the over-reservation refunds; the billed total never exceeds the reservation.
-//! 3. There is NO API on the gate or the handle that tears down an in-flight run
-//!    (`inflight_interrupt_count` is `0` by construction).
-
 use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError, RunKind};
 use myelin_storage::reserve_settle::{
     CostLedger, MeteredUnit, MicroUsd, ReservationState, RunId,
@@ -32,17 +8,11 @@ fn tenant() -> TenantId {
     TenantId::from_token("01J0ACME")
 }
 
-/// **CONSUMER side of 11.7 — the agent fabric's reserve-at-dispatch.** The fabric fronts every run
-/// through the gate: a funded reserve mints an in-flight handle (the run starts); an exhausted wallet
-/// is refused (no balance → no run; the run NEVER starts). The fabric relies on this exact surface —
-/// it never reaches around the gate to start a run, so the runaway self-limiter is
-/// correct-by-construction.
 #[test]
 fn consumer_reserve_at_dispatch_no_balance_no_run() {
     let mut gate = AgentRunGate::new();
     let mut ledger = CostLedger::new();
 
-    // Funded → fronted, in-flight, labelled AgentRun (the fabric's run kind).
     let handle = gate
         .dispatch(
             &mut ledger,
@@ -58,7 +28,6 @@ fn consumer_reserve_at_dispatch_no_balance_no_run() {
         Some(ReservationState::InFlight)
     );
 
-    // Exhausted wallet → refused; NO handle; NO reservation row (the run never started).
     let err = gate
         .dispatch(
             &mut ledger,
@@ -76,7 +45,7 @@ fn consumer_reserve_at_dispatch_no_balance_no_run() {
         ledger
             .state_of(&tenant(), &RunId::new("run-broke"))
             .is_none(),
-        "a refused run leaves NO reservation — it never started"
+        "a refused run leaves NO reservation - it never started"
     );
     assert_eq!(
         gate.reserve_refusals(),
@@ -85,11 +54,6 @@ fn consumer_reserve_at_dispatch_no_balance_no_run() {
     );
 }
 
-/// **CONSUMER side of 11.7 — settle-on-completion through the in-flight handle.** The fabric settles a
-/// completed run with its actual metered units: one cost event per unit, wholesale ≠ markup recorded
-/// distinctly, the over-reservation refunded, the billed total capped at the reservation. The fabric
-/// depends on this surface to bill correctly (and on the SKELETON/Mock path it bills ZERO units → the
-/// whole reservation refunds, the gate's balanced-ledger property).
 #[test]
 fn consumer_settle_on_completion_one_event_per_unit_with_split() {
     let mut gate = AgentRunGate::new();
@@ -104,7 +68,6 @@ fn consumer_settle_on_completion_one_event_per_unit_with_split() {
         )
         .unwrap();
 
-    // A run that metered two units (the LlmAgentRuntime shape, AG-P25): one cost event per unit.
     let units = vec![
         MeteredUnit {
             unit: "llm.tokens",
@@ -138,9 +101,6 @@ fn consumer_settle_on_completion_one_event_per_unit_with_split() {
         Some(ReservationState::Settled)
     );
 
-    // The SKELETON/Mock shape: a run that meters ZERO units settles the whole reservation as refund
-    // (reserved == settled; billed 0). This is the property the agent-fabric balanced-ledger gate
-    // reads — the Mock metering ZERO is CORRECT, not a floor.
     let zero = gate
         .dispatch(
             &mut ledger,
@@ -166,12 +126,6 @@ fn consumer_settle_on_completion_one_event_per_unit_with_split() {
     );
 }
 
-/// **CONSUMER side of 11.7 — there is NO interrupt path (the never-interrupt-in-flight invariant the
-/// fabric relies on).** The agent fabric NEVER interrupts an in-flight run because the provider gives
-/// it no way to: the gate exposes no tear-down method, and the ledger's only teardown
-/// (`cancel_unstarted`) is structurally barred from an in-flight row. The fabric's runaway
-/// self-limiter (AG-D11) depends on EXACTLY this — a refusal of a NEXT run can never reach into a
-/// RUNNING one.
 #[test]
 fn consumer_relies_on_no_interrupt_path_for_in_flight_runs() {
     let mut gate = AgentRunGate::new();
@@ -186,7 +140,6 @@ fn consumer_relies_on_no_interrupt_path_for_in_flight_runs() {
         )
         .unwrap();
 
-    // The ONLY teardown the ledger has refuses an in-flight row (the fabric cannot reach around it).
     assert!(
         ledger
             .cancel_unstarted(&tenant(), &RunId::new("live"))
@@ -196,7 +149,7 @@ fn consumer_relies_on_no_interrupt_path_for_in_flight_runs() {
     assert_eq!(
         ledger.state_of(&tenant(), &RunId::new("live")),
         Some(ReservationState::InFlight),
-        "the run is untouched — still in-flight"
+        "the run is untouched - still in-flight"
     );
     assert_eq!(
         ledger.inflight_interrupt_count(),
@@ -204,7 +157,6 @@ fn consumer_relies_on_no_interrupt_path_for_in_flight_runs() {
         "0 in-flight interrupts (by construction)"
     );
 
-    // The run still settles normally on its OWN completion (it kept running).
     handle.settle(&mut ledger, &[]).unwrap();
     assert_eq!(
         ledger.state_of(&tenant(), &RunId::new("live")),
@@ -212,9 +164,6 @@ fn consumer_relies_on_no_interrupt_path_for_in_flight_runs() {
     );
 }
 
-/// **PROVIDER side of 11.7 — the frozen surface the consumer pins above is implemented.** A funded
-/// dispatch mints a handle; an unfunded one does not; the settle is idempotent (a double-completion
-/// never double-charges — the surface the fabric's at-least-once delivery relies on).
 #[test]
 fn provider_surface_is_idempotent_on_settle() {
     let mut gate = AgentRunGate::new();

@@ -1,5 +1,3 @@
-//! Tenant-scoped, ReBAC-gated administration for durable CI secrets and their use bindings.
-
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -14,16 +12,11 @@ use crate::ci_secret_store::{CiSecretStoreError, DurableCiSecretStore, ManagedSe
 use crate::rebac_fragment::{object_types, ADMINISTER};
 use crate::secret_broker::strict_secret_segment;
 
-/// The secret-management capability. It is deliberately the CI-project administration permission,
-/// not the job-facing `secret.read` permission.
 pub const SECRET_ADMIN_PERMISSION: &str = ADMINISTER;
 
 const SECRET_ID_DOMAIN: &[u8] = b"myelin-ci-managed-secret-id:v1";
-/// Maximum plaintext accepted by the service and every transport adapter before encryption.
 pub const MAX_SECRET_MATERIAL_BYTES: usize = 64 * 1024;
 
-/// Secret input owned by the call. Debug is always redacted and the allocation is zeroized on drop,
-/// including every success and error path after encryption.
 pub struct SecretMaterial(Zeroizing<String>);
 
 impl SecretMaterial {
@@ -54,7 +47,6 @@ impl From<&str> for SecretMaterial {
     }
 }
 
-/// Material-free metadata returned by create, update, rotate, and list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecretMetadata {
     pub project_id: String,
@@ -63,10 +55,6 @@ pub struct SecretMetadata {
     pub version: i64,
 }
 
-/// A use binding is either available to every job in the project or to one exact job. Job scope
-/// validates the canonical UUID syntax but deliberately does not require a durable `ci_job` row:
-/// bindings may be provisioned before a job exists, and use still requires both a live binding and
-/// the exact job principal's independent `secret.read` grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SecretBindingScope {
     Project,
@@ -83,8 +71,6 @@ impl SecretBindingScope {
     }
 }
 
-/// A material-free admin failure. Authorization failures intentionally collapse tenant mismatch,
-/// Identity errors, and non-Allow decisions into the same fail-closed result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SecretAdminError {
     Unauthorized,
@@ -108,8 +94,6 @@ impl std::fmt::Display for SecretAdminError {
 
 impl std::error::Error for SecretAdminError {}
 
-/// A caller-bound secret management service. All operations are tenant-first and authorize before
-/// reading or mutating secret rows.
 pub struct SecretAdmin<I: IdentityService> {
     store: Arc<DurableCiSecretStore>,
     identity: Arc<I>,
@@ -815,8 +799,6 @@ mod tests {
             .unwrap();
         let secret_id = secret_id_for(&tenant, PROJECT, "DEPLOY_KEY");
 
-        // This is the losing grant-after-delete interleaving. The production INSERT..SELECT and FK
-        // make the same interleaving fail closed even when delete commits between lookup and insert.
         admin.delete_secret(&tenant, PROJECT, "DEPLOY_KEY").unwrap();
         assert_eq!(
             store

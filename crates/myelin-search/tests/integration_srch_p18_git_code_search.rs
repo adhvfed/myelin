@@ -1,32 +1,3 @@
-//! # Integration — SRCH-P18 (P-261, M3): Search indexes the REAL Git corpus (code search v1)
-//!
-//! **Drill source:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` SRCH-D1 (F1 — the
-//! zero-escape leak: a private repo's blob NEVER in any result incl. counts) + SRCH-D3 (F2 —
-//! cross-tenant IDOR = 0), the gate-invariant ratchet **re-confirmed on the REAL Git corpus** (the M2
-//! drills re-run on each new producer corpus). **Architecture:** `search-and-indexing.md` §4.4 (code
-//! search v1 = symbol/path/literal + trigram, the code tokenizer; `code_block.text` raw — X-2). **Contracts:**
-//! 6.5 (consume the real Git `git.*` projection per blob/ref/symbol), 13.1 (the raw code-block text).
-//! **Reconciliation:** change #8 (the SCIP/LSIF find-usages follow-on named, post-M4).
-//!
-//! ## What this proves (the dated green artifact, 2026-06-21)
-//! A REAL Git code corpus (blobs of Rust/Python source, paths, string literals, commit messages) is
-//! projected through [`git_blob_search_projection`] (git's owned 6.5 projection BUILDER, the genuine
-//! code-tokenizer + trigram index) into the LIVE [`IncrementalIndexer`] per-event pipeline
-//! (project-fetch → analyze → upsert), then queried back through the engine surface. The GATE:
-//!
-//! 1. **Code search v1 correctness** — a SYMBOL query (camel/snake-split identifier) returns the right
-//!    blob; an EXACT-identifier query hits the whole token; a PATH query hits the blob at that path; a
-//!    string-LITERAL query hits; a COMMIT-MESSAGE query hits; a TRIGRAM substring/regex-lite query hits.
-//! 2. **SRCH-D1 (F1) on the Git corpus** — a PRIVATE repo's blob never appears in ANY result (incl.
-//!    counts) for an unauthorized viewer; a grant ⇒ it appears (the rejection was the ACL, not a deny).
-//! 3. **SRCH-D3 (F2) on the Git corpus** — a viewer's tenant partitions the index; a cross-tenant
-//!    query sees 0 of the other tenant's blobs (the per-tenant index, partition-keyed).
-//!
-//! The ENGINE is UNCHANGED — this is producer-corpus wiring (the prompt's DoD). No new mutation-core
-//! module is added; the SRCH-P09 mutation floor still holds (the engine decision logic is the same
-//! one that drill mutation-tests; here it runs on Git code). The SCIP/LSIF find-usages floor is named
-//! (post-M4, change #8).
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -43,10 +14,6 @@ use myelin_search::{
 };
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
-// ----------------------------------------------------------------------------------------------
-// fixtures — the REAL Git corpus (blobs projected through git's owned 6.5 builder)
-// ----------------------------------------------------------------------------------------------
-
 fn tenant() -> TenantId {
     TenantId("acme".into())
 }
@@ -61,10 +28,6 @@ fn viewer(id: &str, t: &str) -> Principal {
     )
 }
 
-/// A scripted [`ProjectFetcher`] over a `ref → SearchProjection` map — the owner's `project(ref,
-/// viewer)` (5.6 / 6.5). The REAL Git corpus is built by [`git_blob_search_projection`] over blob
-/// inputs, so this fetcher serves Git's genuine 6.5 projection (NOT a repo read — the no-cross-db
-/// floor; Search does NOT parse repos, §4.4).
 #[derive(Default)]
 struct GitFetcher {
     projections: Mutex<BTreeMap<String, SearchProjection>>,
@@ -112,7 +75,6 @@ fn git_event(id: &str, type_: &str, subject: &str, t: &str) -> EventEnvelope {
     }
 }
 
-/// Build the indexer over the REAL Git spec (the `git`/`blob` code-projection shape).
 fn git_indexer(fetcher: Arc<GitFetcher>) -> IncrementalIndexer {
     IncrementalIndexer::new(
         vec![git_code_projection_spec()],
@@ -121,7 +83,6 @@ fn git_indexer(fetcher: Arc<GitFetcher>) -> IncrementalIndexer {
     )
 }
 
-/// A real Rust blob (camelCase + snake_case symbols, a string literal, a commit message).
 fn scheduler_blob() -> GitBlobProjectionInput {
     GitBlobProjectionInput {
         path: "src/scheduler/deadlock.rs".into(),
@@ -135,7 +96,6 @@ fn scheduler_blob() -> GitBlobProjectionInput {
     }
 }
 
-/// A real Python blob (a different path/language; distinct symbols so a symbol query is selective).
 fn parser_blob() -> GitBlobProjectionInput {
     GitBlobProjectionInput {
         path: "lib/parser/tokenizer.py".into(),
@@ -147,12 +107,6 @@ fn parser_blob() -> GitBlobProjectionInput {
     }
 }
 
-// ----------------------------------------------------------------------------------------------
-// 1. Code search v1 correctness — symbol / exact-id / path / literal / commit-message / trigram
-// ----------------------------------------------------------------------------------------------
-
-/// **A symbol/path/literal/commit-message query returns the right blob; a trigram substring query
-/// works; identifiers tokenize via camel/snake keeping operators (the SRCH-P18 GATE).**
 #[test]
 fn git_code_search_v1_symbol_path_literal_commit_trigram() {
     let rust_ref = "myelin://acme/git/blob/repoA:main:src/scheduler/deadlock.rs";
@@ -174,7 +128,6 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
 
     let acl = AclFilter::ids([rust_ref, py_ref]);
 
-    // SYMBOL (camel/snake split): `deadlock` is a camel part of `detectDeadlock` → the Rust blob.
     let sym = ix
         .search_ft(&tenant(), &region(), &acl, "deadlock", 10)
         .expect("symbol search");
@@ -187,7 +140,6 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
         "the symbol does not find the unrelated Python blob"
     );
 
-    // EXACT identifier: the whole lowercased identifier `detectdeadlock` hits.
     let exact = ix
         .search_ft(&tenant(), &region(), &acl, "detectdeadlock", 10)
         .expect("exact-id search");
@@ -196,7 +148,6 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
         "the whole identifier `detectdeadlock` hits"
     );
 
-    // PATH: a path segment `tokenizer` (and the snake symbol `parse_html`) → the Python blob.
     let path_hit = ix
         .search_ft(&tenant(), &region(), &acl, "tokenizer", 10)
         .expect("path search");
@@ -205,7 +156,6 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
         "the path segment `tokenizer` finds the Python blob"
     );
 
-    // LITERAL: the string literal "cycle detected" → the Rust blob.
     let lit = ix
         .search_ft(&tenant(), &region(), &acl, "cycle", 10)
         .expect("literal search");
@@ -214,7 +164,6 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
         "the string-literal token `cycle` finds the Rust blob"
     );
 
-    // COMMIT MESSAGE: `resolve` is from the Rust blob's commit message.
     let commit = ix
         .search_ft(&tenant(), &region(), &acl, "resolve", 10)
         .expect("commit-message search");
@@ -223,7 +172,6 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
         "the commit-message token `resolve` finds the Rust blob"
     );
 
-    // STRUCTURED PATH FACET (GF-3 "find this path"): an exact path equality returns just that blob.
     let path_facet = ix
         .search_structured(
             &tenant(),
@@ -237,7 +185,6 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
     assert_eq!(path_facet.len(), 1, "exactly the blob at that path");
     assert_eq!(path_facet[0].doc_id, rust_ref);
 
-    // STRUCTURED LANGUAGE FACET: language == python → just the Python blob.
     let lang_facet = ix
         .search_structured(
             &tenant(),
@@ -251,9 +198,6 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
     assert_eq!(lang_facet.len(), 1, "exactly the python blob");
     assert_eq!(lang_facet[0].doc_id, py_ref);
 
-    // TRIGRAM substring/regex-lite: the substring `adlo` (inside `Deadlock`) decomposes into trigrams;
-    // a conjunction of those trigram tokens (the Cox candidate filter) returns the Rust blob. We query
-    // the FT body for the trigram conjunction (every trigram MUST be present — `+` is Tantivy MUST).
     let q = trigram_query("adlo");
     assert!(!q.is_empty(), "a 4-char substring yields trigrams");
     let conjunction = q
@@ -274,21 +218,12 @@ fn git_code_search_v1_symbol_path_literal_commit_trigram() {
     );
 }
 
-// ----------------------------------------------------------------------------------------------
-// 2. SRCH-D1 (F1) — the zero-escape leak on the REAL Git corpus
-// ----------------------------------------------------------------------------------------------
-
-/// **SRCH-D1 (F1) re-confirmed on the Git corpus: a PRIVATE repo's blob never appears in ANY result
-/// (incl. counts) for an unauthorized viewer — and a grant makes it appear (the rejection was the ACL
-/// firing, not a blanket deny).** Both blobs carry the SAME rare symbol so a leak would be exposed by
-/// FT/count/IDF inference.
 #[test]
 fn srch_d1_private_git_blob_never_leaks() {
     let visible = "myelin://acme/git/blob/public-repo:main:src/lib.rs";
     let private = "myelin://acme/git/blob/secret-repo:main:src/secret.rs";
     let fetcher = Arc::new(GitFetcher::default());
 
-    // BOTH blobs contain the SAME rare identifier `zarquonReactor` — so a leak surfaces via FT/count.
     let public_blob = GitBlobProjectionInput {
         path: "src/lib.rs".into(),
         text: "fn zarquonReactor() { /* public */ }".into(),
@@ -313,11 +248,8 @@ fn srch_d1_private_git_blob_never_leaks() {
         "both blobs are indexed"
     );
 
-    // The unauthorized viewer's reachable set is JUST the visible repo's blob (the private repo is NOT
-    // in it — git ACL is repo-granular, and the viewer is not a member of secret-repo).
     let acl_unauth = AclFilter::ids([visible]);
 
-    // FT: the shared rare symbol `zarquonreactor` — only the visible blob surfaces; private never does.
     let hits = ix
         .search_ft(&tenant(), &region(), &acl_unauth, "zarquonreactor", 10)
         .expect("ft");
@@ -332,7 +264,6 @@ fn srch_d1_private_git_blob_never_leaks() {
         "0 leak: the private blob never surfaces"
     );
 
-    // Even a trigram substring of the SECRET-only content never surfaces the private blob.
     let q = trigram_query("classified");
     let conjunction = q
         .iter()
@@ -347,7 +278,6 @@ fn srch_d1_private_git_blob_never_leaks() {
         "0 leak: a substring unique to the private blob never surfaces it for an unauthorized viewer"
     );
 
-    // The chained grant: the viewer is now a member of secret-repo → the private blob becomes visible.
     let acl_granted = AclFilter::ids([visible, private]);
     let granted = ix
         .search_ft(&tenant(), &region(), &acl_granted, "zarquonreactor", 10)
@@ -363,16 +293,8 @@ fn srch_d1_private_git_blob_never_leaks() {
     );
 }
 
-// ----------------------------------------------------------------------------------------------
-// 3. SRCH-D3 (F2) — cross-tenant IDOR = 0 on the REAL Git corpus
-// ----------------------------------------------------------------------------------------------
-
-/// **SRCH-D3 (F2) re-confirmed on the Git corpus: a viewer's tenant partitions the index — a query
-/// against a DIFFERENT tenant's index sees 0 of this tenant's blobs (the per-tenant index, §3.4).**
 #[test]
 fn srch_d3_cross_tenant_git_blobs_do_not_leak() {
-    // Two tenants index a blob under a COLLIDING repo:path namespace, so only the partition key
-    // (tenant, region) keeps them apart — not a lucky id difference.
     let acme_blob = "myelin://acme/git/blob/shared:main:src/main.rs";
     let evil_blob = "myelin://evil/git/blob/shared:main:src/main.rs";
     let fetcher = Arc::new(GitFetcher::default());
@@ -387,7 +309,6 @@ fn srch_d3_cross_tenant_git_blobs_do_not_leak() {
     let acme_t = TenantId("acme".into());
     let evil_t = TenantId("evil".into());
 
-    // Positive control: acme's viewer querying acme's index sees acme's blob.
     let acme_hits = ix
         .search_ft(
             &acme_t,
@@ -402,8 +323,6 @@ fn srch_d3_cross_tenant_git_blobs_do_not_leak() {
         "acme sees its own blob"
     );
 
-    // The cross-tenant attack: even with an allow-set NAMING the evil blob's doc-id, querying ACME's
-    // partition returns 0 — the evil blob lives in a DIFFERENT (tenant, region) index entirely.
     let cross = ix
         .search_ft(
             &acme_t,
@@ -418,7 +337,6 @@ fn srch_d3_cross_tenant_git_blobs_do_not_leak() {
         "0 cross-tenant: acme's index holds none of evil's blobs"
     );
 
-    // And the evil tenant's index, conversely, holds only evil's blob.
     let evil_hits = ix
         .search_ft(
             &evil_t,

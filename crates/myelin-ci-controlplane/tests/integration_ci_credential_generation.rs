@@ -1,22 +1,3 @@
-//! **Live-PostgreSQL proof for CT-007's phase-credential generations.**
-//!
-//! Everything here runs against the REAL migration set, the REAL production SQL constants, and a
-//! REAL Identity (PASETO + S7) minter — never a stub that merely returns a string.
-//!
-//! The properties proven:
-//! 1. exact retry returns ONE durable row and an identical generation id, JTI, anchor, expiry, TTL,
-//!    and bearer;
-//! 2. concurrent same-purpose mints (a genuine two-connection barrier drill) produce exactly one row;
-//! 3. an expired same-purpose generation REFUSES rather than rotating;
-//! 4. every divergent claim fact refuses BEFORE Identity is ever invoked;
-//! 5. out-of-order purposes, the full journal-status matrix (including `sealed_ceiling`), a missing
-//!    parent attempt, a lapsed execution lease, an expired claim, and a non-`leased` state all refuse;
-//! 6. appending a successor instantly retires its predecessor at the durable execution gate
-//!    (stale-generation replay after supersession), and a requeue retires everything;
-//! 7. an Identity-success/DB-rollback orphan cannot pass the durable phase gate;
-//! 8. the V1 production pin refuses every phase mint, and V2 is an explicit opt-in;
-//! 9. the workload V2 launch CAS requires the current `workload` generation;
-//! 10. RLS isolates the credential log across tenants.
 #![cfg(feature = "integration")]
 
 mod common;
@@ -56,15 +37,12 @@ use myelin_storage::{reserve_settle_durable_migrations, HotTables, PgMigrator};
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool, Row};
 
-/// Independent `PgMigrator` sequences against the same live PostgreSQL deadlock on the migration
-/// advisory lock when run concurrently — the same guard `integration_ci_lease_topology` uses.
 static MIGRATION_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const TENANT: &str = "phase-credential";
 const REGION: &str = "fr-par";
 const REPO_REF: &str = "myelin://phase-credential/git/repo/core";
 const COMMIT_OID: &str = "deadbeef00deadbeef00deadbeef00deadbeef00";
-/// timeout 120s, checkout-bearing → `4 * (120 + 600)`.
 const WINDOW_SECS: i64 = 4 * (120 + 600);
 
 fn app_url() -> String {
@@ -94,15 +72,10 @@ async fn pinned_pool(url: &str, schema: &str) -> PgPool {
         .expect("connect to live PostgreSQL (is the dev stack up?)")
 }
 
-/// A pool whose connections carry a unique `application_name`, so `pg_stat_activity` can identify
-/// exactly WHICH backend is lock-waiting rather than "some backend touching job_queue". Mirrors the
-/// definition-cutover drills' convention.
 async fn tagged_pool(url: &str, schema: &str, application_name: &str) -> PgPool {
     tagged_pool_capped(url, schema, application_name, 4).await
 }
 
-/// Like [`tagged_pool`] but with an explicit connection cap (a ONE-connection pool is how the
-/// cancellation drill proves a leaked transaction would reach the next borrower).
 async fn tagged_pool_capped(
     url: &str,
     schema: &str,
@@ -134,7 +107,6 @@ async fn tagged_pool_capped(
         .expect("connect the tagged pool")
 }
 
-/// Poll until a backend carrying EXACTLY `application_name` is blocked on a lock. Returns its pid.
 async fn await_lock_waiter(observer: &PgPool, application_name: &str) -> i32 {
     for _ in 0..400 {
         if let Some(pid) = sqlx::query_scalar::<_, i32>(
@@ -176,13 +148,6 @@ fn checkout_scope() -> myelin_ci_sandbox::CheckoutAuthorizationScope {
     .unwrap()
 }
 
-// =================================================================================================
-// The Identity seam under test, wrapped so a test can prove a refusal happened BEFORE any mint.
-// =================================================================================================
-
-/// A REAL Identity minter (PASETO signer + S7 revocation store) that also counts invocations. Every
-/// "refuses before Identity" assertion reads this counter — a refusal that merely produced an error
-/// AFTER signing would still have created a live S7 token.
 struct CountingPhaseMinter {
     inner: IdentityCiJobCredentialMinter,
     calls: Arc<AtomicUsize>,
@@ -199,9 +164,6 @@ impl CiPhaseCredentialMinter for CountingPhaseMinter {
     }
 }
 
-/// A real Identity minter that BLOCKS its first invocation. Because the store calls Identity while
-/// still holding the `job_queue` row lock and the per-job advisory lock, blocking here parks a mint
-/// transaction in exactly the state a concurrent racer must contend with.
 struct BlockingPhaseMinter {
     inner: IdentityCiJobCredentialMinter,
     entered: Arc<tokio::sync::Notify>,
@@ -256,18 +218,11 @@ fn store(
     )
 }
 
-// =================================================================================================
-// Fixture.
-// =================================================================================================
-
 struct Fixture {
     claim: CiJobTokenRequest,
     reserve_handle: String,
 }
 
-/// One complete, live, checkout-bearing leased generation: reservation, `ci_run`, immutable
-/// manifest, durable `ci_job_spec`, the public `ci_job` surface row, and a `job_queue` row leased
-/// with a topology-sized claim window and a live execution lease.
 async fn seed_fixture(app: &PgPool, admin: &PgPool, seed: u64, claim_age_secs: i64) -> Fixture {
     let ci_run_id = uuid(0x10, seed);
     let wf_run_id = uuid(0x20, seed);
@@ -507,7 +462,6 @@ async fn seed_fixture(app: &PgPool, admin: &PgPool, seed: u64, claim_age_secs: i
     }
 }
 
-/// Admit the exact durable parent attempt this claim's execution gates require.
 async fn admit_parent(admin: &PgPool, fixture: &Fixture) {
     sqlx::query(
         "INSERT INTO ci_job_parent_attempt (
@@ -532,8 +486,6 @@ async fn admit_parent(admin: &PgPool, fixture: &Fixture) {
     .unwrap();
 }
 
-/// Write one prelaunch journal phase row directly, so the journal-status matrix can be driven
-/// exhaustively without running the real Hop A/B.
 async fn set_phase(admin: &PgPool, fixture: &Fixture, phase: &str, status: &str) {
     let (exact, resolved) = match status {
         "started" => (None, None),
@@ -569,10 +521,6 @@ async fn set_phase(admin: &PgPool, fixture: &Fixture, phase: &str, status: &str)
     .unwrap();
 }
 
-/// Insert a `started` `checkout_transport` journal row whose `seal_after` deadline is ALREADY
-/// overdue, so the production topology-deadline sealer will pick it up on the next sweep. The
-/// deadline column is immutable (a transition-guard trigger), so it must be seeded overdue at insert
-/// time rather than updated afterwards.
 async fn insert_overdue_started_transport(admin: &PgPool, fixture: &Fixture) {
     sqlx::query(
         "INSERT INTO ci_job_prelaunch_usage (
@@ -592,7 +540,6 @@ async fn insert_overdue_started_transport(admin: &PgPool, fixture: &Fixture) {
     .unwrap();
 }
 
-/// The current status of one journal phase (or `None` if absent).
 async fn phase_status(admin: &PgPool, fixture: &Fixture, phase: &str) -> Option<String> {
     sqlx::query_scalar::<_, String>(
         "SELECT status FROM ci_job_prelaunch_usage
@@ -610,8 +557,6 @@ async fn phase_status(admin: &PgPool, fixture: &Fixture, phase: &str) -> Option<
     .unwrap()
 }
 
-/// Try to lock the exact `job_queue` row `FOR UPDATE NOWAIT` from a fresh admin connection.
-/// `Ok(true)` = the lock was free (nothing retained it); `Ok(false)` = it is currently held.
 async fn queue_row_lockable(admin: &PgPool, fixture: &Fixture) -> bool {
     match sqlx::query_scalar::<_, i32>(
         "SELECT 1 FROM job_queue
@@ -636,8 +581,6 @@ async fn queue_row_lockable(admin: &PgPool, fixture: &Fixture) -> bool {
     }
 }
 
-/// Drive the complete phase sequence to a live `workload` generation: parent admitted, both journal
-/// phases measured, all four credentials minted in order.
 async fn mint_full_sequence(
     store: &CiJobCredentialGenerationStore,
     admin: &PgPool,
@@ -708,8 +651,6 @@ async fn generation_rows(admin: &PgPool, fixture: &Fixture) -> Vec<(String, i16,
     .collect()
 }
 
-/// Recompute the generation id/JTI a mint WOULD have produced for these exact inputs — used both to
-/// pre-seed an expired row and to name the orphan generation an aborted mint would have created.
 fn expected_generation(
     claim: &CiJobTokenRequest,
     purpose: CiCredentialPurpose,
@@ -826,10 +767,6 @@ async fn migrated_schema(tag: &str) -> (String, PgPool, PgPool, PgPool) {
     (schema, bootstrap, admin, app)
 }
 
-// =================================================================================================
-// 1. Determinism, ordering, supersession, and the journal matrix.
-// =================================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fractional_claim_epoch_is_floored_and_the_real_credential_seam_issues() {
     let (schema, bootstrap, admin, app) = migrated_schema("fractional_claim_epoch").await;
@@ -851,10 +788,6 @@ async fn fractional_claim_epoch_is_floored_and_the_real_credential_seam_issues()
         .await
         .unwrap();
 
-        // Re-present the complete fixture to the REAL region scheduler so CLAIM_QUERY, rather than
-        // test-side epoch arithmetic, creates and extracts the claim generation. Start the claim in
-        // the latter half of a PostgreSQL second: a bare numeric -> bigint cast rounds this durable
-        // timestamp up, while the credential issuance clock below floors the same second.
         sqlx::query(
             "UPDATE job_queue
              SET state = 'queued', lease_owner = NULL, lease_expires = NULL,
@@ -868,9 +801,6 @@ async fn fractional_claim_epoch_is_floored_and_the_real_credential_seam_issues()
         .await
         .unwrap();
 
-        // Put CLAIM_QUERY safely inside [.50, .60), leaving nearly half a second for the real mint
-        // transaction. Verify the persisted timestamp rather than trusting client scheduling; retry
-        // the claim if a heavily loaded host misses the window.
         let scheduler = ci_region_queue_store_test_support(admin.clone());
         let (leased, exact_started_epoch) = loop {
             let fraction: f64 = sqlx::query_scalar::<_, String>(
@@ -971,7 +901,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         let fixture = seed_fixture(&app, &admin, 1, 5).await;
         let claim = &fixture.claim;
 
-        // ---- advertise: the resolver's first mint, BEFORE the parent attempt exists ----
         let advertise = store
             .mint_phase_credential(claim, CiCredentialPurpose::CheckoutAdvertise)
             .await
@@ -985,7 +914,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         );
         assert!(advertise.binding.generation_id.starts_with("ci-credential:v1:"));
 
-        // ---- EXACT retry: one row, identical everything, identical bearer ----
         let replay = store
             .mint_phase_credential(claim, CiCredentialPurpose::CheckoutAdvertise)
             .await
@@ -998,7 +926,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
             "an acknowledgement-loss retry reproduces the IDENTICAL bearer"
         );
 
-        // ---- out of order: fetch has no parent/journal yet ----
         assert_eq!(
             store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutFetch).await.unwrap_err(),
             CiCredentialGenerationError::MissingParentAttempt
@@ -1009,7 +936,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
             CiCredentialGenerationError::JournalPredicateUnmet,
             "fetch requires checkout_transport = started"
         );
-        // Skipping a purpose is refused outright.
         assert_eq!(
             store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutMaterialization).await.unwrap_err(),
             CiCredentialGenerationError::OutOfOrderGeneration
@@ -1019,7 +945,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
             CiCredentialGenerationError::OutOfOrderGeneration
         );
 
-        // ---- the advertise credential's execution gate: parent + started transport ----
         let advertise_gate = gate_for(claim, CiCredentialPurpose::CheckoutAdvertise, &advertise);
         assert!(
             !verify_phase_generation_live(&app, &advertise_gate).await.unwrap(),
@@ -1031,7 +956,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
             "advertise is usable once the parent and journal phase exist"
         );
 
-        // ---- fetch ----
         let fetch = store
             .mint_phase_credential(claim, CiCredentialPurpose::CheckoutFetch)
             .await
@@ -1040,8 +964,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         assert_ne!(fetch.binding.generation_id, advertise.binding.generation_id);
         assert_ne!(fetch.credential.jti, advertise.credential.jti);
 
-        // **Stale-generation replay after supersession.** Appending fetch retired advertise at the
-        // durable gate, in the same commit — with no revocation write anywhere.
         assert!(
             !verify_phase_generation_live(&app, &advertise_gate).await.unwrap(),
             "the advertise generation is retired the moment fetch is appended"
@@ -1049,13 +971,11 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         assert!(verify_phase_generation_live(&app, &gate_for(claim, CiCredentialPurpose::CheckoutFetch, &fetch))
             .await
             .unwrap());
-        // And a superseded purpose can never be minted again, even as a "retry".
         assert_eq!(
             store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutAdvertise).await.unwrap_err(),
             CiCredentialGenerationError::OutOfOrderGeneration
         );
 
-        // ---- materialization: transport measured, materialization started ----
         assert_eq!(
             store.mint_phase_credential(claim, CiCredentialPurpose::CheckoutMaterialization).await.unwrap_err(),
             CiCredentialGenerationError::JournalPredicateUnmet
@@ -1072,7 +992,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
             .await
             .expect("materialization mints");
 
-        // ---- workload: both journal rows measured ----
         assert_eq!(
             store.mint_phase_credential(claim, CiCredentialPurpose::Workload).await.unwrap_err(),
             CiCredentialGenerationError::JournalPredicateUnmet
@@ -1083,7 +1002,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
             .await
             .expect("workload mints once both phases are measured");
 
-        // ---- exactly four rows, one per purpose, in ordinal order ----
         let rows = generation_rows(&admin, &fixture).await;
         assert_eq!(
             rows.iter().map(|row| (row.0.as_str(), row.1)).collect::<Vec<_>>(),
@@ -1095,7 +1013,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         let unique_jtis: std::collections::BTreeSet<&String> = rows.iter().map(|row| &row.3).collect();
         assert_eq!(unique_jtis.len(), 4, "every expected JTI is distinct");
 
-        // Every preparation credential is now retired at the durable gate; only workload is current.
         for (purpose, minted) in [
             (CiCredentialPurpose::CheckoutAdvertise, &advertise),
             (CiCredentialPurpose::CheckoutFetch, &fetch),
@@ -1107,7 +1024,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
             );
         }
 
-        // ---- the workload V2 launch CAS requires exactly the current workload generation ----
         let queue = ci_job_queue_store(app.clone());
         let launch_claim = CiJobLaunchClaim {
             tenant_id: claim.tenant_id.clone(),
@@ -1120,14 +1036,12 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
             claim_started_at_epoch_secs: claim.claim_started_at_epoch_secs,
             claim_expires_at_epoch_secs: claim.claim_expires_at_epoch_secs,
         };
-        // A PREPARATION generation presented at the workload CAS matches nothing.
         let mut substituted = gate_for(claim, CiCredentialPurpose::Workload, &materialization);
         substituted.purpose = CiCredentialPurpose::Workload;
         assert!(
             !queue.authorize_launch_v2(&launch_claim, &substituted).await.unwrap(),
             "a materialization generation cannot drive the workload launch CAS"
         );
-        // The exact current workload generation wins.
         let workload_gate = gate_for(claim, CiCredentialPurpose::Workload, &workload);
         assert!(queue.authorize_launch_v2(&launch_claim, &workload_gate).await.unwrap());
         let state: String = sqlx::query_scalar(
@@ -1140,7 +1054,6 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
         .await
         .unwrap();
         assert_eq!(state, "running");
-        // And it is one-shot: the row is no longer `leased`.
         assert!(!queue.authorize_launch_v2(&launch_claim, &workload_gate).await.unwrap());
 
         assert!(calls.load(Ordering::SeqCst) >= 4, "each accepted mint invoked the REAL Identity seam");
@@ -1148,28 +1061,17 @@ async fn the_phase_sequence_is_ordered_replay_stable_and_bounded_to_four_generat
     .await;
 }
 
-// =================================================================================================
-// 2. Concurrency: a real two-connection barrier drill.
-// =================================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_same_purpose_mints_produce_exactly_one_durable_row() {
     let (schema, bootstrap, admin, app) = migrated_schema("race").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         let fixture = Arc::new(seed_fixture(&app, &admin, 2, 5).await);
 
-        // Round-1 major 4: the earlier drill barriered BEFORE either task acquired a connection, so
-        // it could pass entirely sequentially. This one BLOCKS the first mint inside its Identity
-        // call — at which point it is holding the `job_queue` row lock `FOR UPDATE` and the per-job
-        // advisory lock — then starts the second mint on its own tagged connection and PROVES, via
-        // `pg_stat_activity`, that the second backend is genuinely lock-waiting before releasing.
         let a_tag = format!("myelin-cred-mint-a-{}", std::process::id());
         let b_tag = format!("myelin-cred-mint-b-{}", std::process::id());
         let a_pool = tagged_pool(&app_url(), &schema, &a_tag).await;
         let b_pool = tagged_pool(&app_url(), &schema, &b_tag).await;
 
-        // ONE Identity signer + S7 store shared by both racers: a determinism claim about the
-        // returned bearer is only meaningful if both sides could actually have produced it.
         let s7 = RevocationStore::new();
         let cell = Arc::new(CellTokenAuthority::from_seed(&[31_u8; 32], &[32_u8; 32]).unwrap());
         let identity = RunTokenMinter::with_signer_and_tuples(
@@ -1202,7 +1104,6 @@ async fn concurrent_same_purpose_mints_produce_exactly_one_durable_row() {
             CiJobCredentialWriteVersion::V2PhaseBound,
         ));
 
-        // A: enters the locked transaction and parks inside Identity.
         let a_fixture = fixture.clone();
         let a_store = store_a.clone();
         let racer_a = tokio::spawn(async move {
@@ -1212,7 +1113,6 @@ async fn concurrent_same_purpose_mints_produce_exactly_one_durable_row() {
         });
         entered.notified().await;
 
-        // B: starts only once A is provably holding the locks.
         let b_fixture = fixture.clone();
         let b_store = store_b.clone();
         let racer_b = tokio::spawn(async move {
@@ -1221,7 +1121,6 @@ async fn concurrent_same_purpose_mints_produce_exactly_one_durable_row() {
                 .await
         });
 
-        // B's OWN backend must be blocked on a lock — not merely "slower".
         let observer = pinned_pool(&admin_url(), &schema).await;
         let waiting_pid = await_lock_waiter(&observer, &b_tag).await;
         let blocked_on_queue: bool = sqlx::query_scalar(
@@ -1235,7 +1134,6 @@ async fn concurrent_same_purpose_mints_produce_exactly_one_durable_row() {
             blocked_on_queue,
             "the second mint must block on the FIRST mint's job_queue row lock"
         );
-        // Nothing is committed while A is parked.
         assert_eq!(
             generation_rows(&admin, &fixture).await.len(),
             0,
@@ -1271,11 +1169,6 @@ async fn concurrent_same_purpose_mints_produce_exactly_one_durable_row() {
     .await;
 }
 
-/// **Round-1 blocker 1: the retained preparation gate really holds the row through the child-release
-/// boundary.** While ownership is held, a concurrent requeue BLOCKS (proved via `pg_stat_activity`,
-/// not by timing); revalidation under the held lock still succeeds; and once released, the requeue
-/// lands and the generation is refused — so there is no window in which a child could be released
-/// under a generation that has already been invalidated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn retained_phase_ownership_blocks_a_concurrent_requeue_until_release() {
     let (schema, bootstrap, admin, app) = migrated_schema("ownership").await;
@@ -1295,14 +1188,11 @@ async fn retained_phase_ownership_blocks_a_concurrent_requeue_until_release() {
             &advertise,
         );
 
-        // Take retained ownership — this is what a committed `LaunchPermit` holds while the child is
-        // mechanically blocked at the launch gate.
         let mut owned = acquire_phase_generation_ownership(&app, &gate)
             .await
             .unwrap()
             .expect("the current generation grants ownership");
 
-        // A concurrent reaper-style requeue on its own tagged backend.
         let reaper_tag = format!("myelin-cred-reaper-{}", std::process::id());
         let reaper_pool = tagged_pool(&admin_url(), &schema, &reaper_tag).await;
         let job_id = fixture.claim.job_id.clone();
@@ -1335,8 +1225,6 @@ async fn retained_phase_ownership_blocks_a_concurrent_requeue_until_release() {
             "the requeue must block on the retained FOR SHARE row lock"
         );
 
-        // The generation is still verifiably current WHILE the requeue waits — this is exactly the
-        // guarantee a released child depends on.
         owned
             .validate()
             .await
@@ -1356,14 +1244,12 @@ async fn retained_phase_ownership_blocks_a_concurrent_requeue_until_release() {
             "the requeue cannot have landed while ownership is held"
         );
 
-        // Release (the post-gate release) — only now may the requeue proceed.
         owned.release().await.expect("ownership releases cleanly");
         assert_eq!(
             requeue.await.unwrap().expect("the requeue eventually runs"),
             1
         );
 
-        // And afterwards the generation is refused: a NEW acquisition attempt spawns nothing.
         assert!(
             acquire_phase_generation_ownership(&app, &gate)
                 .await
@@ -1375,8 +1261,6 @@ async fn retained_phase_ownership_blocks_a_concurrent_requeue_until_release() {
     .await;
 }
 
-/// The other direction of the same race: when the requeue wins FIRST, acquisition simply refuses —
-/// there is no stale spawn, and the refusal costs no lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_requeue_that_wins_first_makes_phase_ownership_unacquirable() {
     let (schema, bootstrap, admin, app) = migrated_schema("ownership_lost").await;
@@ -1411,8 +1295,6 @@ async fn a_requeue_that_wins_first_makes_phase_ownership_unacquirable() {
             .unwrap()
             .is_none());
 
-        // The workload purpose may never route through the preparation gate at all: that would
-        // authorize a spawn without ever running the launch CAS.
         let mut workload_gate = gate.clone();
         workload_gate.purpose = CiCredentialPurpose::Workload;
         assert_eq!(
@@ -1425,10 +1307,6 @@ async fn a_requeue_that_wins_first_makes_phase_ownership_unacquirable() {
     .await;
 }
 
-// =================================================================================================
-// 3. Expiry never rotates; the write-version pin; divergent claim facts.
-// =================================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expired_generation_refuses_rather_than_rotating_and_v1_refuses_everything() {
     let (schema, bootstrap, admin, app) = migrated_schema("expiry").await;
@@ -1437,7 +1315,6 @@ async fn an_expired_generation_refuses_rather_than_rotating_and_v1_refuses_every
         let fixture = seed_fixture(&app, &admin, 3, 900).await;
         let claim = &fixture.claim;
 
-        // ---- the production pin refuses before touching the database at all ----
         let v1 = store(
             &app,
             minter.clone(),
@@ -1461,7 +1338,6 @@ async fn an_expired_generation_refuses_rather_than_rotating_and_v1_refuses_every
         assert_eq!(generation_rows(&admin, &fixture).await.len(), 0);
         assert_eq!(calls.load(Ordering::SeqCst), 0);
 
-        // ---- an already-expired generation refuses; it never rotates ----
         let now = chrono::Utc::now().timestamp();
         let issued = now - 400;
         let expires = now - 100;
@@ -1531,8 +1407,6 @@ async fn every_divergent_claim_fact_refuses_before_identity_is_invoked() {
         let fixture = seed_fixture(&app, &admin, 4, 5).await;
 
         type Mutation = (&'static str, fn(&mut CiJobTokenRequest));
-        // Round-1 minor 6: the matrix now covers EVERY identity field the mint binds, including
-        // tenant, region, job id, and idem token.
         let mutations: [Mutation; 12] = [
             ("tenant", |c| c.tenant_id = "some-other-tenant".into()),
             ("region", |c| c.region = "eu-west".into()),
@@ -1571,7 +1445,6 @@ async fn every_divergent_claim_fact_refuses_before_identity_is_invoked() {
             );
         }
 
-        // A lapsed EXECUTION lease refuses even though the claim window is still open.
         sqlx::query(
             "UPDATE job_queue SET lease_expires = statement_timestamp() - interval '1 second'
              WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -1601,7 +1474,6 @@ async fn every_divergent_claim_fact_refuses_before_identity_is_invoked() {
         .await
         .unwrap();
 
-        // A cancelled public surface refuses.
         sqlx::query(
             "UPDATE ci_job SET state = 'cancelled'
              WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -1630,7 +1502,6 @@ async fn every_divergent_claim_fact_refuses_before_identity_is_invoked() {
         .await
         .unwrap();
 
-        // A `running` (already-launched) row refuses a PREPARATION mint outright.
         sqlx::query(
             "UPDATE job_queue SET state = 'running'
              WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -1659,10 +1530,6 @@ async fn every_divergent_claim_fact_refuses_before_identity_is_invoked() {
     .await;
 }
 
-// =================================================================================================
-// 4. Requeue, the Identity-success/DB-rollback orphan, and RLS.
-// =================================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_requeue_retires_every_credential_and_refuses_every_further_mint() {
     let (schema, bootstrap, admin, app) = migrated_schema("requeue").await;
@@ -1684,7 +1551,6 @@ async fn a_requeue_retires_every_credential_and_refuses_every_further_mint() {
         );
         assert!(verify_phase_generation_live(&app, &gate).await.unwrap());
 
-        // The reaper's requeue: the exact generation is gone.
         sqlx::query(
             "UPDATE job_queue
              SET state = 'queued', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL
@@ -1708,16 +1574,11 @@ async fn a_requeue_retires_every_credential_and_refuses_every_further_mint() {
                 .is_err(),
             "a post-requeue mint refuses"
         );
-        // The old audit row survives — the log is append-only and never cleaned by the reaper.
         assert_eq!(generation_rows(&admin, &fixture).await.len(), 1);
     })
     .await;
 }
 
-/// **Identity succeeded, then the durable transaction rolled back.** A `DEFERRABLE INITIALLY
-/// DEFERRED` constraint trigger raises at COMMIT — i.e. strictly AFTER the insert AND after the
-/// Identity mint — reproducing the exact orphan the design names. The S7 token is genuinely live;
-/// the point is that it has no committed generation row and therefore cannot pass any phase gate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_identity_success_with_a_rolled_back_transaction_leaves_an_unusable_orphan() {
     let (schema, bootstrap, admin, app) = migrated_schema("orphan").await;
@@ -1757,8 +1618,6 @@ async fn an_identity_success_with_a_rolled_back_transaction_leaves_an_unusable_o
             "no generation row committed"
         );
 
-        // The orphan S7 token names a generation that does not exist durably. Even with the exact
-        // parent and journal state in place, no phase gate can accept it.
         admit_parent(&admin, &fixture).await;
         set_phase(&admin, &fixture, "checkout_transport", "started").await;
         let now = chrono::Utc::now().timestamp();
@@ -1810,7 +1669,6 @@ async fn the_credential_log_is_tenant_isolated_and_structurally_immutable() {
         let fixture = seed_fixture(&app, &admin, 7, 5).await;
         store.mint_phase_credential(&fixture.claim, CiCredentialPurpose::CheckoutAdvertise).await.unwrap();
 
-        // FORCE-RLS: the owning tenant sees its row; another tenant sees nothing.
         for (tenant, expected) in [(TENANT, 1_i64), ("some-other-tenant", 0)] {
             let mut connection = app.acquire().await.unwrap();
             sqlx::query("SELECT set_config('myelin.tenant_id', $1, false), set_config('myelin.region', $2, false)")
@@ -1826,7 +1684,6 @@ async fn the_credential_log_is_tenant_isolated_and_structurally_immutable() {
             assert_eq!(visible, expected, "tenant {tenant} visibility");
         }
 
-        // UPDATE/DELETE are revoked from the app role AND blocked by the immutability trigger.
         let update = sqlx::query(
             "UPDATE ci_job_credential_generation SET jti = 'tampered'
              WHERE tenant_id = $1 AND region = $2",
@@ -1857,7 +1714,6 @@ async fn the_credential_log_is_tenant_isolated_and_structurally_immutable() {
             Some("P0001")
         );
 
-        // The purpose-to-ordinal CHECK is real, not merely a Rust convention.
         let forged = sqlx::query(
             "INSERT INTO ci_job_credential_generation (
                tenant_id, region, job_id, wf_run_id, ci_run_id, token_authority_handle, idem_token,
@@ -1889,9 +1745,6 @@ async fn the_credential_log_is_tenant_isolated_and_structurally_immutable() {
     .await;
 }
 
-/// **The `sealed_ceiling` half of the journal-status matrix.** A phase the reaper sealed (rather
-/// than the worker measuring) never satisfies any downstream purpose, and instantly retires the
-/// credential whose own boundary required that phase to be `started`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sealed_ceiling_phase_satisfies_no_purpose_and_retires_its_own_credential() {
     let (schema, bootstrap, admin, app) = migrated_schema("sealed").await;
@@ -1913,7 +1766,6 @@ async fn a_sealed_ceiling_phase_satisfies_no_purpose_and_retires_its_own_credent
         );
         assert!(verify_phase_generation_live(&app, &gate).await.unwrap());
 
-        // The reaper seals the abandoned phase at its ceiling.
         sqlx::query(
             "UPDATE ci_job_prelaunch_usage
              SET status = 'sealed_ceiling', resolved_at = statement_timestamp()
@@ -1954,21 +1806,9 @@ async fn a_sealed_ceiling_phase_satisfies_no_purpose_and_retires_its_own_credent
     .await;
 }
 
-/// **Activation surface — exact allowed occurrences across BOTH crates.**
-///
-/// The earlier version scanned only `myelin-ci-controlplane/src`, excluded the four defining modules
-/// wholesale, and never looked at `myelin-ci-sandbox` at all — so an activation added inside an
-/// excluded module or anywhere in the sandbox would have stayed green.
-///
-/// This version walks the PRODUCTION source of both crates (each file truncated at its top-level
-/// test module) and pins the exact number of occurrences of every activation marker, per file. Any
-/// new occurrence ANYWHERE — including inside a defining module — fails, so a future activation goes
-/// red and has to be an explicit, reviewed edit to this table.
 #[test]
 fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
-    /// Every token that would constitute reaching (or composing) the dormant V2 surface.
     const MARKERS: [&str; 22] = [
-        // control plane
         "mint_phase_credential(",
         "authorize_workload_v2_retained(",
         "authorize_checkout_advertise_retained(",
@@ -1979,21 +1819,13 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         "acquire_phase_generation_ownership(",
         "V2PhaseBound",
         "CiJobCredentialGenerationStore",
-        // CT-007 5b.3-6e.2: the V2 composition FAÇADE is activated only through the named wiring
-        // root. These markers pin that exact surface and reject any second composition path.
         "V2CheckoutComposition",
         "v2_phase_credential_store(",
         "mint_initial_phase_credential(",
         "parent_attempt_reserve_hook(",
-        // CT-007 5b.3-6e.1: the activation-chassis SELECTORS. These are BARE symbols (no leading `.`
-        // and no trailing `(`), so the scan catches BOTH method-call `x.with_checkout_config(y)` AND
-        // UFCS `GvisorBackend::with_checkout_config(x, y)` forms (Sol's 6e.1 major 2). Selecting a
-        // checkout config, the readiness predicate, or the production readiness probe from ANY
-        // composition root is exactly what these trip on.
         "with_checkout_config",
         "with_activation_readiness",
         "ActivationReadinessProbe::production",
-        // sandbox
         "authorize_checkout_phase(",
         "with_checkout_phase_authorization(",
         "fetch_checkout_pack_within_parent_attempt_v2(",
@@ -2001,12 +1833,7 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         "PhaseAuthorization",
     ];
 
-    /// `(crate, file, marker) -> exact allowed occurrence count` in PRODUCTION source. Everything
-    /// absent from this table must have ZERO occurrences.
-    /// `(crate, file, marker) -> exact allowed CODE occurrence count` in PRODUCTION source.
-    /// Everything absent from this table must have ZERO occurrences in EITHER crate.
     const ALLOWED: [(&str, &str, &str, usize); 84] = [
-        // --- the definition sites ---
         (
             "myelin-ci-controlplane",
             "ci_credential_generation.rs",
@@ -2085,25 +1912,12 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "CiJobCredentialGenerationStore",
             1,
         ),
-        // CT-007 slice 5b.3-6e.2 Stage A: the protocol DESCRIPTOR records the production credential
-        // writer choice `V2PhaseBound` ONCE, as a dormant `pub const`. No production root reads it
-        // until the atomic Stage B activation (which also adds this file to the definition hash), so
-        // this is a definition-only occurrence, NOT a composition — the composition-root zeros stay
-        // zero.
         (
             "myelin-ci-controlplane",
             "ci_pipeline_protocol.rs",
             "V2PhaseBound",
             1,
         ),
-        // CT-007 5b.3-6d STEP 3: the DORMANT control-plane composition module. It is the real
-        // durable backing for the sandbox `AttemptAuthority`/resolver seam — a NEW definition site,
-        // NOT a composition root (no production root constructs `V2CheckoutComposition`, and
-        // production `RunnerHooks` never install its parent-attempt reserve hook), so the
-        // composition-root zeros below stay zero. `V2PhaseBound` (the phase-store factory) x1,
-        // `CiJobCredentialGenerationStore` (import + factory return + factory body + the two durable-
-        // authority struct fields) x5, `mint_phase_credential(` (the initial resolver mint + the
-        // per-generation mint + the `AttemptAuthority` trait method) x3.
         (
             "myelin-ci-controlplane",
             "ci_checkout_composition.rs",
@@ -2122,11 +1936,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "mint_phase_credential(",
             3,
         ),
-        // CT-007 5b.3-6d STEP 3: the composition-façade DEFINITION sites (all in the dormant module).
-        // `V2CheckoutComposition` = the struct def + its `impl` block; `v2_phase_credential_store(` =
-        // the factory def + its one call inside `V2CheckoutComposition::new`; the resolver seam and the
-        // reserve-hook constructor are each defined once. These are the exact symbols whose appearance
-        // in ANY composition root below means the V2 checkout path was activated.
         (
             "myelin-ci-controlplane",
             "ci_checkout_composition.rs",
@@ -2151,8 +1960,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "parent_attempt_reserve_hook(",
             1,
         ),
-        // ...and EXPLICITLY ZERO in every production composition root: constructing the façade, minting
-        // the initial credential, or installing the reserve hook from any of these turns the scan RED.
         (
             "myelin-ci-controlplane",
             "ci_runtime_composition.rs",
@@ -2177,14 +1984,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "parent_attempt_reserve_hook(",
             0,
         ),
-        // CT-007 slice 5b.3-6e.2 Stage A: `ci_runner_v2_wiring` is the DORMANT V2 runner composition
-        // root. It CONSTRUCTS the façade (`V2CheckoutComposition` x2 = the resolver's arg + the hooks'
-        // arg, one shared value), installs the ONE parent-attempt reserve hook (compute AND checkout),
-        // the per-phase checkout authorization, and the workload/advertise/fetch/materialization
-        // retained authorizers. It is a NEW definition site, NOT selected by any production root —
-        // `main.rs` / `ci_runtime_composition.rs` / `lib.rs` stay ZERO (the atomic Stage B flip points
-        // `main` here). The V2 resolver seam lives in `runner_bind.rs`: it names the composition type
-        // (its one param) once and calls `mint_initial_phase_credential` once.
         (
             "myelin-ci-controlplane",
             "ci_runner_composition.rs",
@@ -2323,22 +2122,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "fetch_checkout_pack_within_parent_attempt_v2(",
             1,
         ),
-        // CT-007 5b.3-6a (Sol's r4): the capsule + reshaped Hop B entry relocated to the dedicated
-        // `gvisor/checkout_runtime.rs` submodule so module privacy enforces field inseparability.
-        // `run_checkout_preparation_v2(` and one `PhaseAuthorization` (the v2 signature) moved with it;
-        // the submodule also imports `PhaseAuthorization` (its own `use`), so its count is 2.
-        // CT-007 5b.3-6c: the DORMANT orchestrator + continuation (in gvisor.rs) now CALL the V2 phase
-        // surface — mint the advertise/fetch/materialization generations and run the fused Hop B — so
-        // gvisor.rs's `PhaseAuthorization` count is 10, it gains `mint_phase_credential` (advertise +
-        // fetch + materialization = 3) and one `run_checkout_preparation_v2(` call. The actual
-        // `authorize_checkout_phase(` calls live in the `checkout_orchestration::authorize_phase_generation`
-        // helper (Sol's finding 1: authorize the per-phase ROTATED spec), so gvisor.rs no longer calls it
-        // directly. These are dormant CALL sites in NON-composition-root modules (the outer orchestrator
-        // itself has zero production callers — see the sandbox dormancy pin
-        // `the_checkout_runtime_capsule_has_no_production_caller`), NOT a production activation. The
-        // composition-root zeros below stay zero.
-        // 11 (not 10): CT-007 5b.3-6c Sol's r4 finding-1 control inversion added the
-        // `prepare_materialization` closure whose return type names `PhaseAuthorization` once more.
         ("myelin-ci-sandbox", "gvisor.rs", "PhaseAuthorization", 11),
         (
             "myelin-ci-sandbox",
@@ -2352,10 +2135,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "run_checkout_preparation_v2(",
             1,
         ),
-        // CT-007 5b.3-6c: the sandbox-side capability vocabulary + the per-phase authorization helper.
-        // `mint_phase_credential(` is the `AttemptAuthority` trait method DEFINITION (1); the helper
-        // `authorize_phase_generation` holds the ONE `authorize_checkout_phase(` call site + one
-        // `PhaseAuthorization` in its return type — no control-plane dependency crosses the boundary.
         (
             "myelin-ci-sandbox",
             "checkout_orchestration.rs",
@@ -2380,9 +2159,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "run_checkout_preparation_v2(",
             1,
         ),
-        // 6e.2 S2: the third occurrence is the explicitly test-support-gated Hop-B seam consuming
-        // the real materialization authorization; the production-zero composition-root pins below
-        // remain unchanged.
         (
             "myelin-ci-sandbox",
             "gvisor/checkout_runtime.rs",
@@ -2396,7 +2172,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             1,
         ),
         ("myelin-ci-sandbox", "lib.rs", "PhaseAuthorization", 4),
-        // --- explicitly ZERO everywhere they could be composed into production ---
         (
             "myelin-ci-controlplane",
             "ci_runtime_composition.rs",
@@ -2440,8 +2215,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             0,
         ),
         ("myelin-ci-sandbox", "runner.rs", "PhaseAuthorization", 0),
-        // --- CT-007 5b.3-6e.1 activation-chassis selectors (Sol's major 2) ---
-        // Definition sites remain exactly once; activated calls are separately pinned below.
         ("myelin-ci-sandbox", "gvisor.rs", "with_checkout_config", 1),
         (
             "myelin-ci-controlplane",
@@ -2449,8 +2222,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
             "with_activation_readiness",
             1,
         ),
-        // Every root not named by the activation remains explicitly zero. The named activated roots
-        // carry exact nonzero counts, so an alternate selection turns the scan red.
         (
             "myelin-ci-controlplane",
             "main.rs",
@@ -2540,18 +2311,12 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     ];
 
     fn production_of(source: &str) -> &str {
-        // Split at the TOP-LEVEL test module specifically — several of these files carry inline
-        // `#[cfg(test)]` helpers far above it, and splitting on the bare attribute would truncate
-        // most of the production body and make the whole scan vacuous.
         match source.find("\n#[cfg(test)]\nmod tests {") {
             Some(end) => &source[..end],
             None => source,
         }
     }
 
-    /// Count CODE occurrences only: a doc/line comment naming a seam is documentation, not a call,
-    /// and pinning prose would make this table churn on every wording change while saying nothing
-    /// about reachability.
     fn code_occurrences(source: &str, marker: &str) -> usize {
         production_of(source)
             .lines()
@@ -2569,10 +2334,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     let mut scanned_files = 0_usize;
     let mut observed: std::collections::BTreeMap<(String, String, &str), usize> =
         std::collections::BTreeMap::new();
-    // Walk `src` RECURSIVELY (CT-007 5b.3-6a, Sol's r4: the checkout capsule now lives in the
-    // `gvisor/checkout_runtime.rs` submodule, so a non-recursive `read_dir` would leave it unscanned).
-    // The `name` is the path RELATIVE to `src` (e.g. "gvisor/checkout_runtime.rs"), so files directly
-    // in `src` keep their bare basenames.
     fn collect_rs(
         dir: &std::path::Path,
         base: &std::path::Path,
@@ -2627,7 +2388,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
          commit that composes it. If it is not, something reached the dormant surface."
     );
 
-    // The explicit zeroes are asserted separately so a typo in a file name cannot hide them.
     for (krate, file, marker, count) in ALLOWED {
         if count != 0 {
             continue;
@@ -2640,7 +2400,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
         );
     }
 
-    // Belt and braces: the four production accounting sites all select the V4 store explicitly.
     let composition = std::fs::read_to_string(
         workspace
             .join("myelin-ci-controlplane")
@@ -2652,12 +2411,6 @@ fn the_v2_phase_credential_surface_has_exactly_its_known_occurrences() {
     assert_eq!(code_occurrences(&composition, "with_pg_and_write_version"), 2);
 }
 
-/// **Round-1 blocker 3: the V2 workload CAS may never resurrect an expired execution lease.**
-///
-/// A workload credential minted moments before lease expiry, then presented AFTER expiry but before
-/// the reaper wins the row-lock race, must not transition the stale owner to `running` and install a
-/// fresh lease. The V2 CAS carries `lease_expires > statement_timestamp()` for exactly this; the
-/// byte-frozen legacy CAS deliberately does not, which is why the two queries are separate.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_v2_launch_cas_refuses_an_expired_execution_lease() {
     let (schema, bootstrap, admin, app) = migrated_schema("expired_lease").await;
@@ -2670,8 +2423,6 @@ async fn the_v2_launch_cas_refuses_an_expired_execution_lease() {
         let launch_claim = launch_claim_of(&fixture.claim);
         let queue = ci_job_queue_store(app.clone());
 
-        // The EXECUTION lease lapses while the immutable claim window is still wide open — exactly
-        // the state the reaper is about to reclaim.
         sqlx::query(
             "UPDATE job_queue SET lease_expires = statement_timestamp() - interval '1 second'
              WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -2705,7 +2456,6 @@ async fn the_v2_launch_cas_refuses_an_expired_execution_lease() {
             "the V2 CAS must refuse a lapsed execution lease"
         );
 
-        // Neither the queue row nor the public surface moved, and no fresh lease was installed.
         let after: (String, String, bool) = sqlx::query_as(
             "SELECT q.state,
                     (SELECT s.state FROM ci_job s
@@ -2727,8 +2477,6 @@ async fn the_v2_launch_cas_refuses_an_expired_execution_lease() {
             "queue state, surface state, and the lapsed lease are ALL unchanged"
         );
 
-        // Restore a live lease and the SAME credential launches — proving the lease predicate was
-        // the one and only reason for the refusal.
         sqlx::query(
             "UPDATE job_queue SET lease_expires = statement_timestamp() + interval '600 seconds'
              WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -2750,20 +2498,11 @@ async fn the_v2_launch_cas_refuses_an_expired_execution_lease() {
     .await;
 }
 
-/// **Round-2 blocker 1: acquisition is cancellation-safe — an aborted future leaks no open
-/// transaction, no stale tenant scope, and no retained lock onto the pooled connection.**
-///
-/// Two cases on a ONE-connection pool: (a) the acquisition future is aborted while blocked mid-
-/// transaction (BEGIN + SET LOCAL done, blocked taking the `job_queue` FOR SHARE); (b) a fully
-/// acquired handle is dropped WITHOUT `release()`. Both must roll back through the RAII
-/// `sqlx::Transaction` so the next borrower on that single connection sees a clean session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn aborting_or_dropping_acquisition_leaks_no_transaction_scope_or_lock() {
     let (schema, bootstrap, admin, app) = migrated_schema("cancel_safe").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
         let (minter, _calls) = real_minter();
-        // A ONE-connection app pool: if a cancelled/dropped acquisition leaked its transaction onto
-        // the connection, the very next borrow would inherit the open tx / stale GUC / held lock.
         let one_pool = tagged_pool_capped(&app_url(), &schema, "myelin-cred-cancel", 1).await;
         let store = store(&app, minter, CiJobCredentialWriteVersion::V2PhaseBound);
         let fixture = seed_fixture(&app, &admin, 12, 5).await;
@@ -2779,8 +2518,6 @@ async fn aborting_or_dropping_acquisition_leaks_no_transaction_scope_or_lock() {
             &advertise,
         );
 
-        // ---- (a) abort mid-transaction ----
-        // Hold the queue row FOR UPDATE from admin so acquisition's statement A blocks.
         let mut blocker = admin.begin().await.unwrap();
         sqlx::query(
             "SELECT 1 FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
@@ -2802,11 +2539,8 @@ async fn aborting_or_dropping_acquisition_leaks_no_transaction_scope_or_lock() {
             aborted.is_err(),
             "the acquisition must still be blocked mid-transaction when the timeout fires"
         );
-        // Release the blocker; the aborted acquisition's transaction must already be torn down.
         blocker.rollback().await.unwrap();
 
-        // The next borrow on the SINGLE connection sees no stale tenant scope (a leaked open tx
-        // would still carry the SET LOCAL scope).
         let scope: String = sqlx::query_scalar("SELECT current_setting('myelin.tenant_id', true)")
             .fetch_one(&one_pool)
             .await
@@ -2815,19 +2549,16 @@ async fn aborting_or_dropping_acquisition_leaks_no_transaction_scope_or_lock() {
             scope, "",
             "a cancelled acquisition left no tenant scope on the connection"
         );
-        // ...and a fresh statement on that connection works (it is not stuck in a leftover tx).
         let usable: i32 = sqlx::query_scalar("SELECT 1")
             .fetch_one(&one_pool)
             .await
             .unwrap();
         assert_eq!(usable, 1);
-        // ...and the queue row lock was never leaked.
         assert!(
             queue_row_lockable(&admin, &fixture).await,
             "a cancelled acquisition left no lock on the queue row"
         );
 
-        // ---- (b) drop a fully acquired handle without release() ----
         let owned = acquire_phase_generation_ownership(&one_pool, &gate)
             .await
             .unwrap()
@@ -2836,8 +2567,7 @@ async fn aborting_or_dropping_acquisition_leaks_no_transaction_scope_or_lock() {
             !queue_row_lockable(&admin, &fixture).await,
             "while ownership is held the queue row is genuinely locked"
         );
-        drop(owned); // NO release() — the RAII Transaction Drop must roll back.
-                     // Force the pooled connection to flush its queued rollback, then observe a clean session.
+        drop(owned);
         let scope: String = sqlx::query_scalar("SELECT current_setting('myelin.tenant_id', true)")
             .fetch_one(&one_pool)
             .await
@@ -2851,15 +2581,6 @@ async fn aborting_or_dropping_acquisition_leaks_no_transaction_scope_or_lock() {
     .await;
 }
 
-/// **Round-2 blocker 2: the retained ownership also freezes the journal status against the
-/// production topology-deadline sealer, which locks ONLY the journal row (never `job_queue`).**
-///
-/// With an overdue `seal_after`, the real `seal_expired_prelaunch_usage` sweep would otherwise
-/// transition `started → sealed_ceiling`. While ownership is retained it CANNOT: the sealer's
-/// `FOR UPDATE SKIP LOCKED` skips the row this transaction holds `FOR SHARE`, so it seals nothing and
-/// the row stays `started`. A plain (waiting) `FOR UPDATE` on that journal row from a tagged backend
-/// is proven Lock-waiting via `pg_stat_activity`, evidencing the conflict on the journal row itself.
-/// After release, the next sweep seals it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn retained_ownership_freezes_the_journal_status_against_the_production_sealer() {
     let (schema, bootstrap, admin, app) = migrated_schema("sealer_race").await;
@@ -2868,7 +2589,6 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
         let store = store(&app, minter, CiJobCredentialWriteVersion::V2PhaseBound);
         let fixture = seed_fixture(&app, &admin, 13, 5).await;
         admit_parent(&admin, &fixture).await;
-        // A started transport phase whose seal deadline is ALREADY overdue.
         insert_overdue_started_transport(&admin, &fixture).await;
         let advertise = store
             .mint_phase_credential(&fixture.claim, CiCredentialPurpose::CheckoutAdvertise)
@@ -2880,21 +2600,13 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
             &advertise,
         );
 
-        // The REAL production sealer (region-scoped) — admin bypasses RLS in the isolated schema,
-        // exactly as every other admin read/write in this suite does.
         let sealer = ci_region_queue_store_test_support(admin.clone());
 
-        // (The positive control that an unguarded overdue row DOES seal is the post-release sweep
-        // below: it seals exactly this row once ownership is dropped. A region-wide sweep here on a
-        // sibling would also seal the primary row, since the sealer is region-scoped.)
-
-        // ---- take ownership: this locks q FOR SHARE and the transport journal row FOR SHARE ----
         let mut owned = acquire_phase_generation_ownership(&app, &gate)
             .await
             .unwrap()
             .expect("the current generation grants ownership");
 
-        // The production sealer now SKIPS the locked row: it seals nothing and the row stays started.
         assert_eq!(
             sealer.seal_expired_prelaunch_usage(REGION).await.unwrap(),
             0,
@@ -2907,22 +2619,17 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
             Some("started"),
             "the phase cannot seal while ownership is retained"
         );
-        // Revalidation under the held locks still holds.
         owned
             .validate()
             .await
             .expect("revalidation holds under the retained journal lock");
 
-        // Evidence the FOR SHARE lock is genuinely on the JOURNAL row: a plain (waiting) FOR UPDATE
-        // on it from a tagged backend Lock-waits until release.
         let waiter_tag = format!("myelin-cred-journal-waiter-{}", std::process::id());
         let waiter_pool = tagged_pool(&app_url(), &schema, &waiter_tag).await;
         let job_id = fixture.claim.job_id.clone();
         let lease_epoch = fixture.claim.lease_epoch;
         let claim_nonce = fixture.claim.claim_nonce.clone();
         let waiter = tokio::spawn(async move {
-            // One transaction on one connection: the tenant scope and the FOR UPDATE must share it,
-            // or RLS hides the row from the app role and the lock is never contended.
             let mut tx = waiter_pool.begin().await.unwrap();
             sqlx::query(
                 "SELECT set_config('myelin.tenant_id', $1, true),
@@ -2933,7 +2640,6 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
             .execute(&mut *tx)
             .await
             .unwrap();
-            // A plain FOR UPDATE (NOT skip-locked): it must WAIT for the retained FOR SHARE.
             sqlx::query(
                 "SELECT 1 FROM ci_job_prelaunch_usage
                  WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
@@ -2949,7 +2655,6 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
             .execute(&mut *tx)
             .await
             .unwrap();
-            // Release immediately so the following seal sweep can proceed.
             tx.rollback().await.unwrap();
         });
         let observer = pinned_pool(&admin_url(), &schema).await;
@@ -2966,7 +2671,6 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
             "the conflicting FOR UPDATE must Lock-wait on the journal row specifically"
         );
 
-        // ---- release: the phase can seal again, and the waiter completes ----
         owned.release().await.expect("ownership releases cleanly");
         waiter.await.unwrap();
         assert_eq!(
@@ -2984,16 +2688,6 @@ async fn retained_ownership_freezes_the_journal_status_against_the_production_se
     .await;
 }
 
-// =================================================================================================
-// 11. CT-007 5b.3-6d STEP 3: the DORMANT durable checkout-composition adapter, live-PG.
-//
-// These prove the `DurableAttemptAuthority`/parent-attempt reserve hook COMPOSE the journal, lease,
-// credential, and reservation authorities correctly — state predicates, RLS role, lock ordering,
-// Identity invocation, and the synchronous off-runtime bridge — which the component tests (each
-// exercising one authority in isolation) and 6c's fake authorities do not.
-// =================================================================================================
-
-/// Build the dormant composition over one pool, injecting the call-counting Identity minter.
 fn adapter_composition(pool: &PgPool, minter: Arc<CountingPhaseMinter>) -> V2CheckoutComposition {
     V2CheckoutComposition::new(
         pool.clone(),
@@ -3005,9 +2699,6 @@ fn adapter_composition(pool: &PgPool, minter: Arc<CountingPhaseMinter>) -> V2Che
     .expect("compose the dormant V2 checkout authorities")
 }
 
-/// Drive the V2 resolver seam (mint the initial `CheckoutAdvertise`) and build the resolved checkout
-/// [`JobSpec`] the parent-attempt reserve hook reconstructs its claim from — exactly what the runner
-/// would hand `RunnerAgent`.
 fn resolved_checkout_spec(comp: &V2CheckoutComposition, fixture: &Fixture) -> JobSpec {
     let scope = checkout_scope();
     let (minted, context) = comp
@@ -3102,8 +2793,6 @@ async fn lease_facts(admin: &PgPool, fixture: &Fixture) -> LeaseFacts {
     }
 }
 
-/// The generation id the carrier's ephemeral authorization CONTEXT binds — proves the context (not
-/// just the returned string) names the exact durable generation.
 fn binding_generation_of(context: &myelin_ci_sandbox::RunTokenAuthorizationContext) -> String {
     match context {
         myelin_ci_sandbox::RunTokenAuthorizationContext::CiJob(c) => c
@@ -3115,8 +2804,6 @@ fn binding_generation_of(context: &myelin_ci_sandbox::RunTokenAuthorizationConte
     }
 }
 
-/// Insert one prior (superseded) parent-attempt row under the SAME reserve/policy but a distinct
-/// generation, so a later admission counts it toward the exact-policy budget.
 async fn insert_prior_parent(admin: &PgPool, fixture: &Fixture, lease_epoch: i64, nonce: &str) {
     sqlx::query(
         "INSERT INTO ci_job_parent_attempt (
@@ -3149,7 +2836,6 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
         let comp = adapter_composition(&app, minter);
         let fixture = seed_fixture(&app, &admin, 1, 5).await;
 
-        // Resolver seam: the initial CheckoutAdvertise is minted before any parent attempt exists.
         let spec = resolved_checkout_spec(&comp, &fixture);
         assert_eq!(
             calls.load(Ordering::SeqCst),
@@ -3158,8 +2844,6 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
         );
         let before = lease_facts(&admin, &fixture).await;
 
-        // Drive the WHOLE adapter phase sequence from a dedicated OFF-runtime thread (the runner
-        // thread `CiRunnerLoop::spawn` uses — where the sync bridge does a direct `block_on`).
         let comp_t = comp.clone();
         let spec_t = spec.clone();
         let gens = std::thread::spawn(move || {
@@ -3176,7 +2860,6 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
                 cpu_seconds: 3,
                 mem_byte_seconds: 7,
             };
-            // transport: begin -> advertise REPLAY -> fetch mint -> complete
             authority
                 .begin_phase(PreparationPhase::CheckoutTransport)
                 .expect("begin transport");
@@ -3192,7 +2875,6 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
             authority
                 .renew_preparation_lease()
                 .expect("renew after transport");
-            // materialization: begin -> mint -> complete -> renew -> workload mint
             authority
                 .begin_phase(PreparationPhase::CheckoutMaterialization)
                 .expect("begin materialization");
@@ -3219,7 +2901,6 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
         .join()
         .expect("the runner thread drove the sequence");
 
-        // The ADAPTER performed the reservation transition and inserted exactly one parent row.
         assert_eq!(
             reservation_state(&admin, &fixture.reserve_handle).await,
             "inflight",
@@ -3227,7 +2908,6 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
         );
         assert_eq!(parent_row_count(&admin, &fixture).await, 1);
 
-        // Both journal phases are measured.
         assert_eq!(
             phase_status(&admin, &fixture, "checkout_transport")
                 .await
@@ -3241,8 +2921,6 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
             Some("measured")
         );
 
-        // Exactly four generation rows in order, and the adapter's carriers name each durable
-        // generation (the ephemeral context binds the same generation id).
         let rows = generation_rows(&admin, &fixture).await;
         let purposes: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(
@@ -3273,12 +2951,8 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
             "the carrier's authorization context binds the same generation"
         );
 
-        // Identity was invoked once per mint call — advertise(apply) + advertise(replay) + fetch +
-        // materialization + workload = 5 — yet only FOUR generation rows exist: the replay reproduced
-        // the advertise generation deterministically, it did not create a fifth row.
         assert_eq!(calls.load(Ordering::SeqCst), 5);
 
-        // Renew moved ONLY the execution lease; every immutable claim fact is unchanged.
         let after = lease_facts(&admin, &fixture).await;
         assert_eq!(after.claim_started, before.claim_started);
         assert_eq!(after.claim_expires, before.claim_expires);
@@ -3297,7 +2971,6 @@ async fn durable_checkout_adapter_drives_the_full_phase_sequence() {
 async fn adapter_admission_loses_cleanly_to_claim_generation_change() {
     let (schema, bootstrap, admin, app) = migrated_schema("adapter_race").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // Control: a clean admission proves the ADAPTER (not a mock) performs the transition.
         {
             let (minter, _calls) = real_minter();
             let comp = adapter_composition(&app, minter);
@@ -3315,8 +2988,6 @@ async fn adapter_admission_loses_cleanly_to_claim_generation_change() {
             assert_eq!(parent_row_count(&admin, &fixture).await, 1);
         }
 
-        // Race: hold the exact queue row lock, prove admission is Lock-waiting, then reclaim the
-        // generation and commit — admission must refuse with NO durable mutation.
         let tag = format!("myelin-adapter-admit-{}", std::process::id());
         let admit_pool = tagged_pool(&app_url(), &schema, &tag).await;
         let (minter, _calls) = real_minter();
@@ -3341,8 +3012,6 @@ async fn adapter_admission_loses_cleanly_to_claim_generation_change() {
         let observer = pinned_pool(&admin_url(), &schema).await;
         await_lock_waiter(&observer, &tag).await;
 
-        // Reclaim: a reaper-style generation bump, then commit — releases the lock and supersedes
-        // the claim the admission is reconstructing.
         sqlx::query("UPDATE job_queue SET lease_epoch = 2 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid")
             .bind(TENANT)
             .bind(REGION)
@@ -3368,12 +3037,6 @@ async fn adapter_admission_loses_cleanly_to_claim_generation_change() {
 async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
     let (schema, bootstrap, admin, app) = migrated_schema("adapter_matrix").await;
     with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        // (A) The should_requeue() boundary is EXACT at `count < max` (production max = 5). Both
-        // sides are pinned so a `count < max - 1` regression (which would wrongly refuse the legal
-        // 4/5 requeue) and a `count <= max` regression (which would wrongly permit 5/5) each turn RED.
-        //
-        // (A1) count == max - 1 (== 4): admitted, should_requeue() == TRUE. Three prior rows + the
-        // admitted current row = 4/5. A `count < max - 1` regression refuses here → caught.
         {
             let (minter, _calls) = real_minter();
             let comp = adapter_composition(&app, minter);
@@ -3395,9 +3058,6 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
             assert!(requeue, "count(4) < max(5) still permits another attempt");
         }
 
-        // (A2) count == max (== 5): admitted (the fifth attempt IS the last legal admission), but
-        // should_requeue() == FALSE — the budget is now spent. Four prior rows + the admitted current
-        // = 5/5. A `count <= max` regression would wrongly requeue here → caught.
         {
             let (minter, _calls) = real_minter();
             let comp = adapter_composition(&app, minter);
@@ -3422,8 +3082,6 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
             assert!(!requeue, "count(5) == max(5) permits NO further attempt");
         }
 
-        // (B) exhaustion: the typed exhausted admission, reservation inflight, no new parent row.
-        // Production `max_parent_attempts` is 5, so five prior rows exhaust the exact-policy budget.
         {
             let (minter, _calls) = real_minter();
             let comp = adapter_composition(&app, minter);
@@ -3457,8 +3115,6 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
             );
         }
 
-        // (C) a stale authority (its generation reclaimed) refuses renew/begin/mint, touches no
-        // durable row, and never reaches Identity.
         {
             let (minter, calls) = real_minter();
             let comp = adapter_composition(&app, minter);
@@ -3476,7 +3132,6 @@ async fn adapter_exhaustion_retry_and_stale_authority_matrix() {
                 .join()
                 .unwrap();
 
-            // Reclaim: bump the generation so the authority's bound claim is now stale.
             sqlx::query(
                 "UPDATE job_queue SET lease_epoch = 2 WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
             )

@@ -1,21 +1,3 @@
-//! # CI-D7 drill — fork-gets-no-secrets (CI-P24 / P-367).
-//!
-//! The whole-system drill (drill catalogue row CI-D7): an **adversarial `UntrustedFork` run** attempts
-//! to read protected secrets through the in-boundary broker → the **`read & !is_untrusted_fork` ABAC
-//! edge holds STRUCTURALLY** → **0 secret reads by a fork-tier run**. The quantified gate:
-//! `0 fork secret reads`.
-//!
-//! This is the canonical "fork exfiltrates prod secrets" CVE class (the poisoned-pipeline attack,
-//! EI-02 §1). The failure-injection harness MAXIMISES the adversary's advantage:
-//! - the fork references EVERY protected secret name (a full-spectrum exfil attempt);
-//! - the authz layer is MISCONFIGURED to grant the fork's subject read on ALL of them (a
-//!   defence-in-depth test: even a broken grant must not leak — the STRUCTURAL fork short-circuit is
-//!   the boundary, not the authz check);
-//! - the broker is also asked to mint an OIDC cloud credential (the registry-exfil vector).
-//!
-//! Every one is REFUSED: the fork resolves to 0 secrets, makes 0 authz reads, and gets no cloud
-//! credential. Emits the dated green artifact on pass.
-
 use myelin_ci_controlplane::secret_broker::{SecretBroker, SecretCapability, WithholdReason};
 use myelin_ci_sandbox::{SecretRef, TrustTier};
 use myelin_identity::{
@@ -28,7 +10,6 @@ use myelin_identity::{
 use myelin_tenancy::{ArtifactRef, TenantId};
 use std::cell::RefCell;
 
-/// A capability that WOULD resolve every secret (the adversary's advantage maximised).
 struct AlwaysResolves;
 impl SecretCapability for AlwaysResolves {
     fn resolve_handle(
@@ -50,9 +31,6 @@ impl SecretCapability for AlwaysResolves {
     }
 }
 
-/// An authz layer MISCONFIGURED to ALLOW the fork's subject `read` on every secret — and that records
-/// every `check` it received, so the drill can prove the fork made ZERO authz reads (the structural
-/// short-circuit fired BEFORE the broken grant was ever consulted).
 struct MisconfiguredGrantAll {
     reads: RefCell<usize>,
 }
@@ -69,7 +47,6 @@ impl IdentityService for MisconfiguredGrantAll {
         _cav: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
         *self.reads.borrow_mut() += 1;
-        // The MISCONFIGURATION: grant everything. The structural defence must survive this.
         Ok(Decision::Allow)
     }
     fn list_objects(
@@ -131,10 +108,6 @@ fn secret_object_of(r: &SecretRef) -> ArtifactRef {
     ArtifactRef(r.handle.clone())
 }
 
-/// **CI-D7: 0 fork secret reads.** An adversarial fork references every protected secret; the authz
-/// layer is misconfigured to grant them all; the broker STILL resolves ZERO and makes ZERO authz reads
-/// (the `!is_untrusted_fork` arm by construction). A trusted control run with the SAME spec resolves
-/// them (the defence is asymmetric — a wall against forks, not against members).
 #[test]
 fn ci_d7_fork_gets_no_secrets() {
     let cap = AlwaysResolves;
@@ -143,7 +116,6 @@ fn ci_d7_fork_gets_no_secrets() {
     };
     let broker = SecretBroker::new(&cap, &id);
 
-    // The fork's full-spectrum exfil spec: every protected secret a prod deploy uses.
     let protected_secrets = vec![
         SecretRef {
             name: "PROD_DB_PASSWORD".into(),
@@ -173,7 +145,6 @@ fn ci_d7_fork_gets_no_secrets() {
         mode: ConsistencyMode::Strong,
     };
 
-    // ---- the adversarial fork-tier resolution ----------------------------------------------------
     let fork_res = broker
         .resolve(
             TrustTier::UntrustedFork,
@@ -184,11 +155,9 @@ fn ci_d7_fork_gets_no_secrets() {
         )
         .expect("resolution does not error (a fork resolution is a clean 0, not a panic)");
 
-    // THE QUANTIFIED GATE: 0 secret reads by a fork-tier run.
     let fork_secret_reads = fork_res.secret_count();
     assert_eq!(fork_secret_reads, 0, "CI-D7 gate: 0 fork secret reads");
     assert!(fork_res.is_empty());
-    // Every referenced name is withheld with the STRUCTURAL fork reason.
     for o in &fork_res.outcomes {
         assert!(o.resolved().is_none());
         assert!(matches!(
@@ -199,15 +168,12 @@ fn ci_d7_fork_gets_no_secrets() {
             }
         ));
     }
-    // THE STRUCTURAL PROOF: the fork made ZERO authz reads — the misconfigured grant was never even
-    // consulted (the short-circuit fired first). This is why a broken grant cannot leak to a fork.
     let fork_authz_reads = *id.reads.borrow();
     assert_eq!(
         fork_authz_reads, 0,
-        "the fork short-circuited BEFORE any authz check — a misconfigured grant cannot leak"
+        "the fork short-circuited BEFORE any authz check - a misconfigured grant cannot leak"
     );
 
-    // The fork is ALSO refused an OIDC cloud credential (the registry-exfil vector).
     let mut oidc_mint_attempts = 0;
     let cred = broker.mint_oidc(
         TrustTier::UntrustedFork,
@@ -227,9 +193,6 @@ fn ci_d7_fork_gets_no_secrets() {
         "the fork never even reached the OIDC mint"
     );
 
-    // ---- the asymmetry control: a TRUSTED member run with the SAME spec DOES resolve --------------
-    // (proves the broker is a wall against forks, not a wall against everything — the secrets ARE
-    // resolvable for a legitimately-granted member run.)
     let trusted_subject = Principal::stub(
         PrincipalId("u:trusted-member".into()),
         PrincipalKind::Human,
@@ -250,7 +213,6 @@ fn ci_d7_fork_gets_no_secrets() {
     );
     assert_eq!(trusted_res.secret_count(), 4);
 
-    // ---- the dated green artifact (the prompt's "CI-D7 emits its dated green artifact") -----------
     println!(
         "[CI-D7 GREEN 2026-06-23] fork-gets-no-secrets: {} protected secrets referenced by an \
          adversarial fork; {} fork secret reads (gate: 0); {} fork authz reads (the structural \
@@ -264,9 +226,6 @@ fn ci_d7_fork_gets_no_secrets() {
     );
 }
 
-/// **The HITL companion gate (the prompt's second quantified gate): a double-click approval is ONE
-/// approval; a declined effect is WITHHELD (returns Denied, never mutates).** Proven over the FROZEN
-/// per-effect `idem_key` in `deployment::DeployGate`.
 #[test]
 fn ci_p24_hitl_double_click_is_one_apply_decline_withholds() {
     use myelin_ci_controlplane::deployment::{DeployGate, DeployGateOutcome, DECLINE_TOKEN};
@@ -276,7 +235,6 @@ fn ci_p24_hitl_double_click_is_one_apply_decline_withholds() {
     let mut applied: HashMap<String, String> = HashMap::new();
     let mut applies = 0;
 
-    // A double-click on "approve" → ONE apply (the per-effect idem_key dedup).
     for _ in 0..2 {
         let o = DeployGate::gate_deploy(
             "deploy-card-prod",
@@ -296,7 +254,6 @@ fn ci_p24_hitl_double_click_is_one_apply_decline_withholds() {
         "a double-click is ONE approval (per-effect idem_key, OQ-F)"
     );
 
-    // A declined deploy → WITHHELD, 0 mutation (AG-8).
     let mut decline_applies = 0;
     let declined = DeployGate::gate_deploy(
         "deploy-card-staging",

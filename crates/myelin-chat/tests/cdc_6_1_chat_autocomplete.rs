@@ -1,19 +1,3 @@
-//! # CDC 6.1 — the Chat `@`/`#` autocomplete is Search-backed (CHAT-P12 / P-406, M4-C3)
-//!
-//! **Contract 6.1** — `query(ast, viewer, zookie?, page) → RankedResults` (the ACL-conjoining Search
-//! entry; the `search-requires-acl-filter` discipline). **CONSUMED** by Chat: the composer's `@`/`#`
-//! autocomplete ([`myelin_chat::composer::AutocompletePort`]) is **Search-backed** — there is **0
-//! chat-private mention/artifact index**. This CDC PINS that the REAL `myelin_search::query` surface
-//! satisfies chat's `AutocompletePort` (the seam the gateway wires), and that the conjoined
-//! `list_objects` `Filter` excludes a suggestion the viewer cannot see BEFORE it reaches the composer
-//! (the no-leak property the autocomplete inherits — a `#`-suggestion for a confidential artifact never
-//! appears in the picker; not in the rows, not in the count).
-//!
-//! This is the CONSUMER leg of contract 6.1 for Chat. The PROVIDER (the ACL-conjoining pipeline) is the
-//! Search crate's (`cdc_query_pipeline_6_1.rs`); HERE the chat-side adapter routes through that one
-//! surface and the autocomplete inherits the leak-free guarantee — chat owns no second index, no
-//! post-filter.
-
 use myelin_chat::composer::{AutocompleteKind, AutocompletePort, Suggestion};
 use myelin_content::InlineNode;
 use myelin_events::ArtifactRef;
@@ -30,7 +14,6 @@ use myelin_tenancy::TenantId;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// The viewer driving the autocomplete (a human composing a message).
 fn viewer() -> Principal {
     Principal::stub(
         PrincipalId("p-opaque-alice".into()),
@@ -46,9 +29,6 @@ fn consistency() -> Consistency {
     }
 }
 
-/// The full-text AST a `#`/`@` prefix compiles to (a body-field equality over the prefix term — the
-/// composer builds this from the in-flight text; the real adapter would use a prefix matcher, the
-/// shape is the same: an FT query over the kind's object type, ALWAYS ACL-conjoined).
 fn ast_body(term: &str) -> QueryAst {
     QueryAst::compiled(Predicate::Cmp {
         op: CmpOp::Eq,
@@ -79,9 +59,6 @@ fn schema() -> myelin_search::FieldSchema {
         )
 }
 
-/// A scripted `ListObjectsPort` (the per-viewer ACL pre-filter) returning a canned allow-set + counting
-/// the calls (the no-N+1 gate). The SAME fake the Search/Knowledge CDCs use — chat does not author a
-/// second authz path.
 struct FakeAuthz {
     answer: ListObjectsResult,
     calls: AtomicU64,
@@ -119,7 +96,6 @@ impl ListObjectsPort for FakeAuthz {
     }
 }
 
-/// A `#`-artifact corpus: a PUBLIC issue + a CONFIDENTIAL issue, both matching the FT term "deploy".
 fn artifact_corpus() -> TantivyBackend {
     let mut be = TantivyBackend::open(&facet_decl()).expect("open");
     let mut upsert = |id: &str, body: &str| {
@@ -139,10 +115,6 @@ fn artifact_corpus() -> TantivyBackend {
     be
 }
 
-/// **THE CHAT-SIDE ADAPTER under test** — a `composer::AutocompletePort` that routes through the REAL
-/// `myelin_search::query` ACL-conjoining surface (contract 6.1). It holds NO chat-private index: every
-/// suggestion comes from Search, pre-filtered by the viewer's `list_objects` `Filter`. This is the seam
-/// the chat gateway wires in production; the CDC proves the real Search surface satisfies the port.
 struct SearchAutocompleteAdapter<'a, B: IndexBackend> {
     engine: &'a ScopedEngine<'a, B>,
     authz: &'a dyn ListObjectsPort,
@@ -152,9 +124,6 @@ struct SearchAutocompleteAdapter<'a, B: IndexBackend> {
 
 impl<B: IndexBackend> AutocompletePort for SearchAutocompleteAdapter<'_, B> {
     fn suggest(&self, kind: AutocompleteKind, prefix: &str, limit: u32) -> Vec<Suggestion> {
-        // The kind selects the ACL object type the conjoin keys on (`member` for `@`, `issue` for
-        // `#` here — the real adapter fans the `#` query across the artifact object types). The query
-        // ALWAYS goes through the conjoining `query` entry — there is NO chat-private index branch.
         let ty = match kind {
             AutocompleteKind::Mention => ObjectType("member".into()),
             AutocompleteKind::Artifact => ObjectType("issue".into()),
@@ -172,29 +141,23 @@ impl<B: IndexBackend> AutocompletePort for SearchAutocompleteAdapter<'_, B> {
             &stats,
         )
         .expect("the Search query surface is reachable");
-        // Map the ranked, ALREADY-AUTHORISED hits to suggestions. A denied artifact is NOT in `hits`
-        // (the engine pre-filter excluded it) — so it cannot become a suggestion.
         res.hits
             .into_iter()
             .take(limit as usize)
             .map(|h| Suggestion {
                 target: ArtifactRef(h.doc_id.clone()),
-                label: h.doc_id, // the doc id is the authorised display key here (leak-free).
+                label: h.doc_id,
                 kind,
             })
             .collect()
     }
 }
 
-/// **The `#`-autocomplete is Search-backed and leak-free: a confidential artifact is NOT suggested
-/// (0 chat-private index), then a grant makes it appear.** Both issues match "deploy"; the
-/// unauthorized allow-set excludes SECRET-9 → it is in neither the suggestions NOR the count.
 #[test]
 fn artifact_autocomplete_is_search_backed_and_excludes_confidential_incl_count() {
     let be = artifact_corpus();
     let eng = ScopedEngine::new(&be, "acme", "fr-par", schema());
 
-    // UNAUTHORIZED: the allow-set excludes the confidential issue.
     let unauth = FakeAuthz::ids(&["myelin://acme/issue/issue/ENG-1"]);
     let adapter = SearchAutocompleteAdapter {
         engine: &eng,
@@ -209,25 +172,21 @@ fn artifact_autocomplete_is_search_backed_and_excludes_confidential_incl_count()
         ["myelin://acme/issue/issue/ENG-1"],
         "the confidential artifact is excluded by the Search pre-filter (0 leak)"
     );
-    // The count-leak close: the suggestion count is the VISIBLE count only.
     assert_eq!(
         sugg.len(),
         1,
         "the autocomplete count reveals neither the existence nor the number of forbidden artifacts"
     );
-    // No N+1: exactly ONE list_objects per autocomplete query.
     assert_eq!(
         unauth.calls.load(Ordering::Relaxed),
         1,
         "exactly ONE list_objects (the conjoined pre-filter; no N+1)"
     );
-    // Selecting the suggestion inserts a STRUCTURED artifact_ref node (the refs.edge producer reads it).
     assert!(matches!(
         sugg[0].artifact_node(),
         Some(InlineNode::ArtifactRefNode(_))
     ));
 
-    // GRANTED: the allow-set now includes SECRET-9 → it surfaces on re-query (the SAME surface).
     let granted = FakeAuthz::ids(&[
         "myelin://acme/issue/issue/ENG-1",
         "myelin://acme/issue/issue/SECRET-9",
@@ -246,9 +205,6 @@ fn artifact_autocomplete_is_search_backed_and_excludes_confidential_incl_count()
     );
 }
 
-/// **A viewer who can see NO artifact gets ZERO suggestions (the `SetExpr::None` short-circuit) — the
-/// autocomplete cannot leak a count.** The conjoined `WHERE false` ACL returns an empty result without
-/// materialising a candidate set; the picker is empty.
 #[test]
 fn autocomplete_empty_allow_set_yields_no_suggestions() {
     let be = artifact_corpus();
@@ -267,9 +223,6 @@ fn autocomplete_empty_allow_set_yields_no_suggestions() {
     );
 }
 
-/// **The autocomplete is bounded by the requested `limit` (the picker shows a bounded window) and runs
-/// over the kind's object type.** A `@`-mention query and a `#`-artifact query both route through the
-/// SAME `query` surface — proving there is one Search-backed path, not a per-kind chat-private index.
 #[test]
 fn autocomplete_respects_limit_and_one_surface_per_kind() {
     let be = artifact_corpus();
@@ -284,7 +237,6 @@ fn autocomplete_respects_limit_and_one_surface_per_kind() {
         viewer: viewer(),
         at: consistency(),
     };
-    // limit=1 over a 2-hit corpus → exactly one suggestion (bounded picker window).
     let sugg = adapter.suggest(AutocompleteKind::Artifact, "deploy", 1);
     assert_eq!(sugg.len(), 1, "the picker window is bounded by limit");
     assert_eq!(sugg[0].kind, AutocompleteKind::Artifact);

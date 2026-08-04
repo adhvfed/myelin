@@ -1,26 +1,3 @@
-//! # CDC — the incremental-indexer consumer seam (SRCH-P06 → P-169)
-//!
-//! **Architecture:** `search-and-indexing.md` §4.1 (the indexer is an ordinary `myelin-events`
-//! consumer; the per-event pipeline dedup → fetch `project(ref, viewer)` (NOT the DB) → analyze →
-//! embed-if-semantic → build IndexDocument → stamp indexed_zookie+version → upsert → mark dedup →
-//! ack). **Contracts:** 2.1 EventEnvelope, 2.4/2.5 the consumer template + dedup ledger, 5.6
-//! `project(ref, viewer)`.
-//!
-//! This CDC pins TWO seams from the CONSUMER side (Search consumes both):
-//! - **2.4 (the consumer template):** the indexer is driven by the ONE sanctioned consumer runtime
-//!   ([`myelin_events::Consumer`] — the seven encoded rules), idempotent on `event_id` via the
-//!   [`myelin_events::DedupLedger`] (2.5). A redelivered event is a handler no-op (0 dup); the
-//!   handler never reaches the engine on a redelivery.
-//! - **5.6 (`project(ref, viewer)`):** the indexer fetches the owner's searchable projection through
-//!   the [`myelin_search::ProjectFetcher`] seam — and ONLY this. There is NO owner-DB read path (the
-//!   no-cross-db floor). If a fetch is transiently unavailable the handler RETRIES (0 lost, never a
-//!   fabricated projection); if the artifact is GONE the doc is removed.
-//!
-//! The dated green artifact (2026-06-20): a synthetic producer emits a domain event; the indexer
-//! consumer fetches the owner's projection (5.6, never the DB), builds + stamps the IndexDocument, and
-//! the doc is searchable — and a redelivery is deduped (2.4/2.5). The mock embedding adapter +
-//! synthetic producer are the named floors (real model post-M5; real IndexSpecs M3/M4).
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -45,11 +22,6 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 
-/// The CONSUMER-side stand-in for the owner's 5.6 `project(ref, viewer)`: a per-tenant map of
-/// `ref → projection`, with a call counter so a redelivery's dedup-skip is observable (it must NOT
-/// re-fetch). A ref not in the map is GONE. **This is NOT a DB** — it is the owner's per-viewer
-/// projection over the resilient client (the only sanctioned way Search reads another subsystem's
-/// artifact, 5.6).
 #[derive(Default)]
 struct OwnerProjectStandIn {
     projections: Mutex<BTreeMap<String, SearchProjection>>,
@@ -126,8 +98,6 @@ fn event(id: &str, type_: &str, subject: &str) -> EventEnvelope {
     }
 }
 
-/// **The consumer seam (2.4/2.5 + 5.6): the indexer runs through the sanctioned runtime, fetches the
-/// owner's projection (NOT the DB), indexes the doc, and a redelivery is deduped (0 dup).**
 #[test]
 fn indexer_consumes_via_2_4_and_fetches_via_5_6() {
     let r = "myelin://acme/issue/issue/ENG-1";
@@ -142,8 +112,6 @@ fn indexer_consumes_via_2_4_and_fetches_via_5_6() {
         Arc::new(MockEmbeddingAdapter::new(8)),
     );
 
-    // The ONE sanctioned consumer runtime (2.4) over the indexer handler; idempotent via the dedup
-    // ledger (2.5). The subscription whitelists a concrete subject prefix — NEVER `*`.
     let sub = Subscription::bind(
         ConsumerName(INDEXER_CONSUMER.into()),
         &["myelin://acme/issue/"],
@@ -158,7 +126,6 @@ fn indexer_consumes_via_2_4_and_fetches_via_5_6() {
         envelope: ev,
     };
 
-    // First delivery: the handler fetches the owner projection (5.6) ONCE and indexes the doc.
     assert_eq!(
         consumer.deliver(&msg),
         Delivered::Acked,
@@ -167,18 +134,15 @@ fn indexer_consumes_via_2_4_and_fetches_via_5_6() {
     assert_eq!(
         owner.calls(r),
         1,
-        "the owner's project(ref) was fetched once (5.6 — NOT the DB)"
+        "the owner's project(ref) was fetched once (5.6 - NOT the DB)"
     );
 
-    // The doc is searchable (the freshness property — SRCH-D7).
     let hits = indexer
         .search_ft(&tenant(), &region(), &AclFilter::ids([r]), "deadlock", 10)
         .expect("search");
     assert_eq!(hits.len(), 1, "the indexed doc is searchable");
     assert_eq!(hits[0].doc_id, r);
 
-    // Redelivery: the dedup ledger absorbs it (2.5) — the handler is SKIPped, the owner is NOT
-    // re-fetched, and the index is unchanged (0 dup).
     assert_eq!(
         consumer.deliver(&msg),
         Delivered::Deduplicated,
@@ -196,12 +160,8 @@ fn indexer_consumes_via_2_4_and_fetches_via_5_6() {
     );
 }
 
-/// **The 5.6 fetch is the ONLY ingest path — a transient owner hiccup RETRIES (0 lost), never a
-/// fabricated projection or a silent drop.** (The consumer side of 5.6 under the resilient client.)
 #[test]
 fn transient_owner_unavailable_retries_never_fabricates() {
-    /// An owner that is unavailable until the Nth call (the transient hiccup the resilient client
-    /// surfaces).
     struct FlakyOwner {
         fail_remaining: Mutex<u32>,
         text: String,
@@ -238,7 +198,6 @@ fn transient_owner_unavailable_retries_never_fabricates() {
     );
     let ev = event("01J-9", "issue.issue.created", r);
 
-    // First handle: the owner is down → Retry (NOT acked, NOT a poison, NOTHING indexed).
     assert!(
         matches!(indexer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Retry(_)),
         "a transient hiccup retries"
@@ -248,7 +207,6 @@ fn transient_owner_unavailable_retries_never_fabricates() {
         0,
         "no fabricated projection on the hiccup"
     );
-    // Redelivery: the owner is back → Done, the doc indexes (0 lost).
     assert_eq!(
         indexer.handle(&ev, &mut myelin_events::HandlerTx::none()),
         HandleOutcome::Done,

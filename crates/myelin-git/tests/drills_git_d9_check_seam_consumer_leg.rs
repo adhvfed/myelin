@@ -1,27 +1,3 @@
-//! # GIT-D9 / 5.9 consumer-leg LIVE drill — the check-seam consumer goes live (EB-26 / P-246, M3)
-//!
-//! **Contract:** `contract-index.md` row 5.9 (the Git↔CI `CheckStatus` seam — CI produces, **the
-//! Bus carries**, Git is the consumer/gate). Owning architecture: `event-bus.md` §4.12 (the Bus's
-//! NARROW carriage role) + the Git glue doc §1.1 (the X-1 consumer built from the §4.2 idempotent
-//! template). **Drill:** GIT-D9 (the Bus's per-aggregate ordering holds under the producer; the
-//! consumer is idempotent on `event_id`). **Reconciliation:** X-1.
-//!
-//! ## What this drill proves (the consumer leg LIVE — the M3 half of the seam)
-//! As of EB-26 the consumer leg is WIRED: [`myelin_git::check_status::CheckStatusConsumer`] is an
-//! idempotent [`EventHandler`] over the Bus's per-aggregate-ordered `ci.check.updated` carriage,
-//! driven here through the Bus's ONE consumer runtime ([`myelin_events::Consumer`] — the §4.2
-//! idempotent template, EB-05). The PRODUCER half (CI's real emit) is EB-27/M4 — here it is a
-//! SYNTHETIC `ci.check.updated` emitter (the seam-floor drill fixture, named in the module).
-//!
-//! The drill asserts, end-to-end through the Bus runtime:
-//! 1. **Idempotent on `event_id`** — a redelivered `ci.check.updated` is deduplicated by the Bus
-//!    runtime's `consumer_dedup` ledger (rule 1) → the handler runs ONCE → 0 dup.
-//! 2. **Per-aggregate ordered → monotonic supersession** — facts delivered out of `seq` order are
-//!    consumed in per-aggregate order ([`CheckSeamOrder`]); a late lower-attempt re-delivery is
-//!    DROPPED, so the current `check_status` row is the highest attempt regardless of arrival order.
-//! 3. **A malformed payload dead-letters LOUDLY** — never silently dropped, never the wrong shape
-//!    into the projection (rule 5 / the consumer's decode gate).
-
 use myelin_events::check_seam::{check_aggregate, check_subject, CheckSeamOrder};
 use myelin_events::taxonomy::new_tokens::CI_CHECK_UPDATED;
 use myelin_events::{
@@ -40,10 +16,6 @@ use std::collections::BTreeMap;
 const REPO: &str = "myelin://acme/git/repo/core";
 const COMMIT: &str = "abc123def";
 
-/// The SYNTHETIC `ci.check.updated` producer (the seam-floor emitter — CI's real producer is
-/// EB-27/M4). Builds a delivered envelope carrying the OPAQUE `CheckStatus` payload (the Bus carries
-/// it as a `serde_json::Value`; the consumer decodes it). `event_id` is stamped per (context,
-/// attempt) so a redelivery carries the SAME id (the dedup key).
 fn synthetic_check_updated(
     context: &str,
     attempt: u32,
@@ -99,9 +71,6 @@ fn synthetic_check_updated(
     }
 }
 
-/// Bind the live check-status consumer to the Bus's ONE consumer runtime (the §4.2 idempotent
-/// template): the `ci.check.updated` subject whitelist (never `*`), a durable name, the shared dedup
-/// ledger (idempotent on `event_id`).
 fn bind_consumer() -> Consumer<CheckStatusConsumer> {
     let subjects: Vec<&str> = CheckStatusConsumer::new()
         .subjects()
@@ -117,9 +86,6 @@ fn bind_consumer() -> Consumer<CheckStatusConsumer> {
     Consumer::new(CheckStatusConsumer::new(), sub, DedupLedger::new())
 }
 
-/// **GIT-D9 / 5.9 LIVE — idempotent on `event_id` through the Bus runtime (0 dup).** A redelivered
-/// `ci.check.updated` is deduplicated by the runtime's `consumer_dedup` ledger → the handler runs
-/// ONCE → the projection has exactly one row, applied once.
 #[test]
 fn consumer_leg_is_idempotent_on_event_id_zero_dup() {
     let consumer = bind_consumer();
@@ -129,18 +95,14 @@ fn consumer_leg_is_idempotent_on_event_id_zero_dup() {
         envelope: env,
     };
 
-    // First delivery — the handler runs, the fact is applied + acked.
     assert_eq!(consumer.deliver(&msg), Delivered::Acked);
-    // The at-least-once transport RE-DELIVERS the same event_id — deduplicated, the handler is SKIPPED.
     assert_eq!(
         consumer.deliver(&msg),
         Delivered::Deduplicated,
-        "0 dup — handler runs once"
+        "0 dup - handler runs once"
     );
-    // A third redelivery is still deduplicated.
     assert_eq!(consumer.deliver(&msg), Delivered::Deduplicated);
 
-    // The projection has exactly ONE row, and the handler applied exactly once.
     let proj = consumer.handler().projection();
     assert_eq!(proj.len(), 1);
     assert_eq!(
@@ -151,28 +113,20 @@ fn consumer_leg_is_idempotent_on_event_id_zero_dup() {
     assert_eq!(consumer.handler().dropped_stale_count(), 0);
 }
 
-/// **GIT-D9 / 5.9 LIVE — per-aggregate ordering → monotonic supersession.** Deliver facts for one
-/// `(repo, commit_oid)` across contexts + re-runs, SCRAMBLED; the Bus's per-aggregate order
-/// ([`CheckSeamOrder`]) is the consumed order, so the consumer's monotonic supersession leaves the
-/// current row at the highest attempt — a late lower-attempt re-delivery is DROPPED (not a clobber).
 #[test]
 fn consumer_leg_per_aggregate_ordered_supersession_drops_stale() {
     let consumer = bind_consumer();
 
-    // The outbox assigned seqs (state-change order): build#1=1, test#1=2, build#2=3 (a re-run).
     let build1 = synthetic_check_updated("build", 1, CheckState::Failure, TrustTier::Trusted);
     let test1 = synthetic_check_updated("test", 1, CheckState::Success, TrustTier::Trusted);
     let build2 = synthetic_check_updated("build", 2, CheckState::Success, TrustTier::Trusted);
 
-    // The Bus's per-aggregate ordering substrate (the carriage half) orders them by seq regardless of
-    // the SCRAMBLED arrival (3, 1, 2) — this is what the consumer reads.
     let mut order = CheckSeamOrder::new(REPO, COMMIT);
     assert!(order.ingest(&build2, 3).unwrap());
     assert!(order.ingest(&build1, 1).unwrap());
     assert!(order.ingest(&test1, 2).unwrap());
-    assert_eq!(order.ordering_gap(), 0, "contiguous — 0 ops lost");
+    assert_eq!(order.ordering_gap(), 0, "contiguous - 0 ops lost");
 
-    // The consumer applies the facts in per-aggregate seq order (the order the Bus carriage exposes).
     for oc in order.in_order() {
         let env = match oc.seq {
             1 => &build1,
@@ -187,12 +141,7 @@ fn consumer_leg_per_aggregate_ordered_supersession_drops_stale() {
         assert_eq!(consumer.deliver(&msg), Delivered::Acked);
     }
 
-    // The at-least-once transport RE-DELIVERS the stale build attempt-1 LATE (a new physical
-    // delivery, but the SAME event_id — so the dedup ledger absorbs it; even without dedup the
-    // supersession would drop it). Use a fresh consumer to prove the supersession-drop independent of
-    // the dedup ledger: re-apply build1 directly through the handler.
     let handler = consumer.handler();
-    // The current build row is the attempt-2 success (the re-run), NOT the attempt-1 failure.
     let proj = handler.projection();
     let build_key = myelin_git::check_status::CheckKey {
         commit_oid: GitOid(COMMIT.into()),
@@ -208,10 +157,8 @@ fn consumer_leg_per_aggregate_ordered_supersession_drops_stale() {
         CheckState::Success,
         "the re-run success is current, not the stale failure"
     );
-    // Two contexts → two rows; the supersession was in-place (no duplicate build row).
     assert_eq!(proj.len(), 2);
 
-    // A directly-applied stale lower attempt is observably DROPPED (the supersession's loud half).
     let stale = CheckStatusConsumer::decode(&build1.payload).unwrap();
     let mut proj2 = handler.projection();
     assert_eq!(
@@ -223,13 +170,10 @@ fn consumer_leg_per_aggregate_ordered_supersession_drops_stale() {
     );
 }
 
-/// **GIT-D9 / 5.9 LIVE — a malformed payload dead-letters LOUDLY** (never silently dropped, never the
-/// wrong shape into the projection). The decode gate is a real gate.
 #[test]
 fn consumer_leg_dead_letters_a_malformed_payload() {
     let consumer = bind_consumer();
     let mut env = synthetic_check_updated("build", 1, CheckState::Success, TrustTier::Trusted);
-    // Corrupt the opaque payload (not a valid CheckStatus fact).
     env.payload = serde_json::json!({ "garbage": true });
     let msg = Message {
         subject: env.subject.0.clone(),
@@ -245,20 +189,15 @@ fn consumer_leg_dead_letters_a_malformed_payload() {
         }
         other => panic!("a malformed payload must dead-letter, got {other:?}"),
     }
-    // Nothing was applied into the projection (the wrong shape never lands).
     assert!(consumer.handler().projection().is_empty());
     assert_eq!(consumer.handler().applied_count(), 0);
 }
 
-/// **GIT-D9 / 5.9 LIVE — a foreign type slipping the whitelist dead-letters.** The handler binds only
-/// `ci.check.updated`; a non-ci.check.updated event is a wiring bug, dead-lettered loudly (rule 5).
 #[test]
 fn consumer_leg_dead_letters_a_foreign_type() {
     let consumer = bind_consumer();
     let mut env = synthetic_check_updated("build", 1, CheckState::Success, TrustTier::Trusted);
     env.type_ = EventType("git.ref.updated".into());
-    // Deliver it directly to the handler (the subject still matches the prefix; the handler's own
-    // type-guard is the second line of defence).
     assert!(matches!(
         consumer.handler().handle(&env, &mut myelin_events::HandlerTx::none()),
         myelin_events::HandleOutcome::NonRetryable(_)

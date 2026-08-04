@@ -1,20 +1,3 @@
-//! # FLOW-D4 drill — the multi-day HITL approval-card round-trip (P-FLOW-11 → P-208)
-//!
-//! The headline drill the P-FLOW-11 GATE requires (testing-strategy FLOW-D4): a gated workflow
-//! `wait_for_signal("approval:<call>", timeout)` PARKS (`state=waiting`, holding NO runtime) across a
-//! worker **restart** + a **deploy**; the approval is delivered **days later** with a **double-click**;
-//! the workflow resumes, consumes the approval **EXACTLY ONCE**, and runs (approved) or withholds
-//! (denied → **0 mutation**, AG-8). The exact threshold (testing-strategy FLOW-D4): **1 consume** on
-//! the signal-buffer-depth ledger; **withhold = 0 mutation**. A red drill is information — never weaken
-//! it to pass (EI-01 §3).
-//!
-//! **What "restart" + "deploy" model:** the engine drives runs through a [`FlowDispatcher`] (one
-//! per-partition worker). A RESTART is a FRESH dispatcher over the SAME run store + journal + signal
-//! buffer (the durable state survives the worker death). A DEPLOY is a re-registration of the
-//! workflow body (here the SAME version 1 — a deploy that does not change the workflow shape; a deploy
-//! that DOES bump the version is the FLOW-D2 divergence guard, drilled at P-FLOW-07). The durability is
-//! the point: the approval arrives across both, days later, and is still consumed exactly once.
-
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
     approval_wait_name, partition_for_run_id, request_approval_and_wait, run_state,
@@ -51,16 +34,13 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// The gated-tool workflow body: request approval (`agent.approval.requested` via the outbox) + wait;
-/// on approve → run the merge tool (one mutating activity → one effect ref); on decline/timeout →
-/// WITHHELD (0 mutation, AG-8). Deterministic over its journal (the flow-determinism contract).
 fn gated_merge_body() -> Box<WorkflowBody> {
     Box::new(|ctx: &mut WfCtx| {
         let outcome = request_approval_and_wait(
             ctx,
             "call-1",
             vec![ArtifactRef("myelin://acme/agent/tool/merge".into())],
-            Some(7 * 86_400), // a one-week approval window.
+            Some(7 * 86_400),
             |refs| myelin_events::EventDraft {
                 type_: myelin_events::EventType("agent.approval.requested".into()),
                 subject: myelin_events::ArtifactRef("myelin://acme/agent/run/R1".into()),
@@ -77,10 +57,9 @@ fn gated_merge_body() -> Box<WorkflowBody> {
             WaitOutcome::Signalled {
                 payload_key_ref, ..
             } if payload_key_ref.as_deref() == Some(DECLINE_MARKER) => {
-                Ok(vec![]) // DENY → WITHHELD: 0 mutation (AG-8).
+                Ok(vec![])
             }
             WaitOutcome::Signalled { .. } => {
-                // APPROVE → run the merge tool (one mutating activity → one effect).
                 let eff = ctx
                     .activity(RetryPolicy { max_attempts: 1 }, |_i, _a| {
                         Ok(vec![ArtifactRef(
@@ -90,14 +69,12 @@ fn gated_merge_body() -> Box<WorkflowBody> {
                     .map_err(|e| format!("{e:?}"))?;
                 Ok(eff)
             }
-            WaitOutcome::TimedOut => Ok(vec![]), // auto-deny → 0 mutation.
-            WaitOutcome::Parked => Ok(vec![]),   // still waiting.
+            WaitOutcome::TimedOut => Ok(vec![]),
+            WaitOutcome::Parked => Ok(vec![]),
         }
     })
 }
 
-/// Build the shared durable substrate (run store + journal + signal buffer + outbox + telemetry) a
-/// worker drives over. Restarts share THIS substrate (the durable state survives a worker death).
 struct Substrate {
     runs: RunStore,
     journal: WfJournal,
@@ -106,8 +83,6 @@ struct Substrate {
     tele: FlowTelemetry,
 }
 
-/// A FRESH dispatcher over the shared substrate (a "restart" / a "redeploy" — a new worker process),
-/// on the run's partition so its lease scan finds it.
 fn fresh_worker(sub: &Substrate, worker: &str, partition: i16) -> FlowDispatcher {
     let mut disp = FlowDispatcher::new(
         sub.runs.clone(),
@@ -121,12 +96,10 @@ fn fresh_worker(sub: &Substrate, worker: &str, partition: i16) -> FlowDispatcher
         30,
     )
     .with_signals(sub.signals.clone());
-    disp.register("agent.run", gated_merge_body()); // the deploy re-registers the body.
+    disp.register("agent.run", gated_merge_body());
     disp
 }
 
-/// **FLOW-D4 (APPROVE): park across a restart + a deploy, approve days later with a double-click,
-/// resume + run, consume EXACTLY ONCE.** The threshold: 1 consume; the merge runs once.
 #[test]
 fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
     let ex = FlowExecutor::new(minter(), tenant(), region());
@@ -148,7 +121,6 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
         tele: FlowTelemetry::new(),
     };
 
-    // WORKER 1 ticks: the body requests the approval card + PARKS (state=waiting holds no runtime).
     let part = partition_for_run_id(&run.0);
     let w1 = fresh_worker(&sub, "worker-1", part);
     let o1 = w1
@@ -162,7 +134,7 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
     assert_eq!(
         sub.runs.get(&tenant(), &run.0).unwrap().state,
         run_state::WAITING,
-        "state=waiting — the multi-day HITL wait holds no runtime (FLOW-D4)"
+        "state=waiting - the multi-day HITL wait holds no runtime (FLOW-D4)"
     );
     assert_eq!(
         sub.outbox.committed_count(),
@@ -170,10 +142,8 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
         "the agent.approval.requested card was emitted once"
     );
 
-    // --- WORKER 1 CRASHES (restart) + the service is REDEPLOYED while the run is parked (days pass). ---
     drop(w1);
 
-    // DAYS LATER: a human clicks Approve — and DOUBLE-CLICKS (two deliveries under the SAME idem_key).
     let approve = || {
         ex.signal(SignalSpec {
             run: run.clone(),
@@ -185,7 +155,7 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
         .expect("approve")
     };
     let first = approve();
-    let second = approve(); // the DOUBLE-CLICK.
+    let second = approve();
     assert_eq!(
         first,
         myelin_flow::SignalOutcome::Buffered,
@@ -202,10 +172,8 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
         "the double-click buffered EXACTLY ONE approval (the workflow wakes once)"
     );
 
-    // the signal-wake flips the parked run waiting → running so the NEW worker re-leases it.
     sub.runs.wake(&tenant(), &run.0);
 
-    // --- WORKER 2 (the redeployed process) re-leases + resumes the run DAYS later. ---
     let w2 = fresh_worker(&sub, "worker-2", part);
     let o2 = w2
         .tick(7 * 86_400 + 2_000, "2026-06-28T00:00:00Z", 7)
@@ -219,19 +187,16 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
         other => panic!("expected the run to resume + complete, got {other:?}"),
     }
 
-    // THE THRESHOLD: 1 consume on the signal-buffer-depth ledger (the approval was consumed ONCE).
     assert_eq!(
         sub.signals.buffered_depth(),
         0,
-        "the approval was consumed EXACTLY ONCE — the buffered depth dropped to 0 (FLOW-D4: 1 consume)"
+        "the approval was consumed EXACTLY ONCE - the buffered depth dropped to 0 (FLOW-D4: 1 consume)"
     );
-    // the card request was emitted exactly once across BOTH drives (NOT re-emitted on the resume).
     assert_eq!(
         sub.outbox.committed_count(),
         1,
         "the card request was emitted ONCE (no re-emit on resume)"
     );
-    // the run is terminal (completed) — it will never be driven again.
     assert!(sub.runs.get(&tenant(), &run.0).unwrap().state == run_state::COMPLETED);
 
     println!(
@@ -240,8 +205,6 @@ fn flow_d4_multiday_hitl_approve_across_restart_and_deploy_consumes_once() {
     );
 }
 
-/// **FLOW-D4 (DENY): park, deny days later → WITHHELD = 0 MUTATION (AG-8).** The threshold:
-/// withhold = 0 mutation. The merge activity NEVER runs; the decline is consumed once.
 #[test]
 fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
     let ex = FlowExecutor::new(minter(), tenant(), region());
@@ -263,7 +226,6 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
         tele: FlowTelemetry::new(),
     };
 
-    // WORKER 1: request the card + park.
     let part = partition_for_run_id(&run.0);
     let w1 = fresh_worker(&sub, "worker-1", part);
     assert_eq!(
@@ -272,9 +234,8 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
         "the run parks on the approval wait"
     );
     let emits_after_card = sub.outbox.committed_count();
-    drop(w1); // crash + redeploy.
+    drop(w1);
 
-    // DAYS LATER: a human clicks DENY (empty payload + the DECLINE_MARKER, §3.4) — and double-clicks.
     let deny = || {
         ex.signal(SignalSpec {
             run: run.clone(),
@@ -286,7 +247,7 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
         .expect("deny")
     };
     deny();
-    deny(); // double-click → one buffered decline.
+    deny();
     assert_eq!(
         sub.signals.count_for_run(&tenant(), &run.0),
         1,
@@ -294,7 +255,6 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
     );
     sub.runs.wake(&tenant(), &run.0);
 
-    // WORKER 2: resume + WITHHOLD (0 mutation).
     let w2 = fresh_worker(&sub, "worker-2", part);
     let o2 = w2
         .tick(2_000, "2026-06-28T00:00:00Z", 7)
@@ -305,12 +265,10 @@ fn flow_d4_multiday_hitl_deny_withholds_zero_mutation() {
         "a DENY completes the run with NO effect (the merge tool was WITHHELD)"
     );
 
-    // THE THRESHOLD: withhold = 0 mutation. The merge activity NEVER ran → no effect emitted past the
-    // card request; the buffered depth dropped to 0 (the decline was consumed once).
     assert_eq!(
         sub.outbox.committed_count(),
         emits_after_card,
-        "the declined merge made 0 MUTATION — no effect emitted past the card request (AG-8)"
+        "the declined merge made 0 MUTATION - no effect emitted past the card request (AG-8)"
     );
     assert_eq!(
         sub.signals.buffered_depth(),

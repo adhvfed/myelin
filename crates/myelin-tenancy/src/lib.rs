@@ -1,392 +1,98 @@
-//! # `myelin-tenancy` — tenant / region / residency types (the DAG root)
-//!
-//! **Owning architecture doc:** `planning/05-refined-shared-systems-architecture/00-platform-substrate.md`
-//! §2.5 (`myelin-tenancy` — the substrate-relevant seam) and §2.9 (the dependency root).
-//!
-//! **Contract-index cluster:** 12 — Tenancy & control plane
-//! (`planning/05-refined-shared-systems-architecture/contract-index.md` rows 12.1, 12.5).
-//!
-//! ## What crosses the crate boundary here (the frozen surface)
-//! `TenantId` and `Region` are the `(tenant, region)` first-class partition key
-//! (contract 12.1; ADR-11). Tenant is the first column / partition key of *everything*
-//! and comes from the verified token, never the URL path (architecture §0.1). This crate
-//! is the **sink** of the dependency DAG (§2.9): it depends on nothing above it, so a
-//! cycle cannot form. The `no-cross-sync-cycle` lint (P-S10) enforces the same property
-//! on the *service* call graph; the `crate-graph-acyclic` test in this workspace
-//! (`myelin-substrate`) enforces it on the *crate* graph.
-//!
-//! ## P-CP-01 (P-025) — the partition-key types frozen as the names/units anchor
-//! This prompt fills the `myelin-tenancy` skeleton P-001 stood up with the **three**
-//! contract-12.1 partition-key value types — [`TenantId`], [`Region`], **[`ResidencyTag`]** —
-//! to the frozen §4.1 shape: `(tenant, region)` is the first-class partition key, injected by
-//! the harness, identical at every isolation tier. A change to any of these glue types breaks
-//! every consumer's build *now*, never silently in prod (ADR-01). `TenantId` is an **opaque,
-//! non-personal** token (NOT a slug, NOT an email — `control-plane-pii-free`); `Region` is
-//! **immutable once assigned** (a region change is a *new value*, never a mutation — there is
-//! no setter and the field is exposed read-only by construction discipline); `ResidencyTag` is
-//! the per-row residency marker the `residency-pin` lint (P-CP-03 / P-026) reads.
-//!
-//! ## P-CP-02 (P-027) — the frozen-not-live `CrossCellPointer` bridge frame
-//! This prompt adds the **PII-free cross-cell pointer bridge frame** (contract 12.6,
-//! architecture §6.1) to this crate — the four-field frame copied byte-exact:
-//! [`CrossCellPointer`] `{ subject: `[`OpaqueSubjectId`]`, type: `[`ArtifactType`]`,
-//! correlation_id: `[`CorrelationId`]`, home_cell: `[`CellId`]` }` — plus the supporting
-//! newtypes it needs ([`CellId`], [`OpaqueSubjectId`], [`ArtifactType`]). The frame carries
-//! **only** these four fields — never payload, never PII, never authz state (§6.1). It is the
-//! one shape ISS portfolio rollup / KN cross-cell collab / CHAT cross-org channels compile
-//! against (the named multi-cell floor they ride, C-3), reconciled up front (EI-01 §7).
-//! The `correlation_id` field reuses the SAME `CorrelationId` the envelope carries (2.1) — to
-//! keep ONE definition platform-wide it is defined here (the sink) and re-exported as
-//! `myelin_events::CorrelationId`, mirroring the `ArtifactRef` DAG-deviation below.
-//!
-//! ## Floors named (stubbed bodies → filling prompt)
-//! - **FROZEN-NOT-LIVE: the [`CrossCellPointer`] frame is the TYPE only — there is NO
-//!   resolution path yet.** The cell-local bridge *resolution* (cell A asks cell B to
-//!   `resolve(ref, viewer, mode)` IN B, permission-checked in B, only the rendered projection
-//!   crossing — §6.2) is the **M5 multi-cell build, P-CP-19** ("CrossCellPointer bridge
-//!   resolution live, always cell-local, 0 PII"). The type exists so consumers compile *now*
-//!   and so the `control-plane-pii-free` lint (P-CP-04 / P-028) can guard it (no
-//!   `is_personal=true` field). There is deliberately **no `resolve()` method** on the frame —
-//!   adding it early would claim a green this band has not earned (VISION §3, name-your-floors;
-//!   §6.3, the honest designed-vs-deferred floor).
-//! - The control-plane *routing/attestation* surfaces (`discover`, `place`, `placement_of`,
-//!   `residency_verify`) live in the `myelin-control-plane` service crate — CP-M1 (P-CP-05…),
-//!   NOT this prompt; this crate ships only the partition-key value types they thread.
-//! - The `residency-pin` lint that READS `Region`/`ResidencyTag` (recognising them as the
-//!   region-binder on a store construction) is **P-CP-03 (P-026)**; the storage-half twin
-//!   already ships in P-ST-04 / P-020 (`myelin-lints`, which already tokenises `ResidencyTag`).
-//!
-//! ## DEVIATION FROM A FROZEN SHAPE (EI-01 §1 — code wins, write it down)
-//! The architecture (§2.1) sites the `ArtifactRef` *type* in `myelin-events`, and the
-//! P-001 prompt lists `ArtifactRef` under `myelin-events`. BUT the frozen DAG (§2.9) has
-//! `myelin-identity` upstream of `myelin-events` (identity is a sink with only tenancy
-//! below it), and `AuthzClient::check(..., object: &ArtifactRef, ...)` (contract 4.2,
-//! §2.2) takes an `ArtifactRef`. Putting the type in `myelin-events` would force
-//! identity → events, a back-edge that VIOLATES root-last ordering and breaks
-//! "identity depends on nothing above tenancy".
-//!
-//! Resolution: the `ArtifactRef` **value newtype** (`pub struct ArtifactRef(String)` —
-//! pure data; parse/format/resolve stay in `myelin-refs`, REF-3) is defined HERE in the
-//! DAG sink and **re-exported as `myelin_events::ArtifactRef`** so the frozen public
-//! path the envelope + the prompt name is preserved byte-for-byte for every consumer.
-//! No signature changes; only the definition site moves down to keep the DAG acyclic.
-//! This is the minimal change that satisfies BOTH "ArtifactRef is the envelope's
-//! `subject` type in events" AND "identity is a sink". Flagged in the P-001 report.
-
 use serde::{Deserialize, Serialize};
 
-/// The first-class tenant partition key (contract 12.1; ADR-11; architecture §4.1).
-///
-/// Tenant is the first column / partition key of everything; there is no cross-tenant
-/// query path. Held as an **opaque, non-personal** comparable token so it can be a SQL
-/// partition key and a telemetry/trace label *without* exposing tenant-name PII
-/// (`control-plane-pii-free`, §3.3). It is **NOT a slug, NOT an email, NOT a tenant name**
-/// — the human tenant name + admin email are born *inside* the assigned cell (two-phase
-/// signup, §6), never in this id. The id wraps a `String` only as its storage representation
-/// (a ULID/opaque token in practice); it deliberately does **not** implement `From<String>`,
-/// `From<&str>`, or `Display`, so a name/email/slug cannot be *implicitly* coerced into a
-/// `TenantId` — construction is always the explicit, greppable `TenantId(token)` /
-/// [`TenantId::from_token`] call, which an audit can scan for. See the opaqueness type-level
-/// test below (`tenant_id_is_opaque_not_personal`).
-///
-/// # Opaque-token doc-test (the names/units anchor)
-/// A `TenantId` is born from an **opaque token**, and there is *no* implicit coercion from a
-/// personal string — a tenant name / email / slug can never become a `TenantId` by accident:
-/// ```
-/// use myelin_tenancy::TenantId;
-/// // The ONLY way in is the explicit, greppable opaque-token constructor:
-/// let t = TenantId::from_token("01J0OPAQUE_ULID");
-/// assert_eq!(t.as_str(), "01J0OPAQUE_ULID");
-/// // It is comparable/hashable (a usable partition key) but carries no PII accessor —
-/// // there is no `t.name()` / `t.email()`, because there is no personal data inside it.
-/// assert_eq!(t, TenantId::from_token("01J0OPAQUE_ULID"));
-/// ```
-/// The negative half — that `TenantId` does **not** implement `From<String>` / `From<&str>`,
-/// so a bare personal string cannot coerce into a tenant id — is a `compile_fail` doc-test:
-/// ```compile_fail
-/// use myelin_tenancy::TenantId;
-/// // A bare personal string must NOT coerce into a TenantId — this must FAIL to compile.
-/// let _personal: TenantId = "ada@example.com".to_string().into();
-/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TenantId(pub String);
 
 impl TenantId {
-    /// Construct a `TenantId` from an already-minted **opaque token** (a ULID / control-plane
-    /// routing token, §3.2 — never a name/email/slug). Named `from_token`, not `from_string`,
-    /// so the call site reads as "this is an opaque id" and so the type can *never* be the
-    /// target of a blanket `From<String>`/`From<&str>` (which would let a personal string be
-    /// coerced in silently — the bug class `control-plane-pii-free` exists to forbid).
     #[inline]
     pub fn from_token(token: impl Into<String>) -> Self {
         TenantId(token.into())
     }
 
-    /// The opaque token as a string slice (for use as a partition-key / trace label). This is
-    /// the *only* read accessor; there is intentionally no `name()` / `email()` — there is no
-    /// PII inside a `TenantId` to expose.
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// The residency region a `(tenant, region)` pair is pinned to (contract 12.1; ADR-11;
-/// architecture §4.1).
-///
-/// Every store/stream/index/cache declares a region (the `residency-pin` lint, P-CP-03 /
-/// P-026); `Region` is the value that declaration carries, and it is the compiled-in shard
-/// key so "EU data stays in EU" and "scale this tenant out" are the *same* mechanism (§1.3).
-///
-/// **Immutable once assigned (frozen rule, §4.1 / §5.1).** A cell's region — and therefore a
-/// tenant's region — never changes; *a region change is modelled as a NEW value, never as a
-/// mutation of an existing one.* This type carries **no setter and no `&mut` accessor**: you
-/// build a new `Region` and place it, you never rewrite one in place. The immutability is
-/// structural (there is no API to mutate the inner value through a shared reference); the
-/// `region change == new value` discipline is proven by the `region_is_immutable_new_value`
-/// compile-fixture test below.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Region(pub String);
 
 impl Region {
-    /// Construct a `Region` value. There is deliberately no in-place mutator: a region change
-    /// is a *new* `Region` (see the type doc) — this constructor is how that new value is made.
     #[inline]
     pub fn new(code: impl Into<String>) -> Self {
         Region(code.into())
     }
 
-    /// The region code as a string slice (for the partition key / the `residency-pin`
-    /// region-binder / blast-radius scoping, §10.1).
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// The per-row residency marker (contract 12.1; architecture §4.3 / §5.3).
-///
-/// Where [`Region`] is the *cell's* immutable region, `ResidencyTag` is the **per-row** tag a
-/// store carries on each stored fact so the `residency-pin` lint (P-CP-03 / P-026) can assert
-/// `row.region == cell.region` at the write boundary — a region-mismatched write fails *at the
-/// boundary*, never reaching a cross-region store (`external-insights/04` §1: residency as
-/// region-pinning, no cross-region query path). It is the third type of the `(tenant, region)`
-/// partition-key family frozen here as the names/units anchor; the `myelin-lints` residency-pin
-/// scanner already tokenises `ResidencyTag` as a region-binder (P-ST-04 / P-020), and P-CP-03
-/// wires it as the per-row write-boundary assertion.
-///
-/// A `ResidencyTag` is **derived from** the cell's [`Region`] and is therefore immutable in the
-/// same way: it is set once on write to the owning cell's region and never rewritten in place.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ResidencyTag(pub Region);
 
 impl ResidencyTag {
-    /// Tag a row with the cell's region (the only way a residency tag is born — `row.region`
-    /// is *pinned to* `cell.region`, §4.3). Takes the cell [`Region`] by value: the row adopts
-    /// the cell's region, it does not pick its own.
     #[inline]
     pub fn pinned_to(cell_region: Region) -> Self {
         ResidencyTag(cell_region)
     }
 
-    /// The region this row is pinned to (what the `residency-pin` write-boundary check reads).
     #[inline]
     pub fn region(&self) -> &Region {
         &self.0
     }
 }
 
-/// The canonical artifact reference (contract 5.1; ADR-13.1).
-///
-/// `myelin://<tenant>/<subsystem>/<type>/<id>[#sub]`. This is the **value type only** —
-/// `parse`/`format`/`resolve` live in `myelin-refs` (REF-3), which must not be
-/// re-implemented per service. The `#sub` sub-anchor grammar is frozen in Refs
-/// (contract 5.7, X-4).
-///
-/// **Definition-site note (see crate-level DEVIATION):** the architecture sites this
-/// type in `myelin-events`, but the DAG (§2.9) puts `myelin-identity` above events and
-/// `AuthzClient::check` needs `ArtifactRef`. So the value type lives here in the sink
-/// and is re-exported as `myelin_events::ArtifactRef`; the frozen path is preserved and
-/// the DAG stays acyclic with identity-as-sink.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct ArtifactRef(pub String);
 
-/// The causal-root id (architecture §2.1; BUS-5). Carries through a whole causal chain.
-///
-/// **Definition-site note (see crate-level DEVIATION — same shape as `ArtifactRef`).** The
-/// `CorrelationId` value type is the envelope's causal-root field (contract 2.1) AND the
-/// `correlation_id` field of the frozen [`CrossCellPointer`] frame (contract 12.6, §6.1 —
-/// "ties it to the originating causal chain, BUS-5"). It would naively live in `myelin-events`
-/// (where the envelope is), but the DAG (architecture §2.9) puts `myelin-events` ABOVE
-/// `myelin-tenancy`, and the frame is owned HERE in the sink. Re-defining the type in tenancy
-/// would create a SECOND `CorrelationId` (the coherence bug-class EI-01 §7 forbids — one type,
-/// one definition). So — exactly as with `ArtifactRef` — the *value type* is defined here in
-/// the DAG sink and **re-exported as `myelin_events::CorrelationId`**; the frozen envelope path
-/// is preserved byte-for-byte and there remains exactly ONE `CorrelationId` platform-wide. The
-/// derive set is kept identical to the previous events-side definition (no `Ord`, by design:
-/// a correlation id is an opaque causal token, not an ordering key).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CorrelationId(pub String);
 
-/// The cell a tenant / artifact is **homed** in (contract 12.6; architecture §6.1).
-///
-/// A `CellId` is the opaque routing handle of a Myelin **cell** (the unit of placement —
-/// Pool / Bridge / Dedicated, §7.1). It is PII-free (a cell hosts many tenants and carries no
-/// person), and like [`TenantId`] it is an *opaque token*, never a name/email/slug — so it can
-/// be a routing key and a trace label without leaking PII (`control-plane-pii-free`, P-CP-04).
-/// It is the `home_cell` field of the frozen [`CrossCellPointer`] frame: "where it lives;
-/// resolution happens THERE" (§6.2 — resolution is always cell-local).
-///
-/// Construction is the explicit, greppable [`CellId::from_token`]; there is deliberately no
-/// `From<String>`/`Display`, so a personal string cannot coerce into a cell id by accident.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct CellId(pub String);
 
 impl CellId {
-    /// Construct a `CellId` from an already-minted **opaque cell-routing token** (never a
-    /// name/email/slug — same opaqueness discipline as [`TenantId::from_token`]).
     #[inline]
     pub fn from_token(token: impl Into<String>) -> Self {
         CellId(token.into())
     }
 
-    /// The opaque cell token as a string slice (a routing key / trace label — no PII inside).
     #[inline]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-/// The **opaque** subject of a cross-cell pointer (contract 12.6; architecture §6.1).
-///
-/// This is the `subject` field of the frozen [`CrossCellPointer`] frame. The architecture is
-/// emphatic (§6.1): the subject is "an opaque id — **NEVER** a name/email/body"; it is an
-/// "opaque `ArtifactRef`-class id, **not a person**". So `OpaqueSubjectId` is modelled as a
-/// thin wrapper over an [`ArtifactRef`] token — an `myelin://…` artifact reference (issue /
-/// page / channel / …), which is itself opaque and PII-free — and it carries **no** name/email
-/// accessor (there is no PII inside it to expose). It is what the `control-plane-pii-free` lint
-/// (P-CP-04) will assert is NOT classified `is_personal=true`.
-///
-/// It is named `OpaqueSubjectId` (not `SubjectId`) precisely so the call site reads as "this is
-/// an opaque pointer, not a person" — the frozen §6.1 name. Construction is the explicit,
-/// greppable [`OpaqueSubjectId::from_ref`] over an already-parsed opaque [`ArtifactRef`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OpaqueSubjectId(pub ArtifactRef);
 
 impl OpaqueSubjectId {
-    /// Build an `OpaqueSubjectId` from the opaque [`ArtifactRef`] it points at (the only way in
-    /// — the subject is always an `ArtifactRef`-class opaque id, never a person, §6.1).
     #[inline]
     pub fn from_ref(artifact: ArtifactRef) -> Self {
         OpaqueSubjectId(artifact)
     }
 
-    /// The opaque artifact reference this subject points at (a `myelin://…` token — PII-free).
     #[inline]
     pub fn artifact_ref(&self) -> &ArtifactRef {
         &self.0
     }
 }
 
-/// What kind of artifact a [`CrossCellPointer`] points at (contract 12.6; architecture §6.1).
-///
-/// The `type` field of the frozen frame — "what kind of thing is pointed at
-/// (issue/page/channel/…)". It is a small, closed, **PII-free** classification (a kind tag, not
-/// a person), kept deliberately coarse at the control-plane grain: the control plane needs only
-/// to know *which subsystem owns the home-cell resolution*, never the artifact's content. The
-/// fine-grained per-subsystem artifact taxonomy lives in each subsystem's own contracts; this
-/// enum is the bridge-frame-level kind the §6.1 examples name, with an explicit `Other(kind)`
-/// escape so a new subsystem can ride the FROZEN four-field frame without a frame change (the
-/// frame shape stays frozen; only this open kind set grows — additive, never a field add).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ArtifactType {
-    /// An Issues artifact (issue / worklog / initiative) — ISS rollup rides this (§6.2).
     Issue,
-    /// A Knowledge artifact (page / row / field) — KN cross-cell collab rides this (§6.2).
     Page,
-    /// A Chat artifact (channel / thread / message) — CHAT cross-org channels ride this (§6.2).
     Channel,
-    /// A Git artifact (repo / ref / commit-anchored sub).
     Repo,
-    /// An open escape for a subsystem not yet enumerated — a PII-free *kind* token, never a
-    /// person. Keeps the four-field frame FROZEN while the kind set stays additive.
     Other(String),
 }
 
-/// The **frozen-not-live** PII-free cross-cell pointer bridge frame (contract 12.6;
-/// architecture §6.1 — "the frame, frozen, PII-free").
-///
-/// This is the four-field bridge frame that ISS portfolio rollup, KN cross-cell collab, and
-/// CHAT cross-org channels compile against (the named multi-cell floor they ride, C-3). It is
-/// copied **byte-exact** from the §6.1 shape and carries **only** these four fields — *never*
-/// payload, *never* PII, *never* authz state:
-///
-/// | field            | type                | meaning (§6.1)                                   |
-/// |------------------|---------------------|--------------------------------------------------|
-/// | `subject`        | [`OpaqueSubjectId`] | an opaque id — NEVER a name/email/body            |
-/// | `r#type`         | [`ArtifactType`]    | what kind of thing is pointed at                 |
-/// | `correlation_id` | [`CorrelationId`]   | ties it to the originating causal chain (BUS-5)  |
-/// | `home_cell`      | [`CellId`]          | where it lives; resolution happens THERE         |
-///
-/// ## FLOOR — FROZEN-NOT-LIVE (named, with its follow-on)
-/// **This type is the frozen FRAME only — there is NO resolution path yet.** The bridge
-/// *resolution* (cell A asks cell B to `resolve(ref, viewer, mode)` IN B, permission-checked
-/// in B, only the already-rendered projection crossing — §6.2) is the **M5 multi-cell build,
-/// P-CP-19** (`CrossCellPointer` bridge resolution goes live, always cell-local, 0 PII). This
-/// crate ships the type so consumers compile *now* (EI-01 §7 — reconcile the contract shape up
-/// front so ISS/KN/CHAT ride ONE frozen shape) and so the `control-plane-pii-free` lint
-/// (P-CP-04 / P-028) can guard it; the cell-local resolution is deferred to P-CP-19. Per VISION
-/// §3 (name-your-floors) and §6.3 (the honest designed-vs-deferred floor) this floor is named
-/// in writing here with its follow-on pointer. **Do not add a `resolve()` method here** — that
-/// is P-CP-19's deliverable; adding it early would claim a green this band has not earned.
-///
-/// ## Why a struct with private fields + a constructor (not bare `pub` fields)
-/// The frame is *constructed* from exactly the four §6.1 inputs and is otherwise read-only; the
-/// PII-free invariant is structural — there is no setter through which a fifth, PII-bearing
-/// field could be smuggled in. A fifth field cannot be added without changing THIS frozen type,
-/// which (ADR-01) breaks every consumer's build *now*, never silently in prod.
-///
-/// # Frame-shape gate (the prompt's GATE doc-test — exactly four fields, `subject` opaque)
-/// A `CrossCellPointer` is built from its four §6.1 inputs and exposes exactly those four —
-/// `subject` is an [`OpaqueSubjectId`] (an `ArtifactRef`-class opaque id, NEVER a name/email):
-/// ```
-/// use myelin_tenancy::{
-///     ArtifactRef, ArtifactType, CellId, CorrelationId, CrossCellPointer, OpaqueSubjectId,
-/// };
-/// let p = CrossCellPointer::new(
-///     OpaqueSubjectId::from_ref(ArtifactRef("myelin://01J0ACME/issues/issue/42".into())),
-///     ArtifactType::Issue,
-///     CorrelationId("01J0CORR".into()),
-///     CellId::from_token("cell-eu-west-3"),
-/// );
-/// // Exactly the four frozen fields are readable — and nothing else (no payload/PII/authz).
-/// let _subject: &OpaqueSubjectId = p.subject();
-/// let _type: &ArtifactType = p.artifact_type();
-/// let _corr: &CorrelationId = p.correlation_id();
-/// let _home: &CellId = p.home_cell();
-/// // `subject` is opaque: it yields an ArtifactRef token, never a person — there is no
-/// // `p.subject().name()` / `.email()` to call, because no PII lives in the frame.
-/// assert_eq!(
-///     p.subject().artifact_ref().0,
-///     "myelin://01J0ACME/issues/issue/42"
-/// );
-/// ```
-/// The negative half — that a fifth, PII-bearing field cannot be smuggled onto the frame via a
-/// struct literal (the fields are private; the only constructor takes exactly four) — is a
-/// `compile_fail` doc-test:
-/// ```compile_fail
-/// use myelin_tenancy::CrossCellPointer;
-/// // The frame's fields are private and there is NO fifth field — this struct literal that
-/// // tries to add a PII `email` field must FAIL to compile (the frame stays four-field, PII-free).
-/// let _ = CrossCellPointer {
-///     email: "ada@example.com".to_string(),
-/// };
-/// ```
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CrossCellPointer {
     subject: OpaqueSubjectId,
-    // `type` is a Rust keyword; the FROZEN field NAME is `type` (the wire/serde name is pinned
-    // to `type` below so the §6.1 frame is byte-exact on the wire), exposed via `r#type` in Rust.
     #[serde(rename = "type")]
     r#type: ArtifactType,
     correlation_id: CorrelationId,
@@ -394,11 +100,6 @@ pub struct CrossCellPointer {
 }
 
 impl CrossCellPointer {
-    /// Construct the frozen four-field bridge frame from exactly its four §6.1 inputs.
-    ///
-    /// There is no other constructor and no setter: a `CrossCellPointer` is born with exactly
-    /// these four PII-free fields and is read-only thereafter (the structural PII-free
-    /// invariant). It carries NO resolution path — see the FROZEN-NOT-LIVE floor on the type.
     #[inline]
     pub fn new(
         subject: OpaqueSubjectId,
@@ -414,26 +115,21 @@ impl CrossCellPointer {
         }
     }
 
-    /// The opaque subject pointed at (never a person — [`OpaqueSubjectId`], §6.1).
     #[inline]
     pub fn subject(&self) -> &OpaqueSubjectId {
         &self.subject
     }
 
-    /// What kind of artifact is pointed at ([`ArtifactType`], §6.1).
     #[inline]
     pub fn artifact_type(&self) -> &ArtifactType {
         &self.r#type
     }
 
-    /// The causal-root id tying the pointer to its originating chain (BUS-5, §6.1).
     #[inline]
     pub fn correlation_id(&self) -> &CorrelationId {
         &self.correlation_id
     }
 
-    /// The home cell where the pointed-at artifact lives — **resolution happens THERE**
-    /// (cell-local, §6.2). The resolution path itself is the P-CP-19 (M5) follow-on.
     #[inline]
     pub fn home_cell(&self) -> &CellId {
         &self.home_cell
@@ -445,80 +141,40 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Compile-asserting test: the frozen public surface exists with the frozen field
-    /// shapes — `TenantId`, `Region`, and `ResidencyTag` are the three contract-12.1
-    /// partition-key value types. If a field name/shape drifts from the §4.1/§12.1 anchor,
-    /// this stops compiling.
     #[test]
     fn surface_partition_key_types_exist() {
         let tenant: TenantId = TenantId("01J0TENANT".to_string());
         let region: Region = Region("eu-west".to_string());
         let tag: ResidencyTag = ResidencyTag::pinned_to(region.clone());
-        // ordering + hashing are part of the frozen shape (partition-key usable).
         assert_eq!(tenant, TenantId("01J0TENANT".to_string()));
         assert!(region < Region("eu-westz".to_string()));
         assert_eq!(tag.region(), &region);
     }
 
-    /// **Opaqueness type-level test (the prompt's required `TenantId` test).** Proves
-    /// `TenantId` is an *opaque token*, not a name/email/slug type, and cannot be
-    /// *accidentally* coerced from a personal string. The guarantee is structural: a blanket
-    /// `From<String>`/`From<&str>`/`Display` would let `let t: TenantId = some_email.into();`
-    /// compile (the `control-plane-pii-free` bug class). We assert at the type level that no
-    /// such conversion exists, while the *explicit* opaque-token constructor does.
     #[test]
     fn tenant_id_is_opaque_not_personal() {
-        // Helper that is satisfiable IFF `T: From<S>` exists. We do NOT call it for
-        // (TenantId, String) / (TenantId, &str): those impls must not exist, so the
-        // corresponding lines below are deliberately ABSENT (a present line would fail to
-        // compile, turning this into the captured compile-fixture the prompt asks for).
         fn assert_from<T, S>()
         where
             T: From<S>,
         {
         }
-        // A *personal* string type stands in for an email/name/slug.
         struct Email(#[allow(dead_code)] String);
-        // POSITIVE: the opaque-token path IS the way in, and it is explicit + greppable.
         let t = TenantId::from_token("01J0OPAQUE");
         assert_eq!(t.as_str(), "01J0OPAQUE");
-        // NEGATIVE (structural): there is no `From<Email> for TenantId`, so an email cannot
-        // be coerced into a tenant id. If someone added `impl From<Email> for TenantId`,
-        // uncommenting the next line would compile — its ABSENCE is the proof.
-        // assert_from::<TenantId, Email>();   // must NOT compile — left commented on purpose.
         let _ = Email("ada@example.com".to_string());
-        // Sanity: the helper itself is well-formed against a real From impl (String→String).
         assert_from::<String, &str>();
     }
 
-    /// **Region-immutable compile-fixture (the prompt's required `Region` test).** A region
-    /// change is modelled as a *new value*, never a mutation: there is no setter / `&mut`
-    /// accessor on `Region`, so "relocate to a new region" is `Region::new(..)`, producing a
-    /// distinct value, never an in-place rewrite. This test exercises exactly that discipline.
     #[test]
     fn region_is_immutable_new_value() {
         let original = Region::new("eu-west");
-        // "Changing" the region produces a NEW value; `original` is untouched (it is not
-        // mutated through any accessor — there is none).
         let relocated = Region::new("eu-north");
         assert_ne!(original, relocated);
-        assert_eq!(original.as_str(), "eu-west"); // original is unchanged.
-                                                  // There is intentionally no `original.set_region(..)` / `*original.0 = ..` API: the
-                                                  // type carries no in-place mutator, so immutability is structural, not by convention.
+        assert_eq!(original.as_str(), "eu-west");
     }
 
-    /// **CDC pair for 12.1 (provider + consumer).** The provider side is this crate exporting
-    /// `(TenantId, Region)`; the consumer side is a downstream store handle *parameterised by*
-    /// the partition key — a `StoreHandle` keyed by `(TenantId, Region)` that refuses any read
-    /// not scoped to a `(tenant, region)`. This is the contract the harness injects everywhere
-    /// (§4.1: "the first-class partition key, injected by the harness"). If the partition-key
-    /// shape drifts, this consumer stops compiling — the whole point of a glue-crate CDC.
     #[test]
     fn cdc_12_1_store_handle_parameterised_by_tenant_region() {
-        /// A stand-in consumer: a per-`(tenant, region)` store handle (the shape every real
-        /// store — OLTP/blob/index/cache — opens through). It can ONLY be opened with a
-        /// partition key, and every row it holds carries the residency tag derived from the
-        /// cell's region, so a cross-region row is unrepresentable.
         struct StoreHandle {
             partition: (TenantId, Region),
             residency: ResidencyTag,
@@ -534,7 +190,6 @@ mod tests {
                 }
             }
             fn put(&mut self, key: &str, val: &str) {
-                // every write is implicitly in the handle's region — residency by construction.
                 self.rows.insert(key.to_string(), val.to_string());
             }
             fn get(&self, key: &str) -> Option<&String> {
@@ -547,15 +202,12 @@ mod tests {
         let mut store = StoreHandle::open(tenant.clone(), cell_region.clone());
         store.put("k", "v");
 
-        // The consumer is parameterised by the EXACT provider types.
         assert_eq!(store.partition.0, tenant);
         assert_eq!(store.partition.1, cell_region);
-        // Every row is pinned to the cell's region (the residency-pin invariant's seed).
         assert_eq!(store.residency.region(), &cell_region);
         assert_eq!(store.get("k").map(String::as_str), Some("v"));
     }
 
-    /// Build the canonical frozen frame the P-CP-02 tests share.
     fn sample_pointer() -> CrossCellPointer {
         CrossCellPointer::new(
             OpaqueSubjectId::from_ref(ArtifactRef("myelin://01J0ACME/issues/issue/42".into())),
@@ -565,16 +217,9 @@ mod tests {
         )
     }
 
-    /// **The prompt's required unit test: the `CrossCellPointer` frame round-trips its four
-    /// fields.** Constructed from exactly the four §6.1 inputs, every field reads back equal,
-    /// and a serde round-trip preserves the frame byte-for-byte (the on-wire frame is the four
-    /// fields, the `type` serde-name frozen). The "rejects a fifth PII-bearing field" half is
-    /// the `compile_fail` doc-test on the type (a struct literal with an `email` field does not
-    /// compile) — the fields are private and the only constructor takes exactly four.
     #[test]
     fn cross_cell_pointer_round_trips_its_four_fields() {
         let p = sample_pointer();
-        // Each of the four frozen fields reads back via its accessor.
         assert_eq!(
             p.subject().artifact_ref().0,
             "myelin://01J0ACME/issues/issue/42"
@@ -583,8 +228,6 @@ mod tests {
         assert_eq!(p.correlation_id(), &CorrelationId("01J0CORR".into()));
         assert_eq!(p.home_cell().as_str(), "cell-eu-west-3");
 
-        // serde round-trip: the frame carries ONLY the four fields, and `type` is the frozen
-        // wire name (a Rust keyword exposed as `r#type`, serde-renamed to `type`).
         let json = serde_json::to_value(&p).expect("frame serialises");
         let obj = json.as_object().expect("frame is a JSON object");
         let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
@@ -592,25 +235,16 @@ mod tests {
         assert_eq!(
             keys,
             ["correlation_id", "home_cell", "subject", "type"],
-            "the frozen frame carries EXACTLY the four §6.1 fields — no payload/PII/authz state"
+            "the frozen frame carries EXACTLY the four §6.1 fields - no payload/PII/authz state"
         );
         let back: CrossCellPointer =
             serde_json::from_value(json).expect("frame deserialises to the same value");
         assert_eq!(p, back);
     }
 
-    /// **The prompt's required unit test (negative half, structural): `subject` is an
-    /// `OpaqueSubjectId`, never a name/email type.** The frame's `subject` is built from an
-    /// opaque `ArtifactRef`-class id; there is no path by which a personal string becomes the
-    /// subject of a pointer (the constructor takes `OpaqueSubjectId`, which wraps an
-    /// `ArtifactRef`, which is an opaque `myelin://…` token — see the `control-plane-pii-free`
-    /// lint, P-CP-04). The compile-time proof that no fifth PII field can be added is the
-    /// `compile_fail` doc-test on the type.
     #[test]
     fn cross_cell_pointer_subject_is_opaque_not_personal() {
         let p = sample_pointer();
-        // The subject yields an ArtifactRef token (opaque) — there is no `.name()`/`.email()`
-        // accessor on the subject, because there is no PII inside it.
         let subject_ref: &ArtifactRef = p.subject().artifact_ref();
         assert!(
             subject_ref.0.starts_with("myelin://"),
@@ -618,28 +252,12 @@ mod tests {
         );
     }
 
-    /// **CDC pair for 12.6 (provider + consumer).** The provider side is this crate exporting
-    /// the frozen `CrossCellPointer` frame; the consumer side stands in for ISS/KN/CHAT — a
-    /// downstream that *constructs* a `CrossCellPointer` and asserts it holds **only** the four
-    /// frozen fields (the named multi-cell floor they ride, C-3). The consumer can ONLY build
-    /// the frame from the four §6.1 inputs and can read back only those four — it cannot attach
-    /// payload/PII/authz state, because the type does not let it. If the frame shape drifts (a
-    /// field added/removed/retyped), this consumer stops compiling — the whole point of a
-    /// glue-crate CDC (EI-01 §7: ISS/KN/CHAT ride ONE frozen shape).
-    ///
-    /// Note: this CDC exercises the FRAME ONLY. There is intentionally **no `resolve()`** here —
-    /// the cell-local resolution path is the FROZEN-NOT-LIVE floor's follow-on (P-CP-19, M5).
     #[test]
     fn cdc_12_6_consumer_constructs_frame_and_sees_only_four_fields() {
-        /// A stand-in cross-cell consumer (the shape ISS rollup / KN collab / CHAT channels
-        /// build): it holds a pointer to an artifact homed in another cell and can read back
-        /// ONLY the four bridge fields — never the artifact's content (that is resolved
-        /// cell-local in the home cell, §6.2, the P-CP-19 follow-on).
         struct PortfolioRollupEntry {
             pointer: CrossCellPointer,
         }
         impl PortfolioRollupEntry {
-            /// The consumer constructs the frame from exactly the four §6.1 inputs.
             fn point_at(
                 subject: OpaqueSubjectId,
                 kind: ArtifactType,
@@ -650,8 +268,6 @@ mod tests {
                     pointer: CrossCellPointer::new(subject, kind, corr, home),
                 }
             }
-            /// All the consumer can see across the bridge is the home cell to route resolution
-            /// to (resolution itself is cell-local + deferred to P-CP-19).
             fn route_target(&self) -> &CellId {
                 self.pointer.home_cell()
             }
@@ -664,7 +280,6 @@ mod tests {
             CellId::from_token("cell-eu-north-1"),
         );
 
-        // The consumer sees exactly the four frozen fields — and uses `home_cell` to route.
         assert_eq!(entry.route_target().as_str(), "cell-eu-north-1");
         assert_eq!(entry.pointer.artifact_type(), &ArtifactType::Issue);
         assert_eq!(
@@ -677,12 +292,8 @@ mod tests {
         );
     }
 
-    /// The shared `CorrelationId` is byte-identical to the events-side path it is re-exported
-    /// to (EI-01 §7 coherence — exactly ONE `CorrelationId` platform-wide). The frame's
-    /// `correlation_id` is the SAME type `myelin_events::CorrelationId` resolves to.
     #[test]
     fn correlation_id_is_the_one_shared_type() {
-        // A value built here is the same type the frame holds (and that events re-exports).
         let corr = CorrelationId("01J0SHARED".into());
         let p = CrossCellPointer::new(
             OpaqueSubjectId::from_ref(ArtifactRef("myelin://01J0X/issues/issue/1".into())),

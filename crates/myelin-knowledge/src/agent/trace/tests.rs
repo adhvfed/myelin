@@ -1,5 +1,3 @@
-//! Unit + drill tests for the AG-7 content-addressed agent-trace holder (KN-P28 / P-318 — KN-D12).
-
 use super::*;
 use myelin_content::{parse_inline, Block};
 use myelin_gdpr::SubjectRef;
@@ -31,18 +29,14 @@ fn subject_ref(id: &str) -> SubjectRef {
     ))
 }
 
-/// A trace narrative AS the block model (no new schema): a paragraph of surfaced reasoning.
 fn narrative(text: &str) -> Vec<Block> {
     vec![Block::Paragraph {
         inline: parse_inline(text, &[]),
     }]
 }
 
-// ───────────────────────── the block-model trace + its content-address ─────────────────────────
-
 #[test]
 fn trace_reuses_the_block_model_no_new_schema() {
-    // The trace is a Document-shaped Vec<Block> — the frozen myelin_content AST, not a new schema.
     let trace = AgentTrace::new(
         "run-1",
         "p-agent",
@@ -62,14 +56,11 @@ fn trace_reuses_the_block_model_no_new_schema() {
     assert_eq!(trace.actor_principal_id, "p-agent");
 }
 
-/// **THE CONTENT-ADDRESS GATE (CI): a trace write is content-addressed (BLAKE3) and idempotent —
-/// the same content writes once; distinct content → distinct refs.**
 #[test]
 fn content_address_gate_blake3_and_idempotent() {
     let holder = AgentTraceHolder::new();
     let t = tenant();
 
-    // The ref IS the BLAKE3 content address (the `blake3:` multihash inside the myelin:// ref).
     let trace = AgentTrace::new(
         "run-1",
         "p-agent",
@@ -82,7 +73,6 @@ fn content_address_gate_blake3_and_idempotent() {
         r1.0
     );
 
-    // IDEMPOTENT: writing the SAME content again returns the SAME ref and stores ONE copy.
     let r2 = holder.write(&t, trace.clone());
     assert_eq!(
         r1, r2,
@@ -94,13 +84,11 @@ fn content_address_gate_blake3_and_idempotent() {
         "the same content writes ONCE (idempotent-by-content)"
     );
 
-    // DISTINCT content → DISTINCT ref.
     let other = AgentTrace::new("run-1", "p-agent", narrative("a different reasoning trace"));
     let r3 = holder.write(&t, other);
     assert_ne!(r1, r3, "distinct content → distinct refs");
     assert_eq!(holder.len(), 2, "the second distinct trace is stored");
 
-    // The content hash is the SAME deterministic BLAKE3 over the canonical bytes (re-derivable).
     let expected =
         crate::compaction::content_address(&trace.canonical_bytes()).to_multihash_string();
     assert!(
@@ -111,7 +99,6 @@ fn content_address_gate_blake3_and_idempotent() {
 
 #[test]
 fn write_agent_trace_free_fn_matches_the_5_2_signature() {
-    // write_agent_trace(run_id, content, actor) -> run.trace_ref (architecture §5.2).
     let holder = AgentTraceHolder::new();
     let t = tenant();
     let trace_ref = write_agent_trace(
@@ -129,15 +116,10 @@ fn write_agent_trace_free_fn_matches_the_5_2_signature() {
     assert_eq!(holder.len(), 1);
 }
 
-// ───────────────────────── distinct from the audit log (§5.2 / §6.5) ─────────────────────────
-
 #[test]
 fn trace_is_distinct_from_the_audit_log() {
-    // The architecture §6.5 boundary: the trace holder is structurally distinct from the audit log
-    // (distinct ids AND distinct erase semantics — erasable vs the retain carve-out).
     assert!(trace_is_distinct_from_audit());
     assert_ne!(TRACE_HOLDER_ID, AUDIT_LOG_STORE_ID, "distinct holder ids");
-    // the trace IS erasable; the audit log is the retain carve-out — distinct erase mechanisms.
     assert_ne!(
         TRACE_ERASABLE, AUDIT_LOG_ERASABLE,
         "distinct erase mechanisms"
@@ -146,7 +128,6 @@ fn trace_is_distinct_from_the_audit_log() {
 
 #[test]
 fn holder_id_matches_the_gdpr_service_seam_h17_id() {
-    // ONE name across the seam (EI-01 §7): the Knowledge-side producer + the GDPR-service seam agree.
     assert_eq!(
         TRACE_HOLDER_ID,
         myelin_gdpr_service::AGENT_TRACE_HOLDER_ID,
@@ -154,11 +135,6 @@ fn holder_id_matches_the_gdpr_service_seam_h17_id() {
     );
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════
-// The KN-D12 erasure drill machinery (REUSES the KN-P26 crypto-shred core + the storage seams)
-// ════════════════════════════════════════════════════════════════════════════════════════════
-
-/// A tiny in-memory IndexBackend (DB-free) — a `doc_id → present` map; `delete` removes (idempotent).
 #[derive(Default)]
 struct MemIndex {
     docs: BTreeMap<String, ()>,
@@ -238,8 +214,6 @@ impl ErasureLedgerSink for RecLedger {
     }
 }
 
-/// Seal a per-subject free-text column (the trace's PII-bearing content) under the subject's DEK, so
-/// the erase has a REAL key to destroy + a real backup snapshot to probe.
 fn engine_with_subject_trace_content(
     subject: &SubjectRef,
     plaintext: &[u8],
@@ -259,18 +233,13 @@ fn engine_with_subject_trace_content(
     (kms, col)
 }
 
-/// **KN-D12 (the dated green): erase a subject → their content-addressed agent traces
-/// crypto-shredded/purged, attribution falls back to the pseudonym; 0 recoverable PII in traces,
-/// attribution intact; the audit log is unaffected.**
 #[test]
 fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
     let subject = subject_ref("p-alice");
-    // The trace's PII-bearing free-text content, sealed under alice's per-subject DEK.
     let (kms, sealed) =
         engine_with_subject_trace_content(&subject, b"alice asked about her home address");
     let cryptor = ColumnCryptor::new(&kms, region());
 
-    // BEFORE: the trace content decrypts (the PII is live), the DEK is in the backup.
     assert!(
         cryptor.decrypt(&sealed).is_ok(),
         "the trace content decrypts BEFORE erase"
@@ -284,7 +253,6 @@ fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
         "alice's per-subject DEK is in the backup BEFORE erase"
     );
 
-    // The holder stores TWO of alice's traces + one of another actor's (the other must survive).
     let holder = AgentTraceHolder::new();
     let t = tenant();
     write_agent_trace(
@@ -315,7 +283,6 @@ fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
         "two of the traces are alice's (by actor attribution)"
     );
 
-    // Seed the index with alice's trace docs (the lockstep purge) + a page store for backlinks.
     let mut idx = MemIndex::default();
     for h in holder.subject_trace_hashes(&subject, &t) {
         idx.upsert(&IndexDocument::new(
@@ -346,7 +313,6 @@ fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
         )
         .expect("the KN-D12 trace erase succeeds (every step green)");
 
-    // ── 0 recoverable PII in traces: the per-subject DEK destroyed, reaching backups ──
     assert_eq!(
         receipt.traces_shredded, 2,
         "both of alice's traces shredded"
@@ -363,7 +329,6 @@ fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
         !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
         "alice's DEK is ABSENT from the backup after the trace erase (stays dead across a restore)"
     );
-    // The embeddings purged in lockstep (embeddings of PII are PII).
     assert_eq!(
         receipt.embeddings_purged, 2,
         "both trace index docs purged in lockstep"
@@ -379,7 +344,6 @@ fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
         }
     }
 
-    // ── attribution falls back to the opaque pseudonym (attribution intact) ──
     assert_eq!(
         receipt.attribution_pseudonym, subject.principal.principal_id.0,
         "attribution falls back to the opaque pseudonym (the row keeps the principal_id)"
@@ -392,7 +356,6 @@ fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
         "the pseudonym map was shredded → the id is un-resolvable to a human (4.8)"
     );
 
-    // The receipt is the dated KN-D12 green.
     assert!(
         receipt.is_green(),
         "KN-D12 green: 0 recoverable trace PII, attribution intact"
@@ -402,10 +365,6 @@ fn kn_d12_erase_subject_traces_zero_recoverable_pii_attribution_intact() {
     assert!(!receipt.re_run);
 }
 
-/// **Distinct from the audit log: a trace erase does NOT touch the audit log (§6.5).** The trace
-/// holder + the (separate) audit log are independent; erasing the trace leaves a parallel audit-log
-/// store untouched. We model the audit log as a separate store and assert the trace erase never reads
-/// or mutates it (the holder ids differ + the erase only drives the trace holder's seams).
 #[test]
 fn trace_erase_leaves_the_audit_log_unaffected() {
     let subject = subject_ref("p-carol");
@@ -414,8 +373,6 @@ fn trace_erase_leaves_the_audit_log_unaffected() {
     let t = tenant();
     write_agent_trace(&holder, &t, "run-c", narrative("carol trace"), "p-carol");
 
-    // A SEPARATE audit-log store (the H16 carve-out) — a tamper-evident record the trace erase must
-    // never touch. We record an audit entry under the audit store id and prove it survives.
     let audit_entry = format!("audit:{}:retained", subject.principal.principal_id.0);
     let audit_log: BTreeSet<String> = [audit_entry.clone()].into_iter().collect();
 
@@ -441,7 +398,6 @@ fn trace_erase_leaves_the_audit_log_unaffected() {
         )
         .expect("the trace erase succeeds");
 
-    // The audit log is UNAFFECTED — the retain carve-out survives a trace erase (distinct holders).
     assert!(
         audit_log.contains(&audit_entry),
         "the tamper-evident audit log is UNTOUCHED by the trace erase (§6.5)"
@@ -452,8 +408,6 @@ fn trace_erase_leaves_the_audit_log_unaffected() {
     );
 }
 
-/// A partial failure (the embedding purge can't complete) → the trace erase aborts LOUDLY and is
-/// never a false 'erased' (the trace content is plaintext-derived PII in the index).
 #[test]
 fn trace_erase_partial_failure_is_loud_never_false_green() {
     struct FailingIndex;
@@ -531,8 +485,6 @@ fn trace_erase_partial_failure_is_loud_never_false_green() {
     );
 }
 
-// ───────────────────────── mutation-floor guards (the KN-D12 green predicate) ─────────────────────────
-
 #[test]
 fn trace_receipt_is_green_only_when_zero_recoverable_and_attribution_intact() {
     let base = TraceEraseReceipt {
@@ -550,14 +502,12 @@ fn trace_receipt_is_green_only_when_zero_recoverable_and_attribution_intact() {
         "0 recoverable + a non-empty pseudonym is GREEN"
     );
 
-    // Kills the `recoverable_in_backup` mutant: non-zero recoverable is RED.
     let leaky = TraceEraseReceipt {
         recoverable_in_backup: 1,
         ..base.clone()
     };
     assert!(!leaky.is_green(), "non-zero recoverable PII is RED");
 
-    // Kills the attribution mutant: an empty pseudonym (attribution lost) is RED.
     let no_attr = TraceEraseReceipt {
         attribution_pseudonym: String::new(),
         ..base

@@ -1,8 +1,3 @@
-//! Durable PostgreSQL PR lifecycle-event wire adapter.
-//!
-//! Event schema lineage and producer-authored head ordering live beside the one-transaction outbox
-//! write, separate from the already-large PR state store.
-
 use std::sync::Arc;
 
 use myelin_events::{
@@ -38,9 +33,6 @@ pub(crate) async fn co_commit_event(
         })
     });
     let is_head_trigger = matches!(event_type, GIT_PR_OPENED | GIT_PR_SYNCHRONIZED);
-    // The outbox aggregate sequence is not in the frozen wire envelope. `git_pr.version` is
-    // row-locked and incremented in the same transaction, so it is the downstream newest-head
-    // authority without guesses from timestamps, ULIDs, or arrival order.
     let head_generation = if is_head_trigger {
         let number =
             i64::try_from(record.number).map_err(|_| pg_query("encode PR event generation"))?;

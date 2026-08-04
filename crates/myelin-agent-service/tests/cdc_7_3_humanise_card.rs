@@ -1,20 +1,3 @@
-//! # The consumer CDC for contract 7.3 (`humanise`) — the AG-P11 card-text path (P-223)
-//!
-//! **Contract:** `planning/05-refined-shared-systems-architecture/contract-index.md` row 7.3
-//! (`humanise(item | (template_key, args), viewer, locale) -> HumanisedString{text, links, icon}` —
-//! per-viewer, permission-/erasure-safe, ICU MessageFormat; the ONE templating surface every other
-//! subsystem registers against). Owning architecture: `agent-fabric.md` §5.3 (C9 — the HITL card
-//! text + agent-authored messages go through the ONE templating surface `humanise`, never raw
-//! strings) / `notifications.md` §3.3 (the humanise render pipeline OWNED by Notif).
-//!
-//! **The CDC shape:** the PROVIDER is the REAL Notif `humanise` chokepoint (`myelin_notif::humanise`
-//! over a real `RefResolvePort` resolve provider, the SAME `Projection | Tombstone` shape Refs
-//! REF-P10 returns); the CONSUMER is the agent fabric's [`humanise_card`] /
-//! [`humanise_risk_summary`] (AG-P11) lowering a `(template_key, args)` slot onto that surface. The
-//! agreed face: the agent fabric NEVER renders text itself — it CALLS Notif `humanise`, which renders
-//! per-viewer (a denied viewer sees a tombstone, never the title). A drift in the 7.3 shape (a
-//! renamed field, a dropped per-viewer gate) breaks THIS test, never silently in prod (ADR-01).
-
 use myelin_agent::{GateId, ToolName};
 use myelin_agent_service::{assert_no_raw_agent_surface, humanise_agent_message};
 use myelin_agent_service::{
@@ -32,14 +15,8 @@ use myelin_notif::{
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use std::sync::Mutex;
 
-// ───────────────────────── PROVIDER side: the Refs resolve chokepoint (5.2 → humanise) ─────────────
-
 const SECRET_TITLE: &str = "PR #99: ship the GDPR erasure fan-out";
 
-/// **A REAL provider on the 5.2 resolve surface humanise binds slots to (the Refs chokepoint
-/// shape).** Per (viewer, ref) it returns a `Projection` (allowed) or a `Tombstone` (denied) — the
-/// EXACT shape the production `ResolveService` (REF-P10) returns. Notif `humanise` (the 7.3 provider)
-/// consumes it; the agent fabric (the consumer) calls humanise through it.
 #[derive(Default)]
 struct ProviderResolve {
     allowed: Mutex<Vec<(String, String)>>,
@@ -129,13 +106,6 @@ fn a_card() -> myelin_agent_service::HitlCard {
     surface_card(&gate)
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════
-//  CDC — the agent fabric (consumer) renders the HITL card through Notif humanise (provider)
-// ════════════════════════════════════════════════════════════════════════════════════════════
-
-/// **CDC 7.3 (provider Notif `humanise` ⇄ consumer agent card-text): the card renders per-viewer.**
-/// An authorised viewer gets the title bound in; an unauthorised viewer gets a tombstone — the agreed
-/// per-viewer, permission-safe face of 7.3. The agent fabric never renders text itself.
 #[test]
 fn cdc_card_renders_per_viewer_through_humanise() {
     let prov = ProviderResolve::default();
@@ -187,14 +157,10 @@ fn cdc_card_renders_per_viewer_through_humanise() {
         lead.risk_text.text, other.risk_text.text,
         "per-viewer renders differ"
     );
-    // the structured fields (the agreed non-text card payload) ride through unchanged.
     assert_eq!(lead.cost_estimate, 50);
     assert_eq!(lead.action_tool, "git.merge");
 }
 
-/// **CDC 7.3: an agent-authored message renders through the SAME surface (one render path).** The
-/// consumer lowers an `AgentMessage` `(template_key, args)` onto the provider `humanise` — never a
-/// second engine.
 #[test]
 fn cdc_agent_message_renders_through_humanise() {
     let prov = ProviderResolve::default();
@@ -220,9 +186,6 @@ fn cdc_agent_message_renders_through_humanise() {
     );
 }
 
-/// **CDC 7.3 (the 0-raw-string face): a raw agent string never reaches the templating surface.** The
-/// consumer-side gate refuses a raw-string key BEFORE it ever calls the provider — the agreed face is
-/// that only a stable `(template_key, args)` pair crosses into `humanise`.
 #[test]
 fn cdc_no_raw_agent_string_reaches_humanise() {
     assert!(

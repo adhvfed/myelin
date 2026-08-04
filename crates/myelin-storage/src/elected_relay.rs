@@ -1,35 +1,17 @@
-//! Single-leader drain for the shared PostgreSQL outbox.
-//!
-//! The `outbox` table is shared by service producers, so independently running relays are unsafe:
-//! `SKIP LOCKED` permits them to publish later aggregate sequence numbers before an earlier locked
-//! row, and repeated broker failures can multiply retry/dead-letter accounting. This primitive uses
-//! one transaction-scoped PostgreSQL advisory lock to elect exactly one cooperating publisher for
-//! a drain pass. Election, claims, publication, quarantine, sent marks, and commit use the same
-//! transaction and connection. A broker outage therefore rolls the transaction back: rows remain
-//! unsent and their permanent-failure `attempts` budget is untouched.
-
 use myelin_events::relay::EventPublisher;
 use sqlx::postgres::PgPool;
 
 use crate::pg::PgError;
 use crate::pgrelay::{PgRelay, RelayValidationConfig};
 
-/// Stable cell-local election key for the one shared-outbox publisher.
-///
-/// The value is an application namespace constant, not derived from stream/service names. Every
-/// cooperating publisher attached to the same database must use this key.
 pub const SHARED_OUTBOX_PUBLISHER_LOCK_ID: i64 = 0x4d59_454c_494e_4f42;
 
-/// Result of one elected drain attempt.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ElectedDrainOutcome {
-    /// Another cooperating instance holds the publisher election lock.
     Standby,
-    /// This instance was elected and committed a pass, including an empty pass.
     Published(usize),
 }
 
-/// Loud failures from election, relay publication, or lock release.
 #[derive(Debug)]
 pub enum ElectedRelayError {
     InvalidConfiguration(String),
@@ -58,7 +40,6 @@ impl core::fmt::Display for ElectedRelayError {
 
 impl std::error::Error for ElectedRelayError {}
 
-/// PostgreSQL-advisory-lock elected wrapper around [`PgRelay::relay_once`].
 #[derive(Clone)]
 pub struct ElectedPgRelay {
     pool: PgPool,
@@ -66,15 +47,10 @@ pub struct ElectedPgRelay {
 }
 
 impl ElectedPgRelay {
-    /// Use the stable shared-outbox election namespace.
     pub fn new(pool: PgPool, validation: RelayValidationConfig) -> Result<Self, ElectedRelayError> {
         Ok(Self { pool, validation })
     }
 
-    /// Try to become publisher leader for one ordered drain pass.
-    ///
-    /// The transaction-scoped lock is released atomically by commit or rollback. Cancellation,
-    /// panic, connection loss, and publish failure therefore cannot leave a stale elected session.
     pub async fn drain_once<P: EventPublisher + ?Sized>(
         &self,
         publisher: &P,
@@ -92,7 +68,6 @@ impl ElectedPgRelay {
             .await
             .map_err(|e| ElectedRelayError::Election(PgError::Query(e.to_string())))?;
 
-        // @tenant-cross-scope: the cell-local publisher election lock protects the shared outbox.
         let elected: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
             .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
             .fetch_one(&mut *tx)
@@ -122,7 +97,6 @@ mod tests {
 
     #[tokio::test]
     async fn one_connection_pool_is_valid() {
-        // @residency-cell-pinned: lazy invalid test pool; the relay scope below pins its region.
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_lazy("postgres://myelin:myelin@127.0.0.1/myelin")

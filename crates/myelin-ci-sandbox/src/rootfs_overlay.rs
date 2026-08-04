@@ -1,29 +1,3 @@
-//! Per-job OverlayFS rootfs primitive.
-//!
-//! This module provides the wired-but-dormant CoW primitive: it mounts the digest-verified base as
-//! OverlayFS's read-only `lowerdir` and gives a job fresh `upperdir` and `workdir` directories, so a
-//! job's writes land in the upper and never mutate the shared base. `GvisorBackend::
-//! materialize_job_guest_root` already routes both launch paths (compute + checkout) through the
-//! merged view WHEN a `RootfsOverlayManager` is installed. It stays DORMANT until then: production
-//! has not yet installed a manager (`rootfs_overlay` is `None`), so `materialize_job_guest_root`
-//! returns the bare verified base and behaviour is byte-identical to pre-integration. Activation is a
-//! composition change (`with_rootfs_overlay_manager`) — see tasks #26/#27. Hosts used for unit tests select
-//! [`RootfsOverlayMode::DeterministicDirectoryForTests`], which copies the exact same fd-bound lower
-//! tree into `merged` without requiring `CAP_SYS_ADMIN` or OverlayFS support.
-//!
-//! The verified base pathname is opened once with `O_PATH|O_DIRECTORY|O_NOFOLLOW`, checked against
-//! the `(device, inode)` captured by asset verification, and thereafter named only through
-//! `/proc/self/fd/<fd>`. Both the OverlayFS `lowerdir` option and deterministic copy therefore use
-//! the exact verified inode even if its old pathname is renamed after the check.
-//!
-//! Teardown is owned by the non-cloneable [`RootfsOverlay`] guard: unmount (production), then remove
-//! only that guard's held per-job plain directory. An uncertain unmount, identity check, or removal
-//! retains the capacity charge, poisons admission, and reports a reconciliation path. There is no
-//! runtime shared-tree scan. Production initialization first unmounts and removes stale entries
-//! beneath the dedicated overlay root, then enters a private runner mount namespace. Consequently,
-//! normal guard teardown is deterministic, while runner exit (including `SIGKILL`) destroys any
-//! remaining mounts with the namespace; restart cleanup runs before the new runner admits jobs.
-
 use crate::asset_registry::VerifiedRootfs;
 use crate::workspace_manager::IncidentSink;
 use std::collections::{BTreeMap, BTreeSet};
@@ -45,10 +19,6 @@ const OVERLAY_MOUNT_POLICY: &str = "metacopy=off,redirect_dir=nofollow,index=off
 const OVERLAY_ROOT_MARKER: &str = ".myelin-overlay-root";
 const OVERLAY_ROOT_MARKER_CONTENT: &[u8] = b"myelin-ci-sandbox overlay root v1\n";
 
-/// Host-visible ownership and mode for the writable merged root.
-///
-/// The caller must pass the uid/gid that the workload's root uid maps to on the host. `0755` gives
-/// that owner write access while keeping `/` traversable as a conventional root directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkloadRootPermissions {
     uid: u32,
@@ -92,13 +62,9 @@ impl WorkloadRootPermissions {
     }
 }
 
-/// Storage substrate selected for per-job rootfs overlays.
 #[derive(Clone, Debug)]
 pub enum RootfsOverlayMode {
-    /// Production: mount a kernel OverlayFS beneath `overlays_dir/<pid>/<job>`, with the verified
-    /// base as its read-only lower layer and fresh plain directories as upper/work.
     OverlayFs { overlays_dir: PathBuf },
-    /// Unit-test support: copy the fd-bound verified tree into the same per-job `merged` layout.
     #[cfg(any(test, feature = "test-support"))]
     DeterministicDirectoryForTests { overlays_dir: PathBuf },
 }
@@ -113,8 +79,6 @@ impl RootfsOverlayMode {
     }
 }
 
-/// Admission is monotonic: uncertain cleanup blocks new overlays until an external, boot-scoped
-/// reconciliation has established a fresh overlay root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RootfsOverlayAdmission {
     Healthy,
@@ -270,19 +234,12 @@ impl Shared {
     }
 }
 
-/// Persistent owner of overlay admission and fail-closed capacity accounting.
 #[derive(Clone)]
 pub struct RootfsOverlayManager {
     shared: Arc<Shared>,
 }
 
 impl RootfsOverlayManager {
-    /// Initialize the overlay root before job admission.
-    ///
-    /// This startup-only constructor holds an exclusive lock on the dedicated overlay root for the
-    /// manager's lifetime. It first recursively detaches stale mounts and removes stale entries. In
-    /// production mode it then enters a new mount namespace and makes all propagation private. Call
-    /// it before spawning runner worker threads; no overlay can be created without this lifecycle.
     pub fn initialize(
         mode: RootfsOverlayMode,
         incident_sink: IncidentSink,
@@ -327,7 +284,6 @@ impl RootfsOverlayManager {
         })
     }
 
-    /// Create a writable per-job view whose lower layer is the exact once-verified base inode.
     pub fn create_overlay(
         &self,
         base: &VerifiedRootfs,
@@ -400,7 +356,6 @@ impl RootfsOverlayManager {
             });
         }
 
-        // Test-only adversarial seam. Every derivation below consumes `base_fd`, never this path.
         after_source_verified();
 
         let leaf = format!("overlay-{job_key}-{}", next_overlay_sequence());
@@ -469,7 +424,6 @@ impl RootfsOverlayManager {
                 }
             };
         }
-        // Test-only unwind seam: `OverlayResources::drop` owns cleanup until the final guard exists.
         after_layout_derived();
 
         let job_path = resources.job_path.clone();
@@ -516,19 +470,15 @@ impl RootfsOverlayManager {
         self.shared.lock().admission.clone()
     }
 
-    /// Number of per-job storage slots still charged. Cleanup uncertainty retains its slot.
     pub fn capacity_in_use(&self) -> usize {
         self.shared.lock().active.len()
     }
 
-    /// Paths retained for external reconciliation. This is reporting only; it never scans or
-    /// deletes a shared tree at runtime.
     pub fn reconciliation_paths(&self) -> BTreeSet<PathBuf> {
         self.shared.lock().reconciliation.clone()
     }
 }
 
-/// A non-cloneable writable rootfs view for the follow-on bundle-staging integration.
 pub struct RootfsOverlay {
     path: PathBuf,
     job_path: PathBuf,
@@ -538,13 +488,11 @@ pub struct RootfsOverlay {
     resources: Option<OverlayResources>,
     verified_base_digest: String,
     verified_base_identity: (u64, u64),
-    // Held for the complete mount lifetime, matching the descriptor-derived lowerdir source.
     base_fd: File,
     shared: Arc<Shared>,
 }
 
 impl RootfsOverlay {
-    /// Merged rootfs path to stage into the OCI bundle.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -557,7 +505,6 @@ impl RootfsOverlay {
         self.verified_base_identity
     }
 
-    /// Descriptor-derived OverlayFS lowerdir source. The guard keeps its fd live.
     pub fn lowerdir_source(&self) -> &Path {
         debug_assert_eq!(
             self.lowerdir_source,
@@ -567,17 +514,14 @@ impl RootfsOverlay {
         &self.lowerdir_source
     }
 
-    /// Runner-owned plain directory receiving this job's OverlayFS changes.
     pub fn upperdir(&self) -> &Path {
         &self.upperdir
     }
 
-    /// Runner-owned plain OverlayFS work directory paired with [`Self::upperdir`].
     pub fn workdir(&self) -> &Path {
         &self.workdir
     }
 
-    /// Authoritative teardown; [`Drop`] performs the same operation during normal unwind.
     pub fn dispose(mut self) -> Result<(), RootfsOverlayError> {
         self.cleanup_once()
     }
@@ -627,8 +571,6 @@ struct OverlayResources {
 
 impl OverlayResources {
     fn remove(&mut self) -> Result<(), String> {
-        // Explicit guard/manager cleanup owns uncertainty reporting. Disarm the fallback Drop so a
-        // failed authoritative attempt is not silently retried behind fail-closed accounting.
         self.cleanup_on_drop = false;
         self.remove_inner()
     }
@@ -664,7 +606,6 @@ impl OverlayResources {
             ));
         }
         let leaf = component_cstring(&self.location.leaf).map_err(|error| error.to_string())?;
-        // SAFETY: `leaf` is the guard's one checked component beneath its held PID directory.
         if unsafe {
             libc::unlinkat(
                 self.location.pid_dir.as_raw_fd(),
@@ -705,8 +646,6 @@ fn remove_empty_pid_directory(location: &OverlayLocation) {
     let Ok(pid_name) = component_cstring(&location.pid_name) else {
         return;
     };
-    // Best-effort organizational cleanup only: ENOTEMPTY is expected while sibling jobs exist.
-    // SAFETY: identity was rechecked and the name is one component beneath the held overlay root.
     let _ = unsafe {
         libc::unlinkat(
             location.root_dir.as_raw_fd(),
@@ -783,27 +722,12 @@ fn prepare_overlay_root(path: &Path) -> Result<(PathBuf, File), RootfsOverlayErr
         path: canonical.clone(),
         reason: format!("reopen dedicated overlay root readably: {error}"),
     })?;
-    // Acquire the exclusive advisory lock that makes this runner the SOLE owner of the dedicated
-    // overlay root — the single-owner invariant the whole cleanup model rests on (`startup_cleanup`
-    // may remove EVERY stale entry beneath the root precisely BECAUSE no other live runner can hold
-    // it). `flock` is associated with the OPEN FILE DESCRIPTION, and a concurrent `fork()`+`execve()`
-    // anywhere else in this process momentarily DUPLICATES this descriptor into the child across the
-    // `[fork, exec]` window (`O_CLOEXEC` only closes it AT exec, not at fork). So immediately after a
-    // previous owner in this same process released the lock, a sibling child racing to `exec` can
-    // still pin it for a few milliseconds, surfacing a transient `EWOULDBLOCK`. That is NOT a
-    // competing live runner: a real second runner holds the lock DURABLY, so it never clears within
-    // the bounded budget and is still correctly refused below (single-owner is preserved — the budget
-    // only ever elapses against a genuinely-held foreign lock). Production acquires this once at
-    // single-threaded startup and never races; the retry hardens the crash-restart path (racing a
-    // not-yet-reaped inherited fd) and makes parallel tests deterministic.
     let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     loop {
-        // SAFETY: `root` is a live descriptor; flock state is held by the returned file description.
         if unsafe { libc::flock(root.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
             break;
         }
         let error = io::Error::last_os_error();
-        // `EWOULDBLOCK == EAGAIN` on Linux — the single `EAGAIN` arm covers the flock "held" case.
         let transient = matches!(
             error.raw_os_error(),
             Some(libc::EAGAIN) | Some(libc::EINTR)
@@ -957,8 +881,6 @@ fn decode_mountinfo_field(encoded: &[u8]) -> io::Result<Vec<u8>> {
 
 fn unmount_stale_path(path: &Path) -> Result<(), String> {
     let target = path_cstring(path).map_err(|error| format!("encode stale mountpoint: {error}"))?;
-    // MNT_DETACH removes the stale namespace attachment even if a killed runner left references.
-    // SAFETY: `target` is one mountpoint selected from mountinfo beneath the dedicated root.
     if unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) } < 0 {
         Err(format!(
             "detach stale overlay mount {}: {}",
@@ -985,18 +907,12 @@ fn remove_overlay_root_stale_entries(root: &File) -> Result<(), String> {
 }
 
 fn enter_private_mount_namespace() -> Result<(), String> {
-    // This must run before runner worker threads are spawned. Namespace destruction on process exit
-    // (including SIGKILL) then tears down every per-job overlay still mounted inside it.
-    // SAFETY: unshare changes only the calling process/thread's mount-namespace membership.
     if unsafe { libc::unshare(libc::CLONE_NEWNS) } < 0 {
         return Err(format!(
             "unshare runner mount namespace with CLONE_NEWNS: {}",
             io::Error::last_os_error()
         ));
     }
-    // A copied namespace can inherit shared propagation (commonly from systemd). Recursively making
-    // it private ensures subsequent overlay mounts never propagate back to the parent namespace.
-    // SAFETY: null source/fs/data plus `/` and propagation-only flags are the mount(2) API contract.
     if unsafe {
         libc::mount(
             std::ptr::null(),
@@ -1016,13 +932,6 @@ fn enter_private_mount_namespace() -> Result<(), String> {
 }
 
 fn current_mount_namespace_identity() -> Result<(u64, u64), String> {
-    // MUST read `/proc/thread-self`, NOT `/proc/self`: `unshare(CLONE_NEWNS)` moves only the CALLING
-    // thread into the new namespace, but `/proc/self` resolves to the thread-group LEADER — so a
-    // `/proc/self` read compares the leader's namespace to itself and can NEVER fire (a tautology,
-    // false confidence). `/proc/thread-self` reflects the calling thread's own namespace, so the
-    // init-capture and the per-job check genuinely verify that `create_overlay` runs inside the
-    // private namespace `initialize` unshared into (a `std::thread::scope` child inherits it, so this
-    // passes under the real runner thread model while catching a future thread that does not).
     let metadata = fs::metadata("/proc/thread-self/ns/mnt")
         .map_err(|error| format!("identify current runner mount namespace: {error}"))?;
     Ok((metadata.dev(), metadata.ino()))
@@ -1127,7 +1036,6 @@ fn mount_overlay(base_fd: &File, resources: &mut OverlayResources) -> Result<(),
         &proc_fd_path(&resources.upper_dir),
         &proc_fd_path(&resources.work_dir),
     )?;
-    // SAFETY: all strings are NUL-terminated and every procfs path names a live held directory fd.
     let result = unsafe {
         libc::mount(
             source.as_ptr(),
@@ -1146,8 +1054,6 @@ fn mount_overlay(base_fd: &File, resources: &mut OverlayResources) -> Result<(),
     resources.mounted = true;
     match openat_path_directory(&resources.job_dir, OsStr::new("merged")) {
         Ok(mounted_dir) => {
-            // The descriptor opened before `mount` refers to the covered directory. Reopen the
-            // component now so teardown's descriptor belongs to the mounted OverlayFS itself.
             resources.merged_dir = mounted_dir;
             Ok(())
         }
@@ -1171,9 +1077,6 @@ fn mount_overlay(base_fd: &File, resources: &mut OverlayResources) -> Result<(),
 }
 
 fn overlay_mount_options(lower: &Path, upper: &Path, work: &Path) -> Result<CString, String> {
-    // Full data copy-up plus no redirect following/index eliminates dependence on undigested lower
-    // metadata xattrs. `userxattr` is explicit for the non-root workload rather than host-default
-    // dependent; with metacopy and redirects disabled it cannot reinterpret lower xattrs.
     CString::new(format!(
         "lowerdir={},upperdir={},workdir={},{OVERLAY_MOUNT_POLICY}",
         lower.display(),
@@ -1189,16 +1092,12 @@ fn normalize_writable_root(
 ) -> Result<(), String> {
     let directory = readable_reopen(directory)
         .map_err(|error| format!("reopen held root directory readably: {error}"))?;
-    // Ownership is applied only to upper/merged descriptors. The fd-bound verified lower is never
-    // passed here, preserving both its contents and metadata byte-for-byte.
-    // SAFETY: `directory` is a live descriptor for the intended root directory.
     if unsafe { libc::fchown(directory.as_raw_fd(), permissions.uid(), permissions.gid()) } < 0 {
         return Err(format!(
             "fchown held writable root: {}",
             io::Error::last_os_error()
         ));
     }
-    // SAFETY: `directory` is live and the validated mode contains only permission bits.
     if unsafe { libc::fchmod(directory.as_raw_fd(), permissions.mode()) } < 0 {
         return Err(format!(
             "fchmod held writable root: {}",
@@ -1215,7 +1114,6 @@ fn unmount_held(merged: &File) -> Result<(), String> {
 fn unmount_path(path: &Path) -> Result<(), String> {
     let target =
         path_cstring(path).map_err(|error| format!("encode merged mountpoint: {error}"))?;
-    // SAFETY: target is a live descriptor-derived path to this guard's merged mountpoint.
     if unsafe { libc::umount2(target.as_ptr(), 0) } < 0 {
         Err(format!(
             "unmount merged OverlayFS: {}",
@@ -1250,7 +1148,6 @@ fn copy_base_into_merged(base_fd: &File, resources: &OverlayResources) -> Result
 
 fn open_path_directory(path: &Path) -> io::Result<File> {
     let path = path_cstring(path)?;
-    // SAFETY: the path is NUL-terminated and success returns a new owned descriptor.
     let fd = unsafe {
         libc::open(
             path.as_ptr(),
@@ -1260,14 +1157,12 @@ fn open_path_directory(path: &Path) -> io::Result<File> {
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
-        // SAFETY: `fd` is freshly returned by `open` and uniquely owned here.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 }
 
 fn openat_path_directory(parent: &File, name: &OsStr) -> io::Result<File> {
     let name = component_cstring(name)?;
-    // SAFETY: `name` is one component and `parent` remains live for this call.
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -1278,14 +1173,12 @@ fn openat_path_directory(parent: &File, name: &OsStr) -> io::Result<File> {
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
-        // SAFETY: `fd` is freshly returned by `openat` and uniquely owned here.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 }
 
 fn openat_regular(parent: &File, name: &OsStr, flags: i32, mode: libc::mode_t) -> io::Result<File> {
     let name = component_cstring(name)?;
-    // SAFETY: `name` is one component, `parent` remains live, and success returns an owned fd.
     let fd = unsafe {
         libc::openat(
             parent.as_raw_fd(),
@@ -1297,7 +1190,6 @@ fn openat_regular(parent: &File, name: &OsStr, flags: i32, mode: libc::mode_t) -
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
-        // SAFETY: `fd` is freshly returned by openat and uniquely owned here.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 }
@@ -1312,7 +1204,6 @@ fn mkdirat_if_absent(parent: &File, name: &OsStr) -> io::Result<()> {
 
 fn mkdirat_new(parent: &File, name: &OsStr) -> io::Result<()> {
     let name = component_cstring(name)?;
-    // SAFETY: `name` is one checked component below the held directory.
     if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
         Err(io::Error::last_os_error())
     } else {
@@ -1346,13 +1237,10 @@ fn readable_reopen(directory: &File) -> io::Result<File> {
 
 #[cfg(any(test, feature = "test-support"))]
 fn duplicate_inheritable(file: &File) -> io::Result<File> {
-    // F_DUPFD deliberately clears CLOEXEC so the child sees the same held inode by descriptor.
-    // SAFETY: `file` is live; success returns a fresh descriptor uniquely owned below.
     let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 3) };
     if fd < 0 {
         Err(io::Error::last_os_error())
     } else {
-        // SAFETY: `fd` is freshly returned by fcntl and uniquely owned here.
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 }
@@ -1383,7 +1271,6 @@ fn remove_directory_contents_fd_bound(directory: &File) -> Result<(), String> {
 fn remove_entry_fd_bound(parent: &File, name: &OsStr) -> Result<(), String> {
     let name_c = component_cstring(name).map_err(|error| error.to_string())?;
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: name and parent are live, and `stat` points at writable storage.
     if unsafe {
         libc::fstatat(
             parent.as_raw_fd(),
@@ -1398,7 +1285,6 @@ fn remove_entry_fd_bound(parent: &File, name: &OsStr) -> Result<(), String> {
             io::Error::last_os_error()
         ));
     }
-    // SAFETY: successful fstatat initialized `stat`.
     let stat = unsafe { stat.assume_init() };
     let is_directory = stat.st_mode & libc::S_IFMT == libc::S_IFDIR;
     let is_symlink = stat.st_mode & libc::S_IFMT == libc::S_IFLNK;
@@ -1410,7 +1296,6 @@ fn remove_entry_fd_bound(parent: &File, name: &OsStr) -> Result<(), String> {
     } else {
         0
     };
-    // SAFETY: deletion is one enumerated component beneath the held directory.
     if unsafe { libc::unlinkat(parent.as_raw_fd(), name_c.as_ptr(), flags) } < 0 {
         Err(format!(
             "unlink guarded entry: {}",
@@ -1477,8 +1362,6 @@ mod tests {
         }
 
         fn workload_root(&self) -> WorkloadRootPermissions {
-            // Unit tests run without CAP_CHOWN. The explicit identity is still verified against the
-            // created inode; production passes the host-visible subuid (normally 65534) here.
             WorkloadRootPermissions::new(
                 unsafe { libc::geteuid() },
                 unsafe { libc::getegid() },

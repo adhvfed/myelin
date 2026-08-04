@@ -1,10 +1,3 @@
-//! # GT-003 — the cross-system reconciler: crash-window recovery proof (builder ≠ verifier oracle).
-//!
-//! Drives the REAL durable push path ([`myelin_git::receive_pack::RefStore::open_durable`]) into the
-//! apply-after-outbox-commit crash window ([`CrashPoint::AfterCommitBeforeApply`]) and proves the
-//! reconciler ([`myelin_git::reconcile`]) recovers the on-disk ref to the committed `update_seq`,
-//! idempotently, with `git fsck` clean afterward (the external oracle).
-
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::Arc;
@@ -209,10 +202,6 @@ fn malformed_scoped_retained_witnesses_fail_discovery_and_replay_loudly() {
     .is_err());
 }
 
-/// **THE CRASH-WINDOW PROOF.** A push is crashed AFTER the outbox committed but BEFORE the on-disk ref
-/// CAS applied. The committed `git.ref.updated` is durable; the on-disk ref is BEHIND. The reconciler
-/// replays the committed event and recovers the ref onto disk — then is idempotent on a re-run, and the
-/// repo is `git fsck` clean.
 #[test]
 fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_clean() {
     let root = temp_root("window");
@@ -232,7 +221,6 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
         minter.clone(),
     );
 
-    // Crash in the apply-after-outbox-commit window.
     let db = InMemoryObjectDb::new();
     let outcome = rs
         .receive(
@@ -245,8 +233,6 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
         matches!(outcome, PushOutcome::Crashed(c) if c.at == CrashPoint::AfterCommitBeforeApply),
         "the push crashed in the reconciler window: {outcome:?}"
     );
-    // A different tenant can have the same local repository slug. Its committed witness must never
-    // be selected while reconciling acme/core.
     let foreign = RefStore::open_durable(
         repo.clone(),
         "core",
@@ -261,7 +247,6 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
             CrashPoint::AfterCommitBeforeApply,
         )
         .expect("commit same-slug foreign-tenant witness");
-    // The event is the durable witness (committed); the on-disk ref is BEHIND (not yet applied).
     assert_eq!(
         outbox.committed_count(),
         2,
@@ -273,9 +258,6 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
         "the on-disk ref is behind its committed update_seq (the crash window)"
     );
 
-    // Publication can independently exhaust its retry budget. Dead-lettering changes the ordinary
-    // `committed_rows` live-set view, but it must never erase the retained state-change witness that
-    // boot recovery consumes.
     let bus = InProcessBus::new();
     bus.sever();
     let relay = Relay::new(outbox.clone(), bus, || {
@@ -295,8 +277,6 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
         "dead-lettered ref witnesses remain retained for recovery"
     );
 
-    // Simulate restart: a FRESH durable store + repo handle over the same root, replay the committed
-    // events through the reconciler.
     let store2 = DurableGitStore::rooted(&root);
     let repo2 = store2.open_repo(&loc).expect("open after restart");
     assert!(refs_from_outbox_scoped_bounded(
@@ -342,12 +322,10 @@ fn reconciler_recovers_the_apply_after_outbox_commit_window_idempotently_fsck_cl
         "the committed ref move is now on disk (recovered to the committed update_seq)"
     );
 
-    // Idempotent: a second reconcile re-applies nothing.
     let again = reconcile_refs(&repo2, &records).expect("reconcile again");
     assert!(!again.recovered_any(), "idempotent on update_seq");
     assert_eq!(again.already_current, 1);
 
-    // External oracle: git fsck clean after the recovery.
     let (ok, err) = git_fsck(repo2.path());
     assert!(ok, "git fsck clean after reconcile: {err}");
 

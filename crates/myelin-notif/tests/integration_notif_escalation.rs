@@ -1,30 +1,3 @@
-//! Live-Postgres integration test (Stage 1 / infra) — the `notif_escalation_run` durable-handle
-//! read/write contract (NOTIF-P14 / P-192, contract 7.5): the escalation-run row (the durable
-//! workflow handle a RESTART resumes the chain from) round-trips its state transition
-//! (`active → acked`), and RLS isolates a tenant's runs — **0 cross-tenant escalation-run rows
-//! readable** — proven against REAL Postgres.
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free (the binding-policy floor — no DB at build). This runs
-//! ONLY against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-notif --features integration --test integration_notif_escalation -- --nocapture
-//!
-//! Endpoints come from the myelin-config dev defaults (the dev<->prod CONFIG SWAP seam), so the same
-//! test runs against Scaleway (fr-par) by exporting the prod env vars — never a code change.
-//!
-//! It proves, against REAL Postgres, that:
-//!   1. The `notif_escalation_run` INSERT stores the durable handle (run_id, policy_id,
-//!      trigger_event, workflow_ref, current_step, state='active') — the row a Notif restart reads
-//!      back to RESUME the chain from `current_step` (never missing a step, never double-paging).
-//!   2. The ack UPDATE (`state='acked', acked_by=…, acked_at=now()`) transitions the run in place —
-//!      the durable signal-wait resolution recorded on the same handle (the chain HALTS).
-//!   3. The `state` CHECK constraint rejects an off-grammar state — a typo'd state cannot persist
-//!      (the four-state machine is a REAL database invariant).
-//!   4. RLS isolates runs end-to-end: a session set to tenant A reads ONLY tenant A's run row —
-//!      **0 cross-tenant rows readable** (the no-cross-tenant-query-path invariant, in Postgres).
-//!      The app role is NOSUPERUSER NOBYPASSRLS, so the policy is actually in force.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -69,7 +42,6 @@ async fn notif_escalation_run_round_trips_state_check_and_rls_denies_cross_tenan
         .await
         .unwrap();
 
-    // ---- (1) INSERT the durable handle for tenant A (the escalation_run a restart resumes from) ---
     let mut conn = app.acquire().await.unwrap();
     sqlx::query("SELECT set_config('myelin.tenant_id', 'tenantA', false)")
         .execute(&mut *conn)
@@ -108,7 +80,6 @@ async fn notif_escalation_run_round_trips_state_check_and_rls_denies_cross_tenan
         "the run is active (chain walking)"
     );
 
-    // ---- (2) the ack UPDATE transitions the handle in place (the chain HALTS) --------------------
     let ack = format!(
         "UPDATE {run_tbl} SET state='acked', acked_by='psn:alice', acked_at=now() WHERE run_id='esc-run-1'"
     );
@@ -133,7 +104,6 @@ async fn notif_escalation_run_round_trips_state_check_and_rls_denies_cross_tenan
         "the acker is recorded on the handle"
     );
 
-    // ---- (3) the state CHECK constraint rejects an off-grammar state -----------------------------
     let bad = format!(
         "INSERT INTO {run_tbl} \
          (tenant_id, region, run_id, policy_id, trigger_event, workflow_ref, state, dek_ref) \
@@ -146,7 +116,6 @@ async fn notif_escalation_run_round_trips_state_check_and_rls_denies_cross_tenan
     );
     drop(conn);
 
-    // ---- (4) RLS: a tenant B session reads 0 of tenant A's escalation-run rows -------------------
     let mut conn_b = app.acquire().await.unwrap();
     sqlx::query("SELECT set_config('myelin.tenant_id', 'tenantB', false)")
         .execute(&mut *conn_b)
@@ -166,7 +135,6 @@ async fn notif_escalation_run_round_trips_state_check_and_rls_denies_cross_tenan
         "RLS denies cross-tenant: tenant B reads 0 of tenant A's escalation runs"
     );
 
-    // cleanup
     sqlx::query(&format!("DROP TABLE IF EXISTS {run_tbl}"))
         .execute(&admin)
         .await

@@ -1,73 +1,3 @@
-//! # `budget` — the reserve/settle bookend on every dispatch (P-FLOW-16 → P-212, M2)
-//!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/durable-workflow.md` §4.9 step 1+4 (reserve at
-//! dispatch — *no balance → no dispatch*; settle on the `job.done`/`ci.result` signal; NEVER interrupt
-//! in-flight; meter into the SAME wallet as a synchronous activity) + §4.4 (the bookend on the
-//! synchronous activity) + §8 (the F-6 extended assertion — reserve-at-dispatch for the long-park) +
-//! §5.4 (the reserve/settle-reject-rate telemetry, contract 1.8).
-//!
-//! **Contract-index cluster:** OWNS contract 9.5 (workflow↔agent mapping — *reserve/settle = the
-//! bookends*). CONSUMES contract 11.7 (the reserve/settle cost gate — Storage's durable ledger
-//! [`myelin_storage::reserve_settle::CostLedger`], integer minor-units, wholesale ≠ markup) and
-//! contract 1.8 (the reserve/settle-reject-rate telemetry on [`crate::FlowTelemetry`]).
-//!
-//! ## What this prompt (P-FLOW-16) ships — the BOOKEND that fronts every spend-bearing dispatch
-//!
-//! The cost gate ledger MECHANISM (reserve/settle bookkeeping, the never-interrupt-in-flight
-//! invariant, integer minor-units, the one-cost-event-per-unit rule) is **Storage's** — contract 11.7,
-//! `myelin_storage::reserve_settle` (P-103). It is correct-by-construction and complete. This prompt
-//! ships the **bookend in the workflow engine** (contract 9.5): the thing that puts that ledger IN
-//! FRONT of every spend-bearing dispatch the engine makes — both the [`WfCtx::schedule_and_run_job`]
-//! long-park dispatch (P-FLOW-15) and the synchronous [`WfCtx::metered_activity`], metered into the
-//! SAME wallet.
-//!
-//! ### The four invariants the bookend enforces (each mutation-tested, ≥ 90% — *a surviving mutant =
-//! a runaway spend or a refused-when-funded*)
-//!
-//! 1. **Reserve-at-dispatch / no-balance → no-dispatch.** [`BudgetGate::reserve`] debits an integer
-//!    minor-unit amount from the [`Wallet`] via the Storage ledger; if the wallet is exhausted the
-//!    reservation is REFUSED ([`BudgetError::Refused`]) and the dispatch NEVER STARTS — the activity
-//!    closure is never invoked, the job is never handed to the runner. This is the runaway
-//!    self-limiter (FLOW-D6 / AG-D11).
-//! 2. **Settle-on-completion.** [`BudgetGate::settle`] closes the reservation with the actual metered
-//!    cost on the `job.done`/`ci.result` signal (or the synchronous activity's completion), refunding
-//!    any over-reservation back into the SAME wallet. Idempotent (a double-settle never double-charges).
-//! 3. **NEVER interrupt in-flight.** Once [`BudgetGate::begin`] moves a reservation in-flight there is
-//!    NO code path that tears it down — the Storage ledger has none ([`myelin_storage::reserve_settle`]
-//!    §3) and this bookend adds none. A wallet that depletes WHILE a job runs refuses the NEXT dispatch
-//!    but never interrupts the running one; it settles on completion. The
-//!    `inflight_interrupt_count` is `0` by construction.
-//! 4. **Same wallet as a synchronous activity.** A [`WfCtx::metered_activity`] and a
-//!    [`WfCtx::schedule_and_run_job`] reserve/settle against the SAME [`Wallet`] (§4.9 — *meter into the
-//!    same wallet as a synchronous activity*). The long-park dispatch is not a second budget; it draws
-//!    the same depleting balance.
-//!
-//! ## FLOORS named (recorded, not owned here)
-//!
-//! - **The live Commercial wallet balance** (the real money) is Commercial's (contract 11.7 co-owner).
-//!   The [`Wallet`] here is the engine's depleting-balance MODEL seeded from that wallet at the run's
-//!   budget ([`crate::RunBudget`]); the production binding to the Commercial wallet lands when the
-//!   Agent-fabric consumer wires it (P-ST-19 / global P-146, recorded in `reserve_settle.rs`). The
-//!   bookend MECHANISM + the FLOW-D6 drill are complete now and do not change shape.
-//! - **The durable Postgres-backed ledger.** The Storage ledger is a backend-agnostic in-memory-
-//!   testable model over the OLTP tier (its concrete driver lands with P-S12). No NEW db/cache/bus
-//!   trait is touched by THIS prompt (the bookend composes the existing ledger model), so no new
-//!   integration drill is owed (recorded in the P-212 report).
-//! - **The AG-D4 sandbox-escape gate** still fronts the dispatch INTO the runner (recorded in
-//!   [`crate::job`]); the reserve fronts the dispatch, AG-D4 fronts the execution.
-//!
-//! ## Mutation floor (the reserve/settle gate, EI-01 §2 — ≥ 90%)
-//! `cargo mutants -p myelin-flow --file crates/myelin-flow/src/budget.rs`: 31 mutants, 20 unviable,
-//! **10 caught / 1 missed = 90.9%** (above the 90% floor; the non-equivalent score is 10/10 = 100%).
-//! The 1 missed (`inflight_interrupt_count -> 0`) is a **mathematically equivalent mutant** (EI-01 §3
-//! — do not manufacture a false test to "kill" it): the counter is `0` by construction — there is NO
-//! code path in the bookend OR the consumed Storage ledger that increments it (the
-//! never-interrupt-in-flight invariant is structural), so a function that always returns `0` is
-//! indistinguishable from the constant `0`. This is the SAME documented-equivalent mutant the Storage
-//! ledger carries (`reserve_settle.rs`). The dispatch-bookend logic in [`crate::job`]
-//! (`metered_schedule_and_run_job`) carries 6/6 viable mutants caught = 100%.
-
 use crate::engine::FlowTelemetry;
 use crate::wfctx::WfCtx;
 use myelin_storage::reserve_settle::{
@@ -77,67 +7,37 @@ use myelin_storage::reserve_settle::{
 use myelin_tenancy::TenantId;
 use std::sync::{Arc, Mutex};
 
-/// **The depleting per-run wallet the bookend reserves against (the engine's view of the Commercial
-/// balance, §4.9).** Integer minor-units (never a float — §5.1). Seeded from the run's
-/// [`crate::RunBudget`] at start; a reserve DEBITS it (no balance → no dispatch) and a settle REFUNDS
-/// the over-reservation back into it. The SAME wallet is drawn by a synchronous [`WfCtx::metered_activity`]
-/// and a [`WfCtx::schedule_and_run_job`] dispatch (§4.9 — *meter into the same wallet*).
-///
-/// The live Commercial wallet (the real money) is consumed (contract 11.7); this is the engine's
-/// depleting-balance model the bookend meters against — the production binding to the Commercial
-/// balance lands at P-ST-19 (recorded in `reserve_settle.rs`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Wallet {
-    /// The available balance in integer minor-units (the depleting balance reserves draw down).
     available: MicroUsd,
 }
 
 impl Wallet {
-    /// A wallet seeded with `balance` minor-units.
     pub fn new(balance: MicroUsd) -> Wallet {
         Wallet { available: balance }
     }
 
-    /// A wallet seeded from a run's [`crate::RunBudget`] (the run's cost ceiling — §5.1). A negative
-    /// budget (never legal — minor-units are non-negative) is clamped to 0 (an exhausted wallet).
     pub fn from_budget(budget: &crate::RunBudget) -> Wallet {
         let units = u64::try_from(budget.minor_units).unwrap_or(0);
         Wallet::new(MicroUsd(units))
     }
 
-    /// The current available balance (minor-units).
     pub fn balance(&self) -> MicroUsd {
         self.available
     }
 }
 
-/// **The outcome of a settle — the recorded cost events, the billed total, and the amount refunded to
-/// the wallet (§4.9 step 4).** Re-exports the Storage ledger's [`SettleOutcome`] shape so a caller does
-/// not depend on `myelin-storage` directly to read a settle.
 pub type BudgetSettle = SettleOutcome;
 
-/// An error from the reserve/settle bookend.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BudgetError {
-    /// **The wallet is exhausted — the reserve was REFUSED and the dispatch NEVER STARTED (§4.9, the
-    /// no-balance → no-dispatch floor).** Carries the requested amount + the available balance. This is
-    /// the runaway self-limiter: the activity closure is not invoked, the job is not handed to the
-    /// runner. The body retries / compensates / dequeues exactly like a failed dispatch.
     Refused {
-        /// The amount the dispatch asked to reserve.
         requested: MicroUsd,
-        /// The balance available in the wallet (insufficient).
         available: MicroUsd,
     },
-    /// A reservation already exists for this `(tenant, run)` — a dispatch is reserved exactly once (the
-    /// replay re-derivation must reuse the SAME ledger run-id; a double-reserve is a loud bug).
     DuplicateReservation,
-    /// No reservation exists for this `(tenant, run)` — a settle/begin against an un-reserved dispatch
-    /// (a settle never invents a charge).
     NoSuchReservation,
-    /// A settle retry supplied units that differ from the already-recorded settlement.
     UsageDivergence,
-    /// Integer minor-units arithmetic overflowed `u64` — loud, never a silent wrap.
     AmountOverflow,
 }
 
@@ -149,7 +49,7 @@ impl core::fmt::Display for BudgetError {
                 available,
             } => write!(
                 f,
-                "reserve refused: wallet exhausted (requested {} minor-units, {} available) — \
+                "reserve refused: wallet exhausted (requested {} minor-units, {} available) - \
                  no balance, no dispatch (durable-workflow §4.9); the dispatch never started",
                 requested.0, available.0
             ),
@@ -158,7 +58,7 @@ impl core::fmt::Display for BudgetError {
             }
             BudgetError::NoSuchReservation => write!(
                 f,
-                "settle/begin refused: no reservation for this (tenant, run) — never invent a charge"
+                "settle/begin refused: no reservation for this (tenant, run) - never invent a charge"
             ),
             BudgetError::UsageDivergence => write!(
                 f,
@@ -199,16 +99,6 @@ impl From<SettleError> for BudgetError {
     }
 }
 
-/// **The reserve/settle bookend the workflow engine fronts every spend-bearing dispatch with (contract
-/// 9.5 OWNED, §4.9).** A cheap-to-clone handle over a shared [`Wallet`] + the Storage reserve/settle
-/// [`CostLedger`] (contract 11.7 CONSUMED) + the optional reject-rate [`FlowTelemetry`]. It is held by
-/// a [`WfCtx`] (via [`WfCtx::with_budget`]) so the engine's [`WfCtx::metered_activity`] and
-/// [`WfCtx::schedule_and_run_job`] reserve-at-dispatch / settle-on-completion against the SAME wallet.
-///
-/// **Never interrupt in-flight (§4.9):** the gate has NO teardown path for an in-flight reservation —
-/// it inherits the Storage ledger's structural guarantee (there is no API that interrupts an
-/// `InFlight` row). A wallet that depletes while a job runs refuses the NEXT dispatch but never the
-/// running one. `inflight_interrupt_count` is `0` by construction.
 #[derive(Clone)]
 pub struct BudgetGate {
     inner: Arc<Mutex<GateInner>>,
@@ -216,27 +106,16 @@ pub struct BudgetGate {
 }
 
 struct GateInner {
-    /// The depleting wallet reserves draw down + settles refund into (§4.9 — the same wallet).
     wallet: Wallet,
-    /// The Storage reserve/settle ledger (contract 11.7) — the durable reserve/settle bookkeeping,
-    /// the never-interrupt-in-flight invariant, integer minor-units, wholesale ≠ markup.
     ledger: CostLedger,
 }
 
 impl BudgetGate {
-    /// Build a bookend over a `wallet` backed by a fresh **in-memory** Storage ledger. **MR-009b W6b2:
-    /// `#[cfg(any(test, feature = "test-support"))]` — this constructs the now-`test-support`-gated
-    /// in-memory [`CostLedger::new`] TEST DOUBLE.** The PRODUCTION constructors are
-    /// [`BudgetGate::with_pg`] (durable ledger from a provider) / [`BudgetGate::new_durable`] (a
-    /// caller-supplied ledger). Telemetry is absent — use [`BudgetGate::with_telemetry`] to attach it.
     #[cfg(any(test, feature = "test-support"))]
     pub fn new(wallet: Wallet) -> BudgetGate {
         BudgetGate::new_durable(wallet, CostLedger::new())
     }
 
-    /// Build a bookend over a `wallet` + a caller-supplied Storage [`CostLedger`] (always-compiled —
-    /// the injection seam the durable production wiring uses). Telemetry is absent (chainable on
-    /// [`BudgetGate::with_telemetry`]).
     pub fn new_durable(wallet: Wallet, ledger: CostLedger) -> BudgetGate {
         BudgetGate {
             inner: Arc::new(Mutex::new(GateInner { wallet, ledger })),
@@ -244,15 +123,10 @@ impl BudgetGate {
         }
     }
 
-    /// Build a bookend over a `wallet` backed by the **durable** production [`CostLedger`] over the
-    /// MR-022 provider (always-compiled — the `cost_reservation`/`cost_event` FORCE-RLS tables). **Must
-    /// be called inside a tokio runtime** (the durable ledger captures `Handle::current()`).
     pub fn with_pg(wallet: Wallet, provider: myelin_storage::SubstrateProvider) -> BudgetGate {
         BudgetGate::new_durable(wallet, CostLedger::with_pg(provider))
     }
 
-    /// Attach a [`FlowTelemetry`] so each reserve attempt/reject + each settle is recorded into the
-    /// §5.4 reserve/settle-reject-rate signal (contract 1.8). Chainable on [`BudgetGate::new`].
     pub fn with_telemetry(mut self, telemetry: FlowTelemetry) -> BudgetGate {
         self.telemetry = Some(telemetry);
         self
@@ -262,19 +136,10 @@ impl BudgetGate {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// The current wallet balance (for the drill / consumer to observe the depletion).
     pub fn balance(&self) -> MicroUsd {
         self.lock().wallet.balance()
     }
 
-    /// **Reserve-at-dispatch (§4.9 step 1 — the no-balance → no-dispatch floor).** Debit `amount`
-    /// (integer minor-units) from the wallet via the Storage ledger for `(tenant, run)`. On success the
-    /// wallet is debited and a `Reserved` row is written. On an exhausted wallet the reserve is REFUSED
-    /// ([`BudgetError::Refused`]) and NOTHING is debited — **the dispatch never starts** (the caller
-    /// must not invoke the activity closure / hand the spec to the runner).
-    ///
-    /// Records the reserve attempt (and, on a refusal, the reject) into the reject-rate telemetry
-    /// (§5.4). The Storage ledger keeps the bookkeeping; the wallet is the engine's depleting balance.
     pub fn reserve(
         &self,
         tenant: &TenantId,
@@ -286,16 +151,11 @@ impl BudgetGate {
         }
         let mut g = self.lock();
         let available = g.wallet.available;
-        // The ledger enforces the no-balance → no-run floor + the duplicate guard; it does NOT mutate
-        // the wallet (Storage owns bookkeeping, not money). On admit we debit the wallet here.
         match g
             .ledger
             .reserve(tenant.clone(), run.clone(), amount, available)
         {
             Ok(_reservation) => {
-                // Debit the wallet by the reserved amount (the depletion the next reserve sees). The
-                // ledger already proved `available >= amount`, so this subtraction never underflows;
-                // the checked form keeps it loud.
                 g.wallet.available = available
                     .checked_sub(amount)
                     .ok_or(BudgetError::AmountOverflow)?;
@@ -311,10 +171,6 @@ impl BudgetGate {
         }
     }
 
-    /// **Mark a reserved dispatch IN-FLIGHT (§4.9 — it has begun executing).** From this point the
-    /// reservation is NEVER interrupted; the only exit is [`BudgetGate::settle`]. Idempotent (re-marking
-    /// an in-flight run is a no-op success). This is what makes the never-interrupt-in-flight invariant
-    /// observable: a depleting wallet cannot tear a run down once it is in flight.
     pub fn begin(&self, tenant: &TenantId, run: &LedgerRunId) -> Result<(), BudgetError> {
         self.lock()
             .ledger
@@ -322,12 +178,6 @@ impl BudgetGate {
             .map_err(BudgetError::from)
     }
 
-    /// **Settle-on-completion (§4.9 step 4).** Close the reservation for `(tenant, run)` with the actual
-    /// metered `units`, recording exactly one cost event per unit (wholesale ≠ markup) and REFUNDING the
-    /// over-reservation back into the wallet (the same wallet the reserve debited). Idempotent on
-    /// `(tenant, run)`: a double-settle returns the same outcome and refunds NOTHING further (no
-    /// double-credit) and records NO further §5.4 telemetry (only the FIRST, real settle is counted — an
-    /// idempotent re-settle on a replay is not a new settle event).
     pub fn settle(
         &self,
         tenant: &TenantId,
@@ -335,8 +185,6 @@ impl BudgetGate {
         units: &[MeteredUnit],
     ) -> Result<BudgetSettle, BudgetError> {
         let mut g = self.lock();
-        // Was this run already settled? Re-settling must NOT re-credit the wallet (idempotent — no
-        // double-credit). The ledger's settle is idempotent; we only refund on the FIRST settle.
         let already_settled = g.ledger.state_of(tenant, run)
             == Some(myelin_storage::reserve_settle::ReservationState::Settled);
         let outcome = g
@@ -344,8 +192,6 @@ impl BudgetGate {
             .settle(tenant, run, units)
             .map_err(BudgetError::from)?;
         if !already_settled {
-            // Refund the over-reservation back into the wallet (reserved − billed). The ledger already
-            // computed it as `outcome.refunded` (never negative — the reserve is the cap).
             g.wallet.available = g
                 .wallet
                 .available
@@ -353,11 +199,6 @@ impl BudgetGate {
                 .ok_or(BudgetError::AmountOverflow)?;
         }
         drop(g);
-        // Record ONLY a real settle into the §5.4 telemetry — an idempotent re-settle (an
-        // already-`Settled` run re-driven on replay) refunds nothing and is NOT a new settle event, so
-        // it must not inflate the settle count. This keeps the settle-count the true parity ledger of
-        // completed/failed metered dispatches even across a crash-recovery re-drive (the metered-activity
-        // bookend now settles unconditionally-but-idempotently on every drive).
         if !already_settled {
             if let Some(t) = &self.telemetry {
                 t.record_settle();
@@ -366,8 +207,6 @@ impl BudgetGate {
         Ok(outcome)
     }
 
-    /// The lifecycle state of a reservation (for the drill / consumer to observe `Reserved → InFlight
-    /// → Settled`). `None` if the `(tenant, run)` was never reserved (a refused dispatch writes no row).
     pub fn state_of(
         &self,
         tenant: &TenantId,
@@ -376,88 +215,45 @@ impl BudgetGate {
         self.lock().ledger.state_of(tenant, run)
     }
 
-    /// **The in-flight-interrupt counter the FLOW-D6 drill reads (§4.9).** `0` by construction — there
-    /// is no code path in the bookend OR the Storage ledger that interrupts an in-flight reservation
-    /// (the never-interrupt-in-flight invariant is structural). The drill asserts this stays `0` while
-    /// a depleting wallet refuses NEW dispatches.
     pub fn inflight_interrupt_count(&self) -> u64 {
         self.lock().ledger.inflight_interrupt_count()
     }
 }
 
-/// **Names a metered dispatch for the reserve→begin front bracket's loud refusals.** The reserve/
-/// begin FLOW is identical for a synchronous activity and a long-park job — only the noun in the
-/// refusal differs. Each call site passes its spelling so the ONE consolidated bracket keeps the
-/// exact per-site message a test may assert (`ci_pipeline` asserts the long-park's "never dispatched").
 pub(crate) struct DispatchNoun {
-    /// The op label prefixing every refusal (`"metered_activity"` / `"schedule_and_run_job"`).
     label: &'static str,
-    /// The no-dispatch tail clause (`"the activity never started"` / `"the job was never dispatched"`).
     tail: &'static str,
 }
 
 impl DispatchNoun {
-    /// The synchronous [`WfCtx::metered_activity`] spelling.
     pub(crate) const ACTIVITY: DispatchNoun = DispatchNoun {
         label: "metered_activity",
         tail: "the activity never started",
     };
-    /// The long-park [`WfCtx::metered_schedule_and_run_job`] spelling.
     pub(crate) const LONG_PARK: DispatchNoun = DispatchNoun {
         label: "schedule_and_run_job",
         tail: "the job was never dispatched",
     };
 }
 
-/// **The admit half of a metered dispatch's front bracket (§4.9 step 1).** Returned by
-/// [`WfCtx::reserve_and_begin`] once the reserve admitted (a FRESH reserve, now `begin`-marked
-/// in-flight) OR re-drove an already-in-flight reservation (the duplicate-guard replay path):
-/// it carries the deterministic ledger key the dispatch reserved under so the caller's back-half
-/// settles against the SAME key. A REFUSED reserve (no balance) never yields this — it is the ONE
-/// loud [`crate::WfError::CoCommit`] the bracket returns. (Whether the drive was fresh or re-driven
-/// is fully resolved INSIDE the bracket — it decides `begin` — so the caller needs only the key.)
 pub(crate) struct ReserveAdmit {
-    /// The deterministic `(run, command)` ledger key the dispatch reserved under (and settles on).
     pub(crate) ledger_run: LedgerRunId,
 }
 
 impl WfCtx {
-    /// **Supply the reserve/settle bookend so this `WfCtx` can meter spend-bearing dispatches (contract
-    /// 9.5, §4.9).** A `WfCtx` built without this runs UN-METERED (the engine still owns the loop-cap
-    /// depth, AG-6 — an un-budgeted run is not a runaway-spend risk because it has no spend gate
-    /// wired). The dispatcher calls this when it builds the drive's `WfCtx` from the run's
-    /// [`crate::RunBudget`] so the body's [`WfCtx::metered_activity`] + [`WfCtx::schedule_and_run_job`]
-    /// reserve/settle against the SAME wallet. Chainable on `begin`/`resume`.
     pub fn with_budget(mut self, gate: BudgetGate) -> Self {
         self.budget = Some(gate);
         self
     }
 
-    /// The bookend handle (if one was supplied via [`WfCtx::with_budget`]) — used by the engine's
-    /// metered dispatch paths. `None` on an un-metered `WfCtx`.
     pub(crate) fn budget(&self) -> Option<&BudgetGate> {
         self.budget.as_ref()
     }
 
-    /// **The deterministic ledger run-id a dispatch at `command_id` reserves under (§4.9).** Derived
-    /// PURELY from `(run_id, command_id)` so a re-drive (replay) reconstructs the SAME ledger key — the
-    /// reservation is keyed identically across a crash-recovery re-drive (the reserve short-circuits on
-    /// the duplicate guard rather than double-reserving). Distinct per dispatch position so two
-    /// dispatches in one body get two reservations.
     pub(crate) fn dispatch_ledger_run(&self, command_id: &str) -> LedgerRunId {
         LedgerRunId::new(format!("{}/{}", self.run_id(), command_id))
     }
 
-    /// **The reserve→begin front bracket every metered dispatch opens with — ONE spelling of the
-    /// no-balance → no-dispatch floor (§4.9 step 1).** Reserve `cost` at the deterministic
-    /// dispatch-position ledger key ([`WfCtx::dispatch_ledger_run`]); on a FRESH admit mark the
-    /// reservation in-flight ([`BudgetGate::begin`]) — from there it is NEVER interrupted; on a
-    /// DUPLICATE (the normal re-drive after a durable park) leave the in-flight reservation untouched
-    /// (no double-debit, no re-`begin` — the progression is monotonic). An EXHAUSTED wallet is REFUSED
-    /// here and the dispatch NEVER starts: the single loud [`crate::WfError::CoCommit`] both metered
-    /// paths surface, spelled with `noun` so each call site keeps its own message. Returns the ledger
-    /// key so the caller's back-half settles against it. Keyed deterministically so a re-drive re-keys
-    /// identically (the duplicate guard makes the replay reserve a no-op — 0 double-debit).
     pub(crate) fn reserve_and_begin(
         &self,
         gate: &BudgetGate,
@@ -473,10 +269,9 @@ impl WfCtx {
                 requested,
                 available,
             }) => {
-                // No balance → no dispatch. The dispatch NEVER starts.
                 return Err(crate::WfError::CoCommit(format!(
                     "{} refused at reserve: wallet exhausted (requested {} minor-units, {} available) \
-                     — {} (§4.9)",
+                     - {} (§4.9)",
                     noun.label, requested.0, available.0, noun.tail
                 )));
             }
@@ -488,7 +283,6 @@ impl WfCtx {
             }
         };
         if fresh {
-            // The reservation is in-flight: from here it is NEVER interrupted.
             gate.begin(&tenant, &ledger_run).map_err(|e| {
                 crate::WfError::CoCommit(format!("{} begin failed: {e}", noun.label))
             })?;
@@ -496,20 +290,6 @@ impl WfCtx {
         Ok(ReserveAdmit { ledger_run })
     }
 
-    /// **`metered_activity(policy, cost, units, closure)` (contract 9.5, §4.4/§4.9) — a synchronous
-    /// activity fronted by the reserve/settle bookend.** Reserve `cost` minor-units at dispatch (NO
-    /// balance → the activity NEVER runs, [`BudgetError::Refused`] surfaces as
-    /// [`crate::WfError::CoCommit`]); mark in-flight; run the activity (the existing journaled/retried
-    /// [`WfCtx::activity`]); settle the actual metered `units` on completion, refunding the
-    /// over-reservation into the SAME wallet (§4.9 — *meter into the same wallet as a synchronous
-    /// activity*). An un-metered `WfCtx` (no [`WfCtx::with_budget`]) runs the activity WITHOUT a
-    /// reserve (the loop-cap is still the runaway bound, AG-6).
-    ///
-    /// **Never interrupt in-flight:** once the reserve admits + `begin` marks the run in-flight, a
-    /// wallet that depletes mid-activity cannot tear it down — the activity runs to completion and
-    /// settles. **Replay:** the reserve is keyed on the deterministic [`WfCtx::dispatch_ledger_run`]
-    /// (the same across a re-drive — the duplicate-reserve guard makes a re-driven reserve a no-op),
-    /// and the inner [`WfCtx::activity`] short-circuits its journaled result (0 re-execution).
     pub fn metered_activity<F>(
         &mut self,
         policy: crate::RetryPolicy,
@@ -520,38 +300,14 @@ impl WfCtx {
     where
         F: Fn(&str, u32) -> Result<Vec<myelin_refs::ArtifactRef>, crate::ActivityError>,
     {
-        // Un-metered: no gate wired — run the activity WITHOUT a reserve (the loop-cap depth is still
-        // the runaway bound, AG-6). This is the metered_activity-specific unmetered back-half.
         let Some(gate) = self.budget().cloned() else {
             return self.activity(policy, f);
         };
 
-        // ── RESERVE → BEGIN front bracket (the no-balance → no-dispatch floor, §4.9 step 1). A refused
-        // reserve means the wallet is exhausted — the activity NEVER runs (the closure is not invoked).
-        // On a re-drive the reserve hits the duplicate guard and does NOT re-`begin`. The one spelling
-        // of the spend floor lives in [`WfCtx::reserve_and_begin`].
         let admit = self.reserve_and_begin(&gate, cost, DispatchNoun::ACTIVITY)?;
 
-        // Run the activity (journaled, retried — §4.4). It short-circuits its journaled result on a
-        // re-drive (0 re-execution). It returns `Ok` on a successful completion, or
-        // `Err(WfError::ActivityExhausted)` when the retries are exhausted (or any other `WfError`).
         let outcome = self.activity(policy, f);
 
-        // **Settle-on-completion reconciles the reservation on BOTH outcomes (§4.9 step 4).** A
-        // completion — success OR retry-exhaustion — is NOT an in-flight interrupt (the activity ran
-        // to the END of its retries before this point), so it SETTLES: a SUCCESS bills the actual
-        // metered `units`; a FAILURE bills ZERO metered units — a failed activity produced no
-        // artifacts, so the WHOLE reservation is refunded — releasing the reservation the exhaustion
-        // path used to orphan permanently `InFlight` (the wallet was never refunded and the ledger
-        // key, private to this bookend, could never be settled by any caller).
-        //
-        // **Replay-safe (§4.9 replay), NOT gated on the fresh/re-driven distinction:** the settle is
-        // idempotent on `(tenant, run)`. A normal re-drive whose fresh-drive settle already committed
-        // re-settles to the SAME outcome and refunds NOTHING further (no double-refund). A crash BETWEEN
-        // the activity finishing and this settle committing leaves the reservation open on the fresh
-        // drive; the re-drive (which replays `activity_failed`, or re-runs an un-journaled activity, to
-        // the same outcome) RECONCILES the still-open key here. An unconditional idempotent settle is
-        // therefore correct where the old fresh-only settle leaked on every exhaustion.
         match outcome {
             Ok(result) => {
                 gate.settle(self.tenant_id(), &admit.ledger_run, &units)
@@ -561,12 +317,6 @@ impl WfCtx {
                 Ok(result)
             }
             Err(activity_err) => {
-                // Release/refund the reservation (bill ZERO units) BEFORE propagating. We surface the
-                // ORIGINAL activity error — the outcome the body branches on (retry / compensate /
-                // dequeue) — even if this settle itself errors: a durable-ledger settle failure recurs
-                // and is reconciled by the unconditional settle on the next re-drive, so it must not
-                // mask the activity's own failure. (For the in-memory ledger a zero-unit settle of a
-                // live reservation is infallible.)
                 let _ = gate.settle(self.tenant_id(), &admit.ledger_run, &[]);
                 Err(activity_err)
             }
@@ -635,7 +385,6 @@ mod tests {
         }
     }
 
-    /// The recording runner (the contract-8.4 seam fixture) — counts dispatches.
     #[derive(Default)]
     struct RecordingRunner {
         calls: AtomicUsize,
@@ -663,14 +412,11 @@ mod tests {
         });
     }
 
-    /// **Reserve against an EMPTY wallet REFUSES the dispatch — the activity NEVER runs (§4.9).** The
-    /// no-balance → no-dispatch floor: a metered activity whose reserve is refused does NOT invoke the
-    /// closure (the side effect never happens) and surfaces a loud error.
     #[test]
     fn reserve_against_empty_wallet_refuses_the_dispatch_the_activity_never_runs() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
-        let gate = BudgetGate::new(Wallet::new(MicroUsd::ZERO)); // exhausted wallet.
+        let gate = BudgetGate::new(Wallet::new(MicroUsd::ZERO));
         let ran = Arc::new(AtomicUsize::new(0));
         let ran_c = ran.clone();
 
@@ -695,7 +441,6 @@ mod tests {
             0,
             "the activity closure NEVER ran (no dispatch)"
         );
-        // nothing reserved (a refused reserve writes no ledger row).
         let lr = LedgerRunId::new("R1/merge.queue:0");
         assert!(
             gate.state_of(&tenant(), &lr).is_none(),
@@ -703,8 +448,6 @@ mod tests {
         );
     }
 
-    /// **A funded metered activity reserves, runs, and SETTLES into the same wallet (§4.9 step 4).** The
-    /// over-reservation is refunded: reserve 100, bill 60 → the wallet ends at `start − 60`.
     #[test]
     fn funded_metered_activity_reserves_runs_and_settles_into_the_same_wallet() {
         let outbox = OutboxStore::new();
@@ -715,13 +458,12 @@ mod tests {
         let out = ctx
             .metered_activity(
                 RetryPolicy::default_policy(),
-                MicroUsd(100),                  // reserve 100
-                vec![unit("llm.tokens", 40, 20)], // bill 60
+                MicroUsd(100),
+                vec![unit("llm.tokens", 40, 20)],
                 |_idem, _att| Ok(vec![ArtifactRef("myelin://acme/out".into())]),
             )
             .expect("a funded metered activity runs");
         assert_eq!(out, vec![ArtifactRef("myelin://acme/out".into())]);
-        // wallet: 1000 − 100 (reserve) + 40 (refund of 100−60) = 940. Billed 60 stays drawn.
         assert_eq!(
             gate.balance(),
             MicroUsd(940),
@@ -734,25 +476,20 @@ mod tests {
         );
     }
 
-    /// **An in-flight metered activity is NEVER interrupted by exhaustion — it settles (§4.9).** The
-    /// activity's reserve depletes the wallet to 0; a SECOND metered dispatch is refused (no balance),
-    /// but the FIRST (already in-flight, here completed) settled normally. The interrupt counter is 0.
     #[test]
     fn in_flight_activity_is_not_interrupted_by_exhaustion_second_dispatch_refused() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
-        // Exactly enough for ONE reserve of 100; the second reserve has nothing left.
         let gate = BudgetGate::new(Wallet::new(MicroUsd(100)));
 
         let body_gate = gate.clone();
         let mut ctx = begin_ctx(&outbox, journal, gate.clone());
 
-        // FIRST metered activity: reserves 100 (wallet → 0), bills 100 (no refund), settles.
         let out1 = ctx
             .metered_activity(
                 RetryPolicy::default_policy(),
                 MicroUsd(100),
-                vec![unit("llm.tokens", 70, 30)], // bill exactly 100
+                vec![unit("llm.tokens", 70, 30)],
                 |_i, _a| Ok(vec![ArtifactRef("first".into())]),
             )
             .expect("first runs");
@@ -763,7 +500,6 @@ mod tests {
             "wallet exhausted by the first"
         );
 
-        // SECOND metered activity: wallet is empty → refused, never runs.
         let ran2 = Arc::new(AtomicUsize::new(0));
         let ran2_c = ran2.clone();
         let err = ctx
@@ -776,14 +512,13 @@ mod tests {
                     Ok(vec![ArtifactRef("second".into())])
                 },
             )
-            .expect_err("the second is refused — the wallet is exhausted");
+            .expect_err("the second is refused - the wallet is exhausted");
         assert!(matches!(err, crate::WfError::CoCommit(_)));
         assert_eq!(
             ran2.load(Ordering::SeqCst),
             0,
             "the second activity NEVER ran"
         );
-        // The first run was never interrupted — it settled. 0 interrupts.
         assert_eq!(
             gate.inflight_interrupt_count(),
             0,
@@ -791,9 +526,6 @@ mod tests {
         );
     }
 
-    /// **An in-flight long-park is NEVER interrupted even after the wallet empties — it settles on the
-    /// job.done signal (§4.9).** Dispatch reserves; the wallet then depletes (a sibling reserve); the
-    /// job.done still settles the in-flight long-park. 0 interrupts.
     #[test]
     fn long_park_reserves_at_dispatch_and_settles_on_job_done_into_the_same_wallet() {
         let outbox = OutboxStore::new();
@@ -802,9 +534,6 @@ mod tests {
         let runner = RecordingRunner::default();
         let gate = BudgetGate::new(Wallet::new(MicroUsd(500)));
 
-        // The job.done is already buffered (a fast job) under the deterministic dispatch token.
-        // metered_schedule_and_run_job's first command is the RESERVE marker? No — reserve is not a
-        // command; the dispatch activity is command merge.queue:0, so the job token is on :0.
         let token = job_idem_token("R1", "merge.queue:0");
         deliver_job_done(
             &signals,
@@ -830,8 +559,8 @@ mod tests {
                 JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
                 &runner,
                 None,
-                MicroUsd(200),                  // reserve 200 for the job
-                vec![unit("ci.minute", 100, 50)], // bill 150 on completion
+                MicroUsd(200),
+                vec![unit("ci.minute", 100, 50)],
             )
             .expect("dispatch + complete");
 
@@ -842,7 +571,6 @@ mod tests {
             other => panic!("expected Completed, got {other:?}"),
         }
         assert_eq!(runner.calls.load(Ordering::SeqCst), 1, "dispatched once");
-        // wallet: 500 − 200 (reserve) + 50 (refund of 200−150) = 350.
         assert_eq!(
             gate.balance(),
             MicroUsd(350),
@@ -851,9 +579,6 @@ mod tests {
         assert_eq!(gate.inflight_interrupt_count(), 0, "0 interrupts");
     }
 
-    /// A real long-park completes on a later drive, not the dispatching drive. The duplicate reserve
-    /// on resume must retain the in-flight reservation and the consumed `job.done` must settle it;
-    /// another full replay is an idempotent no-op for money and dispatch.
     #[test]
     fn resumed_long_park_settles_once_after_job_done_and_replay() {
         let outbox = OutboxStore::new();
@@ -952,16 +677,13 @@ mod tests {
         );
     }
 
-    /// **A long-park dispatch against an EXHAUSTED wallet is REFUSED — the job is never handed to the
-    /// runner (§4.9, the F-6 extended assertion).** The reserve fronts the dispatch: no balance → the
-    /// runner is never called.
     #[test]
     fn long_park_dispatch_against_empty_wallet_is_refused_runner_never_called() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let signals = SignalStore::new();
         let runner = RecordingRunner::default();
-        let gate = BudgetGate::new(Wallet::new(MicroUsd(50))); // not enough for a 200 reserve.
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(50)));
 
         let mut ctx = WfCtx::begin(
             &outbox,
@@ -993,8 +715,6 @@ mod tests {
         );
     }
 
-    /// **Settle is idempotent — a double-settle never double-credits the wallet (§4.9).** Settling the
-    /// same run twice refunds the over-reservation ONCE.
     #[test]
     fn double_settle_does_not_double_credit_the_wallet() {
         let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
@@ -1003,14 +723,13 @@ mod tests {
         gate.begin(&tenant(), &lr).unwrap();
         assert_eq!(gate.balance(), MicroUsd(900), "reserved 100");
 
-        let units = vec![unit("u", 40, 20)]; // bill 60
+        let units = vec![unit("u", 40, 20)];
         gate.settle(&tenant(), &lr, &units).unwrap();
         assert_eq!(
             gate.balance(),
             MicroUsd(940),
             "refunded 40 once (900 + 40)"
         );
-        // Re-settle: same outcome, NO further refund.
         gate.settle(&tenant(), &lr, &units).unwrap();
         assert_eq!(
             gate.balance(),
@@ -1019,21 +738,17 @@ mod tests {
         );
     }
 
-    /// **The reject-rate telemetry records attempts + rejects (§5.4, contract 1.8).** Two reserves: one
-    /// admits, one refused → 2 attempts, 1 reject, rate = 5000 bps; one settle recorded.
     #[test]
     fn reject_rate_telemetry_records_attempts_rejects_and_settles() {
         let telemetry = FlowTelemetry::new();
         let gate = BudgetGate::new(Wallet::new(MicroUsd(100))).with_telemetry(telemetry.clone());
 
-        // Reserve 1: admits (wallet 100 → 0).
         let lr1 = LedgerRunId::new("R1/cmd:0");
         gate.reserve(&tenant(), &lr1, MicroUsd(100))
             .expect("admits");
         gate.begin(&tenant(), &lr1).unwrap();
         gate.settle(&tenant(), &lr1, &[unit("u", 100, 0)]).unwrap();
 
-        // Reserve 2: refused (wallet empty).
         let lr2 = LedgerRunId::new("R1/cmd:1");
         gate.reserve(&tenant(), &lr2, MicroUsd(50))
             .expect_err("refused");
@@ -1048,8 +763,6 @@ mod tests {
         assert_eq!(telemetry.settled(), 1, "one settle recorded");
     }
 
-    /// **An un-metered `WfCtx` (no with_budget) runs the activity WITHOUT a reserve (AG-6 loop-cap is
-    /// the bound).** A `metered_activity` with no gate behaves as a plain activity.
     #[test]
     fn unmetered_wfctx_runs_the_activity_without_a_reserve() {
         let outbox = OutboxStore::new();
@@ -1063,7 +776,7 @@ mod tests {
             "merge.queue",
             "2026-06-21T00:00:00Z",
             42,
-        ); // NO with_budget.
+        );
         let out = ctx
             .metered_activity(
                 RetryPolicy::default_policy(),
@@ -1075,16 +788,12 @@ mod tests {
         assert_eq!(out, vec![ArtifactRef("ran".into())]);
     }
 
-    /// **A re-drive (replay) re-keys the reserve identically — the duplicate guard makes it a no-op, 0
-    /// double-reserve, 0 double-debit (§4.9 replay).** Drive 1 reserves+settles; drive 2 (resume) hits
-    /// the duplicate guard on reserve and the activity short-circuits → the wallet is debited ONCE.
     #[test]
     fn replay_re_keys_the_reserve_identically_no_double_debit() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
 
-        // DRIVE 1: reserve 100 + bill 60 → wallet 940, journaled.
         let mut c1 = begin_ctx(&outbox, journal.clone(), gate.clone());
         c1.metered_activity(
             RetryPolicy::default_policy(),
@@ -1097,8 +806,6 @@ mod tests {
         assert_eq!(gate.balance(), MicroUsd(940), "drive 1 drew 60");
         let history = journal.history_for(&tenant(), "R1");
 
-        // DRIVE 2 (re-drive): resume over the journal. The reserve hits the duplicate guard (no
-        // re-debit); the activity short-circuits its journaled result; the settle is idempotent.
         let mut c2 = WfCtx::resume(
             &outbox,
             minter(),
@@ -1131,13 +838,6 @@ mod tests {
         );
     }
 
-    /// **R3.7b — a metered activity whose closure EXHAUSTS its retries SETTLES-on-exhaustion: the wallet
-    /// is FULLY restored, the reservation is `Settled` (not orphaned `InFlight`), and the settle is
-    /// recorded (§4.9).** This pins the budget-reservation-leak fix: reserve debits the wallet + `begin`
-    /// marks it in-flight, then the activity exhausts and surfaces `ActivityExhausted`. BEFORE the fix
-    /// the error propagated before the settle, so the reservation stayed `InFlight` forever — the wallet
-    /// was never refunded and no settle event was recorded. A failed activity produced no artifacts, so
-    /// it bills ZERO units → the whole reservation is refunded.
     #[test]
     fn exhausted_metered_activity_settles_refunds_full_and_is_not_left_in_flight() {
         use myelin_storage::reserve_settle::ReservationState;
@@ -1151,8 +851,8 @@ mod tests {
         let err = ctx
             .metered_activity(
                 RetryPolicy { max_attempts: 2 },
-                MicroUsd(100),                  // reserve 100 (wallet 1000 → 900)
-                vec![unit("llm.tokens", 40, 20)], // the would-be billing — NOT charged on failure
+                MicroUsd(100),
+                vec![unit("llm.tokens", 40, 20)],
                 |_idem, attempt| Err(crate::ActivityError(format!("hard failure {attempt}"))),
             )
             .expect_err("the activity exhausts its retries");
@@ -1162,44 +862,30 @@ mod tests {
         );
 
         let lr = LedgerRunId::new("R1/merge.queue:0");
-        // The wallet is FULLY restored — the whole 100 reservation is refunded (a failed activity bills
-        // nothing). Before the fix this leaked at 900 (the reservation stayed InFlight, never refunded).
         assert_eq!(
             gate.balance(),
             MicroUsd(1_000),
             "the reservation is fully refunded on exhaustion (no leak)"
         );
-        // The reservation is Settled — NOT orphaned InFlight.
         assert_eq!(
             gate.state_of(&tenant(), &lr),
             Some(ReservationState::Settled),
-            "the reservation settled on exhaustion — never left InFlight"
+            "the reservation settled on exhaustion - never left InFlight"
         );
-        // A settle event was recorded (the reconciliation is observable). A failed activity bills ZERO
-        // metered units, so no per-unit CostEvent row is written — the recorded event IS the settle.
         assert_eq!(
             telemetry.settled(),
             1,
             "the settle-on-exhaustion is recorded"
         );
-        // A settle-on-exhaustion is a COMPLETION, not an interrupt — the headline zero still holds.
         assert_eq!(gate.inflight_interrupt_count(), 0, "0 in-flight interrupts");
     }
 
-    /// **R3.7b — a RE-DRIVE after an exhausted metered activity does NOT double-refund (idempotent
-    /// settle, §4.9 replay).** Drive 1 exhausts + settles (full refund, wallet restored, one
-    /// `activity_failed` journaled); drive 2 (resume) replays the journaled failure — the reserve hits
-    /// the duplicate guard and the settle re-runs IDEMPOTENTLY, refunding NOTHING further. The wallet is
-    /// restored EXACTLY once (the settle-on-exhaustion is not gated on `fresh`, so it reconciles a
-    /// crash-between-exhaust-and-settle re-drive, yet a normal re-drive never double-credits).
     #[test]
     fn re_drive_after_exhaustion_does_not_double_refund() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
 
-        // DRIVE 1: reserve 100 (wallet → 900), begin, activity exhausts → settle(zero units) refunds 100
-        // (wallet → 1000), then journal the activity_failed on commit.
         let mut c1 = begin_ctx(&outbox, journal.clone(), gate.clone());
         let err1 = c1
             .metered_activity(
@@ -1218,9 +904,6 @@ mod tests {
         );
         let history = journal.history_for(&tenant(), "R1");
 
-        // DRIVE 2 (re-drive): resume over the journal. The activity short-circuits its journaled
-        // activity_failed (0 re-execution — the closure must NOT run), the reserve hits the duplicate
-        // guard, and the settle re-runs idempotently (already Settled → no second refund).
         let mut c2 = WfCtx::resume(
             &outbox,
             minter(),
@@ -1249,7 +932,6 @@ mod tests {
         );
     }
 
-    /// `Wallet::from_budget` seeds from a RunBudget; a negative budget clamps to an empty wallet.
     #[test]
     fn wallet_from_budget_seeds_and_clamps() {
         let w = Wallet::from_budget(&crate::RunBudget { minor_units: 500 });
@@ -1262,11 +944,6 @@ mod tests {
         );
     }
 
-    /// **`begin` moves a reservation `Reserved → InFlight` (the never-interrupt anchor, §4.9).** Before
-    /// `begin` the reservation is `Reserved` (the one teardown-able state); AFTER `begin` it is
-    /// `InFlight` — the state from which there is NO teardown path. This pins the begin transition so a
-    /// `begin -> no-op` regression (the reservation would stay `Reserved` and remain teardown-able) is
-    /// caught.
     #[test]
     fn begin_moves_reservation_reserved_to_in_flight() {
         use myelin_storage::reserve_settle::ReservationState;
@@ -1282,9 +959,8 @@ mod tests {
         assert_eq!(
             gate.state_of(&tenant(), &lr),
             Some(ReservationState::InFlight),
-            "after begin: InFlight — from here there is NO teardown path (never interrupt)"
+            "after begin: InFlight - from here there is NO teardown path (never interrupt)"
         );
-        // begin is idempotent — re-marking an in-flight run is a no-op success, still InFlight.
         gate.begin(&tenant(), &lr).unwrap();
         assert_eq!(
             gate.state_of(&tenant(), &lr),
@@ -1292,7 +968,6 @@ mod tests {
         );
     }
 
-    /// The `BudgetError` Displays are loud + specific (observability is part of the pass, EI-01 §3).
     #[test]
     fn budget_errors_display_loud_and_specific() {
         let refused = BudgetError::Refused {

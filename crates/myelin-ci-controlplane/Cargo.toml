@@ -5,22 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# CI-P6 (P-349, M4): the CI Control Plane service is a `serve(AppSpec)` shell (contract 1.1) — the
-# binary below is the "every service main.rs" the row names: it does nothing but hand the CI Control
-# Plane AppSpec to the harness's one call (NOT a hand-rolled lifecycle). The library carries the
-# shell builder (`controlplane_app_spec` / `run_controlplane`), the COMPLETE forward-only data-model
-# migrations for every CI Control-Plane table (ci_run, ci_job, check_attempt, job_queue, fair_deficit,
-# runner, log_segment, log_anchor, artifact, cache_entry, environment, deployment, secret_binding,
-# cost_event — arch 01 §3), and the `#[personal_data(...)]`-tagged row mirrors that keep the
-# no-untagged-personal-data lint GREEN on the CI schema.
-#
-# Like the other service/subsystem crates (myelin-search, myelin-identity-service, myelin-control-plane)
-# it is a LEAF CONSUMER above the shared substrate + glue crates: it depends on the frozen contract
-# surfaces (substrate serve/AppSpec + migrations + holder-registry, gdpr PersonalData, tenancy
-# partition keys) and NOTHING in the production eleven-crate library DAG depends back on it — so
-# `substrate_is_root()` / `identity_is_sink()` in crate_graph.rs are preserved (a subsystem crate is
-# the graph's terminal consumer, OUTSIDE the modelled DAG). cargo build --workspace stays DB-free; the
-# live-stack schema apply is behind the `integration` feature only.
 [[bin]]
 name = "ci-controlplane"
 path = "src/main.rs"
@@ -29,71 +13,19 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
-# The substrate serve(AppSpec) harness (contract 1.1/1.2/1.3): the three-surface split, liveness ≠
-# readiness, the forward-only migration runner + the HotTables declaration, the holder auto-registry
-# (contract 1.4). The CI Control Plane is an AppSpec, not a hand-rolled main.
 myelin-substrate = { path = "../myelin-substrate" }
-# The GDPR contract surface — the `#[derive(PersonalData)]` classify-derive + the
-# `#[personal_data(...)]` helper (contract 10.2) the CI row mirrors carry on `triggered_by` /
-# `approved_by` (the pseudonym-subject PII fields, arch 01 §3 / contract 4.8).
 myelin-gdpr = { path = "../myelin-gdpr" }
-# The frozen (tenant, region) partition-key value types (contract 12.1) every CI table is keyed on.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# CI-P7 (P-350): the CI Control Plane is the outbox PRODUCER / check emitter (arch 00 §4), so it is
-# the proper home for CI's `ci.*` event-taxonomy REGISTRATION into the Bus seed (contract 2.9).
-# `myelin-events` is the FROZEN Bus grammar + the §6.2 subsystem/type token table CI registers
-# AGAINST (the one validator, EB-02 / P-042); `myelin-ci-sandbox` carries the canonical `ci.*` token
-# CONSTANTS the early M4 names-freeze (EB-27 / P-327) defined — the control plane RE-EXPORTS them
-# (one source of truth, no second token language). NO cycle: neither `myelin-events` nor
-# `myelin-ci-sandbox` has an edge back to `myelin-ci-controlplane` (it is a LEAF consumer, nothing in
-# the DAG depends on it), so `myelin-ci-controlplane → {myelin-events, myelin-ci-sandbox}` is acyclic.
 myelin-events = { path = "../myelin-events" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
-# CI-P8 (P-351): the CI ReBAC namespace fragment (contract 4.9) the CI subsystem DECLARES.
-# `myelin-identity` is the FROZEN contract-surface crate carrying the names-only `NamespaceFragment` ABI
-# carrier Identity's `admit_fragment` consumes; CI's namespace declarations remain independent of
-# the rich engine. The separate R4.2 composition dependency below is only for the concrete signed
-# launch-token adapter. Neither Identity crate depends back on this service, so the graph is acyclic.
 myelin-identity = { path = "../myelin-identity" }
-# R4.2 final launch composition: the service shell owns the concrete adapter over Identity's real
-# PASETO signer/verifier and durable S7 run-token lifecycle. This is intentionally a composition-root
-# edge, not a second auth engine: all cryptographic and revocation decisions remain in
-# `myelin-identity-service::RunToken{Minter,Authorizer}`.
 myelin-identity-service = { path = "../myelin-identity-service" }
-# CI-P15 (P-358): the `ci.pipeline` DURABLE WORKFLOW BODY composes the FROZEN `myelin-flow` durable
-# substrate — `WfCtx` (contract 9.2), `run_ci_pipeline` (the `SCHEDULE_AND_RUN_JOB` long-park idiom,
-# 9.4), the per-stage reserve/settle bookend (11.7), and the SLA timer wheel (9.3). The CI body OWNS
-# only the X-1 PRODUCER side over that substrate (the per-context `ci.check.updated` terminal facts +
-# `ci.run.failed`/`ci.run.succeeded` + the `ci.result` rollup signal). NO cycle: `myelin-flow` has no
-# edge back to `myelin-ci-controlplane` (it is the durable-execution engine; CI is a leaf consumer).
 myelin-flow = { path = "../myelin-flow" }
-# CI-P17 (P-360): the reserve/settle metering module reserves/settles against the SAME durable ledger
-# (contract 11.7) the engine bookend wraps — the `cost_event` rows live in `myelin_storage::reserve_settle`
-# (the `RunId` ledger key + the integer-minor-units `CostEvent` shape). CI builds NO second ledger; it
-# REUSES Storage's frozen one (EI-01 §7 coherence). NO cycle: `myelin-storage` has no edge back to
-# `myelin-ci-controlplane` (the same acyclic edge `myelin-flow` carries to the ledger).
 myelin-storage = { path = "../myelin-storage" }
-# The references-not-payloads `ArtifactRef` (contract 5.7) every X-1 check fact rides
-# (`run`/`details_ref` refs, never log bytes). The frozen Refs contract surface — a leaf edge.
 myelin-refs = { path = "../myelin-refs" }
-# CI-P26 (P-369): the cross-fabric surfacing `declare_indexable` half (contract 6.3) constructs the
-# ONE Search-owned `IndexSpec` (`myelin_search::IndexSpec`) for CI's `ci/run` projection — CI declares
-# WHAT to index (the run facets + the semantic failure_summary), Search owns the engine. The same
-# acyclic GIT-P5 edge (`myelin-git → myelin-search`): `myelin-search` has NO edge back to
-# `myelin-ci-controlplane` (a leaf producer), so `myelin-ci-controlplane → myelin-search` is acyclic.
-# `myelin-query` carries the frozen `FieldType` taxonomy the struct facets type over (re-export anchor).
 myelin-search = { path = "../myelin-search" }
 myelin-query = { path = "../myelin-query" }
-# CI-P26 (P-369): the `ToolDef` registrations half (contract 8.1) registers CI's agent-facing actions
-# into the ONE permissioned `ToolSurface` (`myelin_agent::ToolSurface`/`ToolDef`) with the FROZEN X-6
-# `requires_approval` defaults (deploy/secret/rollback/approve = yes; run/read/validate/plan = no).
-# `myelin-agent` is the frozen contract-surface types crate (deps only `myelin-identity` +
-# `myelin-events`, both already in this tree) — it has NO edge back to `myelin-ci-controlplane`, so
-# `myelin-ci-controlplane → myelin-agent` is acyclic (mirrors the `myelin-search` edge above).
 myelin-agent = { path = "../myelin-agent" }
-# CI-P14 (P-357): the fleet events are `EventDraft`s whose payload is a `serde_json::Value` (the
-# frozen envelope payload shape) — runner-id / region / pool / health, PII-free. The workspace
-# serde_json (the same crate the envelope payload uses); no new myelin edge.
 serde_json = { workspace = true }
 serde = { workspace = true }
 blake3 = { workspace = true }
@@ -101,116 +33,31 @@ base64 = "0.22"
 zeroize = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-# ------------------------------------------------------------------------------------------
-# REAL live-stack schema apply behind the `integration` feature (CI-P6). The complete CI
-# Control-Plane data-model migration gets PROVEN against the live dev-stack Postgres (forward-only
-# apply + RLS isolation + the scheduler claim indexes) in
-# tests/integration_ci_p6_controlplane_schema.rs. The OPTIONAL sqlx + tokio deps are pulled ONLY by
-# `--features integration` — the default `cargo build`/`cargo test --workspace` stay DB-free. These
-# are EXTERNAL crates only; no new myelin edge is added. The test reads DATABASE_URL inline (no
-# myelin-config edge — same posture as refs-service/identity).
-# ------------------------------------------------------------------------------------------
-# CT-004a (CI backend reconcile-and-harden): sqlx is now a NON-OPTIONAL production dependency — the
-# durable CI `cost_event` projection store (`cost_store::CiCostEventStore`) executes the metering SQL
-# constants against the real OLTP pool in the DEFAULT build (turning the "model-only" metering path
-# into a production-callable store). This follows the identity-service durable-by-default precedent
-# ("tokio/sqlx/myelin-config non-optional; `integration` is a test-selector"). The build stays DB-free
-# (connecting happens at RUNTIME, never at build); the `integration` feature only gates the live-stack
-# tests that need a running Postgres.
 sqlx = { workspace = true }
-# MR-009b W3b.6: tokio + myelin-config are REGULAR deps now — the durable service main.rs
-# (provider-from-env → migrate_foundation → OutboxStore::durable, fail-loud) needs them. The
-# `integration` feature no longer carries their dep: activation; the build stays DB-free
-# (connecting happens at RUNTIME, never at build).
 tokio = { workspace = true }
-# CI-P20 (P-363): the log-pipeline seal is PROVEN against the live dev stack — the sealed segment
-# flushes to the REAL RustFS object store (`S3BlobStore`, contract 11.2) AND the `(job, step,
-# byte-range)` index rows (`log_segment`/`log_anchor`, contract 11.8) apply + INSERT + read back
-# (0 dangling anchors) against the live Postgres in tests/integration_ci_p20_log_pipeline.rs. The
-# OPTIONAL myelin-config (the dev S3 endpoint) + aws-sdk-s3 (the raw client for the round-trip
-# verify) deps are pulled ONLY by `--features integration`; `myelin-storage/integration` exposes the
-# real `S3BlobStore` (RustFS in dev, Scaleway in prod — a config swap, never a code change). The
-# default build stays DB-free.
 myelin-config = { path = "../myelin-config" }
 aws-sdk-s3 = { workspace = true, optional = true }
 
 [dev-dependencies]
-# MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
-# targets (the `src/metering_tests.rs` unit tests + `tests/drills_ci_p17_*` + `tests/drill_ci_p34_*`
-# that call the now-gated `reserve_settle_parity_drill` / `run_e2e2_ci_flagship_slice`). The sanctioned
-# Cargo idiom; it does NOT affect the normal `cargo build`, which stays durable-by-default.
 myelin-ci-controlplane = { path = ".", features = ["test-support"] }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-# MR-009b W3b.6: enable `test-support` so this crate's DEV tests reach the events in-memory
-# `OutboxStore::new()` double (the durable `OutboxStore::durable` is the production default; the
-# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
-# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
-# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
-# production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# CT-007 5b.3-6e.2 (Stage A §4): enable `test-support` on the sandbox crate for THIS crate's DEV/TEST
-# targets ONLY — the four live-PG §4 active-path tests reach the sandbox's `pub` `test-support`
-# checkout-cycle driver (`drive_checkout_cycle_with_substituted_runsc_given`) to drive the REAL
-# `launch_checkout_orchestrated_with_given` orchestrator (steps 1-14 single-sourced) under a
-# deterministic hardware-independent Enabled backend, injecting the REAL `DurableAttemptAuthority`
-# obtained the production way (`reserve_parent_attempt` → `Admitted`). DEV-ONLY, resolver-v2 safe: the
-# normal `[dependencies]` edge above stays feature-less, so `cargo tree -e no-dev` / a `--release`
-# production build carries NO test-support edge (same posture as the events/storage dev-deps above).
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox", features = ["test-support"] }
-# The architecture-lint ratchet (contract 1.6): CI-P6's own red+green confirmation that the
-# `no-untagged-personal-data` lint REJECTS an untagged PII CI field and ADMITS the tagged CI schema
-# (tests/lint_no_untagged_personal_data.rs). A test-support crate (NOT a production DAG node) — it
-# keeps the gate provably live over the CI types. Plus the residency-pin / forward-only confirmations.
 myelin-lints = { path = "../myelin-lints" }
-# CI-P18 (P-361): the CDC PROVIDER half of contract 5.9 (`tests/cdc_5_9_ci_check_producer.rs`) proves
-# CI's assembled `ci.check.updated` payload decodes BYTE-IDENTICALLY into Git's frozen consumer view
-# `myelin_git::check_status::CheckStatus` — the seam's contract test (CI producer + Git consumer). A
-# DEV-DEP ONLY (the test surface, NOT the production DAG): `myelin-git` is a leaf consumer that does
-# NOT depend back on `myelin-ci-controlplane`, so the test-only edge stays acyclic — exactly the
-# `myelin-ci-dispatch → myelin-git` / `myelin-ci-sandbox → myelin-git` edges the CI crates carry. CI's
-# PRODUCTION code never depends on Git (it produces the frozen JSON shape); only the CDC test decodes
-# it through Git to PROVE the no-drift property.
 myelin-git = { path = "../myelin-git" }
-# CI-P26 (P-369): the 7.3 CDC CONSUMER half — CI's `CheckStatus.summary` HumanisedRef templates are
-# admitted into Notif's ONE humanise `TemplateStore` and every summary key resolves to a registered
-# ICU body (tests/cdc_6_3_2_6_7_3_ci_surfacing_index.rs). A DEV-DEP ONLY (the CDC test surface, NOT
-# the production DAG): `myelin-notif` is a leaf consumer that does not depend back on
-# `myelin-ci-controlplane`, so the test-only edge stays acyclic.
 myelin-notif = { path = "../myelin-notif" }
-# CI-P27 (P-370): the STOR-D1/D2 restore-verify gate over the CI stores
-# (tests/integration_ci_p27_restore_verify_ci_stores.rs) REUSES Storage's RestoreVerifyGate +
-# CellKillRestore and emits the measured RPO/RTO/cross-seam numbers on the SAME telemetry-assertion
-# library every restore drill uses (the harness `SignalSource`), reading the RPO/RTO bounds from the
-# versioned workspace-root `thresholds.toml` (NEVER hardcoded, EI-01 §3). Both are TEST-SUPPORT only —
-# nothing in the CI control-plane production DAG pulls `myelin-harness` or `toml` (no cycle).
 myelin-harness = { path = "../myelin-harness" }
 toml.workspace = true
-# Test-hygiene retrofit (panic-safe schema teardown, tests/common/mod.rs): `FutureExt::catch_unwind`
-# is what lets `with_schema_cleanup` intercept a test-body panic mid-`.await`, ALWAYS run the schema
-# DROP, then resume the unwind — a synchronous `Drop` impl cannot safely run that async cleanup. A
-# DEV-DEP ONLY (the shared test helper, NOT the production DAG); no new myelin edge.
 futures = { workspace = true }
 
 [features]
 default = []
-# MR-009b W6b2 — the `test-support` cargo feature. Gates the two ledger-constructing DRILL pub-fns
-# (`metering::reserve_settle_parity_drill` builds `myelin_flow::BudgetGate::new`; `e2e_flagship::
-# run_e2e2_ci_flagship_slice` builds the in-memory `CostLedger::new`) behind
-# `#[cfg(any(test, feature = "test-support"))]`, so the default build stays durable-by-default. Forwards
-# to `myelin-flow/test-support` + `myelin-storage/test-support` (the two in-memory doubles the drills
-# reach). DEV/TEST only — never in the production DAG.
-# MR-009b W3b.5/.6: also forwards to `myelin-events/test-support` — the gated e2e_wedge drill
-# runners + the DEV tests construct the now-gated in-memory `OutboxStore::new()` double.
 test-support = [
     "myelin-flow/test-support",
     "myelin-storage/test-support",
     "myelin-events/test-support",
 ]
-# `myelin-storage/integration` exposes the s3blob module (the real S3BlobStore over RustFS/Scaleway)
-# the CI-P20 log-pipeline seal flushes its sealed segments to.
 integration = [
     "dep:aws-sdk-s3",
     "myelin-storage/integration",

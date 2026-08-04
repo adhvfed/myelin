@@ -1,23 +1,3 @@
-//! # CT-006b END-TO-END: CLONE/FETCH through the PRODUCTION `GitCore` seam (GT-006)
-//!
-//! Proves the wire-serving path the production [`myelin_edge::GitWireExecutor`] + the
-//! [`myelin_git::core::RoutedGitCore`] stand up, end-to-end, against a REAL on-disk bare repo, through
-//! the SAME [`myelin_git::core::GitCore`] seam the CT-006c HTTP smart-transport server will drive — but
-//! NOT yet the HTTP server (that is CT-006c). Every claim is a REAL `runsc` run of REAL `git` inside
-//! the hardened gVisor sandbox via `GvisorBackend::launch_git_wire` (the executor owns the launch; the
-//! edge carries no host-exec fingerprint).
-//!
-//!   1. **advertise_refs(UploadPack)** → the real `refs/heads/main` + HEAD oid (pkt-line framed).
-//!   2. **serve(UploadPack, <real want/done stateless-rpc request>)** → a real packfile; we prove a
-//!      client could complete the fetch by feeding the pack to `git index-pack` + `git verify-pack`
-//!      and confirming the WANTED commit oid is present in the pack.
-//!
-//! ## Gating
-//! SKIPS gracefully when `runsc` is not on PATH or the pinned production git rootfs is unavailable.
-//! With
-//! `MYELIN_REQUIRE_RUNSC=1` an absent capability is a HARD failure (never a vacuous green). Run:
-//! `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-edge --test git_wire_clone_fetch_e2e_test -- --nocapture`.
-
 use myelin_ci_sandbox::verified_gvisor_git_rootfs;
 use myelin_edge::{
     production_git_core_with_issuer, test_git_wire_credential_issuer, GitWireExecutor,
@@ -25,8 +5,6 @@ use myelin_edge::{
 use myelin_git::core::{GitCore, RepoLoc, Service};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-// ───────────────────────────── runsc / rootfs preconditions ─────────────────────────────
 
 fn runsc_bin() -> Option<String> {
     let bin = std::env::var("MYELIN_RUNSC_BIN").unwrap_or_else(|_| "runsc".to_string());
@@ -46,7 +24,7 @@ fn require_or_skip(test: &str) -> bool {
     if runsc_bin().is_none() {
         if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
             panic!(
-                "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc` is not on PATH — CT-006b refuses a \
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc` is not on PATH - CT-006b refuses a \
                  VACUOUS green."
             );
         }
@@ -59,7 +37,7 @@ fn require_or_skip(test: &str) -> bool {
         Err(error) if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
             panic!(
                 "[{test}] MYELIN_REQUIRE_RUNSC=1 but the pinned production git rootfs is \
-                 unavailable: {error} — CT-006b refuses a VACUOUS green."
+                 unavailable: {error} - CT-006b refuses a VACUOUS green."
             );
         }
         Err(error) => {
@@ -68,8 +46,6 @@ fn require_or_skip(test: &str) -> bool {
         }
     }
 }
-
-// ───────────────────────────── a real bare repo with a commit ─────────────────────────────
 
 fn run_git(args: &[&str], cwd: Option<&Path>) {
     let mut c = Command::new("git");
@@ -85,7 +61,6 @@ fn run_git(args: &[&str], cwd: Option<&Path>) {
     );
 }
 
-/// Build `<root>/<tenant>/<region>/<repo>.git` as a REAL bare repo with one commit; return the HEAD oid.
 fn make_repo_with_commit(root: &Path, tenant: &str, region: &str, slug: &str) -> String {
     let bare = root.join(tenant).join(region).join(format!("{slug}.git"));
     std::fs::create_dir_all(bare.parent().unwrap()).expect("mkdir repo parent");
@@ -129,14 +104,11 @@ fn temp_root(tag: &str) -> PathBuf {
     d
 }
 
-/// pkt-line frame a payload (`0009done\n`): a 4-hex length prefix counting itself + the payload bytes.
 fn pkt(payload: &str) -> Vec<u8> {
     let mut v = format!("{:04x}", payload.len() + 4).into_bytes();
     v.extend_from_slice(payload.as_bytes());
     v
 }
-
-// ═══════════════════════════════ the proof ═══════════════════════════════
 
 #[test]
 fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
@@ -147,8 +119,6 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
     let root = temp_root("e2e");
     let oid = make_repo_with_commit(&root, "acme", "fr-par", "widgets");
 
-    // The PRODUCTION GitCore: sandboxed GitWireExecutor (wire) + in-process GixCore (read), rooted at
-    // the SAME on-disk root. This is exactly what `DurableGitBackend::wire_serving()` composes.
     let core = production_git_core_with_issuer(
         &root,
         GitWireExecutor::default_limits(),
@@ -157,7 +127,6 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
     );
     let repo = RepoLoc::new("acme", "fr-par", "widgets");
 
-    // ── 1. advertise_refs(UploadPack) — the real refs/HEAD oid through the seam ──
     let adv = core
         .advertise_refs(&repo, Service::UploadPack)
         .expect("advertise_refs must run sandboxed against the real repo");
@@ -176,13 +145,10 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
         "advertisement lists refs/heads/main"
     );
 
-    // ── 2. serve(UploadPack, <real want/done request>) — a real packfile through the seam ──
-    // A v0 stateless-rpc fetch request: want the HEAD oid (capabilities on the first want line; NO
-    // side-band so upload-pack streams a raw self-contained pack), flush-pkt, then `done`.
     let mut request = pkt(&format!(
         "want {oid} multi_ack_detailed no-progress ofs-delta agent=myelin/ct006b\n"
     ));
-    request.extend_from_slice(b"0000"); // flush-pkt: end of want list
+    request.extend_from_slice(b"0000");
     request.extend_from_slice(&pkt("done\n"));
 
     let served = core
@@ -195,7 +161,6 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
         body.len()
     );
 
-    // The response is `0008NAK\n` then the raw packfile (no side-band). Slice from the PACK signature.
     let pack_at = body
         .windows(4)
         .position(|w| w == b"PACK")
@@ -206,7 +171,6 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
         String::from_utf8_lossy(&pack[..4])
     );
 
-    // ── 3. PROVE a client could complete the fetch: index-pack + verify-pack the wanted oid ──
     let verify_dir = root.join("verify");
     std::fs::create_dir_all(&verify_dir).expect("mkdir verify");
     let pack_path = verify_dir.join("clone.pack");
@@ -240,7 +204,7 @@ fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
     );
     assert!(
         listing.contains(&oid),
-        "the wanted commit oid {oid} MUST be present in the served pack — a real client completes the fetch"
+        "the wanted commit oid {oid} MUST be present in the served pack - a real client completes the fetch"
     );
 
     println!("=== CT-006b CLONE/FETCH PROVEN end-to-end through the production GitCore seam ===");

@@ -1,35 +1,3 @@
-//! # Drill — SRCH-D9 (CI variant): restore + cross-seam + re-erase at scale — 0 resurrected, 0
-//! row↔doc↔vector mismatch (SRCH-P28 → P-421, the restore-verify permanent gate)
-//!
-//! **Drill source:** `planning/05-refined-shared-systems-architecture/testing-strategy/01-whole-system-e2e-and-drill-catalogue.md`
-//! SRCH-D9 (~364): *Restore index with OLTP/blob/offsets → no resurrected erased docs (re-erasure
-//! runs); no row↔doc↔vector mismatch.* **Architecture:** `search-and-indexing.md` §4.9 (reindex-from-
-//! source is the ONLY rebuild path; post-restore re-erasure runs from the erasure ledger 10.8 through
-//! the live reindex path) + §4.8 (erase = purge + re-index, not hide; 0 orphan embedding). **Contract:**
-//! 6.4 (reindex post-restore), 10.8 (the erasure ledger driving post-restore re-erasure).
-//!
-//! ## What this drill proves (the dated green artifact, 2026-06-24)
-//! A moderate corpus of knowledge pages is the owner's PRE-erase truth (the state an older backup
-//! captured). Several pages mention erased data subjects by their `<pseudonym>@<tenant>.noreply` handle
-//! (contract 4.8); the rest do not. Those subjects were ERASED in the live cell — recorded in the
-//! PII-free, non-shred-erasable Search erasure ledger (10.8). Then a RESTORE happens: the index is
-//! rebuilt **reindex-from-source** to the pre-erase consistency point — which RESURRECTS the erased
-//! subjects' docs (the backup predates the erase). The Search restore-verify gate then RE-ERASES from
-//! the ledger through the SAME live erase path and asserts:
-//! - **0 resurrected erased docs** — every ledger-erased subject has 0 live docs after the re-erasure;
-//! - **0 row↔doc↔vector mismatch** — every live semantic doc has exactly one live vector
-//!   (`live_count == live_vector_count`);
-//! - **0 orphan embedding** — the re-erasure compaction physically removed every tombstoned vector;
-//! - the **surviving (non-erased) pages are intact** — the re-erasure is surgical, not a blanket wipe.
-//!
-//! ## Floor named
-//! This is the **CI-scale** variant (a moderate corpus, not the world-scale fleet corpus). The
-//! at-scale whole-system E2E wedge (E2E-3 reindex-parity / E2E-4 DSAR fan-out) is **SRCH-P32 (P-465)**;
-//! the HYOK cross-store + backup-scale erasure proofs are **SRCH-P29 (P-422)**; the object-store index
-//! backstop is **SRCH-P30 (P-463)**. The SRCH-D9 restore-verify LOGIC + its dated artifact ship now and
-//! re-run as a `cargo test` permanent gate on every store-touching change. The SRCH-P15 erase mutation
-//! floor + the SRCH-P16 reindex mutation floor hold (unchanged) — this drill re-drives those paths.
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -149,20 +117,14 @@ fn cell() -> (
     (ix, fetcher, reindexer, holder)
 }
 
-/// **SRCH-D9 (CI variant) — the dated green artifact.** A moderate corpus where a restore to the
-/// pre-erase point resurrects three erased subjects' docs; the gate re-erases them all and proves 0
-/// resurrected + 0 row↔doc↔vector mismatch + 0 orphan; the survivors are intact.
 #[test]
 fn srch_d9_restore_reerase_zero_resurrected_zero_mismatch() {
     let (ix, fetcher, reindexer, holder) = cell();
 
-    // Three erased subjects + their pseudonyms (the .noreply handle the body mentions them by).
     let erased_ids = ["u-erased-1", "u-erased-2", "u-erased-3"];
     let ledger = SearchErasureLedger::new(tenant(), region());
 
-    // The owner's PRE-erase truth: 12 pages. Three mention an erased subject; nine are unrelated.
     let mut owner = ReferenceReindexSource::new("knowledge", "page");
-    // The three pages owned by erased subjects (mention them by pseudonym).
     for (i, id) in erased_ids.iter().enumerate() {
         let agg = format!("owned-{i}");
         owner.upsert(&agg, 1, serde_json::json!({ "kind": "page" }));
@@ -172,7 +134,6 @@ fn srch_d9_restore_reerase_zero_resurrected_zero_mismatch() {
         );
         ledger.record(&subject(id), "2026-06-20T00:00:00Z");
     }
-    // Nine unrelated pages (the survivors).
     for i in 0..9 {
         let agg = format!("free-{i}");
         owner.upsert(&agg, 1, serde_json::json!({ "kind": "page" }));
@@ -183,7 +144,6 @@ fn srch_d9_restore_reerase_zero_resurrected_zero_mismatch() {
     }
     assert_eq!(ledger.len(), 3, "three subjects recorded erased (PII-free)");
 
-    // RESTORE to the pre-erase consistency point (a full cold rebuild from source) → the gate re-erases.
     let mut outbox = OutboxStore::new();
     let srcs: &[&dyn ReindexSource] = &[&owner];
     let mut inputs = SearchRestoreInputs {
@@ -201,9 +161,8 @@ fn srch_d9_restore_reerase_zero_resurrected_zero_mismatch() {
 
     let artifact = SearchRestoreVerifyGate::new()
         .run_or_fail_ci(&mut inputs)
-        .expect("SRCH-D9 must GREEN — 0 resurrected, 0 mismatch");
+        .expect("SRCH-D9 must GREEN - 0 resurrected, 0 mismatch");
 
-    // The dated green artifact's measured numbers.
     assert_eq!(
         artifact.re_erased_subjects, 3,
         "three ledger subjects replayed"
@@ -227,11 +186,10 @@ fn srch_d9_restore_reerase_zero_resurrected_zero_mismatch() {
     assert_eq!(artifact.live_doc_count, 9, "nine survivors remain");
     assert_eq!(
         artifact.live_vector_count, 9,
-        "nine live vectors — exact doc↔vector parity"
+        "nine live vectors - exact doc↔vector parity"
     );
     assert!(artifact.is_green());
 
-    // Cross-check the live index: the erased subjects are NOT searchable; the survivors are.
     assert_eq!(ix.live_count(&tenant(), &region()), 9);
     assert_eq!(
         ix.live_vector_count(&tenant(), &region()),
@@ -250,22 +208,18 @@ fn srch_d9_restore_reerase_zero_resurrected_zero_mismatch() {
         .expect("ft paxos");
     assert_eq!(paxos.len(), 9, "all nine survivors searchable");
 
-    // The dated artifact summary (observability is part of the pass, EI-01 §3).
     let s = artifact.summary();
     assert!(s.contains("search restore-verify PASS (SRCH-D9)"));
     assert!(s.contains("re-erased 3 ledger subject"));
     println!("[P-421 SRCH-D9 GATE GREEN 2026-06-24] {s}");
 }
 
-/// **The gate is a TRUE gate (loud-never-swallowed): a restore that cannot reach a consistent point
-/// FAILs CI.** The realistic failure path — an unreachable/unregistered owner — surfaces as a loud
-/// `RestoreFailed`, never a silent empty rebuild that would mask a wiring bug.
 #[test]
 fn srch_d9_restore_failure_is_loud() {
     let (_ix, _f, reindexer, holder) = cell();
     let src = ReferenceReindexSource::new("knowledge", "page");
     let ledger = SearchErasureLedger::new(tenant(), region());
-    let unknown = SnapshotScope::new("refs", "edge:all"); // no `refs` owner registered.
+    let unknown = SnapshotScope::new("refs", "edge:all");
     let mut outbox = OutboxStore::new();
     let srcs: &[&dyn ReindexSource] = &[&src];
     let mut inputs = SearchRestoreInputs {

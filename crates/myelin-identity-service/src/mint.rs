@@ -1,80 +1,3 @@
-//! # `mint` — `mint_run_token`: per-run attenuated tokens + self-hosted scope + mid-resume re-mint
-//! (P-ID-18 → global P-076; drill ID-D6)
-//!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/identity-and-access.md`
-//! §4 (the per-run attenuated token: capability tokens are **attenuable bearer tokens** whose
-//! authority is a **macaroon/biscuit caveat chain** — offline, client-side, **monotone
-//! attenuation**; life == run life; **self-hosted-runner token scoped to one tenant's `SelfHosted`
-//! jobs**; **mid-resume re-mint** C9 — a days-later HITL approval re-mints a fresh attenuated
-//! token), §11 / §6 (per-run agent grants are **auto-expiring tuples** `expires_at == run life` as
-//! defence-in-depth for **revoke-on-crash**), §6 (the **monotone-intersection delegation algebra**
-//! the mint applies: `agent.policy ∩ delegation ∩ tenant.policy`, with the **"you cannot delegate
-//! authority you do not have"** re-check at mint).
-//!
-//! **Reconciliation (00 §1, C6/C9):** the self-hosted-runner token scope (one tenant's `SelfHosted`
-//! jobs), and the per-job-token mid-resume re-mint, are frozen on 4.7.
-//!
-//! **Contract-index:** row **4.7** — `mint_run_token(agent_id, run_id, delegation_caveats, ttl) →
-//! token` (the **mint half** — OWNED here; the `revoke` half + the S7 store shipped in P-ID-14 /
-//! P-072 and are CONSUMED here). Row **4.5** `delegation` (the intersection the mint applies) —
-//! CONSUMED.
-//!
-//! ## What this module ships (P-ID-18 — the mint half of 4.7)
-//! [`RunTokenMinter::mint_run_token`] mints a **per-run attenuated token** whose authority is the
-//! composed [`DelegationAlgebra`] effective policy (so a token **never exceeds the effective
-//! policy** — the mint re-applies the monotone intersection, EI-01 §7 one primitive). The mint:
-//!
-//! 1. **applies the delegation intersection** (`agent.policy ∩ delegation ∩ tenant.policy`, with
-//!    the trigger-actor re-check) — a run token can never carry authority the agent, the delegator,
-//!    or the tenant did not grant. This is the **"you cannot delegate authority you do not have"**
-//!    re-check at MINT (architecture §6) — the security floor that makes "an agent can do things no
-//!    human role can" structurally impossible (EI-02 §2);
-//! 2. **stamps the run identity** — the token's `jti` is bound to `(agent_id, run_id)`, so the
-//!    token's life IS the run's life; a per-run token is single-purpose;
-//! 3. **enforces the self-hosted-runner one-tenant scope** (C6) — a self-hosted run token's
-//!    authority may name only its own tenant's `SelfHosted` scope (`selfhosted:<tenant>`); it
-//!    **cannot mint or act cross-tenant** (the no-global-pool property at the identity layer);
-//! 4. **registers the `expires_at == run-life` TTL in the S7 store** ([`RevocationStore`]) — the
-//!    auto-expiring revoke-on-crash defence-in-depth: even if the explicit teardown `revoke` is
-//!    lost (the run process crashed), the token **auto-expires at run-life** inside the W bound;
-//! 5. (optionally) **writes the auto-expiring per-run grant tuple** (`expires_at == run life`,
-//!    architecture §6/§11) through the SAME [`TupleStore::write_tuples`] path (one write primitive).
-//!
-//! [`RunTokenMinter::re_mint_on_resume`] is the **mid-workflow re-mint** (C9): when a multi-day
-//! HITL approval lands days later (the Workflow durable-signal case), a resuming activity re-mints a
-//! **fresh** attenuated token (a new `jti`, a new `expires_at == the resumed run-life`) applying the
-//! intersection **as of resume time** — so a delegator who LOST the right between dispatch and
-//! resume yields a NARROWER re-minted token (the intersection is recomputed, never cached-stale).
-//!
-//! [`RunTokenMinter::teardown`] is the explicit revoke leg (the run ended / was killed): it
-//! `revoke`s the token's `jti` (the S7 denylist) so the deny is effective immediately — the ID-D6
-//! `token-revocation-lag` is the gap between teardown and the deny, which is 0 (a hot consult).
-//!
-//! ## The two mandatory-core properties (mutation-tested, per the prompt GATE)
-//! - **The mint re-check** — a minted token's authority is the **monotone intersection** of the
-//!   conjuncts; a grant outside `agent ∩ delegation ∩ tenant` (or one the delegator never held) is
-//!   **never minted into the token**. A mutation that SKIPS the re-check (so the token carried the
-//!   raw requested authority, exceeding the effective policy) MUST be caught — it is the exact
-//!   "an agent does what no one delegated" failure.
-//! - **The auto-expire** — every minted token registers an `expires_at == run-life` TTL, so it
-//!   stops being honoured at run-life **even if the teardown `revoke` is skipped** (the
-//!   revoke-on-crash defence-in-depth). A mutation that DROPS `expires_at` (the token lived past its
-//!   run) MUST be caught.
-//!
-//! ## Floors named
-//! **None new** — the mint is complete in M1 (the prompt's DELIVERABLE: "Floor named: none new — mint
-//! is complete in M1"). Two inherited, named floors are CONSUMED here, unchanged:
-//! - the **cryptographic token envelope** (PASETO v4 sign / biscuit caveat-chain crypto / DPoP) is
-//!   the SAME EI-01 §1 documented structural seam the [`crate::machine_auth::StructuralTokenVerifier`]
-//!   models — the mint emits the same verified-fact envelope, including purpose, audience, run
-//!   binding, and durable delegation snapshot where applicable, so a minted token round-trips
-//!   through `authenticate` (P-ID-07); the real crypto signer
-//!   swaps in behind the [`TokenSigner`] seam (named P5/P6, the same hand-off `machine_auth` names).
-//! - the **wall-clock run-deadline source** (the `expires_at == now + ttl` instant) lands with the
-//!   substrate clock binding (P-S12/P-S18); here the caller supplies `now` (RFC-3339), exactly as
-//!   the S7 store + the audit chain + the tuple store already do (one time convention).
-
 use crate::delegation::{authority_of, DelegationAlgebra, DelegationInput, IntersectionProof};
 use crate::delegation_policy::ResolvedDelegationPolicy;
 use crate::machine_auth::{scheme, CapabilityToken, CredentialPurpose, MachineKind, TokenVerifier};
@@ -88,24 +11,10 @@ use myelin_identity::{
 use myelin_storage::TenantScope;
 use std::sync::Arc;
 
-/// The grant prefix a self-hosted-runner run token's authority is ceiling-bounded to
-/// (`"selfhosted:<tenant>"`) — the SAME prefix [`crate::machine_auth`] enforces at `authenticate`
-/// (one ceiling convention, EI-01 §7). A self-hosted run token may name only its OWN tenant's
-/// `SelfHosted` scope (architecture §3/§4, C6).
 pub const SELFHOSTED_GRANT_PREFIX: &str = "selfhosted:";
 
-/// The relation a per-run grant tuple is written under when the mint also stamps the auto-expiring
-/// `expires_at == run life` grant tuple (architecture §6/§11). A per-run grant is a narrow,
-/// auto-expiring edge `run:<run_id>#bound@<agent_id>` — its `expires_at` IS the revoke-on-crash
-/// defence-in-depth at the TUPLE layer (the S7 TTL is the same defence at the token layer).
 pub const RUN_GRANT_RELATION: &str = "run_bound";
 
-/// Final-boundary verifier for an externally presented per-run token.
-///
-/// The router's successful mint is not itself authorization for a mutation adapter: the adapter
-/// calls this verifier immediately before its public endpoint. Verification is fail-closed and
-/// binds the signed token to the expected run-token record, tenant/region, principal, and every
-/// independently resolved capability required by the selected tool.
 #[derive(Clone)]
 pub struct RunTokenAuthorizer {
     verifier: Arc<dyn TokenVerifier>,
@@ -113,33 +22,18 @@ pub struct RunTokenAuthorizer {
     now: Arc<dyn Fn() -> Timestamp + Send + Sync>,
 }
 
-/// Why a CI-job credential was refused at the final launch boundary.
-///
-/// Variants expose actionable policy facts only; opaque bearer material and verifier internals are
-/// deliberately never retained or rendered.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CiJobAuthorizationError {
-    /// The caller did not name the exact non-empty job/run identifier it is about to launch.
     EmptyExpectedIdentifier,
-    /// Signature, expiry, or signed caveat verification refused the credential.
     CredentialVerificationRefused,
-    /// The verified credential was not minted under [`MachineKind::Ci`].
     WrongMachineKind { actual: MachineKind },
-    /// The verified credential purpose was not [`CredentialPurpose::CiJob`].
     WrongCredentialPurpose,
-    /// The signed CI job/run identifier did not equal the expected launch identifier.
     JobIdentifierMismatch,
-    /// The public carrier JTI did not equal the cryptographically signed JTI.
     CarrierJtiMismatch,
-    /// The signed tenant did not equal the launch boundary tenant.
     TenantMismatch,
-    /// The signed region did not equal the launch boundary region.
     RegionMismatch,
-    /// The signed subject did not equal the expected CI principal.
     SubjectMismatch,
-    /// Durable S7 did not report the token as exactly live within its run lifetime.
     NotLive { state: RunTokenState },
-    /// The attenuated signed authority omitted one capability required by this launch.
     MissingCapability { capability: String },
 }
 
@@ -199,8 +93,6 @@ enum BoundaryCheckError {
 }
 
 impl RunTokenAuthorizer {
-    /// Build the production-capable boundary over an injected cryptographic verifier and the SAME
-    /// durable S7 store the minter/teardown path writes.
     pub fn new(verifier: Arc<dyn TokenVerifier>, revocations: RevocationStore) -> Self {
         Self {
             verifier,
@@ -209,13 +101,11 @@ impl RunTokenAuthorizer {
         }
     }
 
-    /// Inject a deterministic boundary clock for tests and replay drills.
     pub fn with_clock(mut self, now: impl Fn() -> Timestamp + Send + Sync + 'static) -> Self {
         self.now = Arc::new(now);
         self
     }
 
-    /// Verify and authorize a token for one exact final-boundary tool invocation.
     pub fn authorize(
         &self,
         scope: &TenantScope,
@@ -273,12 +163,6 @@ impl RunTokenAuthorizer {
         Ok(verified)
     }
 
-    /// Authorize one exact CI job immediately before launch.
-    ///
-    /// Verification is pinned to the `ci` credential scheme and requires an exact CI machine kind,
-    /// exact `ci_job` purpose and non-empty signed identifier, carrier/signed JTI equality, exact
-    /// tenant/region/subject binding, cryptographic and caveat validity, live S7 run state, and every
-    /// independently resolved launch capability. This method grants no runtime authority itself.
     pub fn authorize_ci_job(
         &self,
         scope: &TenantScope,
@@ -376,23 +260,12 @@ fn system_now_timestamp() -> Timestamp {
     Timestamp(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-/// **An error the mint refuses LOUDLY on (never a fabricated/over-broad token).** A mint that cannot
-/// honour its invariants (a self-hosted run token naming another tenant's scope; a non-positive
-/// TTL that could mint a never-expiring token) refuses — it does NOT mint a degraded token.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MintError {
-    /// A self-hosted-runner run token's authority named a grant outside its own tenant's
-    /// `SelfHosted` scope (cross-tenant / non-`selfhosted` grant) — the no-global-pool property
-    /// (C6). The offending grant is carried for the audit.
     SelfHostedScopeViolation(String),
-    /// The requested TTL is zero — a per-run token MUST have a finite, positive life (its life ==
-    /// run life). A zero-TTL token could be mistaken for "never expires"; refused.
     NonPositiveTtl,
-    /// A durable run-policy cursor must be a positive storage snapshot.
     InvalidDelegationSnapshot(i64),
-    /// The generic run minter cannot mint long-lived PAT or deploy-key credentials.
     UnsupportedRunKind(MachineKind),
-    /// Caller arguments do not match the verified principals/run bound into the resolved snapshot.
     ResolvedPolicyBindingMismatch,
 }
 
@@ -402,24 +275,24 @@ impl core::fmt::Display for MintError {
             MintError::SelfHostedScopeViolation(g) => write!(
                 f,
                 "self-hosted-runner run token authority `{g}` names a scope outside its own \
-                 tenant's SelfHosted jobs — a runner token cannot act cross-tenant (C6, \
-                 no-global-pool) — refused"
+                 tenant's SelfHosted jobs - a runner token cannot act cross-tenant (C6, \
+                 no-global-pool) - refused"
             ),
             MintError::NonPositiveTtl => write!(
                 f,
-                "a per-run token TTL must be positive (life == run life) — a zero-TTL token is \
+                "a per-run token TTL must be positive (life == run life) - a zero-TTL token is \
                  refused (it could be mistaken for never-expiring)"
             ),
             MintError::InvalidDelegationSnapshot(snapshot) => write!(
                 f,
-                "durable delegation snapshot `{snapshot}` is not a positive storage cursor — refused"
+                "durable delegation snapshot `{snapshot}` is not a positive storage cursor - refused"
             ),
             MintError::UnsupportedRunKind(kind) => write!(
                 f,
-                "machine kind `{kind:?}` is not a run-scoped credential kind — refused"
+                "machine kind `{kind:?}` is not a run-scoped credential kind - refused"
             ),
             MintError::ResolvedPolicyBindingMismatch => f.write_str(
-                "resolved delegation policy does not match the requested run/principal/scope binding — refused",
+                "resolved delegation policy does not match the requested run/principal/scope binding - refused",
             ),
         }
     }
@@ -427,26 +300,10 @@ impl core::fmt::Display for MintError {
 
 impl std::error::Error for MintError {}
 
-/// The pluggable token-SIGNING seam (the EI-01 §1 named floor — the mint counterpart of
-/// [`crate::machine_auth::TokenVerifier`]). A signer turns the mint's trust-rooted facts (tenant,
-/// region, subject key, jti, the attenuated authority) into the opaque bearer material a presented
-/// credential later verifies. The REAL crypto signer (PASETO v4 sign / biscuit caveat-chain seal /
-/// DPoP binding) implements this and swaps in behind the SAME seam; the mint's intersection + scope
-/// + TTL logic does not change. The floor implementation is [`StructuralTokenSigner`].
 pub trait TokenSigner: Send + Sync {
-    /// Sign the mint's facts into the opaque bearer material. The material MUST round-trip through
-    /// the verifier (the floor signer emits the verifier's complete verified-fact envelope), so a
-    /// minted token authenticates as the principal it was minted
-    /// for. `grants` is the ALREADY-ATTENUATED effective authority (the mint applied the
-    /// intersection) — the signer never widens it.
     fn sign(&self, request: &TokenSignRequest) -> String;
 }
 
-/// Trust-rooted, already-attenuated facts presented to a [`TokenSigner`].
-///
-/// Tenant and region travel together as a verified [`TenantScope`], while the subject and purpose
-/// retain their domain types. Raw subject keys, revocation handles, and grant names are deliberately
-/// omitted from `Debug` because signer requests routinely cross logging/error boundaries.
 #[derive(Clone)]
 pub struct TokenSignRequest {
     scope: TenantScope,
@@ -458,7 +315,6 @@ pub struct TokenSignRequest {
 }
 
 impl TokenSignRequest {
-    /// Capture the verified scope and the mint's already-attenuated authority without widening it.
     pub fn new(
         scope: &TenantScope,
         subject: PrincipalId,
@@ -516,18 +372,10 @@ impl core::fmt::Debug for TokenSignRequest {
     }
 }
 
-/// **The floor token signer (the EI-01 §1 documented deviation).** Emits the SAME structural
-/// verified-token envelope [`crate::machine_auth::StructuralTokenVerifier`] parses
-/// (`<tenant>|<region>|<subject_key>|<jti>|<dpop:0|1>|<grant>,<grant>,…`), so a minted run token
-/// round-trips through `authenticate` (P-ID-07) — the authorization-relevant path is proven without
-/// pretending to do crypto. A per-run token is short-lived (TTL-constrained), so it is minted
-/// `dpop:0` (its TTL is the constraint, not DPoP — §4). The real PASETO/biscuit signer is the named
-/// P5/P6 floor.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct StructuralTokenSigner;
 
 impl StructuralTokenSigner {
-    /// A fresh floor token signer.
     pub fn new() -> StructuralTokenSigner {
         StructuralTokenSigner
     }
@@ -540,8 +388,6 @@ impl TokenSigner for StructuralTokenSigner {
         let subject_key = &request.subject().0;
         let jti = request.jti();
         let purpose = request.purpose();
-        // A per-run token is TTL-constrained, not DPoP-bound (§4) → dpop = 0. The grant list is the
-        // already-attenuated effective authority (comma-separated; empty ⇒ no grants).
         format!(
             "{tenant}|{region}|{subject_key}|{jti}|0|{}|{}|edge|{}|{}",
             request.grants().join(","),
@@ -558,67 +404,29 @@ impl TokenSigner for StructuralTokenSigner {
     }
 }
 
-/// **The recorded proof a kill-mid-flight is bounded (the ID-D6 green artifact, EI-01 §3 "prove
-/// it").** A killed run's per-run token is revoked (teardown) AND auto-expires (`expires_at`) within
-/// run-life ≤ W. This records the two legs so the drill emits the dated artifact: the
-/// `revoked_on_teardown` flag (the explicit `revoke` landed → deny is effective at teardown time)
-/// and the `auto_expires_within_run_life` flag (the S7 TTL guarantees the token dies at run-life
-/// even if teardown is SKIPPED). Both true is the only passing value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevocationProof {
-    /// The token's `jti` (the revocation handle).
     pub jti: String,
-    /// The explicit teardown `revoke` landed → the deny is effective immediately (a hot consult).
     pub revoked_on_teardown: bool,
-    /// The token auto-expires at run-life via the S7 `expires_at` TTL — even if teardown is skipped
-    /// (the revoke-on-crash defence-in-depth).
     pub auto_expires_within_run_life: bool,
-    /// The measured token-revocation-lag, in seconds: the gap between the kill and the deny. `0` for
-    /// the teardown path (a hot denylist consult — the deny is effective at revoke time); for the
-    /// crash path (teardown skipped) the bound is the TTL (run-life), asserted ≤ W by the drill.
     pub token_revocation_lag_secs: i64,
 }
 
 impl RevocationProof {
-    /// Is the kill bounded (both legs hold)? `true` is the only passing value the drill greens on.
     pub fn holds(&self) -> bool {
         self.revoked_on_teardown && self.auto_expires_within_run_life
     }
 }
 
-/// **The per-run-token minter (contract 4.7, the mint half; architecture §4/§6/§11).** Mints
-/// per-run attenuated tokens that never exceed the composed delegation policy, registers the
-/// `expires_at == run-life` TTL (revoke-on-crash defence-in-depth), enforces the self-hosted-runner
-/// one-tenant scope, and re-mints a fresh attenuated token mid-workflow on resume.
-///
-/// Holds the [`DelegationAlgebra`] (the intersection the mint applies — the SAME algebra P-ID-17
-/// ships, one primitive), the S7 [`RevocationStore`] (the TTL + teardown revoke target P-ID-14
-/// ships), an optional [`TupleStore`] (for the auto-expiring per-run grant tuple), and the pluggable
-/// [`TokenSigner`] (the floor structural envelope; the real crypto signer swaps in behind it).
 #[derive(Clone)]
 pub struct RunTokenMinter {
-    /// The monotone-intersection delegation algebra (P-ID-17) — the mint applies it so a token never
-    /// exceeds `agent.policy ∩ delegation ∩ tenant.policy` (one intersection primitive).
     algebra: DelegationAlgebra,
-    /// The S7 revocation list / token denylist (P-ID-14) — the mint registers the `expires_at ==
-    /// run-life` TTL here (defence-in-depth), and `teardown` revokes the `jti` here.
     revocations: RevocationStore,
-    /// The token signer (the floor structural envelope → the real crypto signer behind the seam).
     signer: std::sync::Arc<dyn TokenSigner>,
-    /// The S3 tuple store — when wired, the mint also writes the auto-expiring per-run grant tuple
-    /// (`expires_at == run life`, §6/§11). `None` for the pure-token mint (the token-layer TTL is
-    /// the revoke-on-crash defence; the tuple-layer grant is an additional defence-in-depth a caller
-    /// that owns the run's object graph wires).
     tuples: Option<TupleStore>,
 }
 
 impl RunTokenMinter {
-    /// **The production minter constructor (MR-012) — REQUIRES an injected real [`TokenSigner`].**
-    /// No `Structural*` default is built here: the composition root injects the REAL
-    /// [`crate::capability_crypto::PasetoCapabilitySigner`] (PASETO v4 / Ed25519, from the cell token
-    /// authority). `tuples` is `Some` when the caller also writes the auto-expiring per-run grant
-    /// tuple (`expires_at == run life`, §6/§11). This is the constructor `StoreBackedCheck` wires —
-    /// the `no-structural-crypto-in-prod` scanner is GREEN here (no mock-crypto construction).
     pub fn with_signer_and_tuples(
         revocations: RevocationStore,
         tuples: Option<TupleStore>,
@@ -632,10 +440,6 @@ impl RunTokenMinter {
         }
     }
 
-    /// **TEST-DOUBLE constructor (`#[cfg(test)]`, MR-012).** Build a minter over a shared S7
-    /// [`RevocationStore`] with the mock floor [`StructuralTokenSigner`] and NO tuple store. The
-    /// forgeable-envelope signer is NOT in the production graph — production injects the real signer
-    /// via [`Self::with_signer_and_tuples`]; the scanner admits this `#[cfg(test)]`-gated construction.
     #[cfg(test)]
     pub fn new(revocations: RevocationStore) -> RunTokenMinter {
         RunTokenMinter::with_signer_and_tuples(
@@ -645,9 +449,6 @@ impl RunTokenMinter {
         )
     }
 
-    /// **TEST-DOUBLE constructor (`#[cfg(test)]`, MR-012).** A minter that ALSO writes the
-    /// auto-expiring per-run grant tuple, with the mock floor [`StructuralTokenSigner`]. Production
-    /// uses [`Self::with_signer_and_tuples`] with the real signer.
     #[cfg(test)]
     pub fn with_tuple_store(revocations: RevocationStore, tuples: TupleStore) -> RunTokenMinter {
         RunTokenMinter::with_signer_and_tuples(
@@ -657,39 +458,15 @@ impl RunTokenMinter {
         )
     }
 
-    /// Swap in an explicit [`TokenSigner`] (the seam the real PASETO/biscuit crypto signer plugs
-    /// into — the named floor). The mint's intersection + scope + TTL logic is unchanged.
     pub fn with_signer(mut self, signer: std::sync::Arc<dyn TokenSigner>) -> RunTokenMinter {
         self.signer = signer;
         self
     }
 
-    /// The shared S7 revocation list / token denylist this minter writes the per-run TTL + teardown
-    /// revoke into (so a caller can assert the deny / read the `revocation_lag` telemetry).
     pub fn revocations(&self) -> &RevocationStore {
         &self.revocations
     }
 
-    /// **`mint_run_token(agent_id, run_id, delegation_caveats, ttl) → token` (contract 4.7, the mint
-    /// half).** Mints a per-run attenuated token whose authority is the composed effective policy
-    /// (the monotone intersection the mint applies), with `expires_at == run-life` registered in S7.
-    ///
-    /// - `scope` is the verified `(tenant, region)` the run executes under (the partition the TTL is
-    ///   registered in; tenant-from-token, never a path — the tenant-predicate floor). The ABI 4.7
-    ///   signature has no scope; the service surface ([`crate::StoreBackedCheck`]) wires THIS entry.
-    /// - `agent_id` / `run_id` identify the run; the token's `jti` is bound to them (the token's life
-    ///   IS the run's life).
-    /// - `input` carries the delegation conjuncts (the agent ceiling, the delegation chain, the
-    ///   tenant guardrails, the trigger-actor's held set) the intersection composes — the SAME
-    ///   [`DelegationInput`] P-ID-17 uses. `delegation_caveats` (the frozen ABI carrier) is the
-    ///   projection of `input.delegation`; both are accepted so the ABI shape and the rich algebra
-    ///   input stay aligned.
-    /// - `kind` selects the self-hosted-runner ceiling (a [`MachineKind::PerJob`] run token is
-    ///   bounded to its own tenant's `SelfHosted` scope, C6).
-    /// - `ttl` is the run's life (the `expires_at` window); `now` is the mint instant (RFC-3339).
-    ///
-    /// Returns the minted [`RunToken`] (the opaque bearer material + the `jti`), or a [`MintError`]
-    /// (a self-hosted scope violation; a non-positive TTL) — never a fabricated/over-broad token.
     #[allow(clippy::too_many_arguments)]
     pub fn mint_run_token(
         &self,
@@ -719,11 +496,6 @@ impl RunTokenMinter {
         Ok(token)
     }
 
-    /// **The mint WITH the recorded [`IntersectionProof`] (the ID-D5/ID-D6 "prove-it" observation).**
-    /// Identical to [`RunTokenMinter::mint_run_token`] but additionally returns the proof that the
-    /// minted token's authority is the monotone intersection (the four conjunct sets + the composed
-    /// effective set + the verified subset-of-every-conjunct post-condition). EI-01 §3: the property
-    /// does not exist until a test forces it AND the mint records it.
     #[allow(clippy::too_many_arguments)]
     pub fn mint_proved(
         &self,
@@ -753,8 +525,6 @@ impl RunTokenMinter {
         )
     }
 
-    /// Mint from a server-resolved durable delegation policy. This is the authoritative run-token
-    /// path: the signed credential binds both the run id and the exact durable policy snapshot.
     #[allow(clippy::too_many_arguments)]
     pub fn mint_from_resolved_policy(
         &self,
@@ -819,26 +589,14 @@ impl RunTokenMinter {
         now: &Timestamp,
         delegation_snapshot: Option<i64>,
     ) -> Result<(RunToken, IntersectionProof), MintError> {
-        // (0) A per-run token MUST have a finite, positive life (life == run life). A zero-TTL token
-        //     could be mistaken for never-expiring — refuse it (never mint a no-expiry per-run token).
         if ttl.static_max_secs == 0 {
             return Err(MintError::NonPositiveTtl);
         }
-        let _ = delegation_caveats; // the ABI carrier; the rich `input.delegation` is the authority source.
+        let _ = delegation_caveats;
 
-        // (1) THE MINT RE-CHECK (architecture §6 — "you cannot delegate authority you do not have").
-        //     Apply the SAME monotone intersection the delegation algebra (P-ID-17) computes:
-        //     effective = agent.policy ∩ (delegation ∩ trigger_actor_held) ∩ tenant.policy. The
-        //     minted token's authority is THIS effective set — a token never exceeds the effective
-        //     policy. (One intersection primitive; the mint does not re-implement the algebra.)
         let (effective_policy, proof) = self.algebra.delegation_proved(agent, trigger_actor, input);
         let effective = authority_of(&effective_policy);
 
-        // (2) THE SELF-HOSTED-RUNNER ONE-TENANT SCOPE (architecture §3/§4, C6). A self-hosted run
-        //     token's authority may name ONLY its own tenant's SelfHosted scope. We enforce it
-        //     AFTER the intersection (so the ceiling is checked on the authority actually minted) —
-        //     a grant outside the own-tenant SelfHosted scope is refused (never silently dropped or
-        //     widened: the run was asked to act on a scope it must not, which is a loud error).
         if kind.is_self_hosted_runner() {
             let own = format!("{SELFHOSTED_GRANT_PREFIX}{}", scope.tenant().0);
             for g in effective.grants() {
@@ -848,12 +606,8 @@ impl RunTokenMinter {
             }
         }
 
-        // (3) The run identity: the token's jti is bound to (agent_id, run_id) — the token's life IS
-        //     the run's life. A per-run token is single-purpose; its jti is the revocation handle.
         let jti = run_token_jti(agent_id, run_id, now);
 
-        // Compute the authoritative run deadline before signing so the outer cryptographic `exp` and
-        // the durable S7 lifecycle record share the same boundary.
         let expires_at = expires_at_of(now, ttl);
 
         let purpose = match kind {
@@ -872,9 +626,6 @@ impl RunTokenMinter {
             }
         };
 
-        // (4) Sign the (already-attenuated) effective authority into the bearer material (the floor
-        //     structural envelope → the real crypto signer behind the seam). The signer NEVER widens
-        //     the authority — it carries exactly the effective set the intersection produced.
         let request = TokenSignRequest::new(
             scope,
             agent_id.clone(),
@@ -885,22 +636,9 @@ impl RunTokenMinter {
         );
         let material = self.signer.sign(&request);
 
-        // (5) Register the `expires_at == run-life` TTL in S7 (the revoke-on-crash defence-in-depth,
-        //     §11). The token is denylisted UNTIL `expires_at` — wait, no: the S7 TTL models the
-        //     auto-EXPIRY (the token stops being a *live grant* at run-life). The revoke-on-crash
-        //     property: even if the explicit teardown revoke is lost, the token cannot outlive its
-        //     run — authentication requires `run_token_state == LiveWithinRunLife`, so expired,
-        //     torn-down, and unknown records are dead. We register the TTL so run-life is RECORDED in the
-        //     durable S7 mirror (so a crash-recovered cell still knows the run-life boundary). This
-        //     is the per-run-token TTL store P-ID-14 (`register_run_token_ttl`) shipped for this mint.
         self.revocations
             .register_run_token_ttl(scope, &jti, now.clone(), expires_at.clone());
 
-        // (6) Optionally write the auto-expiring per-run GRANT tuple (`expires_at == run life`,
-        //     §6/§11) — the tuple-layer revoke-on-crash defence, alongside the token-layer S7 TTL.
-        //     A narrow `run:<run_id>#run_bound@<agent_id>` edge whose expiry IS the run-life. Through
-        //     the SAME write_tuples path (one write primitive); a write failure is non-fatal to the
-        //     mint (the token-layer TTL is the primary defence) but is surfaced (never swallowed).
         if let Some(tuples) = &self.tuples {
             let delta = TupleDelta::Add(RelationTuple {
                 object: ObjectId(format!("run:{}", run_id.0)),
@@ -908,7 +646,6 @@ impl RunTokenMinter {
                 subject: agent_id.clone(),
                 caveat: None,
             });
-            // The grant tuple co-commits with its identity.tuple.written emit; expires_at == run life.
             let _ = tuples.write_tuples(
                 scope,
                 agent,
@@ -928,17 +665,6 @@ impl RunTokenMinter {
         ))
     }
 
-    /// **The mid-workflow re-mint on resume (architecture §4, C9 — the Workflow durable-signal
-    /// case).** When a multi-day HITL approval lands days later, the resuming activity re-mints a
-    /// **fresh** attenuated token: a NEW `jti`, a NEW `expires_at == the resumed run-life`, applying
-    /// the intersection **as of resume time** (`now_resume`). Because the intersection is recomputed
-    /// against the conjuncts as-of-resume, a delegator who LOST the right between dispatch and resume
-    /// yields a NARROWER re-minted token — the re-mint is never a stale copy of the dispatch token.
-    ///
-    /// Returns the fresh [`RunToken`] (a distinct `jti` from any prior mint for the run). The prior
-    /// token is NOT auto-revoked here (the workflow engine tears it down on its own boundary,
-    /// [`RunTokenMinter::teardown`]) — the re-mint is purely "a fresh, possibly-narrower token for
-    /// the resumed leg".
     #[allow(clippy::too_many_arguments)]
     pub fn re_mint_on_resume(
         &self,
@@ -953,9 +679,6 @@ impl RunTokenMinter {
         ttl: &FailStaticBound,
         now_resume: &Timestamp,
     ) -> Result<RunToken, MintError> {
-        // The re-mint IS a mint, run again as-of resume time (one mint primitive, no bespoke resume
-        // path). The fresh `now_resume` yields a fresh jti + a fresh expires_at; the recomputed
-        // intersection yields the as-of-resume (possibly narrower) authority.
         self.mint_run_token(
             scope,
             agent_id,
@@ -970,37 +693,18 @@ impl RunTokenMinter {
         )
     }
 
-    /// **The explicit teardown revoke (the run ended / was killed) — the ID-D6 teardown leg.**
-    /// Revokes the token's `jti` (the S7 denylist) so the deny is effective immediately (a hot
-    /// consult — the token-revocation-lag is 0). Idempotent + crash-safe (it is a `revoke` of the
-    /// jti, P-ID-14). Pairs with the auto-expiry: teardown is the immediate deny, the `expires_at`
-    /// TTL is the defence-in-depth if teardown is skipped (the crash path).
     pub fn teardown(&self, scope: &TenantScope, token: &RunToken, now: &Timestamp) {
         self.revocations
             .tear_down_run_token(scope, &token.jti, now.clone());
     }
 
-    /// **Is the run token still live as of `now` (the consult a surface runs before honouring a per-
-    /// run token)?** A token is dead when (a) it was explicitly revoked (teardown), OR (b) its
-    /// `expires_at == run-life` TTL has passed (the auto-expire, even if teardown was skipped). This
-    /// is the consult `authenticate`/`check` already run for the jti (the SAME S7 `is_revoked`
-    /// honouring expiry) — exposed here as the run-token-liveness predicate the drill asserts.
     pub fn is_live(&self, scope: &TenantScope, token: &RunToken, now: &Timestamp) -> bool {
-        // `is_revoked` is TRUE while a TTL'd entry has NOT expired (it is on the denylist UNTIL
-        // expiry as the run-life marker), and stays true forever for a teardown revoke (a no-TTL
-        // jti revoke). So liveness needs BOTH: the entry exists (the run was minted) AND we are
-        // before expiry AND it was not torn down. We model this directly against the two facts:
-        // the TTL window and the teardown flag — see `revocation_state`.
         match self.revocation_state(scope, token, now) {
             RunTokenState::LiveWithinRunLife => true,
             RunTokenState::Expired | RunTokenState::TornDown | RunTokenState::Unknown => false,
         }
     }
 
-    /// The state of a per-run token's S7 record as of `now` (the basis for [`RunTokenMinter::is_live`]
-    /// and the ID-D6 proof) — re-exported from the S7 store ([`RevocationStore::run_token_state`]).
-    /// Distinguishes the deaths: torn-down (explicit teardown), expired (the TTL passed — the
-    /// auto-expire), and the live window.
     pub fn revocation_state(
         &self,
         scope: &TenantScope,
@@ -1012,37 +716,18 @@ impl RunTokenMinter {
     }
 }
 
-/// Build a per-run token's `jti` from `(agent_id, run_id, mint_instant)`. A re-mint at a later
-/// instant yields a DISTINCT jti (the mint-instant disambiguates the resumed leg from the dispatch
-/// leg) — so the re-mint is a fresh token, never a collision with the prior one. PII-free (opaque
-/// ids only).
 pub fn run_token_jti(agent_id: &PrincipalId, run_id: &RunId, mint_instant: &Timestamp) -> String {
     format!("runtok:{}:{}:{}", agent_id.0, run_id.0, mint_instant.0)
 }
 
-/// Compute the per-run token's `expires_at == now + ttl` (the run-life boundary). The wall-clock
-/// arithmetic source lands with the substrate clock binding (P-S12/P-S18); on this floor `now` is an
-/// RFC-3339 instant and the TTL is added by parsing the trailing seconds — the structural carrier
-/// the real clock swaps in behind. We model the boundary as `now#+<ttl>s` only when `now` is not a
-/// parseable instant; for the canonical `YYYY-MM-DDTHH:MM:SSZ` form we add the TTL to the seconds.
 pub fn expires_at_of(now: &Timestamp, ttl: &FailStaticBound) -> Timestamp {
     Timestamp(add_secs_rfc3339(&now.0, ttl.static_max_secs))
 }
 
-/// Add `secs` to an RFC-3339 `YYYY-MM-DDTHH:MM:SSZ` instant, carrying minutes/hours/days as needed.
-/// The lexical order of the result preserves chronological order (the SAME convention the S7 store,
-/// the tuple-store zookie, and the audit chain rely on), so the S7 `now < expires_at` string compare
-/// is correct. A non-canonical instant falls back to a lexically-greater suffix so the TTL is never
-/// silently zero (the auto-expire is mandatory-core — it must always be a strictly-later instant).
 fn add_secs_rfc3339(instant: &str, secs: u64) -> String {
-    // Parse `YYYY-MM-DDTHH:MM:SSZ`. If it does not match, return a lexically-greater marker so the
-    // expiry is always strictly after `now` (never a no-op that would drop the auto-expire).
     let parsed = parse_rfc3339(instant);
     match parsed {
         Some((y, mo, d, h, mi, s)) => {
-            // Convert to a day-second count, add, re-normalise. Days-in-month is the proleptic
-            // Gregorian calendar; this is the structural floor (the real clock library lands with
-            // the substrate binding). Correct for the bounded TTLs a run-life uses (≤ hours).
             let total = day_seconds(h, mi, s) + secs;
             let extra_days = total / 86_400;
             let rem = total % 86_400;
@@ -1062,10 +747,7 @@ fn day_seconds(h: u32, mi: u32, s: u32) -> u64 {
     h as u64 * 3_600 + mi as u64 * 60 + s as u64
 }
 
-/// Parse a `YYYY-MM-DDTHH:MM:SSZ` instant into its fields (the canonical floor form). `None` for any
-/// other shape (the caller falls back to a lexically-greater suffix so the auto-expire never drops).
 fn parse_rfc3339(s: &str) -> Option<(i64, u32, u32, u32, u32, u32)> {
-    // Expected exact length `YYYY-MM-DDTHH:MM:SSZ` == 20 chars.
     let b = s.as_bytes();
     if b.len() != 20
         || b[4] != b'-'
@@ -1089,9 +771,6 @@ fn parse_rfc3339(s: &str) -> Option<(i64, u32, u32, u32, u32, u32)> {
     Some((y, mo, d, h, mi, sec))
 }
 
-/// Add `extra_days` to a `(year, month, day)`, carrying across month/year boundaries (proleptic
-/// Gregorian). For the bounded TTLs a run-life uses, `extra_days` is 0 or 1; the loop handles any
-/// value robustly.
 fn add_days(mut y: i64, mut mo: u32, mut d: u32, extra_days: u64) -> (i64, u32, u32) {
     let mut remaining = extra_days;
     while remaining > 0 {
@@ -1831,21 +1510,16 @@ mod tests {
         );
     }
 
-    /// **Minting re-checks "cannot delegate what you lack": the token's authority is the monotone
-    /// intersection, never the raw requested set (architecture §6 — the mint re-check, mandatory-
-    /// core).** The delegation NAMES a grant the delegator never held; the minted token does NOT
-    /// carry it (the mint applied the intersection).
     #[test]
     fn mint_applies_the_intersection_cannot_delegate_what_you_lack() {
         let s7 = RevocationStore::new();
         let minter = RunTokenMinter::new(s7);
         let acme = scope("acme");
-        // The delegation TRIES to grant admin; the delegator never HELD admin → it is dropped.
         let inp = input(
             &["repo:acme/web#admin", "repo:acme/web#read"],
             &["repo:acme/web#admin", "repo:acme/web#read"],
             &["repo:acme/web#admin", "repo:acme/web#read"],
-            &["repo:acme/web#read"], // delegator holds only read
+            &["repo:acme/web#read"],
         );
         let (token, proof) = minter
             .mint_proved(
@@ -1861,7 +1535,6 @@ mod tests {
                 &ts("2026-06-19T00:00:00Z"),
             )
             .expect("mint succeeds");
-        // The minted token's material carries ONLY repo:acme/web#read (admin was never minted).
         assert!(
             token.token.contains("repo:acme/web#read"),
             "the held grant is minted"
@@ -1877,16 +1550,12 @@ mod tests {
         assert_eq!(proof.effective, vec!["repo:acme/web#read".to_string()]);
     }
 
-    /// **A self-hosted-runner run token cannot act cross-tenant (architecture §3/§4, C6 — mandatory-
-    /// core).** A per-job run token may name ONLY its own tenant's SelfHosted scope; an effective
-    /// authority naming another tenant's scope is REFUSED (the no-global-pool property).
     #[test]
     fn self_hosted_runner_token_cannot_act_cross_tenant() {
         let s7 = RevocationStore::new();
         let minter = RunTokenMinter::new(s7);
         let acme = scope("acme");
 
-        // Own-tenant SelfHosted scope → mints.
         let ok = input(
             &["selfhosted:acme"],
             &["selfhosted:acme"],
@@ -1909,9 +1578,6 @@ mod tests {
             .expect("own-tenant SelfHosted run token mints");
         assert!(token.token.contains("selfhosted:acme"));
 
-        // An effective authority naming ANOTHER tenant's SelfHosted scope → refused.
-        // (The conjuncts all name globex's scope, so the intersection is non-empty — it is the
-        // SCOPE ceiling, not the intersection, that must catch this.)
         let cross = input(
             &["selfhosted:globex"],
             &["selfhosted:globex"],
@@ -1939,9 +1605,6 @@ mod tests {
         );
     }
 
-    /// **A re-mint on resume yields a FRESH attenuated token (architecture §4, C9).** The resumed
-    /// leg re-mints a distinct `jti`; and when the delegator LOST the right between dispatch and
-    /// resume, the re-minted token is NARROWER (the intersection recomputed as-of-resume).
     #[test]
     fn re_mint_on_resume_is_fresh_and_recomputes_the_intersection() {
         let s7 = RevocationStore::new();
@@ -1950,7 +1613,6 @@ mod tests {
         let agent_id = PrincipalId("p:agent".into());
         let run = RunId("run-1".into());
 
-        // DISPATCH: the delegator holds both read + write → both flow into the token.
         let dispatch = input(
             &["repo:acme/web#read", "repo:acme/web#write"],
             &["repo:acme/web#read", "repo:acme/web#write"],
@@ -1976,13 +1638,11 @@ mod tests {
             "dispatch token carries #write"
         );
 
-        // RESUME days later: the delegator LOST #write. The re-mint recomputes the intersection
-        // as-of-resume → the fresh token is narrower (no #write).
         let resume = input(
             &["repo:acme/web#read", "repo:acme/web#write"],
             &["repo:acme/web#read", "repo:acme/web#write"],
             &["repo:acme/web#read", "repo:acme/web#write"],
-            &["repo:acme/web#read"], // delegator's held set shrank
+            &["repo:acme/web#read"],
         );
         let t1 = minter
             .re_mint_on_resume(
@@ -2008,13 +1668,10 @@ mod tests {
         );
         assert!(
             !t1.token.contains("#write"),
-            "the re-minted token is NARROWER (the delegator lost #write — recomputed as-of-resume)"
+            "the re-minted token is NARROWER (the delegator lost #write - recomputed as-of-resume)"
         );
     }
 
-    /// **A per-run token auto-expires at run-life (architecture §11 — mandatory-core).** The minted
-    /// token is live within its run-life window and DEAD after `expires_at` — even with NO teardown
-    /// revoke (the revoke-on-crash defence-in-depth).
     #[test]
     fn per_run_token_auto_expires_at_run_life() {
         let s7 = RevocationStore::new();
@@ -2030,16 +1687,14 @@ mod tests {
                 &input(&["g"], &["g"], &["g"], &["g"]),
                 &caveats(&["g"]),
                 MachineKind::Agent,
-                &ttl(300), // run-life = 5 min
+                &ttl(300),
                 &ts("2026-06-19T00:00:00Z"),
             )
             .expect("mint");
-        // WITHIN run-life: live (no teardown issued).
         assert!(
             minter.is_live(&acme, &token, &ts("2026-06-19T00:02:00Z")),
             "the token is live within its run-life window"
         );
-        // AFTER run-life: dead (auto-expired) — even though teardown was never called.
         assert!(
             !minter.is_live(&acme, &token, &ts("2026-06-19T00:06:00Z")),
             "the token auto-expires at run-life even if teardown is skipped (revoke-on-crash)"
@@ -2051,9 +1706,6 @@ mod tests {
         );
     }
 
-    /// **A killed run's token is revoked AND auto-expires (the ID-D6 core — mandatory-core).** On
-    /// teardown the token is denied immediately (token-revocation-lag = 0); and even on the crash
-    /// path (teardown skipped) it auto-expires at run-life. Both legs hold.
     #[test]
     fn killed_run_token_is_revoked_and_auto_expires() {
         let s7 = RevocationStore::new();
@@ -2073,9 +1725,7 @@ mod tests {
                 &ts("2026-06-19T00:00:00Z"),
             )
             .expect("mint");
-        // Live mid-run.
         assert!(minter.is_live(&acme, &token, &ts("2026-06-19T00:01:00Z")));
-        // KILL mid-flight → teardown revoke. The deny is effective immediately.
         minter.teardown(&acme, &token, &ts("2026-06-19T00:01:30Z"));
         assert!(
             !minter.is_live(&acme, &token, &ts("2026-06-19T00:01:31Z")),
@@ -2085,11 +1735,9 @@ mod tests {
             minter.revocation_state(&acme, &token, &ts("2026-06-19T00:01:31Z")),
             RunTokenState::TornDown
         );
-        // And the auto-expire leg: even past run-life it stays dead (defence-in-depth).
         assert!(!minter.is_live(&acme, &token, &ts("2026-06-19T00:06:00Z")));
     }
 
-    /// **A zero-TTL mint is refused (a per-run token must have a finite, positive life).**
     #[test]
     fn zero_ttl_mint_is_refused() {
         let s7 = RevocationStore::new();
@@ -2110,10 +1758,6 @@ mod tests {
         assert_eq!(r, Err(MintError::NonPositiveTtl));
     }
 
-    /// **The mint optionally writes the auto-expiring per-run GRANT tuple (`expires_at == run
-    /// life`, §6/§11) — the tuple-layer revoke-on-crash defence.** With a tuple store wired, the
-    /// minted run writes a narrow `run:<run_id>#run_bound@<agent_id>` edge whose `expires_at` is the
-    /// run-life.
     #[test]
     fn mint_writes_the_auto_expiring_run_grant_tuple() {
         let s7 = RevocationStore::new();
@@ -2134,7 +1778,6 @@ mod tests {
                 &ts("2026-06-19T00:00:00Z"),
             )
             .expect("mint");
-        // The per-run grant tuple is present, auto-expiring (expires_at == run life = +120s).
         let stored = tuples.tuples_in(&acme);
         let grant = stored
             .iter()
@@ -2149,31 +1792,24 @@ mod tests {
         );
     }
 
-    /// **`expires_at_of` adds the TTL to the run's mint instant (the run-life boundary), carrying
-    /// minute/hour/day boundaries (the auto-expire is mandatory-core — it is ALWAYS strictly later).**
     #[test]
     fn expires_at_is_always_strictly_after_now() {
-        // A simple within-minute add.
         assert_eq!(
             expires_at_of(&ts("2026-06-19T00:00:00Z"), &ttl(30)).0,
             "2026-06-19T00:00:30Z"
         );
-        // Carrying across a minute.
         assert_eq!(
             expires_at_of(&ts("2026-06-19T00:00:45Z"), &ttl(30)).0,
             "2026-06-19T00:01:15Z"
         );
-        // Carrying across an hour.
         assert_eq!(
             expires_at_of(&ts("2026-06-19T00:59:45Z"), &ttl(30)).0,
             "2026-06-19T01:00:15Z"
         );
-        // Carrying across a day (and a month boundary).
         assert_eq!(
             expires_at_of(&ts("2026-06-30T23:59:50Z"), &ttl(20)).0,
             "2026-07-01T00:00:10Z"
         );
-        // The auto-expire is NEVER a no-op: the result is always lexically (chronologically) GREATER.
         for (now, secs) in [
             ("2026-06-19T00:00:00Z", 1u64),
             ("2026-12-31T23:59:59Z", 1),
@@ -2263,11 +1899,6 @@ mod tests {
         assert_eq!(result, Err(MintError::ResolvedPolicyBindingMismatch));
     }
 
-    /// **The minted token round-trips through the `authenticate` envelope shape (one token
-    /// convention).** The floor signer emits the SAME signed-fact envelope
-    /// `StructuralTokenVerifier` parses, including purpose, audience, run id, and optional durable
-    /// delegation snapshot. The legacy caller-supplied mint leaves the snapshot empty, so it can
-    /// exercise mint algebra but cannot authenticate as an authoritative edge run credential.
     #[test]
     fn minted_token_uses_the_authenticate_envelope_shape() {
         let s7 = RevocationStore::new();

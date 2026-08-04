@@ -1,19 +1,3 @@
-//! # GT-005 — the `myelin` CLI through the DURABLE GT-003 edge: real end-to-end write proofs.
-//!
-//! Spins up the REAL `myelin-edge` gateway IN-PROCESS over a real TCP socket with Git registered via
-//! `register_git_durable` (the on-disk DURABLE backend), mints a REAL PASETO capability token, then
-//! runs the compiled `myelin` BINARY against the socket. Proves the operator surface:
-//!  - `myelin git repo create <slug>` PERSISTS (a fresh durable read + `repo list` reflect it);
-//!  - `myelin git pr open <repo>` opens a durable PR; `myelin git pr view <repo> <n>` reads it back;
-//!  - `myelin git pr merge <repo> <n>` against an UNMET branch-protection gate is a CLEAN CLI error
-//!    carrying the gate reason (exit 1) — the CLI REFLECTS the server gate, never bypasses it;
-//!  - `myelin git search code <query> [--repo <slug>]` preserves form-sensitive query bytes and
-//!    honestly reports that the durable index is unavailable;
-//!  - `--json` emits machine-readable output.
-//!
-//! The forged/missing-token clean auth errors (exit 3) are proven in `cli_edge_integration.rs` (the
-//! same auth path); this file focuses on the durable write/read round-trips + the gate reflection.
-
 use myelin_edge::{
     register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
@@ -62,7 +46,6 @@ fn admin_scope(tenant: &str) -> TenantScope {
     )
 }
 
-/// The exact active service identity seeded for `subj-1`; it carries no synthetic admin identity.
 fn authenticated_agent(tenant: &str) -> Principal {
     Principal::new(
         TenantId(tenant.into()),
@@ -91,8 +74,6 @@ fn seed_tenant(store: &PrincipalStore, tenant: &str) {
         .expect("link credential");
 }
 
-/// Build the real gateway over a known cell seed with Git registered over the DURABLE backend. Returns
-/// the gateway, the cell authority (to mint tokens), and the shared backend (to set repo-owned policy).
 fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBackend>) {
     let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell authority");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
@@ -160,9 +141,6 @@ fn run_cli(edge: &str, token: &str, args: &[&str]) -> (i32, String, String) {
     )
 }
 
-/// The shell and durable Edge share one strict code-search boundary. Form-sensitive bytes must stay
-/// inside `q` (not become extra parameters), and a valid repository filter is syntax-only: even an
-/// absent repository reaches the same honest unavailable response without a storage probe.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn code_search_preserves_query_bytes_and_reports_unavailable() {
     let root = temp_root("search");
@@ -204,8 +182,6 @@ async fn code_search_preserves_query_bytes_and_reports_unavailable() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// **THE DURABLE WRITE/READ ROUND-TRIP.** `repo create` persists (read back via `repo list`); `pr open`
-/// + `pr view` round-trip a durable PR; `--json` works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn durable_create_open_view_round_trip() {
     let root = temp_root("rt");
@@ -214,7 +190,6 @@ async fn durable_create_open_view_round_trip() {
     let edge = format!("http://{addr}");
     let token = mint(&cell, "acme", "jti-rt");
 
-    // repo create → exit 0, durable.
     let (code, out, err) = run_cli(
         &edge,
         &token,
@@ -233,7 +208,6 @@ async fn durable_create_open_view_round_trip() {
         "create echoed; got {out}"
     );
 
-    // repo list reflects the new durable repo.
     let (lc, lout, _) = run_cli(&edge, &token, &["--json", "git", "repo", "list"]);
     assert_eq!(lc, 0);
     let v: serde_json::Value = serde_json::from_str(&lout).expect("--json valid");
@@ -266,7 +240,6 @@ async fn durable_create_open_view_round_trip() {
         "--json intentionally emits the lightweight empty summary row, not RepoHome"
     );
 
-    // pr open → a durable PR #1.
     let (oc, _oout, oerr) = run_cli(
         &edge,
         &token,
@@ -285,7 +258,6 @@ async fn durable_create_open_view_round_trip() {
     );
     assert_eq!(oc, 0, "pr open succeeds; stderr={oerr}");
 
-    // pr view reads it back (durable).
     let (vc, vout, verr) = run_cli(
         &edge,
         &token,
@@ -299,8 +271,6 @@ async fn durable_create_open_view_round_trip() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// **THE GATE REFLECTS, NEVER BYPASSES.** A merge against an UNMET repo-owned branch-protection gate is
-/// a CLEAN CLI error carrying the gate reason (exit 1) — not a panic, not a faked success.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn merge_blocked_by_gate_is_a_clean_cli_error() {
     let root = temp_root("gate");
@@ -309,8 +279,6 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
     let edge = format!("http://{addr}");
     let token = mint(&cell, "acme", "jti-gate");
 
-    // Create the repo via the CLI, then set repo-owned branch protection requiring a never-green CI
-    // context (the merge gate must block). Policy is repo-owned — never author input (the GT-003 fix).
     assert_eq!(
         run_cli(
             &edge,
@@ -361,7 +329,6 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
         0
     );
 
-    // pr merge → the server gate BLOCKS → a clean CLI error (exit 1) naming the reason; never a panic.
     let (code, stdout, stderr) = run_cli(
         &edge,
         &token,
@@ -386,7 +353,6 @@ async fn merge_blocked_by_gate_is_a_clean_cli_error() {
     assert!(!stderr.contains("panicked"), "never a panic");
     assert!(stdout.is_empty(), "no view-model on a blocked merge");
 
-    // The gate was NOT bypassed: the PR is still open on disk.
     let rec = be
         .get_pr("acme", REGION, "alpha", 1, &authenticated_agent("acme"))
         .unwrap()

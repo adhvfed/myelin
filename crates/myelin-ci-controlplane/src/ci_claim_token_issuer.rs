@@ -1,11 +1,3 @@
-//! Claim-time verification for CI job credentials.
-//!
-//! A queued launch template carries only a public, content-bound authority handle. The executable
-//! bearer is minted later, under one exact scheduler claim. This module makes that mint conditional
-//! on durable truth: it locks the scheduler claim and run-of-record, reloads the immutable manifest
-//! in the same tenant-scoped transaction, reconstructs the complete authority request, verifies the
-//! handle, and only then invokes the raw Identity credential minter while both locks remain held.
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -27,11 +19,6 @@ use crate::job_queue_store::{CiJobQueueStore, LockedJobClaim};
 use crate::job_spec_store::{CiJobSpecStore, DurableCiJobLaunchTemplate};
 use crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS;
 
-/// The narrow Identity-facing mint seam. Implementations receive only server-reconstructed durable
-/// authority plus the exact live claim. They must be exact-retry stable while the deterministic
-/// token generation is live, refuse that same claim after the generation expires, use the claim's
-/// absolute expiry as a ceiling, and report a lifetime no greater than either the complete claim
-/// lifetime or [`MAX_CI_JOB_TOKEN_TTL_SECS`].
 pub trait CiJobCredentialMinter: Send + Sync {
     fn mint_verified<'a>(
         &'a self,
@@ -40,9 +27,6 @@ pub trait CiJobCredentialMinter: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<RunTokenCredential, CiJobTokenIssueError>> + Send + 'a>>;
 }
 
-/// Production claim-time issuer. Its raw minter is unreachable until the durable scheduler claim,
-/// run, and manifest have been locked, cross-checked, and reduced to the exact authority digest
-/// stored on the job.
 #[derive(Clone)]
 pub struct LockedManifestCiJobTokenIssuer {
     pool: PgPool,
@@ -90,8 +74,6 @@ impl CiJobTokenIssuer for LockedManifestCiJobTokenIssuer {
 
             with_tenant_tx_error(&self.pool, &tenant, &region, move |connection| {
                 Box::pin(async move {
-                    // Global lock order for this boundary: scheduler row, then run-of-record. The
-                    // reporter/reaper own only the first and finalization owns only the second.
                     let locked_claim = CiJobQueueStore::lock_for_token_mint_on_conn(
                         connection,
                         &request.tenant_id,
@@ -122,10 +104,6 @@ impl CiJobTokenIssuer for LockedManifestCiJobTokenIssuer {
                         .await
                         .map_err(|_| refused("immutable CI manifest authority is unavailable"))?
                         .ok_or_else(|| refused("immutable CI manifest authority is absent"))?;
-                    // CT-007 slice 5b.3-2b: load the durable `ci_job_spec` row in this SAME locked
-                    // tx and cross-check its `workspace` against what the manifest granted this job
-                    // — closing the gap where nothing previously verified that the `JobSpec` a
-                    // launch will actually execute agrees with what was authorized.
                     let launch_template = job_spec_store
                         .get_launch_template_on_conn(
                             connection,
@@ -145,10 +123,6 @@ impl CiJobTokenIssuer for LockedManifestCiJobTokenIssuer {
                             "scheduler claim authority differs from the immutable manifest",
                         ));
                     }
-                    // CT-007 lease/topology reconciliation, defense in depth: the durable spec
-                    // resolver already refused a checkout-bearing legacy row before this mint was
-                    // requested, but the credential boundary re-derives the window from the durable
-                    // spec under the SAME row lock rather than trusting that earlier check.
                     verify_claim_window(&request, &locked_claim, &launch_template)?;
                     let credential = credential_minter
                         .mint_verified(request.clone(), authority)
@@ -182,20 +156,6 @@ pub(crate) fn verify_locked_claim(
     Ok(())
 }
 
-/// **CT-007 lease/topology reconciliation: the claim window's anti-forgery cross-check.** The
-/// immutable `claim_expires_at - claim_started_at` difference is what every downstream authority
-/// binds; this proves that difference really was sized from the durable window, and that the durable
-/// window really is what the dispatched spec's own topology derives. The two directions matter
-/// separately: the first catches a queue row whose timestamps were written under a different window
-/// than the one it now carries; the second catches a queue row whose window disagrees with the spec
-/// that will actually execute.
-///
-/// `claim_window_secs = NULL` is the legacy generation, claimed under the flat execution-lease
-/// fallback:
-/// - non-checkout → accepted only if the difference is exactly
-///   [`CI_RUNNER_EXECUTION_LEASE_TTL_SECS`], i.e. the row really was claimed under that fallback;
-/// - checkout-bearing → REFUSED outright. A four-execution topology under a one-execution ceiling
-///   would have its claim expire mid-preparation, and no credential may be minted for it.
 pub(crate) fn verify_claim_window(
     request: &CiJobTokenRequest,
     locked: &LockedJobClaim,
@@ -262,12 +222,6 @@ pub(crate) fn authority_from_durable_claim(
     if job.token_authority_handle != claim.token_authority_handle {
         return Err(refused("claimed token authority differs from the manifest"));
     }
-    // CT-007 slice 5b.3-2b, Sol's review: the durable `ci_job_spec` row carries its OWN
-    // authority-identity fields (`ci_run_id`, `token_authority_handle`) alongside the dispatched
-    // `spec` -- verify BOTH against the same run/manifest/claim identity this function already
-    // locked, not just the spec's workspace. A row whose wrapper identity diverged from its own
-    // spec (or from the run/claim/manifest already verified above) is refused before it can ever
-    // reach the credential minter.
     if launch_template.ci_run_id != run.run_id
         || launch_template.token_authority_handle != job.token_authority_handle
         || launch_template.spec.idem_token.0 != claim.idem_token
@@ -280,9 +234,6 @@ pub(crate) fn authority_from_durable_claim(
         ));
     }
     verify_dispatched_spec_matches_granted_workspace(&launch_template.spec, &job.workspace)?;
-    // Persisted legacy handles are verified in their exact historical shape, then the fully
-    // reconstructed current authority is returned so credentials minted during convergence still
-    // sign the locked manifest/spec checkout commit and reservation.
     let mut handle_authority = authority.clone();
     if claim.token_authority_handle.starts_with("ci-token-authority:v1:")
         || claim.token_authority_handle.starts_with("ci-token-authority:v2:")
@@ -306,16 +257,6 @@ pub(crate) fn authority_from_durable_claim(
     Ok(authority)
 }
 
-/// Reconstruct every immutable runtime-authority request in the exact canonical manifest order.
-///
-/// Both claim-time credential minting and the prelaunch-usage journal's v2 reservation verifier use
-/// this one function. The latter must recompute the COMPLETE reservation batch because the durable
-/// v2 batch digest binds every job, not only the currently claimed one.
-// CT-007 5b.3-6e.2 Stage A (Sol ruling): `pub` so the §4 invariant test
-// (`every_ci_manifest_authority_is_checkout_bearing`) can assert, cross-crate, that EVERY manifest
-// job reconstructs a `(Some, Some)` checkout authority — the durable guarantee that the compute arm is
-// dead-in-CI today. Pure reconstruction from immutable durable rows; widening it to `pub` exposes no
-// mutation surface.
 pub fn runtime_authorities_from_durable_claim(
     claim: &CiJobTokenRequest,
     run: &CiRunRecord,
@@ -380,12 +321,6 @@ pub fn runtime_authorities_from_durable_claim(
     Ok(authorities)
 }
 
-/// CT-007 slice 5b.3-2b: derive the checkout scope the manifest GRANTED this job, via the sandbox's
-/// own [`derive_checkout_authorization_scope`] facade only (never hand-parsed here) — the exact
-/// same derivation `checkout_scope_for_run` used at materialize time, so a claim-time digest
-/// recomputation can only ever agree or disagree with the materialize-time one for a genuine reason
-/// (a real divergence in the underlying repo_ref/commit_oid), never because the two sites parse
-/// differently.
 fn checkout_scope_for_manifest_job(
     granted_workspace: &CiManifestWorkspaceV1,
 ) -> Result<Option<myelin_ci_sandbox::CheckoutAuthorizationScope>, CiJobTokenIssueError> {
@@ -397,17 +332,6 @@ fn checkout_scope_for_manifest_job(
         .map_err(|_| refused("manifest-granted checkout target is invalid"))
 }
 
-/// CT-007 slice 5b.3-2b: refuse a checkout scope whose repo-ref ArtifactRef encodes a DIFFERENT
-/// tenant than the durable `ci_run`'s own tenant. This is DEFENSE IN DEPTH, not an independently
-/// reachable authorization gap (Sol's correction of an earlier, inaccurate doc claim here):
-/// `CiDriveManifestV1::validate`'s `validate_canonical_ref("repo_ref", ..., &self.tenant_id, "git",
-/// "repo")` already requires `manifest.repo_ref`'s OWN embedded tenant to equal `manifest.tenant_id`,
-/// and `authority_from_durable_claim` separately requires `manifest.tenant_id == run.tenant_id` — so
-/// for any manifest that already passes `validate()`, this branch can never actually fire; a
-/// cross-tenant repo_ref is refused earlier, by `validate()` itself. Kept anyway as an explicit,
-/// directly-testable second check on the exact property this slice cares about (never trusting the
-/// checkout scope's tenant without comparison), so a future change that weakens or removes the
-/// `validate()` guarantee does not silently reopen this gap unnoticed.
 fn verify_checkout_scope_tenant(
     checkout: &Option<myelin_ci_sandbox::CheckoutAuthorizationScope>,
     run_tenant_id: &str,
@@ -422,11 +346,6 @@ fn verify_checkout_scope_tenant(
     Ok(())
 }
 
-/// CT-007 slice 5b.3-2b: verify the durable `ci_job_spec` row's `workspace` — what a launch will
-/// ACTUALLY execute — is byte-identical to what the manifest GRANTED this job. Before this slice,
-/// nothing checked this; `ci_manifest_job_runner.rs` copies the manifest's `workspace` verbatim when
-/// it persists the dispatch, so this should always hold in the happy path, but a claim-time check
-/// closes the gap for any future write path (bug or otherwise) that could let the two diverge.
 fn verify_dispatched_spec_matches_granted_workspace(
     dispatched_spec: &myelin_ci_sandbox::JobSpecTemplate,
     granted_workspace: &CiManifestWorkspaceV1,
@@ -491,7 +410,6 @@ mod tests {
     const PIPELINE_ID: &str = "44444444-4444-4444-4444-444444444444";
     const JOB_ID: &str = "55555555-5555-5555-5555-555555555555";
 
-    /// The fixed checkout target `run()`/`manifest_and_claim()` always grant.
     fn default_granted_workspace() -> CiManifestWorkspaceV1 {
         let run = run();
         CiManifestWorkspaceV1 {
@@ -502,10 +420,6 @@ mod tests {
         }
     }
 
-    /// The durable `ci_job_spec` row's complete wrapper — spec plus the two authority-identity
-    /// fields (`ci_run_id`, `token_authority_handle`) `authority_from_durable_claim` now ALSO
-    /// verifies (Sol's review) — for a `claim` whose `token_authority_handle`/`ci_run_id` this
-    /// template must agree with to pass.
     fn launch_template_for(
         claim: &CiJobTokenRequest,
         granted_workspace: &CiManifestWorkspaceV1,
@@ -522,9 +436,6 @@ mod tests {
         launch_template_for(claim, &default_granted_workspace())
     }
 
-    /// A minimal, valid [`myelin_ci_sandbox::JobSpecTemplate`] whose `workspace` matches
-    /// `granted_workspace` exactly — the durable `ci_job_spec` row's dispatched spec, standing in
-    /// for what `ci_manifest_job_runner.rs` actually persists at dispatch time.
     fn dispatched_spec_for(
         granted_workspace: &CiManifestWorkspaceV1,
     ) -> myelin_ci_sandbox::JobSpecTemplate {
@@ -871,11 +782,6 @@ mod tests {
         .is_err());
     }
 
-    // ---------------------------------------------------------------------------------------
-    // CT-007 lease/topology reconciliation: the claim-window cross-check at the mint boundary.
-    // ---------------------------------------------------------------------------------------
-
-    /// A claim/locked pair whose generation really was sized from `window`.
     fn claim_of_window(window: i64) -> (CiJobTokenRequest, LockedJobClaim) {
         let (_, mut claim) = manifest_and_claim();
         claim.claim_expires_at_epoch_secs = claim.claim_started_at_epoch_secs + window;
@@ -884,8 +790,6 @@ mod tests {
         (claim, locked)
     }
 
-    /// The checkout-bearing template every fixture here dispatches: timeout 600s, four execution
-    /// slots → 4,800s.
     const FIXTURE_CHECKOUT_WINDOW_SECS: i64 = 4 * (600 + 600);
 
     fn compute_launch_template(claim: &CiJobTokenRequest) -> DurableCiJobLaunchTemplate {
@@ -900,12 +804,10 @@ mod tests {
         let template = default_launch_template(&claim);
         verify_claim_window(&claim, &locked, &template).unwrap();
 
-        // The generation's timestamps say something different from the stored window.
         let (_, mut divergent_generation) = claim_of_window(FIXTURE_CHECKOUT_WINDOW_SECS);
         divergent_generation.claim_window_secs = Some(FIXTURE_CHECKOUT_WINDOW_SECS - 1);
         assert!(verify_claim_window(&claim, &divergent_generation, &template).is_err());
 
-        // The stored window says something different from what the dispatched spec derives.
         let (short_claim, short_locked) = claim_of_window(30);
         assert!(verify_claim_window(
             &short_claim,
@@ -921,8 +823,6 @@ mod tests {
         locked.claim_window_secs = None;
         verify_claim_window(&claim, &locked, &compute_launch_template(&claim)).unwrap();
 
-        // A null-window row whose generation was NOT sized from the flat TTL is not the legacy
-        // shape this fallback exists for.
         let (short_claim, mut short_locked) = claim_of_window(30);
         short_locked.claim_window_secs = None;
         assert!(verify_claim_window(
@@ -997,10 +897,6 @@ mod tests {
         }
     }
 
-    // ---------------------------------------------------------------------------------------
-    // CT-007 slice 5b.3-2b: the checkout-authority blocker-test list Sol required before landing.
-    // ---------------------------------------------------------------------------------------
-
     #[test]
     fn refuses_a_dispatched_spec_whose_repo_was_substituted() {
         let (manifest, claim) = manifest_and_claim();
@@ -1021,11 +917,6 @@ mod tests {
 
     #[test]
     fn verify_checkout_scope_tenant_is_a_pure_defense_in_depth_check() {
-        // A pure-function unit test of `verify_checkout_scope_tenant`'s own contract, called
-        // directly (bypassing the full manifest/claim chain entirely). Per Sol's correction: this
-        // branch is NOT independently reachable through `authority_from_durable_claim` for any
-        // manifest that already passes `CiDriveManifestV1::validate` (see that function's doc) --
-        // this test exists to pin the helper's own behavior, not to prove a reachable gap.
         let scope = myelin_ci_sandbox::derive_checkout_authorization_scope(
             JobKind::Ci,
             &myelin_ci_sandbox::WorkspaceSpec {
@@ -1041,11 +932,6 @@ mod tests {
 
     #[test]
     fn full_chain_refuses_a_cross_tenant_repo_ref_via_manifest_validate() {
-        // The full-chain proof Sol asked for: a manifest whose `repo_ref` (and, to keep `job.workspace`
-        // consistent with it, the job's own workspace) names a DIFFERENT tenant than `manifest.tenant_id`
-        // is refused by `authority_from_durable_claim` -- not via `verify_checkout_scope_tenant` (which
-        // never gets a chance to run), but because `CiDriveManifestV1::validate`'s
-        // `validate_canonical_ref("repo_ref", ..., &self.tenant_id, "git", "repo")` refuses it first.
         let (mut manifest, claim) = manifest_and_claim();
         manifest.repo_ref = "myelin://globex/git/repo/core".into();
         manifest.jobs[0].workspace.repo_ref = manifest.repo_ref.clone();
@@ -1121,8 +1007,6 @@ mod tests {
         assert_ne!(v3, v4);
     }
 
-    /// A fully literal, fixed authority request — never built from `run()`/`manifest_and_claim()`,
-    /// so nothing here can silently drift if those shared fixtures change.
     fn golden_compute_authority() -> CiJobRuntimeAuthorityRequest {
         CiJobRuntimeAuthorityRequest {
             tenant_id: "golden-tenant".into(),
@@ -1185,13 +1069,6 @@ mod tests {
         }
     }
 
-    /// External golden pin (Sol's review): a self-referential test that computes the expected value
-    /// via the same function it's testing stays green even if the encoding silently drifts. This
-    /// test instead hard-codes the digest's OUTPUT for a fixed, fully literal request as a plain
-    /// string literal, captured once and frozen here — any future change to what
-    /// `token_authority_digest`/`token_authority_digest_v2` hash (field order, domain, framing) will
-    /// change the computed value and fail this assertion, regardless of what the implementation
-    /// itself currently believes is correct.
     #[test]
     fn golden_v1_digest_for_a_fixed_compute_request_is_pinned() {
         let digest =

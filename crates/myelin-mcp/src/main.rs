@@ -1,7 +1,3 @@
-//! Production composition root for the governed MCP stdio server and its operator-only HITL tools.
-//! Every serving path is durable-by-default and fail-loud: real PASETO authentication, PostgreSQL
-//! identity/revocation/delegation/HITL stores, live Git ReBAC, and the durable outbox.
-
 use std::fs::OpenOptions;
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -149,9 +145,6 @@ enum Command {
     Bootstrap(BootstrapArgs),
 }
 
-/// Pure/configuration preflight that must finish before database connection, migrations, or key
-/// loading. Authentication itself remains after key load, but malformed scope config and unsafe
-/// credential files cannot trigger stateful composition work.
 fn preflight_command(command: &Command) -> Result<(), String> {
     let tenant = required_env(MCP_TENANT_ENV)?;
     let region = required_env(MCP_REGION_ENV)?;
@@ -353,7 +346,6 @@ fn read_secret_file(path: &Path) -> Result<String, String> {
     if metadata.permissions().mode() & 0o777 != 0o600 {
         return Err("credential file permissions must be exactly 0600".into());
     }
-    // SAFETY: `geteuid` has no pointer arguments or memory-safety preconditions.
     let effective_uid = unsafe { libc::geteuid() };
     if metadata.uid() != effective_uid {
         return Err("credential file must be owned by the effective process user".into());
@@ -762,10 +754,6 @@ async fn decide(core: Core, gate_id: &str, approve: bool) -> Result<(), String> 
         );
     }
     let run_id = RunId(gate.run_id.clone());
-    // The durable intent precedes the decision, while the terminal audit follows it. These are not
-    // one PostgreSQL transaction today: a missing pre-intent prevents the decision; a missing
-    // terminal fact returns an explicit indeterminate error after the decision instead of claiming
-    // success. The router still requires and one-shot consumes the exact durable approval.
     audit
         .record(GovernanceAuditRecord {
             scope: &identity.scope,
@@ -990,8 +978,6 @@ async fn run_stdio_signal_aware(server: McpServer) -> Result<(), String> {
     result
 }
 
-/// Wait for terminal or process-manager shutdown. Either signal exits through `server.teardown()`
-/// above so session-scoped run-token authority is revoked before the stdio process returns.
 async fn shutdown_signal() -> Result<(), String> {
     #[cfg(unix)]
     {

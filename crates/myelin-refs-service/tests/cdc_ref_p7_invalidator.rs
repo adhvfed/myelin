@@ -1,22 +1,3 @@
-//! **REF-P7 / P-156 — the refs-projection-invalidator consumer + no-op cache shim CDC + idempotency
-//! tests.**
-//!
-//! These run on the default `cargo test --workspace` (DB-free): they exercise the invalidator through
-//! the REAL [`myelin_events::Consumer`] runtime + the REAL [`myelin_events::DedupLedger`] (contracts
-//! 2.4/2.5) — the no-op [`NoOpCacheShim`] records the bust calls (the cache behind the §3.6
-//! invalidation interface is a shim until REF-P12 ships the live R2 cache).
-//!
-//! What is proven here (the prompt's required TESTS):
-//! - **CDC (consumer side of the invalidation contract):** the invalidator binds through the ONE
-//!   sanctioned entry-point with a `*`-free whitelist (BUS-3/BUS-4), consumes `*.updated`/`*.erased`,
-//!   and drives EXACTLY ONE `invalidate(tenant, ref)` per artifact.
-//! - **Idempotent on `event_id`:** a redelivery (same `event_id`) is dropped by the `consumer_dedup`
-//!   ledger BEFORE `handle` runs — so the bust is NOT issued twice (0 double-bust).
-//! - **A non-invalidating event (`*.created`) is acked with no bust** (the invalidator only busts on
-//!   update/erase; creation is the builder's job, REF-P6).
-//! - **A malformed invalidating event (no ArtifactRef) dead-letters** through the runtime
-//!   (fail-closed; a stale ref must never silently render).
-
 use myelin_events::{
     consume, Actor, AggregateKey, ArtifactRef, ConsumerName, ConsumerSpec, CorrelationId, DataRole,
     DedupLedger, Delivered, EventEnvelope, EventId, EventType, Message, Reason, Timestamp,
@@ -69,9 +50,6 @@ fn msg(subject: &str, ev: &EventEnvelope) -> Message {
     }
 }
 
-/// **The refs-projection-invalidator is a valid consumer: it binds through the ONE sanctioned
-/// entry-point with a `*`-free whitelist (BUS-3/BUS-4).** `consume(...)` admits the lifecycle subject
-/// prefixes (never `*`).
 #[test]
 fn invalidator_binds_through_the_sanctioned_entrypoint_no_wildcard() {
     let shim = NoOpCacheShim::new();
@@ -87,9 +65,6 @@ fn invalidator_binds_through_the_sanctioned_entrypoint_no_wildcard() {
     );
 }
 
-/// **CDC (consumer side) + idempotency through the runtime.** Delivering a `knowledge.page.updated`
-/// busts the cache exactly once; a REDELIVERY (same `event_id`) is deduped by the ledger (the handler
-/// does not re-run), so the bust is NOT issued twice (0 double-bust).
 #[test]
 fn updated_busts_once_and_redelivery_is_deduped() {
     let shim = NoOpCacheShim::new();
@@ -126,7 +101,6 @@ fn updated_busts_once_and_redelivery_is_deduped() {
     );
 }
 
-/// **An `*.erased` busts the cache through the runtime (the §3.6 erasure invalidation).**
 #[test]
 fn erased_busts_through_the_runtime() {
     let shim = NoOpCacheShim::new();
@@ -149,8 +123,6 @@ fn erased_busts_through_the_runtime() {
     );
 }
 
-/// **A `*.created` is acked with NO bust (the invalidator only busts on update/erase).** Creation
-/// builds an edge (REF-P6's builder); nothing was cached for a new artifact, so there is no bust.
 #[test]
 fn created_is_acked_with_no_bust() {
     let shim = NoOpCacheShim::new();
@@ -173,8 +145,6 @@ fn created_is_acked_with_no_bust() {
     assert_eq!(shim.call_count(), 0, "no bust on create");
 }
 
-/// **A malformed invalidating event (no ArtifactRef) dead-letters through the runtime (fail-closed).**
-/// A stale ref must never silently render — the malformed bust signal surfaces.
 #[test]
 fn malformed_updated_dead_letters() {
     let shim = NoOpCacheShim::new();
@@ -187,7 +157,7 @@ fn malformed_updated_dead_letters() {
 
     let mut bad = lifecycle_event("01J-bad", "knowledge.page.updated", "");
     bad.subject = ArtifactRef(String::new());
-    bad.payload = serde_json::json!({ "title": "x" }); // no ref/subject.
+    bad.payload = serde_json::json!({ "title": "x" });
     match consumer.deliver(&msg("knowledge.page.updated", &bad)) {
         Delivered::DeadLettered(Reason(r)) => {
             assert!(

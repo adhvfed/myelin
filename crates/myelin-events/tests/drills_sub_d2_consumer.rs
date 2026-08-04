@@ -1,21 +1,3 @@
-//! # SUB-D2 drill + the SUB-D1-through-a-consumer re-confirm (P-S08 → P-009)
-//!
-//! The consumer half of the **silent-data-loss floor**. These are the failure-injection-harness
-//! drills the P-S08 TESTS field requires — they CHAIN the whole emit path end-to-end (EI-01 §4:
-//! real sessions chain; that is where bugs live):
-//!
-//!   emit (P-S06) → outbox co-commit (P-S07) → relay publish (P-S07) → broker → **consumer
-//!   runtime + dedup ledger (P-S08)**.
-//!
-//! and inject the **P-S03 scoped-reversible dependency-break injector** (`Dependency::Broker`) to
-//! DROP the broker mid-stream, then reconnect (re-bind by name) and re-consume — asserting **0
-//! lost + 0 dup** over the sequence and that the **P-S04** `consumer_lag` signal recovers, with
-//! no head-of-line stall.
-//!
-//! Thresholds are **0 lost / 0 dup** and **lag → 0**. A red drill is information: it is NOT
-//! weakened — it becomes a dated "claimed, not proven" thresholds-file row (P-S22). **This is a
-//! PERMANENT gate (re-run on every emit-path change).**
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, BusTransport, CausedBy, Consumer, ConsumerName, DataRole,
     DedupLedger, Delivered, EmitContextBase, EventDraft, EventEnvelope, EventHandler, EventType,
@@ -63,7 +45,6 @@ fn draft(i: usize, aggregate: &str) -> EventDraft {
     }
 }
 
-/// Commit `n` events for one aggregate (the "state-commit" half), returning their ids.
 fn commit_n(
     store: &OutboxStore,
     minter: Arc<dyn IdMinter>,
@@ -80,8 +61,6 @@ fn commit_n(
     ids
 }
 
-/// A handler that records the DISTINCT event_ids it processed and counts total runs (so a
-/// duplicate process — a bug — is observable as `runs > distinct`).
 #[derive(Default)]
 struct RecordingHandler {
     runs: AtomicU32,
@@ -108,8 +87,6 @@ fn sub() -> Subscription {
     .unwrap()
 }
 
-/// Pull every envelope the broker has delivered (the consumer's read of the durable stream) and
-/// hand each to the runtime — modeling the broker pushing the bound consumer its messages.
 fn pump(consumer: &Consumer<RecordingHandler>, bus: &InProcessBus) -> Vec<Delivered> {
     bus.consume(SUBJECT_PREFIX)
         .into_iter()
@@ -120,12 +97,6 @@ fn pump(consumer: &Consumer<RecordingHandler>, bus: &InProcessBus) -> Vec<Delive
         .collect()
 }
 
-/// **SUB-D2 — drop broker mid-stream → 0 lost across reconnect (bind-by-name + dedup); a slow
-/// subject does not head-of-line-block others.** And **SUB-D1 re-confirmed through a consumer:**
-/// the dedup ledger absorbs the relay's at-least-once redelivery → 0 dup.
-///
-/// Chains emit → relay → broker → consumer, drops the broker mid-stream via the P-S03 injector,
-/// reconnects, and asserts 0 lost + 0 dup + `consumer_lag → 0`.
 #[test]
 fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
     let tenant = TenantId("acme".into());
@@ -134,25 +105,21 @@ fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
 
     let store = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-    // STATE-COMMIT: 6 events committed durably (the producer side).
     let ids = commit_n(&store, minter, 6, "issue:PROJ-1");
     let committed: std::collections::HashSet<_> = ids.iter().cloned().collect();
 
     let bus = InProcessBus::new();
     let relay = Relay::new(store.clone(), bus.clone(), clock);
 
-    // The durable dedup ledger — survives the reconnect (rule 4: bind-by-name re-uses it).
     let ledger = DedupLedger::new();
 
-    // === Connection 1: relay publishes, consumer processes SOME, then the broker DROPS. ===
-    relay.drain_to_empty(); // every committed event is now on the broker.
+    relay.drain_to_empty();
     assert_eq!(
         bus.delivered_count(),
         6,
         "relay published all 6 (at-least-once available)"
     );
 
-    // The first consumer processes the first 3 of the 6 delivered, then the broker drops.
     let processed_before;
     {
         let c1 = Consumer::new(RecordingHandler::default(), sub(), ledger.clone());
@@ -167,27 +134,20 @@ fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
             "consumer 1 durably handled 3 before the drop"
         );
 
-        // (1) INJECT: drop the broker mid-stream (the SUB-D2 fault). The remaining 3 were never
-        //     delivered to a consumer.
         breaker.break_dependency(Dependency::Broker, scope.clone());
         if breaker.is_broken(&Dependency::Broker, &scope) {
             bus.sever();
         }
-        // c1 is dropped here — the connection is gone.
     }
 
-    // === Reconnect (Connection 2): SAME consumer name + SAME ledger (rule 4). ===
     breaker.restore_dependency(Dependency::Broker, scope.clone());
     if !breaker.is_broken(&Dependency::Broker, &scope) {
         bus.heal();
     }
 
     let c2 = Consumer::new(RecordingHandler::default(), sub(), ledger.clone());
-    // The broker REDELIVERS the whole stream (at-least-once) — all 6, incl. the 3 already handled.
     let outcomes = pump(&c2, &bus);
 
-    // 0 DUP: the 3 already-handled events are DEDUPLICATED (the ledger absorbed the redelivery);
-    // the 3 not-yet-handled are ACKED (0 lost).
     let deduped = outcomes
         .iter()
         .filter(|o| **o == Delivered::Deduplicated)
@@ -202,15 +162,12 @@ fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
         "the 3 surviving events were handled after reconnect (0 lost)"
     );
 
-    // The handler on c2 ran EXACTLY 3 times (only the not-yet-handled events) — no double-process.
     assert_eq!(
         c2.handler().runs.load(Ordering::SeqCst),
         3,
         "no event processed twice (0 dup)"
     );
 
-    // 0 LOST: across the WHOLE sequence, every committed event was handled exactly once. The
-    // ledger now holds exactly the committed set.
     assert_eq!(
         ledger.len(),
         6,
@@ -226,7 +183,6 @@ fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
         "the handled set == the committed set (0 lost, 0 dup)"
     );
 
-    // consumer_lag recovers to 0 (the P-S04 survival signal; no HoL stall — all subjects drained).
     let mut signals = SignalSource::new();
     signals.set_scalar(SignalName::ConsumerLag, c2.lag() as i64);
     signals
@@ -239,13 +195,8 @@ fn drill_sub_d2_drop_broker_mid_stream_zero_lost_zero_dup() {
     );
 }
 
-/// **A slow subject does NOT head-of-line-block a fast one (the SUB-D2 no-HoL leg).** One
-/// consumer subscribed to TWO subjects; the slow subject's messages RETRY (stay pending, lag
-/// rises on that subject) while the fast subject's messages ACK and clear — the fast subject is
-/// not stalled behind the slow one.
 #[test]
 fn drill_sub_d2_slow_subject_does_not_block_fast_subject() {
-    // The handler RETRIES anything on the "slow" subject, and is Done on the "fast" one.
     struct LaneHandler;
     impl EventHandler for LaneHandler {
         fn subjects(&self) -> &'static [SubjectPattern] {
@@ -276,7 +227,6 @@ fn drill_sub_d2_slow_subject_does_not_block_fast_subject() {
         envelope: envelope("01J-fast", "myelin://acme/fast/y"),
     };
 
-    // The slow subject retries (stays pending, lag on it rises); the fast subject ACKs regardless.
     assert_eq!(c.deliver(&slow), Delivered::Retried(30));
     assert_eq!(
         c.deliver(&fast),
@@ -294,8 +244,6 @@ fn drill_sub_d2_slow_subject_does_not_block_fast_subject() {
         "the fast subject drained (no HoL stall)"
     );
 
-    // The P-S04 signal reads the slow subject's lag is non-zero while the fast lane is clear — a
-    // drill asserts the fast lane held (its lag == 0).
     let mut signals = SignalSource::new();
     signals.set_labelled(
         SignalName::ConsumerLag,
@@ -343,10 +291,6 @@ fn envelope(id: &str, subject: &str) -> EventEnvelope {
     }
 }
 
-/// The CDC pair for 2.4/2.5: the consumer (the runtime) reads the SAME wire envelope the relay
-/// (the provider) published, dedups on the `(consumer, event_id)` PK, and the handler sees the
-/// frozen envelope shape. Provider = relay/broker; consumer = [`Consumer`]. This is the consumer
-/// half the P-S05/P-S06 provider CDC named as landing in P-S08.
 #[test]
 fn cdc_2_4_2_5_consumer_reads_relayed_envelope_and_dedups() {
     let store = OutboxStore::new();
@@ -359,8 +303,6 @@ fn cdc_2_4_2_5_consumer_reads_relayed_envelope_and_dedups() {
     let ledger = DedupLedger::new();
     let c = Consumer::new(RecordingHandler::default(), sub(), ledger.clone());
 
-    // The consumer reads exactly the relayed envelopes (provider→consumer 2.4 pair) and processes
-    // each once.
     let first = pump(&c, &bus);
     assert!(
         first.iter().all(|o| *o == Delivered::Acked),
@@ -372,7 +314,6 @@ fn cdc_2_4_2_5_consumer_reads_relayed_envelope_and_dedups() {
         "the consumer saw the provider's wire event_ids in (aggregate, seq) order"
     );
 
-    // 2.5: a redelivery of the same stream is fully deduped (the `(consumer, event_id)` PK).
     let again = pump(&c, &bus);
     assert!(
         again.iter().all(|o| *o == Delivered::Deduplicated),
@@ -385,8 +326,6 @@ fn cdc_2_4_2_5_consumer_reads_relayed_envelope_and_dedups() {
     );
 }
 
-/// SUB-D2 registers into the P-S04 every-incident-adds-a-drill registry so it re-runs forever
-/// (EI-01 §3/§5) — a regression on the consumer path re-reds it loudly.
 #[test]
 fn sub_d2_registers_into_the_permanent_drill_suite() {
     use myelin_harness::{DrillRegistry, DrillScenario};
@@ -405,7 +344,6 @@ fn sub_d2_registers_into_the_permanent_drill_suite() {
         let ledger = DedupLedger::new();
 
         relay.drain_to_empty();
-        // process 2, then drop the broker.
         {
             let c1 = Consumer::new(RecordingHandler::default(), sub(), ledger.clone());
             for envelope in bus.consume(SUBJECT_PREFIX).into_iter().take(2) {
@@ -418,7 +356,6 @@ fn sub_d2_registers_into_the_permanent_drill_suite() {
                 bus.sever();
             }
         }
-        // reconnect: same name + ledger; redeliver everything → 0 lost, 0 dup.
         ctx.breaker.restore_dependency(Dependency::Broker, scope);
         bus.heal();
         let c2 = Consumer::new(RecordingHandler::default(), sub(), ledger.clone());
@@ -439,7 +376,6 @@ fn sub_d2_registers_into_the_permanent_drill_suite() {
         );
         let _ = ids;
 
-        // the asserted survival signal: consumer_lag recovered to 0.
         ctx.signals
             .set_scalar(SignalName::ConsumerLag, c2.lag() as i64);
         ctx.signals

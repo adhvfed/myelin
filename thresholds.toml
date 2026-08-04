@@ -1,108 +1,14 @@
-# =============================================================================================
-# thresholds.toml — THE versioned thresholds file (P-S22 / P-038, master band M0)
-# =============================================================================================
-#
-# The single, versioned source of truth for every Q32 "default-to-beat": the quantified
-# threshold every M0 drill reads its number from. NO drill hardcodes a magic number — it reads
-# its threshold from here (loaded by `myelin_substrate::thresholds`). A missing threshold is a
-# LOUD error (the loader fails), never a silent default.
-#
-# CANON:
-#   - external-insights/01-process-and-quality-doctrine.md §3 — "prove it or it isn't real":
-#     gates resolve to quantified thresholds; NEVER weaken a threshold or invert an assertion to
-#     make a check pass. A red gate is *information* and becomes a "claimed, not proven" row IN
-#     THIS FILE (see [[claimed_not_proven]] below) — never edited green.
-#   - planning/05-refined-shared-systems-architecture/00-platform-substrate.md §10.2 (the
-#     telemetry signal set the thresholds key on) + §8.2 (the fail-static value W `[OPEN — LEGAL]`).
-#   - planning/06-roadmaps/shared/00-platform-substrate.md §2 SUB-M0 item 5 (the Q32 defaults) +
-#     §5 (the green-artifact / thresholds-file discipline) + §6 (the honesty register).
-#
-# DISCIPLINE (the thresholds-file rule, roadmap §5 / EI-01 §3): a milestone is done only when its
-# drill emits a dated green artifact reading green. A drill that fails does NOT get its threshold
-# softened; it is recorded as a [[claimed_not_proven]] row with a date and an owner, and stays
-# there until the deliverable is genuinely repaired. A threshold here is edited only by re-running
-# the drill that measures it (e.g. the M5 surge tunes the shed-budget numbers — never edited green
-# without the drill).
-#
-# UNITS are frozen by the EventEnvelope names/units anchor (§2.10): durations in SECONDS (suffix
-# `_secs`) or MINUTES (suffix `_mins`) as named; multipliers are bare integers; ceilings are
-# integer causal depths.
-# =============================================================================================
 
 version = 1
-# The date this file's current row set was last asserted against its drills (ISO-8601). Bump
-# (with a [[claimed_not_proven]] or a drill-dated note) on every threshold change.
 as_of = "2026-07-22"
 
-# ---------------------------------------------------------------------------------------------
-# [revocation] — N, the deprovision / revocation SLA (the disabled-user blast-radius bound).
-# Roadmap §2 item 5: "N = 5 min revocation". This is the ceiling the fail-static window must sit
-# under (static_max ≤ revocation_sla), and the bound ID-D1/SUB-D4 assert a revoked actor is denied
-# within. Keyed on contract 1.10 / 4.11.
-# ---------------------------------------------------------------------------------------------
 [revocation]
 sla_mins = 5
 
-# ---------------------------------------------------------------------------------------------
-# [surge] — the load-multiplier the harness drives the surge family at (SUB-D3, the F6 family).
-# Roadmap §2 item 5: "30× surge". The 1×/10×/30× load generator (P-S02) reads its top multiplier
-# here; SUB-D3 asserts the human lane holds, the agent lane sheds, cross-tenant impact is 0 at this
-# multiplier. Keyed on contract 1.11.
-# MEASURED + PROVEN GREEN at 30× by BUS-D7 (EB-29 / P-420, 2026-06-24): the Bus's reactive/dispatch
-# tier shed lanes on the AgentMention surface — the protected human lane HELD (0 human sheds), the
-# agent lane SHED with 429 + Retry-After, and a second tenant was UNAFFECTED (cross-tenant shed 0)
-# under the full 30× agent-skewed surge. The agent-mention shed budget below is no longer just a
-# named floor — it is asserted green at the surge multiplier here.
-#
-# MEASURED + PROVEN GREEN at 30× by AG-D6 (AG-P22 / P-478, 2026-06-25): the agent-FABRIC's own slice —
-# the agent-DISPATCH surge gate (myelin_agent_service::AgentDispatchSurgeGate) wires the substrate
-# shed::ShedLane over AgentMention (the concurrency front) in front of the storage AgentRunGate reserve/
-# settle gate (the wallet front). A 30× agent-dispatch storm (P-S02 generator, agent-skewed mix) on ONE
-# tenant: the protected human lane HELD (0 human shed, surging tenant's own + a quiet co-tenant's human
-# admitted), the agent lane SHED with 429 + Retry-After (the runtime HONOURED it — 0 immediate retries,
-# no retry storm), reserve/settle REFUSED the over-budget runs (reserve_refusals > 0) WITHOUT
-# interrupting in-flight (0 interrupts), and cross-tenant impact was 0. This MOVES the AgentMention cap
-# below from the M2 placeholder floor to the MEASURED default-to-beat (the agent-fabric's slice of the
-# F6 surge family; sibling to BUS-D7 / SUB-D3 / FLOW-D8).
-#
-# MEASURED + PROVEN GREEN at 30× by SUB-D3 (P-S32 / P-433, 2026-06-24): the substrate's own
-# principal-aware shed lane (shed::ShedLane) was driven by the P-S02 load generator at the full 30×
-# agent/CI-skewed mix on ONE tenant against the substrate's public surfaces (HttpIntake + CiDispatch).
-# The protected human lane HELD (0 human sheds; the human-lane p99 stayed within `human_lane_p99_budget_us`
-# — a human is admitted into the reserved lane, never queued behind a machine lane), the agent + CI
-# lanes SHED with 429 + Retry-After (shed-count > 0, every shed carrying the surface's Retry-After),
-# and a SECOND tenant trickling baseline traffic was UNAFFECTED (cross-tenant shed 0). This is the
-# substrate's slice of the F6 surge family (sibling to BUS-D7 / ID-D9); the per-surface shed-budget
-# NUMBERS the surge measured against are tuned to measured values in the M5 follow-on (P-S33).
-# ---------------------------------------------------------------------------------------------
 [surge]
 multiplier = 30
 human_lane_p99_budget_us = 10000  # SUB-D3: the substrate's protected-human-lane p99 ceiling under 30× (P-S33 re-confirms).
 
-# ---------------------------------------------------------------------------------------------
-# [ci_surge] — the MEASURED CI-surge controls: the tuned DRR / shed-budget / pre-warm numbers + the
-# per-fair_key starvation-histogram trigger (CI-P30 / P-490, M5; CI-D2, the F6 surge family;
-# continuous-integration §2.2/§2.4/§5.4, contract 1.11/1.8 / open question 07#1, 07#2, 07#5).
-#
-# MEASURED + PROVEN GREEN at 30× by CI-D2 (CI-P30 / P-490, 2026-06-25): the CI Control Plane's surge
-# controls were driven by the P-S02 LoadGenerator at the full 30× CI/agent-skewed mix on ONE tenant
-# against the CiDispatch surface + the DRR fair-share scheduler. The protected INTERACTIVE lane HELD
-# (0 interactive shed — a PR-check is admitted, never queued behind a batch matrix), the BATCH/CI lane
-# SHED with 429 + Retry-After (shed-count > 0, every shed carrying CiDispatch's 5 s Retry-After honoured
-# by `myelin ci`), a SECOND tenant was UNAFFECTED (cross-tenant shed 0 — the per-tenant bounded
-# run-queue held), reserve/settle REFUSED over-budget runs, and a KILLED runner's leased jobs
-# RE-QUEUED within the lease TTL with 0 orphans. Under the same surge the per-fair_key wait-time p99 was
-# MEASURED WITHIN the starvation trigger (flat DRR fairly interleaves the surging tenant — no
-# starvation), so `hierarchical_scheduler_promotion_owed = false`: the hierarchical scheduler (CI-P29)
-# stays a NAMED FLOOR (measured-not-predicted, open question 07#1; EI-04 §5).
-#
-# These NUMBERS mirror `myelin_ci_controlplane::surge::CiSurgeControls` + `fairness::{BASE_QUANTUM,
-# DEFICIT_CEILING,DEFAULT_TENANT_IN_FLIGHT_CAP}` (kept in lock-step by the CI-D2 drill); this file is the
-# source of truth. The starvation p99 + the pre-warm sizing are MEASUREMENT-GATE numbers (compared
-# against, never tuned toward); a regression past the starvation trigger is the hierarchical-scheduler
-# promotion signal, never a lowered bar (EI-01 §3). `per_tenant_in_flight_cap` EQUALS the CiDispatch
-# shed-budget cap below (one number, not two).
-# ---------------------------------------------------------------------------------------------
 [ci_surge]
 per_tenant_in_flight_cap = 64               # MEASURED: == shed_budgets.CiDispatch cap; the 30× CI surge shed the batch lane here, cross-tenant 0.
 drr_base_quantum = 1                        # the DRR deficit decrement on one claim (fairness::BASE_QUANTUM).
@@ -112,416 +18,89 @@ hierarchical_scheduler_promotion_owed = false # CI-D2 measured the wait p99 with
 prewarm_buffer_per_arrival_rate_bps = 1000  # MEASURED (07#2 / §5.4): 10% of the recent arrival rate kept warm (replaces CI-P4's fixed floor).
 prewarm_max_buffer = 16                     # the warm-buffer ceiling — bin-packing under the per-VM memory floor (never past the zone's headroom).
 
-# ---------------------------------------------------------------------------------------------
-# [ci_switch_test] — the CI SWITCH-TEST interactive run/log render-latency budget (CI-P35 / P-509,
-# M6; the Git OQ-12 / CI switch test; continuous-integration §3 CI-M6; arch 04 §2 the run/log/deploy
-# views the switch test drives). The microsecond ceiling the representative `myelin ci` run/log view
-# render must stay WITHIN for a GitHub-Actions user to move without hitting a UX wall the old tool
-# didn't have. MEASURED by the switch test (driven against the real surface, EI-01 §4), never
-# hardcoded in the test and never weakened to pass.
-# ---------------------------------------------------------------------------------------------
 [ci_switch_test]
 render_budget_us = 50000                    # MEASURED-GATE: the interactive run/log view render p-latency budget; a render slower than the GitHub Actions anchor's interactive grade is a UX wall.
 
-# ---------------------------------------------------------------------------------------------
-# [refs_switch_test] — the Refs SWITCH-TEST cross-artifact-jump latency budgets (REF-P29 / P-514,
-# M6; the reference-graph switch test; reference-graph §3 R-M6 the switch-test bullet + the latency
-# budgets; refined arch 05 §1 the moat thesis — the four-keystroke cross-artifact jump). The
-# microsecond ceilings the three driven Refs surfaces (the backlink read / the per-viewer unfurl
-# "within the keyboard" / the whole four-keystroke jump within the no-spinner-flash budget) must stay
-# WITHIN for a GitHub/Jira/Linear/Notion user's cross-artifact navigation to work without hitting a
-# wall the old tool didn't have. MEASURED by the switch test (driven against the real surface, EI-01
-# §4), never hardcoded in the test and never weakened to pass.
-# ---------------------------------------------------------------------------------------------
 [refs_switch_test]
 backlink_read_budget_us = 20000             # MEASURED-GATE: the per-viewer backlink "referenced-by" read that opens the jump; slower than the anchor's interactive grade is a UX wall.
 unfurl_budget_us = 16000                    # MEASURED-GATE: the "within the keyboard" single-unfurl render budget (~one keystroke at 60 fps, no spinner); slower is a wall.
 jump_no_spinner_budget_us = 100000          # MEASURED-GATE: the whole four-keystroke jump (failing-test→line→issue→conversation) within the human-perceptible "instant" ceiling so no spinner flashes.
 
-# ---------------------------------------------------------------------------------------------
-# [search_switch_test] — the Search SWITCH-TEST interactive find-latency budgets (SRCH-P33 / P-515,
-# M6; the Search switch test; search-and-indexing §3 S-M6 the switch-test bullet — code-by-symbol /
-# doc-by-content / issue-by-facet found within the latency budget; VISION §3 the switch test). The
-# microsecond ceilings the three driven Search surfaces (the code-by-symbol FT find / the doc-by-content
-# semantic find / the issue-by-facet structured find) must stay WITHIN for a GitHub/Notion/Jira user to
-# FIND what they expect without hitting a wall the old tool didn't have. MEASURED by the switch test
-# (driven against the real Search surface, EI-01 §4), never hardcoded in the test and never weakened.
-# ---------------------------------------------------------------------------------------------
 [search_switch_test]
 code_by_symbol_budget_us = 30000            # MEASURED-GATE: the per-viewer code-by-symbol trigram FT find on the git-blob corpus; slower than the GitHub code-search anchor's interactive grade is a UX wall.
 doc_by_content_budget_us = 40000           # MEASURED-GATE: the doc-by-content semantic/hybrid find on the Knowledge corpus (the vector probe costs more than an FT find); slower than a Notion content search is a wall.
 issue_by_facet_budget_us = 20000           # MEASURED-GATE: the issue-by-facet structured find on the issue corpus (status/priority/assignee); slower than a Jira facet search's interactive grade is a wall.
 
-# ---------------------------------------------------------------------------------------------
-# [git_switch_test] — the Git OQ-12 SWITCH-TEST budgets (GIT-P35 / P-518, M6; the git-hosting done-bar;
-# git-hosting §3 M6-G10 the switch-test bullet — measured contrast + latency + render(parse(md)) === md
-# + overlays against the real anchor; VISION §3 the switch test driven in a browser). The render-latency
-# ceiling the driven git surface (a representative PR overview page render) must stay WITHIN, plus the
-# contrast floor every rendered status overlay must MEET, for a GitHub user to move to Myelin git hosting
-# without hitting a wall the old tool didn't have. MEASURED by the switch test (driven against the real
-# surface, EI-01 §4), never hardcoded in the test and never weakened to pass.
-# ---------------------------------------------------------------------------------------------
 [git_switch_test]
 pr_overview_render_budget_us = 50000        # MEASURED-GATE: the representative PR overview page render p-latency (the view the switch test drives); slower than the GitHub PR-page anchor's interactive grade is a UX wall.
 overlay_contrast_floor_bp = 450             # MEASURED-GATE: the status-overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-language §8b anchor); an overlay below it is an accessibility wall.
 
-# ---------------------------------------------------------------------------------------------
-# [knowledge_switch_test] — the Knowledge SWITCH-TEST budgets (KN-P34 / P-519, M6; the knowledge-platform
-# done-bar; knowledge-platform §3 KN-M6 the dogfood + switch-test bullet — measured contrast + latency +
-# render(parse(md)) === md against the real anchor (the design sketches / design-manual block-editor §2
-# one-render-path law); VISION §3 the switch test driven in a browser). The page render-latency ceiling the
-# driven Knowledge editor surface (a representative page render — the ONE render path) must stay WITHIN,
-# plus the contrast floor every rendered reference-chip / tombstone overlay must MEET, for a Notion user to
-# move to Myelin Knowledge without hitting a wall the old tool didn't have. MEASURED by the switch test
-# (driven against the real surface, EI-01 §4), never hardcoded in the test and never weakened to pass.
-# ---------------------------------------------------------------------------------------------
 [knowledge_switch_test]
 page_render_budget_us = 50000               # MEASURED-GATE: the representative Knowledge page render p-latency (the editor view the switch test drives, the ONE render path); slower than the Notion page anchor's interactive grade is a UX wall.
 overlay_contrast_floor_bp = 450             # MEASURED-GATE: the reference-chip / tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
 
-# ---------------------------------------------------------------------------------------------
-# [issues_switch_test] — the Issues ISS-D14 SWITCH-TEST budgets (ISS-P37 / P-520, M6; the issue-tracker
-# done-bar; issue-tracker §6 M6-I10 the dogfood + switch-test bullet — the create→triage→plan→board→done
-# loop without a manual, measured contrast + latency on the primary screens incl. the empty/loading/error/
-# permission/erased/agent-pending states; VISION §3 the switch test driven in a browser). The render-latency
-# ceiling the driven Issues surface (a representative canonical-view render — the board/table/roadmap view)
-# must stay WITHIN, plus the contrast floor every rendered primary-screen overlay must MEET, for a
-# Jira/Linear user to move to Myelin Issues without hitting a wall the old tool didn't have. MEASURED by the
-# switch test (driven against the real surface, EI-01 §4), never hardcoded in the test and never weakened.
-# ---------------------------------------------------------------------------------------------
 [issues_switch_test]
 view_render_budget_us = 50000               # MEASURED-GATE: the representative Issues canonical-view render p-latency (the board/table/roadmap view the switch test drives, a ViewSpec projection over the one issue table); slower than the Jira/Linear board anchor's interactive grade is a UX wall.
 overlay_contrast_floor_bp = 450             # MEASURED-GATE: the state-pill / priority-badge / agent-pending / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
 
-# ---------------------------------------------------------------------------------------------
-# [chat_switch_test] — the Chat CHAT-D19 SWITCH-TEST budgets (CHAT-P32 / P-521, M6; the chat done-bar;
-# chat §4 M6 the switch-test done-bar — drive the real Chat UI (the 13 screens S1–S13 + the responsive
-# cases: hover-action / width-takeover / flip-popover) in a browser; measured contrast + latency budgets —
-# optimistic send < ~100ms perceived; flip-popovers correct against the real bottom-pinned composer anchor;
-# VISION §3 the switch test driven in a browser). The perceived optimistic-send latency ceiling the driven
-# Chat composer's optimistic echo must stay WITHIN, plus the contrast floor every rendered overlay must MEET,
-# for a Slack user to move to Myelin Chat without hitting a wall the old tool didn't have. MEASURED by the
-# switch test (driven against the real surface, EI-01 §4), never hardcoded in the test and never weakened.
-# ---------------------------------------------------------------------------------------------
 [chat_switch_test]
 perceived_send_budget_us = 100000           # MEASURED-GATE: the optimistic-send perceived p-latency (the S3 composer's optimistic echo into the timeline before the durable ack); the wireframes' "optimistic send < ~100ms perceived" target — slower than the Slack anchor's optimistic grade is a UX wall.
 overlay_contrast_floor_bp = 450             # MEASURED-GATE: the message-row / agent / unfurl / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
 
-# ---------------------------------------------------------------------------------------------
-# [authz_surge] — the ID-D9 (F6) protected-human-lane authz-decision p99 budget under the 30× authz
-# hot-path surge (identity §10/§13: authz is the highest-QPS shared system; contract 1.8
-# `auth_decision_latency` / 4.11 the shed order on the authz surface).
-#
-# ID-D9 (P-ID-31 / P-424) drives a 30× agent-skewed surge of `check` calls on the authz hot path. The
-# protected human lane must HOLD within this p99 budget while the agent lane SHEDS (429 + Retry-After,
-# the §7.2 shed order) and cross-tenant impact stays 0. The SHAPE (a measured human-lane p99 ceiling
-# under surge) is FROZEN; the NUMBER is the default-to-beat. A regression that pushes the human-lane
-# p99 past it is a dated [[claimed_not_proven]] row, never a lowered bar (EI-01 §3).
-#
-# UNITS: MICROSECONDS (`_us`, the §2.10 names/units anchor). A `check` is an in-cell, memo-bounded
-# tuple resolution; the human-lane p99 sits far under this ceiling even under the surge.
-#
-# MEASURED + PROVEN GREEN under the 30× surge by ID-D9 (P-ID-31 / P-424, 2026-06-24): the authz
-# hot-path shed lane on the HttpIntake authz surface held the protected human lane (0 human sheds,
-# human-lane check p99 within budget), the agent lane SHED with 429 + Retry-After (shed-count > 0),
-# and a second tenant was UNAFFECTED (cross-tenant impact 0) under the full 30× agent-skewed surge.
-# ---------------------------------------------------------------------------------------------
 [authz_surge]
 human_lane_p99_budget_us = 5000  # ID-D9: the protected human lane's authz-decision p99 ceiling under 30×.
 
-# ---------------------------------------------------------------------------------------------
-# [fail_static] — W, the bounded-staleness window for FailStatic<T> (contract 1.10 / 4.11).
-#
-# The MECHANISM and the constraint `static_max ≤ revocation-SLA` AND `static_max ≥ agent-token-TTL`
-# (architecture §8.2) ship in M0 REGARDLESS and are enforced in the FailStatic constructor (P-S18).
-# The VALUE W is `[OPEN — LEGAL]` — a DPO-ratified call (L-1, the one substrate-owned legal flag,
-# roadmap §6): it is the residual GDPR-revocation exposure window, handed to counsel, NOT an
-# engineering default set silently.
-#
-# Until the DPO ratifies, `static_max_secs` is ABSENT (commented out). The loader exposes W as an
-# `Open` variant carrying its constraint; reading W as a concrete number is a LOUD error until the
-# legal flag clears. `static_max_default_secs` is the engineering *seed* the mechanism is drilled
-# against (== revocation_sla = 5 min = 300 s, the largest value the constraint admits) — it is NOT
-# the ratified W and is labelled as a seed, not a default-to-beat.
-# ---------------------------------------------------------------------------------------------
 [fail_static]
 status = "OPEN — LEGAL"          # L-1, DPO-ratified; the VALUE is absent until counsel clears it.
 owner = "DPO / Legal"
-# static_max_secs = <RATIFIED W>  # [OPEN — LEGAL] — intentionally absent (a loud error to read).
 static_max_default_secs = 300    # the engineering SEED the mechanism is drilled against (P-S18/P-S25).
-# The LOWER bound of the constraint (§8.2): static_max ≥ agent-token TTL — the window must CONTAIN
-# the short-lived per-run agent token (ID-1 / GD-3 / ADR-17). The agent token's life == its run
-# life; 60s is the v1 seed floor (the FailStatic constructor rejects any static_max below it,
-# P-S18). The real per-run TTL is set by mint_run_token (Identity M1); this is the substrate-side
-# bound the constraint is enforced against in M0.
 agent_token_ttl_secs = 60
-# The constraint that ships regardless and is enforced structurally in the constructor (P-S18):
 constraint = "static_max <= revocation-SLA AND static_max >= agent-token-TTL"
-# CONSUMERS (confirmed in place — never re-defined): the W bound is consumed by Identity's S6
-# fail-static availability cache (P-ID-15 / P-073, `failstatic_cache::FailStaticCache`), which reads
-# this row + the `[revocation]` SLA and constructs `FailStatic<CoarseGrant>` against them (so a
-# `static_max > revocation-SLA` window cannot be built). The ID-D2 drill asserts authenticated
-# traffic survives a hiccup on the coarse grant + a just-revoked subject is denied through S6;
-# `staleness_age ≤ static_max ≤ revocation-SLA` is the green-artifact bound. The DPO ratification of
-# the *number* W stays the `[OPEN — LEGAL]` L-1 follow-on (parallel legal — the floor does not wait).
 
-# ---------------------------------------------------------------------------------------------
-# [rpo_rto] — the durability objectives the restore-verify gate (STOR-D1/D2, SUB-D6) asserts.
-# Roadmap §2 item 5: "RPO ≤ 5 min, RTO ≤ 1h/tenant ≤ 4h/cell". These are PROVEN in M1 (the
-# substrate supplies the injection/assertion half; the value lives here from M0 so the M1 drill
-# reads it). Keyed on contract 11.5.
-# ---------------------------------------------------------------------------------------------
 [rpo_rto]
 rpo_max_mins = 5             # recovery-point objective: at most 5 minutes of data may be lost.
 rto_tenant_max_mins = 60     # recovery-time objective, per tenant: ≤ 1 hour.
 rto_cell_max_mins = 240      # recovery-time objective, per cell: ≤ 4 hours.
 
-# ---------------------------------------------------------------------------------------------
-# [online_migration] — the STOR-D8 lock-wait budget the online-migration drill (P-ST-21 / P-126)
-# asserts against. Drill catalogue row STOR-D8: "expand→backfill→contract on a restored prod-scale
-# copy under load → no blocking lock beyond budget; 0 downtime. Telemetry: lock-wait p99; 0
-# downtime." (storage.md §3.1: forward-only online migrations — lock time measured against a
-# RESTORED copy, now that restore-verify exists.)
-#
-# This is the PROPOSED DEFAULT-TO-BEAT measured here at prod-scale (P-126) and re-confirmed at
-# CELL scale in M5 (P-ST-34 / world-scale). The online idiom's defining property is that each
-# step (Expand = a nullable add / CREATE INDEX CONCURRENTLY; Backfill = throttled off-hot-path
-# batches; Contract = a validated swap) takes only a SHORT metadata/catalog lock, never a
-# table-rewrite lock at write QPS. A step whose p99 lock-wait exceeds this budget is NOT the
-# online idiom and the drill FAILs (it is the blocking-ALTER bug class the runner rejects, now
-# proven empirically under load). `downtime_max_ms = 0` is the 0-downtime invariant: an online
-# migration NEVER takes the table offline. Weakening either number to pass is forbidden (EI-01
-# §3) — a red is a dated `[[claimed_not_proven]]` scorecard row, never a lowered bar. Keyed on
-# contract 1.5 (the migration runner) + 11.5 (the restored copy STOR-D8 rehearses against).
-#
-# PROVEN GREEN at the substrate level by SUB-D10 (P-S34 / P-435, M5, 2026-06-24): the substrate's
-# online-migration-under-load chain — the migration runner (1.5) tied to the P-S26 restore-verify
-# machinery (the migration runs on a RESTORED prod-scale copy, §9.2's lock-time-against-a-restore
-# rule) under the P-S02 load generator's concurrent write traffic (the in-flight writers DERIVED from
-# a real 30× generator run) — held this budget: an expand→backfill→contract migration on the restored
-# 50M-row copy had its lock-wait p99 WITHIN budget, 0 errored writes (the online idiom takes only
-# short metadata/catalog/row-level locks, so the concurrent writers proceeded), and 0 downtime, and
-# the restored copy stayed cross-seam consistent across the migration. The blocking-ALTER counter-case
-# BLEW the budget (the dynamic proof the static gate cannot make). The lock-cost MODEL is the storage
-# tier's (STOR-D8, migration_under_load.rs) — REUSED, not duplicated; SUB-D10 adds the substrate-level
-# restore+load+telemetry wiring. CELL-scale re-confirm under WORLD-SCALE load is the M5 follow-on
-# P-S35 / P-436.
-# ---------------------------------------------------------------------------------------------
 [online_migration]
 lock_wait_p99_max_ms = 500   # STOR-D8: an online step's p99 lock-wait must stay ≤ 500 ms (a short
-                             # metadata/catalog lock), never a table-rewrite lock at write QPS.
 downtime_max_ms = 0          # STOR-D8: 0 downtime — an online migration NEVER takes the table offline.
 
-# ---------------------------------------------------------------------------------------------
-# [git_pack_ceiling] — the GIT-D4 clone-serve p99 budget the object-backed-git-packs drill
-# (P-ST-31 / P-442, with Git) asserts against. Drill catalogue row GIT-D4: "Grow a synthetic
-# monorepo until partial-clone/sparse/bitmaps degrade → documented v1 ceiling (GF-4); clone/fetch
-# p99 held below it." (storage.md §3.5 the git object-backing seam STOR-5 — authoritative git bytes
-# move from node-local disk to the object tier; §8 measure-before-shard — the swap is triggered by
-# the MEASURED single-node ceiling, not predicted; EI-04 §3 the explicit sequenced transition.)
-#
-# This is the PROPOSED DEFAULT-TO-BEAT. The clone-serve p99 ceiling is the SINGLE number both halves
-# of the gate are checked against: a SINGLE NODE serving the whole clone storm off one local-disk
-# pack tier CROSSES this p99 as the clone-storm read fan-out grows (the documented single-node
-# ceiling GF-4, the trigger), while the OBJECT-BACKED tier — fanning the same read load across the
-# object tier's serving nodes + the within-EU CDN clone class (content-addressed bundles) — HOLDS the
-# p99 within it (the green half). A clone-serve p99 past this budget on the object-backed packs is a
-# dated `[[claimed_not_proven]]` scorecard row, never a lowered bar (EI-01 §3). Keyed on contract
-# 11.2 (the object-backed pack/delta seam). The object-backed pack-ALGORITHM impl (chunking/delta-
-# base/smart-transport) is co-owned with the Git subsystem M5 deliverable (GIT-P33); CELL-scale
-# re-confirm under WORLD-SCALE clone surge is the M5 F6 surge family (P-ST-35, GIT-D6).
-# ---------------------------------------------------------------------------------------------
 [git_pack_ceiling]
 clone_serve_p99_max_ms = 50  # GIT-D4: the object-backed packs' clone-serve p99 must stay ≤ 50 ms;
-                             # a single node serving the whole storm off local disk CROSSES this as
-                             # the read fan-out grows (the measured trigger for the object-backed swap).
 
-# ---------------------------------------------------------------------------------------------
-# [git_merge_queue] — the GIT-D5 concurrent-merge LINEARIZABILITY drill (P-482 / GIT-P33, with Git)
-# asserts against. Drill catalogue row GIT-D5: "concurrent merges + force-push to one protected
-# base_ref + DB-replica failover + node recovery mid-merge → LINEARIZABLE on the ref CAS; NO
-# split-brain; 0 LOST MERGE; update_seq monotonic + the fence honoured." (05-hard-problems.md HP-6
-# — the per-ref CAS is the linearisation point, update_seq is the fence, no bespoke per-repo
-# consensus group; HP-8 — the speculative/parallel merge queue, OQ-5.)
-#
-# The drill runs `concurrent_merge_attempts` PRs racing onto ONE protected base_ref through the
-# speculative queue, injects a force-push (base movement) + a DB-replica failover mid-merge, and
-# asserts: exactly the green-prefix landed as a strictly-monotonic update_seq CAS sequence (0 lost),
-# the force-pushed batch was invalidated (0 stale land), and update_seq is monotonic. The
-# `lost_merge_max` is the hard floor: a SINGLE lost merge fails the drill (a lost merge is the
-# failure mode the mutation-tested core defends). Keyed on HP-6/HP-8 + contract 5.9 (the merge-queue
-# ci.result wait). World-scale concurrent-merge under WORLD-SCALE surge is the M5 F6 family (GIT-D6,
-# GIT-P34).
-# ---------------------------------------------------------------------------------------------
 [git_merge_queue]
 concurrent_merge_attempts = 64  # GIT-D5: PRs racing onto one protected base_ref in the drill.
 lost_merge_max = 0              # the hard floor: 0 lost merge (a single lost merge fails the drill).
 
-# ---------------------------------------------------------------------------------------------
-# [depth_ceilings] — the causal-depth ceilings the agent-loop guard halts a loop at (SUB-D8).
-# Roadmap §2 item 5: "depth ceilings 12/16". The soft ceiling flags a deepening loop early; the
-# hard ceiling structurally halts it (reads EventEnvelope.depth). These ARE the seed constants in
-# `agent_load::DepthCeiling::{V1_SOFT, V1_HARD}` — this file is now their single source of truth.
-# Keyed on contract 1.11.
-# ---------------------------------------------------------------------------------------------
 [depth_ceilings]
 soft = 12
 hard = 16
 
-# ---------------------------------------------------------------------------------------------
-# [refs_traverse] — the Refs recursive-CTE traverse bounds (REF-P13 / P-162; contract 5.3,
-# reference-graph §4.5). The bounded, cycle-safe `WITH RECURSIVE` walk reads its DEPTH CEILING
-# (default 16) + its collected-node budget (the partial-result truncation point, X-3) from HERE —
-# the single source of truth, no hardcoded magic in the traverse. This is the GRAPH-HOP ceiling,
-# DISTINCT from [depth_ceilings] (the agent CAUSAL depth, contract 1.11): a deep dependency tree is
-# not a runaway agent loop. These ARE the seed constants in
-# `myelin_refs_service::traverse::{TRAVERSE_DEPTH_CEILING, TRAVERSE_MAX_NODES}`. Keyed on contract
-# 5.3. `max_nodes` is a default-to-beat re-measured at world-scale (REF-P22).
-# ---------------------------------------------------------------------------------------------
 [refs_traverse]
 depth_ceiling = 16
 max_nodes = 10000
 
-# ---------------------------------------------------------------------------------------------
-# [refs_hot_artifact] — the Refs hot-artifact backlink-read budget that triggers the R4 reach-index
-# promotion (REF-P23 / P-454, M5; contract 5.3 at scale / 1.8 the hot_artifact_fanout telemetry;
-# reference-graph.md §6.3 — the hot-artifact backlink scale "viral PR / referenced-by-50,000" case).
-#
-# The BUILT floor (REF-P11) is the read-time CTE + list_objects filter + pagination + replica: you
-# never materialise 50,000 backlinks, you PAGE them. The FOLLOW-ON (this prompt) is the Leopard-style
-# flattened reach index R4 — derived/rebuildable from R1, incrementally maintained from refs.edge.*,
-# gated by the SAME list_objects filter — promoted ONLY when MEASURED hot-fanout exceeds the read
-# budget (R5), NOT predicted (architecture §6.3; EI-04 §7; ADR-10 measure-before-shard).
-#
-# `read_budget_fanout` is R5: the inbound-fanout (the count of LIVE inbound edges to a target_root)
-# above which the read-time CTE scan is MEASURED to fall over its p99 budget, so R4 is promoted to
-# serve that target. STRICTLY greater-than (a target AT the budget still serves from the CTE floor —
-# the frozen >budget wording, mirroring the §6.3 "exceeding the read budget"). This is a
-# MEASURED-not-predicted criterion (the hot_artifact_fanout telemetry measures the real fanout; R4 is
-# promoted only when a real target crosses it), never a value tuned toward. The number is a v1
-# default-to-beat seeded at the synthetic REF-D3 corpus scale (the "referenced-by-50,000" case, drill
-# ~348); the WORLD-SCALE fleet-hardware re-measure of the real crossover is the named M5 floor. A
-# regression that needs a HIGHER budget than measured is a dated [[claimed_not_proven]] row, never a
-# silently-raised bar (EI-01 §3). Mirrors `myelin_refs_service::reach_index::R4_READ_BUDGET_FANOUT`
-# (the seed constant); this file is its source of truth.
-# ---------------------------------------------------------------------------------------------
 [refs_hot_artifact]
 read_budget_fanout = 1000     # R5: inbound fanout above which the CTE read falls over budget → R4 promotes (>budget).
 
-# ---------------------------------------------------------------------------------------------
-# [flex_db] — the Knowledge flexible-database read budgets + the FROZEN >5% facet-promotion
-# threshold (KN-P17 / P-307; KN-D9; contract 6.3 / OQ-C, knowledge-platform architecture 01 §1.2 /
-# 02 §4.1). The flexible DB is JSONB property-bag rows (source of truth) + a GIN `jsonb_path_ops`
-# projection + generated columns for the MEASURED-hot facets; views lower their `QueryAst` filter
-# into JSONB ops over `props` and ALWAYS conjoin the `list_objects` `SetExpr` ACL (permission by
-# construction, 0 post-filter — composes with KN-D5).
-#
-# `view_read_p99_max_ms` is the KN-D9 flex-DB latency gate (the default-to-beat measured at scale
-# on the failure-injection harness; re-confirmed at WORLD scale in KN-P31). `page_row_cap` is the
-# §4.1 step-5 row cap — a single view read is ALWAYS paginated/row-capped, never an unbounded scan
-# (mirrors `database::PageBound::MAX`). `facet_promotion_ratio` is the FROZEN Search-owned tunable
-# (contract 6.3): a facet in MORE than this fraction of a collection's view executions over a
-# rolling window promotes from a cold GIN scan to a per-facet generated/expression-column index —
-# MEASURED here (KN-P17 `FacetTelemetry`), ACTED on (the index provisioned off the bus via
-# expand→backfill→contract) in KN-P31 (M5). The trigger is STRICTLY >5% (a facet at exactly 5% does
-# NOT promote — the frozen 6.3 wording). Weakening any number to pass is forbidden (EI-01 §3) —
-# a red is a dated [[claimed_not_proven]] row, never a lowered bar. Mirrors
-# `myelin_knowledge::{database::PageBound::MAX, FACET_PROMOTION_THRESHOLD}`; this file is their
-# source of truth.
-# ---------------------------------------------------------------------------------------------
 [flex_db]
 view_read_p99_max_ms = 200    # KN-D9: the flex-DB view-read p99 budget (JSONB + GIN + SetExpr conjoin).
 page_row_cap = 500            # §4.1 step 5: the page row cap (a view read is always row-capped).
 facet_promotion_ratio = 0.05  # contract 6.3: the FROZEN >5% facet-promotion trigger (measured, acted on KN-P31).
 rollup_read_p99_max_ms = 250  # KN-D10 (KN-P18 / P-308, architecture §4.2 / KQ-4): the read-time rollup/formula
-                              # recompute p99 budget. A rollup over a large related set is computed at READ TIME
-                              # (permission-filtered, conjoining list_objects), NEVER stored; its recompute p99 must
-                              # stay within this. A rollup whose MEASURED read-time recompute p99 crosses it
-                              # (RollupLatencyTelemetry::materialisation_candidates) is the per-rollup materialisation
-                              # trigger — promoted to an incrementally-maintained materialised aggregate fed off the bus
-                              # → the OLAP read store (11.6) in KN-P31 (M5). STRICTLY greater-than (a rollup at exactly
-                              # the budget is within budget). Weakening to pass is forbidden (EI-01 §3).
 
-# ---------------------------------------------------------------------------------------------
-# [authz_index] — the S8 authz-reverse-index measured tunables (P-ID-11 / P-069, identity §7.1).
-# The Ids↔Filter SHAPE is FROZEN (small reachable sets materialise as `Ids`, large ones push down as
-# `Filter`); only the NUMBERS — the cardinality cap that switches between them + the
-# `reverse_index_lag` freshness SLO — were open. Keyed on contract 4.3 / 1.8. Mirrors
-# `list_objects::DEFAULT_IDS_CARDINALITY_CAP` (the seed constant); this file is its source of truth.
-#
-# MEASURED + FINALISED AT WORLD-SCALE by the S8-tunables drill (P-ID-32 / P-425, 2026-06-24):
-#   - `ids_cardinality_cap` — the Ids↔Filter crossover was MEASURED under the world-scale list/load
-#     case (a cap-sized reachable set is the largest set the materialise plan is ever chosen for):
-#     the materialise (`Ids`) plan's cost is LINEAR in the reachable-set size (the inlined `IN (…)`
-#     list + per-candidate permission re-resolution), while the push-down (`Filter`) plan is a FIXED
-#     single `authz_visible` JOIN (no N+1). The measured cost curve is monotone in the set size and
-#     the crossover sits AT the cap (a cap-sized set fully materialises; one past it flips to the
-#     fixed-cost JOIN). 1000 is FINALISED as the measured default-to-beat: small enough that
-#     materialising + inlining is the cheaper plan, large enough that ordinary lists (a user's
-#     repos/channels/boards) materialise. The dispatch flips EXACTLY at the cap (AT→Ids, OVER→Filter).
-#     This CLOSES the P-ID-11 cardinality-cap floor (the SHAPE was always frozen; the NUMBER is now
-#     measured, not predicted).
-#   - `reverse_index_lag_slo_ms` — FINALISED at 1000 ms, MEASURED under a 30× write surge (~1920
-#     `iam.tuple_written` writes): the S8 projection kept up (max measured reverse_index_lag = 0 ms
-#     on the synchronous apply path — FAR under the SLO), so the SLO is comfortably achievable. The
-#     SLO stays bounded above by the revocation SLA (5 min = 300 000 ms, §15 / §8.2) so a stale grant
-#     served from a behind index can NEVER outlive a revoke. The watermark fallback honours it: a
-#     zookie-stamped scan within the SLO (at-or-before the watermark) serves from S8; one beyond the
-#     watermark falls back to per-row `check` (the new-enemy guard — never serve a stale grant).
-# Both numbers are no longer "named floors" — they are asserted green at world-scale here. A
-# regression past either is a dated [[claimed_not_proven]] row, never a lowered bar (EI-01 §3).
-# ---------------------------------------------------------------------------------------------
 [authz_index]
 ids_cardinality_cap = 1000      # P-ID-32: the Ids↔Filter switch point, MEASURED + FINALISED at scale (crossover sits AT the cap).
 reverse_index_lag_slo_ms = 1000 # P-ID-32: the freshness SLO, MEASURED + FINALISED under surge (achievable; bounded < revocation SLA).
-# `list_subjects(object, permission)` (the Zanzibar Expand at density, contract 4.4 / C8) served by
-# the SAME S8 reverse index: the read-fanout case (a 50k-member channel `list_subjects(channel,
-# watcher)`) must return within this budget so Notif's ambient-unread fanout does not degrade. The
-# SHAPE (an S8-served expand, NOT a bespoke per-member scan) is FROZEN here; the NUMBER is the
-# default-to-beat seed measured against SYNTHETIC density now (P-ID-13 / P-071) and re-measured
-# against a REAL watchable subsystem (the `watcher` relation P-ID-23, Chat channels M4) — those
-# prompts close the real-density floor. Keyed on contract 4.4. The `list_subjects` body asserts the
-# 50k-member synthetic expand finishes well under this ceiling.
 list_subjects_density_members = 50000 # the pinned density (a 50k-member channel, C8).
 list_subjects_density_budget_ms = 250 # the 50k-density expand budget seed (P-ID-23/M4 re-measure at real density).
 
-# ---------------------------------------------------------------------------------------------
-# [dsr] — the DSR (data-subject-request) deadline thresholds (contract 10.4 / gdpr §4.1 step 6 /
-# the GA-D4 drill). The durable deadline timer (P-GA-21 / P-148) arms a `sleep_until(now +
-# deadline_secs)` on the `myelin-flow` minute-bucket wheel on `dsr_submit`; a nearing-deadline
-# point — `warning_margin_secs` BEFORE the deadline — fires the `dsr_deadline_margin` warning
-# Signal so the statutory deadline is NEVER silently missed (GA-D4: 0 silent misses). The
-# extension-to-3-months-for-complex case re-arms to `extension_total_secs` with a recorded reason.
-#
-# UNITS: seconds (the §2.10 names/units anchor). The numbers are the Art. 12(3) STATUTORY seeds;
-# Phase 6 may WIDEN `warning_margin_secs` (a wider margin = an earlier, safer warning) — it is
-# never tightened toward 0 (that would re-introduce the silent-miss risk).
-# ---------------------------------------------------------------------------------------------
 [dsr]
 deadline_secs = 2592000          # Art. 12(3): 1 month = 30 days.
 warning_margin_secs = 604800     # the nearing-deadline warning fires 7 days (1 week) before the deadline.
 extension_total_secs = 7776000   # Art. 12(3) extension-for-complex: 3 months = 90 days (re-arm w/ recorded reason).
 
-# ---------------------------------------------------------------------------------------------
-# [cell_sizing] — the MEASURED cell sizing-band numbers (P-CP-22 / P-431; tenancy-and-control-plane.md
-# §7.1, ADR-10 "measure-before-shard"). The §5.1 cell `capacity` vector is multi-dimensional
-# (`tenants_max` / `write_qps_max` / `storage_bytes_max`); §7.1 says the BINDING dimension — the one a
-# cell class fills first — is discovered by MEASUREMENT, NEVER predicted. These rows replace the
-# conservative §5.1 seed (1000 tenants / 5000 qps / 1 TiB) with the MEASURED Pool-tier band.
-#
-# MEASURED + PROVEN GREEN by the cell-sizing load test (CP-D7 sibling, P-CP-22 / P-431, 2026-06-24):
-# the Pool-tier load test drove a synthetic tenant population at 1×/10×/30× write QPS while the
-# `cell_utilisation` telemetry (contract 1.8) recorded per-dimension fill. The WRITE-QPS dimension
-# bound FIRST (a Pool cell's OLTP write path saturates before the tenant-count or storage ceilings at
-# the v1 isolation tier — the measured cost curve is steepest in write throughput). The measured band:
-# a Pool cell admits ~2000 tenants but is WRITE-QPS-bound at ~9000 sustained write QPS (the binding
-# dimension), holding ~2 TiB before storage binds. The headroom below the binding dimension is 20% (a
-# cell past 80% of its measured write-QPS ceiling is "hot" — sealing cannot relieve it, and the live
-# cell→cell migration, P-CP-22, is the relief lever). These are MEASURED defaults-to-beat (ADR-10),
-# never predicted: a regression that exceeds the measured band is the migration trigger, never a
-# silently-raised bar (EI-01 §3). The avoid-migration-by-sizing floor (P-CP-05/P-CP-07) is PROMOTED —
-# the sizing numbers are measured, and live migration is the relief when sizing cannot.
-# ---------------------------------------------------------------------------------------------
 [cell_sizing]
 pool_tenants_max = 2000           # MEASURED: tenants one Pool cell admits (NOT the binding dimension here).
 pool_write_qps_max = 9000         # MEASURED: the Pool tier's sustained write-QPS ceiling (the BINDING dimension).
@@ -529,33 +108,6 @@ pool_storage_bytes_max = 2199023255552  # MEASURED: ~2 TiB stored-bytes ceiling 
 pool_binding_dimension = "write_qps"    # MEASURED (ADR-10): write QPS binds FIRST at the Pool tier.
 pool_hot_headroom_bps = 2000      # 20% headroom below the binding dimension before a cell is "hot" (the migration trigger).
 
-# ---------------------------------------------------------------------------------------------
-# [[shed_budgets]] — the per-surface shed budgets (contract 1.11, architecture §7.6).
-#
-# TUNED + MEASURED (P-S33 / P-434, M5, 2026-06-24): these were the M0 v1 FLOORS (named, not
-# claimed-final). The M5 surge family — SUB-D3 (P-S32 / P-433) at the full 30× agent/CI surge on the
-# substrate's own surfaces, BUS-D7 (P-420) on AgentMention, ID-D9 (P-424) on the authz hot path,
-# GIT-P15 on GitFrontDoor — plus the connection-storm drill (P-S31, the ConnectionTier/CollabOpStream
-# firehose rows) DROVE these numbers under real surge + connection-storm load. The three F6
-# properties held at every number: the protected human lane held (0 human sheds, within
-# `surge.human_lane_p99_budget_us`), the machine lanes shed with `429 + Retry-After`, and
-# cross-tenant impact was 0. So the NUMBERS are now MEASURED defaults-to-beat, not just floors.
-#
-# The MEASURED human-lane floor: every human-facing surface reserves at-or-above 20% of its cap
-# (`SurfaceBudget::HUMAN_LANE_FLOOR_BPS` = 2000 bps) — the boundary below which the surge's concurrent
-# human traffic no longer fits the reserved slice and the human lane is starved. Every row below holds
-# it (e.g. ConnectionTier 64/256 = 25%, HttpIntake 50/200 = 25%, AgentMention 24/96 = 25%). The
-# `Thresholds::validate_shed_budgets()` gate REJECTS a row that tunes a human lane below this floor —
-# so a future hand-edit dropping a reservation under the floor fails at LOAD, never silently at
-# runtime (the human-lane-starvation regression, P-S33; EI-01 §3 — never weaken a threshold to pass).
-# CiDispatch is the documented exception (the §7.6 batch lane: CI + agent share the wallet, n/a human
-# reservation), exempt from the floor but still bounded.
-#
-# The floor DISCIPLINE (bounded + reserved human lane + shed order: speculative → batch/CI → agent →
-# human-last) is the UNCHANGED contract; only the posture of the numbers moved floor → measured. They
-# mirror `shed::ShedBudgetTable::v1_floor()` (kept in lock-step by a CDC test); this file is the
-# source of truth. `surface` matches the `shed::Surface` enum variant name.
-# ---------------------------------------------------------------------------------------------
 [[shed_budgets]]
 surface = "CiDispatch"        # CI is the batch lane (§7.6: n/a human reservation) — CI + agent share the wallet.
 per_tenant_in_flight_cap = 64 # MEASURED: SUB-D3 30× CI/agent surge shed the machine lanes here; cross-tenant 0.
@@ -570,68 +122,42 @@ retry_after_secs = 2
 
 [[shed_budgets]]
 surface = "ConnectionTier"    # reserved connection slots for interactive humans.
-# TUNED + CONFIRMED on the CHAT surface by CHAT-D3/D4 (CHAT-P26 / P-500, M5, 2026-06-25): the chat
-# surge gate (myelin_chat_gateway::run_chat_surge over the ShedGovernor) was driven by the P-S02
-# LoadGenerator at the full 30× agent message/connection storm on ONE tenant against this surface (the
-# presence/typing/read-state + live human-message lanes). The protected human live-message lane HELD
-# (0 human shed, every human frame delivered — humans never queue behind agent runs), the presence/
-# speculative lane SHED first, a SECOND tenant was UNAFFECTED (cross-tenant shed 0), and the deploy-herd
-# (CHAT-D4 fleet roll in waves) completed resume for ALL with 0 message loss. This PROMOTES the chat-side
-# CHAT-P10 floor (OQ-K / R-C2 / Q-C5) to a CONFIRMED default-to-beat at this cap — the number is the same
-# one the connection-storm (P-S31) measured; CHAT-D3/D4 confirm it sufficient on the chat connection tier.
 per_tenant_in_flight_cap = 256 # MEASURED: connection-storm (P-S31) + CHAT-D3/D4 (P-500) held interactive humans at this cap.
 human_lane_reservation = 64    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 3
 
 [[shed_budgets]]
 surface = "AgentMention"      # humans never queue behind agent runs (a reserved human fraction).
-# AGENT-LANE SHED BUDGET — the M2 PLACEHOLDER → the MEASURED cap (AG-P22 / P-478, AG-D6, 2026-06-25).
-# BEFORE (M2 v1 floor, agent-fabric.md §8 C10): the bound EXISTED (Surface::AgentMention in the substrate
-# shed table) but the NUMBER was a round, conservative placeholder (96/24). AFTER (MEASURED): the agent-
-# fabric's own 30× agent-DISPATCH surge (AG-D6, P-478) drove the P-S02 generator at 30× agent-mention
-# load on ONE tenant through BOTH fronts — the substrate shed::ShedLane (concurrency front) AND the
-# storage AgentRunGate reserve/settle gate (wallet front). The protected human lane HELD (0 human shed,
-# the surging tenant's own + a quiet co-tenant's human dispatch admitted), the agent lane SHED with
-# 429 + Retry-After (the agent runtime HONOURED it — 0 immediate retries, no retry storm), reserve/settle
-# REFUSED the over-budget runs (reserve_refusals > 0) WITHOUT interrupting in-flight (0 interrupts), and
-# cross-tenant impact was 0. The 96/24 cap is the SAME number the Bus's BUS-D7 (P-420) slice measured —
-# AG-D6 confirms it sufficient on the agent-dispatch path, so the row is the MEASURED default-to-beat, no
-# longer a named floor (never a number chosen to make the drill pass).
 per_tenant_in_flight_cap = 96  # MEASURED: BUS-D7 (P-420) + SUB-D3 + AG-D6 (P-478) held the human lane under the 30× agent-dispatch storm.
 human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 10
 
 [[shed_budgets]]
 surface = "GitFrontDoor"      # the Git clone/push front door (GIT-P15, OQ-K): a CI/agent clone storm
-                              # sheds before a human's interactive fetch (a reserved human fraction).
 per_tenant_in_flight_cap = 128 # MEASURED: GIT-P15 clone-storm sheds the machine lanes before a human fetch at this cap.
 human_lane_reservation = 32    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 5
 
 [[shed_budgets]]
 surface = "RefsBacklinkRead"  # the Refs backlink/traverse READ surface (REF-P22, REF-D10): a CI/agent
-                              # backlink-read storm sheds before a human's interactive backlink/traverse read.
 per_tenant_in_flight_cap = 192 # MEASURED: REF-D10 30× agent backlink-read surge shed the machine lane at this cap; human read held.
 human_lane_reservation = 48    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 3
 
 [[shed_budgets]]
 surface = "RefsRefCreate"     # the Refs ref-CREATION surface (REF-P22, REF-D10): an agent ref-creation
-                              # storm sheds before a human's interactive ref-creation (the per-tenant bulkhead).
 per_tenant_in_flight_cap = 96  # MEASURED: REF-D10 30× agent ref-creation surge shed the machine lane at this cap; human create held.
 human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 5
 
 [[shed_budgets]]
 surface = "SearchQuery"       # the Search QUERY surface (SRCH-P25, SRCH-D6): a CI/agent search-query storm
-                              # sheds before a human's interactive search (the per-tenant bulkhead, §6.3).
 per_tenant_in_flight_cap = 160 # MEASURED: SRCH-D6 30× agent/CI search-query surge shed the machine lanes at this cap; the human search lane held within its interactive latency budget.
 human_lane_reservation = 40    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 3
 
 [[shed_budgets]]
 surface = "WorkflowAgentLane" # the durable-workflow START surface (P-FLOW-27, FLOW-D8): an agent-initiated-workflow
-                              # storm sheds before a human-initiated workflow (the F-8 protected lane, §7.6).
 per_tenant_in_flight_cap = 96  # MEASURED: FLOW-D8 30× agent-initiated-workflow surge shed the agent lane at this cap; the human-initiated workflow lane held within its reserved slots.
 human_lane_reservation = 24    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 10          # generous — a workflow start is not latency-critical; an agent fan-out backs off and re-initiates.
@@ -642,43 +168,11 @@ per_tenant_in_flight_cap = 200 # MEASURED: SUB-D3 (P-S32) + ID-D9 (P-424) held t
 human_lane_reservation = 50    # 25% of cap — above the 20% measured human-lane floor.
 retry_after_secs = 5
 
-# ---------------------------------------------------------------------------------------------
-# [[resilient_client]] — the MEASURED resilient-client per-target tuned values (contract 1.9, §6.3;
-# P-S36 / P-437, M5). The M0 default-per-target floor (P-S16 / P-033, `ResilientConfig::default`)
-# is CLOSED here: the per-target NUMBERS are tuned to what the surge/latency drills MEASURED — the
-# auth hot path gets a TIGHTER timeout than a batch indexer (architecture §6.3 / §8.4 the stated
-# tuning; EI-01 §3 measured-not-predicted). The SHAPE + on-by-default posture are UNCHANGED; only
-# the numbers are tuned.
-#
-# Each row carries `latency_budget_ms`: the MEASURED p99 latency budget for the target (the surge/
-# latency drill number, headroom included). The gate (`Thresholds::validate_resilient_targets`,
-# loaded by `myelin_substrate::thresholds`) enforces TWO invariants the file cannot be hand-edited
-# past:
-#   (1) THE HEADLINE: a tuned `timeout_ms` LOOSER (greater) than its measured `latency_budget_ms`
-#       fails the gate — a deadline beyond the measured budget admits a call past the SLO it was
-#       measured against. NEVER softened (EI-01 §3); a red is a dated [[claimed_not_proven]] row.
-#   (2) THE RELATION: every batch (non-hot-path) target's timeout is STRICTLY looser than the
-#       tightest hot-path target's — the auth-hot-path-tighter-than-batch-indexer rule (§6.3).
-#
-# UNITS: MILLISECONDS (`_ms`, the §6.3 resilient-client unit anchor; distinct from the µs authz
-# budget — a `check` is in-cell µs, the RESILIENT-CLIENT deadline wrapping a network hop is ms).
-#
-# MEASURED + PROVEN GREEN by the surge/latency drills (SUB-D3 P-S32/P-433 + the per-surface tuning
-# P-S33/P-434, 2026-06-24): the auth hot-path (`identity-authz` — the highest-QPS `check`/
-# `list_objects` spine, identity §10/§13) p99 sat far under its 150 ms client-deadline budget under
-# the 30× surge, so its timeout is tuned to 120 ms — TIGHTER than every batch target. The batch
-# indexer (`search-index` — off-hot-path bulk indexing, search-and-indexing §7) measured a p99 of
-# whole seconds, so its budget is 30 s and its timeout 25 s — LOOSER by design (a batch job is not
-# starved by a hot-path deadline). The relation holds: 120 ms (hot) << 25 000 ms (batch).
-# ---------------------------------------------------------------------------------------------
 [[resilient_client]]
 target = "identity-authz"        # the auth HOT PATH: `check`/`list_objects` (the authz spine, the
-                                 # highest-QPS shared call). The TIGHTEST timeout in the set.
 hot_path = true
 latency_budget_ms = 150          # MEASURED: the authz client-deadline budget under the 30× surge
-                                 # (the in-cell `check` p99 is µs; this is the network-hop deadline).
 timeout_ms = 120                 # TUNED tighter than the budget — an authz call past 120 ms is a
-                                 # breaker-feeding failure, never a slow human waiting on a hot path.
 backoff_base_ms = 20             # tight backoff — a hot-path retry must resolve fast or shed.
 max_attempts = 3
 breaker_failure_ratio = 0.5
@@ -715,7 +209,6 @@ bulkhead_max_concurrency = 32    # bounded lower: a blob hop is heavy.
 
 [[resilient_client]]
 target = "search-index"          # the BATCH INDEXER: off-hot-path bulk indexing (search §7). The
-                                 # LOOSEST timeout in the set — the canonical "batch indexer".
 hot_path = false
 latency_budget_ms = 30000        # MEASURED: a bulk index batch p99 is whole seconds.
 timeout_ms = 25000               # LOOSER by design — a batch job is not starved by a hot-path deadline.
@@ -727,27 +220,6 @@ breaker_window = 20
 breaker_open_ms = 10000          # long open window — a batch downstream recovers slowly.
 bulkhead_max_concurrency = 16    # bounded low: a batch index hop is the heaviest.
 
-# ---------------------------------------------------------------------------------------------
-# [[firehose_retention]] — the MEASURED per-stream-class firehose retention window (contract 3.5,
-# architecture event-bus.md §4.3; EB-30 / P-439, M5). EB-21 / P-141 NAMED this as a FLOOR
-# ("named-not-numbered; the window must exceed the p99 reconnect gap; MEASURED + tuned by D-10 in
-# M5"). It is CLOSED here: the firehose is sized for the three heaviest producers (§2.9 item 6 —
-# CI logs (heaviest), the KN collab op-stream + presence, Chat live delivery + presence + agent
-# partials), each with its OWN window because each has a different frame RATE.
-#
-# MEASURED + PROVEN GREEN by D-10 (EB-30, 2026-06-24): the firehose-reconnect drill
-# (`drills_eb21_firehose_d10.rs` + `drills_eb30_retention_and_crdt_boundary.rs`) dropped a subscribed
-# connection mid-stream per class and MEASURED the seq gap a reconnect must backfill; the p99 of that
-# gap is `p99_reconnect_gap_frames`. Each `window_frames` is then sized to EXCEED its measured p99 gap
-# with >= 4x headroom (the §4.3 "comfortably exceeds" posture — too short forces an expensive
-# `resync_required → *.snapshot` rebuild on a routine reconnect; too long costs storage). The
-# HEADLINE invariant `window_frames > p99_reconnect_gap_frames` (with headroom) is asserted from this
-# measured data per class by `retention::tests::every_class_window_exceeds_its_measured_p99_reconnect_gap`
-# AND held in lock-step with `retention::StreamClass::tuning()` by a CDC test (`cdc_3_5_retention.rs`).
-# These are MEASURED defaults-to-beat (ADR-10 / EI-01 §3): a regression needing a LARGER window than
-# measured is a dated `claimed_not_proven` row, NEVER a silently-shrunk window.
-# `class` matches the `retention::StreamClass` token.
-# ---------------------------------------------------------------------------------------------
 [[firehose_retention]]
 class = "ci_log"                  # ci.log.appended — the HEAVIEST producer (§4.3) → the LARGEST window.
 window_frames = 49152            # MEASURED: >= 4x the measured p99 reconnect gap (a high log-line rate).
@@ -756,8 +228,6 @@ p99_reconnect_gap_frames = 12288 # MEASURED: the p99 frames a CI-log reconnect m
 [[firehose_retention]]
 class = "collab_op"              # the KN doc op-stream + presence — a moderate interactive rate.
 window_frames = 8192             # MEASURED: >= 4x the measured p99 gap. UNCHANGED across the KN
-                                 # CAS->CRDT engine_promote boundary (the transport is byte-opaque to
-                                 # the apply engine; D-10 re-greens across the boundary — EB-30).
 p99_reconnect_gap_frames = 2048  # MEASURED: the p99 frames a collab-op reconnect must backfill (D-10).
 
 [[firehose_retention]]
@@ -765,185 +235,26 @@ class = "chat_live"              # Chat live delivery + presence + agent partial
 window_frames = 2048             # MEASURED: >= 4x the measured p99 gap (the smallest of the three).
 p99_reconnect_gap_frames = 512   # MEASURED: the p99 frames a chat-live reconnect must backfill (D-10).
 
-# ---------------------------------------------------------------------------------------------
-# [column_store_seam] — the column-store / time-series promotion seam (BUS-6, event-bus §7.5;
-# P-440 / EB-31, M5). The MEASUREMENT GATE, not a build. The highest-volume durable streams keep a
-# seam for a ClickHouse-class column tier (aligning with the OLAP read store, ADR-10) BEHIND the
-# unchanged `BusTransport` trait (contract 2.1 — put/consume/ack/purge; the swap is a relay-target
-# change, never a consumer rewrite). The canonical posture (event-bus §7.5; EI-04 §5.2) is
-# SPECIFIED-NOT-BUILT: do not add the column tier before the volume is MEASURED.
-#
-# A durable stream is a promotion CANDIDATE iff its MEASURED sustained publish rate exceeds
-# `promote_events_per_sec_per_stream` AND, at that rate, the JetStream tier serves it at a
-# per-aggregate publish-latency p99 over `degraded_publish_latency_p99_ms` (volume alone never
-# promotes — the tier must be measurably DEGRADED at that volume). These are MEASURED-not-predicted
-# CRITERIA a real measurement is compared against, NOT values to tune toward (EI-04 §5.2).
-#
-# `promotion_owed = false` at this commit: NO production stream has been measured to cross both
-# criteria, so the seam stays NAMED — no build, no dated follow-on prompt is owed until a real
-# per-stream volume measurement flips this (EI-01 §3: a seam is not a floor-with-a-follow-on until a
-# measurement makes it one). The decision is `ColumnStoreSeam::promotion_owed_for(rate, p99)`.
-# ---------------------------------------------------------------------------------------------
 [column_store_seam]
 promote_events_per_sec_per_stream = 50000  # MEASURED criterion: a single-stream sustained rate above
-                                           # which a stream is a column-tier promotion candidate.
 degraded_publish_latency_p99_ms = 100      # MEASURED criterion: the per-aggregate publish-latency p99
-                                           # above which JetStream is judged degraded at that volume.
 promotion_owed = false                     # NO measured volume outgrows JetStream → seam stays NAMED.
 
-# ---------------------------------------------------------------------------------------------
-# [search_freshness] — the Search event→searchable freshness budget MEASURED under load (SRCH-D7
-# full-scale; SRCH-P24 / P-459, M5; search-and-indexing §4.10 the seconds-grade p99 freshness budget
-# + the index-lag alarm before user-visible staleness; contract 1.8 the index_lag + freshness-p99
-# telemetry). The M2 CI floor (SRCH-P06) measured the synchronous-pipeline variant; THIS is the
-# full-scale-under-load measure that records the number here.
-#
-# MEASURED + PROVEN GREEN by SRCH-D7 full-scale (P-459, 2026-06-25): the 1×/10×/30× load generator
-# (the agent-skewed surge mix) drove 3000+ real synthetic events through the LIVE indexer
-# (drill_srch_d7_freshness_at_scale.rs). The MEASURED event→searchable p99 under the 30× surge was
-# ~20 ms (debug build, single-host synchronous project→analyze→embed→upsert apply cost) — at 1×/10×/
-# 30× it sat in the 18–23 ms band, with NO regression as the load climbed. That is far under the
-# `freshness_p99_ms` BUDGET below, which is the §4.10 seconds-grade SLO CEILING (the p99 the indexer
-# must hold under, not the observed value — the same budget-vs-observed split as the resilient-client
-# `latency_budget_ms` and `human_lane_p99_budget_us`). Headroom is ~100× — a fleet-hardware /
-# network-delivered run (the one remaining floor) has vast room before it nears the budget. The
-# budget is NOT lowered to the observed 20 ms (that would self-trip on a slower CI host); a regression
-# that pushes the measured p99 past `freshness_p99_ms` is a dated [[claimed_not_proven]] row, never a
-# loosened budget (EI-01 §3).
-#
-# `index_lag_alarm_margin_ms` is how far BELOW the budget the index-lag alarm fires: the alarm trips
-# at `freshness_p99_ms − index_lag_alarm_margin_ms` = 1500 ms, so a building backlog is caught with
-# 500 ms of headroom BEFORE a just-written artifact would be un-findable (the §4.10 "lag alarms
-# before user-visible" posture). The margin MUST be < the budget (the gate rejects a margin ≥ budget
-# as a mis-specified alarm — staleness would precede the alarm). Mirrors
-# `myelin_search::freshness::FRESHNESS_P99_SEED_MS`; this file is its source of truth.
-# ---------------------------------------------------------------------------------------------
 [search_freshness]
 freshness_p99_ms = 2000          # MEASURED-under-load + held: the §4.10 seconds-grade event→searchable
-                                 # p99 BUDGET (SLO ceiling). The 30× surge measured ~20 ms — ~100× of
-                                 # headroom. NOT lowered to the observed value (EI-01 §3).
 index_lag_alarm_margin_ms = 500  # the index-lag alarm fires at 2000−500 = 1500 ms — BELOW the budget,
-                                 # so staleness is caught BEFORE it becomes user-visible (§4.10).
 
-# ---------------------------------------------------------------------------------------------
-# [filtered_ann] — the tuned filtered-ANN strategy MEASURED at scale (SRCH-D8; SRCH-P26 / P-461, M5;
-# search-and-indexing §4.2.2 the filter-during-traversal recall@k + the brute-force-fallback
-# threshold, §3.3 the HNSW↔IVF-PQ promotion point; contract 6.2 the filtered-ANN traversal, 1.8 the
-# recall + zero-escape telemetry). SRCH-P11 (M2) fixed the PROPERTY (k visible neighbours, no leak);
-# THIS records the tuned STRATEGY numbers.
-#
-# MEASURED + PROVEN GREEN by SRCH-D8 (P-461, 2026-06-25): the drill builds a large deterministic HNSW
-# corpus (drill_srch_d8_filtered_ann_recall.rs), applies a VERY selective ACL/structured filter (a
-# handful of scattered visible docs), and compares the filtered-ANN top-k against the brute-force
-# ground truth over the VISIBLE set across many query points. The MEASURED recall@k under the
-# selective filter was EXACTLY 100.00 % (every k-nearest VISIBLE neighbour recovered) with a
-# zero-escape counter of 0 (no hidden doc ever surfaced) — the brute-force fallback (§4.2.2) makes
-# exact recall achievable under a selective filter, so the floor is not a soft 95 %: it is "no visible
-# nearest neighbour is ever DROPPED, no hidden one ever LEAKED".
-#
-# `recall_at_k_bps` is the recall floor in basis points (10000 = 100.00 %): a measured recall BELOW it
-# is a dated [[claimed_not_proven]] row, NEVER a softened bar (EI-01 §3). `brute_force_fallback_visible_bps`
-# is the TUNED selectivity (basis points of visible/total) at/below which the ANN graph walk is presumed
-# to under-fill so Search falls back to brute-force over the small visible set — a COST knob (correctness
-# holds either side: the graph walk is independently leak-safe, the brute pass independently exact).
-# `ivf_pq_promotion_live_vectors` is the §3.3 HNSW→IVF-PQ promotion point: the live per-cell vector count
-# at which the per-cell memory budget triggers the IVF-PQ compression (changes COST/RAM, not correctness
-# — the recall floor still binds). The world-scale fleet run (real per-cell hardware) finalises the exact
-# promotion number — the ONE remaining floor; the cell-class memory budget sets this seed. The real
-# EU-hostable embedding-model adapter is the post-M5 / runtime config swap (the vector math + erasure are
-# done) — named, not built here. Mirrors `myelin_search::filtered_ann::FilteredAnnStrategy` seed constants.
-# ---------------------------------------------------------------------------------------------
 [filtered_ann]
 recall_at_k_bps = 10000               # MEASURED + held: exact recall@k (100.00 %) under a selective
-                                      # filter, 0 leak (SRCH-D8). NOT softened to a 95 % bar (EI-01 §3).
 brute_force_fallback_visible_bps = 2000 # the TUNED very-selective trigger: ≤ 20 % visible ⇒ fall back to
-                                      # brute-force over the small visible set (§4.2.2). Cost knob only.
 ivf_pq_promotion_live_vectors = 1000000 # the §3.3 HNSW→IVF-PQ promotion point (per-cell live vectors);
-                                      # the real per-cell number is the world-scale fleet floor.
 
-# ---------------------------------------------------------------------------------------------
-# [projection_feeder] — the Search-side MEASURED projection-feeder promotion threshold (SRCH-D /
-# SCHED; SRCH-P27 / P-462, M5; search-and-indexing §4.6.1 the projection-feeder promotion, contract
-# 6.3 / OQ-C; reconciliation 00 OQ-C the promotion threshold). The fraction of a collection's view
-# executions a facet must be filtered in (over a rolling window) for Search to promote it from its
-# cold GIN-indexed JSONB scan to a generated/columnar fast-field index.
-#
-# OWNERSHIP (§4.6.1): the OWNER of the per-facet filter-frequency signal is Issues/Knowledge
-# (`myelin_knowledge::FacetTelemetry` / `FACET_PROMOTION_THRESHOLD`); SRCH-P27 is the Search-side
-# CONSUMER that reads the signal and decides promotion for ITS OWN index. This `promotion_ratio` is
-# the SAME OQ-C number (0.05 == > 5 %) the KN-side `[flex_db].facet_promotion_ratio` carries — a
-# Search-owned tunable, NOT a contract constant (§4.6.1), measured never predicted (EI-01 §3).
-#
-# MEASURED + PROVEN GREEN by the SCHED promotion gate (P-462, 2026-06-25,
-# projection_feeder.rs::tests): the gate records view executions against a facet, crosses the
-# measured > 5 % threshold, promotes the facet from the GIN scan to the generated index, and proves
-# the promoted facet's results are BYTE-IDENTICAL across the promotion (promotion changes COST, never
-# correctness — the GIN scan serves correctly meanwhile). A promotion that changed ANY result is a
-# typed RED, never softened. Recorded honestly: the threshold is carried as the OQ-C default-to-beat
-# (the same > 5 % the KN owner measures the frequency against); the PROMOTION MECHANISM + the
-# byte-identical-correctness invariant are MEASURED here.
-#
-# `promotion_ratio` is the > 5 % trigger (STRICTLY greater-than — a facet at EXACTLY 5 % does NOT
-# promote, the frozen §4.6.1 wording). `min_executions` is the rolling-window floor below which the
-# measured frequency is too noisy to act on (1/1 == 100 % is not a hot facet). The world-scale fleet
-# run re-confirms both at a real per-cell collection — the cell-class window sets the seed. Mirrors
-# `myelin_search::projection_feeder::ProjectionFeeder` seed constants.
-# ---------------------------------------------------------------------------------------------
 [projection_feeder]
 promotion_ratio = 0.05  # contract 6.3 / OQ-C: the FROZEN > 5 % trigger Search consumes from Issues/KN
-                        # (strictly greater-than; the same number as [flex_db].facet_promotion_ratio).
 min_executions = 20     # the rolling-window floor: fewer executions is too noisy to promote on.
 
-# ---------------------------------------------------------------------------------------------
-# [timer_wheel_promotion] — the per-cell durable-timer-wheel promotion seam MEASURED at cell scale
-# (FLOW-D3 full; P-FLOW-26 / P-475, M5; durable-workflow §7.3 the millions-of-timers scaling story +
-# reconciliation OQ #5 the per-cell timer-wheel-promotion threshold; contract 9.3 the timer wheel at
-# cell scale / 1.8 the `timer_wheel_lag` telemetry). The minute-bucket PG-indexed wheel (P-FLOW-13)
-# scales to MILLIONS of durable timers for free — a far-future timer sits in a far-future bucket and is
-# NEVER read until its minute (the partial index `(bucket, partition) WHERE NOT fired`), so the per-cell
-# cost is the DUE-NOW rate (timers crossing `bucket <= now` per second), NOT the table size.
-#
-# MEASURED + PROVEN GREEN by FLOW-D3 full (P-475, 2026-06-25, drills_flow_d3_full_1m_timer_wheel.rs):
-# the drill arms 1M+ durable timers (a far-future fleet + a one-minute burst) across N worker shards,
-# ticks the sharded wheel, and proves the due burst fires WITHIN the tick budget (`timer_wheel_lag`
-# drains to 0), the far-future fleet is NEVER scanned (the partial-index range read — `rows_scanned`
-# touched only the due set, not the 1M+ table), two shards never double-claim a timer (the
-# effectively-once fire + the per-partition scan), and a crash re-fires only the unfired (0 lost / 0
-# double-fire). The drill MEASURED the per-cell due-now rate the wheel sustained within budget and
-# recorded it here.
-#
-# This is the OQ #5 MEASUREMENT GATE, not a build (mirrors [column_store_seam]): the per-cell sustained
-# due-now rate above which the PG-indexed wheel yields to a DEDICATED scheduling tier, AND the
-# `timer_wheel_lag` budget the wheel must hold within at that rate. A cell is a promotion CANDIDATE iff
-# its MEASURED due-now rate exceeds `promote_due_now_per_sec_per_cell` AND, at that rate, the measured
-# `timer_wheel_lag` crosses `degraded_wheel_lag_budget` (rate alone never promotes — the wheel must be
-# measurably FALLING BEHIND its tick budget, §7.3 / EI-04 §5.2). `promotion_owed` is `false`: the 1M+
-# run drains its due burst within the tick budget (lag → 0 at the measured rate), so the PG-indexed
-# wheel suffices and NO dedicated scheduling tier is owed — the tier is a NAMED follow-on ONLY if a
-# measured rate demands it (it does not here). The world-scale fleet run (real per-cell hardware) is
-# the ONE remaining floor; the cell-class load-test sets this seed. Mirrors
-# `myelin_flow::timer::TimerWheelPromotion` seed constants. This row CLOSES the P-FLOW-13 100k-timer
-# FLOOR (the seven-figure follow-on is now proven).
-# ---------------------------------------------------------------------------------------------
 [timer_wheel_promotion]
 promote_due_now_per_sec_per_cell = 100000 # §7.3 / OQ #5: the per-cell sustained due-now fire rate above
-                                          # which the PG-indexed wheel yields to a dedicated scheduling
-                                          # tier (MEASURED, never predicted — the criterion a real
-                                          # per-cell rate is compared against, not a value to beat).
 degraded_wheel_lag_budget = 0             # the `timer_wheel_lag` budget: any due timer left unfired past
-                                          # its minute at the candidate rate is "degraded" (the SECOND
-                                          # half of the trigger — rate alone never promotes).
 promotion_owed = false                    # the 1M+ FLOW-D3-full run drained within the tick budget
-                                          # (lag → 0) → the PG-indexed wheel suffices, no dedicated tier
-                                          # owed (the dedicated scheduler is a NAMED follow-on iff a
-                                          # measured rate demands it).
 
-# ---------------------------------------------------------------------------------------------
-# [[claimed_not_proven]] — the scorecard (EI-01 §3, roadmap §5). A drill that comes back RED is
-# recorded HERE as a dated row with an owner and the follow-on, and is NEVER edited green: the
-# threshold it gates stays unchanged; the row stays until the deliverable is genuinely repaired
-# and the drill reads green at the un-weakened threshold. An EMPTY list means every shipped M0
-# drill is green-at-threshold (the honest state at this commit).
-# Each row: { gate, threshold_key, date, owner, note }.
-# ---------------------------------------------------------------------------------------------
-# (none — every shipped M0 drill is green at its threshold as of `as_of`.)

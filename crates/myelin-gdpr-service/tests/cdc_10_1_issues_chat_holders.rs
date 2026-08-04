@@ -1,22 +1,3 @@
-//! # CDC 10.1 — the Issues (H3) + Chat (H5) consumer-holder fan-out (P-GA-30 → P-333)
-//!
-//! **Contract:** index row 10.1 — the `PersonalDataHolder` fan-out. This prompt owns the
-//! ORCHESTRATION leg over the M4 CONSUMER subsystems (the impls are Issues'/Chat's; GDPR REGISTERS
-//! them + CALLS them in the canonical erase order with their per-derivative cascades). This is the
-//! consumer-driven contract test the coverage scanner (P-S21) reads both halves of:
-//!
-//! - **provider** = the consumer holders AS `PersonalDataHolder`s (`myelin_gdpr_service::
-//!   IssuesStoreHolder` / `ChatStoreHolder`) — each responds to the five-op contract for a subject;
-//!   `erase` crypto-shreds the per-subject free-text / message-body DEK (Chat reaching hot + cold).
-//! - **consumer** = the DSR ORCHESTRATOR (the fan-out, P-GA-12 / P-GA-06) — it registers H3/H5 through
-//!   `IssuesChatCascadeDriver::register_issues_chat` at their canonical phases and fans the erase out,
-//!   collecting each holder's receipt. It never reaches into a consumer store (the no-cross-store-read
-//!   law — it holds only `&dyn PersonalDataHolder`).
-//!
-//! The dated green artifact (2026-06-22): the orchestrator fans to the two consumer holders + those
-//! holders respond with content-addressed receipts; the fan-out reaches every one (100% coverage). If
-//! 10.1's holder-contract shape drifts, this stops compiling/passing — that is the contract.
-
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef, TenantId};
 use myelin_gdpr_service::{
     issues_chat_phase_of, CanonicalErasePhase, ChatStoreHolder, ChatStoreModel, EraseChecklist,
@@ -39,7 +20,6 @@ fn subject(id: &str) -> SubjectRef {
 
 #[test]
 fn provider_consumer_holders_respond_to_the_orchestrator_fan_out() {
-    // PROVIDER: the two consumer holders over a faithful crypto-shred KMS + models.
     let kms = InMemoryShredKms::new();
     kms.provision(
         ShredKeyHandle {
@@ -56,7 +36,6 @@ fn provider_consumer_holders_respond_to_the_orchestrator_fan_out() {
     let issues_h = IssuesStoreHolder::new(&issues, &kms);
     let chat_h = ChatStoreHolder::new(&chat, &kms);
 
-    // CONSUMER: the DSR orchestrator registers H3/H5 at their canonical phases + fans out.
     let consumers = IssuesChatCascadeDriver::register_issues_chat(vec![
         (ISSUES_DB, &issues_h as &dyn PersonalDataHolder),
         (CHAT_DB, &chat_h),
@@ -70,7 +49,6 @@ fn provider_consumer_holders_respond_to_the_orchestrator_fan_out() {
     };
     let receipts = orch.fan_out_erase(&scope, &checklist).unwrap();
 
-    // The provider+consumer pair: the orchestrator fanned to both; each responded.
     assert_eq!(
         receipts.len(),
         2,
@@ -95,7 +73,6 @@ fn provider_consumer_holders_respond_to_the_orchestrator_fan_out() {
 
 #[test]
 fn the_consumer_phases_are_the_frozen_canonical_coordinates() {
-    // The consumer registers H3/H5 at the free-text crypto-shred phase (both shred a per-subject DEK).
     assert_eq!(
         issues_chat_phase_of(ISSUES_DB),
         Some(CanonicalErasePhase::CryptoShredDek)
@@ -104,6 +81,5 @@ fn the_consumer_phases_are_the_frozen_canonical_coordinates() {
         issues_chat_phase_of(CHAT_DB),
         Some(CanonicalErasePhase::CryptoShredDek)
     );
-    // An unknown holder declares no phase.
     assert_eq!(issues_chat_phase_of("not_a_consumer_store"), None);
 }

@@ -1,25 +1,3 @@
-//! # CDC pair — contract 10.1 (the Chat holder `erase`) + 11.4 (per-subject-DEK crypto-shred) +
-//! 10.4 (the DSR cascade via the bus) for the Chat erase fan-out (CHAT-P22 / P-411, M4-C8)
-//!
-//! **The three contract halves this artifact proves (the prompt's GATE):**
-//! - **10.1 — the Chat `PersonalDataHolder` erase path.** PROVIDER: the Chat erase fan-out
-//!   ([`myelin_chat::ChatErasureCascade`]) produces a COMPLETE per-store receipt set (one per
-//!   registered Chat holder store) + the aggregate [`myelin_gdpr::EraseReceipt`] the frozen 10.1
-//!   `erase(scope)` returns. CONSUMER: the DSR-orchestrator-facing surface asserts the receipt set is
-//!   complete (0 holders missed) and content-addressed.
-//! - **11.4 — per-subject-DEK crypto-shred.** PROVIDER: the cascade destroys the subject's per-subject
-//!   body/draft DEK over the ONE [`myelin_storage::kms::KmsEngine`]. CONSUMER: a read-side that finds
-//!   every body the subject authored is now unrecoverable ciphertext (the GD-4 individual lever — the
-//!   tenant's other subjects untouched).
-//! - **10.4 — the DSR cascade via the bus (never a backdoor).** PROVIDER: the cascade emits a
-//!   `chat.message.erased` event per record through the OUTBOX. CONSUMER: a derivative-facing reader
-//!   sees the tombstones on the bus (the cascade Search/Refs/Notif consume) — Chat never writes their
-//!   stores.
-//!
-//! The provider + consumer are the SAME frozen shapes (one KmsEngine, one holder trait, one outbox —
-//! EI-01 §7), proven DB-free. The live-Postgres / live-bus round-trip is the `integration`-feature
-//! artifact (the CHAT-P6 subject-DEK integration lever + the bus relay drills).
-
 use myelin_chat::{
     aggregate_receipt, encrypt_body, is_body_unrecoverable, AuthorKind, ChatErasureCascade,
     ChatFreeText, ConversationId, MemDraftStore, MemHotTier, MessageId, MessageStore, NewMessage,
@@ -98,15 +76,9 @@ fn append(
     id
 }
 
-// ───────────────────────────── 11.4 — per-subject-DEK crypto-shred ─────────────────────────────
-
-/// **PROVIDER (11.4) + CONSUMER: the cascade crypto-shreds the subject's DEK so their body is
-/// unrecoverable, while ANOTHER subject's body (distinct DEK) stays recoverable (the GD-4 individual
-/// lever).**
 #[test]
 fn cdc_11_4_provider_consumer_per_subject_dek_individual_lever() {
     let kms = KmsEngine::new();
-    // Two subjects' bodies, each under their OWN per-subject DEK.
     let ada = encrypt_body(
         &kms,
         &region(),
@@ -145,22 +117,16 @@ fn cdc_11_4_provider_consumer_per_subject_dek_individual_lever() {
     );
     tx.commit().expect("commit");
 
-    // CONSUMER: ada's body is unrecoverable; bo's (distinct DEK) is untouched (individual lever).
     assert!(
         is_body_unrecoverable(&kms, &region(), &ada),
-        "11.4: ada's per-subject DEK is shredded — 0 recoverable"
+        "11.4: ada's per-subject DEK is shredded - 0 recoverable"
     );
     assert!(
         !is_body_unrecoverable(&kms, &region(), &bo),
-        "11.4 GD-4: bo's distinct per-subject DEK is untouched — only ada was erased"
+        "11.4 GD-4: bo's distinct per-subject DEK is untouched - only ada was erased"
     );
 }
 
-// ───────────────────────────── 10.4 — the DSR cascade via the bus ─────────────────────────────
-
-/// **PROVIDER (10.4): the cascade emits a `chat.message.erased` per record through the OUTBOX (the
-/// bus + DSR path).** CONSUMER: a derivative-facing reader sees exactly those tombstones on the bus —
-/// the only cross-subsystem effect (no backdoor).
 #[test]
 fn cdc_10_4_provider_consumer_cascade_rides_the_bus_not_a_backdoor() {
     let kms = KmsEngine::new();
@@ -186,7 +152,6 @@ fn cdc_10_4_provider_consumer_cascade_rides_the_bus_not_a_backdoor() {
     );
     tx.commit().expect("commit");
 
-    // CONSUMER: exactly two chat.message.erased on the bus — the cascade the derivatives consume.
     let erased = outbox
         .committed_rows()
         .into_iter()
@@ -204,11 +169,6 @@ fn cdc_10_4_provider_consumer_cascade_rides_the_bus_not_a_backdoor() {
     assert!(report.cascade_published);
 }
 
-// ───────────────────────────── 10.1 — the holder erase path ─────────────────────────────
-
-/// **PROVIDER (10.1): the cascade produces a COMPLETE per-store receipt set + the aggregate
-/// `EraseReceipt`.** CONSUMER: the DSR-orchestrator asserts the set is complete (0 holders missed)
-/// and the aggregate is content-addressed (the audit-log hash-link).
 #[test]
 fn cdc_10_1_provider_consumer_complete_holder_receipt_set() {
     let kms = KmsEngine::new();
@@ -228,10 +188,9 @@ fn cdc_10_1_provider_consumer_complete_holder_receipt_set() {
     let report = cascade.erase(&mut tx, &scope, &[]);
     tx.commit().expect("commit");
 
-    // CONSUMER: the receipt set is complete + content-addressed; the aggregate folds it (10.1).
     assert!(
         report.receipts_complete(),
-        "10.1: every registered Chat store got an erase receipt — 0 holders missed"
+        "10.1: every registered Chat store got an erase receipt - 0 holders missed"
     );
     let agg = aggregate_receipt(&report, &scope);
     assert_eq!(agg.receipt.operation, "erase");
@@ -239,18 +198,12 @@ fn cdc_10_1_provider_consumer_complete_holder_receipt_set() {
         agg.receipt.content_hash.starts_with("blake3:"),
         "10.1: the aggregate erase receipt is content-addressed (the audit hash-link)"
     );
-    // The destroyed-key epoch is folded into the content-address (a receipt cannot claim an epoch it
-    // did not address) — the post-restore re-erase audit trail (10.8).
     assert_eq!(agg.receipt.key_epoch_destroyed, report.destroyed_key_epoch);
 }
 
-/// **The crypto-shredded DEK is excluded from the backup (11.4 / §7.5) — the receipt's destroyed
-/// epoch matches the DEK that no longer round-trips.** Ties the 10.1 receipt to the 11.4 shred: the
-/// epoch the receipt records is the epoch of the DEK now absent from the backup snapshot.
 #[test]
 fn cdc_11_4_10_1_destroyed_epoch_matches_the_excluded_backup_dek() {
     let kms = KmsEngine::new();
-    // Seal a body so the subject's DEK exists (with an epoch).
     let _col = encrypt_body(
         &kms,
         &region(),

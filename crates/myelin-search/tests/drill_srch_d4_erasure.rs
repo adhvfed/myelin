@@ -1,35 +1,3 @@
-//! # Drill — SRCH-D4 (CI variant): erasure reaches the index — 0 recoverable incl. vectors
-//! (SRCH-P15 → P-178)
-//!
-//! **Drill source:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` SRCH-D4
-//! (erasure-reaches-search: erase a subject; assert every doc/field/**vector/embedding** purged — not
-//! hidden — and unrecoverable; **no orphan embedding**; gate: **0 recoverable personal data
-//! post-erasure, incl. vectors**). **Architecture:** `search-and-indexing.md` §4.8 (erase = PURGE +
-//! RE-INDEX not hide; vectors tombstoned + compacted; the `*.erased` tombstone drives the purge via
-//! the SAME live consumer path — no erasure backdoor) + §3.3 (soft-delete-then-compact, 0 orphan).
-//!
-//! ## What this drill proves (the dated green artifact, 2026-06-20)
-//! A moderate corpus of knowledge pages is indexed through the **live indexer** (the only ingest
-//! path), with semantic vectors. Several docs reference a data subject `u-target` (by an `actor`
-//! subject-locator facet, by an `assignee` facet, by the subject's `.noreply` pseudonym in the body)
-//! and the rest do not. The DSR fan-out calls the Search holder's `erase(subject)`. After the erase:
-//! - every referencing doc is **GONE from full-text search** (not hidden — a `WHERE`-everything admin
-//!   query returns 0 of them);
-//! - every referencing doc's **VECTOR is gone** from the co-located HNSW shape (a k-NN aimed straight
-//!   at the erased text returns 0 of them);
-//! - **0 orphan embedding** survives the compaction (the erasure-critical GATE — embeddings are
-//!   personal data, erased with their source);
-//! - the **unrelated docs are untouched** (the erase is surgical, not a blanket wipe — so a green is
-//!   not a "deleted everything" artefact);
-//! - the purge rode the **live consumer path** (`*.erased` → the indexer's `index()`), no backdoor.
-//!
-//! ## Floor named
-//! This is the **CI-scale** variant. The full **backup-level** erasure proof (SRCH-D4 at backup scale,
-//! folded into the M5 DSAR fan-out E2E-4) is the follow-on **SRCH-P29 / SRCH-P32** (P-422). The
-//! reindex-from-source rebuild of the surviving artifact (after the subject's docs are purged) is the
-//! sibling slice **SRCH-P16** (P-179); post-erase re-erasure after a reindex does not resurrect the
-//! subject (proven jointly there).
-
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -63,7 +31,6 @@ fn subject(id: &str) -> SubjectRef {
     ))
 }
 
-/// A semantic page spec with `actor`/`assignee` subject-locator facets.
 fn page_spec() -> IndexSpec {
     let mut fields = BTreeMap::new();
     fields.insert("actor".to_string(), FieldType::Principal);
@@ -71,7 +38,6 @@ fn page_spec() -> IndexSpec {
     IndexSpec::new("knowledge", "page", fields).semantic()
 }
 
-/// A scripted ProjectFetcher over a ref → projection map; absent ⇒ Gone.
 struct Fetcher {
     map: std::sync::Mutex<std::collections::HashMap<String, myelin_search::SearchProjection>>,
 }
@@ -132,8 +98,6 @@ fn assignee(id: &str) -> BTreeMap<String, FieldValue> {
     f
 }
 
-/// **SRCH-D4 (CI): erase a subject ⇒ 0 recoverable personal data incl. vectors; 0 orphan embedding;
-/// the unrelated docs untouched; the purge rode the live consumer path.**
 #[test]
 fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
     let target = subject("u-target");
@@ -141,7 +105,6 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
         .expect("pseudonym")
         .render();
 
-    // The corpus: 5 docs reference u-target (actor / assignee / pseudonym-mention), 20 do not.
     let mut docs: Vec<(String, myelin_search::SearchProjection)> = Vec::new();
     docs.push((
         "myelin://acme/knowledge/page/t-owned".into(),
@@ -173,10 +136,8 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
     ));
     docs.push((
         "myelin://acme/knowledge/page/t-acl".into(),
-        // acl_object == the subject id (a doc pinned on the subject).
         proj("a page owned directly by the subject", BTreeMap::new()),
     ));
-    // The 20 unrelated docs (different authors, no mention).
     for i in 0..20 {
         docs.push((
             format!("myelin://acme/knowledge/page/u{i}"),
@@ -187,11 +148,6 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
         ));
     }
 
-    // The t-acl doc's doc_id is NOT the subject id; instead give it an acl_object == subject via its
-    // ref-key. The matcher matches acl_object == subject id, so index it under a ref whose acl_object
-    // resolves to the subject. (Simpler: rely on the four facet/pseudonym/owned docs being matched;
-    // assert ≥ 4 referencing docs are purged.) Drop t-acl from the "must purge" set below — it does
-    // not carry the subject id as acl_object here. So we count 4 referencing docs.
     docs.retain(|(d, _)| !d.ends_with("t-acl"));
 
     let map: std::collections::HashMap<String, myelin_search::SearchProjection> =
@@ -214,7 +170,6 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
         "the whole corpus indexed"
     );
 
-    // Pre-erase: the subject's referencing docs are located + reachable by FT + by vector.
     let matcher = SubjectMatcher::new("u-target", Some(pseudonym.clone()));
     let referencing = ix.locate_subject(&tenant(), &region(), &matcher);
     assert_eq!(
@@ -233,7 +188,6 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
         "the subject's doc is reachable by k-NN before erase"
     );
 
-    // The DSR fan-out: erase the subject through the Search holder (the contract surface).
     let kms = Arc::new(KmsEngine::new());
     let pin = SearchDekPin::new(kms);
     pin.reserve(&tenant(), &region())
@@ -252,8 +206,6 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
         "content-addressed receipt"
     );
 
-    // ── GATE: 0 recoverable personal data incl. vectors ──────────────────────────────────────────
-    // (1) every referencing doc is GONE from the index (not hidden).
     let post_located = ix.locate_subject(&tenant(), &region(), &matcher);
     assert!(
         post_located.is_empty(),
@@ -265,7 +217,6 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
         "exactly the four referencing docs were purged; the rest survive"
     );
 
-    // (2) the erased docs are gone from FULL-TEXT search.
     let ft = ix
         .search_ft(&tenant(), &region(), &AclFilter::All, "raft leadership", 30)
         .expect("ft");
@@ -274,7 +225,6 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
         "the erased doc is GONE from full-text search (0 recoverable via FT)"
     );
 
-    // (3) the erased docs' VECTORS are gone from the co-located HNSW shape.
     let post = ix
         .search_semantic(&tenant(), &region(), &AclFilter::All, &q, 30)
         .expect("semantic post");
@@ -285,13 +235,11 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
         );
     }
 
-    // (4) 0 orphan embedding survives the compaction (the erasure-critical GATE).
     assert!(
         !ix.has_orphan_embedding(&tenant(), &region()),
         "0 orphan embedding after the erase compaction (embeddings purged with their source, §3.3)"
     );
 
-    // (5) the unrelated docs are untouched (surgical erase, not a blanket wipe).
     let unrelated = ix
         .search_ft(&tenant(), &region(), &AclFilter::All, "paxos", 30)
         .expect("ft unrelated");
@@ -302,10 +250,6 @@ fn srch_d4_erase_leaves_zero_recoverable_including_vectors() {
     );
 }
 
-/// **The `*.erased` tombstone drives the purge via the SAME live consumer path — NO erasure backdoor
-/// (the prompt's CI gate).** A real owner-emitted `knowledge.page.erased` and the holder's synthetic
-/// erase event BOTH remove a doc through the indexer's public `index()` path — there is no private
-/// backend `delete` the holder reaches around the consumer to call.
 #[test]
 fn srch_d4_erase_tombstone_rides_the_live_consumer_path() {
     let r = "myelin://acme/knowledge/page/p1";
@@ -324,7 +268,6 @@ fn srch_d4_erase_tombstone_rides_the_live_consumer_path() {
     ix.index(&created_event(r)).expect("index");
     assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
-    // A real owner `*.erased` removes it through the live consumer path.
     let mut erased = created_event(r);
     erased.type_ = EventType("knowledge.page.erased".into());
     erased.payload = serde_json::json!({ "ref": r });

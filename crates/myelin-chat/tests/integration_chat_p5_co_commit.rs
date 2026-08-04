@@ -1,29 +1,3 @@
-//! **CHAT-P5 / P-399 — the outbox CO-COMMIT + idempotent send + per-conversation total order,
-//! PROVEN against the live dev-stack Postgres (contract 2.2 / 2.3; the silent-data-loss floor).**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-chat --features integration \
-//!     --test integration_chat_p5_co_commit -- --nocapture
-//!
-//! This is the GATE's REAL-DATA leg for CHAT-D13 / CHAT-D14 / CHAT-D2. It proves, against REAL
-//! Postgres (the `message` hot tier + the frozen `outbox` table) + the real
-//! `myelin_storage::PgRelay` drain:
-//!
-//! 1. **CHAT-D13 (the co-commit proof):** `append_co_commit` writes the message row AND the
-//!    `chat.message.created` outbox row in ONE DB transaction — after a SUCCESSFUL append BOTH are
-//!    present (0 orphan messages, 0 phantom events); after a FAILED co-commit (a poisoned tx)
-//!    NEITHER is present. The relay drains the committed row to the bus exactly once (0 orphan / 0
-//!    phantom on the broker side too).
-//! 2. **CHAT-D14 (idempotent send → exactly ONE message AND ONE event):** a retried `client_nonce`
-//!    co-commits nothing new — message-count = 1, outbox-event-count = 1.
-//! 3. **CHAT-D2 (per-conversation total order):** a burst of co-committed sends to one conversation
-//!    yields contiguous, gap-free, no-dup per-aggregate seqs (`aggregate = conversation_id`).
-//!
-//! The drill is registered red-until-proven and flips green ONLY here, against the live stack —
-//! never mocked.
 #![cfg(feature = "integration")]
 
 use myelin_chat::store::pg::PgMessageStore;
@@ -70,8 +44,6 @@ fn new_msg(conv: &ConversationId, nonce: &str, author: &str, body: &str) -> NewM
     }
 }
 
-/// A fresh stable ULID event_id per send (the broker-side dedup key; production mints this from the
-/// shared clock+random source — here a counter is sufficient for the dedup property).
 fn event_id(n: usize) -> EventId {
     EventId(format!("01JCHATP399{n:020}"))
 }
@@ -90,12 +62,9 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
     let suffix = std::process::id();
     let table = format!("message_p399_{suffix}");
 
-    // The message hot tier (the frozen DDL + RLS).
     let store = PgMessageStore::new(admin.clone(), region(), table.clone());
     store.migrate().await.expect("apply the message DDL + RLS");
 
-    // The frozen `outbox` table (run, not re-defined — the shared 2.3 shape). Scope the outbox to
-    // THIS run's conversation aggregates so a shared dev outbox table does not cross-contaminate.
     sqlx::raw_sql(myelin_events::OUTBOX_MIGRATION)
         .execute(&admin)
         .await
@@ -104,14 +73,12 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
     let conv = ConversationId::new("acmeP399", region(), format!("01J0CONVP399{suffix}"));
     let src = MonotonicUlidSource::new();
 
-    // Clean any prior rows for this aggregate (re-runnable).
     sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
         .bind(&conv.conversation_id)
         .execute(&admin)
         .await
         .ok();
 
-    // ── 1. CHAT-D13 (the happy co-commit): append_co_commit writes BOTH the message + the event ──
     let id0 = store
         .append_co_commit(
             &src,
@@ -124,7 +91,6 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         .await
         .expect("co-commit append");
 
-    // The message row is present.
     let msg_count: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {table} WHERE conversation_id = $1"
     ))
@@ -137,7 +103,6 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         "CHAT-D13: the message row is present after co-commit"
     );
 
-    // The co-committed outbox event is present — references-only, aggregate = conversation_id.
     let ob_rows = sqlx::query(
         "SELECT event_id, aggregate, seq, subject, envelope FROM outbox WHERE aggregate = $1 ORDER BY seq",
     )
@@ -165,7 +130,6 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         0,
         "first event for the aggregate is seq 0"
     );
-    // References-not-payloads: the body NEVER rides the bus.
     let payload_str = envelope["payload"].to_string();
     assert!(
         !payload_str.contains("hello world"),
@@ -176,7 +140,6 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         "subject is the stable message-<id> #sub anchor"
     );
 
-    // The relay drains the committed row to the bus exactly once (0 orphan / 0 phantom broker-side).
     let relay = PgRelay::new(admin.clone());
     let bus = InProcessBus::new();
     let drained = relay.relay_once(&bus, 64).await.expect("relay drain");
@@ -195,7 +158,6 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         "the outbox drains to depth 0 (0 orphan)"
     );
 
-    // ── 2. CHAT-D14: a retried nonce co-commits NOTHING new (1 message, 1 event) ─────────────────
     let id0_retry = store
         .append_co_commit(
             &src,
@@ -230,7 +192,6 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         "CHAT-D14: exactly one event (the retry emitted none)"
     );
 
-    // ── 3. CHAT-D2: a burst of co-committed sends → contiguous, gap-free per-aggregate seqs ──────
     const N: usize = 24;
     for i in 1..=N {
         store
@@ -251,13 +212,12 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         .await
         .unwrap();
     seqs.sort_unstable();
-    let expected: Vec<i64> = (0..=N as i64).collect(); // seq 0 (the first send) .. N
+    let expected: Vec<i64> = (0..=N as i64).collect();
     assert_eq!(
         seqs, expected,
         "CHAT-D2: per-conversation seqs are contiguous + gap-free + no-dup (0 ordering violations)"
     );
 
-    // ── cleanup ──────────────────────────────────────────────────────────────────────────────────
     sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
         .bind(&conv.conversation_id)
         .execute(&admin)

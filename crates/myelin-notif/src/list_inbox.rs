@@ -1,67 +1,3 @@
-//! # `list_inbox` — the ONE inbox + the scoped-view filter grammar (the C-9 invariant) (NOTIF-P5 / P-183, M2)
-//!
-//! **Owning architecture doc:** `notifications.md` §1.3 (the C-9 resolution — there is exactly ONE
-//! cross-subsystem inbox; Issues **"My Work"**, Chat **"Activity/Mentions"**, Git **"Review
-//! requests"** are *scoped, filtered queries INTO this one inbox*, each a `filter` over the item's
-//! structured `reason` + `subject`, **never a second store** — one store → one read-state truth),
-//! §1.4 (agents have inboxes too — an agent is a `Principal`), §3.4 step-0 (AUTHORIZE: a
-//! notification is a *read* of the subject on the recipient's behalf; it obeys `check` exactly —
-//! ADR-03, never leak). **Contracts:** **7.1** `list_inbox(principal, filter?, page?) → [InboxItem]`
-//! (owned), **4.2** `check` (consumed, the step-0 read authorize), **4.10** zookie (consumed, the
-//! consistency token a security-sensitive read carries). **External insight:**
-//! `01-process-and-quality-doctrine.md` §3 (prove-it — the C-9 invariant test forces the "a view is
-//! a subset" property), §5 (an uncommitted contract test is no contract test).
-//!
-//! ## What this prompt (NOTIF-P5) ships — the read surface + the filter grammar, nothing else
-//!
-//! 1. **`list_inbox(principal, filter?, page?)` — the ONE inbox.** It reads the SAME
-//!    [`InboxProjection`](crate::router::InboxProjection) the router (NOTIF-P3) UPSERTs into (no
-//!    second store): it selects the rows whose `recipient` is the calling `principal`, applies the
-//!    optional [`InboxFilter`] (the C-9 scoped-view grammar), runs **step-0 read authorize** over
-//!    each candidate's `subject` (an item the recipient cannot see is NOT returned, ADR-03), and
-//!    returns the survivors in a **stable order** with a page [`Cursor`].
-//!
-//! 2. **The scoped-view filter grammar (the C-9 invariant).** [`InboxFilter`] is a filter over
-//!    `subsystem` (derived from the item's `subject` `ArtifactRef`) **and** `reason` — never a
-//!    second store. The three frozen platform views ([`InboxFilter::issues_my_work`],
-//!    [`InboxFilter::chat_activity`], [`InboxFilter::git_review_requests`]) are exactly the §1.3
-//!    table. **A subsystem that wants its own "my X" surface adds a filtered view, never a second
-//!    store** — proven by the C-9 invariant test (every view's rows ⊆ `list_inbox(filter=∅)`).
-//!
-//! ## FLOORS named (this read surface is NOT the ranked inbox)
-//!
-//! - **Ranking is NOTIF-P7.** Here items return in a **stable, deterministic order** (the
-//!   unranked-but-stable order: `(occurred-tiebreak via dedup_key, item_id)`), with the page cursor.
-//!   The deterministic explainable priority-0..100 ranking layers in as the ORDERING in NOTIF-P7 —
-//!   the function plugs into this same `list_inbox` body. Named so the read surface is not mistaken
-//!   for the ranked inbox.
-//! - **The durable OLTP `SELECT … WHERE tenant=$1 AND recipient=$2` over the `notif_inbox_item`
-//!   table** (behind the in-memory [`InboxProjection`]) is the substrate floor (P-007 / P-S12 — the
-//!   OLTP client wiring into `serve`); the in-memory projection models exactly that read
-//!   (tenant-scoped, recipient-scoped), and the filter/authorize/order logic is byte-identical when
-//!   the read moves to SQL (the filter lowers to a `WHERE reason = ANY(...)` + the authorize lowers
-//!   to the `list_objects` `SetExpr` JOIN, contract 4.3 — the read-fanout push-down is NOTIF-P13).
-//! - **read-state (`mark`/`snooze`/`mark_all_read`) is NOTIF-P6**; **prefs/quiet-hours** NOTIF-P10;
-//!   **the inbox `watch` live transport** NOTIF-P15. This is the read surface only.
-//!
-//! ## Mutation floor (the list-inbox module — mandatory-core)
-//! `list_inbox` is mandatory-core (the platform's ONE read surface). The mutation-tested core is the
-//! decision logic: the `recipient`-scoping (an item NOT for the principal is not returned), the
-//! `InboxFilter::matches` predicate (subsystem ∧ reason — the C-9 grammar), the
-//! [`subsystem_of`]-from-`subject` derivation, the step-0 authorize gate (a denied `check` drops the
-//! item — never leaked, ADR-03), and the stable order + page slice. **Floor: ≥ 80% line/branch
-//! mutation score on `list_inbox.rs`** (measured with `cargo mutants`; reported in the P-183 commit
-//! body). The floor is **stated and met** by the unit + chained + CDC tests: every view is asserted
-//! a subset, an unauthorized item is asserted dropped, a not-for-me item is asserted excluded, and a
-//! mutant that widens a filter, skips the authorize, mis-derives the subsystem, breaks the recipient
-//! scope, or dangles the page cursor is caught.
-//!
-//! **Measured (P-183):** `cargo mutants --file crates/myelin-notif/src/list_inbox.rs` → 24 mutants,
-//! **20 caught / 1 missed / 3 unviable** = **95.2% on the 21 viable** (≥ 80% floor MET). The single
-//! miss is the **provably-equivalent** mutant `InboxFilter::all -> Default::default()` — `all()` IS
-//! defined as `InboxFilter::default()`, so the two are byte-identical and no test can distinguish
-//! them (an equivalent mutant, not a coverage gap).
-
 use std::collections::HashSet;
 
 use myelin_events::ArtifactRef;
@@ -70,46 +6,23 @@ use myelin_identity::{Consistency, Decision, Principal};
 use crate::router::{InboxProjection, RoutedInboxItem};
 use crate::Reason;
 
-/// The **subsystem** an inbox item belongs to — derived from the item's `subject`
-/// [`ArtifactRef`] (`myelin://<tenant>/<subsystem>/<type>/<id>`), the second path segment. The C-9
-/// scoped-view filter pins on `subsystem ∧ reason` (§1.3): Issues "My Work" is `subsystem∈{issue}`,
-/// Chat "Activity" is `subsystem∈{chat}`, Git "Review requests" is `subsystem∈{git}`. This is NOT a
-/// stored column on the row — it is *derived from the ref* (references-not-payloads, NOTIF-1), so a
-/// view stays a filter over the structured `subject`, never a second store.
-///
-/// An unknown / malformed ref derives [`Subsystem::Unknown`] (it is never silently bucketed into a
-/// known subsystem — a filter over a known subsystem set must never accidentally admit it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Subsystem {
-    /// The Issues subsystem (`myelin://<tenant>/issue/...` / `.../issues/...`).
     Issue,
-    /// The Chat subsystem (`myelin://<tenant>/chat/...`).
     Chat,
-    /// The Git-hosting subsystem (`myelin://<tenant>/git/...`).
     Git,
-    /// The Knowledge subsystem (`myelin://<tenant>/kn/...` / `.../knowledge/...`).
     Knowledge,
-    /// The CI subsystem (`myelin://<tenant>/ci/...`).
     Ci,
-    /// Any other / unrecognised subsystem (the ref's second segment is not a known subsystem). A
-    /// view over a KNOWN subsystem set NEVER admits this (the filter is a strict membership test).
     Unknown,
 }
 
-/// **Derive the [`Subsystem`] from an item's `subject` [`ArtifactRef`]** — the second path segment
-/// of `myelin://<tenant>/<subsystem>/<type>/<id>`. The C-9 filter pins on this *derived* value, so
-/// the scoped view is a filter over the structured `subject` (references-not-payloads), never a
-/// second store. A malformed / unknown ref → [`Subsystem::Unknown`] (never silently a known
-/// subsystem — a filter over `{issue}` must not accidentally admit a `myelin://acme/foo/...` ref).
 pub fn subsystem_of(subject: &ArtifactRef) -> Subsystem {
-    // myelin://<tenant>/<subsystem>/<type>/<id> — strip the scheme, take the segment AFTER tenant.
     let rest = match subject.0.strip_prefix("myelin://") {
         Some(r) => r,
         None => return Subsystem::Unknown,
     };
-    // segments: [tenant, subsystem, type, id, ...] — the subsystem is the SECOND segment.
     let mut segs = rest.split('/');
-    let _tenant = segs.next(); // the tenant segment (already the partition key; not the subsystem).
+    let _tenant = segs.next();
     match segs.next() {
         Some("issue") | Some("issues") => Subsystem::Issue,
         Some("chat") => Subsystem::Chat,
@@ -120,34 +33,17 @@ pub fn subsystem_of(subject: &ArtifactRef) -> Subsystem {
     }
 }
 
-/// **The scoped-view filter grammar (the C-9 invariant).** A filter over `subsystem` (derived from
-/// `subject`) **and** `reason` — never a second store. `subsystems = None` means "any subsystem";
-/// `reasons = None` means "any reason"; the empty/`None` filter ([`InboxFilter::all`]) is the
-/// canonical unfiltered inbox. A view is a STRICT SUBSET of the unfiltered inbox by construction:
-/// [`InboxFilter::matches`] only ever NARROWS (it never adds a row), so every view's rows ⊆
-/// `list_inbox(filter=∅)` — the property the C-9 invariant test forces.
-///
-/// The three frozen platform views (§1.3) are the constructors [`InboxFilter::issues_my_work`],
-/// [`InboxFilter::chat_activity`], [`InboxFilter::git_review_requests`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InboxFilter {
-    /// The subsystem set the view admits (`None` = any subsystem). A membership test over the
-    /// *derived* [`subsystem_of`]`(subject)` — never a second store.
     pub subsystems: Option<HashSet<Subsystem>>,
-    /// The reason set the view admits (`None` = any reason). A membership test over the structured
-    /// `reason` (the §1.3 reason filter).
     pub reasons: Option<HashSet<Reason>>,
 }
 
 impl InboxFilter {
-    /// The empty filter — the canonical unfiltered ONE inbox (`filter = ∅`, §1.3). Every scoped
-    /// view's rows are a subset of THIS.
     pub fn all() -> InboxFilter {
         InboxFilter::default()
     }
 
-    /// Issues **"My Work"** (§1.3): `subsystem∈{issue} ∧ reason∈{assigned, mentioned,
-    /// review_requested, sla, watched, blocked, approval_requested}`. A *view*, not a store.
     pub fn issues_my_work() -> InboxFilter {
         InboxFilter {
             subsystems: Some([Subsystem::Issue].into_iter().collect()),
@@ -167,8 +63,6 @@ impl InboxFilter {
         }
     }
 
-    /// Chat **"Activity / Mentions"** (§1.3): `subsystem∈{chat} ∧ reason∈{mentioned, replied,
-    /// thread_watched, approval_requested}`. A *view*, not a store.
     pub fn chat_activity() -> InboxFilter {
         InboxFilter {
             subsystems: Some([Subsystem::Chat].into_iter().collect()),
@@ -185,8 +79,6 @@ impl InboxFilter {
         }
     }
 
-    /// Git **"Review requests"** (§1.3): `subsystem∈{git} ∧ reason∈{review_requested, mentioned}`.
-    /// A *view*, not a store.
     pub fn git_review_requests() -> InboxFilter {
         InboxFilter {
             subsystems: Some([Subsystem::Git].into_iter().collect()),
@@ -198,11 +90,6 @@ impl InboxFilter {
         }
     }
 
-    /// **Does `item` pass this filter?** A pure NARROWING predicate over the *structured*
-    /// `subsystem` (derived from `subject`) ∧ `reason`. `None` on a dimension = "any" (no narrowing
-    /// on it). Because it only ever narrows — it NEVER admits a row the unfiltered inbox lacks — a
-    /// view's result is a strict subset of `list_inbox(filter=∅)` by construction (the C-9
-    /// invariant). This is the load-bearing predicate the mutation floor pins.
     pub fn matches(&self, item: &RoutedInboxItem) -> bool {
         if let Some(subs) = &self.subsystems {
             if !subs.contains(&subsystem_of(&item.subject)) {
@@ -218,41 +105,17 @@ impl InboxFilter {
     }
 }
 
-/// **The step-0 read-authorize port (contract 4.2 — `check`).** `list_inbox` is a *read* of each
-/// item's `subject` on the recipient's behalf; it obeys `check` exactly (§3.4 step-0, ADR-03 —
-/// never leak). An item whose subject the recipient can no longer see is **not returned** — held,
-/// not leaked. A security-sensitive read carries the `zookie` (contract 4.10) so it does not serve
-/// from the fail-static cache; the port evaluates the `check` at that consistency snapshot.
-///
-/// This mirrors the search subsystem's `BoundedCheckPort` seam (a thin trait over `check` so the
-/// crate does not link the full `IdentityService`). The body — the real Identity `check` /
-/// `list_objects` push-down (the read-fanout JOIN over the `authz_visible` reverse index) — is
-/// wired through this port; the **read-fanout watcher resolution** is NOTIF-P13. Here the seam is
-/// frozen and a denying check is PROVEN to drop the item.
 pub trait ReadAuthorizePort {
-    /// Can `viewer` READ `subject` at consistency `at` (contract 4.2 / 4.10)? `Decision::Allow`
-    /// ⇒ surface the item; `Decision::Deny` / `Decision::Conditional` ⇒ DROP it (fail-closed,
-    /// ADR-03 — a `Conditional` the read path cannot satisfy is treated as a deny: never a silent
-    /// leak). The default permission is `read` (a notification is a read of the subject).
     fn can_read(&self, viewer: &Principal, subject: &ArtifactRef, at: &Consistency) -> Decision;
 }
 
-/// **A page through the ONE inbox (contract 7.1 `page?`).** A bounded slice over the stable order
-/// (NOTIF-P7 ranking plugs into the same order). `after` is the exclusive start cursor (the
-/// `item_id` of the last item of the previous page; `None` = the first page); `limit` bounds the
-/// page size (so a 50k-item inbox never returns unboundedly — the read is always bounded).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Page {
-    /// The exclusive start cursor — return items strictly AFTER this `item_id` in the stable order.
-    /// `None` starts at the first item.
     pub after: Option<String>,
-    /// The maximum page size (the read is always bounded — never an unbounded `SELECT *`).
     pub limit: usize,
 }
 
 impl Default for Page {
-    /// The default page: the first page, bounded to 50 items (a sensible inbox page; the read is
-    /// never unbounded).
     fn default() -> Page {
         Page {
             after: None,
@@ -261,40 +124,15 @@ impl Default for Page {
     }
 }
 
-/// **The opaque forward cursor a page returns (contract 7.1 `page`).** `Some(item_id)` ⇒ there may
-/// be more items after this one (pass it as the next [`Page::after`]); `None` ⇒ the last page (the
-/// inbox is exhausted). PII-free (an opaque `item_id`, never a payload).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cursor(pub Option<String>);
 
-/// **One page of `list_inbox` results (contract 7.1).** The selected [`RoutedInboxItem`]s in the
-/// stable order + the forward [`Cursor`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxPage {
-    /// The items on this page (recipient-scoped, filtered, authorized, ordered). Refs-not-payloads.
     pub items: Vec<RoutedInboxItem>,
-    /// The forward cursor (`Some` ⇒ more pages; `None` ⇒ exhausted).
     pub cursor: Cursor,
 }
 
-/// **`list_inbox(principal, filter, page, authorize, at)` — the ONE inbox (contract 7.1).**
-///
-/// Reads the SAME [`InboxProjection`] the router (NOTIF-P3) UPSERTs into (no second store) and, in
-/// order:
-/// 1. **scopes to the recipient** — only rows whose `recipient` is `principal` (an item is in the
-///    principal's inbox iff it is addressed to them; an agent is a `Principal` too, §1.4);
-/// 2. **applies the C-9 `filter`** — [`InboxFilter::matches`] narrows by `subsystem ∧ reason` (a
-///    scoped view; `InboxFilter::all()` = the unfiltered inbox);
-/// 3. **step-0 read authorize** — drops any item whose `subject` the recipient cannot `check`-READ
-///    at the consistency snapshot `at` (ADR-03, never leak — held, not leaked);
-/// 4. **orders by RANK** — by `(priority DESC, item_id ASC)` (the deterministic explainable v1
-///    ranking, NOTIF-P7, plugs into this exact slot: `priority` is the primary key, `item_id` the
-///    stable tiebreak), then **pages** the bounded slice.
-///
-/// Returns the [`InboxPage`] (the items + the forward cursor). The recipient scope + the authorize
-/// are the two non-negotiables: a row not addressed to the caller is never returned, and a row the
-/// caller cannot see is never leaked. For the per-item priorities + the explain-trace (NOTIF-2),
-/// call [`list_inbox_ranked`].
 pub fn list_inbox(
     inbox: &InboxProjection,
     principal: &Principal,
@@ -303,35 +141,21 @@ pub fn list_inbox(
     authorize: &dyn ReadAuthorizePort,
     at: &Consistency,
 ) -> InboxPage {
-    // (1) Recipient scope — the inbox is read per-recipient. The projection snapshot is already
-    // tenant-scoped (the model of `WHERE tenant = $1`); we narrow to `recipient = principal`.
     let me = principal.principal_id.0.as_str();
     let mut candidates: Vec<RoutedInboxItem> = inbox
         .snapshot_for_tenant(&principal.tenant)
         .into_iter()
         .filter(|row| row.recipient == me)
-        // (2) The C-9 scoped-view filter — narrows by subsystem ∧ reason (a view, not a store).
         .filter(|row| filter.matches(row))
-        // (3) Step-0 read authorize — a denied/conditional check DROPS the item (ADR-03, never
-        // leak). A notification is a read of the subject on the recipient's behalf (§3.4 step-0).
         .filter(|row| authorize.can_read(principal, &row.subject, at) == Decision::Allow)
         .collect();
 
-    // (4) RANKED order (NOTIF-P7) — the deterministic explainable v1 ranking plugs into this exact
-    // slot: order by `(priority DESC, item_id ASC)` (the ranked inbox; `item_id` is the stable
-    // deterministic tiebreak so paging is consistent across calls — no random/HashMap order leaks).
-    // The ranking runs AFTER the recipient-scope + the C-9 filter + the step-0 authorize above, so
-    // it only ever orders items the recipient is allowed to see (the authorize is never skipped).
-    // The v1 strategy uses the NeutralAffinity seam (the live Id/Refs affinity is NOTIF-P13); the
-    // ML ranker swaps in behind the SAME `RankStrategy`. `list_inbox_ranked` exposes the priorities
-    // + the per-rank explain-trace (NOTIF-2); this convenience entry returns just the ordered rows.
     let ranker = crate::ranking::DeterministicV1::default();
     candidates = crate::ranking::rank_and_order(candidates, principal, &ranker)
         .into_iter()
         .map(|ranked| ranked.item)
         .collect();
 
-    // Page: skip past the `after` cursor (exclusive), take `limit`, and compute the forward cursor.
     let start = match &page.after {
         Some(after) => candidates
             .iter()
@@ -342,7 +166,6 @@ pub fn list_inbox(
     };
     let end = start.saturating_add(page.limit).min(candidates.len());
     let items: Vec<RoutedInboxItem> = candidates[start..end].to_vec();
-    // The forward cursor: Some(last item_id) iff there are more rows after this page.
     let cursor = if end < candidates.len() {
         Cursor(items.last().map(|row| row.item_id.clone()))
     } else {
@@ -351,31 +174,12 @@ pub fn list_inbox(
     InboxPage { items, cursor }
 }
 
-/// **One page of RANKED `list_inbox` results (contract 7.1, NOTIF-P7).** Each item carries its
-/// deterministic priority + the explain-trace (NOTIF-2 — "why am I seeing this, ranked here?"), so
-/// the inbox UI / CLI / a drill can show the rank AND its justification. Same recipient-scope +
-/// C-9 filter + step-0 authorize + paging as [`list_inbox`]; this surface additionally exposes the
-/// [`RankedItem`](crate::ranking::RankedItem)s instead of the bare rows.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RankedPage {
-    /// The ranked items on this page (recipient-scoped, filtered, authorized, `(priority DESC,
-    /// item_id ASC)`-ordered) — each carrying its priority + explain-trace.
     pub items: Vec<crate::ranking::RankedItem>,
-    /// The forward cursor (`Some` ⇒ more pages; `None` ⇒ exhausted).
     pub cursor: Cursor,
 }
 
-/// **`list_inbox_ranked(...)` — the ONE inbox, RANKED, with the per-rank explain-trace (NOTIF-P7).**
-///
-/// Identical narrowing to [`list_inbox`] (recipient-scope → C-9 filter → step-0 authorize → rank →
-/// page) but takes an explicit [`RankStrategy`](crate::ranking::RankStrategy) (so the ML ranker
-/// swaps in at the call boundary, §3.1) and returns the [`RankedItem`](crate::ranking::RankedItem)s
-/// — each with its `priority` + `trace`. The plain [`list_inbox`] is this with the default
-/// [`DeterministicV1`](crate::ranking::DeterministicV1) ranker, projecting away the priorities.
-///
-/// **The non-negotiable:** the ranking runs over the ALREADY-AUTHORIZED candidate set — a denied
-/// item is dropped BEFORE it is ranked (the authorize is never skipped to rank an item). Every
-/// returned item carries a trace (the NOTIF-2 100%-trace gate is structural).
 pub fn list_inbox_ranked(
     inbox: &InboxProjection,
     principal: &Principal,
@@ -385,8 +189,6 @@ pub fn list_inbox_ranked(
     at: &Consistency,
     strategy: &dyn crate::ranking::RankStrategy,
 ) -> RankedPage {
-    // (1)-(3) recipient-scope + C-9 filter + step-0 authorize (identical to `list_inbox` — never
-    // skipped). Only items the recipient may see reach the ranker.
     let me = principal.principal_id.0.as_str();
     let candidates: Vec<RoutedInboxItem> = inbox
         .snapshot_for_tenant(&principal.tenant)
@@ -396,10 +198,8 @@ pub fn list_inbox_ranked(
         .filter(|row| authorize.can_read(principal, &row.subject, at) == Decision::Allow)
         .collect();
 
-    // (4) rank + order `(priority DESC, item_id ASC)` — every item gets its priority + explain-trace.
     let ranked = crate::ranking::rank_and_order(candidates, principal, strategy);
 
-    // page over the ranked order (same cursor math as `list_inbox` — keyed on item_id).
     let start = match &page.after {
         Some(after) => ranked
             .iter()
@@ -418,15 +218,6 @@ pub fn list_inbox_ranked(
     RankedPage { items, cursor }
 }
 
-/// **A permissive read-authorize port (every read ALLOWED).** The seam Notif uses until the live
-/// Identity `check` client is wired into `serve` (P-007 / P-S12) — and the port a single-cell
-/// self-host with no per-item ACL narrowing uses. It is the IDENTITY seam shape; it is NOT a
-/// security bypass: the production wiring substitutes the real `check` resolver behind the SAME
-/// [`ReadAuthorizePort`]. Named explicitly so a deployment never mistakes it for the enforced path.
-///
-/// **Floor:** the live `check` / `list_objects` push-down (the read-fanout JOIN over the
-/// `authz_visible` reverse index, contract 4.3/4.4) is NOTIF-P13; here the SEAM is frozen and the
-/// denying-check drop is proven (see the `denied_item_is_not_returned` test) against a denying port.
 pub struct AllowAllAuthorize;
 
 impl ReadAuthorizePort for AllowAllAuthorize {
@@ -456,7 +247,6 @@ mod tests {
         }
     }
 
-    /// Build a routed inbox row addressed to `recipient`, about `subject`, with `reason`.
     fn item(recipient: &str, item_id: &str, subject: &str, reason: Reason) -> RoutedInboxItem {
         RoutedInboxItem {
             tenant: tenant(),
@@ -474,10 +264,8 @@ mod tests {
         }
     }
 
-    /// Seed a projection with a mixed batch addressed to `me` across the three subsystems.
     fn seeded_inbox(me: &str) -> InboxProjection {
         let inbox = InboxProjection::new();
-        // Issues — in "My Work" (assigned) + one NOT in it (state_changed).
         inbox.upsert_for_test(item(
             me,
             "itm-iss-assigned",
@@ -490,7 +278,6 @@ mod tests {
             "myelin://acme/issue/issue/PROJ-2",
             Reason::StateChanged,
         ));
-        // Chat — in "Activity" (mentioned) + one NOT (state_changed).
         inbox.upsert_for_test(item(
             me,
             "itm-chat-ment",
@@ -503,7 +290,6 @@ mod tests {
             "myelin://acme/chat/thread/T2",
             Reason::StateChanged,
         ));
-        // Git — in "Review requests" (review_requested) + one NOT (watched).
         inbox.upsert_for_test(item(
             me,
             "itm-git-review",
@@ -523,11 +309,6 @@ mod tests {
         page.items.iter().map(|i| i.item_id.clone()).collect()
     }
 
-    // --- subsystem derivation (the C-9 filter pins on the DERIVED subsystem, refs-not-payloads) ---
-
-    /// **`subsystem_of` derives the subsystem from the second ref segment** — and a malformed /
-    /// unknown ref is `Unknown` (NEVER silently a known subsystem). A mutant that mis-buckets a ref
-    /// or defaults an unknown ref into a known subsystem is caught.
     #[test]
     fn subsystem_is_derived_from_the_subject_ref_unknown_is_not_a_known_subsystem() {
         assert_eq!(
@@ -554,7 +335,6 @@ mod tests {
             subsystem_of(&ArtifactRef("myelin://acme/ci/run/42".into())),
             Subsystem::Ci
         );
-        // an unknown subsystem / a malformed ref → Unknown (never silently a known one).
         assert_eq!(
             subsystem_of(&ArtifactRef("myelin://acme/mystery/x/1".into())),
             Subsystem::Unknown
@@ -569,12 +349,6 @@ mod tests {
         );
     }
 
-    // --- THE C-9 INVARIANT: every scoped view ⊆ the unfiltered inbox (a view is a filter) ---
-
-    /// **THE C-9 INVARIANT (the gate): every scoped view returns a STRICT SUBSET of
-    /// `list_inbox(filter=∅)` — a view is a filter, not a store.** For each of the three frozen
-    /// views: every row in the view is also in the unfiltered inbox, and 0 rows in the view are
-    /// absent from it. This is the load-bearing property the prompt names.
     #[test]
     fn c9_invariant_every_view_is_a_strict_subset_of_the_unfiltered_inbox() {
         let me = "u1";
@@ -607,7 +381,6 @@ mod tests {
         ] {
             let v = list_inbox(&inbox, &p, &view, &big, &AllowAllAuthorize, &strong());
             let view_ids = ids(&v);
-            // STRICT SUBSET: every view row is in the unfiltered inbox; 0 rows absent from it.
             assert!(
                 view_ids.is_subset(&full_ids),
                 "C-9: the view {view:?} is a SUBSET of the unfiltered inbox"
@@ -623,9 +396,6 @@ mod tests {
         }
     }
 
-    /// **Each frozen view selects EXACTLY its §1.3 rows** (the filter narrows correctly — it does
-    /// not over- or under-select). Issues "My Work" = the assigned issue (not the state-changed
-    /// one); Chat "Activity" = the mention; Git "Review requests" = the review request.
     #[test]
     fn the_three_frozen_views_select_exactly_their_rows() {
         let me = "u1";
@@ -652,7 +422,6 @@ mod tests {
             !my_work.contains("itm-iss-state"),
             "a state_changed issue is NOT in My Work"
         );
-        // a chat row never leaks into the issues view (the subsystem clause is real).
         assert!(
             !my_work.contains("itm-chat-ment"),
             "a chat mention is NOT in the Issues view (subsystem clause)"
@@ -685,9 +454,6 @@ mod tests {
         );
     }
 
-    /// **The `InboxFilter::matches` predicate only ever NARROWS** — the all-filter matches every
-    /// row; a view-filter matches a strict subset. (The structural basis of the C-9 subset
-    /// property: a mutant that makes a filter ADMIT a non-matching row is caught.)
     #[test]
     fn filter_matches_only_narrows() {
         let issue_assigned = item(
@@ -697,16 +463,13 @@ mod tests {
             Reason::Assigned,
         );
         let chat_mention = item("u1", "b", "myelin://acme/chat/thread/T1", Reason::Mentioned);
-        // the all-filter admits everything.
         assert!(InboxFilter::all().matches(&issue_assigned));
         assert!(InboxFilter::all().matches(&chat_mention));
-        // My Work admits the issue-assigned, rejects the chat (wrong subsystem).
         assert!(InboxFilter::issues_my_work().matches(&issue_assigned));
         assert!(
             !InboxFilter::issues_my_work().matches(&chat_mention),
             "wrong subsystem → rejected"
         );
-        // a right-subsystem / wrong-reason row is rejected (the reason clause bites).
         let issue_state = item(
             "u1",
             "c",
@@ -719,11 +482,6 @@ mod tests {
         );
     }
 
-    // --- recipient scope: an item NOT for me is never in my inbox ---
-
-    /// **`list_inbox` is recipient-scoped: an item addressed to ANOTHER principal is never
-    /// returned.** A mutant that drops the recipient filter (returning the whole tenant's inbox) is
-    /// caught — this is a confidentiality non-negotiable (you never see someone else's inbox).
     #[test]
     fn list_inbox_is_recipient_scoped_others_items_are_not_returned() {
         let inbox = InboxProjection::new();
@@ -756,10 +514,6 @@ mod tests {
         assert_eq!(got.len(), 1);
     }
 
-    // --- step-0 authorize: a denied item is held, not leaked (ADR-03) ---
-
-    /// A read-authorize port that DENIES exactly the subjects in its deny-set (else allows). The
-    /// seam shape the live Identity `check` plugs into.
     struct DenySubjects(BTreeSet<String>);
     impl ReadAuthorizePort for DenySubjects {
         fn can_read(&self, _v: &Principal, subject: &ArtifactRef, _at: &Consistency) -> Decision {
@@ -771,9 +525,6 @@ mod tests {
         }
     }
 
-    /// **Step-0 authorize (ADR-03): an item the recipient cannot `check`-READ is NOT returned —
-    /// held, not leaked.** A denying port drops exactly the unseeable item; the rest surface. A
-    /// mutant that skips the authorize (leaks the denied item) is caught — the non-negotiable.
     #[test]
     fn denied_item_is_not_returned() {
         let me = "u1";
@@ -803,8 +554,6 @@ mod tests {
         assert_eq!(got.len(), 5, "the other 5 visible items surface");
     }
 
-    /// **A `Conditional` decision the read path cannot satisfy is treated as a DENY (fail-closed).**
-    /// list_inbox surfaces iff `check` ALLOWS — never on a `Conditional`/`Deny` (deny-when-unsure).
     #[test]
     fn conditional_check_is_failclosed_not_leaked() {
         struct AlwaysConditional;
@@ -828,13 +577,6 @@ mod tests {
         );
     }
 
-    // --- stable order + paging ---
-
-    /// **The order is the RANKED order (priority DESC, item_id ASC), deterministic, and paging walks
-    /// it exactly once (no dup, no skip).** Two pages of limit 2 over 6 items + a final page; the
-    /// cursor chains; the paged union equals the single-call ranked order with no overlap. A mutant
-    /// that breaks the rank order or the cursor math is caught. (NOTIF-P7: the order is now the rank,
-    /// not the pure item_id sort.)
     #[test]
     fn ranked_order_and_paging_is_exhaustive_and_non_overlapping() {
         let me = "u1";
@@ -843,9 +585,6 @@ mod tests {
 
         let mut seen: Vec<String> = Vec::new();
         let mut after: Option<String> = None;
-        // A hard iteration guard: 6 items at limit 2 is ≤ 4 pages. A mutant that breaks the cursor
-        // math (a phantom next page / a stuck cursor) trips this BOUND instead of hanging forever —
-        // so the cursor-arithmetic mutants surface as a FAST assertion failure, not a 20s timeout.
         let mut guard = 0;
         loop {
             guard += 1;
@@ -872,8 +611,6 @@ mod tests {
                 None => break,
             }
         }
-        // The single-call ranked order (priority DESC, item_id ASC) is the EXPECTED order: the three
-        // direct (70) items by item_id, then the three watching (35) items by item_id.
         let expected: Vec<String> = list_inbox(
             &inbox,
             &p,
@@ -892,12 +629,12 @@ mod tests {
         assert_eq!(
             expected,
             vec![
-                "itm-chat-ment".to_string(),  // mentioned = 70 (direct)
-                "itm-git-review".to_string(), // review_requested = 70 (direct)
-                "itm-iss-assigned".to_string(), // assigned = 70 (direct)
-                "itm-chat-state".to_string(), // state_changed = 35 (watching)
-                "itm-git-watched".to_string(), // watched = 35 (watching)
-                "itm-iss-state".to_string(),  // state_changed = 35 (watching)
+                "itm-chat-ment".to_string(),
+                "itm-git-review".to_string(),
+                "itm-iss-assigned".to_string(),
+                "itm-chat-state".to_string(),
+                "itm-git-watched".to_string(),
+                "itm-iss-state".to_string(),
             ],
             "the order is (priority DESC, item_id ASC): the three direct(70) above the three watching(35)"
         );
@@ -910,11 +647,6 @@ mod tests {
         );
     }
 
-    /// **`list_inbox_ranked` exposes the per-item priority + the explain-trace (NOTIF-2) and ranks
-    /// the same candidate set `list_inbox` orders.** Every returned item carries a non-empty,
-    /// deterministic trace whose `final_priority` == the item's priority (the 100%-trace gate), and
-    /// the order is `(priority DESC, item_id ASC)`. The ranked surface authorizes identically (a
-    /// denied item is dropped BEFORE ranking).
     #[test]
     fn list_inbox_ranked_carries_priority_and_trace_per_item() {
         use crate::ranking::DeterministicV1;
@@ -935,7 +667,6 @@ mod tests {
             &ranker,
         );
         assert_eq!(page.items.len(), 6, "all 6 visible items are ranked");
-        // every item carries a complete, deterministic trace (the NOTIF-2 100%-trace gate).
         for r in &page.items {
             assert_eq!(
                 r.priority, r.trace.final_priority,
@@ -946,12 +677,10 @@ mod tests {
                 "every rank carries a non-empty explain-trace"
             );
         }
-        // the order is priority-descending (the first item's priority ≥ the last's).
         let priorities: Vec<u8> = page.items.iter().map(|r| r.priority).collect();
         let mut sorted = priorities.clone();
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(priorities, sorted, "ranked page is priority-descending");
-        // a denied item is dropped BEFORE ranking (authorize never skipped on the ranked surface).
         let deny = DenySubjects(
             ["myelin://acme/issue/issue/PROJ-1".to_string()]
                 .into_iter()
@@ -979,8 +708,6 @@ mod tests {
         assert_eq!(denied_page.items.len(), 5);
     }
 
-    /// **A page is bounded by `limit` and reports a forward cursor iff more rows remain.** The first
-    /// page of limit 2 over 6 items returns 2 items + a `Some` cursor; the read is never unbounded.
     #[test]
     fn page_is_bounded_and_reports_more() {
         let inbox = seeded_inbox("u1");
@@ -1006,14 +733,9 @@ mod tests {
         );
     }
 
-    /// **A page that EXACTLY exhausts the inbox reports NO forward cursor** (`end == len` → `None`,
-    /// not a dangling cursor onto an empty next page). The 6-item inbox read with limit 6 returns
-    /// all 6 and a `None` cursor; a limit of exactly the remaining count is the last page. A mutant
-    /// that loosens the cursor's `end < len` to `end <= len` (a phantom next page) is caught.
     #[test]
     fn page_that_exactly_exhausts_reports_no_cursor() {
-        let inbox = seeded_inbox("u1"); // 6 items for u1.
-                                        // limit exactly == the item count → the last page, no dangling cursor.
+        let inbox = seeded_inbox("u1");
         let page = list_inbox(
             &inbox,
             &principal("u1"),
@@ -1032,7 +754,6 @@ mod tests {
             "an exactly-exhausting page has NO forward cursor (end == len)"
         );
 
-        // and a SECOND page after the last item is empty with no cursor (the cursor did not dangle).
         let last_id = page.items.last().unwrap().item_id.clone();
         let next = list_inbox(
             &inbox,
@@ -1048,8 +769,6 @@ mod tests {
         assert!(next.items.is_empty(), "no items after the last one");
     }
 
-    /// **An empty inbox / a principal with no items returns an empty page with no cursor.** The
-    /// edge: `list_inbox` over a principal with zero rows is `{items: [], cursor: None}`.
     #[test]
     fn empty_inbox_returns_empty_page_no_cursor() {
         let inbox = InboxProjection::new();
@@ -1065,8 +784,6 @@ mod tests {
         assert_eq!(page.cursor, Cursor(None), "no more rows → no cursor");
     }
 
-    /// **The AllowAll authorize port allows every read** (the documented non-bypass seam). The
-    /// production wiring substitutes the real `check` resolver behind the SAME port.
     #[test]
     fn allow_all_authorize_allows() {
         let port = AllowAllAuthorize;

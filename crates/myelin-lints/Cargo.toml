@@ -5,21 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-lints is the ARCHITECTURE-LINT crate (P-S10 → P-017, P-S11 → P-018; the
-# committed-ratchet realisation of doctrine EI-01 §5 "turn discipline into committed,
-# loud gates"). It ships the twelve architecture lints from the §2.11 lint table /
-# contract-index row 1.6 as cargo-level source-scanning checks, each with a red fixture
-# (a sample the lint MUST reject — the gate fails on it) and a green fixture (a sample it
-# MUST admit). P-S10 ships the FOUR most load-bearing — `tenant-predicate`,
-# `no-raw-publish`, `no-host-exec`, `no-untagged-personal-data`; P-S11 completes the
-# twelve in the same crate.
-#
-# It is NOT a node in the production crate DAG (architecture §2.9) — like myelin-harness
-# it is a leaf test-support crate; NO production crate depends on it. The lints are run as
-# CI jobs (loud-never-swallowed: a violation is a typed `Err`, never a swallowed pass) over
-# the workspace's own source tree (see `tests/workspace_clean.rs`) and the fixture matrix
-# (see `tests/fixture_matrix.rs`). It depends on nothing — the lint engine is pure string
-# analysis so it is hermetic and deterministic (no DB, no network).
 [dependencies]
 proc-macro2 = { workspace = true, features = ["span-locations"] }
 serde = { workspace = true, features = ["derive"] }
@@ -27,10 +12,4 @@ syn = { workspace = true, features = ["full", "visit"] }
 toml.workspace = true
 
 [dev-dependencies]
-# Dev-dep ONLY (test-only edge — no production DAG change, same posture as the several test-only
-# cross-crate edges myelin-ci-sandbox itself carries): `tests/runner_asset_digest_pin.rs` recomputes
-# each staged runner asset's canonical-tree digest with the SAME pure-Rust hasher
-# `GvisorAssetRegistry::from_bindings` uses (`myelin_ci_sandbox::canonical_tree_sha256_hex`),
-# rather than shelling out to a host `tar` process from a test (this crate's own scanners already
-# forbid exactly that pattern in PRODUCTION code via the `no-host-exec` lint).
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }

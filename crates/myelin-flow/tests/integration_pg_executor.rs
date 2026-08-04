@@ -1,4 +1,3 @@
-//! Live-Postgres proof for the durable workflow control surface.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -75,9 +74,6 @@ fn typed_job_done(run: &RunId, idem_key: &str, passed: bool) -> TypedSignalSpec 
     }
 }
 
-/// A future combinator that catches a panic from the wrapped future without requiring it to be
-/// `Send`/`'static` (unlike `tokio::spawn`) — used only so `with_schema_cleanup` can run its cleanup
-/// even when the test body panics.
 struct CatchUnwind<F> {
     inner: std::pin::Pin<Box<F>>,
 }
@@ -98,10 +94,6 @@ impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
     }
 }
 
-/// Run `body`, then unconditionally drop `schema` from `pool` afterward — success, assertion
-/// failure, or panic all still clean up, unlike the old "only reset at the START of the next run"
-/// pattern that let schemas accumulate indefinitely on this host. A synchronous `Drop` impl can't
-/// safely do async cleanup, so this uses catch_unwind + always-cleanup + resume_unwind instead.
 async fn with_schema_cleanup<Fut>(pool: &PgPool, schema: &str, body: impl FnOnce() -> Fut)
 where
     Fut: std::future::Future<Output = ()>,
@@ -179,8 +171,6 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
         ));
     });
 
-    // The transaction-aware entry point writes on the caller's exact connection. Rolling the
-    // caller back removes the workflow start too; no nested transaction escaped the co-commit.
     let mut caller_tx = pool.begin().await.expect("begin caller co-commit tx");
     sqlx::query(
         "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
@@ -264,8 +254,6 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
         "caller rollback removes workflow start"
     );
 
-    // The production consumer path owns the transaction: its durable dedup mark and the workflow
-    // start land together. A committed redelivery is deduplicated before it can create another run.
     let ledger = DedupLedger::durable(Arc::new(DurableDedupBacking::new(
         pool.clone(),
         tokio::runtime::Handle::current(),
@@ -364,8 +352,6 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
     });
     drop(first_process);
 
-    // A fresh executor handle models a process restart: the idempotency row, definition, and run
-    // state must come from Postgres, not a surviving Arc<Mutex<...>>.
     let restarted = executor(&pool, "acme");
     let replay = tokio::task::block_in_place(|| {
         restarted
@@ -384,9 +370,6 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
     .expect("count idempotent starts");
     assert_eq!(count, 1, "restart/re-delivery creates exactly one run");
 
-    // The typed completion seam can join a caller-owned state transition on the exact same
-    // transaction. An unscoped connection is refused even through the admin pool; rollback removes
-    // BOTH the caller's claim disposition and the workflow signal/wake; commit makes BOTH visible.
     let mut unscoped = pool.begin().await.expect("begin unscoped caller tx");
     let unscoped_error = restarted
         .signal_typed_on_conn(
@@ -566,8 +549,6 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
             if message.contains("divergent payload")
     ));
 
-    // Once history has consumed this exact signal, its at-least-once replay remains a successful
-    // Duplicate but cannot wake the run again.
     sqlx::query(
         "UPDATE wf_signal SET consumed_seq = 5 WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
          AND signal_name = 'job.done' AND idem_key = 'job-token-1'",
@@ -610,20 +591,11 @@ async fn durable_control_survives_restart_and_fails_closed_on_drift_and_cross_te
     assert_eq!(status.state, "terminated");
     tokio::task::block_in_place(|| after_second_restart.cancel(&run, "duplicate"))
         .expect("terminal cancellation is idempotent");
-    // A VERIFIED same-tenant delivery to a terminal run is now a typed no-op (P-FLOW late-completion,
-    // Change 3): the caller acknowledges the late signal WITHOUT it being an error, and NO terminal
-    // history/signal row is mutated. This IDENTICAL redelivery (same idem_key + same payload as the
-    // row already consumed above) is the acknowledged no-op. (A late CI `job.done` reporter settles its
-    // lease on this instead of retrying a rejection forever.)
     assert_eq!(
         tokio::task::block_in_place(|| after_second_restart.signal(signal()))
             .expect("a verified terminal delivery is an acknowledged no-op, not an error"),
         SignalOutcome::TerminalNoOp
     );
-    // The divergent-redelivery guard is NOT bypassed by terminality: the SAME idem_key with a
-    // DIFFERENT payload is producer CORRUPTION (two distinct completions under one key) and MUST still
-    // be surfaced as InvalidInput even on a terminal run — the terminal no-op is only for an
-    // absent-or-identical delivery.
     let divergent = SignalSpec {
         payload: vec![ArtifactRef("myelin://acme/ci/artifact/divergent".into())],
         ..signal()

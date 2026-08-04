@@ -1,29 +1,3 @@
-//! **CT-004 / E2.3 — CI backend HARDEN: the load-bearing CI control-plane state is DURABLE on real
-//! Postgres, KILL-9 PROVEN.**
-//!
-//! The census (CT-004) found every CI control-plane SQL contract proven *in-tx* on live Postgres
-//! (CI-P12 claim/reaper, CI-P18 check_attempt, CI-P20 anchors) — but NONE proven across a process
-//! boundary, and metering had NO durable Postgres impl at all (model-only). This is the spine's
-//! durability discipline (MR-022..025) applied to the CI backend: **state written + committed before a
-//! simulated crash is present after a FRESH store opens; an uncommitted write leaves no ghost; a
-//! one-tx co-commit is all-or-nothing across a crash between steps.**
-//!
-//! The "kill-9 / reopen" is modelled the way the spine models it: the work commits through one
-//! `PgPool`, that pool is **dropped without a graceful close** (the process "dies"), and a brand-new
-//! pool reconnects to the SAME live Postgres and reads the state back — proving the state lived in
-//! Postgres, never in process memory. The SQL under test is the BYTE-IDENTICAL production constant
-//! (`CLAIM_QUERY` / `REAP_QUERY` / `BUMP_CHECK_ATTEMPT_SQL` / `INSERT_COST_EVENT_QUERY` /
-//! `UPSERT_LOG_ANCHOR_QUERY`); only the table identifier is per-pid suffixed for isolation + cleanup
-//! (the CI-P12/P18 convention). The in-memory models stay the DB-free default; this proves the same
-//! semantics hold durably.
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build`/`cargo test --workspace`
-//! stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   DATABASE_URL=postgres://myelin_app:myelin_app_pw@localhost:5433/myelin \
-//!     cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_p28_ct004_durability -- --nocapture
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
@@ -46,9 +20,6 @@ fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// Open a FRESH admin pool — a brand-new connection to the SAME live Postgres. Calling this after
-/// `drop(prev_pool)` models a process restart (the "reopen" half of a kill-9 durability proof: the
-/// only way the state is still here is if it lives in Postgres).
 async fn reopen() -> PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
@@ -57,8 +28,6 @@ async fn reopen() -> PgPool {
         .expect("reconnect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)")
 }
 
-/// A stable uuid from a name (the `uuid` columns) — deterministic (a simple FNV-1a fill, no extra
-/// crate feature) so a reopened pool can assert equality against the SAME id the pre-crash pool wrote.
 fn uid(name: &str) -> Uuid {
     let mut bytes = [0u8; 16];
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -76,8 +45,6 @@ fn uid(name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// Run the production `check_attempt` bump (retargeted to a suffixed table) and return the stamped
-/// `run_attempt`. A free async fn (not a closure) so the returned future does not borrow the `&str`s.
 async fn do_bump(pool: &PgPool, bump_sql: &str, run: &str) -> i32 {
     sqlx::query(bump_sql)
         .bind("acme")
@@ -92,10 +59,6 @@ async fn do_bump(pool: &PgPool, bump_sql: &str, run: &str) -> i32 {
         .get::<i32, _>("run_attempt")
 }
 
-// =================================================================================================
-// 1. Scheduler claim/lease/reaper — the committed lease survives kill-9; an uncommitted claim leaves
-//    NO ghost lease; an expired lease is reclaimable AFTER a reopen (the reaper seam, CI-P12).
-// =================================================================================================
 #[tokio::test]
 async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     let suffix = std::process::id();
@@ -116,7 +79,6 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
         .execute(&p1)
         .await
         .expect("apply job_queue DDL");
-    // The CT-004d.2 claim-generation + completion-receipt columns (`ci_0004a`), on the suffixed table.
     let alter = ALTER_JOB_QUEUE_ADD_COMPLETION_DDL.replace("job_queue", &tbl);
     sqlx::query(&alter)
         .execute(&p1)
@@ -164,7 +126,6 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     .await
     .expect("apply authoritative lifecycle tables");
 
-    // Seed two eligible queued jobs: `kept` (claimed + committed) and `ghost` (claimed in an aborted tx).
     let enqueue = |job: &str, run: &str, idem: &str, ago: i64| -> String {
         format!(
             "INSERT INTO {tbl} (tenant_id, region, job_id, run_id, lane, labels, trust_tier, \
@@ -213,7 +174,6 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
             .replace("$5", "'30'")
     };
 
-    // ── COMMITTED claim: lease `kept` (the older job wins) on the pool (autocommit) — durable. ──
     let row = sqlx::query(&bind_claim("worker-kept"))
         .fetch_one(&p1)
         .await
@@ -224,8 +184,6 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
         "the committed claim leases `kept` (oldest in-region eligible)"
     );
 
-    // ── UNCOMMITTED claim: lease `ghost` inside a tx, then DROP the tx (the process dies before
-    //    commit). sqlx rolls the tx back — there must be NO ghost lease after reopen. ──
     {
         let mut tx = p1.begin().await.unwrap();
         let g = sqlx::query(&bind_claim("worker-ghost"))
@@ -237,17 +195,13 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
             uid("ghost"),
             "the in-tx claim leases `ghost` (the only remaining queued job)"
         );
-        // Drop `tx` WITHOUT commit → rollback (the crash before commit).
         drop(tx);
     }
 
-    // ── KILL-9: drop the pool without a graceful close. The process "dies". ──
     drop(p1);
 
-    // ── REOPEN: a brand-new pool reconnects to the SAME Postgres. ──
     let p2 = reopen().await;
 
-    // The COMMITTED lease survived the crash.
     let kept = sqlx::query(&format!(
         "SELECT state, lease_owner FROM {tbl} WHERE job_id = '{}'",
         uid("kept")
@@ -262,7 +216,6 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     );
     assert_eq!(kept.get::<String, _>("lease_owner"), "worker-kept");
 
-    // The UNCOMMITTED claim left NO ghost: `ghost` is still queued (reclaimable) — no half-claimed row.
     let ghost = sqlx::query(&format!(
         "SELECT state, lease_owner FROM {tbl} WHERE job_id = '{}'",
         uid("ghost")
@@ -273,15 +226,13 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     assert_eq!(
         ghost.get::<String, _>("state"),
         "queued",
-        "the uncommitted claim left NO ghost lease — `ghost` is reclaimable (no lost/ghost job)"
+        "the uncommitted claim left NO ghost lease - `ghost` is reclaimable (no lost/ghost job)"
     );
     assert!(
         ghost.try_get::<String, _>("lease_owner").is_err(),
         "the rolled-back claim wrote no lease_owner"
     );
 
-    // ── REAPER after reopen: a claimed-but-crashed runner's lease expires → reclaimable. Force the
-    //    `kept` lease into the past (its owner died) and run the production reaper on the fresh pool. ──
     sqlx::query(&format!(
         "UPDATE {tbl} SET lease_expires = now() - interval '1 second' WHERE job_id = '{}'",
         uid("kept")
@@ -330,11 +281,6 @@ async fn scheduler_claim_lease_survives_kill9_and_no_ghost_lease() {
     );
 }
 
-// =================================================================================================
-// 2. Run/step state + metering co-commit — ci_run + ci_job + cost_event commit in ONE tx and survive
-//    kill-9 (settled stays settled, cost attributed to (run_id, job_id)); a crash BETWEEN steps (no
-//    commit) leaves NOTHING (no half-billed run, no ghost run-state). The spine's one-tx rule.
-// =================================================================================================
 #[tokio::test]
 async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     let suffix = std::process::id();
@@ -371,8 +317,6 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     let insert_cost =
         INSERT_COST_EVENT_QUERY.replace("INTO ci_cost_event", &format!("INTO {ce_tbl}"));
 
-    // Insert a run + its job, transition the run terminal, AND record its metered cost — all in ONE tx
-    // (the run-state/metering co-commit: a crash here must not half-bill nor leave a ghost run).
     let insert_run = |run: &str, state: &str, settled: bool| -> String {
         format!(
             "INSERT INTO {run_tbl} (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
@@ -392,7 +336,6 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
         )
     };
 
-    // ── The committed co-commit. ──
     let mut tx = p1.begin().await.unwrap();
     sqlx::query(&insert_run("run-ok", "running", false))
         .execute(&mut *tx)
@@ -402,7 +345,6 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
         .execute(&mut *tx)
         .await
         .unwrap();
-    // Record the metered cost via the production durable settle query (wholesale ≠ markup).
     sqlx::query(&insert_cost)
         .bind("acme")
         .bind("fr-par")
@@ -411,13 +353,12 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
         .bind(uid("job-ok"))
         .bind("cpu_seconds")
         .bind(120_i64)
-        .bind(100_i64) // wholesale
-        .bind(20_i64) // markup (distinct from wholesale)
+        .bind(100_i64)
+        .bind(20_i64)
         .bind("ci")
         .execute(&mut *tx)
         .await
         .unwrap();
-    // Transition run terminal + settle in the SAME tx (the co-commit bookend).
     sqlx::query(&format!(
         "UPDATE {run_tbl} SET state='succeeded', cost_settled=true, finished_at=now() WHERE run_id='{}'",
         uid("run-ok")
@@ -425,7 +366,6 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     .execute(&mut *tx)
     .await
     .unwrap();
-    // Exactly-once: a re-delivered settle of the same cost_id is a no-op (double-effect = 0).
     let dup = sqlx::query(&insert_cost)
         .bind("acme")
         .bind("fr-par")
@@ -447,7 +387,6 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     );
     tx.commit().await.unwrap();
 
-    // ── Crash BETWEEN steps: begin a second run, write run + job, but record NO cost + NO commit. ──
     {
         let mut tx2 = p1.begin().await.unwrap();
         sqlx::query(&insert_run("run-crash", "running", false))
@@ -458,15 +397,12 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
             .execute(&mut *tx2)
             .await
             .unwrap();
-        // Drop tx2 WITHOUT commit → the crash before the co-commit completes.
         drop(tx2);
     }
 
-    // ── KILL-9 + REOPEN. ──
     drop(p1);
     let p2 = reopen().await;
 
-    // The committed run is durable + SETTLED stays settled across the crash.
     let run = sqlx::query(&format!(
         "SELECT state, cost_settled FROM {run_tbl} WHERE run_id='{}'",
         uid("run-ok")
@@ -480,7 +416,6 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
         "a settled run stays settled after kill-9/reopen"
     );
 
-    // The cost is durable + ATTRIBUTED to its (run_id, job_id), with wholesale ≠ markup (two columns).
     let select =
         SELECT_COST_EVENTS_FOR_RUN_QUERY.replace("FROM ci_cost_event", &format!("FROM {ce_tbl}"));
     let costs = sqlx::query(&select)
@@ -507,7 +442,6 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
         "wholesale ≠ markup (the two cost columns are distinct, arch 02 §8)"
     );
 
-    // The crashed-between-steps run left NOTHING — no ghost run-state, no half-billed cost.
     let ghost_run: i64 = sqlx::query(&format!(
         "SELECT count(*)::bigint AS n FROM {run_tbl} WHERE run_id='{}'",
         uid("run-crash")
@@ -543,10 +477,6 @@ async fn run_step_metering_co_commit_survives_kill9_no_partial() {
     );
 }
 
-// =================================================================================================
-// 3. check_attempt monotonic ACROSS processes — the counter persists across a kill-9; the reopened
-//    store continues the sequence (never resets to 1). CI is the durable source of run_attempt (X-1).
-// =================================================================================================
 #[tokio::test]
 async fn check_attempt_is_monotonic_across_kill9() {
     let suffix = std::process::id();
@@ -574,7 +504,6 @@ async fn check_attempt_is_monotonic_across_kill9() {
     assert_eq!(do_bump(&p1, &bump, run_a).await, 1, "first dispatch → 1");
     assert_eq!(do_bump(&p1, &bump, run_b).await, 2, "re-dispatch → 2");
 
-    // ── KILL-9 mid-sequence + REOPEN. The counter must NOT reset. ──
     drop(p1);
     let p2 = reopen().await;
     assert_eq!(
@@ -601,10 +530,6 @@ async fn check_attempt_is_monotonic_across_kill9() {
     println!("[CT-004] PASS check_attempt: 1,2 then kill-9 → reopen → 3 (monotonic across processes, no reset)");
 }
 
-// =================================================================================================
-// 4. Log anchor (the ci.log.available pointer index) — the anchor persists across kill-9 and its
-//    idempotent in-place status transition survives the reopen (CI-P20).
-// =================================================================================================
 #[tokio::test]
 async fn log_anchor_persists_across_kill9() {
     let suffix = std::process::id();
@@ -623,7 +548,6 @@ async fn log_anchor_persists_across_kill9() {
     let upsert = UPSERT_LOG_ANCHOR_QUERY
         .replace("INTO log_anchor", &format!("INTO {tbl}"))
         .replace("log_anchor.", &format!("{tbl}."));
-    // Open the anchor (running) and commit it.
     sqlx::query(&upsert)
         .bind("acme")
         .bind("fr-par")
@@ -654,7 +578,6 @@ async fn log_anchor_persists_across_kill9() {
     );
     assert_eq!(a.get::<i64, _>("byte_start"), 0);
 
-    // The idempotent in-place transition (running → failed, byte_end set) applies on the reopened store.
     sqlx::query(&upsert)
         .bind("acme")
         .bind("fr-par")

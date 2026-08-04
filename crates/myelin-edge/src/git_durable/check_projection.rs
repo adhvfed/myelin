@@ -15,7 +15,6 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The ordinary durable-store provider plus the separately bounded protected-push admission lane.
 pub struct GitDatabaseProviders {
     pub(super) primary: myelin_storage::SubstrateProvider,
     pub(super) check_admission: myelin_storage::SubstrateProvider,
@@ -78,8 +77,6 @@ impl ProtectedPushMutation {
 }
 
 impl DurableGitBackend {
-    /// Enrich one repository's bounded PR page from one protection-config read and one projected
-    /// checks batch. Projection failure degrades summaries to unavailable without hiding PRs.
     pub(super) fn enrich_pr_records(
         &self,
         loc: &RepoLoc,
@@ -124,8 +121,6 @@ impl DurableGitBackend {
             .collect()
     }
 
-    /// Cross-repository counterpart: batch projected heads per visible repository and fail static
-    /// per repository if either protection or projection state is unreadable.
     pub(super) fn enrich_cross_pr_records(
         &self,
         tenant: &str,
@@ -191,9 +186,6 @@ impl DurableGitBackend {
             .collect()
     }
 
-    /// Evaluate production protected-ref updates and mutate the refs while holding the projection
-    /// consumer's exact-commit admission locks. Check updates therefore serialize either before
-    /// the admission read or after the ref mutation; no green-read → stale-CAS window exists.
     pub(super) fn receive_with_check_admission(
         &self,
         loc: &RepoLoc,
@@ -262,9 +254,6 @@ impl DurableGitBackend {
             .map_err(|error| ProtectedPushAdmissionError::Projection(error.to_string()))?
     }
 
-    /// Resolve Git's recorded check facts for a direct protected-branch push. Production reads the
-    /// per-commit projection and fails closed on any projection error; the PR-record fallback exists
-    /// only for the in-memory test composition.
     pub(super) fn check_facts_for_head(
         &self,
         loc: &RepoLoc,
@@ -296,8 +285,6 @@ impl DurableGitBackend {
         (green, fork_unendorsed, endorsed)
     }
 
-    /// Overlay the Git-owned per-commit projection onto the PR facts consumed by the policy
-    /// evaluator. Stored check arrays are compatibility-only when the production projection exists.
     pub(super) fn record_with_projected_checks(
         &self,
         loc: &RepoLoc,
@@ -340,8 +327,6 @@ impl DurableGitBackend {
             .map_err(|_| DurableError::Io("Git check projection is unavailable".into()))
     }
 
-    /// Authoritative checks and merge-gate view used by both the checks endpoint and a merge-conflict
-    /// rerender. The UI consumes the decision; it does not recompute it.
     pub(super) fn pr_checks_json(
         &self,
         loc: &RepoLoc,

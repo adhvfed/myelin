@@ -1,4 +1,3 @@
-//! Live proof for the split-credential PostgreSQL bootstrap.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;

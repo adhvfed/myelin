@@ -1,31 +1,3 @@
-//! **KN-P16 / P-306 — the leak-free `list_objects` `SetExpr` push-down for Knowledge db
-//! views/lists AND the permission-correct `COUNT(*)` (the KN-D5 count-leak-closed crux), PROVEN
-//! against the live dev-stack Postgres.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-knowledge --features integration \
-//!     --test integration_kn_d5_list_pushdown -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires (the prompt touches the §4.1
-//! `list_objects` DB read contract 4.3 + the `authz_visible` JOIN target). The db-row-list read —
-//! the lowered `SetExpr` (the `authz_visible` JOIN form) conjoined into the `db_row` scan over
-//! `db_row.id` — runs as **ONE SQL query** against real Postgres and returns ONLY the rows the
-//! viewer may see (0 leak), with the tenant + `db_id` predicates isolating cross-tenant / cross-db
-//! rows. **The KN-D5 HEADLINE that distinguishes Knowledge from the sibling git push-down:** the
-//! SAME ACL conjunct INSIDE a `SELECT COUNT(*)` makes the aggregate permission-correct — a `COUNT`
-//! over a row-restricted db cannot reveal the existence or number of forbidden rows (**0
-//! count-leak**). The KN-D5 drill is registered red-until-proven and flips green ONLY here, against
-//! the live stack — never mocked. Survival signals: **0 leaked artifacts; 0 count-leak; 1 SQL query;
-//! revoke reflected (read-your-writes)**.
-//!
-//! The SQL the test runs is the lowered form Knowledge's [`myelin_knowledge::list_filter`] composes:
-//! it builds the `InRelation` → `authz_visible` JOIN clause via the REAL
-//! [`myelin_knowledge::lower_over_db_row_id`] lowering (the SAME `LoweredFilter` the production read
-//! composes), then executes the one-query list AND the one-query COUNT against the seeded `db_row` +
-//! `authz_visible` tables.
 #![cfg(feature = "integration")]
 
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RelName, SetExpr};
@@ -54,8 +26,6 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
     let row_tbl = format!("db_row_p306_{suffix}");
     let av_tbl = format!("authz_visible_p306_{suffix}");
 
-    // ── 1. A minimal `db_row` table (the §4.1 columns the db-list read touches: tenant + db_id +
-    //       id) + an authz_visible reverse index table (the JOIN target). Throwaway, suffixed. ─────
     sqlx::query(&format!(
         "CREATE TABLE {row_tbl} (\
            tenant text NOT NULL, region text NOT NULL, db_id text NOT NULL, id text NOT NULL, \
@@ -73,8 +43,6 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
     .await
     .expect("create the authz_visible reverse index table");
 
-    // ── 2. Seed a row-restricted db: rows the viewer can read, one SECRET row (granted to someone
-    //       else — the leak witness), a row in ANOTHER db (no-cross-db), and a CROSS-TENANT row. ──
     for (tenant, db_id, id) in [
         ("acme", "db:projects", "row:1"),
         ("acme", "db:projects", "row:2"),
@@ -93,9 +61,6 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         .expect("seed a db_row");
     }
 
-    // ── 3. Grant the viewer `read` of ONLY row:1 + row:2 in the reverse index (tenant acme).
-    //       row:secret is granted to p:other (not the viewer); row:otherdb is in another db;
-    //       row:x is in evilcorp. ────────────────────────────────────────────────────────────────
     let viewer = Principal::stub(
         PrincipalId("p:viewer".into()),
         PrincipalKind::Human,
@@ -105,8 +70,6 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         ("p:viewer", "row:1"),
         ("p:viewer", "row:2"),
         ("p:other", "row:secret"),
-        // Note: the viewer is even granted read of row:otherdb to PROVE the db_id predicate (not the
-        // ACL) is what confines the read to ONE db — no-cross-db is structural, not ACL-luck.
         ("p:viewer", "row:otherdb"),
     ] {
         sqlx::query(&format!(
@@ -120,8 +83,6 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         .expect("grant read");
     }
 
-    // ── 4. Build the REAL lowered SetExpr (InRelation{row_reader/read} → the authz_visible JOIN over
-    //       db_row.id) — the SAME LoweredFilter the production view/COUNT composers conjoin. ───────
     let lowered = lower_over_db_row_id(
         &SetExpr::InRelation {
             relation: RelName("read".into()),
@@ -134,19 +95,14 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         1,
         "the InRelation lowers to ONE JOIN (no N+1)"
     );
-    // Rebind the lowered JOIN clause onto the suffixed test tables + bind the viewer subject/relation
-    // (in production the table names are canonical + the driver binds the params; the SHAPE under
-    // test is the lowering's clause verbatim — `db_row.id` → the test table, `authz_visible` → av).
     let join_clause = lowered.joins[0]
         .clause
         .replace(AUTHZ_VISIBLE_TABLE, &av_tbl)
         .replace("db_row.id", &format!("{row_tbl}.id"))
         .replace(":subject_0", "'p:viewer'")
         .replace(":rel_for_read", "'read'");
-    let predicate = lowered.sql_predicate; // `av0.object_id IS NOT NULL`
+    let predicate = lowered.sql_predicate;
 
-    // ── 5. THE ONE db-list query: the lowered JOIN + predicate conjoined into the db_row scan,
-    //       tenant + db_id scoped, ORDER BY id LIMIT :page (the §4.1 pre-filter, never post-filter). ─
     let list_sql = format!(
         "SELECT {row_tbl}.id FROM {row_tbl} {join_clause} \
          WHERE {row_tbl}.tenant = 'acme' AND {row_tbl}.db_id = 'db:projects' AND ({predicate}) \
@@ -157,8 +113,6 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         .await
         .unwrap_or_else(|e| panic!("the ONE db-list query runs: {e}\nSQL: {list_sql}"));
 
-    // ── 6. PROVE leak-free VIEW: exactly the TWO authorized rows; row:secret + cross-db + cross-tenant
-    //       ABSENT. ──────────────────────────────────────────────────────────────────────────────
     let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
     assert_eq!(
         ids,
@@ -178,10 +132,6 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         "0 cross-tenant: the tenant predicate excluded evilcorp's row"
     );
 
-    // ── 7. THE KN-D5 HEADLINE — the permission-correct COUNT(*): the SAME ACL JOIN + predicate INSIDE
-    //       the aggregate. The count is the surviving cardinality, NOT a post-count over a wider scan
-    //       (which would leak the forbidden count). 0 count-leak: COUNT = 2, NOT 3 (row:secret
-    //       uncounted), NOT 4 (row:otherdb uncounted). ──────────────────────────────────────────────
     let count_sql = format!(
         "SELECT COUNT(*) AS n FROM {row_tbl} {join_clause} \
          WHERE {row_tbl}.tenant = 'acme' AND {row_tbl}.db_id = 'db:projects' AND ({predicate})"
@@ -198,11 +148,9 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
     assert_eq!(
         count as usize,
         ids.len(),
-        "the COUNT equals the listed cardinality — the ACL is the SAME conjunct, no second path can diverge"
+        "the COUNT equals the listed cardinality - the ACL is the SAME conjunct, no second path can diverge"
     );
 
-    // ── 8. PROVE one query / no post-filter / no N+1: EXPLAIN confirms a single join plan (no
-    //       correlated per-row check subplan) for BOTH the view and the COUNT. ──────────────────────
     let plan = sqlx::query(&format!("EXPLAIN (FORMAT TEXT) {list_sql}"))
         .fetch_all(&admin)
         .await
@@ -231,9 +179,6 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         "the COUNT is a single aggregate over the JOINed/filtered set (ACL inside the aggregate): {count_plan_text}"
     );
 
-    // ── 9. REVOKE reflected (read-your-writes / new-enemy guard): remove the viewer's grant on row:1
-    //       from the reverse index; re-run the SAME view + COUNT → row:1 drops out AND the COUNT
-    //       decrements to 1 (a just-revoked grant cannot be read or counted stale, contract 4.10). ──
     sqlx::query(&format!(
         "DELETE FROM {av_tbl} WHERE tenant = 'acme' AND subject = 'p:viewer' AND relation = 'read' AND object_id = 'row:1'"
     ))
@@ -258,7 +203,7 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
         .await
         .expect("re-run the COUNT after revoke")
         .get::<i64, _>("n");
-    assert_eq!(count_after, 1, "0 count-leak after revoke: the COUNT decremented to 1 — a revoked grant cannot be counted stale");
+    assert_eq!(count_after, 1, "0 count-leak after revoke: the COUNT decremented to 1 - a revoked grant cannot be counted stale");
 
     println!(
         "[P-306 INTEGRATION GREEN] KN-D5 db-row-list + permission-correct COUNT SetExpr push-down \
@@ -268,7 +213,6 @@ async fn kn_d5_db_row_list_and_count_setexpr_join_zero_leak_zero_count_leak_revo
          revoke drops row:1 from the SAME view AND decrements the COUNT to 1 (read-your-writes)."
     );
 
-    // ── 10. Cleanup (forward teardown). ─────────────────────────────────────────────────────────
     sqlx::query(&format!("DROP TABLE {row_tbl}"))
         .execute(&admin)
         .await

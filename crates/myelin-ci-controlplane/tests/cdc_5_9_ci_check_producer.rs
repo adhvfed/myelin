@@ -1,26 +1,3 @@
-//! # The CDC PROVIDER half of contract 5.9 — CI's `ci.check.updated` producer (CI-P18 → P-361, M4)
-//!
-//! **Contract:** `planning/05-refined-shared-systems-architecture/contract-index.md` row 5.9 (the
-//! Git↔CI `CheckStatus` seam — **CI is the PRODUCER**; `ci.check.updated` + the `run_attempt`
-//! source). Owning architecture:
-//! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
-//! §4 (the seam, produced) + `01-tech-and-data-model.md` §3.2 (the `check_attempt` counter).
-//! Reconciliation: `00-reconciliation-decisions.md` X-1 (the FROZEN `CheckStatus` struct).
-//!
-//! ## What this CDC pins (the check-fact half of 5.9 — the PROVIDER's promise)
-//! CI assembles the `ci.check.updated` payload through [`myelin_ci_controlplane::check_status_payload`]
-//! (CI never depends on Git in PRODUCTION code — it produces the frozen JSON shape). This CDC proves
-//! the PROVIDER ↔ CONSUMER no-drift property: CI's assembled payload decodes BYTE-IDENTICALLY into
-//! Git's frozen consumer view `myelin_git::check_status::CheckStatus` via the real consumer
-//! `CheckStatusConsumer::decode` — the exact decode the live Git consumer leg runs. If CI's producer
-//! shape ever diverged from the frozen 5.9 struct, this decode would FAIL (a loud contract break).
-//!
-//! The CONSUMER half (Git's `check_status` projection + the monotonic `run_attempt` supersession +
-//! the merge gate) is proven in `myelin-git`; the END-TO-END seam GATE (GIT-D10 / CI-D8, the
-//! `ci.result` rollup → merge-queue wake, 0 double-merge) is CI-P19 (P-362) — the floor this CDC
-//! provider half names. This is a DEV-DEP-ONLY decode (the test surface), acyclic exactly like
-//! `myelin-ci-dispatch → myelin-git`.
-
 use myelin_ci_controlplane::{
     check_status_payload, CheckEmitContext, CheckProvider, CheckState, CostPosture, TrustTier,
 };
@@ -44,9 +21,6 @@ fn emit_ctx(attempt: u32, tier: TrustTier) -> CheckEmitContext {
     }
 }
 
-/// **The PROVIDER promise: CI's assembled `ci.check.updated` payload decodes into Git's FROZEN
-/// `CheckStatus` (no drift — the check-fact half of 5.9).** CI produces the shape; Git's REAL consumer
-/// decode (`CheckStatusConsumer::decode`) accepts it byte-for-byte. Every frozen field round-trips.
 #[test]
 fn ci_producer_payload_decodes_into_git_frozen_checkstatus() {
     let ctx = emit_ctx(2, TrustTier::Trusted);
@@ -60,11 +34,9 @@ fn ci_producer_payload_decodes_into_git_frozen_checkstatus() {
         None,
     );
 
-    // The REAL Git consumer decode — the exact decode the live consumer leg runs.
     let fact = CheckStatusConsumer::decode(&payload)
         .expect("CI's producer payload decodes into Git's frozen 5.9 CheckStatus (no drift)");
 
-    // Every frozen 5.9 field round-tripped into Git's typed view.
     assert_eq!(fact.tenant.0, "acme", "the partition key");
     assert_eq!(fact.repo.0, REPO);
     assert_eq!(fact.commit_oid.0, COMMIT, "the seam key half");
@@ -85,7 +57,7 @@ fn ci_producer_payload_decodes_into_git_frozen_checkstatus() {
     );
     assert_eq!(
         fact.summary.template_key, "ci.check.success",
-        "the summary is a HumanisedRef (template_key, args) — never a raw string (7.3)"
+        "the summary is a HumanisedRef (template_key, args) - never a raw string (7.3)"
     );
     assert_eq!(
         fact.summary.args.get("context").map(String::as_str),
@@ -98,9 +70,6 @@ fn ci_producer_payload_decodes_into_git_frozen_checkstatus() {
     );
 }
 
-/// **A FORK run is recorded faithfully with `trust_tier = untrusted_fork` — CI never endorses it.**
-/// The producer stamps the tier from provenance; Git's consumer decodes `UntrustedFork` and treats it
-/// as neutral-for-gating until endorsed (the poisoned-pipeline defence — CI reports, Git gates).
 #[test]
 fn ci_producer_stamps_untrusted_fork_git_decodes_it_faithfully() {
     let ctx = emit_ctx(1, TrustTier::UntrustedFork);
@@ -122,14 +91,10 @@ fn ci_producer_stamps_untrusted_fork_git_decodes_it_faithfully() {
     assert_eq!(
         fact.trust_tier,
         GitTier::UntrustedFork,
-        "stamped from provenance — CI never endorses a fork (X-1)"
+        "stamped from provenance - CI never endorses a fork (X-1)"
     );
 }
 
-/// **A FAILURE fact decodes with the `#step-<n>` jump-to-failure `details_ref`, the failure summary,
-/// and a not-yet-settled cost posture.** The producer assembles the failure shape; Git's consumer
-/// decodes the `Failure` state, the failing-step anchor, and `cost_settled: false` (still pending
-/// the settle bookend).
 #[test]
 fn ci_producer_failure_fact_decodes_with_step_anchor_and_unsettled() {
     let ctx = emit_ctx(3, TrustTier::Trusted);
@@ -155,12 +120,8 @@ fn ci_producer_failure_fact_decodes_with_step_anchor_and_unsettled() {
     );
 }
 
-/// **A malformed (incomplete) payload FAILS Git's decode — the seam shape is a real gate.** A payload
-/// missing a frozen field is a LOUD decode error (Git dead-letters it), proving the CDC's no-drift
-/// assertion above is a real constraint, not a vacuous pass.
 #[test]
 fn an_incomplete_payload_fails_the_git_decode() {
-    // A payload missing `summary` / `tenant` / etc. (the OLD divergent loose shape).
     let loose = serde_json::json!({
         "state": "success",
         "run_attempt": 1,

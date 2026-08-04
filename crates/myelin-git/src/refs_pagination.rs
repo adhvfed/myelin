@@ -1,12 +1,3 @@
-//! Bounded durable Git-ref summaries and stable keyset pagination.
-//!
-//! The namespace is scanned once per request under the wire ref-count and aggregate-name-byte
-//! ceilings. Only constant-size summary/default/HEAD facts plus the smallest `limit + 1` matching
-//! rows are retained. A cursor carries an order-independent namespace fingerprint, a scope hash for
-//! the verified repository path and normalized query, and the final key. These values are only
-//! consistency fences: callers must still perform their normal permission and ref/object resolution
-//! before reading any object.
-
 use std::cmp::Ordering;
 
 use base64::Engine as _;
@@ -14,14 +5,10 @@ use base64::Engine as _;
 use crate::core::Oid;
 use crate::durable::{DurableError, DurableGitRepo, WIRE_MAX_REFS};
 
-/// Default and maximum number of branch/tag rows in one page.
 pub const REFS_PAGE_DEFAULT_LIMIT: usize = 100;
 pub const REFS_PAGE_MAX_LIMIT: usize = 100;
-/// Maximum raw and normalized query bytes.
 pub const REFS_PAGE_MAX_QUERY_BYTES: usize = 256;
-/// Maximum one fully-qualified ref name accepted by the bounded namespace scanner.
 pub const WIRE_MAX_REF_NAME_BYTES: usize = 4 * 1024;
-/// Maximum aggregate fully-qualified ref-name bytes scanned in one request.
 pub const WIRE_MAX_REF_NAMES_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 
 const CURSOR_PREFIX: &str = "gr1_";
@@ -43,7 +30,6 @@ const WIRE_SCAN_LIMITS: ScanLimits = ScanLimits {
     total_name_bytes: WIRE_MAX_REF_NAMES_TOTAL_BYTES,
 };
 
-/// Branches sort before tags; names within each kind use raw UTF-8 byte order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RefKind {
     Branch,
@@ -86,13 +72,10 @@ impl RefKind {
     }
 }
 
-/// One direct branch or tag returned by a page or pin.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefPageItem {
     pub kind: RefKind,
-    /// Fully-qualified ref name. Consumers must use this exact name for subsequent resolution.
     pub qualified_name: String,
-    /// Display name with the `refs/heads/` or `refs/tags/` prefix removed.
     pub name: String,
     pub tip: Oid,
 }
@@ -106,27 +89,21 @@ impl RefPageItem {
     }
 }
 
-/// Constant-size facts computed without retaining the ref namespace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefsSummary {
     pub branch_count: usize,
     pub tag_count: usize,
-    /// HEAD's fully-qualified symbolic target, whether or not that target currently exists.
     pub head_symbolic_target: Option<String>,
-    /// Existing default branch selected by live HEAD, then `main`, then the first branch. Empty
-    /// repositories retain the legacy `main` display fallback with no `default_tip`.
     pub default_branch: String,
     pub default_tip: Option<Oid>,
 }
 
-/// Lightweight repository-catalogue classification based only on direct branch presence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CatalogueRepoState {
     Populated,
     Empty,
 }
 
-/// Additive page request. `current_ref`, when present, must be a fully-qualified branch/tag ref.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefsPageRequest {
     pub limit: usize,
@@ -146,18 +123,14 @@ impl Default for RefsPageRequest {
     }
 }
 
-/// One bounded page plus independently exposed current/default pins.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RefsPage {
     pub summary: RefsSummary,
     pub items: Vec<RefPageItem>,
-    /// At most current + default, deduplicated by fully-qualified ref name. Pins are outside the
-    /// query and page window so navigation cannot hide the active/default ref.
     pub pins: Vec<RefPageItem>,
     pub next_cursor: Option<String>,
 }
 
-/// Typed request/cursor failures, separate from durable repository failures.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RefsPageError {
     Durable(DurableError),
@@ -350,10 +323,6 @@ struct ScanResult {
 }
 
 impl DurableGitRepo {
-    /// Classify a repository for catalogue display without building a repository home. A repository
-    /// is populated iff at least one direct `refs/heads/*` target exists. The lookup checks a live
-    /// symbolic HEAD branch, then `main`, then a bounded branch-only iterator that stops at the first
-    /// direct target. It never scans tags or reads trees, blobs, README content, counts, or history.
     pub fn catalogue_repo_state(&self) -> Result<CatalogueRepoState, DurableError> {
         self.catalogue_repo_state_with_limits(WIRE_SCAN_LIMITS)
     }
@@ -411,14 +380,12 @@ impl DurableGitRepo {
         Ok(CatalogueRepoState::Empty)
     }
 
-    /// Scan branch/tag summary facts without retaining the namespace.
     pub fn refs_summary(&self) -> Result<RefsSummary, DurableError> {
         let repo = self.open_git()?;
         let head_target = read_head_target(&repo)?;
         Ok(scan_refs(&repo, head_target, None, None, None, 0, WIRE_SCAN_LIMITS)?.summary)
     }
 
-    /// Return a bounded, stable page of direct branches/tags.
     pub fn refs_page(&self, request: RefsPageRequest) -> Result<RefsPage, RefsPageError> {
         if request.limit == 0 || request.limit > REFS_PAGE_MAX_LIMIT {
             return Err(RefsPageError::InvalidLimit {
@@ -489,8 +456,6 @@ impl DurableGitRepo {
     }
 
     fn refs_scope_hash(&self, query: Option<&str>) -> Result<[u8; 32], DurableError> {
-        // `canonicalize` both proves the handle still names an existing repository and prevents two
-        // textual aliases for the same verified store path from yielding cross-scope cursors.
         let verified_path = std::fs::canonicalize(self.path()).map_err(|error| {
             DurableError::Io(format!(
                 "canonicalize repository {} for ref cursor: {error}",
@@ -608,8 +573,6 @@ fn scan_refs(
         let Some(target) = reference.target() else {
             continue;
         };
-        // Fence the complete direct namespace, not only pageable heads/tags. A concurrent custom
-        // ref change must not let a continuation pretend it observed one stable repository state.
         namespace.add(full_name, target);
         let Some((kind, short_name)) = RefKind::classify(full_name) else {
             continue;
@@ -1119,8 +1082,6 @@ mod tests {
             ));
         }
 
-        // A base64 spelling with non-zero discarded bits decodes to the same bytes in permissive
-        // decoders. Exact canonical re-encoding rejects it.
         let mut noncanonical = cursor.clone();
         let final_char = noncanonical.pop().expect("cursor char");
         let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";

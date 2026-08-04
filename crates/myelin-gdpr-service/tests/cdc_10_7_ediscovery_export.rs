@@ -1,25 +1,3 @@
-//! # CDC 10.7 — eDiscovery / legal-hold export (P-GA-26 → P-153)
-//!
-//! **Contract:** index row 10.7 — `ediscovery_export(scope) → MerkleProvenBundle`; content-
-//! addressed, inclusion-proof-bearing, legal-hold-frozen (gdpr §5.4). The same tamper-evident
-//! substrate (the per-tenant audit Merkle tree, contract 10.6) that proves "we erased it" (the DSR
-//! receipt) here proves "this is the unaltered record".
-//!
-//! The contract-coverage scanner (P-S21) reads BOTH halves of the pair from this file:
-//! - **provider** = `myelin_gdpr_service::EDiscoveryExporter` — the GDPR/Audit service's eDiscovery
-//!   authority. It assembles a subject/tenant/matter-scoped bundle over the per-tenant audit log,
-//!   attaches each record's inclusion proof against the bundle's signed tree head, freezes the scope
-//!   with a legal hold, and content-addresses the whole bundle.
-//! - **consumer** = a LEGAL / AUDITOR recipient — a downstream party (a regulator, opposing counsel,
-//!   a customer's legal team) that, holding ONLY the returned bundle + the published STH signing key,
-//!   VERIFIES the production was not altered: it re-derives the bundle content-address, checks the
-//!   STH signature, and verifies EVERY record's inclusion proof. This is the chain-of-custody an
-//!   eDiscovery production requires (§5.4 — "a recipient can *verify* the bundle was not altered").
-//!
-//! The dated green artifact: the provider exports a scope; the consumer (the auditor) verifies the
-//! whole bundle with only PII-free material — and a tampered/forged bundle is REJECTED. The export
-//! is legal-hold-frozen (a concurrent erase over the scope is deferred while the bundle is in flight).
-
 use myelin_events::{
     Actor, AggregateKey, CorrelationId, DataRole, EventEnvelope, EventHandler, EventId, EventType,
     Timestamp, Visibility,
@@ -63,15 +41,10 @@ fn action(id: &str, tenant: &str, subject: &str, correlation: &str) -> EventEnve
     }
 }
 
-/// The CONSUMER (the legal/auditor recipient): given the bundle + the published STH signing key,
-/// verify the whole production was not altered — re-derive the content-address, check the STH
-/// signature, verify EVERY record's inclusion proof. PII-free material only.
 fn auditor_verifies(bundle: &EDiscoveryBundle, published_key: &dyn SigningKey) -> bool {
-    // The bundle's own end-to-end verify (digest + STH + every proof).
     if !bundle.verify(published_key) {
         return false;
     }
-    // And independently: the auditor re-runs each record's inclusion proof against the bundle STH.
     bundle
         .records
         .iter()
@@ -80,12 +53,10 @@ fn auditor_verifies(bundle: &EDiscoveryBundle, published_key: &dyn SigningKey) -
 
 #[test]
 fn provider_exports_a_scope_and_the_auditor_consumer_verifies_the_chain_of_custody() {
-    // PROVIDER: the GDPR/Audit service builds the audit substrate + the exporter.
     let key = CellSigningKey::from_seed("cell:fr-par:audit-key");
     let authority = AuditAuthority::new(key);
     let holds = LegalHoldRegistry::new();
 
-    // Seed the per-tenant audit log: 3 actions about subject-A, 2 about subject-B.
     authority
         .consumer()
         .handle(&action("1", "acme", "myelin://acme/subj/A", "r-1"), &mut myelin_events::HandlerTx::none());
@@ -111,7 +82,6 @@ fn provider_exports_a_scope_and_the_auditor_consumer_verifies_the_chain_of_custo
         .export(&scope, "2026-06-20T01:00:00Z")
         .expect("a non-empty export");
 
-    // CONSUMER (the legal/auditor): verifies the chain of custody with only the bundle + the key.
     assert!(
         auditor_verifies(&bundle, authority.key()),
         "the auditor verifies the export was not altered (content-addressed + inclusion-proof-bearing)"
@@ -150,7 +120,6 @@ fn the_auditor_consumer_rejects_a_tampered_or_forged_bundle() {
         "the honest production verifies"
     );
 
-    // A DROPPED record (the producer tried to omit one) → the content-address no longer matches.
     let mut dropped = bundle.clone();
     dropped.records.pop();
     assert!(
@@ -158,7 +127,6 @@ fn the_auditor_consumer_rejects_a_tampered_or_forged_bundle() {
         "the auditor rejects a dropped record"
     );
 
-    // A FORGED STH (signed by a different cell key) → the signature check fails.
     let forged_key = CellSigningKey::from_seed("an-attackers-key");
     assert!(
         !auditor_verifies(&bundle, &forged_key),
@@ -168,8 +136,6 @@ fn the_auditor_consumer_rejects_a_tampered_or_forged_bundle() {
 
 #[test]
 fn the_export_is_legal_hold_frozen_so_a_concurrent_erase_is_deferred() {
-    // PROVIDER assembles the export; the legal-hold freeze means the CONSUMER's production cannot be
-    // shredded out from under it (gdpr §5.4 — legal-hold-frozen).
     let key = CellSigningKey::from_seed("cell:fr-par:audit-key");
     let authority = AuditAuthority::new(key);
     let holds = LegalHoldRegistry::new();
@@ -186,7 +152,6 @@ fn the_export_is_legal_hold_frozen_so_a_concurrent_erase_is_deferred() {
         subject: SubjectRef::new(principal),
         tenant: TenantId("acme".into()),
     };
-    // Before the export, a DSR erase over the subject would PROCEED.
     assert_eq!(
         holds.verdict(DsrKind::Erasure, &erase_scope),
         HoldVerdict::Proceed
@@ -200,8 +165,6 @@ fn the_export_is_legal_hold_frozen_so_a_concurrent_erase_is_deferred() {
     let bundle = exporter.export(&scope, "t").expect("export");
     assert!(bundle.legal_hold_frozen, "the bundle records the freeze");
 
-    // After the export, the SAME hold gate the DSR fan-out passes through DEFERS the erase — the
-    // production is frozen while a legal matter is open.
     assert_eq!(
         holds.verdict(DsrKind::Erasure, &erase_scope),
         HoldVerdict::Deferred,

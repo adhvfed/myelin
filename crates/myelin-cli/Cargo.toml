@@ -5,16 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The `myelin` CLI (E0.9 / MR-020): the ONE local command surface a HUMAN or an AGENT drives the
-# product through. It is an edge CLIENT — it presents a REAL capability token as `Authorization:
-# Bearer <paseto>` and calls the MR-014 gateway's `/v1/...` endpoints, under the SAME auth + audit a
-# browser session is (agent governance from day one). A LEAF BINARY: it depends on the subsystem
-# command grammars (myelin-git / myelin-issues `api::parse_cli`, myelin-notif `cli`) + a tiny HTTP
-# client, and NOTHING
-# in the production crate DAG depends back on it. Like myelin-edge it is NOT a node in the eleven-crate
-# library DAG modelled by myelin-substrate::crate_graph (substrate_is_root()/identity_is_sink()
-# unaffected). See src/lib.rs.
-
 [lib]
 path = "src/lib.rs"
 
@@ -23,39 +13,19 @@ name = "myelin"
 path = "src/main.rs"
 
 [dependencies]
-# clap — the arg-parsing framework the ledger names ("clap binary"). It owns ONLY the top-level shell
-# (`myelin <subsystem> ...` + the global flags + `login`/`whoami`); the per-subsystem command SET is
-# REUSED from the subsystem crates (anti-duplication), so new git/Issues commands in api.rs flow to
-# the CLI without re-declaring them here.
 clap = { version = "4", features = ["derive"] }
 
-# REUSE the git CLI command grammar (api::parse_cli / CliCommand) — the CLI does NOT re-derive git's
-# commands; it parses with git's own total parser and maps the parsed command to the edge route.
 myelin-git = { path = "../myelin-git" }
-# REUSE the Issues-owned total command grammar (`myelin_issues::api`) and map it to the existing
-# durable Edge routes. The CLI never re-declares Issue verbs or accepts tenant/region selectors.
 myelin-issues = { path = "../myelin-issues" }
-# REUSE CI's owned durable-read/live grammar. The CLI maps it to the authenticated Edge routes;
-# `watch` consumes the durable resume-cursor stream and fetches bytes through the archive reader.
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
-# REUSE the notif CLI grammar (cli::CliView — the named scoped views + verb set).
 myelin-notif = { path = "../myelin-notif" }
 
-# The {items,page} + {error:{message,code}} envelopes + the rendered view-models are serde_json::Value
-# (the one workspace-pinned JSON shape) — the CLI parses/renders them directly.
 serde_json = { workspace = true }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
-# Build strict form-query strings for paginated Edge calls without interpolating cursor bytes.
 percent-encoding = "2.3"
 
-# ----------------------------------------------------------------------------------------------
-# THE HTTP CLIENT — hyper 1.x + rustls DIRECTLY (no reqwest). Every crate below is ALREADY in
-# Cargo.lock through the storage/AWS stack, so promoting verified HTTPS support adds no new package.
-# Native roots admit enterprise/private CAs installed by the operator while rustls still verifies the
-# server name and certificate chain. Plain HTTP is accepted only for loopback development endpoints.
-# ----------------------------------------------------------------------------------------------
 hyper = { version = "1", features = ["client", "http1"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "aws-lc-rs", "tls12"] }
@@ -65,19 +35,8 @@ bytes = "1"
 tokio = { version = "1", features = ["rt", "net", "macros", "io-util", "time"] }
 
 [dev-dependencies]
-# The integration proof spins up the REAL edge in-process (a known cell seed so a token can be minted
-# — the deployable `edge` binary generates a random cell with no mint API yet) over a real TCP socket,
-# then runs the `myelin` binary as a subprocess against it. These build the gateway + mint a REAL
-# PASETO capability token (genuine Ed25519 crypto).
-# MR-009b W3b.6: + `test-support` — the tests build the edge in-memory git backend double
-# (`DurableGitBackend::rooted_inmem_for_test`), now gated with the events in-memory OutboxStore.
 myelin-edge = { path = "../myelin-edge", features = ["test-support"] }
 myelin-identity = { path = "../myelin-identity" }
-# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
-# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
-# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-# MR-009b Wave 5: + `test-support` — the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]`; this crate's DEV tests construct it. DEV-only.
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-tenancy = { path = "../myelin-tenancy" }

@@ -1,34 +1,3 @@
-//! # The `SCHEDULE_AND_RUN_JOB` effectively-once drill — CI-D1 (CI-P16 → P-359, M4)
-//!
-//! **The CI-P16 GATE (the drill catalogue row CI-D1, EI-01 §4 — chain mutations end-to-end):** kill
-//! the runner mid-job; kill the control plane mid-run → the run RESUMES (the durable-workflow replay +
-//! the `SCHEDULE_AND_RUN_JOB` idempotent re-dispatch on the engine-minted `idem_token`) → **0 lost
-//! runs, 0 double-deploys, 0 duplicate artifact publishes** (effectively-once) — double-effect count =
-//! 0.
-//!
-//! The drill runs the REAL `ci.pipeline` body ([`run_ci_pipeline_body`]) under the REAL durable
-//! dispatcher ([`myelin_flow::FlowDispatcher`]), with the REAL CI dispatch handshake
-//! ([`myelin_ci_controlplane::SchedulerJobRunner`]) enqueuing each stage's job into a REAL CI
-//! scheduler ([`myelin_ci_controlplane::SchedulerState`] `job_queue`). The two kills are injected:
-//!
-//! - **Kill the runner mid-job** — a runner claims+leases the dispatched job, then DIES; the
-//!   dead-runner reaper sweeps the expired lease back to `queued` (CI-P12). The dispatch's
-//!   deterministic `idem_token` makes the re-claim a re-attempt of the SAME job (the `jq_idem` unique
-//!   keeps it ONE `job_queue` row).
-//! - **Kill the control plane mid-run** — a FRESH dispatcher worker re-drives the run off the journal
-//!   (a new process). The dispatch activity SHORT-CIRCUITS (0 re-dispatch); the re-driven body
-//!   redundantly re-dispatches the un-journaled stage idempotently (still ONE row).
-//!
-//! The double-effect probe is the **`job_queue` row count per stage** (the dispatch enqueue is the
-//! observable side effect that, doubled, would double-deploy / double-publish) PLUS the **runner's
-//! observed dispatch-accept count** vs the **distinct jobs that actually reached the queue**. The
-//! invariant: across every kill + replay, each stage is ONE `job_queue` row, completed ONCE.
-//!
-//! The in-sandbox EXECUTION of the dispatched job (`ToolHands::exec`) is GATED by AG-D4; this drill
-//! exercises the dispatch handshake + the effectively-once invariant over the scheduler model + the
-//! engine, with the runner's terminal `job.done` standing in for the sandboxed completion. The
-//! reserve/settle metering into `cost_event` is CI-P17.
-
 use myelin_ci_controlplane::ci_pipeline::{
     run_ci_pipeline_body, CheckFacts, PipelineRun, PipelineStage,
 };
@@ -85,7 +54,6 @@ fn facts() -> CheckFacts {
     }
 }
 
-/// The reference run: two ordered runner stages (`build` → `test`), each a `SCHEDULE_AND_RUN_JOB`.
 fn run_spec() -> PipelineRun {
     PipelineRun {
         stages: vec![
@@ -107,7 +75,6 @@ fn run_spec() -> PipelineRun {
     }
 }
 
-/// The CI run's scheduling terms (a PURE function of the snapshot).
 fn terms(run_id: &str) -> JobScheduleTerms {
     JobScheduleTerms::new(
         "acme",
@@ -119,9 +86,6 @@ fn terms(run_id: &str) -> JobScheduleTerms {
     )
 }
 
-/// A `JobRunner` that wraps the REAL [`SchedulerJobRunner`] and ALSO counts every dispatch ACCEPT (so
-/// the drill can assert the engine's replay short-circuit = 0 re-dispatch, while the underlying
-/// `jq_idem` keeps it ONE row even when a re-dispatch DOES reach the runner).
 #[derive(Clone)]
 struct CountingSchedulerRunner {
     inner: SchedulerJobRunner,
@@ -143,7 +107,6 @@ impl JobRunner for CountingSchedulerRunner {
     }
 }
 
-/// The registered `ci.pipeline` body closure.
 fn ci_pipeline_body(runner: CountingSchedulerRunner) -> Box<WorkflowBody> {
     Box::new(move |ctx: &mut WfCtx| {
         let verdict =
@@ -172,8 +135,6 @@ struct Substrate {
     timers: TimerStore,
 }
 
-/// A FRESH dispatcher worker (a NEW control-plane process — the "kill the control plane" injection: a
-/// new worker re-drives the run off the shared journal/run-store).
 fn fresh_worker(
     sub: &Substrate,
     worker: &str,
@@ -219,7 +180,6 @@ fn start(idem: &str) -> (FlowExecutor, myelin_flow::RunId, Substrate) {
     (ex, run, sub)
 }
 
-/// The deterministic dispatch `idem_token` for the Nth runner stage (= the `job_queue` job_id).
 fn stage_token(run_id: &str, stage_idx: usize) -> String {
     job_idem_token(run_id, &format!("{CI_PIPELINE_WF_TYPE}:{}", stage_idx * 2))
 }
@@ -241,9 +201,6 @@ fn deliver_stage_done(
     .expect("deliver job.done")
 }
 
-/// **CI-D1 — kill the runner mid-job + kill the control plane mid-run → effectively-once (0 lost runs,
-/// 0 double-deploys, 0 duplicate publishes; double-effect count = 0).** The drill chains the two kills
-/// end-to-end across a two-stage run and asserts each stage is ONE `job_queue` row, completed ONCE.
 #[test]
 fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
     let (ex, run, sub) = start("ci.pipeline:pr-7:run-1");
@@ -251,7 +208,6 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
     let scheduler = Arc::new(Mutex::new(SchedulerState::new()));
     let runner = CountingSchedulerRunner::new(scheduler.clone(), &run.0);
 
-    // ── DRIVE 1: dispatch `build` (enqueue ONE job_queue row) + park on its job.done.
     let w1 = fresh_worker(&sub, "worker-1", part, runner.clone());
     assert_eq!(
         w1.tick(1_000, "2026-06-23T00:00:00Z", 7).expect("drive 1"),
@@ -269,7 +225,6 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
         );
     }
 
-    // ── KILL THE RUNNER MID-JOB: a runner claims+leases build, then DIES; the reaper re-queues it.
     {
         let mut s = scheduler.lock().unwrap();
         let claim = ClaimRequest {
@@ -281,20 +236,16 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
         };
         let claimed = s.claim(&claim).expect("the runner claims build");
         assert_eq!(claimed.job_id, build_token, "build leased");
-        // the runner DIES — advance past the lease + reap (the dead-runner reaper, CI-P12).
         s.advance(50);
         let reaped = s.reap();
         assert_eq!(reaped.len(), 1, "the dead runner's build lease was reaped");
         assert_eq!(
             s.state_of("acme", &build_token),
             Some(JobState::Queued),
-            "build re-queued IN PLACE (one row) — claimable by a fresh runner"
+            "build re-queued IN PLACE (one row) - claimable by a fresh runner"
         );
     }
 
-    // ── KILL THE CONTROL PLANE MID-RUN: a FRESH worker re-drives off the journal. The dispatch
-    // SHORT-CIRCUITS (0 re-dispatch into the engine); the body still parks on build (only a journaled
-    // job.done advances it). The reaper re-queue + the engine replay leave build as ONE row.
     sub.runs.wake(&tenant(), &run.0);
     let accepts_before_replay = runner.accepts.load(Ordering::SeqCst);
     let w_replay = fresh_worker(&sub, "worker-replay", part, runner.clone());
@@ -315,12 +266,10 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
         assert_eq!(
             s.jobs().len(),
             1,
-            "STILL one build row after runner-kill + control-plane-kill (0 double-deploy — CI-D1)"
+            "STILL one build row after runner-kill + control-plane-kill (0 double-deploy - CI-D1)"
         );
     }
 
-    // ── The fresh runner claims the re-queued build + completes it. Deliver build's job.done TWICE
-    // (at-least-once under the bus) — the engine wakes ONCE; complete_job terminates the row ONCE.
     {
         let mut s = scheduler.lock().unwrap();
         let claim = ClaimRequest {
@@ -342,7 +291,7 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
     );
 
     let s1 = deliver_stage_done(&ex, &run, 0, "build", true);
-    let s2 = deliver_stage_done(&ex, &run, 0, "build", true); // DOUBLE delivery (at-least-once).
+    let s2 = deliver_stage_done(&ex, &run, 0, "build", true);
     assert_eq!(
         s1,
         SignalOutcome::Buffered,
@@ -351,10 +300,9 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
     assert_eq!(
         s2,
         SignalOutcome::Duplicate,
-        "the second job.done is a DUPLICATE no-op (the wf_signal PK dedup — one wake)"
+        "the second job.done is a DUPLICATE no-op (the wf_signal PK dedup - one wake)"
     );
 
-    // ── Advance to `test` (build's journaled job.done → the body dispatches test).
     sub.runs.wake(&tenant(), &run.0);
     let w2 = fresh_worker(&sub, "worker-2", part, runner.clone());
     assert_eq!(
@@ -366,7 +314,6 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
     let test_token = stage_token(&run.0, 1);
     {
         let s = scheduler.lock().unwrap();
-        // build (terminal) + test (queued) = 2 rows, each ONE.
         assert_eq!(
             s.jobs().len(),
             2,
@@ -384,7 +331,6 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
         );
     }
 
-    // ── test completes → the run reaches SUCCESS and emits the X-1 producer facts ONCE.
     let _ = complete_job(&scheduler, "acme", &test_token).expect("complete test");
     deliver_stage_done(&ex, &run, 1, "test", true);
     sub.runs.wake(&tenant(), &run.0);
@@ -396,40 +342,36 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
         DriveOutcome::Completed(refs) => assert_eq!(
             refs,
             &vec![ArtifactRef("verdict:succeeded:2".into())],
-            "the run COMPLETED — both stages, effectively-once across every kill"
+            "the run COMPLETED - both stages, effectively-once across every kill"
         ),
         other => panic!("the run should COMPLETE, got {other:?}"),
     }
 
-    // ── THE EFFECTIVELY-ONCE INVARIANT (the double-effect probe = 0):
     {
         let s = scheduler.lock().unwrap();
         assert_eq!(
             s.jobs().len(),
             2,
-            "exactly TWO job_queue rows across the WHOLE run (build + test) — 0 double-deploy"
+            "exactly TWO job_queue rows across the WHOLE run (build + test) - 0 double-deploy"
         );
-        // distinct idem_tokens (= job_ids) = 2: no stage was ever enqueued twice.
         let distinct: std::collections::BTreeSet<_> =
             s.jobs().iter().map(|j| j.idem_token.clone()).collect();
         assert_eq!(
             distinct.len(),
             2,
-            "two DISTINCT idem_tokens — no duplicate job (0 duplicate publish)"
+            "two DISTINCT idem_tokens - no duplicate job (0 duplicate publish)"
         );
         assert!(
             s.jobs().iter().all(|j| j.state == JobState::Terminal),
             "both stages terminated ONCE"
         );
     }
-    // run state = completed → 0 lost runs.
     assert_eq!(
         sub.runs.get(&tenant(), &run.0).unwrap().state,
         run_state::COMPLETED,
         "the run reached a terminal COMPLETED state (0 lost runs)"
     );
 
-    // The X-1 producer facts land EXACTLY ONCE (the body emitted them on the single terminal drive).
     let types: Vec<String> = sub
         .outbox
         .committed_rows()
@@ -449,7 +391,7 @@ fn ci_d1_kill_runner_and_control_plane_mid_run_is_effectively_once() {
     assert_eq!(
         types.iter().filter(|t| *t == CI_RESULT).count(),
         1,
-        "the ci.result rollup emitted EXACTLY once (wakes Git's merge queue ONCE — 0 double-merge)"
+        "the ci.result rollup emitted EXACTLY once (wakes Git's merge queue ONCE - 0 double-merge)"
     );
 
     println!(

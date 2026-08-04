@@ -5,19 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-content is in the mid-tier of the DAG (architecture 00 §2.9). It depends on
-# tenancy + events (for ArtifactRef, which its inline `artifact_ref`/`embed` nodes
-# carry). It MUST NOT depend on -agent, -gdpr, -client, or -substrate (downstream).
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-events = { path = "../myelin-events" }
 myelin-identity = { path = "../myelin-identity" }
-# myelin-query is a same-tier mid-DAG crate (00 §2.9: `-events (+ -refs, -content, -query)`);
-# `db_view.view` carries the frozen `myelin_query::ViewSpec` (13.3), swapping the KN-P01
-# `ViewHandle` floor (P-235/KN-P02). query is std-only + serde-only, so it stays WASM-clean.
 myelin-query = { path = "../myelin-query" }
 serde.workspace = true
-# JSON for the per-owner reindex `replay` body (EB-26 / P-246, M3): KN's `KnowledgeReindexSource`
-# re-emits `*.snapshot` drafts carrying the live block payload (`serde_json::Value`, references-not-
-# payloads). serde_json is pure-Rust + std-only, so the crate stays WASM-clean.
 serde_json.workspace = true

@@ -1,41 +1,13 @@
-//! # Git wired through the product edge — the DURABLE front door (GT-003 / E1.2)
-//!
-//! MR-015 wired git's routes through the edge but its write handlers returned `{ durable: false }`
-//! (honest stubs over the in-memory [`crate::GitEdgeState`]). GT-003 replaces the in-memory write source
-//! at the LIVE front door with the **real on-disk durable backend** (GT-001):
-//!
-//! - **create-repo** → [`myelin_git::durable::DurableGitStore::create_repo`] (a real bare repo persists);
-//! - **web-edit commit / ref-update** → the durable per-ref CAS over
-//!   [`myelin_git::receive_pack::RefStore::open_durable`] (the SAME one-transaction ref-CAS + outbox
-//!   emit the push path uses — `durable: true`; a stale base is still the honest `409`);
-//! - **open-PR / review / merge / endorse** → the durable [`myelin_git::pr_store::DurablePrStore`] +
-//!   the reused [`myelin_git::lifecycle`] / [`myelin_git::merge_gate`] / [`myelin_git::fork_gate`]
-//!   logic — a merge advances the target ref via the durable CAS ONLY after the merge-gate + fork-trust
-//!   gate admit (never a bypass);
-//! - **reads (repo list / blob view / PR overview / checks)** reflect the DURABLE on-disk state (the real
-//!   repo + the durable PR record), not a seeded in-memory ViewModel.
-//!
-//! The gateway still owns auth / tenant-from-token / IDOR / error / pagination (unchanged); every write
-//! is under `ctx.scope` (the verified token's tenant + region) and the validated, traversal-safe resolver
-//! (a repo under tenant A is never reachable via tenant B's locator). The reconciler
-//! ([`myelin_git::reconcile`]) heals the apply-after-outbox-commit window before this front door serves.
-//!
-//! `myelin-git` PG-home for PR/review rows (the MR-022 provider) is the named **GT-003b** follow-on; the
-//! durable medium here is on-disk repo metadata (path-isolated via the same resolver — GT-003 §2 option).
-
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
 use crate::repo_authz::{DenyAllRepos, RepoAuthorizer, RepoPermission};
-// `AllowAllRepos` is now constructed ONLY by the test-support `rooted_inmem_for_test` helper (R2.6:
-// the prod default is fail-closed `DenyAllRepos`), so its import is test-support-gated too.
 #[cfg(any(test, feature = "test-support"))]
 use crate::repo_authz::AllowAllRepos;
 use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
 use crate::request::{EdgeRequest, EdgeResponse};
 use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
-// Used only by the `test-support`-gated `rooted_inmem_for_test` helper (MR-009b W3b.6).
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::MonotonicMinter;
 use myelin_git::api::{
@@ -89,7 +61,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-/// Verified request identity and repository route coordinates for a Git edge operation.
 #[derive(Clone, Copy)]
 pub struct RepoActorContext<'a> {
     tenant: &'a str,
@@ -99,7 +70,6 @@ pub struct RepoActorContext<'a> {
 }
 
 impl<'a> RepoActorContext<'a> {
-    /// Bind route coordinates to the already-authenticated principal.
     pub fn new(tenant: &'a str, region: &'a str, slug: &'a str, principal: &'a Principal) -> Self {
         Self {
             tenant,
@@ -109,7 +79,6 @@ impl<'a> RepoActorContext<'a> {
         }
     }
 
-    /// Add the pull-request number required by PR-scoped operations.
     pub fn for_pr(self, number: u64) -> PrActorContext<'a> {
         PrActorContext { repo: self, number }
     }
@@ -126,7 +95,6 @@ impl core::fmt::Debug for RepoActorContext<'_> {
     }
 }
 
-/// Authenticated repository context plus a pull-request number.
 #[derive(Clone, Copy)]
 pub struct PrActorContext<'a> {
     repo: RepoActorContext<'a>,
@@ -142,63 +110,22 @@ impl core::fmt::Debug for PrActorContext<'_> {
     }
 }
 
-/// **The durable on-disk git backend the edge writes/reads through (GT-003).** Holds the durable git
-/// store + the durable PR store rooted at one on-disk root, plus the shared outbox + id minter the ref
-/// CAS co-commits its `git.ref.updated` through (the reconciler replays this outbox). The `(tenant,
-/// region)` is taken from `ctx.scope` per request — never from the URL/body (the GIT-D8 invariant).
 pub struct DurableGitBackend {
     store: DurableGitStore,
-    /// Filesystem authority retained for repository-owned branch-protection policy and explicit
-    /// legacy/test PR fixtures only. Production PR lifecycle records never read or write here.
     prs: DurablePrStore,
-    /// Production PR lifecycle authority. `None` exists only in the test-support constructor so the
-    /// long-standing filesystem fixtures remain hermetic.
     pg_prs: Option<PgPrStore>,
-    /// Git-owned durable projection of CI check facts. Production always supplies it; test-support
-    /// constructors leave it absent and continue to use explicit PR-record fixtures.
     checks: Option<myelin_git::check_status_store::PgCheckStatusProjection>,
-    /// **R3.3 / R3.2 — the durable PR review-thread / comment / review-batch store.** Keyed by the
-    /// canonical `object_key` (`pr:<slug>:<n>`); rooted at the SAME on-disk root as `store`/`prs`.
     threads: DurablePrThreadStore,
     outbox: OutboxStore,
     minter: Arc<dyn IdMinter>,
-    /// **F3 (R4.1 dogfood) — the PUBLIC base URL prefix for the HTTP git-wire clone URL.** The wire is
-    /// HTTP smart-transport ONLY (there is NO SSH server), and its real path grammar is
-    /// `/{tenant}/{region}/{repo}.git` — so the clone URL rendered into every repo-home ViewModel must
-    /// be `{base}/{tenant}/{region}/{repo}.git`, never the old hardcoded `ssh://git@myelin/{tenant}/…`
-    /// (wrong scheme, missing region, wrong slug). The edge does not inherently know its own external
-    /// origin, so the composition root injects its validated `MYELIN_PUBLIC_BASE_URL` (e.g.
-    /// `https://git.example.com`); an empty value yields an HONEST relative
-    /// `/{tenant}/{region}/{repo}.git` (a real path on this host) rather than a fabricated hostname.
     clone_base: String,
-    /// The on-disk root holding `<tenant>/<region>/<repo>.git` bare repos — retained so the wire-serving
-    /// tier (CT-006b) composes its sandboxed `GitCore` over the SAME root the durable store reads/writes.
     root: PathBuf,
-    /// Process shutdown propagated into every per-request gVisor executor so `runsc` is killed and
-    /// reaped before the HTTP drain deadline instead of outliving an aborted async task.
     git_shutdown: Arc<AtomicBool>,
-    /// Per-wire short-lived credential authority. Production defaults unavailable/fail-closed until
-    /// the composition root injects the live Identity adapter; test support injects an explicit
-    /// deterministic issuer.
     git_wire_credentials: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuerFactory>,
-    /// **R0.3 / DELTA N2 — the per-repo object-authorization seam for the git wire.** The wire handlers
-    /// consult this AFTER `repo_loc` resolves the repo and BEFORE serving any bytes, so an in-tenant
-    /// principal with no grant on a repo cannot clone/fetch/push it (the un-granted-repo-reach hole,
-    /// closed). Defaults to the [`AllowAllRepos`] fixture (the happy-path wire proofs dispatch);
-    /// production boot injects a grant-backed authorizer via [`DurableGitBackend::with_repo_authorizer`]
-    /// — the R2 platform-wide object-authz seam backs this with the real tuple store / Identity `check`.
     repo_authz: Arc<dyn RepoAuthorizer>,
-    /// **R2.1a — the repo-create bootstrap-grant seam.** Consulted by
-    /// [`DurableGitBackend::create_repo_as`] BEFORE the bare repo lands on disk: production injects
-    /// [`crate::repo_authz_live::TupleRepoBootstrap`] (the creator→admin tuple through
-    /// `write_tuples`, 4.6) so a fresh repo is immediately reachable by its creator under the
-    /// deny-by-default [`crate::repo_authz_live::CheckBackedRepoAuthorizer`]. Defaults to the no-op
-    /// (paired with the `AllowAllRepos` fixture, where no grant is needed). A grant failure ABORTS
-    /// the create (fail-closed — never a repo no one can reach).
     bootstrap: Arc<dyn RepoBootstrapGrants>,
 }
 
-/// Loud summary of one placement-derived tenant recovery pass performed before serving starts.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitBootRecoveryReport {
     pub repos_reconciled: usize,
@@ -206,7 +133,6 @@ pub struct GitBootRecoveryReport {
     pub merges_recovered: usize,
 }
 
-/// Cell-wide aggregate for the placement-derived boot pass.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitCellBootRecoveryReport {
     pub tenants_recovered: usize,
@@ -215,9 +141,6 @@ pub struct GitCellBootRecoveryReport {
     pub merges_recovered: usize,
 }
 
-/// Derive recovery scopes only from the durable local-tenant directory plus its canonical placement
-/// row, then recover each active tenant. This is shared by Edge and MCP boot so neither process mints
-/// tenant authority from Git filesystem paths or an incoming request.
 pub async fn recover_placed_git_at_boot(
     backend: &DurableGitBackend,
     provider: &SubstrateProvider,
@@ -280,10 +203,6 @@ pub async fn recover_placed_git_at_boot(
     Ok(report)
 }
 
-/// One PR enriched for a list row (R3.1): the durable record + the rolled-up checks summary (Q4 —
-/// rolled up in ONE pass, no N+1) + whether the viewer is a requested reviewer + the repo slug
-/// (cross-repo rows only). The `summary` FAILS STATIC (`Unavailable`) if the repo's branch-protection
-/// config could not be read — the row still lists (ux-git #5: a checks hiccup never blanks the row).
 struct EnrichedPr {
     rec: PrRecord,
     summary: ChecksSummary,
@@ -326,17 +245,6 @@ impl CrossPrListLimits {
 }
 
 impl DurableGitBackend {
-    /// Root the durable backend at an on-disk directory holding `<tenant>/<region>/<repo>.git` repos —
-    /// the same root the durable git store + read backend resolve against. The wire object-authz seam
-    /// (R0.3) defaults to [`AllowAllRepos`]; production injects a grant-backed authorizer via
-    /// [`DurableGitBackend::with_repo_authorizer`].
-    ///
-    /// **The outbox + id minter are INJECTED (MR-009b W3b.4 — the composition root owns
-    /// durability):** the production `main.rs` passes `OutboxStore::durable(PgOutboxBacking)` over
-    /// the MR-022 provider pool AND a UNIQUE id source (`myelin_events::UlidMinter` — NEVER the
-    /// per-instance-resetting default `MonotonicMinter`, whose colliding `event_id`s the durable
-    /// path's `ON CONFLICT (event_id) DO NOTHING` silently drops; the W3b.3 named condition). A
-    /// test passes the in-memory `OutboxStore::new()` double + a seeded deterministic minter.
     pub fn rooted(
         root: impl Into<PathBuf>,
         public_clone_base: impl Into<String>,
@@ -356,35 +264,18 @@ impl DurableGitBackend {
             threads: DurablePrThreadStore::rooted(root.clone()),
             outbox,
             minter,
-            // F3: only the composition root's already validated public URL reaches clone responses.
             clone_base: public_clone_base.into().trim_end_matches('/').to_string(),
             root,
             git_shutdown: Arc::new(AtomicBool::new(false)),
             git_wire_credentials:
                 crate::git_wire_exec::unavailable_git_wire_credential_issuer_factory(),
-            // R2.6: the prod constructor default is FAIL-CLOSED (`DenyAllRepos`) — a composition root
-            // that forgets `with_repo_authorizer` denies every repo rather than serving all of them.
-            // Production `main.rs` ALWAYS injects the real `CheckBackedRepoAuthorizer`; the permissive
-            // `AllowAllRepos` fixture now lives ONLY in the test-support `rooted_inmem_for_test` below.
             repo_authz: Arc::new(DenyAllRepos),
             bootstrap: Arc::new(NoRepoBootstrap),
         })
     }
 
-    /// The in-memory-floor constructor for tests/drills: `rooted` over the in-memory outbox double
-    /// plus the seeded deterministic `MonotonicMinter` (the pre-W3b.4 shape). Production roots use
-    /// [`DurableGitBackend::rooted`] with a durable store + `UlidMinter` — this helper exists so
-    /// the many test call sites stay one-line and the production signature stays injection-first.
-    /// NOT a production path: the memory store loses events on restart (SI-007). MR-009b W3b.6
-    /// gated `OutboxStore::new` — so this helper is `test-support`-gated with it, exactly as the
-    /// W3b.4 note promised.
     #[cfg(any(test, feature = "test-support"))]
     pub fn rooted_inmem_for_test(root: impl Into<PathBuf>) -> DurableGitBackend {
-        // The test/drill floor defaults to the permissive `AllowAllRepos` fixture so the many
-        // non-authz test call sites stay one-line (each authz test overrides via
-        // `with_repo_authorizer`). This is the ONLY `AllowAllRepos` construction left, and it is
-        // inside this `test-support`-gated helper — never a production path (R2.6: prod `rooted`
-        // fails closed with `DenyAllRepos`).
         let root = root.into();
         DurableGitBackend {
             store: DurableGitStore::rooted(root.clone()),
@@ -403,10 +294,6 @@ impl DurableGitBackend {
         }
     }
 
-    /// **Inject the R0.3 per-repo object authorizer** (the wire object-authz seam) — the analogue of
-    /// injecting the Identity-M1 [`Authorizer`](myelin_substrate::Authorizer) into the gateway. Boot
-    /// wires the real grant-backed authorizer here; tests default to the [`AllowAllRepos`] fixture.
-    /// **TODO(R2):** back this with the platform-wide object-authz tuple store / Identity `check()`.
     pub fn with_repo_authorizer(
         mut self,
         repo_authz: Arc<dyn RepoAuthorizer>,
@@ -415,16 +302,10 @@ impl DurableGitBackend {
         self
     }
 
-    /// The injected R0.3 per-repo object authorizer (the wire handlers consult this before serving).
     pub fn repo_authorizer(&self) -> &Arc<dyn RepoAuthorizer> {
         &self.repo_authz
     }
 
-    /// **Inject the R2.1a repo-create bootstrap-grant writer** (the pair of
-    /// [`DurableGitBackend::with_repo_authorizer`]: deny-by-default is only livable if a fresh
-    /// repo's creator is granted on create). Production wires
-    /// [`crate::repo_authz_live::TupleRepoBootstrap`] over the SAME tuple store the injected
-    /// authorizer's engine reads.
     pub fn with_repo_bootstrap(
         mut self,
         bootstrap: Arc<dyn RepoBootstrapGrants>,
@@ -433,14 +314,11 @@ impl DurableGitBackend {
         self
     }
 
-    /// Bind the production process shutdown flag shared by upload-pack and receive-pack executors.
     pub fn with_git_shutdown_signal(mut self, shutdown: Arc<AtomicBool>) -> DurableGitBackend {
         self.git_shutdown = shutdown;
         self
     }
 
-    /// Bind the live Identity credential authority used immediately before each Git wire sandbox
-    /// launch. Without this injection the production default refuses every wire invocation.
     pub fn with_git_wire_credential_issuer(
         mut self,
         issuer: Arc<dyn crate::git_wire_exec::GitWireCredentialIssuerFactory>,
@@ -449,12 +327,6 @@ impl DurableGitBackend {
         self
     }
 
-    /// **The wire-serving `GitCore` over the SAME on-disk root (CT-006b / GT-006).** Composes the
-    /// production sandboxed [`crate::git_wire_exec::GitWireExecutor`] (wire ops → canonical `git` in the
-    /// hardened gVisor sandbox, no-host-exec) with the in-process [`myelin_git::gix_backend::GixCore`]
-    /// read backend. `advertise_refs(repo, UploadPack)` / `serve(repo, UploadPack, request)` flow
-    /// through here against the real on-disk bare repos. The HTTP smart-transport listener that drives
-    /// this over the wire (+ the receive-pack/PUSH path) is CT-006c.
     pub fn wire_serving(
         &self,
         principal: &Principal,
@@ -471,17 +343,10 @@ impl DurableGitBackend {
         )
     }
 
-    /// The shared outbox (so the reconciler / a relay can read the committed `git.ref.updated` rows).
     pub fn outbox(&self) -> &OutboxStore {
         &self.outbox
     }
 
-    /// **The GT-003 recovery boot-hook (required before the front door serves).** Replay the committed
-    /// `git.ref.updated` rows against one repo's on-disk refs, healing the apply-after-outbox-commit
-    /// window ([`myelin_git::reconcile`]) — idempotent on `update_seq`. The production composition root
-    /// drives this for every repo in the placement registry on boot, over the durable outbox tier
-    /// (the events crate's `outbox` table); the edge's in-memory [`OutboxStore`] is the model of that
-    /// tier. A repo with no behind refs is a clean no-op.
     pub fn reconcile_repo(
         &self,
         tenant: &str,
@@ -511,11 +376,6 @@ impl DurableGitBackend {
         myelin_git::reconcile::reconcile_refs(&repo, records)
     }
 
-    /// Recover every durable Git write known for a placement-validated tenant before serving. The
-    /// repository discovery set is exclusively durable authority: scoped committed ref witnesses
-    /// union scoped pending merge intents. Filesystem directory names never mint recovery scope.
-    /// Every target repository is opened and its ref witnesses reconciled before any pending merge
-    /// intent is drained; an absent/corrupt target fails boot loud.
     pub fn recover_tenant_at_boot(
         &self,
         scope: &TenantScope,
@@ -591,9 +451,6 @@ impl DurableGitBackend {
         RepoLoc::new(tenant, region, slug)
     }
 
-    /// Mint the database scope only from the verified principal, then require the route-derived
-    /// locator to agree. A forged tenant/region argument is indistinguishable from an absent
-    /// partition and never becomes query authority.
     fn verified_pr_scope(
         principal: &Principal,
         loc: &RepoLoc,
@@ -619,10 +476,6 @@ impl DurableGitBackend {
         }
     }
 
-    /// Materialized migration seam for
-    /// `pull_request.review = reviewer ∪ parent_repo->push`. The PR relation tuples are not yet
-    /// projected into Identity, so settle the same union from the durable requested-reviewer fact
-    /// and the live repo permission. Any row lookup failure denies.
     pub(crate) fn authorize_pr_review(
         &self,
         tenant: &str,
@@ -786,13 +639,10 @@ impl DurableGitBackend {
             .map_err(|_| EdgeError::BadRequest("invalid `Idempotency-Key` header".into()))
     }
 
-    /// The GIT-1 tenant pseudonym for a principal (`<principal>@<tenant>.noreply`) — never a raw identity.
     fn pseudonym(tenant: &str, principal: &Principal) -> String {
         format!("{}@{}.noreply", principal.principal_id.0, tenant)
     }
 
-    /// Whether a principal is an AGENT (ADR-08 legibility — an agent author is stamped `is_agent`,
-    /// never disguised as a human).
     fn is_agent(principal: &Principal) -> bool {
         matches!(principal.kind, PrincipalKind::Agent { .. })
     }
@@ -814,15 +664,6 @@ impl DurableGitBackend {
         )
     }
 
-    // ── create-repo (durable) ──
-
-    /// Create a bare repo on disk under the verified `(tenant, region)`. Returns `true` iff newly created
-    /// (an existing repo is a conflict the handler surfaces as `409`). Traversal-safe via the resolver.
-    ///
-    /// **The DIRECT (no-bootstrap-grant) path** — test fixtures / pre-authz callers that stage repos
-    /// out-of-band. The edge's create HANDLER goes through [`DurableGitBackend::create_repo_as`]
-    /// (R2.1a) so the creator→admin bootstrap grant is written; under the production deny-by-default
-    /// authorizer a repo created HERE is reachable by no one until a tuple is granted separately.
     pub fn create_repo(
         &self,
         tenant: &str,
@@ -837,28 +678,6 @@ impl DurableGitBackend {
         Ok(true)
     }
 
-    /// **Create a bare repo AS a verified principal (R2.1a — the edge create path).** Same as
-    /// [`DurableGitBackend::create_repo`] plus the creator→admin bootstrap grant through the
-    /// injected [`RepoBootstrapGrants`] seam, written BEFORE the directory lands:
-    ///
-    /// - **grant-first ordering:** the tuple write and the on-disk `git init` are two stores with no
-    ///   shared transaction. Grant-first (not create-first) avoids the residue we refuse most — a
-    ///   repo that exists but is reachable by NO ONE.
-    /// - **fail-closed:** a grant-write failure ABORTS the create loudly (`DurableError::Git` → the
-    ///   handler's 500); the repo is NOT created without its owner grant.
-    /// - **compensation on create-failure (R2.1a-followup, defect #7):** if the grant committed but
-    ///   the on-disk `git init` then FAILS, the error arm issues a COMPENSATING
-    ///   [`RepoBootstrapGrants::revoke_creator`] (an exact-tuple `Remove` through the 4.6 write path)
-    ///   so NO orphan `repo:<slug>#admin@<creator>` grant survives on a repo that does not exist. The
-    ///   orphan is the real hole: a DIFFERENT principal could later create the same slug and the
-    ///   original (failed-create) principal would silently still hold admin on it (cross-user
-    ///   access). If the compensation ITSELF fails we surface BOTH errors loudly — a known, logged
-    ///   orphan grant beats a silent one; a reconciler is the durable sweep for that narrow window.
-    /// - **residual window (documented, out of scope):** a process crash BETWEEN the grant-commit and
-    ///   the compensating remove still orphans the grant (no shared transaction across PG + the
-    ///   filesystem, and no in-process compensation can run through a crash). Healing that requires an
-    ///   out-of-band reconciler (grant with no on-disk repo → revoke) — named, not built here. The
-    ///   common failure path (an on-disk create error the process observes) IS cleaned up.
     pub fn create_repo_as(
         &self,
         tenant: &str,
@@ -872,21 +691,15 @@ impl DurableGitBackend {
         }
         self.bootstrap.grant_creator(creator, &loc).map_err(|e| {
             DurableError::Git(format!(
-                "creator bootstrap grant refused (repo NOT created — fail-closed): {e}"
+                "creator bootstrap grant refused (repo NOT created - fail-closed): {e}"
             ))
         })?;
-        // The grant is now durably committed. If the on-disk create fails, we MUST NOT leave the
-        // grant as an orphan (defect #7 — cross-user access via slug reuse), so compensate before
-        // returning the error.
         match self.store.create_repo(&loc) {
             Ok(_repo) => Ok(true),
             Err(create_err) => match self.bootstrap.revoke_creator(creator, &loc) {
-                // Compensation succeeded: no orphan grant survives — surface the original create error.
                 Ok(()) => Err(create_err),
-                // Compensation FAILED: fail loud with BOTH — a KNOWN orphan grant (logged here) beats
-                // a silent one, and a reconciler is the durable sweep for it.
                 Err(revoke_err) => Err(DurableError::Git(format!(
-                    "repo create FAILED and the compensating bootstrap-grant removal ALSO failed — \
+                    "repo create FAILED and the compensating bootstrap-grant removal ALSO failed - \
                      an admin grant on `{slug}` is ORPHANED (reachable by slug reuse; a reconciler \
                      must revoke it): create error: {create_err}; compensation error: {revoke_err}"
                 ))),
@@ -894,12 +707,6 @@ impl DurableGitBackend {
         }
     }
 
-    // ── repo list (durable read) ──
-
-    /// The verified tenant's on-disk repo SLUGS (sorted). The tenant/region dir holds `<repo>.git`
-    /// bare repos; resolve via a representative locator's parent so the scan stays inside the
-    /// validated tenant/region path (no traversal). This is the CANDIDATE set the R2.1 list
-    /// prefilter intersects with the principal's `pull`-visible set — never served raw.
     fn scan_repo_slugs(&self, tenant: &str, region: &str) -> Result<Vec<String>, DurableError> {
         self.scan_repo_slugs_bounded(tenant, region, REPO_SCAN_MAX_CANDIDATES)
     }
@@ -947,12 +754,6 @@ impl DurableGitBackend {
         Ok(slugs)
     }
 
-    /// **List the repos `principal` may `pull` (R2.1 — the leak-free list).** The on-disk listing is
-    /// the CANDIDATE set; the injected [`RepoAuthorizer::visible_repos`] prefilter (backed by the
-    /// Identity `list_objects` Ids-materialise in production, per-candidate checks otherwise)
-    /// resolves the visible subset BEFORE any ViewModel is built — an un-granted repo's slug/readme/
-    /// tree never reach the response (0-leak: pre-filter by construction, never a post-filter).
-    /// ViewModels are built from the REAL on-disk state (Populated/Empty) — never a seed.
     fn list_repos_visible(
         &self,
         tenant: &str,
@@ -981,9 +782,6 @@ impl DurableGitBackend {
         Ok((out, has_more))
     }
 
-    /// Build only the selected repository-catalogue rows. Candidate discovery and the complete
-    /// visibility intersection happen before the keyset continuation is applied; repository state
-    /// is opened and classified only for the final output page.
     fn list_repo_summaries_visible(
         &self,
         tenant: &str,
@@ -1026,10 +824,6 @@ impl DurableGitBackend {
         Ok((rows, next_slug))
     }
 
-    /// **F3 — the HTTP git-wire clone URL for a repo.** The wire path grammar is
-    /// `/{tenant}/{region}/{repo}.git` (the ONLY transport is HTTP smart-protocol), prefixed by the
-    /// configured public base (`MYELIN_PUBLIC_BASE_URL`; empty → an honest relative path). Never the
-    /// old `ssh://git@myelin/…` (no SSH server exists; the region segment + real slug were missing).
     fn clone_url(&self, tenant: &str, region: &str, slug: &str) -> String {
         format!("{}/{tenant}/{region}/{slug}.git", self.clone_base)
     }
@@ -1076,11 +870,6 @@ impl DurableGitBackend {
         }
     }
 
-    // ── commit log + commit diff (durable read; reuses the durable repo's libgit2 walk/diff) ──
-
-    /// A page of the commit log for a ref (newest-first) as [`CommitRow`] ViewModels + the `has_more`
-    /// cursor flag. A bare ref name is qualified to `refs/heads/<ref>` (a fully-qualified `refs/…` is
-    /// used as-is). Tenant-scoped via the validated resolver.
     fn commit_log(
         &self,
         tenant: &str,
@@ -1097,7 +886,6 @@ impl DurableGitBackend {
         Ok((metas.into_iter().map(commit_row).collect(), has_more))
     }
 
-    /// One commit's diff page as a [`CommitDiff`] ViewModel (`None` if the oid is malformed/absent).
     fn commit_diff(
         &self,
         tenant: &str,
@@ -1110,14 +898,6 @@ impl DurableGitBackend {
         Ok(repo.commit_detail(oid)?.map(commit_diff_vm))
     }
 
-    // ── R3.2 · G-7 — the PR three-dot diff (N1) + expand-context (N2) ──
-
-    /// The PR three-dot diff page (`GET …/prs/{n}/diff`) as a [`PrDiffVM`]. Resolves the PR record
-    /// (404 if absent — a thread/diff op on a missing PR is the overview's 0-leak 404), computes
-    /// `merge-base(base_ref, head_oid) … head_oid` over the durable repo, and pages FILES (MR-014
-    /// envelope) at `offset`/`limit`. `restricted_files` is COUNT-ONLY — under the current repo-level
-    /// `Pull` guard a viewer who may see the PR may see every file, so it is 0 (the per-path ACL is a
-    /// named follow-on; the field is wired non-leaking so a future ACL feeds a count, never paths).
     fn pr_diff(
         &self,
         target: PrActorContext<'_>,
@@ -1138,8 +918,6 @@ impl DurableGitBackend {
         let repo = self.store.open_repo(&loc)?;
         let Some(diff) = repo.pr_diff(&rec.base_ref, &rec.head_oid, PR_DIFF_PER_FILE_LINE_CAP)?
         else {
-            // A malformed/absent head oid — an honest empty diff (the UI renders the empty state, not
-            // an error): no files, the base_ref labelled, three_dot false.
             return Ok(Some(PrDiffVM {
                 number,
                 base_ref: rec.base_ref.clone(),
@@ -1158,9 +936,6 @@ impl DurableGitBackend {
         Ok(Some(pr_diff_vm(number, &rec.base_ref, diff, offset, limit)))
     }
 
-    /// Expand-context lines (`GET …/file-lines/{oid}?path=&start=&end=`) — the raw context of a blob at
-    /// `oid`, `start..=end`. `path` is carried for the client's column mapping only; the authz is the
-    /// SAME object check as the blob route (`Pull` at the edge). `None` if the oid is malformed/absent.
     fn file_lines(
         &self,
         tenant: &str,
@@ -1175,11 +950,6 @@ impl DurableGitBackend {
         repo.file_lines(oid, start, end)
     }
 
-    // ── R3.4 repo-browsing completeness: refs · tree-at-path · nested blob · raw/download ──
-
-    /// The RefsVM for the switcher (`GET /repos/{repo}/refs`) — the legacy branches/tags/default
-    /// fields plus bounded current/default pins and stable pagination. The route's
-    /// [`RepoObjectGuard`] performs `Pull` authorization before its strict query/cursor parser runs.
     fn refs_json(
         &self,
         tenant: &str,
@@ -1234,9 +1004,6 @@ impl DurableGitBackend {
         }))
     }
 
-    /// The enriched RepoHomeVM (`GET /repos/{repo}`) — default_branch, full README, latest_commit,
-    /// per-entry latest-commit (ONE bounded walk), branch/tag counts, name-carrying entries. Built from
-    /// the durable on-disk state; `NotFound` (404) if the repo is absent under the verified tenant.
     fn repo_home_json(
         &self,
         tenant: &str,
@@ -1244,7 +1011,7 @@ impl DurableGitBackend {
         slug: &str,
     ) -> Result<Value, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        let repo = self.store.open_repo(&loc)?; // NotFound → 404 (0-leak)
+        let repo = self.store.open_repo(&loc)?;
         let full_slug = format!("{tenant}/{slug}");
         let clone_url = self.clone_url(tenant, region, slug);
         let refs = repo.refs_summary()?;
@@ -1286,8 +1053,6 @@ impl DurableGitBackend {
             "slug": full_slug,
             "clone_url": clone_url,
             "default_branch": default_branch,
-            // Full README (rendered via the editor read-path / sanitized markdown renderer on the client;
-            // never a raw-HTML dump). `readme_excerpt` retained for back-compat with the pre-R3.4 VM.
             "readme": readme,
             "readme_excerpt": readme.as_ref().map(|r| r.chars().take(400).collect::<String>()),
             "latest_commit": latest.as_ref().map(commit_brief_json),
@@ -1298,9 +1063,6 @@ impl DurableGitBackend {
         }))
     }
 
-    /// The TreeVM (`GET /repos/{repo}/tree/{ref}/{...path}`, root = empty path). A file requested under
-    /// `tree/` returns `{ redirect_to_blob: true }` (the gate's kind-mismatch → client redirect); an
-    /// absent path is `NotFound` (404). Shares the entry projection with the repo home.
     fn tree_json(
         &self,
         tenant: &str,
@@ -1360,10 +1122,6 @@ impl DurableGitBackend {
         }
     }
 
-    /// The enriched BlobVM (`GET /repos/{repo}/blob/{ref}/{...path}`, nested). Small files include a
-    /// server-classified inline preview; larger files stop at the ODB header and return an honest
-    /// metadata-only fallback. A directory requested under `blob/` returns
-    /// `{ redirect_to_tree: true }` (kind mismatch → client redirect); an absent path is `NotFound`.
     fn blob_json(
         &self,
         tenant: &str,
@@ -1428,8 +1186,6 @@ impl DurableGitBackend {
                 is_binary,
                 size,
             } => {
-                // Binary bytes never enter a text projection. Large objects never reach this branch:
-                // the bounded reader returns metadata from the object header before inflation.
                 let contents = if is_binary {
                     String::new()
                 } else {
@@ -1452,11 +1208,6 @@ impl DurableGitBackend {
         }
     }
 
-    /// Serve raw file BYTES (`GET /repos/{repo}/raw|download/{ref}/{...path}`) — gateway-proxied,
-    /// in-region, never a public signed URL (the sovereignty rail, BINDING). `attachment` sets
-    /// `Content-Disposition: attachment` (the Download affordance); otherwise the bytes stream inline
-    /// with a conservative content-type (never `text/html` — a repo blob is never browser-executed).
-    /// Object-guarded on `Pull` at the route.
     fn raw_response(
         &self,
         tenant: &str,
@@ -1511,8 +1262,6 @@ impl DurableGitBackend {
                 )))
             }
         };
-        // A conservative content-type: text stays `text/plain; charset=utf-8` (never executed),
-        // binary is `application/octet-stream`. The filename is the basename of the requested path.
         let content_type = if is_binary {
             "application/octet-stream".to_string()
         } else {
@@ -1527,7 +1276,6 @@ impl DurableGitBackend {
                 format!("inline; filename=\"{}\"", sanitize_filename(filename))
             },
         )];
-        // Defense-in-depth: never let a browser sniff a repo blob into an executable type.
         headers.push(("x-content-type-options".to_string(), "nosniff".to_string()));
         Ok(EdgeResponse::Bytes {
             status: 200,
@@ -1537,11 +1285,6 @@ impl DurableGitBackend {
         })
     }
 
-    // ── web-edit commit (durable ref-CAS) ──
-
-    /// Commit a single-file web edit DURABLY: GF-6 stale-base CAS on the blob, then write the new commit
-    /// to the odb and advance the ref via the durable per-ref CAS ([`RefStore`]). A stale blob base OR a
-    /// raced ref tip is the honest `409`; a clean base persists (`durable: true`).
     fn web_edit_commit(
         &self,
         target: RepoActorContext<'_>,
@@ -1560,14 +1303,11 @@ impl DurableGitBackend {
         let repo = Arc::new(self.store.open_repo(&loc)?);
         let full = format!("refs/heads/{gitref}");
 
-        // GF-6: the current blob oid (or "" for a new file) is the CAS base. The oid comes directly
-        // from the tree entry; never inflate a potentially huge existing file merely to compare it.
         let current_base = repo
             .blob_oid_at_path(&full, path)?
             .map(|oid| oid.0)
             .unwrap_or_default();
 
-        // The pure GF-6 CAS (reused) — a stale base refuses honestly (no silent overwrite).
         let probe = WebEditOutcome::evaluate(expected_base, &current_base, "pending", true);
         if let WebEditOutcome::StaleBase { current_oid } = probe {
             return Ok(WebEditOutcome::StaleBase { current_oid });
@@ -1576,12 +1316,10 @@ impl DurableGitBackend {
             return Ok(WebEditOutcome::Denied);
         }
 
-        // Build the real commit (blob → tree → commit) authored to the tenant pseudonym (GIT-1).
         let psn = Self::pseudonym(tenant, principal);
         let (new_commit, _new_blob, parent) =
             repo.build_file_commit(&full, path, contents.as_bytes(), "web edit", &psn, &psn)?;
 
-        // Advance the ref via the durable per-ref CAS (the SAME one-tx ref-CAS + outbox the push uses).
         let ref_store = self.open_durable_refstore(repo, slug, tenant, region, principal);
         let expected_old = parent
             .map(|p| PushOid::new(p.0))
@@ -1607,7 +1345,6 @@ impl DurableGitBackend {
             PushOutcome::Accepted { .. } => Ok(WebEditOutcome::Committed {
                 new_oid: new_commit.0,
             }),
-            // A raced ref tip (someone committed between our read and CAS) → honest stale (409).
             PushOutcome::Rejected(_) => Ok(WebEditOutcome::StaleBase {
                 current_oid: current_base,
             }),
@@ -1615,10 +1352,6 @@ impl DurableGitBackend {
         }
     }
 
-    // ── PR lifecycle (durable) ──
-
-    /// Read a durable PR record back (the fresh-read proof a write persisted). `None` if absent under
-    /// the verified `(tenant, region)`. Tenant-scoped via the validated resolver.
     pub fn get_pr(
         &self,
         tenant: &str,
@@ -1631,11 +1364,6 @@ impl DurableGitBackend {
     }
 
     fn next_pr_number(&self, loc: &RepoLoc) -> Result<u64, DurableError> {
-        // Peer-review finding #3: allocate from the FILENAME-authoritative max, independently of
-        // parsing the list. A corrupt highest PR record makes list fail loud but its occupied filename
-        // still counts here, so allocation can never reuse and overwrite it.
-        // The directory read is authoritative too: an I/O fault must abort allocation, never reset it
-        // to #1. Exhausting the u64 namespace is likewise a loud refusal, not a wrap to zero.
         Self::next_pr_number_after(self.prs.max_pr_number(loc)?)
     }
 
@@ -1670,12 +1398,7 @@ impl DurableGitBackend {
         operation_id: &PrOperationId,
     ) -> Result<PrRecord, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.store.open_repo(&loc)?; // 404 if the target repo is absent
-                                     // The PR-open body carries ONLY the proposal (base/head/head_oid/draft) — NEVER branch-protection
-                                     // POLICY (required set / approval threshold) or check FACTS (greens). Policy is repo-owned (set
-                                     // via the repo-admin branch-protection op); facts are set by authorized producers (the CI
-                                     // check-report op, the review op, the endorse op). This is the GT-003 bypass fix: a PR author
-                                     // cannot weaken the gate by supplying loose policy or self-claimed greens at open.
+        self.store.open_repo(&loc)?;
         let base_ref = body
             .get("base_ref")
             .and_then(Value::as_str)
@@ -1696,9 +1419,6 @@ impl DurableGitBackend {
                 "open-PR head repository slug must be non-empty".into(),
             ));
         }
-        // Source authority is derived from the verified principal's partition, never from the body.
-        // Pull authorization is checked on the exact source repo before its ref/OID is resolved; a
-        // denial is 0-leak and indistinguishable from an absent source.
         let head_loc = Self::loc(&principal.tenant.0, &principal.region.0, head_repo_slug);
         if !self
             .repo_authz
@@ -1712,13 +1432,6 @@ impl DurableGitBackend {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        // F8 (R4.1 dogfood): if the caller omitted `head_oid`, RESOLVE it from `head_ref`'s CURRENT tip
-        // in the durable repo. Previously an absent head_oid was stored EMPTY and the PR was silently
-        // unmergeable — a merge later failed with the confusing "invalid merge head: head_oid  is not a
-        // commit in the repo". Resolving at OPEN time both (a) makes the ref-only open path mergeable
-        // (the stored head_oid is the branch tip) and (b) turns a non-existent head_ref into a CLEAR
-        // 400 the moment the PR is proposed, not a mystifying failure at merge. The explicit-head_oid
-        // path is UNCHANGED — an author who pins a specific oid keeps exactly that oid.
         let qualified_head_ref = if head_ref.starts_with("refs/") {
             head_ref.clone()
         } else {
@@ -1726,14 +1439,11 @@ impl DurableGitBackend {
         };
         let source_tip = head_repo.read_ref(&qualified_head_ref)?;
         let head_oid = if head_oid.is_empty() {
-            // Qualify a bare branch name to `refs/heads/<name>`; a fully-qualified `refs/…` is used as-is.
             match source_tip {
                 Some(tip) => tip.0,
-                // 400 at OPEN (map_durable_err routes a "missing" `Git` error to BadRequest) — never a
-                // stored empty head that wedges the merge dialog with a confusing error later.
                 None => {
                     return Err(DurableError::Git(format!(
-                    "open-PR head_ref `{head_ref}` does not exist in the repo — no branch tip to \
+                    "open-PR head_ref `{head_ref}` does not exist in the repo - no branch tip to \
                          open against (missing head)"
                 )))
                 }
@@ -1747,9 +1457,6 @@ impl DurableGitBackend {
         } else {
             head_oid
         };
-        // R3.1: the title is REQUIRED at create (a hollow list is the ux-git #3 defect). A missing or
-        // blank title is a clean 400 — never a silent empty title on a NEW PR (a legacy record with no
-        // title predates the store and honestly renders as `#number`; a fresh create must carry one).
         let title = body
             .get("title")
             .and_then(Value::as_str)
@@ -1757,8 +1464,6 @@ impl DurableGitBackend {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| DurableError::Git("open-PR body missing a non-empty `title`".into()))?
             .to_string();
-        // Cap the title (verifier note, R3.1): it is echoed in every list row — an unbounded
-        // title is a response-bloat vector. 512 bytes is generous for a real title.
         if title.len() > 512 {
             return Err(DurableError::Git(
                 "open-PR `title` exceeds 512 bytes".into(),
@@ -1769,8 +1474,6 @@ impl DurableGitBackend {
             .or_else(|| body.get("body"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        // PostgreSQL owns allocation atomically; production never consults stale/corrupt legacy
-        // filesystem PR files. The legacy/test authority still allocates from its filenames.
         let number = if self.pg_prs.is_some() {
             0
         } else {
@@ -1789,34 +1492,11 @@ impl DurableGitBackend {
         rec.body_md = body_md;
         rec.author_is_agent = Self::is_agent(principal);
         let now = now_unix();
-        rec.created_at = Some(now); // R3.3 N1 — the header's "opened …" date, stamped once at open.
+        rec.created_at = Some(now);
         rec.updated_at = Some(now);
         self.pr_open(&loc, rec, operation_id, principal)
     }
 
-    // ── R3.1 — the leak-free PR LIST (per-repo + cross-repo front door) ──────────────────────────
-    //
-    // **The leak-free prefilter (the anti-oracle rule).** The frozen Git ReBAC fragment defines
-    // `pull_request.view = parent_repo->pull` (repo_authz.rs / contract 4.9), so the PR-list
-    // permission `myelin_git::list_filter::PR_LIST_PERMISSION` (`"view"`) REDUCES, for every PR in a
-    // repo, to the viewer's `pull` on the PARENT repo. Two consequences the wiring rides:
-    //   • **per-repo `/repos/{repo}/prs`** is guarded by the SAME [`RepoObjectGuard`] `Pull` check as
-    //     every other repo read (registered in `register_git_durable`): a viewer who cannot `pull`
-    //     gets the 0-leak 404 (the "no access" state), and once past it EVERY PR in the repo is
-    //     `view`-able — so counts/tab-badges/cursors computed over the on-disk set never leak a
-    //     hidden PR (there is none to hide);
-    //   • **cross-repo `/prs`** prefilters the repo candidate set through
-    //     [`RepoAuthorizer::visible_repos`] (the `list_objects(viewer, pull, repo)` seam) FIRST, then
-    //     lists PRs only within the visible repos — a forbidden repo's PRs never enter any bucket,
-    //     count, or cursor.
-    // This realises `compose_pr_list_query` / `PR_LIST_PERMISSION`'s leak-free *semantics* over both
-    // storage authorities. The SQL composer in `list_filter.rs` targets an abstract authorization
-    // projection rather than this literal query; the repo `pull` prefilter is the equivalent gate.
-
-    /// **The per-repo PR list (R3.1).** Every PR in the repo (the caller has already cleared the
-    /// `Pull` object guard, so all are `view`-able), enriched with the checks rollup + the viewer's
-    /// review status. Storage applies state/sort/cursor and computes exact tab/sidebar counts over
-    /// the already leak-free repository relation before only the bounded page is enriched.
     fn list_prs_for_repo(
         &self,
         tenant: &str,
@@ -1826,7 +1506,7 @@ impl DurableGitBackend {
         query: &PrListQuery,
     ) -> Result<EnrichedPrSlice, DurableError> {
         let loc = Self::loc(tenant, region, slug);
-        self.store.open_repo(&loc)?; // 404 if the repo is absent (never a phantom empty list).
+        self.store.open_repo(&loc)?;
         let page = self.pr_list_page(&loc, principal, query)?;
         let rows =
             self.enrich_pr_records(&loc, principal, &query.viewer_pseudonym, None, page.records);
@@ -1863,13 +1543,6 @@ impl DurableGitBackend {
         })
     }
 
-    /// **The cross-repo PR front door (R3.1, single-cell for R3 — Q5).** Prefilter the on-disk repo
-    /// candidates through the `visible_repos` `list_objects` seam FIRST (a forbidden repo never
-    /// contributes a PR), then enrich the PRs under each visible repo, tagging each row with its repo
-    /// slug. The bucket predicate (`yours` = authored-by-viewer; `needs-review` = viewer is a
-    /// requested reviewer) is applied by the handler over this leak-free set. Per-repository reads
-    /// and the request-wide record/serialized-byte aggregate are independently capped; below those
-    /// ceilings the returned bucket remains exact.
     pub(crate) fn visible_pr_repo_slugs(
         &self,
         tenant: &str,
@@ -2086,7 +1759,6 @@ impl DurableGitBackend {
         })
     }
 
-    /// The stable state token for a PR (matches [`Self::pr_json`]).
     fn pr_state_token(state: PrState) -> &'static str {
         match state {
             PrState::Draft => "draft",
@@ -2096,9 +1768,6 @@ impl DurableGitBackend {
         }
     }
 
-    /// The list-row VM JSON for one enriched PR (`PrListRowVM`). An empty `title` (a legacy record)
-    /// serialises as `null` so the frontend renders the honest `#number` fallback, never a blank
-    /// title masquerading as real.
     fn pr_list_row_json(e: &EnrichedPr) -> Value {
         let rec = &e.rec;
         json!({
@@ -2123,10 +1792,6 @@ impl DurableGitBackend {
         })
     }
 
-    /// **Repo-admin: set the branch-protection policy (GT-003).** The required set + thresholds the merge
-    /// enforces live HERE, never in author input. The edge gates this behind the distinct
-    /// `git.repo.branch_protection.set` authorize action (the production authorizer resolves
-    /// `Id.check(repo_admin)`); the durable config is path-isolated via the validated resolver.
     pub fn set_branch_protection(
         &self,
         tenant: &str,
@@ -2182,22 +1847,6 @@ impl DurableGitBackend {
         Ok(n)
     }
 
-    /// **CI check-report — a CI-PRODUCER capability (GT-003 / R2-exit Defect 1).** The authorized
-    /// producer stamps the green / fork-unendorsed check facts on a PR for its head; the facts the merge
-    /// gate reads come from HERE, never from the PR-open body.
-    ///
-    /// **The producer floor (why a plain writer cannot self-certify its own PR).** Reporting CI check
-    /// facts is NOT an ordinary writer capability — if it were, a PR author (a writer) could stamp its
-    /// own required checks green and defeat the merge gate / the protected-push gate. So this is gated
-    /// as a CI-producer capability two ways: (1) the edge routes `DReportChecks` through the R2.1
-    /// [`RepoObjectGuard`] (`RepoPermission::Push` — the object-level repo grant stays required); and
-    /// (2) HERE, fail-closed, the reporting principal MUST be a SERVICE principal — the kind a CI
-    /// runner's self-hosted-runner run token mints as (`mint`, P-ID-18). A `Human` (or `Agent`)
-    /// principal is REFUSED regardless of any writer grant. How CI legitimately reports today: a CI run
-    /// executes under a service principal (the run token), and that service principal — never the human
-    /// developer who opened the PR — posts the check facts. The full producer-RELATION
-    /// (`repo.report_checks` / a `ci_producer` edge in the frozen fragment) is the R2+ follow-on; this
-    /// SERVICE-kind floor is the deny-a-human-writer guarantee in the meantime.
     pub fn report_checks(
         &self,
         tenant: &str,
@@ -2230,12 +1879,10 @@ impl DurableGitBackend {
         body: &Value,
         operation_id: &PrOperationId,
     ) -> Result<PrRecord, DurableError> {
-        // The producer floor: only a SERVICE principal (a CI run token) may attest CI check facts. A
-        // human writer / an agent is refused (fail-closed) — it cannot self-certify its own PR.
         if !matches!(principal.kind, PrincipalKind::Service) {
             return Err(DurableError::Forbidden(format!(
                 "git.checks.report is a CI-producer capability: principal `{}` (kind {:?}) is not a CI \
-                 service producer — a human/agent writer cannot attest CI check facts on a PR",
+                 service producer - a human/agent writer cannot attest CI check facts on a PR",
                 principal.principal_id.0, principal.kind
             )));
         }
@@ -2370,9 +2017,6 @@ impl DurableGitBackend {
         let rec = self
             .pr_get(&loc, number, principal)?
             .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
-        // Endorse the named contexts (or all currently-un-endorsed fork contexts). The maintainer's
-        // `approve_untrusted_ci` capability is the gateway's authz gate; the durable record records the
-        // resolved endorsement ([`myelin_git::fork_gate`] is the live resolver in the CLI/agent path).
         let to_endorse: Vec<String> = match body.get("contexts").and_then(Value::as_array) {
             Some(a) => a
                 .iter()
@@ -2415,10 +2059,6 @@ impl DurableGitBackend {
         let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
         if let Some(store) = &self.pg_prs {
             let scope = Self::verified_pr_scope(principal, &loc)?;
-            // Re-enter an already-admitted operation from the durable target-side intent before
-            // touching the source repository. A source grant can be revoked or the fork deleted
-            // after the ref CAS; neither may strand finalization of an operation that already moved
-            // the target ref. Request retries still have to match the original actor + operation.
             if let Some(intent) = store.pending_merge_intent(&scope, slug, number)? {
                 if intent.operation_id != operation_id.digest()
                     || intent.actor_subject_id != principal.principal_id.0.trim()
@@ -2451,10 +2091,6 @@ impl DurableGitBackend {
                 return Err(DurableError::NotFound("repository not found".into()));
             }
             let source_repo = self.store.open_repo(&source_loc)?;
-            // A fork PR's locked commit may live only in the source repository. Install its complete
-            // verified object closure in the target ODB before the durable merge protocol is allowed
-            // to advance the target ref. The import copies no source refs; the PG protocol below still
-            // revalidates that the authoritative source ref equals this locked OID.
             repo.import_commit_closure_from(&source_repo, &CoreOid::new(rec.head_oid.clone()))
                 .map_err(sanitize_fork_import_error)?;
             return store.merge_pr_durable(
@@ -2482,25 +2118,10 @@ impl DurableGitBackend {
         )
     }
 
-    // ── R3.3 / R3.2 — the PR review-thread / comment / review-batch surface ───────────────────────
-    //
-    // The canonical model is THREADS (an optional content anchor; comments belong to threads); review
-    // batching layers on via `review_id` + the `ReviewBatch` lifecycle. Read = PR view (the `Pull`
-    // object guard at the route); write = `pull_request.review` (requested reviewer or parent-repo
-    // Push) — never a permissive authorizer. Storage keys by the canonical `object_key`
-    // (`pr:<slug>:<n>`) so issues/
-    // docs mount the SAME store later. Every mutation verifies the PR exists first (a thread on a
-    // non-existent PR is a 404, mirroring the overview).
-
-    /// The canonical type-qualified object key for a PR (`pr:<slug>:<n>`). Bare `type:id` form is a
-    /// fixed point under [`myelin_refs::object_key`] (the tuple key IS this string), so issues/docs can
-    /// mount the same store by their own `issue:<id>` / `doc:<id>` keys with zero migration.
     fn pr_object_key(slug: &str, number: u64) -> String {
         format!("pr:{slug}:{number}")
     }
 
-    /// The [`ThreadPrincipal`] snapshot for the acting principal (GIT-1 pseudonym as the display;
-    /// the four-channel agent badge rides `kind`). Never a raw identity.
     fn thread_principal(tenant: &str, principal: &Principal) -> ThreadPrincipal {
         let kind = match principal.kind {
             PrincipalKind::Agent { .. } => PrincipalRole::Agent,
@@ -2510,7 +2131,6 @@ impl DurableGitBackend {
         ThreadPrincipal::plain(kind, Self::pseudonym(tenant, principal))
     }
 
-    /// Verify the PR exists (a thread op on an absent PR is a 404, exactly like the overview).
     fn require_pr(
         &self,
         loc: &RepoLoc,
@@ -2521,9 +2141,6 @@ impl DurableGitBackend {
             .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))
     }
 
-    /// Resolve a requested line against the current authoritative PR diff and capture the immutable
-    /// revision pair used for the decision. A stale or fabricated path/side/line never becomes a
-    /// misleading `live` anchor.
     fn resolve_thread_anchor(
         &self,
         loc: &RepoLoc,
@@ -2567,9 +2184,6 @@ impl DurableGitBackend {
         Ok(anchor)
     }
 
-    /// **GET …/prs/{n}/threads — the viewer-scoped conversation.** Read = PR view (the `Pull` guard).
-    /// Pending review-batch comments authored by OTHERS never enter the projection (non-leak by
-    /// construction — `SubjectThreads::view_for`).
     pub fn list_threads(
         &self,
         tenant: &str,
@@ -2586,8 +2200,6 @@ impl DurableGitBackend {
         Ok(viewed_threads_json(&doc.view_for(&viewer)))
     }
 
-    /// POST …/prs/{n}/threads — open a new thread with its first comment (`anchor` null = a discussion
-    /// thread; an anchor object = a diff-line thread). Write = `pull_request.review`.
     pub fn create_thread(
         &self,
         tenant: &str,
@@ -2612,7 +2224,6 @@ impl DurableGitBackend {
         Ok(thread_json(&thread))
     }
 
-    /// POST …/prs/{n}/threads/{tid}/comments — reply to a thread. Write = `Push`.
     pub fn add_thread_comment(
         &self,
         target: PrActorContext<'_>,
@@ -2638,7 +2249,6 @@ impl DurableGitBackend {
         Ok(comment_json(&comment))
     }
 
-    /// POST …/prs/{n}/threads/{tid}/resolve — resolve/unresolve a thread. Write = `Push`.
     pub fn resolve_thread(
         &self,
         target: PrActorContext<'_>,
@@ -2664,9 +2274,6 @@ impl DurableGitBackend {
         Ok(json!({ "thread_id": thread_id, "resolved": resolved }))
     }
 
-    /// POST …/prs/{n}/reviews/start — start a review batch (draft; verdict `in_progress`). Write =
-    /// `pull_request.review`. (`/start` distinguishes this from the existing single-shot `POST …/reviews` verdict op
-    /// that feeds the merge gate — a named deviation from N5's literal path, preserving R2's gate path.)
     pub fn start_review_batch(
         &self,
         tenant: &str,
@@ -2683,8 +2290,6 @@ impl DurableGitBackend {
         Ok(review_batch_json(&batch))
     }
 
-    /// POST …/prs/{n}/reviews/{rid}/comments — add a PENDING comment to a draft batch (visible only to
-    /// its author until submit). Write = `pull_request.review`.
     pub fn add_pending_comment(
         &self,
         target: PrActorContext<'_>,
@@ -2712,10 +2317,6 @@ impl DurableGitBackend {
         Ok(comment_json(&comment))
     }
 
-    /// POST …/prs/{n}/reviews/{rid}/submit `{ verdict, summary_md }` — submit the batch. Emits ONE
-    /// batch event (R-BATCH-1; idempotent on retry). A NON-advisory (human) `approved` /
-    /// `changes_requested` verdict ALSO feeds the merge gate via the durable review record (an agent
-    /// batch stays advisory — it never gates). Write = `pull_request.review`.
     pub fn submit_review_batch(
         &self,
         target: PrActorContext<'_>,
@@ -2759,10 +2360,6 @@ impl DurableGitBackend {
             now_unix(),
         )?;
         let submitted = self.threads.submit_review(request)?;
-        // Feed the merge gate: a NON-advisory approved/changes_requested verdict pushes a durable
-        // review record (the gate reads `counting_approvals` + `has_blocking_review`). An agent batch
-        // is advisory and a comment-only verdict adds no gate signal. Only the FIRST submit (Some)
-        // feeds the gate — a re-submit is idempotent (None), so no double-counted approval.
         if let Some(ref batch) = submitted {
             if !batch.review.advisory {
                 let gate_verdict = match verdict {
@@ -2771,15 +2368,12 @@ impl DurableGitBackend {
                     _ => None,
                 };
                 if let Some(v) = gate_verdict {
-                    // Reuse the existing gate-feeding review op (self-approval is excluded there).
                     let _ = self.submit_review(tenant, region, slug, number, v, principal);
                 }
             }
         }
         self.bump_pr_updated(&loc, number, principal);
         Ok(json!({
-            // The ONE batch event's payload (server-side R-BATCH-1). `emitted` is true exactly once
-            // (the first submit); a re-submit is idempotent → `emitted: false`, no double event.
             "emitted": submitted.is_some(),
             "review": submitted.as_ref().map(|b| review_batch_json(&b.review)),
             "comment_ids": submitted
@@ -2789,8 +2383,6 @@ impl DurableGitBackend {
         }))
     }
 
-    /// DELETE …/prs/{n}/reviews/{rid} — discard a DRAFT batch (its private comments leave no trace).
-    /// A submitted batch is public record — `Forbidden`. Write = `Push`.
     pub fn discard_review_batch(
         &self,
         tenant: &str,
@@ -2808,19 +2400,12 @@ impl DurableGitBackend {
         Ok(json!({ "discarded": review_id }))
     }
 
-    /// Bump the PR's `updated_at` after an authored conversation mutation (best-effort — a failure to
-    /// re-stamp the record never fails the comment that already persisted).
     fn bump_pr_updated(&self, loc: &RepoLoc, number: u64, principal: &Principal) {
         if let Ok(operation_id) = self.fresh_operation_id() {
             let _ = self.pr_mutate(loc, number, PrMutation::Touch, &operation_id, principal);
         }
     }
 
-    // ── git smart-HTTP PUSH (receive-pack) over the wire — CT-006d ──
-
-    /// The receive-pack ref advertisement source: every `(ref_name, oid)` on the durable repo, sorted.
-    /// A pure read of OUR tenant-scoped repo (no sandbox needed); the wire handler frames it + the
-    /// service header + the restricted capability list. `NotFound` (404) if the repo is absent.
     pub fn receive_pack_refs(
         &self,
         tenant: &str,
@@ -2838,15 +2423,6 @@ impl DurableGitBackend {
         Ok(refs)
     }
 
-    /// **The receive-pack PUSH write path (CT-006d).** Parses the ref-update commands + packfile, ingests
-    /// the UNTRUSTED pack in the hardened sandbox (`index-pack` into a writable `/tmp` quarantine — the
-    /// real repo stays RO), stages the fully-resolved objects in a HOST quarantine (connectivity + non-ff
-    /// computed there, never touching the real repo), then runs the in-process policy + the ONE-tx
-    /// ref-CAS + `git.ref.updated` outbox emit ([`RefStore::receive`]) — migration writes the accepted
-    /// objects into the real repo BETWEEN policy-pass and the CAS (reject-before-ref-moves; abort discards
-    /// the quarantine). Returns the `report-status` body the client renders. A push to a non-existent repo
-    /// is `NotFound` (404); every per-push refusal (corrupt pack / policy / non-ff / connectivity) is a
-    /// clean `report-status` with `ng` per ref (HTTP 200) so `git push` shows the honest rejection.
     pub fn receive_pack(
         &self,
         tenant: &str,
@@ -2861,7 +2437,7 @@ impl DurableGitBackend {
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let loc = Self::loc(tenant, region, slug);
-        let repo = Arc::new(self.store.open_repo(&loc)?); // NotFound → 404 (no cross-tenant leak)
+        let repo = Arc::new(self.store.open_repo(&loc)?);
 
         let (cmds, pack) = match parse_push_request(body) {
             Ok(v) => v,
@@ -2871,7 +2447,6 @@ impl DurableGitBackend {
             return Ok(report_status("no-commands", &[]));
         }
 
-        // 1. Ingest the untrusted pack in the SANDBOX → fully-resolved objects (empty for delete-only).
         let objects: Vec<(String, String, Vec<u8>)> = if pack.is_empty() {
             Vec::new()
         } else {
@@ -2892,7 +2467,6 @@ impl DurableGitBackend {
                         ))
                     }
                 },
-                // A corrupt/forged/incomplete pack fails `index-pack` in the sandbox → honest reject.
                 Err(e) => {
                     return Ok(report_status(
                         &format!("index-pack-failed: {e}"),
@@ -2902,8 +2476,6 @@ impl DurableGitBackend {
             }
         };
 
-        // 2. Stage the objects in a HOST quarantine repo (alternates → the real repo so existing history
-        //    + thin bases resolve) so connectivity + non-ff are computed WITHOUT touching the real repo.
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -2928,13 +2500,8 @@ impl DurableGitBackend {
             });
         }
 
-        // 3. Build the proposed updates: `forced` = an existing ref advancing to a NON-descendant; a
-        //    non-delete tip whose object set is INCOMPLETE (missing tree/blob) rejects the whole push.
         let mut updates = Vec::new();
         let mut per_ref_status: Vec<(String, Option<String>)> = Vec::new();
-        // R0.7-D / DELTA N4: the durable repo's CURRENT ref tips (pre-push state), computed once for the
-        // full-history connectivity walk below. The walk hides these so a thin push only pays for the
-        // newly-introduced commits; an unreadable ref list fails safe to `[]` (a wider walk = stricter).
         let existing_tips: Vec<CoreOid> = repo
             .list_refs_bounded(WIRE_MAX_REFS)
             .unwrap_or_default()
@@ -2944,12 +2511,6 @@ impl DurableGitBackend {
         for c in &cmds {
             let new_zero = c.new.chars().all(|ch| ch == '0');
             let old_zero = c.old.chars().all(|ch| ch == '0');
-            // R0.7-D / DELTA N4: FULL-history connectivity, not just the tip tree. `index-pack --fix-thin`
-            // resolves delta bases but NOT missing PARENT commits, and the old tip-only check
-            // (`commit_tree_complete`) verified only the tip commit's own tree — so a push whose tip has a
-            // missing ancestor was accepted and later wedged clone/fetch. Walk from the new tip hiding the
-            // existing tips; reject if any reachable commit/tree/blob/parent is absent. Fail-closed:
-            // `.unwrap_or(false)` rejects on any infra error too.
             if !new_zero
                 && !q
                     .history_connectivity_complete(&CoreOid::new(c.new.clone()), &existing_tips)
@@ -2995,45 +2556,21 @@ impl DurableGitBackend {
             per_ref_status.push((c.ref_name.clone(), None));
         }
 
-        // 3b. **R0.2 / DELTA N1 — the branch-protection gate on a DIRECT push to a PROTECTED ref.** A
-        //     `git push` straight to a protected branch must clear the SAME gate a PR merge into that
-        //     branch would: reject force-push (non-ff) + delete, and REQUIRE the repo's configured
-        //     `required_contexts` to be green-and-current for the pushed head. Protected-ness comes from
-        //     the repo-owned [`BranchProtectionConfig`] (never a hardcoded literal) — a configured
-        //     ruleset (any ref pattern) protects its refs; the built-in `main`/`release/*` literal is at
-        //     most a fallback for an unconfigured protected-looking ref (never MORE permissive than the
-        //     pre-R0.2 force/delete floor). Reject-before-the-ref-moves: any protected violation aborts
-        //     the whole atomic push with a loud per-ref `ng` (0 under-gated protected push). The check
-        //     facts are read from Git's OWN durable records (acyclic — this never calls CI, EI-02 §3).
-        // FAIL-CLOSED on a config-load error (verifier finding): a MISSING protection file is `Ok(None)`
-        // (no protection configured — proceed), but a CORRUPT/unreadable `branch-protection.json` is an
-        // `Err`. Swallowing that Err into `None` (`.ok().flatten()`) would SILENTLY DISABLE protection —
-        // a non-standard protected ref (e.g. `refs/heads/prod`) would skip the gate entirely, and
-        // `main`/`release/*` would lose required-CI enforcement. That is a self-disabling security gate.
-        // If we cannot read the policy we cannot safely accept ANY push, so reject the whole push loudly
-        // (matching the PR-merge path, which fail-closes via `?` on the same load error).
         let protection = match self.prs.get_protection(&loc) {
             Ok(p) => p,
             Err(e) => {
-                let _ = std::fs::remove_dir_all(&qdir); // discard the host quarantine (no ref moves).
+                let _ = std::fs::remove_dir_all(&qdir);
                 return Ok(report_status(
                     "ok",
                     &all_ng(
                         &cmds,
                         &format!(
-                            "rejected (branch-protection policy unreadable — fail-closed): {e}"
+                            "rejected (branch-protection policy unreadable - fail-closed): {e}"
                         ),
                     ),
                 ));
             }
         };
-        // R2-exit Defect 2 — the pusher's PROTECTED-PUSH (admin/bypass) standing, resolved ONCE through
-        // the R2.1 per-repo object authorizer (`repo.protected_push = admin`, contract 4.9). A DIRECT
-        // push to a protected ref is admitted only if the pusher holds this admin-only rung OR the push
-        // clears the FULL branch-protection ruleset (Defect 3) — a plain writer holds neither, so it can
-        // no longer land arbitrary code on `refs/heads/main` over the wire. Computed here (not per-ref) —
-        // the standing is a repo-level grant, and a push whose refs include ANY protected one is held to
-        // the stronger check.
         let pusher_has_protected_push = self.repo_authz.authorize_repo_permission(
             principal,
             &loc,
@@ -3048,13 +2585,11 @@ impl DurableGitBackend {
                 .is_some();
             let is_protected = configured || u.ref_name.is_protected();
             if !is_protected {
-                continue; // a non-protected ref keeps the existing PushPolicy checks (unchanged).
+                continue;
             }
             let ruleset = effective_ruleset(protection.as_ref(), ref_str);
             protected_updates.push((index, ruleset.clone()));
             if self.checks.is_some() {
-                // Production evaluates under the projection consumer's shared admission lock below,
-                // holding it through the ref mutation. Reading here would reopen a check→CAS race.
                 continue;
             }
             let is_delete = u.new_oid.is_zero();
@@ -3072,7 +2607,7 @@ impl DurableGitBackend {
                 &fork_unendorsed,
                 &endorsed,
             ) {
-                let _ = std::fs::remove_dir_all(&qdir); // discard the host quarantine (no ref moves).
+                let _ = std::fs::remove_dir_all(&qdir);
                 return Ok(report_status(
                     "ok",
                     &all_ng(&cmds, &format!("rejected (branch protection): {reason:?}")),
@@ -3080,10 +2615,6 @@ impl DurableGitBackend {
             }
         }
 
-        // 4. The ONE-transaction ref-CAS + outbox via the durable RefStore. policy (secret-scan / size /
-        //    pseudonymity) runs INSIDE `receive` BEFORE the migration; `ObjectPromotion::migrate` writes
-        //    the accepted objects into the REAL repo (re-hashing each — a forged oid is impossible)
-        //    between policy-pass and the CAS; the CAS + `git.ref.updated` commit together (BUS-2).
         let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
         let push = PushSession {
             updates,
@@ -3114,7 +2645,7 @@ impl DurableGitBackend {
                         &all_ng(
                             &cmds,
                             &format!(
-                                "rejected (check admission scope unavailable — fail-closed): {error}"
+                                "rejected (check admission scope unavailable - fail-closed): {error}"
                             ),
                         ),
                     ));
@@ -3133,7 +2664,7 @@ impl DurableGitBackend {
                         &all_ng(
                             &cmds,
                             &format!(
-                                "rejected (check projection unavailable — fail-closed): {error}"
+                                "rejected (check projection unavailable - fail-closed): {error}"
                             ),
                         ),
                     ));
@@ -3146,19 +2677,13 @@ impl DurableGitBackend {
             };
             ref_store.receive(&push, &migration, CrashPoint::None)
         };
-        let _ = std::fs::remove_dir_all(&qdir); // the host quarantine is discarded either way
+        let _ = std::fs::remove_dir_all(&qdir);
 
         match outcome.map_err(|e| DurableError::Git(format!("ref-CAS: {e:?}")))? {
             PushOutcome::Accepted { .. } => {
-                // F9 (R4.1 dogfood): the first push that lands a branch heals a dangling `init_bare`
-                // HEAD (→ the default branch) so a fresh `git clone` checks out with NO "nonexistent
-                // ref, unable to checkout" warning. Best-effort: the push already committed durably and
-                // the read-side paginated ref summary remains the fallback, so a heal hiccup must never
-                // turn an ACCEPTED push into a failure.
                 let _ = repo.heal_head_symref();
                 Ok(report_status("ok", &per_ref_status))
             }
-            // A policy/non-ff refusal moved NO ref and discarded the quarantine — LOUD `ng` per ref.
             PushOutcome::Rejected(reason) => Ok(report_status(
                 "ok",
                 &all_ng(&cmds, &format!("rejected: {reason:?}")),
@@ -3170,8 +2695,6 @@ impl DurableGitBackend {
     fn pr_json(rec: &PrRecord) -> Value {
         json!({
             "number": rec.number,
-            // R3.1: the title/body store. An empty title (a legacy record) is `null` — the honest
-            // `#number` fallback, never a fabricated title.
             "title": if rec.title.is_empty() { Value::Null } else { json!(rec.title) },
             "body_md": rec.body_md,
             "pr_state": Self::pr_state_token(rec.state),
@@ -3182,15 +2705,11 @@ impl DurableGitBackend {
             "author_is_agent": rec.author_is_agent,
             "reviews": rec.reviews.len(),
             "updated_at": rec.updated_at,
-            // R3.3 N1 — the header's "opened …" date (Intl-formatted client-side); null on a legacy
-            // record (the header omits it rather than fabricating a date).
             "created_at": rec.created_at,
             "durable": true,
         })
     }
 
-    /// The commits IN a PR count (R3.3 N1/N2 — the tab badge) via the bounded reachability walk. A cap
-    /// keeps it O(cap); the count is exact for dogfood-scale PRs (the named floor is `cap+`).
     fn commits_in_pr_count(&self, loc: &RepoLoc, rec: &PrRecord) -> Option<(u64, bool)> {
         let repo = self.store.open_repo(loc).ok()?;
         let (rows, has_more) = repo.commits_in_pr(&rec.base_ref, &rec.head_oid, 500).ok()?;
@@ -3198,18 +2717,8 @@ impl DurableGitBackend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Handlers (durable; ViewModel/record-backed)
-// ---------------------------------------------------------------------------
-
-/// The [`QuarantineMigration`] that promotes a sandbox-validated, policy-passed push into the REAL repo
-/// (CT-006d). `RefStore::receive` calls `migrate` ONLY after the in-process policy admits the push and
-/// BEFORE the ref CAS — so a secret/oversized/non-pseudonymous object NEVER reaches the real odb, and a
-/// crash/abort after migrate leaves only orphan (unreferenced, GC'able) objects, never a moved ref. Each
-/// object is written via `write_raw_object`, which RE-HASHES the content (a forged oid is impossible).
 struct ObjectPromotion<'a> {
     repo: &'a DurableGitRepo,
-    /// (claimed-oid, type, raw-payload) for every object the sandbox returned.
     objects: &'a [(String, String, Vec<u8>)],
 }
 
@@ -3235,8 +2744,6 @@ fn region_of<'a>(ctx: &'a HandlerCtx<'_>) -> &'a str {
     ctx.scope.region().0.as_str()
 }
 
-/// Wall-clock unix seconds for the durable `updated_at` stamp (the list's "updated" column +
-/// `sort=updated`). Best-effort — a clock before the epoch stamps 0 (the row simply omits the time).
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -3244,10 +2751,6 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-// ── R3.3 / R3.2 thread-surface helpers (body parsing + VM serialization) ─────────────────────────
-
-/// Extract a non-empty `body_md` (or `body`) from a comment/thread POST body — a clean 400 if absent
-/// or blank (never a silent empty comment).
 fn require_body_md(body: &Value) -> Result<String, DurableError> {
     body.get("body_md")
         .or_else(|| body.get("body"))
@@ -3258,9 +2761,6 @@ fn require_body_md(body: &Value) -> Result<String, DurableError> {
         .ok_or_else(|| DurableError::Git("comment body missing a non-empty `body_md`".into()))
 }
 
-/// Parse an optional diff-line content anchor from a POST body. A line anchor must fully specify
-/// `{ path, line, side }`; the caller then resolves it against the current authoritative PR diff.
-/// `None` (absent anchor) means a PR-level discussion thread.
 fn parse_anchor(body: &Value) -> Result<Option<ThreadAnchor>, DurableError> {
     let Some(value) = body.get("anchor") else {
         return Ok(None);
@@ -3342,7 +2842,6 @@ fn comment_json(c: &CommentRecord) -> Value {
     json!({
         "id": c.id,
         "author": principal_json(&c.author),
-        // A removed comment withholds its body ("Comment removed", tree preserved) — never serialised.
         "body_md": match c.state { CommentState::Removed => Value::Null, _ => json!(c.body_md) },
         "created_at": c.created_at,
         "edited_at": c.edited_at,
@@ -3379,9 +2878,6 @@ fn review_batch_json(r: &ReviewBatch) -> Value {
     })
 }
 
-/// The `GET …/threads` envelope: the viewer-scoped threads split into discussion (anchor null) vs
-/// anchored, plus the visible review batches. The overview consumes `discussion` + `reviews`; the diff
-/// pack consumes `anchored`.
 fn viewed_threads_json(v: &ViewedThreads) -> Value {
     let (anchored, discussion): (Vec<&ThreadRecord>, Vec<&ThreadRecord>) =
         v.threads.iter().partition(|t| t.anchor.is_some());
@@ -3446,9 +2942,6 @@ fn decode_pr_list_query_component(raw: &str) -> Result<String, EdgeError> {
     Ok(decoded)
 }
 
-/// Strictly parse the per-repository PR-list query. PostgreSQL relations may be larger than the
-/// transitional numeric cursor coordinate ceiling: their first pages and exact badges remain
-/// available, while this v1 cursor never discloses an unusable continuation beyond the cap.
 fn repo_pr_list_query(
     ctx: &HandlerCtx<'_>,
     viewer_pseudonym: String,
@@ -3702,7 +3195,6 @@ fn cross_pr_list_query(
     .map_err(|_| EdgeError::BadRequest("invalid pull request page".into()))
 }
 
-/// Qualify a bare ref (`main`) to `refs/heads/main`; a fully-qualified `refs/…` passes through.
 fn qualify_ref(gitref: &str) -> String {
     if gitref.starts_with("refs/") {
         gitref.to_string()
@@ -3711,21 +3203,13 @@ fn qualify_ref(gitref: &str) -> String {
     }
 }
 
-/// The bounded per-entry latest-commit history walk cap (R3.4 gate decision): entries not resolved
-/// within this many commits render name-only (graceful degrade — never an N-walk-per-entry blow-up).
 const LATEST_COMMIT_WALK_CAP: usize = 500;
 
-/// Candidate repositories must be materialized before the permission list-object intersection.
-/// Bound that tenant-local directory scan so a pathological partition cannot grow one request
-/// without limit; normal response pagination happens after this leak-free authorization prefilter.
 const REPO_SCAN_MAX_CANDIDATES: usize = 10_000;
 
-/// Each visible repository is bounded independently before cross-repository aggregation begins.
 const PR_LIST_PER_REPO_MAX_RECORDS: usize = PR_LIST_OFFSET_MAX;
 const PR_LIST_PER_REPO_MAX_BYTES: usize = 64 * 1024 * 1024;
 
-/// Request/cell-wide cross-repository aggregation ceilings. They bound the final exact bucket set
-/// even when every individual visible repository remains below its independent limit.
 const CROSS_PR_LIST_MAX_RECORDS: usize = 10_000;
 const CROSS_PR_LIST_MAX_BYTES: usize = 64 * 1024 * 1024;
 
@@ -3754,23 +3238,15 @@ fn serialized_pr_records_bytes(records: &[PrRecord]) -> Result<usize, DurableErr
     })
 }
 
-/// Boot recovery fails loud above this finite pending-command envelope so tenant backlog cannot
-/// become an unbounded startup allocation.
 const BOOT_RECOVERY_MAX_PENDING_MERGES: usize = 10_000;
 const BOOT_RECOVERY_MAX_PENDING_MERGE_BYTES: usize = 64 * 1024 * 1024;
 const BOOT_RECOVERY_MAX_RETAINED_OUTBOX_ROWS: usize = 100_000;
 const BOOT_RECOVERY_MAX_RETAINED_OUTBOX_BYTES: usize = 256 * 1024 * 1024;
 
-/// The inline-text cap for a blob view (R3.4). The ODB header is checked first: a larger object gets
-/// a metadata-only download fallback and is never inflated merely to build the interactive page.
 const BLOB_INLINE_CAP: usize = 512 * 1024;
 
-/// README markdown shares the JSON response budget with tree metadata and is checked at the ODB
-/// header before inflation. Oversized or binary README files simply omit the optional preview.
 const README_MAX_BYTES: usize = 512 * 1024;
 
-/// Match the web gateway's raw-response ceiling so the Edge rejects from the ODB header before
-/// inflating a file the next hop must reject anyway.
 const RAW_BLOB_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 fn first_root_tree_page(repo: &DurableGitRepo, branch_ref: &str) -> Result<TreePage, DurableError> {
@@ -3805,19 +3281,14 @@ fn read_text_blob_at_snapshot_bounded(
     }
 }
 
-/// The short oid (first 12 chars) — the browse log/tree short form.
 fn short_oid12(oid: &str) -> String {
     oid.chars().take(12).collect()
 }
 
-/// Fork import failures can contain repository paths or low-level libgit2 diagnostics. Those are
-/// useful only inside the storage boundary and must never be reflected through HTTP/MCP denial
-/// text. The public mutation boundary exposes one stable, non-oracular failure.
 fn sanitize_fork_import_error(_error: DurableError) -> DurableError {
     DurableError::Git("fork commit import could not be completed".into())
 }
 
-/// A compact latest-commit projection for a tree row / the repo-home latest-commit bar (R3.4).
 fn commit_brief_json(m: &CommitMeta) -> Value {
     json!({
         "short_oid": short_oid12(&m.oid),
@@ -3828,9 +3299,6 @@ fn commit_brief_json(m: &CommitMeta) -> Value {
     })
 }
 
-/// Project tree entries to JSON (shared by the repo home + the tree route — the gate's "share the
-/// projection"). Each entry carries its basename `name`, its full `path` (for the link), `is_dir`, an
-/// optional blob `size`, and the bounded-walk `latest_commit` when resolved.
 fn tree_entries_json(
     entries: &[myelin_git::durable::TreeEntryInfo],
     base: &str,
@@ -3856,8 +3324,6 @@ fn tree_entries_json(
         .collect()
 }
 
-/// Strip a filename to a safe `Content-Disposition` token: keep the basename's safe chars, drop quotes
-/// / control / path separators (defense against header injection + path leakage in the attachment name).
 fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -3870,7 +3336,6 @@ fn sanitize_filename(name: &str) -> String {
     }
 }
 
-/// Map the durable raw [`CommitMeta`] to the [`CommitRow`] ViewModel (the author is the GIT-1 pseudonym).
 fn commit_row(m: CommitMeta) -> CommitRow {
     CommitRow {
         oid: m.oid,
@@ -3881,7 +3346,6 @@ fn commit_row(m: CommitMeta) -> CommitRow {
     }
 }
 
-/// Map the durable raw [`CommitDetail`] to the [`CommitDiff`] ViewModel.
 fn commit_diff_vm(d: CommitDetail) -> CommitDiff {
     CommitDiff {
         commit: commit_row(d.meta),
@@ -3903,11 +3367,8 @@ fn commit_diff_vm(d: CommitDetail) -> CommitDiff {
     }
 }
 
-/// The per-file rendered-line cap for the PR diff (over-cap files carry `truncated == true` + an
-/// "Expand all" refetch). Generous for dogfood-scale reviews; the wire never dumps an unbounded file.
 const PR_DIFF_PER_FILE_LINE_CAP: usize = 4000;
 
-/// Map one durable [`myelin_git::durable::DiffLineDelta`] to the [`PrDiffLine`] VM.
 fn pr_diff_line(l: myelin_git::durable::DiffLineDelta) -> PrDiffLine {
     PrDiffLine {
         origin: l.origin,
@@ -3917,9 +3378,6 @@ fn pr_diff_line(l: myelin_git::durable::DiffLineDelta) -> PrDiffLine {
     }
 }
 
-/// Map the raw [`PrDiff`] to the [`PrDiffVM`], paging FILES (MR-014) at `offset`/`limit`. The whole
-/// diff is computed in one libgit2 pass; the RESPONSE is paged (dogfood scale — a genuinely lazy
-/// per-file compute is a named follow-on). `restricted_files` is 0 under the repo-level `Pull` guard.
 fn pr_diff_vm(number: u64, base_ref: &str, diff: PrDiff, offset: usize, limit: usize) -> PrDiffVM {
     let total_files = diff.total_files;
     let files: Vec<PrDiffFile> = diff
@@ -4011,8 +3469,6 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::Git(m) if m.starts_with("wire ref limit exceeded:") => {
             EdgeError::PayloadTooLarge("repository exceeds the smart-HTTP ref limit".into())
         }
-        // A traversal-rejected slug / malformed body (e.g. R3.1 open-PR with no `title`) surfaces as a
-        // clean 400 (never a silent wrong path, never a 500 for a client input error).
         DurableError::Git(m)
             if m.contains("traversal")
                 || m.contains("segment")
@@ -4024,7 +3480,6 @@ fn map_durable_err(e: DurableError) -> EdgeError {
             EdgeError::BadRequest(m)
         }
         DurableError::CasMismatch { .. } => EdgeError::Conflict(e.to_string()),
-        // A capability-scoped refusal (e.g. a non-CI-producer reporting checks) is a fail-closed 403.
         DurableError::Forbidden(m) => EdgeError::Forbidden(m),
         other => EdgeError::Internal(other.to_string()),
     }

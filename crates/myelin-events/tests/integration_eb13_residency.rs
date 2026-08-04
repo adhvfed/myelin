@@ -1,22 +1,3 @@
-//! EB-13 (P-090) — the Bus streams are residency-PINNED: a stream provisioned in one region has
-//! NO cross-region read path, PROVEN against the LIVE NATS JetStream dev stack.
-//!
-//! Gated behind the `integration` cargo feature so the default build stays broker-free. Run against
-//! the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-events --features integration --test integration_eb13_residency -- --nocapture
-//!
-//! What this proves on REAL hardware (not the in-process fake):
-//!  1. A per-(tenant, subsystem) stream is provisioned PINNED to its cell's region
-//!     ([`BusStreamResidency::provision`]) — and the live broker stream's subjects carry that
-//!     residency-pinned routing. The region report the Bus feeds into `residency_verify` (contract
-//!     12.4) reports the cell's region.
-//!  2. **No cross-region stream READ path:** a consumer whose filter is scoped to a DIFFERENT
-//!     region's stream-namespace captures 0 messages from the pinned stream — the cross-region read
-//!     path does not exist at the broker level (the per-region stream-name namespace + the
-//!     in-process [`BusStreamResidency::authorize_read`] guard agree: 0 cross-region reads). This is
-//!     the Bus's slice of CP-D3 / STOR-D5 on real infrastructure.
 #![cfg(feature = "integration")]
 
 use async_nats::jetstream;
@@ -56,13 +37,11 @@ fn envelope(tenant: &str, region: &str, event_id: &str) -> EventEnvelope {
     }
 }
 
-/// A residency-pinned stream provisioned in region A is never read from region B: the per-region
-/// stream-namespace at the broker + the in-process residency guard agree on 0 cross-region reads.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker() {
     let cfg = MyelinConfig::dev();
-    let cell_region = Region::new(&cfg.region); // the cell's region (fr-par on the dev stack)
-    let other_region = Region::new("eu-north"); // a DIFFERENT region — no read path to it
+    let cell_region = Region::new(&cfg.region);
+    let other_region = Region::new("eu-north");
 
     let client = async_nats::connect(&cfg.nats_url)
         .await
@@ -73,8 +52,6 @@ async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker
     let tenant = TenantId("acme".into());
     let partition = PartitionKey::new(tenant.clone(), cell_region.clone());
 
-    // 1. Provision the stream PINNED to the cell's region. A partition matching the cell provisions;
-    //    the region report the Bus feeds `residency_verify` (contract 12.4) is the cell's region.
     let stream_residency = BusStreamResidency::provision(&partition, "issue", &cell_region)
         .expect("a partition matching the cell region provisions a residency-pinned stream");
     assert_eq!(stream_residency.region(), &cell_region);
@@ -83,21 +60,14 @@ async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker
         .region_report()
         .matches_region_of_record(&cell_region));
 
-    // A provision asking for a DIFFERENT region than the cell is REFUSED (the stream lives in its
-    // cell — no cross-region provision).
     let wrong = PartitionKey::new(tenant.clone(), other_region.clone());
     assert!(matches!(
         BusStreamResidency::provision(&wrong, "issue", &cell_region),
         Err(ResidencyError::WrongCellRegion { .. })
     ));
 
-    // 2. The live broker: a per-REGION stream namespace. The pinned stream captures only its
-    //    region's subject space; a consumer scoped to ANOTHER region's namespace reads nothing.
-    //    Subject layout: `<root>.<region>.evt.<tenant>.<subsystem>.…` — the region is the first
-    //    routing token after the root, so a region-scoped filter is a hard partition.
     let root = format!("evt_eb13_{suffix}");
     let stream_name = format!("MYELIN_EB13_{suffix}");
-    // The cell's stream captures ONLY its region's namespace (`<root>.<cell-region>.>`).
     let cell_filter = format!("{root}.{}.>", cell_region.as_str());
     let stream = js
         .create_stream(jetstream::stream::Config {
@@ -108,7 +78,6 @@ async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker
         .await
         .expect("create the region-pinned JetStream stream");
 
-    // Publish an in-region event under the cell-region namespace.
     let env = envelope("acme", cell_region.as_str(), &format!("acme-{suffix}"));
     let subj = StreamSubject::of(&env).expect("subject");
     let in_region_wire = format!("{root}.{}.{}", cell_region.as_str(), subj.to_subject());
@@ -126,9 +95,6 @@ async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker
         "the in-region event landed in the cell stream"
     );
 
-    // THE GATE: a consumer scoped to a DIFFERENT region's namespace captures 0 messages — there is
-    // no cross-region read path. (The cell stream does not even capture another region's subject
-    // space, so a cross-region filter has nothing to read.)
     let cross_region_filter = format!("{root}.{}.>", other_region.as_str());
     assert_ne!(
         cell_filter, cross_region_filter,
@@ -145,11 +111,10 @@ async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker
     let cross_info = cross_consumer.info().await.expect("cross consumer info");
     assert_eq!(
         cross_info.num_pending, 0,
-        "THE GATE: a read scoped to a DIFFERENT region captures 0 messages — no cross-region \
+        "THE GATE: a read scoped to a DIFFERENT region captures 0 messages - no cross-region \
          stream read path (CP-D3 Bus slice; 0 cross-region reads)"
     );
 
-    // The in-process residency guard agrees: a cross-region read is REJECTED.
     assert!(matches!(
         stream_residency.authorize_read(&other_region),
         Err(ResidencyError::CrossRegionRead { .. })
@@ -158,7 +123,6 @@ async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker
         .authorize_read(&cell_region)
         .expect("an in-region read is authorized");
 
-    // An in-region consumer DOES read the message (the pin blocks cross-region, not in-region).
     let mut in_consumer = stream
         .create_consumer(jetstream::consumer::pull::Config {
             durable_name: Some(format!("inregion_{suffix}")),
@@ -173,6 +137,5 @@ async fn a_region_pinned_stream_has_no_cross_region_read_path_on_the_live_broker
         "the in-region read sees the event (the pin allows in-region)"
     );
 
-    // Cleanup.
     js.delete_stream(&stream_name).await.expect("delete stream");
 }

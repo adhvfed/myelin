@@ -1,19 +1,3 @@
-//! # `server` — the MCP JSON-RPC server: handshake + `tools/list` + governed `tools/call`.
-//!
-//! Ties the three halves together: the [`crate::protocol`] framing, the [`crate::registry`] tool
-//! catalogue (sourced from `agent_tools()`), and the [`crate::governance`] chokepoint (the MR-006
-//! `mint_run_token → EffectApi::apply` routing). Total over malformed input — a bad line yields a
-//! JSON-RPC error, never a panic.
-//!
-//! ## The MCP methods
-//! - `initialize` → the server's protocol version + capabilities (`tools`) + server info.
-//! - `notifications/initialized` → a notification (no response).
-//! - `tools/list` → the registered tools (names + input schemas + the frozen `requiresApproval`).
-//! - `tools/call` → resolve the tool, route through the governance chokepoint, return the outcome.
-//!   With NO governance router wired (the standalone binary), `tools/call` returns an HONEST
-//!   "not wired" JSON-RPC error — the per-run minter + the `EffectApi` body are injected by the
-//!   composition root (myelin-agent-service), never constructed in the protocol shell.
-
 use std::io::{BufRead, Read, Write};
 use std::sync::Arc;
 
@@ -29,18 +13,12 @@ use myelin_agent::EffectKind;
 use myelin_events::Timestamp;
 use myelin_identity::Principal;
 
-/// The MCP protocol version this server advertises (the MCP revision string).
 pub const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// Maximum JSON-RPC frame payload accepted over stdio. This bounds memory use before JSON parsing;
-/// an oversized frame is drained and rejected without terminating the session.
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
 
-/// An injectable RFC-3339 clock. Production reads it for every governed call and at teardown;
-/// tests can supply a fixed instant without freezing a long-lived production process in time.
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
-/// Error returned by a direct subsystem read adapter.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DirectReadError {
     InvalidInput(String),
@@ -49,8 +27,6 @@ pub enum DirectReadError {
     Unavailable,
 }
 
-/// Direct read boundary injected by the production composition root. The server supplies the exact
-/// agent principal from the governed run; implementations must perform object-level authorization.
 pub trait DirectReadExecutor: Send + Sync {
     fn execute(
         &self,
@@ -61,19 +37,14 @@ pub trait DirectReadExecutor: Send + Sync {
     ) -> Result<Value, DirectReadError>;
 }
 
-/// The MCP server — the registry plus optional governed mutation/direct-read adapters. Without a
-/// router, the protocol catalogue is live and calls honestly refuse as not wired.
 pub struct McpServer {
     registry: ToolRegistry,
     router: Option<GovernedRouter>,
     read_executor: Option<Arc<dyn DirectReadExecutor>>,
-    /// The clock each governed call mints/consults under. Production uses a wall clock; tests can
-    /// inject a deterministic clock.
     clock: Clock,
 }
 
 impl McpServer {
-    /// A server over git's tool catalogue with NO governance router (the standalone protocol shell).
     pub fn new_catalogue_only() -> McpServer {
         McpServer {
             registry: ToolRegistry::with_git(),
@@ -83,12 +54,10 @@ impl McpServer {
         }
     }
 
-    /// A production server with governed routing and a fresh wall-clock read for every call.
     pub fn with_router(registry: ToolRegistry, router: GovernedRouter) -> McpServer {
         McpServer::with_router_and_clock(registry, router, Arc::new(system_now))
     }
 
-    /// A server with governed routing and an injected dynamic clock.
     pub fn with_router_and_clock(
         registry: ToolRegistry,
         router: GovernedRouter,
@@ -102,7 +71,6 @@ impl McpServer {
         }
     }
 
-    /// A production server with both governed mutations and direct permission-checked reads.
     pub fn with_router_and_reads(
         registry: ToolRegistry,
         router: GovernedRouter,
@@ -116,7 +84,6 @@ impl McpServer {
         )
     }
 
-    /// Testable form of [`McpServer::with_router_and_reads`] with a dynamic injected clock.
     pub fn with_router_reads_and_clock(
         registry: ToolRegistry,
         router: GovernedRouter,
@@ -131,18 +98,14 @@ impl McpServer {
         }
     }
 
-    /// The tool registry (so a host/test can inspect the catalogue).
     pub fn registry(&self) -> &ToolRegistry {
         &self.registry
     }
 
-    /// The governance router, if wired (so a test can read the audit trail / revoke the run token).
     pub fn router(&self) -> Option<&GovernedRouter> {
         self.router.as_ref()
     }
 
-    /// **Handle ONE input line, returning the response line to write — or `None` for a notification.**
-    /// TOTAL: any malformed input yields a JSON-RPC error string, never a panic.
     pub fn handle_line(&self, line: &str) -> Option<String> {
         let line = line.trim();
         if line.is_empty() {
@@ -152,7 +115,6 @@ impl McpServer {
             Ok(r) => r,
             Err((id, err)) => return Some(write_value(&error_response(id, err))),
         };
-        // A notification (no id) NEVER gets a response (JSON-RPC §4.1), even on error.
         if req.is_notification {
             return None;
         }
@@ -174,9 +136,6 @@ impl McpServer {
         Some(write_value(&response))
     }
 
-    /// **Run the stdio loop** — read bounded newline-delimited JSON-RPC frames, write responses, and
-    /// tear down any minted run token on EOF or I/O failure. Malformed and oversized frames do not
-    /// panic or terminate an otherwise healthy session.
     pub fn run(&self, mut reader: impl BufRead, mut writer: impl Write) -> std::io::Result<()> {
         let result = (|| {
             loop {
@@ -219,7 +178,6 @@ impl McpServer {
         result
     }
 
-    /// The `initialize` result — the protocol version + capabilities (tools) + server info.
     fn initialize_result(&self) -> Value {
         json!({
             "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -228,7 +186,6 @@ impl McpServer {
         })
     }
 
-    /// `tools/call` — resolve the tool + route through the governance chokepoint.
     fn tools_call(&self, params: &Value) -> Result<Value, RpcError> {
         let name = params
             .get("name")
@@ -236,16 +193,12 @@ impl McpServer {
             .ok_or_else(|| RpcError::new(INVALID_PARAMS, "tools/call requires a string `name`"))?;
         let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
-        // Resolve against the catalogue (sourced from agent_tools()). Unknown ⇒ Invalid params,
-        // never a panic / a faked call.
         let tool = self
             .registry
             .resolve(name)
             .ok_or_else(|| RpcError::new(INVALID_PARAMS, format!("unknown tool: {name}")))?
             .clone();
 
-        // The governance router is the chokepoint. Without one, this is honestly "not wired" — the
-        // per-run minter + the EffectApi body are injected by the composition root, never here.
         let router = self.router.as_ref().ok_or_else(|| {
             RpcError::new(
                 GOVERNANCE_NOT_WIRED,
@@ -287,11 +240,6 @@ impl McpServer {
             EffectKind::Mutate | EffectKind::External => {}
         }
 
-        // HITL (R2.4): a re-drive after a human approved the card PRESENTS the server-issued
-        // opaque gate id (`approval.gateId`); the router looks it up in the SERVER-SIDE verdict
-        // store and proceeds only if THAT gate is Approved there by a distinct HUMAN principal. The
-        // legacy caller-supplied `approval.granted` boolean is deliberately NOT read — it is inert
-        // on the wire and never an enforcement input (the 2026-07-06 HIGH finding).
         let presented_gate_id = params
             .get("approval")
             .and_then(|a| a.get("gateId"))
@@ -318,8 +266,6 @@ impl McpServer {
         Ok(call_result_json(name, &outcome))
     }
 
-    /// Revoke the session's minted run token, if any. Idempotent and also invoked automatically by
-    /// [`McpServer::run`] on every exit path.
     pub fn teardown(&self) {
         if let Some(router) = &self.router {
             router.teardown(&(self.clock)());
@@ -334,8 +280,6 @@ enum Frame {
     InvalidUtf8,
 }
 
-/// Read one bounded line. If it crosses the cap, discard through the next newline so the following
-/// request starts on a clean frame boundary.
 fn read_frame(reader: &mut impl BufRead) -> std::io::Result<Frame> {
     let mut bytes = Vec::with_capacity(4096);
     let read = reader
@@ -389,9 +333,6 @@ fn write_response(writer: &mut impl Write, response: &str) -> std::io::Result<()
     writer.flush()
 }
 
-/// Map a governed [`CallOutcome`] to the MCP `tools/call` result body. `isError` is set for a denied
-/// effect; a gated effect surfaces the gate id (the human must approve). Every result carries the
-/// run-token `jti` under `_meta` — the attribution that makes the call auditable to the run.
 fn call_result_json(tool: &str, outcome: &CallOutcome) -> Value {
     let (text, is_error) = match outcome {
         CallOutcome::Applied { event_id, .. } => (
@@ -461,17 +402,13 @@ fn read_result_json(tool: &str, jti: &str, result: Result<Value, DirectReadError
     })
 }
 
-/// Serialise a response `Value` to a single line (no embedded newline — the stdio framing rule).
 fn write_value(v: &Value) -> String {
-    // `serde_json::to_string` never emits a newline; this is the on-the-wire frame.
     serde_json::to_string(v).unwrap_or_else(|_| {
-        // Unreachable for a well-formed Value; stay TOTAL rather than panic.
         r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32603,"message":"internal serialize error"}}"#
             .to_string()
     })
 }
 
-/// The production wall clock formatted for the identity mint/revocation contract.
 fn system_now() -> Timestamp {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

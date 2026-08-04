@@ -1,28 +1,3 @@
-//! # The CDC pair for contract 2.8 — schema-evolution upcasters (P-S09, forward-only)
-//!
-//! **Contract:** `planning/05-refined-shared-systems-architecture/contract-index.md` row 2.8
-//! (schema evolution / upcasters — `(type, from_ver) → to_ver` pure fns at consume; forward-only).
-//! Owning architecture: `00-platform-substrate.md` §2.1 (`schema_ver` gates evolution; upcasters
-//! bridge versions at consume, forward-only) + `event-bus.md` §4.10.
-//!
-//! ## The contract this pair pins (the forward-only evolution seam)
-//! Schema 2.8 is the seam between the side that EMITTED an event at an OLD `schema_ver` (the
-//! PROVIDER — a producer running an earlier deploy) and the side that CONSUMES it after the type
-//! has evolved (the CONSUMER — a handler written for the current shape that runs the upcaster
-//! registry before `handle`). The frozen behaviour both sides agree on:
-//!
-//! - the producer only ever ADDS optional fields and bumps `schema_ver` (expand→migrate→contract,
-//!   no rollback migrations) — so an old event is a STRICT subset shape of the new one;
-//! - at consume, the registered `(type, from_ver) → to_ver` PURE chain lifts the old envelope up
-//!   to the current shape BEFORE `handle` sees it (forward-only — never a down-cast);
-//! - an UNBRIDGEABLE `schema_ver` (a missing upcaster) is term'd to the DLQ via a loud
-//!   `NonRetryable`, **never silently dropped** and never handed to a handler at the wrong shape.
-//!
-//! This is the dedicated 2.8 provider+consumer pair the P-S09 TESTS field names (the chain
-//! correctness + purity + un-upcastable→loud unit tests live in `upcast.rs::tests`; the
-//! runtime-level dead-letter test lives in `consumer.rs::tests`). EB-10 (P-046) reconciles in
-//! place against `upcast.rs` and adds its Bus-flavoured `v1→v2→v3` / DLQ assertions.
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, Consumer, ConsumerName, CorrelationId, DataRole, DedupLedger,
     Delivered, EventEnvelope, EventHandler, EventId, EventType, HandleOutcome, Message,
@@ -43,8 +18,6 @@ fn principal() -> Principal {
     )
 }
 
-/// **PROVIDER side of 2.8** — a producer on an EARLIER deploy emits the event at an OLD
-/// `schema_ver` with the old (subset) payload shape (here v1: only `title`, no `priority`).
 fn provider_emits_old_version(schema_ver: u32) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId("01J-old".into()),
@@ -65,13 +38,10 @@ fn provider_emits_old_version(schema_ver: u32) -> EventEnvelope {
         pii_key_ref: None,
         occurred_at: Timestamp("2026-06-19T00:00:00Z".into()),
         recorded_at: Timestamp("2026-06-19T00:00:00Z".into()),
-        // The OLD subset payload — no `priority` (the field v1→v2 adds).
         payload: serde_json::json!({ "title": "ship it" }),
     }
 }
 
-/// The current-shape registry the CONSUMER runs at consume: `issues.issue.created` v1→v2 adds
-/// `priority` (the expand half — a new optional field). Pure shape transform.
 fn consumer_registry() -> UpcasterRegistry {
     let mut r = UpcasterRegistry::new();
     r.register(EventType("issues.issue.created".into()), 1, 2, |mut e| {
@@ -85,16 +55,12 @@ fn consumer_registry() -> UpcasterRegistry {
     r
 }
 
-/// A handler written for the CURRENT (v2) shape: it asserts it ALWAYS sees the current
-/// `schema_ver` + the forward-added `priority` field — never the old subset shape.
 struct CurrentShapeHandler {
     seen_ver: Arc<AtomicU32>,
     saw_priority: Arc<AtomicU32>,
 }
 impl EventHandler for CurrentShapeHandler {
     fn subjects(&self) -> &'static [SubjectPattern] {
-        // A `*`-free whitelist (the handler-declared subjects; the runtime whitelist below uses
-        // the same prefix). The runtime rejects a `*` subscription at bind time.
         &[]
     }
     fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
@@ -120,9 +86,6 @@ fn subscription() -> Subscription {
     .expect("a `*`-free whitelist binds")
 }
 
-/// **CDC 2.8 — the old event is bridged forward to the current shape at consume.** The provider
-/// emits v1 (old subset payload); the consumer runs the upcaster registry before `handle`, so the
-/// handler sees v2 WITH `priority`. Forward-only: the consumer never saw the old shape.
 #[test]
 fn cdc_2_8_old_event_is_upcast_to_current_before_handle() {
     let seen_ver = Arc::new(AtomicU32::new(0));
@@ -135,7 +98,6 @@ fn cdc_2_8_old_event_is_upcast_to_current_before_handle() {
     let c = Consumer::new(handler, subscription(), DedupLedger::new())
         .with_upcaster(consumer_registry().into_hook());
 
-    // The provider's OLD (v1) event arrives at the consumer.
     let old = provider_emits_old_version(1);
     assert_eq!(old.schema_ver, 1, "provider emitted the old version");
     assert!(
@@ -160,10 +122,6 @@ fn cdc_2_8_old_event_is_upcast_to_current_before_handle() {
     );
 }
 
-/// **CDC 2.8 — an un-upcastable `schema_ver` is term'd to the DLQ, never silently dropped.** The
-/// provider emits a version (v0) for which the consumer has NO upcaster chain to current. The
-/// runtime dead-letters it loudly (`NonRetryable` → DLQ); the handler never runs; 0 silently
-/// dropped (the message is surfaced on the dead-letter list, diagnosably).
 #[test]
 fn cdc_2_8_unbridgeable_version_is_dead_lettered_never_silently_dropped() {
     let seen_ver = Arc::new(AtomicU32::new(0));
@@ -171,7 +129,6 @@ fn cdc_2_8_unbridgeable_version_is_dead_lettered_never_silently_dropped() {
         seen_ver: seen_ver.clone(),
         saw_priority: Arc::new(AtomicU32::new(0)),
     };
-    // The registry only knows v1->v2 (current = v2); a v0 event has no v0->v1 hop → unbridgeable.
     let c = Consumer::new(handler, subscription(), DedupLedger::new())
         .with_upcaster(consumer_registry().into_hook());
 
@@ -200,6 +157,6 @@ fn cdc_2_8_unbridgeable_version_is_dead_lettered_never_silently_dropped() {
     assert_eq!(
         c.dead_letters().len(),
         1,
-        "term'd to the DLQ — surfaced, 0 silently dropped"
+        "term'd to the DLQ - surfaced, 0 silently dropped"
     );
 }

@@ -1,21 +1,3 @@
-//! P-ST-14 (global P-100) GATE / DRILL — **STOR-D3 (post-restore re-erasure)**, dated green artifact.
-//!
-//! **STOR-D3 (storage.md §7.5 / testing-strategy §4.2 row STOR-D3 / D-S3):** *erase a subject, restore
-//! an OLDER backup → still erased (the post-restore re-erasure pass ran); **0 resurrected subjects**.*
-//! Telemetry: re-erasure receipt + 0 resurrected.
-//!
-//! The scenario this drill exercises end-to-end:
-//! 1. A backup is taken at PIT T (the subject's per-subject DEK is LIVE at T).
-//! 2. The subject is erased (crypto-shredded) at offset `e > T` — AFTER the backup.
-//! 3. The cell is restored from the OLDER backup at T → the restore RESURRECTS the subject's DEK (it
-//!    was alive at T; the before-the-backup gate leg P-061 does NOT cover a post-T erasure).
-//! 4. The mandatory post-restore re-erasure pass (§7.5) re-applies the erasure → **0 resurrected**.
-//!
-//! ## The assertion is REAL, not vacuous (EI-01 §3 — a drill that cannot go red is not a gate)
-//! [`stor_d3_without_reerase_the_restore_resurrects`] proves the restore DOES resurrect the subject
-//! WITHOUT the pass (the DEK is back), so the green drill's 0-resurrected is earned by the pass, not by
-//! the subject having been absent anyway.
-
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
@@ -85,8 +67,6 @@ fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     arch
 }
 
-/// Stand up the restored-copy KMS with the subject's pre-erasure DEK ALIVE (resurrected by the
-/// restore of the older backup T — the key was live at T).
 fn restored_copy_with_resurrected_subject(t: &TenantId, subject: &SubjectId) -> KmsEngine {
     let kms = KmsEngine::new();
     kms.ensure_kek(&KekId::new(t.clone(), region()));
@@ -101,14 +81,11 @@ fn restored_copy_with_resurrected_subject(t: &TenantId, subject: &SubjectId) -> 
     kms
 }
 
-/// **STOR-D3: erase a subject, restore an older backup, run the mandatory re-erasure pass → 0
-/// resurrected. The dated green artifact.**
 #[test]
 fn stor_d3_post_restore_reerase_zero_resurrected() {
     let t = tenant("acme");
     let subject = SubjectId::new("u-forget");
 
-    // The restored copy (from the OLDER backup at PIT T=100) has the subject's DEK resurrected.
     let kms = restored_copy_with_resurrected_subject(&t, &subject);
     let subject_dek = DekId::new(t.clone(), KeyClass::Subject(subject.0.clone()));
     assert!(
@@ -116,7 +93,6 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
         "precondition: the restore of the older backup RESURRECTED the subject's DEK"
     );
 
-    // Restore lands at the older PIT T=100.
     let arch = reachable_archiver(300);
     let report = restore_to_offset(
         &arch,
@@ -128,11 +104,9 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
     )
     .unwrap();
 
-    // The erasure ledger records the erasure as completed at offset 200 — AFTER the backup PIT.
     let mut ledger = InMemoryPostPitLedger::new();
     ledger.record(ErasureRecord::new(subject.clone(), t.clone(), 200));
 
-    // The MANDATORY post-restore re-erasure pass (§7.5).
     let seams = Seams::default();
     let holders = EraseHolders {
         pseudonym: &seams,
@@ -147,8 +121,6 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
         .run(&report, &ledger, &holders, 1_000)
         .expect("re-erasure pass runs");
 
-    // THE GATE READING: 0 resurrected, observably on the telemetry source (the SAME assertion surface
-    // every drill uses). A subject still recoverable would read RED.
     let mut signals = SignalSource::new();
     signals.set_scalar(
         SignalName::RestoreCrossSeamMismatch,
@@ -171,10 +143,9 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
         rep.re_erased[0].was_resurrected_before_reapply,
         "the subject WAS resurrected by the restore and re-killed by the pass"
     );
-    // The DEK is gone from the restored copy now.
     assert!(
         !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
-        "the resurrected DEK is re-destroyed — still erased after restore"
+        "the resurrected DEK is re-destroyed - still erased after restore"
     );
 
     println!(
@@ -187,9 +158,6 @@ fn stor_d3_post_restore_reerase_zero_resurrected() {
     );
 }
 
-/// **WITHOUT the re-erasure pass, the restore RESURRECTS the subject** (the assertion is real). Proves
-/// the green drill's 0-resurrected is EARNED by the pass — not by the subject having been absent. A
-/// drill that cannot go red is not a gate (EI-01 §3).
 #[test]
 fn stor_d3_without_reerase_the_restore_resurrects() {
     let t = tenant("acme");
@@ -197,14 +165,12 @@ fn stor_d3_without_reerase_the_restore_resurrects() {
     let kms = restored_copy_with_resurrected_subject(&t, &subject);
     let subject_dek = DekId::new(t.clone(), KeyClass::Subject(subject.0.clone()));
 
-    // The restore of the older backup brings the DEK back — WITHOUT a re-erasure pass it is alive.
     let resurrected = kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek);
     assert!(
         resurrected,
         "WITHOUT the §7.5 re-erasure pass, the restore RESURRECTS the post-T-erased subject's DEK"
     );
 
-    // Modelled as the 'resurrected_count' a no-pass restore would emit: 1 → RED on the gate assertion.
     let mut signals = SignalSource::new();
     signals.set_scalar(SignalName::RestoreCrossSeamMismatch, 1);
     let verdict = signals.assert_signal(SignalName::RestoreCrossSeamMismatch, Predicate::Eq(0));

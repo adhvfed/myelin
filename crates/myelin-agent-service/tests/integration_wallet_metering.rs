@@ -1,21 +1,3 @@
-//! # v1 TOKEN METERING proven against LIVE Postgres (the wallet-touching leg).
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo build/test --workspace` stays
-//! DB-free. Runs ONLY against the docker-compose dev stack (or the make-it-real env):
-//!
-//!   DATABASE_URL=postgres://myelin_app:myelin_app_pw@localhost:5433/myelin \
-//!     AWS_DEFAULT_REGION=fr-par cargo test -p myelin-agent-service \
-//!       --features integration --test integration_wallet_metering -- --nocapture
-//!
-//! It proves, on the REAL durable [`AgentWallet`] (immutable ledger, `FOR UPDATE`, RLS), that a
-//! metered run driven through the REAL [`SkeletonAgent::handle_run`] path DEBITS the wallet per turn
-//! for exactly the priced token usage — while the nominal reserve/settle ledger stays untouched:
-//!   A. **per-turn debit** — a three-turn metered run appends exactly three run-linked `debit` ledger
-//!      rows and drops the balance by exactly `3 × (wholesale + markup)`.
-//!   B. **the spend cap** — a run whose wallet cannot fund every turn halts GRACEFULLY (teardown
-//!      fires) with NO negative balance (the underfunded turn's debit wrote nothing).
-//!
-//! Skips gracefully if the DB is unreachable (like the sibling integration tests).
 #![cfg(feature = "integration")]
 
 use myelin_agent::{
@@ -36,8 +18,6 @@ use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::SubstrateProvider;
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
-
-// ───────────────────────── the contract-4.7 mint/revoke doubles (deterministic) ─────────────────
 
 #[derive(Default)]
 struct ProviderMinter;
@@ -85,10 +65,6 @@ fn agent_principal(tenant: &TenantId) -> Principal {
     )
 }
 
-// ───────────────────────── a metered brain reporting fixed usage (search → read → submit) ───────
-
-/// The fixed per-turn usage: wholesale = (1000*200_000 + 500*20_000 + 200*1_200_000)/1e6 = 450 ;
-/// markup = round(9.0) = 9 ; total = 459 micro-USD per turn.
 const TEST_USAGE: TokenUsage = TokenUsage::Reported {
     input: 1_000,
     cached_input: 500,
@@ -141,8 +117,6 @@ impl MeteredRuntime for MeteredBrain {
     }
 }
 
-// ───────────────────────── the live-PG plumbing (mirrors integration_agent_wallet.rs) ───────────
-
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
     let mut c = cfg.clone();
     c.database_url = c
@@ -162,7 +136,6 @@ fn uniq() -> String {
     )
 }
 
-/// Apply the agent-wallet migration (0080) as the admin/owner role. `None` (SKIP) if unreachable.
 async fn migrate_admin() -> Option<SubstrateProvider> {
     let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
         Ok(p) => p,
@@ -178,7 +151,6 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
     Some(admin)
 }
 
-/// Count the run-linked `debit` rows for `(tenant, region)`, directly in SQL (the independent oracle).
 async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id: &str) -> i64 {
     let mut tx = pool.begin().await.expect("begin count tx");
     sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
@@ -201,12 +173,6 @@ async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id
     n
 }
 
-// ───────────────────────── the drills ────────────────────────────────────────────────────────────
-
-/// **A — a metered run DEBITS the durable wallet per turn for exactly the priced usage, run-linked,
-/// while the nominal reserve/settle ledger stays balanced.** Three metered turns × 459 = 1_377
-/// micro-USD debited; three run-linked `debit` ledger rows; the materialized balance drops by exactly
-/// 1_377; `charged_micro` telemetry == 1_377; reserved == settled (the nominal gate is untouched).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metered_run_debits_the_durable_wallet_per_turn() {
     let Some(_admin) = migrate_admin().await else {
@@ -219,14 +185,12 @@ async fn metered_run_debits_the_durable_wallet_per_turn() {
     let tenant = TenantId(format!("01J0METER{}", uniq()));
     let wallet = AgentWallet::new(app.clone());
 
-    // The per-turn charge, computed by the SAME pricing the loop uses (no magic number drift).
     let per_turn = price(&TEST_USAGE, &LUNA_RATES)
         .expect("prices without overflow")
         .total()
         .expect("total fits");
     let three_turns = MicroUsd(per_turn.0 * 3);
 
-    // Seed the wallet with plenty ($1.00), then drive ONE metered run to completion.
     let topup = MicroUsd(1_000_000);
     wallet
         .credit(&tenant, topup, CreditKind::Topup, None)
@@ -270,21 +234,17 @@ async fn metered_run_debits_the_durable_wallet_per_turn() {
         .expect("the metered run completes");
     assert!(out.0.contains("completed"), "the run completed: {out:?}");
 
-    // The materialized balance dropped by EXACTLY 3 × the per-turn charge.
     assert_eq!(
         wallet.balance(&tenant),
         MicroUsd(topup.0 - three_turns.0),
         "balance dropped by exactly 3 × (wholesale + markup)"
     );
-    // Exactly THREE run-linked debit rows (one per turn — no double-charge, no skip).
     assert_eq!(
         debit_row_count(app.db_pool(), &tenant.0, &region_s, run_id).await,
         3,
         "one run-linked debit ledger row per turn"
     );
-    // The run's charged-micro telemetry mirrors the durable spend.
     assert_eq!(tele.charged_micro(), three_turns.0);
-    // THE LAYERING: the nominal reserve/settle ledger is balanced + unchanged by the metering.
     assert!(tele.ledger_balanced(), "reserved == settled is unaffected");
     assert_eq!(tele.reserved(), 10);
     assert_eq!(tele.settled(), 10);
@@ -293,11 +253,6 @@ async fn metered_run_debits_the_durable_wallet_per_turn() {
     assert_eq!(tele.runs_completed(), 1);
 }
 
-/// **B — a run whose durable wallet cannot fund every turn halts GRACEFULLY (spend cap) with NO
-/// negative balance.** The wallet is topped up to fund only two turns; the third turn's debit is
-/// refused by the real wallet (fail-closed) → the run terminates with
-/// [`SkeletonError::WalletSpendCapReached`], the token is torn down, and the balance is left
-/// non-negative (the refused turn wrote nothing — exactly two debit rows).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metered_run_dry_durable_wallet_halts_gracefully() {
     let Some(_admin) = migrate_admin().await else {
@@ -311,7 +266,6 @@ async fn metered_run_dry_durable_wallet_halts_gracefully() {
     let wallet = AgentWallet::new(app.clone());
 
     let per_turn = price(&TEST_USAGE, &LUNA_RATES).unwrap().total().unwrap();
-    // Fund EXACTLY two turns (2 × 459 = 918); the third turn's debit must be refused.
     let two_turns = MicroUsd(per_turn.0 * 2);
     wallet
         .credit(&tenant, two_turns, CreditKind::Topup, None)
@@ -357,8 +311,6 @@ async fn metered_run_dry_durable_wallet_halts_gracefully() {
         matches!(err, SkeletonError::WalletSpendCapReached { .. }),
         "graceful spend-cap halt: {err}"
     );
-    // The balance is left NON-NEGATIVE — exactly drained to 0 by the two funded turns; the refused
-    // third turn wrote nothing (no negative balance, no partial debit).
     assert_eq!(
         wallet.balance(&tenant),
         MicroUsd::ZERO,
@@ -367,10 +319,9 @@ async fn metered_run_dry_durable_wallet_halts_gracefully() {
     assert_eq!(
         debit_row_count(app.db_pool(), &tenant.0, &region_s, run_id).await,
         2,
-        "exactly two debit rows — the refused turn wrote nothing"
+        "exactly two debit rows - the refused turn wrote nothing"
     );
     assert_eq!(tele.charged_micro(), two_turns.0);
-    // Teardown STILL fired; the run did not complete (reservation left in-flight, no trace).
     assert_eq!(tele.tokens_revoked(), 1, "torn down on the spend-cap path");
     assert_eq!(tele.traces_written(), 0);
     assert_eq!(tele.runs_completed(), 0);

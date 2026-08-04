@@ -1,19 +1,3 @@
-//! # CT-006d EXTERNAL-ORACLE: a REAL `git push` against the Myelin smart-HTTP server
-//!
-//! The GT-006 WRITE-side done-bar. Binds a real edge listener, registers the git smart-HTTP wire
-//! endpoints over the DURABLE on-disk backend, and drives the **host's REAL `git`** as a pushing client:
-//!   1. a real `git push` of new commits over HTTP → SUCCEEDS; the objects + ref land DURABLY (a FRESH
-//!      process / re-opened durable repo sees the new ref + objects — survives restart), `git fsck` is
-//!      clean on the server repo, and ONE `git.ref.updated` outbox event was emitted (emit-iff-committed);
-//!   2. a REJECTED push (a planted AWS-key secret) does NOT move the ref + emits NO event (0 ghost) — the
-//!      ref tip + outbox depth are UNCHANGED;
-//!   3. an UNAUTHENTICATED push is refused; a CROSS-TENANT push is refused (no ref move, no leak).
-//!
-//! Every pushed byte's pack is a REAL `runsc` run of REAL `git index-pack` inside the hardened gVisor
-//! sandbox (`GvisorBackend::launch_git_receive_pack`), streamed back + migrated by the in-process
-//! one-tx ref-CAS + outbox. Gated like CT-006c: `MYELIN_REQUIRE_RUNSC=1` ⇒ an absent capability is a
-//! HARD failure. Run: `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-edge --test git_wire_http_push_oracle_test -- --nocapture`.
-
 use myelin_ci_sandbox::verified_gvisor_git_rootfs;
 use myelin_edge::{
     register_git_wire, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
@@ -62,7 +46,7 @@ fn host_git() -> bool {
 fn require_or_skip(test: &str) -> bool {
     if runsc_bin().is_none() || !host_git() {
         if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
-            panic!("[{test}] MYELIN_REQUIRE_RUNSC=1 but runsc/host git absent — refusing a vacuous green.");
+            panic!("[{test}] MYELIN_REQUIRE_RUNSC=1 but runsc/host git absent - refusing a vacuous green.");
         }
         eprintln!("[{test}] SKIPPED: runsc/host git absent.");
         return false;
@@ -73,7 +57,7 @@ fn require_or_skip(test: &str) -> bool {
         Err(error) if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
             panic!(
                 "[{test}] MYELIN_REQUIRE_RUNSC=1 but the pinned production git rootfs is \
-                 unavailable: {error} — refusing a vacuous green."
+                 unavailable: {error} - refusing a vacuous green."
             );
         }
         Err(error) => {
@@ -149,8 +133,6 @@ fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority, Arc<DurableGitBacken
     )
 }
 
-/// Same as [`build`] but with a caller-supplied backend (so a test can inject a restrictive per-repo
-/// authorizer — e.g. a write-only-but-NOT-protected_push grant to prove the R2-exit wire denial).
 fn build_with_authz(
     root: &Path,
     backend: Arc<DurableGitBackend>,
@@ -203,14 +185,10 @@ async fn spawn(gateway: Arc<Gateway>) -> SocketAddr {
     addr
 }
 
-/// Make a work repo with one initial commit (not yet pushed to the server).
 fn make_work(root: &Path) -> PathBuf {
     let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
     run_git(&["init", "-q", "-b", "main"], Some(&work));
-    // The push pseudonymity gate (GIT-1) requires every pushed commit's author/committer identity to be
-    // a `<pseudonym>@<tenant>.noreply` handle for the pushing tenant (acme) — a raw name/email is refused
-    // BEFORE the ref moves. A real client does this one-time `git config`; the oracle does the same.
     run_git(
         &["config", "user.email", "anon-7@acme.noreply"],
         Some(&work),
@@ -232,7 +210,6 @@ fn make_work(root: &Path) -> PathBuf {
     work
 }
 
-/// Run `git push <url> main` with an optional Bearer token. Returns (success, stdout, stderr).
 fn git_push(
     addr: SocketAddr,
     token: Option<&str>,
@@ -255,7 +232,6 @@ fn git_push(
     )
 }
 
-/// Re-open the durable repo in a FRESH store (a new process would do the same) and read a ref's tip.
 fn durable_tip(root: &Path, tenant: &str, slug: &str, refname: &str) -> Option<String> {
     let store = DurableGitStore::rooted(root.to_path_buf());
     let repo = store.open_repo(&RepoLoc::new(tenant, REGION, slug)).ok()?;
@@ -269,7 +245,6 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     }
 
     let root = temp_root("push");
-    // The server repo must exist (push to a non-existent repo is a 404). Create it durably.
     let backend_for_create = DurableGitBackend::rooted_inmem_for_test(root.clone());
     backend_for_create
         .create_repo("acme", REGION, "widgets")
@@ -290,12 +265,10 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
 
     let depth_before = backend.outbox().outbox_depth();
 
-    // ── 1. REAL `git push` over smart-HTTP with the Bearer token ──
     let (ok, so, se) = git_push(addr, Some(&token), "/acme/eu-west/widgets.git", &work);
     println!("=== git push (authenticated) ===\nsuccess={ok}\nstdout=\n{so}\nstderr=\n{se}");
     assert!(ok, "the authenticated push MUST succeed");
 
-    // The ref + objects landed DURABLY: a FRESH store (≈ a restarted process) sees the new tip.
     let tip = durable_tip(&root, "acme", "widgets", "refs/heads/main");
     println!("durable re-open: refs/heads/main = {tip:?} (pushed {pushed_oid})");
     assert_eq!(
@@ -304,7 +277,6 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
         "the pushed ref must survive a fresh re-open"
     );
 
-    // `git fsck --full` on the SERVER bare repo is clean (the migrated objects are intact + connected).
     let bare = root.join("acme/eu-west/widgets.git");
     let fsck = Command::new("git")
         .args(["--git-dir", &bare.to_string_lossy(), "fsck", "--full"])
@@ -320,7 +292,6 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
         "git fsck on the server repo must be clean"
     );
 
-    // emit-iff-committed: exactly ONE git.ref.updated row became durable for the accepted ref move.
     let depth_after = backend.outbox().outbox_depth();
     println!("outbox depth: before={depth_before} after={depth_after} (expect +1)");
     assert_eq!(
@@ -329,11 +300,8 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
         "the accepted push emits exactly one git.ref.updated (0 ghost / 0 lost)"
     );
 
-    // ── 2. a REJECTED push (a planted AWS-key secret) does NOT move the ref + emits NO event ──
     let tip_before_reject = durable_tip(&root, "acme", "widgets", "refs/heads/main");
     let depth_before_reject = backend.outbox().outbox_depth();
-    // Assemble the planted secret at runtime so this self-hosted scanner oracle does not make its
-    // own source blob unpushable.
     let planted_secret = [b"aws_key = AK".as_slice(), b"IAIOSFODNN7EXAMPLE\n"].concat();
     std::fs::write(work.join("creds.txt"), planted_secret).unwrap();
     run_git(&["add", "-A"], Some(&work));
@@ -349,7 +317,7 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
         Some(&work),
     );
     let (ok_s, so_s, se_s) = git_push(addr, Some(&token), "/acme/eu-west/widgets.git", &work);
-    println!("=== git push (PLANTED SECRET) — must be rejected ===\nsuccess={ok_s}\nstdout=\n{so_s}\nstderr=\n{se_s}");
+    println!("=== git push (PLANTED SECRET) - must be rejected ===\nsuccess={ok_s}\nstdout=\n{so_s}\nstderr=\n{se_s}");
     assert!(!ok_s, "a push carrying a secret MUST be rejected");
     let tip_after_reject = durable_tip(&root, "acme", "widgets", "refs/heads/main");
     assert_eq!(
@@ -361,7 +329,6 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
         depth_before_reject,
         "a rejected push emits NO event"
     );
-    // The server repo is still fsck-clean (no half-migrated corruption from the rejected push).
     let fsck2 = Command::new("git")
         .args(["--git-dir", &bare.to_string_lossy(), "fsck", "--full"])
         .output()
@@ -370,15 +337,12 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
         fsck2.status.success(),
         "the server repo stays fsck-clean after a rejected push"
     );
-    // Undo the local secret commit so the cross-tenant leg pushes a clean history.
     run_git(&["reset", "-q", "--hard", "HEAD~1"], Some(&work));
 
-    // ── 3a. UNAUTHENTICATED push is refused ──
     let (ok_n, _so_n, se_n) = git_push(addr, None, "/acme/eu-west/widgets.git", &work);
-    println!("=== git push (NO token) — must be refused ===\nsuccess={ok_n}\nstderr=\n{se_n}");
+    println!("=== git push (NO token) - must be refused ===\nsuccess={ok_n}\nstderr=\n{se_n}");
     assert!(!ok_n, "an unauthenticated push MUST be refused");
 
-    // ── 3b. CROSS-TENANT push is refused (globex's token for acme's repo) ──
     let globex = mint(&cell, "globex", "jti-x");
     let tip_before_x = durable_tip(&root, "acme", "widgets", "refs/heads/main");
     std::fs::write(work.join("x.txt"), b"cross tenant attempt\n").unwrap();
@@ -388,7 +352,7 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
         Some(&work),
     );
     let (ok_x, _so_x, se_x) = git_push(addr, Some(&globex), "/acme/eu-west/widgets.git", &work);
-    println!("=== git push (CROSS-TENANT globex→acme) — must be refused ===\nsuccess={ok_x}\nstderr=\n{se_x}");
+    println!("=== git push (CROSS-TENANT globex→acme) - must be refused ===\nsuccess={ok_x}\nstderr=\n{se_x}");
     assert!(!ok_x, "a cross-tenant push MUST be refused");
     assert_eq!(
         durable_tip(&root, "acme", "widgets", "refs/heads/main"),
@@ -399,15 +363,6 @@ async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() 
     println!("=== CT-006d EXTERNAL ORACLE PROVEN: real git push lands durably + secret-reject (0 ghost) + auth/cross-tenant refusal ===");
     let _ = std::fs::remove_dir_all(&root);
 }
-
-// ═══════════════ R2.1a — R0.2 LIVE: branch protection fires on the production-shaped wire ═══════════════
-//
-// R0.2 (`evaluate_protected_ref_push`) was proven at the handler tier; what was missing was the wire
-// itself in the production composition (main.rs never called `register_git_wire`). This oracle runs
-// the R2.1a composition — the live CheckEngine repo-authorizer + the creator→admin bootstrap grant +
-// the mounted wire — and proves the protected-ref gate rejects a REAL `git push --force` to
-// `refs/heads/main` (the default-protected ref) with the ref tip UNMOVED, while ordinary
-// fast-forward pushes by the granted creator continue to land.
 
 use myelin_edge::{
     register_git_durable, register_git_wire as register_wire_r21a, CheckBackedRepoAuthorizer,
@@ -420,7 +375,7 @@ use myelin_substrate::FailStaticThreshold;
 
 fn r21a_threshold() -> FailStaticThreshold {
     FailStaticThreshold {
-        status: "OPEN — LEGAL".into(),
+        status: "OPEN - LEGAL".into(),
         owner: "DPO / Legal".into(),
         static_max_secs: None,
         static_max_default_secs: 300,
@@ -429,8 +384,6 @@ fn r21a_threshold() -> FailStaticThreshold {
     }
 }
 
-/// The R2.1a production-shaped gateway (mirrors main.rs): live CheckEngine repo authz + bootstrap
-/// grants + the durable routes (create-repo) + the wire.
 fn build_r21a(root: &Path) -> (Arc<Gateway>, CellTokenAuthority) {
     let cell = CellTokenAuthority::from_seed(&[21u8; 32], &[23u8; 32]).expect("cell");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
@@ -485,7 +438,6 @@ fn mint_for(cell: &CellTokenAuthority, jti: &str, subject_key: &str) -> String {
     })
 }
 
-/// A minimal HTTP/1.1 POST over a raw TcpStream (no client dep): returns the full response text.
 fn http_post(addr: SocketAddr, path: &str, token: &str, body: &str) -> String {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(addr).expect("connect edge");
@@ -499,7 +451,6 @@ fn http_post(addr: SocketAddr, path: &str, token: &str, body: &str) -> String {
     out
 }
 
-/// `git push [--force] <url> main`; returns (success, stdout, stderr).
 fn push_main(addr: SocketAddr, token: &str, work: &Path, force: bool) -> (bool, String, String) {
     let url = format!("http://{addr}/acme/eu-west/widgets.git");
     let mut c = Command::new("git");
@@ -530,8 +481,6 @@ async fn r0_2_branch_protection_rejects_force_push_through_the_live_wire() {
     let addr = spawn(gw).await;
     let token = mint_for(&cell, "jti-r02", "subj-c");
 
-    // The creator creates the repo THROUGH the edge (bootstrap grant written) and pushes twice —
-    // ordinary fast-forwards land through the live-authz wire.
     let resp = http_post(addr, "/v1/git/repos", &token, r#"{"slug":"widgets"}"#);
     assert!(
         resp.starts_with("HTTP/1.1 201"),
@@ -560,9 +509,6 @@ async fn r0_2_branch_protection_rejects_force_push_through_the_live_wire() {
     );
     let tip_b = durable_tip(&root, "acme", "widgets", "refs/heads/main").expect("tip B");
 
-    // Rewrite history (divergent C from A) and FORCE-push → R0.2: `refs/heads/main` is protected
-    // by default; a force push is rejected AT THE WIRE (per-ref `ng` — the whole atomic push
-    // aborts) and the durable tip does not move.
     run_git(&["reset", "-q", "--hard", "HEAD~1"], Some(&work));
     std::fs::write(work.join("c.txt"), b"divergent\n").unwrap();
     run_git(&["add", "-A"], Some(&work));
@@ -578,7 +524,7 @@ async fn r0_2_branch_protection_rejects_force_push_through_the_live_wire() {
         Some(&work),
     );
     let (ok_f, so_f, se_f) = push_main(addr, &token, &work, true);
-    println!("=== FORCE push (divergent) — must be rejected by R0.2 ===\nsuccess={ok_f}\nstdout=\n{so_f}\nstderr=\n{se_f}");
+    println!("=== FORCE push (divergent) - must be rejected by R0.2 ===\nsuccess={ok_f}\nstdout=\n{so_f}\nstderr=\n{se_f}");
     assert!(
         !ok_f,
         "a force push to the protected `main` MUST be rejected through the wire (R0.2 live)"
@@ -597,17 +543,6 @@ async fn r0_2_branch_protection_rejects_force_push_through_the_live_wire() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// ═══════════════ R2-EXIT BLOCKER — a plain WRITER's direct push to a protected ref is DENIED ═══════
-//
-// The red-team exploit, over the REAL wire: a principal holding only a `write` grant (NO
-// `admin`/`protected_push`) pushes DIRECTLY to a protected `main` whose repo-owned ruleset requires a
-// human approval. Defect 2 (the wire consults R2.1's admin-only `RepoPermission::ProtectedPush` rung —
-// a writer lacks it) + Defect 3 (the full ruleset, not just contexts — a direct push carries 0
-// approvals) compose so the push is REJECTED at the wire (`ng`), the ref never moves, and NO event is
-// emitted.
-
-/// **THE EXPLOIT, FLIPPED TO DENIED (end-to-end).** A write-only principal's direct `git push` to a
-/// protected `main` that requires an approval is refused over the wire; the ref is never created/moved.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
     if !require_or_skip("r2-exit writer→protected-push oracle") {
@@ -615,10 +550,6 @@ async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
     }
 
     let root = temp_root("r2exit-writer");
-    // A backend whose per-repo authorizer grants the pushing principal (svc:agent) WRITE only — NOT
-    // protected_push (`writer` in the frozen lattice; `protected_push = admin`). So the wire Write gate
-    // ADMITS the push, but the protected-ref gate does not find the admin bypass, and holds the direct
-    // push to the full ruleset.
     let backend = Arc::new(
         DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()).with_repo_authorizer(
             Arc::new(myelin_edge::GrantBackedRepos::new().grant_write(
@@ -631,7 +562,6 @@ async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
     backend
         .create_repo("acme", REGION, "widgets")
         .expect("create server repo");
-    // Repo-owned protection: `main` requires ONE approval — unsatisfiable by a DIRECT push (no PR).
     backend
         .set_branch_protection(
             "acme",
@@ -654,7 +584,7 @@ async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
     let work = make_work(&root);
 
     let (ok, so, se) = git_push(addr, Some(&token), "/acme/eu-west/widgets.git", &work);
-    println!("=== writer direct push to PROTECTED main — must be refused ===\nsuccess={ok}\nstdout=\n{so}\nstderr=\n{se}");
+    println!("=== writer direct push to PROTECTED main - must be refused ===\nsuccess={ok}\nstdout=\n{so}\nstderr=\n{se}");
     assert!(
         !ok,
         "a plain writer's direct push to a protected ref MUST be refused (needs protected_push OR a satisfied full ruleset)"
@@ -678,19 +608,6 @@ async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// ═══════════════ R4.0 item C — REAL `git` clone + push over HTTP **Basic auth** ═══════════════
-//
-// `git push/clone http://…` sends `Authorization: Basic base64(user:pass)`. R4.0 makes the git WIRE
-// accept Basic where the PASSWORD is the capability token (username ignored) — the SAME PASETO verify
-// path as Bearer. This oracle proves it with the host's REAL `git`, forming the Basic header NATIVELY
-// from URL-embedded credentials (`http://x-access-token:<token>@host/…`): a Basic push lands durably,
-// a Basic clone recovers the pushed commit, and a GARBAGE Basic password is refused (401 — no ref).
-
-/// The `Authorization: Basic base64("<user>:<token>")` header value — the EXACT bytes `git` sends
-/// natively for HTTP Basic (the server cannot distinguish this from git forming it from URL creds; it
-/// exercises the same server-side Basic-decode path). We hand it to `git` via `http.extraHeader` so
-/// the capability token (which contains `|`, a URL-userinfo-unsafe byte) reaches the server verbatim,
-/// never mangled by a URL-encoding round-trip.
 fn basic_auth_header(user: &str, token: &str) -> String {
     use base64::Engine as _;
     let b64 =
@@ -698,7 +615,6 @@ fn basic_auth_header(user: &str, token: &str) -> String {
     format!("Authorization: Basic {b64}")
 }
 
-/// `git clone <url> <dst>` presenting the token as the Basic PASSWORD (via `http.extraHeader`).
 fn git_clone_basic(
     addr: SocketAddr,
     token: &str,
@@ -722,7 +638,6 @@ fn git_clone_basic(
     )
 }
 
-/// `git push <url> main` presenting the token as the Basic PASSWORD (via `http.extraHeader`).
 fn git_push_basic(
     addr: SocketAddr,
     token: &str,
@@ -764,7 +679,6 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
     let addr = spawn(gw).await;
     let token = mint(&cell, "acme", "jti-basic");
 
-    // ── 1. REAL `git push` over smart-HTTP with **Basic** auth (password = the capability token) ──
     let work = make_work(&root);
     let pushed_oid = {
         let o = Command::new("git")
@@ -788,13 +702,10 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
         "the Basic-auth push landed durably"
     );
 
-    // ── 2. REAL `git clone` over smart-HTTP with **Basic** auth recovers the pushed commit ──
     let clone_dst = root.join("clone");
     let (okc, sec) = git_clone_basic(addr, &token, "/acme/eu-west/widgets.git", &clone_dst);
     println!("=== git clone (HTTP BASIC) ===\nsuccess={okc}\nstderr=\n{sec}");
     assert!(okc, "the Basic-auth clone MUST succeed: {sec}");
-    // Compare against the remote-tracking ref (robust regardless of whether the server advertises a
-    // HEAD symref — the pushed `main` is always fetched as `origin/main`).
     let cloned_tip = {
         let o = Command::new("git")
             .args([
@@ -812,7 +723,6 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
         "the Basic-auth clone recovered the pushed commit"
     );
 
-    // ── 3. a GARBAGE Basic password is refused (401 — the same as a missing credential; no ref move) ──
     let garbage_dst = root.join("clone-garbage");
     let (okg, seg) = git_clone_basic(
         addr,
@@ -820,37 +730,23 @@ async fn real_git_clone_and_push_over_http_basic_auth() {
         "/acme/eu-west/widgets.git",
         &garbage_dst,
     );
-    println!("=== git clone (GARBAGE Basic password) — must be refused ===\nsuccess={okg}\nstderr=\n{seg}");
+    println!("=== git clone (GARBAGE Basic password) - must be refused ===\nsuccess={okg}\nstderr=\n{seg}");
     assert!(
         !okg,
         "a garbage Basic password MUST be refused (uniform 401)"
     );
-    let _ = backend; // keep the composed backend alive for the duration of the test.
+    let _ = backend;
 
     println!("=== R4.0 BASIC-AUTH ORACLE PROVEN: real git clone + push over HTTP Basic (password=token) lands durably; garbage refused ===");
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// ═══════════════ F1 (R4.1 dogfood) — REAL `git` over a CREDENTIAL HELPER needs the 401 challenge ═══
-//
-// A real `git push/clone` using a credential helper/manager/interactive prompt (NOT preemptive
-// `http.extraHeader`) only OFFERS its Basic credential AFTER a 401 that carries `WWW-Authenticate:
-// Basic …`. Before F1 the edge's git-wire 401 had no such header, so git never sent the credential and
-// the operation failed auth (proven: `curl -u` worked, `http.extraHeader` worked, a helper did NOT).
-// This oracle drives the host's REAL `git` with a credential helper (no preemptive header) and proves a
-// clone + push now succeed — i.e. the challenge is present and git offers the credential.
-
-/// An inline `credential.helper` that answers `get` with `username=x-access-token` + the token as the
-/// password (double-quoted so the token's `|` bytes are literal to the helper's `sh`). This is the
-/// NON-preemptive path: git invokes it ONLY after a `WWW-Authenticate: Basic` 401.
 fn credential_helper_arg(token: &str) -> String {
-    // The leading `!` makes git run the value via the shell; it receives the op (`get`) as $1.
     format!(
         "credential.helper=!f() {{ echo username=x-access-token; echo \"password={token}\"; }}; f"
     )
 }
 
-/// `git clone <url> <dst>` authenticating ONLY through a credential helper (no `http.extraHeader`).
 fn git_clone_via_helper(
     addr: SocketAddr,
     token: &str,
@@ -871,7 +767,6 @@ fn git_clone_via_helper(
     )
 }
 
-/// `git push <url> main` authenticating ONLY through a credential helper (no `http.extraHeader`).
 fn git_push_via_helper(
     addr: SocketAddr,
     token: &str,
@@ -909,17 +804,15 @@ async fn f1_real_git_over_credential_helper_needs_the_basic_challenge() {
     let addr = spawn(gw).await;
     let token = mint(&cell, "acme", "jti-f1-helper");
 
-    // ── PUSH via a credential helper (no preemptive header) — must succeed thanks to the 401 challenge.
     let work = make_work(&root);
     let (ok_push, se_push) = git_push_via_helper(addr, &token, "/acme/eu-west/widgets.git", &work);
     println!("=== F1 git push (credential HELPER, no extraHeader) ===\nsuccess={ok_push}\nstderr=\n{se_push}");
     assert!(
         ok_push,
-        "F1: a helper-driven push MUST succeed — the git-wire 401 now carries WWW-Authenticate: Basic \
+        "F1: a helper-driven push MUST succeed - the git-wire 401 now carries WWW-Authenticate: Basic \
          so git offers the credential (stderr: {se_push})"
     );
 
-    // ── CLONE via a credential helper — must succeed likewise.
     let dst = root.join("clone-helper");
     let (ok_clone, se_clone) =
         git_clone_via_helper(addr, &token, "/acme/eu-west/widgets.git", &dst);
@@ -933,14 +826,6 @@ async fn f1_real_git_over_credential_helper_needs_the_basic_challenge() {
     println!("=== F1 ORACLE PROVEN: real git over a credential helper authenticates (the 401 Basic challenge is present) ===");
     let _ = std::fs::remove_dir_all(&root);
 }
-
-// ═══════════════ F9 (R4.1 dogfood) — a fresh `git clone` checks out `main` (HEAD symref healed) ═════
-//
-// A freshly-created repo's on-disk HEAD is left at `init_bare`'s `refs/heads/master` while pushes land
-// on `main`, so `git clone` warned "remote HEAD refers to nonexistent ref, unable to checkout" (refs +
-// objects present; only HEAD dangling). F9 heals HEAD on the first push. This oracle pushes `main`, then
-// a plain `git clone` and asserts the WORKING TREE checked out (README present), no warning, and the
-// server bare repo's HEAD symref targets `refs/heads/main`.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn f9_fresh_clone_checks_out_main_and_server_head_symref_is_main() {
@@ -958,12 +843,10 @@ async fn f9_fresh_clone_checks_out_main_and_server_head_symref_is_main() {
     let addr = spawn(gw).await;
     let token = mint(&cell, "acme", "jti-f9");
 
-    // Push `main` (auth via extraHeader — F9 is about HEAD, not the auth path).
     let work = make_work(&root);
     let (ok, _so, se) = git_push(addr, Some(&token), "/acme/eu-west/widgets.git", &work);
     assert!(ok, "the setup push must land: {se}");
 
-    // The server bare repo's on-disk HEAD symref now targets refs/heads/main (healed on first push).
     let bare = root.join("acme/eu-west/widgets.git");
     let symref = Command::new("git")
         .args(["--git-dir", &bare.to_string_lossy(), "symbolic-ref", "HEAD"])
@@ -976,7 +859,6 @@ async fn f9_fresh_clone_checks_out_main_and_server_head_symref_is_main() {
         "F9: the on-disk HEAD symref must target the pushed default branch"
     );
 
-    // A plain `git clone` (default checkout) recovers a checked-out working tree with NO warning.
     let dst = root.join("f9-clone");
     let out = Command::new("git")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -1004,7 +886,7 @@ async fn f9_fresh_clone_checks_out_main_and_server_head_symref_is_main() {
     );
     assert!(
         dst.join("README.md").is_file(),
-        "F9: the working tree checked out `main` (README.md present) — HEAD resolved on the server"
+        "F9: the working tree checked out `main` (README.md present) - HEAD resolved on the server"
     );
     let _ = backend;
 

@@ -5,22 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-storage is the STORAGE SUBSTRATE crate (architecture 05-…/storage.md §47-52, the
-# "implementation crate" note: Storage's runtime code — the tier clients, KMS adapters,
-# BlobStore impls, backup/restore machinery — lands in this new workspace crate). It is the
-# harness-level seam the bootstrap harness (`serve(AppSpec)`) wires every subsystem through;
-# it is NOT a per-subsystem data-access crate (architecture 00 §2.8: there is deliberately
-# no shared storage-API crate spanning subsystems — each service owns its schema, the
-# boundary is the no-cross-db lint). See the crate-level DEVIATION note in src/lib.rs.
-#
-# DAG position (architecture 00 §2.9, root-last): it sits below -gdpr/-client and ABOVE
-# -substrate (the harness depends on the tier clients it wires). It depends on:
-#   - myelin-tenancy   : TenantId / Region — the (tenant, region) partition key (12.1);
-#   - myelin-identity  : Principal — the verified token the tenant is sourced FROM (12.1);
-#   - myelin-events    : the outbox the OLTP DB co-locates (11.1; co-location body is P-ST-02);
-#   - myelin-refs      : the one canonical ArtifactRef parser used at the relay trust boundary;
-#   - myelin-gdpr      : PersonalDataHolder — every store auto-registers as a holder (1.4/10.1).
-# It MUST NOT depend on -client or -substrate (downstream); such an edge MUST NOT compile.
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
@@ -28,42 +12,12 @@ myelin-events = { path = "../myelin-events" }
 myelin-refs = { path = "../myelin-refs" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 serde.workspace = true
-# BlobStore (P-ST-03 / 11.2): BLAKE3 hash-on-write + re-hash-on-read integrity (a cited proven
-# structure — VISION §4 / storage.md §11), `hex` renders the multihash digest into the
-# self-describing content-address + the per-tenant fs key path.
 blake3.workspace = true
 zeroize = "1"
 hex.workspace = true
-# SHA-256 verification for git-imported objects (P-ST-22 / 11.2 git pack tier). The BlobStore
-# admits a `sha256:` multihash tag (P-ST-03); the git pack tier supplies the read-side verify
-# for that tag so a corrupt git object is detected on read (0 silent serve, STOR-D7 on packs).
-# RustCrypto `sha2` (FIPS-180-4) — never a hand-rolled hash (VISION §4 / EI-01 §7).
 sha2.workspace = true
-# The three-level KMS hierarchy (P-ST-06 / 11.3): the L2 DEK working keys are AES-256-GCM
-# (storage.md §4). We use the vetted RustCrypto `aes-gcm` AEAD (NIST SP 800-38D) for the
-# real wrap/unwrap envelope crypto rather than hand-rolling it (EI-01 §7: one primitive
-# behind a narrow trait; "cite proven structures, do not hand-roll crypto"). The
-# `getrandom` feature gives us `aead::OsRng` for key + nonce generation. The self-hostable
-# engine seam (Vault-Transit-class) fronts this in-process software engine on this floor.
 aes-gcm = "0.10"
 
-# ------------------------------------------------------------------------------------------
-# REAL backends — NON-OPTIONAL as of MR-009b Wave 1 (the durable-un-gate compile foundation).
-# The DURABLE path (the DAG root every dependent wires on) is now ALWAYS compiled: these deps
-# are plain [dependencies], so the default `cargo build --workspace` compiles the live-PG / S3 /
-# Valkey code UNCONDITIONALLY. This is safe with NO live DB at build time because there are ZERO
-# compile-time `sqlx::query!`/`query_as!` macros in the tree — all durable code uses runtime
-# `sqlx::query(&str)` (grounded in W0). The `integration` feature (below) is now a TEST-SELECTOR
-# only; it no longer pulls these deps — it enables the downstream live-bus test surface.
-#   - sqlx            : the OLTP/outbox/ReBAC Postgres client (RUNTIME queries, no live-DB build);
-#   - aws-sdk-s3      : the object-store BlobStore backing (RustFS/Scaleway, path-style);
-#   - fred            : the Valkey/Redis backing for the Cache seam (cache.rs);
-#   - tokio           : the async runtime the real clients need;
-#   - myelin-config   : the dev↔prod config swap the production composition root (provider.rs) reads.
-# NOTE (Waves 2-5): this makes the durable CODE compile unconditionally; it does NOT flip any
-# composition root to durable-by-default — the in-memory models stay the default WIRING until the
-# per-holder waves re-point them.
-# ------------------------------------------------------------------------------------------
 sqlx.workspace = true
 aws-config.workspace = true
 aws-sdk-s3.workspace = true
@@ -71,117 +25,28 @@ aws-credential-types.workspace = true
 fred.workspace = true
 tokio.workspace = true
 myelin-config.workspace = true
-# serde_json: (1) the OLAP live feed (olap_feed.rs, P-145) constructs the `*.snapshot`
-# `SnapshotDraft.payload` (a `serde_json::Value`) it re-emits through the bus reindex seam — a
-# pure-Rust JSON lib already in `myelin-events`' non-optional DAG, NOT a DB client, so it does not
-# affect the DB-free build floor; (2) the pg.rs outbox stores the EventEnvelope as JSONB behind the
-# `integration` feature. It is a normal (non-optional) dependency.
 serde_json.workspace = true
 
 [features]
 default = []
-# Production-selectable NATS publisher support, independent of live integration tests.
 nats = ["myelin-events/nats"]
-# MR-009b Wave 1: `integration` is now a TEST-SELECTOR only — the durable deps (sqlx/aws/fred/
-# tokio/myelin-config) are non-optional [dependencies] above, so the durable code compiles in the
-# DEFAULT build; `integration` no longer carries any `dep:` activation. It remains the
-# `required-features` marker on tests/integration_*.rs (the live-PG/S3 drills) and it turns on the
-# downstream events live-bus surface: the real NATS JetStream broker (`myelin_events::nats`, used by
-# the `events_serve` composition root) is optional behind the production `myelin-events/nats`
-# feature, so storage's integration feature enables it transitively. Do NOT delete
-# this feature — the live-backend tests still gate on it.
 integration = [
     "nats",
     "myelin-events/integration",
-    # MR-009b Wave 3: `integration` is a TEST-SELECTOR, so it also turns on the events in-memory
-    # `test-support` doubles the live-PG integration/drill tests build against (e.g. the
-    # `DedupLedger::new()` / `OutboxStore::new()` in-process-floor comparisons in
-    # `integration_mr023_events_serve` + the reindex-parity drills). Never in a production build
-    # (`cargo build` / `--workspace` do not enable `integration`) → no runtime double leak.
     "myelin-events/test-support",
 ]
 
-# MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It exists to gate the
-# in-memory durable-store DOUBLES (KMS engine, cost/erasure/post-pit ledgers, blob store, …) so
-# DOWNSTREAM crates can enable them as a DEV-dependency: the doubles are consumed CROSS-CRATE in
-# non-test lib code (e.g. `KmsEngine::new()` at ~90 sites), which `#[cfg(test)]` (crate-local) can
-# NOT reach. It is EMPTY here in Wave 0 — the feature is established so later waves (2-7) gate the
-# doubles behind `#[cfg(any(test, feature = "test-support"))]` and downstream dev-deps can turn it
-# on; NO code moves behind it yet. The `no-in-memory-durable-store` scanner treats
-# `feature = "test-support"` as a test-double gate (Wave 0). `memory` is a documented alias.
-# MR-009b W3b.5/.6: forwards to `myelin-events/test-support` — this crate's `test-support`-gated
-# harness code (`e2e3_reindex_parity`'s `booted_bus()`) constructs the now-gated in-memory
-# `OutboxStore::new()` double, so enabling the doubles here must enable them in events too.
 test-support = ["myelin-events/test-support"]
 memory = ["test-support"]
 
-# The failure-injection harness is TEST-SUPPORT only (the same posture as a service's
-# main.rs / the harness's own dev usage). The IDOR + pool-saturation DRILLS read the
-# contract-1.8 survival signal set (CrossTenantCount == 0, PoolSaturation) off the
-# telemetry-assertion library. It is a dev-dependency ONLY — nothing in the production
-# build path pulls myelin-harness into the storage crate's runtime DAG.
 [dev-dependencies]
-# MR-009b Wave 5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
-# `tests/*.rs` integration-test files (a separate compilation unit linking the NORMAL lib, where
-# `#[cfg(test)]` is NOT active). The in-memory `KmsEngine::new()` double + the in-process dogfood
-# drill surface (`run_restore_verify_on_dogfood`) are now `#[cfg(any(test, feature = "test-support"))]`.
-# The sanctioned Cargo idiom (same as the myelin-identity-service Wave-2 self dev-dependency); it does
-# NOT affect the normal `cargo build`, which stays durable-by-default.
 myelin-storage = { path = ".", features = ["test-support"] }
-# MR-009b W6c-events — the events `test-support` doubles as a DEV-dependency (the in-memory
-# `BusErasureLedger::new()` used by the DB-free `tests/drills_bus_d8_backups.rs` in-process drill,
-# now that the ledger is durable-by-default and its in-memory arm is `test-support`-gated). DEV-only:
-# `cargo build`/`--workspace` do not pull it, so production stays durable-by-default and
-# `cargo tree -e no-dev` shows NO test-support edge (the same idiom as the self dev-dep above).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
 myelin-harness = { path = "../myelin-harness" }
-# myelin-lints is TEST-SUPPORT only: the P-ST-08 encryption GATE drill
-# (tests/encryption_gate_drill.rs) exercises the `no-untagged-personal-data` lint over an inline
-# red (untagged PII scratch field fires) + green (tagged) fixture — the GATE's "a deliberately-
-# untagged PII scratch field fires the lint, then remove it" step. The lint scanner is a pure
-# function over source text (no live backend). It is a dev-dep ONLY — nothing in the storage
-# crate's production DAG pulls myelin-lints (and myelin-lints does not depend on myelin-storage,
-# so there is no cycle).
 myelin-lints = { path = "../myelin-lints" }
-# (serde_json is a normal [dependencies] entry — see above — so it is available to tests too.)
-# toml is TEST-SUPPORT only: the STOR-D2 RPO drill (tests/stor_d2_rpo_drill.rs) reads its
-# `rpo_max_mins` bound from the workspace-root `thresholds.toml` (the versioned source of
-# truth, P-038) — NEVER a hardcoded magic number (EI-01 §3). It never enters the runtime DAG.
 toml.workspace = true
-# myelin-control-plane is a DEV-dependency ONLY: the contract-12.4 CDC pair
-# (tests/cdc_12_4_storage_residency_report.rs, P-ST-15) proves Storage's per-store region REPORTS
-# (the provider) feed the control plane's `residency_verify` (the consumer) that signs the
-# no-global-pool attestation. The control plane already depends on myelin-storage (the normal
-# DAG edge); a dev-dependency back is the CDC consumer reaching DOWN to its provider's test — a
-# dev-only edge Cargo permits (it never enters the storage crate's production/runtime DAG, so no
-# build cycle). This is the SAME posture as the myelin-lints / myelin-harness dev-deps above.
-# MR-009b W6d: `test-support` turned on DEV-only — the cdc_10_5_mirror_crossing_flag CDC builds the
-# control-plane in-memory `Registry::new()` double (now `test-support`-gated). Never in the
-# production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-control-plane = { path = "../myelin-control-plane", features = ["test-support"] }
-# myelin-gdpr-service is a DEV-dependency ONLY: the E2E-4 holder-coverage CDC pair
-# (tests/cdc_e2e4_holder_coverage.rs, P-ST-35) pins that storage's H1–H18 `HolderClass::ALL`
-# catalogue (the PROVIDER of the storage-side crypto-shred reach) covers the orchestrator's
-# storage-owned `orchestration::holder_ids` (the CONSUMER that drives the data-map fan-out). The
-# two coverage proofs MUST agree. `myelin-gdpr-service` does NOT depend on `myelin-storage`, so a
-# dev-dependency back is a CDC consumer reaching DOWN to its provider's test — no build cycle
-# (the same posture as the myelin-control-plane / myelin-lints / myelin-harness dev-deps above).
 myelin-gdpr-service = { path = "../myelin-gdpr-service" }
-# myelin-search + myelin-refs-service are DEV-dependencies ONLY: the E2E-3 reindex-parity CDC pair
-# (tests/cdc_e2e3_reindex_parity.rs, P-ST-36) confirms that storage's derived-store reindex-parity
-# contribution (the PROVIDER — `DerivedStoreClass::ALL` = OLAP/Search/Refs, all cold-reindex==live
-# with NO backup-restore path) AGREES with the REAL Search (`SearchReindexer` / SRCH-D5) and Refs
-# (`RefsReindexer` / REF-D4) cold==live byte-parity drills (the CONSUMERS). Both crates already
-# depend on `myelin-storage` (the normal DAG edge — they consume the KMS/holder substrate); a
-# dev-dependency BACK is the CDC reaching DOWN to corroborate the real reindexers — a dev-only edge
-# Cargo permits (it never enters the storage crate's production/runtime DAG, so no build cycle). The
-# two proofs MEET; neither re-derives the other (the SAME posture as the myelin-gdpr-service /
-# myelin-control-plane dev-deps above).
 myelin-search = { path = "../myelin-search" }
 myelin-refs-service = { path = "../myelin-refs-service" }
-# Test-hygiene retrofit (panic-safe ad-hoc-table/row teardown, tests/common/mod.rs):
-# `FutureExt::catch_unwind` is what lets `with_cleanup` intercept a test-body panic mid-`.await`,
-# ALWAYS run the test's own cleanup, then resume the unwind — a synchronous `Drop` impl cannot
-# safely run that async cleanup. Same posture as the myelin-ci-controlplane sibling fix. A
-# DEV-DEP ONLY (the shared test helper, NOT the production DAG); no new myelin edge.
 futures = { workspace = true }

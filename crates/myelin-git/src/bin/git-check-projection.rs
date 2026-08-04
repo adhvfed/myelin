@@ -1,9 +1,3 @@
-//! Production Git-owned `ci.check.updated` projection consumer.
-//!
-//! This is deliberately a separate control-plane process from Edge: CI emits facts to the durable
-//! bus, Git consumes them into its own RLS projection, and Edge/merge policy read that projection.
-//! There is no synchronous Git→CI dependency.
-
 use myelin_config::Mode;
 use myelin_events::nats::{JetStreamConsumerConfig, NatsJetStreamBus};
 use myelin_events::{DedupLedger, OutboxStore};

@@ -1,9 +1,3 @@
-//! Catalog and dogfood compatibility audit for every migration set applied by a production main.
-//!
-//! Migration ids share one PostgreSQL ledger, even though each service owns its DDL. A duplicate id
-//! with different bytes makes startup order-dependent; a dogfood row with a checksum different from
-//! today's authoritative DDL means enabling the runtime guard would refuse that service.
-
 use myelin_config::MyelinConfig;
 use myelin_migration_audit::{borrowed_sets, production_migration_sets};
 use myelin_storage::pg_migrator::{ddl_checksum, migration_checksum_collisions};

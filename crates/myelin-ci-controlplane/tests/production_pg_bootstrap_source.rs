@@ -1,5 +1,3 @@
-//! Deployment guards for the CI Controlplane split-credential bootstrap sequence.
-
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
@@ -41,7 +39,6 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runner_host_source = include_str!("../src/ci_runner_host.rs");
     let launch_gate_source = include_str!("../../myelin-ci-sandbox/src/launch_gate.rs");
     let gvisor_source = include_str!("../../myelin-ci-sandbox/src/gvisor.rs");
-    let dogfood_source = include_str!("../../../scripts/dogfood.sh");
 
     assert!(source.contains("MyelinConfig::from_env(Mode::RequireEnv)"));
     assert!(source.contains("CiSchedulerDbConfig::from_env(&platform_config)"));
@@ -85,11 +82,6 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runtime_factory = source
         .find("ci_production_runtime_factory(")
         .expect("the exact-tenant workflow/reporter factory must be composed at the root");
-    // CT-007 round-2 blocker 1: the source-pinned definition is now activated by the CUTOVER FENCE
-    // — one transaction that locks the superseded `wf_definition` row `FOR UPDATE` (mutually
-    // exclusive with a fresh old-binary admission's `FOR SHARE`), runs the database-wide backlog
-    // probe under that fence, and only then drains the old version and activates this one. The
-    // preflight `activate_definition()` it replaced could not close that race.
     let definition_cutover = source
         .find(".cutover_definition(&scheduler_provider.region_run_discovery())")
         .expect("the source-pinned ci.pipeline definition must be activated through the fence");
@@ -97,12 +89,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         source[..definition_cutover].ends_with("runner_runtime\n            "),
         "the cutover must be invoked on the composed runtime factory"
     );
-    // The diagnostic must come from the SCHEDULER capability, not the RLS-blind app pool: the app
-    // role cannot see other tenants' rows, so an app-pool diagnostic reports "0 runs" for a real
-    // backlog (round-3 finding 4).
     assert!(
         !source.contains("runner_runtime.activate_definition()"),
-        "the unserialized preflight activation must never come back — it cannot fence fresh \
+        "the unserialized preflight activation must never come back - it cannot fence fresh \
          admission by the outgoing binary"
     );
     let starter_poller = source
@@ -153,9 +142,6 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         .find("run_controlplane_until_shutdown(Config::default()")
         .expect("signal-driven service lifecycle must remain wired");
 
-    // The cutover is the LAST boot gate: every fallible composition happens first (so a refusal
-    // cannot strand a half-built process holding a committed registry transition), and nothing that
-    // could admit work under the new version has spawned before the fence commits.
     for (name, position) in [
         ("starter poller", starter_poller),
         ("workflow poller", workflow_poller),
@@ -202,8 +188,6 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(!source.contains("unresolved_stage_spec_builder"));
     assert!(!source.contains("TenantId(\"ci-controlplane\""));
     assert!(!source.contains("synthetic tenant"));
-    // The starter lane composes behind the SAME explicit MYELIN_CI_RUNNER seam the runner uses and is
-    // never spawned unconditionally.
     assert!(source.contains("if runner_host_requested {"));
     assert!(source.contains("let runner_host_requested = matches!(&runner_setting"));
     let starter_factory_source = &library_source[starter_lane_source_start(library_source)..];
@@ -374,11 +358,6 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
             "runner-host executor preflight must retain {executor_preflight}"
         );
     }
-    assert!(dogfood_source.contains("export MYELIN_GVISOR_ROOTFS="));
-    assert!(dogfood_source.contains("export MYELIN_CI_RUNNER=1"));
-    assert!(dogfood_source.contains("export MYELIN_CI_CHECKOUT_REPO_ROOT="));
-    assert!(dogfood_source
-        .contains("exec cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane"));
     for production_supersession_dependency in [
         "pr_head_generation",
         "cancel_stale_queued_on_conn",
@@ -450,11 +429,11 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         !runner_bind_source.contains("FirecrackerBackend"),
         "FirecrackerBackend must NEVER be wired into production runner_bind.rs: unlike \
          GvisorBackend, it does not yet make the Uncommitted/CommitOutcomeUnknown/\
-         CommittedButNotExecuted/Executed phase distinction on a post-reserve launch failure — \
+         CommittedButNotExecuted/Executed phase distinction on a post-reserve launch failure - \
          every failure is compatibility-wrapped (phase-unclassified) as `SandboxLaunchError::Failed` \
          (see firecracker.rs's SandboxBackend impl). Wiring it into production today would \
          silently reproduce the exact reservation-leak class this whole CT-007 fix closed for \
-         gVisor. This is a NAMED production-activation blocker, not merely a comment — give \
+         gVisor. This is a NAMED production-activation blocker, not merely a comment - give \
          FirecrackerBackend gVisor's same phase-aware treatment before ever removing this guard."
     );
     let claim_lock = claim_issuer_source
@@ -493,14 +472,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
          before handle acceptance"
     );
     assert!(library_source.contains("PgCiRunStarterFactory::new_with_authority"));
-    // It routes an AUTHORITATIVE tenant, never a synthetic one — no starter is constructed for a fixed
-    // service tenant at the root (the factory mints per discovered ci_run.tenant_id).
     assert!(!source.contains("PgCiPipelineStarter::new"));
     assert!(source.contains("InvalidRunnerSetting(String)"));
     assert!(source.contains("NonUnicodeRunnerSetting(OsString)"));
-    // CT-007 slice 4: the workspace-activation level is a SEPARATE opt-in gate layered on top of
-    // MYELIN_CI_RUNNER, parsed/preflighted exactly once, and its owned result -- never a second
-    // environment read -- is what reaches CiRunnerLoop::new.
     assert!(source.contains("InvalidWorkspaceMode(String)"));
     assert!(source.contains("NonUnicodeWorkspaceMode(OsString)"));
     assert!(source.contains("\"MYELIN_CI_WORKSPACE_MODE\""));
@@ -674,16 +648,6 @@ async fn boot_time_sigterm_is_latched_before_the_real_runner_host_can_claim() {
             .unwrap()
             .as_nanos()
     );
-    // One exact row in `public.ci_run` is a deliberately preserved, permanent exception to
-    // "zero pre-existing active work": tenant_id = 'myelin', run_id =
-    // '5db61d81-6aea-7dd9-b3f1-035abcf56b26', state = 'running'. It was intentionally left
-    // running/unsettled as permanent historical negative evidence by the R4.2
-    // publisher-capability-reconciliation investigation (see
-    // planning/system-reviews/2026-06-26/12-ci-track-ledger.md, ledger entry CT-005f8a and the
-    // "Honest remaining floor" note below it) and must never be relabelled, deleted, or counted.
-    // This is a single named `(tenant_id, run_id)` pair, not a blanket tenant carve-out: any OTHER
-    // active row (including any other row for tenant `myelin`, or any row in `job_queue`) still
-    // fails this precondition as unexpected leftover work.
     const PRESERVED_NEGATIVE_EVIDENCE_TENANT_ID: &str = "myelin";
     const PRESERVED_NEGATIVE_EVIDENCE_RUN_ID: &str = "5db61d81-6aea-7dd9-b3f1-035abcf56b26";
 

@@ -1,18 +1,3 @@
-//! Live-PostgreSQL proof for the CT-007 lease/topology reconciliation slice.
-//!
-//! Four properties, all against the real migration set and the real production SQL constants:
-//! 1. the claim sizes the IMMUTABLE window from the job's own topology while the heartbeat-
-//!    extendable EXECUTION lease stays flat at `CI_RUNNER_EXECUTION_LEASE_TTL_SECS`;
-//! 2. a legacy NULL-window row still claims under the flat fallback, and a checkout-bearing job on
-//!    such a row is refused BEFORE any credential is minted;
-//! 3. the exact-generation preparation renewal accepts only the complete live generation and is
-//!    capped at the immutable claim expiry;
-//! 4. the reaper seals exactly the generation it requeued, in the SAME transaction — and a failing
-//!    seal rolls the whole sweep back rather than committing a claimable-but-unresolved state.
-//!
-//! Plus the two guards the definition-version bump this slice forces made necessary: the
-//! superseded-definition boot guard, and the claim-window expand's refusal to adopt a same-named
-//! constraint whose definition diverges.
 #![cfg(feature = "integration")]
 
 mod common;
@@ -39,9 +24,6 @@ use myelin_storage::{HotTables, PgMigrator};
 use myelin_tenancy::Region;
 use sqlx::{Executor, PgPool, Row};
 
-/// Independent `PgMigrator` sequences against the same live PostgreSQL deadlock on the migration
-/// advisory lock when run concurrently — the same guard `integration_ci_terminal_accounting_atomic`
-/// already uses.
 static MIGRATION_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const TENANT: &str = "lease-topology";
@@ -92,9 +74,6 @@ fn schema_name(tag: &str) -> String {
     )
 }
 
-
-
-/// A fresh schema carrying the real Flow + CI control-plane migration sets.
 async fn migrated_schema(tag: &str) -> (String, PgPool, PgPool, PgPool) {
     let schema = schema_name(tag);
     let bootstrap = pinned_pool(&admin_url(), "public").await;
@@ -178,8 +157,6 @@ fn launch_template(seed: u64, timeout_secs: u32, checkout: bool) -> DurableCiJob
     }
 }
 
-/// Dispatch one job through the REAL co-persist path and activate its Flow/CI owners so the claim's
-/// lifecycle conjunction holds. Returns `(job_id, wf_run_id, ci_run_id, derived window)`.
 async fn dispatch(
     admin: &PgPool,
     specs: &CiJobSpecStore,
@@ -251,7 +228,6 @@ async fn dispatch(
     (job_id, wf_run_id, ci_run_id, window)
 }
 
-/// The two durable deadlines of a leased row, as whole seconds relative to `claim_started_at`.
 async fn deadlines(admin: &PgPool, job_id: &str) -> (i64, i64, Option<i64>) {
     let row = sqlx::query(
         "SELECT EXTRACT(EPOCH FROM (claim_expires_at - claim_started_at))::bigint AS claim_span,
@@ -272,8 +248,6 @@ async fn deadlines(admin: &PgPool, job_id: &str) -> (i64, i64, Option<i64>) {
     )
 }
 
-// ═════════════ 1. topology-derived claim ceiling, flat per-execution lease ════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_claim_sizes_the_immutable_ceiling_from_topology_and_the_lease_per_execution() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -283,7 +257,6 @@ async fn the_claim_sizes_the_immutable_ceiling_from_topology_and_the_lease_per_e
         let specs = ci_job_spec_store(app.clone());
         let region_store = ci_region_queue_store_test_support(admin.clone());
 
-        // (timeout, checkout, expected immutable window)
         let cases: [(u32, bool, i64); 5] = [
             (1, false, CI_RUNNER_EXECUTION_LEASE_TTL_SECS),
             (2 * 60 * 60, false, CI_RUNNER_EXECUTION_LEASE_TTL_SECS),
@@ -330,8 +303,6 @@ async fn the_claim_sizes_the_immutable_ceiling_from_topology_and_the_lease_per_e
             );
         }
 
-        // The two 6-hour cases are the headline of the slice: identical job timeouts, the checkout
-        // job's generation lives four times as long while both leases stay at 22,200 seconds.
         let (flat_claim, flat_lease, _) = deadlines(&admin, &uuid(0x40, 102)).await;
         let (checkout_claim, checkout_lease, _) = deadlines(&admin, &uuid(0x40, 104)).await;
         assert_eq!(flat_claim, 22_200);
@@ -344,10 +315,6 @@ async fn the_claim_sizes_the_immutable_ceiling_from_topology_and_the_lease_per_e
     .await;
 }
 
-// ═════════════ 2. the legacy NULL-window generation ══════════════════════════════════════════════
-
-/// An issuer that must never be reached: a checkout-bearing job on a legacy row has to be refused
-/// BEFORE any credential is minted.
 struct NeverMintIssuer(Arc<std::sync::Mutex<u32>>);
 
 impl CiJobTokenIssuer for NeverMintIssuer {
@@ -379,7 +346,6 @@ async fn a_legacy_null_window_row_claims_flat_and_refuses_checkout_before_any_mi
             (201, "legacy-ckout", true),
         ] {
             let (job_id, _, _, _) = dispatch(&admin, &specs, seed, label, 600, checkout).await;
-            // Rewrite the row to the pre-expand shape an older dispatch binary would have left.
             sqlx::query(
                 "UPDATE job_queue SET claim_window_secs = NULL
                  WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -402,7 +368,6 @@ async fn a_legacy_null_window_row_claims_flat_and_refuses_checkout_before_any_mi
             unused_secret_terminal_reporter(),
         );
 
-        // The non-checkout legacy row is claimed under the flat fallback and resolves normally.
         let compute = region_store
             .claim(
                 REGION,
@@ -432,7 +397,6 @@ async fn a_legacy_null_window_row_claims_flat_and_refuses_checkout_before_any_mi
         );
         assert_eq!(*mints.lock().unwrap(), 1, "the compute job did mint");
 
-        // The checkout-bearing legacy row is refused BEFORE the mint and left for the reaper.
         let checkout = region_store
             .claim(
                 REGION,
@@ -460,7 +424,7 @@ async fn a_legacy_null_window_row_claims_flat_and_refuses_checkout_before_any_mi
         assert_eq!(
             *mints.lock().unwrap(),
             1,
-            "the refusal happens BEFORE the mint — no second credential was requested"
+            "the refusal happens BEFORE the mint - no second credential was requested"
         );
         let state: String = sqlx::query_scalar(
             "SELECT state FROM job_queue WHERE tenant_id = $1 AND job_id = $2::uuid",
@@ -478,9 +442,6 @@ async fn a_legacy_null_window_row_claims_flat_and_refuses_checkout_before_any_mi
     .await;
 }
 
-// ═════════════ 3. the exact-generation preparation renewal ═══════════════════════════════════════
-
-/// Seed one leased generation with a durable parent attempt and a public `ci_job` surface row.
 #[allow(clippy::too_many_arguments)]
 async fn seed_leased_generation(
     admin: &PgPool,
@@ -651,7 +612,6 @@ async fn the_preparation_renewal_accepts_only_the_complete_live_generation() {
         )
         .await;
 
-        // The exact live generation renews and pushes the execution lease forward by one slot.
         assert!(queue.renew_preparation_lease(&claim).await.unwrap());
         let lease_ahead: i64 = sqlx::query_scalar(
             "SELECT EXTRACT(EPOCH FROM (lease_expires - statement_timestamp()))::bigint
@@ -668,7 +628,6 @@ async fn the_preparation_renewal_accepts_only_the_complete_live_generation() {
             "the renewal installs one execution slot, got {lease_ahead}s"
         );
 
-        // EVERY identity component is load-bearing: a single divergent field refuses.
         type ClaimMutation = fn(&mut CiJobLaunchClaim);
         let mutations: [(&str, ClaimMutation); 8] = [
             ("tenant", |c| c.tenant_id = "other-tenant".into()),
@@ -698,7 +657,6 @@ async fn the_preparation_renewal_accepts_only_the_complete_live_generation() {
             "a divergent claim expiry must lose ownership"
         );
 
-        // Surface/queue states: only `leased` + a pre-workload `ci_job` surface may renew.
         for (queue_state, refuses) in [("running", true), ("terminal", true), ("leased", false)] {
             sqlx::query(
                 "UPDATE job_queue SET state = $1 WHERE tenant_id = $2 AND job_id = $3::uuid",
@@ -760,7 +718,6 @@ async fn the_preparation_renewal_accepts_only_the_complete_live_generation() {
         .await
         .unwrap();
 
-        // A recorded completion receipt terminalizes ownership for renewal purposes.
         sqlx::query(
             "UPDATE job_queue SET completion_receipt = 'receipt'
              WHERE tenant_id = $1 AND job_id = $2::uuid",
@@ -786,9 +743,6 @@ async fn the_preparation_renewal_accepts_only_the_complete_live_generation() {
             "the restored generation renews again"
         );
 
-        // The exact durable parent attempt must exist: an identical live generation that was never
-        // admitted to the journal has no preparation to renew for. (The parent-attempt table is
-        // structurally immutable, so this is a separately seeded job rather than a deletion.)
         let unadmitted = seed_leased_generation(
             &admin,
             &specs,
@@ -807,7 +761,6 @@ async fn the_preparation_renewal_accepts_only_the_complete_live_generation() {
             "no durable parent attempt means no preparation to renew for"
         );
 
-        // An already-expired claim window can never be renewed back to life.
         let expired_claim = seed_leased_generation(
             &admin,
             &specs,
@@ -840,7 +793,6 @@ async fn the_renewal_is_capped_at_the_immutable_claim_expiry() {
         let specs = ci_job_spec_store(app.clone());
         let queue = ci_job_queue_store(app.clone());
         let now = chrono::Utc::now().timestamp();
-        // A window far shorter than one execution slot: the cap, not the slot, must win.
         let claim = seed_leased_generation(
             &admin,
             &specs,
@@ -875,8 +827,6 @@ async fn the_renewal_is_capped_at_the_immutable_claim_expiry() {
     .await;
 }
 
-// ═════════════ 4. atomic reap + exact-generation journal sealing ═════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_failed_seal() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -887,9 +837,6 @@ async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_fa
         let region_store = ci_region_queue_store_test_support(admin.clone());
         let now = chrono::Utc::now().timestamp();
 
-        // Reapable: leased, lease lapsed, claim window still open. Its CURRENT generation is
-        // epoch 2; an OLDER generation (epoch 1) also has an unresolved phase and must be left
-        // alone, as must a phase the worker already measured.
         let reapable = seed_leased_generation(
             &admin,
             &specs,
@@ -951,7 +898,6 @@ async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_fa
         .execute(&admin)
         .await
         .unwrap();
-        // The job's public surface is `running` so the reap's surface reset is exercised too.
         sqlx::query(
             "UPDATE ci_job SET state = 'running' WHERE tenant_id = $1 AND job_id = $2::uuid",
         )
@@ -961,7 +907,6 @@ async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_fa
         .await
         .unwrap();
 
-        // A LIVE neighbour whose lease has not lapsed: nothing about it may change.
         let live = seed_leased_generation(
             &admin,
             &specs,
@@ -984,7 +929,6 @@ async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_fa
         )
         .await;
 
-        // ── (a) an injected seal failure rolls the COMPLETE sweep back ──
         admin
             .execute(
                 "CREATE FUNCTION myelin_test_refuse_seal() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -1031,7 +975,6 @@ async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_fa
         .unwrap();
         assert_eq!(surface, "running", "the surface reset rolled back too");
 
-        // ── (b) the next sweep, with the injection removed, commits all three effects ──
         admin
             .execute(
                 "DROP TRIGGER myelin_test_refuse_seal ON ci_job_prelaunch_usage;
@@ -1085,9 +1028,6 @@ async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_fa
             "the surface is reset after a successful seal"
         );
 
-        // ── (c) a replacement attempt settles with the old generation already ceiling-sealed ──
-        // Resolve the older still-`started` generation away first (it stands in for the
-        // independent deadline sealer's work), then admit a fresh generation and settle.
         sqlx::query(
             "UPDATE ci_job_prelaunch_usage
              SET status = 'sealed_ceiling', resolved_at = statement_timestamp()
@@ -1171,8 +1111,6 @@ async fn the_reaper_seals_exactly_the_generation_it_requeued_and_rolls_back_a_fa
     .await;
 }
 
-// ═════════════ 5. the rolling upgrade of an already-populated queue ══════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_claim_window_expand_upgrades_a_populated_queue_without_touching_existing_rows() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -1191,7 +1129,6 @@ async fn the_claim_window_expand_upgrades_a_populated_queue_without_touching_exi
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup, &schema_for_cleanup, || async move {
         let admin = pinned_pool(&admin_url(), &schema).await;
-        // The PRE-expand shape: the frozen create plus every previously shipped queue ALTER.
         for ddl in [
             myelin_ci_controlplane::CREATE_JOB_QUEUE_DDL,
             myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
@@ -1214,7 +1151,6 @@ async fn the_claim_window_expand_upgrades_a_populated_queue_without_touching_exi
         .await
         .expect("a legacy row exists before the expand");
 
-        // The expand + its online validation.
         admin
             .execute(myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
             .await
@@ -1223,7 +1159,6 @@ async fn the_claim_window_expand_upgrades_a_populated_queue_without_touching_exi
             .execute(myelin_ci_controlplane::VALIDATE_JOB_QUEUE_CLAIM_WINDOW_DDL)
             .await
             .expect("the bounded CHECK validates against the existing rows");
-        // Re-applying the expand is a no-op (several fixtures replay this exact DDL text).
         admin
             .execute(myelin_ci_controlplane::ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL)
             .await
@@ -1238,7 +1173,6 @@ async fn the_claim_window_expand_upgrades_a_populated_queue_without_touching_exi
         .unwrap();
         assert_eq!(legacy, None, "the pre-expand row survives as a legacy NULL");
 
-        // The bound is enforced in both directions, at exactly the Rust maximum.
         for (window, admitted) in [
             (1_i64, true),
             (MAX_CI_JOB_CLAIM_WINDOW_SECS as i64, true),
@@ -1263,8 +1197,6 @@ async fn the_claim_window_expand_upgrades_a_populated_queue_without_touching_exi
     })
     .await;
 }
-
-// ═════════════ 6. the claim-window expand refuses a divergent same-named constraint ══════════════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_claim_window_expand_refuses_a_divergent_same_named_constraint() {
@@ -1293,9 +1225,6 @@ async fn the_claim_window_expand_refuses_a_divergent_same_named_constraint() {
         ] {
             admin.execute(ddl).await.expect("pre-expand job_queue shape");
         }
-        // A hand-patched / divergently-deployed constraint under the SAME name, with a WIDER bound
-        // than Rust's authority. Swallowing `duplicate_object` would silently adopt it, and
-        // `ci_0020f` would then VALIDATE the wrong ceiling.
         admin
             .execute(
                 "ALTER TABLE job_queue ADD COLUMN claim_window_secs bigint;
@@ -1320,7 +1249,6 @@ async fn the_claim_window_expand_refuses_a_divergent_same_named_constraint() {
             "the refusal must show the constraint it found; got: {message}"
         );
 
-        // The divergent bound is still in place — nothing was silently adopted or rewritten.
         let still_divergent: String = sqlx::query_scalar(
             "SELECT pg_get_constraintdef(oid) FROM pg_constraint
              WHERE conrelid = 'job_queue'::regclass AND conname = 'job_queue_claim_window_range'",
@@ -1330,8 +1258,6 @@ async fn the_claim_window_expand_refuses_a_divergent_same_named_constraint() {
         .unwrap();
         assert!(still_divergent.contains("999999"));
 
-        // Replacing it with the EXPECTED constraint makes the same DDL idempotent again, both
-        // before and after `ci_0020f` strips the NOT VALID marker.
         admin
             .execute(
                 "ALTER TABLE job_queue DROP CONSTRAINT job_queue_claim_window_range;

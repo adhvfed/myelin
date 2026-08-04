@@ -1,5 +1,3 @@
-//! Deployment guards for the CI Dispatch split-credential bootstrap sequence.
-
 #[test]
 fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let source = include_str!("../src/main.rs");

@@ -1,10 +1,3 @@
-//! Issues-owned command grammar for the product CLI.
-//!
-//! The top-level `myelin` binary owns authentication and transport only. Issues owns these verbs and
-//! validates every identifier before a request can leave the machine. Tenant and region are absent
-//! by construction: both always come from the verified capability token at the Edge.
-
-/// The default and maximum page sizes exposed by the founder CLI floor.
 pub const DEFAULT_CLI_PAGE_LIMIT: u32 = 50;
 pub const MAX_CLI_PAGE_LIMIT: u32 = 100;
 pub const MAX_ISSUE_KEY_PREFIX_BYTES: usize = 32;
@@ -13,7 +6,6 @@ const MAX_TITLE_BYTES: usize = 512;
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_PREFIX: &str = "ic_";
 
-/// Authoritative product list state. The product UX defaults to open work.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssueListState {
     Open,
@@ -57,7 +49,6 @@ impl IssueListState {
     }
 }
 
-/// Normalize an issue-key prefix search. It is deliberately not a title-search grammar.
 pub fn normalize_issue_key_prefix(value: &str) -> Option<String> {
     if value.is_empty()
         || value.len() > MAX_ISSUE_KEY_PREFIX_BYTES
@@ -70,14 +61,12 @@ pub fn normalize_issue_key_prefix(value: &str) -> Option<String> {
     Some(value.to_ascii_uppercase())
 }
 
-/// Decoded keyset position. Scope, principal, and encrypted fields never enter this payload.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssuePageCursor {
     pub updated_at_micros: i64,
     pub issue_id: String,
 }
 
-/// Mint a versioned, URL-safe opaque cursor bound to the normalized list filters.
 pub fn encode_issue_page_cursor(
     state: IssueListState,
     key: Option<&str>,
@@ -108,7 +97,6 @@ pub fn encode_issue_page_cursor(
     Ok(encoded)
 }
 
-/// Strictly decode a cursor and reject reuse under a different normalized state/key filter.
 pub fn decode_issue_page_cursor(
     cursor: &str,
     expected_state: IssueListState,
@@ -180,7 +168,6 @@ fn decode_hex(value: u8) -> Result<u8, &'static str> {
     }
 }
 
-/// A fully parsed Issues command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
     List {
@@ -203,7 +190,6 @@ pub enum CliCommand {
     },
 }
 
-/// Total parse failure. No variant contains tenant, region, or any server-derived detail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliParseError {
     Empty,
@@ -234,8 +220,6 @@ impl core::fmt::Display for CliParseError {
 
 impl std::error::Error for CliParseError {}
 
-/// Parse `myelin issues ...` arguments. Unknown, duplicate, missing, and surplus tokens are always
-/// rejected; no parser branch silently ignores input.
 pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
     let (verb, rest) = args.split_first().ok_or(CliParseError::Empty)?;
     match *verb {
@@ -421,7 +405,6 @@ fn require_uuid(field: &'static str, value: &str) -> Result<(), CliParseError> {
     }
 }
 
-/// Canonical lowercase hyphenated UUID shape used by CLI and operator-bootstrap validation.
 pub fn is_canonical_uuid(value: &str) -> bool {
     value.len() == 36
         && value.bytes().enumerate().all(|(index, byte)| match index {

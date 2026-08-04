@@ -1,29 +1,3 @@
-//! # STOR F4 — OLAP reindex-parity (cold == live). The P-ST-18 / P-145 headline drill.
-//!
-//! Drill catalogue: the **F4 family** (`testing-strategy/01 …` §4.1) — the storage face of **BUS-D5**
-//! (`reindex(scope)` byte-matches live) ON the OLAP derived store. The OLAP read store fed by the bus
-//! (contract 11.6) is rebuilt BYTE-IDENTICALLY by re-emitting `*.snapshot` events through the SAME
-//! outbox→relay→bus→live-consumer path — never by scanning OLTP (storage.md §3.4 / EI-04 §5: the
-//! derived store rebuilds via the live consumer path ONLY, no bespoke recovery reader).
-//!
-//! The drill runs the FULL real path (not a shortcut):
-//! 1. **LIVE**: the OLAP consumer ingests the owner's live events → the live read-model bytes.
-//! 2. **WIPE** the OLAP store (a lost analytics warehouse — the recovery trigger).
-//! 3. **`reindex(scope)`**: the OWNER `replay`s → `*.snapshot` via the REAL outbox; the REAL relay
-//!    drains them to the InProcessBus; the OLAP consumer ingests the published snapshots (the EXACT
-//!    outbox→relay→bus→consumer path a live event takes — `OlapEvent::from_envelope` → `apply`).
-//! 4. **ASSERT cold == live**: the rebuilt `parity_bytes` are byte-identical to live.
-//! 5. **IDEMPOTENT re-run**: reindexing again emits 0 new snapshots (the deterministic `event_id`
-//!    dedups) and a wiped consumer rebuilds byte-stable from the retained delivered snapshots.
-//!
-//! Telemetry (the dated GREEN artifact): `reindex_parity_hash` matches (cold == live),
-//! `oltp_scan_path_count == 0` (no OLTP-scan backdoor), `snapshots_emitted_second == 0` (idempotent).
-//!
-//! FLOOR (EI-01 §1): the real ClickHouse-class columnar backend + the per-owner real `replay` body
-//! (CI/KN/Refs/Issues) land downstream (the columnar store behind the trait; the owner replays in
-//! EB-26 / the owners' M3/M4 prompts). This drill proves the SEAM + the cold==live byte-parity over
-//! the reference owner — the SAME posture as the Bus's BUS-D5 drill over its reference owner.
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EmitContextBase, EventEnvelope,
     EventId, EventType, InProcessBus, OutboxStore, Region, ReindexSource, Relay, SnapshotScope,
@@ -60,7 +34,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// The owner's analytics source of truth (the facts the OLAP read model projects).
 fn olap_source() -> OlapAnalyticsSource {
     let mut src = OlapAnalyticsSource::new("olap_src");
     src.upsert("issue:PROJ-1", 1, Some("subj:alice"));
@@ -70,8 +43,6 @@ fn olap_source() -> OlapAnalyticsSource {
     src
 }
 
-/// A live bus envelope for one of the owner's facts (same `event_id`-by-content + same routing fields
-/// as the `*.snapshot` of that `(aggregate, version)` — so the cold snapshot is byte-indistinct).
 fn live_envelope(agg: &str, event_id: &str, subject: Option<&str>) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId(event_id.into()),
@@ -104,9 +75,6 @@ fn live_envelope(agg: &str, event_id: &str, subject: Option<&str>) -> EventEnvel
     }
 }
 
-/// The LIVE projection: the owner's facts arrive as live events; the OLAP consumer ingests them. The
-/// live `event_id` is the SAME deterministic snapshot id (so the dedup ledger absorbs either order
-/// and the BYTES compared are the read model, not the id stream).
 fn live_projection(src: &OlapAnalyticsSource) -> OlapBusConsumer {
     let mut consumer = OlapBusConsumer::boot(region());
     for draft in src.replay(&SnapshotScope::new("olap_src", "all"), None) {
@@ -132,23 +100,18 @@ fn booted_bus() -> (OutboxStore, InProcessBus, Relay<InProcessBus>) {
     (outbox, bus, relay)
 }
 
-/// **THE F4 DRILL (dated green artifact): `reindex(scope)` rebuilds the OLAP read model
-/// BYTE-MATCHING live, through the REAL outbox→relay→bus→consumer path; the re-run is idempotent.**
 #[test]
 fn stor_f4_olap_reindex_parity_cold_equals_live() {
     let src = olap_source();
 
-    // (1) LIVE projection (the steady-state feed).
     let live = live_projection(&src);
     let live_bytes = live.parity_bytes();
     assert_eq!(live.store().doc_count(), 4, "four facts projected live");
 
-    // (2) WIPE is implicit: the cold consumer starts empty inside `reindex_olap_from_bus`.
     let (mut outbox, bus, relay) = booted_bus();
     let scope = SnapshotScope::new("olap_src", "all");
     let sources: Vec<&dyn ReindexSource> = vec![&src];
 
-    // (3) REINDEX through the REAL path.
     let (cold, r1) = reindex_olap_from_bus(
         region(),
         &scope,
@@ -161,7 +124,6 @@ fn stor_f4_olap_reindex_parity_cold_equals_live() {
     )
     .expect("the OLAP reindex-from-bus succeeds");
 
-    // (4) cold == live, BYTE-FOR-BYTE (the F4 gate).
     assert_eq!(
         r1.snapshots_emitted, 4,
         "reindex re-emitted all 4 aggregates as *.snapshot"
@@ -182,7 +144,6 @@ fn stor_f4_olap_reindex_parity_cold_equals_live() {
         "no OLTP-scan backdoor"
     );
 
-    // (5) IDEMPOTENT re-run: 0 new snapshots; a WIPED consumer rebuilds byte-stable.
     let (again, r2) = reindex_olap_from_bus(
         region(),
         &scope,
@@ -208,7 +169,6 @@ fn stor_f4_olap_reindex_parity_cold_equals_live() {
         "the re-run rebuilds the wiped consumer byte-stable (cold == live across re-runs)"
     );
 
-    // The dated GREEN artifact — emit the F4 telemetry observably (EI-01 §3).
     let signal = OlapReindexParitySignal {
         store: "issue_analytics_olap",
         reindex_matches_live: cold.parity_bytes() == live_bytes,
@@ -223,7 +183,7 @@ fn stor_f4_olap_reindex_parity_cold_equals_live() {
     println!(
         "[P-145 STOR-F4 DRILL GREEN 2026-06-20] OLAP reindex-parity: reindex(scope=olap_src) \
          rebuilt the OLAP read model BYTE-MATCHING live through the real outbox→relay→bus→consumer \
-         path — reindex_matches_live={}, oltp_scan_path_count={}, snapshots_emitted_first={}, \
+         path - reindex_matches_live={}, oltp_scan_path_count={}, snapshots_emitted_first={}, \
          snapshots_emitted_second={} (idempotent re-run). Cold == live, no OLTP-scan backdoor.",
         signal.reindex_matches_live,
         signal.oltp_scan_path_count,
@@ -232,9 +192,6 @@ fn stor_f4_olap_reindex_parity_cold_equals_live() {
     );
 }
 
-/// An OLTP-scan backdoor would be the §3.4 contract breach: reindex-from-source is the ONLY rebuild
-/// path. The structural guard is `oltp_scan_path_count == 0` (proven by construction in the frame +
-/// the feed source-grep); this drill re-asserts the GATE telemetry reads 0 on the rebuilt store.
 #[test]
 fn stor_f4_no_oltp_scan_backdoor_on_the_rebuild() {
     let src = olap_source();
@@ -255,7 +212,7 @@ fn stor_f4_no_oltp_scan_backdoor_on_the_rebuild() {
     assert_eq!(
         cold.store().oltp_scan_path_count(),
         0,
-        "reindex-from-source is the ONLY rebuild path — the rebuilt OLAP store has no OLTP-scan \
+        "reindex-from-source is the ONLY rebuild path - the rebuilt OLAP store has no OLTP-scan \
          backdoor (storage.md §3.4)"
     );
 }

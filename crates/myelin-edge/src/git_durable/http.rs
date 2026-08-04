@@ -1,5 +1,3 @@
-//! HTTP handlers, object-authorization guards, route registration, and their local tests.
-
 use super::*;
 
 struct DRepoList {
@@ -42,8 +40,6 @@ impl Handler for DRepoList {
             let envelope = page_envelope(json!(items), next_cursor, query.limit);
             return repo_summary_response(&envelope);
         }
-        // R2.1: the LIST endpoint is prefiltered to the principal's `pull`-visible set (the
-        // `list_objects` seam) BEFORE pagination — an un-granted repo's existence is never leaked.
         let offset = ctx
             .page
             .cursor
@@ -83,9 +79,6 @@ impl Handler for DRepoCreate {
             .or_else(|| body.get("name"))
             .and_then(Value::as_str)
             .ok_or_else(|| EdgeError::BadRequest("create-repo body missing `slug`".into()))?;
-        // R2.1a: the CREATE-through-the-edge path writes the creator→admin bootstrap grant (via the
-        // injected RepoBootstrapGrants seam) before the bare repo lands — under the deny-by-default
-        // CheckBackedRepoAuthorizer the creator can immediately clone/push its fresh repo.
         let created = self
             .be
             .create_repo_as(tenant_of(ctx), region_of(ctx), slug, ctx.principal)
@@ -105,8 +98,6 @@ struct DRepoHome {
 }
 impl Handler for DRepoHome {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        // R3.4: the enriched repo-home VM (default_branch, full README, latest_commit, per-entry
-        // bounded-walk activity, branch/tag counts, name-carrying entries).
         let home = self
             .be
             .repo_home_json(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?)
@@ -172,9 +163,6 @@ impl Handler for DCommitLog {
         } else {
             None
         };
-        // R3.4: bidirectional paging + honest position (range + page, NO fabricated total — the gate
-        // decision). `prev_cursor` is the "Newer" link (null on the first page); `range`/`offset` drive
-        // the "Commits 31–60 · Seite 2" readout without a costly total commit count.
         let prev = if offset > 0 {
             Some(offset.saturating_sub(limit).to_string())
         } else {
@@ -220,7 +208,6 @@ struct DBlobView {
 }
 impl Handler for DBlobView {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        // R3.4: nested `{...path}` + binary/size/truncation + gateway-proxied raw/download URLs.
         let vm = self
             .be
             .blob_json(
@@ -485,8 +472,6 @@ mod refs_query_tests {
 
 impl Handler for DRefs {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        // Registration wraps this handler in `RepoObjectGuard(Pull)`, so authorization has already
-        // succeeded before any query or cursor diagnostic becomes observable.
         let request = parse_refs_query(&ctx.request.query)?;
         let vm = self
             .be
@@ -1194,10 +1179,7 @@ mod tree_page_backend_tests {
 
 impl Handler for DTree {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        // Registration wraps this handler in `RepoObjectGuard(Pull)`, so authorization has already
-        // succeeded before any strict query/cursor diagnostic becomes observable.
         let request = parse_tree_query(&ctx.request.query)?;
-        // The catch-all `{...path}` binds the whole nested path (empty at the tree root).
         let path = ctx.params.get("path").map(String::as_str).unwrap_or("");
         let vm = self
             .be
@@ -1214,8 +1196,6 @@ impl Handler for DTree {
     }
 }
 
-/// Raw/download byte-serving (R3.4). `attachment` is fixed at registration (raw = inline, download =
-/// attachment) so the disposition is not client-controlled.
 struct DRawFile {
     be: Arc<DurableGitBackend>,
     attachment: bool,
@@ -1278,7 +1258,7 @@ impl Handler for DWebEditCommit {
         match outcome {
             WebEditOutcome::Denied => Err(EdgeError::Forbidden("no write permission for this ref".into())),
             WebEditOutcome::StaleBase { .. } => Err(EdgeError::Conflict(
-                "the file changed since you opened it — refused so nothing is silently overwritten \
+                "the file changed since you opened it - refused so nothing is silently overwritten \
                  (GF-6: no 3-way editor in v1)"
                     .into(),
             )),
@@ -1331,8 +1311,6 @@ impl Handler for DPrOverview {
             .map_err(map_durable_err)?
             .ok_or_else(|| EdgeError::NotFound("no such pull request".into()))?;
         let mut vm = DurableGitBackend::pr_json(&rec);
-        // R3.3 N1 — the commits-in-PR count (the tab badge) enriches the base record. A read failure
-        // degrades to `null` (the badge simply omits the count — never a fabricated number).
         if let Some(obj) = vm.as_object_mut() {
             match self.be.commits_in_pr_count(&loc, &rec) {
                 Some((count, has_more)) => {
@@ -1348,8 +1326,6 @@ impl Handler for DPrOverview {
     }
 }
 
-/// **GET …/prs/{n}/commits — the commits IN a PR (R3.3 N2).** Reachable from the head but not the base
-/// (three-dot semantics via the reachability walk), newest-first, MR-014 envelope. `Pull`-guarded.
 struct DPrCommits {
     be: Arc<DurableGitBackend>,
 }
@@ -1442,9 +1418,6 @@ fn map_pr_commit_page_error(error: PrCommitPageError) -> EdgeError {
 
 impl Handler for DPrCommits {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        // Registration wraps this handler in RepoObjectGuard, so strict query/cursor parsing occurs
-        // only after the zero-leak Pull authorization decision. This v1 route deliberately parses
-        // raw query bytes here: unlike generic `Page`, limit must be canonical and within 1..=100.
         let query = parse_pr_commit_query(&ctx.request.query)?;
         let repo_slug = param(ctx, "repo")?;
         let number = num_param(ctx, "n")?;
@@ -1849,7 +1822,6 @@ mod pr_commit_pagination_tests {
         let handler = DPrCommits {
             be: Arc::new(fixture.be),
         };
-        // Seed PR #2 so replay across PR number reaches the scope check rather than a missing object.
         handler
             .be
             .open_pr(
@@ -1993,9 +1965,6 @@ mod pr_commit_pagination_tests {
     }
 }
 
-/// **GET …/prs/{n}/diff?cursor=&view= — the PR three-dot diff (R3.2 · G-7 N1).** `Pull`-guarded
-/// (read = PR view; 0-leak 404 on an absent PR). `?view=` is the layout hint the client owns (the
-/// server is layout-agnostic); `cursor` pages FILES (MR-014). `restricted_files` is count-only.
 struct DPrDiff {
     be: Arc<DurableGitBackend>,
 }
@@ -2027,9 +1996,6 @@ impl Handler for DPrDiff {
     }
 }
 
-/// **GET …/file-lines/{oid}?path=&start=&end= — expand-context (R3.2 · G-7 N2).** `Pull`-guarded
-/// (the SAME object check as the blob route). Returns `{ lines: [...] }` (context lines at a blob
-/// oid); an absent canonical oid → empty `lines`, while malformed or unbounded input fails with 400.
 struct DFileLines {
     be: Arc<DurableGitBackend>,
 }
@@ -2181,9 +2147,6 @@ impl Handler for DFileLines {
     }
 }
 
-// ── R3.3 / R3.2 thread + review-batch handlers ──────────────────────────────────────────────────
-
-/// GET …/prs/{n}/threads — the viewer-scoped conversation. `Pull`-guarded (read = PR view).
 struct DPrThreads {
     be: Arc<DurableGitBackend>,
 }
@@ -2203,7 +2166,6 @@ impl Handler for DPrThreads {
     }
 }
 
-/// POST …/prs/{n}/threads — open a new thread + first comment. `Push`-guarded.
 struct DPrThreadCreate {
     be: Arc<DurableGitBackend>,
 }
@@ -2228,7 +2190,6 @@ impl Handler for DPrThreadCreate {
     }
 }
 
-/// POST …/prs/{n}/threads/{tid}/comments — reply to a thread. `Push`-guarded.
 struct DPrThreadComment {
     be: Arc<DurableGitBackend>,
 }
@@ -2256,7 +2217,6 @@ impl Handler for DPrThreadComment {
     }
 }
 
-/// POST …/prs/{n}/threads/{tid}/resolve — resolve/unresolve a thread. `Push`-guarded.
 struct DPrThreadResolve {
     be: Arc<DurableGitBackend>,
 }
@@ -2288,7 +2248,6 @@ impl Handler for DPrThreadResolve {
     }
 }
 
-/// POST …/prs/{n}/reviews/start — start a review batch (draft). `pull_request.review`-guarded.
 struct DPrReviewStart {
     be: Arc<DurableGitBackend>,
 }
@@ -2311,8 +2270,6 @@ impl Handler for DPrReviewStart {
     }
 }
 
-/// POST …/prs/{n}/reviews/{rid}/comments — add a pending comment to a draft batch.
-/// `pull_request.review`-guarded.
 struct DPrReviewComment {
     be: Arc<DurableGitBackend>,
 }
@@ -2340,8 +2297,6 @@ impl Handler for DPrReviewComment {
     }
 }
 
-/// POST …/prs/{n}/reviews/{rid}/submit — submit the batch (ONE event, R-BATCH-1).
-/// `pull_request.review`-guarded.
 struct DPrReviewSubmit {
     be: Arc<DurableGitBackend>,
 }
@@ -2373,7 +2328,6 @@ impl Handler for DPrReviewSubmit {
     }
 }
 
-/// DELETE …/prs/{n}/reviews/{rid} — discard a draft batch. `pull_request.review`-guarded.
 struct DPrReviewDiscard {
     be: Arc<DurableGitBackend>,
 }
@@ -2511,8 +2465,6 @@ fn cross_pr_list_envelope(page: EnrichedCrossPrSlice) -> Value {
     })
 }
 
-/// Build the unchanged R3.1 wire envelope from a storage-paginated per-repository slice. Exact
-/// counts and filtered total came from the same authorized storage read as the bounded page.
 fn repo_pr_list_envelope(page: EnrichedPrSlice) -> Value {
     let counts = json!({
         "open": page.counts.open,
@@ -2535,11 +2487,6 @@ fn repo_pr_list_envelope(page: EnrichedPrSlice) -> Value {
     })
 }
 
-/// **`GET /v1/git/repos/{repo}/prs` — the per-repo PR list (R3.1).** Registered through the
-/// [`RepoObjectGuard`] `Pull` check (the leak-free prefilter: `pull_request.view = parent_repo->pull`
-/// — a viewer who cannot pull gets the 0-leak 404 "no access" state; once past it every PR is
-/// view-able). The `?state=` tab filters the returned rows; `counts` (open/merged/closed/all + the
-/// sidebar's yours/needs-review) are computed over the FULL leak-free set so a tab badge never leaks.
 struct DRepoPrList {
     be: Arc<DurableGitBackend>,
 }
@@ -2562,11 +2509,6 @@ impl Handler for DRepoPrList {
     }
 }
 
-/// **`GET /v1/git/prs?bucket=needs-review|yours` — the cross-repo front door (R3.1, single-cell).**
-/// NOT object-guarded (no `{repo}` segment): the prefilter is [`DurableGitBackend::list_prs_cross`]'s
-/// `visible_repos` seam (a forbidden repo's PRs never enter the set). The `bucket` predicate then
-/// selects `yours` (authored-by-viewer) or `needs-review` (viewer is a requested reviewer) — the
-/// default is `needs-review` (the attention job). Each row carries its `repo` slug (the repo chip).
 struct DMyPrs {
     be: Arc<DurableGitBackend>,
 }
@@ -2672,10 +2614,6 @@ impl Handler for DMerge {
                     "durable": true,
                 }),
             )),
-            // The merge gate BLOCKED — a loud, honest refusal (no ref advanced). N6: a 409 carrying the
-            // FRESH re-rendered `checks` (the gate may have flipped mid-dialog) so the UI re-renders the
-            // blocked card WITHOUT a second round-trip and NEVER merges on stale state. `gate_admitted`
-            // stays authoritative — the UI reflects it, never recomputes.
             MergeAttempt::Blocked(_eval) => {
                 let loc =
                     DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), param(ctx, "repo")?);
@@ -2700,8 +2638,6 @@ impl Handler for DMerge {
             MergeAttempt::RefRefused(reason) => Err(EdgeError::Conflict(format!(
                 "merge ref advance refused: {reason:?}"
             ))),
-            // An arbitrary / non-existent / non-descendant head — refused, no ref advance (never advance
-            // a protected ref to an arbitrary oid). 422: the merge target is unprocessable.
             MergeAttempt::InvalidHead(why) => {
                 Err(EdgeError::BadRequest(format!("invalid merge head: {why}")))
             }
@@ -2815,9 +2751,6 @@ struct DCodeSearch;
 impl Handler for DCodeSearch {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let _validated = parse_code_search_query(&ctx.request.query)?;
-        // The ranked, ACL-pre-filtered index is owned by the Search track. Until that production
-        // dependency is mounted, the durable route refuses honestly instead of fabricating an empty
-        // successful result set. Validation deliberately does not probe an optional repository.
         Err(EdgeError::Unavailable(
             "code search index is unavailable".into(),
         ))
@@ -2952,32 +2885,6 @@ mod code_search_boundary_tests {
     }
 }
 
-/// **The R2.1 OBJECT-AUTHZ chokepoint for every object-addressed git JSON route — the registration-
-/// declared object check (the platform forward pattern).** The gateway's action gate authorizes the
-/// ACTION only; this guard is the OBJECT leg: it wraps the route's handler at REGISTRATION time with
-/// the ONE frozen-fragment [`RepoPermission`] the route needs, and consults the injected
-/// [`RepoAuthorizer`] on the `(principal, repo:<slug>, permission)` triple BEFORE the inner handler
-/// parses a byte of the request body. Deny postures mirror the wire oracle convention exactly:
-///
-/// - a **`Pull`** denial is the 0-leak **404** (`repository not found` — repo existence is never
-///   leaked to an un-granted in-tenant principal; identical to the absent-repo response);
-/// - every other denial is a fail-closed **403** naming the missing grant class.
-///
-/// The repo is resolved from the validated `{repo}` path segment + the VERIFIED `ctx.scope`
-/// (tenant-from-token, GIT-D8) — never a body/header field. A route with no `{repo}` param cannot
-/// pass this guard (fail-closed 400), so a mis-registered object route is loud, never silently
-/// action-only.
-///
-/// **Why this lives at the subsystem's registration and not a `GatewayBuilder::route_scoped`:** the
-/// gateway holds no object-authorizer handle (main.rs injects the object seam into the git BACKEND),
-/// the per-route permission varies across FOUR rungs (pull/push/protected_push/approve_untrusted_ci
-/// — not a binary object spec), and the deny posture varies with it (0-leak 404 vs 403). Mirroring
-/// R2.2's `sse_route`/`sse_route_scoped` registration-time contract, the enforced-by-construction
-/// property lands HERE: [`register_git_durable`] wraps every object-addressed route through
-/// [`guarded`], so a new git route either declares its object permission or visibly ships without
-/// one at the single registration site. The next subsystem mounting object-addressed routes copies
-/// this guard shape over its own object grammar (or generalises it into the gateway once two
-/// subsystems share an object-authorizer seam there).
 struct RepoObjectGuard {
     be: Arc<DurableGitBackend>,
     permission: RepoPermission,
@@ -2994,8 +2901,6 @@ impl Handler for RepoObjectGuard {
             self.permission,
         ) {
             return Err(match self.permission {
-                // The 0-leak read posture (the wire's `map_wire_err` convention): an un-granted
-                // reader learns nothing an absent repo would not also say.
                 RepoPermission::Pull => EdgeError::NotFound("repository not found".into()),
                 RepoPermission::Push => {
                     EdgeError::Forbidden("no write grant for this repository".into())
@@ -3013,8 +2918,6 @@ impl Handler for RepoObjectGuard {
     }
 }
 
-/// Wrap `inner` in the [`RepoObjectGuard`] for `permission` — the one-line registration-time
-/// declaration every object-addressed git route goes through.
 fn guarded(
     be: &Arc<DurableGitBackend>,
     permission: RepoPermission,
@@ -3027,12 +2930,6 @@ fn guarded(
     })
 }
 
-/// Temporary materialized form of the frozen
-/// `pull_request.review = reviewer ∪ parent_repo->push` permission. Production PR rows already
-/// carry requested-reviewer facts, but the matching Identity `pull_request` tuples are not yet
-/// projected. Until they are, evaluate the same union from the two authoritative facts available
-/// here: the live repo `Push` check or a requested-reviewer record on this exact PR. A failed PR
-/// lookup denies without distinguishing absence from an authorization failure.
 struct PrReviewGuard {
     be: Arc<DurableGitBackend>,
     inner: Arc<dyn Handler>,
@@ -3061,39 +2958,9 @@ fn pr_review_guarded(be: &Arc<DurableGitBackend>, inner: Arc<dyn Handler>) -> Ar
     })
 }
 
-/// **Register Git through the product edge over the DURABLE backend (GT-003).** Iterates Git's OWN
-/// catalogue (anti-duplication — the route set is Git's, re-rooted under `/v1/git/...`) and binds the
-/// durable handlers. The gateway owns auth/scope/IDOR/error/pagination; every write persists on the real
-/// on-disk backend under `ctx.scope` (the verified tenant + region), the merge passes the gate, and the
-/// resolver is traversal-safe.
-///
-/// **R2.1 — every object-addressed route is registered through the [`RepoObjectGuard`]** with the
-/// frozen-fragment permission it needs (the object leg the action-only gateway gate cannot do). The
-/// per-handler mapping (each reduces to a `repo:<slug>` check; PR routes reduce via the fragment's
-/// ttu arms, the parent repo being the validated `{repo}` segment):
-///
-/// | route | permission | deny |
-/// |---|---|---|
-/// | repo home / commit log / commit diff / blob view / PR overview / PR checks | `Pull` | 0-leak 404 |
-/// | web-edit commit / open-PR / CI check-report | `Push` | 403 |
-/// | PR review / discussion writes | `pull_request.review` | 403 |
-/// | endorse fork CI | `ApproveUntrustedCi` | 403 |
-/// | merge (`pull_request.merge = parent_repo->protected_push`) | `ProtectedPush` | 403 |
-/// | set branch protection | `ProtectedPush` | 403 |
-///
-/// NOT object-guarded (deliberate): `GET /repos` (the LIST — prefiltered leak-free inside
-/// [`DRepoList`] via the `list_objects` seam, which is stronger than a single object check);
-/// `POST /repos` (create — there is no repo OBJECT yet; the gateway's `git.repo.create` ACTION gate
-/// authorizes it and the R2.1a creator→admin bootstrap grant makes the fresh repo owned — a
-/// tenant-level "may create repos" object check needs a tenant/project object the frozen fragment
-/// does not define, named for the fragment's next revision); `GET /search/code` (strictly validates
-/// its query, then returns 503 until the ACL-prefiltered Search-track index is mounted).
 pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -> GatewayBuilder {
     use RepoPermission::{ApproveUntrustedCi, ProtectedPush, Pull, Push};
     for ep in http_catalogue() {
-        // R3.4: the blob READ route is widened to a nested `{...path}` catch-all (the core routing
-        // change vs the single-segment catalogue entry). The POST web-edit stays single-segment
-        // (nested web-edit is the GT-004b composer follow-on, not this surface).
         let pattern = match (ep.method, ep.path) {
             (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
                 reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
@@ -3103,11 +2970,9 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         let method = map_method(ep.method);
         let (handler, action): (Arc<dyn Handler>, &'static str) = match (ep.method, ep.path) {
             (GitMethod::Get, "/api/git/repos") => {
-                // The LIST: prefiltered inside the handler (list_objects seam) — see above.
                 (Arc::new(DRepoList { be: be.clone() }), "git.repos.list")
             }
             (GitMethod::Post, "/api/git/repos") => {
-                // Create: action-gated + bootstrap-granted — no repo object exists yet (see above).
                 (Arc::new(DRepoCreate { be: be.clone() }), "git.repo.create")
             }
             (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}") => (
@@ -3134,8 +2999,6 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 pr_review_guarded(&be, Arc::new(DPrReview { be: be.clone() })),
                 "git.pr.review",
             ),
-            // The X-1 endorsement: the DISTINCT approve_untrusted_ci relation (never collapsed to
-            // write — endorsing an untrusted fork run is its own trust decision).
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci") => (
                 guarded(
                     &be,
@@ -3144,16 +3007,10 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 ),
                 "git.pr.endorse_fork_ci",
             ),
-            // Merge: `pull_request.merge = parent_repo->protected_push` (§5-frozen) — the guard
-            // checks the reduction on the parent repo (the validated `{repo}` segment). A push-only
-            // writer does NOT clear this.
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/merge") => (
                 guarded(&be, ProtectedPush, Arc::new(DMerge { be: be.clone() })),
                 "git.pr.merge",
             ),
-            // Repo-admin: set branch-protection policy — a DISTINCT authorize action AND the
-            // admin-only protected_push OBJECT check (a non-admin writer is rejected here even if
-            // action-granted).
             (GitMethod::Post, "/api/git/repos/{repo}/branch-protection") => (
                 guarded(
                     &be,
@@ -3162,9 +3019,6 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 ),
                 "git.repo.branch_protection.set",
             ),
-            // CI check-report — a DISTINCT authorize action (the producer is CI/M4; a PR author is not
-            // granted it) + the per-repo write grant (an in-tenant CI producer stamps greens only on
-            // repos it is granted on).
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/checks") => (
                 guarded(&be, Push, Arc::new(DReportChecks { be: be.clone() })),
                 "git.checks.report",
@@ -3177,30 +3031,20 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         };
         b = b.route(method, &pattern, action, handler);
     }
-    // The GT-004 browse READ endpoints Git's catalogue doesn't expose yet — added here (reusing the
-    // durable repo's libgit2 reads, never a git reimplementation), tenant-scoped exactly like the
-    // catalogue routes (the gateway owns auth/scope/IDOR/error/pagination per route). All GET (reads),
-    // all object-guarded on `Pull` (R2.1).
     let get = map_method(GitMethod::Get);
     let post = map_method(GitMethod::Post);
-    // R3.1 — the per-repo PR LIST. Object-guarded on `Pull`: the leak-free prefilter is the frozen
-    // `pull_request.view = parent_repo->pull` reduction (a viewer who cannot pull gets the 0-leak 404
-    // "no access" state; once past it every PR in the repo is view-able, so counts never leak).
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/prs"),
         "git.prs.list",
         guarded(&be, Pull, Arc::new(DRepoPrList { be: be.clone() })),
     );
-    // ── R3.3 N2 — commits IN a PR (the tab badge's full list). `Pull` (read = PR view). ──
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/prs/{n}/commits"),
         "git.pr.commits",
         guarded(&be, Pull, Arc::new(DPrCommits { be: be.clone() })),
     );
-    // ── R3.2 · G-7 — the PR three-dot diff (N1) + expand-context (N2). Both `Pull` (read = PR view /
-    //    the same object-check as the blob route). 0-leak 404 on deny; restricted files count-only. ──
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/prs/{n}/diff"),
@@ -3213,8 +3057,6 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         "git.file.lines",
         guarded(&be, Pull, Arc::new(DFileLines { be: be.clone() })),
     );
-    // ── R3.3 / R3.2 — the thread + review-batch surface. READ = `Pull` (thread read = PR
-    //    view); WRITE = `pull_request.review` (requested reviewer OR parent-repo Push). ──
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/prs/{n}/threads"),
@@ -3239,9 +3081,6 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         "git.pr.thread.resolve",
         pr_review_guarded(&be, Arc::new(DPrThreadResolve { be: be.clone() })),
     );
-    // The review-batch lifecycle (G-8). `/reviews/start` (not `POST /reviews`) preserves the existing
-    // single-shot `POST /reviews` verdict op that feeds the merge gate — a named deviation from N5's
-    // literal path. Discard is `POST …/discard` (the gateway git grammar is Get/Post only, no DELETE).
     b = b.route(
         post,
         &reroot("/api/git/repos/{repo}/prs/{n}/reviews/start"),
@@ -3266,9 +3105,6 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         "git.pr.review.discard",
         pr_review_guarded(&be, Arc::new(DPrReviewDiscard { be: be.clone() })),
     );
-    // R3.1 — the CROSS-REPO PR front door (`/prs`). NOT object-guarded (no `{repo}`): the prefilter is
-    // the `visible_repos` `list_objects` seam inside the handler (stronger than a single object check
-    // — a forbidden repo's PRs never enter the set), so it registers action-gated only, like `/repos`.
     b = b.route(
         get,
         &reroot("/api/git/prs"),
@@ -3293,24 +3129,18 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         "git.commit.diff",
         guarded(&be, Pull, Arc::new(DCommitDiff { be: be.clone() })),
     );
-    // R3.4 repo-browsing completeness — the ref switcher + nested tree + raw/download read endpoints.
-    // All GET reads, all object-guarded on `Pull` (0-leak 404 on deny — the un-granted-repo posture),
-    // tenant-scoped via `ctx.scope` exactly like the catalogue routes.
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/refs"),
         "git.refs.list",
         guarded(&be, Pull, Arc::new(DRefs { be: be.clone() })),
     );
-    // One catch-all handles BOTH the tree root (`/tree/{ref}`, empty `{...path}`) and nested paths.
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/tree/{ref}/{...path}"),
         "git.tree.view",
         guarded(&be, Pull, Arc::new(DTree { be: be.clone() })),
     );
-    // Raw/download byte-serving — gateway-proxied, in-region, `Content-Disposition` set server-side
-    // (BINDING: no public signed URLs). `raw` = inline, `download` = attachment.
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/raw/{ref}/{...path}"),
@@ -3398,12 +3228,6 @@ mod event_privacy_tests {
 
 #[cfg(test)]
 mod create_compensation_tests {
-    //! **R2.1a-followup, defect #7 — the create-fail compensation path.** `create_repo_as` writes
-    //! the creator→admin grant BEFORE the on-disk `git init`; if the on-disk create then fails, the
-    //! error arm MUST issue a compensating [`RepoBootstrapGrants::revoke_creator`] so no orphan admin
-    //! grant survives on a repo that does not exist (the cross-user hole: orphan grant + slug reuse
-    //! by another principal). These tests pin the ordering and the compensation with a recording
-    //! bootstrap double, forcing the on-disk create to fail deterministically.
 
     use super::*;
     use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -3432,13 +3256,10 @@ mod create_compensation_tests {
         ))
     }
 
-    /// A recording bootstrap double: counts grant/revoke calls and records the (creator, slug) each
-    /// was invoked with, so a test asserts the compensating remove fired with the EXACT tuple key.
     #[derive(Default)]
     struct RecordingBootstrap {
         grants: Mutex<Vec<(String, String)>>,
         revokes: Mutex<Vec<(String, String)>>,
-        /// When set, `revoke_creator` returns Err (the compensation-ALSO-fails path).
         revoke_fails: bool,
     }
 
@@ -3463,16 +3284,12 @@ mod create_compensation_tests {
         }
     }
 
-    /// Make the on-disk create fail deterministically: plant a regular FILE where the
-    /// `<tenant>/<region>` directory would go, so `create_dir_all(parent)` inside
-    /// `DurableGitStore::create_repo` errors — the grant has already committed at that point.
     fn block_on_disk_create(root: &std::path::Path, tenant: &str, region: &str) {
         let tenant_dir = root.join(tenant);
         std::fs::create_dir_all(&tenant_dir).unwrap();
         std::fs::write(tenant_dir.join(region), b"not-a-directory").unwrap();
     }
 
-    /// **The happy path still grants and never compensates** (a successful create leaves the grant).
     #[test]
     fn successful_create_grants_and_does_not_revoke() {
         let root = temp_root("ok");
@@ -3492,8 +3309,6 @@ mod create_compensation_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **Defect #7 — an on-disk create failure AFTER the grant committed issues the compensating
-    /// remove** with the EXACT (creator, slug) the grant used, and surfaces the create error.
     #[test]
     fn create_failure_after_grant_compensates_the_orphan() {
         let root = temp_root("fail");
@@ -3505,7 +3320,6 @@ mod create_compensation_tests {
         let err = be
             .create_repo_as("acme", "fr-par", "widgets", &creator)
             .expect_err("the on-disk create must fail");
-        // The grant fired, then the compensating remove fired with the SAME tuple key.
         assert_eq!(
             *boot.grants.lock().unwrap(),
             vec![("svc:creator".to_string(), "widgets".to_string())]
@@ -3515,8 +3329,6 @@ mod create_compensation_tests {
             vec![("svc:creator".to_string(), "widgets".to_string())],
             "the compensating remove fired with the exact grant tuple"
         );
-        // The surfaced error is the underlying create error (compensation succeeded → not the
-        // orphan-known message).
         let msg = err.to_string();
         assert!(
             !msg.contains("ORPHANED"),
@@ -3525,8 +3337,6 @@ mod create_compensation_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **When the compensation ITSELF fails, the error names the ORPHANED grant loudly** (a known,
-    /// logged orphan beats a silent one — the reconciler's cue).
     #[test]
     fn compensation_failure_surfaces_the_known_orphan_loudly() {
         let root = temp_root("double-fail");
@@ -3554,8 +3364,6 @@ mod create_compensation_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **An existing repo short-circuits: neither grant nor revoke fires** (the conflict path, not a
-    /// create — no bootstrap tuple churn on a `409`).
     #[test]
     fn existing_repo_neither_grants_nor_revokes() {
         let root = temp_root("exists");
@@ -3565,7 +3373,6 @@ mod create_compensation_tests {
         assert!(be
             .create_repo_as("acme", "fr-par", "widgets", &creator)
             .unwrap());
-        // A second create of the same slug is a conflict (Ok(false)) — no second grant, no revoke.
         assert!(!be
             .create_repo_as("acme", "fr-par", "widgets", &creator)
             .unwrap());
@@ -3897,13 +3704,6 @@ mod repo_summary_tests {
 
 #[cfg(test)]
 mod pr_list_tests {
-    //! **R3.1 — the PR-list endpoints: leak-free prefilter, no-oracle counts, cursor stability.** The
-    //! per-repo list rides the SAME `Pull` [`RepoObjectGuard`] as every repo read (tested elsewhere);
-    //! these drive the list HANDLERS directly to prove: (a) the cross-repo front door never surfaces a
-    //! PR from a repo the viewer cannot `pull` (even one the viewer AUTHORED) — the prefilter runs
-    //! before the bucket predicate; (b) tab/bucket counts are computed over the leak-free set; (c) the
-    //! bidirectional cursor pages the sorted set with no gaps/dups; (d) a legacy record with no title
-    //! rows as `#number` and a config-read failure fails static ("checks unavailable"), never blanks.
 
     use super::*;
     use crate::catalogue::Page;
@@ -3940,7 +3740,7 @@ mod pr_list_tests {
     }
 
     fn open_pr(be: &DurableGitBackend, slug: &str, title: &str, opener: &Principal) {
-        be.create_repo_as(TENANT, REGION, slug, opener).ok(); // idempotent-ish (409 → already there)
+        be.create_repo_as(TENANT, REGION, slug, opener).ok();
         let body = json!({
             "title": title,
             "base_ref": "refs/heads/main",
@@ -3958,7 +3758,6 @@ mod pr_list_tests {
         serialized_pr_records_bytes(&records).expect("measure seeded PR records")
     }
 
-    /// Drive a list handler with a viewer + query string, returning the parsed JSON body.
     fn serve(handler: &dyn Handler, viewer: &Principal, repo: Option<&str>, query: &str) -> Value {
         serve_result(handler, viewer, repo, query)
             .unwrap_or_else(|e| panic!("handler errored: {e:?}"))
@@ -3991,7 +3790,6 @@ mod pr_list_tests {
             .map(|response| response.json_body().expect("json body"))
     }
 
-    /// Transitional numeric cursors are canonical and capped at the finite legacy coordinate.
     #[test]
     fn forged_or_over_cap_pr_list_cursor_is_a_clean_bad_request() {
         let root = temp_root("forged-cursor");
@@ -4120,8 +3918,6 @@ mod pr_list_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **The PR title is capped at create (verifier note, R3.1)** — an unbounded title is echoed
-    /// into every list row (response-bloat vector). >512 bytes is a clean error, never stored.
     #[test]
     fn oversized_title_is_rejected_at_create() {
         let root = temp_root("title-cap");
@@ -4136,7 +3932,6 @@ mod pr_list_tests {
         });
         let err = be.open_pr(TENANT, REGION, "core", &body, &author);
         assert!(err.is_err(), "513-byte title must be rejected");
-        // At the cap is fine.
         let ok_body = json!({
             "title": "x".repeat(512),
             "base_ref": "refs/heads/main",
@@ -4149,23 +3944,14 @@ mod pr_list_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **The cross-repo front door is leak-free: a PR in a repo the viewer cannot `pull` NEVER
-    /// appears — even one the viewer AUTHORED.** The `visible_repos` prefilter runs BEFORE the bucket
-    /// predicate, so a forbidden repo contributes nothing to the items OR the count (the anti-oracle
-    /// rule). This is the PR-list analogue of the `visible_repos_filters_to_the_granted_set` proof.
     #[test]
     fn cross_repo_bucket_never_leaks_a_forbidden_repos_pr() {
         let root = temp_root("cross-leak");
-        // Viewer is granted `read` on `alpha` only; `beta` is invisible to them.
         let authz = GrantBackedRepos::new().grant_read("u:viewer", TENANT, "alpha");
         let be = DurableGitBackend::rooted_inmem_for_test(&root);
         let viewer = human("u:viewer");
-        // The viewer AUTHORS a PR in BOTH repos (so the bucket predicate `yours` WOULD match beta if
-        // the prefilter leaked).
         open_pr(&be, "alpha", "Alpha change", &viewer);
         open_pr(&be, "beta", "Beta change (forbidden repo)", &viewer);
-        // Install the visibility boundary after seeding: production open checks Pull on the exact
-        // source repo, while this test is specifically about the subsequent cross-repo read filter.
         let be = be.with_repo_authorizer(Arc::new(authz));
 
         let handler = DMyPrs { be: Arc::new(be) };
@@ -4174,7 +3960,6 @@ mod pr_list_tests {
         assert_eq!(items.len(), 1, "only the visible repo's PR is listed");
         assert_eq!(items[0]["repo"], "alpha");
         assert_eq!(items[0]["title"], "Alpha change");
-        // The count is over the leak-free set — beta's PR never contributes.
         assert_eq!(body["counts"]["bucket"], 1);
         assert_eq!(body["page"]["total"], 1);
         std::fs::remove_dir_all(&root).ok();
@@ -4383,9 +4168,6 @@ mod pr_list_tests {
         ));
     }
 
-    /// **The per-repo list: rows carry the title, tab/sidebar counts are over the full authorised set,
-    /// and the `?state=` filter narrows the returned rows without changing the counts** (a badge never
-    /// under-counts because a tab is active).
     #[test]
     fn per_repo_list_rows_titles_and_counts() {
         let root = temp_root("per-repo");
@@ -4397,18 +4179,15 @@ mod pr_list_tests {
         open_pr(&be, "core", "Second PR", &viewer);
 
         let handler = DRepoPrList { be: Arc::new(be) };
-        // Default (state=open) — both open PRs listed, titles present.
         let body = serve(&handler, &viewer, Some("core"), "");
         let items = body["items"].as_array().unwrap();
         assert_eq!(items.len(), 2);
         let titles: Vec<&str> = items.iter().map(|i| i["title"].as_str().unwrap()).collect();
         assert!(titles.contains(&"First PR") && titles.contains(&"Second PR"));
-        // Counts over the full set.
         assert_eq!(body["counts"]["open"], 2);
         assert_eq!(body["counts"]["all"], 2);
         assert_eq!(body["counts"]["merged"], 0);
         assert_eq!(body["counts"]["yours"], 2, "the viewer authored both");
-        // A tab with no matches returns zero rows but the counts are unchanged (no under-count).
         let merged = serve(&handler, &viewer, Some("core"), "state=merged");
         assert_eq!(merged["items"].as_array().unwrap().len(), 0);
         assert_eq!(
@@ -4418,9 +4197,6 @@ mod pr_list_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **Cursor stability: paging the sorted set with `limit` visits every row exactly once, in a
-    /// stable order, with a correct bidirectional cursor** (`prev_cursor` None at the head; `next`
-    /// None at the tail).
     #[test]
     fn per_repo_list_cursor_is_stable_and_bidirectional() {
         let root = temp_root("cursor");
@@ -4433,7 +4209,6 @@ mod pr_list_tests {
         }
         let handler = DRepoPrList { be: Arc::new(be) };
 
-        // Page 1 (limit 2): head → prev None, next is an opaque Older keyset.
         let p1 = serve(&handler, &viewer, Some("core"), "state=all&limit=2");
         assert_eq!(p1["items"].as_array().unwrap().len(), 2);
         assert_eq!(p1["page"]["total"], 5);
@@ -4441,7 +4216,6 @@ mod pr_list_tests {
         let c2 = p1["page"]["next_cursor"].as_str().unwrap();
         assert!(c2.starts_with(PR_LIST_CURSOR_PREFIX));
 
-        // Omitted filter/sort/limit inherit from the cursor. Page 2 has both directions.
         let p2 = serve(&handler, &viewer, Some("core"), &format!("cursor={c2}"));
         let c1 = p2["page"]["prev_cursor"].as_str().unwrap();
         let c3 = p2["page"]["next_cursor"].as_str().unwrap();
@@ -4450,12 +4224,10 @@ mod pr_list_tests {
         let back = serve(&handler, &viewer, Some("core"), &format!("cursor={c1}"));
         assert_eq!(back["items"], p1["items"], "Newer returns the prior page");
 
-        // Page 3 (tail): 1 row, next None.
         let p3 = serve(&handler, &viewer, Some("core"), &format!("cursor={c3}"));
         assert_eq!(p3["items"].as_array().unwrap().len(), 1);
         assert!(p3["page"]["next_cursor"].is_null(), "tail has no Older");
 
-        // The three pages cover all 5 numbers exactly once (no gaps/dups — stable order).
         let mut seen: Vec<u64> = Vec::new();
         for pg in [&p1, &p2, &p3] {
             for it in pg["items"].as_array().unwrap() {
@@ -4487,8 +4259,6 @@ mod pr_list_tests {
         );
         let cursor = first["page"]["next_cursor"].as_str().unwrap().to_string();
 
-        // Remove the anchor (#4) from the selected relation and insert a newer row. A keyset does
-        // not need to find the anchor by equality, and the newer insertion cannot shift Older.
         be.prs
             .update(
                 &DurableGitBackend::loc(TENANT, REGION, "core"),
@@ -4537,8 +4307,6 @@ mod pr_list_tests {
             .as_str()
             .unwrap()
             .to_string();
-        // Moving an unseen ordering key across the boundary is intentionally live, not historical:
-        // #2 is now Newer and therefore is not returned by this Older continuation.
         be.prs
             .update(
                 &DurableGitBackend::loc(TENANT, REGION, "core"),
@@ -4641,11 +4409,8 @@ mod pr_list_tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **A legacy record (empty title) rows as `null` title (→ `#number` fallback) and a degraded
-    /// checks projection fails static** — the row VM is honest, never fabricates, never blanks.
     #[test]
     fn row_vm_title_null_and_checks_unavailable_are_honest() {
-        // A legacy record: empty title, no updated stamp.
         let pr = myelin_git::lifecycle::PullRequest::open(
             9,
             "refs/heads/main",
@@ -4674,19 +4439,14 @@ mod pr_list_tests {
         assert_eq!(row["updated_at"], Value::Null);
     }
 
-    /// **F3 (R4.1 dogfood) — the repo-home clone URL is the HONEST HTTP git-wire shape, never
-    /// `ssh://git@myelin/…`.** The wire is HTTP smart-transport ONLY (no SSH server) and its path
-    /// grammar is `/{tenant}/{region}/{repo}.git` — so the advertised clone URL must end in the real
-    /// `(tenant, region, repo)` path and carry no `ssh://` scheme / fabricated host.
     #[test]
     fn f3_clone_url_is_http_wire_shape_never_ssh() {
         let root = temp_root("f3-clone-url");
         let be = DurableGitBackend::rooted_inmem_for_test(&root);
-        // The builder: `{base}/{tenant}/{region}/{repo}.git` (base empty by default → a relative path).
         let url = be.clone_url(TENANT, REGION, "widgets");
         assert!(
             url.ends_with("/acme/eu-west/widgets.git"),
-            "the wire path grammar is /{{tenant}}/{{region}}/{{repo}}.git — got {url}"
+            "the wire path grammar is /{{tenant}}/{{region}}/{{repo}}.git - got {url}"
         );
         assert!(
             !url.contains("ssh://"),
@@ -4694,7 +4454,6 @@ mod pr_list_tests {
         );
         assert!(!url.contains("git@myelin"), "no fabricated ssh host: {url}");
 
-        // End-to-end through the repo-home projection (an empty repo still advertises the URL).
         let author = human("u:author");
         be.create_repo_as(TENANT, REGION, "widgets", &author)
             .unwrap();
@@ -4730,9 +4489,6 @@ mod pr_list_tests {
         assert!(err.to_string().contains("number space exhausted"));
     }
 
-    /// **F8 (R4.1 dogfood) — open a PR with a `head_ref` but NO `head_oid` → the stored PR carries the
-    /// ref's CURRENT tip (so it is mergeable), and a non-existent `head_ref` is refused with a clear
-    /// 400 at OPEN (never the confusing "invalid merge head" at merge time).**
     #[test]
     fn f8_open_pr_resolves_head_oid_from_head_ref_tip() {
         let root = temp_root("f8-resolve-head");
@@ -4740,7 +4496,6 @@ mod pr_list_tests {
         let author = human("u:author");
         be.create_repo_as(TENANT, REGION, "core", &author).unwrap();
 
-        // Seed a real commit as the tip of `refs/heads/feature` (the proposed head branch).
         let loc = DurableGitBackend::loc(TENANT, REGION, "core");
         let repo = be.store.open_repo(&loc).expect("open repo");
         let blob = repo.write_blob(b"hello\n").expect("blob");
@@ -4757,12 +4512,10 @@ mod pr_list_tests {
         )
         .expect("create feature ref");
 
-        // Open with head_ref but NO head_oid → the resolver fills in the branch tip.
         let body = json!({
             "title": "resolve my head",
             "base_ref": "refs/heads/main",
             "head_ref": "refs/heads/feature",
-            // head_oid deliberately OMITTED
         });
         let rec = be
             .open_pr(TENANT, REGION, "core", &body, &author)
@@ -4772,7 +4525,6 @@ mod pr_list_tests {
             "F8: an omitted head_oid is resolved from head_ref's current tip"
         );
 
-        // A bare (unqualified) head_ref resolves too (qualified to refs/heads/<name>).
         let body_bare = json!({ "title": "bare head_ref", "head_ref": "feature" });
         let rec2 = be
             .open_pr(TENANT, REGION, "core", &body_bare, &author)
@@ -4782,8 +4534,6 @@ mod pr_list_tests {
             "F8: a bare branch name also resolves to the tip"
         );
 
-        // A non-existent head_ref → a clean 400 at OPEN (mapped from the durable error), NOT an empty
-        // head_oid that wedges the merge dialog with "invalid merge head" later.
         let bad = json!({ "title": "ghost branch", "head_ref": "refs/heads/does-not-exist" });
         let err = be
             .open_pr(TENANT, REGION, "core", &bad, &author)
@@ -4972,12 +4722,6 @@ mod file_lines_boundary_tests {
 
 #[cfg(test)]
 mod pr_thread_tests {
-    //! **R3.3 / R3.2 — the PR thread / comment / review-batch surface at the edge.** Drives the
-    //! handlers to prove: (a) thread READ = PR view (the `Pull` guard) while WRITE follows the exact
-    //! review union (requested reviewer or repo pusher; an unrelated reader is denied); (b) a pending review
-    //! comment is invisible to a second viewer until submit; (c) submit emits exactly ONE batch event
-    //! (idempotent on retry); (d) a submitted human `changes_requested` verdict flips the merge gate to
-    //! blocked; (e) a blocked merge returns a 409 carrying the FRESH re-rendered checks (N6).
 
     use super::*;
     use crate::catalogue::Page;
@@ -5014,7 +4758,6 @@ mod pr_thread_tests {
         )
     }
 
-    /// Drive a handler (JSON body + path params), returning the `Result` so authz denials are testable.
     fn serve(
         handler: &dyn Handler,
         method: &str,
@@ -5046,7 +4789,6 @@ mod pr_thread_tests {
         handler.handle(&ctx).map(|r| r.json_body().expect("json"))
     }
 
-    /// A backend with a writer + a read-only viewer, a repo, and one open PR at head `head_oid`.
     fn setup(tag: &str, head_oid: &str) -> (Arc<DurableGitBackend>, Principal, Principal) {
         let root = temp_root(tag);
         let authz = GrantBackedRepos::new()
@@ -5065,13 +4807,9 @@ mod pr_thread_tests {
         (Arc::new(be), writer, reader)
     }
 
-    /// **Write = `pull_request.review`, not `Push` alone.** A requested reviewer may comment without
-    /// repo write, a repo writer remains admitted by the union's inheritance arm, and an unrelated
-    /// read-only viewer is denied.
     #[test]
     fn thread_write_admits_requested_reviewer_or_repo_pusher_only() {
         let (be, writer, reader) = setup("authz", &"0".repeat(40));
-        // The reader may LIST (Pull-guarded read).
         let list = guarded(
             &be,
             RepoPermission::Pull,
@@ -5097,7 +4835,6 @@ mod pr_thread_tests {
         .expect_err("an unrelated read-only viewer must be forbidden from commenting");
         assert!(matches!(err, EdgeError::Forbidden(_)), "got {err:?}");
 
-        // The repo writer is the `parent_repo->push` union arm.
         serve(
             &*create,
             "POST",
@@ -5107,7 +4844,6 @@ mod pr_thread_tests {
         )
         .expect("a repo pusher may review");
 
-        // Materialize the direct `reviewer` arm on the current PR. The reader still has no Push.
         let loc = DurableGitBackend::loc(TENANT, REGION, SLUG);
         be.prs
             .update(&loc, 1, |record| {
@@ -5154,7 +4890,6 @@ mod pr_thread_tests {
             .is_empty());
     }
 
-    /// A pending review comment is invisible to a second viewer until submit; submit emits ONE event.
     #[test]
     fn pending_comment_is_private_and_submit_emits_one_event() {
         let (be, writer, reader) = setup("pending", &"0".repeat(40));
@@ -5163,7 +4898,6 @@ mod pr_thread_tests {
         let pending = Arc::new(DPrReviewComment { be: be.clone() });
         let submit = Arc::new(DPrReviewSubmit { be: be.clone() });
 
-        // The reader (a real reviewer with read) starts a batch + drafts a pending comment.
         let batch = serve(
             &*start,
             "POST",
@@ -5185,7 +4919,6 @@ mod pr_thread_tests {
         )
         .unwrap();
 
-        // The WRITER (a different viewer) sees NO thread and NO draft batch.
         let seen = serve(
             &*threads,
             "GET",
@@ -5205,7 +4938,6 @@ mod pr_thread_tests {
             "draft batch is hidden"
         );
 
-        // Submit → ONE event (emitted true); a re-submit is idempotent (emitted false).
         let first = serve(
             &*submit,
             "POST",
@@ -5228,7 +4960,6 @@ mod pr_thread_tests {
             "no double event"
         );
 
-        // Now the writer sees the (submitted) thread.
         let seen = serve(
             &*threads,
             "GET",
@@ -5244,8 +4975,6 @@ mod pr_thread_tests {
         );
     }
 
-    /// A submitted human `changes_requested` batch flips the merge gate → the checks projection reads
-    /// `changes_requested: true` and `gate_admitted: false` (the VERIFIED R2 gate input).
     #[test]
     fn a_changes_requested_batch_blocks_the_gate() {
         let (be, _writer, reader) = setup("blockgate", &"0".repeat(40));
@@ -5291,13 +5020,8 @@ mod pr_thread_tests {
         );
     }
 
-    /// A blocked merge returns a 409 carrying the FRESH re-rendered checks (N6 — the UI re-renders the
-    /// blocked card without a second round-trip, never merges on stale state).
     #[test]
     fn a_blocked_merge_returns_409_with_rerendered_checks() {
-        // A protected base (`refs/heads/main`) defaults CLOSED (requires a non-author approval) → the
-        // merge is blocked by POLICY. Build the backend with an ADMIN grant for the writer so the
-        // OBJECT guard (ProtectedPush) admits and the POLICY gate is what blocks (the N6 case).
         let root = temp_root("merge409");
         let authz = GrantBackedRepos::new().grant_admin("u:writer", TENANT, SLUG);
         let writer = human("u:writer");
@@ -5334,8 +5058,6 @@ mod pr_thread_tests {
         );
     }
 
-    /// Seed a repo with a real base commit on `main` + a head commit branched off it (modifying
-    /// file.txt), open a PR at the real head oid, and return the backend + a reader + the head oid.
     fn setup_diff(tag: &str) -> (Arc<DurableGitBackend>, Principal, String) {
         let root = temp_root(tag);
         let authz = GrantBackedRepos::new()
@@ -5437,9 +5159,6 @@ mod pr_thread_tests {
         assert_eq!(stored.threads.len(), 2, "invalid anchors persisted nothing");
     }
 
-    /// **R3.2 · G-7 N1 — the PR diff is `Pull`-guarded, 0-leak, three-dot, count-only restricted.** A
-    /// reader (PR view) gets the three-dot diff; a stranger with NO grant gets a 0-leak 404 (never a
-    /// distinguishable Forbidden, never a leaked path). `restricted_files` is count-only (0 here).
     #[test]
     fn pr_diff_is_pull_guarded_zero_leak_and_three_dot() {
         let (be, reader, head) = setup_diff("diffauthz");
@@ -5448,7 +5167,6 @@ mod pr_thread_tests {
             RepoPermission::Pull,
             Arc::new(DPrDiff { be: be.clone() }),
         );
-        // The reader sees the three-dot diff of file.txt (the PR's own change).
         let v = serve(
             &*guard,
             "GET",
@@ -5474,19 +5192,16 @@ mod pr_thread_tests {
             new_blob_oid, head,
             "the blob oid must never be the PR head commit oid"
         );
-        // Line numbers cross the wire additively.
         let lines = v["files"][0]["hunks"][0]["lines"].as_array().unwrap();
         assert!(lines
             .iter()
             .any(|l| l["origin"] == "+" && l["content"] == "d" && l["new_no"] == 4));
-        // Restricted disclosure is COUNT-ONLY — the field is a number, never a path list.
         assert_eq!(
             v["restricted_files"], 0,
             "count-only; 0 under the repo-level Pull guard"
         );
         assert!(v["restricted_files"].is_number());
 
-        // A STRANGER with no grant → a 0-leak 404 (NotFound), never a distinguishable Forbidden.
         let stranger = human("u:stranger");
         let err = serve(
             &*guard,
@@ -5502,7 +5217,6 @@ mod pr_thread_tests {
         );
     }
 
-    /// A diff request for an ABSENT PR is a clean 404 (exactly like the overview — never a 500).
     #[test]
     fn pr_diff_absent_pr_is_not_found() {
         let (be, reader, _head) = setup_diff("diffabsent");

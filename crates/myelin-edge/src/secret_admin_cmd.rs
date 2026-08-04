@@ -1,11 +1,3 @@
-//! Testable body for the authenticated `edge secret ...` operator command family.
-//!
-//! Secret material crosses exactly one CLI boundary: UTF-8 bytes are read from STDIN into a
-//! [`Zeroizing<String>`], moved into [`SecretMaterial`], and consumed by [`SecretAdmin`]. It is never
-//! accepted in argv/environment, formatted, logged, returned, or retained by an error. Authentication
-//! uses the same capability authenticator as the serving edge; only a signed `OperatorBootstrap`
-//! credential carrying `edge.operator` reaches the independent `ci_project.administer` ReBAC gate.
-
 use std::io::Read;
 use std::sync::Arc;
 
@@ -18,7 +10,6 @@ use myelin_identity_service::{CapabilityAuthenticator, CredentialAudience, Crede
 use myelin_tenancy::TenantId;
 use zeroize::Zeroizing;
 
-/// One secret target. Required fields are validated before authentication or STDIN is read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecretTarget<'a> {
     pub tenant: &'a str,
@@ -26,7 +17,6 @@ pub struct SecretTarget<'a> {
     pub name: &'a str,
 }
 
-/// The typed operation behind the `edge secret` subcommand family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SecretCommand<'a> {
     Create(SecretTarget<'a>),
@@ -47,7 +37,6 @@ pub enum SecretCommand<'a> {
     },
 }
 
-/// Material-free success output. No variant has a field capable of carrying secret material.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SecretCommandOutput {
     Changed {
@@ -63,7 +52,6 @@ pub enum SecretCommandOutput {
 }
 
 impl SecretCommandOutput {
-    /// Render operator-safe metadata. Secret material is structurally absent from the output type.
     pub fn render(&self) -> String {
         match self {
             Self::Changed {
@@ -98,8 +86,6 @@ impl SecretCommandOutput {
     }
 }
 
-/// A PII- and secret-safe operator failure. Authentication and authorization are intentionally
-/// uniform; no verifier, ReBAC, store, IO, token, or material detail crosses this boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SecretCommandError {
     BadParam(&'static str),
@@ -141,11 +127,6 @@ impl core::fmt::Display for SecretCommandError {
 
 impl std::error::Error for SecretCommandError {}
 
-/// Authenticate an operator token and execute one secret administration operation.
-///
-/// Material-bearing operations read exactly one bounded UTF-8 value from `input`. The owned input
-/// allocation is moved into `SecretMaterial`, whose redacted/zeroizing contract covers every
-/// success and error path inside `SecretAdmin`.
 pub fn execute_secret_command<I: IdentityService>(
     authenticator: &CapabilityAuthenticator,
     identity: Arc<I>,
@@ -309,8 +290,6 @@ fn binding_scope(scope: &str) -> Result<SecretBindingScope, SecretCommandError> 
 
 fn secret_material(input: &mut impl Read) -> Result<SecretMaterial, SecretCommandError> {
     let mut material = read_material(input)?;
-    // Move the one allocation into SecretMaterial. `material` is now an empty Zeroizing buffer;
-    // SecretMaterial owns and zeroizes the original allocation after SecretAdmin consumes it.
     Ok(SecretMaterial::from(std::mem::take(&mut *material)))
 }
 

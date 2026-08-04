@@ -1,12 +1,3 @@
-//! Unit tests for the Git Web UI view-model (GIT-P32). These assert the design-pass invariants at the
-//! view-model level (the browser-driven e2e is `tests/e2e_git_p32_web_browser.rs`):
-//! - the fork-trust badge NEVER lets a fork's own green read as gating-green (the signed-off security
-//!   invariant, design pass §4.1);
-//! - status is NEVER colour alone (glyph + label always present, WCAG 1.4.1 / design pass §3);
-//! - a tombstone NEVER leaks a title (the 0-leak boundary, design pass §5);
-//! - the inline-colour ban holds in the rendered markup (no `style="color:` on interactive elements);
-//! - the GF-6 single-file web-edit refuses a stale base (no silent overwrite, no 3-way editor).
-
 use super::*;
 use crate::check_status::{
     CheckContext, CheckState, CheckStatus, CheckStatusRow, GitOid, HumanisedRef, TrustTier,
@@ -47,7 +38,6 @@ fn row(state: CheckState, trust: TrustTier, ctx: &str) -> CheckStatusRow {
 
 #[test]
 fn status_is_never_colour_alone_every_check_state_has_glyph_and_label() {
-    // WCAG 1.4.1 / design pass §3: glyph + label always present (the colour-blind / monochrome floor).
     for state in [
         CheckState::Success,
         CheckState::Failure,
@@ -71,7 +61,6 @@ fn status_is_never_colour_alone_every_check_state_has_glyph_and_label() {
 
 #[test]
 fn error_and_cancelled_are_distinct_from_failure() {
-    // design pass §4.2: an infra error is NOT a test failure and must not read as one.
     let failure = StatusCue::for_check_state(CheckState::Failure);
     let error = StatusCue::for_check_state(CheckState::Error);
     let cancelled = StatusCue::for_check_state(CheckState::Cancelled);
@@ -88,9 +77,6 @@ fn error_and_cancelled_are_distinct_from_failure() {
 
 #[test]
 fn fork_badge_appears_only_for_unendorsed_fork_success() {
-    // The signed-off security invariant (design pass §4.1): a fork's own green NEVER reads as
-    // gating-green. The badge (the "neutral until trusted" warning) appears EXACTLY for an
-    // un-endorsed untrusted_fork row.
     let trusted = row(CheckState::Success, TrustTier::Trusted, "build");
     assert!(
         ForkTrustBadge::for_row(&trusted, true, false).is_none(),
@@ -102,7 +88,6 @@ fn fork_badge_appears_only_for_unendorsed_fork_success() {
         ForkTrustBadge::for_row(&fork, true, false).is_some(),
         "un-endorsed fork success MUST show the neutral-until-trusted badge"
     );
-    // Once endorsed it flips to the success state — no warning badge.
     assert!(
         ForkTrustBadge::for_row(&fork, true, true).is_none(),
         "endorsed fork success: badge clears (counts toward the gate)"
@@ -111,8 +96,6 @@ fn fork_badge_appears_only_for_unendorsed_fork_success() {
 
 #[test]
 fn fork_trust_action_is_absent_for_a_viewer_without_the_capability() {
-    // design pass §4.1: the [ Trust this run ] action is gated on approve_untrusted_ci; absent
-    // (read-only) for a viewer without it — no leaked affordance.
     let fork = row(CheckState::Success, TrustTier::UntrustedFork, "build");
 
     let with_cap = ForkTrustBadge::for_row(&fork, true, false)
@@ -130,14 +113,11 @@ fn fork_trust_action_is_absent_for_a_viewer_without_the_capability() {
         !without_cap.contains("Trust this run"),
         "a viewer without approve_untrusted_ci must NOT see the trust action (no leaked affordance)"
     );
-    // The honest copy is present regardless (the badge is never silently hidden).
     assert!(without_cap.contains("untrusted fork") || without_cap.contains("FORK run"));
 }
 
 #[test]
 fn checks_panel_renders_humanised_summary_not_a_raw_ci_string() {
-    // design pass §4.2 / §5: the panel renders the Notif-humanised summary (the frontend owns no
-    // humanisation map). The view-model takes the already-humanised text.
     let r = row(CheckState::Failure, TrustTier::Trusted, "test");
     let view = CheckRowView::from_row(&r, "3 tests failed", true, false, false);
     let html = view.render();
@@ -155,7 +135,6 @@ fn checks_panel_renders_humanised_summary_not_a_raw_ci_string() {
 
 #[test]
 fn checks_panel_covers_empty_loading_error_states() {
-    // design pass §4.2: empty / loading-skeleton / error (fail-static for this surface only).
     let empty = ChecksPanel::Empty.render();
     assert!(empty.contains("No checks configured"));
 
@@ -173,7 +152,6 @@ fn checks_panel_covers_empty_loading_error_states() {
         loading.contains("aria-live=\"polite\""),
         "one polite live region announces loading"
     );
-    // No blank spinner — there is no spinner token in the system.
     assert!(!loading.to_lowercase().contains("spinner"));
 
     let error = ChecksPanel::Error.render();
@@ -186,8 +164,6 @@ fn checks_panel_covers_empty_loading_error_states() {
 
 #[test]
 fn merge_readiness_names_which_gate_is_unmet_never_a_bare_blocked() {
-    // design pass §4.3: the readiness names WHICH context is unmet, humanised, with the next action —
-    // never a bare "blocked".
     let outcome = MergeGateOutcome::Blocked {
         unmet: vec![
             UnmetContext {
@@ -209,7 +185,6 @@ fn merge_readiness_names_which_gate_is_unmet_never_a_bare_blocked() {
         html.contains("awaiting fork trust"),
         "humanises the fork-neutral reason"
     );
-    // The bare word "Blocked:" is a prefix to the named list — never alone.
     assert!(html.contains("Blocked:"));
     assert!(html.len() > "Blocked".len() + 20);
 }
@@ -225,8 +200,6 @@ fn merge_readiness_ready_shows_merge_and_auto_merge() {
 
 #[test]
 fn pr_overview_tombstone_never_leaks_a_title() {
-    // The 0-leak boundary (design pass §5): a tombstoned projection renders the dignified, content-free
-    // permission/erased state — the title NEVER reaches the render.
     use crate::project::{Tombstone, TombstoneReason};
     let page = PrOverviewPage {
         projected: Projected::Tombstoned(Tombstone {
@@ -241,7 +214,6 @@ fn pr_overview_tombstone_never_leaks_a_title() {
         html.contains("not available to you"),
         "dignified permission state"
     );
-    // No title, no state pill, no checks panel leaked for a tombstone.
     assert!(
         !html.contains("pr-title"),
         "no title element for a tombstone"
@@ -299,7 +271,6 @@ fn pr_overview_visible_renders_title_state_checks_merge() {
 
 #[test]
 fn web_edit_refuses_a_stale_base_no_silent_overwrite() {
-    // GF-6: single-file web edit refuses a stale base honestly (no 3-way editor, no silent overwrite).
     let committed = WebEditOutcome::evaluate("base-oid", "base-oid", "new-oid", true);
     assert_eq!(
         committed,
@@ -327,7 +298,6 @@ fn web_edit_refuses_a_stale_base_no_silent_overwrite() {
 
 #[test]
 fn web_edit_form_omits_composer_for_a_read_only_viewer() {
-    // DESIGN-MANUAL §4.2: an unpickable affordance is ABSENT, not greyed.
     let editable = WebEditForm {
         path: "src/lib.rs".into(),
         contents: "fn main() {}".into(),
@@ -354,8 +324,6 @@ fn web_edit_form_omits_composer_for_a_read_only_viewer() {
 
 #[test]
 fn rendered_markup_carries_no_inline_interactive_colour() {
-    // The inline-colour ban (design pass §1, PROVEN): no screen sets colour via inline style on an
-    // interactive element (inline beats :hover/:focus specificity). All colour is token/class driven.
     let r = row(CheckState::Success, TrustTier::UntrustedFork, "build");
     let badge = ForkTrustBadge::for_row(&r, true, false).unwrap().render();
     let checks = ChecksPanel::Live {
@@ -380,10 +348,8 @@ fn page_shell_is_well_formed_and_uses_semantic_tokens() {
     assert!(html.starts_with("<!doctype html>"));
     assert!(html.contains("lang=\"en\""));
     assert!(html.contains("data-theme=\"dark\""));
-    // The stylesheet binds classes to var(--…) semantic tokens (never a primitive in markup).
     assert!(STYLE.contains("var(--success)"));
     assert!(STYLE.contains("var(--focus-ring)"));
-    // focus-ring is distinct from accent (the carve-out rule, design pass §1).
     assert!(STYLE.contains("--focus-ring:") && STYLE.contains("--accent:"));
     assert!(
         STYLE.contains("prefers-reduced-motion"),
@@ -542,8 +508,6 @@ fn pr_commit_cursor_codec_is_canonical_bounded_and_round_trips() {
 
 #[test]
 fn commit_row_and_diff_json_carry_the_browse_contract() {
-    // GT-004 browse ViewModels: the JSON the Solid Git web UI renders (short_oid + the +/- diff
-    // origins as the three-channel signal; PII-free pseudonymous author; unix `committed_at`).
     let row = CommitRow {
         oid: "0123456789abcdef0123".into(),
         summary: "feat: land the browse surface".into(),
@@ -553,7 +517,7 @@ fn commit_row_and_diff_json_carry_the_browse_contract() {
     };
     let j = row.to_json();
     assert_eq!(j["oid"], "0123456789abcdef0123");
-    assert_eq!(j["short_oid"], "0123456789ab"); // first 12 chars
+    assert_eq!(j["short_oid"], "0123456789ab");
     assert_eq!(j["author"], "u_dev@acme.noreply");
     assert_eq!(j["committed_at"], 1_700_000_000i64);
     assert_eq!(j["parents"][0], "aaaa");

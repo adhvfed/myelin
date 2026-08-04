@@ -1,31 +1,3 @@
-//! # P-ID-26 (global P-249) GATE / DRILL — KN-D5 / KN-D13, the Knowledge no-leak-incl-COUNT +
-//! cross-tenant guard (dated green artifacts)
-//!
-//! **Drill catalogue rows KN-D5 / KN-D13 (F1/F2):** *A confidential page / row / field is ABSENT from
-//! any `list_objects` / search result for an unauthorized viewer **INCLUDING the COUNT** (no count
-//! leak), and cross-tenant access is 0.* Survival signals: **0 leaked pages/rows/fields incl. COUNT;
-//! 0 cross-tenant** (the `CrossTenantCount == 0` survival signal from the contract-1.8 set, exactly as
-//! ID-D3 / GIT-D8). `myelin-harness` is a DEV-dependency only — it never enters the identity-service
-//! production DAG.
-//!
-//! **The scenarios (all over Id's compiled Knowledge fragment, P-ID-26):**
-//!
-//! 1. **Page (the page-tree OVERRIDE).** A sub-page inherits read from its parent, but a `- direct_block`
-//!    override removes the viewer. `list_objects(viewer, read, page)` must NOT contain the blocked
-//!    sub-page — and the COUNT must drop by exactly one (the blocked page is absent from the count, not
-//!    merely the body — the no-COUNT-leak guard; a post-filter that hid the row but kept the count
-//!    would FAIL this).
-//! 2. **Row (the row-level ACL).** A confidential `database_row` granted to someone else is ABSENT from
-//!    the viewer's `list_objects(viewer, read, database_row)` — body AND count.
-//! 3. **Field (the off-hot-path caveat, §8.6).** A redacted column is `Deny` for the under-cleared
-//!    viewer — it is absent from the field projection AND any field count (a redacted column never
-//!    contributes to a COUNT).
-//! 4. **Cross-tenant.** A confidential page in `acme` is unreachable by an `evil-corp` viewer:
-//!    `CrossTenantCount == 0`.
-//!
-//! A leak (a blocked page in the body OR an unchanged count) aborts LOUDLY — the threshold is NEVER
-//! weakened to pass (EI-01 §3).
-
 use myelin_events::{BusTransport, EventHandler as _, InProcessBus, OutboxStore, Relay, Timestamp};
 use myelin_harness::telemetry::{Predicate, SignalName, SignalSource};
 use myelin_identity::{
@@ -73,9 +45,6 @@ fn now() -> Timestamp {
     Timestamp("2026-06-21T00:00:00Z".into())
 }
 
-/// Build a `StoreBackedCheck` over the core hierarchy + Id's compiled Knowledge fragment, seeded with
-/// `grants` and a LIVE S8 reverse index fed off the bus (so `list_objects` materialises the real
-/// candidate set, not a stub).
 fn provider(scope: &TenantScope, grants: &[TupleDelta]) -> StoreBackedCheck {
     let outbox = OutboxStore::new();
     let store = TupleStore::new(outbox.clone());
@@ -116,31 +85,20 @@ fn ids_of(result: ListObjectsResult) -> Vec<ObjectId> {
     }
 }
 
-/// **KN-D5 / KN-D13 (F1) — a blocked sub-page is absent from `list_objects` INCLUDING the COUNT.**
-///
-/// `page:secret` inherits read from `page:home` (the viewer reads home) but a `- direct_block` override
-/// removes the viewer from `page:secret`. The viewer's `list_objects(read, page)` must contain
-/// `page:home` and `page:open` but NOT `page:secret` — and the COUNT must be exactly the visible
-/// count (the blocked page contributes 0 to the count; a post-filter that kept the count would fail).
 #[test]
 fn kn_d5_blocked_page_absent_from_list_incl_count() {
     let s = scope_of(&principal("acme", "p-admin"));
     let svc = provider(
         &s,
         &[
-            // The viewer reads page:home directly.
             add("page:home", "direct_reader", "p:viewer"),
-            // page:open also readable directly.
             add("page:open", "direct_reader", "p:viewer"),
-            // page:secret INHERITS read from page:home (parent_page->read)...
             add("page:secret", "parent_page", "page:home#read"),
-            // ...but the OVERRIDE blocks the viewer on the sub-page (- direct_block).
             add("page:secret", "direct_block", "p:viewer"),
         ],
     );
     let viewer = principal("acme", "p:viewer");
 
-    // Sanity: the viewer reads home + open, NOT secret (the override narrows the inherited access).
     let can = |obj: &str| {
         matches!(
             svc.check(
@@ -166,8 +124,6 @@ fn kn_d5_blocked_page_absent_from_list_incl_count() {
         "the - direct_block override narrows inherited access: the viewer does NOT read page:secret"
     );
 
-    // THE NO-COUNT-LEAK GUARD: list_objects(read, page) returns the visible pages — and the COUNT
-    // (ids.len()) is exactly the visible count. The blocked sub-page is absent from BODY and COUNT.
     let listed = ids_of(
         svc.list_objects(
             &viewer,
@@ -185,7 +141,7 @@ fn kn_d5_blocked_page_absent_from_list_incl_count() {
     assert_eq!(
         listed.len(),
         2,
-        "no COUNT leak: exactly 2 pages in the count (home + open) — the blocked page contributes 0"
+        "no COUNT leak: exactly 2 pages in the count (home + open) - the blocked page contributes 0"
     );
 
     println!(
@@ -198,10 +154,6 @@ fn kn_d5_blocked_page_absent_from_list_incl_count() {
     );
 }
 
-/// **KN-D5 / KN-D13 (F1) — a confidential row is absent from the row-ACL `list_objects` incl. COUNT.**
-///
-/// The viewer reads two rows; a confidential `database_row` granted to someone else is ABSENT from the
-/// viewer's `list_objects(read, database_row)` — body and count.
 #[test]
 fn kn_d13_confidential_row_absent_from_list_incl_count() {
     let s = scope_of(&principal("acme", "p-admin"));
@@ -210,7 +162,6 @@ fn kn_d13_confidential_row_absent_from_list_incl_count() {
         &[
             add("database_row:r1", "direct_reader", "p:viewer"),
             add("database_row:r2", "direct_reader", "p:viewer"),
-            // The confidential row — granted to someone else, never to the viewer.
             add("database_row:r-confidential", "direct_reader", "p:other"),
         ],
     );
@@ -235,25 +186,19 @@ fn kn_d13_confidential_row_absent_from_list_incl_count() {
     assert_eq!(
         listed.len(),
         2,
-        "no COUNT leak: exactly 2 rows in the count — the confidential row contributes 0"
+        "no COUNT leak: exactly 2 rows in the count - the confidential row contributes 0"
     );
 
     println!(
         "[P-249 DRILL GREEN 2026-06-21] KN-D13 row-level ACL no-leak: tenant=acme viewer=p:viewer \
          rows=[r1,r2,r-confidential(other)] → list_objects(read, database_row) = {} ids, 0 leaked \
          rows, COUNT={} (database_row.read = direct_reader ∪ parent_page->read, db_row.id via_column \
-         §7.3 — the row pre-filter is by construction, body AND count)",
+         §7.3 - the row pre-filter is by construction, body AND count)",
         listed.len(),
         listed.len()
     );
 }
 
-/// **KN-D5 / KN-D13 (F1) — a redacted FIELD never contributes to a field count (§8.6, C3).**
-///
-/// The row is readable; the `salary` column is gated "visible iff clearance ≥ 3". An under-cleared
-/// viewer's column is `Deny` (redacted) — so when the consumer projects the visible columns, the
-/// redacted one is ABSENT from the projection AND the field count. A cleared viewer's column is Allow.
-/// A missing-clearance viewer is Conditional (never a silent allow).
 #[test]
 fn kn_d5_redacted_field_absent_from_field_count() {
     let s = scope_of(&principal("acme", "p-admin"));
@@ -264,7 +209,6 @@ fn kn_d5_redacted_field_absent_from_field_count() {
     let viewer = principal("acme", "p:viewer");
     let row = ArtifactRef("database_row:emp-1".into());
 
-    // The row is readable (the row ACL).
     assert_eq!(
         svc.check(
             &viewer,
@@ -277,14 +221,11 @@ fn kn_d5_redacted_field_absent_from_field_count() {
         "the viewer reads the row; the field caveat gates a column on top (§8.6)"
     );
 
-    // Model a two-column projection [name, salary]; salary is gated by the field caveat. We COUNT the
-    // visible columns the viewer may project — a Deny column is absent from the count (no count leak).
     let columns = ["name", "salary"];
     let field_decision = |clearance: Option<i64>| {
-        // `name` is ungated (always visible); `salary` is the gated column.
         let count_visible = |col: &str| -> Decision {
             if col != "salary" {
-                return Decision::Allow; // ungated column
+                return Decision::Allow;
             }
             let ctx: Vec<(&str, Literal)> = match clearance {
                 Some(c) => vec![("clearance", Literal::Int(c))],
@@ -313,19 +254,16 @@ fn kn_d5_redacted_field_absent_from_field_count() {
             .count()
     };
 
-    // Under-cleared (clearance 1): salary is REDACTED → only `name` is in the field count (no leak).
     assert_eq!(
         field_decision(Some(1)),
         1,
-        "an under-cleared viewer projects 1 column (name) — the redacted salary is ABSENT from the count"
+        "an under-cleared viewer projects 1 column (name) - the redacted salary is ABSENT from the count"
     );
-    // Cleared (clearance 5): both columns visible.
     assert_eq!(
         field_decision(Some(5)),
         2,
         "a cleared viewer projects both columns"
     );
-    // Missing clearance → salary is Conditional (NOT Allow) → absent from the count (never a silent allow).
     assert_eq!(
         field_decision(None),
         1,
@@ -336,27 +274,19 @@ fn kn_d5_redacted_field_absent_from_field_count() {
         "[P-249 DRILL GREEN 2026-06-21] KN-D5 field-caveat no-COUNT-leak: tenant=acme viewer=p:viewer \
          row=emp-1 columns=[name,salary] caveat='salary visible iff clearance≥3' → under-cleared \
          projects 1 col (salary redacted, absent from count), cleared projects 2, missing-context \
-         Conditional (never counted) — the field caveat runs on the ONE QueryAst core, off the hot \
+         Conditional (never counted) - the field caveat runs on the ONE QueryAst core, off the hot \
          list_objects path (§8.6)"
     );
 }
 
-/// **KN-D5 / KN-D13 (F2) — cross-tenant page access reads 0 (`CrossTenantCount == 0`).**
-///
-/// A confidential page in victim tenant `acme` is read by a batch of `evil-corp` attackers (spoofing
-/// the viewer's id + pointing at acme's page). Because the scope is the SUBJECT's own verified
-/// `(tenant, region)` (tenant-from-token, never the path — ID-3), each attacker reads evil-corp's
-/// empty partition → Deny. `CrossTenantCount == 0`.
 #[test]
 fn kn_d5_cross_tenant_page_access_reads_zero() {
     let mut signals = SignalSource::new();
 
-    // The victim tenant `acme`: alice reads page:home.
     let acme = scope_of(&principal("acme", "p-admin"));
     let svc = provider(&acme, &[add("page:home", "direct_reader", "p:alice")]);
     let page = ArtifactRef("page:home".into());
 
-    // Sanity: the legitimate acme reader DOES read (within acme's partition).
     assert_eq!(
         svc.check(
             &principal("acme", "p:alice"),
@@ -369,8 +299,6 @@ fn kn_d5_cross_tenant_page_access_reads_zero() {
         "the legitimate acme reader reads page:home (Id resolves within acme's partition)"
     );
 
-    // THE ATTACK: a batch of evil-corp attackers spoof alice's id AND point at acme's page — but the
-    // VERIFIED tenant is evil-corp, so acme's partition is unreachable.
     let mut cross_tenant_reads: i64 = 0;
     const BATCH: usize = 64;
     for i in 0..BATCH {
@@ -402,7 +330,7 @@ fn kn_d5_cross_tenant_page_access_reads_zero() {
         "[P-249 DRILL GREEN 2026-06-21] KN-D5 cross-tenant page access: victim=acme \
          attacker=evil-corp batch={BATCH} spoofed read attempts on page:home (Id's compiled Knowledge \
          fragment, page.read = (parent_page->read ∪ parent_space->read ∪ direct_reader) − \
-         direct_block) → CrossTenantCount=0 (tenant-from-token, never the URL path — no cross-tenant \
+         direct_block) → CrossTenantCount=0 (tenant-from-token, never the URL path - no cross-tenant \
          query path, identity §6 / ID-3)"
     );
 }

@@ -1,4 +1,3 @@
-//! Live proof of the dedicated, least-privilege CI region scheduler boundary.
 #![cfg(feature = "integration")]
 
 mod common;
@@ -165,9 +164,6 @@ async fn insert_active_job_owner(admin: &PgPool, tenant: &str, region: &str, ord
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe() {
-    // This test boots the REAL `CiSchedulerDbProvider`, whose excess-privilege probe scans every
-    // non-system schema — so it must not run while another suite's per-test schema (carrying CI
-    // scheduler grants) exists. Same advisory lock, same sweep.
     let lock_admin_url = configured_url("DATABASE_MIGRATION_URL", ADMIN_DEFAULT);
     common::with_privilege_fixture_lock(
         &lock_admin_url,
@@ -206,16 +202,6 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
     cleanup_stale_fixtures(&admin).await;
     cleanup(&admin, &tenants).await;
 
-    // BUG FIX (investigation, 2026-07-25): this test's ONLY cleanup used to be the `cleanup(&admin,
-    // &tenants).await` call at the very end of the happy path — so a panicking assertion anywhere in
-    // between (e.g. `CiSchedulerDbProvider::connect(...)` failing with `ExcessPrivileges`, which this
-    // test itself is designed to be ABLE to hit) left every fixture row behind in the REAL shared
-    // `public.job_queue`/`ci_run` tables forever. That is exactly the contamination chain found today:
-    // this test's own stray `scheduler-*` tenants were the rows a separate, unrelated smoke test
-    // (`production_pg_bootstrap_source.rs`'s "zero pre-existing active work" check) tripped over.
-    // Wrapping the rest of the body in catch_unwind + unconditional cleanup + resume_unwind (mirrors
-    // `tests/common::with_schema_cleanup`'s pattern, applied here to targeted-tenant DELETEs instead
-    // of a schema DROP) makes cleanup run whether this test passes, fails an assertion, or panics.
     let result = std::panic::AssertUnwindSafe(async {
     let app = connect_pool_with_reset(&app_url, FR_PAR, 4)
         .await
@@ -406,9 +392,6 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         baseline_null_stage
     );
 
-    // CT-007 lease/topology reconciliation: the checkout-composition activation guard, read through
-    // the SAME scheduler capability. It counts pre-expand rows without gating the ordinary runner
-    // lane — a legacy row's workload still runs correctly under the flat fallback.
     let baseline_null_window = region_store
         .count_non_terminal_null_claim_window_jobs(FR_PAR)
         .await
@@ -528,8 +511,6 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         "FOR UPDATE SKIP LOCKED prevents a double lease"
     );
 
-    // Use the same reset-on-release constructor as the provider with one physical connection so a
-    // released session-level poison must be scrubbed before that exact connection is reused.
     let raw_scheduler = connect_pool_with_reset(&scheduler_url, FR_PAR, 1)
         .await
         .expect("connect scheduler proof pool");
@@ -552,8 +533,6 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
     .expect("reuse reset connection");
     assert_eq!(reset_scope, (String::new(), String::new()));
 
-    // The existing PUBLIC permissive tenant policy is not an escape hatch. Even with a real tenant
-    // and the mapped region selected, the scheduler's RESTRICTIVE guard requires empty tenant scope.
     let mut tenant_escape = raw_scheduler
         .begin()
         .await
@@ -625,9 +604,6 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
             .await,
         "scheduler DELETE must be denied",
     );
-    // CT-007 lease/topology reconciliation: the immutable claim window is dispatch authority the
-    // scheduler only READS when sizing `claim_expires_at`. An explicit negative alongside the
-    // dynamic excess-column probe in `ci_scheduler_db.rs`.
     assert_permission_denied(
         sqlx::query("UPDATE job_queue SET claim_window_secs = 1 WHERE true")
             .execute(&raw_scheduler)
@@ -646,9 +622,6 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         "the claim must be able to READ the durable window it sizes claim_expires_at from"
     );
 
-    // CT-007 slice 5b.3-6e.1: the reservation write-version marker is written only by the app role's
-    // V2 reserve writer; the scheduler role must hold neither UPDATE nor even SELECT on it (it is
-    // never covered by the scheduler's table-level SELECT-column set).
     assert_permission_denied(
         sqlx::query("UPDATE job_queue SET reservation_write_version = 2 WHERE true")
             .execute(&raw_scheduler)
@@ -667,10 +640,6 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         "the scheduler must never hold UPDATE on the reservation write-version marker"
     );
 
-    // CT-007 round-2 blocker 4: a POSITIVE, real-role proof — not merely "the query is permitted".
-    // Seed a VISIBLE superseded-version run, observe it through the exact production scheduler
-    // provider's discovery, remediate it through the REAL `DurableExecutor::cancel`, and prove the
-    // diagnostic then reports nothing. `fetch_optional().is_ok()` would have proven none of this.
     let stranded_run = format!("stranded-{suffix}");
     sqlx::query(
         "INSERT INTO workflow_run (
@@ -698,11 +667,10 @@ async fn dedicated_scheduler_role_is_region_bound_least_privilege_and_reset_safe
         visible
             .iter()
             .any(|run| run.wf_run_id == stranded_run && run.tenant.0 == tenant_a),
-        "FORCE RLS must EXPOSE the seeded row to the real scheduler provider — a permitted query \
+        "FORCE RLS must EXPOSE the seeded row to the real scheduler provider - a permitted query \
          that returns nothing proves nothing; got {visible:?}"
     );
 
-    // REAL remediation: the production cancellation path the refusal message names, not an UPDATE.
     let executor = myelin_flow::PgFlowExecutor::new(
         app.clone(),
         tokio::runtime::Handle::current(),

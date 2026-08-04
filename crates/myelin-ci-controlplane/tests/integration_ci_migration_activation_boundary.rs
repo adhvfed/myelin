@@ -1,4 +1,3 @@
-//! Live compatibility proof for splitting the legacy `ci_0004_job_queue` migration.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -55,9 +54,6 @@ async fn legacy_bundled_ci_0004_could_not_be_recorded_by_pg_migrator() {
         .await
         .expect("validate split roles for the isolated schema");
 
-    // This reconstructs the pre-split byte shape: table + all three concurrent indexes + RLS in
-    // one simple-query command. PostgreSQL treats a multi-statement command as an implicit
-    // transaction, where CREATE INDEX CONCURRENTLY is forbidden.
     let mut legacy = String::from(myelin_ci_controlplane::CREATE_JOB_QUEUE_DDL);
     legacy.push(';');
     for (_, index) in myelin_ci_controlplane::CREATE_JOB_QUEUE_INDEXES_DDL {

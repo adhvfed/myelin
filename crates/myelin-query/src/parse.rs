@@ -1,71 +1,17 @@
-//! The textual **`QueryAst` grammar parser** — compiles a predicate string
-//! (`"status == 'open' AND severity >= 3"`) into the ONE frozen [`Predicate`](crate::Predicate)
-//! tree (contract 13.3 / 3.4, X-3/OQ-C).
-//!
-//! ## What this is (the P-235 named floor, now filled)
-//! `lib.rs` named the **textual grammar parser** as the Issues/Knowledge co-owned deliverable
-//! landing in **P-235 (KN-P02)**: a string surface that compiles into the existing frozen
-//! [`Predicate`] tree + the one bounded interpreter. This module is that parser. It does **NOT**
-//! define a second predicate engine — it is a *front-end* over the one engine: it produces a
-//! [`QueryAst`](crate::QueryAst) wrapping a validated [`Predicate`], and every consumer
-//! (saved-view filters, the Bus `EventMatcher`, Notif prefs) evaluates the SAME tree through the
-//! SAME [`QueryAst::eval`](crate::QueryAst::eval). The parser validates its own output against the
-//! one static cost bound ([`QueryAst::validate`](crate::QueryAst::validate)) so a crafted string
-//! can never present an over-budget tree to the interpreter.
-//!
-//! ## The grammar (bounded, declarative — no UDFs, no loops, no recursion-to-unbounded-depth)
-//! ```text
-//! query      := or_expr
-//! or_expr    := and_expr ( ("OR"  | "or" ) and_expr )*
-//! and_expr   := not_expr ( ("AND" | "and") not_expr )*
-//! not_expr   := ("NOT" | "not" | "!") not_expr | primary
-//! primary    := "(" or_expr ")" | "true" | "false" | comparison
-//! comparison := field op value
-//! field      := IDENT ( "." IDENT )*            // a dotted field path, e.g. `payload.status`
-//! op         := "==" | "!=" | "<" | "<=" | ">" | ">="
-//! value      := STRING | INT | "true" | "false" | field   // a field-vs-field or field-vs-literal cmp
-//! STRING     := "'" ... "'" | "\"" ... "\""     // single- or double-quoted, with \\ and \' escapes
-//! INT        := -?[0-9]+
-//! ```
-//! A dotted **field path** becomes an [`Expr::Var`](crate::Expr::Var) with the dotted name (the
-//! same variable namespace `project_envelope` binds for the matcher: `event.type`,
-//! `payload.status`, …). A bare-literal value becomes an [`Expr::Lit`](crate::Expr::Lit).
-//!
-//! ## Boundedness is structural AND parse-time
-//! The recursive-descent parser is itself depth-bounded ([`MAX_PARSE_DEPTH`]) so a pathological
-//! deeply-parenthesised string is rejected at parse time (it never blows the parser stack), and the
-//! produced tree is re-validated against [`crate::MAX_PREDICATE_NODES`] /
-//! [`crate::MAX_PREDICATE_DEPTH`] before it is handed to a consumer — belt and braces.
-
 use crate::{CmpOp, Expr, Predicate, PredicateError, QueryAst};
 use myelin_identity::Literal;
 
-/// The maximum recursion depth the recursive-descent parser will descend (each `(`/`NOT` is one
-/// level). A string nesting deeper than this is rejected with [`ParseError::TooDeep`] **at parse
-/// time** — the parser stack is statically bounded, so a crafted string cannot DoS the compiler
-/// itself (defence in depth, distinct from the produced tree's [`crate::MAX_PREDICATE_DEPTH`]).
 pub const MAX_PARSE_DEPTH: usize = 64;
 
-/// A query-string parse failure. Every variant is a *precise, located* rejection — the parser
-/// fails closed (it never produces a partial/ambiguous tree), so a malformed filter surfaces a
-/// loud error rather than a silently-wrong predicate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseError {
-    /// An unexpected character at the given byte offset (e.g. a stray symbol).
     UnexpectedChar { ch: char, at: usize },
-    /// A token was expected (named) but a different one (or end-of-input) was found.
     Expected { what: &'static str, found: String },
-    /// Input ended before the expression was complete.
     UnexpectedEof,
-    /// Trailing tokens after a complete expression (the whole string must parse).
     TrailingInput { rest: String },
-    /// An unterminated string literal (no closing quote).
     UnterminatedString,
-    /// An integer literal that does not fit `i64`.
     BadInt { text: String },
-    /// The parser recursion exceeded [`MAX_PARSE_DEPTH`] (a pathological nesting depth).
     TooDeep,
-    /// The produced predicate tree exceeded the one static cost bound (re-validation after parse).
     Oversized(PredicateError),
 }
 
@@ -97,21 +43,12 @@ impl std::fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
-/// Compile a query string into the frozen [`QueryAst`] (a validated [`Predicate`] tree + the
-/// retained textual source). This is the P-235 grammar front-end over the one bounded engine — the
-/// produced AST evaluates through [`QueryAst::eval`](crate::QueryAst::eval) exactly like a
-/// directly-built tree. The whole string must parse (trailing tokens are an error), the parse depth
-/// is bounded, and the tree is re-validated against the one static cost bound.
 pub fn parse_query(src: &str) -> Result<QueryAst, ParseError> {
     let predicate = parse_predicate(src)?;
-    // Re-validate against the ONE static cost bound (belt and braces over the parse-depth guard).
     QueryAst::validate(&predicate).map_err(ParseError::Oversized)?;
-    // Preserve the textual source on the AST (observability + the placeholder-surface handle).
     Ok(QueryAst::compiled_with_source(predicate, src))
 }
 
-/// Parse a query string into the bare [`Predicate`] tree (without wrapping it in a [`QueryAst`] /
-/// retaining the source). Used by [`parse_query`] and exposed for callers that want the tree.
 pub fn parse_predicate(src: &str) -> Result<Predicate, ParseError> {
     let tokens = lex(src)?;
     let mut p = Parser {
@@ -132,15 +69,10 @@ pub fn parse_predicate(src: &str) -> Result<Predicate, ParseError> {
     Ok(pred)
 }
 
-// ───────────────────────────────────── Lexer ─────────────────────────────────────
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Tok {
-    /// An identifier piece (a field-path segment or a keyword like AND/OR/NOT/true/false).
     Ident(String),
-    /// A quoted string literal (the unescaped content).
     Str(String),
-    /// An integer literal.
     Int(i64),
     Dot,
     LParen,
@@ -252,7 +184,6 @@ fn lex(src: &str) -> Result<Vec<Tok>, ParseError> {
                 out.push(Tok::Ident(src[start..i].to_string()));
             }
             _ => {
-                // Decode the offending char for a precise error (handles multi-byte UTF-8).
                 let ch = src[i..].chars().next().unwrap_or('\u{FFFD}');
                 return Err(ParseError::UnexpectedChar { ch, at: i });
             }
@@ -261,8 +192,6 @@ fn lex(src: &str) -> Result<Vec<Tok>, ParseError> {
     Ok(out)
 }
 
-/// Lex a quoted string body (after the opening quote at `start`), honouring `\\` and `\<quote>`
-/// escapes. Returns the unescaped content + the index just past the closing quote.
 fn lex_string(bytes: &[u8], start: usize, quote: u8) -> Result<(String, usize), ParseError> {
     let mut s = String::new();
     let mut i = start;
@@ -278,7 +207,6 @@ fn lex_string(bytes: &[u8], start: usize, quote: u8) -> Result<(String, usize), 
                     s.push(quote as char);
                     i += 2;
                 }
-                // An unknown escape is preserved verbatim (backslash + char) — no surprising drops.
                 Some(&other) => {
                     s.push('\\');
                     s.push(other as char);
@@ -289,10 +217,7 @@ fn lex_string(bytes: &[u8], start: usize, quote: u8) -> Result<(String, usize), 
         } else if c == quote {
             return Ok((s, i + 1));
         } else {
-            // Copy the (possibly multi-byte) UTF-8 char through. We only ever index ASCII control
-            // bytes; non-ASCII bytes are part of a UTF-8 sequence we copy whole.
             let ch_len = utf8_len(c);
-            // SAFETY of slicing: `bytes` came from a `&str`, so a multi-byte sequence is well-formed.
             let chunk = std::str::from_utf8(&bytes[i..(i + ch_len).min(bytes.len())])
                 .map_err(|_| ParseError::UnterminatedString)?;
             s.push_str(chunk);
@@ -321,7 +246,6 @@ fn lex_int(src: &str, bytes: &[u8], start: usize) -> Result<(i64, usize), ParseE
         i += 1;
     }
     if i == digits_start {
-        // A lone `-` with no digits.
         return Err(ParseError::Expected {
             what: "an integer",
             found: "-".into(),
@@ -340,8 +264,6 @@ fn is_ident_start(c: u8) -> bool {
 fn is_ident_continue(c: u8) -> bool {
     c.is_ascii_alphanumeric() || c == b'_'
 }
-
-// ───────────────────────────────────── Parser ─────────────────────────────────────
 
 struct Parser<'a> {
     tokens: &'a [Tok],
@@ -362,7 +284,6 @@ impl<'a> Parser<'a> {
         t
     }
 
-    /// `or_expr := and_expr ( OR and_expr )*`.
     fn parse_or(&mut self) -> Result<Predicate, ParseError> {
         let mut terms = vec![self.parse_and()?];
         while self.match_keyword_or() {
@@ -375,7 +296,6 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `and_expr := not_expr ( AND not_expr )*`.
     fn parse_and(&mut self) -> Result<Predicate, ParseError> {
         let mut terms = vec![self.parse_not()?];
         while self.match_keyword_and() {
@@ -388,7 +308,6 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// `not_expr := (NOT | !) not_expr | primary`.
     fn parse_not(&mut self) -> Result<Predicate, ParseError> {
         if self.match_keyword_not() || matches!(self.peek(), Some(Tok::Bang)) {
             if matches!(self.peek(), Some(Tok::Bang)) {
@@ -405,7 +324,6 @@ impl<'a> Parser<'a> {
         self.parse_primary()
     }
 
-    /// `primary := "(" or_expr ")" | true | false | comparison`.
     fn parse_primary(&mut self) -> Result<Predicate, ParseError> {
         match self.peek() {
             Some(Tok::LParen) => {
@@ -441,7 +359,6 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// `comparison := field op value`.
     fn parse_comparison(&mut self) -> Result<Predicate, ParseError> {
         let lhs = self.parse_field()?;
         let op = self.parse_op()?;
@@ -449,7 +366,6 @@ impl<'a> Parser<'a> {
         Ok(Predicate::Cmp { op, lhs, rhs })
     }
 
-    /// `field := IDENT ( "." IDENT )*` → an [`Expr::Var`] with the dotted name.
     fn parse_field(&mut self) -> Result<Expr, ParseError> {
         let mut name = match self.bump() {
             Some(Tok::Ident(s)) => s.clone(),
@@ -497,7 +413,6 @@ impl<'a> Parser<'a> {
         Ok(op)
     }
 
-    /// `value := STRING | INT | true | false | field`.
     fn parse_value(&mut self) -> Result<Expr, ParseError> {
         match self.peek() {
             Some(Tok::Str(s)) => {
@@ -518,7 +433,6 @@ impl<'a> Parser<'a> {
                 self.bump();
                 Ok(Expr::Lit(Literal::Bool(false)))
             }
-            // A bare identifier on the RHS is a field-vs-field comparison.
             Some(Tok::Ident(_)) => self.parse_field(),
             other => Err(ParseError::Expected {
                 what: "a value (string, int, bool, or field)",
@@ -579,10 +493,8 @@ mod tests {
 
     #[test]
     fn parses_boolean_connectives_with_precedence() {
-        // AND binds tighter than OR: `a OR b AND c` == `a OR (b AND c)`.
         let ast = parse_query("status == 'closed' OR severity >= 3 AND flag == true").unwrap();
         assert_eq!(ast.eval(&ctx()), Ok(true));
-        // Parens override precedence.
         let ast2 = parse_query("(status == 'closed' OR severity >= 3) AND flag == false").unwrap();
         assert_eq!(ast2.eval(&ctx()), Ok(false));
     }
@@ -627,7 +539,6 @@ mod tests {
 
     #[test]
     fn missing_context_surfaces_not_silent_true() {
-        // The parsed tree fails closed exactly like a directly-built one.
         let ast = parse_query("status == 'open'").unwrap();
         assert_eq!(
             ast.eval(&EvalContext::new()),
@@ -657,7 +568,6 @@ mod tests {
     #[test]
     fn rejects_unexpected_char() {
         let err = parse_query("status == 'open' & flag").unwrap_err();
-        // `&` alone is not a token (only `&&` would be, which we do not accept — use AND).
         assert!(
             matches!(err, ParseError::UnexpectedChar { ch: '&', .. }),
             "got {err:?}"
@@ -676,9 +586,6 @@ mod tests {
         assert!(matches!(err, ParseError::BadInt { .. }), "got {err:?}");
     }
 
-    /// **A deeply-nested parenthesised string is rejected at PARSE time (the parser stack is
-    /// statically bounded) — it never blows the stack.** The red half of the cost-bound fixture
-    /// for the textual surface.
     #[test]
     fn rejects_overdeep_nesting_at_parse_time() {
         let deep = format!(
@@ -689,13 +596,8 @@ mod tests {
         assert_eq!(parse_query(&deep).unwrap_err(), ParseError::TooDeep);
     }
 
-    /// **A parsed predicate is re-validated against the ONE static cost bound** — a string that
-    /// expands past [`crate::MAX_PREDICATE_NODES`] is rejected (defence in depth over the
-    /// parse-depth guard). The green half: a modestly-sized expression parses fine.
     #[test]
     fn oversized_flat_expression_rejected_after_parse() {
-        // A long flat OR chain that blows the node budget but stays shallow (so the depth guard
-        // does NOT catch it — only the node re-validation does).
         let chain = std::iter::repeat_n("status == 'x'", crate::MAX_PREDICATE_NODES)
             .collect::<Vec<_>>()
             .join(" OR ");
@@ -705,13 +607,10 @@ mod tests {
             "got {err:?}"
         );
 
-        // The green half: a handful of conjoined comparisons parses + validates fine.
         let ok = "status == 'open' AND severity >= 1 AND flag == true";
         assert!(parse_query(ok).is_ok());
     }
 
-    /// **A round-trip-stable parse: the same string always compiles to the same tree** (the
-    /// golden-determinism property the Issues + Knowledge co-owners both build to).
     #[test]
     fn parse_is_deterministic() {
         let src = "status == 'open' AND (severity >= 3 OR flag == false)";

@@ -1,36 +1,3 @@
-//! # AG-D4 / CI-T1 RE-RUN on the gVisor (`runsc`) second backend (CI-P28 → P-423, M5)
-//!
-//! **Owning architecture (byte-authoritative):**
-//! `continuous-integration/architecture/02-internals-and-algorithms.md` §5.1 ("gVisor is the named
-//! second backend behind the SAME `SandboxBackend` trait — its own drill") + §5.5 (THE escape drill;
-//! the corpus + the green-attestation artifact). **Drills:**
-//! `05-refined-shared-systems-architecture/testing-strategy/01-whole-system-e2e-and-drill-catalogue.md`
-//! row **AG-D4 / CI-T1** — re-run on every backend (the PERMANENT GATE). **Contract:**
-//! `contract-index.md` row 8.4 (the escape drill re-runs on the gVisor backend). **Doctrine:**
-//! EI-04 §5.1 (a property not drilled is a CLAIM, not a fact); EI-01 §3 (prove-it — the green
-//! attestation IS the pass condition, never weaken the threshold to manufacture green).
-//!
-//! ## What this PROVES — the CI-P28 promotion
-//! The CI-P28 trigger-gated promotion. The host has rootless `runsc` (gVisor) AND `/dev/kvm` (the
-//! binding DEV-REAL policy reclassifies the sandbox-escape gate from a FLOOR to a REAL drill on this
-//! host), so gVisor is PROMOTED: the SAME seven-family adversarial corpus
-//! ([`build_gvisor_corpus_script`]) runs INSIDE a real `runsc` userspace-kernel sandbox via a
-//! hardened OCI bundle (read-only root, all caps dropped, no-new-privs, pids ceiling, NO network
-//! namespace ⇒ `--network=none` leaves only loopback). The SAME host-side parser
-//! ([`parse_console`]) over the captured gVisor console produces the SAME [`DrillReport`] gate
-//! predicate — ANY escape, any attack that did not run, or a truncated corpus ⇒ RED, and NO
-//! attestation is minted (a red AG-D4 is a dated no-go, never a weakened threshold).
-//!
-//! On a green run it emits a DATED green escape attestation with `Backend::GvisorRunsc`
-//! **exercised** (not the run-when-available residual the Firecracker drill recorded) — the 8.4
-//! permanent gate re-greened on the new backend.
-//!
-//! ## Gating (CI without runsc still passes)
-//! SKIPPED GRACEFULLY (returns early, NOT failed) when `runsc` is not on PATH or the staged minimal
-//! rootfs is absent. With `MYELIN_REQUIRE_RUNSC=1` an absent runtime/rootfs is a HARD FAILURE (no
-//! vacuous green). Run:
-//! `cargo test -p myelin-ci-sandbox --features integration --test escape_drill_gvisor_test -- --nocapture`.
-
 #![cfg(feature = "integration")]
 
 use myelin_ci_sandbox::escape_corpus::{parse_console, Backend, BackendRun, EscapeAttestation};
@@ -42,10 +9,8 @@ use myelin_ci_sandbox::{
 };
 use std::path::{Path, PathBuf};
 
-/// The drill's pids.max fork-bomb ceiling (the OCI `linux.resources.pids.limit` the bundle sets).
 const DRILL_PIDS_MAX: u32 = 64;
 
-/// Whether `runsc` resolves on PATH (env override `MYELIN_RUNSC_BIN`).
 fn runsc_bin() -> Option<String> {
     let bin = std::env::var("MYELIN_RUNSC_BIN").unwrap_or_else(|_| "runsc".to_string());
     if bin.contains('/') {
@@ -60,7 +25,6 @@ fn runsc_bin() -> Option<String> {
     None
 }
 
-/// The drill preconditions: `runsc` on PATH AND the staged minimal rootfs present.
 fn preconditions() -> Option<String> {
     let bin = runsc_bin()?;
     if !resolved_gvisor_rootfs().exists() {
@@ -69,8 +33,6 @@ fn preconditions() -> Option<String> {
     Some(bin)
 }
 
-/// The hardened JobSpec the drill derives its OCI posture from (default-deny egress ⇒ no NIC; the
-/// pids ceiling; read-only root; caps dropped — the mandatory backend-independent profile).
 fn drill_spec() -> JobSpec {
     JobSpec::new(
         JobKind::Agent,
@@ -101,22 +63,16 @@ fn drill_spec() -> JobSpec {
     .unwrap()
 }
 
-/// Stage a self-contained OCI bundle in a temp dir: a copy-free `rootfs` symlink to the staged
-/// minimal rootfs is NOT used (runsc needs a real dir as `root.path`), so we point the bundle's
-/// `rootfs` at the staged dir by writing config.json with an absolute root path. runsc requires
-/// `root.path` relative-to-bundle OR absolute; we use the bundle dir with a `rootfs` symlink.
 fn stage_bundle(spec: &JobSpec) -> PathBuf {
     let bundle = std::env::temp_dir().join(format!("myelin-agd4-gvisor-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&bundle);
     std::fs::create_dir_all(&bundle).expect("create bundle dir");
 
-    // Symlink rootfs → the staged minimal rootfs (runsc reads `root.path = "rootfs"` in the bundle).
     let rootfs_link = bundle.join("rootfs");
     #[cfg(unix)]
     std::os::unix::fs::symlink(resolved_gvisor_rootfs(), &rootfs_link)
         .expect("symlink rootfs into bundle");
 
-    // Write the corpus script into the bundle's rootfs (it runs as the container entrypoint).
     let script = build_gvisor_corpus_script(DRILL_PIDS_MAX);
     std::fs::write(
         resolved_gvisor_rootfs().join(GVISOR_CORPUS_SCRIPT),
@@ -124,14 +80,12 @@ fn stage_bundle(spec: &JobSpec) -> PathBuf {
     )
     .expect("write corpus script into rootfs");
 
-    // Write the hardened OCI config.json (read-only root, caps dropped, nnp, pids ceiling, no netns).
     let cfg =
         gvisor_drill_config_json(spec, GVISOR_CORPUS_SCRIPT).expect("build hardened OCI config");
     std::fs::write(bundle.join("config.json"), cfg).expect("write config.json");
     bundle
 }
 
-/// Where the dated green attestation artifact is written (the form AG-P17 / P-229 consumes).
 fn attestation_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -160,23 +114,13 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
         return;
     };
 
-    // 1) Build + stage the hardened OCI bundle (the SAME mandatory profile, gVisor's mechanism).
     let spec = drill_spec();
     let bundle = stage_bundle(&spec);
     let container_id = format!("myelin-agd4-{}", std::process::id());
 
-    // 2) Run the corpus INSIDE a REAL runsc (gVisor) sandbox. --network=none ⇒ only loopback exists
-    //    (egress closed); --rootless runs without sudo. The corpus prints per-attack markers to
-    //    stdout, which we capture for the SAME host-side parser the Firecracker drill uses.
-    //
-    //    CT-003b (SI-017): the corpus now carries the anon-memory hog (Mx_memhog). rootless runsc
-    //    does NOT enforce the OCI memory.limit, so — exactly as the production launch() does — we
-    //    place the runsc process tree into an OUT-OF-BAND host memory cgroup (the SAME
-    //    `MemoryCgroup` helper the production path uses; no forked enforcer). Without it the hog
-    //    would HELD an oversized anonymous allocation ⇒ ESCAPED ⇒ the drill would (correctly) go RED.
     let cgroup = MemoryCgroup::create(spec.limits.mem_bytes, spec.limits.cpu_millis).expect(
         "[AG-D4 gVisor] the resource cgroup MUST be establishable to contain the anon-memory hog \
-         and bound CPU (cgroup v2 + delegated `memory` and `cpu` controllers) — fail-closed \
+         and bound CPU (cgroup v2 + delegated `memory` and `cpu` controllers) - fail-closed \
          otherwise (SI-017)",
     );
     let mut cmd = std::process::Command::new(&bin);
@@ -193,7 +137,6 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
         .output()
         .expect("run the corpus inside a real runsc sandbox");
     cgroup.cleanup();
-    // Best-effort teardown (idempotent; the container has exited).
     let _ = std::process::Command::new(&bin)
         .arg("--rootless")
         .arg("delete")
@@ -214,20 +157,17 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
     }
     println!("=== (runsc exit_code={:?}) ===", out.status.code());
 
-    // Sanity: the corpus ran inside the gVisor kernel (uname reports the gVisor kernel string).
     assert!(
         console.contains("gvisor") || console.contains("CORPUS_BEGIN"),
         "the corpus must have run inside a REAL runsc sandbox.\n--- console ---\n{console}"
     );
 
-    // 3) OBSERVE containment — parse the REAL console. No hardcoded green; ONE gate predicate.
     let report = parse_console(&console);
     println!("{}", report.summary());
 
-    // THE HARD GATE, re-run on the gVisor backend. ANY escape / did-not-run / truncation ⇒ RED.
     assert!(
         report.is_green(),
-        "AG-D4 / CI-T1 is RED on the gVisor backend — a DATED NO-GO, NOT a weakened threshold. \
+        "AG-D4 / CI-T1 is RED on the gVisor backend - a DATED NO-GO, NOT a weakened threshold. \
          escapes={} did_not_run={} corpus_completed={}.\n{}\n--- full console ---\n{}",
         report.escapes(),
         report.did_not_run(),
@@ -236,9 +176,6 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
         console
     );
 
-    // 4) Emit the DATED GREEN ESCAPE ATTESTATION with gVisor EXERCISED (the CI-P28 re-green). The
-    //    gate-backend stays Firecracker (the production default); gVisor is the named SECOND backend
-    //    now proven (exercised: true) — not the run-when-available residual the FC drill recorded.
     let backends = vec![BackendRun {
         backend: Backend::GvisorRunsc,
         exercised: true,
@@ -249,8 +186,6 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
         date.clone(),
         &report,
         backends,
-        // The GATE backend for the platform remains Firecracker (the production default for untrusted
-        // code, arch §5.1); this artifact PROVES the SECOND backend also contains the full corpus.
         Backend::GvisorRunsc,
         "gvisor-rootfs-busybox",
         "gvisor-kernel-runsc",
@@ -286,7 +221,6 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
          second backend (the permanent gate re-runs per backend)."
     );
 
-    // Final structural assertions on the artifact (the consumer's contract).
     assert_eq!(attestation.total_escapes, 0);
     assert!(
         attestation

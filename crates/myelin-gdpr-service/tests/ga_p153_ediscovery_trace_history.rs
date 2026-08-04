@@ -1,19 +1,3 @@
-//! # GATE / DRILL — P-GA-26 (→ P-153): eDiscovery inclusion proof + trace≠audit + history-rewrite skeleton
-//!
-//! **DATED GREEN ARTIFACT (2026-06-20).** This drill is the dated green artifact the P-GA-26 GATE
-//! requires (the GDPR prompts record their drill artifacts as the test itself — there is no separate
-//! scorecard file; the green is a passing, committed test, EI-01 §3 prove-it). It proves the three
-//! GATE rows the scorecard names ("eDiscovery inclusion proof; trace≠audit"):
-//!
-//! 1. **eDiscovery export carries an inclusion proof against the Merkle tree + is legal-hold-frozen**
-//!    (gdpr §5.4) — a subject-scoped export verifies record-by-record against the per-tenant audit
-//!    tree's signed tree head, and the scope is frozen by a legal hold so a concurrent erase defers.
-//! 2. **The agent-trace H17 seam is distinct from the audit log** (gdpr §3.2 H17 / §6.5) — different
-//!    holder id, different H-number, different erase mechanism (trace = erasable; audit = retain
-//!    carve-out).
-//! 3. **The history-rewrite skeleton is a resumable, idempotent activity** (gdpr §6.6) — a crash
-//!    mid-drive re-runs ONLY the un-receipted phases; the invalidation fan-out is the named M5 floor.
-
 use myelin_events::{
     Actor, AggregateKey, CorrelationId, DataRole, EventEnvelope, EventHandler, EventId, EventType,
     Timestamp, Visibility,
@@ -58,7 +42,6 @@ fn action(id: &str, tenant: &str, subject: &str) -> EventEnvelope {
     }
 }
 
-/// GATE row 1 — **eDiscovery export is inclusion-proof-bearing + legal-hold-frozen** (gdpr §5.4).
 #[test]
 fn gate_ediscovery_export_is_inclusion_proof_bearing_and_legal_hold_frozen() {
     let authority = AuditAuthority::new(CellSigningKey::from_seed("cell:fr-par:audit-key"));
@@ -76,7 +59,6 @@ fn gate_ediscovery_export_is_inclusion_proof_bearing_and_legal_hold_frozen() {
         .export(&scope, "2026-06-20T01:00:00Z")
         .expect("export");
 
-    // INCLUSION PROOF: every record verifies against the bundle STH (the Merkle tree root).
     assert!(
         bundle.verify(authority.key()),
         "the bundle verifies end-to-end"
@@ -90,7 +72,6 @@ fn gate_ediscovery_export_is_inclusion_proof_bearing_and_legal_hold_frozen() {
     }
     assert_eq!(bundle.record_count(), 2, "both u-A records");
 
-    // LEGAL-HOLD-FROZEN: a concurrent erase over the scope is now deferred.
     assert!(bundle.legal_hold_frozen);
     let principal = Principal::stub(
         PrincipalId("u-A".into()),
@@ -108,17 +89,14 @@ fn gate_ediscovery_export_is_inclusion_proof_bearing_and_legal_hold_frozen() {
     );
 }
 
-/// GATE row 2 — **the agent-trace H17 seam is distinct from the audit log** (gdpr §3.2 H17 / §6.5).
 #[test]
 fn gate_agent_trace_seam_is_distinct_from_the_audit_log() {
     assert!(trace_is_distinct_from_audit(), "trace ≠ audit");
     let seam = AgentTraceHolderSeam::new();
     assert_eq!(seam.holder_id(), AGENT_TRACE_HOLDER_ID);
-    // It is a trailing derived-copy holder (erased after identity + per-subject DEK).
     assert!(agent_trace_phase() > myelin_gdpr_service::CanonicalErasePhase::CryptoShredDek);
 }
 
-/// GATE row 3 — **the history-rewrite skeleton is a resumable, idempotent activity** (gdpr §6.6).
 #[test]
 fn gate_history_rewrite_skeleton_is_a_resumable_idempotent_activity() {
     let activity = HistoryRewriteActivity::new();
@@ -136,7 +114,6 @@ fn gate_history_rewrite_skeleton_is_a_resumable_idempotent_activity() {
         "audited as git.history_rewrite"
     );
 
-    // Crash mid-drive losing phase 2+ → re-drive re-runs ONLY the un-receipted phases.
     activity.simulate_crash_losing(RewritePhase::CryptoShredPackTier);
     activity.drive(&request);
     assert_eq!(
@@ -150,9 +127,6 @@ fn gate_history_rewrite_skeleton_is_a_resumable_idempotent_activity() {
         "phase 2 re-ran once"
     );
 
-    // P-451 (P-GA-35) PROMOTED the invalidation fan-out from the M5 floor to a live mechanism — no
-    // phase is a deferred floor on the first-class op; the residual is still named, not pretended-
-    // solved, and now names the outbound push-mirror residency gate (GA-11, P-GA-36).
     let invalidate = first
         .phase_receipts
         .iter()

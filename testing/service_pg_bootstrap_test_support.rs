@@ -1,5 +1,3 @@
-//! Shared deployment assertions for service production binaries.
-
 pub fn assert_split_role_source(source: &str, service_migration: &str, serve_call: &str) {
     assert!(source.contains("PgBootstrap::from_env(Mode::RequireEnv)"));
     assert!(!source.contains("Mode::DevDefaults"));

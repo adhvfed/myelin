@@ -1,16 +1,3 @@
-//! # The edge HTTPS client — present the Bearer capability token, parse the envelopes.
-//!
-//! The CLI is an edge CLIENT: it calls the MR-014 gateway's `/v1/...` routes over HTTP/1.1 (hyper
-//! 1.x directly — the SAME minimal transport stack the edge uses; no reqwest), presenting the
-//! capability token as `Authorization: Bearer <token>` + the `x-myelin-token-scheme` the gateway
-//! reads. It parses the uniform `{items,page}` list envelope and the `{error:{message,code}}` error
-//! envelope, and maps a `401` to a clean [`CliError::Unauthorized`] (NOT a panic).
-//!
-//! Remote endpoints require certificate-verified HTTPS. Plain HTTP is allowed only for loopback
-//! development (`localhost`, `127.0.0.0/8`, or `::1`), so a configuration typo cannot send a bearer
-//! capability over a clear-text network. The token is NEVER logged: it is placed only in the
-//! `Authorization` header; no error path interpolates it, and the header is not printed.
-
 use crate::config::EdgeConfig;
 use crate::dispatch::EdgeCall;
 use crate::error::CliError;
@@ -33,8 +20,6 @@ struct Target {
     authority: String,
 }
 
-/// Parse the base URL + call into an absolute request target. HTTPS is the production path. HTTP is
-/// intentionally limited to loopback so bearer material never crosses a clear-text network.
 fn target(config: &EdgeConfig, call: &EdgeCall) -> Result<Target, CliError> {
     let base = config.url.trim_end_matches('/');
     if !(base.starts_with("https://") || base.starts_with("http://")) {
@@ -103,18 +88,10 @@ fn is_loopback_host(host: &str) -> bool {
             .is_ok_and(|ip| ip.is_loopback())
 }
 
-/// **Run an [`EdgeCall`] against the edge** with the Bearer capability token, returning the parsed
-/// JSON body on success. Total: a connect/transport failure is [`CliError::Transport`]; a `401` is
-/// [`CliError::Unauthorized`]; any other non-2xx with the `{error:{message}}` envelope is
-/// [`CliError::Edge`]. No panic, ever.
 pub async fn execute(config: &EdgeConfig, token: &str, call: &EdgeCall) -> Result<Value, CliError> {
     execute_with_limits(config, token, call, REQUEST_DEADLINE, MAX_RESPONSE_BYTES).await
 }
 
-/// Open a long-lived authenticated SSE response. The deadline covers only request construction and
-/// receipt of response headers; once a valid stream is open, its lifetime belongs to the caller.
-/// Non-success statuses are returned intact so the CI consumer can distinguish retention-stale 409
-/// from terminal authorization/input failures.
 pub async fn open_event_stream(
     config: &EdgeConfig,
     token: &str,
@@ -186,9 +163,6 @@ async fn execute_with_limits(
     }
     let target = target(config, call)?;
     let connector = HttpsConnectorBuilder::new()
-        // The workspace also carries ring through unrelated consumers. Select this client's
-        // provider explicitly so rustls never has to guess a process-global default from unified
-        // Cargo features (which would panic before either an HTTP or HTTPS request is sent).
         .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())
         .map_err(|e| CliError::Transport(format!("load native TLS trust roots: {e}")))?
         .https_or_http()
@@ -201,8 +175,6 @@ async fn execute_with_limits(
         .uri(&target.uri)
         .header("host", &target.authority)
         .header("accept", "application/json")
-        // The Bearer capability token + the scheme the gateway reads. The token is presented ONLY
-        // here; it is never logged.
         .header("authorization", format!("Bearer {token}"))
         .header("x-myelin-token-scheme", &config.scheme);
     let payload = call.payload.clone().unwrap_or_default();
@@ -726,8 +698,6 @@ fn malformed_ci_error(reason: impl Into<String>) -> CliError {
     ))
 }
 
-/// Map an HTTP `(status, body)` to a success value or a typed [`CliError`], parsing the
-/// `{error:{message,code}}` envelope. Separated so it is unit-testable without a socket.
 pub fn interpret(status: u16, body: Value) -> Result<Value, CliError> {
     if (200..300).contains(&status) {
         return Ok(body);
@@ -960,17 +930,14 @@ mod tests {
 
     #[test]
     fn interpret_maps_status_to_typed_errors() {
-        // 2xx → the body.
         let ok = interpret(200, json!({"items":[]})).unwrap();
         assert_eq!(ok["items"], json!([]));
-        // 401 → Unauthorized (exit 3), carrying the envelope message (no token in it).
         let e = interpret(
             401,
             json!({"error":{"message":"authentication required","code":"unauthorized"}}),
         )
         .unwrap_err();
         assert_eq!(e.code(), 3);
-        // a 404 → Edge with the parsed code/message (exit 1).
         let e = interpret(
             404,
             json!({"error":{"message":"no such pull request","code":"not_found"}}),
@@ -988,7 +955,6 @@ mod tests {
             }
             other => panic!("expected Edge, got {other:?}"),
         }
-        // a non-2xx with no envelope does not panic.
         assert!(interpret(500, Value::Null).is_err());
     }
 

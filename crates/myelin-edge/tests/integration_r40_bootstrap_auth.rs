@@ -1,25 +1,3 @@
-//! # R4.0 item B — the operator BOOTSTRAP mints a token that AUTHENTICATES against a composed edge.
-//!
-//! The founder-dogfood exit for the JSON surface, proven against LIVE Postgres (`--features integration`):
-//! the DURABLE cell token authority (`load_or_generate` from `cell_token_root`) + the durable S1 store
-//! (`with_pg`) + the `edge bootstrap` library body ([`bootstrap_principal_and_mint`]) compose so a
-//! minted capability token, presented as a Bearer credential to a SEPARATELY-composed [`Gateway`] over
-//! the SAME durable stores, authenticates and drives the real product handlers:
-//!   1. `GET /v1/whoami` → 200, resolving to the bootstrapped principal;
-//!   2. `POST /v1/git/repos` (create) → 201;
-//!   3. `POST .../blob/...` (web-edit commit) → 200 → a head oid;
-//!   4. `POST .../prs` (open) → 201, `POST .../prs/1/reviews` (review) → 200, `POST .../prs/1/merge` → 200.
-//!
-//! Plus: **bootstrap is idempotent** — a second run for the SAME principal mints a NEW token (distinct
-//! jti) without corrupting the principal, and BOTH tokens authenticate.
-//!
-//! Run (dev docker stack up):
-//!   DATABASE_URL=postgres://… DATABASE_MIGRATION_URL=postgres://… \
-//!     cargo test -p myelin-edge --features integration \
-//!     --test integration_r40_bootstrap_auth -- --nocapture
-//!
-//! Skips gracefully if `DATABASE_URL` is unset (hermetic without a DB). The live path migrates with
-//! the admin credential, closes it, and drives every store through the constrained runtime pool.
 #![cfg(feature = "integration")]
 
 use myelin_config::{Mode, MyelinConfig};
@@ -65,7 +43,6 @@ fn now_unix() -> i64 {
         .as_secs() as i64
 }
 
-/// A minimal HTTP/1.1 request over a raw TcpStream (no client dep): returns `(status, body_json)`.
 fn http(
     addr: SocketAddr,
     method: &str,
@@ -138,8 +115,6 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     let seal = SealKey::from_encoded(SEAL_HEX).expect("seal key");
     let cell_id = format!("cell-r40b-{}", uniq());
 
-    // The DURABLE KMS + the DURABLE cell token authority (the R4.0 make-or-break) — both sealed under
-    // the same key, both recovered from PG.
     let kms = Arc::new(
         DurableKmsBacking::new(provider.db_pool().clone(), &cell_id)
             .load_or_generate(&seal)
@@ -152,7 +127,6 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
         .expect("cell-root load_or_generate");
     let cell = Arc::new(CellTokenAuthority::from_material(&cell_material).expect("cell authority"));
 
-    // The durable S1 store the bootstrap seeds into (and the serving edge resolves through).
     let store = PrincipalStore::with_pg(
         kms.clone(),
         DurablePrincipalBacking::new(provider.clone()),
@@ -169,7 +143,6 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
         display: Some("The Founder"),
         ttl_days: 30,
     };
-    // (B1) bootstrap — seed + mint. (B2) idempotent re-run — a NEW token, distinct jti, same principal.
     let out1 = bootstrap_principal_and_mint(&store, &tuples, &cell, &params, now_unix())
         .expect("bootstrap #1");
     let out2 = bootstrap_principal_and_mint(&store, &tuples, &cell, &params, now_unix())
@@ -180,8 +153,6 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     );
     assert_eq!(out1.principal_id, "founder");
 
-    // A FRESH tuple-store handle proves the grant is durable. Re-bootstrap converges on exactly one
-    // project reader edge and grants no other project/relation.
     let founder = Principal::new(
         TenantId::from_token(tenant.clone()),
         Region::new(REGION),
@@ -206,8 +177,6 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     assert_eq!(durable_edges[0].tuple.relation.0, "reader");
     assert_eq!(durable_edges[0].tuple.subject.0, "founder");
 
-    // The product still goes through the ordinary may_create check: the exact project is admitted,
-    // while an ungranted project remains denied.
     let issue_check = StoreBackedCheck::new(restarted_tuples);
     for verdict in issue_check.admit_issue_fragment() {
         assert!(matches!(
@@ -219,11 +188,6 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     assert!(issue_authorizer.may_create(&founder, ISSUES_PROJECT));
     assert!(!issue_authorizer.may_create(&founder, "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"));
 
-    // Compose a serving Gateway over the SAME durable stores + the SAME cell trust anchor, exactly as
-    // production `serve()` authenticates (a SEPARATE PrincipalStore handle over the same PG backing,
-    // the durable revocation store, the real PASETO verifier). The git backend is the in-memory test
-    // double (AllowAllRepos) so the bootstrap TOKEN drives the real product handlers without the
-    // per-object ReBAC composition (proven separately) — the point here is the AUTH loop.
     let authn = Arc::new(CapabilityAuthenticator::with_verifier(
         PrincipalStore::with_pg(
             kms.clone(),
@@ -257,18 +221,15 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
 
     let token = &out1.token;
 
-    // (1) whoami — the token authenticates + resolves the bootstrapped principal.
     let (st, who) = http(addr, "GET", "/v1/whoami", token, None);
     assert_eq!(st, 200, "the bootstrap token authenticates whoami: {who}");
     assert_eq!(who["principal_id"], "founder");
     assert_eq!(who["tenant"], tenant.as_str());
     assert_eq!(who["region"], REGION);
 
-    // The SECOND token also authenticates (idempotent bootstrap did not corrupt the principal).
     let (st2, _who2) = http(addr, "GET", "/v1/whoami", &out2.token, None);
     assert_eq!(st2, 200, "the re-minted token also authenticates");
 
-    // (2) create a repo.
     let (st, cr) = http(
         addr,
         "POST",
@@ -278,7 +239,6 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     );
     assert_eq!(st, 201, "the token creates a repo: {cr}");
 
-    // (3) a web-edit commit on a feature ref → a head oid.
     let (st, wv) = http(
         addr,
         "POST",
@@ -292,8 +252,6 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
         .expect("web-edit commit returns a new_oid")
         .to_string();
 
-    // (4) open a PR against an UNPROTECTED base ref (required_approvals defaults to 0 there), review,
-    //     and merge — all with the ONE bootstrap token (the creator is authorized for every verb).
     let open_body = format!(
         r#"{{"title":"first PR","base_ref":"refs/heads/dev","head_ref":"refs/heads/feature","head_oid":"{head_oid}"}}"#
     );
@@ -328,7 +286,6 @@ async fn bootstrap_token_authenticates_and_drives_the_product_surface() {
     );
     assert_eq!(mg["applied"]["merged"], true, "the PR merged: {mg}");
 
-    // cleanup the durable cell-infra + principal rows for this test's cell/tenant.
     let pool = provider.db_pool();
     let _ = sqlx::query("DELETE FROM cell_token_root WHERE cell_id = $1")
         .bind(&cell_id)

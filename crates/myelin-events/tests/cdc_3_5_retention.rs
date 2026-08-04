@@ -1,21 +1,6 @@
-//! # CDC — contract 3.5 firehose retention-window tuning (EB-30 / P-439, M5)
-//!
-//! **Contract-index:** row 3.5 (the firehose transport + resume-cursor protocol). EB-30 HARDENS this
-//! contract by closing the named M2 retention-window floor with the MEASURED per-stream-class numbers.
-//!
-//! This is the consumer/provider conformance for the retention-window TUNING: the workspace
-//! `thresholds.toml` (`[firehose_retention]`) is the versioned SOURCE OF TRUTH for the measured
-//! windows; `retention::StreamClass::tuning()` is the in-code expression a `Firehose::for_stream_class`
-//! opens a window from. This CDC asserts the two are byte-for-byte in lock-step — so a future
-//! hand-edit of the file that drifts from the code (or vice versa) fails HERE, never silently at
-//! runtime. It ALSO re-asserts the §4.3 headline invariant (window > p99 reconnect gap, with
-//! headroom) from the FILE's numbers, so the measured-data assertion holds on the recorded source of
-//! truth, not just the in-code copy.
-
 use myelin_events::{RetentionTuning, StreamClass};
 use serde::Deserialize;
 
-/// One `[[firehose_retention]]` row in `thresholds.toml` (the versioned source of truth).
 #[derive(Debug, Deserialize)]
 struct RetentionRow {
     class: String,
@@ -29,9 +14,7 @@ struct ThresholdsFile {
     firehose_retention: Vec<RetentionRow>,
 }
 
-/// Load + parse the workspace-root `thresholds.toml` (the single versioned source of truth, P-S22).
 fn load_thresholds() -> ThresholdsFile {
-    // tests run with CWD = the crate dir; the workspace root is two levels up (crates/<crate>/).
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
@@ -41,9 +24,6 @@ fn load_thresholds() -> ThresholdsFile {
     toml::from_str(&raw).expect("thresholds.toml parses as the expected shape")
 }
 
-/// **CDC: every `retention::StreamClass` has a `[[firehose_retention]]` row in `thresholds.toml`, and
-/// the row's numbers EQUAL the in-code `tuning()` measured numbers (the file is the source of truth,
-/// kept in lock-step with the code).** A drift in either direction fails here.
 #[test]
 fn thresholds_file_firehose_retention_matches_the_code_tuning() {
     let file = load_thresholds();
@@ -84,9 +64,6 @@ fn thresholds_file_firehose_retention_matches_the_code_tuning() {
     }
 }
 
-/// **CDC: the §4.3 invariant (window EXCEEDS the measured p99 reconnect gap, with headroom) holds on
-/// the FILE's recorded numbers — not just the in-code copy.** The recorded source of truth is itself
-/// valid; a hand-edit shrinking a recorded window below its recorded p99 gap fails here.
 #[test]
 fn thresholds_file_windows_exceed_the_recorded_p99_gap_with_headroom() {
     let file = load_thresholds();

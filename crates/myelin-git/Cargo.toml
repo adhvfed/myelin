@@ -5,197 +5,44 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-git is a SUBSYSTEM (producer) crate, NOT a node in the eleven-crate library DAG
-# modelled by `myelin-substrate::crate_graph` (architecture 00 §2.9). Like the service crates
-# (myelin-identity-service, myelin-gdpr-service) it is a LEAF CONSUMER above the shared glue
-# crates: it depends on the frozen contract surfaces (gdpr/PersonalDataHolder + the
-# #[personal_data] classify-derive, tenancy partition keys, identity Principal) and NOTHING in
-# the production library DAG depends back on it. `substrate_is_root()` / `identity_is_sink()`
-# in crate_graph.rs are preserved (a subsystem crate is the graph's terminal consumer).
-#
-# At GIT-P3 (P-063) this crate carries ONLY: the H1 holder-INTENT declaration + the
-# #[personal_data(...)] classification tags on the (still-skeletal) git schema types, so the
-# no-untagged-personal-data lint (contract 10.2 / 1.6) is GREEN from the first migration
-# (GIT-P8). No git FEATURE ships here — the holder is OPENED + auto-registered in GIT-P8 (M3-G1).
 [dependencies]
-# The GDPR contract surface (contract 10.1 PersonalDataHolder + contract 10.2 the
-# #[personal_data] classify-derive + the five tag enums). Consumed, not provided here.
 myelin-gdpr = { path = "../myelin-gdpr" }
-# The canonical (tenant, region) partition keys threaded through every git schema row.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# Principal — the verified subject reference the holder's locate/erase key on (via SubjectRef).
 myelin-identity = { path = "../myelin-identity" }
-# The Bus event-taxonomy grammar validator + token table (contract 2.9 / EB-02). GIT-P2 (P-124)
-# REGISTERS git's complete `git.*` token list and PROVES each grammatical against this one validator
-# — git registers, it does not author the grammar (no second token language; the names anchor X-5).
-# A producer LEAF depending on the events glue crate is a sanctioned edge: `myelin-events` is a
-# shared contract carrier and NOTHING in the production DAG depends back on `myelin-git` (the §2.9
-# graph stays acyclic — `substrate_is_root()` / `identity_is_sink()` are unaffected).
 myelin-events = { path = "../myelin-events" }
-# The one Refs library (contract 5.1/5.7) — the `ArtifactRef` codec + the frozen unified `#sub`
-# grammar + the `mint`/`SubKind`/`SubKindRegistration` registration surface. GIT-P4 (P-230) REGISTERS
-# the `#sub` kinds git owns (comment-/thread-/L<a>-L<b>) with Refs and mints grammatical sub-URNs
-# through this one codec — git mints, Refs owns the grammar (no second URN language, REF-3). Refs is
-# a shared glue crate that does NOT depend back on git (the §2.9 DAG stays acyclic).
 myelin-refs = { path = "../myelin-refs" }
-# The durable-workflow substrate (contract 9.1/9.2/9.4) — `WfCtx::run_merge_attempt` + the
-# `ci.result`-waiting merge-queue BODY (the generic durable mechanics: dispatch+reserve, park on
-# ci.result, merge-or-dequeue, exactly-once-on-merge_attempt_id). GIT-P23 (P-285, M3-G4) COMPOSES
-# that body — it does NOT re-implement it (EI-01 §7): Git owns the merge-queue's Git-specific seams
-# (the `MergePerformer` that runs the §6.2 merge gate + the §6.3 fork-endorsement before merging) and
-# drives the GIT-D10 aggregate against the flow `MockCiResultProducer` (the synthetic producer; CI's
-# real producer is M4/EB-27). `myelin-flow` is a shared durable-execution substrate that does NOT
-# depend back on `myelin-git` (the §2.9 DAG stays acyclic — verified: flow's Cargo.toml carries no
-# myelin-git edge); Git reads its OWN check_status projection and NEVER synchronously calls CI
-# (no-cross-sync-cycle, X-1 / EI-02 §3).
 myelin-flow = { path = "../myelin-flow" }
-# The Search indexing-contract surface (contract 6.3 declare_indexable / IndexSpec). GIT-P5 (P-231)
-# REGISTERS git's owned code-projection spec — the `git.*` blob projection shape — by constructing
-# the frozen `myelin_search::IndexSpec` and proving it serializes to the 6.3 wire shape. Git declares
-# its spec; Search owns the IndexSpec type (no second indexing-contract shape, EI-01 §7). The EMITTER
-# that feeds the projection at push time is the GIT-P25 follow-on. `myelin-search` is a sibling
-# subsystem/glue crate that does NOT depend back on `myelin-git` (the §2.9 DAG stays acyclic).
 myelin-search = { path = "../myelin-search" }
-# The frozen FieldType enum (contract 13.3) — the structured/columnar facet taxonomy git's
-# code-projection `struct_fields` (path/language/blob_oid) are typed over. Owned by Search/Query, not
-# re-defined here.
 myelin-query = { path = "../myelin-query" }
-# The FROZEN myelin-content markdown-subset + the three structured inline nodes (contract 13.1,
-# X-2/OQ-B). GIT-P17 (P-278, M3-G3): Git PR/review/comment BODIES are a `myelin-content` document —
-# the markdown-subset string + the positional `mention`/`artifact_ref`/`embed` nodes — round-tripped
-# through the ONE editor render path (`render(parse(md)) === md`), and the three inline ref nodes
-# produce `refs.edge.created` uniformly via the outbox (5.4). Git CONSUMES the frozen subset; Knowledge
-# leads/freezes the taxonomy (no second content model, EI-01 §7). `myelin-content` is the Knowledge
-# data-model LEAF (it depends on no subsystem crate and NOTHING in the production DAG depends back on
-# it); a producer LEAF (`myelin-git`) consuming the frozen shared content shape is an acyclic sanctioned
-# edge (mirrors the `myelin-refs` / `myelin-search` / `myelin-notif` edges this crate already carries).
 myelin-content = { path = "../myelin-content" }
-# The Notif registration seam (contract 7.6 define_notif_rule + the read-fanout WatcherResolvePort,
-# 4.3/4.10). GIT-P19 (P-263) is producer accretion: Git REGISTERS its define_notif_rule set
-# (review_requested / mentioned) by constructing the frozen `myelin_notif::NotifRule` values + wires
-# its REAL PR-watcher reverse index behind the frozen `myelin_notif::WatcherResolvePort` — Git
-# registers/produces, Notif owns the seam (ZERO Notif code change, the inverse-signal property,
-# EI-01 §1). `myelin-notif` is a NAMED leaf CONSUMER (it depends on no subsystem crate and NOTHING in
-# the production DAG depends back on it); a producer LEAF (`myelin-git`) calling its public
-# registration seam is an acyclic sanctioned edge (mirrors the `myelin-search` declare_indexable +
-# `myelin-refs` mint edges this crate already carries). Notif's `Reason`/`Class`/`NotifRule`/
-# `WatcherResolvePort` are consumed, never re-defined (the names anchor X-5).
 myelin-notif = { path = "../myelin-notif" }
 serde.workspace = true
-# JSON for the LIVE check-seam consumer leg (EB-26 / P-246, M3): Git decodes the OPAQUE
-# `ci.check.updated` payload (`myelin_events::check_seam::OrderedCheck::check_status`, carried as a
-# `serde_json::Value`) into the typed `CheckStatus` consumer view in `CheckStatusConsumer::handle`.
-# A runtime edge now (the consumer is wired), not just test scaffolding — the same serde_json the
-# rest of the workspace pins.
 serde_json.workspace = true
 
-# DEV-REAL data layer (GIT-P20 / P-281, M3) — the store-backed `check_status` projection. The Postgres
-# driver + async runtime are production dependencies; only the dev config helper is pulled by
-# `--features integration`. The live `check_status`
-# table + the same-tx idempotent-on-`event_id` + monotonic supersession apply (contract 5.9 / X-1 §6.1)
-# is proven against the dev Postgres stack by `tests/integration_git_d10_check_status_projection.rs`.
 sqlx.workspace = true
 tokio.workspace = true
 myelin-config.workspace = true
 
-# BLAKE3 content-addresses the IMMUTABLE git commit object (GIT-P25 / P-ID-25, M3): the commit OID
-# is `blake3:<hex>` over the canonical commit bytes — the SAME multihash convention the GDPR holder
-# Receipt + the BlobStore content-address use (one digest convention across the platform, never a
-# hand-rolled hash). The OID is computed OVER the pseudonymous author/committer line, so the property
-# the GIT-D2 drill proves (no recoverable real identity in the immutable bytes) is anchored in the
-# content-address itself.
 blake3.workspace = true
 hex.workspace = true
-# Opaque Git-ref pagination cursors use canonical unpadded base64url framing. The decoded frame is
-# strictly bounded and versioned; BLAKE3 supplies its repository/query scope and namespace fence.
 base64 = "0.22"
 
-# git2 (libgit2) — the in-process READ backend of the GitCore layered seam (GIT-P8 / P-269,
-# arch 01 §2.2). The architecture-NAMED fallback (gix-preferred is the OQ-1 floor, GIT-P33), used
-# here because gix 0.84 does not compile on the workspace toolchain. A real in-process read/diff/
-# blame path — NOT a `git` fork (no-host-exec holds by construction). default-features=false +
-# vendored-libgit2: in-process object-DB reads only, no SSH/HTTPS transport, C lib built in-tree
-# (self-contained / EU-deployable). Part of the default build (an in-process library like tantivy);
-# does NOT touch a DB/object-store/cache/bus contract, so the build stays DB-free.
 git2.workspace = true
-# Cross-process per-ref linearisation locks for durable receive-pack. Already pinned in Cargo.lock;
-# its safe API preserves this crate's `forbid(unsafe_code)` boundary.
 fs4 = "0.13"
 
-# The content-addressed object backing — the `BlobStore` trait + the local-disk git PACK TIER
-# (`GitPackTier<B: BlobStore>` + `RepoGitPlacement`, contract 11.2 / storage §3.5, shipped by P-252).
-# GIT-P11 (P-272, M3) lands the git-SIDE pack tier ON TOP of this storage seam: the quarantine→object
-# migration writes accepted objects THROUGH the trait, and the commit-graph/bitmap/MIDX maintenance
-# artifacts ride the same content-addressed backing. REUSED, never re-defined (EI-01 §7) — the git
-# side owns the acceleration structures + the clone round-trip; storage owns the byte addressing +
-# the region-pinned relocatable placement. `myelin-storage` is a shared glue crate that does NOT
-# depend back on `myelin-git` (the §2.9 DAG stays acyclic; the build stays DB-free — fs-floor only).
 myelin-storage = { path = "../myelin-storage" }
 
-# The substrate ROOT surface (contract 1.10 FailStatic<T> + 4.11 the Id-usage bound, contract 1.8
-# fail-static survival signals). GIT-P14 (P-275, M3) bounds the git→Id `check` with the SAME
-# `myelin_substrate::FailStaticAuthz` the platform Identity dependency root rides (P-S25 / SUB-D4) —
-# so an Id hiccup DEGRADES (serves the bounded-stale coarse grant within `static_max ≤ revocation
-# SLA`) instead of cascading every request closed, and a just-revoked subject is still denied THROUGH
-# the stale cache. REUSED, never re-defined (EI-01 §7): there is ONE fail-static cache primitive on
-# the platform; the Git front door wraps it, it does not author a bespoke availability path.
-# `myelin-substrate` is the crate-DAG ROOT (architecture 00 §2.9): it depends on the shared glue
-# crates `myelin-git` also consumes (storage/identity/events/…) and NOTHING in the production DAG
-# depends back on `myelin-git`, so the `myelin-git → myelin-substrate` edge is acyclic + sanctioned
-# (the terminal subsystem consumer of the substrate root, the same pattern as the service crates).
 myelin-substrate = { path = "../myelin-substrate" }
-# The ONE resilient client (contract 1.9 — timeout + breaker + bulkhead + jittered-retry-idempotent-
-# only). GIT-P14 rides it as the transport layer UNDER the fail-static cache on the git→Id `check`
-# dependency: ResilientClient bounds the call (a tripped breaker / timeout surfaces as the hiccup the
-# fail-static cache then degrades on). One client, never a bespoke retry loop (EI-01 §7).
 myelin-client = { path = "../myelin-client" }
 
-# DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
-# Identity SERVICE crate. The runtime Git fragment is the names-only `myelin_identity::Namespace-
-# Fragment` ABI carrier (above) — a producer LEAF never depends on a service crate (the §2.9 DAG
-# stays acyclic). The contract-4.9 CDC pair (tests/cdc_4_9_git_fragment.rs) needs the real engine to
-# PROVE the Git fragment admits + its rewrites compile through the four operators, so the engine is a
-# dev-dependency (test scaffolding only — no runtime edge). EI-01 §7: extend/prove against the frozen
-# engine, never re-define it.
 [dev-dependencies]
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
-# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
-# production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
-# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
-# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-# MR-009b Wave 3 (R1): enable `test-support` so this crate's DEV tests reach the events in-memory
-# `DedupLedger::new` test-double, which moved behind `#[cfg(any(test, feature = "test-support"))]`
-# (the durable `DedupLedger::durable` is production). Without this, `drills_git_d9_check_seam_consumer_leg`
-# only compiled via workspace feature-unification and broke under isolated `cargo clippy -p myelin-git
-# --all-targets`. DEV-only — a test-support dev-dep back-edge, never in the production DAG (§2.9).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# The architecture-lint engine — the merge-queue e2e (GIT-P23 / P-285) runs the `no-cross-sync-cycle`
-# lint over `src/merge_queue.rs` to PROVE Git makes 0 synchronous calls to CI (it reads its own
-# check_status projection; X-1 / EI-02 §3). A dev-only edge (the lint scanner is a test-time tool, not
-# a production-DAG node — architecture §2.9).
 myelin-lints = { path = "../myelin-lints" }
-# TEST-SUPPORT only: the failure-injection / 1×/10×/30× load generator (myelin-harness, P-S02..S04) the
-# GIT-D6 clone-storm surge drill (`tests/drill_git_d6_clone_surge.rs`, GIT-P34 / P-483) drives the
-# mixed-principal surge with — and the STOR-D2 cell-scale re-confirm uses for the world-scale load. A
-# dev-only edge (the harness is NOT a production-DAG node — architecture §2.9; the SAME posture as the
-# myelin-lints dev-dep above). Nothing in `src/` depends on it.
 myelin-harness = { path = "../myelin-harness" }
-# TEST-SUPPORT only: the GIT-D5 concurrent-merge linearizability drill
-# (`tests/drills_git_d5_concurrent_merge_linearizability.rs`, GIT-P33 / P-482) reads its
-# `concurrent_merge_attempts` + `lost_merge_max` bounds from the workspace-root `thresholds.toml`
-# (the versioned source of truth — EI-01 §3, never a magic number). No runtime edge.
 toml.workspace = true
 
 [features]
-# The DEV-REAL integration leg (GIT-P20 / P-281, M3) — the store-backed `check_status` projection
-# (`src/check_status_store.rs`) + its live GIT-D10 part-(a) drill
-# (`tests/integration_git_d10_check_status_projection.rs`). Off by default so `cargo build --workspace`
-# stays DB-free; proven green against the docker-compose dev Postgres stack.
-# `myelin-storage/integration` pulls in the REAL `ValkeyCache` (the `fork:<pr_id>` cache-confinement
-# integration test, GIT-P22 / P-284, `tests/integration_git_p22_fork_cache_confinement.rs`).
 test-support = []
 integration = ["test-support", "myelin-storage/integration"]

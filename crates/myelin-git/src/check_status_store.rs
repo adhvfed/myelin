@@ -1,39 +1,3 @@
-//! # `check_status_store` — the STORE-BACKED `check_status` projection (GIT-P20 / P-281, M3)
-//!
-//! **Owning architecture:**
-//! `planning/04-subsystem-architectures/git-hosting/architecture/02-internals-and-algorithms.md`
-//! §6.1 (the `check_status` consumer — apply the monotonic `run_attempt` supersession into the
-//! projection table, idempotent on `event_id`, exactly ONE current row per
-//! `(tenant, region, repo, commit_oid, context)`).
-//! **Contract:** index row **5.9** (the Git↔CI CheckStatus seam — Git is the consumer + gate).
-//! **Reconciliation:** X-1 (the bus is at-least-once, so the stale-lower-attempt drop is mandatory).
-//! **Drill:** GIT-D10 part (a) — out-of-order/dup `ci.check.updated` → supersession holds the correct
-//! current row (exactly 1 current row per key; idempotent on `event_id`).
-//!
-//! ## What GIT-P20 ships here — the data-layer leg the seam-floor named
-//! [`check_status`](crate::check_status) declared the in-memory [`CheckStatusProjection`] SEMANTICS
-//! (GIT-P6 / P-232) and wired the LIVE Bus-runtime consumer leg (EB-26 / P-246). It named ONE
-//! remaining floor (`check_status.rs` §"what is still a FLOOR", leg 2):
-//!
-//! > **The store-backed projection** — the real `check_status` table + the migration + the same-tx
-//! > `consumer_dedup` write — is the data-layer follow-on.
-//!
-//! THIS module fills that floor. [`PgCheckStatusProjection`] is the LIVE, Postgres-backed
-//! `check_status` projection. The production consumer runs the projection UPSERT on the
-//! [`myelin_events::HandlerTx`] connection that already contains the uncommitted
-//! `consumer_dedup` mark. Thus the mark and the **monotonic `run_attempt` supersession** UPSERT
-//! (`ON CONFLICT … DO UPDATE … WHERE
-//!    EXCLUDED.run_attempt >= check_status.run_attempt`) — a `>=` incoming attempt supersedes; a late
-//!    LOWER attempt is dropped IN SQL (the `WHERE` makes the drop atomic, never a read-then-write
-//!    race) land together. The projection holds **exactly one current row per
-//!    `(tenant, region, repo, commit_oid, context)`** regardless of physical arrival order or
-//!    redelivery. Standalone [`PgCheckStatusProjection::apply`] remains only as an integration-test
-//!    driver and performs the same mark+effect transaction itself.
-//!
-//! ## Acyclic-by-construction (EI-02 §3 / no-cross-sync-cycle)
-//! Git reads its OWN projection — it NEVER synchronously calls CI. This module only ever touches the
-//! Git-owned `check_status` table; there is no outbound call to CI anywhere in the consumer/gate path.
-
 use crate::check_status::{
     CheckContext, CheckState, CheckStatus, CheckStatusConsumer, CheckStatusRow, GitOid, TrustTier,
 };
@@ -59,9 +23,6 @@ fn check_status_subjects() -> &'static [SubjectPattern] {
         .as_slice()
 }
 
-/// Production projection schema. Repository identity and region are part of the key; omitting
-/// either aliases two distinct authorities that happen to share a commit OID. The table is an RLS
-/// tenant/region store and is derived/rebuildable from `ci.check.updated`.
 pub const CREATE_CHECK_STATUS_DDL: &str = r#"
 CREATE TABLE check_status (
   tenant_id text NOT NULL,
@@ -115,22 +76,6 @@ pub fn check_status_hot_tables() -> HotTables {
     HotTables::declare([CHECK_STATUS_TABLE])
 }
 
-/// Scratch-table DDL for integration isolation. The production schema is owned by
-/// [`check_status_migrations`]; this helper deliberately mirrors it without RLS so a test can own
-/// and remove a uniquely named table.
-///
-/// Keyed `(tenant, region, repo, commit_oid, context_provider, context_name)` — exactly ONE current row per key
-/// (last-writer-wins by monotonic `run_attempt`). Mirrors the contract-surface
-/// [`crate::check_status::CHECK_STATUS_PROJECTION_DDL`] (the same column set) with `IF NOT EXISTS` so
-/// the migration is idempotent. The companion table mirrors the platform's consumer-internal,
-/// globally unique-event ledger exactly: `(consumer, event_id)` plus its recorded timestamp. Tenant
-/// and region are set on the surrounding transaction for the projection's RLS policy, not duplicated
-/// into the dedup key.
-///
-/// The `tenant_id` column name is the platform convention (`PgStore`, the RLS policy keys on
-/// `tenant_id`); the architecture §6.1 key is `(tenant, repo, commit_oid, context.*)` — `tenant_id`
-/// IS that `tenant`. The table name is parameterised at construction (the integration test isolates
-/// per-process) so the drill never collides with a sibling run; the shape is identical.
 pub fn projection_ddl(table: &str, dedup_table: &str) -> Result<String, sqlx::Error> {
     validate_sql_identifier("projection table", table)?;
     validate_sql_identifier("dedup table", dedup_table)?;
@@ -163,9 +108,6 @@ pub fn projection_ddl(table: &str, dedup_table: &str) -> Result<String, sqlx::Er
     ))
 }
 
-/// Accept only ordinary unquoted PostgreSQL identifiers before interpolating a table name into DDL.
-/// Table names are composition-time inputs rather than query parameters, but validating the seam
-/// keeps a future config-wired caller from turning that distinction into SQL injection.
 fn validate_sql_identifier(kind: &str, identifier: &str) -> Result<(), sqlx::Error> {
     let mut chars = identifier.chars();
     let starts_safely = chars
@@ -181,45 +123,25 @@ fn validate_sql_identifier(kind: &str, identifier: &str) -> Result<(), sqlx::Err
     )))
 }
 
-/// The outcome of a store-backed [`apply`](PgCheckStatusProjection::apply) — the loud, observable
-/// distinction the drill asserts (never a silent drop). It mirrors
-/// [`crate::check_status::ApplyOutcome`] but adds the `DuplicateEvent` arm the store guard surfaces
-/// (the in-memory model leaves `event_id` dedup to the Bus runtime; the store does it in-tx here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StoreApplyOutcome {
-    /// The fact became (or seeded) the current row — its `run_attempt` is the new high-water mark.
     Superseded,
-    /// A late LOWER-attempt fact — dropped IN SQL by the supersession `WHERE`; the row is unchanged.
     DroppedStale,
-    /// A re-delivered `event_id` — the `consumer_dedup` guard absorbed it (idempotent no-op).
     DuplicateEvent,
 }
 
-/// **The LIVE, Postgres-backed `check_status` projection (GIT-P20).** Holds exactly one current row
-/// per `(tenant, region, repo, commit_oid, context)`, applying the monotonic `run_attempt`
-/// supersession + the
-/// `event_id` idempotency in ONE transaction. This is the store binding of the in-memory
-/// [`crate::check_status::CheckStatusProjection`] (the same semantics, proven against live Postgres by
-/// the GIT-D10 part-(a) drill).
 #[derive(Clone)]
 pub struct PgCheckStatusProjection {
     pool: PgPool,
     table: String,
     dedup_table: String,
-    /// The durable consumer name (the `consumer_dedup` half of the PK) — `git.check_status`.
     consumer: String,
     provider: Option<SubstrateProvider>,
-    /// Separately bounded runtime lane for protected-push admission locks. The callback may commit
-    /// the Git ref outbox through `provider`; keeping this connection source distinct prevents a
-    /// nested-acquisition pool deadlock at maximum concurrency.
     admission_provider: Option<SubstrateProvider>,
     runtime: tokio::runtime::Handle,
 }
 
 impl PgCheckStatusProjection {
-    /// Bind the production projection after the composition root has applied
-    /// [`check_status_migrations`]. Reads are always executed through the verified tenant/region
-    /// transaction supplied by the shared [`SubstrateProvider`].
     pub fn production(
         provider: SubstrateProvider,
         admission_provider: SubstrateProvider,
@@ -236,22 +158,12 @@ impl PgCheckStatusProjection {
         }
     }
 
-    /// Bind a projection to a live pool + table names, running the (idempotent) migration. The
-    /// `consumer` name is the `consumer_dedup` PK half (one ledger per logical consumer).
     pub async fn connect(
         pool: PgPool,
         table: &str,
         dedup_table: &str,
         consumer: &str,
     ) -> Result<PgCheckStatusProjection, sqlx::Error> {
-        // Run the `CREATE TABLE IF NOT EXISTS` projection DDL under the SAME app-wide advisory-lock
-        // discipline the storage `PgMigrator` uses (`myelin_storage::with_migration_lock`), NOT a
-        // bare `raw_sql(ddl).execute(&pool)`. Concurrent startup of multiple consumers against the
-        // same DB would otherwise race two `CREATE TABLE`s on Postgres's `pg_type_typname_nsp_index`
-        // (the same bug `PgStore::migrate` had); serializing on the shared migration lock closes it.
-        // We do NOT version-record this DDL (it is a per-table, idempotent `IF NOT EXISTS` projection
-        // a consumer re-runs on every startup), so the lock-around-DDL helper is the right tool
-        // rather than a recorded `PgMigrator::apply`.
         let ddl = projection_ddl(table, dedup_table)?;
         myelin_storage::with_migration_lock(&pool, &ddl)
             .await
@@ -267,21 +179,6 @@ impl PgCheckStatusProjection {
         })
     }
 
-    /// **Apply one decoded [`CheckStatus`] fact under the X-1 rules, in ONE transaction (§6.1).**
-    ///
-    /// 1. **Idempotency on `event_id`** (contract 2.5): `INSERT … {dedup_table} … ON CONFLICT DO
-    ///    NOTHING`. If the row already existed (the `event_id` was applied), this is a
-    ///    [`StoreApplyOutcome::DuplicateEvent`] — the projection write is SKIPPED and the tx commits
-    ///    (the message is acked, 0 dup). This is the at-least-once → effectively-once anchor.
-    /// 2. **Monotonic supersession** (X-1): the projection UPSERT's `DO UPDATE … WHERE
-    ///    EXCLUDED.run_attempt >= {table}.run_attempt` lets a `>=` incoming attempt supersede and
-    ///    DROPS a late lower attempt — IN SQL, atomically (no read-then-write race). A fresh key is an
-    ///    `INSERT` (the `ON CONFLICT` never fires).
-    ///
-    /// Returns the loud [`StoreApplyOutcome`]: `Superseded` if the row changed, `DroppedStale` if the
-    /// supersession `WHERE` rejected a lower attempt, `DuplicateEvent` if the dedup guard absorbed it.
-    /// The dedup write + the projection write share the tx, so a rollback rolls back BOTH (the
-    /// silent-data-loss guard).
     pub async fn apply(
         &self,
         event_id: &str,
@@ -291,11 +188,6 @@ impl PgCheckStatusProjection {
         let mut tx = self.pool.begin().await?;
         let tenant_id = &fact.tenant.0;
 
-        // 1. The idempotency guard — INSERT the platform `(consumer, event_id)` ledger row.
-        //    `rows_affected == 0` means the triple already existed → a re-delivery → the projection
-        //    write is skipped. The platform ledger is globally keyed by `(consumer, event_id)`;
-        //    tenant/region scope belongs to the effect transaction and the projected row.
-        // @tenant-cross-scope: consumer_dedup is consumer-internal event identity, not tenant data.
         let dedup = sqlx::query(&format!(
             "INSERT INTO {} (consumer, event_id) VALUES ($1, $2) \
              ON CONFLICT DO NOTHING",
@@ -306,7 +198,6 @@ impl PgCheckStatusProjection {
         .execute(&mut *tx)
         .await?;
         if dedup.rows_affected() == 0 {
-            // Already applied — the effectively-once no-op. Commit (the dedup row stays; nothing else).
             tx.commit().await?;
             return Ok(StoreApplyOutcome::DuplicateEvent);
         }
@@ -320,8 +211,6 @@ impl PgCheckStatusProjection {
         )
         .await?;
 
-        // 2. The monotonic supersession UPSERT. The `WHERE EXCLUDED.run_attempt >= …` clause is the
-        //    `>=` supersedes / `<` dropped rule IN SQL — a late lower attempt updates 0 rows.
         let provider = match fact.context.provider {
             crate::check_status::CheckProvider::Ci => "ci",
             crate::check_status::CheckProvider::External => "external",
@@ -368,7 +257,6 @@ impl PgCheckStatusProjection {
         .await?;
 
         let outcome = if upsert.rows_affected() == 0 {
-            // The `WHERE EXCLUDED.run_attempt >= …` rejected a late LOWER attempt — dropped in SQL.
             StoreApplyOutcome::DroppedStale
         } else {
             StoreApplyOutcome::Superseded
@@ -377,9 +265,6 @@ impl PgCheckStatusProjection {
         Ok(outcome)
     }
 
-    /// Apply a fact on the consumer runtime's existing transaction. The dedup mark is already
-    /// uncommitted on this connection; returning `Done` commits mark+projection and returning
-    /// `Retry` rolls both back.
     pub async fn apply_in_tx(
         conn: &mut sqlx::PgConnection,
         region: &str,
@@ -388,8 +273,6 @@ impl PgCheckStatusProjection {
         apply_projection_in_tx(CHECK_STATUS_TABLE, conn, region, fact).await
     }
 
-    /// The current [`CheckStatusRow`] for a `(commit_oid, context)` key, if any — the row the merge
-    /// gate reads. Exactly one per key (the PK + the supersession guarantee that).
     pub async fn current(
         &self,
         tenant_id: &str,
@@ -417,19 +300,6 @@ impl PgCheckStatusProjection {
         row.map(decode_row).transpose()
     }
 
-    /// **THE LIVE MERGE GATE (GIT-P21 / §6.2 — the required-set policy over the STORE-BACKED
-    /// projection).** Evaluate a [`MergeGatePolicy`] against the live `check_status` table for the PR's
-    /// `head_oid`: for EACH required context, fetch its current row from Postgres and classify it via
-    /// the SHARED [`evaluate_merge_gate_row`] primitive (the IDENTICAL state/trust logic the in-memory
-    /// gate applies — the DB path and the in-memory path can never drift). `endorsed_contexts` is the
-    /// set of fork-endorsed contexts (the GIT-P22 `approve_untrusted_ci` input).
-    ///
-    /// Returns [`MergeGateOutcome::Admitted`] iff every required context has a current `success` row
-    /// with an acceptable trust posture, else [`MergeGateOutcome::Blocked`] with the specific unmet
-    /// contexts. **0 merges are admitted with a missing/stale/un-endorsed required context** (the
-    /// 0-under-gated-merges invariant, proven against the LIVE stack). Git reads its OWN table — it
-    /// never synchronously calls CI (acyclic, EI-02 §3); it reads `trust_tier` OFF the row, never
-    /// recomputes it.
     pub async fn merge_gate(
         &self,
         tenant_id: &str,
@@ -445,12 +315,10 @@ impl PgCheckStatusProjection {
                 crate::check_status::CheckProvider::Ci => "ci",
                 crate::check_status::CheckProvider::External => "external",
             };
-            // Read Git's OWN projection row for this required (head_oid, context) — never CI.
             let row = self
                 .current(tenant_id, region, repo_ref, head_oid, provider, &ctx.name)
                 .await?;
             let endorsed = endorsed_contexts.contains(ctx);
-            // The IDENTICAL classify logic as the in-memory gate (no drift between the DB + memory path).
             if let Some(reason) = evaluate_merge_gate_row(row.as_ref(), endorsed) {
                 unmet.push(UnmetContext {
                     context: ctx.clone(),
@@ -465,8 +333,6 @@ impl PgCheckStatusProjection {
         })
     }
 
-    /// The number of current rows for a commit (one per context) — the "exactly 1 current row per key"
-    /// signal the GIT-D10 drill asserts.
     pub async fn row_count_for_commit(
         &self,
         tenant_id: &str,
@@ -488,7 +354,6 @@ impl PgCheckStatusProjection {
         Ok(count)
     }
 
-    /// Drop the projection + dedup tables — the integration test's teardown (per-process isolation).
     pub async fn drop_tables(&self) -> Result<(), sqlx::Error> {
         sqlx::raw_sql(&format!(
             "DROP TABLE IF EXISTS {}; DROP TABLE IF EXISTS {}",
@@ -499,8 +364,6 @@ impl PgCheckStatusProjection {
         Ok(())
     }
 
-    /// Read every current context for one repository commit through a verified tenant transaction.
-    /// This is the production Edge/merge-gate source; it never calls CI.
     pub fn rows_for_commit(
         &self,
         scope: &TenantScope,
@@ -511,8 +374,6 @@ impl PgCheckStatusProjection {
         Ok(rows.remove(&commit_oid.0).unwrap_or_default())
     }
 
-    /// Batch variant used by PR list surfaces. A single verified transaction reads every requested
-    /// head OID so list rendering does not introduce one projection query per pull request.
     pub fn rows_for_commits(
         &self,
         scope: &TenantScope,
@@ -584,10 +445,6 @@ impl PgCheckStatusProjection {
         .map_err(|error| sqlx::Error::Protocol(error.to_string()))
     }
 
-    /// Freeze check facts for a protected-ref admission while holding the same transaction-scoped
-    /// locks used by the projection consumer. `op` runs before the tenant transaction commits, so
-    /// every check update for these exact commits is serialized after the caller's admission
-    /// decision and state mutation. This is the direct-push counterpart to merge intent admission.
     pub fn with_admission_snapshot<R, F>(
         &self,
         scope: &TenantScope,
@@ -710,10 +567,6 @@ async fn apply_projection_in_tx(
     })
 }
 
-/// Serialize projection changes with a merge admission for the same repository commit. The lock is
-/// transaction-scoped and also covers the "no rows yet" state, which row locks cannot represent.
-/// A merge that holds this lock may freeze the currently committed check facts into its durable
-/// intent; a later check update is a fact that arrived after admission.
 pub(crate) async fn lock_check_admission(
     conn: &mut sqlx::PgConnection,
     tenant_id: &str,
@@ -721,8 +574,6 @@ pub(crate) async fn lock_check_admission(
     repo_ref: &str,
     commit_oid: &str,
 ) -> Result<(), sqlx::Error> {
-    // PostgreSQL `text` rejects NUL bytes, so frame each segment by its byte length rather than
-    // relying on an in-band separator. The encoding stays injective even when a value contains `:`.
     let key = format!(
         "myelin.check-admission.v1|{}:{tenant_id}|{}:{region}|{}:{repo_ref}|{}:{commit_oid}",
         tenant_id.len(),
@@ -730,8 +581,6 @@ pub(crate) async fn lock_check_admission(
         repo_ref.len(),
         commit_oid.len(),
     );
-    // @tenant-cross-scope: advisory lock state reads no tenant rows; its injective key already
-    // contains the verified tenant, region, canonical repository ref, and exact commit.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(key)
         .execute(conn)
@@ -739,8 +588,6 @@ pub(crate) async fn lock_check_admission(
     Ok(())
 }
 
-/// Read production projection rows on an existing tenant-scoped transaction. Callers that use the
-/// rows for a durable admission decision must acquire [`lock_check_admission`] first.
 pub(crate) async fn rows_for_commit_in_tx(
     conn: &mut sqlx::PgConnection,
     tenant_id: &str,
@@ -764,9 +611,6 @@ pub(crate) async fn rows_for_commit_in_tx(
     rows.into_iter().map(decode_row).collect()
 }
 
-/// Git-owned durable event handler. It binds the artifact-ref namespace used by the production
-/// pump, then narrows to `ci.check.updated` and validates that envelope tenant/region/repository
-/// provenance agrees with the decoded fact before any write.
 pub struct DurableCheckStatusConsumer {
     runtime: tokio::runtime::Handle,
     expected_region: String,
@@ -899,8 +743,6 @@ pub fn build_durable_check_consumer(
     })
 }
 
-/// The closed-set `CheckState` → column string (the projection's `state` column). The inverse of
-/// [`parse_state`]; together they are the round-trip the `current` read proves.
 fn state_str(state: CheckState) -> &'static str {
     match state {
         CheckState::Queued => "queued",
@@ -913,7 +755,6 @@ fn state_str(state: CheckState) -> &'static str {
     }
 }
 
-/// The column string → `CheckState`. A row written by [`state_str`] always parses back.
 fn parse_state(s: &str) -> Result<CheckState, sqlx::Error> {
     match s {
         "queued" => Ok(CheckState::Queued),
@@ -927,7 +768,6 @@ fn parse_state(s: &str) -> Result<CheckState, sqlx::Error> {
     }
 }
 
-/// `TrustTier` → column string.
 fn trust_str(tier: TrustTier) -> &'static str {
     match tier {
         TrustTier::Trusted => "trusted",
@@ -935,7 +775,6 @@ fn trust_str(tier: TrustTier) -> &'static str {
     }
 }
 
-/// Column string → `TrustTier`.
 fn parse_trust(s: &str) -> Result<TrustTier, sqlx::Error> {
     match s {
         "trusted" => Ok(TrustTier::Trusted),
@@ -944,7 +783,6 @@ fn parse_trust(s: &str) -> Result<TrustTier, sqlx::Error> {
     }
 }
 
-/// Decode a projection table row into the typed [`CheckStatusRow`] the merge gate reads.
 fn decode_row(row: sqlx::postgres::PgRow) -> Result<CheckStatusRow, sqlx::Error> {
     use crate::check_status::{CheckContext, CheckProvider, HumanisedRef};
     use myelin_tenancy::{ArtifactRef, TenantId};

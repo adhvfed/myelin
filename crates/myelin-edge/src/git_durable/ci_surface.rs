@@ -1,14 +1,9 @@
-//! Git-owned authorization adapters for CI's parent-repository read boundary.
-
 use crate::git_durable::DurableGitBackend;
 use crate::repo_authz::RepoPermission;
 use myelin_git::{core::RepoLoc, durable::DurableError};
 use myelin_identity::Principal;
 
 impl DurableGitBackend {
-    /// The bounded, leak-free repository visibility set CI run listing inherits from Git's live
-    /// `list_objects(viewer, pull, repo)` authority. A CI run is readable exactly through its parent
-    /// repository; CT-005 never invents a second run ACL.
     pub(crate) fn visible_repo_slugs_for_ci(
         &self,
         principal: &Principal,
@@ -20,7 +15,6 @@ impl DurableGitBackend {
         )
     }
 
-    /// Authorize one CI run's canonical parent repo through Git's exact Pull permission.
     pub(crate) fn may_view_ci_repo(&self, principal: &Principal, slug: &str) -> bool {
         let loc = RepoLoc::new(principal.tenant.as_str(), principal.region.as_str(), slug);
         self.repo_authorizer()

@@ -1,16 +1,3 @@
-//! # ISS-P21 / P-388 — the import engine e2e: the export→import→export round-trip oracle (ISS-D9(a))
-//!
-//! **The drill (drill-catalogue row ISS-D9(a)):** `export→import→export` round-trips over a corpus;
-//! the ADF lossy-map nodes are NAMED, never silent; the **round-trip oracle (the named-lossy report)
-//! is the green artifact.**
-//!
-//! This is the chained-mutation e2e (EI-01 §4 — the import is a real chained operation): a corpus of
-//! provider records is normalised into the canonical interchange (the export side), imported through
-//! the two-pass engine (mint + map + emit `issue.created`, then resolve relations), and re-exported
-//! by reading the id-map + the committed events back into the canonical form — asserting the
-//! re-exported canonical issues round-trip the originals (the round-trip oracle) AND that the
-//! lossy-map report names every degraded node (never silent, X-2).
-
 use myelin_content::adf::AdfNode;
 use myelin_events::{
     Actor, CausedBy, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Region, TenantId,
@@ -44,7 +31,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// A Jira provider corpus: a mix of lossless + lossy ADF body nodes, with relations.
 fn jira_corpus() -> Vec<ProviderRecord> {
     vec![
         ProviderRecord {
@@ -59,12 +45,12 @@ fn jira_corpus() -> Vec<ProviderRecord> {
                     resolved: true,
                 },
                 AdfBodyNode {
-                    kind: AdfNode::Status, // unconditionally lossy (lozenge)
+                    kind: AdfNode::Status,
                     text: "In Review".into(),
                     resolved: true,
                 },
                 AdfBodyNode {
-                    kind: AdfNode::Date, // unconditionally lossy (date chip)
+                    kind: AdfNode::Date,
                     text: "2026-06-01".into(),
                     resolved: true,
                 },
@@ -82,12 +68,11 @@ fn jira_corpus() -> Vec<ProviderRecord> {
             body_adf: vec![AdfBodyNode {
                 kind: AdfNode::Mention,
                 text: "@external-contractor".into(),
-                resolved: false, // degrades to a plain-text @name run (lossy)
+                resolved: false,
             }],
             reporter_pseudonym: "psn-b@acme.noreply".into(),
             state: "open".into(),
             contains_pii: false,
-            // JIRA-2 blocks JIRA-1.
             relations: vec![myelin_issues::CanonicalRelation {
                 src_source_id: "JIRA-2".into(),
                 dst_source_id: "JIRA-1".into(),
@@ -97,10 +82,6 @@ fn jira_corpus() -> Vec<ProviderRecord> {
     ]
 }
 
-/// Re-export the imported issues into the canonical form by reading the id-map back (the "export"
-/// side of the round-trip). The re-exported canonical issue carries the SAME source-agnostic fields
-/// the original canonical interchange did (the title/body/state survive; the source id is the id-map
-/// key). The round-trip oracle compares the re-export against the original normalised import.
 fn re_export(
     tenant: &TenantId,
     original: &CanonicalImport,
@@ -118,19 +99,12 @@ fn re_export(
         .collect()
 }
 
-/// **THE ISS-D9(a) ROUND-TRIP ORACLE — export→import→export round-trips, lossy nodes NAMED.** The
-/// normalised canonical import (export) is imported (two-pass), then re-exported off the id-map; the
-/// re-export round-trips the original canonical issues AND the lossy-map report names every degraded
-/// node (status + date + the unresolved mention) — never silent (X-2).
 #[test]
 fn iss_d9a_export_import_export_round_trips_with_named_lossy_report() {
-    // ── EXPORT (normalise the provider corpus into the canonical interchange) ──
     let import = JiraAdapter.normalise(&jira_corpus());
     assert_eq!(import.issues.len(), 2);
     assert_eq!(import.relations.len(), 1);
 
-    // The lossy-map report NAMES every degraded node (status + date unconditional, + the unresolved
-    // external mention conditional) — 3 recorded, never silent.
     assert_eq!(
         import.report.loss_count(),
         3,
@@ -140,10 +114,8 @@ fn iss_d9a_export_import_export_round_trips_with_named_lossy_report() {
     assert!(degraded_nodes.contains(&AdfNode::Status));
     assert!(degraded_nodes.contains(&AdfNode::Date));
     assert!(degraded_nodes.contains(&AdfNode::Mention));
-    // none is silent — each conversion names what was lost.
     assert!(import.report.conversions.iter().all(|c| !c.what.is_empty()));
 
-    // ── IMPORT (two-pass: mint + map + emit, then resolve relations) ──
     let alloc = HiLoKeyAllocator::new(InMemoryPrefixCounter::new());
     let id_map = InMemorySourceIdMap::new();
     let engine = ImportEngine::new(&alloc, &id_map, ImportLaneBudget::default_budget());
@@ -156,12 +128,9 @@ fn iss_d9a_export_import_export_round_trips_with_named_lossy_report() {
     assert_eq!(report.created, 2);
     assert_eq!(report.relations_created, 1, "JIRA-2 blocks JIRA-1 resolved");
     assert!(report.unresolved.is_empty());
-    // the named lossy report survives onto the reconciliation report (the green artifact).
     assert_eq!(report.loss.loss_count(), 3);
-    // the permission-scheme R-9 legal leg is named.
     assert_eq!(report.legal_review.len(), 1);
 
-    // ── EXPORT AGAIN (re-export off the id-map) + assert the round-trip ──
     let re = re_export(&tenant(), &import, &id_map);
     assert_eq!(re.len(), 2, "every imported issue re-exports");
     assert_eq!(
@@ -170,8 +139,6 @@ fn iss_d9a_export_import_export_round_trips_with_named_lossy_report() {
     );
 }
 
-/// **The round-trip oracle holds across a markdown-native source too (GitHub) — fully lossless.** A
-/// markdown-native import re-exports identically with an EMPTY lossy report (the clean-adoption path).
 #[test]
 fn iss_d9a_markdown_native_round_trips_lossless() {
     let records = vec![ProviderRecord {
@@ -207,5 +174,5 @@ fn iss_d9a_markdown_native_round_trips_lossless() {
         re, import.issues,
         "the markdown-native canonical issue round-trips"
     );
-    let _ = SourceSystem::GitHub; // the source-system tag is the id-map key segment.
+    let _ = SourceSystem::GitHub;
 }

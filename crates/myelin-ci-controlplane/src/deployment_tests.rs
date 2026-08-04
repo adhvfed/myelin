@@ -1,9 +1,3 @@
-//! Unit tests for the deployment / protected-env HITL gate (CI-P24 / P-367).
-//!
-//! Proves: the per-effect `idem_key` HITL (double-click = ONE apply; a declined effect is WITHHELD,
-//! returns Denied, never mutates — AG-8); the approver-set resolution via `list_subjects`; and the
-//! `ci.deployment.*` drafts validate against the FROZEN event tokens.
-
 use super::*;
 use myelin_events::validate_event_type;
 use myelin_flow::{ApprovalDecision, EffectOutcome};
@@ -17,16 +11,11 @@ use myelin_identity::{
 use myelin_tenancy::{ArtifactRef, TenantId};
 use std::collections::HashMap;
 
-// ---------------------------------------------------------------------------
-// DEFENCE — the per-effect idem_key HITL gate (OQ-F).
-// ---------------------------------------------------------------------------
-
 #[test]
 fn double_click_approve_is_one_apply() {
     let mut applied: HashMap<String, String> = HashMap::new();
     let mut apply_calls = 0;
 
-    // First click: approves + applies once.
     let o1 = DeployGate::gate_deploy(
         "card-deploy-1",
         0,
@@ -41,7 +30,6 @@ fn double_click_approve_is_one_apply() {
     assert_eq!(o1, DeployGateOutcome::Approved("dep-7".into()));
     assert_eq!(apply_calls, 1);
 
-    // Second click (the double-click): the SAME per-effect key → NO second apply (OQ-F).
     let o2 = DeployGate::gate_deploy(
         "card-deploy-1",
         0,
@@ -49,7 +37,7 @@ fn double_click_approve_is_one_apply() {
         ApprovalDecision::Approve,
         &mut applied,
         || {
-            apply_calls += 1; // must NOT run
+            apply_calls += 1;
             "dep-OTHER".to_string()
         },
     );
@@ -76,7 +64,7 @@ fn declined_deploy_is_withheld_and_never_mutates() {
         ApprovalDecision::Decline,
         &mut applied,
         || {
-            apply_calls += 1; // must NOT run (AG-8: a withheld effect makes 0 mutation)
+            apply_calls += 1;
             "dep-NEVER".to_string()
         },
     );
@@ -91,7 +79,6 @@ fn declined_deploy_is_withheld_and_never_mutates() {
 
 #[test]
 fn batch_partial_approval_is_well_defined() {
-    // A batch deploy card gating 3 environments: approve 0 + 2, decline 1 (a partial approval).
     let mut applied: HashMap<String, String> = HashMap::new();
     let decisions = [
         ApprovalDecision::Approve,
@@ -112,7 +99,6 @@ fn batch_partial_approval_is_well_defined() {
         DeployGateOutcome::Withheld(DECLINE_TOKEN.into())
     );
     assert_eq!(outcomes[2], DeployGateOutcome::Approved("dep-2".into()));
-    // The per-effect keys are distinct (multi-effect rule) — 2 applied, the declined one absent.
     assert_eq!(applied.len(), 2);
     assert!(applied.contains_key("card-batch:0"));
     assert!(applied.contains_key("card-batch:2"));
@@ -134,10 +120,6 @@ fn deploy_outcome_maps_from_flow_effect_outcome() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The protected-env gate decision + approver resolution (contract 4.4).
-// ---------------------------------------------------------------------------
-
 #[test]
 fn protected_env_requires_approval_unprotected_does_not() {
     assert!(
@@ -150,7 +132,6 @@ fn protected_env_requires_approval_unprotected_does_not() {
     );
 }
 
-/// An Identity whose `list_subjects(environment, approve)` returns a fixed approver set.
 struct ApproverIdentity {
     approvers: Vec<String>,
 }
@@ -183,7 +164,6 @@ impl IdentityService for ApproverIdentity {
         p: &Permission,
         _at: &Consistency,
     ) -> IdResult<SubjectTree> {
-        // The gate resolves the approver set via the `approve` permission ONLY.
         assert_eq!(
             p.0, ENVIRONMENT_APPROVE_PERMISSION,
             "resolves the `approve` set"
@@ -251,10 +231,6 @@ fn resolve_approvers_flattens_the_list_subjects_tree() {
     assert_eq!(approvers, vec!["u:alice".to_string(), "u:bob".to_string()]);
 }
 
-// ---------------------------------------------------------------------------
-// The ci.deployment.* drafts validate against the FROZEN tokens (arch §3).
-// ---------------------------------------------------------------------------
-
 #[test]
 fn deployment_drafts_carry_frozen_tokens_and_the_deployment_aggregate() {
     let drafts = [
@@ -268,14 +244,10 @@ fn deployment_drafts_carry_frozen_tokens_and_the_deployment_aggregate() {
         deployment_rolled_back_draft("acme", "dep-1", "env-1", "run-1"),
     ];
     for d in &drafts {
-        // Each type is a VALID registered Bus event type (the §6.2 grammar, EB-02).
         validate_event_type(&d.type_.0)
             .unwrap_or_else(|e| panic!("invalid type {}: {e:?}", d.type_.0));
-        // The aggregate is per-deployment (ordering within the deployment, arch §1.2).
         assert_eq!(d.aggregate.0, "deployment:dep-1");
-        // The subject is the deployment ArtifactRef.
         assert_eq!(d.subject.0, "myelin://acme/ci/deployment/dep-1");
-        // References-not-payloads: no inline clear PII (the approver is a pseudonym TOKEN).
         assert!(!d.contains_personal_data);
         assert!(d.pii_key_ref.is_none());
     }
@@ -284,7 +256,6 @@ fn deployment_drafts_carry_frozen_tokens_and_the_deployment_aggregate() {
 #[test]
 fn approved_draft_carries_the_pseudonym_approver_ref_only() {
     let d = deployment_approved_draft("acme", "dep-1", "env-1", "run-1", "pseudo:approver");
-    // The approver rides as a token in the payload — never a clear PII body.
     assert_eq!(d.payload["approved_by"], "pseudo:approver");
     assert_eq!(d.payload["state"], "deploying");
     assert!(

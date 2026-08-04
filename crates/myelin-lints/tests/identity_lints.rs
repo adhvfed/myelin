@@ -1,28 +1,3 @@
-//! The FOUR Id-relevant architecture lints, the Identity slice (P-ID-03 → global P-024).
-//!
-//! P-S10 → P-017 and P-S11 → P-018 first shipped the twelve architecture lints as the shared
-//! substrate scanners + engine + the generic fixture matrix (`fixture_matrix.rs`). P-ST-04 → P-020
-//! then shipped the STORAGE slice (`storage_lints.rs`): the two storage-relevant lints with
-//! storage-shaped fixtures, sharpened to the real `myelin-storage` constructors. P-ID-03 is the
-//! IDENTITY slice — the contract-1.6 / §2.11 four Id-relevant lints (`tenant-predicate`,
-//! `no-untagged-personal-data`, `residency-pin`, `control-plane-pii-free`) wired as ONE ratchet
-//! unit, each with an IDENTITY-shaped red fixture (an Id bug fingerprint the gate must reject) +
-//! an Identity-shaped green fixture (the correct Id shape the gate must admit), so the
-//! no-IDOR / no-untagged-PII / no-cross-region / control-plane-PII-free surface is closed for
-//! Identity in one commit.
-//!
-//! **Coherence note (EI-01 §7 — reconcile, never duplicate).** The four lints, their engine, and
-//! the generic red/green fixtures ALREADY exist (P-017/P-018); the iam.* opaque-id event projection
-//! the `control-plane-pii-free` lint guards landed in P-ID-02 → P-023. This prompt adds NO new lint
-//! and re-defines NO type: it reuses the in-place [`myelin_lints`] scanners and adds only the
-//! genuinely-new Identity-shaped fixtures + this Identity verdict test, exactly mirroring the
-//! `storage_lints.rs` precedent. The lints are exercised, never weakened (EI-01 §5).
-//!
-//! These tests ARE the P-ID-03 fixtures (the TESTS field: "the eight fixtures (4 red + 4 green) ARE
-//! the tests"). They run loud over the Identity fixtures and assert the exact verdict; the CI-wiring
-//! proof (an Identity red fixture ⇒ the `lint-gate` binary exits non-zero, no `|| true` swallow) is
-//! the last test. No threshold is weakened: a lint is never softened to admit a red fixture.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -41,7 +16,6 @@ fn read_fixture(name: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("missing fixture {path:?}: {e}"))
 }
 
-/// One Identity-lint row: the lint + its Identity red fixture + its Identity green fixture.
 struct IdentityRow {
     lint: fn() -> Lint,
     id: LintId,
@@ -49,7 +23,6 @@ struct IdentityRow {
     green: &'static str,
 }
 
-/// The FOUR Id-relevant lints (contract-1.6 / §2.11), in the P-ID-03 DELIVERABLE order.
 fn identity_matrix() -> Vec<IdentityRow> {
     vec![
         IdentityRow {
@@ -81,8 +54,6 @@ fn identity_matrix() -> Vec<IdentityRow> {
 
 #[test]
 fn the_four_id_lints_are_exactly_the_ratchet_unit() {
-    // 4/4: the Identity ratchet unit is exactly the four contract-1.6 Id-relevant lints, in the
-    // P-ID-03 DELIVERABLE order. (Guards against a row drifting off the named four.)
     let rows = identity_matrix();
     assert_eq!(rows.len(), 4, "the Id ratchet unit is exactly four lints");
     let ids: Vec<LintId> = rows.iter().map(|r| r.id).collect();
@@ -100,7 +71,6 @@ fn the_four_id_lints_are_exactly_the_ratchet_unit() {
 
 #[test]
 fn the_four_id_lints_reject_their_identity_red_fixtures() {
-    // 4/4 REJECT: each Identity red fixture produces >= 1 violation, fired by THAT lint.
     for row in identity_matrix() {
         let lint = (row.lint)();
         let violations = lint.run(&read_fixture(row.red));
@@ -120,7 +90,6 @@ fn the_four_id_lints_reject_their_identity_red_fixtures() {
 
 #[test]
 fn the_four_id_lints_admit_their_identity_green_fixtures() {
-    // 4/4 ADMIT: each Identity green fixture produces 0 violations from ITS lint.
     for row in identity_matrix() {
         let lint = (row.lint)();
         let violations = lint.run(&read_fixture(row.green));
@@ -136,9 +105,6 @@ fn the_four_id_lints_admit_their_identity_green_fixtures() {
 
 #[test]
 fn each_identity_red_fixture_trips_exactly_its_own_lint() {
-    // Cross-lint isolation over the Identity fixtures: an Identity red fixture for lint X is caught
-    // by X and NO OTHER of the twelve (so the whole-set gate attributes the failure correctly, and
-    // the green fixtures cannot be trivially passing by a different lint over-matching).
     for row in identity_matrix() {
         let mut firing: Vec<LintId> = Vec::new();
         let red = read_fixture(row.red);
@@ -160,9 +126,6 @@ fn each_identity_red_fixture_trips_exactly_its_own_lint() {
 
 #[test]
 fn the_full_twelve_set_rejects_each_identity_red_and_admits_each_identity_green() {
-    // The set-level gate (the form CI runs): run() over ALL twelve lints is Err on each Identity red
-    // fixture and Ok on each Identity green fixture — loud, never swallowed (EI-01 §5). No green
-    // fixture may false-positive on another lint.
     let all = all_twelve();
     for row in identity_matrix() {
         assert!(
@@ -180,11 +143,6 @@ fn the_full_twelve_set_rejects_each_identity_red_and_admits_each_identity_green(
 
 #[test]
 fn control_plane_pii_free_guards_the_iam_event_projection() {
-    // The P-ID-02 ↔ P-ID-03 seam: the `control-plane-pii-free` lint REJECTS an `iam.*` event
-    // projection that leaks a name/email (the erasable profile crossing the immutable log) and
-    // ADMITS the opaque-id projection P-ID-02 freezes (actor/subject by opaque `principal_id`
-    // only, `contains_personal_data` false). This is the lint enforcing the GATE field of P-ID-02:
-    // "the projection contains no PII field".
     let leaking = read_fixture("control_plane_pii_free.identity.red.rs.txt");
     let opaque = read_fixture("control_plane_pii_free.identity.green.rs.txt");
     assert!(
@@ -199,10 +157,6 @@ fn control_plane_pii_free_guards_the_iam_event_projection() {
 
 #[test]
 fn ci_gate_exits_non_zero_on_an_identity_red_fixture_and_zero_on_green() {
-    // THE CI-WIRING PROOF (loud, never swallowed — EI-01 §5): the `lint-gate` binary the CI job
-    // runs exits NON-ZERO over each Identity red fixture and ZERO over each Identity green fixture.
-    // A process whose exit code IS the gate cannot be `|| true`-swallowed. `--no-exclude` disables
-    // the by-design `/fixtures/` exclusion so the fixture is actually scanned.
     let bin = env!("CARGO_BIN_EXE_lint-gate");
     let run_over = |name: &str| -> i32 {
         Command::new(bin)

@@ -1,22 +1,3 @@
-//! # CHAT-D4 (TE-21 build-gate) — roll the gateway fleet under a CONNECTION STORM → bounded
-//! reconnect; resume completes for ALL; no message loss; readiness gates new connections; liveness
-//! no restart-storm; the protected-human-lane shed order holds (CHAT-P10 / P-404).
-//!
-//! The prove-it gate (external-insights/01 §3; testing-strategy CHAT-D4): roll the fleet under a
-//! connection storm and WATCH the human lane hold while the agent/speculative lanes shed. The dated
-//! green artifact is the SIGNAL pair: (a) `resume completes for ALL, 0 message loss` across the storm
-//! (the reconnect-rate signal), and (b) `0 human-lane drops while a lower-priority lane sheds` (the
-//! shed-count signal). Observability is part of the pass.
-//!
-//! The drill drives the REAL composition: real `MemHotTier` durable store + real
-//! `myelin_events::Firehose` transport + the real `ChatGateway` + the real `ShedGovernor` — no mock
-//! of the data layer (the in-process firehose is the unit/drill transport; the broker binding is
-//! P-S12). The per-surface shed budgets are now TUNED (P-500 / CHAT-P26 promoted the CHAT-P10 floor —
-//! the `ConnectionTier`/`AgentMention` rows in `thresholds.toml` carry the MEASURED defaults-to-beat);
-//! this drill asserts the SHED-ORDER PROPERTY (bounded + reserved human lane + shed order applied),
-//! while `chat_d4_at_scale_deploy_herd_*` re-runs the fleet roll at world scale (the deploy-herd) and
-//! `drill_chat_d3_agent_surge.rs` proves the tuned numbers green under the 30× surge.
-
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
@@ -44,8 +25,6 @@ const TENANT: &str = "acme";
 const REGION: &str = "fr-par";
 const CHANNEL: &str = "01J0CHANNEL";
 
-// A thin Id fixture: authenticate (tenant-from-token) + a member-set channel.read gate. Every
-// connection-storm client is a member (the storm is admitted members reconnecting en masse).
 #[derive(Clone, Default)]
 struct DrillId {
     members: Arc<Mutex<BTreeSet<String>>>,
@@ -168,10 +147,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// The Message Service's durable write of a human message (the source of truth the snapshot
-/// rebuilds from). The gateway has no emit path; we drive the write through its READ-handle to the
-/// SAME store (`append` takes `&self`), modelling the Message Service writing the tier the gateway
-/// reads on the snapshot fallback.
 fn durable_send(
     gw: &ChatGateway<DrillId, MemHotTier, HealthTable>,
     ob: &OutboxStore,
@@ -215,11 +190,6 @@ fn cred(p: &str) -> Credential {
     }
 }
 
-/// **CHAT-D4 — roll a FLEET under a connection storm: resume completes for ALL, 0 message loss.**
-/// A fleet of N members connect, consume a prefix, are SEVERED en masse (the storm), then RECONNECT
-/// concurrently while messages keep flowing. Each one's resume backfills its gap — EVERY op recovered
-/// for EVERY connection (0 loss). The reconnect-rate signal: all N resumes succeed in-window
-/// (bounded; no resync needed because the window covers the storm gap).
 #[test]
 fn chat_d4_fleet_reconnect_completes_for_all_zero_loss() {
     const FLEET: usize = 32;
@@ -229,7 +199,6 @@ fn chat_d4_fleet_reconnect_completes_for_all_zero_loss() {
     let store = MemHotTier::new();
     let mut gw = gateway(store, 4096, &member_refs);
 
-    // every member connects + subscribes; record each connection.
     let mut conns = Vec::new();
     let mut subs = Vec::new();
     for m in &members {
@@ -241,7 +210,6 @@ fn chat_d4_fleet_reconnect_completes_for_all_zero_loss() {
     let stream = conns[0].stream.clone();
     let scope = chat_channel_scope(CHANNEL).unwrap();
 
-    // a prefix of frames is delivered + consumed by all (each at last_seq = 3).
     for body in ["m1", "m2", "m3"] {
         gw.firehose_mut()
             .publish(&stream, &scope, myelin_events::FrameDraft::new(body));
@@ -254,16 +222,13 @@ fn chat_d4_fleet_reconnect_completes_for_all_zero_loss() {
     }
     assert!(last_seqs.iter().all(|s| *s == 3));
 
-    // THE STORM: sever the entire fleet at once (drop every subscription handle).
     subs.clear();
 
-    // while severed, more frames flow (the gap every reconnect must recover).
     for body in ["m4", "m5", "m6", "m7"] {
         gw.firehose_mut()
             .publish(&stream, &scope, myelin_events::FrameDraft::new(body));
     }
 
-    // RECONNECT the whole fleet — each resume must complete in-window, 0 loss.
     let cursor = myelin_chat::MessageId("00000000000000000000000000".into());
     let mut resumed = 0usize;
     for c in &conns {
@@ -276,26 +241,21 @@ fn chat_d4_fleet_reconnect_completes_for_all_zero_loss() {
                 assert_eq!(
                     gap,
                     vec![4, 5, 6, 7],
-                    "0 lost — the full storm gap recovered"
+                    "0 lost - the full storm gap recovered"
                 );
                 resumed += 1;
             }
             ResumeOutcome::Resync { .. } => {
-                panic!("the window covers the storm gap — no resync needed for an in-window cursor")
+                panic!("the window covers the storm gap - no resync needed for an in-window cursor")
             }
         }
     }
-    // the dated green artifact (reconnect-rate signal): resume completed for ALL.
     assert_eq!(
         resumed, FLEET,
         "CHAT-D4: resume completes for ALL {FLEET} reconnecting connections (0 loss)"
     );
 }
 
-/// **CHAT-D4 — readiness gates new connections under storm; liveness never restart-storms.** When a
-/// critical dependency is severed under the storm, the gateway flips NotReady and SHEDS new
-/// connections (never serves on a not-ready instance) — and liveness stays Up (a dependency outage
-/// flips READINESS, never liveness; no restart-storm). Heal → ready again, no restart.
 #[test]
 fn chat_d4_readiness_gates_under_storm_liveness_no_restart_storm() {
     let firehose = Firehose::with_limits(4096, DEFAULT_INFLIGHT_CAP);
@@ -309,12 +269,10 @@ fn chat_d4_readiness_gates_under_storm_liveness_no_restart_storm() {
         health,
     );
 
-    // ready → a storm of connects is admitted.
     for _ in 0..16 {
         assert!(gw.connect(&cred("alice")).is_ok());
     }
 
-    // a critical dep dies UNDER the storm → NotReady → every new connect SHEDS (never serves).
     probe.mark_down("identity");
     for _ in 0..16 {
         assert!(matches!(
@@ -322,7 +280,6 @@ fn chat_d4_readiness_gates_under_storm_liveness_no_restart_storm() {
             Err(GatewayError::NotReady)
         ));
     }
-    // liveness NEVER restart-storms across the outage (the no-restart-storm signal).
     assert_eq!(
         gw.health().liveness_restart_count(),
         0,
@@ -330,16 +287,10 @@ fn chat_d4_readiness_gates_under_storm_liveness_no_restart_storm() {
     );
     assert!(!gw.health().liveness().should_restart());
 
-    // heal → ready again, no restart needed (the outage was transient).
     probe.mark_up("identity");
     assert!(gw.connect(&cred("alice")).is_ok());
 }
 
-/// **CHAT-D4 — the protected-human-lane shed order holds under storm: the human message lane is
-/// delivered while the agent/speculative lanes shed (0 human-lane drops).** Under storm pressure the
-/// live-delivery surface sheds presence first and the agent lane next, but EVERY human-message frame
-/// is delivered — humans never queue behind agent runs (VISION §3). The shed-count signal is the
-/// green artifact: shed_count(presence) > 0, shed_count(human) == 0.
 #[test]
 fn chat_d4_shed_order_holds_human_lane_zero_drops() {
     use myelin_substrate::shed::SurfaceBudget;
@@ -350,10 +301,6 @@ fn chat_d4_shed_order_holds_human_lane_zero_drops() {
     let tenant = alice.principal.tenant.clone();
     let scope = chat_channel_scope(CHANNEL).unwrap();
 
-    // drive the gateway's shed governor at a SMALL deterministic budget (the storm boundary is
-    // reachable without a 256-deep storm) — the OQ-K v1 floor numbers are tuned by CHAT-P26; the
-    // FLOOR PROPERTY (bounded + reserved human lane + shed order) is what this drill asserts. The
-    // connection-storm signal flips pressure on.
     let conn_budget = SurfaceBudget {
         per_tenant_in_flight_cap: 12,
         human_lane_reservation: 4,
@@ -375,14 +322,10 @@ fn chat_d4_shed_order_holds_human_lane_zero_drops() {
     let mut human_delivered = 0usize;
     let mut human_shed = 0usize;
 
-    // roll a storm of mixed frames: lots of presence + agent partials (low value) interleaved with
-    // human messages (the protected lane). The presence/agent lanes overflow their budgets and shed;
-    // the human lane keeps delivering (the reserved slots are never given to a machine lane).
     let storm = 40usize;
 
     for i in 0..storm {
         let mut d = gw.live_delivery();
-        // a presence beacon (speculative — sheds first).
         if d.deliver(
             &tenant,
             &stream,
@@ -395,7 +338,6 @@ fn chat_d4_shed_order_holds_human_lane_zero_drops() {
         {
             presence_shed += 1;
         }
-        // an agent partial (the agent lane — sheds before humans).
         if d.deliver(
             &tenant,
             &stream,
@@ -407,7 +349,6 @@ fn chat_d4_shed_order_holds_human_lane_zero_drops() {
         {
             agent_shed += 1;
         }
-        // a HUMAN message (the protected lane — must NOT shed while cheaper lanes carry load).
         match d.deliver(
             &tenant,
             &stream,
@@ -419,17 +360,11 @@ fn chat_d4_shed_order_holds_human_lane_zero_drops() {
             DeliveryOutcome::Delivered(_) => human_delivered += 1,
             DeliveryOutcome::Shed => human_shed += 1,
         }
-        // the human frame is pumped to the socket PROMPTLY (interactive priority) → its slot is
-        // released, so the human lane stays within budget while the machine lanes back up and shed.
         d.governor_mut()
             .on_drained(&tenant, LiveSurface::HumanMessage);
-        // a real durable human send underlies the live frame (the source of truth).
         durable_send(&gw, &ob, &minter, &format!("h{i}"));
     }
 
-    // the shed-count signal (the dated green artifact):
-    //  - the speculative + agent lanes SHED under pressure (they overflowed their budgets);
-    //  - the human lane took 0 drops (it delivered EVERY frame — humans never queue behind agents).
     assert!(
         presence_shed > 0,
         "CHAT-D4: the speculative/presence lane sheds under storm (shed_count > 0)"
@@ -448,25 +383,16 @@ fn chat_d4_shed_order_holds_human_lane_zero_drops() {
     );
 }
 
-/// **CHAT-D4-AT-SCALE — the DEPLOY-HERD: roll the gateway fleet in WAVES under a connection storm →
-/// bounded reconnect, resume completes for ALL, 0 message loss (CHAT-P26 / P-500, M5).** The M4-C2
-/// CHAT-D4 connection-storm drill RE-RUN at world scale: a deploy-herd rolls the fleet in
-/// `WAVES` cohorts (a rolling deploy / gateway-fleet roll), each cohort severed + reconnected while
-/// messages keep flowing, so EVERY cohort's resume backfills its own gap. The bounded-reconnect
-/// signal: every reconnect completes IN-WINDOW (no resync needed — the window covers the herd gap),
-/// 0 lost across the whole roll. This is the deploy-herd half of the F6 surge family (sibling to
-/// SUB-D11 connection-storm / the CHAT-D3 surge).
 #[test]
 fn chat_d4_at_scale_deploy_herd_reconnect_completes_for_all_zero_loss() {
-    const FLEET: usize = 256; // world-scale fleet (8× the M4-C2 FLEET); the real-fleet 30× is the named floor.
-    const WAVES: usize = 8; // the rolling-deploy cohort count (the herd reconnects in waves).
+    const FLEET: usize = 256;
+    const WAVES: usize = 8;
     let members: Vec<String> = (0..FLEET).map(|i| format!("u{i}")).collect();
     let member_refs: Vec<&str> = members.iter().map(|s| s.as_str()).collect();
 
     let store = MemHotTier::new();
     let mut gw = gateway(store, 16384, &member_refs);
 
-    // every member connects + subscribes (the full fleet up before the roll).
     let mut conns = Vec::new();
     let mut subs = Vec::new();
     for m in &members {
@@ -478,7 +404,6 @@ fn chat_d4_at_scale_deploy_herd_reconnect_completes_for_all_zero_loss() {
     let stream = conns[0].stream.clone();
     let scope = chat_channel_scope(CHANNEL).unwrap();
 
-    // a prefix of frames is delivered + consumed by the whole fleet (all at last_seq = 2).
     for body in ["m1", "m2"] {
         gw.firehose_mut()
             .publish(&stream, &scope, myelin_events::FrameDraft::new(body));
@@ -492,21 +417,16 @@ fn chat_d4_at_scale_deploy_herd_reconnect_completes_for_all_zero_loss() {
         );
     }
 
-    // THE DEPLOY HERD: roll the fleet in WAVES. Each cohort is severed (its node rolls — drop its
-    // subscription handles), messages keep flowing during the gap, then the cohort reconnects +
-    // resumes — bounded reconnect, 0 loss. Sever the ENTIRE fleet up front (the rolling deploy
-    // detaches every node's live socket); each wave reconnects its cohort while traffic flows.
     subs.clear();
     let cursor = myelin_chat::MessageId("00000000000000000000000000".into());
     let cohort = FLEET / WAVES;
-    let mut next_seq = 3u64; // m1,m2 already published.
+    let mut next_seq = 3u64;
     let mut resumed = 0usize;
 
     for wave in 0..WAVES {
         let lo = wave * cohort;
         let hi = lo + cohort;
 
-        // frames flow DURING this wave's roll (the gap each reconnecting cohort member must backfill).
         let gap_lo = next_seq;
         for k in 0..3 {
             gw.firehose_mut().publish(
@@ -519,8 +439,6 @@ fn chat_d4_at_scale_deploy_herd_reconnect_completes_for_all_zero_loss() {
         let gap_hi = next_seq - 1;
         let expected_gap: Vec<u64> = (gap_lo..=gap_hi).collect();
 
-        // RECONNECT this cohort — each resume must complete in-window (bounded), 0 loss. The cohort
-        // resumes from the seq just before this wave's gap (the herd reconnects after the roll).
         for c in &conns[lo..hi] {
             let outcome = gw
                 .resume(c, &conv(), None, gap_lo - 1, &cursor)
@@ -530,18 +448,17 @@ fn chat_d4_at_scale_deploy_herd_reconnect_completes_for_all_zero_loss() {
                     let got: Vec<u64> = backfill.iter().map(|f| f.seq).collect();
                     assert_eq!(
                         got, expected_gap,
-                        "0 lost — wave {wave} cohort recovered its full roll gap"
+                        "0 lost - wave {wave} cohort recovered its full roll gap"
                     );
                     resumed += 1;
                 }
                 ResumeOutcome::Resync { .. } => panic!(
-                    "the window covers the deploy-herd gap — no resync for an in-window cursor (wave {wave})"
+                    "the window covers the deploy-herd gap - no resync for an in-window cursor (wave {wave})"
                 ),
             }
         }
     }
 
-    // the dated green artifact (bounded-reconnect signal): resume completed for ALL across the roll.
     assert_eq!(
         resumed, FLEET,
         "CHAT-D4-at-scale: resume completes for ALL {FLEET} reconnecting connections across the \

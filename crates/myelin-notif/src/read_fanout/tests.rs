@@ -1,11 +1,3 @@
-//! Unit tests for the read-fanout (NOTIF-P13 / P-191): the §3.5 read-fanout — ONE coalesced marker
-//! per subject_root (zero write amplification), the `SetExpr` watcher push-down JOIN (one query, no
-//! N+1, no post-filter), and the zookie watermark (a just-revoked watch reflected; held, not leaked).
-//!
-//! The mutation floor's load-bearing surfaces — [`AmbientMarkerStore::record`] (ONE marker, never N),
-//! the [`SetExpr`] lowering (`InRelation`/`TupleSet`/boolean/`Ids`/`NotIds`/`All`/`None`), and the
-//! watermark gate ([`ReverseIndexAnswer::honours`]) — are each pinned by an assertion below.
-
 use super::*;
 use myelin_identity::{
     AuthzIndexRef, ConsistencyMode, ObjectId, PrincipalId, PrincipalKind, Zookie,
@@ -30,17 +22,10 @@ fn strong(zk: &str) -> Consistency {
     }
 }
 
-// --- (1) ONE coalesced marker per subject_root — ZERO write amplification ---
-
-/// **`AmbientMarkerStore::record`: N ambient events on a subject coalesce into ONE marker (count
-/// accumulates), NEVER N markers and NEVER one row per watcher (§3.5, zero write amplification).** A
-/// 50k-watcher celebrity subject hit 1000 times produces exactly ONE marker with `count = 1000`. A
-/// mutant that opens a new marker per event (or per watcher) is caught.
 #[test]
 fn record_stores_one_marker_per_subject_root_zero_write_amplification() {
     let store = AmbientMarkerStore::new();
     let subj = subject("myelin://acme/chat/thread/celebrity");
-    // 1000 ambient events on the ONE hot subject (a 50k-watcher celebrity channel).
     for i in 0..1000 {
         store.record(
             &tenant(),
@@ -49,7 +34,6 @@ fn record_stores_one_marker_per_subject_root_zero_write_amplification() {
             &origin(&format!("e{i}")),
         );
     }
-    // ZERO write amplification: exactly ONE marker (not 1000, not 50k).
     assert_eq!(
         store.marker_count(&tenant()),
         1,
@@ -65,8 +49,6 @@ fn record_stores_one_marker_per_subject_root_zero_write_amplification() {
     assert_eq!(m.reason, crate::Reason::Watched);
 }
 
-/// **The `#sub` fragment is stripped to the root, so sub-thread activity coalesces into the ONE
-/// root marker (§3.2.3).** Two events on `…/T1#c1` and `…/T1#c2` share the ONE `…/T1` marker.
 #[test]
 fn record_coalesces_subthreads_into_the_root_marker() {
     let store = AmbientMarkerStore::new();
@@ -93,8 +75,6 @@ fn record_coalesces_subthreads_into_the_root_marker() {
     assert_eq!(m.count, 2);
 }
 
-/// **Markers are tenant-partitioned: another tenant's marker is never counted/read** (the partition
-/// key, §3.4). A marker under `acme` is invisible to a `globex` read.
 #[test]
 fn markers_are_tenant_partitioned() {
     let store = AmbientMarkerStore::new();
@@ -114,9 +94,6 @@ fn markers_are_tenant_partitioned() {
     assert!(store.get(&other, "myelin://acme/git/pr/9").is_none());
 }
 
-// --- (2) the SetExpr watcher push-down JOIN: one query, no N+1, no post-filter ---
-
-/// Seed three ambient markers + an index where the viewer watches exactly two of the three roots.
 fn seeded() -> (AmbientMarkerStore, SyntheticReverseIndex) {
     let store = AmbientMarkerStore::new();
     store.record(
@@ -143,10 +120,6 @@ fn seeded() -> (AmbientMarkerStore, SyntheticReverseIndex) {
     (store, idx)
 }
 
-/// **The read-fanout resolves the viewer's slice via the `SetExpr` JOIN — only the roots the viewer
-/// WATCHES are materialised (the markers ⋈ reachable_roots JOIN, no post-filter).** u1 watches a + c
-/// (not b); the read-fanout returns exactly the a + c markers from the THREE-marker store. A mutant
-/// that returns all markers (skips the JOIN) or the wrong slice is caught.
 #[test]
 fn read_fanout_materialises_only_the_watched_slice_via_the_join() {
     let (store, idx) = seeded();
@@ -158,14 +131,12 @@ fn read_fanout_materialises_only_the_watched_slice_via_the_join() {
         vec!["root/a", "root/c"],
         "the viewer sees exactly the roots they watch (a, c), stable order"
     );
-    // the un-watched root b is NOT in the slice (the JOIN excluded it — not a post-filter over all).
     assert!(
         !roots.contains(&"root/b"),
         "a non-watched subject's marker is NOT in the viewer's slice"
     );
 }
 
-/// **A viewer who watches NOTHING gets an empty slice (the JOIN yields ∅, not the whole store).**
 #[test]
 fn read_fanout_for_a_non_watcher_is_empty() {
     let (store, idx) = seeded();
@@ -177,17 +148,12 @@ fn read_fanout_for_a_non_watcher_is_empty() {
     );
 }
 
-/// **The `SetExpr` boolean + bounded forms lower correctly over Notif's own subject_root column.**
-/// Exercises every algebra arm against the marker set directly (the leak-critical lowering surface):
-/// `All`, `None`, `Ids`, `NotIds`, `Union`, `Intersect`, `Difference`. A mutant that widens `None`/
-/// `NotIds`/`Difference` or narrows `All`/`Union` is caught.
 #[test]
 fn setexpr_lowering_covers_every_algebra_arm() {
     let store = AmbientMarkerStore::new();
     for r in ["root/a", "root/b", "root/c", "root/d"] {
         store.record(&tenant(), &subject(r), crate::Reason::Watched, &origin(r));
     }
-    // A resolver that returns the given SetExpr as the pushed-down filter, watermark always honoured.
     struct ExprPort(SetExpr);
     impl WatcherResolvePort for ExprPort {
         fn list_objects(
@@ -202,7 +168,6 @@ fn setexpr_lowering_covers_every_algebra_arm() {
                 zookie: Zookie("zk-0".into()),
             })
         }
-        // No relational leaf in these exprs → resolve_relation is never called; the default would error.
     }
     let roots = |expr: SetExpr| -> Vec<String> {
         let port = ExprPort(expr);
@@ -214,25 +179,20 @@ fn setexpr_lowering_covers_every_algebra_arm() {
     };
     let id = |s: &str| ObjectId(s.into());
 
-    // All → every marker of the tenant.
     assert_eq!(
         roots(SetExpr::All).len(),
         4,
         "All → every marker (type+tenant scoped)"
     );
-    // None → ∅ (WHERE false) — the deny short-circuit.
     assert!(roots(SetExpr::None).is_empty(), "None → ∅ (WHERE false)");
-    // Ids → exactly the listed roots.
     assert_eq!(
         roots(SetExpr::Ids(vec![id("root/a"), id("root/c")])),
         vec!["root/a", "root/c"]
     );
-    // NotIds → every root EXCEPT the deny-set.
     assert_eq!(
         roots(SetExpr::NotIds(vec![id("root/a")])),
         vec!["root/b", "root/c", "root/d"]
     );
-    // Union(Ids{a}, Ids{b}) → a ∪ b.
     assert_eq!(
         roots(SetExpr::Union(vec![
             SetExpr::Ids(vec![id("root/a")]),
@@ -240,7 +200,6 @@ fn setexpr_lowering_covers_every_algebra_arm() {
         ])),
         vec!["root/a", "root/b"]
     );
-    // Intersect(NotIds{a}, Ids{a,b}) → b (the intersection bites).
     assert_eq!(
         roots(SetExpr::Intersect(vec![
             SetExpr::NotIds(vec![id("root/a")]),
@@ -248,7 +207,6 @@ fn setexpr_lowering_covers_every_algebra_arm() {
         ])),
         vec!["root/b"]
     );
-    // Difference(All, Ids{a,b,c}) → d (everything except a,b,c).
     assert_eq!(
         roots(SetExpr::Difference(
             Box::new(SetExpr::All),
@@ -258,8 +216,6 @@ fn setexpr_lowering_covers_every_algebra_arm() {
     );
 }
 
-/// **The `TupleSet` relational form also resolves via the reverse-index JOIN (the big-result path).**
-/// The synthetic index serves the same watched set for a `TupleSet` leaf as for `InRelation{watcher}`.
 #[test]
 fn tupleset_relational_form_resolves_via_the_join() {
     let (store, idx) = seeded();
@@ -299,16 +255,9 @@ fn tupleset_relational_form_resolves_via_the_join() {
     );
 }
 
-// --- (3) the zookie watermark: a just-revoked watch reflected; held, not leaked ---
-
-/// **THE ZOOKIE WATERMARK (contract 4.10): a just-revoked watch is reflected at-or-after the new
-/// zookie — the revoked subject's ambient marker is ABSENT from the viewer's slice (held, not
-/// leaked).** u1 watches a + c; the watch on c is REVOKED (a newer zookie); a read at the new
-/// watermark returns ONLY a (c is held, not leaked). The chained drill the prompt names.
 #[test]
 fn revoked_watch_is_reflected_held_not_leaked() {
     let (store, idx) = seeded();
-    // Before: u1 watches a + c → both materialise.
     let before = read_fanout(
         &viewer("u1"),
         &store,
@@ -323,10 +272,8 @@ fn revoked_watch_is_reflected_held_not_leaked() {
         "before revoke: u1 sees a + c"
     );
 
-    // Revoke u1's watch on c → a NEWER zookie (the watermark a strong read must honour).
     let new_zk = idx.revoke_watch(&tenant(), "u1", "root/c");
 
-    // After: a read at the NEW watermark reflects the revocation — c is HELD, not leaked.
     let after = read_fanout(&viewer("u1"), &store, &idx, &strong(&new_zk.0)).unwrap();
     let after_roots: Vec<&str> = after.iter().map(|m| m.subject_root.as_str()).collect();
     assert_eq!(
@@ -340,16 +287,10 @@ fn revoked_watch_is_reflected_held_not_leaked() {
     );
 }
 
-/// **The watermark GATE rejects a STALE reverse-index revision (never read stale → held, not
-/// leaked).** A resolver pinned to serve an OLD revision below the required watermark is rejected as
-/// [`ReadFanoutError::StaleReverseIndex`] — a stale revision could re-admit a just-revoked watch (the
-/// new-enemy problem). A mutant that skips `honours()` (serves the stale revision) is caught.
 #[test]
 fn stale_reverse_index_revision_is_rejected_not_served() {
     let (store, idx) = seeded();
-    // Advance the revision (more writes) so the current watermark is high…
-    let current = idx.grant_watch(&tenant(), "other", "root/x"); // bumps revision
-                                                                 // …but pin the index to SERVE an old revision (1) below the required watermark.
+    let current = idx.grant_watch(&tenant(), "other", "root/x");
     idx.pin_served_revision(Some(1));
     let err = read_fanout(&viewer("u1"), &store, &idx, &strong(&current.0)).unwrap_err();
     match err {
@@ -363,9 +304,6 @@ fn stale_reverse_index_revision_is_rejected_not_served() {
     }
 }
 
-/// **An UNAVAILABLE resolver → held, not leaked (ADR-03 deny-when-unsure, §5.3).** An Id hiccup makes
-/// `list_objects` unavailable; the read-fanout returns a loud [`ReadFanoutError::Unavailable`] — it
-/// NEVER falls open and serves the whole store. A mutant that swallows the error and widens is caught.
 #[test]
 fn unavailable_resolver_holds_not_leaks() {
     let (store, idx) = seeded();
@@ -383,19 +321,15 @@ fn unavailable_resolver_holds_not_leaks() {
     );
 }
 
-/// **A `BoundedStale` read may serve from a lower watermark (the fail-static path, §10) — it does NOT
-/// reject a lagging revision.** The mode discriminates: Strong pins the watermark, BoundedStale sets
-/// it to 0 (any non-stale revision satisfies). A mutant that ignores the mode is caught.
 #[test]
 fn bounded_stale_read_serves_from_a_lower_watermark() {
     let (store, idx) = seeded();
-    let current = idx.grant_watch(&tenant(), "other", "root/x"); // a high current revision
-    idx.pin_served_revision(Some(1)); // serve an old revision
+    let current = idx.grant_watch(&tenant(), "other", "root/x");
+    idx.pin_served_revision(Some(1));
     let bounded = Consistency {
         at_least: current,
         mode: ConsistencyMode::BoundedStale,
     };
-    // BoundedStale → watermark 0 → the old revision is acceptable (the fail-static path serves it).
     let slice = read_fanout(&viewer("u1"), &store, &idx, &bounded).unwrap();
     let roots: Vec<&str> = slice.iter().map(|m| m.subject_root.as_str()).collect();
     assert_eq!(
@@ -405,9 +339,6 @@ fn bounded_stale_read_serves_from_a_lower_watermark() {
     );
 }
 
-/// **The `Ids` (S4) materialised path needs NO JOIN — a bounded watched set is returned directly.** A
-/// resolver answering with `Ids{watched}` (a viewer with a small bounded watch set) materialises that
-/// slice without a `resolve_relation` call (the no-N+1 invariant: 0 relational resolves on the S4 path).
 #[test]
 fn ids_materialised_path_needs_no_join() {
     let store = AmbientMarkerStore::new();
@@ -423,8 +354,6 @@ fn ids_materialised_path_needs_no_join() {
         crate::Reason::Watched,
         &origin("b"),
     );
-    // A resolver that returns the S4 materialised Ids path — and PANICS if resolve_relation is called
-    // (proving the S4 path makes ZERO reverse-index JOIN calls — the no-N+1 invariant).
     struct IdsPort;
     impl WatcherResolvePort for IdsPort {
         fn list_objects(
@@ -457,10 +386,6 @@ fn ids_materialised_path_needs_no_join() {
     assert_eq!(slice[0].subject_root, "root/a");
 }
 
-// --- the watermark gate predicate (the load-bearing comparison the mutation floor pins) ---
-
-/// **`ReverseIndexAnswer::honours`: a revision ≥ the watermark honours; below is rejected.** The exact
-/// boundary the watermark gate turns on. A mutant that flips `>=` to `>` or `<` is caught.
 #[test]
 fn honours_is_revision_ge_watermark() {
     let answer = |rev: u64| ReverseIndexAnswer {
@@ -481,8 +406,6 @@ fn honours_is_revision_ge_watermark() {
     );
 }
 
-/// **The default `resolve_relation` is UNAVAILABLE (deny-when-unsure).** A port wired only for the
-/// bounded path has no reverse index — a relational leaf is a loud error, never a silent widen.
 #[test]
 fn default_resolve_relation_is_unavailable() {
     struct BoundedOnlyPort;
@@ -503,7 +426,6 @@ fn default_resolve_relation_is_unavailable() {
             })
         }
     }
-    // The list_objects returns a relational Filter, but the port has no resolver → Unavailable (held).
     let store = AmbientMarkerStore::new();
     store.record(
         &tenant(),
@@ -518,9 +440,6 @@ fn default_resolve_relation_is_unavailable() {
     );
 }
 
-/// **The synthetic fixture's `revoke_watch` BUMPS the monotone revision (a newer zookie).** The
-/// watermark drill depends on a revoke advancing the revision strictly past the grant's — assert it
-/// (a mutant that fails to bump the revision on revoke would let a stale read mask the revocation).
 #[test]
 fn synthetic_revoke_bumps_the_revision_strictly() {
     let idx = SyntheticReverseIndex::new();
@@ -530,7 +449,6 @@ fn synthetic_revoke_bumps_the_revision_strictly() {
         after_revoke > after_grant,
         "revoke advances the monotone revision strictly (a newer zookie)"
     );
-    // and a second revoke advances it again (strictly monotone, never flat/decreasing).
     let after_second = parse_zk(&idx.revoke_watch(&tenant(), "u1", "root/a").0);
     assert!(
         after_second > after_revoke,
@@ -538,15 +456,11 @@ fn synthetic_revoke_bumps_the_revision_strictly() {
     );
 }
 
-/// **The synthetic fixture serves ONLY the `watcher` relation — a different relation resolves to the
-/// EMPTY set (never the watched set).** A mutant that drops the relation guard (serving the watched
-/// set for ANY relation) is caught.
 #[test]
 fn synthetic_serves_only_the_watcher_relation() {
     let idx = SyntheticReverseIndex::new();
     idx.grant_watch(&tenant(), "u1", "root/a");
     let req = RevisionWatermark(0);
-    // the watcher relation → the watched set.
     let watcher_leaf = RelationalLeaf::InRelation {
         relation: RelName(WATCHER_RELATION.into()),
         via_column: subject_root_col(),
@@ -559,7 +473,6 @@ fn synthetic_serves_only_the_watcher_relation() {
         1,
         "the watcher relation resolves the watched set"
     );
-    // a DIFFERENT relation (e.g. `editor`) → the EMPTY set (the guard bites; never the watched set).
     let other_leaf = RelationalLeaf::InRelation {
         relation: RelName("editor".into()),
         via_column: subject_root_col(),
@@ -577,9 +490,6 @@ fn parse_zk(zk: &str) -> u64 {
     zk.strip_prefix("zk-").unwrap().parse().unwrap()
 }
 
-/// **The marker carries REFS, never payloads (NOTIF-1, references-not-payloads).** The subject +
-/// latest-origin are `ArtifactRef`s, resolved per-viewer at humanise time — so erasing a person
-/// tombstones their appearance for free (the X-7 erasure posture applies to the read-fanout too).
 #[test]
 fn marker_carries_refs_not_payloads() {
     let store = AmbientMarkerStore::new();

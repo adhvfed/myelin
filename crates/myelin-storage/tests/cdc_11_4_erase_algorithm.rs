@@ -1,20 +1,3 @@
-//! Contract 11.4 CDC pair — the crypto-shred `erase(subject, tenant)` six-step algorithm
-//! (P-ST-09 / global P-099, the erase-algorithm half of row 11.4).
-//!
-//! Row 11.4's erase-algorithm half is the storage-side MECHANISM behind the DSR orchestrator. This
-//! CDC pair pins the seam between:
-//!   - the **PROVIDER** = `myelin-storage` — [`CryptoShredErase::erase`] (the six steps in §5.2
-//!     order, idempotent, loud-on-partial-failure), step 2 (`KMS.destroy(per_subject_DEK)`) owned
-//!     in-crate, the cross-holder steps (1/3/4/5/6) driven through the seam traits;
-//!   - the **CONSUMER** = the DSR ORCHESTRATOR (GDPR 10.1/10.11) — it wires the real subsystem
-//!     holders behind the five seams ([`PseudonymShred`] → Id, [`SearchPurge`] → Search,
-//!     [`RefsTombstone`] → Refs, [`BusErase`] → Bus, [`ErasureLedgerSink`] → the 10.8 ledger) and
-//!     calls `erase(subject, tenant)`, expecting the six steps to run in order and the per-subject
-//!     ciphertext to become unrecoverable (live + backup).
-//!
-//! If the algorithm's step set/order, its idempotency, or its 0-recoverable post-condition drifts,
-//! this stops passing — exactly the consumer-driven contract the DSR orchestrator depends on.
-
 use myelin_gdpr::ErasureMethod;
 use myelin_storage::{
     BusErase, ColumnCryptor, CryptoShredErase, EpochMillis, EraseError, EraseHolders,
@@ -27,8 +10,6 @@ use std::collections::BTreeSet;
 fn region() -> Region {
     Region("eu-west".into())
 }
-
-// ── The CONSUMER's wiring: the DSR orchestrator's five seam adapters (deterministic doubles). ──
 
 #[derive(Default)]
 struct OrchestratorWiring {
@@ -91,7 +72,6 @@ fn cdc_11_4_dsr_orchestrator_calls_erase_and_the_six_steps_run_in_order() {
     let kms = engine_with_subject_column(&tenant, &subject);
     let eraser = CryptoShredErase::new(&kms, region());
 
-    // The DSR orchestrator wires ONE struct as all five seams and calls erase.
     let wiring = OrchestratorWiring::default();
     let holders = EraseHolders {
         pseudonym: &wiring,
@@ -105,7 +85,6 @@ fn cdc_11_4_dsr_orchestrator_calls_erase_and_the_six_steps_run_in_order() {
         .erase(&subject, &tenant, &holders, 1_000)
         .expect("the DSR orchestrator's erase succeeds");
 
-    // The six steps ran in the §5.2 order (step 2 = KMS, owned; observed via dek_destroyed_now).
     assert_eq!(
         wiring.order.borrow().as_slice(),
         ["1:pseudonym", "3:search", "4:refs", "5:bus", "6:ledger"],
@@ -124,8 +103,6 @@ fn cdc_11_4_dsr_orchestrator_calls_erase_and_the_six_steps_run_in_order() {
 
 #[test]
 fn cdc_11_4_erase_is_idempotent_for_the_orchestrator() {
-    // The orchestrator MUST be able to retry a (partially-)failed DSR without an error on the second
-    // pass — re-erasing an already-erased subject is a no-op success (per-effect idempotency).
     let tenant = TenantId("acme".into());
     let subject = SubjectId::new("u-retry");
     let kms = engine_with_subject_column(&tenant, &subject);

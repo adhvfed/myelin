@@ -1,23 +1,3 @@
-//! # LIVE end-to-end drill — real Luna brain → the driving loop → per-turn wallet metering → answer.
-//!
-//! The full hosted-agent composition proven against BOTH real dependencies:
-//!   - the **real Luna brain** ([`LunaClient::from_env`], `OPENAI_API_KEY` injected via `fed`), and
-//!   - the **real durable wallet** on live Postgres `:5433` (the same stack + gating as
-//!     `myelin-agent-service`'s `integration_wallet_metering`).
-//!
-//! Run it (key + DB present):
-//! ```text
-//! DATABASE_URL=postgres://myelin_app:myelin_app_pw@localhost:5433/myelin \
-//!   AWS_DEFAULT_REGION=fr-par \
-//!   cargo test -p myelin-agent-host --test e2e_luna_live -- --ignored --nocapture
-//! ```
-//! It skips GRACEFULLY (no failure) when `OPENAI_API_KEY` is absent or the DB is unreachable, and is
-//! `#[ignore]` so the default hermetic suite never reaches the network — the mock sibling
-//! (`e2e_mock_metered_run.rs`) proves the identical composition + F1 + metering path with no network.
-//!
-//! The API key rides only in the Luna `Authorization` header (never logged); this drill prints the
-//! real answer + the wallet debit, never the key.
-
 use std::sync::Arc;
 
 use myelin_agent_host::{AgentHost, CreditKind, LlmRunTask, MicroUsd, RunSubstrateWiring, Tools};
@@ -51,7 +31,6 @@ fn uniq() -> String {
     )
 }
 
-/// Apply the agent-wallet migration (0080) as the admin/owner role. `None` (SKIP) if unreachable.
 async fn migrate_admin() -> Option<SubstrateProvider> {
     let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
         Ok(p) => p,
@@ -67,7 +46,6 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
     Some(admin)
 }
 
-/// Count the run-linked `debit` rows for `(tenant, region)` directly in SQL (the independent oracle).
 async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id: &str) -> i64 {
     let mut tx = pool.begin().await.expect("begin count tx");
     sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
@@ -101,13 +79,9 @@ fn agent_principal(tenant: &TenantId) -> Principal {
     )
 }
 
-/// **The headline live drill: seed a durable wallet, drive a real Luna run through
-/// [`AgentHost::run_llm_agent`], and assert it SUBMITTED a real text answer, the wallet DROPPED
-/// (metered — a run-linked debit row), and the run tore down cleanly.**
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "hits real Luna + live Postgres; requires OPENAI_API_KEY and the dev DB (:5433)"]
 async fn live_luna_run_is_metered_end_to_end() {
-    // Gate 1 — the real brain (the key rides only in the Luna Authorization header; never printed).
     let luna = match LunaClient::from_env() {
         Ok(c) => c,
         Err(ModelError::MissingApiKey) => {
@@ -116,7 +90,6 @@ async fn live_luna_run_is_metered_end_to_end() {
         }
         Err(e) => panic!("unexpected Luna construction error: {e}"),
     };
-    // Gate 2 — the live durable wallet DB.
     let Some(_admin) = migrate_admin().await else {
         return;
     };
@@ -126,18 +99,14 @@ async fn live_luna_run_is_metered_end_to_end() {
     let region_s = app.config().region.clone();
     let tenant = TenantId(format!("01J0HOSTLUNA{}", uniq()));
 
-    // The F2-airtight composition root: wallet + region both from THIS provider.
     let host = AgentHost::new(app.clone());
     assert_eq!(host.region().0, region_s, "F2: host region == provider region");
 
-    // Seed $1.00 (a few cents cap is plenty for a one-word Luna answer).
     let topup = MicroUsd(1_000_000);
     host.wallet()
         .credit(&tenant, topup, CreditKind::Topup, None)
         .expect("topup seeds the wallet");
 
-    // The in-memory nominal substrate (the reserve/settle nominal layer; the wallet is the real
-    // money and is durable).
     let mut ledger = CostLedger::new();
     let outbox = OutboxStore::new();
     let mut wiring = RunSubstrateWiring {
@@ -159,12 +128,10 @@ async fn live_luna_run_is_metered_end_to_end() {
     .with_max_output_tokens(16)
     .with_now_secs(1000);
 
-    // F1: the durable wallet is threaded non-optionally — a real paid run is always billed.
     let report = host
         .run(&task, &mut wiring, Box::new(luna), Tools::none())
         .expect("the live Luna run completes");
 
-    // The run SUBMITTED a non-empty text answer from REAL Luna.
     eprintln!("LIVE Luna answer: {:?}", report.answer);
     eprintln!(
         "LIVE wallet: topup={} charged_micro={} balance={}",
@@ -175,20 +142,17 @@ async fn live_luna_run_is_metered_end_to_end() {
     assert!(!report.answer.trim().is_empty(), "real Luna produced an answer");
     assert!(report.outcome.0.contains("completed"), "the run completed cleanly");
 
-    // The wallet DROPPED — metered per turn (real billing).
     assert!(report.charged_micro > 0, "at least one turn was priced + debited");
     assert_eq!(
         host.wallet().balance(&tenant),
         MicroUsd(topup.0 - report.charged_micro),
         "balance dropped by exactly the charged amount"
     );
-    // At least one run-linked debit row landed in the immutable ledger (the independent SQL oracle).
     assert!(
         debit_row_count(app.db_pool(), &tenant.0, &region_s, run_id).await >= 1,
         "a run-linked debit row was written"
     );
 
-    // The run tore down cleanly: a balanced reserve/settle ledger, a trace, the token revoked.
     assert!(report.telemetry.ledger_balanced(), "reserved == settled");
     assert_eq!(report.telemetry.traces_written(), 1);
     assert_eq!(report.telemetry.tokens_revoked(), 1, "per-run token revoked on teardown");

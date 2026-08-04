@@ -1,26 +1,3 @@
-//! # CHAT-D1 / CHAT-D13 — the Bus's firehose + co-commit under Chat's load (EB-27 / P-327, M4)
-//!
-//! **Drill catalogue:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` rows
-//! **CHAT-D1** (F5/OQ-J — sever the gateway↔firehose mid-publish → `resume(stream, scope, last_seq)`
-//! recovers the gap **0 lost / 0 dup**; an over-window `last_seq` → `resync_required` → `*.snapshot`
-//! fallback, still 0 lost) + **CHAT-D13** (F5 — crash between message persist and event emit →
-//! either BOTH committed or NEITHER; the message and `chat.message.created` are ATOMIC; no
-//! orphan/phantom — the co-commit proof).
-//!
-//! ## What these prove (the Bus's NARROW carriage under Chat's load)
-//! Chat is the heaviest firehose producer (presence/typing/live delivery over `channel:<id>` scopes)
-//! and a durable producer (`chat.message.created` via the outbox). The Bus owns the CARRIAGE: the
-//! firehose resume-cursor transport (contract 3.5) + the outbox emit-iff-committed co-commit (BUS-D4,
-//! contract 2.2). These drills assert the Bus's guarantees UNDER Chat's specific load shape:
-//! - **CHAT-D1** rides the Bus firehose on a `channel:<id>` scope (Chat's hot-channel storm surface);
-//! - **CHAT-D13** rides the Bus outbox co-commit (the message row + its `chat.message.created` event
-//!   share ONE transaction — both or neither).
-//!
-//! Chat OWNS its message model + presence semantics; this Bus prompt provides + drills the CARRIAGE
-//! they ride (the §4.12-style narrow role). The verdict is read off the FROZEN §10.2 harness
-//! assertion library (the firehose seq-gap → `ConsumerLag`; the resync count → `ResyncRequiredCount`;
-//! the outbox co-commit → `OutboxDepth`).
-
 use std::sync::Arc;
 
 use myelin_events::{
@@ -33,8 +10,6 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_tenancy::{Region, TenantId};
 
 const STREAM: &str = "chat";
-/// Chat's hot-channel firehose scope (the `channel:<id>` storm surface — the same bounded selector
-/// grammar a hot board / hot doc uses, OQ-J).
 const CHANNEL_SCOPE: &str = "channel:eng-general";
 
 fn channel_scope() -> FirehoseScope {
@@ -61,8 +36,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// A `chat.message.created` durable draft (the message row's co-committed event). The body PII rides
-/// behind a per-subject DEK in the real store; the drill payload is references-only.
 fn message_created(msg_id: &str, channel: &str) -> EventDraft {
     EventDraft {
         type_: EventType("chat.message.created".into()),
@@ -76,14 +49,11 @@ fn message_created(msg_id: &str, channel: &str) -> EventDraft {
     }
 }
 
-/// **CHAT-D1 LEG 1 — sever the gateway↔firehose mid-publish; `resume(last_seq)` recovers the gap
-/// (0 lost / 0 dup) on a Chat `channel:` scope.**
 #[test]
 fn chat_d1_resume_recovers_the_gap_zero_lost_zero_dup() {
     let mut fh = Firehose::new();
     let scope = channel_scope();
 
-    // A client subscribes live to the hot channel and sees the first 3 presence/live frames.
     let sub = fh
         .subscribe(STREAM, &scope, None)
         .expect("a bounded channel: scope subscribes (never `*`)");
@@ -98,13 +68,11 @@ fn chat_d1_resume_recovers_the_gap_zero_lost_zero_dup() {
     );
     let last_seq = sub.last_seq();
 
-    // SEVER the gateway↔firehose connection. While down, the producer keeps publishing the gap.
     drop(sub);
     for _ in 0..4 {
         fh.publish(STREAM, &scope, FrameDraft::new("chat.live.frame"));
     }
 
-    // RECONNECT: resume(last_seq=3) → backfill (3, now] = {4,5,6,7}, then live.
     let resumed = fh
         .resume(STREAM, &scope, last_seq)
         .expect("an in-window resume backfills the gap");
@@ -112,15 +80,13 @@ fn chat_d1_resume_recovers_the_gap_zero_lost_zero_dup() {
     assert_eq!(
         backfilled,
         vec![4, 5, 6, 7],
-        "the gap (last_seq, now] is replayed — 0 ops lost"
+        "the gap (last_seq, now] is replayed - 0 ops lost"
     );
 
-    // A new live frame after the resume continues the seq with NO duplicate across the boundary.
     fh.publish(STREAM, &scope, FrameDraft::new("chat.live.frame"));
     let live: Vec<u64> = resumed.drain_ready().iter().map(|f| f.seq).collect();
     assert_eq!(live, vec![8], "0 dup across the backfill→live boundary");
 
-    // The seq-gap is 0 (contiguous) → through the §10.2 harness assertion library.
     let mut src = SignalSource::new();
     src.set_labelled(
         SignalName::ConsumerLag,
@@ -144,26 +110,19 @@ fn chat_d1_resume_recovers_the_gap_zero_lost_zero_dup() {
     );
 }
 
-/// **CHAT-D1 LEG 2 — an over-window `last_seq` → `resync_required` (NAMED, not silent) → the
-/// `*.snapshot` replay fallback, still 0 lost.** The retention window is bounded; a client behind the
-/// window floor cannot backfill — the Bus raises `resync_required` so Chat falls back to a
-/// `chat.*.snapshot` replay (EB-22), never a silent gap.
 #[test]
 fn chat_d1_over_window_raises_resync_required() {
-    // A small bounded window (the Chat hot-channel retention bound).
     let mut fh = Firehose::with_limits(4, DEFAULT_INFLIGHT_CAP);
     let scope = channel_scope();
 
     let sub = fh
         .subscribe(STREAM, &scope, None)
         .expect("bounded channel: scope");
-    // Publish far past the window capacity → the window floor advances beyond an old last_seq.
     for _ in 0..10 {
         fh.publish(STREAM, &scope, FrameDraft::new("chat.live.frame"));
     }
     drop(sub);
 
-    // A client whose last_seq (2) is now older than the window floor → resync_required.
     let err = fh
         .resume(STREAM, &scope, 2)
         .expect_err("an over-window resume cannot backfill");
@@ -173,8 +132,6 @@ fn chat_d1_over_window_raises_resync_required() {
     );
     assert!(matches!(err, FirehoseError::ResyncRequired { .. }));
 
-    // The resync signal fired → the §10.2 ResyncRequiredCount row reads >= 1 (the snapshot fallback
-    // is the EB-22 `*.snapshot` replay, proven cold == live by BUS-D5).
     let mut src = SignalSource::new();
     src.set_scalar(SignalName::ResyncRequiredCount, 1);
     src.assert_signal(SignalName::ResyncRequiredCount, Predicate::Gte(1))
@@ -184,16 +141,11 @@ fn chat_d1_over_window_raises_resync_required() {
     );
 }
 
-/// **CHAT-D13 — message-persist ↔ `chat.message.created` co-commit (BUS-D4 under Chat's load):
-/// either BOTH committed or NEITHER; no orphan/phantom.** The Bus's outbox carries Chat's durable
-/// message event in the SAME transaction as the message row — a crash between persist and emit writes
-/// NEITHER (emit-iff-committed).
 #[test]
 fn chat_d13_message_persist_event_co_commit() {
     let store = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
 
-    // (A) A COMMITTED message-persist: the message row + its chat.message.created commit TOGETHER.
     let committed_ids = {
         let mut tx = store.begin(minter.clone(), ctx_base());
         tx.stage_state_change("chat message m1 persisted");
@@ -205,17 +157,12 @@ fn chat_d13_message_persist_event_co_commit() {
         vec![id]
     };
 
-    // (B) A CRASHED message-persist: the message staged + the event emitted, then the transaction is
-    //     DROPPED without commit (the crash between persist and emit). Co-commit: this writes NOTHING
-    //     — no orphan message, no phantom event.
     {
         let mut tx = store.begin(minter, ctx_base());
         tx.stage_state_change("chat message m2 (will crash before commit)");
         tx.emit(message_created("m2", "eng-general"), None).unwrap();
-        // crash: tx dropped here without commit.
     }
 
-    // The crashed transaction left no rows: exactly the committed 1 (not 2) — no phantom event.
     assert_eq!(
         store.committed_count(),
         1,
@@ -227,7 +174,6 @@ fn chat_d13_message_persist_event_co_commit() {
         .assert_signal(SignalName::OutboxDepth, Predicate::Eq(1))
         .expect_green();
 
-    // The relay delivers exactly the committed message event — never the crashed one (no orphan).
     let bus = InProcessBus::new();
     let relay = Relay::new(store.clone(), bus.clone(), clock);
     relay.drain_to_empty();
@@ -250,8 +196,6 @@ fn chat_d13_message_persist_event_co_commit() {
     println!("[2026-06-21] PASS  drill=CHAT-D13  co_commit=true  (persist+emit atomic; no orphan/phantom)");
 }
 
-/// Guard: the firehose is a `channel:` scope (Chat's hot-channel surface), never `*` — the
-/// over-broad-scope rejection is the transport chokepoint Chat's load rides through.
 #[test]
 fn chat_firehose_rejects_an_over_broad_scope() {
     let mut fh = Firehose::new();

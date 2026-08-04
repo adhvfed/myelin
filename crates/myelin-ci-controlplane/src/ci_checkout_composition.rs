@@ -1,25 +1,3 @@
-//! CT-007 slice 5b.3-6d STEP 3: the **dormant** control-plane composition for the sandbox checkout
-//! orchestrator.
-//!
-//! This module supplies the REAL, durable implementations of the sandbox-side capability vocabulary
-//! that CT-007 slice 5b.3-6c drove with FAKE authorities:
-//!
-//! - the V2 phase-credential store factory ([`v2_phase_credential_store`]);
-//! - the V2 resolver seam ([`V2CheckoutComposition::mint_initial_phase_credential`] +
-//!   [`initial_phase_purpose`]) — a checkout job's first generation is `CheckoutAdvertise`, a compute
-//!   job's is `Workload`;
-//! - the durable [`AttemptAuthority`] adapter ([`DurableAttemptAuthority`]) bridging the sandbox's SYNC
-//!   trait onto the ASYNC control plane;
-//! - the parent-attempt reserve hook ([`V2CheckoutComposition::parent_attempt_reserve_hook`]) mapping
-//!   [`admit_parent_attempt`](crate::ci_prelaunch_usage_journal::CiPrelaunchUsageJournal::admit_parent_attempt)
-//!   to the sandbox [`ParentAttemptAdmission`], in ONE tenant transaction.
-//!
-//! **Dormant by construction.** No production composition root constructs [`V2CheckoutComposition`] or
-//! the V2 phase-store, and production `RunnerHooks` never install a [`ParentAttemptReserveHook`], so
-//! the whole path stays unreachable until 5b.3-6e's single activating cutover. The credential-store
-//! dormancy scan (`integration_ci_credential_generation.rs`) pins this file's exact marker occurrences
-//! as new DEFINITION sites while every composition-root zero stays zero.
-
 use std::sync::Arc;
 
 use myelin_ci_sandbox::checkout_orchestration::{
@@ -42,23 +20,8 @@ use crate::ci_prelaunch_usage_journal::{
     CiJobParentAttempt, CiParentAttemptAdmission, CiPrelaunchUsageJournal, CiPrelaunchUsagePhase,
 };
 use crate::job_queue_store::{CiJobLaunchClaim, CiJobQueueStore};
-// **The async→sync bridge is the crate's ONE shared off-runtime helper** (`runner_bind::bridge`) — the
-// SAME one `DurableLeaseAdapter`/`DurablePreparationLeaseCheckpoint` use, NOT a fork. Its precondition
-// (never a current-thread Tokio runtime; drive on a dedicated OS thread) holds on BOTH sync entry
-// points, which run on two DISTINCT off-runtime OS threads: (1) the parent-attempt reserve hook +
-// initial-credential resolution run on the runner's own `CiRunnerLoop::spawn` OS thread (inside
-// `run_one`), and (2) the `DurableAttemptAuthority` phase/lease/mint calls run on the sandbox's
-// scoped-launch OS thread (`std::thread::scope`, off the async runtime) into which the backend drives
-// the checkout orchestrator. Neither is a Tokio worker, so `block_on` runs directly and the
-// `try_current`/`block_in_place` fallback (which would PANIC on a current-thread runtime) is only ever
-// taken by the multi-thread live-PG tests that legally call these helpers on a Tokio worker.
 use crate::runner_bind::{bridge, DurablePreparationLeaseCheckpoint};
 
-/// The V2 phase-credential store factory — the ONLY sanctioned way this slice constructs a
-/// `V2PhaseBound` generation store, pairing the durable insert-or-replay store with the phase minter.
-/// Production passes `Arc::new(`[`IdentityCiJobCredentialMinter`](crate::ci_identity_adapter::IdentityCiJobCredentialMinter)`::new(..))`
-/// (the SAME minter type composition already builds at `ci_runner_composition.rs:734` for V1); the
-/// trait-object seam lets a live-PG test inject a call-counting wrapper to prove Identity invocation.
 pub fn v2_phase_credential_store(
     pool: sqlx::PgPool,
     region: impl Into<String>,
@@ -72,10 +35,6 @@ pub fn v2_phase_credential_store(
     )
 }
 
-/// **The V2 resolver seam's SELECTION rule.** A checkout-bearing job's first (resolver-minted)
-/// generation is `CheckoutAdvertise`; a compute job's is `Workload`. Both are mintable at claim
-/// resolution before any parent attempt — the store admits advertise (its parent/journal gates live
-/// in the execution boundary) and a compute job's workload as the FIRST generation of its claim.
 pub fn initial_phase_purpose(checkout: Option<&CheckoutAuthorizationScope>) -> CiCredentialPurpose {
     match checkout {
         Some(_) => CiCredentialPurpose::CheckoutAdvertise,
@@ -83,8 +42,6 @@ pub fn initial_phase_purpose(checkout: Option<&CheckoutAuthorizationScope>) -> C
     }
 }
 
-/// The sandbox preparation phase → durable journal phase mapping — the ONE place the two vocabularies
-/// meet, so a phase can never be journaled through a hand-written mismatched token.
 fn journal_phase(phase: PreparationPhase) -> CiPrelaunchUsagePhase {
     match phase {
         PreparationPhase::SecretResolution => {
@@ -95,9 +52,6 @@ fn journal_phase(phase: PreparationPhase) -> CiPrelaunchUsagePhase {
     }
 }
 
-/// The sandbox checkout phase → durable credential purpose mapping (preparation purposes only; the
-/// workload is a SEPARATE mint, so `CheckoutPhase` — which structurally excludes the workload —
-/// maps only onto the three preparation purposes).
 fn phase_purpose(phase: CheckoutPhase) -> CiCredentialPurpose {
     match phase {
         CheckoutPhase::Advertise => CiCredentialPurpose::CheckoutAdvertise,
@@ -106,33 +60,6 @@ fn phase_purpose(phase: CheckoutPhase) -> CiCredentialPurpose {
     }
 }
 
-/// **Reconstruct the exact durable claim from a resolved [`JobSpec`]'s phase authorization context.**
-///
-/// The [`ParentAttemptReserveHook`] receives only `&JobSpec`, but
-/// [`admit_parent_attempt`](CiPrelaunchUsageJournal::admit_parent_attempt) needs the full
-/// [`CiJobTokenRequest`] — including `ci_run_id`, `token_authority_handle`, and `idem_token`, which the
-/// base [`CiJobAuthorizationContext`](myelin_ci_sandbox::CiJobAuthorizationContext) does NOT itself
-/// carry. They live on the V2 resolver's [`CiJobCredentialBinding`](myelin_ci_sandbox::CiJobCredentialBinding),
-/// which `ci_job_phase_authorization_context` installs at resolve time. Every one of the 12
-/// `CiJobTokenRequest` fields is present between the context and its binding, so this reconstruction is
-/// EXACT — proven by `claim.validate()` here and by the durable admission re-verifying the claim under
-/// the queue row lock. `reserve_handle` comes separately from `spec.meter_to.reserve_id`.
-///
-/// A spec resolved under the legacy V1 shape (no binding) is refused — this seam is only reachable for
-/// a V2-resolved checkout/compute job.
-///
-/// **The spec is fully cross-checked against the context, not merely projected from it** (Sol's r1
-/// blocker 1). The trusted authority is `spec.workspace` + `spec.kind` + `spec.idem_token` — the
-/// caller-facing execution surface. So this:
-/// 1. re-derives the checkout scope from `spec.workspace` via the ONE sanctioned facade and requires
-///    EXACT equality with the context's `checkout_scope` (a substituted commit from the same repo
-///    would carry the same `repo:<ref>#pull` capability, so scope equality — not capability presence —
-///    is what closes the substitution the checkout-authorization chain exists to prevent);
-/// 2. requires the binding's `purpose` to be the EXPECTED INITIAL purpose for this job shape
-///    (`CheckoutAdvertise` for a checkout job, `Workload` for a compute job) — a workload binding can
-///    never be smuggled into a checkout job's admission and vice versa;
-/// 3. requires the binding's `idem_token` to equal `spec.idem_token` — the reconstructed claim's idem
-///    is fused to the exact dispatched job, not merely echoed from a claimed context.
 fn reconstruct_claim(
     spec: &JobSpec,
 ) -> Result<(CiJobTokenRequest, Option<CheckoutAuthorizationScope>), HookError> {
@@ -152,8 +79,6 @@ fn reconstruct_claim(
                 .into(),
         )
     })?;
-    // (1) Re-derive the checkout scope from the spec's OWN workspace and require exact equality with
-    // the context — never trust the context's scope on its own.
     let derived_scope = derive_checkout_authorization_scope(spec.kind, &spec.workspace)
         .map_err(|reason| HookError(format!("deriving the spec's checkout scope failed: {reason}")))?;
     if derived_scope != context.checkout_scope {
@@ -163,7 +88,6 @@ fn reconstruct_claim(
                 .into(),
         ));
     }
-    // (2) The binding must be the EXPECTED INITIAL generation for this job shape.
     let expected_initial = initial_phase_purpose(derived_scope.as_ref());
     if CiCredentialPurpose::from_token(&binding.purpose) != Some(expected_initial) {
         return Err(HookError(format!(
@@ -173,7 +97,6 @@ fn reconstruct_claim(
             expected_initial.token()
         )));
     }
-    // (3) The binding's idem token must be exactly the dispatched job's.
     if binding.idem_token != spec.idem_token.0 {
         return Err(HookError(
             "V2 parent-attempt admission refused: the phase-credential binding's idem token does not \
@@ -205,13 +128,6 @@ fn reconstruct_claim(
     Ok((claim, derived_scope))
 }
 
-/// **CT-007 slice 5b.3-6d STEP 4: the exact `CiJobTokenRequest` → sandbox [`PreparationReportClaim`]
-/// projection.** The sandbox carries this reporting identity through the (dormant) admission and
-/// continuation; the CI pipeline reporter router maps it 1:1 back onto a `CiJobTokenRequest` to reach
-/// the durable preparation CAS. It is built from the SAME validated claim
-/// [`DurableAttemptAuthority`] is constructed with — never re-derived from a different source — so the
-/// thirteen fields are identical to the ones the durable admission verified. The mapping is field-for-
-/// field with no drop or reorder; the round-trip is proven in `ci_pipeline_driver` tests.
 pub(crate) fn preparation_report_claim(claim: &CiJobTokenRequest) -> PreparationReportClaim {
     PreparationReportClaim {
         tenant_id: claim.tenant_id.clone(),
@@ -230,8 +146,6 @@ pub(crate) fn preparation_report_claim(claim: &CiJobTokenRequest) -> Preparation
     }
 }
 
-/// The exact durable claim generation → [`CiJobLaunchClaim`] projection the preparation-lease
-/// checkpoint renews against.
 fn launch_claim(claim: &CiJobTokenRequest) -> CiJobLaunchClaim {
     CiJobLaunchClaim {
         tenant_id: claim.tenant_id.clone(),
@@ -246,10 +160,6 @@ fn launch_claim(claim: &CiJobTokenRequest) -> CiJobLaunchClaim {
     }
 }
 
-/// **The dormant durable composition for one region's checkout orchestration.** Holds the shared
-/// journal + phase-credential store + queue store + runtime handle; hands out the parent-attempt
-/// reserve hook and the initial-credential resolver seam. Constructed by NO production composition
-/// root (5b.3-6e does that).
 #[derive(Clone)]
 pub struct V2CheckoutComposition {
     journal: CiPrelaunchUsageJournal,
@@ -259,7 +169,6 @@ pub struct V2CheckoutComposition {
 }
 
 impl V2CheckoutComposition {
-    /// Compose the durable authorities from one region's pool + Identity minter + queue store.
     pub fn new(
         pool: sqlx::PgPool,
         region: impl Into<String>,
@@ -279,11 +188,6 @@ impl V2CheckoutComposition {
         })
     }
 
-    /// **The V2 resolver seam.** Mint (or replay) the job's INITIAL phase credential — `CheckoutAdvertise`
-    /// for a checkout-bearing job, `Workload` for a compute job (see [`initial_phase_purpose`]) — and
-    /// return it alongside the phase authorization context the resolved [`JobSpec`] carries. The
-    /// caller rotates both into the spec (`resolve_with_authorization`), which the parent-attempt hook
-    /// later reconstructs the claim from.
     pub fn mint_initial_phase_credential(
         &self,
         claim: &CiJobTokenRequest,
@@ -307,12 +211,6 @@ impl V2CheckoutComposition {
         Ok((minted, context))
     }
 
-    /// **The parent-attempt reserve hook.** Reconstructs the exact claim from the resolved spec,
-    /// takes `reserve_handle` from `spec.meter_to.reserve_id`, and drives
-    /// [`admit_parent_attempt`](CiPrelaunchUsageJournal::admit_parent_attempt) — reservation
-    /// `reserved → inflight` and parent-row insertion in ONE tenant transaction. On admission it
-    /// hands back a real [`DurableAttemptAuthority`]; on exhaustion the settleable reserve for the
-    /// terminal `AttemptsExhausted` report.
     pub fn parent_attempt_reserve_hook(&self) -> myelin_ci_sandbox::ParentAttemptReserveHook {
         let this = self.clone();
         Box::new(move |spec: &JobSpec| this.admit(spec))
@@ -320,9 +218,6 @@ impl V2CheckoutComposition {
 
     fn admit(&self, spec: &JobSpec) -> Result<ParentAttemptAdmission, HookError> {
         let (claim, checkout) = reconstruct_claim(spec)?;
-        // CT-007 5b.3-6d STEP 4: derive the preparation REPORTING identity from the SAME validated
-        // claim used to build the durable authority — both arms carry it (an exhausted attempt still
-        // reports its terminal), so build it before `claim` is moved into the authority below.
         let report_claim = preparation_report_claim(&claim);
         let reserve_handle = spec.meter_to.reserve_id.clone();
         match bridge(
@@ -363,18 +258,6 @@ impl V2CheckoutComposition {
     }
 }
 
-/// **The REAL durable [`AttemptAuthority`] for one admitted checkout attempt.** Every sandbox trait
-/// method bridges onto its durable backing:
-///
-/// | method | durable backing |
-/// |---|---|
-/// | `begin_phase` / `complete_phase` / `seal_phase` | [`CiPrelaunchUsageJournal`] |
-/// | `renew_preparation_lease` | [`DurablePreparationLeaseCheckpoint`] |
-/// | `mint_phase_credential` / `mint_workload_credential` | [`CiJobCredentialGenerationStore::mint_phase_credential`] |
-/// | `should_requeue` | [`CiPrelaunchUsageJournal::parent_attempt_retry_permitted`] (live `count < max`) |
-///
-/// The carrier's ephemeral authorization context is built by `ci_job_phase_authorization_context`
-/// from the exact reconstructed `claim` + the durable binding the mint returned.
 struct DurableAttemptAuthority {
     journal: CiPrelaunchUsageJournal,
     credential_store: CiJobCredentialGenerationStore,
@@ -387,9 +270,6 @@ struct DurableAttemptAuthority {
 }
 
 impl DurableAttemptAuthority {
-    /// Mint one preparation OR workload generation and build its carrier parts. The workload/checkout
-    /// carrier split is enforced by the callers passing the matching purpose; both share this exact
-    /// mint + context construction so a generation always carries its own binding, never a stale one.
     fn mint(
         &self,
         purpose: CiCredentialPurpose,
@@ -449,8 +329,6 @@ impl AttemptAuthority for DurableAttemptAuthority {
     }
 
     fn renew_preparation_lease(&self) -> Result<(), PreparationLeaseLost> {
-        // Delegates to the SAME already-proven durable checkpoint the transport/preparation legs
-        // accept; a DB error is treated as lost ownership (fail-closed), never as success.
         PreparationLeaseCheckpoint::renew(&self.lease_checkpoint)
     }
 
@@ -468,9 +346,6 @@ impl AttemptAuthority for DurableAttemptAuthority {
     }
 
     fn should_requeue(&self) -> bool {
-        // The live `count < max` policy. A durable error fails CLOSED to "exhausted" (terminalize
-        // rather than requeue-forever): the durable requeue CAS would re-verify anyway, and the
-        // conservative branch never strands a job in an endless requeue loop.
         bridge(
             &self.rt,
             self.journal
@@ -533,9 +408,6 @@ mod tests {
             .expect("the checkout workspace is checkout-bearing")
     }
 
-    /// A CONSISTENT V2 checkout context: its `checkout_scope` equals the scope derived from the
-    /// checkout workspace, its binding purpose is the initial `checkout_advertise`, and its binding
-    /// idem token equals the spec's idem token — exactly what `reconstruct_claim` now cross-checks.
     fn v2_context() -> CiJobAuthorizationContext {
         CiJobAuthorizationContext {
             tenant_id: "acme".into(),
@@ -574,7 +446,6 @@ mod tests {
         let context = v2_context();
         let spec = spec_with_context(Some(RunTokenAuthorizationContext::CiJob(context.clone())));
         let (claim, _checkout) = reconstruct_claim(&spec).expect("reconstructs an exact claim");
-        // The context supplies the base claim identity...
         assert_eq!(claim.tenant_id, context.tenant_id);
         assert_eq!(claim.region, context.region);
         assert_eq!(claim.wf_run_id, context.wf_run_id);
@@ -590,12 +461,10 @@ mod tests {
             claim.claim_expires_at_epoch_secs,
             context.claim_expires_at_epoch_secs
         );
-        // ...and the three binding-only fields the base context does NOT carry come from the binding.
         let binding = context.credential_binding.as_ref().unwrap();
         assert_eq!(claim.ci_run_id, binding.ci_run_id);
         assert_eq!(claim.token_authority_handle, binding.token_authority_handle);
         assert_eq!(claim.idem_token, binding.idem_token);
-        // The reconstructed claim is well-formed (the seam validates before use).
         claim.validate().expect("the reconstructed claim validates");
     }
 
@@ -615,9 +484,6 @@ mod tests {
 
     #[test]
     fn reconstruct_claim_refuses_a_scope_substitution() {
-        // The context claims a checkout scope, but the spec's OWN workspace is a plain compute
-        // workspace — so the scope derived from the spec (None) does NOT equal the context's scope.
-        // A substituted spec must be refused before any durable admission.
         let context = v2_context();
         let spec = job_spec(
             WorkspaceSpec::default(),
@@ -631,8 +497,6 @@ mod tests {
 
     #[test]
     fn reconstruct_claim_refuses_a_binding_purpose_that_is_not_the_initial() {
-        // A workload binding smuggled into a checkout job's context (its expected initial purpose is
-        // advertise) must refuse.
         let mut context = v2_context();
         context.credential_binding.as_mut().unwrap().purpose = "workload".into();
         let spec = spec_with_context(Some(RunTokenAuthorizationContext::CiJob(context)));
@@ -641,7 +505,6 @@ mod tests {
 
     #[test]
     fn reconstruct_claim_refuses_an_idem_token_mismatch() {
-        // The binding's idem token must equal the dispatched spec's; a mismatch is refused.
         let mut context = v2_context();
         context.credential_binding.as_mut().unwrap().idem_token =
             "11111111-1111-1111-1111-111111111111/other".into();

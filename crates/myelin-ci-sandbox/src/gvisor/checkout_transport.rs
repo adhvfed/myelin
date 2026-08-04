@@ -1,6 +1,3 @@
-//! Hop A of a checkout: fetching exactly one commit's pack through the existing hardened git-wire
-//! serving path, inside the parent attempt's metering and authorization.
-
 use super::*;
 use crate::runner::{
     PreparationAttemptDisposition, PreparationPhase, PreparationTerminalDisposition,
@@ -15,52 +12,22 @@ use std::io::{Seek, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 
-// =================================================================================================
-// CT-007 slice 5b.2 — the checkout-specific runtime (design locked in with Sol, 2026-07-27, ledger
-// 12): a SEQUENCE of two sandboxed hops glued by the host, never a live inter-container pipe, never
-// `/repo` mounted into either the checkout container:
-//
-//   Hop A ([`fetch_checkout_pack`]): fetch exactly one commit's pack through the EXISTING,
-//   unchanged, already-hardened git-wire serving path (`GvisorBackend::launch_git_wire`) — a real,
-//   billed use of that path. `/repo` stays inside the git-wire server's own container, as today.
-//
-//   Hop B ([`run_checkout_preparation`]): a NEW, dedicated checkout-preparation container —
-//   `ExplicitUserNamespace` + the workspace mount (the lease's `PreparationBound` identity from
-//   slice 5b.1), NO `/repo`, no network, stdin = Hop A's prefetched pack file. This hop performs no
-//   `reserve`/`settle` of its own (there is no per-checkout job to reserve against); its measured
-//   usage is charged through the PARENT ATTEMPT's aggregate settlement in slice 5b.3, never
-//   silently free.
-// =================================================================================================
-
-// `GitObjectFormat`/`ExpectedGitCommitId` moved to `crate::workspace_intent` (CT-007 slice 5b.3-1,
-// Sol's review): backend-independent semantics the intent parser needs too, so they must not live
-// in a backend-specific module.
 use crate::workspace_intent::ExpectedGitCommitId;
 
 use git_wire_codec::{
     parse_checkout_fetch_response, parse_upload_pack_advertisement, pkt_line_encode,
 };
 
-/// A one-shot, file-backed, ALREADY-VERIFIED-FRAMED pack artifact from Hop A (Sol's round-1 review,
-/// point 3): never a `Vec<u8>` — a real repo's pack can be many MiB, and the git-wire response was
-/// already materialized once by `launch_git_wire`'s own capture path, so a second in-memory copy
-/// here would be pure waste. Not `Clone` — it is consumed exactly once, by [`StdinSource::File`], the
-/// moment the checkout-preparation container spawns.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct PrefetchedCheckoutPack {
     pub(super) file: std::fs::File,
-    /// `true` iff Hop A's response reported the wanted commit itself as the shallow boundary — the
-    /// checkout script seeds `.git/shallow` with it before checkout iff this is set.
     pub(super) shallow: bool,
 }
 
 #[cfg(test)]
 #[allow(dead_code)]
 impl PrefetchedCheckoutPack {
-    /// CT-007 slice 5b.3-6c: a test-only pack so a 6c continuation test can build a
-    /// [`CheckoutPreparationSpec`] without a real Hop A. `#[cfg(test)]` only — `fetch_checkout_pack`
-    /// stays the sole production constructor.
     pub(crate) fn for_tests() -> Self {
         let path = std::env::temp_dir().join(format!(
             "myelin-test-pack-{}-{}",
@@ -68,7 +35,7 @@ impl PrefetchedCheckoutPack {
             unique_suffix()
         ));
         let file = std::fs::File::create(&path).expect("a temp file for the test pack");
-        let _ = std::fs::remove_file(&path); // unlink; the handle stays valid.
+        let _ = std::fs::remove_file(&path);
         PrefetchedCheckoutPack {
             file,
             shallow: false,
@@ -76,19 +43,6 @@ impl PrefetchedCheckoutPack {
     }
 }
 
-/// CT-007 slice 5b.2, Hop A: fetch exactly one commit's pack through the EXISTING, unchanged,
-/// already-hardened git-wire serving path (`GvisorBackend::launch_git_wire`) — a REAL, billed use of
-/// that path (it reserves/settles through `hooks` exactly like any other git-wire caller). Never
-/// touches `/repo` itself — that stays inside the git-wire server's own already-hardened container.
-///
-/// Uses a DEDICATED per-invocation `-c uploadpack.allowReachableSHA1InWant=true` (Sol's round-2
-/// review) rather than reconfiguring the general serving path: CI/merge-queue dispatch commonly
-/// targets a commit that is reachable but no longer an exact advertised ref tip by the time a queued
-/// attempt starts (ordinary queue delay), and this codebase has no per-attempt ref to pin it with
-/// today. The flow: parse the advertisement; if `expected` is a direct tip, proceed; otherwise
-/// require the advertisement to actually offer `allow-reachable-sha1-in-want` (never silently
-/// assume the `-c` was honored); send the exact `want`; let `upload-pack` itself perform the
-/// reachability check and refuse if the commit is no longer reachable.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) fn fetch_checkout_pack(
@@ -133,10 +87,6 @@ pub(crate) fn fetch_checkout_pack(
     let advertisement = backend
         .launch_git_wire(&advertise_spec, hooks)
         .map_err(|e| CheckoutPreparationError::Refused(format!("advertise-refs: {e}")))?;
-    // Sol's review: `launch_git_wire`'s `SandboxLaunch` handle is a live entry in `backend.live`
-    // (plus a staged bundle dir) until `backend.kill` retires it -- every path below (success OR
-    // parse refusal) must retire it EXACTLY ONCE, never leak it. Compute the parse result into a
-    // local first, kill unconditionally, THEN propagate -- so a `?` can never skip the kill.
     let advertise_parse_result = (|| {
         if !advertisement.result.passed() {
             return Err(format!(
@@ -149,9 +99,6 @@ pub(crate) fn fetch_checkout_pack(
         parse_upload_pack_advertisement(&advertisement.result.stdout, expected)
     })();
     let kill_result = backend.kill(&advertisement.handle);
-    // Sol's review: NEVER let a parse error's `?` propagate before a simultaneous `kill` error is
-    // even inspected -- a real runtime leak must not be silently hidden behind whichever failure
-    // happened to be checked first.
     let parsed = match (advertise_parse_result, kill_result) {
         (Ok(parsed), Ok(())) => parsed,
         (Ok(parsed), Err(kill_error)) => {
@@ -207,18 +154,11 @@ pub(crate) fn fetch_checkout_pack(
         IdemToken(format!("{}:checkout-fetch", idem_token.0)),
     )
     .map_err(|e| CheckoutPreparationError::Refused(format!("build fetch spec: {e}")))?;
-    // Sol's review: stage the pack artifact BEFORE launching the fetch, never after -- a
-    // `tempfile_for_checkout_pack` failure between a successful launch and this point would
-    // otherwise leak that launch's live `backend.live` entry + bundle dir with no path back to it.
     let mut pack_file = tempfile_for_checkout_pack()
         .map_err(|e| CheckoutPreparationError::Refused(format!("stage pack artifact: {e}")))?;
     let fetched = backend
         .launch_git_wire(&fetch_spec, hooks)
         .map_err(|e| CheckoutPreparationError::Refused(format!("fetch: {e}")))?;
-    // Same leak/guest-failure fix as the advertisement call above: retire the fetch launch's live
-    // handle EXACTLY ONCE, on every path, never skipped by an early `?`. A `kill` failure is not
-    // silently discarded (Sol's review) -- a live runsc container/bundle may have leaked, which
-    // matters even when parsing itself succeeded.
     let fetch_parse_result = if !fetched.result.passed() {
         Err(format!(
             "fetch did not pass (exit={:?} timed_out={}, stderr: {})",
@@ -235,7 +175,6 @@ pub(crate) fn fetch_checkout_pack(
         )
     };
     let kill_result = backend.kill(&fetched.handle);
-    // Same combine-don't-lose-either-error fix as the advertisement block above.
     let parsed_fetch = match (fetch_parse_result, kill_result) {
         (Ok(parsed), Ok(())) => parsed,
         (Ok(parsed), Err(kill_error)) => {
@@ -271,10 +210,6 @@ pub(crate) fn fetch_checkout_pack(
     })
 }
 
-/// The outcome of a successful parent-attempt Hop A transport (CT-007 slice 5b.3-3): the fetched
-/// pack plus the REAL measured usage across BOTH nested git-wire executions (advertise + fetch),
-/// checked-summed. Never settled here — the caller (5b.3-6's `launch_with` splice) folds this into
-/// the ONE aggregate settlement for the whole attempt, alongside Hop B's and the workload's own usage.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct ParentAttemptCheckoutTransportOutcome {
@@ -289,42 +224,19 @@ impl ParentAttemptCheckoutTransportOutcome {
     }
 }
 
-/// Every way the parent-attempt Hop A transport (5b.3-3) can fail. Deliberately NOT
-/// [`CheckoutPreparationError`] (Hop B's own error type): a Hop A failure AFTER the advertisement run
-/// has already consumed measurable, non-free resources, and reusing `CheckoutPreparationError::Refused`
-/// here would silently discard that usage.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) enum CheckoutTransportError {
-    /// Refused before anything spawned for the WHOLE transport (a proof/scope/token-generation
-    /// mismatch, or a malformed request) — there is no usage to account.
     Refused { message: String },
-    /// A safely retired execution or post-hop operation failed. `disposition` structurally
-    /// distinguishes a terminal checkout rejection/timeout from retryable infrastructure or an
-    /// invariant requiring reconciliation; no caller parses `message`. `usage` carries everything
-    /// measured up through the point of failure and must still be folded into the parent attempt.
     Failed {
         message: String,
         usage: ResourceUsage,
         disposition: PreparationAttemptDisposition,
     },
-    /// A real execution ran, but this function could not independently prove the nested container
-    /// was fully retired (child killed AND bundle removed, OR `finalize_runtime`'s own OS-level
-    /// teardown checks) — `usage` still carries everything measured. The caller must treat this as a
-    /// genuine teardown-unproven condition, never silently discard the possibly-leaked resources.
     TeardownUnproven {
         message: String,
         usage: ResourceUsage,
     },
-    /// Real, measured usage occurred (Sol's review, blocker 3), but the exact total can no longer be
-    /// honestly represented (a checked `ResourceUsage` addition overflowed). `usage` is the LAST
-    /// EXACT total this function could still prove (never a wrapped/truncated/best-guess value) —
-    /// distinct from `Failed` precisely because `Failed.usage` is a contract the caller may safely
-    /// settle, and an overflowed total is NOT safely settleable as-is. This is an
-    /// accounting/reconciliation failure, not an ordinary transport failure. `teardown_unproven`
-    /// (Sol's round-3 review) is an ORTHOGONAL fact, never collapsed into this one variant's choice:
-    /// usage-representability and teardown-proof are independent axes, and 5b.3-6 must be able to act
-    /// on both (whether it's safe to settle at all, AND whether resources might still be live).
     UsageUnrepresentable {
         message: String,
         usage: ResourceUsage,
@@ -333,8 +245,6 @@ pub(crate) enum CheckoutTransportError {
 }
 
 impl CheckoutTransportError {
-    /// The machine-readable outcome for Hop A. This deliberately never examines `message`;
-    /// diagnostics are not an authorization, retry, or terminal-accounting protocol.
     #[allow(dead_code)]
     pub(crate) fn attempt_disposition(&self) -> PreparationAttemptDisposition {
         match self {
@@ -428,8 +338,6 @@ impl std::fmt::Display for CheckoutTransportError {
     }
 }
 
-/// Checked (never wrapping/saturating) `ResourceUsage` aggregation (Sol's review, section B): an
-/// overflow is a loud accounting/reconciliation failure, never a silently wrapped/truncated total.
 fn checked_add_usage(a: ResourceUsage, b: ResourceUsage) -> Result<ResourceUsage, String> {
     Ok(ResourceUsage {
         cpu_seconds: a.cpu_seconds.checked_add(b.cpu_seconds).ok_or_else(|| {
@@ -444,12 +352,6 @@ fn checked_add_usage(a: ResourceUsage, b: ResourceUsage) -> Result<ResourceUsage
     })
 }
 
-/// Fully retire ONE nested git-wire container the parent-attempt transport spawned: kill the
-/// (already-exited) child and remove its bundle dir. Unlike [`GvisorBackend::kill`] (which discards a
-/// `remove_dir_all` failure with `let _ =`, relying on `self.live` to let a LATER `kill()` retry), this
-/// function has no such registry to fall back on: it never registers into `self.live` at all (Sol's
-/// review — the parent-attempt transport returns no live backend handle), so a removal failure here is
-/// the ONLY signal the caller ever gets that a bundle may have leaked. Never silently discarded.
 fn retire_parent_attempt_hop(
     mut child: Box<dyn RunscChild + Send>,
     bundle_dir: &Path,
@@ -466,15 +368,6 @@ fn retire_parent_attempt_hop(
     }
 }
 
-/// A [`RunFailure`] from a nested hop whose teardown WAS independently proven fine (either it never
-/// reached `finalize_runtime` at all — genuinely `Uncommitted` — or `finalize_runtime` succeeded),
-/// converted with `usage_before` (measured by PRIOR hops in this same transport) folded in.
-/// `prior_hop_completed` (Sol's review, blocker 4) is an EXPLICIT phase fact, never inferred from
-/// `usage_before == 0` — a hop can genuinely execute with zero measured usage, and that must still be
-/// `Failed`, never misreported as the free `Refused`. `LaunchPermit::immediate()`'s commit closure can
-/// never itself fail, so `CommitOutcomeUnknown` is unreachable in practice here — Sol's review:
-/// represent it as a loud invariant-violation `Failed`, never silently assumed away, never mislabeled
-/// as a teardown question it has nothing to do with.
 fn map_hop_run_failure(
     run_failure: RunFailure,
     usage_before: ResourceUsage,
@@ -515,20 +408,12 @@ fn map_hop_run_failure(
                      {overflow})"
                 ),
                 usage: usage_before,
-                // This branch is only ever reached via `Finalized(primary: Err(Executed))` — never
-                // the bare pre-finalize outer `Err` (`run_git_wire_container_raw` never produces
-                // `Executed` before `finalize_and_merge`) — so teardown WAS independently proven here.
                 teardown_unproven: false,
             },
         },
     }
 }
 
-/// Every reason a git-wire hop's OWN result disqualifies it from being treated as a clean success
-/// (Sol's round-3 review, blocker 3): shared between the ordinary success path
-/// ([`run_one_git_wire_hop_within_parent_attempt`]) and [`map_hop_finalization_failure`]'s
-/// `primary: Ok` branch, so a non-passing/truncated/stream-errored run is NEVER silently reduced to
-/// "just" a teardown problem when both are true simultaneously.
 fn hop_result_failure_reasons(
     result: &SandboxResult,
     truncated: bool,
@@ -550,18 +435,6 @@ fn hop_result_failure_reasons(
     reasons
 }
 
-/// A hop whose `finalize_runtime` genuinely could NOT prove teardown (Sol's review, blocker 2) —
-/// `primary` is the hop's own `Result<(ContainerRun, bool), RunFailure>` from BEFORE finalization
-/// collapsed it, `teardown` is the independent teardown failure. Teardown ambiguity is orthogonal to
-/// whatever `primary` says: even a `primary` that itself failed for an unrelated reason still leaves
-/// teardown genuinely unproven, and that must never be silently downgraded to an ordinary `Failed`.
-/// When `primary` is `Ok`, this function ALSO performs the best-effort discard `run_git_wire_container`
-/// would otherwise have owned (kill + remove bundle) — mirroring
-/// [`discard_container_run_after_teardown_failure`], simplified because git-wire's `prepared_mode` is
-/// always `Rootless` (the namespace-identity-drift skip that function handles never applies here).
-/// Sol's round-3 review, blocker 3: the `Ok` branch also folds in [`hop_result_failure_reasons`] —
-/// previously it reported ONLY the teardown problem, silently dropping a simultaneous non-passing
-/// exit / truncation / stream error.
 fn map_hop_finalization_failure(
     primary: Result<(ContainerRun, bool), RunFailure>,
     teardown: RuntimeTeardownError,
@@ -609,10 +482,6 @@ fn map_hop_finalization_failure(
                     }
                 }
                 RunFailure::CommitOutcomeUnknown { message } => {
-                    // Sol's round-4 review: this branch is reached from `RuntimeFinalization::Failed`
-                    // — teardown was ALREADY independently NOT proven, regardless of how impossible
-                    // the accompanying commit ambiguity is. Reporting ordinary `Failed` here would
-                    // erase that real, independent teardown failure — never downgrade it.
                     CheckoutTransportError::TeardownUnproven {
                         message: format!(
                             "internal invariant violated (an immediate launch permit's commit \
@@ -640,13 +509,6 @@ fn map_hop_finalization_failure(
     }
 }
 
-/// The raw per-hop git-wire executor the parent-attempt transport drives twice (advertise, then
-/// fetch) — mirrors [`run_git_wire_container_raw`]'s signature exactly (Sol's review, blocker 2: the
-/// executor must hand back the STRUCTURED [`RuntimeFinalization`], not the standalone path's already-
-/// collapsed `Result<(ContainerRun, bool), RunFailure>`, so a teardown-unproven outcome can be told
-/// apart from an ordinary run failure). Production always passes [`run_git_wire_container_raw`]
-/// itself; tests inject a deterministic fake so the transport's aggregation/error-mapping logic is
-/// verifiable without a real `runsc` binary (the true runsc/git-rootfs integration is 5b.3-7).
 pub(super) type GitWireHopExecutor<'a> = &'a dyn Fn(
     &JobSpec,
     &OciConfig,
@@ -659,13 +521,6 @@ pub(super) type GitWireHopExecutor<'a> = &'a dyn Fn(
     BundleCleanupProof,
 );
 
-/// If `bundle_cleanup` proves nothing (Sol's round-3 review, blocker 1), the hop's own result can no
-/// longer mean "genuinely nothing left behind" — upgrade whatever disposition `mapped` would
-/// otherwise be into one that says so, folding the cleanup failure's text in. This TRUMPS
-/// `Refused`/`Failed` entirely (an unproven bundle can never be reported as free or ordinary); for an
-/// already-more-severe disposition (`TeardownUnproven`/`UsageUnrepresentable`) it only adds the extra
-/// fact, never downgrades. A no-op whenever `bundle_cleanup` is `Ok(())` (the overwhelmingly common
-/// case — nothing to add).
 fn force_teardown_unproven_if_cleanup_unproven(
     mapped: CheckoutTransportError,
     bundle_cleanup: &BundleCleanupProof,
@@ -702,10 +557,6 @@ fn force_teardown_unproven_if_cleanup_unproven(
     }
 }
 
-/// The post-`execute()` half of [`run_one_git_wire_hop_within_parent_attempt`] — factored out purely
-/// so its caller can uniformly apply [`force_teardown_unproven_if_cleanup_unproven`] to WHATEVER
-/// `CheckoutTransportError` this produces, via one `.map_err(...)`, rather than needing to thread the
-/// bundle-cleanup adjustment into every individual early return below.
 fn handle_git_wire_hop_finalization(
     finalization_result: Result<GitWireHopFinalization, RunFailure>,
     usage_before: ResourceUsage,
@@ -749,18 +600,11 @@ fn handle_git_wire_hop_finalization(
                     }
                 },
                 usage: usage_before,
-                // Teardown (container delete + cgroup quiescence) was ALREADY independently proven
-                // by the time we reach here (we are inside the `Finalized` arm) — only THIS
-                // function's own retirement discard is in question, tracked separately below.
                 teardown_unproven: discard_result.is_err(),
             });
         }
     };
 
-    // Sol's review, blocker 1: a nonzero-exit or timed-out guest execution with otherwise
-    // syntactically valid stdout must never be accepted as a successful transport — the standalone
-    // path (`fetch_checkout_pack`, via `SandboxLaunch.result.passed()`) already enforces this; this
-    // path must too.
     let reasons = hop_result_failure_reasons(&result, truncated, &run_error);
 
     if !reasons.is_empty() {
@@ -794,18 +638,6 @@ fn handle_git_wire_hop_finalization(
     }
 }
 
-/// Run ONE git-wire hop entirely within the parent attempt's own bookkeeping (CT-007 slice 5b.3-3):
-/// builds the hardened job/config via the SAME [`build_git_wire_job`]/[`build_git_wire_oci_config`]
-/// preparation the standalone billed path uses, executes it with an IMMEDIATE launch permit (never a
-/// real durable fence — there is no separate reservation for this hop to commit against), and
-/// unconditionally retires the container (kill + remove bundle dir) before returning — this function
-/// never leaves a live handle or bundle behind on any path. Returns the hop's `SandboxResult` (for the
-/// caller's own wire-protocol parsing) plus the RUNNING total usage (`usage_before` + this hop's own,
-/// checked). `prior_hop_completed` is Sol's review, blocker 4 — an explicit phase fact the caller
-/// supplies (never inferred from `usage_before`). Sol's round-3 review, blocker 1: `execute`'s paired
-/// [`BundleCleanupProof`] is checked against the FINAL disposition, regardless of which branch below
-/// produced it — an unproven pre-finalization bundle cleanup forces `TeardownUnproven`, never a free
-/// `Refused`.
 #[allow(clippy::too_many_arguments)]
 fn run_one_git_wire_hop_within_parent_attempt(
     hop_spec: &GitWireSpec,
@@ -837,13 +669,6 @@ fn run_one_git_wire_hop_within_parent_attempt(
         permit,
     );
 
-    // Sol's round-4 review: match the COMPLETE `(result, cleanup_proof)` pair, not just the error
-    // side — an unproven `bundle_cleanup_proof` must force `TeardownUnproven` even when
-    // `handle_git_wire_hop_finalization` itself returns `Ok`. Production never actually produces this
-    // combination today (a hop only reaches `Ok` via the success path, which performs its OWN
-    // verified retirement — see `retire_parent_attempt_hop` inside that function — so its bundle is
-    // ALWAYS proven removed by the time `Ok` is returned), but the executor's TYPE permits it, and the
-    // "regardless of branch" guarantee this function documents must be structural, not incidental.
     match handle_git_wire_hop_finalization(finalization_result, usage_before, prior_hop_completed) {
         Ok(success) => match &bundle_cleanup_proof {
             Ok(()) => Ok(success),
@@ -866,60 +691,26 @@ fn run_one_git_wire_hop_within_parent_attempt(
     }
 }
 
-/// A synthetic [`MeterTarget`] for the two nested git-wire hops the parent-attempt transport spawns.
-/// Never used for reserve/settle (this transport never calls `hooks.reserve`/`hooks.settle_completed`
-/// at all — see [`fetch_checkout_pack_within_parent_attempt`]'s own doc) — only present because
-/// `JobSpec::new` mandates a value structurally.
 fn synthetic_parent_attempt_meter_target() -> MeterTarget {
     MeterTarget {
         reserve_id: "checkout-transport-within-parent-attempt".to_string(),
     }
 }
 
-/// A synthetic, per-hop-unique [`IdemToken`] — same rationale as
-/// [`synthetic_parent_attempt_meter_target`]: `JobSpec::new` mandates one, but this transport never
-/// reserves/dedups against it.
 fn synthetic_parent_attempt_idem_token(label: &str) -> IdemToken {
     IdemToken(format!("checkout-transport-{label}-{}", unique_suffix()))
 }
 
-/// CT-007 slice 5b.3-3: the parent-attempt Hop A transport. Unlike [`fetch_checkout_pack`] (the
-/// standalone, billed git-wire caller — unchanged, still reserves/settles through `hooks` exactly as
-/// before), this function takes NO `RunnerHooks`, `MeterTarget`, `IdemToken`, or workload
-/// `LaunchPermit`: it is meant to run entirely INSIDE an outer `launch_with` attempt that has already
-/// reserved once for the whole attempt (5b.3-6 wires the call site). It consumes the one-shot
-/// [`CheckoutAuthorizationProof`] by value, verifies its scope and run-token generation against THIS
-/// request BEFORE spawning anything, drives both nested git-wire executions with
-/// `LaunchPermit::immediate()`, and fully retires each child+bundle itself — it returns no
-/// `SandboxLaunch`/live backend handle, and never reserves, settles, releases, or calls the real
-/// workload CAS. See [`CheckoutTransportError`] for how a mid-transport failure still carries the
-/// real usage already measured; the caller (5b.3-4/5/6) decides how that pre-workload usage survives
-/// and settles.
-/// **CT-007 round-1 blocker 2: how Hop A is authorized, MODULE-PRIVATE.**
-///
-/// This enum is an implementation detail of the shared transport body — it is deliberately NOT
-/// `pub(crate)`, so no other module can select an arm. The two PUBLIC entry points
-/// ([`fetch_checkout_pack_within_parent_attempt`] for V1 and
-/// [`fetch_checkout_pack_within_parent_attempt_v2`] for V2) each construct exactly one arm, so the
-/// V2 entry point offers no legacy option at the TYPE level rather than by source-pin convention.
 enum TransportAuthority<'a> {
     LegacyClaimBound {
         proof: CheckoutAuthorizationProof,
     },
     PhaseBound {
         advertise: PhaseAuthorization,
-        /// Invoked EXACTLY once, only after the advertisement succeeded and its container was
-        /// retired, and before the fetch spawns. A refusal here aborts Hop A carrying the
-        /// advertisement's already-measured usage — the fetch never spawns. The credential and the
-        /// authorization come back together, and the authorization's own privately-retained JTI is
-        /// what the credential is checked against when the permit is extracted.
         fetch: &'a mut dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>,
     },
 }
 
-/// **The LEGACY (V1 claim-bound) Hop A entry point.** Signature and behaviour are exactly as
-/// shipped: one claim-bound credential covers both git-wire executions, each spawned under an
-/// internally-minted immediate permit. There is no durable phase gate for a V1 preparation.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) fn fetch_checkout_pack_within_parent_attempt(
@@ -951,14 +742,6 @@ pub(crate) fn fetch_checkout_pack_within_parent_attempt(
     )
 }
 
-/// **The V2 (phase-bound) Hop A entry point.** Takes ONE opaque [`PhaseAuthorization`] for the
-/// advertise leg — proof and retained durable permit fused from a single hook invocation — plus a
-/// one-shot provider for the fetch leg's own credential + authorization, invoked only after the
-/// advertisement has fully retired and the lease checkpoint has renewed.
-///
-/// There is deliberately NO legacy arm reachable from here: a `CheckoutAuthorizationProof` cannot be
-/// passed to this function at all, and a `PhaseAuthorization` cannot be constructed outside
-/// `checkout_authorization`.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(crate) fn fetch_checkout_pack_within_parent_attempt_v2(
@@ -992,7 +775,6 @@ pub(crate) fn fetch_checkout_pack_within_parent_attempt_v2(
     )
 }
 
-/// Deterministic `_given` seam for the V2 entry point (this codebase's established convention).
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(super) fn fetch_checkout_pack_within_parent_attempt_v2_given(
@@ -1024,11 +806,6 @@ pub(super) fn fetch_checkout_pack_within_parent_attempt_v2_given(
     )
 }
 
-/// The exact anti-substitution comparison every checkout proof must pass against the request it is
-/// about to authorize: the token generation it was checked against, and the tenant/repo/commit it
-/// names. Extracted (CT-007 phase-credential generations) so the V2 FETCH leg — whose proof and
-/// credential are minted mid-transport, after the advertisement — receives byte-identical scrutiny
-/// to the advertise leg rather than a weaker ad-hoc check.
 #[allow(dead_code)]
 fn verify_transport_proof_against_request(
     proof: &CheckoutAuthorizationProof,
@@ -1073,11 +850,6 @@ fn verify_transport_proof_against_request(
     Ok(())
 }
 
-/// Deterministic `_given` seam for [`fetch_checkout_pack_within_parent_attempt`] (this codebase's
-/// established convention, e.g. `finalize_runtime_given`): `execute` stands in for
-/// `run_git_wire_container_raw` so tests can drive the aggregation/error-mapping logic without
-/// spawning a real `runsc` binary. The true runsc/git-rootfs integration is exercised by 5b.3-7's live
-/// drill.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 pub(super) fn fetch_checkout_pack_within_parent_attempt_given(
@@ -1108,8 +880,6 @@ pub(super) fn fetch_checkout_pack_within_parent_attempt_given(
     )
 }
 
-/// The one shared transport body both entry points drive. `authority` is module-private, so the arm
-/// is decided by WHICH entry point was called, never by the caller.
 #[allow(clippy::too_many_arguments)]
 #[allow(dead_code)]
 fn fetch_checkout_pack_within_parent_attempt_inner(
@@ -1125,17 +895,8 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
     lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
     execute: GitWireHopExecutor,
 ) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
-    // Resolve the advertise leg's launch permit plus (V2 only) the one-shot fetch source. In the V2
-    // arm the permit can ONLY be obtained by consuming the whole `PhaseAuthorization` through a
-    // check of its phase, its privately-retained run-token JTI, and its scope against THIS request —
-    // so a permit minted for another claim/generation can never be paired with this credential
-    // (round-1 blocker 2). In the V1 arm the proof is verified and an immediate permit is minted, as
-    // shipped.
     let (advertise_generation, advertise_permit, mut fetch_source) = match authority {
         TransportAuthority::LegacyClaimBound { proof } => {
-            // Verify the proof's scope AND the exact token generation it was checked against,
-            // against THIS parent attempt's own request, BEFORE spawning anything (Sol's design,
-            // point A).
             verify_transport_proof_against_request(&proof, &run_token, tenant, repo, expected)
                 .map_err(|message| CheckoutTransportError::Refused { message })?;
             (None, LaunchPermit::immediate(), None)
@@ -1164,7 +925,6 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
         "uploadpack.allowReachableSHA1InWant=true".to_string(),
     ];
 
-    // ---- Hop A step 1: advertise-refs ----
     let mut advertise_argv = allow_reachable.clone();
     advertise_argv.extend([
         "upload-pack".to_string(),
@@ -1198,7 +958,7 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
         advertise_command,
         cancellation,
         zero,
-        false, // this is the FIRST hop of the whole transport -- nothing has run yet.
+        false,
         advertise_permit,
         execute,
     )?;
@@ -1229,32 +989,16 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
     request.extend_from_slice(b"0000");
     request.extend_from_slice(&pkt_line_encode("done\n"));
 
-    // ---- Hop A step 2: fetch ----
-    // Stage the pack artifact BEFORE launching the fetch (same reasoning as `fetch_checkout_pack`):
-    // a staging failure here must still carry the advertisement's already-measured usage, never
-    // silently drop it.
     let mut pack_file = tempfile_for_checkout_pack().map_err(|e| {
         checkout_transport_retryable(format!("stage pack artifact: {e}"), usage_after_advertise)
     })?;
 
-    // CT-007 lease/topology reconciliation: Hop A contains TWO independently full-timeout
-    // executions, so the advertise→fetch boundary is a mandatory renewal checkpoint — without it the
-    // interval between renewals could legally hold two executions and lapse the lease mid-Hop-A. The
-    // renewal runs AFTER the advertisement is fully retired and BEFORE the fetch spawns; a lost
-    // generation aborts here carrying the advertisement's already-measured usage, never spawns under
-    // a lease another worker now owns. `None` keeps every pre-composition caller unchanged; 5b.3-6
-    // supplies the durable checkpoint and adds the later Hop A→B and B→workload calls.
     if let Some(checkpoint) = lease_checkpoint {
         checkpoint.renew().map_err(|lost| {
             checkout_transport_retryable(lost.to_string(), usage_after_advertise)
         })?;
     }
 
-    // CT-007 phase-credential generations: mint the FETCH credential here — after the advertisement
-    // is fully retired, after the lease renewal proved this worker still owns the generation, and
-    // before anything for the fetch is built or spawned. The renewal is deliberately NOT treated as
-    // authorization: the provider re-locks and re-verifies the exact live generation itself. A
-    // refusal aborts carrying the advertisement's measured usage, and the fetch never spawns.
     let (fetch_run_token, fetch_permit) = match fetch_source.as_mut() {
         None => (run_token, LaunchPermit::immediate()),
         Some(provider) => {
@@ -1264,10 +1008,6 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
                     usage_after_advertise,
                 )
             })?;
-            // The fetch generation must be a DISTINCT durable generation from the advertise one: a
-            // provider that handed back the advertise generation again would mean the successor was
-            // never appended, so the advertise credential is still current and this leg would run
-            // under a generation that has not been superseded as the phase sequence requires.
             if advertise_generation.as_deref() == Some(authorization.generation_id()) {
                 return Err(checkout_transport_retryable(
                     "the fetch-phase authorization names the SAME durable generation as the \
@@ -1276,10 +1016,6 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
                     usage_after_advertise,
                 ));
             }
-            // Consuming the authorization is the ONLY way to reach its permit, and doing so checks
-            // the phase, the authorization's own retained JTI against THIS credential, and the full
-            // scope against this request. A credential from one invocation cannot be paired with a
-            // permit from another.
             let permit = authorization
                 .into_transport_permit(crate::CheckoutPhase::Fetch, &credential, tenant, repo, expected)
                 .map_err(|error| checkout_transport_retryable(error.0, usage_after_advertise))?;
@@ -1316,7 +1052,7 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
         fetch_command,
         cancellation,
         usage_after_advertise,
-        true, // the advertisement hop above already completed.
+        true,
         fetch_permit,
         execute,
     )?;
@@ -1350,9 +1086,6 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
     })
 }
 
-/// A fresh, `O_CLOEXEC` host temp file to stream Hop A's pack into (removed from the directory the
-/// instant it's created — an unlinked, anonymous-by-path file the process's own fd keeps alive for
-/// exactly as long as it is needed, never left behind on any early-return path).
 #[allow(dead_code)]
 pub(super) fn tempfile_for_checkout_pack() -> io::Result<std::io::BufWriter<std::fs::File>> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -1361,20 +1094,12 @@ pub(super) fn tempfile_for_checkout_pack() -> io::Result<std::io::BufWriter<std:
         std::process::id(),
         unique_suffix()
     ));
-    // `create_new` (== `O_CREAT|O_EXCL`) refuses if ANYTHING already exists at `path` (including a
-    // symlink) rather than following it -- this is what actually prevents the raced-symlink issue,
-    // not merely the unlink below. `mode(0o600)` (Sol's review) makes the file owner-only from
-    // creation instead of depending on umask, since it carries a real source pack.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
-    // Unlink immediately: from this point on the file is reachable ONLY through this process's own
-    // fd, never a second path-based open. A failed unlink means it is NOT actually anonymous
-    // despite this function's contract -- propagate the failure (Sol's review) rather than
-    // silently carrying a private pack through a still-path-reachable file.
     std::fs::remove_file(&path)?;
     Ok(std::io::BufWriter::new(file))
 }
@@ -1396,15 +1121,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    // =========================================================================================
-    // CT-007 slice 5b.3-3 — the parent-attempt Hop A transport. Deterministic coverage via an
-    // injected executor (`GitWireHopExecutor`) — no real `runsc` binary needed for this refactor
-    // slice (the true runsc/git-rootfs integration is 5b.3-7's live drill).
-    // =========================================================================================
     mod checkout_transport_5b3_3 {
         use super::*;
-        // CT-007 slice 5b.3-6e.2 Stage A: git-wire fakes relocated to the test-support module so
-        // the runsc-driver seam + §4 tests share them. Re-imported so the existing tests compile.
         use crate::gvisor::checkout_transport_test_support::{
             advertisement_bytes, fake_quiescence_evidence, fetch_response_bytes,
             permit_recording_executor, sha1_oid, BoxedHopExecutor, FakeRunsc, ScriptedStep,
@@ -1489,9 +1207,6 @@ mod tests {
             }
         }
 
-        /// A real (not symlinked) bare-repo directory under a fresh root, matching exactly what
-        /// `resolve_bare_repo_path`/`assert_repo_under_root` require — both hops resolve the SAME
-        /// path, so this is staged once per test.
         fn staged_repo_root() -> PathBuf {
             let root = temp_dir_for("5b3-3-root");
             std::fs::create_dir_all(root.join(TENANT).join(REGION).join(format!("{REPO}.git")))
@@ -1548,13 +1263,6 @@ mod tests {
             hooks.authorize_checkout(&job, scope).unwrap()
         }
 
-        /// CT-007 phase-credential generations: mint a REAL fused [`PhaseAuthorization`]
-        /// through the real hook. `permit_outcome` stands in for the control plane's durable
-        /// phase gate: `Ok(())` = the generation is still current at the spawn boundary,
-        /// `Err(..)` = it is not (requeued, superseded, expired).
-        ///
-        /// Note there is NO way for a test to build one of these by hand either — the only
-        /// route is a genuine hook invocation, exactly like production.
         fn minted_phase_authorization(
             scope: CheckoutAuthorizationScope,
             jti: &str,
@@ -1594,8 +1302,6 @@ mod tests {
                 .unwrap()
         }
 
-        /// A distinct durable generation id per purpose, so the advertise→fetch supersession
-        /// check has real values to compare.
         fn generation_id_for(phase: crate::CheckoutPhase) -> String {
             let seed = match phase {
                 crate::CheckoutPhase::Advertise => 'a',
@@ -1648,20 +1354,6 @@ mod tests {
             }
         }
 
-        // A step still returns the simple pre-finalization shape — `scripted_executor` below
-        // auto-wraps a successful step into a `RuntimeFinalization::Finalized` (teardown proven
-        // fine), matching what every EXISTING test needs. Tests that specifically need to exercise a
-        // genuine teardown-unproven `RuntimeFinalization::Failed` (Sol's review, blocker 2) build a
-        // `BoxedHopExecutor` closure directly instead of going through this helper (see
-        // `production_shaped_teardown_failure_is_reported_as_teardown_unproven`).
-        //
-        // `ScriptedStep`, `BoxedHopExecutor`, and `fake_quiescence_evidence` were relocated to the
-        // `checkout_transport_test_support` module (re-imported above).
-
-        /// Scripts exactly `steps.len()` executor calls, one scripted outcome each, in order.
-        /// Returns the executor closure plus a handle to the number of REMAINING (not yet
-        /// consumed) steps, so a test can assert exactly the scripted count of calls happened.
-        /// Panics if invoked more times than scripted (Sol's review: "exactly two ... executions").
         fn scripted_executor(steps: Vec<ScriptedStep>) -> (BoxedHopExecutor, Arc<Mutex<usize>>) {
             let remaining = Arc::new(Mutex::new(steps.len()));
             let remaining_for_closure = Arc::clone(&remaining);
@@ -1684,9 +1376,6 @@ mod tests {
                     })),
                     Err(run_failure) => Err(run_failure),
                 };
-                // Bundle cleanup is never in question for these auto-wrapped scripted steps —
-                // dedicated tests for an unproven bundle cleanup build a `BoxedHopExecutor`
-                // directly instead (see `bundle_cleanup_failure_forces_teardown_unproven`).
                 (finalization_result, Ok(()))
             };
             (Box::new(f), remaining)
@@ -1695,11 +1384,6 @@ mod tests {
         fn panics_if_called_executor() -> (BoxedHopExecutor, Arc<Mutex<usize>>) {
             scripted_executor(vec![])
         }
-
-        // `advertisement_bytes` / `fetch_response_bytes` were relocated to the
-        // `checkout_transport_test_support` module (re-imported above).
-
-        // ---- proof verification happens BEFORE any spawn ----
 
         #[test]
         fn proof_with_wrong_run_token_jti_refuses_before_any_spawn() {
@@ -1831,12 +1515,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- happy path ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn happy_path_executes_exactly_two_immediate_gated_hops_and_checked_adds_usage() {
             let root = staged_repo_root();
@@ -1899,9 +1581,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- the advertise→fetch preparation-lease checkpoint ----
-
-        /// A checkpoint that always refuses, recording that it was consulted exactly once.
         struct LostLeaseCheckpoint {
             calls: std::sync::Mutex<u32>,
         }
@@ -1918,7 +1597,7 @@ mod tests {
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn a_lost_preparation_lease_refuses_between_advertise_and_fetch_and_retains_usage() {
             let root = staged_repo_root();
@@ -1933,7 +1612,6 @@ mod tests {
                 mem_byte_seconds: 7,
             };
             let advertise_bytes = advertisement_bytes(&oid);
-            // Exactly ONE scripted hop: the fetch must never spawn once the lease is lost.
             let (executor, remaining) = scripted_executor(vec![Box::new(move || {
                 Ok((
                     fake_hop_container_run(advertise_bytes, advertise_usage),
@@ -1987,7 +1665,7 @@ mod tests {
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn a_live_preparation_lease_checkpoint_lets_hop_a_complete() {
             struct LiveCheckpoint {
@@ -2041,12 +1719,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- every failure point retains usage already incurred ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn advertisement_parse_failure_retains_advertisement_usage() {
             let root = staged_repo_root();
@@ -2099,7 +1775,7 @@ mod tests {
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn fetch_pre_spawn_failure_retains_advertisement_usage() {
             let root = staged_repo_root();
@@ -2158,7 +1834,7 @@ mod tests {
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn fetch_post_spawn_executed_failure_retains_advertisement_plus_fetch_usage() {
             let root = staged_repo_root();
@@ -2223,12 +1899,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- arithmetic overflow refuses loudly ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn usage_aggregation_overflow_refuses_loudly() {
             let root = staged_repo_root();
@@ -2238,9 +1912,6 @@ mod tests {
                 minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
             let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
 
-            // Advertisement alone doesn't overflow (usage_before starts at zero) — the overflow
-            // must occur when the FETCH hop's own usage is checked-added onto the advertisement's
-            // already-measured `u64::MAX`.
             let advertise_usage = ResourceUsage {
                 cpu_seconds: u64::MAX,
                 mem_byte_seconds: 1,
@@ -2281,9 +1952,6 @@ mod tests {
                 0,
                 "both hops must have run before the overflow is detected"
             );
-            // Overflow happens folding the fetch hop's own usage onto the advertisement's
-            // already-measured `u64::MAX` — refused loudly (never wrapped/saturated) rather than
-            // silently reporting a wrapped-around total.
             match err {
                 CheckoutTransportError::UsageUnrepresentable {
                     message,
@@ -2307,12 +1975,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- teardown-unproven is distinct and still carries usage ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn kill_failure_on_a_successful_hop_yields_teardown_unproven_and_retains_usage() {
             let root = staged_repo_root();
@@ -2367,7 +2033,7 @@ mod tests {
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn truncated_output_combined_with_kill_failure_preserves_both_messages() {
             let root = staged_repo_root();
@@ -2384,7 +2050,7 @@ mod tests {
             let (executor, remaining) = scripted_executor(vec![Box::new(move || {
                 Ok((
                     fake_hop_container_run_with_unkillable_child(Vec::new(), advertise_usage),
-                    true, // stdout_truncated
+                    true,
                 ))
             })]);
             let cancellation = AtomicBool::new(false);
@@ -2424,7 +2090,7 @@ mod tests {
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn run_error_combined_with_kill_failure_preserves_both_messages() {
             let root = staged_repo_root();
@@ -2481,12 +2147,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- no live handle or bundle remains after return, on ANY path ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn successful_transport_leaves_no_bundle_dirs_behind() {
             let root = staged_repo_root();
@@ -2570,13 +2234,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- Sol's round-1 review, blocker 1: a non-passing guest execution must never be
-        // accepted just because its stdout happens to parse ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn not_passed_advertisement_is_never_accepted_as_success() {
             let root = staged_repo_root();
@@ -2626,7 +2287,7 @@ mod tests {
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn not_passed_fetch_is_never_accepted_as_success() {
             let root = staged_repo_root();
@@ -2693,13 +2354,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- Sol's round-1 review, blocker 2: a genuine production-shaped teardown-unproven
-        // outcome (RuntimeFinalization::Failed) must never be collapsed into an ordinary Failed ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn production_shaped_teardown_failure_is_reported_as_teardown_unproven() {
             let root = staged_repo_root();
@@ -2790,12 +2448,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- Sol's round-1 review, blocker 4: numerical usage is not a lifecycle marker ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn zero_usage_advertisement_then_fetch_pre_spawn_failure_is_still_failed_not_refused() {
             let root = staged_repo_root();
@@ -2805,9 +2461,6 @@ mod tests {
                 minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
             let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
 
-            // A completed advertisement hop with GENUINELY ZERO measured usage -- distinct from
-            // "no hop ran yet." A prior implementation compared `usage_before == zero` to decide
-            // Refused-vs-Failed, which would have misclassified this exact case.
             let zero_advertise_usage = ResourceUsage {
                 cpu_seconds: 0,
                 mem_byte_seconds: 0,
@@ -2855,13 +2508,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- Sol's round-3 review, blocker 1: an unproven pre-finalization bundle cleanup
-        // must never be silently reported as the free `Refused` ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn bundle_cleanup_failure_forces_teardown_unproven_even_on_the_first_hop() {
             let root = staged_repo_root();
@@ -2871,9 +2521,6 @@ mod tests {
                 minted_proof_for(parent_attempt_scope(&oid, GitObjectFormat::Sha1), "jti-1");
             let run_token = RunTokenCredential::new("bearer", "jti-1", 300).unwrap();
 
-            // Simulates a pre-finalization failure (e.g. cgroup creation) whose OWN best-effort
-            // bundle-dir removal also failed -- nothing ever executed (genuinely `Uncommitted`,
-            // first hop), yet the bundle cleanup itself could not be proven.
             let slot = Mutex::new(Some((
                 Err(RunFailure::uncommitted("simulated cgroup creation failure")),
                 Err("simulated bundle dir removal failure".to_string()),
@@ -2934,13 +2581,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- Sol's round-3 review, blocker 3: a finalization failure must not mask a
-        // simultaneous guest-result failure ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn non_passing_result_inside_a_teardown_failure_preserves_both_reasons() {
             let root = staged_repo_root();
@@ -2960,7 +2604,7 @@ mod tests {
                 child: Box::new(FakeRunsc),
                 bundle_dir,
                 result: SandboxResult {
-                    exit_code: Some(1), // did NOT pass
+                    exit_code: Some(1),
                     timed_out: false,
                     usage: advertise_usage,
                     stdout: advertise_bytes,
@@ -3027,13 +2671,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- Sol's round-4 review, blocker 1: CommitOutcomeUnknown inside a genuine teardown
-        // failure must not erase it ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn commit_outcome_unknown_inside_a_teardown_failure_is_still_teardown_unproven() {
             let root = staged_repo_root();
@@ -3112,13 +2753,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // ---- Sol's round-4 review, blocker 2: an unproven bundle cleanup must force
-        // TeardownUnproven even when the hop's own result is Ok ----
-
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn bundle_cleanup_failure_forces_teardown_unproven_even_on_an_otherwise_successful_hop() {
             let root = staged_repo_root();
@@ -3145,11 +2783,6 @@ mod tests {
                 },
                 run_error: None,
             };
-            // A structurally-permitted but production-never-produces-this combination (Sol's
-            // round-4 review): the finalization result is a clean success, yet the paired
-            // `BundleCleanupProof` is `Err` -- the executor type allows this even though the real
-            // `run_git_wire_container_raw` never returns it (its success path only ever pairs `Ok`
-            // finalization with `Ok(())` cleanup, since nothing is removed on that path yet).
             let slot = Mutex::new(Some((
                 Ok(RuntimeFinalization::Finalized(FinalizedRun {
                     primary: Ok((run, false)),
@@ -3207,19 +2840,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        // =================================================================================
-        // CT-007 phase-credential generations: the V2 transport / preparation authority.
-        //
-        // Round-1 blocker 2: the concrete bypass these tests exist to close is "still-valid
-        // proof for requeued claim A + live permit for claim B". With the fused, consuming
-        // `PhaseAuthorization` that pairing is not expressible — the tests below prove the
-        // adjacent mix-and-match attempts that ARE expressible all refuse before any spawn.
-        // =================================================================================
-
-        // `permit_recording_executor` was relocated to the `checkout_transport_test_support`
-        // module (re-imported above) so the runsc-driver seam + §4 tests share the ONE two-call
-        // permit-recording executor.
-
         fn advertise_authorization(oid: &str, jti: &str) -> PhaseAuthorization {
             minted_phase_authorization(
                 parent_attempt_scope(oid, GitObjectFormat::Sha1),
@@ -3230,8 +2850,6 @@ mod tests {
             )
         }
 
-        /// **Cross-phase substitution, FETCH-for-ADVERTISE.** A well-formed authorization for
-        /// the wrong boundary refuses before anything spawns.
         #[test]
         fn a_fetch_phase_authorization_substituted_for_advertise_refuses_before_any_spawn() {
             let root = staged_repo_root();
@@ -3273,18 +2891,12 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        /// **CROSS-INVOCATION: an authorization minted against a DIFFERENT claim's credential.**
-        /// This is the closest expressible form of the blocker-2 bypass — the caller holds a
-        /// live authorization (permit included) from claim B and tries to drive claim A's
-        /// transport with it. The authorization's privately retained JTI refuses it.
         #[test]
         fn an_authorization_from_another_claim_cannot_drive_this_transport() {
             let root = staged_repo_root();
             let oid = sha1_oid(0xd9);
             let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
-            // Claim B's authorization: fully valid, permit live.
             let claim_b = advertise_authorization(&oid, "jti-claim-b");
-            // ...presented alongside claim A's credential.
             let claim_a_credential = RunTokenCredential::new("bearer", "jti-claim-a", 300).unwrap();
             let (executor, _remaining) = panics_if_called_executor();
             let cancellation = AtomicBool::new(false);
@@ -3315,7 +2927,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        /// **CROSS-SCOPE: a valid authorization for another repo/commit.**
         #[test]
         fn an_authorization_for_another_target_cannot_drive_this_transport() {
             let root = staged_repo_root();
@@ -3386,12 +2997,10 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        /// **Advertisement succeeds but the fetch mint refuses: the fetch never spawns, and the
-        /// advertisement's already-measured usage survives into the error.**
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn a_refused_fetch_mint_never_spawns_the_fetch_and_keeps_the_advertisement_usage() {
             let root = staged_repo_root();
@@ -3458,17 +3067,14 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        /// The fetch provider returning a WRONG-PHASE authorization, a MISMATCHED credential, or
-        /// the SAME generation as the advertisement all refuse — and the fetch never spawns.
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn a_divergent_fetch_authorization_refuses_before_the_fetch_spawns() {
             type Provider =
                 Box<dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>>;
-            /// (label, expected refusal fragment, provider builder).
             type DivergentFetchCase = (&'static str, &'static str, fn(&str) -> Provider);
             let cases: Vec<DivergentFetchCase> = vec![
                 (
@@ -3497,8 +3103,6 @@ mod tests {
                         let oid = oid.to_string();
                         Box::new(move || {
                             Ok((
-                                // A credential that does NOT belong to the authorization
-                                // returned alongside it.
                                 RunTokenCredential::new("bearer", "jti-other-claim", 300).unwrap(),
                                 minted_phase_authorization(
                                     parent_attempt_scope(&oid, GitObjectFormat::Sha1),
@@ -3587,12 +3191,10 @@ mod tests {
             }
         }
 
-        /// **The V2 happy path: each leg spawns under its OWN credential and its OWN durable
-        /// phase permit.** This is what makes a >5-minute Hop A survivable at all.
         #[test]
         #[cfg_attr(
             not(feature = "privileged-host-tests"),
-            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) — run on the host lane with --features privileged-host-tests"
+            ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
         )]
         fn the_v2_transport_spawns_each_leg_under_its_own_credential_and_phase_permit() {
             let root = staged_repo_root();
@@ -3677,8 +3279,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(&root);
         }
 
-        /// **A phase permit whose durable generation is no longer current refuses AT THE SPAWN
-        /// GATE**, not at mint time — the whole reason the permit is retained and lazy.
         #[test]
         fn a_superseded_phase_permit_refuses_when_the_spawn_gate_commits_it() {
             let oid = sha1_oid(0xd6);
@@ -3710,19 +3310,13 @@ mod tests {
             );
         }
 
-        // ---- Hop B: the materialization authority ----
-
         #[test]
         fn hop_b_consumes_only_a_materialization_authorization_for_the_exact_claim() {
             let oid = sha1_oid(0xd7);
             let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
             let run_token = RunTokenCredential::new("bearer", "jti-materialization", 300).unwrap();
-            // CT-007 slice 5b.3-6a (blocker 1): Hop B's permit is now resolved against the
-            // capsule's FULL derived scope, not just the commit — the capsule was acquired for
-            // exactly this scope.
             let capsule_scope = parent_attempt_scope(&oid, GitObjectFormat::Sha1);
 
-            // The exact materialization authorization is accepted, and its permit commits.
             resolve_checkout_preparation_permit(
                 minted_phase_authorization(
                     parent_attempt_scope(&oid, GitObjectFormat::Sha1),
@@ -3739,7 +3333,6 @@ mod tests {
             .commit_and_release()
             .expect("its durable permit commits");
 
-            // Every adjacent substitution refuses.
             let cases: [(&str, crate::CheckoutPhase, &str, &str, &str); 4] = [
                 (
                     "fetch phase",
@@ -3767,8 +3360,6 @@ mod tests {
                     crate::CheckoutPhase::Materialization,
                     "jti-materialization",
                     "ffffffffffffffffffffffffffffffffffffffff",
-                    // 5b.3-6a: a different commit is now a FULL-scope mismatch against the
-                    // capsule's own scope, caught before the commit-vs-preparation check.
                     "was minted for scope",
                 ),
             ];

@@ -1,27 +1,3 @@
-//! # Merge-queue-in-isolation drill — the merge-queue durable workflow body (P-FLOW-19 → P-215)
-//!
-//! The headline drill the P-FLOW-19 GATE requires (durable-workflow.md §6.5 + the M2.4 Exit gate):
-//! the merge-queue workflow body, drilled **IN ISOLATION** against a **MOCK `ci.result` producer**
-//! (this engine does NOT own the real producer — that is CI, M4, the NAMED FLOOR **P-FLOW-22**).
-//!
-//! The four assertions the GATE quantifies (durable-workflow.md §6.5 / the Exit-gate drill):
-//! 1. **A double-delivered `ci.result` for a merge_attempt → exactly ONE wake** (idempotent on the
-//!    `merge_attempt_id`); 0 double-merge, 1 wake per attempt.
-//! 2. **A vanished CI run → the timeout branch fires and bounds the wait** (the run never parks
-//!    forever; the queue continues).
-//! 3. **A success-for-all-required-contexts → exactly one merge + one `git.pr.merged` emit + one
-//!    settle.**
-//! 4. **A failure → one dequeue with a humanised reason** (contract 7.3); the queue continues.
-//!
-//! Green artifact: **0 double-merge, 1 wake per attempt, timeout-bounded, dated**. A red drill is
-//! information — never weaken it to pass (EI-01 §3).
-//!
-//! **What "in isolation" means here:** the merge-queue body runs on the REAL durable substrate (a
-//! [`FlowDispatcher`] over a `RunStore` + journal + signal buffer + outbox), so the park/resume,
-//! the exactly-once consume, and the co-committed `git.pr.merged` emit are all exercised end-to-end —
-//! but the `ci.result` PRODUCER is the [`MockCiResultProducer`] (delivered via the executor's
-//! `signal` path), standing in for CI's real rollup until P-FLOW-22.
-
 use myelin_events::check_seam::CiOverall;
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
@@ -62,7 +38,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// A CI dispatcher that counts dispatches (so the drill proves 0 re-dispatch across a restart).
 #[derive(Default)]
 struct CountingCi {
     calls: AtomicUsize,
@@ -74,7 +49,6 @@ impl CiDispatcher for CountingCi {
     }
 }
 
-/// A merge performer that counts merges (so the drill proves EXACTLY one merge per attempt).
 #[derive(Default)]
 struct CountingMerger {
     merges: AtomicUsize,
@@ -95,9 +69,6 @@ fn request() -> MergeRequest {
     }
 }
 
-/// The merge-queue workflow body: ONE merge attempt (dispatch required CI + park on `ci.result` +
-/// merge-or-dequeue). Captures the CI dispatcher + merger (the unified-runner + merge seams). The
-/// outcome is encoded into the body's result refs so the drill can read it off the [`DriveOutcome`].
 fn merge_queue_body(ci: Arc<CountingCi>, merger: Arc<CountingMerger>) -> Box<WorkflowBody> {
     Box::new(move |ctx: &mut WfCtx| {
         let out = ctx
@@ -125,7 +96,6 @@ fn merge_queue_body(ci: Arc<CountingCi>, merger: Arc<CountingMerger>) -> Box<Wor
     })
 }
 
-/// The shared durable substrate a worker drives over (survives a restart).
 struct Substrate {
     runs: RunStore,
     journal: WfJournal,
@@ -159,7 +129,6 @@ fn fresh_worker(
     disp
 }
 
-/// Start a fresh merge-queue run on the executor + a substrate over it.
 fn start(idem: &str) -> (FlowExecutor, myelin_flow::RunId, Substrate) {
     let ex = FlowExecutor::new(minter(), tenant(), region());
     ex.register_definition("merge.queue");
@@ -182,8 +151,6 @@ fn start(idem: &str) -> (FlowExecutor, myelin_flow::RunId, Substrate) {
     (ex, run, sub)
 }
 
-/// Deliver a `ci.result` via the executor's signal path (the MOCK producer, modelled on CI's
-/// at-least-once delivery). Returns the [`SignalOutcome`].
 fn deliver_ci_result(
     ex: &FlowExecutor,
     run: &myelin_flow::RunId,
@@ -208,10 +175,6 @@ fn deliver_ci_result(
     .expect("deliver ci.result")
 }
 
-/// **GATE (3) + (1): success for all required contexts across a restart → exactly ONE merge + ONE
-/// `git.pr.merged`; a double-delivered `ci.result` is ONE wake (0 double-merge).** The body dispatches
-/// CI + parks; the worker crashes; CI delivers the rollup TWICE (at-least-once) days later; the
-/// redeployed worker resumes, consumes ONCE, merges ONCE, emits `git.pr.merged` ONCE.
 #[test]
 fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
     let ci = Arc::new(CountingCi::default());
@@ -219,7 +182,6 @@ fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
     let (ex, run, sub) = start("queue:main:pr-7");
     let part = partition_for_run_id(&run.0);
 
-    // WORKER 1: dispatch CI + PARK on ci.result (state=waiting holds no runtime).
     let w1 = fresh_worker(&sub, "worker-1", part, ci.clone(), merger.clone());
     let o1 = w1
         .tick(1_000, "2026-06-21T00:00:00Z", 7)
@@ -232,7 +194,7 @@ fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
     assert_eq!(
         sub.runs.get(&tenant(), &run.0).unwrap().state,
         run_state::WAITING,
-        "state=waiting — the merge queue holds no runtime across the multi-hour CI run"
+        "state=waiting - the merge queue holds no runtime across the multi-hour CI run"
     );
     assert_eq!(
         ci.calls.load(Ordering::SeqCst),
@@ -242,14 +204,12 @@ fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
     assert_eq!(
         merger.merges.load(Ordering::SeqCst),
         0,
-        "no merge yet — CI still running"
+        "no merge yet - CI still running"
     );
     assert_eq!(sub.outbox.committed_count(), 0, "no git.pr.merged yet");
-    drop(w1); // worker crashes + service redeployed while parked (hours pass).
+    drop(w1);
 
-    // The deterministic merge_attempt_id CI echoes (the dispatch was command merge.queue:0).
     let attempt = merge_attempt_id(&run.0, "merge.queue:0");
-    // CI delivers the rollup TWICE (at-least-once double-delivery).
     let first = deliver_ci_result(
         &ex,
         &run,
@@ -283,7 +243,6 @@ fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
     );
     sub.runs.wake(&tenant(), &run.0);
 
-    // WORKER 2 (redeployed): re-lease + resume + merge.
     let w2 = fresh_worker(&sub, "worker-2", part, ci.clone(), merger.clone());
     let o2 = w2
         .tick(2_000, "2026-06-21T02:00:00Z", 7)
@@ -297,7 +256,6 @@ fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
         other => panic!("expected the run to merge + complete, got {other:?}"),
     }
 
-    // THE THRESHOLDS: 1 wake, 0 double-merge, 1 git.pr.merged, 0 re-dispatch.
     assert_eq!(
         sub.signals.buffered_depth(),
         0,
@@ -327,8 +285,6 @@ fn merge_queue_success_double_delivery_one_wake_one_merge_across_restart() {
     );
 }
 
-/// **GATE (4): a failure `ci.result` → ONE dequeue with a humanised reason; the queue continues.** No
-/// merge, no `git.pr.merged`.
 #[test]
 fn merge_queue_failure_one_dequeue_humanised_reason() {
     let ci = Arc::new(CountingCi::default());
@@ -391,9 +347,6 @@ fn merge_queue_failure_one_dequeue_humanised_reason() {
     );
 }
 
-/// **GATE (2): a vanished CI run → the timeout branch fires and bounds the wait.** CI is dispatched
-/// but never reports; the SLA timeout-timer fires and the run dequeues (TimedOut), never parking
-/// forever — the queue continues.
 #[test]
 fn merge_queue_vanished_ci_run_timeout_bounds_the_wait() {
     let ci = Arc::new(CountingCi::default());
@@ -401,7 +354,6 @@ fn merge_queue_vanished_ci_run_timeout_bounds_the_wait() {
     let (_ex, run, sub) = start("queue:main:pr-9");
     let part = partition_for_run_id(&run.0);
 
-    // WORKER 1 at clock=1000 with a 3600s SLA (the body's timeout) → dispatch + park.
     let w1 = fresh_worker(&sub, "worker-1", part, ci.clone(), merger.clone());
     assert_eq!(
         w1.tick(1_000, "2026-06-21T00:00:00Z", 7).unwrap(),
@@ -410,12 +362,8 @@ fn merge_queue_vanished_ci_run_timeout_bounds_the_wait() {
     );
     drop(w1);
 
-    // No ci.result ever arrives. The wheel/clock advances past the deadline; the run is woken by the
-    // timeout (modelled by waking it + re-driving past the deadline — the timeout branch reads the
-    // live clock and fires).
     sub.runs.wake(&tenant(), &run.0);
     let w2 = fresh_worker(&sub, "worker-2", part, ci.clone(), merger.clone());
-    // clock far past the 1000 + 3600 = 4600 deadline → the timeout fires.
     let o2 = w2
         .tick(10_000, "2026-06-21T03:00:00Z", 7)
         .expect("worker-2 re-drives past the deadline");
@@ -430,7 +378,7 @@ fn merge_queue_vanished_ci_run_timeout_bounds_the_wait() {
     assert_eq!(
         ci.calls.load(Ordering::SeqCst),
         1,
-        "0 re-dispatch — the dispatch short-circuited on replay"
+        "0 re-dispatch - the dispatch short-circuited on replay"
     );
     assert_eq!(
         merger.merges.load(Ordering::SeqCst),

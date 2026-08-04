@@ -1,32 +1,3 @@
-//! # NOTIF-D10 — head-of-line isolation: a slow/poison Signal does not stall the router (P-181)
-//!
-//! **Drill source:**
-//! `planning/05-refined-shared-systems-architecture/testing-strategy/01-whole-system-e2e-and-drill-catalogue.md`
-//! row **NOTIF-D10** ("Inject a slow/poison Signal type → whitelisted-template router doesn't
-//! stall, terminates poison, lag-alarm fires." Threshold: **0 head-of-line stalls; lag below the
-//! thresholds-file default**), and §3.3 (assertions read from production telemetry — observability
-//! is part of the pass, EI-01 §3).
-//!
-//! **The dated GREEN artifact (2026-06-20).** A POISON Signal (an un-parseable payload on a
-//! `sig.acme.*` subject) is injected into the live router consumer alongside GOOD Signals on
-//! sibling subjects. The drill asserts, through the harness telemetry-assertion library (the SAME
-//! `consumer_lag` signal contract-1.8 names, §10.2):
-//!
-//! 1. **0 head-of-line stalls** — the poison terminates IMMEDIATELY (`NonRetryable` → dead-letter,
-//!    rule 5), it is SURFACED (not silently dropped), and EVERY good Signal on a sibling subject
-//!    still routes (UPSERTs its inbox item + emits `notif.item.created`). The poison did not block
-//!    the subject behind it.
-//! 2. **lag below the default** — the consumer-lag survival signal (`consumer_lag`) recovers to 0
-//!    (the dead-letter is terminal; the good Signals acked). 0 is below any thresholds-file default
-//!    (the lag-alarm is armed at the default; this run reads 0 — the alarm does NOT fire spuriously,
-//!    and WOULD fire on a real stall because the un-acked backlog would climb).
-//!
-//! The poison-tolerance is the router's, not the test's: [`myelin_notif::SignalRouter::handle`]
-//! returns `NonRetryable` for a malformed Signal, which the seven-rule
-//! [`Consumer`](myelin_events::Consumer) runtime dead-letters without burning the redelivery budget
-//! or blocking the lane. The harness reads `consumer_lag` off the live consumer — the green is the
-//! observed lag, not a claimed one.
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, ConsumerName, CorrelationId, DataRole, DedupLedger,
     Delivered, EventEnvelope, EventId, EventType, Message, OutboxStore, Timestamp, Visibility,
@@ -51,7 +22,6 @@ fn principal() -> Principal {
     )
 }
 
-/// A curated Signal (the shape the engine, P-138, publishes), carried in a `sig.<tenant>.…` event.
 fn signal(rule: &str, severity: Severity, subject: &str, dedup: &str) -> Signal {
     Signal {
         rule_id: RuleId(rule.into()),
@@ -104,7 +74,6 @@ fn good_msg(id: &str, sig: &Signal) -> Message {
     }
 }
 
-/// **NOTIF-D10: 0 head-of-line stalls + the lag-alarm reads a bounded lag (the dated green).**
 #[test]
 fn notif_d10_poison_signal_no_stall_lag_bounded() {
     let outbox = OutboxStore::new();
@@ -112,7 +81,6 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
     let consumer =
         build_router(&tenant(), inbox.clone(), outbox.clone(), DedupLedger::new()).unwrap();
 
-    // Inject a POISON Signal: a `sig.acme.error.broken` subject whose payload is NOT a Signal.
     let poison = Message {
         subject: "sig.acme.error.broken_rule".into(),
         envelope: signal_envelope(
@@ -127,7 +95,6 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
         ),
     };
 
-    // Three GOOD Signals on sibling subjects (distinct runs → distinct inbox rows).
     let goods = [
         good_msg(
             "evt-g1",
@@ -158,7 +125,6 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
         ),
     ];
 
-    // (1) The poison terminates IMMEDIATELY (dead-letter, rule 5) — not a Retry, not a stall.
     let out = consumer.deliver(&poison);
     assert!(
         matches!(out, Delivered::DeadLettered(_)),
@@ -170,7 +136,6 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
         "the poison is SURFACED, not silently dropped"
     );
 
-    // (2) Every GOOD Signal on a sibling subject still routes — 0 head-of-line stalls.
     let mut routed = 0;
     for g in &goods {
         assert_eq!(
@@ -189,16 +154,12 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
         3,
         "three distinct inbox rows UPSERTed (the poison wrote none)"
     );
-    // The poison emitted nothing; the three good Signals each emitted one notif.item.created.
     assert_eq!(
         outbox.committed_count(),
         3,
-        "3 emits (the poison did not emit — not a half-write)"
+        "3 emits (the poison did not emit - not a half-write)"
     );
 
-    // (3) Read the consumer-lag survival signal off the LIVE consumer (observability is part of the
-    // pass, §3.3 / EI-01 §3) and ASSERT it through the harness telemetry-assertion library. The lag
-    // recovered to 0 (the dead-letter is terminal; the good Signals acked) → below any default.
     let observed_lag = consumer.lag() as i64;
     let mut src = SignalSource::new();
     src.set_labelled(
@@ -206,9 +167,6 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
         vec![Label::new("consumer", ROUTER_CONSUMER_NAME)],
         observed_lag,
     );
-    // The lag-alarm: assert consumer_lag <= the threshold default. The default-to-beat for a
-    // recovered consumer is 0 (no un-acked backlog); we assert <= 0 so a single stalled subject
-    // (lag >= 1) would FAIL this LOUDLY (the alarm fires on a real stall — not inverted away).
     src.assert_labelled(
         SignalName::ConsumerLag,
         vec![Label::new("consumer", ROUTER_CONSUMER_NAME)],
@@ -216,7 +174,6 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
     )
     .expect_green();
 
-    // Belt: the runtime's own lag accessor agrees (0 head-of-line stalls).
     assert_eq!(
         consumer.lag(),
         0,
@@ -225,18 +182,13 @@ fn notif_d10_poison_signal_no_stall_lag_bounded() {
     assert_eq!(consumer.name(), &ConsumerName(ROUTER_CONSUMER_NAME.into()));
 }
 
-/// **The lag-alarm WOULD fire on a real stall (the drill is not vacuous).** A retrying (un-acked)
-/// Signal sits in consumer lag; asserting `lag <= 0` against a lag of 1 is RED — proving the green
-/// above is earned (the assertion has teeth; a stall is caught, not inverted away).
 #[test]
 fn notif_d10_lag_alarm_fires_on_a_real_stall() {
-    // Model the stalled state directly on the signal source (a router whose outbox is wedged would
-    // Retry → un-acked → lag climbs; here we assert the ALARM, not the router, catches a lag of 1).
     let mut src = SignalSource::new();
     src.set_labelled(
         SignalName::ConsumerLag,
         vec![Label::new("consumer", ROUTER_CONSUMER_NAME)],
-        1, // one un-acked (stalled) Signal.
+        1,
     );
     let verdict = src.assert_labelled(
         SignalName::ConsumerLag,
@@ -245,6 +197,6 @@ fn notif_d10_lag_alarm_fires_on_a_real_stall() {
     );
     assert!(
         !verdict.is_green(),
-        "lag=1 against `<= 0` is RED — the lag-alarm fires on a real stall"
+        "lag=1 against `<= 0` is RED - the lag-alarm fires on a real stall"
     );
 }

@@ -1,28 +1,3 @@
-//! P-CP-08 (global P-084) GATE / DRILL — **`placement_of` + the gateway misroute-rejection at
-//! tenant grain (CP-D2)** — dated green artifact.
-//!
-//! **The GATE (testing-strategy CP-D2 / tenancy-and-control-plane.md §5.3 layer 4 / §7.3):** a
-//! request to a cell for a `tenant_id` it doesn't host → **misroute rejection** (not proxied), a
-//! misroute redirect to the correct cell-endpoint, an audit entry written, and **0
-//! cross-tenant/cross-cell rows read**. Telemetry: `misroute_count` increments, an audit entry is
-//! written, the `CrossTenantCount` projection == 0.
-//!
-//! **The most load-bearing zero (EI-01 §2):** a cross-tenant IDOR / cross-cell read is
-//! stop-the-bleeding. The structural defence here is `placement_of` (layer 4): the gateway asks the
-//! control-plane authoritative routing answer which cell homes the tenant and rejects+redirects if
-//! that is not THIS cell — BEFORE any tenant row is touched, so the 0 is by construction, not by a
-//! `0`-row query that "happened" to return nothing.
-//!
-//! **This drill proves the gate can go RED** (a misroute IS rejected + audited; a gate that cannot go
-//! red is not a gate, EI-01 §3) **AND green** (the home cell serves its own tenant), and emits the
-//! CP-D2 result on the SAME [`SignalSource`] every drill uses (observability is part of the pass).
-//!
-//! **FLOOR (named, VISION §3):** `member_cells` single-element / resolution always same-cell in v1 —
-//! the gateway accepts IFF the tenant's `home_cell` is THIS cell. The multi-cell resolution path (the
-//! `CrossCellPointer` bridge) goes live in **M5 (P-CP-19 / P-CP-20)**. The misroute audit lands in a
-//! typed in-process sink; the durable tamper-evident chain is GDPR P-GA-19 / P-062 (the consumer
-//! reads the same PII-free shape).
-
 use myelin_control_plane::{
     Capacity, Cell, CellGateway, CellStatus, GatewayReject, IsolationKind, Misroute,
     MisrouteAuditRecord, PlacementStatus, Registry, TenantPlacement,
@@ -60,20 +35,14 @@ fn place(reg: &mut Registry, tenant: &str, home: &str, slug: &str) {
     .expect("a single-region placement is admitted");
 }
 
-/// **THE CP-D2 DRILL (dated green artifact): a request to a cell for a `tenant_id` it doesn't host →
-/// rejected + redirected + audited, 0 cross-tenant/cross-cell read; the home cell serves its own
-/// tenant.**
 #[test]
 fn cp_d2_misroute_rejection_tenant_grain() {
-    // Two cells in eu-west; ACME homed on cell-w-1, BETA homed on cell-w-2.
     let mut reg = Registry::new();
     reg.insert_cell(cell("cell-w-1", "eu-west"));
     reg.insert_cell(cell("cell-w-2", "eu-west"));
     place(&mut reg, "01J0ACME", "cell-w-1", "acme");
     place(&mut reg, "01J0BETA", "cell-w-2", "beta");
 
-    // ── RED leg: cell-w-2's gateway receives a request for ACME (homed on cell-w-1) → a MISROUTE.
-    //    Rejected (NOT proxied), redirected to cell-w-1's endpoint, audited, 0 cross-cell read. ──
     let wrong = CellGateway::new(CellId::from_token("cell-w-2"));
     let reject = wrong
         .route(&reg, &TenantId::from_token("01J0ACME"))
@@ -87,7 +56,6 @@ fn cp_d2_misroute_rejection_tenant_grain() {
         }),
         "the misroute redirects to the HOME cell-endpoint (not proxied)"
     );
-    // The misroute was audited (PII-free, opaque ids only) — loud, never swallowed.
     assert_eq!(wrong.audit().count(), 1, "the misroute is audited");
     assert_eq!(
         wrong.audit().records()[0],
@@ -108,7 +76,6 @@ fn cp_d2_misroute_rejection_tenant_grain() {
         "0 cross-tenant/cross-cell rows read (the CP-D2 zero)"
     );
 
-    // An UNKNOWN tenant is also rejected (no redirect target) + audited — still 0 cross-cell read.
     let unknown = wrong
         .route(&reg, &TenantId::from_token("01J0GHOST"))
         .expect_err("an unknown tenant is rejected (no route)");
@@ -125,7 +92,6 @@ fn cp_d2_misroute_rejection_tenant_grain() {
     );
     assert_eq!(wrong.cross_tenant_reads(), 0, "still 0 cross-tenant reads");
 
-    // ── GREEN leg: the home cell (cell-w-1) serves its OWN tenant (ACME) — no misroute, no audit. ──
     let home = CellGateway::new(CellId::from_token("cell-w-1"));
     let served = home
         .route(&reg, &TenantId::from_token("01J0ACME"))
@@ -145,8 +111,6 @@ fn cp_d2_misroute_rejection_tenant_grain() {
     assert_eq!(home.audit().count(), 0, "nothing to audit on an accept");
     assert_eq!(home.cross_tenant_reads(), 0);
 
-    // The redirect is then SERVED by the home cell (a redirect, never a proxy): re-route ACME to the
-    // redirect's correct cell — it accepts.
     let GatewayReject::Misroute(redirect) = reject else {
         panic!("expected a misroute")
     };
@@ -155,8 +119,6 @@ fn cp_d2_misroute_rejection_tenant_grain() {
         .expect("the redirected request is served by the home cell");
     assert_eq!(re_routed.home_cell, redirect.correct_cell);
 
-    // ── Emit the CP-D2 gate result on the SAME SignalSource every drill uses (observability is part
-    //    of the pass, EI-01 §3): the CrossTenantCount projection == 0 (the headline CP-D2 zero). ──
     let mut sig = SignalSource::new();
     sig.set_scalar(SignalName::CrossTenantCount, cross_tenant_reads as i64);
     sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
@@ -177,18 +139,13 @@ fn cp_d2_misroute_rejection_tenant_grain() {
     );
 }
 
-/// **The gate is NOT vacuous: a cross-tenant read SERVED would read RED.** Proves the CP-D2 zero is a
-/// real tripwire — if a (hypothetical) code path served a foreign tenant, `CrossTenantCount > 0`
-/// would fail the predicate. (The structural defence pins the real value to 0; this asserts the
-/// assertion itself is load-bearing — EI-01 §3, a gate that cannot go red is not a gate.)
 #[test]
 fn cp_d2_gate_is_not_vacuous() {
     let mut sig = SignalSource::new();
-    // A hypothetical regression that SERVED one cross-tenant read.
     sig.set_scalar(SignalName::CrossTenantCount, 1);
     assert!(
         !sig.assert_signal(SignalName::CrossTenantCount, Predicate::Eq(0))
             .is_green(),
-        "a served cross-tenant read MUST read RED — the CP-D2 zero is a real tripwire"
+        "a served cross-tenant read MUST read RED - the CP-D2 zero is a real tripwire"
     );
 }

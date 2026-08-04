@@ -1,8 +1,3 @@
-//! Unit tests for the Issues OLAP CQRS feed (ISS-P20 / P-387): the off-the-bus CQRS isolation (0 OLTP
-//! reads), the restriction-flag exclusion (a restricted subject contributes 0 rows — the
-//! mandatory-core GDPR-correctness logic), the SLA-compliance aggregate, and the reindex-from-source
-//! 0-drift parity. These are the mandatory-core mutation-bearing tests.
-
 use super::*;
 use crate::replay::IssueReplayKind;
 use myelin_events::{
@@ -24,8 +19,6 @@ fn principal(id: &str) -> Principal {
     )
 }
 
-/// Build an analytics-driving Issues envelope. `actor_id` is the pseudonymous principal; `subject` is
-/// the issue ref the analytics row is about; `aggregate` is the per-aggregate ordering row.
 fn ev(
     event_id: &str,
     type_token: &str,
@@ -61,11 +54,6 @@ fn consumer() -> IssueOlapConsumer {
     IssueOlapConsumer::new(region(), RestrictionFlag::new())
 }
 
-// ── CQRS isolation: off the bus, NEVER the OLTP table (the 0-OLTP-read gate) ──────────────────────
-
-/// **The analytics path reads 0 from the OLTP table (the 0-OLTP-read GATE, arch §1.2).** The consumer
-/// holds no OLTP handle; it feeds the read store off the bus envelope only. `oltp_read_count` is 0 by
-/// construction, before and after a feed.
 #[test]
 fn zero_oltp_reads_from_the_analytics_path() {
     let c = consumer();
@@ -91,8 +79,6 @@ fn zero_oltp_reads_from_the_analytics_path() {
     );
 }
 
-/// **The consumer is idempotent on `event_id` (contract 2.4 / 2.5).** The SAME event handled twice
-/// projects once; a redelivery is a no-op.
 #[test]
 fn consumer_is_idempotent_on_event_id() {
     let c = consumer();
@@ -109,14 +95,12 @@ fn consumer_is_idempotent_on_event_id() {
     assert_eq!(c.doc_count(), 1, "exactly one projected doc");
 }
 
-/// **The whitelist is the analytics-driving issue.*/sla.*/cycle.* tokens, NEVER `*` (BUS-3).** A
-/// non-analytics token (e.g. `issue.issue.created`) is dropped, never projected.
 #[test]
 fn non_analytics_token_is_dropped() {
     let c = consumer();
     let e = ev(
         "e1",
-        events::ISSUE_CREATED, // NOT an analytics token
+        events::ISSUE_CREATED,
         "psn:alice",
         "myelin://acme/issue/issue/ENG-1",
         "issue:ENG-1",
@@ -124,7 +108,6 @@ fn non_analytics_token_is_dropped() {
     );
     assert_eq!(c.handle(&e, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done, "dropped, not an error");
     assert_eq!(c.doc_count(), 0, "a non-analytics token projects nothing");
-    // The whitelist never contains `*`.
     assert!(
         c.subjects().iter().all(|s| s.0 != "*"),
         "the OLAP consumer never subscribes to `*` (BUS-3)"
@@ -132,8 +115,6 @@ fn non_analytics_token_is_dropped() {
     assert!(!c.subjects().is_empty(), "the whitelist is non-empty");
 }
 
-/// **An out-of-region event is a non-retryable poison (the residency boundary, §3.4).** A misrouted
-/// event can never become in-region by retry.
 #[test]
 fn out_of_region_event_is_non_retryable_poison() {
     let c = consumer();
@@ -157,18 +138,10 @@ fn out_of_region_event_is_non_retryable_poison() {
     );
 }
 
-// ── the restriction flag — no analytics for a restricted subject (mandatory-core, GDPR-bearing) ───
-
-/// **A restricted subject contributes 0 rows to CFD/velocity/cycle-time (recon §8 / contract 11.6 —
-/// the restriction-exclusion GATE).** Two SLA-met rows for alice + one for bob; restrict alice → only
-/// bob survives every cross-team aggregate, and the leak audit is 0.
 #[test]
 fn restricted_subject_excluded_from_every_aggregate() {
     let flag = RestrictionFlag::new();
     let c = IssueOlapConsumer::new(region(), flag.clone());
-    // alice: two rows; bob: one row. Each event's SUBJECT is the issue; the restriction is keyed on
-    // the subject ref (the doc's subject) — we make the subject ref the person id here so the C5 set
-    // (which keys on the doc subject) excludes alice's docs.
     for (id, subj) in [("a1", "psn:alice"), ("a2", "psn:alice"), ("b1", "psn:bob")] {
         c.handle(&ev(
             id,
@@ -179,7 +152,6 @@ fn restricted_subject_excluded_from_every_aggregate() {
             serde_json::json!({ "category": "completed" }),
         ), &mut myelin_events::HandlerTx::none());
     }
-    // Unrestricted: all three contribute (pins the count, not a constant).
     c.analytics(|a| {
         assert_eq!(a.velocity(), 3, "all three contribute unrestricted");
         assert_eq!(a.cfd().len(), 3, "three CFD rows unrestricted");
@@ -189,9 +161,7 @@ fn restricted_subject_excluded_from_every_aggregate() {
             "no restriction → 0 leak"
         );
     });
-    // Restrict alice (the holder flag) — her two rows drop from every aggregate.
     flag.set("psn:alice", true);
-    // A subsequent feed re-syncs the OLAP set; re-feed bob (a redelivery is a no-op but re-syncs).
     c.handle(&ev(
         "b1",
         events::ISSUE_TRANSITIONED,
@@ -212,8 +182,6 @@ fn restricted_subject_excluded_from_every_aggregate() {
     });
 }
 
-/// **The restriction LIFTS → the subject REAPPEARS (filter-at-query-time, no reindex).** The rows
-/// stayed in the store; a lift makes alice reappear in the next query.
 #[test]
 fn restriction_lifts_subject_reappears() {
     let flag = RestrictionFlag::new();
@@ -229,7 +197,6 @@ fn restriction_lifts_subject_reappears() {
         ), &mut myelin_events::HandlerTx::none());
     }
     flag.set("psn:alice", true);
-    // Re-feed to re-sync the C5 set (a redelivery no-ops the projection but re-applies the flag).
     c.handle(&ev(
         "a1",
         events::ISSUE_TRANSITIONED,
@@ -239,7 +206,6 @@ fn restriction_lifts_subject_reappears() {
         serde_json::json!({ "category": "completed" }),
     ), &mut myelin_events::HandlerTx::none());
     c.analytics(|a| assert_eq!(a.velocity(), 1, "alice withheld"));
-    // Lift — re-sync — alice reappears with no reindex.
     flag.set("psn:alice", false);
     c.handle(&ev(
         "a1",
@@ -258,10 +224,6 @@ fn restriction_lifts_subject_reappears() {
     });
 }
 
-// ── the SLA-compliance aggregate (the Issues ask's added leg; restriction-honouring) ──────────────
-
-/// **SLA-compliance = met / (met + breached) over CONTRIBUTING rows.** Two met + one breached →
-/// compliance 2/3; the breach drops it below 1.0.
 #[test]
 fn sla_compliance_is_met_over_met_plus_breached() {
     let c = consumer();
@@ -299,7 +261,6 @@ fn sla_compliance_is_met_over_met_plus_breached() {
     });
 }
 
-/// **An all-met feed is 1.0 compliance; a single breach drops it (pins the numerator/denominator).**
 #[test]
 fn sla_compliance_one_when_all_met_and_drops_on_breach() {
     let c = consumer();
@@ -329,8 +290,6 @@ fn sla_compliance_one_when_all_met_and_drops_on_breach() {
     });
 }
 
-/// **No contributing SLA outcome → `None` (never a divide-by-zero).** A feed of only transitions (no
-/// SLA outcome) reports no compliance.
 #[test]
 fn sla_compliance_is_none_without_outcomes() {
     let c = consumer();
@@ -352,14 +311,10 @@ fn sla_compliance_is_none_without_outcomes() {
     });
 }
 
-/// **A restricted subject contributes 0 rows to SLA-compliance (the SLA leg honours the C5 filter).**
-/// alice met + bob breached; restrict alice → compliance is bob only (0.0, all-breached), and the
-/// leak audit (incl. the SLA leg) is 0. This is the mandatory-core GDPR-bearing SLA exclusion.
 #[test]
 fn restricted_subject_excluded_from_sla_compliance() {
     let flag = RestrictionFlag::new();
     let c = IssueOlapConsumer::new(region(), flag.clone());
-    // The subject ref IS the person id so the C5 set (keyed on the doc subject) excludes alice's row.
     c.handle(&ev(
         "m1",
         events::SLA_MET,
@@ -384,7 +339,6 @@ fn restricted_subject_excluded_from_sla_compliance() {
         );
     });
     flag.set("psn:alice", true);
-    // Re-sync the C5 set (re-feed alice's met row — a no-op projection that re-applies the flag).
     c.handle(&ev(
         "m1",
         events::SLA_MET,
@@ -394,7 +348,6 @@ fn restricted_subject_excluded_from_sla_compliance() {
         serde_json::json!({}),
     ), &mut myelin_events::HandlerTx::none());
     c.analytics(|a| {
-        // alice's met row is withheld → only bob's breach remains → 0/1 = 0.0.
         assert_eq!(a.sla_sample_size(), 1, "only bob's SLA outcome contributes");
         assert_eq!(
             a.sla_compliance(),
@@ -409,14 +362,8 @@ fn restricted_subject_excluded_from_sla_compliance() {
     });
 }
 
-// ── reindex-from-source: rebuild drift-free off the source of truth (contract 2.6) ────────────────
-
-/// **Reindex-from-source rebuilds the OLAP feed DRIFT-FREE off Issues' source of truth (contract 2.6,
-/// the ISS-D8b OLAP-feed half).** Feed the live consumer off the bus; rebuild a fresh consumer cold
-/// from the SAME source-of-truth snapshots; the two read models byte-match (`parity_bytes`).
 #[test]
 fn reindex_from_source_byte_matches_live() {
-    // (1) the live feed off the bus.
     let live = consumer();
     live.handle(&ev(
         "t1",
@@ -435,8 +382,6 @@ fn reindex_from_source_byte_matches_live() {
         serde_json::json!({}),
     ), &mut myelin_events::HandlerTx::none());
 
-    // (2) the source of truth (Issues' OWN rows) — each snapshot names the analytics token it stands
-    // in for (the SAME row the live event projected), so the reindex routes through the SAME handle.
     let mut source = IssueReindexSource::new();
     source.upsert(
         IssueReplayKind::Issue,
@@ -453,7 +398,6 @@ fn reindex_from_source_byte_matches_live() {
         serde_json::json!({ "olap_token": events::SLA_MET }),
     );
 
-    // (3) the cold rebuild through the SAME handle body.
     let cold = consumer();
     let n = cold.reindex_from(&source, &ReindexCtx::new(TenantId("acme".into()), region()));
     assert_eq!(
@@ -461,7 +405,6 @@ fn reindex_from_source_byte_matches_live() {
         "two analytics snapshots projected on the cold rebuild"
     );
 
-    // (4) cold == live (0 drift) — the byte view byte-matches.
     assert_eq!(
         cold.doc_count(),
         live.doc_count(),
@@ -474,8 +417,6 @@ fn reindex_from_source_byte_matches_live() {
     );
 }
 
-/// **A wiped feed rebuilds from source; the reindex is idempotent (cold == live, BUS-D5).** Two
-/// reindexes off the same source produce byte-identical read models.
 #[test]
 fn reindex_is_idempotent() {
     let mut source = IssueReindexSource::new();
@@ -498,8 +439,6 @@ fn reindex_is_idempotent() {
     );
 }
 
-/// **An erased aggregate is SKIPPED on reindex (X-7) — an erased subject stays out of analytics.** A
-/// source row erased before the rebuild is not re-projected.
 #[test]
 fn erased_aggregate_skipped_on_reindex() {
     let mut source = IssueReindexSource::new();
@@ -528,15 +467,10 @@ fn erased_aggregate_skipped_on_reindex() {
     );
 }
 
-// ── the dated GREEN gate artifact (the two ISS-P20 gates + the parity) ────────────────────────────
-
-/// **The ISS-D8b OLAP-feed GATE artifact is GREEN:** 0 OLTP reads, 0 restriction leak, cold == live,
-/// ≥ 1 subject restricted (non-vacuous). The two ISS-P20 gates + the reindex-parity in one signal.
 #[test]
 fn olap_feed_signal_is_green() {
     let flag = RestrictionFlag::new();
     let live = IssueOlapConsumer::new(region(), flag.clone());
-    // Feed alice + bob, restrict alice.
     live.handle(&ev(
         "a1",
         events::SLA_MET,
@@ -565,7 +499,6 @@ fn olap_feed_signal_is_green() {
 
     let leak = live.analytics(|a| a.leak_audit().restricted_subject_leak);
 
-    // Cold rebuild from source (the SAME rows) — byte-parity check.
     let mut source = IssueReindexSource::new();
     source.upsert(
         IssueReplayKind::Issue,
@@ -603,9 +536,6 @@ fn olap_feed_signal_is_green() {
     );
 }
 
-/// **The gate reads RED when ANY invariant fails** (a conjunction — no single green hides a breach):
-/// an OLTP read, a restriction leak, a cold≠live divergence, or a VACUOUS run (0 subjects restricted)
-/// each flips `is_green` to false.
 #[test]
 fn olap_feed_signal_reads_red_when_any_invariant_fails() {
     let green = IssueOlapFeedSignal {
@@ -650,8 +580,6 @@ fn olap_feed_signal_reads_red_when_any_invariant_fails() {
     );
 }
 
-/// **The Issues feed adds SLA-compliance on top of Storage's four cross-team aggregates (recon §8).**
-/// The aggregate name set is the four Storage aggregates + `sla_compliance`.
 #[test]
 fn issue_analytics_adds_sla_compliance_aggregate() {
     let names = issue_analytics_aggregate_names();
@@ -670,7 +598,6 @@ fn issue_analytics_adds_sla_compliance_aggregate() {
     );
 }
 
-/// **The floors are named (VISION §3).** The Monte-Carlo forecast follow-on (ISS-P32) is named.
 #[test]
 fn floors_are_named() {
     assert!(IssueOlapFeedFloors::MONTE_CARLO_FORECAST.contains("ISS-P32"));

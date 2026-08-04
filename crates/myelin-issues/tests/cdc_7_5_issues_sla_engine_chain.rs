@@ -1,25 +1,3 @@
-//! # The CDC pair for contract 7.5 — **the SLA business-calendar engine STARTS the FROZEN chain on
-//! breach** (ISS-P26 / P-393, M4-I7)
-//!
-//! **Contract-index row 7.5** (`oncall_now` / `page` — the FROZEN escalation chain). The chain SHAPE +
-//! the watcher read-fanout are pinned by `cdc_7_5_4_9_issues_sla_escalation.rs` (NOTIF-P21 / P-342);
-//! THIS file pins the NEW ISS-P26 producer/consumer edge: the **SLA business-calendar engine's breach
-//! handler** ([`myelin_issues::sla_calendar::SlaEngine::on_breach_timer`]) is the PRODUCER that, on a
-//! to-the-second breach, hands the FROZEN Issues chain
-//! ([`myelin_issues::sla_escalation::issue_sla_escalation_policy`]) to Notif's CONSUMER
-//! ([`myelin_notif::escalation::EscalationEngine::page`]) — proving the engine starts the chain Notif
-//! walks, not a parallel calc.
-//!
-//! - the **PROVIDER** is the SLA engine's breach: it emits `issue.sla.breached` naming the FROZEN
-//!   `SLA_ESCALATION_POLICY_ID`, and the FROZEN chain value it starts is byte-identical to the one the
-//!   7.5 CDC pins.
-//! - the **CONSUMER** is Notif's `EscalationEngine::page` starting + walking that SAME chain on the
-//!   durable wheel (pinned end-to-end in the NOTIF-P21 CDC; here we assert the engine HANDS the
-//!   identical chain — the seam between the SLA-engine producer and the escalation consumer).
-//!
-//! A drift on either (the SLA engine starts a different policy id / chain; Notif renames the chain
-//! shape) fails this test.
-
 use myelin_events::OutboxStore;
 use myelin_identity::PrincipalId;
 use myelin_issues::events::SLA_BREACHED;
@@ -92,9 +70,6 @@ fn team_schedule() -> OncallSchedule {
     }
 }
 
-/// **PROVIDER — the SLA engine's breach handler starts the FROZEN chain (by policy id).** A breach
-/// emits `issue.sla.breached` naming `SLA_ESCALATION_POLICY_ID` — the engine starts the FROZEN Issues
-/// chain, not a parallel one. A drift (the engine invents a different policy id) fails here.
 #[test]
 fn producer_sla_engine_breach_starts_the_frozen_chain() {
     let mut eng = SlaEngine::new(tenant(), region());
@@ -125,13 +100,8 @@ fn producer_sla_engine_breach_starts_the_frozen_chain() {
     }
 }
 
-/// **CONSUMER — the chain the SLA engine starts is the SAME frozen value Notif's EscalationEngine
-/// pages.** The policy id the engine's breach names keys the SAME `issue_sla_escalation_policy` the
-/// consumer walks: the FROZEN three-tier chain pages the team on-call AT FIRE TIME with zero Notif
-/// change. This pins the SLA-engine→escalation seam.
 #[test]
 fn consumer_notif_pages_the_chain_the_engine_starts() {
-    // the engine's breach names this policy id ...
     let mut eng = SlaEngine::new(tenant(), region());
     eng.arm(
         "ENG#9",
@@ -154,7 +124,6 @@ fn consumer_notif_pages_the_chain_the_engine_starts() {
         _ => panic!("no breach"),
     };
 
-    // ... and the FROZEN chain under that id is exactly what the consumer pages.
     let chain = issue_sla_escalation_policy(15, 1);
     assert_eq!(
         chain.policy_id, policy_id,
@@ -182,6 +151,6 @@ fn consumer_notif_pages_the_chain_the_engine_starts() {
     assert_eq!(
         first.principal,
         pid("psn:team-lead"),
-        "tier 1 (the team on-call) is paged at fire time — the chain the SLA engine started"
+        "tier 1 (the team on-call) is paged at fire time - the chain the SLA engine started"
     );
 }

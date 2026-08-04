@@ -1,106 +1,7 @@
-//! **The CI distributed scheduler — the pull-lease claim + concurrency groups + affinity + the
-//! dead-runner reaper (CI-P12 / P-355, M4).**
-//!
-//! **Owning architecture doc (byte-authoritative):**
-//! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
-//! §2.1 (pull-leasing — the claim query with `FOR UPDATE SKIP LOCKED`, the lease, the heartbeat, the
-//! dead-runner reaper), §2.3 (concurrency groups — `deploy:prod` serialize + `pr:web:42`
-//! cancel-superseded, affinity labels); `01-tech-and-data-model.md` §3.3 (the scheduler tables —
-//! `job_queue` + the claim indexes) + §3.4 (runners). **Contracts consumed:** 11.1 (OLTP — the claim
-//! hot path + `FOR UPDATE SKIP LOCKED`), 1.8 (the telemetry signal set — scheduler queue-depth, claim
-//! latency, lease-reap count).
-//!
-//! ## What CI-P12 ships here — the claim's WHOLE intelligence, as ONE query
-//! The claim is the scheduler's entire decision (arch 02 §2.1): a runner long-polls and claims the
-//! next eligible job via the `jq_claimable` `FOR UPDATE SKIP LOCKED` query. The claim encodes, as
-//! predicates in ONE query, every scheduling rule:
-//! - **RESIDENCY** — `region = $cell_region` (a runner claims only in-region; no global pool,
-//!   residency by construction, arch 00 §5);
-//! - **AFFINITY** — `labels <@ runner_labels` (the job's labels are a subset of the runner's);
-//! - **TRUST** — `trust_tier = ANY($runner_allowed_tiers)` (an `untrusted_fork` job never reaches a
-//!   self-hosted-trusted runner, arch 01 §2 / contract 4.9);
-//! - **CONCURRENCY (serialize)** — `NOT EXISTS (… r.concurrency_group = q.concurrency_group AND
-//!   r.state='running' AND q.concurrency_group LIKE 'deploy:%')` (one `deploy:prod` at a time, the
-//!   `jq_serialize` partial unique index);
-//! - **LANES** — `ORDER BY lane_priority(lane) DESC` (interactive > batch > deploy, the
-//!   protected-human-lane analogue inside CI, arch 02 §2.3);
-//! - **FAIRNESS** — `fair_deficit.deficit DESC` (the DRR term; the deficit ADVANCE/REPLENISH is
-//!   CI-P13 — here the claim ORDERS on the term, see the floor);
-//! - then **`enqueued_at ASC`** (oldest first within an equal key).
-//!
-//! On claim the row is leased: `lease_owner` / `lease_expires` set, `state='leased'`. Both claim and
-//! the **dead-runner reaper** require the owning Flow workflow and CI run to remain active. The
-//! reaper re-queues expired active jobs (`state='queued'`, lease fields cleared), which makes the
-//! run's `SCHEDULE_AND_RUN_JOB` activity retry idempotently. An expired launched job whose workflow
-//! is already cancelled is deliberately excluded and reconciled to terminal accounting by the
-//! production reaper driver rather than resurrected.
-//!
-//! ## Concurrency groups (arch 02 §2.3)
-//! - `deploy:prod` is a **serialization key** (the `jq_serialize` partial unique index — at most one
-//!   `deploy:%` group running at a time; the claim's `NOT EXISTS` predicate holds it).
-//! - `pr:web:42` is **cancel-superseded** ([`cancel_superseded`] — a new push to the PR cancels the
-//!   in-flight `queued`/`leased` run for that group so only the latest head is tested).
-//!
-//! ## DB-free model + the live-stack proof (the binding data-layer policy)
-//! This module carries the claim/reaper logic TWICE, in lock-step:
-//! - the [`CLAIM_QUERY`] / [`CANCEL_SUPERSEDED_QUERY`] / [`REAP_QUERY`] **`&str` SQL** the live OLTP
-//!   path runs (arch 02 §2.1 verbatim intent — the `FOR UPDATE SKIP LOCKED` claim, the serialize
-//!   `NOT EXISTS`, the reaper sweep). The REAL apply against the dev-stack Postgres (a real claim
-//!   under concurrency, the serialize index, the reaper re-queue) is
-//!   `tests/integration_ci_p12_scheduler_claim.rs` behind the `integration` cargo feature;
-//! - a **deterministic in-memory model** ([`SchedulerState`]) for queue-local predicate semantics —
-//!   label/trust/residency/lane ordering, re-queue idempotency, serialization, and supersession. The
-//!   durable Flow/CI lifecycle conjunction is SQL-owned and pinned by source assertions plus live
-//!   PostgreSQL tests because a queue-only model cannot honestly represent those authoritative
-//!   tables.
-//!
-//! ## Floors named (VISION §3 / the prompt DoD)
-//! - the **DRR fair-share** advance/replenish over `fair_key` + the **priority lanes** detail +
-//!   **per-tenant backpressure** are **CI-P13** (P-356): this prompt's claim ORDERS on
-//!   `fair_deficit.deficit DESC` (the term), but does NOT advance/replenish the counter — that is
-//!   CI-P13. The lane ORDER BY is here (the strict precedence); the lane SHED budget under surge is
-//!   CI-P13.
-//! - the **flat-DRR → hierarchical** (per-tenant → per-project → per-pipeline) scheduler follow-on is
-//!   **CI-P29** (measured-starvation-triggered, the per-`fair_key` wait-time histogram signal).
-
 use std::collections::BTreeMap;
 
 pub use myelin_ci_sandbox::TrustTier;
 
-// =================================================================================================
-// 1. The live OLTP claim/reaper SQL (arch 02 §2.1, verbatim intent). Held as `&str` so the lints do
-//    not mistake the DDL/DML for live Rust; the live integration test runs the IDENTICAL query.
-// =================================================================================================
-
-/// **The pull-lease claim (arch 02 §2.1) — the scheduler's whole intelligence as ONE query.** A
-/// runner long-polls and claims the highest-priority, fairest, label-eligible, in-region, trust-
-/// allowed, non-serialized job via `FOR UPDATE SKIP LOCKED` (so concurrent runners never block each
-/// other; each takes a different row). Bind params: `$1 cell_region`, `$2 runner_labels text[]`,
-/// `$3 runner_allowed_tiers text[]`, `$4 lease_owner`, `$5 execution_lease_ttl_seconds`.
-///
-/// **The two deadlines are sized from different authorities (CT-007 lease/topology
-/// reconciliation).** `lease_expires` is the heartbeat-extendable EXECUTION lease and still comes
-/// from `$5` — one execution's wall clock plus headroom. `claim_expires_at` is the IMMUTABLE
-/// per-generation ceiling and comes from the row's own dispatch-derived `claim_window_secs`, which is
-/// four execution slots for a checkout-bearing job and exactly `$5` for every other job. A legacy
-/// row written before that column existed COALESCEs back to `$5`, so its claim window is
-/// byte-identical to pre-slice behaviour; the returned window lets the resolver refuse such a row
-/// for checkout composition rather than silently running a four-execution topology under a
-/// one-execution ceiling.
-///
-/// The `lane_priority` CASE is the strict lane ORDER (interactive > batch > deploy, arch 02 §2.3);
-/// `fair_deficit.deficit DESC` is the DRR fairness term (the ADVANCE is CI-P13); `enqueued_at ASC`
-/// breaks the tie oldest-first. The serialize `NOT EXISTS` is the `deploy:%` one-at-a-time hold. On
-/// claim the row is updated to `leased` with the lease owner + expiry, and the claimed row returned.
-/// The same PostgreSQL statement clock is returned beside the expiry so token issuance can bind a
-/// retry-stable absolute lifetime to this exact claim generation without trusting a process clock.
-///
-/// **`FOR UPDATE OF q` (not a bare `FOR UPDATE`).** The `fair_deficit` join is a READ-ONLY fairness
-/// hint (left-joined; a missing deficit row defaults to 0). Postgres refuses `FOR UPDATE` on the
-/// nullable side of an outer join (`make_outerjoininfo`), and locking the fairness hint is wrong
-/// anyway — only the claimed `job_queue` row must be locked SKIP-LOCKED so concurrent runners take
-/// different rows. So the lock is scoped to `q` (the `job_queue` row) explicitly. (Production fix
-/// proven by `tests/integration_ci_p12_scheduler_claim.rs` against live Postgres.)
 pub const CLAIM_QUERY: &str = "\
 WITH eligible AS (
   SELECT q.tenant_id, q.region, q.job_id
@@ -158,10 +59,6 @@ RETURNING j.tenant_id, j.job_id, j.run_id, j.lane, j.concurrency_group, j.fair_k
           FLOOR(EXTRACT(EPOCH FROM j.claim_started_at))::bigint AS claim_started_at_epoch_secs,
           FLOOR(EXTRACT(EPOCH FROM j.claim_expires_at))::bigint AS claim_expires_at_epoch_secs";
 
-/// **Cancel-superseded (arch 02 §2.3) — a new push to a PR cancels the in-flight run for that group.**
-/// On a new enqueue for a `pr:%` concurrency group, the prior `queued`/`leased` rows for that group
-/// are moved to `terminal` so only the latest head is tested. Bind: `$1 tenant_id`, `$2 region`,
-/// `$3 concurrency_group`, `$4 keep_job_id` (the new head, never cancelled).
 pub const CANCEL_SUPERSEDED_QUERY: &str = "\
 UPDATE job_queue
 SET state = 'terminal', lease_owner = NULL, lease_expires = NULL
@@ -172,20 +69,6 @@ WHERE tenant_id = $1
   AND job_id <> $4
 RETURNING job_id";
 
-/// **The dead-runner reaper (arch 02 §2.1) — sweep expired active leases → re-queue.** A runner that
-/// died while both the owning Flow workflow and CI run remain active leaves a `leased`/`running` row
-/// whose `lease_expires` has passed; the reaper moves it back to `queued` so it is claimable again.
-/// Cancelled/terminated owners are excluded so generic lease recovery cannot resurrect superseded
-/// work; the production driver reconciles an expired launched row through terminal accounting
-/// instead. Active re-queue is idempotent, and `jq_idem` rejects duplicate enqueue. Bind: `$1 region`.
-///
-/// **The OLD generation identity is returned alongside the row (CT-007 lease/topology
-/// reconciliation).** The `UPDATE` clears `claim_nonce`, so `RETURNING` on the queue row alone
-/// cannot name the generation that was just reaped. The `expired` CTE carries the pre-requeue
-/// `lease_epoch`/`claim_nonce` through, so [`crate::job_queue_region::reap_region_scoped`] can seal
-/// exactly that generation's unresolved prelaunch phases in the SAME transaction — never a
-/// neighbouring generation's, and never a committed "freshly claimable but old phase unresolved"
-/// state.
 pub const REAP_QUERY: &str = "\
 WITH candidates AS MATERIALIZED (
   SELECT tenant_id, region, job_id, state, lease_epoch, claim_nonce
@@ -236,23 +119,6 @@ WHERE j.tenant_id = e.tenant_id AND j.job_id = e.job_id
 RETURNING j.tenant_id, j.job_id, e.lease_epoch AS reaped_lease_epoch,
           e.claim_nonce::text AS reaped_claim_nonce";
 
-/// **Final exact-generation launch fence.** Atomically move one still-live scheduler generation
-/// from `leased` to `running` immediately before sandbox spawn. Cancellation and this CAS serialize
-/// on the same row: cancellation winning first makes this match zero rows; this winning first makes
-/// the row ineligible for cancel-superseded. Every persisted generation fact is compared, including
-/// the original (heartbeat-independent) claim timestamps. The successful CAS installs a fresh
-/// execution lease covering the admitted runtime while a session advisory lock protects the much
-/// smaller commit→gated-release interval. Bind: `$1 tenant`, `$2 region`, `$3 job`, `$4 workflow
-/// run`, `$5 owner`, `$6 epoch`, `$7 nonce`, `$8 claim start`, `$9 claim expiry`, `$10 execution
-/// lease seconds`. The public `ci_job` row crosses to `running` in the SAME statement: if that
-/// surface row is absent, cancelled, or otherwise inconsistent, the CTE returns no row and the
-/// caller rolls the complete launch transaction back rather than executing an invisible job.
-///
-/// **The installed lease is capped at the immutable claim expiry (CT-007 lease/topology
-/// reconciliation).** Every downstream authority already refuses past `claim_expires_at`, so an
-/// execution lease reaching beyond it would only delay the reaper's recovery of a generation nothing
-/// can legitimately act on any more. `LEAST` makes the hard ceiling structural. The PREDICATES are
-/// unchanged, byte for byte.
 pub const AUTHORIZE_JOB_LAUNCH_QUERY: &str = "\
 WITH launched AS (
 UPDATE job_queue
@@ -284,33 +150,6 @@ WHERE surface.tenant_id = launched.tenant_id
   AND surface.state IN ('queued', 'leased')
 RETURNING surface.job_id";
 
-/// **CT-007 phase-credential generations: the V2 workload launch CAS.** Structurally the SAME
-/// `leased -> running` transition as [`AUTHORIZE_JOB_LAUNCH_QUERY`] — which stays BYTE-UNCHANGED, is
-/// what production still executes, and is pinned byte-for-byte by its own test — with the current
-/// `workload` credential-generation predicate folded into the same statement, and therefore the same
-/// transaction and the same row lock as the CAS itself. Folding rather than pre-checking is the
-/// point: a separate `SELECT` would leave a window in which a successor generation could be appended
-/// between the check and the CAS.
-///
-/// The added predicates: the EXECUTION lease is still live, the exact `workload` generation row
-/// exists with exactly the presented binding facts, no generation with a greater ordinal exists
-/// (structurally impossible for ordinal 4, asserted anyway so a future fifth purpose cannot silently
-/// make a stale workload credential current), the generation itself has not expired, the exact
-/// durable parent attempt exists, and NO prelaunch phase row for this claim is in a non-`measured`
-/// state (which is vacuously true for a compute job with no phase rows, and requires both phases
-/// measured for a checkout-bearing one).
-///
-/// **Why the lease predicate is V2-only and load-bearing (round-1 blocker 3).** Minting and every
-/// preparation gate already require `lease_expires > statement_timestamp()`; without the same
-/// requirement here, a workload credential minted moments before lease expiry could be presented
-/// AFTER expiry but before the reaper wins the row-lock race, transitioning a stale owner to
-/// `running` and installing a fresh lease — resurrecting ownership the reaper was about to reclaim.
-/// The LEGACY query cannot take this predicate (it is byte-frozen, and its V1 callers legitimately
-/// launch under the flat claim contract), which is exactly why the two queries are separate.
-///
-/// Bind: `$1..$10` exactly as the legacy query, then `$11 binding version`, `$12 generation id`,
-/// `$13 jti`, `$14 issued at`, `$15 expires at`, `$16 CI run`, `$17 authority handle`,
-/// `$18 idem token`, `$19 exact checkout commit`.
 pub const AUTHORIZE_JOB_LAUNCH_V2_QUERY: &str = "\
 WITH launched AS (
 UPDATE job_queue
@@ -410,16 +249,6 @@ WHERE surface.tenant_id = launched.tenant_id
   AND surface.state IN ('queued', 'leased')
 RETURNING surface.job_id";
 
-/// **CT-007 slice 5b.3-2c: the read-only sibling of [`AUTHORIZE_JOB_LAUNCH_QUERY`].** Same exact
-/// generation predicate (every bound parameter, in the same order), including the SAME `ci_job`
-/// surface-state gate the real CAS's second `UPDATE` enforces (Sol's review: the `job_queue`-only
-/// predicate alone let Hop A proceed for a missing, canceled, or otherwise surface-inconsistent job
-/// the real workload CAS would refuse) -- but a plain `SELECT`, no `UPDATE`, no state transition, no
-/// advisory-lock session dance. This is what the pre-Hop-A checkout-authorization hook uses to
-/// confirm the durable claim is still live WITHOUT performing the `leased -> running` CAS the real
-/// workload launch alone is allowed to commit. Bind: `$1 tenant`, `$2 region`, `$3 job`, `$4
-/// workflow run`, `$5 owner`, `$6 epoch`, `$7 nonce`, `$8 claim start`, `$9 claim expiry` (no `$10`
-/// -- there is no execution lease to install here).
 pub const VERIFY_JOB_LAUNCH_LIVE_QUERY: &str = "\
 SELECT 1
 FROM job_queue
@@ -443,24 +272,6 @@ WHERE tenant_id = $1
       AND surface.state IN ('queued', 'leased')
   )";
 
-/// **The exact-generation preparation-lease renewal (CT-007 lease/topology reconciliation).** A
-/// checkout-bearing parent attempt contains four sequential executions under ONE immutable claim
-/// window; this is what a preparation phase boundary calls so no interval between renewals holds
-/// more than one legally bounded execution.
-///
-/// Deliberately NOT a widening of [`HEARTBEAT_QUERY`]: that query is owner-only and accepts
-/// `running`, which is precisely what a preparation renewal must refuse — a generation whose
-/// workload launch already won is no longer in preparation, and extending it here would let a stale
-/// preparation worker prolong a lease the workload owns. This binds the SAME full identity the
-/// checkout/live-claim boundary does (tenant, region, job, workflow run, owner, epoch, nonce, both
-/// claim timestamps), requires the exact durable parent attempt to exist, requires the pre-workload
-/// `ci_job` surface states, and requires the claim itself to still be live.
-///
-/// The renewal is capped at `claim_expires_at`: the immutable window is the hard ceiling and renewal
-/// can never push past it. ZERO ROWS MEANS OWNERSHIP WAS LOST — the caller aborts before another
-/// spawn rather than treating a no-op as success. Bind: `$1 tenant`, `$2 region`, `$3 job`,
-/// `$4 workflow run`, `$5 owner`, `$6 epoch`, `$7 nonce`, `$8 claim start`, `$9 claim expiry`,
-/// `$10 execution lease seconds`.
 pub const RENEW_PREPARATION_LEASE_QUERY: &str = "\
 UPDATE job_queue AS q
 SET lease_expires = LEAST(
@@ -502,20 +313,6 @@ WHERE q.tenant_id = $1
   )
 RETURNING q.job_id";
 
-/// **The idempotent enqueue (arch 02 §2.1 / §3.2) — insert ONE schedulable `job_queue` row.** The
-/// durable equivalent of [`SchedulerState::enqueue`]: a job the run's `SCHEDULE_AND_RUN_JOB`
-/// activity dispatches becomes a `queued` row. Idempotent on the `jq_idem` unique
-/// `(tenant_id, idem_token)` via `ON CONFLICT … DO NOTHING`, so a reaper re-queue + a redundant
-/// re-dispatch of the same `(tenant_id, idem_token)` is ONE row, never a duplicate (0 duplicate
-/// enqueues — the CI-D1 effectively-once floor). `enqueued_at` defaults to `now()` (the claim's
-/// oldest-first tie-break). Bind: `$1 tenant_id`, `$2 region`, `$3 job_id` (uuid), `$4 run_id`
-/// (uuid), `$5 lane`, `$6 labels text[]`, `$7 trust_tier`, `$8 concurrency_group` (nullable),
-/// `$9 fair_key`, `$10 idem_token`, `$11 stage`, `$12 claim_window_secs` (the dispatch-derived
-/// immutable window; a new writer never supplies NULL — NULL is legacy-only), `$13
-/// reservation_write_version` (2 only for a parse-valid V2 reserve handle; NULL for historical V1).
-/// `RETURNING job_id` is
-/// present iff the row was inserted (absent on the idempotent conflict) — so the store reads
-/// INSERTED vs DUPLICATE from the returned-row count.
 pub const INSERT_JOB_QUEUE_QUERY: &str = "\
 INSERT INTO job_queue
   (tenant_id, region, job_id, run_id, lane, labels, trust_tier, concurrency_group, fair_key, idem_token, stage, claim_window_secs, reservation_write_version, state)
@@ -523,13 +320,6 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, 'queued')
 ON CONFLICT (tenant_id, idem_token) DO NOTHING
 RETURNING job_id";
 
-/// **Complete a job — move it to `terminal` (the runner reported `job.done`, arch 02 §3.2).** The
-/// durable equivalent of [`SchedulerState::complete_job`]: a `leased`/`running`/`queued` job whose
-/// runner finished is moved to `terminal` (clearing the lease) so the reaper NEVER re-queues a
-/// completed job (re-queuing a done job would double-run it). Idempotent: a re-complete of an
-/// already-`terminal` row matches nothing (`state <> 'terminal'`) → 0 rows, the `job.done` side of
-/// the effectively-once invariant (a double-delivered `job.done` terminates the row ONCE). Bind:
-/// `$1 tenant_id`, `$2 job_id`. `RETURNING job_id` iff this call moved the row.
 pub const COMPLETE_JOB_QUERY: &str = "\
 UPDATE job_queue
 SET state = 'terminal', lease_owner = NULL, lease_expires = NULL
@@ -538,13 +328,6 @@ WHERE tenant_id = $1
   AND state <> 'terminal'
 RETURNING job_id";
 
-/// **Heartbeat — a LIVE runner extends its lease (arch 02 §2.1).** The durable equivalent of
-/// [`SchedulerState::heartbeat`]: while a job is `leased`/`running` by this owner, push
-/// `lease_expires` forward
-/// so a heart-beating runner is NOT swept by the [`REAP_QUERY`] (only a DEAD runner's expired lease
-/// is reaped). Guarded to the lease OWNER (`lease_owner = $3`) so a stale/other runner cannot extend
-/// a lease it does not hold. Bind: `$1 tenant_id`, `$2 job_id`, `$3 lease_owner`,
-/// `$4 extend_seconds`. `RETURNING job_id` iff the lease was extended.
 pub const HEARTBEAT_QUERY: &str = "\
 UPDATE job_queue
 SET lease_expires = now() + ($4 || ' seconds')::interval
@@ -554,16 +337,6 @@ WHERE tenant_id = $1
   AND lease_owner = $3
 RETURNING job_id";
 
-/// **The atomic prove-and-consume completion CAS (CT-004d.2 claim-bound completion).** Before any
-/// verdict is signalled, the terminal reporter consumes the CLAIM: it moves the row to `terminal` and
-/// records the deterministic `completion_receipt` ONLY IF the presented claim generation matches the
-/// row's — `lease_owner = $3 AND lease_epoch = $4` — and the exact launch CAS already moved that
-/// generation to `running`. A merely leased claimant cannot invent a terminal result for work that
-/// never executed. A stale worker (reaped + re-claimed → higher epoch, or a different owner) matches
-/// 0 rows and is refused; a forger with a valid token but no running claim matches 0 rows. Bind:
-/// `$1 tenant_id`, `$2 job_id`, `$3 lease_owner`, `$4 lease_epoch`, `$5 claim_nonce`,
-/// `$6 completion_receipt`, `$7 stage`. `RETURNING job_id` iff THIS call consumed the claim. The
-/// receipt is idempotent evidence an exact redelivery reads.
 pub const CONSUME_CLAIM_QUERY: &str = "\
 UPDATE job_queue
 SET state = 'terminal', completion_receipt = $6, lease_owner = NULL, lease_expires = NULL
@@ -577,13 +350,6 @@ WHERE tenant_id = $1
   AND completion_receipt IS NULL
 RETURNING job_id";
 
-/// **Preparation-only completion CAS (CT-007 slice 5b.3-5b).** This is deliberately separate from
-/// [`CONSUME_CLAIM_QUERY`]: a checkout failure may terminalize only the exact still-`leased`
-/// generation whose immutable parent-attempt row exists. The ordinary workload completion remains
-/// `running`-only. The launch CAS and this CAS both require the same `leased` row, so PostgreSQL's
-/// row-level UPDATE serialization makes them mutually exclusive. Bind: `$1 tenant`, `$2 region`,
-/// `$3 job`, `$4 workflow run`, `$5 idem token`, `$6 owner`, `$7 epoch`, `$8 nonce`, `$9 stage`,
-/// `$10 claim start`, `$11 claim expiry`, `$12 CI run`, `$13 reserve handle`, `$14 v4 receipt`.
 pub const CONSUME_PREPARATION_CLAIM_QUERY: &str = "\
 UPDATE job_queue AS q
 SET state = 'terminal', completion_receipt = $14, lease_owner = NULL, lease_expires = NULL
@@ -626,10 +392,6 @@ WHERE q.tenant_id = $1
   )
 RETURNING q.job_id";
 
-/// Terminalize a secret-bearing claim that was withheld before any sandbox or checkout preparation
-/// began. It binds the complete live lease generation and requires that no parent-attempt row exists
-/// for it; therefore this path cannot be used to forge a result for executed work. The durable
-/// diagnostic is written by the terminal reporter in the same transaction.
 pub const CONSUME_SECRET_WITHHELD_CLAIM_QUERY: &str = "\
 UPDATE job_queue AS q
 SET state = 'terminal', completion_receipt = $14, lease_owner = NULL, lease_expires = NULL
@@ -672,20 +434,6 @@ WHERE q.tenant_id = $1
   )
 RETURNING q.job_id";
 
-/// **CT-007 slice 5b.3-6d: the exhausted-variant preparation-completion CAS.** Byte-for-byte
-/// [`CONSUME_PREPARATION_CLAIM_QUERY`] EXCEPT the parent-attempt predicate. The original requires a
-/// parent-attempt row for the CURRENT claim generation (`lease_owner = $6 AND lease_epoch =
-/// q.lease_epoch AND claim_nonce = q.claim_nonce`); this is exactly the row that DOES NOT exist when a
-/// generation was refused admission because the budget was already exhausted. This variant instead
-/// requires that the reserve's PRIOR exact-policy rows already equal the durable max — the same
-/// invariant [`verify_preparation_disposition_on_conn`](crate::ci_pipeline_driver) enforced one step
-/// earlier in the same transaction. The queue-row identity match (`$6/$7/$8/$10/$11`) is UNCHANGED, so
-/// only the exact current lease holder can terminalize, and `state = 'leased'` keeps it structurally
-/// exclusive with the `state = 'running'` workload CAS.
-///
-/// This is a NEW query, so the shipped-query no-credential-dependency pin is untouched; it takes NO
-/// dependency on `ci_job_credential_generation` either. It is only ever used for the
-/// `AttemptsExhausted` disposition — `Failed`/`TimedOut` still route through the current-row CAS above.
 pub const CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY: &str = "\
 UPDATE job_queue AS q
 SET state = 'terminal', completion_receipt = $14, lease_owner = NULL, lease_expires = NULL
@@ -725,19 +473,6 @@ WHERE q.tenant_id = $1
   )
 RETURNING q.job_id";
 
-/// **CT-007 slice 5b.3-6d step 2: the preparation-RETRY CAS.** When a checkout preparation attempt
-/// fails RETRYABLY and another parent attempt is permitted, the exact still-`leased` generation is
-/// returned to `queued` for a fresh runner to re-claim. This shares
-/// [`CONSUME_PREPARATION_CLAIM_QUERY`]'s entire `WHERE … RETURNING` block BYTE-FOR-BYTE — including
-/// the current-generation parent-attempt predicate (a retryable failure was, by definition, an
-/// admitted attempt whose exact row exists) and the pre-workload `ci_job` surface guard — and differs
-/// ONLY in the action: it clears the lease and the claim nonce and moves the row back to `queued`
-/// rather than terminalizing with a completion receipt. There is NO `$14` (no receipt): a requeue is
-/// not a terminal outcome and settles nothing.
-///
-/// Crucially this NEVER touches `retry_attempts`: the parent-attempt journal — not the workload
-/// retry counter — is the authority for preparation retries, so the workload retry path stays wholly
-/// independent. Bind `$1..$13` exactly as the shipped preparation CAS binds them (minus the receipt).
 pub const REQUEUE_PREPARATION_CLAIM_QUERY: &str = "\
 UPDATE job_queue AS q
 SET state = 'queued', lease_owner = NULL, lease_expires = NULL, claim_nonce = NULL
@@ -780,44 +515,21 @@ WHERE q.tenant_id = $1
   )
 RETURNING q.job_id";
 
-/// **CT-007 5b.3-6d step 2: reset the `ci_job` DAG surface after a preparation requeue.** Mirrors the
-/// dead-runner reaper's [`RESET_REAPED_CI_JOB_SURFACE_QUERY`](crate::job_queue_region) and the workload
-/// retryable-attempt reset: a requeued preparation generation must leave the public surface pre-workload
-/// so a fresh generation can re-win the launch fence. Preparation never crosses the surface to
-/// `running` (only [`AUTHORIZE_JOB_LAUNCH_QUERY`] does), so this only ever needs to undo a `leased`
-/// surface; a terminal DAG state (`succeeded`/`failed`/…) is never reopened. Bind `$1 tenant`, `$2 job`.
 pub const RESET_REQUEUED_PREPARATION_CI_JOB_SURFACE_QUERY: &str = "\
 UPDATE ci_job SET state = 'queued'
 WHERE tenant_id = $1 AND job_id = $2::uuid AND state = 'leased'";
 
-/// **Read a job's terminal disposition for the completion CAS's 0-row branch.** When
-/// [`CONSUME_CLAIM_QUERY`] consumes nothing, this distinguishes an IDEMPOTENT redelivery (the row is
-/// already `terminal` with the SAME `completion_receipt`) from a fail-closed REFUSAL (missing row,
-/// stale claim generation, or a divergent receipt — e.g. a flipped-verdict replay). Bind:
-/// `$1 tenant_id`, `$2 job_id`.
 pub const READ_COMPLETION_DISPOSITION_QUERY: &str = "\
 SELECT state, completion_receipt FROM job_queue WHERE tenant_id = $1 AND job_id = $2";
 
-// =================================================================================================
-// 2. The deterministic in-memory model — the IDENTICAL claim/reaper semantics, DB-free, so the unit
-//    + drill tests are deterministic. The live SQL above carries the same algorithm against Postgres.
-// =================================================================================================
-
-/// The three lanes (arch 02 §2.3), strict precedence interactive > batch > deploy. The claim ORDER
-/// BY's `lane_priority(lane) DESC` is exactly this enum's `priority()` (higher = claimed first).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lane {
-    /// PR-check feedback — the protected-human lane; must never queue behind a batch matrix.
     Interactive,
-    /// A nightly/batch matrix.
     Batch,
-    /// A deploy job (serialized via the `deploy:%` concurrency group).
     Deploy,
 }
 
 impl Lane {
-    /// The strict lane priority (higher = claimed first): interactive(2) > batch(1) > deploy(0). This
-    /// is the `CASE … DESC` term in [`CLAIM_QUERY`] — interactive feedback never queues behind batch.
     pub fn priority(self) -> i32 {
         match self {
             Lane::Interactive => 2,
@@ -826,7 +538,6 @@ impl Lane {
         }
     }
 
-    /// The `job_queue.lane` CHECK-constraint string value (arch 01 §3.3).
     pub fn as_str(self) -> &'static str {
         match self {
             Lane::Interactive => "interactive",
@@ -835,9 +546,6 @@ impl Lane {
         }
     }
 
-    /// Parse a `job_queue.lane` CHECK token back to a [`Lane`] (the read-back side of [`Lane::as_str`]).
-    /// `None` for a token outside the frozen three-lane set — a corrupt durable row the store surfaces
-    /// loudly (never silently coerced), the same posture as the metering store's meter/kind parse.
     pub fn from_token(token: &str) -> Option<Lane> {
         match token {
             "interactive" => Some(Lane::Interactive),
@@ -848,18 +556,11 @@ impl Lane {
     }
 }
 
-/// The `job_queue.state` lifecycle (arch 01 §3.3 CHECK): `queued` → `leased` (claimed) → `running`
-/// (runner started) → `terminal` (done/cancelled). The reaper moves an expired `leased` back to
-/// `queued`; cancel-superseded moves `queued`/`leased` to `terminal`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobState {
-    /// Claimable.
     Queued,
-    /// Claimed by a runner; holds a lease (`lease_owner` + `lease_expires`).
     Leased,
-    /// The runner has started executing.
     Running,
-    /// Done or cancelled — no longer schedulable.
     Terminal,
 }
 
@@ -874,46 +575,25 @@ impl JobState {
     }
 }
 
-/// A schedulable `job_queue` row (the in-memory mirror of the live table — the SAME columns the
-/// claim orders on). PII-free: every field is an opaque id / label / vocabulary token.
 #[derive(Clone, Debug)]
 pub struct QueuedJob {
-    /// The tenant partition (the first PK component; never crossed by a query path).
     pub tenant_id: String,
-    /// The residency region — a runner claims only in-region (no global pool).
     pub region: String,
-    /// The opaque job id (the `(tenant_id, job_id)` PK).
     pub job_id: String,
-    /// The owning run id.
     pub run_id: String,
-    /// The lane (the strict ORDER BY term).
     pub lane: Lane,
-    /// The affinity labels — a job is claimable iff `labels ⊆ runner_labels`.
     pub labels: Vec<String>,
-    /// The trust tier — a job is claimable iff `trust_tier ∈ runner_allowed_tiers`.
     pub trust_tier: TrustTier,
-    /// The concurrency group (`deploy:prod` serialize, `pr:web:42` cancel-superseded) or `None`.
     pub concurrency_group: Option<String>,
-    /// The DRR fairness key (`tenant` or `tenant:project`).
     pub fair_key: String,
-    /// The idempotency token — the `jq_idem` unique `(tenant_id, idem_token)` makes a re-enqueue a
-    /// no-op (the reaper re-dispatch is ONE row, never a duplicate).
     pub idem_token: String,
-    /// A monotonic enqueue order (the `enqueued_at ASC` tie-break; lower = older).
     pub enqueued_seq: u64,
-    /// The lifecycle state.
     pub state: JobState,
-    /// The lease owner (a runner id) while `leased`/`running`, else `None`.
     pub lease_owner: Option<String>,
-    /// The logical lease-expiry tick (compared against the reaper's `now`), else `None`.
     pub lease_expires: Option<u64>,
 }
 
 impl QueuedJob {
-    /// A fresh `queued` job (the enqueue shape). `enqueued_seq` is the monotonic order the claim
-    /// breaks ties on (`enqueued_at ASC`). The arguments mirror the `job_queue` columns the claim
-    /// orders on; each is load-bearing (the claim filters/orders on every one), so
-    /// `too_many_arguments` is allowed (the same posture as the search pipeline/cache constructors).
     #[allow(clippy::too_many_arguments)]
     pub fn enqueued(
         tenant_id: impl Into<String>,
@@ -944,95 +624,61 @@ impl QueuedJob {
         }
     }
 
-    /// Builder: set the affinity labels.
     pub fn with_labels(mut self, labels: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.labels = labels.into_iter().map(Into::into).collect();
         self
     }
 
-    /// Builder: set the concurrency group (`deploy:prod` serialize / `pr:web:42` cancel-superseded).
     pub fn with_concurrency_group(mut self, group: impl Into<String>) -> Self {
         self.concurrency_group = Some(group.into());
         self
     }
 }
 
-/// The runner's claim filter (arch 02 §2.1 bind params): the cell region (residency), the runner's
-/// labels (affinity: the job's labels must be a subset), the trust tiers the runner is allowed to
-/// execute (an untrusted-fork job never reaches a trusted self-hosted runner), and the lease the
-/// runner takes on claim (owner + TTL).
 #[derive(Clone, Debug)]
 pub struct ClaimRequest {
-    /// The runner's cell region — only in-region jobs are claimable (no global pool).
     pub cell_region: String,
-    /// The runner's labels — a job is claimable iff its labels are a SUBSET of these.
     pub runner_labels: Vec<String>,
-    /// The trust tiers this runner may execute — a job is claimable iff its tier is one of these.
     pub runner_allowed_tiers: Vec<TrustTier>,
-    /// The runner id recorded as the lease owner on claim.
     pub lease_owner: String,
-    /// The lease TTL (in logical ticks) — `lease_expires = now + lease_ttl`.
     pub lease_ttl: u64,
 }
 
-/// The result of a successful claim — the leased job's identity + the scheduling terms it was
-/// claimed on (so a caller / drill can assert WHY this job won the claim).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Claimed {
-    /// The claimed job's tenant.
     pub tenant_id: String,
-    /// The claimed job id.
     pub job_id: String,
-    /// The owning run.
     pub run_id: String,
-    /// The lane it was claimed in.
     pub lane: Lane,
-    /// The concurrency group (if any).
     pub concurrency_group: Option<String>,
 }
 
-/// The deterministic scheduler model: the `job_queue` rows + the per-`fair_key` deficit (read by the
-/// claim's DRR term; the ADVANCE is CI-P13). `now` is a logical clock the reaper compares lease
-/// expiries against — DB-free + deterministic, the SAME predicate semantics as the live SQL.
 #[derive(Clone, Debug, Default)]
 pub struct SchedulerState {
     jobs: Vec<QueuedJob>,
-    /// The per-`(tenant, region, fair_key)` DRR deficit (the claim ORDER reads it; CI-P13 advances).
     fair_deficit: BTreeMap<(String, String, String), i64>,
-    /// The logical clock (reaper compares `lease_expires < now`).
     now: u64,
 }
 
-/// Why an enqueue was rejected (the idempotency floor — `jq_idem` unique on `(tenant_id,
-/// idem_token)`). A duplicate enqueue is a NO-OP, never a second row (the reaper re-dispatch relies
-/// on this: re-queueing a reaped job, then a redundant `SCHEDULE_AND_RUN_JOB` retry, is one row).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EnqueueOutcome {
-    /// The job was inserted (a new `(tenant_id, idem_token)`).
     Inserted,
-    /// A row with the same `(tenant_id, idem_token)` already exists — the insert was a no-op
-    /// (idempotent enqueue, the `jq_idem` unique).
     DuplicateIdem,
 }
 
 impl SchedulerState {
-    /// A fresh empty scheduler at logical tick 0.
     pub fn new() -> Self {
         SchedulerState::default()
     }
 
-    /// The current logical tick.
     pub fn now(&self) -> u64 {
         self.now
     }
 
-    /// Advance the logical clock by `ticks` (so a lease can expire for the reaper drill).
     pub fn advance(&mut self, ticks: u64) {
         self.now += ticks;
     }
 
-    /// Set the DRR deficit for a `fair_key` (CI-P13 owns the ADVANCE/REPLENISH; the claim here only
-    /// ORDERS on it — this lets the unit test prove the claim's DRR ordering term in isolation).
     pub fn set_deficit(&mut self, tenant_id: &str, region: &str, fair_key: &str, deficit: i64) {
         self.fair_deficit.insert(
             (
@@ -1055,7 +701,6 @@ impl SchedulerState {
             .unwrap_or(0)
     }
 
-    /// All jobs (read-only) — for assertions/telemetry (the scheduler queue-depth signal, 1.8).
     pub fn jobs(&self) -> &[QueuedJob] {
         &self.jobs
     }
@@ -1066,9 +711,6 @@ impl SchedulerState {
             .position(|j| j.tenant_id == tenant_id && j.job_id == job_id)
     }
 
-    /// **Enqueue a job, idempotent on `(tenant_id, idem_token)` (the `jq_idem` unique).** A duplicate
-    /// idem token is a NO-OP — this is the floor the reaper re-dispatch + the
-    /// `SCHEDULE_AND_RUN_JOB` retry rely on (re-queue then redundant retry = ONE row).
     pub fn enqueue(&mut self, job: QueuedJob) -> EnqueueOutcome {
         let dup = self
             .jobs
@@ -1081,10 +723,6 @@ impl SchedulerState {
         EnqueueOutcome::Inserted
     }
 
-    /// **Enqueue with cancel-superseded for a `pr:%` group (arch 02 §2.3).** Enqueue the new head,
-    /// then cancel the prior `queued`/`leased` rows of the same concurrency group (so only the latest
-    /// head is tested). Returns the enqueue outcome; the cancellation is applied as a side effect (it
-    /// mirrors [`CANCEL_SUPERSEDED_QUERY`] run on the new enqueue).
     pub fn enqueue_superseding(&mut self, job: QueuedJob) -> EnqueueOutcome {
         let group = job.concurrency_group.clone();
         let new_job_id = job.job_id.clone();
@@ -1099,8 +737,6 @@ impl SchedulerState {
         outcome
     }
 
-    /// **Cancel-superseded ([`CANCEL_SUPERSEDED_QUERY`]): move the prior `queued`/`leased` rows of a
-    /// concurrency group to `terminal`, keeping `keep_job_id`.** Returns the cancelled job ids.
     pub fn cancel_superseded(
         &mut self,
         tenant_id: &str,
@@ -1125,8 +761,6 @@ impl SchedulerState {
         cancelled
     }
 
-    /// Is a `deploy:%` group already running (the serialize `NOT EXISTS` — the `jq_serialize` partial
-    /// unique index, at most one running per `deploy:%` group)?
     fn deploy_group_running(&self, tenant_id: &str, group: &str) -> bool {
         self.jobs.iter().any(|j| {
             j.tenant_id == tenant_id
@@ -1135,18 +769,13 @@ impl SchedulerState {
         })
     }
 
-    /// Whether a job is eligible for a given claim request — the EXACT predicate conjunction of
-    /// [`CLAIM_QUERY`]'s `WHERE`: queued, in-region, labels ⊆ runner_labels, trust ∈ allowed, and the
-    /// `deploy:%` serialize hold.
     fn eligible(&self, job: &QueuedJob, req: &ClaimRequest) -> bool {
         if job.state != JobState::Queued {
             return false;
         }
-        // RESIDENCY: in-region only.
         if job.region != req.cell_region {
             return false;
         }
-        // AFFINITY: job labels ⊆ runner labels.
         if !job
             .labels
             .iter()
@@ -1154,11 +783,9 @@ impl SchedulerState {
         {
             return false;
         }
-        // TRUST: job tier ∈ runner-allowed tiers.
         if !req.runner_allowed_tiers.contains(&job.trust_tier) {
             return false;
         }
-        // CONCURRENCY (serialize): a `deploy:%` group with one already running is held.
         if let Some(group) = &job.concurrency_group {
             if group.starts_with("deploy:") && self.deploy_group_running(&job.tenant_id, group) {
                 return false;
@@ -1167,15 +794,6 @@ impl SchedulerState {
         true
     }
 
-    /// **The pull-lease claim (arch 02 §2.1; [`CLAIM_QUERY`]).** Pick the single highest-priority,
-    /// fairest, label-eligible, in-region, trust-allowed, non-serialized job and lease it. The pick
-    /// order is the claim's `ORDER BY`: lane priority DESC, then DRR `deficit` DESC, then
-    /// `enqueued_seq` ASC. On claim the row is set `leased` with the lease owner + expiry
-    /// (`now + lease_ttl`). Returns `None` if no job is eligible (the runner long-polls again).
-    ///
-    /// `FOR UPDATE SKIP LOCKED` in the live SQL means concurrent runners never block each other (each
-    /// claims a different row); the model is single-threaded, so the claim is a deterministic pick —
-    /// the same row the live query would return under no contention.
     pub fn claim(&mut self, req: &ClaimRequest) -> Option<Claimed> {
         let mut best: Option<usize> = None;
         for (i, job) in self.jobs.iter().enumerate() {
@@ -1186,11 +804,9 @@ impl SchedulerState {
                 None => i,
                 Some(b) => {
                     let cur = &self.jobs[b];
-                    // ORDER BY lane_priority DESC, deficit DESC, enqueued_seq ASC.
                     let key_new = (
                         job.lane.priority(),
                         self.deficit_of(job),
-                        // enqueued_seq ascending → negate for a single max comparison.
                         -(job.enqueued_seq as i64),
                     );
                     let key_cur = (
@@ -1223,8 +839,6 @@ impl SchedulerState {
         })
     }
 
-    /// Mark a leased job `running` (the runner started). Used to prove the `deploy:%` serialize hold:
-    /// once a `deploy:prod` job is running, a second `deploy:prod` job is NOT claimable.
     pub fn mark_running(&mut self, tenant_id: &str, job_id: &str) -> bool {
         if let Some(i) = self.find(tenant_id, job_id) {
             if self.jobs[i].state == JobState::Leased {
@@ -1235,14 +849,6 @@ impl SchedulerState {
         false
     }
 
-    /// **The dead-runner reaper ([`REAP_QUERY`], arch 02 §2.1): re-queue every expired lease.** A
-    /// `leased`/`running` job whose `lease_expires < now` is moved back to `queued` (clearing the lease) so it
-    /// is claimable again. The re-queue is idempotent — a job already `queued` is untouched; a job
-    /// whose lease has NOT expired is untouched. Returns the re-queued `(tenant_id, job_id)` set.
-    ///
-    /// 0 orphans: every expired lease is re-queued. 0 duplicate enqueues: the reaper updates the
-    /// EXISTING row in place (it never inserts), and any subsequent `SCHEDULE_AND_RUN_JOB` retry is
-    /// idempotent on `idem_token` (the `jq_idem` unique).
     pub fn reap(&mut self) -> Vec<(String, String)> {
         let now = self.now;
         let mut reaped = Vec::new();
@@ -1259,9 +865,6 @@ impl SchedulerState {
         reaped
     }
 
-    /// Heartbeat: a live runner extends its lease (`lease_expires = now + ttl`) — proves a
-    /// heart-beating runner is NOT reaped (only a DEAD runner's expired lease is swept). Returns true
-    /// if the lease was extended (the job is leased/running under this owner).
     pub fn heartbeat(&mut self, tenant_id: &str, job_id: &str, owner: &str, ttl: u64) -> bool {
         let now = self.now;
         if let Some(i) = self.find(tenant_id, job_id) {
@@ -1276,14 +879,6 @@ impl SchedulerState {
         false
     }
 
-    /// **Complete a job — move it to `terminal` (the runner reported `job.done`).** A `leased` /
-    /// `running` job whose runner finished is moved to `terminal` (clearing the lease) so the reaper
-    /// NEVER re-queues a completed job (a completed job is not a dead-runner orphan — re-queuing it
-    /// would double-run it). Idempotent: a re-complete of an already-`terminal` job is a NO-OP
-    /// (returns false) — this is the `job.done` side of the effectively-once invariant (a double-
-    /// delivered `job.done` terminates the row ONCE). Returns true iff this call moved the row to
-    /// terminal. A `queued` job (not yet claimed) reporting done is unusual but also terminates (the
-    /// runner finished a job the scheduler had not yet observed as leased).
     pub fn complete_job(&mut self, tenant_id: &str, job_id: &str) -> bool {
         if let Some(i) = self.find(tenant_id, job_id) {
             let j = &mut self.jobs[i];
@@ -1297,12 +892,10 @@ impl SchedulerState {
         false
     }
 
-    /// The state of a job (for assertions).
     pub fn state_of(&self, tenant_id: &str, job_id: &str) -> Option<JobState> {
         self.find(tenant_id, job_id).map(|i| self.jobs[i].state)
     }
 
-    /// The number of `queued` (claimable) jobs — the scheduler queue-depth telemetry signal (1.8).
     pub fn queue_depth(&self) -> usize {
         self.jobs
             .iter()
@@ -1311,13 +904,10 @@ impl SchedulerState {
     }
 }
 
-/// The SQL `lane` CHECK token for a [`Lane`] — used by the live integration test to seed rows whose
-/// `lane` matches the model's `priority()` ordering. (Kept here so the two stay in lock-step.)
 pub fn lane_token(lane: Lane) -> &'static str {
     lane.as_str()
 }
 
-/// The SQL `state` token for a [`JobState`] — used by the live integration test to seed/assert rows.
 pub fn state_token(state: JobState) -> &'static str {
     state.as_str()
 }
@@ -1350,10 +940,6 @@ mod tests {
         )
     }
 
-    // ── CLAIM PREDICATES ───────────────────────────────────────────────────────────────────────
-
-    /// **RESIDENCY: a runner claims only in-region jobs (no global pool, arch 00 §5).** An
-    /// out-of-region job is never claimed by an in-region runner.
     #[test]
     fn claim_residency_in_region_only() {
         let mut s = SchedulerState::new();
@@ -1364,7 +950,6 @@ mod tests {
             s.claim(&req("fr-par", "r1")).is_none(),
             "an out-of-region job is NOT claimable (residency by construction)"
         );
-        // Same job in-region IS claimable.
         s.enqueue(job("j2", Lane::Batch, 1));
         let c = s
             .claim(&req("fr-par", "r1"))
@@ -1372,8 +957,6 @@ mod tests {
         assert_eq!(c.job_id, "j2");
     }
 
-    /// **AFFINITY: a job is claimable iff its labels ⊆ the runner's labels (arch 02 §2.3).** A job
-    /// requiring a label the runner lacks is never claimed.
     #[test]
     fn claim_affinity_labels_subset() {
         let mut s = SchedulerState::new();
@@ -1389,9 +972,6 @@ mod tests {
         assert_eq!(c.job_id, "jok", "labels ⊆ runner_labels claims");
     }
 
-    /// **TRUST: an untrusted-fork job never reaches a runner that does not allow that tier (arch 01
-    /// §2 / contract 4.9).** A `SelfHosted` job is not claimable by a runner allowing only
-    /// trusted/untrusted-fork tiers.
     #[test]
     fn claim_trust_tier_membership() {
         let mut s = SchedulerState::new();
@@ -1402,20 +982,15 @@ mod tests {
             s.claim(&req("fr-par", "r1")).is_none(),
             "a SelfHosted job is NOT claimable by a runner that doesn't allow that tier"
         );
-        // A runner that DOES allow SelfHosted claims it.
         let mut r = req("fr-par", "r1");
         r.runner_allowed_tiers = vec![TrustTier::SelfHosted];
         let c = s.claim(&r).expect("the self-hosted-allowed runner claims");
         assert_eq!(c.job_id, "jself");
     }
 
-    /// **LANES: interactive is claimed before batch before deploy (the strict ORDER BY, arch 02
-    /// §2.3).** The protected-human-lane analogue — interactive PR feedback never queues behind a
-    /// batch matrix even when the batch job is older.
     #[test]
     fn claim_lane_priority_strict() {
         let mut s = SchedulerState::new();
-        // The batch job is OLDER (seq 0); the interactive job is newer (seq 1) — lane wins over age.
         s.enqueue(job("jbatch", Lane::Batch, 0));
         s.enqueue(job("jinteractive", Lane::Interactive, 1));
         let c = s.claim(&req("fr-par", "r1")).expect("a job claims");
@@ -1425,9 +1000,6 @@ mod tests {
         );
     }
 
-    /// **FAIRNESS term: among same-lane jobs, the higher DRR deficit is claimed first (the CI-P13
-    /// term the claim ORDERS on).** Proves the claim reads `fair_deficit.deficit DESC`; CI-P13 owns
-    /// the advance/replenish.
     #[test]
     fn claim_fairness_deficit_orders() {
         let mut s = SchedulerState::new();
@@ -1435,10 +1007,9 @@ mod tests {
         ja.fair_key = "tenantA".into();
         let mut jb = job("jb", Lane::Batch, 1);
         jb.fair_key = "tenantB".into();
-        jb.tenant_id = "tenantA".into(); // same tenant partition, different fair_key for the test
+        jb.tenant_id = "tenantA".into();
         s.enqueue(ja);
         s.enqueue(jb);
-        // tenantB's fair_key has the higher deficit → it is claimed first despite being newer.
         s.set_deficit("tenantA", "fr-par", "tenantB", 100);
         s.set_deficit("tenantA", "fr-par", "tenantA", 1);
         let c = s.claim(&req("fr-par", "r1")).expect("a job claims");
@@ -1448,7 +1019,6 @@ mod tests {
         );
     }
 
-    /// **ENQUEUED_AT tie-break: same lane + same deficit → oldest (lowest seq) first.**
     #[test]
     fn claim_oldest_first_within_equal_key() {
         let mut s = SchedulerState::new();
@@ -1461,18 +1031,12 @@ mod tests {
         );
     }
 
-    // ── CONCURRENCY: serialize + cancel-superseded ─────────────────────────────────────────────
-
-    /// **CONCURRENCY (serialize): at most ONE `deploy:prod` runs at a time (the `jq_serialize`
-    /// partial unique — the claim's serialize `NOT EXISTS`).** Two `deploy:prod` jobs: claim+run the
-    /// first; the second is NOT claimable until the first leaves `running`.
     #[test]
     fn concurrency_deploy_serialize_one_at_a_time() {
         let mut s = SchedulerState::new();
         s.enqueue(job("d1", Lane::Deploy, 0).with_concurrency_group("deploy:prod"));
         s.enqueue(job("d2", Lane::Deploy, 1).with_concurrency_group("deploy:prod"));
 
-        // Claim + start the first deploy.
         let c1 = s
             .claim(&req("fr-par", "r1"))
             .expect("the first deploy claims");
@@ -1482,13 +1046,11 @@ mod tests {
             "the first deploy is running"
         );
 
-        // The second deploy:prod is NOT claimable while the first runs (the serialize hold).
         assert!(
             s.claim(&req("fr-par", "r2")).is_none(),
             "a second deploy:prod is NOT claimable while the first runs (serialize)"
         );
 
-        // Once the first is terminal, the second is claimable.
         let d1_idx = s.find("tenantA", "d1").unwrap();
         s.jobs[d1_idx].state = JobState::Terminal;
         let c2 = s
@@ -1500,8 +1062,6 @@ mod tests {
         );
     }
 
-    /// **A non-deploy concurrency group does NOT serialize (only `deploy:%` is the serialize key).**
-    /// Two `pr:web:42` jobs are both claimable (cancel-superseded is the PR rule, not serialize).
     #[test]
     fn concurrency_non_deploy_group_does_not_serialize() {
         let mut s = SchedulerState::new();
@@ -1515,14 +1075,10 @@ mod tests {
         );
     }
 
-    /// **CONCURRENCY (cancel-superseded): a new push to a PR cancels the prior in-flight run for that
-    /// group (arch 02 §2.3).** Enqueue `pr:web:42` head 1, then head 2 superseding — head 1 goes
-    /// `terminal`, only head 2 remains schedulable.
     #[test]
     fn concurrency_cancel_superseded_keeps_latest_head() {
         let mut s = SchedulerState::new();
         s.enqueue(job("head1", Lane::Interactive, 0).with_concurrency_group("pr:web:42"));
-        // A new push: head2 supersedes head1 for the same group.
         let out = s.enqueue_superseding(
             job("head2", Lane::Interactive, 1).with_concurrency_group("pr:web:42"),
         );
@@ -1532,7 +1088,6 @@ mod tests {
             Some(JobState::Terminal),
             "the prior head is cancelled (cancel-superseded)"
         );
-        // Only head2 is claimable.
         let c = s
             .claim(&req("fr-par", "r1"))
             .expect("the latest head claims");
@@ -1543,8 +1098,6 @@ mod tests {
         );
     }
 
-    /// **Cancel-superseded also cancels a LEASED prior head (a push lands while the old head is
-    /// claimed but not yet running).**
     #[test]
     fn cancel_superseded_cancels_a_leased_prior_head() {
         let mut s = SchedulerState::new();
@@ -1559,30 +1112,20 @@ mod tests {
         );
     }
 
-    // ── THE REAPER DRILL ───────────────────────────────────────────────────────────────────────
-
-    /// **THE REAPER-RECOVERY DRILL (the prompt GATE): kill a runner mid-lease → the reaper re-queues
-    /// within the lease TTL with 0 orphans and 0 duplicate enqueues.** A runner claims a job (lease
-    /// TTL 30), then dies (no heartbeat); the clock advances past the lease; the reaper sweeps → the
-    /// job is `queued` again (re-claimable), the re-dispatch is ONE row (the `jq_idem` unique rejects
-    /// a duplicate enqueue), and there are 0 orphaned (`leased`-forever) jobs.
     #[test]
     fn reaper_recovery_within_lease_ttl_zero_orphans_zero_dup_enqueue() {
         let mut s = SchedulerState::new();
         s.enqueue(job("j1", Lane::Batch, 0));
         let total_before = s.jobs().len();
 
-        // A runner claims the job and takes a lease (now=0, ttl=30 → expires at 30).
         let c = s
             .claim(&req("fr-par", "dead-runner"))
             .expect("the job is claimed");
         assert_eq!(c.job_id, "j1");
         assert_eq!(s.state_of("tenantA", "j1"), Some(JobState::Leased));
 
-        // The runner dies — no heartbeat. The clock advances PAST the lease TTL.
         s.advance(31);
 
-        // The reaper sweeps: the expired lease is re-queued (0 orphans).
         let reaped = s.reap();
         assert_eq!(
             reaped,
@@ -1592,21 +1135,19 @@ mod tests {
         assert_eq!(
             s.state_of("tenantA", "j1"),
             Some(JobState::Queued),
-            "the reaped job is re-queued (claimable again) — 0 orphans"
+            "the reaped job is re-queued (claimable again) - 0 orphans"
         );
 
-        // 0 duplicate enqueues: the reaper updated the EXISTING row; the count is unchanged. A
-        // redundant SCHEDULE_AND_RUN_JOB retry (same idem_token) is a no-op.
         assert_eq!(
             s.jobs().len(),
             total_before,
             "the reaper inserts no new row"
         );
-        let retry = s.enqueue(job("j1", Lane::Batch, 0)); // same (tenant, idem_token)
+        let retry = s.enqueue(job("j1", Lane::Batch, 0));
         assert_eq!(
             retry,
             EnqueueOutcome::DuplicateIdem,
-            "the re-dispatch is idempotent on idem_token — ONE enqueue row, never a duplicate"
+            "the re-dispatch is idempotent on idem_token - ONE enqueue row, never a duplicate"
         );
         assert_eq!(
             s.jobs().len(),
@@ -1614,28 +1155,23 @@ mod tests {
             "still ONE row after the idempotent retry"
         );
 
-        // A fresh runner re-claims the re-queued job (recovery complete).
         let c2 = s
             .claim(&req("fr-par", "live-runner"))
             .expect("the re-queued job re-claims");
         assert_eq!(c2.job_id, "j1", "a live runner picks up the recovered job");
     }
 
-    /// **A HEART-BEATING runner is NOT reaped (only a DEAD runner's expired lease is swept).** The
-    /// reaper is targeted: a live runner that extends its lease keeps the job; the reaper finds 0 to
-    /// sweep.
     #[test]
     fn heartbeat_keeps_a_live_lease_off_the_reaper() {
         let mut s = SchedulerState::new();
         s.enqueue(job("j1", Lane::Batch, 0));
         s.claim(&req("fr-par", "live")).expect("claimed");
-        // The clock advances, but the runner heartbeats BEFORE the lease expires.
         s.advance(20);
         assert!(
             s.heartbeat("tenantA", "j1", "live", 30),
             "the live runner extends its lease"
         );
-        s.advance(11); // now=31, but lease was extended to 20+30=50.
+        s.advance(11);
         let reaped = s.reap();
         assert!(
             reaped.is_empty(),
@@ -1648,8 +1184,6 @@ mod tests {
         );
     }
 
-    /// **The reaper is idempotent across repeated sweeps (re-running reap does not re-process an
-    /// already-re-queued job).** After the first sweep the job is `queued`; a second sweep finds 0.
     #[test]
     fn reaper_is_idempotent_across_sweeps() {
         let mut s = SchedulerState::new();
@@ -1663,11 +1197,6 @@ mod tests {
         );
     }
 
-    // ── THE LIVE-SQL LOCK-STEP CHECK ───────────────────────────────────────────────────────────
-
-    /// **The live claim SQL encodes the SAME predicate conjunction the model implements.** Pins the
-    /// [`CLAIM_QUERY`] text so a model/SQL drift is loud: the claim is `FOR UPDATE SKIP LOCKED`, keys
-    /// on region/labels/trust, holds the `deploy:%` serialize, and ORDERs lane→deficit→enqueued_at.
     #[test]
     fn the_live_claim_sql_matches_the_model_predicates() {
         assert!(
@@ -1710,7 +1239,6 @@ mod tests {
                 "claim refuses a queue row without active owner predicate `{active_owner}`"
             );
         }
-        // The reaper SQL re-queues an expired lease in place (no INSERT → 0 duplicate enqueues).
         assert!(
             REAP_QUERY.contains("SET state = 'queued'")
                 && REAP_QUERY.contains("lease_expires < now()")
@@ -1724,20 +1252,15 @@ mod tests {
                     .starts_with("WITH candidates AS MATERIALIZED"),
             "the reaper UPDATEs an expired lease in place (no INSERT)"
         );
-        // Cancel-superseded terminalises the prior heads, keeping the new one.
         assert!(
             CANCEL_SUPERSEDED_QUERY.contains("SET state = 'terminal'")
                 && CANCEL_SUPERSEDED_QUERY.contains("job_id <> $4"),
             "cancel-superseded terminalises prior heads, keeps the new head"
         );
-        // The lane tokens match the model's CHECK-constraint strings.
         assert_eq!(lane_token(Lane::Interactive), "interactive");
         assert_eq!(state_token(JobState::Leased), "leased");
     }
 
-    /// **The two deadlines are sized from different authorities, and the claim returns the durable
-    /// window.** The execution lease still comes from `$5`; the immutable claim ceiling comes from
-    /// the row's own `claim_window_secs`, falling back to `$5` only for a legacy NULL row.
     #[test]
     fn the_claim_sizes_the_execution_lease_and_the_claim_ceiling_separately() {
         assert!(
@@ -1755,9 +1278,6 @@ mod tests {
         );
     }
 
-    /// **The reaper returns the OLD generation identity it just requeued.** Without this the
-    /// same-transaction journal seal could not name the exact generation (the UPDATE clears the
-    /// nonce), and would have to guess.
     #[test]
     fn the_reaper_returns_the_exact_generation_it_requeued() {
         assert!(REAP_QUERY
@@ -1766,8 +1286,6 @@ mod tests {
         assert!(REAP_QUERY.contains("e.claim_nonce::text AS reaped_claim_nonce"));
     }
 
-    /// **Both lease installations are capped by the immutable claim ceiling; the launch CAS's
-    /// predicates are untouched.**
     #[test]
     fn every_installed_lease_is_capped_at_the_immutable_claim_expiry() {
         for (name, query) in [
@@ -1779,10 +1297,6 @@ mod tests {
                 "the {name} lease must be capped at the immutable claim expiry"
             );
         }
-        // The predicate block is FROZEN byte-for-byte, not spot-checked: a substring list would
-        // still pass if the tenant/region/job/run or surface predicates were deleted outright. This
-        // slice may only change how the launch CAS SIZES the lease, never what it admits — so any
-        // edit between `WHERE` and the `RETURNING` that closes the CTE fails here.
         const FROZEN_LAUNCH_PREDICATES: &str = "\
 WHERE tenant_id = $1
   AND region = $2
@@ -1817,9 +1331,6 @@ RETURNING surface.job_id";
         );
     }
 
-    /// **The preparation renewal binds the complete generation and never accepts a launched job.**
-    /// A renewal that accepted `running` would let a stale preparation worker extend a lease the
-    /// workload already owns.
     #[test]
     fn the_preparation_renewal_binds_the_full_generation_and_refuses_a_launched_job() {
         for predicate in [
@@ -1851,17 +1362,11 @@ RETURNING surface.job_id";
             !RENEW_PREPARATION_LEASE_QUERY.contains("SET state"),
             "a renewal is a lease extension only, never a lifecycle transition"
         );
-        // The owner-only heartbeat is deliberately NOT the renewal path and stays unchanged.
         assert!(HEARTBEAT_QUERY.contains("state IN ('leased', 'running')"));
     }
 
-    /// **CT-007 phase-credential generations: the V2 launch CAS is the legacy CAS PLUS the current
-    /// workload-generation predicate, in the SAME statement.** A separate pre-`SELECT` would leave a
-    /// window in which a successor generation could be appended between check and CAS, so the
-    /// predicate must live inside the `UPDATE`'s own `WHERE`.
     #[test]
     fn the_v2_launch_cas_folds_the_current_workload_generation_into_the_same_statement() {
-        // Everything the legacy CAS admits, unchanged.
         for predicate in [
             "SET state = 'running'",
             "WHERE tenant_id = $1",
@@ -1884,8 +1389,6 @@ RETURNING surface.job_id";
                 "the V2 launch CAS must still bind `{predicate}`"
             );
         }
-        // Round-1 blocker 3: the V2 CAS may never resurrect an expired execution lease, and the
-        // byte-frozen legacy CAS may never acquire this predicate by accident.
         assert!(
             AUTHORIZE_JOB_LAUNCH_V2_QUERY.contains("AND lease_expires > statement_timestamp()"),
             "the V2 launch CAS requires a LIVE execution lease, like every other V2 boundary"
@@ -1894,7 +1397,6 @@ RETURNING surface.job_id";
             !AUTHORIZE_JOB_LAUNCH_QUERY.contains("lease_expires > statement_timestamp()"),
             "the legacy launch CAS stays byte-frozen; the lease predicate is V2-only"
         );
-        // Plus the generation predicate, inside the same UPDATE.
         for predicate in [
             "FROM ci_job_credential_generation AS generation",
             "generation.purpose = 'workload'",
@@ -1929,7 +1431,6 @@ RETURNING surface.job_id";
             generation_predicate_position < cte_close,
             "the generation predicate must live INSIDE the launching UPDATE, not after it"
         );
-        // A V2 generation predicate must never leak into the legacy query.
         assert!(
             !AUTHORIZE_JOB_LAUNCH_QUERY.contains("ci_job_credential_generation"),
             "the production launch CAS stays byte-unchanged: production is still V1-pinned"
@@ -1941,23 +1442,12 @@ RETURNING surface.job_id";
                 && !CONSUME_PREPARATION_CLAIM_QUERY.contains("ci_job_credential_generation"),
             "no previously shipped query gains a credential-generation dependency in this slice"
         );
-        // CT-007 5b.3-6d: the new exhausted-variant CAS is likewise free of any credential-generation
-        // dependency (it recovers on the parent-attempt policy, not on any credential row).
         assert!(
             !CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY.contains("ci_job_credential_generation"),
             "the exhausted-variant preparation CAS must not depend on credential generations"
         );
     }
 
-    /// **CT-007 5b.3-6d: the exhausted CAS shares the shipped preparation CAS's predicate block
-    /// BYTE-FOR-BYTE, differing ONLY in the parent-attempt predicate.** The queue-identity + live-claim
-    /// block (tenant/region/job/run/idem/owner/epoch/nonce/stage/claim-start/claim-expiry/live-expiry/
-    /// `state='leased'`/`completion_receipt IS NULL`) and the `ci_job` surface guard + `RETURNING` are
-    /// the SAME bytes as [`CONSUME_PREPARATION_CLAIM_QUERY`], which is already fully behaviorally
-    /// tested. So every shared predicate is load-bearing here by byte-identity: dropping or editing any
-    /// of them fails this pin. The ONLY sanctioned difference is the parent predicate — the shipped CAS
-    /// binds the exact current generation's row; the exhausted CAS recovers on the policy-exhaustion
-    /// group and must NOT bind the current generation.
     #[test]
     fn the_exhausted_cas_shares_the_shipped_predicate_block_byte_for_byte() {
         const PARENT_MARKER: &str =
@@ -1970,7 +1460,6 @@ RETURNING surface.job_id";
         let exhausted_parent = CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY
             .find(PARENT_MARKER)
             .expect("the exhausted CAS opens a parent-attempt EXISTS block");
-        // Identical PREFIX: the UPDATE/SET and the entire queue-identity + live-claim predicate block.
         assert_eq!(
             &CONSUME_PREPARATION_CLAIM_QUERY[..shipped_parent],
             &CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY[..exhausted_parent],
@@ -1983,14 +1472,12 @@ RETURNING surface.job_id";
         let exhausted_surface = CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY
             .find(SURFACE_MARKER)
             .expect("the exhausted CAS has a ci_job surface guard");
-        // Identical SUFFIX: the ci_job surface guard and the RETURNING.
         assert_eq!(
             &CONSUME_PREPARATION_CLAIM_QUERY[shipped_surface..],
             &CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY[exhausted_surface..],
             "the exhausted CAS must share the shipped ci_job surface guard + RETURNING byte-for-byte"
         );
 
-        // The ONLY sanctioned divergence is the parent predicate.
         let shipped_parent_block = &CONSUME_PREPARATION_CLAIM_QUERY[shipped_parent..shipped_surface];
         let exhausted_parent_block =
             &CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY[exhausted_parent..exhausted_surface];
@@ -2012,12 +1499,6 @@ RETURNING surface.job_id";
         );
     }
 
-    /// **CT-007 5b.3-6d step 2: the requeue CAS shares the shipped preparation CAS's ENTIRE
-    /// `WHERE … RETURNING` block BYTE-FOR-BYTE, differing ONLY in the action.** The queue-identity +
-    /// live-claim + current-generation parent + `ci_job` surface predicates are the SAME bytes as the
-    /// already-fully-tested [`CONSUME_PREPARATION_CLAIM_QUERY`], so every admission/guard predicate is
-    /// load-bearing here by identity; the only sanctioned difference is the `SET` (requeue-to-queued +
-    /// clear nonce, no completion receipt) rather than terminalize.
     #[test]
     fn the_requeue_cas_shares_the_shipped_where_block_byte_for_byte() {
         const WHERE_MARKER: &str = "WHERE q.tenant_id = $1";
@@ -2027,18 +1508,11 @@ RETURNING surface.job_id";
         let requeue_where = REQUEUE_PREPARATION_CLAIM_QUERY
             .find(WHERE_MARKER)
             .expect("the requeue CAS opens its WHERE block");
-        // The entire predicate block through `RETURNING q.job_id` is byte-identical: any predicate
-        // drop/edit fails here. (The shipped CAS carries `$14` only in its SET, so the WHERE blocks
-        // themselves share the SAME parameter references.)
         assert_eq!(
             &CONSUME_PREPARATION_CLAIM_QUERY[shipped_where..],
             &REQUEUE_PREPARATION_CLAIM_QUERY[requeue_where..],
             "the requeue CAS must admit EXACTLY what the shipped preparation CAS admits"
         );
-        // The action differs: requeue returns the row to `queued`, RELEASES the lease
-        // (`lease_owner`/`lease_expires` NULL), and clears the nonce; it never terminalizes and never
-        // writes a completion receipt. The COMPLETE SET is fenced byte-for-byte so removing any one
-        // assignment (e.g. `lease_expires = NULL`) fails here.
         let requeue_set = &REQUEUE_PREPARATION_CLAIM_QUERY[..requeue_where];
         assert_eq!(
             requeue_set,

@@ -1,31 +1,3 @@
-//! # `pr_store` — the DURABLE PR/review store + the repo-owned branch-protection policy + the gated,
-//! durable merge (GT-003 / E1.2)
-//!
-//! The hosting-layer entities Git owns ([`crate::lifecycle`] — PR, Review, branch-protection ruleset)
-//! become **durable** here, so open-PR / review / merge survive a restart and drive the product-API write
-//! path. Per the GT-003 prompt's offered option, the durable medium is **on-disk repo metadata** under
-//! the bare repo dir, resolved through the SAME validated [`RepoPathResolver`] the durable git store uses
-//! (tenant/region path-isolated + traversal-safe). The arch's long-term home for PR/review/policy rows is
-//! the control-plane OLTP (PG via the MR-022 provider) — the named **GT-003b** follow-on.
-//!
-//! ## The security boundary (GT-003 verifier fix): policy is REPO-OWNED, never author-settable
-//! Branch-protection POLICY — the required check set, the approval threshold, the CODEOWNERS/conversation
-//! rules, the fork-endorsement requirement — lives in a **repo-owned** [`BranchProtectionConfig`]
-//! (`<repo>.git/myelin/branch-protection.json`), set ONLY by an authorized repo-admin operation. A PR
-//! record carries only FACTS (the head, the submitted reviews, the CI-reported green contexts, the
-//! maintainer endorsements). The merge sources the required set + thresholds from the repo policy for the
-//! target ref — NEVER from author-supplied PR fields — and a **protected ref defaults CLOSED** (an
-//! unconfigured protected ref still requires a non-author approval). So a tenant member cannot merge by
-//! supplying loose/null policy at PR-open (the proven bypass — closed).
-//!
-//! ## Anti-duplication
-//! - The lifecycle STATE MACHINE / ruleset entity is [`crate::lifecycle`] — reused, not reimplemented.
-//! - The merge GATE is [`crate::merge_gate`] (required-set + fork-trust) AND
-//!   [`crate::lifecycle::evaluate_ruleset`] (approvals / CODEOWNERS / conversations) — reused verbatim. A
-//!   merge advances the target ref via the durable per-ref CAS ([`crate::receive_pack::RefStore`]) ONLY
-//!   after both admit AND the head is a valid fast-forward target — never a policy bypass, never an
-//!   arbitrary oid.
-
 use std::io::Read as _;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -49,9 +21,6 @@ use crate::receive_pack::{
     Pusher, RefName, RefStore,
 };
 
-/// A PR record accumulates checks and reviews over its lifetime. Keep one corrupted or adversarial
-/// record from becoming an unbounded point read/list row, and refuse mutations before they persist a
-/// document beyond the same ceiling.
 pub(crate) const PR_RECORD_MAX_BYTES: usize = 2 * 1024 * 1024;
 const BRANCH_PROTECTION_MAX_BYTES: usize = 256 * 1024;
 
@@ -73,33 +42,17 @@ fn ensure_branch_protection_size(size: usize) -> Result<(), DurableError> {
     Ok(())
 }
 
-// ───────────────────────────── repo-owned branch-protection policy ────────────────────────────────
-
-/// **The repo-owned branch-protection config** — the durable POLICY, set ONLY by an authorized repo
-/// admin (never author input). A list of [`BranchProtectionRuleset`]s (reused entity), each protecting a
-/// ref pattern; the first whose `matches(base_ref)` wins. Persisted at
-/// `<repo>.git/myelin/branch-protection.json`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BranchProtectionConfig {
-    /// The rulesets, in precedence order (first match wins).
     pub rulesets: Vec<BranchProtectionRuleset>,
 }
 
 impl BranchProtectionConfig {
-    /// The first configured ruleset protecting `base_ref` (`None` if none matches).
     pub fn resolve(&self, base_ref: &str) -> Option<&BranchProtectionRuleset> {
         self.rulesets.iter().find(|r| r.matches(base_ref))
     }
 }
 
-/// The **effective** ruleset the merge enforces for `base_ref`:
-/// - a CONFIGURED ruleset wins (the repo admin's policy — unbypassable);
-/// - else if `base_ref` is a PROTECTED ref (the default branch / `release/*`), a **default-CLOSED**
-///   built-in ruleset (require 1 non-author approval) — so an unconfigured protected ref is NOT a free
-///   merge; the repo admin must opt into anything looser;
-/// - else (an unprotected ref like a feature branch) no requirements.
-///
-/// The required set + thresholds therefore NEVER come from author input.
 pub fn effective_ruleset(
     config: Option<&BranchProtectionConfig>,
     base_ref: &str,
@@ -108,7 +61,6 @@ pub fn effective_ruleset(
         return rs.clone();
     }
     if RefName::new(base_ref).is_protected() {
-        // Default-CLOSED for a protected ref: at minimum a non-author approval is required.
         return BranchProtectionRuleset {
             ref_pattern: base_ref.to_string(),
             required_contexts: Vec::new(),
@@ -118,7 +70,6 @@ pub fn effective_ruleset(
             allow_force_push: false,
         };
     }
-    // An unprotected ref — no branch-protection requirements (still head-validated at merge).
     BranchProtectionRuleset {
         ref_pattern: base_ref.to_string(),
         required_contexts: Vec::new(),
@@ -129,17 +80,10 @@ pub fn effective_ruleset(
     }
 }
 
-// ───────────────────────────── the durable PR/review record (FACTS only) ──────────────────────────
-
-/// A persisted review (the [`crate::lifecycle::Review`] entity, durable). The verdict lives in the
-/// lifecycle [`ReviewState`]; the reviewer pseudonym + agent-legibility ride alongside (GIT-1 / ADR-08).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewRecord {
-    /// The reviewer's OPAQUE pseudonym (GIT-1).
     pub reviewer_pseudonym: String,
-    /// The review lifecycle state (`Requested` / `Submitted(verdict)` / `Dismissed`).
     pub state: ReviewState,
-    /// Agent legibility (ADR-08) — `true` iff the reviewer is an agent.
     pub is_agent: bool,
 }
 
@@ -155,80 +99,37 @@ impl ReviewRecord {
     }
 }
 
-/// The **durable pull-request record — FACTS ONLY** (the [`PullRequest`] entity + its reviews + the
-/// CI/endorsement facts). It carries NO branch-protection policy: the required set + thresholds come from
-/// the repo-owned [`BranchProtectionConfig`] at merge time, never from these fields. The check facts
-/// (`green_contexts` / `fork_unendorsed_contexts` / `endorsed_contexts`) are produced by authorized
-/// producers (the CI check-report path — the real producer is M4; the maintainer endorsement —
-/// [`crate::fork_gate`]; the reviews — the review op), NOT by the PR author at open.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrRecord {
-    /// The per-repo PR number (git's stable canonical key).
     pub number: u64,
-    /// **The human title (R3.1 — required at create through the edge).** `#[serde(default)]` so a
-    /// PR record persisted BEFORE the title store existed deserializes with an EMPTY title — the list
-    /// renders such a legacy PR as its `#number` (an honest fallback, never a fabricated title). The
-    /// on-disk JSON store's additive-field schema evolution is the durable equivalent of a migration
-    /// (there is no `pr` SQL table to `ALTER` — the PG home is the named GT-003b follow-on).
     #[serde(default)]
     pub title: String,
-    /// **The optional Markdown body (R3.1).** `None` for a legacy record or a PR opened without one.
     #[serde(default)]
     pub body_md: Option<String>,
-    /// **Whether the PR AUTHOR is an agent (ADR-08 legibility).** Set at open from the opener's
-    /// [`PrincipalKind`]; drives the row's four-channel agent badge (`is_agent` is REQUIRED, never
-    /// disguised as a human). `#[serde(default)]` = `false` for a legacy record.
     #[serde(default)]
     pub author_is_agent: bool,
-    /// **Last-touched wall-clock (unix seconds), for the list's "updated" column + `sort=updated`.**
-    /// Set at open and bumped on each authored mutation through the edge. `None` for a legacy record
-    /// (the row omits the timestamp rather than fabricating one).
     #[serde(default)]
     pub updated_at: Option<i64>,
-    /// **When the PR was opened (unix seconds) — the overview header's "opened DD.MM.YYYY" (R3.3 N1).**
-    /// Set once at open through the edge; `None` for a legacy record (the header omits the date rather
-    /// than fabricating one). Additive `#[serde(default)]` — the JSON-store schema-evolution path.
     #[serde(default)]
     pub created_at: Option<i64>,
-    /// The lifecycle state.
     pub state: PrState,
-    /// The base ref the PR targets (the ref a merge advances; the policy keys on it).
     pub base_ref: String,
-    /// The head ref the PR proposes to land.
     pub head_ref: String,
-    /// The repository that AUTHORITATIVELY owns `head_ref` and `head_oid`.
-    ///
-    /// New production rows always persist this explicitly. The empty default exists only so legacy
-    /// filesystem records remain importable; callers must resolve it to the target repository during
-    /// import and must never treat an empty value as fork-trust evidence.
     #[serde(default)]
     pub head_repo_slug: String,
-    /// The head commit oid a merge advances `base_ref` to (validated as a real FF target at merge).
     pub head_oid: String,
-    /// The PR author's OPAQUE pseudonym (GIT-1) — a self-approval by this pseudonym does NOT count.
     pub author_pseudonym: String,
-    /// Canonical GDPR/KMS subject locator: the normalized stable `principal_id`, kept distinct from
-    /// the display pseudonym. New PostgreSQL rows require it; the empty default is legacy-import only.
     #[serde(default)]
     pub author_subject_id: String,
-    /// The reviews on this PR (durable; submitted via the authorized review op).
     pub reviews: Vec<ReviewRecord>,
-    /// Contexts with a CURRENT TRUSTED success for `head_oid` (the CI check-report fact; producer M4).
     pub green_contexts: Vec<String>,
-    /// Contexts with a CURRENT `untrusted_fork` success NOT yet endorsed — neutral-for-gating (Δ3).
     pub fork_unendorsed_contexts: Vec<String>,
-    /// Contexts a maintainer endorsed via `approve_untrusted_ci` ([`crate::fork_gate`]).
     pub endorsed_contexts: Vec<String>,
-    /// Whether the CODEOWNERS review requirement is satisfied (resolved by the owner Expand; default
-    /// `false` — safe: a repo requiring CODEOWNERS blocks until genuinely satisfied).
     pub codeowner_review_satisfied: bool,
-    /// The count of OUTSTANDING (unresolved) conversation threads.
     pub outstanding_conversations: u32,
 }
 
 impl PrRecord {
-    /// Open a new PR record (FACTS empty) from the [`PullRequest`] entity. Carries NO policy — the merge
-    /// reads the repo-owned ruleset.
     pub fn open(pr: &PullRequest, head_oid: impl Into<String>) -> PrRecord {
         PrRecord {
             number: pr.number,
@@ -265,16 +166,6 @@ impl PrRecord {
         pr
     }
 
-    /// Current approvals that COUNT toward the threshold — the number of DISTINCT, non-author, HUMAN
-    /// reviewers whose current review is an approval. Three exclusions, each a real gate bypass if
-    /// dropped (peer-review finding 2026-07-16 #1):
-    ///   - **de-dup by `reviewer_pseudonym`**: one reviewer approving N times (the single-shot review
-    ///     route appends a `ReviewRecord` per submission with no uniqueness check) must count ONCE —
-    ///     otherwise a lone reviewer could alone satisfy `required_approvals >= 2`.
-    ///   - **exclude agents** (`!is_agent`, ADR-08): an agent review is ALWAYS advisory — it never
-    ///     counts toward the merge gate (the batch path already gates on `!advisory`; this is the
-    ///     single-shot path's missing half).
-    ///   - **exclude the author** (no self-approval meets the requirement).
     fn counting_approvals(&self) -> u32 {
         let mut approvers: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for r in &self.reviews {
@@ -288,9 +179,6 @@ impl PrRecord {
         approvers.len() as u32
     }
 
-    /// **The row-level review posture (R3.1 list VM).** `changes` if any current review requests
-    /// changes; else `approved` if a non-author approval counts; else `requested` if any reviewer is
-    /// still in the requested state; else `none`. Drives the quiet review marker on the list row.
     pub fn review_state_label(&self) -> &'static str {
         if self.reviews.iter().any(|r| r.is_blocking()) {
             "changes"
@@ -307,23 +195,12 @@ impl PrRecord {
         }
     }
 
-    /// **Is `viewer_pseudonym` a REQUESTED reviewer on this PR?** (the cross-repo "needs your review"
-    /// bucket predicate + the row's "review requested" marker.) A requested review whose reviewer is
-    /// the viewer — never leaks another reviewer's request.
     pub fn is_review_requested_of(&self, viewer_pseudonym: &str) -> bool {
         self.reviews.iter().any(|r| {
             matches!(r.state, ReviewState::Requested) && r.reviewer_pseudonym == viewer_pseudonym
         })
     }
 
-    /// **The checks-summary rollup for the list row (R3.1 / gate Q4 — rolled up IN the list pass, no
-    /// N+1).** Derived from the durable check FACTS on this record (the CI-reported `green_contexts`)
-    /// against the REPO-OWNED `ruleset`'s required set — the same facts [`evaluate_merge`] reads, so
-    /// the row never contradicts the merge gate. **Honest floor:** the record persists only SUCCESS
-    /// facts (greens), so a required context that is not yet green is `pending` (verdict `running`) —
-    /// this projection cannot distinguish a genuine FAILURE from a still-running check (`failing`
-    /// stays 0 until the per-commit `check_status` projection is joined here; a named follow-on). The
-    /// `verdict` is the load-bearing, leak-free signal; the counts refine it.
     pub fn checks_summary(&self, ruleset: &BranchProtectionRuleset) -> ChecksSummary {
         let total = ruleset.required_contexts.len() as u32;
         let passing = ruleset
@@ -332,7 +209,6 @@ impl PrRecord {
             .filter(|c| self.green_contexts.iter().any(|g| g == *c))
             .count() as u32;
         let verdict = if total == 0 {
-            // No required checks: "pass" if the record carries greens (a merged/green PR), else none.
             if self.green_contexts.is_empty() {
                 ChecksVerdict::None
             } else {
@@ -352,26 +228,16 @@ impl PrRecord {
     }
 }
 
-/// The list-row checks verdict (glyph+label; the ring stays reserved for this CI trio). `None` = no
-/// checks reported; `Unavailable` = the projection could not be read (the row FAILS STATIC — it still
-/// lists, the checks glyph shows a neutral "checks unavailable", never a blanked row; ux-git #5).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChecksVerdict {
-    /// Every required check is green (or a green-carrying merged PR).
     Pass,
-    /// A required check reported a failure (reserved — the record cannot yet witness this; see the
-    /// [`PrRecord::checks_summary`] floor).
     Fail,
-    /// A required check is not yet green (running/pending — the record cannot distinguish these).
     Running,
-    /// No required checks and no greens reported.
     None,
-    /// The checks projection could not be read for this row (degraded — fail static, still lists).
     Unavailable,
 }
 
 impl ChecksVerdict {
-    /// The stable wire token the row VM emits (the frontend maps it to a glyph+label).
     pub fn as_str(self) -> &'static str {
         match self {
             ChecksVerdict::Pass => "pass",
@@ -383,21 +249,15 @@ impl ChecksVerdict {
     }
 }
 
-/// The rolled-up checks posture for one list row — `verdict` + the refining counts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ChecksSummary {
-    /// The load-bearing, leak-free verdict.
     pub verdict: ChecksVerdict,
-    /// Required contexts currently green.
     pub passing: u32,
-    /// Required contexts witnessed as FAILED (0 until the check_status projection is joined — floor).
     pub failing: u32,
-    /// Required contexts in total.
     pub total: u32,
 }
 
 impl ChecksSummary {
-    /// The degraded summary a row shows when the checks projection could not be read (fail static).
     pub fn unavailable() -> ChecksSummary {
         ChecksSummary {
             verdict: ChecksVerdict::Unavailable,
@@ -408,18 +268,10 @@ impl ChecksSummary {
     }
 }
 
-// ───────────────────────────── bounded PR-list read contract ─────────────────────────────────────
-
-/// Maximum page size accepted by the storage-neutral PR-list contract. This matches the Edge's
-/// uniform list ceiling; callers cannot turn a page read into an unbounded materialisation.
 pub const PR_LIST_PAGE_MAX: usize = 100;
 
-/// Maximum transitional numeric cursor coordinate accepted by every storage backend. This keeps
-/// direct store callers from issuing attacker-sized offset work while the wire contract migrates
-/// to opaque keyset cursors.
 pub const PR_LIST_OFFSET_MAX: usize = 10_000;
 
-/// The per-repository state tab selected by a PR-list request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrListState {
     Open,
@@ -449,9 +301,6 @@ impl PrListState {
     }
 }
 
-/// Stable per-repository PR-list ordering. `Created` deliberately preserves the existing contract:
-/// per-repository PR number is the create-order authority. `Updated` uses the persisted optional
-/// unix-second stamp, with unstamped legacy rows last and PR number as the total-order tie breaker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrListSort {
     Updated,
@@ -486,8 +335,6 @@ fn pr_record_before_key(
     }
 }
 
-/// Storage-neutral, already-authorized per-repository PR-list request. New requests use live
-/// keysets; bounded numeric offsets remain only as a transitional compatibility input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrListQuery {
     pub state: PrListState,
@@ -549,8 +396,6 @@ impl PrListQuery {
         Ok(query)
     }
 
-    /// Recheck bounds at a storage entry point. This also protects a backend from callers that
-    /// construct this public transport struct directly instead of using [`Self::new`].
     pub fn validate(&self) -> Result<(), DurableError> {
         if matches!(self.page, crate::pr_list_pagination::PrListPage::LegacyOffset(offset) if offset > PR_LIST_OFFSET_MAX)
         {
@@ -578,8 +423,6 @@ impl PrListQuery {
     }
 }
 
-/// Exact tab/sidebar counts over the full already-authorized repository relation. State filtering
-/// narrows page rows only and never changes these counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PrListCounts {
     pub open: usize,
@@ -615,7 +458,6 @@ impl PrListCounts {
     }
 }
 
-/// One bounded storage page plus exact counts and exact live navigation flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrListSlice {
     pub records: Vec<PrRecord>,
@@ -626,7 +468,6 @@ pub struct PrListSlice {
     pub has_older: bool,
 }
 
-/// Cross-repository inbox bucket selected by `/v1/git/prs`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrListBucket {
     Yours,
@@ -643,7 +484,6 @@ impl PrListBucket {
     }
 }
 
-/// Validated cross-repository bucket page request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrCrossListQuery {
     pub bucket: PrListBucket,
@@ -747,29 +587,18 @@ pub struct PrCrossListSlice {
     pub has_older: bool,
 }
 
-// ───────────────────────────── the merge-gate evaluation (reused logic) ───────────────────────────
-
-/// The combined merge-gate decision over the repo-owned ruleset and durable PR facts. It combines
-/// the required-set and fork-trust half ([`crate::merge_gate`]) with the approvals, CODEOWNERS, and
-/// conversations half ([`crate::lifecycle::evaluate_ruleset`]). A merge is admitted only when both
-/// halves admit.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MergeEval {
-    /// The required-set + fork-trust posture outcome.
     pub gate: MergeGateOutcome,
-    /// The approvals / CODEOWNERS / conversations outcome.
     pub ruleset: RulesetOutcome,
 }
 
 impl MergeEval {
-    /// `true` iff BOTH halves admit — the only state that lets a merge advance the ref (0 policy bypass).
     pub fn admitted(&self) -> bool {
         self.gate.is_admitted() && self.ruleset.is_satisfied()
     }
 }
 
-/// A malformed required-context string in the repo-owned ruleset (the merge gate must never silently
-/// treat an unparseable required context as absent — that would be an under-gated merge).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GateInputError(pub String);
 
@@ -808,10 +637,6 @@ fn synthetic_fact(
     }
 }
 
-/// **Evaluate the merge gate over a REPO-OWNED ruleset + the durable PR facts.** The required set +
-/// thresholds come from `ruleset` (repo policy — never author input); the facts (greens, endorsements,
-/// approvals, conversations) come from the durable record. Reuses [`crate::merge_gate`] (required-set +
-/// fork-trust) + [`crate::lifecycle::evaluate_ruleset`] (approvals/CODEOWNERS/conversations).
 pub fn evaluate_merge(
     ruleset: &BranchProtectionRuleset,
     rec: &PrRecord,
@@ -846,11 +671,8 @@ pub fn evaluate_merge(
         .map(|c| parse(c))
         .collect::<Result<_, _>>()?;
 
-    // The required-set + fork-trust half (merge_gate owns it) — required set from REPO policy.
     let gate = evaluate_merge_gate(&policy, &proj, &head, &endorsed);
 
-    // The approvals / CODEOWNERS / conversations half (lifecycle ruleset owns it). `required_contexts`
-    // is intentionally EMPTY here — merge_gate owns the required-set check above (no duplication/drift).
     let ruleset_def = BranchProtectionRuleset {
         ref_pattern: ruleset.ref_pattern.clone(),
         required_contexts: Vec::new(),
@@ -874,19 +696,12 @@ pub fn evaluate_merge(
     })
 }
 
-// ───────────────────────────── the durable on-disk PR + policy store ───────────────────────────────
-
-/// **The durable on-disk PR/review + branch-protection store.** PR records live as JSON under
-/// `<root>/<tenant>/<region>/<repo>.git/myelin/prs/<n>.json`; the repo-owned branch-protection config
-/// lives at `…/<repo>.git/myelin/branch-protection.json` — both resolved through the SAME validated
-/// [`RepoPathResolver`] (tenant/region path-isolated + traversal-safe).
 pub struct DurablePrStore<P: RepoPathResolver = RootedResolver> {
     resolver: P,
     write_lock: Mutex<()>,
 }
 
 impl DurablePrStore<RootedResolver> {
-    /// Root the store at the SAME on-disk root the durable git store uses.
     pub fn rooted(root: impl Into<PathBuf>) -> Self {
         Self {
             resolver: RootedResolver::new(root),
@@ -896,7 +711,6 @@ impl DurablePrStore<RootedResolver> {
 }
 
 impl<P: RepoPathResolver> DurablePrStore<P> {
-    /// Build over a resolver (the placement resolver swaps in here behind the same port).
     pub fn new(resolver: P) -> Self {
         Self {
             resolver,
@@ -955,11 +769,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         Ok(Some(bytes))
     }
 
-    // ── branch-protection policy (repo-owned) ──
-
-    /// Persist (overwrite) the repo-owned branch-protection config. The CALLER must have authorized this
-    /// as a repo-admin operation (the edge gates the distinct `git.repo.branch_protection.set` action;
-    /// the production authorizer resolves `Id.check(repo_admin)`). Atomic temp-file + rename.
     pub fn put_protection(
         &self,
         repo: &RepoLoc,
@@ -973,7 +782,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         self.write_atomic(&dir, &self.protection_path(repo)?, &bytes)
     }
 
-    /// Read the repo-owned branch-protection config (`None` if the repo has none configured).
     pub fn get_protection(
         &self,
         repo: &RepoLoc,
@@ -991,8 +799,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         }
     }
 
-    /// The EFFECTIVE ruleset enforced for `base_ref` (repo policy, or default-closed for a protected
-    /// ref) — the required set + thresholds the merge uses, never author input.
     pub fn effective_ruleset_for(
         &self,
         repo: &RepoLoc,
@@ -1002,9 +808,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         Ok(effective_ruleset(config.as_ref(), base_ref))
     }
 
-    // ── PR records (facts) ──
-
-    /// Persist (create or overwrite) a PR record durably (atomic temp-file + rename).
     pub fn put(&self, repo: &RepoLoc, rec: &PrRecord) -> Result<(), DurableError> {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.put_unlocked(repo, rec)
@@ -1018,7 +821,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         self.write_atomic(&dir, &self.pr_path(repo, rec.number)?, &bytes)
     }
 
-    /// Read a PR record from disk (`None` if absent). A FRESH store over the same root reads it back.
     pub fn get(&self, repo: &RepoLoc, number: u64) -> Result<Option<PrRecord>, DurableError> {
         let path = self.pr_path(repo, number)?;
         match Self::read_bounded_file(
@@ -1042,7 +844,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         }
     }
 
-    /// Open a NEW PR durably — conflict if the number already exists.
     pub fn open_pr(&self, repo: &RepoLoc, rec: &PrRecord) -> Result<(), DurableError> {
         let _guard = self.write_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.get(repo, rec.number)?.is_some() {
@@ -1054,8 +855,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         self.put_unlocked(repo, rec)
     }
 
-    /// Atomically load, mutate, and replace one PR record under the filesystem store's write lock.
-    /// This is the fallback equivalent of the PostgreSQL row lock used by `apply_mutation`.
     pub fn update<R>(
         &self,
         repo: &RepoLoc,
@@ -1071,8 +870,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         Ok(output)
     }
 
-    /// List PR records while stopping before more than `maximum_records` JSON documents are read
-    /// and parsed. Interactive callers use this to keep tenant-controlled record cardinality finite.
     pub fn list_bounded(
         &self,
         repo: &RepoLoc,
@@ -1142,13 +939,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         Ok(out)
     }
 
-    /// Serve the storage-neutral per-repository list contract from the legacy filesystem authority.
-    ///
-    /// This is an explicitly bounded degradation, not true storage pagination: exact counts and
-    /// updated-time ordering cannot be derived from filenames, so the fallback first reuses
-    /// [`Self::list_bounded`] (at the caller's finite record/byte ceilings), then filters, sorts and
-    /// selects `limit + 1` in memory. Production PostgreSQL pushes the same operations into SQL;
-    /// a filesystem manifest/index is a separate migration and is never silently assumed here.
     pub fn list_page_bounded(
         &self,
         repo: &RepoLoc,
@@ -1224,13 +1014,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         })
     }
 
-    /// **The highest PR number present on disk, from the FILENAMES (`<n>.json`) — never the parsed
-    /// content (peer-review finding 2026-07-16 #3).** PR-number allocation MUST NOT derive from
-    /// [`Self::list_bounded`]: list parsing and number allocation are separate concerns, and allocation
-    /// must remain possible only from the filename-authoritative set. A PR's number is authoritative
-    /// in its filename (`pr_path` writes `<n>.json`), so this reads the directory entries and takes the
-    /// max of numbers parsed from `.json` stems — a corrupt record still counts and is never re-issued.
-    /// Returns `None` on an empty/absent dir (the first PR is #1).
     pub fn max_pr_number(&self, repo: &RepoLoc) -> Result<Option<u64>, DurableError> {
         let dir = self.prs_dir(repo)?;
         let rd = match std::fs::read_dir(&dir) {
@@ -1245,7 +1028,6 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            // The number is the file STEM (`<n>.json`) — authoritative regardless of content validity.
             if let Some(n) = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -1258,34 +1040,18 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
     }
 }
 
-// ───────────────────────────── the gated, durable merge ───────────────────────────────────────────
-
-/// The outcome of a [`merge_pr`] attempt — loud + typed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MergeAttempt {
-    /// The gate admitted, the head is a valid FF target, the base ref advanced durably, the PR is
-    /// `Merged`. Carries the new tip + the durable `update_seq`.
     Merged {
-        /// The base ref that advanced.
         base_ref: String,
-        /// The new tip (the head the PR landed).
         new_oid: String,
-        /// The post-update durable generation.
         update_seq: u64,
     },
-    /// The merge gate BLOCKED — no ref advance. Carries the evaluation.
     Blocked(MergeEval),
-    /// The head_oid is not a valid merge target (non-existent / non-commit / not a fast-forward of base)
-    /// — refused, no ref advance (never advance a protected ref to an arbitrary oid).
     InvalidHead(String),
-    /// The ref CAS was refused by the push policy (a raced base, or a protected-ref rule) — no advance.
     RefRefused(crate::receive_pack::RejectReason),
 }
 
-/// **The gated, durable merge (GT-003).** Sources the required set + thresholds from the REPO-OWNED
-/// `ruleset` (never author input), validates the head is a real FF target via the on-disk `repo`, and
-/// ONLY on a fully-admitted gate advances `base_ref` to `head_oid` via the durable per-ref CAS + the
-/// reused [`PullRequest::transition`]. A blocked gate / invalid head advances NOTHING.
 pub fn merge_pr<P: RepoPathResolver>(
     store: &DurablePrStore<P>,
     repo_loc: &RepoLoc,
@@ -1298,15 +1064,13 @@ pub fn merge_pr<P: RepoPathResolver>(
         .get(repo_loc, number)?
         .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
 
-    // The REPO-OWNED policy for the target ref (never author input).
     let ruleset = store.effective_ruleset_for(repo_loc, &rec.base_ref)?;
 
     let eval = evaluate_merge(&ruleset, &rec).map_err(|e| DurableError::Git(e.to_string()))?;
     if !eval.admitted() {
-        return Ok(MergeAttempt::Blocked(eval)); // 0 policy bypass.
+        return Ok(MergeAttempt::Blocked(eval));
     }
 
-    // Validate the head is a REAL fast-forward target of the base (never advance to an arbitrary oid).
     let base = RefName::new(rec.base_ref.clone());
     let cur_tip: Option<CoreOid> = ref_store.try_tip(&base)?.map(|o| CoreOid::new(o.0));
     let head_core = CoreOid::new(rec.head_oid.clone());
@@ -1323,7 +1087,6 @@ pub fn merge_pr<P: RepoPathResolver>(
         )));
     }
 
-    // The gate admitted + the head is valid — advance via the durable per-ref CAS.
     let expected_old = cur_tip
         .map(|o| PushOid::new(o.0))
         .unwrap_or_else(PushOid::zero);
@@ -1353,8 +1116,6 @@ pub fn merge_pr<P: RepoPathResolver>(
             pr.transition(PrTransition::Merge, true)
                 .map_err(|e| DurableError::Git(format!("PR merge transition: {e}")))?;
             rec.state = pr.state;
-            // Merge is a mutation: bump `updated_at` so `sort=updated` doesn't rank a merged
-            // PR by its pre-merge activity (verifier note, R3.1).
             rec.updated_at = Some(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1414,8 +1175,6 @@ mod tests {
         }
     }
 
-    /// Seed main at c1, return (c1, c2) where c2 is a real descendant of c1 (a valid FF target). main is
-    /// left pointing at c1.
     fn seed_main_then_descendant(repo: &DurableGitRepo) -> (CoreOid, CoreOid) {
         let (c1, _b1, _p1) = repo
             .build_file_commit(
@@ -1459,7 +1218,6 @@ mod tests {
         RefStore::open_durable(repo, "core", ctx_base(), outbox, minter)
     }
 
-    /// A repo-owned ruleset survives a FRESH store over the same root (durable, path-isolated).
     #[test]
     fn branch_protection_config_survives_a_fresh_store() {
         let root = temp_root("prot");
@@ -1515,20 +1273,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **A CORRUPT protection file is `Err`, NOT `Ok(None)` (the R0.2 fail-closed precondition).** The
-    /// wire push gate (`git_durable.rs` step 3b) relies on this distinction: a MISSING file means "no
-    /// protection configured" (`Ok(None)`, proceed), but an UNREADABLE/garbage `branch-protection.json`
-    /// must surface as `Err` so the push path can fail CLOSED (reject) rather than silently disable the
-    /// branch-protection gate. If this ever regressed to `Ok(None)` on corruption, a corrupt policy would
-    /// re-open force-push/delete/un-CI'd-push on every protected ref.
     #[test]
     fn a_corrupt_protection_file_is_an_error_not_a_silent_none() {
         let root = temp_root("prot-corrupt");
         let gitstore = DurableGitStore::rooted(&root);
         gitstore.create_repo(&loc()).unwrap();
         let store = DurablePrStore::rooted(&root);
-        // Write a valid config so the file exists at the canonical path, then overwrite it with garbage
-        // (the path helper is private, so locate the file by name under the store root).
         store
             .put_protection(&loc(), &BranchProtectionConfig::default())
             .unwrap();
@@ -1550,8 +1300,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **R3.1 — the title/body store round-trips durably** (a fresh store over the same root reads
-    /// the title + body back).
     #[test]
     fn title_and_body_round_trip_durably() {
         let root = temp_root("title");
@@ -1825,14 +1573,8 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **R3.1 — the on-disk "migration": a PR record written BEFORE the title store existed (no
-    /// `title`/`body_md`/`author_is_agent`/`updated_at` keys) still deserializes** — the additive
-    /// `#[serde(default)]` fields default (empty title → the list's honest `#number` fallback; not an
-    /// error, not a fabricated title). This is the durable-schema-evolution analogue of a boot
-    /// migration for the JSON store (there is no `pr` SQL table to `ALTER` — GT-003b).
     #[test]
     fn a_legacy_record_without_title_deserializes_with_defaults() {
-        // A pre-R3.1 record shape: only the fields that existed before the title store.
         let legacy = serde_json::json!({
             "number": 7,
             "state": "Open",
@@ -1858,8 +1600,6 @@ mod tests {
         assert_eq!(rec.updated_at, None);
     }
 
-    /// **R3.1 — the checks-summary rollup matches the merge-gate facts** (pass when all required are
-    /// green; running when a required one is not yet green; none when nothing is required/reported).
     #[test]
     fn checks_summary_rolls_up_from_greens_and_required_set() {
         let ruleset = BranchProtectionRuleset {
@@ -1872,34 +1612,28 @@ mod tests {
         };
         let mut rec = open_record(1, "refs/heads/main", "abc", "psn:a@acme");
 
-        // Nothing green yet → running (2 required, 0 passing).
         let s = rec.checks_summary(&ruleset);
         assert_eq!(s.verdict, ChecksVerdict::Running);
         assert_eq!((s.passing, s.failing, s.total), (0, 0, 2));
 
-        // One green → still running.
         rec.green_contexts = vec!["ci/build".into()];
         assert_eq!(rec.checks_summary(&ruleset).verdict, ChecksVerdict::Running);
 
-        // Both green → pass.
         rec.green_contexts = vec!["ci/build".into(), "ci/test".into()];
         let s = rec.checks_summary(&ruleset);
         assert_eq!(s.verdict, ChecksVerdict::Pass);
         assert_eq!(s.passing, 2);
 
-        // No required contexts + no greens → none.
         let empty_rs = BranchProtectionRuleset {
             required_contexts: vec![],
             ..ruleset.clone()
         };
         let mut fresh = open_record(2, "refs/heads/main", "abc", "psn:a@acme");
         assert_eq!(fresh.checks_summary(&empty_rs).verdict, ChecksVerdict::None);
-        // …but greens on an unrequired ref still read as pass (a green merged PR).
         fresh.green_contexts = vec!["ci/build".into()];
         assert_eq!(fresh.checks_summary(&empty_rs).verdict, ChecksVerdict::Pass);
     }
 
-    /// Minimal recursive file walk (test-only) — returns every file path under `dir`.
     fn walkdir(dir: &std::path::Path) -> Vec<PathBuf> {
         let mut out = Vec::new();
         if let Ok(rd) = std::fs::read_dir(dir) {
@@ -1915,8 +1649,6 @@ mod tests {
         out
     }
 
-    /// (a) **The bypass is CLOSED.** A protected ref defaults CLOSED: a PR carrying NO policy (the author
-    /// cannot set any) is blocked — the repo-owned default requires a non-author approval.
     #[test]
     fn protected_ref_defaults_closed_no_author_policy_can_open_it() {
         let root = temp_root("closed");
@@ -1939,9 +1671,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// (b) The SAME merge succeeds only with GENUINE greens (repo requires ci/build) + a NON-author
-    /// approval — facts from the durable record, required set from REPO policy. A self-approval does NOT
-    /// count.
     #[test]
     fn merge_admits_only_with_genuine_repo_required_checks_and_nonauthor_approval() {
         let root = temp_root("genuine");
@@ -1972,13 +1701,11 @@ mod tests {
             .unwrap();
         let rs = durable_ref_store(repo.clone());
 
-        // No greens, no approval → blocked.
         assert!(matches!(
             merge_pr(&store, &loc(), 1, &rs, &repo, "psn:m@acme").unwrap(),
             MergeAttempt::Blocked(_)
         ));
 
-        // A self-approval by the AUTHOR + greens → still blocked (self-approval does not count).
         let mut rec = store.get(&loc(), 1).unwrap().unwrap();
         rec.green_contexts = vec!["ci/build".into()];
         rec.reviews.push(ReviewRecord {
@@ -1995,7 +1722,6 @@ mod tests {
             "a self-approval must NOT satisfy the approval threshold"
         );
 
-        // A genuine non-author approval + genuine green → admitted, ref advances to c2.
         let mut rec = store.get(&loc(), 1).unwrap().unwrap();
         rec.reviews.push(ReviewRecord {
             reviewer_pseudonym: "psn:reviewer@acme".into(),
@@ -2014,15 +1740,10 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Peer-review finding 2026-07-16 #3: PR-number allocation is FILENAME-authoritative — a corrupt
-    /// highest-numbered record still bumps `max_pr_number`, so its number is never re-issued (which
-    /// would overwrite the live-but-corrupt PR). The authoritative list fails loud on the corruption;
-    /// number allocation independently preserves the occupied filename.
     #[test]
     fn max_pr_number_counts_a_corrupt_record_so_its_number_is_never_reused() {
         let root = temp_root("prnum");
         let store = DurablePrStore::rooted(&root);
-        // Two valid PRs (#1, #2) + a corrupt #3.json (unparseable content).
         store
             .open_pr(
                 &loc(),
@@ -2043,7 +1764,6 @@ mod tests {
             .list_bounded(&loc(), 10, 10 * PR_RECORD_MAX_BYTES)
             .expect_err("the authoritative PR list must surface a corrupt record");
         assert!(list_error.to_string().contains("parse"));
-        // But number allocation counts it → next is #4, NOT #3 (no reuse / no overwrite).
         assert_eq!(
             store.max_pr_number(&loc()).unwrap(),
             Some(3),
@@ -2052,10 +1772,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Peer-review finding 2026-07-16 #1: the approval count must be DISTINCT human non-author
-    /// reviewers — the single-shot review route appends a `ReviewRecord` per submission with no
-    /// uniqueness/agent check, so without de-dup + agent-exclusion a lone reviewer (or an agent)
-    /// could satisfy `required_approvals >= 2`.
     #[test]
     fn counting_approvals_dedups_reviewers_and_excludes_agents() {
         let approve = |who: &str, agent: bool| ReviewRecord {
@@ -2064,7 +1780,6 @@ mod tests {
             is_agent: agent,
         };
 
-        // One HUMAN reviewer approving THREE times counts ONCE (not three).
         let mut rec = open_record(1, "refs/heads/main", &"a".repeat(40), "psn:author@acme");
         rec.reviews.push(approve("psn:rev1@acme", false));
         rec.reviews.push(approve("psn:rev1@acme", false));
@@ -2075,7 +1790,6 @@ mod tests {
             "N approvals by ONE reviewer count once"
         );
 
-        // An AGENT approval never counts (ADR-08 advisory) — even alongside the human.
         rec.reviews.push(approve("psn:agent@acme", true));
         assert_eq!(
             rec.counting_approvals(),
@@ -2083,11 +1797,9 @@ mod tests {
             "an agent approval must not count toward the gate"
         );
 
-        // The AUTHOR's own approval never counts.
         rec.reviews.push(approve("psn:author@acme", false));
         assert_eq!(rec.counting_approvals(), 1, "self-approval must not count");
 
-        // A SECOND distinct human reviewer brings the count to 2 (a real required_approvals>=2 path).
         rec.reviews.push(approve("psn:rev2@acme", false));
         assert_eq!(
             rec.counting_approvals(),
@@ -2096,8 +1808,6 @@ mod tests {
         );
     }
 
-    /// (c) A non-existent or non-descendant head_oid is refused — the protected ref is never advanced to
-    /// an arbitrary oid.
     #[test]
     fn arbitrary_or_nondescendant_head_oid_is_refused() {
         let root = temp_root("head");
@@ -2106,7 +1816,6 @@ mod tests {
         let (c1, c2) = seed_main_then_descendant(&repo);
         let store = DurablePrStore::rooted(&root);
         let rs = durable_ref_store(repo.clone());
-        // Create an UNPROTECTED base ref `feat` at c2 (so the gate admits — isolating the head check).
         rs.receive(
             &PushSession {
                 updates: vec![ProposedRefUpdate {
@@ -2127,7 +1836,6 @@ mod tests {
         )
         .unwrap();
 
-        // A non-existent head → InvalidHead.
         let bogus = "0".repeat(40);
         store
             .open_pr(
@@ -2140,7 +1848,6 @@ mod tests {
             MergeAttempt::InvalidHead(_)
         ));
 
-        // A real commit that is an ANCESTOR (not descendant) of feat's tip c2 → not a fast-forward.
         store
             .open_pr(
                 &loc(),

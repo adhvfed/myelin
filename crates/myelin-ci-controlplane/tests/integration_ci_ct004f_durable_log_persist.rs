@@ -1,25 +1,3 @@
-//! **CT-004f sub-step 4a — the DURABLE `LogPersist` store, PROVEN through the tenant-scoped write.**
-//!
-//! The CI-P20 sibling (`integration_ci_p20_log_pipeline`) proved the frozen `log_segment` /
-//! `log_anchor` bind-param SQL applies + round-trips, but with RAW inline sqlx on a session-GUC
-//! connection — there was no production STORE (the same "model-only, no store" gap CT-004a closed for
-//! metering). This proves the real store ([`myelin_ci_controlplane::DurableLogPersist`]) end to end:
-//!
-//!   1. **The live log path writes the index THROUGH the sink → store, tenant-scoped.** A
-//!      [`LogPipelineSink`] over the real `DurableLogPersist` ships frames + `finish`es a job; the
-//!      sealed `log_segment` + closed `log_anchor` rows land in REAL Postgres via ONE
-//!      `with_tenant_tx` transaction (FORCE-RLS), under the RLS-enforced **app** role (the GUC the
-//!      tenant-scoped tx sets is what admits the write) — a read-back proves the `(job, step,
-//!      byte-range)` index is present, the anchor closed `passed` with a bounded span, 0 dangling.
-//!   2. **A re-delivered finish is idempotent (double-effect 0).** Persisting the SAME flushed index
-//!      twice affects the rows via `ON CONFLICT … DO UPDATE` (the PK upsert) — the row COUNT is
-//!      unchanged (no duplicate segment/anchor), the closed status stays `passed`.
-//!
-//! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
-//!
-//!   eval "$(scripts/dev-stack.sh env)"
-//!   cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_ct004f_durable_log_persist -- --nocapture
 #![cfg(feature = "integration")]
 
 mod common;
@@ -56,8 +34,6 @@ fn schema_name() -> String {
     )
 }
 
-/// A pool whose connections pin `search_path` to the per-pid schema (so the store's UNQUALIFIED
-/// `log_segment`/`log_anchor` resolve to the isolated tables; `public` follows for the RLS helper).
 async fn pool(url: &str, schema: &str) -> sqlx::PgPool {
     let schema = schema.to_owned();
     sqlx::postgres::PgPoolOptions::new()
@@ -75,7 +51,6 @@ async fn pool(url: &str, schema: &str) -> sqlx::PgPool {
         .expect("connect to dev Postgres (is the stack up? eval \"$(scripts/dev-stack.sh env)\")")
 }
 
-/// A stable uuid string from a name (deterministic FNV-1a fill) — the durable id columns are `uuid`.
 fn uid(name: &str) -> String {
     let mut bytes = [0u8; 16];
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -121,8 +96,6 @@ impl LogPersist for SynchronizedResumePersist {
     }
 }
 
-/// Fresh per-pid schema + the REAL CI durable migrations (log_segment/log_anchor with FORCE-RLS) +
-/// grants so the RLS-enforced app role can exercise the tenant-scoped write.
 async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
     admin
         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
@@ -132,8 +105,6 @@ async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
         .execute(format!("CREATE SCHEMA {schema}").as_str())
         .await
         .expect("create the per-pid schema");
-    // Only the log index tables (ci_0007_log_segment / ci_0008_log_anchor) — the rest of the full CI
-    // set is irrelevant here and `job_queue`'s CREATE INDEX CONCURRENTLY cannot run in a tx block.
     for m in ci_controlplane_migrations()
         .0
         .iter()
@@ -144,8 +115,6 @@ async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
             .await
             .unwrap_or_else(|e| panic!("apply CI durable migration {} into the schema: {e}", m.id));
     }
-    // The durable outbox (sub-step 4b: the ci.log.available pointer co-commits here on the SAME tx as
-    // the index rows). Relay-internal, NOT tenant-scoped (no RLS) — created before the grant below.
     admin
         .execute(OUTBOX_MIGRATION)
         .await
@@ -163,8 +132,6 @@ async fn setup_schema(admin: &sqlx::PgPool, schema: &str) {
             .await
             .unwrap_or_else(|error| panic!("scope {table} log-route authority: {error}"));
     }
-    // Grant the RLS-enforced app role access to the schema + its tables (the real tenant-scoped write
-    // runs as this role; FORCE-RLS + the tx GUC — not a grant — is what isolates it to the tenant).
     admin
         .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
         .await
@@ -212,8 +179,6 @@ async fn seed_log_route(
     .expect("seed immutable CI log route");
 }
 
-/// Read back the `(segment_count, anchor_status, anchor_byte_end, dangling)` for a run/job, as the
-/// tenant (RLS: set the GUC on the read connection so the app role can see its own rows).
 async fn read_back(
     app: &sqlx::PgPool,
     tenant: &str,
@@ -250,7 +215,6 @@ async fn read_back(
     .expect("the closed anchor is present");
     let status: String = anchor.get("status");
     let byte_end: Option<i64> = anchor.get("byte_end");
-    // Dangling: an anchor whose closed byte_end exceeds the max sealed segment byte_end.
     let dangling: i64 = sqlx::query(
         "SELECT COUNT(*) AS c FROM log_anchor a WHERE a.byte_end IS NOT NULL AND a.byte_end > \
          (SELECT COALESCE(MAX(byte_end), 0) FROM log_segment s WHERE s.run_id = a.run_id AND s.job_id = a.job_id)",
@@ -262,8 +226,6 @@ async fn read_back(
     (seg_count, status, byte_end, dangling)
 }
 
-/// The count of `ci.log.available` outbox rows for a run/job aggregate (sub-step 4b). The outbox is
-/// relay-internal (no RLS), so no tenant GUC is needed to read it.
 async fn outbox_count(app: &sqlx::PgPool, run: &str, job: &str) -> i64 {
     let aggregate = format!("ci/run/{run}/job/{job}");
     sqlx::query(
@@ -293,10 +255,6 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     let job = uid("ct004f-job");
     seed_log_route(&admin, &tenant, &region, &workflow_run, &run, &job).await;
 
-    // Drive the sink on a DEDICATED off-runtime thread — exactly how the CiRunnerLoop runs it. The
-    // sink holds a `LogPipeline` (non-Send: the firehose uses Rc), so it is CONSTRUCTED inside the
-    // thread (its inputs — pool, region, blobs, rt handle — are all Send) and never crosses a thread.
-    // Off-runtime → `try_current()` is Err → the persist bridge runs `block_on` directly (production).
     let app_for_thread = app.clone();
     let rt = tokio::runtime::Handle::current();
     let (run_c, job_c, tenant_c, region_c) = (
@@ -310,9 +268,6 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     let runner = std::thread::spawn(move || {
         let persist = DurableLogPersist::with_pg(app_for_thread, rt);
         let sink = LogPipelineSink::new(region_c, Arc::new(FsBlobStore::new()), persist);
-        // Ship one frame, then deliberately hold the command open. The test reads PostgreSQL before
-        // allowing finish, proving this is a during-execution durable checkpoint rather than merely
-        // a different post-exit call order.
         sink.ship_frame(
             &run_c,
             &job_c,
@@ -357,9 +312,8 @@ async fn live_log_path_writes_the_index_through_the_tenant_scoped_store() {
     );
     assert_eq!(
         dangling, 0,
-        "0 dangling anchors — every anchor's span is within the sealed bytes"
+        "0 dangling anchors - every anchor's span is within the sealed bytes"
     );
-    // Sub-step 4b: the ci.log.available pointer co-committed to the outbox on the SAME tx.
     assert!(
         outbox_count(&app, &run, &job).await >= 1,
         "a ci.log.available pointer landed in the outbox (co-committed with the index)"
@@ -401,7 +355,7 @@ async fn retried_sink_appends_after_the_committed_live_prefix() {
         first
             .ship_frame(&run_c, &job_c, &tenant_c, b"attempt-one\n")
             .expect("first attempt commits its live prefix");
-        drop(first); // injected runner loss before terminal finish
+        drop(first);
 
         let retry = LogPipelineSink::new(
             region_c,
@@ -662,7 +616,6 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
     let run = uid("ct004f-idem-run");
     let job = uid("ct004f-idem-job");
 
-    // Build a deterministic flushed index from a real pipeline (seal small so multiple segments form).
     let flushed = {
         let mut p = LogPipeline::new(
             tenant.clone(),
@@ -697,8 +650,6 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
     let rt = tokio::runtime::Handle::current();
     let (t1, f1) = (tenant.clone(), flushed.clone());
     let (t2, f2) = (tenant.clone(), flushed.clone());
-    // Persist TWICE (the re-delivered terminal report) on a dedicated off-runtime thread (block_on
-    // direct — the production bridge path).
     std::thread::spawn(move || {
         let persist = DurableLogPersist::with_pg(app_for_thread, rt);
         persist.persist(&t1, f1).expect("first persist");
@@ -718,8 +669,6 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
     );
     assert_eq!(status, "passed");
     assert_eq!(dangling, 0);
-    // Sub-step 4b idempotency: the re-delivered persist did NOT duplicate the outbox pointers — the
-    // deterministic event_id + ON CONFLICT (event_id) DO NOTHING dedups (double-emit 0).
     assert_eq!(
         outbox_count(&app, &run, &job).await as usize,
         flushed.pointers.len(),
@@ -737,10 +686,6 @@ async fn re_delivered_persist_is_idempotent_no_duplicate_rows() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
-    // The mid-stream COALESCE pointer path (segment_ref = None): a long job crosses the byte budget
-    // before a segment seals, so the drained set at finish carries a pointer that names a byte range
-    // with NO sealed-segment ref. This path is reachable via the real sink (drain_pointers returns
-    // ALL buffered pointers at finish) but was previously unexercised end-to-end (verifier gap).
     let schema = schema_name();
     let cleanup_admin = pool(&admin_url(), &schema).await;
     let schema_for_cleanup = schema.clone();
@@ -754,8 +699,6 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
     let run = uid("ct004f-coalesce-run");
     let job = uid("ct004f-coalesce-job");
 
-    // Small COALESCE budget + a LARGE seal threshold → a pointer emits from coalescing (segment_ref
-    // None) with no seal.
     let flushed = {
         let mut p = LogPipeline::new(
             tenant.clone(),
@@ -773,10 +716,9 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
         );
         let coord = LogCoord::new(&run, &job, SINGLE_STEP_ID);
         for _ in 0..4 {
-            p.ship_line(&coord, "0123456789").expect("ship"); // 10 bytes each → crosses the 10-byte budget
+            p.ship_line(&coord, "0123456789").expect("ship");
         }
         p.close_step(&coord, AnchorStatus::Passed).expect("close");
-        // Do NOT flush_job here — we want the pre-seal coalesce pointer, not a seal pointer.
         let pointers = p.drain_pointers();
         assert!(
             pointers.iter().any(|pt| pt.segment_ref.is_none()),
@@ -804,7 +746,6 @@ async fn byte_budget_coalesce_pointer_without_a_seal_persists() {
     .join()
     .expect("the persist thread joins");
 
-    // The segment_ref=None pointer co-committed to the outbox (the anchor closed even with no seal).
     assert_eq!(
         outbox_count(&app, &run, &job).await as usize,
         pointer_count,

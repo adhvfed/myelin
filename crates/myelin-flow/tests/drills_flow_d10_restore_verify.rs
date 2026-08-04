@@ -1,37 +1,3 @@
-//! # FLOW-D10 — restore to a consistent point: in-flight runs resume, no vanished result (P-FLOW-25, M5)
-//!
-//! **Drill catalogue:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` row **FLOW-D10**
-//! (FLOW / F3, SCHED): *"Restore `myelin-flow` PG to a consistent point → in-flight runs resume; store↔outbox
-//! offsets↔referenced rows at one consistent point; no run pointing at a vanished result."* Green artifact:
-//! **restore-verify; consistent point.**
-//!
-//! **Thresholds (exact — NEVER weaken, EI-01 §3):**
-//! - after a restore to the consistent point `T` (the event-log offset, contract 11.5), every IN-FLIGHT
-//!   (non-terminal) run RESUMES — it re-leases + replays its restored `wf_history` to its cursor with
-//!   **0 re-executed side effect** (exactly-once-in-effect, §4.1);
-//! - **no run points at a VANISHED RESULT** — every retained `wf_history` row's referenced result is still
-//!   produced by a retained row (the F-10 no-orphaned-reference leg, §7);
-//! - **store ↔ outbox offsets RECONCILE** — the journal `seq` and the outbox committed offset land at ONE
-//!   point `T` (no emit-without-journal ghost, no journal-without-emit lost write);
-//! - the **restore-verify** telemetry (contract 1.8) emits the dated consistent-point signal (the green
-//!   artifact) with `restore_verify_red_count == 0`.
-//!
-//! ## What this drill proves — the F-10 invariant at the workflow grain (the P-FLOW-24 floor's sibling)
-//! P-FLOW-24 closed the crypto-shred-reach floor (FLOW-D9). This drill is its M5 sibling: it drives the
-//! myelin-flow restore-verify ([`WfRestoreVerify`]) over a crashed-mid-run scenario — a run journals progress,
-//! the worker dies (the un-journaled tail is lost), the store is restored to the consistent point, and the
-//! engine's REAL replay/lease loop resumes the in-flight run. The drill cross-validates this workflow-native
-//! leg against STORAGE's [`restore_to_offset`] + the harness cross-seam assertion (the SAME one STOR-D1 /
-//! SUB-D6 drive) on the SAME consistent-point offset, so the two prove ONE consistent point (coherence,
-//! EI-01 §7 — not a parallel second assertion).
-//!
-//! ## DB-free, real-stack named
-//! The drill operates over the in-memory [`RunStore`] + [`WfJournal`] + [`OutboxStore`] (the restore truncates
-//! them at `T`, modeling `pg_restore` to a PITR target) + the engine's real replay/lease loop. The dated
-//! cell-scale SCHED green artifact against the LIVE `myelin-flow` Postgres restored to a PITR target rides
-//! Storage's STOR-D1/D2 restore-verify at cell scale (already green at P-444); this is the workflow-grain
-//! unit-of-proof that re-runs forever as a `cargo test` drill.
-
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
     run_state, FlowTelemetry, RestoreVerifyFailure, RetryPolicy, RunRow, RunStore, WfCtx,
@@ -72,8 +38,6 @@ fn minter() -> Arc<dyn IdMinter> {
     Arc::new(MonotonicMinter::new())
 }
 
-/// An `n`-activity deterministic body recording which steps actually RAN (vs replayed) — the §4.1
-/// crash-recovery body. Step `k` returns effect ref `myelin://acme/effect/eK`.
 fn n_activity_body(n: usize, ran: Arc<Mutex<Vec<usize>>>) -> Box<WorkflowBody> {
     Box::new(move |ctx: &mut WfCtx| {
         for k in 0..n {
@@ -88,10 +52,6 @@ fn n_activity_body(n: usize, ran: Arc<Mutex<Vec<usize>>>) -> Box<WorkflowBody> {
     })
 }
 
-/// **FLOW-D10 CORE — restore to a consistent point: the in-flight run resumes with 0 double-effect, no
-/// vanished result, store↔outbox reconciled.** A run journals 4 of 7 activities (durable), then the worker
-/// crashes (the un-journaled tail is lost, the run is left `running`). The store is restored to the consistent
-/// point `T`; the post-restore re-drive replays the 4 journaled steps (0 re-execution) and resumes at step 5.
 #[test]
 fn drill_flow_d10_consistent_point_resume() {
     let live_runs = RunStore::new();
@@ -99,8 +59,6 @@ fn drill_flow_d10_consistent_point_resume() {
     let live_outbox = OutboxStore::new();
     let tele = FlowTelemetry::new();
 
-    // (1) An in-flight run journals 4 of 7 activities, then the worker DIES (the run is left `running`,
-    //     cursor 4, holding a now-dead lease). The un-journaled tail (steps 4..=6) was never durable.
     let ran_crash = Arc::new(Mutex::new(Vec::new()));
     let body4 = n_activity_body(4, ran_crash.clone());
     {
@@ -129,8 +87,6 @@ fn drill_flow_d10_consistent_point_resume() {
         "4 journaled at the crash point"
     );
 
-    // (2) RESTORE to the consistent point T (every journal/outbox row at seq <= T retained). T is past the
-    //     4 journaled rows (they survive whole), so the restore retains the durable progress.
     let restore = WfRestore::to_offset(1000);
     let ran_resume = Arc::new(Mutex::new(Vec::new()));
     let bodies = move |wf_type: &str| -> Option<Box<WorkflowBody>> {
@@ -151,7 +107,6 @@ fn drill_flow_d10_consistent_point_resume() {
         &bodies,
     );
 
-    // (3) THE FLOW-D10 ASSERTIONS — the consistent-point restore greened.
     let artifact = outcome
         .artifact()
         .unwrap_or_else(|| panic!("the restore must GREEN, got {:?}", outcome.failure()));
@@ -174,8 +129,6 @@ fn drill_flow_d10_consistent_point_resume() {
         "store↔outbox reconciled at one point"
     );
 
-    // The resumed run replayed steps 0..=3 (0 re-execution) and ran steps 4..=6 live — the §4.1 resume:
-    // exactly 3 new commands executed, 0 journaled side effects re-executed.
     assert_eq!(
         tele.commands_replayed(),
         4,
@@ -192,22 +145,18 @@ fn drill_flow_d10_consistent_point_resume() {
         "0 double-effect across the resume (exactly-once-in-effect)"
     );
 
-    // The dated restore-verify telemetry (the green artifact, contract 1.8).
     assert_eq!(tele.restore_verify_consistent_offset(), 1000);
     assert_eq!(tele.restore_verify_runs_resumed(), 1);
     assert_eq!(tele.restore_verify_green_count(), 1);
     assert_eq!(
         tele.restore_verify_red_count(),
         0,
-        "0 red — the restore landed at one consistent point"
+        "0 red - the restore landed at one consistent point"
     );
 
-    // The resumed run completed (the in-flight run resumed to terminal).
-    let resumed = live_runs.get(&tenant(), "R1"); // NOTE: the gate restored a COPY; the live run is unchanged.
+    let resumed = live_runs.get(&tenant(), "R1");
     assert!(resumed.is_some());
 
-    // (4) Emit the FLOW-D10 survival signal on the SAME assertion library every drill uses (observability is
-    //     part of the pass, EI-01 §3): restore_verify_red_count == 0.
     let mut signals = SignalSource::new();
     signals.set_scalar(
         SignalName::DeadLetterCount,
@@ -224,9 +173,6 @@ fn drill_flow_d10_consistent_point_resume() {
     );
 }
 
-/// **FLOW-D10 — a deliberately-INCONSISTENT restore (a run pointing at a result produced PAST the consistent
-/// point) FAILs the gate (never silently passes).** The orphaned-reference floor — a row at seq <= T
-/// references a result whose producer was truncated past T. The gate makes it LOUD; `run_or_fail` FAILs.
 #[test]
 fn drill_flow_d10_vanished_result_fails_loudly() {
     use myelin_flow::schema::WfHistoryRow;
@@ -236,8 +182,6 @@ fn drill_flow_d10_vanished_result_fails_loudly() {
     let live_outbox = OutboxStore::new();
     let tele = FlowTelemetry::new();
 
-    // A side_marker at seq 2 references "result/future"; the activity_completed that PRODUCES it is at seq 9
-    // (past T=5). After the restore the producer is truncated → seq 2 dangles.
     let marker = WfHistoryRow {
         tenant: tenant(),
         region: region(),
@@ -264,7 +208,7 @@ fn drill_flow_d10_vanished_result_fails_loudly() {
     run.cursor = 1;
     live_runs.put(run);
 
-    let restore = WfRestore::to_offset(5); // truncate the seq-9 producer away.
+    let restore = WfRestore::to_offset(5);
     let bodies = |_: &str| -> Option<Box<WorkflowBody>> { None };
     let err = WfRestoreVerify::new()
         .run_or_fail(
@@ -297,15 +241,8 @@ fn drill_flow_d10_vanished_result_fails_loudly() {
     println!("[2026-06-24] PASS  drill=FLOW-D10  inconsistent_restore=FAILED_LOUDLY  ({err})");
 }
 
-/// **FLOW-D10 cross-validation — STORAGE's restore-to-consistent-point AGREES on the same offset (coherence,
-/// EI-01 §7).** The workflow-grain restore-verify above proves the durable-workflow invariants; this asserts
-/// Storage's [`restore_to_offset`] (the SAME machinery the storage gate STOR-D1 drives) lands a whole
-/// OLTP↔blob↔offset restore at the SAME consistent point with 0 cross-seam mismatch — the two prove ONE
-/// consistent point, never a parallel second assertion.
 #[test]
 fn drill_flow_d10_cross_validates_storage_restore_at_one_point() {
-    // A storage restore to the SAME consistent point T: every referenced blob present, derived ==
-    // source-replay → 0 dangling (the §7.3 consistent-point restore).
     let mut arch = ContinuousArchiver::new();
     arch.archive_segment(WalSegment {
         end_offset: 0,
@@ -347,7 +284,7 @@ fn drill_flow_d10_cross_validates_storage_restore_at_one_point() {
             id: "r-future".into(),
             written_at: 250,
             blob_ref: None,
-        }, // > T → truncated
+        },
     ];
 
     let report = restore_to_offset(&arch, 100, &rows, &presence, &source, &kms)
@@ -360,12 +297,9 @@ fn drill_flow_d10_cross_validates_storage_restore_at_one_point() {
     );
     assert_eq!(
         report.dangling_ref_count, 0,
-        "0 dangling — every referenced blob present"
+        "0 dangling - every referenced blob present"
     );
 
-    // Feed the storage restore into the harness cross-seam assertion (the SAME one SUB-D6 / STOR-D1 drive)
-    // — 0 mismatches ⇒ OLTP↔blob↔index↔offset at ONE consistent point. This is the coherence cross-check:
-    // the workflow-grain restore-verify and storage's restore agree on the consistent-point posture.
     let mut b = RestoredSnapshot::builder(report.restored_to_offset);
     for blob in [&blob_a_addr, &blob_b_addr] {
         b = b.blob(blob.to_multihash_string());
@@ -390,8 +324,6 @@ fn drill_flow_d10_cross_validates_storage_restore_at_one_point() {
     println!("[2026-06-24] PASS  drill=FLOW-D10  cross_validate=storage_restore  consistent_point=T100  cross_seam_mismatches=0");
 }
 
-/// The drill REGISTERS into the M0 permanent-drill registry so it re-runs forever (EI-01 §3/§5) — a
-/// regression on the restore-verify consistent-point path re-reds it loudly.
 #[test]
 fn flow_d10_registers_into_the_permanent_drill_suite() {
     use myelin_harness::{DrillRegistry, DrillScenario};
@@ -405,7 +337,6 @@ fn flow_d10_registers_into_the_permanent_drill_suite() {
             let live_outbox = OutboxStore::new();
             let tele = FlowTelemetry::new();
 
-            // an in-flight run with 2 journaled steps, crashed.
             let ran = Arc::new(Mutex::new(Vec::new()));
             let body2 = n_activity_body(2, ran);
             {
@@ -474,8 +405,6 @@ fn flow_d10_registers_into_the_permanent_drill_suite() {
     println!("{}", results[0].artifact_row("2026-06-24"));
 }
 
-/// A run that is already TERMINAL (completed) is not re-driven on restore — the gate greens with 0 resumed
-/// (a settled run is not an in-flight run).
 #[test]
 fn drill_flow_d10_terminal_run_not_resumed() {
     use myelin_flow::schema::WfHistoryRow;

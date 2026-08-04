@@ -1,9 +1,3 @@
-//! **The ROLLING-UPGRADE migration proof (CT-004d.2).** The existing migration tests prove a FRESH
-//! bootstrap applies the whole set. This proves the UPGRADE path from the already-shipped completion
-//! WIP: apply the sequence with `ci_0004a`/`ci_0015a`/`ci_0016a`, then apply the full set. Those
-//! shared ids checksum-match and the new additive migrations add nonce authority, queued-run
-//! discovery, and active-workflow recovery. This is the checked invariant behind editing NO
-//! applied migration DDL (the base creates stay byte-frozen).
 #![cfg(feature = "integration")]
 
 mod common;
@@ -48,7 +42,6 @@ async fn pinned_pool(schema: &str) -> PgPool {
         .expect("connect schema-pinned admin pool (is the dev stack up?)")
 }
 
-/// The additive follow-ons; every other migration id/DDL represents the deployed WIP schema.
 const NEW_SUB_MIGRATION_IDS: &[&str] = &[
     CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
     CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
@@ -61,7 +54,6 @@ const NEW_SUB_MIGRATION_IDS: &[&str] = &[
     CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID,
 ];
 
-/// The full set with the new sub-migrations filtered OUT — the sequence a pre-CT-004d.2 deploy applied.
 fn old_sequence() -> Migrations {
     Migrations::of(
         ci_controlplane_migrations()
@@ -104,9 +96,6 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     with_schema_cleanup(&cleanup_bare, &schema_for_cleanup, move || async move {
     let pool = pinned_pool(&schema).await;
 
-    // CI's recovery-route follow-ons intentionally target Flow's authoritative workflow_run table.
-    // Install that prerequisite in the same isolated schema so this proof cannot mutate or inherit
-    // policies/indexes from public.workflow_run.
     PgMigrator::apply_validated(
         &pool,
         &myelin_flow::migrations::migrations(),
@@ -115,13 +104,7 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     .await
     .expect("the isolated Flow prerequisite applies");
 
-    // Steps 1–4 are ONE locked region. `old_sequence()` filters only nine migration ids and still
-    // contains the `myelin_ci_region_scheduler` grant migrations, so its grants are live from step 1
-    // onward; locking only the step-2 apply left them exposed to every concurrently-booting
-    // scheduler probe throughout the step-1 assertions. The helper revokes once, after step 4, and
-    // only then releases the lock.
     common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
-    // ── 1. Apply the already-shipped WIP sequence (including immutable a-suffix migrations). ──
     PgMigrator::apply_validated(&pool, &old_sequence(), &ci_controlplane_hot_tables())
         .await
         .expect("the already-shipped completion WIP sequence applies");
@@ -144,8 +127,6 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
         "the deployed WIP schema predates producer-authored PR ordering authority"
     );
 
-    // ── 2. Apply the NEW full set over the old schema — the shared applied ids checksum-match (the base
-    //       a-suffix DDL is byte-frozen), and only the additive follow-ons apply. ──
     PgMigrator::apply_validated(
         &pool,
         &ci_controlplane_migrations(),
@@ -154,7 +135,6 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     .await
     .expect("the NEW full set applies forward-only over the old schema (no checksum conflict)");
 
-    // ── 3. The new columns now exist (the rolling upgrade converged on the fresh-bootstrap shape). ──
     assert!(
         column_exists(&pool, &schema, "ci_job_spec", "stage").await,
         "ci_0015a added ci_job_spec.stage on the upgrade"
@@ -192,7 +172,6 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
         "ci_0001d added producer-authored PR ordering authority on the upgrade"
     );
 
-    // ── 4. Idempotent re-apply is a clean no-op (every id already recorded). ──
     PgMigrator::apply_validated(
         &pool,
         &ci_controlplane_migrations(),
@@ -204,12 +183,6 @@ async fn claim_authority_followons_preserve_applied_wip_checksums() {
     .await;
 
     pool.close().await;
-    // NOTE: do NOT close `bare` here — `cleanup_bare` (passed to `with_schema_cleanup` above) is a
-    // `.clone()` of `bare`, sharing the SAME underlying pool. `PgPool::close()` shuts the whole shared
-    // pool down for every clone, which would silently break the wrapper's own post-body `DROP SCHEMA`
-    // (its error is deliberately swallowed by `with_schema_cleanup`, so this failed with no visible
-    // signal — exactly the kind of silent leak this retrofit exists to prevent). Let `bare` drop
-    // normally; the wrapper closes/drops the schema through `cleanup_bare` after this closure returns.
     })
     .await;
 }

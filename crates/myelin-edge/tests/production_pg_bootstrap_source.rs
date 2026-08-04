@@ -1,5 +1,3 @@
-//! Deployment guards for the Edge binary and founder-dogfood split-credential handoff.
-
 #[test]
 fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind() {
     let source = include_str!("../src/main.rs");
@@ -102,14 +100,8 @@ fn production_edge_mounts_the_repo_authorized_durable_ci_reads() {
     assert!(route.contains("/v1/ci/runs"));
     assert!(route.contains("/v1/ci/runs/{run}"));
     assert!(route.contains("visible_repo_slugs_for_ci(ctx.principal)"));
-    // `authorized_repo_ref` centralizes the per-run repo authorization check so the run-view,
-    // log-archive, and log-tail (including its poll-loop re-check) call sites share one
-    // enforcement point instead of duplicating it; it takes a `&Principal` rather than the
-    // HTTP `ctx` so the poll loop (which no longer has a `ctx`) can reuse it too.
     assert!(route.contains("may_view_ci_repo(principal, repo_slug)"));
     assert!(route.contains("fn authorized_repo_ref("));
-    // Every read entry point must still feed the *authenticated request's* principal
-    // (ctx.principal) into that shared, authorizing helper — never a query-param-derived one.
     assert!(route.contains("self.api.read_run(ctx.principal, run_id)"));
     assert!(route.contains(".open_log_tail(ctx.principal, run_id, job_id, cursor)"));
     assert!(route.contains(".read_log(ctx.principal, run_id, job_id, request.start, request.limit)"));
@@ -157,7 +149,6 @@ fn production_runtime_identity_and_git_storage_are_explicit_before_database_boot
 fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallback() {
     let main = include_str!("../src/main.rs");
     let adapter = include_str!("../src/issue_authz.rs");
-    let dogfood = include_str!("../../../scripts/dogfood.sh");
 
     assert!(main.contains("StoreBackedIssueAuthorizer::new(check.clone())"));
     assert!(main.contains("myelin_issues::PgIssueStore::new("));
@@ -191,7 +182,6 @@ fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallb
     assert!(adapter.contains("VisibleIssues::effective_issue_view_filter()"));
     assert!(!adapter.contains("Ok(VisibleIssues::All)"));
     assert!(adapter.contains("MYELIN_ISSUES_RECONCILE_TENANTS"));
-    assert!(dogfood.contains("export MYELIN_ISSUES_RECONCILE_TENANTS="));
 }
 
 #[test]
@@ -208,43 +198,6 @@ fn production_git_wire_binds_the_verified_principal_to_the_live_identity_minter(
     assert!(main.contains(".with_git_wire_credential_issuer(git_wire_credentials)"));
     assert!(durable.contains("self.git_wire_credentials.bind(principal)"));
     assert!(http.contains(".wire_serving(ctx.principal)"));
-}
-
-#[test]
-fn dogfood_exports_distinct_runtime_and_migration_credentials() {
-    let dev_stack = include_str!("../../../scripts/dev-stack.sh");
-    let dogfood = include_str!("../../../scripts/dogfood.sh");
-
-    assert!(dev_stack.contains(
-        "export DATABASE_URL=\"postgres://myelin_app:myelin_app_pw@localhost:5433/myelin\""
-    ));
-    assert!(dev_stack.contains(
-        "export DATABASE_MIGRATION_URL=\"postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin\""
-    ));
-    assert!(!dogfood.contains("DATABASE_URL_ADMIN"));
-    assert!(!dogfood.contains("db_app/myelin_app"));
-    assert!(!dogfood.contains("export DATABASE_URL=\"${db_admin}\""));
-}
-
-#[test]
-fn founder_issue_identifiers_and_bootstrap_default_cannot_drift() {
-    const PROJECT: &str = "20aee030-c7fa-4757-8243-700faf528690";
-    const ISSUE_TYPE: &str = "7d457754-f6a1-4cd8-8738-21751570b627";
-
-    let dogfood = include_str!("../../../scripts/dogfood.sh");
-    let runbook = include_str!("../../../docs/dogfood.md");
-
-    for value in [PROJECT, ISSUE_TYPE] {
-        assert!(dogfood.contains(value));
-        assert!(runbook.contains(value));
-    }
-    assert!(dogfood.contains("DOGFOOD_ISSUES_PREFIX=\"MYL\""));
-    assert!(runbook.contains("PREFIX=MYL"));
-    assert!(dogfood.contains("set -- \"$@\" --issues-project \"${MYELIN_DOGFOOD_ISSUES_PROJECT}\""));
-    assert!(!dogfood.contains("11111111-1111-1111-1111-111111111111"));
-    assert!(!dogfood.contains("22222222-2222-2222-2222-222222222222"));
-    assert!(!runbook.contains("11111111-1111-1111-1111-111111111111"));
-    assert!(!runbook.contains("22222222-2222-2222-2222-222222222222"));
 }
 
 #[test]

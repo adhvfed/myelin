@@ -30,8 +30,6 @@ impl MergeCommandResult {
     }
 }
 
-/// Replace compatibility-era PR check arrays with the durable projection snapshot used at the
-/// merge-intent boundary. Only settled successes can become gate-green.
 pub(super) fn overlay_projected_checks(
     record: &mut PrRecord,
     rows: impl IntoIterator<Item = CheckStatusRow>,

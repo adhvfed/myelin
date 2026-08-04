@@ -1,17 +1,3 @@
-//! # CDC — contract 7.8 `DeliveryAdapter` under the REAL EU-sovereign provider (NOTIF-P26 / P-468)
-//!
-//! **Architecture:** `notifications.md` §3.6 (the EU-sovereign delivery fabric — ONE trait
-//! `DeliveryAdapter{channel, region, send(RedactedMessage, idem_key), receipts}`, EU-preferring,
-//! region-aware, swappable; off-cell redacted; at-least-once + idempotent) + §10 row 2 (the concrete
-//! production EU provider — `[OPEN — LEGAL]`). **Contract:** **7.8** (CONSUMED — the real provider
-//! swaps into the SAME frozen trait via the strategy pattern, NO shape change).
-//!
-//! This CDC pins the 7.8 seam from the REAL-PROVIDER side: the production [`EuSovereignAdapter`]
-//! implements the SAME `DeliveryAdapter` signature the mock did (`channel`/`region`/`send` →
-//! `Receipt`), the [`DeliveryFabric`] dispatches to it by channel, and the same at-least-once +
-//! idempotent + EU-preferring + off-cell-redacted PROPERTIES hold. A drift on the trait signature
-//! breaks THIS build (the swap-is-a-config-change, never-a-code-change mandate, ADR-12.8).
-
 use myelin_notif::prefs::Channel;
 use myelin_notif::{
     build_idem_key, is_eu_region, redact_for_offcell, Class, DeliveryAdapter, DeliveryFabric,
@@ -32,12 +18,10 @@ fn summary() -> HumanisedString {
     }
 }
 
-/// **The real EU provider satisfies the frozen 7.8 trait + the at-least-once + idempotent property.**
 #[test]
 fn real_provider_is_at_least_once_and_idempotent_over_the_frozen_trait() {
     let ledger = DeliveryLedger::new();
     let transport = RecordingEuTransport::new("eu-mailer");
-    // The real adapter registers over the SAME `DeliveryAdapter` trait the mock used (the swap point).
     let real: Arc<dyn DeliveryAdapter + Send + Sync> = Arc::new(EuSovereignAdapter::new(
         Channel::Email,
         Region("fr-par".into()),
@@ -66,7 +50,6 @@ fn real_provider_is_at_least_once_and_idempotent_over_the_frozen_trait() {
     );
 }
 
-/// **The real provider is region-aware + EU-preferring (the §3.6/§10 sovereignty posture).**
 #[test]
 fn real_provider_is_eu_preferring() {
     let real = EuSovereignAdapter::new(
@@ -82,7 +65,6 @@ fn real_provider_is_eu_preferring() {
     assert!(real.guard_region().is_ok());
 }
 
-/// **The real provider carries ONLY a RedactedMessage off-cell (`redacted=true`) — the wire is frozen.**
 #[test]
 fn real_provider_offcell_is_redacted() {
     let ledger = DeliveryLedger::new();

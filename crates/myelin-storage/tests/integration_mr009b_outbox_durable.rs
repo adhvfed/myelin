@@ -1,24 +1,3 @@
-//! # MR-009b W3b.2 — the durable `outbox` backing (`PgOutboxBacking`), proven against LIVE Postgres.
-//!
-//! The **CDC PARITY SUITE** the W3b design contract requires: ONE set of observable-behavior
-//! assertions run against BOTH backends — the in-memory `OutboxStore::new()` and the durable
-//! `OutboxStore::durable(PgOutboxBacking)` over real Postgres — asserting they are
-//! byte-for-byte-equivalent at the seam. Plus the durable-only live gates the memory model cannot
-//! reach: gap-free per-aggregate seq under CONCURRENT committers (EB-03, durably), and
-//! crash-window re-publish idempotency (0 ghost / 0 lost across a killed relay tx).
-//!
-//! Proven behaviors (each asserted for BOTH backends unless marked durable-only):
-//!   1. commit atomicity — an aborted (dropped, un-committed) transaction stages NOTHING;
-//!   2. duplicate-`event_id` REJECTION — a duplicate id ERRORS the whole commit (not
-//!      `ON CONFLICT DO NOTHING`), staging nothing (the W3b.1 verifier's open question, resolved);
-//!   3. per-aggregate seq gap-free + true-commit-order, incl. under CONCURRENT committers (EB-03);
-//!   4. depth / age / committed_rows / committed_count read parity;
-//!   5. drain claim → publish → mark-sent → dead-letter counts vs `MAX_PUBLISH_ATTEMPTS`;
-//!   6. crash-window re-publish idempotency (durable-only; mirrors `relay_once_crash_after`).
-//!
-//! Run against the dev stack:
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-storage --features integration --test integration_mr009b_outbox_durable -- --nocapture
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,16 +18,11 @@ use myelin_tenancy::{Region, TenantId};
 
 use sqlx::postgres::PgPool;
 
-// ----------------------------------------------------------------------------------------------
-// shared helpers
-// ----------------------------------------------------------------------------------------------
-
 fn admin_url(cfg: &MyelinConfig) -> String {
     cfg.database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// Serializes the durable tests (they share the ONE `outbox` table and TRUNCATE it for isolation).
 fn db_lock() -> &'static tokio::sync::Mutex<()> {
     static L: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     L.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -131,8 +105,6 @@ fn staged_row(id: &str, aggregate: &str) -> OutboxRow {
     }
 }
 
-/// A minter that ALWAYS returns the same ULID — forces a duplicate `event_id` for the rejection
-/// parity test (the production `MonotonicMinter` can never collide).
 struct StuckMinter(String);
 impl IdMinter for StuckMinter {
     fn mint(&self) -> Ulid {
@@ -140,8 +112,6 @@ impl IdMinter for StuckMinter {
     }
 }
 
-/// The structural identity of a row (ignores `published_at`, which differs by wall-clock between
-/// the memory arm's injected test clock and the durable arm's `now()`).
 fn key(r: &OutboxRow) -> (String, String, u64) {
     (r.event_id.0.clone(), r.aggregate.0.clone(), r.seq)
 }
@@ -153,7 +123,6 @@ async fn ensure_foundation(pool: &PgPool) {
         .expect("apply OUTBOX_MIGRATION");
 }
 
-/// A FRESH durable store over a truncated `outbox` table (call while holding `db_lock`).
 async fn fresh_durable_store(pool: &PgPool) -> OutboxStore {
     sqlx::query("TRUNCATE outbox")
         .execute(pool)
@@ -163,23 +132,10 @@ async fn fresh_durable_store(pool: &PgPool) -> OutboxStore {
     OutboxStore::durable(Arc::new(backing))
 }
 
-/// The per-pid schema this binary's `outbox` lives in.
-///
-/// **Test-isolation (2026-07 re-prosecution finding):** these tests leave UNSENT rows in the `outbox`
-/// (e.g. `concurrent_seq_scenario` commits 32 rows and never drains them). In the shared `public.outbox`
-/// those rows RACE cross-binary with WHOLE-TABLE relay/count ops in OTHER integration binaries
-/// (`smoke_backends::pg_outbox_relay_drains_to_bus` claims up to 16 whole-table rows and asserts n==2;
-/// `integration_mr023_events_serve` counts `outbox_depth`). Pinning every connection here to a per-pid
-/// schema keeps this binary's rows OUT of `public.outbox`, so those cross-binary whole-table assertions
-/// are deterministic. `db_lock` still serializes WITHIN this binary; the per-pid schema isolates ACROSS.
 fn schema() -> String {
     format!("mr009b_outbox_{}", std::process::id())
 }
 
-/// Serializes the one-time per-pid schema + foundation-table creation across this binary's
-/// concurrently-starting tests (each calls `connect()` BEFORE acquiring `db_lock`). `CREATE SCHEMA /
-/// TABLE IF NOT EXISTS` are NOT atomic in Postgres (the existence check races the insert → 23505), so
-/// setup runs exactly once under this guard rather than racing.
 fn setup_once() -> &'static tokio::sync::Mutex<bool> {
     static S: OnceLock<tokio::sync::Mutex<bool>> = OnceLock::new();
     S.get_or_init(|| tokio::sync::Mutex::new(false))
@@ -225,16 +181,8 @@ fn minter() -> Arc<dyn IdMinter> {
     Arc::new(MonotonicMinter::new())
 }
 
-// ----------------------------------------------------------------------------------------------
-// (1) commit atomicity + (4) read parity + drain-to-empty — asserted for BOTH backends.
-// ----------------------------------------------------------------------------------------------
-
-/// The full commit → read → drain scenario, written once against the public `OutboxStore` API so it
-/// runs UNCHANGED on the memory arm and the durable arm. Returns the observed committed-row keys so
-/// the caller can assert cross-backend parity.
 fn commit_read_drain_scenario(store: &OutboxStore) -> Vec<(String, String, u64)> {
     let m = minter();
-    // Commit 2 events to aggregate A and 1 to aggregate B in ONE transaction.
     let mut tx = store.begin(m, ctx_base());
     tx.stage_state_change("state");
     let a0 = tx
@@ -246,11 +194,9 @@ fn commit_read_drain_scenario(store: &OutboxStore) -> Vec<(String, String, u64)>
     let a1 = tx
         .emit(draft("issues.issue.updated", "issue:A"), None)
         .unwrap();
-    // emit-iff-committed: nothing durable before commit.
     assert_eq!(store.outbox_depth(), 0, "open tx wrote nothing");
     tx.commit().unwrap();
 
-    // reads: depth, committed_count, per-aggregate gap-free seq.
     assert_eq!(store.outbox_depth(), 3);
     assert_eq!(store.committed_count(), 3);
     assert_eq!(store.row(&a0).unwrap().seq, 0, "A seq 0");
@@ -263,7 +209,6 @@ fn commit_read_drain_scenario(store: &OutboxStore) -> Vec<(String, String, u64)>
     );
     assert_eq!(store.dead_letter_count(), 0);
 
-    // drain to a reachable broker: every row delivered exactly once, depth → 0.
     let bus = InProcessBus::new();
     let relay = Relay::new(store.clone(), bus.clone(), || {
         Timestamp("2026-06-19T00:00:09Z".into())
@@ -281,10 +226,8 @@ fn commit_read_drain_scenario(store: &OutboxStore) -> Vec<(String, String, u64)>
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn cdc_parity_commit_reads_and_drain() {
-    // memory arm.
     let mem_keys = commit_read_drain_scenario(&OutboxStore::new());
 
-    // durable arm (real PG) — identical observable behavior.
     let pool = connect().await;
     let _guard = db_lock().lock().await;
     let store = fresh_durable_store(&pool).await;
@@ -294,12 +237,8 @@ async fn cdc_parity_commit_reads_and_drain() {
         mem_keys, dur_keys,
         "CDC parity: memory and durable committed_rows are identical (event_id, aggregate, seq)"
     );
-    eprintln!("PARITY OK — commit/reads/drain identical across memory + real-PG backends");
+    eprintln!("PARITY OK - commit/reads/drain identical across memory + real-PG backends");
 }
-
-// ----------------------------------------------------------------------------------------------
-// (1) abort stages nothing — BOTH backends.
-// ----------------------------------------------------------------------------------------------
 
 fn abort_stages_nothing_scenario(store: &OutboxStore) {
     {
@@ -307,7 +246,6 @@ fn abort_stages_nothing_scenario(store: &OutboxStore) {
         tx.stage_state_change("aborted");
         tx.emit(draft("issues.issue.created", "issue:GHOST"), None)
             .unwrap();
-        // dropped WITHOUT commit.
     }
     assert_eq!(store.outbox_depth(), 0, "aborted tx wrote no event");
     assert_eq!(store.committed_count(), 0, "no ghost row");
@@ -324,26 +262,15 @@ async fn cdc_parity_abort_stages_nothing() {
     abort_stages_nothing_scenario(&store);
 }
 
-// ----------------------------------------------------------------------------------------------
-// (2) duplicate-event_id REJECTION (error, not ON CONFLICT DO NOTHING) — BOTH backends.
-// ----------------------------------------------------------------------------------------------
-
 fn duplicate_rejected_scenario(store: &OutboxStore) {
-    // The realistic duplicate-`event_id` case both arms share: a SECOND transaction re-emits an
-    // id that a FIRST transaction already durably committed. (The in-memory arm's uniqueness check
-    // is against already-committed rows, `Inner::rows`; a within-one-batch duplicate is a
-    // programming error the monotonic minter makes impossible and the arm does not screen. So the
-    // meaningful, observable parity is the cross-transaction duplicate → both REJECT.)
     let stuck: Arc<dyn IdMinter> = Arc::new(StuckMinter(format!("01JDUP{}", uniq())));
 
-    // tx1: commit id X.
     let mut tx1 = store.begin(Arc::clone(&stuck), ctx_base());
     tx1.emit(draft("issues.issue.created", "issue:DUP"), None)
         .unwrap();
     tx1.commit().unwrap();
     assert_eq!(store.committed_count(), 1);
 
-    // tx2: re-emit the SAME id X → the whole commit is REJECTED (not ON CONFLICT DO NOTHING).
     let mut tx2 = store.begin(Arc::clone(&stuck), ctx_base());
     tx2.emit(draft("issues.issue.updated", "issue:DUP"), None)
         .unwrap();
@@ -353,7 +280,6 @@ fn duplicate_rejected_scenario(store: &OutboxStore) {
         "duplicate event_id must ERROR the whole commit, got: {}",
         err.0
     );
-    // atomicity: the rejected commit staged NOTHING new — the original row is untouched.
     assert_eq!(
         store.outbox_depth(),
         1,
@@ -370,28 +296,18 @@ async fn cdc_parity_duplicate_event_id_rejected() {
     let _guard = db_lock().lock().await;
     let store = fresh_durable_store(&pool).await;
     duplicate_rejected_scenario(&store);
-    eprintln!("PARITY OK — duplicate event_id REJECTED (not silently ignored) on both backends");
+    eprintln!("PARITY OK - duplicate event_id REJECTED (not silently ignored) on both backends");
 }
-
-// ----------------------------------------------------------------------------------------------
-// (2b) H1 (peer-review #7 re-prosecution) — ABSORB-mode commit: a byte-identical deterministic
-//      re-emit is ABSORBED (Ok, no duplicate, no livelock); a DIVERGENT payload under the SAME id is
-//      STILL REJECTED (the payload-equality safety that keeps absorb from silently swallowing a
-//      genuine collision) — BOTH backends.
-// ----------------------------------------------------------------------------------------------
 
 fn absorb_scenario(store: &OutboxStore) {
     let stuck: Arc<dyn IdMinter> = Arc::new(StuckMinter(format!("01JABS{}", uniq())));
 
-    // tx1: commit id X with draft A.
     let mut tx1 = store.begin(Arc::clone(&stuck), ctx_base());
     tx1.emit(draft("issues.issue.created", "issue:ABS"), None)
         .unwrap();
     tx1.commit().unwrap();
     assert_eq!(store.committed_count(), 1);
 
-    // tx2: ABSORB the SAME id X with the SAME draft (a byte-identical crash-window re-emit) → Ok,
-    // NOT the reject-arm Err → no `Retry` livelock. No duplicate row.
     let mut tx2 = store.begin(Arc::clone(&stuck), ctx_base());
     tx2.emit(draft("issues.issue.created", "issue:ABS"), None)
         .unwrap();
@@ -399,8 +315,6 @@ fn absorb_scenario(store: &OutboxStore) {
         .expect("H1: byte-identical deterministic re-emit is ABSORBED (no livelock)");
     assert_eq!(store.committed_count(), 1, "absorb added NO duplicate");
 
-    // tx3: a DIVERGENT payload under the SAME id X → STILL REJECTED (payload-equality safety: absorb
-    // must not silently swallow a genuine id collision with a different payload).
     let mut tx3 = store.begin(Arc::clone(&stuck), ctx_base());
     tx3.emit(draft("issues.issue.updated", "issue:ABS"), None)
         .unwrap();
@@ -426,14 +340,10 @@ async fn cdc_parity_absorb_mode_idempotent_but_rejects_divergent_payload() {
     let store = fresh_durable_store(&pool).await;
     absorb_scenario(&store);
     eprintln!(
-        "PARITY OK (H1) — absorb-mode ABSORBS a byte-identical re-emit (no livelock) but REJECTS a \
+        "PARITY OK (H1) - absorb-mode ABSORBS a byte-identical re-emit (no livelock) but REJECTS a \
          divergent-payload collision, on both backends"
     );
 }
-
-// ----------------------------------------------------------------------------------------------
-// (5) bounded retries → dead-letter at MAX_PUBLISH_ATTEMPTS — BOTH backends.
-// ----------------------------------------------------------------------------------------------
 
 fn dead_letter_scenario(store: &OutboxStore) {
     let mut tx = store.begin(minter(), ctx_base());
@@ -444,12 +354,11 @@ fn dead_letter_scenario(store: &OutboxStore) {
     assert_eq!(store.outbox_depth(), 1);
 
     let bus = InProcessBus::new();
-    bus.sever(); // broker permanently down for this row.
+    bus.sever();
     let relay = Relay::new(store.clone(), bus.clone(), || {
         Timestamp("2026-06-19T00:00:09Z".into())
     });
 
-    // Each pass is one failed attempt; the MAX_PUBLISH_ATTEMPTS-th pass dead-letters.
     for pass in 1..=MAX_PUBLISH_ATTEMPTS {
         let r = relay.drain_once();
         if pass < MAX_PUBLISH_ATTEMPTS {
@@ -477,7 +386,6 @@ fn dead_letter_scenario(store: &OutboxStore) {
         "attempts hit the bound"
     );
     assert_eq!(dl[0].event_id, id);
-    // a dead-lettered row reads as absent from the live set (parity with the memory arm).
     assert!(store.row(&id).is_none(), "dead row absent from live rows");
     assert_eq!(
         store.committed_count(),
@@ -494,12 +402,8 @@ async fn cdc_parity_dead_letter_at_max_attempts() {
     let _guard = db_lock().lock().await;
     let store = fresh_durable_store(&pool).await;
     dead_letter_scenario(&store);
-    eprintln!("PARITY OK — dead-letter at MAX_PUBLISH_ATTEMPTS identical across backends");
+    eprintln!("PARITY OK - dead-letter at MAX_PUBLISH_ATTEMPTS identical across backends");
 }
-
-// ----------------------------------------------------------------------------------------------
-// (3) EB-03 — per-aggregate seq gap-free + no-dup under CONCURRENT committers — BOTH backends.
-// ----------------------------------------------------------------------------------------------
 
 async fn concurrent_seq_scenario(store: &OutboxStore, n: u64) {
     let m = minter();
@@ -508,8 +412,6 @@ async fn concurrent_seq_scenario(store: &OutboxStore, n: u64) {
     for _ in 0..n {
         let store = store.clone();
         let m = Arc::clone(&m);
-        // A spawned task runs on a runtime worker, so the durable arm's internal
-        // block_in_place + block_on bridge is valid (the sanctioned sync→async pattern).
         handles.push(tokio::spawn(async move {
             let mut tx = store.begin(m, ctx_base());
             let id = tx.emit(draft("issues.issue.updated", hot), None).unwrap();
@@ -533,15 +435,13 @@ async fn concurrent_seq_scenario(store: &OutboxStore, n: u64) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn eb03_seq_gap_free_under_concurrent_committers_both_backends() {
-    // memory arm (the events unit test proves 64; re-prove through this harness at 32).
     concurrent_seq_scenario(&OutboxStore::new(), 32).await;
 
-    // durable arm — the EB-03 gate re-run DURABLY against real PG under true concurrency.
     let pool = connect().await;
     let _guard = db_lock().lock().await;
     let store = fresh_durable_store(&pool).await;
     concurrent_seq_scenario(&store, 32).await;
-    eprintln!("EB-03 OK (DURABLE) — gap-free per-aggregate seq under 32 concurrent PG committers");
+    eprintln!("EB-03 OK (DURABLE) - gap-free per-aggregate seq under 32 concurrent PG committers");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
@@ -615,17 +515,12 @@ async fn domain_batch_and_ordinary_staged_writer_share_the_same_aggregate_lock()
     );
 }
 
-// ----------------------------------------------------------------------------------------------
-// (6) crash-window re-publish idempotency (durable-only) — mirrors relay_once_crash_after.
-// ----------------------------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn crash_window_republish_is_idempotent_zero_ghost_zero_lost() {
     let pool = connect().await;
     let _guard = db_lock().lock().await;
     let store = fresh_durable_store(&pool).await;
 
-    // Commit 4 events through the durable store (co-committed, emit-iff-committed).
     let m = minter();
     let mut tx = store.begin(m, ctx_base());
     let mut ids = Vec::new();
@@ -641,18 +536,15 @@ async fn crash_window_republish_is_idempotent_zero_ghost_zero_lost() {
     let bus = InProcessBus::new();
     let relay = PgRelay::new(pool.clone());
 
-    // CRASH mid-drain: publish 2 rows to the broker, then drop the tx WITHOUT committing the
-    // published_at marks (the worst-case silent-data-loss window).
     let published_before_crash = relay
         .relay_once_crash_after(&bus, 16, 2)
         .await
         .expect("crash drain");
     assert_eq!(published_before_crash, 2, "2 forwarded before the crash");
-    // The marks rolled back: all 4 rows are still unsent (0 lost).
     assert_eq!(
         store.outbox_depth(),
         4,
-        "0 lost — crash rolled back the marks"
+        "0 lost - crash rolled back the marks"
     );
     assert_eq!(
         bus.delivered_count(),
@@ -660,8 +552,6 @@ async fn crash_window_republish_is_idempotent_zero_ghost_zero_lost() {
         "2 delivered to the broker pre-crash"
     );
 
-    // RESTART: drain again. The 2 re-claimed already-delivered rows are DEDUPLICATED (0 ghost),
-    // the other 2 are freshly published — every committed event delivered exactly once.
     let report = Relay::new(store.clone(), bus.clone(), || {
         Timestamp("2026-06-19T00:00:09Z".into())
     })
@@ -676,7 +566,7 @@ async fn crash_window_republish_is_idempotent_zero_ghost_zero_lost() {
     assert_eq!(
         bus.delivered_count(),
         4,
-        "exactly 4 delivered — 0 ghost / 0 lost across the crash window"
+        "exactly 4 delivered - 0 ghost / 0 lost across the crash window"
     );
     let delivered = bus.delivered_ids();
     for id in &ids {
@@ -685,5 +575,5 @@ async fn crash_window_republish_is_idempotent_zero_ghost_zero_lost() {
             "every committed event was delivered"
         );
     }
-    eprintln!("SUB-D1 OK (DURABLE) — crash-window re-publish idempotent: 0 ghost / 0 lost");
+    eprintln!("SUB-D1 OK (DURABLE) - crash-window re-publish idempotent: 0 ghost / 0 lost");
 }

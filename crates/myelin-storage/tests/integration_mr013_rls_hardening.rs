@@ -1,30 +1,3 @@
-//! # MR-013 (P-531) — tenant-isolation RLS hardening, PROVEN against live Postgres.
-//!
-//! MR-013 closes census **SI-005** in the `PgStore` OLTP/ReBAC path: the legacy session-scoped
-//! `set_config('myelin.tenant_id', $1, false)` (the cross-tenant pooled-connection BLEED) and the
-//! bare `PgStore::pool() -> &PgPool` hatch are GONE. Every tenant op now sets the `(tenant, region)`
-//! GUC TRANSACTION-scoped (`set_config(.., true)`) via the MR-022 `with_tenant_tx` convention over a
-//! `connect_pool_with_reset` pool (reset-on-release + region `application_name`), and the bare pool
-//! accessor is replaced by `health_check()`. This file proves, against the LIVE dev Postgres:
-//!
-//!   A. **RLS applies INSIDE the transaction-scoped PgStore op** — through the NOBYPASSRLS
-//!      `myelin_app` role, a deliberately tenant-predicate-LESS read on a `scoped_conn` (now a
-//!      tenant-scoped TRANSACTION) sees ONLY the acting tenant's rows; a cross-tenant subject is
-//!      invisible. The DB enforces it, not app code.
-//!   B. **No GUC bleeds across a pooled checkout** (the exact SI-005 surface). PgStore exposes NO
-//!      raw pool (the bare hatch is gone), so the residual GUC is observed at the MECHANISM PgStore
-//!      now delegates to: `with_tenant_tx` over the `connect_pool_with_reset` pool. A reused
-//!      connection after a tenant-scoped op carries NO residual `myelin.tenant_id`. The test is
-//!      NON-VACUOUS: the contrast leg shows the OLD session-scoped `set_config(.., false)` DOES bleed
-//!      on a bare pool (so the test genuinely detects a bleed), while the transaction-scoped
-//!      convention discards the GUC at COMMIT even on a bare pool with no reset-on-release. A test
-//!      that passed on the session-scoped path would FAIL the contrast assertion.
-//!   C. **Region fail-fast** — `connect` with a blank region is REFUSED loudly (no region-less pool),
-//!      and the explicit-region tenant entry points refuse a blank region.
-//!
-//! Run against the dev stack:
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   DATABASE_URL=… cargo test -p myelin-storage --features integration --test integration_mr013_rls_hardening -- --nocapture
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -33,22 +6,16 @@ use myelin_config::MyelinConfig;
 use myelin_storage::pg::{PgError, PgStore};
 use myelin_storage::tenant_tx::{connect_pool_with_reset, with_tenant_tx};
 
-/// DDL/seed runs as the migration/owner role (myelin_admin); the isolation read runs as the
-/// NOBYPASSRLS app role (myelin_app) so RLS is genuinely enforced. The dev DATABASE_URL is the app
-/// role; this rewrites it to admin.
 fn admin_url(cfg: &MyelinConfig) -> String {
     cfg.database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// A process-unique suffix so concurrent runs never collide on tenant ids / object ids.
 fn uniq() -> String {
     static N: AtomicU64 = AtomicU64::new(0);
     format!("{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
 }
 
-/// A bare single-connection pool with NO reset-on-release — the surface a session-scoped GUC bleeds
-/// across. Used only by the NON-VACUITY contrast leg of test B.
 async fn bare_single_conn(database_url: &str) -> sqlx::PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -57,8 +24,6 @@ async fn bare_single_conn(database_url: &str) -> sqlx::PgPool {
         .expect("bare single-connection pool (is the stack up?)")
 }
 
-/// Read `current_setting('myelin.tenant_id', true)` on a reused connection from `pool` (returns ''
-/// when unset). The `, true` makes a missing GUC return '' instead of erroring.
 async fn residual_tenant_guc(pool: &sqlx::PgPool) -> String {
     let mut conn = pool.acquire().await.expect("reacquire pooled connection");
     let v: Option<String> = sqlx::query_scalar("SELECT current_setting('myelin.tenant_id', true)")
@@ -67,10 +32,6 @@ async fn residual_tenant_guc(pool: &sqlx::PgPool) -> String {
         .expect("read myelin.tenant_id GUC");
     v.unwrap_or_default()
 }
-
-// ==============================================================================================
-// A — RLS applies INSIDE the transaction-scoped PgStore op (NOBYPASSRLS app role).
-// ==============================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
@@ -88,7 +49,6 @@ async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
     let tenant_a = format!("mr013-A-{tag}");
     let tenant_b = format!("mr013-B-{tag}");
 
-    // Seed both tenants' rows THROUGH the migrated public put_tuple (transaction-scoped).
     admin
         .put_tuple(&tenant_a, "A-secret-1", "reader", "user:alice")
         .await
@@ -102,13 +62,10 @@ async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
         .await
         .expect("seed B1");
 
-    // The NOBYPASSRLS app role — the load-bearing part (a superuser would bypass the policy).
     let app = PgStore::connect(&cfg.database_url, &cfg.region, 2)
         .await
         .expect("connect as the NOBYPASSRLS app role");
 
-    // (a) scoped_conn is now a tenant-scoped TRANSACTION. A predicate-LESS SELECT (only the DB
-    //     FORCE-RLS policy scopes it) returns ONLY tenant A's rows — zero of tenant B's.
     let visible_as_a = {
         use sqlx::Row;
         let mut tx = app
@@ -119,7 +76,6 @@ async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
             .fetch_all(&mut *tx)
             .await
             .expect("predicate-less RLS read");
-        // a read tx needs no commit (drop = rollback; the GUC is discarded either way).
         rows.iter()
             .map(|r| r.get::<String, _>("object_id"))
             .collect::<Vec<String>>()
@@ -134,8 +90,6 @@ async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
         "ZERO cross-tenant leak inside the transaction-scoped PgStore op"
     );
 
-    // (b) the app-layer reverse_index (the real authz path) is ALSO RLS-scoped: as tenant A, a
-    //     subject that only exists in tenant B returns ZERO rows (no cross-tenant query path).
     let cross = app
         .reverse_index(&tenant_a, "user:mallory", "reader")
         .await
@@ -151,7 +105,6 @@ async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
         visible_as_a.len()
     );
 
-    // cleanup (admin, through the convention so the RLS DELETE policy admits it).
     for t in [&tenant_a, &tenant_b] {
         let _ = with_tenant_tx(
             &connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 1)
@@ -177,16 +130,11 @@ async fn mr013_pgstore_transaction_scoped_op_isolates_tenants() {
     }
 }
 
-// ==============================================================================================
-// B — No GUC bleeds across a pooled checkout (the exact SI-005 surface), with a non-vacuity leg.
-// ==============================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mr013_no_guc_bleed_on_reused_pooled_connection() {
     let cfg = MyelinConfig::dev();
     let region = cfg.region.clone();
 
-    // Bootstrap the table once (admin), skipping cleanly if the stack is down.
     match PgStore::connect(&admin_url(&cfg), &region, 2).await {
         Ok(s) => s.migrate().await.expect("migrate"),
         Err(_) => {
@@ -198,16 +146,12 @@ async fn mr013_no_guc_bleed_on_reused_pooled_connection() {
     let tag = uniq();
     let tenant = format!("mr013-bleed-{tag}");
 
-    // ---- (1) The MIGRATED mechanism: with_tenant_tx over the connect_pool_with_reset pool (the
-    //          EXACT pool builder + convention PgStore::connect / put_tuple now use), max_conn=1 so
-    //          the single backend connection is REUSED across checkouts (the bleed surface). ----
     let pool = connect_pool_with_reset(&cfg.database_url, &region, 1)
         .await
         .expect("app-role reset-on-release single-conn pool");
     let tenant_q = tenant.clone();
     with_tenant_tx(&pool, &tenant, &region, move |conn| {
         Box::pin(async move {
-            // a real tenant-scoped read under the tx (the GUC must be live HERE).
             let _ = sqlx::query("SELECT object_id FROM rebac_tuple WHERE tenant_id = $1")
                 .bind(&tenant_q)
                 .fetch_all(&mut *conn)
@@ -218,7 +162,6 @@ async fn mr013_no_guc_bleed_on_reused_pooled_connection() {
     })
     .await
     .expect("tenant-scoped tx commits");
-    // The SAME backend connection, reused: NO residual tenant identity.
     assert_eq!(
         residual_tenant_guc(&pool).await,
         "",
@@ -226,30 +169,24 @@ async fn mr013_no_guc_bleed_on_reused_pooled_connection() {
          residual myelin.tenant_id (reset-on-release + SET LOCAL discarded at COMMIT)"
     );
 
-    // ---- (2) NON-VACUITY — prove the test can DETECT a bleed: the OLD session-scoped pattern on a
-    //          BARE pool (no reset-on-release) DOES persist across the checkout. ----
     let bleeder = format!("bleeder-{tag}");
     let bare_a = bare_single_conn(&cfg.database_url).await;
     {
         let mut conn = bare_a.acquire().await.expect("bare conn");
-        // the EXACT pre-MR-013 leak: session-scoped (is_local = false) on a bare pooled connection.
         sqlx::query("SELECT set_config('myelin.tenant_id', $1, false)")
             .bind(&bleeder)
             .execute(&mut *conn)
             .await
             .expect("set a session-scoped GUC (the old leak pattern)");
-        // conn drops → returned to the bare pool (no reset hook).
     }
     assert_eq!(
         residual_tenant_guc(&bare_a).await,
         bleeder,
         "non-vacuity: a session-scoped set_config(.., false) on a BARE pool BLEEDS across the \
-         checkout (the test genuinely detects a bleed) — a test passing on the session-scoped path \
+         checkout (the test genuinely detects a bleed) - a test passing on the session-scoped path \
          would FAIL here"
     );
 
-    // ---- (3) The convention discards the GUC even on a BARE pool (isolates the transaction-scoping
-    //          mechanism itself from the reset-on-release belt-and-braces). ----
     let bare_b = bare_single_conn(&cfg.database_url).await;
     with_tenant_tx(&bare_b, &format!("probe-{tag}"), &region, |_conn| {
         Box::pin(async move { Ok(()) })
@@ -259,7 +196,7 @@ async fn mr013_no_guc_bleed_on_reused_pooled_connection() {
     assert_eq!(
         residual_tenant_guc(&bare_b).await,
         "",
-        "SET LOCAL alone (no reset-on-release) discards the tenant GUC at COMMIT — the \
+        "SET LOCAL alone (no reset-on-release) discards the tenant GUC at COMMIT - the \
          transaction-scoping mechanism PgStore delegates to does NOT bleed, by construction"
     );
 
@@ -270,29 +207,21 @@ async fn mr013_no_guc_bleed_on_reused_pooled_connection() {
     );
 }
 
-// ==============================================================================================
-// C — Region fail-fast: a blank region is refused loudly.
-// ==============================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mr013_region_fail_fast_refuses_blank_region() {
     let cfg = MyelinConfig::dev();
 
-    // (1) connect with an EMPTY region is refused at construction (no region-less pool opened).
     let empty = PgStore::connect(&cfg.database_url, "", 2).await;
     assert!(
         matches!(empty, Err(PgError::Connect(_))),
         "connect with an empty region must be refused loudly (region fail-fast)"
     );
-    // (2) a whitespace-only region is also blank → refused.
     let blankish = PgStore::connect(&cfg.database_url, "   ", 2).await;
     assert!(
         matches!(blankish, Err(PgError::Connect(_))),
         "connect with a whitespace-only region must be refused (region fail-fast)"
     );
 
-    // (3) A validly-constructed store still refuses a blank region at the explicit-region tenant
-    //     entry points (belt-and-suspenders fail-fast).
     let store = match PgStore::connect(&cfg.database_url, &cfg.region, 2).await {
         Ok(s) => s,
         Err(_) => {

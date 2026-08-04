@@ -5,129 +5,21 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The CI SANDBOX crate (CI-P1 → P-129, M2). The runner/backend home (architecture
-# continuous-integration 01 §2: the runtime-agnostic seam; ADR-20 / X-6 / CI-1). At P-129 it
-# carries ONLY the SEAM, frozen byte-authoritative to arch 01 §2:
-#   - the JobSpec struct (kind ∈ {Ci, Agent} — the UNIFY point) + its supporting value types
-#     (ImageRef digest-pin-or-reject, EgressPolicy default-deny, ResourceLimits incl. pids_max +
-#     zero-swap + timeout, TrustTier, ephemeral RunTokenCredential + durable RunTokenRef,
-#     MeterTarget, IdemToken, …);
-#   - the SandboxBackend trait SHAPE (launch / kill) + the FleetProvider trait SHAPE
-#     (provision / deprovision / capacity) — shapes ONLY (no impl: Firecracker is CI-P2/P-237,
-#     gVisor is CI-P28, the fleet impl is CI-P14);
-#   - the four-uniform-guarantee wiring SEAM (RunnerHooks: reserve/settle 11.7, mint_run_token
-#     4.7 attribution, the HITL-withhold routing note, the isolation-floor hook CI-P5's escape
-#     drill drives). ToolHands::exec (8.4) IS launch(JobSpec{kind:Agent}) — the equivalence wired
-#     here (agent_job(...)) so the agent fabric (AG-P8/P-226) dispatches onto THIS exact runner.
-#
-# DAG POSITION (a documented, NAMED leaf consumer, exactly like myelin-git / myelin-issues /
-# myelin-notif / myelin-chat): it sits ABOVE the shared glue crates and NOTHING in the production
-# library DAG depends back on it. It is therefore OUTSIDE the eleven-crate library DAG modelled by
-# `myelin-substrate::crate_graph` (substrate_is_root() / identity_is_sink() are preserved — a
-# subsystem crate is the graph's terminal consumer, not a node in it). This crate BEGAN with only
-# the myelin-tenancy edge (the frozen Region partition type the FleetProvider trait names) and has
-# since gained further, individually-justified acyclic dependencies as real needs arose: the shared
-# glue crates myelin-refs/myelin-events (job.done ArtifactRefs, the ci.* event taxonomy, and now
-# also `workspace_intent.rs`'s `myelin_refs::parse_scoped` validation of a checkout-bearing job's
-# `repo_ref`), and the standalone terminal-DAG-consumer substrate crates myelin-flow/myelin-notif
-# (each justified individually at its own entry below — none of them has an edge back to this
-# crate). CORRECTION (CT-007 slice 5b.3-1, Sol's review): an earlier version of this paragraph
-# claimed the crate "depends ONLY on myelin-tenancy" — that WAS accurate when originally written
-# (git history confirms it predated the other dependencies); it simply was never updated as those
-# were added. The invariant this paragraph protects — a leaf consumer, never a subsystem crate like
-# myelin-git, with nothing depending back — still holds; only the "ONLY myelin-tenancy" headline had
-# gone stale.
-#
-# DB-FREE / VM-FREE BY DEFAULT: this crate touches NO DB / object-store / cache / bus contract.
-# CI-P2 (P-237) adds the Firecracker default backend + the gVisor named-second backend + the
-# backend-independent mandatory hardening profile. Their unit tests inject a fake VMM/runtime so
-# the default `cargo test` NEVER boots a guest. The REAL microVM boot lives ONLY behind the
-# `integration` feature (tests/hardened_boot_selftest.rs), gated to SKIP gracefully without
-# /dev/kvm or `firecracker`. `cargo build --workspace` + the default `cargo test` stay DB-free AND
-# VM-free. The ZERO-escapes real-kernel GATE (AG-D4 / CI-T1) is CI-P5 (named floor).
 [dependencies]
-# The frozen (tenant, region) partition types (contract 12.1 / P-CP-01). The FleetProvider trait
-# names `Region` in provision/capacity (arch 01 §2). myelin-tenancy is a shared partition-key
-# carrier and NOTHING in the production DAG depends back on myelin-ci-sandbox, so this leaf edge
-# keeps the §2.9 graph acyclic.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# The runner agent (CI-P3 → P-238) reports terminal via the FROZEN `job.done` durable signal
-# (9.2/9.4) — it ECHOES the workflow-minted `idem_token` onto the ENGINE's `DurableExecutor::signal`
-# (`SignalSpec{signal_name = JOB_DONE_SIGNAL, idem_key = idem_token}`), whose `INSERT … ON CONFLICT
-# (tenant, run_id, signal_name, idem_key) DO NOTHING` IS the exactly-once wake (recon §OQ-F, shipped
-# P-FLOW-09/P-205). The runner does NOT build a second signal path — it consumes the one engine
-# signal idempotency. NO cycle: `myelin-flow` is a TERMINAL DAG consumer (nothing depends back on it,
-# and it has no edge to `myelin-ci-sandbox`), so `myelin-ci-sandbox → myelin-flow` stays acyclic —
-# exactly the edge `myelin-agent-service` already carries to both crates.
 myelin-flow = { path = "../myelin-flow" }
-# The `job.done` signal payload is references-not-payloads `ArtifactRef`s (§3.4) — the terminal
-# report carries result refs (the `ci.log.available` pointer + artifact refs), never a PII body.
-# ALSO (CT-007 slice 5b.3-1): `workspace_intent.rs` calls `myelin_refs::parse_scoped` directly to
-# validate a checkout-bearing job's `WorkspaceSpec.repo_ref` (subsystem/type/no-#sub, canonical
-# tenant/repo-id extraction) — the SAME already-justified edge, no new dependency.
 myelin-refs = { path = "../myelin-refs" }
-# CI's `ci.*` event taxonomy (EB-27 / P-327, M4 — `events.rs` + `replay.rs`) registers its complete
-# token list against the Bus grammar + provides CI's `ReindexSource` body. NON-TEST code now, so
-# myelin-events is a real (not dev-only) dep. NO cycle: myelin-events has no edge back to
-# myelin-ci-sandbox, and myelin-refs (above) already pulls myelin-events transitively.
 myelin-events = { path = "../myelin-events" }
-# CI registers its status-summary `define_notif_rule` set (7.6) + its `CheckStatus.summary`
-# `HumanisedRef` templates (7.3) on Notif's ONE templating surface — the CI half of the M4 consumer
-# accretion (NOTIF-P23 / P-344). The registration is a data insertion + a template `put` (the
-# inverse-signal seam, EI-01 §1) — ZERO Notif code change. NO cycle: `myelin-notif` has NO edge back
-# to `myelin-ci-sandbox` (it sits below it in the DAG, depending only on the shared glue crates), so
-# `myelin-ci-sandbox → myelin-notif` stays acyclic — exactly the edge `myelin-git` / `myelin-issues`
-# already carry. CI is the producer; it depends on Notif's frozen registration seams, NOT on Git's
-# consumer view of `CheckStatus` (X-1 acyclic: CI emits, Git reads — CI never depends back on Git).
 myelin-notif = { path = "../myelin-notif" }
 serde.workspace = true
-# The escape-drill green-attestation artifact (CI-P5 → P-239) serializes to the JSON form AG-P17
-# (P-229) consumes — `EscapeAttestation::to_json` is non-test code, so serde_json is a real dep here
-# (not dev-only). Still DB-free / VM-free: a pure value serializer.
 serde_json.workspace = true
 zeroize = "1"
 libc = "0.2"
-# The pure-Rust canonical-tree hasher (`canonical_tar.rs`) that `GvisorAssetRegistry::from_bindings`
-# uses to recompute a staged rootfs directory's digest BEFORE any resource is reserved — no host `tar`
-# process may be spawned from that trusted path (the `no-host-exec` architecture lint). `sha2` is
-# ALREADY the workspace's vetted RustCrypto FIPS-180-4 sha256 impl (see the root `Cargo.toml`'s
-# `[workspace.dependencies]` note) — reused here rather than a hand-rolled hash.
 sha2.workspace = true
 
 [features]
 test-support = []
-# CT-007 gate-4: opt-in lane for the substrate-requiring unit tests. OFF by default (and NOT in
-# `default`), so the hermetic workspace `cargo test --lib` — which runs unprivileged in gVisor with
-# `--network=none`, no delegated cgroup v2, no btrfs, no staged gvisor-assets, HOME=/nonexistent —
-# sees every such test as `ignored` (honest, still type-checked) and the test lane goes GREEN in ANY
-# environment. Turn it ON only on the privileged HOST/dogfood lane
-# (`--features myelin-ci-sandbox/privileged-host-tests`, alongside the `test-support` that workspace
-# feature-unification already supplies there) to actually exercise those tests against real substrate:
-# real delegated cgroup v2, btrfs subvolumes, a real runsc + staged `gvisor-assets/git-rootfs`, a real
-# user namespace, and real host filesystem symlink/O_NOFOLLOW semantics. Coverage is not lost, only
-# relocated to the lane that can run it. Kept a leaf `= []` (never enables `test-support` itself) so a
-# stray `--features privileged-host-tests` can never silently pull in more than the ignore-flip.
 privileged-host-tests = []
-# Two REAL live-stack proofs, both DB/VM-free by default:
-#   - tests/hardened_boot_selftest.rs (CI-P2) boots a Firecracker microVM with the full hardening
-#     profile ON; gated to SKIP gracefully without /dev/kvm or `firecracker`.
-#   - tests/escape_drill_test.rs (CI-P5 → P-239) is THE HARD GATE: the full adversarial corpus runs
-#     inside a REAL Firecracker microVM on real KVM (production backend), asserts ZERO escapes from
-#     the parsed guest console, and emits the dated green escape attestation (the form AG-P17/P-229
-#     consumes). Gated to SKIP gracefully without /dev/kvm or `firecracker`. NEVER claims green over
-#     a red drill. Run: cargo test -p myelin-ci-sandbox --features integration --test escape_drill_test -- --nocapture.
-#   - tests/escape_drill_gvisor_test.rs (CI-P28 → P-423) RE-RUNS the SAME adversarial corpus inside
-#     a REAL runsc (gVisor) sandbox via a hardened OCI bundle (the second backend behind the same
-#     trait), asserts ZERO escapes from the parsed console, and emits a dated green attestation with
-#     gVisor EXERCISED — contract 8.4 re-greened on the second backend (the permanent gate re-runs
-#     per backend). Gated to SKIP gracefully without `runsc` or the staged minimal rootfs. Run:
-#     cargo test -p myelin-ci-sandbox --features integration --test escape_drill_gvisor_test -- --nocapture.
-#   - tests/integration_runner_lease.rs (CI-P3 → P-238) proves the runner-side lease handshake
-#     against REAL Postgres: claim (`FOR UPDATE SKIP LOCKED`) + heartbeat-renew + the exactly-once
-#     terminal report (`job.done` ON CONFLICT DO NOTHING → double-deliver buffers once). The
-#     `FOR UPDATE SKIP LOCKED` lease is a Postgres contract — it MUST be proven on the live stack,
-#     not mocked. Run: cargo test -p myelin-ci-sandbox --features integration.
-# `cargo build --workspace` + the default `cargo test` stay DB-free AND VM-free.
 integration = ["dep:myelin-config", "dep:sqlx", "dep:tokio"]
 
 [dependencies.myelin-config]
@@ -144,33 +36,11 @@ optional = true
 
 [dev-dependencies]
 serde_json.workspace = true
-# Dev-dep ONLY (CT-007 slice 5b.3-6a, Sol's r2 blocker 2): the checkout-capsule inseparability pin is
-# a SYNTAX-AWARE (AST) test — a text/substring scan cannot enforce "no trait impl / no destructuring
-# escape" against multi-line Rust (a `impl Deref for\n<capsule>` splits every substring). `syn` is
-# already a workspace dependency (myelin-lints parses Rust with it); this test-only edge adds no
-# production DAG dependency.
 syn = { workspace = true, features = ["full", "visit"] }
-# `proc-macro2` (also a workspace dep) lets the same guard scan macro token streams by Ident rather
-# than by substring, so a `unreachable!("… enabled_context …")` string literal is not a false positive
-# while a real `enabled_context` ident inside a macro body still trips the review gate.
 proc-macro2 = { workspace = true }
-# The replay unit test drives the owner reindex seam through the in-memory outbox double. Keep that
-# constructor test-only: standalone `cargo test -p myelin-ci-sandbox` must compile without relying on
-# workspace-wide feature unification from another crate.
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# Dev-dep ONLY: the reindex/replay unit tests (EB-27 / P-327) build an `Actor(Principal::stub(..))`
-# to drive `events::reindex` through the outbox. Production `replay.rs` takes refs only — it never
-# names `Principal` outside `#[cfg(test)]`. NO production DAG edge (test-only).
 myelin-identity = { path = "../myelin-identity" }
-# Dev-dep ONLY: the NOTIF-P23 X-1 CDC test (integration_ci_summary_humanises.rs) decodes CI's
-# producer summary `(template_key, args)` into the Git CONSUMER `HumanisedRef` to prove the producer
-# half and the consumer half agree on the ONE frozen 5.9 shape. CI never depends on Git in
-# production (X-1 acyclic: CI emits, Git reads) — this edge is `#[cfg(test)]`-only, no production DAG edge.
 myelin-git = { path = "../myelin-git" }
-# Dev-dep ONLY: the same CDC test drives CI's summary through Notif's `humanise` (the ONE templating
-# surface) with a synthetic Refs resolver — it names `humanise` + `RefResolvePort` + `Region` +
-# `Principal`. `myelin-notif` is already a production dep (above); `myelin-refs` / `myelin-tenancy`
-# are pulled transitively. The test-only names below are the resolver/Region/Principal fixtures.
 myelin-refs = { path = "../myelin-refs" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-notif = { path = "../myelin-notif" }

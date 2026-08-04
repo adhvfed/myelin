@@ -1,25 +1,3 @@
-//! # CDC 2.6 / 6.4 — Chat replay(scope, since) full parity (Search/Refs/Notif rebuild; ONE path)
-//! (CHAT-P21 / P-416, M4-C7)
-//!
-//! **Contract 2.6** — `reindex-from-source` / `replay(scope, since)` (OWNED by the Bus seam; each owner
-//! ships its `replay` body). This CDC pins BOTH sides of the Chat leg of the seam:
-//! - **PROVIDER (chat)** — `myelin_chat::replay::ChatReindexSource::replay` re-emits one
-//!   `chat.message.snapshot` per durable message through the Bus OUTBOX (`myelin_events::reindex`), at
-//!   the DETERMINISTIC `snapshot_event_id(aggregate, version)` (idempotent re-run).
-//! - **CONSUMER (chat read-models)** — `myelin_chat::replay::ChatReadModelConsumer::ingest` re-applies
-//!   each `*.snapshot` through the SAME step the steady-state live event takes, materializing the three
-//!   Chat-fed read-models (Search row ∥ Refs edge ∥ Notif reason). Steady-state and recovery share ONE
-//!   path (0 recovery-only code paths) → the `reindex_parity_hash` of a cold rebuild == the live one.
-//!
-//! **Contract 6.4** — `reindex(scope) -> job` (Search). **CONSUMED** by Chat: the chat message
-//! read-model is rebuilt the §4.9 ONLY way — the Bus re-emit (2.6) drives the SAME live indexer step
-//! (CONSUMED here through `ChatReadModelConsumer`, the Search-engine-backed leg is the CHAT-D15 drill).
-//!
-//! Coherence (EI-01 §7): chat owns NO second rebuild path. The rebuild reuses the ONE Bus reindex seam
-//! plus the ONE consumer ingest step; the parity is inherited from the cold==live invariant, not
-//! re-built. The erased-subject tombstone (X-7) is the SAME `ChatReindexSource::erase` skip the
-//! skeleton proves.
-
 use myelin_chat::events::CHAT_MESSAGE_SNAPSHOT;
 use myelin_chat::replay::{
     reindex_parity_hash, ChatReadModelConsumer, ChatReindexSource, ChatReplayKind,
@@ -55,8 +33,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// The owner's `project(message)` (5.6) over an in-memory truth — the SAME fetcher serves the live emit
-/// and the cold replay (cold == live). An ABSENT (erased) message returns `None` (no row, X-7).
 #[derive(Default)]
 struct FakeProjector {
     bodies: BTreeMap<String, MessageProjection>,
@@ -136,23 +112,17 @@ fn live_envelope(message_ref: &str, version: u64) -> EventEnvelope {
     }
 }
 
-/// **The 2.6 / 6.4 pair, end-to-end: the PROVIDER (chat replay re-emits) + the CONSUMER (the read-models
-/// rebuild) — steady-state and recovery share ONE path (the parity hash matches).**
 #[test]
 fn cdc_2_6_6_4_chat_replay_parity_provider_reemits_consumer_rebuilds_one_path() {
     let proj = projector();
     let src = source();
     let scope = SnapshotScope::new("chat", "message:all");
 
-    // CONSUMER (live): the steady-state path ingests the live message events.
     let mut live = ChatReadModelConsumer::new();
     for draft in src.replay(&scope, None) {
         live.ingest(&live_envelope(&draft.aggregate.0, draft.version), &proj);
     }
 
-    // PROVIDER (recovery): chat's replay re-emits each chat.message.snapshot through the Bus outbox at
-    // its deterministic id. CONSUMER (recovery): a WIPED read-model rebuilds from those re-emits through
-    // the SAME ingest step.
     let mut outbox = OutboxStore::new();
     let sources: &[&dyn ReindexSource] = &[&src];
     let receipt = bus_reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("reindex");
@@ -173,20 +143,16 @@ fn cdc_2_6_6_4_chat_replay_parity_provider_reemits_consumer_rebuilds_one_path() 
         cold.ingest(&row.envelope, &proj);
     }
 
-    // THE DATED GREEN ARTIFACT: the reindex-parity hash matches (cold == live across Search/Refs/Notif;
-    // one path, 0 recovery-only code paths).
     assert_eq!(
         reindex_parity_hash(&cold),
         reindex_parity_hash(&live),
-        "steady-state and recovery share one path — the reindex-parity hash matches (CHAT-D15)"
+        "steady-state and recovery share one path - the reindex-parity hash matches (CHAT-D15)"
     );
     assert_eq!(cold.search_len(), 2);
     assert_eq!(cold.refs_len(), 1, "the Refs read-model rebuilt (5.2)");
     assert_eq!(cold.notif_len(), 2, "the Notif read-model rebuilt (7.1)");
 }
 
-/// **PROVIDER idempotence (the deterministic id) — a re-run emits 0 new snapshots.** The re-emit is a
-/// no-op on the deterministic `snapshot_event_id`; the consumer's rebuild is unchanged.
 #[test]
 fn cdc_2_6_chat_replay_rerun_emits_zero_new() {
     let src = source();
@@ -201,8 +167,6 @@ fn cdc_2_6_chat_replay_rerun_emits_zero_new() {
     assert_eq!(r2.snapshots_skipped_duplicate, 2);
 }
 
-/// **CONSUMER erased-skip (X-7) — an erased subject emits a tombstone on rebuild (no resurrection).**
-/// m2 is erased at the owner; the rebuild SKIPS it (its Search/Notif rows are absent).
 #[test]
 fn cdc_2_6_chat_replay_erased_subject_is_a_tombstone_on_rebuild() {
     let mut proj = projector();
@@ -224,7 +188,7 @@ fn cdc_2_6_chat_replay_erased_subject_is_a_tombstone_on_rebuild() {
     assert_eq!(
         cold.search_len(),
         1,
-        "only m1 rebuilt — the erased m2 did not resurrect"
+        "only m1 rebuilt - the erased m2 did not resurrect"
     );
     assert!(!cold.search_indexes("myelin://acme/chat/message/m2"));
     assert_eq!(
@@ -234,7 +198,6 @@ fn cdc_2_6_chat_replay_erased_subject_is_a_tombstone_on_rebuild() {
     );
 }
 
-/// The Notif notify-reason token is the frozen `mentioned` rule-key (contract 7.6) — pinned, not a literal.
 #[test]
 fn cdc_7_1_chat_notif_reason_is_the_frozen_mentioned_rule_key() {
     assert_eq!(NOTIF_REASON_MENTIONED, "chat.message.mentioned");

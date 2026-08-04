@@ -1,26 +1,3 @@
-//! **REF-P15 / P-164 — the structural-erasure holder, PROVEN against the live dev-stack Valkey.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-refs-service --features integration \
-//!     --test integration_ref_p15_holder_erase -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires for the REF-P15 cache-PII purge: the
-//! holder `erase(subject)` drives the §4.6 purge through the REAL [`myelin_storage::ValkeyCache`] (the
-//! SAME `invalidate` eviction path the `*.erased` consumer drives — one path, no backdoor). We prove
-//! against the LIVE Valkey (REF-D5 CI variant, real-store half):
-//!
-//! - warm the subject's cached projection titles (a name) into REAL Valkey (sealed under the per-tenant
-//!   DEK);
-//! - `RefsCacheHolder::erase(Subject)` → the live Valkey keys for the refs the subject touches are
-//!   DELETED → a subsequent read MISSES (0 recoverable PII, never the stale name);
-//! - tenant isolation: another tenant's cached title is untouched by the erase.
-//!
-//! `MYELIN_REGION=fr-par` is the dev posture; the cache is residency-pinned by riding the cell-local
-//! Valkey (dev<->prod is a config swap, never a code change). The full backup-level 0-recoverable shred
-//! (REF-D5 at scale) is REF-P25 (named floor).
 #![cfg(feature = "integration")]
 
 use std::sync::Arc;
@@ -46,12 +23,10 @@ fn redis_url() -> String {
 fn region() -> Region {
     Region("fr-par".into())
 }
-/// A per-process-unique tenant so parallel runs / reruns never collide on the real server.
 fn ttenant(tag: &str) -> TenantId {
     TenantId(format!("p164-{tag}-{}", std::process::id()))
 }
 fn gtenant(t: &TenantId) -> GdprTenantId {
-    // gdpr's TenantId IS myelin_tenancy::TenantId (a type alias) — pass it straight through.
     t.clone()
 }
 fn subject(id: &str, t: &TenantId) -> SubjectRef {
@@ -113,14 +88,12 @@ async fn holder_erase_purges_cache_pii_on_real_valkey_zero_recoverable() {
 
     let t = ttenant("erase");
 
-    // the subject p-erase-me authored an edge whose SOURCE cached title holds their name.
     let builder = RefsEdgeBuilder::new(EdgeProjection::new());
     let src = "myelin://acme/chat/message/m1";
     let tgt = "myelin://acme/knowledge/page/7c2";
     builder.handle(&edge_event(&t, "e1", "p-erase-me", src, tgt), &mut myelin_events::HandlerTx::none());
     let projection_handle = builder.projection().clone();
 
-    // warm the subject's cached title (a name) into REAL Valkey, sealed under the per-tenant DEK.
     cache
         .fill(
             &t,
@@ -136,7 +109,6 @@ async fn holder_erase_purges_cache_pii_on_real_valkey_zero_recoverable() {
         "the cached title (a name) is present in live Valkey before erase"
     );
 
-    // a DIFFERENT tenant's cached title — must be untouched by the erase (tenant isolation).
     let t_other = ttenant("other");
     cache
         .fill(
@@ -147,7 +119,6 @@ async fn holder_erase_purges_cache_pii_on_real_valkey_zero_recoverable() {
         )
         .expect("warm the other tenant's title");
 
-    // REF-P15: the holder erase drives the §4.6 purge through the live Valkey (the ONE eviction path).
     let holder = RefsCacheHolder::with_cache(cache.clone(), projection_handle);
     let receipt = holder
         .erase(EraseScope::Subject {
@@ -157,15 +128,12 @@ async fn holder_erase_purges_cache_pii_on_real_valkey_zero_recoverable() {
         .expect("holder erase succeeds");
     assert_eq!(receipt.receipt.operation, "erase");
 
-    // 0 recoverable PII: the subject's cached title is GONE from live Valkey (a read MISSES → re-resolve,
-    // never the stale name).
     assert!(
         cache
             .read(&t, &region(), &ArtifactRef(src.into()))
             .is_none(),
         "0 recoverable PII: the subject's cached title is purged from live Valkey"
     );
-    // tenant isolation: the OTHER tenant's title is untouched.
     assert!(
         cache
             .read(&t_other, &region(), &ArtifactRef(src.into()))

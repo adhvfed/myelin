@@ -1,9 +1,3 @@
-//! Unit tests for the Issues Refs wiring (ISS-P17 / P-383): the `#sub` mints (5.7), the inline-node
-//! `refs.edge.created` producer (5.4), the TE-7 typed-edge mirror (5.5), the bounded cycle-safe
-//! traverse (5.3), the `project(ref, viewer)` 4-step tombstone ladder (5.6 / 5.7), and the `issue.*`
-//! Search projection emitter (6.3). The project-leak path is the mandatory-core leak surface — the
-//! permission-deny / erased / restricted / sub-gone tombstone tests are the mutation-floor anchors.
-
 use super::*;
 use myelin_content::inline::InlineNode;
 use myelin_events::{
@@ -17,8 +11,6 @@ use myelin_identity::{
 };
 use std::collections::HashSet;
 use std::sync::Arc;
-
-// ───────────────────────────── shared fixtures ─────────────────────────────
 
 fn tenant() -> TenantId {
     TenantId("acme".into())
@@ -61,8 +53,6 @@ fn z() -> Zookie {
     Zookie("z0".into())
 }
 
-/// A deterministic Id stub: a `view@object` allow-list (absent ⇒ Deny, fail-closed); a toggle forces a
-/// transport hiccup (the projector must then fail CLOSED to a tombstone).
 struct StubId {
     allow: HashSet<String>,
     hiccup: bool,
@@ -197,11 +187,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-// ════════════════════════════ 1. the #sub mints (5.7) ════════════════════════════
-
-/// **Each `#sub` mint produces the canonical full sub-URN through the ONE codec, round-trips, and
-/// classifies to the right kind; `strip_sub` recovers the parent issue root.** The opaque id is stable
-/// across edits (the embed never dangles, §2).
 #[test]
 fn issues_sub_mints_are_grammatical_and_strip_to_the_root() {
     let root = issue("ENG-1421");
@@ -225,23 +210,14 @@ fn issues_sub_mints_are_grammatical_and_strip_to_the_root() {
     assert_eq!(r.0, "myelin://acme/issue/issue/ENG-1421#row-r2");
 }
 
-/// **A malformed opaque body / a sub-of-a-sub is rejected LOUDLY at mint time (0 ungrammatical mints by
-/// construction).**
 #[test]
 fn issues_sub_mints_reject_a_malformed_body() {
     let root = issue("ENG-1");
-    // an empty comment id
     assert!(comment_sub_ref(&root, "").is_err());
-    // a sub-of-a-sub (the root must be a bare issue)
     let already = comment_sub_ref(&root, "c1").unwrap();
     assert!(comment_sub_ref(&already, "c2").is_err());
 }
 
-// ════════════════════════════ 2. the inline-node refs.edge.created producer (5.4) ════════════════
-
-/// **Each `mention`/`artifact_ref`/`embed` node emits ONE `refs.edge.created` (reference-class), NOT
-/// coalesced, with the references-not-payloads triple + the shared edge aggregate.** A `mention`
-/// targets the opaque principal URN (no inline PII).
 #[test]
 fn each_inline_node_emits_one_reference_edge() {
     let (store, minter) = store_and_minter();
@@ -261,11 +237,10 @@ fn each_inline_node_emits_one_reference_edge() {
     let ids = emit_content_edges(&mut tx, &tenant(), &source, &nodes, None).unwrap();
     tx.commit().unwrap();
 
-    assert_eq!(ids.len(), 3, "one edge per structured node — NOT coalesced");
+    assert_eq!(ids.len(), 3, "one edge per structured node - NOT coalesced");
     assert_eq!(store.outbox_depth(), 3);
 
     let rows: Vec<_> = store.committed_rows();
-    // mention → mentions @ the opaque principal URN, reference-class, no inline PII.
     let mention = store.row(&ids[0]).unwrap();
     assert_eq!(mention.envelope.type_.0, REFS_EDGE_CREATED);
     assert_eq!(mention.envelope.payload["rel"], "mentions");
@@ -275,21 +250,16 @@ fn each_inline_node_emits_one_reference_edge() {
         "myelin://acme/identity/principal/alice"
     );
     assert!(!mention.envelope.contains_personal_data, "no inline PII");
-    // artifact_ref → references @ the verbatim target.
     let aref = store.row(&ids[1]).unwrap();
     assert_eq!(aref.envelope.payload["rel"], "references");
     assert_eq!(aref.envelope.payload["target"], "myelin://acme/git/pr/4291");
-    // embed → embeds.
     let embed = store.row(&ids[2]).unwrap();
     assert_eq!(embed.envelope.payload["rel"], "embeds");
-    // every edge is reference-class (never lifecycle).
     assert!(rows
         .iter()
         .all(|r| r.envelope.payload["rel_class"] == REL_CLASS_REFERENCE));
 }
 
-/// **Emit-iff-committed: an aborted body persist drops the buffered edges with it (0 edge without its
-/// committed node).**
 #[test]
 fn content_edges_are_dropped_on_an_aborted_persist() {
     let (store, minter) = store_and_minter();
@@ -300,15 +270,10 @@ fn content_edges_are_dropped_on_an_aborted_persist() {
     let mut tx = store.begin(minter, ctx_base());
     tx.stage_state_change("staged");
     emit_content_edges(&mut tx, &tenant(), &source, &nodes, None).unwrap();
-    drop(tx); // abort — no commit
+    drop(tx);
     assert_eq!(store.outbox_depth(), 0, "0 edge without a committed node");
 }
 
-// ════════════════════════════ 3. the TE-7 typed-edge mirror (5.5) ════════════════════════════
-
-/// **An `issue_relation` write co-commits its TE-7 mirror event (`issue.relation.created`), lifecycle-
-/// class, references-not-payloads.** ONE event yields BOTH directions (the Refs mirror fixes the
-/// inverse).
 #[test]
 fn te7_relation_create_emits_the_lifecycle_mirror_edge() {
     let (store, minter) = store_and_minter();
@@ -337,8 +302,6 @@ fn te7_relation_create_emits_the_lifecycle_mirror_edge() {
     assert!(!row.envelope.contains_personal_data);
 }
 
-/// **An unrelate co-commits `issue.relation.removed` on the SAME edge aggregate (the create → remove
-/// sequence is per-aggregate ordered).**
 #[test]
 fn te7_relation_remove_emits_removed_on_the_same_aggregate() {
     let (store, minter) = store_and_minter();
@@ -357,8 +320,6 @@ fn te7_relation_remove_emits_removed_on_the_same_aggregate() {
     assert_eq!(row.aggregate, agg, "same edge aggregate as the create");
 }
 
-/// **The lifecycle-rel vocabulary round-trips byte-identically to the `issue_relation.rel` CHECK
-/// tokens (no second vocabulary).**
 #[test]
 fn lifecycle_rel_tokens_round_trip() {
     for rel in [
@@ -374,10 +335,6 @@ fn lifecycle_rel_tokens_round_trip() {
     assert_eq!(IssueLifecycleRel::from_token("not_a_rel"), None);
 }
 
-// ════════════════════════════ 4. the bounded cycle-safe traverse (5.3) ════════════════════════════
-
-/// **The traverse walks the forward edges, is rel-filtered, and returns the reachable set (not the
-/// seed) with the BFS depth.**
 #[test]
 fn traverse_walks_forward_edges_rel_filtered() {
     let a = issue("ENG-1");
@@ -386,23 +343,18 @@ fn traverse_walks_forward_edges_rel_filtered() {
     let mut g = IssueRelationGraph::new();
     g.add_edge(&a, &b, IssueLifecycleRel::BlockedBy);
     g.add_edge(&b, &c, IssueLifecycleRel::BlockedBy);
-    g.add_edge(&a, &c, IssueLifecycleRel::Relates); // a different rel
+    g.add_edge(&a, &c, IssueLifecycleRel::Relates);
 
-    // only the blocked_by chain a → b → c
     let reached = g.traverse(&a, Some(IssueLifecycleRel::BlockedBy));
     let nodes: Vec<&str> = reached.iter().map(|n| n.node.0.as_str()).collect();
     assert_eq!(nodes, vec![b.0.as_str(), c.0.as_str()]);
     assert_eq!(reached[0].depth, 1);
     assert_eq!(reached[1].depth, 2);
-    // the seed is never returned
     assert!(reached.iter().all(|n| n.node != a));
 }
 
-/// **The traverse is CYCLE-SAFE (a `blocked_by` cycle terminates) and DEPTH-BOUNDED (a node past depth
-/// 16 is not expanded).** This is the mutation-floor anchor for the bound + the visited-set.
 #[test]
 fn traverse_is_cycle_safe_and_depth_bounded() {
-    // A cycle A → B → A: the walk visits B once and terminates (no infinite loop).
     let a = issue("CY-A");
     let b = issue("CY-B");
     let mut cyclic = IssueRelationGraph::new();
@@ -412,8 +364,6 @@ fn traverse_is_cycle_safe_and_depth_bounded() {
     assert_eq!(reached.len(), 1, "B is reached once; the cycle terminates");
     assert_eq!(reached[0].node, b);
 
-    // A long chain deeper than the bound: every reached node is at depth ≤ 16, and the chain stops
-    // expanding at the bound (the 18th node is never reached).
     let mut chain = IssueRelationGraph::new();
     let nodes: Vec<ArtifactRef> = (0..20).map(|i| issue(&format!("CH-{i}"))).collect();
     for w in nodes.windows(2) {
@@ -424,7 +374,6 @@ fn traverse_is_cycle_safe_and_depth_bounded() {
         reached.iter().all(|n| n.depth <= TRAVERSE_MAX_DEPTH),
         "no node past the depth-16 bound"
     );
-    // exactly TRAVERSE_MAX_DEPTH nodes reachable (depths 1..=16); the root is depth 0 (not returned).
     assert_eq!(reached.len(), TRAVERSE_MAX_DEPTH);
     assert!(
         !reached.iter().any(|n| n.node == nodes[17]),
@@ -432,9 +381,6 @@ fn traverse_is_cycle_safe_and_depth_bounded() {
     );
 }
 
-// ════════════════════════════ 5. project(ref, viewer) — the 4-step ladder (5.6 / 5.7) ════════════
-
-/// **A permitted viewer gets the per-viewer projection (title/state/category/icon/render_hint).**
 #[test]
 fn a_permitted_viewer_gets_the_projection() {
     let root = issue("ENG-1421");
@@ -456,13 +402,9 @@ fn a_permitted_viewer_gets_the_projection() {
     assert!(p.sub_anchor.is_none());
 }
 
-/// **MANDATORY-CORE: an unauthorized viewer (a confidential issue) gets a Tombstone carrying the ROOT,
-/// NEVER the title (the ISS-D3 0-leak unfurl property re-asserted at the project() boundary).** A
-/// deny / a transport hiccup both fail CLOSED.
 #[test]
 fn unauthorized_viewer_gets_a_tombstone_carrying_the_root_never_the_title() {
     let root = issue("ENG-7");
-    // The viewer is NOT on the allow-list (a confidential issue) — Deny.
     let id = StubId::new();
     let mut store = IssueProjectionStore::new();
     store.put_issue(&root, meta("CONFIDENTIAL acquisition codename"));
@@ -479,7 +421,6 @@ fn unauthorized_viewer_gets_a_tombstone_carrying_the_root_never_the_title() {
     assert_eq!(t.root, root, "the tombstone carries the root");
     assert_eq!(t.display_text(), "(not available)");
 
-    // A transport hiccup ALSO fails closed to a tombstone (never a leak).
     let mut store2 = IssueProjectionStore::new();
     store2.put_issue(&root, meta("secret"));
     let proj2 = Projector::new(StubId::new().allow_view(&root).with_hiccup(), store2);
@@ -488,8 +429,6 @@ fn unauthorized_viewer_gets_a_tombstone_carrying_the_root_never_the_title() {
     assert_eq!(out2.title(), None);
 }
 
-/// **An erased issue projects to an `Erased` tombstone carrying the root (the per-subject DEK shred /
-/// the `issue.*.erased` tombstone) — even for a permitted viewer.**
 #[test]
 fn an_erased_issue_projects_to_an_erased_tombstone() {
     let root = issue("ENG-9");
@@ -506,39 +445,31 @@ fn an_erased_issue_projects_to_an_erased_tombstone() {
     assert_eq!(t.root, root);
 }
 
-/// **MANDATORY-CORE: a RESTRICTED sub-URN tombstones even when the root is not restricted (the `||`
-/// guard over root-OR-full-ref). The restriction window suppresses the specific part.**
 #[test]
 fn a_restricted_sub_urn_tombstones_even_when_the_root_is_not() {
     let root = issue("ENG-11");
     let sub = comment_sub_ref(&root, "abc").unwrap();
     let mut store = IssueProjectionStore::new();
     store.put_issue(&root, meta("the parent is fine"));
-    store.mark_restricted(&sub); // the SUB is restricted, not the root
+    store.mark_restricted(&sub);
     let proj = Projector::new(StubId::new().allow_view(&root), store);
 
-    // the bare root still projects (the root is not restricted)
     assert!(proj.project(&root, &viewer("v"), z()).unwrap().is_visible());
-    // the restricted sub-URN tombstones
     let out = proj.project(&sub, &viewer("v"), z()).unwrap();
     assert!(out.is_tombstone());
     assert_eq!(out.title(), None);
 }
 
-/// **MANDATORY-CORE: an ERASED sub-URN tombstones even when the root is not erased (the `||` guard
-/// over root-OR-full-ref on the erasure arm).** Kills the `|| → &&` mutant on the erased guard.
 #[test]
 fn an_erased_sub_urn_tombstones_even_when_the_root_is_not() {
     let root = issue("ENG-12");
     let sub = comment_sub_ref(&root, "gone").unwrap();
     let mut store = IssueProjectionStore::new();
     store.put_issue(&root, meta("the parent is fine"));
-    store.mark_erased(&sub); // the SUB is erased, not the root
+    store.mark_erased(&sub);
     let proj = Projector::new(StubId::new().allow_view(&root), store);
 
-    // the bare root still projects (the root is not erased)
     assert!(proj.project(&root, &viewer("v"), z()).unwrap().is_visible());
-    // the erased sub-URN tombstones with the Erased reason; the title never leaks
     let out = proj.project(&sub, &viewer("v"), z()).unwrap();
     assert_eq!(out.title(), None);
     let t = match out {
@@ -548,7 +479,6 @@ fn an_erased_sub_urn_tombstones_even_when_the_root_is_not() {
     assert_eq!(t.reason, TombstoneReason::Erased);
 }
 
-/// **A dangling root projects to a `RootGone` tombstone (the issue does not exist).**
 #[test]
 fn a_dangling_root_projects_to_root_gone() {
     let root = issue("ENG-404");
@@ -561,9 +491,6 @@ fn a_dangling_root_projects_to_root_gone() {
     assert_eq!(t.reason, TombstoneReason::RootGone);
 }
 
-/// **The sub-anchor ladder lives / moves / outdates / gones (the 4-step ladder's step 3).** A live/
-/// moved/outdated sub projects a `SubAnchor` on that rung; a gone sub is a `SubGone` tombstone carrying
-/// the root.
 #[test]
 fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     let root = issue("ENG-50");
@@ -580,7 +507,6 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     let proj = Projector::new(StubId::new().allow_view(&root), store);
     let v = viewer("v");
 
-    // LIVE (untracked sub defaults to live)
     let p = match proj.project(&live, &v, z()).unwrap() {
         Projected::Visible(p) => p,
         _ => panic!("live sub visible"),
@@ -589,21 +515,18 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     assert_eq!(p.sub_anchor.as_ref().unwrap().kind, "comment-");
     assert_eq!(p.sub_anchor.as_ref().unwrap().sub_id, "c-live");
 
-    // MOVED
     let p = match proj.project(&moved, &v, z()).unwrap() {
         Projected::Visible(p) => p,
         _ => panic!("moved sub visible"),
     };
     assert_eq!(p.sub_anchor.unwrap().rung, LadderRung::Moved);
 
-    // OUTDATED
     let p = match proj.project(&outdated, &v, z()).unwrap() {
         Projected::Visible(p) => p,
         _ => panic!("outdated sub visible"),
     };
     assert_eq!(p.sub_anchor.unwrap().rung, LadderRung::Outdated);
 
-    // GONE → SubGone tombstone carrying the root
     let out = proj.project(&gone, &v, z()).unwrap();
     let t = match out {
         Projected::Tombstoned(t) => t,
@@ -613,8 +536,6 @@ fn the_sub_anchor_ladder_lives_moves_outdates_and_gones() {
     assert_eq!(t.root, root);
 }
 
-/// **A non-Issues / unknown-type ref is a LOUD error, not a tombstone (the projector owns only Issues
-/// types).**
 #[test]
 fn a_non_issue_ref_is_a_loud_error() {
     let proj = Projector::new(StubId::new(), IssueProjectionStore::new());
@@ -625,11 +546,6 @@ fn a_non_issue_ref_is_a_loud_error() {
     ));
 }
 
-// ════════════════════════════ 6. the issue.* Search projection emitter (6.3 / 6.4) ════════════════
-
-/// **The LIVE `issue.*` Search projection: a permitted issue projects the title text + the typed facets
-/// (the keys are byte-identical to the declared 6.3 spec).** The emitter is the SAME store the
-/// projector reads (no second projection path).
 #[test]
 fn issue_search_projection_emits_text_and_typed_facets() {
     let root = issue("ENG-1421");
@@ -639,7 +555,6 @@ fn issue_search_projection_emits_text_and_typed_facets() {
 
     let proj = fetcher.project(&tenant(), &region(), &root).unwrap();
     assert_eq!(proj.text, "Fix the login flow");
-    // the typed facets match the declared 6.3 spec keys + FieldTypes.
     assert_eq!(
         proj.fields.get(crate::declares::FACET_STATE_CATEGORY),
         Some(&FieldValue::Select("started".into()))
@@ -664,8 +579,6 @@ fn issue_search_projection_emits_text_and_typed_facets() {
     );
 }
 
-/// **The EMITTER honours an erased/restricted SUB-URN even when the root is not (the `||` guards over
-/// the `reference.0` arm).** Kills the `|| → &&` mutants on the emitter's erasure/restriction arms.
 #[test]
 fn emitter_excludes_an_erased_or_restricted_sub_even_when_root_is_clean() {
     let root = issue("ENG-S");
@@ -677,22 +590,17 @@ fn emitter_excludes_an_erased_or_restricted_sub_even_when_root_is_clean() {
     store.mark_restricted(&restricted_sub);
     let fetcher = IssueProjectFetcher::new(store);
 
-    // the root projects fine (it is neither erased nor restricted)
     assert!(fetcher.project(&tenant(), &region(), &root).is_ok());
-    // the erased sub-URN is Gone (the `erased.contains(&reference.0)` arm)
     assert_eq!(
         fetcher.project(&tenant(), &region(), &erased_sub),
         Err(ProjectFetchError::Gone)
     );
-    // the restricted sub-URN is Gone (the `restricted.contains(&reference.0)` arm)
     assert_eq!(
         fetcher.project(&tenant(), &region(), &restricted_sub),
         Err(ProjectFetchError::Gone)
     );
 }
 
-/// **The ladder rung tokens are the frozen `live`/`moved`/`outdated` strings + the `Projected`
-/// accessors discriminate visible-vs-tombstone (kills the accessor/token mutants).**
 #[test]
 fn rung_tokens_and_projected_accessors_are_pinned() {
     assert_eq!(LadderRung::Live.as_str(), "live");
@@ -720,9 +628,6 @@ fn rung_tokens_and_projected_accessors_are_pinned() {
     assert_eq!(tomb.title(), None);
 }
 
-/// **The projection EMITTER is restriction-/erasure-safe: a restricted/erased issue projects to `Gone`
-/// (the index removes the doc — no leak via a search result/count/rank), exactly mirroring the
-/// project-time tombstone.**
 #[test]
 fn issue_search_projection_excludes_restricted_and_erased() {
     let restricted_root = issue("ENG-R");
@@ -744,16 +649,12 @@ fn issue_search_projection_excludes_restricted_and_erased() {
         Err(ProjectFetchError::Gone),
         "an erased issue is excluded from the index"
     );
-    // a missing issue is likewise Gone (the indexer removes/skips the doc).
     assert_eq!(
         fetcher.project(&tenant(), &region(), &issue("ENG-404")),
         Err(ProjectFetchError::Gone)
     );
 }
 
-/// **The declared 6.3 spec ACCEPTS the emitter's projection (the schema/row pairing — the spec is the
-/// columnar schema, the emitter is the row).** The facet keys the emitter sets are a subset of the
-/// declared `struct_fields`, so the indexer admits the projection without a schema mismatch.
 #[test]
 fn emitter_facets_are_within_the_declared_6_3_spec() {
     let spec = crate::declares::issue_facets_projection_spec();

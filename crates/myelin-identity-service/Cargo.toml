@@ -5,18 +5,10 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The service binary the harness runs (the "every service `main.rs`" of contract 1.1). Named
-# `identity` (= SERVICE_NAME) so the deployable matches the service/trace identifier.
 [[bin]]
 name = "identity"
 path = "src/main.rs"
 
-# MR-009 kill-9/restart durability child process (writer + reader). The harness spawns this as a
-# REAL OS process and SIGKILLs it, so the durability proof is a genuine process-death proof (not the
-# census's in-process "crash" = drop+recreate). `required-features = ["integration"]` means the
-# default `cargo build/check --workspace` NEVER compiles it (it stays DB-free); it is built only
-# under `--features integration`, where the integration test (which spawns it via CARGO_BIN_EXE_*)
-# runs against the docker-compose dev stack. See src/bin/mr009_kill9_writer.rs.
 [[bin]]
 name = "mr009_kill9_writer"
 path = "src/bin/mr009_kill9_writer.rs"
@@ -25,197 +17,39 @@ required-features = ["integration"]
 [lib]
 path = "src/lib.rs"
 
-# THE Identity SERVICE crate (P-ID-04 → P-054): the bootable service shell the harness wires
-# (boot → migrate → relay → consumers → three ports → graceful drain), NOT a hand-rolled main.
-#
-# DAG POSITION (a documented, NAMED extension of the §2.9 eleven-crate DAG, like myelin-harness
-# and myelin-lints): this is a SERVICE crate — the "every service `main.rs`" consumer the
-# contract-index row 1.1 names. It is the FIRST such service. It sits ABOVE myelin-substrate
-# (the root-last harness) as a leaf consumer: it depends on the harness (serve/AppSpec) and the
-# frozen identity contract surface, and NOTHING in the production DAG depends on it. It is
-# therefore OUTSIDE the eleven-crate library DAG modelled by `crate_graph.rs`
-# (substrate_is_root() — "no crate depends on substrate" — is preserved: a service main is not
-# part of that library graph, it is the graph's terminal consumer). See the crate-level note in
-# src/lib.rs.
 [dependencies]
-# The frozen Identity & Access contract surface (the eleven-method IdentityService ABI, the
-# Principal/Decision/Consistency types) — P-ID-04 wires the shell's check/list_objects SLOTS
-# against these signatures with fail-closed stubs until the bodies land (P-ID-09/P-ID-11).
 myelin-identity = { path = "../myelin-identity" }
-# The harness: serve(AppSpec) + the three-surface topology (public/internal/metrics-health) +
-# liveness≠readiness + graceful drain. The shell is an AppSpec this wires; it is NOT a service
-# that re-implements the lifecycle (architecture 00 §3.1, the one call).
 myelin-substrate = { path = "../myelin-substrate" }
-# TenantId / Region value types (for the Principal the internal-RPC authorizer threads).
 myelin-tenancy = { path = "../myelin-tenancy" }
-# P-ID-08 (P-057): the S3 ReBAC tuple store emits iam.tuple_written via the OUTBOX — the ONLY
-# emit path (the no-raw-publish lint forbids any other). The OutboxStore / OutboxTx::emit /
-# EventDraft / EmitContextBase carriers + the iam.tuple_written envelope construction live in
-# the events tier; the store buffers its delta + the event into ONE OutboxTransaction so the
-# tuple write and its event co-commit (emit-iff-committed). A service crate (a leaf consumer
-# ABOVE the events tier) may depend on it; nothing in the production library DAG depends back.
 myelin-events = { path = "../myelin-events" }
-# P-ID-08 (P-057): the S3 store is RLS-partitioned `(tenant, region)` with NO cross-tenant query
-# path — every store access is built through TenantScope/TenantQuery (the tenant-predicate floor),
-# and the store auto-registers as a PersonalDataHolder (the OltpStoreHolder seam). The OLTP tier
-# client (RLS guard + holder) lives in myelin-storage.
 myelin-storage = { path = "../myelin-storage" }
-# The iam.tuple_written event payload is references-not-payloads JSON (object#relation@subject
-# refs + the zookie watermark, never PII) built with `serde_json::json!`. The whole workspace
-# shares one serde_json::Value shape behind EventEnvelope.payload (workspace.dependencies).
 serde_json = { workspace = true }
-# P-ID-05 (P-064): the S1 principal store tags every PII column with the frozen
-# `#[personal_data(...)]` attribute (contract 10.2) referencing the five-tag classification enums
-# (DataCategory/DataRole/LawfulBasis/RetentionClass/ErasureMethod) so the no-untagged-personal-data
-# lint (contract 1.6) is GREEN on S1 and the store compiles against the FROZEN tags (never drift).
-# The PersonalDataHolder trait id the S1 store registers under also lives here (10.1).
 myelin-gdpr = { path = "../myelin-gdpr" }
-# P-133 (P-ID-22): the ONE platform predicate language. The promoted `CaveatContext`
-# evaluator (check_engine::eval_caveat) calls into the single bounded, DoS-hardened,
-# statically-cost-bounded `myelin-query` QueryAst interpreter (contract 3.4, the EventMatcher
-# core) — there is no second predicate language. A service crate (the terminal consumer ABOVE
-# the mid-tier library DAG) depends on myelin-query; nothing in the production library DAG
-# depends back on this service.
 myelin-query = { path = "../myelin-query" }
-# P-264 (NOTIF-P20, M3): the Notif registration seam (contract 7.6 define_notif_rule + the
-# read-fanout WatcherResolvePort, 4.3/4.10). Knowledge REGISTERS its define_notif_rule set
-# (mentions / comments / shares / watched) by constructing the frozen `myelin_notif::NotifRule`
-# values + wires its REAL page/space/database_row watcher reverse index behind the frozen
-# `myelin_notif::WatcherResolvePort` — Knowledge registers/produces, Notif owns the seam (ZERO
-# Notif code change, the inverse-signal property, EI-01 §1). This module lives in the
-# identity-service crate for the SAME §2.9-DAG reason `knowledge_fragment` does: `myelin-content`
-# (the Knowledge data-model leaf) MUST NOT depend back on Notif (Notif already depends ON content,
-# so the reverse edge would be a cycle), and Id already owns Knowledge's compiled authz content
-# (the `watcher` relation on space/page/database_row, contract 4.9). `myelin-notif` is a NAMED leaf
-# CONSUMER (it depends on no subsystem crate and NOTHING in `myelin-refs`/this service edges it) —
-# so this service crate (the graph's terminal consumer) may depend on it; nothing in the production
-# library DAG depends back. Notif's Reason/Class/NotifRule/WatcherResolvePort surface is frozen.
 myelin-notif = { path = "../myelin-notif" }
-# The `myelin_refs::ArtifactRef` the Notif router `classify`s a curated KN Signal under (the subject
-# the inbox item is about). A pure value carrier; no production DAG edge depends back on this service.
 myelin-refs = { path = "../myelin-refs" }
-# MR-008 expiry comparison (revocation.rs): RFC3339 token-TTL timestamps must be compared as INSTANTS,
-# not lexically — a raw string compare fails OPEN under differing fractional precision / non-`Z`
-# offsets (an expired token could read as live/not-revoked). REUSE the chrono already in the workspace
-# lock (sqlx pulls it); parse-only (`default-features = false`, no `clock` — we never read the wall
-# clock here). NON-optional: the default-build (in-memory) revocation path uses the same comparison.
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-# ------------------------------------------------------------------------------------------
-# MR-010a (SI-001/004, the OIDC slice of P-526): REAL OIDC ID-token (JWT) signature verification.
-# The verifier replaces the forgeable `StructuralVerifier` for the OIDC scheme with VETTED crypto —
-# NO hand-rolled signature math. All four crates below are ALREADY in Cargo.lock as transitive deps
-# (ring/rsa/base64 via the sqlx/rustls/aws stacks); these edges only PROMOTE them to direct deps, so
-# no new crate enters the dependency tree.
-#   - `ring` — ES256 (ECDSA P-256/SHA-256, fixed r‖s) + EdDSA (Ed25519) signature verification.
-#   - `rsa` + `sha2` — RS256 (RSA PKCS#1 v1.5 / SHA-256), constructed straight from the JWKS n/e.
-#   - `base64` — base64url (no-pad) decoding of the JWS compact segments (RFC 7515).
-# JWKS is INJECTED (no network in the crypto path); a runtime jwks_uri fetch is a later thin layer.
 ring = "0.17"
 rsa = "0.9"
-# `oid` enables `AssociatedOid` for Sha256 — required for the prefixed PKCS#1 v1.5 (RS256) DigestInfo.
-# Features are additive across the workspace; this widens the shared `sha2` build, breaking nothing.
 sha2 = { workspace = true, features = ["oid"] }
 base64 = "0.22"
-# ------------------------------------------------------------------------------------------
-# MR-011 (SI-002/003, the machine/capability-token slice of P-527): REAL PASETO v4.public
-# capability-token signing/verification + macaroon-style HMAC caveat attenuation + DPoP (RFC 9449).
-# The macaroon caveat chain binds each offline-added narrowing under the PREVIOUS tag, seeded from a
-# cell-held secret (so a holder can EXTEND/attenuate but cannot REMOVE a caveat) → amplification-proof.
-# `hmac` is the vetted RustCrypto HMAC (constant-time `verify_slice`); it is ALREADY in Cargo.lock
-# (transitive); this edge only PROMOTES it to a direct dep — no new crate enters the tree. The
-# Ed25519 sign/verify reuses `ring` (the SAME primitive the OIDC EdDSA + SSH paths already pull);
-# base64url is `base64`; the claims body is `serde_json`. NO hand-rolled signature/MAC math.
 hmac = "0.12"
-# ------------------------------------------------------------------------------------------
-# MR-010b (SI-001/004, the SAML slice of P-526): REAL SAML 2.0 XML-DSig signature verification.
-# `xmlparser` is a NON-EXPANDING, non-validating XML TOKENIZER — it emits DTD/entity tokens rather
-# than expanding them, which is exactly the property the XXE / billion-laughs defence needs (the
-# verifier refuses any DTD/entity token outright). It is ALREADY in Cargo.lock as a transitive dep
-# (via aws-smithy-xml); this edge only PROMOTES it to a direct dep, so no new crate enters the tree.
-# Exclusive c14n is hand-built (see saml.rs); the signature math reuses the SAME vetted primitives the
-# OIDC path already pulls (`rsa` + `sha2` for rsa-sha256, `ring` for ecdsa-p256-sha256). No C deps
-# (no libxml2 / openssl) — the security-conscious choice for this minefield (see saml.rs STEP-1 note).
 xmlparser = "0.13"
-# ------------------------------------------------------------------------------------------
-# MR-010c (SI-001/004, the passkey slice of P-526): REAL WebAuthn/FIDO2 assertion + attestation
-# verification. WebAuthn needs CBOR (the attestationObject + the COSE-encoded credential public key)
-# and COSE key parsing; no CBOR/COSE crate was in Cargo.lock. `ciborium` is a small, well-maintained,
-# PURE-Rust CBOR codec (NO C deps; it pulls only pure-Rust crates — ciborium-io/ll, half, crunchy). Its
-# `from_reader` is TOTAL (a malformed/truncated/garbage blob is an `Err`, never a panic — the fuzz
-# requirement). The signature math is NOT hand-rolled: COSE ES256 (ASN.1-DER, `ring`), RS256 (`rsa` +
-# `sha2`), and EdDSA (`ring`) reuse the SAME vetted primitives the OIDC/SSH paths already pull. The
-# X.509 attestation-cert chain (packed FULL / tpm / apple / android) is DEFERRED (refused, not faked) —
-# no pure-Rust X.509 chain verifier is in the lock, and a half-built one would be a security regression.
 ciborium = "0.2"
-# ------------------------------------------------------------------------------------------
-# MR-009b Wave 2 (SI-018/019/020): the durable PG backings for the S1 principal + S3 tuple + S7
-# revocation stores live in myelin-storage and are NOW compiled unconditionally (W1 made the storage
-# durable deps non-optional). The identity-layer stores delegate to them through the MR-022
-# SubstrateProvider + with_tenant_tx convention as the PRODUCTION DEFAULT; the sync store API drives
-# the async backing via a `tokio::runtime::Handle` (block_in_place + block_on — the same bridge
-# ValkeyCache/S3BlobStore use). These deps are NON-OPTIONAL (mirror W1): the durable `with_pg` path
-# is the always-compiled default, so `tokio`/`myelin-config` must be present in the DEFAULT build. The
-# in-memory doubles move behind `test-support` (below). `integration` is now a TEST-SELECTOR only.
 tokio = { workspace = true, features = ["signal"] }
 myelin-config = { workspace = true }
-# The MR-007/008 integration tests reach the live pool directly for migration setup + the GUC-bleed
-# probe + RLS-bypassing admin cleanup (the same posture as myelin-storage's integration tests).
-# NON-OPTIONAL (mirror W1) — used by the live-PG tests gated by `required-features = ["integration"]`.
 sqlx = { workspace = true }
 
 [dev-dependencies]
-# MR-010a: the OIDC negative/positive corpus MINTS real RSA keys to sign genuine test tokens (the
-# verifier only ever sees the PUBLIC half via the injected JWKS). `rand` 0.8 (rand_core 0.6,
-# compatible with rsa 0.9's keygen) is already in Cargo.lock — DEV-only, never in the prod graph.
 rand = "0.8"
-# P-ID-10 (P-068) ID-D3 drill: the failure-injection harness's telemetry-assertion library
-# (the contract-1.8 survival-signal set, incl. CrossTenantCount) the cross-tenant drill emits its
-# dated green artifact through. DEV-only — myelin-harness never enters the service production DAG.
 myelin-harness = { path = "../myelin-harness" }
-# P-ID-15 (P-073) CDC for 4.11: the critical-dep caller wraps `check` in the ResilientClient
-# (contract 1.9) — the M0 shared resilient inter-service client (timeout + breaker + bulkhead +
-# jittered retry). The CDC pins the provider (Identity `check` + S6 FailStatic) against the
-# consumer (a critical-dep caller wrapping the check in ResilientClient + S6). DEV-only — the
-# client never enters the identity-service production DAG; the CDC models a DOWNSTREAM consumer
-# of Identity (every other service is such a caller).
 myelin-client = { path = "../myelin-client" }
-# P-ID-23 (P-134) ID-D5 re-run: the frozen Agent-Fabric EffectApi trait + its plan-then-apply value
-# types (ProposedEffect / EffectResult / RunCtx, contract 8.2). The M2 re-run of ID-D5 drives a real
-# `impl EffectApi` whose capability+delegation step routes through Identity's `delegation_with_check_in`
-# (the agent never re-implements the algebra) — the Id-SIDE verification of the consumer integration.
-# DEV-only: myelin-agent is a frozen contract carrier; nothing in the identity-service production DAG
-# depends on it (the live EffectApi body is AG-P6 → P-218; this drill proves Id's half is consumed).
 myelin-agent = { path = "../myelin-agent" }
-# MR-009b Wave 2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
-# `tests/*.rs` integration-test files (a separate compilation unit that links the NORMAL lib, where
-# `#[cfg(test)]` is NOT active). The in-memory doubles (`PrincipalStore::new`/`TupleStore::new`/
-# `RevocationStore::new`/`StoreBackedCheck::new`) are now `#[cfg(any(test, feature = "test-support"))]`,
-# so the crate's own CDC/drill/e2e tests reach them ONLY when `test-support` is on. Listing the crate
-# as a DEV-dependency of itself with the feature is the sanctioned Cargo idiom (dev-dep cycles are
-# allowed; it does NOT affect the normal `cargo build`, which stays durable-by-default). This keeps
-# `cargo test -p myelin-identity-service` (DB-free) green without polluting the production build.
 myelin-identity-service = { path = ".", features = ["test-support"] }
 
 [features]
 default = []
-# MR-009b Wave 2: `integration` is now a TEST-SELECTOR only. The durable deps (tokio/myelin-config/
-# sqlx) are non-optional [dependencies] above, so the durable `with_pg` store path compiles in the
-# DEFAULT build (durable-by-default); `integration` no longer carries any `dep:` activation. It stays
-# the `required-features` marker on the live-PG tests (`tests/integration_*.rs`, the mr007/008/009/011
-# drills) + the `mr009_kill9_writer` bin, and turns on myelin-storage's integration feature (the live
-# broker surface for the durable tests). Do NOT delete it — the live-backend tests gate on it.
 integration = ["myelin-storage/integration"]
 
-# MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It gates the identity spine's
-# in-memory durable-store DOUBLES (PrincipalStore/TupleStore/RevocationStore/PseudonymStore Inner +
-# `Memory(..)` backend arms) so DOWNSTREAM crates enable them as a DEV-dependency (the in-memory
-# doubles are consumed cross-crate in non-test lib code; `#[cfg(test)]` is crate-local and can't
-# reach them). EMPTY in Wave 0 — established so later waves (W2) gate the doubles behind it + the
-# `no-in-memory-durable-store` scanner treats `feature = "test-support"` as a test-double gate. No
-# code moves behind it yet. `memory` is a documented alias.
-# MR-009b Wave 5: forwards to `myelin-storage/test-support` — the identity `test-support` surface
-# (e.g. `StoreBackedCheck::with_index`) constructs the storage in-memory `KmsEngine::new()` double,
-# which is itself `#[cfg(any(test, feature = "test-support"))]` as of Wave 5. Enabling the identity
-# doubles therefore requires the storage double to exist.
 test-support = ["myelin-storage/test-support"]
 memory = ["test-support"]

@@ -1,26 +1,9 @@
-//! # `integration_escape_gate` — the Fabric gate consumes the REAL P-239 attestation (AG-P17 → P-229)
-//!
-//! **Gated behind the `integration` feature** so the DEFAULT `cargo test --workspace` never depends
-//! on a VM-produced artifact. This test consumes the REAL green [`EscapeAttestation`] the CI-side
-//! escape drill wrote on a real Firecracker microVM (CI-P5 → P-239,
-//! `target/ag-d4-attestation/<date>.json`) and proves the Fabric exec gate ADMITS untrusted compute
-//! against it — the live, end-to-end half of the drill-as-gate (contract 8.4).
-//!
-//! Run with: `cargo test -p myelin-agent-service --features integration --test integration_escape_gate
-//! -- --nocapture`.
-//!
-//! The default (VM-free) consumer contract is pinned in `tests/cdc_8_4_escape_gate.rs`; this test adds
-//! the REAL-artifact leg. If the artifact is absent (the drill has not run on this host), the test
-//! proves the gate is fail-closed on the absent artifact (no green attestation ⇒ no untrusted compute)
-//! and reports it — it never fakes a green.
 #![cfg(feature = "integration")]
 
 use myelin_agent_service::escape_gate::{AgentExecGate, GateRefusal, ProductionBackendId};
 use myelin_ci_sandbox::EscapeAttestation;
 use std::path::PathBuf;
 
-/// The directory the P-239 drill writes the dated attestation artifact into (workspace
-/// `target/ag-d4-attestation/`).
 fn attestation_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
@@ -29,7 +12,6 @@ fn attestation_dir() -> PathBuf {
         .join("ag-d4-attestation")
 }
 
-/// Load the most recent attestation artifact JSON, if any was produced by the real drill.
 fn latest_attestation() -> Option<(PathBuf, EscapeAttestation)> {
     let dir = attestation_dir();
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -52,9 +34,6 @@ fn the_fabric_gate_admits_on_the_real_p239_attestation_or_is_fail_closed_without
                 "[AG-D4] consuming REAL attestation artifact: {}",
                 path.display()
             );
-            // The gate's required production identity is taken FROM the attestation the real drill
-            // produced (the runner's pinned images / corpus). Admitting against this identity proves
-            // the Fabric exec path is gated on the REAL green attestation, end-to-end.
             let id = ProductionBackendId {
                 backend: att.gate_backend,
                 rootfs_sha256: att.rootfs_sha256.clone(),
@@ -66,8 +45,6 @@ fn the_fabric_gate_admits_on_the_real_p239_attestation_or_is_fail_closed_without
             println!("{}", gate.open_line());
             assert_eq!(att.total_escapes, 0, "the real attestation is ZERO escapes");
 
-            // The permanent gate: a changed identity (a different corpus version) does NOT admit the
-            // real attestation — it must be re-drilled.
             let mut changed = id.clone();
             changed.corpus_version = att.corpus_version + 1;
             assert!(matches!(
@@ -76,9 +53,8 @@ fn the_fabric_gate_admits_on_the_real_p239_attestation_or_is_fail_closed_without
             ));
         }
         None => {
-            // No real artifact on this host — prove the gate is fail-closed (never a faked green).
             println!(
-                "[AG-D4] no real attestation artifact found at {} — the drill has not run on this \
+                "[AG-D4] no real attestation artifact found at {} - the drill has not run on this \
                  host; proving the gate is FAIL-CLOSED (no green attestation ⇒ no untrusted compute)",
                 attestation_dir().display()
             );

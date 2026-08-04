@@ -1,23 +1,3 @@
-//! # The CDC pair for contract 5.5 — Git typed-edge (lifecycle) mirror edges (GIT-P19 / P-280)
-//!
-//! **Contract:**
-//! - **5.5** the TE-7 typed-edge mirror — lifecycle edges (`closes`/`relates`/…) emitted by the producer
-//!   subsystem, mirrored into the Refs projection as `rel_class='lifecycle'`; the producer is the source
-//!   of truth, Refs holds the rebuildable projection + fixes the inverse pairing. Provider = Git's
-//!   PR-lifecycle producer ([`myelin_git::typed_edges`]); consumer = the Refs mirror
-//!   (`myelin_refs_service::mirror`).
-//!
-//! **The seam this pair pins.** Git is a producer LEAF and CANNOT depend on the Refs SERVICE crate (the
-//! §2.9 acyclic DAG — and `myelin-refs-service` already depends ON `myelin-git`, so the edge is
-//! one-directional by construction). So the Git-owned producer half
-//! ([`myelin_git::typed_edges::emit_lifecycle_edges`]) must emit the **byte-identical**
-//! `refs.edge.created` (`rel_class='lifecycle'`) wire shape the Refs mirror consumer ingests. This CDC
-//! models the CONSUMER half locally — the exact field reads + the deterministic `edge_id` derivation
-//! (`edge_id`) + the mirror's FORWARD + INVERSE projection (`mirror_edges`: `relates` is symmetric, the
-//! endpoints swapped; `closes` has no frozen inverse token yet → forward only) — and PROVES the
-//! provider's emitted envelope ingests through it with the correct edge identity AND that the Refs
-//! mirror would project the expected forward/inverse pair. A drift on either side fails this one CI job.
-
 use std::sync::Arc;
 
 use myelin_events::{
@@ -30,16 +10,9 @@ use myelin_git::project::git_pr_ref;
 use myelin_git::typed_edges::{emit_lifecycle_edges, extract_lifecycle_edges, LifecycleRel};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
-// ── The CONSUMER half (the Refs mirror's field reads + the deterministic edge_id + the forward/inverse
-//    projection), modelled here so this crate need not depend on the Refs service crate (the §2.9 DAG
-//    one-directional edge). These MUST stay byte-identical to `myelin_refs_service::edge_builder::edge_id`
-//    and `myelin_refs_service::mirror::{LifecycleRel, mirror_edges}`. ─────────────────────────────────
-
-/// The deterministic `edge_id = hash(tenant, source, target, rel)` — byte-identical to
-/// `myelin_refs_service::edge_builder::edge_id` (FNV-1a 128-bit over the NUL-separated tuple).
 fn consumer_edge_id(tenant: &str, source: &str, target: &str, rel: &str) -> String {
-    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d; // FNV-1a 128-bit offset basis.
-    const PRIME: u128 = 0x0000000001000000000000000000013b; // FNV-1a 128-bit prime.
+    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013b;
     let mut feed = |bytes: &[u8]| {
         for &b in bytes {
             h ^= b as u128;
@@ -55,7 +28,6 @@ fn consumer_edge_id(tenant: &str, source: &str, target: &str, rel: &str) -> Stri
     format!("{h:032x}")
 }
 
-/// The consumer's view of a projected lifecycle edge (the fields the Refs mirror's `EdgeRow` carries).
 #[derive(Debug, PartialEq, Eq, Clone)]
 struct ProjectedEdge {
     edge_id: String,
@@ -65,22 +37,14 @@ struct ProjectedEdge {
     rel_class: String,
 }
 
-/// The CONSUMER's inverse pairing — byte-identical to `myelin_refs_service::mirror::LifecycleRel::inverse`
-/// for the two rels Git produces. `relates` is SYMMETRIC (same rel, endpoints swapped); `closes` has no
-/// frozen inverse token yet (forward only — the REF-P18/REF-P20 floor). `None` here means "no inverse
-/// leg projected".
 fn consumer_inverse(rel: &str) -> Option<&'static str> {
     match rel {
-        "relates" => Some("relates"), // symmetric: same rel, endpoints swapped.
-        "closes" => None,             // Inverse::None floor — forward only.
+        "relates" => Some("relates"),
+        "closes" => None,
         other => panic!("git only produces closes/relates, got {other}"),
     }
 }
 
-/// The CONSUMER mirror: read `source`/`target`/`rel`/`rel_class` off the `refs.edge.created` envelope,
-/// validate the lifecycle class, then project the FORWARD lifecycle edge AND (if the rel has a frozen
-/// inverse) the INVERSE edge with the endpoints swapped — exactly what `mirror_edges` does. Each row
-/// carries the deterministic `edge_id`. Returns `Err(field)` if a required field is missing (fail-closed).
 fn consumer_mirror(env: &EventEnvelope) -> Result<Vec<ProjectedEdge>, String> {
     assert_eq!(
         env.type_.0, "refs.edge.created",
@@ -98,7 +62,6 @@ fn consumer_mirror(env: &EventEnvelope) -> Result<Vec<ProjectedEdge>, String> {
     );
 
     let tenant = &env.tenant.0;
-    // Forward leg.
     let mut rows = vec![ProjectedEdge {
         edge_id: consumer_edge_id(tenant, &source, &target, &rel),
         source: source.clone(),
@@ -106,7 +69,6 @@ fn consumer_mirror(env: &EventEnvelope) -> Result<Vec<ProjectedEdge>, String> {
         rel: rel.clone(),
         rel_class: rel_class.clone(),
     }];
-    // Inverse leg (the Refs mirror's, not Git's): endpoints swapped, the inverse rel token.
     if let Some(inv) = consumer_inverse(&rel) {
         rows.push(ProjectedEdge {
             edge_id: consumer_edge_id(tenant, &target, &source, inv),
@@ -135,8 +97,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// The PR's `git.pr.merged` lifecycle event (the CAUSE) — the merge write holds it in hand; the
-/// lifecycle edges co-commit with the PR state change in the SAME transaction.
 fn merged_event(source: &ArtifactRef) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId("01J-merged".into()),
@@ -169,14 +129,6 @@ fn issue(key: &str) -> ArtifactRef {
     ArtifactRef(format!("myelin://acme/issue/issue/{key}"))
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-// 5.5 — the PROVIDER (Git PR lifecycle) emits the wire shape the CONSUMER (Refs mirror) ingests
-// ─────────────────────────────────────────────────────────────────────────────────────────────────
-
-/// **A Git-emitted `closes` lifecycle edge mirrors through the Refs consumer to the SAME deterministic
-/// `edge_id`, with `rel_class = lifecycle` and FORWARD-ONLY projection** (`closes` has no frozen inverse
-/// token yet — the REF-P18/REF-P20 floor). This is the 5.5 provider↔consumer equivalence for the
-/// trailer-driven close edge.
 #[test]
 fn git_closes_edge_mirrors_through_the_refs_consumer_forward_only() {
     let outbox = OutboxStore::new();
@@ -196,7 +148,6 @@ fn git_closes_edge_mirrors_through_the_refs_consumer_forward_only() {
 
     let env = outbox.row(&ids[0]).unwrap().envelope;
     let projected = consumer_mirror(&env).expect("the Refs mirror ingests the Git lifecycle edge");
-    // FORWARD ONLY — closes has no frozen inverse (the floor).
     assert_eq!(
         projected.len(),
         1,
@@ -213,10 +164,6 @@ fn git_closes_edge_mirrors_through_the_refs_consumer_forward_only() {
     );
 }
 
-/// **A Git-emitted `relates` lifecycle edge mirrors through the Refs consumer to BOTH directions** (the
-/// symmetric pair — the Refs mirror projects the forward AND the endpoint-swapped inverse, both
-/// `relates`, both lifecycle-class). Git emits ONLY the forward; the BOTH-directions traversal is the
-/// Refs mirror's discipline.
 #[test]
 fn git_relates_edge_mirrors_to_both_directions_through_the_refs_consumer() {
     let outbox = OutboxStore::new();
@@ -231,7 +178,6 @@ fn git_relates_edge_mirrors_to_both_directions_through_the_refs_consumer() {
         emit_lifecycle_edges(&mut tx, &source, &[], std::slice::from_ref(&linked), &ev).unwrap();
     tx.commit().unwrap();
 
-    // Git emits exactly ONE forward event (the inverse is the Refs mirror's projection, not a second emit).
     assert_eq!(
         ids.len(),
         1,
@@ -246,15 +192,12 @@ fn git_relates_edge_mirrors_to_both_directions_through_the_refs_consumer() {
         "relates is symmetric → the mirror projects BOTH directions"
     );
 
-    // forward: PR 42 → PR 7.
     assert_eq!(projected[0].rel, "relates");
     assert_eq!(projected[0].source, source.0);
     assert_eq!(projected[0].target, linked.0);
-    // inverse: PR 7 → PR 42 (same rel, endpoints swapped).
     assert_eq!(projected[1].rel, "relates");
     assert_eq!(projected[1].source, linked.0);
     assert_eq!(projected[1].target, source.0);
-    // both legs carry their own deterministic edge_id (distinct rows, idempotent rebuild).
     assert_eq!(
         projected[0].edge_id,
         consumer_edge_id("acme", &source.0, &linked.0, "relates")
@@ -269,8 +212,6 @@ fn git_relates_edge_mirrors_to_both_directions_through_the_refs_consumer() {
     );
 }
 
-/// **The frozen lifecycle tokens are exactly the Refs mirror wire tokens** (the names anchor X-5; no
-/// second vocabulary). The lifecycle class is NEVER the reference class (a content edge's).
 #[test]
 fn git_lifecycle_tokens_match_the_refs_mirror_vocabulary() {
     assert_eq!(LifecycleRel::Closes.as_str(), "closes");

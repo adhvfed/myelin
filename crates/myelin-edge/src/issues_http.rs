@@ -1,11 +1,3 @@
-//! Durable Issues product routes mounted on the production Edge.
-//!
-//! The handler receives only the gateway's verified principal and delegates every operation to
-//! [`PgIssueStore`]. Lists use the materialized effective `issue:view` projection in the store's
-//! SQL query; object reads and writes are guarded by a live strong ReBAC decision and then checked
-//! again at the durable store boundary. No handler accepts tenant, region, creator, or subject from
-//! a path, query, or body.
-
 use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
@@ -21,16 +13,11 @@ use std::future::Future;
 use std::sync::Arc;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
-/// Tight per-route JSON bound. The transport's larger 100 MiB ceiling exists for Git packfiles;
-/// issue mutations carry at most a 512-byte title plus three short identifiers.
 pub const MAX_ISSUE_JSON_BYTES: usize = 4 * 1024;
 const AUTHORIZATION_STATUS_RETRY_AFTER_MS: u64 = 1_000;
 
 type ProductionIssueStore = PgIssueStore<StoreBackedIssueAuthorizer>;
 
-/// Sync adapter required by Edge's established object-safe Handler ABI. Production runs on Tokio's
-/// multi-thread runtime, where `block_in_place` yields the worker before the async PostgreSQL call.
-/// A current-thread runtime is refused as unavailable instead of panicking or applying a mutation.
 #[derive(Clone)]
 struct DurableIssueHttpApi {
     store: Arc<ProductionIssueStore>,
@@ -145,9 +132,7 @@ fn is_canonical_uuid(value: &str) -> bool {
 fn map_store_error(error: IssueStoreError) -> EdgeError {
     match error {
         IssueStoreError::BadInput(reason) => EdgeError::BadRequest(reason),
-        // An absent object and an object denied by ReBAC deliberately share one envelope.
         IssueStoreError::NotFound => EdgeError::NotFound("issue not found".into()),
-        // Projection state, tuple faults, and policy internals are not client-visible.
         IssueStoreError::AuthorizationUnavailable(_) => {
             EdgeError::Unavailable("issue authorization is temporarily unavailable".into())
         }
@@ -265,8 +250,6 @@ impl Handler for IssueCreateHandler {
             .api
             .drive(self.api.store.create(ctx.principal, proposal))
             .map_err(map_store_error)?;
-        // Creation is intentionally asynchronous: the row remains invisible until the durable
-        // Identity tuple reconciler activates the staged binding.
         Ok(no_store(EdgeResponse::json(
             202,
             &json!({
@@ -350,8 +333,6 @@ impl Handler for IssueCloseHandler {
                 "Issues request body exceeds {MAX_ISSUE_JSON_BYTES} bytes"
             )));
         }
-        // Close currently accepts no mutable client fields. Rejecting a non-empty body prevents a
-        // caller from believing a supplied tenant, state, reason, or version was honored.
         if !ctx.request.body.is_empty() {
             let value = ctx.request.json_body()?;
             if value.as_object().is_none_or(|object| !object.is_empty()) {
@@ -369,9 +350,6 @@ impl Handler for IssueCloseHandler {
     }
 }
 
-/// Registration-time object guard for every route carrying `{issue}`. This is independent of the
-/// identical check inside PgIssueStore, so future handler refactors cannot silently turn an
-/// object-addressed route into action-only authorization.
 struct IssueObjectGuard {
     authorizer: StoreBackedIssueAuthorizer,
     permission: IssuePermission,
@@ -403,8 +381,6 @@ fn guarded(
     })
 }
 
-/// Mount the useful durable Issues floor: keyset list, create receipt/status, leak-free object
-/// view, and idempotent close. Every action is separately capability-mapped in the Edge catalogue.
 pub fn register_issues(
     builder: GatewayBuilder,
     store: Arc<PgIssueStore<StoreBackedIssueAuthorizer>>,
@@ -425,8 +401,6 @@ pub fn register_issues(
             "issues.create",
             Arc::new(IssueCreateHandler { api: api.clone() }),
         )
-        // Register the fixed authorization-request namespace before the `{issue}` route so a
-        // request receipt can never be interpreted as an issue identifier.
         .route(
             Method::Get,
             "/v1/issues/authorization-requests/{request_event_id}",

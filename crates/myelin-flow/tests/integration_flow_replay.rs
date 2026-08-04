@@ -1,28 +1,3 @@
-//! Live-Postgres integration test (Stage 1 / infra) — the FLOW-D1 deterministic replay/recovery +
-//! LEASE-based crash recovery proven against REAL Postgres (P-FLOW-05 / P-202).
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free (the binding-policy floor — no DB at build). This runs
-//! ONLY against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-flow --features integration --test integration_flow_replay -- --nocapture
-//!
-//! Endpoints come from the myelin-config dev defaults (the dev<->prod CONFIG SWAP seam), so the same
-//! test runs against Scaleway (fr-par) by exporting the prod env vars — never a code change.
-//!
-//! It proves, against REAL Postgres, the two FLOW-D1 properties the in-memory `engine` model
-//! (`src/engine.rs`) asserts:
-//!
-//!   1. **Lease-based crash recovery (§4.7):** a runnable `workflow_run` row is leased with `UPDATE …
-//!      WHERE lease_owner IS NULL OR lease_expires <= now FOR UPDATE SKIP LOCKED` (the real claim);
-//!      a LIVE lease is skip-locked (no second worker steals it); an EXPIRED lease re-leases to
-//!      another worker — crash recovery, in real Postgres.
-//!   2. **Deterministic replay short-circuit (§4.1):** a worker that re-drives a half-journaled run
-//!      reads `wf_history` ordered by `seq` and SHORT-CIRCUITS every already-journaled `command_id`
-//!      (the journaled RESULT is returned, the activity is NOT re-executed). The cursor-keyed scan
-//!      resumes at the first un-journaled command — 0 re-executed side effects, against the REAL
-//!      frozen `wf_history` `UNIQUE(tenant_id, run_id, command_id)` journaling-idempotency key.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -46,9 +21,6 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     let run_tbl = format!("workflow_run_replay_{pid}");
     let hist_tbl = format!("wf_history_replay_{pid}");
 
-    // The REAL frozen DDL shapes (with per-pid table names so concurrent runs isolate). The
-    // workflow_run DDL names the lease columns + cursor + state CHECK; wf_history names the
-    // UNIQUE(tenant_id, run_id, command_id) replay key.
     let run_create = WORKFLOW_RUN_DDL.replacen("workflow_run", &run_tbl, 1);
     let hist_create = WF_HISTORY_DDL.replacen("wf_history", &hist_tbl, 1);
     for tbl in [&run_tbl, &hist_tbl] {
@@ -66,8 +38,6 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
         .await
         .expect("the wf_history DDL applies");
 
-    // Seed a runnable run (state running, cursor 0, UNLEASED) + journal its first 5 of 10 activities
-    // (the crash point — a worker journaled 5 steps then died, the journal is the source of truth).
     sqlx::query(&format!(
         "INSERT INTO {run_tbl} \
          (tenant_id, region, run_id, wf_type, wf_version, input, state, cursor, correlation_id, depth, partition) \
@@ -87,9 +57,6 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
         .expect("journal the crashed worker's step");
     }
 
-    // (1) LEASE-BASED CRASH RECOVERY (§4.7). The real claim: lease the run for worker-2 IFF it is
-    //     running AND its lease is free (unleased OR expired), FOR UPDATE SKIP LOCKED. The seeded run
-    //     is unleased → worker-2 wins it, stamping lease_owner + lease_expires = now + 30s.
     let now_secs: i64 = 1000;
     let leased = sqlx::query(&format!(
         "UPDATE {run_tbl} SET lease_owner = 'worker-2', \
@@ -111,7 +78,6 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
         "the re-leased run resumes from cursor 5"
     );
 
-    // a SECOND worker cannot steal the LIVE-leased run (the lease has not expired) — skip-locked.
     let steal_blocked = sqlx::query(&format!(
         "SELECT count(*)::bigint AS c FROM {run_tbl} \
          WHERE partition = 0 AND state = 'running' \
@@ -126,10 +92,6 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
         "the live-leased run is not re-leasable (skip-locked, no double-drive)"
     );
 
-    // (2) DETERMINISTIC REPLAY SHORT-CIRCUIT (§4.1). The re-driving worker reads wf_history ordered
-    //     by seq; for each of the 10 commands the body issues, it checks whether the command_id is
-    //     already journaled — if so it RETURNS the journaled result (no re-execution). We model the
-    //     drive: read the journaled command_ids, then for command 0..=9 decide replay vs execute.
     let journaled: Vec<String> = sqlx::query(&format!(
         "SELECT command_id FROM {hist_tbl} WHERE tenant_id='acme' AND run_id='R1' ORDER BY seq"
     ))
@@ -149,10 +111,8 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     for k in 0..10i64 {
         let command_id = format!("agent.run:{k}");
         if journaled.contains(&command_id) {
-            // REPLAY: the journaled result is returned; the activity is NOT re-executed.
             continue;
         }
-        // LIVE: this command is past the cursor — execute + journal it (the resumed work).
         executed.push(k);
         sqlx::query(&format!(
             "INSERT INTO {hist_tbl} (tenant_id, region, run_id, seq, kind, command_id, result) \
@@ -163,14 +123,12 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
         .await
         .expect("journal the resumed live command");
     }
-    // THE FLOW-D1 ASSERTION: only 5..=9 executed (0..=4 replayed) — resumed at step 6, 0 re-execution.
     assert_eq!(
         executed,
         vec![5, 6, 7, 8, 9],
-        "resumed at step 6 — only 5..=9 ran; 0..=4 replayed"
+        "resumed at step 6 - only 5..=9 ran; 0..=4 replayed"
     );
 
-    // 0 lost progress + 0 duplicate journal rows: exactly 10 history rows (the UNIQUE key held).
     let total: i64 = sqlx::query(&format!(
         "SELECT count(*)::bigint AS c FROM {hist_tbl} WHERE tenant_id='acme' AND run_id='R1'"
     ))
@@ -183,8 +141,6 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
         "10 journaled, 0 lost progress, 0 duplicate (the UNIQUE(command_id) key)"
     );
 
-    // the UNIQUE(tenant_id, run_id, command_id) replay key BITES — a re-journal of a replayed command
-    // is rejected (the silent-double-effect floor under replay, §3.2).
     let dup = sqlx::query(&format!(
         "INSERT INTO {hist_tbl} (tenant_id, region, run_id, seq, kind, command_id) \
          VALUES ('acme','fr-par','R1',99,'activity_completed','agent.run:0')"
@@ -196,7 +152,6 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
         "the UNIQUE replay key rejects a re-journal of a replayed command (§3.2)"
     );
 
-    // settle the run completed + release the lease (the drive finished).
     sqlx::query(&format!(
         "UPDATE {run_tbl} SET state='completed', cursor=10, lease_owner=NULL, lease_expires=NULL \
          WHERE tenant_id='acme' AND run_id='R1'"
@@ -205,7 +160,6 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     .await
     .unwrap();
 
-    // cleanup
     for tbl in [&run_tbl, &hist_tbl] {
         sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
             .execute(&admin)
@@ -217,12 +171,6 @@ async fn flow_d1_lease_crash_recovery_and_replay_short_circuit_in_real_postgres(
     );
 }
 
-/// **FLOW-D2 (live-PG): the replay-divergence guard dead-letters a run as `nondeterministic` in REAL
-/// Postgres (P-FLOW-07).** Drives the in-memory engine's divergence guard to its terminal verdict and
-/// proves the dead-letter row PERSISTS to the real `workflow_run` — the `state` CHECK admits
-/// `nondeterministic` (the frozen DDL) and a divergent run lands there, never silently continues. The
-/// `nondeterministic`-halt count is the green artifact; here we prove its terminal write is durable
-/// against the live state-CHECK (a state the CHECK rejected would error the UPDATE — the floor).
 #[tokio::test]
 async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres() {
     use myelin_events::{Actor, EmitContextBase, MonotonicMinter, OutboxStore, Timestamp};
@@ -258,7 +206,6 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
         .await
         .expect("the workflow_run DDL applies");
 
-    // Seed a runnable run pinned to wf_version=1 in real Postgres.
     sqlx::query(&format!(
         "INSERT INTO {run_tbl} \
          (tenant_id, region, run_id, wf_type, wf_version, input, state, cursor, correlation_id, depth, partition) \
@@ -268,8 +215,6 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
     .await
     .expect("seed the runnable run");
 
-    // Drive the in-memory engine's divergence guard: a v1-pinned run replayed with v2 (a deploy bump)
-    // — the guard halts as nondeterministic WITHOUT running a command (the version-divergence leg).
     let ctx_base = EmitContextBase {
         tenant: TenantId("acme".into()),
         region: Region("fr-par".into()),
@@ -328,7 +273,6 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
         "the nondeterministic-halt count incremented by exactly 1"
     );
 
-    // PERSIST the dead-letter to REAL Postgres — the state CHECK MUST admit 'nondeterministic'.
     let settled = runs.get(&TenantId("acme".into()), "RD").unwrap();
     assert_eq!(
         settled.state,
@@ -342,9 +286,8 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
     .bind(&settled.state)
     .execute(&admin)
     .await
-    .expect("the dead-letter state persists — the frozen state CHECK admits 'nondeterministic'");
+    .expect("the dead-letter state persists - the frozen state CHECK admits 'nondeterministic'");
 
-    // read it back: the run is durably 'nondeterministic' (terminal, never re-driven by the wf_runnable index).
     let st: String = sqlx::query(&format!("SELECT state FROM {run_tbl} WHERE run_id='RD'"))
         .fetch_one(&admin)
         .await
@@ -354,7 +297,6 @@ async fn flow_d2_divergence_guard_dead_letters_nondeterministic_in_real_postgres
         st, "nondeterministic",
         "the dead-letter row persists in real Postgres"
     );
-    // it is NOT runnable (the partial wf_runnable index covers only state IN ('running')).
     let runnable: i64 = sqlx::query(&format!(
         "SELECT count(*) AS c FROM {run_tbl} WHERE partition=0 AND state='running'"
     ))

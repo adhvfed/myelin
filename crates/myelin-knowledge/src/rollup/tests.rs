@@ -1,11 +1,3 @@
-//! Unit tests for the read-time formula/rollup engine (KN-P18 / P-308, §4.2):
-//! - each [`RollupFn`] (COUNT/SUM/MIN/MAX/AVG) over a permission-filtered related set;
-//! - the bounded [`FormulaExpr`] arithmetic evaluator (Int-only; #ERROR fail-closed);
-//! - the depth-bound + cycle detection → [`CellValue::Cycle`] (`#CYCLE`, never a loop);
-//! - the permission-filtered rollup conjoin (0 rollup leak — a restricted target is uncounted);
-//! - the dependency-graph ordering (a formula referencing a rollup referencing a property);
-//! - the static cost-bound rejection (an over-budget / over-deep formula is refused at build).
-
 use super::*;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_query::{FieldId, FieldValue};
@@ -25,8 +17,6 @@ fn fid(s: &str) -> FieldId {
     FieldId::new(s)
 }
 
-/// A test fixture: a source row with N rollup_source edges to target rows carrying an Int `amount`,
-/// the viewer granted read of a subset (the rest are the leak witnesses).
 struct Fixture {
     tenant: TenantId,
     region: Region,
@@ -36,8 +26,6 @@ struct Fixture {
 }
 
 impl Fixture {
-    /// Build a fixture: `src` related to `targets` (id, amount); `granted` is the subset the viewer
-    /// may read (the rest are present in the relation but ACL-hidden — the leak witnesses).
     fn build(src: &str, targets: &[(&str, i64)], granted: &[&str]) -> Fixture {
         let tenant = TenantId("acme".into());
         let region = Region::new("fr-par");
@@ -89,11 +77,8 @@ impl Fixture {
     }
 }
 
-// ───────────────────────────── each RollupFn ──────────────────────────────
-
 #[test]
 fn rollup_count_over_visible_related_rows() {
-    // 4 targets, 3 granted: COUNT == 3 (the hidden 4th is uncounted).
     let fx = Fixture::build(
         "src:1",
         &[("t:1", 10), ("t:2", 20), ("t:3", 30), ("t:secret", 99)],
@@ -152,7 +137,6 @@ fn rollup_sum_min_max_avg_over_visible_numeric_targets() {
 
 #[test]
 fn rollup_min_max_over_empty_visible_set_is_empty_diagnostic() {
-    // All targets hidden → the visible set is empty: MIN/MAX → #EMPTY; SUM/COUNT/AVG → 0.
     let fx = Fixture::build("src:1", &[("t:1", 10), ("t:2", 20)], &[]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
@@ -190,12 +174,8 @@ fn rollup_min_max_over_empty_visible_set_is_empty_diagnostic() {
     );
 }
 
-// ───────────────────────── the permission-filtered conjoin (0 rollup leak) ────────────────────────
-
 #[test]
 fn rollup_permission_filtered_restricted_target_never_summed_or_counted() {
-    // A restricted target (amount 1000) must NOT contribute to the SUM/COUNT for the unauthorized
-    // viewer — the 0-rollup-leak gate (composing with KN-D5).
     let fx = Fixture::build(
         "src:1",
         &[("t:1", 5), ("t:2", 5), ("t:secret", 1000)],
@@ -231,19 +211,17 @@ fn rollup_permission_filtered_restricted_target_never_summed_or_counted() {
     assert_eq!(
         sum,
         CellValue::Int(10),
-        "0 rollup leak: SUM = 10 (5+5), NOT 1010 — the restricted 1000 is uncounted"
+        "0 rollup leak: SUM = 10 (5+5), NOT 1010 - the restricted 1000 is uncounted"
     );
     assert_eq!(
         count,
         CellValue::Int(2),
-        "0 rollup leak: COUNT = 2, NOT 3 — the restricted row is uncounted"
+        "0 rollup leak: COUNT = 2, NOT 3 - the restricted row is uncounted"
     );
 }
 
 #[test]
 fn rollup_max_does_not_leak_a_restricted_higher_target() {
-    // The restricted target is the MAX — proving the leak would be a value disclosure, not just a
-    // count. MAX over the visible set must NOT reveal the hidden higher value.
     let fx = Fixture::build(
         "src:1",
         &[("t:1", 7), ("t:2", 9), ("t:secret", 9999)],
@@ -263,15 +241,12 @@ fn rollup_max_does_not_leak_a_restricted_higher_target() {
     assert_eq!(
         out,
         CellValue::Int(9),
-        "0 rollup leak: MAX = 9 (visible), NOT 9999 (restricted) — no value disclosure"
+        "0 rollup leak: MAX = 9 (visible), NOT 9999 (restricted) - no value disclosure"
     );
 }
 
-// ───────────────────────── arithmetic + the dependency-graph ordering ─────────────────────────────
-
 #[test]
 fn formula_arithmetic_over_props_and_rollups() {
-    // total = SUM(amount) + base; the dependency graph: a formula reads a rollup AND a property.
     let fx = Fixture::build("src:1", &[("t:1", 10), ("t:2", 20)], &["t:1", "t:2"]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
@@ -294,7 +269,6 @@ fn formula_arithmetic_over_props_and_rollups() {
 
 #[test]
 fn formula_referencing_another_formula_resolves_in_dependency_order() {
-    // c = b * 2; b = a + 1; a = Prop. The graph must resolve a → b → c.
     let fx = Fixture::build("src:1", &[], &[]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
@@ -352,8 +326,6 @@ fn formula_divide_by_zero_is_error_never_panic() {
 
 #[test]
 fn formula_arithmetic_results_are_exact() {
-    // Pin the exact arithmetic results so a `+`→`-`/`*`→`/`/`/`→`*`/`%` operator mutant is caught
-    // (the cost-of-an-aggregate formula uses every op; a mutated op changes the value).
     let fx = Fixture::build("src:1", &[], &[]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
@@ -395,7 +367,6 @@ fn formula_arithmetic_results_are_exact() {
 
 #[test]
 fn formula_arithmetic_on_non_int_is_error() {
-    // base is a Text property: arithmetic over it is un-evaluable → #ERROR (never coerced).
     let fx = Fixture::build("src:1", &[], &[]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
@@ -435,11 +406,8 @@ fn formula_missing_property_is_error() {
     );
 }
 
-// ───────────────────────────── the cycle gate (#CYCLE, never a loop) ──────────────────────────────
-
 #[test]
 fn direct_self_cycle_is_cycle_diagnostic_never_loops() {
-    // a = a → #CYCLE (the simplest cycle).
     let fx = Fixture::build("src:1", &[], &[]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
@@ -458,7 +426,6 @@ fn direct_self_cycle_is_cycle_diagnostic_never_loops() {
 
 #[test]
 fn mutual_cycle_is_cycle_diagnostic() {
-    // a = b + 1; b = a + 1 → both #CYCLE.
     let fx = Fixture::build("src:1", &[], &[]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
@@ -493,8 +460,6 @@ fn mutual_cycle_is_cycle_diagnostic() {
 
 #[test]
 fn cycle_through_arithmetic_propagates_not_masked() {
-    // c = (a) * 1 where a cycles — the cycle must propagate through the arithmetic wrapper, not be
-    // masked as #ERROR (the cycle diagnosis is the bounded-evaluation green artifact).
     let fx = Fixture::build("src:1", &[], &[]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
@@ -521,8 +486,6 @@ fn cycle_through_arithmetic_propagates_not_masked() {
 
 #[test]
 fn long_acyclic_chain_resolves_within_depth_bound() {
-    // f0 = Prop; f1 = f0 + 1; …; f50 = f49 + 1. A deep BUT acyclic chain resolves (not a false
-    // #CYCLE) — the visited-set, not a blanket depth cap, distinguishes a cycle from a deep chain.
     let fx = Fixture::build("src:1", &[], &[]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
@@ -552,13 +515,10 @@ fn long_acyclic_chain_resolves_within_depth_bound() {
 
 #[test]
 fn acyclic_chain_at_dependency_depth_bound_resolves_pinning_the_guard() {
-    // A FormulaRef chain whose depth reaches EXACTLY MAX_DEPENDENCY_DEPTH must still resolve (not a
-    // false #CYCLE) — this exercises the `depth > MAX_DEPENDENCY_DEPTH` guard at its boundary so a
-    // `>`→`==`/`>=` mutant (which would return #CYCLE at depth == the bound) flips this assertion.
     let fx = Fixture::build("src:1", &[], &[]);
     let v = viewer("p:viewer", "acme");
     let r = fx.resolver();
-    let chain = MAX_DEPENDENCY_DEPTH; // the deepest acyclic chain whose walk reaches the bound.
+    let chain = MAX_DEPENDENCY_DEPTH;
     let mut fields = vec![FormulaField {
         field: fid("g0"),
         expr: FormulaExpr::Prop(fid("x")),
@@ -580,12 +540,8 @@ fn acyclic_chain_at_dependency_depth_bound_resolves_pinning_the_guard() {
     );
 }
 
-// ───────────────────────────── static cost-bound rejection ────────────────────────────────────────
-
 #[test]
 fn over_deep_formula_is_rejected_at_build() {
-    // A nested arithmetic tree exceeding MAX_FORMULA_DEPTH is refused at schema build (before any
-    // evaluation) — the DoS-hardening surface, fail-closed.
     let mut expr = FormulaExpr::Lit(Literal::Int(1));
     for _ in 0..(MAX_FORMULA_DEPTH + 5) {
         expr = FormulaExpr::Add(Box::new(expr), Box::new(FormulaExpr::Lit(Literal::Int(1))));
@@ -603,11 +559,7 @@ fn over_deep_formula_is_rejected_at_build() {
 
 #[test]
 fn formula_exactly_at_depth_bound_is_accepted_one_over_is_rejected() {
-    // A tree of EXACTLY MAX_FORMULA_DEPTH is accepted; depth+1 is rejected. This pins the strict
-    // `>` boundary (a `>`→`>=`/`==` mutant flips one of these two assertions).
     let build = |depth: usize| {
-        // depth-1 nested Adds gives an expression of nesting depth `depth` (each Add is one level,
-        // the leaf Lit is the innermost level).
         let mut expr = FormulaExpr::Lit(Literal::Int(1));
         for _ in 0..(depth - 1) {
             expr = FormulaExpr::Add(Box::new(expr), Box::new(FormulaExpr::Lit(Literal::Int(1))));
@@ -630,9 +582,6 @@ fn formula_exactly_at_depth_bound_is_accepted_one_over_is_rejected() {
     );
 }
 
-/// Build a WIDE, shallow tree of an exact node count via a balanced binary Add tree (depth stays
-/// `log2(nodes)`, well within MAX_FORMULA_DEPTH, so the NODE bound — not the depth bound — is what
-/// rejects). `leaves` Lit leaves → a balanced Add tree of `2*leaves - 1` nodes.
 fn balanced_add_tree(leaves: usize) -> FormulaExpr {
     let mut level: Vec<FormulaExpr> = (0..leaves)
         .map(|_| FormulaExpr::Lit(Literal::Int(1)))
@@ -653,13 +602,7 @@ fn balanced_add_tree(leaves: usize) -> FormulaExpr {
 
 #[test]
 fn formula_node_budget_boundary_is_strict() {
-    // A balanced (shallow) tree just AT the node bound is accepted; the next size up (still shallow,
-    // so the NODE bound — not depth — is the gate) is rejected with TooLarge. A balanced Add tree of
-    // L leaves has 2L-1 nodes and depth ~log2(L) ≪ MAX_FORMULA_DEPTH. Pins the strict
-    // `nodes > MAX_FORMULA_NODES` boundary (a `>`→`==`/`>=` mutant flips the accept/reject) AND the
-    // node_count arithmetic (a wrong count mis-places the boundary).
-    // 2L-1 <= MAX → L <= (MAX+1)/2; the largest accepted L:
-    let l_at = MAX_FORMULA_NODES.div_ceil(2); // 2*l_at-1 = MAX (for odd MAX) or MAX-1 (even) — within bound.
+    let l_at = MAX_FORMULA_NODES.div_ceil(2);
     let at_bound = balanced_add_tree(l_at);
     assert!(
         FormulaSchema::of([FormulaField {
@@ -669,7 +612,6 @@ fn formula_node_budget_boundary_is_strict() {
         .is_ok(),
         "a balanced tree at the node bound is accepted (strict >)"
     );
-    // A clearly-over tree (3x the leaf budget) is rejected on the NODE bound (depth ~log2 still tiny).
     let over = balanced_add_tree(MAX_FORMULA_NODES * 3);
     let err = FormulaSchema::of([FormulaField {
         field: fid("over"),
@@ -703,7 +645,6 @@ fn duplicate_formula_field_is_rejected() {
 
 #[test]
 fn static_dependency_set_lists_formula_refs() {
-    // c = a + (b * 1): the static dependency set is {a, b} (the FormulaRef leaves only).
     let expr = FormulaExpr::Add(
         Box::new(FormulaExpr::FormulaRef(fid("a"))),
         Box::new(FormulaExpr::Mul(
@@ -730,12 +671,9 @@ fn cell_value_display_renders_diagnostics() {
     assert!(CellValue::Cycle.is_diagnostic() && !CellValue::Int(0).is_diagnostic());
 }
 
-// ───────────────────────────── the rollup-latency telemetry (KN-D10 trigger) ──────────────────────
-
 #[test]
 fn rollup_latency_telemetry_flags_over_budget_rollup() {
     let mut tel = RollupLatencyTelemetry::new();
-    // A fast rollup (within a 250 ms budget) and a slow one (over).
     for _ in 0..100 {
         tel.record("db:fast", &fid("count"), Duration::from_millis(5));
         tel.record("db:slow", &fid("sum"), Duration::from_millis(400));
@@ -764,9 +702,6 @@ fn rollup_latency_telemetry_flags_over_budget_rollup() {
 #[test]
 fn rollup_latency_p99_is_the_99th_percentile_and_strict_budget() {
     let mut tel = RollupLatencyTelemetry::new();
-    // 100 samples: 99 at 10 ms, one at 1000 ms. The p99 (99th percentile, index 98 of 0..99) is the
-    // 99th-smallest = 10 ms — NOT the max. Pins the percentile index arithmetic (a `*`/`-` mutant in
-    // the index calc would pick the 1000 ms max and flip the within-budget verdict).
     for _ in 0..99 {
         tel.record("db:x", &fid("r"), Duration::from_millis(10));
     }
@@ -776,7 +711,6 @@ fn rollup_latency_p99_is_the_99th_percentile_and_strict_budget() {
         (9.0..=11.0).contains(&p99),
         "the p99 is the 99th-percentile (~10 ms), NOT the 1000 ms max: {p99}"
     );
-    // A 10 ms p99 is WITHIN a 10 ms budget (strict `>`): not a candidate. At 9 ms budget it crosses.
     assert!(
         tel.materialisation_candidates(10).is_empty(),
         "p99==budget is WITHIN budget (strict >): not a candidate"

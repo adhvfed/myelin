@@ -1,4 +1,3 @@
-//! Live PostgreSQL proofs for the fenced workflow drive-storage transaction.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -162,7 +161,6 @@ async fn claim_is_skip_locked_restart_safe_epoch_fenced_and_scope_isolated() {
     let lease = claims.into_iter().flatten().next().expect("one winner");
     assert_eq!(lease.run_id, "R-claim");
 
-    // A new store handle models a process restart; all state comes from PostgreSQL.
     let restarted = store(&pool, "acme", "fr-par");
     assert_eq!(
         restarted
@@ -178,8 +176,6 @@ async fn claim_is_skip_locked_restart_safe_epoch_fenced_and_scope_isolated() {
         .expect("renew live lease");
     assert!(renewed > lease.lease_expires_unix_ms);
 
-    // Force expiry, then a successor claim increments the fencing epoch. Same owner text cannot
-    // revive the old authority (the ABA case).
     sqlx::query(
         "UPDATE workflow_run SET lease_expires = clock_timestamp() - INTERVAL '1 second' \
          WHERE tenant_id = 'acme' AND region = 'fr-par' AND run_id = 'R-claim'",
@@ -202,7 +198,6 @@ async fn claim_is_skip_locked_restart_safe_epoch_fenced_and_scope_isolated() {
         Err(DriveStoreError::LeaseLost)
     );
 
-    // Explicit tenant+region predicates prevent the acme/fr-par worker seeing either neighbour.
     assert!(restarted
         .claim_runnable(3, "worker-c", 30)
         .await
@@ -519,8 +514,6 @@ async fn journal_and_outbox_roll_back_together_and_stale_owner_cannot_commit() {
     .unwrap();
     assert_eq!(gap_event, 0, "a journal gap aborts before any outbox write");
 
-    // The settlement trigger fails only after history, timer, and shared outbox inserts have all
-    // executed. The typed tenant transaction rolls every one of them back.
     let failed = DriveCommit {
         drive_id: "rollback-drive".into(),
         expected_cursor: 0,
@@ -679,7 +672,6 @@ async fn timer_fire_wakes_and_journals_once_without_crossing_tenant_or_region() 
         "the one fire woke the run exactly once"
     );
 
-    // A terminal run's outstanding timeout is cancelled without journal/cursor/state mutation.
     seed_run(&pool, "acme", "fr-par", "R-terminal", "completed", 0, 7).await;
     sqlx::query(
         "INSERT INTO wf_timer \
@@ -715,8 +707,6 @@ async fn timer_fire_wakes_and_journals_once_without_crossing_tenant_or_region() 
     assert_eq!(terminal, ("completed".into(), 0));
     assert_eq!(terminal_history, 0);
 
-    // A due timer may not append beneath a live drive. Once the lease is released, the already-
-    // running run makes the timeout obsolete, so it is disarmed without a journal row.
     seed_run(&pool, "acme", "fr-par", "R-live-timer", "running", 0, 8).await;
     sqlx::query(
         "INSERT INTO wf_timer \

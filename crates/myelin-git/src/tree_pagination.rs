@@ -1,11 +1,3 @@
-//! Bounded, snapshot-stable pagination over one durable Git tree directory.
-//!
-//! The requested ref and path are resolved normally on every call. Cursor object ids are compared
-//! with that resolved commit and directory tree only as consistency fences; they are never used to
-//! select objects. A scan accounts the complete directory under wire ceilings while retaining only
-//! the smallest `limit + 1` matching rows after the keyset. Blob headers are read after truncation,
-//! for returned file rows only.
-
 use std::cmp::Ordering;
 
 use base64::Engine as _;
@@ -13,18 +5,12 @@ use base64::Engine as _;
 use crate::core::Oid;
 use crate::durable::{DurableError, DurableGitRepo, TreeEntryInfo, TREE_OBJECT_MAX_BYTES};
 
-/// Default and maximum number of rows in one tree page.
 pub const TREE_PAGE_DEFAULT_LIMIT: usize = 100;
 pub const TREE_PAGE_MAX_LIMIT: usize = 100;
-/// Maximum raw and normalized basename-query bytes.
 pub const TREE_PAGE_MAX_QUERY_BYTES: usize = 256;
-/// Maximum entries inspected in one directory scan.
 pub const TREE_PAGE_SCAN_MAX_ENTRIES: usize = 100_000;
-/// Maximum UTF-8 bytes in one scanned entry basename.
 pub const TREE_PAGE_SCAN_MAX_NAME_BYTES: usize = 4 * 1024;
-/// Maximum aggregate UTF-8 basename bytes inspected by one scan.
 pub const TREE_PAGE_SCAN_MAX_TOTAL_NAME_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum history entries inspected for latest-commit metadata on a selected page.
 pub const TREE_PAGE_LATEST_COMMIT_WALK_MAX: usize = 500;
 
 const CURSOR_PREFIX: &str = "gt1_";
@@ -45,7 +31,6 @@ const WIRE_SCAN_LIMITS: ScanLimits = ScanLimits {
     total_name_bytes: TREE_PAGE_SCAN_MAX_TOTAL_NAME_BYTES,
 };
 
-/// Additive tree-page request. `query` matches normalized immediate-child basenames only.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreePageRequest {
     pub limit: usize,
@@ -63,18 +48,14 @@ impl Default for TreePageRequest {
     }
 }
 
-/// One immutable directory page. README content is intentionally not part of this durable method.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreePage {
-    /// Commit actually resolved from the requested ref for this page.
     pub snapshot_oid: Oid,
-    /// Directory tree object actually resolved at the requested path.
     pub tree_oid: Oid,
     pub entries: Vec<TreeEntryInfo>,
     pub next_cursor: Option<String>,
 }
 
-/// Typed path outcome matching the existing tree browse surface.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TreePageLookup {
     Dir(TreePage),
@@ -82,7 +63,6 @@ pub enum TreePageLookup {
     Missing,
 }
 
-/// Typed request and cursor failures, separate from durable repository failures.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TreePageError {
     Durable(DurableError),
@@ -266,7 +246,6 @@ const fn encoded_len(decoded: usize) -> usize {
 }
 
 impl DurableGitRepo {
-    /// Return one bounded, snapshot-stable page from the directory at `path` under `ref_name`.
     pub fn tree_page(
         &self,
         ref_name: &str,
@@ -974,8 +953,6 @@ mod tests {
         ));
         fixture.set_main(first_commit);
 
-        // A cursor naming present but unreachable objects cannot select them: normal main/path
-        // resolution happens first, then the forged consistency ids fail stale.
         let git = fixture.git();
         let secret_blob = git.blob(b"unreachable secret\n").expect("secret blob");
         let mut builder = git.treebuilder(None).expect("tree builder");

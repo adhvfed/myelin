@@ -1,11 +1,3 @@
-//! Unit + chained-drill tests for the REF-P25 backup-scale restore + re-erase surface (REF-D5 at
-//! scale). Proves: the PII-free ledger records every erasure (10.8); a restore of a pre-erase backup
-//! resurrects the cached titles + per-subject DEKs + un-tombstones the edges; the re-erase from the
-//! ledger re-applies the IDENTICAL §4.6 erase → **0 recoverable PII** (0 decryptable cached titles, 0
-//! live per-subject DEKs, 0 live edges for a re-erased subject); the pass is idempotent; the
-//! counter-case (a MISSED ledger entry) leaves resurrected PII (the green is earned). The REF-P15 erase
-//! mutation floor (`holder.rs`) STILL HOLDS at scale — this drill adds no new erase decision logic.
-
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,8 +14,6 @@ fn region() -> Region {
 }
 const NOW: &str = "2026-06-24T00:00:00Z";
 
-/// A fresh (cache, dek, builder, ledger) over a shared KMS — the SAME pin the cache seals with and the
-/// re-erase crypto-shreds with (one hierarchy).
 fn fixtures() -> (
     Arc<R2ProjectionCache>,
     Arc<RefsDekPin>,
@@ -40,9 +30,6 @@ fn fixtures() -> (
     (cache, dek, builder, RefsErasureLedger::new())
 }
 
-/// **Unit: the PII-free ledger records an erasure + is non-shred-erasable (10.8).** A `record` is
-/// remembered (idempotently merges); the entry carries ONLY opaque ids (the pseudonymous subject id +
-/// the key NAMES + the edge ids), never a name/payload.
 #[test]
 fn ledger_records_erasure_pii_free_and_idempotent() {
     let ledger = RefsErasureLedger::new();
@@ -56,7 +43,6 @@ fn ledger_records_erasure_pii_free_and_idempotent() {
         &["edge-a".into()],
         NOW,
     );
-    // Idempotent merge: a second record of the same subject merges key/edge ids, keeps the first time.
     ledger.record(
         &tenant(),
         &region(),
@@ -75,13 +61,10 @@ fn ledger_records_erasure_pii_free_and_idempotent() {
         e.erased_at, NOW,
         "keeps the FIRST erased_at (non-shred-erasable)"
     );
-    // PII-free: the subject id is the pseudonymous opaque id; the key ref is a NAME, never key material.
     assert!(e.subject_id.starts_with("p-opaque-"));
     assert!(e.key_refs[0].starts_with("kms://"));
 }
 
-/// **Unit: the ledger is non-shred-erasable across cells (residency-pin).** A subject erased in one cell
-/// is NOT seen in another cell's read — the re-erase replays only within its own cell.
 #[test]
 fn ledger_is_cell_scoped() {
     let ledger = RefsErasureLedger::new();
@@ -89,29 +72,20 @@ fn ledger_is_cell_scoped() {
     assert!(ledger.is_erased(&tenant(), &region(), "p-opaque-0"));
     assert!(
         !ledger.is_erased(&TenantId("other".into()), &region(), "p-opaque-0"),
-        "the ledger is cell-scoped (residency-pin — no cross-cell read)"
+        "the ledger is cell-scoped (residency-pin - no cross-cell read)"
     );
 }
 
-/// **THE chained drill (REF-D5 at backup scale): erase → restore a pre-erase backup → re-erase from the
-/// ledger → 0 recoverable PII.** A backup-scale corpus (many subjects × many edges); erase a subset;
-/// restore resurrects their cached titles + per-subject DEKs + un-tombstones their edges; the re-erase
-/// from the ledger re-applies the IDENTICAL §4.6 erase → the gate: 0 recoverable PII across every
-/// surface (0 decryptable cached titles, 0 live per-subject DEKs, 0 live edges).
 #[test]
 fn restore_then_reerase_leaves_zero_recoverable_pii_at_backup_scale() {
     let (cache, dek, builder, ledger) = fixtures();
-    // Backup scale: 12 subjects, 4 edges each = 48 name-bearing cached titles. Deterministic.
     let corpus = build_backup_scale_corpus(&tenant(), &region(), 12, 4);
     assert_eq!(corpus.edge_count(), 48);
 
-    // Erase a subset (the DSAR targets) — the rest stay live (tenant isolation within the cell).
     let targets: Vec<String> = corpus.subjects.iter().take(5).cloned().collect();
 
     let report = re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW);
 
-    // The restore genuinely brought the PII back (the honest "what came back" signal is non-zero) —
-    // otherwise the drill would be vacuous (proving 0 recoverable when nothing was resurrected).
     assert_eq!(
         report.cached_titles_resurrected_by_restore, 20,
         "the restore re-warmed 5 subjects × 4 cached titles (the name-bearing PII came back)"
@@ -125,7 +99,6 @@ fn restore_then_reerase_leaves_zero_recoverable_pii_at_backup_scale() {
         "the re-erase re-tombstoned every restored edge"
     );
 
-    // THE GATE: 0 recoverable PII post-restore across EVERY surface (no resurrected PII past the erasure).
     assert_eq!(
         report.recoverable_pii, 0,
         "0 decryptable cached titles post-restore"
@@ -144,16 +117,12 @@ fn restore_then_reerase_leaves_zero_recoverable_pii_at_backup_scale() {
         report.summary()
     );
 
-    // The ledger remembers every target (the durable, non-shred-erasable record).
     assert_eq!(report.re_erased_subjects, 5);
     for t in &targets {
         assert!(ledger.is_erased(&tenant(), &region(), t));
     }
 }
 
-/// **Tenant/subject isolation: a NON-erased subject's references + cached title survive the re-erase.**
-/// The DSAR targets a subset; an untargeted subject in the SAME cell keeps its name-bearing cached title
-/// and live edges (the re-erase is subject-grained, never a tenant-wide wipe).
 #[test]
 fn non_erased_subject_is_untouched_by_the_reerase() {
     let (cache, dek, builder, ledger) = fixtures();
@@ -162,7 +131,6 @@ fn non_erased_subject_is_untouched_by_the_reerase() {
 
     re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW);
 
-    // A subject NOT in the target set keeps its cached title + live edges.
     let survivor = corpus.subjects.last().unwrap().clone();
     assert!(!targets.contains(&survivor));
     let projection = builder.projection();
@@ -178,7 +146,6 @@ fn non_erased_subject_is_untouched_by_the_reerase() {
                 .unwrap_or(false),
             "the survivor's edge stays live"
         );
-        // The survivor's per-subject DEK is still live (resolvable).
         assert!(
             dek.subject_backstop_is_live(&tenant(), &region(), &survivor),
             "the survivor's per-subject DEK is untouched"
@@ -186,9 +153,6 @@ fn non_erased_subject_is_untouched_by_the_reerase() {
     }
 }
 
-/// **The re-erase is idempotent: running the pass again over the SAME ledger is a clean no-op success
-/// (still 0 recoverable PII).** Re-shredding a dead key + re-tombstoning a tombstoned edge never errors
-/// or resurrects.
 #[test]
 fn reerase_is_idempotent() {
     let (cache, dek, builder, ledger) = fixtures();
@@ -198,7 +162,6 @@ fn reerase_is_idempotent() {
     let first = re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW);
     assert!(first.is_ref_d5_backup_scale_green());
 
-    // Run the pass AGAIN (no new restore happened) — a clean no-op success.
     let again = re_erase_at_backup_scale(&corpus, &builder, &cache, &dek, &ledger, &targets, NOW);
     assert_eq!(again.recoverable_pii, 0, "idempotent: still 0 recoverable");
     assert_eq!(again.live_deks_post_reerase, 0);
@@ -206,16 +169,11 @@ fn reerase_is_idempotent() {
     assert!(again.is_ref_d5_backup_scale_green());
 }
 
-/// **Counter-case (the green is EARNED): a MISSED ledger entry leaves resurrected PII.** If the restore
-/// resurrects a subject the ledger does NOT remember erasing, the re-erase replay never covers it — its
-/// cached title is decryptable + its DEK live + its edges live again. The drill's own counter-case flips
-/// the 0-recoverable verdict RED (proving the green is not vacuous).
 #[test]
 fn missed_ledger_entry_resurrects_pii_red_counter_case() {
     let (cache, dek, builder, ledger) = fixtures();
     let corpus = build_backup_scale_corpus(&tenant(), &region(), 4, 2);
 
-    // Steady-state: ingest + warm everything.
     for edge in &corpus.edges {
         builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
     }
@@ -224,10 +182,7 @@ fn missed_ledger_entry_resurrects_pii_red_counter_case() {
         warm_subject_titles_test(&corpus, &cache, &dek, subject_id);
     }
 
-    // A subject the restore resurrects but the LEDGER NEVER RECORDED (the buggy path: erase happened but
-    // the durable record was lost — exactly what the non-shred-erasable ledger exists to prevent).
     let forgotten = corpus.subjects[0].clone();
-    // Simulate the erase WITHOUT recording it in the ledger.
     let holder = RefsCacheHolder::with_cache(cache.clone(), projection.clone());
     holder
         .erase(EraseScope::Subject {
@@ -241,7 +196,6 @@ fn missed_ledger_entry_resurrects_pii_red_counter_case() {
     }
     assert!(!ledger.is_erased(&tenant(), &region(), &forgotten));
 
-    // A RESTORE resurrects the forgotten subject (cached title + DEK + edge come back).
     dek.reserve_subject_backstop(&tenant(), &region(), &forgotten)
         .unwrap();
     for edge in corpus.edges_of(&forgotten) {
@@ -260,8 +214,6 @@ fn missed_ledger_entry_resurrects_pii_red_counter_case() {
         builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
     }
 
-    // RE-ERASE from the (EMPTY) ledger — the forgotten subject is NOT replayed.
-    // The ledger has no entries, so the re-erase covers nothing. The forgotten subject's PII survives:
     let mut still_recoverable = 0usize;
     for edge in corpus.edges_of(&forgotten) {
         if cache.read(&tenant(), &region(), &edge.source).is_some() {
@@ -270,12 +222,11 @@ fn missed_ledger_entry_resurrects_pii_red_counter_case() {
     }
     assert!(
         still_recoverable > 0,
-        "RED: a subject the non-shred-erasable ledger forgot is resurrected past the erasure — \
+        "RED: a subject the non-shred-erasable ledger forgot is resurrected past the erasure - \
          the 0-recoverable green is EARNED only because the ledger records every erasure"
     );
 }
 
-/// Test-only re-export of the private warm helper (the counter-case needs to warm without erasing).
 fn warm_subject_titles_test(
     corpus: &BackupScaleErasureCorpus,
     cache: &R2ProjectionCache,
@@ -285,7 +236,6 @@ fn warm_subject_titles_test(
     super::warm_subject_titles(corpus, cache, dek, subject_id);
 }
 
-/// **The world-scale fleet floor is named (EI-01 §3) + the telemetry signal is a named constant.**
 #[test]
 fn floor_and_signal_are_named() {
     assert!(WORLD_SCALE_BACKUP_FLEET_FLOOR.contains("30x"));

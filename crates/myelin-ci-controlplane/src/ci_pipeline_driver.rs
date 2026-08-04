@@ -1,49 +1,3 @@
-//! # Durable CI dispatch and claim-bound completion
-//!
-//! **Owning architecture doc (byte-authoritative):**
-//! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
-//! §3.1 (the pipeline IS a durable workflow — `run_ci_pipeline_body`), §3.3 (the
-//! `SCHEDULE_AND_RUN_JOB` dispatch handshake → the durable `job_queue` row), §2.1 (the pull-lease claim
-//! the CT-004c.2 runner drives) + arch 01 §3.1 (`ci_run` is the thin index over the myelin-flow run).
-//!
-//! CT-004b armed a durable `ci_run` and pre-minted `wf_run_id`; CT-004c made the runner claim a
-//! durable `job_queue` row and execute it in gVisor; CT-004d.1 co-persisted `job_queue` and
-//! `ci_job_spec`. This module owns the remaining production-safe components at that boundary:
-//!
-//! - **Chunk 5 — [`DurableJobRunner`]:** the [`myelin_flow::JobRunner`] the pipeline body dispatches
-//!   each stage through. Instead of [`crate::SchedulerJobRunner`]'s in-memory `SchedulerState`, it
-//!   builds a [`DurableEnqueue`] + the digest-pinned sandbox [`SandboxJobSpec`] and calls
-//!   [`CiJobSpecStore::co_persist_dispatch`] — so each stage lands a DURABLE `job_queue` row (+ its
-//!   `ci_job_spec`) the CT-004c.2 runner claims. **THE SECURITY INVARIANT:** the enqueue's `trust_tier`
-//!   + `region` come from the run's real [`JobScheduleTerms`] (stamped from `ci_run.trust_tier` /
-//!   `ci_run.region` at trigger time), forwarded UNCHANGED, and the SAME tier is stamped onto the
-//!   sandbox spec — so `co_persist_dispatch`'s `enq.trust_tier == spec.trust_tier` gate holds by
-//!   construction and an `untrusted_fork` stage can NEVER be enqueued behind a widened `trusted` gate.
-//! - **Claim-bound completion — [`CiPipelineReporter`]:** verifies and consumes the exact live queue
-//!   claim, settles Storage money truth, writes CI's cost projection and immutable accounting
-//!   receipt, and inserts the typed `job.done` signal in one PostgreSQL transaction. A production
-//!   [`myelin_flow::PgFlowWorker`] wakes from and consumes that durable signal directly. Exact
-//!   redelivery reads the stored pricing outcome; historical work is never repriced.
-//!
-//! ## The verdict-vocabulary bridge (why a bespoke reporter, not `EngineTerminalReporter`)
-//! The real sandbox runner ([`myelin_ci_sandbox::RunnerAgent::run_one`]) DERIVES `passed` from the guest
-//! exit code and reports it as a `myelin://job-done/passed-<bool>` marker; the pipeline body
-//! ([`myelin_flow::WfCtx::run_ci_pipeline`]) decodes the stage verdict from a
-//! [`myelin_flow::stage_verdict_marker`] (`ci.stage.verdict:<pass|fail>:<stage>`). Neither frozen body
-//! is touched (the sandbox `run_one` security body, the engine fixture). The bridge is the
-//! [`myelin_ci_sandbox::TerminalReporter`] seam — a legitimate injection point the runner already
-//! depends on abstractly: [`CiPipelineReporter`] re-encodes the runner's derived `passed` into the
-//! stage-verdict marker the body decodes. The stage name is co-persisted on `job_queue` and
-//! `ci_job_spec`; completion reads that durable identity in the same transaction that consumes the
-//! claim and buffers the typed PostgreSQL workflow signal.
-//!
-//! ## The durable-RunStore FLOOR (named, not silently skipped)
-//! The former same-process `CiPipelineDriver` is compiled only with `test-support`. It remains a
-//! compatibility harness for historical tests and is absent from the default production build. The
-//! production activation floor is now explicit: define a restart-safe CI body-input manifest and
-//! DAG-aware execution semantics before composing `PgFlowWorker`; V2 launch authority remains
-//! refused until its resource, egress, workspace, token, metering, and check capabilities exist.
-
 use std::collections::BTreeMap;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
@@ -120,10 +74,6 @@ use crate::schedule_and_run_job::JobScheduleTerms;
 #[cfg(any(test, feature = "test-support"))]
 use crate::scheduler::Lane;
 
-/// Bridge one async durable-store call to a sync body on a dedicated OFF-runtime thread (the SAME
-/// convention [`crate::runner_bind`] + `myelin_storage::kms_durable` use). The pipeline `tick` runs on
-/// its own thread; the `try_current` guard falls back to `block_in_place` if ever driven on a
-/// multi-thread worker.
 fn bridge<F: std::future::Future>(rt: &tokio::runtime::Handle, fut: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
         Ok(_) => tokio::task::block_in_place(|| rt.block_on(fut)),
@@ -131,73 +81,28 @@ fn bridge<F: std::future::Future>(rt: &tokio::runtime::Handle, fut: F) -> F::Out
     }
 }
 
-/// **The seam that resolves a dispatched stage to its digest-pinned sandbox [`SandboxJobSpec`] template
-/// (the `.myelin/ci.toml` resolved-snapshot → executable-spec resolution).** Given the flow
-/// [`FlowJobSpec`] the pipeline body dispatched (its opaque `target` names the pipeline step), it
-/// returns the image/command/limits/egress/workspace the sandbox launches. `Err` is a fail-closed
-/// resolve (the stage never becomes a launchable durable job). **The builder does NOT set the
-/// security-load-bearing `trust_tier` or the `idem_token`** — [`DurableJobRunner::dispatch`] STAMPS
-/// those from the run's terms + the dispatch, so a builder can never widen the trust tier.
-///
-/// In production the impl resolves the pinned snapshot's per-stage command; the CT-004d.2 integration
-/// test injects a real compute spec that runs in a `runsc` guest. Until the snapshot resolver lands
-/// (the named follow-on), [`unresolved_stage_spec_builder`] is the fail-closed default.
 pub type StageSpecBuilder =
     Arc<dyn Fn(&FlowJobSpec) -> Result<SandboxJobSpec, String> + Send + Sync>;
 
-/// **The fail-closed default stage-spec builder (the snapshot→spec resolver is the named follow-on).**
-/// Returns `Err` for every stage — a driver wired with this dispatches NOTHING (the activity retries +
-/// the run fails loud), never a fabricated spec. The real resolver (the pinned `.myelin/ci.toml`
-/// snapshot → per-stage command/image) is CT-004d.3+; the integration test injects a real builder.
 pub fn unresolved_stage_spec_builder() -> StageSpecBuilder {
     Arc::new(|spec: &FlowJobSpec| {
         Err(format!(
             "no pinned-snapshot → JobSpec resolver yet (CT-004d follow-on) for stage target `{}`; \
-             the driver cannot fabricate an executable spec — dispatch refused fail-closed",
+             the driver cannot fabricate an executable spec - dispatch refused fail-closed",
             spec.target
         ))
     })
 }
 
-// =================================================================================================
-// Chunk 5 — the DURABLE JobRunner.
-// =================================================================================================
-
-/// **Chunk 5 — the DURABLE [`JobRunner`] the pipeline body dispatches each stage through.** Replaces
-/// [`crate::SchedulerJobRunner`]'s in-memory `SchedulerState`: on [`JobRunner::dispatch`] it builds a
-/// [`DurableEnqueue`] + the sandbox [`SandboxJobSpec`] and calls [`CiJobSpecStore::co_persist_dispatch`]
-/// — one atomic tenant-scoped tx writes the `job_queue` row (the claim gate) + the `ci_job_spec` row
-/// (what EXECUTES), idempotent on the engine-minted `idem_token`. Constructed PER RUN (it holds the
-/// run's [`JobScheduleTerms`]); the pipeline body closure builds it fresh for each drive.
-///
-/// **THE SECURITY INVARIANT (the adversarial-verifier surface).** The `trust_tier` + `region` the
-/// enqueue gates the claim on come from `self.terms` (the run's real facts, stamped from
-/// `ci_run.trust_tier` / `ci_run.region` at trigger time), forwarded UNCHANGED — never widened,
-/// defaulted, or dropped. The SAME `terms.trust_tier` is stamped onto the sandbox spec, so
-/// `co_persist_dispatch`'s `enq.trust_tier == spec.trust_tier` assertion holds BY CONSTRUCTION (it is
-/// not bypassed — it is fed the truth). The [`StageSpecBuilder`] never sets the tier, so it cannot
-/// widen it. An `untrusted_fork` run therefore enqueues every stage as `untrusted_fork`, and the
-/// CT-004c.2 trusted-only runner never claims it (the durable predicate) — the poisoned-pipeline
-/// defence, closed at the dispatch.
 pub struct DurableJobRunner {
     store: CiJobSpecStore,
     rt: tokio::runtime::Handle,
-    /// the run's real scheduling terms — tenant/region/run_id/lane/labels/trust_tier/fair_key, a PURE
-    /// function of the resolved snapshot (the trust tier stamped at trigger time). Forwarded UNCHANGED.
     terms: JobScheduleTerms,
     build_spec: StageSpecBuilder,
-    /// `(stage target → stage name)` for THIS run's pipeline — so a dispatched flow `JobSpec` (which
-    /// carries the opaque `target`, not the stage name) maps back to the stage name persisted DURABLY
-    /// onto the `ci_job_spec` row (the reporter reads it back at `job.done`, restart-safe). Built from
-    /// the [`PipelineRun`]'s stages at construction. A dispatch whose target is not a known stage fails
-    /// closed (never a durable row the reporter cannot attribute a verdict to).
     targets: Vec<(String, String)>,
 }
 
 impl DurableJobRunner {
-    /// Build the durable runner for one run: the durable `ci_job_spec` store, the runtime handle the
-    /// async co-persist bridges onto, the run's [`JobScheduleTerms`] (the security-load-bearing tier +
-    /// region), the [`StageSpecBuilder`], and the run's pipeline stages (for the target → name map).
     pub fn new(
         store: CiJobSpecStore,
         rt: tokio::runtime::Handle,
@@ -218,17 +123,10 @@ impl DurableJobRunner {
         }
     }
 
-    /// The deterministic `job_queue.job_id` (a `uuid`) for a dispatched stage — derived PURELY from the
-    /// engine-minted `idem_token` so a re-dispatch (control-plane replay) re-derives the SAME id and the
-    /// `(tenant_id, job_id)` PK collapses it to one row. (The `idem_token` itself — `<run_id>/…:<n>/job`
-    /// — is NOT a uuid, so it can not be the durable `job_id` directly; it stays the `jq_idem` key.)
     fn stage_job_id(idem_token: &str) -> String {
         deterministic_uuid(&format!("jobq:{idem_token}"))
     }
 
-    /// **The PURE (DB-free) half of a dispatch** — delegates to [`build_dispatch_parts`] (a free fn so
-    /// the SECURITY invariant is unit-testable with NO store/pool at all). Returns the enqueue + the
-    /// spec whose `trust_tier` equals `enq.trust_tier` by construction (`co_persist_dispatch` re-asserts).
     fn build_dispatch(
         &self,
         flow_spec: &FlowJobSpec,
@@ -237,33 +135,19 @@ impl DurableJobRunner {
     }
 }
 
-/// **The pure (store-free) dispatch builder — the SECURITY-load-bearing half.** Builds the
-/// [`DurableEnqueue`] + the sandbox [`SandboxJobSpec`] the co-persist writes, forwarding the run's
-/// `trust_tier` + `region` from `terms` UNCHANGED and STAMPING the SAME tier + the echo `idem_token`
-/// onto the spec — so `co_persist_dispatch`'s `enq.trust_tier == spec.trust_tier` gate holds BY
-/// CONSTRUCTION and the [`StageSpecBuilder`] can never widen the tier. A free fn (no `self`, no store)
-/// so the invariant is provable with zero DB/pool surface.
 fn build_dispatch_parts(
     terms: &JobScheduleTerms,
     build_spec: &StageSpecBuilder,
     flow_spec: &FlowJobSpec,
 ) -> Result<(DurableEnqueue, SandboxJobSpec), ActivityError> {
-    // Resolve the stage's executable template (image/command/limits/egress/workspace).
     let mut spec = (build_spec)(flow_spec).map_err(ActivityError)?;
 
-    // SECURITY — stamp the run's REAL trust_tier onto the spec (forwarded UNCHANGED from
-    // terms.trust_tier), and the engine-minted idem_token the runner echoes on job.done. So the
-    // enqueue + the spec carry the SAME tier by construction — never widened by the builder.
     spec.trust_tier = terms.trust_tier;
     spec.idem_token = IdemToken(flow_spec.idem_token.clone());
-    // Belt-and-suspenders: clamp the wall-clock timeout to the store's ceiling so a legitimate stage
-    // never trips the fail-closed TimeoutTooLong (the lease-outliving double-run guard).
     if spec.limits.timeout_secs > MAX_JOB_TIMEOUT_SECS {
         spec.limits.timeout_secs = MAX_JOB_TIMEOUT_SECS;
     }
 
-    // The immutable claim ceiling, derived from the SAME (already timeout-clamped) spec this
-    // dispatch persists — `co_persist_dispatch` recomputes it and refuses any divergence.
     let claim_window_secs = crate::ci_claim_window::claim_window_secs(
         spec.kind,
         &spec.workspace,
@@ -271,8 +155,6 @@ fn build_dispatch_parts(
     )
     .map_err(|error| ActivityError(error.to_string()))?;
 
-    // The DURABLE enqueue — trust_tier + region FROM the run's terms (forwarded UNCHANGED);
-    // idem_token = the engine's dispatch token (the jq_idem key + the job.done echo key).
     let enq = DurableEnqueue {
         tenant_id: terms.tenant_id.clone(),
         region: terms.region.clone(),
@@ -280,7 +162,7 @@ fn build_dispatch_parts(
         run_id: terms.run_id.clone(),
         lane: terms.lane,
         labels: terms.labels.clone(),
-        trust_tier: terms.trust_tier, // == spec.trust_tier (both terms.trust_tier)
+        trust_tier: terms.trust_tier,
         concurrency_group: terms.concurrency_group.clone(),
         fair_key: terms.fair_key.clone(),
         idem_token: flow_spec.idem_token.clone(),
@@ -298,10 +180,6 @@ impl JobRunner for DurableJobRunner {
     fn dispatch(&self, flow_spec: &FlowJobSpec) -> Result<(), ActivityError> {
         let (mut enq, spec) = self.build_dispatch(flow_spec)?;
 
-        // Resolve the dispatched stage's NAME (the reporter attributes the verdict to it). It is
-        // persisted DURABLY onto the ci_job_spec row (not an in-memory map), so a fresh reporter after
-        // a restart reads it back. A target that is not a known pipeline stage FAILS CLOSED — a durable
-        // job the reporter could never attribute a verdict to must never be enqueued.
         let stage = self
             .targets
             .iter()
@@ -309,7 +187,7 @@ impl JobRunner for DurableJobRunner {
             .map(|(_, name)| name.clone())
             .ok_or_else(|| {
                 ActivityError(format!(
-                    "ci.pipeline dispatch refused: target `{}` is not a known pipeline stage — the \
+                    "ci.pipeline dispatch refused: target `{}` is not a known pipeline stage - the \
                      verdict could not be durably attributed (fail-closed)",
                     flow_spec.target
                 ))
@@ -324,9 +202,6 @@ impl JobRunner for DurableJobRunner {
             token_authority_handle: authority,
         };
 
-        // Co-persist the job_queue row + the ci_job_spec row (carrying the durable stage) in ONE
-        // tenant-scoped tx (bridged onto the runtime). A dispatch failure surfaces as an ActivityError
-        // the engine retries (reusing the SAME idem_token — the durable ON CONFLICT dedups the re-dispatch).
         bridge(
             &self.rt,
             self.store.co_persist_dispatch(&enq, &launch, &stage),
@@ -336,27 +211,11 @@ impl JobRunner for DurableJobRunner {
     }
 }
 
-// =================================================================================================
-// The durable-completion-authority reporter (the external-reviewer blocker: verify the claim first).
-// =================================================================================================
-
-/// **Why a refused completion is fail-closed** — the reasons [`CiPipelineReporter::report_done`] rejects
-/// a `job.done` BEFORE any verdict is signalled (nothing durable changes on a refusal). Each is a
-/// forged / mis-keyed / unclaimed completion: the caller does not own the durable job it claims.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ClaimRefusal {
-    /// The completion's claimed `tenant` is not the tenant this reporter's executor is bound to. A
-    /// region runner claims cross-tenant; a reporter is tenant-bound, so a mis-routed completion is
-    /// refused rather than signalled against the wrong tenant's run.
     TenantMismatch { reporter: String, claimed: String },
-    /// No durable `ci_job_spec` dispatch record exists for `(tenant, job_id)` — the job was never
-    /// dispatched/claimed under this identity (a fabricated completion), so it is refused.
     NoDispatchRecord { job_id: String },
-    /// The durable dispatch record's `run_id` does not match the completion's `run` — the claim names a
-    /// different run than the one it was dispatched for.
     RunMismatch { durable: String, claimed: String },
-    /// The durable dispatch record's `idem_token` does not match the echoed one — the claim was keyed
-    /// to a different dispatch.
     IdemMismatch { durable: String, claimed: String },
 }
 
@@ -383,12 +242,6 @@ impl std::fmt::Display for ClaimRefusal {
     }
 }
 
-/// **The PURE (DB-free) claimed-job verification — the security core, unit-testable with NO pool.**
-/// Given the completion's claimed authority `(claimed_tenant, presented_run, presented_job_id,
-/// presented_idem_token)`, the reporter's bound `reporter_tenant`, and the durable dispatch record read for
-/// `(tenant, job_id)`, returns the durable stage the verdict attributes to — or a [`ClaimRefusal`]
-/// (fail-closed, nothing signalled). Every field of the durable claimed-job identity must match; a
-/// forged / mis-keyed / unclaimed completion resolves no matching record and is refused.
 fn verify_claimed_identity(
     reporter_tenant: &TenantId,
     claimed_tenant: &TenantId,
@@ -423,11 +276,6 @@ fn verify_claimed_identity(
     Ok(identity.stage)
 }
 
-/// **The deterministic, nonce-keyed completion receipt the CAS records.** It length-frames tenant,
-/// region, run, job, idem token, durable stage, verdict, timeout status, actual usage, ordered result
-/// refs, owner, epoch, and the fresh claim nonce. Exact at-least-once redelivery recomputes the same
-/// receipt; any authority, verdict, accounting, or payload divergence is refused. The row CAS still
-/// proves live ownership; the keyed receipt is its tamper-evident idempotency evidence.
 #[derive(Clone, Copy)]
 struct CompletionReceiptInput<'a> {
     tenant: &'a TenantId,
@@ -483,9 +331,6 @@ struct CompletionReceipts {
     legacy_v3: String,
 }
 
-/// Mint the new disposition-bound receipt while retaining the exact historical v3 encoder above.
-/// The v3 twin is needed both for old-row replay and for the byte-frozen accounting column during a
-/// rolling deployment.
 fn completion_receipts_v4(
     input: CompletionReceiptInput<'_>,
     disposition: CiJobTerminalDisposition,
@@ -515,9 +360,6 @@ struct PreparationCompletionReceiptInput<'a> {
     claim_expires_at_epoch_secs: i64,
 }
 
-/// Preparation completion has its own byte domain and cannot accept caller verdict/payload fields.
-/// The v3 twin exists only for the byte-frozen accounting compatibility column; the queue CAS
-/// always writes and replays the disposition-bound v4 receipt.
 fn preparation_completion_receipts(
     input: PreparationCompletionReceiptInput<'_>,
     disposition: PreparationTerminalDisposition,
@@ -567,9 +409,6 @@ fn workload_disposition(report: &TerminalReport) -> CiJobTerminalDisposition {
 
 const RETRY_ATTEMPT_RECORD_VERSION: u8 = 1;
 
-/// Last immutable measured-attempt receipt retained beside fixed-size cumulative usage on
-/// `job_queue` until a later terminal generation settles the aggregate. The JSON object is PII-free
-/// and constant-size across arbitrarily many retries.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RetryAttemptRecord {
@@ -622,11 +461,6 @@ fn retry_attempt_receipt(
     format!("retry-v1:{}", hasher.finalize().to_hex())
 }
 
-/// Build the exact durable `RetryAttemptRecord` a real attempt would persist — a small PURE helper
-/// (no DB access) extracted from `record_retryable_attempt_on_conn` so the write-side cause binding
-/// is directly unit-testable. This is the exact site Sol's review caught hardcoding
-/// `OUTPUT_PERSISTENCE_CAUSE` regardless of `failure.cause` — a unit test against THIS function,
-/// not just `decode_retry_attempts`, is what would actually catch a regression back to that bug.
 fn expected_retry_attempt_record(
     claim: &CompletionClaim,
     region: &str,
@@ -699,7 +533,6 @@ fn aggregate_usage(
     .map_err(CompletionTxError::Usage)
 }
 
-/// A typed refusal before raw usage reaches bigint-backed accounting or pricing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiUsageAggregationError {
     Overflow,
@@ -744,9 +577,6 @@ pub(crate) fn checked_add_accounting_usage(
     })
 }
 
-/// Immutable-pricing output for the two raw resource dimensions a sandbox reports. There is no
-/// built-in or permissive production price: an adapter must name the pricing revision and provide
-/// the wholesale/markup split for both CPU and memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PricedCiJobUsage {
     pub pricing_revision: String,
@@ -757,25 +587,13 @@ pub struct PricedCiJobUsage {
     pub memory_markup: MicroUsd,
 }
 
-/// Frozen Tier-P settlement policy. Paired with both `ci-reserve:v1:` and (CT-007 slice 5b.3-4a.1b)
-/// `ci-reserve:v2:` reservation authority -- `v2` only changes the reservation-amount topology and
-/// durable handle shape, never the zero-markup settlement policy itself.
 pub const TIER_P_OPERATIONAL_PRICING_REVISION: &str = "tier-p-operational:v1";
-/// Tier-P operational unit price in micro-USD: one placeholder unit per measured CPU-second and per
-/// measured memory-GiB-second, at the unified micro-USD scale (`1 cent = 10_000 micro-USD`). This is
-/// the historical 1-cent-per-resource-second placeholder rescaled by the fixed cent→micro-USD factor
-/// so it keeps the SAME real magnitude after the wallet type unification; it is NOT a real price
-/// (real CI pricing is a deferred Commercial decision, R-2). Zero markup, per the frozen policy.
 pub const MICRO_USD_PER_CPU_SECOND: u64 = 10_000;
 pub const MICRO_USD_PER_GB_SECOND: u64 = 10_000;
 pub(crate) const TIER_P_OPERATIONAL_RESERVATION_PREFIX: &str = "ci-reserve:v1:";
-/// CT-007 slice 5b.3-4a.1b: the `v2` reservation-handle prefix (parent-attempt budget authority,
-/// design locked with Sol 2026-07-29). Same Tier-P pricing revision and zero-markup settlement
-/// policy as `v1` -- only the reservation-amount topology and durable handle shape differ.
 pub(crate) const TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX: &str = "ci-reserve:v2:";
 const PRICING_GIB_BYTES: u64 = 1_073_741_824;
 
-/// A fail-closed pricing refusal. Values and authority handles are deliberately absent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiJobPricingError {
     Unavailable,
@@ -793,17 +611,10 @@ impl core::fmt::Display for CiJobPricingError {
 
 impl std::error::Error for CiJobPricingError {}
 
-/// Immutable completion-accounting lookup. Tier P uses an explicitly revisioned operational-unit
-/// adapter with zero markup; Tier B may later compose a Commercial-owned price lookup. Either way,
-/// the resulting revision and split amounts are persisted so replay never reprices, and the adapter
-/// must use the same unit policy as the reservation that admitted the job.
 pub trait CiJobAccountingPricer: Send + Sync {
     fn price(&self, usage: ResourceUsage) -> Result<PricedCiJobUsage, CiJobPricingError>;
 }
 
-/// Bind a versioned reservation authority to its exact settlement unit policy. Generic and future
-/// Commercial handles remain governed by their own revisioned adapters, but a Tier-P operational
-/// handle cannot be settled by an arbitrary monetary pricer merely because it implements the trait.
 pub(crate) fn validate_reservation_pricing_policy(
     reserve_handle: &str,
     usage: ResourceUsage,
@@ -828,9 +639,6 @@ pub(crate) fn validate_reservation_pricing_policy(
     }
 }
 
-/// All durable authorities required by the production terminal reporter. Constructing an accounted
-/// reporter is impossible without the money ledger, CI projection, immutable receipt store,
-/// canonical manifest authority, verified tenant scope, and an explicit pricing adapter.
 #[derive(Clone)]
 pub struct DurableCiJobAccounting {
     scope: TenantScope,
@@ -1044,15 +852,6 @@ async fn record_retryable_attempt_on_conn(
     .fetch_optional(&mut *conn)
     .await
     .map_err(|_| CompletionTxError::RetryStore)?;
-    // BUG FIX (investigation, 2026-07-25): a retryable-attempt requeue moves `job_queue` back to
-    // `queued` here, but historically never touched the `ci_job` DAG surface
-    // `AUTHORIZE_JOB_LAUNCH_QUERY` also crosses to `running` in the SAME statement as the launch
-    // CAS. Without this reset, `ci_job.state` stayed stuck at `'running'` from the FIRST attempt, so
-    // a fresh runner generation claiming the requeued row could never re-win the launch fence
-    // (`surface.state IN ('queued', 'leased')`, deliberately pinned in `job_queue_store.rs`'s unit
-    // tests) — the retry would be permanently stranded. Mirrors the same reset added to the
-    // dead-runner reaper (`job_queue_region.rs::RESET_REAPED_CI_JOB_SURFACE_QUERY`) for the analogous
-    // crash-recovery path.
     if requeue && updated.is_some() {
         sqlx::query(
             "UPDATE ci_job SET state = 'queued' \
@@ -1269,11 +1068,6 @@ async fn verify_preparation_disposition_on_conn(
     reserve_handle: &str,
     disposition: PreparationTerminalDisposition,
 ) -> Result<(), CompletionTxError> {
-    // The parent-attempt row for THIS exact claim generation. It is REQUIRED for Failed/TimedOut (a
-    // measured/sealed terminal phase belongs to the current generation), but OPTIONAL for
-    // AttemptsExhausted: CT-007 5b.3-6d permits an exhausted terminal for a generation that was
-    // refused admission (and so has no row of its own) when the prior exact-policy rows already
-    // equal the durable max.
     let current = sqlx::query(
         "SELECT budget_revision, max_parent_attempts
          FROM ci_job_parent_attempt
@@ -1312,7 +1106,6 @@ async fn verify_preparation_disposition_on_conn(
         } => return Err(CompletionTxError::Refused),
         PreparationTerminalDisposition::Failed { phase }
         | PreparationTerminalDisposition::TimedOut { phase } => {
-            // Executed checkout preparation requires the current exact parent row.
             current.ok_or(CompletionTxError::Refused)?;
             let terminal = sqlx::query_scalar::<_, i32>(
                 "SELECT 1
@@ -1335,10 +1128,6 @@ async fn verify_preparation_disposition_on_conn(
             }
         }
         PreparationTerminalDisposition::AttemptsExhausted => {
-            // Determine the governing exact policy. When the current generation HAS a row, take its
-            // policy (the pre-6d behaviour). When it does NOT (refused admission), derive the single
-            // immutable policy the PRIOR rows already carry — permitting the terminal only when those
-            // prior exact-policy rows are themselves the durable max.
             let (revision, maximum) = match &current {
                 Some(row) => (
                     row.try_get::<i16, _>("budget_revision")
@@ -1366,8 +1155,6 @@ async fn verify_preparation_disposition_on_conn(
                     .map_err(|_| {
                         CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database)
                     })?;
-                    // One immutable policy must govern this reserve; divergence (or no prior rows at
-                    // all) is a fail-closed refusal.
                     if policies.len() != 1 {
                         return Err(CompletionTxError::Refused);
                     }
@@ -1408,17 +1195,6 @@ async fn verify_preparation_disposition_on_conn(
     Ok(())
 }
 
-/// **CT-007 5b.3-6d step 2: a preparation RETRY is permitted only for an ADMITTED current generation
-/// whose journal is fully RESOLVED and whose exact-policy budget still permits another attempt.** The
-/// current generation's exact parent row is required (a retryable failure was, by definition, an
-/// admitted attempt); any still-`started` phase for this generation refuses (the failing attempt must
-/// have completed/sealed its phase first); and `count < max` under the same immutable policy is what
-/// makes this a REQUEUE rather than an exhaustion (that boundary is terminalized elsewhere).
-/// The gate a preparation-retry verification resolves to (CT-007 5b.3-6d step 2, round 2).
-/// `Proceed` = the exact generation is live-leased AND permitted (run the requeue CAS). `NotLive` =
-/// the generation is no longer the live leased one (already requeued/reclaimed, or never the current
-/// generation) — a benign `NoOp`, distinct from an `Err` refusal (a live generation that is exhausted
-/// or has an unresolved started phase).
 enum PreparationRetryGate {
     Proceed,
     NotLive,
@@ -1429,15 +1205,6 @@ async fn verify_preparation_retry_permitted_on_conn(
     claim: &CiJobTokenRequest,
     reserve_handle: &str,
 ) -> Result<PreparationRetryGate, CompletionTxError> {
-    // **Round-2 blocker 1: lock the exact queue generation FOR UPDATE BEFORE reading journal
-    // status/count, preserving the canonical queue -> advisory -> journal lock order.** Without this,
-    // a concurrent `begin_phase` (which locks this same row via `require_live_parent_attempt_on_conn`)
-    // could insert a `started` phase AFTER this verification read no `started` phase but BEFORE the
-    // requeue CAS — leaving a freshly-`queued` job with an unresolved old-generation phase. Holding
-    // the row here forces that ordering: a phase writer already past its own queue lock has committed
-    // its `started` row (this then sees it and refuses); otherwise it BLOCKS on this lock until the
-    // requeue clears the generation (its own re-verify then fails). This is the exact discipline
-    // `require_live_parent_attempt_on_conn` and the lease-slice deadline sealer use.
     let live = sqlx::query_scalar::<_, String>(
         "SELECT q.job_id::text
          FROM job_queue AS q
@@ -1463,12 +1230,8 @@ async fn verify_preparation_retry_permitted_on_conn(
     .await
     .map_err(|_| CompletionTxError::Prelaunch(CiPrelaunchUsageJournalError::Database))?;
     if live.is_none() {
-        // Not the live leased generation (already requeued/reclaimed, or a stale/forged identity):
-        // a benign NoOp, never a hard refusal.
         return Ok(PreparationRetryGate::NotLive);
     }
-    // The per-job advisory lock, in the canonical order (queue row already held above), so this shares
-    // the exact serialization domain the journal's phase writers take.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!(
             "myelin.ci.parent-attempt.v1:{}:{}:{}",
@@ -1510,7 +1273,6 @@ async fn verify_preparation_retry_permitted_on_conn(
         .try_get("max_parent_attempts")
         .map_err(|_| CompletionTxError::Refused)?;
 
-    // No unresolved phase may remain for this generation.
     let unresolved = sqlx::query_scalar::<_, i32>(
         "SELECT 1 FROM ci_job_prelaunch_usage
          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid
@@ -1529,7 +1291,6 @@ async fn verify_preparation_retry_permitted_on_conn(
         return Err(CompletionTxError::Refused);
     }
 
-    // Another parent attempt must still be permitted under the exact immutable policy.
     let count: i64 = sqlx::query_scalar(
         "SELECT count(*)
          FROM ci_job_parent_attempt
@@ -1632,8 +1393,6 @@ fn terminal_result_summary(
     }
 }
 
-/// Canonical surface summary for 5b's future preparation-only terminal CAS. It is intentionally
-/// pure and cannot accept caller-supplied pass/usage/text fields.
 #[allow(dead_code)]
 pub(crate) fn preparation_terminal_result_summary(
     disposition: myelin_ci_sandbox::PreparationTerminalDisposition,
@@ -1746,38 +1505,12 @@ pub(crate) async fn close_cancelled_run_if_accounted(
     Ok(())
 }
 
-/// The outcome of a dormant preparation-retry report (CT-007 5b.3-6d step 2).
-///
-/// A requeue is not a terminal outcome, so there is no `Buffered`/`Duplicate` signal vocabulary here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreparationRetryOutcome {
-    /// The exact leased generation was returned to `queued` for a fresh attempt.
     Requeued,
-    /// The presented generation was no longer the live leased one (already requeued/reclaimed) — a
-    /// benign no-op that changed nothing.
     NoOp,
 }
 
-/// **The [`TerminalReporter`] that VERIFIES durable claimed-job identity before signalling a verdict
-/// (the external reviewer's blocker).** The runner ([`myelin_ci_sandbox::RunnerAgent`]) derives `passed`
-/// from the real guest exit code and calls `report_done` carrying the CLAIMED row's authority
-/// `(tenant, run, job_id, idem_token, owner, epoch, nonce)`. This reporter:
-///
-/// 1. **Verifies the claim.** It reads the durable `ci_job_spec` dispatch record for `(tenant, job_id)`
-///    and refuses fail-closed ([`ClaimRefusal`]) unless the claimed `tenant`, `job_id`
-///    `run_id`, and `idem_token` ALL match the durable record — so a
-///    caller cannot forge a completion for a job it does not own, and the idem token is no longer a
-///    predictable `(run_id, command_id)` free pass (it must match a real claimed row).
-/// 2. **Resolves the stage DURABLY.** The verdict-attribution stage name comes from the `ci_job_spec.stage`
-///    column (persisted at dispatch) — a restart-safe read, never an in-memory map. So a fresh reporter
-///    over the same PG resolves the verdict exactly.
-/// 3. **Accounts, consumes, and signals in one transaction.** The queue CAS binds the fresh nonce,
-///    durable stage, and a receipt over every canonical completion field. The same transaction
-///    settles Storage's reservation, writes CI's per-meter projection and immutable receipt, and then
-///    [`PgFlowExecutor::signal_typed_on_conn`] buffers `job.done`. Exact replay reuses the persisted
-///    pricing revision instead of repricing. A late completion returns
-///    [`SignalOutcome::TerminalNoOp`] (an acknowledged no-op), so the runner settles its lease instead
-///    of retrying forever.
 #[derive(Clone)]
 pub struct CiPipelineReporter {
     pg_executor: PgFlowExecutor,
@@ -1787,25 +1520,19 @@ pub struct CiPipelineReporter {
     tenant: TenantId,
     region: String,
     accounting: ReporterAccounting,
-    /// Compatibility-only mirror for the historical in-memory culmination harness. This field and
-    /// all code that touches it are absent from normal production builds.
     #[cfg(any(test, feature = "test-support"))]
     test_executor: Option<FlowExecutor>,
 }
 
 impl CiPipelineReporter {
-    /// Exact tenant scope this reporter verifies before any durable completion work.
     pub fn tenant(&self) -> &TenantId {
         &self.tenant
     }
 
-    /// Exact residency region used for every reporter transaction.
     pub fn region(&self) -> &str {
         &self.region
     }
 
-    /// Build the production reporter with all terminal-accounting authorities present. There is no
-    /// default pricer and no production constructor that bypasses the atomic accounting co-commit.
     pub fn new_accounted(
         pg_executor: PgFlowExecutor,
         spec_store: CiJobSpecStore,
@@ -1828,10 +1555,6 @@ impl CiPipelineReporter {
         }
     }
 
-    /// Terminalize an exact still-leased checkout preparation generation. This endpoint deliberately
-    /// accepts the claim-bound token request rather than [`CompletionClaim`]: the immutable claim
-    /// timestamps, CI-run identity, and token-authority handle are all required to re-verify the
-    /// parent attempt. No production caller is wired until the full checkout sequence lands.
     pub fn report_preparation_terminal(
         &self,
         claim: &CiJobTokenRequest,
@@ -1840,8 +1563,6 @@ impl CiPipelineReporter {
         self.report_preparation_terminal_with_diagnostic(claim, disposition, None)
     }
 
-    /// The production preparation-terminal path, retaining an operator-safe checkout diagnostic in
-    /// the job surface while the immutable accounting receipt remains disposition-bound.
     pub fn report_preparation_terminal_with_diagnostic(
         &self,
         claim: &CiJobTokenRequest,
@@ -1954,7 +1675,6 @@ impl CiPipelineReporter {
                             return Err(CompletionTxError::Refused);
                         }
 
-                        // Preserve the existing Flow -> queue -> advisory -> journal lock order.
                         let signal = TypedSignalSpec {
                             run: RunId(claim.wf_run_id.clone()),
                             signal_name: JOB_DONE_SIGNAL.to_string(),
@@ -2048,10 +1768,6 @@ impl CiPipelineReporter {
                             reserve_handle: &reserve_handle,
                             completion_receipt: &receipts.current_v4,
                         };
-                        // Secret resolution occurs before parent-attempt admission and uses its own
-                        // exact leased-generation CAS. AttemptsExhausted may also lack the current
-                        // parent but proves exhaustion against prior policy rows. Executed checkout
-                        // Failed/TimedOut keeps the current-parent CAS.
                         let claim_outcome = match disposition {
                             PreparationTerminalDisposition::Failed {
                                 phase: PreparationPhase::SecretResolution,
@@ -2146,16 +1862,6 @@ impl CiPipelineReporter {
         }
     }
 
-    /// **CT-007 slice 5b.3-6d step 2: report a RETRYABLE preparation failure — requeue the exact
-    /// still-`leased` generation for a fresh attempt.** Distinct from
-    /// [`report_preparation_terminal`](Self::report_preparation_terminal): a requeue is not terminal, so
-    /// it emits NO `job.done` signal, settles NO accounting, and — critically — writes NO
-    /// `retry_attempts` (the parent-attempt journal, not the workload retry counter, is the authority
-    /// for preparation retries). In one tenant transaction it re-verifies the claimed dispatch
-    /// identity, that the generation was ADMITTED (its exact parent row exists) with a fully RESOLVED
-    /// journal, and that the exact-policy budget still permits another attempt, then drives the requeue
-    /// CAS + `ci_job` surface reset. A stale/redelivered request that no longer matches the live leased
-    /// generation is a benign [`PreparationRetryOutcome::NoOp`]. No production caller is wired.
     pub fn report_preparation_retry(
         &self,
         claim: &CiJobTokenRequest,
@@ -2168,9 +1874,6 @@ impl CiPipelineReporter {
                 "ci.pipeline preparation retry refused: reporter scope mismatch".into(),
             ));
         }
-        // The `get_dispatch_identity_on_conn` read parses the job UUID; the claim's own `validate()`
-        // (above) rejects malformed identity UUIDs, and every identity field is bound as text against
-        // the CAS's `$N::uuid` casts.
         let job_uuid = Uuid::parse_str(&claim.job_id)
             .map_err(|_| ExecutorError::InvalidInput("invalid job UUID".into()))?;
         let claim = claim.clone();
@@ -2230,9 +1933,6 @@ impl CiPipelineReporter {
                         {
                             return Err(CompletionTxError::Refused);
                         }
-                        // A not-live generation short-circuits to NoOp WITHOUT the CAS (the FOR UPDATE
-                        // lock above already found nothing to protect); a live-but-unpermitted one has
-                        // already returned Err.
                         if let PreparationRetryGate::NotLive =
                             verify_preparation_retry_permitted_on_conn(conn, &claim, &reserve_handle)
                                 .await?
@@ -2283,8 +1983,6 @@ impl CiPipelineReporter {
         }
     }
 
-    /// Compatibility constructor for historical test fixtures. It does not exist in a production
-    /// build, so a composition root cannot accidentally activate a reporter without accounting.
     #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         pg_executor: PgFlowExecutor,
@@ -2307,8 +2005,6 @@ impl CiPipelineReporter {
         }
     }
 
-    /// Attach the legacy in-memory executor only for the test-support culmination harness. The
-    /// production reporter has no such field or method in a default build.
     #[cfg(any(test, feature = "test-support"))]
     fn with_test_executor(mut self, executor: FlowExecutor) -> Self {
         self.test_executor = Some(executor);
@@ -2316,12 +2012,6 @@ impl CiPipelineReporter {
     }
 }
 
-/// **CT-007 slice 5b.3-6d STEP 4: the exact sandbox [`PreparationReportClaim`] → durable
-/// [`CiJobTokenRequest`] projection.** The mechanical 1:1 inverse of `preparation_report_claim` in
-/// `ci_checkout_composition`: the thirteen fields map field-for-field with no drop or reorder, so a
-/// claim minted at admission reaches the durable preparation CAS byte-identical. The router and the
-/// `CiPipelineReporter` trait impl both use this to reach the inherent durable methods; the round-trip
-/// is proven by a unit test.
 pub(crate) fn token_request_from_preparation_report_claim(
     claim: &PreparationReportClaim,
 ) -> CiJobTokenRequest {
@@ -2366,9 +2056,6 @@ impl TerminalReporter for CiPipelineReporter {
             claim_nonce,
         } = claim;
         let lease_epoch = *lease_epoch;
-        // ── BLOCKER 2: the tenant check is FIRST, before ANY database access. The reporter is
-        // tenant-bound; a cross-tenant completion is refused BEFORE the caller-supplied tenant can reach
-        // the RLS GUC. Every durable query below uses self.tenant (the verified value), never the caller's.
         if tenant != &self.tenant {
             return Err(ExecutorError::InvalidInput(format!(
                 "ci.pipeline job.done refused (unverified claim, fail-closed): {}",
@@ -2431,9 +2118,6 @@ impl TerminalReporter for CiPipelineReporter {
                             identity,
                         )
                         .map_err(|_| CompletionTxError::Refused)?;
-                        // Lock Flow before the scheduler/accounting rows. Run supersession uses the
-                        // same order, so a canceller cannot hold a queue row while waiting for Flow
-                        // as this reporter holds Flow while waiting for that queue row.
                         let signal = TypedSignalSpec {
                             run: run_owned.clone(),
                             signal_name: JOB_DONE_SIGNAL.to_string(),
@@ -2457,9 +2141,6 @@ impl TerminalReporter for CiPipelineReporter {
                         )
                         .await?;
                         let mut accounted_report = report_owned.clone();
-                        // The sandbox report is workload-only. Checkout preparation is authoritative
-                        // in `ci_job_prelaunch_usage` and is added exactly once below; folding it
-                        // into `TerminalReport` as well would double-account it.
                         accounted_report.usage =
                             aggregate_usage(attempts.as_ref(), report_owned.usage)?;
                         let (ci_run_id, usage) = match &accounting {
@@ -2641,8 +2322,6 @@ impl TerminalReporter for CiPipelineReporter {
 
         #[cfg(any(test, feature = "test-support"))]
         if let Some(executor) = &self.test_executor {
-            // Compatibility for the historical test harness only. Production builds contain no
-            // process-local mirror: PgFlowWorker consumes the PostgreSQL signal directly.
             executor.signal_typed(signal)?;
             executor.runs().wake(&self.tenant, &run.0);
         }
@@ -2758,8 +2437,6 @@ impl TerminalReporter for CiPipelineReporter {
                             let report = TerminalReport {
                                 passed: false,
                                 timed_out: false,
-                                // `retry_attempts` contains workload attempts only. Prelaunch usage
-                                // is resolved from its journal immediately below.
                                 usage: ResourceUsage {
                                     cpu_seconds: attempts.cpu_seconds,
                                     mem_byte_seconds: attempts.mem_byte_seconds,
@@ -2873,10 +2550,6 @@ impl TerminalReporter for CiPipelineReporter {
         disposition: PreparationTerminalDisposition,
         diagnostic: Option<&str>,
     ) -> Result<SignalOutcome, ExecutorError> {
-        // CT-007 5b.3-6d STEP 4: map the sandbox reporting identity 1:1 onto the durable claim-bound
-        // request and delegate to the INHERENT durable method (which re-verifies scope, v4-accounting
-        // activation, and the parent attempt under the CAS). Explicit UFCS names the inherent method,
-        // never this trait method.
         CiPipelineReporter::report_preparation_terminal_with_diagnostic(
             self,
             &token_request_from_preparation_report_claim(claim),
@@ -2899,13 +2572,6 @@ impl TerminalReporter for CiPipelineReporter {
     }
 }
 
-// =================================================================================================
-// Chunk 2 + 3 — the pipeline driver (register + drive the body; start with the pre-minted id).
-// =================================================================================================
-
-/// One run's plan the registered body resolves by `run_id`: its [`PipelineRun`] (the ordered stages +
-/// the X-1 producer facts) + its [`JobScheduleTerms`] (the security-load-bearing tier/region the
-/// durable runner forwards). Populated by [`CiPipelineDriver::start_run`] BEFORE the run is started.
 #[derive(Clone)]
 #[cfg(any(test, feature = "test-support"))]
 struct RunPlan {
@@ -2913,45 +2579,27 @@ struct RunPlan {
     terms: JobScheduleTerms,
 }
 
-/// **Chunks 2 + 3 — the CI pipeline DRIVER (the same-process engine over the shared executor).** Owns
-/// the [`FlowExecutor`] the runner's `job.done` wakes, registers `run_ci_pipeline_body` under
-/// [`CI_PIPELINE_WF_TYPE`] (with a per-run [`DurableJobRunner`] injected), and `tick`s a background
-/// dispatcher over the SHARED `RunStore`/`SignalStore`. [`start_run`](Self::start_run) reads a durable
-/// `ci_run` (queued) row and starts the parked run under the pre-minted `wf_run_id` — so the parked
-/// run's id EQUALS the `job_queue` row's `run_id` the runner reports to.
-///
-/// **Durable-drive FLOOR (named):** start and typed completion signal are PostgreSQL-durable, but body
-/// dispatch still mirrors through the in-memory executor. Production activation remains refused until
-/// `PgFlowDriveStore` owns lease/replay end to end.
 #[cfg(any(test, feature = "test-support"))]
 pub struct CiPipelineDriver {
     executor: FlowExecutor,
     pg_executor: PgFlowExecutor,
     tenant: TenantId,
     region: String,
-    // the shared durable-workflow substrate the dispatcher drives over (RunStore/SignalStore come from
-    // the executor; the rest are the driver's).
     journal: WfJournal,
     outbox: OutboxStore,
     telemetry: FlowTelemetry,
     timers: TimerStore,
     minter: Arc<dyn IdMinter>,
     ctx_base: EmitContextBase,
-    // the chunk-5 wiring the registered body composes per run.
     spec_store: CiJobSpecStore,
     rt: tokio::runtime::Handle,
     build_spec: StageSpecBuilder,
-    // run_id → RunPlan (the per-run pipeline + terms the registered body resolves).
     plans: Arc<Mutex<HashMap<String, RunPlan>>>,
-    // the run ids this driver started (so drive_once can wake any parked run robustly).
     started: Arc<Mutex<Vec<String>>>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl CiPipelineDriver {
-    /// Build the driver for a cell `(tenant, region)`. Constructs the shared [`FlowExecutor`] +
-    /// registers [`CI_PIPELINE_WF_TYPE`]; the `spec_store` + `rt` + `build_spec` are the chunk-5 durable
-    /// dispatch seam the registered body composes.
     pub fn new(
         tenant: TenantId,
         region: impl Into<String>,
@@ -2990,16 +2638,10 @@ impl CiPipelineDriver {
         }
     }
 
-    /// The SHARED [`FlowExecutor`] the parked pipeline runs on — the runner loop's reporter signals
-    /// THIS executor (one signal path). A cloneable handle (shared `Arc<Mutex<…>>` state).
     pub fn executor(&self) -> FlowExecutor {
         self.executor.clone()
     }
 
-    /// Build the [`CiPipelineReporter`] the runner loop drives (over this driver's shared executor +
-    /// durable spec store). The runner's `job.done` is VERIFIED against the durable claimed-job identity
-    /// (tenant/run/job_id/idem_token), the stage is resolved from the durable `ci_job_spec.stage`
-    /// column, and the typed verdict wakes the parked run.
     pub fn reporter(&self) -> CiPipelineReporter {
         CiPipelineReporter::new(
             self.pg_executor.clone(),
@@ -3012,22 +2654,10 @@ impl CiPipelineDriver {
         .with_test_executor(self.executor.clone())
     }
 
-    /// The outbox the pipeline body's X-1 producer emits (`ci.run.succeeded` / `ci.check.updated` /
-    /// `ci.result`) co-commit into. Shared so a test/driver can read the emitted terminal facts.
     pub fn outbox(&self) -> &OutboxStore {
         &self.outbox
     }
 
-    /// **Chunk 3 — start the parked `ci.pipeline` run under the pre-minted `wf_run_id`.** Registers the
-    /// run's [`RunPlan`] (so the registered body resolves it by `run_id`), then calls
-    /// [`DurableExecutor::start_with_id`] with `Some(RunId(record.wf_run_id))`. Idempotent on the
-    /// `idem_key` (`ci:<run_id>`): a re-drive (a restart re-reading the queued `ci_run`) returns the
-    /// EXISTING run — never a second run. `record.trust_tier` / `record.region` are forwarded UNCHANGED
-    /// into the run's [`JobScheduleTerms`] (the durable runner's security-load-bearing source).
-    ///
-    /// `labels` are the runner-affinity labels the stage jobs require (a job is claimable iff
-    /// `labels ⊆ runner_labels`) — from the resolved snapshot (the CT-004d follow-on); the caller
-    /// supplies them here.
     pub fn start_run(
         &self,
         record: &CiRunRecord,
@@ -3035,14 +2665,12 @@ impl CiPipelineDriver {
         labels: Vec<String>,
     ) -> Result<RunId, StartRunError> {
         validate_driver_tenant(&self.tenant, record)?;
-        // Forward the run's STAMPED trust tier UNCHANGED (parse the ci_run.trust_tier CHECK token). A
-        // corrupt token is a loud refusal — never a silent widen/default.
         let trust_tier = trust_from_token(&record.trust_tier).map_err(StartRunError::TrustTier)?;
         let terms = JobScheduleTerms {
             tenant_id: record.tenant_id.clone(),
             region: record.region.clone(),
             run_id: record.wf_run_id.clone(),
-            lane: Lane::Interactive, // a PR/push CI check is the interactive lane (arch 02 §2.3)
+            lane: Lane::Interactive,
             labels,
             trust_tier,
             concurrency_group: None,
@@ -3093,11 +2721,6 @@ impl CiPipelineDriver {
         Ok(durable)
     }
 
-    /// The registered `ci.pipeline` body: resolve the run's [`RunPlan`] by `run_id`, build a per-run
-    /// [`DurableJobRunner`] (chunk 5), and drive [`run_ci_pipeline_body`] (which dispatches each stage
-    /// through the durable queue + emits the X-1 producer facts). The body is FLOW-DETERMINISTIC: the
-    /// plan/terms are fixed at start (no clock/RNG/IO), the dispatch rides the journaled activity, the
-    /// verdict rides the journaled `job.done`.
     fn body(&self) -> Box<WorkflowBody> {
         let plans = self.plans.clone();
         let spec_store = self.spec_store.clone();
@@ -3112,7 +2735,7 @@ impl CiPipelineDriver {
                 .cloned()
                 .ok_or_else(|| {
                     format!(
-                        "no PipelineRun registered for ci.pipeline run `{run_id}` — the starter must \
+                        "no PipelineRun registered for ci.pipeline run `{run_id}` - the starter must \
                          register the plan before start_with_id (CT-004d.2 chunk 3)"
                     )
                 })?;
@@ -3140,10 +2763,6 @@ impl CiPipelineDriver {
         })
     }
 
-    /// Build a fresh [`FlowDispatcher`] over the SHARED substrate for a partition (the dogfood
-    /// per-tick-worker shape). The `RunStore`/`SignalStore` are the executor's (so a `start_with_id`
-    /// seeds a run this dispatcher leases + drives, and the runner's `job.done` signal is the one this
-    /// consumes); the journal/timers/outbox/telemetry are the driver's persistent shared handles.
     fn dispatcher(&self, partition: i16) -> FlowDispatcher {
         let mut disp = FlowDispatcher::new(
             self.executor.runs().clone(),
@@ -3162,12 +2781,6 @@ impl CiPipelineDriver {
         disp
     }
 
-    /// **One drive pass: wake every started run, then `tick` every partition.** The wake is the robust
-    /// re-drive (idempotent — it only flips `waiting → running`): a run with no new `job.done` replays
-    /// to its park point and re-parks (cheap); a run whose `job.done` arrived advances. This closes the
-    /// report-before-park race the one-shot reporter wake alone could miss. Each `tick` leases + drives
-    /// at most one runnable run per partition; the driver loop calls this repeatedly. Returns the
-    /// non-idle drive outcomes this pass observed (a test reads `Completed`/`Failed`; the loop ignores).
     pub fn drive_once(&self, now: i64, now_clock: &str) -> Vec<DriveOutcome> {
         for run_id in self
             .started
@@ -3187,9 +2800,6 @@ impl CiPipelineDriver {
         outcomes
     }
 
-    /// Whether a started run has reached a TERMINAL engine state (completed/failed/terminated/
-    /// nondeterministic) — the `ci_run` is the thin index over this myelin-flow run (arch 01 §3.1).
-    /// `None` for an unknown run.
     pub fn is_terminal(&self, run: &RunId) -> Option<bool> {
         self.executor
             .describe(run)
@@ -3197,37 +2807,23 @@ impl CiPipelineDriver {
             .map(|status| status.terminal)
     }
 
-    /// The engine `state` of a started run (running/waiting/completed/failed/…), for the driver loop /
-    /// a test to poll. `None` for an unknown run.
     pub fn run_state(&self, run: &RunId) -> Option<String> {
         self.executor.describe(run).ok().map(|s| s.state)
     }
 
-    /// The cell region this driver runs in.
     pub fn region(&self) -> &str {
         &self.region
     }
 }
 
-/// Why [`CiPipelineDriver::start_run`] refused — a corrupt stamped trust token, or an executor start
-/// failure (unknown workflow / a pre-minted-id collision with a DIFFERENT run). Surfaced, never swallowed.
 #[derive(Debug)]
 #[cfg(any(test, feature = "test-support"))]
 pub enum StartRunError {
-    /// The durable run belongs to a different tenant than this per-tenant driver. Refused before a
-    /// plan is registered or an engine run/job is created, so a region-wide starter cannot stamp
-    /// one tenant's authority or fair-queue key onto another tenant's run.
     TenantMismatch {
-        /// Tenant this driver was composed for.
         driver_tenant: String,
-        /// Authoritative tenant read from `ci_run.tenant_id`.
         record_tenant: String,
     },
-    /// The `ci_run.trust_tier` token was outside the frozen CHECK vocabulary (a corrupt run-of-record) —
-    /// refused loudly rather than defaulting the tier the durable dispatch gates on.
     TrustTier(JobQueueStoreError),
-    /// The executor `start_with_id` failed (unknown workflow, or a pre-minted `wf_run_id` collision with
-    /// a DIFFERENT run — fail-closed, never a silent clobber).
     Start(ExecutorError),
 }
 
@@ -3253,9 +2849,6 @@ impl std::fmt::Display for StartRunError {
 #[cfg(any(test, feature = "test-support"))]
 impl std::error::Error for StartRunError {}
 
-/// Enforce the per-tenant driver boundary before any mutable in-memory/durable orchestration state
-/// is touched. A future region-wide queued-run poller must route each record to a driver composed for
-/// exactly this authoritative tenant; it may never reuse a synthetic service tenant.
 #[cfg(any(test, feature = "test-support"))]
 fn validate_driver_tenant(
     driver_tenant: &TenantId,
@@ -3271,14 +2864,6 @@ fn validate_driver_tenant(
     }
 }
 
-// =================================================================================================
-// Helpers.
-// =================================================================================================
-
-/// The service emit context the driver's dispatcher stamps onto the co-committed X-1 producer events
-/// (`ci.run.succeeded` / `ci.check.updated` / `ci.result`). A platform-service principal (no PII), the
-/// cell `(tenant, region)`. The deterministic timestamps keep the body replay-stable (the body reads no
-/// clock outside `WfCtx`).
 #[cfg(any(test, feature = "test-support"))]
 fn service_ctx_base(tenant: &TenantId, region: &str) -> EmitContextBase {
     EmitContextBase {
@@ -3296,11 +2881,6 @@ fn service_ctx_base(tenant: &TenantId, region: &str) -> EmitContextBase {
     }
 }
 
-/// **A deterministic uuid-shaped string from a seed (2×-salted FNV-1a fill).** Mirrors
-/// `myelin_ci_dispatch::deterministic_uuid` (the leaf crate can not be a dependency of this one) so a
-/// re-dispatch derives the SAME `job_queue.job_id` (the `(tenant_id, job_id)` PK idempotency anchor).
-/// Non-cryptographic — it keys a DEDUP boundary (a collision would merge two stages' durable rows), not
-/// an auth boundary; the trust gate is the forwarded `trust_tier`, not this id.
 fn deterministic_uuid(seed: &str) -> String {
     let fill = |salt: u64| -> u64 {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325 ^ salt;
@@ -3320,11 +2900,6 @@ fn deterministic_uuid(seed: &str) -> String {
     )
 }
 
-/// **A digest-pinned compute [`SandboxJobSpec`] builder for a fixed test command.** Produces a
-/// `kind=ci` spec running `command` in a `runsc` guest,
-/// default-deny egress, a read-only workspace. The `trust_tier` + `idem_token` are placeholders the
-/// [`DurableJobRunner`] OVERWRITES from the run's terms + the dispatch (so this builder can never widen
-/// the tier). `image` MUST be digest-pinned (fail-closed via [`ImageRef::pinned`]).
 #[cfg(any(test, feature = "test-support"))]
 pub fn fixed_command_spec_builder(
     image: &str,
@@ -3349,7 +2924,6 @@ pub fn fixed_command_spec_builder(
                 timeout_secs,
             },
             WorkspaceSpec::default(),
-            // placeholders — DurableJobRunner::dispatch overwrites both from the run's terms + dispatch.
             TrustTier::Trusted,
             RunTokenCredential::new("ci-pipeline-driver-bearer", "ci-pipeline-driver-jti", 300)
                 .expect("static driver credential is valid"),

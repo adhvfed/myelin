@@ -1,7 +1,3 @@
-//! The production binary must never fall back to the former catalogue-only server. Protocol framing
-//! is covered in `server`/`governed_routing`; this subprocess pin proves missing durable production
-//! configuration fails before stdin is served.
-
 use std::process::Command;
 
 #[test]

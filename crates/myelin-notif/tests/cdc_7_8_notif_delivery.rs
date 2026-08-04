@@ -1,27 +1,3 @@
-//! # CDC — contract 7.8 `DeliveryAdapter` (the EU-sovereign delivery fabric) (P-194)
-//!
-//! **Architecture:** `notifications.md` §3.6 (the EU-sovereign delivery fabric: ONE trait
-//! `DeliveryAdapter{channel, region, send(RedactedMessage, idem_key), receipts}` — EU-preferring,
-//! region-aware, swappable; PII-minimised off-cell payloads (`RedactedMessage` = summary + deep link,
-//! `delivery.redacted=true`, GDPR Art. 5(1)(c)); in-app stays in-cell; at-least-once + idempotent on
-//! `UNIQUE(idem_key)`). **Contract:** **7.8** `DeliveryAdapter{channel, region, send(RedactedMessage,
-//! idem_key), receipts}` (OWNED — the trait was frozen as a carrier in NOTIF-P1; the BODY is here).
-//!
-//! This CDC pins the 7.8 seam from BOTH sides:
-//!
-//! - **PROVIDER (Notif owns 7.8):** the [`DeliveryFabric`] delivers at-least-once + idempotent on
-//!   `UNIQUE(tenant, idem_key)` — a retried send collapses to exactly one effective delivery; an
-//!   off-cell channel carries ONLY a `RedactedMessage` (`delivery.redacted=true`); the in-app channel
-//!   stays in-cell. The region-aware adapter is EU-preferring.
-//! - **CONSUMER (a channel adapter — mock now, the real EU provider NOTIF-P25 later):** a concrete
-//!   adapter implements the SAME `DeliveryAdapter` trait (the strategy-pattern swap point); the
-//!   fabric dispatches to it by channel and records its receipt. A drift on the trait signature
-//!   (`channel`/`region`/`send(RedactedMessage, idem_key) -> Receipt`) breaks THIS build.
-//!
-//! Both halves agree on the WIRE: the trait signature, the `idem_key` collapse, and the off-cell
-//! redaction discipline. The real EU provider (NOTIF-P25/P26) is a named floor; here the deterministic
-//! mock proves the PROPERTIES (idempotency, redaction, EU-preferring) against the seam.
-
 use myelin_notif::prefs::Channel;
 use myelin_notif::{
     build_idem_key, is_eu_region, redact_for_offcell, Class, DeliveryAdapter, DeliveryFabric,
@@ -42,9 +18,6 @@ fn summary() -> HumanisedString {
     }
 }
 
-// === PROVIDER side: the fabric delivers at-least-once + idempotent, EU-preferring, redacted ===
-
-/// **PROVIDER — the fabric is at-least-once + idempotent on `UNIQUE(tenant, idem_key)`.**
 #[test]
 fn provider_fabric_is_at_least_once_and_idempotent() {
     let ledger = DeliveryLedger::new();
@@ -56,7 +29,6 @@ fn provider_fabric_is_at_least_once_and_idempotent() {
         .deliver(&tenant(), "itm-1", Channel::Email, &msg)
         .unwrap();
     assert!(matches!(first, DeliveryOutcome::Delivered(_)));
-    // The retry collapses (UNIQUE(tenant, idem_key)) — the provider is invoked exactly once.
     let retry = fabric
         .deliver(&tenant(), "itm-1", Channel::Email, &msg)
         .unwrap();
@@ -69,7 +41,6 @@ fn provider_fabric_is_at_least_once_and_idempotent() {
     );
 }
 
-/// **PROVIDER — off-cell carries a RedactedMessage (`redacted=true`); in-app stays in-cell.**
 #[test]
 fn provider_offcell_is_redacted_in_app_is_in_cell() {
     let ledger = DeliveryLedger::new();
@@ -103,7 +74,6 @@ fn provider_offcell_is_redacted_in_app_is_in_cell() {
     );
 }
 
-/// **PROVIDER — the adapter is region-aware + EU-preferring (the §3.6 posture).**
 #[test]
 fn provider_adapter_is_eu_preferring() {
     let mock = MockAdapter::new(Channel::Email, Region("fr-par".into()));
@@ -114,11 +84,6 @@ fn provider_adapter_is_eu_preferring() {
     );
 }
 
-// === CONSUMER side: a concrete adapter implements the SAME trait (the strategy-pattern swap) ===
-
-/// **CONSUMER — a real-shaped adapter implements 7.8 and the fabric dispatches to it.** This stands
-/// in for the production EU provider (NOTIF-P25): it implements the SAME trait signature, so the swap
-/// is a config change, never a code change (ADR-12.8 strategy pattern). A drift breaks THIS build.
 #[test]
 fn consumer_a_custom_adapter_satisfies_the_frozen_trait() {
     use std::sync::Mutex;
@@ -147,7 +112,6 @@ fn consumer_a_custom_adapter_satisfies_the_frozen_trait() {
     });
     let ledger = DeliveryLedger::new();
     let fabric = DeliveryFabric::new(ledger).with_adapter(stub.clone());
-    // The fabric dispatches the email channel to the custom adapter (the swap point).
     let out = fabric
         .deliver(
             &tenant(),
@@ -168,7 +132,6 @@ fn consumer_a_custom_adapter_satisfies_the_frozen_trait() {
     );
 }
 
-/// **The wire both sides agree on: the `idem_key` is `<item>:<channel>` (the collapse key).**
 #[test]
 fn the_idem_key_wire_is_frozen() {
     assert_eq!(build_idem_key("itm-1", Channel::Email), "itm-1:email");

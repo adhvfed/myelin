@@ -1,10 +1,3 @@
-//! Manifest-backed production body for the durable `ci.pipeline` workflow.
-//!
-//! The starter persists exactly two workflow input references. This module resolves those references
-//! under Flow's fenced lease to the insert-only manifest, verifies the workflow identity/code pin,
-//! and then drives only the manifest DAG. The synchronous body performs no database or clock reads
-//! outside `WfCtx`.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -33,7 +26,6 @@ use crate::ci_run_store::{
 use crate::pg_pipeline_starter::{decode_ci_claimed_input, CiWorkflowDefinitionPin};
 use crate::CI_PIPELINE_WF_TYPE;
 
-/// Scope- and code-pinned resolver installed alongside the production `ci.pipeline` body.
 #[derive(Clone)]
 pub struct CiManifestInputResolver {
     store: CiDriveManifestStore,
@@ -114,9 +106,6 @@ impl PgWorkflowInputResolver for CiManifestInputResolver {
     }
 }
 
-/// Install the code-pinned resolver and manifest-native body as one definition. The runner capture
-/// is an effect adapter only; all workflow decisions and job targets come from resolved manifest
-/// bytes and journaled `WfCtx` reads.
 pub fn register_ci_manifest_pipeline<R>(
     worker: &mut PgFlowWorker,
     resolver: CiManifestInputResolver,
@@ -148,7 +137,6 @@ fn map_manifest_load_error(error: CiDriveManifestError) -> PgInputResolveError {
     }
 }
 
-/// Terminal or parked result of one manifest-native DAG drive.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CiManifestPipelineOutcome {
     Parked,
@@ -156,8 +144,6 @@ pub enum CiManifestPipelineOutcome {
     Failed { job: String, timed_out: bool },
 }
 
-/// Decode the resolver's canonical bytes, re-bind them to the claimed drive, and execute the DAG.
-/// This is the body installed by [`register_ci_manifest_pipeline`].
 pub fn drive_resolved_ci_manifest_pipeline<R>(
     input: &PgResolvedDriveInput,
     ctx: &mut WfCtx,
@@ -173,7 +159,6 @@ where
     Ok(vec![ArtifactRef(manifest.run_ref)])
 }
 
-/// Decode canonical resolver output and bind it again to the claimed workflow identity.
 pub fn decode_resolved_ci_manifest(
     input: &PgResolvedDriveInput,
 ) -> Result<CiDriveManifestV1, String> {
@@ -190,12 +175,6 @@ pub fn decode_resolved_ci_manifest(
     Ok(manifest)
 }
 
-/// Execute the validated manifest DAG through Flow's split dispatch/join surface.
-///
-/// Every ready node is dispatched before any join. Joins use the engine-required
-/// `(deadline, idem_token)` order. Once a frontier contains a failure, all already-dispatched
-/// siblings are drained before the workflow emits its terminal facts; descendants are never
-/// dispatched.
 pub fn run_ci_manifest_pipeline<R>(
     ctx: &mut WfCtx,
     manifest: &CiDriveManifestV1,
@@ -276,9 +255,6 @@ where
             }
         }
 
-        // A Flow dispatch deadline is a terminal workflow verdict, not permission to abandon money
-        // truth. The sandbox job is never interrupted by this timer. Park on the same exact signal
-        // without a second deadline until the runner co-commits measured usage and `job.done`.
         for (job_name, idem_token) in late_accounting {
             match ctx.wait_for_signal_exact(JOB_DONE_SIGNAL, &idem_token, None)? {
                 WaitOutcome::Parked => return Ok(CiManifestPipelineOutcome::Parked),

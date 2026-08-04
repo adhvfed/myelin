@@ -1,30 +1,3 @@
-//! # The CDC pair for mid-workflow `mint_run_token` re-mint on resume — contract 4.7
-//! (workflow CONSUMER ↔ Identity PROVIDER)
-//!
-//! **Contracts:** `planning/05-refined-shared-systems-architecture/contract-index.md` row 4.7
-//! (`mint_run_token(agent_id, run_id, delegation_caveats, ttl) → token` — callable mid-workflow on
-//! resume, CONSUMED by workflow). Owning architecture: `durable-workflow.md` §6.2 (mid-workflow token
-//! re-mint on resume — *token life == activity life*) + §5.2 (the 4.7 pin).
-//!
-//! ## What this pair pins (the CONSUMER ↔ PROVIDER agreement of 4.7 across the mint seam)
-//!
-//! **4.7 CONSUMER (the workflow engine's re-mint on resume) — what it drives:** on a resume across a
-//! multi-day wait it calls the contract-4.7 mint surface with `(agent_id, run_id, delegation_caveats,
-//! ttl)` where `ttl` is the SHORT fail-static window (token life == activity life) and the caveats are
-//! ATTENUATED per-run. It NEVER fabricates a token — it always asks Identity.
-//!
-//! **4.7 PROVIDER (Identity's `IdentityService::mint_run_token`):** mints a per-run attenuated token
-//! `RunToken{token, jti}` for `(agent_id, run_id)` with the delegation caveats + the TTL bound. This
-//! fixture adapts the REAL `myelin_identity::IdentityService` trait (the frozen contract-4.7 surface)
-//! onto the engine's [`RunTokenMinter`] seam — the agreement is the SAME `(agent_id, run_id, caveats,
-//! ttl)` flows engine → Identity → `RunToken` → engine.
-//!
-//! **FLOOR named:** the `mint_run_token` BODY is Identity's (body → P-ID-18, M1 — the M0 stub returns
-//! `NotYetImplemented`). This CDC fixture is a REAL `IdentityService` impl that mints a deterministic
-//! test token, proving the engine drives the surface with the right args (the short TTL + per-run
-//! attenuation). The production binding onto the live Identity service lands when the dispatcher wires
-//! the run's agent identity (the spine, P-FLOW-27).
-
 use myelin_events::{
     Actor, CausedBy, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp,
 };
@@ -69,12 +42,6 @@ fn minter() -> Arc<dyn IdMinter> {
     Arc::new(MonotonicMinter::new())
 }
 
-/// **The PROVIDER fixture: a REAL `myelin_identity::IdentityService` whose `mint_run_token` mints a
-/// deterministic per-run token (contract 4.7).** It RECORDS the `(agent_id, run_id, caveats, ttl)` it
-/// was called with (so the test can prove the engine drove the surface with the short TTL + the
-/// per-run attenuation) and mints a fresh, DISTINCT `RunToken` per call (a re-mint is a NEW token).
-/// Every OTHER method is the M0 fail-closed / not-yet-implemented floor (this CDC pins ONLY the 4.7
-/// mint path).
 #[derive(Default)]
 struct MintingIdentity {
     calls: AtomicU64,
@@ -96,14 +63,12 @@ impl IdentityService for MintingIdentity {
             delegation_caveats.clone(),
             *ttl,
         ));
-        // a deterministic, DISTINCT per-mint token (the real mint is P-ID-18; this proves the seam).
         Ok(RunToken {
             token: format!("rt-{}-{}", run_id.0, n),
             jti: format!("jti-{}-{}", run_id.0, n),
         })
     }
 
-    // ---- the rest of the eleven-method surface is the M0 floor (this CDC pins only 4.7) ----
     fn authenticate(&self, _c: &Credential) -> Result<Principal, AuthzError> {
         Err(AuthzError::NotYetImplemented("authenticate (CDC stub)"))
     }
@@ -169,11 +134,6 @@ impl IdentityService for MintingIdentity {
     }
 }
 
-/// **The CONSUMER-side adapter: the engine's [`RunTokenMinter`] over the REAL `IdentityService`
-/// (contract 4.7).** It maps the engine's `(agent_id, run_id, caveats, ttl_secs)` onto Identity's
-/// `mint_run_token(PrincipalId, RunId, DelegationCaveats, FailStaticBound)` and maps the returned
-/// `RunToken` back onto the engine's [`RunTokenHandle`] — the 1:1 contract-4.7 agreement across the
-/// mint seam. A `NotYetImplemented` / fail-static from Identity maps to a loud [`RunTokenError`].
 struct IdentityRemintAdapter {
     id: Arc<MintingIdentity>,
 }
@@ -228,10 +188,6 @@ fn deliver_approval(signals: &SignalStore, call_id: &str, payload: Vec<ArtifactR
     });
 }
 
-/// **PROVIDER ↔ CONSUMER: a days-later HITL resume re-mints a fresh token via Identity's
-/// `mint_run_token` (contract 4.7, §6.2).** Drive 1 parks on the approval wait (state=waiting holds no
-/// runtime, no mint). The approval arrives DAYS later. Drive 2 (the resume) consumes it AND drives the
-/// contract-4.7 mint surface: Identity mints a short-lived per-run token — the engine's re-mint.
 #[test]
 fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
     let outbox = OutboxStore::new();
@@ -239,7 +195,6 @@ fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
     let signals = SignalStore::new();
     let id = Arc::new(MintingIdentity::default());
 
-    // DRIVE 1: park on the approval wait (no signal yet) → no mint (the run holds NO token while parked).
     let mut c1 = WfCtx::begin(
         &outbox,
         minter(),
@@ -273,14 +228,12 @@ fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
     c1.commit().expect("co-commit the park");
     let history = journal.history_for(&tenant(), "R1");
 
-    // ... DAYS later, the human clicks Approve ...
     deliver_approval(
         &signals,
         "call-7",
         vec![ArtifactRef("myelin://acme/approval/yes".into())],
     );
 
-    // DRIVE 2 (the resume): consume the approval AND re-mint a fresh token via Identity (contract 4.7).
     let mut c2 = WfCtx::resume(
         &outbox,
         minter(),
@@ -307,7 +260,6 @@ fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
         "the resume re-minted exactly one fresh token"
     );
 
-    // CONSUMER ↔ PROVIDER agreement: Identity's mint_run_token was driven with the engine's args.
     assert_eq!(
         id.calls.load(Ordering::SeqCst),
         1,
@@ -319,13 +271,11 @@ fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
         "minted for the run's agent (4.7 agent_id)"
     );
     assert_eq!(run.0, "R1", "minted for THIS run (4.7 run_id)");
-    // SHORT-LIVED: the TTL is the fail-static window (token life == activity life), not the workflow life.
     assert_eq!(
         ttl.static_max_secs,
         RunTokenLease::DEFAULT_TTL_SECS,
-        "the mint TTL is the SHORT fail-static window — not the days-long workflow life (§6.2)"
+        "the mint TTL is the SHORT fail-static window - not the days-long workflow life (§6.2)"
     );
-    // ATTENUATED per-run: the caveat chain carries a per-run caveat naming THIS run.
     assert!(
         caveats.0.contains(&"run:R1".to_string()),
         "the token is attenuated per-run (scoped to THIS run): {caveats:?}"
@@ -336,9 +286,6 @@ fn provider_mints_a_short_lived_per_run_token_on_a_days_later_hitl_resume() {
     );
 }
 
-/// **CONSUMER: the explicit `remint_on_resume` surface drives Identity's `mint_run_token` directly
-/// (contract 4.7).** A body that calls the public re-mint gets a fresh `RunToken` from the real
-/// Identity provider — the engine never fabricates a token.
 #[test]
 fn consumer_remint_on_resume_drives_identity_mint_run_token() {
     let outbox = OutboxStore::new();

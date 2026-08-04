@@ -1,9 +1,3 @@
-//! CDC for contract 8.1's CI ToolDef → MCP projection.
-//!
-//! PROVIDER: CI owns `ci_tool_defs`, including the exact read schemas, capability, routing
-//! discriminator, side-effect flag, gate default, and MCP exposure bit.
-//! CONSUMER: the MCP registry projects those shared fields without a second CI definition model.
-
 use myelin_agent::EffectKind;
 use myelin_ci_controlplane::ci_tool_def;
 use myelin_mcp::ToolRegistry;

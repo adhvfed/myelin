@@ -1,32 +1,3 @@
-//! # CDC 11.6 (+ 10.1 derived-store faces) — `restrict` suppression into the derived stores
-//! (P-GA-25 → P-152)
-//!
-//! **Contracts:** index row **11.6** (the OLAP read store **honours the restriction flag** — no
-//! analytics for a restricted subject) + the Search/Refs/Notif/Agent restriction faces of **10.1**
-//! (every holder honours `restrict` — no indexing / agent-use / notification for a restricted
-//! subject, §4.4). The `restrict`-into-derived FAN-OUT (the orchestration leg of 10.1) wires the five
-//! derived-store holders as the orchestrator's per-holder `restrict` calls and reads back their
-//! processing verdicts. This is the consumer-driven contract test the coverage scanner (P-S21) reads
-//! both halves of:
-//!
-//! - **provider** = a DERIVED-store holder ([`DerivedStoreHolder`] over a [`DerivedStore`] of each
-//!   §4.4 kind — the faithful M2 store double whose `restrict` sets the shared flag and whose
-//!   processing chokepoint HONOURS it) IMPLEMENTING the contract — the store owns its processing op +
-//!   honours the flag; GDPR calls it.
-//! - **consumer** = the [`RestrictFanOutDriver`] (the DSR orchestrator's `restrict`-fan-out stage)
-//!   CALLING the derived holders through the [`PersonalDataHolder`] contract — it NEVER reaches into
-//!   a store (the no-cross-store-read law, gdpr §3.1).
-//!
-//! The dated green artifacts:
-//! - **11.6** — the consumer fans `restrict(set)` to OLAP (provider): OLAP suppresses analytics (no
-//!   analytics for a restricted subject); `restrict(clear)` resumes it (reversible).
-//! - **10.1 (Search/Refs/Notif/Agent faces)** — the consumer fans `restrict` to each derived store
-//!   (provider): each suppresses its processing op (index / edge-projection / notification /
-//!   agent-read) while retaining the row; reversible.
-//!
-//! If 11.6's (or the 10.1 `restrict` face's) shape drifts, this stops compiling/passing — that is
-//! the contract.
-
 use myelin_gdpr::{PersonalDataHolder, SubjectRef, TenantId};
 use myelin_gdpr_service::{
     restrict_holder_ids, DerivedProcessed, DerivedProcessing, DerivedStore, DerivedStoreHolder,
@@ -46,9 +17,6 @@ fn subject(id: &str) -> SubjectRef {
     ))
 }
 
-/// **11.6 (provider OLAP ⇄ consumer driver): `restrict` ⇒ no analytics for a restricted subject;
-/// reversible.** The consumer sets the restriction through the OLAP provider via the contract; the
-/// OLAP read store suppresses analytics (the row is retained). Clearing resumes analytics.
 #[test]
 fn cdc_11_6_olap_honours_the_restriction_flag_no_analytics() {
     let tenant = t("acme");
@@ -59,16 +27,13 @@ fn cdc_11_6_olap_honours_the_restriction_flag_no_analytics() {
     assert_eq!(olap.holder_id(), restrict_holder_ids::OLAP_READ_STORE);
 
     let provider = DerivedStoreHolder::new(&olap);
-    // The CONSUMER calls the provider via `dyn PersonalDataHolder` — never into the store.
     let consumer: &dyn PersonalDataHolder = &provider;
 
-    // Unrestricted: OLAP analyses the subject's rows.
     assert!(matches!(
         olap.process(&subj, &tenant),
         DerivedProcessed::Processed(_)
     ));
 
-    // SET the restriction through the contract ⇒ OLAP suppresses analytics (11.6).
     let set = consumer
         .restrict(&subj, true)
         .expect("OLAP restrict honours 11.6");
@@ -82,13 +47,11 @@ fn cdc_11_6_olap_honours_the_restriction_flag_no_analytics() {
         DerivedProcessed::Suppressed,
         "11.6: no analytics for a restricted subject"
     );
-    // Storage retained (the OLAP row survives the restriction).
     assert!(
         olap.has_row(&subj, &tenant),
         "11.6: storage retained while restricted"
     );
 
-    // CLEAR the restriction through the contract ⇒ analytics resume (reversible).
     consumer
         .restrict(&subj, false)
         .expect("OLAP un-restrict honours 11.6");
@@ -98,9 +61,6 @@ fn cdc_11_6_olap_honours_the_restriction_flag_no_analytics() {
     );
 }
 
-/// **10.1 (Search/Refs/Notif/Agent faces): each derived store honours `restrict` through the
-/// contract.** The consumer fans the restriction to each derived store provider; each suppresses its
-/// processing op while retaining the row; reversible.
 #[test]
 fn cdc_10_1_search_refs_notif_agent_honour_restrict() {
     let tenant = t("acme");
@@ -118,7 +78,6 @@ fn cdc_10_1_search_refs_notif_agent_honour_restrict() {
         let provider = DerivedStoreHolder::new(&store);
         let consumer: &dyn PersonalDataHolder = &provider;
 
-        // Unrestricted: the store processes.
         assert!(
             matches!(
                 store.process(&subj, &tenant),
@@ -127,7 +86,6 @@ fn cdc_10_1_search_refs_notif_agent_honour_restrict() {
             "{} processes before restriction",
             kind.holder_id()
         );
-        // SET via the contract ⇒ suppressed, row retained.
         consumer
             .restrict(&subj, true)
             .expect("derived restrict honours 10.1");
@@ -142,7 +100,6 @@ fn cdc_10_1_search_refs_notif_agent_honour_restrict() {
             "{}: storage retained",
             kind.holder_id()
         );
-        // CLEAR via the contract ⇒ resumes (reversible).
         consumer
             .restrict(&subj, false)
             .expect("derived un-restrict honours 10.1");
@@ -157,9 +114,6 @@ fn cdc_10_1_search_refs_notif_agent_honour_restrict() {
     }
 }
 
-/// **The fan-out leg (consumer driver over the five providers): 0 processing of a restricted subject
-/// across all five derived stores, reversible.** The contract is honoured by every derived store at
-/// once — the orchestration leg of 10.1 + 11.6.
 #[test]
 fn cdc_restrict_fan_out_zero_processing_across_all_five() {
     let tenant = t("acme");

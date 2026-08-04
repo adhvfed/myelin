@@ -1,4 +1,3 @@
-//! Live PostgreSQL proof for the exact-cell CI run starter.
 #![cfg(feature = "integration")]
 
 mod common;
@@ -56,20 +55,10 @@ use myelin_storage::{
 use myelin_tenancy::{Region, TenantId};
 use sqlx::{Executor, PgPool};
 
-/// Concurrent `#[tokio::test]` functions in this file each run their own `PgMigrator` sequence
-/// against the same live PostgreSQL instance; running two migration sequences at once can hit a
-/// genuine advisory-lock deadlock (not just contention) rather than a benign wait, so every test
-/// that runs migrations serializes on this guard for its migration-touching span, mirroring
-/// `MIGRATION_SCENARIO_LOCK` in `integration_ci_terminal_accounting_atomic.rs`.
 static MIGRATION_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const BODY_HASH: &str = "blake3:ci-pg-body-v1";
 const BODY_HASH_V2: &str = "blake3:ci-pg-body-v2";
-/// A syntactically valid (40-hex-char, SHA-1-shaped) placeholder commit id. The real production
-/// launch authority (`checkout_scope_for_run` in `ci_launch_authority.rs`) requires a full
-/// 40-character (SHA-1) or 64-character (SHA-256) lowercase-hex commit object id and refuses
-/// anything shorter (e.g. the old `"deadbeef"` placeholder), so every fixture that may reach that
-/// real authority must use this instead.
 const TEST_COMMIT_OID: &str = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 static AUTHORITY_CALLS: AtomicUsize = AtomicUsize::new(0);
 
@@ -350,9 +339,6 @@ fn starter_with_operational_reservations(
     .expect("valid exact-cell production starter")
 }
 
-// The production composition-root seam (`ci_run_starter_factory`) over the app-role pool + cell region
-// + blob CAS — the exact router the service main composes behind the runner activation gate. It mints a
-// per-tenant `PgCiPipelineStarter` for an explicit authoritative tenant, never enumerating tenants.
 fn factory(pool: &PgPool, blobs: Arc<FsBlobStore>) -> PgCiRunStarterFactory {
     PgCiRunStarterFactory::new_with_authority(
         pool.clone(),
@@ -1077,9 +1063,6 @@ async fn assert_run_ledger_index_is_used(admin: &PgPool, tenant: &str, run_id: &
         "exact-cell ledger index has the frozen key order: {indexdef}"
     );
 
-    // Disable only sequential scans inside this probe. PostgreSQL may choose either an Index Scan or
-    // Bitmap Index Scan; both prove the index can serve the exact tenant+region+run predicate without
-    // making a brittle cost/cardinality assertion.
     let mut transaction = admin.begin().await.expect("begin planner probe");
     sqlx::query("SET LOCAL enable_seqscan = off")
         .execute(&mut *transaction)
@@ -1337,8 +1320,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .expect("register immutable workflow definition");
     });
 
-    // A shutdown arriving during one real starter transaction lets that in-flight start commit, then
-    // prevents the next queued run in the same nominal 64-item pass from acquiring authority.
     let shutdown_run_a = "10000000-0000-0000-0000-0000000000c1";
     let shutdown_wf_a = "20000000-0000-0000-0000-0000000000c1";
     let shutdown_run_b = "10000000-0000-0000-0000-0000000000c2";
@@ -1412,9 +1393,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .await
         .expect("remove only the deliberately unstarted shutdown fixture");
 
-    // The region-wide poller routes only the discovered authoritative tenant into the exact-cell
-    // starter. Two pollers may discover the same row, but the starter's exact queued-row lock admits
-    // one authority call and one atomic start; the loser returns Idle.
     let poller_run = "10000000-0000-0000-0000-0000000000e0";
     let poller_wf = "20000000-0000-0000-0000-0000000000e0";
     insert_run(
@@ -1454,9 +1432,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         "racing discovery passes cannot duplicate launch authority"
     );
 
-    // Production composition has no implicit runtime policy. Reserve-time attempt authority already
-    // exists; a fresh V2 run is refused before any manifest, job, workflow, or lifecycle mutation
-    // when no launch-authority adapter is wired.
     let denied_run = "10000000-0000-0000-0000-0000000000d0";
     let denied_wf = "20000000-0000-0000-0000-0000000000d0";
     insert_run(
@@ -1491,10 +1466,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .is_empty()
     );
 
-    // The real Tier-P authority is dispatched through `materialize_in_tx`: reservations are written
-    // before the manifest, but a later manifest failure rolls both back with the starter transaction.
-    // Calling the authority's standalone path here would commit three orphan reservations and fail
-    // this proof.
     let reservation_tenant = "tenant_atomic_reservation";
     let reservation_run = "10000000-0000-0000-0000-0000000000a7";
     let reservation_wf = "20000000-0000-0000-0000-0000000000a7";
@@ -1617,10 +1588,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
          marker=2 is asserted when those manifest jobs are actually dispatched"
     );
 
-    // Producer generations, not arrival time, own PR supersession. Starting generation 2
-    // co-commits its own workflow/reservations with cancellation of the already-running generation
-    // 1 run. Because no old job crossed launch, all three reservations settle at zero and the
-    // cancelled run is immediately cost-closed.
     let pr_tenant = "tenant_pr_supersession";
     let pr_group = "pr:core:42";
     let old_run = "10000000-0000-0000-0000-000000000141";
@@ -1712,9 +1679,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert_eq!(old_accounting, (3, 6, 3, 1));
     assert_cancelled_facts(&admin, pr_tenant, old_run, &[true]).await;
 
-    // A delayed generation-1 event is consumed without consulting its missing CAS plan. The
-    // already-running generation 2 remains untouched, proving arrival order and timestamps do not
-    // become accidental authority.
     let delayed_run = "10000000-0000-0000-0000-000000000140";
     let delayed_wf = "20000000-0000-0000-0000-000000000140";
     insert_pr_run(
@@ -1757,9 +1721,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .unwrap();
     assert_eq!(current_state, "running");
 
-    // Terminal rows remain the durable generation high-water mark. A late lower positive row and
-    // a rolling-upgrade NULL row are stale even after the newest generation has left the active
-    // set; completion never erases producer ordering authority.
     let terminal_watermark_group = "pr:core:48";
     let terminal_watermark_run = "10000000-0000-0000-0000-000000000201";
     let terminal_watermark_wf = "20000000-0000-0000-0000-000000000201";
@@ -1814,9 +1775,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         );
     }
 
-    // Rolling-upgrade NULL generations are legacy-oldest only relative to a positive generation.
-    // Two legacy rows do not invent an order and therefore both start; a positive successor then
-    // cancels both.
     let legacy_group = "pr:core:43";
     let legacy_a = "10000000-0000-0000-0000-000000000151";
     let legacy_a_wf = "20000000-0000-0000-0000-000000000151";
@@ -1877,8 +1835,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .unwrap();
     assert_eq!(legacy_cancelled, 2);
 
-    // Cancellation winning the final-launch race terminalizes the exact leased generation and
-    // zero-settles even an already-inflight reservation. The later launch CAS is refused.
     let cancel_wins_group = "pr:core:44";
     let cancel_wins_old = "10000000-0000-0000-0000-000000000161";
     let cancel_wins_old_wf = "20000000-0000-0000-0000-000000000161";
@@ -1948,9 +1904,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_cancelled_facts(&admin, pr_tenant, cancel_wins_old, &[true]).await;
 
-    // Production manifest dispatch and supersession share the exact Flow→queue fence. A dispatch
-    // that commits first is observed and terminalized; after cancellation commits, a stale body
-    // cannot insert another manifest row behind the queue snapshot.
     let late_dispatch_group = "pr:core:49";
     let late_dispatch_old = "10000000-0000-0000-0000-000000000211";
     let late_dispatch_old_wf = "20000000-0000-0000-0000-000000000211";
@@ -2062,10 +2015,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         "stale body writes neither queue nor executable spec"
     );
 
-    // Recreate the dangerous finalizer-winning interleaving: hold the old ci_run row, let
-    // supersession terminate/lock Flow and reach the product CAS, then publish a terminal product
-    // result first. The canceller must roll back its Flow termination and the replacement start,
-    // never accept a terminal product row paired with a newly terminated workflow.
     let finalizer_group = "pr:core:50";
     let finalizer_old = "10000000-0000-0000-0000-000000000221";
     let finalizer_old_wf = "20000000-0000-0000-0000-000000000221";
@@ -2193,9 +2142,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .unwrap();
     let reporter = runtime.reporter_router().unwrap();
 
-    // A job that completed before the newer head is immutable settled history, not cancellation
-    // work. Supersession verifies its queue receipt, pricing mode, and settled Storage reservation,
-    // then zero-settles only the two undispatched jobs.
     let completed_group = "pr:core:46";
     let completed_old = "10000000-0000-0000-0000-000000000181";
     let completed_old_wf = "20000000-0000-0000-0000-000000000181";
@@ -2288,9 +2234,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_cancelled_facts(&admin, pr_tenant, completed_old, &[true]).await;
 
-    // Matching IDs, receipt text, and pricing token are insufficient accounting authority. Forge a
-    // mutually matching queue/accounting receipt and an exact Storage settlement, but diverge the
-    // CI usage projection. Supersession must verify all monetary truth and abort the replacement.
     let corrupt_group = "pr:core:47";
     let corrupt_old = "10000000-0000-0000-0000-000000000191";
     let corrupt_old_wf = "20000000-0000-0000-0000-000000000191";
@@ -2444,9 +2387,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .unwrap();
 
-    // A no-queue skipped receipt is accepted only when its deterministic supersession receipt and
-    // full-refund monetary facts agree. Even exact zero-unit ledgers/projections cannot bless an
-    // invented completion receipt.
     let skipped_forge_group = "pr:core:51";
     let skipped_forge_old = "10000000-0000-0000-0000-000000000231";
     let skipped_forge_old_wf = "20000000-0000-0000-0000-000000000231";
@@ -2586,10 +2526,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await
     .unwrap();
 
-    // If final launch wins first, supersession never zero-settles that running generation. It
-    // terminates Flow and closes every other job, leaving cost_settled=false until the real terminal
-    // report accounts actual usage. The late report is an acknowledged terminal no-op at Flow while
-    // atomically closing the cancelled ci_run; exact replay changes nothing.
     let launch_wins_group = "pr:core:45";
     let launch_wins_old = "10000000-0000-0000-0000-000000000171";
     let launch_wins_old_wf = "20000000-0000-0000-0000-000000000171";
@@ -2704,8 +2640,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert_eq!(after_late_report, (true, "terminal".into(), 3, 6, 0));
     assert_cancelled_facts(&admin, pr_tenant, launch_wins_old, &[false, true]).await;
 
-    // Two concurrent starters see one row. SKIP LOCKED lets one win and the other return idle;
-    // there is exactly one workflow and the state transition cannot split from it.
     let run1 = "10000000-0000-0000-0000-000000000001";
     let wf1 = "20000000-0000-0000-0000-000000000001";
     insert_run(&admin, blobs.as_ref(), "tenant_a", run1, wf1).await;
@@ -2771,8 +2705,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         "only the exact queued-row lock winner may invoke launch authority"
     );
 
-    // Reserve two runs before either starter executes. Their immutable attempts stay A=1/B=2;
-    // starting the older run never reallocates it above the newer queued fact.
     let prequeued_tenant = "tenant_prequeued_attempts";
     let prequeued_a = "11000000-0000-0000-0000-000000000001";
     let prequeued_b = "11000000-0000-0000-0000-000000000002";
@@ -2828,13 +2760,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         "an older terminal fact cannot supersede the newer queued rerun"
     );
 
-    // ── CT-004: the per-tenant starter COMPOSITION SEAM (`PgCiRunStarterFactory`) against the real
-    // migrated schema — the exact router the service main composes at the root (dormant behind the
-    // runner activation gate). (a) A factory-minted starter CONSTRUCTS against the live schema and starts
-    // its own tenant's queued run atomically. (b) Per-tenant scoping SURVIVES the seam: a starter minted
-    // for tenant A never discovers or starts tenant B's queued run; a starter minted for B starts B's.
-    // Exercised here while v1 is still the sole active definition (before the fresh-old-pin scenario
-    // registers v2 below).
     let starters = factory(&app, blobs.clone());
     assert_eq!(starters.region(), &Region("fr-par".into()));
 
@@ -2853,7 +2778,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert!(matches!(a_started, StartQueuedOutcome::Started { .. }));
     assert_atomic_started(&admin, "tenant_factory_a", run_fa, true, true).await;
 
-    // (b) tenant B has a queued run; the A-minted starter must never see or start it.
     let run_fb = "10000000-0000-0000-0000-0000000000fb";
     let wf_fb = "20000000-0000-0000-0000-0000000000fb";
     insert_run(&admin, blobs.as_ref(), "tenant_factory_b", run_fb, wf_fb).await;
@@ -2869,7 +2793,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_atomic_started(&admin, "tenant_factory_b", run_fb, false, false).await;
 
-    // The B-minted starter starts B's run — proving the router binds each record to its own cell.
     let b_started = starters
         .starter_for(
             TenantId("tenant_factory_b".into()),
@@ -2882,8 +2805,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert!(matches!(b_started, StartQueuedOutcome::Started { .. }));
     assert_atomic_started(&admin, "tenant_factory_b", run_fb, true, true).await;
 
-    // Exact legacy replay is a byte-for-byte no-op on the complete DAG ledger. Re-open only the
-    // lifecycle split that this starter repairs; the existing workflow and all three jobs remain.
     sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
         .bind(run1)
         .execute(&admin)
@@ -2900,8 +2821,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert_exact_jobs(&admin, "tenant_a", run1).await;
     assert_initial_checks(&admin, "tenant_a", run1, 1).await;
 
-    // A divergent immutable field is refused before the queued split can commit. Restore the
-    // adversarial edit after the probe, never through the starter.
     for (mutation, restore) in [(
         "UPDATE ci_job SET spec_ref='myelin://tenant_a/ci/snapshot/blake3:forged' \
              WHERE tenant_id='tenant_a' AND run_id=$1::uuid AND name='package'",
@@ -2942,7 +2861,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
             .unwrap();
     }
 
-    // Replay verifies immutable job authority but never rewinds legitimate lifecycle progress.
     sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
         .bind(run1)
         .execute(&admin)
@@ -2986,8 +2904,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .await
         .unwrap();
 
-    // The run-id half of the exact SELECT catches an unexpected extra ledger row even though its
-    // job id is not one of the derived ids.
     let extra_id = "80000000-0000-8000-8000-000000000001";
     sqlx::query(
         "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, matrix_key, \
@@ -3019,8 +2935,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .unwrap();
     assert_exact_jobs(&admin, "tenant_a", run1).await;
 
-    // The expected-id half catches a truncated-id collision owned by another run. The two otherwise
-    // fresh victim jobs inserted before verification roll back with the failed start.
     let collision_run = "18000000-0000-0000-0000-000000000001";
     let collision_wf = "28000000-0000-0000-0000-000000000001";
     let owner_run = "18000000-0000-0000-0000-000000000002";
@@ -3079,8 +2993,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         "foreign owner survives the rolled-back victim start"
     );
 
-    // A reconstructed starter repairs a manifest-backed lifecycle split without reallocating
-    // attempts or reconstructing authority from mutable inputs.
     let run2 = "10000000-0000-0000-0000-000000000002";
     let wf2 = "20000000-0000-0000-0000-000000000002";
     insert_run(&admin, blobs.as_ref(), "tenant_a", run2, wf2).await;
@@ -3118,9 +3030,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert_atomic_started(&admin, "tenant_a", run2, true, true).await;
     assert_exact_jobs(&admin, "tenant_a", run2).await;
 
-    // Retry an older frozen manifest after a newer run has superseded all three contexts. Replay
-    // neither consults today's unavailable authority nor moves the monotonic attempt ledger back to
-    // the old run (or forward again).
     sqlx::query("UPDATE ci_run SET state='queued' WHERE tenant_id='tenant_a' AND run_id=$1::uuid")
         .bind(run1)
         .execute(&admin)
@@ -3140,8 +3049,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_exact_jobs(&admin, "tenant_a", run1).await;
 
-    // A failure after workflow insertion (the trigger rejects the lifecycle CAS) rolls the workflow
-    // back too. No queued->running row can exist without its workflow.
     let run3 = "10000000-0000-0000-0000-000000000003";
     let wf3 = "20000000-0000-0000-0000-000000000003";
     insert_run(&admin, blobs.as_ref(), "tenant_rollback", run3, wf3).await;
@@ -3180,8 +3087,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .await
         .is_empty());
 
-    // A manifest and workflow are an atomic replay pair. An orphan manifest is corruption and must
-    // not invoke current authority or synthesize a replacement workflow.
     let orphan_run = "10000000-0000-0000-0000-0000000000a1";
     let orphan_wf = "20000000-0000-0000-0000-0000000000a1";
     insert_run(
@@ -3220,8 +3125,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_eq!(AUTHORITY_CALLS.load(Ordering::SeqCst), calls_before_orphan);
 
-    // Frozen attempts are checked against the immutable per-run ledger. Removing one context makes
-    // replay fail before any workflow/job/lifecycle mutation.
     let attempt_run = "10000000-0000-0000-0000-0000000000a2";
     let attempt_wf = "20000000-0000-0000-0000-0000000000a2";
     insert_run(
@@ -3261,7 +3164,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_manifest_backed_queued(&admin, "tenant_attempt_tamper", attempt_run).await;
 
-    // Replay requires the complete immutable ci_job ledger and never repairs a missing row.
     let missing_job_run = "10000000-0000-0000-0000-0000000000a3";
     let missing_job_wf = "20000000-0000-0000-0000-0000000000a3";
     insert_run(
@@ -3308,7 +3210,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .unwrap();
     assert_eq!(still_missing, 2);
 
-    // A pre-minted run-id collision cannot clobber the foreign workflow and leaves ci_run queued.
     let run4 = "10000000-0000-0000-0000-000000000004";
     let wf4 = "20000000-0000-0000-0000-000000000004";
     insert_run(&admin, blobs.as_ref(), "tenant_id_collision", run4, wf4).await;
@@ -3332,7 +3233,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .is_err());
     assert_atomic_started(&admin, "tenant_id_collision", run4, false, true).await;
 
-    // An idempotency-key collision resolving to a different run id is also refused explicitly.
     let run5 = "10000000-0000-0000-0000-000000000005";
     let wf5 = "20000000-0000-0000-0000-000000000005";
     let other_wf5 = "29999999-0000-0000-0000-000000000005";
@@ -3357,8 +3257,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .is_err());
     assert_atomic_started(&admin, "tenant_key_collision", run5, false, false).await;
 
-    // Even when both idempotency keys resolve to the expected pre-minted ID, a divergent stored
-    // input cannot be blessed as this CI run. Verification locks and compares the exact row.
     let run7 = "10000000-0000-0000-0000-000000000007";
     let wf7 = "20000000-0000-0000-0000-000000000007";
     insert_run(&admin, blobs.as_ref(), "tenant_divergent", run7, wf7).await;
@@ -3382,8 +3280,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .is_err());
     assert_atomic_started(&admin, "tenant_divergent", run7, false, true).await;
 
-    // An exact historical workflow that is already terminal is not resurrected or linked to a
-    // still-queued CI row.
     let run8 = "10000000-0000-0000-0000-000000000008";
     let wf8 = "20000000-0000-0000-0000-000000000008";
     insert_run(&admin, blobs.as_ref(), "tenant_terminal", run8, wf8).await;
@@ -3402,8 +3298,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .is_err());
     assert_manifest_backed_queued(&admin, "tenant_terminal", run8).await;
 
-    // Hold ID/key/input fixed and mutate every other starter-owned immutable workflow column in an
-    // isolated tenant. Each row is genuinely claimed and rejected by the post-start identity proof.
     let immutable_mutations = [
         (
             "tenant_wf_version",
@@ -3465,7 +3359,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         assert_manifest_backed_queued(&admin, tenant, run_id).await;
     }
 
-    // The typed code pin is load-bearing even when the version number matches.
     let run_hash = "12000000-0000-0000-0000-000000000001";
     let wf_hash = "22000000-0000-0000-0000-000000000001";
     insert_run(
@@ -3487,7 +3380,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .is_err());
     assert_atomic_started(&admin, "tenant_bad_code_pin", run_hash, false, false).await;
 
-    // Queued lifecycle contradictions are refused before any workflow is created.
     for (tenant, run_id, wf_run_id, mutation) in [
         (
             "tenant_cost_settled",
@@ -3516,8 +3408,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         assert_atomic_started(&admin, tenant, run_id, false, false).await;
     }
 
-    // CAS preflight holds no row lock: a concurrent authority mutation can commit, and the exact
-    // re-lock compares the complete row and refuses it before workflow creation.
     let run_preflight = "12000000-0000-0000-0000-000000000004";
     let wf_preflight = "22000000-0000-0000-0000-000000000004";
     insert_run(
@@ -3567,8 +3457,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     )
     .await;
 
-    // Likewise, a winner can complete while another starter is in CAS preflight. The loser re-locks
-    // the exact candidate, observes it is no longer queued, and returns Idle without a duplicate.
     let run_winner = "12000000-0000-0000-0000-000000000005";
     let wf_winner = "22000000-0000-0000-0000-000000000005";
     insert_run(
@@ -3612,7 +3500,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_atomic_started(&admin, "tenant_preflight_winner", run_winner, true, true).await;
 
-    // Existing pinned v1 runs may recover while v1 is draining; fresh intake remains closed.
     let run_draining = "12000000-0000-0000-0000-000000000006";
     let wf_draining = "22000000-0000-0000-0000-000000000006";
     insert_run(
@@ -3650,7 +3537,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .await
         .unwrap();
 
-    // Invalid/absent CAS is refused before a workflow row exists and before lifecycle mutation.
     let run6 = "10000000-0000-0000-0000-000000000006";
     let wf6 = "20000000-0000-0000-0000-000000000006";
     insert_run(&admin, blobs.as_ref(), "tenant_cas", run6, wf6).await;
@@ -3671,7 +3557,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
         .is_err());
     assert_atomic_started(&admin, "tenant_cas", run6, false, false).await;
 
-    // Genuine app-role RLS plus the exact tenant predicate: an A starter cannot discover or start B.
     let run_b = "10000000-0000-0000-0000-0000000000bb";
     let wf_b = "20000000-0000-0000-0000-0000000000bb";
     insert_run(&admin, blobs.as_ref(), "tenant_b", run_b, wf_b).await;
@@ -3679,8 +3564,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     assert_eq!(isolated.run_once().await.unwrap(), StartQueuedOutcome::Idle);
     assert_atomic_started(&admin, "tenant_b", run_b, false, false).await;
 
-    // Region is an independent residency boundary, not merely part of tenant RLS. A fr-par starter
-    // cannot claim the same tenant's de-fra row.
     let run_region = "10000000-0000-0000-0000-0000000000cc";
     let wf_region = "20000000-0000-0000-0000-0000000000cc";
     insert_run(
@@ -3708,8 +3591,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     );
     assert_atomic_started(&admin, "tenant_region", run_region, false, false).await;
 
-    // Fresh intake cannot silently bind an older pinned body when a newer active definition is the
-    // deterministic registry selection. The queued row remains untouched and no workflow appears.
     let register_v2 = flow_executor(&admin, "tenant_fresh_old_pin");
     tokio::task::block_in_place(|| {
         register_v2
@@ -3743,13 +3624,6 @@ async fn exact_cell_starter_is_atomic_concurrent_restart_safe_and_rls_isolated()
     .await;
 }
 
-/// A queued PR run superseded by a newer generation is normally cancelled cleanly, exactly like the
-/// `delayed_run` scenario above: nothing has attached launch, workflow, or accounting authority to it,
-/// so `cancel_stale_queued_on_conn` finds it untouched and closes it out. Here a `ci-reserve:v2:`-shaped
-/// `cost_reservation` row is attached to the stale run before the starter observes it. That must trip
-/// the same corruption guard the zero-attachment case never reaches: `cancel_stale_queued_on_conn`
-/// refuses the cancellation with `CorruptState` (surfaced through `run_once()` as
-/// `PgCiStarterError::Supersession`) instead of returning the clean `StartQueuedOutcome::Superseded`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_v2_reservation_prevents_stale_queued_cancellation() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -3919,8 +3793,6 @@ async fn a_v2_reservation_prevents_stale_queued_cancellation() {
                 .expect("register immutable workflow definition");
         });
 
-        // The same PR-supersession fixture as `delayed_run` above: a queued generation-1 run becomes
-        // stale once a newer generation-2 head is running.
         let pr_tenant = "tenant_pr_v2_reservation_guard";
         let pr_group = "pr:core:99";
         let old_run = "10000000-0000-0000-0000-000000000901";
@@ -3972,10 +3844,6 @@ async fn a_v2_reservation_prevents_stale_queued_cancellation() {
             StartQueuedOutcome::Started { run_id, .. } if run_id == new_run
         ));
 
-        // A stale generation-1 arrival, same shape as `delayed_run`, would normally be cancelled cleanly
-        // because nothing has attached launch/workflow/accounting authority to it. Attach a v2 operational
-        // reservation to it before the starter observes it: `cancel_stale_queued_on_conn`'s "nothing
-        // attached" guard must now refuse the cancellation instead of closing the run out.
         let stale_run = "10000000-0000-0000-0000-000000000900";
         let stale_wf = "20000000-0000-0000-0000-000000000900";
         insert_pr_run(

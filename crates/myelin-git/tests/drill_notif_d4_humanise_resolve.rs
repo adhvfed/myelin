@@ -1,26 +1,3 @@
-//! # NOTIF-D4-class on a REAL Git subject, through the REAL `GitRefResolver` → humanise chain
-//! (GIT-P31 / P-292, M3-G8)
-//!
-//! **Drill source:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md`
-//! - row **NOTIF-D4-class** ("notify on a confidential subject to a viewer lacking access → humanised
-//!   tombstone; the title NEVER appears; 0 confidential titles in delivered notifications"). The
-//!   prompt's GATE: *"a confidential PR/commit subject → humanised TOMBSTONE; the title NEVER leaks in
-//!   the notification (0 confidential titles in delivered notifications)."* Threshold 0, never softened.
-//!
-//! **What this drill PROVES that the GIT-P19 drill did not (the floor it fills).** GIT-P19's NOTIF-D4
-//! re-confirmation (`drill_notif_d4_git_d8_real_git_subject.rs`) drove humanise through a
-//! `GitRepoResolver` **defined inside the test file** — explicitly NAMED there as a floor ("the
-//! production resolve transport is the Refs chokepoint … the [`GitRepoResolver`] here stands in"). THIS
-//! drill drives the SAME NOTIF-D4-class leak gate through the REAL crate seam
-//! [`myelin_git::git_resolve::GitRefResolver`] (P-292), which delegates to Git's REAL
-//! [`Projector::project`](myelin_git::project::Projector) (contract 5.6 — permission FIRST). So the leak
-//! property is now exercised over Git's REAL per-viewer permission logic — not a test approximation.
-//!
-//! **ZERO Notif code change.** This consumes Notif's frozen [`humanise`](myelin_notif::humanise) +
-//! [`RefResolvePort`](myelin_notif::RefResolvePort) seams; the resolver is an impl handed in. The leak
-//! invariant is structural: a denied ref maps to a [`Tombstone`](myelin_notif::Tombstone) with no
-//! `title` field.
-
 use myelin_git::body::Body;
 use myelin_git::check_status::GateOutcome;
 use myelin_git::git_resolve::GitRefResolver;
@@ -37,7 +14,6 @@ use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 use std::collections::HashSet;
 
-/// The secret PR title of the REAL private Git repo — must NEVER appear for a denied viewer.
 const SECRET_PR_TITLE: &str =
     "fix: rotate the PROJECT-NIGHTFALL signing key before the acquisition";
 
@@ -64,7 +40,6 @@ fn strong(zk: &str) -> Consistency {
     }
 }
 
-/// A REAL private PR in acme's repo. Only principals holding `view` (→ `repo->pull`) may see the title.
 fn private_pr() -> (ArtifactRef, PullRequest) {
     let pr_ref = git_pr_ref("acme", "repo7", 9);
     let mut pr = PullRequest::open(
@@ -78,9 +53,6 @@ fn private_pr() -> (ArtifactRef, PullRequest) {
     (pr_ref, pr)
 }
 
-/// A deterministic Id: a `(viewer.tenant, view@object)` allow-list. GIT-D8: the decision keys on the
-/// TOKEN tenant (viewer.tenant) — a cross-tenant viewer is denied even if a same-id grant exists in
-/// another tenant.
 struct StubId {
     allow: HashSet<(String, String)>,
 }
@@ -198,12 +170,9 @@ fn contains_leak(text: &str) -> bool {
         || lc.contains("signing key")
 }
 
-/// **NOTIF-D4-class (the dated green artifact): 0 title leak through the REAL `GitRefResolver` →
-/// humanise chain.** A confidential PR review-requested to viewers WITHOUT `pull` → across every viewer
-/// × every channel × every Git reason, the secret title appears EXACTLY ZERO times. Threshold 0.
 #[test]
 fn notif_d4_zero_leak_through_real_git_resolver() {
-    let resolver = resolver(StubId::new()); // nobody granted → every viewer denied
+    let resolver = resolver(StubId::new());
     let templates = TemplateStore::with_platform_defaults();
     let (subject, _) = private_pr();
     let denied = ["ex-contractor", "wrong-team-dev", "intern-no-access"];
@@ -257,8 +226,6 @@ fn notif_d4_zero_leak_through_real_git_resolver() {
     );
 }
 
-/// **The complement — a viewer WITH `pull` sees the PR title through the real resolver (the gate
-/// discriminates, not a blanket redaction).**
 #[test]
 fn notif_d4_permitted_viewer_sees_the_title() {
     let (subject, _) = private_pr();
@@ -286,14 +253,9 @@ fn notif_d4_permitted_viewer_sees_the_title() {
     );
 }
 
-/// **GIT-D8 — cross-tenant unfurl denied through the real resolver (0 cross-tenant leak).** A viewer
-/// whose TOKEN tenant (`evilcorp`) differs from the subject's home tenant (`acme`) is denied — even if a
-/// same-id principal in acme would be allowed. The humanise render degrades to a tombstone; the
-/// private-repo title never crosses the tenant boundary. Threshold 0.
 #[test]
 fn git_d8_cross_tenant_unfurl_denied_through_real_resolver() {
-    let (subject, _) = private_pr(); // home tenant: acme
-                                     // an acme "spy" WOULD be allowed — but the cross-tenant token below is a DIFFERENT tenant.
+    let (subject, _) = private_pr();
     let resolver = resolver(StubId::new().grant(&acme(), &subject));
     let cross_tenant = viewer_in("spy", TenantId("evilcorp".into()));
 
@@ -328,7 +290,7 @@ fn git_d8_cross_tenant_unfurl_denied_through_real_resolver() {
     }
     assert_eq!(
         leak, 0,
-        "GIT-D8: 0 cross-tenant leak — the token tenant decides, the title never crosses"
+        "GIT-D8: 0 cross-tenant leak - the token tenant decides, the title never crosses"
     );
     eprintln!("GIT-D8 GREEN through the real resolver (2026-06-22): cross-tenant-leak-count = {leak} (threshold 0)");
 }

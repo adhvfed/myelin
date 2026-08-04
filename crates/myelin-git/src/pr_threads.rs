@@ -1,38 +1,3 @@
-//! # `pr_threads` — the DURABLE review-thread / comment / review-batch store (R3.3 · shared by R3.2)
-//!
-//! The ONE canonical conversation store both R3 packs consume (the `_gate.md` §02/§03 cross-pack
-//! reconciliation, BINDING):
-//!
-//! - the canonical model is **threads** — a [`ThreadRecord`] has an OPTIONAL content
-//!   [`ThreadAnchor`] (a diff-line anchor); comments belong to threads. The PR overview's
-//!   "discussion" is exactly the set of threads with `anchor == None`; the diff pack's line-anchored
-//!   threads are the ones with `Some(anchor)`. One store, one shape, two faces.
-//! - **review batching** layers on via a `review_id` carried on each comment + a [`ReviewBatch`]
-//!   lifecycle ([`start_review`](DurablePrThreadStore::start_review) →
-//!   [`add_pending_comment`](DurablePrThreadStore::add_pending_comment) →
-//!   [`submit_review`](DurablePrThreadStore::submit_review) / [`discard_review`]). A batch's pending
-//!   comments are **visible ONLY to their author** until submit ([`SubjectThreads::view_for`] filters
-//!   by construction — a non-author never sees another reviewer's unsubmitted draft).
-//! - **submit emits ONE batch event** (R-BATCH-1): [`submit_review`] returns `Some(SubmittedBatch)`
-//!   exactly once (the first submit); a re-submit is idempotent `None` — so the wire emits one event
-//!   per batch, never one-per-comment and never a double on retry. (The wire `git.review.submitted`
-//!   emit itself is the GIT-P16 outbox-emit floor; this store produces the single authoritative batch
-//!   the emit carries.)
-//!
-//! ## Storage — keyed by the canonical type-qualified `object_key` (R2.2 grammar)
-//! Threads are persisted per SUBJECT, keyed by the canonical [`myelin_refs::object_key`] tuple key
-//! (`pr:<slug>:<n>` today; `issue:<id>` / `doc:<id>` when those surfaces mount the SAME store later —
-//! the reconciliation's "build once, generalize by key"). The durable medium is JSON-on-disk under the
-//! bare repo dir (the [`crate::pr_store`] pattern — there is no `thread` SQL table yet; the PG home is
-//! the GT-003b follow-on). Schema evolution is additive `#[serde(default)]` fields (the honest
-//! JSON-store analogue of a migration), exactly as `PrRecord` does it.
-//!
-//! ## Authz (enforced at the edge, named here)
-//! Thread READ = the PR's own view permission (the `Pull` object guard — a viewer who may view the PR
-//! may read its threads). Comment / review WRITE = `pull_request.review` (requested reviewer or
-//! parent-repo Push), never a permissive authorizer. This store holds no authorizer — it is the
-//! durable medium; the edge is the chokepoint.
-
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::PathBuf;
@@ -44,8 +9,6 @@ use crate::core::RepoLoc;
 use crate::durable::DurableError;
 use crate::gix_backend::{RepoPathResolver, RootedResolver};
 
-/// Hard ceilings for the temporary monolithic JSON store. These bound authorized-user resource
-/// consumption until conversation rows move to their PostgreSQL home.
 pub const MAX_COMMENT_BODY_BYTES: usize = 64 * 1024;
 pub const MAX_REVIEW_SUMMARY_BYTES: usize = 64 * 1024;
 pub const MAX_THREAD_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
@@ -53,7 +16,6 @@ pub const MAX_THREADS_PER_SUBJECT: usize = 4_096;
 pub const MAX_COMMENTS_PER_SUBJECT: usize = 8_192;
 pub const MAX_REVIEWS_PER_SUBJECT: usize = 1_024;
 
-/// A validated request to append one private draft comment to a review batch.
 #[derive(Clone, PartialEq, Eq)]
 pub struct PendingCommentRequest {
     repo: RepoLoc,
@@ -105,7 +67,6 @@ impl core::fmt::Debug for PendingCommentRequest {
     }
 }
 
-/// A validated request to atomically publish a review batch and its pending comments.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SubmitReviewRequest {
     repo: RepoLoc,
@@ -193,11 +154,6 @@ fn validate_review_target(
     Ok(())
 }
 
-// ───────────────────────────── the shared atoms (VM shapes) ────────────────────────────────────────
-
-/// The identity/agent badge atom (the `PrincipalVM` shape). `display` arrives pre-collapsed —
-/// `[erased user]` / `Restricted` are set by the caller, never reconstructed here (non-leak by
-/// construction). `on_behalf_of` / `trigger` are the agent attribution channels (ADR-08 legibility).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadPrincipal {
     pub kind: PrincipalRole,
@@ -209,7 +165,6 @@ pub struct ThreadPrincipal {
 }
 
 impl ThreadPrincipal {
-    /// A plain human/agent/service principal with only a display pseudonym (the common case).
     pub fn plain(kind: PrincipalRole, display: impl Into<String>) -> Self {
         ThreadPrincipal {
             kind,
@@ -220,8 +175,6 @@ impl ThreadPrincipal {
     }
 }
 
-/// The principal role on a comment/review — `human` / `agent` / `service` (glyph + label, never
-/// colour alone at the UI). An agent review is always advisory (never gates).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrincipalRole {
@@ -231,23 +184,18 @@ pub enum PrincipalRole {
 }
 
 impl PrincipalRole {
-    /// Is this an agent principal? An agent review is ADVISORY — it never counts toward the gate.
     pub fn is_agent(self) -> bool {
         matches!(self, PrincipalRole::Agent)
     }
 }
 
-/// The resolved content anchor for a diff-line-anchored thread — `None` on a thread means a PR-level
-/// (Overview "discussion") thread. `line == None` = a detached (outdated) anchor.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadAnchor {
     pub path: String,
     #[serde(default)]
     pub line: Option<u64>,
-    /// Which side of the reviewed diff the line number names. `None` is legacy-data only.
     #[serde(default)]
     pub side: Option<AnchorSide>,
-    /// Immutable diff identity captured when the anchor was admitted. Absent on legacy rows.
     #[serde(default)]
     pub base_oid: Option<String>,
     #[serde(default)]
@@ -262,7 +210,6 @@ pub enum AnchorSide {
     New,
 }
 
-/// The anchor's resolved state (reference-chip §5 vocabulary). Never a silent wrong-line re-anchor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AnchorState {
@@ -271,7 +218,6 @@ pub enum AnchorState {
     Outdated,
 }
 
-/// A comment's visibility state — `Removed` renders "Comment removed", the thread tree preserved.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommentState {
@@ -279,24 +225,18 @@ pub enum CommentState {
     Removed,
 }
 
-/// One durable comment. `pending == true` iff it belongs to an un-submitted review batch — visible
-/// ONLY to its author until submit ([`SubjectThreads::view_for`] enforces this).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommentRecord {
     pub id: String,
     pub author: ThreadPrincipal,
-    /// The Markdown body (ONE render path — the BlockEditor read path at the UI).
     pub body_md: String,
     pub created_at: i64,
     #[serde(default)]
     pub edited_at: Option<i64>,
     #[serde(default = "visible")]
     pub state: CommentState,
-    /// Batch membership — `Some(review_id)` iff this comment was authored inside a review batch.
     #[serde(default)]
     pub review_id: Option<String>,
-    /// True ONLY while the owning batch is un-submitted (drives the "Pending · only you" pill AND the
-    /// read-side visibility filter). Submit flips this to `false` for every comment in the batch.
     #[serde(default)]
     pub pending: bool,
 }
@@ -305,7 +245,6 @@ fn visible() -> CommentState {
     CommentState::Visible
 }
 
-/// One durable thread — a content anchor (or `None` for a PR-level discussion thread) + its comments.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadRecord {
     pub id: String,
@@ -318,14 +257,11 @@ pub struct ThreadRecord {
 }
 
 impl ThreadRecord {
-    /// Is this a PR-level (Overview "discussion") thread? (anchor == None)
     pub fn is_discussion(&self) -> bool {
         self.anchor.is_none()
     }
 }
 
-/// The verdict on a review batch. `InProgress` = an un-submitted draft; the terminal verdicts are set
-/// at submit. `Approved` / `ChangesRequested` on a NON-advisory (human) batch feed the merge gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BatchVerdict {
@@ -336,7 +272,6 @@ pub enum BatchVerdict {
 }
 
 impl BatchVerdict {
-    /// The stable wire token (the frontend maps it to a glyph + label).
     pub fn as_str(self) -> &'static str {
         match self {
             BatchVerdict::InProgress => "in_progress",
@@ -347,8 +282,6 @@ impl BatchVerdict {
     }
 }
 
-/// One durable review batch (the `PrReviewVM` lifecycle). `advisory == true` for an agent reviewer —
-/// it NEVER counts toward the gate. `submitted_at == None` while the batch is a draft.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewBatch {
     pub id: String,
@@ -362,26 +295,19 @@ pub struct ReviewBatch {
 }
 
 impl ReviewBatch {
-    /// A draft (un-submitted) batch belongs to its reviewer alone — hidden from other viewers.
     pub fn is_draft(&self) -> bool {
         self.submitted_at.is_none()
     }
 }
 
-// ───────────────────────────── the per-subject durable document ────────────────────────────────────
-
-/// The whole conversation for ONE subject (`object_key`), persisted as one JSON file. Additive
-/// `#[serde(default)]` fields are the JSON-store schema-evolution path (no `thread` SQL table yet).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubjectThreads {
-    /// The canonical type-qualified object key this document keys on (`pr:<slug>:<n>`, `issue:<id>`…).
     #[serde(default)]
     pub object_key: String,
     #[serde(default)]
     pub threads: Vec<ThreadRecord>,
     #[serde(default)]
     pub reviews: Vec<ReviewBatch>,
-    /// A monotonic per-subject id counter (thread/comment/review ids are `t-<n>` / `c-<n>` / `r-<n>`).
     #[serde(default)]
     pub seq: u64,
 }
@@ -394,7 +320,6 @@ impl SubjectThreads {
         Ok(format!("{prefix}-{}", self.seq))
     }
 
-    /// A find for a batch by id.
     fn review(&self, review_id: &str) -> Option<&ReviewBatch> {
         self.reviews.iter().find(|r| r.id == review_id)
     }
@@ -418,10 +343,6 @@ impl SubjectThreads {
         Ok(())
     }
 
-    /// **The viewer-scoped projection (BINDING non-leak rule).** Returns the threads + reviews a
-    /// `viewer` (by pseudonym `display`) may see: every PENDING comment authored by ANOTHER principal
-    /// is dropped, a thread left with no visible comments is dropped, and a DRAFT (un-submitted) review
-    /// batch owned by another reviewer is hidden. A viewer's own pending drafts stay visible to them.
     pub fn view_for(&self, viewer_display: &str) -> ViewedThreads {
         let threads = self
             .threads
@@ -434,7 +355,7 @@ impl SubjectThreads {
                     .cloned()
                     .collect();
                 if comments.is_empty() {
-                    return None; // a thread of only-others'-pending comments does not exist for this viewer
+                    return None;
                 }
                 Some(ThreadRecord {
                     id: t.id.clone(),
@@ -454,34 +375,24 @@ impl SubjectThreads {
     }
 }
 
-/// A viewer-scoped projection of a subject's conversation (the output of [`SubjectThreads::view_for`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ViewedThreads {
     pub threads: Vec<ThreadRecord>,
     pub reviews: Vec<ReviewBatch>,
 }
 
-/// The single authoritative batch a submit produces — the ONE notification event's payload
-/// (R-BATCH-1). `comment_ids` are the comments the submit made visible (0..N — the event carries the
-/// whole batch, never one event per comment).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubmittedBatch {
     pub review: ReviewBatch,
     pub comment_ids: Vec<String>,
 }
 
-// ───────────────────────────── the durable on-disk store ───────────────────────────────────────────
-
-/// **The durable on-disk thread/comment/review store.** One JSON document per subject at
-/// `<repo>.git/myelin/threads/<safe(object_key)>.json`, resolved through the SAME validated
-/// [`RepoPathResolver`] the durable git + PR stores use (tenant/region path-isolated + traversal-safe).
 pub struct DurablePrThreadStore<P: RepoPathResolver = RootedResolver> {
     resolver: P,
     subject_locks: Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>,
 }
 
 impl DurablePrThreadStore<RootedResolver> {
-    /// Root the store at the SAME on-disk root the durable git + PR stores use.
     pub fn rooted(root: impl Into<PathBuf>) -> Self {
         Self {
             resolver: RootedResolver::new(root),
@@ -490,12 +401,6 @@ impl DurablePrThreadStore<RootedResolver> {
     }
 }
 
-/// Sanitise a canonical object key (`pr:core:42`) into a safe single-segment filename stem
-/// (`pr-core-42`). Any non-`[A-Za-z0-9._-]` byte becomes `_` so a key with `:` / `/` never escapes the
-/// threads dir (the resolver already isolates the repo dir; this keeps ONE file per subject inside it).
-/// **Floor:** two keys differing only in a sanitised byte would collide — object keys are
-/// `type:id`-structured and workspace-unique per subsystem, so within one repo `pr:<slug>:<n>` stems
-/// are distinct; a cross-type mount (issue/doc) carries its own `type` prefix, keeping stems disjoint.
 fn key_stem(object_key: &str) -> String {
     object_key
         .chars()
@@ -510,7 +415,6 @@ fn key_stem(object_key: &str) -> String {
 }
 
 impl<P: RepoPathResolver> DurablePrThreadStore<P> {
-    /// Build over a resolver (the placement resolver swaps in here behind the same port).
     pub fn new(resolver: P) -> Self {
         Self {
             resolver,
@@ -542,15 +446,12 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         if let Some(lock) = locks.get(&path).and_then(Weak::upgrade) {
             return Ok(lock);
         }
-        // A subject's last operation drops its strong Arc. Prune those dead weak entries on each
-        // cache miss so tenant-created PR cardinality cannot become permanent process memory.
         locks.retain(|_, weak| weak.strong_count() > 0);
         let lock = Arc::new(Mutex::new(()));
         locks.insert(path, Arc::downgrade(&lock));
         Ok(lock)
     }
 
-    /// Load the subject document (an empty, `object_key`-stamped default if none persisted yet).
     pub fn load(&self, repo: &RepoLoc, object_key: &str) -> Result<SubjectThreads, DurableError> {
         let path = self.subject_path(repo, object_key)?;
         match std::fs::File::open(&path) {
@@ -601,10 +502,6 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         crate::durable::write_file_atomic(&dir, &file, &bytes)
     }
 
-    // ── thread + comment ops (single, un-batched — the Overview discussion + the diff line threads) ──
-
-    /// Create a NEW thread with its first comment. `anchor == None` = a PR-level discussion thread
-    /// (the Overview renders those); `Some` = a diff-line-anchored thread (the diff pack renders those).
     pub fn create_thread(
         &self,
         repo: &RepoLoc,
@@ -647,7 +544,6 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         Ok(thread)
     }
 
-    /// Reply to an existing thread (a single, non-batched comment). `NotFound` if the thread is absent.
     pub fn add_comment(
         &self,
         repo: &RepoLoc,
@@ -687,7 +583,6 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         Ok(comment)
     }
 
-    /// Resolve / unresolve a thread. `NotFound` if the thread is absent.
     pub fn resolve_thread(
         &self,
         repo: &RepoLoc,
@@ -708,10 +603,6 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         Ok(())
     }
 
-    // ── review-batch lifecycle (G-8) ──
-
-    /// Start a review batch (verdict `InProgress`, `submitted_at == None`). `advisory` is derived from
-    /// the reviewer role (an agent batch is advisory — it never gates). Returns the fresh batch.
     pub fn start_review(
         &self,
         repo: &RepoLoc,
@@ -747,9 +638,6 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         Ok(batch)
     }
 
-    /// Add a PENDING comment to an un-submitted batch (its own thread, anchored or discussion). The
-    /// comment is `pending == true` → visible only to its author until submit. `NotFound` if the batch
-    /// is absent; a `Forbidden` if the batch is already submitted (no appending to a closed batch).
     pub fn add_pending_comment(
         &self,
         request: PendingCommentRequest,
@@ -777,12 +665,9 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
             Some(r) if !r.is_draft() => {
                 return Err(DurableError::Forbidden(format!(
-                    "review {review_id} is already submitted — cannot append pending comments"
+                    "review {review_id} is already submitted - cannot append pending comments"
                 )))
             }
-            // A draft batch is PRIVATE to its author (the write-side of the `view_for` read filter):
-            // only the batch's own reviewer may append pending comments. Anything else is a 403 —
-            // never let one principal inject a comment into another's private draft (R3.3 verifier H).
             Some(r) if r.reviewer.display != author.display => {
                 return Err(DurableError::Forbidden(format!(
                     "review {review_id} belongs to another reviewer"
@@ -812,11 +697,6 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         Ok(comment)
     }
 
-    /// **Submit a review batch — the ONE-event operation (R-BATCH-1).** Sets the terminal verdict +
-    /// `submitted_at` + optional summary, flips every pending comment of the batch to `pending ==
-    /// false` (now visible to all), and returns `Some(SubmittedBatch)` — the single event payload —
-    /// EXACTLY ONCE. A re-submit of an already-submitted batch is idempotent `None` (no double event,
-    /// no verdict flip). `NotFound` if the batch is absent.
     pub fn submit_review(
         &self,
         request: SubmitReviewRequest,
@@ -837,19 +717,14 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
             Some(r) => (r.reviewer.display.clone(), !r.is_draft()),
         };
-        // Only the batch's OWN reviewer may submit it — else a Push holder could force-publish another
-        // reviewer's private draft under their identity/verdict (R3.3 verifier H-1: verdict forgery).
-        // The ownership check precedes the idempotency short-circuit so a stranger targeting an
-        // already-submitted batch still gets a 403, not a misleading idempotent success.
         if owner_display != actor.display {
             return Err(DurableError::Forbidden(format!(
                 "review {review_id} belongs to another reviewer"
             )));
         }
         if already {
-            return Ok(None); // idempotent — one event per batch, never a double on retry.
+            return Ok(None);
         }
-        // Flip the batch's pending comments visible.
         let mut comment_ids = Vec::new();
         for t in &mut doc.threads {
             for c in &mut t.comments {
@@ -859,7 +734,6 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
                 }
             }
         }
-        // Set the terminal verdict on the batch.
         let review = {
             let r = doc
                 .reviews
@@ -878,9 +752,6 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         }))
     }
 
-    /// Discard an un-submitted batch: remove the batch AND every pending comment/thread it owns (the
-    /// text was the reviewer's private draft — discarding it leaves no trace). A submitted batch is
-    /// NOT discardable (its comments are public record) — `Forbidden`. `NotFound` if absent.
     pub fn discard_review(
         &self,
         repo: &RepoLoc,
@@ -895,11 +766,9 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             None => return Err(DurableError::NotFound(format!("review {review_id}"))),
             Some(r) if !r.is_draft() => {
                 return Err(DurableError::Forbidden(format!(
-                    "review {review_id} is already submitted — its comments are public record"
+                    "review {review_id} is already submitted - its comments are public record"
                 )))
             }
-            // Only the batch's OWN reviewer may discard it — else a Push holder could destroy another
-            // reviewer's private draft (R3.3 verifier H-2).
             Some(r) if r.reviewer.display != actor.display => {
                 return Err(DurableError::Forbidden(format!(
                     "review {review_id} belongs to another reviewer"
@@ -907,7 +776,6 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             }
             Some(_) => {}
         }
-        // Drop this batch's pending comments, then any thread left empty.
         for t in &mut doc.threads {
             t.comments
                 .retain(|c| c.review_id.as_deref() != Some(review_id));
@@ -1063,7 +931,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A discussion thread (anchor null) round-trips durably; a fresh store over the same root reads it.
     #[test]
     fn a_discussion_thread_round_trips_durably() {
         let root = temp_root("rt");
@@ -1148,8 +1015,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A legacy/partial subject document (missing the additive fields) still deserializes — the JSON
-    /// store's schema-evolution analogue of a migration.
     #[test]
     fn a_legacy_subject_doc_deserializes_with_defaults() {
         let legacy = serde_json::json!({ "object_key": "pr:core:1", "threads": [
@@ -1166,8 +1031,6 @@ mod tests {
         assert_eq!(c.review_id, None);
     }
 
-    /// **BINDING: a pending review comment is visible ONLY to its author.** A second viewer's
-    /// projection does not contain the draft; the author's does.
     #[test]
     fn a_pending_comment_is_invisible_to_others_until_submit() {
         let root = temp_root("pending");
@@ -1185,16 +1048,13 @@ mod tests {
             .unwrap();
 
         let doc = store.load(&loc(), KEY).unwrap();
-        // The author sees their draft (comment + the draft batch).
         let mine = doc.view_for("psn:reviewer@acme");
         assert_eq!(mine.threads.len(), 1, "author sees their own pending draft");
         assert_eq!(mine.reviews.len(), 1);
-        // A DIFFERENT viewer sees neither the pending comment nor the draft batch.
         let other = doc.view_for("psn:other@acme");
         assert_eq!(other.threads.len(), 0, "a pending comment must be invisible to others");
         assert_eq!(other.reviews.len(), 0, "a draft batch is hidden from others");
 
-        // After submit, the comment is visible to everyone.
         store
             .submit_review(submitted_review(
                 &batch.id,
@@ -1212,8 +1072,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **BINDING R-BATCH-1: submit emits exactly ONE batch event, regardless of comment count, and is
-    /// idempotent on retry (no double event).**
     #[test]
     fn submit_emits_one_batch_event_and_is_idempotent() {
         let root = temp_root("onevent");
@@ -1231,7 +1089,6 @@ mod tests {
                 ))
                 .unwrap();
         }
-        // First submit → ONE event carrying all three comments.
         let first = store
             .submit_review(submitted_review(
                 &batch.id,
@@ -1245,7 +1102,6 @@ mod tests {
         assert_eq!(ev.comment_ids.len(), 3, "the ONE event carries the whole batch");
         assert_eq!(ev.review.verdict, BatchVerdict::Approved);
         assert_eq!(ev.review.summary_md.as_deref(), Some("LGTM"));
-        // Re-submit → idempotent None (no second event, no verdict change).
         let second = store
             .submit_review(submitted_review(
                 &batch.id,
@@ -1259,7 +1115,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// An agent review batch is ADVISORY (never gates).
     #[test]
     fn an_agent_batch_is_advisory() {
         let root = temp_root("agent");
@@ -1275,7 +1130,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Discarding a draft batch leaves no trace; a submitted batch is not discardable.
     #[test]
     fn discard_removes_a_draft_but_not_a_submitted_batch() {
         let root = temp_root("discard");
@@ -1296,7 +1150,6 @@ mod tests {
         assert_eq!(doc.threads.len(), 0, "discard removes the draft's threads");
         assert_eq!(doc.reviews.len(), 0);
 
-        // A submitted batch cannot be discarded.
         let b2 = store.start_review(&loc(), KEY, human("psn:r@acme")).unwrap();
         store
             .submit_review(submitted_review(
@@ -1314,9 +1167,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **BINDING (R3.3 verifier H-1/H-2): a review batch is PRIVATE to its author on the WRITE side.**
-    /// Another principal (even one holding repo write) cannot submit, discard, or append to someone
-    /// else's draft batch — each is a `Forbidden`, and the draft is left intact and still private.
     #[test]
     fn a_batch_is_not_submittable_discardable_or_appendable_by_a_non_author() {
         let root = temp_root("batch-owner");
@@ -1333,7 +1183,6 @@ mod tests {
             ))
             .unwrap();
 
-        // H-1: the attacker cannot force-submit the author's private draft.
         assert!(matches!(
             store.submit_review(submitted_review(
                 &batch.id,
@@ -1344,12 +1193,10 @@ mod tests {
             )),
             Err(DurableError::Forbidden(_))
         ));
-        // H-2: nor discard it.
         assert!(matches!(
             store.discard_review(&loc(), KEY, &batch.id, &attacker),
             Err(DurableError::Forbidden(_))
         ));
-        // Nor inject a comment into it.
         assert!(matches!(
             store.add_pending_comment(pending_comment(
                 &batch.id,
@@ -1360,7 +1207,6 @@ mod tests {
             Err(DurableError::Forbidden(_))
         ));
 
-        // The draft survived intact and is STILL private to its author, still submittable by them.
         let doc = store.load(&loc(), KEY).unwrap();
         assert_eq!(doc.view_for("psn:attacker@acme").reviews.len(), 0, "still hidden from the attacker");
         assert_eq!(doc.view_for("psn:author@acme").reviews.len(), 1, "author still owns their draft");
@@ -1377,7 +1223,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Resolve toggles the thread flag durably.
     #[test]
     fn resolve_thread_persists() {
         let root = temp_root("resolve");
@@ -1391,7 +1236,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The object-key stem sanitiser keeps one file per subject and never escapes the dir.
     #[test]
     fn key_stem_sanitises_separators() {
         assert_eq!(key_stem("pr:core:42"), "pr_core_42");

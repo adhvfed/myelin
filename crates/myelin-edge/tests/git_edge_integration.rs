@@ -1,23 +1,3 @@
-//! # MR-015 — Git wired through the product edge: real HTTP integration proofs.
-//!
-//! Binds an ephemeral TCP port, serves the edge with [`myelin_edge::serve_edge`] + Git's routes
-//! registered via [`myelin_edge::register_git`], and drives REAL HTTP round-trips with a hyper client
-//! using REAL minted capability tokens (genuine Ed25519/PASETO crypto over a real cell + seeded S1
-//! directory). No live PG is needed — the tenant SCOPE is the in-memory `PublicSurface`/`TenantScope`
-//! logic, and Git's read handlers serve Git's real `web` ViewModels as JSON under `ctx.scope.tenant()`.
-//!
-//! Covered:
-//! - (a) `GET /v1/git/repos` → 200 with the paginated ViewModel JSON; `GET …/prs/{n}` → the PR
-//!   overview ViewModel JSON (the expected shape).
-//! - (b) **tenant isolation** — two tenants (acme, globex) are seeded with DISTINCT git data; a token
-//!   for acme on `/v1/git/repos` sees ONLY acme's repos, a token for globex sees ONLY globex's. Git's
-//!   grammar carries no `{tenant}` segment (tenant is from the token, never the URL), so acme cannot
-//!   even NAME globex's data — the strongest IDOR floor.
-//! - (c) a forged token → 401 (the gateway's, still applies to git routes).
-//! - (d) pagination on the repo list (limit + cursor).
-//! - (e) the JSON shape matches the ViewModel (asserted keys).
-//! - writes: `POST …/merge` → 200 `durable: false` (honest E1.1 deferral); web-edit stale base → 409.
-
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -69,7 +49,6 @@ fn repo(slug: &str) -> RepoHome {
     }
 }
 
-/// Seed a principal + credential link for a tenant so a token minted for it resolves.
 fn seed_tenant(store: &PrincipalStore, tenant: &str) {
     let scope = admin_scope(tenant);
     store
@@ -87,8 +66,6 @@ fn seed_tenant(store: &PrincipalStore, tenant: &str) {
         .expect("link credential");
 }
 
-/// Build the gateway with Git registered + two tenants (acme: 3 repos + a PR + a blob; globex: 1
-/// distinct repo + a PR) seeded with DISTINCT data, returning the gateway + the cell (to mint tokens).
 fn build() -> (Arc<Gateway>, CellTokenAuthority) {
     let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell authority");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
@@ -127,7 +104,6 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
                     viewer_may_edit: true,
                 },
             )
-            // globex — DISTINCT data, so an acme token must never see it.
             .with_repo("globex", "zeta", repo("globex/zeta"))
             .with_pr(
                 "globex",
@@ -218,15 +194,12 @@ fn hdr<'a>(b: &'a [(&'static str, String); 2]) -> Vec<(&'a str, &'a str)> {
     b.iter().map(|(k, v)| (*k, v.as_str())).collect()
 }
 
-/// (a)+(e) `GET /v1/git/repos` → 200 with the paginated ViewModel JSON; the PR overview ViewModel JSON
-/// has the expected shape (title/pr_state/checks/merge — Git's real `web` ViewModel, no re-vocabulary).
 #[tokio::test]
 async fn repos_list_and_pr_overview_serve_the_viewmodel_json() {
     let (gw, cell) = build();
     let addr = spawn(gw).await;
     let h = bearer(&mint(&cell, "acme", "jti-a1"));
 
-    // (a) the repo list — the uniform { items, page } envelope, ViewModel-backed.
     let (status, v) = http(addr, "GET", "/v1/git/repos", &hdr(&h), vec![]).await;
     assert_eq!(status, 200, "repos list: {v}");
     let items = v["items"].as_array().expect("items array");
@@ -238,7 +211,6 @@ async fn repos_list_and_pr_overview_serve_the_viewmodel_json() {
     assert!(items[0]["slug"].as_str().unwrap().starts_with("acme/"));
     assert_eq!(v["page"]["limit"], 50, "the default page limit");
 
-    // (a)+(e) the PR overview ViewModel — the centrepiece shape.
     let (status, pr) = http(addr, "GET", "/v1/git/repos/alpha/prs/1", &hdr(&h), vec![]).await;
     assert_eq!(status, 200, "pr overview: {pr}");
     assert_eq!(pr["visible"], true);
@@ -257,7 +229,6 @@ async fn repos_list_and_pr_overview_serve_the_viewmodel_json() {
     );
     assert_eq!(pr["merge"]["approvals"]["required"], 2);
 
-    // the checks sub-endpoint returns the SAME checks ViewModel.
     let (cs, checks) = http(
         addr,
         "GET",
@@ -271,9 +242,6 @@ async fn repos_list_and_pr_overview_serve_the_viewmodel_json() {
     assert_eq!(checks["rows"][0]["required"], true);
 }
 
-/// (b) **Tenant isolation on git routes.** An acme token on `/v1/git/repos` sees ONLY acme's repos; a
-/// globex token on the SAME path sees ONLY globex's. The tenant is the verified token's — never client
-/// input — so acme cannot reach globex's PR (globex's PR #7 simply does not exist under acme's scope).
 #[tokio::test]
 async fn tenant_isolation_git_data_is_partitioned_by_the_verified_token() {
     let (gw, cell) = build();
@@ -281,7 +249,6 @@ async fn tenant_isolation_git_data_is_partitioned_by_the_verified_token() {
     let acme = bearer(&mint(&cell, "acme", "jti-acme"));
     let globex = bearer(&mint(&cell, "globex", "jti-globex"));
 
-    // acme sees acme's 3 repos, all slugged acme/*.
     let (_, av) = http(addr, "GET", "/v1/git/repos", &hdr(&acme), vec![]).await;
     let acme_repos = av["items"].as_array().unwrap();
     assert_eq!(acme_repos.len(), 3);
@@ -289,7 +256,6 @@ async fn tenant_isolation_git_data_is_partitioned_by_the_verified_token() {
         .iter()
         .all(|r| r["slug"].as_str().unwrap().starts_with("acme/")));
 
-    // globex, the SAME path, sees ONLY globex's 1 repo — never acme's data.
     let (_, gv) = http(addr, "GET", "/v1/git/repos", &hdr(&globex), vec![]).await;
     let globex_repos = gv["items"].as_array().unwrap();
     assert_eq!(globex_repos.len(), 1, "globex has exactly its own repo");
@@ -299,10 +265,8 @@ async fn tenant_isolation_git_data_is_partitioned_by_the_verified_token() {
         "no acme data bleeds into globex's response: {gv}"
     );
 
-    // acme's token cannot read globex's PR #7 — it is not in acme's scope (404, never served).
     let (st, _) = http(addr, "GET", "/v1/git/repos/zeta/prs/7", &hdr(&acme), vec![]).await;
     assert_eq!(st, 404, "globex's PR is invisible to an acme token");
-    // globex CAN read its own PR #7.
     let (st_ok, gpr) = http(
         addr,
         "GET",
@@ -315,35 +279,30 @@ async fn tenant_isolation_git_data_is_partitioned_by_the_verified_token() {
     assert!(gpr["title"].as_str().unwrap().contains("globex"));
 }
 
-/// (c) A forged token → 401 on a git route (the gateway's auth still applies to git routes).
 #[tokio::test]
 async fn forged_token_is_401_on_a_git_route() {
     let (gw, _cell) = build();
     let addr = spawn(gw).await;
-    let h = bearer("acme|eu-west|subj-1|jti|0|agent:run"); // a hand-rolled plaintext (not a v4.public)
+    let h = bearer("acme|eu-west|subj-1|jti|0|agent:run");
     let (status, v) = http(addr, "GET", "/v1/git/repos", &hdr(&h), vec![]).await;
     assert_eq!(status, 401, "a forged token is rejected on git routes");
     assert_eq!(v["error"]["message"], "authentication required");
     assert_eq!(v["error"]["code"], "unauthorized");
-    // No credential at all → also 401.
     let (nc, _) = http(addr, "GET", "/v1/git/repos", &[], vec![]).await;
     assert_eq!(nc, 401);
 }
 
-/// (d) Pagination on the repo list — `limit` caps the page; the `next_cursor` continues it.
 #[tokio::test]
 async fn repo_list_pagination_limit_and_cursor() {
     let (gw, cell) = build();
     let addr = spawn(gw).await;
     let h = bearer(&mint(&cell, "acme", "jti-page"));
 
-    // limit=2 → 2 items + a next_cursor.
     let (_, p1) = http(addr, "GET", "/v1/git/repos?limit=2", &hdr(&h), vec![]).await;
     assert_eq!(p1["items"].as_array().unwrap().len(), 2);
     assert_eq!(p1["page"]["limit"], 2);
     let cursor = p1["page"]["next_cursor"].as_str().expect("a next cursor");
 
-    // follow the cursor → the remaining 1 item, no further cursor.
     let (_, p2) = http(
         addr,
         "GET",
@@ -359,15 +318,12 @@ async fn repo_list_pagination_limit_and_cursor() {
     );
 }
 
-/// Writes: `POST …/merge` is wired (200) but HONESTLY `durable: false` (E1.1); a web-edit against a
-/// stale base is the GF-6 honest refuse (409), never a silent overwrite.
 #[tokio::test]
 async fn writes_are_wired_but_durable_effect_is_deferred_to_e1_1() {
     let (gw, cell) = build();
     let addr = spawn(gw).await;
     let h = bearer(&mint(&cell, "acme", "jti-write"));
 
-    // merge — wired route, modeled outcome, durable:false (never a faked persisted merge).
     let (st, mv) = http(
         addr,
         "POST",
@@ -384,7 +340,6 @@ async fn writes_are_wired_but_durable_effect_is_deferred_to_e1_1() {
     assert_eq!(mv["applied"]["action"], "git.pr.merge");
     assert!(mv["note"].as_str().unwrap().contains("E1.1"));
 
-    // web-edit against a stale base → 409 (GF-6 honest refuse, no silent overwrite).
     let (stale, sv) = http(
         addr,
         "POST",
@@ -396,7 +351,6 @@ async fn writes_are_wired_but_durable_effect_is_deferred_to_e1_1() {
     assert_eq!(stale, 409, "a stale base is refused (GF-6): {sv}");
     assert_eq!(sv["error"]["code"], "conflict");
 
-    // web-edit against the CURRENT base → 200, modeled committed outcome, durable:false.
     let (ok, ov) = http(
         addr,
         "POST",

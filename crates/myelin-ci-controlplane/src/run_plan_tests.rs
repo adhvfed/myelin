@@ -284,14 +284,8 @@ fn structured_cargo_recipe_is_canonical_and_constructs_direct_argv() {
         .any(|arg| arg == "/bin/sh" || arg == "-c"));
 }
 
-/// **Wire byte-stability for the additive `selected_cargo_vendor` field (CT-007 gate 4, blocker 1).**
-/// A legacy V2 producer that never sets the field emits canonical bytes with NO `selected_cargo_vendor`
-/// key (proven byte-for-byte against `version_two_canonical_wire_...`'s pinned string), and those
-/// legacy bytes still decode and re-serialize byte-identically. A plan that DOES carry a selection
-/// round-trips through decode with the field preserved, and its canonical bytes DO carry the key.
 #[test]
 fn selected_cargo_vendor_is_additive_and_byte_stable_on_the_v2_wire() {
-    // (a) Legacy V2 without the field: the key never appears, and the exact bytes round-trip.
     let legacy = structured_cargo_plan_v2();
     assert!(legacy.jobs[0].selected_cargo_vendor.is_none());
     let legacy_bytes = legacy.canonical_bytes().expect("legacy V2 canonical bytes");
@@ -302,8 +296,6 @@ fn selected_cargo_vendor_is_additive_and_byte_stable_on_the_v2_wire() {
     let redecoded = decode_resolved_run_plan(&legacy_bytes).expect("legacy V2 decodes");
     assert_eq!(redecoded.canonical_bytes().unwrap(), legacy_bytes);
 
-    // (b) A plan carrying a stamped, server-selected vendor: the key IS present, and decode
-    //     preserves the exact reference; re-serialization is byte-identical.
     let mut selected = structured_cargo_plan_v2();
     let reference = myelin_ci_sandbox::cargo_vendor_smoke_reference();
     selected.jobs[0].selected_cargo_vendor = Some(reference.clone());
@@ -314,10 +306,8 @@ fn selected_cargo_vendor_is_additive_and_byte_stable_on_the_v2_wire() {
     assert_eq!(decoded, VersionedResolvedRunPlan::V2(selected.clone()));
     assert_eq!(decoded.canonical_bytes().unwrap(), selected_bytes);
 
-    // The two wires are genuinely different bytes: the field is not a no-op.
     assert_ne!(legacy_bytes, selected_bytes);
 
-    // (c) A selection on a NON-build job is refused fail-closed by wire validation.
     let mut bogus = valid_plan_v2();
     bogus.jobs[0].selected_cargo_vendor = Some(reference);
     assert!(matches!(
@@ -832,7 +822,6 @@ fn matrix_axes_and_values_are_bounded_machine_tokens() {
     assert_invalid(plan, "more than 16 matrix axes");
 }
 
-/// Helper: a structured Cargo recipe validates iff it is in the platform allowlist.
 fn recipe_is_admitted(args: &[&str]) -> bool {
     let build = StructuredBuildV1 {
         tool: StructuredBuildToolV1::Cargo,
@@ -841,8 +830,6 @@ fn recipe_is_admitted(args: &[&str]) -> bool {
     build.validate_for_job("job").is_ok()
 }
 
-/// The three widened job kinds — build, unit test, and clippy — are each admitted, and
-/// `platform_argv` lowers each to the exact hermetic argv (vendor `--config` before any `--`).
 #[test]
 fn structured_build_allowlist_admits_build_test_and_clippy_with_exact_argv() {
     let lower = |args: &[&str]| {
@@ -855,21 +842,18 @@ fn structured_build_allowlist_admits_build_test_and_clippy_with_exact_argv() {
     let replace = "source.crates-io.replace-with=\"vendored\"";
     let vendor = "source.vendored.directory=\"/opt/myelin/cargo-vendor\"";
 
-    // build — unchanged: vendor --config appended at the end.
     assert!(recipe_is_admitted(&["build", "--locked"]));
     assert_eq!(
         lower(&["build", "--locked"]),
         ["cargo", "build", "--locked", "--config", replace, "--config", vendor]
     );
 
-    // test --lib — offline-safe unit tests; vendor --config appended at the end (no `--`).
     assert!(recipe_is_admitted(&["test", "--locked", "--lib"]));
     assert_eq!(
         lower(&["test", "--locked", "--lib"]),
         ["cargo", "test", "--locked", "--lib", "--config", replace, "--config", vendor]
     );
 
-    // test --lib --workspace — same, fanned across the workspace.
     assert!(recipe_is_admitted(&[
         "test",
         "--locked",
@@ -891,7 +875,6 @@ fn structured_build_allowlist_admits_build_test_and_clippy_with_exact_argv() {
         ]
     );
 
-    // clippy — vendor --config inserted BEFORE the `--`, so `-D warnings` still reaches the driver.
     assert!(recipe_is_admitted(&[
         "clippy",
         "--locked",
@@ -925,15 +908,12 @@ fn structured_build_allowlist_admits_build_test_and_clippy_with_exact_argv() {
     );
 }
 
-/// The `build --locked` lowering is BYTE-IDENTICAL to the pre-widening output (the platform vendor
-/// suffix appended verbatim, nothing reordered).
 #[test]
 fn structured_build_argv_is_byte_unchanged_for_build() {
     let build = StructuredBuildV1 {
         tool: StructuredBuildToolV1::Cargo,
         args: vec!["build".into(), "--locked".into()],
     };
-    // The exact bytes the single-recipe grammar produced before this slice.
     let expected: Vec<String> = [
         "cargo",
         "build",
@@ -949,20 +929,18 @@ fn structured_build_argv_is_byte_unchanged_for_build() {
     assert_eq!(build.platform_argv(), expected);
 }
 
-/// Anything outside the closed allowlist is refused with the typed `InvalidPlan` error: bare
-/// subcommands, integration-test recipes, non-cargo subcommands, and any attempt to smuggle a flag.
 #[test]
 fn structured_build_allowlist_rejects_everything_else() {
     for rejected in [
-        &["build"][..],                                       // missing --locked
-        &["test"][..],                                        // bare test
-        &["test", "--locked"][..],                            // missing --lib (integration unsafe)
-        &["test", "--locked", "--workspace"][..],             // --workspace without --lib
-        &["test", "--locked", "--lib", "--all-features"][..], // extra flag
-        &["clippy", "--locked", "--all-targets"][..],         // missing the -- -D warnings tail
+        &["build"][..],
+        &["test"][..],
+        &["test", "--locked"][..],
+        &["test", "--locked", "--workspace"][..],
+        &["test", "--locked", "--lib", "--all-features"][..],
+        &["clippy", "--locked", "--all-targets"][..],
         &["clippy", "--locked"][..],
-        &["run", "--locked"][..], // arbitrary subcommand
-        &["build", "--locked", "--target-dir", "/x"][..], // path-reopening option
+        &["run", "--locked"][..],
+        &["build", "--locked", "--target-dir", "/x"][..],
         &["build", "--locked", "--offline"][..],
         &[
             "build",

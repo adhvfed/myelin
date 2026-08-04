@@ -1,24 +1,3 @@
-//! # CDC — contract 7.1 `list_inbox` (the ONE inbox + the C-9 scoped-view filter) (P-183)
-//!
-//! **Architecture:** `notifications.md` §1.3 (the C-9 resolution — exactly ONE inbox; Issues "My
-//! Work" / Chat "Activity" / Git "Review requests" are `filter`s over `reason`/`subject`, never a
-//! second store), §3.4 step-0 (AUTHORIZE — a notification is a read of the subject; obeys `check`,
-//! ADR-03). **Contract:** **7.1** `list_inbox(principal, filter?, page?) → [InboxItem]`.
-//!
-//! This CDC pins the 7.1 seam from BOTH sides:
-//!
-//! - **PROVIDER (Notif owns 7.1):** `list_inbox` reads the ONE inbox; a scoped `filter` (subsystem
-//!   ∧ reason) returns a STRICT SUBSET (a view is a filter, not a store), and step-0 authorize
-//!   drops an item the recipient cannot see (held, not leaked).
-//! - **CONSUMER (a subsystem scoped view / the inbox UI / the CLI):** a subsystem that wants its own
-//!   "my X" surface adds a *filtered view* over 7.1, never a second store — proven here by the
-//!   three frozen views all reading the SAME rows as the unfiltered inbox (the C-9 invariant), and
-//!   the CLI `inbox list|show` reading through the SAME `list_inbox` path (no back-door read).
-//!
-//! The two halves agree on the WIRE: the `InboxFilter` grammar (subsystem ∧ reason) + the step-0
-//! authorize seam (`ReadAuthorizePort`, contract 4.2/4.10). A drift on either side (a filter that
-//! becomes a store, an authorize that is skipped) breaks THIS build.
-
 use myelin_events::ArtifactRef;
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, Principal, PrincipalId, PrincipalKind, Zookie,
@@ -61,7 +40,6 @@ fn item(recipient: &str, id: &str, subject: &str, reason: Reason) -> RoutedInbox
     }
 }
 
-/// A mixed batch for `me` across the three subsystems — some rows in each scoped view, some not.
 fn seeded(me: &str) -> InboxProjection {
     let inbox = InboxProjection::new();
     inbox.upsert_for_test(item(
@@ -101,10 +79,6 @@ fn id_set(items: &[RoutedInboxItem]) -> std::collections::BTreeSet<String> {
     items.iter().map(|i| i.item_id.clone()).collect()
 }
 
-/// **PROVIDER + CONSUMER (the C-9 invariant): every scoped view ⊆ `list_inbox(filter=∅)` — a view
-/// is a filter over the ONE inbox, never a second store.** The provider (Notif) returns the
-/// unfiltered inbox; each consumer view (a subsystem's "my X" surface) returns a STRICT SUBSET — 0
-/// rows in a view absent from the unfiltered inbox.
 #[test]
 fn list_inbox_scoped_views_are_strict_subsets_of_the_one_inbox() {
     let me = "u1";
@@ -145,8 +119,6 @@ fn list_inbox_scoped_views_are_strict_subsets_of_the_one_inbox() {
             view_ids.len() < full_ids.len(),
             "a scoped view is STRICTLY smaller (a filter, not the store)"
         );
-        // every view row carries the SAME read-state row identity as the unfiltered inbox (one
-        // store → one read-state truth): the item_id in the view is the item_id in the full inbox.
         for vid in &view_ids {
             assert!(
                 full_ids.contains(vid),
@@ -156,9 +128,6 @@ fn list_inbox_scoped_views_are_strict_subsets_of_the_one_inbox() {
     }
 }
 
-/// **CONSUMER (the CLI scoped views): `myelin inbox list --view <name>` reads the contract view.**
-/// The CLI my-work/activity/review-requests views select exactly the §1.3 rows, all through the
-/// ONE `list_inbox` path — a CLI view is the contract view, never a second store.
 #[test]
 fn cli_views_read_the_contract_filtered_views() {
     let me = "u1";
@@ -208,7 +177,6 @@ fn cli_views_read_the_contract_filtered_views() {
     );
     assert_eq!(reviews, ["git-review".to_string()].into_iter().collect());
 
-    // the default CLI view is the ONE inbox.
     let all = inbox_list(
         &inbox,
         &p,
@@ -220,10 +188,6 @@ fn cli_views_read_the_contract_filtered_views() {
     assert_eq!(all.items.len(), 5, "the default CLI view is the ONE inbox");
 }
 
-/// **PROVIDER (step-0 authorize, contract 4.2/4.10): an item the recipient cannot READ is NOT
-/// returned by `list_inbox` — held, not leaked (ADR-03).** A denying `ReadAuthorizePort` (the seam
-/// the live Identity `check` plugs into) drops exactly the unseeable item; the CLI `show` of that
-/// item is `None` (no back-door read).
 #[test]
 fn list_inbox_obeys_step0_authorize_held_not_leaked() {
     struct DenyOne(String);
@@ -253,15 +217,12 @@ fn list_inbox_obeys_step0_authorize_held_not_leaked() {
     );
     assert_eq!(got.len(), 4, "the other 4 visible items surface");
 
-    // the CLI `show` of the denied item is None (no back-door read through show).
     assert!(
         inbox_show(&inbox, &p, "iss-assigned", &deny, &strong()).is_none(),
         "show obeys the same authorize"
     );
 }
 
-/// **The 7.1 wire is recipient-scoped: another principal's items are never returned.** The provider
-/// scopes to the calling principal; a consumer can only ever read its own inbox.
 #[test]
 fn list_inbox_is_recipient_scoped() {
     let inbox = InboxProjection::new();

@@ -1,4 +1,3 @@
-//! Live PostgreSQL proof for the durable effective `issue:view` projection.
 #![cfg(feature = "integration")]
 
 use myelin_config::{Mode, MyelinConfig};
@@ -173,14 +172,12 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
                 "team:eng#view",
             ),
             tuple(true, "team:eng", "member", &bob.principal_id.0),
-            // Malformed tuple-to-userset target: a concrete subject must never inherit project view.
             tuple(
                 true,
                 format!("project:{project}"),
                 "parent_team",
                 &outsider.principal_id.0,
             ),
-            // A tuple-to-userset target must name the computed `view`, not an arbitrary relation.
             tuple(
                 true,
                 format!("project:{project}"),
@@ -246,7 +243,6 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         .items
         .is_empty());
 
-    // Reconstruct the pool/store as a process restart: durable rows and watermark remain serveable.
     drop(store);
     let restarted_bootstrap = PgBootstrap::connect(config, 4)
         .await
@@ -266,7 +262,6 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         1
     );
 
-    // Confidential exclusion removes normal project viewers; an explicit grant unions one back.
     let issue_object = format!("issue:{}", staged.id);
     write(
         &tuples,
@@ -311,7 +306,6 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         .items
         .is_empty());
 
-    // A revocation commits with the stale marker. It is unavailable before rebuild and absent after.
     write(
         &tuples,
         &scope,
@@ -342,7 +336,6 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
     assert!(forbidden.items.is_empty());
     assert!(forbidden.next_cursor.is_none());
 
-    // Concurrent mutation waits behind the rebuild's state-row lock, then leaves the result pending.
     write(
         &tuples,
         &scope,
@@ -400,7 +393,6 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         .items
         .is_empty());
 
-    // Tenant and region cannot inherit the other partition's effective rows.
     let other = principal(&other_tenant, "fr-par", &alice.principal_id.0);
     let other_worker = principal(&other_tenant, "fr-par", "svc:worker:other");
     restarted
@@ -421,7 +413,6 @@ async fn durable_effective_filter_survives_restart_revocation_and_rebuild_races(
         Err(IssueStoreError::NotFound)
     );
 
-    // Exact test partition cleanup (admin role; projection rows precede their state parent).
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(

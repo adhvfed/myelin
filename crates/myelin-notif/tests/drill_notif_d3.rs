@@ -1,38 +1,3 @@
-//! # NOTIF-D3 — reindex-from-source: wipe `inbox_item`, reindex(notif) → cold == live (P-195)
-//!
-//! **Drill source:**
-//! `planning/05-refined-shared-systems-architecture/testing-strategy/01-whole-system-e2e-and-drill-catalogue.md`
-//! row **NOTIF-D3** ("Wipe `inbox_item`; `reindex(notif)` → the rebuilt inbox matches live (items +
-//! read-state from source events); reindex-parity hash equal — cold == live") + `notifications.md`
-//! §3.8 (reindex-from-source: the inbox is a derived read-model, rebuildable ONLY via the live
-//! consumer path — `events::reindex(scope=notif)` → owners replay `*.snapshot` → the SAME router
-//! re-ingests idempotently → `inbox_item`/`delivery` reconstructed; cold == live, the only recovery
-//! path) + EI-04 §5.3 (no second read path → steady-state and recovery cannot drift) + EI-01 §3
-//! (prove-it: wipe and rebuild, assert cold == live; the parity hash is the green artifact).
-//!
-//! **The dated GREEN artifact (2026-06-20).** A batch of curated Signals is routed LIVE through the
-//! Signal-consumer router (NOTIF-P3) — building an inbox WITH read-state (some items marked read /
-//! snoozed). The live inbox's reindex-parity hash is captured. Then `inbox_item` is WIPED (the
-//! read-model is lost). `reindex(notif)` replays the owner's `*.snapshot` events through the SAME
-//! `Consumer::deliver` step a live `sig.*` event hits — re-ingesting idempotently. The drill measures
-//! + asserts, with NO threshold weakened:
-//!
-//! 1. **the rebuilt inbox matches live (items)** — same row count + the SAME `(recipient, dedup_key)`
-//!    identities reconstructed through the SAME router (cold == live).
-//! 2. **the reindex-parity hash is IDENTICAL** — cold == live over the inbox items + read-state
-//!    (`state`/`snooze_until`). The threshold is exact equality — never softened.
-//! 3. **the recovery path is the ONLY read path** — the rebuild re-drives the SAME `Consumer::deliver`
-//!    over the SAME `SignalRouter`; there is no "read the inbox from another store" backdoor (the
-//!    single-code-path law). A snapshot of an already-routed Signal collapses onto the SAME row via the
-//!    router's `(tenant, recipient, dedup_key)` UPSERT.
-//!
-//! **FLOORS named.** The ~90-day item-retention window (§3.8): older items age out and are
-//! reconstructable from the OLAP/Audit long-term holder (NOT this reindex, which replays the bounded
-//! window); `prefs`/`on-call`/`templates` are permanent (restore-verify gated, 11.5), not reindexed.
-//! The real owner replay is the dispatch tier / EB-26 (the reference `SignalReindexSource` is the
-//! contract-shape carrier the drill runs against). `delivery` reconstruction is downstream of the
-//! rebuilt inbox (the fabric's `UNIQUE(idem_key)` ledger is not re-sent on a rebuild).
-
 use myelin_events::{
     Actor, Consumer, DataRole, DedupLedger, EmitContextBase, OutboxStore, Region as BusRegion,
     ReindexSource, Timestamp,
@@ -119,8 +84,6 @@ fn live_router(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection
     (consumer, inbox)
 }
 
-/// **NOTIF-D3 — the dated green artifact (2026-06-20).** Wipe `inbox_item`; `reindex(notif)` → the
-/// rebuilt inbox matches live (items + read-state); reindex-parity hash equal (cold == live).
 #[test]
 fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
     let signals = [
@@ -152,13 +115,11 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
 
-    // (1) LIVE: route the curated Signals through the ordinary live `sig.*` path (steady-state).
     for (i, sig) in signals.iter().enumerate() {
         consumer.deliver(&live_msg(&format!("evt-{i}"), sig));
     }
     assert_eq!(inbox.len(), 4, "the live inbox holds four rows");
 
-    // Build read-state on the live inbox (mark one read, snooze another) — the parity must cover it.
     let rows = inbox.snapshot_for_tenant(&tenant());
     let read_me = rows[0].clone();
     let snooze_me = rows[1].clone();
@@ -173,7 +134,6 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
     )
     .expect("snooze");
 
-    // Capture the LIVE parity hash + the live active-inbox view (items the recipient sees).
     let live_hash = inbox_parity_hash(&inbox, &tenant());
     let live_active = active_inbox(
         inbox
@@ -185,20 +145,15 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
     .len();
     let live_count = inbox.len();
 
-    // (2) The owner's curated-Signal truth (the source the reindex replays — the dispatch tier / EB-26
-    // floor; the reference source is the contract-shape carrier).
     let mut owner = SignalReindexSource::new();
     for sig in &signals {
         owner.upsert(sig.clone(), 1);
     }
 
-    // (3) WIPE `inbox_item` (the read-model is lost — D-N3).
     let wiped = inbox.wipe_tenant(&tenant());
     assert_eq!(wiped, 4, "the wipe removed all four rows");
     assert!(inbox.is_empty(), "the inbox read-model is gone");
 
-    // (4) reindex(notif): replay the owner's *.snapshot events through the SAME router (the ONLY
-    // recovery path — re-drives the SAME Consumer::deliver a live Signal hits).
     let reindexer = NotifReindexer::new(&consumer);
     let mut outbox = OutboxStore::new();
     let sources: &[&dyn ReindexSource] = &[&owner];
@@ -213,8 +168,6 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
         )
         .expect("reindex(notif)");
 
-    // THE ARTIFACT, asserted with no threshold weakened:
-    // 1. the rebuilt inbox matches live (items).
     assert_eq!(
         receipt.snapshots_emitted, 4,
         "four *.snapshot re-emitted via the bus"
@@ -229,13 +182,6 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
         "the rebuilt row count == live (cold == live, items)"
     );
 
-    // NOTE on read-state: the inbox is a PROJECTION of the SIGNAL stream. The reindex rebuilds it from
-    // the SOURCE Signals; per-user read-state (mark/snooze) is itself recorded as source state
-    // (notif.item.read / notif.item.snoozed events on the inbox-item aggregate) and replays through
-    // the SAME path. In this reference drill the owner replays the curated Signals (the create side);
-    // the read-state source events are the user's own aggregate (their replay is the same seam,
-    // re-applied here directly to model the read-state source on the rebuilt rows so the parity covers
-    // it — the read-state IS source state, not derived).
     let rebuilt = inbox.snapshot_for_tenant(&tenant());
     let rebuilt_read = rebuilt
         .iter()
@@ -260,14 +206,12 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
     )
     .expect("replay the snooze source event onto the rebuilt row");
 
-    // 2. the reindex-parity hash is IDENTICAL (items + read-state) — cold == live.
     let cold_hash = inbox_parity_hash(&inbox, &tenant());
     assert_eq!(
         cold_hash, live_hash,
         "NOTIF-D3: cold == live (reindex-parity hash IDENTICAL)"
     );
 
-    // The active-inbox view (what the user sees) reconstructs identically too.
     let cold_active = active_inbox(
         inbox
             .snapshot_for_tenant(&tenant())
@@ -282,8 +226,6 @@ fn notif_d3_wipe_reindex_rebuilds_cold_equals_live() {
     );
 }
 
-/// A recipient [`Principal`] from the opaque pseudonym the router stores as `recipient` (the read-state
-/// API addresses the row by `(tenant, principal_id)`; the router's recipient is that pseudonym id).
 fn recipient_principal(recipient: &str) -> Principal {
     Principal::stub(
         PrincipalId(recipient.into()),
@@ -292,9 +234,6 @@ fn recipient_principal(recipient: &str) -> Principal {
     )
 }
 
-/// **The single-code-path check (CI): recovery re-drives the SAME router as live — 0 second read
-/// path.** A reindex of a Signal already routed live collapses onto the SAME row (the router's
-/// `(tenant, recipient, dedup_key)` UPSERT), proving recovery and steady-state share ONE write path.
 #[test]
 fn notif_d3_single_code_path_no_second_read_path() {
     let sig = signal(
@@ -314,7 +253,6 @@ fn notif_d3_single_code_path_no_second_read_path() {
     owner.upsert(sig.clone(), 1);
     let reindexer = NotifReindexer::new(&consumer);
     let mut outbox = OutboxStore::new();
-    // An INCREMENTAL re-ingest (since=Some(0), no wipe) of the SAME Signal collapses onto the SAME row.
     reindexer
         .reindex(
             &tenant(),

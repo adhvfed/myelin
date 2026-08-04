@@ -1,9 +1,3 @@
-//! L2 production-module erosion budget.
-//!
-//! Counts parsed Rust source lines while excluding exact `#[cfg(test)]` items. Files above the
-//! soft ceiling must be named at their exact current size in the committed allowlist. An entry that
-//! grows is red; an entry that shrinks is also red until the allowance shrinks with it.
-
 use proc_macro2::Span;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};

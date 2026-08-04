@@ -1,15 +1,3 @@
-//! # ISS-D8(b) — the OLAP-feed reindex-parity + restriction-exclusion drill (ISS-P20 / P-387, M4).
-//!
-//! **The shared ISS-D8(b) reindex-parity property, applied to the OLAP feed half (the prompt's named
-//! drill).** Two green artifacts, both in ONE dated signal (`IssueOlapFeedSignal`):
-//! - **reindex-from-source rebuilds the OLAP feed DRIFT-FREE vs live (0 drift).** The cold rebuild's
-//!   analytics read model byte-matches the live projection — steady-state and recovery share ONE code
-//!   path (contract 2.6).
-//! - **the restriction flag excludes a restricted subject (`restricted_subject_leak == 0`).** A
-//!   restricted subject contributes 0 rows to CFD/cycle-time/velocity/SLA-compliance.
-//!
-//! Plus the 0-OLTP-read gate (`oltp_read_count == 0`): the feed is off the bus, never the OLTP table.
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventHandler,
     EventId, EventType, Timestamp, Visibility,
@@ -60,14 +48,11 @@ fn ev(
     }
 }
 
-/// **ISS-D8(b) — the OLAP-feed drill produces a GREEN signal.** Feed a mixed stream (two subjects),
-/// restrict one, assert the leak is 0, rebuild cold from source, assert 0 drift — all three gates green.
 #[test]
 fn iss_d8b_olap_feed_drill_is_green() {
     let flag = RestrictionFlag::new();
     let live = IssueOlapConsumer::new(region(), flag.clone());
 
-    // A realistic mixed analytics stream: SLA outcomes + transitions for two subjects.
     live.handle(&ev(
         "a-sla",
         events::SLA_MET,
@@ -97,16 +82,13 @@ fn iss_d8b_olap_feed_drill_is_green() {
         serde_json::json!({ "category": "started" }),
     ), &mut myelin_events::HandlerTx::none());
 
-    // Restrict alice (the non-vacuous gate exercise).
     flag.set("psn:alice", true);
     let leak = live.analytics(|a| {
-        // alice excluded → only bob's two rows survive.
         assert_eq!(a.velocity(), 2, "alice's rows excluded");
         a.leak_audit().restricted_subject_leak
     });
     assert_eq!(leak, 0, "the restriction flag excludes alice → 0 leak");
 
-    // Reindex-from-source: rebuild cold from Issues' OWN rows.
     let mut source = IssueReindexSource::new();
     source.upsert(
         IssueReplayKind::Issue,
@@ -166,8 +148,6 @@ fn iss_d8b_olap_feed_drill_is_green() {
     );
 }
 
-/// **The drill is non-vacuous: a run that restricts 0 subjects reads RED.** A §3 compliance gate must
-/// be exercised, not vacuously green (EI-01 §3).
 #[test]
 fn iss_d8b_drill_is_non_vacuous() {
     let live = IssueOlapConsumer::new(region(), RestrictionFlag::new());
@@ -182,7 +162,7 @@ fn iss_d8b_drill_is_non_vacuous() {
         store: ISSUE_ANALYTICS_OLAP,
         oltp_read_count: live.oltp_read_count(),
         restricted_subject_leak: 0,
-        subjects_restricted: 0, // VACUOUS — nothing restricted
+        subjects_restricted: 0,
         reindex_matches_live: true,
     };
     assert!(

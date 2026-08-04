@@ -1,5 +1,3 @@
-//! Strict MCP argument adapter for CI's durable permission-checked reads.
-
 use crate::governance::ReadAuthorization;
 use crate::server::{DirectReadError, DirectReadExecutor};
 use myelin_ci_controlplane::surfacing_store::CI_LOG_RANGE_DEFAULT;
@@ -11,7 +9,6 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-/// Production adapter over the same durable read authority used by authenticated Edge HTTP.
 pub struct CiDirectReadExecutor {
     api: DurableCiReadApi,
     authority: Arc<RunTokenAuthorizer>,
@@ -128,8 +125,6 @@ fn map_edge_error(error: EdgeError) -> DirectReadError {
         EdgeError::BadRequest(reason) | EdgeError::Unprocessable(reason) => {
             DirectReadError::InvalidInput(reason)
         }
-        // Denied and absent are intentionally the same result. The shared Edge adapter already
-        // turns failed parent-repository Pull checks into NotFound.
         EdgeError::NotFound(_) | EdgeError::Forbidden(_) | EdgeError::Unauthorized(_) => {
             DirectReadError::NotFound
         }

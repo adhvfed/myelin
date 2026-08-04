@@ -1,12 +1,3 @@
-//! # Rendering the edge view-model — human-readable by default, `--json` for scripts/agents.
-//!
-//! The edge serves the subsystem ViewModel DATA as JSON (the SAME vocabulary the UI renders — never a
-//! parallel one). The CLI renders it two ways:
-//! - **`--json`** — the raw JSON, pretty-printed, for scripting / an agent consumer (machine-readable);
-//! - **default** — a compact human-readable form: the uniform `{items,page}` list as one line per
-//!   item, the `whoami` principal as a single line, and an unknown shape falls back to terminal-safe
-//!   JSON (total — it never panics on an unexpected shape).
-
 use crate::dispatch::EdgeCall;
 use base64::Engine as _;
 use myelin_ci_controlplane::surfacing_store::CI_RUN_CURSOR_PREFIX;
@@ -14,8 +5,6 @@ use myelin_git::web::RepoListCursor;
 use serde_json::Value;
 use std::fmt::Write as _;
 
-/// Make an untrusted server string safe to place on one terminal line. Printable Unicode is kept
-/// intact; line separators and terminal-control bytes become visible ASCII escape sequences.
 fn terminal_safe_single_line(value: &str) -> String {
     let mut safe = String::with_capacity(value.len());
     for character in value.chars() {
@@ -39,14 +28,10 @@ fn terminal_safe_single_line(value: &str) -> String {
     safe
 }
 
-/// Render an edge response value. In `json_mode` the raw JSON is pretty-printed; otherwise a compact
-/// human form is produced (the `{items,page}` list, the whoami line, or a JSON fallback).
 pub fn render(value: &Value, json_mode: bool) -> String {
     render_with_call(value, json_mode, None)
 }
 
-/// Render an Edge response with enough request context to emit an exact, parseable pagination
-/// continuation for surfaces whose cursors are intentionally opaque.
 pub fn render_for_call(value: &Value, json_mode: bool, call: &EdgeCall) -> String {
     render_with_call(value, json_mode, Some(call))
 }
@@ -61,7 +46,6 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     if is_ci_run_detail(value) {
         return render_ci_run_detail(value);
     }
-    // The uniform list envelope: one line per item + an optional "more" hint.
     if let Some(items) = value.get("items").and_then(Value::as_array) {
         let mut out = String::new();
         if items.is_empty() {
@@ -77,19 +61,18 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
             .and_then(Value::as_str)
         {
             if let Some(command) = call.and_then(|call| ci_page_command(call, cursor)) {
-                out.push_str(&format!("… (more — run: {command})\n"));
+                out.push_str(&format!("… (more - run: {command})\n"));
             } else if RepoListCursor::parse(cursor).is_ok() {
                 let cursor = terminal_safe_single_line(cursor);
                 out.push_str(&format!(
-                    "… (more — run: myelin git repo list --cursor {cursor})\n"
+                    "… (more - run: myelin git repo list --cursor {cursor})\n"
                 ));
             } else {
-                out.push_str("… (more — pass --cursor to page)\n");
+                out.push_str("… (more - pass --cursor to page)\n");
             }
         }
         return out;
     }
-    // The whoami principal view-model.
     if let Some(pid) = value.get("principal_id").and_then(Value::as_str) {
         let kind = value.get("kind").and_then(Value::as_str).unwrap_or("?");
         let tenant = value.get("tenant").and_then(Value::as_str).unwrap_or("?");
@@ -100,8 +83,6 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
         let region = terminal_safe_single_line(region);
         return format!("{pid} ({kind})  tenant={tenant}  region={region}\n");
     }
-    // Issues create is asynchronous. Render the durable receipt honestly and pair it with the exact
-    // follow-up read; never claim the pending row is visible before the authorization reconciler.
     if let (Some(issue), Some(authorization)) = (value.get("issue"), value.get("authorization")) {
         if let (Some(id), Some(key)) = (
             issue.get("id").and_then(Value::as_str),
@@ -119,18 +100,13 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
             );
         }
     }
-    // An Issue view/close response.
     if is_issue(value) {
         return format!("{}\n", render_issue(value));
     }
-    // An unknown shape: terminal-safe JSON (total — never a panic). Sanitize the serialized form too:
-    // JSON permits DEL/C1 bytes unescaped, and those are still terminal controls in human mode.
     let serialized = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
     format!("{}\n", terminal_safe_single_line(&serialized))
 }
 
-/// Render one list item to a line. Known shapes: a RepoHome (`slug`/`state`) and a code-search hit
-/// (`repo`/`path`/`line`/`excerpt`); an unknown item falls back to compact JSON.
 fn render_item(item: &Value) -> String {
     if is_ci_run_summary(item) {
         return render_ci_run_summary(item);
@@ -295,7 +271,7 @@ fn render_ci_log_range(value: &Value) -> String {
         if next >= 0 && safe_cli_uuid(run) && safe_cli_uuid(job) {
             if let Some(limit) = end.checked_sub(start).filter(|limit| *limit > 0) {
                 output.push_str(&format!(
-                    "… (more — run: myelin ci logs {run} --job {job} --start {next} --limit {limit})\n"
+                    "… (more - run: myelin ci logs {run} --job {job} --start {next} --limit {limit})\n"
                 ));
             }
         }
@@ -303,8 +279,6 @@ fn render_ci_log_range(value: &Value) -> String {
     output
 }
 
-/// Render arbitrary log bytes without allowing terminal-control injection. Invalid UTF-8 remains
-/// byte-identifiable as `\xNN`; printable Unicode and line boundaries stay readable.
 pub fn terminal_safe_log_bytes(bytes: &[u8]) -> String {
     let mut output = String::new();
     let mut remaining = bytes;
@@ -492,7 +466,7 @@ mod tests {
         let command = rendered
             .lines()
             .find_map(|line| {
-                line.strip_prefix("… (more — run: ")
+                line.strip_prefix("… (more - run: ")
                     .and_then(|line| line.strip_suffix(')'))
             })
             .expect("actionable next-page command");
@@ -525,7 +499,6 @@ mod tests {
     fn unknown_shape_falls_back_to_json_no_panic() {
         let out = render(&json!({"weird":[1,2,3]}), false);
         assert!(out.contains("weird"));
-        // empty list renders the explicit marker.
         assert!(render(&json!({"items":[]}), false).contains("(no items)"));
     }
 
@@ -642,7 +615,7 @@ mod tests {
         let command = output
             .lines()
             .find_map(|line| {
-                line.strip_prefix("… (more — run: ")
+                line.strip_prefix("… (more - run: ")
                     .and_then(|line| line.strip_suffix(')'))
             })
             .expect("actionable next-page command");
@@ -743,6 +716,6 @@ mod tests {
             "encoding": "base64",
             "data": "eA=="
         });
-        assert!(!render(&log, false).contains("more — run:"));
+        assert!(!render(&log, false).contains("more - run:"));
     }
 }

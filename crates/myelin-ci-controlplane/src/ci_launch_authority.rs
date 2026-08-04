@@ -1,14 +1,3 @@
-//! Policy-owned launch grants for supported executable CI profiles.
-//!
-//! Customer V2 plans may request a supported execution profile, but they carry no runtime
-//! authority. This module turns that request into fixed, server-owned isolation and scheduling
-//! terms. It delegates the
-//! durable capacity reservation to one explicit provider, while deriving a content-bound token-authority
-//! reference locally; the existing claim-time `CiJobTokenIssuer` remains the only bearer-mint seam.
-//! Keeping those capabilities separate matters for Tier P: Identity can become real without
-//! inventing the Commercial wallet that remains deliberately deferred. There is no budget-provider
-//! default and no caller-controlled egress, limits, labels, or lane.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::num::NonZeroU32;
@@ -34,24 +23,14 @@ use myelin_storage::{with_tenant_tx, PgError};
 use sqlx::{PgPool, Row};
 
 pub const LINUX_SMALL_V1_POLICY_REVISION: &str = "linux-small-v1:1";
-/// Exact scheduler labels emitted by the production policy and advertised by its runner pool.
 pub const LINUX_SMALL_V1_RUNNER_LABELS: [&str; 2] = ["linux", "linux-small-v1"];
 pub const LINUX_BUILD_V1_POLICY_REVISION: &str = "linux-build-v1:1";
-/// Exact scheduler labels required by the build-profile runner pool.
 pub const LINUX_BUILD_V1_RUNNER_LABELS: [&str; 2] = ["linux", "linux-build-v1"];
-/// Production-for-one ceiling on durable Tier-P reservations for one tenant and region.
-///
-/// Reservations cover every queued DAG job, so this is deliberately distinct from the measured
-/// scheduler cap, which covers only leased/running jobs. An idle tenant can reserve one largest
-/// valid run; additional runs fail closed until enough earlier reservations settle.
 pub const TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING: u32 = 1_024;
 const CI_OPERATIONAL_RESERVATION_V1_DOMAIN: &[u8] = b"myelin.ci.operational-reservation.v1\0";
 const CI_OPERATIONAL_BATCH_V1_DOMAIN: &[u8] = b"myelin.ci.operational-reservation-batch.v1\0";
 const GIB_BYTES: u64 = 1_073_741_824;
 
-/// Complete immutable request shared by the budget reservation and token-reference derivation. All
-/// identity comes from the locked `ci_run` and validated plan; neither path can replace executable
-/// or scheduling terms.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiJobRuntimeAuthorityRequest {
     pub tenant_id: String,
@@ -69,44 +48,17 @@ pub struct CiJobRuntimeAuthorityRequest {
     pub workflow_code_hash: String,
     pub policy_revision: String,
     pub limits: CiManifestLimitsV1,
-    /// The exact reservation the eventual `JobSpec.meter_to.reserve_id` must charge. It is absent
-    /// while the reservation provider is allocating the handle, then populated before the token
-    /// authority is minted. `None` is also the explicit compatibility shape for a persisted v1/v2
-    /// token-authority handle, whose frozen digest never attested this field.
     pub reserve_id: Option<String>,
-    /// The exact checkout commit attested by current token-authority handles. Kept as a distinct
-    /// authority fact (despite also appearing inside `checkout`) so v4 can make commit presence a
-    /// fail-closed, versioned contract without reinterpreting any frozen v1/v2/v3 byte stream.
-    /// `None` is the explicit compatibility shape for a persisted legacy handle.
     pub checkout_commit: Option<String>,
-    /// CT-007 slice 5b.3-2b: the job's checkout target, when it has one. `None` for an ordinary
-    /// compute job (never present in this workspace's CI jobs today, since `ci_run.repo_ref`/
-    /// `.commit_oid` are always non-empty for a CI run — see `run_plan::parse_snapshot_ref`
-    /// — but kept genuinely optional to mirror `myelin_ci_sandbox::WorkspaceIntent`'s own
-    /// Compute/Checkout duality rather than assuming CI is the only caller). Derived ONLY via
-    /// [`myelin_ci_sandbox::derive_checkout_authorization_scope`] — never hand-constructed — so the
-    /// authority digest and the real `JobSpec` a launch builds always agree on how a workspace is
-    /// parsed. Hashed into the `v2` token-authority digest (`token_authority_digest_v2`); the
-    /// frozen `v1` digest (`token_authority_digest`) never hashes this field, by design — a `v1`
-    /// handle cannot prove checkout authority (see [`ManifestBoundCiJobTokenAuthority`]).
     pub checkout: Option<CheckoutAuthorizationScope>,
 }
 
-/// External reservation boundary used by the server policy. The complete job set is one
-/// all-or-nothing operation: an implementation must commit every reservation or none, preserve input
-/// order in its result, and return the same handles on an exact retry. A wrong cardinality, empty,
-/// overlong, control-bearing, or duplicate handle is a provider refusal and must commit nothing.
-/// This prevents a later job or malformed response from stranding reservations before the manifest
-/// exists.
 pub trait CiJobBudgetReservationProvider: Send + Sync {
     fn reserve_batch<'a>(
         &'a self,
         requests: Vec<CiJobRuntimeAuthorityRequest>,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<String>, CiLaunchAuthorityError>> + Send + 'a>>;
 
-    /// Reserve on the starter's already tenant-scoped transaction. External providers may retain
-    /// the default exact-retry call, but an in-database implementation overrides this so reservation,
-    /// immutable manifest, workflow start, and CI job ledger share one commit.
     fn reserve_batch_in_tx<'a>(
         &'a self,
         _conn: &'a mut sqlx::PgConnection,
@@ -117,50 +69,21 @@ pub trait CiJobBudgetReservationProvider: Send + Sync {
     }
 }
 
-/// Durable Tier-P operational reservation source.
-///
-/// This is deliberately not a wallet. It enforces one explicit per-tenant ceiling on outstanding
-/// CI job reservations and writes the existing Storage-owned `cost_reservation` rows that the
-/// launch hook and terminal accounting path advance. One complete manifest batch commits in one
-/// tenant-scoped PostgreSQL transaction. The transaction takes a tenant/region advisory lock so
-/// concurrent fresh batches cannot both observe spare capacity.
-///
-/// Handles bind the complete immutable runtime-authority request. An exact acknowledgement-loss
-/// retry returns the existing handles in input order, regardless of how far their reservation
-/// lifecycle has subsequently advanced. Reusing a job id with changed authority or observing a
-/// partial prior batch is refused instead of creating a second reservation.
 #[derive(Clone)]
 pub struct PgTierPCiJobBudgetReservation {
     pool: PgPool,
     region: String,
     max_outstanding_jobs_per_tenant: u32,
-    /// Stored explicitly (never re-derived ad hoc) so every fresh `v2` write this provider ever
-    /// mints agrees on the same policy. Read-side replay of an EXISTING durable `v2` row never
-    /// consults this -- it reconstructs the policy from that row's own embedded descriptor instead,
-    /// since a durable row may have been minted under an older policy than whatever is configured
-    /// now (see `replay_v2_batch`).
     budget_policy: CiAttemptBudgetPolicy,
-    /// CT-007 slice 5b.3-4a.1c: gates whether a genuinely fresh batch (no durable rows yet) mints
-    /// `v1` or `v2`. See [`OperationalReservationWriteVersion`].
     write_version: OperationalReservationWriteVersion,
 }
 
-/// Completion-side policy paired with [`PgTierPCiJobBudgetReservation`].
-///
-/// Tier P records internal operational minor-units, not a customer price: one unit per measured
-/// CPU-second and one per measured memory-GiB-second, with zero markup. The reservation upper bound
-/// uses the exact same dimensions at the server-owned job limits. A future Commercial pricer must
-/// not be composed with Tier-P reservation rows; changing unit policy requires a new revision and a
-/// coordinated reservation/settlement migration.
 #[derive(Clone, Debug, Default)]
 pub struct TierPOperationalCiJobPricer;
 
 impl CiJobAccountingPricer for TierPOperationalCiJobPricer {
     fn price(&self, usage: ResourceUsage) -> Result<PricedCiJobUsage, CiJobPricingError> {
         let memory_gb_seconds = usage.mem_byte_seconds.div_ceil(GIB_BYTES);
-        // Preserve the raw-dimension overflow guard the reservation bound also relies on, then
-        // convert each raw resource-second to its micro-USD unit price (checked: a job whose priced
-        // amount would exceed u64 is refused, not silently wrapped).
         usage
             .cpu_seconds
             .checked_add(memory_gb_seconds)
@@ -275,23 +198,6 @@ impl CiJobBudgetReservationProvider for PgTierPCiJobBudgetReservation {
     }
 }
 
-/// CT-007 slice 5b.3-4a.1b: fields are named `v1_*` (not just `handle`/`amount`) because this type
-/// is now shared with `v2` replay-decision code elsewhere in this module -- but this struct itself
-/// carries ONLY `v1` data. Sol's round-1 review: an earlier draft also eagerly computed a `v2`
-/// candidate here under the provider's CURRENT policy on every batch, even though nothing writes
-/// `v2` this slice -- that meant a fresh `v1` write (or an exact `v1` replay) could fail solely
-/// because unrelated, unused `v2` ceiling arithmetic overflowed for the current policy. `v2`
-/// candidates are still never computed here; every `v2` computation this module ever does is one of
-/// exactly two callers (CT-007 slice 5b.3-4a.1c), each with its own policy:
-/// - a genuinely FRESH batch (no durable rows at all) that this provider is configured to WRITE
-///   `v2` for -- computed lazily in `reserve_operational_batch_on_conn`'s fresh branch, using the
-///   provider's CURRENTLY configured policy, only after replay has already confirmed there is
-///   nothing durable to recover instead;
-/// - an existing DURABLE `v2` row being replayed -- computed lazily in `replay_v2_batch`, using a
-///   policy RECONSTRUCTED from that row's own embedded descriptor, never the current one.
-///
-/// Neither case ever runs for a `v1`-shaped fresh write or an exact `v1` replay -- those two paths
-/// never touch `v2` arithmetic in any form.
 #[derive(Clone)]
 struct PreparedOperationalReservation {
     request: CiJobRuntimeAuthorityRequest,
@@ -369,10 +275,6 @@ fn operational_batch_digest(validated: &[(CiJobRuntimeAuthorityRequest, i64)]) -
     hasher.finalize()
 }
 
-/// CT-007 slice 5b.3-4a.1b: the `v2` sibling of [`operational_batch_digest`] -- recomputes each
-/// per-request `v2` digest internally from `(request, policy)` rather than accepting it as an input,
-/// for the same reason [`operational_reservation_digest_v2`] does: no authority encoder accepts an
-/// independently forgeable derived fact.
 fn operational_batch_digest_v2(
     validated: &[(&CiJobRuntimeAuthorityRequest, i64)],
     policy: &CiAttemptBudgetPolicy,
@@ -387,15 +289,10 @@ fn operational_batch_digest_v2(
     Ok(hasher.finalize())
 }
 
-/// The plain-text `a<N>` segment embedded in a durable `v2` handle for `max_parent_attempts` -- kept
-/// alongside the revision tag so a reader can reconstruct the exact policy an already-durable row
-/// was minted under (CT-007 slice 5b.3-4a.1b), never the provider's currently configured value.
 fn attempts_handle_tag(max_parent_attempts: NonZeroU32) -> String {
     format!("a{}", max_parent_attempts.get())
 }
 
-/// The inverse of [`attempts_handle_tag`]. Returns `None` for anything that isn't an `a` followed by
-/// a positive integer -- an unrecognized or zero value must refuse replay, never guess or clamp.
 fn parse_attempts_handle_tag(tag: &str) -> Option<NonZeroU32> {
     let digits = tag.strip_prefix('a')?;
     let value: u32 = digits.parse().ok()?;
@@ -407,10 +304,6 @@ struct V2Candidate {
     amount: i64,
 }
 
-/// The `v2` handle+amount every request in `requests` would durably mint under exactly `policy` --
-/// factored out of [`prepare_operational_batch`] (CT-007 slice 5b.3-4a.1b) so replay validation can
-/// call it a SECOND time with a policy reconstructed from an already-durable row's own embedded
-/// descriptor, never the provider's currently configured policy, which may have since changed.
 fn build_v2_candidates(
     requests: &[CiJobRuntimeAuthorityRequest],
     policy: &CiAttemptBudgetPolicy,
@@ -442,10 +335,6 @@ fn build_v2_candidates(
         .collect()
 }
 
-/// The fields embedded in a durable `v2` handle after its prefix, parsed back apart. Used ONLY
-/// during replay (CT-007 slice 5b.3-4a.1b) to recover which policy an already-durable row was
-/// minted under -- never trusted on its own; the caller must still recompute the expected candidate
-/// from these parsed fields and compare it byte-for-byte against the durable row.
 struct ParsedV2Handle {
     ci_run_id: String,
     revision: CiAttemptBudgetRevision,
@@ -453,10 +342,6 @@ struct ParsedV2Handle {
     job_id: String,
 }
 
-/// Parses `<run_id>:<budget_tag>:<attempts_tag>:<batch_digest>:<job_id>:<request_digest>` (the
-/// suffix after [`TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX`]). Returns `None` for any handle that
-/// doesn't have exactly this shape or carries an unrecognized revision/attempts tag -- malformed or
-/// forward-versioned handles must refuse replay, never be guessed at.
 fn parse_v2_handle(handle: &str) -> Option<ParsedV2Handle> {
     let suffix = handle.strip_prefix(TIER_P_OPERATIONAL_RESERVATION_V2_PREFIX)?;
     let mut parts = suffix.split(':');
@@ -479,16 +364,10 @@ fn parse_v2_handle(handle: &str) -> Option<ParsedV2Handle> {
     })
 }
 
-/// The durable reservation-writer marker carried by one `job_queue` dispatch.
-///
-/// This is derived from the reserve handle's exact wire shape rather than supplied as an unrelated
-/// integer beside it. A legacy/V1 (or malformed/unknown) handle produces `NULL`; only an exactly
-/// parseable V2 handle produces the protocol descriptor's marker `2`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReservationWriteVersionMarker(Option<i16>);
 
 impl ReservationWriteVersionMarker {
-    /// Derive the queue marker from the actual durable reserve handle.
     pub fn derive_from_reserve_handle(handle: &str) -> Self {
         if parse_v2_handle(handle).is_some() {
             Self(Some(
@@ -499,22 +378,15 @@ impl ReservationWriteVersionMarker {
         }
     }
 
-    /// Historical/V1 dispatch marker (`NULL`).
     pub const fn legacy() -> Self {
         Self(None)
     }
 
-    /// The SQL value persisted in `job_queue.reservation_write_version`.
     pub const fn value(self) -> Option<i16> {
         self.0
     }
 }
 
-/// Verify one durable v2 reservation against the complete immutable authority batch.
-///
-/// Parsing only recovers the policy descriptor; it grants no authority. This resolver reconstructs
-/// that policy, rebuilds every candidate (thereby binding the batch digest), then requires the
-/// current job's complete handle and durable amount to match byte-for-byte.
 pub(crate) fn verify_v2_operational_reservation(
     requests: &[CiJobRuntimeAuthorityRequest],
     expected_ci_run_id: &str,
@@ -547,13 +419,6 @@ pub(crate) fn verify_v2_operational_reservation(
     Ok(policy)
 }
 
-/// Reserve the maximum micro-USD COST the server-owned limits can bill: the maximum CPU-seconds and
-/// memory-GiB-seconds each priced at the same per-second rate settlement uses
-/// (`MICRO_USD_PER_CPU_SECOND` / `MICRO_USD_PER_GB_SECOND`). This makes the durable reservation a
-/// true upper bound on the eventual settled price, so the settle cap (`billed_capped = min(billed,
-/// reserved)`) only ever refunds genuine unused headroom — never under-bills a within-limits job.
-/// Terminal accounting prices the same two measured dimensions at the same rates and refunds the
-/// unused remainder.
 fn operational_reservation_amount(
     limits: &CiManifestLimitsV1,
 ) -> Result<i64, CiLaunchAuthorityError> {
@@ -661,12 +526,6 @@ async fn reserve_operational_batch_on_conn(
         )));
     }
 
-    // Genuinely fresh (no durable rows exist for this run yet): mint whichever version this
-    // provider is currently configured to WRITE. `v2` candidates are computed here for the first
-    // time in this whole call -- CT-007 slice 5b.3-4a.1b's round-1 bug was eagerly computing them
-    // for every batch regardless of need; this is the one place they're actually needed. Building
-    // the complete candidate `Vec` before the insert loop starts means a `v2` overflow anywhere in
-    // the batch refuses before any row is written -- never a partial insert.
     let fresh: Vec<(String, i64)> = match write_version {
         OperationalReservationWriteVersion::V1 => prepared
             .iter()
@@ -701,12 +560,6 @@ async fn reserve_operational_batch_on_conn(
     Ok(Ok(fresh.into_iter().map(|(handle, _)| handle).collect()))
 }
 
-/// The pure replay/divergence decision over already-fetched durable rows (CT-007 slice 5b.3-4a.1b) --
-/// factored out of [`reserve_operational_batch_on_conn`] so every branch (exact `v1` replay, exact
-/// `v2` replay, mixed-version refusal, tampered/partial/divergent refusal) is directly unit-testable
-/// without a database. Returns `None` when there is nothing durable for this run yet (the caller
-/// should proceed to the active-ceiling check and a fresh `v1` insert); `Some(Ok(handles))` or
-/// `Some(Err(_))` otherwise.
 fn resolve_durable_replay(
     rows: Vec<(String, i64)>,
     v1_run_prefix: &str,
@@ -716,8 +569,6 @@ fn resolve_durable_replay(
     if rows.is_empty() {
         return None;
     }
-    // A durable run may hold `v1` OR `v2` rows (never both -- a batch is written entirely under
-    // one version), so split by prefix before replaying either.
     let mut durable_v1 = BTreeMap::new();
     let mut durable_v2 = BTreeMap::new();
     for (handle, amount) in rows {
@@ -763,11 +614,6 @@ fn resolve_durable_replay(
     Some(replay_v2_batch(prepared, &durable_v2))
 }
 
-/// Validates an exact acknowledgement-loss replay against durably-found `v2` rows (CT-007 slice
-/// 5b.3-4a.1b). The durable rows may have been minted under an OLDER policy than the provider's
-/// CURRENTLY configured one, so this recovers the actual policy from the rows' own embedded
-/// descriptor instead -- a `v2` batch created under one attempt cap must still replay correctly
-/// after the provider is reconfigured with another.
 fn replay_v2_batch(
     prepared: &[PreparedOperationalReservation],
     durable_v2: &BTreeMap<String, i64>,
@@ -835,15 +681,6 @@ const CI_TOKEN_AUTHORITY_V2_HANDLE_PREFIX: &str = "ci-token-authority:v2:";
 const CI_TOKEN_AUTHORITY_V3_HANDLE_PREFIX: &str = "ci-token-authority:v3:";
 const CI_TOKEN_AUTHORITY_V4_HANDLE_PREFIX: &str = "ci-token-authority:v4:";
 
-/// Content-addressed token-authority reference. The immutable manifest persists this handle, and a
-/// later claim-bound issuer can reload the manifest and recompute it before minting. The hash binds
-/// every locked identity, source, workflow, policy, and limit field; it contains no secret and grants
-/// no authority by itself.
-///
-/// New handles are `v4`, explicitly binding the exact checkout commit in addition to v3's checkout
-/// scope and allocated reservation. The v1/v2/v3 encoders remain byte-frozen. Rolling-fleet
-/// verification accepts an older version only when every fact introduced after that generation is
-/// explicitly absent; absent legacy facts can never be reinterpreted as attested after the fact.
 #[derive(Clone, Debug, Default)]
 pub struct ManifestBoundCiJobTokenAuthority;
 
@@ -855,11 +692,6 @@ impl ManifestBoundCiJobTokenAuthority {
         )
     }
 
-    /// Recompute the public authority reference from server-resolved facts. This is not bearer
-    /// verification; the claim-bound issuer uses it before asking Identity to mint a credential.
-    /// Dispatches on the persisted handle's own version prefix rather than assuming `v2`, so a
-    /// pre-existing `v1` manifest handle (minted before this slice) still verifies for a compute
-    /// job.
     pub fn verifies(request: &CiJobRuntimeAuthorityRequest, handle: &str) -> bool {
         if let Some(digest_hex) = handle.strip_prefix(CI_TOKEN_AUTHORITY_V4_HANDLE_PREFIX) {
             if request.checkout_commit.as_deref()
@@ -894,8 +726,6 @@ impl ManifestBoundCiJobTokenAuthority {
     }
 }
 
-/// Server policy for the supported V2 execution profiles. Resource limits, default-deny egress,
-/// batch scheduling, and fair-share identity are constants owned here—not plan fields.
 #[derive(Clone)]
 pub struct LinuxSmallV1LaunchAuthority {
     budget_reservations: Arc<dyn CiJobBudgetReservationProvider>,
@@ -984,11 +814,6 @@ fn limits_and_policy_for_profile(profile: CiExecutionProfileV1) -> CiExecutionPr
     }
 }
 
-/// The exact scheduler labels a runner must advertise to be eligible to CLAIM a job whose launch
-/// authority stamps `profile`. Single source of truth for the profile→label mapping, shared by the
-/// authority (which stamps a job's required labels) and the runner composition (which advertises the
-/// labels of the profiles a host is provisioned to serve). Claim eligibility is a subset test — a
-/// job's required labels must be ⊆ the runner's advertised set — so advertising a superset is safe.
 pub fn runner_labels_for_profile(profile: CiExecutionProfileV1) -> [&'static str; 2] {
     match profile {
         CiExecutionProfileV1::LinuxSmallV1 => LINUX_SMALL_V1_RUNNER_LABELS,
@@ -996,10 +821,6 @@ pub fn runner_labels_for_profile(profile: CiExecutionProfileV1) -> [&'static str
     }
 }
 
-/// The sorted, de-duplicated union of runner labels across `profiles` — the exact label set a runner
-/// host advertises when it is provisioned to serve those profiles. `linux` is shared across profiles
-/// and appears once. An empty `profiles` yields an empty set (a runner serving no profile claims
-/// nothing); callers that require at least one profile enforce that upstream.
 pub fn runner_labels_for_profiles(profiles: &[CiExecutionProfileV1]) -> Vec<String> {
     profiles
         .iter()
@@ -1130,9 +951,6 @@ fn launch_concurrency_group(
         ("pull_request", Some(group), None)
             if crate::ci_run_store::valid_pr_concurrency_group(group) =>
         {
-            // Rows written by the immediately preceding dispatcher during a rolling deploy do not
-            // have this additive column. They remain runnable but are permanently legacy-oldest;
-            // the run-supersession transaction must never let NULL cancel a positive generation.
             Ok(Some(group.to_owned()))
         }
         ("pull_request", _, _) => Err(refused(
@@ -1187,15 +1005,6 @@ fn hash_length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
 
 const CI_TOKEN_AUTHORITY_V2_DOMAIN: &[u8] = b"myelin.ci.token-authority.v2\0";
 
-/// CT-007 slice 5b.3-2b: the `v2` token-authority digest. A wholly SEPARATE encoder from
-/// [`token_authority_digest`] (Sol's review) — never a conditional variant of the shared
-/// [`runtime_authority_digest`] helper, which stays byte-frozen because it is ALSO used by the two
-/// budget-reservation domains ([`CI_OPERATIONAL_RESERVATION_V1_DOMAIN`],
-/// [`CI_OPERATIONAL_BATCH_V1_DOMAIN`]), which have no reason to know about checkout scope at all.
-/// Hashes every field the `v1` digest hashes, under a DIFFERENT domain separator (so a `v2` digest
-/// can never collide with a `v1` one even for a request with `checkout: None`), plus an explicit
-/// present/absent discriminator byte and — only when `Some` — the checkout scope's own canonical
-/// fields (tenant, repo ref, repo id, exact commit hex, object format).
 pub(crate) fn token_authority_digest_v2(request: &CiJobRuntimeAuthorityRequest) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(CI_TOKEN_AUTHORITY_V2_DOMAIN);
@@ -1244,9 +1053,6 @@ pub(crate) fn token_authority_digest_v2(request: &CiJobRuntimeAuthorityRequest) 
 
 const CI_TOKEN_AUTHORITY_V3_DOMAIN: &[u8] = b"myelin.ci.token-authority.v3\0";
 
-/// Task #91: the reserve-attested token-authority digest. This is a wholly separate encoder so the
-/// frozen v1/v2 byte streams cannot drift. It repeats v2's complete canonical encoding under a new
-/// domain, then appends an explicit reserve-id presence discriminator and the length-prefixed id.
 pub(crate) fn token_authority_digest_v3(request: &CiJobRuntimeAuthorityRequest) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(CI_TOKEN_AUTHORITY_V3_DOMAIN);
@@ -1304,10 +1110,6 @@ pub(crate) fn token_authority_digest_v3(request: &CiJobRuntimeAuthorityRequest) 
 
 const CI_TOKEN_AUTHORITY_V4_DOMAIN: &[u8] = b"myelin.ci.token-authority.v4\0";
 
-/// Slice #28: a separate v4 encoder preserves the complete v3 byte stream while adding an explicit
-/// exact-checkout-commit fact. The presence discriminator is load-bearing for rolling convergence:
-/// a historical v1/v2/v3 handle verifies only after reconstruction clears this post-generation
-/// field, while every newly materialized checkout authority carries `Some(exact commit)`.
 pub(crate) fn token_authority_digest_v4(request: &CiJobRuntimeAuthorityRequest) -> blake3::Hash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(CI_TOKEN_AUTHORITY_V4_DOMAIN);
@@ -1392,13 +1194,6 @@ fn linux_build_limits() -> CiManifestLimitsV1 {
     }
 }
 
-/// CT-007 slice 5b.3-2b: derive the checkout scope every job in `record`'s run shares (a `ci_run`'s
-/// `repo_ref`/`commit_oid` are per-RUN, not per-job — every `GrantedCiJobV1.workspace` this run's
-/// manifest ever builds copies the SAME pair, see `pg_pipeline_starter.rs`'s manifest-building code).
-/// Goes through [`derive_checkout_authorization_scope`] ONLY — never hand-parses `repo_ref`/
-/// `commit_oid` itself — so this authority-side derivation can never silently diverge from what
-/// `ci_manifest_job_runner.rs` does when it builds the real launched `JobSpec.workspace` from the
-/// identical two strings.
 fn checkout_scope_for_run(
     record: &CiRunRecord,
 ) -> Result<Option<CheckoutAuthorizationScope>, CiLaunchAuthorityError> {
@@ -1465,41 +1260,13 @@ fn refused(detail: &str) -> CiLaunchAuthorityError {
     CiLaunchAuthorityError(detail.into())
 }
 
-// =================================================================================================
-// CT-007 slice 5b.3-4a.1a — the `v2` operational-reservation budget authority (design locked with
-// Sol, 2026-07-29): pure calculator + digest-encoder machinery, NOT wired into any live reservation
-// path yet (5b.3-4a.1b activates it at `PgTierPCiJobBudgetReservation` materialization). `v1` stays
-// completely untouched — every function/constant above this section is byte-frozen.
-//
-// The core fact this machinery prices: a checkout-bearing parent attempt sequentially runs Hop A's
-// two nested git-wire executions (advertise-refs, fetch) plus Hop B's checkout-materialization run,
-// BEFORE the workload's own execution — four sequential executions total, each independently
-// enforcing the SAME `spec.limits` ceiling (Sol's review: peak resources stay one container's
-// limits since the four are sequential, never concurrent; metered resource-TIME is additive across
-// them). The existing `v1` single-workload reservation has no concept of this and must not be
-// reinterpreted to cover it — `v2` adds a separate, ADDITIVE parent-attempt budget instead of
-// dividing the existing per-container ceiling four ways (which would silently weaken every
-// individual execution's own timeout/resource allowance).
-// =================================================================================================
-
-/// Named execution counts within one checkout-bearing parent attempt — never a bare `4` scattered
-/// through the ceiling math. Hop A's two nested git-wire executions (advertise-refs, fetch) plus Hop
-/// B's one checkout-materialization run, additive with the workload's own one execution.
 const CHECKOUT_TRANSPORT_EXECUTIONS: u64 = 2;
 const CHECKOUT_MATERIALIZATION_EXECUTIONS: u64 = 1;
 const WORKLOAD_EXECUTIONS: u64 = 1;
 
 const CI_OPERATIONAL_RESERVATION_V2_DOMAIN: &[u8] = b"myelin.ci.operational-reservation.v2\0";
-/// CT-007 slice 5b.3-4a.1b: the `v2` sibling of [`CI_OPERATIONAL_BATCH_V1_DOMAIN`], used by
-/// [`operational_batch_digest_v2`] so a `v2` batch's aggregate digest can never collide with a `v1`
-/// batch's, even over an identical set of per-request digests.
 const CI_OPERATIONAL_BATCH_V2_DOMAIN: &[u8] = b"myelin.ci.operational-reservation-batch.v2\0";
 
-/// The revision of the attempt-budget CALCULATION topology/algorithm a `v2` reservation was priced
-/// under — distinct from [`CiAttemptBudgetPolicy::max_parent_attempts`] (a policy VALUE), this
-/// identifies HOW ceilings combine (how many executions per phase, how they're aggregated). Hashed
-/// separately into the `v2` digest so a future topology change (e.g. Hop B splitting into two
-/// executions) can never silently collide with today's `V1` revision's handles.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiAttemptBudgetRevision {
     V1,
@@ -1512,18 +1279,12 @@ impl CiAttemptBudgetRevision {
         }
     }
 
-    /// The plain-text segment embedded in a durable `v2` handle (CT-007 slice 5b.3-4a.1b) so a
-    /// reader can recover which topology revision priced an already-durable row without trusting
-    /// the provider's CURRENTLY configured revision -- an old row must replay under the revision it
-    /// was actually written with, even if production has since moved on.
     fn handle_tag(self) -> &'static str {
         match self {
             CiAttemptBudgetRevision::V1 => "budget-v1",
         }
     }
 
-    /// The inverse of [`Self::handle_tag`]. Returns `None` for anything not durably minted by this
-    /// binary's known revisions -- an unrecognized tag must refuse replay, never guess.
     fn from_handle_tag(tag: &str) -> Option<Self> {
         match tag {
             "budget-v1" => Some(CiAttemptBudgetRevision::V1),
@@ -1532,18 +1293,6 @@ impl CiAttemptBudgetRevision {
     }
 }
 
-/// The durable policy governing how many times one job may be attempted before its `v2`
-/// reservation's upper bound is exhausted. Sol's round-2 review: a "parent attempt" is counted from
-/// a durably-begun claim generation — before Hop A for a checkout-bearing job, or before workload
-/// launch itself for a compute job (which has no Hop A/B preparation at all, yet still receives the
-/// SAME 5-attempt `v2` ceiling — this cap counts attempts at the job, not at checkout preparation
-/// specifically). CT-007 slice 5b.3-4a.2 must enforce this cap for BOTH shapes.
-///
-/// `max_parent_attempts` is a deliberate, REVISABLE policy value (CT-007 slice 5b.3-4, default `5`
-/// — chosen 2026-07-29 as a cost/reliability trade-off, not derived from any technical constraint;
-/// mirrors the same house convention as [`TIER_P_OPERATIONAL_ACTIVE_RESERVATION_CEILING`]). A
-/// provider must STORE this explicitly (never re-derive it ad hoc) so every request it prices agrees
-/// on the same policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CiAttemptBudgetPolicy {
     revision: CiAttemptBudgetRevision,
@@ -1551,7 +1300,6 @@ pub struct CiAttemptBudgetPolicy {
 }
 
 impl CiAttemptBudgetPolicy {
-    /// The production default: revision `V1`, 5 attempts.
     pub fn production() -> Self {
         Self {
             revision: CiAttemptBudgetRevision::V1,
@@ -1559,7 +1307,6 @@ impl CiAttemptBudgetPolicy {
         }
     }
 
-    /// A checked constructor for tests and future non-default compositions.
     pub fn new(revision: CiAttemptBudgetRevision, max_parent_attempts: NonZeroU32) -> Self {
         Self {
             revision,
@@ -1576,28 +1323,12 @@ impl CiAttemptBudgetPolicy {
     }
 }
 
-/// CT-007 slice 5b.3-4a.1c: which reservation version a provider mints for a genuinely FRESH batch
-/// (one with no durable rows for its run yet). This is orthogonal to [`CiAttemptBudgetPolicy`] --
-/// that describes the `v2` AMOUNT topology; this describes whether fresh writes use it at all.
-///
-/// Sol's review: a committed 4a.1c binary is safe to write `v2` ONLY once every reader in the fleet
-/// already understands `v2` (i.e. every binary has 5b.3-4a.1b's compatibility reads). A preceding
-/// commit alone does not guarantee that during a rolling deployment -- an old binary mid-rollout
-/// still cannot discover or count `v2` rows. Production MUST stay on `V1` until fleet convergence is
-/// separately confirmed and this is deliberately flipped; existing durable rows always replay under
-/// whichever version they were actually written with regardless of this setting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OperationalReservationWriteVersion {
     V1,
     V2,
 }
 
-/// Raw, unpriced resource-seconds — CPU-seconds and memory-byte-seconds kept SEPARATE (Sol's
-/// review: "aggregate raw dimensions first, price once"). Distinct from `v1`'s
-/// [`operational_reservation_amount`], which combines cpu-seconds + memory-GiB-seconds into one
-/// already-converted `i64` at the very first step — `v2`'s math instead stays in raw dimensions
-/// through every intermediate aggregation, converting to operational units exactly once, at the end
-/// ([`operational_reservation_amount_v2`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ResourceCeiling {
     cpu_seconds: u64,
@@ -1619,10 +1350,6 @@ impl ResourceCeiling {
     }
 }
 
-/// The raw resource-seconds ceiling for ONE execution at `limits` — checked arithmetic, kept in raw
-/// dimensions (never combined/converted here). Mirrors `v1`'s [`operational_reservation_amount`]
-/// CPU/memory formulas exactly (same inputs, same validation), but returns the two dimensions
-/// separately instead of one pre-converted `i64`.
 fn raw_execution_ceiling(
     limits: &CiManifestLimitsV1,
 ) -> Result<ResourceCeiling, CiLaunchAuthorityError> {
@@ -1653,8 +1380,6 @@ fn raw_execution_ceiling(
     })
 }
 
-/// Raw ceiling for one sandbox execution, exposed only to the prelaunch journal so it can derive
-/// phase ceilings from the same checked arithmetic used by the v2 reservation.
 pub(crate) fn raw_execution_usage_ceiling(
     request: &CiJobRuntimeAuthorityRequest,
 ) -> Result<ResourceUsage, CiLaunchAuthorityError> {
@@ -1665,10 +1390,6 @@ pub(crate) fn raw_execution_usage_ceiling(
     })
 }
 
-/// One parent attempt's total raw ceiling: the workload alone for a compute job, or Hop A (2
-/// executions) + Hop B (1) + the workload (1) for a checkout-bearing job. Checkout presence is
-/// derived ONLY from `request.checkout` (Sol's review: never a caller-supplied bool, which could
-/// disagree with the authority request and under-reserve it).
 fn parent_attempt_ceiling(
     request: &CiJobRuntimeAuthorityRequest,
 ) -> Result<ResourceCeiling, CiLaunchAuthorityError> {
@@ -1681,8 +1402,6 @@ fn parent_attempt_ceiling(
     one_execution.checked_mul(executions)
 }
 
-/// The complete raw ceiling a job may durably accrue across every parent attempt its budget policy
-/// allows — [`parent_attempt_ceiling`] times `policy.max_parent_attempts`, checked.
 fn job_lifetime_ceiling(
     request: &CiJobRuntimeAuthorityRequest,
     policy: &CiAttemptBudgetPolicy,
@@ -1691,24 +1410,9 @@ fn job_lifetime_ceiling(
     per_attempt.checked_mul(u64::from(policy.max_parent_attempts.get()))
 }
 
-/// The final conversion from a raw [`ResourceCeiling`] to the maximum micro-USD COST — `cpu_seconds
-/// × MICRO_USD_PER_CPU_SECOND + ceil(mem_byte_seconds / GiB) × MICRO_USD_PER_GB_SECOND`, checked.
-/// Prices each dimension at the same per-second rate [`TierPOperationalCiJobPricer`] settles at, so
-/// a job's `v2` reservation is a true upper bound on its eventual settlement price and the settle
-/// cap only refunds unused headroom. The cost multiply is done in `u128` (a `u64`-derived ceiling
-/// can never overflow it), so the final `i64` range check is the boundary that fires for an
-/// out-of-range ceiling.
 fn operational_amount_from_ceiling(
     ceiling: ResourceCeiling,
 ) -> Result<i64, CiLaunchAuthorityError> {
-    // UPPER-BOUND PRECONDITION: this `div_ceil` is applied ONCE to the aggregate (lifetime)
-    // mem-byte-seconds, while settlement may `div_ceil` per execution. The aggregate rounding is a
-    // valid upper bound on the per-execution sum ONLY while each per-execution memory ceiling is a
-    // whole-GiB multiple (true for all server-owned limits today: linux_small = 256MiB×600 = 150
-    // GiB-s exactly). If a future limit sets a non-whole-GiB `mem_bytes × timeout_secs`, aggregate
-    // `div_ceil` could dip below Σ per-execution `div_ceil` by up to (N−1) GiB-s, re-opening a small
-    // under-reserve. Slice 4 (CI reserve/settle wiring) must add a v2 reserved≥price regression test
-    // and either enforce whole-GiB ceilings or `div_ceil` per execution before aggregating.
     let memory_gib_seconds = ceiling.mem_byte_seconds.div_ceil(GIB_BYTES);
     let cpu_cost = u128::from(ceiling.cpu_seconds)
         .checked_mul(u128::from(MICRO_USD_PER_CPU_SECOND))
@@ -1722,8 +1426,6 @@ fn operational_amount_from_ceiling(
     i64::try_from(total).map_err(|_| refused("operational v2 reservation exceeds durable range"))
 }
 
-/// `v2`'s final conversion to operational units — aggregate raw dimensions first
-/// ([`job_lifetime_ceiling`]), convert exactly once via [`operational_amount_from_ceiling`].
 fn operational_reservation_amount_v2(
     request: &CiJobRuntimeAuthorityRequest,
     policy: &CiAttemptBudgetPolicy,
@@ -1732,18 +1434,6 @@ fn operational_reservation_amount_v2(
     operational_amount_from_ceiling(ceiling)
 }
 
-/// The `v2` operational-reservation digest — a wholly SEPARATE encoder from
-/// [`runtime_authority_digest`] (which stays byte-frozen; it is ALSO shared by the `v1` batch
-/// domain, which has no reason to know about checkout scope, budget policy, or ceilings at all).
-/// Mirrors [`token_authority_digest_v2`]'s checkout-hashing pattern exactly (same present/absent
-/// discriminator + canonical fields), and additionally binds the budget-policy revision,
-/// `max_parent_attempts`, and the resulting per-attempt/lifetime raw ceilings — so two jobs with
-/// identical limits and checkout-presence, but a different budget policy (or a future topology
-/// revision), can NEVER collide on the same `v2` handle, even if their reservation AMOUNT happens to
-/// coincide. Sol's round-2 review: derives `per_attempt`/`lifetime` INTERNALLY from `request`/
-/// `policy` rather than accepting them as caller-supplied parameters — no authority encoder may
-/// accept independently forgeable derived facts; a caller could otherwise pass ceilings that
-/// disagree with the request/policy they claim to describe.
 fn operational_reservation_digest_v2(
     request: &CiJobRuntimeAuthorityRequest,
     policy: &CiAttemptBudgetPolicy,
@@ -1854,11 +1544,6 @@ mod tests {
         LinuxSmallV1LaunchAuthority::new(budget)
     }
 
-    // =============================================================================================
-    // CT-007 slice 5b.3-4a.1a — the `v2` operational-reservation budget authority. Pure
-    // calculator/digest-encoder tests only; nothing here is wired into any live reservation path yet
-    // (5b.3-4a.1b).
-    // =============================================================================================
     mod v2_budget_authority_5b3_4a1a {
         use super::*;
 
@@ -1901,8 +1586,6 @@ mod tests {
 
         #[test]
         fn v1_amount_is_the_max_micro_usd_cost() {
-            // unified-wallet slice 2b: the v1 reservation is now the maximum micro-USD cost (raw
-            // 750 operational units × the 10_000 µUSD/second settlement rate), not raw capacity units.
             assert_eq!(
                 operational_reservation_amount(&linux_small_limits()).unwrap(),
                 7_500_000
@@ -1911,10 +1594,6 @@ mod tests {
 
         #[test]
         fn golden_v1_digest_for_a_fixed_request_is_pinned() {
-            // Frozen hard-coded v1 handle-digest vector (Sol's round-4a.1a review): proves this
-            // slice's additions never touch `runtime_authority_digest`/`CI_OPERATIONAL_RESERVATION_V1_DOMAIN`
-            // byte-for-byte, computed once and pasted as a literal (never compared via the same
-            // function under test).
             let request = v2_request(None);
             let digest = runtime_authority_digest(CI_OPERATIONAL_RESERVATION_V1_DOMAIN, &request);
             assert_eq!(
@@ -1954,7 +1633,6 @@ mod tests {
             let lifetime = job_lifetime_ceiling(&request, &policy).unwrap();
             assert_eq!(lifetime.cpu_seconds, 3_000);
             assert_eq!(lifetime.mem_byte_seconds, 805_306_368_000);
-            // slice 2b: max micro-USD cost = raw 3_750 operational units × 10_000 µUSD/second.
             assert_eq!(
                 operational_reservation_amount_v2(&request, &policy).unwrap(),
                 37_500_000
@@ -1968,7 +1646,6 @@ mod tests {
             let lifetime = job_lifetime_ceiling(&request, &policy).unwrap();
             assert_eq!(lifetime.cpu_seconds, 12_000);
             assert_eq!(lifetime.mem_byte_seconds, 3_221_225_472_000);
-            // slice 2b: max micro-USD cost = raw 15_000 operational units × 10_000 µUSD/second.
             assert_eq!(
                 operational_reservation_amount_v2(&request, &policy).unwrap(),
                 150_000_000
@@ -2079,10 +1756,8 @@ mod tests {
 
         #[test]
         fn job_lifetime_ceiling_overflow_refuses_loudly() {
-            // A large-but-individually-valid raw ceiling whose CHECKOUT parent-attempt (x4) times
-            // the production policy's max_parent_attempts (x5) overflows u64 mem-byte-seconds.
             let mut limits = linux_small_limits();
-            limits.mem_bytes = u64::MAX / 15; // *4 (checkout) *5 (max_attempts) = *20 > u64::MAX
+            limits.mem_bytes = u64::MAX / 15;
             limits.timeout_secs = 1;
             let request = v2_request(Some(checkout_scope_fixture()));
             let mut request = request;
@@ -2094,10 +1769,6 @@ mod tests {
 
         #[test]
         fn operational_amount_from_ceiling_huge_cpu_exceeds_i64_after_scaling() {
-            // Before slice 2b this triggered a u64 `checked_add` overflow. Now the micro-USD cost
-            // conversion runs in u128, which a u64-derived ceiling can never overflow (u64::MAX ×
-            // 10_000 ≪ u128::MAX), so the final i64 range check is the guard that fires — a distinct
-            // message ("exceeds"), same fail-closed refusal.
             let ceiling = ResourceCeiling {
                 cpu_seconds: u64::MAX,
                 mem_byte_seconds: GIB_BYTES,
@@ -2108,8 +1779,6 @@ mod tests {
 
         #[test]
         fn operational_amount_from_ceiling_exceeding_i64_range_refuses_loudly() {
-            // A total that fits comfortably in u64 (no checked_add overflow) but exceeds i64::MAX --
-            // a DISTINCT failure mode from the checked_add overflow above.
             let ceiling = ResourceCeiling {
                 cpu_seconds: i64::MAX as u64 + 100,
                 mem_byte_seconds: 0,
@@ -2119,12 +1788,6 @@ mod tests {
         }
     }
 
-    /// CT-007 slice 5b.3-4a.1b: dual-version replay-compatibility tests. `resolve_durable_replay`
-    /// and `replay_v2_batch` are pure, synchronous, in-memory decision functions -- no database
-    /// required -- so every branch (exact v1/v2 replay, mixed-version refusal, tampered/partial
-    /// divergence, policy-descriptor disagreement, replay surviving a provider reconfiguration) is
-    /// covered here directly. Live-database coverage (active-ceiling counting across both prefixes,
-    /// a real INSERT/SELECT round trip) lives in `tests/integration_ci_operational_reservation.rs`.
     mod handle_replay_5b3_4a1b {
         use super::*;
 
@@ -2269,9 +1932,6 @@ mod tests {
                 .iter()
                 .map(|candidate| (candidate.handle.clone(), candidate.amount))
                 .collect();
-            // Flip the trailing hex character of the first row's digest suffix. It still PARSES
-            // (the revision/attempts tags are untouched) but no longer matches any recomputed
-            // candidate's handle string.
             let mut chars: Vec<char> = rows[0].0.chars().collect();
             let last = chars.len() - 1;
             chars[last] = if chars[last] == '0' { '1' } else { '0' };
@@ -2328,11 +1988,6 @@ mod tests {
 
         #[test]
         fn v2_batch_replays_correctly_under_a_non_default_written_policy() {
-            // The durable rows were minted under a NON-default policy (3 attempts). Replay must
-            // recover that from the rows' own embedded descriptor -- `prepared` carries no policy
-            // at all any more (Sol's round-2 review: `prepare_operational_batch` must never touch
-            // `v2` arithmetic eagerly), so there is nothing here for replay to fall back to except
-            // what it parses from the durable handles themselves.
             let requests = fixture_batch();
             let written_policy = CiAttemptBudgetPolicy::new(
                 CiAttemptBudgetRevision::V1,
@@ -2358,13 +2013,6 @@ mod tests {
 
         #[test]
         fn fresh_v1_preparation_succeeds_even_when_a_v2_calculation_would_overflow() {
-            // Sol's round-2 review: an earlier draft eagerly computed a v2 candidate inside
-            // `prepare_operational_batch` under the provider's current policy, so a fresh v1 write
-            // could fail purely because unused v2 ceiling arithmetic overflowed. `limits` below is
-            // exactly the fixture the existing `job_lifetime_ceiling_overflow_refuses_loudly` test
-            // uses to trigger that v2 overflow under the checkout-4x times production's 5-attempt
-            // multiplier (mem_bytes = u64::MAX / 15, so 20x overflows u64) -- proving v1 preparation
-            // never even evaluates that arithmetic.
             let mut request = fixture_request("88888888-8888-8888-8888-888888888881");
             request.limits.mem_bytes = u64::MAX / 15;
             request.limits.timeout_secs = 1;
@@ -2402,10 +2050,6 @@ mod tests {
 
         #[test]
         fn exact_v2_replay_succeeds_under_a_safe_written_policy_when_production_would_overflow() {
-            // Same overflow-triggering limits as above, but replayed as a v2 batch written under a
-            // SAFE (1-attempt) policy instead of production's 5-attempt one. Proves replay recomputes
-            // strictly under the policy parsed from the durable rows -- never under
-            // `CiAttemptBudgetPolicy::production()`, which this test never even hands to replay.
             let mut request = fixture_request("88888888-8888-8888-8888-888888888881");
             request.limits.mem_bytes = u64::MAX / 15;
             request.limits.timeout_secs = 1;
@@ -2448,8 +2092,6 @@ mod tests {
 
         #[test]
         fn partial_v2_batch_refuses() {
-            // One durable row for a two-job batch: the module's design narrative promises "partial
-            // divergence" refuses, but nothing previously exercised it directly for v2.
             let requests = fixture_batch();
             let policy = CiAttemptBudgetPolicy::production();
             let candidates = build_v2_candidates(&requests, &policy).unwrap();
@@ -2464,15 +2106,6 @@ mod tests {
 
         #[test]
         fn golden_v2_batch_digest_for_a_fixed_two_job_batch_is_pinned() {
-            // External golden vector (Sol's round-2 review): the per-request
-            // `operational_reservation_digest_v2` is already pinned by the 4a.1a goldens, but the
-            // BATCH framing (domain, cardinality, ordering, amount) is new to this slice and was
-            // previously only exercised by generating expectations through `build_v2_candidates`
-            // itself -- a tautology. These are computed once and pasted as literals (never compared
-            // via the same function under test). unified-wallet slice 2b: the amount is now the
-            // max micro-USD cost (3_750 × 10_000 = 37_500_000), which the BATCH digest hashes — so
-            // the batch-digest segment of each handle changed accordingly (the per-request digest
-            // segment, which does NOT hash the amount, is unchanged). Recomputed by running the test.
             let requests = fixture_batch();
             let policy = CiAttemptBudgetPolicy::production();
             let candidates = build_v2_candidates(&requests, &policy).unwrap();
@@ -2658,9 +2291,6 @@ mod tests {
         assert_eq!(priced.memory_wholesale, MicroUsd(1_500_000));
         assert_eq!(priced.cpu_markup, MicroUsd::ZERO);
         assert_eq!(priced.memory_markup, MicroUsd::ZERO);
-        // slice 2b: the reservation now shares the pricer's micro-USD scale — raw 750 operational
-        // units × 10_000 µUSD/second. (Pricer above: 6_000_000 + 1_500_000 = 7_500_000 for the same
-        // linux-small ceiling, so bound == max price.)
         assert_eq!(
             operational_reservation_amount(&linux_small_limits()).unwrap(),
             7_500_000
@@ -2677,20 +2307,12 @@ mod tests {
         );
     }
 
-    /// unified-wallet slice 2b regression: the durable settle cap
-    /// (`reserve_settle_durable`: `billed_capped = min(billed, reserved)`) must never clamp a
-    /// within-limits job's real settlement price DOWN — that is a silent under-bill. Slice 2 priced
-    /// Tier-P settlement in micro-USD (×10_000); this test proves the reservation ceiling is in the
-    /// SAME unit and is a true upper bound on the price, so the cap only ever refunds genuine unused
-    /// headroom. It asserts the billing invariant directly and depends on NO golden hash value.
     #[test]
     fn v1_reservation_ceiling_is_an_upper_bound_on_the_tier_p_settlement_price() {
         let limits = linux_small_limits();
         let reserved = operational_reservation_amount(&limits).unwrap();
         assert_eq!(reserved, 7_500_000, "linux-small v1 reservation, in micro-USD");
 
-        // The most a single within-limits execution can settle to: its raw resource-second ceiling,
-        // priced by the exact pricer the durable settle uses.
         let ceiling = raw_execution_ceiling(&limits).unwrap();
         let priced = TierPOperationalCiJobPricer
             .price(ResourceUsage {
@@ -2705,7 +2327,7 @@ mod tests {
 
         assert!(
             reserved as u64 >= price,
-            "reservation {reserved} must be a valid upper bound on the settlement price {price} — \
+            "reservation {reserved} must be a valid upper bound on the settlement price {price} - \
              otherwise the settle cap under-bills a within-limits job"
         );
         assert_eq!(

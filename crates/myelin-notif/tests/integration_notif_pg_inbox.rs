@@ -1,4 +1,3 @@
-//! Live-PostgreSQL proof for the durable notification inbox repository.
 #![cfg(feature = "integration")]
 
 use std::collections::HashSet;
@@ -296,8 +295,6 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
         .unwrap();
     assert!(foreign.items.is_empty(), "recipient scope is exact");
 
-    // A fresh repository value over the same pool sees the committed rows: the inbox truth is in
-    // PostgreSQL, not in process memory, and remains readable after composition is rebuilt.
     let after_rebuild = PgInboxStore::new(app)
         .list(&InboxReadRequest {
             scope,

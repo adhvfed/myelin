@@ -5,30 +5,7 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-issues is a CONSUMER SUBSYSTEM crate (the most cross-subsystem-coupled of the five —
-# architecture issue-tracker 00-overview §1), NOT a node in the eleven-crate library DAG modelled
-# by `myelin-substrate::crate_graph` (architecture 00 §2.9). Like the other subsystem/service
-# crates (myelin-git, myelin-identity-service, myelin-gdpr-service) it is a LEAF CONSUMER above the
-# shared glue crates: it depends on the frozen contract surfaces (identity NamespaceFragment +
-# Principal, gdpr PersonalDataHolder + the #[personal_data] classify-derive, tenancy partition keys)
-# and NOTHING in the production library DAG depends back on it. `substrate_is_root()` /
-# `identity_is_sink()` in crate_graph.rs are preserved (a subsystem crate is the graph's terminal
-# consumer, OUTSIDE the modelled DAG).
-#
-# At ISS-P01 (P-125 / M1) this crate carries ONLY the M1 "freeze-so-dependents-compile" slice
-# (issue-tracker roadmap §3.0): the frozen Issues ReBAC namespace fragment (contract 4.9 — the
-# `issue` namespace + the `- confidential` set-difference userset + `watcher` + the field/transition
-# ABAC sub-objects) Identity compiles into the one cell schema, PLUS the H-Issues holder INTENT +
-# the #[personal_data(...)] classification tags on the skeletal issue schema (contract 10.2 — incl.
-# the OQ-H worklog/productivity behavioural tags) so the no-untagged-personal-data lint (contract
-# 1.6) is GREEN from the first migration (ISS-P05). No Issues FEATURE ships here — the holder is
-# OPENED + auto-registered by serve when the store opens in ISS-P07.
 [[bin]]
-# ISS-P05 (P-371, M4): the Issue Tracker service is a `serve(AppSpec)` shell (contract 1.1) — this
-# binary is the "every service main.rs" the row names: it does nothing but hand the Issues AppSpec to
-# the harness's one call (NOT a hand-rolled lifecycle). The library carries the shell builder
-# (`issues_app_spec` / `run_issues`), the COMPLETE forward-only issue-spine migrations, and the
-# auto-registered H3 PersonalDataHolder.
 name = "issues"
 path = "src/main.rs"
 
@@ -36,202 +13,36 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
-# ISS-P05 (P-371, M4): the substrate serve(AppSpec) harness (contract 1.1/1.2/1.3): the three-surface
-# split, liveness ≠ readiness, the forward-only migration runner + the HotTables declaration, the
-# holder auto-registry (contract 1.4). The Issues service is an AppSpec, not a hand-rolled main. A
-# leaf-consumer edge onto the substrate (the same edge every service shell carries); nothing in the
-# production DAG depends back on myelin-issues. The CREATE-TABLE DDL stays `&str` the runner admits
-# DB-free; the live forward-only apply is behind the `integration` feature only.
 myelin-substrate = { path = "../myelin-substrate" }
-# The frozen Identity contract surface: the names-only `NamespaceFragment` ABI carrier Identity
-# admits into the cell schema (contract 4.9) + Principal (the verified subject the holder keys on).
-# A consumer LEAF depending on the identity GLUE crate (not the service) keeps the §2.9 DAG acyclic.
 myelin-identity = { path = "../myelin-identity" }
-# The GDPR contract surface: contract 10.1 PersonalDataHolder + contract 10.2 the #[personal_data]
-# classify-derive + the five frozen tag enums. Consumed (the H-Issues INTENT + the schema tags), not
-# provided here.
 myelin-gdpr = { path = "../myelin-gdpr" }
-# The canonical (tenant, region) partition keys threaded through every issue schema row + ArtifactRef.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# The frozen shared QUERY core (contract 13.3, X-3): the FieldType enum + the ViewSpec view-model +
-# the QueryAst grammar + the order_key/LexoRank codec. Issues CO-OWNS this crate with Knowledge
-# (ADR-06): it LINKS the frozen definitions directly — *the same bytes* Knowledge uses, never a
-# re-implementation (architecture issue-tracker 01-tech-and-data-model §1 + §3). Issues owns its OWN
-# AST→store compiler (ISS-P13) ON TOP of these shared shapes; the DEFINITIONS are byte-identical and
-# live here, linked. The byte-identity drift-killer (tests/cdc_13_3_issues_coown.rs) replays the
-# shared CONFORMANCE_VECTOR + serializes the shared ViewSpec from the Issues side and asserts 0 byte
-# differences vs Knowledge's frozen outputs.
 myelin-query = { path = "../myelin-query" }
-# ISS-P10 (P-376, M4): the FROZEN `myelin-content` block + inline taxonomy (contract 13.1, X-2/OQ-B).
-# The issue body + comments are a `myelin-content` block SUBTREE — the consumed Issues SUBSET (the
-# block set MINUS the Knowledge-only `db_view`/`sync_block`/`toggle`) + the three structured inline
-# ref nodes. Issues LINKS the frozen `Block`/`Inline` types + the ONE WASM render path
-# (`parse_inline`/`serialize_inline`, the SAME code compiled native + wasm32) — it defines NO second
-# content model and NO second renderer (EI-01 §7; the two-divergent-renderers trap is eliminated
-# structurally). DAG-safe: Issues is a terminal LEAF consumer; `myelin-content` is a mid-tier freeze
-# crate depending only on tenancy/events/identity/query (never back on Issues — no cycle), the SAME
-# leaf edge git/search/refs-service/notif/knowledge already carry (00 §2.9).
 myelin-content = { path = "../myelin-content" }
-# The frozen Bus event grammar (contract 2.9) + the EventEnvelope unit anchor (contract 2.1). Issues
-# REGISTERS its complete `issue.*` taxonomy AGAINST this grammar (ISS-P03 / P-242) — `events.rs`
-# below calls the ONE Bus validator (`myelin_events::validate_event_type`); there is no second token
-# language and Issues does NOT author the grammar (EI-01 §7). The `initiative` type token is already
-# in the Bus seed (recon §2); Issues completes the `issue.*`/`initiative.*` event-name list here.
 myelin-events = { path = "../myelin-events" }
-# The frozen Search-owned `declare_indexable` surface (contract 6.3): the `IndexSpec` shape Issues
-# CONSTRUCTS its `issue.*` facets projection against + the `IncrementalIndexer` admission seam that
-# ACCEPTS the registration (the build-time gate). Issues does NOT define a second indexing-contract
-# shape — it links the ONE frozen `myelin_search::IndexSpec` (EI-01 §7). The live emitter
-# (`issue.*` Search projection rows) lands in ISS-P17; here the DECLARATION is the deliverable.
 myelin-search = { path = "../myelin-search" }
-# The frozen Notif-owned `define_notif_rule` surface (contract 7.6): the `NotifRule`/`Reason`/`Class`
-# shapes + the `NotifRuleRegistry::register` inverse-signal seam. Issues registers its reason set
-# (SLA at-risk / unblocked / approval-requested) against the ONE Notif ranking table — never a second
-# reason vocabulary (EI-01 §1/§7). The live notif wiring ("My Work" inbox routing) lands in ISS-P22;
-# here the DECLARATION is the deliverable.
 myelin-notif = { path = "../myelin-notif" }
-# ISS-P07 (P-373, M4): the FROZEN per-subject-DEK at-rest encryption surface (contract 11.4 / GD-4).
-# Issues' free-text title/props/change-delta columns are sealed with the per-subject DEK through the
-# ONE shared `myelin_storage::encryption::ColumnCryptor` over the P-058 `KmsEngine` (the SAME engine
-# rotation/crypto-shred reach by construction) — Issues defines NO second cryptor and NO parallel key
-# store (EI-01 §7). `key_class_for` routes the `#[personal_data(erasure = CryptoShred(subject_dek))]`
-# tag to a `KeyClass::Subject` DEK; a wrong/missing subject is a LOUD `KeyChoiceError`, never a silent
-# tenant-key downgrade. `myelin-storage` is a SHARED GLUE crate with no edge back to a subsystem (the
-# §2.9 DAG stays acyclic — the same regular edge `myelin-git`/`myelin-ci-controlplane` carry). The
-# DB-free in-memory `KmsEngine::new()` keeps `cargo build --workspace` DB-free; the live-stack DEK
-# round-trip is the `integration`-feature proof (tests/integration_iss_p07_subject_dek.rs).
 myelin-storage = { path = "../myelin-storage" }
-# ISS-P17 (P-383, M4): the ONE Refs codec (contract 5.1/5.7) — `parse`/`format`/`mint`/`strip_sub`/
-# `sub_kind` over the frozen `ArtifactRef` + the unified `#sub` grammar. The Issues Refs wiring
-# (`project(ref,viewer)` + the `#sub` mints + the inline-node `refs.edge.created` producer + the TE-7
-# mirror + the bounded traverse) mints/strips/classifies through THIS — Issues never re-implements URN
-# handling (REF-3 / EI-01 §7). A consumer LEAF edge onto the refs GLUE crate (the SAME edge
-# `myelin-git`/`myelin-ci-controlplane`/`myelin-knowledge` already carry — never the refs SERVICE
-# crate, so the §2.9 DAG stays acyclic). Promoted from a dev-dependency: the Refs glue now ships at
-# RUNTIME, not just in the declares CDC.
 myelin-refs = { path = "../myelin-refs" }
 serde.workspace = true
 serde_json.workspace = true
-# ISS-P32 (P-495, M5): the move-CRDT measured floor follow-on (R-3 / arch 05 §5 "Floor → follow-on").
-# The Yrs CRDT is the CITED convergent structure (VISION §4 — never a hand-rolled merge) the move-CRDT
-# promotion of the ISS-P09 server-arbitrated-CAS ranking floor slots into, reusing the BYTE-IDENTICAL
-# `order_key` (the promotion swaps the conflict-resolution ENGINE, not the data model — arch §5). This
-# is the SAME `yrs` crate Knowledge's `yrs_engine` (KN-P29 / P-484) uses for its block move-CRDT — the
-# cited structure is shared, NOT the `myelin-knowledge` subsystem crate (a subsystem→subsystem edge
-# would break the §2.9 leaf-consumer DAG). Issues links the `yrs` external crate directly, mirroring
-# Knowledge's pattern over the shared cited type. Promoted ONLY on a MEASURED concurrent-reorder
-# trigger (`move_crdt::ReorderPressure`) — the CAS floor stands until the measurement fires.
 yrs = { workspace = true }
 
-# ------------------------------------------------------------------------------------------
-# ISS-P05 (P-371): REAL live-stack schema apply behind the `integration` feature. The complete
-# issue-spine data-model migration gets PROVEN against the live dev-stack Postgres (forward-only
-# apply + RLS isolation + the FK + the hot-path indexes) in tests/integration_iss_p05_spine_schema.rs.
-# The OPTIONAL sqlx + tokio deps are pulled ONLY by `--features integration` — the default
-# `cargo build`/`cargo test --workspace` stay DB-free. EXTERNAL crates only; no new myelin edge. The
-# test reads DATABASE_URL inline (no myelin-config edge — same posture as ci-controlplane/refs).
-# ------------------------------------------------------------------------------------------
-# R4.4: the production Issues OLTP store is always compiled and binds through
-# `SubstrateProvider::with_tenant_tx`; sqlx is no longer test-only. Connecting still happens only at
-# runtime, so ordinary builds remain DB-free.
 sqlx = { workspace = true }
-# MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
-# foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
-# (the Wave-2 identity-service posture), so `tokio` (the multi-thread runtime the sync→async
-# bridge requires) + `myelin-config` (the env-first durable config, fail-loud) are now regular
-# deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
 tokio = { workspace = true, features = ["signal"] }
 myelin-config = { path = "../myelin-config" }
 
-# DEV-ONLY: the rich ReBAC namespace ENGINE (FragmentDef / Userset / StoreBackedCheck) lives in the
-# Identity SERVICE crate. The runtime Issues fragment is the names-only `myelin_identity::Namespace-
-# Fragment` ABI carrier (above) — a consumer subsystem never depends on a service crate at runtime
-# (the §2.9 DAG stays acyclic). The contract-4.9 CDC pair (tests/cdc_4_9_issues_fragment.rs) needs
-# the real engine to PROVE the Issues fragment admits + that the `- confidential` set-difference
-# userset resolves LEAK-FREE (a confidential issue is absent from view for a non-grantee) — so the
-# engine is a dev-dependency (test scaffolding only — no runtime edge). EI-01 §7: prove against the
-# frozen engine, never re-define it.
 [dev-dependencies]
-# MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
-# targets (the `src/e2e_flagship/tests.rs` + `src/dogfood.rs` unit tests + `tests/e2e_flagship_iss_p35.rs`
-# + `tests/iss_p37_dogfood_drill.rs`) that call the now-gated dogfood/agent-flagship drills. The
-# sanctioned Cargo idiom; it does NOT affect the normal `cargo build`.
 myelin-issues = { path = ".", features = ["test-support"] }
-# MR-009b Wave 3 follow-up (found by the Wave-5 per-crate isolation check, the 5340c47 bug class):
-# this crate's OWN tests (drill_iss_p06_emit_iff_committed / drill_iss_d5_reorder_zero_clobber)
-# construct the events in-memory `DedupLedger::new()` double, which is
-# `#[cfg(any(test, feature = "test-support"))]` as of Wave 3 — the workspace build masked the
-# missing feature via unification; the isolated `cargo clippy -p myelin-issues --all-targets`
-# catches it. DEV-only.
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
-# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
-# production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
-# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
-# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-# ISS-P35 (P-498, M5): the E2E-2 agent-native flagship (Issues' slice) drives the
-# exactly-once-approval-ACROSS-A-KILL leg against the REAL `myelin-flow` durable HITL substrate —
-# `SignalStore` (the `wf_signal` ON-CONFLICT-DO-NOTHING dedup, 9.4) + `approval::{ApprovalCard,
-# apply_approved_effects, per_effect_idem_key}` (the per-effect gated apply, OQ-F). The Issues lib
-# carries the SAME per-effect `idem_key` rule (`agent_spend::per_effect_idem_key`); this dev-dep PROVES
-# the Issues-side derivation is byte-identical to the agent-fabric/flow derivation and that the durable
-# signal applies the governed transition EXACTLY ONCE across the kill + the at-least-once double-click.
-# DEV-only: a test-support edge (the durable wheel is a CONSUMED seam, not a runtime DAG node — the
-# acyclic posture, EI-02 §3).
 myelin-flow = { path = "../myelin-flow" }
-# ISS-P36 (P-499, M5): the E2E-3 spec-to-ship traceability (Issues' slice) drives the audit-tamper leg
-# (GA-D3) against the REAL GDPR tamper-evident audit hash-chain — `AuditAuthority` (the per-tenant
-# BLAKE3 hash-chain + the Merkle STH, P-GA-19/20) + `audit::verify_entries_for_test` (the chain-
-# integrity verifier). The Issues lineage anchor (`lineage_audit_anchor` — the PII-free initiative ref)
-# is bound into a real audit entry's `subject`; a retroactive edit BREAKS the chain (tamper detected).
-# DEV-only: a test-support edge proving Issues' lineage anchor rides the ONE tamper-evidence frame, NOT a
-# second one (EI-01 §7). `myelin-gdpr-service` is a LEAF SERVICE (nothing in the production DAG depends
-# back on it); it carries `myelin-issues` only as its OWN dev-dependency (the GA-D7 worklog drill), so
-# both edges are dev-only — the NORMAL dependency graph stays acyclic (the §2.9 posture).
 myelin-gdpr-service = { path = "../myelin-gdpr-service" }
-# ISS-P30 (P-397, M4): the §10.2 firehose survival-signal assertion library
-# (`SignalSource`/`Predicate`/`SignalName::{FirehoseFrameLag, ResyncRequiredCount}`) the ISS-D13
-# board-sync drill (drill_iss_d13_board_sync.rs) asserts its 0-ops-lost + resync-fired green artifact
-# through — the SAME frozen library the EB-21 D-10 firehose drill uses (the firehose owns the
-# measurement; the harness owns the assertion vocabulary). DEV-only: a test-support failure-injection
-# crate, never a production DAG node (the same posture events/substrate carry).
 myelin-harness = { path = "../myelin-harness" }
-# Note: `myelin-storage` is now a REGULAR dependency (above) — ISS-P07 seals the free-text columns
-# with the shared `ColumnCryptor` at RUNTIME (the per-subject-DEK write path), so the edge is no
-# longer test-only.
-# Note: `myelin-refs` is now a REGULAR dependency (above) — ISS-P17 (P-383) ships the Refs wiring
-# (project/#sub-mints/edges/traverse/TE-7 mirror) at RUNTIME over the ONE Refs codec, so the edge is
-# no longer test-only.
-# ISS-P05 (P-371): the architecture-lint ratchet (contract 1.6) — Issues' own dated red+green
-# confirmation that `no-untagged-personal-data` REJECTS an untagged PII Issues field + ADMITS the
-# tagged schema, and that `forward-only-migration` / `residency-pin` are GREEN over the issue-spine
-# migration source (tests/lint_issue_spine.rs). A test-support crate (NOT a production DAG node).
 myelin-lints = { path = "../myelin-lints" }
-# Note: `myelin-events` + `serde_json` are now REGULAR dependencies (above) — `events.rs` (ISS-P03)
-# registers the `issue.*` taxonomy against the Bus grammar at RUNTIME, and the 13.3 byte-identity CDC
-# (tests/cdc_13_3_issues_coown.rs) keeps serializing the co-owned ViewSpec/FieldType to JSON. Both
-# resolve through the regular deps; no separate dev entry needed.
 
 [features]
 default = []
-# MR-009b W6b2 — the `test-support` cargo feature. The dogfood + agent-flagship in-process drills
-# (`run_e2e_2_issues_flagship`, `run_issues_over_myelins_own_work` → `run_issues_truth_up_scorecard`)
-# construct the now-`test-support`-gated in-memory `CostLedger::new()`, so they are gated behind
-# `#[cfg(any(test, feature = "test-support"))]`. Forwards to `myelin-storage/test-support`. DEV/TEST only.
 test-support = ["myelin-storage/test-support"]
-# ISS-P05 (P-371): the live-stack schema-apply proof (the issue-spine migration against real
-# Postgres). ISS-P06 (P-372) ADDS the live-stack emit-iff-committed proof for the write path (the
-# issue state row + its issue.* event co-commit in ONE Postgres tx; a rolled-back tx writes 0 of
-# each — tests/integration_iss_p06_outbox.rs). Pulls the optional sqlx + tokio external crates only;
-# the default build stays DB-free. ISS-P07 (P-373) ADDS the live-stack per-subject-DEK proof: the
-# free-text title/props/change-delta columns sealed under the per-subject DEK are stored as ciphertext
-# into a real Postgres column and read back to assert 0 plaintext-at-rest + a successful decrypt while
-# the key lives (tests/integration_iss_p07_subject_dek.rs). The ColumnCryptor seal/open is DB-free
-# (in-memory KmsEngine), so the integration test only adds the real at-rest round-trip.
-# (tokio is a regular dep since W3b.4 — the durable main.rs needs it; the feature now only
-# pulls the raw-sqlx test harness.)
 integration = []

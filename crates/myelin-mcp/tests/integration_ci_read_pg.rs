@@ -1,5 +1,3 @@
-//! Live proof that one MCP CI read crosses the complete production authority chain:
-//! governed router → signed per-run token → final-boundary verifier → durable Edge/CI read API.
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,9 +96,6 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         .expect("grant fixture access");
 }
 
-/// A future combinator that catches a panic from the wrapped future without requiring it to be
-/// `Send`/`'static` (unlike `tokio::spawn`) — used only so `with_schema_cleanup` can run its cleanup
-/// even when the test body panics.
 struct CatchUnwind<F> {
     inner: std::pin::Pin<Box<F>>,
 }
@@ -121,10 +116,6 @@ impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
     }
 }
 
-/// Run `body`, then unconditionally drop `schema` from `pool` afterward — success, assertion
-/// failure, or panic all still clean up, unlike the old "only reset at the START of the next run"
-/// pattern that let schemas accumulate indefinitely on this host. A synchronous `Drop` impl can't
-/// safely do async cleanup, so this uses catch_unwind + always-cleanup + resume_unwind instead.
 async fn with_schema_cleanup<Fut>(pool: &PgPool, schema: &str, body: impl FnOnce() -> Fut)
 where
     Fut: std::future::Future<Output = ()>,

@@ -1,23 +1,3 @@
-//! # R2.4 — the durable HITL verdict store, proven against LIVE Postgres (`agent_hitl_gate`, 0054).
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo test -p myelin-storage` stays
-//! DB-free (the verdict-lookup CORE is unit-tested DB-free over the in-memory arm in
-//! `src/hitl_gate_durable.rs`). Runs ONLY against the docker-compose dev stack:
-//!
-//!   DATABASE_URL=postgres://myelin_app:myelin_app_pw@localhost:5433/myelin \
-//!     cargo test -p myelin-storage --features integration \
-//!       --test integration_r24_hitl_gate_durable -- --nocapture
-//!
-//! Proves on the REAL table what R2.4 requires of the server-side verdict authority:
-//!   1. a gated effect's `waiting` row INSERTs and is **lookup-able by its opaque gate_id from a
-//!      SECOND store instance over a fresh pool** (across requests/processes — the property the old
-//!      never-stored `hitl:{jti}:{tool}` display string could not have);
-//!   2. approve/reject UPDATE the state durably, with the distinct-approver rule enforced in the
-//!      durable arm (self-approval + out-of-filter refused; the row stays `waiting`);
-//!   3. `GateRecord::authorizes` admits ONLY the approved exact effect for the requesting agent —
-//!      read back from the second instance.
-//!
-//! Skips gracefully if the DB is unreachable (the sibling integration-test convention).
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -78,7 +58,6 @@ fn waiting(tenant_tag: &str, gate_id: &str, effect: &str) -> GateRecord {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_enforced() {
-    // Boot: apply the 0054 migration as the admin/owner role (idempotent on the shared schema).
     let admin = match SubstrateProvider::connect(admin_config(), 4).await {
         Ok(p) => p,
         Err(_) => {
@@ -91,7 +70,6 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         .await
         .expect("migration 0054 applies (idempotent)");
 
-    // The stores run through the app role (NOBYPASSRLS) — the production path.
     let app = SubstrateProvider::connect(MyelinConfig::dev(), 4)
         .await
         .expect("open the app-role provider");
@@ -103,14 +81,11 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
     let gate_id = format!("gate:{suffix}");
     let effect = "gate:git.merge:myelin://acme/git/pr/40";
 
-    // (1) INSERT the waiting gate through instance ONE.
     let mut store1 = HitlVerdictStore::with_pg(app.clone());
     store1
         .open(&scope, waiting(&suffix, &gate_id, effect))
         .expect("the pending gate row INSERTs");
 
-    // ... and it is lookup-able by gate_id from a SECOND instance over a FRESH pool (the
-    // across-processes property).
     let app2 = SubstrateProvider::connect(MyelinConfig::dev(), 4)
         .await
         .expect("open a second app-role provider (simulated second process)");
@@ -125,13 +100,10 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         "a waiting gate authorizes nothing"
     );
 
-    // (2) The distinct-HUMAN-approver rule holds in the DURABLE arm: self-approval, a distinct
-    //     MACHINE (R2.4b), and an out-of-filter principal are all refused and the row STAYS waiting.
     assert_eq!(
         store2.approve(&scope, &gate_id, "agent:claude", PrincipalKind::Human),
         Err(GateDecideError::SelfApproval)
     );
-    // R2.4b — a distinct principal that IS eligible but is a MACHINE is refused on LIVE PG.
     assert_eq!(
         store2.approve(
             &scope,
@@ -154,12 +126,9 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         GateState::Waiting
     );
 
-    // A distinct eligible HUMAN approves through instance TWO ...
     store2
         .approve(&scope, &gate_id, "psn:lead", PrincipalKind::Human)
         .expect("a distinct eligible human approves");
-    // ... and instance ONE reads the durable verdict back: approved, by psn:lead, authorizing
-    // exactly the bound effect for the requesting agent — and nothing else.
     let rec = store1.fetch(&scope, &gate_id).unwrap();
     assert_eq!(rec.state, GateState::Approved);
     assert_eq!(rec.decided_by.as_deref(), Some("psn:lead"));
@@ -172,13 +141,11 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         ),
         "the approval is bound to ITS effect (never the tool name)"
     );
-    // Terminal: a re-decide refuses durably.
     assert_eq!(
         store1.approve(&scope, &gate_id, "psn:maintainer", PrincipalKind::Human),
         Err(GateDecideError::AlreadyDecided(GateState::Approved))
     );
 
-    // (3) A sibling gate rejected through ONE reads rejected from TWO (withheld forever).
     let gate2 = format!("gate:{suffix}-2");
     let effect2 = "gate:git.merge:myelin://acme/git/pr/41";
     store1
@@ -194,7 +161,6 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         "a rejected gate never authorizes"
     );
 
-    // Cleanup (admin role — RLS-bypassing owner).
     let _ = sqlx::query("DELETE FROM agent_hitl_gate WHERE tenant_id = $1 AND region = $2")
         .bind(&tenant)
         .bind(&region)

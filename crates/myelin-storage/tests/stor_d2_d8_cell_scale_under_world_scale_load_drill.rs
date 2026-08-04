@@ -1,42 +1,3 @@
-//! # STOR-D1/STOR-D2/STOR-D8 re-confirmed at CELL SCALE under WORLD-SCALE load
-//!
-//! **Prompt:** P-ST-34 → global **P-444** (M5). **Drill catalogue:**
-//! `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` §4.2 rows **STOR-D1** (restore-verify,
-//! the permanent gate), **STOR-D2** (kill a cell; restore → RPO/RTO), **STOR-D8** (online migration
-//! under load). **Architecture:** `storage.md` §2 "S-M5" (*restore-verify at cell scale under
-//! world-scale load; online-migration-under-load at prod scale*). **Contract-index:** row **11.5**
-//! (restore-verify at cell scale). **Doctrine:** EI-01 §3 (RPO/RTO + lock budgets read from the FILE,
-//! never hardcoded; the world-scale load is REAL generated traffic; never weaken a threshold to pass).
-//!
-//! ## What this drill IS — the STORAGE-TIER-NATIVE cell-scale re-confirm (coherence, EI-01 §7)
-//! P-436 (`myelin-substrate::tests::drill_sub_d6_restore_verify_cell_scale`) re-confirmed the
-//! cross-seam restore-verify at cell scale using the harness's `RestoredSnapshot` abstraction. This
-//! drill is the **complementary storage-tier half**: it re-runs STORAGE's OWN permanent gate
-//! ([`RestoreVerifyGate`], P-061) + STORAGE's OWN online-migration-under-load drill
-//! ([`MigrationUnderLoad`], P-126) across a CELL's worth of tenants, while a REAL world-scale load
-//! (the P-S02 generator at 30×) is offered — proving the storage tier's native gates hold at cell
-//! scale under surge. It does NOT re-implement either gate (it RE-DRIVES them at scale, the SUB-D10
-//! idiom — no second copy), and it does NOT duplicate the substrate drill (different gate surface:
-//! storage's `RestoreVerifyGate`/`MigrationUnderLoad` vs the harness `RestoredSnapshot`).
-//!
-//! ## The cell-scale shape (read from the FROZEN thresholds file, not a guess)
-//! "Cell scale" = a full Pool cell's worth of tenants — the MEASURED `cell_sizing.pool_tenants_max`
-//! from `thresholds.toml` (the P-431 measured band), never a typed literal. The SCHED headline runs
-//! the WHOLE measured tenant count; a CI smoke variant runs a thin slice (the SAME assertion path — no
-//! drift). A SINGLE tenant whose restore is not whole fails the whole cell (0 loss is per cell, not on
-//! average). The lock budget, RPO bound, and surge multiplier are all read from the FILE.
-//!
-//! ## Floors named
-//! - **No real WAL/PITR rebuild + live `pg_restore`/concurrent-write workload at the full cell count
-//!   on this floor** — the restored copies + the Postgres lock-cost are MODELLED (the same model the
-//!   single-tenant STOR-D1/STOR-D8 drills use); when Storage's real drivers (P-059..P-061 /
-//!   P-S12/P-S15/P-ST-30) land they populate the SAME gate inputs at the full cell scale, and this
-//!   drill's wiring + assertions do not change.
-//! - **The 30× world-scale FLEET-hardware load is the ONE legitimate remaining floor** (real fleet);
-//!   here the world-scale load is the P-S02 generator at 30× across the cell's tenants.
-//! - **SCHED + a cheaper CI smoke variant** — the headline runs the full measured tenant count at
-//!   SCHED frequency; the smoke rides every commit over a thin slice (SAME assertion path).
-
 use std::path::Path;
 
 use myelin_harness::load_generator::{
@@ -54,7 +15,6 @@ fn region() -> Region {
     Region("fr-par".into())
 }
 
-/// The workspace-root `thresholds.toml` doc (the versioned source of truth, P-038).
 fn thresholds_doc() -> toml::Value {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let root = manifest
@@ -77,17 +37,14 @@ fn int_threshold(doc: &toml::Value, table: &str, key: &str) -> u64 {
     v as u64
 }
 
-/// The measured cell-scale tenant count (`cell_sizing.pool_tenants_max`) — never a literal (EI-01 §3).
 fn pool_tenants_max() -> u32 {
     int_threshold(&thresholds_doc(), "cell_sizing", "pool_tenants_max") as u32
 }
 
-/// The lock budget read from `[online_migration]` (the STOR-D8 bound).
 fn lock_budget_from_thresholds() -> LockBudget {
     let doc = thresholds_doc();
     LockBudget::new(
         int_threshold(&doc, "online_migration", "lock_wait_p99_max_ms"),
-        // downtime_max_ms is 0 (the 0-downtime invariant); read it tolerantly (0 is valid here).
         doc.get("online_migration")
             .and_then(|t| t.get("downtime_max_ms"))
             .and_then(|v| v.as_integer())
@@ -96,12 +53,10 @@ fn lock_budget_from_thresholds() -> LockBudget {
     )
 }
 
-/// The surge multiplier read from `[surge]` (the world-scale load multiplier).
 fn surge_multiplier() -> u32 {
     int_threshold(&thresholds_doc(), "surge", "multiplier") as u32
 }
 
-/// An archiver whose base + WAL tail makes every offset in `0..=tail` reachable.
 fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     let mut arch = ContinuousArchiver::new();
     arch.archive_segment(WalSegment {
@@ -118,8 +73,6 @@ fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     arch
 }
 
-/// A sink that counts the world-scale load offered across the cell during the verify window — the live
-/// traffic the cell-scale restore-verify holds against (DERIVED from a real generator run, not typed).
 #[derive(Default)]
 struct CellLoadSink {
     requests: u64,
@@ -130,8 +83,6 @@ impl Sink for CellLoadSink {
     }
 }
 
-/// Drive a world-scale (30× agent-skewed CI-surge) load across `tenants` and return the request count
-/// offered — the live load the cell-scale gates are re-confirmed under.
 fn world_scale_load_across_cell(tenants: &[TenantId], base_requests: u64) -> u64 {
     let m = Multiplier::custom(surge_multiplier()).expect("a positive surge multiplier");
     let gen = LoadGenerator::new(
@@ -151,10 +102,6 @@ fn world_scale_load_across_cell(tenants: &[TenantId], base_requests: u64) -> u64
     sink.requests
 }
 
-/// Re-run STORAGE's OWN restore-verify gate (STOR-D1) for ONE tenant's restored copy and return its
-/// consistency point T. A whole copy: every referenced blob present + checksum-parity-verified, derived
-/// == source-replay, erasure held. (Modelled inputs — the same model the single-tenant STOR-D1 drill
-/// uses; the real WAL/PITR rebuild populates the SAME `GateInputs` shape.)
 fn verify_one_tenant_restore(tenant: &TenantId) -> u64 {
     let kms = KmsEngine::new();
     kms.ensure_kek(&KekId::new(tenant.clone(), region()));
@@ -202,7 +149,6 @@ fn verify_one_tenant_restore(tenant: &TenantId) -> u64 {
     artifact.restored_to_offset
 }
 
-/// The prod-scale online expand→backfill→contract migration (the online idiom — no table-rewrite lock).
 fn online_migration() -> (Migrations, HotTables) {
     let hot = HotTables::declare(["issue"]);
     let migrations = Migrations::of([
@@ -228,20 +174,13 @@ fn online_migration() -> (Migrations, HotTables) {
     (migrations, hot)
 }
 
-/// Re-confirm STOR-D1/STOR-D2 (restore-verify) across a CELL's worth of tenants + STOR-D8
-/// (online-migration-under-load) at prod scale on the restored copy, while a REAL world-scale load is
-/// offered across the cell. Returns `(tenant_count, load_requests, lock_wait_p99_ms)`. ONE assertion
-/// path shared by the SCHED headline + the CI smoke (no drift).
 fn reconfirm_cell_scale(tenant_count: u32, base_load_requests: u64) -> (u32, u64, u64) {
     let tenants: Vec<TenantId> = (0..tenant_count)
         .map(|i| TenantId(format!("cell-tenant-{i:05}")))
         .collect();
 
-    // (a) The restore-verify is re-confirmed UNDER world-scale load (the P-S02 generator across cell).
     let load_requests = world_scale_load_across_cell(&tenants, base_load_requests);
 
-    // (b) STOR-D1/STOR-D2: re-run storage's OWN restore-verify gate for EVERY tenant. A single tenant
-    //     whose copy is not whole panics (0 loss is per cell, not on average). All must land at T=100.
     for tenant in &tenants {
         let restored_to = verify_one_tenant_restore(tenant);
         assert_eq!(
@@ -250,8 +189,6 @@ fn reconfirm_cell_scale(tenant_count: u32, base_load_requests: u64) -> (u32, u64
         );
     }
 
-    // (c) STOR-D8 at prod scale on the restored copy: 50M rows + 256 concurrent writers, the lock
-    //     budget read from the FILE; 0 downtime, p99 within budget.
     let budget = lock_budget_from_thresholds();
     let (migrations, hot) = online_migration();
     let load = WriteLoad::prod_scale(50_000_000, 256);
@@ -269,8 +206,6 @@ fn reconfirm_cell_scale(tenant_count: u32, base_load_requests: u64) -> (u32, u64
     (tenant_count, load_requests, artifact.lock_wait_p99_ms)
 }
 
-/// **THE SCHED DRILL (the dated green artifact the DoD names).** Re-confirm STOR-D1/STOR-D2 + STOR-D8
-/// across the FULL measured cell tenant count under world-scale load — all bounds read from the FILE.
 #[test]
 fn stor_d2_d8_cell_scale_under_world_scale_load_sched() {
     let tenant_count = pool_tenants_max();
@@ -278,7 +213,6 @@ fn stor_d2_d8_cell_scale_under_world_scale_load_sched() {
         tenant_count >= 1000,
         "the measured cell-scale tenant count must be a full cell ({tenant_count} tenants)"
     );
-    // base 64 * 30× world-scale load across the whole cell.
     let (n, load_requests, p99) = reconfirm_cell_scale(tenant_count, 64);
     println!(
         "[P-444 STOR-D1/D2/D8@cell-scale GREEN 2026-06-24] {n} restored tenants re-confirmed whole \
@@ -289,8 +223,6 @@ fn stor_d2_d8_cell_scale_under_world_scale_load_sched() {
     );
 }
 
-/// **THE CI SMOKE VARIANT (rides every commit): the same cell-scale re-confirm over a THIN tenant
-/// slice + a lighter load.** SAME assertion path — no drift from the SCHED headline.
 #[test]
 fn stor_d2_d8_cell_scale_ci_smoke() {
     let (n, load_requests, p99) = reconfirm_cell_scale(8, 16);
@@ -298,10 +230,6 @@ fn stor_d2_d8_cell_scale_ci_smoke() {
     assert!(load_requests > 0 && p99 <= lock_budget_from_thresholds().lock_wait_p99_max_ms);
 }
 
-/// **MANDATORY counter-case: a SINGLE inconsistent restored tenant fails the WHOLE cell (0 loss is per
-/// cell, not on average).** A deliberately-corrupt restored copy (a referenced blob whose bytes do not
-/// re-hash to its address) must FAIL storage's restore-verify gate — proving the cell-scale gate is a
-/// real bar, never weakened to pass (EI-01 §3).
 #[test]
 fn stor_d1_cell_scale_one_corrupt_tenant_fails_the_gate() {
     use myelin_storage::{ContentHash, GateFailure};
@@ -311,7 +239,6 @@ fn stor_d1_cell_scale_one_corrupt_tenant_fails_the_gate() {
     kms.ensure_dek(&tenant, &region(), KeyClass::Tenant)
         .unwrap();
     let arch = reachable_archiver(300);
-    // The object is stored under the address for "good", but the restore brought back "CORRUPT" bytes.
     let address = ContentHash::blake3(b"good");
     let corrupt = RestoredObject {
         content_address: address.clone(),
@@ -343,14 +270,10 @@ fn stor_d1_cell_scale_one_corrupt_tenant_fails_the_gate() {
     );
 }
 
-/// **MANDATORY counter-case: a BLOCKING ALTER at cell scale FAILS STOR-D8 (no lowered bar).** An
-/// `ACCESS EXCLUSIVE` table-rewrite on the hot table at prod scale must read RED — the online idiom is
-/// a real bar, the lock budget read from the FILE, never weakened (EI-01 §3).
 #[test]
 fn stor_d8_cell_scale_a_blocking_alter_fails() {
     use myelin_storage::MigrationLoadFailure;
     let hot = HotTables::declare(["issue"]);
-    // A column-type rewrite on a hot table is a blocking ACCESS EXCLUSIVE rewrite — refused/over-budget.
     let migrations = Migrations::of([Migration::phased(
         "0099_rewrite",
         "ALTER TABLE issue ALTER COLUMN priority TYPE BIGINT;",
@@ -364,7 +287,6 @@ fn stor_d8_cell_scale_a_blocking_alter_fails() {
         !verdict.is_green(),
         "a blocking ALTER at cell scale MUST FAIL STOR-D8 (no lowered bar)"
     );
-    // It fails either by the static refusal or by the downtime/lock-budget breach — all loud.
     assert!(
         matches!(
             verdict.failure(),

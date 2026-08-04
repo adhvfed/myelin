@@ -1,17 +1,3 @@
-//! # GIT-P14 (P-275, M3-G2) — the live ReBAC fragment + the FailStatic degrade, end-to-end
-//!
-//! The chained drill the prompt requires: **grant a relation → read-your-writes within the zookie →
-//! break Id → assert degrade (not cascade) + just-revoked-denied**, proven against the **REAL**
-//! Identity engine ([`StoreBackedCheck`] over the `with_core_hierarchy` cell schema with the Git
-//! fragment admitted), NOT a stub. The [`myelin_git::live_check::GitCheckGate`] wraps the real engine
-//! behind a forced, scoped, reversible dependency-break injector ([`BreakableId`]) so the degrade is
-//! PROVEN by a real failure + observability (EI-01 §3), not asserted.
-//!
-//! This file carries the **drill** (the chained e2e) + the **CDC pairs** for contract rows 4.9 (the
-//! Git fragment live — enforced at the check) and 4.11 (the FailStatic bound — degrade-not-cascade;
-//! `static_max ≤ revocation SLA`). The fragment-evaluation + fail-static path is mandatory-core; the
-//! cargo-mutants mutation floor over `live_check.rs` is named in the prompt report.
-
 use std::cell::Cell;
 
 use myelin_events::{OutboxStore, Timestamp};
@@ -25,15 +11,6 @@ use myelin_storage::TenantScope;
 use myelin_substrate::{AuthzServed, FailStaticThreshold, TestClock};
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
-// ───────────────────────────── the dependency-break injector (a real engine, breakable) ──────────
-
-/// A thin [`IdentityService`] wrapper over the REAL [`StoreBackedCheck`] engine with a forced,
-/// reversible **break** toggle — the scoped dependency break the degrade drill injects (EI-01 §3,
-/// the P-S03 `DependencyBreaker` pattern). When `broken`, every `check`/`list_subjects` returns a
-/// transport-style `Unavailable` (the transient Identity hiccup the fail-static cache degrades on);
-/// when not broken, it delegates to the authoritative engine. The `list_subjects` ABI method needs a
-/// `(tenant, region)` scope the trait cannot carry, so it delegates to `list_subjects_in` over the
-/// fixed test scope.
 struct BreakableId {
     inner: StoreBackedCheck,
     scope: TenantScope,
@@ -66,7 +43,6 @@ impl IdentityService for BreakableId {
         caveat: Option<&myelin_identity::CaveatContext>,
     ) -> myelin_identity::Result<Decision> {
         if self.broken.get() {
-            // The forced break: the authoritative engine is unreachable (a transient hiccup).
             return Err(myelin_identity::AuthzError::Unavailable(
                 "forced Id break (drill)".into(),
             ));
@@ -93,8 +69,6 @@ impl IdentityService for BreakableId {
                 "forced Id break (drill)".into(),
             ));
         }
-        // The ABI trait method cannot carry the (tenant, region) scope; delegate to the scoped
-        // `list_subjects_in` over the fixed test scope (the CODEOWNERS Expand path).
         Ok(self
             .inner
             .list_subjects_in(&self.scope, object, permission, at))
@@ -148,8 +122,6 @@ impl IdentityService for BreakableId {
     }
 }
 
-// ───────────────────────────── fixtures ──────────────────────────────────────────────────────────
-
 fn scope(tenant: &str) -> TenantScope {
     let admin = Principal::stub(
         PrincipalId("admin".into()),
@@ -180,7 +152,7 @@ fn add(object: &str, relation: &str, subj: &str) -> TupleDelta {
 
 fn threshold() -> FailStaticThreshold {
     FailStaticThreshold {
-        status: "OPEN — LEGAL".into(),
+        status: "OPEN - LEGAL".into(),
         owner: "DPO / Legal".into(),
         static_max_secs: None,
         static_max_default_secs: 300,
@@ -191,7 +163,6 @@ fn threshold() -> FailStaticThreshold {
 
 const REVOCATION_SLA: u64 = 300;
 
-/// Admit the Git fragment into a fresh real engine + return it seeded with `tuples`.
 fn engine_with_git_fragment(scope: &TenantScope, tuples: &[TupleDelta]) -> StoreBackedCheck {
     let store = TupleStore::new(OutboxStore::new());
     let admin = subject("p-admin", scope.tenant().as_str());
@@ -215,13 +186,6 @@ fn engine_with_git_fragment(scope: &TenantScope, tuples: &[TupleDelta]) -> Store
     svc
 }
 
-// ───────────────────────────── CDC 4.9: the Git fragment is LIVE (enforced at the check) ──────────
-
-/// **CDC 4.9 — the live Git fragment is ENFORCED at the front-door check (0 unauthorized admitted).**
-/// A repo `admin` gets `pull` through the real engine + the fail-static gate; an outsider is denied.
-/// This is the contract-4.9 consumer↔provider pair reified: Git (the consumer) gates an action ONLY
-/// on a resolved grant; Identity (the provider) resolves the Git permission through the four userset
-/// operators. The gate (the GitCheckGate) is the live ENFORCEMENT seam.
 #[test]
 fn cdc_4_9_live_fragment_is_enforced_at_the_check() {
     let s = scope("acme");
@@ -237,7 +201,6 @@ fn cdc_4_9_live_fragment_is_enforced_at_the_check() {
     let repo = ArtifactRef("repo:core".into());
     let pull = Permission(perm::PULL.into());
 
-    // alice (a real repo admin) pulls — the live fragment resolves pull = reader∪writer∪admin∪….
     let d = gate.front_door_check(
         &subject("p:alice", "acme"),
         &pull,
@@ -250,7 +213,6 @@ fn cdc_4_9_live_fragment_is_enforced_at_the_check() {
         "a repo admin pulls through the LIVE fragment (0 unauthorized denied)"
     );
 
-    // an outsider is denied (fail-closed — no resolved grant).
     let d = gate.front_door_check(
         &subject("p:bob", "acme"),
         &pull,
@@ -264,9 +226,6 @@ fn cdc_4_9_live_fragment_is_enforced_at_the_check() {
     );
 }
 
-/// **CDC 4.9 — the X-1 fork-endorsement relation is a plain `check` (not bespoke logic).** A
-/// maintainer with the `approve_untrusted_ci` relation endorses; an outsider does not — proven
-/// through the live engine via the fail-static gate's `fork_endorsement_check`.
 #[test]
 fn cdc_4_9_fork_endorsement_relation_is_enforced_live() {
     let s = scope("acme");
@@ -280,8 +239,6 @@ fn cdc_4_9_fork_endorsement_relation_is_enforced_live() {
     .expect("valid");
     let repo = ArtifactRef("repo:core".into());
 
-    // The zookie is the read-your-writes fence; an empty zookie reads at latest (no prior write to
-    // fence on — the endorsement relation was seeded, not written through this gate's `grant_relation`).
     let d = gate.fork_endorsement_check(
         &subject("p:maint", "acme"),
         &repo,
@@ -304,30 +261,12 @@ fn cdc_4_9_fork_endorsement_relation_is_enforced_live() {
     );
 }
 
-// ───────────────────────────── the CHAINED e2e (the GIT-P14 gate) ────────────────────────────────
-
-/// **THE CHAINED DRILL (GIT-P14, the M3-G2 gate): grant → read-your-writes → break Id → degrade
-/// (not cascade) + just-revoked-denied.** Proven against the REAL engine end-to-end.
-///
-/// 1. **grant a relation** — alice is made a repo admin via the real `TupleStore::write_tuples`
-///    (the grant returns a zookie fence).
-/// 2. **read-your-writes within the zookie** — a check stamped with that zookie sees the just-granted
-///    grant immediately (alice pulls). (Contract 4.10.)
-/// 3. **break Id** — the forced, scoped, reversible dependency break (the engine becomes
-///    unreachable).
-/// 4. **assert DEGRADE, not cascade** — a bounded-stale read serves the last coarse grant STATIC
-///    (already-authorised traffic survives), within `static_max ≤ revocation SLA`.
-/// 5. **assert just-revoked-DENIED** — even with a cached ALLOW + the Id still broken, a revoked
-///    subject is denied THROUGH the stale cache (the cached ALLOW never overrides a revoke).
 #[test]
 fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
     let s = scope("acme");
-    // The grant is via the real engine's TupleStore; build the store first so we can write to it,
-    // then wrap it. We seed alice's admin grant DIRECTLY (step 1, the real write_tuples path).
     let store = TupleStore::new(OutboxStore::new());
     let admin = subject("p-admin", "acme");
 
-    // 1. GRANT a relation (alice → repo admin) — the real atomic write returns the zookie fence.
     let zookie = store
         .write_tuples(
             &s,
@@ -362,8 +301,6 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
     let pull = Permission(perm::PULL.into());
     let alice = subject("p:alice", "acme");
 
-    // 2. READ-YOUR-WRITES within the zookie — the just-granted admin grant is visible NOW. The
-    //    front-door read (bounded-stale) caches the coarse ALLOW (and is fresh — the engine is up).
     let d = gate.front_door_check(&alice, &pull, &repo, zookie.clone(), false);
     assert!(
         is_allow(&d),
@@ -375,11 +312,8 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
         "served fresh from the live engine"
     );
 
-    // 3. BREAK Id (the forced, reversible, scoped dependency break).
     gate.id_ref().set_broken(true);
 
-    // 4. DEGRADE, not cascade — just past fresh_ttl, inside static_max: the bounded-stale read serves
-    //    the last coarse grant STATIC (the availability win), NOT a fail-closed cascade.
     gate.clock().advance(31);
     let d = gate.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false);
     assert!(
@@ -388,10 +322,9 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
     );
     assert!(
         is_allow(&d),
-        "the degraded answer is the cached ALLOW — already-authorised survives"
+        "the degraded answer is the cached ALLOW - already-authorised survives"
     );
 
-    // observability is part of the pass (EI-01 §3): a stale answer was observed; its age ≤ static_max.
     let sig = gate.signals();
     assert!(
         sig.stale >= 1,
@@ -402,14 +335,12 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
         "staleness age ≤ static_max ≤ revocation SLA (a degrade never outlives the bound)"
     );
 
-    // 5. JUST-REVOKED DENIED — alice is revoked. Even with a cached ALLOW + the Id still broken (so a
-    //    fresh re-check is impossible), the revocation consult denies her THROUGH the stale cache.
     let d = gate.front_door_check(
         &alice,
         &pull,
         &repo,
         Zookie(String::new()),
-        /*revoked*/ true,
+         true,
     );
     assert_eq!(
         d.served,
@@ -421,7 +352,6 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
         "the cached ALLOW does NOT override the revoke (0 stale escalation)"
     );
 
-    // 6. RECOVER (reversible) → the next read is fresh again (the break left no cascade behind).
     gate.id_ref().set_broken(false);
     let d = gate.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false);
     assert_eq!(
@@ -431,16 +361,9 @@ fn chained_grant_read_your_writes_break_degrade_revoked_denied() {
     );
 }
 
-// ───────────────────────────── CDC 4.11: the FailStatic bound (degrade-not-cascade) ──────────────
-
-/// **CDC 4.11 — the FailStatic bound: a zookie (Strong) read BYPASSES the cache + fails CLOSED on a
-/// break.** The merge gate's read-your-writes is a security-sensitive transition; it never serves
-/// stale (the new-enemy guard, 4.10). Proven through the real engine.
 #[test]
 fn cdc_4_11_strong_merge_read_bypasses_cache_fails_closed_on_break() {
     let s = scope("acme");
-    // alice is a repo admin → pull_request.merge resolves via parent_repo->protected_push (= admin).
-    // The PR points at its parent repo via the parent_repo relation.
     let svc = engine_with_git_fragment(
         &s,
         &[
@@ -462,8 +385,6 @@ fn cdc_4_11_strong_merge_read_bypasses_cache_fails_closed_on_break() {
     let pr = ArtifactRef("pull_request:core:42".into());
     let alice = subject("p:alice", "acme");
 
-    // healthy: the strong merge read serves the authoritative engine directly (cache bypassed). The
-    // empty zookie reads at latest (the merge gate would carry the grant's zookie for read-your-writes).
     let d = gate.merge_check(&alice, &pr, Zookie(String::new()), false);
     assert_eq!(
         d.served,
@@ -475,7 +396,6 @@ fn cdc_4_11_strong_merge_read_bypasses_cache_fails_closed_on_break() {
         "alice (admin → protected_push → merge) may merge"
     );
 
-    // BREAK Id: the strong read fails CLOSED (never serves stale) — the new-enemy guard.
     gate.id_ref().set_broken(true);
     let d = gate.merge_check(&alice, &pr, Zookie(String::new()), false);
     assert_eq!(
@@ -489,18 +409,15 @@ fn cdc_4_11_strong_merge_read_bypasses_cache_fails_closed_on_break() {
     );
 }
 
-/// **CDC 4.11 — `static_max ≤ revocation SLA` is structural.** A thresholds row whose `static_max`
-/// seed exceeds the revocation SLA does NOT construct the gate (a revoked actor could otherwise
-/// outlive N). The bound is enforced in the constructor, never the hot path.
 #[test]
 fn cdc_4_11_static_max_over_revocation_sla_does_not_construct() {
     let s = scope("acme");
     let svc = engine_with_git_fragment(&s, &[]);
     let bad = FailStaticThreshold {
-        status: "OPEN — LEGAL".into(),
+        status: "OPEN - LEGAL".into(),
         owner: "DPO / Legal".into(),
         static_max_secs: None,
-        static_max_default_secs: 400, // > revocation SLA (300)
+        static_max_default_secs: 400,
         agent_token_ttl_secs: 60,
         constraint: "static_max <= revocation-SLA AND static_max >= agent-token-TTL".into(),
     };
@@ -519,9 +436,6 @@ fn cdc_4_11_static_max_over_revocation_sla_does_not_construct() {
     );
 }
 
-/// **CDC 4.11 — past `static_max` a sustained break fails CLOSED (deny is correct again), never
-/// open.** The staleness budget is bounded; past the window the degrade ends in a fail-closed deny,
-/// never an open fall-through. Proven through the real engine.
 #[test]
 fn cdc_4_11_past_static_max_sustained_break_fails_closed() {
     let s = scope("acme");
@@ -545,7 +459,7 @@ fn cdc_4_11_past_static_max_sustained_break_fails_closed() {
         false
     )));
     gate.id_ref().set_broken(true);
-    gate.clock().advance(301); // past static_max (300)
+    gate.clock().advance(301);
     let d = gate.front_door_check(&alice, &pull, &repo, Zookie(String::new()), false);
     assert_eq!(
         d.served,

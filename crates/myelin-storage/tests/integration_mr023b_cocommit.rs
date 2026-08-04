@@ -1,22 +1,3 @@
-//! # MR-023b / peer-review #7 — the same-transaction co-commit, proven against LIVE Postgres.
-//!
-//! This is the kill-9 co-commit GATE for the idempotent consumer: it proves the dedup mark and the
-//! handler's DB effect land ATOMICALLY in ONE transaction (either both or neither), against the live
-//! docker-compose Postgres (:5433), NOT modeled in memory.
-//!
-//! The bug it closes (the OLD at-most-once floor): the consumer marked `(consumer, event_id)`
-//! handled — a durable INSERT that COMMITTED IMMEDIATELY — BEFORE calling the handler, whose effect
-//! committed LATER in a SEPARATE transaction. A kill-9 between the two → on restart the broker
-//! redelivers → `mark_handled` reads NOT-fresh → `Deduplicated` → ack → THE EFFECT IS LOST FOREVER.
-//!
-//! The fix (Option A — same-tx co-commit): [`DedupLedger::begin_co_commit`] opens ONE tx, INSERTs
-//! the dedup mark within it, and hands the transaction-bound connection to the handler; the runtime
-//! commits on `Done` / rolls back on `Retry`/failure. A crash before commit leaves NEITHER → a
-//! redelivery re-runs and the effect lands (exactly-once-WITH-EFFECT).
-//!
-//! Run against the dev stack:
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-storage --features integration --test integration_mr023b_cocommit -- --nocapture
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -79,16 +60,10 @@ fn envelope(id: &str) -> EventEnvelope {
 
 static SUBJECTS: &[SubjectPattern] = &[];
 
-/// A handler whose EFFECT is a DB write on the co-commit transaction — the exact shape #7/MR-023b is
-/// about. It downcasts `tx.connection::<sqlx::PgConnection>()` and INSERTs the event_id into an
-/// effect table ON THE SAME TX the dedup mark is in, then returns a scripted terminal outcome. A
-/// handler that finds NO tx fails-closed (Retry), never a silent write outside the tx.
 struct EffectHandler {
     table: String,
     rt: tokio::runtime::Handle,
-    /// The terminal outcome to return AFTER writing (Done commits; Retry rolls back — the kill-9 model).
     outcome: HandleOutcome,
-    /// How many times the handler actually ran its body (so a dedup-skip is observable).
     ran: AtomicU32,
 }
 
@@ -99,7 +74,6 @@ impl EventHandler for EffectHandler {
     fn handle(&self, ev: &EventEnvelope, tx: &mut HandlerTx<'_>) -> HandleOutcome {
         self.ran.fetch_add(1, Ordering::SeqCst);
         let Some(conn) = tx.connection::<sqlx::PgConnection>() else {
-            // Fail-closed: a durable handler with no co-commit tx must NOT write outside it.
             return HandleOutcome::Retry(Backoff { seconds: 1 });
         };
         let sql = format!(
@@ -156,11 +130,6 @@ async fn dedup_present(pool: &sqlx::PgPool, consumer: &str, id: &str) -> bool {
     exists
 }
 
-// ==============================================================================================
-// TEST 1 — the co-commit PRIMITIVE: a crash-before-commit leaves NEITHER the mark NOR the effect;
-//          a commit lands BOTH; a redelivery is deduped with 0 duplicate effect. (kill-9 model.)
-// ==============================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
     let cfg = MyelinConfig::dev();
@@ -178,8 +147,6 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
     let tenant = TenantId("acme".into());
     let region = Region(cfg.region.clone());
 
-    // (A) CRASH BEFORE COMMIT: open the co-commit tx (marks dedup within it), write the effect on
-    //     the SAME tx, then ROLL BACK (models the process dying before commit).
     tokio::task::block_in_place(|| {
         let (mut cotx, fresh) = ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
         assert!(fresh, "first delivery marks the dedup row FRESH");
@@ -195,11 +162,9 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
                 .await
                 .expect("write effect on the co-commit tx");
         });
-        // the process "dies" here — roll back instead of commit.
         cotx.rollback();
     });
 
-    // The OLD bug would have a COMMITTED mark with a LOST effect. The FIX: NEITHER is present.
     assert!(
         !dedup_present(&pool, &consumer.0, &id).await,
         "crash-before-commit: the dedup mark did NOT persist (rolled back with the effect)"
@@ -209,7 +174,6 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
         "crash-before-commit: the effect did NOT persist (rolled back with the mark)"
     );
 
-    // (B) REDELIVERY re-runs (the mark is gone → still fresh) and this time COMMITS: both land.
     tokio::task::block_in_place(|| {
         let (mut cotx, fresh) = ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
         assert!(fresh, "after the rollback the redelivery is STILL FRESH (0 lost)");
@@ -237,7 +201,6 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
         "after commit: the effect IS durable (exactly-once-with-effect)"
     );
 
-    // (C) A further REDELIVERY is now deduped (mark present) → 0 duplicate effect.
     tokio::task::block_in_place(|| {
         let (cotx, fresh) = ledger.begin_co_commit(&consumer, &EventId(id.clone()), &tenant, &region);
         assert!(!fresh, "the committed mark makes a redelivery a DUPLICATE (deduped)");
@@ -249,14 +212,8 @@ async fn mr023b_cocommit_primitive_crash_leaves_neither_commit_lands_both() {
             .fetch_one(&pool)
             .await
             .expect("count");
-    assert_eq!(effect_count, 1, "exactly ONE effect row — no duplicate on redelivery");
+    assert_eq!(effect_count, 1, "exactly ONE effect row - no duplicate on redelivery");
 }
-
-// ==============================================================================================
-// TEST 2 — through the Consumer RUNTIME with a DB-writing handler: Done co-commits mark+effect; a
-//          redelivery is Deduplicated (0 dup); a Retry rolls BOTH back → a redelivery re-runs and
-//          the effect lands (the kill-9 invariant end-to-end through `Consumer::deliver`).
-// ==============================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
@@ -288,8 +245,6 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
         envelope: envelope(&id),
     };
 
-    // (A) A RETRY handler: writes the effect on the tx, then returns Retry → the runtime ROLLS BACK
-    //     (models a crash / transient failure before commit). NEITHER the mark NOR the effect lands.
     let retry_consumer = Consumer::new(
         EffectHandler {
             table: effect.clone(),
@@ -312,9 +267,6 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
         "Retry rolled back the co-commit tx → the effect is GONE (both vanish together)"
     );
 
-    // (B) REDELIVERY to a Done handler (same durable ledger over the same pool — a fresh Consumer,
-    //     as a reconnect / restart would be): the handler RE-RUNS (0 lost), writes the effect, and
-    //     the runtime COMMITS → mark + effect both durable.
     let done_consumer = Consumer::new(
         EffectHandler {
             table: effect.clone(),
@@ -333,10 +285,9 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
     );
     assert!(
         effect_present(&pool, &effect, &id).await,
-        "Done committed the effect (exactly-once-WITH-EFFECT — not deduped-and-lost)"
+        "Done committed the effect (exactly-once-WITH-EFFECT - not deduped-and-lost)"
     );
 
-    // (C) A further REDELIVERY is Deduplicated — the handler does NOT re-run, 0 duplicate effect.
     let out = tokio::task::block_in_place(|| done_consumer.deliver(&msg));
     assert_eq!(out, Delivered::Deduplicated, "the committed mark dedups the redelivery");
     assert_eq!(
@@ -350,5 +301,5 @@ async fn mr023b_consumer_runtime_cocommit_retry_rolls_back_then_reruns() {
             .fetch_one(&pool)
             .await
             .expect("count");
-    assert_eq!(effect_count, 1, "exactly ONE effect row — no duplicate");
+    assert_eq!(effect_count, 1, "exactly ONE effect row - no duplicate");
 }

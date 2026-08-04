@@ -1,31 +1,3 @@
-//! **CT-004m — the `cost_event` table-name collision is RESOLVED: Storage's money-ledger `cost_event`
-//! and CI's metering projection `ci_cost_event` COEXIST in ONE shared `myelin` database.**
-//!
-//! The platform runs ONE shared Postgres for every service (docs/dev-stack.md — NOT "each service its
-//! own DB"), so CI's tables land in the SAME database as Storage's. Before CT-004m both were named
-//! `cost_event`; `CREATE TABLE IF NOT EXISTS cost_event` silently no-op'd whichever applied second,
-//! leaving the loser's INSERT to fail at runtime on the missing columns. CT-004m renamed CI's table to
-//! `ci_cost_event`. This test PROVES the fix end-to-end on live PG:
-//!
-//!   1. **Both migration sets apply to ONE schema.** Storage's `reserve_settle_durable_migrations()`
-//!      (the piece of `all_durable_migrations()` that owns the colliding `cost_event`, migration
-//!      `0050`) AND CI's `ci_durable_migrations()` (`ci_run` + `check_attempt` + `ci_cost_event`) both
-//!      apply into the SAME schema — no `CREATE TABLE` swallows a differently-shaped sibling.
-//!      (A DB-free structural assertion first confirms `reserve_settle_durable_migrations()` really is
-//!      a subset of `all_durable_migrations()`, so "apply Storage's cost_event" == "apply the piece of
-//!      the aggregate that ships it".)
-//!   2. **Both tables exist with their DISTINCT columns.** Storage's `cost_event` carries `ord` + `unit`
-//!      (the reserve-keyed money log); CI's `ci_cost_event` carries `cost_id` + `job_id` + `meter` +
-//!      `kind` (the run/job-attributed projection). Neither has the other's columns.
-//!   3. **A CT-004a settle AND a CT-004b reserve BOTH succeed in the SAME DB.** `CiCostEventStore.settle`
-//!      records into `ci_cost_event`; a `ci_run` reserve insert succeeds into `ci_run`; Storage's
-//!      `cost_event` is left untouched (no cross-write).
-//!
-//! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
-//!
-//!   eval "$(scripts/dev-stack.sh env)"
-//!   cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_ct004m_cost_event_no_collision -- --nocapture
 #![cfg(feature = "integration")]
 
 mod common;
@@ -65,10 +37,6 @@ fn verified_scope(tenant: &TenantId, region: &str) -> TenantScope {
     TenantScope::from_verified_token(&principal, principal.region.clone())
 }
 
-/// An admin pool pinned to the per-pid schema (with `public` in the path so the platform RLS helper
-/// `myelin_make_tenant_scoped` — defined in `public` — resolves, while unqualified CREATEs land in the
-/// per-pid schema first). Admin creates the isolated schema; store operations still carry verified
-/// tenant/region scope and transaction-local GUCs.
 async fn pool() -> PgPool {
     let schema = schema_name();
     sqlx::postgres::PgPoolOptions::new()
@@ -103,7 +71,6 @@ fn uid(name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
-/// The set of column names of a table in the per-pid schema.
 async fn columns(p: &PgPool, schema: &str, table: &str) -> Vec<String> {
     sqlx::query(
         "SELECT column_name FROM information_schema.columns \
@@ -121,9 +88,6 @@ async fn columns(p: &PgPool, schema: &str, table: &str) -> Vec<String> {
 
 #[tokio::test]
 async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
-    // ── (0) DB-FREE structural check: Storage's cost-ledger migration IS a subset of the aggregate. ──
-    // So applying `reserve_settle_durable_migrations()` == applying the piece of `all_durable_migrations()`
-    // that owns the colliding `cost_event` — the aggregate a real service main applies at boot.
     let agg_ids: Vec<&str> = all_durable_migrations().0.iter().map(|m| m.id).collect();
     for m in reserve_settle_durable_migrations().0.iter() {
         assert!(
@@ -149,7 +113,6 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         .await
         .expect("create the per-pid schema");
 
-    // ── (1) Apply BOTH migration sets into the SAME schema — no CREATE swallows a sibling. ──
     for m in reserve_settle_durable_migrations().0.iter() {
         p.execute(m.ddl)
             .await
@@ -161,7 +124,6 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
             .unwrap_or_else(|e| panic!("apply CI migration {}: {e}", m.id));
     }
 
-    // ── (2) BOTH tables exist with their DISTINCT columns. ──
     let storage_cols = columns(&p, &schema, "cost_event").await;
     let ci_cols = columns(&p, &schema, "ci_cost_event").await;
     assert!(
@@ -172,7 +134,6 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         !ci_cols.is_empty(),
         "CI's projection `ci_cost_event` exists in the SAME schema (no collision no-op)"
     );
-    // Storage's cost_event: the reserve-keyed money log (ord + unit); NOT the CI projection columns.
     assert!(
         storage_cols.contains(&"ord".to_string()) && storage_cols.contains(&"unit".to_string()),
         "Storage's cost_event carries its money-log columns (ord, unit): {storage_cols:?}"
@@ -183,7 +144,6 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
             && !storage_cols.contains(&"meter".to_string()),
         "Storage's cost_event does NOT carry CI's projection columns: {storage_cols:?}"
     );
-    // CI's ci_cost_event: the run/job-attributed projection (cost_id, job_id, meter, kind).
     for c in [
         "cost_id",
         "job_id",
@@ -201,7 +161,6 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         "CI's ci_cost_event does NOT carry Storage's money-log columns: {ci_cols:?}"
     );
 
-    // ── (3a) A CT-004a settle records into ci_cost_event (NOT Storage's cost_event). ──
     let run = uid("ct004m-run");
     let job = uid("ct004m-job");
     let store = CiCostEventStore::with_pg(p.clone(), Region(region.into()));
@@ -226,7 +185,6 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         .expect("read back the settled unit");
     assert_eq!(read.len(), 1, "the unit is in ci_cost_event");
     assert_eq!(read[0].meter, Meter::CpuSeconds);
-    // Storage's cost_event was NOT written by the CI settle.
     let storage_rows: i64 =
         sqlx::query("SELECT count(*)::bigint AS n FROM cost_event WHERE tenant_id = $1")
             .bind(tenant.as_str())
@@ -239,7 +197,6 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         "the CI settle did NOT write Storage's money-ledger cost_event (no cross-write)"
     );
 
-    // ── (3b) A CT-004b-style ci_run reserve succeeds in the SAME DB. ──
     let reserve_run = uid("ct004m-reserve-run");
     sqlx::query(
         "INSERT INTO ci_run (tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, \
@@ -262,13 +219,9 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         .get("n");
     assert_eq!(runs, 1, "the ci_run row is durable in the shared DB");
 
-    // ── (4) #11 — the BOOT-TIME SHAPE ASSERTION. The correctly-migrated ci_cost_event PASSES. ──
     verify_ci_cost_event_shape(&p)
         .await
         .expect("the correctly-migrated ci_cost_event passes the boot shape assertion");
-    // A WRONG-shaped ci_cost_event (the pre-CT-004m hazard: a table bound under the CI name but NOT the
-    // metering-projection shape) is REFUSED LOUDLY — the money table is never written wrong-shaped.
-    // (Done last: ci_cost_event is no longer needed, and the schema is dropped below.)
     p.execute("DROP TABLE ci_cost_event")
         .await
         .expect("drop ci_cost_event for the wrong-shape leg");

@@ -1,30 +1,3 @@
-//! **KN-P18 / P-308 — the read-time rollup permission-filtered conjoin (a rollup over a relation
-//! aggregates ONLY the related rows the viewer may `read`, conjoining `list_objects`) PROVEN against
-//! the live dev-stack Postgres.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-knowledge --features integration \
-//!     --test integration_kn_d10_rollup -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires: a read-time rollup is computed at
-//! READ TIME (never stored) over the `db_relation` `rollup_source` edges, and its target set is
-//! **permission-filtered** by the SAME `list_objects` `SetExpr` conjoin (the `authz_visible` JOIN
-//! over `db_row.id`) the view executor uses. The drill proves, against REAL Postgres, that:
-//!
-//! - a rollup `SUM`/`COUNT`/`MAX` over a relation conjoins the ACL JOIN into ONE query — a restricted
-//!   target row is uncounted/unsummed (**0 rollup leak**, composing with KN-D5);
-//! - the rollup is computed at read time over the `rollup_source` edges (the `db_relation` TE-7
-//!   source of truth) — never a stored, cascaded recompute (the KN-3 invariant);
-//! - the aggregate is the conjoined query's value, NOT a post-filter subtraction (which would itself
-//!   leak the hidden total/count).
-//!
-//! The lowered SQL the test runs is the SAME `lower_over_db_row_id` ACL JOIN
-//! [`myelin_knowledge::RollupResolver`] conjoins (the in-memory model the unit/drill use is the
-//! mirror of this). The KN-D10 rollup-permission half is registered red-until-proven and flips green
-//! ONLY here, against the live stack — never mocked.
 #![cfg(feature = "integration")]
 
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RelName, SetExpr};
@@ -54,9 +27,6 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
     let rel_tbl = format!("db_relation_p308_{suffix}");
     let av_tbl = format!("authz_visible_p308_{suffix}");
 
-    // ── 1. The target db_row table (each related row carries an Int `amount` in props), the
-    //       db_relation rollup_source edges (the TE-7 source of truth), and the authz_visible
-    //       reverse index (the SetExpr JOIN target the rollup conjoins). ──────────────────────────────
     sqlx::query(&format!(
         "CREATE TABLE {row_tbl} (\
            tenant text NOT NULL, id text NOT NULL, props jsonb NOT NULL, \
@@ -80,8 +50,6 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
     .await
     .expect("create the authz_visible reverse index table");
 
-    // ── 2. Seed: src:1 related (rollup_source) to t:1 (10), t:2 (20), t:secret (100000). Grant the
-    //       viewer read of t:1, t:2 only — t:secret is the leak witness (a glaring value). ────────────
     let targets: &[(&str, i64)] = &[("t:1", 10), ("t:2", 20), ("t:secret", 100_000)];
     for (id, amount) in targets {
         sqlx::query(&format!(
@@ -115,8 +83,6 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
         .expect("grant read of a visible target");
     }
 
-    // ── 3. The REAL lowered SetExpr ACL (InRelation{read} → the authz_visible JOIN over db_row.id) —
-    //       the SAME lowering RollupResolver conjoins. Rebind onto the suffixed test tables. ──────────
     let lowered_acl = lower_over_db_row_id(
         &SetExpr::InRelation {
             relation: RelName("read".into()),
@@ -135,11 +101,8 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
         .replace("db_row.id", "r.id")
         .replace(":subject_0", "'p:viewer'")
         .replace(":rel_for_read", "'read'");
-    let acl_pred = lowered_acl.sql_predicate; // `av0.object_id IS NOT NULL`
+    let acl_pred = lowered_acl.sql_predicate;
 
-    // ── 4. THE read-time rollup as ONE query: aggregate over the rollup_source targets of src:1,
-    //       JOINED to db_row for the `amount` value, CONJOINED with the ACL JOIN (the permission
-    //       filter). The aggregate counts/sums ONLY the rows the viewer may read. ────────────────────
     let rollup_sql = format!(
         "SELECT COUNT(*)::bigint AS n, COALESCE(SUM((r.props ->> 'amount')::bigint), 0)::bigint AS total, \
                 COALESCE(MAX((r.props ->> 'amount')::bigint), 0)::bigint AS hi \
@@ -157,7 +120,6 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
     let total: i64 = row.get("total");
     let hi: i64 = row.get("hi");
 
-    // ── 5. PROVE 0 rollup leak: the aggregate reflects ONLY the visible targets. ───────────────────
     assert_eq!(
         n, 2,
         "0 rollup leak: COUNT = 2 (the visible targets), NOT 3 (t:secret uncounted)"
@@ -171,8 +133,6 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
         "0 rollup leak: MAX = 20 (visible), NOT 100000 (t:secret's value not disclosed)"
     );
 
-    // ── 6. The authorized viewer (granted all three) sees the full aggregate — per-viewer conjoin,
-    //       not a blanket hide. ─────────────────────────────────────────────────────────────────────
     for object in ["t:1", "t:2", "t:secret"] {
         sqlx::query(&format!(
             "INSERT INTO {av_tbl} (tenant, subject, relation, object_id) VALUES ('acme', 'p:admin', 'read', $1)"
@@ -215,7 +175,6 @@ async fn kn_d10_read_time_rollup_permission_filtered_conjoin_zero_leak() {
          never stored (KN-3)."
     );
 
-    // ── 7. Cleanup (forward teardown). ───────────────────────────────────────────────────────────
     sqlx::query(&format!("DROP TABLE {row_tbl}"))
         .execute(&admin)
         .await

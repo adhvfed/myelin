@@ -1,9 +1,3 @@
-//! Authenticated Edge read surface for the durable notification inbox.
-//!
-//! The client may select only a named view and bounded page coordinates. Tenant, residency region,
-//! and recipient are derived exclusively from the verified principal in [`HandlerCtx`]. The wire
-//! projection stays structured until the durable per-viewer humanisation resolver is available.
-
 use std::future::Future;
 use std::sync::Arc;
 
@@ -76,11 +70,6 @@ impl Handler for InboxListHandler {
             .api
             .drive(self.api.store.list(&request))
             .map_err(map_inbox_error)?;
-        // A notification is not a permanent capability to its subject. Re-confirm every returned
-        // subject at a strong current snapshot and hold denied/uncertain rows instead of leaking
-        // their structured reference. The page is bounded to 100, so this fallback cannot fan out
-        // without limit; a future authz-visible SQL projection can replace it without changing the
-        // wire contract.
         let items = page
             .items
             .iter()
@@ -254,7 +243,6 @@ fn map_inbox_error(error: PgInboxError) -> EdgeError {
     }
 }
 
-/// Mount the recipient-scoped durable inbox list. No route carries a tenant or recipient selector.
 pub fn register_notif(
     builder: GatewayBuilder,
     store: Arc<PgInboxStore>,

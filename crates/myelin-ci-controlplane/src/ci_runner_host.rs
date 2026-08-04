@@ -1,9 +1,3 @@
-//! Coordinated lifecycle owner for the production CI starter, Flow recovery, and sandbox runner.
-//!
-//! One signal stops all three intake paths. The async starter and workflow lanes are joined with the
-//! dedicated runner thread; an already-launched sandbox is allowed to finish under its persisted
-//! per-job timeout. Any lane failure stops its peers and is surfaced to the service lifecycle.
-
 use std::future::Future;
 use std::time::Duration;
 
@@ -16,16 +10,10 @@ use crate::{
     MAX_CI_WORKFLOW_SCOPES_PER_PASS, MAX_JOB_TIMEOUT_SECS,
 };
 
-/// Production starter/recovery cadence. Each pass is additionally bounded by the public batch
-/// ceilings below.
 pub const CI_RUNNER_HOST_POLL_INTERVAL: Duration = Duration::from_millis(250);
-/// Process-fatal graceful-drain deadline: the maximum admitted sandbox wall clock plus one minute.
-/// Crossing it fails the service immediately, but the supervisor retains and awaits every task/thread
-/// owner until the process is terminated or the work actually returns.
 pub const CI_RUNNER_HOST_DRAIN_TIMEOUT: Duration =
     Duration::from_secs(MAX_JOB_TIMEOUT_SECS as u64 + 60);
 
-/// Validated lifecycle bounds for one runner host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CiRunnerHostConfig {
     starter_poll_interval: Duration,
@@ -37,8 +25,6 @@ pub struct CiRunnerHostConfig {
 }
 
 impl CiRunnerHostConfig {
-    /// Production bounds: one complete bounded page per 250 ms tick, with an explicit process-fatal
-    /// maximum-job drain deadline.
     pub const fn production() -> Self {
         Self {
             starter_poll_interval: CI_RUNNER_HOST_POLL_INTERVAL,
@@ -82,7 +68,6 @@ impl Default for CiRunnerHostConfig {
     }
 }
 
-/// Credential-free runner-host failure. Values are safe to emit at the composition root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiRunnerHostFailure {
     InvalidConfig,
@@ -99,9 +84,6 @@ pub enum CiRunnerHostFailure {
     WorkflowExitedEarly,
     RunnerExitedEarly,
     DrainTimedOut,
-    /// CT-007 slice 4: `GvisorBackend::try_new` refused the preflighted `GvisorWorkspaceConfig`
-    /// before the runner ever attempted a claim. An expected, diagnosable operational failure, not
-    /// a panic -- the detailed cause is already logged on the runner thread itself.
     SandboxBackendInitializationFailed,
 }
 
@@ -136,7 +118,6 @@ impl std::fmt::Display for CiRunnerHostFailure {
 
 impl std::error::Error for CiRunnerHostFailure {}
 
-/// Complete, not-yet-started production runner host.
 pub struct CiRunnerHost {
     starter: PgCiRunStarterPoller,
     workflow: CiProductionWorkflowPoller,
@@ -156,8 +137,6 @@ impl CiRunnerHost {
         }
     }
 
-    /// Start every lane behind one owned lifecycle signal. The runner thread is created before the
-    /// Tokio tasks so thread-resource failure leaves no detached partial host.
     pub fn start(
         self,
         config: CiRunnerHostConfig,
@@ -166,12 +145,6 @@ impl CiRunnerHost {
         self.start_with_shutdown(config, shutdown)
     }
 
-    /// Start every lane behind a lifecycle signal that was armed before host construction.
-    ///
-    /// Production passes the process-wide shutdown sender installed before bootstrap. A signal
-    /// received while migrations or composition are still running is therefore already visible to
-    /// every lane at its first instruction; no queued work can be admitted in the gap between
-    /// bootstrap and host supervision.
     pub fn start_with_shutdown(
         self,
         config: CiRunnerHostConfig,
@@ -217,8 +190,6 @@ fn map_starter_error(error: CiRunStarterPollerError) -> CiRunnerHostFailure {
     CiRunnerHostFailure::Starter
 }
 
-/// Owned running host. A failure receiver lets the service stop intake immediately if any lane
-/// fails; `shutdown` always joins the supervisor's bounded drain before returning.
 pub struct CiRunnerHostHandle {
     shutdown: watch::Sender<bool>,
     failures: watch::Receiver<Option<CiRunnerHostFailure>>,
@@ -243,8 +214,6 @@ impl CiRunnerHostHandle {
     }
 }
 
-/// Wait for a host failure. Closing the supervisor without publishing one is itself a failure:
-/// production must never silently continue serving after losing its runner host.
 pub async fn wait_for_ci_runner_host_failure(
     mut failures: watch::Receiver<Option<CiRunnerHostFailure>>,
 ) -> CiRunnerHostFailure {
@@ -258,10 +227,6 @@ pub async fn wait_for_ci_runner_host_failure(
     }
 }
 
-/// Retained production watchdog for the process-fatal drain deadline. Earlier lane failures are
-/// deliberately ignored here because the service lifecycle observes them; this receiver stays live
-/// after that first observer resolves so a later stuck-drain deadline cannot become an infinite hang.
-/// `true` means the deadline fired; `false` means the host supervisor ended without one.
 pub async fn wait_for_ci_runner_host_drain_timeout(
     mut failures: watch::Receiver<Option<CiRunnerHostFailure>>,
 ) -> bool {
@@ -674,10 +639,6 @@ mod tests {
         );
     }
 
-    /// CT-007 slice 4: a sandbox-backend construction refusal (the preflighted
-    /// `GvisorWorkspaceConfig` no longer matches what `GvisorBackend::try_new` finds on the
-    /// runner thread) must behave exactly like every other static runner refusal --
-    /// mirrors `static_runner_refusal_stops_async_intake_and_surfaces`.
     #[tokio::test]
     async fn sandbox_backend_initialization_failure_stops_async_intake_and_surfaces() {
         let async_lanes_stopped = Arc::new(AtomicUsize::new(0));

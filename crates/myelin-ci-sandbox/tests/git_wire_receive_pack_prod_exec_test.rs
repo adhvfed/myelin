@@ -1,11 +1,3 @@
-//! # CT-006d: the SANDBOXED receive-pack PACK-INGEST self-test — REAL `git index-pack` in `runsc`
-//!
-//! Proves [`GvisorBackend::launch_git_receive_pack`] ingests a real push-shaped packfile inside the
-//! hardened gVisor sandbox (writable `/tmp` tmpfs quarantine — NOT a host bind), `--fix-thin`-completes
-//! it against the RO `/repo` alternates, and streams a VALIDATED, self-contained packfile back on
-//! stdout that the HOST can re-index. The repo bind stays READ-ONLY. Gated exactly like the CT-006a
-//! sandbox self-test (`MYELIN_REQUIRE_RUNSC=1` ⇒ a missing capability is a HARD failure).
-
 #![cfg(feature = "integration")]
 
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -35,7 +27,7 @@ fn require_or_skip(test: &str) -> Option<String> {
         Some(bin) => bin,
         None if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
             panic!(
-                "[{test}] MYELIN_REQUIRE_RUNSC=1 but runsc is absent — refusing a vacuous green."
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but runsc is absent - refusing a vacuous green."
             );
         }
         None => {
@@ -49,7 +41,7 @@ fn require_or_skip(test: &str) -> Option<String> {
         Err(error) if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
             panic!(
                 "[{test}] MYELIN_REQUIRE_RUNSC=1 but the pinned production git rootfs is \
-                 unavailable: {error} — refusing a vacuous green."
+                 unavailable: {error} - refusing a vacuous green."
             );
         }
         Err(error) => {
@@ -74,7 +66,6 @@ fn run_git(args: &[&str], cwd: Option<&Path>) -> std::process::Output {
     out
 }
 
-/// Parse a `git cat-file --batch` stream: `<oid> SP <type> SP <size>\n<payload>\n` repeated.
 fn parse_batch(mut buf: &[u8]) -> Vec<(String, String, Vec<u8>)> {
     let mut out = Vec::new();
     while !buf.is_empty() {
@@ -86,7 +77,7 @@ fn parse_batch(mut buf: &[u8]) -> Vec<(String, String, Vec<u8>)> {
         buf = &buf[nl + 1..];
         let parts: Vec<&str> = header.split(' ').collect();
         if parts.len() < 3 {
-            break; // a `missing`/`ambiguous` line — should not happen on the happy path
+            break;
         }
         let size: usize = parts[2].parse().unwrap_or(0);
         let payload = buf[..size].to_vec();
@@ -131,7 +122,6 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
         None,
     );
 
-    // Author commit 1, push it (so the bare repo has a base for a THIN pack), then author commit 2.
     let work = root.join("work");
     std::fs::create_dir_all(&work).unwrap();
     run_git(&["init", "-q", "-b", "main"], Some(&work));
@@ -165,7 +155,6 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
         .trim()
         .to_string();
 
-    // Build the THIN pack a push of c2 (with base c1 already on the server) would send.
     let pack = {
         let out = Command::new("git")
             .args([
@@ -208,7 +197,7 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
         "acme",
         "fr-par",
         "widgets",
-        Vec::new(), // ignored for receive-pack ingest (sh -c runs the fixed script)
+        Vec::new(),
         pack,
         Vec::new(),
         None,
@@ -242,8 +231,6 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
     );
     assert_eq!(result.exit_code, Some(0), "ingest must exit 0");
 
-    // The streamed stdout is a `git cat-file --batch` object stream: `<oid> SP <type> SP <size>\n<payload>\n`
-    // per object, deltas already resolved. Parse it and assert the NEW commit came through, fully materialised.
     let objs = parse_batch(&result.stdout);
     println!("=== streamed {} fully-resolved objects ===", objs.len());
     for (oid, ty, bytes) in &objs {
@@ -256,7 +243,6 @@ fn sandboxed_receive_pack_ingests_a_thin_pack_and_streams_a_validated_pack() {
         commit.is_some(),
         "the new commit {new_oid} must be in the streamed object set, fully resolved"
     );
-    // The commit payload is the real, delta-resolved object (starts with `tree `) — a thin delta would be opaque.
     assert!(
         commit.unwrap().2.starts_with(b"tree "),
         "the streamed commit must be a fully-materialised object"

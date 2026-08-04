@@ -1,8 +1,3 @@
-//! Unit tests for the CI metering module (CI-P17 → P-360, M4): the reserve/settle bookends
-//! (refuse-start-on-exhaustion, settle-on-job.done, never interrupt in flight), the `cost_event`
-//! integer-minor-units + wholesale ≠ markup invariant, the resource-second meter taxonomy, and the
-//! CI-D5 reserve/settle-parity drill (the GATE).
-
 use super::*;
 use myelin_flow::{BudgetGate, Wallet};
 use myelin_tenancy::TenantId;
@@ -11,8 +6,6 @@ fn tenant() -> TenantId {
     TenantId::from_token("01J0ACME")
 }
 
-/// The frozen meter token set is EXACTLY the `cost_event.meter` CHECK constraint set — no sixth meter,
-/// round-trips through the token, parses back, and rejects an unknown token (a corrupt write).
 #[test]
 fn meter_taxonomy_is_the_frozen_cost_event_set() {
     assert_eq!(
@@ -35,18 +28,14 @@ fn meter_taxonomy_is_the_frozen_cost_event_set() {
     );
 }
 
-/// The kind tokens are exactly the `cost_event.kind` CHECK set — `ci` | `agent` (UNIFY / X-6).
 #[test]
 fn cost_kind_tokens_are_ci_and_agent() {
     assert_eq!(CostKind::Ci.token(), "ci");
     assert_eq!(CostKind::Agent.token(), "agent");
 }
 
-/// **`cost_event` rows record wholesale + markup as DISTINCT integer-minor-units columns** — one row
-/// per metered unit, the billed total is `wholesale + markup`, and a float cost is unrepresentable.
 #[test]
 fn cost_event_rows_carry_distinct_wholesale_and_markup_columns() {
-    // 20% flat markup (the test stand-in for Commercial's R-2 pricing table).
     let markup = FlatBpsMarkup::new(2_000);
     let samples = [
         (Meter::CpuSeconds, 120u64, MicroUsd(240)),
@@ -62,10 +51,8 @@ fn cost_event_rows_carry_distinct_wholesale_and_markup_columns() {
         &markup,
     );
 
-    // ONE row per metered unit (the cost_events_per_unit == 1 invariant).
     assert_eq!(rows.len(), 3, "one cost_event per metered unit");
 
-    // The cpu row: wholesale 240, markup 20% of 240 = 48 — DISTINCT columns, never conflated.
     let cpu = &rows[0];
     assert_eq!(cpu.meter, Meter::CpuSeconds);
     assert_eq!(
@@ -84,7 +71,7 @@ fn cost_event_rows_carry_distinct_wholesale_and_markup_columns() {
     );
     assert_ne!(
         cpu.wholesale, cpu.markup,
-        "wholesale ≠ markup — two distinct columns"
+        "wholesale ≠ markup - two distinct columns"
     );
     assert_eq!(
         cpu.billed(),
@@ -93,7 +80,6 @@ fn cost_event_rows_carry_distinct_wholesale_and_markup_columns() {
     );
     assert_eq!(cpu.kind, CostKind::Ci);
 
-    // The agent kind fronts the SAME schema (UNIFY / X-6).
     let agent_rows = meter_resource_seconds(
         &tenant(),
         "agent/run/9",
@@ -109,21 +95,17 @@ fn cost_event_rows_carry_distinct_wholesale_and_markup_columns() {
     );
 }
 
-/// The flat-bps markup is an integer floor of `wholesale * bps / 10_000` — never a fractional cost,
-/// and a huge wholesale does not overflow before the divide (u128 widening).
 #[test]
 fn flat_bps_markup_is_integer_and_overflow_safe() {
-    let m = FlatBpsMarkup::new(2_000); // 20%
+    let m = FlatBpsMarkup::new(2_000);
     assert_eq!(
         m.markup_for(Meter::CpuSeconds, 1, MicroUsd(100)),
         MicroUsd(20)
     );
-    // Integer floor: 99 * 20% = 19.8 → 19.
     assert_eq!(
         m.markup_for(Meter::CpuSeconds, 1, MicroUsd(99)),
         MicroUsd(19)
     );
-    // A huge wholesale * bps would overflow u64 if not widened — proves the u128 path.
     let big = m.markup_for(Meter::CpuSeconds, 1, MicroUsd(u64::MAX));
     assert!(
         big.0 > 0,
@@ -131,22 +113,17 @@ fn flat_bps_markup_is_integer_and_overflow_safe() {
     );
 }
 
-/// **The reserve/settle bookend at the resource-second grain (refuse-start, settle-on-job.done).** A
-/// funded CI run reserves, settles its resource-seconds (recording cost_event rows), and the wallet is
-/// debited only the billed amount.
 #[test]
 fn ci_meter_reserves_and_settles_resource_seconds() {
     let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
     let meter = CiMeter::new(&gate, FlatBpsMarkup::new(2_000));
     let run = myelin_storage::reserve_settle::RunId::new("ci/run/1");
 
-    // reserve_budget: reserve 400 (the resource-second upper bound) → wallet 600, in-flight.
     meter
         .reserve_budget(&tenant(), &run, MicroUsd(400))
         .expect("a funded reserve admits + begins (in-flight)");
     assert_eq!(meter.balance(), MicroUsd(600), "reserved 400");
 
-    // settle_budget: bill cpu 200 wholesale + 40 markup = 240 → refund 400 − 240 = 160.
     let rows = meter
         .settle_budget(
             &tenant(),
@@ -159,7 +136,6 @@ fn ci_meter_reserves_and_settles_resource_seconds() {
         .expect("a settle records the cost events + refunds the over-reservation");
     assert_eq!(rows.len(), 1, "one cost_event per metered unit");
     assert_eq!(rows[0].billed(), Some(MicroUsd(240)));
-    // wallet: 600 + refund(400 − 240 = 160) = 760.
     assert_eq!(
         meter.balance(),
         MicroUsd(760),
@@ -172,11 +148,9 @@ fn ci_meter_reserves_and_settles_resource_seconds() {
     );
 }
 
-/// **refuse-to-start on exhaustion — the run NEVER starts (arch §6, the runaway self-limiter).** A
-/// reserve against an empty wallet is REFUSED loudly; nothing is reserved.
 #[test]
 fn reserve_against_exhausted_wallet_refuses_the_start() {
-    let gate = BudgetGate::new(Wallet::new(MicroUsd::ZERO)); // exhausted.
+    let gate = BudgetGate::new(Wallet::new(MicroUsd::ZERO));
     let meter = CiMeter::new(&gate, FlatBpsMarkup::new(2_000));
     let run = myelin_storage::reserve_settle::RunId::new("ci/run/broke");
     let err = meter
@@ -188,8 +162,6 @@ fn reserve_against_exhausted_wallet_refuses_the_start() {
     );
 }
 
-/// **Never interrupt in flight — a depleting wallet refuses the NEXT run but never tears down the
-/// running one.** Run A reserves the whole wallet (in-flight); run B is refused; A still settles.
 #[test]
 fn in_flight_run_is_never_interrupted_by_exhaustion() {
     let gate = BudgetGate::new(Wallet::new(MicroUsd(100)));
@@ -197,16 +169,13 @@ fn in_flight_run_is_never_interrupted_by_exhaustion() {
     let run_a = myelin_storage::reserve_settle::RunId::new("ci/run/a");
     let run_b = myelin_storage::reserve_settle::RunId::new("ci/run/b");
 
-    // A reserves the whole wallet (in-flight, NEVER interrupted).
     meter
         .reserve_budget(&tenant(), &run_a, MicroUsd(100))
         .unwrap();
-    // B is refused — the wallet is exhausted.
     assert!(matches!(
         meter.reserve_budget(&tenant(), &run_b, MicroUsd(50)),
         Err(myelin_flow::BudgetError::Refused { .. })
     ));
-    // A still settles (it was never torn down) — bill 100, no refund.
     meter
         .settle_budget(
             &tenant(),
@@ -224,8 +193,6 @@ fn in_flight_run_is_never_interrupted_by_exhaustion() {
     );
 }
 
-/// `metered_units_for` carries the wholesale + markup split THROUGH unchanged so the engine ledger
-/// records the same two distinct columns.
 #[test]
 fn metered_units_carry_the_split_through_unchanged() {
     let rows = meter_resource_seconds(
@@ -234,7 +201,7 @@ fn metered_units_carry_the_split_through_unchanged() {
         "j",
         CostKind::Ci,
         &[(Meter::CpuSeconds, 10, MicroUsd(100))],
-        &FlatBpsMarkup::new(5_000), // 50%
+        &FlatBpsMarkup::new(5_000),
     );
     let units = metered_units_for(&rows);
     assert_eq!(units.len(), 1);
@@ -243,9 +210,6 @@ fn metered_units_carry_the_split_through_unchanged() {
     assert_eq!(units[0].markup, MicroUsd(50));
 }
 
-/// [`MeteredResource`] converts to the engine [`MeteredUnit`] carrying the meter token + the split,
-/// and `billed` sums wholesale + markup (checked) — exercises the public `MeteredResource` API so it
-/// is not a silent dead value.
 #[test]
 fn metered_resource_converts_and_bills() {
     let r = MeteredResource {
@@ -263,7 +227,6 @@ fn metered_resource_converts_and_bills() {
         Some(MicroUsd(150)),
         "billed = wholesale + markup"
     );
-    // An overflowing billed is a loud None (integer minor-units, never a silent wrap).
     let overflow = MeteredResource {
         meter: Meter::CpuSeconds,
         amount: 1,
@@ -273,20 +236,14 @@ fn metered_resource_converts_and_bills() {
     assert_eq!(overflow.billed(), None);
 }
 
-/// **THE CI-D5 GATE: reserve/settle parity CI ↔ agent.** Exhaust ONE wallet; both a CI run AND an
-/// agent run refuse-start (the parity); 0 starts past exhaustion; 0 in-flight interrupts; one
-/// cost_event per metered unit; and a pricing change re-prices the markup column while the wholesale
-/// column + the 0-over-exhaustion property are STABLE.
 #[test]
 fn ci_d5_reserve_settle_parity_drill_is_green() {
-    // The wallet affords exactly 4 runs of 300; samples are 2 dimensions so wholesale ≠ markup is
-    // exercised across meters.
     let samples = [
         (Meter::CpuSeconds, 120u64, MicroUsd(200)),
         (Meter::MemGbSeconds, 64, MicroUsd(40)),
     ];
-    let before = FlatBpsMarkup::new(2_000); // 20% markup
-    let after = FlatBpsMarkup::new(3_500); // a PRICING CHANGE — 35% markup
+    let before = FlatBpsMarkup::new(2_000);
+    let after = FlatBpsMarkup::new(3_500);
 
     let signal =
         reserve_settle_parity_drill(&tenant(), MicroUsd(300), 4, &samples, &before, &after);
@@ -295,7 +252,6 @@ fn ci_d5_reserve_settle_parity_drill_is_green() {
         signal.is_green(),
         "the CI-D5 drill must be GREEN: {signal:?}"
     );
-    // The parity: BOTH kinds refuse-start when exhausted.
     assert!(
         signal.ci_refused_when_exhausted,
         "the CI run refused-start past exhaustion"
@@ -304,14 +260,10 @@ fn ci_d5_reserve_settle_parity_drill_is_green() {
         signal.agent_refused_when_exhausted,
         "the agent run refused-start past exhaustion"
     );
-    // 0 starts past exhaustion (the headline number).
     assert_eq!(signal.starts_past_exhaustion, 0, "0 over-exhaustion starts");
     assert_eq!(signal.inflight_interrupt_count, 0, "0 in-flight interrupts");
-    // One cost_event per metered unit: 4 runs * 2 dimensions = 8.
     assert_eq!(signal.cost_events_recorded, 8);
     assert_eq!(signal.metered_units, 8);
-    // BOTH kinds participated in the SAME metering path (the unified meter — runs 0,2 = ci; 1,3 =
-    // agent → 2 runs each * 2 dimensions = 4 events each).
     assert_eq!(
         signal.ci_cost_events, 4,
         "CI runs metered into the shared path"
@@ -324,7 +276,6 @@ fn ci_d5_reserve_settle_parity_drill_is_green() {
         signal.ci_cost_events + signal.agent_cost_events,
         signal.cost_events_recorded
     );
-    // wholesale ≠ markup, and the pricing change moves the markup but NOT the wholesale.
     assert_ne!(
         signal.wholesale_total, signal.markup_total_before,
         "wholesale ≠ markup"
@@ -333,22 +284,15 @@ fn ci_d5_reserve_settle_parity_drill_is_green() {
         signal.markup_total_before, signal.markup_total_after,
         "the pricing change re-prices the markup column"
     );
-    // wholesale is the SAME basis under both pricings (the pricing change touches ONLY markup):
-    // 4 runs * (200 + 40) = 960 wholesale.
     assert_eq!(
         signal.wholesale_total,
         MicroUsd(960),
         "the wholesale column is stable"
     );
-    // markup before: 4 * (200*20% + 40*20%) = 4 * (40 + 8) = 192.
     assert_eq!(signal.markup_total_before, MicroUsd(192));
-    // markup after: 4 * (200*35% + 40*35%) = 4 * (70 + 14) = 336.
     assert_eq!(signal.markup_total_after, MicroUsd(336));
 }
 
-/// The drill's `run_kind` alternates CI (even) / agent (odd) so both kinds meter into the same path
-/// (the unified-meter property). Pins the alternation so a `%`→`/` or `==`→`!=` regression (which
-/// would make every run the SAME kind — breaking the parity coverage) is caught.
 #[test]
 fn run_kind_alternates_ci_even_agent_odd() {
     assert_eq!(super::run_kind(0), CostKind::Ci);
@@ -357,9 +301,6 @@ fn run_kind_alternates_ci_even_agent_odd() {
     assert_eq!(super::run_kind(3), CostKind::Agent);
 }
 
-/// `count_over_exhaustion_starts` counts the kinds that did NOT refuse-start (the RED metric): both
-/// refused → 0 (green), one started → 1, both started → 2. Pins the `+` (not `-`/`*`) so a regression
-/// that under-counts a parity breach is caught.
 #[test]
 fn over_exhaustion_starts_counts_each_non_refusal() {
     assert_eq!(
@@ -384,8 +325,6 @@ fn over_exhaustion_starts_counts_each_non_refusal() {
     );
 }
 
-/// A RED parity signal is correctly classified NOT green — proving `is_green` is not vacuously true
-/// (a start past exhaustion, or one kind not refusing, must read RED).
 #[test]
 fn a_red_parity_signal_is_not_green() {
     let base = ReserveSettleParitySignal {
@@ -403,14 +342,12 @@ fn a_red_parity_signal_is_not_green() {
     };
     assert!(base.is_green(), "the baseline is green");
 
-    // No CI run participated (only agent metered) → NOT the parity, reads RED.
     let no_ci = ReserveSettleParitySignal {
         ci_cost_events: 0,
         agent_cost_events: 8,
         ..base.clone()
     };
     assert!(!no_ci.is_green(), "no CI run in the shared path reads RED");
-    // No agent run participated → reads RED.
     let no_agent = ReserveSettleParitySignal {
         ci_cost_events: 8,
         agent_cost_events: 0,
@@ -421,7 +358,6 @@ fn a_red_parity_signal_is_not_green() {
         "no agent run in the shared path reads RED"
     );
 
-    // The agent kind did NOT refuse — a parity breach (an over-exhaustion agent start).
     let agent_started = ReserveSettleParitySignal {
         agent_refused_when_exhausted: false,
         starts_past_exhaustion: 1,
@@ -432,14 +368,12 @@ fn a_red_parity_signal_is_not_green() {
         "an agent start past exhaustion reads RED"
     );
 
-    // A cost-event mismatch (a metered unit recorded no event) reads RED.
     let mismatch = ReserveSettleParitySignal {
         cost_events_recorded: 7,
         ..base.clone()
     };
     assert!(!mismatch.is_green(), "a cost-event mismatch reads RED");
 
-    // wholesale == markup (the two columns conflated) reads RED.
     let conflated = ReserveSettleParitySignal {
         markup_total_before: MicroUsd(960),
         ..base.clone()
@@ -447,11 +381,6 @@ fn a_red_parity_signal_is_not_green() {
     assert!(!conflated.is_green(), "wholesale == markup reads RED");
 }
 
-/// **Model ↔ SQL drift guard for the durable `cost_event` settle (CT-004).** The durable
-/// [`INSERT_COST_EVENT_QUERY`] MUST write exactly the columns the in-memory [`CostEventRow`] model
-/// mirrors, keep wholesale + markup as TWO distinct columns (the §8 invariant — never one conflated
-/// number), and be exactly-once on `(tenant_id, cost_id)` (`ON CONFLICT … DO NOTHING`). If the model
-/// row gains/loses a billed dimension the constant must move in lockstep — this fails loud otherwise.
 #[test]
 fn insert_cost_event_query_matches_the_cost_event_row_model() {
     let q = INSERT_COST_EVENT_QUERY;
@@ -459,7 +388,6 @@ fn insert_cost_event_query_matches_the_cost_event_row_model() {
         q.contains("INSERT INTO ci_cost_event"),
         "writes the ci_cost_event table (CT-004m: CI-namespaced, distinct from Storage's cost_event)"
     );
-    // Every CostEventRow field has its column (run/job attribution + the two distinct cost columns).
     for col in [
         "tenant_id",
         "region",
@@ -477,17 +405,14 @@ fn insert_cost_event_query_matches_the_cost_event_row_model() {
             "the durable settle writes the {col} column"
         );
     }
-    // wholesale + markup are SEPARATE columns (never conflated — the arch 02 §8 invariant).
     assert!(
         q.contains("wholesale_minor_units") && q.contains("markup_minor_units"),
         "wholesale ≠ markup: the two cost columns are distinct in the durable write"
     );
-    // Exactly-once settle: a re-delivered job.done records the same cost_id ONCE (double-effect = 0).
     assert!(
         q.contains("ON CONFLICT (tenant_id, cost_id) DO NOTHING"),
-        "the settle is idempotent on (tenant_id, cost_id) — exactly-once cost recording"
+        "the settle is idempotent on (tenant_id, cost_id) - exactly-once cost recording"
     );
-    // The read-back attributes to the producing run.
     assert!(
         SELECT_COST_EVENTS_FOR_RUN_QUERY.contains("WHERE tenant_id = $1 AND run_id = $2"),
         "the read-back attributes every metered unit to its (tenant, run)"

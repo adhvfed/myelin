@@ -1,4 +1,3 @@
-//! Live proof of the complete production dispatch composition over PG + NATS + Git + S3.
 #![cfg(feature = "integration")]
 
 use std::sync::Arc;
@@ -321,9 +320,6 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
         "the production dispatch transaction allocates a new monotonic attempt before each queued fact"
     );
 
-    // Regression for the audit's gate-green rerun window: make attempt 1 a settled success, prove
-    // it admits, then consume the second production-dispatch queued fact. Its allocated attempt 2
-    // must supersede immediately and block before PgPipelineStarter emits InProgress.
     let projection = PgCheckStatusProjection::connect(
         pool.clone(),
         "dispatch_check_status",
@@ -497,8 +493,6 @@ async fn elected_publisher_delivers_trigger_then_dispatch_leaves_new_rows_for_ne
     );
 
     handle.signal_drain();
-    // `drain(self)` consumes and drops the original handle/boxed transport. Dropping the returned
-    // telemetry makes that ownership boundary explicit before a fresh client rebinds the durable.
     drop(handle.drain());
     let rebound = NatsJetStreamBus::connect_consumer(intake_config, rt.clone()).unwrap();
     assert!(

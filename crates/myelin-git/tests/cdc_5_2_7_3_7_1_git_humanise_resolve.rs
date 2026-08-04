@@ -1,36 +1,3 @@
-//! # The CDC pair for contracts 5.2 + 7.3 + 7.1 — **Git's resolve-for-unfurls bridged through Notif's
-//! humanise (the ONE templating surface); review-requests a FILTER over the ONE inbox** (GIT-P31 /
-//! P-292, M3-G8)
-//!
-//! **Contract-index rows.**
-//! - **5.2** `resolve(ref, viewer, mode) → Projection | Tombstone` — the live per-viewer unfurl/embed;
-//!   denied → tombstone; `Display` mode = the Notif humanisation projection (cell-local, OQ-I). The
-//!   resolve SEAM is Refs/Notif's frozen [`RefResolvePort`](myelin_notif::RefResolvePort); THIS file
-//!   pins the **Git slice** — Git's REAL [`GitRefResolver`](myelin_git::git_resolve::GitRefResolver)
-//!   delegating to its [`Projector`](myelin_git::project::Projector) (5.6).
-//! - **7.3** `humanise((template_key, args), viewer, locale) → HumanisedString` — the ONE templating
-//!   surface; resolves each `ArtifactRef` per-viewer via the 5.2 resolve port; permission/erasure-safe.
-//!   The humanise verb is owned + frozen by Notif (NOTIF-P9, `crates/myelin-notif/tests/`); THIS file
-//!   pins the **Git consumer slice** — Git's resolver feeds humanise → a confidential subject renders a
-//!   tombstone (0 title leak).
-//! - **7.1** `list_inbox(principal, filter?) → [InboxItem]` — the ONE inbox (C-9); scoped views (Git
-//!   "Review requests") are `filter`s over `reason`/`subject`, NEVER a second store. THIS file pins
-//!   that Git's "Review requests" view is the [`git_review_requests_filter`] predicate over the ONE
-//!   inbox.
-//!
-//! **PROVIDER / CONSUMER.**
-//! - the **PROVIDER** (the resolve transport) is **Git's [`GitRefResolver`]** — a REAL impl of the
-//!   frozen [`RefResolvePort`] over Git's permission-first [`Projector`]. Its promise: a denied/erased
-//!   ref returns a [`Tombstone`](myelin_notif::Tombstone) (no `title` field) — the leak invariant is
-//!   structural.
-//! - the **CONSUMER** is **Notif's [`humanise`](myelin_notif::humanise)** — it calls `resolve_display`
-//!   per-viewer BEFORE formatting and binds a denied slot to the PII-free tombstone display.
-//!
-//! A drift on either side (Git widens the deny path / leaks a title into the tombstone branch; Notif
-//! changes the resolve→slot binding or the tombstone display) fails this test in the same CI job. **The
-//! gate of GIT-P31 is the resolve→humanise→tombstone chain over Git's REAL projector** — replacing the
-//! GIT-P19 test-local resolve stand-in (the named floor).
-
 use myelin_git::body::Body;
 use myelin_git::check_status::GateOutcome;
 use myelin_git::git_resolve::{
@@ -194,13 +161,6 @@ fn resolver(granted: bool) -> (GitRefResolver<StubId>, ArtifactRef) {
     (GitRefResolver::new(Projector::new(id, store)), pr_ref)
 }
 
-// ===========================================================================
-// 5.2 — PROVIDER (Git's resolver returns Projection | Tombstone, permission-first)
-// ===========================================================================
-
-/// **PROVIDER side (5.2) — Git's resolver returns a Tombstone for a denied viewer (no title) + a
-/// Projection for a permitted viewer.** The `Projection | Tombstone` shape IS the 5.2 contract; the
-/// resolver delegates to Git's permission-first projector.
 #[test]
 fn provider_git_resolver_returns_projection_or_tombstone() {
     let (denied_resolver, pr_ref) = resolver(false);
@@ -228,13 +188,6 @@ fn provider_git_resolver_returns_projection_or_tombstone() {
     }
 }
 
-// ===========================================================================
-// 7.3 — CONSUMER (Notif's humanise binds the resolver's slots; denied → tombstone, 0 leak)
-// ===========================================================================
-
-/// **CONSUMER side (7.3) — Notif's humanise renders a confidential Git subject as a TOMBSTONE for a
-/// denied viewer (0 title leak).** humanise calls the resolver per-viewer; the denied slot binds the
-/// PII-free tombstone display, never the title.
 #[test]
 fn consumer_humanise_renders_denied_git_subject_as_tombstone() {
     let (resolver, pr_ref) = resolver(false);
@@ -261,8 +214,6 @@ fn consumer_humanise_renders_denied_git_subject_as_tombstone() {
     assert!(h.links.is_empty(), "no click-route for a denied subject");
 }
 
-/// **CONSUMER side (7.3) — a PERMITTED viewer's humanise carries the title + the click-route.** The
-/// gate discriminates (the ONE templating surface is not a blanket redaction).
 #[test]
 fn consumer_humanise_renders_permitted_git_subject_with_title() {
     let (resolver, pr_ref) = resolver(true);
@@ -289,13 +240,6 @@ fn consumer_humanise_renders_permitted_git_subject_with_title() {
     );
 }
 
-// ===========================================================================
-// 7.1 — Review-requests are a FILTER over the ONE inbox (never a second store)
-// ===========================================================================
-
-/// **7.1 — Git's "Review requests" scoped view is a FILTER over the ONE inbox, never a second store.**
-/// The filter is `reason = ReviewRequested` AND a git subject; a non-review / non-git row is filtered
-/// out — the row lives in the ONE inbox, the view just selects it.
 #[test]
 fn review_requests_is_a_filter_over_the_one_inbox() {
     let (reason, prefix) = git_review_requests_filter();

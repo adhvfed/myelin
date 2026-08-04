@@ -1,25 +1,3 @@
-//! # The subsystem command framework — REUSE the grammars, map to the edge route.
-//!
-//! This is the headline of MR-020: the CLI is a THIN shell over (a) each subsystem's OWN command
-//! grammar and (b) the MR-014 edge contract. A subsystem's command SET is NOT re-declared here — it
-//! is parsed by the subsystem's own total parser, and the parsed command is mapped to an edge
-//! `(method, path)`. So a new git command added to `myelin_git::api` flows to the CLI the moment its
-//! `parse_cli` accepts it; the only thing this crate adds is the route mapping.
-//!
-//! ## How a subsystem adds CLI commands (the plug-in convention — mirrors the MR-014 edge plug-in)
-//! The MR-014 edge convention is "a subsystem adds ONLY its routes + handlers; the gateway owns
-//! auth/scope/error/pagination". The CLI's mirror is:
-//!   1. **Parse** — the subsystem exposes a total `parse(args) -> Result<Command, ParseError>` over
-//!      its frozen verb grammar (git: [`myelin_git::api::parse_cli`]; notif: [`myelin_notif::cli`]).
-//!      The CLI calls it verbatim — it never re-derives the verbs.
-//!   2. **Map** — a small `command -> EdgeCall` function names the `(method, path, query, payload)`
-//!      the parsed command lowers to (reusing the subsystem's edge routes, registered MR-015+).
-//!   3. **Dispatch** — the CLI shell (`main`) resolves the token, presents the Bearer, runs the call,
-//!      and renders the `{items,page}` / view-model JSON (human or `--json`).
-//!
-//! Adding a subsystem to the CLI is steps 1+2 only — the auth, the Bearer presentation, the envelope
-//! parsing, the rendering, and the exit codes are owned ONCE by the shell (this crate), for everyone.
-
 use crate::error::CliError;
 use myelin_ci_controlplane::cli::{parse_cli as parse_ci_cli, CliCommand as CiCliCommand};
 use myelin_git::api::{parse_cli, CliCommand, CliParseError};
@@ -80,17 +58,13 @@ impl FormQuery {
     }
 }
 
-/// The HTTP method an [`EdgeCall`] uses (the CLI only issues reads + simple writes today).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HttpMethod {
-    /// A read (`GET`).
     Get,
-    /// A write (`POST`).
     Post,
 }
 
 impl HttpMethod {
-    /// The uppercase HTTP token.
     pub fn as_str(self) -> &'static str {
         match self {
             HttpMethod::Get => "GET",
@@ -99,21 +73,12 @@ impl HttpMethod {
     }
 }
 
-/// **A resolved edge call** — the `(method, path)` (+ optional query/payload) a parsed subsystem
-/// command lowers to. The path is the versioned `/v1/...` route the MR-014 gateway dispatches; the
-/// tenant is NEVER in the path (it is the verified token's — the IDOR floor).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EdgeCall {
-    /// The HTTP method.
     pub method: HttpMethod,
-    /// The versioned route path (`/v1/git/repos`).
     pub path: String,
-    /// The raw query string (without `?`), if any.
     pub query: Option<String>,
-    /// The request payload bytes (for a write), if any.
     pub payload: Option<Vec<u8>>,
-    /// Retry-stable caller identity for a mutation. Reads never carry one; writes are refused by
-    /// the client until the top-level shell attaches the explicit global `--idempotency-key`.
     pub idempotency_key: Option<String>,
 }
 
@@ -128,8 +93,6 @@ impl EdgeCall {
         }
     }
 
-    /// A `POST` with a JSON body (the body bytes are the serialized payload). The tenant is NEVER in
-    /// the body — it is the verified token's (the IDOR floor); the body carries only the proposal.
     fn post_json(path: impl Into<String>, payload: serde_json::Value) -> EdgeCall {
         EdgeCall {
             method: HttpMethod::Post,
@@ -140,8 +103,6 @@ impl EdgeCall {
         }
     }
 
-    /// Attach the caller's retry-stable mutation identity. The grammar is byte-identical to the
-    /// production Edge's `PrOperationId`: trimmed, non-empty, at most 128 ASCII-graphic bytes.
     pub fn with_idempotency_key(mut self, value: &str) -> Result<EdgeCall, CliError> {
         if self.method != HttpMethod::Post {
             return Err(CliError::Usage(
@@ -162,8 +123,6 @@ impl EdgeCall {
     }
 }
 
-/// Map a parse error from a subsystem grammar to a clean [`CliError::Usage`] (exit 2) — a bad verb /
-/// missing arg is never a panic.
 fn usage_from_git(e: CliParseError) -> CliError {
     let m = match e {
         CliParseError::Empty => {
@@ -178,27 +137,13 @@ fn usage_from_git(e: CliParseError) -> CliError {
     CliError::Usage(m)
 }
 
-/// **Parse + map a `myelin git …` invocation** (the args AFTER `git`). REUSES git's own
-/// [`parse_cli`] (no re-derivation), then maps the parsed [`CliCommand`] to the edge route. A command
-/// the grammar accepts but the edge does not yet expose is a HONEST [`CliError::Unsupported`] (exit
-/// 4), never a faked success.
 pub fn git_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let command = parse_cli(args).map_err(usage_from_git)?;
     git_command_to_call(&command)
 }
 
-/// Map a git [`CliCommand`] to its edge [`EdgeCall`]. As of GT-005 the operator surface is wired to
-/// the DURABLE GT-003 edge: repo create/list/view, PR open/view/checks/review/merge/endorse, blob, and
-/// code-search all hit a real `/v1/git/...` route under the Bearer capability token (the tenant is the
-/// token's — no path-tenant). A server-side gate (the merge gate) surfaces as a clean edge error
-/// through the client, never a CLI bypass. PR lists use the edge's leak-free list handlers: an
-/// optional `--repo` selects the object-guarded repository list, while the unscoped command selects
-/// the cross-repository "needs your review" front door.
 pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
     match command {
-        // ── Reads ──
-        // GET /v1/git/repos?view=summary → the bounded lightweight catalogue rows. The CLI never
-        // requests the legacy RepoHome list projection.
         CliCommand::RepoList { limit, cursor } => {
             let mut query = FormQuery::default();
             query.push("view", "summary");
@@ -216,23 +161,17 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
                 idempotency_key: None,
             })
         }
-        // GET /v1/git/repos/<repo> → the per-repo home projection (durable on-disk state).
         CliCommand::RepoView { repo } => Ok(EdgeCall::get(format!("/v1/git/repos/{repo}"))),
-        // GET /v1/git/repos/<repo>/prs/<n> → the durable PR overview.
         CliCommand::PrView { repo, number } => {
             Ok(EdgeCall::get(format!("/v1/git/repos/{repo}/prs/{number}")))
         }
-        // GET /v1/git/repos/<repo>/prs/<n>/checks → the X-1 checks projection (the repo-owned ruleset).
         CliCommand::PrChecks { repo, number } => Ok(EdgeCall::get(format!(
             "/v1/git/repos/{repo}/prs/{number}/checks"
         ))),
-        // GET /v1/git/repos/<repo>/prs → every visible PR in one object-guarded repository.
-        // GET /v1/git/prs → the cross-repository, leak-free attention list (needs-review by default).
         CliCommand::PrList { repo } => Ok(match repo {
             Some(repo) => EdgeCall::get(format!("/v1/git/repos/{repo}/prs")),
             None => EdgeCall::get("/v1/git/prs"),
         }),
-        // GET /v1/git/search/code?q=… → the ACL-pre-filtered code-search hits.
         CliCommand::SearchCode {
             query: search,
             repo,
@@ -251,14 +190,10 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             })
         }
 
-        // ── Writes (durable GT-003; the tenant is the token's, never the body) ──
-        // POST /v1/git/repos {slug} → create a durable bare repo.
         CliCommand::RepoCreate { slug } => Ok(EdgeCall::post_json(
             "/v1/git/repos",
             json!({ "slug": slug }),
         )),
-        // POST /v1/git/repos/<repo>/prs {base_ref, head_ref, head_oid, draft} → open a PR. The body
-        // carries ONLY the proposal (never branch-protection policy or check facts — the GT-003 fix).
         CliCommand::PrOpen {
             repo,
             title,
@@ -286,7 +221,6 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
                 body,
             ))
         }
-        // POST /v1/git/repos/<repo>/prs/<n>/reviews {verdict} → submit a review.
         CliCommand::PrReview {
             repo,
             number,
@@ -295,14 +229,10 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
             format!("/v1/git/repos/{repo}/prs/{number}/reviews"),
             json!({ "verdict": verdict }),
         )),
-        // POST /v1/git/repos/<repo>/prs/<n>/merge → the merge gate (server-enforced). A blocked gate is
-        // a clean edge error the CLI surfaces (the reason), never a bypass. `--auto` (merge-when-green)
-        // is a named durable follow-on; the immediate gate evaluation runs server-side either way.
         CliCommand::PrMerge { repo, number, .. } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/merge"),
             json!({}),
         )),
-        // POST /v1/git/repos/<repo>/prs/<n>/endorse-fork-ci → the maintainer fork-CI endorsement.
         CliCommand::PrEndorseForkCi { repo, number } => Ok(EdgeCall::post_json(
             format!("/v1/git/repos/{repo}/prs/{number}/endorse-fork-ci"),
             json!({}),
@@ -310,15 +240,11 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
     }
 }
 
-/// Parse an Issues invocation with the subsystem-owned grammar and map it to the existing durable
-/// Edge routes. A create intentionally returns the Edge's `202` pending receipt; dispatch never
-/// rewrites that asynchronous contract into a claim of immediate visibility.
 pub fn issues_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let command = parse_issues_cli(args).map_err(|error| CliError::Usage(error.to_string()))?;
     Ok(issues_command_to_call(&command))
 }
 
-/// Map a validated Issues command to its tenant-less Edge call.
 pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
     match command {
         IssuesCliCommand::List {
@@ -365,13 +291,11 @@ pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
     }
 }
 
-/// Parse CI's subsystem-owned durable-read/live grammar and map it to authenticated Edge routes.
 pub fn ci_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let command = parse_ci_cli(args).map_err(|error| CliError::Usage(error.to_string()))?;
     Ok(ci_command_to_call(&command))
 }
 
-/// Map one validated CI read to the tenant-less Edge route.
 pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
     match command {
         CiCliCommand::List(request) => {
@@ -412,9 +336,6 @@ pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
     }
 }
 
-/// **Parse + map a `myelin notif …` invocation** (the args AFTER `notif`/`inbox`). REUSES notif's own
-/// grammar ([`myelin_notif::cli::CliView`] for the `--view` flag + its verb set). The durable list
-/// route is live; item detail/read mutation remain honest unsupported floors.
 pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     use myelin_notif::cli::CliView;
     let (verb, rest) = args.split_first().ok_or_else(|| {
@@ -491,7 +412,7 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
                 .ok_or_else(|| CliError::Usage(format!("`notif {verb}` needs an <item_id>")))?;
             Err(CliError::Unsupported(format!(
                 "notif `{verb}` is not yet wired through the edge (/v1/notif routes are a follow-on) \
-                 — deferred"
+                 - deferred"
             )))
         }
         other => Err(CliError::Usage(format!(
@@ -514,8 +435,6 @@ mod tests {
         )
     }
 
-    /// **The REAL command — `myelin git repo list` maps to the opt-in lightweight summary through
-    /// git's OWN grammar** (the reuse proof: `parse_cli(["repo","list"])` is git's).
     #[test]
     fn git_repo_list_maps_to_the_edge_repos_route() {
         let call = git_dispatch(&["repo", "list"]).unwrap();
@@ -550,8 +469,6 @@ mod tests {
         assert_eq!(encoded.finish(), "cursor=rl1_a%26b%25%3D%20%3F");
     }
 
-    /// A git command defined in `api.rs` is reachable WITHOUT re-declaring it here: `search code`
-    /// parses via git's grammar and maps to the edge search route.
     #[test]
     fn git_search_code_reuses_the_grammar_and_maps_to_search_route() {
         let call = git_dispatch(&["search", "code", "needle"]).unwrap();
@@ -586,17 +503,13 @@ mod tests {
         );
     }
 
-    /// A bad git verb is a clean Usage error (exit 2), never a panic.
     #[test]
     fn git_bad_verb_is_usage_not_panic() {
         let err = git_dispatch(&["frobnicate"]).unwrap_err();
         assert_eq!(err.code(), 2);
-        // a non-numeric PR number is also a clean usage error (git's BadArg).
         assert_eq!(git_dispatch(&["pr", "view", "abc"]).unwrap_err().code(), 2);
     }
 
-    /// The PR-list grammar selects the matching leak-free edge endpoint. An unscoped list is the
-    /// cross-repository attention inbox; `--repo` selects the object-guarded repository list.
     #[test]
     fn git_pr_list_maps_to_cross_repo_or_repo_scoped_route() {
         let cross_repo = git_dispatch(&["pr", "list"]).unwrap();
@@ -610,8 +523,6 @@ mod tests {
         assert!(repo.query.is_none() && repo.payload.is_none());
     }
 
-    /// GT-005: the durable write commands now map to a real `/v1/git/...` route (POST with a JSON
-    /// body) — the tenant is the token's, never the body (the IDOR floor).
     #[test]
     fn git_durable_writes_map_to_real_routes() {
         let create = git_dispatch(&["repo", "create", "alpha"]).unwrap();
@@ -672,7 +583,6 @@ mod tests {
         );
     }
 
-    /// notif REUSES its own view grammar and maps only recipient-neutral page coordinates.
     #[test]
     fn notif_list_maps_to_the_authenticated_inbox_route() {
         let call = notif_dispatch(&[

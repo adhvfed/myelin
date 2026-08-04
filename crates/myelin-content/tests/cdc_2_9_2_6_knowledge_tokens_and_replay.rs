@@ -1,12 +1,3 @@
-//! # CDC: Knowledge's M3 list registration (2.9) + per-owner replay (2.6) — EB-26 / P-246, M3
-//!
-//! **Contracts:** `contract-index.md` row 2.9 ("each subsystem completes its list" — KN COMPLETES
-//! its `knowledge.*` list, registered into the Bus's EB-26 harness) + row 2.6 (`events::reindex` →
-//! KN `replay(scope, since)` emits `*.snapshot`, **page-subtree at BLOCK granularity**). Owning
-//! architecture: `event-bus.md` §6.1/§6.4 (grammar/seed) + §4.9 (reindex). KN-D7 / KN-D1 are the
-//! Bus's carriage drills under KN's producers (asserted in `myelin-events`'s reindex/firehose
-//! drills); this pins KN's OWN halves: its list registers, its replay rebuilds cold == live.
-
 use myelin_content::events::{
     register_knowledge_tokens, KNOWLEDGE_DURABLE_TOKENS, KNOWLEDGE_FIREHOSE_TOKENS,
 };
@@ -18,18 +9,13 @@ use myelin_events::{
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
-/// **PROVIDER (KN) registers its COMPLETE list; the CONSUMER (the Bus harness) admits it in full.**
-/// KN's whole `knowledge.*` list (durable + firehose) is admitted into the Bus's cross-subsystem
-/// harness — every name §6.1-conformant + `knowledge.`-prefixed + unique.
 #[test]
 fn cdc_2_9_knowledge_complete_list_admitted_by_the_bus_harness() {
-    // KN self-registers against the grammar (the in-crate gate).
     assert!(
         register_knowledge_tokens().is_ok(),
         "KN's list parses the §6.1 grammar"
     );
 
-    // And the WHOLE list is admitted into the Bus's cross-subsystem harness.
     let mut harness = TokenListHarness::new();
     let all: Vec<&str> = KNOWLEDGE_DURABLE_TOKENS
         .iter()
@@ -44,7 +30,6 @@ fn cdc_2_9_knowledge_complete_list_admitted_by_the_bus_harness() {
     assert!(harness.is_registered("knowledge.page.snapshot"));
 }
 
-/// **The harness REJECTS a malformed addition to KN's list — LOUDLY.**
 #[test]
 fn cdc_2_9_harness_rejects_a_malformed_knowledge_addition() {
     let mut harness = TokenListHarness::new();
@@ -54,7 +39,6 @@ fn cdc_2_9_harness_rejects_a_malformed_knowledge_addition() {
             KNOWLEDGE_DURABLE_TOKENS,
         ))
         .unwrap();
-    // plural artifact-type token (`pages` not `page`).
     assert!(matches!(
         harness.add(
             "knowledge",
@@ -108,9 +92,6 @@ fn snapshot_envelope(draft: &SnapshotDraft) -> EventEnvelope {
     }
 }
 
-/// **CDC 2.6: KN's per-owner replay rebuilds cold == live at BLOCK granularity, idempotent.** Build
-/// a LIVE projection from KN's block snapshots; wipe + rebuild from the reindex replay through the
-/// outbox; assert byte-identical. Re-run → 0 new (the deterministic id no-ops it).
 #[test]
 fn cdc_2_6_knowledge_replay_rebuilds_cold_equals_live_block_granular() {
     let mut source = KnowledgeReindexSource::new();
@@ -132,13 +113,11 @@ fn cdc_2_6_knowledge_replay_rebuilds_cold_equals_live_block_granular() {
     );
     let scope = SnapshotScope::new("knowledge", "page:home");
 
-    // LIVE projection.
     let mut live = DerivedStore::new();
     for draft in source.replay(&scope, None) {
         live.ingest(&snapshot_envelope(&draft));
     }
 
-    // COLD projection — rebuilt only from the reindex replay through the outbox.
     let mut cold = DerivedStore::new();
     let sources: &[&dyn ReindexSource] = &[&source];
     let mut outbox = OutboxStore::new();
@@ -157,7 +136,6 @@ fn cdc_2_6_knowledge_replay_rebuilds_cold_equals_live_block_granular() {
         "cold == live (byte-identical)"
     );
 
-    // Idempotent re-run.
     let r2 = reindex(&scope, None, sources, &mut outbox, ctx_base()).expect("re-reindex");
     assert_eq!(r2.snapshots_emitted, 0, "a re-run emits 0 new (idempotent)");
     assert_eq!(r2.snapshots_skipped_duplicate, 3);

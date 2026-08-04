@@ -1,16 +1,3 @@
-//! # The CDC pair for contract 8.5 — `Agent::handle` SKELETON loop body (AG-P4 → P-216)
-//!
-//! **Contract:** `planning/05-refined-shared-systems-architecture/contract-index.md` row 8.5
-//! (`Agent::handle(InboxEvent, &dyn AgentRuntime) → RunOutcome` — the platform-owned bounded
-//! multi-turn loop; a run is a durable workflow; nested causality). Owning architecture:
-//! `agent-fabric.md` §2.3 / §5.1 / §5.6. AG-P1 (→ P-130) shipped the SIGNATURE-half CDC
-//! (`myelin-agent/tests/cdc_8_5_agent_handle.rs`); THIS pair pins the LOOP-BODY half AG-P4 owns: the
-//! provider drives the chained substrate path (mint → reserve → step → trace → settle → revoke) and
-//! the consumer (the dispatch tier) reads the run outcome.
-//!
-//! This is the CDC the prompt's TESTS field names ("the provider+consumer CDC for 8.5") for the
-//! loop-body deliverable — distinct from, and extending, the AG-P1 signature CDC (no duplication).
-
 use myelin_agent::{AgentRuntime, Conversation, MeteredRuntime, StepOutcome};
 use myelin_agent_service::{
     MockToolExecutor, MockToolSurface, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent,
@@ -23,8 +10,6 @@ use myelin_storage::reserve_settle::{CostLedger, MicroUsd};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
-/// A REAL provider on the contract-4.7 mint surface (the Identity side). Binds the jti to
-/// `(agent, run)` — token life == run life.
 #[derive(Default)]
 struct ProviderMinter;
 impl RunTokenMinter for ProviderMinter {
@@ -43,7 +28,6 @@ impl RunTokenMinter for ProviderMinter {
     }
 }
 
-/// A REAL provider on the contract-4.7 revoke surface (the Identity revocation side).
 #[derive(Default)]
 struct ProviderRevoker {
     revoked: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -72,11 +56,6 @@ fn agent_principal(tenant: &TenantId) -> Principal {
     )
 }
 
-/// **PROVIDER side of 8.5 (the agent fabric's SKELETON loop body).** The platform-owned
-/// `Agent::handle` loop drives the brain through the `&dyn AgentRuntime` seam AND chains the whole
-/// substrate path (mint → reserve → step → trace → settle → revoke) as a durable workflow. It
-/// returns a `RunOutcome` the dispatch tier reads. The brain is dynamically dispatched (swappable
-/// mock/real); the loop is platform-owned (identical for mock and real).
 #[test]
 fn provider_skeleton_loop_drives_the_chained_substrate_path() {
     let tenant = TenantId("acme".into());
@@ -87,8 +66,6 @@ fn provider_skeleton_loop_drives_the_chained_substrate_path() {
     let mut ledger = CostLedger::new();
     let outbox = myelin_events::OutboxStore::new();
     let mut tele = SkeletonTelemetry::new();
-    // The SKELETON registers no tools: an EMPTY catalogue + a no-op executor (the loop body is
-    // never entered — the SKELETON submits on turn 0).
     let cat = MockToolSurface::new();
     let exec = MockToolExecutor::new();
 
@@ -119,9 +96,6 @@ fn provider_skeleton_loop_drives_the_chained_substrate_path() {
         .handle_run(&rt, &mut sub, &mut tele, RunOutcomeKind::Completed)
         .expect("the SKELETON loop drives the chain to completion");
 
-    // CONSUMER side of 8.5 (the dispatch tier): reads the run outcome — the run completed, a trace
-    // was written, and the ledger is balanced (reserved == settled). Observability is part of the
-    // pass (a path that emits no signal has failed the drill).
     assert!(
         out.0.contains("completed"),
         "the dispatch tier reads a completed RunOutcome: {out:?}"
@@ -142,13 +116,8 @@ fn provider_skeleton_loop_drives_the_chained_substrate_path() {
     );
 }
 
-/// **CONSUMER side of 8.5 — the brain is dynamically dispatched + swappable (the strategy seam).**
-/// The loop drives ANY `AgentRuntime` through the `&dyn` seam; a different deterministic brain on the
-/// SAME loop produces a `RunOutcome` the dispatch tier reads identically (the loop is the constant;
-/// only the brain swaps — the whole point of the SKELETON → mock → real build order).
 #[test]
 fn consumer_loop_drives_any_runtime_through_the_dyn_seam() {
-    // A second deterministic brain (still no model) — proves the loop is brain-agnostic.
     struct OtherSubmit;
     impl AgentRuntime for OtherSubmit {
         fn step(&self, _c: &Conversation) -> StepOutcome {
@@ -193,7 +162,7 @@ fn consumer_loop_drives_any_runtime_through_the_dyn_seam() {
         .expect("the loop drives a different brain through the seam");
     assert!(
         out.0.contains("completed"),
-        "the loop is brain-agnostic — only the decision differs"
+        "the loop is brain-agnostic - only the decision differs"
     );
     assert!(
         tele.ledger_balanced(),

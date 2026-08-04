@@ -1,4 +1,3 @@
-//! Live-PostgreSQL proof for the singleton shared-outbox publisher.
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -194,8 +193,6 @@ async fn elected_relay_serializes_contenders_preserves_order_and_retains_outage_
         ]
     );
 
-    // Prove the Standby outcome without timing: a separate PostgreSQL session holds the exact
-    // fixed election key, so an elected relay must fail its non-blocking try-lock immediately.
     let mut lock_holder = pool.acquire().await.expect("lock-holder connection");
     lock_holder.close_on_drop();
     let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")

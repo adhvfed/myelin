@@ -5,70 +5,27 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-events sits below identity in the DAG (architecture 00 §2.9):
-# tenancy → identity → events. It depends on tenancy (TenantId/Region/ArtifactRef) and
-# identity (Principal, for the envelope's Actor). It MUST NOT depend on -refs, -content,
-# -query, -agent, -gdpr, -client, or -substrate (those are downstream); such an edge
-# MUST NOT compile.
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
 serde_json.workspace = true
-# Fixed-width, versioned check aggregate IDs. A repository ArtifactRef may be longer than one NATS
-# token (or contain `.`), so the production routing key hashes the exact `(repo, commit_oid)` pair.
 blake3.workspace = true
 
-# ------------------------------------------------------------------------------------------
-# REAL durable bus behind the `nats` feature (Stage 1 / infra). The BusTransport trait
-# (relay.rs) gets a NATS JetStream backing here in later prompts; the OPTIONAL async-nats +
-# tokio deps are pulled by production's `--features nats` or by the `integration` live-test
-# selector. The default `cargo build --workspace` compiles neither — the
-# in-process InProcessBus remains the unit/floor transport.
-# ------------------------------------------------------------------------------------------
 async-nats = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 myelin-config = { workspace = true, optional = true }
-# StreamExt over the NATS JetStream pull-consumer batch (the nats.rs BusTransport backing).
 futures = { workspace = true, optional = true }
 
 [features]
 default = []
-# The real broker adapter is selectable by production binaries without also enabling the
-# integration-test surface (or its test doubles). `integration` remains the live-test selector and
-# includes the same broker implementation.
 nats = ["dep:async-nats", "dep:tokio", "dep:myelin-config", "dep:futures"]
 integration = ["nats"]
 
-# MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It gates the events pipeline's
-# in-memory durable-store DOUBLES (OutboxStore, DedupLedger `Memory` arm, BusErasureLedger) so
-# DOWNSTREAM crates enable them as a DEV-dependency (the doubles are consumed cross-crate in non-test
-# lib code; `#[cfg(test)]` is crate-local and can't reach them). EMPTY in Wave 0 — established so
-# later waves (W3) gate the doubles behind it + the `no-in-memory-durable-store` scanner treats
-# `feature = "test-support"` as a test-double gate. No code moves behind it yet. `memory` is an alias.
 test-support = []
 memory = ["test-support"]
 
-# TEST-SUPPORT ONLY (dev-dependency, P-S07). The SUB-D1 / BUS-D4 drill scenarios ride the
-# P-S03 scoped-reversible dependency-break injector (Dependency::Broker) + the P-S04
-# telemetry-assertion library (outbox_depth / dead_letter_count signals), exactly as the
-# prompt's TESTS field requires. This is a DEV-dependency, never a normal one: myelin-harness
-# is the leaf TEST-SUPPORT crate (it depends on -identity + -tenancy, both BELOW events), and
-# nothing in the production crate DAG (architecture §2.9) depends on it. A dev-only edge
-# events → harness pulls test machinery into the test build only and forms NO production
-# cycle (harness does not depend on events). The crate-graph-acyclic model (myelin-substrate)
-# continues to model the production crates only.
 [dev-dependencies]
 myelin-harness = { path = "../myelin-harness" }
-# MR-009b Wave 3 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
-# crates (`tests/*.rs`): the in-memory `DedupLedger::new()` double is now
-# `#[cfg(any(test, feature = "test-support"))]` (the durable `DedupLedger::durable` is the production
-# default), so the crate's own external CDC/drill tests (drills_bus_d2/d8, drills_sub_d2,
-# cdc_2_5/2_8, …) reach it ONLY when `test-support` is on. Listing the crate as a DEV-dependency of
-# itself with the feature is the sanctioned Cargo idiom (dev-dep cycles are allowed) — it keeps
-# `cargo test -p myelin-events` (DB-free) green WITHOUT polluting the production build.
 myelin-events = { path = ".", features = ["test-support"] }
-# CDC: the firehose-retention CDC test (EB-30 / P-439) parses the workspace `thresholds.toml`
-# `[firehose_retention]` rows and asserts they are byte-for-byte the `retention::StreamClass::tuning()`
-# measured numbers (the file is the versioned source of truth, kept in lock-step with the code).
 toml = { workspace = true }

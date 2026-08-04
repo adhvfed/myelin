@@ -1,11 +1,3 @@
-//! # Unit tests for the delivery fabric (NOTIF-P16 / P-194)
-//!
-//! Exercises the mandatory-core decision logic to the ≥ 80% mutation floor on `delivery.rs`: the
-//! idem_key collapse (a retry after provider-ack is a no-op — exactly one effective delivery), the
-//! redaction discipline (off-cell carries the summary + link, never the body; in-app stays in-cell),
-//! the first-writer-wins ledger, the bounce path, and the EU-preferring posture. The whole-system
-//! NOTIF-D9 drill (the crash between provider-ack and ledger-write) lives in `tests/drill_notif_d9.rs`.
-
 use super::*;
 use crate::prefs::Channel;
 use crate::{Class, DeliveryAdapter, HumanisedString, RedactedMessage};
@@ -31,8 +23,6 @@ fn redacted_msg() -> RedactedMessage {
     redact_for_offcell(summary(), Class::Direct)
 }
 
-// ---- the in-cell / off-cell channel split (the in-app-stays-in-cell invariant) -----------------
-
 #[test]
 fn in_app_is_the_only_in_cell_channel() {
     assert!(
@@ -40,7 +30,6 @@ fn in_app_is_the_only_in_cell_channel() {
         "in_app is the in-cell inbox push (never egresses)"
     );
     assert!(!Channel::InApp.is_off_cell());
-    // Every other channel egresses → MUST be redacted.
     for c in [
         Channel::WebPush,
         Channel::MobilePush,
@@ -56,45 +45,33 @@ fn in_app_is_the_only_in_cell_channel() {
     }
 }
 
-// ---- the idempotency key (stable, channel-scoped, PII-free) -------------------------------------
-
 #[test]
 fn idem_key_is_stable_per_item_channel_and_channel_scoped() {
-    // Stable: the same (item, channel) yields the same key (a retry produces the same dedup key).
     assert_eq!(
         build_idem_key("itm-1", Channel::Email),
         build_idem_key("itm-1", Channel::Email)
     );
     assert_eq!(build_idem_key("itm-1", Channel::Email), "itm-1:email");
-    // Channel-scoped: the same item to two channels is two DISTINCT deliveries (never collapsed).
     assert_ne!(
         build_idem_key("itm-1", Channel::Email),
         build_idem_key("itm-1", Channel::WebPush)
     );
-    // Item-scoped: different items never collapse.
     assert_ne!(
         build_idem_key("itm-1", Channel::Email),
         build_idem_key("itm-2", Channel::Email)
     );
 }
 
-// ---- the redaction discipline (off-cell carries summary + link, NEVER the body) ----------------
-
 #[test]
 fn redact_for_offcell_carries_summary_and_link_not_the_body() {
     let msg = redact_for_offcell(summary(), Class::Direct);
-    // The off-cell payload is the humanised SUMMARY (viewer-safe) + the deep link + the class.
     assert_eq!(msg.rendered.text, "you were mentioned on PROJ-1");
     assert_eq!(
         msg.rendered.links,
         vec!["myelin://acme/issues/issue/PROJ-1".to_string()]
     );
     assert_eq!(msg.class, Class::Direct);
-    // A RedactedMessage carries NO `body` field at all — the full body cannot cross the boundary by
-    // construction (the type has only {rendered: HumanisedString, class}). This is a structural test.
 }
-
-// ---- the delivery ledger (UNIQUE(tenant, idem_key) first-writer-wins) ---------------------------
 
 #[test]
 fn ledger_record_is_first_writer_wins_on_idem_key() {
@@ -107,8 +84,6 @@ fn ledger_record_is_first_writer_wins_on_idem_key() {
         accepted,
         adapter: "fr-par:email".into(),
     };
-    // The FIRST record wins (true); a second on the SAME idem_key is REJECTED (false) — the
-    // UNIQUE(tenant, idem_key) collapse. The first record's row is preserved (accepted=true stays).
     assert!(ledger.record(&tenant(), rec(true)), "first record wins");
     assert!(
         !ledger.record(&tenant(), rec(false)),
@@ -137,14 +112,11 @@ fn ledger_is_tenant_partitioned() {
         adapter: "fr-par:email".into(),
     };
     assert!(ledger.record(&TenantId("acme".into()), rec.clone()));
-    // The SAME idem_key under a DIFFERENT tenant is a distinct row (tenant-partitioned).
     assert!(ledger.record(&TenantId("globex".into()), rec));
     assert_eq!(ledger.effective_count(&TenantId("acme".into())), 1);
     assert_eq!(ledger.effective_count(&TenantId("globex".into())), 1);
     assert!(!ledger.contains(&TenantId("globex".into()), "nope"));
 }
-
-// ---- the deterministic mock adapter (record-only, exactly-once provider call) ------------------
 
 #[test]
 fn mock_adapter_records_each_send_and_accepts_by_default() {
@@ -169,8 +141,6 @@ fn mock_adapter_bounces_a_marked_key() {
     assert!(!r.accepted, "the marked key bounces (accepted=false)");
 }
 
-// ---- THE IDEM-KEY COLLAPSE: a retry after provider-ack is a NO-OP (the core invariant) ----------
-
 #[test]
 fn deliver_is_idempotent_a_retry_after_ack_is_a_noop() {
     let ledger = DeliveryLedger::new();
@@ -179,7 +149,6 @@ fn deliver_is_idempotent_a_retry_after_ack_is_a_noop() {
         DeliveryFabric::new(ledger.clone()).with_adapter(std::sync::Arc::new(mock.clone()));
     let msg = redacted_msg();
 
-    // First delivery → the provider is invoked, the ledger row recorded, exactly one effective.
     let out = fabric
         .deliver(&tenant(), "itm-1", Channel::Email, &msg)
         .unwrap();
@@ -193,14 +162,13 @@ fn deliver_is_idempotent_a_retry_after_ack_is_a_noop() {
         "provider invoked exactly once"
     );
 
-    // RETRY on the SAME (item, channel) → collapsed by the ledger; the provider is NOT re-invoked.
     let retry = fabric
         .deliver(&tenant(), "itm-1", Channel::Email, &msg)
         .unwrap();
     assert_eq!(
         retry,
         DeliveryOutcome::AlreadyDelivered { accepted: true },
-        "the retry is collapsed by UNIQUE(tenant, idem_key) — no re-deliver"
+        "the retry is collapsed by UNIQUE(tenant, idem_key) - no re-deliver"
     );
     assert_eq!(
         mock.send_count("itm-1:email"),
@@ -208,7 +176,6 @@ fn deliver_is_idempotent_a_retry_after_ack_is_a_noop() {
         "the provider was NOT invoked again (exactly once)"
     );
 
-    // Exactly ONE effective delivery per (item, channel) — the NOTIF-D9 threshold (never 2).
     assert_eq!(
         effective_delivery_count(&ledger, &tenant(), "itm-1", Channel::Email),
         1
@@ -221,7 +188,6 @@ fn deliver_records_redacted_true_for_offcell_and_false_for_in_app() {
     let ledger = DeliveryLedger::new();
     let fabric = DeliveryFabric::with_mock(ledger.clone(), region());
 
-    // Off-cell email → redacted=true (the §3.6 PII-minimisation flag set on the row).
     fabric
         .deliver(&tenant(), "itm-1", Channel::Email, &redacted_msg())
         .unwrap();
@@ -231,7 +197,6 @@ fn deliver_records_redacted_true_for_offcell_and_false_for_in_app() {
         "off-cell email is redacted (delivery.redacted=true)"
     );
 
-    // In-app → redacted=false (stays in-cell; no off-cell egress, no redaction flag).
     let in_app_msg = RedactedMessage {
         rendered: summary(),
         class: Class::Direct,
@@ -256,7 +221,6 @@ fn deliver_to_two_channels_is_two_distinct_deliveries() {
     fabric
         .deliver(&tenant(), "itm-1", Channel::WebPush, &redacted_msg())
         .unwrap();
-    // Two distinct effective deliveries (the same item to two channels is never collapsed).
     assert_eq!(ledger.effective_count(&tenant()), 2);
     assert_eq!(
         effective_delivery_count(&ledger, &tenant(), "itm-1", Channel::Email),
@@ -282,7 +246,6 @@ fn deliver_a_bounce_is_recorded_and_still_idempotent() {
         matches!(out, DeliveryOutcome::Bounced(_)),
         "a rejected message is a bounce"
     );
-    // A bounce IS recorded (so a blind retry does not re-deliver) — still exactly one effective row.
     assert_eq!(ledger.effective_count(&tenant()), 1);
     let retry = fabric
         .deliver(&tenant(), "itm-1", Channel::Email, &redacted_msg())
@@ -298,7 +261,6 @@ fn deliver_a_bounce_is_recorded_and_still_idempotent() {
 #[test]
 fn deliver_to_an_unregistered_channel_errors_loudly() {
     let ledger = DeliveryLedger::new();
-    // A fabric with ONLY an email adapter — delivering to web_push must error (never a silent drop).
     let fabric = DeliveryFabric::new(ledger).with_adapter(std::sync::Arc::new(MockAdapter::new(
         Channel::Email,
         region(),
@@ -314,8 +276,6 @@ fn deliver_to_an_unregistered_channel_errors_loudly() {
     assert!(err.to_string().contains("web_push"));
 }
 
-// ---- the EU-preferring posture (the §3.6 FLOOR) -------------------------------------------------
-
 #[test]
 fn eu_preferring_posture_recognises_eu_regions() {
     assert!(
@@ -325,21 +285,17 @@ fn eu_preferring_posture_recognises_eu_regions() {
     assert!(is_eu_region(&Region("nl-ams".into())), "nl-ams is EU");
     assert!(is_eu_region(&Region("eu-west".into())), "eu-* is EU");
     assert!(is_eu_region(&Region("de-fra".into())), "de-* is EU");
-    // Conservative: an unknown / non-EU region is NOT assumed EU.
     assert!(
         !is_eu_region(&Region("us-east".into())),
         "us-east is NOT EU"
     );
     assert!(!is_eu_region(&Region("ap-tokyo".into())), "ap-* is NOT EU");
-    // The mock adapter is EU-preferring (the v1 dev runtime delivers from an EU region).
     let mock = MockAdapter::new(Channel::Email, Region("fr-par".into()));
     assert!(
         is_eu_region(mock.region()),
         "the mock delivers from an EU region (EU-preferring)"
     );
 }
-
-// ---- channel <-> token round-trip --------------------------------------------------------------
 
 #[test]
 fn channel_token_round_trips() {
@@ -367,12 +323,10 @@ fn channel_token_round_trips() {
 #[test]
 fn effective_delivery_count_is_zero_for_an_undelivered_item() {
     let ledger = DeliveryLedger::new();
-    // A never-delivered (item, channel) reads 0 (not 1) — the signal distinguishes 0/1.
     assert_eq!(
         effective_delivery_count(&ledger, &tenant(), "never", Channel::Email),
         0
     );
-    // And it reads exactly 1 once delivered (never 2 — the per-key boolean count).
     let fabric = DeliveryFabric::with_mock(ledger.clone(), region());
     fabric
         .deliver(&tenant(), "itm-1", Channel::Email, &redacted_msg())
@@ -390,13 +344,10 @@ fn effective_delivery_count_is_zero_for_an_undelivered_item() {
 #[test]
 fn mock_send_count_is_zero_before_any_send_and_counts_repeats() {
     let mock = MockAdapter::new(Channel::Email, region());
-    // 0 before any send (distinguishes the count from a constant 1).
     assert_eq!(mock.send_count("itm-1:email"), 0);
     mock.send(&redacted_msg(), "itm-1:email");
     mock.send(&redacted_msg(), "itm-1:email");
-    // A raw adapter (no fabric dedupe) counts BOTH calls — proving the count is a real tally.
     assert_eq!(mock.send_count("itm-1:email"), 2);
-    // An unrelated key reads 0.
     assert_eq!(mock.send_count("other:email"), 0);
 }
 
@@ -407,8 +358,6 @@ fn fabric_ledger_accessor_returns_the_shared_ledger() {
     fabric
         .deliver(&tenant(), "itm-1", Channel::Email, &redacted_msg())
         .unwrap();
-    // The fabric's own ledger accessor sees the recorded row (it is the SAME shared ledger, not a
-    // fresh default) — a mutant that returns a default empty ledger would read 0 here.
     assert_eq!(fabric.ledger().effective_count(&tenant()), 1);
     assert!(fabric.ledger().contains(&tenant(), "itm-1:email"));
 }

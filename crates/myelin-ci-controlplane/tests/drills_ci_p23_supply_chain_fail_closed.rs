@@ -1,21 +1,3 @@
-//! # CI-D4 drill — supply-chain fail-closed (CI-P23 / P-366, M4).
-//!
-//! The whole-system drill (07 D-4 / drill catalogue row CI-D4): a **floating tag** and a
-//! **tampered/unsigned component** are injected at run; the **digest-pin + sign-verify-before-use**
-//! verifier **fails CLOSED** at run, emitting `ci.supply_chain.verification_failed` for EVERY
-//! refusal. The quantified gates:
-//!   - **0 un-pinned executions** — every floating-tag reference is refused at run;
-//!   - **0 unsigned-component runs** — every unsigned / tampered / un-logged component is refused;
-//!   - **the `ci.supply_chain.verification_failed` audit event** is built for every refusal.
-//!
-//! This is the CI-side failure-injection scenario over the [`SupplyChainVerifier`] (arch 05 HP-4):
-//! the adversary forces (a) a floating tag past the plan-time resolver, (b) a tampered component
-//! (digest mismatch), (c) an unsigned component, (d) an un-logged signature — every one is refused
-//! fail-closed AND yields an audit draft; only the digest-pinned + signed + transparency-logged
-//! shape is admitted.
-//!
-//! Emits a dated green artifact line on pass.
-
 use myelin_ci_controlplane::supply_chain::{
     BuildIdentity, KeylessSignature, SbomFormat, SupplyChainVerifier, VerificationFailure,
 };
@@ -31,7 +13,6 @@ fn identity() -> BuildIdentity {
     BuildIdentity::new(RUN_ID, "ci-runner@acme")
 }
 
-/// The `@<algo>:<hex>` digest half of a pinned reference (the component's content digest).
 fn digest_of(reference: &str) -> String {
     reference
         .rsplit_once('@')
@@ -39,35 +20,23 @@ fn digest_of(reference: &str) -> String {
         .unwrap()
 }
 
-/// **CI-D4: supply-chain fail-closed — 0 un-pinned/unsigned executions + the audit event.**
-///
-/// A verifier with one legitimately signed + logged component (`PINNED_BUILD`). The adversary then
-/// injects the full attack matrix; every attack is refused fail-closed and emits the audit event,
-/// and the ONE honest component still passes.
 #[test]
 fn ci_d4_supply_chain_fails_closed_with_zero_unpinned_unsigned_executions() {
     let mut verifier = SupplyChainVerifier::new();
 
-    // The legitimate supply step: PINNED_BUILD is signed by the run's keyless build identity and
-    // sealed into the Rekor transparency log (the only admitted shape).
     let honest_sig = KeylessSignature::sign(digest_of(PINNED_BUILD), &identity());
     verifier
         .record_signature(&honest_sig)
         .expect("an honest signature is recorded into the transparency log");
 
-    // ---- the failure-injection attack matrix ----
-    // Each entry: (label, reference, signature, expected machine reason token).
     let tampered = {
-        // A signature whose bytes do not honestly attest its claimed digest+identity (a forgery).
         let mut s = KeylessSignature::sign(digest_of(PINNED_TEST), &identity());
         s.signature = "blake3:00000000deadbeef".into();
         s
     };
-    // An honest signature that was NEVER appended to the transparency log (out-of-band).
     let unlogged = KeylessSignature::sign(digest_of(PINNED_TEST), &identity());
 
     let attacks: Vec<(&str, &str, Option<&KeylessSignature>, &str)> = vec![
-        // (a) a FLOATING TAG forced past the plan-time resolver → refused at run.
         ("floating-tag", "alpine:3", None, "floating_tag"),
         (
             "floating-tag-latest",
@@ -75,16 +44,13 @@ fn ci_d4_supply_chain_fails_closed_with_zero_unpinned_unsigned_executions() {
             None,
             "floating_tag",
         ),
-        // (b) an UNSIGNED digest-pinned component.
         ("unsigned", PINNED_TEST, None, "unsigned"),
-        // (c) a TAMPERED/forged signature (verify-before-use fails).
         (
             "tampered",
             PINNED_TEST,
             Some(&tampered),
             "signature_mismatch",
         ),
-        // (d) an honest but UN-LOGGED signature (not in the transparency log).
         (
             "unlogged",
             PINNED_TEST,
@@ -99,21 +65,19 @@ fn ci_d4_supply_chain_fails_closed_with_zero_unpinned_unsigned_executions() {
 
     for (label, reference, sig, expected_reason) in &attacks {
         match verifier.verify_component(reference, *sig) {
-            Ok(()) => panic!("attack `{label}` ({reference}) was ADMITTED — fail-closed violated"),
+            Ok(()) => panic!("attack `{label}` ({reference}) was ADMITTED - fail-closed violated"),
             Err(failure) => {
                 assert_eq!(
                     failure.reason_token(),
                     *expected_reason,
                     "attack `{label}` refused with the expected reason"
                 );
-                // Tally the two quantified gates.
                 match &failure {
                     VerificationFailure::FloatingTag { .. } => unpinned_executions += 1,
                     VerificationFailure::Unsigned { .. }
                     | VerificationFailure::SignatureMismatch { .. }
                     | VerificationFailure::NotInTransparencyLog { .. } => unsigned_runs += 1,
                 }
-                // The audit-critical fail-closed proof is built for EVERY refusal.
                 let draft = verifier.refusal_event(RUN_ID, &failure);
                 assert_eq!(draft.type_.0, CI_SUPPLY_CHAIN_VERIFICATION_FAILED);
                 assert_eq!(draft.aggregate.0, format!("ci/run/{RUN_ID}"));
@@ -124,8 +88,6 @@ fn ci_d4_supply_chain_fails_closed_with_zero_unpinned_unsigned_executions() {
         }
     }
 
-    // The ONE admitted shape (digest-pinned + signed + transparency-logged) still passes — the gate
-    // is fail-closed, not closed-to-everything.
     assert!(
         verifier
             .verify_component(PINNED_BUILD, Some(&honest_sig))
@@ -133,8 +95,6 @@ fn ci_d4_supply_chain_fails_closed_with_zero_unpinned_unsigned_executions() {
         "the honest digest-pinned + signed + logged component is admitted"
     );
 
-    // The quantified CI-D4 gates: every floating tag and every unsigned/tampered/un-logged
-    // component was refused (none executed), and every refusal emitted the audit event.
     let attempted_floating = attacks.iter().filter(|a| a.3 == "floating_tag").count();
     let attempted_unsigned = attacks.len() - attempted_floating;
     assert_eq!(
@@ -159,10 +119,6 @@ fn ci_d4_supply_chain_fails_closed_with_zero_unpinned_unsigned_executions() {
     );
 }
 
-/// **CI-D4 (the attestation half): a verified run produces a SIGNED SLSA L1–L2 provenance + an SBOM,
-/// both sealed/inventoried from DIGEST-PINNED inputs only.** A produced artifact's provenance is
-/// auditable (which run, which snapshot, which input digests) and is itself a transparency-log leaf;
-/// a floating input is refused fail-closed (the same control).
 #[test]
 fn ci_d4_a_verified_run_attests_provenance_and_sbom() {
     let mut verifier = SupplyChainVerifier::new();
@@ -179,7 +135,6 @@ fn ci_d4_a_verified_run_attests_provenance_and_sbom() {
         )
         .expect("a pinned-input attestation succeeds");
 
-    // The provenance is a signed, honest, auditable attestation, sealed into the transparency log.
     assert!(
         provenance.sign().verifies(),
         "the provenance is honestly signed"
@@ -190,7 +145,6 @@ fn ci_d4_a_verified_run_attests_provenance_and_sbom() {
         before + 1,
         "the provenance is sealed into the Rekor transparency log"
     );
-    // The SBOM inventories the digest-pinned components.
     assert_eq!(sbom.format, SbomFormat::CycloneDx);
     assert_eq!(
         sbom.components.len(),
@@ -202,7 +156,6 @@ fn ci_d4_a_verified_run_attests_provenance_and_sbom() {
         "every SBOM component is digest-pinned"
     );
 
-    // A floating INPUT is refused fail-closed (the same control extends to attestation inputs).
     let floating = verifier.attest(
         "blake3:x",
         &identity(),

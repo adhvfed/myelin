@@ -1,9 +1,3 @@
-//! Unit tests for the CHAT-P3 glue slice (humanise keys + notif rules + fanout-class +
-//! firehose-scope validation + TE-21 no-op). The prompt's TESTS line:
-//! - each `define_notif_rule` round-trips its dedup template + default class;
-//! - the fanout-class is total over the `chat.*` durable tokens;
-//! - the firehose scope shape is bounded (never `*`).
-
 use super::*;
 use myelin_notif::{Class, NotifRuleRegistry, Reason};
 use myelin_refs::ArtifactRef;
@@ -13,14 +7,6 @@ fn subject() -> ArtifactRef {
     ArtifactRef("myelin://acme/chat/channel/eng".into())
 }
 
-// ---------------------------------------------------------------------------------------------
-// §1 — the humanise template keys (contract 7.3) — the ONE templating surface (OQ-L)
-// ---------------------------------------------------------------------------------------------
-
-/// **Chat registers exactly its humanise keys into the ONE templating surface (contract 7.3).** The
-/// card / card-facets / agent-message / `chat.message.mentioned` strings + the three `project(ref,
-/// viewer)` title surfaces (channel/message/thread, CHAT-P15) — each a NULL-tenant `en` platform-default
-/// row, NO chat-private string map (OQ-L). A rename/drop here is a contract change.
 #[test]
 fn chat_humanise_keys_are_registered_into_the_one_templating_surface() {
     let rows = chat_humanise_templates();
@@ -40,15 +26,11 @@ fn chat_humanise_keys_are_registered_into_the_one_templating_surface() {
         let row = by_key
             .get(key)
             .unwrap_or_else(|| panic!("chat must register `{key}`"));
-        // each is a platform-default NULL-tenant `en` row (a tenant overrides; chat never renders).
         assert_eq!(
             row.tenant, PLATFORM_DEFAULT_TENANT,
             "`{key}` is a platform-default row"
         );
         assert_eq!(row.locale, myelin_notif::DEFAULT_LOCALE);
-        // the body binds a `{0}` slot (the subject ref for the per-viewer surfaces; the first facet
-        // for the facets surface; the title label for the project surfaces) — resolved per-viewer
-        // (title|tombstone) or formatter-bound.
         assert!(
             row.body.contains("{0}"),
             "`{key}` body must bind the {{0}} slot"
@@ -57,10 +39,6 @@ fn chat_humanise_keys_are_registered_into_the_one_templating_surface() {
     }
 }
 
-/// **The keys register into Notif's ONE `TemplateStore` and look up (the GATE — there is no
-/// chat-private string map, OQ-L).** Registering chat's rows into a platform-default store and
-/// looking each up returns chat's body — the honest "accepted": Notif's ONE templating surface admits
-/// + serves chat's keys. (The live per-viewer humanise RENDER route is CHAT-P16/P18.)
 #[test]
 fn chat_humanise_keys_register_and_look_up_through_notif() {
     let mut store = TemplateStore::with_platform_defaults();
@@ -80,10 +58,6 @@ fn chat_humanise_keys_register_and_look_up_through_notif() {
     }
 }
 
-/// **Chat holds NO private string map — the keys ARE Notif's ICU-subset rows (OQ-L).** The
-/// `chat.message.mentioned` body is the per-viewer subject-binding shape; rendering it through the
-/// ONE Notif formatter substitutes the bound slot — proving chat's string is a row in the ONE
-/// surface, not a chat-local rendered string.
 #[test]
 fn chat_mentioned_renders_through_the_one_notif_formatter() {
     let rows = chat_humanise_templates();
@@ -91,19 +65,10 @@ fn chat_mentioned_renders_through_the_one_notif_formatter() {
         .iter()
         .find(|r| r.template_key == TPL_CHAT_MENTIONED)
         .expect("mentioned");
-    // the ONE Notif ICU-subset formatter binds {0} — chat does not render strings itself.
     let bound = myelin_notif::render_message(&mentioned.body, &["#eng".to_string()]);
     assert_eq!(bound, "You were mentioned in #eng");
 }
 
-// ---------------------------------------------------------------------------------------------
-// §2 — the define_notif_rule set (contract 7.6): mentioned / replied / thread_watched / approval
-// ---------------------------------------------------------------------------------------------
-
-/// **The reason set IS the four frozen chat reasons at their §3.1 bands.** mentioned → direct,
-/// replied → participating, thread_watched → watching, approval_requested → critical. A re-band
-/// (a `define_notif_rule` reconciliation drop) would have panicked at construction; this pins the
-/// accepted result.
 #[test]
 fn chat_notif_rules_are_the_four_chat_reasons_at_their_bands() {
     let rules = chat_notif_rules();
@@ -146,14 +111,9 @@ fn chat_notif_rules_are_the_four_chat_reasons_at_their_bands() {
     );
 }
 
-/// **Each `define_notif_rule` round-trips its dedup template + default class (the prompt's TESTS
-/// line).** Rendering each rule's dedup key for a `(recipient, subject)` substitutes the template's
-/// placeholders (the §3.2 collapse key), and the rule's `default_class` is exactly its §3.1 band — a
-/// round-trip through the frozen verb's value.
 #[test]
 fn each_chat_rule_round_trips_its_dedup_template_and_default_class() {
     for (key, rule) in chat_notif_rules() {
-        // the dedup template renders the §3.2 collapse key for (recipient, subject) — round-trip.
         let dk = rule.dedup_key("psn:alice", &subject());
         assert!(
             dk.contains("psn:alice") && dk.contains("myelin://acme/chat/channel/eng"),
@@ -163,7 +123,6 @@ fn each_chat_rule_round_trips_its_dedup_template_and_default_class() {
             dk.starts_with("chat."),
             "rule `{key}` dedup key is chat-namespaced: `{dk}`"
         );
-        // the default_class is the §3.1 table band for the reason (the table owns the band).
         assert_eq!(
             rule.default_class,
             myelin_notif::reason_base_class(rule.reason).1,
@@ -172,11 +131,6 @@ fn each_chat_rule_round_trips_its_dedup_template_and_default_class() {
     }
 }
 
-/// **The reason set registers with Notif and CLASSIFIES (the GATE — the inverse-signal seam).**
-/// Registering the set into a platform-default registry and classifying a Signal carrying each
-/// `rule_key` routes through the registered chat rule (`from_registered_rule = true`) with the right
-/// reason + band + a dedup key collapsing by `(recipient, subject)` — Notif admits + routes chat's
-/// rules with ZERO Notif change.
 #[test]
 fn chat_notif_rules_register_and_classify_through_notif() {
     let mut reg = NotifRuleRegistry::platform_default();
@@ -206,9 +160,6 @@ fn chat_notif_rules_register_and_classify_through_notif() {
     assert!(c.from_registered_rule);
 }
 
-/// **Chat cannot smuggle a reason into the wrong band — the table owns the band (OQ1 / NOTIF-D1).**
-/// `approval_requested` registered at a non-critical band is rejected LOUDLY by the frozen verb. This
-/// pins that chat registers WHICH reason; Notif's §3.1 table owns WHICH band.
 #[test]
 fn chat_cannot_smuggle_a_reason_into_the_wrong_band() {
     let err = define_notif_rule(
@@ -223,13 +174,6 @@ fn chat_cannot_smuggle_a_reason_into_the_wrong_band() {
     ));
 }
 
-// ---------------------------------------------------------------------------------------------
-// §3 — the fanout-class (arch 03 §4): write-fanout (bounded) vs read-fanout (unbounded ambient)
-// ---------------------------------------------------------------------------------------------
-
-/// **The fanout-class is TOTAL over the `chat.*` durable tokens (the prompt's TESTS line / the GATE).**
-/// Every durable token classifies into exactly one [`FanoutClass`] — a NEW durable token without a
-/// fanout decision would fail this. The callable invariant agrees.
 #[test]
 fn fanout_class_is_total_over_the_chat_durable_tokens() {
     assert!(
@@ -242,18 +186,12 @@ fn fanout_class_is_total_over_the_chat_durable_tokens() {
             "durable token `{t}` must classify into a fanout class"
         );
     }
-    // a non-chat / unregistered token does not classify.
     assert_eq!(fanout_class("git.pr.opened"), None);
     assert_eq!(fanout_class("chat.message.nonexistent"), None);
 }
 
-/// **The write-fanout set is the BOUNDED high-signal set; everything else is ambient read-fanout
-/// (arch §4).** `chat.message.mentioned` (the canonical write-fanout producer) + `chat.thread.replied`
-/// (a reply in your thread) are write-fanout; `chat.channel.member_added` / `chat.message.created` /
-/// the snapshots are read-fanout (the unbounded ambient set never write-amplifies — celebrity-fanout).
 #[test]
 fn write_fanout_is_the_bounded_high_signal_set_rest_is_read_fanout() {
-    // the bounded high-signal write-fanout set (per-recipient inbox items).
     assert_eq!(
         fanout_class(CHAT_MESSAGE_MENTIONED),
         Some(FanoutClass::WriteFanout)
@@ -263,7 +201,6 @@ fn write_fanout_is_the_bounded_high_signal_set_rest_is_read_fanout() {
         Some(FanoutClass::WriteFanout)
     );
 
-    // the unbounded ambient read-fanout set — a 100k-member channel post does ZERO per-member writes.
     for ambient in [
         crate::events::CHAT_MESSAGE_CREATED,
         crate::events::CHAT_CHANNEL_MEMBER_ADDED,
@@ -276,7 +213,6 @@ fn write_fanout_is_the_bounded_high_signal_set_rest_is_read_fanout() {
             "`{ambient}` is the ambient read-fanout set (never write-amplifies)"
         );
     }
-    // the firehose ephemeral frames are ambient read-fanout (never per-recipient writes).
     for fh in CHAT_FIREHOSE_TOKENS {
         assert_eq!(
             fanout_class(fh),
@@ -286,9 +222,6 @@ fn write_fanout_is_the_bounded_high_signal_set_rest_is_read_fanout() {
     }
 }
 
-/// **The write-fanout set is BOUNDED — it is the minted high-signal subset, not the whole durable
-/// list.** The bounded-vs-unbounded distinction IS the celebrity-fanout mitigation: the write-fanout
-/// set must be a strict, small subset of the durable tokens (else every post would write-amplify).
 #[test]
 fn the_write_fanout_set_is_a_bounded_subset_of_the_durable_tokens() {
     let write_fanout_count = CHAT_DURABLE_TOKENS
@@ -303,38 +236,23 @@ fn the_write_fanout_set_is_a_bounded_subset_of_the_durable_tokens() {
         write_fanout_count < CHAT_DURABLE_TOKENS.len(),
         "write-fanout must be a STRICT subset (the unbounded ambient set never write-amplifies)"
     );
-    // the mention producer is in the write-fanout set (the canonical producer, contract 13.1).
     assert!(CHAT_WRITE_FANOUT_TOKENS.contains(&CHAT_MESSAGE_MENTIONED));
 }
 
-// ---------------------------------------------------------------------------------------------
-// §3b — the explicit-first agent-dispatch boundary (contract 8.6 / CHAT-1, NOTIF-P22): a casual
-//        @agent mention is NOTIFY-ONLY (0 auto-spawn); only an explicit action dispatches a run.
-// ---------------------------------------------------------------------------------------------
-
-/// **A casual `@agent` mention is NOTIFY-ONLY — the explicit-first floor (CHAT-1).** Whatever the
-/// `is_explicit_action` flag says, a `chat.message.mentioned` is [`AgentDispatchClass::NotifyOnly`]
-/// — it notifies, it NEVER auto-spawns a costed run. This is the chat-side half of CHAT-D17 (0
-/// auto-spawn from a casual mention); the dispatch tier maps it to `NotifiedOnly`.
 #[test]
 fn a_casual_agent_mention_is_notify_only() {
     assert_eq!(
         agent_dispatch_class(CHAT_MESSAGE_MENTIONED, false),
         AgentDispatchClass::NotifyOnly,
-        "a casual @agent mention notifies — it does not auto-spawn a costed run (CHAT-1)"
+        "a casual @agent mention notifies - it does not auto-spawn a costed run (CHAT-1)"
     );
-    // even mis-flagged as an action, a mention can ONLY notify (the explicit-first floor holds).
     assert_eq!(
         agent_dispatch_class(CHAT_MESSAGE_MENTIONED, true),
         AgentDispatchClass::NotifyOnly,
-        "a mention is never an explicit dispatch — the explicit-first floor is structural"
+        "a mention is never an explicit dispatch - the explicit-first floor is structural"
     );
 }
 
-/// **Only an EXPLICIT action dispatches a costed run.** A deliberate structured action (not a casual
-/// mention) flagged `is_explicit_action = true` is [`AgentDispatchClass::ExplicitDispatch`]; a
-/// non-mention chat event without the explicit flag stays notify-only (the safe default — a costed
-/// run requires a deliberate action).
 #[test]
 fn only_an_explicit_action_dispatches_a_costed_run() {
     assert_eq!(
@@ -349,21 +267,11 @@ fn only_an_explicit_action_dispatches_a_costed_run() {
     );
 }
 
-// ---------------------------------------------------------------------------------------------
-// §3c — the HITL approval card renders ACTION + RISK + COST through the ONE templating surface
-//        (refined §1.4 / NOTIF-P9): the card is leak-safe (the subject slot is the only ref slot).
-// ---------------------------------------------------------------------------------------------
-
-/// **The HITL card surfaces ACTION + RISK + COST via `chat_hitl_card_facets` through the ONE Notif
-/// formatter — refined §1.4 / NOTIF-P9.** The facets are PII-free literal agent strings (NOT
-/// per-viewer refs), bound by Notif's ONE ICU-subset formatter over [`TPL_CHAT_CARD_FACETS`]; the
-/// per-viewer subject is the separate [`TPL_CHAT_CARD`] line. Chat renders nothing itself (OQ-L).
 #[test]
 fn hitl_card_facets_render_action_risk_and_cost_through_the_one_surface() {
     let mut store = TemplateStore::with_platform_defaults();
     register_chat_humanise_templates(&mut store);
 
-    // the facets body binds the three facet slots (action {0}, risk {1}, cost {2}).
     let facets_tpl = store
         .lookup(
             PLATFORM_DEFAULT_TENANT,
@@ -379,20 +287,12 @@ fn hitl_card_facets_render_action_risk_and_cost_through_the_one_surface() {
         );
     }
 
-    // the helper renders all three facets through the ONE Notif formatter (chat renders nothing).
     let facets = chat_hitl_card_facets(&store, "merge", "irreversible", "0.40 USD");
     assert!(facets.contains("merge"), "action: `{facets}`");
     assert!(facets.contains("irreversible"), "risk: `{facets}`");
     assert!(facets.contains("0.40 USD"), "cost: `{facets}`");
 }
 
-// ---------------------------------------------------------------------------------------------
-// §4 — the firehose scope shape (contract 3.5): channel:<id>, bounded (never *)
-// ---------------------------------------------------------------------------------------------
-
-/// **Chat's firehose scope shape is BOUNDED — `channel:<id>`, never `*` (the prompt's TESTS line /
-/// the GATE: 0 unbounded-scope declarations).** A valid channel id parses to a `ScopeKind::Channel`
-/// bounded selector through the Bus-owned `*`-rejecting chokepoint; round-trips its selector string.
 #[test]
 fn chat_firehose_scope_is_bounded_channel_never_star() {
     let scope = chat_channel_scope("eng").expect("a bounded channel scope parses");
@@ -409,9 +309,6 @@ fn chat_firehose_scope_is_bounded_channel_never_star() {
     );
 }
 
-/// **An unbounded / `*` chat scope is REJECTED at the chokepoint (0 unbounded-scope declarations).**
-/// `*`, an empty channel id, a `*`-containing id are all rejected as over-broad — chat cannot
-/// declare an unbounded subscription (the `*`-rejection generalises to `channel:` exactly).
 #[test]
 fn an_unbounded_chat_scope_is_rejected() {
     for bad in ["*", "", "*all"] {
@@ -425,18 +322,12 @@ fn an_unbounded_chat_scope_is_rejected() {
             "`channel:{bad}` is an over-broad-scope rejection (scope is never *)"
         );
     }
-    // a bare `channel:` (no id) is also over-broad (the chokepoint rejects an empty resource id).
     assert!(FirehoseScope::parse("channel:")
         .unwrap_err()
         .is_over_broad_scope());
-    // and the raw `*` scope through the chokepoint is rejected.
     assert!(FirehoseScope::parse("*").unwrap_err().is_over_broad_scope());
 }
 
-/// **The `resync_required → *.snapshot` fallback contract names chat's durable snapshot tokens
-/// (contract 3.5).** The fallback a `resync_required` client cold-rebuilds from is the chat
-/// reindex-from-source snapshots (channel/message/thread), each a registered DURABLE token — never a
-/// firehose frame (the cold rebuild rides the durable outbox, arch §6).
 #[test]
 fn the_resync_snapshot_fallback_names_chat_durable_snapshots() {
     assert_eq!(
@@ -456,14 +347,6 @@ fn the_resync_snapshot_fallback_names_chat_durable_snapshots() {
     }
 }
 
-// ---------------------------------------------------------------------------------------------
-// §5 — the TE-21 connection-tier language pin (contract 1.7): Rust default, the shim is a NO-OP
-// ---------------------------------------------------------------------------------------------
-
-/// **The TE-21 pin is Rust and the harness shim is a NO-OP today (the GATE — the shim's no-op
-/// obligation is satisfied).** The pinned value is Rust; `is_no_op()` is true; the recorded obligation
-/// returns the pinned Rust value. The BEAM hatch is written-but-closed (its obligation binds only in
-/// CHAT-P26).
 #[test]
 fn te21_pin_is_rust_and_the_harness_shim_is_a_no_op() {
     assert_eq!(
@@ -475,7 +358,6 @@ fn te21_pin_is_rust_and_the_harness_shim_is_a_no_op() {
         Te21LanguagePin::Rust.is_no_op(),
         "the all-Rust default makes the shim a no-op"
     );
-    // the recorded obligation returns the pinned Rust no-op.
     let recorded = te21_harness_shim_obligation();
     assert_eq!(recorded, Te21LanguagePin::Rust);
     assert!(
@@ -483,8 +365,6 @@ fn te21_pin_is_rust_and_the_harness_shim_is_a_no_op() {
         "the recorded TE-21 obligation is a no-op against the 1.7 shim"
     );
 
-    // the BEAM hatch is written-but-CLOSED: it exists as a variant but is NOT a no-op (its
-    // cross-language harness-shim obligations bind when selected — CHAT-P26).
     assert!(
         !Te21LanguagePin::Beam.is_no_op(),
         "the BEAM hatch carries the shim obligation (CHAT-P26)"

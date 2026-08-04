@@ -1,43 +1,3 @@
-//! # The CDC pairs for the Knowledge Refs glue (KN-P19 / P-309): 5.4 / 5.5 / 5.6 / 5.7
-//!
-//! **Contracts proven here (the CDC pairs the prompt's TESTS field names):**
-//! - **5.4** `refs.edge.created` — the three structured content nodes (`mention`/`artifact_ref`/
-//!   `embed`) are the PRODUCERS of `refs.edge.created` (reference-class), via the outbox, NOT
-//!   coalesced (a discrete edge fact); there is NO standalone edge-write API.
-//! - **5.5** the TE-7 typed-edge mirror — a `page_parent` / `db_relation` typed-row write emits
-//!   `knowledge.page.parent_set` / `knowledge.relation.*` (lifecycle-class) in the SAME transaction
-//!   (the typed table is the source of truth; Refs holds the rebuildable projection + the inverse).
-//! - **5.6** `project(ref, viewer)` — the frozen `{title, state, icon, render_hint, sub_anchor?}`
-//!   shape, per-viewer permission-checked; a confidential page degrades to a content-free tombstone,
-//!   never the title (the project-leak counter = 0).
-//! - **5.7** the unified `#sub` 4-step tombstone ladder — permission → root → sub-resolve
-//!   {LIVE/MOVED/OUTDATED/GONE} → ERASED; a tombstone ALWAYS carries the root.
-//!
-//! **Owning architecture:** `04-subsystem-architectures/knowledge-platform/architecture/`
-//! `03-events-contracts-and-glue.md` §2.1 (the ladder; a confidential page → tombstone, never leaks),
-//! §2.2 (`project` shape), §3.1 (the TE-7 mirror). **Reconciliation:** `00-reconciliation-decisions.md`
-//! X-4 (the frozen grammar + the ONE ladder).
-//!
-//! ## CDC pair markers (the contract-coverage gate)
-//! This file carries BOTH sides of each seam:
-//! - **PROVIDER side** — Knowledge is the producer/owner: it emits the byte-identical
-//!   `refs.edge.created` / `knowledge.*` wire shapes (the `source`/`target`/`rel`/`rel_class` triple
-//!   plus the shared `edge:<source>-><target>` aggregate), and it OWNS `project(ref, viewer)` plus
-//!   the four-step ladder.
-//! - **CONSUMER side** — the Refs edge-builder / mirror is the consumer: this file models the
-//!   consumer's field reads (the `rel`/`rel_class` discrimination, the forward/inverse pairing
-//!   responsibility) plus a downstream resolver consuming `project`'s `Projection | Tombstone` —
-//!   modelled LOCALLY because `myelin-knowledge` is a producer LEAF and cannot depend on the Refs
-//!   SERVICE crate (the §2.9 one-directional edge: `myelin-refs-service` depends on the producers).
-//!
-//! ## Mutation floor (mandatory-core — the project-leak surface)
-//! `project(ref, viewer)` is the mandatory-core leak surface (a project leak IS the failure). The
-//! floor for the project/ladder path (`myelin_knowledge::refs_glue`) is **≥ 90% of viable mutants
-//! caught** (`cargo mutants -p myelin-knowledge -f crates/myelin-knowledge/src/refs_glue.rs`): the
-//! permission-first gate (deny ⇒ tombstone carrying the root), each ladder rung
-//! (LIVE/MOVED/OUTDATED/GONE/ERASED), and the TE-7 forward-edge emit shape each have a unit + a CDC a
-//! mutation flips. The world-scale corpus-under-load drill is KN-P32 (named).
-
 use myelin_content::inline::InlineNode;
 use myelin_events::{
     Actor, ArtifactRef, CausedBy, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Region,
@@ -84,7 +44,6 @@ fn z() -> Zookie {
     Zookie("z0".into())
 }
 
-/// A deterministic Id stub: a `read@object` allow-list (absent ⇒ Deny, fail-closed).
 struct StubId {
     allow: HashSet<String>,
 }
@@ -193,12 +152,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-// ════════════════ 5.4 — the content-node refs.edge.created producer (PROVIDER + CONSUMER) ════════
-
-/// **PROVIDER side of 5.4** — each `mention`/`artifact_ref`/`embed` node emits ONE `refs.edge.created`
-/// (reference-class) via the outbox, NOT coalesced. **CONSUMER side** — the Refs edge-builder's field
-/// reads (`rel`/`rel_class` discrimination) are modelled locally: a content edge is ALWAYS
-/// reference-class, distinguishable from a lifecycle mirror edge.
 #[test]
 fn cdc_5_4_content_nodes_produce_reference_edges() {
     let (store, minter) = store_and_minter();
@@ -218,10 +171,9 @@ fn cdc_5_4_content_nodes_produce_reference_edges() {
     assert_eq!(
         ids.len(),
         3,
-        "one edge per node — NOT coalesced (a discrete edge fact)"
+        "one edge per node - NOT coalesced (a discrete edge fact)"
     );
 
-    // CONSUMER field reads: every content edge is reference-class (never lifecycle).
     for id in &ids {
         let row = store.row(id).expect("edge row");
         assert_eq!(row.envelope.type_.0, "refs.edge.created");
@@ -231,12 +183,6 @@ fn cdc_5_4_content_nodes_produce_reference_edges() {
     }
 }
 
-// ════════════════ 5.5 — the TE-7 typed-edge mirror (PROVIDER + CONSUMER) ══════════════════════════
-
-/// **PROVIDER side of 5.5** — a `page_parent` typed-row write emits `knowledge.page.parent_set`
-/// (lifecycle-class, forward `parent` edge) in the SAME tx (0 typed-row-without-edge). **CONSUMER
-/// side** — the Refs mirror reads the forward `parent` edge and OWNS the inverse `child` pairing (the
-/// producer emits forward only; modelled locally).
 #[test]
 fn cdc_5_5_page_parent_mirror_forward_only_lifecycle() {
     let (store, minter) = store_and_minter();
@@ -254,8 +200,6 @@ fn cdc_5_5_page_parent_mirror_forward_only_lifecycle() {
     assert_eq!(row.envelope.type_.0, "knowledge.page.parent_set");
     assert_eq!(row.envelope.payload["rel"], "parent");
     assert_eq!(row.envelope.payload["rel_class"], REL_CLASS_LIFECYCLE);
-    // CONSUMER responsibility: the producer emits the FORWARD edge only; the inverse `child` is the
-    // Refs mirror's (no inverse token in the emitted payload).
     assert_eq!(
         row.envelope.payload["source"],
         "myelin://acme/knowledge/page/project"
@@ -266,10 +210,6 @@ fn cdc_5_5_page_parent_mirror_forward_only_lifecycle() {
     );
 }
 
-/// **PROVIDER side of 5.5** — a `db_relation` typed-row write/delete emits `knowledge.relation.created`
-/// / `.removed` (lifecycle-class) in the SAME tx, on the shared edge aggregate (create→remove ordered).
-/// **CONSUMER side** — the field reads + the typed-table-is-truth invariant: the `RelationStore`
-/// records the forward row, the emit mirrors it.
 #[test]
 fn cdc_5_5_db_relation_mirror_created_then_removed() {
     let (store, minter) = store_and_minter();
@@ -304,11 +244,6 @@ fn cdc_5_5_db_relation_mirror_created_then_removed() {
     );
 }
 
-// ════════════════ 5.6 / 5.7 — project(ref, viewer) + the 4-step tombstone ladder ════════════════
-
-/// **PROVIDER side of 5.6/5.7** — `project` of a page for an authorized viewer returns the frozen
-/// `{title,state,icon,render_hint}` shape. **CONSUMER side** — a downstream reader (Refs/Search/Notif)
-/// sees the projection IFF authorized.
 #[test]
 fn cdc_5_6_project_authorized_shape() {
     let root = page_root("7c2");
@@ -330,9 +265,6 @@ fn cdc_5_6_project_authorized_shape() {
     }
 }
 
-/// **THE PROJECT-LEAK GATE (5.6) — project-leak counter = 0.** A confidential page → a tombstone
-/// CARRYING THE ROOT, never the title, for an unauthorized viewer. **CONSUMER side** — the downstream
-/// reader gets a content-free tombstone it can render as "(not available)".
 #[test]
 fn cdc_5_6_confidential_page_tombstones_never_leaks() {
     let root = page_root("7c2");
@@ -344,7 +276,7 @@ fn cdc_5_6_confidential_page_tombstones_never_leaks() {
             state: "live".into(),
         },
     );
-    let p = Projector::new(StubId::new(), store); // allows nobody.
+    let p = Projector::new(StubId::new(), store);
     let got = p.project(&root, &viewer("mallory"), z()).unwrap();
     assert!(got.is_tombstone());
     assert_eq!(got.title(), None, "0 title leak");
@@ -359,9 +291,6 @@ fn cdc_5_6_confidential_page_tombstones_never_leaks() {
     }
 }
 
-/// **THE 4-STEP LADDER GATE (5.7) — each of LIVE/MOVED/OUTDATED/GONE/ERASED returns the right outcome,
-/// a tombstone always carrying the root.** PROVIDER + CONSUMER in one: the provider runs the ladder,
-/// the consumer reads the rung / the tombstone reason.
 #[test]
 fn cdc_5_7_the_four_step_ladder_all_rungs() {
     let root = page_root("7c2");
@@ -386,7 +315,6 @@ fn cdc_5_7_the_four_step_ladder_all_rungs() {
     store.mark_erased(&erased);
     let p = Projector::new(StubId::new().allow_read(&root), store);
 
-    // LIVE / MOVED / OUTDATED resolve to a sub-anchor on the right rung.
     for (r, rung) in [
         (&live, LadderRung::Live),
         (&moved, LadderRung::Moved),
@@ -397,7 +325,6 @@ fn cdc_5_7_the_four_step_ladder_all_rungs() {
             Projected::Tombstoned(_) => panic!("{rung:?} must resolve to a visible sub-anchor"),
         }
     }
-    // GONE → SubGone tombstone carrying the root (the page resolves, the block is dead).
     match p.project(&gone, &viewer("alice"), z()).unwrap() {
         Projected::Tombstoned(t) => {
             assert_eq!(t.reason, TombstoneReason::SubGone);
@@ -405,7 +332,6 @@ fn cdc_5_7_the_four_step_ladder_all_rungs() {
         }
         Projected::Visible(_) => panic!("a GONE block must tombstone"),
     }
-    // ERASED → Erased tombstone carrying the root (the shred made it unrenderable).
     match p.project(&erased, &viewer("alice"), z()).unwrap() {
         Projected::Tombstoned(t) => {
             assert_eq!(t.reason, TombstoneReason::Erased);

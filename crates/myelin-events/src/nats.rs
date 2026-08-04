@@ -1,28 +1,3 @@
-//! `NatsJetStreamBus` — the [`BusTransport`](crate::relay::BusTransport) trait backed by a REAL
-//! NATS JetStream (Apache-2.0) durable bus via `async-nats`.
-//!
-//! **Stage 2 / infra.** This is the durable backing for the bus the [`crate::relay`] module's
-//! [`crate::relay::InProcessBus`] floor models in process. It implements the EXACT frozen
-//! `put/consume/ack/purge` shape behind the existing [`BusTransport`] trait — it does NOT fork
-//! or redefine the trait (EI-01 §7 coherence). The in-process fake remains the unit/default
-//! transport; this real backing is config-selected under production's `nats` feature (also
-//! included by the live-test `integration` feature).
-//!
-//! ## The JetStream wiring (durable stream + durable PULL consumer + ack)
-//! - A durable **stream** captures the subject set, with `MsgId`-based **dedup** so a second
-//!   `put` carrying an `event_id` the stream already accepted is suppressed (the
-//!   `Nats-Msg-Id = event_id` broker-side dedup → 0 ghost, exactly the property the
-//!   [`BusTransport::put`] contract names).
-//! - A durable **PULL consumer** (an explicit-ack consumer) is what [`BusTransport::consume`]
-//!   fetches a batch from; the delivered messages' ack handles are stashed keyed by `event_id`
-//!   so [`BusTransport::ack`] can ack EXACTLY the delivered message (explicit ack, at-least-once
-//!   with consumer-side dedup the durable consumer provides).
-//!
-//! ## How a sync trait drives the async client
-//! [`BusTransport`] is sync (it matches the in-process floor). `async-nats` is async, so
-//! `NatsJetStreamBus` holds a `tokio::runtime::Handle` and drives each op with `block_in_place`
-//! + `block_on` — the same bridge the storage S3/Valkey backings use.
-
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -40,11 +15,6 @@ use crate::relay::{
 };
 use crate::{ArtifactRef, EventEnvelope, EventId};
 
-/// Explicit capacity and durability policy for the shared production event stream.
-///
-/// There are deliberately no unlimited defaults: callers must choose finite byte and message
-/// bounds, a retention age, a deduplication window, and a replica count appropriate for the NATS
-/// cluster they operate.
 #[derive(Clone, PartialEq, Eq)]
 pub struct JetStreamPublisherConfig {
     pub nats_url: String,
@@ -74,7 +44,6 @@ impl core::fmt::Debug for JetStreamPublisherConfig {
     }
 }
 
-/// Explicit bounded-capacity policy for a durable JetStream pull consumer.
 #[derive(Clone, PartialEq, Eq)]
 pub struct JetStreamConsumerConfig {
     pub nats_url: String,
@@ -108,7 +77,6 @@ impl core::fmt::Debug for JetStreamConsumerConfig {
 }
 
 impl JetStreamConsumerConfig {
-    /// The bounded production defaults. A caller still supplies the exact server-side filter.
     pub fn bounded(
         nats_url: impl Into<String>,
         stream_name: impl Into<String>,
@@ -123,9 +91,6 @@ impl JetStreamConsumerConfig {
             filter_subject: filter_subject.into(),
             consumer_name: consumer_name.into(),
             ack_wait: std::time::Duration::from_secs(30),
-            // Unlimited redelivery is intentional until broker delivery-attempt metadata is
-            // carried into the durable application DLQ transaction. A finite broker-only cap
-            // would strand the final unacked Retry with only a JetStream advisory.
             max_deliver: -1,
             max_ack_pending: 256,
             max_batch: 256,
@@ -189,7 +154,6 @@ impl JetStreamConsumerConfig {
 }
 
 impl JetStreamPublisherConfig {
-    /// Refuse incomplete, unlimited, or internally inconsistent production stream settings.
     pub fn validate(&self) -> Result<(), TransportError> {
         if self.nats_url.trim().is_empty() {
             return Err(TransportError("NATS URL must not be empty".into()));
@@ -312,10 +276,6 @@ fn validate_stream_config(
     }
 }
 
-/// Refuse any semantic drift in the durable pull consumer. Every field emitted by
-/// [`JetStreamConsumerConfig::pull_config`] is pinned, including the safety-relevant defaults:
-/// a pull (not push) consumer, no rate/sample/backoff overrides, disk-backed inherited storage,
-/// and no alternate filter set.
 fn validate_consumer_config(
     actual: &jetstream::consumer::Config,
     expected: &jetstream::consumer::pull::Config,
@@ -470,11 +430,9 @@ fn drain_queued_settlements<T: Clone>(
     }
 }
 
-/// Administrative stream provisioning, deliberately separate from runtime publication.
 pub struct JetStreamProvisioner;
 
 impl JetStreamProvisioner {
-    /// Create the configured stream if absent, then refuse any policy drift.
     pub fn ensure(
         config: JetStreamPublisherConfig,
         rt: tokio::runtime::Handle,
@@ -509,11 +467,6 @@ where
         .map_err(|_| TransportError("JetStream publish acknowledgement timed out".into()))?
 }
 
-/// A capability-minimal production adapter for the elected shared-outbox relay.
-///
-/// [`connect_existing`](Self::connect_existing) performs no stream or consumer administration.
-/// Its public surface implements only [`EventPublisher`], so the relay cannot consume,
-/// acknowledge, alter, or purge production history.
 pub struct NatsJetStreamPublisher {
     js: Context,
     subject_root: String,
@@ -522,9 +475,6 @@ pub struct NatsJetStreamPublisher {
 }
 
 impl NatsJetStreamPublisher {
-    /// Compatibility composition for tests: provision with this authority, then open the
-    /// publish-only runtime adapter. Production callers should use explicit `provision` and
-    /// [`connect_existing`](Self::connect_existing) paths with separate authorities.
     pub fn connect(
         config: JetStreamPublisherConfig,
         rt: tokio::runtime::Handle,
@@ -533,7 +483,6 @@ impl NatsJetStreamPublisher {
         Self::connect_existing(config, rt)
     }
 
-    /// Connect the runtime publisher without stream/consumer create, update, or delete requests.
     pub fn connect_existing(
         config: JetStreamPublisherConfig,
         rt: tokio::runtime::Handle,
@@ -758,7 +707,6 @@ mod routing_tests {
     }
 }
 
-/// The [`BusTransport`] backed by a real NATS JetStream stream + durable PULL consumer.
 pub struct NatsJetStreamBus {
     js: Context,
     stream_name: String,
@@ -767,26 +715,14 @@ pub struct NatsJetStreamBus {
     max_batch: usize,
     max_expires: std::time::Duration,
     rt: tokio::runtime::Handle,
-    /// Raw handles are keyed only by opaque process-local delivery token. Event ids are payload
-    /// data and cannot identify malformed messages or distinguish duplicate-id deliveries.
     pending: Mutex<HashMap<DeliveryToken, jetstream::Message>>,
-    /// Exact failed settlement handles plus their intended ACK/NAK/TERM operation. This queue is
-    /// drained before another pull, so its size is bounded by the broker's admitted pending window.
     settlement_retries: Mutex<HashMap<DeliveryToken, QueuedSettlement<jetstream::Message>>>,
-    /// Serializes pulls and settlement transitions. In production the pump is single-threaded;
-    /// this also prevents accidental concurrent callers from racing the retry-before-pull gate.
     intake_gate: Mutex<()>,
     next_delivery_token: AtomicU64,
-    /// Compatibility lookup for the legacy `BusTransport` surface. The production
-    /// [`crate::relay::EventConsumer`] path settles directly by token.
     legacy_tokens: Mutex<HashMap<String, VecDeque<DeliveryToken>>>,
 }
 
 impl NatsJetStreamBus {
-    /// Connect to NATS at `nats_url`, ensure a durable JetStream stream named `stream_name`
-    /// capturing `subject_root.>` exists (with `MsgId` dedup), and ensure a durable PULL
-    /// consumer named `consumer_name` exists. `rt` is the runtime handle the sync trait methods
-    /// drive the async client on. Idempotent: re-connecting reuses the existing stream/consumer.
     pub fn connect(
         nats_url: &str,
         stream_name: &str,
@@ -831,9 +767,6 @@ impl NatsJetStreamBus {
         )
     }
 
-    /// Connect only the bounded durable pull consumer to an already elected/shared stream.
-    /// Production consumer services use this constructor so they never create or mutate stream
-    /// publisher state. Existing consumer configuration is validated and drift fails boot.
     pub fn connect_consumer(
         config: JetStreamConsumerConfig,
         rt: tokio::runtime::Handle,
@@ -884,18 +817,6 @@ impl NatsJetStreamBus {
         })
     }
 
-    /// Map an event onto a concrete JetStream subject under the stream's root. EB-12: the routing +
-    /// ordering key is now the §2.2 STRUCTURED subject
-    /// `evt.<tenant>.<subsystem>.<aggregate_type>.<aggregate_id>.<event_name>` ([`StreamSubject`]),
-    /// derived from the envelope — so the broker subject encodes the `(tenant, subsystem)` routing
-    /// split (the blast-radius unit) and the per-aggregate ordering partition, not an opaque token.
-    /// We keep the transport's `subject_root` as the stream-capture + consume-filter namespace and
-    /// slot the structured subject beneath it: `<subject_root>.evt.<tenant>.…`. So the stream's
-    /// `<root>.>` filter still captures every event and a `consume(subject_root)` still matches,
-    /// while the subject carries the real §2.2 key.
-    ///
-    /// A malformed envelope is rejected before a broker operation. Durable elected relays
-    /// quarantine it in PostgreSQL; transports must never invent a fallback routing namespace.
     fn subject_for(&self, envelope: &EventEnvelope) -> Result<String, TransportError> {
         event_subject(&self.subject_root, envelope)
     }
@@ -937,7 +858,6 @@ impl NatsJetStreamBus {
         for msg in msgs {
             let token = allocate_delivery_token(&self.next_delivery_token)?;
             let classify = msg.clone();
-            // Insert the raw handle before any fallible metadata/decode/routing operation.
             self.pending
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -994,8 +914,6 @@ impl NatsJetStreamBus {
     ) -> Result<(), TransportError> {
         match intent {
             SettlementIntent::Ack => self.block(async {
-                // Wait for the server's acknowledgement-of-ack. If that response is uncertain,
-                // the exact handle and ACK intent remain queued for retry before new intake.
                 message
                     .double_ack()
                     .await
@@ -1262,8 +1180,6 @@ impl BusTransport for NatsJetStreamBus {
             .map_err(|e| TransportError(format!("serialize envelope: {e}")))?;
 
         let mut headers = async_nats::HeaderMap::new();
-        // Nats-Msg-Id = the stable event_id → broker-side dedup (0 ghost): a re-publish of the
-        // same event_id is suppressed and flagged `duplicate` on the ack.
         headers.insert("Nats-Msg-Id", dedup_id.0.as_str());
 
         let ack = self.block(async {
@@ -1275,7 +1191,6 @@ impl BusTransport for NatsJetStreamBus {
                 .map_err(|e| TransportError(format!("publish ack: {e}")))
         })?;
 
-        // `duplicate` true ⇒ the broker already had this dedup_id ⇒ Deduplicated; else Accepted.
         if ack.duplicate {
             Ok(Delivery::Deduplicated)
         } else {
@@ -1284,10 +1199,6 @@ impl BusTransport for NatsJetStreamBus {
     }
 
     fn consume(&self, _subject_prefix: &str) -> Vec<EventEnvelope> {
-        // Fetch a batch from the durable PULL consumer. The delivered messages' ack handles are
-        // stashed keyed by event_id so `ack` can ack exactly the delivered message (explicit
-        // ack). Returns the decoded envelopes in delivery order. A pull with no messages within
-        // the short expiry returns empty (a clean "nothing to consume right now").
         self.try_consume()
             .unwrap_or_default()
             .into_iter()
@@ -1302,8 +1213,6 @@ impl BusTransport for NatsJetStreamBus {
                     Some(*envelope)
                 }
                 BrokerDeliveryBody::Poison(_) | BrokerDeliveryBody::TransientMetadataFault => {
-                    // Legacy consumers have no quarantine seam. NAK independently instead of
-                    // silently leaking the raw handle or discarding valid siblings.
                     let _ = self.try_retry(delivery.token, 1);
                     None
                 }
@@ -1312,17 +1221,12 @@ impl BusTransport for NatsJetStreamBus {
     }
 
     fn ack(&self, _consumer: &str, event_id: &EventId) {
-        // Explicit ack of the delivered message stashed by `consume` (at-least-once → the ack is
-        // what makes it not redeliver). Acking an un-consumed / already-acked id is a no-op.
         if let Ok(token) = self.legacy_token(event_id) {
             let _ = self.try_ack(token);
         }
     }
 
     fn purge(&self) {
-        // Purge the stream's accepted/dedup state (test/GC convenience — the frozen shape's
-        // fourth method). Best-effort: a transport error is swallowed (purge is not on a
-        // correctness path).
         let stream_name = self.stream_name.clone();
         self.block(async {
             if let Ok(stream) = self.js.get_stream(&stream_name).await {

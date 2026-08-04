@@ -1,40 +1,3 @@
-//! CT-007 pre-registered cutover-floor GATE 2/4 (digest-pinned runner assets) — MECHANICAL
-//! enforcement for the committed `runner-assets.toml` manifest.
-//!
-//! `planning/system-reviews/2026-06-26/12-ci-track-ledger.md` ("Pre-registered CT-007 cutover
-//! floor", ~line 311, gate 2/4): "digest-pinned one-cell runner assets provide the actual
-//! Rust/Node/browser/container capabilities [the 12 GitHub CI jobs] require without weakening
-//! gVisor, egress, or privilege boundaries." `scripts/dogfood.sh`'s `verify_ci_rootfs()` is only a
-//! MANUAL operator script (run by hand, over the `.myelin/ci.toml` founder pipeline's ONE rootfs);
-//! this test is the mechanical, committed-CI-level equivalent for EVERY row of
-//! `runner-assets.toml` (a distinct manifest — asset id → digest, not GitHub job → owner).
-//!
-//! Two checks, in order:
-//! 1. **Manifest-internal consistency (unconditional — no staged directory required):** every row's
-//!    `image` field (the `ImageRef` reference `GvisorAssetRegistry` would register it under) must be
-//!    digest-pinned with the SAME sha256 hex digest as that row's own `canonical_tree_sha256` — a
-//!    row whose `image` digest and `canonical_tree_sha256` disagree could never actually resolve
-//!    through the registry (CT-007 gate 2/4's `GvisorAssetRegistry::from_bindings` would refuse
-//!    it), so this is a real, useful check even on a host with the asset absent.
-//! 2. **Staged-content match (conditional on the asset being staged):** if the staged directory the
-//!    row names (`env_var`, falling back to `default_path`) exists on the CURRENT machine, recompute
-//!    its canonical-tree sha256 with the pure-Rust hasher
-//!    [`myelin_ci_sandbox::canonical_tree_sha256_hex`] — the SAME hasher
-//!    `GvisorAssetRegistry::from_bindings` uses on the real production launch path, reproducing
-//!    EXACTLY the same bytes the `tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner
-//!    --format=gnu -C <dir> -cf - . | sha256sum` shell recipe `verify_ci_rootfs()` uses would produce
-//!    (proven byte-for-byte in `crates/myelin-ci-sandbox/tests/canonical_tar_matches_shell_recipe_test.rs`)
-//!    — and assert it matches the committed `canonical_tree_sha256` pin. If the directory is ABSENT
-//!    (any dev machine or CI runner without this asset staged), this is a GENUINE, HONEST skip
-//!    (printed, not silent) — matching this repo's existing runsc/KVM graceful-skip convention.
-//!    `MYELIN_REQUIRE_RUST_ROOTFS_PIN=1` forces a hard failure instead of a skip, for hosts (like the
-//!    founder dogfood host) where the asset is expected to be staged.
-//!
-//! This test does NOT shell out to a host `tar`/`sha256sum` process (a prior version did) — it calls
-//! the pure-Rust `myelin-ci-sandbox` hasher as a dev-dependency instead, exercising the SAME code
-//! path the production asset registry uses rather than a parallel shell-based reimplementation that
-//! could silently drift from it.
-
 use myelin_ci_sandbox::{canonical_tree_sha256_hex, file_sha256_hex};
 use myelin_ci_sandbox::{
     CARGO_VENDOR_SMOKE_LOCK_SHA256, CARGO_VENDOR_SMOKE_TREE_SHA256,
@@ -84,8 +47,6 @@ fn load_real_manifest() -> Manifest {
     toml::from_str(&source).expect("parse runner-assets.toml")
 }
 
-/// A minimal view of `.myelin/ci.toml` — just enough to read the ONE founder-dogfood job's `image`
-/// field, whose embedded digest must match `LINUX_SMALL_V1_ROOTFS_SHA256`.
 #[derive(Debug, Deserialize)]
 struct CiToml {
     jobs: Vec<CiJobRow>,
@@ -104,9 +65,6 @@ fn load_real_ci_toml() -> CiToml {
     toml::from_str(&source).expect("parse .myelin/ci.toml")
 }
 
-/// Resolve an asset row's staged directory: its `env_var` if set, else its documented
-/// `default_path` (expanding a leading `~` against `$HOME`, since these paths are always
-/// `~/.local/share/gvisor-assets/...` in this manifest).
 fn resolve_staged_dir(row: &AssetRow) -> PathBuf {
     if let Ok(value) = std::env::var(&row.env_var) {
         return PathBuf::from(value);
@@ -118,9 +76,6 @@ fn resolve_staged_dir(row: &AssetRow) -> PathBuf {
     PathBuf::from(&row.default_path)
 }
 
-/// Parse the sha256 hex digest out of an `@sha256:<hex>`-pinned `image` reference string. Returns
-/// `None` (never a partial/garbage match) if the reference isn't pinned that way — the caller turns
-/// that into a loud, specific assertion failure rather than a confusing downstream one.
 fn parse_sha256_digest(image: &str) -> Option<&str> {
     let (_, after_at) = image.rsplit_once('@')?;
     let (algo, digest) = after_at.split_once(':')?;
@@ -130,8 +85,6 @@ fn parse_sha256_digest(image: &str) -> Option<&str> {
     (digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit())).then_some(digest)
 }
 
-/// HARD-FAIL on an absent staged asset iff `MYELIN_REQUIRE_RUST_ROOTFS_PIN=1` (this gate refuses
-/// a vacuous green on a host expected to carry the asset); otherwise GRACEFUL, HONEST SKIP.
 fn require_or_skip(row: &AssetRow, dir: &Path) -> bool {
     if dir.is_dir() {
         return true;
@@ -146,7 +99,7 @@ fn require_or_skip(row: &AssetRow, dir: &Path) -> bool {
         );
     }
     eprintln!(
-        "runner-asset `{}`: SKIPPED — staged directory {} is absent on this machine (this asset \
+        "runner-asset `{}`: SKIPPED - staged directory {} is absent on this machine (this asset \
          is not staged here; MYELIN_REQUIRE_RUST_ROOTFS_PIN=1 would hard-fail instead of skip).",
         row.id,
         dir.display()
@@ -164,7 +117,7 @@ fn every_row_image_digest_matches_its_own_canonical_tree_sha256() {
     for row in &manifest.asset {
         let parsed = parse_sha256_digest(&row.image).unwrap_or_else(|| {
             panic!(
-                "runner-asset `{}`: `image` (`{}`) must be pinned as `...@sha256:<64-hex>` — a \
+                "runner-asset `{}`: `image` (`{}`) must be pinned as `...@sha256:<64-hex>` - a \
                  GvisorAssetRegistry entry can only ever resolve a sha256-pinned reference today",
                 row.id, row.image
             )
@@ -172,7 +125,7 @@ fn every_row_image_digest_matches_its_own_canonical_tree_sha256() {
         assert_eq!(
             parsed, row.canonical_tree_sha256,
             "runner-asset `{}`: the digest embedded in `image` (`{}`) must equal this row's own \
-             `canonical_tree_sha256` (`{}`) — a registry entry built from this row's `image` and \
+             `canonical_tree_sha256` (`{}`) - a registry entry built from this row's `image` and \
              rootfs path could never verify at from_bindings() construction time otherwise (the digest a real \
              registry would check the staged directory against would never be the digest the \
              directory is actually pinned to)",
@@ -225,7 +178,7 @@ fn staged_runner_assets_match_their_committed_digest_pin() {
             row.canonical_tree_sha256,
             "runner-asset `{}` staged at {} has DRIFTED from its committed pin in \
              runner-assets.toml: expected sha256:{}, computed sha256:{}. Either the staged tree \
-             was mutated/rebuilt without updating the manifest, or the manifest is stale — re-run \
+             was mutated/rebuilt without updating the manifest, or the manifest is stale - re-run \
              `{}` and update `canonical_tree_sha256` if the drift is intentional.",
             row.id,
             dir.display(),
@@ -239,24 +192,12 @@ fn staged_runner_assets_match_their_committed_digest_pin() {
         assert!(
             checked_any,
             "MYELIN_REQUIRE_RUST_ROOTFS_PIN=1 but no runner-asset row's staged directory was \
-             present — require_or_skip should have already hard-panicked; this is a bug in the \
+             present - require_or_skip should have already hard-panicked; this is a bug in the \
              skip-detection above if reached"
         );
     }
 }
 
-/// **UNCONDITIONAL (no staged directory required) — the source-file sync check.** Before this test,
-/// `GVISOR_GIT_ROOTFS_SHA256`/`LINUX_RUST_V1_ROOTFS_SHA256`/
-/// `LINUX_SMALL_V1_ROOTFS_SHA256` (`gvisor.rs`) duplicated
-/// `runner-assets.toml`'s `canonical_tree_sha256`/`image` fields and `.myelin/ci.toml`'s `image`
-/// field as separate hardcoded literals with NO mechanical link between any of them — a source-file
-/// edit to one could leave every existing test green while production silently refused (or accepted
-/// a wrong) newly-authored image. This asserts:
-///   - `LINUX_RUST_V1_ROOTFS_SHA256` == `runner-assets.toml`'s `linux-rust-v1` row's
-///     `canonical_tree_sha256` == that row's own `image` field's embedded `@sha256:` digest.
-///   - `GVISOR_GIT_ROOTFS_SHA256` == the equivalent `git-v1` row values.
-///   - `LINUX_SMALL_V1_ROOTFS_SHA256` == `.myelin/ci.toml`'s (single) job's `image` field's embedded
-///     `@sha256:` digest.
 #[test]
 fn rust_and_small_rootfs_constants_are_mechanically_synced_to_their_toml_sources() {
     let manifest = load_real_manifest();
@@ -268,7 +209,7 @@ fn rust_and_small_rootfs_constants_are_mechanically_synced_to_their_toml_sources
     assert_eq!(
         LINUX_RUST_V1_ROOTFS_SHA256, rust_row.canonical_tree_sha256,
         "gvisor.rs's LINUX_RUST_V1_ROOTFS_SHA256 constant has drifted from runner-assets.toml's \
-         `linux-rust-v1` row's `canonical_tree_sha256` — update whichever is stale"
+         `linux-rust-v1` row's `canonical_tree_sha256` - update whichever is stale"
     );
     let rust_embedded = parse_sha256_digest(&rust_row.image).unwrap_or_else(|| {
         panic!(
@@ -371,13 +312,6 @@ fn cargo_vendor_manifest_row_is_mechanically_synced_to_code_and_fixture() {
     );
 }
 
-/// Gate-3 prerequisite: the full-workspace `cargo-vendor-workspace-v1` row is pinned the SAME way
-/// the smoke row is — capability/job/env/mount vocabulary, canonical-tree digest synced to the
-/// registry const, `image` digest carrying the same complete-tree pin, and the embedded-lock key
-/// synced to BOTH the registry const AND the row's own `source_image_digest`. Its `source_image` is
-/// this repo's OWN root `Cargo.lock`, so this ALSO asserts the workspace lock key is the digest of
-/// the live root lockfile — a drift here means the vendor tree no longer matches the workspace it
-/// claims to vendor. Mirrors `cargo_vendor_manifest_row_is_mechanically_synced_to_code_and_fixture`.
 #[test]
 fn cargo_vendor_workspace_manifest_row_is_mechanically_synced_to_code_and_lockfile() {
     let manifest = load_real_manifest();
@@ -426,7 +360,7 @@ fn cargo_vendor_workspace_manifest_row_is_mechanically_synced_to_code_and_lockfi
         .unwrap_or_else(|error| panic!("hash root lock {}: {error}", root_lock.display()));
     assert_eq!(
         actual_root_lock_sha256, CARGO_VENDOR_WORKSPACE_LOCK_SHA256,
-        "the workspace root Cargo.lock moved without an intentional asset rebuild/repin — the \
+        "the workspace root Cargo.lock moved without an intentional asset rebuild/repin - the \
          vendor tree no longer matches the workspace it claims to vendor"
     );
 }

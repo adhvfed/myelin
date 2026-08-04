@@ -1,28 +1,3 @@
-//! # BUS-D8 (live-store leg) — the Bus crypto-shred + tombstone erasure drill (EB-15 / P-092)
-//!
-//! This is the **BUS-D8 live-store-leg** drill the EB-15 GATE / TESTS field names (the erasure drill
-//! greened in the live-store leg; the *reaches-backups* leg is the M5 follow-on EB-29). It proves the
-//! Bus's instantiation of the ONE platform erasure posture (Bus §4.8 / X-7, by reference):
-//!
-//! 1. **seed** an in-cell event log with the subject's RARE inline-PII events (sealed under a
-//!    per-subject DEK) + the common references-not-payloads events;
-//! 2. **erase(subject)** through the holder mechanism ([`myelin_events::BusHolder`]) — crypto-shred
-//!    the per-subject DEK through the [`myelin_events::InlinePiiShredder`] KMS seam + emit `*.erased`
-//!    tombstones through the **outbox** (the only sanctioned emit path; BUS-2);
-//! 3. **relay → broker → consumer**: the relay publishes the tombstone, a live consumer sees it and
-//!    **degrades gracefully** ([`myelin_events::degrade_on_tombstone`] → `Done`, never blocks, never
-//!    reads the now-unrecoverable payload);
-//! 4. **READ the erase-receipt + tombstone-count** (the SCHED artifact) and assert the BUS-D8
-//!    threshold: **0 recoverable inline-PII in the live log; tombstones present** — and bridge the
-//!    Bus's survival signals into the harness's frozen §10.2 assertion library so the verdict is a
-//!    loud, never-swallowed green (EI-01 §3): after the erase + tombstone emit + drain, `outbox_depth
-//!    == 0` and `dead_letter_count == 0` (nothing was lost erasing the subject).
-//!
-//! The DEVIATION (`myelin-events` cannot depend on the harness in production — the §2.9 DAG) is
-//! bridged HERE, in the test build where the harness IS a dev-dependency, exactly as the EB-11
-//! self-test does it. The `impl gdpr::PersonalDataHolder` adapter + the live `KmsEngine` binding are
-//! the named floor P-GA-06; this drill proves the MECHANISM that adapter wraps.
-
 use myelin_events::{
     degrade_on_tombstone, ArtifactRef, BusEventLog, BusHolder, BusSignals, ConsumerName, DataRole,
     DedupLedger, EventDraft, EventType, IdMinter, InMemoryShredder, InProcessBus, MonotonicMinter,
@@ -54,8 +29,6 @@ fn actor_for(id: &str) -> Actor {
     ))
 }
 
-/// Build one retained envelope. `pii_subject = Some(s)` = an inline-PII event sealed under `s`'s
-/// per-subject DEK; `None` = references-not-payloads (no inline PII).
 fn retained(
     event_id: &str,
     type_: &str,
@@ -89,9 +62,6 @@ fn retained(
     myelin_events::derive_envelope(draft, ctx, None)
 }
 
-/// A consumer that degrades gracefully on the `*.erased` tombstone (the BUS-D8 "consumers degrade
-/// gracefully" leg). It records each tombstone it saw; it NEVER reads the shredded payload and NEVER
-/// returns `Retry`/`NonRetryable` for a tombstone.
 struct DegradingConsumer {
     seen_tombstones: std::sync::Mutex<usize>,
 }
@@ -111,12 +81,8 @@ impl myelin_events::EventHandler for DegradingConsumer {
     }
 }
 
-/// **BUS-D8 (live-store leg): erase a subject → 0 recoverable inline-PII live + tombstones present +
-/// consumers degrade gracefully + nothing lost.** The unit-of-proof the EB-15 GATE requires.
 #[test]
 fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstones_present() {
-    // (0) SEED the in-cell log: subject u42 has one rare inline-PII event; u99 one; plus two
-    //     references-only events (the common case — erasing tombstones the identity, not the fact).
     let mut log = BusEventLog::new();
     let shredder = InMemoryShredder::new();
     let e1 = retained("01J-1", "chat.message.created", "u42", Some("u42"));
@@ -139,7 +105,6 @@ fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstone
         "precondition: u42's inline-PII DEK is live"
     );
 
-    // (1) ERASE(u42): crypto-shred the per-subject DEK + emit *.erased tombstones into the outbox.
     let holder = BusHolder::new(tenant(), region(), shredder.clone());
     let mut outbox = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
@@ -147,7 +112,6 @@ fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstone
         .erase("u42", &mut log, &mut outbox, minter)
         .expect("erase succeeds (KMS reachable)");
 
-    // (2) READ the erase-receipt (the SCHED artifact) — the BUS-D8 threshold.
     assert_eq!(
         receipt.recoverable_remaining, 0,
         "BUS-D8: 0 recoverable inline-PII in the live log"
@@ -157,23 +121,19 @@ fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstone
         "the per-subject DEK was destroyed"
     );
     assert_eq!(receipt.tombstones_emitted, 1, "tombstones present");
-    // The crypto-shred is REAL: u42's DEK no longer resolves (the live-log ciphertext is dead).
     assert!(
         !shredder.is_live(&key_u42),
-        "u42's inline-PII DEK is crypto-shredded — unrecoverable"
+        "u42's inline-PII DEK is crypto-shredded - unrecoverable"
     );
-    // Per-subject granularity (GD-4): u99 is UNTOUCHED.
     assert!(
         shredder.is_live(&PiiKeyRef("kms://acme/0/subject:u99".into())),
         "u99 untouched"
     );
-    // The erased event is tombstoned in the live log (the consumer-degrade signal).
     assert!(
         log.is_tombstoned("01J-1"),
         "the erased event carries a tombstone"
     );
 
-    // (3) RELAY → BROKER → CONSUMER: the relay publishes the tombstone; a live consumer degrades.
     let bus = InProcessBus::new();
     let relay = Relay::new(outbox.clone(), bus.clone(), clock);
     let drain = relay.drain_to_empty();
@@ -182,8 +142,6 @@ fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstone
         "the relay published the *.erased tombstone"
     );
 
-    // The relay publishes each event under its `subject` ArtifactRef; the Bus's tombstones land
-    // under `myelin://<tenant>/bus/event/<id>`, so the consumer binds + reads that prefix.
     const TOMBSTONE_PREFIX: &str = "myelin://acme/bus/event";
     let consumer = Consumer::new(
         DegradingConsumer {
@@ -207,8 +165,6 @@ fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstone
         "the live consumer saw the tombstone and degraded gracefully (never blocked, never read the payload)"
     );
 
-    // (4) BRIDGE into the harness §10.2 assertion library — a LOUD green (never swallowed): after
-    //     the erase + tombstone emit + drain, nothing was lost (depth 0, no dead-letters).
     let obs = BusObservations::default();
     let now = Timestamp("2026-06-19T00:00:03Z".into());
     let sig = BusSignals::snapshot(&outbox, &drain, &obs, &now, 0);
@@ -234,8 +190,6 @@ fn bus_d8_live_store_leg_crypto_shred_renders_inline_pii_unrecoverable_tombstone
     );
 }
 
-/// **BUS-D8 loud-failure leg:** a crypto-shred KMS failure ABORTS the erase as INCOMPLETE (never
-/// "assume erased"; the DSR retries). The DEK stays as-is, no tombstone is committed.
 #[test]
 fn bus_d8_crypto_shred_kms_failure_is_loud_never_assumes_erased() {
     let mut log = BusEventLog::new();
@@ -267,6 +221,6 @@ fn bus_d8_crypto_shred_kms_failure_is_loud_never_assumes_erased() {
     );
     assert!(
         shredder.is_live(&key_u42),
-        "DEK untouched — the DSR retries (never assume erased)"
+        "DEK untouched - the DSR retries (never assume erased)"
     );
 }

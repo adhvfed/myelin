@@ -1,5 +1,3 @@
-//! Deployment guard for the Issues binary's split-credential bootstrap sequence.
-
 #[test]
 fn production_main_hands_privileged_bootstrap_off_before_runtime_store_construction() {
     let source = include_str!("../src/main.rs");

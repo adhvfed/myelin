@@ -1,44 +1,3 @@
-//! # `durable` — REAL on-disk bare git repos: the durable STORAGE floor (GT-001 / E1.1)
-//!
-//! The genuinely-durable storage organ the rest of the Git track sits on. Today the
-//! [`crate::receive_pack::RefStore`] kept refs + reflog in an in-memory `Mutex<BTreeMap>` whose
-//! `open` loaded NOTHING (census SI-012 — the entry point of every repo lost on restart), and the
-//! object/pack index was an in-memory `oid → hash` map rebuilt on open (F-git-2). This module makes
-//! the WRITE / ref / repo-lifecycle path durable on the **same on-disk model the READ path already
-//! uses** ([`crate::gix_backend::GixCore`] opens real bare repos via `git2::Repository::open`):
-//!
-//! - **Repo lifecycle on disk** — repo creation is `git2::Repository::init_bare` at the resolver
-//!   path `<root>/<tenant>/<region>/<repo>.git`; existence/open loads the real bare repo.
-//! - **Durable refs + reflog** — ref reads / writes / **compare-and-swap** go to the real on-disk
-//!   repo's refs via `git2` (`reference` / `reference_matching` / `find_reference`), and a FRESH
-//!   handle over the same on-disk root sees them (no empty map on open). The reflog is the real
-//!   on-disk git reflog (`core.logallrefupdates`).
-//! - **Durable objects** — object writes/reads go to the on-disk repo's **odb** (`git2`); the
-//!   `oid → object` lookup IS the real on-disk odb (no in-memory index rebuilt on open).
-//! - **Tenant/region pathing is the isolation boundary** — a repo lives under its `tenant/region`
-//!   and is never reachable cross-tenant by path (the resolver mints the path from the locator).
-//!
-//! ## Anti-duplication — REUSE git2 + the read resolver, never reimplement git
-//! This module does NOT reimplement git objects/refs/packing. It REUSES:
-//! - [`crate::gix_backend::RepoPathResolver`] / [`crate::gix_backend::RootedResolver`] — the exact
-//!   `<tenant>/<region>/<repo>.git` path mapping the read backend ([`crate::gix_backend::GixCore`])
-//!   already resolves against, so the write/lifecycle path and the read path open the SAME repo.
-//! - `git2` (libgit2) — the architecture-named in-process backend (gix-preferred is the OQ-1 floor,
-//!   GIT-P33). Safe Rust API only; the crate stays `#![forbid(unsafe_code)]`.
-//!
-//! ## Scope — git object durability vs the generic blob tier (be precise, prompt §3)
-//! The **git object tier** is the on-disk **odb** ([`DurableGitRepo::write_blob`] /
-//! [`DurableGitRepo::read_object_bounded`]): real `fs`-backed git objects, `git fsck`-clean, survive
-//! restart.
-//! The generic content-addressed [`myelin_storage::FsBlobStore`] (the `Mutex<HashMap>` byte tier the
-//! [`crate::pack_tier`] rides) is a SEPARATE track — its real on-disk/object-store byte backing is
-//! P-ST-30 (census SI-014/015/029), already carried in the `no-in-memory-durable-store` baseline.
-//! GT-001 fixes the **git object durability** here; the generic blob tier's backing swap is not this
-//! prompt (and `myelin-git` is out of the spine lint's scan scope, so this module changes no ratchet).
-//!
-//! The smart-transport WIRE (`clone`/`push` over the network) is **GT-006** (sandbox-gated) — NOT
-//! this module. This is the durable STORAGE the wire (and the API/UI/CLI) will sit on.
-
 use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -56,33 +15,16 @@ pub use crate::tree_pagination::{
     TREE_PAGE_SCAN_MAX_TOTAL_NAME_BYTES,
 };
 
-// ───────────────────────────── errors ────────────────────────────────────────────────────────────
-
-/// The error surface of the durable on-disk git store. Loud + specific (a refusal is diagnosable —
-/// EI-01 §3); never a silent wrong-bytes / lost-write.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurableError {
-    /// A `git2` (libgit2) op failed (open / odb / reference). Carries the libgit2 message.
     Git(String),
-    /// A filesystem op failed (creating the tenant/region parent dirs for a new repo).
     Io(String),
-    /// A compare-and-swap ref update was REJECTED because the ref's current tip did not match the
-    /// expected-old the caller asserted (a non-fast-forward / lost-update race). The ref did NOT
-    /// move — the LOUD reject the per-ref linearisation point owns (arch §3).
     CasMismatch {
-        /// the fully-qualified ref the CAS targeted.
         ref_name: String,
-        /// the tip the caller believed it was moving from (`None` = expected-to-not-exist / create).
         expected: Option<String>,
-        /// the ref's actual current tip (`None` = the ref does not exist).
         actual: Option<String>,
     },
-    /// An object / ref / repo asked for was not present on disk.
     NotFound(String),
-    /// **A capability-scoped refusal (R2-exit).** The operation is well-formed and the object exists,
-    /// but the principal is NOT authorized to perform it — e.g. a non-CI-producer principal attempting
-    /// to report CI check facts (`git.checks.report` is a CI-PRODUCER capability, never an ordinary
-    /// writer one). Maps to a fail-closed 403 at the edge. Loud + specific (a refusal is diagnosable).
     Forbidden(String),
 }
 
@@ -98,7 +40,7 @@ impl std::fmt::Display for DurableError {
             } => write!(
                 f,
                 "ref CAS rejected on {ref_name}: expected {expected:?} but the on-disk tip is \
-                 {actual:?} — the ref did NOT move (non-fast-forward / lost-update)"
+                 {actual:?} - the ref did NOT move (non-fast-forward / lost-update)"
             ),
             DurableError::NotFound(m) => write!(f, "durable git not found: {m}"),
             DurableError::Forbidden(m) => write!(f, "durable git forbidden: {m}"),
@@ -115,8 +57,6 @@ fn git_err(ctx: &str, e: git2::Error) -> DurableError {
 static ATOMIC_WRITE_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Durably replace `file` with `bytes`: sync a process-unique temporary file, rename it into place,
-/// then sync the parent directory so the rename itself survives a crash.
 pub(crate) fn write_file_atomic(
     dir: &Path,
     file: &Path,
@@ -129,8 +69,6 @@ pub(crate) fn write_file_atomic(
     })
 }
 
-/// Durably replace `file` with bytes produced directly into its process-unique temporary file.
-/// This is the streaming form used by large bounded artifacts to avoid a second whole-body buffer.
 pub(crate) fn write_file_atomic_with(
     dir: &Path,
     file: &Path,
@@ -166,33 +104,8 @@ pub(crate) fn write_file_atomic_with(
     result
 }
 
-// ───────────────────────────── durable per-ref generation counter (R0.4 / git #1 HIGH) ───────────
-
-/// The git-config key holding the durable, monotonic generation of one ref (R0.4 / git #1 HIGH).
-///
-/// **Why this exists (the bug it replaces).** The crash reconciler + write path used to treat the
-/// on-disk **reflog LENGTH** ([`DurableGitRepo::reflog_len`]) as the durable per-ref `update_seq`
-/// generation. Reflog length is an OPERATION COUNT, not a monotonic generation: when a ref is
-/// **deleted**, libgit2 removes that ref's reflog, so on a delete+recreate the count RESETS to 1 —
-/// while the committed `update_seq` (the recovery fence) is monotonic and keeps climbing. After a
-/// delete+recreate followed by a crash in the apply-after-outbox-commit window, the reconciler then
-/// mis-compares (the restarted reflog is smaller than the committed seq of an already-applied move)
-/// and can replay a stale move (CAS-mismatch) or leave a ref wrongly deleted. See git #1 HIGH.
-///
-/// **Why the config counter is correct.** This counter is keyed by the ref NAME and stored in the
-/// repo's git-**config** (`[myelin "refgen"] <encoded-ref> = N`), which is a wholly separate on-disk
-/// file from the ref's reflog. So it:
-///  - **survives the ref's own deletion** — deleting a ref removes its reflog but never touches the
-///    `myelin.refgen.*` config, so the generation does NOT reset on delete+recreate;
-///  - **survives restart** — config is on disk; a fresh [`Self::open_git`] reopen reads it back;
-///  - **is monotonic (max-wins, never decreases)** — every advancing CAS writes `current + 1`.
-///
-/// The ref name is **hex-encoded** (with a leading letter) so the config variable is always a valid
-/// git identifier (`[a-zA-Z][a-zA-Z0-9-]*`) regardless of the ref's slashes/dots, and the encoding is
-/// 1:1 — two distinct refs never collide onto one counter.
 fn refgen_key(ref_name: &str) -> String {
     use std::fmt::Write as _;
-    // Leading 'r' guarantees an alphabetic first char (a bare hex digit is a rejected config key).
     let mut var = String::with_capacity(ref_name.len() * 2 + 1);
     var.push('r');
     for b in ref_name.as_bytes() {
@@ -201,7 +114,6 @@ fn refgen_key(ref_name: &str) -> String {
     format!("myelin.refgen.{var}")
 }
 
-/// Read one config-backed generation without conflating an absent key with corrupt configuration.
 fn read_ref_generation(cfg: &git2::Config, ref_name: &str) -> Result<u64, DurableError> {
     match cfg.get_i64(&refgen_key(ref_name)) {
         Ok(value) => u64::try_from(value).map_err(|_| {
@@ -212,70 +124,39 @@ fn read_ref_generation(cfg: &git2::Config, ref_name: &str) -> Result<u64, Durabl
     }
 }
 
-/// Return the next generation only when it can still round-trip through git-config's signed
-/// integer representation. The receive path uses this before committing its outbox witness, and
-/// the disk apply path uses the same bound before mutating the ref.
 pub(crate) fn next_ref_generation(current: u64) -> Option<u64> {
     current.checked_add(1).filter(|next| i64::try_from(*next).is_ok())
 }
 
-// ───────────────────────────── one on-disk reflog entry ──────────────────────────────────────────
-
-/// One durable reflog entry read back from the on-disk git reflog. The reflog is durable (it is the
-/// real git reflog on disk) — this is the read shape the [`crate::receive_pack::RefStore`] assembles
-/// its [`crate::receive_pack::ReflogEntry`] view from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableReflogEntry {
-    /// the old tip (`None` for the create entry — the zero oid in git's reflog).
     pub old_oid: Option<Oid>,
-    /// the new tip.
     pub new_oid: Oid,
-    /// the committer name recorded on the entry — the [`crate::receive_pack::RefStore`] writes the
-    /// pusher PSEUDONYM here (never a raw identity — GIT-1), so it round-trips on read.
     pub committer: String,
-    /// the reflog message.
     pub message: String,
 }
 
-// ───────────────────────────── commit log / diff raw read shapes (GT-004) ────────────────────────
-
-/// Raw metadata for one commit read from the on-disk graph (libgit2). PII-free — `author_*` is the
-/// GIT-1 tenant pseudonym the commit was authored with (never a raw identity).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitMeta {
-    /// The full commit oid.
     pub oid: String,
-    /// The commit summary (first line of the message).
     pub summary: String,
-    /// The author name (the tenant pseudonym).
     pub author_name: String,
-    /// The author email (the tenant pseudonym's `…@<tenant>.noreply`).
     pub author_email: String,
-    /// Commit time, unix seconds.
     pub time: i64,
-    /// The parent oids (0 = root; >1 = a merge commit).
     pub parents: Vec<String>,
 }
 
-/// Immutable object coordinates captured for the first page of a pull-request commit walk.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrCommitSnapshot {
-    /// Base tip resolved on page one, or `None` when the base ref did not exist.
     pub base_oid: Option<String>,
-    /// Pull-request head commit resolved on page one.
     pub head_oid: String,
 }
 
-/// A pull-request commit snapshot page could not be served.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrCommitPageError {
-    /// The requested page size or continuation position exceeds the finite interactive ceilings.
     InvalidPagination,
-    /// A pinned head or base graph exceeds the finite reachability proof ceiling.
     CapacityExceeded,
-    /// An object pinned by a previously minted continuation no longer exists.
     SnapshotExpired,
-    /// Another durable Git operation failed.
     Durable(DurableError),
 }
 
@@ -300,34 +181,21 @@ impl From<DurableError> for PrCommitPageError {
     }
 }
 
-/// Raw per-file delta in a commit diff (libgit2 `diff_tree_to_tree`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileDelta {
-    /// The (new) file path.
     pub path: String,
-    /// The rename/copy source path (`None` otherwise).
     pub old_path: Option<String>,
-    /// `A`/`M`/`D`/`R`/`C`.
     pub status: char,
-    /// The unified-diff lines: `(origin, content)` where origin is `+`/`-`/` `.
     pub lines: Vec<(char, String)>,
 }
 
-/// Raw full detail of one commit: metadata + full message + per-file diff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitDetail {
-    /// The commit metadata.
     pub meta: CommitMeta,
-    /// The full commit message.
     pub message: String,
-    /// The changed files.
     pub files: Vec<FileDelta>,
 }
 
-// ───────────────────────────── PR diff raw read shapes (R3.2 · G-7 N1) ───────────────────────────
-
-/// The rendered kind of a changed file — drives the R-21 binary/LFS/submodule rows (never a garbled
-/// text dump). `Text` is the default (hunks render); the others carry NO hunks (a pointer/size row).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileKind {
     Text,
@@ -337,7 +205,6 @@ pub enum FileKind {
 }
 
 impl FileKind {
-    /// The stable wire token (the DiffViewer maps it to the row treatment).
     pub fn as_str(self) -> &'static str {
         match self {
             FileKind::Text => "text",
@@ -348,23 +215,14 @@ impl FileKind {
     }
 }
 
-/// One diff line with BOTH line numbers (anchors, SR prefixes, deep-links need them). `old_no` is
-/// `None` on an added line, `new_no` is `None` on a removed line (a context line carries both).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffLineDelta {
-    /// `+` add / `-` remove / ` ` context.
     pub origin: char,
-    /// The line content (newline-trimmed).
     pub content: String,
-    /// The OLD-side line number (`None` on `+`).
     pub old_no: Option<u32>,
-    /// The NEW-side line number (`None` on `-`).
     pub new_no: Option<u32>,
 }
 
-/// A bounded expand-context lookup. The caller can distinguish an absent object, a binary object,
-/// and a text object that was refused by the pre-inflation ODB-size ceiling without materializing
-/// arbitrary repository bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileLinesLookup {
     Found(Vec<DiffLineDelta>),
@@ -373,11 +231,8 @@ pub enum FileLinesLookup {
     Missing,
 }
 
-/// One hunk of a file delta — its `@@` header + boundaries + lines. Boundaries let the client render
-/// collapsed unchanged runs and expand context (a flat `lines[]` can't).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiffHunkDelta {
-    /// The full hunk header (`@@ -104,7 +104,9 @@ impl DurableGitEdge {`).
     pub header: String,
     pub old_start: u32,
     pub old_lines: u32,
@@ -386,39 +241,25 @@ pub struct DiffHunkDelta {
     pub lines: Vec<DiffLineDelta>,
 }
 
-/// One changed file in a PR diff — hunk-structured, with the kind + counts + size the R-21 rows need.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrFileDelta {
     pub path: String,
     pub old_path: Option<String>,
-    /// New-side blob content address. `None` for deletions and submodules (whose new object is a
-    /// commit, not a blob). Expand-context consumers must use this exact immutable object.
     pub new_blob_oid: Option<String>,
-    /// `A`/`M`/`D`/`R`/`C`.
     pub status: char,
     pub kind: FileKind,
     pub additions: u32,
     pub deletions: u32,
-    /// The new-side blob byte size (binary/LFS rows show it; `None` for a text/deleted file).
     pub size_bytes: Option<u64>,
     pub hunks: Vec<DiffHunkDelta>,
-    /// `true` for a deleted file whose contents are collapsed by default ("Show deleted contents").
     pub deleted_body_available: bool,
-    /// `true` when the per-file line cap was hit (the client offers "Expand all" → a refetch).
     pub truncated: bool,
 }
 
-/// A PR's three-dot diff (`merge-base(base, head) … head`) — the reviewer reviews the PR's OWN
-/// changes, not drift in the base. `base_oid` is the merge-base ACTUALLY diffed (honest even under
-/// the two-dot fallback — it is then the base tip, and the UI labels it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrDiff {
-    /// The merge-base actually diffed against (or the base tip under the two-dot fallback).
     pub base_oid: String,
-    /// The head snapshot this diff renders.
     pub head_oid: String,
-    /// `true` iff `base_oid` is a real merge-base (three-dot); `false` = the two-dot fallback (the UI
-    /// labels "compared against <ref> @ <oid>").
     pub three_dot: bool,
     pub files: Vec<PrFileDelta>,
     pub total_files: usize,
@@ -426,102 +267,58 @@ pub struct PrDiff {
     pub total_deletions: u32,
 }
 
-/// One entry in a nested tree listing (R3.4 repo-browsing). `size` is the blob byte size for files
-/// (`None` for directories) — the tree row's size affordance.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeEntryInfo {
-    /// The entry basename (never the full path).
     pub name: String,
-    /// `true` for a subdirectory (links to `tree/…`), `false` for a file (links to `blob/…`).
     pub is_dir: bool,
-    /// The blob byte size (files only).
     pub size: Option<u64>,
 }
 
-/// Resolving a `{...path}` under a ref as a BLOB (R3.4). [`BlobPathLookup::IsDir`] drives the
-/// blob→tree client redirect (kind mismatch).
 pub enum BlobPathLookup {
-    /// The blob bytes + its content-address + server-side binary detection + byte size.
     Found {
-        /// The raw file bytes.
         bytes: Vec<u8>,
-        /// The blob content-address (the GF-6 CAS base).
         oid: Oid,
-        /// `true` if the bytes look binary (a NUL in the first 8000 bytes) — the download-fallback gate.
         is_binary: bool,
-        /// The blob byte size.
         size: u64,
     },
-    /// The blob exists but exceeds a caller-supplied pre-allocation byte ceiling. Its object id is
-    /// still available from the tree entry without inflating the object, so metadata-only callers
-    /// can render an honest download fallback.
     TooLarge {
         size: u64,
         maximum: usize,
         oid: Oid,
     },
-    /// The path resolves to a directory → the caller redirects to the tree route.
     IsDir,
-    /// No such path under the ref.
     Missing,
 }
 
-/// The git binary-file heuristic: a NUL byte within the first 8000 bytes marks the content binary
-/// (so the UI renders the download fallback instead of a garbled `split('\n')` text dump — R3.4).
 fn looks_binary(bytes: &[u8]) -> bool {
     bytes.iter().take(8000).any(|b| *b == 0)
 }
 
-/// Maximum inclusive line span accepted by the expand-context API.
 pub const FILE_LINES_MAX_RANGE: usize = 1_000;
-/// Maximum blob size inflated by the expand-context API. Checked through the ODB header first.
 pub const FILE_LINES_MAX_BLOB_BYTES: usize = 512 * 1024;
-/// Maximum direct refs materialized by smart-HTTP and push-adjacent recovery/audit paths.
 pub const WIRE_MAX_REFS: usize = 100_000;
-/// Maximum entries materialized from one durable reflog during audit/export.
 pub const REFLOG_MAX_ENTRIES_PER_REF: usize = 100_000;
-/// Maximum on-disk bytes libgit2 may parse for one durable reflog during audit/export.
 pub const REFLOG_MAX_BYTES_PER_REF: usize = 32 * 1024 * 1024;
-/// Maximum entries materialized across every ref in one durable audit/export view.
 pub const REFLOG_MAX_TOTAL_ENTRIES: usize = 100_000;
-/// Maximum reflog input/output string bytes materialized by one durable audit/export view.
 pub const REFLOG_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
-/// Maximum encoded bytes loaded for one tree object during interactive browsing.
 pub(crate) const TREE_OBJECT_MAX_BYTES: usize = 8 * 1024 * 1024;
-/// Maximum changed files computed for one interactive pull-request diff.
 pub const PR_DIFF_MAX_FILES: usize = 1_000;
-/// Maximum commit parents represented in interactive metadata (matching the web read contract).
 pub const COMMIT_META_MAX_PARENTS: usize = 64;
-/// Maximum first-line commit summary bytes represented in interactive metadata.
 pub const COMMIT_META_MAX_SUMMARY_BYTES: usize = 8 * 1024;
-/// Maximum author name/email bytes represented in interactive metadata.
 pub const COMMIT_META_MAX_IDENTITY_BYTES: usize = 1_024;
-/// Deepest offset accepted by the interactive commit-log walker.
 pub const COMMIT_LOG_MAX_OFFSET: usize = 100_000;
-/// Largest commit page materialized by one interactive history read.
 pub const COMMIT_LOG_MAX_PAGE: usize = 500;
-/// Deepest position one pull-request commit snapshot page may scan from its pinned head.
 pub const PR_COMMIT_MAX_POSITION: usize = 100_000;
-/// Maximum unique commit OIDs retained while proving either pinned PR snapshot coordinate.
 pub const PR_COMMIT_MAX_GRAPH_NODES_PER_PIN: usize = 100_000;
-/// Maximum parent edges examined while proving either pinned PR snapshot coordinate.
 pub const PR_COMMIT_MAX_GRAPH_EDGES_PER_PIN: usize = 1_000_000;
-/// Maximum rows yielded by the real page walk, including the one-row `has_more` probe.
 pub const PR_COMMIT_MAX_PAGE_WALK_OBSERVATIONS: usize =
     PR_COMMIT_MAX_POSITION + COMMIT_LOG_MAX_PAGE + 1;
-/// Maximum libgit2 walk nodes the sorted/hidden walk may preprocess after successful preflights.
 pub const PR_COMMIT_MAX_INTERNAL_WALK_NODES: usize = 2 * PR_COMMIT_MAX_GRAPH_NODES_PER_PIN;
-/// Maximum parent edges the sorted/hidden walk may examine after successful graph preflights.
 pub const PR_COMMIT_MAX_INTERNAL_WALK_EDGES: usize = 2 * PR_COMMIT_MAX_GRAPH_EDGES_PER_PIN;
-/// Maximum files materialized for one interactive commit diff.
 pub const COMMIT_DIFF_MAX_FILES: usize = 1_000;
-/// Maximum rendered lines materialized for one file in an interactive commit diff.
 pub const COMMIT_DIFF_MAX_LINES_PER_FILE: usize = 4_000;
-/// Maximum UTF-8 bytes accepted for one rendered diff line.
 pub const DIFF_MAX_LINE_BYTES: usize = 64 * 1024;
-/// Maximum aggregate rendered line bytes retained for one interactive diff computation.
 pub const DIFF_MAX_RENDERED_BYTES: usize = 4 * 1024 * 1024;
-/// Maximum commit message bytes copied into an interactive commit response.
 pub const COMMIT_DIFF_MAX_MESSAGE_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Copy)]
@@ -541,10 +338,6 @@ const COMMIT_DIFF_LIMITS: CommitDiffLimits = CommitDiffLimits {
     message_bytes: COMMIT_DIFF_MAX_MESSAGE_BYTES,
 };
 
-/// **Nested-path traversal guard (R3.4).** A tree-relative path may never carry a `..` or `.` segment
-/// or be absolute — such a path can only be an attempt to escape the committed tree (or a malformed
-/// client path), so it resolves to "no such path" cleanly (never a host-file read, never a 500). An
-/// empty/root path is safe (it selects the root tree). Called before `Tree::get_path`.
 fn is_safe_tree_path(clean: &str) -> bool {
     if clean.is_empty() {
         return true;
@@ -554,7 +347,6 @@ fn is_safe_tree_path(clean: &str) -> bool {
         .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
-/// Project a libgit2 commit into the PII-free [`CommitMeta`] read shape.
 fn utf8_prefix(value: &str, maximum_bytes: usize) -> String {
     if value.len() <= maximum_bytes {
         return value.to_string();
@@ -568,7 +360,6 @@ fn utf8_prefix(value: &str, maximum_bytes: usize) -> String {
 
 fn commit_meta(c: &git2::Commit<'_>) -> CommitMeta {
     let author = c.author();
-    // `Commit::summary` takes `&mut self`; derive the first message line (a `&self` accessor) instead.
     let message = c.message().unwrap_or("");
     CommitMeta {
         oid: c.id().to_string(),
@@ -601,11 +392,6 @@ fn pr_commit_walk_error(context: &str, error: git2::Error) -> PrCommitPageError 
     }
 }
 
-/// Prove one pinned coordinate's reachable graph is finite before enabling libgit2's preprocessing
-/// modes. The retained `scheduled` set includes both the frontier and visited OIDs, so its length is
-/// the peak stored unique-OID bound. Every parent relation is counted separately, including edges to
-/// an already-scheduled commit. Capacity takes precedence when discovering a missing parent would
-/// exceed a cap; otherwise that object is classified as expired when it is popped and loaded.
 fn preflight_pr_commit_reachability(
     repo: &git2::Repository,
     start: git2::Oid,
@@ -642,20 +428,12 @@ fn preflight_pr_commit_reachability(
     Ok(())
 }
 
-// ───────────────────────────── the per-repo durable handle ───────────────────────────────────────
-
-/// **A real on-disk bare git repository.** Wraps the resolved `<root>/<tenant>/<region>/<repo>.git`
-/// path; every op opens the repo via `git2` (the same per-call open the read backend [`GixCore`] uses
-/// — libgit2 caches the odb/refdb, and this keeps the handle `Send`-cheap with no long-lived FFI
-/// borrow). Refs, reflog, and objects all live ON DISK and survive a process restart.
 #[derive(Debug)]
 pub struct DurableGitRepo {
-    /// the bare repo's on-disk path (`…/<repo>.git`).
     path: PathBuf,
 }
 
 impl DurableGitRepo {
-    /// The bare repo's on-disk path.
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -665,9 +443,6 @@ impl DurableGitRepo {
             .map_err(|e| git_err(&format!("open bare repo {}", self.path.display()), e))
     }
 
-    /// Acquire the durable cross-process linearisation lock for one ref. The returned file owns the
-    /// exclusive lock until dropped. Lock filenames use the same injective hex encoding as ref
-    /// generations, and callers acquire multiple refs in sorted order to remain deadlock-free.
     pub(crate) fn lock_ref_exclusive(&self, ref_name: &str) -> Result<std::fs::File, DurableError> {
         let lock_dir = self.path.join("myelin-ref-locks");
         std::fs::create_dir_all(&lock_dir).map_err(|e| {
@@ -692,12 +467,6 @@ impl DurableGitRepo {
         Ok(file)
     }
 
-    /// **Open a THROWAWAY host-side quarantine bare repo (CT-006d push staging).** `init_bare` at `dir`
-    /// with its odb alternating to `alternate_objects` (the REAL repo's `objects/` dir, READ-only) — the
-    /// staging area where the sandbox-validated pushed objects are written + inspected (policy +
-    /// connectivity) BEFORE any of them migrate into the real repo. The alternate lets a thin delta's
-    /// base + existing-history connectivity resolve against the real repo without writing to it. The
-    /// caller removes `dir` after the push resolves (accept OR reject — the quarantine is never kept).
     pub fn init_quarantine(
         dir: &Path,
         alternate_objects: &Path,
@@ -721,24 +490,12 @@ impl DurableGitRepo {
             .map_err(|e| DurableError::Git(format!("bad oid {}: {e}", oid.as_str())))
     }
 
-    // ── objects (the on-disk odb — F-git-2: the oid→object lookup IS the real odb) ──
-
-    /// Write a blob object into the on-disk odb and return its **real git oid** (computed by git, not
-    /// a hand-rolled hash). Durable: a fresh handle over the same path reads it back.
     pub fn write_blob(&self, bytes: &[u8]) -> Result<Oid, DurableError> {
         let repo = self.open_git()?;
         let oid = repo.blob(bytes).map_err(|e| git_err("write blob", e))?;
         Ok(Oid::new(oid.to_string()))
     }
 
-    /// Import the complete object closure reachable from `locked_head` out of another durable
-    /// repository into this repository's ODB.
-    ///
-    /// This is the fork-merge object boundary: PR metadata may lock a head that lives in a distinct
-    /// source repository, while the eventual target ref may only name objects present in the target
-    /// ODB.  Libgit2 builds a self-contained pack from the exact locked commit (no source refs are
-    /// copied), then its verified indexer installs that pack in the target. Passing no target ODB to
-    /// the indexer deliberately rejects thin packs whose delta bases are absent from the pack.
     pub fn import_commit_closure_from(
         &self,
         source: &DurableGitRepo,
@@ -776,16 +533,12 @@ impl DurableGitRepo {
             .commit()
             .map_err(|e| git_err("verify and commit fork import pack", e))?;
 
-        // Reopen after installation so verification cannot be satisfied by a stale ODB cache.
         self.open_git()?
             .find_commit(head)
             .map_err(|e| git_err("verify imported fork head in target ODB", e))?;
         Ok(())
     }
 
-    /// Write a tree from `(name, blob_oid)` entries (regular-file mode `0o100644`) into the odb,
-    /// returning the tree's real oid. The minimal real tree the durable write path (and GT-003) build
-    /// a commit over.
     pub fn write_tree(&self, entries: &[(&str, &Oid)]) -> Result<Oid, DurableError> {
         let repo = self.open_git()?;
         let mut builder = repo.treebuilder(None).map_err(|e| git_err("treebuilder", e))?;
@@ -798,9 +551,6 @@ impl DurableGitRepo {
         Ok(Oid::new(oid.to_string()))
     }
 
-    /// Write a commit object into the odb (the real, `git fsck`-clean commit a ref points at).
-    /// `author_name`/`author_email` are the pseudonymous identity (GIT-1 — the caller passes the
-    /// tenant pseudonym, never a raw identity). Returns the commit's real oid.
     pub fn write_commit(
         &self,
         tree: &Oid,
@@ -823,15 +573,11 @@ impl DurableGitRepo {
             .collect::<Result<_, _>>()?;
         let parent_refs: Vec<&git2::Commit<'_>> = parent_commits.iter().collect();
         let oid = repo
-            // `None` target ref — write the object only; the ref move is the explicit CAS step below.
             .commit(None, &sig, &sig, message, &tree_obj, &parent_refs)
             .map_err(|e| git_err("write commit", e))?;
         Ok(Oid::new(oid.to_string()))
     }
 
-    /// Read an object's raw bytes from the on-disk odb by its git oid, rejecting from the object
-    /// header before allocation when it exceeds `maximum_bytes`. `NotFound` if absent — the lookup
-    /// is the real odb, NOT an in-memory index (F-git-2).
     pub fn read_object_bounded(
         &self,
         oid: &Oid,
@@ -854,7 +600,6 @@ impl DurableGitRepo {
         Ok(obj.data().to_vec())
     }
 
-    /// Whether an object exists in the on-disk odb.
     pub fn has_object(&self, oid: &Oid) -> bool {
         let Ok(repo) = self.open_git() else {
             return false;
@@ -866,10 +611,6 @@ impl DurableGitRepo {
         odb.exists(goid)
     }
 
-    // ── refs (durable; SI-012: read/CAS go to the on-disk repo, open loads from disk) ──
-
-    /// Read a ref's current tip from disk (`None` if the ref does not exist). A FRESH handle over the
-    /// same on-disk root reads the same value — the durability the in-memory `open` lacked (SI-012).
     pub fn read_ref(&self, name: &str) -> Result<Option<Oid>, DurableError> {
         let repo = self.open_git()?;
         let reference = repo.find_reference(name);
@@ -885,8 +626,6 @@ impl DurableGitRepo {
         }
     }
 
-    /// List direct refs with an explicit materialization ceiling. Wire-facing callers use this
-    /// before advertising or walking all tips so tenant-created ref cardinality remains finite.
     pub fn list_refs_bounded(
         &self,
         maximum: usize,
@@ -912,16 +651,6 @@ impl DurableGitRepo {
         Ok(out)
     }
 
-    /// **Compare-and-swap a ref** (the per-ref linearisation point, arch §3). Atomically moves
-    /// `name` from `expected` to `new` ONLY if its on-disk tip equals `expected`; otherwise the ref
-    /// does NOT move and [`DurableError::CasMismatch`] is returned (the LOUD non-fast-forward reject).
-    ///
-    /// - `expected = None` → CREATE (the ref must not yet exist).
-    /// - `new = None` → DELETE (the ref must currently equal `expected`).
-    /// - both `Some` → UPDATE (the ref must currently equal `expected`).
-    ///
-    /// The update is written through libgit2's `reference_matching` (the C `current_id` guard is the
-    /// real CAS) so it is durable + reflog-logged (`core.logallrefupdates` is set on creation).
     pub fn update_ref_cas(
         &self,
         name: &str,
@@ -941,9 +670,6 @@ impl DurableGitRepo {
             });
         }
 
-        // Ref generations live in git-config's signed integer domain. Prove there is capacity BEFORE
-        // mutating the ref; discovering exhaustion after the CAS would leave the tip advanced without
-        // its recovery fence. The receive path performs the same check before its outbox commit.
         if !matches!((expected, new), (None, None)) {
             let cfg = repo.config().map_err(|e| git_err("config (refgen preflight)", e))?;
             let current = read_ref_generation(&cfg, name)?;
@@ -952,9 +678,6 @@ impl DurableGitRepo {
             })?;
         }
 
-        // Set the committer identity only after the CAS and generation preconditions pass, so a
-        // rejected operation does not mutate repository configuration. Libgit2 reads these values
-        // for the reflog committer (GIT-1).
         {
             let mut cfg = repo.config().map_err(|e| git_err("config", e))?;
             cfg.set_str("user.name", committer_pseudonym)
@@ -964,13 +687,10 @@ impl DurableGitRepo {
         }
 
         match (expected, new) {
-            // CREATE — the ref must not exist; `reference` with force=false fails if it does.
             (None, Some(new_oid)) => {
                 repo.reference(name, Self::parse_oid(new_oid)?, false, reflog_msg)
                     .map_err(|e| git_err(&format!("create ref {name}"), e))?;
             }
-            // UPDATE — `reference_matching` only moves the ref if its current value == `current_id`
-            // (the real compare-and-swap), force=true to permit the value change.
             (Some(exp), Some(new_oid)) => {
                 repo.reference_matching(
                     name,
@@ -981,7 +701,6 @@ impl DurableGitRepo {
                 )
                 .map_err(|e| git_err(&format!("update ref {name}"), e))?;
             }
-            // DELETE — find the ref, re-check the tip under the open, then delete.
             (Some(exp), None) => {
                 let mut r = repo
                     .find_reference(name)
@@ -996,26 +715,15 @@ impl DurableGitRepo {
                 }
                 r.delete().map_err(|e| git_err(&format!("delete ref {name}"), e))?;
             }
-            // A no-op (delete a non-existent ref): nothing to do, already absent.
             (None, None) => {}
         }
 
-        // R0.4 / git #1 HIGH: bump the durable per-ref generation on every successful, non-noop CAS —
-        // create, update, AND delete alike (a delete is a generation-advancing event too). The bump is
-        // `previous + 1`, keyed by ref NAME in git-config, so it is monotonic ACROSS the ref's own
-        // deletion (the reflog dies with the ref; this counter does not) and across restart. This
-        // replaces reflog-LENGTH-as-generation, which reset on delete+recreate and broke the reconciler
-        // fence. See [`refgen_key`]. The `(None, None)` no-op above is deliberately excluded.
         if !matches!((expected, new), (None, None)) {
             self.bump_generation(&repo, name)?;
         }
         Ok(())
     }
 
-    /// Advance the durable per-ref generation to `current + 1` (R0.4). Reads the current value from the
-    /// repo's git-config (0 if never written), writes `+1` back at the repo-local config level (the same
-    /// config handle pattern `update_ref_cas` uses for `user.name`/`user.email`). Monotonic — a bump
-    /// never decreases the stored value.
     fn bump_generation(&self, repo: &git2::Repository, name: &str) -> Result<(), DurableError> {
         let key = refgen_key(name);
         let mut cfg = repo.config().map_err(|e| git_err("config (refgen)", e))?;
@@ -1029,10 +737,6 @@ impl DurableGitRepo {
         Ok(())
     }
 
-    /// Repair the one-step crash window where the ref CAS reached its committed new tip but the
-    /// following config-backed generation bump did not. The reconciler proves the witness is exactly
-    /// `expected_current + 1` and the tip already equals its new state before calling this method.
-    /// Rechecking the current generation here makes a concurrent or repeated repair fail safely.
     pub(crate) fn repair_ref_generation(
         &self,
         name: &str,
@@ -1054,23 +758,12 @@ impl DurableGitRepo {
             .ok_or_else(|| DurableError::Git(format!("ref generation exhausted for {name}")))
     }
 
-    /// **The durable, monotonic per-ref generation** (R0.4 / git #1 HIGH — the recovery fence the
-    /// reconciler compares `update_seq` against). Reads the `myelin.refgen.<encoded-ref>` config counter
-    /// (0 if the ref was never written). Unlike [`Self::reflog_len`], this does NOT reset when a ref is
-    /// deleted and recreated (it is keyed by name in config, not tied to the ref's reflog), and it
-    /// survives a process restart (config is on disk). This is the source of truth both the write path
-    /// ([`crate::receive_pack`]) and the reconciler ([`crate::reconcile`]) use for `update_seq`.
     pub fn ref_generation(&self, name: &str) -> Result<u64, DurableError> {
         let repo = self.open_git()?;
         let cfg = repo.config().map_err(|e| git_err("config (refgen)", e))?;
         read_ref_generation(&cfg, name)
     }
 
-    /// The number of entries in a ref's on-disk reflog (0 if the ref / reflog does not exist). This is
-    /// the reflog ENTRY COUNT — used only for the reflog listing view / entry-count assertions. It is
-    /// **NOT** the durable generation (R0.4 / git #1 HIGH): the reflog is destroyed when a ref is
-    /// deleted, so this count RESETS on a delete+recreate while the true generation must keep climbing.
-    /// Use [`Self::ref_generation`] for the monotonic per-ref generation / recovery fence.
     pub fn reflog_len(&self, name: &str) -> Result<usize, DurableError> {
         if !git2::Reference::is_valid_name(name) {
             return Err(DurableError::Git("invalid reflog ref name".into()));
@@ -1098,9 +791,6 @@ impl DurableGitRepo {
         }
     }
 
-    /// Read a ref's durable on-disk reflog, oldest-first (git stores newest-first; we reverse it for
-    /// the [`crate::receive_pack::RefStore`] audit view). The file-size header is checked before
-    /// libgit2 parses the reflog, and the durable generation is captured under the same ref lock.
     pub(crate) fn reflog_entries_bounded(
         &self,
         name: &str,
@@ -1110,8 +800,6 @@ impl DurableGitRepo {
         if !git2::Reference::is_valid_name(name) {
             return Err(DurableError::Git("invalid reflog ref name".into()));
         }
-        // The same cross-process lock gates Myelin's ref writers, so the reflog and its durable
-        // generation are one stable snapshot while libgit2 parses the bounded file.
         let _lock = self.lock_ref_exclusive(name)?;
         let repo = self.open_git()?;
         let path = repo.path().join("logs").join(name);
@@ -1146,7 +834,6 @@ impl DurableGitRepo {
             ));
         }
         let mut out = Vec::with_capacity(log.len());
-        // git reflog is stored newest-first; iterate in reverse for oldest-first (update order).
         for entry in log.iter().rev() {
             let old = entry.id_old();
             let old_oid = if old.is_zero() {
@@ -1182,13 +869,6 @@ impl DurableGitRepo {
         Ok((out, on_disk_bytes, generation))
     }
 
-    // ── working-tree reads + the single-file commit build (GT-003 web-edit) ──
-
-    /// Resolve a ref to its tip commit (`None` if the ref does not exist).
-    /// Resolve a revspec (a bare branch/tag name, an oid, or a fully-qualified `refs/…`) to its commit
-    /// — `None` if it does not resolve (an absent ref/oid is an empty browse, not an error). Uses
-    /// libgit2's `revparse_single` (the same resolution `git show <rev>` uses) so branches, tags, and
-    /// oids all work through the one browse path (R3.4).
     pub(crate) fn resolve_commit<'r>(
         &self,
         repo: &'r git2::Repository,
@@ -1197,10 +877,6 @@ impl DurableGitRepo {
         match repo.revparse_single(revspec) {
             Ok(obj) => match obj.peel_to_commit() {
                 Ok(c) => Ok(Some(c)),
-                // A revspec that resolves to a NON-commit object (e.g. a bare tree oid, `main^{tree}`)
-                // is a client input error, not a server fault: peel fails with InvalidSpec. Treat it
-                // like NotFound → an empty browse (404), never a 500 (R3.4 verifier finding 1; honours
-                // the module invariant "an absent ref/oid is an empty browse, not an error").
                 Err(e)
                     if matches!(
                         e.code(),
@@ -1231,8 +907,6 @@ impl DurableGitRepo {
         }
     }
 
-    /// Read a blob from one exact immutable commit object id. Unlike the browse-oriented
-    /// [`Self::read_blob_at_path_bounded`], this API never accepts a revspec.
     pub fn read_blob_at_commit_oid_bounded(
         &self,
         oid: &Oid,
@@ -1252,10 +926,6 @@ impl DurableGitRepo {
         Self::read_blob_from_commit(&repo, &commit, path, maximum_bytes)
     }
 
-    /// Resolve a nested blob while checking its ODB header before inflating/materializing content.
-    /// A directory returns [`BlobPathLookup::IsDir`], an absent or unsafe path returns
-    /// [`BlobPathLookup::Missing`], and binary detection happens server-side only after the header
-    /// admits the allocation.
     pub fn read_blob_at_path_bounded(
         &self,
         ref_name: &str,
@@ -1269,8 +939,6 @@ impl DurableGitRepo {
         Self::read_blob_from_commit(&repo, &commit, path, maximum_bytes)
     }
 
-    /// Resolve only the blob object id for a path. The tree entry is authoritative, so callers that
-    /// need a CAS base do not have to inflate or copy the blob contents first.
     pub fn blob_oid_at_path(
         &self,
         ref_name: &str,
@@ -1293,10 +961,10 @@ impl DurableGitRepo {
         let root = commit.tree().map_err(|e| git_err("commit tree", e))?;
         let clean = path.trim_matches('/');
         if clean.is_empty() {
-            return Ok(BlobPathLookup::IsDir); // the repo root is a tree, not a file.
+            return Ok(BlobPathLookup::IsDir);
         }
         if !is_safe_tree_path(clean) {
-            return Ok(BlobPathLookup::Missing); // a `..`/absolute path cannot name an in-tree blob.
+            return Ok(BlobPathLookup::Missing);
         }
         let entry = match root.get_path(std::path::Path::new(clean)) {
             Ok(e) => e,
@@ -1335,20 +1003,8 @@ impl DurableGitRepo {
         }
     }
 
-    /// **F9 (R4.1 dogfood) — heal a dangling HEAD symref so a fresh `git clone` checks out.** libgit2's
-    /// `init_bare` leaves HEAD symbolically pointing at `refs/heads/master`, but Myelin pushes land on
-    /// `main` (or whatever the FIRST branch pushed is) — so a freshly-created repo has a DANGLING HEAD
-    /// and `git clone` warns "remote HEAD refers to nonexistent ref, unable to checkout" (the refs +
-    /// objects ARE present; only the HEAD pointer is wrong). Call on the first push that lands a branch:
-    /// if HEAD does NOT already resolve to a live branch, repoint it (the WRITE side) at the default
-    /// branch — `main` if present, else the first branch by sorted name — mirroring the read-side
-    /// paginated ref summary. A HEAD that already resolves to a live branch is left
-    /// UNTOUCHED (an admin-chosen default is preserved). No-op when the repo has no branch yet (an
-    /// empty repo clones cleanly with a still-symbolic HEAD). Idempotent.
     pub fn heal_head_symref(&self) -> Result<(), DurableError> {
         let repo = self.open_git()?;
-        // `head()` errs (`UnbornBranch`) exactly when HEAD's symbolic target names a nonexistent
-        // branch — the dangling-HEAD condition. If it resolves, HEAD is already fine: leave it.
         if repo.head().is_ok() {
             return Ok(());
         }
@@ -1362,16 +1018,13 @@ impl DurableGitRepo {
         } else if let Some(first) = branches.first() {
             first.clone()
         } else {
-            return Ok(()); // no branch on disk yet — nothing to point HEAD at (empty repo is fine).
+            return Ok(());
         };
         repo.set_head(&format!("refs/heads/{target}"))
             .map_err(|e| git_err("set HEAD symref (F9)", e))?;
         Ok(())
     }
 
-    /// Resolve latest-commit metadata for one already-selected tree page against its immutable
-    /// commit snapshot. This never re-resolves a mutable branch between page selection and metadata
-    /// projection. Tree pages contain at most 100 rows and this snapshot walk is capped at 500 commits.
     pub fn latest_commits_for_entries_at_snapshot(
         &self,
         snapshot_oid: &Oid,
@@ -1412,8 +1065,6 @@ impl DurableGitRepo {
         self.latest_commits_for_entries_from_tip(&repo, tip, clean_path, entries, cap)
     }
 
-    /// Read compact metadata for one exact immutable commit object id. This never accepts or
-    /// resolves a ref/revspec; malformed, absent, and non-commit object ids return `None`.
     pub fn commit_meta_at_oid(&self, oid: &Oid) -> Result<Option<CommitMeta>, DurableError> {
         let git_oid = match git2::Oid::from_str(oid.as_str()) {
             Ok(oid) => oid,
@@ -1498,12 +1149,10 @@ impl DurableGitRepo {
                     let Some(rel) = p.strip_prefix(&prefix) else {
                         continue;
                     };
-                    // The immediate child of dir_path (a file directly here, or the dir it lives in).
                     let child = rel.split('/').next().unwrap_or_default();
                     if child.is_empty() || !requested.contains(child) {
                         continue;
                     }
-                    // First (newest) commit to touch this child wins; later (older) commits don't override.
                     out.entry(child.to_string()).or_insert_with(|| meta.clone());
                 }
             }
@@ -1514,11 +1163,6 @@ impl DurableGitRepo {
         Ok(out)
     }
 
-    // ── commit log + commit diff (the browse surface — GT-004; libgit2 revwalk + tree diff) ──
-
-    /// Walk the commit log from a ref tip (newest-first), returning a page of [`CommitMeta`] plus a
-    /// `has_more` flag (the cursor the edge advances). Reuses libgit2's `revwalk` over the REAL on-disk
-    /// commit graph — never a reimplemented walk. An absent ref yields an empty page (not an error).
     pub fn commit_log(
         &self,
         ref_name: &str,
@@ -1557,9 +1201,6 @@ impl DurableGitRepo {
         Ok((out, has_more))
     }
 
-    /// Resolve the immutable object coordinates for the first page of a pull-request commit walk.
-    /// An absent/malformed head keeps the historical empty-list behavior; an absent base ref is an
-    /// explicit `None` snapshot coordinate and therefore remains absent on continuation pages.
     pub fn pr_commit_snapshot(
         &self,
         base_ref: &str,
@@ -1581,16 +1222,6 @@ impl DurableGitRepo {
         }))
     }
 
-    /// Walk one immutable pull-request commit snapshot page. Explicit stack/`HashSet` preflights
-    /// first prove the pinned head and base graphs each stay within
-    /// [`PR_COMMIT_MAX_GRAPH_NODES_PER_PIN`] retained unique OIDs and
-    /// [`PR_COMMIT_MAX_GRAPH_EDGES_PER_PIN`] examined parent edges. Only then is libgit2's existing
-    /// `TIME` + hide ordering enabled; it may preprocess a union bounded by
-    /// [`PR_COMMIT_MAX_INTERNAL_WALK_NODES`] nodes and [`PR_COMMIT_MAX_INTERNAL_WALK_EDGES`] edges.
-    /// These are graph bookkeeping/work bounds, not a total RSS claim: libgit2 and commit-object
-    /// parsing have their own finite allocations. The page iterator yields at most
-    /// [`PR_COMMIT_MAX_PAGE_WALK_OBSERVATIONS`] rows, while skipped rows and the one-row `has_more`
-    /// probe are never expanded into [`CommitMeta`].
     pub fn commits_in_pr_snapshot(
         &self,
         base_oid: Option<&str>,
@@ -1693,9 +1324,6 @@ impl DurableGitRepo {
         Ok((out, has_more))
     }
 
-    /// **The commits IN a PR (R3.3 N2) — reachable from `head_oid` but NOT from `base_ref`'s tip.**
-    /// Compatibility wrapper used by the overview's bounded count. Interactive pagination calls
-    /// [`Self::commits_in_pr_snapshot`] directly with cursor-pinned object coordinates.
     pub fn commits_in_pr(
         &self,
         base_ref: &str,
@@ -1725,9 +1353,6 @@ impl DurableGitRepo {
             })
     }
 
-    /// The full detail of one commit (`None` if the oid is malformed or absent): its metadata, full
-    /// message, and the per-file unified diff against the FIRST parent (the root commit diffs against
-    /// the empty tree). Reuses libgit2's `diff_tree_to_tree` over the REAL on-disk trees.
     pub fn commit_detail(&self, oid_str: &str) -> Result<Option<CommitDetail>, DurableError> {
         self.commit_detail_bounded(oid_str, COMMIT_DIFF_LIMITS)
     }
@@ -1777,8 +1402,6 @@ impl DurableGitRepo {
             )));
         }
 
-        // Two cooperating callbacks share one accumulator via RefCell: file_cb opens a new file delta,
-        // line_cb appends lines to the current (last) one. libgit2 calls file_cb before its lines.
         let files: std::cell::RefCell<Vec<FileDelta>> = std::cell::RefCell::new(Vec::new());
         let rendered_bytes = std::cell::Cell::new(0usize);
         let limit_exceeded = std::cell::Cell::new(false);
@@ -1799,7 +1422,6 @@ impl DurableGitRepo {
                 git2::Delta::Copied => 'C',
                 _ => 'M',
             };
-            // A rename only carries old_path when it actually differs from path.
             let old_path = old_path.filter(|o| o != &path);
             files.borrow_mut().push(FileDelta {
                 path,
@@ -1847,16 +1469,6 @@ impl DurableGitRepo {
         }))
     }
 
-    /// **The PR three-dot diff (R3.2 · G-7 N1) — `merge-base(base_ref, head_oid) … head_oid`.** The
-    /// reviewer reviews the PR's OWN changes, never drift the base picked up. Reuses libgit2's
-    /// `merge_base` + `diff_tree_to_tree` over the REAL on-disk trees (no reimplementation). Hunk-
-    /// structured, with per-line old/new numbers, binary/submodule kinds, and a per-file line cap
-    /// (`truncated`). A malformed/absent head → `None` (the edge maps that to a dignified state, not a
-    /// 500). If `merge_base` can't resolve (a foreign/absent base), falls back to the base TIP as the
-    /// diff base and flags `three_dot == false` (the honest two-dot floor the UI labels).
-    ///
-    /// `per_file_line_cap` bounds each file's rendered line count (0 = uncapped); a file over the cap
-    /// keeps its first-cap lines + `truncated == true`.
     pub fn pr_diff(
         &self,
         base_ref: &str,
@@ -1892,15 +1504,11 @@ impl DurableGitRepo {
             Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
             Err(e) => return Err(git_err("find head commit", e)),
         };
-        // Resolve the base tip (try the ref as-is, then refs/heads/<ref> — R3.3's stored form varies).
         let base_tip = match self.tip_commit(&repo, base_ref)? {
             Some(t) => Some(t),
             None if base_ref.starts_with("refs/") => None,
             None => self.tip_commit(&repo, &format!("refs/heads/{base_ref}"))?,
         };
-        // Three-dot: the merge-base of base and head. On any failure (no base, foreign histories),
-        // fall back to the base tip (two-dot) and flag it — honest, never a silent wrong base.
-        // `None` base_oid = no base ref at all → diff head against the empty tree (a brand-new branch).
         let (base_oid, three_dot): (Option<git2::Oid>, bool) = match base_tip {
             Some(bt) => match repo.merge_base(bt, head) {
                 Ok(mb) => (Some(mb), true),
@@ -1930,10 +1538,6 @@ impl DurableGitRepo {
         }
 
         let files: std::cell::RefCell<Vec<PrFileDelta>> = std::cell::RefCell::new(Vec::new());
-        // Rendered-line count for the CURRENT file — bounds memory: once a file reaches its cap we
-        // stop ACCUMULATING lines (still counting the true diffstat), so a huge single-hunk file never
-        // materializes wholesale in the response Vec (R3.2 verifier HOLD — the cap is a load bound, not
-        // just a post-hoc trim). Reset when a new file delta begins.
         let rendered = std::cell::RefCell::new(0usize);
         let rendered_bytes = std::cell::Cell::new(0usize);
         let limit_exceeded = std::cell::Cell::new(false);
@@ -1956,8 +1560,6 @@ impl DurableGitRepo {
                 git2::Delta::Copied => 'C',
                 _ => 'M',
             };
-            // Kind: a submodule is a gitlink (filemode Commit); a binary is libgit2's binary flag; LFS
-            // is a text pointer file we sniff below once its content is seen. size = the new blob size.
             let kind = if matches!(delta.new_file().mode(), git2::FileMode::Commit)
                 || matches!(delta.old_file().mode(), git2::FileMode::Commit)
             {
@@ -2018,18 +1620,15 @@ impl DurableGitRepo {
                            line: git2::DiffLine<'_>| {
             let origin = line.origin();
             if !matches!(origin, '+' | '-' | ' ') {
-                return true; // skip file/hunk header context lines libgit2 emits with other origins.
+                return true;
             }
             let mut fs = files.borrow_mut();
             if let Some(f) = fs.last_mut() {
-                // The diffstat (additions/deletions) always reflects the TRUE totals, even past the cap.
                 match origin {
                     '+' => f.additions += 1,
                     '-' => f.deletions += 1,
                     _ => {}
                 }
-                // Bound accumulation at the per-file cap: past it, count but don't store the line, and
-                // flag the file truncated. `cap == 0` means unbounded (caller opted out).
                 let mut r = rendered.borrow_mut();
                 if per_file_line_cap > 0 && *r >= per_file_line_cap {
                     f.truncated = true;
@@ -2045,7 +1644,6 @@ impl DurableGitRepo {
                         return false;
                     }
                     rendered_bytes.set(next_bytes.unwrap_or(maximum_rendered_bytes));
-                    // LFS sniff: a pointer file's first added line is `version https://git-lfs…`.
                     if f.kind == FileKind::Text
                         && origin == '+'
                         && content.starts_with("version https://git-lfs")
@@ -2079,15 +1677,10 @@ impl DurableGitRepo {
         traversal.map_err(|e| git_err("pr diff foreach", e))?;
 
         let mut files = files.into_inner();
-        // Binary/LFS/submodule files carry NO text hunks (never a garbled dump).
         for f in &mut files {
             if f.kind != FileKind::Text {
                 f.hunks.clear();
             }
-            // `line_cb` already bounded accumulation at `per_file_line_cap` (within a hunk, so a huge
-            // single-hunk file is capped — R3.2 verifier HOLD). A truncated file may carry trailing
-            // hunks that received no lines (the cap hit before them); drop those empty hunks so the
-            // wire never ships a bare hunk header.
             if f.truncated {
                 f.hunks.retain(|h| !h.lines.is_empty());
             }
@@ -2106,13 +1699,6 @@ impl DurableGitRepo {
         }))
     }
 
-    /// **Expand-context (R3.2 · G-7 N2) — the raw lines of a blob at `oid`, `start..=end` (1-based).**
-    /// Serves Expand ↑/↓/all and "Show deleted contents" (via the old-side blob oid). Returns context
-    /// lines (origin `' '`) carrying their blob line number in `new_no` (the client maps the old-side
-    /// column from the surrounding hunk offset). A malformed/absent oid or a non-blob returns
-    /// [`FileLinesLookup::Missing`]. The object-check is the caller's (the edge Pull-guards it exactly
-    /// like the blob route). The range and ODB byte ceilings are enforced here as defense in depth,
-    /// before blob materialization.
     pub fn file_lines(
         &self,
         oid: &str,
@@ -2165,7 +1751,7 @@ impl DurableGitRepo {
             Err(e) => return Err(git_err("find blob", e)),
         };
         if blob.is_binary() {
-            return Ok(FileLinesLookup::Binary); // never expand a binary into a garbled dump.
+            return Ok(FileLinesLookup::Binary);
         }
         let text = String::from_utf8_lossy(blob.content());
         let out = text
@@ -2184,11 +1770,6 @@ impl DurableGitRepo {
         Ok(FileLinesLookup::Found(out))
     }
 
-    /// **Build a single-file web-edit commit (GT-003).** Write `contents` as a blob, rebuild the ref's
-    /// top-level tree with `path` set to that blob (seeded from the current tree so OTHER entries are
-    /// preserved; empty for a first commit), and write a commit whose parent is the ref's current tip.
-    /// Returns `(new_commit_oid, new_blob_oid, parent_commit_oid)`. Does NOT move the ref — the durable
-    /// per-ref CAS ([`crate::receive_pack::RefStore`]) is the explicit next step (one write path, GF-6).
     pub fn build_file_commit(
         &self,
         ref_name: &str,
@@ -2203,7 +1784,6 @@ impl DurableGitRepo {
 
         let blob_oid = repo.blob(contents).map_err(|e| git_err("write blob", e))?;
 
-        // Seed the tree builder from the parent's tree so other files survive the single-file edit.
         let base_tree = match parent_oid {
             Some(p) => {
                 let c = repo.find_commit(p).map_err(|e| git_err("find parent", e))?;
@@ -2238,10 +1818,6 @@ impl DurableGitRepo {
         ))
     }
 
-    // ── merge-target validation (GT-003 — never advance a protected ref to an arbitrary oid) ──
-
-    /// Whether `oid` exists in the odb AND is a commit (a ref must point at a real commit). Used to
-    /// reject a merge that names a non-existent / non-commit `head_oid`.
     pub fn object_is_commit(&self, oid: &Oid) -> bool {
         let Ok(repo) = self.open_git() else { return false };
         let Ok(goid) = git2::Oid::from_str(oid.as_str()) else {
@@ -2251,10 +1827,6 @@ impl DurableGitRepo {
         is_commit
     }
 
-    /// Is advancing a ref from `base_tip` to `head` a fast-forward (the only durable merge advance v1
-    /// admits — never advance a protected ref to an unrelated/arbitrary oid)? `head` must be a real
-    /// commit; `base_tip = None` (creating the ref) is allowed; otherwise `head` must equal OR be a
-    /// descendant of `base_tip` (the connectivity/ancestry check the empty-quarantine path lacked).
     pub fn is_fast_forward(
         &self,
         base_tip: Option<&Oid>,
@@ -2263,10 +1835,10 @@ impl DurableGitRepo {
         let repo = self.open_git()?;
         let head_g = Self::parse_oid(head)?;
         if repo.find_commit(head_g).is_err() {
-            return Ok(false); // head is not a real commit on disk
+            return Ok(false);
         }
         match base_tip {
-            None => Ok(true), // creating the ref — any real commit is a valid initial tip
+            None => Ok(true),
             Some(base) => {
                 let base_g = Self::parse_oid(base)?;
                 if base_g == head_g {
@@ -2278,27 +1850,18 @@ impl DurableGitRepo {
         }
     }
 
-    // ── integrity (the external-oracle discipline, in-process slice) ──
-
-    /// **In-process integrity check** — the `git fsck`-equivalent slice runnable in `src` (no host
-    /// exec). Verifies (a) the odb opens and every loose/packed object parses (re-hash-on-read is
-    /// libgit2's own — a corrupt object fails to read), and (b) every ref resolves to an object that
-    /// EXISTS in the odb (no dangling ref). The TESTS additionally run the real `git fsck` binary
-    /// (the full external oracle) — see `tests/`.
     pub fn fsck(&self) -> Result<(), DurableError> {
         let repo = self.open_git()?;
         let odb = repo.odb().map_err(|e| git_err("odb", e))?;
-        // (a) every object in the odb parses (libgit2 verifies the object on read).
         let mut count = 0usize;
         odb.foreach(|oid| {
             if odb.read(*oid).is_err() {
-                return false; // abort the walk → reported as a corrupt object below.
+                return false;
             }
             count += 1;
             true
         })
         .map_err(|e| git_err("odb foreach (corrupt object?)", e))?;
-        // (b) every ref points at an object present in the odb (no dangling ref).
         for (name, tip) in self.list_refs_bounded(WIRE_MAX_REFS)? {
             let goid = Self::parse_oid(&tip)?;
             if !odb.exists(goid) {
@@ -2311,15 +1874,6 @@ impl DurableGitRepo {
         Ok(())
     }
 
-    // ── push intake: migrate a sandbox-validated quarantine object into the durable odb (CT-006d) ──
-
-    /// **Write a raw `(type, payload)` git object into this repo's on-disk odb (CT-006d push migration).**
-    /// `kind` is `commit`/`tree`/`blob`/`tag`; `payload` is the object body WITHOUT the `"<type> <len>\0"`
-    /// header (exactly what `git cat-file --batch` emits and what `read_object` returns). git2 RE-HASHES
-    /// the content and returns the computed oid — a forged/mismatched oid is structurally impossible, and
-    /// a content-addressed re-write of an object that already exists is an idempotent no-op. This is the
-    /// TRUSTED in-process migration: the sandboxed `index-pack` already validated the untrusted pack; the
-    /// host only promotes the resulting fully-resolved objects, AFTER the in-process policy admits them.
     pub fn write_raw_object(&self, kind: &str, payload: &[u8]) -> Result<Oid, DurableError> {
         let obj_type = match kind {
             "commit" => git2::ObjectType::Commit,
@@ -2340,18 +1894,6 @@ impl DurableGitRepo {
         Ok(Oid::new(oid.to_string()))
     }
 
-    /// Whether `tip` is a real commit whose OWN root tree is present + readable in the odb — the
-    /// **tip-only** slice (trees + blobs reachable from THIS commit's tree exist). It walks exactly one
-    /// commit's tree and says NOTHING about the commit's ancestry.
-    ///
-    /// **R0.7-D / DELTA N4 — why this is NOT the full connectivity check.** A push whose tip tree is
-    /// complete can still reference a MISSING ANCESTOR commit (`index-pack --fix-thin` resolves delta
-    /// bases, never missing parent COMMITS). Accepting on the tip-tree alone lets one crafted push wedge
-    /// a branch's clonability: the accept gate says "ok", but a later `clone`/`fetch` fails client-side
-    /// walking into the absent parent — a durable-integrity DoS. The push-accept gate MUST instead use
-    /// [`Self::history_connectivity_complete`], which verifies EVERY new commit's tree AND that every
-    /// parent oid is present. This method is retained only as the single-commit tree slice (reused by
-    /// the full walk via the shared [`Self::tree_objects_present`] helper).
     pub fn commit_tree_complete(&self, tip: &Oid) -> Result<bool, DurableError> {
         let repo = self.open_git()?;
         let goid = Self::parse_oid(tip)?;
@@ -2367,11 +1909,6 @@ impl DurableGitRepo {
         Self::tree_objects_present(&odb, &tree)
     }
 
-    /// The shared tree-walk: whether EVERY tree/blob reachable from `tree` is present in `odb`. Factored
-    /// out of [`Self::commit_tree_complete`] so the full connectivity walk
-    /// ([`Self::history_connectivity_complete`]) checks each commit's tree with the SAME logic (no
-    /// duplicated object walking — the anti-duplication discipline). A missing tree/blob → `Ok(false)`
-    /// (a walk that aborts early); only a libgit2 walk failure surfaces as `Err`.
     fn tree_objects_present(odb: &git2::Odb, tree: &git2::Tree) -> Result<bool, DurableError> {
         let mut complete = true;
         tree.walk(git2::TreeWalkMode::PreOrder, |_root, entry| {
@@ -2389,40 +1926,6 @@ impl DurableGitRepo {
         Ok(complete)
     }
 
-    /// **R0.7-D / DELTA N4 (MEDIUM) — full push-connectivity check: is EVERY object reachable from
-    /// `new_tip` and NOT already reachable from `existing_tips` present + connected in the odb?**
-    ///
-    /// The push-accept gate MUST call this INSTEAD of the tip-only [`Self::commit_tree_complete`]. The
-    /// tip-only check verifies just the tip commit's own tree, so a crafted push whose tip references a
-    /// MISSING ANCESTOR commit is accepted (the tip's tree is complete) yet leaves the branch
-    /// un-clonable — a later `clone`/`fetch` fails walking into the absent parent. That is a durable-
-    /// integrity DoS one push can inflict; this walk closes it by proving the WHOLE newly-introduced
-    /// history is self-contained before the ref moves.
-    ///
-    /// **The walk (thin-push cheap).** A libgit2 revwalk pushes `new_tip` and HIDES each `existing_tips`
-    /// entry, so only the commits this push actually INTRODUCES are visited — a thin push pays for its
-    /// delta, not the whole history each time. `existing_tips` empty (a repo/branch CREATE) is correct:
-    /// the walk then covers the full new history, which a fresh branch must be entirely self-contained
-    /// to satisfy. Hiding a non-existent / unparseable existing tip is done gracefully (skipped): it
-    /// contributes nothing to reachability, so failing to hide it only WIDENS the walk — the fail-closed
-    /// direction (we verify more, never less).
-    ///
-    /// For EACH new commit the walk yields we assert three things, reusing existing helpers:
-    /// - the commit object exists (`find_commit`),
-    /// - its root tree is complete ([`Self::tree_objects_present`] — the shared tree walk), and
-    /// - EVERY parent oid is present in the odb (`odb.exists`) — a missing ancestor commit.
-    ///
-    /// **Fail-closed mapping (deliberate).** A genuinely-missing ancestor manifests two ways, and BOTH
-    /// map to `Ok(false)` (REJECT the push), never `Err`:
-    /// 1. `odb.exists(parent)` is `false` for a walked commit's parent — the deterministic catch;
-    /// 2. the revwalk step itself ERRORS because libgit2 tried to load a missing parent to continue the
-    ///    traversal — mapped to `Ok(false)`.
-    ///
-    /// Returning `Err` for a missing object would be dangerous: a caller might treat an `Err` as a
-    /// transient/infra failure and retry-then-accept, re-opening the hole. So a missing object is a
-    /// hard, first-class REJECT (`Ok(false)`), distinct from the genuine infrastructure errors that DO
-    /// surface as `Err` (`open_git` / `odb` acquisition / a `new_tip` that is not a parseable oid). On
-    /// any doubt within the walk we fail CLOSED — reject, never accept.
     pub fn history_connectivity_complete(
         &self,
         new_tip: &Oid,
@@ -2431,8 +1934,6 @@ impl DurableGitRepo {
         let repo = self.open_git()?;
         let odb = repo.odb().map_err(|e| git_err("odb", e))?;
         let tip_g = Self::parse_oid(new_tip)?;
-        // The new tip itself must be a present commit — a ref never advances to a missing/non-commit
-        // tip (mirrors the tip-only check's first guard).
         if repo.find_commit(tip_g).is_err() {
             return Ok(false);
         }
@@ -2440,22 +1941,15 @@ impl DurableGitRepo {
         let mut walk = repo.revwalk().map_err(|e| git_err("revwalk", e))?;
         walk.push(tip_g)
             .map_err(|e| git_err("revwalk push new_tip", e))?;
-        // Hide each already-reachable existing tip → only the NEW commits are walked (thin-push cheap).
-        // A tip we cannot parse or that is absent from the odb is skipped gracefully (see doc): failing
-        // to hide only widens the walk, which is the fail-closed direction.
         for t in existing_tips {
             if let Ok(g) = Self::parse_oid(t) {
                 if odb.exists(g) {
-                    // A hide of a genuinely-present commit; ignore a benign libgit2 hide error (still
-                    // fail-closed — an un-hidden tip only means we verify more objects).
                     let _ = walk.hide(g);
                 }
             }
         }
 
         for step in walk {
-            // A revwalk step that ERRORS is libgit2 failing to load a commit it must traverse (a
-            // missing ancestor) → REJECT (fail closed), never a swallowed-into-accept `Err`.
             let commit_oid = match step {
                 Ok(o) => o,
                 Err(_) => return Ok(false),
@@ -2464,7 +1958,6 @@ impl DurableGitRepo {
                 Ok(c) => c,
                 Err(_) => return Ok(false),
             };
-            // (a) this commit's own tree must be complete (the shared tree-walk helper).
             let tree = match commit.tree() {
                 Ok(t) => t,
                 Err(_) => return Ok(false),
@@ -2472,9 +1965,6 @@ impl DurableGitRepo {
             if !Self::tree_objects_present(&odb, &tree)? {
                 return Ok(false);
             }
-            // (b) every PARENT commit oid must be present in the odb — the missing-ancestor catch the
-            // tip-only check lacked. A boundary commit whose parent is the absent ancestor is itself
-            // NEW (reachable, not hidden), so this deterministically rejects the wedge push.
             for parent_oid in commit.parent_ids() {
                 if !odb.exists(parent_oid) {
                     return Ok(false);
@@ -2485,21 +1975,11 @@ impl DurableGitRepo {
     }
 }
 
-// ───────────────────────────── the rooted durable store (repo lifecycle) ─────────────────────────
-
-/// **The durable on-disk git store** — repo lifecycle (`init_bare` / open / exists) over a
-/// [`RepoPathResolver`], the WRITE-side companion to the read backend [`GixCore`]. Generic over the
-/// resolver so a test injects a temp root and the serving tier injects the real placement resolver
-/// (the same seam [`GixCore`] uses — GIT-P13). The default resolver is [`RootedResolver`]
-/// (`<root>/<tenant>/<region>/<repo>.git`).
 pub struct DurableGitStore<P: RepoPathResolver = RootedResolver> {
     resolver: P,
 }
 
 impl DurableGitStore<RootedResolver> {
-    /// Root a durable store at a directory holding `<tenant>/<region>/<repo>.git` bare repos — the
-    /// v1 local-NVMe layout (the SAME root [`GixCore`]'s [`RootedResolver`] reads from, so the write
-    /// path and the read path open the same repos).
     pub fn rooted(root: impl Into<PathBuf>) -> Self {
         Self {
             resolver: RootedResolver::new(root),
@@ -2508,25 +1988,16 @@ impl DurableGitStore<RootedResolver> {
 }
 
 impl<P: RepoPathResolver> DurableGitStore<P> {
-    /// Build the durable store over a repo-path resolver (the serving-tier placement resolver swaps
-    /// in here behind the same port [`GixCore`] uses).
     pub fn new(resolver: P) -> Self {
         Self { resolver }
     }
 
-    /// The on-disk path a repo resolves to (`<root>/<tenant>/<region>/<repo>.git`). The tenant/region
-    /// pathing IS the isolation boundary — a repo under tenant A's locator never resolves under
-    /// tenant B's.
     pub fn repo_path(&self, repo: &RepoLoc) -> Result<PathBuf, DurableError> {
         self.resolver
             .repo_path(repo)
             .map_err(|e| DurableError::Git(e.to_string()))
     }
 
-    /// **Create a repo on disk** = `git2::Repository::init_bare` at the resolver path (creating the
-    /// `<tenant>/<region>/` parent dirs first). Idempotent: if the bare repo already exists it is
-    /// opened, not clobbered. Sets `core.logallrefupdates=true` so ref CASes are reflog-logged
-    /// durably (bare repos default it off).
     pub fn create_repo(&self, repo: &RepoLoc) -> Result<DurableGitRepo, DurableError> {
         let path = self.repo_path(repo)?;
         if let Some(parent) = path.parent() {
@@ -2535,7 +2006,6 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
         }
         let git_repo = git2::Repository::init_bare(&path)
             .map_err(|e| git_err(&format!("init_bare {}", path.display()), e))?;
-        // Durable reflog for ALL refs (a bare repo defaults logallrefupdates off; arch §3 reflog).
         git_repo
             .config()
             .and_then(|mut c| c.set_bool("core.logallrefupdates", true))
@@ -2543,21 +2013,13 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
         Ok(DurableGitRepo { path })
     }
 
-    /// **Open an existing repo on disk.** `NotFound` if the bare repo is not present (the lifecycle
-    /// reject the front door surfaces — never auto-create on a read path).
     pub fn open_repo(&self, repo: &RepoLoc) -> Result<DurableGitRepo, DurableError> {
         let path = self.repo_path(repo)?;
-        // Probe with a real open so a missing/!valid repo is a clean NotFound, not a later op error.
-        // Peer-review finding 2026-07-16 #5: the NotFound message names the repo by its LOGICAL slug
-        // (which the caller already supplied), NEVER the on-disk `path.display()` — a granted-but-
-        // missing repo must not leak the server's filesystem layout (the authz guard runs upstream, so
-        // this is not an existence oracle, but the host path is still not the client's to see).
         git2::Repository::open(&path)
             .map_err(|_| DurableError::NotFound(format!("bare repo {}", repo.repo)))?;
         Ok(DurableGitRepo { path })
     }
 
-    /// Whether a repo exists on disk (a valid bare git repo at the resolver path).
     pub fn repo_exists(&self, repo: &RepoLoc) -> bool {
         let Ok(path) = self.repo_path(repo) else {
             return false;
@@ -2570,7 +2032,6 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
 mod tests {
     use super::*;
 
-    /// A unique temp root under the scratch dir for an isolated on-disk store per test.
     fn temp_root(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
@@ -2585,7 +2046,6 @@ mod tests {
         RepoLoc::new("acme", "fr-par", "core")
     }
 
-    /// Build a real, `fsck`-clean commit (blob → tree → commit) authored to a tenant pseudonym.
     fn seed_commit(repo: &DurableGitRepo, content: &[u8]) -> Oid {
         let blob = repo.write_blob(content).expect("blob");
         let tree = repo.write_tree(&[("file.txt", &blob)]).expect("tree");
@@ -2657,7 +2117,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **Repo lifecycle on disk: create = init_bare; the bare repo is a real on-disk git dir.**
     #[test]
     fn create_repo_inits_a_real_on_disk_bare_repo() {
         let root = temp_root("lifecycle");
@@ -2665,36 +2124,26 @@ mod tests {
         assert!(!store.repo_exists(&loc()), "absent before create");
 
         let repo = store.create_repo(&loc()).expect("create");
-        // The path is exactly <root>/<tenant>/<region>/<repo>.git
         assert_eq!(repo.path(), root.join("acme").join("fr-par").join("core.git"));
         assert!(repo.path().is_dir(), "the bare repo is a real on-disk directory");
         assert!(store.repo_exists(&loc()), "present after create");
-        // Idempotent: a second create opens, does not clobber.
         assert!(store.create_repo(&loc()).is_ok());
 
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **F9 (R4.1 dogfood) — the first push heals a dangling HEAD so a fresh `git clone` checks out.**
-    /// `init_bare` leaves HEAD symbolically at `refs/heads/master`, but pushes land on `main` — so HEAD
-    /// dangles until healed and a clone warns "remote HEAD refers to nonexistent ref, unable to
-    /// checkout". After landing the first branch on `main` + [`DurableGitRepo::heal_head_symref`], HEAD
-    /// resolves to `refs/heads/main`.
     #[test]
     fn f9_heal_head_symref_points_head_at_the_pushed_default_branch() {
         let root = temp_root("f9-head");
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
 
-        // A fresh bare repo: HEAD is unborn/dangling (points at the nonexistent `master`).
         let g = git2::Repository::open(repo.path()).unwrap();
         assert!(g.head().is_err(), "fresh init_bare HEAD dangles (a clone would warn)");
 
-        // Land the first branch on `main` (exactly what a real first push does).
         let c = seed_commit(&repo, b"first push\n");
         repo.update_ref_cas("refs/heads/main", None, Some(&c), "create", "psn@acme.noreply")
             .expect("create main");
-        // Still dangling until we heal — the read-side workaround exists, but a clone reads on-disk HEAD.
         assert!(
             git2::Repository::open(repo.path()).unwrap().head().is_err(),
             "HEAD still dangles after the push until it is healed"
@@ -2702,7 +2151,6 @@ mod tests {
 
         repo.heal_head_symref().expect("heal HEAD");
 
-        // HEAD now resolves to refs/heads/main → a fresh clone checks out `main` with no warning.
         let g2 = git2::Repository::open(repo.path()).unwrap();
         let head = g2.head().expect("HEAD resolves after heal");
         assert_eq!(
@@ -2711,7 +2159,6 @@ mod tests {
             "F9: HEAD points at the pushed default branch"
         );
 
-        // Idempotent + non-clobbering: a repo whose HEAD already resolves is left untouched.
         repo.heal_head_symref().expect("heal is idempotent");
         assert_eq!(
             git2::Repository::open(repo.path()).unwrap().head().unwrap().name().unwrap(),
@@ -2721,8 +2168,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **F9 — a first push to a NON-`main` branch heals HEAD to that branch (git's own behavior).** If
-    /// the first branch a repo receives is e.g. `develop`, HEAD should follow it (not stay dangling).
     #[test]
     fn f9_heal_head_symref_follows_the_first_branch_when_no_main() {
         let root = temp_root("f9-head-develop");
@@ -2740,10 +2185,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **THE CORE PROOF — durability across restart.** Write a ref + a real commit object via one
-    /// store, then open a FRESH store + handle over the SAME on-disk root (a simulated process
-    /// restart) and read both back — present + correct. A test that hit an in-memory store would NOT
-    /// survive the fresh handle.
     #[test]
     fn ref_and_object_survive_a_fresh_handle_over_the_same_root() {
         let root = temp_root("restart");
@@ -2760,21 +2201,19 @@ mod tests {
                 "psn-7@acme.noreply",
             )
             .expect("create ref");
-        } // drop everything — nothing in-memory carries over.
+        }
 
-        // A completely FRESH store + handle over the same root (the "restart").
         let store2 = DurableGitStore::rooted(&root);
         let repo2 = store2.open_repo(&loc()).expect("open after restart");
         assert_eq!(
             repo2.read_ref("refs/heads/main").expect("read ref"),
             Some(commit.clone()),
-            "the ref survived the restart (SI-012 fixed — open loads from disk)"
+            "the ref survived the restart (SI-012 fixed - open loads from disk)"
         );
         assert!(
             repo2.has_object(&commit),
-            "the commit object survived the restart (F-git-2 — on-disk odb)"
+            "the commit object survived the restart (F-git-2 - on-disk odb)"
         );
-        // The object bytes round-trip (it is a real git commit).
         let bytes = repo2
             .read_object_bounded(&commit, 64 * 1024 * 1024)
             .expect("read object");
@@ -2792,7 +2231,6 @@ mod tests {
             repo2.read_object_bounded(&commit, bytes.len() - 1),
             Err(DurableError::Git(message)) if message.starts_with("object read limit exceeded:")
         ));
-        // list_refs loads the entry point from disk (not an empty map).
         assert!(matches!(
             repo2.list_refs_bounded(0),
             Err(DurableError::Git(message))
@@ -2806,8 +2244,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A fork PR's locked head can live in a physically distinct bare repository. Importing it
-    /// installs the full commit/tree/blob ancestry in the target ODB without copying any source ref.
     #[test]
     fn fork_import_moves_verified_commit_closure_without_source_refs() {
         let root = temp_root("fork-import");
@@ -2863,8 +2299,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **GT-004 browse: the commit log + commit diff read the REAL on-disk graph** (libgit2 revwalk +
-    /// tree diff), newest-first, paginated, with the root commit diffing against the empty tree.
     #[test]
     fn commit_log_and_diff_read_the_real_graph() {
         let root = temp_root("log");
@@ -2887,7 +2321,6 @@ mod tests {
         repo.update_ref_cas("refs/heads/main", Some(&c1), Some(&c2), "ff", "psn@acme.noreply")
             .unwrap();
 
-        // Newest-first, both commits, no more within a generous page.
         let (rows, more) = repo.commit_log("refs/heads/main", 0, 10).expect("log");
         assert!(!more);
         assert_eq!(rows.len(), 2);
@@ -2896,7 +2329,6 @@ mod tests {
         assert_eq!(rows[0].parents, vec![c1.0.clone()]);
         assert_eq!(rows[1].oid, c1.0);
 
-        // Pagination: page-of-1 reports has_more; offset 1 returns the older commit.
         let (p0, more0) = repo.commit_log("refs/heads/main", 0, 1).unwrap();
         assert!(more0 && p0.len() == 1 && p0[0].oid == c2.0);
         let (p1, more1) = repo.commit_log("refs/heads/main", 1, 1).unwrap();
@@ -2910,7 +2342,6 @@ mod tests {
             Err(DurableError::Git(message)) if message == "commit log pagination limit exceeded"
         ));
 
-        // Diff of c2 vs its parent: file.txt MODIFIED with an added "line two".
         let detail = repo.commit_detail(&c2.0).expect("detail").expect("present");
         assert_eq!(detail.meta.oid, c2.0);
         assert_eq!(detail.files.len(), 1);
@@ -2934,11 +2365,9 @@ mod tests {
             ));
         }
 
-        // The ROOT commit diffs against the empty tree → file.txt ADDED.
         let root_detail = repo.commit_detail(&c1.0).unwrap().unwrap();
         assert_eq!(root_detail.files[0].status, 'A');
 
-        // A malformed/absent oid → None (a clean 404 upstream; never a panic).
         assert!(repo.commit_detail("not-a-real-oid").unwrap().is_none());
 
         std::fs::remove_dir_all(&root).ok();
@@ -3046,7 +2475,6 @@ mod tests {
             "a fixed snapshot walk is deterministic"
         );
 
-        // Moving the mutable base ref after page one does not alter the cursor-pinned snapshot.
         repo.update_ref_cas(
             "refs/heads/main",
             Some(&base),
@@ -3240,16 +2668,12 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **R3.2 · G-7 N1 — the PR diff is THREE-DOT: `merge-base(base, head) … head`.** It shows the
-    /// PR's OWN changes and excludes drift the base picked up after the branch point. Line numbers
-    /// (old_no/new_no), hunk boundaries, and status are all correct.
     #[test]
     fn pr_diff_is_three_dot_and_carries_line_numbers() {
         let root = temp_root("prdiff");
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
 
-        // base @ main: file.txt = a,b,c
         let b0 = repo.write_blob(b"a\nb\nc\n").unwrap();
         let t0 = repo.write_tree(&[("file.txt", &b0)]).unwrap();
         let base = repo
@@ -3258,14 +2682,12 @@ mod tests {
         repo.update_ref_cas("refs/heads/main", None, Some(&base), "create", "psn@acme.noreply")
             .unwrap();
 
-        // head branch off base: modify line 2 + add line 4
         let bh = repo.write_blob(b"a\nB\nc\nd\n").unwrap();
         let th = repo.write_tree(&[("file.txt", &bh)]).unwrap();
         let head = repo
             .write_commit(&th, &[&base], "head", "psn@acme.noreply", "psn@acme.noreply")
             .unwrap();
 
-        // DRIFT: main advances past the branch point with an unrelated file the PR never touched.
         let bd = repo.write_blob(b"unrelated\n").unwrap();
         let td = repo.write_tree(&[("file.txt", &b0), ("other.txt", &bd)]).unwrap();
         let drift = repo
@@ -3277,7 +2699,6 @@ mod tests {
         let diff = repo.pr_diff("refs/heads/main", &head.0, 4000).unwrap().unwrap();
         assert!(diff.three_dot, "durable repos are libgit2-backed → real merge-base");
         assert_eq!(diff.base_oid, base.0, "base = merge-base(main, head), NOT main's tip");
-        // ONLY file.txt — other.txt is main's drift, NOT the PR's change (three-dot excludes it).
         assert_eq!(diff.total_files, 1, "three-dot shows only the PR's own files");
         assert_eq!(diff.files[0].path, "file.txt");
         assert_eq!(diff.files[0].status, 'M');
@@ -3298,7 +2719,6 @@ mod tests {
         );
         assert_eq!(diff.files[0].additions, 2, "line 2 changed (+B) + line 4 added (+d)");
         assert_eq!(diff.files[0].deletions, 1, "line 2's old (-b)");
-        // Line numbers: the added "d" carries new_no == 4 and old_no == None.
         let hunk = &diff.files[0].hunks[0];
         let added_d = hunk.lines.iter().find(|l| l.origin == '+' && l.content == "d").unwrap();
         assert_eq!(added_d.new_no, Some(4));
@@ -3306,7 +2726,6 @@ mod tests {
         let removed_b = hunk.lines.iter().find(|l| l.origin == '-' && l.content == "b").unwrap();
         assert_eq!(removed_b.old_no, Some(2));
         assert_eq!(removed_b.new_no, None);
-        // Context line "a" carries BOTH numbers.
         let ctx_a = hunk.lines.iter().find(|l| l.origin == ' ' && l.content == "a").unwrap();
         assert_eq!(ctx_a.old_no, Some(1));
         assert_eq!(ctx_a.new_no, Some(1));
@@ -3339,21 +2758,16 @@ mod tests {
             ));
         }
 
-        // A malformed/absent head → None (the edge renders the empty state, not a 500).
         assert!(repo.pr_diff("refs/heads/main", "not-an-oid", 4000).unwrap().is_none());
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **R3.2 verifier HOLD: a huge SINGLE-HUNK file (a new file = one `@@ -0,0 +1,N @@` hunk) is
-    /// capped, not dumped wholesale.** The cap must bind WITHIN a hunk (the pre-fix code only dropped
-    /// whole trailing hunks, so a one-hunk file sailed past the cap). The diffstat stays truthful.
     #[test]
     fn pr_diff_caps_a_single_huge_hunk_not_only_at_hunk_boundaries() {
         let root = temp_root("prcap");
         let store = DurableGitStore::rooted(&root);
         let repo = store.create_repo(&loc()).expect("create");
 
-        // base: empty tree (no files).
         let t0 = repo.write_tree(&[]).unwrap();
         let base = repo
             .write_commit(&t0, &[], "base", "psn@acme.noreply", "psn@acme.noreply")
@@ -3361,7 +2775,6 @@ mod tests {
         repo.update_ref_cas("refs/heads/main", None, Some(&base), "create", "psn@acme.noreply")
             .unwrap();
 
-        // head: add ONE new 5000-line file — a single `@@ -0,0 +1,5000 @@` hunk.
         let big: String = (0..5000).map(|i| format!("line {i}\n")).collect();
         let bh = repo.write_blob(big.as_bytes()).unwrap();
         let th = repo.write_tree(&[("big.txt", &bh)]).unwrap();
@@ -3378,7 +2791,6 @@ mod tests {
         let rendered: usize = f.hunks.iter().map(|h| h.lines.len()).sum();
         assert!(rendered <= cap, "rendered lines ({rendered}) must not exceed the cap ({cap})");
         assert_eq!(f.additions, 5000, "the diffstat still reports the TRUE addition count");
-        // Uncapped (cap=0) renders the whole file — the opt-out path.
         let full = repo.pr_diff("refs/heads/main", &head.0, 0).unwrap().unwrap();
         let full_rendered: usize = full.files[0].hunks.iter().map(|h| h.lines.len()).sum();
         assert_eq!(full_rendered, 5000, "cap=0 is uncapped");
@@ -3386,7 +2798,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **R3.2 · G-7 — a binary file diffs as `kind=binary` with NO text hunks (never a garbled dump).**
     #[test]
     fn pr_diff_flags_binary_with_no_hunk_dump() {
         let root = temp_root("prbin");
@@ -3394,7 +2805,6 @@ mod tests {
         let repo = store.create_repo(&loc()).expect("create");
         let base = seed_commit(&repo, b"a\n");
         repo.update_ref_cas("refs/heads/main", None, Some(&base), "c", "psn@acme.noreply").unwrap();
-        // A NUL-containing blob is binary to libgit2.
         let bin = repo.write_blob(&[0u8, 1, 2, 0, 255, 3]).unwrap();
         let tb = repo.write_tree(&[("logo.png", &bin)]).unwrap();
         let head = repo
@@ -3433,7 +2843,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **R3.2 · G-7 N2 — expand-context reads a blob's lines; a binary blob never dumps garbled text.**
     #[test]
     fn file_lines_expands_context_and_is_binary_safe() {
         let root = temp_root("filelines");
@@ -3460,12 +2869,10 @@ mod tests {
         };
         assert_eq!(exact_lines.len(), FILE_LINES_MAX_RANGE);
         assert_eq!(exact_lines.last().unwrap().new_no, Some(FILE_LINES_MAX_RANGE as u32));
-        // A malformed oid → Missing (a stale expand never 500s).
         assert_eq!(
             repo.file_lines("not-an-oid", 1, 10).unwrap(),
             FileLinesLookup::Missing,
         );
-        // A binary blob → an empty expansion (never a garbled dump).
         let bin = repo.write_blob(&[0u8, 1, 2, 0]).unwrap();
         assert_eq!(repo.file_lines(&bin.0, 1, 10).unwrap(), FileLinesLookup::Binary);
 
@@ -3484,8 +2891,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **fsck-clean: the in-process integrity check passes on a well-formed repo.** (The full
-    /// external `git fsck` oracle runs in `tests/`.)
     #[test]
     fn fsck_is_clean_on_a_well_formed_repo() {
         let root = temp_root("fsck");
@@ -3498,7 +2903,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **Ref CAS: a stale expected-old is REJECTED (the ref does not move).**
     #[test]
     fn ref_cas_rejects_a_stale_expected_old() {
         let root = temp_root("cas");
@@ -3514,7 +2918,6 @@ mod tests {
         repo.update_ref_cas("refs/heads/main", None, Some(&c1), "create", "psn@acme.noreply")
             .expect("create");
 
-        // A CAS that believes main is still absent (stale) is rejected; the ref stays at c1.
         let stale = repo.update_ref_cas(
             "refs/heads/main",
             None,
@@ -3528,7 +2931,6 @@ mod tests {
         );
         assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(c1.clone()));
 
-        // A correct CAS (expected = c1) moves it to c2 and bumps the reflog generation.
         repo.update_ref_cas(
             "refs/heads/main",
             Some(&c1),
@@ -3560,7 +2962,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **Tenant isolation by path: a repo under tenant A is NOT reachable via tenant B's locator.**
     #[test]
     fn tenant_isolation_by_path() {
         let root = temp_root("isolation");
@@ -3574,11 +2975,9 @@ mod tests {
             .update_ref_cas("refs/heads/main", None, Some(&commit), "create", "psn@tenant-a.noreply")
             .expect("ref a");
 
-        // Tenant B's locator resolves to a DIFFERENT path; B's repo does not even exist yet.
         assert_ne!(store.repo_path(&a).unwrap(), store.repo_path(&b).unwrap());
         assert!(store.repo_exists(&a));
         assert!(!store.repo_exists(&b), "tenant B cannot reach A's repo by path");
-        // Even after B creates its own repo, A's object/ref are not visible in B's odb.
         let repo_b = store.create_repo(&b).expect("create b");
         assert!(
             !repo_b.has_object(&commit),
@@ -3587,18 +2986,12 @@ mod tests {
         assert_eq!(
             repo_b.read_ref("refs/heads/main").unwrap(),
             None,
-            "tenant B's main is empty — A's ref did not bleed across the tenant path"
+            "tenant B's main is empty - A's ref did not bleed across the tenant path"
         );
 
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **R0.4 / git #1 HIGH — a delete+recreate does NOT reset the durable generation.** A delete CAS
-    /// removes the ref durably; the ref's on-disk REFLOG restarts (that is libgit2 behaviour — the
-    /// reflog dies with the ref), but the durable per-ref GENERATION counter is keyed by name in config
-    /// and is monotonic ACROSS the delete: create→delete→recreate advances it 1→2→3, never resetting.
-    /// This is exactly the invariant reflog-length-as-generation violated (git #1 HIGH): reflog_len
-    /// resets to 1 on recreate while `ref_generation` correctly reaches 3.
     #[test]
     fn delete_cas_removes_ref_but_does_not_reset_durable_generation() {
         let root = temp_root("delete");
@@ -3621,20 +3014,17 @@ mod tests {
 
         repo.update_ref_cas("refs/heads/tmp", None, Some(&c1), "recreate", "psn@acme.noreply")
             .expect("recreate");
-        // libgit2 restarts the ref's reflog on recreate — that is the OLD (wrong) generation source.
         assert_eq!(
             repo.reflog_len("refs/heads/tmp"),
             Ok(1),
-            "the recreated ref's reflog restarts (libgit2 behaviour — why reflog_len was wrong)"
+            "the recreated ref's reflog restarts (libgit2 behaviour - why reflog_len was wrong)"
         );
-        // The DURABLE generation does NOT reset — it keeps climbing across the delete (the fix).
         assert_eq!(
             repo.ref_generation("refs/heads/tmp"),
             Ok(3),
             "the durable per-ref generation is monotonic across delete+recreate (R0.4 fix)"
         );
 
-        // And it survives a restart: a FRESH store + handle over the same root reads the same value.
         drop(repo);
         let store2 = DurableGitStore::rooted(&root);
         let repo2 = store2.open_repo(&loc()).expect("reopen");
@@ -3742,11 +3132,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // ── R0.7-D / DELTA N4: full push-connectivity (missing-ancestor rejection) ──
-
-    /// Copy one object's raw bytes from `src`'s odb into `dst`'s odb, preserving its oid (git2
-    /// re-hashes on write, so we assert the oid is identical — a forged copy is impossible). Used to
-    /// stage a `dst` odb that is MISSING a chosen ancestor commit while its tip tree is complete.
     fn copy_object(src: &DurableGitRepo, dst: &DurableGitRepo, oid: &Oid, kind: &str) {
         let bytes = src
             .read_object_bounded(oid, 64 * 1024 * 1024)
@@ -3755,8 +3140,6 @@ mod tests {
         assert_eq!(written.0, oid.0, "the re-hashed copy keeps the same oid");
     }
 
-    /// Build a linear `c1 <- c2 <- c3` history in a fresh source repo and return
-    /// `(root, repo, [(blob,tree,commit); 3])` so a target odb can be assembled with a chosen subset.
     #[allow(clippy::type_complexity)]
     fn seed_three_commit_history() -> (PathBuf, DurableGitRepo, Vec<(Oid, Oid, Oid)>) {
         let root = temp_root("conn-src");
@@ -3776,11 +3159,6 @@ mod tests {
         (root, repo, chain)
     }
 
-    /// **THE R0.7-D REGRESSION (DELTA N4).** A push whose TIP commit's tree is COMPLETE but whose
-    /// PARENT (ancestor) commit is MISSING from the odb must be REJECTED by the full-connectivity check
-    /// — this is exactly the state the tip-only [`DurableGitRepo::commit_tree_complete`] ACCEPTS today
-    /// (proven here) and that would wedge the branch's clonability. `existing_tips` is empty (a branch
-    /// create): a fresh branch must be fully self-contained.
     #[test]
     fn history_connectivity_rejects_a_missing_ancestor_commit() {
         let (src_root, src, chain) = seed_three_commit_history();
@@ -3788,8 +3166,6 @@ mod tests {
         let (b2, t2, c2) = chain[1].clone();
         let (b3, t3, c3) = chain[2].clone();
 
-        // Target odb: everything EXCEPT the ANCESTOR commit c1 (its tree/blob copied so nothing else
-        // is missing — the ONLY hole is the parent COMMIT c1).
         let dst_root = temp_root("conn-dst-missing");
         let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
         copy_object(&src, &dst, &b1, "blob");
@@ -3800,27 +3176,21 @@ mod tests {
         copy_object(&src, &dst, &t3, "tree");
         copy_object(&src, &dst, &c2, "commit");
         copy_object(&src, &dst, &c3, "commit");
-        // c1 (the ancestor commit) is deliberately NOT copied.
         assert!(!dst.has_object(&c1), "the ancestor commit is absent from the target odb");
 
-        // What passes today: the tip's OWN tree is complete (the tip-only slice says "ok").
         assert!(
             dst.commit_tree_complete(&c3).unwrap(),
-            "the tip-only check ACCEPTS — the tip's tree is complete (this is the hole)"
+            "the tip-only check ACCEPTS - the tip's tree is complete (this is the hole)"
         );
-        // The FIX: full connectivity REJECTS (missing ancestor → a branch a clone cannot walk).
         assert!(
             !dst.history_connectivity_complete(&c3, &[]).unwrap(),
-            "R0.7-D: a missing ANCESTOR commit rejects the push (fail-closed) — the ref must not move"
+            "R0.7-D: a missing ANCESTOR commit rejects the push (fail-closed) - the ref must not move"
         );
 
         std::fs::remove_dir_all(&src_root).ok();
         std::fs::remove_dir_all(&dst_root).ok();
     }
 
-    /// A normal push whose FULL history is present is ACCEPTED (the full-connectivity walk finds every
-    /// commit + tree + parent). Both the branch-create (`existing_tips == []`) form and the tip-only
-    /// slice agree here — the fix is never MORE permissive on a well-formed push.
     #[test]
     fn history_connectivity_accepts_full_history() {
         let (src_root, src, chain) = seed_three_commit_history();
@@ -3840,10 +3210,6 @@ mod tests {
         std::fs::remove_dir_all(&dst_root).ok();
     }
 
-    /// **Thin-push cheapness + correctness.** With `existing_tips = [c2]` the walk HIDES the existing
-    /// history and visits ONLY the newly-introduced commit c3 — so a push whose delta base c2 is present
-    /// is accepted WITHOUT re-verifying the whole chain, AND a non-existent existing tip is hidden
-    /// gracefully (skipped, only widening the walk — fail-closed).
     #[test]
     fn history_connectivity_thin_push_hides_existing_tips() {
         let (src_root, src, chain) = seed_three_commit_history();
@@ -3862,7 +3228,6 @@ mod tests {
                 .unwrap(),
             "a thin push onto a present base tip is accepted (only the delta is walked)"
         );
-        // A bogus / non-existent existing tip is hidden gracefully — the push is still correctly judged.
         let bogus = Oid::new("0".repeat(39) + "1");
         assert!(
             dst.history_connectivity_complete(&c3, &[c2, bogus]).unwrap(),
@@ -3872,17 +3237,12 @@ mod tests {
         std::fs::remove_dir_all(&dst_root).ok();
     }
 
-    /// A thin push whose DELTA BASE is present but whose deeper ancestor is missing is still ACCEPTED
-    /// when that ancestor is already reachable from `existing_tips` (it is present, just hidden); but a
-    /// push introducing a commit whose parent is genuinely absent is REJECTED even with a non-empty
-    /// `existing_tips`. This pins the boundary: the check verifies parents of every NEW commit.
     #[test]
     fn history_connectivity_rejects_missing_parent_of_a_new_commit_even_with_existing_tips() {
         let (src_root, src, chain) = seed_three_commit_history();
         let (b2, t2, c2) = chain[1].clone();
         let (b3, t3, c3) = chain[2].clone();
 
-        // Target odb has c3 + its tree/blob and c2's tree/blob, but NOT c2 (the parent of the new tip).
         let dst_root = temp_root("conn-dst-thin-missing");
         let dst = DurableGitStore::rooted(&dst_root).create_repo(&loc()).expect("create dst");
         copy_object(&src, &dst, &b2, "blob");
@@ -3892,13 +3252,10 @@ mod tests {
         copy_object(&src, &dst, &c3, "commit");
         assert!(!dst.has_object(&c2), "the new tip's parent commit is absent");
 
-        // existing_tips names c2, but c2 is NOT in the odb → hidden gracefully (skipped), so the walk
-        // still visits c3 and finds its parent c2 missing → REJECT (fail-closed).
         assert!(
             !dst.history_connectivity_complete(&c3, &[c2]).unwrap(),
             "a new commit whose parent is genuinely absent is rejected regardless of existing_tips"
         );
-        // A missing NEW tip is itself a reject (never a swallowed error).
         assert!(
             !dst.history_connectivity_complete(&Oid::new("0".repeat(39) + "1"), &[])
                 .unwrap(),
@@ -3908,12 +3265,6 @@ mod tests {
         std::fs::remove_dir_all(&dst_root).ok();
     }
 
-    // ── R3.4 repo-browsing completeness: nested tree/blob, kind mismatch, binary, refs, bounded walk ──
-
-    /// Build a real commit with NESTED content on `refs/heads/main`:
-    /// `README.md` (text), `crates/inner/deep.rs` (text), `assets/logo.bin` (binary — has NUL bytes).
-    /// Returns the seeded [`DurableGitRepo`]. Uses git2 directly (the crate's dep) to construct subtrees
-    /// bottom-up, since [`DurableGitRepo::write_tree`] only builds flat trees.
     fn seed_nested_repo(root: &std::path::Path) -> DurableGitRepo {
         let store = DurableGitStore::rooted(root);
         let repo = store.create_repo(&loc()).expect("create");
@@ -3923,19 +3274,15 @@ mod tests {
         let deep = git.blob(b"pub fn deep() {}\n").unwrap();
         let binary = git.blob(&[0x89, b'P', b'N', b'G', 0x00, 0x01, 0x02, 0x00, 0xff]).unwrap();
 
-        // inner tree { deep.rs }
         let mut b = git.treebuilder(None).unwrap();
         b.insert("deep.rs", deep, 0o100644).unwrap();
         let inner = b.write().unwrap();
-        // crates tree { inner/ }
         let mut b = git.treebuilder(None).unwrap();
         b.insert("inner", inner, 0o040000).unwrap();
         let crates = b.write().unwrap();
-        // assets tree { logo.bin }
         let mut b = git.treebuilder(None).unwrap();
         b.insert("logo.bin", binary, 0o100644).unwrap();
         let assets = b.write().unwrap();
-        // root tree { README.md, crates/, assets/ }
         let mut b = git.treebuilder(None).unwrap();
         b.insert("README.md", readme, 0o100644).unwrap();
         b.insert("crates", crates, 0o040000).unwrap();
@@ -3955,7 +3302,6 @@ mod tests {
             "psn-7@acme.noreply",
         )
         .expect("set main");
-        // Also tag it, to prove the ref switcher separates branches from tags.
         repo.update_ref_cas(
             "refs/tags/v1.0",
             None,
@@ -3967,17 +3313,11 @@ mod tests {
         repo
     }
 
-    /// **A ref that resolves to a NON-commit object (a bare tree oid, `main^{tree}`) is a clean
-    /// empty browse, never a 500 (R3.4 verifier finding 1).** `revparse_single` succeeds but
-    /// `peel_to_commit` fails with InvalidSpec; `resolve_commit` maps that to `None`, so the browse
-    /// surfaces `Missing`/`None` rather than propagating a server error the edge would render as 500.
     #[test]
     fn ref_resolving_to_a_non_commit_object_is_a_clean_empty_browse_not_an_err() {
         let root = temp_root("noncommit-ref");
         let repo = seed_nested_repo(&root);
-        // `main^{tree}` peels the tip to its TREE object — a non-commit revspec a client can supply.
         let tree_spec = "main^{tree}";
-        // Blob resolution stays a clean Missing, not an internal error.
         assert!(matches!(
             repo.read_blob_at_path_bounded(tree_spec, "README.md", 1024).unwrap(),
             BlobPathLookup::Missing
@@ -3985,13 +3325,11 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **Nested blob read + server-side binary detection + the blob→dir kind-mismatch hint (R3.4).**
     #[test]
     fn read_blob_at_path_detects_binary_and_flags_a_dir() {
         let root = temp_root("blob-nested");
         let repo = seed_nested_repo(&root);
 
-        // A nested TEXT blob: not binary, real size, real oid.
         let BlobPathLookup::Found { bytes, oid, is_binary, size } =
             repo.read_blob_at_path_bounded("main", "crates/inner/deep.rs", 1024).unwrap()
         else {
@@ -4009,7 +3347,6 @@ mod tests {
             BlobPathLookup::TooLarge { size, maximum: 1, oid } if size > 1 && oid.as_str().len() == 40
         ));
 
-        // A BINARY blob (NUL bytes): flagged binary so the UI never split('\n')s it.
         let BlobPathLookup::Found { is_binary, .. } =
             repo.read_blob_at_path_bounded("main", "assets/logo.bin", 1024).unwrap()
         else {
@@ -4017,17 +3354,14 @@ mod tests {
         };
         assert!(is_binary, "a file with NUL bytes is detected binary server-side");
 
-        // A DIRECTORY requested under blob/ → IsDir (the client redirects to tree), not a 404.
         assert!(matches!(
             repo.read_blob_at_path_bounded("main", "crates/inner", 1024).unwrap(),
             BlobPathLookup::IsDir
         ));
-        // The repo root under blob/ is a dir too.
         assert!(matches!(
             repo.read_blob_at_path_bounded("main", "", 1024).unwrap(),
             BlobPathLookup::IsDir
         ));
-        // An absent file → Missing.
         assert!(matches!(
             repo.read_blob_at_path_bounded("main", "no/such/file", 1024).unwrap(),
             BlobPathLookup::Missing
@@ -4035,9 +3369,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **Nested-path traversal safety (R3.4): a `../`-laden path never escapes the tree** — libgit2's
-    /// `Tree::get_path` treats the path as tree-relative and refuses to walk above the root, so a
-    /// traversal attempt resolves to Missing (never a file OUTSIDE the committed tree, never a panic).
     #[test]
     fn nested_path_traversal_is_contained() {
         let root = temp_root("traversal");
@@ -4048,7 +3379,6 @@ mod tests {
             "crates/inner/../../../../secret",
             "/etc/passwd",
         ] {
-            // The load-bearing property: blob resolution never yields bytes from outside the tree.
             if escape.contains("etc/passwd") || escape.contains("secret") {
                 assert!(
                     matches!(repo.read_blob_at_path_bounded("main", escape, 1024).unwrap(), BlobPathLookup::Missing),

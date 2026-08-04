@@ -1,17 +1,3 @@
-//! # CDC 1.11 (agent slice) — agent-load caps + the causal-loop guard (P-S20 → P-036)
-//!
-//! **Contract-index:** row 1.11 (the **agent slice** of the protected-human-lane / loop-guard
-//! machinery — AG-6: the bounded dispatch pool drops over-cap (never forks), the causal-depth ceiling,
-//! the shared-causal-root tripwire, the bounded predicate-evaluation guard). Consumes row 1.8 (the
-//! `causal_depth` histogram + `tripwire_fired` + `dispatch_pool_drops` producer signals).
-//!
-//! This consumer-driven contract test exercises the 1.11 agent-load shape from OUTSIDE the crate (the
-//! Bus reactive/dispatch tier, EB-23/P-143, is the consumer of the [`AgentLoadGuard`]): it builds the
-//! envelopes the dispatch tier would deliver and asserts each cap's frozen behaviour + the combined
-//! consult. The provider side is [`myelin_substrate::agent_load`]; the unit half is `agent_load::tests`;
-//! the SUB-D8 adversarial-loop drill is `tests/drill_sub_d8_causal_loop.rs`. Together they are the
-//! dated green artifact.
-
 use myelin_events::{
     derive_envelope, Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EmitContext,
     EventDraft, EventEnvelope, EventId, EventType, Region, TenantId, Timestamp, Visibility,
@@ -22,10 +8,6 @@ use myelin_substrate::{
     GuardOutcome, PredicateGuard, PredicateVerdict, SharedRootTripwire, TripwireVerdict,
 };
 
-/// Build a reaction envelope at a chosen causal depth + root — the shape a dispatched reaction
-/// carries. Built through `derive_envelope` (the same path `OutboxTx::emit` uses) then the loop-hop
-/// `depth`/`correlation_id` are set directly to drive the boundary; in production the outbox stamps
-/// them correct-by-construction (§5.3).
 fn reaction(depth: u32, root: &str) -> EventEnvelope {
     let draft = EventDraft {
         type_: EventType("agent.run.reacted".into()),
@@ -57,8 +39,6 @@ fn reaction(depth: u32, root: &str) -> EventEnvelope {
     env
 }
 
-/// **CDC 1.11 agent (a) — the bounded dispatch pool drops over-cap, never forks.** The consumer (the
-/// dispatch tier) gets a typed `Dropped` it counts, never an unbounded fork into a new worker.
 #[test]
 fn cdc_1_11_agent_dispatch_pool_drops_over_cap_never_forks() {
     let mut pool = DispatchPool::new(2);
@@ -67,7 +47,7 @@ fn cdc_1_11_agent_dispatch_pool_drops_over_cap_never_forks() {
     assert_eq!(
         pool.try_dispatch(),
         DispatchAdmission::Dropped,
-        "over-cap is DROPPED (never forked) — the §7.4 structural concurrency cap"
+        "over-cap is DROPPED (never forked) - the §7.4 structural concurrency cap"
     );
     assert_eq!(pool.in_flight(), 2, "in-flight never exceeds the bound");
     assert_eq!(
@@ -77,8 +57,6 @@ fn cdc_1_11_agent_dispatch_pool_drops_over_cap_never_forks() {
     );
 }
 
-/// **CDC 1.11 agent (b) — the causal-depth ceiling reads `EventEnvelope.depth` and halts at the hard
-/// ceiling (the §5.3 structural guarantee — it reads the envelope field, not a convention).**
 #[test]
 fn cdc_1_11_agent_depth_ceiling_reads_envelope_depth_and_halts() {
     let mut ceiling = DepthCeiling::v1_floor();
@@ -95,13 +73,11 @@ fn cdc_1_11_agent_depth_ceiling_reads_envelope_depth_and_halts() {
     assert_eq!(
         ceiling.evaluate(&reaction(16, "r")),
         DepthVerdict::Halt,
-        "a reaction at the hard depth is halted — the loop is stopped"
+        "a reaction at the hard depth is halted - the loop is stopped"
     );
     assert_eq!(ceiling.halts(), 1);
 }
 
-/// **CDC 1.11 agent (c) — the shared-causal-root tripwire reads `EventEnvelope.correlation_id` and
-/// fires on a wide fan-out off one root (the guard a per-chain depth ceiling would miss).**
 #[test]
 fn cdc_1_11_agent_shared_root_tripwire_reads_correlation_id_and_fires() {
     let mut tw = SharedRootTripwire::new(8, 4);
@@ -120,7 +96,6 @@ fn cdc_1_11_agent_shared_root_tripwire_reads_correlation_id_and_fires() {
         1,
         "tripwire_fired is exported (contract-1.8)"
     );
-    // diverse roots are normal traffic — never fire.
     let mut tw2 = SharedRootTripwire::new(8, 4);
     for i in 0..8 {
         assert_eq!(
@@ -131,8 +106,6 @@ fn cdc_1_11_agent_shared_root_tripwire_reads_correlation_id_and_fires() {
     assert_eq!(tw2.tripwire_fired(), 0);
 }
 
-/// **CDC 1.11 agent (d) — the bounded predicate-evaluation guard rejects a crafted over-cost matcher
-/// before it can DoS the trigger engine (§7.5).**
 #[test]
 fn cdc_1_11_agent_predicate_guard_rejects_over_cost_matcher() {
     let mut guard = PredicateGuard::v1_floor();
@@ -147,7 +120,6 @@ fn cdc_1_11_agent_predicate_guard_rejects_over_cost_matcher() {
         PredicateVerdict::OverBudget(BudgetBreach::Steps),
         "a crafted matcher is rejected BEFORE evaluation"
     );
-    // the runtime backstop catches a predicate that passed the static check but ran long.
     assert_eq!(
         guard.check_runtime(9_999),
         PredicateVerdict::OverBudget(BudgetBreach::Time)
@@ -155,18 +127,13 @@ fn cdc_1_11_agent_predicate_guard_rejects_over_cost_matcher() {
     assert_eq!(guard.rejections(), 2);
 }
 
-/// **CDC 1.11 agent — the composed `AgentLoadGuard`: the four caps are complementary, so an
-/// adversarial loop is stopped by whichever cap trips first, and a halt takes no permit.** This is the
-/// single consult the dispatch tier makes per reaction.
 #[test]
 fn cdc_1_11_agent_composed_guard_stops_the_loop_whichever_way_it_evades() {
-    // a deep chain → halted by depth.
     let mut g = AgentLoadGuard::v1_floor(64);
     assert_eq!(g.admit(&reaction(16, "deep")), GuardOutcome::HaltedByDepth);
     assert_eq!(g.pool.in_flight(), 0, "a halted reaction leaks no permit");
     assert_eq!(g.signals().causal_depth_firings(), 1);
 
-    // a wide fan-out → halted by the tripwire.
     let mut g2 = AgentLoadGuard {
         pool: DispatchPool::new(1000),
         depth: DepthCeiling::new(12, 16),
@@ -182,7 +149,6 @@ fn cdc_1_11_agent_composed_guard_stops_the_loop_whichever_way_it_evades() {
     );
     assert_eq!(g2.signals().tripwire_fired, 1);
 
-    // a concurrency surge → dropped by the pool (never forked).
     let mut g3 = AgentLoadGuard {
         pool: DispatchPool::new(2),
         depth: DepthCeiling::new(12, 16),

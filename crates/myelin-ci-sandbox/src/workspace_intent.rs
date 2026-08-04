@@ -1,31 +1,5 @@
-//! CT-007 slice 5b.3-1: deriving a job's checkout intent from its [`crate::WorkspaceSpec`] —
-//! backend-independent semantics, deliberately NOT in `gvisor.rs` (Sol's review: the intent parser
-//! must not depend conceptually on a backend implementation). `pub(crate)` throughout except
-//! [`GitObjectFormat`] itself (re-exported at the crate root — see its own doc); nothing else here
-//! is exposed outside this crate.
-//!
-//! This module answers ONLY "is this job checkout-bearing, and if so, what did the caller ask for,
-//! syntactically validated?" — it does NOT resolve a repo reference to a filesystem path, does NOT
-//! check tenant/region authority, and does NOT verify the job's authorization actually grants
-//! read access to the named repo/commit. Those are slice 5b.3-2's job, layered on TOP of the
-//! [`ValidatedCheckoutRequest`] this module produces (hence the name — "validated" syntactically,
-//! not yet "resolved" to a trusted locator).
-
 use crate::JobKind;
 
-/// The git object-format hex width an `ExpectedGitCommitId` was validated against. Local to this
-/// crate deliberately: `myelin-ci-sandbox` does not depend on `myelin-git`'s
-/// `object_format::ObjectFormat`/`receive_pack::Oid` types (a much higher-level subsystem crate) —
-/// pulling those in just for this would be a genuinely new, unwarranted DAG edge. This type carries
-/// only what the wire negotiation and the checkout script need: which hex width to expect/request,
-/// and which wire capability / `git init` flag that implies. (`myelin-refs`, used elsewhere in this
-/// module for `ArtifactRef` parsing, is a DIFFERENT, already-existing production dependency of this
-/// crate — a shared URN-grammar crate, not a subsystem crate — see this crate's own `Cargo.toml`.)
-///
-/// `pub` (re-exported at the crate root as `crate::GitObjectFormat`, CT-007 slice 5b.3-2a, Sol's
-/// review) so [`crate::CheckoutAuthorizationScope`] can carry it directly — ONE enum, not a
-/// duplicated public mirror that could drift from this one. Its wire-specific methods stay
-/// `pub(crate)`: only this crate's own checkout transport needs them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GitObjectFormat {
     Sha1,
@@ -40,8 +14,6 @@ impl GitObjectFormat {
         }
     }
 
-    /// The `object-format=<...>` wire capability token this format requires in the fetch request —
-    /// `None` for SHA-1 (omitting the capability entirely means SHA-1, the protocol default).
     pub(crate) fn capability_token(self) -> Option<&'static str> {
         match self {
             GitObjectFormat::Sha1 => None,
@@ -49,8 +21,6 @@ impl GitObjectFormat {
         }
     }
 
-    /// The `git init --object-format=<...>` token (also matched against the advertisement's own
-    /// `object-format=` capability, when present).
     pub(crate) fn init_token(self) -> &'static str {
         match self {
             GitObjectFormat::Sha1 => "sha1",
@@ -59,12 +29,6 @@ impl GitObjectFormat {
     }
 }
 
-/// A validated git commit id CT-007 will check out — exactly [`GitObjectFormat::hex_width`]
-/// lowercase-hex characters, never the all-zero null id (the protocol's delete/"nothing" sentinel,
-/// never a real checkout target). Deliberately NOT named `CommitOid`/built on a generic
-/// hash-agnostic string type (Sol's round-2 review, slice 5b.2): the object format is load-bearing
-/// here — it picks the wire capability AND the `git init` flag — so it is carried explicitly, never
-/// inferred silently downstream from a bare hex length.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExpectedGitCommitId {
     hex: String,
@@ -97,12 +61,6 @@ impl ExpectedGitCommitId {
         Ok(ExpectedGitCommitId { hex, format })
     }
 
-    /// Parse a commit id whose OBJECT FORMAT is inferred from its width alone (CT-007 slice 5b.3-1,
-    /// Sol's review) — 40 characters dispatches to SHA-1, 64 to SHA-256, anything else refused
-    /// before the shared hex/nonzero checks in [`Self::new`] even run. Unlike [`Self::new`] (which
-    /// requires the caller to already know which format it expects, e.g. from a live wire
-    /// advertisement), this is the right constructor for a caller-supplied plain string with no
-    /// separate format signal — exactly `WorkspaceSpec.commit`'s shape.
     pub(crate) fn parse_exact(hex: impl Into<String>) -> Result<Self, String> {
         let hex = hex.into();
         let format = match hex.len() {
@@ -128,9 +86,6 @@ impl ExpectedGitCommitId {
     }
 }
 
-/// A job's checkout intent, derived from its [`crate::WorkspaceSpec`] (CT-007 slice 5b.3-1). `None`/
-/// `None` is [`Self::Compute`]; `Some`/`Some` is [`Self::Checkout`]; any mixed combination is refused
-/// by [`derive_workspace_intent`] before either variant is ever constructed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum WorkspaceIntent {
@@ -138,13 +93,6 @@ pub(crate) enum WorkspaceIntent {
     Checkout(ValidatedCheckoutRequest),
 }
 
-/// A checkout-bearing job's request, validated SYNTACTICALLY only (CT-007 slice 5b.3-1): the
-/// `repo_ref` parses as a canonical `myelin://<tenant>/git/repo/<id>` reference and `commit` is a
-/// real, full, lowercase-hex object id. Deliberately NOT called `ResolvedCheckoutRequest` (Sol's
-/// review): no storage-path resolution, no tenant/region authority check, and no repo-read
-/// authorization has happened yet — those are slice 5b.3-2's job, which layers a genuinely
-/// *resolved* + *authorized* type on top of this one. The opaque repo `id` is intentionally never
-/// converted into a filesystem path here — only a later, trusted resolver may do that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct ValidatedCheckoutRequest {
@@ -155,8 +103,6 @@ pub(crate) struct ValidatedCheckoutRequest {
 }
 
 impl ValidatedCheckoutRequest {
-    /// The typed canonical identity, NOT a re-parsed string (Sol's review) — the authorization
-    /// layer (slice 5b.3-2) consumes this directly, never reconstructs it from text.
     #[allow(dead_code)]
     pub(crate) fn artifact_ref(&self) -> &myelin_events::ArtifactRef {
         &self.artifact_ref
@@ -177,10 +123,6 @@ impl ValidatedCheckoutRequest {
         &self.commit
     }
 
-    /// Project this SYNTACTICALLY-validated request into the narrow
-    /// [`crate::CheckoutAuthorizationScope`] (CT-007 slice 5b.3-2a) — the ONE place a
-    /// `CheckoutAuthorizationScope` is ever constructed from real data (its own fields are
-    /// private; this module is the sole legitimate source).
     #[allow(dead_code)]
     pub(crate) fn to_authorization_scope(&self) -> crate::CheckoutAuthorizationScope {
         crate::CheckoutAuthorizationScope::new(
@@ -193,10 +135,6 @@ impl ValidatedCheckoutRequest {
     }
 }
 
-/// Derive a job's [`WorkspaceIntent`] from its `kind` + [`crate::WorkspaceSpec`] (CT-007 slice
-/// 5b.3-1) — the FIRST thing `launch_with` will do for a checkout-bearing job once slice 5b.3-6
-/// wires this in (before `reserve` or any other external effect), per Sol's design. Fail-closed at
-/// every step; never silently defaults a malformed/ambiguous request to `Compute`.
 #[allow(dead_code)]
 pub(crate) fn derive_workspace_intent(
     kind: JobKind,

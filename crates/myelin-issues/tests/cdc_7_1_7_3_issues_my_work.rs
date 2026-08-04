@@ -1,31 +1,3 @@
-//! # The CDC pair for contracts 7.1 + 7.3 — Issues **"My Work"** over the ONE inbox + the humanise
-//! templates (ISS-P22 / P-389, M4)
-//!
-//! **Contract-index rows 7.1** (`list_inbox(principal, filter?, page?)` — the ONE inbox; a scoped view
-//! is a `filter` over `reason`/`subject`, NEVER a second store) **and 7.3** (`humanise` — the ONE
-//! templating surface, OQ-L). The Notif machinery is owned + frozen at NOTIF-P5 (`list_inbox` + the
-//! C-9 `InboxFilter`) / NOTIF-P8/P9 (the ONE `humanise` templating surface). THIS file pins the
-//! **Issues "My Work" wiring slice** ISS-P22 ships:
-//! - **7.1 PROVIDER** — Issues' "My Work" is the FILTER [`myelin_issues::my_work_filter`] (= the frozen
-//!   [`myelin_notif::InboxFilter::issues_my_work`]); the provider's promise is that it is a FILTER over
-//!   the ONE inbox (a STRICT SUBSET), never a parallel Issues store.
-//! - **7.1 CONSUMER** — Notif's [`myelin_notif::list_inbox`] reads the ONE [`InboxProjection`] through
-//!   the My Work filter; a mark/snooze on a My Work item reflects in the unified inbox (one read-state
-//!   truth — 0 second store).
-//! - **7.3 PROVIDER** — Issues registers its SLA-at-risk / unblocked / approval-requested strings
-//!   ([`myelin_issues::register_issue_humanise_templates`]) into the ONE templating surface; the
-//!   provider's promise is NO second template engine (OQ-L) — the strings are
-//!   [`myelin_notif::HumaniseTemplate`] rows in the ONE [`myelin_notif::TemplateStore`].
-//! - **7.3 CONSUMER** — Notif's ONE [`myelin_notif::humanise`] pipeline ADMITS + RENDERS the Issues
-//!   strings through the SAME formatter + the SAME per-viewer tombstone-never-leak chokepoint
-//!   (NOTIF-D4) — a denied viewer gets the tombstone, never the title (the Issues string inherits the
-//!   ONE surface's structural leak-safety).
-//!
-//! The two sides are pinned here so a drift on either (Issues defines a parallel filter/engine; Notif
-//! renames `InboxFilter`/`HumaniseTemplate` or changes the formatter) fails this test in the same CI
-//! job. The Issues-side C-9 subset + one-read-state property additionally has the integration drill
-//! `tests/integration_issues_my_work_c9.rs`; this CDC is the contract-shape evidence.
-
 use std::collections::BTreeSet;
 
 use myelin_identity::{
@@ -76,9 +48,6 @@ fn ids(page: &InboxPage) -> BTreeSet<String> {
     page.items.iter().map(|i| i.item_id.clone()).collect()
 }
 
-/// A synthetic Refs `resolve` port — allows exactly the (viewer, ref) pairs given, else a denied
-/// tombstone (the 5.2 resolve seam the ONE humanise binds its slots to; production = the Refs
-/// chokepoint).
 struct Resolver {
     allowed: Vec<(String, String)>,
 }
@@ -130,16 +99,11 @@ fn seeded() -> InboxProjection {
     inbox
 }
 
-// --- 7.1: My Work is a FILTER over the ONE inbox (provider + consumer) ---
-
-/// **7.1 PROVIDER — Issues' "My Work" is the ONE Notif filter, never a parallel filter shape.**
 #[test]
 fn provider_my_work_is_the_one_notif_filter() {
     assert_eq!(my_work_filter(), InboxFilter::issues_my_work());
 }
 
-/// **7.1 CONSUMER — Notif's `list_inbox` reads the ONE inbox through the My Work filter; the view is a
-/// STRICT SUBSET (a filter, not a second store).**
 #[test]
 fn consumer_my_work_is_a_strict_subset_of_the_one_inbox() {
     let inbox = seeded();
@@ -168,11 +132,9 @@ fn consumer_my_work_is_a_strict_subset_of_the_one_inbox() {
     assert!(!my_ids.contains("git-review"), "other subsystem excluded");
 }
 
-/// **7.1 + 7.2 — one read-state truth: a mark/snooze on a My Work item reflects in the unified inbox.**
 #[test]
 fn one_read_state_truth_across_my_work_and_the_inbox() {
     let inbox = seeded();
-    // mark read through the ONE read-state verb (the row id from My Work).
     mark(&inbox, &me(), "iss-assigned", ReadState::Read).expect("mark my own item");
     let full = list_inbox(
         &inbox,
@@ -192,7 +154,6 @@ fn one_read_state_truth_across_my_work_and_the_inbox() {
         "the mark reflects in the unified inbox"
     );
 
-    // snooze it; the SAME row in the unified inbox is snoozed + suppressed from the active inbox.
     snooze(&inbox, &me(), "iss-assigned", "2026-07-01T09:00:00Z").expect("snooze my own item");
     let full = list_inbox(
         &inbox,
@@ -216,10 +177,6 @@ fn one_read_state_truth_across_my_work_and_the_inbox() {
     );
 }
 
-// --- 7.3: the Issues humanise templates register + render on the ONE surface (provider + consumer) ---
-
-/// **7.3 PROVIDER + CONSUMER — the Issues SLA/unblocked/approval strings register on the ONE surface
-/// and render through the ONE `humanise` pipeline (0 second template engine).**
 #[test]
 fn issue_templates_render_through_the_one_humanise_surface() {
     let mut store = TemplateStore::with_platform_defaults();
@@ -233,7 +190,7 @@ fn issue_templates_render_through_the_one_humanise_surface() {
     for (key, expected) in [
         (
             TPL_SLA_AT_RISK,
-            "SLA at risk on ENG-1421: payments timeout — respond before the deadline",
+            "SLA at risk on ENG-1421: payments timeout - respond before the deadline",
         ),
         (TPL_UNBLOCKED, "ENG-1421: payments timeout is now unblocked"),
         (
@@ -260,14 +217,12 @@ fn issue_templates_render_through_the_one_humanise_surface() {
     }
 }
 
-/// **7.3 — the leak invariant holds for an Issues string (NOTIF-D4): a denied viewer gets the
-/// tombstone, NEVER the title.** The Issues string inherits the ONE surface's structural leak-safety.
 #[test]
 fn issue_template_is_leak_safe_for_a_denied_viewer() {
     let mut store = TemplateStore::with_platform_defaults();
     register_issue_humanise_templates(&mut store);
     let subject = ArtifactRef("myelin://acme/issue/issue/ENG-1421".into());
-    let resolver = Resolver { allowed: vec![] }; // allow nobody → a denied tombstone.
+    let resolver = Resolver { allowed: vec![] };
     let h = humanise(
         &resolver,
         &tenant(),
@@ -290,8 +245,6 @@ fn issue_template_is_leak_safe_for_a_denied_viewer() {
     );
 }
 
-/// **The wiring point ties BOTH surfaces (the ISS-P22 deliverable): the reason set into the ONE
-/// registry AND the templates into the ONE store, zero Notif change.**
 #[test]
 fn wire_issues_my_work_registers_both_surfaces() {
     let mut reg = NotifRuleRegistry::platform_default();

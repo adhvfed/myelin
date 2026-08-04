@@ -1,28 +1,3 @@
-//! # CDC — contract 5.1 (`ArtifactRef` id grammar, git's canonical keys) + 5.2/5.6
-//! (`project(ref, viewer)` for git artifacts) — GIT-P18 / P-279
-//!
-//! Rows 5.1 / 5.2 / 5.6 are the seam between:
-//! - the **PROVIDER** (git) that MINTS its stable canonical `ArtifactRef` keys (`pr/<repo>:<n>`,
-//!   `commit/<repo>:<sha>`, contract 5.1 / REF-3) and IMPLEMENTS `project(ref, viewer)` — the ONLY way
-//!   git's artifacts are read (per-viewer permission-checked; a denied viewer gets a tombstone, 5.2/5.6);
-//! - the **CONSUMER** (Refs/Search/Notif) that reads a git artifact ONLY through `project(ref, viewer)`
-//!   (no cross-DB) and gets a `Projection` (authorized) or a `Tombstone` (denied/erased) — never a raw
-//!   title for a viewer it may not show it to.
-//!
-//! The PROVIDER's promise (asserted on the provider side): every minted key round-trips byte-identical
-//! through the one Refs codec (0 ungrammatical keys; the `#n` display is render-time only, 0 stored
-//! display keys); and `project` is permission-FIRST (deny ⇒ tombstone with NO artifact field read).
-//!
-//! The CONSUMER's promise (asserted on the consumer side): a downstream reader that holds only a
-//! canonical `ArtifactRef` + a viewer `Principal` gets back exactly the §3 `{title, state, icon}`
-//! projection IFF the viewer is authorized, and a content-free tombstone otherwise — so a 0-leak in
-//! `project` is a 0-leak for EVERY consumer (the M3-G5/M5 leak-drill feed, GIT-D11 / SRCH-D1/D3).
-//!
-//! FLOORS named: the `blob`/`#L<a>-L<b>` content-anchored sub-projection is GIT-P24; the live OLTP
-//! store is GIT-P20; cross-cell projection is single-home (the multi-cell floor). The general Refs
-//! `resolve(ref, viewer, mode)` 4-step tombstone LADDER (over ALL subsystems) is the P-159 Refs
-//! resolver; THIS pair ships the GIT-OWNED `project()` half rows 5.2/5.6 assign to git.
-
 use myelin_git::body::Body;
 use myelin_git::check_status::GateOutcome;
 use myelin_git::lifecycle::PullRequest;
@@ -38,12 +13,6 @@ use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 use std::collections::HashSet;
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// PROVIDER side (git): the canonical-key id grammar (5.1) + permission-first project() (5.2/5.6).
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
-/// **PROVIDER side of 5.1** — git mints its stable canonical keys; each round-trips byte-identical
-/// through the ONE Refs codec, and the `#n` display is render-time only (0 stored display keys).
 fn provider_canonical_keys() -> Vec<(ArtifactRef, &'static str)> {
     vec![
         (
@@ -60,10 +29,8 @@ fn provider_canonical_keys() -> Vec<(ArtifactRef, &'static str)> {
 #[test]
 fn provider_mints_canonical_keys_that_round_trip_and_have_no_stored_display_key() {
     for (key, expect) in provider_canonical_keys() {
-        // the canonical stored key round-trips byte-identical.
         assert_eq!(myelin_refs::format(&key), expect);
         assert_eq!(myelin_refs::parse(expect).unwrap(), key);
-        // the render-time display (`#n`) is NEVER a stored scope (REF-3).
         if let Some(disp) = myelin_git::project::display_key(&key) {
             assert!(
                 myelin_refs::parse(&disp).is_err(),
@@ -73,7 +40,6 @@ fn provider_mints_canonical_keys_that_round_trip_and_have_no_stored_display_key(
     }
 }
 
-// ── a deterministic Id over a `view@object` allow-list (the provider's permission source) ──
 struct StubId {
     allow: HashSet<String>,
 }
@@ -185,7 +151,6 @@ fn viewer(id: &str) -> Principal {
     )
 }
 
-/// Build a projector seeded with one PR + one commit, with `alice` authorized to view both.
 fn seeded_projector(authorized: bool) -> (Projector<StubId>, ArtifactRef, ArtifactRef) {
     let pr_ref = git_pr_ref("acme", "payments", 1421);
     let commit_ref = git_commit_ref("acme", "payments", "blake3:deadbeefcafe");
@@ -216,8 +181,7 @@ fn seeded_projector(authorized: bool) -> (Projector<StubId>, ArtifactRef, Artifa
 
 #[test]
 fn provider_project_is_permission_first_deny_yields_a_tombstone_with_no_title() {
-    // PROVIDER: a denied viewer's projection is a tombstone that never read the title (0 leak).
-    let (projector, pr_ref, _commit) = seeded_projector(/*authorized*/ false);
+    let (projector, pr_ref, _commit) = seeded_projector( false);
     let got = projector
         .project(&pr_ref, &viewer("mallory"), Zookie("z".into()))
         .unwrap();
@@ -229,15 +193,6 @@ fn provider_project_is_permission_first_deny_yields_a_tombstone_with_no_title() 
     );
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// CONSUMER side (Refs/Search/Notif): read a git artifact ONLY through project(ref, viewer).
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
-/// A downstream **CONSUMER** (modelled — Refs/Search/Notif) reads a git artifact through the ONLY
-/// allowed path: `project(ref, viewer)`. It holds the canonical `ArtifactRef` + the viewer `Principal`
-/// and consumes whatever `project` returns — never reaching into git's DB. The consumer's promise: it
-/// renders the `{title, state, icon}` for an authorized viewer and a content-free "(not available)" for
-/// a tombstone — it has no other way to learn the title (so a 0-leak in `project` is a 0-leak here).
 fn consumer_render(projector: &Projector<StubId>, r: &ArtifactRef, v: &Principal) -> String {
     match projector.project(r, v, Zookie("z".into())) {
         Ok(Projected::Visible(p)) => format!("{}|{}|{}", p.icon, p.state, p.title),
@@ -248,8 +203,7 @@ fn consumer_render(projector: &Projector<StubId>, r: &ArtifactRef, v: &Principal
 
 #[test]
 fn consumer_reads_the_projection_for_an_authorized_viewer() {
-    let (projector, pr_ref, commit_ref) = seeded_projector(/*authorized*/ true);
-    // the consumer gets the §3 {icon, state, title} projection — the ONLY git-artifact read path.
+    let (projector, pr_ref, commit_ref) = seeded_projector( true);
     assert_eq!(
         consumer_render(&projector, &pr_ref, &viewer("alice")),
         "pr|open|Harden the retry path"
@@ -262,12 +216,11 @@ fn consumer_reads_the_projection_for_an_authorized_viewer() {
 
 #[test]
 fn consumer_gets_a_content_free_tombstone_for_an_unauthorized_viewer() {
-    let (projector, pr_ref, _commit) = seeded_projector(/*authorized*/ false);
-    // the consumer holds the canonical ref + the viewer; the ONLY thing it can learn is "(not available)".
+    let (projector, pr_ref, _commit) = seeded_projector( false);
     let rendered = consumer_render(&projector, &pr_ref, &viewer("mallory"));
     assert_eq!(
         rendered, "(not available)",
-        "0 leak — the consumer never sees the title"
+        "0 leak - the consumer never sees the title"
     );
     assert!(
         !rendered.contains("Harden"),

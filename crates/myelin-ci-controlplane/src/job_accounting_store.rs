@@ -1,10 +1,3 @@
-//! Immutable per-job accounting receipts.
-//!
-//! The terminal reporter writes this row in the same PostgreSQL transaction as Storage's money
-//! settlement, CI's metering projection, claim consumption, and the `job.done` signal. A repeated
-//! completion may observe the existing row, but it is accepted only when every authoritative field
-//! is identical; a conflicting replay fails closed.
-
 use myelin_ci_sandbox::{PreparationPhase, PreparationTerminalDisposition, ResourceUsage};
 use myelin_flow::MicroUsd;
 use myelin_storage::TenantScope;
@@ -13,7 +6,6 @@ use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
 use sqlx::Row;
 
-/// Insert one immutable accounting receipt. Bind order is documented by [`CiJobAccountingStore`].
 pub const INSERT_CI_JOB_ACCOUNTING_QUERY: &str = "\
 INSERT INTO ci_job_accounting
   (tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, skipped,
@@ -23,7 +15,6 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $
 ON CONFLICT (tenant_id, job_id) DO NOTHING
 RETURNING job_id";
 
-/// Read all immutable fields after a conflict so an idempotent replay cannot hide divergence.
 pub const SELECT_CI_JOB_ACCOUNTING_QUERY: &str = "\
 SELECT region, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, skipped, cpu_seconds,
        mem_byte_seconds, pricing_revision, billed_minor_units, refunded_minor_units,
@@ -31,7 +22,6 @@ SELECT region, wf_run_id, ci_run_id, reserve_handle, passed, timed_out, skipped,
 FROM ci_job_accounting
 WHERE tenant_id = $1 AND job_id = $2";
 
-/// The complete terminal-accounting fact for one claimed CI job.
 #[derive(Clone, PartialEq, Eq)]
 pub struct CiJobAccountingRecord {
     pub tenant: TenantId,
@@ -41,25 +31,16 @@ pub struct CiJobAccountingRecord {
     pub reserve_handle: String,
     pub passed: bool,
     pub timed_out: bool,
-    /// True for a manifest job settled without execution because a dependency failed or the whole
-    /// run was cancelled before this job crossed the final launch fence.
     pub skipped: bool,
     pub usage: ResourceUsage,
     pub pricing_revision: String,
     pub billed: MicroUsd,
     pub refunded: MicroUsd,
-    /// Closed, machine-readable terminal meaning for v4 receipts. `None` identifies a v3-compatible
-    /// row, including fresh writes while production remains activation-gated to v3.
     pub disposition: Option<CiJobTerminalDisposition>,
-    /// The authoritative receipt for this row's selected write generation.
     pub completion_receipt: String,
-    /// V4 rows retain the exact v3 receipt in the byte-frozen legacy column so activation never
-    /// requires weakening or replacing its shipped v3 CHECK/UNIQUE constraints.
     pub legacy_completion_receipt_v3: Option<String>,
 }
 
-/// Closed terminal-accounting vocabulary. Preparation dispositions deliberately carry no usage,
-/// pass bit, or arbitrary text; those remain separate, independently validated accounting facts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiJobTerminalDisposition {
     WorkloadPassed,
@@ -160,9 +141,6 @@ impl CiJobTerminalDisposition {
     }
 }
 
-/// Bind a closed disposition to an existing deterministic v3 accounting receipt. Owners with
-/// distinct historical v3 domains (normal completion, supersession, skipped-before-start) can
-/// preserve those encoders byte-for-byte while converging on one v4 compatibility shape.
 pub(crate) fn disposition_receipt_v4(
     legacy_v3: &str,
     disposition: CiJobTerminalDisposition,
@@ -182,8 +160,6 @@ pub(crate) struct VersionedCiJobAccountingReceipt {
     pub legacy_completion_receipt_v3: Option<String>,
 }
 
-/// Select only the fresh-write representation. Replay readers remain dual-version regardless of
-/// this choice.
 pub(crate) fn versioned_accounting_receipt(
     write_version: CiJobAccountingWriteVersion,
     legacy_completion_receipt_v3: String,
@@ -231,16 +207,12 @@ pub enum CiJobAccountingWrite {
     ExactReplay,
 }
 
-/// Fresh-write format for immutable CI job accounting. Reads always understand both generations;
-/// production remains pinned to v3 until the fleet can safely replay v4 queue receipts and result
-/// summaries during a rolling deployment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiJobAccountingWriteVersion {
     V3,
     V4,
 }
 
-/// A safe-to-log refusal from the immutable accounting store.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiJobAccountingError {
     ScopeMismatch,
@@ -299,13 +271,10 @@ impl core::fmt::Debug for CiJobAccountingStore {
 }
 
 impl CiJobAccountingStore {
-    /// Production-safe constructor. Fresh writes remain v3 until every possible replay owner
-    /// understands v4; additive v4 columns are still readable.
     pub fn with_pg(pool: PgPool, region: Region) -> Self {
         Self::with_pg_and_write_version(pool, region, CiJobAccountingWriteVersion::V3)
     }
 
-    /// Explicit activation seam for tests and a future fleet-convergence switch.
     pub fn with_pg_and_write_version(
         pool: PgPool,
         region: Region,
@@ -326,10 +295,6 @@ impl CiJobAccountingStore {
         self.write_version
     }
 
-    /// Record or exactly verify a receipt on the caller's tenant-scoped transaction.
-    ///
-    /// Bind order: tenant, region, job, workflow run, CI run, reserve handle, verdict, timeout,
-    /// CPU-seconds, memory-byte-seconds, pricing revision, billed, refunded, completion receipt.
     pub async fn record_in_tx(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -429,9 +394,6 @@ impl CiJobAccountingStore {
         }
     }
 
-    /// Read the immutable receipt on the caller's scoped transaction. This is the terminal
-    /// redelivery path: an already-consumed claim reuses historical pricing instead of consulting
-    /// the current price table and accidentally repricing old work.
     pub async fn load_in_tx(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -495,7 +457,6 @@ impl CiJobAccountingStore {
         }))
     }
 
-    /// Convenience path for callers that need only the accounting receipt, not a larger co-commit.
     pub async fn record(
         &self,
         scope: &TenantScope,
@@ -662,8 +623,6 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_write_version_is_explicit_and_production_defaults_to_v3() {
-        // @residency-cell-pinned: lazy unit-test pool that never connects; the store built from it
-        // on the next line pins its region explicitly (`with_pg(pool, Region("fr-par"))`).
         let pool = sqlx::postgres::PgPoolOptions::new()
             .connect_lazy("postgres://unused:unused@127.0.0.1/unused")
             .unwrap();

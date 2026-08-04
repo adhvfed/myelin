@@ -1,20 +1,3 @@
-//! **CT-004d.2 chunk 4 — the durable `ci_run` writer (`CiRunStore`) round-trip + idempotency + GENUINE
-//! RLS isolation, PROVEN on live PG under the APP role (non-BYPASSRLS).**
-//!
-//! The co-commit atomicity (the `ci_run` ROW ⇄ dedup mark in one tx) is proven in ci-dispatch's
-//! `tests/integration_ci_ct004b_trigger_consumer.rs` (`chunk4_*`). THIS proves the store's own verbs
-//! against live Postgres:
-//!   1. **Round-trip:** `insert_ci_run` writes every column; `get_ci_run` reads them ALL back faithfully.
-//!   2. **Exact replay:** a second `insert_ci_run` of the SAME immutable row returns `false` only after
-//!      the mandatory second locking statement verifies it; a divergence is a typed collision.
-//!   3. **RLS (GENUINE — the `myelin_app` role, RLS ENFORCED, not BYPASSRLS):** a `get_ci_run` scoped
-//!      to tenant B CANNOT read tenant A's row even with A's `run_id` in hand — the `(tenant, region)`
-//!      RLS policy hides it (`with_tenant_tx` sets the GUC transaction-scoped; the app role has no
-//!      BYPASSRLS). This is the no-cross-tenant-query-path floor, live.
-//!
-//!   eval "$(scripts/dev-stack.sh env)"
-//!   cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_ct004d2_ci_run_store -- --nocapture
 #![cfg(feature = "integration")]
 
 mod common;
@@ -42,9 +25,6 @@ fn schema_name() -> String {
     format!("ci_ct004d2_{}", std::process::id())
 }
 
-/// A pool whose connections pin `search_path` to `schema` (so the store's unqualified `ci_run`
-/// resolves to the per-test schema's table). `url` selects the role (admin = owner/BYPASSRLS to build;
-/// app = RLS-ENFORCED to exercise).
 async fn pool_on(url: &str, schema: &str) -> PgPool {
     let schema = schema.to_string();
     sqlx::postgres::PgPoolOptions::new()
@@ -98,8 +78,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
 
-    // ── Build the schema + the FORCE-RLS ci_run table (the ONE platform tenant-scoping helper), grant
-    //    the app role USAGE + table privileges (mirrors integration_ci_p6). ──
     admin
         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
         .await
@@ -145,14 +123,12 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         .await
         .expect("grant dedup privileges");
 
-    // ── The store runs on the APP pool (RLS ENFORCED — no BYPASSRLS). ──
     let app = pool_on(&app_url(), &schema).await;
     let store = ci_run_store_factory(app.clone());
 
     let run_a = "11111111-1111-1111-1111-111111111111";
     let a = row("tenantA", run_a);
 
-    // (1) Round-trip: fresh insert → true; every column reads back faithfully.
     assert!(
         store.insert_ci_run(&a).await.expect("insert tenantA"),
         "a fresh row inserts (true)"
@@ -182,14 +158,13 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     assert_eq!(got.state, "queued");
     assert_eq!(got.correlation_id, "corr-1");
 
-    // (2) Idempotent only after exact immutable replay verification: false, one row.
     assert!(
         !store.insert_ci_run(&a).await.expect("re-insert tenantA"),
         "an exact redelivery is verified before returning false"
     );
     let n: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM ci_run WHERE run_id = $1::uuid")
         .bind(run_a)
-        .fetch_one(&admin) // count via admin (BYPASSRLS) — the ground truth is exactly one row.
+        .fetch_one(&admin)
         .await
         .unwrap();
     assert_eq!(
@@ -218,9 +193,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "producer-authored PR ordering authority round-trips durably"
     );
 
-    // Producer insertion takes the same exact group lock as starter classification/cancellation.
-    // Hold that lock independently and prove the real store cannot publish a newer generation
-    // behind a starter transaction that is still deciding the group's durable high-water mark.
     let mut held_group = admin.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind("myelin.ci.pr-run-supersession.v1:tenantA:fr-par:pr:team/web:43")
@@ -303,8 +275,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "PostgreSQL-equivalent UUID spelling/case is an exact replay, not a string collision"
     );
 
-    // (3) GENUINE RLS: a tenantB-scoped read CANNOT see tenantA's row even knowing its run_id (the app
-    //     role is RLS-enforced; with_tenant_tx sets the (tenant, region) GUC → the policy hides it).
     let cross = store
         .get_ci_run("tenantB", "fr-par", run_a)
         .await
@@ -314,8 +284,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "RLS: tenantB cannot read tenantA's ci_run (no cross-tenant query path)"
     );
 
-    // tenantB can write + read its OWN row (RLS admits the in-tenant path), including the same run
-    // UUID because the durable key is tenant-qualified.
     let run_b = "55555555-5555-5555-5555-555555555555";
     assert!(
         store
@@ -346,9 +314,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "the same run UUID in another tenant is a distinct fresh row"
     );
 
-    // (4) Every immutable field is collision checked. Region is special: the explicit region
-    // predicate + FORCE RLS make the conflicting row invisible, so it fails closed without region
-    // disclosure. All visible immutable differences report field names only.
     let immutable_fields = [
         "region",
         "project_id",
@@ -417,8 +382,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         }
     }
 
-    // Lifecycle advancement does not invalidate an exact reserve replay: mutable state, settlement,
-    // and timestamps are intentionally outside the immutable identity comparison.
     let advanced_run = run_id(30);
     let advanced = row("tenantA", &advanced_run);
     assert!(store.insert_ci_run(&advanced).await.unwrap());
@@ -439,7 +402,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "an exact immutable replay remains exact after lifecycle advancement"
     );
 
-    // Pseudonym erasure is the one sanctioned monotone change to an immutable identity edge.
     let erased_run = run_id(31);
     let erased = row("tenantA", &erased_run);
     assert!(store.insert_ci_run(&erased).await.unwrap());
@@ -458,8 +420,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "stored erased pseudonym accepts the pre-erasure exact replay"
     );
 
-    // Invalid reserve state is rejected before a transaction begins. Use a malformed UUID too: if
-    // SQL were touched first this would be Db, not the typed initial-state error.
     let mut invalid = row("tenant-invalid", "not-a-uuid");
     invalid.state = "running".into();
     assert_eq!(
@@ -483,8 +443,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "malformed UUID remains a loud database error"
     );
 
-    // Concurrent identical contenders: the loser waits for the winner's commit, then the mandatory
-    // second READ COMMITTED statement verifies it exactly.
     let identical = row("tenantA", &run_id(40));
     let identical_peer = identical.clone();
     let (identical_a, identical_b) = tokio::join!(
@@ -499,8 +457,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "concurrent exact contenders produce one fresh insert and one verified replay"
     );
 
-    // Concurrent divergent contenders: exactly one wins; the other receives the typed collision
-    // after observing the committed winner in its second statement.
     let divergent_a = row("tenantA", &run_id(41));
     let mut divergent_b = divergent_a.clone();
     divergent_b.definition_snapshot = "blake3:concurrent-other".into();
@@ -522,8 +478,6 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     }
     assert_eq!((fresh, collisions), (1, 1));
 
-    // The shared HandlerTx path has identical semantics. An exact replay can co-commit a dedup mark;
-    // a divergent replay propagates its typed error so the caller can roll that mark back atomically.
     let co_run = run_id(50);
     let co_original = row("tenantA", &co_run);
     assert!(store.insert_ci_run(&co_original).await.unwrap());

@@ -1,54 +1,14 @@
-//! # myelin-config — the env-driven CONFIG layer (the dev<->prod CONFIG SWAP)
-//!
-//! Code talks to STANDARD interfaces (Postgres, S3, Redis-protocol, NATS) so moving from the
-//! local docker-compose dev stack to the Scaleway (fr-par) prod backends is a CONFIG change,
-//! not a code change. This crate is that seam: it reads the endpoints from the environment and
-//! hands them to the trait impls (the OLTP client in myelin-storage/-substrate, the BlobStore
-//! object impl, the cache, the NATS BusTransport) — which all live behind the `integration`
-//! cargo feature.
-//!
-//! ## The env-var contract
-//!
-//! | var              | meaning                                  | dev default                                                  |
-//! |------------------|------------------------------------------|--------------------------------------------------------------|
-//! | `DATABASE_URL`   | Postgres runtime (OLTP/outbox/ReBAC)     | `postgres://myelin_app:myelin_app_pw@localhost:5433/myelin`  |
-//! | `DATABASE_MIGRATION_URL` | Postgres migration-only credential | `postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin` |
-//! | `S3_ENDPOINT`    | S3-compatible object-store endpoint      | `http://localhost:9000`                                      |
-//! | `S3_REGION`      | S3 region label                          | `fr-par`                                                     |
-//! | `S3_ACCESS_KEY`  | S3 access key id                         | `myelin_dev_access`                                          |
-//! | `S3_SECRET_KEY`  | S3 secret access key                     | `myelin_dev_secret`                                          |
-//! | `S3_BUCKET`      | default object-store bucket              | `myelin-dev`                                                 |
-//! | `REDIS_URL`      | Valkey/Redis cache URL                   | `redis://localhost:6380`                                     |
-//! | `NATS_URL`       | NATS JetStream bus URL                   | `nats://localhost:4222`                                      |
-//! | `MYELIN_REGION`  | data-residency region pin                | `fr-par`                                                     |
-//!
-//! Dev defaults point at `docker-compose.dev.yml`. In prod every var is supplied by the
-//! environment and points at Scaleway (FR) — see `docs/dev-stack.md` for the endpoint mapping.
-//!
-//! ## Object-store path-style addressing
-//!
-//! [`S3Config::force_path_style`] is `true` so `aws-sdk-s3` addresses RustFS as
-//! `http://endpoint/bucket/key` rather than the virtual-host `http://bucket.endpoint/key`
-//! form (RustFS/MinIO-class servers want path-style). The same flag works for Scaleway.
-
 #![forbid(unsafe_code)]
 
 use std::{env, io::Read as _};
 
-/// Maximum accepted OIDC JWK Set document size for both bootstrap and HTTPS refresh paths.
 pub const OIDC_JWKS_MAX_BYTES: usize = 1024 * 1024;
 
-/// An error reading the env config. Loud + typed: a missing required var in prod is a
-/// fail-fast at boot (architecture §3.2 — never a silent fallback to a wrong endpoint).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfigError {
-    /// A required env var was absent and the chosen mode forbids a dev default.
     Missing(&'static str),
-    /// A var was present but its value was not valid UTF-8 / empty where non-empty is required.
     Invalid {
-        /// The offending env var name.
         var: &'static str,
-        /// Why it was rejected.
         reason: String,
     },
 }
@@ -64,10 +24,8 @@ impl core::fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-/// The default residency region (the prod pin lives in `MYELIN_REGION=fr-par`).
 pub const DEFAULT_REGION: &str = "fr-par";
 
-// ---- dev defaults: every one points at docker-compose.dev.yml ----
 const DEV_DATABASE_URL: &str = "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin";
 const DEV_DATABASE_MIGRATION_URL: &str =
     "postgres://myelin_admin:myelin_dev_pw@localhost:5433/myelin";
@@ -79,70 +37,28 @@ const DEV_S3_BUCKET: &str = "myelin-dev";
 const DEV_REDIS_URL: &str = "redis://localhost:6380";
 const DEV_NATS_URL: &str = "nats://localhost:4222";
 
-/// How [`MyelinConfig::from_env`] treats absent vars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
-    /// Dev: a missing var falls back to the docker-compose default (developer convenience).
     DevDefaults,
-    /// Prod: every endpoint var MUST be present (fail-fast at boot, no silent dev fallback).
-    /// `MYELIN_REGION` still defaults to [`DEFAULT_REGION`] (`fr-par`) — the residency pin.
     RequireEnv,
 }
 
-/// The validated, env-first runtime config — the dev<->prod swap target.
-///
-/// R0.7-C: `Debug` is hand-written (NOT derived) because [`MyelinConfig::database_url`],
-/// [`MyelinConfig::database_migration_url`], [`MyelinConfig::redis_url`], and
-/// [`MyelinConfig::nats_url`] are connection DSNs
-/// that can embed a password in their userinfo
-/// (`postgres://user:PASSWORD@host/db`); a derived `{:?}` in a log line, a panic, or an error
-/// context would print that password in clear. The redacting impl below prints `<redacted>` for
-/// every credential-bearing DSN (and defers S3 credential redaction to [`S3Config`]'s own impl).
 #[derive(Clone, PartialEq, Eq)]
 pub struct MyelinConfig {
-    /// Postgres OLTP connection string (OLTP + outbox + ReBAC tuple store + audit).
     pub database_url: String,
-    /// Postgres migration-only connection string. This privileged credential is consumed only by
-    /// the storage bootstrap and must never be retained by a serving provider.
     pub database_migration_url: String,
-    /// The S3-compatible object-store config (RustFS in dev, Scaleway Object Storage in prod).
     pub s3: S3Config,
-    /// Valkey/Redis cache URL.
     pub redis_url: String,
-    /// NATS JetStream bus URL.
     pub nats_url: String,
-    /// The data-residency region pin (`fr-par` in prod — the residency-pin lint's prod value).
     pub region: String,
-    /// **R2.5 — the OPTIONAL real-OIDC login surface.** `None` means no IdP is configured and the
-    /// edge keeps the refuse-not-mock human-login default (a boot with no OIDC configured still
-    /// succeeds — OIDC is opt-in, we do NOT force every prod deploy to configure an IdP before this
-    /// lands). `Some` carries the issuer/audience the token is validated against and an optional
-    /// bootstrap JWKS JSON. Production also requires the provider's HTTPS
-    /// `jwks_uri` so signing-key rotation does not require an edge restart. A PARTIALLY-set OIDC
-    /// surface is a loud [`ConfigError`]
-    /// (misconfiguration is never coerced into a silent half-config).
     pub oidc: Option<OidcSettings>,
 }
 
-/// **The env-driven OIDC login surface (R2.5).** The issuer + audience an OIDC ID token is validated
-/// against, an optional bootstrap JWKS JSON document (RFC 7517), and the provider's refresh URI.
-/// The config crate remains network-free; the edge fetches and validates refreshed key sets.
-///
-/// R0.7-C consistency: `Debug` is hand-written. The issuer/audience are NOT secrets (they identify
-/// the IdP + this RP), and a JWKS carries only PUBLIC keys — but the document can be large, so its
-/// `Debug` prints a byte-length summary. The URI is shown only as configured/unconfigured because a
-/// malformed value could contain user-info credentials before the edge validates it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct OidcSettings {
-    /// The exact `iss` an OIDC ID token must carry (the configured IdP issuer).
     pub issuer: String,
-    /// The audience this relying-party IS — the token's `aud` must contain it.
     pub audience: String,
-    /// Optional bootstrap JWKS. Keeping this alongside the URI lets a restart use a known-good set
-    /// when the IdP is temporarily unavailable.
     pub jwks_json: Option<String>,
-    /// HTTPS URL of the provider's JWK Set document. Required in production; optional for hermetic
-    /// development configurations that inject only a static set.
     pub jwks_uri: Option<String>,
 }
 
@@ -163,32 +79,17 @@ impl core::fmt::Debug for OidcSettings {
     }
 }
 
-/// The S3-compatible object-store config (the [`MyelinConfig::s3`] slice). Consumed by the
-/// `aws-sdk-s3` BlobStore object impl behind the `integration` feature.
-///
-/// R0.7-C: `Debug` is hand-written (NOT derived) because [`S3Config::access_key`] and
-/// [`S3Config::secret_key`] are plaintext credentials; a derived `{:?}` (in a log line, a panic,
-/// or an error context) would print the S3 secret in clear. The redacting impl below prints
-/// `<redacted>` for both credential fields; the non-secret fields print normally.
 #[derive(Clone, PartialEq, Eq)]
 pub struct S3Config {
-    /// Custom endpoint URL (RustFS/Scaleway) — NOT the AWS default endpoint.
     pub endpoint: String,
-    /// Region label.
     pub region: String,
-    /// Static access key id (dev creds in dev; Scaleway IAM in prod).
     pub access_key: String,
-    /// Static secret access key.
     pub secret_key: String,
-    /// Default bucket.
     pub bucket: String,
-    /// Use path-style addressing (`true` for RustFS/MinIO-class + Scaleway). The
-    /// `aws-sdk-s3` `force_path_style` knob.
     pub force_path_style: bool,
 }
 
 impl core::fmt::Debug for S3Config {
-    /// R0.7-C: redact the credential fields so a `{:?}` never prints the S3 secret/access key.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("S3Config")
             .field("endpoint", &self.endpoint)
@@ -202,9 +103,6 @@ impl core::fmt::Debug for S3Config {
 }
 
 impl core::fmt::Debug for MyelinConfig {
-    /// R0.7-C: redact every credential-bearing DSN so a `{:?}` never prints the password embedded
-    /// in its userinfo. `s3` defers to [`S3Config`]'s own redacting impl; only `region` prints
-    /// normally.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("MyelinConfig")
             .field("database_url", &"<redacted>")
@@ -219,11 +117,6 @@ impl core::fmt::Debug for MyelinConfig {
 }
 
 impl MyelinConfig {
-    /// Read the config from the process environment using `mode`.
-    ///
-    /// In [`Mode::DevDefaults`] an absent var falls back to its docker-compose default. In
-    /// [`Mode::RequireEnv`] (prod) an absent endpoint var is a [`ConfigError::Missing`]
-    /// (fail-fast). `MYELIN_REGION` defaults to `fr-par` in BOTH modes — the residency pin.
     pub fn from_env(mode: Mode) -> Result<MyelinConfig, ConfigError> {
         let database_url = req(mode, "DATABASE_URL", DEV_DATABASE_URL)?;
         let database_migration_url =
@@ -240,13 +133,10 @@ impl MyelinConfig {
             access_key: req(mode, "S3_ACCESS_KEY", DEV_S3_ACCESS_KEY)?,
             secret_key: req(mode, "S3_SECRET_KEY", DEV_S3_SECRET_KEY)?,
             bucket: req(mode, "S3_BUCKET", DEV_S3_BUCKET)?,
-            // Path-style is the correct addressing for RustFS and Scaleway alike.
             force_path_style: true,
         };
         let redis_url = req(mode, "REDIS_URL", DEV_REDIS_URL)?;
         let nats_url = req(mode, "NATS_URL", DEV_NATS_URL)?;
-        // MYELIN_REGION is the residency pin: it defaults to fr-par in BOTH modes (the lint's
-        // prod value). An empty value is rejected — a blank region is never a valid pin.
         let region = match read(mode, "MYELIN_REGION") {
             Some(v) if v.trim().is_empty() => {
                 return Err(ConfigError::Invalid {
@@ -258,8 +148,6 @@ impl MyelinConfig {
             None => DEFAULT_REGION.to_string(),
         };
 
-        // R2.5 — the OPTIONAL OIDC login surface. It is opt-in in BOTH modes (absent → None → the
-        // edge keeps refuse-not-mock login, boot succeeds); a PARTIAL config is a loud error.
         let oidc = oidc_from_env(mode)?;
 
         Ok(MyelinConfig {
@@ -273,15 +161,11 @@ impl MyelinConfig {
         })
     }
 
-    /// Convenience: the dev config (the docker-compose stack) with no env reads required.
     pub fn dev() -> MyelinConfig {
-        // Cannot fail: every default is a non-empty literal.
         MyelinConfig::from_env(Mode::DevDefaults).expect("dev defaults are always valid")
     }
 }
 
-/// Read an env var, returning `None` for absent OR present-but-empty (an empty endpoint is
-/// treated as unset so a stray `VAR=` does not become a silent bad endpoint).
 fn read(_mode: Mode, var: &'static str) -> Option<String> {
     match env::var(var) {
         Ok(v) if !v.is_empty() => Some(v),
@@ -289,7 +173,6 @@ fn read(_mode: Mode, var: &'static str) -> Option<String> {
     }
 }
 
-/// Resolve a required endpoint var per `mode`: dev falls back to `dev_default`; prod fails fast.
 fn req(mode: Mode, var: &'static str, dev_default: &str) -> Result<String, ConfigError> {
     match env::var(var) {
         Ok(v) if v.trim().is_empty() => Err(ConfigError::Invalid {
@@ -349,15 +232,6 @@ fn read_jwks_file(path: &str) -> Result<String, ConfigError> {
     bounded_jwks(document, "MYELIN_OIDC_JWKS_FILE")
 }
 
-/// Resolve the OPTIONAL OIDC login surface (R2.5). OIDC is opt-in in BOTH modes:
-/// - **absent** (none of the OIDC vars set) → `Ok(None)` — the edge keeps refuse-not-mock human
-///   login and boot succeeds (we do NOT force every prod deploy to configure an IdP before this
-///   lands);
-/// - **fully set** (`MYELIN_OIDC_ISSUER`, `MYELIN_OIDC_AUDIENCE`, production
-///   `MYELIN_OIDC_JWKS_URI`, and optionally exactly one bootstrap source) → `Ok(Some(..))`;
-/// - **partially set** (any OIDC var present but the set is incomplete, or BOTH JWKS sources set) →
-///   a loud [`ConfigError`] — a half-configured IdP is a misconfiguration, never silently ignored.
-///
 fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
     let issuer = read(mode, "MYELIN_OIDC_ISSUER");
     let audience = read(mode, "MYELIN_OIDC_AUDIENCE");
@@ -365,7 +239,6 @@ fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
     let jwks_file = read(mode, "MYELIN_OIDC_JWKS_FILE");
     let jwks_uri = read(mode, "MYELIN_OIDC_JWKS_URI");
 
-    // OIDC is fully absent → not configured.
     if issuer.is_none()
         && audience.is_none()
         && jwks_inline.is_none()
@@ -375,7 +248,6 @@ fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
         return Ok(None);
     }
 
-    // Any OIDC var present ⇒ the full set is required (partial config fails loud).
     let issuer = non_empty(
         issuer.ok_or(ConfigError::Missing("MYELIN_OIDC_ISSUER"))?,
         "MYELIN_OIDC_ISSUER",
@@ -388,7 +260,7 @@ fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
         (Some(_), Some(_)) => {
             return Err(ConfigError::Invalid {
                 var: "MYELIN_OIDC_JWKS",
-                reason: "set only ONE JWKS source — MYELIN_OIDC_JWKS (inline JSON) OR \
+                reason: "set only ONE JWKS source - MYELIN_OIDC_JWKS (inline JSON) OR \
                          MYELIN_OIDC_JWKS_FILE (a path), not both"
                     .into(),
             })
@@ -418,9 +290,6 @@ fn oidc_from_env(mode: Mode) -> Result<Option<OidcSettings>, ConfigError> {
 mod tests {
     use super::*;
 
-    // These tests mutate the process env, so they MUST run serialized. We gate the whole
-    // module behind a single mutex to avoid cross-test env races (cargo runs tests in
-    // parallel threads within a binary).
     use std::sync::Mutex;
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -459,7 +328,6 @@ mod tests {
         assert!(cfg.s3.force_path_style);
         assert_eq!(cfg.redis_url, "redis://localhost:6380");
         assert_eq!(cfg.nats_url, "nats://localhost:4222");
-        // The residency pin defaults to fr-par.
         assert_eq!(cfg.region, "fr-par");
     }
 
@@ -523,7 +391,6 @@ mod tests {
     fn region_pin_defaults_fr_par_even_in_prod() {
         let _g = ENV_LOCK.lock().unwrap();
         clear();
-        // Supply every endpoint var but NOT MYELIN_REGION.
         env::set_var("DATABASE_URL", "postgres://prod/db");
         env::set_var("DATABASE_MIGRATION_URL", "postgres://migrator@prod/db");
         env::set_var("S3_ENDPOINT", "https://s3.fr-par.scw.cloud");
@@ -551,8 +418,6 @@ mod tests {
         clear();
     }
 
-    /// R0.7-C: a `{:?}` of the config must NOT contain the S3 secret / access key nor the DB
-    /// password embedded in the DSN — it must print the `<redacted>` marker instead.
     #[test]
     fn debug_redacts_secrets() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -567,8 +432,6 @@ mod tests {
         );
         env::set_var("S3_ENDPOINT", "https://s3.fr-par.scw.cloud");
         env::set_var("S3_REGION", "fr-par");
-        // Keep the planted credential effective at runtime without making this source blob match
-        // the Git wire's own reject-before-promote scanner.
         let access_key = ["AK", "IA_SECRET_ACCESS_ID"].concat();
         env::set_var("S3_ACCESS_KEY", &access_key);
         env::set_var("S3_SECRET_KEY", "TOP_SECRET_S3_KEY_MATERIAL");
@@ -577,7 +440,6 @@ mod tests {
         env::set_var("NATS_URL", "nats://natsuser:NATS_SECRET_PW@prod:4222");
         let cfg = MyelinConfig::from_env(Mode::RequireEnv).unwrap();
 
-        // S3Config on its own redacts both credential fields.
         let s3_dbg = format!("{:?}", cfg.s3);
         assert!(!s3_dbg.contains(&access_key), "access_key leaked: {s3_dbg}");
         assert!(
@@ -593,7 +455,6 @@ mod tests {
             "non-secret bucket should still print: {s3_dbg}"
         );
 
-        // The whole config's Debug redacts the S3 secret AND the DSN passwords.
         let dbg = format!("{cfg:?}");
         assert!(
             !dbg.contains("TOP_SECRET_S3_KEY_MATERIAL"),
@@ -622,8 +483,6 @@ mod tests {
         clear();
     }
 
-    /// R2.5: OIDC is opt-in. With no OIDC vars set, `oidc` is `None` in BOTH modes — the edge keeps
-    /// refuse-not-mock login and boot succeeds (dev AND a prod deploy that has not configured an IdP).
     #[test]
     fn oidc_absent_is_none_and_boots() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -632,7 +491,6 @@ mod tests {
             .unwrap()
             .oidc
             .is_none());
-        // A fully-configured prod env (no OIDC) still boots with oidc == None.
         env::set_var("DATABASE_URL", "postgres://prod/db");
         env::set_var("DATABASE_MIGRATION_URL", "postgres://migrator@prod/db");
         env::set_var("S3_ENDPOINT", "https://s3.fr-par.scw.cloud");
@@ -649,7 +507,6 @@ mod tests {
         clear();
     }
 
-    /// R2.5: a fully-set OIDC surface (issuer + audience + inline JWKS JSON) parses into `Some`.
     #[test]
     fn oidc_fully_set_is_wired() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -664,7 +521,6 @@ mod tests {
         assert_eq!(oidc.audience, "myelin-rp");
         assert_eq!(oidc.jwks_json.as_deref(), Some(jwks));
         assert_eq!(oidc.jwks_uri, None);
-        // The JWKS document (public keys) is not dumped in Debug — a byte summary instead.
         let dbg = format!("{oidc:?}");
         assert!(
             dbg.contains("<"),
@@ -677,8 +533,6 @@ mod tests {
         clear();
     }
 
-    /// Production OIDC requires a refresh URI even when a bootstrap JWKS is supplied. A URI-only
-    /// configuration is valid and lets the edge fetch its initial key set at boot.
     #[test]
     fn production_oidc_requires_refresh_uri() {
         let _g = ENV_LOCK.lock().unwrap();
@@ -720,21 +574,16 @@ mod tests {
         assert!(dbg.contains("<configured>"));
     }
 
-    /// R2.5: a PARTIAL OIDC surface (issuer set, JWKS + audience missing) fails LOUD — a
-    /// half-configured IdP is a misconfiguration, never silently ignored.
     #[test]
     fn oidc_partial_fails_loud() {
         let _g = ENV_LOCK.lock().unwrap();
         clear();
-        // Only the issuer → missing audience is the first loud error.
         env::set_var("MYELIN_OIDC_ISSUER", "https://idp.example.com");
         let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
         assert_eq!(err, ConfigError::Missing("MYELIN_OIDC_AUDIENCE"));
-        // Issuer + audience but NO JWKS source → missing JWKS.
         env::set_var("MYELIN_OIDC_AUDIENCE", "myelin-rp");
         let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
         assert_eq!(err, ConfigError::Missing("MYELIN_OIDC_JWKS"));
-        // BOTH JWKS sources set → ambiguous, loud.
         env::set_var("MYELIN_OIDC_JWKS", "{}");
         env::set_var("MYELIN_OIDC_JWKS_FILE", "/tmp/nope.json");
         let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
@@ -780,8 +629,6 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap();
         clear();
         env::set_var("MYELIN_REGION", "");
-        // Empty var is treated as unset by `read`, so it falls back to the pin — NOT rejected.
-        // To hit the Invalid branch the var must be present-and-whitespace.
         env::set_var("MYELIN_REGION", "   ");
         let err = MyelinConfig::from_env(Mode::DevDefaults).unwrap_err();
         assert_eq!(

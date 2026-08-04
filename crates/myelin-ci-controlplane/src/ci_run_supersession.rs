@@ -1,11 +1,3 @@
-//! Durable newest-head supersession for pull-request CI runs.
-//!
-//! The Git producer supplies the only ordering authority: a positive `git_pr.version` persisted as
-//! `ci_run.pr_head_generation`. This module serializes starters for one canonical PR group, cancels
-//! only strictly older generations (with rolling-upgrade NULL rows treated as legacy-oldest), and
-//! co-commits Flow termination, pre-launch queue cancellation, Storage settlement, CI projection,
-//! immutable accounting receipts, and the `ci_run` lifecycle transition.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -130,7 +122,6 @@ impl std::fmt::Display for CiRunSupersessionError {
 
 impl std::error::Error for CiRunSupersessionError {}
 
-/// Exact-tenant run-level supersession authority.
 #[derive(Clone)]
 pub struct PgCiRunSupersession {
     pool: sqlx::PgPool,
@@ -189,8 +180,6 @@ impl PgCiRunSupersession {
         })
     }
 
-    /// Serialize all starters for this exact canonical PR group. Hash collisions only serialize
-    /// unrelated groups; they cannot merge authority or alter the generation comparison.
     pub(crate) async fn lock_group_on_conn(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -289,8 +278,6 @@ impl PgCiRunSupersession {
         Ok(())
     }
 
-    /// Cancel every strictly older active peer after the replacement run is fully materialized in
-    /// this same transaction. Equal positive generations and legacy-vs-legacy rows are unordered.
     pub(crate) async fn cancel_older_on_conn(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -351,8 +338,6 @@ impl PgCiRunSupersession {
         .await
     }
 
-    /// Every retained generation is durable high-water authority, including terminal runs. A
-    /// delayed lower generation must never become current merely because the newer run finished.
     async fn generation_peers(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -436,10 +421,6 @@ impl PgCiRunSupersession {
                 "manifest contains duplicate job identity",
             ));
         }
-        // Flow owns creation of durable dispatch rows. Lock and terminalize it before taking the
-        // queue snapshot so no drive can insert a previously absent manifest job behind
-        // cancellation. Reporter transactions take this same workflow lock before queue/accounting
-        // locks, establishing one lock order for cancellation and terminal reports.
         let flow_outcome = self
             .executor
             .cancel_on_conn(conn, &RunId(peer.wf_run_id.clone()), SUPERSEDED_REASON)
@@ -772,8 +753,6 @@ impl PgCiRunSupersession {
                 markup: row.markup,
             })
             .collect();
-        // Re-settlement is read/verify-only for an already settled reservation: Storage checks the
-        // complete ordered unit log and reconstructs billed/refunded from the durable reservation.
         let settlement = self
             .ledger
             .settle_in_tx(
@@ -939,9 +918,6 @@ impl PgCiRunSupersession {
         Ok((usage, prelaunch))
     }
 
-    /// Reconcile one cancelled launched job whose execution lease expired before its runner could
-    /// report measured usage. The immutable manifest ceiling is charged conservatively: this is an
-    /// operational-capacity safety bookend, never commercial billing.
     pub async fn reconcile_abandoned_job(
         &self,
         wf_run_id: &str,
@@ -1103,8 +1079,6 @@ impl From<myelin_storage::PgError> for CiRunSupersessionError {
     }
 }
 
-/// Re-emit the cancelled per-context check set after the final launched job reports and the run's
-/// reserve/settle bookend becomes complete. The caller owns the exact reporter transaction.
 pub(crate) async fn emit_settled_cancelled_checks_on_conn(
     conn: &mut sqlx::PgConnection,
     tenant: &TenantId,

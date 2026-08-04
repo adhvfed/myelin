@@ -1,26 +1,3 @@
-//! **CI-P12 / P-355 — the scheduler pull-lease claim + concurrency-serialize + the dead-runner
-//! reaper, PROVEN against the live dev-stack Postgres.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build`/`cargo test
-//! --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_p12_scheduler_claim -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires: the arch 02 §2.1 claim runs as a
-//! `FOR UPDATE SKIP LOCKED` query against real Postgres over the real `job_queue` table + the
-//! `jq_claimable`/`jq_serialize`/`jq_idem` indexes — proving:
-//!   1. the claim leases the highest-priority/fairest/in-region/label-eligible/trust-allowed job
-//!      (lane > deficit > enqueued_at), under real `FOR UPDATE SKIP LOCKED` (two concurrent runners
-//!      claim DIFFERENT rows, never the same one — 0 double-claims);
-//!   2. the `deploy:%` concurrency serialize holds (a second `deploy:prod` is NOT claimable while the
-//!      first runs — the claim's `NOT EXISTS` + the `jq_serialize` partial unique);
-//!   3. the dead-runner reaper re-queues an expired lease in place (0 orphans, 0 duplicate enqueues —
-//!      the `jq_idem` unique rejects a second enqueue of the same `(tenant_id, idem_token)`);
-//!   4. cancel-superseded terminalises a prior PR head, keeping the latest.
-//!
-//! The drill is registered red-until-proven and flips green ONLY here.
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
@@ -39,9 +16,6 @@ fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// A deterministic UUID for a human-readable job/run name (the `job_id`/`run_id` columns are `uuid`).
-/// Derived from an md5 of the name, formatted 8-4-4-4-12 — stable across runs so a claim's RETURNING
-/// `job_id` (a uuid) can be asserted equal to `id("jint")`.
 fn id(name: &str) -> String {
     let d = md5_hex(name.as_bytes());
     format!(
@@ -54,9 +28,7 @@ fn id(name: &str) -> String {
     )
 }
 
-/// Minimal MD5 (test-only; avoids a new crate dep) → 32-hex string.
 fn md5_hex(input: &[u8]) -> String {
-    // RFC 1321 MD5.
     const S: [u32; 64] = [
         7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20, 5,
         9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 6, 10,
@@ -121,7 +93,6 @@ fn md5_hex(input: &[u8]) -> String {
     out
 }
 
-/// Insert one queued job row (the enqueue shape). The args mirror the `job_queue` columns.
 #[allow(clippy::too_many_arguments)]
 async fn enqueue(
     conn: &mut sqlx::PgConnection,
@@ -175,14 +146,11 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
     let suffix = std::process::id();
     let tbl = format!("job_queue_p355_{suffix}");
 
-    // ── 1. Apply the REAL forward-only job_queue CREATE + the three claim indexes (suffixed). ──
     let create = CREATE_JOB_QUEUE_DDL.replace("EXISTS job_queue (", &format!("EXISTS {tbl} ("));
     sqlx::query(&create)
         .execute(&admin)
         .await
         .expect("apply the job_queue CREATE TABLE forward-only");
-    // The CT-004d.2 claim-generation + completion-receipt columns (the `ci_0004a` sub-migration),
-    // rewritten to the suffixed table.
     let alter = ALTER_JOB_QUEUE_ADD_COMPLETION_DDL.replace("job_queue", &tbl);
     sqlx::query(&alter)
         .execute(&admin)
@@ -208,8 +176,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         .execute(&admin)
         .await
         .expect("apply the job_queue claim-window expand");
-    // The indexes (rewritten to the suffixed table; CONCURRENTLY needs its own tx outside a pool tx —
-    // a fresh empty table makes a plain index create lock-free, so drop CONCURRENTLY for the test DDL).
     for (name, idx) in CREATE_JOB_QUEUE_INDEXES_DDL {
         let idx = idx
             .replace("ON job_queue ", &format!("ON {tbl} "))
@@ -224,8 +190,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
             .unwrap_or_else(|e| panic!("apply index {name}: {e}"));
     }
 
-    // The live CLAIM/REAP/CANCEL queries reference `job_queue` / `fair_deficit` by name; point them at
-    // the suffixed table (and a suffixed fair_deficit so the LEFT JOIN resolves).
     let fair = format!("fair_deficit_p355_{suffix}");
     sqlx::raw_sql(&format!(
         "CREATE TABLE IF NOT EXISTS {fair} (tenant_id text NOT NULL, region text NOT NULL, \
@@ -259,7 +223,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
 
     let mut conn = admin.acquire().await.unwrap();
 
-    // ── 2. Seed: an interactive, a batch (older), a deploy:prod, plus an out-of-region job. ──
     enqueue(
         &mut conn,
         &tbl,
@@ -312,7 +275,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
     .await
     .unwrap();
 
-    // ── 3. CLAIM (FOR UPDATE SKIP LOCKED): the in-region interactive job wins over the older batch. ──
     let runner_labels = "ARRAY['linux','gpu']::text[]";
     let allowed = "ARRAY['trusted','untrusted_fork']::text[]";
     let bind_claim = |region: &str, owner: &str| {
@@ -323,7 +285,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
             .replacen("$4", &format!("'{owner}'"), 1)
             .replace("$5", "'30'")
     };
-    // The claim returns `job_id` as a uuid; format it back to the string form `id()` produced.
     let claimed_uuid =
         |r: &sqlx::postgres::PgRow| r.get::<sqlx::types::Uuid, _>("job_id").to_string();
     let row = sqlx::query(&bind_claim("fr-par", "r1"))
@@ -344,7 +305,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         "the returned token-mint lifetime is derived from the same PostgreSQL statement clock as the lease"
     );
 
-    // The claimed row is leased with an owner + a future expiry.
     let leased = sqlx::query(&format!(
         "SELECT state, lease_owner, lease_expires > now() AS in_future FROM {tbl} WHERE job_id='{}'",
         id("jint")
@@ -359,7 +319,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         "the lease has a future expiry"
     );
 
-    // ── 4. SERIALIZE: two deploy:prod jobs → at most ONE runs at a time. ──
     enqueue(
         &mut conn,
         &tbl,
@@ -394,8 +353,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
     )
     .await
     .unwrap();
-    // Claim repeatedly until a deploy job is reached (batch outranks deploy in the lane ORDER BY, so
-    // the queued jbatch is claimed before either deploy). The FIRST deploy claimed is marked running.
     let mut first_deploy: Option<String> = None;
     for owner in ["rd", "rd2", "rd3"] {
         let Some(r) = sqlx::query(&bind_claim("fr-par", owner))
@@ -418,7 +375,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
     .execute(&mut *conn)
     .await
     .unwrap();
-    // The OTHER deploy:prod is NOT claimable while this one runs (the serialize NOT EXISTS predicate).
     let other = sqlx::query(&bind_claim("fr-par", "rd-other"))
         .fetch_optional(&mut *conn)
         .await
@@ -431,7 +387,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         );
     }
 
-    // The serialize partial-unique index forbids two RUNNING deploy:prod rows at once.
     let other_deploy = if first_deploy == id("d1") {
         id("d2")
     } else {
@@ -447,8 +402,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         "the jq_serialize partial unique index forbids a second RUNNING deploy:prod (serialize)"
     );
 
-    // ── 5. REAPER: kill a runner mid-lease → reaper re-queues within TTL, 0 orphans, 0 dup enqueue. ──
-    // jint is leased by r1 (ttl 30). Force its lease into the past (the runner died, no heartbeat).
     sqlx::query(&format!(
         "UPDATE {tbl} SET lease_expires = now() - interval '1 second' WHERE job_id='{}'",
         id("jint")
@@ -479,7 +432,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         "reaped job is re-queued (claimable)"
     );
 
-    // 0 duplicate enqueues: a redundant SCHEDULE_AND_RUN_JOB retry (same idem_token) inserts 0 rows.
     let before_count: i64 = sqlx::query(&format!("SELECT count(*) AS n FROM {tbl}"))
         .fetch_one(&mut *conn)
         .await
@@ -517,7 +469,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         "0 duplicate enqueues (the idempotent re-dispatch)"
     );
 
-    // ── 6. CANCEL-SUPERSEDED: a new PR head terminalises the prior head. ──
     enqueue(
         &mut conn,
         &tbl,
@@ -589,7 +540,6 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         "the latest head h2 stays schedulable"
     );
 
-    // ── cleanup ──
     sqlx::query(&format!("DROP TABLE {tbl}"))
         .execute(&admin)
         .await

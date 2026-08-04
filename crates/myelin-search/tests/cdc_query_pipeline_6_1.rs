@@ -1,30 +1,3 @@
-//! # CDC — the Search **query pipeline** (contract 6.1 provider) + the **`list_objects` consumer**
-//! (contract 4.3) (SRCH-P08 → P-171).
-//!
-//! **Architecture:** `search-and-indexing.md` §4.2 / §4.2.1 (the permission-aware query pipeline:
-//! `acl ← list_objects → compile(ast) → CONJOIN acl_clause into EVERY branch → engine.search at the
-//! posting-list level → rank/fuse`; the bounded-set `Ids/All/None/NotIds` lowering; All → no clause,
-//! None → short-circuit empty). Reconciliation `00-reconciliation-decisions.md` OQ-E (the `SetExpr`
-//! push-down frozen — `Ids/All/None` are the bounded-set forms lowered here; the relational forms
-//! are SRCH-P09).
-//!
-//! - **PROVIDER (6.1)** = Search's ONE public [`myelin_search::query`] entry — `query(ast, viewer,
-//!   zookie?, page) -> RankedResults`, ALWAYS conjoining the OQ-E filter (the
-//!   `search-requires-acl-filter` lint, contract 1.6). This test pins the provider's observable
-//!   contract: the answer is permission-filtered (a denied doc never surfaces), tenant-confined
-//!   (cross-tenant 0, SRCH-D3), and computed with exactly ONE `list_objects` call (no N+1).
-//! - **CONSUMER (4.3)** = Search is one of the five named `SetExpr` consumers. It consumes
-//!   `list_objects -> Ids{ids,zookie} | Filter{set_expr, zookie}` (NO Id signature change) and lowers
-//!   the bounded-set modes (`Ids/All/None/NotIds`) to the engine [`myelin_search::AclFilter`]. This
-//!   test pins the consumer side: every bounded-set mode lowers to the expected engine behaviour, and
-//!   a RELATIONAL form is a loud floor (SRCH-P09), never a silent widen.
-//!
-//! The dated green artifact (2026-06-20): the query path conjoins the ACL filter into every branch
-//! BEFORE scoring; the bounded-set `Ids/All/None/NotIds` modes lower correctly; cross-tenant results
-//! are 0 (SRCH-D3); the query issues exactly one `list_objects` (no N+1); the relational forms are a
-//! named floor (SRCH-P09). If the 4.3 `ListObjectsResult`/`SetExpr` shape or the 6.1 query contract
-//! drifts, this stops compiling/passing — that is the contract.
-
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -102,13 +75,9 @@ fn ast() -> QueryAst {
     .expect("within cost bounds")
 }
 
-/// A scripted [`ListObjectsPort`] returning a canned answer + counting calls (the 4.3 consumer CDC
-/// provider double).
 struct ScriptedAuthz {
     answer: ListObjectsResult,
     calls: AtomicU64,
-    /// The canned reverse-index JOIN answer (SRCH-P09) — `None` if the test exercises only the
-    /// bounded-set path (then a relational leaf fails closed via the default `resolve_relation`).
     reverse: Option<ReverseIndexAnswer>,
     resolve_calls: AtomicU64,
 }
@@ -138,8 +107,6 @@ impl ListObjectsPort for ScriptedAuthz {
         ty: &ObjectType,
         _at: &Consistency,
     ) -> AuthzResult<ListObjectsResult> {
-        // **The 4.3 consumer-side contract:** Search asks for `read` over the object type — pin it so
-        // an Id-side rename of the permission/type shape breaks this CDC now.
         assert_eq!(
             permission,
             &Permission("read".into()),
@@ -191,8 +158,6 @@ fn run(
     (res, authz.calls.load(Ordering::Relaxed), stats)
 }
 
-/// **PROVIDER 6.1 + CONSUMER 4.3 (Ids mode): a materialised allow-set surfaces only the visible
-/// doc, with exactly ONE list_objects call.**
 #[test]
 fn cdc_6_1_ids_mode_filters_and_no_n_plus_1() {
     let be = corpus();
@@ -218,7 +183,6 @@ fn cdc_6_1_ids_mode_filters_and_no_n_plus_1() {
     assert_eq!(stats.list_objects_calls(), 1);
 }
 
-/// **CONSUMER 4.3 (Filter{All} mode): admin sees every matching doc (no ACL clause).**
 #[test]
 fn cdc_4_3_filter_all_mode_admits_all() {
     let be = corpus();
@@ -240,7 +204,6 @@ fn cdc_4_3_filter_all_mode_admits_all() {
     assert_eq!(calls, 1);
 }
 
-/// **CONSUMER 4.3 (Filter{None} mode): short-circuit to empty (no doc surfaces).**
 #[test]
 fn cdc_4_3_filter_none_mode_short_circuits() {
     let be = corpus();
@@ -261,7 +224,6 @@ fn cdc_4_3_filter_none_mode_short_circuits() {
     );
 }
 
-/// **CONSUMER 4.3 (Filter{NotIds} mode): the bounded deny-set hides exactly the denied doc.**
 #[test]
 fn cdc_4_3_filter_not_ids_mode_denies_bounded() {
     let be = corpus();
@@ -281,8 +243,6 @@ fn cdc_4_3_filter_not_ids_mode_denies_bounded() {
     );
 }
 
-/// **PROVIDER 6.1 (SRCH-D3): a cross-tenant viewer is rejected — 0 cross-tenant results, and the
-/// authz dependency is never even consulted.**
 #[test]
 fn cdc_6_1_cross_tenant_zero() {
     let be = corpus();
@@ -303,15 +263,11 @@ fn cdc_6_1_cross_tenant_zero() {
     assert_eq!(stats.engine_branches(), 0, "0 cross-tenant engine touches");
 }
 
-/// **CONSUMER 4.3 (the SRCH-P09 relational reverse-index JOIN): a `TupleSet` form resolves through
-/// the per-tenant authz reverse index to the visible-id set (an `Ids` membership clause) — one JOIN,
-/// honouring the revision watermark — never a silent widen to All.**
 #[test]
 fn cdc_4_3_relational_tuple_set_joins_the_reverse_index() {
     use myelin_identity::AuthzIndexRef;
     let be = corpus();
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
-    // The reverse-index JOIN resolves ONLY PUB-1 at revision 4; the watermark from `z@4` is 4.
     let authz = ScriptedAuthz::with_reverse(
         ListObjectsResult::Filter {
             set_expr: SetExpr::TupleSet {
@@ -356,15 +312,11 @@ fn cdc_4_3_relational_tuple_set_joins_the_reverse_index() {
     );
 }
 
-/// **CONSUMER 4.3 / contract 4.10 (the revision watermark): a reverse-index revision STALER than the
-/// `list_objects` watermark is refused (StaleReverseIndex) — never read stale (SRCH-P09; the full
-/// fail-static path is SRCH-P10).**
 #[test]
 fn cdc_4_10_stale_reverse_index_revision_is_refused() {
     use myelin_identity::AuthzIndexRef;
     let be = corpus();
     let eng = ScopedEngine::new(&be, "acme", "eu-west", schema());
-    // The zookie requires watermark 9; the reverse index serves a stale revision 3.
     let authz = ScriptedAuthz::with_reverse(
         ListObjectsResult::Filter {
             set_expr: SetExpr::TupleSet {

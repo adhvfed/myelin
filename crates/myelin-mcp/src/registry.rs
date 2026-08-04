@@ -1,28 +1,17 @@
-//! MCP projection of subsystem-owned tool definitions.
-//!
-//! New surfaces register the shared [`myelin_agent::ToolDef`] directly and only definitions marked
-//! `exposed_over_mcp` enter the external catalogue. Git's older [`myelin_git::api::AgentToolDef`]
-//! catalogue remains behind an explicit compatibility adapter until its producer registration is
-//! moved to the shared type; CI does not copy that legacy model.
-
 use myelin_agent::{EffectKind, ToolDef};
 use myelin_git::api::AgentToolDef;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-/// The source retained for one registered definition.
 #[derive(Clone, Debug)]
 enum ToolSource {
-    /// The frozen shared catalogue shape (contract 8.1).
     Shared(ToolDef),
-    /// Git's pre-contract MCP catalogue. Kept explicit so no new subsystem can accidentally copy it.
     LegacyGit {
         subsystem: &'static str,
         def: AgentToolDef,
     },
 }
 
-/// One tool registered into the MCP catalogue.
 #[derive(Clone, Debug)]
 pub struct RegisteredTool {
     mcp_name: String,
@@ -30,12 +19,10 @@ pub struct RegisteredTool {
 }
 
 impl RegisteredTool {
-    /// The externally visible, subsystem-qualified MCP name.
     pub fn name(&self) -> &str {
         &self.mcp_name
     }
 
-    /// Whether the subsystem's frozen default requires a server-side HITL verdict.
     pub fn requires_approval(&self) -> bool {
         match &self.source {
             ToolSource::Shared(def) => def.requires_approval,
@@ -43,7 +30,6 @@ impl RegisteredTool {
         }
     }
 
-    /// The capabilities required from the exact minted run-token intersection.
     pub fn required_caps(&self) -> Vec<&str> {
         match &self.source {
             ToolSource::Shared(def) => def.required_caps.iter().map(String::as_str).collect(),
@@ -51,16 +37,13 @@ impl RegisteredTool {
         }
     }
 
-    /// The routing discriminator owned by the shared ToolDef contract.
     pub fn effect_kind(&self) -> EffectKind {
         match &self.source {
             ToolSource::Shared(def) => def.effect_kind,
-            // Every tool in the currently live legacy Git MCP catalogue is a platform mutation.
             ToolSource::LegacyGit { .. } => EffectKind::Mutate,
         }
     }
 
-    /// Whether the definition declares an external/platform side effect.
     pub fn side_effecting(&self) -> bool {
         match &self.source {
             ToolSource::Shared(def) => def.side_effecting,
@@ -68,7 +51,6 @@ impl RegisteredTool {
         }
     }
 
-    /// Project the subsystem-owned input schema and governance annotations into MCP.
     pub fn to_mcp_json(&self) -> Value {
         let (description, input_schema) = match &self.source {
             ToolSource::Shared(def) => {
@@ -129,7 +111,6 @@ impl RegisteredTool {
     }
 }
 
-/// A fail-loud catalogue registration error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistryError {
     InvalidDefinition(String),
@@ -147,7 +128,6 @@ impl std::fmt::Display for RegistryError {
     }
 }
 
-/// The MCP tool registry.
 #[derive(Clone, Debug, Default)]
 pub struct ToolRegistry {
     tools: Vec<RegisteredTool>,
@@ -158,7 +138,6 @@ impl ToolRegistry {
         ToolRegistry { tools: Vec::new() }
     }
 
-    /// Register Git's existing external catalogue through its isolated compatibility adapter.
     pub fn register_legacy_git(&mut self) -> Result<(), RegistryError> {
         for def in myelin_git::api::agent_tools() {
             self.push(RegisteredTool {
@@ -172,7 +151,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Register the externally exposed subset of a subsystem's shared ToolDefs.
     pub fn register_tool_defs(
         &mut self,
         defs: impl IntoIterator<Item = ToolDef>,
@@ -200,7 +178,6 @@ impl ToolRegistry {
         Ok(())
     }
 
-    /// Build the historical Git-only registry.
     pub fn with_git() -> ToolRegistry {
         let mut registry = ToolRegistry::new();
         registry
@@ -209,7 +186,6 @@ impl ToolRegistry {
         registry
     }
 
-    /// Build the production registry with Git mutations plus CI's two honest durable reads.
     pub fn with_git_and_ci_reads() -> Result<ToolRegistry, RegistryError> {
         let mut registry = ToolRegistry::with_git();
         registry.register_tool_defs(myelin_ci_controlplane::ci_tool_defs())?;

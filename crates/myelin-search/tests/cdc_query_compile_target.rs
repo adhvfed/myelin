@@ -1,28 +1,3 @@
-//! # CDC — the Search compile-target side of contract 13.3 (SRCH-P07 → P-170)
-//!
-//! **Architecture:** `search-and-indexing.md` §4.6 (Search is **one compile target of the single
-//! frozen `QueryAst`**, contract 13.3 — the SAME AST the bus's `EventMatcher` (3.4) and saved views
-//! compile). Reconciliation `00-reconciliation-decisions.md` X-3/OQ-C (the `QueryAst`/`FieldType`/
-//! `ViewSpec` frozen byte-identical) + KN-3 (rollup/formula read-time-computed, never stored).
-//!
-//! - **PROVIDER** = the frozen `myelin-query` primitive (contract 13.3, byte-identical X-3): the
-//!   [`myelin_query::QueryAst`] / [`myelin_query::Predicate`] grammar + the
-//!   [`myelin_query::FieldType`] enum. Search does **not** define a second query language; it
-//!   CONSUMES this one frozen AST.
-//! - **CONSUMER** = Search's query-AST [`myelin_search::compile`] (this prompt). It validates the
-//!   frozen AST against the frozen `FieldType` schema + the bounded-cost guard, lowers it to the
-//!   FT/structured/vector shapes + the read-time post-fetch path, and exposes the always-conjoin
-//!   seam.
-//!
-//! The dated green artifact (2026-06-20): Search compiles the SAME frozen AST the EventMatcher core
-//! consumes; the predicate bytes are byte-identical (no Search/matcher drift); a `FieldType`
-//! rename/reorder in the contract home (`myelin-query`) breaks THIS test now (the byte-identical
-//! drift anchor); the bounded-cost guard rejects a crafted AST (0 engine DoS); a read-time
-//! rollup/formula field is post-fetch, never a stored clause (KN-3); and the compiled plan is inert
-//! until the ACL conjoin seam (`with_acl`) produces an executable plan — the
-//! `search-requires-acl-filter` ratchet is structural. If the 13.3 AST/`FieldType` shape drifts,
-//! this stops compiling/passing — that is the contract.
-
 use myelin_identity::{Literal, ObjectType};
 use myelin_query::{CmpOp, EventMatcher, Expr, FieldType, Predicate, QueryAst};
 use myelin_search::{
@@ -40,8 +15,6 @@ fn i(n: i64) -> Expr {
     Expr::Lit(Literal::Int(n))
 }
 
-/// The synthetic-producer facet schema (the structured facets a subsystem's `IndexSpec` declares,
-/// 13.3) + the FT body + a read-time rollup. The real per-subsystem schemas arrive M3/M4.
 fn schema() -> FieldSchema {
     FieldSchema::new()
         .with(FT_BODY_FIELD, FieldDecl::stored(FieldType::Text))
@@ -54,12 +27,8 @@ fn schema() -> FieldSchema {
         .with("progress", FieldDecl::read_time(FieldType::Int))
 }
 
-/// **PROVIDER↔CONSUMER: Search compiles the SAME frozen `QueryAst` the EventMatcher core consumes,
-/// byte-identically.** The predicate the bus matcher carries and the predicate Search lowers are the
-/// SAME `myelin_query::QueryAst` with ONE serialisation — a grammar change breaks both at once.
 #[test]
 fn search_compiles_the_same_frozen_queryast_as_the_eventmatcher() {
-    // ONE frozen predicate, consumed by BOTH the matcher (provider 3.4) and Search's compiler.
     let predicate = QueryAst::compiled(Predicate::And(vec![
         Predicate::Cmp {
             op: CmpOp::Eq,
@@ -76,14 +45,12 @@ fn search_compiles_the_same_frozen_queryast_as_the_eventmatcher() {
 
     let matcher = EventMatcher::new(ObjectType("issue".into()), predicate.clone());
 
-    // Byte-identical: the matcher's predicate bytes and the bytes Search lowers are equal (no drift).
     assert_eq!(
         serde_json::to_value(matcher.predicate()).unwrap(),
         serde_json::to_value(&predicate).unwrap(),
-        "ONE QueryAst serialisation — Search and the EventMatcher core do not drift (X-3/13.3)"
+        "ONE QueryAst serialisation - Search and the EventMatcher core do not drift (X-3/13.3)"
     );
 
-    // Search's compiler lowers it to the FT + structured shapes.
     let plan = compile(&predicate, &schema()).expect("Search compiles the frozen AST");
     assert_eq!(
         plan.ft,
@@ -103,9 +70,6 @@ fn search_compiles_the_same_frozen_queryast_as_the_eventmatcher() {
     );
 }
 
-/// **The byte-identical `FieldType` drift anchor (X-3/OQ-C).** Search's compiler lowers over the
-/// frozen `FieldType` taxonomy; pin the full taxonomy by value so a rename/reorder of a variant in
-/// the contract home breaks THIS CDC now, not in prod.
 #[test]
 fn field_type_taxonomy_is_byte_identical_frozen() {
     let wire_ids: Vec<&str> = FieldType::all().iter().map(|t| t.wire_id()).collect();
@@ -123,14 +87,11 @@ fn field_type_taxonomy_is_byte_identical_frozen() {
         ],
         "the frozen FieldType taxonomy (byte-identical across Search / EventMatcher / Issues / KN)"
     );
-    // The discriminants are pinned (the byte-identical wire encoding).
     for (n, t) in FieldType::all().into_iter().enumerate() {
         assert_eq!(t as u8, n as u8, "{} discriminant pinned", t.wire_id());
     }
 }
 
-/// **CONTRACT: the bounded-cost guard rejects a crafted AST (0 engine DoS).** An oversized AST never
-/// even constructs (the frozen `QueryAst` rejects it); a within-bounds AST compiles.
 #[test]
 fn bounded_cost_guard_rejects_crafted_ast() {
     let big: Vec<Predicate> = (0..(myelin_query::MAX_PREDICATE_NODES + 10))
@@ -142,8 +103,6 @@ fn bounded_cost_guard_rejects_crafted_ast() {
     );
 }
 
-/// **CONTRACT: a read-time rollup/formula field is post-fetch, never a stored engine clause (KN-3 /
-/// X-3).** Search indexed only the inputs; the derived value is computed after fetch.
 #[test]
 fn read_time_rollup_is_post_fetch_not_indexed() {
     let plan = compile(
@@ -168,8 +127,6 @@ fn read_time_rollup_is_post_fetch_not_indexed() {
     assert_eq!(plan.post_fetch[0].field, "progress");
 }
 
-/// **CONTRACT: the always-conjoin seam — a compiled plan is inert until `with_acl` (the SRCH-P08
-/// conjoin) produces an executable plan.** The `search-requires-acl-filter` ratchet is structural.
 #[test]
 fn compiled_plan_is_inert_until_the_acl_conjoin_seam() {
     let plan = compile(
@@ -182,8 +139,6 @@ fn compiled_plan_is_inert_until_the_acl_conjoin_seam() {
         &schema(),
     )
     .expect("compile");
-    // The only path to an executable plan demands the ACL clause (here a marker for the SRCH-P08
-    // AclFilter lowering of list_objects).
     let conjoined = plan.with_acl("acl_clause(list_objects(viewer, read, issue))");
     assert_eq!(
         conjoined.acl,
@@ -191,8 +146,6 @@ fn compiled_plan_is_inert_until_the_acl_conjoin_seam() {
     );
 }
 
-/// **CONTRACT: render(compile(ast)) is the canonical form (one renderer) — an agent and the UI emit
-/// the SAME query, permission-filtered identically (no agent back-door).**
 #[test]
 fn render_is_the_one_canonical_form() {
     let p = Predicate::And(vec![
@@ -221,7 +174,6 @@ fn render_is_the_one_canonical_form() {
     assert_eq!(ui.sort, Some(Sort::OrderKeyAsc));
 }
 
-/// **CONTRACT: a semantic/near request lowers to the vector branch (the compiler's vector target).**
 #[test]
 fn semantic_request_lowers_to_the_vector_branch() {
     let plan = compile(
@@ -237,7 +189,6 @@ fn semantic_request_lowers_to_the_vector_branch() {
     assert_eq!(plan.vector.unwrap().query_text, "reset my password");
 }
 
-/// **CONTRACT: an undeclared field / type mismatch is a loud compile error (no silent coercion).**
 #[test]
 fn undeclared_or_mismatched_is_a_loud_compile_error() {
     let undeclared = compile(

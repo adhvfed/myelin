@@ -1,27 +1,3 @@
-//! **MR-009b W3b.4 — the durable composition root PROVEN through a spec-built app against the
-//! live dev-stack Postgres.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-issues --features integration \
-//!     --test integration_w3b4_durable_spec_boot -- --nocapture
-//!
-//! This is the W3b.4 exit proof the design contract names: an emit through a SPEC-BUILT app (the
-//! `issues_app_spec(config, outbox)` injection seam + the harness `boot` lifecycle) lands in the
-//! REAL PG `outbox` table (verified with an independent raw SELECT, not the store's own reads),
-//! while the service lifecycle cannot claim or stamp the shared row. The separately elected cell
-//! publisher owns publication; this proof prevents a service-local relay from stealing another
-//! subsystem's row into a process-private bus. The id source is the PRODUCTION `UlidMinter` (the P-S12
-//! stand-in), satisfying the W3b.3 named condition — a per-run-unique `event_id`, never the
-//! per-instance-resetting default `MonotonicMinter` whose collisions the durable
-//! `ON CONFLICT (event_id) DO NOTHING` path silently drops.
-//!
-//! The multi-thread test flavor is REQUIRED: the sync `DurableOutboxBacking` verbs bridge to
-//! async sqlx via `block_in_place` + `block_on`, which panics on a current-thread runtime — this
-//! test also pins that the harness lifecycle verbs (`boot`/`tick`) are drivable on the same
-//! multi-thread runtime shape the rewired service mains use (`#[tokio::main]`).
 #![cfg(feature = "integration")]
 
 use std::sync::Arc;
@@ -62,12 +38,8 @@ fn ctx_base(tenant: &str) -> EmitContextBase {
     }
 }
 
-/// The shared-outbox producer proof: the spec-built app commits to PG, while its lifecycle leaves
-/// publication to the elected cell relay.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn spec_built_app_emit_lands_in_pg_without_claiming_the_shared_relay() {
-    // The SAME composition-root shape the rewired service mains use (W3b.4): provider from env →
-    // foundation migrations → OutboxStore::durable(PgOutboxBacking).
     let mut migration_config = MyelinConfig::from_env(Mode::DevDefaults).expect("dev config");
     migration_config.database_url = admin_url();
     let migrator = SubstrateProvider::connect(migration_config.clone(), 2)
@@ -78,8 +50,6 @@ async fn spec_built_app_emit_lands_in_pg_without_claiming_the_shared_relay() {
         .await
         .expect("apply the foundation migrations (outbox/consumer_dedup)");
 
-    // Runtime operations use the constrained NOBYPASSRLS app role. Production still needs one
-    // platform-wide way to supply this credential split; the test models the required boundary.
     migration_config.database_url = app_url();
     let provider = SubstrateProvider::connect(migration_config, 4)
         .await
@@ -89,12 +59,8 @@ async fn spec_built_app_emit_lands_in_pg_without_claiming_the_shared_relay() {
         tokio::runtime::Handle::current(),
     )));
 
-    // The SPEC-BUILT app owns the durable producer store but deliberately has no embedded relay.
     let handle = boot(issues_app_spec(Config::default(), outbox.clone())).expect("boot");
 
-    // Emit through the spec's outbox with the PRODUCTION UlidMinter (the W3b.3 named condition:
-    // a unique id source, never the resetting default MonotonicMinter). The aggregate is
-    // per-run-unique so re-runs against the shared dev DB never contend on (aggregate, seq).
     let minter: Arc<dyn IdMinter> = Arc::new(UlidMinter::new());
     let run_tag = format!(
         "w3b4-{}-{}",
@@ -124,8 +90,6 @@ async fn spec_built_app_emit_lands_in_pg_without_claiming_the_shared_relay() {
         .expect("emit");
     tx.commit().expect("durable co-commit");
 
-    // INDEPENDENT PG proof (not the store's own reads): the committed row is in the REAL outbox
-    // table, unsent (published_at IS NULL), under the per-run aggregate at seq 0.
     let (n, published): (i64, Option<bool>) = {
         let row: (i64,) =
             sqlx::query_as("SELECT count(*) FROM outbox WHERE event_id = $1 AND aggregate = $2")
@@ -149,7 +113,6 @@ async fn spec_built_app_emit_lands_in_pg_without_claiming_the_shared_relay() {
         "a freshly committed row is unsent (published_at IS NULL)"
     );
 
-    // A service tick must not claim the global table. The elected cell publisher runs separately.
     handle.tick();
 
     let sent_after: (bool,) =
@@ -163,7 +126,6 @@ async fn spec_built_app_emit_lands_in_pg_without_claiming_the_shared_relay() {
         "the producer lifecycle must leave publication to the elected cell relay"
     );
 
-    // The durable store's own read agrees (the dispatching read path — no memory arm involved).
     let row = handle
         .outbox()
         .row(&event_id)
@@ -173,6 +135,5 @@ async fn spec_built_app_emit_lands_in_pg_without_claiming_the_shared_relay() {
         "store read confirms the shared row was not claimed locally"
     );
 
-    // Graceful drain still works over the durable arm (stop intake, finish in-flight, ack-exit).
     handle.signal_drain();
 }

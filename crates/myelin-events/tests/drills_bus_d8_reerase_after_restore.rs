@@ -1,29 +1,3 @@
-//! # STOR-D1/D2 (Bus leg) — post-restore re-erasure: the key stays destroyed across a restore
-//! (EB-16 / P-093)
-//!
-//! This is the Bus's leg of the STOR-D1/D2 restore-verify cross-seam the EB-16 GATE / TESTS field
-//! names (the event-log offset is the cross-seam cursor; `post_restore_reerase`). It proves that a
-//! restored backup does NOT resurrect an erased subject's inline-PII (external-insights/04 §1: the key
-//! stays destroyed even after a backup is restored):
-//!
-//! 1. **erase + record** a subject in the live cell — crypto-shred the per-subject DEK + record it in
-//!    the PII-free, non-shred-erasable erasure ledger ([`myelin_events::BusErasureLedger`], 10.8);
-//! 2. **restore an OLDER backup** (one taken BEFORE the erase) — the DEK is resurrected (live again)
-//!    and the log row is back WITHOUT its tombstone (exactly what a pre-erase restore does);
-//! 3. **re_erase_after_restore**: the Bus's holder REPLAYS the ledger — re-runs the IDENTICAL
-//!    crypto-shred over every ledger-listed subject (cold == live), re-destroying the resurrected DEK
-//!    + re-emitting `*.erased` tombstones for the restored rows;
-//! 4. **READ the re-erasure receipt** (the SCHED artifact) and assert the threshold: **0 resurrected
-//!    inline-PII keys after a restore** — and bridge the Bus's survival signals into the harness's
-//!    frozen §10.2 assertion library so the verdict is a loud, never-swallowed green (EI-01 §3): after
-//!    the re-erase + re-tombstone + drain, `outbox_depth == 0` and `dead_letter_count == 0` (nothing
-//!    was lost re-erasing across the restore).
-//!
-//! The DEVIATION (`myelin-events` cannot depend on the harness in production — the §2.9 DAG; and the
-//! cross-seam restore TRIGGER is owned by Storage/GDPR, the floors P-ST-14/P-GA-06) is bridged HERE,
-//! in the test build where the harness IS a dev-dependency, exactly as the BUS-D8 drill does it. This
-//! drill proves the Bus MECHANISM the downstream restore-verify cross-seam wires.
-
 use myelin_events::{Actor, AggregateKey, EmitContext, EventId};
 use myelin_events::{
     ArtifactRef, BusErasureLedger, BusEventLog, BusHolder, BusObservations, BusSignals, DataRole,
@@ -83,11 +57,8 @@ fn minter() -> Arc<dyn IdMinter> {
     Arc::new(MonotonicMinter::new())
 }
 
-/// **STOR-D1/D2 (Bus leg): erase a subject → restore an older backup → re-erase → 0 resurrected
-/// inline-PII keys post-restore + nothing lost.** The unit-of-proof the EB-16 GATE requires.
 #[test]
 fn bus_post_restore_re_erasure_zero_resurrected_keys_nothing_lost() {
-    // (1) ERASE + RECORD u42 in the live cell. The PII-free ledger (10.8) durably remembers it.
     let mut live_log = BusEventLog::new();
     let shredder = InMemoryShredder::new();
     let ev = inline_pii("01J-1", "u42");
@@ -120,8 +91,6 @@ fn bus_post_restore_re_erasure_zero_resurrected_keys_nothing_lost() {
         "the PII-free ledger remembers the erasure"
     );
 
-    // (2) RESTORE an OLDER backup (taken BEFORE the erase): the DEK is resurrected (re-sealed) and the
-    //     log row is back WITHOUT its tombstone — exactly what restoring a pre-erase backup does.
     let mut restored_log = BusEventLog::new();
     restored_log.append(inline_pii("01J-1", "u42"));
     shredder.seal(&key);
@@ -130,7 +99,6 @@ fn bus_post_restore_re_erasure_zero_resurrected_keys_nothing_lost() {
         "the restore RESURRECTED u42's inline-PII DEK"
     );
 
-    // (3) RE-ERASE AFTER RESTORE: replay the ledger — re-destroy the resurrected key + re-tombstone.
     let mut reerase_outbox = OutboxStore::new();
     let receipt = holder
         .re_erase_after_restore(
@@ -142,7 +110,6 @@ fn bus_post_restore_re_erasure_zero_resurrected_keys_nothing_lost() {
         )
         .expect("re-erase after restore (KMS reachable)");
 
-    // (4) READ the re-erasure receipt (the SCHED artifact) — the STOR-D1/D2 Bus-leg threshold.
     assert_eq!(
         receipt.resurrected, 0,
         "STOR-D1/D2: 0 resurrected inline-PII keys post-restore"
@@ -157,19 +124,15 @@ fn bus_post_restore_re_erasure_zero_resurrected_keys_nothing_lost() {
         receipt.tombstones_re_emitted >= 1,
         "re-tombstoned the restored row"
     );
-    // The crypto-shred is REAL across the restore: the key no longer resolves.
     assert!(
         !shredder.is_live(&key),
         "the key STAYS destroyed across the restore"
     );
-    // The restored row is tombstoned again (consumers degrade gracefully on it).
     assert!(
         restored_log.is_tombstoned("01J-1"),
         "the restored row carries a tombstone again"
     );
 
-    // (5) RELAY → BROKER: the re-emitted tombstone publishes (the consumer-degrade signal survives
-    //     the re-erasure too).
     let bus = InProcessBus::new();
     let relay = Relay::new(reerase_outbox.clone(), bus.clone(), clock);
     let drain = relay.drain_to_empty();
@@ -178,8 +141,6 @@ fn bus_post_restore_re_erasure_zero_resurrected_keys_nothing_lost() {
         "the relay published the re-emitted *.erased tombstone"
     );
 
-    // (6) BRIDGE into the harness §10.2 assertion library — a LOUD green (never swallowed): after the
-    //     re-erase + tombstone emit + drain, nothing was lost (depth 0, no dead-letters).
     let obs = BusObservations::default();
     let sig = BusSignals::snapshot(&reerase_outbox, &drain, &obs, &now(), 0);
     let mut rec = myelin_events::MetricRecorder::new();
@@ -204,9 +165,6 @@ fn bus_post_restore_re_erasure_zero_resurrected_keys_nothing_lost() {
     );
 }
 
-/// **STOR-D1/D2 (Bus leg) loud-failure:** a KMS failure during the post-restore re-erasure ABORTS the
-/// pass loudly (never silently reports green) — the DSR retries. The re-erasure is part of the DSR,
-/// never "assume re-erased".
 #[test]
 fn bus_post_restore_re_erasure_is_loud_on_kms_failure() {
     let mut live_log = BusEventLog::new();
@@ -230,7 +188,6 @@ fn bus_post_restore_re_erasure_is_loud_on_kms_failure() {
         )
         .expect("live erase + record");
 
-    // Restore resurrects the key, but the KMS is unreachable → the re-erase MUST be loud.
     let mut restored = BusEventLog::new();
     restored.append(inline_pii("01J-1", "u42"));
     let key = PiiKeyRef("kms://acme/0/subject:u42".into());

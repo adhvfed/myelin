@@ -1,29 +1,3 @@
-//! # LIVE tool-executing drill — real Luna INVOKES a governed READ tool → real tenant data → answer.
-//!
-//! The headline of this slice, against BOTH real dependencies:
-//!   - the **real Luna brain** ([`LunaClient::from_env`], `OPENAI_API_KEY` injected via `fed`) that
-//!     actually DECIDES to call the `git.read_check_status` tool, and
-//!   - the **real Git subsystem read** ([`PgCheckStatusProjection::rows_for_commit`] via
-//!     [`GitCheckStatusReadExecutor`]) over the real, RLS-scoped `check_status` table on live
-//!     Postgres `:5433` — the SAME stack + gating as `e2e_luna_live`.
-//!
-//! It SEEDS a readable check-status row (a `ci/build = failure` row for a unique tenant/commit),
-//! then drives a real Luna run whose task REQUIRES reading it, and proves the agent CALLED the tool,
-//! the executor returned the real seeded data, the agent's answer reflects it, and the wallet was
-//! debited for MULTIPLE turns (the tool turn + the answer turn) — metered end-to-end.
-//!
-//! Run it (key + DB present):
-//! ```text
-//! DATABASE_URL=postgres://myelin_app:myelin_app_pw@localhost:5433/myelin \
-//!   AWS_DEFAULT_REGION=fr-par \
-//!   cargo test -p myelin-agent-host --test e2e_luna_tool_live -- --ignored --nocapture
-//! ```
-//! It skips GRACEFULLY (no failure) when `OPENAI_API_KEY` is absent or the DB is unreachable, and is
-//! `#[ignore]` so the default hermetic suite never reaches the network — the mock sibling
-//! (`e2e_mock_tool_run.rs`) proves the identical tool path with no network. The API key rides only in
-//! the Luna `Authorization` header (never logged); this drill prints the real answer + the tool
-//! result + the wallet debit, never the key.
-
 use std::sync::Arc;
 
 use myelin_agent::{ToolCall, ToolCallId, ToolName};
@@ -71,8 +45,6 @@ fn uniq() -> String {
     )
 }
 
-/// Apply the agent-wallet migration (0080) AND the Git `check_status` projection migration as the
-/// admin/owner role. `None` (SKIP) if unreachable.
 async fn migrate_admin() -> Option<SubstrateProvider> {
     let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
         Ok(p) => p,
@@ -85,9 +57,6 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
         .migrate(&agent_wallet_migrations(), &HotTables::none())
         .await
         .expect("apply the agent-wallet migration (0080)");
-    // Apply ONLY the plain `check_status` table DDL (the PK covers the (tenant, region, repo, commit)
-    // read; the CONCURRENTLY commit-index is an unnecessary optimisation for this drill). The id
-    // matches the real Git migration, so on a dogfood DB that already has it applied this is a no-op.
     let check_status_table = Migrations::of([Migration::plain_on(
         "git_0014_check_status",
         CREATE_CHECK_STATUS_DDL,
@@ -97,10 +66,6 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
         .migrate(&check_status_table, &HotTables::none())
         .await
         .expect("apply the Git check_status projection table (git_0014)");
-    // The REAL per-run token mint/revoke needs the durable S7 denylist tables (`revocation` +
-    // `run_token_teardown`, via `identity_durable_migrations`) and the cell token-authority signing
-    // root table (`cell_token_root`, via `cell_root_durable_migrations`). Idempotent on a dogfood DB
-    // that already has them applied.
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -112,8 +77,6 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
     Some(admin)
 }
 
-/// Count the run-linked `debit` rows for `(tenant, region, run_id)` directly in SQL (the independent
-/// multi-turn-metering oracle).
 async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id: &str) -> i64 {
     let mut tx = pool.begin().await.expect("begin count tx");
     sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
@@ -136,9 +99,6 @@ async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id
     n
 }
 
-/// Seed ONE readable `check_status` row for `(tenant, region, repo, commit)` through the app role's
-/// `with_tenant_tx` (RLS GUCs set → the WITH CHECK passes; a genuinely tenant-scoped write). A
-/// distinctive `ci/build = failure` row so the agent's answer is checkable.
 async fn seed_check_row(
     app: &SubstrateProvider,
     tenant: &str,
@@ -189,12 +149,6 @@ fn agent_principal(tenant: &TenantId) -> Principal {
     )
 }
 
-/// Build the REAL ReBAC decision engine (the same [`StoreBackedCheck::check`] a human's request flows
-/// through) over an in-memory tuple store. When `grant_pull` is set, seed a GENUINE
-/// `repo:core#pull@<agent>` grant through the real [`TupleStore::write_tuples`] path — under the SAME
-/// `(tenant, region)` scope the engine derives from the agent's own verified token — so the cap gate
-/// finds the grant and ALLOWS the tool. The tool's `repo` argument (`myelin://<tenant>/git/repo/core`)
-/// canonicalises to the `repo:core` tuple key, so this grant authorizes the run's exact call.
 fn rebac_engine_with_pull(agent: &Principal, grant_pull: bool) -> StoreBackedCheck {
     let tuples = TupleStore::new(OutboxStore::new());
     if grant_pull {
@@ -223,13 +177,9 @@ fn rebac_engine_with_pull(agent: &Principal, grant_pull: bool) -> StoreBackedChe
     StoreBackedCheck::new(tuples)
 }
 
-/// **The headline live drill: seed a check-status row, drive a real Luna run that INVOKES the read
-/// tool to fetch it, and assert the tool was CALLED, its real result reached the agent, the answer
-/// reflects it, and the wallet was debited for MULTIPLE turns — torn down cleanly.**
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "hits real Luna + live Postgres; requires OPENAI_API_KEY and the dev DB (:5433)"]
 async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
-    // Gate 1 — the real brain (the key rides only in the Luna Authorization header; never printed).
     let luna = match LunaClient::from_env() {
         Ok(c) => c,
         Err(ModelError::MissingApiKey) => {
@@ -238,7 +188,6 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         }
         Err(e) => panic!("unexpected Luna construction error: {e}"),
     };
-    // Gate 2 — the live durable DB (wallet + check_status projection migrated).
     let Some(_admin) = migrate_admin().await else {
         return;
     };
@@ -250,14 +199,8 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     let repo = format!("myelin://{}/git/repo/core", tenant.0);
     let commit = "abc123def456live";
 
-    // SEED the readable tenant data (a distinctive `ci/build = failure` row).
     seed_check_row(&app, &tenant.0, &region_s, &repo, commit).await;
 
-    // The F2-airtight composition root wired to the REAL Identity per-run token mint + durable S7
-    // revocation. A UNIQUE cell_id per run (a fresh generated signing root, never colliding with a
-    // pre-existing sealed root under a different key) + a fixed dev seal key — the SAME durable-cell +
-    // seal-key path the edge gateway / CI runner use (a production main sources these from
-    // MYELIN_CELL_ID / MYELIN_KMS_SEAL_KEY; the drill controls them so it is self-contained).
     let cell_id = format!("cell-agenthost-{}", uniq());
     let seal_key = SealKey::from_encoded(&"11".repeat(32)).expect("a 32-byte dev seal key");
     let host = AgentHost::with_identity(
@@ -268,14 +211,11 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     )
     .await
     .expect("wire the REAL Identity per-run mint + durable revocation");
-    let topup = MicroUsd(2_000_000); // a couple cents cap — plenty for a tool call + a short answer.
+    let topup = MicroUsd(2_000_000);
     host.wallet()
         .credit(&tenant, topup, CreditKind::Topup, None)
         .expect("topup seeds the wallet");
 
-    // The REAL read tool: the durable `Direct` executor over Git's check_status projection, scoped to
-    // THIS run's verified token (tenant + region), plus the catalogue + advertised schema the loop +
-    // the model use.
     let agent = agent_principal(&tenant);
     let scope = TenantScope::from_verified_token(&agent, Region(region_s.clone()));
     let executor = GitCheckStatusReadExecutor::new(
@@ -284,12 +224,8 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         tokio::runtime::Handle::current(),
         scope,
     );
-    // THE CAP GATE: the run's `git.read_check_status` tool declares `required_caps = ["pull"]`. Wrap
-    // the real read executor in the cap-enforcement checkpoint, which consults the REAL ReBAC engine
-    // for the agent principal's `pull` grant on the repo BEFORE the read runs — fail-closed if absent.
-    // We seed a genuine grant so the tool is ALLOWED and the drill passes end-to-end.
     let rebac: Arc<dyn IdentityService + Send + Sync> =
-        Arc::new(rebac_engine_with_pull(&agent, /* grant_pull */ true));
+        Arc::new(rebac_engine_with_pull(&agent,  true));
     let gated = CapEnforcingExecutor::for_git_read_tool(rebac, agent.clone(), &executor);
     let catalogue = ToolCatalogue::new([git_check_status_read_tool_def()]);
     let advertised = [git_check_status_read_tool_schema()];
@@ -320,7 +256,6 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     .with_max_output_tokens(256)
     .with_now_secs(1000);
 
-    // F1: the durable wallet is threaded non-optionally — a real paid tool run is always billed.
     let report = host
         .run(
             &task,
@@ -344,18 +279,15 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         executor.invocations(),
     );
 
-    // THE TOOL WAS ACTUALLY INVOKED — Luna decided to call it and the executor ran the real read.
     assert!(
         executor.invocations() >= 1,
         "the agent CALLED the read tool at least once"
     );
-    // The executor returned the REAL seeded data.
     let tool_text = executor.last_result().expect("the executor produced a read result");
     assert!(
         tool_text.contains("ci/build = Failure"),
         "the tool returned the real seeded row: {tool_text}"
     );
-    // The agent's final answer REFLECTS the seeded state.
     assert!(!report.answer.trim().is_empty(), "real Luna produced an answer");
     assert!(
         report.answer.to_lowercase().contains("fail"),
@@ -364,7 +296,6 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     );
     assert!(report.outcome.0.contains("completed"), "the run completed cleanly");
 
-    // The wallet was DEBITED for MULTIPLE turns (the tool turn + the answer turn) — metered per turn.
     assert!(report.charged_micro > 0, "the run was priced + debited");
     assert_eq!(
         host.wallet().balance(&tenant),
@@ -373,20 +304,15 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     );
     assert!(
         debit_row_count(app.db_pool(), &tenant.0, &region_s, run_id).await >= 2,
-        "at least TWO run-linked debit rows (the tool turn + the answer turn) — multi-turn metering"
+        "at least TWO run-linked debit rows (the tool turn + the answer turn) - multi-turn metering"
     );
 
-    // The run tore down cleanly: a balanced reserve/settle ledger, a trace, the token revoked.
     assert!(report.telemetry.ledger_balanced(), "reserved == settled");
     assert_eq!(report.telemetry.traces_written(), 1);
     assert_eq!(report.telemetry.tokens_revoked(), 1, "per-run token revoked on teardown");
     assert_eq!(report.telemetry.runs_completed(), 1);
 
-    // ── THE REAL-IDENTITY GATE: the per-run token was REALLY minted + REALLY revoked on the durable
-    //    S7 denylist (not the in-process stub). The mint's `jti` is deterministic
-    //    `runtok:<agent_id>:<run_id>:<mint_instant>`, so we recompute it and consult the durable
-    //    store's lifecycle state. ──
-    let mint_now = timestamp_from_epoch(1000); // the run's `with_now_secs(1000)` mint instant.
+    let mint_now = timestamp_from_epoch(1000);
     let jti = run_token_jti(
         &PrincipalId("psn:host-agent".into()),
         &RunId(run_id.into()),
@@ -395,7 +321,6 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     let verify_agent = agent_principal(&tenant);
     let verify_scope = TenantScope::from_verified_token(&verify_agent, Region(region_s.clone()));
 
-    // (a) THIS host's durable S7 store reports the run's token TORN DOWN (the immediate teardown deny).
     let revocations = host
         .revocations()
         .expect("a with_identity host exposes the durable S7 store");
@@ -405,9 +330,6 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         "the REAL per-run token was torn down on the durable S7 denylist (post-run)"
     );
 
-    // (b) DURABILITY: a FRESH S7 store instance over the SAME pool (a distinct connection / a
-    //     cold-recovered cell) still sees the teardown denylist row — the revocation survives a
-    //     process restart, and is dead for everyone in the tenant partition.
     let fresh_revocations = RevocationStore::with_pg(
         DurableRevocationBacking::new(app.clone()),
         tokio::runtime::Handle::current(),
@@ -420,13 +342,8 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
 
     eprintln!("LIVE real-Identity revocation: run token TornDown on the durable S7 denylist (durable across a fresh store instance)");
 
-    // ── THE CAP-ENFORCEMENT DENY GATE (the sibling proof): the SAME governed tool call, but with NO
-    //    `pull` grant for the agent, is DENIED fail-closed by the REAL ReBAC engine BEFORE the read
-    //    runs. This confirms the allowed run above passed BECAUSE of the seeded grant, not because the
-    //    cap is unenforced. We drive the executor directly (no second paid Luna turn) with the exact
-    //    validated arguments the run used. ──
     let no_grant: Arc<dyn IdentityService + Send + Sync> =
-        Arc::new(rebac_engine_with_pull(&verify_agent, /* grant_pull */ false));
+        Arc::new(rebac_engine_with_pull(&verify_agent,  false));
     let probe_scope = TenantScope::from_verified_token(&verify_agent, Region(region_s.clone()));
     let probe_exec = GitCheckStatusReadExecutor::new(
         app.clone(),

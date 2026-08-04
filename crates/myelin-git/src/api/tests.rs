@@ -1,16 +1,7 @@
-//! Unit tests for the Git CLI + HTTP/RPC + agent-tool API catalogue (GIT-P32). These assert the
-//! structural surface invariants:
-//! - every WRITE endpoint is `Id.check`-gated (BUS-2 — the catalogue refuses an un-gated write);
-//! - every CLI verb / HTTP route maps to an ALREADY-BUILT handler (no new handler);
-//! - the agent-tool `requires_approval` defaults are FROZEN (`git.merge = yes`, the rest `no`);
-//! - the CLI parser is total + loud (an unknown verb / missing arg is a typed error, never coerced).
-
 use super::*;
 
 #[test]
 fn every_write_endpoint_is_id_checked_bus2() {
-    // BUS-2 / the X-1 floor: a write endpoint that skips Id.check is a leak. The catalogue must carry
-    // no such route.
     for ep in http_catalogue() {
         if ep.method.is_write() {
             assert!(
@@ -24,7 +15,6 @@ fn every_write_endpoint_is_id_checked_bus2() {
 
 #[test]
 fn endpoint_constructor_refuses_an_ungated_write() {
-    // The structural guard: a mutant that registers an un-gated write fails at `new`, not silently.
     assert!(
         Endpoint::new(
             Method::Post,
@@ -35,7 +25,6 @@ fn endpoint_constructor_refuses_an_ungated_write() {
         .is_none(),
         "an un-gated write endpoint must be refused"
     );
-    // A gated write + any read are admitted.
     assert!(Endpoint::new(Method::Post, "/x", Handler::Lifecycle, true).is_some());
     assert!(Endpoint::new(Method::Get, "/x", Handler::Project, false).is_some());
 }
@@ -44,7 +33,6 @@ fn endpoint_constructor_refuses_an_ungated_write() {
 fn the_catalogue_covers_the_arch_section_4_endpoints() {
     let cat = http_catalogue();
     let paths: Vec<&str> = cat.iter().map(|e| e.path).collect();
-    // The representative arch §4 endpoints are all present.
     for expected in [
         "/api/git/repos",
         "/api/git/repos/{repo}/prs/{n}",
@@ -59,7 +47,6 @@ fn the_catalogue_covers_the_arch_section_4_endpoints() {
             "the catalogue is missing arch §4 endpoint {expected}"
         );
     }
-    // The merge route lowers to the merge gate; the checks route to the X-1 projection.
     let merge = cat.iter().find(|e| e.path.ends_with("/merge")).unwrap();
     assert_eq!(merge.handler, Handler::MergeGate);
     let checks = cat.iter().find(|e| e.path.ends_with("/checks")).unwrap();
@@ -115,7 +102,6 @@ fn cli_parses_the_arch_section_3_2_verbs() {
             draft: true,
         }
     );
-    // `pr open` without `--title` is a clean parse error (R3.1: title required at create).
     assert!(matches!(
         parse_cli(&["pr", "open", "core", "--head-oid", "abc"]),
         Err(CliParseError::MissingArg { what: "title" })
@@ -309,7 +295,6 @@ fn repo_list_cli_rejects_ambiguous_or_noncanonical_pagination_flags() {
 
 #[test]
 fn cli_each_verb_lowers_to_an_existing_handler() {
-    // No new handler — every CLI verb maps to an already-built module.
     assert_eq!(
         CliCommand::RepoList {
             limit: None,
@@ -383,7 +368,6 @@ fn cli_write_commands_are_classified_for_the_bus2_gate() {
         draft: false
     }
     .is_write());
-    // Reads are not writes.
     assert!(!CliCommand::RepoList {
         limit: None,
         cursor: None,
@@ -415,12 +399,10 @@ fn cli_is_loud_on_unknown_and_missing() {
         parse_cli(&["pr", "view", "core", "notanum"]),
         Err(CliParseError::BadArg { .. })
     ));
-    // `pr view <repo>` with no number is a missing-arg (the number positional is required).
     assert!(matches!(
         parse_cli(&["pr", "view", "core"]),
         Err(CliParseError::MissingArg { .. })
     ));
-    // `pr review <repo> <n>` with no verdict flag is a missing-arg.
     assert!(matches!(
         parse_cli(&["pr", "review", "core", "1"]),
         Err(CliParseError::MissingArg { .. })
@@ -429,7 +411,6 @@ fn cli_is_loud_on_unknown_and_missing() {
 
 #[test]
 fn agent_tool_requires_approval_defaults_are_frozen() {
-    // recon X-1 / ADR-08 frozen defaults: git.merge = yes (the ONLY consequential git gate), rest = no.
     let tools = agent_tools();
     let merge = tools.iter().find(|t| t.name == "git.merge").unwrap();
     assert!(
@@ -444,7 +425,6 @@ fn agent_tool_requires_approval_defaults_are_frozen() {
         "open_pr is reversible → not HITL-gated"
     );
 
-    // Exactly ONE consequential git gate.
     let gated: Vec<&str> = tools
         .iter()
         .filter(|t| t.requires_approval)

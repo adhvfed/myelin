@@ -1,13 +1,3 @@
-//! Unit tests for the CI cross-fabric surfacing module (CI-P25 / P-368) — the leak-free
-//! `list_objects` `SetExpr` push-down over `ci_run.run_id`, the `ArtifactRef`/`#sub` mints (stable
-//! across retries), and the permission-first `project(ref, viewer)` tombstone-on-deny.
-//!
-//! These are the security-load-bearing (mandatory-core) tests; they pin every branch so the
-//! `cargo-mutants` ≥ 80% floor (the module doc) is killable: the `None`/empty-`Ids` ⇒ `FALSE`
-//! leak-free identity elements, the no-N+1 JOIN dedup, the revoke-reflected leak-free property, the
-//! permission-first projection gate (deny ⇒ tombstone, 0 title leak), and the `#step-<n>` mint
-//! stability.
-
 use super::*;
 use crate::check_emitter::CheckState;
 use myelin_identity::{
@@ -20,12 +10,6 @@ use myelin_identity::{
 use myelin_tenancy::{Region, TenantId};
 use std::collections::HashSet;
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// Test doubles + fixtures.
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
-/// A deterministic Id stub: a `view@object` allow-list (absent ⇒ Deny, fail-closed); a toggle to
-/// force a transport hiccup (the projector must then fail CLOSED to a tombstone).
 struct StubId {
     allow: HashSet<String>,
     hiccup: bool,
@@ -156,15 +140,10 @@ fn a_run() -> RunMeta {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// 1. THE ArtifactRef MINTS + the #sub mints (contracts 5.1 / 5.7)
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn ci_artifact_refs_round_trip_canonical_keys() {
     let run = ci_run_ref("acme", "01J7RUN");
     assert_eq!(myelin_refs::format(&run), "myelin://acme/ci/run/01J7RUN");
-    // re-parse is a fixed point (the stored key is stable).
     assert_eq!(myelin_refs::parse(&myelin_refs::format(&run)).unwrap(), run);
 
     assert_eq!(
@@ -187,8 +166,6 @@ fn ci_artifact_refs_round_trip_canonical_keys() {
 
 #[test]
 fn step_mint_is_stable_across_retries_and_byte_identical_to_details_ref() {
-    // The `#step-<n>` mint is opaque + STABLE across retries: the SAME (run, step) mints the SAME
-    // sub-URN regardless of retry/runtime order (a chat/runbook embed of `#step-3` never dangles).
     let run = ci_run_ref("acme", "01J7RUN");
     let s1 = run_step_ref(&run, 3).unwrap();
     let s2 = run_step_ref(&run, 3).unwrap();
@@ -198,8 +175,6 @@ fn step_mint_is_stable_across_retries_and_byte_identical_to_details_ref() {
         "myelin://acme/ci/run/01J7RUN#step-3"
     );
 
-    // RECONCILIATION (EI-01 §7): the SAME anchor `check_emitter::details_ref` mints for the
-    // `CheckStatus.details_ref` jump-to-failure — ONE source of truth, no divergent grammar.
     let from_details = crate::check_emitter::details_ref(&run.0, CheckState::Failure, Some(3));
     assert_eq!(
         myelin_refs::format(&s1),
@@ -216,7 +191,6 @@ fn line_range_and_check_mints_go_through_the_one_codec() {
         myelin_refs::format(&lr),
         "myelin://acme/ci/run/01J7RUN#L42-L88"
     );
-    // an inverted range is rejected LOUDLY by the codec (never coerced).
     assert!(run_step_line_ref(&run, 88, 42).is_err());
 
     let check = commit_check_ref(&run, "build").unwrap();
@@ -235,10 +209,6 @@ fn classify_rejects_a_non_ci_ref() {
     ));
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// 2. THE list_objects SetExpr PUSH-DOWN (contract 4.3, §5.1) — leak-free, one query, no N+1
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
 #[test]
 fn none_set_lowers_to_false_never_a_permissive_default() {
     let l = lower_over_run_id(&SetExpr::None, &viewer("alice"));
@@ -248,10 +218,8 @@ fn none_set_lowers_to_false_never_a_permissive_default() {
 
 #[test]
 fn empty_ids_lowers_to_false_the_leak_free_identity_element() {
-    // An empty allow-set is `FALSE` (no rows) — NEVER a permissive TRUE (the leak-free identity).
     let l = lower_over_run_id(&SetExpr::Ids(vec![]), &viewer("alice"));
     assert_eq!(l.sql_predicate, "FALSE");
-    // An empty deny-set excludes nothing → TRUE.
     let l2 = lower_over_run_id(&SetExpr::NotIds(vec![]), &viewer("alice"));
     assert_eq!(l2.sql_predicate, "TRUE");
 }
@@ -263,7 +231,6 @@ fn ids_lower_to_a_bound_in_over_run_id_never_interpolated() {
         &viewer("alice"),
     );
     assert_eq!(l.sql_predicate, "ci_run.run_id IN (:id_0, :id_1)");
-    // the literal ids live in `params` (bound), never in the SQL.
     assert_eq!(l.params.len(), 2);
     assert_eq!(l.params[0].value, "r1");
     assert!(!l.sql_predicate.contains("r1"), "0 interpolated literals");
@@ -271,7 +238,6 @@ fn ids_lower_to_a_bound_in_over_run_id_never_interpolated() {
 
 #[test]
 fn in_relation_lowers_to_one_authz_visible_join_no_n_plus_1() {
-    // A boolean tree that references the SAME `read` relation TWICE must emit the JOIN ONCE (no N+1).
     let read = SetExpr::InRelation {
         relation: RelName("read".into()),
         via_column: ci_run_id_colref(),
@@ -281,7 +247,7 @@ fn in_relation_lowers_to_one_authz_visible_join_no_n_plus_1() {
     assert_eq!(
         l.joins.len(),
         1,
-        "one JOIN per distinct (viewer, relation) — no N+1"
+        "one JOIN per distinct (viewer, relation) - no N+1"
     );
     assert!(l.joins[0].clause.contains("authz_visible"));
     assert!(l.joins[0].clause.contains("av0.object_id = ci_run.run_id"));
@@ -300,10 +266,8 @@ fn composed_run_list_query_is_one_leak_free_statement_with_the_tenant_predicate(
         1,
         "ONE query (no N+1, no second statement)"
     );
-    // the tenant predicate is ALWAYS emitted (a tenant-less list is unconstructable).
     assert!(q.sql.contains("ci_run.tenant_id = :tenant"));
     assert!(q.sql.contains("ci_run.region = :region"));
-    // the ACL predicate is conjoined BEFORE the ORDER BY / LIMIT (pre-filter, never post-filter).
     let where_pos = q.sql.find("WHERE").unwrap();
     let order_pos = q.sql.find("ORDER BY").unwrap();
     let join_pos = q.sql.find("JOIN authz_visible").unwrap();
@@ -316,10 +280,8 @@ fn composed_run_list_query_is_one_leak_free_statement_with_the_tenant_predicate(
 
 #[test]
 fn the_push_down_returns_only_visible_rows_zero_leak_and_revoke_reflected() {
-    // The LEAK-FREE drill: a partial-visibility run list returns ONLY the visible rows via the JOIN.
     let idx = AuthzVisibleIndex::new();
     let alice = viewer("alice");
-    // alice may `read` r1 and r3, but NOT r2 (the confidential run).
     idx.grant(&tenant(), &region(), "alice", "read", "r1");
     idx.grant(&tenant(), &region(), "alice", "read", "r3");
 
@@ -337,30 +299,26 @@ fn the_push_down_returns_only_visible_rows_zero_leak_and_revoke_reflected() {
     assert_eq!(
         visible,
         vec![ObjectId("r1".into()), ObjectId("r3".into())],
-        "0 leaked rows — the confidential r2 never survives the JOIN"
+        "0 leaked rows - the confidential r2 never survives the JOIN"
     );
 
-    // REVOKE reflected: after revoking r3, the list returns only r1.
     idx.revoke(&tenant(), &region(), "alice", "read", "r3");
     let after = idx.evaluate(&tenant(), &region(), &alice, &lowered, &candidates);
     assert_eq!(
         after,
         vec![ObjectId("r1".into())],
-        "a revoked grant is reflected — r3 no longer surfaces"
+        "a revoked grant is reflected - r3 no longer surfaces"
     );
 }
 
 #[test]
 fn the_search_pre_filter_carries_the_acl_filter_binder_for_the_lint() {
-    // The `search-requires-acl-filter` lint fingerprints the `acl_filter` binder — a search that
-    // scores first leaks the existence/rank of a forbidden run.
     let read = SetExpr::InRelation {
         relation: RelName("read".into()),
         via_column: ci_run_id_colref(),
     };
     let pf = run_search_pre_filter(&read, &viewer("alice"));
     assert!(pf.acl_filter.depends_on_reverse_index());
-    // a denied run never survives the pre-filter (the search INPUT set, not a post-filter).
     let idx = AuthzVisibleIndex::new();
     let visible = idx.evaluate(
         &tenant(),
@@ -377,7 +335,6 @@ fn the_search_pre_filter_carries_the_acl_filter_binder_for_the_lint() {
 
 #[test]
 fn difference_lowers_to_and_not_for_the_fork_exclusion() {
-    // `run.read = run.view − is_untrusted_fork` lowers as an `AND NOT` (the fork exclusion).
     let view = SetExpr::InRelation {
         relation: RelName("view".into()),
         via_column: ci_run_id_colref(),
@@ -387,7 +344,6 @@ fn difference_lowers_to_and_not_for_the_fork_exclusion() {
     let l = lower_over_run_id(&expr, &viewer("alice"));
     assert!(l.sql_predicate.contains("AND NOT"));
 
-    // the fork run is excluded even though `view` is granted.
     let idx = AuthzVisibleIndex::new();
     idx.grant(&tenant(), &region(), "alice", "view", "good-run");
     idx.grant(&tenant(), &region(), "alice", "view", "fork-run");
@@ -404,10 +360,6 @@ fn difference_lowers_to_and_not_for_the_fork_exclusion() {
         "the fork run is excluded by the Difference (AND NOT)"
     );
 }
-
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// 3. project(ref, viewer) — PERMISSION FIRST (the 0-leak gate, contract 5.6)
-// ════════════════════════════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn authorized_viewer_gets_the_run_projection() {
@@ -442,7 +394,6 @@ fn unauthorized_viewer_gets_a_tombstone_never_the_title() {
     let run_ref = ci_run_ref("acme", "01J7RUN");
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
-    // the Id stub allows NOBODY → every check denies.
     let p = Projector::new(StubId::new(), store);
 
     let got = p.project(&run_ref, &viewer("mallory"), z()).unwrap();
@@ -450,11 +401,10 @@ fn unauthorized_viewer_gets_a_tombstone_never_the_title() {
         got.is_tombstone(),
         "an unauthorized viewer must get a tombstone"
     );
-    // THE 0-LEAK INVARIANT: the title is NEVER returned to the denied viewer.
     assert_eq!(
         got.title(),
         None,
-        "0 title leak — the denied viewer never gets the title"
+        "0 title leak - the denied viewer never gets the title"
     );
     if let Projected::Tombstoned(t) = got {
         assert_eq!(t.reason, TombstoneReason::Unauthorized);
@@ -467,7 +417,6 @@ fn an_id_hiccup_fails_closed_to_a_tombstone() {
     let run_ref = ci_run_ref("acme", "01J7RUN");
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
-    // the Id ALLOWS alice, but the transport hiccups — the projector must fail CLOSED.
     let p = Projector::new(StubId::new().allow_view(&run_ref).with_hiccup(), store);
 
     let got = p.project(&run_ref, &viewer("alice"), z()).unwrap();
@@ -484,7 +433,6 @@ fn an_erased_run_projects_to_a_tombstone() {
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
     store.mark_erased(&run_ref);
-    // the viewer IS authorised, but the artifact is erased → an erasure-safe tombstone (§6).
     let p = Projector::new(StubId::new().allow_view(&run_ref), store);
 
     let got = p.project(&run_ref, &viewer("alice"), z()).unwrap();
@@ -519,8 +467,6 @@ fn a_step_sub_anchor_projects_and_inherits_the_parent_run_permission() {
     let step_ref = run_step_ref(&run_ref, 3).unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
-    // the Id allows `view` on the ROOT run — the step sub inherits it (the projector checks the
-    // stripped root; a sub is never more visible than its parent).
     let p = Projector::new(StubId::new().allow_view(&run_ref), store);
 
     let got = p.project(&step_ref, &viewer("alice"), z()).unwrap();
@@ -538,7 +484,6 @@ fn a_step_sub_is_tombstoned_when_the_parent_run_is_denied() {
     let step_ref = run_step_ref(&run_ref, 3).unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
-    // the Id allows NOBODY → the step's parent run is denied → the step is tombstoned.
     let p = Projector::new(StubId::new(), store);
     let got = p.project(&step_ref, &viewer("mallory"), z()).unwrap();
     assert!(got.is_tombstone());
@@ -597,7 +542,6 @@ fn project_deployment_and_pipeline_for_authorized_viewer() {
 
 #[test]
 fn a_dangling_ref_is_not_found_not_a_tombstone() {
-    // authorised, but nothing in the store → NotFound (distinct from a tombstone).
     let run_ref = ci_run_ref("acme", "missing");
     let p = Projector::new(StubId::new().allow_view(&run_ref), ArtifactStore::new());
     assert!(matches!(
@@ -616,16 +560,12 @@ fn a_non_ci_ref_is_a_loud_error_not_a_tombstone() {
     ));
 }
 
-// ── erasure/restriction keyed on the SUB-REF ONLY (the `||` in the guard is load-bearing: an erased
-//    `#step-3` whose ROOT is NOT erased must STILL tombstone — `&&` would leak the step). ──
-
 #[test]
 fn an_erased_step_subref_tombstones_even_when_the_root_is_not_erased() {
     let run_ref = ci_run_ref("acme", "01J7RUN");
     let step_ref = run_step_ref(&run_ref, 3).unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
-    // mark ONLY the full sub-URN erased (the root is live) — the `reference.0` arm of the `||`.
     store.mark_erased(&step_ref);
     let p = Projector::new(StubId::new().allow_view(&run_ref), store);
 
@@ -643,7 +583,7 @@ fn a_restricted_step_subref_tombstones_even_when_the_root_is_not_restricted() {
     let step_ref = run_step_ref(&run_ref, 3).unwrap();
     let mut store = ArtifactStore::new();
     store.put_run(&run_ref, a_run());
-    store.mark_restricted(&step_ref); // the `reference.0` arm of the restricted `||`.
+    store.mark_restricted(&step_ref);
     let p = Projector::new(StubId::new().allow_view(&run_ref), store);
 
     let got = p.project(&step_ref, &viewer("alice"), z()).unwrap();
@@ -655,7 +595,6 @@ fn a_restricted_step_subref_tombstones_even_when_the_root_is_not_restricted() {
 
 #[test]
 fn runner_and_artifact_project_to_a_minimal_id_based_projection() {
-    // exercises `project_minimal` + `canonical_id` (the `<id>` segment extraction).
     let runner_ref = ci_runner_ref("acme", "rn1");
     let art_ref = ci_artifact_ref("acme", "art2");
     let p = Projector::new(
@@ -709,18 +648,13 @@ fn project_errors_display_loud_and_name_the_reference() {
     assert!(nf.to_string().contains("dangling"));
 }
 
-// ── direct exercise of the in-memory evaluator's boolean predicate parser (the `Union`/`Intersect`/
-//    `Difference` lowering composed with the JOIN forms — the `AND`/`OR`/`AND NOT`/paren grammar). ──
-
 #[test]
 fn the_evaluator_resolves_or_and_difference_precedence_correctly() {
     let idx = AuthzVisibleIndex::new();
     let alice = viewer("alice");
-    // alice may `view` r1 and r2; r2 is also a fork (excluded by the Difference).
     idx.grant(&tenant(), &region(), "alice", "view", "r1");
     idx.grant(&tenant(), &region(), "alice", "view", "r2");
 
-    // (view) AND NOT (fork-ids) — the Difference; AND binds tighter than OR.
     let expr = SetExpr::Difference(
         Box::new(SetExpr::InRelation {
             relation: RelName("view".into()),
@@ -740,10 +674,8 @@ fn the_evaluator_resolves_or_and_difference_precedence_correctly() {
             ObjectId("r3".into()),
         ],
     );
-    // r1: view ✓, not in fork-set → kept. r2: view ✓ but in fork-set → excluded. r3: no view → out.
     assert_eq!(got, vec![ObjectId("r1".into())]);
 
-    // a Union of two allow-sets: the OR keeps either side.
     let union = SetExpr::Union(vec![
         SetExpr::Ids(vec![ObjectId("a".into())]),
         SetExpr::Ids(vec![ObjectId("b".into())]),
@@ -762,7 +694,6 @@ fn the_evaluator_resolves_or_and_difference_precedence_correctly() {
     );
     assert_eq!(gu, vec![ObjectId("a".into()), ObjectId("b".into())]);
 
-    // an Intersect of (view) AND (allow r1) keeps only r1.
     let inter = SetExpr::Intersect(vec![
         SetExpr::InRelation {
             relation: RelName("view".into()),

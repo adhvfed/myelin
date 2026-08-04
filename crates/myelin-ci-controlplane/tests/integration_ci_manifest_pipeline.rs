@@ -1,4 +1,3 @@
-//! Live PostgreSQL proof for immutable-manifest resolution and DAG replay.
 #![cfg(feature = "integration")]
 
 mod common;
@@ -199,15 +198,6 @@ fn definition() -> CiWorkflowDefinitionPin {
     CiWorkflowDefinitionPin::new(1, BODY_HASH).unwrap()
 }
 
-/// Seed `ci_run_check_attempt` for every manifest check context, mirroring the allocation
-/// `CiRunStore::co_commit_reserve` performs at real dispatch/reserve time (see
-/// `ci_run_store::allocate_reserve_check_attempts`). Production `PgCiPipelineStarter::run_once`
-/// only ever READS this table (`pg_pipeline_starter::load_reserved_check_attempts`) — it never
-/// allocates it itself, by design, because the runtime role has no `UPDATE` grant on the table and
-/// the allocation is meant to happen exactly once, at dispatch reserve time, before the run is even
-/// queued. This test drives `ci_run` into existence with a raw `INSERT` instead of going through the
-/// dispatch consumer's `co_commit_reserve`, so it must perform this same reservation itself or the
-/// starter correctly refuses to fabricate a manifest with no run-scoped attempt authority.
 async fn reserve_test_check_attempts(pool: &PgPool, run_id: &str, repo_ref: &str, commit_oid: &str) {
     let run_id = sqlx::types::Uuid::parse_str(run_id).expect("test run UUID");
     for context in ["build", "package", "test"] {
@@ -326,16 +316,6 @@ async fn starter_manifest_drives_dag_across_worker_restarts_and_loader_retry() {
         .await
         .unwrap();
     let pool = pool_on(&schema).await;
-    // BUG FIX (investigation, 2026-07-25): this test's ONLY cleanup used to be the
-    // `pool.close(); bare.execute(DROP SCHEMA ...)` pair at the very end of the happy path — so a
-    // panicking assertion or `.unwrap()` anywhere in between (this test hit exactly that, via a
-    // genuinely separate `pg_pipeline_starter.rs` "manifest check context has no run-scoped
-    // allocation ledger" bug) left `ci_manifest_dag_<pid>` behind forever, the same class of leak
-    // found and fixed across 21 other files today. Wrapping the body in catch_unwind + unconditional
-    // cleanup + resume_unwind (mirrors `myelin-ci-sandbox`/`myelin-storage`'s sibling fixes) makes
-    // cleanup run whether this test passes, fails an assertion, or panics. `pool.close()` shuts down
-    // the WHOLE pool (not just this handle) for every clone, so it must run AFTER the wrapped body,
-    // never inside it.
     let result = std::panic::AssertUnwindSafe(async {
     PgMigrator::apply(&pool, &foundation_migrations())
         .await

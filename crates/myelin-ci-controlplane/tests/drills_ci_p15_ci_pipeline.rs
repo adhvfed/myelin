@@ -1,26 +1,3 @@
-//! # The `ci.pipeline` body drill — CI-D9 (determinism guard) (CI-P15 → P-358, M4)
-//!
-//! The CI-P15 GATE drill: the `ci.pipeline` DURABLE WORKFLOW BODY
-//! ([`myelin_ci_controlplane::ci_pipeline::run_ci_pipeline_body`]) run UNDER THE REAL DURABLE
-//! DISPATCHER ([`myelin_flow::FlowDispatcher`] over a `RunStore` + journal + signal buffer + outbox +
-//! timer wheel), proving CI-D9:
-//!
-//! - **flow-determinism lint GREEN on the real body** — the actual `ci_pipeline.rs` body file passes
-//!   the `flow-determinism` lint (no clock/RNG/IO outside `WfCtx`); a RED fixture (a body with a raw
-//!   `SystemTime::now()`) FAILS the lint (the red+green fixture pair, the prompt's required test).
-//! - **REPLAY-BIT-IDENTICAL + ONLY-journaled-`job.done`** — a parked run re-driven with NO buffered
-//!   `job.done` STILL parks (the body never advances on an un-journaled stage), and the journal is
-//!   BYTE-IDENTICAL across the two drives (0 re-dispatch, 0 re-emit).
-//! - **The X-1 PRODUCER side lands on the terminal drive** — once every stage's `job.done` is
-//!   journaled, the run reaches SUCCESS and the body emits the terminal per-context
-//!   `ci.check.updated` + `ci.run.succeeded` + the `ci.result` rollup (the producer facts the merge
-//!   queue + Git's gate consume).
-//!
-//! The `job.done` PRODUCER is a recording runner fixture standing in for CI's real runner pool — the
-//! `SCHEDULE_AND_RUN_JOB` dispatch into the live scheduler/runner is CI-P16 (P-359), GATED by AG-D4.
-//! The bit-identical replay + effectively-once crash-recovery of the ENGINE the body composes is
-//! additionally drilled in `myelin-flow/tests/drills_ci_pipeline.rs` (CI-D9/CI-D1 on the substrate).
-
 use myelin_ci_controlplane::ci_pipeline::{
     run_ci_pipeline_body, CheckFacts, PipelineRun, PipelineStage, RunVerdict,
 };
@@ -74,8 +51,6 @@ fn facts() -> CheckFacts {
     }
 }
 
-/// The reference run: two ordered runner stages (`build` → `test`), un-metered, each a
-/// `SCHEDULE_AND_RUN_JOB` long-park; two reported contexts (`build`, `test`).
 fn run_spec() -> PipelineRun {
     PipelineRun {
         stages: vec![
@@ -109,8 +84,6 @@ impl JobRunner for CountingCiRunner {
     }
 }
 
-/// The registered `ci.pipeline` body closure: run the CI body + encode the terminal verdict into the
-/// body's result refs so the drill reads it off the [`DriveOutcome`].
 fn ci_pipeline_body(runner: Arc<CountingCiRunner>) -> Box<WorkflowBody> {
     Box::new(move |ctx: &mut WfCtx| {
         let verdict = run_ci_pipeline_body(ctx, &run_spec(), runner.as_ref())
@@ -184,7 +157,6 @@ fn start(idem: &str) -> (FlowExecutor, myelin_flow::RunId, Substrate) {
     (ex, run, sub)
 }
 
-/// The deterministic dispatch `idem_token` for the Nth runner stage (each = 2 command positions).
 fn stage_token(run_id: &str, stage_idx: usize) -> String {
     job_idem_token(run_id, &format!("{CI_PIPELINE_WF_TYPE}:{}", stage_idx * 2))
 }
@@ -206,18 +178,12 @@ fn deliver_stage_done(
     .expect("deliver job.done")
 }
 
-/// **CI-D9 — the `ci.pipeline` BODY is replay-bit-identical + only a journaled `job.done` feeds it +
-/// the X-1 producer facts land on the terminal drive.** The body runs under the real dispatcher: a
-/// parked re-drive with no buffered `job.done` STILL parks (byte-identical journal, 0 re-dispatch);
-/// once every stage's `job.done` is journaled, the run reaches SUCCESS and emits the terminal X-1
-/// producer facts.
 #[test]
 fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
     let runner = Arc::new(CountingCiRunner::default());
     let (ex, run, sub) = start("ci.pipeline:pr-7:run-1");
     let part = partition_for_run_id(&run.0);
 
-    // DRIVE 1: dispatch `build` + park on its job.done.
     let w1 = fresh_worker(&sub, "worker-1", part, runner.clone());
     assert_eq!(
         w1.tick(1_000, "2026-06-23T00:00:00Z", 7).expect("drive 1"),
@@ -227,7 +193,7 @@ fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
     assert_eq!(
         sub.runs.get(&tenant(), &run.0).unwrap().state,
         run_state::WAITING,
-        "state=waiting — the pipeline holds no runtime across the build"
+        "state=waiting - the pipeline holds no runtime across the build"
     );
     assert_eq!(
         runner.calls.load(Ordering::SeqCst),
@@ -246,7 +212,6 @@ fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
         "the dispatch + wait journaled"
     );
 
-    // ONLY-JOURNALED-JOB.DONE: a re-drive with NO buffered job.done STILL parks at build.
     sub.runs.wake(&tenant(), &run.0);
     let w_replay = fresh_worker(&sub, "worker-replay", part, runner.clone());
     assert_eq!(
@@ -262,7 +227,6 @@ fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
         "0 RE-DISPATCH on the replay (the dispatch short-circuited)"
     );
 
-    // BIT-IDENTICAL: the journal after the replay is BYTE-IDENTICAL to drive 1's.
     let journal_after_replay: Vec<_> = sub
         .journal
         .history_for(&tenant(), &run.0)
@@ -273,7 +237,6 @@ fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
         journal_after_drive1, journal_after_replay,
         "REPLAY-BIT-IDENTICAL: the journal is byte-identical across the two drives (CI-D9)"
     );
-    // No terminal X-1 facts while parked (a parked run is not terminal).
     assert!(
         sub.outbox
             .committed_rows()
@@ -282,7 +245,6 @@ fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
         "no terminal ci.run.succeeded while the run is parked"
     );
 
-    // Feed build's job.done → advance to test (parks on test's job.done).
     deliver_stage_done(&ex, &run, 0, "build", true);
     sub.runs.wake(&tenant(), &run.0);
     let w2 = fresh_worker(&sub, "worker-2", part, runner.clone());
@@ -298,7 +260,6 @@ fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
         "build (replayed, 0 re-dispatch) + test (dispatched once)"
     );
 
-    // Feed test's job.done → the run reaches SUCCESS and emits the X-1 producer facts.
     deliver_stage_done(&ex, &run, 1, "test", true);
     sub.runs.wake(&tenant(), &run.0);
     let w3 = fresh_worker(&sub, "worker-3", part, runner.clone());
@@ -319,7 +280,6 @@ fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
         "exactly two dispatches across the whole run (0 re-dispatch on any replay)"
     );
 
-    // THE X-1 PRODUCER FACTS: two per-context terminal ci.check.updated + ci.run.succeeded + ci.result.
     let types: Vec<String> = sub
         .outbox
         .committed_rows()
@@ -348,15 +308,10 @@ fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
     );
 }
 
-/// **CI-D9 (the flow-determinism red+green fixture) — the REAL `ci.pipeline` body is lint-green; a
-/// body with a raw clock is lint-RED.** The prompt's required red+green fixture: the actual
-/// `ci_pipeline.rs` body file passes `flow-determinism` (no clock/RNG/IO outside `WfCtx`); a fixture
-/// body with a raw `SystemTime::now()` inside a `@workflow-body` FAILS the lint.
 #[test]
 fn ci_d9_flow_determinism_lint_green_on_the_real_body_red_on_a_raw_clock() {
     let lint = myelin_lints::flow_determinism();
 
-    // GREEN: the ACTUAL ci.pipeline body file (the deliverable) reads no clock/RNG/IO outside WfCtx.
     let real_body = include_str!("../src/ci_pipeline.rs");
     let green = lint.run(real_body);
     assert!(
@@ -364,11 +319,9 @@ fn ci_d9_flow_determinism_lint_green_on_the_real_body_red_on_a_raw_clock() {
         "the real ci.pipeline body must be flow-determinism clean, got {green:?}"
     );
 
-    // RED: a workflow body that reads a raw clock bypasses WfCtx → the lint FIRES (the determinism
-    // guard the body must never trip). The `@workflow-body` marker scopes the scan.
     let red = "// @workflow-body\n\
         fn ci_pipeline(ctx: &mut WfCtx) {\n\
-        \x20\x20\x20\x20let now = std::time::SystemTime::now(); // BYPASSES WfCtx — replay diverges\n\
+        \x20\x20\x20\x20let now = std::time::SystemTime::now(); // BYPASSES WfCtx - replay diverges\n\
         \x20\x20\x20\x20let _ = (ctx, now);\n\
         }\n";
     assert!(

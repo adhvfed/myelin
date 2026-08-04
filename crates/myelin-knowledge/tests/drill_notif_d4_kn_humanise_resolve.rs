@@ -1,25 +1,3 @@
-//! # NOTIF-D4 re-confirmed on a REAL Knowledge subject through the project-Display → humanise path
-//! (KN-P22 / P-312, M3)
-//!
-//! **Drill source:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` row **NOTIF-D4**
-//! ("notify on a confidential subject to a viewer lacking access → humanised tombstone; the title
-//! NEVER appears; 0 title/PII leak") — re-run here against a REAL Knowledge confidential page subject
-//! (`myelin://<tenant>/knowledge/page/<id>`), driving Notif's [`humanise`](myelin_notif::humanise)
-//! over Knowledge's REAL per-viewer [`Projector`](myelin_knowledge::refs_glue::Projector) via the
-//! [`KnowledgeRefResolver`](myelin_knowledge::KnowledgeRefResolver) (the project Display mode = the
-//! humanisation projection, architecture 03 §2.2 / OQ-L). This is the prompt's GATE: a Knowledge
-//! mention/comment/share/watched renders through the ONE humanise surface per-viewer, and a
-//! confidential subject degrades to a humanised tombstone with the title NEVER leaking (threshold 0,
-//! never softened).
-//!
-//! **The always-current / chained-mutation property (EI-01 §4):** because humanise binds the slot at
-//! READ time through the per-viewer resolve, a permission CHANGE flips the slot from a title to a
-//! tombstone with NO re-write. The chained test below proves it: render WITH access (title) → revoke
-//! → re-render → the title is now a tombstone. **ZERO Notif code change** — this consumes Notif's
-//! frozen humanise + RefResolvePort seams; the leak property is structural (a denied ref resolves to a
-//! `Tombstone` that carries no title field). The full real-page-tree `- direct_block` override version
-//! is `crates/myelin-identity-service/tests/drill_notif_d4_kn_d5_d13_real_kn_subject.rs` (NOTIF-P20).
-
 use std::collections::HashSet;
 use std::sync::Mutex;
 
@@ -37,11 +15,9 @@ use myelin_notif::{reason_template_key, Reason};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 
-/// The secret page title (the leak target — must NEVER appear for a denied viewer).
 const SECRET_PAGE_TITLE: &str =
     "Incident PROJECT-NIGHTFALL: signing-key rotation before the acquisition";
 
-/// Every KN reason → its humanise template key; the leak property must hold for ALL of them.
 const KN_REASONS: &[Reason] = &[
     Reason::Mentioned,
     Reason::Comments,
@@ -76,9 +52,6 @@ fn contains_leak(text: &str) -> bool {
         || lc.contains("signing-key")
 }
 
-/// A deterministic Id whose `read` allow-set is MUTABLE (so the chained-revoke test flips it). A
-/// `read@object` allow-list (absent ⇒ Deny, fail-closed). Behind a `Mutex` so it is `Send + Sync`
-/// (the `RefResolvePort` bound).
 struct MutableId {
     allow: Mutex<HashSet<String>>,
 }
@@ -198,13 +171,9 @@ fn resolver_with(id: MutableId) -> KnowledgeRefResolver<MutableId> {
     KnowledgeRefResolver::new(Projector::new(id, store))
 }
 
-/// **NOTIF-D4 on a REAL KN subject (the dated green artifact): 0 title/PII leak when a viewer lacking
-/// `read` on a confidential KN page is notified about it.** Across denied viewers × every channel ×
-/// every KN reason template, the secret page title appears EXACTLY ZERO times, and every denied render
-/// shows the PII-free `a restricted page` tombstone. Threshold 0 — never softened.
 #[test]
 fn notif_d4_zero_leak_on_real_kn_confidential_page() {
-    let resolver = resolver_with(MutableId::new()); // nobody granted read → every viewer denied
+    let resolver = resolver_with(MutableId::new());
     let templates = TemplateStore::with_platform_defaults();
     let subject = confidential_page();
     let denied = ["ex-contractor", "wrong-space-member", "intern-no-access"];
@@ -258,9 +227,6 @@ fn notif_d4_zero_leak_on_real_kn_confidential_page() {
     );
 }
 
-/// **The complement — a viewer WITH `read` DOES see the confidential page title (the gate
-/// discriminates, it is not a blanket redaction).** Proves the resolve→humanise path is REAL, over
-/// Knowledge's permission-first projector.
 #[test]
 fn notif_d4_permitted_kn_viewer_sees_the_page_title() {
     let id = MutableId::new();
@@ -289,10 +255,6 @@ fn notif_d4_permitted_kn_viewer_sees_the_page_title() {
     );
 }
 
-/// **Always-current (the chained-mutation property, EI-01 §4): a permission REVOKE between two renders
-/// flips the slot from a title to a tombstone with NO re-write.** Render WITH access (title shown) →
-/// revoke read → re-render → the title is now a tombstone (0 leak). The inbox row never moved; only the
-/// per-viewer resolve at read time changed.
 #[test]
 fn notif_d4_revoke_flips_title_to_tombstone_no_rewrite() {
     let id = MutableId::new();
@@ -300,7 +262,6 @@ fn notif_d4_revoke_flips_title_to_tombstone_no_rewrite() {
     let resolver = resolver_with(id);
     let subject = confidential_page();
 
-    // (1) with access: the title resolves.
     match resolver.resolve_display(
         &acme(),
         &region(),
@@ -312,12 +273,9 @@ fn notif_d4_revoke_flips_title_to_tombstone_no_rewrite() {
         RefResolution::Tombstone(_) => panic!("alice has read → must project the title"),
     }
 
-    // (2) REVOKE alice's read (the new-enemy guard in prod is a fresh zookie watermark). The Id is the
-    // SAME mutable allow-set the projector holds — granted then revoked → the next render is denied,
-    // with NO inbox re-write (the slot is bound at READ time through the per-viewer resolve).
     let revoked_id = MutableId::new();
     revoked_id.grant_read(&subject);
-    revoked_id.revoke_read(&subject); // granted then revoked → denied
+    revoked_id.revoke_read(&subject);
     let revoked = resolver_with(revoked_id);
     let h = humanise(
         &revoked,

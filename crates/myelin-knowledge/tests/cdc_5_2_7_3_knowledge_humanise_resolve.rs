@@ -1,35 +1,3 @@
-//! # The CDC pair for contracts 5.2 + 7.3 — **Knowledge's `project` Display mode feeds the ONE
-//! humanise templating surface** (KN-P22 / P-312, M3)
-//!
-//! **Contract-index rows.**
-//! - **7.3** `humanise(item | (template_key, args), viewer, locale) -> HumanisedString{text, links[],
-//!   icon}` — the ONE platform templating surface (owned + frozen at NOTIF-P9, `crates/myelin-notif/
-//!   src/humanise.rs`). THIS file pins the **Knowledge slice**: Knowledge feeds its per-viewer project
-//!   Display projection into the ONE surface (architecture 03 §2.2 — "Display mode = the humanisation
-//!   projection Notif uses … the sole humanise templating surface, OQ-L; Knowledge registers no second
-//!   template engine"). It accretes the SAME way Git's slice does (`cdc_5_2_7_3_7_1_git_humanise_
-//!   resolve.rs`) — ZERO Notif change.
-//! - **5.2** `resolve(ref, viewer, mode=Display) -> Projection | Tombstone` (the resolve seam humanise
-//!   binds its slots to). The Knowledge **PROVIDER** is the REAL `KnowledgeRefResolver` over the
-//!   permission-first `Projector` (5.6); the **CONSUMER** is Notif's humanise, which calls
-//!   `resolve_display` on a `&dyn RefResolvePort` BEFORE formatting.
-//!
-//! - The **PRODUCER** (the provider side) is **Knowledge resolving a ref to a `Projection | Tombstone`
-//!   per-viewer, permission FIRST** ([`myelin_knowledge::KnowledgeRefResolver`] over
-//!   [`myelin_knowledge::refs_glue::Projector`]). The producer's promise: an allowed viewer gets the
-//!   title + a click-route; a denied/erased/restricted/gone viewer gets a tombstone that STRUCTURALLY
-//!   carries no title (the 0-leak invariant), and NO second template engine (it feeds the ONE surface).
-//! - The **CONSUMER** is **Notif's `humanise`** binding each `ArtifactRef` slot through the resolver
-//!   and rendering the ICU-subset template → the per-viewer `HumanisedString` (the title for an allowed
-//!   viewer; the PII-free `a restricted page` / `[erased user]` for a denied/erased one).
-//!
-//! The two sides are pinned here so a drift on either (KN leaks a title on the deny path / invents a
-//! second template engine; Notif changes the `RefResolvePort` shape, the `HumanisedString` shape, or
-//! the tombstone display) fails this test in the same CI job. The KN reason vocabulary (`mentioned` /
-//! `comments` / `shared` / `watched`) the templates key on is the SAME set NOTIF-P20 registers via
-//! `define_notif_rule` (asserted here against `myelin_identity_service::knowledge_rules`, the dev-dep),
-//! so the 7.6 registration and the 7.3 render agree by NAME (X-5).
-
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, ConsistencyMode, Credential, Decision, IdentityService,
     ListObjectsResult, ObjectId, ObjectType, Permission, Principal, PrincipalId, PrincipalKind,
@@ -63,7 +31,6 @@ fn strong(zk: &str) -> Consistency {
     }
 }
 
-/// A deterministic Id: a `read@object` allow-list (absent ⇒ Deny, fail-closed).
 struct StubId {
     allow: HashSet<String>,
 }
@@ -184,12 +151,8 @@ fn resolver(grant_read: bool) -> KnowledgeRefResolver<StubId> {
     KnowledgeRefResolver::new(Projector::new(id, store))
 }
 
-/// **PROVIDER side: Knowledge's resolver returns `Projection | Tombstone` per-viewer, permission
-/// FIRST.** An allowed viewer's slot carries the title + the click-route ref; a denied viewer's slot is
-/// a tombstone that STRUCTURALLY has no title field — the 5.2 resolve seam humanise binds against.
 #[test]
 fn provider_knowledge_resolve_is_projection_or_tombstone_permission_first() {
-    // allowed → Projection with the title + the click-route ref.
     let allowed = resolver(true);
     match allowed.resolve_display(
         &acme(),
@@ -205,7 +168,6 @@ fn provider_knowledge_resolve_is_projection_or_tombstone_permission_first() {
         }
         RefResolution::Tombstone(_) => panic!("an allowed viewer must project the title"),
     }
-    // denied → Tombstone carrying the opaque root, NEVER the title.
     let denied = resolver(false);
     match denied.resolve_display(
         &acme(),
@@ -219,16 +181,11 @@ fn provider_knowledge_resolve_is_projection_or_tombstone_permission_first() {
     }
 }
 
-/// **CONSUMER side: Notif's `humanise` binds the KN Display slot per-viewer → a per-viewer
-/// `HumanisedString`.** The allowed viewer sees the title (+ a click-route link); the denied viewer
-/// sees the PII-free `a restricted page` tombstone — the SAME reason template, rendered through the ONE
-/// surface. This is the project-Display → humanise bridge (architecture §2.2 / OQ-L).
 #[test]
 fn consumer_humanise_renders_the_kn_display_projection_per_viewer() {
     let templates = TemplateStore::with_platform_defaults();
-    let key = reason_template_key(Reason::Mentioned); // "You were mentioned in {0}"
+    let key = reason_template_key(Reason::Mentioned);
 
-    // allowed viewer → the title renders.
     let allowed = resolver(true);
     let h = humanise(
         &allowed,
@@ -252,7 +209,6 @@ fn consumer_humanise_renders_the_kn_display_projection_per_viewer() {
         "the allowed branch carries the click-route link"
     );
 
-    // denied viewer → the PII-free tombstone, the SAME reason template (the ONE surface, no 2nd engine).
     let denied = resolver(false);
     let h = humanise(
         &denied,
@@ -280,16 +236,11 @@ fn consumer_humanise_renders_the_kn_display_projection_per_viewer() {
     );
 }
 
-/// **The 7.3 render keys on the SAME KN reason vocabulary the 7.6 registration (NOTIF-P20) declares —
-/// one vocabulary, no drift (X-5).** The four KN reasons Knowledge registers via `define_notif_rule`
-/// (in `myelin_identity_service::knowledge_rules`) each have a platform-default humanise template, so a
-/// KN Signal of that reason renders through the ONE surface. A rename on either side breaks this.
 #[test]
 fn the_kn_reason_vocabulary_agrees_between_7_6_registration_and_7_3_render() {
     use myelin_identity_service::knowledge_rules::knowledge_notif_rules;
     let rules = knowledge_notif_rules().expect("kn's set is table-correct");
     let templates = TemplateStore::with_platform_defaults();
-    // Each registered KN reason has a platform-default humanise template (the render surface admits it).
     for (key, rule) in &rules {
         let tkey = reason_template_key(rule.reason);
         assert!(
@@ -298,7 +249,6 @@ fn the_kn_reason_vocabulary_agrees_between_7_6_registration_and_7_3_render() {
             rule.reason
         );
     }
-    // the four KN reasons are exactly mentioned / comments / shared / watched.
     let reasons: Vec<Reason> = rules.iter().map(|(_, r)| r.reason).collect();
     assert_eq!(
         reasons,
@@ -312,9 +262,6 @@ fn the_kn_reason_vocabulary_agrees_between_7_6_registration_and_7_3_render() {
     );
 }
 
-/// **NOTIF-D4-class re-confirm (the gate): a confidential KN subject humanises to a tombstone across
-/// every channel × every KN reason → 0 title leak.** Threshold 0, never softened. This is the gate the
-/// prompt names; the full real-page-tree `- direct_block` version is the NOTIF-P20 drill.
 #[test]
 fn notif_d4_zero_title_leak_over_every_kn_reason_and_channel() {
     let denied = resolver(false);

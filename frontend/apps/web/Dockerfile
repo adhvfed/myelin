@@ -6,7 +6,6 @@ WORKDIR /workspace
 
 RUN corepack enable && corepack prepare pnpm@10.5.2 --activate
 
-# Resolve the locked graph before copying source so ordinary code changes retain the dependency layer.
 COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml frontend/.npmrc ./frontend/
 COPY frontend/apps/web/package.json ./frontend/apps/web/package.json
 COPY frontend/apps/desktop/package.json ./frontend/apps/desktop/package.json
@@ -29,8 +28,6 @@ ENV HOST=0.0.0.0
 ENV PORT=3000
 WORKDIR /app
 
-# Nitro's node-server output includes the exact runtime dependencies it needs; no package manager or
-# source tree is carried into the serving image.
 COPY --from=build --chown=node:node /workspace/frontend/apps/web/.output/ ./
 
 USER node

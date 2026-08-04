@@ -1,26 +1,3 @@
-//! # BUS-D1 (F5) — kill consumer + sever broker → 0 lost, 0 duplicate effects (EB-23 / P-143)
-//!
-//! **Drill catalogue:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` row BUS-D1
-//! ("Kill consumer + sever broker during sustained publish → 0 lost, 0 duplicate effects on
-//! reconnect", gate: **lost/dup = 0; lag drains**) — the F5 family; architecture §8.
-//!
-//! ## What this drill proves (the EB-23 GATE), in the dispatch tier's scope
-//! The dispatch tier delivers dispatched actions to the Agent Fabric inbox (8.6) over the broker.
-//! When the broker is SEVERED mid-stream (the consumer cannot deliver), the tier must NOT silently
-//! drop the dispatch and must NOT double-effect it on reconnect:
-//! 1. **0 LOST.** A dispatch attempted while the broker is down is NOT silently lost — it is
-//!    re-driven on reconnect (the at-least-once posture; the durable re-drive is the outbox relay's
-//!    in the production path, modelled here by the re-drive loop).
-//! 2. **0 DUPLICATE EFFECTS.** The re-drive is **idempotent on `event_id`** — the inbox dedups a
-//!    redelivered dispatched action (the `consumer_dedup` discipline, 2.5), so the surviving effect
-//!    count after the storm-and-reconnect equals the number of DISTINCT dispatches, never more.
-//! 3. **LAG DRAINS.** After reconnect every pending dispatch is delivered exactly once (the
-//!    `ConsumerLag` survival signal reads `0`).
-//!
-//! The broker kill is driven through the FROZEN harness `Dependency::Broker` reversible break
-//! injector (P-S03), and the verdict is read off the §10.2 `ConsumerLag` survival signal — exactly
-//! the same fault + assertion vocabulary the events crate's SUB-D1/BUS-D1 drills use.
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EventEnvelope, EventId,
     EventType, Timestamp, Visibility,
@@ -78,16 +55,9 @@ fn req(n: u64) -> DispatchRequest {
     }
 }
 
-/// The 8.6 inbox CONSUMER, broker-aware + dedup-disciplined (the BUS-D1 model):
-/// - while `Dependency::Broker` is SEVERED it refuses delivery (`Err`) — the consumer is "killed";
-/// - it dedups a redelivered action by `event_id` (the `consumer_dedup` discipline, 2.5), so a
-///   re-drive after reconnect lands the effect **exactly once** (0 duplicate).
 struct BrokerAwareInbox {
     breaker: DependencyBreaker,
-    /// The DISTINCT dispatched-action ids that landed an effect (the dedup ledger). A redelivery of
-    /// an already-seen id is a no-op (0 duplicate effects).
     landed: RefCell<HashSet<EventId>>,
-    /// The total number of effects applied (must equal `landed.len()` — proof of 0 duplicate).
     effect_count: RefCell<u64>,
 }
 
@@ -103,15 +73,12 @@ impl BrokerAwareInbox {
 
 impl DispatchTarget for BrokerAwareInbox {
     fn deliver(&self, action: &EventEnvelope) -> Result<(), DispatchError> {
-        // The broker is severed → the consumer cannot deliver (it is "killed"). Surfaced, never a
-        // silent success: the tier re-drives on reconnect.
         if self
             .breaker
             .is_broken(&Dependency::Broker, &Scope::Tenant(TenantId("t1".into())))
         {
             return Err(DispatchError("broker severed".into()));
         }
-        // Dedup on event_id (2.5): a redelivered action lands its effect exactly once.
         let mut landed = self.landed.borrow_mut();
         if landed.insert(action.event_id.clone()) {
             *self.effect_count.borrow_mut() += 1;
@@ -120,21 +87,16 @@ impl DispatchTarget for BrokerAwareInbox {
     }
 }
 
-/// **BUS-D1 — sever the broker mid-stream, re-drive on reconnect → 0 lost, 0 duplicate effects.**
 #[test]
 fn bus_d1_kill_consumer_sever_broker_zero_lost_zero_duplicate_on_reconnect() {
     let breaker = DependencyBreaker::new();
     let inbox = BrokerAwareInbox::new(breaker.clone());
-    let gate = InMemoryCostGate::new(0); // isolate from the balance gate
+    let gate = InMemoryCostGate::new(0);
     let mut tier = DispatchTier::new(inbox, gate);
     let t1 = TenantId("t1".into());
 
-    // The pending dispatch backlog (the "sustained publish" the broker drop interrupts).
     let backlog: Vec<u64> = (0..8).collect();
 
-    // LEG 1 — sever the broker. Every dispatch attempted now FAILS to deliver (the consumer is
-    // killed). The tier surfaces it (an audited BreakerShed), it is NOT silently lost — it stays in
-    // the re-drive backlog.
     assert!(breaker
         .break_dependency(Dependency::Broker, Scope::Tenant(t1.clone()))
         .changed());
@@ -146,7 +108,7 @@ fn bus_d1_kill_consumer_sever_broker_zero_lost_zero_duplicate_on_reconnect() {
             &Timestamp("2026-06-20T00:00:01Z".into()),
         ) {
             Disposition::Delivered { .. } => panic!("should not deliver while the broker is down"),
-            Disposition::BreakerShed { .. } => pending.push(n), // surfaced, queued for re-drive
+            Disposition::BreakerShed { .. } => pending.push(n),
             o => panic!("unexpected disposition {o:?}"),
         }
     }
@@ -161,8 +123,6 @@ fn bus_d1_kill_consumer_sever_broker_zero_lost_zero_duplicate_on_reconnect() {
         "no effect landed while the broker was down"
     );
 
-    // LEG 2 — restore the broker (reconnect). Re-drive the pending backlog AND replay the first two
-    // (the at-least-once redelivery that BUS-D1 must dedup) — the inbox dedups by event_id.
     assert!(breaker
         .restore_dependency(Dependency::Broker, Scope::Tenant(t1.clone()))
         .changed());
@@ -183,8 +143,6 @@ fn bus_d1_kill_consumer_sever_broker_zero_lost_zero_duplicate_on_reconnect() {
         );
     }
 
-    // GATE: 0 lost (every distinct dispatch landed) + 0 duplicate (the at-least-once redelivery of
-    // the first two landed exactly once each — effect_count == distinct count, NOT count + 2).
     assert_eq!(
         *tier.target().effect_count.borrow(),
         backlog.len() as u64,
@@ -192,7 +150,6 @@ fn bus_d1_kill_consumer_sever_broker_zero_lost_zero_duplicate_on_reconnect() {
     );
     assert_eq!(tier.target().landed.borrow().len(), backlog.len());
 
-    // The §10.2 ConsumerLag survival signal drains to 0 after reconnect.
     let mut src = SignalSource::new();
     let lag = backlog.len() as i64 - tier.target().landed.borrow().len() as i64;
     src.set_labelled(

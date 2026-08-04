@@ -1,25 +1,3 @@
-//! # The CDC pair for the per-effect `idem_key` rule — contract 9.1 / §6.4 (P-FLOW-10)
-//!
-//! **Contracts:** `planning/05-refined-shared-systems-architecture/contract-index.md` row 9.1
-//! (`DurableExecutor::signal` — the **per-effect `idem_key` rule**: `card_id` single,
-//! `card_id:<effect_idx>` multi/partial). Owning architecture: `durable-workflow.md` §6.4 (a partial
-//! approval is three independently-idempotent signals, each mapping to **exactly one**
-//! `EffectApi::apply`; a declined effect is **withheld** — `Denied`, never mutates, AG-8) + §3.4 (the
-//! `wf_signal` PK that makes the rule true by construction).
-//!
-//! ## What this pair pins (the PROVIDER ↔ CONSUMER agreement of the per-effect rule)
-//!
-//! **PROVIDER (the `myelin-flow` per-effect rule + gated loop):** constructs the per-effect key
-//! (`per_effect_idem_key`), buffers each per-effect decision idempotently into `wf_signal`, and the
-//! gated loop (`apply_approved_effects`) calls the supplied apply target EXACTLY ONCE per approved
-//! effect and NEVER for a declined effect.
-//!
-//! **CONSUMER (the Agent Fabric `EffectApi::apply`, contract `8.x`):** the real `myelin_agent::
-//! EffectApi` trait — each approved effect maps to exactly one `apply` (→ `Applied`); a declined
-//! effect never reaches `apply` (AG-8: zero mutation). This pair proves the two ends RECONCILE: the
-//! engine OWNS the key rule + the gating decision; Agent Fabric OWNS the apply, and the engine calls
-//! it exactly once per approved effect, never for a declined one.
-
 use myelin_agent::{EffectApi, EffectResult, EventId, ProposedEffect, RunCtx};
 use myelin_events::{IdMinter, MonotonicMinter};
 use myelin_flow::{
@@ -58,10 +36,6 @@ fn start_a_run(ex: &FlowExecutor) -> RunId {
     .expect("start")
 }
 
-/// **The Agent Fabric CONSUMER fixture — a real `myelin_agent::EffectApi` impl.** It RECORDS each
-/// `apply` (the proposed effect it was handed) and returns `Applied`. The §6.4 invariant: the engine
-/// calls this EXACTLY ONCE per approved effect and NEVER for a declined effect. The recording proves
-/// the apply count = the approved-effect count (0 double-apply, 0 apply-on-decline).
 struct RecordingEffectApi {
     applied: RefCell<Vec<String>>,
 }
@@ -112,10 +86,6 @@ fn card(run: &RunId, decisions: [ApprovalDecision; 3]) -> ApprovalCard {
     }
 }
 
-/// **PROVIDER ↔ CONSUMER reconcile: a partial approval is three independent signals, each mapping to
-/// exactly one `EffectApi::apply`; a declined effect never reaches apply (AG-8).** The engine's gated
-/// loop drives the REAL Agent Fabric `EffectApi`: approve 0 and 2, decline 1 → the consumer's
-/// `apply` is called EXACTLY twice (effects 0 and 2), never for the declined effect 1.
 #[test]
 fn partial_approval_maps_each_approved_effect_to_exactly_one_apply() {
     let ex = executor();
@@ -123,10 +93,8 @@ fn partial_approval_maps_each_approved_effect_to_exactly_one_apply() {
     approve(&ex, &run, "card-7", 0, 3);
     decline(&ex, &run, "card-7", 1, 3);
     approve(&ex, &run, "card-7", 2, 3);
-    // PROVIDER: three distinct per-effect keys → three buffered signals (the §6.4 anchor).
     assert_eq!(ex.signals().count_for_run(&tenant(), &run.0), 3);
 
-    // CONSUMER: the real Agent Fabric EffectApi the engine's gated loop delegates to.
     let consumer = RecordingEffectApi {
         applied: RefCell::new(vec![]),
     };
@@ -143,8 +111,6 @@ fn partial_approval_maps_each_approved_effect_to_exactly_one_apply() {
             ],
         ),
         &|eff: &ArtifactRef| {
-            // delegate to the REAL EffectApi::apply (the contract 8.x consumer) — exactly the
-            // production wiring: each approved effect → one apply.
             match consumer.apply(&run_ctx, ProposedEffect(eff.0.clone())) {
                 EffectResult::Applied(EventId(id)) => Ok(id),
                 EffectResult::Gated(g) => Err(format!("gated:{}", g.0)),
@@ -153,7 +119,6 @@ fn partial_approval_maps_each_approved_effect_to_exactly_one_apply() {
         },
     );
 
-    // the two ends RECONCILE: 0 applied, 1 withheld (AG-8), 2 applied.
     assert!(matches!(outcomes[0], Some(Ok(EffectOutcome::Applied(_)))));
     assert_eq!(
         outcomes[1],
@@ -161,8 +126,6 @@ fn partial_approval_maps_each_approved_effect_to_exactly_one_apply() {
     );
     assert!(matches!(outcomes[2], Some(Ok(EffectOutcome::Applied(_)))));
 
-    // CONSUMER reliance: the real EffectApi::apply was called EXACTLY twice — the declined effect
-    // never reached it (AG-8: a declined effect makes 0 mutation).
     let applied = consumer.applied.into_inner();
     assert_eq!(
         applied.len(),
@@ -175,10 +138,6 @@ fn partial_approval_maps_each_approved_effect_to_exactly_one_apply() {
     );
 }
 
-/// **A double-click on "approve all" wakes the engine once per effect — the real `EffectApi::apply`
-/// is called exactly three times, not six (0 double-apply, §6.4).** Re-sending the same per-effect
-/// keys → `ON CONFLICT DO NOTHING` → the buffered set is unchanged → the loop applies each effect
-/// once.
 #[test]
 fn double_click_drives_the_real_effect_api_exactly_once_per_effect() {
     let ex = executor();
@@ -187,7 +146,7 @@ fn double_click_drives_the_real_effect_api_exactly_once_per_effect() {
         approve(&ex, &run, "card-7", idx, 3);
     }
     for idx in 0..3 {
-        approve(&ex, &run, "card-7", idx, 3); // double-click → ON CONFLICT DO NOTHING.
+        approve(&ex, &run, "card-7", idx, 3);
     }
     assert_eq!(
         ex.signals().count_for_run(&tenant(), &run.0),

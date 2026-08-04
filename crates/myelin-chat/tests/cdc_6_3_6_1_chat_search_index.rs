@@ -1,23 +1,3 @@
-//! # CDC 6.3 / 6.1 — the Chat `declare_indexable` IndexSpec + the ACL-conjoined search feeder
-//! (CHAT-P20 / P-415, M4-C7)
-//!
-//! **Contract 6.3** — `declare_indexable(IndexSpec{ subsystem, type, ft_fields, struct_fields,
-//! semantic, acl_object_type })`: the chat/message Search projection (arch §7). Chat OWNS this spec
-//! (it is a PRODUCER of searchable artifacts — one searchable doc per `message`); Search OWNS the
-//! `IndexSpec` TYPE. This CDC is the PROVIDER (chat) + CONSUMER (Search admits) pair: chat constructs
-//! the real [`myelin_search::IndexSpec`] to the frozen §7 shape, and Search ACCEPTS it into a live
-//! [`myelin_search::IncrementalIndexer`]'s facet union (the only honest "registered").
-//!
-//! **Contract 6.1** — `query(ast, viewer, at, page) → RankedResults` (the ACL-conjoining surface; the
-//! `search-requires-acl-filter` discipline). **CONSUMED** by Chat: every message search routes through
-//! the ONE `myelin_search::query` entry (the chat-side [`myelin_chat::AclConjoinedSearchFeeder`]), so a
-//! viewer's `list_objects(view, message)` `Filter` pre-filters the candidate set BEFORE scoring. This
-//! CDC pins that the REAL Search surface satisfies chat's feeder and that the conjoin keys on the SAME
-//! `message` object type the spec declares (`acl_object_type = "message"`).
-//!
-//! Coherence (EI-01 §7): chat owns NO second indexing type and NO second search path — the spec is the
-//! frozen Search-owned shape, the query is the one conjoining surface.
-
 use myelin_chat::{
     message_index_spec, message_search_acl_anchor, register_message_index_specs,
     AclConjoinedSearchFeeder, FACET_ARTIFACT_REF, FACET_AUTHOR, FACET_CHANNEL, FACET_CREATED_AT,
@@ -51,14 +31,6 @@ fn consistency() -> Consistency {
     }
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// CDC 6.3 — the chat/message IndexSpec is the frozen §7 shape Search accepts
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-
-/// **CDC 6.3 (PROVIDER) — the chat message spec is the OWNED §7 shape.** `subsystem = "chat"`,
-/// `type = "message"`, **semantic** (embeddings ARE personal data, §7), `acl_object_type = "message"`
-/// (the conjoin keys on `message.id`), and the §7 columnar facets + the three cross-producer reference
-/// facets (X-2). A drift off any of these breaks the registrant.
 #[test]
 fn chat_message_spec_is_the_frozen_6_3_shape() {
     let s = message_index_spec();
@@ -92,16 +64,12 @@ fn chat_message_spec_is_the_frozen_6_3_shape() {
             "`{facet}` is a dependable cross-producer reference facet (X-2)"
         );
     }
-    // The full-text body is delivered at emit time in SearchProjection.text — NOT a struct facet.
     assert!(
         !s.struct_fields.contains_key(FT_BODY_FIELD),
         "the markdown body is the ft_fields projection, not a structured facet"
     );
 }
 
-/// **CDC 6.3 (CONSUMER) — Search ACCEPTS the chat message spec.** The accepted set is byte-equal to
-/// the declared set, admitted into a live indexer's per-tenant facet union without a schema mismatch
-/// (the semantic spec wires the embedding adapter — the embeddings path is live).
 #[test]
 fn search_accepts_the_chat_message_spec() {
     let accepted = register_message_index_specs();
@@ -111,10 +79,6 @@ fn search_accepts_the_chat_message_spec() {
         "Search accepts the chat spec verbatim"
     );
 }
-
-// ════════════════════════════════════════════════════════════════════════════════════════════════
-// CDC 6.1 — the ACL-conjoined feeder routes through the REAL Search query surface
-// ════════════════════════════════════════════════════════════════════════════════════════════════
 
 fn schema() -> FieldSchema {
     FieldSchema::new().with(FT_BODY_FIELD, FieldDecl::stored(FieldType::Text))
@@ -160,7 +124,6 @@ impl ListObjectsPort for FakeAuthz {
         ty: &ObjectType,
         _at: &Consistency,
     ) -> AuthzResult<ListObjectsResult> {
-        // PIN: the feeder conjoins on (view, message) — the SAME anchor the spec declares.
         assert_eq!(permission.0, "read");
         assert_eq!(ty.0, "message");
         self.calls.fetch_add(1, Ordering::Relaxed);
@@ -177,9 +140,6 @@ fn ast(term: &str) -> QueryAst {
     .expect("within cost bounds")
 }
 
-/// **CDC 6.1 (CONSUMER) — the chat feeder routes through the REAL ACL-conjoining `query` surface; a
-/// denied message is excluded incl. count, exactly one list_objects (no N+1).** Both messages match
-/// "deploy"; the allow-set excludes the confidential one → it is in neither the rows NOR the count.
 #[test]
 fn chat_feeder_is_acl_conjoined_through_the_real_query_surface() {
     let be = corpus();
@@ -216,9 +176,6 @@ fn chat_feeder_is_acl_conjoined_through_the_real_query_surface() {
     );
 }
 
-/// **CDC 6.1 — the ACL anchor is `(view, message)`, byte-matched to the spec's `acl_object_type`.**
-/// The feeder must conjoin on the SAME object type the IndexSpec declares — otherwise the pre-filter
-/// keys on the wrong column and the leak guarantee breaks.
 #[test]
 fn feeder_acl_anchor_matches_the_spec_acl_object_type() {
     let (perm, ty) = message_search_acl_anchor();
@@ -227,9 +184,6 @@ fn feeder_acl_anchor_matches_the_spec_acl_object_type() {
     assert_eq!(ty.0, "message");
 }
 
-/// **CDC 6.1 — there is no chat-private search path: a `SetExpr::None` viewer gets 0 results.** The
-/// `WHERE false` short-circuit yields an empty result without materialising a candidate set — the
-/// only visibility gate is the engine pre-filter.
 #[test]
 fn non_member_setexpr_none_yields_zero() {
     struct NoneAuthz;
@@ -267,9 +221,6 @@ fn non_member_setexpr_none_yields_zero() {
     );
 }
 
-/// **Cross-check: the same conjoining `query` surface the feeder uses is the platform one (one
-/// surface, not a chat fork).** Calling `myelin_search::query` directly with the same inputs yields
-/// the same visible set — proving the feeder is a thin router over the ONE surface.
 #[test]
 fn feeder_is_a_thin_router_over_the_one_query_surface() {
     let be = corpus();

@@ -1,30 +1,3 @@
-//! # CDC — contract 7.4 `get_prefs / set_prefs` (prefs + quiet-hours over the frozen QueryAst) (P-188)
-//!
-//! **Architecture:** `notifications.md` §2.2 (the preference matcher binds the frozen `myelin-query`
-//! [`QueryAst`] = the EventMatcher core 3.4 — Notif invents NO second predicate language; quiet-hours
-//! in the recipient tz; critical/escalated pierce by default via `pierce_classes` — the one
-//! deliberate override, you cannot silence an on-call page). **Contract:** **7.4** `get_prefs /
-//! set_prefs(principal, routing, quiet_hours, digest)`. **Consumed:** **13.3 / 3.4** the frozen
-//! `QueryAst`.
-//!
-//! This CDC pins the 7.4 seam from BOTH sides:
-//!
-//! - **PROVIDER (Notif owns 7.4):** `set_prefs` UPSERTs a principal's routing matrix (each rule a
-//!   channel + a cost-bounded frozen-`QueryAst` matcher) + quiet-hours; `get_prefs` reads them back
-//!   (safe defaults for a principal with none); `route` is the delivery decision (matcher ∧ ¬quiet,
-//!   unless the class pierces). A critical item pierces quiet-hours; a non-crit item in a quiet
-//!   window is suppressed off-cell (the inbox row is NEVER suppressed).
-//! - **CONSUMER (the router / the inbox UI / the CLI / Identity's CaveatContext):** the matcher is
-//!   the ONE predicate language — a consumer that wants a routing rule compiles a `QueryAst` (the
-//!   SAME tree the EventMatcher/caveat read), never a second DSL. Proven here by the consumer-built
-//!   matcher evaluating over the SAME bounded interpreter, and the CLI `notify test` previewing the
-//!   SAME `route` decision the router uses (no second decision path).
-//!
-//! The two halves agree on the WIRE: the `QueryAst` predicate grammar + the `route_context`
-//! variable namespace (`reason`/`class`/`subsystem`) + the `pierce_classes` override. A drift on
-//! either side (a second predicate language, a pierce that silences on-call, a quiet-hours that
-//! suppresses the audit row) breaks THIS build.
-
 use myelin_identity::{Literal, Principal, PrincipalId, PrincipalKind};
 use myelin_notif::cli::notify_test;
 use myelin_notif::prefs::{
@@ -43,15 +16,11 @@ fn principal(id: &str) -> Principal {
     )
 }
 
-/// **PROVIDER side (Notif owns 7.4): set_prefs UPSERTs, get_prefs reads back, route decides.** The
-/// stored routing matrix routes a critical item to mobile_push; quiet-hours suppress a fyi but
-/// critical pierces — the provider's full decision.
 #[test]
 fn provider_set_get_and_route_decision() {
     let store = PrefStore::new();
     let me = principal("alice");
 
-    // route critical → mobile_push AND in_app; everything else → in_app only.
     let prefs = NotifPrefs {
         routing: vec![
             RoutingRule {
@@ -69,7 +38,6 @@ fn provider_set_get_and_route_decision() {
             classes: vec![],
         },
     };
-    // quiet all night, Paris tz; critical pierces by default.
     let quiet = QuietHours {
         tz: Tz::from_offset_minutes(60),
         windows: vec![QuietWindow {
@@ -89,9 +57,7 @@ fn provider_set_get_and_route_decision() {
     let got = get_prefs(&store, &me);
     assert_eq!(got.quiet, quiet, "get_prefs reads back the quiet-hours");
 
-    // 02:00 Paris = 01:00 UTC — inside the 22:00..07:00 quiet window.
     let utc_min = 60;
-    // CRITICAL pierces: delivers to mobile_push even at 02:00 local.
     let crit = route(
         &got.prefs,
         &got.quiet,
@@ -105,7 +71,6 @@ fn provider_set_get_and_route_decision() {
         crit.contains(&Channel::MobilePush),
         "critical pierces quiet-hours (on-call cannot be silenced)"
     );
-    // FYI suppressed off-cell; the in-cell inbox still receives.
     let fyi = route(
         &got.prefs,
         &got.quiet,
@@ -125,13 +90,8 @@ fn provider_set_get_and_route_decision() {
     );
 }
 
-/// **CONSUMER side: a consumer builds the routing matcher as the ONE frozen QueryAst.** A consumer
-/// (the router / a subsystem registering a rule) compiles a predicate over the SAME bounded
-/// interpreter the EventMatcher/caveat use — never a second predicate language. The consumer-built
-/// matcher evaluates byte-for-byte through `QueryAst::eval`.
 #[test]
 fn consumer_matcher_is_the_one_query_ast() {
-    // The consumer builds a matcher by hand (the same `Predicate` tree the EventMatcher reads).
     let matcher = QueryAst::compiled(Predicate::Or(vec![
         Predicate::Cmp {
             op: CmpOp::Eq,
@@ -161,7 +121,6 @@ fn consumer_matcher_is_the_one_query_ast() {
         QuietHours::default(),
     );
 
-    // The provider's route uses the consumer's matcher: critical/direct → email; watching → none.
     let got = get_prefs(&store, &me);
     assert!(
         route(
@@ -191,9 +150,6 @@ fn consumer_matcher_is_the_one_query_ast() {
     );
 }
 
-/// **CONSUMER side: the CLI `notify test` previews the SAME `route` decision the router uses.** A
-/// preview can never disagree with real delivery (one decision path). The consumer (the operator
-/// running `notify test`) sees exactly what the router would deliver.
 #[test]
 fn consumer_cli_notify_test_matches_route() {
     let store = PrefStore::new();
@@ -210,7 +166,6 @@ fn consumer_cli_notify_test_matches_route() {
         },
         QuietHours::default(),
     );
-    // CLI preview at noon.
     let preview = notify_test(
         &store,
         &me,
@@ -227,8 +182,6 @@ fn consumer_cli_notify_test_matches_route() {
     );
 }
 
-/// **The cost-bound is the WIRE invariant both sides honour: 0 unbounded matcher accepted.** An
-/// over-budget predicate is rejected at construction, so neither side can store one.
 #[test]
 fn wire_cost_bound_rejects_unbounded() {
     let huge: Vec<Predicate> = (0..myelin_query::MAX_PREDICATE_NODES)

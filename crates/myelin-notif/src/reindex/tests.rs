@@ -1,13 +1,3 @@
-//! Unit + chained + NOTIF-D3 drill tests for reindex-from-source (NOTIF-P17 / P-195).
-//!
-//! The mandatory-core reindex decision logic is exercised here: the wipe-iff-full-rebuild branch, the
-//! bus re-emit drive, the deterministic-id drain order, the feed-through-the-LIVE-router step, the
-//! parity hash (every covered field), the incremental backfill (no wipe), and the retention-window
-//! boundary. The NOTIF-D3 drill (`notif_d3_*`) wipes the inbox, reindexes, and asserts the rebuilt
-//! inbox's parity hash == the live inbox's (cold == live). The single-code-path check
-//! (`reindex_re_ingests_through_the_same_consumer_deliver`) pins that recovery uses the SAME
-//! `Consumer::deliver` as live ingest — 0 second read path.
-
 use super::*;
 use crate::router::{build_router, InboxProjection, RoutedInboxItem, SignalRouter};
 use myelin_events::{Actor, Region as BusRegion, Timestamp};
@@ -43,7 +33,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// A curated Signal (the shape the engine, P-138, publishes — the owner's source of truth).
 fn signal(rule: &str, severity: Severity, subject: &str, dedup: &str) -> Signal {
     Signal {
         rule_id: RuleId(rule.into()),
@@ -58,8 +47,6 @@ fn signal(rule: &str, severity: Severity, subject: &str, dedup: &str) -> Signal 
     }
 }
 
-/// A live `sig.<tenant>.<sev>.<rule>` broker [`Message`] carrying the curated Signal (the live
-/// router-ingest path — what steady-state delivery looks like).
 fn live_signal_msg(id: &str, sig: &Signal) -> Message {
     use myelin_events::{
         AggregateKey, CorrelationId, DataRole, EventEnvelope, EventId, EventType, Visibility,
@@ -92,7 +79,6 @@ fn live_signal_msg(id: &str, sig: &Signal) -> Message {
     }
 }
 
-/// Build a live Signal-consumer router over a fresh inbox (the SAME `build_router` `serve` wires).
 fn live_router(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection) {
     let inbox = InboxProjection::new();
     let consumer =
@@ -100,8 +86,6 @@ fn live_router(outbox: &OutboxStore) -> (Consumer<SignalRouter>, InboxProjection
     (consumer, inbox)
 }
 
-/// An owning Signal source with three curated Signals at known versions (the owner's truth — the
-/// dispatch tier's curated-Signal log, the named floor).
 fn owner_with_three_signals() -> SignalReindexSource {
     let mut src = SignalReindexSource::new();
     src.upsert(
@@ -134,14 +118,6 @@ fn owner_with_three_signals() -> SignalReindexSource {
     src
 }
 
-// ===========================================================================================
-//  The required UNIT: bus re-emit → the LIVE router → the inbox rebuilds from cold.
-// ===========================================================================================
-
-/// **The reindex drives the bus re-emit → the LIVE router → rebuilds the inbox from cold (the
-/// NOTIF-D3 happy path; the prompt's required unit).** The owner replays curated Signals as
-/// `*.snapshot` events; they ride the outbox; each is fed through the SAME `Consumer::deliver` a
-/// live `sig.*` event hits; the inbox projection ends up with the routed rows.
 #[test]
 fn reindex_rebuilds_the_inbox_from_the_bus_re_emit_through_the_live_router() {
     let src = owner_with_three_signals();
@@ -177,7 +153,6 @@ fn reindex_rebuilds_the_inbox_from_the_bus_re_emit_through_the_live_router() {
     );
     assert_eq!(receipt.owners_replayed, vec!["notif".to_string()]);
     assert_eq!(inbox.len(), 3, "the inbox holds the three rebuilt rows");
-    // The rebuild went through the router's own projection (the rebuild target).
     assert_eq!(
         reindexer.inbox().len(),
         3,
@@ -185,21 +160,12 @@ fn reindex_rebuilds_the_inbox_from_the_bus_re_emit_through_the_live_router() {
     );
 }
 
-// ===========================================================================================
-//  The required CHAINED test (EI-01 §4): ingest live → wipe → reindex → hash-equal to live.
-// ===========================================================================================
-
-/// **CHAINED (NOTIF-D3): ingest a batch live → reindex(notif) on a wiped store → the rebuilt inbox +
-/// read-state hash-equal to live.** Build a LIVE inbox by routing live `sig.*` Signals; snapshot its
-/// parity hash; WIPE the inbox; reindex-from-source; assert the rebuilt inbox's parity hash ==
-/// live's. cold == live (the threshold is IDENTICAL).
 #[test]
 fn notif_d3_chained_wipe_reindex_rebuilds_hash_equal_to_live() {
     let src = owner_with_three_signals();
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
 
-    // LIVE: route the three curated Signals through the ordinary `sig.*` live path (steady-state).
     for (i, (_, (v, sig))) in (0..).zip(src_truth_iter(&src)) {
         let _ = v;
         consumer.deliver(&live_signal_msg(&format!("evt-{i}"), &sig));
@@ -207,12 +173,10 @@ fn notif_d3_chained_wipe_reindex_rebuilds_hash_equal_to_live() {
     assert_eq!(inbox.len(), 3, "the live inbox holds three rows");
     let live_hash = inbox_parity_hash(&inbox, &tenant());
 
-    // WIPE the inbox (the read-model is lost — D-N3).
     let wiped = inbox.wipe_tenant(&tenant());
     assert_eq!(wiped, 3, "the wipe removed all three rows");
     assert!(inbox.is_empty(), "the inbox is empty after the wipe");
 
-    // REINDEX-FROM-SOURCE: rebuild through the SAME router.
     let reindexer = NotifReindexer::new(&consumer);
     let mut outbox = OutboxStore::new();
     let receipt = reindexer
@@ -230,7 +194,6 @@ fn notif_d3_chained_wipe_reindex_rebuilds_hash_equal_to_live() {
         "the rebuild replayed three through the live router"
     );
 
-    // PARITY: the rebuilt inbox's hash == the live inbox's (items + read-state). cold == live.
     let cold_hash = inbox_parity_hash(&inbox, &tenant());
     assert_eq!(inbox.len(), 3, "the rebuilt inbox holds three rows");
     assert_eq!(
@@ -239,10 +202,7 @@ fn notif_d3_chained_wipe_reindex_rebuilds_hash_equal_to_live() {
     );
 }
 
-/// Iterate the owner's truth in deterministic order (a test helper — mirrors `replay` ordering).
 fn src_truth_iter(src: &SignalReindexSource) -> Vec<(String, (u64, Signal))> {
-    // The owner replays in ascending-aggregate order; rebuild the same order from the replay drafts'
-    // aggregates by re-deriving the Signals from a fresh full replay.
     src.replay(&notif_scope("inbox:all"), None)
         .into_iter()
         .map(|d| {
@@ -252,16 +212,6 @@ fn src_truth_iter(src: &SignalReindexSource) -> Vec<(String, (u64, Signal))> {
         .collect()
 }
 
-// ===========================================================================================
-//  The required SINGLE-CODE-PATH check (CI): reindex re-ingests through the SAME router.
-// ===========================================================================================
-
-/// **The single-code-path check (CI): reindex re-ingests through the SAME `Consumer::deliver` the
-/// live path uses — 0 second read path.** Drive a live Signal AND a reindex snapshot of the SAME
-/// curated Signal through the SAME consumer; they collapse onto the SAME row (the router's
-/// `(tenant, recipient, dedup_key)` UPSERT) — proving recovery and steady-state share ONE write
-/// path (cannot drift, EI-04 §5.3). If reindex had a second read path, the snapshot would not
-/// collapse onto the live row.
 #[test]
 fn reindex_re_ingests_through_the_same_consumer_deliver_one_code_path() {
     let sig = signal(
@@ -273,13 +223,10 @@ fn reindex_re_ingests_through_the_same_consumer_deliver_one_code_path() {
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
 
-    // LIVE: one curated Signal → one inbox row.
     consumer.deliver(&live_signal_msg("evt-live", &sig));
     assert_eq!(inbox.len(), 1, "the live Signal produced one row");
     let live_row = inbox.snapshot_for_tenant(&tenant())[0].clone();
 
-    // REINDEX a snapshot of the SAME curated Signal through the SAME consumer: it collapses onto the
-    // SAME row (coalesce_count bumps) — NOT a new row, NOT a second store. One write path.
     let mut src = SignalReindexSource::new();
     src.upsert(sig.clone(), 1);
     let reindexer = NotifReindexer::new(&consumer);
@@ -311,13 +258,6 @@ fn reindex_re_ingests_through_the_same_consumer_deliver_one_code_path() {
     );
 }
 
-// ===========================================================================================
-//  Idempotency, incremental backfill, wipe, parity-hash field coverage, loud errors.
-// ===========================================================================================
-
-/// **Re-running the reindex is idempotent in EFFECT** — the bus emits 0 NEW snapshots (the
-/// deterministic id makes the re-emit a no-op) and the consumer deduplicates the redelivered
-/// snapshots; the inbox converges to the SAME row set (no duplication).
 #[test]
 fn reindex_is_idempotent_on_the_deterministic_snapshot_event_id() {
     let src = owner_with_three_signals();
@@ -344,10 +284,6 @@ fn reindex_is_idempotent_on_the_deterministic_snapshot_event_id() {
     assert_eq!(first.signals_replayed, 3);
     let hash_after_first = inbox_parity_hash(&inbox, &tenant());
 
-    // A SECOND full reindex over the SAME outbox: the BUS skips all three as duplicate (their
-    // deterministic ids are already present), but the full rebuild WIPES the inbox + forgets the
-    // snapshot dedup marks, so it RE-APPLIES the three through the router and converges to the SAME
-    // three rows (the router's (tenant, recipient, dedup_key) UPSERT keeps it idempotent in effect).
     let second = reindexer
         .reindex(
             &tenant(),
@@ -360,14 +296,12 @@ fn reindex_is_idempotent_on_the_deterministic_snapshot_event_id() {
         .expect("second");
     assert_eq!(
         second.snapshots_emitted, 0,
-        "0 NEW snapshots emitted (deterministic id — bus no-op)"
+        "0 NEW snapshots emitted (deterministic id - bus no-op)"
     );
     assert_eq!(
         second.snapshots_skipped_duplicate, 3,
         "all three skipped at the bus re-emit"
     );
-    // The full rebuild forgot the prior marks → it re-applies the three (not a dedup no-op), so the
-    // wiped inbox is rebuilt — never left empty.
     assert_eq!(
         second.signals_replayed, 3,
         "the full rebuild re-applies the three over the wipe"
@@ -375,7 +309,7 @@ fn reindex_is_idempotent_on_the_deterministic_snapshot_event_id() {
     assert_eq!(
         inbox.len(),
         3,
-        "still exactly three rows — idempotent in effect"
+        "still exactly three rows - idempotent in effect"
     );
     assert_eq!(
         inbox_parity_hash(&inbox, &tenant()),
@@ -384,12 +318,8 @@ fn reindex_is_idempotent_on_the_deterministic_snapshot_event_id() {
     );
 }
 
-/// **The incremental backfill (`since = Some`) does NOT wipe the live inbox — it re-ingests above the
-/// cursor.** A new-recipient / upcaster backfill rides the SAME path but preserves the already-routed
-/// rows.
 #[test]
 fn incremental_backfill_does_not_wipe_the_inbox() {
-    // The owner gains a new curated Signal at version 5; the inbox already holds an older row.
     let mut src = SignalReindexSource::new();
     src.upsert(
         signal(
@@ -413,7 +343,6 @@ fn incremental_backfill_does_not_wipe_the_inbox() {
     let (consumer, inbox) = live_router(&outbox_router);
     let reindexer = NotifReindexer::new(&consumer);
 
-    // Pre-seed the inbox with the OLD row via a full reindex of only the old Signal.
     let mut only_old = SignalReindexSource::new();
     only_old.upsert(
         signal(
@@ -437,7 +366,6 @@ fn incremental_backfill_does_not_wipe_the_inbox() {
         .expect("seed old");
     assert_eq!(inbox.len(), 1, "the old row is routed");
 
-    // Incremental backfill since=1: only the version-5 Signal replays; the old row is PRESERVED.
     let mut outbox2 = OutboxStore::new();
     let job = reindexer
         .reindex(
@@ -456,19 +384,15 @@ fn incremental_backfill_does_not_wipe_the_inbox() {
     assert_eq!(
         inbox.len(),
         2,
-        "the backfill APPENDED — the old row survives (no wipe)"
+        "the backfill APPENDED - the old row survives (no wipe)"
     );
 }
 
-/// **A full reindex WIPES the inbox first (the cold-rebuild precondition).** A stale row not present
-/// in the owner's truth is removed by the wipe and NOT resurrected (the rebuild reflects only the
-/// owner's current truth — the erasure-stays-erased posture, X-7).
 #[test]
 fn full_reindex_wipes_stale_rows_not_in_the_owner_truth() {
     let outbox_router = OutboxStore::new();
     let (consumer, inbox) = live_router(&outbox_router);
 
-    // A STALE live row (a curated Signal the owner has since tombstoned — not in its truth).
     consumer.deliver(&live_signal_msg(
         "evt-stale",
         &signal(
@@ -480,7 +404,6 @@ fn full_reindex_wipes_stale_rows_not_in_the_owner_truth() {
     ));
     assert_eq!(inbox.len(), 1, "the stale row is in the inbox");
 
-    // The owner's CURRENT truth holds a DIFFERENT Signal (the stale one is gone — erased).
     let mut src = SignalReindexSource::new();
     src.upsert(
         signal(
@@ -505,7 +428,6 @@ fn full_reindex_wipes_stale_rows_not_in_the_owner_truth() {
         )
         .expect("reindex");
 
-    // The rebuilt inbox holds ONLY the fresh row — the stale one is wiped and NOT resurrected.
     assert_eq!(
         inbox.len(),
         1,
@@ -518,14 +440,10 @@ fn full_reindex_wipes_stale_rows_not_in_the_owner_truth() {
     );
 }
 
-/// **The parity hash covers the read-state — a reindex that lost read-state flips it.** Two inboxes
-/// with identical rows but DIFFERENT read-state (`state`) hash DIFFERENTLY; the same read-state hashes
-/// the same. Pins that NOTIF-D3 compares items + read-state (not just item identity).
 #[test]
 fn parity_hash_covers_read_state_and_is_order_independent() {
     let a = InboxProjection::new();
     let b = InboxProjection::new();
-    // Insert the SAME logical rows in DIFFERENT orders (the hash must be order-independent).
     a.upsert_for_test(row("u1", "k1", "unread", None));
     a.upsert_for_test(row("u2", "k2", "read", None));
     b.upsert_for_test(row("u2", "k2", "read", None));
@@ -536,9 +454,8 @@ fn parity_hash_covers_read_state_and_is_order_independent() {
         "the parity hash is canonical-order-independent (same rows → same hash)"
     );
 
-    // A row with a DIFFERENT read-state hashes DIFFERENTLY (the hash covers `state`).
     let c = InboxProjection::new();
-    c.upsert_for_test(row("u1", "k1", "read", None)); // state differs from `a`'s u1 (unread)
+    c.upsert_for_test(row("u1", "k1", "read", None));
     c.upsert_for_test(row("u2", "k2", "read", None));
     assert_ne!(
         inbox_parity_hash(&a, &tenant()),
@@ -546,7 +463,6 @@ fn parity_hash_covers_read_state_and_is_order_independent() {
         "a lost/changed read-state flips the parity hash (NOTIF-D3 covers read-state)"
     );
 
-    // snooze_until also participates (read-state truth).
     let d = InboxProjection::new();
     d.upsert_for_test(row(
         "u1",
@@ -562,7 +478,6 @@ fn parity_hash_covers_read_state_and_is_order_independent() {
     );
 }
 
-/// A test inbox row at a known `(recipient, dedup_key)` with an explicit read-state.
 fn row(
     recipient: &str,
     dedup_key: &str,
@@ -585,15 +500,13 @@ fn row(
     }
 }
 
-/// **A reindex of an UNKNOWN owner is a LOUD error (never a silent empty rebuild that masks a wiring
-/// bug).** The bus's `NoSourceForOwner` bubbles up as a `Bus` error.
 #[test]
 fn reindex_of_unknown_owner_is_a_loud_error() {
-    let src = SignalReindexSource::new(); // owns the `notif` token.
+    let src = SignalReindexSource::new();
     let outbox_router = OutboxStore::new();
     let (consumer, _inbox) = live_router(&outbox_router);
     let reindexer = NotifReindexer::new(&consumer);
-    let unknown = SnapshotScope::new("search", "doc:all"); // no `search` source registered.
+    let unknown = SnapshotScope::new("search", "doc:all");
     let mut outbox = OutboxStore::new();
     let err = reindexer
         .reindex(&tenant(), &unknown, None, &[&src], &mut outbox, ctx_base())
@@ -604,7 +517,6 @@ fn reindex_of_unknown_owner_is_a_loud_error() {
     );
 }
 
-/// **The full rebuild wipes ONLY the reindexed tenant (another tenant's live inbox is untouched).**
 #[test]
 fn full_reindex_wipe_is_tenant_scoped() {
     let other = TenantId("globex".into());
@@ -625,12 +537,6 @@ fn full_reindex_wipe_is_tenant_scoped() {
     );
 }
 
-// ===========================================================================================
-//  The retention-window FLOOR + the snapshot-shape carriers.
-// ===========================================================================================
-
-/// **The ~90-day retention window is the named §3.8 floor.** The default is 90 days; a 0-day window is
-/// floored to 1 (never a wedged inbox); an explicit per-cell window is honoured (a config swap).
 #[test]
 fn retention_window_is_the_named_90_day_floor() {
     assert_eq!(
@@ -652,9 +558,6 @@ fn retention_window_is_the_named_90_day_floor() {
     );
 }
 
-/// **A snapshot draft carries the curated Signal on the `sig.<tenant>.*` subject the router
-/// whitelists** (so `Consumer::deliver` routes it through the SAME path as a live Signal), at the
-/// deterministic id, with the live router's aggregate key.
 #[test]
 fn signal_snapshot_draft_carries_the_signal_on_the_whitelisted_subject() {
     let sig = signal(
@@ -674,18 +577,14 @@ fn signal_snapshot_draft_carries_the_signal_on_the_whitelisted_subject() {
         draft.subject.0, "sig.acme.error.ci_run_failed",
         "the `sig.<tenant>.*` whitelist subject"
     );
-    // The payload round-trips to the SAME curated Signal (cold == live).
     let back: Signal = serde_json::from_value(draft.payload.clone()).unwrap();
     assert_eq!(back.dedup_key.0, "run-42");
-    // The deterministic id is stable on (aggregate, version).
     assert_eq!(
         draft.event_id(),
         myelin_events::snapshot_event_id(&draft.aggregate, 3)
     );
 }
 
-/// **`notif_scope` pins the `notif` owner token; `NOTIF_OWNER_TOKEN`/`NOTIF_SNAPSHOT_TYPE` are
-/// frozen.** A drift breaks the build (the bus dispatches on `scope.owner`).
 #[test]
 fn notif_scope_and_tokens_are_frozen() {
     assert_eq!(NOTIF_OWNER_TOKEN, "notif");
@@ -695,8 +594,6 @@ fn notif_scope_and_tokens_are_frozen() {
     assert_eq!(scope.selector, "inbox:all");
 }
 
-/// **The reference Signal source replays in deterministic order and honours the `since` cursor at the
-/// EXACT boundary (`> since`, not `>= since`).**
 #[test]
 fn signal_source_replays_deterministically_and_honours_since() {
     let mut src = SignalReindexSource::new();
@@ -710,7 +607,6 @@ fn signal_source_replays_deterministically_and_honours_since() {
     );
     assert_eq!(src.len(), 2);
     assert!(!src.is_empty());
-    // A truly empty source is empty (pins `is_empty` is not a constant).
     assert!(
         SignalReindexSource::new().is_empty(),
         "a fresh source is empty"
@@ -718,7 +614,6 @@ fn signal_source_replays_deterministically_and_honours_since() {
 
     let all = src.replay(&notif_scope("inbox:all"), None);
     assert_eq!(all.len(), 2, "a full replay yields both");
-    // Deterministic ascending-aggregate order (signal:k1 < signal:k2).
     assert_eq!(all[0].aggregate.0, "signal:k1");
     assert_eq!(all[1].aggregate.0, "signal:k2");
 
@@ -730,15 +625,12 @@ fn signal_source_replays_deterministically_and_honours_since() {
     );
     assert_eq!(since[0].aggregate.0, "signal:k2");
 
-    // EXACT boundary: a Signal AT the cursor version is EXCLUDED (`> since`, not `>= since`). With
-    // since=5, the version-5 Signal must NOT replay (it is at, not above, the cursor).
     let at_boundary = src.replay(&notif_scope("inbox:all"), Some(5));
     assert_eq!(
         at_boundary.len(),
         0,
         "a Signal AT the cursor is excluded (strict >, not >=)"
     );
-    // since=4 includes the version-5 Signal (it IS above the cursor).
     assert_eq!(
         src.replay(&notif_scope("inbox:all"), Some(4)).len(),
         1,
@@ -746,10 +638,6 @@ fn signal_source_replays_deterministically_and_honours_since() {
     );
 }
 
-/// **An INCREMENTAL reindex (no wipe) of an already-applied snapshot is DEDUPLICATED by the live
-/// consumer (the `signals_deduplicated` counter increments; the row is not double-applied).** Unlike
-/// a full rebuild (which forgets the marks), the incremental path keeps the consumer_dedup marks — a
-/// redelivered snapshot above the cursor is a no-op (no resurrection). Pins the dedup-counting arm.
 #[test]
 fn incremental_reindex_deduplicates_an_already_applied_snapshot() {
     let sig = signal(
@@ -766,7 +654,6 @@ fn incremental_reindex_deduplicates_an_already_applied_snapshot() {
     let reindexer = NotifReindexer::new(&consumer);
     let mut outbox = OutboxStore::new();
 
-    // First incremental reindex (since=Some(0), no wipe): the snapshot applies — replayed, not deduped.
     let first = reindexer
         .reindex(
             &tenant(),
@@ -787,8 +674,6 @@ fn incremental_reindex_deduplicates_an_already_applied_snapshot() {
     );
     assert_eq!(inbox.len(), 1);
 
-    // A SECOND incremental reindex of the SAME snapshot (no wipe): the consumer_dedup ledger makes it
-    // a no-op — counted as deduplicated, NOT replayed (the row is not double-applied).
     let second = reindexer
         .reindex(
             &tenant(),
@@ -810,12 +695,10 @@ fn incremental_reindex_deduplicates_an_already_applied_snapshot() {
     assert_eq!(
         inbox.len(),
         1,
-        "still exactly one row — no resurrection/duplication"
+        "still exactly one row - no resurrection/duplication"
     );
 }
 
-/// **The `ReindexError::Display` renders distinct, informative messages** (the LOUD-error artifact —
-/// a silent/empty Display would mask a wiring bug).
 #[test]
 fn reindex_error_display_is_informative() {
     let bus = ReindexError::Bus("no owner".into());

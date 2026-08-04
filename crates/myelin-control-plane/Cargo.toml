@@ -8,156 +8,32 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
-# MR-024 → MR-009b W6d: the durable PG binding for the placement registry (the `Pg` arm of the
-# registry's backend enum) now compiles UNCONDITIONALLY and is the production default — the
-# in-memory `Registry`/`MisrouteAudit` doubles are `test-support`-gated. The DEFAULT build/test
-# stays DB-free (all durable code is runtime `sqlx::query(&str)`; no live DB at build time).
 [features]
 default = []
-# MR-009b W6d: `integration` is now a TEST-SELECTOR only (the live-PG proof tests gate on it) — the
-# durable Pg arm of the placement `Registry` / `MisrouteAudit` / `DurablePlacementRegistry` compiles
-# UNCONDITIONALLY (tokio is a plain dependency below; sqlx is non-optional in myelin-storage post-W1),
-# exactly like the identity-service Wave-2 flip. It still enables the storage/events live-bus test
-# surface transitively.
 integration = ["myelin-storage/integration"]
 
-# MR-009b Wave 0 — the `test-support` cargo feature (alias `memory`). It gates the control-plane's
-# in-memory durable-store DOUBLES (the placement `Registry` `Memory` arm, `CellResolverRegistry`,
-# the `MisrouteAudit` sink) so DOWNSTREAM crates enable them as a DEV-dependency (the doubles are
-# consumed cross-crate in non-test lib code; `#[cfg(test)]` is crate-local and can't reach them).
-# EMPTY in Wave 0 — established so later waves (W4) gate the doubles behind it + the
-# `no-in-memory-durable-store` scanner treats `feature = "test-support"` as a test-double gate. No
-# code moves behind it yet. `memory` is a documented alias.
 test-support = []
 memory = ["test-support"]
 
-# THE Tenancy control-plane SERVICE crate (P-CP-05 → global P-080): the three PII-free
-# control-plane registry tables (`cell` / `tenant_placement` / `cell_provisioning`) + the per-cell
-# `local_tenant` directory + the HARD placement invariant (multi-cell single-region by
-# construction). This is the FIRST `myelin-control-plane` prompt; the routing/attestation surfaces
-# (`discover`/`place`/`placement_of`/`residency_verify`) land in P-CP-06..P-CP-09.
-#
-# DAG POSITION (a documented, NAMED extension of the §2.9 eleven-crate library DAG, exactly like
-# `myelin-identity-service`, `myelin-gdpr-service`, and `myelin-git`). This is a SERVICE crate — a
-# LEAF consumer ABOVE the glue crates: it depends on the harness (serve/AppSpec + holder
-# auto-registration), the partition-key types (myelin-tenancy), and the GDPR holder/classify
-# surface (myelin-gdpr). The registry tables open through the OLTP tier client's bounded pool + RLS
-# (Storage P-ST-01) once the driver lands — a named floor, NOT a compile-time dep at this band.
-# NOTHING in the production library DAG depends back on it, so it is OUTSIDE the eleven-crate
-# library graph modelled by
-# `myelin_substrate::crate_graph` (substrate_is_root() is preserved — a service is the graph's
-# terminal consumer). See the crate-level note in src/lib.rs.
 [dependencies]
-# The harness: serve(AppSpec) (boot → migrate → relay → consumers → ports → drain) + the holder
-# auto-registration registry (HolderRegistry/StoreKind/StoreManifest) the registry stores open
-# through, and the forward-only Migrations the registry schema is applied by (region/cell_id are
-# injected by the harness — architecture §11). The service is an AppSpec this wires, not a
-# hand-rolled lifecycle.
 myelin-substrate = { path = "../myelin-substrate" }
-# TenantId / Region / ResidencyTag / CellId — the (tenant, region) partition key the registry
-# stores (contract 12.1; the immutable Region the placement invariant pins).
 myelin-tenancy = { path = "../myelin-tenancy" }
-# The Zanzibar zookie consistency watermark (`Zookie`, contract 4.10) — REUSED for the cross-cell
-# zookie-consistency leg (P-CP-20 / §6.3: a zookie minted in the home cell read in a member cell,
-# bounded-staleness). There is ONE zookie type in the platform (coherence, EI-01 §7); the cross-cell
-# bounded read-through carries the Id-minted zookie rather than redefining it. `myelin-identity` is a
-# glue crate below the service layer; a service crate consuming it is established precedent
-# (myelin-identity-service / myelin-gdpr-service). No cycle (identity never depends on control-plane).
 myelin-identity = { path = "../myelin-identity" }
-# The `Timestamp` value type (the dated cross-cell DSR receipt-set / GA-D8 artifact). A glue value
-# crate below the service layer; no cycle.
 myelin-events = { path = "../myelin-events" }
-# The PersonalDataHolder trait + the five-tag classify enums + the #[personal_data] derive the
-# registry would carry IF it held PII (it does not — every column is opaque; the
-# control-plane-pii-free lint guards that). The control-plane store auto-registers as a holder
-# (contract 1.4) so the harness's one-door discipline covers it, even though its DSR surface is a
-# tenant-record-only holder (no in-region PII).
 myelin-gdpr = { path = "../myelin-gdpr" }
-# The storage SUBSTRATE crate (P-ST-01..P-061). Cell-provisioning gating (P-CP-11 / P-083) CONSUMES
-# two storage contracts: 11.5 — the restore-verify gate (`RestoreVerifyGate`/`GateInputs`/
-# `GateVerdict`) as the cell-READINESS gate (a cell does not go `Active` until its backup is proven
-# whole), and 11.3 — `KmsEngine::destroy_kek` (the tenant-decommission crypto-shred lever). This is a
-# CDC-consumer edge (contract 11.5/11.3), NOT a re-implementation — there is ONE durability gate in the
-# platform (coherence, EI-01 §7). `myelin-storage` is the harness-wired storage substrate (a documented
-# §2.9 DAG extension, below gdpr); a SERVICE crate consuming it is established precedent
-# (myelin-identity-service depends on it too). cargo build stays DB-free: the gate is modeled
-# (in-memory clean target), the real `pg_restore` driver is the named Storage floor P-S12/P-S15.
 myelin-storage = { path = "../myelin-storage" }
-# The `residency_verify` signed attestation (P-CP-09 / P-085, contract 12.4) MACs its canonical
-# PII-free body with a keyed BLAKE3 (the "signed" half) — the SAME `blake3:<hex>` multihash
-# convention the GDPR audit chain (P-GA-19) uses, extended with the keyed-MAC discriminator. No DB:
-# the attestation is a pure aggregation + sign, so `cargo build --workspace` stays DB-free.
 blake3 = { workspace = true }
 hex = { workspace = true }
-# The durable-workflow engine (contract 9.1 — `DurableExecutor`/`FlowExecutor`/`StartSpec`), the M2
-# substrate now available (myelin-flow, P-FLOW-*). P-CP-22 (P-431) PROMOTES the scripted provisioning
-# (P-CP-11) + the live cell→cell migration onto the durable workflow: the migration/provisioning
-# procedure runs as a `DurableExecutor::start`-ed run (crash-safe + resumable + idempotent on the
-# per-effect idem_key), so a migration that crashes mid-move resumes instead of half-moving a tenant.
-# `myelin-flow` is a SERVICE-layer crate that does NOT depend on the control plane (no cycle — verified),
-# so this is a clean leaf→leaf consumer edge (a documented §2.9 DAG extension, exactly like the storage
-# / gdpr-service edges already declared above). cargo build stays DB-free: the executor is modeled
-# in-memory (the real engine's Postgres six-table model is the named myelin-flow floor); the control
-# plane consumes the engine-agnostic `DurableExecutor` TRAIT, never a concrete DB-bound engine.
 myelin-flow = { path = "../myelin-flow" }
-# MR-024 → MR-009b W6d: the sync→async bridge for the durable placement backing (block_in_place +
-# block_on), matching the sync Registry API to the async sqlx backing. NON-OPTIONAL as of W6d — the
-# placement `Registry` / `MisrouteAudit` Pg arms are the ALWAYS-COMPILED production backends (the
-# in-memory arms are `test-support`-gated doubles), so the bridge must compile in the default build.
-# tokio is already a non-optional dependency of myelin-storage (W1), so this adds no new production
-# DAG edge. `cargo build --workspace` stays DB-free: all queries are runtime `sqlx::query(&str)`.
 tokio = { workspace = true }
 
 [dev-dependencies]
-# MR-009b W6c-cp — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
-# targets. The `CellResolverRegistry` in-memory double (`new`/`register` + the `Memory` backend arm) is
-# now `#[cfg(any(test, feature = "test-support"))]` (the production arm is the durable-cell-table
-# `Projected` projection), so the crate's own integration drills (cp_d8 / cdc_12_6 / cdc_10_4 /
-# ga_d8_cross_cell_dsr) — separate test binaries that link the lib WITHOUT `cfg(test)` — reach the
-# double ONLY when `test-support` is on. Listing the crate as a DEV-dependency of itself with the
-# feature is the sanctioned Cargo idiom (dev-dep cycles are allowed), matching the Wave-2/3
-# identity/events self dev-dependencies; it keeps `cargo test -p myelin-control-plane` (DB-free) green
-# WITHOUT polluting the production build (cargo tree -e no-dev shows no test-support edge).
 myelin-control-plane = { path = ".", features = ["test-support"] }
-# MR-009b W3b.6: the control-plane spec-builder test boots the in-process outbox floor
-# (`OutboxSpec::default_inproc`), which is `test-support`-gated in the substrate (and constructs
-# the gated events in-memory OutboxStore). DEV-only — never in the production DAG.
 myelin-substrate = { path = "../myelin-substrate", features = ["test-support"] }
-# MR-009b W6c-cp — DEV-only: the dev config (`MyelinConfig::dev()`) the live-PG W6c-cp projection
-# integration test connects the pool with. DEV-only — never in the production DAG.
 myelin-config = { path = "../myelin-config" }
-# Panic-safe test teardown (`tests/common::with_cleanup`, the same shape as
-# `myelin-storage/tests/common/mod.rs`): `FutureExt::catch_unwind` lets a test's body run to
-# completion OR panic while its own `cleanup(...)` call still runs unconditionally afterward. DEV-only
-# — never in the production DAG.
 futures = { workspace = true }
-# MR-009b W6c-cp — DEV-only: the live-PG W6c-cp projection integration test cleans up its own throwaway
-# `cell` rows (the control-plane `cell` table is cross-tenant routing infra with no RLS/suffix scope, so
-# `all_cells()` is unscoped) through a direct DELETE. DEV-only — never in the production DAG.
 sqlx = { workspace = true }
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests (the same
-# posture as the Wave-2/3 identity/events test-support dev-dependencies). DEV-only — never in the
-# production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# The GDPR/Audit SERVICE crate — DEV-only, for the contract-10.8 CDC pair + the STOR-D4/STOR-D3-GA-face
-# drills (P-GA-15 / P-115). The control-plane is the ONLY crate that sees BOTH the GDPR erasure ledger
-# (10.8, the PROVIDER — `myelin-gdpr-service`) and Storage's `post_restore_reerase` (11.5, the CONSUMER
-# — `myelin-storage`), so the cross-subsystem seam that wires the ledger into the restore-verify
-# re-erasure pass is proven HERE (it is the cell-orchestration / boot home that drives restores). DEV-only:
-# it is a TEST seam — the production `serve(AppSpec)` wiring is the named boot floor; nothing in the
-# control-plane production DAG depends on the GDPR service (substrate_is_root() preserved).
 myelin-gdpr-service = { path = "../myelin-gdpr-service" }
-# The drill harness (SignalSource/SignalName/Predicate) — the CP-D6 drill emits its dated green
-# artifact through the SAME telemetry the other drills use (observability is part of the pass, EI-01
-# §3). DEV-only — myelin-harness never enters the service production DAG (a test-support crate above
-# the substrate).
 myelin-harness = { path = "../myelin-harness" }
-# The CI subsystem's runner-claim MECHANISM (`JobLeaseStore::claim_for_labels`) — DEV-only, for the
-# CI-R3 runner-claim drill (P-CP-18 / P-325): the cross-owner drill proves the CI claim mechanism (the
-# residency predicate that skips out-of-region jobs) and the control-plane region-pin ASSERTION
-# (`RunnerClaimPin::admit_claim`) AGREE — an out-of-region runner cannot claim an EU tenant's run from
-# either side. NO production DAG edge (myelin-ci-sandbox is a leaf; nothing in the control-plane
-# production DAG depends on it — substrate_is_root() preserved); it is a TEST-only cross-owner pairing,
-# the same shape the residency_verify CDC uses to prove Storage's reports feed the control plane.
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }

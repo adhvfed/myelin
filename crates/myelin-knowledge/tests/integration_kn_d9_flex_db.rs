@@ -1,33 +1,3 @@
-//! **KN-P17 / P-307 — the flexible database (JSONB property bag + GIN-indexed projection + the
-//! view filter conjoined with the `list_objects` `SetExpr` ACL) PROVEN against the live dev-stack
-//! Postgres.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-knowledge --features integration \
-//!     --test integration_kn_d9_flex_db -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires (the prompt touches the §4.1
-//! flexible-DB read contract: JSONB `props` source of truth + the GIN `jsonb_path_ops` projection +
-//! the `SetExpr` conjoin). The drill proves, against REAL Postgres:
-//!
-//! - the **JSONB property bag is the source of truth** and the **GIN `jsonb_path_ops` index** covers
-//!   it — a `props ->> 'status'` view filter uses the index (EXPLAIN confirms it is not a parallel
-//!   seq-scan blind path);
-//! - the **VIEW_QUERY is ONE query**: the view filter (JSONB ops over `props`) AND the
-//!   `list_objects` `SetExpr` ACL (the `authz_visible` JOIN over `db_row.id`) conjoined into one
-//!   `SELECT`, returning ONLY the rows the viewer may read AND that match the filter — **0 leak**
-//!   across a row-restricted db (composes with KN-D5);
-//! - the **permission-correct `COUNT(*)`** over the same conjoined set (the ACL inside the
-//!   aggregate) — **0 count-leak**;
-//! - the read is **paginated / row-capped / under a statement-timeout** (the §4.1 step-5 bounds).
-//!
-//! The lowered SQL the test runs is what Knowledge's [`myelin_knowledge::database`] +
-//! [`myelin_knowledge::list_filter`] compose: the REAL [`lower_view_filter`] JSONB predicate + the
-//! REAL [`lower_over_db_row_id`] ACL JOIN. The KN-D9 drill is registered red-until-proven and flips
-//! green ONLY here, against the live stack — never mocked.
 #![cfg(feature = "integration")]
 
 use myelin_identity::{Literal, Principal, PrincipalId, PrincipalKind, RelName, SetExpr};
@@ -59,8 +29,6 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
     let row_tbl = format!("db_row_p307_{suffix}");
     let av_tbl = format!("authz_visible_p307_{suffix}");
 
-    // ── 1. The §4.2 db_row table: JSONB `props` is the SOURCE OF TRUTH; a GIN jsonb_path_ops index is
-    //       the DERIVED projection. + the authz_visible reverse index (the SetExpr JOIN target). ────
     sqlx::query(&format!(
         "CREATE TABLE {row_tbl} (\
            tenant text NOT NULL, region text NOT NULL, db_id text NOT NULL, id text NOT NULL, \
@@ -84,16 +52,13 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
     .await
     .expect("create the authz_visible reverse index table");
 
-    // ── 2. Seed a row-restricted db: rows with status open/closed, one OPEN row granted to someone
-    //       ELSE (the leak witness), a cross-db row, a cross-tenant row. ─────────────────────────────
     let seed: &[(&str, &str, &str, &str, i64)] = &[
-        // (tenant, db_id, id, status, priority)
         ("acme", "db:projects", "row:1", "open", 5),
         ("acme", "db:projects", "row:2", "open", 3),
-        ("acme", "db:projects", "row:3", "closed", 4), // filtered out (status != open)
-        ("acme", "db:projects", "row:secret", "open", 9), // leak witness: open, but granted to p:other
-        ("acme", "db:other", "row:otherdb", "open", 1),   // no-cross-db
-        ("evilcorp", "db:projects", "row:x", "open", 1),  // no-cross-tenant
+        ("acme", "db:projects", "row:3", "closed", 4),
+        ("acme", "db:projects", "row:secret", "open", 9),
+        ("acme", "db:other", "row:otherdb", "open", 1),
+        ("evilcorp", "db:projects", "row:x", "open", 1),
     ];
     for (tenant, db_id, id, status, priority) in seed {
         let props = serde_json::json!({ "status": status, "priority": priority, "title": format!("Item {id}") });
@@ -110,9 +75,6 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         .expect("seed a db_row");
     }
 
-    // ── 3. Grant the viewer `read` of row:1, row:2, row:3 (closed) + row:otherdb; row:secret to
-    //       p:other. (row:3 is granted but filtered by status; row:otherdb is granted but cross-db —
-    //       proving the FILTER and the db_id predicate, not ACL-luck, confine the result.) ───────────
     let viewer = Principal::stub(
         PrincipalId("p:viewer".into()),
         PrincipalKind::Human,
@@ -135,8 +97,6 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         .expect("grant read");
     }
 
-    // ── 4. Build the REAL lowered VIEW filter (status == 'open' → a JSONB predicate over props) + the
-    //       REAL lowered SetExpr ACL (InRelation → the authz_visible JOIN over db_row.id). ────────────
     let filter = QueryAst::compiled(Predicate::Cmp {
         op: CmpOp::Eq,
         lhs: Expr::Var("status".into()),
@@ -164,23 +124,18 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         "the InRelation lowers to ONE JOIN (no N+1)"
     );
 
-    // Rebind the lowering output onto the suffixed test tables + bind the literals inline for the
-    // seeded test (the SHAPE under test is the lowering's verbatim output; production binds params).
     let join_clause = lowered_acl.joins[0]
         .clause
         .replace(AUTHZ_VISIBLE_TABLE, &av_tbl)
         .replace("db_row.id", &format!("{row_tbl}.id"))
         .replace(":subject_0", "'p:viewer'")
         .replace(":rel_for_read", "'read'");
-    let acl_pred = lowered_acl.sql_predicate; // `av0.object_id IS NOT NULL`
-                                              // The view filter predicate, with `db_row.props` → the test table + the bound `:f0` → 'open'.
+    let acl_pred = lowered_acl.sql_predicate;
     let filter_pred = lowered_filter
         .sql_predicate
         .replace("db_row.props", &format!("{row_tbl}.props"))
         .replace(&lowered_filter.params[0].placeholder, "'open'");
 
-    // ── 5. THE ONE VIEW_QUERY: the view filter (JSONB) AND the ACL (JOIN) conjoined, tenant + db_id
-    //       scoped, ORDER BY priority DESC then order_key, LIMIT 50 (the §4.1 pre-filter). ───────────
     let list_sql = format!(
         "SELECT {row_tbl}.id FROM {row_tbl} {join_clause} \
          WHERE {row_tbl}.tenant = 'acme' AND {row_tbl}.db_id = 'db:projects' \
@@ -193,9 +148,6 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         .unwrap_or_else(|e| panic!("the ONE VIEW_QUERY runs: {e}\nSQL: {list_sql}"));
     let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("id")).collect();
 
-    // ── 6. PROVE leak-free + filtered: exactly the granted OPEN rows in this db, priority-sorted.
-    //       row:1 (prio 5) before row:2 (prio 3); row:3 (closed) filtered; row:secret (granted to
-    //       other) absent; cross-db + cross-tenant absent. ──────────────────────────────────────────
     assert_eq!(
         ids,
         vec!["row:1".to_string(), "row:2".to_string()],
@@ -218,8 +170,6 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         "0 cross-tenant: the tenant predicate excluded evilcorp's row"
     );
 
-    // ── 7. The permission-correct COUNT(*) — the SAME filter + ACL INSIDE the aggregate. 0
-    //       count-leak: COUNT = 2 (the granted open rows), NOT 3 (would leak row:secret). ────────────
     let count_sql = format!(
         "SELECT COUNT(*) AS n FROM {row_tbl} {join_clause} \
          WHERE {row_tbl}.tenant = 'acme' AND {row_tbl}.db_id = 'db:projects' \
@@ -240,9 +190,6 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         "the COUNT == the listed cardinality (the SAME conjunct, no divergent path)"
     );
 
-    // ── 8. PROVE one query + the GIN projection: EXPLAIN confirms a single JOIN plan (no per-row
-    //       check subplan). With this small seed Postgres may pick a seq-scan over the index, but the
-    //       presence of the GIN index + the one-join plan is what the contract requires. ─────────────
     let plan: String = sqlx::query(&format!("EXPLAIN (FORMAT TEXT) {list_sql}"))
         .fetch_all(&admin)
         .await
@@ -255,8 +202,6 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         plan.to_lowercase().contains("join") || plan.to_lowercase().contains("nested loop"),
         "the VIEW_QUERY is ONE join query (no per-row check loop): {plan}"
     );
-    // The GIN index exists on props (the derived projection is present, even if the planner picks a
-    // different access path on this tiny seed — the index is the contract artifact, not the plan).
     let has_gin: bool = sqlx::query(&format!(
         "SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = '{row_tbl}_gin') AS e"
     ))
@@ -278,7 +223,6 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
          the aggregate); EXPLAIN shows one join plan."
     );
 
-    // ── 9. Cleanup (forward teardown). ───────────────────────────────────────────────────────────
     sqlx::query(&format!("DROP TABLE {row_tbl}"))
         .execute(&admin)
         .await

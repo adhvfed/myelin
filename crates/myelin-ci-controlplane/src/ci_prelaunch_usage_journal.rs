@@ -1,10 +1,3 @@
-//! Durable parent-attempt admission and checkout-preparation usage journaling.
-//!
-//! A parent attempt is admitted only after the exact scheduler generation, immutable manifest,
-//! durable launch template, v2 reservation handle, reservation amount, and reservation lifecycle
-//! all agree in one tenant transaction. Checkout phases then move monotonically from `started` to
-//! either exact `measured` usage or the conservative `sealed_ceiling` fallback.
-
 use myelin_ci_sandbox::ResourceUsage;
 use myelin_storage::{with_tenant_tx_error, PgError};
 use myelin_tenancy::{Region, TenantId};
@@ -28,7 +21,6 @@ use crate::job_spec_store::CiJobSpecStore;
 
 const PRELAUNCH_PHASE_DEADLINE_HEADROOM_SECS: u64 = 600;
 
-/// One checkout-preparation phase represented by `ci_job_prelaunch_usage`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiPrelaunchUsagePhase {
     CheckoutTransport,
@@ -51,14 +43,12 @@ impl CiPrelaunchUsagePhase {
     }
 }
 
-/// Whether a durable journal operation created/transitioned a row or recovered an exact replay.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiPrelaunchJournalOutcome {
     Applied,
     Replayed,
 }
 
-/// Typed, non-secret refusal from the prelaunch-usage journal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiPrelaunchUsageJournalError {
     InvalidClaim,
@@ -137,7 +127,6 @@ impl From<PgError> for CiPrelaunchUsageJournalError {
     }
 }
 
-/// Opaque proof that one exact parent attempt passed the durable admission boundary.
 #[derive(Clone, Debug)]
 pub struct CiJobParentAttempt {
     tenant_id: String,
@@ -170,59 +159,34 @@ impl CiJobParentAttempt {
     }
 }
 
-/// **CT-007 slice 5b.3-6d: the typed parent-attempt admission outcome.** The recovery gap Sol named:
-/// [`begin_parent_attempt`](CiPrelaunchUsageJournal::begin_parent_attempt) can only ever say
-/// `ParentAttemptLimitExceeded` (an error that rolls its whole transaction back), but
-/// `report_preparation_terminal(AttemptsExhausted)` needs a settleable reservation to terminalize
-/// against. This outcome is the reconciliation: an exhausted attempt still surfaces its operational
-/// `reserve_handle`, and — because [`admit_parent_attempt`](CiPrelaunchUsageJournal::admit_parent_attempt)
-/// commits the `reserved → inflight` transition inside the SAME tenant transaction that detects
-/// exhaustion — that reserve is provably `inflight`, never stranded `reserved`.
-///
-/// [`begin_parent_attempt`] keeps its exact legacy behaviour (an `Err(ParentAttemptLimitExceeded)`
-/// that rolls back); [`admit_parent_attempt`] is the NEW typed path. Both drive the identical durable
-/// admission logic ([`run_parent_admission_on_conn`]); they differ only in whether exhaustion commits
-/// (typed capability) or rolls back (legacy error).
-// One value is produced per admission call and consumed immediately — never stored in bulk — so the
-// size delta between the `CiJobParentAttempt`-bearing arm and the handle-only arm is immaterial;
-// boxing would only add an allocation + deref on the hot admitted path.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum CiParentAttemptAdmission {
-    /// The exact claim was validated, the reservation is `inflight`, and a parent-attempt row was
-    /// inserted or exactly replayed — the attempt may proceed.
     Admitted {
         attempt: CiJobParentAttempt,
         outcome: CiPrelaunchJournalOutcome,
     },
-    /// The durable parent-attempt budget is already exhausted for this exact-policy reserve. No row
-    /// was created for the newly-claimed generation; the caller terminalizes `AttemptsExhausted` and
-    /// settles `reserve_handle` (which this same transaction committed as `inflight`).
     AttemptsExhausted { reserve_handle: String },
 }
 
-/// PostgreSQL-backed state machine for the parent-attempt and phase journal pair.
 #[derive(Clone)]
 pub struct CiPrelaunchUsageJournal {
     pool: PgPool,
     region: String,
 }
 
-/// Whether a v2 settlement boundary requires proof that at least one parent attempt began.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiPrelaunchParentExpectation {
     Required,
     OptionalBeforeLaunch,
 }
 
-/// How a terminal owner handles a phase that is still `started` while it holds the queue lock.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiPrelaunchUnresolvedPolicy {
     Refuse,
     SealToCeiling,
 }
 
-/// Exact prelaunch usage recovered from the durable journal for one job settlement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CiPrelaunchUsageAccrual {
     pub usage: ResourceUsage,
@@ -245,7 +209,6 @@ impl Default for CiPrelaunchUsageAccrual {
     }
 }
 
-/// Durable identity the terminal owner must match before consuming journaled prelaunch usage.
 #[derive(Clone, Copy, Debug)]
 pub struct CiPrelaunchSettlementIdentity<'a> {
     pub tenant_id: &'a str,
@@ -273,15 +236,6 @@ impl CiPrelaunchUsageJournal {
         Ok(Self { pool, region })
     }
 
-    /// Admit one exact live claim generation and create its immutable parent-attempt row.
-    ///
-    /// Exact replay returns the existing row. A distinct generation is admitted only while the
-    /// policy embedded in the verified v2 handle still has capacity.
-    ///
-    /// **Legacy behaviour, byte-for-byte preserved (CT-007 5b.3-6d).** Exhaustion returns
-    /// `Err(ParentAttemptLimitExceeded)`, which rolls the whole tenant transaction back — including
-    /// the `reserved → inflight` transition. Callers that need the typed exhaustion capability (a
-    /// settleable reserve rather than an error) use [`admit_parent_attempt`](Self::admit_parent_attempt).
     pub async fn begin_parent_attempt(
         &self,
         claim: &CiJobTokenRequest,
@@ -303,9 +257,6 @@ impl CiPrelaunchUsageJournal {
                 .await?
                 {
                     ParentAdmissionTxOutcome::Admitted(attempt, outcome) => Ok((attempt, outcome)),
-                    // Exhaustion is a legacy ERROR here: returning `Err` rolls the whole transaction
-                    // back (the `reserved → inflight` transition included), preserving the exact
-                    // pre-6d behaviour every existing caller depends on.
                     ParentAdmissionTxOutcome::Exhausted => {
                         Err(CiPrelaunchUsageJournalError::ParentAttemptLimitExceeded)
                     }
@@ -315,14 +266,6 @@ impl CiPrelaunchUsageJournal {
         .await
     }
 
-    /// **CT-007 slice 5b.3-6d: the typed admission path.** Identical durable logic to
-    /// [`begin_parent_attempt`](Self::begin_parent_attempt), but exhaustion returns the typed
-    /// [`CiParentAttemptAdmission::AttemptsExhausted`] capability instead of an error. Crucially the
-    /// transaction COMMITS on that arm, so the `reserved → inflight` transition
-    /// [`run_parent_admission_on_conn`] performs BEFORE it counts the budget is durable: the exhausted
-    /// attempt's reserve is provably `inflight` and therefore settleable by
-    /// `report_preparation_terminal(AttemptsExhausted)`. See [`CiParentAttemptAdmission`] for the
-    /// invariant proof.
     pub async fn admit_parent_attempt(
         &self,
         claim: &CiJobTokenRequest,
@@ -346,9 +289,6 @@ impl CiPrelaunchUsageJournal {
                     ParentAdmissionTxOutcome::Admitted(attempt, outcome) => {
                         Ok(CiParentAttemptAdmission::Admitted { attempt, outcome })
                     }
-                    // Exhaustion COMMITS: `run_parent_admission_on_conn` already transitioned the
-                    // reservation `reserved → inflight` (or found it already inflight) in THIS
-                    // transaction, so returning `Ok` durably leaves the reserve settleable.
                     ParentAdmissionTxOutcome::Exhausted => {
                         Ok(CiParentAttemptAdmission::AttemptsExhausted { reserve_handle })
                     }
@@ -358,10 +298,6 @@ impl CiPrelaunchUsageJournal {
         .await
     }
 
-    /// Shared admission prologue: validate the claim + reserve-handle shape (rejecting legacy v1
-    /// handles and malformed v2 handles before any database work) and build the manifest/spec stores
-    /// both admission entry points drive [`run_parent_admission_on_conn`] with. Returns the cloned
-    /// claim + owned handle so the caller can move them into its own tenant transaction.
     fn prepare_admission(
         &self,
         claim: &CiJobTokenRequest,
@@ -396,7 +332,6 @@ impl CiPrelaunchUsageJournal {
         Ok((claim, reserve_handle.to_owned(), manifest_store, spec_store))
     }
 
-    /// Begin one checkout phase with the ceiling derived from the verified durable job authority.
     pub async fn begin_phase(
         &self,
         attempt: &CiJobParentAttempt,
@@ -462,8 +397,6 @@ impl CiPrelaunchUsageJournal {
         .await
     }
 
-    /// Complete a begun phase with exact measured usage. Exact acknowledgement-loss replay is
-    /// accepted; a different measurement or a previously sealed phase is refused.
     pub async fn complete_phase(
         &self,
         attempt: &CiJobParentAttempt,
@@ -474,7 +407,6 @@ impl CiPrelaunchUsageJournal {
             .await
     }
 
-    /// Seal a begun phase at its immutable ceiling when teardown/measurement cannot be proven.
     pub async fn seal_phase(
         &self,
         attempt: &CiJobParentAttempt,
@@ -563,20 +495,6 @@ impl CiPrelaunchUsageJournal {
         .await
     }
 
-    /// **CT-007 slice 5b.3-6d STEP 3: the live `count < max` requeue policy.** Read-only: whether the
-    /// exact-policy parent-attempt budget for this reserve still permits ANOTHER attempt. The dormant
-    /// [`AttemptAuthority::should_requeue`](myelin_ci_sandbox::checkout_orchestration::AttemptAuthority)
-    /// routes on exactly this — a permitted budget requeues the leased generation, an exhausted one
-    /// terminalizes `AttemptsExhausted`. It mirrors the counting the exhaustion CAS
-    /// ([`verify_preparation_disposition_on_conn`](crate::ci_pipeline_driver)) re-verifies under lock:
-    /// exactly ONE immutable governing policy must exist for the reserve, and `count < max` under it.
-    /// A divergent or absent policy fails CLOSED (not permitted) — the same fail-closed posture the
-    /// exhaustion CAS takes for `policies.len() != 1` — so a routing decision is never made on an
-    /// ambiguous budget. It takes ONLY the per-job advisory lock (it never acquires the queue row, so
-    /// this is not the queue → advisory order the phase writers hold); that is sufficient because this
-    /// is a non-mutating routing hint, and the durable requeue/exhaustion CAS the reporter runs later
-    /// re-verifies the count under its own transaction (with the full queue → advisory ordering)
-    /// before any state change.
     pub async fn parent_attempt_retry_permitted(
         &self,
         claim: &CiJobTokenRequest,
@@ -620,8 +538,6 @@ impl CiPrelaunchUsageJournal {
                     .fetch_all(&mut *connection)
                     .await
                     .map_err(map_sql_error)?;
-                    // Exactly one immutable policy must govern this reserve; divergence (or no rows
-                    // at all) fails closed to "not permitted", never a routing decision on ambiguity.
                     if policies.len() != 1 {
                         return Ok(false);
                     }
@@ -674,10 +590,6 @@ enum PhaseResolution {
     Sealed,
 }
 
-/// Resolve every durable prelaunch phase for one eventual settlement while holding the canonical
-/// queue → advisory → journal lock order. This is the single accounting reader shared by normal
-/// terminal settlement and abandoned-job reconciliation in 4b.2; 4b.1 lands and tests the reader
-/// before either caller changes billing behavior.
 pub async fn resolve_prelaunch_usage_on_conn(
     connection: &mut sqlx::PgConnection,
     identity: CiPrelaunchSettlementIdentity<'_>,
@@ -872,37 +784,17 @@ struct DurablePhase {
     seal_window_secs: Option<u64>,
 }
 
-/// The internal result of the shared admission transaction (CT-007 5b.3-6d). The two public entry
-/// points diverge ONLY on the `Exhausted` arm: [`CiPrelaunchUsageJournal::begin_parent_attempt`] maps
-/// it to `Err` (rollback), [`CiPrelaunchUsageJournal::admit_parent_attempt`] to a committed typed
-/// capability.
-// Produced once per admission and matched immediately (never stored in bulk) — see the note on
-// [`CiParentAttemptAdmission`].
 #[allow(clippy::large_enum_variant)]
 enum ParentAdmissionTxOutcome {
     Admitted(CiJobParentAttempt, CiPrelaunchJournalOutcome),
     Exhausted,
 }
 
-/// The three-way result of [`insert_or_replay_parent_attempt`]: a fresh insert, an exact replay, or
-/// the durable budget already exhausted. Exhaustion is a VALUE, not an error, so the caller decides
-/// whether it commits (typed capability) or rolls back (legacy error) — the reservation transition
-/// this transaction already performed rides on that decision.
 enum InsertOrReplayOutcome {
     Journaled(CiPrelaunchJournalOutcome),
     Exhausted,
 }
 
-/// **CT-007 slice 5b.3-6d: the ONE durable admission transaction body**, shared verbatim by
-/// [`CiPrelaunchUsageJournal::begin_parent_attempt`] and
-/// [`CiPrelaunchUsageJournal::admit_parent_attempt`]. It runs entirely on the caller's single
-/// tenant-scoped connection (the caller owns the commit/rollback boundary), so reservation transition
-/// and parent-row insertion are one atomic unit — never split across transactions.
-///
-/// **Ordering is load-bearing for the exhaustion invariant.** The `reserved → inflight` reservation
-/// transition happens BEFORE the parent-attempt count/insert. So any path that reaches
-/// [`InsertOrReplayOutcome::Exhausted`] has ALREADY ensured the reservation is `inflight` in this same
-/// transaction: a committed exhaustion (via `admit_parent_attempt`) leaves a settleable reserve.
 async fn run_parent_admission_on_conn(
     connection: &mut sqlx::PgConnection,
     claim: &CiJobTokenRequest,
@@ -984,10 +876,6 @@ async fn run_parent_admission_on_conn(
         durable_amount,
     )
     .map_err(|_| CiPrelaunchUsageJournalError::ReservationAuthorityMismatch)?;
-    // The `reserved → inflight` transition — performed BEFORE the budget count below, so an exhausted
-    // outcome that this transaction commits (admit_parent_attempt) always leaves an `inflight`,
-    // settleable reserve. A settled/absent reservation is `ReservationNotLaunchable`, so exhaustion
-    // is never surfaced for an unsettleable reserve.
     match reservation_state.as_str() {
         "inflight" => {}
         "reserved" => {
@@ -1076,9 +964,6 @@ async fn insert_or_replay_parent_attempt(
         .ok()
         .is_none_or(|count| count >= u64::from(policy.max_parent_attempts().get()))
     {
-        // The durable budget is exhausted. This is a VALUE, not an error: the caller (via
-        // `run_parent_admission_on_conn`) decides whether to commit it as a typed capability or roll
-        // it back as the legacy `ParentAttemptLimitExceeded`.
         return Ok(InsertOrReplayOutcome::Exhausted);
     }
 
@@ -1174,9 +1059,6 @@ async fn lock_parent_attempt_job_on_conn(
     Ok(())
 }
 
-/// Lock and re-verify the exact queue generation before any worker-side phase mutation. The queue
-/// row is deliberately locked before the per-job advisory lock at every entry point, establishing
-/// the canonical queue → advisory → journal order shared with settlement reconciliation.
 async fn require_live_parent_attempt_on_conn(
     connection: &mut sqlx::PgConnection,
     attempt: &CiJobParentAttempt,

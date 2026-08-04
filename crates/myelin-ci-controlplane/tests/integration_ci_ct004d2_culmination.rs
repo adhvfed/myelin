@@ -1,29 +1,3 @@
-//! **CT-004d.2 CULMINATION — a pushed CI trigger runs a REAL pipeline END-TO-END, in ONE process,
-//! against live PG + real `runsc`.** This is the payoff: the durable `ci_run` a push armed (CT-004b)
-//! is started as a parked `ci.pipeline` run (chunk 3), its stage is dispatched through the DURABLE
-//! `job_queue`+`ci_job_spec` (chunk 5's `DurableJobRunner` — trust_tier/region forwarded UNCHANGED),
-//! the CT-004c.2 runner CLAIMS it + EXECUTES it in a REAL gVisor (`runsc`) guest + reports `job.done`,
-//! and the parked run WAKES through PostgreSQL (`CiPipelineReporter` + reconstructed `PgFlowWorker`),
-//! advances, and COMPLETES — the X-1 producer emits the green check/result durably.
-//!
-//! What it proves:
-//!   1. **END TO END (requires real `runsc`):** a queued `ci_run` → durable workflow start → drive
-//!      dispatches the
-//!      stage into the DURABLE queue → a `job_queue` row + its `ci_job_spec` appear → the durable-backed
-//!      runner claims it → a REAL `runsc` guest runs the stage command → `job.done` (re-encoded to the
-//!      stage-verdict codec) wakes a newly reconstructed PostgreSQL worker → the run COMPLETES →
-//!      `ci.run.succeeded` + `ci.check.updated{success}` commit to the durable outbox. SKIPS green if
-//!      `runsc`/rootfs absent; HARD-FAILS under
-//!      `MYELIN_REQUIRE_RUNSC=1`.
-//!   2. **SECURITY — the trust tier is forwarded UNCHANGED into the durable dispatch:** the `job_queue`
-//!      row + the `ci_job_spec` carry the run's stamped `trust_tier` (`trusted`), never widened.
-//!
-//! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
-//!
-//!   eval "$(scripts/dev-stack.sh env)"
-//!   export MYELIN_REQUIRE_RUNSC=1
-//!   cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_ct004d2_culmination -- --nocapture
 #![cfg(feature = "integration")]
 
 mod common;
@@ -99,8 +73,6 @@ impl CiJobTokenIssuer for ClaimTokenIssuer {
     }
 }
 
-// ─────────────────────────────── PG / schema plumbing (mirrors CT-004c.2) ─────────────────────────
-
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin".into())
@@ -164,16 +136,6 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         .execute(ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL)
         .await
         .expect("add ci_run PR ordering authority");
-    // BUG FIX (investigation, 2026-07-25): this per-pid schema never created its own `ci_job`
-    // table. `AUTHORIZE_JOB_LAUNCH_QUERY` (the launch CAS every real claim crosses) requires a
-    // matching `ci_job` row to also cross `queued`/`leased` -> `running` in the SAME statement —
-    // without this table, `search_path`'s `public` fallback silently resolved every `ci_job`
-    // reference to the SHARED dev database's `public.ci_job` (leftover rows from unrelated runs),
-    // which never has a row for this schema's `job_id`. The CAS therefore matched zero rows EVERY
-    // time (100% reproducible, not a timing/race artifact — confirmed by 5/5 identical failures
-    // within ~1.3s each, far under any claim TTL). Creating the real per-schema table here — and
-    // seeding the matching row at dispatch time below — is what a real push's starter
-    // (`pg_pipeline_starter.rs`'s `materialize_ci_jobs`) already does for every run.
     admin
         .execute(CREATE_CI_JOB_DDL)
         .await
@@ -231,7 +193,6 @@ async fn drop_schema(admin: &PgPool, schema: &str) {
         .ok();
 }
 
-/// A stable uuid from a name (FNV-1a fill) — the durable `uuid` columns require real uuids.
 fn uid(name: &str) -> Uuid {
     let mut bytes = [0u8; 16];
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -248,8 +209,6 @@ fn uid(name: &str) -> Uuid {
     bytes[8..].copy_from_slice(&h2.to_be_bytes());
     Uuid::from_bytes(bytes)
 }
-
-// ─────────────────────────────── runsc gating (mirrors CT-004c.2) ─────────────────────────────────
 
 fn runsc_present() -> bool {
     let bin = std::env::var("MYELIN_RUNSC_BIN").unwrap_or_else(|_| "runsc".to_string());
@@ -271,15 +230,13 @@ fn require_or_skip(test: &str) -> bool {
     if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
         panic!(
             "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc` is not on PATH or the staged rootfs ({}) is \
-             absent — CT-004d.2 refuses a VACUOUS green: a real `runsc` guest MUST run the pipeline stage.",
+             absent - CT-004d.2 refuses a VACUOUS green: a real `runsc` guest MUST run the pipeline stage.",
             resolved_gvisor_rootfs().display()
         );
     }
-    eprintln!("[{test}] SKIPPED: `runsc`/rootfs absent — this host cannot run a gVisor guest.");
+    eprintln!("[{test}] SKIPPED: `runsc`/rootfs absent - this host cannot run a gVisor guest.");
     false
 }
-
-// ─────────────────────────────── sandbox seam helpers ────────────────────────────────────────────
 
 #[derive(Clone, Default)]
 struct CapturingFirehose {
@@ -319,9 +276,6 @@ fn bridge<F: Future>(rt: &tokio::runtime::Handle, future: F) -> F::Output {
     }
 }
 
-/// Historical culmination support still uses a test credential issuer, but completion must cross
-/// the same durable `leased` -> `running` CAS as production. The permit defers that CAS until the
-/// real gVisor backend has armed its child launch gate.
 fn durable_launch_hooks(queue_store: CiJobQueueStore, rt: tokio::runtime::Handle) -> RunnerHooks {
     common::with_stage_b_compute_admission_for_legacy_runsc_test(
         RunnerHooks::new_with_launch_fence(
@@ -364,11 +318,6 @@ fn durable_launch_hooks(queue_store: CiJobQueueStore, rt: tokio::runtime::Handle
     )
 }
 
-// CT-007 gate 2/4: `spec.image` is now the real launch authority — this is the REAL,
-// already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin), registered
-// (see `test_registry` below) against the SAME base rootfs the founder pipeline actually runs. This
-// used to be a fabricated placeholder the runner ignored entirely (the exact gap CT-007 gate 2/4
-// closes); it is now a genuinely verifiable pin.
 fn pinned_image() -> ImageRef {
     ImageRef::pinned(format!(
         "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
@@ -397,9 +346,6 @@ fn now_secs() -> i64 {
 
 const TEST_CI_BODY_HASH: &str = "blake3:test-only-pinned-ci-pipeline-v1";
 
-/// Build the restartable PostgreSQL worker used by this culmination proof. The captured plan is
-/// deliberately test-only: production must derive this data from the future immutable drive-input
-/// manifest, never from process memory.
 fn pg_ci_test_worker(
     admin: &PgPool,
     tenant: &str,
@@ -480,8 +426,6 @@ fn pg_ci_test_worker(
     worker
 }
 
-// ═══════════════════════════════ THE END-TO-END PROOF ════════════════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_push_runs_a_real_pipeline_end_to_end() {
     let _test_guard = TEST_LOCK.lock().await;
@@ -489,10 +433,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         return;
     }
     let schema = schema_name("e2e");
-    // A cleanup-dedicated pool: `with_schema_cleanup` unconditionally drops `schema` through THIS
-    // pool once the test body (success, assertion failure, or panic) finishes, so the schema never
-    // outlives this test regardless of outcome (previously it was ONLY dropped at the START of this
-    // same test's NEXT run, letting orphaned schemas accumulate on this shared dev Postgres).
     let cleanup_admin = admin_pool(&schema).await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
@@ -501,9 +441,8 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     let admin = admin_pool(&schema).await;
     create_schema(&admin, &schema).await;
 
-    // ── (CT-004b) the durable `ci_run` a push armed: state=queued, with the pre-minted wf_run_id. ──
     let run_uuid = uid("d2-ci-run").to_string();
-    let wf_run_uuid = uid("d2-wf-run").to_string(); // the parked run's id (= the job_queue row's run_id)
+    let wf_run_uuid = uid("d2-wf-run").to_string();
     let ci_run_store = ci_run_store_factory(admin.clone());
     ci_run_store
         .insert_ci_run(&CiRunInsert {
@@ -517,7 +456,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
             trigger_kind: "push".into(),
             concurrency_group: None,
             pr_head_generation: None,
-            trust_tier: "trusted".into(), // the stamped tier — forwarded UNCHANGED into the dispatch
+            trust_tier: "trusted".into(),
             state: "queued".into(),
             correlation_id: "corr-d2".into(),
             cause_event_id: Some("evt-push-d2".into()),
@@ -537,7 +476,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     assert_eq!(record.state, "queued");
     assert_eq!(record.wf_run_id, wf_run_uuid);
 
-    // ── Test-only pinned body input; the stage runs `echo` in gVisor. ──
     let stage_target = "pipeline://myelin/self#build";
     let build_spec = fixed_command_spec_builder(
         &pinned_image().reference,
@@ -592,11 +530,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         RunId(wf_run_uuid.clone()),
         "the run's id == the pre-minted wf_run_id"
     );
-    // This culmination test begins at the production starter's durable output but constructs the
-    // worker directly so it can pin the one-stage body. Mirror the starter's queued -> running
-    // transition explicitly; the dedicated starter integration proves the transition and workflow
-    // start are one transaction. Leaving this row queued would make the production claim correctly
-    // refuse the otherwise-active workflow and turn every downstream assertion into a false proof.
     let activated: u64 = sqlx::query(
         "UPDATE ci_run SET state = 'running'
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
@@ -612,7 +545,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     .rows_affected();
     assert_eq!(activated, 1, "exactly the armed CI run becomes active");
 
-    // ── DRIVE #1: PgFlowWorker dispatches the stage durably and parks. ──
     let now = now_secs();
     let first = worker
         .run_once(now, "2026-07-17T00:00:00Z")
@@ -636,8 +568,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         "the pipeline dispatched the stage + parked on job.done"
     );
 
-    // Destroy every process-local drive object, then rebuild from PostgreSQL with the same immutable
-    // definition identity. The second drive below therefore proves journal/signal restart recovery.
     drop(worker);
     let worker = pg_ci_test_worker(
         &admin,
@@ -649,7 +579,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         "d2-flow-worker-after-restart",
     );
 
-    // a DURABLE job_queue row appeared (queued), carrying the run's stamped trust_tier UNCHANGED.
     let (jq_run, jq_trust, jq_state): (Uuid, String, String) =
         sqlx::query_as("SELECT run_id, trust_tier, state FROM job_queue WHERE run_id = $1")
             .bind(uid("d2-wf-run"))
@@ -669,7 +598,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         jq_state, "queued",
         "the stage job is queued, awaiting a runner claim"
     );
-    // its ci_job_spec is resolvable (the spec that EXECUTES) + carries the SAME tier.
     let spec_trust: String =
         sqlx::query_scalar("SELECT spec->'spec'->>'trust_tier' FROM ci_job_spec WHERE run_id = $1")
             .bind(uid("d2-wf-run"))
@@ -681,22 +609,12 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         "the executing spec's tier == the gate tier (no widening)"
     );
 
-    // Mirror the starter's `materialize_ci_jobs` (`pg_pipeline_starter.rs`): a real push-triggered
-    // run has its whole `ci_job` DAG row set (state='queued') materialized at arm time, BEFORE any
-    // stage dispatch. This test drives the pipeline directly (see the note above), so it must seed
-    // the single `build` job's `ci_job` row itself — `AUTHORIZE_JOB_LAUNCH_QUERY`'s launch CAS
-    // requires a matching `ci_job` row to cross `queued`/`leased` -> `running` in the SAME
-    // statement, and without it the CAS deterministically matches zero rows (see the `create_schema`
-    // comment for the full diagnosis).
     let dispatched_job_id: Uuid =
         sqlx::query_scalar("SELECT job_id FROM job_queue WHERE run_id = $1")
             .bind(uid("d2-wf-run"))
             .fetch_one(&admin)
             .await
             .expect("the dispatched job_queue row's job_id");
-    // `ci_job.run_id` FKs to `ci_run.run_id` (the CI run id, `run_uuid`) — NOT `job_queue.run_id`
-    // (which is the workflow's `wf_run_id`). The launch CAS itself only matches `ci_job` on
-    // `(tenant_id, region, job_id)`, so only `job_id` must line up with the dispatched row.
     sqlx::query(
         "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, spec_ref, \
          state, attempt) \
@@ -711,8 +629,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     .await
     .expect("seed the starter-owned ci_job surface row the launch CAS crosses");
 
-    // ── The durable-backed runner claims + executes in real runsc. The PostgreSQL-only reporter
-    //    consumes the exact claim and inserts job.done atomically; it has no FlowExecutor mirror. ──
     let resolver = durable_spec_resolver_test_support(
         ci_job_spec_store(admin.clone()),
         region,
@@ -748,7 +664,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     let agent = RunnerAgent::new(
         "d2-worker",
         vec!["linux".into()],
-        vec![TrustTier::Trusted], // trusted-only
+        vec![TrustTier::Trusted],
         Region(region.into()),
         30,
         adapter,
@@ -784,7 +700,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         "the REAL runsc guest ran the stage command (proves real exec). got: {guest:?}"
     );
 
-    // ── DRIVE #2 after reconstruction: consume durable job.done and complete. ──
     let second = worker
         .run_once(now_secs(), "2026-07-17T01:00:00Z")
         .await
@@ -816,7 +731,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         .expect("count durable signals");
     assert_eq!(signal_count, 1, "exactly one durable job.done was buffered");
 
-    // the durable lease was SETTLED (the job_queue row moved to terminal).
     let jq_final: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE run_id = $1")
         .bind(uid("d2-wf-run"))
         .fetch_one(&admin)
@@ -824,7 +738,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         .expect("read the settled job state");
     assert_eq!(jq_final, "terminal", "the runner settled the durable lease");
 
-    // The X-1 producer events co-committed through PgFlowDriveStore's durable outbox.
     let types: Vec<String> = sqlx::query_scalar(
         "SELECT envelope->>'type_' FROM outbox WHERE envelope->>'type_' LIKE 'ci.%' ORDER BY seq",
     )
@@ -840,8 +753,6 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         "the pipeline emitted a terminal ci.check.updated. emitted: {types:?}"
     );
 
-    // sanity: the job.done payload carried the STAGE VERDICT codec (the bridge translated the runner's
-    // derived pass), NOT the raw passed marker — this is what let run_ci_pipeline decode the verdict.
     let jd: serde_json::Value = sqlx::query_scalar(
         "SELECT payload FROM wf_signal WHERE run_id = $1 AND signal_name = $2 AND idem_key = $3",
     )
@@ -867,20 +778,10 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
     .await;
 }
 
-/// The engine-minted dispatch `idem_token` for the single build stage (command position 0): the
-/// `<run_id>/ci.pipeline:0/job` shape `job_idem_token` mints (the runner echoes it on job.done).
 fn outcome_idem(run_id: &str) -> String {
     myelin_flow::job_idem_token(run_id, "ci.pipeline:0")
 }
 
-// ═══════════════ CLAIM-BOUND COMPLETION — the adversarial proofs (no runsc needed) ═══════════════
-// These drive the reporter's prove-and-consume CAS directly (seed the claim, no guest exec), proving
-// dispatch EXISTENCE is not claim OWNERSHIP, that a stale/re-claimed generation is refused, that the
-// receipt makes a redelivery idempotent, and that a flipped-verdict replay is refused.
-
-/// Arm a queued `ci_run`, start its parked `ci.pipeline` run, and drive ONE tick so its build stage is
-/// dispatched into the durable queue + `ci_job_spec` (with the durable stage). Returns the parked run,
-/// the dispatched `job_id`, and the dispatch `idem_token` the reporter verifies against.
 async fn arm_and_dispatch(
     admin: &PgPool,
     ci_run_store: &myelin_ci_controlplane::CiRunStore,
@@ -952,10 +853,6 @@ async fn arm_and_dispatch(
             .fetch_one(admin)
             .await
             .expect("the dispatched ci_job_spec row");
-    // Mirror the starter's `materialize_ci_jobs` (see the `create_schema`/`a_push_...` comments):
-    // the launch CAS (`AUTHORIZE_JOB_LAUNCH_QUERY`) requires a matching `ci_job` row to cross
-    // `queued`/`leased` -> `running` in the SAME statement. `ci_job.run_id` FKs to `ci_run.run_id`
-    // (`run_uuid`), not the workflow `wf_run_id` `ci_job_spec`/`job_queue` key on.
     sqlx::query(
         "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, spec_ref, \
          state, attempt) \
@@ -1003,7 +900,6 @@ impl TestClaimFacts {
     }
 }
 
-/// Simulate a runner claim on the dispatched job with complete durable generation facts.
 async fn claim_job(admin: &PgPool, wf_run: &str, owner: &str, epoch: i64) -> TestClaimFacts {
     let nonce = uid(&format!("{wf_run}:{owner}:{epoch}:claim"));
     let (nonce, started_at_epoch_secs, expires_at_epoch_secs): (String, i64, i64) = sqlx::query_as(
@@ -1070,8 +966,6 @@ fn completion_claim(
 async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     let _test_guard = TEST_LOCK.lock().await;
     let schema = schema_name("claim");
-    // See `a_push_runs_a_real_pipeline_end_to_end`'s cleanup comment: this pool unconditionally
-    // drops `schema` after the test body finishes, however it finishes.
     let cleanup_admin = admin_pool(&schema).await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
@@ -1102,15 +996,11 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         result_refs: vec![],
     };
 
-    // ── MAIN run: dispatch a stage. ──
     let (run, job_id, idem) =
         arm_and_dispatch(&admin, &ci_run_store, &driver, tenant, region, "cbc-main").await;
     let wf_run = run.0.clone();
     let reporter = driver.reporter();
 
-    // (A) DISPATCH EXISTENCE ≠ OWNERSHIP: a caller who reconstructs the exact valid (run, job_id, idem)
-    // tuple (all derivable from the public token grammar) but holds NO claim is REFUSED — the row is
-    // still `queued`, so no live claim generation matches, and nothing is signalled.
     let forged_nonce = Uuid::nil().to_string();
     let forged = reporter.report_done(
         &completion_claim(
@@ -1134,7 +1024,6 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         "a refused forgery signals nothing"
     );
 
-    // ── the runner claims at generation (worker-real, epoch 1). ──
     let claim = claim_job(&admin, &wf_run, "worker-real", 1).await;
 
     let leased_completion = reporter.report_done(
@@ -1197,8 +1086,6 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         "typed-signal failure rolls back running-claim consumption"
     );
 
-    // (B) STALE GENERATION: a worker whose lease was reaped and re-claimed elsewhere presents a LOWER
-    // epoch — refused (the CAS matches no live claim at that generation).
     let stale = reporter.report_done(
         &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 0, &claim.nonce),
         &pass(),
@@ -1207,7 +1094,6 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         matches!(stale, Err(ExecutorError::InvalidInput(_))),
         "a stale epoch is refused, got {stale:?}"
     );
-    // a DIFFERENT owner at the correct epoch is refused too.
     let wrong_owner = reporter.report_done(
         &completion_claim(&tid, &run, &job_id, &idem, "worker-evil", 1, &claim.nonce),
         &pass(),
@@ -1222,7 +1108,6 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         "no refused delivery signalled"
     );
 
-    // (C) THE OWNING RUNNING CLAIM consumes the claim + signals the verdict.
     let ok = reporter
         .report_done(
             &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
@@ -1239,8 +1124,6 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
     assert_eq!(state, "terminal", "the claim was consumed to terminal");
     assert!(receipt.is_some(), "a completion receipt was recorded");
 
-    // (D) RECEIPT-BASED RETRY: the identical completion redelivered is idempotent (AlreadyConsumed →
-    // re-signal, the engine dedups to Duplicate) — a signal that failed after the CAS retries safely.
     let retry = reporter
         .report_done(
             &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
@@ -1253,9 +1136,6 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         "the redelivery is a wake-once no-op"
     );
 
-    // (E) FLIPPED-VERDICT REPLAY: the SAME valid claim but `passed=false` computes a DIFFERENT receipt
-    // than the recorded one — REFUSED (the receipt binds the verdict; a consumed pass cannot be replayed
-    // as a fail).
     let flipped = reporter.report_done(
         &completion_claim(&tid, &run, &job_id, &idem, "worker-real", 1, &claim.nonce),
         &TerminalReport {
@@ -1299,7 +1179,6 @@ async fn claim_bound_completion_refuses_forged_stale_and_flipped_verdict() {
         "an actual-usage divergence changes the receipt and is refused"
     );
 
-    // ── FAIL-CLOSED run: a dispatched stage whose durable spec stage is NULL. ──
     let (run2, job2, idem2) =
         arm_and_dispatch(&admin, &ci_run_store, &driver, tenant, region, "cbc-quar").await;
     let wf_run2 = run2.0.clone();

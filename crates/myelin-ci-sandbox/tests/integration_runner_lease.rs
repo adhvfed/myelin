@@ -1,23 +1,3 @@
-//! Live-Postgres integration test (CI-P3 → P-238) — the runner-side lease/heartbeat handshake +
-//! the exactly-once `job.done` terminal report proven against REAL Postgres.
-//!
-//! The lease/heartbeat is a Postgres `FOR UPDATE SKIP LOCKED` contract (arch 02 §2.1) and the
-//! terminal report is the engine's `wf_signal` ON CONFLICT idempotency (§OQ-F / P-FLOW-09) — both
-//! MUST be proven on the LIVE stack, never mocked. Gated behind the `integration` cargo feature so
-//! the DEFAULT `cargo build --workspace` / `cargo test --workspace` stay DB-free. Runs ONLY against
-//! the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-ci-sandbox --features integration --test integration_runner_lease -- --nocapture
-//!
-//! It proves three things the in-memory `JobLeaseStore` + the engine `SignalStore` models assert:
-//!   1. CLAIM — `FOR UPDATE SKIP LOCKED` claims ONE eligible (region+label) free-lease job; a second
-//!      claimer SKIPS the live-leased row (no double-run).
-//!   2. HEARTBEAT — `UPDATE … SET lease_expires = now()+ttl WHERE job_id=$j AND lease_owner=$w` renews
-//!      the owner's lease; an EXPIRED lease is reclaimable by another worker (the reaper seam, CI-P12).
-//!   3. EXACTLY-ONCE TERMINAL — `job.done` via the ENGINE's `wf_signal` `INSERT … ON CONFLICT
-//!      (tenant_id, run_id, signal_name, idem_key) DO NOTHING`: a doubly-delivered report buffers ONCE
-//!      (double-effect = 0). The runner REUSES the engine signal path — no second signal mechanism.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -36,9 +16,6 @@ async fn admin_pool() -> sqlx::PgPool {
         .expect("connect as admin to dev Postgres (is the stack up?)")
 }
 
-/// A future combinator that catches a panic from the wrapped future without requiring it to be
-/// `Send`/`'static` (unlike `tokio::spawn`) — used only so `with_tables_cleanup` can run its cleanup
-/// even when the test body panics.
 struct CatchUnwind<F> {
     inner: std::pin::Pin<Box<F>>,
 }
@@ -59,14 +36,6 @@ impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
     }
 }
 
-/// Run `body`, then unconditionally drop the per-pid ad-hoc `tables` from `pool` afterward —
-/// success, assertion failure, or panic all still clean up. This file has no ad-hoc SCHEMA (unlike
-/// its sibling integration tests) — its per-pid isolation is two ad-hoc TABLES
-/// (`job_queue_lease_<pid>` / `wf_signal_runner_<pid>`) that were, before this fix, only ever
-/// cleaned up via `DROP TABLE IF EXISTS ...` at the START of the crate's OWN next run — never on
-/// panic. Same root cause as the schema-leak pattern elsewhere, one level down (tables, not a
-/// schema). A synchronous `Drop` impl can't safely do async cleanup, so this uses catch_unwind +
-/// always-cleanup + resume_unwind instead.
 async fn with_tables_cleanup<Fut>(pool: &sqlx::PgPool, tables: &[&str], body: impl FnOnce() -> Fut)
 where
     Fut: std::future::Future<Output = ()>,
@@ -85,10 +54,6 @@ where
     }
 }
 
-/// A minimal `job_queue` lease table — the lease columns (`lease_owner`, `lease_expires`) + the
-/// residency/affinity predicates the runner-side claim needs. The FULL `job_queue` (the fairness /
-/// lane / concurrency columns + the jq_claimable/jq_serialize/jq_idem indexes) is CI-P6; here we
-/// prove ONLY the runner-side `FOR UPDATE SKIP LOCKED` lease handshake against real Postgres.
 fn job_queue_ddl(tbl: &str) -> String {
     format!(
         "CREATE TABLE {tbl} (\
@@ -124,7 +89,6 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         .execute(&admin)
         .await
         .expect("the job_queue lease DDL applies");
-    // the REAL frozen wf_signal DDL (the engine's exactly-once buffer) — per-pid isolation.
     sqlx::query(&WF_SIGNAL_DDL.replacen("wf_signal", &sig, 1))
         .execute(&admin)
         .await
@@ -132,7 +96,6 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
 
     let tables = [jq.as_str(), sig.as_str()];
     with_tables_cleanup(&admin, &tables, || async {
-    // seed one eligible queued job (fr-par, labels {linux}, trusted) for run R-1, idem_token tok-1.
     sqlx::query(&format!(
         "INSERT INTO {jq} (tenant_id, region, run_id, job_id, labels, trust_tier, idem_token) \
          VALUES ('acme','fr-par','R-1','job-1', ARRAY['linux'], 'trusted', 'tok-1')"
@@ -141,10 +104,6 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     .await
     .unwrap();
 
-    // ───────────────────────── 1. CLAIM via FOR UPDATE SKIP LOCKED ───────────────────────────────
-    // worker-1 claims the highest-priority in-region, label-eligible, free-lease job and stamps the
-    // lease in ONE statement (the arch 02 §2.1 claim). A concurrent transaction's SKIP LOCKED means a
-    // second claimer never blocks on, nor double-claims, a row worker-1 holds.
     let mut tx1 = admin.begin().await.unwrap();
     let claimed = sqlx::query(&format!(
         "WITH eligible AS ( \
@@ -174,7 +133,6 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     );
     tx1.commit().await.unwrap();
 
-    // a SECOND claimer finds NO eligible row (the only job's lease is LIVE) — skip-locked safety.
     let none = sqlx::query(&format!(
         "WITH eligible AS ( \
            SELECT job_id FROM {jq} \
@@ -192,8 +150,6 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         "a live-leased job is not double-claimed (skip-locked / no double-run)"
     );
 
-    // ───────────────────────── 2. HEARTBEAT renew (owner only) ───────────────────────────────────
-    // worker-1 renews its OWN lease (UPDATE … WHERE lease_owner = 'worker-1'); the renew applies.
     let renewed = sqlx::query(&format!(
         "UPDATE {jq} SET lease_expires = now() + interval '30 seconds' \
          WHERE job_id = 'job-1' AND lease_owner = 'worker-1'"
@@ -207,7 +163,6 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         "the owner's heartbeat renews the lease"
     );
 
-    // worker-2 CANNOT heartbeat a lease it does not own (0 rows) — only the owner renews.
     let foreign = sqlx::query(&format!(
         "UPDATE {jq} SET lease_expires = now() + interval '30 seconds' \
          WHERE job_id = 'job-1' AND lease_owner = 'worker-2'"
@@ -221,7 +176,6 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         "a non-owner cannot heartbeat the lease"
     );
 
-    // force the lease EXPIRED (set it in the past) → worker-2 reclaims it (the reaper seam, CI-P12).
     sqlx::query(&format!(
         "UPDATE {jq} SET lease_expires = now() - interval '1 second' WHERE job_id = 'job-1'"
     ))
@@ -247,10 +201,6 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         "an expired lease is reclaimable (the reaper / reclaim seam)"
     );
 
-    // ───────────────────────── 3. EXACTLY-ONCE terminal report ───────────────────────────────────
-    // the runner reports terminal by delivering job.done ECHOING the idem_token onto the ENGINE's
-    // wf_signal buffer — INSERT … ON CONFLICT (tenant_id, run_id, signal_name, idem_key) DO NOTHING.
-    // It delivers TWICE (at-least-once); the PK dedups to ONE row (the parked workflow wakes ONCE).
     let deliver = |marker: &str| {
         let tbl = sig.clone();
         let pool = admin.clone();
@@ -279,7 +229,7 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
     let second = deliver("second").await;
     assert!(
         second.is_none(),
-        "the SECOND job.done is a no-op (ON CONFLICT DO NOTHING — wake once)"
+        "the SECOND job.done is a no-op (ON CONFLICT DO NOTHING - wake once)"
     );
 
     let count: i64 = sqlx::query(&format!(
@@ -295,7 +245,6 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         "double-effect = 0: a doubly-delivered job.done buffers EXACTLY ONCE"
     );
 
-    // the buffered payload is the FIRST delivery's (DO NOTHING never overwrote) — references-not-payloads.
     let payload: serde_json::Value = sqlx::query(&format!(
         "SELECT payload FROM {sig} WHERE tenant_id='acme' AND run_id=$1 AND signal_name='job.done' AND idem_key=$2"
     ))
@@ -315,7 +264,7 @@ async fn runner_lease_heartbeat_and_exactly_once_terminal_in_real_postgres() {
         "[2026-06-21] PASS  drill=CI-P3(live-PG)  claim(FOR UPDATE SKIP LOCKED)=worker-1 second-claim=skipped  \
          heartbeat-renew=owner-only(1) foreign=0  expired->reclaim=worker-2  \
          terminal job.done double-deliver->buffer once rows=1 redelivery=no-op (double-effect=0)  \
-         (real Postgres job_queue lease + engine wf_signal ON CONFLICT DO NOTHING — runner reuses the one signal path)"
+         (real Postgres job_queue lease + engine wf_signal ON CONFLICT DO NOTHING - runner reuses the one signal path)"
     );
     })
     .await;

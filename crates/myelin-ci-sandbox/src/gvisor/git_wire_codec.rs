@@ -1,22 +1,12 @@
-//! Git wire-protocol codec (CT-007 slice 5b.2): fail-closed pkt-line reader/encoder and the
-//! two specialized `upload-pack` response parsers (v0 advertise-refs + the single-shot shallow
-//! fetch) the checkout transport relies on. Pure byte-buffer logic with no runtime coupling.
-
 use crate::workspace_intent::{ExpectedGitCommitId, GitObjectFormat};
 use std::io::Write;
 
-/// One raw pkt-line parsed from a git wire byte stream (CT-007 slice 5b.2's fetch/advertisement
-/// decoders).
 #[derive(Debug)]
 enum PktLine<'a> {
     Flush,
     Data(&'a [u8]),
 }
 
-/// Read exactly one pkt-line at `buf[*pos..]`, advancing `*pos` past it. Fail-closed (Sol's round-2
-/// review nailed down these exact bounds): a non-hex length header, a length in the reserved
-/// `0001`-`0003` range, a length exceeding git's own protocol maximum (65,520, i.e. `0xfff0`), or a
-/// header claiming more bytes than remain in `buf`, all refuse rather than guess.
 fn read_pkt_line<'a>(buf: &'a [u8], pos: &mut usize) -> Result<PktLine<'a>, String> {
     let header = buf
         .get(*pos..*pos + 4)
@@ -47,19 +37,12 @@ fn read_pkt_line<'a>(buf: &'a [u8], pos: &mut usize) -> Result<PktLine<'a>, Stri
     Ok(PktLine::Data(payload))
 }
 
-/// Pkt-line-encode one payload (`0009done\n`): a 4-hex-digit length prefix counting itself, then the
-/// payload bytes verbatim.
 pub(super) fn pkt_line_encode(payload: &str) -> Vec<u8> {
     let mut v = format!("{:04x}", payload.len() + 4).into_bytes();
     v.extend_from_slice(payload.as_bytes());
     v
 }
 
-/// The result of parsing a v0 `upload-pack --advertise-refs` response (CT-007 slice 5b.2, Hop A step
-/// 1): whether `expected` is directly advertised as some ref's target, and whether the server offers
-/// `allow-reachable-sha1-in-want` (needed when it is NOT a direct tip — Sol's round-2 review: CI
-/// dispatch commonly targets a commit that is reachable but no longer an exact advertised tip by the
-/// time a queued attempt starts, and this codebase has no per-attempt ref to pin it with today).
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(super) struct ParsedAdvertisement {
@@ -67,13 +50,6 @@ pub(super) struct ParsedAdvertisement {
     pub(super) allows_reachable_want: bool,
 }
 
-/// Parse a v0 `upload-pack --advertise-refs` response. Sol's review hardened this beyond the
-/// original draft: the first ref line's capability section is now MANDATORY (a real repo's
-/// advertisement always has one; its absence is a malformed/spoofed response, not merely a
-/// capability-less repo), every capability THIS TRANSPORT'S fetch request always relies on
-/// (`shallow` — required by the `deepen 1` it always sends; `no-progress`; `ofs-delta`) must
-/// actually be advertised or the whole advertisement is refused, and the response must end EXACTLY
-/// at the terminating flush (trailing bytes refused, never silently ignored).
 #[allow(dead_code)]
 pub(super) fn parse_upload_pack_advertisement(
     response: &[u8],
@@ -166,31 +142,12 @@ pub(super) fn parse_upload_pack_advertisement(
     })
 }
 
-/// What [`parse_checkout_fetch_response`] found about the shallow boundary.
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(super) struct ParsedCheckoutFetch {
-    /// `true` iff the server reported `expected` itself as the shallow boundary (its parents were
-    /// not sent) — the checkout script must then seed `.git/shallow` with it before checkout.
     pub(super) shallow: bool,
 }
 
-/// Parse a v0 stateless-rpc `upload-pack` FETCH response for CT-007's single-shot
-/// `want <expected> ... / deepen 1 / (flush) / done` request, streaming the raw pack straight into
-/// `pack_out` under `pack_cap` bytes. Fail-closed at every step — Sol's round-2 review nailed down
-/// the EXACT accepted grammar for this one specialized request (never the general git-protocol
-/// grammar, which allows far more than this request ever produces):
-///
-/// ```text
-/// [PKT("shallow <expected>")]   -- at most one, only naming `expected`, no `unshallow`
-/// 0000                          -- the shallow-info section's flush -- ALWAYS present (a `deepen`
-///                                  request was sent), even for a root commit with zero lines
-/// PKT("NAK")                    -- exactly one -- no ACK (no `have` lines were ever sent)
-/// PACK...                       -- raw pack bytes, immediately, to EOF -- never scanned for
-/// ```
-///
-/// Anything else (an `ERR` line, a duplicate/foreign/`unshallow` declaration, an ACK, a
-/// missing/misplaced `PACK` signature, a response exceeding `pack_cap`) is refused.
 #[allow(dead_code)]
 pub(super) fn parse_checkout_fetch_response(
     response: &[u8],
@@ -200,7 +157,6 @@ pub(super) fn parse_checkout_fetch_response(
 ) -> Result<ParsedCheckoutFetch, String> {
     let mut pos = 0usize;
     let mut shallow = false;
-    // -- shallow-info: zero or more shallow/unshallow lines, then EXACTLY ONE mandatory flush --
     loop {
         match read_pkt_line(response, &mut pos)? {
             PktLine::Flush => break,
@@ -232,7 +188,6 @@ pub(super) fn parse_checkout_fetch_response(
             }
         }
     }
-    // -- negotiation: exactly one NAK line, no flush after it --
     match read_pkt_line(response, &mut pos)? {
         PktLine::Data(data) => {
             let line = std::str::from_utf8(data)
@@ -249,7 +204,6 @@ pub(super) fn parse_checkout_fetch_response(
         }
         PktLine::Flush => return Err("unexpected flush where NAK was expected".to_string()),
     }
-    // -- pack: everything remaining, starting with the literal 4-byte "PACK" magic --
     let pack = response
         .get(pos..)
         .ok_or_else(|| "response ended before any pack data".to_string())?;
@@ -277,8 +231,6 @@ mod tests {
     use crate::gvisor::checkout_transport_test_support::{
         advertisement, fake_pack, fetch_response, sha1_oid,
     };
-
-    // ---- pkt-line reader ----
 
     #[test]
     fn read_pkt_line_reads_flush() {
@@ -337,8 +289,6 @@ mod tests {
         let mut pos = 0;
         assert!(read_pkt_line(b"zzzzrest", &mut pos).is_err());
     }
-
-    // ---- advertisement parser ----
 
     #[test]
     fn advertisement_parser_finds_a_directly_advertised_oid() {
@@ -441,8 +391,6 @@ mod tests {
         let err = parse_upload_pack_advertisement(&response, &expected).unwrap_err();
         assert!(err.contains("trailing bytes"));
     }
-
-    // ---- fetch-response parser ----
 
     #[test]
     fn fetch_response_parses_the_happy_path_with_no_shallow_line() {
@@ -561,8 +509,8 @@ mod tests {
     fn fetch_response_refuses_a_flush_where_nak_is_expected() {
         let oid = sha1_oid(0x56);
         let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-        let mut response = b"0000".to_vec(); // shallow-info flush
-        response.extend_from_slice(b"0000"); // a second flush instead of NAK
+        let mut response = b"0000".to_vec();
+        response.extend_from_slice(b"0000");
         let mut out = Vec::new();
         let err =
             parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();

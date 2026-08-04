@@ -1,11 +1,3 @@
-//! Durable, tenant-scoped delegation policy versions and per-run snapshots.
-//!
-//! This module is deliberately a storage mechanism, not an authentication or token-minting
-//! surface. The Identity service derives every key supplied here from already-verified principals
-//! and a [`crate::TenantScope`]. Policy changes append versions; a run snapshot binds exactly one
-//! version of each of the four delegation conjuncts. A later policy change therefore makes an
-//! existing snapshot stale instead of silently widening it.
-
 use std::collections::BTreeMap;
 
 use sqlx::Row;
@@ -21,13 +13,9 @@ const TRIGGER_ACTOR: &str = "trigger_actor";
 const ACTIVE: &str = "active";
 const REVOKED: &str = "revoked";
 
-/// Bounded grant count per conjunct. The grant grammar remains owned by Identity; this is the
-/// storage abuse bound and prevents a provisioning mistake from producing unbounded rows/tokens.
 pub const MAX_DELEGATION_POLICY_GRANTS: usize = 512;
-/// Bounded opaque grant length.
 pub const MAX_DELEGATION_POLICY_GRANT_BYTES: usize = 1_024;
 
-/// Append-only versions for all four delegation conjuncts.
 pub const DELEGATION_POLICY_VERSION_MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS delegation_policy_version (
     tenant_id       text NOT NULL,
@@ -52,7 +40,6 @@ CREATE TABLE IF NOT EXISTS delegation_policy_version (
     )
 );"#;
 
-/// Current heads are only cursors into the append-only version ledger.
 pub const DELEGATION_POLICY_HEAD_MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS delegation_policy_head (
     tenant_id        text NOT NULL,
@@ -68,7 +55,6 @@ CREATE TABLE IF NOT EXISTS delegation_policy_head (
             (tenant_id, region, policy_kind, subject_id, trigger_actor_id, version)
 );"#;
 
-/// Immutable-by-API per-run binding to one coherent four-conjunct policy snapshot.
 pub const DELEGATION_RUN_SNAPSHOT_MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS delegation_run_snapshot (
     tenant_id                text NOT NULL,
@@ -120,7 +106,6 @@ CREATE POLICY myelin_tenant_isolation ON delegation_run_snapshot
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
               AND region = current_setting('myelin.region', true));"#;
 
-/// Forward-only migration group. It follows the existing `0060_cell_token_root` group.
 pub fn delegation_policy_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain(
@@ -141,7 +126,6 @@ pub fn delegation_policy_durable_migrations() -> Migrations {
     ])
 }
 
-/// The four grant sets accepted only by the trusted provisioning seam and returned by resolution.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableDelegationPolicyBundle {
     pub agent_policy: Vec<String>,
@@ -150,14 +134,12 @@ pub struct DurableDelegationPolicyBundle {
     pub trigger_actor_held: Vec<String>,
 }
 
-/// Optimistic cursor for one policy head at its natural scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DurableDelegationPolicyHeadCursor {
     pub version: i64,
     pub revision: i64,
 }
 
-/// Versions form the optimistic provisioning cursor and are stamped into each run snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DurableDelegationPolicyVersions {
     pub agent: i64,
@@ -166,7 +148,6 @@ pub struct DurableDelegationPolicyVersions {
     pub trigger_actor: i64,
 }
 
-/// Revisions are monotonic database-issued observations of the four version rows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DurableDelegationPolicyRevisions {
     pub agent: i64,
@@ -175,7 +156,6 @@ pub struct DurableDelegationPolicyRevisions {
     pub trigger_actor: i64,
 }
 
-/// A transactionally coherent policy snapshot suitable for a run-token mint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableDelegationPolicySnapshot {
     pub grants: DurableDelegationPolicyBundle,
@@ -184,7 +164,6 @@ pub struct DurableDelegationPolicySnapshot {
     pub snapshot_cursor: i64,
 }
 
-/// Loud fail-closed outcomes. No variant carries policy data or database credentials.
 #[derive(Debug)]
 pub enum DurableDelegationPolicyError {
     Provider(ProviderError),
@@ -313,8 +292,6 @@ impl PolicyKey {
     }
 }
 
-/// Real PostgreSQL backing. All operations use the provider's tenant transaction, explicit
-/// `(tenant_id, region)` predicates, and the provider's residency-pinned region.
 #[derive(Clone)]
 pub struct DurableDelegationPolicyBacking {
     provider: SubstrateProvider,
@@ -325,12 +302,10 @@ impl DurableDelegationPolicyBacking {
         Self { provider }
     }
 
-    /// The residency region this backing is physically pinned to.
     pub fn region(&self) -> &str {
         &self.provider.config().region
     }
 
-    /// Append a tenant-wide guardrail version.
     pub async fn provision_tenant_policy(
         &self,
         tenant: &str,
@@ -341,7 +316,6 @@ impl DurableDelegationPolicyBacking {
             .await
     }
 
-    /// Append an agent-wide ceiling version.
     pub async fn provision_agent_policy(
         &self,
         tenant: &str,
@@ -353,7 +327,6 @@ impl DurableDelegationPolicyBacking {
             .await
     }
 
-    /// Append a trigger-actor held-authority assertion version.
     pub async fn provision_trigger_actor_policy(
         &self,
         tenant: &str,
@@ -371,7 +344,6 @@ impl DurableDelegationPolicyBacking {
         .await
     }
 
-    /// Append a version for one exact `(agent, trigger_actor)` delegation relationship.
     pub async fn provision_delegation(
         &self,
         tenant: &str,
@@ -436,8 +408,6 @@ impl DurableDelegationPolicyBacking {
         result
     }
 
-    /// Append a revoked delegation version. Other conjuncts remain unchanged, but every existing
-    /// run snapshot becomes stale and every future run is denied by the revoked head.
     pub async fn revoke_delegation(
         &self,
         tenant: &str,
@@ -455,9 +425,6 @@ impl DurableDelegationPolicyBacking {
         .await
     }
 
-    /// Resolve or create the immutable snapshot for a run. The resolution statement locks all four
-    /// current heads in one MVCC snapshot. Existing snapshots must still match every current head;
-    /// policy updates/revocations fail closed and can never grow a run's authority.
     pub async fn resolve_snapshot(
         &self,
         tenant: &str,
@@ -574,8 +541,6 @@ impl DurableDelegationPolicyBacking {
     }
 }
 
-/// Lock policy heads in a deterministic global order. Resolution locks its four differently-scoped
-/// heads; provisioning locks the one head it changes. Hash collisions only over-serialize.
 async fn lock_policy_keys(
     conn: &mut sqlx::PgConnection,
     tenant_id: &str,

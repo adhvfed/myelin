@@ -1,12 +1,3 @@
-//! # e2e ISS-P25 — the stateful Trigger chained-mutation lifecycle (P-392, M4-I6)
-//!
-//! The chained-mutation e2e the prompt's TESTS line requires: arm "remind me when unblocked" → resolve
-//! the last blocker **across a restart** → assert **1 fire** → (a SEPARATE armed promise) advance past
-//! `stale_after` → assert **1 stale nudge** → stale. The armable-condition `QueryAst` evaluates over
-//! `issue_relation` projection state; the bus arm/disarm primitive + the `myelin-flow` `stale_after`
-//! wheel + the one Notif inbox are all CONSUMED (never re-implemented). This drives the FULL Issues
-//! stateful-Trigger surface through one scenario.
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CorrelationId, DataRole, EventEnvelope, EventId, EventType,
     Timestamp, Visibility,
@@ -75,11 +66,8 @@ fn restart(engine: IssueTriggerEngine, inbox: &InboxProjection) -> IssueTriggerE
     restored
 }
 
-/// **The full chained-mutation lifecycle: arm → resolve across a restart (1 fire) + a separate promise
-/// goes stale past `stale_after` (1 stale nudge → stale), all into the ONE inbox.**
 #[test]
 fn stateful_trigger_lifecycle_resolve_and_stale() {
-    // ONE Notif inbox (the C-9 one store) shared across the whole lifecycle.
     let inbox = InboxProjection::new();
 
     let resolve_id = TriggerId("t-unblock/PROJ-1".into());
@@ -87,7 +75,6 @@ fn stateful_trigger_lifecycle_resolve_and_stale() {
 
     let mut engine = IssueTriggerEngine::with_inbox(tenant(), region(), inbox.clone());
 
-    // Arm "remind me when unblocked" over PROJ-1 (will resolve) and PROJ-2 (will go stale).
     engine
         .arm(ArmRequest {
             trigger_id: resolve_id.clone(),
@@ -107,7 +94,6 @@ fn stateful_trigger_lifecycle_resolve_and_stale() {
         })
         .unwrap();
 
-    // PROJ-1 partial resolution (one blocker still open) — no fire.
     assert_eq!(
         engine.on_event(
             &unblock_event("PROJ-1", "p1-rm1", 1),
@@ -117,7 +103,6 @@ fn stateful_trigger_lifecycle_resolve_and_stale() {
         0
     );
 
-    // === RESTART ===
     let mut engine = restart(engine, &inbox);
     assert_eq!(
         engine.arming(&resolve_id).unwrap().state,
@@ -125,7 +110,6 @@ fn stateful_trigger_lifecycle_resolve_and_stale() {
     );
     assert_eq!(engine.arming(&stale_id).unwrap().state, TriggerState::Armed);
 
-    // PROJ-1 last blocker clears after the restart → exactly ONE fire.
     assert_eq!(
         engine.on_event(
             &unblock_event("PROJ-1", "p1-rm2", 0),
@@ -140,7 +124,6 @@ fn stateful_trigger_lifecycle_resolve_and_stale() {
         TriggerState::Resolved
     );
 
-    // PROJ-2 never resolves → advance past stale_after → the wheel fires → exactly ONE stale nudge.
     assert!(engine.on_stale_timer(&stale_id), "1 stale nudge");
     assert_eq!(
         engine.arming(&stale_id).unwrap().state,
@@ -148,7 +131,6 @@ fn stateful_trigger_lifecycle_resolve_and_stale() {
         "the unresolved promise goes stale (no silent forever-armed promise)"
     );
 
-    // The ONE inbox holds exactly TWO rows: one resolve fire + one stale nudge (no second store).
     let rows = inbox.snapshot_for_tenant(&tenant());
     assert_eq!(
         rows.len(),
@@ -156,7 +138,6 @@ fn stateful_trigger_lifecycle_resolve_and_stale() {
         "two inbox rows: one resolve, one stale nudge"
     );
 
-    // The delivery log is the dated artifact: exactly one Resolved + one StaleNudge.
     let kinds: Vec<TriggerInboxKind> = engine.delivered().iter().map(|d| d.kind).collect();
     assert_eq!(
         kinds
@@ -172,7 +153,6 @@ fn stateful_trigger_lifecycle_resolve_and_stale() {
             .count(),
         1
     );
-    // The resolve fire surfaces as Reason::Unblocked (the flagship's calm re-surface band).
     let resolved = engine
         .delivered()
         .iter()
@@ -181,7 +161,6 @@ fn stateful_trigger_lifecycle_resolve_and_stale() {
     assert_eq!(resolved.reason, Reason::Unblocked);
     assert_eq!(resolved.subject, subject("PROJ-1"));
 
-    // === FINAL RESTART: re-deliveries fire nothing (0 duplicate). ===
     let mut engine = restart(engine, &inbox);
     assert_eq!(
         engine.on_event(

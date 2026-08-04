@@ -1,18 +1,3 @@
-//! Server-side durable source for the four delegation conjuncts.
-//!
-//! The resolve path accepts no agent id, tenant id, region, grant, or policy value. Those keys are
-//! derived from an already-authenticated agent [`Principal`], its authenticated trigger actor, and
-//! a verified [`TenantScope`]. The only policy-writing surface is the explicit trusted provisioning
-//! seam; no request transport, environment variable, MCP route, local database credential, or
-//! token-signing key is wired here.
-//!
-//! A policy update makes an existing run snapshot stale, so a later resume/re-mint is denied. This
-//! storage slice does not itself revoke bearer tokens minted before that update; those remain
-//! bounded by their TTL or an explicit S7 token revocation until mint/revocation integration lands.
-//! It also does not yet remove the older public mint methods that accept a caller-supplied
-//! [`DelegationInput`]; production callers must be moved to this source in the token-auth integration
-//! slice before this durable source becomes the only mint authority.
-
 use crate::delegation::{authority_of, effective_policy_of, DelegationAlgebra, DelegationInput};
 use crate::machine_auth::Authority;
 use myelin_identity::{EffectivePolicy, Principal, PrincipalKind, PrincipalStatus, RunId};
@@ -22,7 +7,6 @@ use myelin_storage::{
     DurableDelegationPolicyVersions, TenantScope,
 };
 
-/// Optimistic cursor for a trusted, forward-only provisioning update.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DelegationPolicyVersionCursor {
     head: DurableDelegationPolicyHeadCursor,
@@ -38,7 +22,6 @@ impl DelegationPolicyVersionCursor {
     }
 }
 
-/// Cursor stamped alongside a resolved [`DelegationInput`] before run-token minting.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DelegationRunPolicyCursor {
     pub snapshot: i64,
@@ -46,17 +29,12 @@ pub struct DelegationRunPolicyCursor {
     pub revisions: DurableDelegationPolicyRevisions,
 }
 
-/// The exact four-conjunct snapshot and its durable cursor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResolvedDelegationPolicy {
-    /// Durable binding facts derived by the resolver; the mint rejects any caller arguments that
-    /// do not match them.
     pub(crate) run_id: RunId,
     pub(crate) agent_id: myelin_identity::PrincipalId,
     pub(crate) trigger_actor_id: myelin_identity::PrincipalId,
     pub(crate) input: DelegationInput,
-    /// The three policy sets after the trigger-held re-check and monotone intersection. Consumers
-    /// should mint from this result, never treat an individual raw conjunct as effective authority.
     pub(crate) effective_policy: EffectivePolicy,
     pub(crate) cursor: DelegationRunPolicyCursor,
 }
@@ -86,11 +64,6 @@ impl ResolvedDelegationPolicy {
         self.cursor
     }
 
-    /// Apply an additional authenticated authority ceiling without losing the durable run-policy
-    /// binding. Every raw conjunct is intersected and the effective policy is recomputed by the
-    /// equivalent monotone intersection (`old_effective ∩ ceiling`). The positive snapshot and
-    /// principal/run bindings are deliberately preserved, so callers can hand the result only to
-    /// the snapshot-aware mint path.
     pub fn attenuate(mut self, ceiling: &Authority) -> Self {
         self.input = DelegationInput {
             agent_policy: self.input.agent_policy.attenuate(ceiling),
@@ -103,8 +76,6 @@ impl ResolvedDelegationPolicy {
         self
     }
 
-    /// Build a positively snapshot-bound policy for tests. Production has no constructor from raw
-    /// policy material; it must resolve through [`DelegationPolicySource::resolve_for_run`].
     #[cfg(any(test, feature = "test-support"))]
     pub fn synthetic_for_test(
         run_id: RunId,
@@ -146,7 +117,6 @@ impl ResolvedDelegationPolicy {
     }
 }
 
-/// Fail-closed validation and durable resolution errors.
 #[derive(Debug)]
 pub enum DelegationPolicyError {
     ScopeMismatch,
@@ -196,7 +166,6 @@ impl core::fmt::Display for DelegationPolicyError {
 
 impl std::error::Error for DelegationPolicyError {}
 
-/// Durable server-side policy resolver and its explicit trusted provisioning seam.
 #[derive(Clone)]
 pub struct DelegationPolicySource {
     backing: DurableDelegationPolicyBacking,
@@ -207,7 +176,6 @@ impl DelegationPolicySource {
         Self { backing }
     }
 
-    /// Trusted tenant-control-plane seam for the tenant-wide policy ceiling.
     pub async fn provision_tenant_policy(
         &self,
         scope: &TenantScope,
@@ -227,7 +195,6 @@ impl DelegationPolicySource {
         Ok(DelegationPolicyVersionCursor { head })
     }
 
-    /// Trusted agent-provisioning seam for an agent's global authority ceiling.
     pub async fn provision_agent_policy(
         &self,
         scope: &TenantScope,
@@ -249,9 +216,6 @@ impl DelegationPolicySource {
         Ok(DelegationPolicyVersionCursor { head })
     }
 
-    /// Trusted provisioning seam for the trigger actor's persisted held-authority assertion.
-    /// This slice does not derive that set from credential authority/ReBAC automatically; the
-    /// trusted provisioner owns that fact until the authoritative derivation is wired.
     pub async fn provision_trigger_actor_held(
         &self,
         scope: &TenantScope,
@@ -273,7 +237,6 @@ impl DelegationPolicySource {
         Ok(DelegationPolicyVersionCursor { head })
     }
 
-    /// Trusted control-plane seam for one `(agent, trigger_actor)` delegation grant.
     pub async fn provision_delegation(
         &self,
         scope: &TenantScope,
@@ -297,8 +260,6 @@ impl DelegationPolicySource {
         Ok(DelegationPolicyVersionCursor { head })
     }
 
-    /// Trusted control-plane revocation seam. Revocation appends a tombstone version; it never
-    /// deletes history. Existing snapshots become stale and future resolutions deny explicitly.
     pub async fn revoke_delegation(
         &self,
         scope: &TenantScope,
@@ -320,8 +281,6 @@ impl DelegationPolicySource {
         Ok(DelegationPolicyVersionCursor { head })
     }
 
-    /// Resolve a run snapshot. No policy material or identity key is accepted from the caller: all
-    /// four policy rows are looked up server-side from verified principal bindings.
     pub async fn resolve_for_run(
         &self,
         scope: &TenantScope,

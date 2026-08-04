@@ -5,156 +5,34 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-refs-service is the Refs SUBSYSTEM / SERVICE crate (REF-P3 → P-120 onward), distinct
-# from the `myelin-refs` GLUE crate (the ArtifactRef value type + the #sub codec, REF-P1).
-# Like the other service/subsystem crates (myelin-identity-service, myelin-gdpr-service,
-# myelin-git) it is a LEAF CONSUMER above the shared glue crates: it depends on the frozen
-# contract surfaces (gdpr/PersonalDataHolder, the substrate holder-registry + residency-pin
-# lint, the refs value type, tenancy partition keys, identity Principal) and NOTHING in the
-# production eleven-crate library DAG (modelled by `myelin-substrate::crate_graph`, architecture
-# 00 §2.9) depends back on it. So `substrate_is_root()` / `identity_is_sink()` in crate_graph.rs
-# are preserved — a subsystem crate is the graph's terminal consumer, OUTSIDE the modelled DAG.
-#
-# WHY a separate crate (and NOT a `myelin-gdpr` dep on the GLUE crate): the `myelin-refs` glue
-# crate is a MODELLED node in the eleven-crate library DAG (`Crate::Refs.deps() = [Tenancy,
-# Identity, Events]`) and MUST NOT depend on -gdpr (it would mutate the modelled DAG + the glue
-# crate's stated invariant). The ledger calls for "the myelin-refs SERVICE crate, not the glue
-# crate" (REF-P3 DELIVERABLE; REF-P5 "In the myelin-refs service crate" for the edge migration);
-# this crate is that home. The edge inverse-index schema (REF-P5), the per-tenant DEK pin
-# (REF-P4), the builder/invalidator consumers (REF-P6/P7), and the real erasure body (REF-P15)
-# all land HERE in M2.
-#
-# At REF-P3 (P-120) this crate carries ONLY: the Refs PersonalDataHolder registration (a STUB
-# surface — no edge index exists yet, so locate/export return empty-but-correct, restrict/erase
-# are no-ops; H12 ReferenceGraph in the §3.2 holder catalog) + the residency-pin CONFIRMATION
-# (the future edge table + R2 cache are (tenant, region)-partitioned, cell-local, no cross-tenant
-# query path — asserted structurally, leaning on the REF-P2 residency-pin + tenant-predicate
-# lints). No edge engine, no migration, no real crypto-shred ship here.
 [dependencies]
-# The GDPR contract surface (contract 10.1 PersonalDataHolder + the receipt/scope types). Refs
-# IMPLEMENTS this as holder H12 — a stub surface now, the real erase in REF-P15.
 myelin-gdpr = { path = "../myelin-gdpr" }
-# The KMS hierarchy (contracts 11.3/11.4: per-cell root → per-tenant KEK → per-tenant DEK + the
-# per-subject DEK backstop, crypto-shred). REF-P4 PINS the per-tenant DEK for the (future) edge
-# index + R2 cache into THIS engine — the L0→L1→L2 hierarchy storage froze at P-058. Refs reserves
-# the key CLASS (per-tenant DEK + per-subject backstop) and proves destroy is callable; it does NOT
-# re-implement the engine (no second KMS) — it consumes the one storage-owned `KmsEngine`. Storage
-# depends only on tenancy/identity/events/gdpr (never on refs), so this is acyclic; refs-service
-# stays the graph's terminal leaf consumer.
 myelin-storage = { path = "../myelin-storage" }
-# The substrate holder-registry (StoreKind/HolderRegistration/HolderRegistry — the auto-register
-# mechanism, contract 1.4) + the H1–H18 holder catalog (StoreClassifier/Holder::H12ReferenceGraph
-# + the completeness assertion) + the residency-pin lint linkage. Refs is a LEAF consumer above it.
 myelin-substrate = { path = "../myelin-substrate" }
-# The Refs GLUE crate (the ArtifactRef value type + the #sub codec) — the value type the edge
-# index + R2 cache will key on; consumed here so the holder names its stores against the real type.
 myelin-refs = { path = "../myelin-refs" }
-# The canonical (tenant, region) partition keys the future edge table + R2 cache are pinned to.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# Principal — the verified subject the holder's locate/erase key on (via SubjectRef).
 myelin-identity = { path = "../myelin-identity" }
-# The Bus consumer surface (REF-P6 / P-155): the frozen `EventHandler` template + the
-# `EventEnvelope` (contract 2.1) the refs-edge-builder consumes, the `Consumer` runtime + the
-# `DedupLedger` (contracts 2.4/2.5) that make it idempotent, and the `reindex` seam (contract 2.6)
-# that replays `*.snapshot` events through the SAME `handle` path (steady-state == cold-rebuild).
-# myelin-events sits below the service crates in the DAG (it depends only on tenancy/identity), so
-# refs-service stays the graph's terminal leaf consumer — no new modelled edge.
 myelin-events = { path = "../myelin-events" }
-# serde_json — the references-not-payloads `refs.edge.*` payload the builder reads (source/target/
-# rel/rel_class/zookie). A leaf dev/runtime dep, already in the workspace; no DAG edge added.
 serde_json = { workspace = true }
-# serde derive — the R2 projection cache (REF-P12 / P-161) seals the `Projection` shape (5.6) under
-# the per-tenant DEK; the cache value is the serde-serialized projection, sealed, never plaintext.
-# A leaf dev/runtime dep, already in the workspace; no DAG edge added.
 serde = { workspace = true }
-# The three platform-load-bearing structured inline nodes (`myelin-content::InlineNode` —
-# mention/artifact_ref/embed, contract 13.1, frozen X-2). REF-P8 / P-157: the edge-extraction
-# emit seam reads these structured nodes (NOT a regex over prose) and emits one `refs.edge.created`
-# per node via `OutboxTx::emit`. `myelin-content` depends only on tenancy/events/identity (never on
-# refs-service), so this is acyclic — refs-service stays the graph's terminal leaf consumer.
 myelin-content = { path = "../myelin-content" }
-# The REAL Git producer (REF-P17 / P-258, M3). Refs WIRES to Git's owned `#sub` mints (the
-# `comment-`/`thread-`/`L<a>-L<b>` kinds, contract 5.7) — Refs reuses Git's grammatical mint
-# helpers (`mint_blob_line_range`/`mint_pr_comment`/`decode_path_segment`) + its canonical
-# event/relation/replay tokens rather than re-deriving them (EI-01 §7 coherence — one mint, not a
-# parallel second one). `myelin-git` is a SUBSYSTEM (producer) crate that depends on `myelin-refs`
-# (the GLUE crate) and NOTHING in the production eleven-crate DAG (nor `myelin-refs-service`)
-# depends back on it (its Cargo manifest §2.9 note) — so this is acyclic and refs-service stays the
-# graph's terminal leaf consumer. This is a CONSUMER edge (Refs consumes Git's producer surface),
-# the natural shape of "Refs wires to the real Git producer" (REF-P17 DELIVERABLE).
 myelin-git = { path = "../myelin-git" }
-# The REAL Issues producer (REF-P20 / P-336, M4 — the SECOND real TE-7 mirror). Refs WIRES to
-# Issues' owned `issue.relation.*` typed-lifecycle tokens + its `field-`/`row-` `#sub` kinds
-# (contracts 5.5/5.6/5.7) — Refs reuses Issues' canonical event tokens by NAME (the names anchor,
-# X-5) rather than re-deriving them (EI-01 §7 coherence — one token language). `myelin-issues` is a
-# SUBSYSTEM (producer) crate that depends on `myelin-refs` (the GLUE value-type crate), NOT on
-# `myelin-refs-service`, so this is acyclic and refs-service stays the graph's terminal leaf
-# consumer. This is a CONSUMER edge (Refs consumes Issues' producer surface), the natural shape of
-# "Refs wires to the real Issues producer" (REF-P20 DELIVERABLE).
 myelin-issues = { path = "../myelin-issues" }
-# The REAL Chat producer (REF-P21 / P-337, M4 — the maximal consumer; cross-subsystem traversal
-# complete). Chat is the FINAL producer: its mention/artifact_ref/embed nodes produce reference
-# edges (consuming `resolve` for every unfurl) and it owns the `message-`/`thread-` `#sub` mints
-# (contracts 5.4/5.6/5.7). Refs reuses Chat's canonical `message-`/`thread-` mint codecs
-# (`myelin_chat::subs::mint_message`/`mint_thread`) + its frozen ReBAC fragment names
-# (`channel.read = member + parent_project->read`, `myelin_chat::rebac_fragment`) by NAME (X-5),
-# never a literal. `myelin-chat` is a SUBSYSTEM (producer) crate that depends on `myelin-refs` (the
-# GLUE value-type crate), NOT on `myelin-refs-service`, so this is acyclic and refs-service stays the
-# graph's terminal leaf consumer. This is a CONSUMER edge (Refs consumes Chat's producer surface),
-# the natural shape of "Refs wires to the real Chat producer" (REF-P21 DELIVERABLE).
 myelin-chat = { path = "../myelin-chat" }
-# BLAKE3 + hex — the content-anchored Git line-range fingerprint (REF-P15 / P-164, §3.5: a
-# `#L<a>-L<b>` carries a BLAKE3 fingerprint of the anchored lines so resolution is content-anchored,
-# not positional). The SAME `blake3:<hex>` multihash convention the BlobStore content-address + the
-# GDPR receipt + the audit Merkle leaf use (one convention, not a second one). Leaf dev/runtime deps,
-# already in the workspace; no DAG edge added.
 blake3 = { workspace = true }
 hex = { workspace = true }
 
-# ------------------------------------------------------------------------------------------
-# REAL edge inverse-index schema apply behind the `integration` feature (REF-P5 / P-154). The
-# §3.2 `edge` table migration gets PROVEN against the live dev-stack Postgres (RLS isolation +
-# the three indexes + forward-only) in tests/integration_ref_p5_edge_schema.rs. The OPTIONAL
-# sqlx + tokio deps are pulled ONLY by `--features integration` — the default
-# `cargo build --workspace` / `cargo test --workspace` stay DB-free. These are EXTERNAL crates
-# only; no new myelin edge is added, so refs-service stays the graph's terminal leaf consumer.
-# The test reads DATABASE_URL inline (no myelin-config edge — same posture as identity).
-# ------------------------------------------------------------------------------------------
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
-# REF-P22 / P-453 (M5): the REF-D10 30× surge drill (tests/ref_d10_surge_drill.rs) drives the REAL
-# P-S02 load generator (`myelin_harness::LoadGenerator`) at the surge multiplier to DERIVE the
-# storm-op count (never a hand-typed number). `myelin-harness` does NOT depend on `myelin-refs-service`,
-# so this dev-dep is acyclic; it is a TEST-only dep (the default build stays DB-free + harness-free).
 [dev-dependencies]
 myelin-harness = { path = "../myelin-harness" }
-# MR-009b Wave 3 follow-up (found by the Wave-5 per-crate isolation check, the 5340c47 bug class):
-# this crate's OWN tests (cdc_5_4_edge_builder / cdc_ref_p7_invalidator / ...) construct the events
-# in-memory `DedupLedger::new()` double, which is `#[cfg(any(test, feature = "test-support"))]` as
-# of Wave 3 — the workspace build masked the missing feature via unification; the isolated
-# `cargo clippy -p myelin-refs-service --all-targets` catches it. DEV-only.
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests. DEV-only.
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# MR-009b Wave 5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
-# tests-dir targets (the e2e-wedge/dogfood drills call the now-gated in-process runners). The same
-# posture as the myelin-identity-service self dev-dependency (Wave 2).
 myelin-refs-service = { path = ".", features = ["test-support"] }
 
 [features]
 default = []
-# MR-009b Wave 5 — the `test-support` cargo feature (alias `memory`). Gates this crate's in-process
-# E2E-wedge/dogfood drill runners (`run_e2e_4_dsar_fanout` / `run_refs_e2e_wedge` /
-# `run_refs_over_myelins_own_work`), which construct the in-memory `KmsEngine` test double — so it
-# forwards to `myelin-storage/test-support`. DEV/TEST only.
-# MR-009b W3b.5/.6: also forwards to `myelin-events/test-support` — the gated dogfood/e2e_wedge/
-# reindex_at_scale drill runners construct the now-gated in-memory `OutboxStore::new()` double.
 test-support = ["myelin-storage/test-support", "myelin-events/test-support"]
 memory = ["test-support"]
-# REF-P12 / P-161: the R2 cache integration test (tests/integration_ref_p12_r2_cache.rs) drives the
-# REAL `myelin_storage::ValkeyCache` against the live dev-stack Valkey, so it turns on storage's
-# `integration` feature (which pulls fred + tokio + compiles `ValkeyCache`). The default
-# `cargo build --workspace` / `cargo test --workspace` stay DB-free.
 integration = ["dep:sqlx", "dep:tokio", "myelin-storage/integration"]

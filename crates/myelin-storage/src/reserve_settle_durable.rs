@@ -1,41 +1,3 @@
-//! # Durable PG backing for the reserve/settle cost ledger (MR-009b W6b / P-ST-16, contract 11.7)
-//!
-//! **Owning architecture doc:** `planning/05-refined-shared-systems-architecture/storage.md` §9
-//! (*Storage holds the durable ledger*). This module is the REAL durable backing behind
-//! [`crate::reserve_settle::CostLedger`]: the in-memory `HashMap`/`Vec` core is now the
-//! `test-support`-gated TEST DOUBLE arm, and [`DurableCostLedger`] is the always-compiled production
-//! backend over the `cost_reservation` + `cost_event` tables.
-//!
-//! ## The four invariants preserved on Pg (the mutation floor, proven live)
-//! 1. **Never-interrupt-in-flight** — structural: there is no SQL path that tears down an `InFlight`
-//!    row; [`Self::cancel_unstarted`] only refunds a `Reserved` row. The interrupt counter is `0` by
-//!    construction (there is no column/UPDATE that increments it).
-//! 2. **One-cost-event-per-unit** — [`Self::settle`] inserts exactly one `cost_event` row per
-//!    [`MeteredUnit`] supplied.
-//! 3. **Settle-capped-at-reserved** — the billed total is clamped to the reservation's `reserved`.
-//! 4. **Exact-idempotent double-settle** — a settle on an already-`Settled` row re-reads its ordered
-//!    `cost_event` rows and accepts only byte-equivalent units, inserting NOTHING. Divergent replay
-//!    is refused instead of being mistaken for an acknowledgement-loss retry.
-//!
-//! ## RLS posture — cost rows ARE tenant-owned billing data (FORCE RLS, `with_tenant_tx`)
-//! Unlike the erasure-record ledgers (non-shred-erasable, NO RLS), the cost reservation/event rows are
-//! **tenant-scoped billing data** — a tenant's spend must be structurally unreachable from another
-//! tenant. So both tables carry the SAME FORCE-RLS `(tenant, region)` policy `pg.rs`/`pseudonym_map`
-//! install, and every op runs through the MR-022 [`SubstrateProvider::with_tenant_tx`] convention
-//! (transaction-scoped GUCs, no cross-checkout bleed). Every statement also carries the explicit
-//! `(tenant_id, region)` predicate (defence in depth behind the policy).
-//!
-//! ## Sync API over an async store — the write-through bridge
-//! [`crate::reserve_settle::CostLedger`]'s API is SYNC (its consumers — the agent-run gate, the drills
-//! — are sync). [`DurableCostLedger`] captures the tokio runtime handle at construction and bridges
-//! each op onto it (`block_in_place` + `block_on`, the Wave-5 KMS convention). Each op is ONE
-//! `with_tenant_tx` transaction (read current state → decide → write), so reserve/settle/cancel are
-//! atomic per `(tenant, run)`.
-//!
-//! Amounts are `u64` micro-USD; Postgres `bigint` is `i64`. Values round-trip via a lossless
-//! two's-complement reinterpret (`as i64` / `as u64`) and ALL arithmetic (sum/cap/refund) is done in
-//! Rust on the `u64` side (checked), so the full `u64` range is exact.
-
 use sqlx::Row;
 
 use myelin_tenancy::TenantId;
@@ -48,16 +10,6 @@ use crate::reserve_settle::{
     SettleError, SettleOutcome,
 };
 
-// =================================================================================================
-// Migration 0050 — the tenant-owned (FORCE-RLS) cost_reservation + cost_event tables.
-// =================================================================================================
-
-/// The `cost_reservation` + `cost_event` tables (contract 11.7) + their FORCE-RLS `(tenant, region)`
-/// policies. **Tenant-owned billing data — RLS-tightest** (a tenant's spend is structurally
-/// unreachable cross-tenant). `cost_reservation` is `(tenant, region, run)`-keyed with the reserved
-/// amount + lifecycle state; `cost_event` appends one row per metered unit (`ord` orders them). The
-/// RLS policy is the SAME shape `pg.rs` installs on `rebac_tuple`. Forward-only (`IF NOT EXISTS` /
-/// `DROP POLICY IF EXISTS` before `CREATE POLICY` — idempotent, forward-only-legal).
 pub const COST_LEDGER_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS cost_reservation (
     tenant_id text   NOT NULL,
@@ -94,15 +46,9 @@ CREATE POLICY myelin_tenant_isolation ON cost_event \
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
               AND region = current_setting('myelin.region', true));";
 
-/// The forward-only migration set the durable cost ledger binds to (id `0050`, in the free `0050+`
-/// range). Applied via the MR-022 [`SubstrateProvider::migrate`] at boot; idempotent on re-boot.
 pub fn reserve_settle_durable_migrations() -> Migrations {
     Migrations::of([Migration::plain("0050_cost_ledger", COST_LEDGER_MIGRATION)])
 }
-
-// =================================================================================================
-// State <-> text.
-// =================================================================================================
 
 fn state_token(s: ReservationState) -> &'static str {
     match s {
@@ -125,26 +71,15 @@ fn parse_state(s: &str) -> Result<ReservationState, PgError> {
     }
 }
 
-// =================================================================================================
-// DurableCostLedger — the always-compiled production backend over the cost tables (FORCE RLS).
-// =================================================================================================
-
-/// The REAL durable reserve/settle cost ledger (production default) over the `cost_reservation` +
-/// `cost_event` tables, RLS-scoped through the MR-022 `with_tenant_tx` convention. Cloneable; holds the
-/// tokio runtime handle so the SYNC ledger API bridges onto the async store.
 #[derive(Clone)]
 pub struct DurableCostLedger {
     provider: SubstrateProvider,
     rt: tokio::runtime::Handle,
 }
 
-/// A caller-transaction durable-settle failure. Domain refusals remain typed; storage failures are
-/// deliberately redacted because billing rows and connection details are not safe error payloads.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DurableSettleError {
-    /// The ledger rejected the requested state transition or exact replay.
     Ledger(SettleError),
-    /// PostgreSQL did not complete the settlement statement sequence.
     Store,
 }
 
@@ -160,15 +95,10 @@ impl std::fmt::Display for DurableSettleError {
 impl std::error::Error for DurableSettleError {}
 
 impl DurableCostLedger {
-    /// Build the durable ledger over the MR-022 provider. **Must be called inside a tokio runtime**
-    /// (captures `Handle::current()` for the sync→async bridge).
     pub fn new(provider: SubstrateProvider) -> DurableCostLedger {
         Self::with_runtime(provider, tokio::runtime::Handle::current())
     }
 
-    /// Build the durable ledger with the composition root's explicit runtime handle. Production
-    /// runner hooks use this form because their synchronous callbacks execute on a dedicated OS
-    /// thread outside the Tokio runtime.
     pub fn with_runtime(
         provider: SubstrateProvider,
         rt: tokio::runtime::Handle,
@@ -180,9 +110,6 @@ impl DurableCostLedger {
         self.provider.config().region.clone()
     }
 
-    /// Drive an async op on the runtime handle (the sync→async bridge). A hard DB fault (the store is
-    /// down / unreachable) is FAIL-STATIC LOUD — the cost ledger's typed errors are domain refusals,
-    /// not infra faults, so an infra fault must never be silently coerced into a settle/reserve outcome.
     fn block<T>(&self, fut: impl std::future::Future<Output = Result<T, ProviderError>>) -> T {
         tokio::task::block_in_place(|| self.rt.block_on(fut)).unwrap_or_else(|e| {
             panic!(
@@ -191,9 +118,6 @@ impl DurableCostLedger {
         })
     }
 
-    /// **Reserve-at-dispatch** (invariant 1: no balance → no run). One tenant-scoped tx: reject a
-    /// duplicate `(tenant, run)`; reject an insufficient balance (nothing is written); else INSERT the
-    /// `Reserved` row.
     pub fn reserve(
         &self,
         tenant: TenantId,
@@ -253,8 +177,6 @@ impl DurableCostLedger {
         res
     }
 
-    /// **Mark a reserved run in-flight** (idempotent on `Reserved`/`InFlight`; a settled/cancelled run
-    /// cannot re-enter flight — the monotonic progression).
     pub fn begin(&self, tenant: &TenantId, run: &RunId) -> Result<(), SettleError> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
@@ -264,9 +186,6 @@ impl DurableCostLedger {
         }))
     }
 
-    /// Mark a reserved run in-flight inside a caller-owned tenant-scoped transaction. This is the
-    /// launch-side counterpart to [`Self::settle_in_tx`]: a caller can verify its immutable launch
-    /// authority and advance the exact reservation under the same row-locking transaction.
     pub async fn begin_in_tx(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -279,9 +198,6 @@ impl DurableCostLedger {
             .map_err(DurableSettleError::Ledger)
     }
 
-    /// **Settle-on-completion** (invariants 2/3/4). Exact-idempotent: a settle on an already-`Settled`
-    /// run re-reads its `cost_event` rows and accepts only the same ordered units. Otherwise it records
-    /// one event per unit, caps the billed total at the reservation, and moves the row to `Settled`.
     pub fn settle(
         &self,
         tenant: &TenantId,
@@ -297,9 +213,6 @@ impl DurableCostLedger {
         }))
     }
 
-    /// Settle using a transaction the caller already scoped to this tenant and region. Money truth,
-    /// CI attribution, claim consumption, and workflow signalling can therefore share one commit.
-    /// The reservation row is locked, and a retry must reproduce the exact ordered units.
     pub async fn settle_in_tx(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -313,9 +226,6 @@ impl DurableCostLedger {
             .map_err(DurableSettleError::Ledger)
     }
 
-    /// Cancel an unstarted reservation inside a caller-owned tenant-scoped transaction. A replay of
-    /// the same already-cancelled reservation returns the original refund; in-flight or settled work
-    /// is never interrupted. This lets a workflow co-commit skip accounting with the refund state.
     pub async fn cancel_unstarted_in_tx(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -364,8 +274,6 @@ impl DurableCostLedger {
         }
     }
 
-    /// **Refund an UNSTARTED run** (the ONLY teardown — never touches an `InFlight`/`Settled` row: the
-    /// never-interrupt-in-flight invariant). Refunds the reserved amount.
     pub fn cancel_unstarted(
         &self,
         tenant: &TenantId,
@@ -407,7 +315,6 @@ impl DurableCostLedger {
                         .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
                         Ok(Ok(reserved))
                     }
-                    // NEVER interrupt in-flight (or teardown settled/cancelled) — refuse, untouched.
                     ReservationState::InFlight
                     | ReservationState::Settled
                     | ReservationState::Cancelled => Ok(Err(SettleError::NoSuchReservation)),
@@ -416,7 +323,6 @@ impl DurableCostLedger {
         }))
     }
 
-    /// The current state of a reservation (or `None`).
     pub fn state_of(&self, tenant: &TenantId, run: &RunId) -> Option<ReservationState> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
@@ -438,25 +344,10 @@ impl DurableCostLedger {
         }))
     }
 
-    /// **The in-flight-interrupt counter** — `0` by construction: there is NO SQL path that increments
-    /// it (the never-interrupt-in-flight invariant is structural on the durable arm too).
     pub fn inflight_interrupt_count(&self) -> u64 {
         0
     }
 
-    /// **Σ of `reserved` over this tenant's UNSETTLED reservations** — one tenant-scoped
-    /// `with_tenant_tx` (FORCE-RLS + the explicit `(tenant, region)` predicate, the module's query
-    /// convention): `SELECT COALESCE(SUM(reserved), 0)` over the rows whose `state` is `'reserved'` or
-    /// `'inflight'` (the [`state_token`] encoding — a `'settled'`/`'cancelled'` row is money already
-    /// reconciled and is EXCLUDED). The affordability gate subtracts this from the wallet balance
-    /// (`available = balance − outstanding`).
-    ///
-    /// `SUM(bigint)` is a `numeric` in Postgres; the `::bigint` cast keeps the total in the ledger's
-    /// `u64` domain and raises a LOUD (fail-static) store fault on a bigint overflow — never a silent
-    /// wrap. The `Result` is for parity with the memory arm
-    /// ([`super::reserve_settle::MemoryCostLedger::outstanding_reservations`], which returns the typed
-    /// [`ReserveError::AmountOverflow`]); the durable Σ overflow surfaces as the fail-static fault, not
-    /// this typed arm.
     pub fn outstanding_reservations(&self, tenant: &TenantId) -> Result<MicroUsd, ReserveError> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
@@ -477,8 +368,6 @@ impl DurableCostLedger {
         Ok(MicroUsd(sum as u64))
     }
 
-    /// Every cost event recorded for a `(tenant, run)` (the durable audit) — owned rows (the durable
-    /// arm cannot lend a reference into the DB).
     pub fn cost_events_for(&self, tenant: &TenantId, run: &RunId) -> Vec<CostEvent> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
@@ -627,7 +516,6 @@ async fn settle_on_conn(
     Ok(Ok(outcome))
 }
 
-/// Re-read one already-settled run's ordered durable unit log.
 async fn recorded_events(
     conn: &mut sqlx::PgConnection,
     tenant_s: &str,
@@ -691,9 +579,6 @@ fn rows_to_events(
             Ok(CostEvent {
                 tenant: TenantId(tenant_s.to_string()),
                 run: RunId(run_s.to_string()),
-                // `CostEvent.unit` is an OWNED `String` (MR-009b W6b2), so the rebuilt event simply
-                // carries the durable label — no `Box::leak` (the pre-W6b2 `&'static str` workaround
-                // is gone).
                 unit,
                 wholesale: MicroUsd(
                     r.try_get::<i64, _>("wholesale").map_err(cost_row_decode)? as u64

@@ -1,26 +1,3 @@
-//! Live-Postgres integration test (Stage 1 / infra) — the P-FLOW-13 durable-timer WHEEL proven against
-//! REAL Postgres: the minute-bucket partial index + the `FOR UPDATE SKIP LOCKED` due-scan + the
-//! effectively-once fire.
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free (the binding-policy floor — no DB at build). This runs ONLY
-//! against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-flow --features integration --test integration_flow_timer -- --nocapture
-//!
-//! Endpoints come from the myelin-config dev defaults (the dev<->prod CONFIG SWAP seam), so the same
-//! test runs against Scaleway (fr-par) by exporting the prod env vars — never a code change.
-//!
-//! It proves, against REAL Postgres, the FLOW-D3 wheel properties the in-memory `TimerStore` model
-//! asserts:
-//!   1. the frozen `wf_timer_due` partial index `(bucket, partition) WHERE NOT fired` is USED by the
-//!      due-scan (a far-future timer in a far-future bucket is NEVER read — the SC-11 indexed-not-scanned
-//!      move): the query plan over the index reads only the imminent bucket;
-//!   2. the due-scan `WHERE bucket <= epoch_minute(now) AND NOT fired … FOR UPDATE SKIP LOCKED` claims
-//!      the due timers, not the far-future ones;
-//!   3. firing is effectively-once: `UPDATE … SET fired = true WHERE NOT fired` flips it once; a
-//!      re-fire (the crash-re-fire) updates 0 rows (0 double-fire).
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -43,8 +20,6 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
     let pid = std::process::id();
     let tbl = format!("wf_timer_wheel_{pid}");
 
-    // The REAL frozen DDL (per-pid table name so concurrent runs isolate). The wf_timer DDL + the
-    // SC-11 partial index `(bucket, partition) WHERE NOT fired` (the world-scale move, §3.3).
     let create = WF_TIMER_DDL.replacen("wf_timer", &tbl, 1);
     let idx = WF_TIMER_DUE_IDX
         .replacen("wf_timer_due", &format!("{tbl}_due"), 1)
@@ -62,10 +37,7 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
         .await
         .expect("the wf_timer_due partial index applies");
 
-    // Arm ONE due timer (fire_at now, bucket 0) + 50_000 FAR-FUTURE timers (30 days out — a far-future
-    // bucket). The far-future fleet sits in a far-future bucket; the partial index NEVER reads it until
-    // its minute (the SC-11 indexed-not-scanned move). epoch_minute = extract(epoch from fire_at)::int / 60.
-    let now_bucket: i32 = 0; // model "now" as epoch second 0 → bucket 0 (the due timer's minute).
+    let now_bucket: i32 = 0;
     sqlx::query(&format!(
         "INSERT INTO {tbl} (tenant_id, region, timer_id, run_id, command_id, fire_at, bucket, fired, partition) \
          VALUES ('acme','fr-par','t-due','R-due','sla.run:0', to_timestamp(0), 0, false, 0)"
@@ -73,7 +45,6 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
     .execute(&admin)
     .await
     .expect("the due timer arms");
-    // 50k far-future timers in a single bulk insert (each in a far-future bucket = 43200 = 30 days).
     sqlx::query(&format!(
         "INSERT INTO {tbl} (tenant_id, region, timer_id, run_id, command_id, fire_at, bucket, fired, partition) \
          SELECT 'acme','fr-par','far/'||g, 'R-far-'||g, 'sla.run/far:'||g, \
@@ -84,14 +55,11 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
     .await
     .expect("the 50k far-future fleet arms");
 
-    // ANALYZE so the planner has stats (the partial index choice is plan-dependent).
     sqlx::query(&format!("ANALYZE {tbl}"))
         .execute(&admin)
         .await
         .unwrap();
 
-    // (1) THE BUCKETED DUE-SCAN uses the PARTIAL INDEX — the EXPLAIN over the due-scan reads the
-    //     `_due` index, NOT a sequential scan of the 50k+1 fleet (the SC-11 indexed-not-full-scan).
     let due_scan = format!(
         "SELECT timer_id FROM {tbl} WHERE bucket <= {now_bucket} AND NOT fired AND partition = 0 \
          ORDER BY fire_at FOR UPDATE SKIP LOCKED LIMIT 4096"
@@ -113,7 +81,6 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
         "the due-scan does NOT sequentially scan the 50k+1 fleet (the SC-11 partial-index move): {plan}"
     );
 
-    // (2) THE DUE-SCAN returns ONLY the due timer — the 50k far-future are NOT in the due bucket.
     let due: Vec<String> = sqlx::query(&due_scan)
         .fetch_all(&admin)
         .await
@@ -127,8 +94,6 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
         "the due-scan returned ONLY the due timer (far-future untouched)"
     );
 
-    // (3) EFFECTIVELY-ONCE FIRE: `UPDATE … SET fired = true WHERE NOT fired` flips it ONCE; a re-fire
-    //     (the crash-re-fire) updates 0 rows (0 double-fire).
     let fire = format!(
         "UPDATE {tbl} SET fired = true WHERE tenant_id='acme' AND timer_id='t-due' AND NOT fired"
     );
@@ -145,10 +110,9 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
         .rows_affected();
     assert_eq!(
         second, 0,
-        "the re-fire updates 0 rows (0 double-fire — effectively-once)"
+        "the re-fire updates 0 rows (0 double-fire - effectively-once)"
     );
 
-    // after the fire the due-scan returns NOTHING (the partial index excludes the now-fired timer).
     let after: Vec<String> = sqlx::query(&due_scan)
         .fetch_all(&admin)
         .await
@@ -161,7 +125,6 @@ async fn flow_p13_timer_wheel_bucketed_scan_and_effectively_once_fire_in_real_po
         "the fired timer is excluded by the partial index `WHERE NOT fired`"
     );
 
-    // the far-future fleet is STILL unfired (never touched — cost nothing).
     let far_unfired: i64 = sqlx::query(&format!(
         "SELECT count(*)::bigint AS c FROM {tbl} WHERE bucket = 43200 AND NOT fired"
     ))

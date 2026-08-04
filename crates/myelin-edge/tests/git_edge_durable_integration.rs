@@ -1,15 +1,3 @@
-//! # GT-003 — Git durable front door: real HTTP integration proofs (builder ≠ verifier oracle).
-//!
-//! Binds an ephemeral TCP port, serves the edge with Git's routes registered over the DURABLE on-disk
-//! backend ([`myelin_edge::register_git_durable`]), and drives REAL HTTP round-trips with real minted
-//! capability tokens. Proves:
-//!  - (A) **writes PERSIST** — create-repo + a web-edit commit through the edge are read back from disk;
-//!    a FRESH backend instance over the SAME root (a simulated restart) still serves them.
-//!  - (B) **merge-gate ENFORCED + durable ref-advance** — a merge with unmet required checks is REFUSED
-//!    (no ref advance); with checks green + an approval the merge advances the base ref durably.
-//!  - (C) **tenant isolation + traversal-safety** — an acme repo is invisible to globex; a `../`-laden
-//!    repo slug is refused (the validated resolver), never escaping the tenant root.
-
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
@@ -86,14 +74,10 @@ fn seed_principal(store: &PrincipalStore, tenant: &str, pid: &str, subject_key: 
 }
 
 fn seed_tenant(store: &PrincipalStore, tenant: &str) {
-    // Two principals per tenant: an author (subj-1) and a distinct reviewer (subj-2) — so a NON-author
-    // approval can be genuinely submitted (a self-approval must not count toward the threshold).
     seed_principal(store, tenant, "svc:agent", "subj-1");
     seed_principal(store, tenant, "svc:reviewer", "subj-2");
 }
 
-/// A test authorizer that DENIES one action (proving the gateway re-authorizes per action). All else is
-/// allowed. Used to prove the repo-admin branch-protection op is authorization-gated.
 struct DenyAction(&'static str);
 impl myelin_substrate::Authorizer for DenyAction {
     fn authorize(&self, _principal: &Principal, action: &str) -> bool {
@@ -101,7 +85,6 @@ impl myelin_substrate::Authorizer for DenyAction {
     }
 }
 
-/// Build a gateway with Git registered over a DURABLE backend rooted at `root` + a chosen authorizer.
 fn build_with(
     root: &std::path::Path,
     authorizer: Arc<dyn myelin_substrate::Authorizer>,
@@ -242,8 +225,6 @@ fn hdr<'a>(b: &'a [(&'static str, String); 2]) -> Vec<(&'a str, &'a str)> {
     b.iter().map(|(k, v)| (*k, v.as_str())).collect()
 }
 
-/// (A) Writes PERSIST: create-repo + a web-edit commit are durable, reads reflect them, and a FRESH
-/// backend over the SAME on-disk root (a simulated restart) still serves them.
 #[tokio::test]
 async fn writes_persist_across_a_fresh_backend_restart() {
     let root = temp_root("persist");
@@ -251,7 +232,6 @@ async fn writes_persist_across_a_fresh_backend_restart() {
     let addr = spawn(gw).await;
     let h = bearer(&mint(&cell, "acme", "jti-a1"));
 
-    // create-repo → durable:true.
     let (st, cv) = http(
         addr,
         "POST",
@@ -263,7 +243,6 @@ async fn writes_persist_across_a_fresh_backend_restart() {
     assert_eq!(st, 201, "create-repo: {cv}");
     assert_eq!(cv["durable"], true);
 
-    // a fresh repo lists as Empty (no commits) — the durable read, not a seed.
     let (_, lv) = http(addr, "GET", "/v1/git/repos", &hdr(&h), vec![]).await;
     assert_eq!(
         lv["items"].as_array().unwrap().len(),
@@ -272,7 +251,6 @@ async fn writes_persist_across_a_fresh_backend_restart() {
     );
     assert_eq!(lv["items"][0]["state"], "empty");
 
-    // web-edit commit on main creates README.md durably.
     let (wc, wv) = http(
         addr,
         "POST",
@@ -288,7 +266,6 @@ async fn writes_persist_across_a_fresh_backend_restart() {
     );
     assert_eq!(wv["applied"]["outcome"], "committed");
 
-    // the blob view now reflects the durable write.
     let (bc, bv) = http(
         addr,
         "GET",
@@ -305,11 +282,9 @@ async fn writes_persist_across_a_fresh_backend_restart() {
         "the durable blob carries a real content-address"
     );
 
-    // repo now lists as Populated with the README in the tree.
     let (_, lv2) = http(addr, "GET", "/v1/git/repos", &hdr(&h), vec![]).await;
     assert_eq!(lv2["items"][0]["state"], "populated");
 
-    // A stale base is the honest 409 (GF-6) — no silent overwrite.
     let (sc, _sv) = http(
         addr,
         "POST",
@@ -320,7 +295,6 @@ async fn writes_persist_across_a_fresh_backend_restart() {
     .await;
     assert_eq!(sc, 409, "a stale base is refused");
 
-    // === RESTART: a FRESH backend + gateway over the SAME root. ===
     let (gw2, cell2) = build(&root);
     let addr2 = spawn(gw2).await;
     let h2 = bearer(&mint(&cell2, "acme", "jti-a2"));
@@ -353,18 +327,13 @@ async fn writes_persist_across_a_fresh_backend_restart() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// (B) **Merge bypass CLOSED + gated, durable ref-advance.** Branch-protection policy is REPO-OWNED, not
-/// author-supplied: a PR author cannot weaken the gate by passing loose policy / self-claimed greens at
-/// open (those fields are ignored) or by self-approving. A protected ref defaults CLOSED. The merge
-/// advances the base ref durably ONLY with the repo-required checks genuinely green (CI-reported) + a
-/// genuine NON-author approval; an arbitrary head_oid is refused.
 #[tokio::test]
 async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     let root = temp_root("merge");
     let (gw, cell) = build(&root);
     let addr = spawn(gw).await;
-    let author = bearer(&mint(&cell, "acme", "jti-author")); // subj-1 → svc:agent (the PR author)
-    let reviewer = bearer(&mint_as(&cell, "acme", "subj-2", "jti-rev")); // svc:reviewer (non-author)
+    let author = bearer(&mint(&cell, "acme", "jti-author"));
+    let reviewer = bearer(&mint_as(&cell, "acme", "subj-2", "jti-rev"));
     let ci = bearer_ci(&mint_ci(&cell, "acme", "subj-1"));
 
     http(
@@ -375,7 +344,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
         br#"{"slug":"svc"}"#.to_vec(),
     )
     .await;
-    // The author creates a feature head commit via a web-edit; capture its commit oid.
     let (_, wv) = http(
         addr,
         "POST",
@@ -386,8 +354,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     .await;
     let head_oid = wv["applied"]["new_oid"].as_str().unwrap().to_string();
 
-    // ===== ATTACK (A+B): the author opens a PR to PROTECTED main supplying loose policy + greens in the
-    // body (all IGNORED), then SELF-approves, then tries to merge. Must be BLOCKED. =====
     let attack_body = format!(
         r#"{{"title":"Attack PR","base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}","required_contexts":[],"required_approvals":0,"green_contexts":["ci/build"]}}"#
     );
@@ -400,7 +366,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     )
     .await;
     assert_eq!(oc1, 201);
-    // self-approval by the author.
     http(
         addr,
         "POST",
@@ -431,19 +396,16 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     .await;
     assert_eq!(gb, 404, "no ref advance on the blocked bypass attempt");
 
-    // ===== LEGIT: repo-admin configures protection (repo-owned); CI reports greens; a NON-author
-    // reviewer approves; then the merge is admitted and advances the ref durably. =====
     let (sp, _sv) = http(
         addr,
         "POST",
         "/v1/git/repos/svc/branch-protection",
-        &hdr(&author), // AllowAll here; the AUTHZ gate is proven in the dedicated test below
+        &hdr(&author),
         br#"{"rulesets":[{"ref_pattern":"refs/heads/main","required_contexts":["ci/build"],"required_approvals":1}]}"#.to_vec(),
     )
     .await;
     assert_eq!(sp, 200, "repo-admin sets branch protection");
 
-    // open a fresh PR #2 (the proposal only — no policy/greens accepted).
     let body2 = format!(
         r#"{{"title":"PR two","base_ref":"refs/heads/main","head_ref":"refs/heads/feature","head_oid":"{head_oid}"}}"#
     );
@@ -456,7 +418,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     )
     .await;
 
-    // no greens, no approval → blocked.
     let (m2a, _) = http(
         addr,
         "POST",
@@ -467,7 +428,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     .await;
     assert_eq!(m2a, 409, "repo-required ci/build not green → blocked");
 
-    // CI reports the required check green (the authorized producer path — NOT the author at open).
     let (cr, _crv) = http(
         addr,
         "POST",
@@ -477,7 +437,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     )
     .await;
     assert_eq!(cr, 200);
-    // green but still no NON-author approval → blocked.
     let (m2b, _) = http(
         addr,
         "POST",
@@ -488,7 +447,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     .await;
     assert_eq!(m2b, 409, "green but no non-author approval → blocked");
 
-    // a genuine NON-author approval (the reviewer principal).
     http(
         addr,
         "POST",
@@ -514,7 +472,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
         "base ref advanced to the head"
     );
 
-    // The merged ref is durable across a fresh-backend restart.
     let (gw2, cell2) = build(&root);
     let addr2 = spawn(gw2).await;
     let h2 = bearer(&mint(&cell2, "acme", "jti-m2"));
@@ -529,7 +486,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     assert_eq!(gb3, 200, "the merged ref survived the restart");
     assert_eq!(gv3["contents"], "v1\n");
 
-    // ===== INVALID HEAD: a PR naming a bogus head_oid is refused (no advance to an arbitrary oid). =====
     let bogus = "0".repeat(40);
     let body3 = format!(
         r#"{{"title":"PR three","base_ref":"refs/heads/feat2","head_ref":"refs/heads/x","head_oid":"{bogus}"}}"#
@@ -555,8 +511,6 @@ async fn merge_bypass_is_closed_and_advance_is_gated_and_durable() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// (D) The repo-admin branch-protection op is AUTHORIZATION-gated: a gateway whose authorizer denies
-/// `git.repo.branch_protection.set` rejects the call (403) — a non-admin cannot set/weaken protection.
 #[tokio::test]
 async fn branch_protection_set_is_authorization_gated() {
     let root = temp_root("authz");
@@ -586,14 +540,11 @@ async fn branch_protection_set_is_authorization_gated() {
         sc, 403,
         "a non-admin cannot set/weaken branch protection: {sv}"
     );
-    // A non-denied git action still works (the deny is per-action, not blanket).
     let (lc, _lv) = http(addr, "GET", "/v1/git/repos", &hdr(&h), vec![]).await;
     assert_eq!(lc, 200, "other git actions are unaffected");
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// (C) Tenant isolation + traversal-safety: an acme repo is invisible to globex; a `../`-laden slug is
-/// refused by the validated resolver (never escaping the tenant root).
 #[tokio::test]
 async fn tenant_isolation_and_traversal_safety() {
     let root = temp_root("iso");
@@ -602,7 +553,6 @@ async fn tenant_isolation_and_traversal_safety() {
     let acme = bearer(&mint(&cell, "acme", "jti-acme"));
     let globex = bearer(&mint(&cell, "globex", "jti-globex"));
 
-    // acme creates a repo.
     let (c, _) = http(
         addr,
         "POST",
@@ -613,7 +563,6 @@ async fn tenant_isolation_and_traversal_safety() {
     .await;
     assert_eq!(c, 201);
 
-    // acme sees it; globex sees NOTHING (tenant-partitioned by the verified token).
     let (_, av) = http(addr, "GET", "/v1/git/repos", &hdr(&acme), vec![]).await;
     assert_eq!(av["items"].as_array().unwrap().len(), 1);
     let (_, gv) = http(addr, "GET", "/v1/git/repos", &hdr(&globex), vec![]).await;
@@ -623,7 +572,6 @@ async fn tenant_isolation_and_traversal_safety() {
         "globex cannot see acme's repo: {gv}"
     );
 
-    // globex cannot read acme's repo blob (it does not exist under globex's tenant path).
     let (gb, _) = http(
         addr,
         "GET",
@@ -634,7 +582,6 @@ async fn tenant_isolation_and_traversal_safety() {
     .await;
     assert_eq!(gb, 404);
 
-    // A traversal-laden repo slug is refused by the validated resolver → 400 (never escapes the root).
     let (tc, _tv) = http(
         addr,
         "POST",
@@ -648,10 +595,6 @@ async fn tenant_isolation_and_traversal_safety() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// (D) **GT-004 browse READ endpoints over the durable graph, tenant-scoped.** The repo home, the
-/// commit log (libgit2 revwalk), and the commit diff (libgit2 tree diff) serve the REAL on-disk state
-/// the web-edit commit produced — and a cross-tenant viewer gets a 0-leak 404 (the repo is not found
-/// under its tenant path), never another tenant's bytes.
 #[tokio::test]
 async fn browse_endpoints_serve_the_durable_graph_tenant_scoped() {
     let root = temp_root("browse");
@@ -678,7 +621,6 @@ async fn browse_endpoints_serve_the_durable_graph_tenant_scoped() {
     .await;
     assert_eq!(wc, 200);
 
-    // GET /v1/git/repos/{repo} → the single RepoHome, populated, slug tenant-qualified.
     let (rc, rv) = http(addr, "GET", "/v1/git/repos/browse", &hdr(&h), vec![]).await;
     assert_eq!(rc, 200, "repo home: {rv}");
     assert_eq!(rv["state"], "populated");
@@ -689,7 +631,6 @@ async fn browse_endpoints_serve_the_durable_graph_tenant_scoped() {
         .iter()
         .any(|e| e["path"] == "README.md"));
 
-    // GET /commits/main → the log (one commit, newest-first), PII-free pseudonymous author.
     let (cc, cv) = http(
         addr,
         "GET",
@@ -708,7 +649,6 @@ async fn browse_endpoints_serve_the_durable_graph_tenant_scoped() {
         .unwrap()
         .ends_with("@acme.noreply"));
 
-    // GET /commit/{oid} → the diff (README.md ADDED, with a + line).
     let (dc, dv) = http(
         addr,
         "GET",
@@ -728,7 +668,6 @@ async fn browse_endpoints_serve_the_durable_graph_tenant_scoped() {
         .iter()
         .any(|l| l["origin"] == "+"));
 
-    // A bogus commit oid → a clean 404 (never a panic).
     let (nc, _) = http(
         addr,
         "GET",
@@ -739,7 +678,6 @@ async fn browse_endpoints_serve_the_durable_graph_tenant_scoped() {
     .await;
     assert_eq!(nc, 404);
 
-    // Tenant isolation: globex sees a 0-leak 404 for acme's repo home + log.
     let g = bearer(&mint(&cell, "globex", "jti-br2"));
     let (gc, _) = http(addr, "GET", "/v1/git/repos/browse", &hdr(&g), vec![]).await;
     assert_eq!(gc, 404, "cross-tenant repo home is not found (0-leak)");
@@ -756,10 +694,6 @@ async fn browse_endpoints_serve_the_durable_graph_tenant_scoped() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// **R3.4 repo-browsing completeness — the new read endpoints serve the durable graph.** refs (switcher
-/// source), tree-at-root, the enriched nested blob (binary/size/raw URLs), tree/blob kind-mismatch
-/// redirect hints, the commit-log prev_cursor/range round-trip, and the gateway-proxied raw/download
-/// byte-serving with `Content-Disposition`.
 #[tokio::test]
 async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     let root = temp_root("r34browse");
@@ -776,8 +710,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     )
     .await;
     assert_eq!(st, 201);
-    // Three commits on main via DISTINCT top-level files (each a real commit; avoids the GF-6
-    // stale-base refusal that re-editing one file at base_oid="" would trip) so the log pages.
     for (i, path) in ["a.txt", "b.txt", "c.txt"].iter().enumerate() {
         let (wc, wv) = http(
             addr,
@@ -791,7 +723,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
         assert_eq!(wc, 200, "commit {path}: {wv}");
     }
 
-    // refs → branches includes main (default), no tags.
     let (rc, rv) = http(addr, "GET", "/v1/git/repos/br/refs", &hdr(&h), vec![]).await;
     assert_eq!(rc, 200, "refs: {rv}");
     assert_eq!(rv["default_branch"], "main");
@@ -806,7 +737,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     assert_eq!(rv["page"]["limit"], 100);
     assert!(rv["page"]["next_cursor"].is_null());
 
-    // tree at root → the three files, each with a full `path` + a resolved latest_commit (bounded walk).
     let (tc, tv) = http(addr, "GET", "/v1/git/repos/br/tree/main", &hdr(&h), vec![]).await;
     assert_eq!(tc, 200, "tree: {tv}");
     let entries = tv["entries"].as_array().unwrap();
@@ -820,7 +750,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
         "the bounded walk resolved at least one per-entry latest commit: {tv}"
     );
 
-    // tree/{a file} → the kind-mismatch redirect hint (never a spurious 404).
     let (kc, kv) = http(
         addr,
         "GET",
@@ -832,7 +761,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     assert_eq!(kc, 200, "tree-of-file: {kv}");
     assert_eq!(kv["redirect_to_blob"], true);
 
-    // blob → enriched: not-binary, real size, gateway-proxied raw/download URLs, not truncated.
     let (bc, bv) = http(
         addr,
         "GET",
@@ -849,9 +777,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     assert_eq!(bv["download_url"], "/v1/git/repos/br/download/main/a.txt");
     assert!(bv["contents"].as_str().unwrap().contains("file 0"));
 
-    // blob/{a dir} → the reverse kind-mismatch hint. (Seed a nested dir via a nested-path web edit is
-    // out of scope; the root itself is a dir, so blob at empty path is the reverse case — proven at the
-    // unit level. Here: an absent file is a clean 404.)
     let (nc, _) = http(
         addr,
         "GET",
@@ -862,7 +787,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     .await;
     assert_eq!(nc, 404, "absent blob is a clean 404");
 
-    // commit-log paging: page 1 (limit=1) has a next_cursor and NO prev_cursor; range starts at 1.
     let (p1c, p1) = http(
         addr,
         "GET",
@@ -880,7 +804,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     );
     assert_eq!(p1["page"]["range"]["from"], 1);
     assert_eq!(p1["page"]["range"]["to"], 1);
-    // page 2 (cursor from page 1): prev_cursor is now present (the Newer link) and range advances.
     let cursor = p1["page"]["next_cursor"].as_str().unwrap().to_string();
     let (p2c, p2) = http(
         addr,
@@ -897,7 +820,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     );
     assert_eq!(p2["page"]["range"]["from"], 2);
 
-    // raw = inline disposition; download = attachment disposition (Content-Disposition set server-side).
     let raw = open(
         addr,
         "GET",
@@ -941,8 +863,6 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// PR commit pagination is exercised through the real authenticated gateway/router, including its
-/// object guard. Each continuation is the encoded snapshot cursor returned by the previous page.
 #[tokio::test]
 async fn pr_commit_pages_are_snapshot_pinned_over_the_durable_http_route() {
     let root = temp_root("pr-commit-pages");
@@ -1066,8 +986,6 @@ async fn pr_commit_pages_are_snapshot_pinned_over_the_durable_http_route() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// Stable ref keyset pagination stays bounded above the old 1,000-row browse ceiling. Pins remain
-/// outside filtering/page windows, and typed cursor failures map to the endpoint's scoped statuses.
 #[tokio::test]
 async fn refs_are_stably_paginated_pinned_and_cursor_scoped() {
     let root = temp_root("refs-pagination");
@@ -1246,11 +1164,6 @@ async fn refs_are_stably_paginated_pinned_and_cursor_scoped() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// FRONTEND-CONTRACT: git-read-dev-edge-parity
-///
-/// Provider half of the dev-edge parity gate. The frontend consumer loads the same committed
-/// request/response vectors from `contracts/git-read-dev-edge.golden.json`; only opaque cursor and
-/// object-id bytes are normalized before comparison.
 #[tokio::test]
 async fn git_read_endpoints_match_the_shared_dev_edge_golden_vectors() {
     const GOLDEN: &str = include_str!("../../../contracts/git-read-dev-edge.golden.json");
@@ -1432,10 +1345,6 @@ async fn git_read_endpoints_match_the_shared_dev_edge_golden_vectors() {
         assert_eq!(normalized, vector["expected"], "golden vector {id}: {body}");
     }
 
-    // Capacity is an equally important read contract: the dev Edge must return the production
-    // envelope, and the browser must render that bounded refusal rather than assuming every PR can
-    // be materialized interactively. The dev fixture calls this PR #5; the production fixture uses
-    // its freshly allocated #1 while preserving the request/response semantics.
     let capacity = &golden["capacity_vectors"][0];
     assert_eq!(capacity["id"], "pr-diff-too-large");
     assert_eq!(capacity["endpoint"], "pr-diff");

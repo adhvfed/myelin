@@ -1,26 +1,3 @@
-//! # The CDC quad for the chat HITL approval-card bridge (CHAT-P18 → P-413, M4-C6)
-//!
-//! **Contracts:** `contract-index.md` rows
-//! - `9.1` / `9.4` `DurableExecutor::signal` (idempotent on the per-effect `idem_key`; the durable
-//!   HITL signal) — chat is the **CONSUMER** (the card POSTS the signal); `myelin_flow::FlowExecutor`
-//!   is the **PROVIDER**.
-//! - `4.2` `check(human, approve, run)` (the approve gate) — chat CONSUMES it (the click gate).
-//! - `4.7` `mint_run_token` (the resume token) — chat CONSUMES it (the resume-token mint).
-//!
-//! **Reconciliation:** `00-reconciliation-decisions.md` §OQ-F (the per-effect `idem_key` rule —
-//! `card_id` single, `card_id:<effect_idx>` multi/partial — frozen). **Owning architecture:** chat
-//! `02-internals-and-algorithms.md` §5 (Chat is the SURFACE; steps 2 + 3 of the round-trip).
-//!
-//! ## The seam this quad pins (chat POSTS the decision; the engine DEDUPS + parks)
-//! - **CONSUMER (chat — [`myelin_chat::hitl`])** builds the per-effect signal and posts it through the
-//!   [`SignalPort`]; chat depends on the TRAIT, never the concrete engine (the production DAG stays
-//!   acyclic).
-//! - **PROVIDER (the engine — [`myelin_flow::FlowExecutor::signal`])** buffers the signal idempotently
-//!   on `(tenant, run_id, signal_name, idem_key)` — a double-click re-posting the SAME per-effect key
-//!   is a no-op (`Duplicate`); a partial approval is three independent keys (well-defined).
-//! - **PARITY:** chat's `per_effect_idem_key` and `myelin_flow::per_effect_idem_key` produce the
-//!   BYTE-IDENTICAL key — ONE rule (OQ-F), not two divergent copies.
-
 use myelin_chat::hitl::{
     build_card_signal, per_effect_idem_key as chat_key, post_decision, CardClick, CardDecision,
     CardEffect, CardOutcome, CardSignal, ChatApprovalCard, ClickGate, SignalDelivery, SignalPort,
@@ -51,17 +28,10 @@ fn human(id: &str) -> Principal {
     Principal::stub(PrincipalId(id.into()), PrincipalKind::Human, tenant())
 }
 
-// ───────────────────────── PARITY: ONE per-effect rule (OQ-F) ─────────────────────────
-
-/// **The PARITY leg (OQ-F): chat's `per_effect_idem_key` IS the engine's, byte-for-byte.** There is
-/// ONE frozen rule, not two — if chat's copy ever diverged from the engine's, the per-effect dedup
-/// would break silently. This asserts byte parity across single + multi arities.
 #[test]
 fn cdc_chat_and_engine_per_effect_key_are_byte_identical() {
-    // single-effect: the bare card id (a double-click is one approval).
     assert_eq!(chat_key("card-1", 0, 1), engine_key("card-1", 0, 1));
     assert_eq!(chat_key("card-1", 0, 1), "card-1");
-    // multi-effect: card_id:effect_idx (each effect independently keyed).
     for idx in 0..3 {
         assert_eq!(
             chat_key("card-7", idx, 3),
@@ -72,12 +42,6 @@ fn cdc_chat_and_engine_per_effect_key_are_byte_identical() {
     assert_eq!(chat_key("card-7", 2, 3), "card-7:2");
 }
 
-// ───────────────────────── the real FlowExecutor as a SignalPort (9.1 / 9.4) ─────────────────────
-
-/// **The PROVIDER adapter — chat's [`SignalPort`] over the REAL `myelin_flow::FlowExecutor::signal`.**
-/// This is the production wiring shape: lower a chat [`CardSignal`] onto a `myelin_flow::SignalSpec`
-/// and map the engine's [`SignalOutcome`] back. The engine OWNS the idempotency (`ON CONFLICT DO
-/// NOTHING` on `(tenant, run_id, signal_name, idem_key)`) — chat just posts.
 struct FlowSignalPort {
     ex: FlowExecutor,
 }
@@ -136,8 +100,6 @@ fn effect(refs: &[&str]) -> CardEffect {
     }
 }
 
-// ───────────────────────── an always-allow IdentityService (the 4.2 / 4.7 seam) ─────────────────
-
 struct AllowId;
 impl IdentityService for AllowId {
     fn authenticate(
@@ -154,8 +116,6 @@ impl IdentityService for AllowId {
         at: &IdConsistency,
         _caveat: Option<&CaveatContext>,
     ) -> myelin_identity::Result<Decision> {
-        // the click gate checks `approve` on the run object at Strong consistency (the new-enemy
-        // guard) — the CDC asserts the consumer calls it with the FROZEN shape.
         assert_eq!(permission.0, "approve");
         assert!(object.0.starts_with("run:"));
         assert!(matches!(at.mode, myelin_identity::ConsistencyMode::Strong));
@@ -208,7 +168,6 @@ impl IdentityService for AllowId {
         _delegation_caveats: &DelegationCaveats,
         ttl: &FailStaticBound,
     ) -> myelin_identity::Result<RunToken> {
-        // the resume token TTL is W-bounded (4.11) so a revoked resume token expires inside the SLA.
         assert_eq!(
             ttl.static_max_secs,
             FailStaticBound::DEFAULT_W.static_max_secs
@@ -239,12 +198,6 @@ impl IdentityService for AllowId {
     }
 }
 
-// ───────────────────────── 9.1 / 9.4: the card posts onto the REAL engine, double-click dedups ───
-
-/// **The 9.1/9.4 pair end-to-end: chat's gated card decision POSTS onto the REAL
-/// `FlowExecutor::signal`, and a double-click DEDUPS (one approval).** A single-effect card; a
-/// gated approve buffers ONE signal on the engine; a re-click under the SAME per-effect key is a
-/// `Duplicate` (the engine's `ON CONFLICT DO NOTHING`) → the engine's buffered depth stays 1.
 #[test]
 fn cdc_9_1_9_4_card_decision_posts_onto_the_real_engine_double_click_dedups() {
     let ex = executor();
@@ -262,7 +215,6 @@ fn cdc_9_1_9_4_card_decision_posts_onto_the_real_engine_double_click_dedups() {
         decline_reason: String::new(),
     };
 
-    // first click → the engine BUFFERS the approval (the first decision).
     let o1 = post_decision(&gate, &port, &card, &approve, &human("alice"), Some("zk")).unwrap();
     assert_eq!(o1, CardOutcome::Approved(SignalDelivery::Buffered));
     assert_eq!(
@@ -271,7 +223,6 @@ fn cdc_9_1_9_4_card_decision_posts_onto_the_real_engine_double_click_dedups() {
         "the approve buffered exactly one signal on the real engine"
     );
 
-    // DOUBLE-CLICK: re-post the SAME per-effect key → the engine DEDUPS (Duplicate; one approval).
     let o2 = post_decision(&gate, &port, &card, &approve, &human("alice"), Some("zk")).unwrap();
     assert_eq!(o2, CardOutcome::Approved(SignalDelivery::Duplicate));
     assert_eq!(
@@ -281,10 +232,6 @@ fn cdc_9_1_9_4_card_decision_posts_onto_the_real_engine_double_click_dedups() {
     );
 }
 
-/// **A partial approval (2-of-3) posts THREE independent per-effect keys onto the real engine; the
-/// declined effect carries NO payload (0 mutation, AG-8).** approve 0, decline 1, approve 2 — the
-/// engine buffers three distinct signals keyed `card-7:0` / `card-7:1` / `card-7:2`; the declined
-/// signal carries the `DECLINE_MARKER` (the engine WITHHOLDS it — `EffectApi::apply` never reached).
 #[test]
 fn cdc_9_1_partial_approval_posts_three_independent_keys_decline_withholds() {
     let ex = executor();
@@ -322,13 +269,11 @@ fn cdc_9_1_partial_approval_posts_three_independent_keys_decline_withholds() {
         .unwrap();
     }
 
-    // three independent signals buffered on the real engine (one per per-effect key).
     assert_eq!(
         ex.signals().count_for_run(&tenant(), &run.0),
         3,
         "a partial approval is three independent per-effect signals on the engine"
     );
-    // the declined effect's signal carries the DECLINE_MARKER (the engine withholds it — 0 mutation).
     let declined = ex
         .signals()
         .get(&tenant(), &run.0, "approval:card-7", "card-7:1")
@@ -339,8 +284,6 @@ fn cdc_9_1_partial_approval_posts_three_independent_keys_decline_withholds() {
         "the declined effect carries the DECLINE_MARKER → the engine WITHHOLDS it (AG-8, 0 mutation)"
     );
 }
-
-// ───────────────────────── 4.2: the gate is fail-closed (a denied click posts nothing) ───────────
 
 struct DenyId;
 impl IdentityService for DenyId {
@@ -424,8 +367,6 @@ impl IdentityService for DenyId {
     }
 }
 
-/// **4.2: a denied click posts NO signal onto the engine (fail-closed; the tool stays withheld).** A
-/// `Deny` verdict short-circuits before any post — the engine's buffered depth stays 0.
 #[test]
 fn cdc_4_2_denied_click_posts_no_signal_onto_the_engine() {
     let ex = executor();
@@ -453,15 +394,10 @@ fn cdc_4_2_denied_click_posts_no_signal_onto_the_engine() {
     assert_eq!(
         ex.signals().count_for_run(&tenant(), &run.0),
         0,
-        "a denied click posted NO signal — the gate is the chokepoint (the tool stays withheld)"
+        "a denied click posted NO signal - the gate is the chokepoint (the tool stays withheld)"
     );
 }
 
-// ───────────────────────── 4.7: the resume token is freshly minted (W-bounded) ──────────────────
-
-/// **4.7: chat mints a FRESH resume token (W-bounded TTL) for a days-later approval.** The resume
-/// runs under a fresh attenuated token, not a stale one (the original may be revoked/expired after a
-/// multi-day park). The CDC drives the consumer call against the real `mint_run_token` shape.
 #[test]
 fn cdc_4_7_resume_token_is_freshly_minted_w_bounded() {
     use myelin_chat::hitl::ResumeTokenMinter;
@@ -479,8 +415,6 @@ fn cdc_4_7_resume_token_is_freshly_minted_w_bounded() {
     );
 }
 
-/// The full build_card_signal → engine round-trip for a decline: the signal the chat card builds is
-/// exactly the WITHHELD shape the engine's gated loop reads (empty payload + DECLINE_MARKER, AG-8).
 #[test]
 fn cdc_decline_signal_shape_matches_the_engine_withhold_contract() {
     let card = ChatApprovalCard {
@@ -496,12 +430,10 @@ fn cdc_decline_signal_shape_matches_the_engine_withhold_contract() {
             decline_reason: DECLINE_MARKER.into(),
         },
     );
-    // the engine's `apply_approved_effects` reads exactly this: empty payload + DECLINE_MARKER → AG-8.
     assert!(sig.payload.is_empty());
     assert_eq!(
         sig.payload_key_ref.as_deref(),
         Some(myelin_flow::DECLINE_MARKER)
     );
-    // chat's DECLINE_MARKER IS the engine's (byte parity — one marker, not two).
     assert_eq!(DECLINE_MARKER, myelin_flow::DECLINE_MARKER);
 }

@@ -1,29 +1,3 @@
-//! # MR-009b Wave 6b — the durable in-crate storage ledgers, proven against LIVE Postgres.
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo build/test --workspace` stays
-//! DB-free. Runs ONLY against the docker-compose dev stack (or the make-it-real env):
-//!
-//!   DATABASE_URL=postgres://myelin_app:myelin_app_pw@localhost:5433/myelin \
-//!     AWS_DEFAULT_REGION=fr-par cargo test -p myelin-storage --features integration \
-//!       --test integration_mr009b_w6b_storage_ledgers -- --nocapture
-//!
-//! It proves the W6b deliverables — each MUST hit the live DB (a pass on the in-memory model would
-//! NOT count):
-//!   A. **`DurableCostLedger` (SI-021) — durability + the four invariants on Pg:** a reserve→begin→
-//!      settle cycle survives reconstruction from a FRESH pool (kill-9 equivalent); the idempotent
-//!      exact double-settle records NO further events while divergent units are refused; a
-//!      caller-owned transaction can roll settlement back atomically; settle-capped;
-//!      never-interrupt-in-flight (cancel of an in-flight run refuses; interrupt count 0). The
-//!      `cost_reservation`/`cost_event` tables are FORCE-RLS (tenant-owned billing data) — the app
-//!      role drives them through the MR-022 `with_tenant_tx` convention.
-//!   B. **`DurablePostPitLedger` (P-ST-14) — durability + post-PIT selection on Pg:** an erasure
-//!      recorded through one instance is selected by `erasures_completed_after` on a FRESH instance;
-//!      a pre-PIT erasure is NOT selected.
-//!   C. **`DurableRestoreErasureLedger` + the R1 §7.6 fold-in — restore-inside-window CAUGHT:** an
-//!      erasure recorded with a COMPLETION offset AFTER the restore PIT (inside the backup window) is
-//!      caught/refused by the restore-verify gate reading the DURABLE ledger from a FRESH instance.
-//!
-//! Skips gracefully if the DB is unreachable (like the sibling integration tests).
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -66,8 +40,6 @@ fn uniq() -> String {
     )
 }
 
-/// Apply the three W6b durable migrations (0050 cost + 0051 restore-erasure + 0052 post-pit) as the
-/// admin/owner role. `None` (SKIP) if unreachable.
 async fn migrate_admin() -> Option<SubstrateProvider> {
     let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
         Ok(p) => p,
@@ -91,15 +63,12 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
     Some(admin)
 }
 
-/// A FRESH app-role provider (NOBYPASSRLS, reset-on-release) over a NEW pool — the kill-9-equivalent
-/// reconstruction seam (new connections, nothing carried in-process).
 async fn app_provider() -> SubstrateProvider {
     SubstrateProvider::connect(MyelinConfig::dev(), 6)
         .await
         .expect("connect app role")
 }
 
-/// A reachable archiver (base at 0, tail at `tail`) — the restore-verify gate's PITR source.
 fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     let mut arch = ContinuousArchiver::new();
     arch.archive_segment(WalSegment {
@@ -125,8 +94,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     let region = app.config().region.clone();
     let suffix = uniq();
 
-    // The erasure-record tables (NO RLS) persist across runs (durable!). Clean this region so the
-    // gate's region-wide `records()` read is deterministic for THIS run.
     for tbl in ["restore_erasure_ledger", "post_pit_erasure_ledger"] {
         sqlx::query(&format!("DELETE FROM {tbl} WHERE region = $1"))
             .bind(&region)
@@ -135,9 +102,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
             .expect("clean erasure-record table for this region");
     }
 
-    // =============================================================================================
-    // A — DurableCostLedger: durability + the four invariants on live Pg (FORCE-RLS, with_tenant_tx).
-    // =============================================================================================
     let tenant = TenantId(format!("01J0COST{suffix}"));
     let run = RunId::new(format!("run-{suffix}"));
     let cost1 = DurableCostLedger::new(app.clone());
@@ -171,7 +135,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     assert_eq!(outcome.billed_total, MicroUsd(400));
     assert_eq!(outcome.refunded, MicroUsd(600));
 
-    // Durability: a FRESH ledger over a FRESH pool reads the settled reservation + its events back.
     let cost2 = DurableCostLedger::new(app_provider().await);
     assert_eq!(
         cost2.state_of(&tenant, &run),
@@ -184,8 +147,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         "the durable cost events survived reconstruction"
     );
 
-    // Invariant 4 — idempotent double-settle (the recorded_outcome SQL RE-READ): SAME outcome, NO
-    // further events (never a double-charge), on the fresh instance.
     let again = cost2
         .settle(&tenant, &run, &units)
         .expect("re-settle on Pg");
@@ -205,15 +166,11 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     );
     assert_eq!(cost2.cost_events_for(&tenant, &run).len(), 2);
 
-    // outstanding_reservations (unified-wallet slice 3) — the SUM(reserved) OVER 'reserved'/'inflight'
-    // rows, live on Pg (FORCE-RLS, with_tenant_tx). The affordability gate reads this so
-    // `available = balance − outstanding`. `run` above is already Settled → contributes 0.
     assert_eq!(
         cost2.outstanding_reservations(&tenant),
         Ok(MicroUsd::ZERO),
         "a fully-settled tenant has zero outstanding on Pg"
     );
-    // Reserved counts; a second run marked InFlight adds to the sum.
     let run_out_a = RunId::new(format!("run-out-a-{suffix}"));
     let run_out_b = RunId::new(format!("run-out-b-{suffix}"));
     cost2
@@ -243,7 +200,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         Ok(MicroUsd(800)),
         "Reserved (300) + InFlight (500) = 800 outstanding on Pg"
     );
-    // Settling run_out_a EXCLUDES it (money reconciled) → outstanding drops to run_out_b's 500.
     cost2
         .begin(&tenant, &run_out_a)
         .expect("begin run_out_a before settle");
@@ -255,8 +211,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         Ok(MicroUsd(500)),
         "a Settled row is excluded from outstanding on Pg"
     );
-    // A different tenant's live reservation is NOT summed into this tenant's outstanding (RLS +
-    // the explicit (tenant, region) predicate — no cross-tenant money path).
     let other_tenant = TenantId(format!("01J0COSTX{suffix}"));
     cost2
         .reserve(
@@ -276,8 +230,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         Ok(MicroUsd(7_777))
     );
 
-    // Caller-transaction API: a rollback leaves both the reservation and event log untouched; the
-    // same exact operation can then commit in a later scoped transaction.
     let run_tx = RunId::new(format!("run-tx-{suffix}"));
     cost2
         .reserve(
@@ -341,8 +293,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     );
     assert_eq!(cost2.cost_events_for(&tenant, &run_tx).len(), 1);
 
-    // Caller-transaction cancellation: skipped work refunds only with its companion accounting
-    // transaction, rolls back cleanly, and exactly replays after commit.
     let run_skip = RunId::new(format!("run-skip-{suffix}"));
     cost2
         .reserve(
@@ -400,7 +350,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         Some(ReservationState::Cancelled)
     );
 
-    // Invariant 3 — settle-capped-at-reserved on Pg: an over-run is clamped to the reservation.
     let run_over = RunId::new(format!("run-over-{suffix}"));
     cost2
         .reserve(
@@ -429,7 +378,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     );
     assert_eq!(over.refunded, MicroUsd::ZERO);
 
-    // Invariant 1 — never-interrupt-in-flight on Pg: cancel of an in-flight run REFUSES; count 0.
     let run_live = RunId::new(format!("run-live-{suffix}"));
     cost2
         .reserve(
@@ -456,9 +404,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         "0 interrupts (structural)"
     );
 
-    // =============================================================================================
-    // B — DurablePostPitLedger: durability + the post-PIT `completed_after` selection on live Pg.
-    // =============================================================================================
     let pp_tenant = TenantId(format!("01J0PP{suffix}"));
     let subj_post = SubjectId::new(format!("subj-post-{suffix}"));
     let subj_pre = SubjectId::new(format!("subj-pre-{suffix}"));
@@ -470,7 +415,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         .await
         .expect("record a pre-PIT erasure (offset 60)");
 
-    // A FRESH instance selects exactly the post-PIT erasure (offset > 100), not the pre-PIT one.
     let pp2 = DurablePostPitLedger::new(app_provider().await);
     let after = pp2.erasures_completed_after(100);
     let ids: Vec<String> = after.iter().map(|r| r.subject.0.clone()).collect();
@@ -483,17 +427,10 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         "the pre-PIT erasure is NOT selected: {ids:?}"
     );
 
-    // =============================================================================================
-    // C — DurableRestoreErasureLedger + the R1 §7.6 fold-in: restore-inside-window CAUGHT on Pg.
-    // =============================================================================================
     let windowed = TenantId(format!("01J0WIN{suffix}"));
     let led1 = ErasureLedger::with_pg(DurableRestoreErasureLedger::new(app.clone()));
-    // Completed at offset 140 — AFTER the restore PIT T=100 (inside the backup window). The backup
-    // predates the erasure completion, so it physically holds the pre-erasure key.
     led1.record_erased_at(windowed.clone(), 140);
 
-    // The gate reads the DURABLE ledger from a FRESH instance (durability) and must CATCH the
-    // restore-inside-window resurrection (§7.6) — the bare gate has no re-erasure pass to re-kill it.
     let led2 = ErasureLedger::with_pg(DurableRestoreErasureLedger::new(app_provider().await));
     let kms = KmsEngine::new();
     let arch = reachable_archiver(300);
@@ -524,10 +461,6 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         verdict.failure()
     );
 
-    // =============================================================================================
-    // Cleanup — the erasure-record tables (NO RLS) via admin; the FORCE-RLS cost rows use unique
-    // tenants (no cross-run pollution) so they are left as durable evidence.
-    // =============================================================================================
     for tbl in ["restore_erasure_ledger", "post_pit_erasure_ledger"] {
         let _ = sqlx::query(&format!("DELETE FROM {tbl} WHERE region = $1"))
             .bind(&region)

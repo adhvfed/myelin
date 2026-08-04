@@ -1,20 +1,3 @@
-//! # HERMETIC cap-enforcement drill — the governed tool's `required_caps` are now REALLY enforced.
-//!
-//! A [`ToolDef`]'s `required_caps` (the git read tool's `["pull"]`) were declarative-but-UNENFORCED:
-//! the driving loop `validate_call`d the untrusted arguments (schema) and dispatched to the executor,
-//! but nothing checked that the run's principal was *authorized* to call the tool — only RLS/tenant
-//! scoping gated the underlying read. [`CapEnforcingExecutor`] closes that gap: it consults the REAL
-//! ReBAC decision engine ([`myelin_identity_service::StoreBackedCheck`], the same
-//! [`IdentityService::check`] a human's request flows through) for every declared cap BEFORE the inner
-//! executor runs, and DENIES fail-closed (an `Err` that aborts the run with teardown) when the grant
-//! is absent.
-//!
-//! This proves the enforcement end-to-end over the platform loop, NO network / NO DB:
-//! - **granted** — with a real `repo:core#pull@agent` grant seeded via the real `write_tuples` path,
-//!   the scripted brain's tool call is ALLOWED, the executor runs, and the run completes + tears down;
-//! - **denied** — the SAME run with NO grant is DENIED fail-closed: the run aborts, the inner executor
-//!   is NEVER reached, and the error names the cap-enforcement deny.
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -39,22 +22,16 @@ use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
-// The repo the run reads. The ReBAC engine canonicalises this URN to the `repo:core` tuple key, so
-// the seeded grant on `repo:core` authorizes a check on this exact ref.
 const REPO: &str = "myelin://01J0HOSTCAP/git/repo/core";
 const COMMIT: &str = "capcommit0001";
 const AGENT_ID: &str = "psn:host-agent";
 
-/// The fixed per-turn usage the priced turns report.
 const USAGE: Usage = Usage::Reported {
     input: 1_000,
     cached_input: 500,
     output: 200,
 };
 
-// ───────────────────────── the hermetic doubles (wallet + brain + inner executor) ─────────────────
-
-/// A network-free in-memory [`RunWallet`] double (balance + per-turn debit log, fail-closed).
 struct MemWallet {
     balance: Mutex<u64>,
 }
@@ -89,7 +66,6 @@ impl RunWallet for MemWallet {
     }
 }
 
-/// The scripted brain: call the read tool on the first step; on the tool-result step, answer over it.
 struct ScriptedToolBrain;
 impl ModelClient for ScriptedToolBrain {
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
@@ -116,8 +92,6 @@ impl ModelClient for ScriptedToolBrain {
     }
 }
 
-/// A fake-but-real-shaped READ executor: records that it was reached (the "the tool actually ran"
-/// witness — it MUST stay 0 on a denied cap).
 struct FakeCheckReadExecutor {
     invocations: AtomicUsize,
 }
@@ -156,15 +130,9 @@ fn agent_principal(tenant: &TenantId) -> Principal {
     )
 }
 
-/// Build the REAL ReBAC engine over an in-memory tuple store. When `grant_pull` is set, seed a genuine
-/// `repo:core#pull@<agent>` grant through the real [`TupleStore::write_tuples`] path — under the SAME
-/// `(tenant, region)` scope the engine's `check` derives from the agent's own verified token (the
-/// principal's home region), so the grant and the check agree.
 fn rebac_engine(agent: &Principal, grant_pull: bool) -> StoreBackedCheck {
     let tuples = TupleStore::new(OutboxStore::new());
     if grant_pull {
-        // The engine derives its scope from the SUBJECT's own region (tenant-from-token); seed under
-        // exactly that scope so the check sees the grant.
         let scope = TenantScope::from_verified_token(agent, agent.region.clone());
         let admin = Principal::stub(
             PrincipalId("p-admin".into()),
@@ -215,7 +183,6 @@ fn task(tenant: &TenantId, agent: Principal, run_id: &str) -> LlmRunTask {
     .with_now_secs(1000)
 }
 
-/// **GRANTED: with a real `pull` grant, the cap gate ALLOWS the tool — the run executes + completes.**
 #[test]
 fn tool_call_is_allowed_when_the_principal_holds_the_required_cap() {
     let tenant = TenantId("01J0HOSTCAP".into());
@@ -223,10 +190,8 @@ fn tool_call_is_allowed_when_the_principal_holds_the_required_cap() {
     let agent = agent_principal(&tenant);
 
     let identity: Arc<dyn myelin_identity::IdentityService + Send + Sync> =
-        Arc::new(rebac_engine(&agent, /* grant_pull */ true));
+        Arc::new(rebac_engine(&agent,  true));
     let inner = FakeCheckReadExecutor::new();
-    // The cap-enforcing gate wraps the real read executor: every `required_cap` (git `pull`) is
-    // checked on the real ReBAC engine before the inner executor runs.
     let gated = CapEnforcingExecutor::for_git_read_tool(identity, agent.clone(), &inner);
 
     let wallet = MemWallet::with_balance(1_000_000);
@@ -250,7 +215,6 @@ fn tool_call_is_allowed_when_the_principal_holds_the_required_cap() {
     )
     .expect("a granted principal's tool run completes");
 
-    // The gate ALLOWED the call → the inner executor really ran the read exactly once.
     assert_eq!(
         inner.invocations.load(Ordering::SeqCst),
         1,
@@ -262,14 +226,11 @@ fn tool_call_is_allowed_when_the_principal_holds_the_required_cap() {
         report.answer
     );
     assert!(report.outcome.0.contains("completed"), "the run completed");
-    // It tore down cleanly (balanced ledger, trace, token revoked) — a normal metered run.
     assert!(report.telemetry.ledger_balanced(), "reserved == settled");
     assert_eq!(report.telemetry.tokens_revoked(), 1, "token torn down");
     assert_eq!(report.telemetry.runs_completed(), 1);
 }
 
-/// **DENIED (fail-closed): with NO grant, the cap gate DENIES the tool — the run aborts, teardown
-/// fires, and the inner executor is NEVER reached.** The SAME run as above, only the grant is absent.
 #[test]
 fn tool_call_is_denied_fail_closed_when_the_principal_lacks_the_required_cap() {
     let tenant = TenantId("01J0HOSTCAP".into());
@@ -277,7 +238,7 @@ fn tool_call_is_denied_fail_closed_when_the_principal_lacks_the_required_cap() {
     let agent = agent_principal(&tenant);
 
     let identity: Arc<dyn myelin_identity::IdentityService + Send + Sync> =
-        Arc::new(rebac_engine(&agent, /* grant_pull */ false)); // NO grant.
+        Arc::new(rebac_engine(&agent,  false));
     let inner = FakeCheckReadExecutor::new();
     let gated = CapEnforcingExecutor::for_git_read_tool(identity, agent.clone(), &inner);
 
@@ -302,14 +263,11 @@ fn tool_call_is_denied_fail_closed_when_the_principal_lacks_the_required_cap() {
     )
     .expect_err("a principal without the `pull` grant is DENIED fail-closed");
 
-    // FAIL-CLOSED: the inner executor was NEVER reached — the deny happened before any read.
     assert_eq!(
         inner.invocations.load(Ordering::SeqCst),
         0,
         "the executor is never reached on a denied cap (fail-closed, no execute)"
     );
-    // The abort names the cap-enforcement deny (routed through the same loud teardown path a
-    // `validate_call` rejection takes).
     let msg = err.to_string();
     assert!(
         msg.contains("cap-enforcement DENY") && msg.contains("pull"),

@@ -1,50 +1,3 @@
-//! # `oidc` — REAL OIDC ID-token (JWT) credential verification (MR-010a; census SI-001/004, the
-//! OIDC slice of P-526).
-//!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/identity-and-access.md` §4 (the authentication
-//! surfaces — OIDC; **tenant is taken from the verified credential, never the URL path**, ID-3).
-//!
-//! ## What this module replaces (the #1 CRITICAL census finding)
-//! The production auth graph's floor verifier ([`crate::authenticate::StructuralVerifier`]) parses a
-//! PLAINTEXT `<tenant>|<region>|<subject_key>` envelope — so ANYONE can forge any principal in any
-//! tenant (SI-001/004). [`OidcVerifier`] is the REAL cryptographic replacement for the **OIDC**
-//! scheme: it verifies an OIDC ID token (a JWT) against the IdP's JWKS public key with VETTED
-//! primitives and extracts a trust-rooted [`VerifiedAssertion`] from the VERIFIED claims, or refuses
-//! it LOUDLY. It plugs into the EXISTING [`CredentialVerifier`] seam — the resolution + telemetry
-//! body in [`crate::authenticate`] does not change.
-//!
-//! ## The algorithms (vetted crates only — no hand-rolled signature math)
-//! - **RS256** (RSA PKCS#1 v1.5 / SHA-256) — verified with the `rsa` + `sha2` RustCrypto crates.
-//! - **ES256** (ECDSA P-256 / SHA-256, fixed `r‖s`) — verified with `ring`.
-//! - **EdDSA** (Ed25519) — verified with `ring`.
-//!
-//! ## The alg-confusion defence (CRITICAL — the classic JWT bypass)
-//! The expected algorithm is PINNED FROM THE JWKS KEY (selected by the token's `kid`), **never from
-//! the token header**. We REJECT: `alg: none`; a symmetric alg (`HS*`) presented against an
-//! asymmetric key (the RS256→HS256 attack, where the attacker signs with the RSA *public* key as an
-//! HMAC secret); an unknown/missing `kid`; and any `alg` the selected key does not support.
-//!
-//! ## Claim validation (all from the VERIFIED payload, after the signature checks out)
-//! `iss` (must equal the configured issuer), `aud` (must contain this RP), `exp` (expired → reject,
-//! small clock-skew leeway), `nbf`/`iat` sanity, and `nonce`/`jti` replay defence (a replayed token
-//! is rejected). The `tenant`/`region`/`subject_key` are read ONLY from the verified claims — never
-//! caller-supplied (ID-3, the IDOR floor).
-//!
-//! ## What is INJECTED
-//! The initial JWKS and an optional refresh callback are **injected**. The crypto verifier remains
-//! network-agnostic: production supplies a bounded HTTPS `jwks_uri` fetcher, while tests inject a
-//! deterministic callback. The last good key set is cached, periodically refreshed, and refreshed
-//! early for an unknown `kid` or a signature failure so normal provider key rotation does not need
-//! an edge restart.
-//!
-//! ## Wiring (the dispatch seam — [`SchemeDispatchVerifier`])
-//! [`OidcVerifier`] is wired as the OIDC-scheme verifier via [`SchemeDispatchVerifier`], which routes
-//! a credential to a per-scheme verifier and falls back to an INJECTED default for the not-yet-real
-//! schemes (SAML/SCIM/passkey/SSH → MR-010b/c/d). The dispatcher constructs NO `Structural*` type
-//! itself (the fallback is injected by the caller), so it adds no new mock-crypto construction to the
-//! production graph; removing the `StructuralVerifier` prod default entirely is MR-012.
-
 use crate::authenticate::{scheme, CredentialVerifier, VerifiedAssertion};
 use myelin_identity::{AuthzError, Credential};
 use myelin_tenancy::{Region, TenantId};
@@ -61,10 +14,6 @@ const MAX_OIDC_SCOPE_CLAIM_BYTES: usize = 128;
 const MAX_OIDC_SUBJECT_BYTES: usize = 512;
 const MAX_OIDC_REPLAY_ID_BYTES: usize = 512;
 
-/// Bind an ID token to the browser transaction nonce that initiated its authorization-code flow.
-/// The returned opaque material is accepted only by [`OidcVerifier`]. Direct verifier callers may
-/// still pass a compact JWT for non-browser protocol tests, while the public Edge login route always
-/// uses this bound form.
 pub fn oidc_login_material(id_token: &str, expected_nonce: &str) -> Result<String, AuthzError> {
     if !valid_transaction_nonce(expected_nonce) {
         return Err(AuthzError::BadRequest(
@@ -129,54 +78,32 @@ fn unwrap_login_material(material: &str) -> Result<(Cow<'_, str>, Option<String>
     ))
 }
 
-/// Decode one base64url (no-padding) JWS/JWT segment (RFC 7515 §2). A malformed segment is a loud
-/// structural error (never coerced).
 fn b64url(segment: &str) -> Result<Vec<u8>, AuthzError> {
     base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(segment.as_bytes())
         .map_err(|e| AuthzError::BadRequest(format!("malformed base64url JWT segment: {e}")))
 }
 
-/// A LOUD refusal of a credential that is well-formed but does NOT verify (bad signature, alg
-/// confusion, `alg:none`, expired, wrong `iss`/`aud`, replay, missing trust-rooted claim). It is an
-/// `AuthzError` so an unverifiable token NEVER resolves to a Principal (fail-closed — the assertion
-/// is never fabricated/partial).
 fn refuse(msg: impl Into<String>) -> AuthzError {
     AuthzError::FailClosed(msg.into())
 }
 
-// ================================================================================================
-// JWKS — the injected public-key set (RFC 7517). No network in the crypto path.
-// ================================================================================================
-
-/// The public-key material for one JWKS key — already base64url-decoded and family-pinned. The
-/// family fixes the ONE JWS `alg` the key supports (the alg-confusion pin).
 #[derive(Clone, Debug)]
 pub enum JwkKey {
-    /// RSA (RS256) — modulus `n` and public exponent `e`, big-endian bytes.
     Rsa {
-        /// RSA modulus `n` (big-endian).
         n: Vec<u8>,
-        /// RSA public exponent `e` (big-endian).
         e: Vec<u8>,
     },
-    /// EC P-256 (ES256) — affine coordinates `x`, `y` (32 bytes each).
     EcP256 {
-        /// The `x` coordinate (32 bytes).
         x: Vec<u8>,
-        /// The `y` coordinate (32 bytes).
         y: Vec<u8>,
     },
-    /// Ed25519 (EdDSA) — the 32-byte public key.
     Ed25519 {
-        /// The Ed25519 public key (32 bytes).
         x: Vec<u8>,
     },
 }
 
 impl JwkKey {
-    /// The ONE JWS `alg` this key type supports — the alg-confusion pin (expected from the KEY, never
-    /// taken from the token header).
     pub fn expected_alg(&self) -> &'static str {
         match self {
             JwkKey::Rsa { .. } => "RS256",
@@ -210,8 +137,6 @@ impl JwkKey {
     }
 }
 
-/// **The injected JWKS — the IdP's published public keys, keyed by `kid`.** Provided to the verifier
-/// at construction and atomically replaced by an optional injected refresh callback.
 #[derive(Clone, Debug, Default)]
 pub struct JwkSet {
     by_kid: BTreeMap<String, JwkKey>,
@@ -278,8 +203,6 @@ impl JwksSource {
             return cached.ok_or_else(|| refuse("unknown `kid` (not in the JWKS)"));
         };
 
-        // A stale-but-usable cache never queues behind another network refresh. Unknown keys wait
-        // for the in-flight winner, then re-check the cache before deciding whether to fetch.
         let _refresh_guard = match self.refresh_gate.try_lock() {
             Ok(guard) => guard,
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
@@ -337,41 +260,29 @@ impl JwksSource {
 }
 
 impl JwkSet {
-    /// An empty key set.
     pub fn new() -> JwkSet {
         JwkSet {
             by_kid: BTreeMap::new(),
         }
     }
 
-    /// Add a key under its `kid` (builder form).
     pub fn with_key(mut self, kid: impl Into<String>, key: JwkKey) -> JwkSet {
         self.by_kid.insert(kid.into(), key);
         self
     }
 
-    /// The key published under `kid`, if any (the verifier selects by the token's `kid` — never by a
-    /// header-supplied algorithm).
     pub fn get(&self, kid: &str) -> Option<&JwkKey> {
         self.by_kid.get(kid)
     }
 
-    /// The number of keys held.
     pub fn len(&self) -> usize {
         self.by_kid.len()
     }
 
-    /// Whether the set is empty.
     pub fn is_empty(&self) -> bool {
         self.by_kid.is_empty()
     }
 
-    /// Parse a standard RFC 7517 JWKS JSON document (the shape an IdP's `jwks_uri` returns) into an
-    /// injected key set. Supported families: RSA (RS256), EC P-256 (ES256), OKP/Ed25519 (EdDSA). A
-    /// key with no `kid`, an incompatible `use`/`key_ops`/`alg`, or an unsupported `kty`/`crv`, is
-    /// SKIPPED (a JWKS may legitimately carry encryption keys / other curves we do not verify). A
-    /// weak or malformed supported key and an ambiguous duplicate supported `kid` are loud
-    /// `BadRequest`s.
     pub fn from_jwks_json(doc: &str) -> Result<JwkSet, AuthzError> {
         let v: serde_json::Value = serde_json::from_str(doc)
             .map_err(|e| AuthzError::BadRequest(format!("malformed JWKS JSON: {e}")))?;
@@ -383,7 +294,7 @@ impl JwkSet {
         for k in keys {
             let kid = match k.get("kid").and_then(|x| x.as_str()) {
                 Some(kid) if !kid.is_empty() => kid.to_string(),
-                _ => continue, // a key with no kid cannot be selected by `kid` — skip.
+                _ => continue,
             };
             let kty = k.get("kty").and_then(|x| x.as_str()).unwrap_or("");
             let dec = |field: &str| -> Result<Vec<u8>, AuthzError> {
@@ -401,7 +312,7 @@ impl JwkSet {
                 "EC" => {
                     let crv = k.get("crv").and_then(|x| x.as_str()).unwrap_or("");
                     if crv != "P-256" {
-                        continue; // only ES256 / P-256 is supported here.
+                        continue;
                     }
                     Some(JwkKey::EcP256 {
                         x: dec("x")?,
@@ -411,11 +322,11 @@ impl JwkSet {
                 "OKP" => {
                     let crv = k.get("crv").and_then(|x| x.as_str()).unwrap_or("");
                     if crv != "Ed25519" {
-                        continue; // only Ed25519 EdDSA is supported here.
+                        continue;
                     }
                     Some(JwkKey::Ed25519 { x: dec("x")? })
                 }
-                _ => None, // unsupported key type — skip (do not fabricate a key).
+                _ => None,
             };
             let Some(key) = parsed else { continue };
             if !jwk_allows_verification(k, key.expected_alg())? {
@@ -477,13 +388,6 @@ fn jwk_allows_verification(
     Ok(true)
 }
 
-// ================================================================================================
-// Replay defence — the seen `jti`/`nonce` set.
-// ================================================================================================
-
-/// **The replay defence — an atomic, TTL-bounded set of consumed `jti`/`nonce` values.** Production
-/// uses the shared PG backing so every replica elects one winner; unit tests use the in-memory
-/// backend with identical expiry semantics.
 #[derive(Clone)]
 pub struct ReplayGuard {
     backend: ReplayBackend,
@@ -521,14 +425,12 @@ impl Default for ReplayGuard {
 }
 
 impl ReplayGuard {
-    /// A fresh, empty, TTL-bounded in-memory replay guard for tests and explicit local use.
     pub fn new() -> ReplayGuard {
         ReplayGuard {
             backend: ReplayBackend::Memory(Arc::new(Mutex::new(BTreeMap::new()))),
         }
     }
 
-    /// Build the production replay guard over the cell's shared durable substrate.
     pub fn with_pg(
         backing: myelin_storage::DurableReplayBacking,
         rt: tokio::runtime::Handle,
@@ -549,8 +451,6 @@ impl ReplayGuard {
         expires_at: i64,
         now: i64,
     ) -> Result<bool, AuthzError> {
-        // Fixed-size, domain-separated keys keep opaque replay material out of the database and
-        // prevent an oversized signed claim from exceeding Postgres btree index-entry limits.
         let namespace = replay_digest(b"myelin-auth-replay-namespace-v1", namespace);
         let id = replay_digest(b"myelin-auth-replay-id-v1", id);
         match &self.backend {
@@ -579,34 +479,17 @@ impl PgReplayBacking {
     }
 }
 
-// ================================================================================================
-// Configuration + clock.
-// ================================================================================================
-
-/// The relying-party (RP) configuration the verifier validates a token against — the issuer it
-/// trusts, the audience it IS, the claim names the tenant/region are read from, the clock-skew
-/// leeway, and whether replay-defence material (`jti`/`nonce`) is mandatory.
 #[derive(Clone, Debug)]
 pub struct OidcConfig {
-    /// The exact `iss` the token must carry (the configured IdP issuer).
     pub issuer: String,
-    /// The audience this RP is — the token's `aud` MUST name exactly it. Multi-audience tokens are
-    /// refused until an explicit trusted-additional-audience + `azp` policy is configured.
     pub audience: String,
-    /// The verified-claim name the TENANT is read from (the trust root; default `tenant`).
     pub tenant_claim: String,
-    /// The verified-claim name the REGION is read from (default `region`).
     pub region_claim: String,
-    /// Clock-skew leeway, in seconds, applied to `exp`/`nbf`/`iat` (default 60).
     pub leeway_secs: i64,
-    /// Require replay-defence material (`jti` or `nonce`): a token carrying neither is refused
-    /// (default `true` — a token with no replay identifier cannot be replay-protected).
     pub require_replay_defence: bool,
 }
 
 impl OidcConfig {
-    /// A config for `issuer` / `audience` with the conventional defaults (`tenant`/`region` claims,
-    /// 60s leeway, replay defence required).
     pub fn new(issuer: impl Into<String>, audience: impl Into<String>) -> OidcConfig {
         OidcConfig {
             issuer: issuer.into(),
@@ -618,7 +501,6 @@ impl OidcConfig {
         }
     }
 
-    /// Override the claim names the tenant/region are read from (builder form).
     pub fn with_claims(
         mut self,
         tenant_claim: impl Into<String>,
@@ -630,8 +512,6 @@ impl OidcConfig {
     }
 }
 
-/// The "now" source, in Unix seconds — injected so a test can pin the clock deterministically across
-/// `exp`/`nbf` boundaries (the production default reads the system clock).
 type NowFn = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 fn system_now() -> i64 {
@@ -641,13 +521,6 @@ fn system_now() -> i64 {
         .unwrap_or(0)
 }
 
-// ================================================================================================
-// The verifier.
-// ================================================================================================
-
-/// **The REAL OIDC ID-token (JWT) credential verifier (MR-010a).** Verifies an OIDC ID token against
-/// the injected [`JwkSet`] with vetted primitives and the alg-confusion / `alg:none` defences, then
-/// validates the claims and extracts a trust-rooted [`VerifiedAssertion`] — or refuses it loudly.
 #[derive(Clone)]
 pub struct OidcVerifier {
     config: OidcConfig,
@@ -657,8 +530,6 @@ pub struct OidcVerifier {
 }
 
 impl OidcVerifier {
-    /// Build the verifier over an injected JWKS + RP config, with a fresh replay guard and the system
-    /// clock. (Wire it as the OIDC-scheme verifier via [`SchemeDispatchVerifier::route`].)
     pub fn new(config: OidcConfig, jwks: JwkSet) -> OidcVerifier {
         OidcVerifier {
             config,
@@ -668,20 +539,16 @@ impl OidcVerifier {
         }
     }
 
-    /// Build over an EXPLICIT shared [`ReplayGuard`] (so several verifier handles share one seen-set).
     pub fn with_replay_guard(mut self, replay: ReplayGuard) -> OidcVerifier {
         self.replay = replay;
         self
     }
 
-    /// Build with an injected clock (Unix seconds) — the deterministic-test / drill seam.
     pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> OidcVerifier {
         self.now = Arc::new(now);
         self
     }
 
-    /// Add a bounded refresh source around the initial key set. Cached keys remain usable when a
-    /// refresh fails; an unknown `kid` forces one serialized, rate-limited refresh.
     pub fn with_jwks_refresh(
         mut self,
         refresh: impl Fn() -> Result<JwkSet, AuthzError> + Send + Sync + 'static,
@@ -691,7 +558,6 @@ impl OidcVerifier {
         self
     }
 
-    /// The configured replay guard, which can be cloned into another verifier handle.
     pub fn replay_guard(&self) -> &ReplayGuard {
         &self.replay
     }
@@ -701,16 +567,11 @@ impl OidcVerifier {
     }
 }
 
-/// Read a numeric claim as `i64` (JWT numeric dates are integers, but tolerate a float encoding).
 fn num_claim(claims: &serde_json::Value, key: &str) -> Option<i64> {
     let v = claims.get(key)?;
     v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))
 }
 
-/// Whether the token's `aud` names exactly this RP. OIDC permits an array on the wire, but accepting
-/// arbitrary additional recipients lets a token jointly issued to another client cross a trust
-/// boundary. The conservative default accepts a one-element array for wire compatibility and
-/// refuses every multi-audience token until the deployment has an explicit `azp` policy.
 fn aud_is_exact(claims: &serde_json::Value, want: &str) -> bool {
     match claims.get("aud") {
         Some(serde_json::Value::String(s)) => s == want,
@@ -721,9 +582,6 @@ fn aud_is_exact(claims: &serde_json::Value, want: &str) -> bool {
     }
 }
 
-/// Verify the JWS signature over `msg` with the selected JWKS key, using the vetted crate for the
-/// key's family. Returns `Ok(())` only on a cryptographically valid signature; any failure is a loud
-/// refusal. NO signature math is hand-rolled — each arm calls the vetted crate's `verify`.
 fn verify_signature(key: &JwkKey, msg: &[u8], sig: &[u8]) -> Result<(), AuthzError> {
     key.validate_shape().map_err(refuse)?;
     match key {
@@ -747,7 +605,6 @@ fn verify_signature(key: &JwkKey, msg: &[u8], sig: &[u8]) -> Result<(), AuthzErr
                     "invalid P-256 JWKS coordinates (expected 32 bytes each)",
                 ));
             }
-            // The SEC1 uncompressed point `0x04 ‖ x ‖ y` ring's ECDSA verifier expects.
             let mut point = Vec::with_capacity(65);
             point.push(0x04);
             point.extend_from_slice(x);
@@ -767,8 +624,6 @@ fn verify_signature(key: &JwkKey, msg: &[u8], sig: &[u8]) -> Result<(), AuthzErr
 
 impl CredentialVerifier for OidcVerifier {
     fn verify(&self, credential: &Credential) -> myelin_identity::Result<VerifiedAssertion> {
-        // This verifier owns ONLY the OIDC scheme; another scheme is a wiring error (the dispatcher
-        // routes by scheme). Refuse loudly rather than mis-verify.
         if credential.scheme != scheme::OIDC {
             return Err(AuthzError::BadRequest(format!(
                 "OidcVerifier received a `{}` credential (expected `oidc`)",
@@ -776,7 +631,6 @@ impl CredentialVerifier for OidcVerifier {
             )));
         }
 
-        // (1) Structural shape: a JWS compact serialization is exactly three dot-separated segments.
         let material = credential.material.trim();
         let (token, expected_nonce) = unwrap_login_material(material)?;
         let parts: Vec<&str> = token.split('.').collect();
@@ -788,8 +642,6 @@ impl CredentialVerifier for OidcVerifier {
         }
         let (header_b64, payload_b64, sig_b64) = (parts[0], parts[1], parts[2]);
 
-        // (2) Header — read `alg`/`kid`. The header is UNTRUSTED until the signature checks out; it
-        //     is used ONLY to find the key and to detect alg confusion. The key is selected by `kid`.
         let header: serde_json::Value = serde_json::from_slice(&b64url(header_b64)?)
             .map_err(|e| AuthzError::BadRequest(format!("malformed JWT header JSON: {e}")))?;
         let alg = header
@@ -797,18 +649,11 @@ impl CredentialVerifier for OidcVerifier {
             .and_then(|a| a.as_str())
             .ok_or_else(|| AuthzError::BadRequest("JWT header missing `alg`".into()))?;
 
-        // (2a) ALG-CONFUSION DEFENCE — `alg:none` is rejected outright (the unsigned-token bypass).
         if alg.eq_ignore_ascii_case("none") {
             return Err(refuse(
-                "alg:none rejected — an unsigned OIDC token never authenticates (alg-confusion defence)",
+                "alg:none rejected - an unsigned OIDC token never authenticates (alg-confusion defence)",
             ));
         }
-        // (2b) ALG-CONFUSION DEFENCE — a symmetric (HMAC) alg is rejected: the RS256→HS256 attack
-        //      signs with the RSA *public* key as an HMAC secret. We only ever verify against an
-        //      ASYMMETRIC JWKS key, so any `HS*` alg is a confusion attempt. We compare BYTES (not a
-        //      `&str[..2]` slice — `alg` is attacker-controlled, and a slice that lands mid-UTF-8-char,
-        //      e.g. `"Héx"`, would PANIC: a per-request DoS in the auth hot path). This check is
-        //      defence-in-depth — the key-pinned `alg != expected` test below is the load-bearing one.
         if alg
             .as_bytes()
             .get(..2)
@@ -820,9 +665,6 @@ impl CredentialVerifier for OidcVerifier {
             ));
         }
 
-        // (3) KID selection — the key is chosen by the token's `kid` from the cached JWKS. A
-        //     missing/unknown kid triggers one bounded refresh when configured, then is refused (no
-        //     fallback to a header-chosen alg/key).
         let kid = header
             .get("kid")
             .and_then(|k| k.as_str())
@@ -830,20 +672,14 @@ impl CredentialVerifier for OidcVerifier {
         let now = self.now();
         let mut key = self.jwks.key_for(kid, now, false)?;
 
-        // (3a) ALG-CONFUSION DEFENCE — the expected alg is PINNED FROM THE KEY, not the header. The
-        //      header `alg` must equal what the selected key supports (e.g. an RSA key only verifies
-        //      RS256; a token claiming ES256 against an RSA key is refused).
         let expected = key.expected_alg();
         if alg != expected {
             return Err(refuse(format!(
-                "JWT alg does not match the selected JWKS key (expected `{expected}` — \
+                "JWT alg does not match the selected JWKS key (expected `{expected}` - \
                  alg-confusion / wrong-alg defence)"
             )));
         }
 
-        // (4) SIGNATURE — verify over the EXACT signing input `header_b64.payload_b64` (RFC 7515) with
-        //     the vetted crate for the key family. A tampered payload (sig over different bytes), a
-        //     wrong signing key, or a malformed signature all fail here.
         let signing_input = format!("{header_b64}.{payload_b64}");
         let sig = b64url(sig_b64)?;
         if let Err(initial_error) = verify_signature(&key, signing_input.as_bytes(), &sig) {
@@ -851,24 +687,19 @@ impl CredentialVerifier for OidcVerifier {
                 return Err(initial_error);
             }
             key = self.jwks.key_for(kid, now, true)?;
-            // A provider may (unusually) reuse a `kid` while changing key family. Re-pin the
-            // algorithm after refresh; the untrusted header must never inherit the old key's pin.
             let refreshed_expected = key.expected_alg();
             if alg != refreshed_expected {
                 return Err(refuse(format!(
-                    "JWT alg does not match the refreshed key (expected `{refreshed_expected}` — \
+                    "JWT alg does not match the refreshed key (expected `{refreshed_expected}` - \
                      alg-confusion / wrong-alg defence)"
                 )));
             }
             verify_signature(&key, signing_input.as_bytes(), &sig)?;
         }
 
-        // (5) CLAIMS — only NOW (signature proven) do we trust the payload. Every fact below comes
-        //     from the verified claims; nothing is caller-supplied.
         let claims: serde_json::Value = serde_json::from_slice(&b64url(payload_b64)?)
             .map_err(|e| AuthzError::BadRequest(format!("malformed JWT claims JSON: {e}")))?;
 
-        // (5a) iss — must equal the configured issuer.
         let iss = claims
             .get("iss")
             .and_then(|i| i.as_str())
@@ -877,8 +708,6 @@ impl CredentialVerifier for OidcVerifier {
             return Err(refuse("issuer mismatch"));
         }
 
-        // (5b) aud — must name only this RP. A token shared with another client is rejected unless
-        // a future explicit trusted-audience + authorized-party policy opts into that relationship.
         if !aud_is_exact(&claims, &self.config.audience) {
             return Err(refuse(format!(
                 "audience mismatch: token `aud` must name exactly this RP `{}`",
@@ -886,11 +715,6 @@ impl CredentialVerifier for OidcVerifier {
             )));
         }
 
-        // (5c) exp — required; expired (beyond leeway) → reject. The numeric claims are
-        //      attacker-controlled (`exp`/`nbf`/`iat` can be i64::MAX/MIN), so all leeway arithmetic
-        //      is SATURATING — a plain `exp + leeway` would overflow-panic in debug builds (a
-        //      per-request DoS in the auth hot path). Saturation only ever makes the bound stricter
-        //      (clamps to the i64 extreme), never accepts a token it otherwise would.
         let now = self.now();
         let leeway = self.config.leeway_secs;
         let exp = num_claim(&claims, "exp").ok_or_else(|| refuse("token missing `exp`"))?;
@@ -899,7 +723,6 @@ impl CredentialVerifier for OidcVerifier {
                 "token expired: exp={exp} (+{leeway}s leeway) < now={now}"
             )));
         }
-        // (5d) nbf — if present, must not be in the future (beyond leeway).
         if let Some(nbf) = num_claim(&claims, "nbf") {
             if nbf.saturating_sub(leeway) > now {
                 return Err(refuse(format!(
@@ -907,7 +730,6 @@ impl CredentialVerifier for OidcVerifier {
                 )));
             }
         }
-        // (5e) iat — if present, sanity: not issued (far) in the future.
         if let Some(iat) = num_claim(&claims, "iat") {
             if iat.saturating_sub(leeway) > now {
                 return Err(refuse(format!(
@@ -916,9 +738,6 @@ impl CredentialVerifier for OidcVerifier {
             }
         }
 
-        // (5f) THE TRUST-ROOTED ASSERTION FIELDS — validate every required claim before mutating the
-        // replay store. A signed but incomplete token must not be able to poison a future valid
-        // token's replay identifier.
         let sub = claims
             .get("sub")
             .and_then(|s| s.as_str())
@@ -946,9 +765,6 @@ impl CredentialVerifier for OidcVerifier {
                 ))
             })?;
 
-        // Interactive authorization-code login binds the signed ID-token nonce to the exact
-        // short-lived browser transaction. Check it only after signature/issuer/audience validation,
-        // and before consuming replay state or resolving a principal.
         if let Some(expected_nonce) = expected_nonce.as_deref() {
             let signed_nonce = claims
                 .get("nonce")
@@ -961,9 +777,6 @@ impl CredentialVerifier for OidcVerifier {
             }
         }
 
-        // (5g) REPLAY DEFENCE — atomically consume `jti` (else `nonce`) through a namespace scoped
-        // by issuer, audience, and verified region. The row lives only through the token's accepted
-        // expiry boundary, including configured leeway.
         let replay_id = claims
             .get("jti")
             .and_then(|j| j.as_str())
@@ -994,7 +807,7 @@ impl CredentialVerifier for OidcVerifier {
             None => {
                 if self.config.require_replay_defence {
                     return Err(refuse(
-                        "token carries neither a non-empty `jti` nor `nonce` — no replay-defence material",
+                        "token carries neither a non-empty `jti` nor `nonce` - no replay-defence material",
                     ));
                 }
             }
@@ -1010,24 +823,12 @@ impl CredentialVerifier for OidcVerifier {
     }
 }
 
-// ================================================================================================
-// The per-scheme dispatch seam (wiring OidcVerifier as the OIDC verifier; fallback INJECTED).
-// ================================================================================================
-
-/// **Routes a credential to a per-scheme [`CredentialVerifier`], with an INJECTED fallback.** This is
-/// how [`OidcVerifier`] is wired as the OIDC-scheme verifier while the not-yet-real schemes
-/// (SAML/SCIM/passkey/SSH — MR-010b/c/d) ride the injected fallback. The dispatcher constructs NO
-/// verifier itself (both the per-scheme verifiers and the fallback are injected), so it adds no
-/// `Structural*` mock-crypto construction to the production graph; the full `StructuralVerifier`
-/// prod-default removal is MR-012.
 pub struct SchemeDispatchVerifier {
     by_scheme: BTreeMap<String, Arc<dyn CredentialVerifier>>,
     fallback: Arc<dyn CredentialVerifier>,
 }
 
 impl SchemeDispatchVerifier {
-    /// A dispatcher whose unmatched schemes route to `fallback` (the caller injects it — e.g. the
-    /// floor verifier for the not-yet-real schemes).
     pub fn new(fallback: Arc<dyn CredentialVerifier>) -> SchemeDispatchVerifier {
         SchemeDispatchVerifier {
             by_scheme: BTreeMap::new(),
@@ -1035,7 +836,6 @@ impl SchemeDispatchVerifier {
         }
     }
 
-    /// Route `scheme` to `verifier` (builder form) — e.g. `.route(scheme::OIDC, oidc)`.
     pub fn route(
         mut self,
         scheme: impl Into<String>,
@@ -1060,12 +860,6 @@ mod tests {
     use super::*;
     use crate::authenticate::StructuralVerifier;
 
-    // ── Test token-minting helpers (REAL keys + REAL signatures) ─────────────────────────────────
-    //
-    // These mint genuinely-signed tokens so the positive corpus is a real crypto round-trip and the
-    // negative corpus is real forgery. The keys are generated here; the verifier only ever sees the
-    // PUBLIC half (via the injected JWKS).
-
     fn b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
@@ -1082,11 +876,8 @@ mod tests {
         format!("{}.{}", signing_input(header, claims), b64(sig))
     }
 
-    /// A fixed "now" (well within validity for the standard claims below).
     const NOW: i64 = 1_700_000_000;
 
-    /// Standard valid claims for tenant `acme` / region `eu-west` / subject `oidc-sub-1`, with a
-    /// unique `jti` so the replay guard does not collide across tests.
     fn claims(jti: &str) -> serde_json::Value {
         serde_json::json!({
             "iss": "https://idp.example.com",
@@ -1116,14 +907,12 @@ mod tests {
         }
     }
 
-    // ── RSA (RS256) key + signer ─────────────────────────────────────────────────────────────────
     struct RsaKey {
         priv_key: rsa::RsaPrivateKey,
     }
     impl RsaKey {
         fn generate() -> RsaKey {
             use rand::rngs::OsRng;
-            // 2048-bit — the OIDC floor. Generated once per test that needs it.
             let priv_key = rsa::RsaPrivateKey::new(&mut OsRng, 2048).expect("rsa keygen");
             RsaKey { priv_key }
         }
@@ -1144,7 +933,6 @@ mod tests {
         }
     }
 
-    // ── EC P-256 (ES256) key + signer (ring) ─────────────────────────────────────────────────────
     struct EcKey {
         pair: ring::signature::EcdsaKeyPair,
         rng: ring::rand::SystemRandom,
@@ -1163,7 +951,6 @@ mod tests {
         }
         fn jwk(&self) -> JwkKey {
             use ring::signature::KeyPair;
-            // The public key is the SEC1 uncompressed point `0x04 ‖ x ‖ y` (65 bytes).
             let pt = self.pair.public_key().as_ref();
             assert_eq!(pt.len(), 65, "uncompressed P-256 point");
             JwkKey::EcP256 {
@@ -1180,7 +967,6 @@ mod tests {
         }
     }
 
-    // ── Ed25519 (EdDSA) key + signer (ring) ──────────────────────────────────────────────────────
     struct EdKey {
         pair: ring::signature::Ed25519KeyPair,
     }
@@ -1203,11 +989,6 @@ mod tests {
             self.pair.sign(msg).as_ref().to_vec()
         }
     }
-
-    // ════════════════════════════════════════════════════════════════════════════════════════════
-    // POSITIVE corpus — a correctly-signed RS256, ES256, and EdDSA token each VERIFY and yield the
-    // right tenant/region/subject from the verified claims.
-    // ════════════════════════════════════════════════════════════════════════════════════════════
 
     #[test]
     fn positive_rs256_verifies_and_yields_trust_rooted_assertion() {
@@ -1297,8 +1078,6 @@ mod tests {
         assert_eq!(a.subject_key, "oidc-sub-1");
     }
 
-    /// JWKS round-trips through the standard RFC 7517 JSON shape (the `jwks_uri` body), and a token
-    /// verifies against the parsed key set.
     #[test]
     fn positive_rs256_via_parsed_jwks_json() {
         let key = RsaKey::generate();
@@ -1391,18 +1170,12 @@ mod tests {
         }
     }
 
-    // ════════════════════════════════════════════════════════════════════════════════════════════
-    // NEGATIVE corpus — each forged/invalid token MUST be refused (the whole point of the prompt).
-    // ════════════════════════════════════════════════════════════════════════════════════════════
-
-    /// (a) `alg:none` — an unsigned token never authenticates (the unsigned-token bypass).
     #[test]
     fn negative_alg_none_is_rejected() {
         let key = RsaKey::generate();
         let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
         let header = serde_json::json!({"alg": "none", "kid": "rsa-1"});
         let cl = claims("jti-none");
-        // No signature (or any bytes) — alg:none must be refused regardless.
         let token = jwt(&header, &cl, b"");
         let err = verifier(jwks).verify(&cred(token)).unwrap_err();
         assert!(
@@ -1411,13 +1184,10 @@ mod tests {
         );
     }
 
-    /// (b) ALG CONFUSION — an RS256 key, but the token claims HS256 and is "signed" with the RSA
-    /// public key as an HMAC secret (the classic RS256→HS256 bypass). MUST be rejected.
     #[test]
     fn negative_alg_confusion_rs256_key_as_hs256_is_rejected() {
         let key = RsaKey::generate();
         let pub_jwk = key.jwk();
-        // The attacker's HMAC secret = the RSA public key bytes (n‖e) — the public material.
         let hmac_secret = match &pub_jwk {
             JwkKey::Rsa { n, e } => {
                 let mut s = n.clone();
@@ -1430,7 +1200,6 @@ mod tests {
         let header = serde_json::json!({"alg": "HS256", "kid": "rsa-1"});
         let cl = claims("jti-confusion");
         let si = signing_input(&header, &cl);
-        // A real HMAC-SHA256 over the signing input with the public key as the secret.
         let mac = hmac_sha256(&hmac_secret, si.as_bytes());
         let token = format!("{si}.{}", b64(&mac));
         let err = verifier(jwks).verify(&cred(token)).unwrap_err();
@@ -1440,13 +1209,10 @@ mod tests {
         );
     }
 
-    /// (c) WRONG KEY — a structurally valid RS256 token signed by an UNKNOWN key (not in the JWKS for
-    /// that kid). The signature must fail to verify against the published key.
     #[test]
     fn negative_wrong_signing_key_is_rejected() {
         let real = RsaKey::generate();
         let attacker = RsaKey::generate();
-        // The JWKS publishes the REAL key under kid `rsa-1`; the attacker signs with THEIR key.
         let jwks = JwkSet::new().with_key("rsa-1", real.jwk());
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
         let cl = claims("jti-wrongkey");
@@ -1460,7 +1226,6 @@ mod tests {
         );
     }
 
-    /// (c') UNKNOWN KID — the token names a `kid` not in the JWKS. No fallback; refuse.
     #[test]
     fn negative_unknown_kid_is_rejected() {
         let key = RsaKey::generate();
@@ -1573,14 +1338,13 @@ mod tests {
         assert_eq!(refreshes.load(Ordering::SeqCst), 1);
     }
 
-    /// (d) EXPIRED — `exp` in the past beyond leeway. Reject.
     #[test]
     fn negative_expired_token_is_rejected() {
         let key = RsaKey::generate();
         let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
         let mut cl = claims("jti-expired");
-        cl["exp"] = serde_json::json!(NOW - 1000); // well beyond the 60s leeway
+        cl["exp"] = serde_json::json!(NOW - 1000);
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
         let err = verifier(jwks)
             .verify(&cred(jwt(&header, &cl, &sig)))
@@ -1591,7 +1355,6 @@ mod tests {
         );
     }
 
-    /// (e) REPLAY — the SAME token presented twice. First verifies; the second (same `jti`) refused.
     #[test]
     fn negative_replayed_jti_is_rejected() {
         let key = RsaKey::generate();
@@ -1632,7 +1395,6 @@ mod tests {
             .unwrap());
     }
 
-    /// (f) WRONG AUD — the token's audience is some other RP. Reject.
     #[test]
     fn negative_wrong_audience_is_rejected() {
         let key = RsaKey::generate();
@@ -1681,7 +1443,6 @@ mod tests {
             .expect("a one-element audience array names exactly this RP");
     }
 
-    /// (g) WRONG ISS — the token's issuer is not the configured IdP. Reject.
     #[test]
     fn negative_wrong_issuer_is_rejected() {
         let key = RsaKey::generate();
@@ -1699,9 +1460,6 @@ mod tests {
         );
     }
 
-    /// (h) TAMPERED PAYLOAD — a valid signature over the ORIGINAL claims, then the payload segment is
-    /// swapped for different bytes (tenant `acme`→`globex`). The sig no longer matches → reject. This
-    /// is the load-bearing IDOR/forgery case: you cannot edit the tenant after signing.
     #[test]
     fn negative_tampered_payload_is_rejected() {
         let key = RsaKey::generate();
@@ -1709,7 +1467,6 @@ mod tests {
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
         let cl = claims("jti-tamper");
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
-        // Forge: keep the header + signature, but substitute a payload claiming tenant `globex`.
         let mut forged = cl.clone();
         forged["tenant"] = serde_json::json!("globex");
         let header_b64 = b64(serde_json::to_string(&header).unwrap().as_bytes());
@@ -1722,7 +1479,6 @@ mod tests {
         );
     }
 
-    /// (i) MALFORMED / GARBAGE — not a JWT, bad base64, wrong segment count. Loud structural refusal.
     #[test]
     fn negative_malformed_garbage_is_rejected() {
         let key = RsaKey::generate();
@@ -1734,7 +1490,7 @@ mod tests {
             "only.two",
             "a.b.c.d",
             "!!!.@@@.###",
-            "header.payload", // 2 segments
+            "header.payload",
         ] {
             let err = v.verify(&cred(bad.to_string())).unwrap_err();
             assert!(
@@ -1744,23 +1500,14 @@ mod tests {
         }
     }
 
-    /// (j) PANIC-SAFETY — a NON-ASCII / odd-byte `alg` header must be REFUSED, never PANIC. `alg` is
-    /// attacker-controlled; a `&str[..2]` byte-slice that lands mid-UTF-8-char (e.g. `"Héx"`, where
-    /// byte 2 is inside the 2-byte `é`) would panic "byte index 2 is not a char boundary" — a
-    /// per-request DoS in the auth hot path. The fix compares bytes via `get(..2)`. The verify call
-    /// returning at all (no panic) + an `Err` is the proof.
     #[test]
     fn negative_odd_alg_header_bytes_are_refused_not_panicking() {
         let key = RsaKey::generate();
         let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
         let v = verifier(jwks);
-        // Various attacker `alg` shapes that previously risked a byte-slice panic: a multibyte char
-        // straddling index 2, a 1-byte alg, an empty alg, a lowercase `hs`, and emoji.
         for bad_alg in ["Héx", "H", "", "hs256", "H€", "🔥256", "Hé"] {
             let header = serde_json::json!({"alg": bad_alg, "kid": "rsa-1"});
             let cl = claims("jti-odd-alg");
-            // Sign over the (odd-header) signing input so the path is realistic; verification must
-            // refuse on alg grounds (or sig), and crucially must not panic on the header parse.
             let sig = key.sign(signing_input(&header, &cl).as_bytes());
             let r = v.verify(&cred(jwt(&header, &cl, &sig)));
             assert!(
@@ -1770,17 +1517,12 @@ mod tests {
         }
     }
 
-    /// (k) PANIC-SAFETY — attacker-controlled EXTREME numeric claims (`exp`/`nbf`/`iat` at i64::MAX /
-    /// i64::MIN) must not overflow-panic the leeway arithmetic (a debug-build per-request DoS). They
-    /// are handled with saturating arithmetic; the verify call returns a verdict, never panics. The
-    /// tokens are properly SIGNED so the path actually reaches the (5c/5d/5e) numeric checks.
     #[test]
     fn extreme_numeric_claims_do_not_panic() {
         let key = RsaKey::generate();
         let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
         let v = verifier(jwks);
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
-        // Each case mutates one numeric claim to an i64 extreme; all must return (no panic).
         let cases = [
             ("exp", i64::MAX),
             ("exp", i64::MIN),
@@ -1793,23 +1535,15 @@ mod tests {
             let mut cl = claims(&format!("jti-extreme-{i}"));
             cl[*field] = serde_json::json!(val);
             let sig = key.sign(signing_input(&header, &cl).as_bytes());
-            // We only assert it RETURNS (no panic). Some extremes verify (e.g. exp=MAX is "not
-            // expired"), some refuse (nbf=MAX is "not yet valid") — both are acceptable; a panic is
-            // not. `verify` is total over attacker bytes.
             let _ = v.verify(&cred(jwt(&header, &cl, &sig)));
         }
     }
 
-    /// THE IDOR/TRUST-ROOT PROPERTY — the tenant comes from the VERIFIED claims. A token verified for
-    /// `acme` yields `acme`; the only way to assert a different tenant is to re-sign (which the
-    /// attacker cannot, lacking the IdP private key — proven by (c)/(h)). And a verified token that
-    /// carries NO tenant claim is refused (we never fabricate a tenant).
     #[test]
     fn tenant_comes_only_from_verified_claims() {
         let key = RsaKey::generate();
         let jwks = JwkSet::new().with_key("rsa-1", key.jwk());
         let header = serde_json::json!({"alg": "RS256", "kid": "rsa-1"});
-        // No `tenant` claim → refuse (never a fabricated/empty tenant).
         let mut cl = claims("jti-notenant");
         cl.as_object_mut().unwrap().remove("tenant");
         let sig = key.sign(signing_input(&header, &cl).as_bytes());
@@ -1871,11 +1605,6 @@ mod tests {
             .expect("claim validation must happen before replay consumption");
     }
 
-    // ── The dispatch seam ────────────────────────────────────────────────────────────────────────
-
-    /// The dispatcher routes the OIDC scheme to the REAL [`OidcVerifier`] and everything else to the
-    /// injected fallback. (Construction of the floor `StructuralVerifier` here is `#[cfg(test)]`, so
-    /// the production-graph scanner admits it.)
     #[test]
     fn dispatch_routes_oidc_to_real_verifier_and_others_to_fallback() {
         let key = RsaKey::generate();
@@ -1884,8 +1613,6 @@ mod tests {
         let dispatch = SchemeDispatchVerifier::new(Arc::new(StructuralVerifier::new()))
             .route(scheme::OIDC, oidc);
 
-        // An OIDC credential goes through the real crypto verifier — a forged (alg:none) one is
-        // refused by it, NOT silently accepted by the floor.
         let header = serde_json::json!({"alg": "none", "kid": "rsa-1"});
         let cl = claims("jti-dispatch-none");
         let forged = jwt(&header, &cl, b"");
@@ -1894,8 +1621,6 @@ mod tests {
             "an OIDC alg:none token must hit the real verifier and be refused"
         );
 
-        // A SAML credential (not-yet-real) rides the injected floor fallback — the floor parses its
-        // structural envelope (proving routing reached the fallback, unchanged from before).
         let saml = Credential {
             scheme: scheme::SAML.into(),
             material: "acme|eu-west|nameid-1".into(),
@@ -1907,15 +1632,6 @@ mod tests {
         assert_eq!(a.scheme, scheme::SAML);
     }
 
-    // ════════════════════════════════════════════════════════════════════════════════════════════
-    // R2.5 — the WIRED-PRODUCTION-AUTHENTICATOR corpus. These drive the real OIDC verifier THROUGH
-    // `HumanSsoAuthenticator::production_with_oidc` (the constructor the edge main wires) over a
-    // seeded S1 directory — proving a VALID OIDC token authenticates end-to-end to the right
-    // Principal (tenant/region from the VERIFIED claims, never a path), and forgeries are refused.
-    // The verifier built inside `production_with_oidc` uses the SYSTEM clock, so these tokens carry
-    // REAL wall-clock timestamps (not the pinned `NOW`).
-    // ════════════════════════════════════════════════════════════════════════════════════════════
-
     fn real_now() -> i64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1923,9 +1639,6 @@ mod tests {
             .as_secs() as i64
     }
 
-    /// Seed an active OIDC-linked principal `p:alice` in tenant `acme` / region `eu-west` and build
-    /// the wired production authenticator over an RSA JWKS — returning `(auth, rsa_key)` so the test
-    /// can mint genuinely-signed tokens against the published key.
     fn wired_auth() -> (crate::authenticate::HumanSsoAuthenticator, RsaKey) {
         use crate::authenticate::HumanSsoAuthenticator;
         use crate::principal_store::PrincipalStore;
@@ -1966,8 +1679,6 @@ mod tests {
         (auth, key)
     }
 
-    /// Claims valid RIGHT NOW (real wall clock), with a caller-chosen `jti` so the replay guard does
-    /// not collide across cases in one authenticator.
     fn live_claims(jti: &str) -> serde_json::Value {
         let now = real_now();
         serde_json::json!({
@@ -1983,9 +1694,6 @@ mod tests {
         })
     }
 
-    /// **THE R2.5 END-TO-END PROOF — a VALID OIDC token authenticates through the wired production
-    /// authenticator to the right Principal, with tenant/region from the VERIFIED claims (never the
-    /// URL path).** The path asserts `globex`; the resolved Principal is `acme`'s (the IDOR floor).
     #[test]
     fn wired_production_authenticates_valid_oidc_token_to_principal() {
         use myelin_identity::{PrincipalId, PrincipalKind};
@@ -1998,7 +1706,6 @@ mod tests {
             &key.sign(signing_input(&header, &cl).as_bytes()),
         );
 
-        // The URL path LIES (globex); the credential is IdP-verified for acme.
         let p = auth
             .authenticate(&cred(token), Some(&TenantId("globex".into())))
             .expect(
@@ -2014,10 +1721,6 @@ mod tests {
         assert_eq!(p.kind, PrincipalKind::Human);
     }
 
-    /// **The wired production authenticator REFUSES forgeries** — `alg:none`, wrong `iss`, wrong
-    /// `aud`, and an expired token each fail closed (they never resolve a Principal). Same
-    /// authenticator instance: none of these consume the `jti` (each is refused at/before the
-    /// pre-replay checks), so the corpus is independent.
     #[test]
     fn wired_production_rejects_forged_oidc_tokens() {
         use myelin_identity::AuthzError;
@@ -2026,27 +1729,23 @@ mod tests {
             jwt(header, cl, &key.sign(signing_input(header, cl).as_bytes()))
         };
 
-        // (a) alg:none — unsigned bypass.
         let none = jwt(
             &serde_json::json!({"alg": "none", "kid": "rsa-1"}),
             &live_claims("wired-none"),
             b"",
         );
-        // (b) wrong issuer.
         let mut cl_iss = live_claims("wired-iss");
         cl_iss["iss"] = serde_json::json!("https://evil-idp.example.com");
         let wrong_iss = sign(
             &serde_json::json!({"alg": "RS256", "kid": "rsa-1"}),
             &cl_iss,
         );
-        // (c) wrong audience.
         let mut cl_aud = live_claims("wired-aud");
         cl_aud["aud"] = serde_json::json!("some-other-rp");
         let wrong_aud = sign(
             &serde_json::json!({"alg": "RS256", "kid": "rsa-1"}),
             &cl_aud,
         );
-        // (d) expired.
         let mut cl_exp = live_claims("wired-exp");
         cl_exp["exp"] = serde_json::json!(real_now() - 10_000);
         let expired = sign(
@@ -2068,9 +1767,6 @@ mod tests {
         }
     }
 
-    /// **`production(store)` keeps refuse-not-mock for OIDC** — with no IdP
-    /// configured, even a structurally-valid OIDC token is refused (`NotYetImplemented` from the
-    /// refuse-unsupported fallback), never resolved. This is the opt-in / boot-succeeds semantics.
     #[test]
     fn wired_production_without_oidc_refuses_oidc_scheme() {
         use crate::authenticate::HumanSsoAuthenticator;
@@ -2095,9 +1791,6 @@ mod tests {
         );
     }
 
-    // ── A tiny, self-contained HMAC-SHA256 for the alg-confusion forgery ONLY (test code). ───────
-    // This is NOT used by the verifier (which never accepts a symmetric alg); it exists only to MINT
-    // the attacker's forged HS256 token so we can prove the verifier refuses it.
     fn hmac_sha256(key: &[u8], msg: &[u8]) -> Vec<u8> {
         use sha2::{Digest, Sha256};
         const BLOCK: usize = 64;

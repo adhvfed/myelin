@@ -1,9 +1,3 @@
-//! Live PostgreSQL regression tests for immutable migration checksums.
-//!
-//! These tests exercise the production [`myelin_storage::PgMigrator`] against the docker-compose
-//! development database. They prove that an applied migration id is an immutable mapping to one
-//! exact DDL checksum: an identical rerun skips, drift fails before later migrations execute, and
-//! concurrent drift attempts all observe the same fail-closed result under the advisory lock.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -63,18 +57,12 @@ async fn same_id_same_ddl_is_checksum_verified_and_skipped() {
     let suffix = unique_suffix("checksum_same");
     let id = leaked(format!("{suffix}_0001"));
     let table = leaked(format!("{suffix}_table"));
-    // Deliberately no IF NOT EXISTS: a second execution would fail, so a successful rerun proves
-    // that the matching recorded checksum caused a real skip rather than a harmless DDL replay.
     let ddl = leaked(format!("CREATE TABLE {table} (id text PRIMARY KEY)"));
     let migrations = Migrations::of([Migration::plain(id, ddl)]);
     let ids = [id];
     let tables = [table];
     cleanup(&pool, &ids, &tables).await;
 
-    // Wrapped so a mid-test assertion failure or panic still drops this run's tagged table +
-    // migration row, instead of only the happy path reaching the final `cleanup(...)` call below
-    // (see tests/common/mod.rs). `ids`/`tables` are pre-bound owned arrays (not literals) so the
-    // `cleanup` closure can reference them without borrowing a temporary that does not outlive it.
     common::with_cleanup(
         || async {
             PgMigrator::apply(&pool, &migrations)
@@ -123,10 +111,6 @@ async fn same_id_different_ddl_fails_before_any_later_migration() {
     let tables = [first_table, drift_table, later_table];
     cleanup(&pool, &ids, &tables).await;
 
-    // Wrapped so a mid-test assertion failure or panic still drops this run's tagged tables +
-    // migration rows, instead of only the happy path reaching the final `cleanup(...)` call below
-    // (see tests/common/mod.rs). `ids`/`tables` are pre-bound owned arrays (not literals) so the
-    // `cleanup` closure can reference them without borrowing a temporary that does not outlive it.
     common::with_cleanup(
         || async {
             PgMigrator::apply(&pool, &Migrations::of([Migration::plain(id, original_ddl)]))
@@ -193,10 +177,6 @@ async fn concurrent_drift_attempts_all_fail_closed_without_running_later_ddl() {
     let tables = [original_table, drift_table, later_table];
     cleanup(&pool, &ids, &tables).await;
 
-    // Wrapped so a mid-test assertion failure or panic still drops this run's tagged tables +
-    // migration rows, instead of only the happy path reaching the final `cleanup(...)` call below
-    // (see tests/common/mod.rs). `ids`/`tables` are pre-bound owned arrays (not literals) so the
-    // `cleanup` closure can reference them without borrowing a temporary that does not outlive it.
     common::with_cleanup(
         || async {
             PgMigrator::apply(&pool, &Migrations::of([Migration::plain(id, original_ddl)]))

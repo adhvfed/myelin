@@ -1,4 +1,3 @@
-//! Live PostgreSQL proof for the canonical, insert-only CI drive-manifest store.
 #![cfg(feature = "integration")]
 
 mod common;
@@ -88,12 +87,6 @@ fn digest(byte: char) -> String {
     format!("blake3:{}", byte.to_string().repeat(64))
 }
 
-/// The real, already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin).
-/// CT-007 gate 2/4 made `spec.image` the real launch authority: ONLY `manifest().jobs[0]` (the
-/// "build" job) ever actually reaches `GvisorBackend::launch` in this file (`jobs[1]`/`jobs[2]` are
-/// exercised only through `RunnerHooks::reserve`/`attribute`/`release_unused` directly, never through
-/// the sandbox backend, so their fabricated placeholder `image` digests are untouched — they never
-/// reach the registry). `jobs[0]`'s image is therefore the one that must be genuinely verifiable.
 fn linux_small_v1_image() -> ImageRef {
     ImageRef::pinned(format!(
         "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
@@ -411,11 +404,6 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .await
     .unwrap();
 
-    // A cleanup-dedicated clone of `bare_admin` (a cheap `Arc` handle clone, same underlying
-    // pool — `bare_admin` is never `.close()`d itself, only `admin`/`app` are): `with_schema_cleanup`
-    // unconditionally drops `schema` through it once the test body (success, assertion failure, or
-    // panic) finishes, so the schema never outlives this test regardless of outcome (previously it
-    // was dropped ONLY at the natural end of a passing run).
     let cleanup_admin = bare_admin.clone();
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
@@ -492,14 +480,6 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .execute(&mut *parent)
     .await
     .unwrap();
-    // BUG FIX (investigation, 2026-07-25): this schema never created its own `ci_job` table.
-    // `AUTHORIZE_JOB_LAUNCH_QUERY` (the launch CAS `runner_hooks.attribute` drives) requires a
-    // matching `ci_job` row to also cross `queued`/`leased` -> `running` in the SAME statement —
-    // without one, `search_path`'s `public` fallback silently resolved every `ci_job` reference to
-    // the SHARED dev database's `public.ci_job` (leftover rows from unrelated runs), which never
-    // has a row for this schema's job ids. The CAS therefore matched zero rows EVERY time (100%
-    // reproducible, not a timing/race artifact). Seed the starter-owned `ci_job` DAG row for each
-    // manifest job here, mirroring `pg_pipeline_starter.rs`'s `materialize_ci_jobs`.
     for job in &expected.jobs {
         sqlx::query(
             "INSERT INTO ci_job (tenant_id, region, job_id, run_id, stage, name, needs, spec_ref, \
@@ -710,10 +690,6 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         "a cross-cell-region claim is refused before durable reads or Identity mint"
     );
 
-    // The exact production Identity composition survives a factory reconstruction: the first
-    // instance mints through the locked durable claim, while a second instance reloads the same
-    // sealed cell root and durable S7 state, verifies the signed credential, and wins the one-shot
-    // durable launch CAS.
     let mut provider_config = MyelinConfig::dev();
     provider_config.database_url = scoped_url(&app_url(), &schema);
     provider_config.region = expected.region.clone();
@@ -790,8 +766,6 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         )),
     );
     let launch_authorizer = second_identity.launch_authorizer();
-    // CT-007 slice 5b.3-2c (Sol's review): prove `authorize_checkout` against a REAL durable claim
-    // through a live PostgreSQL round-trip -- the fake claim gates only prove orchestration.
     launch_authorizer
         .authorize_checkout(&pre_cas_spec, &checkout_scope())
         .expect("an exact live generation passes checkout authorization");
@@ -812,11 +786,6 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
         ("leased", "queued"),
         "checkout authorization must never advance either durable row"
     );
-    // A canceled/ineligible `ci_job` surface must fail checkout authorization even though
-    // `job_queue` alone still says `leased` -- exactly the gap the read-only
-    // `VERIFY_JOB_LAUNCH_LIVE_QUERY` EXISTS join against `ci_job` closes (Sol's review). Flips
-    // `ci_job` to `cancelled` and immediately back so the rest of this test's `queued`/`running`
-    // assumptions for this row are undisturbed.
     sqlx::query(
         "UPDATE ci_job SET state = 'cancelled'
          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -851,11 +820,6 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     let cancellation_coordinator =
         ci_runner_cancellation_coordinator(provider.clone(), tokio::runtime::Handle::current());
 
-    // Crash window 1, mint → launch CAS: the first production issuer has committed a credential,
-    // but no reservation begin or launch CAS follows. Expiry + the real regional reaper return the
-    // leased row to the queue. The next real claim increments the durable generation, the stale
-    // credential/context can no longer begin or launch, and production Identity remints for the
-    // replacement generation.
     sqlx::query(
         "UPDATE job_queue SET lease_expires = statement_timestamp() - interval '1 second'
          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -952,12 +916,6 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     .await
     .unwrap();
     assert_eq!(begun_state, "inflight");
-    // Crash window 2, launch CAS → spawn: arm the lazy production permit, commit the exact CAS, and
-    // retain only its session advisory ownership while the sandbox child would still be gated. The
-    // committed `running` state is immediately visible (no hours-long transaction/row lock). Even
-    // after forcing its execution lease expired, the real reaper must not replace this paused live
-    // continuation. Dropping ownership simulates process/connection death; only then may a fresh
-    // generation claim and spawn.
     let paused_ownership = runner_hooks
         .acquire_launch_permit(&spec)
         .expect("the production hook returns a lazy exact-generation permit")
@@ -1114,10 +1072,6 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
          reporter settlement ownership"
     );
 
-    // A final-attribution refusal while the exact claim is still retryable retains its deterministic
-    // reservation. The signed credential belongs to the first job, so changing only the
-    // non-serializable expected context makes Identity refuse before any launch CAS. Once a
-    // cancel-superseded transition has made the same generation terminal, zero-release becomes safe.
     let refused_spec = JobSpecTemplate::new(
         JobKind::Ci,
         ImageRef::pinned(expected.jobs[1].image.clone()).unwrap(),
@@ -1401,11 +1355,6 @@ async fn store_replays_exact_bytes_and_refuses_divergent_authority() {
     drop(provider);
     admin.close().await;
     app.close().await;
-    // `with_schema_cleanup` (wrapping this whole body) now owns dropping `schema` unconditionally
-    // through its own `cleanup_admin` handle — it runs after this closure returns, success or panic
-    // alike, so no explicit `DROP SCHEMA`/`bare_admin.close()` is needed here anymore (closing
-    // `bare_admin` itself here would also close `cleanup_admin`, since `PgPool::close()` shuts down
-    // every clone of the same underlying pool, and make that unconditional cleanup a silent no-op).
     })
     .await;
 }

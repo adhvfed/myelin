@@ -1,23 +1,3 @@
-//! # MR-011 — a revoked MACHINE/capability token stays denied across a restart, proven against LIVE
-//! Postgres (the carried-forward S7Denylist fix, discharged end-to-end through the auth path).
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo test` stays DB-free. Runs ONLY
-//! against the docker-compose dev stack:
-//!
-//!   DATABASE_URL=postgres://myelin_app:myelin_app_pw@localhost:5433/myelin \
-//!     cargo test -p myelin-identity-service --features integration \
-//!       --test integration_mr011_machine_token_revocation_durable -- --nocapture
-//!
-//! The old `S7Denylist` was a tenant-less in-process `Mutex<BTreeSet>` rebuilt EMPTY on construction —
-//! a machine-token `jti` revoked there RE-VALIDATED after a restart (a real revocation gap, census
-//! SI-020). MR-011 routes [`CapabilityAuthenticator`] through the durable, `(tenant, region)`-
-//! partitioned [`RevocationStore`] (`with_pg`). This test proves the discharge END TO END through the
-//! REAL PASETO capability verifier:
-//!   (1) a genuinely-signed capability token authenticates to its Principal;
-//!   (2) revoke its `jti` in the durable store → the SAME authenticator now DENIES it;
-//!   (3) a BRAND-NEW `RevocationStore` instance + a fresh authenticator over the SAME pool (a restart
-//!       simulation; the real kill-9 is MR-009) STILL denies it — the revocation was read back from PG,
-//!       not an in-process set that died with the process. THIS is the durability the stub lacked.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -36,7 +16,6 @@ use myelin_storage::{
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
-/// A pinned "now" (Unix seconds) for the verifier's exp check, and its RFC-3339 form for the consult.
 const NOW_UNIX: i64 = 1_780_000_000;
 const NOW_RFC3339: &str = "2026-06-26T00:00:00Z";
 
@@ -102,9 +81,6 @@ async fn cleanup(admin: &SubstrateProvider, tenant: &str) {
     }
 }
 
-/// Seed an in-memory PrincipalStore with a CI machine principal + its credential link (the S1 lookup
-/// the auth path does after verifying the token; the principal store's OWN durability is MR-007's
-/// concern — this test isolates the REVOCATION durability).
 fn seeded_principal_store(tenant: &str, region: &str, subject_key: &str) -> PrincipalStore {
     let st = PrincipalStore::new(Arc::new(KmsEngine::new()));
     let sc = tenant_scope(tenant, region);
@@ -133,12 +109,10 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
     let suffix = uniq();
     let tenant = format!("mr011-{suffix}");
 
-    // The cell's REAL token authority (Ed25519 + macaroon secret) + the verifier's trust anchor.
     let cell = Arc::new(CellTokenAuthority::from_seed(&[11u8; 32], &[22u8; 32]).expect("cell"));
     let anchor = cell.trust_anchor();
     let subject_key = "svc:ci";
 
-    // A genuinely-signed CI capability token (PASETO v4.public), exp in the future of the pinned clock.
     let material = cell.mint(&CapabilityMintSpec {
         tenant: tenant.clone(),
         region: region.clone(),
@@ -157,7 +131,6 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
         material,
     };
 
-    // ---- Instance #1: the durable store + an authenticator wired to the REAL PASETO verifier. ----
     let store1 =
         RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
     let sc = tenant_scope(&tenant, &region);
@@ -176,7 +149,6 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
     )
     .with_clock(|| Timestamp(NOW_RFC3339.into()));
 
-    // (1) Before revocation: the genuinely-signed token authenticates to its Principal.
     let p = auth1
         .authenticate(&cred, None)
         .expect("a correctly-signed CI token authenticates");
@@ -187,7 +159,6 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
         "tenant from the verified token"
     );
 
-    // (2) Revoke the jti in the durable store (the token's verified partition) → auth1 now DENIES.
     store1.tear_down_run_token(&sc, "mr011-jti", Timestamp(NOW_RFC3339.into()));
     let denied = auth1.authenticate(&cred, None);
     assert!(
@@ -195,9 +166,6 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
         "after revocation the SAME authenticator denies the token, got {denied:?}"
     );
 
-    // (3) THE DURABILITY: a BRAND-NEW RevocationStore + a fresh authenticator over the SAME pool (a
-    //     restart simulation) STILL denies — the revocation was read back from PG, not an in-process
-    //     set. This is exactly what the old tenant-less S7Denylist could NOT do.
     let store2 =
         RevocationStore::with_pg(DurableRevocationBacking::new(app.clone()), handle.clone());
     let verifier2: Arc<dyn myelin_identity_service::TokenVerifier> =
@@ -215,11 +183,9 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
             Err(myelin_identity::AuthzError::FailClosed(_))
         ),
         "a FRESH authenticator + store over the same pool STILL denies the revoked token (durable \
-         revocation survives the 'restart') — got {still_denied:?}"
+         revocation survives the 'restart') - got {still_denied:?}"
     );
 
-    // Sanity: a DIFFERENT, un-revoked jti from the same cell still authenticates through auth2 (the
-    // deny is specific to the revoked handle, not a blanket failure).
     let fresh = cell_fresh_token(&tenant, &region, subject_key);
     let fresh_cred = Credential {
         scheme: "ci".into(),
@@ -240,8 +206,6 @@ async fn revoked_machine_token_stays_denied_across_a_fresh_store_instance() {
     println!("OK: a revoked machine/capability token stays denied across a fresh store instance over the same pool (S7Denylist gap discharged).");
 }
 
-/// A second genuinely-signed CI token with a DISTINCT jti (re-mints the cell material — the cell is
-/// re-derived from the same seed so the verifier anchor matches).
 fn cell_fresh_token(tenant: &str, region: &str, subject_key: &str) -> String {
     let cell = CellTokenAuthority::from_seed(&[11u8; 32], &[22u8; 32]).unwrap();
     cell.mint(&CapabilityMintSpec {

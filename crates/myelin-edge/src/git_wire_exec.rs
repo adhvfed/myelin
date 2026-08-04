@@ -1,35 +1,3 @@
-//! # The PRODUCTION git `WireExecutor` — sandboxed canonical `git` at the serving tier (CT-006b / GT-006)
-//!
-//! [`myelin_git::core::WireExecutor`] is the no-host-exec port the [`myelin_git::core::ShellGitCore`]
-//! wire backend routes every `upload-pack` / `receive-pack` / `ls-refs` / maintenance invocation
-//! through (the git-shaped analogue of `ToolHands::exec` for the agent fabric). The git crate ships
-//! only TEST executors; the PRODUCTION one lives HERE, in the serving tier, NOT in `myelin-git/src/`,
-//! so the `no-host-exec` lint stays green over the git crate (the executor owns the sandboxed launch).
-//!
-//! ## What it does
-//! [`GitWireExecutor`] maps a [`WireInvocation`] `{ repo, argv, stdin }` to a
-//! [`myelin_ci_sandbox::GitWireSpec`] and runs it through
-//! [`myelin_ci_sandbox::gvisor::GvisorBackend::launch_git_wire`] — canonical `git <argv> /repo` inside
-//! the PROVEN hardened gVisor sandbox (CT-002/003/006a: egress default-deny + no-netns, read-only root
-//! + tmpfs scratch, all caps dropped, no-new-privileges, seccomp, non-root uid, mem/pids/disk bounded,
-//!
-//! whole-container kill + cleanup, bounded capture). The bare repo is bound **READ-ONLY** at `/repo`;
-//! the locator is resolver-validated (the GT-001 cross-tenant boundary, replicated + drift-pinned) and
-//! symlink-confined before any mount. **No host-exec fingerprint here** — the edge NEVER calls
-//! `Command`; it delegates the launch to `launch_git_wire`.
-//!
-//! ## Exit / timeout fidelity (never a silent empty stdout)
-//! A non-zero `git` exit or a wall-clock timeout is mapped to [`GitCoreError::Wire`] — the seam never
-//! returns an empty `WireOutput` for a failed run. A clean exit (0, not timed out) returns the captured
-//! stdout (the ref advertisement / packfile bytes).
-//!
-//! ## CT-006c floor (stated, not built here)
-//! - **receive-pack / PUSH**: the writable-quarantine-under-rootless-runsc intake + the in-process
-//!   policy / `git fsck` / one-tx ref-CAS + outbox is CT-006c. This executor passes NO quarantine
-//!   (correct for `upload-pack`); a `receive-pack` serve would need the quarantine wiring CT-006c adds.
-//! - **the HTTP smart-transport server binary/listener** + the external-oracle `git clone`/`fetch`/
-//!   `push` are CT-006c. CT-006b proves the path through the [`myelin_git::core::GitCore`] seam.
-
 use myelin_ci_sandbox::gvisor::GvisorBackend;
 use myelin_ci_sandbox::{
     GitWireSpec, IdemToken, MeterTarget, ResourceLimits, RunTokenCredential, RunnerHooks,
@@ -52,9 +20,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-/// Authenticated facts presented to the serving-tier credential issuer for one sandboxed Git wire
-/// invocation. The issuer itself is expected to be request-bound to the verified principal; no
-/// bearer material or caller-selectable policy enters this carrier.
 pub struct GitWireCredentialRequest<'a> {
     pub tenant: &'a str,
     pub region: &'a str,
@@ -64,18 +29,12 @@ pub struct GitWireCredentialRequest<'a> {
     pub ttl_secs: u64,
 }
 
-/// Final-boundary minting port for sandboxed Git wire work. A production implementation calls the
-/// Identity token authority; the executor has no fallback that fabricates credentials.
 pub trait GitWireCredentialIssuer: Send + Sync {
     fn mint(&self, request: &GitWireCredentialRequest<'_>) -> Result<RunTokenCredential, String>;
 
-    /// Verify signature, purpose, and live run lifecycle immediately before the launch hook admits
-    /// the sandbox. Implementations must return only bounded, credential-free errors.
     fn verify(&self, credential: &RunTokenCredential) -> Result<(), String>;
 }
 
-/// Request-binds a credential issuer to the already verified edge principal. This prevents a
-/// process-global issuer from minting against caller-selected identity data.
 pub trait GitWireCredentialIssuerFactory: Send + Sync {
     fn bind(&self, principal: &Principal) -> Arc<dyn GitWireCredentialIssuer>;
 }
@@ -111,8 +70,6 @@ pub(crate) fn unavailable_git_wire_credential_issuer_factory(
     Arc::new(UnavailableGitWireCredentialIssuerFactory)
 }
 
-/// Explicit deterministic issuer for tests/drills. It is absent from the default production graph;
-/// production composition must bind Identity instead.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 pub struct TestGitWireCredentialIssuer;
@@ -162,10 +119,6 @@ pub fn test_git_wire_credential_issuer_factory() -> Arc<dyn GitWireCredentialIss
     Arc::new(TestGitWireCredentialIssuerFactory)
 }
 
-/// Production Identity adapter. Each bound issuer owns the verified trigger principal, rechecks
-/// its exact repo permission strongly at mint time, and emits a zero-authority per-job credential:
-/// the outer edge authorization permits the Git operation; the sandbox credential supplies only
-/// short-lived, signed attribution and cannot be replayed as repo authority.
 #[derive(Clone)]
 pub struct IdentityGitWireCredentialIssuerFactory {
     identity: StoreBackedCheck,
@@ -314,12 +267,6 @@ fn system_now_timestamp() -> myelin_events::Timestamp {
     myelin_events::Timestamp(instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
-/// The production [`WireExecutor`]: every canonical-`git` wire invocation runs SANDBOXED through the
-/// gVisor backend's [`GvisorBackend::launch_git_wire`]. Rooted at the on-disk dir holding
-/// `<tenant>/<region>/<repo>.git` bare repos (the SAME root the read backend [`GixCore`] /
-/// [`RootedResolver`] and the durable store resolve against). Holds the four-guarantee
-/// [`RunnerHooks`] the launch drives (cost gate, attribution, isolation floor) — the wallet/identity/
-/// KMS bodies are consumed contracts the composition root binds.
 pub struct GitWireExecutor {
     backend: GvisorBackend,
     root: PathBuf,
@@ -327,15 +274,10 @@ pub struct GitWireExecutor {
     hooks: RunnerHooks,
     credential_issuer: Arc<dyn GitWireCredentialIssuer>,
     shutdown: Arc<AtomicBool>,
-    /// Monotone per-invocation sequence → a unique idempotency token per sandboxed launch (the runner
-    /// dedups on it; one sandbox per wire op, never reused).
     seq: AtomicU64,
 }
 
 impl GitWireExecutor {
-    /// Build the production executor over an on-disk git root, resource limits, and the four-guarantee
-    /// hooks. The caller (the composition root / CT-006c server) supplies real hooks; nothing here
-    /// fabricates a guarantee.
     pub fn new(
         root: impl Into<PathBuf>,
         limits: ResourceLimits,
@@ -359,16 +301,11 @@ impl GitWireExecutor {
         }
     }
 
-    /// Bind the process-level shutdown signal used to cancel an active `runsc` wire container. The
-    /// default stays never-cancelled for isolated tests and non-serving callers.
     pub fn with_shutdown_signal(mut self, shutdown: Arc<AtomicBool>) -> Self {
         self.shutdown = shutdown;
         self
     }
 
-    /// Serving-tier default: sane resource bounds + the four-guarantee hooks wired to pass-through
-    /// seams. Credential minting deliberately remains unavailable, so a wire operation fails closed
-    /// until the composition root injects a live Identity issuer with [`Self::new`].
     pub fn serving_default(root: impl Into<PathBuf>) -> Self {
         Self::new(
             root,
@@ -378,18 +315,6 @@ impl GitWireExecutor {
         )
     }
 
-    /// The serving-tier resource bounds for a wire op (every field non-zero: the `JobSpec` invariants
-    /// require `pids_max > 0` and `timeout_secs > 0`).
-    ///
-    /// NOTE (ResourceLimits split): `tmpfs_bytes` mirrors `disk_bytes` here rather than getting an
-    /// independent value, deliberately — `disk_bytes` on THIS spec double-duties as the gVisor
-    /// git-wire `wire_cap` (the `OutputTooLarge` bound on the streamed host-side response capture —
-    /// see `gvisor.rs`'s `run_git_wire_container` / `WIRE_STDOUT_BOUND`), which is unrelated to this
-    /// prompt's mount-plumbing scope and is NOT to be touched here. Bumping `disk_bytes` to a bigger
-    /// dedicated ephemeral-workspace default at this call site would silently widen that unrelated
-    /// wire-response cap — an actual runtime behavior change this pure type-shape step must not make.
-    /// Mirroring keeps both the tmpfs sizing AND the wire cap byte-for-byte unchanged; decoupling them
-    /// is deferred to the follow-up that actually wires up the disk-backed workspace mount.
     pub fn default_limits() -> ResourceLimits {
         ResourceLimits {
             cpu_millis: 2000,
@@ -401,11 +326,6 @@ impl GitWireExecutor {
         }
     }
 
-    /// The four-guarantee hooks for the serving tier. The launch ALWAYS asserts the mandatory hardening
-    /// profile is in force itself (`HardeningProfile::assert_enforced`), so `isolation_floor` here is a
-    /// pass-through; reserve/settle/attribute are the seams the composition root binds to the live
-    /// wallet (11.7) / token mint (4.7). Returning `Ok` here does NOT skip the floor — the floor is
-    /// enforced unconditionally inside `launch_git_wire`.
     pub fn serving_hooks() -> RunnerHooks {
         RunnerHooks::new(
             myelin_ci_sandbox::CompletionSettlementOwner::Hook,
@@ -420,10 +340,6 @@ impl GitWireExecutor {
         )
     }
 
-    /// The git environment the sandboxed `upload-pack` needs: the git-core exec dir, a writable `$HOME`
-    /// on the tmpfs, the system-config opt-out, and `safe.directory=*` (the RO repo is owned by the
-    /// host user, not the in-guest uid 65534, so without this `git` refuses the "dubious ownership"
-    /// repo). v0 stateless-rpc (no `GIT_PROTOCOL=version=2`) — the wire seam drives v0 advertise/serve.
     fn wire_env() -> Vec<String> {
         vec![
             "HOME=/tmp".to_string(),
@@ -435,8 +351,6 @@ impl GitWireExecutor {
         ]
     }
 
-    /// Mint the per-invocation credential and derive non-secret accounting/idempotency handles. A
-    /// missing/refusing Identity issuer is a hard wire error before path resolution or sandbox spawn.
     fn next_tokens(
         &self,
         repo: &myelin_git::core::RepoLoc,
@@ -468,13 +382,6 @@ impl GitWireExecutor {
 }
 
 impl GitWireExecutor {
-    /// **Ingest a pushed packfile in the hardened sandbox (CT-006d).** Drives
-    /// [`GvisorBackend::launch_git_receive_pack`]: the UNTRUSTED client pack is piped to the sandbox,
-    /// `git index-pack --fix-thin` validates + resolves it against the RO `/repo` alternates inside the
-    /// writable `/tmp` tmpfs quarantine (never the real repo), and the FULLY-RESOLVED objects are streamed
-    /// back as a `git cat-file --batch` stream (`<oid> <type> <size>\n<payload>\n` repeated). A non-zero
-    /// `index-pack` exit (corrupt/forged/incomplete pack) or a timeout is a HARD error — never a silent
-    /// empty result. The repo stays READ-ONLY to the sandbox; the host parses + policies + migrates.
     pub fn ingest_pack(
         &self,
         repo: &myelin_git::core::RepoLoc,
@@ -491,10 +398,10 @@ impl GitWireExecutor {
             &repo.tenant,
             &repo.region,
             &repo.repo,
-            Vec::new(), // ignored for receive-pack ingest (the fixed `sh -c` ingest script runs)
+            Vec::new(),
             pack,
             Self::wire_env(),
-            None, // no host-bind quarantine — the quarantine is the in-guest /tmp tmpfs (rootless-safe)
+            None,
             self.limits,
             rt,
             mt,
@@ -548,9 +455,6 @@ impl WireExecutor for GitWireExecutor {
         }
         let operation = inv.argv.first().map(String::as_str).unwrap_or("git-wire");
         let (rt, mt, it) = self.next_tokens(&inv.repo, operation)?;
-        // Map the WireInvocation locator → a resolver-validated, symlink-confined GitWireSpec. A
-        // cross-tenant / `..` / separator locator is REFUSED here (the GT-001 boundary), before mount.
-        // NO quarantine for upload-pack (read-only serve); the receive-pack writable quarantine is CT-006c.
         let spec = GitWireSpec::for_repo(
             &self.root,
             &inv.repo.tenant,
@@ -576,7 +480,6 @@ impl WireExecutor for GitWireExecutor {
             .launch_git_wire_until_cancelled(&spec, &self.hooks, &self.shutdown)
             .map_err(|e| GitCoreError::Wire(e.to_string()))?;
 
-        // One sandbox per wire op — tear it down (idempotent; the guest has already exited).
         let _ = self.backend.kill(&handle);
 
         if !output_complete {
@@ -585,8 +488,6 @@ impl WireExecutor for GitWireExecutor {
                 inv.argv.join(" ")
             )));
         }
-        // Honor the exit/timeout: a timeout or a non-zero `git` exit is a HARD error, never a silent
-        // empty stdout. stderr is folded into the error message (capped capture; never the payload).
         if self.shutdown.load(Ordering::Acquire) {
             return Err(GitCoreError::Wire(format!(
                 "sandboxed `git {}` cancelled by process shutdown",
@@ -595,7 +496,7 @@ impl WireExecutor for GitWireExecutor {
         }
         if result.timed_out {
             return Err(GitCoreError::Wire(format!(
-                "sandboxed `git {}` timed out (wall-clock {}s ceiling) — refused",
+                "sandboxed `git {}` timed out (wall-clock {}s ceiling) - refused",
                 inv.argv.join(" "),
                 self.limits.timeout_secs
             )));
@@ -615,12 +516,6 @@ impl WireExecutor for GitWireExecutor {
     }
 }
 
-/// **The production `GitCore` for the wire-serving tier (CT-006b).** Composes the sandboxed
-/// [`GitWireExecutor`] (wire/maintenance ops → canonical `git`, no-host-exec) with the in-process read
-/// backend [`GixCore`] over the SAME on-disk root (read/diff/blame in libgit2). The serve/advertise
-/// calls flow here; `RoutedGitCore` routes each op by the per-op capability table (wire → Shell,
-/// read → Gix, 0 routing errors). The HTTP smart-transport listener that drives `advertise_refs` /
-/// `serve` over the wire is CT-006c — this is the GitCore it stands on.
 pub fn production_git_core(
     root: impl Into<PathBuf>,
     limits: ResourceLimits,
@@ -637,7 +532,6 @@ pub fn production_git_core(
     RoutedGitCore::new(exec, read)
 }
 
-/// Production Git core with an explicit live Identity credential issuer.
 pub fn production_git_core_with_issuer(
     root: impl Into<PathBuf>,
     limits: ResourceLimits,
@@ -650,7 +544,6 @@ pub fn production_git_core_with_issuer(
     RoutedGitCore::new(exec, read)
 }
 
-/// Production core with a process-level cancellation flag shared by every per-request executor.
 pub fn production_git_core_with_shutdown(
     root: impl Into<PathBuf>,
     limits: ResourceLimits,
@@ -669,7 +562,6 @@ pub fn production_git_core_with_shutdown(
     RoutedGitCore::new(exec, read)
 }
 
-/// Shutdown-aware production Git core with an explicit live Identity credential issuer.
 pub fn production_git_core_with_shutdown_and_issuer(
     root: impl Into<PathBuf>,
     limits: ResourceLimits,
@@ -684,10 +576,6 @@ pub fn production_git_core_with_shutdown_and_issuer(
     RoutedGitCore::new(exec, read)
 }
 
-/// Serving-tier default composition (default limits + pass-through guarantee hooks). Credential
-/// minting is deliberately unavailable, so wire operations fail closed until the composition root
-/// uses [`production_git_core_with_issuer`]. The on-disk `root` is the SAME root the durable git
-/// backend ([`crate::DurableGitBackend`]) writes/reads through.
 pub fn production_git_core_default(
     root: impl Into<PathBuf>,
 ) -> RoutedGitCore<GitWireExecutor, GixCore<RootedResolver>> {
@@ -698,7 +586,6 @@ pub fn production_git_core_default(
     )
 }
 
-/// Serving defaults plus cooperative process-shutdown cancellation.
 pub fn production_git_core_default_with_shutdown(
     root: impl Into<PathBuf>,
     shutdown: Arc<AtomicBool>,

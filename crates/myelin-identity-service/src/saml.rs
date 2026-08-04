@@ -1,92 +1,3 @@
-//! # `saml` — REAL SAML 2.0 XML-DSig credential verification (MR-010b; the SAML slice of P-526,
-//! census SI-001/004). The HARDEST credential type: SAML is the home of **XML Signature Wrapping
-//! (XSW)**, the #1 SAML auth-bypass class.
-//!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/identity-and-access.md` §4 (the authentication
-//! surfaces — SAML 2.0; **tenant is taken from the verified credential, never the URL path**, ID-3).
-//!
-//! ## What this module replaces (the #1 CRITICAL census finding, for the SAML scheme)
-//! The production auth graph's floor verifier ([`crate::authenticate::StructuralVerifier`]) parses a
-//! PLAINTEXT `<tenant>|<region>|<subject_key>` envelope — so ANYONE forges any principal in any
-//! tenant (SI-001/004). [`SamlVerifier`] is the REAL cryptographic replacement for the **SAML**
-//! scheme: it verifies the enveloped XML-DSig signature over a SAML 2.0 assertion against the IdP's
-//! INJECTED signing key, defends against the full XSW family, validates the SAML conditions, and
-//! extracts a trust-rooted [`VerifiedAssertion`] — or refuses it LOUDLY. It plugs into the EXISTING
-//! [`CredentialVerifier`] seam — the resolution + telemetry body in [`crate::authenticate`] does not
-//! change. It is the sibling of [`crate::oidc::OidcVerifier`] / [`crate::ssh_auth::SshVerifier`] —
-//! same seam, same rigor (`verify` is TOTAL over attacker bytes — no slice/`unwrap`/overflow panic).
-//!
-//! ## STEP-1 dependency / risk decision (hand-built exc-c14n + vetted crypto — no C deps)
-//! SAML XML-DSig REQUIRES exclusive XML canonicalization (exc-c14n) of the `SignedInfo` element (to
-//! verify the signature) and of the referenced element (to verify the Reference digest). There is NO
-//! mature pure-Rust XML-DSig / c14n crate in `Cargo.lock`. The realistic vetted options
-//! (`samael`, `xmlsec` bindings) pull **C** dependencies — `libxml2` + `openssl` — into a workspace
-//! whose entire crypto stack is deliberately pure-Rust/`ring` (no openssl), and `libxml2` itself has
-//! a long history of XXE / entity-expansion CVEs (precisely the attack class this prompt must
-//! defend). Adding that C surface here would be a net SECURITY REGRESSION, not a gain. So the choice:
-//! **hand-build a constrained exc-c14n + hand-parse the XML with the non-expanding `xmlparser`
-//! tokenizer (already in `Cargo.lock` via `aws-smithy-xml` — promoting it adds NO new crate to the
-//! tree), and do the signature math with the SAME vetted primitives the OIDC path uses (`rsa` +
-//! `sha2` for RSA-SHA256, `ring` for ECDSA-P256-SHA256).** The XSW defence below is layered so it
-//! does **not** depend on c14n subtleties (single-assertion / single-ID / reference-pinning /
-//! schema-position / comment rejection are structural), giving defence-in-depth even if c14n had a
-//! bug. **Honest c14n coverage (see [`canonicalize`]):** exclusive c14n WITHOUT comments, for the
-//! self-contained-assertion profile — element/attribute/namespace rendering, exclusive minimal
-//! namespace output (default-`xmlns` first then by prefix; the implicit `xml` prefix never emitted),
-//! attribute sort by (namespace-uri, local), and canonical text/attr escaping. NOT implemented (the
-//! honest gaps): the `InclusiveNamespaces` `PrefixList`, processing-instruction / comment nodes
-//! (rejected outright), and DTDs/entities (rejected outright). Interop with a third-party IdP's exact
-//! c14n output is therefore PROVEN here only by a real signing↔verifying round-trip (the corpus mints
-//! genuine RSA/ECDSA signatures over real canonical bytes); a fixed external IdP test vector is a
-//! follow-up. Inclusive (non-exclusive) c14n and SHA-1 are REJECTED.
-//!
-//! ## XML-DSig signature verification (the trust root is INJECTED, never the document)
-//! The IdP signing key is INJECTED ([`SamlConfig::trust_anchors`]) — an attacker controls the whole
-//! document, so the `<KeyInfo>` / any embedded X.509 cert is **NOT** trusted as the trust root; the
-//! signature is verified ONLY against the configured anchor key(s). The `SignatureMethod` is pinned
-//! to the anchor key family (an RSA anchor verifies only `rsa-sha256`; an EC anchor only
-//! `ecdsa-sha256` — the alg-confusion defence). **SHA-1 (`rsa-sha1`/`dsa-sha1`/`ecdsa-sha1`) and
-//! non-exclusive c14n are rejected.** Both the `SignedInfo` signature AND the Reference digest are
-//! verified (a digest that does not match the canonicalized referenced element is refused).
-//!
-//! ## XSW DEFENCE (THE CRITICAL PART — see [`SamlVerifier::verify`])
-//! After the signature checks out, claims are extracted ONLY from the exact element that was signed
-//! AND referenced. The mandatory hardening (each a refusal):
-//! 1. **at most ONE `<Assertion>`** in the whole document (a forged sibling/wrapped assertion → reject);
-//! 2. **exactly ONE `<Signature>`**, an enveloped direct child of that one assertion (schema position);
-//! 3. the Reference URI `#id` pins the signed element; there must be **exactly ONE element with that
-//!    ID** in the whole document (duplicate-ID → reject) and it MUST be the single assertion;
-//! 4. claims (Issuer, NameID, Conditions, Audience) are read from that signed+referenced assertion,
-//!    **never** from any other element;
-//! 5. **comments are rejected** anywhere in the document (the c14n-comment / `;;` NameID-injection
-//!    trick relies on a comment node splitting the NameID text — no comment survives parsing);
-//! 6. **DTD / DOCTYPE / entity declarations are rejected** (XXE / billion-laughs — no entity
-//!    expansion; `xmlparser` is non-expanding and we additionally refuse the tokens outright).
-//!
-//! ## SAML conditions (all from the verified signed assertion)
-//! `Issuer` must equal the configured IdP issuer; `NotBefore`/`NotOnOrAfter` are parsed to INSTANTS
-//! (chrono, never a lexical compare — the MR-008 fail-open lesson) and validated with leeway;
-//! `AudienceRestriction/Audience` must contain this SP; and the assertion `ID` is consumed once via
-//! an injected [`crate::oidc::ReplayGuard`] (a replayed assertion is refused).
-//! The HTTP POST response is additionally bound to an injected, server-held
-//! [`SamlRequestBinding`]: outer `Destination`/`InResponseTo` must match, and the same ACS recipient
-//! and AuthnRequest ID must occur in the signed bearer `SubjectConfirmationData`.
-//!
-//! ## What is INJECTED, and what is honestly out of scope
-//! The trust anchor key(s), replay guard, and per-login request binding are INJECTED — the crypto/test
-//! path makes NO network call. SAML metadata refresh / SP-initiated SLO / encrypted assertions
-//! (`EncryptedAssertion`) / full X.509 path-building to a CA root are OUT OF SCOPE here and NOT
-//! claimed (we PIN the leaf signing key, which is stricter than chain-building). These are thin later
-//! layers.
-//!
-//! ## Wiring (the dispatch seam — [`crate::oidc::SchemeDispatchVerifier`])
-//! [`SamlVerifier`] is wired as the `saml`-scheme verifier via
-//! `SchemeDispatchVerifier::route(scheme::SAML, …)` (exercised in the tests, as for OIDC/SSH). The
-//! dispatcher constructs NO `Structural*` type itself (the fallback is injected by the caller), so it
-//! adds no mock-crypto construction to the production graph; removing the `StructuralVerifier`
-//! prod-default entirely is MR-012.
-
 use crate::authenticate::{scheme, CredentialVerifier, VerifiedAssertion};
 use crate::oidc::{JwkKey, ReplayGuard};
 use myelin_identity::{AuthzError, Credential};
@@ -97,60 +8,29 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
 
-// ── The fixed SAML / XML-DSig namespace + algorithm URIs ─────────────────────────────────────────
-
-/// The XML-DSig namespace (`<ds:Signature>` lives here).
 const DS_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
-/// The SAML 2.0 assertion namespace (`<saml:Assertion>` lives here).
 const SAML_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
-/// The SAML 2.0 protocol namespace (`<samlp:Response>` lives here).
 const SAML_PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
-/// The bearer subject-confirmation method required by the HTTP POST SSO profile.
 const SAML_BEARER_METHOD: &str = "urn:oasis:names:tc:SAML:2.0:cm:bearer";
-/// The implicit `xml` prefix namespace (RFC: never re-declared / never c14n-emitted).
 const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 
-/// Exclusive c14n (the ONLY canonicalization we implement / accept).
 const EXC_C14N: &str = "http://www.w3.org/2001/10/xml-exc-c14n#";
-/// Exclusive c14n with comments — REJECTED (comments must not be canonicalized into the signed bytes).
 const EXC_C14N_COMMENTS: &str = "http://www.w3.org/2001/10/xml-exc-c14n#WithComments";
-/// The enveloped-signature transform (removes the `Signature` from the referenced element).
 const ENVELOPED: &str = "http://www.w3.org/2000/09/xmldsig#enveloped-signature";
-/// SHA-256 digest method (the ONLY digest we accept — SHA-1 is rejected).
 const SHA256_DIGEST: &str = "http://www.w3.org/2001/04/xmlenc#sha256";
-/// RSA-SHA256 signature method.
 const RSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256";
-/// ECDSA-SHA256 signature method.
 const ECDSA_SHA256: &str = "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256";
 
-/// The maximum XML element nesting depth accepted at parse. SAML assertions are shallow; a deeply
-/// nested document is a stack-exhaustion DoS against the recursive DOM traversal / canonicalization /
-/// `Drop` (see the bound in [`parse_xml`]). 256 is far beyond any legitimate assertion.
 const MAX_NESTING_DEPTH: usize = 256;
 
-// ── Loud refusals ────────────────────────────────────────────────────────────────────────────────
-
-/// A LOUD refusal of a credential that is well-formed XML but does NOT verify (bad/missing signature,
-/// XSW, wrong/non-anchored key, SHA-1, tampered, expired, wrong audience, replay, comment-injection).
-/// `AuthzError::FailClosed` so an unverifiable assertion NEVER resolves to a Principal.
 fn refuse(msg: impl Into<String>) -> AuthzError {
     AuthzError::FailClosed(msg.into())
 }
 
-/// A LOUD structural refusal — the bytes are not even well-formed / admissible XML (garbage, a DTD,
-/// an entity declaration, a comment). `AuthzError::BadRequest`.
 fn malformed(msg: impl Into<String>) -> AuthzError {
     AuthzError::BadRequest(msg.into())
 }
 
-// ================================================================================================
-// A minimal, hardened XML DOM — built from the non-expanding `xmlparser` tokenizer.
-// DTDs / entity declarations / comments / processing instructions are REFUSED at parse time (the
-// XXE / billion-laughs / comment-injection defence). `parse` is TOTAL over attacker bytes.
-// ================================================================================================
-
-/// One XML element in the hardened DOM. `ns_decls` are the namespace declarations made ON this
-/// element (`("", uri)` is the default `xmlns`); `attrs` are the non-namespace attributes.
 #[derive(Clone, Debug)]
 struct Element {
     prefix: String,
@@ -160,8 +40,6 @@ struct Element {
     children: Vec<Node>,
 }
 
-/// A non-namespace attribute (`prefix` empty ⇒ no namespace; unprefixed attributes are NOT in the
-/// default namespace, per XML namespaces).
 #[derive(Clone, Debug)]
 struct Attr {
     prefix: String,
@@ -169,7 +47,6 @@ struct Attr {
     value: String,
 }
 
-/// A child node: a nested element or a run of character data (CDATA is folded into text).
 #[derive(Clone, Debug)]
 enum Node {
     Element(Element),
@@ -177,7 +54,6 @@ enum Node {
 }
 
 impl Element {
-    /// The `ID` attribute value (SAML uses the unprefixed `ID` of type `xs:ID`), if present.
     fn id_attr(&self) -> Option<&str> {
         self.attrs
             .iter()
@@ -185,8 +61,6 @@ impl Element {
             .map(|a| a.value.as_str())
     }
 
-    /// The concatenated direct text content (no comments survive parsing, so this is unambiguous —
-    /// the NameID comment-injection trick cannot split this text).
     fn text(&self) -> String {
         let mut s = String::new();
         for c in &self.children {
@@ -198,20 +72,13 @@ impl Element {
     }
 }
 
-/// Parse `xml` into the hardened DOM. TOTAL over attacker bytes: malformed XML is a loud
-/// `BadRequest`, never a panic. A DOCTYPE / DTD / entity declaration / comment / processing
-/// instruction is REFUSED (the XXE / billion-laughs / comment-injection defence). Returns the single
-/// root element.
 fn parse_xml(xml: &str) -> Result<Element, AuthzError> {
     use xmlparser::{ElementEnd, Token};
 
-    // Open elements whose start tag is complete (children append to the last); plus the element whose
-    // start tag is still being read (collecting attributes).
     let mut stack: Vec<Element> = Vec::new();
     let mut pending: Option<Element> = None;
     let mut root: Option<Element> = None;
 
-    // Attach a finished element to its parent (or record it as the root). A second root is a refusal.
     fn attach(
         el: Element,
         stack: &mut [Element],
@@ -235,12 +102,10 @@ fn parse_xml(xml: &str) -> Result<Element, AuthzError> {
     for tok in xmlparser::Tokenizer::from(xml) {
         let tok = tok.map_err(|e| malformed(format!("malformed XML: {e}")))?;
         match tok {
-            // A leading `<?xml …?>` declaration is fine; ignore it.
             Token::Declaration { .. } => {}
-            // XXE / billion-laughs defence — refuse any DTD / DOCTYPE / entity declaration outright.
             Token::DtdStart { .. } | Token::EmptyDtd { .. } | Token::DtdEnd { .. } => {
                 return Err(malformed(
-                    "DTD / DOCTYPE is rejected (XXE / entity-expansion defence — no entity processing)",
+                    "DTD / DOCTYPE is rejected (XXE / entity-expansion defence - no entity processing)",
                 ));
             }
             Token::EntityDeclaration { .. } => {
@@ -248,20 +113,16 @@ fn parse_xml(xml: &str) -> Result<Element, AuthzError> {
                     "entity declaration is rejected (XXE / billion-laughs defence)",
                 ));
             }
-            // Comments are refused (the c14n-comment / NameID-injection trick relies on a comment
-            // node splitting element text; no comment ever enters the DOM).
             Token::Comment { .. } => {
                 return Err(malformed(
                     "XML comments are rejected (NameID comment-injection / c14n-comment defence)",
                 ));
             }
-            // Processing instructions are not part of the SAML profile and are refused.
             Token::ProcessingInstruction { .. } => {
                 return Err(malformed("processing instructions are rejected"));
             }
             Token::ElementStart { prefix, local, .. } => {
                 if pending.is_some() {
-                    // An element start before the previous one's end tag closed — malformed stream.
                     return Err(malformed("malformed XML element nesting"));
                 }
                 pending = Some(Element {
@@ -284,9 +145,9 @@ fn parse_xml(xml: &str) -> Result<Element, AuthzError> {
                 let (p, l) = (prefix.as_str(), local.as_str());
                 let val = unescape_xml(value.as_str())?;
                 if p.is_empty() && l == "xmlns" {
-                    el.ns_decls.push((String::new(), val)); // default namespace
+                    el.ns_decls.push((String::new(), val));
                 } else if p == "xmlns" {
-                    el.ns_decls.push((l.to_string(), val)); // prefixed namespace
+                    el.ns_decls.push((l.to_string(), val));
                 } else {
                     el.attrs.push(Attr {
                         prefix: p.to_string(),
@@ -300,17 +161,9 @@ fn parse_xml(xml: &str) -> Result<Element, AuthzError> {
                     let el = pending
                         .take()
                         .ok_or_else(|| malformed("XML element end without a start"))?;
-                    // NESTING-DEPTH BOUND (DoS defence). `parse_xml` is iterative and survives any
-                    // depth, but the DOWNSTREAM recursive traversals (`collect_named`/`collect_by_id`/
-                    // `canonicalize`) AND the recursive `Drop` of the nested DOM overflow the stack on
-                    // a WELL-FORMED (matched-close-tag) deeply-nested document — an uncatchable SIGABRT
-                    // (a ~35 KB request aborts the auth process; `catch_unwind` does not save a stack
-                    // overflow). Refusing here, BEFORE a too-deep DOM is ever assembled (the stack is
-                    // still flat — children attach only on close), caps the recursion/Drop depth too.
-                    // SAML assertions are shallow (a few dozen levels); 256 is generous.
                     if stack.len() >= MAX_NESTING_DEPTH {
                         return Err(malformed(format!(
-                            "XML nesting too deep (> {MAX_NESTING_DEPTH}) — refused (a deeply-nested \
+                            "XML nesting too deep (> {MAX_NESTING_DEPTH}) - refused (a deeply-nested \
                              document is a stack-exhaustion DoS; SAML assertions are shallow)"
                         )));
                     }
@@ -335,11 +188,9 @@ fn parse_xml(xml: &str) -> Result<Element, AuthzError> {
                         .children
                         .push(Node::Text(unescape_xml(text.as_str())?));
                 }
-                // Text outside the root element is whitespace-only in practice; ignore it.
             }
             Token::Cdata { text, .. } => {
                 if let Some(parent) = stack.last_mut() {
-                    // CDATA content is literal character data; store as text (escaped on c14n output).
                     parent.children.push(Node::Text(text.as_str().to_string()));
                 }
             }
@@ -352,9 +203,6 @@ fn parse_xml(xml: &str) -> Result<Element, AuthzError> {
     root.ok_or_else(|| malformed("empty XML (no root element)"))
 }
 
-/// Unescape the five predefined XML entities + numeric character references in a raw span. ANY other
-/// `&name;` reference is REFUSED (defence-in-depth vs entity smuggling, even though DTDs are already
-/// rejected). TOTAL over attacker bytes (no panic on a dangling `&` or a bad numeric ref).
 fn unescape_xml(raw: &str) -> Result<String, AuthzError> {
     if !raw.contains('&') {
         return Ok(raw.to_string());
@@ -394,7 +242,7 @@ fn unescape_xml(raw: &str) -> Result<String, AuthzError> {
             other => {
                 return Err(malformed(format!(
                     "XML: unknown entity reference `&{other};` (only the predefined entities + \
-                     numeric refs are allowed — no entity expansion)"
+                     numeric refs are allowed - no entity expansion)"
                 )));
             }
         }
@@ -404,27 +252,18 @@ fn unescape_xml(raw: &str) -> Result<String, AuthzError> {
     Ok(out)
 }
 
-// ================================================================================================
-// Exclusive XML canonicalization (exc-c14n, WITHOUT comments) — the hand-built subset.
-// ================================================================================================
-
-/// The in-scope namespace bindings (prefix → uri; `""` is the default namespace). The implicit `xml`
-/// prefix is pre-bound and never emitted.
 type NsScope = BTreeMap<String, String>;
 
-/// A fresh resolution scope with the implicit `xml` prefix bound (RFC: always in scope).
 fn base_scope() -> NsScope {
     let mut s = NsScope::new();
     s.insert("xml".to_string(), XML_NS.to_string());
     s
 }
 
-/// Resolve a prefix to its namespace URI in `scope` (`""` ⇒ the default namespace, or no namespace).
 fn resolve<'a>(scope: &'a NsScope, prefix: &str) -> &'a str {
     scope.get(prefix).map(|s| s.as_str()).unwrap_or("")
 }
 
-/// Push a qualified name (`prefix:local`, or just `local`).
 fn push_qname(out: &mut String, prefix: &str, local: &str) {
     if !prefix.is_empty() {
         out.push_str(prefix);
@@ -433,7 +272,6 @@ fn push_qname(out: &mut String, prefix: &str, local: &str) {
     out.push_str(local);
 }
 
-/// Canonical attribute-value escaping (Canonical XML 1.0): `&` `<` `"` and TAB/LF/CR.
 fn push_attr_value(out: &mut String, v: &str) {
     for c in v.chars() {
         match c {
@@ -448,7 +286,6 @@ fn push_attr_value(out: &mut String, v: &str) {
     }
 }
 
-/// Canonical text-node escaping (Canonical XML 1.0): `&` `<` `>` and CR.
 fn push_text(out: &mut String, t: &str) {
     for c in t.chars() {
         match c {
@@ -461,18 +298,6 @@ fn push_text(out: &mut String, t: &str) {
     }
 }
 
-/// **Exclusive XML canonicalization (exc-c14n) of an element subtree, WITHOUT comments.** `inherited`
-/// is the in-scope namespace context from the element's ancestors (for prefix RESOLUTION); `rendered`
-/// is the set of namespace declarations already emitted by output ancestors (so the EXCLUSIVE rule
-/// emits a namespace only where it is visibly utilized and not already output with the same value).
-/// If `skip_signature` is set, any `ds:Signature` descendant subtree is omitted — this realises the
-/// enveloped-signature transform when digesting the referenced assertion.
-///
-/// Coverage (the honest subset): element + attribute + namespace rendering; default-`xmlns` emitted
-/// before prefixed declarations, prefixed declarations sorted by prefix; the implicit `xml` prefix
-/// never emitted; attributes sorted by (namespace-uri, local); canonical escaping. NOT implemented:
-/// the `InclusiveNamespaces` `PrefixList` (we render the exclusive default — empty prefix list),
-/// comments / PIs (rejected at parse).
 fn canonicalize(
     el: &Element,
     inherited: &NsScope,
@@ -480,14 +305,11 @@ fn canonicalize(
     skip_signature: bool,
     out: &mut String,
 ) {
-    // The resolution scope at this element = inherited + this element's own declarations.
     let mut scope = inherited.clone();
     for (p, u) in &el.ns_decls {
         scope.insert(p.clone(), u.clone());
     }
 
-    // The namespaces VISIBLY UTILIZED by this element: the element's own prefix, plus each prefixed
-    // attribute's prefix. (Unprefixed attributes are in no namespace and do not utilise the default.)
     let mut utilized: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     utilized.insert(el.prefix.clone());
     for a in &el.attrs {
@@ -496,36 +318,30 @@ fn canonicalize(
         }
     }
 
-    // The exclusive set of namespace declarations to EMIT on this element.
     let mut to_render: Vec<(String, String)> = Vec::new();
     for p in &utilized {
         if p == "xml" {
-            continue; // the implicit xml prefix is never emitted.
+            continue;
         }
         let uri = resolve(&scope, p).to_string();
         if p.is_empty() && uri.is_empty() {
-            // The element is in no namespace: emit `xmlns=""` ONLY to override a non-empty default
-            // that an output ancestor already rendered.
             if rendered.get("").is_some_and(|u| !u.is_empty()) {
                 to_render.push((String::new(), String::new()));
             }
             continue;
         }
         match rendered.get(p) {
-            Some(r) if r == &uri => {} // already rendered with the same value — exclusive: skip.
+            Some(r) if r == &uri => {}
             _ => to_render.push((p.clone(), uri)),
         }
     }
-    // Namespace declarations: default ("") sorts first, then by prefix (BTree/`sort` gives this).
     to_render.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // The rendered context passed to children = ancestors' rendered + what we emit here.
     let mut child_rendered = rendered.clone();
     for (p, u) in &to_render {
         child_rendered.insert(p.clone(), u.clone());
     }
 
-    // Attributes sorted by (namespace-uri, local-name); unprefixed ⇒ empty uri (sorts first).
     let mut attrs: Vec<&Attr> = el.attrs.iter().collect();
     attrs.sort_by(|a, b| {
         let ua = if a.prefix.is_empty() {
@@ -541,7 +357,6 @@ fn canonicalize(
         ua.cmp(ub).then_with(|| a.local.cmp(&b.local))
     });
 
-    // Open tag.
     out.push('<');
     push_qname(out, &el.prefix, &el.local);
     for (p, u) in &to_render {
@@ -564,32 +379,24 @@ fn canonicalize(
     }
     out.push('>');
 
-    // Children, in document order.
     for child in &el.children {
         match child {
             Node::Text(t) => push_text(out, t),
             Node::Element(c) => {
                 if skip_signature && c.local == "Signature" && child_ns_matches(c, &scope) == DS_NS
                 {
-                    continue; // the enveloped-signature transform removes the Signature subtree.
+                    continue;
                 }
                 canonicalize(c, &scope, &child_rendered, skip_signature, out);
             }
         }
     }
 
-    // Close tag.
     out.push_str("</");
     push_qname(out, &el.prefix, &el.local);
     out.push('>');
 }
 
-// ================================================================================================
-// DOM navigation (namespace-aware), carrying the inherited scope for c14n.
-// ================================================================================================
-
-/// Recursively collect every element matching `(ns, local)`, paired with the INHERITED scope at that
-/// element (the scope WITHOUT the element's own declarations — what [`canonicalize`] expects).
 fn collect_named<'a>(
     el: &'a Element,
     inherited: &NsScope,
@@ -611,8 +418,6 @@ fn collect_named<'a>(
     }
 }
 
-/// Recursively collect every element with an `ID` attribute equal to `id` (across the whole document
-/// — the duplicate-ID / XSW defence reads this).
 fn collect_by_id<'a>(el: &'a Element, id: &str, out: &mut Vec<&'a Element>) {
     if el.id_attr() == Some(id) {
         out.push(el);
@@ -624,8 +429,6 @@ fn collect_by_id<'a>(el: &'a Element, id: &str, out: &mut Vec<&'a Element>) {
     }
 }
 
-/// Direct child elements (namespace-aware match), with the scope resolved at the parent so the caller
-/// can resolve the children's own names.
 fn child_named<'a>(
     parent: &'a Element,
     scope: &NsScope,
@@ -642,9 +445,6 @@ fn child_named<'a>(
     })
 }
 
-/// Resolve a child element's own namespace URI, accounting for namespace declarations made ON the
-/// child itself (e.g. `<ds:Signature xmlns:ds="…">` declares its own prefix). `parent_scope` is the
-/// scope in effect inside the parent.
 fn child_ns_matches(child: &Element, parent_scope: &NsScope) -> String {
     if child.ns_decls.is_empty() {
         return resolve(parent_scope, &child.prefix).to_string();
@@ -656,7 +456,6 @@ fn child_ns_matches(child: &Element, parent_scope: &NsScope) -> String {
     resolve(&s, &child.prefix).to_string()
 }
 
-/// All direct child elements matching `(ns, local)`.
 fn children_named<'a>(
     parent: &'a Element,
     scope: &NsScope,
@@ -677,7 +476,6 @@ fn children_named<'a>(
         .collect()
 }
 
-/// Read the `Algorithm` attribute of an element (the c14n/transform/digest/signature method id).
 fn algorithm(el: &Element) -> Option<&str> {
     el.attrs
         .iter()
@@ -685,12 +483,6 @@ fn algorithm(el: &Element) -> Option<&str> {
         .map(|a| a.value.as_str())
 }
 
-// ================================================================================================
-// Configuration + clock + trust anchor.
-// ================================================================================================
-
-/// The "now" source, in Unix seconds — injected so a test pins the clock across the
-/// `NotBefore`/`NotOnOrAfter` boundary (the production default reads the system clock).
 type NowFn = Arc<dyn Fn() -> i64 + Send + Sync>;
 
 fn system_now() -> i64 {
@@ -700,34 +492,18 @@ fn system_now() -> i64 {
         .unwrap_or(0)
 }
 
-/// The SP (relying-party) configuration the verifier validates a SAML assertion against: the IdP
-/// issuer it trusts, the audience (SP entity id) it IS, the INJECTED IdP signing key(s) (the trust
-/// root — the document's `KeyInfo` is never trusted), the SAML attribute names the tenant/region are
-/// read from, the fallback region, and the clock-skew leeway.
 #[derive(Clone)]
 pub struct SamlConfig {
-    /// The exact `<saml:Issuer>` the assertion must carry (the configured IdP entity id).
     pub issuer: String,
-    /// The audience this SP IS — `<saml:Audience>` MUST contain it.
     pub sp_entity_id: String,
-    /// The INJECTED IdP signing public key(s) — the trust root. The signature must verify against one
-    /// of these; the document's embedded cert / `KeyInfo` is NEVER trusted. Multiple keys support
-    /// rotation.
     pub trust_anchors: Vec<JwkKey>,
-    /// The SAML `<Attribute Name=…>` the TENANT is read from (default `tenant`).
     pub tenant_attr: String,
-    /// The SAML `<Attribute Name=…>` the REGION is read from (default `region`).
     pub region_attr: String,
-    /// The region to use if the assertion carries no region attribute (the configured IdP-binding
-    /// region). If `None` and no region attribute is present, the assertion is refused.
     pub region_default: Option<String>,
-    /// Clock-skew leeway, in seconds, applied to `NotBefore`/`NotOnOrAfter` (default 60).
     pub leeway_secs: i64,
 }
 
 impl SamlConfig {
-    /// A config for `issuer` / `sp_entity_id` with the conventional defaults (`tenant`/`region`
-    /// attributes, no fallback region, 60s leeway) and the injected `trust_anchors`.
     pub fn new(
         issuer: impl Into<String>,
         sp_entity_id: impl Into<String>,
@@ -744,7 +520,6 @@ impl SamlConfig {
         }
     }
 
-    /// Override the tenant/region attribute names (builder form).
     pub fn with_attrs(
         mut self,
         tenant_attr: impl Into<String>,
@@ -755,27 +530,19 @@ impl SamlConfig {
         self
     }
 
-    /// Set the fallback region (the configured IdP-binding region) used when the assertion carries no
-    /// region attribute (builder form).
     pub fn with_region_default(mut self, region: impl Into<String>) -> SamlConfig {
         self.region_default = Some(region.into());
         self
     }
 }
 
-/// Per-login SP request context. This must come from the server-side authentication transaction,
-/// never from the SAML response itself: it binds the response to the ACS endpoint and the exact
-/// AuthnRequest that initiated this login.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SamlRequestBinding {
-    /// The assertion consumer service URL this login is returning to.
     pub acs_url: String,
-    /// The server-generated AuthnRequest ID expected in `InResponseTo`.
     pub request_id: String,
 }
 
 impl SamlRequestBinding {
-    /// Build one request binding from server-held login transaction state.
     pub fn new(
         acs_url: impl Into<String>,
         request_id: impl Into<String>,
@@ -787,22 +554,12 @@ impl SamlRequestBinding {
     }
 }
 
-/// The signature method (pinned to SHA-256; SHA-1 is rejected at parse of the `SignatureMethod`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SigMethod {
     RsaSha256,
     EcdsaSha256,
 }
 
-// ================================================================================================
-// Signature math — vetted primitives only (the SAME ones the OIDC path uses). No hand-rolled crypto.
-// ================================================================================================
-
-/// Verify a SAML XML-DSig signature over `signed_info_c14n` with the INJECTED trust-anchor key, using
-/// the vetted crate for the key family. The `SignatureMethod` MUST match the anchor key family (an
-/// RSA anchor verifies only `rsa-sha256`; an EC anchor only `ecdsa-sha256` — the alg-confusion
-/// defence). Ed25519 anchors are not part of XML-DSig here and are refused. NO signature math is
-/// hand-rolled.
 fn verify_xmldsig(
     key: &JwkKey,
     method: SigMethod,
@@ -830,8 +587,6 @@ fn verify_xmldsig(
                     "invalid P-256 trust-anchor coordinates (expected 32 bytes each)",
                 ));
             }
-            // XML-DSig ECDSA SignatureValue is the IEEE-P1363 fixed `r‖s` (RFC 4051) — exactly what
-            // ring's *_FIXED verifier expects. The SEC1 uncompressed point is `0x04 ‖ x ‖ y`.
             let mut point = Vec::with_capacity(65);
             point.push(0x04);
             point.extend_from_slice(x);
@@ -840,8 +595,6 @@ fn verify_xmldsig(
                 .verify(signed_info_c14n, sig)
                 .map_err(|_| refuse("XML-DSig ecdsa-sha256 signature verification failed"))
         }
-        // The SignatureMethod does not match the anchor key family (the alg-confusion defence), or an
-        // unsupported anchor family (Ed25519) was configured.
         _ => Err(refuse(
             "signature method does not match the configured trust-anchor key family \
              (alg-confusion defence)",
@@ -849,23 +602,12 @@ fn verify_xmldsig(
     }
 }
 
-/// Decode a base64 blob that may contain XML whitespace (newlines/indentation around DigestValue /
-/// SignatureValue). Whitespace is stripped before decoding. Malformed base64 is a loud refusal.
 fn b64_decode_ws(s: &str) -> Result<Vec<u8>, AuthzError> {
     let compact: String = s.chars().filter(|c| !c.is_ascii_whitespace()).collect();
     B64.decode(compact.as_bytes())
         .map_err(|e| malformed(format!("malformed base64 in signature/digest: {e}")))
 }
 
-// ================================================================================================
-// The verifier.
-// ================================================================================================
-
-/// **The REAL SAML 2.0 XML-DSig credential verifier (MR-010b).** Verifies the enveloped signature on
-/// a SAML assertion against the INJECTED IdP key, defends against the XSW family, validates the SAML
-/// conditions, and resolves the tenant/region/subject from the signed+referenced assertion — or
-/// refuses loudly. `verify` is TOTAL over attacker bytes. Plugs into the existing
-/// [`CredentialVerifier`] seam; the [`crate::authenticate`] resolution + telemetry body is unchanged.
 #[derive(Clone)]
 pub struct SamlVerifier {
     config: SamlConfig,
@@ -875,9 +617,6 @@ pub struct SamlVerifier {
 }
 
 impl SamlVerifier {
-    /// Build the verifier over an SP config (with injected trust anchors), an explicit replay guard,
-    /// and the system clock. Wire it as the `saml`-scheme verifier via
-    /// `SchemeDispatchVerifier::route(scheme::SAML, …)`.
     pub fn new(config: SamlConfig, replay: ReplayGuard) -> SamlVerifier {
         SamlVerifier {
             config,
@@ -887,19 +626,16 @@ impl SamlVerifier {
         }
     }
 
-    /// Bind verification to the server-side login transaction that issued the AuthnRequest.
     pub fn with_request_binding(mut self, binding: SamlRequestBinding) -> SamlVerifier {
         self.request_binding = Some(binding);
         self
     }
 
-    /// Build with an injected clock (Unix seconds) — the deterministic-test / drill seam.
     pub fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> SamlVerifier {
         self.now = Arc::new(now);
         self
     }
 
-    /// The configured replay guard, which can be cloned into another verifier handle.
     pub fn replay_guard(&self) -> &ReplayGuard {
         &self.replay
     }
@@ -908,9 +644,6 @@ impl SamlVerifier {
         (self.now)()
     }
 
-    /// Parse a SAML `xs:dateTime` (`NotBefore`/`NotOnOrAfter`) to a Unix-second INSTANT. Parsed with
-    /// chrono and compared by instant — NEVER lexically (the MR-008 fail-open lesson). A non-parseable
-    /// timestamp is a loud refusal (fail-CLOSED), never coerced.
     fn instant(value: &str) -> Result<i64, AuthzError> {
         chrono::DateTime::parse_from_rfc3339(value.trim())
             .map(|dt| dt.timestamp())
@@ -920,7 +653,6 @@ impl SamlVerifier {
 
 impl CredentialVerifier for SamlVerifier {
     fn verify(&self, credential: &Credential) -> myelin_identity::Result<VerifiedAssertion> {
-        // This verifier owns ONLY the saml scheme; another scheme is a wiring error.
         if credential.scheme != scheme::SAML {
             return Err(malformed(format!(
                 "SamlVerifier received a `{}` credential (expected `saml`)",
@@ -929,7 +661,7 @@ impl CredentialVerifier for SamlVerifier {
         }
         let request_binding = self.request_binding.as_ref().ok_or_else(|| {
             refuse(
-                "SAML request binding is absent — verification requires the server-held ACS URL \
+                "SAML request binding is absent - verification requires the server-held ACS URL \
                  and AuthnRequest ID",
             )
         })?;
@@ -939,7 +671,6 @@ impl CredentialVerifier for SamlVerifier {
             ));
         }
 
-        // (1) PARSE — TOTAL over attacker bytes; DTD/entity/comment/PI refused (XXE / comment-inj).
         let root = parse_xml(credential.material.trim())?;
         let base = base_scope();
         let mut root_scope = base.clone();
@@ -952,8 +683,6 @@ impl CredentialVerifier for SamlVerifier {
             ));
         }
 
-        // (2) XSW — at most ONE Assertion in the whole document. A forged sibling/wrapped/relocated
-        //     assertion (the classic XSW shapes) means >1 here → refuse before any crypto.
         let mut assertions: Vec<(&Element, NsScope)> = Vec::new();
         collect_named(&root, &base, SAML_NS, "Assertion", &mut assertions);
         if assertions.is_empty() {
@@ -961,16 +690,13 @@ impl CredentialVerifier for SamlVerifier {
         }
         if assertions.len() > 1 {
             return Err(refuse(format!(
-                "XSW defence: {} <saml:Assertion> elements present — exactly one is required (a \
+                "XSW defence: {} <saml:Assertion> elements present - exactly one is required (a \
                  wrapped/forged assertion was injected)",
                 assertions.len()
             )));
         }
         let (assertion, assertion_inherited) = assertions.remove(0);
 
-        // (3) XSW — exactly ONE Signature in the whole document, and it MUST be the enveloped direct
-        //     child of the one assertion (schema position). A Signature anywhere else (or a second
-        //     one) is an XSW shape.
         let mut signatures: Vec<(&Element, NsScope)> = Vec::new();
         collect_named(&root, &base, DS_NS, "Signature", &mut signatures);
         if signatures.len() != 1 {
@@ -980,7 +706,6 @@ impl CredentialVerifier for SamlVerifier {
             )));
         }
         let (signature, sig_inherited) = signatures.remove(0);
-        // The signature must be a DIRECT child of the one assertion (enveloped position).
         let sig_is_enveloped_child =
             child_named(assertion, &assertion_inherited, DS_NS, "Signature")
                 .is_some_and(|c| std::ptr::eq(c as *const Element, signature as *const Element));
@@ -991,8 +716,6 @@ impl CredentialVerifier for SamlVerifier {
             ));
         }
 
-        // (4) Parse SignedInfo: c14n method (must be exclusive, non-comment), signature method (pinned
-        //     SHA-256 — SHA-1 refused), and exactly one Reference.
         let signed_info = child_named(signature, &sig_inherited, DS_NS, "SignedInfo")
             .ok_or_else(|| refuse("Signature has no SignedInfo"))?;
         let signed_info_scope = {
@@ -1033,7 +756,7 @@ impl CredentialVerifier for SamlVerifier {
             ECDSA_SHA256 => SigMethod::EcdsaSha256,
             other => return Err(refuse(format!(
                 "unsupported/weak SignatureMethod `{other}` (only rsa-sha256 / ecdsa-sha256 are \
-                     accepted — SHA-1 is rejected)"
+                     accepted - SHA-1 is rejected)"
             ))),
         };
 
@@ -1053,10 +776,6 @@ impl CredentialVerifier for SamlVerifier {
             s
         };
 
-        // (5) XSW — the Reference URI `#id` pins the signed element. Require a same-document fragment
-        //     reference (an empty/whole-doc or detached/external reference is refused), exactly one
-        //     element with that ID in the WHOLE document (duplicate-ID → refuse), and that element
-        //     MUST be the single assertion we read claims from.
         let uri = reference
             .attrs
             .iter()
@@ -1066,7 +785,7 @@ impl CredentialVerifier for SamlVerifier {
         let ref_id = uri.strip_prefix('#').ok_or_else(|| {
             refuse(format!(
                 "Reference URI `{uri}` is not a same-document `#id` fragment (detached/whole-document \
-                 references are refused — XSW defence)"
+                 references are refused - XSW defence)"
             ))
         })?;
         if ref_id.is_empty() {
@@ -1076,7 +795,7 @@ impl CredentialVerifier for SamlVerifier {
         collect_by_id(&root, ref_id, &mut by_id);
         if by_id.len() != 1 {
             return Err(refuse(format!(
-                "XSW defence: {} elements carry ID `{ref_id}` — the signed-element reference must be \
+                "XSW defence: {} elements carry ID `{ref_id}` - the signed-element reference must be \
                  unique (duplicate-ID wrapping)",
                 by_id.len()
             )));
@@ -1088,9 +807,6 @@ impl CredentialVerifier for SamlVerifier {
             ));
         }
 
-        // (6) Transforms — must be exactly {enveloped-signature, exclusive-c14n}; any other transform
-        //     (XPath / XSLT / non-exclusive c14n) is refused (a permissive transform set is an XSW /
-        //     digest-bypass vector).
         let transforms = child_named(reference, &reference_scope, DS_NS, "Transforms");
         let transform_algs: Vec<&str> = transforms
             .map(|t| {
@@ -1124,9 +840,6 @@ impl CredentialVerifier for SamlVerifier {
             }
         }
 
-        // (7) DigestMethod must be SHA-256 (SHA-1 refused). Verify the Reference digest: canonicalize
-        //     the referenced assertion with the Signature removed (the enveloped transform), SHA-256
-        //     it, and compare to DigestValue.
         let digest_method = child_named(reference, &reference_scope, DS_NS, "DigestMethod")
             .and_then(algorithm)
             .ok_or_else(|| refuse("Reference has no DigestMethod"))?;
@@ -1145,7 +858,7 @@ impl CredentialVerifier for SamlVerifier {
             assertion,
             &assertion_inherited,
             &NsScope::new(),
-            true, // enveloped-signature transform: drop the Signature subtree.
+            true,
             &mut ref_c14n,
         );
         let actual_digest = {
@@ -1159,8 +872,6 @@ impl CredentialVerifier for SamlVerifier {
             ));
         }
 
-        // (8) SIGNATURE — canonicalize SignedInfo (exclusive c14n) and verify the SignatureValue
-        //     against the INJECTED trust anchor(s). The document's KeyInfo is NEVER consulted.
         let mut signed_info_c14n = String::new();
         canonicalize(
             signed_info,
@@ -1176,7 +887,7 @@ impl CredentialVerifier for SamlVerifier {
 
         if self.config.trust_anchors.is_empty() {
             return Err(refuse(
-                "no IdP trust anchor configured — cannot verify the SAML signature (fail-closed)",
+                "no IdP trust anchor configured - cannot verify the SAML signature (fail-closed)",
             ));
         }
         let mut verified = false;
@@ -1196,9 +907,6 @@ impl CredentialVerifier for SamlVerifier {
             }));
         }
 
-        // ── The signature + digest are proven; from here every fact comes from the SIGNED assertion ──
-
-        // (9) Issuer — must equal the configured IdP issuer.
         let issuer = child_named(assertion, &assertion_inherited, SAML_NS, "Issuer")
             .map(|e| e.text())
             .map(|s| s.trim().to_string())
@@ -1211,8 +919,6 @@ impl CredentialVerifier for SamlVerifier {
             )));
         }
 
-        // (10) Conditions — NotBefore/NotOnOrAfter parsed to INSTANTS (with leeway); AudienceRestriction
-        //      must list this SP. (Schema position: Conditions is a direct child of the assertion.)
         let now = self.now();
         let leeway = self.config.leeway_secs;
         let assertion_expiry = if let Some(conditions) =
@@ -1248,7 +954,6 @@ impl CredentialVerifier for SamlVerifier {
                     "assertion expired: NotOnOrAfter instant {na} (+{leeway}s) <= now {now}"
                 )));
             }
-            // AudienceRestriction/Audience — at least one Audience must equal this SP.
             let mut audiences: Vec<String> = Vec::new();
             for ar in children_named(conditions, &cond_scope, SAML_NS, "AudienceRestriction") {
                 let ar_scope = {
@@ -1281,9 +986,6 @@ impl CredentialVerifier for SamlVerifier {
             ));
         };
 
-        // (11) Subject / NameID — the subject key. Schema position: Subject is a direct child of the
-        //      assertion, NameID a direct child of Subject. (No comment can split the NameID text —
-        //      comments were rejected at parse.)
         let subject = child_named(assertion, &assertion_inherited, SAML_NS, "Subject")
             .ok_or_else(|| refuse("signed assertion has no <saml:Subject>"))?;
         let subject_scope = {
@@ -1299,9 +1001,6 @@ impl CredentialVerifier for SamlVerifier {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| refuse("signed assertion Subject has no (non-empty) <saml:NameID>"))?;
 
-        // (12) Tenant / region — from the SIGNED assertion's AttributeStatement (the trust root, ID-3),
-        //      never from any caller path / wrapper. Region falls back to the configured IdP-binding
-        //      region if the assertion carries none.
         let attrs = saml_attributes(assertion, &assertion_inherited);
         let tenant = attrs
             .get(&self.config.tenant_attr)
@@ -1326,10 +1025,6 @@ impl CredentialVerifier for SamlVerifier {
                 ))
             })?;
 
-        // (13) REQUEST/ACS BINDING. The outer Response routing fields are checked for protocol
-        // correctness, then the same values are required inside the SIGNED bearer
-        // SubjectConfirmationData. The signed copy is load-bearing: an attacker cannot redirect a
-        // captured assertion to another ACS or attach it to another AuthnRequest.
         let response_attr = |name: &str| {
             root.attrs
                 .iter()
@@ -1402,9 +1097,6 @@ impl CredentialVerifier for SamlVerifier {
             ));
         }
 
-        // (14) REPLAY — consume the assertion ID through the tenant-scoped TTL backend. Done LAST so
-        //      a refused assertion does not burn the ID; retention ends with the earlier signed
-        //      assertion or bearer-confirmation window.
         let replay_namespace = serde_json::json!([
             "saml",
             self.config.issuer,
@@ -1427,7 +1119,6 @@ impl CredentialVerifier for SamlVerifier {
             ));
         }
 
-        // (15) THE TRUST-ROOTED ASSERTION — tenant/region/subject from the verified SIGNED assertion.
         Ok(VerifiedAssertion {
             tenant: TenantId(tenant),
             region: Region(region),
@@ -1438,9 +1129,6 @@ impl CredentialVerifier for SamlVerifier {
     }
 }
 
-/// Collect the SAML `<AttributeStatement>/<Attribute Name=…>` → first `<AttributeValue>` text map of
-/// an assertion (used for the tenant/region trust-rooted facts). Only direct AttributeStatements of
-/// the assertion are read (schema position).
 fn saml_attributes(assertion: &Element, inherited: &NsScope) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let a_scope = {
@@ -1479,11 +1167,6 @@ fn saml_attributes(assertion: &Element, inherited: &NsScope) -> BTreeMap<String,
 
 #[cfg(test)]
 mod tests {
-    // The MR-010b SAML XML-DSig corpus: REAL signed assertions (a test IdP keypair mints genuine
-    // RSA-SHA256 / ECDSA-SHA256 signatures over real exclusive-c14n bytes), plus the full XSW + forgery
-    // negative corpus — each asserted REFUSED. The signer reuses the verifier's OWN `parse_xml` +
-    // `canonicalize`, so the positive cases are a real crypto round-trip and the negatives are REAL
-    // attacks (tampering breaks a real digest/signature; XSW shapes are real wrapped documents).
 
     use super::*;
     use crate::authenticate::{scheme, CredentialVerifier, StructuralVerifier};
@@ -1494,15 +1177,12 @@ mod tests {
     use std::sync::Arc;
 
     const NOW: i64 = 1_700_000_000;
-    // A validity window comfortably around NOW (RFC3339 instants — parsed, not lexical-compared).
-    const NB: &str = "2023-11-14T20:00:00Z"; // ≈ NOW - ~1300s
-    const NA: &str = "2023-11-15T20:00:00Z"; // ≈ NOW + a day
+    const NB: &str = "2023-11-14T20:00:00Z";
+    const NA: &str = "2023-11-15T20:00:00Z";
     const ISSUER: &str = "https://idp.example.com/saml";
     const SP: &str = "https://myelin.example.com/sp";
     const ACS: &str = "https://myelin.example.com/v1/auth/saml/acs";
     const REQUEST_ID: &str = "_authn_request_1";
-
-    // ── Test IdP keypairs (the verifier only ever sees the PUBLIC half via the injected trust anchor) ──
 
     struct RsaSigner {
         priv_key: rsa::RsaPrivateKey,
@@ -1565,8 +1245,6 @@ mod tests {
                 .to_vec()
         }
     }
-
-    // ── The signed-document builder (mints a genuine signature via the verifier's own c14n) ───────────
 
     #[allow(clippy::too_many_arguments)]
     fn build_doc(
@@ -1637,8 +1315,6 @@ mod tests {
             env = ENVELOPED,
             sha = SHA256_DIGEST,
         );
-        // The KeyInfo carries an ATTACKER-CONTROLLED cert string — the verifier must IGNORE it (the
-        // trust root is the injected anchor, never the document's KeyInfo).
         let signature = format!(
             "<ds:Signature xmlns:ds=\"{ds}\">{si}<ds:SignatureValue>@@SIG@@</ds:SignatureValue>\
              <ds:KeyInfo><ds:X509Data><ds:X509Certificate>ATTACKER-CONTROLLED-IGNORED</ds:X509Certificate>\
@@ -1689,13 +1365,9 @@ mod tests {
         finalize(doc, sign)
     }
 
-    /// Insert the real digest (over the enveloped-c14n assertion) and the real signature (over the c14n
-    /// SignedInfo), computed with the verifier's OWN code — so the signed bytes EXACTLY match what the
-    /// verifier canonicalizes.
     fn finalize(doc: String, sign: &dyn Fn(&[u8]) -> Vec<u8>) -> String {
         use sha2::{Digest, Sha256};
 
-        // (1) Digest over the assertion with the Signature removed (the enveloped transform).
         let parsed = parse_xml(&doc).expect("builder doc parses");
         let mut a = Vec::new();
         collect_named(&parsed, &base_scope(), SAML_NS, "Assertion", &mut a);
@@ -1705,7 +1377,6 @@ mod tests {
         let digest = Sha256::digest(c.as_bytes()).to_vec();
         let doc = doc.replace("@@DIGEST@@", &TB64.encode(&digest));
 
-        // (2) Signature over the canonicalized SignedInfo (now carrying the real digest).
         let parsed = parse_xml(&doc).expect("re-parse with digest");
         let mut si = Vec::new();
         collect_named(&parsed, &base_scope(), DS_NS, "SignedInfo", &mut si);
@@ -1733,8 +1404,6 @@ mod tests {
             .with_clock(|| NOW)
     }
 
-    /// A standard, correctly-signed RSA-SHA256 document for tenant `acme` / region `eu-west` / NameID
-    /// `alice@acme.example`, paired with the verifier whose trust anchor is the signing key.
     fn rsa_signed(id: &str) -> (SamlVerifier, String) {
         let signer = RsaSigner::generate();
         let v = verifier(vec![signer.jwk()]);
@@ -1752,11 +1421,6 @@ mod tests {
         );
         (v, doc)
     }
-
-    // ════════════════════════════════════════════════════════════════════════════════════════════════
-    // POSITIVE corpus — a correctly-signed RSA-SHA256 (and ECDSA-SHA256) assertion VERIFIES and yields
-    // the right tenant/region/subject(NameID) from the SIGNED assertion.
-    // ════════════════════════════════════════════════════════════════════════════════════════════════
 
     #[test]
     fn positive_rsa_sha256_verifies_and_yields_trust_rooted_assertion() {
@@ -1795,7 +1459,6 @@ mod tests {
 
     #[test]
     fn positive_region_falls_back_to_configured_idp_binding() {
-        // An assertion carrying NO region attribute resolves region from the configured IdP binding.
         let signer = RsaSigner::generate();
         let v = SamlVerifier::new(
             config(vec![signer.jwk()]).with_region_default("ap-south"),
@@ -1939,12 +1602,6 @@ mod tests {
         );
     }
 
-    // ════════════════════════════════════════════════════════════════════════════════════════════════
-    // XSW corpus — the #1 SAML auth-bypass class. Each forgery uses a REAL signed assertion + a real XSW
-    // shape, asserted REFUSED.
-    // ════════════════════════════════════════════════════════════════════════════════════════════════
-
-    /// A forged assertion (attacker tenant `globex`) — unsigned — to splice into XSW shapes.
     fn forged_assertion(id: &str) -> String {
         format!(
             "<saml:Assertion xmlns:saml=\"{SAML_NS}\" ID=\"{id}\" Version=\"2.0\" IssueInstant=\"{NB}\">\
@@ -1960,7 +1617,6 @@ mod tests {
         )
     }
 
-    /// XSW-1: a forged assertion as a SIBLING of the original signed assertion. Two assertions → refused.
     #[test]
     fn xsw_1_forged_sibling_assertion_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_1");
@@ -1975,11 +1631,9 @@ mod tests {
         );
     }
 
-    /// XSW-2: the forged assertion WRAPS the signed one. Two assertions present → refused.
     #[test]
     fn xsw_2_forged_assertion_wrapping_the_signed_one_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_1");
-        // Pull the signed assertion out and wrap it inside a forged assertion.
         let start = doc.find("<saml:Assertion ").unwrap();
         let end = doc.find("</saml:Assertion>").unwrap() + "</saml:Assertion>".len();
         let signed = &doc[start..end];
@@ -2002,8 +1656,6 @@ mod tests {
         );
     }
 
-    /// XSW-3: the signed assertion is moved into a `<samlp:Extensions>` wrapper while a forged assertion
-    /// takes the asserted position. Two assertions → refused.
     #[test]
     fn xsw_3_signed_moved_into_extensions_forged_in_position_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_1");
@@ -2024,13 +1676,9 @@ mod tests {
         );
     }
 
-    /// XSW-4: DUPLICATE ID — a non-assertion element carries the SAME ID as the signed assertion, so the
-    /// Reference `#id` resolves to two elements. Refused by the duplicate-ID guard (before any digest).
     #[test]
     fn xsw_4_duplicate_id_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_1");
-        // A second element (NOT an Assertion, so the single-assertion guard does not fire first) with the
-        // SAME ID as the signed assertion.
         let attack = doc.replace(
             "</samlp:Response>",
             "<samlp:Extensions ID=\"_assertion_1\"></samlp:Extensions></samlp:Response>",
@@ -2042,9 +1690,6 @@ mod tests {
         );
     }
 
-    /// XSW-5: the Reference is RE-POINTED at a different (non-assertion) element that the attacker adds —
-    /// so the signature references element A while claims would be read from the assertion. Refused
-    /// because the signed Reference does not point at the assertion the claims come from.
     #[test]
     fn xsw_5_reference_reassigned_away_from_assertion_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_1");
@@ -2061,15 +1706,12 @@ mod tests {
         );
     }
 
-    /// XSW (position): the `<ds:Signature>` is moved OUT of the assertion to be a child of the Response
-    /// (detached). Refused by the enveloped schema-position guard.
     #[test]
     fn xsw_signature_not_enveloped_child_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_1");
         let start = doc.find("<ds:Signature ").unwrap();
         let end = doc.find("</ds:Signature>").unwrap() + "</ds:Signature>".len();
         let sig = doc[start..end].to_string();
-        // Remove the signature from the assertion, re-attach it as a child of the Response.
         let without = format!("{}{}", &doc[..start], &doc[end..]);
         let attack = without.replace("</saml:Assertion>", &format!("</saml:Assertion>{sig}"));
         let err = v.verify(&cred(attack)).unwrap_err();
@@ -2079,12 +1721,6 @@ mod tests {
         );
     }
 
-    // ════════════════════════════════════════════════════════════════════════════════════════════════
-    // Other forgery / failure corpus.
-    // ════════════════════════════════════════════════════════════════════════════════════════════════
-
-    /// TAMPERED — the tenant claim is edited AFTER signing (`acme`→`globex`). The canonicalized assertion
-    /// no longer matches the DigestValue → refused. The load-bearing IDOR/forgery case.
     #[test]
     fn tampered_tenant_after_signing_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_1");
@@ -2099,14 +1735,10 @@ mod tests {
         );
     }
 
-    /// NON-ANCHORED CERT — the assertion is signed by an ATTACKER key (whose cert the attacker also put
-    /// in KeyInfo), but the configured trust anchor is the VICTIM IdP key. The signature must fail
-    /// against the anchor (the document's KeyInfo is never trusted).
     #[test]
     fn signature_by_non_anchored_key_is_rejected() {
         let victim = RsaSigner::generate();
         let attacker = RsaSigner::generate();
-        // Anchor = the victim IdP key; document signed by the attacker.
         let v = verifier(vec![victim.jwk()]);
         let doc = build_doc(
             "_assertion_1",
@@ -2127,8 +1759,6 @@ mod tests {
         );
     }
 
-    /// SHA-1 — a `rsa-sha1` SignatureMethod is refused at parse (the SHA-1 downgrade defence), regardless
-    /// of the signature bytes.
     #[test]
     fn sha1_signature_method_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2152,7 +1782,6 @@ mod tests {
         );
     }
 
-    /// UNSIGNED — an assertion with NO signature at all. Refused (zero signatures).
     #[test]
     fn unsigned_assertion_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2169,7 +1798,6 @@ mod tests {
         );
     }
 
-    /// EXPIRED — NotOnOrAfter in the past beyond leeway. Parsed to an instant, refused.
     #[test]
     fn expired_assertion_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2193,8 +1821,6 @@ mod tests {
         );
     }
 
-    /// UNBOUNDED — a signed assertion without a finite expiry cannot have safely bounded replay
-    /// retention, so it is refused.
     #[test]
     fn assertion_without_not_on_or_after_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2218,7 +1844,6 @@ mod tests {
         );
     }
 
-    /// NOT-YET-VALID — NotBefore in the future beyond leeway. Refused.
     #[test]
     fn not_yet_valid_assertion_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2242,7 +1867,6 @@ mod tests {
         );
     }
 
-    /// WRONG AUDIENCE — the assertion is for some other SP. Refused.
     #[test]
     fn wrong_audience_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2266,7 +1890,6 @@ mod tests {
         );
     }
 
-    /// WRONG ISSUER — the assertion Issuer is not the configured IdP. Refused.
     #[test]
     fn wrong_issuer_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2290,7 +1913,6 @@ mod tests {
         );
     }
 
-    /// REPLAY — the SAME assertion presented twice. First verifies; the second (same ID) refused.
     #[test]
     fn replayed_assertion_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_replay");
@@ -2303,8 +1925,6 @@ mod tests {
         );
     }
 
-    /// COMMENT-INJECTION in NameID — the `;;`/c14n-comment trick: a comment node splits the NameID text.
-    /// Comments are rejected at parse, so the document is refused outright.
     #[test]
     fn nameid_comment_injection_is_rejected() {
         let (v, doc) = rsa_signed("_assertion_1");
@@ -2319,7 +1939,6 @@ mod tests {
         );
     }
 
-    /// XXE — an external-entity DOCTYPE. Refused at parse (no entity processing).
     #[test]
     fn xxe_external_entity_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2337,7 +1956,6 @@ mod tests {
         );
     }
 
-    /// BILLION LAUGHS — nested entity-expansion DOCTYPE. Refused at parse (no entity expansion).
     #[test]
     fn billion_laughs_entity_expansion_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2355,8 +1973,6 @@ mod tests {
         );
     }
 
-    /// MALFORMED / GARBAGE + FUZZ — `verify` is TOTAL over attacker bytes: every garbage input is a loud
-    /// refusal, NEVER a panic.
     #[test]
     fn malformed_and_fuzz_inputs_are_refused_not_panicking() {
         let signer = RsaSigner::generate();
@@ -2372,7 +1988,7 @@ mod tests {
             "<a>&#xZZZ;</a>".into(),
             "<a>&".into(),
             "<saml:Assertion".into(),
-            "<root>".to_string() + &"<x>".repeat(5000), // deep nesting (no stack-busting panic / total)
+            "<root>".to_string() + &"<x>".repeat(5000),
             "\u{0}\u{1}\u{2}garbage".into(),
             "<a xmlns:ds=\"\">".into(),
             "<ds:Signature></ds:Signature>".into(),
@@ -2387,11 +2003,6 @@ mod tests {
         }
     }
 
-    /// DEEP NESTING (DoS) — a WELL-FORMED, matched-close-tag document nested far deeper than the
-    /// bound must be REFUSED at parse with the depth error, NEVER crash. This is the case the in-tree
-    /// fuzz corpus missed (it used UNCLOSED nesting, which stays in the parser's flat Vec); a balanced
-    /// document is what overflows the recursive DOM traversal / canonicalize / Drop. 5000 deep is the
-    /// verifier's prior SIGABRT crash point. `verify` must stay TOTAL over attacker bytes.
     #[test]
     fn deeply_nested_well_formed_document_is_refused_not_crashing() {
         let signer = RsaSigner::generate();
@@ -2409,7 +2020,6 @@ mod tests {
             matches!(&err, AuthzError::BadRequest(m) if m.contains("nesting too deep")),
             "a deeply-nested well-formed document must be refused with the depth error, got {err:?}"
         );
-        // And a normal shallow assertion still verifies (the bound never bites a real assertion).
         let (v2, ok) = rsa_signed("_assertion_depth_ok");
         assert!(
             v2.verify(&cred(ok)).is_ok(),
@@ -2417,8 +2027,6 @@ mod tests {
         );
     }
 
-    /// EMPTY / MISSING tenant — a verified assertion that carries no tenant attribute is refused (we never
-    /// fabricate a tenant — the tenant is the trust root, ID-3).
     #[test]
     fn missing_tenant_attribute_is_rejected() {
         let signer = RsaSigner::generate();
@@ -2450,26 +2058,18 @@ mod tests {
         );
     }
 
-    // ── The dispatch seam ────────────────────────────────────────────────────────────────────────────
-
-    /// The dispatcher routes the SAML scheme to the REAL [`SamlVerifier`]; a forged (unsigned) SAML
-    /// credential hits the real verifier and is refused, NOT silently accepted by the floor fallback.
-    /// (Construction of the floor `StructuralVerifier` here is `#[cfg(test)]`, so the production-graph
-    /// scanner admits it.)
     #[test]
     fn dispatch_routes_saml_to_real_verifier() {
         let (v, doc) = rsa_signed("_assertion_dispatch");
         let dispatch = SchemeDispatchVerifier::new(Arc::new(StructuralVerifier::new()))
             .route(scheme::SAML, Arc::new(v));
 
-        // A correctly-signed SAML credential verifies through the real crypto verifier.
         let a = dispatch
             .verify(&cred(doc))
             .expect("real SAML verifies via the dispatcher");
         assert_eq!(a.tenant, TenantId("acme".into()));
         assert_eq!(a.scheme, scheme::SAML);
 
-        // A forged (unsigned) SAML credential hits the real verifier and is refused (not the floor).
         let signer = RsaSigner::generate();
         let dispatch2 = SchemeDispatchVerifier::new(Arc::new(StructuralVerifier::new()))
             .route(scheme::SAML, Arc::new(verifier(vec![signer.jwk()])));
@@ -2483,8 +2083,6 @@ mod tests {
         );
     }
 
-    /// A shared replay guard across verifier handles: an assertion consumed via one handle is a replay on
-    /// another sharing the guard.
     #[test]
     fn shared_replay_guard_blocks_cross_handle_replay() {
         let signer = RsaSigner::generate();

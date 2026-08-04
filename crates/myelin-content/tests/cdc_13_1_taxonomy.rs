@@ -1,12 +1,3 @@
-//! CDC pair for contract-index row 13.1 — the frozen `myelin-content` taxonomy (X-2/OQ-B).
-//!
-//! PROVIDER side: Knowledge (this crate) freezes the complete 15-variant `Block`
-//! taxonomy + the markdown-subset inline grammar + the three structured nodes
-//! (mention/artifact_ref/embed). CONSUMER side: Chat / Issues / Search declare strict
-//! SUBSETS — they compile against the SAME `Block`/`InlineNode` types and never redefine
-//! or add a node type (X-2). This file carries BOTH sides so the contract-coverage
-//! scanner (P-037) admits row 13.1 as a real provider+consumer pair.
-
 use myelin_content::{
     parse_inline, serialize_inline, Block, CalloutTone, Cell, Column, EmbedDisplay, HeadingLevel,
     Inline, InlineNode, ListItem, TaskItem,
@@ -16,11 +7,6 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_query::{FieldId, ViewSpec};
 use myelin_tenancy::TenantId;
 
-// ── PROVIDER side (13.1): Knowledge freezes the complete taxonomy ──────────────────
-
-/// The provider exposes the FULL frozen 15-variant block set + the three structured
-/// inline nodes. Building one of each pins the provider surface; Chat/Issues cannot add
-/// a 16th variant because the enum is closed here.
 fn provider_full_taxonomy() -> Vec<Block> {
     let p = Principal::stub(
         PrincipalId("alice".into()),
@@ -95,11 +81,6 @@ fn provider_full_taxonomy() -> Vec<Block> {
     ]
 }
 
-// ── CONSUMER side (X-2): Chat / Issues declare strict subsets ──────────────────────
-
-/// A consumer (Chat) declares a SUBSET: it builds only the variants it supports, from the
-/// SAME frozen types. `db_view` / `sync_block` are excluded by Chat (Knowledge-only, X-2);
-/// the consumer simply never constructs them. The point: no redefinition, no new node.
 fn chat_subset_consumer() -> Vec<Block> {
     vec![
         Block::Paragraph {
@@ -108,7 +89,7 @@ fn chat_subset_consumer() -> Vec<Block> {
         Block::Heading {
             level: HeadingLevel::new(3).unwrap(),
             inline: Inline::default(),
-        }, // chat caps at 1..3
+        },
         Block::BulletList { items: vec![] },
         Block::CodeBlock {
             lang: None,
@@ -126,9 +107,6 @@ fn chat_subset_consumer() -> Vec<Block> {
     ]
 }
 
-/// A consumer reuses the three shared structured inline nodes verbatim (they are the
-/// uniform producers of `refs.edge.created`, 5.4). The consumer reads them as a node-array
-/// walk — exactly what the provider guarantees.
 fn issues_subset_consumes_structured_nodes() -> Vec<InlineNode> {
     vec![
         InlineNode::Mention(Principal::stub(
@@ -142,7 +120,6 @@ fn issues_subset_consumes_structured_nodes() -> Vec<InlineNode> {
 
 #[test]
 fn cdc_13_1_provider_freezes_taxonomy_consumer_rides_subset() {
-    // provider: the full frozen set is exactly 15 variants and round-trips through serde
     let full = provider_full_taxonomy();
     assert_eq!(full.len(), 15, "the v1 taxonomy is frozen at 15 variants");
     for b in &full {
@@ -151,7 +128,6 @@ fn cdc_13_1_provider_freezes_taxonomy_consumer_rides_subset() {
         assert_eq!(*b, back);
     }
 
-    // provider: the inline round-trip holds and the three structured nodes are preserved
     if let Block::Paragraph { inline } = &full[0] {
         let md = "\u{FFFC} \u{FFFC} \u{FFFC}";
         assert_eq!(serialize_inline(inline), md);
@@ -160,14 +136,12 @@ fn cdc_13_1_provider_freezes_taxonomy_consumer_rides_subset() {
         panic!("first block should be the paragraph carrying the three nodes");
     }
 
-    // consumer: a strict subset compiles against the SAME types, no redefinition
     let chat = chat_subset_consumer();
     assert!(chat.len() < full.len(), "a subset is strictly smaller");
     assert!(chat
         .iter()
         .all(|b| !matches!(b, Block::DbView { .. } | Block::SyncBlock { .. })));
 
-    // consumer: structured nodes are reused verbatim and walk-extractable
     let nodes = issues_subset_consumes_structured_nodes();
     assert_eq!(nodes.len(), 2);
     assert!(matches!(nodes[0], InlineNode::Mention(_)));

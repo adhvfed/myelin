@@ -1,12 +1,3 @@
-//! # Unit tests for the erasure residual instanced — the X-7 posture for Notif (NOTIF-P27 / P-469)
-//!
-//! Exercises the erase path to the ≥ 80% mutation floor on `erasure_residual.rs`: the per-subject DEK
-//! crypto-shred (idempotent destroy + is-live + loud KMS failure), the PII-free non-shred-erasable
-//! erasure ledger (record + idempotent merge + is-erased), and the four-leg erase orchestration (the
-//! chained test EI-01 §4: deliver an off-cell redacted item → erase the subject → assert the inline-PII
-//! column is unrecoverable AND a provider-side erasure was issued AND the receipt is in the ledger).
-//! The drill-harness scenario for NOTIF-D6 lives in `tests/drill_notif_d6_erasure.rs`.
-
 use super::*;
 use crate::eu_provider::{EuSovereignAdapter, RecordingEuTransport};
 use crate::holder::RestrictSet;
@@ -39,7 +30,6 @@ fn redacted_msg() -> RedactedMessage {
     crate::redact_for_offcell(summary(), Class::Direct)
 }
 
-/// An EU-sovereign adapter over a deterministic recording transport (fr-par = EU).
 fn eu_adapter() -> (EuSovereignAdapter, RecordingEuTransport) {
     let transport = RecordingEuTransport::new("eu-mailer");
     let adapter = EuSovereignAdapter::new(
@@ -50,13 +40,6 @@ fn eu_adapter() -> (EuSovereignAdapter, RecordingEuTransport) {
     (adapter, transport)
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════
-// (1) The per-subject DEK crypto-shred seam (contract 11.4)
-// ════════════════════════════════════════════════════════════════════════════════════════════
-
-/// **A sealed inline-PII delivery DEK is live until shredded, then dead — idempotently (11.4).** The
-/// crypto-shred is the lever: destroy the per-subject key → the sealed delivery column is unrecoverable
-/// ciphertext. Idempotent (a re-destroy of a dead key succeeds — re-erasure after a restore).
 #[test]
 fn crypto_shred_destroys_the_dek_idempotently() {
     let shredder = InMemoryDeliveryShredder::new();
@@ -70,13 +53,11 @@ fn crypto_shred_destroys_the_dek_idempotently() {
         "the shredded key is dead (unrecoverable)"
     );
 
-    // Idempotent: a re-destroy of an already-dead key still succeeds (re-erasure after restore).
     shredder
         .destroy_key(&k)
         .expect("re-destroy of a dead key is a no-op success");
     assert!(!shredder.is_live(&k), "still dead");
 
-    // An untouched key is unaffected (the destroy is per-key, not a global wipe).
     let other = key("u-bob");
     shredder.seal(&other);
     shredder.destroy_key(&k).expect("destroy");
@@ -86,8 +67,6 @@ fn crypto_shred_destroys_the_dek_idempotently() {
     );
 }
 
-/// **A KMS that cannot be reached fails LOUDLY — the erase is INCOMPLETE, never silently assumed-done
-/// (EI-01 §3).** The shredder surfaces `KmsUnavailable`; the key stays live (still recoverable).
 #[test]
 fn crypto_shred_is_loud_on_kms_failure() {
     let shredder = InMemoryDeliveryShredder::new();
@@ -102,17 +81,10 @@ fn crypto_shred_is_loud_on_kms_failure() {
     assert!(err.to_string().contains("erase INCOMPLETE"));
     assert!(
         shredder.is_live(&k),
-        "the key is STILL live after a failed destroy — never silently assumed erased"
+        "the key is STILL live after a failed destroy - never silently assumed erased"
     );
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════
-// (2) The PII-free, non-shred-erasable erasure ledger (contract 10.8)
-// ════════════════════════════════════════════════════════════════════════════════════════════
-
-/// **The erasure ledger records the fact-of-erasure (10.8) and merges idempotently.** A record marks
-/// the subject erased; a re-record MERGES new key/provider refs into the existing entry (re-erasure
-/// after a restore re-applies cleanly, never duplicating). An un-recorded subject is "never seen".
 #[test]
 fn erasure_ledger_records_and_merges_idempotently() {
     let ledger = NotifErasureLedger::new();
@@ -135,7 +107,6 @@ fn erasure_ledger_records_and_merges_idempotently() {
         vec!["eu-mailer:itm-1".to_string()]
     );
 
-    // Re-record MERGES new refs (no duplicates), keeps the entry single (idempotent on subject).
     ledger.record(
         "u-erase",
         &[key("a"), key("b")],
@@ -161,13 +132,6 @@ fn erasure_ledger_records_and_merges_idempotently() {
     );
 }
 
-// ════════════════════════════════════════════════════════════════════════════════════════════
-// (3) The four-leg erase orchestration — the X-7 posture instanced (the chained test, EI-01 §4)
-// ════════════════════════════════════════════════════════════════════════════════════════════
-
-/// **THE CHAINED TEST (EI-01 §4): deliver an off-cell redacted item → erase the subject → the
-/// inline-PII column is unrecoverable (DEK destroyed) AND a provider-side erasure-request was issued
-/// AND the receipt is in the erasure ledger.** This is the X-7 posture instanced for Notif end-to-end.
 #[test]
 fn chained_deliver_offcell_then_erase_is_unrecoverable_and_purged_and_ledgered() {
     let (provider, transport) = eu_adapter();
@@ -175,7 +139,6 @@ fn chained_deliver_offcell_then_erase_is_unrecoverable_and_purged_and_ledgered()
     let restrict = RestrictSet::new();
     let ledger = NotifErasureLedger::new();
 
-    // DELIVER an off-cell redacted item for the subject (the one place Notif emits free text off-cell).
     let idem = crate::build_idem_key("itm-1", Channel::Email);
     let receipt = provider
         .try_send(&redacted_msg(), &idem)
@@ -185,7 +148,6 @@ fn chained_deliver_offcell_then_erase_is_unrecoverable_and_purged_and_ledgered()
         .provider_ref_for(&idem)
         .expect("the off-cell copy has a durable provider_ref");
 
-    // The inline-PII delivery column is sealed under a per-subject DEK.
     let dek = key("u-erase");
     shredder.seal(&dek);
     assert!(
@@ -198,7 +160,6 @@ fn chained_deliver_offcell_then_erase_is_unrecoverable_and_purged_and_ledgered()
         inline_pii_key: Some(dek.clone()),
     }];
 
-    // ERASE the subject's notification residual (the four legs).
     let er = erase_residual(
         "u-erase",
         &tenant(),
@@ -211,7 +172,6 @@ fn chained_deliver_offcell_then_erase_is_unrecoverable_and_purged_and_ledgered()
     )
     .expect("the structural erase succeeds");
 
-    // THE GATE: 0 recoverable PII (NOTIF-D6 threshold) + the suppression applied.
     assert_eq!(
         er.recoverable_remaining, 0,
         "0 inline-PII columns recoverable"
@@ -221,14 +181,12 @@ fn chained_deliver_offcell_then_erase_is_unrecoverable_and_purged_and_ledgered()
         "NOTIF-D6 green: 0 recoverable PII + restrict applied"
     );
 
-    // (2) The inline-PII delivery column is UNRECOVERABLE (DEK destroyed).
     assert!(
         !shredder.is_live(&dek),
         "the inline-PII delivery DEK is destroyed"
     );
     assert_eq!(er.shredded_keys, vec![dek], "the DEK was crypto-shredded");
 
-    // (3) A provider-side erasure-request was ISSUED for the already-sent off-cell copy.
     assert!(
         transport.was_erased(&provider_ref),
         "the sub-processor copy was requested-erased"
@@ -239,21 +197,16 @@ fn chained_deliver_offcell_then_erase_is_unrecoverable_and_purged_and_ledgered()
         "the provider erasure is recorded on the receipt"
     );
 
-    // (4) The receipt is in the erasure LEDGER (10.8) — provable + survives a restore.
     assert!(ledger.is_erased("u-erase"), "the erase is in the ledger");
     let entry = ledger.entry("u-erase").expect("ledger entry present");
     assert_eq!(entry.provider_erasures_requested, vec![provider_ref]);
 
-    // (1) restrict was applied (new routing/delivery suppressed).
     assert!(
         restrict.is_restricted("u-erase"),
         "the subject's new routing is suppressed"
     );
 }
 
-/// **`restrict` is applied FIRST — the subject is suppressed even if there is nothing to shred.** An
-/// erase with NO off-cell residuals (an in-cell-only subject) still records the suppression + a
-/// receipt + reports 0 recoverable (the structural references-not-payloads tombstone does the rest).
 #[test]
 fn erase_with_no_residual_still_restricts_and_ledgers_zero_recoverable() {
     let (provider, _transport) = eu_adapter();
@@ -264,7 +217,7 @@ fn erase_with_no_residual_still_restricts_and_ledgers_zero_recoverable() {
     let er = erase_residual(
         "u-incell",
         &tenant(),
-        &[], // no off-cell payload — an in-cell-only subject
+        &[],
         &shredder,
         &restrict,
         &provider,
@@ -291,9 +244,6 @@ fn erase_with_no_residual_still_restricts_and_ledgers_zero_recoverable() {
     );
 }
 
-/// **A redacted summary with NO inline PII (a fully-tombstoned summary) shreds no key but still
-/// purges the off-cell copy.** The `inline_pii_key = None` case: the provider-side erasure still
-/// fires (the sub-processor holds a copy of the redacted bytes), and 0 remain recoverable.
 #[test]
 fn offcell_residual_without_inline_pii_purges_but_shreds_nothing() {
     let (provider, transport) = eu_adapter();
@@ -309,7 +259,7 @@ fn offcell_residual_without_inline_pii_purges_but_shreds_nothing() {
 
     let residuals = vec![OffCellResidual {
         idem_key: idem,
-        inline_pii_key: None, // the summary carried no inline PII (fully tombstoned)
+        inline_pii_key: None,
     }];
     let er = erase_residual(
         "u-erase",
@@ -332,8 +282,6 @@ fn offcell_residual_without_inline_pii_purges_but_shreds_nothing() {
     assert!(er.is_green());
 }
 
-/// **A KMS failure makes the erase LOUD + INCOMPLETE — never a silent partial erase (EI-01 §3).** The
-/// crypto-shred leg surfaces `Shred(KmsUnavailable)`; the erase returns `Err` (the DSR is not done).
 #[test]
 fn erase_is_loud_and_incomplete_on_kms_failure() {
     let (provider, _transport) = eu_adapter();
@@ -347,7 +295,7 @@ fn erase_is_loud_and_incomplete_on_kms_failure() {
         .expect("delivered");
     let dek = key("u-erase");
     shredder.seal(&dek);
-    shredder.make_unreachable(&dek); // the KMS is down for this key
+    shredder.make_unreachable(&dek);
 
     let residuals = vec![OffCellResidual {
         idem_key: idem,
@@ -372,18 +320,13 @@ fn erase_is_loud_and_incomplete_on_kms_failure() {
     assert!(err.to_string().contains("INCOMPLETE"));
     assert!(
         shredder.is_live(&dek),
-        "the key is STILL live — never silently assumed erased"
+        "the key is STILL live - never silently assumed erased"
     );
-    // restrict WAS applied first (the suppression holds even though the shred failed).
     assert!(restrict.is_restricted("u-erase"));
 }
 
-/// **A sub-processor REJECTING the provider-side erasure surfaces LOUDLY — the un-purged copy is the
-/// residual, never silently swallowed (EI-01 §3).** A transport that rejects the erasure request makes
-/// the erase return `ProviderErasure`.
 #[test]
 fn erase_is_loud_when_the_subprocessor_rejects_the_erasure() {
-    // A transport that ACCEPTS submits but REJECTS erasure requests.
     #[derive(Clone)]
     struct RejectingTransport;
     impl crate::eu_provider::EuTransport for RejectingTransport {
@@ -402,7 +345,7 @@ fn erase_is_loud_when_the_subprocessor_rejects_the_erasure() {
             }
         }
         fn request_erasure(&self, _provider_ref: &str) -> bool {
-            false // the sub-processor REJECTS — the copy is un-purged
+            false
         }
     }
 
@@ -440,9 +383,6 @@ fn erase_is_loud_when_the_subprocessor_rejects_the_erasure() {
     );
 }
 
-/// **The erase is idempotent — a re-erase re-applies cleanly and still reports 0 recoverable.** The
-/// shred is idempotent, the provider de-dupes, the ledger merges — a second run is safe (re-erasure
-/// after a restore).
 #[test]
 fn erase_is_idempotent_on_re_run() {
     let (provider, _transport) = eu_adapter();
@@ -474,8 +414,6 @@ fn erase_is_idempotent_on_re_run() {
     .expect("first erase");
     assert!(er1.is_green());
 
-    // Re-erase: the DEK is already dead, the provider already purged (NothingToErase now), the ledger
-    // merges — still green, still 0 recoverable.
     let er2 = erase_residual(
         "u-erase",
         &tenant(),
@@ -499,8 +437,6 @@ fn erase_is_idempotent_on_re_run() {
     );
 }
 
-/// **The ledger `is_empty` reflects the real state (not a constant).** Empty before any record, NOT
-/// empty after — pins both arms (a mutation to a constant `true` is caught by the non-empty arm).
 #[test]
 fn ledger_is_empty_reflects_real_state() {
     let ledger = NotifErasureLedger::new();
@@ -509,9 +445,6 @@ fn ledger_is_empty_reflects_real_state() {
     assert!(!ledger.is_empty(), "after a record the ledger is NOT empty");
 }
 
-/// **`is_green` is the AND of both gate predicates (0 recoverable AND restrict applied) — not a
-/// constant, not an OR.** Pins all three arms: green when both hold, NOT green when EITHER fails. A
-/// mutation to `true`, or `&&`→`||`, is caught.
 #[test]
 fn is_green_requires_both_zero_recoverable_and_restrict() {
     let base = |recoverable: usize, restrict_applied: bool| ResidualEraseReceipt {
@@ -525,17 +458,15 @@ fn is_green_requires_both_zero_recoverable_and_restrict() {
     assert!(base(0, true).is_green(), "0 recoverable + restrict → green");
     assert!(
         !base(1, true).is_green(),
-        "recoverable > 0 → NOT green (even with restrict applied) — the 0-PII threshold"
+        "recoverable > 0 → NOT green (even with restrict applied) - the 0-PII threshold"
     );
     assert!(
         !base(0, false).is_green(),
-        "restrict NOT applied → NOT green (even with 0 recoverable) — the suppression is required"
+        "restrict NOT applied → NOT green (even with 0 recoverable) - the suppression is required"
     );
     assert!(!base(1, false).is_green(), "neither → NOT green");
 }
 
-/// **The X-7 instancing is a named, visible deliverable.** The prompt-id constant pins NOTIF-P27 so
-/// the residual is never a silent claim.
 #[test]
 fn erasure_residual_is_a_named_deliverable() {
     assert_eq!(ERASURE_RESIDUAL_PROMPT, "NOTIF-P27");

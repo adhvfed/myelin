@@ -1,18 +1,3 @@
-//! # P-ID-20 (P-078) — `resolve_pseudonym` + `erase`: the per-subject crypto-shred lever
-//!
-//! The required UNIT-level proofs of the 4.8 erase body the prompt names (architecture §11/§12,
-//! recon §X-7, EI-04 §1, EI-01 §3, drill-catalogue ID-D8 + STOR-D4):
-//!
-//! - `erase(subject)` destroys the per-subject DEK AND shreds the pseudonym-map row;
-//! - an erased subject's real identity is unrecoverable WHILE its opaque `principal_id` still
-//!   attributes events (the EI-04 §1 immutable-attribution split);
-//! - `resolve_pseudonym` round-trips for a live subject and FAILS CLOSED for an erased one;
-//! - the erasure is written to the PII-free erasure ledger (10.8);
-//! - **STOR-D4-adjacent:** the per-subject crypto-shred is unrecoverable IN BACKUPS (the destroyed
-//!   DEK is excluded from `backup_snapshot`);
-//! - **the per-subject-key MUTATION FLOOR:** an erase that left the DEK recoverable MUST be caught
-//!   (a post-erase resolve fails loudly; a destroyed DEK stays out of the backup).
-
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PseudonymHandle};
 use myelin_identity_service::{PseudonymEraseError, StoreBackedCheck, TupleStore};
@@ -44,8 +29,6 @@ fn now() -> Timestamp {
     Timestamp("2026-06-19T00:00:00Z".into())
 }
 
-/// **`resolve_pseudonym_in` round-trips for a LIVE subject — returns the public pseudonym handle
-/// (DSR step-1 attribution).** A mapped subject resolves to its `<pseudonym>@<tenant>.noreply`.
 #[test]
 fn resolve_pseudonym_round_trips_for_a_live_subject() {
     let slot = slot();
@@ -70,9 +53,6 @@ fn resolve_pseudonym_round_trips_for_a_live_subject() {
     );
 }
 
-/// **`erase_in` destroys the per-subject DEK AND shreds the pseudonym-map row (the crypto-shred
-/// body, 4.8).** After erase: the map row is gone, the per-subject DEK is destroyed, and the subject
-/// is recorded in the PII-free ledger.
 #[test]
 fn erase_destroys_the_dek_and_shreds_the_row_and_records_the_ledger() {
     let slot = slot();
@@ -93,27 +73,20 @@ fn erase_destroys_the_dek_and_shreds_the_row_and_records_the_ledger() {
         "the destroyed key is named"
     );
 
-    // The map row is gone.
     assert!(
         slot.pseudonyms().mapping_of(&s, &subject).is_none(),
         "the pseudonym-map row is shredded"
     );
-    // The per-subject DEK is destroyed (the real-identity link is unrecoverable).
     assert!(
         slot.pseudonyms().resolve_subject(&s, &subject).is_none(),
         "the subject's real identity is unrecoverable (the DEK is crypto-shredded)"
     );
-    // The PII-free ledger remembers the erasure (so re-erasure can replay).
     assert!(
         slot.erasure_ledger().is_erased(&s, &subject),
         "the erasure is written to the PII-free ledger (10.8)"
     );
 }
 
-/// **An erased subject's real identity is unrecoverable WHILE its opaque `principal_id` still
-/// attributes events (the EI-04 §1 immutable-attribution split).** The opaque id is unchanged by the
-/// erase — it still names the actor of already-emitted events; only the `pseudonym → real_identity`
-/// resolution is destroyed.
 #[test]
 fn erased_subject_real_identity_unrecoverable_but_opaque_id_still_attributes() {
     let slot = slot();
@@ -124,10 +97,7 @@ fn erased_subject_real_identity_unrecoverable_but_opaque_id_still_attributes() {
         .unwrap();
     slot.erase_in(&s, &subject, now());
 
-    // The real identity is gone.
     assert!(slot.pseudonyms().resolve_subject(&s, &subject).is_none());
-    // The opaque principal_id is unchanged — it STILL attributes events (the receipt carries it; an
-    // event authored by `p:alice` is still attributable to the opaque id, just not de-pseudonymisable).
     let receipt = slot.erase_in(&s, &subject, now());
     assert_eq!(
         receipt.subject, subject,
@@ -135,9 +105,6 @@ fn erased_subject_real_identity_unrecoverable_but_opaque_id_still_attributes() {
     );
 }
 
-/// **`resolve_pseudonym_in` FAILS CLOSED for an erased subject — never a fabricated handle (the
-/// 0-fail-open invariant).** After erase the row is shredded; a resolve returns a LOUD `Erased`
-/// error, distinguishable from a never-mapped `NoMapping`.
 #[test]
 fn resolve_pseudonym_fails_closed_for_an_erased_subject() {
     let slot = slot();
@@ -154,7 +121,6 @@ fn resolve_pseudonym_fails_closed_for_an_erased_subject() {
         "an erased subject's resolve fails CLOSED (Erased), never a fabricated handle: {r:?}"
     );
 
-    // A never-mapped subject is distinguishable (NoMapping, not Erased).
     let never = PrincipalId("p:nobody".into());
     assert!(
         matches!(
@@ -165,8 +131,6 @@ fn resolve_pseudonym_fails_closed_for_an_erased_subject() {
     );
 }
 
-/// **No resurrected GRANTS past an erasure (the ID-D8 grant side).** `erase_in` disables the
-/// principal in S7, so every surface's `check` denies the erased subject.
 #[test]
 fn erase_disables_the_principal_so_no_grants_survive() {
     let slot = slot();
@@ -187,9 +151,6 @@ fn erase_disables_the_principal_so_no_grants_survive() {
     );
 }
 
-/// **STOR-D4: the per-subject crypto-shred is unrecoverable IN BACKUPS.** After erase, the
-/// destroyed per-subject DEK is EXCLUDED from `backup_snapshot` (a backup cannot resurrect the
-/// shredded key). This is the mutation-floor: an erase that left the DEK in the backup MUST be caught.
 #[test]
 fn crypto_shred_is_unrecoverable_in_backups() {
     let slot = slot();
@@ -200,7 +161,6 @@ fn crypto_shred_is_unrecoverable_in_backups() {
         .unwrap();
     let dek_class = KeyClass::Subject("p:alice".into());
 
-    // Before erase: the subject's DEK is present in a backup.
     let pre = slot.kms().backup_snapshot();
     assert!(
         pre.iter()
@@ -210,7 +170,6 @@ fn crypto_shred_is_unrecoverable_in_backups() {
 
     slot.erase_in(&s, &subject, now());
 
-    // After erase: the destroyed DEK is EXCLUDED from the backup (crypto-shred reaches backups).
     let post = slot.kms().backup_snapshot();
     assert!(
         !post
@@ -220,8 +179,6 @@ fn crypto_shred_is_unrecoverable_in_backups() {
     );
 }
 
-/// **Idempotency: a re-erase of an already-shredded subject is a no-op-but-recorded (the receipt
-/// reports `dek_destroyed=false`) and never fails.** Post-restore re-erasure relies on this.
 #[test]
 fn re_erase_of_an_already_shredded_subject_is_a_noop_but_recorded() {
     let slot = slot();
@@ -245,8 +202,6 @@ fn re_erase_of_an_already_shredded_subject_is_a_noop_but_recorded() {
     );
 }
 
-/// **The erase is `(tenant, region)`-scoped — a cross-tenant erase cannot reach another tenant.** An
-/// erase under `acme` does not touch `globex`'s identically-named subject's mapping.
 #[test]
 fn erase_is_tenant_scoped() {
     let slot = slot();

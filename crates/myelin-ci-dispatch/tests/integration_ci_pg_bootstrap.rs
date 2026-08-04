@@ -1,5 +1,3 @@
-//! Live proof that CI Dispatch applies its exact schema with the migration role, then serves with
-//! only the constrained runtime role.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;

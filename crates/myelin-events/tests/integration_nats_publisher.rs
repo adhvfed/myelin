@@ -1,4 +1,3 @@
-//! Live-NATS proof that the production publisher provisions only the bounded shared stream.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -87,8 +86,6 @@ async fn publisher_provisions_bounded_stream_without_consumer_or_purge_capabilit
         "publisher creates no durable consumer"
     );
 
-    // Test infrastructure owns this uniquely named stream; production publisher API has no purge
-    // or delete operation, so cleanup is deliberately performed through the raw test client.
     js.delete_stream(&stream_name)
         .await
         .expect("delete test stream");
@@ -306,7 +303,7 @@ async fn existing_durable_consumer_with_semantic_drift_refuses_boot() {
             max_deliver: -1,
             filter_subject: format!("{subject_root}.evt.*.git.>"),
             replay_policy: async_nats::jetstream::consumer::ReplayPolicy::Instant,
-            max_waiting: 9, // production pins 8: this pre-existing durable has semantic drift.
+            max_waiting: 9,
             max_ack_pending: 256,
             max_batch: 256,
             max_bytes: 4 * 1024 * 1024,
@@ -419,9 +416,6 @@ async fn nak_increments_attempt_then_term_makes_durable_rebind_empty() {
         .unwrap();
 }
 
-/// Two-phase operator proof for the server/volume boundary. Run once with phase `seed`, restart the
-/// NATS service, then run with phase `verify`. It is ignored in ordinary suites because a test
-/// process must not restart shared infrastructure behind other concurrent tests.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "run seed, restart NATS, then run verify"]
 async fn jetstream_file_storage_survives_server_restart() {

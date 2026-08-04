@@ -1,36 +1,3 @@
-//! # Integration — SRCH-P19 (P-262, M3): sub-artifact-granular + content-anchored projections
-//!
-//! **Drill source:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` SRCH-D5 (Git+KN
-//! corpus, the reindex-parity proving the projection re-derives). **Architecture:**
-//! `search-and-indexing.md` §4.1 tail / §4.9 ask (sub-artifact-granular projections; Git line-ranges
-//! content-anchored — the searchable span re-derived from the owner's resolve, never a stale raw line
-//! number; KN replay page-subtree at block granularity; Git replay per-blob/ref), §3.1 (the `doc_id`
-//! may carry a frozen `#sub`). **Reconciliation:** change #7 / X-4 (the unified `#sub` grammar +
-//! content-anchoring). **Contracts:** 5.7 (the `#sub` kinds on real sub-anchors), 2.6 (sub-artifact-
-//! granular replay).
-//!
-//! ## What this proves (the dated green artifact, 2026-06-21)
-//! The sub-artifact GRAIN classifier ([`myelin_search::SubGrain`], keyed off the FROZEN
-//! `myelin_refs::sub_kind` grammar) + the sub-doc projection builders ([`block_subdoc_projection`],
-//! [`db_row_subdoc_projection`], [`db_field_subdoc_projection`], [`line_range_subdoc_projection`])
-//! drive the LIVE [`IncrementalIndexer`] per-event pipeline so that:
-//!
-//! 1. **Sub-anchors resolve at the right grain** — a doc block (`#b<id>`), a KN db row (`#row-<id>`),
-//!    a KN field (`#field-<id>`), and a Git content-anchored line-range (`#L<a>-L<b>`) each index as a
-//!    sub-precise `doc_id` whose ACL pins on the `#sub`-stripped parent (§3.1). A query hits the
-//!    sub-doc, not the whole artifact.
-//! 2. **Content-anchoring re-derives (the chained force-push test)** — a Git line-range another
-//!    artifact embeds is force-pushed; the owner's `project` re-derives the span to its shifted
-//!    position; a SCOPED reindex re-drives `project`; the indexed line-range carries the NEW position
-//!    (never the stale raw line number).
-//! 3. **SRCH-D5 Git+KN reindex-parity** — a live sub-artifact corpus (KN blocks + Git line-ranges) is
-//!    wiped + reindexed-from-source; cold == live (doc set + searchability + the re-derived
-//!    content-anchored line-ranges).
-//!
-//! The ENGINE is UNCHANGED — this is producer-corpus + grain wiring (the prompt's DoD). No new
-//! mutation-core module is added; the SRCH-P16 reindex mutation floor still holds on the real corpora.
-//! The M4 producer sub-anchors (`comment-`/`thread-`/`message-`/`check-`/`step-`) are the named floor.
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -51,10 +18,6 @@ use myelin_search::{
     SearchProjection, SearchReindexer, SubGrain, FACET_ANCHOR_STATE, FACET_LINE_START,
 };
 
-// ----------------------------------------------------------------------------------------------
-// fixtures
-// ----------------------------------------------------------------------------------------------
-
 fn tenant() -> TenantId {
     TenantId("acme".into())
 }
@@ -65,11 +28,6 @@ fn principal() -> Principal {
     Principal::stub(PrincipalId("p-1".into()), PrincipalKind::Human, tenant())
 }
 
-/// A scripted [`ProjectFetcher`] over a `ref → SearchProjection` map — the owner's `project(ref,
-/// viewer)` (5.6 / 5.7). For a sub-anchored ref the OWNER resolved the `#sub` (and for a Git
-/// line-range re-derived the content-anchored span); this fetcher serves what the owner returned (the
-/// no-cross-db floor — Search never reads the owner DB). The map is MUTABLE so the force-push test can
-/// swap the owner's re-derived span (the owner's `project` now returns the shifted span).
 #[derive(Default)]
 struct OwnerFetcher {
     projections: Mutex<BTreeMap<String, SearchProjection>>,
@@ -93,23 +51,17 @@ impl ProjectFetcher for OwnerFetcher {
     }
 }
 
-/// The index specs the sub-artifact corpus declares: KN page (block/heading sub-docs ride the page
-/// spec's facet union) + KN db_row (row/field sub-docs) + Git blob (line-range sub-docs ride the blob
-/// facet union + the re-derived line-range facets). The facet union is the union of all specs.
 fn corpus_specs() -> Vec<IndexSpec> {
     let mut specs = myelin_search::kn_index_specs();
     specs.push(git_line_range_spec());
     specs
 }
 
-/// A `git`/`blob` spec whose struct_fields are the line-range sub-doc facet union (path/language/
-/// blob_oid + the re-derived line_start/line_end/anchor_state). `acl_object_type = repo`.
 fn git_line_range_spec() -> IndexSpec {
     IndexSpec::new("git", "blob", myelin_search::line_range_subdoc_facets())
         .with_acl_object_type("repo")
 }
 
-/// Build a live indexer over the sub-artifact corpus specs + the owner fetcher.
 fn indexer() -> (Arc<IncrementalIndexer>, Arc<OwnerFetcher>) {
     let fetcher = Arc::new(OwnerFetcher::default());
     let ix = Arc::new(IncrementalIndexer::new(
@@ -120,8 +72,6 @@ fn indexer() -> (Arc<IncrementalIndexer>, Arc<OwnerFetcher>) {
     (ix, fetcher)
 }
 
-/// A `*.created` event for a (sub-precise) ref. The subsystem/type is read from the ref; a `#sub`
-/// makes the doc sub-precise (the indexer keys it sub-precisely + pins the ACL on the parent).
 fn created_event(type_: &str, ref_: &str) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId(format!("ev:{ref_}")),
@@ -146,17 +96,10 @@ fn created_event(type_: &str, ref_: &str) -> EventEnvelope {
     }
 }
 
-// ----------------------------------------------------------------------------------------------
-// 1. sub-anchors resolve at the right grain (doc blocks, KN rows/fields, Git line-ranges)
-// ----------------------------------------------------------------------------------------------
-
-/// **A doc BLOCK sub-anchor (`#b<id>`) indexes at block granularity — the doc_id is sub-precise, the
-/// ACL pins on the parent page, and a query hits the BLOCK (not the whole page).**
 #[test]
 fn doc_block_sub_anchor_resolves_at_block_grain() {
     let (ix, fetcher) = indexer();
     let block_ref = "myelin://acme/knowledge/page/42#b9";
-    // The owner resolved the `#b9` sub-anchor → that block's projection.
     let block = Block::Paragraph {
         inline: parse_inline("the deadlock detection block only", &[]),
     };
@@ -170,7 +113,6 @@ fn doc_block_sub_anchor_resolves_at_block_grain() {
         "the block sub-doc is indexed"
     );
 
-    // A query hits the block sub-doc; the doc_id is the SUB-PRECISE ref (the `#b9` is kept).
     let hits = ix
         .search_ft(&tenant(), &region(), &AclFilter::All, "deadlock", 10)
         .expect("ft");
@@ -180,15 +122,12 @@ fn doc_block_sub_anchor_resolves_at_block_grain() {
         "the doc_id keeps the #b9 (sub-precise, §3.1)"
     );
 
-    // The classifier confirms the grain (the frozen grammar).
     assert_eq!(
         SubGrain::classify(&ArtifactRef(block_ref.into())),
         SubGrain::Block("9".into())
     );
 }
 
-/// **A KN db ROW sub-anchor (`#row-<id>`) indexes at row granularity — the row's typed facets + its
-/// full-text are searchable, the doc_id is sub-precise.**
 #[test]
 fn kn_db_row_sub_anchor_resolves_at_row_grain() {
     let (ix, fetcher) = indexer();
@@ -205,7 +144,6 @@ fn kn_db_row_sub_anchor_resolves_at_row_grain() {
         .expect("index row sub-doc");
     assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
-    // The structured facet (priority == P0) hits the row sub-doc (the GIN-scan path), ACL-filtered.
     let hits = ix
         .search_structured(
             &tenant(),
@@ -225,15 +163,12 @@ fn kn_db_row_sub_anchor_resolves_at_row_grain() {
         hits[0].doc_id, row_ref,
         "the doc_id keeps the #row-r7 (sub-precise)"
     );
-    // The row's full-text is searchable too.
     let ft = ix
         .search_ft(&tenant(), &region(), &AclFilter::All, "incident", 10)
         .expect("ft");
     assert_eq!(ft.len(), 1);
 }
 
-/// **A KN FIELD sub-anchor (`#field-<id>`) indexes at field granularity (the finest KN grain) — the
-/// one resolved field + its rendered text, sub-precise doc_id.**
 #[test]
 fn kn_field_sub_anchor_resolves_at_field_grain() {
     let (ix, fetcher) = indexer();
@@ -270,14 +205,10 @@ fn kn_field_sub_anchor_resolves_at_field_grain() {
     );
 }
 
-/// **A Git content-anchored LINE-RANGE sub-anchor (`#L<a>-L<b>`) indexes the RE-DERIVED span — the
-/// span is code-searchable, the doc_id is sub-precise, and the re-derived endpoints + anchor state are
-/// stamped (never a raw line number).**
 #[test]
 fn git_line_range_sub_anchor_resolves_at_span_grain_content_anchored() {
     let (ix, fetcher) = indexer();
     let lr_ref = "myelin://acme/git/blob/repo:main:src/scheduler/deadlock.rs#L42-L45";
-    // The owner's `project` re-derived the content-anchored span (exact match here).
     let span = ContentAnchoredSpan {
         path: "src/scheduler/deadlock.rs".into(),
         language: "rust".into(),
@@ -293,7 +224,6 @@ fn git_line_range_sub_anchor_resolves_at_span_grain_content_anchored() {
         .expect("index line-range sub-doc");
     assert_eq!(ix.live_count(&tenant(), &region()), 1);
 
-    // The span is code-searchable (a symbol query hits the line-range sub-doc).
     let hits = ix
         .search_ft(&tenant(), &region(), &AclFilter::All, "detectdeadlock", 10)
         .expect("ft");
@@ -307,7 +237,6 @@ fn git_line_range_sub_anchor_resolves_at_span_grain_content_anchored() {
         "the doc_id keeps the #L42-L45 (sub-precise)"
     );
 
-    // The re-derived endpoint is stamped (the owner's resolve, never a stored raw line).
     let by_state = ix
         .search_structured(
             &tenant(),
@@ -324,10 +253,6 @@ fn git_line_range_sub_anchor_resolves_at_span_grain_content_anchored() {
         "the anchor state is a typed facet (exact)"
     );
 }
-
-// ----------------------------------------------------------------------------------------------
-// 2. content-anchoring: a force-pushed line-range re-derives through a scoped reindex
-// ----------------------------------------------------------------------------------------------
 
 const REGION: &str = "fr-par";
 
@@ -347,14 +272,8 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// **CHAINED (the prompt's required content-anchoring test): a Git line-range another artifact embeds
-/// is FORCE-PUSHED; the owner's `project` re-derives the span to its shifted position; a SCOPED
-/// reindex re-drives `project`; the indexed line-range carries the NEW position — never the stale raw
-/// line number (content-anchored, §3.1/§4.9).**
 #[test]
 fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
-    // The owner truth: a single Git blob aggregate at the line-range scope. The reference owner replays
-    // the sub-doc as `myelin://t/git/blob/<agg>` — mirror that for the fetcher key.
     let mut src = ReferenceReindexSource::new("git", "blob");
     src.upsert(
         "repo:main:src/scheduler/deadlock.rs#L42-L45",
@@ -365,7 +284,6 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
 
     let (ix, fetcher) = indexer();
 
-    // BEFORE the force-push: the owner resolves the span at lines 42–45 (exact, oid-v1).
     let before = ContentAnchoredSpan {
         path: "src/scheduler/deadlock.rs".into(),
         language: "rust".into(),
@@ -377,7 +295,6 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
     };
     fetcher.put(snapshot_ref, line_range_subdoc_projection(&before));
 
-    // Initial index-from-source (the live consumer path).
     let reindexer = SearchReindexer::new(ix.clone(), region());
     let scope = SnapshotScope::new("git", "blob:all");
     let mut outbox = OutboxStore::new();
@@ -390,7 +307,6 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
         "the line-range sub-doc is indexed"
     );
 
-    // The indexed line-range starts at the minted position (42) — the BEFORE state.
     let pre = ix
         .search_structured(
             &tenant(),
@@ -403,11 +319,6 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
         .expect("structured before");
     assert_eq!(pre.len(), 1, "before the force-push the span is at line 42");
 
-    // ---- THE FORCE-PUSH ----
-    // A force-push rewrote the blob; the fingerprinted lines moved to 60–63 (the owner's
-    // `resolve_line_range` returned `Rebased { new_start: 60, .. }` against the new blob oid). The owner's
-    // `project` NOW returns the re-derived span at the shifted position. The index holds NO raw line
-    // number — it re-derives on the owner's resolve.
     let after = ContentAnchoredSpan {
         blob_oid: "oid-v2-after-force-push".into(),
         resolved_start: 60,
@@ -417,11 +328,6 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
     };
     fetcher.put(snapshot_ref, line_range_subdoc_projection(&after));
 
-    // ---- THE SCOPED REINDEX ----
-    // A scoped reindex (the §4.9 scoped reindex, driven at line-range grain) re-drives the owner's
-    // `project` — which re-derives the content-anchored span. The blob aggregate is re-emitted at a new
-    // version (the force-push bumped it). A full re-scope wipes + rebuilds; the rebuilt projection carries
-    // the NEW position.
     let mut src_after = ReferenceReindexSource::new("git", "blob");
     src_after.upsert(
         "repo:main:src/scheduler/deadlock.rs#L42-L45",
@@ -446,8 +352,6 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
         "still exactly one line-range sub-doc"
     );
 
-    // ---- THE CONTENT-ANCHORING INVARIANT ----
-    // The re-derived line-range is at the NEW position (60) — the stale 42 is GONE (never stored).
     let stale = ix
         .search_structured(
             &tenant(),
@@ -460,7 +364,7 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
         .expect("structured stale");
     assert!(
         stale.is_empty(),
-        "the STALE raw line number (42) is GONE — content-anchored, not positional"
+        "the STALE raw line number (42) is GONE - content-anchored, not positional"
     );
 
     let fresh = ix
@@ -483,7 +387,6 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
         "the same sub-precise doc_id, re-derived span"
     );
 
-    // The anchor state now flags `rebased` (the hit renders the `moved` flag from the CURRENT resolve).
     let moved = ix
         .search_structured(
             &tenant(),
@@ -499,7 +402,6 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
         1,
         "the re-derived span is flagged `rebased` (moved)"
     );
-    // The span content is still code-searchable after the re-derive.
     let ft = ix
         .search_ft(&tenant(), &region(), &AclFilter::All, "detectdeadlock", 10)
         .expect("ft");
@@ -510,18 +412,9 @@ fn chained_force_push_line_range_re_derives_through_a_scoped_reindex() {
     );
 }
 
-// ----------------------------------------------------------------------------------------------
-// 3. SRCH-D5 (Git+KN sub-artifact corpus): cold == live reindex-parity
-// ----------------------------------------------------------------------------------------------
-
-/// **SRCH-D5 (Git+KN sub-artifact corpus): build a LIVE index of a KN block sub-doc + a Git
-/// line-range sub-doc; wipe; reindex-from-source; the rebuilt index is identical (doc set +
-/// searchability + the re-derived content-anchored line-range).** The reindex re-drives the SAME live
-/// consumer path (cold == live); the projection re-derives correctly through the owner's resolve.
 #[test]
 fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
     let _ = REGION;
-    // The KN block sub-doc + the Git line-range sub-doc (one source per owner).
     let block_agg = "page/42#b9";
     let lr_agg = "repo:main:src/x.rs#L10-L12";
     let block_snap = format!("myelin://t/knowledge/page/{block_agg}");
@@ -549,7 +442,6 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
     };
     fetcher.put(&lr_snap, line_range_subdoc_projection(&span));
 
-    // LIVE: ingest both sub-docs through the ordinary `*.created`/`*.indexed` path.
     ix.index(&created_event("knowledge.page.updated", &block_snap))
         .expect("live block");
     ix.index(&created_event("git.blob.indexed", &lr_snap))
@@ -569,10 +461,6 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
         "the Git line-range sub-doc is searchable"
     );
 
-    // COLD: wipe + reindex-from-source (both owners) through the live consumer path. A full reindex
-    // (`since = None`) WIPES the whole per-tenant index, so we wipe ONCE on the first owner (knowledge),
-    // then append the second owner (git) with an incremental backfill (`since = Some(0)`, no re-wipe) —
-    // the multi-owner cold rebuild the §4.9 scope drives (each owner's `replay` feeds the live consumer).
     let reindexer = SearchReindexer::new(ix.clone(), region());
     let sources: &[&dyn ReindexSource] = &[&kn_src, &git_src];
     let kn_scope = SnapshotScope::new("knowledge", "page:all");
@@ -602,7 +490,6 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
         .expect("backfill git (appends, no re-wipe)");
     assert!(git_job.is_done());
 
-    // PARITY: cold == live (doc count + the same sub-docs searchable + the re-derived line-range).
     let cold_count = ix.live_count(&tenant(), &region());
     let cold_raft = ix
         .search_ft(&tenant(), &region(), &AclFilter::All, "raft", 10)
@@ -624,7 +511,6 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
         live_paxos.len(),
         "the Git line-range sub-doc is searchable in the cold rebuild"
     );
-    // The re-derived content-anchored line-range survives the rebuild (still at its resolved position).
     let lr = ix
         .search_structured(
             &tenant(),
@@ -642,10 +528,6 @@ fn srch_d5_git_kn_subartifact_reindex_parity_cold_equals_live() {
     );
 }
 
-/// **The Search half of E2E-1 behaviour proven in-context: a hit on a confidential sub-doc resolves to
-/// a tombstone with 0 title/count leak.** A private block sub-doc under a viewer with no grant NEVER
-/// appears in any result (incl. counts) — the ACL pre-filter (pinned on the parent) fires; the
-/// sub-precise doc_id never leaks. (The DoD's named in-context E2E-1 Search behaviour.)
 #[test]
 fn e2e1_confidential_sub_doc_is_a_tombstone_zero_leak() {
     let (ix, fetcher) = indexer();
@@ -657,8 +539,6 @@ fn e2e1_confidential_sub_doc_is_a_tombstone_zero_leak() {
     ix.index(&created_event("knowledge.page.updated", block_ref))
         .expect("index secret block");
 
-    // A viewer with NO grant: the ACL pre-filter admits NOTHING (the parent page is unreachable). The
-    // confidential block sub-doc never appears in any result, incl. the count.
     let denied = AclFilter::None;
     let hits = ix
         .search_ft(&tenant(), &region(), &denied, "merger", 10)
@@ -668,7 +548,6 @@ fn e2e1_confidential_sub_doc_is_a_tombstone_zero_leak() {
         "0 leak: the confidential sub-doc never appears (incl. count) without a grant"
     );
 
-    // A grant on the PARENT page (the ACL pins on the #sub-stripped parent, §3.1) ⇒ the block appears.
     let granted = AclFilter::ids(["myelin://acme/knowledge/page/secret"]);
     let ok = ix
         .search_ft(&tenant(), &region(), &granted, "merger", 10)
@@ -684,14 +563,6 @@ fn e2e1_confidential_sub_doc_is_a_tombstone_zero_leak() {
     );
 }
 
-/// **R2.7 — the SEMANTIC-path counterpart of `e2e1_confidential_sub_doc_is_a_tombstone_zero_leak`:
-/// the vector path ADMITS/DENIES a confidential sub-doc by `doc_id` OR `acl_object` exactly like the
-/// lexical path.** The confidential block sub-doc carries an embedding (the KN page spec is
-/// semantically indexed). Its `doc_id` is `#sub`-precise (`…/secret#b1`) while the ACL pins on the
-/// `#sub`-stripped parent (`…/secret`). The semantic k-NN must:
-///  - DENY with no grant (`AclFilter::None` short-circuits — 0 vector/RAG leak); and
-///  - ADMIT once a grant on the PARENT `acl_object` reaches it (the acl_object arm — pre-fix this
-///    wrongly DENIED the sub-doc's vector, an availability divergence from the lexical path).
 #[test]
 fn e2e1_confidential_sub_doc_semantic_path_admits_via_parent_acl_object() {
     let (ix, fetcher) = indexer();
@@ -705,11 +576,8 @@ fn e2e1_confidential_sub_doc_semantic_path_admits_via_parent_acl_object() {
     ix.index(&created_event("knowledge.page.updated", block_ref))
         .expect("index secret block (embedded)");
 
-    // The query vector is the sub-doc's own text (the deterministic mock embed makes it the nearest
-    // neighbour). The adapter is a fresh instance with the SAME dim → the SAME vector the indexer used.
     let query = MockEmbeddingAdapter::new(8).embed(text).expect("embed query");
 
-    // No grant ⇒ the confidential sub-doc's vector NEVER surfaces (0 RAG/vector leak).
     let denied = ix
         .search_semantic(&tenant(), &region(), &AclFilter::None, &query, 10)
         .expect("semantic denied");
@@ -718,7 +586,6 @@ fn e2e1_confidential_sub_doc_semantic_path_admits_via_parent_acl_object() {
         "0 vector leak: the confidential sub-doc's embedding never surfaces without a grant"
     );
 
-    // A grant on the PARENT acl_object ⇒ the sub-doc's vector is admitted via the acl_object arm.
     let granted = AclFilter::ids([parent]);
     let ok = ix
         .search_semantic(&tenant(), &region(), &granted, &query, 10)
@@ -734,12 +601,6 @@ fn e2e1_confidential_sub_doc_semantic_path_admits_via_parent_acl_object() {
     );
 }
 
-/// **R2.7 — the DENY-SET leak test BOTH directions on the SEMANTIC path.** With the confidential
-/// sub-doc embedded (`doc_id` = `…/secret#b1`, `acl_object` = the parent `…/secret`):
-///  - a deny on the PARENT `acl_object` EXCLUDES the sub-doc's vector hit — the leak direction that
-///    fails RED on pre-fix code (where `NotIds::admits` only checked `doc_id`, so a deny expressed on
-///    the parent wrongly ADMITTED the sub-doc's semantic hit — a denied document leaking into RAG);
-///  - a deny on the sub-precise `doc_id` ALSO excludes it — the `doc_id` arm stays enforced.
 #[test]
 fn e2e1_confidential_sub_doc_semantic_deny_set_both_directions() {
     let (ix, fetcher) = indexer();
@@ -755,8 +616,6 @@ fn e2e1_confidential_sub_doc_semantic_deny_set_both_directions() {
 
     let query = MockEmbeddingAdapter::new(8).embed(text).expect("embed query");
 
-    // Sanity: a deny that names NEITHER identifier admits the sub-doc (so the exclusions below are
-    // the deny firing, not a blanket empty result).
     let unrelated_deny = AclFilter::not_ids(["myelin://acme/knowledge/page/other"]);
     let admitted = ix
         .search_semantic(&tenant(), &region(), &unrelated_deny, &query, 10)
@@ -767,7 +626,6 @@ fn e2e1_confidential_sub_doc_semantic_deny_set_both_directions() {
         "a deny naming neither identifier admits the sub-doc (control)"
     );
 
-    // LEAK DIRECTION: deny on the PARENT acl_object ⇒ the sub-doc's vector hit is EXCLUDED.
     let deny_parent = AclFilter::not_ids([parent]);
     assert!(
         ix.search_semantic(&tenant(), &region(), &deny_parent, &query, 10)
@@ -776,7 +634,6 @@ fn e2e1_confidential_sub_doc_semantic_deny_set_both_directions() {
         "R2.7: a deny on the parent acl_object excludes the sub-doc's vector hit (no semantic leak)"
     );
 
-    // DOC_ID DIRECTION: deny on the sub-precise doc_id ⇒ also excluded (the doc_id arm intact).
     let deny_docid = AclFilter::not_ids([block_ref]);
     assert!(
         ix.search_semantic(&tenant(), &region(), &deny_docid, &query, 10)

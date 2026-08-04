@@ -1,4 +1,3 @@
-//! Live PostgreSQL proof for strict elected-relay validation and durable quarantine.
 #![cfg(feature = "integration")]
 
 use std::sync::{Arc, Mutex};
@@ -138,7 +137,6 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
         serde_json::json!({"ciphertext_ref": "blob:opaque"}),
     );
     good_pii.contains_personal_data = true;
-    // Epoch zero is the KMS authority's valid initial generation, not a malformed epoch.
     good_pii.pii_key_ref = Some(PiiKeyRef("kms://relay-quarantine/0/subject:u42".into()));
     raw.enqueue("issue:good-pii", 0, &good_pii)
         .await
@@ -399,8 +397,6 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
     .expect("read blocked tail");
     assert_eq!(blocked, (true, 0));
 
-    // A fresh relay process observes the persistent quarantine and neither republishes nor skips
-    // past the quarantined aggregate head.
     let restarted = ElectedPgRelay::new(pool.clone(), validation).expect("restarted strict relay");
     assert_eq!(
         restarted
@@ -415,8 +411,6 @@ async fn strict_relay_quarantines_permanent_rows_and_preserves_transient_rows() 
         .expect("persistent quarantine count");
     assert_eq!(quarantine_count, 16);
 
-    // A permanent defect discovered earlier in a pass is not half-committed if a later broker
-    // operation fails: both the quarantine insert and the published marks share one transaction.
     insert_raw(
         &pool,
         "rollback-invalid",

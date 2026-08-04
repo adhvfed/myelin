@@ -1,30 +1,3 @@
-//! # The gVisor (`runsc`) PRODUCTION exec self-test (CT-002b → P-544, M2) — REAL `runsc` runs spec.command
-//!
-//! **Owning architecture (byte-authoritative):**
-//! `continuous-integration/architecture/02-internals-and-algorithms.md` §5.1 (gVisor — the NAMED
-//! second backend behind the SAME `SandboxBackend` trait) + §5.3 (the mandatory hardening profile).
-//! **Contract:** `contract-index.md` row 8.4 (the unified sandbox — the gVisor half). **Doctrine:**
-//! EI-04 §5.1 (a property not drilled on a real runtime is a CLAIM, not a fact — so this self-test
-//! REALLY runs `runsc`); EI-01 §3 (prove-it: observability is part of the pass).
-//!
-//! ## What it proves (the CT-002b DONE bar)
-//! The named-second backend's [`SandboxBackend::launch`] now runs the untrusted `spec.command` inside
-//! a REAL `runsc` (gVisor) sandbox via an OCI bundle built from the spec (NOT a `runsc --version`
-//! probe), and captures its REAL outcome FROM THE RUNTIME:
-//!   1. `sh -c 'echo hello-stdout; echo oops 1>&2; exit 7'` ⇒ `exit_code == Some(7)` (the `runsc`
-//!      child's REAL exit status — gVisor returns the container's exit directly, NO forge surface),
-//!      stdout-capture contains `hello-stdout`, stderr-capture contains `oops`.
-//!   2. A command sleeping past `timeout_secs=2` ⇒ `timed_out == true`, `exit_code == None`, the whole
-//!      container is killed + cleaned up (no leftover `runsc list` entry, no leaked bundle temp dir).
-//!   3. The untrusted process runs NON-ROOT (uid 65534) inside the sandbox (defense in depth).
-//!
-//! ## Gating (CI without runsc still passes; THIS host must really run a container)
-//! SKIPPED GRACEFULLY (returns early, NOT failed) when `runsc` is not on PATH or the staged minimal
-//! rootfs is absent — so CI without runsc stays green. With `MYELIN_REQUIRE_RUNSC=1` an absent
-//! capability is a HARD FAILURE (panic), never a vacuous green — the CT-002b DONE bar refuses a green
-//! that did not really run a `runsc` container. Run:
-//! `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-ci-sandbox --features integration --test gvisor_prod_exec_test -- --nocapture`.
-
 #![cfg(feature = "integration")]
 
 use myelin_ci_sandbox::asset_registry::{GvisorAssetRegistry, RootfsAssetBinding};
@@ -42,11 +15,6 @@ use std::time::{Duration, Instant};
 
 static REAL_RUNSC_LOCK: Mutex<()> = Mutex::new(());
 
-/// The real, already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin) —
-/// `spec_running`'s image, registered against the SAME base rootfs [`resolved_gvisor_rootfs`]
-/// resolves (env override → `~/.local/share/gvisor-assets/rootfs`). CT-007 gate 2/4 made `spec.image`
-/// the real launch authority, so this test's `GvisorBackend` needs a registry mapping that EXACT
-/// image to a real, digest-matching directory — no fabricated placeholder digest can resolve.
 fn linux_small_v1_image() -> ImageRef {
     ImageRef::pinned(format!(
         "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
@@ -78,7 +46,6 @@ impl SandboxOutputSink for LiveOutput {
     }
 }
 
-/// Whether `runsc` resolves on PATH (env override `MYELIN_RUNSC_BIN`).
 fn runsc_bin() -> Option<String> {
     let bin = std::env::var("MYELIN_RUNSC_BIN").unwrap_or_else(|_| "runsc".to_string());
     if bin.contains('/') {
@@ -93,7 +60,6 @@ fn runsc_bin() -> Option<String> {
     None
 }
 
-/// The drill preconditions: `runsc` on PATH AND the staged minimal rootfs present.
 fn preconditions() -> Option<String> {
     let bin = runsc_bin()?;
     if !resolved_gvisor_rootfs().exists() {
@@ -102,8 +68,6 @@ fn preconditions() -> Option<String> {
     Some(bin)
 }
 
-/// HARD-FAIL on an absent capability iff `MYELIN_REQUIRE_RUNSC=1` (the M2 exit gate refuses a vacuous
-/// green); otherwise GRACEFUL SKIP. Returns the resolved `runsc` bin, or `None` if the caller skips.
 fn require_or_skip(test: &str) -> Option<String> {
     if let Some(bin) = preconditions() {
         return Some(bin);
@@ -117,14 +81,12 @@ fn require_or_skip(test: &str) -> Option<String> {
         );
     }
     eprintln!(
-        "[{test}] SKIPPED: `runsc` not on PATH or the staged minimal rootfs is absent — this host \
+        "[{test}] SKIPPED: `runsc` not on PATH or the staged minimal rootfs is absent - this host \
          cannot run a gVisor container. (CI without runsc passes.)"
     );
     None
 }
 
-/// A trivial hardened CI JobSpec running `command`, with the given `timeout_secs` (default-deny egress
-/// ⇒ no netns; read-only root; pids ceiling set).
 fn spec_running(command: Vec<String>, timeout_secs: u32) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
@@ -155,7 +117,6 @@ fn spec_running(command: Vec<String>, timeout_secs: u32) -> JobSpec {
     .unwrap()
 }
 
-/// The four-guarantee hooks, all accepting (so the launch reaches a real `runsc` run).
 fn ok_hooks() -> RunnerHooks {
     RunnerHooks::new(
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
@@ -179,8 +140,6 @@ fn settling_hooks(settlements: Arc<AtomicUsize>) -> RunnerHooks {
     )
 }
 
-/// Count `runsc` containers this test process left behind (id prefix `myelin-prod-<pid>-`). Used to
-/// assert no container leaks after a timeout-kill teardown.
 fn leftover_containers(bin: &str) -> usize {
     let prefix = format!("myelin-prod-{}-", std::process::id());
     let out = std::process::Command::new(bin)
@@ -231,7 +190,7 @@ fn real_runsc_runs_command_and_captures_exit_stdout_stderr() {
     assert_eq!(
         result.exit_code,
         Some(7),
-        "the REAL container exited 7 — taken from the `runsc` child's REAL exit status (no forge surface)"
+        "the REAL container exited 7 - taken from the `runsc` child's REAL exit status (no forge surface)"
     );
     assert!(
         !result.timed_out,
@@ -389,7 +348,6 @@ fn real_runsc_runs_untrusted_command_non_root() {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let backend = GvisorBackend::new(test_registry());
-    // The untrusted command reports its own uid; the OCI config drops it to 65534 (defense in depth).
     let spec = spec_running(vec!["sh".into(), "-c".into(), "id -u; exit 0".into()], 60);
 
     let launch = backend.launch(&spec, &ok_hooks()).expect("run");
@@ -410,16 +368,6 @@ fn real_runsc_runs_untrusted_command_non_root() {
     backend.kill(&launch.handle).expect("teardown");
 }
 
-/// CT-002c host-side memory-DoS regression (REAL `runsc`). An untrusted workload emits FAR more than
-/// `SANDBOX_CAPTURE_BOUND` (here ~8 MiB) straight onto the container's stdout pipe — vastly exceeding
-/// the 256 KiB host capture cap AND the ~64 KiB OS pipe buffer. The fix proves BOTH properties:
-///   (a) BOUNDED HOST MEMORY — `result.stdout.len() <= SANDBOX_CAPTURE_BOUND`: the host drain thread
-///       head-captures at most the cap and DISCARDS the rest, so it never buffers the whole stream
-///       (the old `read_to_end`-then-truncate would have buffered all ~8 MiB before truncating).
-///   (b) NO PIPE DEADLOCK — the run TERMINATES with the REAL exit (`Some(0)`), NOT a timeout. The
-///       flood is far larger than the pipe buffer; because the host KEEPS READING past the cap
-///       (drain-and-discard) the container's writer never blocks, so it reaches its real exit. A
-///       buggy "stop reading at the cap" would block the writer, hang the container, force a timeout.
 #[test]
 fn real_runsc_runaway_stdout_is_capped_without_deadlock() {
     let Some(_bin) = require_or_skip("gvisor-prod-exec runaway-stdout-cap") else {
@@ -429,8 +377,6 @@ fn real_runsc_runaway_stdout_is_capped_without_deadlock() {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let backend = GvisorBackend::new(test_registry());
-    // Emit ~8 MiB of 'x' to stdout, then exit 0 (the pipeline's last command, `tr`, exits 0). dd,
-    // /dev/zero and tr are all present in the staged rootfs (used by the escape drill).
     let spec = spec_running(
         vec![
             "sh".into(),
@@ -458,14 +404,12 @@ fn real_runsc_runaway_stdout_is_capped_without_deadlock() {
         SANDBOX_CAPTURE_BOUND
     );
 
-    // (a) host memory stayed bounded: the captured head is <= the per-stream bound.
     assert!(
         result.stdout.len() <= SANDBOX_CAPTURE_BOUND,
         "captured stdout MUST be head-bounded to <= {SANDBOX_CAPTURE_BOUND}; got {} (a runaway \
          container must not be able to force the host to buffer the whole stream)",
         result.stdout.len()
     );
-    // (b) the run TERMINATED with the real exit — no pipe deadlock that defeats the timeout.
     assert_eq!(
         result.exit_code,
         Some(0),
@@ -476,7 +420,7 @@ fn real_runsc_runaway_stdout_is_capped_without_deadlock() {
     );
     assert!(
         !result.timed_out,
-        "an ~8 MiB completing flood must NOT time out — a timeout here would mean the host stopped \
+        "an ~8 MiB completing flood must NOT time out - a timeout here would mean the host stopped \
          draining and the container deadlocked on a full stdout pipe"
     );
 
@@ -494,7 +438,6 @@ fn real_runsc_command_past_timeout_is_whole_container_killed() {
         .lock()
         .unwrap_or_else(|error| error.into_inner());
     let backend = GvisorBackend::new(test_registry());
-    // Sleep 30s with a 2s ceiling — the whole container must be killed at ~2s and reaped.
     let spec = spec_running(vec!["sh".into(), "-c".into(), "sleep 30".into()], 2);
 
     let start = Instant::now();
@@ -517,7 +460,7 @@ fn real_runsc_command_past_timeout_is_whole_container_killed() {
     );
     assert_eq!(
         result.exit_code, None,
-        "a timed-out (killed) container has no trustworthy exit code — never fabricated as 0"
+        "a timed-out (killed) container has no trustworthy exit code - never fabricated as 0"
     );
     assert!(!result.passed(), "a timed-out job is not a pass");
     assert!(
@@ -527,10 +470,9 @@ fn real_runsc_command_past_timeout_is_whole_container_killed() {
 
     backend.kill(&launch.handle).expect("teardown");
 
-    // No leaked container + no leaked bundle temp dir (cleanup runs on every path).
     assert_eq!(
         leftover_containers(&bin),
         0,
-        "the timeout-killed container must be deleted — no leftover `runsc list` entry"
+        "the timeout-killed container must be deleted - no leftover `runsc list` entry"
     );
 }

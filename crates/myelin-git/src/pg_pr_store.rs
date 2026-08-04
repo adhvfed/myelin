@@ -1,11 +1,3 @@
-//! PostgreSQL authority for pull-request lifecycle state (GT-003b).
-//!
-//! The two tables are always scoped by the verified `(tenant_id, region)` pair. `git_pr_counter`
-//! allocates per-target-repository numbers in the same transaction that inserts `git_pr`, so aborted
-//! opens consume no number and concurrent committed opens are contiguous. `git_pr.version` is the
-//! optimistic identity exposed to update code; production mutations additionally lock the row before
-//! deriving the next JSON document, preventing read/modify/write lost updates.
-
 use std::future::Future;
 use std::sync::Arc;
 
@@ -344,8 +336,6 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_head_repo_idx
   ON git_pr (tenant_id, region, head_repo_slug, repo_slug, number)
 "#;
 
-/// Default `sort=updated` page index. `NULLS LAST` matches the Rust `Option<i64>` ordering used by
-/// the filesystem fallback; number is the stable total-order tie breaker.
 pub const CREATE_GIT_PR_REPO_UPDATED_LIST_INDEX_DDL: &str = r#"
 CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_repo_updated_list_idx
   ON git_pr (
@@ -355,7 +345,6 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_repo_updated_list_idx
   )
 "#;
 
-/// State-filtered updated pages retain index order without materializing the repository relation.
 pub const CREATE_GIT_PR_REPO_STATE_UPDATED_LIST_INDEX_DDL: &str = r#"
 CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_repo_state_updated_list_idx
   ON git_pr (
@@ -365,8 +354,6 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_repo_state_updated_list_idx
   )
 "#;
 
-/// `sort=created` is PR-number order; this companion serves state-filtered tabs while the primary
-/// key already serves the unfiltered backwards scan.
 pub const CREATE_GIT_PR_REPO_STATE_CREATED_LIST_INDEX_DDL: &str = r#"
 CREATE INDEX CONCURRENTLY IF NOT EXISTS git_pr_repo_state_created_list_idx
   ON git_pr (tenant_id, region, repo_slug, (record->>'state'), number DESC)
@@ -428,10 +415,6 @@ ALTER TABLE git_pr_command
   CHECK (length(operation_id) = 64 AND operation_id ~ '^[0-9a-f]{64}$');
 "#;
 
-/// Expand the command namespace from repository-local to tenant/region-global without rewriting
-/// the hot table or changing its repository FK/primary key. `CONCURRENTLY` keeps writers live; a
-/// pre-existing cross-repository collision fails deployment loudly and must be investigated rather
-/// than arbitrarily discarded.
 pub const CREATE_GIT_PR_COMMAND_OPERATION_SCOPE_INDEX_DDL: &str = r#"
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS git_pr_command_operation_scope_uidx
   ON git_pr_command (tenant_id, region, operation_id)
@@ -515,9 +498,6 @@ pub fn git_pr_hot_tables() -> HotTables {
     HotTables::declare([GIT_PR_TABLE, GIT_PR_COUNTER_TABLE, GIT_PR_COMMAND_TABLE])
 }
 
-/// Bounded request identity for response-lost retry safety. It is opaque, PII-free, and scoped by
-/// `(tenant, region)` in the command table. Repository remains payload/target authority and a
-/// cross-repository replay under the same operation id is rejected loudly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PrOperationId(String);
 
@@ -536,7 +516,6 @@ impl PrOperationId {
         ))
     }
 
-    /// Derive a stable, PII-free operation identity without retaining any raw source material.
     pub fn derive(domain: &str, parts: &[&[u8]]) -> Result<Self, DurableError> {
         if domain.is_empty() || domain.len() > 128 || !domain.is_ascii() {
             return Err(DurableError::Git("invalid PR operation-id domain".into()));
@@ -577,7 +556,6 @@ impl PrOperationId {
     }
 }
 
-/// A pending ref mutation, persisted before the existing ref-CAS is attempted.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MergeIntent {
     pub operation_id: String,
@@ -630,8 +608,6 @@ enum MergeLedgerState {
     Terminal(MergeAttempt),
 }
 
-/// Closed production mutation vocabulary. Callers cannot select an event type or overwrite an
-/// arbitrary JSON document.
 #[derive(Clone, Debug, serde::Serialize)]
 pub enum PrMutation {
     ReportChecks {
@@ -651,7 +627,6 @@ struct SealedPrRecord {
     body: Option<EncryptedColumn>,
 }
 
-/// Verified tenant, residency, and repository authority for one PR-store operation.
 #[derive(Clone, PartialEq, Eq)]
 struct VerifiedRepoScope {
     tenant_id: TenantId,
@@ -706,7 +681,6 @@ impl core::fmt::Debug for VerifiedRepoScope {
     }
 }
 
-/// Provider-only PostgreSQL PR authority. It exposes no raw pool constructor.
 #[derive(Clone)]
 pub struct PgPrStore {
     provider: SubstrateProvider,
@@ -837,8 +811,6 @@ impl PgPrStore {
         .transpose()
     }
 
-    /// Fetch at most one row beyond the caller's ceiling, so interactive list/count projections can
-    /// detect a pathological repository without materializing its entire PR relation in process.
     pub fn list_bounded(
         &self,
         scope: &TenantScope,
@@ -918,12 +890,6 @@ impl PgPrStore {
             .collect()
     }
 
-    /// Exact-count, bounded-return per-repository list read. One PostgreSQL statement computes all
-    /// tab/sidebar aggregates over the verified repository relation and selects only `limit + 1`
-    /// state-filtered rows in the requested order. The extra row detects continuation and is never
-    /// decrypted or returned. Unlike the legacy filesystem fallback, PostgreSQL does not reject a
-    /// large relation merely to preserve process bounds: aggregate work stays in SQL and only the
-    /// bounded page crosses into the process.
     pub fn list_page(
         &self,
         scope: &TenantScope,
@@ -1023,7 +989,6 @@ impl PgPrStore {
         })
     }
 
-    /// One-statement cross-repository bucket page over the already-authorized visible slug set.
     pub fn list_cross_page(
         &self,
         scope: &TenantScope,
@@ -1127,7 +1092,6 @@ impl PgPrStore {
         })
     }
 
-    /// Allocate the number, insert the row and stage `git.pr.opened` in one transaction.
     pub fn open(
         &self,
         scope: &TenantScope,
@@ -1153,7 +1117,6 @@ impl PgPrStore {
         )
     }
 
-    /// Failure-injection seam proving row and lifecycle event share one transaction.
     #[cfg(any(test, feature = "test-support"))]
     pub fn open_then_abort_for_test(
         &self,
@@ -1288,7 +1251,6 @@ impl PgPrStore {
         .map_err(pg_error)
     }
 
-    /// Serialize a record mutation with `FOR UPDATE`, then co-commit its canonical lifecycle event.
     #[allow(clippy::too_many_arguments)]
     fn mutate<F>(
         &self,
@@ -1562,9 +1524,6 @@ impl PgPrStore {
         .map_err(pg_error)
     }
 
-    /// Execute the complete production merge protocol against the concrete durable ref adapter.
-    /// A pending intent is recovered by inspecting the actual target tip; finalization is reachable
-    /// only after the adapter proves that tip equals the locked head OID.
     #[allow(clippy::too_many_arguments)]
     pub fn merge_pr_durable(
         &self,
@@ -1754,13 +1713,6 @@ impl PgPrStore {
         )
     }
 
-    /// Recover one persisted merge using only the target repository, target ref adapter, durable
-    /// intent, and command ledger. The source repository and its authorization are deliberately not
-    /// inputs: admission already froze and persisted those facts before the ref-CAS crash window.
-    ///
-    /// `Ok(None)` means no pending intent exists. Recovery events use the supplied authenticated
-    /// recovery principal, pseudonymized by [`Self::emit_context`], and explicitly link causality to
-    /// the PII-free operation digest stored in the intent.
     #[allow(clippy::too_many_arguments)]
     pub fn recover_pending_merge_target(
         &self,
@@ -1949,8 +1901,6 @@ impl PgPrStore {
         .map_err(pg_error)
     }
 
-    /// Enumerate recovery work for the verified tenant/region only. Startup code then opens the
-    /// exact target/source repositories and re-enters `merge_pr_durable`, which verifies actual tips.
     pub fn list_pending_merges_bounded(
         &self,
         scope: &TenantScope,
@@ -2754,8 +2704,6 @@ fn payload_hash(value: &impl serde::Serialize) -> Result<String, DurableError> {
 }
 
 fn merge_payload_hash(number: u64, intent: &MergeIntent) -> Result<String, DurableError> {
-    // `expected_old_oid` is an observation made by the server immediately before CAS, not request
-    // identity. Excluding it keeps the command hash stable across response-loss/crash recovery.
     payload_hash(&(
         number,
         intent.base_ref.as_str(),
@@ -3456,7 +3404,6 @@ mod tests {
         let handle = tokio::runtime::Handle::current();
         let kms = Arc::new(KmsEngine::new());
 
-        // A raw/admin-connected provider never carries the validated runtime capability marker.
         let mut admin_cfg = cfg.clone();
         admin_cfg.database_url = cfg.database_migration_url.clone();
         let raw_admin = SubstrateProvider::connect(admin_cfg, 1)
@@ -3501,7 +3448,6 @@ mod tests {
             handle,
             Arc::new(UlidMinter::new()),
         );
-        // @residency-cell-pinned: integration admin pool uses the validated region-specific DSN.
         let admin = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .connect(&cfg.database_migration_url)
@@ -3518,7 +3464,6 @@ mod tests {
         let scope_b = TenantScope::from_verified_token(&actor_b, actor_b.region.clone());
         let repo = "core";
 
-        // Aborting after event staging rolls back the row, counter allocation, command and outbox.
         let abort_op = PrOperationId::parse("abort-open").unwrap();
         assert!(store
             .open_then_abort_for_test(
@@ -3548,9 +3493,6 @@ mod tests {
         .unwrap();
         assert_eq!(abort_events, 0, "aborted open emitted no ghost event");
 
-        // Production merge admission ignores legacy PR-record green arrays and rereads Git's
-        // projection while it freezes the intent. With no projection row, a required context blocks
-        // even if the old array claims green.
         let projection_slug = format!("projection-admission-{suffix}");
         let projection_loc = RepoLoc::new(&tenant_a, &region, &projection_slug);
         let projection_root =
@@ -3621,7 +3563,6 @@ mod tests {
             "a blocked projection decision never freezes a merge intent"
         );
 
-        // Exact retry replays one historical result/event; divergent reuse is rejected.
         let open_op = PrOperationId::parse("open-1").unwrap();
         let opened = store
             .open(
@@ -3652,7 +3593,6 @@ mod tests {
             )
             .is_err());
 
-        // Concurrent opens allocate a gap-free committed range and never collide.
         let mut joins = Vec::new();
         for i in 0..8_u64 {
             let store = store.clone();
@@ -3679,8 +3619,6 @@ mod tests {
         numbers.sort_unstable();
         assert_eq!(numbers, (2..=9).collect::<Vec<_>>());
 
-        // The storage-paginated read returns only the bounded page while exact counts survive an
-        // empty/out-of-range page from the same statement.
         let page_query = PrListQuery::new(
             PrListState::All,
             PrListSort::Created,
@@ -3716,7 +3654,6 @@ mod tests {
         assert_eq!(empty.total, 0);
         assert_eq!(empty.counts.all, 9, "empty pages retain exact full badges");
 
-        // Concurrent read/modify/write mutations retain both reviews; exact retry emits no duplicate.
         let mut mutation_joins = Vec::new();
         for i in 0..2_u64 {
             let store = store.clone();
@@ -3774,7 +3711,6 @@ mod tests {
             "10 opens (including projection admission) + 2 mutations, exactly once"
         );
 
-        // Tenant RLS makes the same repo/number invisible; region mismatch fails before SQL.
         assert!(store.get(&scope_b, repo, opened.number).unwrap().is_none());
         let tenant_a_for_probe = tenant_a.clone();
         let repo_for_probe = repo.to_string();
@@ -3809,7 +3745,6 @@ mod tests {
             Err(DurableError::NotFound(_))
         ));
 
-        // The broad JSON projection and command result contain no plaintext or subject locator.
         let row = sqlx::query(
             "SELECT record::text AS record,title_ciphertext,author_subject_id FROM git_pr
               WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4",
@@ -3872,7 +3807,6 @@ mod tests {
         .unwrap();
         assert_eq!(leaking_envelopes, 0, "lifecycle envelopes remain PII-free");
 
-        // Concrete durable ref crash recovery: admitted intent freezes policy/source authority.
         let root = std::env::temp_dir().join(format!("myelin-pg-pr-live-{suffix}"));
         let git_store = crate::durable::DurableGitStore::rooted(&root);
         let policy_store = DurablePrStore::rooted(&root);
@@ -3999,8 +3933,6 @@ mod tests {
 
             let ref_store = open_ref_store(target.clone(), slug, ctx);
             if slug == "merge-before" {
-                // Mutable policy/source become invalid after the durable admitted intent. Recovery
-                // must still execute the exact locked CAS instead of wedging Pending.
                 policy_store
                     .put_protection(&loc, &crate::pr_store::BranchProtectionConfig::default())
                     .unwrap();
@@ -4028,7 +3960,6 @@ mod tests {
                     Some(MergeAttempt::Merged { .. })
                 ));
             } else if slug == "merge-after" {
-                // Simulate crash after the concrete ref CAS but before PostgreSQL finalization.
                 target
                     .update_ref_cas(
                         "refs/heads/main",
@@ -4211,7 +4142,6 @@ mod tests {
             "all lifecycle envelopes remain PII-free"
         );
 
-        // Subject crypto-shred makes every column under that exact canonical subject unavailable.
         assert!(kms.destroy_dek(&DekId::new(
             TenantId(tenant_a.clone()),
             KeyClass::Subject(actor.principal_id.0.clone()),

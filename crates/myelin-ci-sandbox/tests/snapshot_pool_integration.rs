@@ -1,40 +1,9 @@
-//! # The LIVE pre-warmed snapshot-pool restore proof (CI-P4 → P-240, M2) — REAL Firecracker
-//! `PauseVM → CreateSnapshot → LoadSnapshot → ResumeVM` on real silicon.
-//!
-//! **Owning architecture (byte-authoritative):**
-//! `continuous-integration/architecture/02-internals-and-algorithms.md` §5.4 (pre-warmed snapshot
-//! pools — "Firecracker resumes from a memory **snapshot** in tens of ms"). **Contract:** 12.4
-//! (the warm buffer is region-pinned). **Doctrine:** EI-04 §5.1 (a property not drilled on a real
-//! kernel is a claim) — so the snapshot/restore is PROVEN on real KVM, not modelled.
-//!
-//! ## What it proves (and what it does NOT)
-//! This drives the REAL Firecracker **snapshot/restore** cycle through the API socket
-//! (`firecracker --api-sock`), exactly the cycle the [`SnapshotPool`]'s warm buffer is built on:
-//! 1. launch a hardened guest (read-only squashfs root, NO NIC — egress device-closed) and start it;
-//! 2. **PauseVM** then **CreateSnapshot** (a Full memory+state snapshot) — the warm-buffer source;
-//! 3. **LoadSnapshot** into a FRESH Firecracker with `resume_vm:true` — the warm RESTORE the pool
-//!    hands out (tens of ms);
-//! 4. assert the RESTORED guest RUNS — it answers `GET /vm/config` (the resumed VMM is live) and the
-//!    restored boot-source is the hardened read-only-root config.
-//!
-//! This is the LIVE backing for [`SnapshotPool`]'s [`SnapshotRestore`] seam: the modelled restore in
-//! the unit tests is the DB/VM-free floor; THIS is the real cycle on real silicon. The
-//! one-job-per-sandbox-ephemeral invariant is NOT weakened by snapshotting — the snapshot is taken
-//! from a CLEAN pre-boot guest (no job ran in it), and the pool kills a restored guest after one job.
-//!
-//! ## Gating (CI without KVM still passes)
-//! SKIPPED GRACEFULLY (returns early, NOT failed) when `/dev/kvm`, `firecracker`, `curl`, or the
-//! staged assets are absent. On a KVM host with the staged assets it MUST actually snapshot + restore
-//! and assert the restored guest runs. Run with `cargo test -p myelin-ci-sandbox --features
-//! integration --test snapshot_pool_integration -- --nocapture`.
-
 #![cfg(feature = "integration")]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// Resolve the staged kernel/rootfs/firecracker and whether the host can boot a microVM.
 fn preconditions() -> Option<(PathBuf, PathBuf, String)> {
     let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
     let asset = PathBuf::from(home)
@@ -72,7 +41,6 @@ fn which(bin: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// One `curl --unix-socket` request to a Firecracker API socket. Returns stdout (the API response).
 fn api(sock: &Path, method: &str, route: &str, body: &str) -> String {
     let out = Command::new("curl")
         .arg("-s")
@@ -95,13 +63,12 @@ fn pre_warmed_snapshot_restore_runs_the_restored_guest_on_real_silicon() {
     let Some((kernel, rootfs, fc)) = preconditions() else {
         eprintln!(
             "[snapshot-pool integration] SKIPPED: /dev/kvm or `firecracker` or `curl` or the staged \
-             guest assets are absent — this host cannot snapshot/restore a microVM. (CI without KVM \
+             guest assets are absent - this host cannot snapshot/restore a microVM. (CI without KVM \
              passes.)"
         );
         return;
     };
 
-    // A private working dir for the sockets + the snapshot files.
     let work = std::env::temp_dir().join(format!("myelin-snap-{}", std::process::id()));
     std::fs::create_dir_all(&work).expect("create work dir");
     let sock1 = work.join("fc1.sock");
@@ -109,8 +76,6 @@ fn pre_warmed_snapshot_restore_runs_the_restored_guest_on_real_silicon() {
     let snap = work.join("snap.file");
     let mem = work.join("mem.file");
 
-    // ── 1) Launch the source Firecracker with an API socket, configure a HARDENED guest (read-only
-    //    squashfs root, NO NIC ⇒ egress device-closed), and START it.
     let mut fc1 = Command::new(&fc)
         .arg("--api-sock")
         .arg(&sock1)
@@ -120,7 +85,6 @@ fn pre_warmed_snapshot_restore_runs_the_restored_guest_on_real_silicon() {
         .expect("spawn source firecracker");
     std::thread::sleep(Duration::from_millis(600));
 
-    // The SAME hardened posture the production backend builds (read-only-root cmdline, no NIC).
     let boot_args =
         "console=ttyS0 reboot=k panic=1 pci=off root=/dev/vda ro init=/sbin/init".to_string();
     api(
@@ -154,10 +118,8 @@ fn pre_warmed_snapshot_restore_runs_the_restored_guest_on_real_silicon() {
         "actions",
         "{\"action_type\":\"InstanceStart\"}",
     );
-    // Let the guest boot to userspace before snapshotting.
     std::thread::sleep(Duration::from_millis(2500));
 
-    // ── 2) PauseVM → CreateSnapshot (the warm-buffer SOURCE: a clean pre-job memory+state snapshot).
     api(&sock1, "PATCH", "vm", "{\"state\":\"Paused\"}");
     api(
         &sock1,
@@ -177,8 +139,6 @@ fn pre_warmed_snapshot_restore_runs_the_restored_guest_on_real_silicon() {
         "CreateSnapshot must produce the snapshot + memory files (the warm-buffer source)"
     );
 
-    // ── 3) LoadSnapshot into a FRESH Firecracker with resume_vm:true — the WARM RESTORE the pool
-    //    hands out (tens of ms). This is the resume-from-snapshot the SnapshotPool::acquire models.
     let mut fc2 = Command::new(&fc)
         .arg("--api-sock")
         .arg(&sock2)
@@ -201,16 +161,12 @@ fn pre_warmed_snapshot_restore_runs_the_restored_guest_on_real_silicon() {
     );
     let restore_ms = t0.elapsed().as_millis();
 
-    // ── 4) Assert the RESTORED guest RUNS: it answers GET /vm/config (the resumed VMM is live), and
-    //    the restored boot-source is the hardened read-only-root config.
     std::thread::sleep(Duration::from_millis(400));
     let cfg = api(&sock2, "GET", "vm/config", "");
     let _ = fc2.kill();
     let _ = fc2.wait();
     let _ = std::fs::remove_dir_all(&work);
 
-    // A LoadSnapshot error surfaces in the response body (a non-empty error JSON); resume_vm:true
-    // means a successful load already RESUMED the guest.
     assert!(
         !load_resp.contains("\"fault_message\"") && !load_resp.to_lowercase().contains("error"),
         "LoadSnapshot(resume_vm=true) must succeed and resume the restored guest.\n--- load ---\n{load_resp}"
@@ -225,10 +181,9 @@ fn pre_warmed_snapshot_restore_runs_the_restored_guest_on_real_silicon() {
     );
     assert!(
         cfg.contains("\"network-interfaces\":[]"),
-        "the restored guest has NO NIC (egress device-closed — hardening survives the restore)."
+        "the restored guest has NO NIC (egress device-closed - hardening survives the restore)."
     );
 
-    // ── The DATED GREEN ARTIFACT LINE (the warm-restore proof on real silicon).
     let date = "2026-06-21";
     println!(
         "[GREEN] {date} pre-warm snapshot-restore PASS | backend=firecracker(microVM/KVM) v1.16.0 | \

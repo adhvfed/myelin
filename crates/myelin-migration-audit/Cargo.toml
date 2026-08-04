@@ -5,9 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# A test-support LEAF above every production PgBootstrap composition root. Keeping the cross-service
-# catalog here avoids reverse service dependencies in myelin-storage and keeps ordinary storage
-# test compilation focused. Nothing in the production graph depends on this crate.
 [dependencies]
 myelin-storage = { path = "../myelin-storage" }
 myelin-identity-service = { path = "../myelin-identity-service" }

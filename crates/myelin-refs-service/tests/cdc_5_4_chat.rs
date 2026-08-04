@@ -1,25 +1,3 @@
-//! **REF-P21 / P-337 — the CDC pair for the Refs consumer side of 5.4 (Chat), the MAXIMAL producer.**
-//!
-//! These run on the default `cargo test --workspace` (DB-free): they exercise the Chat producer →
-//! consumer round-trip through the REAL [`myelin_events::OutboxTransaction`] (the same-tx co-commit,
-//! contract 2.2) over the in-memory [`myelin_events::OutboxStore`] (which models the §3.2 outbox
-//! table's emit-iff-committed semantics exactly) + the in-memory edge projection (which models the
-//! §3.2 `edge` table). The REAL Postgres `edge` table proof for the Chat corpus is
-//! `tests/integration_ref_p21_chat_producer.rs` (the `integration` feature).
-//!
-//! What is proven here (Chat is the FINAL, MAXIMAL producer — it unfurls EVERY artifact class):
-//! - **CDC 5.4 (provider side, Chat):** a real Chat message body (mention/artifact_ref/embed over
-//!   issue / commit / doc / CI run / another message) emits exactly one `refs.edge.created` per
-//!   structured node via [`ChatEdgeProducer::emit_chat_edges`] — the SAME `OutboxTx::emit` seam every
-//!   producer uses, no Chat-specific edge-write API.
-//! - **CDC 5.4 (consumer side, Chat):** those emitted edges, ingested through the edge projection,
-//!   land as the right `(source, target, rel)` reference triples sourced from the Chat message root —
-//!   the leak-free reference corpus Refs traverses.
-//! - **Emit-iff-committed (REF-D7 producer half):** the Chat message's edges become durable IFF the
-//!   message-send transaction commits; an aborted send drops them (no unfurl edge without its message).
-//! - **Cross-subsystem traversal COMPLETE:** the one Chat message's edge set spans all five producer
-//!   subsystems (Git / CI / Knowledge / Issues / Chat) — the R-M4 milestone.
-
 use myelin_content::InlineNode;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase,
@@ -45,7 +23,6 @@ fn principal() -> Principal {
     )
 }
 
-/// The `chat.message.created` event the unfurl edges co-commit into (the CAUSE).
 fn content_event(depth: u32) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId("01J-chat-msg".into()),
@@ -89,8 +66,6 @@ fn store_and_minter() -> (OutboxStore, Arc<dyn IdMinter>) {
     )
 }
 
-/// The MAXIMAL Chat message body: it unfurls every artifact class (Issues / Git / CI / Knowledge /
-/// Chat) + mentions a person — five structured nodes → five edges.
 fn maximal_chat_body() -> Vec<InlineNode> {
     vec![
         InlineNode::Mention(principal()),
@@ -101,8 +76,6 @@ fn maximal_chat_body() -> Vec<InlineNode> {
     ]
 }
 
-/// **CDC 5.4 (Chat, provider→consumer): a real Chat message's unfurls emit one edge per node, commit,
-/// and ingest as the right reference triples sourced from the Chat message root.**
 #[test]
 fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
     let (store, minter) = store_and_minter();
@@ -111,7 +84,6 @@ fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
     let content = content_event(2);
     let body = maximal_chat_body();
 
-    // ── PROVIDER side: emit the unfurl edges in the SAME transaction as the message write. ──
     let mut tx = store.begin(minter, ctx_base());
     tx.stage_state_change("chat message 01HMSGCDC written");
     let ids: Vec<EventId> = producer
@@ -130,8 +102,6 @@ fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
         "five edge rows durable after commit"
     );
 
-    // ── CONSUMER side: each emitted edge is a `refs.edge.created` reference triple from the Chat ──
-    //    message root, spanning all five producer subsystems (cross-subsystem traversal complete).
     let proj = EdgeProjection::new();
     let mut rels: Vec<EdgeRel> = Vec::new();
     for id in &ids {
@@ -143,7 +113,6 @@ fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
             env.payload["source"], "myelin://acme/chat/message/01HMSGCDC",
             "every unfurl edge is sourced from the Chat message root"
         );
-        // The loop-guard +1 depth stamp + the carried correlation root.
         assert_eq!(env.depth, content.depth + 1);
         assert_eq!(env.correlation_id, content.correlation_id);
         rels.push(match env.payload["rel"].as_str().unwrap() {
@@ -152,7 +121,6 @@ fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
             "embeds" => EdgeRel::Embeds,
             other => panic!("unexpected rel {other}"),
         });
-        // Model the consumer-side ingest into the §3.2 edge projection (the reference corpus).
         let target = env.payload["target"].as_str().unwrap();
         let id_str = myelin_refs_service::edge_id(
             &tenant(),
@@ -178,7 +146,6 @@ fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
             },
         );
     }
-    // The X-2 uniform producer mapping, in document order.
     assert_eq!(
         rels,
         vec![
@@ -190,8 +157,6 @@ fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
         ]
     );
 
-    // Cross-subsystem traversal COMPLETE: the one message's edge set spans all five producer
-    // subsystems (mention → identity/member; + issue/git/ci/knowledge targets).
     let subsystems: std::collections::BTreeSet<String> = body
         .iter()
         .filter_map(|n| match n {
@@ -205,12 +170,10 @@ fn chat_unfurls_emit_commit_and_ingest_as_reference_edges() {
         ["ci", "git", "issue", "knowledge"]
             .iter()
             .all(|s| subsystems.contains(*s)),
-        "the maximal Chat message unfurls every prior producer class — traversal complete"
+        "the maximal Chat message unfurls every prior producer class - traversal complete"
     );
 }
 
-/// **Emit-iff-committed (REF-D7 producer half): an ABORTED chat message-send emits ZERO unfurl edges.**
-/// No unfurl edge without its chat message — the buffered edge rows drop with the aborted transaction.
 #[test]
 fn aborted_chat_message_emits_zero_unfurl_edges() {
     let (store, minter) = store_and_minter();
@@ -229,7 +192,6 @@ fn aborted_chat_message_emits_zero_unfurl_edges() {
             5,
             "five edges buffered into the open transaction"
         );
-        // DROP tx without commit (the abort / crash between state-write and publish).
     }
     assert_eq!(
         store.outbox_depth(),

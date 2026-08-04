@@ -1,5 +1,3 @@
-//! Live PostgreSQL proof that the deployable Issues authorization worker boots, reconciles, drains,
-//! and restarts without a duplicate activation/event.
 #![cfg(feature = "integration")]
 
 use myelin_config::{Mode, MyelinConfig};
@@ -143,8 +141,6 @@ async fn production_worker_boots_reconciles_and_restarts_idempotently() {
     assert_eq!(first.metrics().snapshot().newly_activated, 1);
     first.shutdown().await.expect("first worker drains");
 
-    // A fresh store + worker models process restart. The durable pending/active state is the oracle;
-    // the second immediate scan emits no second `issue.created` event.
     let restarted = Arc::new(PgIssueStore::new(
         provider.clone(),
         kms,

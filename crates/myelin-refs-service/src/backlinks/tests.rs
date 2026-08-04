@@ -1,20 +1,3 @@
-//! Unit + chained + drill tests for the REF-P11 permission-filtered backlink read.
-//!
-//! Coverage (the prompt's TESTS clause):
-//! - **Every `SetExpr` lowering form** (`Ids`, `NotIds`, `InRelation`, `TupleSet`, `Union`,
-//!   `Intersect`, `Difference`, `All`, `None`) → the correct SQL predicate / JOIN over
-//!   `edge.source_root` (the lowering SHAPE pinned identical to §4.4 / the Identity-side §7.2).
-//! - **Every admit form** (the in-memory model of the conjoined scan predicate) — the leak-critical
-//!   mapping a mutation must not flip.
-//! - **REF-D1 backlink half** (the cardinal sin F1): a confidential referrer is ABSENT for an
-//!   unauthorized viewer — incl. filter-mode and under zookie staleness. 0 unauthorized backlinks.
-//! - **REF-D2** (F2): a cross-tenant edge read is 0 — the read carries `WHERE tenant = :viewer.tenant`
-//!   (the tenant-first `inbound_live` partition; no cross-tenant path).
-//! - **REF-D6** (F8, new-enemy): grant → read (visible) → revoke with a new zookie → re-read (absent),
-//!   the chained test proving the carried zookie + watermark fall-back never serves a stale allow.
-//! - **No N+1**: the read issues ONE scan (`query_count` == 1); the filter-mode-split telemetry fires.
-//! - **Pagination**: the read is always paginated (`page > 0`; `LIMIT :page`).
-
 use super::*;
 use myelin_identity::{
     AuthzIndexRef, ConsistencyMode, ObjectId, PrincipalId, PrincipalKind, RelName, Zookie,
@@ -46,23 +29,17 @@ fn latest() -> Consistency {
     }
 }
 
-/// The canonical target the backlinks point at (a public artifact everyone references).
 fn target_root() -> ArtifactRef {
     aref("myelin://acme/issue/issue/PUBLIC-1")
 }
 
-/// A confidential referrer (the artifact whose backlink MUST be hidden from a viewer who cannot see
-/// it — the REF-D1 leak-test source).
 fn secret_source() -> ArtifactRef {
     aref("myelin://acme/issue/issue/SECRET-9")
 }
-/// A public referrer everyone may see.
 fn public_source() -> ArtifactRef {
     aref("myelin://acme/issue/issue/OPEN-2")
 }
 
-/// Seed two inbound edges to `target_root`: one from a SECRET source, one from a PUBLIC source. The
-/// backlink read must admit the public one and hide the secret one for an unauthorized viewer.
 fn seeded_read() -> BacklinkRead {
     let edges = EdgeProjection::new();
     for (eid, src) in [("e-secret", secret_source()), ("e-public", public_source())] {
@@ -86,8 +63,6 @@ fn seeded_read() -> BacklinkRead {
     }
     BacklinkRead::new(edges, AuthzVisibleIndex::new())
 }
-
-// ─────────────────────────────── lowering: every SetExpr form → SQL ───────────────────────────────
 
 #[test]
 fn all_lowers_to_true_no_predicate() {
@@ -261,8 +236,6 @@ fn repeated_relation_emits_one_join_no_n_plus_1() {
     );
 }
 
-// ─────────────────────────────── admit: every SetExpr form (the conjoined predicate) ──────────────
-
 #[test]
 fn admit_all_and_none() {
     let authz = AuthzVisibleIndex::new();
@@ -355,7 +328,6 @@ fn admit_in_relation_reads_the_reverse_index() {
 fn admit_difference_a_except_b() {
     let authz = AuthzVisibleIndex::new();
     let v = viewer("p:a");
-    // All EXCEPT {secret} → admit public, deny secret.
     let expr = SetExpr::Difference(
         Box::new(SetExpr::All),
         Box::new(SetExpr::Ids(vec![ObjectId(secret_source().0)])),
@@ -378,16 +350,8 @@ fn admit_difference_a_except_b() {
     ));
 }
 
-// ─────────────────────────────── REF-D1: backlink leak half (the cardinal sin) ────────────────────
-
-/// **REF-D1 (F1, backlink half): a confidential referrer is ABSENT from `backlinks` for an
-/// unauthorized viewer — 0 unauthorized backlinks (incl. filter-mode).** The viewer may see the
-/// PUBLIC source but NOT the SECRET one; the backlink read returns ONLY the public backlink — the
-/// secret referrer never appears (no per-edge check side-channel, no post-filter leak).
 #[test]
 fn ref_d1_confidential_referrer_absent_for_unauthorized_viewer() {
-    // The viewer may view ONLY the public source. Grant view of the public source through the read's
-    // own reverse index (the Filter/InRelation pushed-down mode reads it).
     let read = seeded_read();
     read.authz.grant(
         &tenant(),
@@ -398,7 +362,6 @@ fn ref_d1_confidential_referrer_absent_for_unauthorized_viewer() {
         "zk-00000000000000000003",
     );
 
-    // Pushed-down (Filter/InRelation) mode: list_objects returns the SetExpr; Refs lowers + conjoins.
     let lo = ListObjectsResult::Filter {
         set_expr: SetExpr::InRelation {
             relation: RelName("view".into()),
@@ -428,7 +391,6 @@ fn ref_d1_confidential_referrer_absent_for_unauthorized_viewer() {
         public_source(),
         "the public backlink is present"
     );
-    // 0 unauthorized backlinks: the SECRET referrer must be ABSENT.
     assert!(
         !page.edges.iter().any(|b| b.source == secret_source()),
         "0 leak: the confidential referrer must be ABSENT from backlinks"
@@ -444,12 +406,9 @@ fn ref_d1_confidential_referrer_absent_for_unauthorized_viewer() {
     );
 }
 
-/// **REF-D1 also holds in `Ids` (materialised) mode**: the small-result allow-set inlines as
-/// `source_root IN (…)`; an unauthorized referrer (not in the allow-set) is absent.
 #[test]
 fn ref_d1_holds_in_ids_filter_mode() {
     let read = seeded_read();
-    // list_objects materialised the allow-set as just the public source.
     let lo = ids_result(&[&public_source().0], "zk-1");
     let page = read
         .backlinks(
@@ -475,7 +434,6 @@ fn ref_d1_holds_in_ids_filter_mode() {
     );
 }
 
-/// **`None` denies everything (a viewer with no grants sees 0 backlinks).**
 #[test]
 fn none_denies_all_backlinks() {
     let read = seeded_read();
@@ -497,7 +455,6 @@ fn none_denies_all_backlinks() {
     assert_eq!(page.edges.len(), 0, "None → 0 backlinks (WHERE false)");
 }
 
-/// **`All` admits every backlink (an admin sees all referrers).**
 #[test]
 fn all_admits_every_backlink() {
     let read = seeded_read();
@@ -519,16 +476,10 @@ fn all_admits_every_backlink() {
     assert_eq!(page.edges.len(), 2, "All → every backlink (admin)");
 }
 
-// ─────────────────────────────── REF-D2: cross-tenant edge read is 0 ──────────────────────────────
-
-/// **REF-D2 (F2): a cross-tenant edge is NOT readable.** The read is tenant-first (`inbound_live`
-/// reads the `(viewer.tenant, region)` partition only). An edge seeded in tenant B's partition is
-/// invisible to a tenant-A read even with an `All` filter — there is NO cross-tenant query path.
 #[test]
 fn ref_d2_cross_tenant_edge_is_not_readable() {
     let edges = EdgeProjection::new();
     let tenant_b = TenantId("evilcorp".into());
-    // Seed an inbound edge in tenant B's partition pointing at the SAME target_root string.
     edges.upsert(
         &tenant_b,
         &region(),
@@ -547,7 +498,6 @@ fn ref_d2_cross_tenant_edge_is_not_readable() {
         },
     );
     let read = BacklinkRead::new(edges, AuthzVisibleIndex::new());
-    // A tenant-A viewer reads with an All filter — the tenant-B edge is in a DIFFERENT partition.
     let lo = ListObjectsResult::Filter {
         set_expr: SetExpr::All,
         zookie: Zookie("zk-1".into()),
@@ -570,12 +520,6 @@ fn ref_d2_cross_tenant_edge_is_not_readable() {
     );
 }
 
-// ─────────────────────────────── REF-D6: new-enemy (the chained test) ─────────────────────────────
-
-/// **REF-D6 (F8, new-enemy) — the chained test: grant → read backlinks (visible) → revoke with a new
-/// zookie → re-read with the post-revoke zookie → ABSENT.** The carried zookie bypasses any stale
-/// cache; the watermark fall-back guarantees a behind index never serves the just-revoked grant. The
-/// re-read returns 0 backlinks for the now-revoked viewer.
 #[test]
 fn ref_d6_new_enemy_grant_read_revoke_reread_absent() {
     let edges = EdgeProjection::new();
@@ -606,7 +550,6 @@ fn ref_d6_new_enemy_grant_read_revoke_reread_absent() {
         zookie: Zookie("zk-00000000000000000005".into()),
     };
 
-    // 1. GRANT: the viewer may view the secret source (at revision 5).
     authz.grant(
         &tenant(),
         &region(),
@@ -632,7 +575,6 @@ fn ref_d6_new_enemy_grant_read_revoke_reread_absent() {
         "the index is at-or-after the read revision → JOIN serves"
     );
 
-    // 2. REVOKE with a NEWER zookie (revision 9) — the grant is gone, the watermark advances.
     authz.revoke(
         &tenant(),
         &region(),
@@ -642,7 +584,6 @@ fn ref_d6_new_enemy_grant_read_revoke_reread_absent() {
         "zk-00000000000000000009",
     );
 
-    // 3. RE-READ with the post-revoke zookie (revision 9): the backlink is ABSENT (no stale allow).
     let absent = read
         .backlinks(
             &tenant(),
@@ -661,10 +602,6 @@ fn ref_d6_new_enemy_grant_read_revoke_reread_absent() {
     );
 }
 
-/// **The watermark fall-back fires when the reverse index is BEHIND the carried zookie.** A read
-/// pinned to a revision NEWER than the index watermark falls back to per-source `check` — and still
-/// returns the leak-free set (the in-memory index is fresh, so the fall-back admits the same set; the
-/// BRANCH is observable). A pure-`Ids` lowering is watermark-independent (always JOIN-serves).
 #[test]
 fn watermark_behind_falls_back_to_check_branch_observable() {
     let read = seeded_read();
@@ -683,7 +620,6 @@ fn watermark_behind_falls_back_to_check_branch_observable() {
         },
         zookie: Zookie("zk-00000000000000000007".into()),
     };
-    // The read requires rev 7; the index watermark is at 3 → fall back to check (the BRANCH).
     let page = read
         .backlinks(
             &tenant(),
@@ -699,11 +635,9 @@ fn watermark_behind_falls_back_to_check_branch_observable() {
         page.fell_back_to_check,
         "a behind index falls back to per-source check, never serves stale"
     );
-    // still leak-free: only the public backlink (the viewer was granted that one).
     assert_eq!(page.edges.len(), 1);
     assert_eq!(page.edges[0].source, public_source());
 
-    // A pure-Ids read pinned to a high revision is watermark-INDEPENDENT (it carries its own set).
     let ids = ids_result(&[&public_source().0], "zk-00000000000000000007");
     let ids_page = read
         .backlinks(
@@ -718,15 +652,10 @@ fn watermark_behind_falls_back_to_check_branch_observable() {
         .expect("read succeeds");
     assert!(
         !ids_page.fell_back_to_check,
-        "a materialised Ids set is watermark-independent — JOIN-serves"
+        "a materialised Ids set is watermark-independent - JOIN-serves"
     );
 }
 
-// ─────────────────────────────── no-N+1, telemetry, pagination ────────────────────────────────────
-
-/// **No N+1: the backlink read issues EXACTLY ONE scan** (`query_count` == 1), regardless of how many
-/// inbound edges it filters — never one `check` per inbound edge. The filter-mode-split telemetry
-/// fires (the Ids vs pushed-down split is observable).
 #[test]
 fn no_n_plus_1_one_query_and_filter_mode_split_fires() {
     let read = seeded_read();
@@ -770,12 +699,9 @@ fn no_n_plus_1_one_query_and_filter_mode_split_fires() {
         2,
         "both authorized backlinks (2 inbound edges)"
     );
-    // ONE scan, NOT one check per inbound edge.
     assert_eq!(read.query_count(), 1, "the read issues ONE query (no N+1)");
-    // the pushed-down split fired (1 pushed-down read, 0 Ids reads so far).
     assert_eq!(read.filter_mode_split(), (0, 1));
 
-    // a second read in Ids mode bumps the Ids side of the split (still one query each).
     let ids = ids_result(&[&public_source().0], "zk-1");
     let _ = read
         .backlinks(
@@ -796,8 +722,6 @@ fn no_n_plus_1_one_query_and_filter_mode_split_fires() {
     );
 }
 
-/// **Always paginated: a page size of 0 is a malformed request (fail loud — never an unbounded
-/// scan); a small page LIMITs the result.**
 #[test]
 fn pagination_zero_page_rejected_and_limit_applied() {
     let read = seeded_read();
@@ -805,7 +729,6 @@ fn pagination_zero_page_rejected_and_limit_applied() {
         set_expr: SetExpr::All,
         zookie: Zookie("zk-1".into()),
     };
-    // page 0 → InvalidPage (always paginated; no unbounded scan).
     let err = read
         .backlinks(
             &tenant(),
@@ -818,7 +741,6 @@ fn pagination_zero_page_rejected_and_limit_applied() {
         )
         .unwrap_err();
     assert_eq!(err, BacklinkError::InvalidPage);
-    // page 1 → LIMIT 1 (the most-recent admitted backlink only).
     let page = read
         .backlinks(
             &tenant(),
@@ -837,8 +759,6 @@ fn pagination_zero_page_rejected_and_limit_applied() {
     );
 }
 
-/// **`edges(ref, viewer)` is the same permission-filtered read as `backlinks` (the contract names
-/// both).** It returns the admitted inbound edges over the ref's root.
 #[test]
 fn edges_is_the_same_permission_filtered_read() {
     let read = seeded_read();
@@ -858,10 +778,6 @@ fn edges_is_the_same_permission_filtered_read() {
     assert_eq!(page.edges[0].source, public_source());
 }
 
-/// **The watermark advances MONOTONICALLY: a stale (older) revision never regresses it; an equal
-/// revision is a no-op.** This pins the new-enemy guard's freshness floor — a late-arriving older
-/// projection cannot make the index look STALER than it is (which would wrongly trigger a fall-back or
-/// — worse — let an older grant resurface).
 #[test]
 fn watermark_advances_monotonically_stale_never_regresses() {
     let authz = AuthzVisibleIndex::new();
@@ -870,20 +786,17 @@ fn watermark_advances_monotonically_stale_never_regresses() {
         authz.watermark(&tenant(), &region()),
         "zk-00000000000000000005"
     );
-    // a STALER revision must NOT regress the watermark (monotone).
     authz.advance_watermark(&tenant(), &region(), "zk-00000000000000000003");
     assert_eq!(
         authz.watermark(&tenant(), &region()),
         "zk-00000000000000000005",
         "a stale advance never regresses the watermark"
     );
-    // an EQUAL revision is a no-op (still 5).
     authz.advance_watermark(&tenant(), &region(), "zk-00000000000000000005");
     assert_eq!(
         authz.watermark(&tenant(), &region()),
         "zk-00000000000000000005"
     );
-    // a NEWER revision advances it.
     authz.advance_watermark(&tenant(), &region(), "zk-00000000000000000009");
     assert_eq!(
         authz.watermark(&tenant(), &region()),
@@ -891,7 +804,6 @@ fn watermark_advances_monotonically_stale_never_regresses() {
     );
 }
 
-/// **`BacklinkError::InvalidPage` renders a non-empty, descriptive message (Display).**
 #[test]
 fn backlink_error_display_is_descriptive() {
     let msg = format!("{}", BacklinkError::InvalidPage);
@@ -902,12 +814,9 @@ fn backlink_error_display_is_descriptive() {
     assert!(!msg.is_empty());
 }
 
-/// **The `edge_projection` / `authz_index` accessors return the SAME stores the read scans.** A
-/// grant/seed through the accessor is observed by the read (the `serve`-wiring + CDC seam).
 #[test]
 fn accessors_return_the_live_stores_the_read_scans() {
     let read = BacklinkRead::new(EdgeProjection::new(), AuthzVisibleIndex::new());
-    // seed an edge through the accessor → the read sees it.
     read.edge_projection().upsert(
         &tenant(),
         &region(),
@@ -958,9 +867,6 @@ fn accessors_return_the_live_stores_the_read_scans() {
     );
 }
 
-/// **The `target_root` rolls up sub-artifact backlinks: a backlink to `target#sub` is keyed on the
-/// stripped `target_root`, so the read finds it by the parent.** (The §3.2 stored-`target_root`
-/// design — one range scan, not a `LIKE` prefix.)
 #[test]
 fn sub_artifact_backlinks_roll_up_to_the_root() {
     let edges = EdgeProjection::new();
@@ -989,7 +895,6 @@ fn sub_artifact_backlinks_roll_up_to_the_root() {
         set_expr: SetExpr::All,
         zookie: Zookie("zk-1".into()),
     };
-    // reading the ROOT finds the backlink to the sub-artifact (rolled up via target_root).
     let page = read
         .backlinks(
             &tenant(),

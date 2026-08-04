@@ -1,27 +1,3 @@
-//! **CI-P20 / P-363 — the log pipeline, PROVEN against the live dev stack (RustFS + Postgres).**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_p20_log_pipeline -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires — CI-P20 touches the BlobStore
-//! (11.2 — object store) AND the T3 `(job, step, byte-range)` index (11.8 — DB):
-//!  1. **11.2 — the sealed segment flushes to the REAL RustFS bucket.** `LogPipeline<S3BlobStore>`
-//!     seals a segment; the `log_segment.blob_ref` content address resolves through the REAL
-//!     `S3BlobStore::get` (re-hash-on-read) to the exact redacted bytes — byte-identical, against
-//!     the live object store (NOT the fs floor, NOT a mock).
-//!  2. **11.8 — the index rows apply + INSERT + read back against the REAL Postgres.** The
-//!     `log_segment`/`log_anchor` forward-only DDL applies onto suffixed throwaway tables, the
-//!     produced rows INSERT via the FROZEN bind-param SQL (`INSERT_LOG_SEGMENT_QUERY` /
-//!     `UPSERT_LOG_ANCHOR_QUERY`), and a read-back proves the `(job, step, byte-range)` index is
-//!     consistent — 0 dangling anchors (every anchor's range is within the sealed segment's span).
-//!
-//! The drill is registered RED-UNTIL-PROVEN and flips green ONLY here, against the live stack —
-//! never mocked, never named a "floor". dev<->prod is a config swap (RustFS↔Scaleway), never a code
-//! change.
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
@@ -42,13 +18,10 @@ fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// Rewrite a production table-named DDL onto a uniquely-suffixed table (the SHAPE is unchanged — only
-/// the identifier is suffixed for isolation + cleanup).
 fn rename(ddl: &str, base: &str, tbl: &str) -> String {
     ddl.replace(&format!("EXISTS {base} ("), &format!("EXISTS {tbl} ("))
 }
 
-/// **11.2 — the sealed segment flushes to the REAL RustFS object store + round-trips byte-identically.**
 #[tokio::test(flavor = "multi_thread")]
 async fn sealed_segment_flushes_to_real_rustfs_and_round_trips() {
     let cfg = MyelinConfig::dev();
@@ -56,8 +29,6 @@ async fn sealed_segment_flushes_to_real_rustfs_and_round_trips() {
     let tenant = TenantId(format!("itest-ci-p20-{}", std::process::id()));
     let region = Region("fr-par".into());
 
-    // The whole seal + verify runs on ONE blocking thread (the sync BlobStore trait drives the async
-    // SDK via block_in_place; the pipeline owns its S3BlobStore for the seal).
     let line = "deploying build artifact to fr-par now".to_string();
     let line_for_thread = line.clone();
     let (blob_ref, got_bytes) = {
@@ -66,7 +37,6 @@ async fn sealed_segment_flushes_to_real_rustfs_and_round_trips() {
         let tenant = tenant.clone();
         let region = region.clone();
         tokio::task::spawn_blocking(move || {
-            // The pipeline seals to the REAL RustFS bucket (11.2 — not the fs floor).
             let store = S3BlobStore::connect(&cfg.s3, handle.clone());
             let mut p = LogPipeline::new(tenant.clone(), region, store, SecretRedactor::default())
                 .with_thresholds(
@@ -76,11 +46,9 @@ async fn sealed_segment_flushes_to_real_rustfs_and_round_trips() {
             let coord = LogCoord::new("01J0RUN", "01J0JOB", "1");
             p.ship_line(&coord, &line_for_thread)
                 .expect("in-region ship");
-            // seal_at_bytes = 1 → the line sealed immediately to a content-addressed RustFS blob.
             assert_eq!(p.segment_rows().len(), 1, "one sealed segment");
             let blob_ref = p.segment_rows()[0].blob_ref.clone().expect("blob_ref");
 
-            // Read the blob back THROUGH the real S3BlobStore (re-hash-on-read integrity).
             let verify_store = S3BlobStore::connect(&cfg.s3, handle);
             let addr = ContentHash::parse(&blob_ref).expect("the blob_ref parses");
             let got = verify_store
@@ -92,13 +60,11 @@ async fn sealed_segment_flushes_to_real_rustfs_and_round_trips() {
         .expect("the blocking seal+verify task joins")
     };
 
-    // The sealed bytes round-trip byte-identically against the REAL object store (11.2).
     assert_eq!(
         got_bytes,
         line.as_bytes(),
         "the sealed segment round-trips through RustFS"
     );
-    // The blob_ref is the content address of the sealed bytes (content-addressed, deterministic).
     let expected = ContentHash::blake3(line.as_bytes()).to_multihash_string();
     assert_eq!(
         blob_ref, expected,
@@ -106,8 +72,6 @@ async fn sealed_segment_flushes_to_real_rustfs_and_round_trips() {
     );
 }
 
-/// **11.8 — the `(job, step, byte-range)` index rows apply + INSERT + read back against REAL Postgres
-/// (0 dangling anchors).**
 #[tokio::test(flavor = "multi_thread")]
 async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
     use sqlx::Row;
@@ -127,8 +91,6 @@ async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
     let seg_tbl = format!("log_segment_p363_{suffix}");
     let anc_tbl = format!("log_anchor_p363_{suffix}");
 
-    // ── 1. Apply the REAL forward-only log_segment / log_anchor CREATE TABLE (arch 01 §3.5), ──
-    //       suffixed, + the platform-wide RLS scoping (the same helper every tenant table uses).
     for (base, tbl, ddl) in [
         (
             "log_segment",
@@ -155,8 +117,6 @@ async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
             .expect("grant the app role");
     }
 
-    // ── 2. Produce the index rows through the REAL pipeline (a fs-floor blob is fine here — this ──
-    //       test proves the INDEX write half; the RustFS seal is the sibling test).
     let tenant = TenantId(format!("itest-ci-p20-idx-{suffix}"));
     let mut p = LogPipeline::new(
         tenant.clone(),
@@ -174,7 +134,7 @@ async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
         "1",
     );
     for _ in 0..8 {
-        p.ship_line(&coord, "0123456789").expect("ship"); // 10 bytes each → seals at 40
+        p.ship_line(&coord, "0123456789").expect("ship");
     }
     p.close_step(&coord, AnchorStatus::Failed)
         .expect("close the step");
@@ -185,7 +145,6 @@ async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
         "0 dangling anchors in the produced index"
     );
 
-    // ── 3. INSERT the produced rows via the FROZEN bind-param SQL into REAL Postgres, RLS-pinned. ──
     let mut conn = app.acquire().await.unwrap();
     sqlx::query("SELECT set_config('myelin.tenant_id', $1, false)")
         .bind(tenant.as_str())
@@ -229,8 +188,6 @@ async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
             .expect("UPSERT the log_anchor row via the frozen bind-param SQL");
     }
 
-    // ── 4. Read back + PROVE the index is consistent: 0 dangling anchors against the live rows. ──
-    //       An anchor is dangling iff its byte_end exceeds the max sealed segment byte_end.
     let max_seg_end: i64 = sqlx::query(&format!(
         "SELECT COALESCE(MAX(byte_end), 0) AS m FROM {seg_tbl}"
     ))
@@ -249,10 +206,9 @@ async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
     assert_eq!(
         dangling, 0,
         "0 dangling anchors against the LIVE Postgres index (every (job, step) anchor's range is \
-         within the sealed segment span — 11.8 consistency)"
+         within the sealed segment span - 11.8 consistency)"
     );
 
-    // a sanity read: the segment row's blob_ref is durably present (the (blob, offset) index).
     let seg_count: i64 = sqlx::query(&format!(
         "SELECT COUNT(*) AS c FROM {seg_tbl} WHERE blob_ref IS NOT NULL"
     ))
@@ -265,7 +221,6 @@ async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
         "the sealed segment's (blob, offset) row is durably present"
     );
 
-    // ── cleanup ──
     sqlx::query(&format!("DROP TABLE IF EXISTS {seg_tbl}"))
         .execute(&admin)
         .await

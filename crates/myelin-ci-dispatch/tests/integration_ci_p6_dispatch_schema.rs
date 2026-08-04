@@ -1,4 +1,3 @@
-//! Live PostgreSQL proof for the single platform-owned `consumer_dedup` schema.
 #![cfg(feature = "integration")]
 
 use myelin_ci_dispatch::CREATE_CONSUMER_DEDUP_DDL;

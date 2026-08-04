@@ -1,31 +1,3 @@
-//! P-ST-24 (global P-253) GATE / DRILL — GIT-D2 (storage half), dated green artifact.
-//!
-//! **GIT-D2 (storage half) (storage.md §5.3 / testing-strategy §4.2 row GIT-D2):** erase a commit
-//! author → crypto-shred reaches backups / reflogs / bitmaps; the residual == the ONE platform
-//! posture (pseudonymous-by-default). Telemetry: the crypto-shred reach RECEIPT;
-//! `residual == documented posture`. The load-bearing zeros: **0 git structures (reflog / bitmap /
-//! pack-tier backup) recoverable from any backup** + **the commit-object residual is the documented
-//! posture, NOT a byte-mutation**.
-//!
-//! This drill seals real git-structure ciphertext (a reflog line, a bitmap index, a pack-tier-backup
-//! object) under the **per-tenant blob DEK** (`KeyClass::Blob`) — exactly how git's structures ride
-//! the [`myelin_storage::gitpack`] pack tier — then runs the real [`GitCryptoShredReach`] AS PART OF
-//! the [`CryptoShredErase`] step-2 crypto-shred (a commit author's full `erase`), and attempts
-//! recovery of each git structure from BOTH (a) the live store and (b) the KMS backup snapshot. The
-//! threshold is NOT weakened to pass: a single recoverable git structure `panic!`s (EI-01 §3 — the
-//! failure mode is a backup resurrecting a reflog / bitmap / pack object).
-//!
-//! **What stays a FLOOR (named, not silently green):**
-//! - **Pseudonymous-by-default commits is THE FLOOR** for the commit-object-byte residual (the
-//!   immutable bytes never carry erasable PII — P-248). This drill does NOT byte-mutate commit
-//!   objects; it asserts the residual is the documented posture.
-//! - **The audited history-rewrite erasure path (contract 10.6, the changed-hash consequence) is the
-//!   NAMED on-demand follow-on (M5 / on-demand)** — for the rare case the commit bytes themselves
-//!   must go (a leaked secret / a court order).
-//! - **The C6 outbound push-mirror residency gate seam is the SIBLING P-ST-25 (global P-255).**
-//! - This drill uses the KMS `backup_snapshot` (which already excludes a destroyed key, §7.5) as the
-//!   "backup"; the real PITR-backup reach is asserted end-to-end by the restore-verify gate STOR-D1.
-
 use myelin_gdpr::ErasureMethod;
 use myelin_storage::{
     BusErase, ColumnCryptor, CryptoShredErase, DekId, EpochMillis, EraseError, EraseHolders,
@@ -73,9 +45,6 @@ impl ErasureLedgerSink for DrillWiring {
     }
 }
 
-/// Seal a git structure's bytes under the per-tenant blob DEK (`KeyClass::Blob`) — the at-rest form
-/// of git's reflog / bitmap / pack-tier-backup ciphertext. Returns the `(key_ref, nonce, ct)` the
-/// live structure AND its pack-tier backup hold (a backup stores ciphertext under the DEK, §7.5).
 fn seal_git_structure(
     kms: &KmsEngine,
     tenant: &TenantId,
@@ -97,7 +66,6 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
 
     let kms = KmsEngine::new();
     kms.ensure_kek(&KekId::new(tenant.clone(), region()));
-    // The commit author's free-text body (per-subject DEK) — shredded by step 2 proper.
     let cryptor = ColumnCryptor::new(&kms, region());
     let body_col = cryptor
         .encrypt(
@@ -107,12 +75,9 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
             b"the author's commit message body (free text PII)",
         )
         .expect("seal the author's free-text body");
-    // The per-tenant blob DEK git's structures seal under.
     kms.ensure_dek(&tenant, &region(), KeyClass::Blob)
         .expect("blob dek");
 
-    // Seal each of the THREE shreddable git structures under the per-tenant blob DEK; retain the
-    // stored ciphertext so the drill can ATTEMPT recovery after the erase.
     let reflog = seal_git_structure(
         &kms,
         &tenant,
@@ -126,8 +91,6 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
     let pack_backup =
         seal_git_structure(&kms, &tenant, b"PACK\0\0\0\x02 a pack-tier backup object");
 
-    // Pre-condition: the author's body decrypts, each git structure decrypts, and the per-tenant
-    // blob DEK is in the backup snapshot.
     assert!(
         cryptor.decrypt(&body_col).is_ok(),
         "the author body decrypts before erase"
@@ -147,9 +110,6 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
         "the per-tenant blob DEK is in the backup before the git crypto-shred"
     );
 
-    // ── THE GIT-D2 (storage-half) MECHANISM: run the git crypto-shred reach (it performs the
-    // per-tenant blob DEK destroy AND verifies the post-condition). Its receipt is the dated
-    // artifact reading. ──
     let git_reach = GitCryptoShredReach::new(&kms, region());
     let git_receipt = git_reach.shred_git_structures(&tenant);
     assert!(
@@ -157,9 +117,6 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
         "the GIT-D2 reach destroyed the per-tenant blob DEK"
     );
 
-    // ── INTEGRATION: the commit author's full `erase` drives the SAME git reach as the step-2
-    // crypto-shred seam (here an idempotent re-run, since the reach above already shred). The
-    // per-subject free-text body is shredded by step 2 proper; the green seam proves the wiring. ──
     let eraser = CryptoShredErase::new(&kms, region());
     let wiring = DrillWiring::default();
     let holders = EraseHolders {
@@ -178,24 +135,18 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
         "the per-subject crypto-shred is green"
     );
 
-    // ── GIT-D2 assertions — attempt recovery of each git structure, prove 0 recoverable. ──
-
-    // (a) LIVE: each git structure is unrecoverable — the per-tenant blob DEK no longer resolves
-    // (a LOUD KmsError, NEVER plaintext). The reflog/bitmap/pack-backup bytes are inert ciphertext.
     for (kr, _nonce, _ct) in [&reflog, &bitmap, &pack_backup] {
         if kms.resolve_dek(kr, &region()).is_ok() {
             panic!(
-                "GIT-D2 BREACH: a git structure's DEK STILL RESOLVES after the crypto-shred — a \
+                "GIT-D2 BREACH: a git structure's DEK STILL RESOLVES after the crypto-shred - a \
                  reflog/bitmap/pack-backup could be recovered live"
             );
         }
     }
 
-    // (b) BACKUP: the per-tenant blob DEK is EXCLUDED from the backup snapshot (§7.5) — so no backup
-    // can resurrect a git structure. 0 recoverable in backup.
     if kms.backup_snapshot().iter().any(|(d, _)| *d == blob_dek) {
         panic!(
-            "GIT-D2 BREACH: the per-tenant blob DEK is STILL in the backup snapshot — a backup \
+            "GIT-D2 BREACH: the per-tenant blob DEK is STILL in the backup snapshot - a backup \
              could resurrect a git reflog/bitmap/pack object (0-recoverable-in-backup violated)"
         );
     }
@@ -204,11 +155,8 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
         "GIT-D2 (storage half): 0 git structures recoverable from any backup"
     );
 
-    // (c) The reach covered EVERY shreddable structure (reflog + bitmap + pack-tier backup).
     assert_eq!(git_receipt.structures_reached, GitShreddable::ALL.to_vec());
 
-    // (d) THE RESIDUAL == the ONE platform posture: pseudonymous-by-default (10.9, by reference) —
-    // the commit-object bytes are NOT byte-mutated; the on-demand history-rewrite (10.6) is named.
     assert_eq!(
         git_receipt.residual,
         GitResidual::PseudonymousByDefault,
@@ -216,7 +164,6 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
     );
     assert!(git_receipt.is_green(), "GIT-D2 (storage half) GREEN");
 
-    // ── DATED GREEN ARTIFACT (the GIT-D2 storage-half receipt). ──
     println!(
         "GIT-D2 (storage half) GREEN @ 2026-06-21 (P-253 / P-ST-24): \
          tenant={tenant} commit_author={author} \
@@ -235,9 +182,6 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
 
 #[test]
 fn git_d2_residual_is_handled_by_reference_never_a_storage_local_restatement() {
-    // The commit-object residual is handled BY REFERENCE (10.9 / 00 §X-7) — Storage contributes its
-    // structural reach but does NOT author a local residual statement (the residual posture is the
-    // ONE platform artifact, ratified once by counsel/DPO for all five subsystems).
     assert!(GitResidual::RESIDUAL_POSTURE_REF.contains("10.9"));
     assert!(GitResidual::RESIDUAL_POSTURE_REF.contains("pseudonymous-by-default"));
     assert!(

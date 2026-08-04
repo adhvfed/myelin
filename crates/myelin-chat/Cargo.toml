@@ -5,142 +5,29 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The Chat SUBSYSTEM crate (CHAT-P1 → P-128, M2). Chat is the MAXIMAL CONSUMER subsystem
-# (architecture chat 00-overview §2.1: four owned hot parts, everything else consumed). At
-# CHAT-P1 it carries ONLY the M2-C0 "freeze-so-dependents-compile" taxonomy slice: the COMPLETE
-# `chat.*` event-token list (architecture 03 §1.1/§1.2) split into the DURABLE-via-outbox set vs
-# the FIREHOSE-only set, each token PROVEN grammatical against the one Bus validator (EB-02/P-042)
-# — chat REGISTERS its list; it does NOT author the grammar (the names anchor X-5, no second token
-# language). The ReBAC fragment + #sub grammar are CHAT-P2; the humanise/notif/fanout slice is
-# CHAT-P3.
-#
-# DAG POSITION (a documented, NAMED leaf consumer, exactly like myelin-git / myelin-issues /
-# myelin-notif): it sits ABOVE the shared glue crates — it depends on the Bus event-taxonomy
-# carrier (myelin-events) and NOTHING in the production library DAG depends back on it. It is
-# therefore OUTSIDE the eleven-crate library DAG modelled by `myelin-substrate::crate_graph`
-# (substrate_is_root()/identity_is_sink() are preserved — a subsystem crate is the graph's
-# terminal consumer, not a node in it). No chat FEATURE ships at P-128: the durable set's emit
-# behaviour begins in CHAT-P5 (the outbox co-commit) and the firehose set's in CHAT-P10 (live
-# delivery). See the crate-level note in src/lib.rs.
 [dependencies]
-# The Bus event-taxonomy grammar validator + token table (contract 2.9 / EB-02). CHAT-P1 (P-128)
-# REGISTERS chat's complete `chat.*` token list and PROVES each grammatical against this one
-# validator — chat registers, it does not author the grammar. A producer LEAF depending on the
-# events glue crate is a sanctioned edge: `myelin-events` is a shared contract carrier and NOTHING
-# in the production DAG depends back on `myelin-chat` (the §2.9 graph stays acyclic —
-# `substrate_is_root()` / `identity_is_sink()` are unaffected).
 myelin-events = { path = "../myelin-events" }
-# CHAT-P2 (P-244): the frozen names-only ReBAC namespace-fragment ABI carrier
-# (`myelin_identity::NamespaceFragment`) chat declares its `channel`/`message` fragment in (contract
-# 4.9). A consumer LEAF depending on the identity GLUE crate (NOT the service) keeps the §2.9 DAG
-# acyclic — `substrate_is_root()` / `identity_is_sink()` are unaffected.
 myelin-identity = { path = "../myelin-identity" }
-# CHAT-P19 (P-414, M4-C6): the FROZEN agent-fabric trait/value crate — `ToolDef`/`ToolName`/
-# `EffectKind`/`ToolSurface`/`EffectApi`/`DryRun`/`ProposedEffect`/`EffectResult`/`RunCtx` (contracts
-# 8.1/8.2/8.7). Chat's agent ToolDef set is data over these frozen types; the routing-split safety
-# boundary is enforced by `effect_kind = Mutate` (route via `EffectApi`, never `ToolHands::exec`).
-# `myelin-agent` is a LEAF trait crate (the signature-only half, AG-P1); a consumer LEAF depending on
-# it keeps the §2.9 DAG acyclic (nothing depends back on `myelin-chat`). Chat does NOT depend on
-# `myelin-agent-service` (the engine) — that crate depends on `myelin-chat` for the ReBAC fragment, so
-# depending back would invert the DAG; the chat tool DEFINITIONS + the routing split live HERE on the
-# trait crate, the plan-then-apply ENGINE stays in the fabric (X-6: chat owns the tool defs, not a
-# second sandbox/budget).
 myelin-agent = { path = "../myelin-agent" }
-# CHAT-P2 (P-244): the one Refs `#sub` grammar + the `mint`/`SubKindRegistration` codec chat
-# registers its `message-`/`thread-` mints with (contract 5.7). Refs owns the grammar; chat mints.
 myelin-refs = { path = "../myelin-refs" }
-# CHAT-P11 (P-405, M4-C3): the FROZEN `myelin-content` taxonomy + the ONE WASM render core (contract
-# 13.1, X-2). Chat CONSUMES a strict SUBSET (paragraph/heading(1..3)/bullet_list/ordered_list/
-# task_list/blockquote/code_block/callout/table/divider/image + the three inline ref nodes
-# mention/artifact_ref/embed; it EXCLUDES db_view/sync_block/toggle). Chat NEVER adds a node outside
-# the frozen subset (a needed change is a whole-workspace contract PR, X-2). `myelin-content` is a
-# mid-DAG shared crate (`-events (+ -refs, -content, -query)`, arch 00 §2.9); a leaf consumer
-# depending on it keeps the §2.9 graph acyclic (nothing depends back on `myelin-chat`) — the SAME
-# sanctioned edge `myelin-git` / `myelin-issues` take. The message body reuses the ONE render path
-# (`render(parse(md)) === md`); chat does NOT author a second renderer (EI-01 §7).
 myelin-content = { path = "../myelin-content" }
-# CHAT-P3 (P-245): the ONE Notif templating + notif-rule surface (contracts 7.3 / 7.6). Chat
-# REGISTERS its humanise template keys (card / agent-message / chat.message.mentioned strings — the
-# ONE templating surface, OQ-L) and its `define_notif_rule` reason set (mentioned / replied /
-# thread_watched / approval_requested) into Notif's frozen verbs + registry — chat registers, Notif
-# owns the engine + the §3.1 ranking table (the inverse-signal seam, EI-01 §1). A consumer LEAF
-# depending on the Notif crate keeps the §2.9 DAG acyclic (nothing depends back on myelin-chat).
 myelin-notif = { path = "../myelin-notif" }
-# (myelin-events is already a dependency above — CHAT-P3 ALSO validates chat's firehose
-# `channel:<id>` scope shape against the Bus-owned `myelin_events::FirehoseScope` (contract 3.5),
-# the `*`-rejecting chokepoint; no transport here, only that chat's scope shape fits the protocol.)
 serde.workspace = true
-# CHAT replay (EB-27 / P-327, M4): the `ChatReindexSource` snapshot payload is the references-only
-# `serde_json::Value` the Bus's `SnapshotDraft` carries (the durable channel/message/thread re-emit).
-# CHAT-P4 (P-398) ALSO uses serde_json to encode/decode the fs-backed cold-segment wire (the
-# `(conversation, range)` segment the detach job seals to a content-addressed BlobStore object).
 serde_json.workspace = true
-# CHAT-P4 (P-398): the message store's TIERS. The hot tier is partitioned by (tenant, region) +
-# conversation behind the `MessageStore` trait (the swap seam; ScyllaDB is the named M5 promotion,
-# CHAT-P28). The COLD tier seals archived ranges to the content-addressed `FsBlobStore` (contract
-# 11.2 fs floor) — a DB-FREE in-process store, so `cargo build --workspace` stays DB-free. The
-# `TenantId` partition-key newtype + the `BlobStore`/`ContentHash` cold-segment primitives come from
-# here. A consumer LEAF depending on the storage GLUE crate keeps the §2.9 DAG acyclic (nothing
-# depends back on myelin-chat). The REAL Postgres hot tier (`store::pg::PgMessageStore`) is gated
-# behind the `integration` feature below.
 myelin-storage = { path = "../myelin-storage" }
-# CHAT-P4 (P-398): the `(tenant, region)` partition-key types (`TenantId`/`Region`, contract
-# 12.1/12.4) the residency-pinned message partition keys on. Re-exported via myelin-events too, but
-# named directly here for the store's `ConversationId` construction.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# CHAT-P6 (P-400, M4-C1): the FROZEN GDPR contract surface — the `PersonalDataHolder` trait + the
-# DSR types (`SubjectRef`/`EraseScope`/`Receipt`/`*Receipt`) + the `#[derive(PersonalData)]`
-# classify-derive + the `ErasureMethod::CryptoShred(subject_dek)` tag (contracts 10.1 / 10.2 / 11.4).
-# Chat is the MOST PII-dense holder (the message body IS the PII, arch 05 §5): it tags its body /
-# draft schema with `#[personal_data(... erasure = CryptoShred(subject_dek))]` and registers an H5
-# `PersonalDataHolder` over its stores. A consumer LEAF depending on the gdpr GLUE crate keeps the
-# §2.9 DAG acyclic (nothing depends back on myelin-chat — the same sanctioned edge myelin-issues uses).
 myelin-gdpr = { path = "../myelin-gdpr" }
-# CHAT-P6 (P-400): the harness auto-registration ONE door (`HolderRegistry`/`StoreClassifier`/`Holder`,
-# contract 1.4) chat opens its stores through so the H5 Chat holder is registered by construction
-# ("the DSR fan-out forgot Chat" is structurally impossible). A LEAF→substrate-glue edge (myelin-issues
-# takes the identical edge); the §2.9 crate-graph models the library DAG, not this terminal consumer.
 myelin-substrate = { path = "../myelin-substrate" }
-# CHAT-P20 (P-415, M4-C7): the Search contract surface — chat is a PRODUCER of searchable artifacts
-# and OWNS its `declare_indexable(IndexSpec{ subsystem:"chat", type:"message", ..})` (contract 6.3,
-# arch §7). The chat-owned `search` module constructs the real `myelin_search::IndexSpec` + routes
-# every message search through the ONE ACL-conjoining `myelin_search::query` surface (6.1; the
-# search-as-non-member=0 guarantee, CHAT-D11). Promoted from dev-only to a real dependency because the
-# `declare_indexable` registration is a compile-time producer concern (the SAME sanctioned producer
-# edge `myelin-issues`/`myelin-git` take for their owned IndexSpecs) — `myelin-search` does NOT depend
-# back on `myelin-chat` (it models chat's tokens byte-identically precisely because it cannot import
-# chat), so the §2.9 DAG stays acyclic. The runtime PORT edges (composer autocomplete, HITL signal)
-# remain port-based; this is the producer-spec edge, not a runtime-engine edge.
 myelin-search = { path = "../myelin-search" }
-# CHAT-P20 (P-415): the frozen `FieldType`/`FieldValue`/`QueryAst` (contract 13.3) the chat message
-# IndexSpec's structured facets + the ACL-conjoined query AST are typed over. `myelin-query` sits in
-# the mid-tier of the §2.9 DAG; nothing depends back on `myelin-chat`, so the graph stays acyclic.
 myelin-query = { path = "../myelin-query" }
-# CHAT-P4 (P-398): the REAL Postgres hot-tier client (`store::pg::PgMessageStore`) + the async
-# runtime the integration test drives. OPTIONAL — pulled ONLY by the `integration` feature, so the
-# default `cargo build --workspace` compiles neither (the DB-free build floor, the binding policy).
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
-# CHAT-P28 (P-502, M5): the dev<->prod CONFIG SWAP seam supplying the object-store (S3) endpoint the
-# cold-segment swap parity proof (`tests/integration_chat_p28_blob_swap.rs`) connects the live
-# `S3BlobStore` to. OPTIONAL — pulled ONLY by `--features integration`; the default DB-free build
-# never sees it (the binding policy). The live `S3BlobStore` itself comes from
-# `myelin-storage/integration` (the real object-store backing the cold tier swaps to).
 myelin-config = { path = "../myelin-config", optional = true }
 
 [features]
 default = []
-# MR-009b Wave 5 — the `test-support` cargo feature (alias `memory`). Gates this crate's in-process
-# E2E-wedge/dogfood drill runners (the `e2e_dsar` leg / `run_chat_e2e_wedge` /
-# `run_chat_over_myelins_own_work`), which construct the in-memory `KmsEngine` test double — so it
-# forwards to `myelin-storage/test-support`. DEV/TEST only.
 test-support = ["myelin-storage/test-support"]
 memory = ["test-support"]
-# CHAT-P4 (P-398): pull the REAL Postgres hot tier (`store::pg::PgMessageStore`) + compile the
-# live-backend integration test. Turns on the storage crate's `integration` feature (the real
-# PgStore/BlobStore clients) and the sqlx/tokio clients the integration test drives. CHAT-P28
-# (P-502) ALSO pulls `myelin-config` (the S3 endpoint for the cold-segment object-store swap proof).
-# The default `cargo build --workspace` compiles NONE of this — the DB-free build floor.
 integration = [
     "myelin-storage/integration",
     "dep:sqlx",
@@ -149,43 +36,9 @@ integration = [
 ]
 
 [dev-dependencies]
-# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
-# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
-# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
-# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# MR-009b Wave 5: the storage in-memory KMS double (`KmsEngine::new()`) is now
-# `#[cfg(any(test, feature = "test-support"))]` — enable it for this crate's DEV tests. DEV-only.
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-# MR-009b Wave 5 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN
-# tests-dir targets (e.g. tests/e2e_wedge_chat_p27.rs calls the now-gated `run_chat_e2e_wedge`).
 myelin-chat = { path = ".", features = ["test-support"] }
-# The Identity namespace ENGINE — the CDC for contract 4.9 admits chat's RICH fragment (the
-# `+ parent_project->read` TTU, the `& parent_project->admin` intersection) into the real cell schema
-# to PROVE the frozen names-only carrier is admissible. A DEV-only edge (the runtime fragment chat
-# ships is the names-only carrier `myelin_identity::NamespaceFragment`; the rich form is exercised
-# only by the CDC test), so the production DAG stays acyclic.
-# MR-009b Wave 2: enable `test-support` so this crate's DEV tests reach the identity in-memory
-# doubles (PrincipalStore/TupleStore/RevocationStore/StoreBackedCheck `::new`) which moved behind
-# `#[cfg(any(test, feature = "test-support"))]`. DEV-only — never in the production DAG.
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-# CHAT-P18 (P-413, M4-C6): the durable-workflow ENGINE — the CDC for contracts 9.1/9.4 posts chat's
-# HITL approval-card decision onto the REAL `myelin_flow::FlowExecutor::signal` (the per-effect
-# `idem_key` dedup — a double-click is ONE approval, a partial approval is well-defined) and ASSERTS
-# BYTE PARITY between chat's `per_effect_idem_key` and the engine's frozen `myelin_flow::
-# per_effect_idem_key` (ONE rule, not two, OQ-F). A DEV-only edge: the runtime card holds only the
-# `SignalPort` (the gateway wires it to the engine), so the production DAG stays acyclic — chat is a
-# leaf consumer, NOTHING depends back on `myelin-chat`. `myelin-flow` sits in the mid-tier of the
-# §2.9 DAG (the SAME posture the D17 dispatch CDC takes with `myelin-query`).
 myelin-flow = { path = "../myelin-flow" }
-# CHAT-P24 (P-418, M4-C9): the AG-D4 / CI-T1 green-escape ATTESTATION artifact
-# (`myelin_ci_sandbox::EscapeAttestation`, contract 8.4 — the permanent sandbox gate, X-6 #4). The
-# CHAT-D16 streaming drill ASSERTS chat refuses to stream agent compute output over a RED AG-D4 and
-# admits over a GREEN one, proven against the REAL attestation type (not a chat-local fake). Chat's
-# RUNTIME gate predicate (`presence::ag_d4_attestation_is_green`) is generic over the frozen
-# attestation FIELDS (artifact-tag / drill-id / total_escapes) so the PRODUCTION crate does NOT
-# depend on `myelin-ci-sandbox`; this DEV-only edge exists solely to feed the real artifact into the
-# CDC/drill — the SAME dev-only posture the 9.1/9.4 CDC takes with `myelin-flow`. The drill is
-# UPSTREAM (M2 / AG-P17 → P-229 / CI-P5 → P-239); chat consumes its green artifact, it does NOT
-# re-run the drill nor fork the attestation type (EI-01 §7 — one drill, one type).
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }

@@ -1,27 +1,3 @@
-//! **CT-007 slice 5b.3-6e.2 Stage A — the composed active-CHECKOUT-path §4 proofs, LIVE PostgreSQL.**
-//!
-//! These tests drive the REAL outer checkout orchestrator (steps 1–14 single-sourced through
-//! `launch_checkout_orchestrated_with_given`) via the DORMANT, `test-support`-gated runsc-driver seam,
-//! substituting ONLY the hardware (the Hop-A git-container execution + the workload runsc spawn), with
-//! an injectable Hop-B outcome (success / terminal / retryable). Unlike the sandbox-crate
-//! `orchestrated_active_path_6e2` proofs (which admit with a NO-OP test authority, PG-free), these
-//! obtain the REAL
-//! `DurableAttemptAuthority` the PRODUCTION way: the real V2 hooks from
-//! [`ci_runner_v2_wiring`](myelin_ci_controlplane::ci_runner_v2_wiring), whose
-//! `reserve_parent_attempt` transitions the durable reservation `reserved → inflight`, inserts the
-//! parent-attempt row, and hands back the durable authority that mints every phase credential and
-//! measures every journal phase against LIVE PG.
-//!
-//! What each test proves is therefore the composition the component tests cannot: the admission
-//! handoff, the transport journal, the advertise/fetch generation ordering + renewals, the capsule
-//! acquisition, and — crucially — the DURABLE rows the active path writes (credential generations,
-//! prelaunch-usage journal phases, the parent-attempt row, and the reservation transition). Each
-//! present-and-shaped assertion is deletion-sensitive (a missing row fails the exact-count/exact-shape
-//! check), and each test carries a row-ABSENT control (a bogus-key query that MUST return nothing) so
-//! the positive assertion is proven non-vacuous.
-//!
-//! Nothing here is `runsc`/Btrfs/subuid/KVM-dependent: the deterministic directory substrate + the
-//! substituted executions run on any host. It DOES require live PG (run as a NON-root user).
 #![cfg(feature = "integration")]
 
 mod common;
@@ -66,8 +42,6 @@ static MIGRATION_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::con
 const TENANT: &str = "acme";
 const REGION: &str = "fr-par";
 const REPO_REF: &str = "myelin://acme/git/repo/widgets";
-/// 0xC7 repeated 20 times — the EXACT commit `checkout_spec_for_backend` / the deterministic driver
-/// advertise for, a valid non-zero lowercase SHA-1 object id.
 const COMMIT_OID: &str = "c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7";
 
 fn app_url() -> String {
@@ -79,7 +53,6 @@ fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// Pin the per-test schema INTO the DSN — `SubstrateProvider::connect` opens its OWN pool from a URL.
 fn scoped_url(url: &str, schema: &str) -> String {
     let separator = if url.contains('?') { '&' } else { '?' };
     format!("{url}{separator}options=-csearch_path%3D{schema}%2Cpublic")
@@ -168,8 +141,6 @@ fn digest(byte: char) -> String {
     format!("blake3:{}", byte.to_string().repeat(64))
 }
 
-/// The checkout scope derived PURELY from `REPO_REF` + `COMMIT_OID` — identical to what the
-/// orchestrator re-derives from `spec.workspace`, so the minted credential authorizes.
 fn checkout_scope() -> myelin_ci_sandbox::CheckoutAuthorizationScope {
     derive_checkout_authorization_scope(
         JobKind::Ci,
@@ -182,22 +153,12 @@ fn checkout_scope() -> myelin_ci_sandbox::CheckoutAuthorizationScope {
     .unwrap()
 }
 
-// =================================================================================================
-// Fixture: one complete leased generation (reservation, ci_run, manifest, ci_job_spec, job_queue).
-// =================================================================================================
-
 struct Fixture {
     claim: CiJobTokenRequest,
     reserve_handle: String,
-    /// The immutable durable claim window this generation was sized from — carried onto the
-    /// reconstructed [`LeasedJob`] so the wiring's resolver never refuses it as a legacy null-window row.
     claim_window_secs: i64,
 }
 
-/// Reconstruct the EXACT leased `job_queue` generation the fixture seeded (`state = 'leased'`), so the
-/// wiring's REAL `durable_v2_spec_resolver` can resolve it exactly as production does — reading the
-/// durable launch template, minting the initial advertise credential through the SAME composition the
-/// hooks share, and producing the digest-pinned `JobSpec` the backend drives.
 fn leased_job(fixture: &Fixture) -> LeasedJob {
     LeasedJob {
         tenant_id: TENANT.into(),
@@ -224,11 +185,6 @@ fn leased_job(fixture: &Fixture) -> LeasedJob {
     }
 }
 
-/// Seed a complete leased generation. The MANIFEST job is always checkout-bearing (the schema mandates
-/// it). `spec_workspace` is what the durable `ci_job_spec` (dispatched launch template) carries: pass the
-/// matching checkout workspace for the positive tests, or a compute `(None, None)` workspace to seed the
-/// negative reject-path fixture (a compute spec beneath a checkout manifest — a provenance divergence the
-/// durable authority resolution MUST refuse).
 async fn seed_fixture(
     app: &PgPool,
     admin: &PgPool,
@@ -334,9 +290,6 @@ async fn seed_fixture(
     .unwrap();
 
     let token_authority_handle = ManifestBoundCiJobTokenAuthority::handle_for(&authority);
-    // Seed the DETERMINISTIC backend image into BOTH the manifest granted job and the durable launch
-    // template, so the wiring's resolver produces a `JobSpec` whose `image` the backend actually
-    // resolves — the active path is driven through the real resolver, not a hand-built spec.
     let manifest = CiDriveManifestV1 {
         schema_version: 1,
         tenant_id: TENANT.into(),
@@ -491,16 +444,6 @@ async fn seed_fixture(
     }
 }
 
-// =================================================================================================
-// The ONE production V2 runner wiring — resolver + hooks from a SINGLE Identity (S3).
-// =================================================================================================
-
-/// Build the REAL production V2 runner wiring exactly as Stage B will — `ci_runner_v2_wiring` composes
-/// the resolver AND the hooks over ONE shared `V2CheckoutComposition` backed by ONE Identity (via
-/// `ci_runner_identity_authorities`). Returning BOTH `(resolver, hooks)` is the honesty line: the same
-/// composition mints the initial advertise credential (through the resolver) that the hooks'
-/// `reserve_parent_attempt` + per-phase authorizations later verify — a broken resolver, a wrong
-/// store/region, or a resolver/hooks mispairing can no longer pass unseen behind a hand-built parallel.
 async fn real_v2_wiring(
     schema: &str,
 ) -> (JobSpecResolver, RunnerHooks, CiPipelineReporterRouter) {
@@ -534,10 +477,6 @@ async fn real_v2_wiring(
     (wiring.0, wiring.1, reporter)
 }
 
-/// Resolve the seeded leased generation through the wiring's REAL resolver — reading the durable launch
-/// template, minting the initial advertise credential, and producing the digest-pinned `JobSpec` the
-/// orchestrator drives. The resolver runs the SYNC off-runtime bridge (a direct `block_on`), so it MUST
-/// run on a dedicated non-runtime thread — exactly the thread `CiRunnerLoop::spawn` uses.
 fn resolve_active_spec(resolver: &JobSpecResolver, fixture: &Fixture) -> JobSpec {
     let leased = leased_job(fixture);
     let resolver = resolver.clone();
@@ -546,12 +485,6 @@ fn resolve_active_spec(resolver: &JobSpecResolver, fixture: &Fixture) -> JobSpec
         .expect("the off-runtime resolve thread completed")
         .expect("the wiring's resolver resolves the leased checkout generation")
 }
-
-// =================================================================================================
-// Off-runtime driver bridge. The driver calls `reserve_parent_attempt` + every authority phase op
-// through the SYNC bridge (a direct `block_on`), so it MUST run on a dedicated non-runtime thread —
-// exactly the thread `CiRunnerLoop::spawn` uses.
-// =================================================================================================
 
 type CheckoutDrive = (
     Result<
@@ -582,10 +515,6 @@ fn drive_checkout_off_runtime(
     .expect("the off-runtime driver thread completed")
 }
 
-// =================================================================================================
-// Durable-row assertion helpers.
-// =================================================================================================
-
 async fn generation_rows(admin: &PgPool, fixture: &Fixture) -> Vec<(String, i16, String, String)> {
     sqlx::query(
         "SELECT purpose, phase_ordinal, generation_id, jti
@@ -614,9 +543,6 @@ async fn generation_rows(admin: &PgPool, fixture: &Fixture) -> Vec<(String, i16,
     .collect()
 }
 
-/// The exact durable prelaunch-usage tuple `(status, exact_cpu_seconds, exact_mem_byte_seconds)` for
-/// one phase — the deletion/mutation-sensitive proof that the REAL path measured the EXACT usage the
-/// substituted executions produced (a wrong total or an unresolved `started` row fails the tuple).
 async fn phase_usage(admin: &PgPool, fixture: &Fixture, phase: &str) -> Option<(String, i64, i64)> {
     sqlx::query(
         "SELECT status, exact_cpu_seconds::bigint AS cpu, exact_mem_byte_seconds::bigint AS mem
@@ -642,8 +568,6 @@ async fn phase_usage(admin: &PgPool, fixture: &Fixture, phase: &str) -> Option<(
     })
 }
 
-/// The current `job_queue.state` for the fixture's job — the durable proof the workload launch fence's
-/// queue→running CAS committed (a leased row that never reached `running` fails this).
 async fn job_queue_state(admin: &PgPool, fixture: &Fixture) -> String {
     sqlx::query_scalar::<_, String>(
         "SELECT state FROM job_queue WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -707,8 +631,6 @@ async fn parent_row_count(admin: &PgPool, fixture: &Fixture) -> i64 {
     .unwrap()
 }
 
-/// A row-ABSENT control: the SAME shaped query keyed to a job_id that does not exist MUST return
-/// nothing — proving the positive present-and-shaped assertion is deletion-sensitive, not vacuous.
 async fn generation_rows_for_bogus_job(admin: &PgPool) -> i64 {
     sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM ci_job_credential_generation
@@ -721,11 +643,6 @@ async fn generation_rows_for_bogus_job(admin: &PgPool) -> i64 {
     .await
     .unwrap()
 }
-
-// =================================================================================================
-// §4.1 — checkout SUCCESS: the full advertise → fetch → materialization → workload path settles, and
-// writes the exact durable rows.
-// =================================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
@@ -746,8 +663,6 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
         )
         .await;
 
-        // Row-ABSENT control BEFORE anything is minted: nothing is written yet, so the positive
-        // assertions below cannot be vacuously satisfied.
         assert!(
             generation_rows(&admin, &fixture).await.is_empty(),
             "no generation rows before mint"
@@ -768,10 +683,7 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             "the seeded generation is leased"
         );
 
-        // The ONE production wiring: the resolver + hooks from a SINGLE Identity/composition (S3).
         let (resolver, hooks, reporter) = real_v2_wiring(&schema).await;
-        // Resolving through the REAL wiring resolver mints the INITIAL advertise generation — after this
-        // exactly ONE generation (advertise) exists; the drive adds fetch/materialization/workload.
         let spec = resolve_active_spec(&resolver, &fixture);
         assert_eq!(
             generation_rows(&admin, &fixture).await.len(),
@@ -787,8 +699,6 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             InjectedHopBOutcome::Success,
         );
 
-        // Exactly the two scripted transport legs ran (executor panics on a third), under DISTINCT
-        // durable credentials, and BOTH phase permits committed.
         assert_eq!(
             recorded.len(),
             2,
@@ -803,7 +713,6 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             "both transport permits commit: {recorded:?}"
         );
 
-        // The active path settled to a clean workload launch carrying the exact substituted usage.
         let workload_usage = match result {
             Ok(CheckoutContinuationOutcome::WorkloadLaunched(launch)) => {
                 assert!(
@@ -823,8 +732,6 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             other => panic!("expected a clean WorkloadLaunched, got {other:?}"),
         };
 
-        // Durable rows the active path wrote — present-and-shaped (deletion-sensitive):
-        // FOUR credential generations, in phase order.
         let rows = generation_rows(&admin, &fixture).await;
         let purposes: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
         assert_eq!(
@@ -837,10 +744,6 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             ],
             "the four durable generations, in order: {rows:?}"
         );
-        // TWO prelaunch-usage journal phases, both measured to the EXACT usage the substituted
-        // executions produced (S4): transport = advertise (3/7) + fetch (11/13) = 14/20; the
-        // materialization phase = the substituted Hop-B evidence usage 2/5. A wrong total or an
-        // unresolved `started` row fails these exact tuples.
         assert_eq!(
             phase_usage(&admin, &fixture, "checkout_transport").await,
             Some(("measured".to_string(), 14, 20)),
@@ -851,13 +754,11 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             Some(("measured".to_string(), 2, 5)),
             "the materialization phase is measured to the exact substituted Hop-B usage 2/5"
         );
-        // S1: the workload launch fence committed the queue→running CAS — the leased row is now running.
         assert_eq!(
             job_queue_state(&admin, &fixture).await,
             "running",
             "the workload launch fence drove the job_queue row leased → running"
         );
-        // ONE parent-attempt row, and the reservation drove reserved → inflight.
         assert_eq!(
             parent_row_count(&admin, &fixture).await,
             1,
@@ -874,8 +775,6 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             "the V2 reserve handle persisted the exact Stage-B queue marker"
         );
 
-        // Completion-side Stage-B proof: route the exact running claim through the production V4
-        // reporter. This atomically writes the V4 final receipt and settles the inflight reservation.
         reporter
             .report_done(
                 &CompletionClaim {
@@ -905,7 +804,6 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
             "settled",
             "completion settled the reservation inflight → settled"
         );
-        // The row-absent control query returns nothing — the assertions above are non-vacuous.
         assert_eq!(
             generation_rows_for_bogus_job(&admin).await,
             0,
@@ -914,10 +812,6 @@ async fn checkout_success_drives_the_active_path_and_writes_the_durable_rows() {
     })
     .await;
 }
-
-// =================================================================================================
-// §4.3 — Hop-B PreparationTerminal: terminal disposition, NO workload/settle path.
-// =================================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hop_b_terminal_reports_a_preparation_terminal_and_never_launches() {
@@ -943,10 +837,8 @@ async fn hop_b_terminal_reports_a_preparation_terminal_and_never_launches() {
             InjectedHopBOutcome::TerminalFailed,
         );
 
-        // Transport still ran (both hops) — the failure is injected at Hop B, after transport.
         assert_eq!(recorded.len(), 2, "the two transport hops still spawned: {recorded:?}");
 
-        // A terminal preparation disposition, carrying the reporting claim — and NO workload launched.
         match result {
             Ok(CheckoutContinuationOutcome::PreparationTerminal { claim, disposition, diagnostic: _ }) => {
                 assert!(
@@ -961,9 +853,6 @@ async fn hop_b_terminal_reports_a_preparation_terminal_and_never_launches() {
             other => panic!("expected a PreparationTerminal, got {other:?}"),
         }
 
-        // The transport phase measured to its exact 14/20; the materialization phase was begun then
-        // RESOLVED to the injected Hop-B usage 2/5 (never left `started` for the sealer) — S4. But the
-        // workload generation was NEVER minted (no settle path).
         assert_eq!(
             phase_usage(&admin, &fixture, "checkout_transport").await,
             Some(("measured".to_string(), 14, 20)),
@@ -983,22 +872,16 @@ async fn hop_b_terminal_reports_a_preparation_terminal_and_never_launches() {
             !purposes.contains(&"workload".to_string()),
             "NO workload generation on a terminal Hop-B failure: {purposes:?}"
         );
-        // The workload launch fence never ran — the job_queue row never reached running.
         assert_ne!(
             job_queue_state(&admin, &fixture).await,
             "running",
             "a terminal Hop-B failure never commits the queue→running CAS"
         );
-        // The parent attempt exists (admission happened) — the row-absent control still finds nothing.
         assert_eq!(parent_row_count(&admin, &fixture).await, 1, "the admission inserted one parent row");
         assert_eq!(generation_rows_for_bogus_job(&admin).await, 0, "a bogus-key query finds no rows");
     })
     .await;
 }
-
-// =================================================================================================
-// §4.4 — Hop-B PreparationRetryable: requeue request, NO job.done / workload.
-// =================================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hop_b_retryable_reports_a_preparation_retry_and_never_launches() {
@@ -1026,7 +909,6 @@ async fn hop_b_retryable_reports_a_preparation_retry_and_never_launches() {
 
         assert_eq!(recorded.len(), 2, "the two transport hops still spawned: {recorded:?}");
 
-        // A retry REQUEST (budget not yet exhausted), carrying the reporting claim — NO workload.
         match result {
             Ok(CheckoutContinuationOutcome::PreparationRetryable { claim, .. }) => {
                 assert_eq!(
@@ -1037,9 +919,6 @@ async fn hop_b_retryable_reports_a_preparation_retry_and_never_launches() {
             other => panic!("expected a PreparationRetryable, got {other:?}"),
         }
 
-        // Both prelaunch phases resolve to their exact measured tuples (S4): transport is the
-        // advertised 3/7 + fetch 11/13 total, and materialization is the injected 2/5 usage. Neither
-        // may be left `started` for the sealer even though no workload path ran.
         assert_eq!(
             phase_usage(&admin, &fixture, "checkout_transport").await,
             Some(("measured".to_string(), 14, 20)),
@@ -1050,7 +929,6 @@ async fn hop_b_retryable_reports_a_preparation_retry_and_never_launches() {
             Some(("measured".to_string(), 2, 5)),
             "the materialization phase was RESOLVED to the injected Hop-B usage 2/5 on the retry path"
         );
-        // No workload generation was minted (no job.done path).
         let purposes: Vec<String> = generation_rows(&admin, &fixture)
             .await
             .into_iter()
@@ -1070,17 +948,6 @@ async fn hop_b_retryable_reports_a_preparation_retry_and_never_launches() {
     .await;
 }
 
-// =================================================================================================
-// §4.4 — THE INVARIANT (replaces compute-through-V2, which is structurally unrepresentable): EVERY CI
-// manifest job reconstructs a checkout-bearing `(Some, Some)` authority — the durable guarantee that the
-// `run_cycle` / `ci_runner_v2_wiring` compute arm is DEAD-in-CI today. This is the tripwire: a future
-// change that makes a compute CI authority representable MUST break this assertion, and (per its
-// message) may not ship without a hardware-independent compute-through-V2 live-PG proof.
-// =================================================================================================
-
-/// Build a valid multi-job [`CiDriveManifestV1`] + its matching [`CiRunRecord`] + a claim, all
-/// mutually consistent so [`runtime_authorities_from_durable_claim`] accepts them. Every job is
-/// checkout-bearing (the manifest schema mandates a `repo_ref`/`commit_oid`).
 fn multi_job_manifest_and_run(
     seed: u64,
     jobs: usize,
@@ -1096,9 +963,6 @@ fn multi_job_manifest_and_run(
         pids_max: 128,
         timeout_secs: 120,
     };
-    // Each job needs a DISTINCT stage (the manifest requires `check_context == stage`, jobs strictly
-    // sorted by name, and `check_attempts` to exactly cover the distinct contexts). `stage{i}` sorts
-    // lexicographically, so name-order and context-coverage both hold.
     let stages: Vec<String> = (0..jobs).map(|i| format!("stage{i}")).collect();
     let granted: Vec<GrantedCiJobV1> = (0..jobs)
         .map(|i| {
@@ -1217,10 +1081,6 @@ fn multi_job_manifest_and_run(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_ci_manifest_authority_is_checkout_bearing() {
-    // Pure invariant (no PG needed) — runs in the integration binary as the 4th §4 slot. Because
-    // `CiManifestWorkspaceV1` mandates `repo_ref`/`commit_oid`, EVERY manifest job reconstructs a
-    // `(Some, Some)` checkout authority, so a compute CI job is unrepresentable through the durable
-    // manifest authority — which is exactly why compute-through-V2 has no live-PG proof today.
     let (manifest, run, claim) = multi_job_manifest_and_run(7, 3);
     let authorities = runtime_authorities_from_durable_claim(&claim, &run, &manifest)
         .expect("the durable authority reconstruction succeeds for a valid multi-job manifest");
@@ -1228,19 +1088,12 @@ async fn every_ci_manifest_authority_is_checkout_bearing() {
     for authority in &authorities {
         assert!(
             authority.checkout.is_some(),
-            "EVERY CI manifest job reconstructs a checkout-bearing authority — the compute arm is \
+            "EVERY CI manifest job reconstructs a checkout-bearing authority - the compute arm is \
              dead-in-CI. CHANGING THIS ASSERTION REQUIRES LANDING A HARDWARE-INDEPENDENT \
              compute-through-V2 PROOF IN THE SAME CHANGE. Offending authority: {authority:?}"
         );
     }
 }
-
-// =================================================================================================
-// §4.5 — the NEGATIVE reject-path proof: a compute-shaped durable `ci_job_spec` beneath a checkout
-// manifest is refused as DurableAuthorityUnavailable, with ZERO mutation. This is the deletion/
-// mutation-sensitive complement: a rejection that leaked a partial row would be caught by the
-// post-rejection row-count assertions.
-// =================================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_compute_spec_beneath_a_checkout_manifest_is_rejected_with_zero_mutation() {
@@ -1251,8 +1104,6 @@ async fn a_compute_spec_beneath_a_checkout_manifest_is_rejected_with_zero_mutati
             "a".repeat(64)
         ))
         .unwrap();
-        // A CHECKOUT manifest but a COMPUTE-shaped durable `ci_job_spec` (workspace `(None, None)`) — the
-        // provenance divergence the durable authority resolution MUST refuse.
         let fixture = seed_fixture(
             &app,
             &admin,
@@ -1265,7 +1116,6 @@ async fn a_compute_spec_beneath_a_checkout_manifest_is_rejected_with_zero_mutati
         )
         .await;
 
-        // Baseline BEFORE the attempt: reservation merely reserved, and no credential/parent rows.
         assert_eq!(
             reservation_state(&admin, &fixture.reserve_handle).await,
             "reserved"
@@ -1280,10 +1130,6 @@ async fn a_compute_spec_beneath_a_checkout_manifest_is_rejected_with_zero_mutati
             "no parent attempt before the attempt"
         );
 
-        // Resolving the leased row through the REAL wiring resolver runs the initial mint, which resolves
-        // the durable authority and refuses (compute spec ≠ checkout manifest) with
-        // DurableAuthorityUnavailable — never signing a credential. Driving the PRODUCTION resolver (not a
-        // hand-built composition) is the honesty line: a broken resolver/store/region pairing would fail here.
         let (resolver, _hooks, _reporter) = real_v2_wiring(&schema).await;
         let leased = leased_job(&fixture);
         let err = std::thread::spawn(move || resolver(&leased))
@@ -1295,7 +1141,6 @@ async fn a_compute_spec_beneath_a_checkout_manifest_is_rejected_with_zero_mutati
             "the refusal is a durable-authority-unavailable rejection, got: {err}"
         );
 
-        // ZERO mutation: a rejection that leaked a partial row would be caught here.
         assert!(
             generation_rows(&admin, &fixture).await.is_empty(),
             "the refused mint wrote NO credential generation row"

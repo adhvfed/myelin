@@ -1,10 +1,3 @@
-//! Durable PostgreSQL inbox persistence and bounded recipient-scoped keyset reads.
-//!
-//! The live ordering is the honest neutral-affinity deterministic-v1 order:
-//! `(ranking::base_priority(reason) DESC, item_id ASC)`. The schema cannot derive the not-yet-live
-//! Identity/Refs affinity bonuses, so this store does not claim to persist them. The matching
-//! expression index is the additive `notif_0010_inbox_recipient_keyset` migration.
-
 use std::collections::HashSet;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -56,7 +49,6 @@ WHERE notif_inbox_item.region = EXCLUDED.region
   AND notif_inbox_item.coalesce_count < 2147483647
 RETURNING coalesce_count";
 
-/// A complete first-write row for `notif_inbox_item`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxUpsert {
     pub item: RoutedInboxItem,
@@ -67,14 +59,12 @@ pub struct InboxUpsert {
     pub dek_ref: String,
 }
 
-/// Whether a write inserted a row or collapsed into the existing compatible row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InboxUpsertOutcome {
     Inserted,
     Collapsed { coalesce_count: i32 },
 }
 
-/// Exact RLS and recipient scope for an inbox read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxReadScope {
     pub tenant: TenantId,
@@ -82,7 +72,6 @@ pub struct InboxReadScope {
     pub recipient: String,
 }
 
-/// A bounded keyset page request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxReadRequest {
     pub scope: InboxReadScope,
@@ -91,7 +80,6 @@ pub struct InboxReadRequest {
     pub cursor: Option<String>,
 }
 
-/// A fully decoded durable inbox row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableInboxItem {
     pub item: RoutedInboxItem,
@@ -103,14 +91,12 @@ pub struct DurableInboxItem {
     pub priority: u8,
 }
 
-/// One bounded durable page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DurableInboxPage {
     pub items: Vec<DurableInboxItem>,
     pub next_cursor: Option<String>,
 }
 
-/// A safe, typed durable-inbox failure. Database details and stored values are never exposed.
 #[non_exhaustive]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PgInboxError {
@@ -150,7 +136,6 @@ impl From<PgError> for PgInboxError {
     }
 }
 
-/// PostgreSQL-backed inbox repository. There is intentionally no in-memory production arm.
 #[derive(Clone)]
 pub struct PgInboxStore {
     pool: PgPool,
@@ -165,7 +150,6 @@ impl PgInboxStore {
         &self.pool
     }
 
-    /// Standalone write under the platform tenant-scoped transaction convention.
     pub async fn upsert(&self, input: &InboxUpsert) -> Result<InboxUpsertOutcome, PgInboxError> {
         let prepared = PreparedUpsert::try_from(input)?;
         let tenant = prepared.tenant_id.0.clone();
@@ -176,8 +160,6 @@ impl PgInboxStore {
         .await
     }
 
-    /// Write on the consumer runtime's exact co-commit connection. Missing/wrong transaction
-    /// authority fails closed; the method never falls back to the store pool.
     pub fn co_commit_upsert(
         &self,
         tx: &mut myelin_events::HandlerTx<'_>,
@@ -191,9 +173,6 @@ impl PgInboxStore {
         tokio::task::block_in_place(|| runtime.block_on(upsert_on_conn(conn, &prepared)))
     }
 
-    /// Check the collapse key on the consumer runtime's exact co-commit connection. This is the
-    /// durable storm-control lookup immediately before [`Self::co_commit_upsert`]; it never falls
-    /// back to the pool or observes another tenant/recipient's rows.
     pub(crate) fn co_commit_contains(
         &self,
         tx: &mut myelin_events::HandlerTx<'_>,
@@ -233,7 +212,6 @@ impl PgInboxStore {
         })
     }
 
-    /// Read one recipient-scoped keyset page. Every filter is lowered into SQL before `LIMIT + 1`.
     pub async fn list(&self, request: &InboxReadRequest) -> Result<DurableInboxPage, PgInboxError> {
         validate_request(request)?;
         let cursor = request

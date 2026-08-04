@@ -1,5 +1,3 @@
-//! DB-free shutdown proof for the production dead-runner reaper.
-
 use std::time::Duration;
 
 use myelin_ci_controlplane::{ci_region_queue_store_test_support, JobQueueReaper};

@@ -1,7 +1,3 @@
-//! Unit tests for [`crate::surfacing_tools`] — the FROZEN X-6 `requires_approval` defaults
-//! (deploy/secret = yes; run/read = no), the effect-kind/side-effecting split, and the complete-set
-//! registration into the ONE ToolSurface (8.1).
-
 use super::*;
 
 struct Catalogue {
@@ -16,19 +12,14 @@ impl ToolSurface for Catalogue {
     }
 }
 
-/// **THE X-6 GATE (arch 04 §3): the `requires_approval` defaults are frozen-correct — deploy / secret
-/// / rollback / approve_deploy = YES; run / read / validate / plan / cancel / retry = NO.** A
-/// loosening of any `yes` or a gating of any read would flip a value here.
 #[test]
 fn x6_requires_approval_defaults_are_frozen_correct() {
-    // gated (yes) — consequential / privileged.
     for gated in ["deploy", "approve_deploy", "rollback", "write_secret"] {
         assert!(
             ci_requires_approval_default(gated),
-            "ci.{gated} is HITL-gated (X-6 — consequential/privileged)"
+            "ci.{gated} is HITL-gated (X-6 - consequential/privileged)"
         );
     }
-    // not gated (no) — cheap / reversible / read.
     for not_gated in [
         "run",
         "run_pipeline",
@@ -46,8 +37,6 @@ fn x6_requires_approval_defaults_are_frozen_correct() {
     }
 }
 
-/// **An UNKNOWN CI action fails CLOSED to gated (a new consequential action is added to the frozen
-/// table, never silently un-gated).**
 #[test]
 fn an_unknown_ci_action_fails_closed_to_gated() {
     assert!(
@@ -56,8 +45,6 @@ fn an_unknown_ci_action_fails_closed_to_gated() {
     );
 }
 
-/// **The effect-kind split (arch 04 §3): the reads are `Read` (not side-effecting); everything else
-/// is `Mutate` (routed through EffectApi::apply, side-effecting).**
 #[test]
 fn effect_kind_and_side_effecting_split() {
     for read in ["read_log", "read_run", "validate", "plan"] {
@@ -90,9 +77,6 @@ fn effect_kind_and_side_effecting_split() {
     }
 }
 
-/// **The `required_caps` are the frozen CI ReBAC permissions (4.9), not invented here.** deploy /
-/// approve / rollback → `environment.deploy`; write_secret → `ci_project.administer`; reads →
-/// `run.view`; run lifecycle → `run.trigger`.
 #[test]
 fn required_caps_are_the_ci_rebac_fragment_permissions() {
     assert_eq!(ci_required_caps("deploy"), vec!["environment.deploy"]);
@@ -109,14 +93,12 @@ fn required_caps_are_the_ci_rebac_fragment_permissions() {
     assert_eq!(ci_required_caps("read_run"), vec!["run.view"]);
     assert_eq!(ci_required_caps("run"), vec!["run.trigger"]);
     assert_eq!(ci_required_caps("validate"), vec!["run.trigger"]);
-    // the caps name the canonical CI fragment permissions (4.9), keyed on the run/env/project objects.
     assert_eq!(CAP_RUN_TRIGGER, "run.trigger");
     assert_eq!(CAP_RUN_VIEW, "run.view");
     assert_eq!(CAP_ENVIRONMENT_DEPLOY, "environment.deploy");
     assert_eq!(CAP_CI_PROJECT_ADMINISTER, "ci_project.administer");
 }
 
-/// **A built `ToolDef` SEEDS its `requires_approval` from the frozen X-6 table (never hand-set).**
 #[test]
 fn tool_def_seeds_the_frozen_x6_gating() {
     for tool in CI_TOOL_NAMES {
@@ -136,9 +118,6 @@ fn tool_def_seeds_the_frozen_x6_gating() {
     }
 }
 
-/// **`register_ci_tools` registers the COMPLETE set into the ONE catalogue (8.1) — every X-6 row
-/// resolves by name with its frozen gating.** And the exactly-four gated set is the privileged CI
-/// gates; everything else is not gated.
 #[test]
 fn register_ci_tools_registers_the_complete_x6_set() {
     let mut cat = Catalogue { defs: vec![] };
@@ -149,7 +128,6 @@ fn register_ci_tools_registers_the_complete_x6_set() {
         "the complete X-6 CI tool set (12 rows)"
     );
 
-    // deploy resolves and is gated; read_run resolves and is not gated.
     let deploy = cat
         .resolve(&ToolName("deploy".into()))
         .expect("deploy registered");
@@ -162,7 +140,6 @@ fn register_ci_tools_registers_the_complete_x6_set() {
         "the registered read_run is NOT gated"
     );
 
-    // the gated set is exactly the four privileged CI gates.
     let gated: Vec<&str> = registered
         .iter()
         .filter(|d| d.requires_approval)
@@ -175,8 +152,6 @@ fn register_ci_tools_registers_the_complete_x6_set() {
     );
 }
 
-/// **`ToolHands::exec` (the runner) is DELIBERATELY ABSENT from the table (X-6 / 05 §HP-5).** The
-/// runner is never a side-effecting tool — there is no `exec` ToolDef.
 #[test]
 fn tool_hands_exec_is_not_a_tool_def() {
     assert!(

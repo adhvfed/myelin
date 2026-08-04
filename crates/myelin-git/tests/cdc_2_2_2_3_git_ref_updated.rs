@@ -1,16 +1,3 @@
-//! # CDC pair — contracts 2.2/2.3: the `git.ref.updated` one-tx outbox emit (provider) ↔ a
-//! consumer reading the wire envelope (consumer) — P-270 / GIT-P9
-//!
-//! **Contract:** 2.2 (`OutboxTx::emit` — the same-transaction co-commit) + 2.3 (the `outbox` row's
-//! per-aggregate ordering, `UNIQUE(aggregate, seq)`) + 2.9 (`git.ref.updated`). The PROVIDER half is
-//! [`myelin_git::receive_pack::RefStore::receive`] — the receive-pack → ref-CAS → outbox emit in one
-//! transaction. The CONSUMER half is a reader that decodes the serialized [`EventEnvelope`] off the
-//! outbox row to its NAMED `git.ref.updated` fields (the wire shape CI/Search/Refs/Agents consume).
-//!
-//! This is the provider/consumer contract-test pair the prompt requires for rows 2.2/2.3: the
-//! provider produces the wire envelope; the consumer reconstructs the fields from JSON — proving the
-//! `git.ref.updated` payload is the frozen, round-tripping shape (no drift between emit + consume).
-
 use myelin_events::{
     Actor, CausedBy, EmitContextBase, EventEnvelope, IdMinter, MonotonicMinter, OutboxStore,
     Region, TenantId, Timestamp,
@@ -23,8 +10,6 @@ use myelin_git::receive_pack::{
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use std::sync::{Arc, Barrier};
 
-/// The CONSUMER-side view of a `git.ref.updated` event (the fields CI/Search/Refs key on) decoded
-/// from the wire envelope's JSON payload — the consumer half of the CDC pair.
 #[derive(Debug, PartialEq, Eq)]
 struct RefUpdatedView {
     repo: String,
@@ -38,8 +23,6 @@ struct RefUpdatedView {
 }
 
 impl RefUpdatedView {
-    /// Decode the wire envelope to the named `git.ref.updated` fields (the consumer contract). A
-    /// missing/wrong-shaped field is a LOUD decode failure (never a silent wrong value).
     fn decode(env: &EventEnvelope) -> Result<RefUpdatedView, String> {
         if env.type_.0 != GIT_REF_UPDATED {
             return Err(format!("not a git.ref.updated event: {}", env.type_.0));
@@ -92,10 +75,6 @@ fn ctx_base() -> EmitContextBase {
     }
 }
 
-/// **The CDC pair: provider emits the wire envelope → consumer decodes the named fields, lossless.**
-/// The provider (the receive-pack one-tx path) produces a `git.ref.updated` row; the consumer reads
-/// the SERIALIZED envelope (round-tripped through JSON, as the relay+broker carry it) and
-/// reconstructs the named fields — proving the 2.2/2.3/2.9 wire shape is the contract.
 #[test]
 fn git_ref_updated_provider_consumer_wire_shape_round_trips() {
     let outbox = OutboxStore::new();
@@ -126,13 +105,10 @@ fn git_ref_updated_provider_consumer_wire_shape_round_trips() {
         o => panic!("expected Accepted, got {o:?}"),
     };
 
-    // PROVIDER: the committed outbox row carries the canonical envelope.
     let row = outbox.row(&id).expect("the committed git.ref.updated row");
-    // Serialize → deserialize, exactly as the relay+broker carry it over the wire (no drift).
     let wire = serde_json::to_string(&row.envelope).expect("the envelope serializes");
     let env: EventEnvelope = serde_json::from_str(&wire).expect("the envelope round-trips");
 
-    // CONSUMER: decode the named git.ref.updated fields off the wire envelope.
     let view = RefUpdatedView::decode(&env).expect("the consumer decodes the named fields");
     assert_eq!(
         view,
@@ -148,12 +124,10 @@ fn git_ref_updated_provider_consumer_wire_shape_round_trips() {
         }
     );
 
-    // The envelope's own frozen fields are the 2.1/2.3 contract: type, per-ref aggregate, and the
-    // pseudonymous payload carries NO inline PII (references-not-payloads).
     assert_eq!(env.type_.0, GIT_REF_UPDATED);
     assert_eq!(
         env.aggregate.0, "ref:core:refs%2Fheads%2Fmain",
-        "the per-ref aggregate (2.3) — `ref:` prefix + percent-encoded ref name, matching \
+        "the per-ref aggregate (2.3) - `ref:` prefix + percent-encoded ref name, matching \
          `GitRefEventKey::aggregate` (receive_pack.rs) and the format every other aggregate-key \
          test in this crate already expects (gt003_reconcile.rs, code_projection.rs)"
     );
@@ -167,9 +141,6 @@ fn git_ref_updated_provider_consumer_wire_shape_round_trips() {
     );
 }
 
-/// **2.3 per-aggregate ordering across the CDC boundary: successive pushes to one ref carry
-/// contiguous outbox seqs the consumer reads in order.** The provider commits three pushes; the
-/// consumer reads update_seq 1,2,3 in the per-aggregate outbox seq order 0,1,2.
 #[test]
 fn git_ref_updated_per_ref_ordering_is_consumed_in_order() {
     let outbox = OutboxStore::new();
@@ -203,7 +174,6 @@ fn git_ref_updated_per_ref_ordering_is_consumed_in_order() {
         }
     }
 
-    // The consumer reads the per-aggregate rows ordered by outbox seq → update_seq is monotonic.
     let mut rows: Vec<_> = ids.iter().map(|id| outbox.row(id).unwrap()).collect();
     rows.sort_by_key(|r| r.seq);
     let seqs: Vec<u64> = rows.iter().map(|r| r.seq).collect();
@@ -223,11 +193,6 @@ fn git_ref_updated_per_ref_ordering_is_consumed_in_order() {
     );
 }
 
-/// **2.3 per-ref ordering UNDER A HOT-REF BURST (GIT-P10 / GIT-D1): a concurrent burst on one ref
-/// still yields a contiguous, per-aggregate-ordered consumer stream.** N racers chain-advance one
-/// hot ref (one wins each generation, the rest are CAS-rejected); the consumer, reading the
-/// committed rows in per-aggregate `seq` order, sees `update_seq` 1,2,…,k with NO gap and NO reorder
-/// — proving the per-ref aggregate ordering (2.3) holds at push QPS, not just for serial pushes.
 #[test]
 fn git_ref_updated_per_ref_ordering_survives_a_concurrent_burst() {
     let outbox = OutboxStore::new();
@@ -235,7 +200,7 @@ fn git_ref_updated_per_ref_ordering_survives_a_concurrent_burst() {
     let store = Arc::new(RefStore::open("core", ctx_base(), outbox.clone(), minter));
 
     let k = 20u64;
-    let multiplier = 12usize; // 12 racers per generation, all hammering the one hot ref.
+    let multiplier = 12usize;
     let mut tip = Oid::zero();
     let mut committed_ids = Vec::new();
 
@@ -272,7 +237,7 @@ fn git_ref_updated_per_ref_ordering_survives_a_concurrent_burst() {
             if let PushOutcome::Accepted { moved, emitted } = h.join().unwrap() {
                 assert!(
                     winner.is_none(),
-                    "round {round}: two winners — a lost update!"
+                    "round {round}: two winners - a lost update!"
                 );
                 winner = Some((moved[0].1.clone(), emitted[0].clone()));
             }
@@ -282,7 +247,6 @@ fn git_ref_updated_per_ref_ordering_survives_a_concurrent_burst() {
         tip = winner_tip;
     }
 
-    // The consumer reads the per-aggregate rows in `seq` order → contiguous `update_seq` 1..=k.
     let mut rows: Vec<_> = committed_ids
         .iter()
         .map(|id| outbox.row(id).unwrap())

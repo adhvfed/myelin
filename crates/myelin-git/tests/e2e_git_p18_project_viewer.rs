@@ -1,15 +1,3 @@
-//! # e2e — `project(ref, viewer)` chained: authorized → title, unauthorized → tombstone (GIT-P18 / P-279)
-//!
-//! The chained end-to-end the prompt's TESTS field requires: resolve a PR ref as an authorized viewer
-//! (gets the title) and as an unauthorized viewer (gets a tombstone) — over the SAME projector and
-//! store, with the ONLY difference being the viewer's `Id.check` decision. This proves the 0-leak
-//! invariant end to end: the unauthorized viewer's projection carries NO title (the title is never
-//! fetched on the deny path). It also exercises the `ArtifactRef` id-grammar round-trip (the canonical
-//! `pr/<repo>:<n>` key is stored; the `#<n>` display is render-time only).
-//!
-//! This feeds the M3-G5/M5 leak drills (GIT-D11, SRCH-D1/D3) — the projection is the ONLY git-artifact
-//! read path, so a 0-leak here is a 0-leak for every downstream consumer (Refs/Search/Notif).
-
 use myelin_git::body::Body;
 use myelin_git::check_status::GateOutcome;
 use myelin_git::lifecycle::PullRequest;
@@ -25,13 +13,10 @@ use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 use std::collections::HashSet;
 
-/// A deterministic Id over a per-SUBJECT `subject:view@object` allow-list — the per-viewer permission
-/// source. A subject not on the list for an object is denied (fail-closed).
 struct StubId {
     allow: HashSet<String>,
 }
 impl StubId {
-    /// Grant `subject` the `view` permission on each object.
     fn granting(subject: &str, objects: &[&ArtifactRef]) -> Self {
         Self {
             allow: objects
@@ -139,18 +124,16 @@ fn viewer(id: &str) -> Principal {
 
 #[test]
 fn project_pr_authorized_gets_title_unauthorized_gets_tombstone_zero_leak() {
-    // ── arrange: one PR, stored under its canonical `pr/<repo>:<n>` key (the id grammar) ──
     let pr_ref = git_pr_ref("acme", "payments", 1421);
-    // the id-grammar round-trip: the stored canonical key is stable; the `#1421` display is render-time.
     assert_eq!(
         myelin_refs::format(&pr_ref),
         "myelin://acme/git/pr/payments:1421",
-        "git's stored canonical key is `pr/<repo>:<n>` (REF-3) — never the `#1421` display"
+        "git's stored canonical key is `pr/<repo>:<n>` (REF-3) - never the `#1421` display"
     );
     assert_eq!(display_key(&pr_ref).as_deref(), Some("#1421"));
     assert!(
         myelin_refs::parse("#1421").is_err(),
-        "the `#1421` display is render-time only — 0 stored display keys (it never re-parses to a scope)"
+        "the `#1421` display is render-time only - 0 stored display keys (it never re-parses to a scope)"
     );
 
     let mut pr = PullRequest::open(
@@ -164,10 +147,8 @@ fn project_pr_authorized_gets_title_unauthorized_gets_tombstone_zero_leak() {
     let mut store = ArtifactStore::new();
     store.put_pr(&pr_ref, pr, GateOutcome::AllRequiredGreen, 2, 1);
 
-    // The projector: alice MAY view the PR; mallory may NOT (same store, same projector).
     let projector = Projector::new(StubId::granting("alice", &[&pr_ref]), store);
 
-    // ── act + assert: the authorized viewer gets the title ──
     let alice = projector
         .project(&pr_ref, &viewer("alice"), Zookie("z".into()))
         .unwrap();
@@ -181,7 +162,6 @@ fn project_pr_authorized_gets_title_unauthorized_gets_tombstone_zero_leak() {
         "the authorized viewer gets the title"
     );
 
-    // ── the unauthorized viewer gets a tombstone, NEVER the title (the 0-leak invariant) ──
     let mallory = projector
         .project(&pr_ref, &viewer("mallory"), Zookie("z".into()))
         .unwrap();
@@ -192,10 +172,10 @@ fn project_pr_authorized_gets_title_unauthorized_gets_tombstone_zero_leak() {
     assert_eq!(
         mallory.title(),
         None,
-        "0 title leak — the unauthorized viewer NEVER gets the title (feeds GIT-D11 / SRCH-D1/D3)"
+        "0 title leak - the unauthorized viewer NEVER gets the title (feeds GIT-D11 / SRCH-D1/D3)"
     );
     if let Projected::Tombstoned(t) = mallory {
         assert_eq!(t.reason, TombstoneReason::Unauthorized);
-        assert_eq!(t.display_text(), "(not available)"); // content-free — no field leaks.
+        assert_eq!(t.display_text(), "(not available)");
     }
 }

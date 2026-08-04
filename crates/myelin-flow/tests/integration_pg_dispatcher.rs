@@ -1,4 +1,3 @@
-//! Live PostgreSQL proofs for the production drive adapter.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -472,8 +471,6 @@ async fn renewal_failure_joins_body_before_run_once_returns_and_refuses_commit()
     .await
     .unwrap();
 
-    // Invalidate the exact owner+epoch while the synchronous body is still blocked. The next
-    // heartbeat observes LeaseLost, but run_once must continue joining the body rather than detach.
     sqlx::query(
         "UPDATE workflow_run SET lease_epoch = lease_epoch + 1 \
          WHERE tenant_id='acme' AND region='no-osl' AND run_id='R-slow'",
@@ -584,7 +581,6 @@ async fn dispatch_frontier_arms_both_deadlines_and_fired_earliest_replays_withou
         .unwrap(),
         myelin_flow::SignalOutcome::Buffered
     );
-    // The sibling completion wakes the run, but deterministic earliest ordering re-parks on A.
     flow.run_once(base + 1, "2026-07-18T00:00:01Z")
         .await
         .unwrap();

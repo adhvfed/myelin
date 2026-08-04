@@ -1,21 +1,3 @@
-//! PostgreSQL-backed starter for queued CI runs.
-//!
-//! A starter is composed for one explicit `(tenant, region)` cell. It never discovers tenants and
-//! never scans a region globally. The selected `ci_run` row, its canonical `ci_job` DAG ledger, the
-//! pre-minted `workflow_run`, and the `queued -> running` transition are committed on one caller-owned
-//! PostgreSQL transaction.
-//!
-//! The service main composes this starter through [`PgCiRunStarterFactory`] (built at the composition
-//! root by [`crate::ci_run_starter_factory`]), behind the SAME explicit `MYELIN_CI_RUNNER=1`
-//! activation seam the runner lane uses. Unset / `0` keeps the complete runner host dormant. A fresh
-//! start accepts only a canonical V2 plan and requires an explicit
-//! policy-aware [`CiLaunchAuthorityMaterializer`]; the production default refuses every fresh launch.
-//! The starter co-commits the immutable runtime grants, check attempts, canonical job ledger, workflow,
-//! and lifecycle transition, while an exact retry validates and reuses the frozen manifest without
-//! consulting mutable current policy. A fresh start also co-emits one manifest-bound in-progress
-//! check fact per authored context through the durable outbox. The region-wide poller is composed
-//! separately and is driven only by that same opt-in host.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -84,22 +66,10 @@ WHERE tenant_id = $1 AND region = $2
   AND (run_id = $3 OR job_id = ANY($4::uuid[]))
 FOR UPDATE";
 
-/// Frozen BLAKE3 derive-key context for the version-1 canonical CI DAG-node identity.
-///
-/// The hash input is four ordered `u64::to_be_bytes()` length-prefixed frames: tenant id, the
-/// RFC-ordered 16 bytes of `ci_run.run_id`, the concrete resolved job name, and
-/// [`crate::ResolvedJobV1::matrix_identity`]. The first 16 digest bytes become an RFC 9562 UUIDv8 by setting
-/// the version and variant bits. Changing any byte of this contract requires a new versioned helper.
 pub const CI_JOB_ID_V1_DOMAIN: &str = "myelin.ci.job-id.v1";
-/// V2 identity also binds the authored stage separately from the concrete matrix-expanded name.
 pub const CI_JOB_ID_V2_DOMAIN: &str = "myelin.ci.job-id.v2";
-/// Frozen deterministic event-id domain for a manifest-bound initial check fact.
 pub const CI_INITIAL_CHECK_EVENT_V1_DOMAIN: &str = "myelin.ci.initial-check-event.v1";
 
-/// Derive the canonical durable `ci_job.job_id` for one resolved version-1 DAG node.
-///
-/// The caller must pass authority read from the locked `ci_run` and validated plan. In particular,
-/// `concrete_name` is the resolved node name (including any matrix suffix), never an authored alias.
 pub fn ci_job_id_v1(
     tenant: &TenantId,
     run_id: sqlx::types::Uuid,
@@ -119,7 +89,6 @@ pub fn ci_job_id_v1(
     let digest = hasher.finalize();
     let mut bytes = [0_u8; 16];
     bytes.copy_from_slice(&digest.as_bytes()[..16]);
-    // RFC 9562: custom UUID version 8 and the RFC 4122/9562 variant (`10xx`).
     bytes[6] = (bytes[6] & 0x0f) | 0x80;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     sqlx::types::Uuid::from_bytes(bytes)
@@ -167,8 +136,6 @@ struct ExpectedCiJobV1 {
     result_summary: Option<serde_json::Value>,
 }
 
-/// Immutable code identity this starter is allowed to bind. `ci_run` does not yet carry this pin,
-/// so the bounded composition must supply the exact deployed body version and hash explicitly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiWorkflowDefinitionPin {
     version: i32,
@@ -200,11 +167,6 @@ impl CiWorkflowDefinitionPin {
     }
 }
 
-/// A policy-aware server adapter that converts one verified customer plan into explicit runtime
-/// grants. The adapter is invoked only after the starter locks the exact queued run. Implementations
-/// must be deterministic and retry-safe for `record.run_id`: external reservation/token services
-/// cannot join the PostgreSQL transaction, so a rolled-back retry must resolve the same stable handles
-/// and must not create an irreversible duplicate. There is no permissive implementation.
 pub trait CiLaunchAuthorityMaterializer: Send + Sync {
     fn materialize<'a>(
         &'a self,
@@ -215,9 +177,6 @@ pub trait CiLaunchAuthorityMaterializer: Send + Sync {
         Box<dyn Future<Output = Result<CiLaunchAuthorityV1, CiLaunchAuthorityError>> + Send + 'a>,
     >;
 
-    /// Materialize on the starter's tenant-scoped transaction. The default preserves truly external
-    /// authority providers; an in-database reservation adapter overrides this so reservation and
-    /// manifest/workflow/job state co-commit.
     fn materialize_in_tx<'a>(
         &'a self,
         _conn: &'a mut sqlx::PgConnection,
@@ -262,7 +221,6 @@ impl CiLaunchAuthorityMaterializer for UnavailableCiLaunchAuthority {
     }
 }
 
-/// Strict, Flow-safe decoding of the two references persisted as a CI workflow's claimed input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClaimedCiInput {
     tenant: TenantId,
@@ -295,8 +253,6 @@ impl std::fmt::Display for ClaimedCiInputError {
 
 impl std::error::Error for ClaimedCiInputError {}
 
-/// Decode exactly `[ci/artifact/drive-manifest-blake3:<64-lower-hex>, ci/run/<uuid>]`. No extra
-/// reference, suffix, foreign tenant, abbreviated digest, or different artifact class is accepted.
 pub fn decode_ci_claimed_input(
     expected_tenant: &TenantId,
     input: &[ArtifactRef],
@@ -373,18 +329,13 @@ struct StarterCandidate {
     finished_at: Option<String>,
 }
 
-/// One bounded starter pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StartQueuedOutcome {
-    /// No queued row exists in this exact configured cell.
     Idle,
-    /// The queued row was atomically terminalized because a higher producer generation exists.
     Superseded { run_id: String },
-    /// The row and workflow were atomically advanced.
     Started { run_id: String, wf_run_id: String },
 }
 
-/// Fail-closed starter errors. The transaction is rolled back for every variant.
 #[derive(Debug)]
 pub enum PgCiStarterError {
     InvalidScope(String),
@@ -423,8 +374,6 @@ impl std::fmt::Display for PgCiStarterError {
 
 impl std::error::Error for PgCiStarterError {}
 
-/// A bounded, exact-cell queued-run starter. Construct one instance for each explicitly configured
-/// tenant and region; there is deliberately no tenant enumeration constructor or API.
 #[derive(Clone)]
 pub struct PgCiPipelineStarter {
     pool: PgPool,
@@ -459,8 +408,6 @@ impl PgCiPipelineStarter {
         )
     }
 
-    /// Construct a starter with an explicit policy-aware authority adapter but no PR supersession
-    /// authority. This is useful for non-PR tests; any pull-request row fails closed.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_authority(
         pool: PgPool,
@@ -538,9 +485,6 @@ impl PgCiPipelineStarter {
         })
     }
 
-    /// Validate one preflight candidate outside a database lock, then re-lock and byte-compare that
-    /// exact row before materializing its canonical DAG and starting it. The exact `ci_job` ledger,
-    /// `start_with_id_on_conn` workflow, identity proof, and lifecycle update share one transaction.
     pub async fn run_once(&self) -> Result<StartQueuedOutcome, PgCiStarterError> {
         let Some(candidate) = self.preflight_candidate().await? else {
             return Ok(StartQueuedOutcome::Idle);
@@ -556,8 +500,6 @@ impl PgCiPipelineStarter {
             .load_by_identity(&candidate.record.wf_run_id, &candidate.record.run_id)
             .await
             .map_err(PgCiStarterError::Manifest)?;
-        // A frozen manifest is the complete replay authority. Only a genuinely fresh launch reads
-        // the source CAS; exact repair must survive source retention and current-policy changes.
         let prepared = if manifest_preflight.is_some() {
             None
         } else {
@@ -658,8 +600,6 @@ impl PgCiPipelineStarter {
                     )
                 })?;
                 validate_definition_pin(&mut transaction, &self.definition, false).await?;
-                // The exact queued row is locked before consulting policy. Same-database reservation
-                // adapters co-commit here; truly external adapters must remain retry-safe by run identity.
                 let authority = self
                     .launch_authority
                     .materialize_in_tx(&mut transaction, &record, prepared, &self.definition)
@@ -894,12 +834,6 @@ async fn emit_initial_checks(
         caused_by: record.caused_by.clone().map(CausedBy),
         depth: cause_depth,
     };
-    // `started_at` is immutable run provenance carried by the payload. Envelope clocks describe
-    // this transaction's actual state transition / durable acceptance, so take one PostgreSQL
-    // wall-clock timestamp for the whole context set rather than pretending the run was accepted
-    // when its queued row was originally created.
-    // @tenant-cross-scope: PostgreSQL's clock is cell infrastructure with no tenant-owned rows;
-    // the caller-owned transaction is already tenant-scoped before this read.
     let emitted_at: String = sqlx::query_scalar(
         "SELECT to_char(clock_timestamp() AT TIME ZONE 'UTC', \
                         'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')",
@@ -988,16 +922,6 @@ fn initial_check_event_id(
     EventId(format!("ci-check-start-{}", hasher.finalize().to_hex()))
 }
 
-/// **The per-(tenant, region) starter composition seam (the region-wide poller's router).** A
-/// [`PgCiPipelineStarter`] is bound to ONE explicit `(tenant, region)` cell and deliberately exposes no
-/// tenant enumeration. A control-plane node, however, serves a whole region: the runner lane claims
-/// across every tenant in its region, so the ci_run-poll autonomy wire must DISCOVER a queued run's
-/// authoritative tenant and route it to a starter composed for exactly that tenant — it may never reuse
-/// a synthetic service identity. This factory is that router: it captures the shared runtime
-/// dependencies (the runtime pool, the id minter, the blob CAS, the cell region) ONCE at the
-/// composition root and mints a fresh exact-cell starter for an explicit authoritative [`TenantId`] on
-/// demand. It never enumerates tenants itself. Constructing the factory wraps the pool + blob client
-/// only; no query runs until a minted starter's [`PgCiPipelineStarter::run_once`] is driven.
 #[derive(Clone)]
 pub struct PgCiRunStarterFactory {
     pool: PgPool,
@@ -1010,11 +934,6 @@ pub struct PgCiRunStarterFactory {
 }
 
 impl PgCiRunStarterFactory {
-    /// Test-support constructor with the explicit fail-closed authority. Production composition uses
-    /// [`Self::new_with_authority_and_supersession`], so a PR lane cannot silently omit newest-head
-    /// ordering and cancellation.
-    /// The `region` is the residency boundary every minted starter polls (and never crosses); `blobs`
-    /// is the plan CAS the resolved run plan is loaded from; `minter` mints durable workflow ids.
     #[cfg(any(test, feature = "test-support"))]
     pub fn new(
         pool: PgPool,
@@ -1084,16 +1003,10 @@ impl PgCiRunStarterFactory {
         }
     }
 
-    /// The cell region every minted starter is bound to (never crossed).
     pub fn region(&self) -> &Region {
         &self.region
     }
 
-    /// **Mint the exact-cell starter for one authoritative tenant.** `tenant` MUST be read from the
-    /// queued `ci_run.tenant_id` the poller discovered (never a synthetic/service identity), so the
-    /// minted starter only ever polls and starts THAT tenant's queued runs in this factory's region;
-    /// `definition` pins the immutable deployed body version + code hash the start is allowed to bind.
-    /// Fails closed on an invalid tenant/region scope — never a widened cell.
     pub fn starter_for(
         &self,
         tenant: TenantId,
@@ -1613,13 +1526,6 @@ fn granted_jobs_v2(
         .collect()
 }
 
-/// Lower one validated authored job into the exact executable manifest fields. Free-form jobs retain
-/// their historical argv/env byte-for-byte. Structured Cargo jobs receive an argv constructed by the
-/// platform and fixed Cargo environment values that overwrite any conflicting grant value.
-///
-/// There is deliberately no shell in this translation. The sandbox consumes the selector and fixed
-/// Cargo configuration below to install its read-only vendor boundary; proving that tenant-authored
-/// path/git dependencies used no additional workspace code remains a separate attestation policy.
 fn platform_owned_execution(
     job: &ResolvedJobV2,
     granted_env: &BTreeMap<String, String>,
@@ -1627,12 +1533,6 @@ fn platform_owned_execution(
     let Some(build) = &job.build else {
         return Ok((job.command.clone(), granted_env.clone()));
     };
-    // A structured Cargo build MUST carry the resolve-time, server-selected vendor reference (keyed to
-    // the repository's root Cargo.lock). Refuse fail-closed if it is absent rather than falling back to
-    // a hardcoded default tree — that hardcoded-smoke fallback was the gate-4 blocker-1 gap. The
-    // selection is always a REGISTERED, digest-pinned reference, and the sandbox independently
-    // re-validates it against its closed asset registry (and re-binds it to the checked-out Cargo.lock)
-    // before spawn.
     let vendor = job.selected_cargo_vendor.as_deref().ok_or_else(|| {
         PgCiStarterError::CorruptRun(format!(
             "structured Cargo build job `{}` has no server-selected Cargo vendor asset; refusing to \
@@ -1715,9 +1615,6 @@ fn build_drive_manifest_v1(
     Ok(manifest)
 }
 
-/// Read the immutable attempt authority reserved by dispatch. The runtime role deliberately has no
-/// `UPDATE` grant on this table, so a row-locking clause would make production startup fail despite
-/// having sufficient `SELECT` authority.
 const SELECT_RESERVED_CHECK_ATTEMPTS_QUERY: &str = "\
 SELECT context, repo_ref, commit_oid, run_attempt FROM ci_run_check_attempt
 WHERE tenant_id=$1 AND region=$2 AND run_id=$3";
@@ -1800,8 +1697,6 @@ where
         PgCiStarterError::CorruptRun(format!("locked ci_run.run_id is not a UUID: {error}"))
     })?;
 
-    // Pass one freezes every node id before any dependency is translated. The BTreeMap preserves
-    // the plan's canonical name language; the set catches a digest truncation collision loudly.
     let mut ids_by_name = BTreeMap::new();
     let mut unique_ids = BTreeSet::new();
     for job in &prepared.plan().jobs {
@@ -1822,11 +1717,7 @@ where
 
     let mut expected = Vec::with_capacity(prepared.plan().jobs.len());
     for job in &prepared.plan().jobs {
-        // V1 COMPATIBILITY CONTRACT: `stage` is the concrete resolved node name because the v1 wire
-        // does not preserve a separate authored-stage identity. A future distinction requires v2.
         let stage = job.name.clone();
-        // Needs are validated as strictly name-sorted by the run-plan loader. Translate in that exact
-        // canonical order; UUID byte order is deliberately not a second ordering authority.
         let needs = job
             .needs
             .iter()
@@ -1858,9 +1749,6 @@ where
             name: job.name.clone(),
             needs,
             matrix_key,
-            // V1 COMPATIBILITY CONTRACT: this is the whole locked resolved-plan CAS object that
-            // contains the job, not a per-job executable JobSpec. Runtime JobSpec authority remains
-            // deliberately disabled and belongs to the later `ci_job_spec` dispatch boundary.
             spec_ref: record.definition_snapshot.clone(),
             state: "queued".into(),
             attempt: 1,
@@ -2017,8 +1905,6 @@ async fn validate_definition_pin(
     pin: &CiWorkflowDefinitionPin,
     replay: bool,
 ) -> Result<(), PgCiStarterError> {
-    // Global code registry: tenant_id/region do not apply because definitions contain no tenant
-    // data. This is the same loud annotation used by PgFlowExecutor's registry queries.
     let tenant_id_not_applicable = sqlx::query(
         "SELECT code_hash, status FROM wf_definition \
          WHERE wf_type = $1 AND version = $2 FOR SHARE \
@@ -2049,8 +1935,6 @@ async fn validate_definition_pin(
             "pinned workflow definition code hash differs from deployed registry".into(),
         ));
     }
-    // A replay pinned to existing code may finish while that version drains. A fresh start must use
-    // an active definition. Retired/unknown states are never resurrected.
     if (replay && !matches!(status.as_str(), "active" | "draining"))
         || (!replay && status != "active")
     {
@@ -2059,7 +1943,6 @@ async fn validate_definition_pin(
         )));
     }
     if !replay {
-        // Same global-registry annotation as the exact pinned-definition lookup above.
         let tenant_id_not_applicable = sqlx::query_scalar::<_, i32>(
             "SELECT version FROM wf_definition WHERE wf_type = $1 AND status = 'active' \
              ORDER BY version DESC LIMIT 1 \

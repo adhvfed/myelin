@@ -1,5 +1,3 @@
-//! L2 production-module line-budget gate.
-
 use myelin_lints::erosion::{parse_budget, scan_workspace};
 use std::process::ExitCode;
 

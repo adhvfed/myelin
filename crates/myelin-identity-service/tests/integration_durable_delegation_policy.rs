@@ -1,4 +1,3 @@
-//! Live PostgreSQL proof for durable server-side delegation policy resolution.
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;

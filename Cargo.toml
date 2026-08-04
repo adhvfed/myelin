@@ -3,372 +3,62 @@ resolver = "2"
 members = [
     "crates/myelin-tenancy",
     "crates/myelin-identity",
-    # The Identity SERVICE crate (P-ID-04 → P-054): the bootable service SHELL the harness wires
-    # (boot → migrate → relay → consumers → three ports → graceful drain; liveness ≠ readiness;
-    # fail-closed check/list_objects slots until the M1 bodies land). This is the "every service
-    # `main.rs`" consumer the contract-index row 1.1 names — the FIRST such service. Like
-    # myelin-harness and myelin-lints it is a LEAF consumer ABOVE myelin-substrate (the root-last
-    # harness): it depends on the harness (serve/AppSpec) + the frozen identity contract surface,
-    # and NOTHING in the production crate DAG depends on it. It is therefore OUTSIDE the
-    # eleven-crate library DAG modelled by crate_graph.rs (substrate_is_root() — "no *library*
-    # crate depends on substrate" — is preserved; a service main is the harness's terminal
-    # consumer). See the crate-level note in crates/myelin-identity-service/src/lib.rs.
     "crates/myelin-identity-service",
     "crates/myelin-events",
     "crates/myelin-refs",
-    # The myelin-search SERVICE crate skeleton (SRCH-P01 → P-021). Search owns NO contract
-    # crate (architecture §0/§1: it is overwhelmingly a CONSUMER — it composes myelin-query,
-    # myelin-identity, myelin-events, myelin-gdpr, myelin-content and holds only derived,
-    # reconstructible state). At M0 this crate carries ONLY the index-document NAME ANCHORS
-    # (the field/unit names aligned to the frozen EventEnvelope (2.1) + ArtifactRef (5.1), no
-    # mechanism) + the names/units drift test. The engine, the index backends, and the
-    # permission-aware query pipeline (the path the search-requires-acl-filter lint guards)
-    # land in M2 (SRCH-P03..SRCH-P16). It sits in the consumer tier of the §2.9 DAG: it
-    # depends on -tenancy/-events/-identity and MUST NOT be depended on by them.
     "crates/myelin-search",
     "crates/myelin-content",
     "crates/myelin-query",
-    # The Knowledge service SHELL crate (KN-P04 → P-294, M3): the bootable AppSpec the harness
-    # wires (boot → migrate → outbox-relay hook → three ports → graceful drain; liveness ≠
-    # readiness) + the hot-table-flag declaration (block/db_row/doc_op, contract 1.5) the high-
-    # write tables KN-P05 creates are protected by + the fail-closed authenticate/check entrypoint
-    # slots (4.1/4.2, the per-op body KN-P14 / ABAC push-down KN-P16). Like the other SERVICE
-    # crates (myelin-identity-service, myelin-notif, myelin-git, myelin-issues) it is a LEAF
-    # CONSUMER above the glue crates (depends on -content/-query/-identity/-events/-tenancy/
-    # -substrate) and is NOT a node in the eleven-crate library DAG modelled by
-    # myelin-substrate::crate_graph — nothing in the production DAG depends back on it;
-    # substrate_is_root()/identity_is_sink() are preserved (a service is the graph's terminal
-    # consumer). The OLTP store + (tenant,region) partition land in KN-P05; the outbox emit
-    # bodies + consumers in KN-P06. See crates/myelin-knowledge/src/lib.rs.
     "crates/myelin-knowledge",
     "crates/myelin-agent",
-    # The Agent-Fabric IMPLEMENTATION / SERVICE crate (AG-P2 → P-131), distinct from the glue crate
-    # myelin-agent (AG-P1 → P-130). It ships the data-model MIGRATIONS — the five (tenant, region)-
-    # first RLS tables (run/tool_def/proposed_effect/hitl_gate/trace, architecture §4) applied
-    # forward-only through the storage online runner + the myelin_make_tenant_scoped RLS convention,
-    # with the #[personal_data] tags on every PII column. Like the other SERVICE / SUBSYSTEM crates
-    # (myelin-identity-service, myelin-gdpr-service, myelin-git, myelin-issues, myelin-notif) it is a
-    # LEAF CONSUMER above the glue crates (depends on -agent/-gdpr/-storage/-tenancy/-identity) and
-    # is NOT a node in the eleven-crate library DAG modelled by myelin-substrate::crate_graph —
-    # nothing in the production DAG depends back on it; substrate_is_root()/identity_is_sink() are
-    # preserved (a service is the graph's terminal consumer). See crates/myelin-agent-service/src/lib.rs.
     "crates/myelin-agent-service",
-    # The VENDOR-BRAIN crate (AG-P25 → the hosted-agent slice-1 kernel): the real `LlmAgentRuntime`
-    # + the `ModelClient` vendor abstraction + the real `LunaClient`. This is the SINGLE sanctioned
-    # home for a model SDK / prompt / model-name string in the whole workspace — the one place the
-    # `no-llm-in-platform` lint (contract 1.6) is excluded (a whole-crate boundary, named LOUD in
-    # myelin-lints/tests/workspace_clean.rs + myelin-lints/src/bin/lint-gate.rs). A LEAF consumer
-    # above the glue crate `myelin-agent`; nothing in the production DAG depends back on it. See
-    # crates/myelin-agent-model/src/lib.rs.
     "crates/myelin-agent-model",
     "crates/myelin-gdpr",
-    # The GDPR/Audit SERVICE crate (P-GA-19 → P-062): the tamper-evident audit log core — the
-    # outbox-only audit CONSUMER + the per-tenant hash-chain + the Merkle leaves + the
-    # minimisation (contract 10.6, the construction half; the proofs/STH/witness are P-119). Like
-    # myelin-identity-service it is a SERVICE crate — a LEAF consumer ABOVE myelin-events /
-    # -identity / -tenancy; it consumes the frozen bus + identity + tenancy surfaces and NOTHING
-    # in the production library DAG depends back on it (substrate_is_root() in crate_graph.rs is
-    # preserved — a service is the graph's terminal consumer, OUTSIDE the eleven-crate library
-    # DAG). The DSR orchestrator + the GDPR-owned holders come to live here in M1
-    # (P-GA-05/-06/-11). See the crate-level note in crates/myelin-gdpr-service/src/lib.rs.
     "crates/myelin-gdpr-service",
-    # The proc-macro half of the GDPR classify-derive (contract 10.2; P-GA-02 → P-050). A
-    # `proc-macro = true` crate may export ONLY procedural macros, so the `#[personal_data]`
-    # attribute lives here while the five-tag enum TYPES it references live in `myelin-gdpr`,
-    # which re-exports the attribute. It is a leaf BELOW myelin-gdpr in the §2.9 DAG (no myelin
-    # deps); only myelin-gdpr depends on it.
     "crates/myelin-gdpr-macros",
     "crates/myelin-client",
-    # The Git-hosting SUBSYSTEM crate (GIT-P3 → P-063). At M1 it carries ONLY the
-    # PersonalDataHolder H1 INTENT (architecture 00-overview §1.1, 03 §6) + the
-    # #[personal_data(...)] classification tags on the skeletal git schema (01 §4.3/§4.5) so the
-    # no-untagged-personal-data lint (contract 10.2 / 1.6) is green from the first migration
-    # (GIT-P8). It is a LEAF SUBSYSTEM consumer ABOVE the glue crates (depends on -gdpr/-tenancy/
-    # -identity) and is NOT a node in the eleven-crate library DAG modelled by
-    # myelin-substrate::crate_graph (like the service crates) — nothing in the production DAG
-    # depends back on it; substrate_is_root()/identity_is_sink() are preserved. The holder is
-    # OPENED + auto-registered by serve in GIT-P8 (M3-G1); no git feature ships at P-063.
     "crates/myelin-git",
-    # The Issue-tracker SUBSYSTEM crate (ISS-P01 → P-125 / M1). The most cross-subsystem-coupled
-    # consumer subsystem (architecture issue-tracker 00-overview §1). At M1 it carries ONLY the
-    # "freeze-so-dependents-compile" slice (roadmap §3.0): the frozen Issues ReBAC namespace fragment
-    # (contract 4.9 — the `issue` namespace + the `- confidential` set-difference userset + `watcher`
-    # + the field/transition ABAC sub-objects) Identity compiles into the one cell schema, PLUS the
-    # H3 holder INTENT + the #[personal_data(...)] classification tags on the skeletal issue schema
-    # (contract 10.2 — incl. the OQ-H worklog/productivity behavioural tags, basis = TBD_LEGAL) so
-    # the no-untagged-personal-data lint (contract 1.6) is GREEN from the first migration (ISS-P05).
-    # Like the other subsystem/service crates (myelin-git, myelin-identity-service) it is a LEAF
-    # CONSUMER above the glue crates (depends on -identity/-gdpr/-tenancy) and is NOT a node in the
-    # eleven-crate library DAG modelled by crate_graph.rs — nothing in the production DAG depends back
-    # on it; substrate_is_root()/identity_is_sink() are preserved. No Issues FEATURE ships at P-125;
-    # the holder is OPENED + auto-registered by serve in ISS-P07. See crates/myelin-issues/src/lib.rs.
     "crates/myelin-issues",
-    # The Refs SERVICE/SUBSYSTEM crate (REF-P3 → P-120). Distinct from the `myelin-refs` GLUE
-    # crate (the ArtifactRef value type + #sub codec, a MODELLED node in the eleven-crate library
-    # DAG that MUST NOT depend on -gdpr). Like the other service/subsystem crates
-    # (myelin-identity-service, myelin-gdpr-service, myelin-git) it is a LEAF CONSUMER above the
-    # glue crates: it depends on -gdpr (PersonalDataHolder) / -substrate (the holder registry +
-    # H1–H18 catalog) / -refs (the value type) / -tenancy / -identity, and NOTHING in the
-    # production library DAG depends back on it (so substrate_is_root()/identity_is_sink() in
-    # crate_graph.rs are preserved — a subsystem crate is the graph's terminal consumer, OUTSIDE
-    # the modelled DAG). At REF-P3 it carries ONLY the Refs PersonalDataHolder registration (H12,
-    # a STUB surface — locate/export empty-but-correct, restrict/erase no-ops) + the residency-pin
-    # confirmation. The edge schema (REF-P5), the per-tenant DEK pin (REF-P4), the builder/
-    # invalidator consumers (REF-P6/P7) and the real erasure body (REF-P15) land here in M1/M2.
     "crates/myelin-refs-service",
-    # The Notifications crate (NOTIF-P1 → P-127, M2). Notif owns ZERO new contracts vs Phase 3
-    # (architecture notifications.md §0/§1.2 — it is overwhelmingly a CONSUMER), so it carries no
-    # separate glue crate; THIS crate plays both roles at the leaf of the §2.9 DAG: (1) the §4.1
-    # EXPOSED contract CARRIERS (InboxItem / HumanisedString / the reason+class enums / the
-    # DeliveryAdapter trait SHAPE — compile-time carriers so a contract change breaks every
-    # consumer's build NOW, ADR-01), and (2) the SERVICE SHELL (an AppSpec passed to
-    # serve(AppSpec) — boot → migrate → relay → three ports → drain, liveness≠readiness, empty
-    # migration set + empty consumer seam). Like the other service/subsystem crates it is a LEAF
-    # CONSUMER above the glue crates (depends on -tenancy/-events/-identity/-refs/-substrate) and
-    # is NOT a node in the eleven-crate library DAG modelled by crate_graph.rs — nothing in the
-    # production DAG depends back on it; substrate_is_root()/identity_is_sink() are preserved. The
-    # data model (NOTIF-P2), the Signal-consumer router (NOTIF-P3), and the holder (NOTIF-P4) are
-    # the named floors. See the crate-level note in crates/myelin-notif/src/lib.rs.
     "crates/myelin-notif",
-    # The durable-workflow SUBSTRATE crate (P-FLOW-01 → P-197, M2). myelin-flow is a BUILD,
-    # DBOS-class, Postgres-embedded engine (architecture durable-workflow.md §2, ADR-09 — NO new
-    # datastore). At P-FLOW-01 it carries the SCHEMA ONLY: the six-table data model (architecture
-    # §3 — workflow_run / wf_history / wf_timer / wf_signal / wf_activity_attempt / wf_definition)
-    # as forward-only `(tenant, region)`-first RLS migrations, plus the row TYPE carriers with the
-    # `#[personal_data(...)]` tags on the rare inline-PII result/payload envelope key refs. Like
-    # the other service/subsystem crates (myelin-notif / myelin-agent-service) it is a LEAF
-    # CONSUMER above the glue crates (depends on -tenancy/-refs/-gdpr/-substrate) and is NOT a node
-    # in the eleven-crate library DAG modelled by crate_graph.rs — nothing in the production DAG
-    # depends back on it; substrate_is_root()/identity_is_sink() are preserved. The AppSpec service
-    # shell (P-FLOW-02), the holder auto-registration (P-FLOW-03), and the algorithms
-    # (P-FLOW-04..08) are the named floors. See the crate-level note in crates/myelin-flow/src/lib.rs.
     "crates/myelin-flow",
-    # The Chat SUBSYSTEM crate (CHAT-P1 → P-128, M2). Chat is the MAXIMAL CONSUMER subsystem
-    # (architecture chat 00-overview §2.1). At CHAT-P1 it carries ONLY the M2-C0
-    # "freeze-so-dependents-compile" taxonomy slice: the COMPLETE `chat.*` event-token list
-    # (architecture 03 §1.1/§1.2) split into the DURABLE-via-outbox set vs the FIREHOSE-only set,
-    # each token PROVEN grammatical against the one Bus validator (EB-02/P-042) — chat REGISTERS
-    # its list; it does NOT author the grammar (the names anchor X-5). Like the other
-    # subsystem/service crates (myelin-git, myelin-issues, myelin-notif) it is a LEAF CONSUMER
-    # above the glue crates (depends on -events) and is NOT a node in the eleven-crate library DAG
-    # modelled by crate_graph.rs — nothing in the production DAG depends back on it;
-    # substrate_is_root()/identity_is_sink() are preserved. No chat FEATURE ships at P-128: the
-    # durable set's emit behaviour begins in CHAT-P5, the firehose set's in CHAT-P10. See the
-    # crate-level note in crates/myelin-chat/src/lib.rs.
     "crates/myelin-chat",
-    # The Chat CONNECTION-TIER gateway (CHAT-P9 / P-403, M4-C2). The stateless Rust gateway:
-    # subscribe/resume/resync_required — the zero-loss-across-reconnect backbone. It COMPOSES the
-    # frozen pieces (the firehose resume-cursor protocol 3.5, the MessageStore::resync_from snapshot
-    # fallback 2.6, the membership read gate 4.2, authenticate 4.1, the liveness!=readiness gate 1.3,
-    # the TE-21 1.7 no-op) and owns NO durable store + NO outbox (the gateway has no emit path — it
-    # calls the Message Service). A leaf consumer ABOVE the glue crates; nothing in the production DAG
-    # depends back on it (substrate_is_root()/identity_is_sink() preserved). The firehose-only LIVE
-    # delivery body + the shed order is CHAT-P10 (P-404).
     "crates/myelin-chat-gateway",
-    # The CI SANDBOX crate (CI-P1 → P-129, M2). The runner/backend home: the JobSpec struct
-    # (the "one struct, two kinds" seam, kind ∈ {Ci, Agent}), the SandboxBackend / FleetProvider
-    # trait SHAPES (no backend impl — Firecracker is CI-P2/P-237, gVisor is CI-P28), and the
-    # four-uniform-guarantee wiring SEAM (reserve/settle 11.7, mint_run_token 4.7, HITL-withhold
-    # routing note, isolation-floor hook). ToolHands::exec (8.4) IS launch(JobSpec{kind:Agent}) —
-    # the equivalence wired here so the agent fabric (AG-P8/P-226) dispatches onto this exact
-    # runner. Like the other subsystem crates it is a LEAF CONSUMER above the glue crates (depends
-    # on -tenancy for Region) and is NOT a node in the eleven-crate library DAG modelled by
-    # crate_graph.rs — nothing in the production DAG depends back on it; substrate_is_root() /
-    # identity_is_sink() are preserved. cargo build --workspace stays DB-free (this is a pure
-    # value/trait crate; no DB/object-store/cache/bus contract is touched at P-129). See the
-    # crate-level note in crates/myelin-ci-sandbox/src/lib.rs.
     "crates/myelin-ci-sandbox",
-    # The CI Trigger & Dispatch SERVICE shell (CI-P6 → P-349, M4): a serve(AppSpec) shell (contract
-    # 1.1) with the three-surface split + liveness ≠ readiness, owning the ONE table Trigger &
-    # Dispatch is stateful in — the `consumer_dedup` exactly-once-effect ledger (arch 01 §3.8 /
-    # contract 2.5). Like the other service/subsystem crates it is a LEAF CONSUMER above the shared
-    # substrate (serve/AppSpec + migrations) and is NOT a node in the eleven-crate library DAG
-    # modelled by crate_graph.rs — nothing in the production DAG depends back on it; substrate_is_root()
-    # is preserved. cargo build --workspace stays DB-free (the live-stack schema apply is behind the
-    # `integration` feature). See crates/myelin-ci-dispatch/src/lib.rs.
     "crates/myelin-ci-dispatch",
-    # Shared-outbox publisher SERVICE. A terminal leaf: nothing in the workspace depends on it.
     "crates/myelin-outbox-publisher",
-    # The CI Control Plane SERVICE shell (CI-P6 → P-349, M4): a serve(AppSpec) shell (contract 1.1)
-    # carrying the COMPLETE forward-only data-model migrations for every CI Control-Plane table
-    # (ci_run … cost_event, arch 01 §3) + the #[personal_data(...)]-tagged row mirrors that keep the
-    # no-untagged-personal-data lint green. Like the other service/subsystem crates it is a LEAF
-    # CONSUMER above the shared substrate + glue crates and is NOT a node in the eleven-crate library
-    # DAG modelled by crate_graph.rs — nothing in the production DAG depends back on it;
-    # substrate_is_root()/identity_is_sink() are preserved. cargo build --workspace stays DB-free (the
-    # live-stack schema apply is behind the `integration` feature). See crates/myelin-ci-controlplane/src/lib.rs.
     "crates/myelin-ci-controlplane",
-    # The storage SUBSTRATE crate (P-ST-01 → P-007): the OLTP tier client (harness pool +
-    # (tenant, region) RLS guard), and — in later prompts — the KMS hierarchy + BlobStore
-    # impls + backup/restore machinery. Sits below -gdpr/-client and ABOVE -substrate in
-    # the §2.9 root-last DAG (the harness depends on the tier client it wires). See the
-    # crate-level DEVIATION note in crates/myelin-storage/src/lib.rs (this node extends the
-    # §2.9 ten-crate DAG; the architecture §2.8 "no shared storage-API crate" is preserved
-    # because this is the harness-wired mechanism, not a cross-subsystem data-access crate).
     "crates/myelin-storage",
-    # Cross-service migration-ledger compatibility probe. A test-support LEAF that assembles the
-    # migration sets from production composition roots without making storage's ordinary test graph
-    # depend back on every service crate.
     "crates/myelin-migration-audit",
-    # The Tenancy control-plane SERVICE crate (P-CP-05 → P-080): the three PII-free registry
-    # tables (`cell` / `tenant_placement` / `cell_provisioning`) + the per-cell `local_tenant`
-    # directory + the HARD placement invariant (multi-cell single-region by construction). Like
-    # the other service/subsystem crates it is a LEAF consumer ABOVE the glue crates (depends on
-    # -substrate/-tenancy/-gdpr) and is NOT a node in the eleven-crate library DAG modelled by
-    # crate_graph.rs — nothing in the production DAG depends back on it; substrate_is_root() is
-    # preserved. See the crate-level note in crates/myelin-control-plane/src/lib.rs.
     "crates/myelin-control-plane",
     "crates/myelin-substrate",
-    # The product/edge API GATEWAY crate (MR-014 / E0.6, P-S14 transport): the ONE HTTP edge the
-    # UI/CLI/MCP call. It implements the PublicSurface request lifecycle as a REAL hyper listener —
-    # request → authenticate (Bearer capability token | session cookie) → resolve principal
-    # (tenant/region) → set tenant scope → authorize → dispatch → respond — plus the API
-    # conventions every subsystem follows (the {error:{message}} envelope, /v1 versioning, cursor
-    # pagination, the SSE real-time convention, the per-subsystem plug-in catalogue). Like the other
-    # service/subsystem crates it is a LEAF CONSUMER above the glue crates + substrate (it depends on
-    # -identity/-identity-service/-substrate/-storage/-tenancy) and is NOT a node in the eleven-crate
-    # library DAG modelled by crate_graph.rs — nothing in the production DAG depends back on it;
-    # substrate_is_root()/identity_is_sink() are preserved (the edge is the graph's terminal
-    # consumer, the one HTTP front door). It REUSES (never forks) substrate::topology::PublicSurface
-    # (tenant-from-token + IDOR reject/audit), the real PasetoCapabilityVerifier /
-    # CapabilityAuthenticator (Bearer auth), HumanSsoAuthenticator::production (refuse-not-mock human
-    # login), and storage::with_tenant_tx (the tenant scope). The per-subsystem handlers are MR-015+
-    # (this crate ships the gateway + conventions + ONE trivial whoami proof handler). It uses
-    # hyper/hyper-util/http-body-util/tokio DIRECTLY (all already in Cargo.lock as transitive deps —
-    # zero new crates enter the tree; axum is NOT in the lock and would add a new subtree), hand-
-    # building the tiny router (frontend canon §0 minimal-deps). See crates/myelin-edge/src/lib.rs.
     "crates/myelin-edge",
-    # Test-support failure-injection harness (P-S02..P-S04). NOT a node in the production
-    # crate DAG (architecture §2.9) — it sits above myelin-substrate as a leaf consumer and
-    # nothing depends on it. See crates/myelin-harness/Cargo.toml.
     "crates/myelin-harness",
-    # The architecture-lint ratchet (P-S10 → P-017: the four load-bearing lints;
-    # P-S11 → P-018 completes the twelve). NOT a node in the production crate DAG
-    # (architecture §2.9) — like myelin-harness it is a leaf test-support crate; NO
-    # production crate depends on it. It ships the §2.11 / contract-1.6 lints as
-    # cargo-level source-scanning checks (red + green fixtures) run as CI jobs over the
-    # workspace source + the fixture matrix. See crates/myelin-lints/Cargo.toml.
     "crates/myelin-lints",
-    # The env-driven CONFIG layer (Stage 1 / infra): the dev<->prod CONFIG SWAP seam. Reads the
-    # standard-interface endpoints (DATABASE_URL, S3_*, REDIS_URL, NATS_URL, MYELIN_REGION) from
-    # the environment so moving from the docker-compose dev stack to Scaleway (fr-par) is a
-    # config change, not a code change. A LEAF, zero-myelin-dep, zero-client-dep crate — it
-    # keeps `cargo build --workspace` DB-free; the real backend clients live behind the
-    # `integration` feature in the crates that own the trait impls.
     "crates/myelin-config",
-    # The `myelin` CLI (E0.9 / MR-020): the ONE local command surface a human or an agent drives the
-    # product through — an edge CLIENT that presents a REAL capability token as `Authorization: Bearer`
-    # and calls the MR-014 gateway's `/v1/...` endpoints (the same auth + audit a browser session is).
-    # A LEAF BINARY: it depends on the subsystem command grammars (myelin-git `api`, myelin-notif `cli`)
-    # + a tiny hyper HTTP client, and nothing in the production DAG depends back on it. Like
-    # myelin-edge it is NOT a node in the eleven-crate library DAG modelled by crate_graph.rs
-    # (substrate_is_root()/identity_is_sink() unaffected). See crates/myelin-cli/src/lib.rs.
     "crates/myelin-cli",
-    # The myelin-mcp MCP server (E0.9 / MR-021): the JSON-RPC-2.0-over-stdio surface a LOCAL Claude
-    # drives Myelin through as native MCP tools, under the SAME governance a human is. The MR-006
-    # binding: every tools/call routes through mint_run_token -> EffectApi::apply (the platform-owned
-    # governance chokepoint), never a bare PAT or a direct mutation. A LEAF BINARY like myelin-cli /
-    # myelin-edge: it REUSES git's agent_tools() catalogue + the EffectApi governance contract + the
-    # RunTokenMinter, and NOTHING in the production DAG depends back on it (NOT a node in the
-    # eleven-crate library DAG modelled by crate_graph.rs; substrate_is_root()/identity_is_sink()
-    # unaffected). See crates/myelin-mcp/src/lib.rs.
     "crates/myelin-mcp",
-    # The hosted-agent COMPOSITION ROOT (AG-P25 real-run wiring): the ONE leaf crate that joins the
-    # real vendor brain (`myelin-agent-model`), the driving loop (`myelin-agent-service`), and the
-    # durable prepaid wallet (`myelin-storage`) into a functioning, metered, end-to-end agent run.
-    # A LEAF consumer (nothing depends on it) — acyclic by construction, OUTSIDE the eleven-crate
-    # library DAG (`crate_graph`), and the single home of the `myelin-agent-model` dependency edge
-    # (the `no-llm-in-platform` boundary keeps agent-service off agent-model). See
-    # crates/myelin-agent-host/src/lib.rs.
     "crates/myelin-agent-host",
 ]
 
-# Workspace-wide dependency versions. Pinned once here so every glue crate shares
-# the exact same shape of serde_json::Value behind EventEnvelope.payload
-# (architecture 00 §2.1, the references-not-payloads rule) and a single ULID/time
-# representation. Kept to a tiny, zero-feature set — this is the skeleton (P-001);
-# real impl deps land with the prompts that fill the stubbed bodies.
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# The versioned thresholds file (P-S22 / P-038) is a TOML config source every M0 drill reads
-# its quantified threshold from. `toml` (de)serializes it; preserve-order is irrelevant here
-# (the file is keyed, not positional), so the default feature set is enough.
 toml = "0.8"
-# BLAKE3 is the content-address hash for the BlobStore (P-ST-03 / contract 11.2): hash-on-write,
-# re-hash-on-read integrity. A cited, proven structure (BLAKE3 2020; storage.md §11) — VISION §4
-# (cite proven structures, do not hand-roll a hash). `hex` renders the multihash digest into the
-# self-describing content-address string + the fs key path.
 blake3 = "1"
 hex = "0.4"
-# Durable workflow rows persist a partition derived from the run id. Freeze the exact historical
-# algorithm (SipHash-1-3) through the dedicated pure-Rust `siphasher` implementation instead of
-# relying on `std::collections::hash_map::DefaultHasher`, whose algorithm is explicitly unspecified.
 siphasher = "1.0.3"
-# SHA-256 — the read-side integrity verification for git-imported objects/packs (P-ST-22 /
-# contract 11.2 git pack tier). Git addresses its objects by SHA (SHA-1 legacy / SHA-256
-# modern); the BlobStore admits a self-describing `sha256:` multihash tag (P-ST-03) so a
-# git object coexists with native BLAKE3 blobs, but the verification path for that tag was the
-# named P-ST-22 floor. `sha2` is the vetted RustCrypto FIPS-180-4 impl (never a hand-rolled
-# hash — VISION §4 / EI-01 §7), used ONLY to re-hash a `sha256:`-addressed object on read.
 sha2 = "0.10"
-# The proc-macro toolchain for the `#[derive(PersonalData)]` classify-derive BODY (contract 10.2,
-# P-GA-07 / P-107): parse the tagged struct + its `#[personal_data(...)]` helper args (syn), emit
-# the generated registry entry + the structural `subject_locator` accessor (quote). `full` is not
-# needed — we parse a `DeriveInput` (a struct) and field attributes, not whole expressions; the
-# default `derive` + `parsing` + `proc-macro` features cover it. proc-macro2 carries the Span type.
 syn = { version = "2", default-features = false, features = ["derive", "parsing", "proc-macro", "printing", "extra-traits"] }
 quote = "1"
 proc-macro2 = "1"
 
-# Tantivy — the in-process v1 reference search engine (SRCH-P04 / search-and-indexing.md §2.1).
-# Pure-Rust, single-binary, per-tenant index directories (residency + crypto-shred-per-index for
-# free). It is the REFERENCE engine behind the `IndexBackend` trait; OpenSearch is the reserved
-# per-cell upgrade behind the SAME trait (a measured M5/§6.2 promotion — a config/impl swap, not a
-# rewrite). Referenced ONLY by `myelin-search`; `mmap` is its default Directory. This is a normal
-# (non-DB) dependency and is part of the default `cargo build --workspace` (it is in-process, not a
-# network backend — unlike the `integration`-gated Postgres/S3/NATS clients above).
 tantivy = "0.26"
 
-# Yrs (y-crdt) — the Rust-native Yjs CRDT engine (KN-P29 / knowledge-platform 02 §3.3). The named
-# M5 Layer-3 merge promotion over the unchanged resume-cursor transport: a per-block content CRDT
-# (`Y.Text`/`Y.XmlFragment`) for inline runs + a tree/move CRDT for block structure (the hybrid
-# granularity). Being Rust-native keeps the server an in-process "dumb relay + persistence +
-# authority" (no separate CRDT process). It is the cited proven structure (Yjs/Yrs; the CRDT-
-# after-CAS named floor, external-insights/04 §2 — VISION §4 "cite proven structures, do not
-# hand-roll a CRDT"). The op-log carries Yrs UPDATE BYTES; the transport, op_seq cursor and
-# idempotent apply are unchanged — the CRDT is a payload-only swap. An in-process pure-Rust
-# library (like tantivy / git2), part of the default DB-free `cargo build --workspace` — it is NOT
-# a network backend, so it does NOT ride the `integration` feature. Referenced ONLY by
-# `myelin-knowledge`'s collab/merge module.
 yrs = "0.27"
 
-# git2 (libgit2 bindings) — the in-process READ backend of the GitCore layered seam (GIT-P8 /
-# P-269, architecture git-hosting 01 §2.2). The architecture PREFERS gix (gitoxide) in-process and
-# names libgit2 as the FALLBACK "where gix lacks a read capability"; at GIT-P8 the current gix
-# release (gix 0.84 / gix-hash) does not compile on the workspace toolchain (rustc 1.95, 2026-06),
-# so the v1 read/diff/blame backend is realised over the architecture-named libgit2 fallback. A
-# REAL in-process read path (NOT a `git` fork — no-host-exec holds by construction); the gix-
-# preferred swap rides the OQ-1 named floor (GIT-P33). default-features=false drops the SSH/HTTPS
-# transports (we only open + read local object DBs in-process; the WIRE transports run sandboxed
-# canonical `git`, not libgit2). vendored-libgit2 builds the C lib in-tree so the build is
-# self-contained / EU-deployable with no system libgit2 dependency. An in-process library (like
-# tantivy), part of the default `cargo build --workspace` — NOT a network backend, so it does NOT
-# ride the `integration` feature and keeps the build DB-free.
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
 
-# ----------------------------------------------------------------------------------------------
-# REAL-BACKEND CLIENTS (Stage 1 / infra). Declared here once for a single pinned shape, but
-# referenced ONLY behind the `integration` cargo feature in the crates that own the trait impls
-# (BlobStore in -storage, BusTransport in -events, the OLTP client + outbox + ReBAC tuple store
-# in -substrate/-storage/-identity). A workspace.dependencies entry compiles NOTHING on its own —
-# it is pulled only by a crate that lists it under `[dependencies]`/an optional dep. So the
-# default `cargo build --workspace` stays DB-FREE; only `--features integration` pulls these.
-# ----------------------------------------------------------------------------------------------
-
-# OLTP client. sqlx with RUNTIME-checked queries (sqlx::query / query_as — NOT the query!
-# compile-time macros), so the build never needs a live DB. rustls (no system OpenSSL),
-# migrate for the forward-only DDL, uuid/chrono for the tuple/audit columns.
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio-rustls",
     "postgres",
@@ -376,12 +66,9 @@ sqlx = { version = "0.8", default-features = false, features = [
     "uuid",
     "chrono",
 ] }
-# async runtime for the real-backend tests/impls.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 
-# Object store: aws-sdk-s3 against a custom endpoint + path-style addressing (RustFS/Scaleway).
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
-# rustls-aware HTTP client (no system OpenSSL) — required so put/get actually dispatch over HTTP.
 aws-sdk-s3 = { version = "1", default-features = false, features = [
     "behavior-version-latest",
     "rt-tokio",
@@ -389,16 +76,11 @@ aws-sdk-s3 = { version = "1", default-features = false, features = [
 ] }
 aws-credential-types = "1"
 
-# Cache: Valkey/Redis via fred.
 fred = { version = "10", default-features = false, features = ["i-std"] }
 
-# Durable bus: NATS JetStream via async-nats.
 async-nats = "0.47"
-# Stream combinators (StreamExt) for draining the NATS JetStream pull-consumer batch. A tiny,
-# default-feature `futures` — pulled ONLY behind the events `integration` feature (the NATS bus).
 futures = "0.3"
 
-# The env-config layer (the dev<->prod swap seam).
 myelin-config = { path = "crates/myelin-config" }
 
 [workspace.package]
@@ -406,15 +88,6 @@ edition = "2021"
 license = "UNLICENSED"
 publish = false
 
-# ----------------------------------------------------------------------------------------------
-# Build-profile infra (NOT a code change). A session of debug + `--features integration` builds
-# across 50+ crates grew `target/debug/deps` to 336GB and filled the disk to 100%, making `ld`
-# bus-error out of disk (signal 7) while linking the large integration test binaries. Debuginfo is
-# the bulk of that size, so cap it workspace-wide: test binaries stay small and the disk stays
-# healthy. Correctness is unaffected — tests run identically; panic `file:line` is emitted by the
-# panic macro at compile time (not from debuginfo); `RUST_BACKTRACE` still resolves function names
-# from the symbol table. Same lever as the `.github/workflows/ci.yml` debuginfo=0 fix.
-# ----------------------------------------------------------------------------------------------
 [profile.dev]
 debug = 0
 

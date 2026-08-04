@@ -1,11 +1,3 @@
-//! Durable read authority for the CT-005 CI run surfaces.
-//!
-//! The product edge supplies the repository refs the verified viewer may pull. This store conjoins
-//! that bounded set with the tenant/region RLS scope before selecting any run row, uses a stable
-//! `(created_at, run_id)` keyset, and returns the canonical `ci_run`/`ci_job`/`log_anchor` facts.
-//! Cursors are opaque, canonical, filter/visibility-bound consistency fences; they never grant
-//! access and contain no offset.
-
 use crate::ci_run_store::{CiRunStore, CiRunStoreError};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -381,8 +373,6 @@ pub struct CiLogArchive {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiLogTailSegmentRef {
-    /// Public resume cursor. `log_segment.segment_seq` is zero-based; the wire cursor is one-based
-    /// so `0` remains the canonical "before the first frame" sentinel.
     pub cursor: u64,
     pub byte_start: i64,
     pub byte_end: i64,
@@ -667,10 +657,6 @@ impl CiRunStore {
         }))
     }
 
-    /// Read one bounded resume batch from the durable T3 log archive. The caller supplies the
-    /// already-authorized canonical parent repository. `None` starts at the current durable head;
-    /// `Some(0)` means "before the first segment". Every returned cursor is the stored zero-based
-    /// `segment_seq + 1`.
     pub async fn get_surface_log_tail(
         &self,
         tenant_id: &str,
@@ -862,8 +848,6 @@ impl CiRunStore {
     }
 }
 
-/// Canonical cursor-scope identity for a bounded visible-repository set. Public so every second
-/// implementation can execute the same golden ordering/deduplication vectors.
 pub fn canonical_visible_repo_refs(values: &[String]) -> Result<Vec<String>, CiRunSurfaceError> {
     if values.len() > CI_RUN_VISIBLE_REPO_MAX {
         return Err(CiRunSurfaceError::BadInput(format!(

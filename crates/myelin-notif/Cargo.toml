@@ -5,8 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The service binary the harness runs (the "every service `main.rs`" of contract 1.1). Named
-# `notif` (= SERVICE_NAME) so the deployable matches the service/trace identifier.
 [[bin]]
 name = "notif"
 path = "src/main.rs"
@@ -14,105 +12,31 @@ path = "src/main.rs"
 [lib]
 path = "src/lib.rs"
 
-# THE Notifications crate (NOTIF-P1 → P-127, M2). Notif owns ZERO new contracts vs Phase 3 —
-# it is overwhelmingly a CONSUMER (architecture notifications.md §0/§1.2: it composes the bus
-# Signal stream, the EventHandler template, Identity check/list_objects, Refs resolve, the
-# durable-workflow wheel, and the frozen QueryAst). It therefore carries no separate glue
-# crate; instead THIS crate plays two roles, both at the leaf of the §2.9 DAG:
-#
-#   1. The CONTRACT CARRIERS (the glue role). The §4.1 EXPOSED contract SHAPES — InboxItem,
-#      HumanisedString, the reason + class enums, the DeliveryAdapter trait — are exported as
-#      compile-time carrier types so a contract change breaks every consumer's build NOW, never
-#      silently in prod (ADR-01). No bodies yet (NOTIF-P2..P18 fill them); just the frozen
-#      signatures every later Notif prompt and every consumer compiles against.
-#   2. The SERVICE SHELL (the impl role). An AppSpec passed to serve(AppSpec) — boot → migrate
-#      → outbox relay → consumer seam → three ports → graceful drain, liveness ≠ readiness. Its
-#      forward-only set creates the nine-table data model plus the online durable-inbox read index.
-#      NOT a hand-rolled main.
-#
-# DAG POSITION (a documented, NAMED leaf consumer, like myelin-identity-service / myelin-search
-# / myelin-refs-service / myelin-gdpr-service): it sits ABOVE the glue crates and the harness —
-# it depends on -tenancy/-events/-identity/-refs (the carrier types' fields) + -substrate (the
-# serve/AppSpec lifecycle), and NOTHING in the production library DAG depends back on it. It is
-# therefore OUTSIDE the eleven-crate library DAG modelled by myelin-substrate::crate_graph
-# (substrate_is_root()/identity_is_sink() are preserved — a service main is the graph's terminal
-# consumer, not a node in it).
 [dependencies]
-# The (tenant, region) partition key + the ArtifactRef value type — the InboxItem `subject`,
-# `template_args`, and the DeliveryAdapter `region` are these frozen value types.
 myelin-tenancy = { path = "../myelin-tenancy" }
-# The EventEnvelope tier (re-exports ArtifactRef); the router (NOTIF-P3) consumes curated
-# Signals over the EventHandler template and emits notif.* via the outbox — the ONLY emit path.
 myelin-events = { path = "../myelin-events", features = ["nats"] }
-# Principal — the InboxItem recipient + the humanise `viewer` + the DeliveryAdapter target are
-# verified subjects (an agent is a Principal too, §1.4).
 myelin-identity = { path = "../myelin-identity" }
-# ArtifactRef (re-exported) — InboxItem stores refs-not-payloads (NOTIF-1), so erasure
-# tombstones a person's appearance for free (the §3.9/C7 invariant the holder, NOTIF-P4, leans on).
 myelin-refs = { path = "../myelin-refs" }
-# The frozen `mention(Principal)` inline structured node (contract 13.1, X-2/C10). Write-fanout
-# (NOTIF-P12) reads the STRUCTURED node — `InlineNode::Mention(Principal)` — it does NOT parse free
-# text (AG-6: only a structured ref re-triggers). Notif consumes the frozen taxonomy node, never a
-# local re-invention of the mention shape (§3.5).
 myelin-content = { path = "../myelin-content" }
-# The curated Signal type + Severity (myelin_query::signals, P-138 / EB-18). The router (NOTIF-P3)
-# consumes Signals over `sig.<tenant>.>` — it deserializes `Signal` from the envelope payload and
-# UPSERTs an inbox item. The Signal engine lives in myelin-query (the documented EB-18 deviation:
-# its matcher IS an EventMatcher, promoted into myelin-query); the router references the Signal type.
 myelin-query = { path = "../myelin-query" }
-# The harness: serve(AppSpec) + the three-surface topology (public/internal/metrics-health) +
-# liveness≠readiness + the outbox relay + graceful drain. The shell is an AppSpec this wires; it
-# is NOT a service that re-implements the lifecycle (contract 1.1).
 myelin-substrate = { path = "../myelin-substrate" }
-# The #[derive(PersonalData)] + #[personal_data(...)] classification (contract 10.2) the nine
-# data-model row types (NOTIF-P2, src/schema.rs) carry on every PII-bearing column — the
-# no-untagged-personal-data gate's compile-time half.
 myelin-gdpr = { path = "../myelin-gdpr" }
 serde = { workspace = true }
-# The reindex-parity hash (NOTIF-P17 / NOTIF-D3): a deterministic BLAKE3 over the rebuilt inbox
-# projection (the cold == live artifact). `inbox_parity_hash` renders `blake3:<hex>` — the SAME
-# content-addressed digest family the gdpr receipts use.
 blake3 = { workspace = true }
-# The router (NOTIF-P3) deserializes the curated `Signal` out of the envelope payload (a poison
-# payload → NonRetryable) and builds the `notif.item.created` references-not-payloads emit payload.
 serde_json = { workspace = true }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 sqlx = { workspace = true }
 
-# MR-009b W3b.4 — the DURABLE composition root in `src/main.rs` (SubstrateProvider from env →
-# foundation migrations → `OutboxStore::durable(PgOutboxBacking)`) is the ALWAYS-COMPILED default
-# (the Wave-2 identity-service posture). Notif joins the other service leaves in depending on
-# myelin-storage (a DAG-legal leaf-consumer→storage edge, like flow/knowledge/issues/search —
-# notif stays a terminal consumer OUTSIDE the eleven-crate library DAG); `tokio` (the multi-thread
-# runtime the sync→async bridge requires) + `myelin-config` (the env-first durable config,
-# fail-loud) are regular deps. Build stays DB-free: connecting happens at RUNTIME, never at build.
 myelin-storage = { path = "../myelin-storage" }
 myelin-config = { path = "../myelin-config" }
 tokio = { workspace = true, features = ["signal"] }
-# The durable inbox repository is production code, so sqlx is a normal dependency above. The
-# `integration` feature gates only live-stack tests; connecting happens at runtime, never at build.
 
 [dev-dependencies]
-# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
-# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
-# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
-# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# The shell's boot self-test asserts against the same three-port / liveness≠readiness surface
-# the later drills (the §4.1 telemetry set) read from. DEV-only — the harness never enters the
-# notif production DAG.
 myelin-harness = { path = "../myelin-harness" }
-# The committed-ratchet lint-fixture test (src/lint_fixtures.rs): the THREE schema gates this prompt
-# names (no-untagged-personal-data / residency-pin / tenant-predicate) run over RED/GREEN fixtures so
-# a regression that lets an untagged-PII column / a region-less store / a tenant-less query slip
-# through fails THIS build. DEV-only — the lint engine never enters the notif production DAG.
 myelin-lints = { path = "../myelin-lints" }
 
 [features]
-# Live-PG tests. Database clients are normal production dependencies; this flag only opts into tests
-# that require the running dev/prod-compatible stack.
 integration = []
-# MR-009b W3b.5 — gates the E2E wedge drill runners (they construct the now-gated in-memory
-# `OutboxStore::new()` double), forwarding to `myelin-events/test-support`. DEV/TEST only.
 test-support = ["myelin-events/test-support"]

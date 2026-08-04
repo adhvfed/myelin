@@ -1,27 +1,11 @@
-//! `runsc` binary resolution + the boot preflight that refuses activation unless the runtime,
-//! the immutable base rootfs, and the delegated memory-cgroup boundary are all usable.
-
 use super::*;
 use crate::redaction::RedactionPlan;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-/// Env var naming the `runsc` binary; defaults to `runsc` on `PATH`.
 pub const ENV_RUNSC_BIN: &str = "MYELIN_RUNSC_BIN";
 
-/// The resolved, CANONICALIZED, ABSOLUTE `runsc` binary path — computed ONCE and cached (Sol's
-/// review, round 2: re-reading the env var on every launch means a boot preflight validating one
-/// binary and a later launch resolving a DIFFERENT one, if the environment changed mid-process,
-/// could silently diverge — caching makes "the boot-validated binary is the one every launch uses"
-/// an actual invariant, not merely usually true). Round 3: [`preflight_gvisor_runner_host`], if
-/// called, populates this SAME cell with its own already-canonicalized, already-probed path. Round
-/// 4 correction: a `set()` conflict is NOT a harmless no-op — [`preflight_gvisor_runner_host`]
-/// treats it as a hard preflight FAILURE (something else already cached a DIFFERENT path before
-/// preflight ran), since silently keeping the earlier, unvalidated value would let preflight report
-/// success for a binary no launch actually uses. A test or tool that calls
-/// [`run_and_capture`]/[`delete_container`] directly, without ever calling preflight, gets the lazy
-/// fallback below instead (best-effort, matching this function's pre-round-3 behavior).
 static RESOLVED_RUNSC_BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 fn resolved_runsc_bin_path() -> &'static Path {
@@ -40,37 +24,21 @@ fn resolved_runsc_bin_path() -> &'static Path {
                 })
                 .unwrap_or_else(|| PathBuf::from(&configured))
         };
-        // Canonicalize when possible (resolves symlinks, makes the cached value absolute) —
-        // falls back to the unresolved candidate when canonicalization fails (e.g. a test
-        // environment with no `runsc` installed at all); resolution failure surfaces naturally as
-        // a spawn error at first actual use, exactly as before this round's hardening.
         candidate.canonicalize().unwrap_or(candidate)
     })
 }
 
-/// Sol's review, round 4: returns the resolved `&Path` directly (was `&str` via `.to_str().
-/// unwrap_or("runsc")`) — falling back to the unrelated literal `"runsc"` for a non-UTF-8 resolved
-/// path would have silently swapped in a DIFFERENT, unvalidated binary resolution. `Command::new`/
-/// `SandboxCommand::new` both accept `impl AsRef<OsStr>`, so callers pass this straight through.
 pub(super) fn runsc_bin() -> &'static Path {
     resolved_runsc_bin_path()
 }
 
-/// How a [`probe_runsc_version`] boot preflight failed; the caller owns the operator-facing wording.
 #[derive(Debug, PartialEq, Eq)]
 pub enum RunscProbeError {
-    /// The candidate carries metadata that would grant authority at `execve` time.
     UnsafeBinary(String),
-    /// The binary could not be spawned for its `--version` probe.
     CouldNotExecute,
-    /// The binary ran but did not identify itself as `runsc`.
     NotRunsc,
 }
 
-/// Boot-preflight probe: verify `path` identifies itself as `runsc` (via `--version`). Lives in
-/// this crate — not the caller's — because the sandbox seam is the one sanctioned host-exec site
-/// (no-host-exec, X-6/AG-2); serving binaries that require the sandbox at boot call this instead
-/// of spawning the probe themselves.
 pub fn probe_runsc_version(path: &Path) -> Result<(), RunscProbeError> {
     probe_runsc_version_given(path, reject_security_capability_xattr)
 }
@@ -79,9 +47,6 @@ fn probe_runsc_version_given(
     path: &Path,
     reject_file_capabilities: impl FnOnce(&Path) -> Result<(), String>,
 ) -> Result<(), RunscProbeError> {
-    // File capabilities participate in execve's authority calculation but are not covered by the
-    // binary's content digest. This check belongs directly at the public probe/exec seam so the
-    // always-run rootless preflight cannot bypass the explicit-userns hardening helper.
     reject_file_capabilities(path).map_err(RunscProbeError::UnsafeBinary)?;
     let output = Command::new(path)
         .arg("--version")
@@ -94,9 +59,6 @@ fn probe_runsc_version_given(
     Ok(())
 }
 
-/// Boot preflight for a production gVisor runner host. This is deliberately stronger than waiting
-/// for the first claimed job: activation must refuse before intake unless the exact runtime,
-/// immutable base rootfs, and delegated memory-cgroup boundary are all usable.
 pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), String> {
     if !runsc.is_absolute() {
         return Err("MYELIN_RUNSC_BIN must be an absolute path".into());
@@ -118,13 +80,6 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
             "MYELIN_RUNSC_BIN did not identify itself as runsc".to_string()
         }
     })?;
-    // Feed THIS canonicalized, probed path into the SAME cell `runsc_bin()` reads, so every
-    // subsequent launch uses the exact binary this preflight just validated (Sol's review, round
-    // 3) rather than a separately (if identically) re-derived path. Round 4: a `set()` failure
-    // (something already cached a DIFFERENT value before this preflight ran) is now a PREFLIGHT
-    // FAILURE, not a silently ignored no-op — otherwise preflight could report success having
-    // validated binary B while every launch keeps using a stale, previously-cached binary A, with
-    // nothing surfacing the divergence.
     if RESOLVED_RUNSC_BIN.set(runsc.clone()).is_err() {
         let already_cached = RESOLVED_RUNSC_BIN
             .get()
@@ -132,7 +87,7 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         if already_cached != &runsc {
             return Err(format!(
                 "MYELIN_RUNSC_BIN preflight validated {runsc:?}, but {already_cached:?} was \
-                 already cached by an earlier resolution — refusing rather than leaving launches \
+                 already cached by an earlier resolution - refusing rather than leaving launches \
                  on a stale, unvalidated binary"
             ));
         }
@@ -170,9 +125,6 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         extra_env: Vec::new(),
         layout: OciExecutionLayout::Rootless,
     };
-    // CT-007 slice 3, piece 7b (Sol's round-2 review, blocker 2): the single prepared mode this
-    // preflight both executes under AND finalizes under — validated against `config` BEFORE
-    // staging anything.
     let prepared_mode = PreparedRuntimeMode::Rootless;
     let mode = require_oci_layout_matches_prepared_mode(&config, &prepared_mode)
         .map_err(|error| format!("CI runner sandbox host preflight failed: {error}"))?;
@@ -183,9 +135,6 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
         std::process::id(),
         unique_suffix()
     );
-    // CT-007 slice 3, piece 7b: same cgroup hoist as the production run paths — this preflight is
-    // real production code (it gates host activation), so it gets the same checked teardown rather
-    // than a best-effort `delete_container`/`Drop`-only cleanup.
     let cgroup = match MemoryCgroup::create(config.mem_bytes, 1000) {
         Ok(cgroup) => cgroup,
         Err(e) => {
@@ -249,11 +198,6 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
     Ok(())
 }
 
-/// The compound-failure decision behind [`preflight_gvisor_runner_host`] (Sol's round-2 review,
-/// blocker 4), pulled out into its own pure function so it can be unit-tested with fabricated
-/// values — a bare `?` on `result` before inspecting `finalize_result` would silently discard a
-/// teardown failure whenever BOTH failed. Mirrors the same "augment, never replace" rule
-/// [`augment_run_failure_with_teardown`] applies to the production path's `RunFailure`.
 fn preflight_capture_and_teardown_result(
     result: Result<RunscOutcome, RunFailure>,
     finalize_result: Result<RuntimeQuiescenceEvidence, RuntimeTeardownError>,
@@ -361,9 +305,6 @@ mod tests {
         assert!(message.contains("boom"), "{message}");
     }
 
-    /// Sol's round-2 review, blocker 4: the previous implementation applied `?` to the capture
-    /// result BEFORE ever inspecting the teardown result — when BOTH failed, the teardown
-    /// diagnostic silently disappeared. Proves both messages survive when both fail.
     #[test]
     fn preflight_capture_and_teardown_result_reports_both_failures_when_both_fail() {
         let capture_failure = RunFailure::uncommitted("spawn runsc: boom");

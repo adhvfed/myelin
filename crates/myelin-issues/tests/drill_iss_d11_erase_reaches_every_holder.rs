@@ -1,16 +1,3 @@
-//! **ISS-D11 / P-385 (M4-I8, the band exit) — erase-reaches-every-holder + post-restore re-erasure.**
-//!
-//! The drill scenario for the Issues GDPR band-exit gate (testing-strategy row ISS-D11): erase a data
-//! subject → assert the PII is gone from EVERY Issues holder (per-subject DEK, change-log, comments,
-//! attachments, OLAP + restriction, Search incl. embeddings, Refs) with a PER-HOLDER receipt → a backup
-//! restore resurrects the key → post-restore re-erasure (GD-14) re-destroys it → 0 resurrected. The
-//! third-party free-text residual is the documented `[OPEN — LEGAL]` limit (the ONE posture 10.9/X-7, by
-//! reference). The per-holder receipts + the 0-resurrected re-erasure ARE the dated green artifact.
-//!
-//! This drill is DB-free: it runs the REAL per-subject-DEK crypto-shred over the in-memory `KmsEngine`
-//! (the SAME engine ISS-P07 seals the free-text under) — the live-Postgres at-rest round-trip rides the
-//! ISS-P07 integration drill (`integration_iss_p07_subject_dek.rs`).
-
 use myelin_identity::{
     AuthzError, CaveatContext, Consistency, Credential, Decision, DelegationCaveats,
     EffectivePolicy, FailStaticBound, FragmentAdmit, IdentityService, ListObjectsResult,
@@ -34,8 +21,6 @@ fn region() -> Region {
     Region::new("fr-par")
 }
 
-/// The Identity surface whose `erase` shreds the person↔pseudonym map (4.8) — counts the shred so the
-/// drill proves the pseudonym-map shred reached. The REAL map is Identity's store (test scaffolding).
 struct DrillId {
     shreds: AtomicUsize,
 }
@@ -116,10 +101,8 @@ impl IdentityService for DrillId {
     }
 }
 
-/// Seal a subject's free-text + attachment-blob DEK so the erase has a REAL key to crypto-shred.
 fn seed_subject(eng: &KmsEngine, subject: &str) {
     use myelin_issues::{encrypt_free_text, IssueFreeText};
-    // the free-text DEK (the SAME class ISS-P07's encrypt_free_text seals under).
     let _ = encrypt_free_text(
         eng,
         &region(),
@@ -129,7 +112,6 @@ fn seed_subject(eng: &KmsEngine, subject: &str) {
         b"fix the login bug for Ada Lovelace, customer ada@example.com",
     )
     .expect("seal the free-text under the subject DEK");
-    // the attachment-blob DEK.
     eng.ensure_dek(
         &tenant(),
         &region(),
@@ -142,7 +124,6 @@ fn ft_ref(subject: &str) -> PiiKeyRef {
     PiiKeyRef::new(tenant(), 0, KeyClass::Subject(subject.to_string()))
 }
 
-/// **ISS-D11 — the chained-mutation drill: erase → every-holder receipt → restore → re-erasure.**
 #[test]
 fn iss_d11_erase_reaches_every_holder_with_post_restore_re_erasure() {
     let subject = "8a2f@acme.noreply";
@@ -153,18 +134,15 @@ fn iss_d11_erase_reaches_every_holder_with_post_restore_re_erasure() {
     let fanout = IssueEraseFanout::new(&eng, region(), restriction.clone(), &id);
     let ledger = IssueErasureLedger::new(tenant(), region());
 
-    // ── pre-erase: the subject's free-text DEK is LIVE (their PII is recoverable) ──
     assert!(
         eng.resolve_dek(&ft_ref(subject), &region()).is_ok(),
         "the subject's free-text is recoverable before the erase"
     );
 
-    // ── (1) ERASE: the fan-out reaches every Issues holder ──
     let outcome = fanout
         .erase(subject, &tenant(), &ledger, "2026-06-23T00:00:00Z")
         .expect("the Issues erase reaches every holder");
 
-    // every holder reached, each with a content-addressed per-holder receipt (the green artifact).
     assert!(
         outcome.reached_every_holder(),
         "PII gone from EVERY Issues holder (per-holder receipts)"
@@ -188,23 +166,19 @@ fn iss_d11_erase_reaches_every_holder_with_post_restore_re_erasure() {
         );
     }
 
-    // the headline DEK is DEAD — the free-text/change-log/comments/worklog is unrecoverable.
     assert!(
         eng.resolve_dek(&ft_ref(subject), &region()).is_err(),
-        "the per-subject DEK is crypto-shredded — 0 recoverable free-text PII"
+        "the per-subject DEK is crypto-shredded - 0 recoverable free-text PII"
     );
-    // the pseudonym map was shredded ("Former user 8a2f" without rewriting issues others own).
     assert_eq!(
         id.shreds.load(Ordering::SeqCst),
         1,
         "the pseudonym map was shredded (4.8)"
     );
-    // the erased subject is restricted (no analytics/agent-use/notif).
     assert!(
         restriction.is_restricted(subject),
         "the erased subject is restricted (OLAP honours it)"
     );
-    // the issue.*.erased tombstones were emitted (Search/Refs/OLAP consume them).
     assert_eq!(
         outcome.tombstones_emitted, 3,
         "OLAP + Search + Refs tombstoned"
@@ -215,7 +189,6 @@ fn iss_d11_erase_reaches_every_holder_with_post_restore_re_erasure() {
         "issue.issue.erased + issue.comment.erased"
     );
 
-    // ── (2) RESTORE an OLDER backup: it resurrects the subject's DEKs (the pre-erase state) ──
     eng.ensure_dek(&tenant(), &region(), KeyClass::Subject(subject.to_string()))
         .expect("the restore resurrected the free-text DEK");
     eng.ensure_dek(
@@ -229,7 +202,6 @@ fn iss_d11_erase_reaches_every_holder_with_post_restore_re_erasure() {
         "the restore RESURRECTED the subject's free-text DEK (the GD-14 hazard)"
     );
 
-    // ── (3) POST-RESTORE RE-ERASURE (GD-14): replay the ledger, re-destroy the resurrected DEKs ──
     let reerase = fanout.re_erase_after_restore(&ledger, "2026-06-23T01:00:00Z");
     println!(
         "ISS-D11 re-erasure: subjects={} resurrected_by_restore={} re_emitted_tombstones={} resurrected={}",
@@ -243,7 +215,6 @@ fn iss_d11_erase_reaches_every_holder_with_post_restore_re_erasure() {
         reerase.deks_resurrected_by_restore, 2,
         "the restore brought back the free-text + blob DEKs"
     );
-    // THE GATE: 0 resurrected PII keys post-restore.
     assert_eq!(
         reerase.resurrected, 0,
         "0 resurrected Issues PII keys post-restore"
@@ -256,7 +227,6 @@ fn iss_d11_erase_reaches_every_holder_with_post_restore_re_erasure() {
         eng.resolve_dek(&ft_ref(subject), &region()).is_err(),
         "the subject's free-text is unrecoverable again after the re-erasure"
     );
-    // the subject stays restricted across the restore.
     assert!(restriction.is_restricted(subject));
 
     println!(

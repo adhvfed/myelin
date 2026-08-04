@@ -1,17 +1,3 @@
-//! P-ST-08 (global P-095) GATE / DRILL — OLTP + blob envelope encryption + classify-driven key
-//! choice. Emits a dated green artifact.
-//!
-//! The prompt GATE has three legs:
-//!  1. **The `no-untagged-personal-data` lint stays green** — a deliberately-untagged PII scratch
-//!     field FIRES the lint; the tagged form does NOT. (The "fires then remove it" step, run as a
-//!     pure scan over inline red/green source — the lint scanner is a function of source text.)
-//!  2. **The scoped encryption gate** — a `personal-data, erasure=subject` column resolves to a
-//!     per-SUBJECT DEK; a bulk column to the TENANT DEK; **0 plaintext-at-rest** for a tagged
-//!     column.
-//!  3. **The telemetry**: `plaintext_at_rest_count == 0` for tagged columns.
-//!
-//! A green here is PROVEN (measured numbers printed), never claimed (EI-01 §3).
-
 use myelin_gdpr::ErasureMethod;
 use myelin_lints::lints::no_untagged_personal_data;
 use myelin_storage::{
@@ -24,11 +10,6 @@ fn region() -> Region {
     Region("eu-west".into())
 }
 
-// ───────────── leg 1: the no-untagged-personal-data lint fires then admits ─────────────
-
-/// A deliberately-untagged PII scratch field — the lint MUST fire on this (the "a deliberately-
-/// untagged PII scratch field fires the lint" step). `email` carries contact PII with no
-/// `#[personal_data(...)]` tag.
 const RED_SCRATCH_FIELD: &str = r#"
 pub struct UserProfileScratch {
     pub subject_ref: SubjectRef,
@@ -38,8 +19,6 @@ pub struct UserProfileScratch {
 }
 "#;
 
-/// The same struct with the PII column tagged — the lint MUST admit it (the "then remove it" step:
-/// the scratch field is removed / properly tagged, the lint is green again).
 const GREEN_TAGGED_FIELD: &str = r#"
 pub struct UserProfile {
     pub subject_ref: SubjectRef,
@@ -61,18 +40,16 @@ pub struct UserProfile {
 fn gate_leg1_no_untagged_personal_data_fires_then_admits() {
     let lint = no_untagged_personal_data();
 
-    // The deliberately-untagged PII scratch field FIRES the lint.
     let red = lint.run(RED_SCRATCH_FIELD);
     assert!(
         !red.is_empty(),
         "GATE leg 1: an untagged PII scratch field MUST fire no-untagged-personal-data"
     );
 
-    // Removing the scratch field (properly tagging it) makes the lint GREEN.
     let green = lint.run(GREEN_TAGGED_FIELD);
     assert!(
         green.is_empty(),
-        "GATE leg 1: the tagged form must be admitted — got violations: {green:?}"
+        "GATE leg 1: the tagged form must be admitted - got violations: {green:?}"
     );
 
     println!(
@@ -82,8 +59,6 @@ fn gate_leg1_no_untagged_personal_data_fires_then_admits() {
     );
 }
 
-// ───────────── legs 2 + 3: the scoped encryption gate + the telemetry ─────────────
-
 #[test]
 fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
     let tenant = TenantId("acme".into());
@@ -91,7 +66,6 @@ fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
     kms.ensure_kek(&KekId::new(tenant.clone(), region()));
     let cryptor = ColumnCryptor::new(&kms, region());
 
-    // (2a) A `personal-data, erasure=subject` column → per-SUBJECT DEK; ciphertext-at-rest.
     let subject_plain = b"alice.bio.free-text@example.test";
     let subject_col = cryptor
         .encrypt(
@@ -111,7 +85,6 @@ fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
         "GATE leg 2: a tagged subject column MUST be ciphertext-at-rest (0 plaintext-at-rest)"
     );
 
-    // (2b) A bulk column → per-TENANT DEK; ciphertext-at-rest.
     let bulk_plain = b"PR-1234 bulk tenant metadata";
     let bulk_col = cryptor
         .encrypt(&tenant, None, &ErasureMethod::PurgeReindex, bulk_plain)
@@ -126,7 +99,6 @@ fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
         "GATE leg 2: a bulk column MUST be ciphertext-at-rest"
     );
 
-    // (2c) The blob content-key wrap: a tagged blob is ciphertext-at-rest under the chosen DEK.
     let blob_wrap = DekContentWrap::new(
         kms.clone(),
         region(),
@@ -147,7 +119,6 @@ fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
         "GATE leg 2: the blob round-trips back to the exact plaintext"
     );
 
-    // Both columns + the blob round-trip back to the exact plaintext (no data loss).
     assert_eq!(
         cryptor.decrypt(&subject_col).expect("subject decrypt"),
         subject_plain
@@ -157,7 +128,6 @@ fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
         bulk_plain
     );
 
-    // (3) THE telemetry the GATE asserts: plaintext_at_rest_count == 0 for tagged columns.
     let plaintext_at_rest = cryptor.plaintext_at_rest_count();
     assert_eq!(
         plaintext_at_rest, 0,

@@ -1,23 +1,3 @@
-//! Live-Postgres integration test (Stage 1 / infra) — the P-FLOW-11 durable-signal WAIT CONSUME proven
-//! against REAL Postgres: the wait that resumes a parked run stamps `consumed_seq` via
-//! `UPDATE … SET consumed_seq = $seq WHERE consumed_seq IS NULL` — the WHERE clause IS the
-//! consume-EXACTLY-ONCE guard (a re-drive races to the same NULL guard and consumes NOTHING new).
-//!
-//! Gated behind the `integration` cargo feature so the DEFAULT `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free (the binding-policy floor — no DB at build). This runs ONLY
-//! against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-flow --features integration --test integration_flow_wait -- --nocapture
-//!
-//! Endpoints come from the myelin-config dev defaults (the dev<->prod CONFIG SWAP seam), so the same
-//! test runs against Scaleway (fr-par) by exporting the prod env vars — never a code change.
-//!
-//! It proves, against REAL Postgres, the P-FLOW-11 consume gate the in-memory `SignalStore::consume`
-//! model asserts (the FLOW-D4 "1 consume" threshold): the wait stamps the FIRST buffered signal's
-//! `consumed_seq` ONCE; a second consume attempt (a re-drive of the same wait) is a no-op (the WHERE
-//! consumed_seq IS NULL guard already lost) — so the signal-buffer-depth drops by EXACTLY one (the
-//! workflow wakes once, withhold/run is decided off the one consumed row, §4.3).
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
@@ -40,8 +20,6 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
     let pid = std::process::id();
     let sig_tbl = format!("wf_signal_wait_{pid}");
 
-    // The REAL frozen DDL (per-pid table name so concurrent runs isolate). The wf_signal DDL names the
-    // PK (tenant_id, run_id, signal_name, idem_key) + the consumed_seq column the wait stamps.
     let sig_create = WF_SIGNAL_DDL.replacen("wf_signal", &sig_tbl, 1);
     let idx_create = WF_SIGNAL_PENDING_IDX
         .replacen("wf_signal_pending", &format!("{sig_tbl}_pending"), 1)
@@ -59,9 +37,6 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
         .await
         .expect("the wf_signal_pending index applies");
 
-    // Buffer the approval (the §6.3 round-trip: Chat posted the decision) — unconsumed (consumed_seq
-    // NULL). A double-click would be a second INSERT under the SAME key → ON CONFLICT DO NOTHING → still
-    // one row (proven in integration_flow_signal.rs); here we focus on the CONSUME side.
     sqlx::query(&format!(
         "INSERT INTO {sig_tbl} (tenant_id, region, run_id, signal_name, idem_key, payload, consumed_seq) \
          VALUES ('acme','fr-par','R-WAIT','approval:call-1','card-7', \
@@ -72,7 +47,6 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
     .await
     .expect("buffer the approval");
 
-    // The signal-buffer-depth before the consume: one BUFFERED (unconsumed) row.
     let before: i64 = sqlx::query(&format!(
         "SELECT count(*)::bigint AS c FROM {sig_tbl} WHERE tenant_id='acme' AND run_id='R-WAIT' AND consumed_seq IS NULL"
     ))
@@ -85,9 +59,6 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
         "the approval is buffered, unconsumed (signal-buffer-depth = 1)"
     );
 
-    // THE CONSUME (the wait resuming): UPDATE … SET consumed_seq = $seq WHERE consumed_seq IS NULL — the
-    // WHERE clause IS the consume-EXACTLY-ONCE guard. This is the exact statement the wait issues when it
-    // finds the buffered signal + stamps the `wf_history` seq that consumed it.
     let consume = |seq: i64| {
         let tbl = sig_tbl.clone();
         let pool = admin.clone();
@@ -105,24 +76,18 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
         }
     };
 
-    // FIRST consume (the wait resumes, stamping the signal_received seq): the row is stamped (RETURNING
-    // yields a row — consumed).
     let first = consume(5).await;
     assert!(
         first.is_some(),
         "the FIRST consume stamped consumed_seq (the wait resumed on this signal)"
     );
 
-    // SECOND consume (a re-drive of the SAME wait, e.g. a later step crashed + the run re-leased): the
-    // WHERE consumed_seq IS NULL guard already LOST — UPDATE matches NOTHING (RETURNING empty) → the
-    // consume is EXACTLY ONCE (the replay returns the journaled signal, never re-consumes, §4.3/§4.1).
     let second = consume(9).await;
     assert!(
         second.is_none(),
-        "the SECOND consume is a no-op (consumed_seq IS NULL guard lost) — consume-exactly-once"
+        "the SECOND consume is a no-op (consumed_seq IS NULL guard lost) - consume-exactly-once"
     );
 
-    // the consumed_seq is the FIRST consume's seq (5), NEVER overwritten by the second (9).
     let stamped: i64 = sqlx::query(&format!(
         "SELECT consumed_seq FROM {sig_tbl} WHERE tenant_id='acme' AND run_id='R-WAIT' AND idem_key='card-7'"
     ))
@@ -135,7 +100,6 @@ async fn flow_p11_wait_consume_stamps_consumed_seq_exactly_once_in_real_postgres
         "the FIRST consume's seq stuck (the second consume never overwrote it)"
     );
 
-    // the signal-buffer-depth dropped by EXACTLY one (the FLOW-D4 "1 consume" threshold) — 0 unconsumed.
     let after: i64 = sqlx::query(&format!(
         "SELECT count(*)::bigint AS c FROM {sig_tbl} WHERE tenant_id='acme' AND run_id='R-WAIT' AND consumed_seq IS NULL"
     ))

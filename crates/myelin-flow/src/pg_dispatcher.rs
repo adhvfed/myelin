@@ -1,10 +1,3 @@
-//! Tenant- and region-scoped PostgreSQL workflow worker.
-//!
-//! The workflow body executes against scratch timer/signal stores and a detached outbox buffer.
-//! Those buffers have no persistence path of their own: every journal row, signal consumption,
-//! timer arm, attempt, outbox row, run settlement, and lease release is handed to
-//! [`PgFlowDriveStore::commit_drive`] for one fenced PostgreSQL transaction.
-
 use crate::engine::{run_state, DriveOutcome, SignalRow, SignalStore};
 use crate::executor::{ExecutorError, PARTITION_COUNT};
 use crate::pg_drive_store::{
@@ -26,13 +19,9 @@ use std::time::Duration;
 
 const MAX_TOKEN_BYTES: usize = 512;
 const MAX_BATCH: usize = 1024;
-/// Hard memory bound for immutable product input material resolved before a durable body runs.
 pub const MAX_PG_RESOLVED_INPUT_BYTES: usize = 16 * 1024 * 1024;
 pub const OPERATIONAL_PROBE_WF_TYPE: &str = "myelin.flow.operational-probe";
 
-/// Immutable run data supplied to a PostgreSQL workflow body from the claimed drive. Product
-/// bodies receive their pinned input and causality here rather than reaching around `WfCtx` or
-/// capturing mutable dispatch state in their registration closure.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PgClaimedDriveInput {
     pub tenant: TenantId,
@@ -49,25 +38,18 @@ pub struct PgClaimedDriveInput {
     pub partition: i16,
 }
 
-/// Claimed run identity plus immutable, scope-verified product input loaded before the synchronous
-/// deterministic body starts. The material is bounded by [`MAX_PG_RESOLVED_INPUT_BYTES`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct PgResolvedDriveInput {
     pub claimed: PgClaimedDriveInput,
     pub material: Vec<u8>,
 }
 
-/// Input resolution distinguishes infrastructure that must release/retry from immutable corruption
-/// that must halt the run as nondeterministic. Neither case is silently coerced to empty input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PgInputResolveError {
     Retry(String),
     Permanent(String),
 }
 
-/// Asynchronous immutable-input resolver executed under the exact workflow drive lease. Product
-/// adapters use this for digest/scope-verified reads that cannot safely happen inside a synchronous
-/// workflow body.
 pub trait PgWorkflowInputResolver: Send + Sync {
     fn resolve(
         &self,
@@ -107,19 +89,11 @@ impl From<&DriveLease> for PgClaimedDriveInput {
     }
 }
 
-/// A deterministic production workflow definition without an external input resolver.
-///
-/// `Fn` prevents ordinary mutable captures, but Rust cannot exclude interior mutability such as an
-/// `Arc<Mutex<_>>`. A production body must derive every effect-selecting fact from its immutable
-/// [`PgClaimedDriveInput`] and journaled [`WfCtx`] reads. Captured adapters may provide side-effect
-/// implementations, but they must not carry mutable workflow decisions or foreign tenant/run state.
-/// This is a registration contract enforced by review and replay tests, not by the type system.
 pub type PgWorkflowBody = dyn Fn(&PgClaimedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
     + Send
     + Sync
     + 'static;
 
-/// Product body paired with a typed immutable-input resolver.
 pub type PgResolvedWorkflowBody =
     dyn Fn(&PgResolvedDriveInput, &mut WfCtx) -> Result<Vec<ArtifactRef>, String>
         + Send
@@ -132,7 +106,6 @@ struct RegisteredBody {
     resolver: Option<Arc<dyn PgWorkflowInputResolver>>,
 }
 
-/// One immutable production worker scope. There is deliberately no tenant discovery API.
 #[derive(Clone)]
 pub struct PgWorkerScope {
     pub tenant: TenantId,
@@ -191,8 +164,6 @@ impl PgWorkerScope {
         })
     }
 
-    /// Load the mandatory production scope. Tenant, region, partition, worker id, and lease TTL
-    /// have no defaults: an incomplete deployment must not silently become a global worker.
     pub fn from_env() -> Result<Self, PgWorkerError> {
         Self::from_lookup(|name| std::env::var(name).ok())
     }
@@ -261,9 +232,6 @@ fn bounded(label: &str, value: &str) -> Result<(), PgWorkerError> {
     Ok(())
 }
 
-/// Parse the mandatory compiled-definition allowlist. The service binary currently contains only
-/// the operational probe. Product definitions such as `ci.pipeline` and merge maintenance require
-/// subsystem-owned adapters and are rejected rather than leased under a fake body.
 pub fn configured_production_definitions() -> Result<Vec<(String, i32)>, PgWorkerError> {
     configured_definitions_from(std::env::var("MYELIN_FLOW_DEFINITIONS").ok())
 }
@@ -338,29 +306,19 @@ pub enum PgRunOnceOutcome {
     },
 }
 
-/// A bounded loop result. `saturated` means the caller should schedule another bounded pass.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PgDriveBatch {
     pub driven: usize,
     pub saturated: bool,
 }
 
-/// How often a `run_once` FORCES a stranded-run repair sweep regardless of backlog (the every-Nth
-/// cadence). Repair otherwise runs only when a normal claim finds nothing, so a CONTINUOUS backlog of
-/// runnable work would starve stranded `waiting` rows indefinitely. 64 bounds the extra cost to one
-/// indexed `SKIP LOCKED` scan per 64 drives (~1.5% overhead) while guaranteeing a stranded row is
-/// swept within at most 64 drives even under saturation. The scan is backed by a partial index on
-/// `state='waiting'` (migration `flow_0011`), so the forced probe is cheap even on a large partition.
 const REPAIR_PROBE_CADENCE: u64 = 64;
 
-/// Production adapter joining the durable control surface to the fenced drive store.
 pub struct PgFlowWorker {
     store: PgFlowDriveStore,
     executor: PgFlowExecutor,
     scope: PgWorkerScope,
     bodies: HashMap<(String, i32), RegisteredBody>,
-    /// Monotone `run_once` counter driving the [`REPAIR_PROBE_CADENCE`] forced-repair sweep — so
-    /// stranded `waiting` rows are recovered on a bounded cadence even under a continuous backlog.
     repair_probe: AtomicU64,
 }
 
@@ -392,11 +350,6 @@ impl PgFlowWorker {
         &self.executor
     }
 
-    /// Persist the immutable definition and install the matching deterministic body locally.
-    ///
-    /// The closure follows [`PgWorkflowBody`]'s capture contract: interior-mutable captures are
-    /// technically possible, but must be limited to scope-safe effect adapters. Workflow branching,
-    /// targets, time, and other replay-sensitive facts come only from the claimed input or `WfCtx`.
     pub fn register_definition<F>(
         &mut self,
         wf_type: &str,
@@ -416,9 +369,6 @@ impl PgFlowWorker {
         self.register_body(wf_type, version, code_hash, None, body)
     }
 
-    /// Register a definition whose per-run immutable product input is resolved asynchronously under
-    /// the claimed lease before the synchronous body is invoked. Retryable resolver failures release
-    /// the lease without committing; permanent failures settle the run `nondeterministic`.
     pub fn register_definition_with_input_resolver<R, F>(
         &mut self,
         wf_type: &str,
@@ -474,7 +424,6 @@ impl PgFlowWorker {
         Ok(())
     }
 
-    /// Claim and drive at most one run in this worker's exact scope.
     pub async fn run_once(
         &self,
         now_unix_secs: i64,
@@ -490,11 +439,6 @@ impl PgFlowWorker {
         definitions.sort();
         let mut claimed = None;
 
-        // FORCED-REPAIR CADENCE: on every `REPAIR_PROBE_CADENCE`-th `run_once`, sweep for a stranded
-        // `waiting`-with-pending-signal run FIRST — so repair never starves behind a continuous
-        // backlog of runnable work (a normal claim would otherwise always win and the fallback sweep
-        // below would never run). Cheap (one indexed `SKIP LOCKED` scan) and bounded (at most one
-        // stranded row recovered per probe).
         let probe = self.repair_probe.fetch_add(1, Ordering::Relaxed) + 1;
         if probe.is_multiple_of(REPAIR_PROBE_CADENCE) {
             for (wf_type, version) in &definitions {
@@ -531,10 +475,6 @@ impl PgFlowWorker {
                 }
             }
         }
-        // Belt-and-braces: if nothing was runnable, try to REPAIR a run stranded `waiting` with a
-        // matching unconsumed signal (recovers rows stranded by older code / manual repair — the
-        // commit-side race fix prevents new strandings). A repaired run is claimed `running` + leased,
-        // then driven exactly like a normal claim (replay re-issues the wait + consumes the signal).
         if claimed.is_none() {
             for (wf_type, version) in &definitions {
                 claimed = self
@@ -558,8 +498,6 @@ impl PgFlowWorker {
 
         let result = self.drive_claimed(&lease, now_unix_secs, now_rfc3339).await;
         if result.is_err() {
-            // Exact owner+epoch+cursor release cannot clear a successor's claim. If an uncertain
-            // commit actually landed, the lease is already gone and this guarded release is a no-op.
             let _ = self.store.release_lease(&lease).await;
         }
         result
@@ -676,9 +614,6 @@ impl PgFlowWorker {
         .with_timers(timers, lease.partition, now_unix_secs)
         .with_signals(signals);
 
-        // The body is synchronous by contract, so run it off the async executor while this task
-        // heartbeats the exact owner+epoch lease. A body that outlives one TTL cannot commit under
-        // stale authority; a failed renewal aborts the drive and the guarded release path runs.
         let body = registered.body;
         let mut body_task = tokio::task::spawn_blocking(move || {
             let result = body(&resolved_input, &mut ctx);
@@ -697,12 +632,6 @@ impl PgFlowWorker {
                 }
                 _ = heartbeat.tick(), if heartbeat_failure.is_none() => {
                     if let Err(error) = self.store.renew_lease(lease, self.scope.lease_ttl_secs).await {
-                        // A spawn_blocking JoinHandle DETACHES when dropped. Latch lost authority
-                        // but keep joining the synchronous body so run_once never returns/releases
-                        // while that body is still executing. We refuse the commit below. If lease
-                        // expiry allowed a successor to overlap an already-dispatched external
-                        // activity, the deterministic activity idem_token is the required dedup
-                        // anchor; lease fencing prevents this stale drive from persisting results.
                         heartbeat_failure = Some(error);
                     }
                 }
@@ -723,7 +652,6 @@ impl PgFlowWorker {
             }
         };
         let staged = if matches!(outcome, DriveOutcome::Nondeterministic(_)) {
-            // Divergence halts without making the divergent body's newly-derived effects durable.
             None
         } else {
             Some(
@@ -778,7 +706,6 @@ impl PgFlowWorker {
         }
     }
 
-    /// Drive until idle or until the explicit bound is reached.
     pub async fn run_until_idle(
         &self,
         max_runs: usize,
@@ -789,7 +716,6 @@ impl PgFlowWorker {
             .await
     }
 
-    /// Drive until idle, the explicit bound, or a coordinated shutdown signal is reached.
     pub async fn run_until_idle_or_shutdown(
         &self,
         max_runs: usize,
@@ -842,7 +768,6 @@ impl PgFlowWorker {
         })
     }
 
-    /// Run bounded passes until shutdown. Each pass also fires at most one scoped due timer.
     pub async fn run_until_shutdown(
         &self,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -931,9 +856,6 @@ fn build_commit(
         DriveOutcome::Waiting => run_state::WAITING,
         DriveOutcome::Nondeterministic(_) => run_state::NONDETERMINISTIC,
     };
-    // The park descriptor rides the commit ONLY for a waiting settlement — it is what closes the
-    // signal/park race (a matching signal that landed mid-drive settles the run runnable). A
-    // non-waiting settlement discards it (a completed/failed run is not parked on anything).
     let park = match outcome {
         DriveOutcome::Waiting => staged.park,
         _ => None,
@@ -961,8 +883,6 @@ fn map_attempt(row: WfActivityAttemptRow) -> ActivityAttemptWrite {
         idem_token: row.idem_token,
         state: row.state,
         error: row.error,
-        // These optional strings are presentation timestamps in the in-memory model. PostgreSQL
-        // stamps its own durable row time; no lossy parser is introduced at this boundary.
         started_unix_ms: None,
         ended_unix_ms: None,
     }
@@ -1006,7 +926,6 @@ impl IdMinter for DriveIdMinter {
     }
 }
 
-/// Current epoch seconds plus an RFC-3339 UTC timestamp without a second clock dependency.
 fn system_clock() -> Result<(i64, String), PgWorkerError> {
     let now = chrono::Utc::now();
     Ok((

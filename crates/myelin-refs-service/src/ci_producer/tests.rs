@@ -1,8 +1,3 @@
-//! Unit drills for the REF-P19 / P-335 CI sub-anchor resolution (the Refs half of X-1). The ladder
-//! arms (`check-<context>` → the supersession-current state; `step-<n>` → the 11.8 sealed-log
-//! resolution), the out-of-order `run_attempt` supersession AT THE SUB-ANCHOR LEVEL, the
-//! root-always-carried rule, and the default-deny leak guard — each pinned by a test a mutation flips.
-
 use super::*;
 use crate::ladder::resolve_sub_outcome;
 use crate::resolve::ProjectOutcome;
@@ -26,8 +21,6 @@ fn viewer() -> Principal {
     )
 }
 
-/// A decoded `ci.check.updated` fact for `(commit, context, attempt, state)` — the CI-owned struct the
-/// Bus carries opaque (`run_attempt` is the supersession authority).
 fn fact(commit: &str, ctx: &str, attempt: u32, state: CheckState) -> CheckStatus {
     CheckStatus {
         tenant: tenant(),
@@ -50,7 +43,6 @@ fn fact(commit: &str, ctx: &str, attempt: u32, state: CheckState) -> CheckStatus
     }
 }
 
-/// A recorded `#step-<n>` resolver (the 11.8 seam stand-in) — scripts the resolution per anchor URN.
 #[derive(Default)]
 struct RecordedStepResolver {
     by_anchor: Mutex<BTreeMap<String, StepResolution>>,
@@ -67,12 +59,9 @@ impl StepAnchorResolver for RecordedStepResolver {
             .unwrap()
             .get(&anchor.0)
             .cloned()
-            // An anchor the seam never saw is GONE (a pruned run / unknown step — never a leak).
             .unwrap_or(StepResolution::Gone)
     }
 }
-
-// ── check-<context> resolves to the current state through the ONE ladder (C-6) ──
 
 #[test]
 fn a_successful_check_anchor_resolves_live() {
@@ -93,8 +82,6 @@ fn an_in_flight_check_anchor_resolves_outdated() {
     let anchor = CiOwner::check_anchor("acme", "abc123", "build");
     owner.ingest_check(&anchor, &fact("abc123", "build", 1, CheckState::InProgress));
 
-    // An in-flight (queued/in_progress) check renders but flags "not yet final" — OUTDATED, never a
-    // hard fail (the merge gate's blocking decision is Git's, GIT-D10).
     let outcome = resolve_sub_outcome(&owner, &anchor);
     assert!(
         matches!(&outcome, ProjectOutcome::Live(p)
@@ -105,8 +92,6 @@ fn an_in_flight_check_anchor_resolves_outdated() {
 
 #[test]
 fn a_failure_check_anchor_resolves_live_not_a_tombstone() {
-    // Refs resolves only that the anchor points at the right STATE — a `failure` is a LIVE render of
-    // the failing verdict (whether it BLOCKS the merge is Git's gate, not Refs'). Never a tombstone.
     let owner = CiOwner::new();
     let anchor = CiOwner::check_anchor("acme", "abc123", "test");
     owner.ingest_check(&anchor, &fact("abc123", "test", 1, CheckState::Failure));
@@ -116,16 +101,11 @@ fn a_failure_check_anchor_resolves_live_not_a_tombstone() {
     ));
 }
 
-// ── the HEADLINE: out-of-order supersession honoured AT THE SUB-ANCHOR LEVEL (X-1) ──
-
 #[test]
 fn out_of_order_ci_check_resolves_the_latest_by_run_attempt() {
     let owner = CiOwner::new();
     let anchor = CiOwner::check_anchor("acme", "abc123", "build");
 
-    // The HIGHER attempt (a re-run, success) arrives FIRST; the stale LOWER attempt (failure) arrives
-    // LATE (the at-least-once transport reordered them). The sub-anchor must resolve the LATEST by
-    // run_attempt — the success — NEVER the physically-last-arrived failure.
     let hi = owner.ingest_check(&anchor, &fact("abc123", "build", 2, CheckState::Success));
     assert_eq!(hi, ApplyOutcome::Superseded { current_attempt: 2 });
 
@@ -139,7 +119,6 @@ fn out_of_order_ci_check_resolves_the_latest_by_run_attempt() {
         "the late lower attempt is DROPPED (monotonic run_attempt supersession)"
     );
 
-    // The sub-anchor resolves the latest-by-attempt (the success), NOT the last-arrived (the failure).
     let outcome = resolve_sub_outcome(&owner, &anchor);
     assert!(
         matches!(outcome, ProjectOutcome::Live(_)),
@@ -161,7 +140,6 @@ fn out_of_order_ci_check_resolves_the_latest_by_run_attempt() {
 
 #[test]
 fn a_higher_attempt_arriving_later_supersedes() {
-    // The in-order case: attempt 1 (failure) then a re-run attempt 2 (success) — the success wins.
     let owner = CiOwner::new();
     let anchor = CiOwner::check_anchor("acme", "abc123", "build");
     owner.ingest_check(&anchor, &fact("abc123", "build", 1, CheckState::Failure));
@@ -172,8 +150,6 @@ fn a_higher_attempt_arriving_later_supersedes() {
         ProjectOutcome::Live(_)
     ));
 }
-
-// ── step-<n> details_ref resolves through the 11.8 sealed CI log segments ──
 
 #[test]
 fn a_step_anchor_resolving_to_bytes_is_live() {
@@ -203,8 +179,6 @@ fn a_step_anchor_for_an_unknown_step_is_a_root_carrying_tombstone() {
     steps.set(&anchor, StepResolution::Gone);
     owner.wire_step_resolver(steps);
 
-    // GONE → SubGone (the root run still resolves; the chokepoint carries the root — the embed shows
-    // the parent run, never a hard 404).
     assert_eq!(
         resolve_sub_outcome(&owner, &anchor),
         ProjectOutcome::SubGone
@@ -223,8 +197,6 @@ fn a_crypto_shredded_step_segment_is_erased() {
 
 #[test]
 fn a_step_anchor_with_no_resolver_wired_is_gone_not_a_leak() {
-    // Defensive: a `#step-<n>` resolved before the 11.8 seam is wired degrades GONE (the root carries),
-    // NEVER a fabricated LIVE projection.
     let owner = CiOwner::new();
     let anchor = CiOwner::step_anchor("acme", "run-7", 2);
     assert_eq!(
@@ -232,8 +204,6 @@ fn a_step_anchor_with_no_resolver_wired_is_gone_not_a_leak() {
         ProjectOutcome::SubGone
     );
 }
-
-// ── the bare root + the leak guard ──
 
 #[test]
 fn a_bare_ci_root_is_live() {
@@ -247,8 +217,6 @@ fn a_bare_ci_root_is_live() {
 
 #[test]
 fn default_deny_a_viewer_with_no_ci_read_is_denied_at_the_root() {
-    // The leak invariant's authz half: an ungranted viewer gets Deny on the root (the chokepoint turns
-    // it into Tombstone{denied} — the check/step state never leaks).
     let owner = CiOwner::new();
     let root = CiOwner::check_root("acme", "abc123");
     let perm = Permission(crate::VIEW_PERMISSION.into());
@@ -259,7 +227,6 @@ fn default_deny_a_viewer_with_no_ci_read_is_denied_at_the_root() {
         Decision::Deny,
         "an ungranted viewer is default-denied at the CI root (no state leaks)"
     );
-    // A granted viewer is allowed.
     owner.grant_view(&tenant(), &region(), &viewer(), &root);
     assert_eq!(
         owner
@@ -271,8 +238,6 @@ fn default_deny_a_viewer_with_no_ci_read_is_denied_at_the_root() {
 
 #[test]
 fn an_unreported_check_anchor_resolves_outdated_not_a_leak() {
-    // A `check-<context>` the CI producer half hasn't reported yet resolves OUTDATED (in-flight
-    // default) — never a fabricated success, never a hard 404.
     let owner = CiOwner::new();
     let anchor = CiOwner::check_anchor("acme", "abc123", "never-reported");
     assert!(matches!(

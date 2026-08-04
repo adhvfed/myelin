@@ -1,17 +1,3 @@
-//! # Edge tenant-scope proof over a LIVE Postgres (`--features integration`).
-//!
-//! Proves the edge SETS the tenant scope via `with_tenant_tx` before dispatch: a handler, given the
-//! gateway-resolved `TenantScope`, opens a real `(tenant, region)`-scoped transaction and reads back
-//! the `myelin.tenant_id` GUC the RLS policy keys on — and it equals the VERIFIED TOKEN's tenant,
-//! never a client-supplied one. This is the live-PG half the default `edge_integration.rs` could not
-//! exercise (it proves auth/IDOR/SSE in-memory; this proves the DB tenant scope is actually set).
-//!
-//! ## Test env
-//! Requires the docker-compose dev stack (`DATABASE_URL` pointing at the dev Postgres). The test
-//! SKIPS (prints + returns) if `DATABASE_URL` is unset, so the suite is hermetic without a DB; under
-//! the live stack it connects and asserts the GUC. Run:
-//!   `DATABASE_URL=postgres://… cargo test -p myelin-edge --features integration --test edge_tenant_scope_integration`
-
 #![cfg(feature = "integration")]
 
 use bytes::Bytes;
@@ -38,8 +24,6 @@ const TENANT: &str = "acme";
 const REGION: &str = "eu-west";
 const SCHEME: &str = "agent";
 
-/// A handler that opens a `(tenant, region)`-scoped transaction over the gateway-resolved scope and
-/// reads back the `myelin.tenant_id` GUC the RLS policy enforces — proving the edge SET the scope.
 struct TenantScopeProbe {
     pool: PgPool,
     rt: tokio::runtime::Handle,
@@ -50,8 +34,6 @@ impl Handler for TenantScopeProbe {
         let tenant = ctx.scope.tenant().0.clone();
         let region = ctx.scope.region().0.clone();
         let pool = self.pool.clone();
-        // Bridge the sync handler onto the async pool (the same block_in_place+block_on pattern the
-        // durable revocation store uses). The GUC is set TRANSACTION-scoped by with_tenant_tx.
         let got: String = tokio::task::block_in_place(|| {
             self.rt.block_on(async move {
                 with_tenant_tx(&pool, &tenant, &region, |conn| {
@@ -93,7 +75,6 @@ async fn edge_sets_the_tenant_scope_in_a_real_transaction() {
         .await
         .expect("connect to the dev Postgres");
 
-    // Seed the S1 directory + the real cell verifier (the same real auth as the default proofs).
     let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
     let scope = admin_scope(TENANT);
@@ -125,8 +106,6 @@ async fn edge_sets_the_tenant_scope_in_a_real_transaction() {
     });
     let gateway = Arc::new(
         Gateway::builder(authn, human, Arc::new(AllowAll))
-            // Reuse a catalogue-backed identity read: even test-only routes must pass the signed
-            // capability boundary, which deliberately rejects invented action strings.
             .route(Method::Get, "/v1/scope-probe", "edge.whoami", probe)
             .build(),
     );
@@ -137,7 +116,6 @@ async fn edge_sets_the_tenant_scope_in_a_real_transaction() {
         let _ = serve_edge(listener, gateway).await;
     });
 
-    // Mint a real token for acme and call the probe over real HTTP.
     let exp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()

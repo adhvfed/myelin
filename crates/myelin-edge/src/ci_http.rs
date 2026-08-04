@@ -1,11 +1,3 @@
-//! Authenticated CT-005 CI run read routes.
-//!
-//! CI owns the durable row/query authority; Edge supplies only the verified principal, derives the
-//! tenant/region from it, and reuses Git's live parent-repository Pull decision. Lists prefilter by
-//! the bounded visible repository set before pagination. Object reads resolve only the parent
-//! repository identity, authorize it, and then load the DAG/job/step detail. Denied and absent runs
-//! are the same 404.
-
 use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
@@ -41,8 +33,6 @@ pub struct DurableCiReadApi {
 }
 
 impl DurableCiReadApi {
-    /// Bind the durable CI stores to Git's exact repository Pull authority. Both authenticated HTTP
-    /// and direct agent/MCP reads call these same methods.
     pub fn new(
         runs: CiRunStore,
         git: Arc<DurableGitBackend>,
@@ -87,7 +77,6 @@ impl DurableCiReadApi {
         }
     }
 
-    /// Read one exact run after resolving and authorizing its canonical parent repository.
     pub fn read_run(&self, principal: &Principal, run_id: &str) -> Result<Value, EdgeError> {
         if !canonical_uuid(run_id) {
             return Err(EdgeError::BadRequest(
@@ -108,7 +97,6 @@ impl DurableCiReadApi {
         }))
     }
 
-    /// Read one bounded archived job-log range under the same run/repository authorization.
     pub fn read_log(
         &self,
         principal: &Principal,
@@ -157,9 +145,6 @@ impl DurableCiReadApi {
         }))
     }
 
-    /// Open a cross-service durable log tail. The T3 `log_segment.segment_seq` is the resume
-    /// authority; SSE carries only byte-range pointers, and clients resolve bytes through
-    /// [`Self::read_log`] so the existing content-addressed integrity checks remain the one reader.
     pub fn open_log_tail(
         &self,
         principal: &Principal,
@@ -222,8 +207,6 @@ impl DurableCiReadApi {
                 if !poll_immediately {
                     tokio::time::sleep(CI_LOG_TAIL_POLL_INTERVAL).await;
                 }
-                // Object permission is live, not a one-time subscription grant. A revoked Pull
-                // relation closes silently, preserving the denied/absent oracle posture.
                 let Ok(repo_ref) = authorized_repo_ref(&api, &principal, &run_id) else {
                     return;
                 };

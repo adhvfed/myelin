@@ -1,22 +1,3 @@
-//! **CI-P25 / P-368 — the leak-free `list_objects` `SetExpr` push-down over `ci_run.run_id`, PROVEN
-//! against the live dev-stack Postgres (the REAL data-layer artifact the binding policy requires).**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_p25_list_pushdown -- --nocapture
-//!
-//! The prompt CONSUMES the §5.1 `list_objects` DB read contract, so the binding policy requires a
-//! REAL integration proof (never mocked): the run-list read — the lowered `SetExpr` (the
-//! `authz_visible` JOIN form) conjoined into the `ci_run` list scan over `ci_run.run_id` — runs as
-//! **ONE SQL query** against real Postgres and returns ONLY the rows the viewer may `read` (0 leak),
-//! with the tenant predicate isolating cross-tenant rows. Survival signals: **0 leak; 1 SQL query;
-//! revoke reflected.** The SQL the test runs is the lowered form
-//! [`myelin_ci_controlplane::lower_over_run_id`] composes (the SAME `LoweredFilter` the production
-//! read composes), executed against the seeded `ci_run` + `authz_visible` tables.
-
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{ci_run_id_colref, lower_over_run_id, AUTHZ_VISIBLE_TABLE};
@@ -45,8 +26,6 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
     let run_tbl = format!("ci_run_p368_{suffix}");
     let av_tbl = format!("authz_visible_p368_{suffix}");
 
-    // ── 1. A minimal `ci_run` table (the §5.1 columns the run-list read touches — keyed on `run_id`)
-    //       + an authz_visible reverse index table (the JOIN target). Throwaway, suffixed. ────────────
     sqlx::query(&format!(
         "CREATE TABLE {run_tbl} (\
            tenant_id text NOT NULL, region text NOT NULL, run_id text NOT NULL, \
@@ -64,8 +43,6 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
     .await
     .expect("create the authz_visible reverse index table");
 
-    // ── 2. Seed a tenant with two runs the viewer can read, one SECRET run (granted to someone else —
-    //       the leak witness), and a CROSS-TENANT run in another tenant (must never be readable). ─────
     for (tenant, run_id, pipeline) in [
         ("acme", "run:1", "ci"),
         ("acme", "run:2", "ci"),
@@ -83,8 +60,6 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
         .expect("seed a run");
     }
 
-    // ── 3. Grant the viewer `read` of ONLY run:1 + run:2 in the reverse index (tenant acme).
-    //       run:secret is granted to p:other; the cross-tenant run:x is in evilcorp. ──────────────────
     let viewer = Principal::stub(
         PrincipalId("p:viewer".into()),
         PrincipalKind::Human,
@@ -106,7 +81,6 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
         .expect("grant read");
     }
 
-    // ── 4. Build the REAL lowered SetExpr (InRelation{read} → the authz_visible JOIN over ci_run.run_id). ──
     let lowered = lower_over_run_id(
         &SetExpr::InRelation {
             relation: RelName("read".into()),
@@ -119,19 +93,14 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
         1,
         "the InRelation lowers to ONE JOIN (no N+1)"
     );
-    // Rebind the lowered JOIN clause onto the suffixed test tables + bind the viewer subject/relation
-    // (in production the table names are canonical + the driver binds the params; the SHAPE under test
-    // is the lowering's clause verbatim).
     let join_clause = lowered.joins[0]
         .clause
         .replace(AUTHZ_VISIBLE_TABLE, &av_tbl)
         .replace("ci_run.run_id", &format!("{run_tbl}.run_id"))
         .replace(":subject_0", "'p:viewer'")
         .replace(":rel_for_read", "'read'");
-    let predicate = lowered.sql_predicate; // `av0.object_id IS NOT NULL`
+    let predicate = lowered.sql_predicate;
 
-    // ── 5. THE ONE run-list query: the lowered JOIN + predicate conjoined into the ci_run scan,
-    //       tenant-scoped, ORDER BY run_id LIMIT :page (the §5.1 pre-filter, never post-filter). ──────
     let list_sql = format!(
         "SELECT {run_tbl}.run_id FROM {run_tbl} {join_clause} \
          WHERE {run_tbl}.tenant_id = 'acme' AND {run_tbl}.region = 'fr-par' AND ({predicate}) \
@@ -142,7 +111,6 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
         .await
         .unwrap_or_else(|e| panic!("the ONE run-list query runs: {e}\nSQL: {list_sql}"));
 
-    // ── 6. PROVE leak-free: exactly the TWO authorized runs; run:secret + the cross-tenant run ABSENT. ──
     let ids: Vec<String> = rows.iter().map(|r| r.get::<String, _>("run_id")).collect();
     assert_eq!(
         ids,
@@ -158,8 +126,6 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
         "0 cross-tenant: the tenant predicate excluded evilcorp's run"
     );
 
-    // ── 7. PROVE one query / no post-filter / no N+1: the read is ONE statement (a JOIN); EXPLAIN
-    //       confirms a single plan (no correlated per-row check subplan). ─────────────────────────────
     let plan = sqlx::query(&format!("EXPLAIN (FORMAT TEXT) {list_sql}"))
         .fetch_all(&admin)
         .await
@@ -175,8 +141,6 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
         "the read is ONE join query (no per-row check loop): {plan_text}"
     );
 
-    // ── 8. REVOKE reflected: remove the viewer's grant on run:1 from the reverse index; re-run the SAME
-    //       one query → run:1 drops out (the read-your-writes guarantee). ────────────────────────────
     sqlx::query(&format!(
         "DELETE FROM {av_tbl} WHERE tenant_id = 'acme' AND subject = 'p:viewer' AND relation = 'read' AND object_id = 'run:1'"
     ))
@@ -197,7 +161,6 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
         "the just-revoked run:1 drops out (revoke reflected): {ids_after:?}"
     );
 
-    // ── 9. Clean up the throwaway tables (leave the stack healthy for subsequent prompts). ───────────
     sqlx::query(&format!("DROP TABLE {run_tbl}"))
         .execute(&admin)
         .await

@@ -1,32 +1,3 @@
-//! # The CDC pair for contract 8.4 (the Fabric half) + 11.7 — `ToolHands::exec` = the unified sandbox
-//!
-//! **Contract:** `planning/05-refined-shared-systems-architecture/contract-index.md` row 8.4
-//! (`ToolHands::exec(Command) -> ToolResult` — sandboxed computation; **no host-exec bypass**; = CI's
-//! `kind=agent` job on the ONE unified sandbox; only `compute` untrusted code reaches the kernel,
-//! `mutate`/`external` go through `EffectApi`; the **four uniform guarantees**), consuming row 11.7
-//! (reserve at dispatch). Owning architecture (byte-authoritative):
-//! `agent-fabric.md` §2.2 (the hands + the four guarantees) + §5.0 (the routing table).
-//! Reconciliation: `00-reconciliation-decisions.md` X-6.
-//!
-//! ## What this pair pins (the AGENT-FABRIC CONSUMER half of 8.4; AG-P15 → P-226)
-//! Row 8.4 is a co-defined seam (EI-01 §7). CI owns the runner (the `JobSpec` shape + the
-//! `SandboxBackend` trait + the four-guarantee hooks — pinned by the CI-P1 CDC,
-//! `myelin-ci-sandbox/tests/cdc_8_4_unified_sandbox.rs`). **This file pins the AGENT-FABRIC consumer
-//! half**: the real `ToolHands::exec` body ([`SandboxToolHands`]) that
-//!
-//! - **PROVIDER (the unified runner seam):** accepts the `kind=agent` `JobSpec` the Fabric builds and
-//!   drives the four-guarantee `RunnerHooks` in the mandated order (isolation floor → attribution →
-//!   reserve → settle), whole-guest-killing on teardown; there is no host-exec bypass (`no-host-exec`);
-//! - **CONSUMER (the agent fabric `ToolHands::exec`):** routes a `compute` tool call into the sandbox
-//!   (`route_of` == `Sandbox`), builds the hardened `kind=agent` job, and dispatches it through
-//!   `launch` — and **CANNOT** route a `mutate`/`external` effect there (the routing split is the
-//!   safety boundary; 0 mutate-via-exec, encoded in the type), and an un-digested image it tries to
-//!   run is rejected fail-closed BEFORE launch.
-//!
-//! The 11.7 consumer leg (reserve at dispatch / refuse-on-exhaustion) is exercised through the
-//! `RunnerHooks::reserve` hook the runner drives. The ZERO-escapes real-kernel GATE proving
-//! guarantee #4 is AG-P17 (→ P-229) / CI-P5 (→ P-239); the Firecracker backend is CI-P2 (→ P-237).
-
 use myelin_agent::{Command, EffectKind, ToolDef, ToolHands, ToolName};
 use myelin_agent_service::escape_gate::{AgentExecGate, ProductionBackendId};
 use myelin_agent_service::exec::{
@@ -75,10 +46,6 @@ fn credential(jti: &str) -> RunTokenCredential {
     RunTokenCredential::new(format!("test-bearer:{jti}"), jti, 300).unwrap()
 }
 
-/// **PROVIDER side (the unified runner seam).** A backend recording the four-guarantee order +
-/// teardown-kill count. It launches only specs that already passed `JobSpec::new`'s fail-closed
-/// non-negotiables (the type guarantees that). There is NO host-execution path — all execution goes
-/// through this `launch` seam (X-6 / `no-host-exec`).
 struct RunnerSeam {
     order: Arc<Mutex<Vec<&'static str>>>,
     kills: Arc<AtomicU32>,
@@ -108,8 +75,6 @@ impl SandboxBackend for RunnerSeam {
                 return Err(error);
             }
             self.order.lock().unwrap().push("attribute");
-            // ... the hardened guest runs the (compute) command here; the seam carries the
-            // result back ...
             let result = SandboxResult::stub_ok(ResourceUsage {
                 cpu_seconds: 2,
                 mem_byte_seconds: 4,
@@ -137,7 +102,7 @@ fn working_hooks() -> RunnerHooks {
         myelin_ci_sandbox::CompletionSettlementOwner::Hook,
         Box::new(|spec| {
             if spec.meter_to.reserve_id == "__exhausted__" {
-                Err(HookError("wallet exhausted — refuse to start".into()))
+                Err(HookError("wallet exhausted - refuse to start".into()))
             } else {
                 Ok(ReserveHandle(spec.meter_to.reserve_id.clone()))
             }
@@ -148,8 +113,6 @@ fn working_hooks() -> RunnerHooks {
     )
 }
 
-/// A real GREEN AG-D4 gate (AG-P17 → P-229) — the structural fail-closed prerequisite the exec hands
-/// require to exist at all. Minted from the corpus parser (never hardcoded).
 fn green_gate() -> AgentExecGate {
     let id = ProductionBackendId {
         backend: Backend::FirecrackerMicrovm,
@@ -180,7 +143,6 @@ fn green_gate() -> AgentExecGate {
     AgentExecGate::admit(Some(&att), &id).unwrap()
 }
 
-/// **CONSUMER side (the agent fabric).** Build the run-scoped hands the platform loop uses.
 fn fabric_hands<'a>(
     backend: &'a RunnerSeam,
     hooks: RunnerHooks,
@@ -202,8 +164,6 @@ fn fabric_hands<'a>(
     )
 }
 
-/// The CONSUMER's `ToolHands::exec` dispatches a `kind=agent` job onto the PROVIDER's runner seam,
-/// driving all four guarantees in the mandated order + whole-guest kill on teardown (X-6).
 #[test]
 fn fabric_exec_dispatches_kind_agent_job_through_the_four_guarantees() {
     let order = Arc::new(Mutex::new(Vec::new()));
@@ -228,8 +188,6 @@ fn fabric_exec_dispatches_kind_agent_job_through_the_four_guarantees() {
     );
 }
 
-/// The 11.7 consumer leg: a `ToolHands::exec` against an exhausted wallet refuses-to-start — the
-/// guest never runs (no "settle"), and the failure surfaces LOUD (never a silent success).
 #[test]
 fn fabric_exec_refuses_to_start_on_exhausted_reserve_11_7() {
     let order = Arc::new(Mutex::new(Vec::new()));
@@ -246,12 +204,10 @@ fn fabric_exec_refuses_to_start_on_exhausted_reserve_11_7() {
     );
     assert!(
         !order.lock().unwrap().contains(&"settle"),
-        "the guest never ran — refuse-to-start (11.7), never interrupt in-flight's dual"
+        "the guest never ran - refuse-to-start (11.7), never interrupt in-flight's dual"
     );
 }
 
-/// THE routing-split safety boundary (0 mutate-via-exec): a `mutate` effect cannot build a
-/// `SandboxJob`, so it has NO path to the sandbox — it is rejected LOUD at the consumer boundary.
 #[test]
 fn a_mutate_effect_can_never_reach_the_sandbox() {
     assert_eq!(route_of(EffectKind::Mutate), ToolRoute::EffectApi);
@@ -279,8 +235,6 @@ fn a_mutate_effect_can_never_reach_the_sandbox() {
     );
 }
 
-/// The hardening profile (guarantee #4) is fully fed into the `kind=agent` spec the CONSUMER builds,
-/// and an un-digested image is rejected fail-closed BEFORE it can reach the PROVIDER's `launch`.
 #[test]
 fn the_consumer_feeds_the_full_hardening_profile_and_fails_closed_on_an_undigested_tag() {
     let compute = def("agent.lint", EffectKind::Compute, false);
@@ -311,13 +265,10 @@ fn the_consumer_feeds_the_full_hardening_profile_and_fails_closed_on_an_undigest
     assert!(spec.image.digest_pinned());
     assert!(spec.egress.allow.is_empty(), "default-deny egress");
     assert!(spec.limits.pids_max > 0 && spec.limits.timeout_secs > 0);
-    // anti-leak (#2): the shared platform token is scrubbed; the per-run token rides in the spec.
     assert!(spec.env.iter().all(|e| e.name != PLATFORM_TOKEN_ENV));
     assert_eq!(spec.run_token.jti, "per-run");
-    // secrets ride as in-boundary refs (names/handles, never the clear material).
     assert_eq!(spec.secret_refs[0].name, "NPM_TOKEN");
 
-    // an un-digested image is rejected fail-closed — it never reaches launch.
     let bad = SandboxJob::for_compute(
         &compute,
         ImageRef {

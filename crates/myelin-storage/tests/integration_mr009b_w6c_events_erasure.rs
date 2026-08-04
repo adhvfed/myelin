@@ -1,30 +1,3 @@
-//! # MR-009b W6c-events — the durable Bus erasure ledger (contract 10.8), proven against LIVE Postgres.
-//!
-//! These are the silent-resurrection GATES for the events `BusErasureLedger` (SI-039), proven against
-//! the live docker-compose Postgres (:5433), NOT modeled in memory. `myelin-events` is a §2.9 DAG SINK
-//! (it cannot name a `PgPool`), so the flip uses the **DedupLedger trait-seam pattern**: the
-//! `DurableBusErasure` trait is defined IN events, the PG impl (`DurableBusErasureBacking`) + the
-//! NON-shred-erasable, NO-RLS `bus_erasure_ledger` table (migration 0053) live here in storage, wired at
-//! the `EventsRuntime` composition root via `BusErasureLedger::durable`.
-//!
-//! The four proofs (the W6c-events gate):
-//!   1. **Records SURVIVE reconstruction from a FRESH pool** — an erasure recorded through one durable
-//!      ledger is STILL remembered by a brand-new ledger over a FRESH pool (the "process restart"): an
-//!      in-memory `BTreeMap` would be empty → the re-erasure pass would replay nothing → a restored
-//!      pre-erase backup could silently resurrect the subject.
-//!   2. **Idempotent `key_refs` MERGE (deduped)** — recording the same subject twice with OVERLAPPING
-//!      ref sets yields ONE row whose `key_refs` are the UNION, de-duplicated + sorted, keeping the
-//!      FIRST `erased_at` (the `ON CONFLICT … DO UPDATE` array-merge).
-//!   3. **Partition ISOLATION** — tenant A's erasure ledger is INVISIBLE to tenant B's `(tenant,
-//!      region)` scope (the explicit predicate on every statement; no RLS on this table by design).
-//!   4. **`re_erase_after_restore` drives off the DURABLE ledger** — after a restore resurrects a
-//!      pre-erase backup, a BusHolder replays a FRESH durable ledger (only the PG rows, no in-memory
-//!      state) and re-destroys the resurrected key → 0 resurrected (the BUS-D8 threshold).
-//!
-//! Run against the dev stack:
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-storage --features integration \
-//!     --test integration_mr009b_w6c_events_erasure -- --nocapture
 #![cfg(feature = "integration")]
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,10 +14,6 @@ use myelin_events::{
     PiiKeyRef, Region, TenantId, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-
-// ----------------------------------------------------------------------------------------------
-// shared helpers
-// ----------------------------------------------------------------------------------------------
 
 fn admin_url(cfg: &MyelinConfig) -> String {
     cfg.database_url
@@ -71,11 +40,6 @@ fn keyref(subject: &str) -> PiiKeyRef {
 }
 
 async fn ensure_table(pool: &sqlx::PgPool) {
-    // `CREATE TABLE IF NOT EXISTS` races across the four concurrent `#[tokio::test]`s on the FIRST run
-    // (Postgres raises a duplicate-`pg_type` / "tuple concurrently updated" error for the losers of the
-    // DDL race). Tolerate the error, then CONFIRM the table exists — the winner created it. (Production
-    // boot applies this via the advisory-locked `SubstrateProvider::migrate`, which serializes DDL; the
-    // test applies it directly so it is self-contained.)
     for _ in 0..8 {
         let _ = sqlx::raw_sql(BUS_ERASURE_LEDGER_MIGRATION).execute(pool).await;
         let exists: bool =
@@ -105,8 +69,6 @@ fn durable_ledger(tenant: &str, pool: &sqlx::PgPool, rt: &tokio::runtime::Handle
         Arc::new(DurableBusErasureBacking::new(pool.clone(), rt.clone())) as Arc<dyn DurableBusErasure>,
     )
 }
-
-// --- BusHolder harness (mirrors the events-crate reerase unit tests) ---
 
 fn actor_for(id: &str, tenant: &str) -> Actor {
     Actor(Principal::stub(
@@ -140,7 +102,6 @@ fn inline_pii(event_id: &str, subject: &str, tenant: &str) -> EventEnvelope {
     derive_envelope(draft, ctx, None)
 }
 
-/// Seal a log + shredder for `subjects`, one inline-PII event each (every DEK live — pre-erase state).
 fn seeded(subjects: &[&str], tenant: &str) -> (BusEventLog, InMemoryShredder) {
     let mut log = BusEventLog::new();
     let shredder = InMemoryShredder::new();
@@ -158,10 +119,6 @@ fn minter() -> Arc<dyn IdMinter> {
     Arc::new(MonotonicMinter::new())
 }
 
-// ==============================================================================================
-// TEST 1 — records SURVIVE reconstruction from a FRESH pool (the durability / "restart" proof)
-// ==============================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w6c_records_survive_reconstruction_from_a_fresh_pool() {
     let cfg = MyelinConfig::dev();
@@ -176,13 +133,8 @@ async fn w6c_records_survive_reconstruction_from_a_fresh_pool() {
     cleanup(&pool_write, &tenant).await;
 
     let subject = format!("subject:{tag}");
-    // ADVERSARIAL input (W6c verifier finding, probe-proven pre-fix): UNSORTED + DUPLICATED refs
-    // on the FIRST insert — the no-conflict INSERT arm used to store the bound array VERBATIM
-    // (only the DO UPDATE arm normalized), diverging from the memory arm and double-counting a
-    // duplicated ref in the re-erasure receipt. The refs must come back sorted + deduped.
     let refs = vec![keyref("b"), keyref("a"), keyref("a")];
 
-    // Record through one durable ledger, then DROP its pool entirely.
     {
         let ledger = durable_ledger(&tenant, &pool_write, &rt);
         ledger.record(&subject, &refs, now());
@@ -190,7 +142,6 @@ async fn w6c_records_survive_reconstruction_from_a_fresh_pool() {
         pool_write.close().await;
     }
 
-    // A brand-NEW pool + a brand-NEW ledger (the process restart): the record SURVIVED in PG.
     let pool_fresh = connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 4)
         .await
         .expect("connect a FRESH pool");
@@ -206,7 +157,7 @@ async fn w6c_records_survive_reconstruction_from_a_fresh_pool() {
         entries[0].key_refs,
         vec![keyref("a"), keyref("b")],
         "the shredded key refs survived NORMALIZED (unsorted+duplicated input came back sorted, \
-         deduped — first-insert-path parity with the memory arm, the W6c verifier finding)"
+         deduped - first-insert-path parity with the memory arm, the W6c verifier finding)"
     );
     assert_eq!(entries[0].erased_at.0, now().0, "the erased_at timestamp survived");
 
@@ -217,10 +168,6 @@ async fn w6c_records_survive_reconstruction_from_a_fresh_pool() {
 
     cleanup(&pool_fresh, &tenant).await;
 }
-
-// ==============================================================================================
-// TEST 2 — idempotent `key_refs` MERGE (union, deduped, first erased_at kept)
-// ==============================================================================================
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w6c_idempotent_key_refs_merge_dedups_and_keeps_first_erased_at() {
@@ -238,9 +185,7 @@ async fn w6c_idempotent_key_refs_merge_dedups_and_keeps_first_erased_at() {
     let subject = format!("subject:{tag}");
     let ledger = durable_ledger(&tenant, &pool, &rt);
 
-    // First record: {a, b} at `now`.
     ledger.record(&subject, &[keyref("a"), keyref("b")], now());
-    // Second record of the SAME subject with an OVERLAPPING set {b, c} at a LATER time.
     ledger.record(&subject, &[keyref("b"), keyref("c")], later());
 
     let entries = ledger.entries();
@@ -265,10 +210,6 @@ async fn w6c_idempotent_key_refs_merge_dedups_and_keeps_first_erased_at() {
     cleanup(&pool, &tenant).await;
 }
 
-// ==============================================================================================
-// TEST 3 — partition ISOLATION (tenant A's ledger invisible to tenant B's scope)
-// ==============================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w6c_partition_isolation_tenant_a_invisible_to_tenant_b() {
     let cfg = MyelinConfig::dev();
@@ -288,7 +229,6 @@ async fn w6c_partition_isolation_tenant_a_invisible_to_tenant_b() {
     let ledger_a = durable_ledger(&tenant_a, &pool, &rt);
     let ledger_b = durable_ledger(&tenant_b, &pool, &rt);
 
-    // Tenant A records an erasure; tenant B (SAME pool, SAME subject id, SAME region) must NOT see it.
     ledger_a.record(&subject, &[keyref("a")], now());
 
     assert!(ledger_a.is_erased(&subject), "tenant A sees its own erasure");
@@ -311,10 +251,6 @@ async fn w6c_partition_isolation_tenant_a_invisible_to_tenant_b() {
     cleanup(&pool, &tenant_b).await;
 }
 
-// ==============================================================================================
-// TEST 4 — `re_erase_after_restore` drives off the DURABLE ledger (BUS-D8: 0 resurrected)
-// ==============================================================================================
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w6c_re_erase_after_restore_drives_off_the_durable_ledger() {
     let cfg = MyelinConfig::dev();
@@ -330,7 +266,6 @@ async fn w6c_re_erase_after_restore_drives_off_the_durable_ledger() {
 
     let subject = "u42";
 
-    // (1) Erase u42 in the live cell AND record it in the DURABLE ledger.
     let (mut live_log, shredder) = seeded(&[subject], &tenant);
     let holder = BusHolder::new(TenantId(tenant.clone()), region(), shredder.clone());
     let write_ledger = durable_ledger(&tenant, &pool, &rt);
@@ -341,14 +276,10 @@ async fn w6c_re_erase_after_restore_drives_off_the_durable_ledger() {
     let key = keyref(subject);
     assert!(!shredder.is_live(&key), "key dead in the live cell");
 
-    // (2) RESTORE an OLDER (pre-erase) backup: the DEK is LIVE again (re-sealed) and the log row is
-    //     back WITHOUT its tombstone — exactly what restoring a backup taken before the erase does.
     let (mut restored_log, _) = seeded(&[subject], &tenant);
     shredder.seal(&key);
     assert!(shredder.is_live(&key), "the restore RESURRECTED u42's DEK");
 
-    // (3) "Restart": a FRESH durable ledger over a FRESH pool — it has NO in-memory state, only the PG
-    //     rows. `re_erase_after_restore` MUST drive off this durable ledger to know u42 was erased.
     let pool_fresh = connect_pool_with_reset(&admin_url(&cfg), &cfg.region, 4)
         .await
         .expect("connect a FRESH pool");

@@ -1,10 +1,3 @@
-//! R4.2 Tier-P operational reservation proof.
-//!
-//! The concrete provider commits one complete manifest batch into Storage's durable reservation
-//! ledger, returns the same request-bound handles after acknowledgement loss, serializes concurrent
-//! retries, refuses divergent authority and exhausted tenant capacity, and leaves no partial rows
-//! when PostgreSQL fails midway through the batch. This is operational capacity control only:
-//! there is no wallet, billing, Stripe, or customer price.
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
@@ -129,8 +122,6 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     .unwrap();
     let batch = vec![request("personal", 1, 1), request("personal", 1, 2)];
 
-    // Concurrent acknowledgement-loss retries serialize on the tenant lock. One transaction
-    // inserts; its waiter observes the exact complete batch and returns the same ordered handles.
     let (first, concurrent_retry) = tokio::join!(
         provider.reserve_batch(batch.clone()),
         provider.reserve_batch(batch.clone())
@@ -144,16 +135,10 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
         .all(|handle| handle.starts_with("ci-reserve:v2:10000000-0000-0000-0000-000000000001:")));
     let rows = reservation_rows(&admin, "personal").await;
     assert_eq!(rows.len(), 2);
-    // CT-007 slice 5b.3-4a.1c: fresh batches now mint v2 for real, so the reservation amount covers
-    // the full parent-attempt*max_attempts budget (checkout job, production policy) instead of one
-    // v1 workload execution's ceiling. unified-wallet slice 2b: the amount is now the max micro-USD
-    // cost (raw 15_000 operational units × 10_000 µUSD/second).
     assert!(rows.iter().all(|(run_id, amount, state)| *amount == 150_000_000
         && state == "reserved"
         && run_id.starts_with("ci-reserve:v2:")));
 
-    // A later replay recovers the same authority even after lifecycle advancement; it does not
-    // create a second reservation or try to rewind settled work.
     sqlx::query(
         "UPDATE cost_reservation SET state = CASE run_id \
            WHEN $1 THEN 'inflight' ELSE 'settled' END WHERE tenant_id = 'personal'",
@@ -165,8 +150,6 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     assert_eq!(provider.reserve_batch(batch.clone()).await.unwrap(), first);
     assert_eq!(reservation_rows(&admin, "personal").await.len(), 2);
 
-    // Batch membership and order are part of the authority. Neither a strict subset nor a reorder
-    // may masquerade as an exact retry of the original complete batch.
     let subset_error = provider
         .reserve_batch(vec![batch[0].clone()])
         .await
@@ -183,16 +166,12 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     assert!(disjoint_error.0.contains("run authority diverged"));
     assert_eq!(reservation_rows(&admin, "personal").await.len(), 2);
 
-    // The job id is the durable idempotency identity. Changed immutable authority under that id
-    // refuses instead of allocating a second handle.
     let mut divergent = batch.clone();
     divergent[0].stage = "forged-stage".into();
     let error = provider.reserve_batch(divergent).await.unwrap_err();
     assert!(error.0.contains("run authority diverged"));
     assert_eq!(reservation_rows(&admin, "personal").await.len(), 2);
 
-    // One still-inflight reservation plus a fresh two-job batch exceeds a ceiling of two. The
-    // complete new batch is refused and leaves no rows.
     let tight = PgTierPCiJobBudgetReservation::new(
         runtime.clone(),
         "fr-par",
@@ -209,8 +188,6 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     assert!(error.0.contains("ceiling is exhausted"));
     assert_eq!(reservation_rows(&admin, "personal").await.len(), before);
 
-    // Different fresh runs contend under the same tenant ceiling. The advisory lock makes the
-    // capacity decision serial: exactly one complete two-job batch commits, never both.
     let race_provider = PgTierPCiJobBudgetReservation::new(
         runtime.clone(),
         "fr-par",
@@ -234,8 +211,6 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     assert_ne!(race_a_result.is_ok(), race_b_result.is_ok());
     assert_eq!(reservation_rows(&admin, "capacity-race").await.len(), 2);
 
-    // Force PostgreSQL to fail on the second INSERT. The provider's one transaction rolls the first
-    // INSERT back too; after the fault is removed, an ordinary retry commits both.
     let crash_tenant = "crash-proof";
     let crash_batch = vec![request(crash_tenant, 3, 5), request(crash_tenant, 3, 6)];
     admin
@@ -289,7 +264,6 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     );
     assert_eq!(reservation_rows(&admin, crash_tenant).await.len(), 2);
 
-    // The concrete runtime role sees only the transaction-scoped tenant through FORCE RLS.
     let visible: i64 = with_tenant_tx(&runtime, "personal", "fr-par", |conn| {
         Box::pin(async move {
             sqlx::query_scalar("SELECT count(*) FROM cost_reservation")
@@ -311,10 +285,6 @@ async fn tier_p_operational_reservation_is_atomic_retry_stable_and_bounded() {
     bootstrap.close().await;
 }
 
-/// CT-007 slice 5b.3-4a.1b: the active-reservation-ceiling COUNT must treat a durable `ci-reserve:v2:...`
-/// row as counting against the SAME tenant ceiling as `ci-reserve:v1:...` rows, even though this slice's
-/// writer still only ever mints `v1` handles. Manually insert one `v2`-shaped row to simulate a future
-/// writer, then prove a fresh `v1` batch request is refused once the ceiling is exhausted by it alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_v2_reservation_row_counts_toward_the_v1_batch_ceiling() {
     let schema = format!(
@@ -389,9 +359,6 @@ async fn a_v2_reservation_row_counts_toward_the_v1_batch_ceiling() {
     bootstrap.close().await;
 }
 
-/// CT-007 slice 5b.3-4a.1c: a run that already has durable `v1` rows must keep replaying `v1`
-/// exactly, even when the provider handling the retry is configured to WRITE `v2` for fresh
-/// batches -- durable precedence, not the provider's current write setting, decides what replays.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_existing_v1_batch_replays_unchanged_through_a_v2_writing_provider() {
     let schema = format!(
@@ -468,10 +435,6 @@ async fn an_existing_v1_batch_replays_unchanged_through_a_v2_writing_provider() 
     bootstrap.close().await;
 }
 
-/// CT-007 slice 5b.3-4a.1c: a `v2` batch written under one attempt policy must still replay
-/// correctly through a provider configured with a DIFFERENT policy -- replay recovers the policy
-/// from the durable handle's own descriptor, never from whatever the replaying provider is
-/// currently configured with.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v2_written_under_one_policy_replays_correctly_under_a_differently_configured_provider() {
     let schema = format!(
@@ -548,9 +511,6 @@ async fn v2_written_under_one_policy_replays_correctly_under_a_differently_confi
     bootstrap.close().await;
 }
 
-/// CT-007 slice 5b.3-4a.1c: a genuinely fresh `v2` write whose ceiling arithmetic overflows must
-/// leave zero durable rows -- `build_v2_candidates` computes the complete batch before any INSERT,
-/// so a single unrepresentable job refuses the whole batch atomically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn fresh_v2_overflow_leaves_zero_rows() {
     let schema = format!(
@@ -580,9 +540,6 @@ async fn fresh_v2_overflow_leaves_zero_rows() {
         .unwrap();
     let runtime = pinned_pool(&app_url(), &schema).await;
 
-    // Checkout job (4 executions/attempt) under production's 5-attempt policy: 20x the raw
-    // ceiling. mem_bytes = u64::MAX / 15 makes that 20x overflow u64 -- same fixture the unit
-    // tests use to trigger this exact overflow.
     let mut overflow_request = request("v2-overflow", 8, 40);
     overflow_request.limits.mem_bytes = u64::MAX / 15;
     overflow_request.limits.timeout_secs = 1;

@@ -1,21 +1,3 @@
-//! # The chained-e2e for the HITL withhold → surface → resume loop + the consumer CDCs for 9.4 / 4.4
-//! (AG-P9 → P-221)
-//!
-//! **Contract:** `planning/05-refined-shared-systems-architecture/contract-index.md` row 8.2 (the
-//! HITL GATE step completion — the `hitl_gate` state machine the `Gated` verdict resumes) +
-//! CONSUMES 9.4 (the durable HITL signal — `state=waiting` holds no runtime; an approval/cancel
-//! arrives hours/days later, re-leases + replays + consumes) + 4.4 (`list_subjects → SubjectTree`,
-//! the approver set). Owning architecture: `agent-fabric.md` §5.3 (withhold → surface → resume) +
-//! §4.4 (the `hitl_gate` table). Drill: AG-D5 (withhold/resume leg) — a gated tool is withheld
-//! (returns an error, does NOT mutate); the card shows action + risk + cost; approval resumes and
-//! applies; rejection halts; **0 mutations before approval**.
-//!
-//! This pairs the HITL machinery (this prompt) with the REAL `PlanThenApply` pipeline (AG-P6) so the
-//! chained loop is proven end-to-end against the same eight-step body the dispatch tier runs: a mock
-//! run proposes a gated effect → withheld (assert 0 mutation) → the workflow parks → an approval
-//! signal arrives → resume (the tool is threaded into `approved`) → a re-run APPLIES; then a
-//! rejection variant halts with the reason in the trace (0 mutation).
-
 use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSurface};
 use myelin_agent_service::{
     derive_approver_set, gate_id_of, run_hitl_loop, surface_card, ApplyError, ApprovedTools,
@@ -31,8 +13,6 @@ use myelin_storage::reserve_settle::MeteredUnit;
 use myelin_tenancy::{ArtifactRef, TenantId};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-
-// ───────────────────────── the REAL consumed seams (the pipeline providers) ─────────────────────
 
 struct Catalogue {
     defs: Vec<ToolDef>,
@@ -84,8 +64,6 @@ impl TenantGuard for PermitAll {
     }
 }
 
-/// The subsystem PUBLIC endpoint — the ONLY mutation path; records EVERY apply so the test can
-/// assert 0 mutation before approval.
 struct Endpoint {
     applied: RefCell<Vec<String>>,
 }
@@ -118,31 +96,17 @@ impl EffectBudget for Budget {
     }
 }
 
-// ───────────────────────── PROVIDER side: 9.4 the durable HITL wait ─────────────────────────
-
-/// **A REAL provider on the contract-9.4 durable HITL wait surface (the durable-workflow side).** It
-/// models the park-and-resume: it returns the scripted decision the human made days later (Approve /
-/// Reject / Expired). The CONSUMER is the agent fabric's [`run_hitl_loop`] threading the decision into
-/// the `hitl_gate` state machine. (The real `myelin-flow::approval::request_approval_and_wait` is the
-/// production provider; this scripted one proves the consumer drives the three decisions correctly.)
 struct ScriptedWait {
     decision: WaitDecision,
     parked: RefCell<Vec<String>>,
 }
 impl HitlWait for ScriptedWait {
     fn park_and_wait(&self, gate: &HitlGate) -> WaitDecision {
-        // record that the run PARKED on this gate (state=waiting holds no runtime) before the human
-        // decided — the wait is the durability seam; the worker is free while parked.
         self.parked.borrow_mut().push(gate.card_ref.clone());
         self.decision.clone()
     }
 }
 
-// ───────────────────────── PROVIDER side: 4.4 list_subjects (Identity) ─────────────────────────
-
-/// **A REAL provider on the contract-4.4 `list_subjects` surface (the Identity side).** Returns the
-/// approver userset for the gated object at the zookie snapshot. The CONSUMER ([`derive_approver_set`])
-/// reads its `members` as the `hitl_gate.approver_filter`.
 struct ProviderSubjects {
     members: Vec<PrincipalId>,
 }
@@ -161,8 +125,6 @@ impl ApproverSet for ProviderSubjects {
         }
     }
 }
-
-// ───────────────────────── fixtures ─────────────────────────
 
 fn agent() -> Principal {
     Principal::stub(
@@ -192,7 +154,6 @@ fn merge_tool() -> ToolDef {
         required_caps: vec!["git.merge".into()],
         effect_kind: EffectKind::Mutate,
         side_effecting: true,
-        // the frozen §6.3 default: git.merge requires_approval = yes.
         requires_approval: true,
         exposed_over_mcp: false,
     }
@@ -227,8 +188,6 @@ fn strong(z: &str) -> Consistency {
     }
 }
 
-/// Run the apply pipeline once for `plan` under the given `approved` set; returns the result + the
-/// total mutations recorded by the endpoint after the call.
 fn apply_once(
     cat: &Catalogue,
     endpoint: &Endpoint,
@@ -264,12 +223,6 @@ fn apply_once(
     (out, muts)
 }
 
-// ───────────────────────── the chained-e2e: withhold (0 mutation) → resume → apply ───────────────
-
-/// **CHAINED-E2E (AG-D5 withhold/resume leg): a gated effect is WITHHELD (0 mutation), the run PARKS
-/// on the durable wait, an APPROVAL arrives days later, the resume threads the tool into `approved`,
-/// and a re-run APPLIES — exactly once.** This is the full withhold → surface → resume loop composed
-/// with the REAL eight-step pipeline.
 #[test]
 fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
     let cat = Catalogue {
@@ -279,7 +232,6 @@ fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
         applied: RefCell::new(vec![]),
     };
 
-    // 1. WITHHOLD: a fresh run (empty `approved`) proposes the gated merge → the pipeline GATES it.
     let (result, muts_before) = apply_once(&cat, &endpoint, BTreeSet::new());
     let gate_id = gate_id_of(&result).expect("a requires_approval tool GATES (AG-8)");
     assert!(
@@ -288,10 +240,9 @@ fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
     );
     assert_eq!(
         muts_before, 0,
-        "0 MUTATIONS before approval (AG-D5 — the gated tool did NOT mutate)"
+        "0 MUTATIONS before approval (AG-D5 - the gated tool did NOT mutate)"
     );
 
-    // surface the card from the gate (action + risk + LIVE cost + approver set) — what the human sees.
     let subjects = ProviderSubjects {
         members: approvers(),
     };
@@ -307,7 +258,6 @@ fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
         "the approver set = list_subjects(object, approve_perm) (4.4)"
     );
 
-    // 2 + 3. SURFACE + DECIDE: the run PARKS on the durable wait (9.4); an APPROVAL arrives days later.
     let wait = ScriptedWait {
         decision: WaitDecision::Approve,
         parked: RefCell::new(vec![]),
@@ -324,7 +274,6 @@ fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
         &mut approved,
     );
 
-    // the run PARKED on the durable wait before the human decided (the worker was free, holds no runtime).
     assert_eq!(
         wait.parked.borrow().len(),
         1,
@@ -335,7 +284,6 @@ fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
         other => panic!("expected Approved, got {other:?}"),
     }
 
-    // 4. RESUME: the re-run with the now-populated `approved` set passes step 6 and APPLIES — once.
     let (result2, muts_after) = apply_once(&cat, &endpoint, approved.as_set());
     assert!(
         matches!(result2, EffectResult::Applied(_)),
@@ -347,9 +295,6 @@ fn chained_withhold_zero_mutation_then_approve_resumes_and_applies() {
     );
 }
 
-/// **CHAINED-E2E (AG-D5 rejection leg): a gated effect is WITHHELD, the run parks, a REJECTION
-/// arrives → `Halted::Rejected(reason)` (the reason rides into the trace + audit); a re-run still
-/// GATES (the tool was never approved) — 0 mutation across the whole flow (AG-8).**
 #[test]
 fn chained_withhold_then_reject_halts_with_reason_zero_mutation() {
     let cat = Catalogue {
@@ -359,13 +304,11 @@ fn chained_withhold_then_reject_halts_with_reason_zero_mutation() {
         applied: RefCell::new(vec![]),
     };
 
-    // WITHHOLD.
     let (result, _) = apply_once(&cat, &endpoint, BTreeSet::new());
     let gate_id = gate_id_of(&result).expect("gated");
 
-    // DECIDE → REJECT (days later).
     let wait = ScriptedWait {
-        decision: WaitDecision::Reject("merge not safe — failing checks".into()),
+        decision: WaitDecision::Reject("merge not safe - failing checks".into()),
         parked: RefCell::new(vec![]),
     };
     let mut approved = ApprovedTools::new();
@@ -380,13 +323,11 @@ fn chained_withhold_then_reject_halts_with_reason_zero_mutation() {
         &mut approved,
     );
 
-    // the rejection settles Halted::Rejected with the reason (recorded in the trace + audit).
     assert_eq!(
         outcome,
-        HitlOutcome::Halted(Halted::Rejected("merge not safe — failing checks".into())),
+        HitlOutcome::Halted(Halted::Rejected("merge not safe - failing checks".into())),
         "rejection settles Halted::Rejected with the reason"
     );
-    // the effect was NEVER threaded into `approved` → a re-run GATES again (never applies).
     assert!(
         !approved.contains_effect("git.merge", "myelin://acme/git/pr/42"),
         "a rejected gate never approves the effect (AG-8)"
@@ -394,14 +335,11 @@ fn chained_withhold_then_reject_halts_with_reason_zero_mutation() {
     let (result2, muts) = apply_once(&cat, &endpoint, approved.as_set());
     assert!(
         matches!(result2, EffectResult::Gated(_)),
-        "a rejected effect still GATES — never applies"
+        "a rejected effect still GATES - never applies"
     );
     assert_eq!(muts, 0, "0 MUTATIONS across the entire reject flow (AG-8)");
 }
 
-/// **CONSUMER CDC for 9.4 (the durable HITL wait) — the agent fabric consumes the three decisions a
-/// durable wait can resume with (Approve / Reject / Expired) and drives the `hitl_gate` state machine
-/// correctly for each.** The PROVIDER is the durable-workflow wait; the CONSUMER is [`run_hitl_loop`].
 #[test]
 fn cdc_9_4_consumer_drives_all_three_wait_decisions() {
     let plan = merge_plan();
@@ -449,8 +387,6 @@ fn cdc_9_4_consumer_drives_all_three_wait_decisions() {
     }
 }
 
-/// **CONSUMER CDC for 4.4 (`list_subjects`) — the approver set the HITL card carries is exactly the
-/// `list_subjects(object, approve_perm)` members at the run's zookie (the REAL Identity provider).**
 #[test]
 fn cdc_4_4_consumer_approver_set_is_list_subjects_members() {
     let subjects = ProviderSubjects {
@@ -464,7 +400,6 @@ fn cdc_4_4_consumer_approver_set_is_list_subjects_members() {
     );
     assert_eq!(set, approvers());
 
-    // the card the gate surfaces carries this approver set (who MAY decide) + the action + LIVE cost.
     let gate = HitlGate::open(
         myelin_agent::GateId("g".into()),
         "R1",

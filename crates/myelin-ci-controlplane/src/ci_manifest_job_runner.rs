@@ -1,9 +1,3 @@
-//! Exact manifest-job translation into the durable scheduler and sandbox.
-//!
-//! The workflow dispatch target is the manifest's immutable job UUID. This adapter preserves that
-//! UUID through `job_queue` and `ci_job_spec`, persists the stable token-authority handle without an
-//! expiring token, and translates every executable/scheduling field from the validated manifest.
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -39,14 +33,9 @@ use crate::{
     SecretBroker, SecretCapability, SecretLaunchError, WithheldSecret, WithholdReason,
 };
 
-/// Claim-time secret resolution port used by the real durable manifest launch reconstruction. The
-/// returned `JobSpec` is the only value allowed onward to the sandbox, so a withhold/error reaches the
-/// leased-job workflow as a material-free resolver refusal instead of becoming `BindingSetMismatch`.
 pub type CiJobSecretResolver =
     Arc<dyn Fn(&TenantId, JobSpec) -> Result<JobSpec, SecretLaunchError> + Send + Sync>;
 
-/// Material-free, stable diagnostic persisted for a terminal secret withhold. Secret names are
-/// validated manifest machine tokens and reasons come from the closed [`WithholdReason`] vocabulary.
 pub(crate) fn secret_withhold_machine_reason(withheld: &[WithheldSecret]) -> String {
     let mut reason = String::from("secret_withheld:");
     for (index, item) in withheld.iter().enumerate() {
@@ -60,8 +49,6 @@ pub(crate) fn secret_withhold_machine_reason(withheld: &[WithheldSecret]) -> Str
     reason
 }
 
-/// Fail-closed production fallback for a deployment with no composed secret-store capability. Empty
-/// jobs still receive a checked empty binding set; secret-bearing jobs are withheld observably.
 pub fn unavailable_ci_job_secret_resolver() -> CiJobSecretResolver {
     Arc::new(|_tenant, spec| {
         if spec.secret_refs.is_empty() {
@@ -86,9 +73,6 @@ pub fn unavailable_ci_job_secret_resolver() -> CiJobSecretResolver {
     })
 }
 
-/// Derive the ReBAC subject for one exact server-authorized CI job. The tenant-global signed
-/// `svc:ci` principal remains the credential issuer identity; secret authorization is deliberately
-/// narrowed to this immutable `(project_id, job_id)` pair.
 pub(crate) fn claim_secret_subject(
     tenant: &TenantId,
     context: &myelin_ci_sandbox::CiJobAuthorizationContext,
@@ -118,9 +102,6 @@ pub(crate) fn claim_secret_subject(
     ))
 }
 
-/// Adapt the real in-boundary broker to the durable CI launch port. The subject is rebuilt only from
-/// the server-resolved, non-persistable claim authorization context; a missing or cross-tenant
-/// context fails closed before the capability or Identity service is called.
 pub fn secret_broker_ci_job_resolver<C, I>(
     capability: Arc<C>,
     identity: Arc<I>,
@@ -149,8 +130,6 @@ where
     })
 }
 
-/// The production claim reconstruction's final step: attach the claim credential, then resolve the
-/// exact manifest-carried secret refs before the `JobSpec` can reach `RunnerAgent`.
 pub(crate) fn resolve_claim_launch_secrets(
     tenant: &TenantId,
     template: SandboxJobSpecTemplate,
@@ -164,9 +143,6 @@ pub(crate) fn resolve_claim_launch_secrets(
     )
 }
 
-/// Owned, retry-stable authority request for one exact live scheduler claim. The epoch + nonce are
-/// the activity generation: acknowledgement-loss retries reuse it, while a reaper/new claim changes
-/// it and may legitimately remint after expiry.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiJobTokenRequest {
     pub tenant_id: String,
@@ -184,12 +160,9 @@ pub struct CiJobTokenRequest {
     pub claim_expires_at_epoch_secs: i64,
 }
 
-/// A token authority refusal. The detail must be structural and safe to journal as an activity
-/// failure; token material is never returned through this error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiJobTokenIssueError(pub String);
 
-/// Maximum fail-static window accepted from Identity for a claim-bound CI credential.
 pub const MAX_CI_JOB_TOKEN_TTL_SECS: u64 = 300;
 
 impl CiJobTokenRequest {
@@ -223,11 +196,6 @@ impl CiJobTokenRequest {
                 .map_err(|_| {
                     CiJobTokenIssueError("claim lifetime is outside the supported range".into())
                 })?;
-        // CT-007 lease/topology reconciliation: the accepted ceiling is the CLAIM window's maximum
-        // (four executions at the job-timeout ceiling), not the one-execution lease TTL — a
-        // legitimately long checkout-bearing claim must not be refused here. The credential's own
-        // lifetime stays capped at `MAX_CI_JOB_TOKEN_TTL_SECS`; this bounds only the claim generation
-        // a credential may be bound to.
         if claim_lifetime > crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS {
             return Err(CiJobTokenIssueError(
                 "claim lifetime exceeds the production claim-window bound".into(),
@@ -245,10 +213,6 @@ impl std::fmt::Display for CiJobTokenIssueError {
 
 impl std::error::Error for CiJobTokenIssueError {}
 
-/// Explicit short-lived token mint. Implementations must be retry-safe for the complete request:
-/// repeated calls for the same claim generation resolve the same credential while its deterministic
-/// short token window is live and refuse after that window expires. A reaped and newly claimed job
-/// carries a new epoch/nonce and may receive a fresh token. There is no permissive default.
 pub trait CiJobTokenIssuer: Send + Sync {
     fn mint(
         &self,
@@ -256,9 +220,6 @@ pub trait CiJobTokenIssuer: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<RunTokenCredential, CiJobTokenIssueError>> + Send + '_>>;
 }
 
-/// Per-run durable adapter. The validated manifest is the sole source of executable and scheduling
-/// authority; the Flow spec contributes only the engine-minted idempotency token and exact job UUID
-/// target.
 pub struct CiManifestDurableJobRunner {
     manifest: Arc<CiDriveManifestV1>,
     store: CiJobSpecStore,
@@ -321,8 +282,6 @@ impl JobRunner for CiManifestDurableJobRunner {
     }
 }
 
-/// Register the strict resolver, manifest-native DAG, and exact durable queue-template writer as one
-/// production definition. Token minting belongs to the later live claim/launch boundary.
 pub fn register_durable_ci_manifest_pipeline(
     worker: &mut PgFlowWorker,
     resolver: CiManifestInputResolver,
@@ -389,18 +348,6 @@ fn manifest_dispatch_parts(
             cpu_millis: job.limits.cpu_millis,
             mem_bytes: job.limits.mem_bytes,
             disk_bytes: job.limits.disk_bytes,
-            // NOTE (ResourceLimits split): mirrored from `disk_bytes`, NOT a new independent
-            // default, deliberately. Two reasons: (1) this is exactly the value that sized the
-            // `/tmp` tmpfs before the split, so mirroring it keeps runtime tmpfs sizing
-            // byte-for-byte unchanged; (2) `ci_runner_composition::manifest_matches_template`
-            // asserts `template.limits.disk_bytes == job.limits.disk_bytes` as a fail-closed
-            // dispatch invariant — giving `disk_bytes` here its own independent
-            // ephemeral-workspace default (as the manifest's declared value no longer directly
-            // sizes anything at runtime) would NOT break that invariant, since it only compares
-            // `disk_bytes`. But there is no manifest-carried tmpfs value to source
-            // `tmpfs_bytes` from, so mirroring `job.limits.disk_bytes` is the only
-            // behavior-preserving choice available without a manifest schema change (a later
-            // step, alongside actually wiring up the disk-backed workspace mount).
             tmpfs_bytes: job.limits.disk_bytes,
             pids_max: job.limits.pids_max,
             timeout_secs: job.limits.timeout_secs,
@@ -416,8 +363,6 @@ fn manifest_dispatch_parts(
         IdemToken(flow.idem_token.clone()),
     )
     .map_err(|error| ActivityError(error.to_string()))?;
-    // The immutable claim ceiling comes from the SAME template this dispatch persists, so
-    // `co_persist_dispatch`'s recomputation can only ever agree (it refuses fail-closed otherwise).
     let claim_window_secs = crate::ci_claim_window::claim_window_secs_for_template(&spec)
         .map_err(|error| ActivityError(error.to_string()))?;
     let enqueue = DurableEnqueue {
@@ -586,8 +531,6 @@ mod tests {
         };
         request.validate().unwrap();
 
-        // A legitimately long checkout-bearing claim is ACCEPTED up to the claim-window maximum, and
-        // refused one second past it. The one-execution lease TTL is no longer the bound here.
         let mut longest_legal = request.clone();
         longest_legal.claim_expires_at_epoch_secs = longest_legal.claim_started_at_epoch_secs
             + crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS as i64;
@@ -608,8 +551,6 @@ mod tests {
         assert!(malformed.validate().is_err());
     }
 
-    /// **The credential ceiling is unchanged by the longer claim window.** A 300-second token
-    /// remains the credential bound regardless of how long the generation it is bound to lives.
     #[test]
     fn the_token_ttl_ceiling_is_independent_of_the_claim_window() {
         assert_eq!(MAX_CI_JOB_TOKEN_TTL_SECS, 300);

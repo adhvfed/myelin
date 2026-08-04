@@ -1,21 +1,3 @@
-//! # CDC — the Knowledge Search feed (rows 6.3 declare_indexable + 6.1 query / 6.2 semantic)
-//!
-//! KN-P21 / P-311 (M3). This file carries BOTH the **provider** and **consumer** sides of the
-//! Knowledge search-feed seam (the coverage scanner requires both markers per file):
-//!
-//! - **6.3 `declare_indexable(IndexSpec)`** — Knowledge is the **PROVIDER** (it OWNS + declares its
-//!   page + db_row index specs, re-homed verbatim from `myelin-search`); Search is the **CONSUMER**
-//!   (it ADMITS them into a live indexer's per-tenant facet union).
-//! - **6.1 `query` / 6.2 `semantic`** — Search is the **PROVIDER** (the frozen permission-aware
-//!   engine that conjoins the `list_objects` `Filter` before scoring); Knowledge is the **CONSUMER**
-//!   (it drives `query`/`semantic` ALWAYS through the conjoining entry, pinned to the `page` object
-//!   type — the `search-requires-acl-filter` discipline; the KN-D5 re-confirm: a confidential page
-//!   appears in NEITHER the result NOR the COUNT, across the FT and the semantic/RAG paths).
-//!
-//! The point of a CDC is that PROVIDER and CONSUMER agree on the SAME shape: the spec Knowledge
-//! declares is byte-equal to the set Search admits, and the conjoin Knowledge routes through is the
-//! engine's frozen pre-filter (no parallel un-ACL'd path, EI-01 §7).
-
 use myelin_identity::{
     Consistency, ConsistencyMode, ListObjectsResult, Literal, ObjectId, ObjectType, Permission,
     Principal, PrincipalId, PrincipalKind, Result as AuthzResult, Zookie,
@@ -33,8 +15,6 @@ use myelin_search::{
 use myelin_tenancy::TenantId;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-// ─────────────────────────── shared fixtures ───────────────────────────
 
 fn viewer() -> Principal {
     Principal::stub(
@@ -69,8 +49,6 @@ fn semantic_ast(term: &str) -> QueryAst {
     .expect("within cost bounds")
 }
 
-/// The scripted `list_objects` port — the leak-free pre-filter the CONSUMER conjoins. Counts the
-/// calls (the no-N+1 GATE asserts exactly one per query).
 struct FakeAuthz {
     answer: ListObjectsResult,
     calls: AtomicU64,
@@ -111,11 +89,6 @@ fn schema() -> FieldSchema {
         .with(ORDER_KEY_FIELD, FieldDecl::stored(FieldType::OrderKey))
 }
 
-// ─────────────────────────── 6.3 declare_indexable ───────────────────────────
-
-/// **PROVIDER (6.3) — Knowledge OWNS + declares its index specs.** The owned set is the page +
-/// db_row specs (the block doc rides the page object type); it is byte-equal to the re-homed Search
-/// shape (no parallel second shape — EI-01 §7).
 #[test]
 fn provider_knowledge_declares_its_index_specs() {
     let specs: Vec<IndexSpec> = kn_declared_index_specs();
@@ -136,8 +109,6 @@ fn provider_knowledge_declares_its_index_specs() {
     }
 }
 
-/// **CONSUMER (6.3) — Search ADMITS the declared specs.** A live indexer takes the SAME declared set
-/// into its per-tenant facet union without a schema mismatch (the agreed shape both sides hold).
 #[test]
 fn consumer_search_admits_the_declared_specs() {
     let accepted = register_kn_index_specs();
@@ -146,7 +117,6 @@ fn consumer_search_admits_the_declared_specs() {
         kn_declared_index_specs(),
         "Search admits exactly the declared KN specs"
     );
-    // And a live indexer over the owned set opens (the facet union is consistent across the specs).
     let _ix = IncrementalIndexer::new(
         kn_declared_index_specs(),
         std::sync::Arc::new(NullFetcher),
@@ -166,10 +136,6 @@ impl myelin_search::ProjectFetcher for NullFetcher {
     }
 }
 
-// ─────────────────────────── 6.1 query / 6.2 semantic (the KN-D5 conjoin) ───────────────────────────
-
-/// Index a KN page corpus, projecting each page via [`feed_project`] (the `project` feed Search
-/// consumes off the bus — the PROVIDER text source, no DB read).
 fn kn_page_corpus() -> TantivyBackend {
     let mut be = TantivyBackend::open(&facet_decl()).expect("open");
     let mut upsert = |id: &str, body: &str| {
@@ -196,9 +162,6 @@ fn kn_page_corpus() -> TantivyBackend {
     be
 }
 
-/// **CONSUMER (6.1) — Knowledge drives `query` with the `list_objects` `Filter` ALWAYS conjoined;
-/// the PROVIDER (Search engine) conjoins it before scoring → a confidential page is in NEITHER the
-/// result NOR the COUNT (KN-D5 re-confirm, 0 leak incl. COUNT).** Pinned to the `page` object type.
 #[test]
 fn consumer_knowledge_query_conjoins_filter_no_count_leak() {
     let be = kn_page_corpus();
@@ -233,9 +196,6 @@ fn consumer_knowledge_query_conjoins_filter_no_count_leak() {
     );
 }
 
-/// **CONSUMER (6.2) — Knowledge drives `semantic`/RAG with the conjoin; the PROVIDER returns k
-/// VISIBLE neighbours (filter-during-traversal) → a confidential page never enters the candidate
-/// set (KN-D5 vector half, the agent-RAG path).** The query text is the exact secret-page text.
 #[test]
 fn consumer_knowledge_semantic_conjoins_filter() {
     let embedder = MockEmbeddingAdapter::new(16);
@@ -290,9 +250,6 @@ fn consumer_knowledge_semantic_conjoins_filter() {
     );
 }
 
-/// **The CONSUMER pins the conjoin to the agreed (object-type, permission) the PROVIDER expects.**
-/// Knowledge always `list_objects(viewer, knowledge.read, page)` — the `page` reachability the page
-/// + block docs are ACL'd under (a block is never more visible than its page).
 #[test]
 fn consumer_pins_the_agreed_object_type_and_permission() {
     assert_eq!(KN_SEARCH_OBJECT_TYPE, "page");

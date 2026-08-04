@@ -1,23 +1,3 @@
-//! **REF-P13 / P-162 — the bounded, cycle-safe recursive-CTE traverse (contract 5.3) provider +
-//! consumer CDC pair.**
-//!
-//! Contract 5.3 also names `traverse(root, rels, depth, viewer) -> [Path]` (OWNED by Refs, the
-//! hierarchy / dependency / impact walk). This CDC pair pins the **bounded + leak-free contract** the
-//! provider (Refs) promises and the consumers (the epic-tree view / the "everything transitively
-//! blocked_by this" impact panel) depend on:
-//!
-//! - **PROVIDER (Refs):** `traverse` returns a BOUNDED set of discovered nodes — the walk is depth-
-//!   capped (default 16), node-budgeted, and cycle-safe (a self-referential graph terminates and is
-//!   surfaced as a DIAGNOSTIC, never a hang). A request that exceeds the budget returns a PARTIAL
-//!   result + a `truncated` marker, NEVER an unbounded scan. The discovered set is permission-filtered
-//!   by ONE `list_objects` post-filter over the COLLECTED node set — a hop into an unreadable artifact
-//!   PRUNES that branch (the traversal is not a side-channel; 0 leak).
-//! - **CONSUMER (an impact / epic-tree renderer):** a renderer that lists the returned
-//!   [`TraverseNode`]s — it can render EVERY returned node WITHOUT a per-node permission re-check
-//!   (the provider already pruned the unreadable branches) AND it reads the `truncated` / `cycle_detected`
-//!   markers to render "… and more (truncated)" / "this dependency graph has a cycle" rather than
-//!   hanging or showing a misleadingly-complete tree. This is the load-bearing 5.3 traverse promise.
-
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{
     edge_builder::{edge_id, EdgeProjection, EdgeRow, RelClass},
@@ -62,13 +42,9 @@ fn link(proj: &EdgeProjection, source: &str, target: &str, rel: &str, class: Rel
     proj.upsert(&tenant(), &region(), row);
 }
 
-/// A trivial impact-tree renderer (the CONSUMER) — it renders every returned node and reads the
-/// bound/diagnostic markers WITHOUT re-checking permission. It returns the rendered node ids + the
-/// flags it surfaced to a human.
 struct ImpactRenderer;
 impl ImpactRenderer {
     fn render(&self, r: &TraverseResult) -> (Vec<String>, bool, bool) {
-        // The consumer trusts the provider's prune — no per-node check here.
         let ids: Vec<String> = r
             .nodes
             .iter()
@@ -78,9 +54,6 @@ impl ImpactRenderer {
     }
 }
 
-/// **PROVIDER + CONSUMER CDC — the epic-tree walk: the provider returns the bounded readable subtree;
-/// the consumer renders it without a re-check.** `epic → story1 → task1`, `epic → story2`. The
-/// viewer may view all; the renderer lists the discovered nodes.
 #[test]
 fn cdc_provider_returns_bounded_readable_subtree_consumer_renders() {
     let proj = EdgeProjection::new();
@@ -113,9 +86,6 @@ fn cdc_provider_returns_bounded_readable_subtree_consumer_renders() {
     assert!(!cycle, "no cycle in a tree");
 }
 
-/// **PROVIDER CDC — the leak-free promise: an unreadable hop is pruned, so the consumer can render
-/// without a per-node check.** `epic → secret-story → secret-task`: the viewer cannot view
-/// `secret-story`, so it AND `secret-task` are absent. The consumer never sees a node it should not.
 #[test]
 fn cdc_provider_prunes_unreadable_branch_consumer_never_sees_it() {
     let proj = EdgeProjection::new();
@@ -136,7 +106,6 @@ fn cdc_provider_prunes_unreadable_branch_consumer_never_sees_it() {
     );
     let t = Traverse::with_default_bounds(proj, AuthzVisibleIndex::new());
 
-    // the viewer may view ok-story (and secret-task in isolation) but NOT secret-story.
     let result = t.traverse(
         &tenant(),
         &region(),
@@ -160,12 +129,8 @@ fn cdc_provider_prunes_unreadable_branch_consumer_never_sees_it() {
     );
 }
 
-/// **PROVIDER + CONSUMER CDC — the cycle diagnostic + the truncated marker: the consumer reads them
-/// instead of hanging / over-claiming.** A cyclic graph terminates with `cycle_detected`; a too-deep
-/// chain terminates with `truncated`. The consumer surfaces both to a human.
 #[test]
 fn cdc_consumer_reads_cycle_and_truncated_markers() {
-    // a cycle.
     let cyclic = EdgeProjection::new();
     link(&cyclic, "A", "B", "blocks", RelClass::Lifecycle);
     link(&cyclic, "B", "A", "blocks", RelClass::Lifecycle);
@@ -185,7 +150,6 @@ fn cdc_consumer_reads_cycle_and_truncated_markers() {
         "the consumer is told the graph has a cycle (a diagnostic, not a hang)"
     );
 
-    // a too-deep chain.
     let deep = EdgeProjection::new();
     for i in 0..100 {
         link(

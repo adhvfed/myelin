@@ -5,21 +5,8 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-config is the env-driven CONFIG layer — the dev<->prod CONFIG SWAP seam (Stage 1).
-# It reads the standard-interface endpoints (DATABASE_URL, DATABASE_MIGRATION_URL, S3_*, REDIS_URL, NATS_URL,
-# MYELIN_REGION) from the environment so swapping the docker-compose dev stack for the
-# Scaleway (fr-par) prod backends is a config change, not a code change.
-#
-# It is a LEAF, ZERO-myelin-dep crate: it carries ONLY the parsed env contract (no client
-# deps), so the default `cargo build --workspace` stays DB-free. The real backend clients
-# (sqlx / aws-sdk-s3 / fred / async-nats) live behind the `integration` feature in the crates
-# that own the trait impls; this crate just hands them their endpoints. It is depended on by
-# the substrate/storage/events/identity tiers and depends on NOTHING in the myelin DAG, so it
-# introduces no cycle.
 [dependencies]
 
 [features]
 default = []
-# Carries no client deps of its own; the flag exists so consumers can express
-# `myelin-config/integration` uniformly when they enable their own real backends.
 integration = []

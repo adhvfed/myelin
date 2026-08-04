@@ -1,28 +1,3 @@
-//! # FLOW-D6 drill — the reserve/settle bookend on a runaway loop vs a depleting wallet (P-FLOW-16 → P-212)
-//!
-//! The headline drill the P-FLOW-16 GATE requires (testing-strategy FLOW-D6 + the F-6 extended
-//! assertion, durable-workflow §8): a **runaway agent loop** against a **depleting wallet** — a new
-//! spend-bearing activity (INCLUDING a `SCHEDULE_AND_RUN_JOB` dispatch) is **REFUSED at reserve when
-//! the wallet is exhausted** (the job never starts), and an **already-dispatched / in-flight job is
-//! NEVER interrupted** (it settles on completion). The green artifact (testing-strategy FLOW-D6):
-//! **reserve-refusal count > 0** AND the **in-flight-interrupt counter == 0**, dated. A red drill is
-//! information — never weaken it to pass (EI-01 §3).
-//!
-//! **What the runaway loop models:** an adversarial workflow body that keeps dispatching spend-bearing
-//! jobs in a loop (the §6.2 loop the budget self-limits). The wallet starts with budget for a FEW
-//! dispatches; the loop tries MANY. The reserve/settle bookend ([`myelin_flow::BudgetGate`]) admits the
-//! funded ones, marks them in-flight, and REFUSES the rest the moment the wallet is exhausted — the
-//! self-limiter (FLOW-D6 / AG-D11). The in-flight ones (already begun) settle normally; nothing is ever
-//! interrupted (the never-interrupt-in-flight invariant is structural — there is NO teardown path for
-//! an in-flight reservation, inherited from the Storage ledger, contract 11.7).
-//!
-//! **Rides the M0 failure-injection harness:** the [`myelin_harness::DependencyBreaker`]
-//! (`Dependency::Broker`, tenant-scoped — the SAME seam BUS-D4 / FLOW-D5 use) models the runaway
-//! condition (the loop is "broken open" — it keeps feeding itself). The drill asserts the survival
-//! signals via the M0 assertion library ([`myelin_harness::SignalSource`] / [`Predicate`]): the
-//! reserve-reject-rate (`> 0`) and the in-flight-interrupt count (`== 0`) — a typed green/red that is
-//! never a swallowed pass (EI-01 §3).
-
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
     BudgetGate, FlowTelemetry, JobKind, JobOutcome, JobRunner, JobSpec, RetryPolicy, SignalStore,
@@ -69,8 +44,6 @@ fn unit(wholesale: u64, markup: u64) -> MeteredUnit {
     }
 }
 
-/// A runner that ACCEPTS every dispatch (and counts them) — so the drill can prove the runner is
-/// called ONLY for the funded dispatches (the refused ones never reach it).
 #[derive(Default)]
 struct CountingRunner {
     calls: AtomicUsize,
@@ -82,13 +55,6 @@ impl JobRunner for CountingRunner {
     }
 }
 
-/// **FLOW-D6 — a runaway loop of spend-bearing ACTIVITIES against a depleting wallet: the exhausted
-/// wallet REFUSES new dispatches (refusal count > 0), the in-flight ones are NEVER interrupted (== 0).**
-///
-/// The loop tries 10 metered activities, each costing 100; the wallet holds 300 (room for 3). Activities
-/// 1-3 reserve + run + settle (drawing the wallet down); activities 4-10 are REFUSED at reserve (the
-/// activity closure never runs). The in-flight-interrupt counter stays 0 — no running activity was torn
-/// down. The green artifact: refusals = 7 (> 0), interrupts = 0.
 #[test]
 fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_interrupted() {
     let scope = Scope::Tenant(tenant());
@@ -97,11 +63,8 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
     let outbox = OutboxStore::new();
     let journal = WfJournal::new();
     let telemetry = FlowTelemetry::new();
-    // The depleting wallet: 300 minor-units = room for exactly THREE 100-unit dispatches.
     let gate = BudgetGate::new(Wallet::new(MicroUsd(300))).with_telemetry(telemetry.clone());
 
-    // (1) INJECT the runaway condition: the loop is "broken open" (it keeps feeding itself). The SAME
-    //     tenant-scoped Broker seam BUS-D4 / FLOW-D5 use.
     breaker.break_dependency(Dependency::Broker, scope.clone());
     assert!(
         breaker.is_broken(&Dependency::Broker, &scope),
@@ -124,13 +87,12 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
     )
     .with_budget(gate.clone());
 
-    // (2) DRIVE the runaway loop: 10 spend-bearing activities, each costing 100. The wallet funds 3.
     for _ in 0..10 {
         let ran_c = ran.clone();
         let res = ctx.metered_activity(
             RetryPolicy::default_policy(),
             MicroUsd(100),
-            vec![unit(70, 30)], // bill exactly 100 — full draw, no refund
+            vec![unit(70, 30)],
             move |_idem, _att| {
                 ran_c.fetch_add(1, Ordering::SeqCst);
                 Ok(vec![ArtifactRef("myelin://acme/agent/step".into())])
@@ -143,7 +105,6 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
         }
     }
 
-    // (3) ASSERT the green artifact via the M0 assertion library.
     assert_eq!(
         admitted, 3,
         "exactly 3 funded dispatches admitted (300 / 100)"
@@ -160,7 +121,6 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
     assert_eq!(gate.balance(), MicroUsd::ZERO, "the wallet is exhausted");
 
     let mut signals = SignalSource::new();
-    // reserve-reject count > 0 (the depleting wallet refused new dispatches) — the headline green.
     signals.set_scalar(
         myelin_harness::SignalName::ShedCount,
         telemetry.reserve_rejected() as i64,
@@ -168,7 +128,6 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
     signals
         .assert_signal(myelin_harness::SignalName::ShedCount, Predicate::Gte(1))
         .expect_green();
-    // the in-flight-interrupt counter == 0 (the headline zero — no running activity torn down).
     signals.set_scalar(
         myelin_harness::SignalName::CausalDepthFirings,
         gate.inflight_interrupt_count() as i64,
@@ -198,14 +157,6 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
     );
 }
 
-/// **FLOW-D6 (F-6 extended) — a runaway loop of `SCHEDULE_AND_RUN_JOB` DISPATCHES against a depleting
-/// wallet: the exhausted wallet REFUSES new dispatches (the runner is never called), the in-flight job
-/// is NEVER interrupted.**
-///
-/// The §8 assertion: reserve-at-dispatch fronts the long-park too. The loop tries 6 job dispatches,
-/// each reserving 200; the wallet holds 400 (room for 2). Dispatch 1-2 reserve + hand to the runner +
-/// settle on the buffered job.done; dispatch 3-6 are REFUSED at reserve (the runner is NEVER called).
-/// The in-flight-interrupt counter stays 0.
 #[test]
 fn drill_flow_d6_runaway_dispatch_loop_refused_when_exhausted_runner_never_called() {
     let scope = Scope::Tenant(tenant());
@@ -217,17 +168,13 @@ fn drill_flow_d6_runaway_dispatch_loop_refused_when_exhausted_runner_never_calle
     let signals_store = SignalStore::new();
     let telemetry = FlowTelemetry::new();
     let runner = CountingRunner::default();
-    // The depleting wallet: 400 = room for exactly TWO 200-unit dispatches.
     let gate = BudgetGate::new(Wallet::new(MicroUsd(400))).with_telemetry(telemetry.clone());
 
     let mut refused = 0u32;
     let mut completed = 0u32;
 
-    // We drive each dispatch on its OWN WfCtx (a fresh body-call) so each dispatch is the first command
-    // (command_id agent.run:0) — and pre-buffer its job.done so the funded ones COMPLETE (a fast job).
     for i in 0..6u32 {
         let run_id = format!("R{i}");
-        // Pre-buffer the job.done under the deterministic dispatch token for this run (a fast runner).
         let token = myelin_flow::job_idem_token(&run_id, "agent.run:0");
         signals_store.deliver(myelin_flow::SignalRow {
             tenant: tenant(),
@@ -259,7 +206,7 @@ fn drill_flow_d6_runaway_dispatch_loop_refused_when_exhausted_runner_never_calle
             &runner,
             None,
             MicroUsd(200),
-            vec![unit(120, 80)], // bill exactly 200 — full draw
+            vec![unit(120, 80)],
         );
         match res {
             Ok(JobOutcome::Completed { .. }) => completed += 1,

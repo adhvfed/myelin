@@ -1,12 +1,3 @@
-//! Immutable, canonical execution authority for replaying one durable CI workflow.
-//!
-//! A resolved run-plan snapshot is customer-authored input, not permission to launch. This module
-//! defines the server-authored boundary between those concerns: a versioned manifest containing the
-//! exact DAG, check attempts, workflow code pin, scheduling/resource grants, and opaque authority
-//! handles needed to reconstruct jobs after a crash. The canonical bytes are insert-only in
-//! PostgreSQL and are the only execution input a future production `ci.pipeline` body may trust.
-//! Secret values and minted token JTIs are structurally absent.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use myelin_ci_sandbox::ImageRef;
@@ -92,9 +83,6 @@ pub struct CiManifestSchedulingV1 {
     pub fair_key: String,
 }
 
-/// Policy-granted runtime terms for one concrete resolved job. Customer-authored DAG/image/command
-/// facts are deliberately absent: the starter copies those from the verified plan and combines them
-/// with this grant, so an authority adapter cannot rewrite the requested program while approving it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CiJobLaunchGrantV1 {
@@ -108,8 +96,6 @@ pub struct CiJobLaunchGrantV1 {
     pub token_authority_handle: String,
 }
 
-/// Complete server-side authority decision for a prepared run. There is intentionally no default
-/// constructor that grants work: a policy-aware adapter must return every concrete job grant.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CiLaunchAuthorityV1 {
@@ -118,8 +104,6 @@ pub struct CiLaunchAuthorityV1 {
     pub merge_waiter: Option<CiMergeWaiterV1>,
 }
 
-/// Server-granted, replayable job template. `token_authority_handle` is a stable minting authority;
-/// it is not a bearer token or JTI. `reserve_handle` names an existing budget reservation.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantedCiJobV1 {
@@ -142,17 +126,10 @@ pub struct GrantedCiJobV1 {
     pub continue_on_error: bool,
 }
 
-/// Frozen V1 mapping from an authored stage to the Git check-context name.
-///
-/// Provider is already a distinct key dimension, so V1 preserves the authored stage verbatim. Both
-/// dispatch's queued fact and the manifest-backed starter call this helper; a future namespace change
-/// therefore requires a new version here instead of silently splitting one check lifecycle in two.
 pub fn ci_check_context_v1(authored_stage: &str) -> String {
     authored_stage.to_owned()
 }
 
-/// Optional Git-owned merge-attempt waiter. Ordinary push/manual/schedule runs carry `None` and do
-/// not fabricate a merge idempotency token or signal target.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CiMergeWaiterV1 {
@@ -161,14 +138,12 @@ pub struct CiMergeWaiterV1 {
     pub required_contexts: Vec<String>,
 }
 
-/// Version-1 canonical manifest. Field order is part of the compact JSON wire.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CiDriveManifestV1 {
     pub schema_version: u32,
     pub tenant_id: String,
     pub region: String,
-    /// Server-owned project scope for every job and secret binding in this immutable manifest.
     pub project_id: String,
     pub wf_run_id: String,
     pub ci_run_id: String,
@@ -443,8 +418,6 @@ impl CiDriveManifestStore {
         Ok(digest)
     }
 
-    /// Scope-bound preflight lookup used to avoid invoking mutable policy for an already-authorized
-    /// immutable run. The starter repeats this lookup after locking the queued row.
     pub async fn load_by_identity(
         &self,
         wf_run_id: &str,
@@ -466,9 +439,6 @@ impl CiDriveManifestStore {
         Ok(loaded)
     }
 
-    /// Insert and exact-replay verify on a caller-owned transaction. This is the starter's co-commit
-    /// seam: attempt allocation, DAG ledger, manifest, workflow start, and run transition can share
-    /// one PostgreSQL commit.
     pub async fn insert_on_conn(
         &self,
         connection: &mut PgConnection,
@@ -504,10 +474,6 @@ impl CiDriveManifestStore {
         Ok(digest)
     }
 
-    /// Read and cryptographically verify an existing immutable manifest on a caller-owned
-    /// transaction. The exact queued-run starter uses this before allocating attempts, so repairing
-    /// a lifecycle split reuses the original per-context values even if a newer run has since
-    /// advanced the shared check counters.
     pub async fn load_by_identity_on_conn(
         &self,
         connection: &mut PgConnection,
@@ -546,9 +512,6 @@ impl CiDriveManifestStore {
         Ok(Some((manifest, digest)))
     }
 
-    /// Resolve the immutable launch authority from the workflow-run id on a caller-owned
-    /// transaction. Terminal accounting uses this to bind the Flow run to its CI run-of-record and
-    /// to verify the dispatched job's reservation handle against the original server grant.
     pub async fn load_by_wf_run_on_conn(
         &self,
         connection: &mut PgConnection,
@@ -696,8 +659,6 @@ async fn scope_connection(
         .execute(&mut *connection)
         .await
         .map_err(|error| database("scope tenant", error))?;
-    // @tenant-cross-scope: this sets the second half of the already tenant-scoped session context;
-    // PostgreSQL's region setting has no tenant column or second value to bind.
     sqlx::query("SELECT set_config('myelin.region', $1, true)")
         .bind(&region.0)
         .execute(&mut *connection)

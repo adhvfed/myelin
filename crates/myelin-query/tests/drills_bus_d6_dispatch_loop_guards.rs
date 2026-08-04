@@ -1,26 +1,3 @@
-//! # BUS-D6 (F9) — the self-triggering automation loop drill (EB-23 / P-143)
-//!
-//! **Drill catalogue:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` row BUS-D6
-//! ("Self-triggering automation → depth ceiling + shared-root tripwire trip the per-tenant
-//! breaker", gate: **halts ≤ ceiling; breaker trips**) — architecture §8 D-6 / §4.7; AG-6.
-//!
-//! ## What this drill proves (the EB-23 GATE)
-//! An adversarial **self-triggering** reactive chain — an agent whose dispatched action emits an
-//! event that would re-trigger the SAME agent on the SAME causal root — is HALTED by TWO structural
-//! guards, with NO weakened threshold:
-//! 1. **The causal-depth ceiling (default 12).** A chain that deepens (`depth = parent + 1` each
-//!    hop) is PARKED once it reaches the ceiling — it halts at `≤ ceiling`, it does NOT recurse
-//!    unboundedly. We drive a chain that deepens and assert the dispatch parks at the ceiling.
-//! 2. **The shared-causal-root tripwire.** A storm that stays UNDER the depth ceiling but fans out
-//!    WIDE on one `correlation_id` trips the **per-tenant circuit breaker** once it exceeds `K`;
-//!    every further dispatch for that tenant is shed (`429 + Retry-After`).
-//!
-//! The verdict is read off the FROZEN §10.2 harness survival signals (the EB-11 deviation bridge:
-//! the dispatch tier owns the *measurement*, the harness owns the *assertion vocabulary*):
-//! `CausalDepthFirings` (the ceiling/tripwire fired, asserted `>= 1`), `BreakerState` (open = 2,
-//! asserted `== 2` for the storming tenant), and `DispatchPoolDrops` / `ShedCount{lane=agent}`
-//! (the storm shed, asserted `>= 1`). All exact — never weakened.
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EventEnvelope, EventId,
     EventType, Timestamp, Visibility,
@@ -34,8 +11,6 @@ use myelin_query::{
 use myelin_tenancy::{Region, TenantId};
 
 fn principal(id: &str) -> Principal {
-    // Kind is irrelevant to the depth/tripwire guards (the self-guard compares principal_id, not
-    // kind); `Human` keeps the fixture simple (the struct-variant `Agent` needs runtime_ref).
     Principal::stub(
         PrincipalId(id.into()),
         PrincipalKind::Human,
@@ -43,8 +18,6 @@ fn principal(id: &str) -> Principal {
     )
 }
 
-/// One event in the self-triggering chain: actor `actor`, the next artifact_ref the chain re-fires
-/// on, at causal `depth`, on the shared root `correlation`.
 fn chain_event(actor: &str, n: u64, depth: u32, correlation: &str) -> EventEnvelope {
     EventEnvelope {
         event_id: EventId(format!("ev:{n}")),
@@ -72,17 +45,12 @@ fn chain_event(actor: &str, n: u64, depth: u32, correlation: &str) -> EventEnvel
 fn req(ev: EventEnvelope, n: u64) -> DispatchRequest {
     DispatchRequest {
         event: ev,
-        // The dispatching consumer is a DIFFERENT agent than the chain's actor, so the self-guard
-        // does not short-circuit this drill — we exercise the depth/tripwire guards specifically.
         agent: PrincipalId("dispatcher-agent".into()),
         run_ref: format!("run-{n}"),
         trigger: TriggerKind::Automation,
     }
 }
 
-/// Bridge the dispatch tier's measured loop-guard telemetry into the FROZEN §10.2 harness signal
-/// vocabulary (the EB-11 deviation bridge). The tier owns the measurement; the harness owns the
-/// assertion. `breaker_open` encodes the §10.2 numeric breaker state (open=2, closed=0).
 fn bridge(src: &mut SignalSource, firings: i64, breaker_open: bool, sheds: i64) {
     src.set_scalar(SignalName::CausalDepthFirings, firings);
     src.set_labelled(
@@ -98,15 +66,11 @@ fn bridge(src: &mut SignalSource, firings: i64, breaker_open: bool, sheds: i64) 
     );
 }
 
-/// **BUS-D6 LEG 1 — the causal-depth ceiling halts a deepening self-trigger at ≤ ceiling.**
 #[test]
 fn bus_d6_depth_ceiling_halts_a_deepening_chain_at_the_ceiling() {
-    let gate = InMemoryCostGate::new(0); // cost 0 — isolate the depth guard from the balance gate
+    let gate = InMemoryCostGate::new(0);
     let mut tier = DispatchTier::new(RecordingTarget::new(), gate);
 
-    // Drive a self-triggering chain that deepens by 1 each hop, starting BELOW the ceiling. Each
-    // dispatched action is depth = parent + 1 (nested causality), so the chain climbs until the
-    // trigger reaches the ceiling and the dispatch PARKS.
     let mut parked_at: Option<u32> = None;
     let mut dispatched = 0u64;
     for depth in (CAUSAL_DEPTH_CEILING - 3)..=(CAUSAL_DEPTH_CEILING + 1) {
@@ -118,7 +82,6 @@ fn bus_d6_depth_ceiling_halts_a_deepening_chain_at_the_ceiling() {
         ) {
             Disposition::Delivered { action } => {
                 dispatched += 1;
-                // The dispatched action is strictly deeper than its trigger (nested, never flat).
                 assert_eq!(action.depth, depth + 1);
             }
             Disposition::DepthCeilingParked { depth: d } => {
@@ -143,7 +106,6 @@ fn bus_d6_depth_ceiling_halts_a_deepening_chain_at_the_ceiling() {
         "the chain halted in a bounded number of hops, not unboundedly"
     );
 
-    // The §10.2 survival signal reads the ceiling fired.
     let mut src = SignalSource::new();
     bridge(
         &mut src,
@@ -155,12 +117,8 @@ fn bus_d6_depth_ceiling_halts_a_deepening_chain_at_the_ceiling() {
         .expect_green();
 }
 
-/// **BUS-D6 LEG 2 (the headline) — the shared-causal-root tripwire trips the per-tenant breaker.**
 #[test]
 fn bus_d6_shared_root_tripwire_trips_the_per_tenant_breaker_and_sheds() {
-    // K = 5 so the trip is forced in a handful of events (the SAME structural code as K=64). A
-    // wide storm on ONE root, all UNDER the depth ceiling (depth 1) — the depth guard does NOT fire,
-    // only the tripwire. Generous balance + cap so only the tripwire is the limiter.
     let gate = InMemoryCostGate::new(0);
     let mut tier = DispatchTier::with_limits(RecordingTarget::new(), gate, 100, 5, 100_000);
     let t1 = TenantId("t1".into());
@@ -168,7 +126,7 @@ fn bus_d6_shared_root_tripwire_trips_the_per_tenant_breaker_and_sheds() {
 
     let mut shed = 0u64;
     for n in 0..20u64 {
-        let ev = chain_event("loop-agent", n, 1, root); // depth 1 — under the ceiling
+        let ev = chain_event("loop-agent", n, 1, root);
         match tier.dispatch(
             &req(ev, n),
             || EventId(format!("act-{n}")),
@@ -186,8 +144,6 @@ fn bus_d6_shared_root_tripwire_trips_the_per_tenant_breaker_and_sheds() {
         }
     }
 
-    // GATE: the breaker tripped (exactly once), the over-K root crossed the tripwire, and the
-    // post-trip dispatches were shed — halts (the storm bounded), breaker trips.
     assert!(tier.breaker_open(&t1), "the per-tenant breaker is OPEN");
     assert_eq!(
         tier.telemetry().tripwire_firings,
@@ -203,7 +159,6 @@ fn bus_d6_shared_root_tripwire_trips_the_per_tenant_breaker_and_sheds() {
         "post-trip dispatches were shed (the storm halted)"
     );
 
-    // The §10.2 survival signals read the verdict: tripwire fired, breaker OPEN, lane shed.
     let mut src = SignalSource::new();
     bridge(
         &mut src,
@@ -227,13 +182,11 @@ fn bus_d6_shared_root_tripwire_trips_the_per_tenant_breaker_and_sheds() {
     .expect_green();
 }
 
-/// **BUS-D6 isolation — the breaker is PER-TENANT: a storm in t1 does not break t2.**
 #[test]
 fn bus_d6_breaker_is_per_tenant_blast_radius_limited() {
     let gate = InMemoryCostGate::new(0);
     let mut tier = DispatchTier::with_limits(RecordingTarget::new(), gate, 100, 3, 100_000);
 
-    // Storm t1's root until it trips.
     for n in 0..10u64 {
         let ev = chain_event("loop-agent", n, 1, "root-t1");
         let _ = tier.dispatch(
@@ -244,7 +197,6 @@ fn bus_d6_breaker_is_per_tenant_blast_radius_limited() {
     }
     assert!(tier.breaker_open(&TenantId("t1".into())));
 
-    // A t2 event (different tenant) is NOT shed by t1's breaker — it dispatches normally.
     let mut t2 = chain_event("other-agent", 99, 1, "root-t2");
     t2.tenant = TenantId("t2".into());
     let disp = tier.dispatch(

@@ -1,12 +1,3 @@
-//! Live Valkey cache integration test (Stage 1 / infra).
-//!
-//! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-storage --features integration --test integration_cache -- --nocapture
-//!
-//! Proves the cache tier (Valkey, the Cache seam in cache.rs) is reachable through REDIS_URL:
-//! set a per-tenant-namespaced key with a TTL, read it back, delete it, confirm the miss.
 #![cfg(feature = "integration")]
 
 use fred::prelude::*;
@@ -23,7 +14,6 @@ async fn valkey_cache_roundtrip() {
         .await
         .expect("connect to Valkey (is the stack up?)");
 
-    // The same per-tenant namespacing the InMemoryCache uses: {tenant}:{key}.
     let suffix = std::process::id();
     let key = format!("tenantA:stage1-probe-{suffix}");
 

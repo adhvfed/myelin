@@ -1,75 +1,3 @@
-//! **CI Trigger & Dispatch: definition resolution → content-addressed snapshot + the reserve/start
-//! handoff (CI-P11 / P-354, M4).**
-//!
-//! **Owning architecture doc (byte-authoritative):**
-//! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
-//! §1 steps 4–5 (definition resolution → CAS snapshot, then the reserve+start handoff) + §7.4 (the
-//! config grammar: a declarative JSON-schema'd core, the bounded `QueryAst` for expressions, and the
-//! **sandboxed dynamic-generation escape hatch** for programmatic fan-out — "run code to compute the
-//! pipeline" inherits the SAME sandbox isolation as any other untrusted code, NO privileged
-//! config-eval path); `03-events-contracts-and-glue.md` §1.2 (`ci.run.started` carries
-//! `trust_tier` / `trigger_kind` / the CAS snapshot ref) + §1.1 / §4 (the first `ci.check.updated`
-//! `{state: queued}` per context, the X-1 seam) + §3 (every `ci.*` event drafted into the outbox in
-//! the SAME tx as the state change — `OutboxTx::emit`, contract 2.2, no `publish_now`).
-//!
-//! **Contracts consumed (implemented to the FROZEN shapes; never re-defined):**
-//! - **11.2** [`myelin_storage::BlobStore`] — the resolved DAG is written as a T2 content-addressed
-//!   CAS blob (BLAKE3 address = the run's reproducible, auditable definition). REUSED, not a new
-//!   store (EI-01 §7).
-//! - **9.1** [`myelin_flow::DurableExecutor::start`] / [`myelin_flow::StartSpec`] — the reserve+start
-//!   handoff hands `StartSpec{ wf_type: "ci.pipeline", input: [snapshot_ref], .. }` to the durable
-//!   executor (the workflow BODY is CI-P15 / `myelin_flow::ci_pipeline`; here dispatch only starts
-//!   it). The `idem_key` makes a re-delivered trigger ONE run, never two.
-//! - **2.2** [`myelin_events::OutboxTx::emit`] — the ONLY sanctioned emit path: this module BUILDS
-//!   the `ci.run.started` + the queued-`ci.check.updated` [`EventDraft`]s; the live consumer emits
-//!   them via the outbox in the SAME tx as the `ci_run` write (no `publish_now`, the `no-raw-publish`
-//!   lint). The drafts are constructed here so the atomic bundle is one testable unit.
-//!
-//! ## The two halves this module owns
-//!
-//! ### 1. Definition resolution → the content-addressed snapshot (the supply-chain floor)
-//! [`resolve_snapshot`] reads a parsed `.myelin/ci.*` [`CiDefinition`], validates it (a non-empty,
-//! acyclic job DAG), **expands the matrix DETERMINISTICALLY** (lexicographic over the sorted
-//! axis-key→value cross-product, so the snapshot is byte-identical for the same input — the
-//! reproducibility floor, VISION §3), and **resolves every image reference TO A DIGEST, FAIL-CLOSED
-//! on a floating tag** (`alpine:3` is REJECTED; `alpine@sha256:<hex>` passes — the
-//! poisoned-pipeline-execution supply-chain control, EI-01 §3 / arch 02 §5.3). It then serialises the
-//! resolved DAG to **canonical JSON** and writes it as a CAS blob (T2, contract 11.2). The returned
-//! [`ResolvedSnapshot`] + its [`ContentHash`] address ARE the run's reproducible definition — IDENTICAL
-//! to the `myelin ci plan` output (shift-left: `validate`/`plan` are pure, no runner spend).
-//!
-//! The digest-pin check REUSES the already-frozen [`myelin_ci_sandbox::ImageRef::digest_pinned`]
-//! rule — NOT a second digest grammar. **The actual tag→digest registry resolution is CI-P23**
-//! (`digest-pin-or-fail-closed` + sigstore verify, supply-chain trust CI-D4); CI-P11 enforces the
-//! fail-closed half at PLAN time (an un-digested reference never reaches a snapshot — 0 floating tags
-//! pinned). State this floor.
-//!
-//! ### 2. The reserve+start handoff (atomic, one tx)
-//! [`reserve_and_start`] takes the snapshot ref + the run facts (the trust stamp from CI-P10's
-//! [`crate::dispatch::stamp_trust`], the trigger kind, the per-context check seam) and produces a
-//! [`StartHandoff`]: the [`StartSpec`] for the `ci.pipeline` workflow (9.1) AND the atomic bundle the
-//! live consumer writes in ONE transaction — the [`CiRunWrite`] row + the [`EventDraft`]s for
-//! `ci.run.started` and the first `ci.check.updated{state: queued}` per context (via the outbox,
-//! 2.2). The atomicity invariant ([`StartHandoff::is_atomic_bundle`]) is the GATE: a row with NO
-//! queued check, or a `ci.run.started` with NO ci_run row, is a partial run — REFUSED by construction
-//! (the bundle is one value the consumer commits together).
-//!
-//! ## FLOOR named (the prompt DoD)
-//! - **The sandboxed dynamic-generation escape hatch** (arch 02 §7.4): [`CiDefinition`] models a
-//!   generator as [`JobDef::kind`] = [`JobKind::Generate`], but [`resolve_snapshot`] currently
-//!   refuses it. The shared execution contract cannot ingest and re-resolve emitted fragments yet,
-//!   so persisting an apparently executable generator plan would be dishonest. Generator execution,
-//!   fragment ingestion, and re-dispatch remain the named CI-P15 follow-on; there is no privileged
-//!   config-evaluation path in the meantime.
-//! - **The tag→digest registry resolution** (the real lookup + sigstore verify): CI-P23 (CI-D4).
-//!   CI-P11 enforces the fail-closed PLAN-time half only.
-//!
-//! ## DB-free by default
-//! `cargo build`/`cargo test --workspace` stay DB-free: the resolver uses the in-memory
-//! [`myelin_storage::FsBlobStore`]-compatible `BlobStore` trait (the unit tests drive an in-memory
-//! blob store), and the reserve/start uses the in-memory [`FlowExecutor`](myelin_flow::FlowExecutor).
-//! The CAS-snapshot round-trip against the LIVE dev-stack object store is the named integration test.
-
 use std::collections::{BTreeMap, BTreeSet};
 
 use myelin_ci_sandbox::ImageRef;
@@ -83,14 +11,10 @@ pub use myelin_ci_controlplane::{
     StructuredBuildToolV1, StructuredBuildV1,
     VersionedResolvedRunPlan as VersionedResolvedSnapshot,
 };
-/// Legacy V1 job alias retained for source compatibility.
 pub type ResolvedJob = ResolvedJobV1;
-/// Legacy V1 snapshot alias retained for source compatibility.
 pub type ResolvedSnapshot = ResolvedRunPlanV1;
 
-/// Dispatch compatibility helpers for the shared resolved-plan wire.
 pub trait ResolvedSnapshotExt {
-    /// Whether the authored plan contains a dynamic generator node.
     fn has_dynamic_generation(&self) -> bool;
 }
 
@@ -113,52 +37,24 @@ use myelin_ci_sandbox::events::CI_RUN_STARTED;
 
 use crate::dispatch::{OnTrigger, TrustStamp};
 
-// =================================================================================================
-// 1. The parsed `.myelin/ci.*` definition (the config-as-code core, arch 02 §7.4).
-// =================================================================================================
-
-/// The kind of a job in a CI definition (arch 02 §7.4). Two kinds matter at resolution:
-/// - [`JobKind::Normal`] — an ordinary build/test/deploy step running a digest-pinned image.
-/// - [`JobKind::Generate`] — the **sandboxed dynamic-generation escape hatch**: a job that *emits* a
-///   pipeline fragment for genuinely programmatic fan-out. It is a NORMAL job in every other respect
-///   (digest-pinned image, runs on the CI-P3 runner, the SAME sandbox as any untrusted code — NO
-///   privileged config-eval path). The type reserves the authored contract, while
-///   [`resolve_snapshot`] refuses generator plans until CI-P15 supplies sandbox execution, fragment
-///   ingestion, and re-dispatch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JobKind {
-    /// An ordinary build/test/deploy job.
     Normal,
-    /// The dynamic-generation escape hatch: a job that emits a pipeline fragment (programmatic
-    /// fan-out), running in the same sandbox as any untrusted code (arch 02 §7.4).
     Generate,
 }
 
-/// One job in a parsed CI definition (arch 02 §7.4). `image` is the RAW reference as authored — it
-/// may be a floating tag (`alpine:3`) at parse time; [`resolve_snapshot`] is where it is resolved to
-/// a digest fail-closed. `needs` is the DAG edge set (the names this job depends on).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobDef {
-    /// The job name (unique within the definition — the DAG node id).
     pub name: String,
-    /// The RAW image reference as authored (may be a floating tag — resolved fail-closed later).
     pub image: String,
-    /// Exact executable argv. Dispatch never infers a shell or fallback command.
     pub command: Vec<String>,
-    /// Optional structured build recipe. It is valid only on the V2 authored contract and is
-    /// lowered by the control-plane into a platform-owned direct invocation.
     pub build: Option<StructuredBuildV1>,
-    /// The names this job depends on (the DAG edges — every name must exist in the definition).
     pub needs: Vec<String>,
-    /// The job kind — [`JobKind::Generate`] marks the sandboxed dynamic-generation escape hatch.
     pub kind: JobKind,
-    /// The optional matrix axes (axis key → the ordered list of values). Empty == a single job
-    /// instance. The cross-product is expanded DETERMINISTICALLY in [`resolve_snapshot`].
     pub matrix: BTreeMap<String, Vec<String>>,
 }
 
 impl JobDef {
-    /// A normal (non-matrix, non-generate) job over `image`.
     pub fn normal(
         name: impl Into<String>,
         image: impl Into<String>,
@@ -175,40 +71,31 @@ impl JobDef {
         }
     }
 
-    /// Replace the free-form command with a platform-invoked structured build recipe.
     pub fn with_structured_build(mut self, build: StructuredBuildV1) -> JobDef {
         self.command.clear();
         self.build = Some(build);
         self
     }
 
-    /// Mark this job's `needs` (the DAG edges).
     pub fn with_needs(mut self, needs: impl IntoIterator<Item = impl Into<String>>) -> JobDef {
         self.needs = needs.into_iter().map(Into::into).collect();
         self
     }
 
-    /// Mark a matrix axis on this job (axis key → ordered values).
     pub fn with_matrix(mut self, key: impl Into<String>, values: Vec<String>) -> JobDef {
         self.matrix.insert(key.into(), values);
         self
     }
 
-    /// Mark this job as the dynamic-generation escape hatch ([`JobKind::Generate`]).
     pub fn as_generator(mut self) -> JobDef {
         self.kind = JobKind::Generate;
         self
     }
 }
 
-/// A parsed `.myelin/ci.*` definition (arch 02 §7.4 config-as-code core). The triggering event
-/// (`on:`) compiles to the ONE `QueryAst` (CI-P10's [`compile_trigger`](crate::dispatch::compile_trigger));
-/// the jobs are the DAG [`resolve_snapshot`] content-addresses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiDefinition {
-    /// The armed trigger (the `on:` block — compiled to the one `QueryAst`, CI-P10).
     pub on: OnTrigger,
-    /// The jobs (the DAG). MUST be non-empty + acyclic — validated in [`resolve_snapshot`].
     pub jobs: Vec<JobDef>,
 }
 
@@ -218,14 +105,10 @@ pub enum CiPlanContract {
     V2(CiExecutionRequestV1),
 }
 
-/// A parsed definition paired with its authored wire contract.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VersionedCiDefinition {
-    /// Versioned authored request contract. V2 still carries no server launch authority.
     pub contract: CiPlanContract,
-    /// The armed trigger.
     pub on: OnTrigger,
-    /// The authored DAG.
     pub jobs: Vec<JobDef>,
 }
 
@@ -247,90 +130,48 @@ impl VersionedCiDefinition {
     }
 }
 
-// =================================================================================================
-// 2. Resolution → the content-addressed snapshot.
-// =================================================================================================
-
-/// Why a definition fails to resolve (fail-closed — arch 02 §7.4 / EI-01 §3). LOUD, never silently
-/// coerced into a degraded snapshot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolveError {
-    /// The definition has no jobs — an empty pipeline is rejected (nothing to run).
     EmptyDefinition,
-    /// A job's image is NOT digest-pinned — a FLOATING TAG is rejected fail-closed (the
-    /// supply-chain control; the real tag→digest registry resolution is CI-P23). Carries the
-    /// offending job + reference for a self-describing error.
     FloatingTag {
-        /// The job whose image was a floating tag.
         job: String,
-        /// The un-digested reference that was refused.
         reference: String,
     },
-    /// Two jobs share a name — the DAG node ids must be unique.
     DuplicateJob(String),
-    /// A `needs` edge names a job that does not exist in the definition (a dangling DAG edge).
     UnknownNeed {
-        /// The job carrying the dangling edge.
         job: String,
-        /// The non-existent name it depends on.
         need: String,
     },
-    /// A job names itself as a dependency.
     SelfNeed(String),
-    /// A job repeats the same dependency instead of declaring a set.
     DuplicateNeed { job: String, need: String },
-    /// The job DAG has a cycle (it is not a DAG) — a run could never make progress.
     Cyclic,
-    /// The CAS blob write failed (the snapshot could not be content-addressed) — surfaced, never
-    /// swallowed (the snapshot is the run's definition; no snapshot ⇒ no start).
     BlobWrite(myelin_storage::BlobError),
-    /// **The matrix cross-product exceeds [`MAX_TOTAL_MATRIX_INSTANCES`] (peer-review finding
-    /// 2026-07-16 #10 — resource-limit fail-closed).** `expand_matrix` materializes the full axis
-    /// cross-product; an unbounded config (e.g. ~8 axes × ~10 values) would OOM the dispatch consumer
-    /// on a SINGLE untrusted push. The instance count is computed with SATURATING arithmetic BEFORE any
-    /// expansion, so an astronomical product is refused without allocating it. Carries the offending
-    /// count + the cap for a self-describing error.
     MatrixTooLarge {
-        /// The total (or running) resolved-instance count that tripped the cap (saturating).
         count: usize,
-        /// The enforced ceiling ([`MAX_TOTAL_MATRIX_INSTANCES`]).
         cap: usize,
     },
-    /// The resolved versioned plan violated the shared execution-boundary contract.
     InvalidPlan(String),
-    /// Two expanded jobs resolved to the same concrete machine-token node name.
     ConcreteNameCollision(String),
-    /// A structured Cargo build was authored but the repository's root `Cargo.lock` could not be
-    /// materialized at the pushed ref — the offline vendor tree cannot be selected without it, so the
-    /// build is refused fail-closed (an offline `cargo build --locked` with no lock is unbuildable).
     CargoVendorLockMissing,
-    /// The repository's root `Cargo.lock` at the pushed ref matches NO registered, server-trusted
-    /// Cargo vendor tree — the structured build is refused fail-closed rather than mounting an
-    /// unregistered or default vendor. Carries the offending lock SHA-256 for a self-describing error.
     CargoVendorUnmatched { lock_sha256: String },
 }
 
-/// **The hard ceiling on the total number of matrix-expanded job instances a single CI definition may
-/// resolve to (peer-review finding #10 — DoS floor).** A push whose config would fan out past this is
-/// refused fail-closed BEFORE the cross-product is materialized (the count is computed with saturating
-/// multiplication). 1024 is far above any legitimate pipeline (the workspace's largest real matrix is a
-/// few dozen instances) and far below anything that pressures the consumer's memory.
 pub const MAX_TOTAL_MATRIX_INSTANCES: usize = 1024;
 
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ResolveError::EmptyDefinition => {
-                write!(f, "the CI definition has no jobs — nothing to run")
+                write!(f, "the CI definition has no jobs - nothing to run")
             }
             ResolveError::FloatingTag { job, reference } => write!(
                 f,
-                "job `{job}`: image `{reference}` is a FLOATING TAG — rejected fail-closed (resolve \
+                "job `{job}`: image `{reference}` is a FLOATING TAG - rejected fail-closed (resolve \
                  every reference to a digest `@<algo>:<hex>`; the tag→digest registry resolution is \
                  CI-P23). 0 un-digested references reach a snapshot."
             ),
             ResolveError::DuplicateJob(name) => {
-                write!(f, "duplicate job name `{name}` — DAG node ids must be unique")
+                write!(f, "duplicate job name `{name}` - DAG node ids must be unique")
             }
             ResolveError::UnknownNeed { job, need } => write!(
                 f,
@@ -338,13 +179,13 @@ impl std::fmt::Display for ResolveError {
             ),
             ResolveError::SelfNeed(job) => write!(f, "job `{job}` depends on itself"),
             ResolveError::DuplicateNeed { job, need } => write!(f, "job `{job}` repeats dependency `{need}`"),
-            ResolveError::Cyclic => write!(f, "the job DAG has a cycle — it is not a DAG"),
+            ResolveError::Cyclic => write!(f, "the job DAG has a cycle - it is not a DAG"),
             ResolveError::BlobWrite(e) => {
                 write!(f, "the CAS snapshot blob write failed: {e} (no snapshot ⇒ no start)")
             }
             ResolveError::MatrixTooLarge { count, cap } => write!(
                 f,
-                "the matrix cross-product resolves to {count} job instances, over the {cap} ceiling — \
+                "the matrix cross-product resolves to {count} job instances, over the {cap} ceiling - \
                  rejected fail-closed (a push cannot fan out unbounded; raise the config's matrix or \
                  split the pipeline)"
             ),
@@ -353,13 +194,13 @@ impl std::fmt::Display for ResolveError {
             ResolveError::CargoVendorLockMissing => write!(
                 f,
                 "a structured Cargo build was authored but the repository has no root `Cargo.lock` at \
-                 the pushed ref — refused fail-closed (an offline `cargo build --locked` needs a \
+                 the pushed ref - refused fail-closed (an offline `cargo build --locked` needs a \
                  committed lock, and the server-trusted vendor tree is selected from it)"
             ),
             ResolveError::CargoVendorUnmatched { lock_sha256 } => write!(
                 f,
                 "the repository's root `Cargo.lock` (sha256:{lock_sha256}) matches no registered, \
-                 server-trusted Cargo vendor tree — the structured build is refused fail-closed \
+                 server-trusted Cargo vendor tree - the structured build is refused fail-closed \
                  rather than mounting an unregistered or default vendor (register a vendor built \
                  from exactly this lock)"
             ),
@@ -369,20 +210,12 @@ impl std::fmt::Display for ResolveError {
 
 impl std::error::Error for ResolveError {}
 
-/// Render a deterministic machine-token instance name for a matrix assignment. The full authored
-/// job name and sorted assignment are length-framed into a BLAKE3 identity, retaining a bounded
-/// human-readable job prefix without allowing distinct assignments to alias.
 fn instance_name(job: &str, assignment: &BTreeMap<String, String>) -> String {
     myelin_ci_controlplane::derive_concrete_job_name(job, assignment)
 }
 
-/// Expand one job's matrix into its deterministic cross-product of axis assignments. The axes are
-/// taken in SORTED key order (a `BTreeMap`), and each axis's values in their authored order; the
-/// cross-product is built so the result list is byte-identical for the same input. A job with no
-/// matrix yields exactly one empty assignment.
 fn expand_matrix(matrix: &BTreeMap<String, Vec<String>>) -> Vec<BTreeMap<String, String>> {
     let mut out: Vec<BTreeMap<String, String>> = vec![BTreeMap::new()];
-    // `BTreeMap` gives the axes in sorted key order → the cross-product nesting is deterministic.
     for (axis, values) in matrix {
         let mut next = Vec::with_capacity(out.len() * values.len().max(1));
         for base in &out {
@@ -399,11 +232,8 @@ fn expand_matrix(matrix: &BTreeMap<String, Vec<String>>) -> Vec<BTreeMap<String,
     out
 }
 
-/// Validate the job DAG is acyclic + every `needs` edge resolves (Kahn's algorithm — a topological
-/// order exists iff the graph is a DAG). Returns the first structural error.
 fn validate_dag(jobs: &[JobDef]) -> Result<(), ResolveError> {
     let names: BTreeSet<&str> = jobs.iter().map(|j| j.name.as_str()).collect();
-    // Every `needs` edge must point at an existing job.
     for j in jobs {
         let mut seen_needs = BTreeSet::new();
         for need in &j.needs {
@@ -424,7 +254,6 @@ fn validate_dag(jobs: &[JobDef]) -> Result<(), ResolveError> {
             }
         }
     }
-    // Kahn: repeatedly remove a node with no unresolved in-edge; if any remain, there is a cycle.
     let mut indeg: BTreeMap<&str, usize> = jobs
         .iter()
         .map(|j| (j.name.as_str(), j.needs.len()))
@@ -437,7 +266,6 @@ fn validate_dag(jobs: &[JobDef]) -> Result<(), ResolveError> {
     let mut removed = 0usize;
     while let Some(n) = queue.pop() {
         removed += 1;
-        // Any job that needs `n` loses one in-edge.
         for j in jobs {
             if j.needs.iter().any(|d| d == n) {
                 let e = indeg.get_mut(j.name.as_str()).expect("name indexed");
@@ -502,20 +330,6 @@ fn validate_authored_tokens(jobs: &[JobDef]) -> Result<(), ResolveError> {
     Ok(())
 }
 
-/// **Resolve a parsed [`CiDefinition`] to a content-addressed [`ResolvedSnapshot`] + write it as a
-/// T2 CAS blob (contract 11.2).** The full arch 02 §1.4 / §7.4 path:
-///   1. **validate** — a non-empty, unique-named, acyclic job DAG (every `needs` resolves);
-///   2. **resolve every image to a digest, FAIL-CLOSED** — a floating tag is REJECTED
-///      ([`ResolveError::FloatingTag`]); 0 un-digested references reach the snapshot (the
-///      supply-chain control, the real tag→digest registry resolution is CI-P23);
-///   3. **expand the matrix DETERMINISTICALLY** — the sorted-axis cross-product, instance names
-///      rendered in sorted axis order (reproducible);
-///   4. **content-address** — serialise the resolved DAG to canonical JSON + `put` it into the
-///      tenant's `BlobStore` (BLAKE3 address = the snapshot ref).
-///
-/// Returns the `(snapshot, address)` — the address is the `definition_snapshot` ref the `ci_run`
-/// row + `ci.run.started` carry. The snapshot is IDENTICAL to the `myelin ci plan` output
-/// (shift-left, no runner spend).
 pub fn resolve_versioned_snapshot(
     def: &VersionedCiDefinition,
     blobs: &dyn BlobStore,
@@ -524,20 +338,6 @@ pub fn resolve_versioned_snapshot(
     resolve_versioned_snapshot_with_cargo_vendor(def, blobs, tenant, None)
 }
 
-/// **Resolve with lockfile-keyed Cargo vendor selection (CT-007 gate 4, blocker 1).** Identical to
-/// [`resolve_versioned_snapshot`], but additionally selects the SERVER-TRUSTED, digest-pinned Cargo
-/// vendor tree for every structured build job by matching the repository's ROOT `Cargo.lock` (read
-/// at the pushed ref by the caller — the same ref the `.myelin/ci.*` config was read from) against
-/// the registered vendors, and STAMPS the selected reference into each build job's
-/// [`ResolvedJobV2::selected_cargo_vendor`] so it is content-addressed into the CAS snapshot and
-/// flows to the control-plane lowering.
-///
-/// Fail-closed: if any structured build is present, `root_cargo_lock` MUST be `Some` (else
-/// [`ResolveError::CargoVendorLockMissing`]) and its SHA-256 MUST match a registered vendor (else
-/// [`ResolveError::CargoVendorUnmatched`]). The tenant can therefore only ever be handed a reference
-/// the server registered and digest-pinned; the sandbox re-validates it against its closed registry
-/// and re-binds it to the checked-out lock before spawn. When no job carries a structured build the
-/// lock is irrelevant and MUST NOT be required.
 pub fn resolve_versioned_snapshot_with_cargo_vendor(
     def: &VersionedCiDefinition,
     blobs: &dyn BlobStore,
@@ -554,7 +354,6 @@ pub fn resolve_versioned_snapshot_with_cargo_vendor(
         ));
     }
     validate_authored_tokens(&def.jobs)?;
-    // Unique job names (DAG node ids).
     let mut seen = BTreeSet::new();
     for j in &def.jobs {
         if !seen.insert(j.name.as_str()) {
@@ -563,11 +362,6 @@ pub fn resolve_versioned_snapshot_with_cargo_vendor(
     }
     validate_dag(&def.jobs)?;
 
-    // FINDING #10 — the matrix-expansion DoS floor: compute the TOTAL instance count with SATURATING
-    // multiplication BEFORE materializing anything, and refuse fail-closed past MAX_TOTAL_MATRIX_INSTANCES.
-    // Each job contributes the product of its axis value-counts (a non-matrix job = 1); an axis is
-    // non-empty by parse-validation. An untrusted push whose config would fan out to millions of
-    // instances is rejected without ever allocating the cross-product.
     let mut total_instances: usize = 0;
     for j in &def.jobs {
         let job_instances = j
@@ -583,11 +377,6 @@ pub fn resolve_versioned_snapshot_with_cargo_vendor(
         }
     }
 
-    // LOCKFILE-KEYED VENDOR SELECTION (CT-007 gate 4, blocker 1). A structured Cargo build runs
-    // OFFLINE against a read-only vendor tree, so it needs the exact server-trusted vendor built from
-    // this repo's root Cargo.lock. Select it ONCE (one root lock per workspace) and fail closed unless
-    // a registered vendor matches. Only computed when a structured build is actually present, so a
-    // non-Cargo pipeline never depends on a committed Cargo.lock.
     let selected_cargo_vendor: Option<String> = if def.jobs.iter().any(|j| j.build.is_some()) {
         let lock = root_cargo_lock.ok_or(ResolveError::CargoVendorLockMissing)?;
         let lock_sha256 = myelin_ci_sandbox::cargo_lock_sha256_hex(lock);
@@ -599,12 +388,8 @@ pub fn resolve_versioned_snapshot_with_cargo_vendor(
         None
     };
 
-    // Resolve + expand. Collect into a Vec, then sort by instance name for the deterministic order.
     let mut resolved: Vec<ResolvedJobV2> = Vec::new();
     for j in &def.jobs {
-        // DIGEST-PIN-OR-REJECT (fail-closed). REUSES the frozen ImageRef::digest_pinned rule — NOT a
-        // second digest grammar. The real tag→digest registry resolution is CI-P23; here a
-        // non-digest-pinned reference is REFUSED (0 floating tags reach a snapshot).
         let image = ImageRef {
             reference: j.image.clone(),
         };
@@ -620,10 +405,6 @@ pub fn resolve_versioned_snapshot_with_cargo_vendor(
                 name: instance_name(&j.name, &assignment),
                 image: j.image.clone(),
                 command: j.command.clone(),
-                // A build job carries the resolve-time vendor selection; a non-build job carries
-                // none. `and` avoids a panic if the two predicates ever drift on a refactor — a
-                // build reaching here with no selection stamps `None`, which `platform_owned_execution`
-                // then refuses fail-closed (CorruptRun) rather than mounting a default tree.
                 selected_cargo_vendor: j.build.as_ref().and(selected_cargo_vendor.clone()),
                 build: j.build.clone(),
                 needs: Vec::new(),
@@ -658,7 +439,6 @@ pub fn resolve_versioned_snapshot_with_cargo_vendor(
         job.needs.sort();
         job.needs.dedup();
     }
-    // Deterministic order — the reproducibility floor (the same input → byte-identical snapshot).
     resolved.sort_by(|a, b| a.name.cmp(&b.name));
     for pair in resolved.windows(2) {
         if pair[0].name == pair[1].name {
@@ -694,7 +474,6 @@ pub fn resolve_versioned_snapshot_with_cargo_vendor(
     Ok((snapshot, address))
 }
 
-/// Resolve through the byte-identical legacy V1 source API.
 pub fn resolve_snapshot(
     def: &CiDefinition,
     blobs: &dyn BlobStore,
@@ -708,10 +487,6 @@ pub fn resolve_snapshot(
     Ok((snapshot, address))
 }
 
-/// The `ArtifactRef` form of a CAS snapshot address — the references-not-payloads handle the
-/// `StartSpec.input` + the `ci_run.definition_snapshot` carry (never the snapshot bytes). The grammar
-/// is `myelin://<tenant>/ci/snapshot/<algo>:<hex>` (a Refs-rooted ref; CI references it, Refs owns the
-/// grammar, contract 5.7).
 pub fn snapshot_ref(tenant: &TenantId, address: &ContentHash) -> ArtifactRef {
     ArtifactRef(format!(
         "myelin://{}/ci/snapshot/{}",
@@ -720,100 +495,56 @@ pub fn snapshot_ref(tenant: &TenantId, address: &ContentHash) -> ArtifactRef {
     ))
 }
 
-// =================================================================================================
-// 3. The reserve+start handoff (atomic, one tx — arch 02 §1.5 / §3).
-// =================================================================================================
-
-/// A check context the run reports (arch 03 §1.1 — `CheckContext = {provider, name}`). The first
-/// `ci.check.updated{state: queued}` is emitted per context at start.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckContext {
-    /// The context name (e.g. `build`, `test/unit`).
     pub name: String,
 }
 
 impl CheckContext {
-    /// A `ci`-provider check context of `name`.
     pub fn ci(name: impl Into<String>) -> CheckContext {
         CheckContext { name: name.into() }
     }
 }
 
-/// The `ci_run` row the reserve+start writes (arch 01 §3.1) — the thin index over the myelin-flow
-/// workflow run, written in the SAME tx as the outbox drafts. The PII surface (`triggered_by`) is a
-/// pseudonym subject (contract 4.8); this struct carries the non-PII fields the dispatch sets at
-/// start (`state: queued`). The live table is `myelin_ci_controlplane::migrations::CREATE_CI_RUN_DDL`;
-/// this is the value the consumer INSERTs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunWrite {
-    /// The run id (an opaque uuid string) — the `ci_run` PK half.
     pub run_id: String,
-    /// The content-addressed definition snapshot ref (the CAS blob, 11.2) — the reproducible
-    /// definition the run runs.
     pub definition_snapshot: ArtifactRef,
-    /// The trigger kind, as the `ci_run.trigger_kind` CHECK token (`push`/`pull_request`/…).
     pub trigger_kind: String,
-    /// The stamped trust tier, as the `ci_run.trust_tier` CHECK token (`trusted`/`untrusted_fork`/
-    /// `self_hosted`). The SAME value stamped onto every `ci.check.updated.trust_tier` (X-1).
     pub trust_tier: String,
-    /// The lifecycle state at start — always `queued` (the reserve+start writes the row queued).
     pub state: String,
-    /// The triggering `event_id` (the cause — the `ci_run.cause_event_id` provenance).
     pub cause_event_id: String,
 }
 
-/// The complete reserve+start handoff (arch 02 §1.5). Produced by [`reserve_and_start`]; the live
-/// consumer (a) calls `DurableExecutor::start(self.start_spec)` (9.1) and (b) commits the atomic
-/// bundle — the [`CiRunWrite`] row + the [`EventDraft`]s — via the outbox in ONE tx (2.2). Holding
-/// the three together makes the atomicity invariant ([`Self::is_atomic_bundle`]) testable: there is
-/// no partial run.
 #[derive(Clone, Debug)]
 pub struct StartHandoff {
-    /// The `DurableExecutor::start` spec for the `ci.pipeline` workflow (9.1) — `input` is the
-    /// references-not-payloads snapshot ref; `idem_key` makes a re-delivered trigger ONE run.
     pub start_spec: StartSpec,
-    /// The `ci_run` row to INSERT (state = queued).
     pub run_write: CiRunWrite,
-    /// The `ci.run.started` draft (carries trust_tier / trigger_kind / the CAS snapshot ref, §1.2).
     pub run_started: EventDraft,
-    /// The first `ci.check.updated{state: queued}` draft PER context (X-1, §1.1 / §4).
     pub queued_checks: Vec<EventDraft>,
 }
 
-// Re-export so callers do not need a second `use` of the frozen flow type to read the handoff.
 pub use myelin_flow::StartSpec;
 
-/// The registered `ci.pipeline` workflow type (contract 9.1 — the body the durable executor drives;
-/// the body itself is CI-P15 / `myelin_flow::ci_pipeline`). Dispatch only NAMES it at `start`.
 pub const CI_PIPELINE_WF_TYPE: &str = "ci.pipeline";
 
 impl StartHandoff {
-    /// **The atomicity invariant (the prompt GATE): the bundle is all-or-nothing — a `ci_run` row
-    /// state=`queued`, a `ci.run.started` event, AND at least one queued `ci.check.updated` per
-    /// context, all present together.** The live consumer commits these in ONE tx via the outbox
-    /// (2.2); this method makes the "no partial run" property assertable: a row with no queued check,
-    /// or a started event with no row, would FAIL this — by construction it never does, because the
-    /// handoff is one value built atomically.
     pub fn is_atomic_bundle(&self) -> bool {
         let row_queued = self.run_write.state == "queued";
         let started_is_run_started = self.run_started.type_.0 == CI_RUN_STARTED;
         let has_queued_check =
             !self.queued_checks.is_empty() && self.queued_checks.iter().all(is_queued_check_draft);
-        // The snapshot ref the row carries IS the input the workflow starts on (no divergence).
         let snapshot_matches =
             self.start_spec.input.first() == Some(&self.run_write.definition_snapshot);
         row_queued && started_is_run_started && has_queued_check && snapshot_matches
     }
 }
 
-/// True iff a draft is a `ci.check.updated` carrying `state: "queued"`.
 fn is_queued_check_draft(d: &EventDraft) -> bool {
     d.type_.0 == myelin_ci_sandbox::events::CI_CHECK_UPDATED
         && d.payload.get("state").and_then(|s| s.as_str()) == Some("queued")
 }
 
-/// Map an [`OnTrigger`] to its `ci_run.trigger_kind` CHECK token (the `CREATE_CI_RUN_DDL` CHECK set:
-/// `push`/`pull_request`/`issue_transition`/`manual`/`agent`/`schedule`).
 fn trigger_kind_token(on: &OnTrigger) -> &'static str {
     match on {
         OnTrigger::Push => "push",
@@ -825,8 +556,6 @@ fn trigger_kind_token(on: &OnTrigger) -> &'static str {
     }
 }
 
-/// Map the stamped [`TrustStamp`]'s job tier to its `ci_run.trust_tier` CHECK token
-/// (`trusted`/`untrusted_fork`/`self_hosted`).
 fn trust_tier_token(stamp: &TrustStamp) -> &'static str {
     use crate::dispatch::TrustTier;
     match stamp.job_tier {
@@ -836,43 +565,21 @@ fn trust_tier_token(stamp: &TrustStamp) -> &'static str {
     }
 }
 
-/// The check-seam subject `repo#commit-<oid>/check-<context>` (X-1, arch 03 §4.12) — REUSES the
-/// frozen `myelin_events::check_seam::check_subject` so the subject grammar is byte-identical to what
-/// Git's gate consumes (no drift).
 fn check_subject(repo: &str, commit_oid: &str, context: &str) -> ArtifactRef {
     myelin_events::check_seam::check_subject(repo, commit_oid, context)
 }
 
-/// The facts the reserve+start handoff needs about the run (provenance the snapshot does not carry):
-/// the repo + commit the checks key on, the per-context list, and the pseudonym actor.
 #[derive(Clone, Debug)]
 pub struct RunFacts {
-    /// The opaque run id (a uuid string).
     pub run_id: String,
-    /// The envelope tenant. Kept explicit so the initial run/details refs are canonical.
     pub tenant_id: String,
-    /// The repo ref the check seam keys on (X-1: `repo#commit-<oid>/check-<context>`).
     pub repo_ref: String,
-    /// The commit oid the run ran against (the CheckStatus key half).
     pub commit_oid: String,
-    /// The check contexts the run reports (one queued `ci.check.updated` each).
     pub contexts: Vec<CheckContext>,
-    /// The triggering `event_id` (the cause provenance — `cause_event_id` + the `idem_key` derivation).
     pub cause_event_id: EventId,
-    /// Deterministic display timestamp inherited from the triggering event.
     pub started_at: String,
 }
 
-/// **Build the atomic reserve+start handoff (arch 02 §1.5; the prompt's second GATE).** Given the
-/// content-addressed `snapshot` ref (from [`resolve_snapshot`]), the CI-P10 trust `stamp`, the armed
-/// trigger `on`, and the `facts`, produces the [`StartHandoff`]: the `DurableExecutor::start` spec for
-/// the `ci.pipeline` workflow (9.1) + the atomic bundle the consumer commits in ONE tx — the
-/// `ci_run` row (state=queued) + `ci.run.started` + the first `ci.check.updated{state: queued}` per
-/// context (via the outbox, 2.2).
-///
-/// The `idem_key` is `<run_id>:<cause_event_id>` so a re-delivered trigger that already minted this
-/// run is ONE start, not two (the 9.1 idempotency, paired with CI-P10's dedup ledger). Personal data
-/// stays references-not-payloads: the `StartSpec.input` is the snapshot ref, never a body.
 pub fn reserve_and_start(
     snapshot: &ArtifactRef,
     stamp: &TrustStamp,
@@ -882,10 +589,6 @@ pub fn reserve_and_start(
     let trigger_kind = trigger_kind_token(on).to_string();
     let trust_tier = trust_tier_token(stamp).to_string();
 
-    // 9.1: the reserve+start spec for the ci.pipeline workflow. input = the snapshot ref
-    // (references-not-payloads); idem_key = <run_id>:<cause_event_id> (a re-delivered trigger is ONE
-    // run). The reserve bookend (refuse-start-on-exhaustion) is the workflow's first act (CI-P15);
-    // dispatch supplies no budget here (the workflow reserves) — left None.
     let start_spec = StartSpec {
         wf_type: CI_PIPELINE_WF_TYPE.to_string(),
         input: vec![snapshot.clone()],
@@ -902,8 +605,6 @@ pub fn reserve_and_start(
         cause_event_id: facts.cause_event_id.0.clone(),
     };
 
-    // §1.2: ci.run.started carries trust_tier / trigger_kind / the CAS snapshot ref
-    // (references-not-payloads — the snapshot is a ref, not the bytes).
     let run_started = EventDraft {
         type_: EventType(CI_RUN_STARTED.to_string()),
         subject: ArtifactRef(format!("ci/run/{}", facts.run_id)),
@@ -920,9 +621,6 @@ pub fn reserve_and_start(
         pii_key_ref: None,
     };
 
-    // §1.1 / §4: the first ci.check.updated{state: queued} per context (X-1). The CheckStatus is the
-    // frozen small + PII-free struct; trust_tier is the SAME stamped value (0 divergence). REUSES the
-    // frozen check_seam subject + aggregate grammar so Git's gate consumes a byte-identical subject.
     let run_ref = format!("myelin://{}/ci/run/{}", facts.tenant_id, facts.run_id);
     let queued_checks = facts
         .contexts
@@ -933,10 +631,6 @@ pub fn reserve_and_start(
                 repo: facts.repo_ref.clone(),
                 commit_oid: facts.commit_oid.clone(),
                 run_ref: run_ref.clone(),
-                // Dispatch does not invent the supersession authority. The durable reserve store
-                // allocates the monotonic attempt in the same transaction as the run, queued
-                // outbox fact, and consumer dedup mark, then replaces this non-emittable template
-                // value before staging.
                 run_attempt: 0,
                 trust_tier: match stamp.check_tier {
                     myelin_git::check_status::TrustTier::Trusted => {
@@ -996,7 +690,6 @@ mod tests {
     }
 
     fn blobs() -> FsBlobStore {
-        // `FsBlobStore::new()` is the in-memory (HashMap-backed) M0 floor — DB-free.
         FsBlobStore::new()
     }
 
@@ -1016,10 +709,6 @@ mod tests {
         })
     }
 
-    // -------- 1. The digest-pin-or-reject resolver (the supply-chain GATE) --------
-
-    /// **THE floating-tag GATE: a floating-tag reference is REJECTED at resolution (fail-closed); 0
-    /// un-digested references reach a snapshot.** The prompt's headline supply-chain control.
     #[test]
     fn a_floating_tag_is_rejected_fail_closed() {
         let def = CiDefinition {
@@ -1035,8 +724,6 @@ mod tests {
         );
     }
 
-    /// Variants of un-digested references are ALL rejected (a bare name, a `:tag`, an empty digest) —
-    /// the fail-closed rule has no gap.
     #[test]
     fn every_undigested_reference_shape_is_rejected() {
         for bad in [
@@ -1059,13 +746,8 @@ mod tests {
         }
     }
 
-    /// **Peer-review finding #10 — the matrix cross-product is capped (DoS floor).** A config with ~8
-    /// axes of 10 values fans out to 10^8 = 100M instances; the count is computed with SATURATING
-    /// arithmetic BEFORE expansion, so the push is refused fail-closed with `MatrixTooLarge` and NOTHING
-    /// is allocated. A legitimately-sized matrix (well under the ceiling) still resolves.
     #[test]
     fn an_unbounded_matrix_is_refused_before_it_is_materialized() {
-        // 8 axes × 10 values each = 10^8 instances — an OOM without the cap.
         let mut job = JobDef::normal("build", PINNED, ["build"]);
         for a in 0..8u32 {
             job = job.with_matrix(
@@ -1085,7 +767,6 @@ mod tests {
             "the over-cap matrix is refused fail-closed: {err:?}"
         );
 
-        // A legitimate matrix (3 × 4 = 12 instances) still resolves + content-addresses.
         let ok = JobDef::normal("test", PINNED2, ["test"])
             .with_matrix("os", vec!["linux".into(), "mac".into(), "win".into()])
             .with_matrix("v", vec!["1".into(), "2".into(), "3".into(), "4".into()]);
@@ -1098,8 +779,6 @@ mod tests {
         assert_eq!(snap.jobs.len(), 12, "3×4 expands to 12 instances");
     }
 
-    /// **A digest-pinned definition resolves + content-addresses (the happy path).** Every image is
-    /// `@sha256:<hex>`; the snapshot is written as a CAS blob and the returned address round-trips.
     #[test]
     fn a_digest_pinned_definition_resolves_and_content_addresses() {
         let store = blobs();
@@ -1113,7 +792,6 @@ mod tests {
         let (snap, addr) =
             resolve_snapshot(&def, &store, &tenant()).expect("a digest-pinned def resolves");
         assert_eq!(snap.jobs.len(), 2, "two resolved jobs");
-        // The CAS blob exists at the returned address + round-trips to the canonical bytes.
         let bytes = store
             .get(&tenant(), &addr)
             .expect("the snapshot blob is present");
@@ -1122,15 +800,9 @@ mod tests {
             snap.canonical_bytes().unwrap(),
             "the blob IS the snapshot bytes"
         );
-        // The address is the BLAKE3 content address of those bytes (content-addressed by construction).
         assert_eq!(addr, ContentHash::blake3(&snap.canonical_bytes().unwrap()));
     }
 
-    // -------- 2. Deterministic matrix expansion --------
-
-    /// **The matrix expands DETERMINISTICALLY: the same definition yields a byte-identical snapshot
-    /// (same address) every time, with instance names in sorted axis order.** The reproducibility
-    /// floor (VISION §3).
     #[test]
     fn the_matrix_expands_deterministically() {
         let store = blobs();
@@ -1141,14 +813,11 @@ mod tests {
                 .with_matrix("rust", vec!["stable".into(), "beta".into()])],
         };
         let (snap, addr) = resolve_snapshot(&def, &store, &tenant()).expect("resolves");
-        // 2 os × 2 rust = 4 instances.
         assert_eq!(snap.jobs.len(), 4, "the 2×2 matrix expands to 4 instances");
-        // Instance names are rendered in SORTED axis order (os before rust) + sorted overall.
         let names: Vec<&str> = snap.jobs.iter().map(|j| j.name.as_str()).collect();
         assert_eq!(names.len(), 4);
         assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(names.iter().all(|name| name.starts_with("test--")));
-        // Re-resolving the SAME definition yields the SAME content address (byte-identical).
         let (_snap2, addr2) = resolve_snapshot(&def, &blobs(), &tenant()).expect("re-resolves");
         assert_eq!(
             addr, addr2,
@@ -1251,12 +920,9 @@ mod tests {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
     }
 
-    /// An empty definition + a structural-DAG defect (a cycle / a dangling need / a dup name) is
-    /// rejected — the resolver validates the DAG before content-addressing.
     #[test]
     fn structural_defects_are_rejected() {
         let store = blobs();
-        // Empty.
         assert_eq!(
             resolve_snapshot(
                 &CiDefinition {
@@ -1268,7 +934,6 @@ mod tests {
             ),
             Err(ResolveError::EmptyDefinition)
         );
-        // A dangling need.
         assert!(matches!(
             resolve_snapshot(
                 &CiDefinition {
@@ -1280,7 +945,6 @@ mod tests {
             ),
             Err(ResolveError::UnknownNeed { need, .. }) if need == "ghost"
         ));
-        // A cycle (a→b→a).
         assert_eq!(
             resolve_snapshot(
                 &CiDefinition {
@@ -1295,7 +959,6 @@ mod tests {
             ),
             Err(ResolveError::Cyclic)
         );
-        // A duplicate job name.
         assert!(matches!(
             resolve_snapshot(
                 &CiDefinition {
@@ -1337,12 +1000,6 @@ mod tests {
         );
     }
 
-    // -------- 3. The dynamic-generation escape-hatch floor (named + hooked) --------
-
-    /// **The dynamic-generation escape hatch is hooked (the named floor): a `Generate` job is a
-    /// NORMAL digest-pinned job whose presence the snapshot exposes via `has_dynamic_generation`.**
-    /// The generator runs in the SAME sandbox (no privileged config-eval path); the in-sandbox
-    /// EXECUTION lands with the runner (CI-P15).
     #[test]
     fn dynamic_generation_is_refused_until_fragment_ingestion_exists() {
         let def = CiDefinition {
@@ -1353,7 +1010,6 @@ mod tests {
             resolve_snapshot(&def, &blobs(), &tenant()),
             Err(ResolveError::InvalidPlan(_))
         ));
-        // A normal definition has no generator.
         let plain = CiDefinition {
             on: OnTrigger::Push,
             jobs: vec![JobDef::normal("build", PINNED, ["build"])],
@@ -1361,8 +1017,6 @@ mod tests {
         let (s2, _) = resolve_snapshot(&plain, &blobs(), &tenant()).unwrap();
         assert!(!s2.has_dynamic_generation());
     }
-
-    // -------- 4. The atomic reserve+start handoff (the second GATE) --------
 
     fn facts() -> RunFacts {
         RunFacts {
@@ -1376,9 +1030,6 @@ mod tests {
         }
     }
 
-    /// **THE reserve+start GATE: the handoff is an ATOMIC bundle — the `ci_run` row (queued) +
-    /// `ci.run.started` + the first queued `ci.check.updated` per context, all present together (one
-    /// tx, no partial run).** The snapshot ref the row carries IS the workflow `start` input.
     #[test]
     fn the_reserve_start_handoff_is_an_atomic_bundle() {
         let snap = snapshot_ref(&tenant(), &ContentHash::blake3(b"snap"));
@@ -1388,16 +1039,13 @@ mod tests {
             handoff.is_atomic_bundle(),
             "the row + ci.run.started + the queued checks are one atomic bundle"
         );
-        // The ci_run row is queued + carries the snapshot ref + the stamped tier.
         assert_eq!(handoff.run_write.state, "queued");
         assert_eq!(handoff.run_write.definition_snapshot, snap);
         assert_eq!(handoff.run_write.trust_tier, "trusted");
         assert_eq!(handoff.run_write.trigger_kind, "push");
-        // ci.run.started carries trust_tier / trigger_kind / the snapshot ref (§1.2).
         assert_eq!(handoff.run_started.type_.0, CI_RUN_STARTED);
         assert_eq!(handoff.run_started.payload["trust_tier"], "trusted");
         assert_eq!(handoff.run_started.payload["definition_snapshot"], snap.0);
-        // One queued ci.check.updated PER context (build, test/unit).
         assert_eq!(
             handoff.queued_checks.len(),
             2,
@@ -1411,16 +1059,11 @@ mod tests {
                 "the pure planner carries a non-emittable template; durable reserve allocates it"
             );
         }
-        // The StartSpec names the ci.pipeline workflow + starts on the snapshot ref.
         assert_eq!(handoff.start_spec.wf_type, CI_PIPELINE_WF_TYPE);
         assert_eq!(handoff.start_spec.input, vec![snap]);
-        // The idem_key makes a re-delivered trigger ONE run.
         assert_eq!(handoff.start_spec.idem_key, "run-0001:ev-push-1");
     }
 
-    /// **The stamped trust tier rides BOTH the `ci_run` row AND every queued `ci.check.updated` with
-    /// 0 divergence (X-1).** A fork run is `untrusted_fork` on the row (3-way) AND `untrusted_fork` on
-    /// every queued check (2-way projection) — the SAME fork verdict.
     #[test]
     fn the_trust_tier_rides_the_row_and_every_check_zero_divergence() {
         let snap = snapshot_ref(&tenant(), &ContentHash::blake3(b"snap"));
@@ -1439,8 +1082,6 @@ mod tests {
         assert!(handoff.is_atomic_bundle());
     }
 
-    /// The queued check subject is the X-1 `repo#commit-<oid>/check-<context>` seam grammar (the
-    /// byte-identical Git-consumed subject — REUSES the frozen check_seam helper, no drift).
     #[test]
     fn the_queued_check_subject_is_the_x1_seam_grammar() {
         let snap = snapshot_ref(&tenant(), &ContentHash::blake3(b"snap"));
@@ -1450,7 +1091,6 @@ mod tests {
             build.subject.0, "myelin://acme/git/repo/web#commit-deadbeef/check-build",
             "the X-1 check subject grammar"
         );
-        // The aggregate is the per-commit ordering partition (all contexts share it).
         for c in &handoff.queued_checks {
             assert_eq!(
                 c.aggregate,
@@ -1463,8 +1103,6 @@ mod tests {
         }
     }
 
-    /// The trigger kind maps to the FROZEN `ci_run.trigger_kind` CHECK token for every trigger (a
-    /// token the live `CREATE_CI_RUN_DDL` CHECK admits — no drift).
     #[test]
     fn trigger_kinds_map_to_the_frozen_check_tokens() {
         let snap = snapshot_ref(&tenant(), &ContentHash::blake3(b"snap"));

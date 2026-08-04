@@ -1,18 +1,3 @@
-//! # CDC 1.1 — the `serve(AppSpec)` provider ⇄ a hello-world `main` consumer (P-S12 → P-010)
-//!
-//! **Contract:** index row 1.1 (`serve(AppSpec)` — boot → migrate → outbox relay → consumers →
-//! three ports → graceful drain). The contract-coverage scanner (P-S21) reads BOTH halves:
-//! - **provider** = `myelin_substrate::serve` / `boot` (the lifecycle), unit-tested in
-//!   `src/serve.rs`;
-//! - **consumer** = a hello-world `main`-shaped caller that constructs an `AppSpec` and calls
-//!   the lifecycle — THIS file. It also exercises the **producer side of the contract-1.8
-//!   telemetry signal set** (architecture §3.5) by reading the signals `serve` exports back
-//!   through the harness's telemetry-assertion library (P-S04) — the SAME `SignalName` set —
-//!   so the green artifact is "the lifecycle ran AND the §10.2 signal set was produced".
-//!
-//! This is the dated green artifact the P-S12 GATE/DRILLS names: the hello-world boot
-//! (boot → emit → consume → drain) passing and the telemetry signal set being produced.
-
 use myelin_events::relay::InProcessBus;
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, Consumer, ConsumerName, DataRole, DedupLedger,
@@ -32,7 +17,6 @@ use std::sync::Arc;
 
 static SUBJECTS: &[SubjectPattern] = &[];
 
-/// The hello-world consumer body (a service's `EventHandler`) — counts what it processed.
 struct Indexer {
     runs: Arc<AtomicU32>,
 }
@@ -75,14 +59,8 @@ fn draft() -> EventDraft {
     }
 }
 
-/// **CDC 1.1 — the consumer side.** A hello-world `main`-shaped caller constructs an `AppSpec`,
-/// boots the lifecycle, emits one event through the outbox, the relay publishes it, the consumer
-/// processes it, and the graceful drain leaves the producer telemetry reading green:
-/// `outbox_depth == 0`, `dead_letter_count == 0`, `consumer_lag{indexer} == 0` — read off the
-/// producer side through the harness's telemetry-assertion library (the §10.2 signal set).
 #[test]
 fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
-    // A service's own outbox store (its handlers emit into it; the relay drains it).
     let outbox = OutboxStore::new();
     let runs = Arc::new(AtomicU32::new(0));
     let sub = Subscription::bind(
@@ -93,8 +71,6 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
     .unwrap();
     let consumer = Consumer::new(Indexer { runs: runs.clone() }, sub, DedupLedger::new());
 
-    // The hello-world AppSpec (the §3.1 verbatim shape: name/config/migrations/public/internal/
-    // consumers/holders/outbox).
     let spec = AppSpec {
         name: "hello",
         config: Config::default(),
@@ -109,7 +85,6 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
         critical: CriticalDependencies::default(),
     };
 
-    // boot the lifecycle (provider side).
     let handle = boot(spec).expect("the hello-world service boots from serve(AppSpec)");
     assert_eq!(
         handle.surfaces(),
@@ -125,14 +100,12 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
         "the opened store auto-registered as a holder (§3.4)"
     );
 
-    // emit one event through the outbox (a handler's co-committed state-change + event).
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
     let mut tx = outbox.begin(minter, ctx_base());
     tx.stage_state_change("hello created");
     tx.emit(draft(), None).unwrap();
     tx.commit().unwrap();
 
-    // serve one tick: the relay publishes the event + the consumer processes it.
     let delivered = handle.tick();
     assert_eq!(delivered, vec![(ConsumerName("indexer".into()), 1)]);
     assert_eq!(
@@ -141,12 +114,8 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
         "the consumer processed the event exactly once"
     );
 
-    // graceful drain.
     handle.signal_drain();
 
-    // --- the producer side of the contract-1.8 signal set, asserted via the P-S04 library ---
-    // Populate the harness's SignalSource from the producer telemetry serve exports (the SAME
-    // SignalName set the harness reads); assert each survival signal is green.
     let t = handle.telemetry();
     let mut src = SignalSource::new();
     src.set_scalar(SignalName::OutboxDepth, t.outbox_depth());
@@ -158,13 +127,10 @@ fn cdc_1_1_hello_world_main_boots_emits_consumes_drains_and_emits_signals() {
             .expect("the indexer consumer's lag is exported"),
     );
 
-    // outbox drained to 0 (nothing committed left unpublished — the SUB-D1 zero, read via serve).
     src.assert_signal(SignalName::OutboxDepth, Predicate::Eq(0))
         .expect_green();
-    // no dead letters on the happy path.
     src.assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
         .expect_green();
-    // the consumer fully caught up (rule 7 lag recovered to 0).
     src.assert_labelled(
         SignalName::ConsumerLag,
         vec![myelin_harness::Label::new("consumer", "indexer")],

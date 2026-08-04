@@ -5,21 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-client sits below the agent/gdpr tier in the DAG (architecture 00 §2.9):
-# agent, gdpr → client → substrate. It depends on identity (authz calls ride the
-# resilient client) and on the events tier; it MUST NOT depend on -substrate (which is
-# strictly downstream and depends on this crate). Such an edge MUST NOT compile.
 [dependencies]
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
 serde.workspace = true
 
-# TEST-SUPPORT ONLY (P-S17 / SUB-D5). The failure-injection harness (P-S03 dependency-break
-# injector + P-S04 telemetry-assertion library + the every-incident drill registry) is a
-# dev-dependency so the SUB-D5 retry-storm drill can drive the REAL resilient client through
-# the same inject → load → assert machinery every other drill uses. There is NO cycle:
-# myelin-harness depends only on {tenancy, identity}; it never depends on myelin-client. The
-# edge is dev-only and so never enters the production crate DAG (architecture §2.9).
 [dev-dependencies]
 myelin-harness = { path = "../myelin-harness" }

@@ -1,18 +1,3 @@
-//! # The C-9 invariant — Issues "My Work" is a FILTER over the ONE inbox, not a second store
-//! (NOTIF-P21 / P-342, M4)
-//!
-//! **Architecture `05-refined-shared-systems-architecture/notifications.md` §1.3** (the C-9 resolution
-//! — there is exactly ONE cross-subsystem inbox; Issues "My Work" is a *scoped, filtered query INTO
-//! this one inbox*, a `filter` over the item's structured `reason` + `subject`, NEVER a separate
-//! store) and **recon §5** ("My Work" = `list_inbox(principal, filter)` over the ONE inbox; never a
-//! second store). **External insight** `01-process-and-quality-doctrine.md` §3 (prove-it — the C-9
-//! invariant test forces the "a view is a subset" property).
-//!
-//! **The threshold (never weakened):** the rows Issues "My Work" returns are a STRICT SUBSET of the
-//! unfiltered inbox — `my_work_rows ⊆ list_inbox(filter=∅)`. The view adds NO row the canonical inbox
-//! lacks (it only narrows), and it shares the ONE read-state column (read it in "My Work", it is read
-//! everywhere). This is the Issues-side proof that "My Work" is a saved filter, not a fourth inbox.
-
 use std::collections::BTreeSet;
 
 use myelin_identity::{
@@ -56,13 +41,8 @@ fn item(item_id: &str, subject: &str, reason: Reason) -> RoutedInboxItem {
     }
 }
 
-/// Seed the ONE inbox with a mix: Issues rows IN "My Work" (every Issues consumer reason), Issues rows
-/// NOT in "My Work" (a non-My-Work reason on an issue), and OTHER subsystems' rows (Git/Chat) that
-/// must never appear in Issues "My Work".
 fn seeded_inbox() -> InboxProjection {
     let inbox = InboxProjection::new();
-    // Issues rows that ARE in "My Work" — the §1.3 reason set Issues now registers (NOTIF-P21):
-    // assigned / blocked / sla / approval_requested (+ mentioned/review_requested/watched).
     inbox.upsert_for_test(item(
         "iss-assigned",
         "myelin://acme/issue/issue/E-1",
@@ -88,13 +68,11 @@ fn seeded_inbox() -> InboxProjection {
         "myelin://acme/issue/issue/E-5",
         Reason::Watched,
     ));
-    // An Issues row NOT in "My Work" (a reason outside the My Work filter) — must be excluded.
     inbox.upsert_for_test(item(
         "iss-fyi",
         "myelin://acme/issue/issue/E-6",
         Reason::Fyi,
     ));
-    // OTHER subsystems — never in Issues "My Work" (the subsystem filter excludes them).
     inbox.upsert_for_test(item(
         "git-review",
         "myelin://acme/git/pr/9",
@@ -108,7 +86,6 @@ fn seeded_inbox() -> InboxProjection {
     inbox
 }
 
-/// **THE C-9 INVARIANT — Issues "My Work" rows ⊆ the unfiltered inbox (a view, not a store).**
 #[test]
 fn issues_my_work_is_a_strict_subset_of_the_one_inbox() {
     let inbox = seeded_inbox();
@@ -118,11 +95,9 @@ fn issues_my_work_is_a_strict_subset_of_the_one_inbox() {
         limit: 1000,
     };
 
-    // the canonical unfiltered ONE inbox (filter = ∅).
     let all = list_inbox(&inbox, &me(), &InboxFilter::all(), &big_page, &auth, &at());
     let all_ids: BTreeSet<String> = all.items.iter().map(|i| i.item_id.clone()).collect();
 
-    // Issues "My Work" — the §1.3 filtered view.
     let my_work = list_inbox(
         &inbox,
         &me(),
@@ -133,19 +108,15 @@ fn issues_my_work_is_a_strict_subset_of_the_one_inbox() {
     );
     let my_work_ids: BTreeSet<String> = my_work.items.iter().map(|i| i.item_id.clone()).collect();
 
-    // (1) SUBSET — every "My Work" row is in the unfiltered inbox (it adds NO row).
     assert!(
         my_work_ids.is_subset(&all_ids),
         "C-9: My Work rows ⊆ list_inbox(filter=∅)"
     );
-    // (2) STRICT — the unfiltered inbox has rows My Work excludes (it is a real narrowing, not a copy).
     assert!(
         my_work_ids.len() < all_ids.len(),
         "My Work is a STRICT subset (the non-My-Work + other-subsystem rows are excluded)"
     );
 
-    // (3) it is exactly the Issues × My-Work-reason rows — every returned row is an Issues subject
-    // with a My-Work reason; the Fyi-issue + Git + Chat rows are absent.
     let my_work_reasons = InboxFilter::issues_my_work().reasons.unwrap();
     for row in &my_work.items {
         assert!(
@@ -172,7 +143,6 @@ fn issues_my_work_is_a_strict_subset_of_the_one_inbox() {
         "a Chat row is not in Issues My Work"
     );
 
-    // (4) the My Work view DID return the registered-reason rows (it is not vacuously empty).
     assert_eq!(
         my_work_ids,
         [
@@ -189,9 +159,6 @@ fn issues_my_work_is_a_strict_subset_of_the_one_inbox() {
     );
 }
 
-/// **ONE read-state truth (the whole point of C-9): a row read through "My Work" is the SAME row as
-/// the unfiltered inbox.** The view shares the item id with the canonical inbox — there is no second
-/// store with a divergent read-state. (Mark-once-consistent-everywhere, recon §5.)
 #[test]
 fn my_work_shares_the_one_read_state_row() {
     let inbox = seeded_inbox();
@@ -211,7 +178,6 @@ fn my_work_shares_the_one_read_state_row() {
         &at(),
     );
 
-    // the assigned row appears in BOTH views with the SAME item_id (one row, one read-state column).
     let in_all = all
         .items
         .iter()

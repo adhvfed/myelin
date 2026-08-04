@@ -1,4 +1,3 @@
-//! Live PostgreSQL + real HTTP proof for the production Issues route surface.
 #![cfg(feature = "integration")]
 
 use bytes::Bytes;
@@ -271,9 +270,6 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     let cell = Arc::new(CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).unwrap());
     let directory = PrincipalStore::new(kms.clone());
 
-    // Drive the production bootstrap body instead of manually seeding the project tuple. This one
-    // call provisions the login, writes the exact durable project reader edge, and mints the token
-    // that drives the complete authenticated founder lifecycle below.
     let bootstrap_directory = directory.clone();
     let bootstrap_tuples = tuples.clone();
     let bootstrap_cell = cell.clone();
@@ -299,8 +295,6 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .unwrap()
     .expect("production bootstrap grants project reader and mints creator token");
 
-    // A second project reader proves that request ownership is the exact authenticated creator,
-    // not merely project membership and never an agent's optional on_behalf_of attribution.
     let peer_directory = directory.clone();
     let peer_tuples = tuples.clone();
     let peer_cell = cell.clone();
@@ -963,10 +957,6 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert_eq!(foreign_page.0, 200);
     assert!(foreign_page.1["items"].as_array().unwrap().is_empty());
 
-    // Realistic skew proof for the exact served authorization/state/prefix CTE. Every synthetic
-    // issue is visible to this subject, while the requested prefix is absent, so a scan of the
-    // entire authorization partition would be both tempting and pathological without the prefix
-    // range index.
     sqlx::query(
         "INSERT INTO issue (tenant_id, region, id, key, prefix, type_id, type_rank, state, \
                             state_category, project_id, rank, title, title_nonce, title_ciphertext, \
@@ -1122,13 +1112,6 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert!(!closed_envelope.to_string().contains(title));
     assert_eq!(closed_envelope["payload"]["category"], "completed");
 
-    // Exact generated-tenant cleanup. Projection state is last because row/tuple deletion triggers
-    // intentionally invalidate it again. `outbox` is handled separately, below, because a live
-    // elected relay (e.g. `myelin-outbox-publisher serve`) sharing this Postgres continuously
-    // quarantines this tenant's own `identity.tuple.written` outbox rows (`iam` is not an admitted Bus
-    // taxonomy subsystem token, so every one of them is permanently rejected —
-    // `myelin_events::taxonomy::SUBSYSTEM_TOKENS`), and `outbox_quarantine_event_id_fkey` is
-    // `ON DELETE RESTRICT`, so a plain `DELETE FROM outbox` can lose a race against the relay.
     for statement in [
         "DELETE FROM issue_authz_binding WHERE tenant_id = $1",
         "DELETE FROM issue WHERE tenant_id = $1",
@@ -1152,12 +1135,6 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     delete_tenant_outbox_despite_concurrent_relay_quarantine(&admin, &foreign_tenant).await;
 }
 
-/// Delete every `outbox` row for `tenant`, tolerating a concurrently running elected relay (this
-/// dev Postgres has a real `myelin-outbox-publisher serve` polling it) that may quarantine one of
-/// this tenant's own rows between the moment we clear `outbox_quarantine` and the moment we issue
-/// `DELETE FROM outbox`. `outbox_quarantine_event_id_fkey` is `ON DELETE RESTRICT`, so that plain
-/// delete fails whenever the relay wins the race. The relay quarantines each row at most once and
-/// this tenant's row set is finite, so re-clearing quarantine and retrying converges quickly.
 async fn delete_tenant_outbox_despite_concurrent_relay_quarantine(admin: &sqlx::PgPool, tenant: &str) {
     const ATTEMPTS: u32 = 20;
     for attempt in 0..ATTEMPTS {

@@ -1,34 +1,21 @@
-//! Total command grammar for the durable CI read surface.
-//!
-//! The platform CLI reuses this parser and only maps validated commands to Edge routes. This module
-//! exposes the durable reads plus the repository-authorized Edge live-log route. `watch` names one
-//! exact job because the production transport is scoped to `(run_id, job_id)`; it does not invent a
-//! run-wide aggregation the durable API cannot authorize or resume.
-
 use crate::surfacing_store::{
     CiLogRangeRequest, CiRunPageRequest, CiRunStateFilter, CI_LOG_RANGE_DEFAULT,
     CI_RUN_CURSOR_PREFIX, CI_RUN_PAGE_DEFAULT,
 };
 use base64::Engine as _;
 
-/// A validated `myelin ci` read or live-observation command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
-    /// List repository-authorized durable runs.
     List(CiRunPageRequest),
-    /// Read one durable run, including its materialized jobs and steps.
     View { run_id: String },
-    /// Read one bounded archived job-log byte range.
     Logs {
         run_id: String,
         job_id: String,
         range: CiLogRangeRequest,
     },
-    /// Follow one job's durable log through the resume-cursor Edge stream.
     Watch { run_id: String, job_id: String },
 }
 
-/// A total, human-readable CI command parse failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CliParseError(String);
 
@@ -40,7 +27,6 @@ impl std::fmt::Display for CliParseError {
 
 impl std::error::Error for CliParseError {}
 
-/// Parse the arguments after `myelin ci`.
 pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         usage(

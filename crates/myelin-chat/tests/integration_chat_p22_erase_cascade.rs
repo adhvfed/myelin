@@ -1,32 +1,3 @@
-//! **CHAT-P22 / P-411 — the Chat erase fan-out (the author crypto-shred + the DSR cascade), PROVEN
-//! against the live dev-stack Postgres (CHAT-D8: 0 recoverable PII at rest).**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-chat --features integration \
-//!     --test integration_chat_p22_erase_cascade -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires for CHAT-P22: a chat body's
-//! CIPHERTEXT lands in a real Postgres `bytea` column (the message hot tier's `body_inline` shape),
-//! the REAL erase fan-out ([`myelin_chat::ChatErasureCascade::erase`]) runs — crypto-shredding the
-//! author's per-subject DEK over the ONE `KmsEngine` and tombstoning the record on the OUTBOX — and
-//! we then read the bytes back STRAIGHT FROM THE DB and prove:
-//!
-//! - **0 recoverable PII at rest after the cascade** — the ciphertext read from the live Postgres
-//!   column no longer decrypts (the per-subject DEK is destroyed; the body is unrecoverable in the
-//!   hot tier AND, by the same key-destroy, the cold segments AND the backups — §7.5), never a
-//!   plaintext fall-through;
-//! - **the holder-receipt set is complete** (0 holders missed) and records the destroyed-key epoch
-//!   (the 10.8 post-restore re-erase audit trail);
-//! - **the `chat.message.erased` tombstone is published** (the DSR cascade the derivatives consume —
-//!   the bus is the only path, no backdoor).
-//!
-//! The drill is registered red-until-proven and flips green ONLY here, against the live stack — never
-//! mocked. (The DEFAULT-build `drill_chat_d8_erasure_cascade.rs` proves the SAME 0-recoverable-PII +
-//! complete-receipt + bus-cascade properties over the in-memory tiers; this is the live-Postgres
-//! at-rest artifact for the crypto-shred leg of the cascade.)
 #![cfg(feature = "integration")]
 
 use myelin_chat::{
@@ -74,7 +45,6 @@ async fn chat_erase_cascade_zero_recoverable_pii_at_rest_in_real_postgres() {
     let region = Region::new("fr-par");
     let author = SubjectId::new(SUBJECT);
 
-    // a PII-laden chat body (the body IS the PII) sealed under the AUTHOR's per-subject DEK.
     let plaintext =
         b"my private chat: my email is ada@example.com and my health is private".to_vec();
     let col = encrypt_body(
@@ -88,7 +58,6 @@ async fn chat_erase_cascade_zero_recoverable_pii_at_rest_in_real_postgres() {
     .expect("seal body_inline under the per-subject DEK");
     assert!(col.key_ref.class.as_token().starts_with("subject:"));
 
-    // ── stand up a real message-shaped table + write the AT-REST ciphertext ───────────────────────
     let admin = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect(&admin_url())
@@ -130,7 +99,6 @@ async fn chat_erase_cascade_zero_recoverable_pii_at_rest_in_real_postgres() {
     .await
     .expect("write the at-rest message row");
 
-    // sanity: while the key lives, the ciphertext read FROM THE DB decrypts to the exact plaintext.
     let row = sqlx::query(&format!(
         "SELECT body_inline FROM {tbl} WHERE message_id = '01J0MSG411'"
     ))
@@ -146,7 +114,6 @@ async fn chat_erase_cascade_zero_recoverable_pii_at_rest_in_real_postgres() {
         "the at-rest body decrypts before the erase"
     );
 
-    // ── run the REAL erase fan-out (the cascade) ──────────────────────────────────────────────────
     let store = MemHotTier::new();
     let outbox = OutboxStore::new();
     let minter = Arc::new(MonotonicMinter::new());
@@ -179,8 +146,6 @@ async fn chat_erase_cascade_zero_recoverable_pii_at_rest_in_real_postgres() {
     );
     tx.commit().expect("commit the cascade transaction");
 
-    // ── prove 0 recoverable PII AT REST after the cascade ─────────────────────────────────────────
-    // The SAME ciphertext is still in the live Postgres column (the immutable log is not rewritten)…
     let row_after = sqlx::query(&format!(
         "SELECT body_inline FROM {tbl} WHERE message_id = '01J0MSG411'"
     ))
@@ -190,17 +155,15 @@ async fn chat_erase_cascade_zero_recoverable_pii_at_rest_in_real_postgres() {
     let at_rest_after: Vec<u8> = row_after.get("body_inline");
     assert_eq!(
         at_rest_after, at_rest,
-        "the ciphertext is unchanged at rest (the immutable log is not rewritten — only the key is shredded)"
+        "the ciphertext is unchanged at rest (the immutable log is not rewritten - only the key is shredded)"
     );
-    // …but it is now UNRECOVERABLE — the per-subject DEK the cascade destroyed is gone.
     let mut from_db_after = col.clone();
     from_db_after.ciphertext = at_rest_after;
     assert!(
         decrypt_body(&engine, &region, &from_db_after).is_err(),
-        "0 recoverable PII: after the cascade's crypto-shred the at-rest body is unrecoverable — never plaintext"
+        "0 recoverable PII: after the cascade's crypto-shred the at-rest body is unrecoverable - never plaintext"
     );
 
-    // ── the holder-receipt set is complete + the cascade rode the bus ─────────────────────────────
     assert!(
         report.receipts_complete(),
         "the holder-receipt set is complete (0 holders missed)"
@@ -216,10 +179,9 @@ async fn chat_erase_cascade_zero_recoverable_pii_at_rest_in_real_postgres() {
         .count();
     assert_eq!(
         erased, 1,
-        "the chat.message.erased tombstone is published (the DSR cascade — the bus is the only path)"
+        "the chat.message.erased tombstone is published (the DSR cascade - the bus is the only path)"
     );
 
-    // cleanup (leave the stack up — never drop the database, only this test's table).
     let _ = sqlx::query(&format!("DROP TABLE IF EXISTS {tbl}"))
         .execute(&admin)
         .await;

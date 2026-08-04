@@ -1,29 +1,3 @@
-//! # The CDC pair for contract 4.9 — Id's compiled **Chat** ReBAC fragment (P-ID-30 / P-323)
-//!
-//! **Contract-index row 4.9** (per-subsystem ReBAC namespace fragment — each subsystem declares
-//! relations and permissions, compiled into ONE cell schema; Identity owns the engine, the
-//! admit-contract, and the core hierarchy and never invents object ids). The engine half is pinned by
-//! `cdc_4_9_namespace_engine.rs` (P-068); the Git fragment by `cdc_4_9_git_fragment.rs`; the Knowledge
-//! fragment by `cdc_4_9_knowledge_fragment.rs`; the CI fragment by `cdc_4_9_ci_fragment.rs`; the Issues
-//! fragment by `cdc_4_9_issue_fragment.rs`. THIS file pins the Identity-side compiled **Chat** fragment
-//! (the rich rewrites Id owns, P-ID-30 / P-323) — the FIFTH and FINAL fragment, CLOSING the M1
-//! engine-only floor.
-//!
-//! - The **PROVIDER** is Identity's namespace engine ([`StoreBackedCheck`] over `with_core_hierarchy`):
-//!   it admits Id's compiled Chat [`FragmentDef`]s, resolves the Chat permissions through the userset
-//!   operators, and never invents an id.
-//! - The **CONSUMER** is the Chat subsystem, which gates a channel/message read ONLY on a resolved
-//!   grant + lists the ambient channel set via `list_objects(subject, read, channel)` keyed on
-//!   `channel.id` (§7.3).
-//!
-//! **The headline invariants this CDC behaviourally pins (CHAT authz side):**
-//! - **`channel.read = member ∪ parent_project->view` (§5):** a direct member OR a project reader can
-//!   read the channel; a NON-member (in neither arm) cannot — and is ABSENT from the ambient
-//!   channel-list `list_objects(subject, read, channel)` (the search-as-non-member 0-results gate).
-//! - **`message.view = parent_channel->read` (§5):** a message inherits its channel's readability, so a
-//!   non-member's message view DENIES by construction.
-//! - **the ambient channel-list conjoins in ONE query** keyed on `channel.id` (§7.3, contract 4.3).
-
 use myelin_events::{BusTransport, EventHandler as _, InProcessBus, OutboxStore, Relay, Timestamp};
 use myelin_identity::{
     ColRef, Consistency, ConsistencyMode, Decision, FragmentAdmit, IdentityService,
@@ -72,9 +46,6 @@ fn add(object: &str, relation: &str, subject: &str) -> TupleDelta {
     })
 }
 
-/// The PROVIDER surface seeded with `tuples` — the core org/team/project hierarchy is preloaded, then
-/// Id's compiled Chat fragment is admitted on top (so `channel.read`'s `parent_project->view`
-/// inheritance terminates on the core `project.view`).
 fn provider(scope: &TenantScope, tuples: &[TupleDelta]) -> StoreBackedCheck {
     let outbox = OutboxStore::new();
     let store = TupleStore::new(outbox.clone());
@@ -106,10 +77,6 @@ fn provider(scope: &TenantScope, tuples: &[TupleDelta]) -> StoreBackedCheck {
     svc
 }
 
-/// **PROVIDER → the compiled Chat fragment ADMITS into the cell schema (the engine-only-floor
-/// closure).** Id declares + compiles its Chat fragment via the fragment-admit contract; every Chat
-/// object type admits on top of the core hierarchy; the headline permissions are compiled. With this,
-/// all five subsystem fragments exist.
 #[test]
 fn cdc_4_9_id_compiled_chat_fragment_admits() {
     let s = scope("acme");
@@ -130,22 +97,15 @@ fn cdc_4_9_id_compiled_chat_fragment_admits() {
     );
 }
 
-/// **CONSUMER → PROVIDER: `channel.read` resolves via `member` AND via `parent_project->view`; a
-/// non-member DENIES (§5).** alice is a DIRECT member of channel:general; bob is a project reader (the
-/// ambient arm); carol is neither — she denies. `message.view` inherits the channel (a member sees the
-/// message, a non-member does not).
 #[test]
 fn cdc_4_9_channel_read_resolves_via_member_and_via_project() {
     let s = scope("acme");
     let svc = provider(
         &s,
         &[
-            // alice is a DIRECT member of the channel.
             add("channel:general", CHANNEL_MEMBER, "p:alice"),
-            // bob inherits via the project-read arm (parent_project->view).
             add("project:proj", "reader", "p:bob"),
             add("channel:general", "parent_project", "project:proj#view"),
-            // A message in the channel (inherits channel.read).
             add("message:m1", "parent_channel", "channel:general#read"),
         ],
     );
@@ -173,22 +133,18 @@ fn cdc_4_9_channel_read_resolves_via_member_and_via_project() {
             Ok(Decision::Allow)
         )
     };
-    // alice reads via the direct member arm.
     assert!(
         can_read(&subject("p:alice"), "channel:general"),
         "a direct member reads the channel (the `member` arm)"
     );
-    // bob reads via the ambient parent_project->view arm.
     assert!(
         can_read(&subject("p:bob"), "channel:general"),
         "a project reader reads the channel (the parent_project->view arm)"
     );
-    // carol (neither member nor project reader) is DENIED.
     assert!(
         !can_read(&subject("p:carol"), "channel:general"),
         "a non-member denies (in neither arm of channel.read)"
     );
-    // message.view inherits the channel: alice sees it, carol does not.
     assert!(
         can_view_msg(&subject("p:alice"), "message:m1"),
         "a member views the channel's messages (message.view = parent_channel->read)"
@@ -199,11 +155,6 @@ fn cdc_4_9_channel_read_resolves_via_member_and_via_project() {
     );
 }
 
-/// Build a wired `list_objects` over Id's compiled Chat fragment + a LIVE S8 index fed off the bus from
-/// `grants`, at an explicit cardinality `cap` (so the Ids↔Filter switch is deterministic). The S8
-/// reverse index projects only DIRECT principal-subject grants, so a direct channel `member` is a
-/// candidate row; the inherited `parent_project->view` arm of the ambient channel scan is resolved by
-/// the consumer's JOIN against `authz_visible` on the `Filter` push-down (P-ID-12).
 fn wired(cap: usize, scope: &TenantScope, grants: &[TupleDelta]) -> ListObjects {
     let outbox = OutboxStore::new();
     let store = TupleStore::new(outbox.clone());
@@ -238,15 +189,9 @@ fn wired(cap: usize, scope: &TenantScope, grants: &[TupleDelta]) -> ListObjects 
     ListObjects::with_cap(store, namespace, index, cap)
 }
 
-/// **CONSUMER → PROVIDER: the ambient channel list conjoins in ONE query — `list_objects(subject, read,
-/// channel)` pushes down to the `channel.id` Filter (§7.3, contract 4.3).** Above the cap the channel
-/// scan returns the S8 push-down naming the consumer's OWN id column (`channel.id`) which the channel
-/// list's query planner conjoins in ONE query (no N+1, never a post-filter).
 #[test]
 fn cdc_4_9_channel_list_conjoins_in_one_query() {
     let s = scope("acme");
-    // alice is a direct member of a handful of channels; with the cap BELOW that slice the scan pushes
-    // down to the Filter (the channel list's one-query conjoin).
     let mut grants: Vec<TupleDelta> = Vec::new();
     for i in 0..8 {
         grants.push(add(&format!("channel:c-{i}"), CHANNEL_MEMBER, "p:alice"));
@@ -268,7 +213,7 @@ fn cdc_4_9_channel_list_conjoins_in_one_query() {
                         table: "channel".into(),
                         column: "id".into()
                     },
-                    "the channel-list Filter names the consumer's own id column (channel.id, §7.3) — \
+                    "the channel-list Filter names the consumer's own id column (channel.id, §7.3) - \
                      one query, no N+1"
                 );
             }
@@ -282,19 +227,12 @@ fn cdc_4_9_channel_list_conjoins_in_one_query() {
     }
 }
 
-/// **CONSUMER → PROVIDER: a NON-MEMBER's channel list is leak-free — a channel they are not a member of
-/// is ABSENT (no count leak; the search-as-non-member 0-results gate).** Below the cap the channel list
-/// materialises `Ids` carrying ONLY the subject's directly-member channels; a channel they are not a
-/// member of never becomes a candidate (the S8 reverse index keys on `(subject, relation)` — a
-/// non-member channel is not even a candidate, never a post-filter).
 #[test]
 fn cdc_4_9_non_member_channel_list_is_leak_free() {
     let s = scope("acme");
     let grants = vec![
-        // alice is a member of two channels → her visible channel list.
         add("channel:visible-1", CHANNEL_MEMBER, "p:alice"),
         add("channel:visible-2", CHANNEL_MEMBER, "p:alice"),
-        // A private channel alice is NOT a member of — the leak witness she must never see.
         add("channel:secret", CHANNEL_MEMBER, "p:other"),
     ];
     let lo = wired(100, &s, &grants);

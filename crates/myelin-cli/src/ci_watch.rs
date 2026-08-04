@@ -1,11 +1,3 @@
-//! Durable CI live-log consumption for `myelin ci watch`.
-//!
-//! The SSE stream carries pointers, never payload bytes. This consumer therefore reads every
-//! pointed range through the ordinary integrity-checked archive endpoint before acknowledging its
-//! event id. A clean disconnect resumes with that id; retention-stale 409 catches the archive up
-//! before opening a fresh subscription. Human output is terminal-safe, while `--json` emits the
-//! exact validated archive range envelopes as newline-delimited JSON.
-
 use crate::client::{execute, interpret, open_event_stream};
 use crate::config::EdgeConfig;
 use crate::dispatch::{EdgeCall, HttpMethod};
@@ -54,7 +46,6 @@ enum StreamEnd {
     Disconnected { progressed: bool },
 }
 
-/// Follow one exact run/job log until the durable stream emits terminal completion.
 pub async fn execute_ci_watch(
     config: &EdgeConfig,
     token: &str,

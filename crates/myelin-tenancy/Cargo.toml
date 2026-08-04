@@ -5,16 +5,8 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# myelin-tenancy is the ROOT of the crate DAG (architecture 00 §2.9): it depends on
-# nothing. Identity depends on tenancy and nothing above it; everything else flows
-# down from here. Adding a dependency edge to ANY other myelin crate here would
-# create a cycle and MUST NOT compile.
 [dependencies]
 serde.workspace = true
 
-# TEST-SUPPORT ONLY (dev-dependency, P-CP-02). The `CrossCellPointer` round-trip unit test
-# serialises the frozen frame to JSON to assert it carries EXACTLY the four §6.1 fields (no
-# payload/PII/authz). `serde_json` is a workspace dev tool here, NOT a runtime dependency —
-# it adds no production crate-DAG edge (tenancy stays the root, depending on nothing above).
 [dev-dependencies]
 serde_json.workspace = true

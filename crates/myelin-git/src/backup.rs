@@ -1,59 +1,3 @@
-//! # `backup` — REAL git-repo backup + DESTRUCTIVE restore (GT-002 / E1.1)
-//!
-//! GT-001 made the on-disk bare repos REAL ([`crate::durable`]); GT-002 makes their BACKUP real.
-//! Today backup/restore are *modeled* (a WAL offset, census SI-014/015 — that lives in
-//! [`myelin_storage::backup`]/[`myelin_storage::restore`] and is the DB's deferred PITR floor
-//! P-S12/P-S15). This module backs up the **repo BYTES**: it captures a bare repo's complete,
-//! self-consistent object graph + refs into a single artifact from which — *with no access to the
-//! original* — a full, `git fsck`-clean repo is reconstructed onto a CLEAN target.
-//!
-//! ## The real mechanism — a self-contained packfile + a ref snapshot (NOT a modeled offset)
-//! The backup is the canonical git mechanism libgit2 (`git2`) exposes, and is exactly what
-//! `git bundle` carries internally: **a ref-tip snapshot + a non-thin packfile of every object
-//! reachable from those tips.**
-//! - **Refs** — [`DurableGitRepo::list_refs`] snapshots `(name, oid)` for every ref FIRST. This is
-//!   the consistency point: git objects are immutable / append-only, so once we have the tip oids,
-//!   the closure reachable from them cannot change underneath us. A concurrent push that moves a
-//!   ref after the snapshot is simply not in this backup (we pack the snapshotted tip's closure) —
-//!   so **every backed-up ref points only at backed-up objects**, by construction.
-//! - **Objects** — a `git2::PackBuilder` packs the full closure: a revwalk over all tips
-//!   (`insert_walk`) captures every commit's ancestry + trees + blobs, and `insert_recursive` per
-//!   tip additionally captures non-commit tips (annotated **tag objects**, which a revwalk peels
-//!   away). libgit2 writes a complete, self-contained (non-thin) packfile with its own SHA trailer
-//!   — re-hash-verifiable on ingest.
-//!
-//! We do NOT reimplement git packing/objects/refs: the pack is built by libgit2, ingested by
-//! libgit2's indexer ([`git2::Odb::packwriter`]), and the refs are recreated through the GT-001
-//! durable CAS path. The artifact's only bespoke part is a thin length-prefixed FRAME around
-//! `(refs, pack)` so it is one file.
-//!
-//! ## Reconciling with the storage backup framework (compose, do not fork)
-//! [`myelin_storage::backup`] orchestrates the OLTP PITR (continuous WAL archiving + base backups,
-//! the `ContinuousArchiver`) and classifies every store into a [`StoreTier`]. The git repo backup
-//! plugs in as a **real artifact at the T2 object tier** ([`GitRepoBackup::store_tier`] ==
-//! [`StoreTier::Object`]): the git odb is content-addressed (every object keyed by its own hash,
-//! immutable, append-only) — *exactly* the T2 "versioned + content-addressed → integrity
-//! re-hash-verifiable" posture the framework already models. We reuse that tier vocabulary rather
-//! than minting a second one. What stays DISTINCT (and still modeled / deferred) is the DB's
-//! OLTP-WAL PITR offset tier — that is the SI-014/015 DB slice (`restore_to_offset`), a different
-//! artifact tier from the repo bytes.
-//!
-//! ## Honest scope (EI-01 §1 — write the floor down)
-//! - **Full-snapshot, not incremental.** Each [`GitRepoBackup::create`] packs the entire reachable
-//!   closure. Incremental / continuous git backup (a since-marker thin pack, or WAL-style ref-log
-//!   shipping) is NOT done here — full-only. The artifact is genuinely reconstructable alone, which
-//!   is the GT-002 bar; incremental is a later optimisation.
-//! - **Bounded Rust pack buffering, not a hard process-RSS claim.** The production
-//!   [`GitRepoBackup::create_to_file`] / [`restore_repo_from_file`] path keeps bulk Rust-owned memory
-//!   to bounded ref metadata plus one fixed-size copy buffer. libgit2 still retains per-object maps,
-//!   delta-selection windows/cache while building, and index state while ingesting. Those costs are
-//!   object-count/content dependent and require an outer worker/cgroup limit if a hard RSS ceiling is
-//!   needed; streaming the pack bytes cannot remove them through the current `git2` API.
-//! - **Git-tier-real.** The repo bytes round-trip through a real libgit2 pack + a real
-//!   destructive restore onto a clean target, proven by the real `git fsck --full --strict`
-//!   external oracle (see `tests/git_backup_restore.rs`). The DB-PITR floor (live `pg_basebackup`
-//!   / WAL replay) remains deferred — that is not this module.
-
 use std::io::{Read as _, Seek as _, Write as _};
 use std::path::Path;
 
@@ -61,45 +5,24 @@ use crate::core::{Oid, RepoLoc};
 use crate::durable::{DurableError, DurableGitRepo, DurableGitStore};
 use crate::gix_backend::RepoPathResolver;
 
-/// The store-tier vocabulary the git backup reconciles with — reused from the storage framework
-/// (NOT re-minted): the git odb is the content-addressed T2 object tier.
 pub use myelin_storage::backup::StoreTier;
 
-/// Artifact magic + versions. v2 adds a BLAKE3 checksum over the entire preceding frame; the reader
-/// retains v1 compatibility so existing off-host backups remain restorable.
 const MAGIC_V1: &[u8] = b"MYELIN-GIT-BACKUP-v1\0";
 const MAGIC_V2: &[u8] = b"MYELIN-GIT-BACKUP-v2\0";
 const MAGIC: &[u8] = MAGIC_V2;
 const CHECKSUM_LEN: usize = 32;
-/// The only whole-body storage used by the disk-backed path. Ref metadata remains bounded
-/// separately; pack bytes are copied between libgit2 and disk in chunks of this size.
 const STREAM_BUFFER_BYTES: usize = 64 * 1024;
 const MAX_BACKUP_REFS: usize = crate::durable::WIRE_MAX_REFS;
-/// The present backup object owns one complete pack in memory. Refuse beyond this operational
-/// ceiling during construction, before a second repo-sized allocation can occur.
 const MAX_BACKUP_PACK_BYTES: usize = 512 * 1024 * 1024;
-/// Aggregate framing/ref-name/oid/checksum bytes outside the pack.
 const MAX_BACKUP_REF_FRAME_BYTES: usize = 64 * 1024 * 1024;
-/// Pack plus bounded ref-frame/checksum overhead accepted from off-host storage.
 const MAX_BACKUP_ARTIFACT_BYTES: usize = MAX_BACKUP_PACK_BYTES + MAX_BACKUP_REF_FRAME_BYTES;
 
-// ───────────────────────────── errors ────────────────────────────────────────────────────────────
-
-/// The error surface of the git-repo backup/restore. Loud + specific (a refusal is diagnosable —
-/// EI-01 §3); never a silent wrong-bytes / partial restore.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitBackupError {
-    /// An underlying GT-001 durable-store op failed (open / refs / repo lifecycle).
     Durable(DurableError),
-    /// A `git2` (libgit2) op failed (packbuilder / odb / pack ingest). Carries the libgit2 message.
     Git(String),
-    /// A filesystem op failed (reading/writing the off-host artifact file).
     Io(String),
-    /// The backup artifact is malformed (bad magic, truncated frame, non-utf8 ref). A corrupt
-    /// artifact is REFUSED — never a silent partial reconstruction.
     BadArtifact(String),
-    /// A restore was asked to land on a target that is NOT clean (a repo already exists there). A
-    /// destructive restore is genuine recovery onto an empty target — it never clobbers a live repo.
     TargetNotClean(String),
 }
 
@@ -112,7 +35,7 @@ impl std::fmt::Display for GitBackupError {
             GitBackupError::BadArtifact(m) => write!(f, "git backup artifact malformed: {m}"),
             GitBackupError::TargetNotClean(m) => write!(
                 f,
-                "git restore target is not clean: {m} — a destructive restore lands on an EMPTY \
+                "git restore target is not clean: {m} - a destructive restore lands on an EMPTY \
                  target (genuine recovery), it never clobbers a live repo"
             ),
         }
@@ -176,7 +99,6 @@ fn with_packbuilder<T>(
     for (name, oid) in refs {
         let goid = git2::Oid::from_str(oid.as_str())
             .map_err(|e| GitBackupError::Git(format!("bad oid for {name}: {e}")))?;
-        // Preserve the tag/non-commit tip itself, then add full commit ancestry below.
         pb.insert_recursive(goid, None)
             .map_err(|e| git_err(&format!("insert_recursive {name}"), e))?;
         let _ = walk.push(goid);
@@ -186,34 +108,17 @@ fn with_packbuilder<T>(
     consume(&mut pb)
 }
 
-// ───────────────────────────── the backup artifact ────────────────────────────────────────────────
-
-/// **A real, self-contained backup of a single bare repo** — a ref-tip snapshot + a non-thin
-/// packfile of every object reachable from those tips. From this artifact ALONE (no access to the
-/// original) a full repo is reconstructed ([`restore_repo`]). It is tenant/region-agnostic in its
-/// bytes (it carries no locator) — the tenant/region scope is the [`RepoLoc`] it is restored UNDER,
-/// through the validated resolver, so a backup can never be restored across the tenant boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitRepoBackup {
-    /// The ref snapshot `(fully-qualified name, tip oid)` — the consistency point. Every tip's
-    /// closure is present in `pack`.
     refs: Vec<(String, Oid)>,
-    /// The complete, self-contained (non-thin) packfile of every object reachable from `refs`.
     pack: Vec<u8>,
 }
 
 impl GitRepoBackup {
-    /// The store-tier this backup plugs into in the storage framework: the **T2 object tier**. The
-    /// git odb is content-addressed (immutable, hash-keyed objects) — the same re-hash-verifiable
-    /// posture [`StoreTier::Object`] models. Reconciles the git tier with the framework's
-    /// classification instead of forking a second backup taxonomy.
     pub fn store_tier() -> StoreTier {
         StoreTier::Object
     }
 
-    /// **Make a REAL backup of `repo`** — snapshot the refs (the consistency point), then pack the
-    /// complete object closure reachable from those tips via libgit2 (we do NOT reimplement
-    /// packing). The returned artifact is reconstructable on its own.
     pub fn create(repo: &DurableGitRepo) -> Result<GitRepoBackup, GitBackupError> {
         Self::create_bounded(repo, MAX_BACKUP_PACK_BYTES)
     }
@@ -222,12 +127,8 @@ impl GitRepoBackup {
         repo: &DurableGitRepo,
         maximum_pack_bytes: usize,
     ) -> Result<GitRepoBackup, GitBackupError> {
-        // (1) Ref-snapshot point FIRST. Objects are immutable/append-only, so the closure reachable
-        // from these exact tips is frozen — the backed-up refs will only point at backed-up objects.
         let refs = snapshot_refs(repo)?;
 
-        // (2) Pack the full closure with libgit2. The compatibility object still owns the complete
-        // pack; production file callers use `create_to_file` below to keep these bytes on disk.
         let pack = with_packbuilder(repo, &refs, |pb| {
             let mut pack = Vec::new();
             let mut exceeded = false;
@@ -251,9 +152,6 @@ impl GitRepoBackup {
         Ok(GitRepoBackup { refs, pack })
     }
 
-    /// Create the current v2 artifact directly on disk without owning the pack or complete frame in
-    /// Rust memory. The process-unique temp file is fsynced and atomically renamed only after the
-    /// pack length is patched and the checksum over the corrected frame has been appended.
     pub fn create_to_file(
         repo: &DurableGitRepo,
         path: &Path,
@@ -266,7 +164,6 @@ impl GitRepoBackup {
         path: &Path,
         maximum_pack_bytes: usize,
     ) -> Result<VerifiedGitRepoBackupFile, GitBackupError> {
-        // The refs are the consistency point and MUST precede any pack traversal.
         let refs = snapshot_refs(repo)?;
         let parent = path
             .parent()
@@ -388,9 +285,6 @@ impl GitRepoBackup {
             .and_then(|()| handle.seek(std::io::SeekFrom::Start(0)).map(|_| ()))
             .map_err(|e| io("patch", e))?;
 
-        // The length field precedes the pack, so preserving the exact v2 wire format requires a
-        // second disk pass after it is known. This pass is fixed-memory and hashes the corrected
-        // frame, not the placeholder bytes.
         let mut hasher = blake3::Hasher::new();
         let mut remaining = frame_len;
         let mut buffer = [0u8; STREAM_BUFFER_BYTES];
@@ -409,25 +303,18 @@ impl GitRepoBackup {
         Ok(())
     }
 
-    /// The ref snapshot captured in this backup.
     pub fn refs(&self) -> &[(String, Oid)] {
         &self.refs
     }
 
-    /// The number of refs in the snapshot.
     pub fn ref_count(&self) -> usize {
         self.refs.len()
     }
 
-    /// The packfile size in bytes (the backup-size signal; the real repo bytes, not a modeled len).
     pub fn pack_len(&self) -> usize {
         self.pack.len()
     }
 
-    /// **Serialize to a single self-describing artifact** (the off-host backup blob). Length-prefixed
-    /// binary frame: `MAGIC · u32 ref_count · {u32 name_len · name · u32 oid_len · oid}* · u64
-    /// pack_len · pack · blake3(frame)`. Big-endian. From these bytes alone the repo is
-    /// reconstructable, and corruption in either the ref snapshot or pack is detected before parse.
     pub fn serialize(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(MAGIC.len() + 16 + self.pack.len() + CHECKSUM_LEN);
         self.write_frame(&mut out)
@@ -462,9 +349,6 @@ impl GitRepoBackup {
         writer.write_all(hasher.finalize().as_bytes())
     }
 
-    /// **Reconstruct a backup from its serialized bytes** — the artifact-alone path. Any shortfall
-    /// (bad magic, a truncated length, non-utf8 ref) is a LOUD [`GitBackupError::BadArtifact`],
-    /// never a silent partial parse.
     pub fn deserialize(bytes: &[u8]) -> Result<GitRepoBackup, GitBackupError> {
         Self::deserialize_bounded(bytes, MAX_BACKUP_ARTIFACT_BYTES, MAX_BACKUP_PACK_BYTES)
     }
@@ -564,7 +448,6 @@ impl GitRepoBackup {
         Ok(GitRepoBackup { refs, pack })
     }
 
-    /// Write the artifact to an off-host file (the real backup blob on disk).
     pub fn write_to_file(&self, path: &Path) -> Result<(), GitBackupError> {
         let parent = path
             .parent()
@@ -578,7 +461,6 @@ impl GitRepoBackup {
         .map_err(GitBackupError::Durable)
     }
 
-    /// Read + reconstruct the artifact from an off-host file.
     pub fn read_from_file(path: &Path) -> Result<GitRepoBackup, GitBackupError> {
         Self::read_from_file_bounded(path, MAX_BACKUP_ARTIFACT_BYTES)
     }
@@ -615,10 +497,6 @@ impl GitRepoBackup {
     }
 }
 
-/// A bounded, verified backup artifact whose pack remains on disk. The private fields ensure a
-/// streamed restore can only start from an artifact that passed exact framing/ref validation and,
-/// for v2, the outer BLAKE3 checksum. The opened handle is retained so replacing `path` after
-/// verification cannot swap in different bytes at restore time.
 #[derive(Debug)]
 pub struct VerifiedGitRepoBackupFile {
     file: std::fs::File,
@@ -629,9 +507,6 @@ pub struct VerifiedGitRepoBackupFile {
 }
 
 impl VerifiedGitRepoBackupFile {
-    /// Open and fully verify a v1 or v2 artifact with fixed-size pack reads. v1 remains readable for
-    /// compatibility; it has no outer checksum by definition, but its pack digest is still pinned
-    /// here and rechecked while libgit2 ingests the pack during restore.
     pub fn open(path: &Path) -> Result<Self, GitBackupError> {
         let mut file = std::fs::File::open(path)
             .map_err(|e| GitBackupError::Io(format!("open artifact {}: {e}", path.display())))?;
@@ -828,17 +703,14 @@ impl VerifiedGitRepoBackupFile {
         })
     }
 
-    /// The validated ref snapshot stored outside the on-disk pack.
     pub fn refs(&self) -> &[(String, Oid)] {
         &self.refs
     }
 
-    /// The number of validated refs in the artifact.
     pub fn ref_count(&self) -> usize {
         self.refs.len()
     }
 
-    /// The pack length without materialising the pack.
     pub fn pack_len(&self) -> u64 {
         self.pack_len
     }
@@ -906,10 +778,6 @@ fn read_frame_u64(
     Ok(u64::from_be_bytes(bytes))
 }
 
-// ───────────────────────────── a tiny bounds-checked cursor (artifact parse) ───────────────────────
-
-/// A minimal big-endian reader over the artifact bytes — every read is bounds-checked so a
-/// truncated artifact is a loud [`GitBackupError::BadArtifact`], never an out-of-bounds panic.
 struct Cursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -953,31 +821,6 @@ impl<'a> Cursor<'a> {
     }
 }
 
-// ───────────────────────────── the destructive restore ────────────────────────────────────────────
-
-/// **DESTRUCTIVE restore of a backup onto a CLEAN target** (the GT-002 headline). Reconstructs the
-/// repo at `loc` (under `store`'s validated resolver — tenant/region-scoped) from `backup` ALONE:
-///
-/// 1. **Clean-target guard** — if a repo already exists at `loc`, REFUSE
-///    ([`GitBackupError::TargetNotClean`]). A genuine recovery lands on an empty target; it never
-///    clobbers a live repo.
-/// 2. **Stage off to the side** — build the whole repo (init_bare + pack ingest + ref recreate) at a
-///    SIBLING temp path under the same `<tenant>/<region>/` dir (same filesystem), then
-///    [`std::fs::rename`] it onto the final `<repo>.git` path ONLY after every step succeeds.
-/// 3. **Rollback on any error** — if the pack ingest or a ref write fails (e.g. a corrupt artifact:
-///    libgit2's indexer hard-verifies the pack, a flipped ref oid points at a missing object), the
-///    staging dir is removed and the FINAL path is left CLEAN. A failed restore never poisons its own
-///    target — an immediate retry with a good artifact succeeds with no manual cleanup.
-///
-/// **Atomicity (approach (a) — temp + atomic rename):** the final path appears in one `rename` only
-/// when the repo is complete, so a mid-restore failure (Err *or* a crash) leaves the final location
-/// empty (at worst an orphan staging dir beside it, which never blocks the real locator).
-///
-/// The pack is ingested through libgit2's indexer ([`git2::Odb::packwriter`]) — objects are
-/// re-validated as they land (a corrupt pack fails, not a silent bad-bytes write) — and the refs are
-/// recreated through the GT-001 durable CAS create path (reflog-logged, on disk). The restored repo
-/// is a valid bare repo whose refs point at the same object graph as the source — proven IDENTICAL on
-/// read-back + `git fsck --full --strict` clean by the integration test.
 pub fn restore_repo<P: RepoPathResolver>(
     store: &DurableGitStore<P>,
     loc: &RepoLoc,
@@ -986,10 +829,6 @@ pub fn restore_repo<P: RepoPathResolver>(
     restore_repo_staged(store, loc, |repo| build_repo_from_memory(repo, backup))
 }
 
-/// Restore a verified file-backed artifact without allocating its pack. The held file handle is
-/// sought to the verified pack offset and copied into libgit2's indexer in fixed-size chunks. Its
-/// pack digest is recomputed during that copy and must still match before the indexer is committed,
-/// refs are recreated, or the staging repo is published; this catches post-open inode mutation.
 pub fn restore_repo_from_file<P: RepoPathResolver>(
     store: &DurableGitStore<P>,
     loc: &RepoLoc,
@@ -1003,7 +842,6 @@ fn restore_repo_staged<P: RepoPathResolver>(
     loc: &RepoLoc,
     build: impl FnOnce(&DurableGitRepo) -> Result<(), GitBackupError>,
 ) -> Result<DurableGitRepo, GitBackupError> {
-    // (1) Clean-target guard — never clobber a live repo (genuine recovery only).
     if store.repo_exists(loc) {
         let path = store
             .repo_path(loc)
@@ -1014,14 +852,8 @@ fn restore_repo_staged<P: RepoPathResolver>(
         )));
     }
 
-    // Resolve (and thereby VALIDATE) the final path FIRST — a traversing locator is refused here,
-    // before any staging dir is created (the resolver guard is never bypassed).
     let final_path = store.repo_path(loc)?;
 
-    // (2) A sibling staging locator: same tenant/region (so it lands in the SAME parent dir → same
-    // filesystem, making the publish rename atomic), with a unique temp repo slug. The `.` chars are
-    // valid slug chars (the resolver accepts `[A-Za-z0-9._-]`); the `.restoring.<n>.tmp` suffix never
-    // collides with the real locator, so it can never be reached as a live repo.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -1033,8 +865,6 @@ fn restore_repo_staged<P: RepoPathResolver>(
     );
     let staging_path = store.repo_path(&staging_loc)?;
 
-    // Build the full repo at the staging path. On ANY failure, remove the staging dir and return —
-    // the final path is never touched (it stays CLEAN for an immediate retry).
     let build_result = store
         .create_repo(&staging_loc)
         .map_err(GitBackupError::Durable)
@@ -1044,7 +874,6 @@ fn restore_repo_staged<P: RepoPathResolver>(
         return Err(e);
     }
 
-    // (3) Atomic publish: move the complete staging repo onto the final path in one rename.
     if let Err(e) = std::fs::rename(&staging_path, &final_path) {
         let _ = std::fs::remove_dir_all(&staging_path);
         return Err(GitBackupError::Io(format!(
@@ -1068,7 +897,6 @@ fn restore_repo_staged<P: RepoPathResolver>(
             ))
         })?;
 
-    // Open the published repo through the validated store (the returned handle is on the final path).
     store.open_repo(loc).map_err(GitBackupError::Durable)
 }
 
@@ -1076,7 +904,6 @@ fn build_repo_from_memory(
     repo: &DurableGitRepo,
     backup: &GitRepoBackup,
 ) -> Result<(), GitBackupError> {
-    // Ingest the self-contained pack into the empty odb (libgit2 indexes + verifies it).
     if !backup.pack.is_empty() {
         let git = git2::Repository::open(repo.path())
             .map_err(|e| git_err(&format!("open restore target {}", repo.path().display()), e))?;
@@ -1150,8 +977,6 @@ fn build_repo_from_file(
 }
 
 fn recreate_refs(repo: &DurableGitRepo, refs: &[(String, Oid)]) -> Result<(), GitBackupError> {
-    // Recreate each ref through the durable CAS create path (on-disk, reflog-logged). A ref can only
-    // publish after its object was accepted by the indexer above.
     for (name, oid) in refs {
         repo.update_ref_cas(
             name,
@@ -1185,7 +1010,6 @@ mod tests {
         RepoLoc::new("acme", "fr-par", "core")
     }
 
-    /// Seed a small real history (two commits on main) + a branch, return (refname→oid) we expect.
     fn seed(repo: &DurableGitRepo) -> Vec<(String, Oid)> {
         let psn = "psn-7@acme.noreply";
         let b1 = repo.write_blob(b"v1\n").unwrap();
@@ -1206,8 +1030,6 @@ mod tests {
         want
     }
 
-    /// The store tier reconciles with the framework as the content-addressed T2 object tier (backed
-    /// up, not derived) — we reuse the vocabulary, not a forked taxonomy.
     #[test]
     fn git_backup_plugs_into_the_t2_object_tier() {
         assert_eq!(GitRepoBackup::store_tier(), StoreTier::Object);
@@ -1215,7 +1037,6 @@ mod tests {
         assert!(!GitRepoBackup::store_tier().is_rebuilt_from_source());
     }
 
-    /// The artifact round-trips through serialize/deserialize byte-for-byte (reconstructable alone).
     #[test]
     fn artifact_serialize_roundtrips() {
         let root = temp_root("ser");
@@ -1240,16 +1061,14 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A corrupt artifact is REFUSED loudly (bad magic / truncation), never a silent partial parse.
     #[test]
     fn corrupt_artifact_is_refused() {
         assert!(matches!(
             GitRepoBackup::deserialize(b"not a myelin backup"),
             Err(GitBackupError::BadArtifact(_))
         ));
-        // A valid prefix then truncated mid-frame.
         let mut t = MAGIC.to_vec();
-        t.extend_from_slice(&5u32.to_be_bytes()); // claims 5 refs, then nothing
+        t.extend_from_slice(&5u32.to_be_bytes());
         assert!(matches!(
             GitRepoBackup::deserialize(&t),
             Err(GitBackupError::BadArtifact(_))
@@ -1375,22 +1194,17 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// **DESTRUCTIVE round-trip into a CLEAN target (the unit slice).** Back up → restore into a
-    /// brand-new empty root (the original never touched) → refs + a sample object identical +
-    /// in-process fsck clean. (The full external `git fsck` oracle runs in `tests/`.)
     #[test]
     fn destructive_restore_into_a_clean_root_reads_back_identical() {
         let src_root = temp_root("src");
         let src_store = DurableGitStore::rooted(&src_root);
         let src_repo = src_store.create_repo(&loc()).unwrap();
         let want = seed(&src_repo);
-        // Persist + reload the artifact from disk so the restore truly reads bytes alone.
         let artifact = temp_root("artifact");
         std::fs::create_dir_all(&artifact).unwrap();
         let artifact_file = artifact.join("core.gitbackup");
         GitRepoBackup::create_to_file(&src_repo, &artifact_file).unwrap();
 
-        // A genuinely CLEAN target root — the original src_root is NOT visible to it.
         let dst_root = temp_root("dst");
         let dst_store = DurableGitStore::rooted(&dst_root);
         assert!(!dst_store.repo_exists(&loc()), "target starts clean/empty");
@@ -1398,9 +1212,7 @@ mod tests {
         let mut reloaded = VerifiedGitRepoBackupFile::open(&artifact_file).unwrap();
         let restored = restore_repo_from_file(&dst_store, &loc(), &mut reloaded).unwrap();
 
-        // Every ref reads back identical.
         assert_eq!(restored.list_refs_bounded(MAX_BACKUP_REFS).unwrap(), want);
-        // Every source object exists + reads back byte-identical in the restored odb.
         for (_, tip) in &want {
             let src_bytes = src_repo.read_object_bounded(tip, 64 * 1024 * 1024).unwrap();
             let dst_bytes = restored.read_object_bounded(tip, 64 * 1024 * 1024).unwrap();
@@ -1415,7 +1227,6 @@ mod tests {
             .fsck()
             .expect("in-process fsck clean on the restored repo");
 
-        // Restoring AGAIN over the now-present repo is refused (clean-target guard).
         assert!(matches!(
             restore_repo_from_file(&dst_store, &loc(), &mut reloaded),
             Err(GitBackupError::TargetNotClean(_))

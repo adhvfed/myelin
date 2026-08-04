@@ -1,24 +1,3 @@
-//! # CT-006c EXTERNAL-ORACLE: a REAL `git clone`/`git fetch` against the Myelin smart-HTTP server
-//!
-//! The GT-006 read-side done-bar. Binds a real edge listener, registers the git smart-HTTP wire
-//! endpoints ([`myelin_edge::register_git_wire`]) over the DURABLE on-disk backend, and drives the
-//! **host's REAL `git`** as the client:
-//!   1. a real bare repo whose packfile is **> 256 KiB** (the old `SANDBOX_CAPTURE_BOUND` that silently
-//!      truncated the wire — CT-006b FU-1) is `git clone`d over HTTP → the clone SUCCEEDS, `git fsck` is
-//!      clean, and the cloned HEAD/content matches the origin (the big pack came through WHOLE — the
-//!      streaming fix proven);
-//!   2. a new origin commit is `git fetch`ed → the new commit arrives;
-//!   3. an UNAUTHENTICATED clone (no token) is REFUSED; a CROSS-TENANT clone (another tenant's token) is
-//!      REFUSED — no repo bytes, no existence leak.
-//!
-//! Every served byte is a REAL `runsc` run of REAL `git upload-pack` inside the hardened gVisor sandbox
-//! (`GvisorBackend::launch_git_wire`), streamed to the client through the production `RoutedGitCore`.
-//!
-//! ## Gating
-//! SKIPS gracefully when `runsc`/the pinned production git rootfs/the host `git` are absent. With
-//! `MYELIN_REQUIRE_RUNSC=1` an absent capability is a HARD failure (never a vacuous green). Run:
-//! `MYELIN_REQUIRE_RUNSC=1 cargo test -p myelin-edge --test git_wire_http_clone_oracle_test -- --nocapture`.
-
 use myelin_ci_sandbox::verified_gvisor_git_rootfs;
 use myelin_edge::{
     register_git_durable, register_git_wire, serve_edge, AllowAll, CheckBackedRepoAuthorizer,
@@ -44,8 +23,6 @@ use tokio::net::TcpListener;
 
 const REGION: &str = "eu-west";
 const SCHEME: &str = "agent";
-
-// ───────────────────────────── runsc / rootfs / git preconditions ─────────────────────────────
 
 fn runsc_bin() -> Option<String> {
     let bin = std::env::var("MYELIN_RUNSC_BIN").unwrap_or_else(|_| "runsc".to_string());
@@ -73,7 +50,7 @@ fn require_or_skip(test: &str) -> bool {
     if runsc_bin().is_none() || !host_git() {
         if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
             panic!(
-                "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc` or host git is absent — CT-006c \
+                "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc` or host git is absent - CT-006c \
                  refuses a VACUOUS green."
             );
         }
@@ -86,7 +63,7 @@ fn require_or_skip(test: &str) -> bool {
         Err(error) if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") => {
             panic!(
                 "[{test}] MYELIN_REQUIRE_RUNSC=1 but the pinned production git rootfs is \
-                 unavailable: {error} — CT-006c refuses a VACUOUS green."
+                 unavailable: {error} - CT-006c refuses a VACUOUS green."
             );
         }
         Err(error) => {
@@ -95,8 +72,6 @@ fn require_or_skip(test: &str) -> bool {
         }
     }
 }
-
-// ───────────────────────────── host-git helpers (the external oracle) ─────────────────────────────
 
 fn now() -> i64 {
     SystemTime::now()
@@ -134,8 +109,6 @@ fn run_git(args: &[&str], cwd: Option<&Path>) {
     );
 }
 
-/// Deterministic pseudo-random incompressible bytes (so the packfile size ≈ raw content — no zlib
-/// shrink masks the size). A tiny xorshift; no external dep.
 fn pseudo_random(n: usize, mut seed: u64) -> Vec<u8> {
     let mut v = Vec::with_capacity(n);
     while v.len() < n {
@@ -148,9 +121,6 @@ fn pseudo_random(n: usize, mut seed: u64) -> Vec<u8> {
     v
 }
 
-/// Build `<root>/<tenant>/<region>/<repo>.git` as a REAL bare repo carrying ~`payload_bytes` of
-/// incompressible content (so its packfile clears 256 KiB). Returns the HEAD oid + the work dir (kept
-/// so a follow-on commit + push can be made for the fetch leg).
 fn make_big_repo(
     root: &Path,
     tenant: &str,
@@ -160,8 +130,6 @@ fn make_big_repo(
 ) -> (String, PathBuf) {
     let bare = root.join(tenant).join(region).join(format!("{slug}.git"));
     std::fs::create_dir_all(bare.parent().unwrap()).expect("mkdir repo parent");
-    // `-b main` so the bare repo's HEAD is a symref to refs/heads/main (else HEAD dangles at the
-    // default branch and a real `git clone` can't check out — "remote HEAD refers to nonexistent ref").
     run_git(
         &[
             "init",
@@ -179,7 +147,6 @@ fn make_big_repo(
     run_git(&["init", "-q", "-b", "main"], Some(&work));
     run_git(&["config", "user.email", "t@t.t"], Some(&work));
     run_git(&["config", "user.name", "t"], Some(&work));
-    // Split the payload across a few files so there are real trees/blobs.
     let per = payload_bytes / 4;
     for i in 0..4 {
         std::fs::write(
@@ -217,8 +184,6 @@ fn make_big_repo(
     )
 }
 
-// ───────────────────────────── the edge server (real auth, real listener) ─────────────────────────────
-
 fn seed_principal(store: &PrincipalStore, tenant: &str, pid: &str, subject_key: &str) {
     let scope = TenantScope::from_verified_token(
         &Principal::stub(
@@ -243,8 +208,6 @@ fn seed_principal(store: &PrincipalStore, tenant: &str, pid: &str, subject_key: 
         .expect("link credential");
 }
 
-/// Build a gateway: real PASETO auth (a fresh cell), the wire endpoints over a durable backend rooted at
-/// `root`, default token scheme `agent` (so a plain `Authorization: Bearer` header authenticates).
 fn build(root: &Path) -> (Arc<Gateway>, CellTokenAuthority) {
     let cell = CellTokenAuthority::from_seed(&[7u8; 32], &[9u8; 32]).expect("cell authority");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
@@ -295,7 +258,6 @@ async fn spawn(gateway: Arc<Gateway>) -> SocketAddr {
     addr
 }
 
-/// Run `git clone` over HTTP with an optional Bearer token. Returns (success, stdout, stderr).
 fn git_clone(
     addr: SocketAddr,
     token: Option<&str>,
@@ -304,7 +266,6 @@ fn git_clone(
 ) -> (bool, String, String) {
     let url = format!("http://{addr}{repo_url_path}");
     let mut c = Command::new("git");
-    // Force the smart-HTTP transport; keep output deterministic.
     c.env("GIT_TERMINAL_PROMPT", "0");
     if let Some(t) = token {
         c.arg("-c")
@@ -319,8 +280,6 @@ fn git_clone(
     )
 }
 
-// ═══════════════════════════════ the external-oracle proof ═══════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn real_git_clone_fetch_over_smart_http_with_auth() {
     if !require_or_skip("ct006c clone/fetch oracle") {
@@ -328,7 +287,6 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
     }
 
     let root = temp_root("oracle");
-    // ~2 MiB payload ⇒ a packfile WELL over the old 256 KiB SANDBOX_CAPTURE_BOUND (proves the fix).
     let (origin_head, work) = make_big_repo(&root, "acme", "eu-west", "widgets", 2 * 1024 * 1024);
     println!("=== CT-006c: origin HEAD = {origin_head} (a > 256 KiB packfile) ===");
 
@@ -336,7 +294,6 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
     let addr = spawn(gw).await;
     let token = mint(&cell, "acme", "jti-clone");
 
-    // ── 1. REAL `git clone` over smart-HTTP with the Bearer token ──
     let dst = root.join("clone-dst");
     let (ok, so, se) = git_clone(addr, Some(&token), "/acme/eu-west/widgets.git", &dst);
     println!("=== git clone (authenticated) ===\nsuccess={ok}\nstdout=\n{so}\nstderr=\n{se}");
@@ -345,7 +302,6 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
         "the authenticated clone of a > 256 KiB-pack repo MUST succeed (streaming fix)"
     );
 
-    // `git fsck` the clone — proves the big pack arrived WHOLE + intact (no early-EOF truncation).
     let fsck = Command::new("git")
         .args(["-C", &dst.to_string_lossy(), "fsck", "--full"])
         .output()
@@ -358,7 +314,6 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
     );
     assert!(fsck.status.success(), "git fsck on the clone must be clean");
 
-    // The cloned HEAD matches the origin (the wanted history came through).
     let head = Command::new("git")
         .args(["-C", &dst.to_string_lossy(), "rev-parse", "HEAD"])
         .output()
@@ -374,7 +329,6 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
         "the cloned working tree must carry the repo content"
     );
 
-    // ── 2. add a commit to the origin, then REAL `git fetch` gets it ──
     std::fs::write(work.join("new.txt"), b"a second commit\n").expect("write new file");
     run_git(&["add", "new.txt"], Some(&work));
     run_git(
@@ -429,13 +383,11 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
         "fetch must deliver the new origin commit"
     );
 
-    // ── 3a. UNAUTHENTICATED clone is REFUSED (no token → 401, no bytes) ──
     let dst_noauth = root.join("clone-noauth");
     let (ok_n, so_n, se_n) = git_clone(addr, None, "/acme/eu-west/widgets.git", &dst_noauth);
-    println!("=== git clone (NO token) — must be refused ===\nsuccess={ok_n}\nstdout=\n{so_n}\nstderr=\n{se_n}");
+    println!("=== git clone (NO token) - must be refused ===\nsuccess={ok_n}\nstdout=\n{so_n}\nstderr=\n{se_n}");
     assert!(!ok_n, "an unauthenticated clone MUST be refused");
 
-    // ── 3b. CROSS-TENANT clone is REFUSED (globex's token for acme's repo → IDOR reject, no leak) ──
     let globex = mint(&cell, "globex", "jti-x");
     let dst_xtenant = root.join("clone-xtenant");
     let (ok_x, so_x, se_x) = git_clone(
@@ -444,7 +396,7 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
         "/acme/eu-west/widgets.git",
         &dst_xtenant,
     );
-    println!("=== git clone (CROSS-TENANT globex→acme) — must be refused ===\nsuccess={ok_x}\nstdout=\n{so_x}\nstderr=\n{se_x}");
+    println!("=== git clone (CROSS-TENANT globex→acme) - must be refused ===\nsuccess={ok_x}\nstdout=\n{so_x}\nstderr=\n{se_x}");
     assert!(
         !ok_x,
         "a cross-tenant clone MUST be refused (no repo bytes, no existence leak)"
@@ -454,12 +406,6 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// ═══════════════════════════ over-the-cap fail-loud (the streaming-bound guard) ═══════════════════════════
-
-/// An upload-pack response that exceeds the GENEROUS wire cap is REFUSED LOUDLY (a `GitCoreError`),
-/// NEVER returned as a silently-truncated `Ok` pack. Drives the production `RoutedGitCore` directly with
-/// a small per-launch wire cap (the cap derives from `disk_bytes`; the guest `/tmp` is ample so the cap —
-/// not an in-guest ENOSPC — is what fires) against a repo whose pack is far larger than the cap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn over_cap_upload_pack_response_errors_cleanly() {
     use myelin_ci_sandbox::ResourceLimits;
@@ -473,12 +419,8 @@ async fn over_cap_upload_pack_response_errors_cleanly() {
     }
 
     let root = temp_root("overcap");
-    // ~16 MiB of incompressible content ⇒ a packfile ≫ the 8 MiB wire cap below.
     let (_head, _work) = make_big_repo(&root, "acme", "eu-west", "huge", 16 * 1024 * 1024);
 
-    // A small WIRE cap (= disk_bytes) but an ample guest /tmp (8 MiB is plenty for upload-pack, which
-    // streams the pack to stdout, not to /tmp) — so OUR host-side cap is what trips, not an in-guest
-    // disk-full. The pack (~16 MiB) overruns the 8 MiB cap ⇒ fail-loud.
     let limits = ResourceLimits {
         cpu_millis: 2000,
         mem_bytes: 512 * 1024 * 1024,
@@ -495,7 +437,6 @@ async fn over_cap_upload_pack_response_errors_cleanly() {
     );
     let repo = RepoLoc::new("acme", "eu-west", "huge");
 
-    // A v0 stateless-rpc fetch request for HEAD — the serve will try to stream the full (oversize) pack.
     let bare = root.join("acme/eu-west/huge.git");
     let oid = {
         let o = Command::new("git")
@@ -524,21 +465,9 @@ async fn over_cap_upload_pack_response_errors_cleanly() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-// ═══════════════════════ R2.1a — R0.3 LIVE: the CheckEngine-backed per-repo authz on the wire ═══════════════════════
-//
-// The production composition (main.rs) now injects the CheckBackedRepoAuthorizer (Read → check(pull),
-// Write → check(push) against the live Git ReBAC fragment) + the TupleRepoBootstrap creator→admin
-// grant, and mounts register_git_wire. This oracle drives the SAME composition end-to-end through a
-// real serve_edge listener with the host's REAL `git`:
-//   RED  (pre-R2.1a: the AllowAllRepos default): mallory's clone/push of an un-granted repo SUCCEEDS
-//        — the un-granted-repo-reach hole, live on the wire.
-//   GREEN (this composition): mallory is denied 0-leak (404, never a 403 on the read path), the
-//        creator's bootstrap grant admits clone+push, and a grant on repo A does not admit repo B.
-
-/// The thresholds-file `[fail_static]` seed (mirrors live_check.rs / the production thresholds).
 fn r21a_threshold() -> FailStaticThreshold {
     FailStaticThreshold {
-        status: "OPEN — LEGAL".into(),
+        status: "OPEN - LEGAL".into(),
         owner: "DPO / Legal".into(),
         static_max_secs: None,
         static_max_default_secs: 300,
@@ -547,14 +476,9 @@ fn r21a_threshold() -> FailStaticThreshold {
     }
 }
 
-/// Build the R2.1a gateway: real PASETO auth, the durable git routes (create-repo → bootstrap
-/// grant) AND the wire endpoints, over a backend carrying the REAL CheckEngine-backed authorizer —
-/// the exact production shape (main.rs), with the in-memory S3 double standing in for PG.
 fn build_r21a(root: &Path) -> (Arc<Gateway>, CellTokenAuthority) {
     let cell = CellTokenAuthority::from_seed(&[11u8; 32], &[13u8; 32]).expect("cell authority");
     let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
-    // THREE distinct in-tenant principals: the creator (granted via bootstrap), mallory (NO grant —
-    // the adversary), and a second creator (for the cross-repo isolation leg).
     seed_principal(&store, "acme", "svc:creator", "subj-c");
     seed_principal(&store, "acme", "svc:mallory", "subj-m");
     seed_principal(&store, "acme", "svc:creator2", "subj-c2");
@@ -568,8 +492,6 @@ fn build_r21a(root: &Path) -> (Arc<Gateway>, CellTokenAuthority) {
         Arc::new(KmsEngine::new()),
     )));
 
-    // The production check slot (in-memory S3 double) with the Git fragment ADMITTED — exactly what
-    // main.rs composes over the durable store.
     let check = StoreBackedCheck::new(TupleStore::new(OutboxStore::new()));
     for admit in check.admit_git_fragment() {
         assert!(
@@ -615,7 +537,6 @@ fn mint_for(cell: &CellTokenAuthority, tenant: &str, jti: &str, subject_key: &st
     })
 }
 
-/// A minimal HTTP/1.1 POST over a raw TcpStream (no client dep): returns the full response text.
 fn http_post(addr: SocketAddr, path: &str, token: &str, body: &str) -> String {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(addr).expect("connect edge");
@@ -629,7 +550,6 @@ fn http_post(addr: SocketAddr, path: &str, token: &str, body: &str) -> String {
     out
 }
 
-/// Make a work repo with one commit under the tenant pseudonym identity (the GIT-1 push gate).
 fn r21a_work(root: &Path, tag: &str) -> PathBuf {
     let work = root.join(format!("work-{tag}"));
     std::fs::create_dir_all(&work).expect("mkdir work");
@@ -655,7 +575,6 @@ fn r21a_work(root: &Path, tag: &str) -> PathBuf {
     work
 }
 
-/// Run `git push <url> main` from `work` with a Bearer token. Returns (success, stdout, stderr).
 fn r21a_push(
     addr: SocketAddr,
     token: &str,
@@ -689,8 +608,6 @@ async fn r2_1a_live_repo_authz_denies_ungranted_admits_creator_and_isolates_repo
     let t_mallory = mint_for(&cell, "acme", "jti-r21a-m", "subj-m");
     let t_creator2 = mint_for(&cell, "acme", "jti-r21a-c2", "subj-c2");
 
-    // ── 1. the creator creates `widgets` THROUGH THE EDGE → 201 + the creator→admin bootstrap
-    //       grant is written (the R2.1a make-or-break: without it, deny-by-default orphans the repo).
     let resp = http_post(addr, "/v1/git/repos", &t_creator, r#"{"slug":"widgets"}"#);
     println!(
         "=== create widgets (creator) ===\n{}",
@@ -701,8 +618,6 @@ async fn r2_1a_live_repo_authz_denies_ungranted_admits_creator_and_isolates_repo
         "create-repo must 201: {resp}"
     );
 
-    // ── 2. ALLOW path (write): the creator's REAL `git push` succeeds off the bootstrap grant
-    //       (admin ⊆ push in the frozen fragment).
     let work = r21a_work(&root, "creator");
     let (ok, so, se) = r21a_push(addr, &t_creator, "/acme/eu-west/widgets.git", &work);
     println!("=== creator push ===\nsuccess={ok}\nstdout=\n{so}\nstderr=\n{se}");
@@ -711,7 +626,6 @@ async fn r2_1a_live_repo_authz_denies_ungranted_admits_creator_and_isolates_repo
         "the creator MUST push its fresh repo (bootstrap grant → push)"
     );
 
-    // ── 3. ALLOW path (read): the creator's REAL `git clone` succeeds (admin ⊆ pull).
     let dst = root.join("clone-creator");
     let (ok_c, so_c, se_c) = git_clone(addr, Some(&t_creator), "/acme/eu-west/widgets.git", &dst);
     println!("=== creator clone ===\nsuccess={ok_c}\nstdout=\n{so_c}\nstderr=\n{se_c}");
@@ -720,12 +634,9 @@ async fn r2_1a_live_repo_authz_denies_ungranted_admits_creator_and_isolates_repo
         "the creator MUST clone its fresh repo (bootstrap grant → pull)"
     );
 
-    // ── 4. DENY path (read, 0-leak): mallory — SAME tenant, NO grant — is refused with a 404
-    //       (repo existence is NOT leaked: the read-deny posture is `not found`, never a 403).
-    //       RED before R2.1a: with the AllowAllRepos production default this clone SUCCEEDED.
     let dst_m = root.join("clone-mallory");
     let (ok_m, so_m, se_m) = git_clone(addr, Some(&t_mallory), "/acme/eu-west/widgets.git", &dst_m);
-    println!("=== mallory clone (NO grant) — must be 0-leak denied ===\nsuccess={ok_m}\nstdout=\n{so_m}\nstderr=\n{se_m}");
+    println!("=== mallory clone (NO grant) - must be 0-leak denied ===\nsuccess={ok_m}\nstdout=\n{so_m}\nstderr=\n{se_m}");
     assert!(
         !ok_m,
         "an un-granted in-tenant clone MUST be refused (the R0.3 hole, closed LIVE)"
@@ -734,24 +645,19 @@ async fn r2_1a_live_repo_authz_denies_ungranted_admits_creator_and_isolates_repo
         se_m.contains("not found"),
         "the read denial is a 0-leak 404 (`repository not found`): {se_m}"
     );
-    // The exact curl-phrase pin (`returned error: 403`) — NOT a bare "403" substring, which can
-    // false-match the ephemeral listener PORT in the URL git prints.
     assert!(
         !se_m.contains("returned error: 403"),
         "a read denial must NOT leak existence via a 403: {se_m}"
     );
 
-    // ── 5. DENY path (write): mallory's REAL `git push` is a fail-closed 403.
     let (ok_mp, _so_mp, se_mp) = r21a_push(addr, &t_mallory, "/acme/eu-west/widgets.git", &work);
-    println!("=== mallory push (NO grant) — must be 403 ===\nsuccess={ok_mp}\nstderr=\n{se_mp}");
+    println!("=== mallory push (NO grant) - must be 403 ===\nsuccess={ok_mp}\nstderr=\n{se_mp}");
     assert!(!ok_mp, "an un-granted in-tenant push MUST be refused");
     assert!(
         se_mp.contains("returned error: 403"),
         "the write denial is a 403: {se_mp}"
     );
 
-    // ── 6. CROSS-REPO isolation: creator2 creates `secrets`; the creator's grant on `widgets`
-    //       does NOT admit `secrets` (0-leak 404 again).
     let resp2 = http_post(addr, "/v1/git/repos", &t_creator2, r#"{"slug":"secrets"}"#);
     assert!(
         resp2.starts_with("HTTP/1.1 201"),
@@ -760,7 +666,7 @@ async fn r2_1a_live_repo_authz_denies_ungranted_admits_creator_and_isolates_repo
     let dst_x = root.join("clone-crossrepo");
     let (ok_x, _so_x, se_x) =
         git_clone(addr, Some(&t_creator), "/acme/eu-west/secrets.git", &dst_x);
-    println!("=== creator clone of creator2's `secrets` — must be denied ===\nsuccess={ok_x}\nstderr=\n{se_x}");
+    println!("=== creator clone of creator2's `secrets` - must be denied ===\nsuccess={ok_x}\nstderr=\n{se_x}");
     assert!(
         !ok_x,
         "a grant on repo A must NOT admit repo B (cross-repo isolation)"
@@ -770,6 +676,6 @@ async fn r2_1a_live_repo_authz_denies_ungranted_admits_creator_and_isolates_repo
         "the cross-repo denial is 0-leak: {se_x}"
     );
 
-    println!("=== R2.1a ORACLE PROVEN: live CheckEngine repo-authz on the wire — 0-leak deny, bootstrap-grant allow, cross-repo isolation ===");
+    println!("=== R2.1a ORACLE PROVEN: live CheckEngine repo-authz on the wire - 0-leak deny, bootstrap-grant allow, cross-repo isolation ===");
     let _ = std::fs::remove_dir_all(&root);
 }

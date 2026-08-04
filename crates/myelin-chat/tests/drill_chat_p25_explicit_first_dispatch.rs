@@ -1,41 +1,3 @@
-//! # CHAT-D17 (the CHAT-P25 / P-419 dispatch-orchestration side) — explicit-first agent dispatch
-//! (no auto-spawn on mention; reserve-gated) + the agent provenance popover, proven against the
-//! `--use-mock` runtime (M4-C9 — the second committable unit; presence+streaming is CHAT-P24 / P-418).
-//!
-//! **Drill (the GATE):** `05-refined-shared-systems-architecture/testing-strategy/01-whole-system-e2e-and-drill-catalogue.md`
-//! row **CHAT-D17** (explicit-first): "A casual `@agent` mention → notifies the agent's inbox, does NOT
-//! spawn a costed run; only an explicit action/structured trigger dispatches; reserve/settle gates even
-//! the explicit run." **Thresholds: 0 auto-spawn; reserve gate.** Reconciliation
-//! `00-reconciliation-decisions.md` §6 (explicit-first dispatch CONFIRM, CHAT-1, AG-6). VISION §3
-//! (agent-native — agents have inboxes; a casual @agent notifies, does not spawn a costed run).
-//!
-//! ## What this drill PROVES (the CHAT-P25 chat-MODULE dispatch orchestration)
-//! The companion `drill_chat_d17_explicit_first.rs` (NOTIF-P22 / P-343) proves the explicit-first
-//! CLASS decision through the Bus dispatch TIER. THIS drill proves the **chat-module dispatch
-//! orchestration** ([`myelin_chat::dispatch`]) that CHAT-P25 ships:
-//! - a casual `@agent` mention → [`Disposition::NotifiedInbox`] (0 run, 0 reserve, 0 token mint) — the
-//!   explicit-first floor lives in the chat module's own dispatch path, not only in the tier;
-//! - **0 auto-spawn paths are wired** ([`no_auto_spawn_path_is_wired`] over the WHOLE casual chat
-//!   surface — a structural proof there is no mention→run edge);
-//! - an EXPLICIT action → reserve (11.7, no balance → no run) → mint a per-run token (4.7) → route the
-//!   run's chat output through `EffectApi` (8.2 — the routing split); the run is dispatched against the
-//!   `--use-mock` runtime (contract 8.3 — the real `LlmAgentRuntime` is the post-M5 swap);
-//! - the reserve gate bites EVEN the explicit run (no balance → `NoBalanceRefused`, nothing minted);
-//! - the agent provenance popover (S12) answers "why did this agent post?" from the dispatched run's
-//!   message envelope (`on_behalf_of` / `causation_id` / `correlation_id`), agent badge always set.
-//!
-//! **AG-D4 (the permanent sandbox-escape gate, contract 8.4 / X-6 #4):** before chat dispatches ANY
-//! agent-compute run it asserts AG-D4 is GREEN and runs NO compute over a RED gate. This drill consumes
-//! the REAL [`myelin_ci_sandbox::EscapeAttestation`] artifact (the drill is UPSTREAM, AG-P17 → P-229 /
-//! CI-P5 → P-239; chat reads it via the SAME green predicate the Fabric's `AgentExecGate` uses —
-//! [`myelin_chat::presence::ag_d4_attestation_is_green`], not a chat-local fork).
-//!
-//! **FLOORS named (VISION §3 / EI-01 §1):** (1) the no-auto-spawn path is a DELIBERATE counsel-gated
-//! **L-3** absence (recon §6 / AG-P20), NOT an omission — [`L3_AUTO_SPAWN_ABSENCE`] names it; (2) the
-//! dispatched brain is the MOCK runtime (`--use-mock`, 8.3 — the real `LlmAgentRuntime` is post-M5);
-//! (3) the real `EventInbox`(8.6)=AG-P4/P-216, the real `CostLedger`(11.7)=P-103/P-146, the real
-//! `mint_run_token`(4.7)=P-ID-18, the real `EffectApi`(8.2)=AG-P6/P-218 — chat CONSUMES all four.
-
 use myelin_agent::{
     AgentRuntime, Conversation, EffectApi, EffectResult, EventId as FxEventId, ProposedEffect,
     RunCtx, StepOutcome, Submission,
@@ -69,8 +31,6 @@ fn agent_id() -> PrincipalId {
     PrincipalId("agent:assistant".into())
 }
 
-// ─────────────────────── the REAL AG-D4 attestation field-view chat asserts over ───────────────────
-
 struct RealAtt<'a>(&'a EscapeAttestation);
 impl AgD4Attestation for RealAtt<'_> {
     fn artifact_tag(&self) -> &str {
@@ -84,8 +44,6 @@ impl AgD4Attestation for RealAtt<'_> {
     }
 }
 
-/// A REAL green AG-D4 attestation, minted from the corpus parser — NEVER hardcoded. `escaped` flips
-/// one attack to ESCAPED to model a red drill (which mints NO attestation — the source guard).
 fn real_attestation(escaped: bool) -> Result<EscapeAttestation, String> {
     let mut console = format!("{BEGIN_MARKER} corpus_version=1 kernel=6.1.168 guest_euid=0\n");
     for atk in CORPUS {
@@ -118,18 +76,12 @@ fn real_attestation(escaped: bool) -> Result<EscapeAttestation, String> {
     )
 }
 
-// ─────────────────────── the --use-mock runtime (the dispatched brain) ──────────────────────────────
-
-/// The mock runtime (`--use-mock`, contract 8.3) — the dispatched run's brain. A deterministic submit
-/// is a valid skeleton decision; the real `LlmAgentRuntime` is the post-M5 swap behind THIS seam.
 struct MockRuntime;
 impl AgentRuntime for MockRuntime {
     fn step(&self, _conv: &Conversation) -> StepOutcome {
         StepOutcome::Submit(Submission("the agent's reply".into()))
     }
 }
-
-// ─────────────────────── the mock Identity (mint_run_token, 4.7) + EffectApi (8.2) ──────────────────
 
 struct MockIdentity;
 impl myelin_identity::IdentityService for MockIdentity {
@@ -215,8 +167,6 @@ impl EffectApi for MockEffectApi {
     }
 }
 
-/// The agent's dispatched-run output message (the FINAL durable `chat.message.created`, provenance-
-/// bearing — §7.3 / §7.5). Carries the agent actor + the causal triple the popover derives over.
 fn dispatched_message(
     on_behalf_of: Option<PrincipalId>,
     causation: Option<EventId>,
@@ -255,24 +205,17 @@ fn dispatched_message(
     }
 }
 
-// ─────────────────────── AG-D4 must be GREEN before any dispatch ────────────────────────────────────
-
-/// **AG-D4 re-confirmed GREEN before chat dispatches any agent-compute run (contract 8.4).** The
-/// green-attestation artifact admits; a red one (any escape) refuses; a missing one is fail-closed.
 #[test]
 fn ag_d4_is_green_before_any_chat_agent_dispatch() {
-    // a REAL green attestation (minted from the green corpus parse) is admitted.
     let green = real_attestation(false).expect("a green drill mints a green attestation");
     assert!(
         ag_d4_attestation_is_green(Some(&RealAtt(&green))),
-        "AG-D4 green attestation admits — chat may dispatch agent compute"
+        "AG-D4 green attestation admits - chat may dispatch agent compute"
     );
-    // a RED drill mints NO attestation at all (the source guard) — a red AG-D4 is a dated no-go.
     assert!(
         real_attestation(true).is_err(),
         "a red drill must NOT mint an attestation (chat runs NO compute over a red gate)"
     );
-    // missing attestation → fail-closed.
     let none: Option<&RealAtt> = None;
     assert!(
         !ag_d4_attestation_is_green(none),
@@ -280,21 +223,13 @@ fn ag_d4_is_green_before_any_chat_agent_dispatch() {
     );
 }
 
-// ─────────────────────── CHAT-D17 — 0 auto-spawn from a casual mention ──────────────────────────────
-
-/// **CHAT-D17 threshold #1 — a casual `@agent` mention NOTIFIES, 0 auto-spawn, 0 reserve, 0 mint.**
-/// The chat-module dispatch path short-circuits a `NotifyOnly` class to `NotifiedInbox` WITHOUT ever
-/// touching the reserve gate / the token mint / `EffectApi` — the explicit-first floor in the module.
 #[test]
 fn a_casual_mention_notifies_zero_auto_spawn() {
-    // the class decision: a casual @agent mention is notify-only.
     assert_eq!(
-        dispatch_disposition_class(CHAT_MESSAGE_MENTIONED, /*is_explicit_action=*/ false),
+        dispatch_disposition_class(CHAT_MESSAGE_MENTIONED,  false),
         DispatchOutcome::NotifyOnly,
-        "a casual @agent mention notifies — it does NOT auto-spawn a costed run (CHAT-1)"
+        "a casual @agent mention notifies - it does NOT auto-spawn a costed run (CHAT-1)"
     );
-    // a NotifyOnly never reaches the run side (dispatch_explicit is only called for WouldDispatch).
-    // The disposition a notify produces is NotifiedInbox — modelled by the caller short-circuit:
     let outcome = dispatch_disposition_class(CHAT_MESSAGE_MENTIONED, false);
     let disp = match outcome {
         DispatchOutcome::NotifyOnly => Disposition::NotifiedInbox,
@@ -303,12 +238,10 @@ fn a_casual_mention_notifies_zero_auto_spawn() {
     assert_eq!(
         disp,
         Disposition::NotifiedInbox,
-        "the mention notifies the inbox — 0 auto-spawn (CHAT-D17 threshold)"
+        "the mention notifies the inbox - 0 auto-spawn (CHAT-D17 threshold)"
     );
 }
 
-/// **CHAT-D17 threshold #2 — 0 auto-spawn PATHS are wired (the structural CI signal).** Over the WHOLE
-/// casual chat surface, NO event auto-spawns a run — a structural proof there is no mention→run edge.
 #[test]
 fn zero_auto_spawn_paths_over_the_casual_chat_surface() {
     let chat_tokens: &[&str] = &[
@@ -320,32 +253,23 @@ fn zero_auto_spawn_paths_over_the_casual_chat_surface() {
         no_auto_spawn_path_is_wired(chat_tokens),
         "0 auto-spawn paths: no casual chat event spawns a costed run (the no-auto-spawn floor)"
     );
-    // the L-3 absence is a recorded decision, not a silent gap (EI-01 §1).
     assert!(
         L3_AUTO_SPAWN_ABSENCE.contains("counsel-gated"),
         "the no-auto-spawn path is a DELIBERATE L-3 absence, named"
     );
 }
 
-// ─────────────────────── CHAT-D17 — an explicit run reserves, mints, routes through EffectApi ───────
-
-/// **CHAT-D17 threshold #3 — an EXPLICIT action DOES dispatch: reserve (11.7) → mint (4.7) → EffectApi
-/// (8.2), against the `--use-mock` runtime.** Notify-only is not "the agent never runs": a deliberate
-/// structured action reserves the cost, mints a per-run token, and routes the run's output through
-/// the governed `EffectApi`. The mock runtime is the dispatched brain (the real LLM is post-M5).
 #[test]
 fn an_explicit_action_reserves_mints_and_routes_through_effect_api_against_the_mock() {
-    // the brain is the mock (--use-mock) — exercised so the runtime seam is real in the drill.
     let runtime = MockRuntime;
-    let _decision = runtime.step(&Conversation::default()); // the mock submits (deterministic).
+    let _decision = runtime.step(&Conversation::default());
 
     let id = MockIdentity;
     let fx = MockEffectApi;
     let mut ledger = CostLedger::new();
 
-    // an EXPLICIT action (a deliberate approve-reaction targeting the agent) → would-dispatch.
     assert_eq!(
-        dispatch_disposition_class(CHAT_REACTION_ADDED, /*is_explicit_action=*/ true),
+        dispatch_disposition_class(CHAT_REACTION_ADDED,  true),
         DispatchOutcome::WouldDispatch
     );
 
@@ -357,11 +281,10 @@ fn an_explicit_action_reserves_mints_and_routes_through_effect_api_against_the_m
         &agent_id(),
         "run:explicit:1",
         MicroUsd(5),
-        MicroUsd(10), // funded wallet
+        MicroUsd(10),
         ProposedEffect("chat.post".into()),
     );
 
-    // the run dispatched + carries the minted per-run token (4.7).
     assert_eq!(
         disp,
         Disposition::Dispatched {
@@ -369,7 +292,6 @@ fn an_explicit_action_reserves_mints_and_routes_through_effect_api_against_the_m
         },
         "an explicit action dispatches a costed run (reserve → mint → EffectApi)"
     );
-    // the run's chat output ROUTED through EffectApi (8.2 — the routing split, X-6).
     assert_eq!(
         applied,
         Some(EffectResult::Applied(FxEventId("applied:chat.post".into()))),
@@ -377,9 +299,6 @@ fn an_explicit_action_reserves_mints_and_routes_through_effect_api_against_the_m
     );
 }
 
-/// **CHAT-D17 threshold #4 — the reserve gate bites EVEN the explicit run (11.7).** With ZERO balance,
-/// a deliberate explicit action is REFUSED at the reserve gate: nothing is minted, nothing applies —
-/// the last clause of CHAT-D17 ("reserve/settle gates even the explicit run").
 #[test]
 fn the_reserve_gate_refuses_an_explicit_run_with_no_balance() {
     let id = MockIdentity;
@@ -394,7 +313,7 @@ fn the_reserve_gate_refuses_an_explicit_run_with_no_balance() {
         &agent_id(),
         "run:explicit:2",
         MicroUsd(50),
-        MicroUsd(0), // exhausted wallet
+        MicroUsd(0),
         ProposedEffect("chat.post".into()),
     );
 
@@ -412,12 +331,6 @@ fn the_reserve_gate_refuses_an_explicit_run_with_no_balance() {
     );
 }
 
-// ─────────────────────── the provenance popover (S12) on the dispatched run's message ──────────────
-
-/// **The agent provenance popover (S12) — "why did this agent post?" on the dispatched run's
-/// message.** Derived from the FINAL `chat.message.created` envelope: which agent + runtime, on whose
-/// authority (`on_behalf_of`), triggered by which event (`causation_id` — the explicit action), the
-/// `correlation_id` audit anchor, the agent badge always set (AI-Act legibility).
 #[test]
 fn the_dispatched_run_carries_a_provenance_popover() {
     let msg = dispatched_message(

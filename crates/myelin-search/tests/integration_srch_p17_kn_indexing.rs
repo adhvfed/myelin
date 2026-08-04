@@ -1,41 +1,3 @@
-//! # Integration — SRCH-P17 (P-260, M3): Search indexes the REAL Knowledge corpus
-//!
-//! **Drill source:** `testing-strategy/01-whole-system-e2e-and-drill-catalogue.md` SRCH-D1 (F1 — the
-//! zero-escape leak: a private/overridden page NEVER in any result incl. counts) + SRCH-D3 (F2 —
-//! cross-tenant IDOR = 0), the gate-invariant ratchet **re-confirmed on the REAL KN corpus** (the M2
-//! drills re-run on each new producer corpus). **Architecture:** `search-and-indexing.md` §4.7 (KN
-//! multilingual analyzers), §3.1 (the structured inline nodes as dependable facets), §4.6 (read-time
-//! rollup/formula — inputs indexed, derived never stored), §4.6.1 (the GIN-indexed JSONB facet scan
-//! FLOOR), §4.5 (vector-in-v1 semantic KN search). **Contracts:** 6.3 (consume KN's IndexSpec), 13.1
-//! (the content taxonomy), 13.3 (the FieldType facets). **Reconciliation:** X-2 (code_block.text raw),
-//! KN-3 (rollup/formula read-time).
-//!
-//! ## What this proves (the dated green artifact, 2026-06-21)
-//! The REAL `myelin-content` taxonomy ([`Block`]/[`InlineNode`]) is projected through
-//! [`myelin_search::page_search_projection`] (KN's owned 6.3 projection) into the LIVE
-//! [`IncrementalIndexer`] per-event pipeline (project-fetch → analyze multilingual → embed → upsert),
-//! then queried back through the engine surface. The GATE:
-//!
-//! 1. **KN indexing correctness** — a block/page query returns the right page multilingual (FR + EN);
-//!    the structured facets (mention/artifact_ref/embed) filter correctly (the JSONB GIN-scan path
-//!    for the custom DB field works); semantic KN search returns visible passages (vector-in-v1).
-//! 2. **Read-time-field correctness** — a `Cmp` over a rollup/formula field reads the INPUTS, not a
-//!    stored derived value (it compiles to a post-fetch predicate; the derived value is NEVER indexed).
-//! 3. **SRCH-D1 (F1) on the KN corpus** — a private page never appears in ANY result (FT, structured
-//!    facet, or semantic) incl. counts, for an unauthorized viewer; grant ⇒ it appears (the rejection
-//!    was the ACL firing, not a blanket deny).
-//! 4. **SRCH-D3 (F2) on the KN corpus** — a viewer's tenant partitions the index; a cross-tenant query
-//!    sees 0 of the other tenant's pages (the per-tenant index, partition-keyed).
-//!
-//! The ENGINE is UNCHANGED — this is producer-corpus wiring (the prompt's DoD). No mutation-core
-//! module is added; the SRCH-P09/P11/P15 mutation floors still hold on the real KN corpus (the engine
-//! decision logic is the same one those drills mutation-test; here it runs on KN content).
-//!
-//! ## Floor named
-//! The GIN-indexed JSONB facet scan for KN custom DB fields serves correctly here; the **measured
-//! projection-feeder promotion** to a generated index (per facet at > 5% of view executions, OQ-C) is
-//! the M5 follow-on **SRCH-P27** — promotion changes COST, never correctness.
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -55,10 +17,6 @@ use myelin_search::{
     FACET_EMBED, FACET_MENTION, FT_BODY_FIELD,
 };
 
-// ----------------------------------------------------------------------------------------------
-// fixtures — the REAL KN corpus (myelin-content Block/Inline) projected through KN's owned 6.3 spec
-// ----------------------------------------------------------------------------------------------
-
 fn tenant() -> TenantId {
     TenantId("acme".into())
 }
@@ -73,9 +31,6 @@ fn viewer(id: &str, t: &str) -> Principal {
     )
 }
 
-/// A scripted [`ProjectFetcher`] over a `ref → SearchProjection` map — the owner's `project(ref,
-/// viewer)` (5.6). The REAL KN corpus is built by [`page_search_projection`] over `Block` content,
-/// so this fetcher serves Knowledge's genuine 6.3 projection (NOT a DB read — the no-cross-db floor).
 #[derive(Default)]
 struct KnFetcher {
     projections: Mutex<BTreeMap<String, SearchProjection>>,
@@ -129,7 +84,6 @@ fn event_in(id: &str, type_: &str, subject: &str, t: &str) -> EventEnvelope {
     ev
 }
 
-/// Build the indexer over the REAL KN specs (the page + db_row declare_indexable shapes).
 fn kn_indexer(fetcher: Arc<KnFetcher>) -> IncrementalIndexer {
     IncrementalIndexer::new(
         vec![kn_page_index_spec(), kn_db_row_index_spec()],
@@ -138,8 +92,6 @@ fn kn_indexer(fetcher: Arc<KnFetcher>) -> IncrementalIndexer {
     )
 }
 
-/// A FR page with an @mention + an inline artifact_ref + a structured embed block (the three
-/// dependable reference facets) and a raw code block.
 fn fr_page_blocks() -> Vec<Block> {
     let issue = ArtifactRef("myelin://acme/issues/issue/ENG-7".into());
     let embedded = ArtifactRef("myelin://acme/knowledge/page/embedded-1".into());
@@ -168,7 +120,6 @@ fn fr_page_blocks() -> Vec<Block> {
     ]
 }
 
-/// An EN page (a different language — proves multilingual indexing).
 fn en_page_blocks() -> Vec<Block> {
     vec![
         Block::Heading {
@@ -181,13 +132,6 @@ fn en_page_blocks() -> Vec<Block> {
     ]
 }
 
-// ----------------------------------------------------------------------------------------------
-// 1. KN indexing correctness — multilingual + structured facets + GIN-scan + vector-in-v1
-// ----------------------------------------------------------------------------------------------
-
-/// **A block/page query returns the right page multilingual (FR + EN); semantic KN search returns a
-/// visible passage (vector-in-v1).** The REAL KN corpus is projected through KN's owned 6.3 spec and
-/// indexed through the live per-event pipeline.
 #[test]
 fn kn_pages_index_multilingual_and_are_searchable() {
     let fr_ref = "myelin://acme/knowledge/page/fr-1";
@@ -203,7 +147,6 @@ fn kn_pages_index_multilingual_and_are_searchable() {
     );
     let ix = kn_indexer(fetcher);
 
-    // Index both pages through the live per-event pipeline (project → analyze → embed → upsert).
     ix.index(&kn_event("e-fr", "knowledge.page.created", fr_ref))
         .expect("index fr page");
     ix.index(&kn_event("e-en", "knowledge.page.created", en_ref))
@@ -214,10 +157,8 @@ fn kn_pages_index_multilingual_and_are_searchable() {
         "both KN pages are live"
     );
 
-    // The viewer can see both pages (the allow-set ACL filter).
     let acl = AclFilter::ids([fr_ref, en_ref]);
 
-    // FR term hits the FR page (multilingual: the FR body was analyzed + indexed).
     let fr_hits = ix
         .search_ft(&tenant(), &region(), &acl, "ordonnanceur", 10)
         .expect("fr search");
@@ -230,7 +171,6 @@ fn kn_pages_index_multilingual_and_are_searchable() {
         "the FR term does not find the EN page"
     );
 
-    // EN term hits the EN page.
     let en_hits = ix
         .search_ft(&tenant(), &region(), &acl, "deadlock", 10)
         .expect("en search");
@@ -239,16 +179,14 @@ fn kn_pages_index_multilingual_and_are_searchable() {
         "the EN term finds the EN page"
     );
 
-    // The RAW code body is indexed (X-2): a code identifier from the FR page's code_block is found.
     let code_hits = ix
         .search_ft(&tenant(), &region(), &acl, "ordonnanceur_interblocage", 10)
         .expect("code search");
     assert!(
         code_hits.iter().any(|h| h.doc_id == fr_ref),
-        "the raw code_block body is indexed (X-2 — code is verbatim, not markdown-parsed)"
+        "the raw code_block body is indexed (X-2 - code is verbatim, not markdown-parsed)"
     );
 
-    // vector-in-v1: semantic KN search returns a visible passage (the page is semantically indexed).
     let embedder = MockEmbeddingAdapter::new(16);
     let q = embedder
         .embed("scheduler deadlock design")
@@ -266,8 +204,6 @@ fn kn_pages_index_multilingual_and_are_searchable() {
     );
 }
 
-/// **The structured inline-node facets (mention/artifact_ref/embed) filter correctly — the
-/// dependable-reference-facet path (§3.1), a node-array walk, never a regex over prose.**
 #[test]
 fn kn_structured_inline_node_facets_filter_correctly() {
     let fr_ref = "myelin://acme/knowledge/page/fr-1";
@@ -289,7 +225,6 @@ fn kn_structured_inline_node_facets_filter_correctly() {
 
     let acl = AclFilter::ids([fr_ref, plain_ref]);
 
-    // mention facet: the page that @mentions alice (the FR page) is found; the plain page is not.
     let m = ix
         .search_structured(
             &tenant(),
@@ -303,7 +238,6 @@ fn kn_structured_inline_node_facets_filter_correctly() {
     assert_eq!(m.len(), 1, "exactly the page mentioning alice");
     assert_eq!(m[0].doc_id, fr_ref);
 
-    // artifact_ref facet: the page referencing ENG-7 is found.
     let a = ix
         .search_structured(
             &tenant(),
@@ -317,7 +251,6 @@ fn kn_structured_inline_node_facets_filter_correctly() {
     assert_eq!(a.len(), 1, "exactly the page referencing ENG-7");
     assert_eq!(a[0].doc_id, fr_ref);
 
-    // embed facet: the page embedding embedded-1 is found.
     let e = ix
         .search_structured(
             &tenant(),
@@ -332,15 +265,11 @@ fn kn_structured_inline_node_facets_filter_correctly() {
     assert_eq!(e[0].doc_id, fr_ref);
 }
 
-/// **A JSONB custom-field (in-doc database) query works via the GIN scan (§4.6.1).** A `db_row` with
-/// a custom `priority` field is indexed; a structured equality on it returns the row. The GIN scan
-/// serves correctly; the measured projection-feeder promotion is the M5 follow-on (SRCH-P27).
 #[test]
 fn kn_db_row_custom_field_query_via_gin_scan() {
     let row_a = "myelin://acme/knowledge/db_row/tasks:1";
     let row_b = "myelin://acme/knowledge/db_row/tasks:2";
     let fetcher = Arc::new(KnFetcher::default());
-    // The db_row projection: the custom DB fields (priority/owner/due) + the order_key sort.
     let mut fa = BTreeMap::new();
     fa.insert("priority".to_string(), FieldValue::Select("high".into()));
     fa.insert("owner".to_string(), FieldValue::Principal("alice".into()));
@@ -380,7 +309,6 @@ fn kn_db_row_custom_field_query_via_gin_scan() {
         .expect("index row b");
 
     let acl = AclFilter::ids([row_a, row_b]);
-    // The GIN-scan facet query: priority == high → exactly row_a.
     let hits = ix
         .search_structured(
             &tenant(),
@@ -399,35 +327,21 @@ fn kn_db_row_custom_field_query_via_gin_scan() {
     assert_eq!(hits[0].doc_id, row_a);
 }
 
-// ----------------------------------------------------------------------------------------------
-// 2. Read-time rollup/formula correctness (§4.6 / KN-3)
-// ----------------------------------------------------------------------------------------------
-
-/// **A `Cmp` over a KN rollup/formula field reads the INPUTS, not a stored derived value (KN-3).** The
-/// db_row schema declares a `rollup_total` as a READ-TIME field; a query over it compiles to a
-/// post-fetch predicate (NEVER a structured clause over a stored value — the derived value is never
-/// indexed). This is the freshness/consistency choice (§4.6).
 #[test]
 fn kn_rollup_field_is_read_time_not_a_stored_indexed_value() {
-    // KN's db_row stored facets (priority/owner/due/order_key) are stored; a rollup/formula is
-    // read-time (its INPUTS are stored; the derived value is computed at read time).
     let spec: IndexSpec = kn_db_row_index_spec();
     let mut schema = FieldSchema::new().with(FT_BODY_FIELD, FieldDecl::stored(FieldType::Text));
     for (name, ty) in &spec.struct_fields {
         schema = schema.with(name.clone(), FieldDecl::stored(*ty));
     }
-    // The rollup/formula field — read-time (KN-3); its declared type is the DERIVED value's type.
     schema = schema.with("rollup_total", FieldDecl::read_time(FieldType::Int));
 
-    // Sanity: a stored custom field IS Stored; the rollup IS ReadTime.
     assert_eq!(schema.get("priority").unwrap().kind, FieldKind::Stored);
     assert_eq!(
         schema.get("rollup_total").unwrap().kind,
         FieldKind::ReadTime
     );
 
-    // A `Cmp` over the rollup field compiles to a POST-FETCH predicate — never a structured clause
-    // over a stored derived value (Search indexed only the INPUTS).
     let ast = QueryAst::compiled(Predicate::Cmp {
         op: CmpOp::Gt,
         lhs: Expr::Var("rollup_total".into()),
@@ -446,7 +360,6 @@ fn kn_rollup_field_is_read_time_not_a_stored_indexed_value() {
         "the rollup derived value is NEVER a stored/indexed structured clause (KN-3)"
     );
 
-    // The contrast: a `Cmp` over a STORED custom field (priority) IS a structured clause.
     let stored_ast = QueryAst::compiled(Predicate::Cmp {
         op: CmpOp::Eq,
         lhs: Expr::Var("priority".into()),
@@ -465,19 +378,11 @@ fn kn_rollup_field_is_read_time_not_a_stored_indexed_value() {
     );
 }
 
-// ----------------------------------------------------------------------------------------------
-// 3. SRCH-D1 (F1) — the zero-escape leak on the REAL KN corpus
-// ----------------------------------------------------------------------------------------------
-
-/// **SRCH-D1 (F1) re-confirmed on the KN corpus: a PRIVATE page never appears in ANY result (FT,
-/// structured facet, semantic) incl. counts, for an unauthorized viewer — and a grant makes it
-/// appear (the rejection was the ACL firing, not a blanket deny).**
 #[test]
 fn srch_d1_private_kn_page_never_leaks() {
     let visible = "myelin://acme/knowledge/page/visible-1";
     let private = "myelin://acme/knowledge/page/private-secret";
     let fetcher = Arc::new(KnFetcher::default());
-    // BOTH pages carry the SAME rare term — so a leak would be exposed by FT/count/IDF inference.
     let secret_blocks = vec![Block::Paragraph {
         inline: parse_inline("classified zarquon deadlock plan", &[]),
     }];
@@ -497,10 +402,8 @@ fn srch_d1_private_kn_page_never_leaks() {
         "both pages are indexed"
     );
 
-    // The unauthorized viewer's reachable set is JUST the visible page (the private page is NOT in it).
     let acl_unauth = AclFilter::ids([visible]);
 
-    // FT: the shared rare term `zarquon` — only the visible page surfaces; the private page never does.
     let hits = ix
         .search_ft(&tenant(), &region(), &acl_unauth, "zarquon", 10)
         .expect("ft");
@@ -515,7 +418,6 @@ fn srch_d1_private_kn_page_never_leaks() {
         "0 leak: the private page never surfaces"
     );
 
-    // Semantic: even if the private page is the STRONGER semantic match, it never surfaces.
     let embedder = MockEmbeddingAdapter::new(16);
     let q = embedder
         .embed("classified zarquon deadlock plan")
@@ -528,7 +430,6 @@ fn srch_d1_private_kn_page_never_leaks() {
         "0 RAG/vector leak: the private page is never a visible neighbour"
     );
 
-    // The chained grant: the viewer is now granted the private page → it becomes visible.
     let acl_granted = AclFilter::ids([visible, private]);
     let granted = ix
         .search_ft(&tenant(), &region(), &acl_granted, "zarquon", 10)
@@ -544,16 +445,8 @@ fn srch_d1_private_kn_page_never_leaks() {
     );
 }
 
-// ----------------------------------------------------------------------------------------------
-// 4. SRCH-D3 (F2) — cross-tenant IDOR = 0 on the REAL KN corpus
-// ----------------------------------------------------------------------------------------------
-
-/// **SRCH-D3 (F2) re-confirmed on the KN corpus: a viewer's tenant partitions the index — a query
-/// against a DIFFERENT tenant's index sees 0 of this tenant's pages (the per-tenant index, §3.4).**
 #[test]
 fn srch_d3_cross_tenant_kn_pages_do_not_leak() {
-    // Two tenants index a page under a COLLIDING doc-id namespace, so only the partition key (tenant,
-    // region) keeps them apart — not a lucky id difference.
     let acme_page = "myelin://acme/knowledge/page/shared-name";
     let evil_page = "myelin://evil/knowledge/page/shared-name";
     let fetcher = Arc::new(KnFetcher::default());
@@ -574,7 +467,6 @@ fn srch_d3_cross_tenant_kn_pages_do_not_leak() {
     let acme_t = TenantId("acme".into());
     let evil_t = TenantId("evil".into());
 
-    // Positive control: acme's viewer querying acme's index sees acme's page.
     let acme_hits = ix
         .search_ft(
             &acme_t,
@@ -589,8 +481,6 @@ fn srch_d3_cross_tenant_kn_pages_do_not_leak() {
         "acme sees its own page"
     );
 
-    // The cross-tenant attack: even with an allow-set NAMING the evil page's doc-id, querying ACME's
-    // partition returns 0 — the evil page lives in a DIFFERENT (tenant, region) index entirely.
     let cross = ix
         .search_ft(
             &acme_t,
@@ -605,7 +495,6 @@ fn srch_d3_cross_tenant_kn_pages_do_not_leak() {
         "0 cross-tenant: acme's index holds none of evil's pages"
     );
 
-    // And the evil tenant's index, conversely, holds only evil's page.
     let evil_hits = ix
         .search_ft(
             &evil_t,

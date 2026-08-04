@@ -1,38 +1,3 @@
-//! **CT-004c.1 — the DURABLE `job_queue` store + the dead-runner reaper, PROVEN against live Postgres.**
-//!
-//! The sibling `integration_ci_p12_scheduler_claim.rs` proved the raw claim/reap/cancel SQL against a
-//! per-pid SCRATCH table (string-replacing `job_queue`), NOT through a production store (there was
-//! none — the scheduler was two-form: the `&str` SQL + the DB-free `SchedulerState` model). CT-004c.1
-//! builds the real store ([`myelin_ci_controlplane::CiJobQueueStore`]) and re-proves the whole claim
-//! intelligence THROUGH it, under the tenant-/region-scoped RLS transactions the FORCE-RLS `job_queue`
-//! table requires:
-//!
-//!   1. **claim** leases exactly ONE eligible row — residency (out-of-region NOT claimed) + affinity
-//!      (wrong-label NOT claimed) + trust (untrusted/self-hosted NOT claimed by a trusted-only claim)
-//!      + lane order (interactive before an older batch) honoured.
-//!   2. **SECURITY (the seam CT-004c.2 depends on):** a claim listing only trusted tiers NEVER leases
-//!      an `untrusted_fork` / `self_hosted` job — the predicate that keeps untrusted code off trusted
-//!      runners.
-//!   3. **SKIP LOCKED:** two CONCURRENT claims take DIFFERENT rows (0 double-lease).
-//!   4. **reap** re-queues an expired dead lease in place (0 orphans), a re-claim works, and the
-//!      re-dispatch is idempotent (`jq_idem` → DuplicateIdem, 0 duplicate enqueue).
-//!   5. **cancel_superseded** terminalises a prior `pr:%` head, keeping the latest.
-//!   6. **Kill-9/reopen:** a leased row survives a pool drop + reopen (durable, not in-process); an
-//!      UNCOMMITTED enqueue leaves NO ghost row after reopen.
-//!   7. **Tenant-scoped RLS under the APP role (NOBYPASSRLS):** the store's tenant-scoped `enqueue`
-//!      inserts correctly under `myelin_app`, and a read under a DIFFERENT tenant GUC sees 0 rows
-//!      (isolation) — proving the `with_tenant_tx` seam works, not just as admin.
-//!
-//! Roles (honest): the region-scoped, cross-tenant claim/reap (the DRR fairness spans tenants by
-//! design, arch 02 §2.2) run under the migration/owner role (`myelin_admin`, a superuser — RLS
-//! bypassed), the SAME role the P12 test uses; a region-scoped scheduler DB role is the named
-//! follow-on. The TENANT-scoped writes are ALSO proven under the non-superuser app role (case 7).
-//!
-//! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
-//!
-//!   eval "$(scripts/dev-stack.sh env)"
-//!   cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_ct004c_job_queue_store -- --nocapture
 #![cfg(feature = "integration")]
 
 mod common;
@@ -61,14 +26,10 @@ fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// The per-pid schema every pool pins `search_path` to — so the store's unqualified `job_queue`
-/// resolves to an ISOLATED table (never another test's rows / the real shared `job_queue`).
 fn schema_name() -> String {
     format!("ci_ct004c_{}", std::process::id())
 }
 
-/// A FRESH admin (superuser) pool with `search_path` pinned to the per-pid schema. Reopening after a
-/// `drop(prev)` models a process restart (the kill-9 "reopen" half).
 async fn reopen_admin() -> PgPool {
     let schema = schema_name();
     sqlx::postgres::PgPoolOptions::new()
@@ -86,8 +47,6 @@ async fn reopen_admin() -> PgPool {
         .expect("connect to dev Postgres as admin (is the stack up? eval \"$(scripts/dev-stack.sh env)\")")
 }
 
-/// A pool for the NON-superuser app role (`myelin_app`, NOBYPASSRLS), `search_path` pinned to the
-/// per-pid schema — the role under which RLS is actually ENFORCED (case 7).
 async fn app_pool() -> PgPool {
     let schema = schema_name();
     sqlx::postgres::PgPoolOptions::new()
@@ -105,8 +64,6 @@ async fn app_pool() -> PgPool {
         .expect("connect to dev Postgres as the app role")
 }
 
-/// A stable uuid from a name (a deterministic FNV-1a fill) — so a reopened pool asserts equality
-/// against the SAME id the pre-crash pool wrote.
 fn uid(name: &str) -> Uuid {
     let mut bytes = [0u8; 16];
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -152,12 +109,6 @@ fn job(
     }
 }
 
-/// Build the isolated queue, fairness, and authoritative lifecycle tables in the per-pid schema.
-/// Claim/reap must see a real active Flow + CI owner; the minimal lifecycle tables keep that
-/// production predicate load-bearing without importing unrelated schema into this focused store
-/// test. Queue/fairness tables are FORCE-RLS via the platform helper. Indexes are applied with
-/// `CONCURRENTLY` stripped (a fresh empty table takes no meaningful lock; CONCURRENTLY cannot run in
-/// the implicit transaction).
 async fn create_schema(admin: &PgPool, schema: &str) {
     admin
         .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
@@ -250,8 +201,6 @@ async fn create_schema(admin: &PgPool, schema: &str) {
         )
         .await
         .expect("create public CI job surface table");
-    // Let the non-superuser app role reach the per-pid schema's tables (case 7). Default privileges
-    // only cover schema `public`; grant explicitly for this custom schema.
     admin
         .execute(format!("GRANT USAGE ON SCHEMA {schema} TO myelin_app").as_str())
         .await
@@ -301,9 +250,6 @@ async fn activate_job_owner(admin: &PgPool, queued: &DurableEnqueue) {
 #[tokio::test]
 async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgres() {
     let schema = schema_name();
-    // A cleanup-dedicated pool, independent of `admin`/`admin2` below (the kill-9 drill drops `admin`
-    // mid-test) — `with_schema_cleanup` unconditionally drops `schema` through THIS pool regardless of
-    // how the test body finishes (success, assertion failure, or panic).
     let cleanup_admin = reopen_admin().await;
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(&cleanup_admin, &schema_for_cleanup, move || async move {
@@ -313,9 +259,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     let store = ci_job_queue_store(admin.clone());
     let region_store = ci_region_queue_store_test_support(admin.clone());
 
-    // ── 1. Seed via the STORE's enqueue (tenant-scoped path): a spread of eligibility cases. ──
-    // interactive (newer) + batch (older) in-region trusted; out-of-region; wrong-label; and the two
-    // UNTRUSTED tiers a trusted-only claim must never lease.
     for j in [
         job(
             "tenantA",
@@ -385,7 +328,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         );
         activate_job_owner(&admin, &j).await;
     }
-    // Idempotent enqueue: a duplicate idem is a no-op (jq_idem unique).
     let dup = job(
         "tenantA",
         region,
@@ -402,7 +344,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "a re-enqueue of the same (tenant, idem_token) is a no-op"
     );
 
-    // ── 2. CLAIM: a trusted linux/gpu runner leases the in-region INTERACTIVE trusted job. ──
     let runner_labels = vec!["linux".to_string(), "gpu".to_string()];
     let trusted_only = vec![TrustTier::Trusted];
     let leased = region_store
@@ -413,7 +354,7 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     assert_eq!(
         leased.job_id,
         uid("jint"),
-        "the in-region INTERACTIVE trusted job is leased (residency + affinity + trust + lane) — the \
+        "the in-region INTERACTIVE trusted job is leased (residency + affinity + trust + lane) - the \
          out-of-region / wrong-label / untrusted jobs are NOT"
     );
     assert_eq!(leased.lane, Lane::Interactive);
@@ -423,8 +364,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "a trusted-only claim leases a trusted job"
     );
 
-    // ── 3. SECURITY: a trusted-only claim NEVER leases the untrusted_fork / self_hosted jobs. ──
-    // Claim repeatedly with only trusted tiers; assert the fork + self-hosted job ids never appear.
     let mut trusted_claims = Vec::new();
     for owner in ["t1", "t2", "t3", "t4", "t5"] {
         if let Some(l) = region_store
@@ -449,7 +388,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         !trusted_claims.contains(&uid("jwinlabel")),
         "affinity: a windows-labelled job is never claimed by a linux/gpu runner"
     );
-    // A claim that DOES list untrusted_fork leases the fork job (the tier gate is exact, not a blanket).
     let fork_claim = region_store
         .claim(
             region,
@@ -464,8 +402,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     assert_eq!(fork_claim.job_id, uid("jfork"));
     assert_eq!(fork_claim.trust_tier, TrustTier::UntrustedFork);
 
-    // ── 4. SKIP LOCKED: two CONCURRENT claims take DIFFERENT rows (0 double-lease). ──
-    // Seed two fresh eligible trusted jobs; fire two claims concurrently.
     for j in [
         job(
             "tenantA",
@@ -510,11 +446,10 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     if let (Some(a), Some(b)) = (&ja, &jb) {
         assert_ne!(
             a.job_id, b.job_id,
-            "two CONCURRENT claims take DIFFERENT rows (FOR UPDATE SKIP LOCKED — 0 double-lease)"
+            "two CONCURRENT claims take DIFFERENT rows (FOR UPDATE SKIP LOCKED - 0 double-lease)"
         );
     }
 
-    // ── 5. REAPER: force jint's lease into the past → reap re-queues it (0 orphans), re-claim works. ──
     admin
         .execute(
             format!(
@@ -545,7 +480,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         state, "queued",
         "the reaped job is re-queued (claimable again)"
     );
-    // 0 duplicate enqueues: a redundant re-dispatch (same idem) is a no-op; count unchanged.
     let retry = job(
         "tenantA",
         region,
@@ -570,7 +504,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         before_count, after_count,
         "0 duplicate enqueues after the reaper re-queue"
     );
-    // A fresh runner re-claims the recovered job.
     let reclaim = region_store
         .claim(region, &runner_labels, &trusted_only, "live-runner", 30)
         .await
@@ -582,7 +515,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "a live runner picks up the reaped job"
     );
 
-    // A HEART-BEATING lease is NOT reaped: extend jint's lease, expire nothing, reap finds it live.
     assert!(
         store
             .heartbeat(
@@ -612,7 +544,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
     );
     let _ = swept;
 
-    // ── 6. CANCEL-SUPERSEDED: a new PR head terminalises the prior head. ──
     store
         .enqueue(&job(
             "tenantA",
@@ -662,7 +593,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .get("state");
     assert_eq!(h2_state, "queued", "the latest head h2 stays schedulable");
 
-    // ── 6b. FINAL LAUNCH CAS vs CANCEL: exactly one row transition wins. ──
     let race_old = job(
         "tenantA",
         region,
@@ -714,9 +644,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         claim_expires_at_epoch_secs: race_lease.claim_expires_at_epoch_secs,
     };
 
-    // A pooled PostgreSQL session lock is re-entrant. Deliberately return a dirty session to a
-    // one-connection pool and prove the launch fence closes/refuses it before the durable CAS,
-    // rather than accepting stale ownership and decrementing only one lock level at release.
     let dirty_schema = schema.clone();
     let dirty_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -822,9 +749,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "the exact launch generation is one-shot"
     );
 
-    // The launch boundary refuses to advance the durable queue when its public job projection is
-    // missing. The writable CTE is one statement, so returning no projected row rolls the queue
-    // transition back with the transaction.
     let missing_surface_job = job(
         "tenantA",
         region,
@@ -884,8 +808,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "a refused public-state transition rolls the durable launch CAS back"
     );
 
-    // A runner that dies after the launch fence is still recoverable when its execution lease
-    // expires; `running` is not an orphan state.
     let reap_job = job(
         "tenantA",
         region,
@@ -952,8 +874,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         .get("state");
     assert_eq!(launch_reap_state, "queued");
 
-    // ── 7. KILL-9 / reopen: a leased row survives; an UNCOMMITTED enqueue leaves NO ghost. ──
-    // jint is leased. Start an enqueue in a raw tx and DROP it without commit (the crash mid-write).
     {
         let mut tx = admin.begin().await.unwrap();
         sqlx::query(INSERT_JOB_QUEUE_QUERY)
@@ -973,12 +893,10 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
             .execute(&mut *tx)
             .await
             .expect("the in-tx enqueue writes (uncommitted)");
-        drop(tx); // rollback — the crash before commit.
+        drop(tx);
     }
-    // KILL-9: drop the pool + store without a graceful close.
     drop(store);
     drop(admin);
-    // REOPEN: a fresh pool reads the state back from Postgres.
     let admin2 = reopen_admin().await;
     let leased_after: String = sqlx::query("SELECT state FROM job_queue WHERE job_id = $1")
         .bind(uid("jint"))
@@ -1001,7 +919,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         "the uncommitted enqueue left NO ghost row (all-or-nothing)"
     );
 
-    // ── 8. TENANT-SCOPED RLS under the APP role (NOBYPASSRLS): enqueue works; a wrong-tenant read sees 0. ──
     let app = app_pool().await;
     let app_store: CiJobQueueStore = ci_job_queue_store(app.clone());
     let rls_job = job(
@@ -1019,7 +936,6 @@ async fn job_queue_store_claim_serialize_reaper_cancel_kill9_rls_on_live_postgre
         EnqueueOutcome::Inserted,
         "the tenant-scoped enqueue INSERTs under the app role (RLS WITH CHECK passes with the tenant GUC)"
     );
-    // Under a DIFFERENT tenant GUC the app role sees 0 rows (isolation); under the right tenant it sees 1.
     let count_under = |tenant: &'static str| {
         let app = app.clone();
         async move {

@@ -1,25 +1,3 @@
-//! # GIT-P22 / P-284 — the fork / trust-tier endorsement gate: the chained e2e (M3-G4)
-//!
-//! **The poisoned-pipeline defence (GIT-D10 parts (b) + (c)).** This is the end-to-end flow EI-01 §4
-//! requires — NOT a unit: it drives the LIVE [`EndorsementResolver`] (the GIT-P22 deliverable that runs
-//! the maintainer's `check(subject, approve_untrusted_ci, repo)` through the LIVE
-//! [`myelin_git::live_check::GitCheckGate`]) feeding the GIT-P21 merge gate, proving:
-//!
-//! - **(b) fork self-green → NEUTRAL FOR GATING** — a fork PR's `untrusted_fork` CI success is recorded
-//!   but the merge gate BLOCKS it (0 forks green their own required gate). The fork AUTHOR cannot
-//!   self-endorse (the resolver runs the check with the author as subject → Deny → 0 endorsements).
-//! - **(c) maintainer endorses → the gate FLIPS GREEN** — a maintainer who holds `approve_untrusted_ci`
-//!   endorses; the resolver produces the endorsed context; the merge gate admits.
-//! - the **`fork:<pr_id>` cache confinement** (11.2 C4): a fork run's cache write cannot reach the
-//!   trusted cache scope (0 fork writes in the trusted scope — the poisoned-cache half).
-//!
-//! **Contracts:** index rows 5.9 (fork-endorsement — neutral-until-endorsed), 11.2 C4 (the
-//! `fork:<pr_id>` trust-scoped cache), 4.9 (the `approve_untrusted_ci` relation). Owning architecture:
-//! `git-hosting/architecture/02-internals-and-algorithms.md` §6.3. **Reconciliation:** X-1 + §8.
-//!
-//! The fork facts here are the SYNTHETIC `ci.check.updated` producer's (CI's real producer is EB-27/M4
-//! — the seam goes end-to-end at the M4 co-gate GIT-D10 / CI-D8).
-
 use myelin_git::check_status::{
     CheckContext, CheckState, CheckStatus, CheckStatusProjection, GitOid, HumanisedRef, Timestamp,
     TrustTier,
@@ -74,8 +52,6 @@ fn principal(id: &str) -> Principal {
     p
 }
 
-// An IdentityService stub: `approve_untrusted_ci@<subject>@repo` is Allow IFF the subject holds the
-// endorsement relation (a maintainer). The fork author does not → Deny (cannot self-endorse).
 struct StubId {
     endorsers: HashMap<String, Decision>,
 }
@@ -174,7 +150,7 @@ impl IdentityService for StubId {
 
 fn threshold() -> FailStaticThreshold {
     FailStaticThreshold {
-        status: "OPEN — LEGAL".into(),
+        status: "OPEN - LEGAL".into(),
         owner: "DPO / Legal".into(),
         static_max_secs: None,
         static_max_default_secs: 300,
@@ -187,7 +163,6 @@ fn gate(id: StubId) -> GitCheckGate<StubId, SystemClock> {
     GitCheckGate::try_new(id, 300, &threshold()).expect("gate constructs")
 }
 
-/// **THE CHAINED E2E — fork self-green NEUTRAL → maintainer endorses → gate FLIPS GREEN (GIT-D10 b+c).**
 #[test]
 fn fork_self_green_is_neutral_until_a_live_maintainer_endorsement() {
     let head = GitOid(HEAD.into());
@@ -195,7 +170,6 @@ fn fork_self_green_is_neutral_until_a_live_maintainer_endorsement() {
     let policy = MergeGatePolicy::from_required_contexts(&["ci/build"]).unwrap();
     let build = CheckContext::ci("build");
 
-    // 1. The fork's CI self-greens `ci/build` — but the run is untrusted_fork (it ran fork code).
     let mut proj = CheckStatusProjection::new();
     proj.apply(&fact(
         "build",
@@ -204,12 +178,9 @@ fn fork_self_green_is_neutral_until_a_live_maintainer_endorsement() {
         TrustTier::UntrustedFork,
     ));
 
-    // The maintainer holds approve_untrusted_ci@repo; the fork author does NOT.
     let g = gate(StubId::new().allowing_endorser("maintainer-1"));
     let resolver = EndorsementResolver::new(&g);
 
-    // 2. (GIT-D10 b) — the FORK AUTHOR tries to merge: the resolver runs the endorsement check with the
-    //    author as subject → Deny → 0 endorsements → the merge gate BLOCKS (0 forks green their gate).
     let author = principal("fork-author");
     let endorsed_by_author = resolver.resolve_endorsed(
         &policy.required,
@@ -237,8 +208,6 @@ fn fork_self_green_is_neutral_until_a_live_maintainer_endorsement() {
         MergeGateOutcome::Admitted => panic!("(b) a fork must NOT self-green its required gate"),
     }
 
-    // 3. (GIT-D10 c) — a MAINTAINER endorses: the resolver runs the check with the maintainer as
-    //    subject → Allow → produces the endorsed context → the merge gate FLIPS GREEN.
     let maintainer = principal("maintainer-1");
     let endorsed_by_maintainer = resolver.resolve_endorsed(
         &policy.required,
@@ -263,9 +232,6 @@ fn fork_self_green_is_neutral_until_a_live_maintainer_endorsement() {
     );
 }
 
-/// **THE CHAINED E2E — the re-run-trusted escape hatch (the other Δ3 path).** A maintainer re-runs the
-/// context trusted (a higher-attempt trusted fact supersedes the fork fact); the gate greens with NO
-/// explicit endorsement — the resolver finds the current row is already trusted (need = NotApplicable).
 #[test]
 fn rerun_trusted_supersedes_and_greens_with_no_endorsement() {
     let head = GitOid(HEAD.into());
@@ -279,10 +245,8 @@ fn rerun_trusted_supersedes_and_greens_with_no_endorsement() {
         CheckState::Success,
         TrustTier::UntrustedFork,
     ));
-    // The maintainer re-runs the context trusted (attempt 2) — supersedes the fork fact in place.
     proj.apply(&fact("build", 2, CheckState::Success, TrustTier::Trusted));
 
-    // Nobody endorses (the StubId grants no endorsement relation) — yet the gate greens.
     let g = gate(StubId::new());
     let resolver = EndorsementResolver::new(&g);
     let anyone = principal("anyone");
@@ -308,15 +272,12 @@ fn rerun_trusted_supersedes_and_greens_with_no_endorsement() {
     );
 }
 
-/// **THE CACHE-CONFINEMENT HALF (11.2 C4) — 0 fork writes in the trusted scope.** A fork run's cache
-/// write (a poisoned dependency graph) cannot be read by a later TRUSTED run of the same logical key.
 #[test]
 fn fork_cache_write_cannot_poison_the_trusted_scope() {
     let cache = InMemoryCache::new();
     let tenant = TenantId("acme".into());
     let ttl = Duration::from_secs(60);
 
-    // The fork run derives its scope from its CI-stamped trust tier — fork:<pr_id>, NEVER trusted.
     let fork_scope = TrustScope::for_run(TrustTier::UntrustedFork, PR_ID);
     assert!(
         !fork_scope.is_trusted(),
@@ -326,8 +287,6 @@ fn fork_cache_write_cannot_poison_the_trusted_scope() {
     fork.set(&tenant, "dep-graph", b"attacker-controlled", ttl)
         .unwrap();
 
-    // A later TRUSTED run reads the same logical key — it MUST see a clean miss (0 fork writes reach
-    // the trusted scope; the fork could not poison it).
     let trusted = ScopedCache::new(&cache, TrustScope::Trusted);
     assert_eq!(
         trusted.get(&tenant, "dep-graph").unwrap(),

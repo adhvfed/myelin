@@ -1,25 +1,3 @@
-//! # AG-P19 (→ P-268, M3) — the Knowledge producer ToolDefs + the agent-trace holder seam
-//! (KN-D11 KN-edit leg + KN-D12 trace-erasure leg + the 4.9 / 8.8 / 13.1 CDC)
-//!
-//! **Contract:** `planning/05-refined-shared-systems-architecture/contract-index.md` row **8.1**
-//! (OWNED — the four KN producer ToolDefs registered into the ONE ToolSurface) + CONSUMES **4.9** (the
-//! KN ReBAC carrier supplies the `required_caps`: `page.publish` / `page.edit` / `page.draft` /
-//! `page.comment`), **8.8** (the agent-trace holder seam — `run.trace_ref` resolves to a
-//! content-addressed Knowledge document), **13.1** (the trace reuses the frozen `myelin-content` block
-//! model). Owning architecture: `agent-fabric.md` §6.1 (the ONE catalogue) + §6.3 (the FROZEN
-//! `requires_approval` defaults — KN `publish`/`edit_confidential` = yes, `draft`/`comment` = no) +
-//! §4.5 (the trace = a content-addressed Knowledge document + erasable holder, distinct from the audit
-//! log).
-//!
-//! **Drills:**
-//! - **KN-D11 (the KN-edit leg, a Fabric-loop assertion):** an agent `publish` is GOVERNED — **0
-//!   ungoverned edits / 0 mutations before approval / 0 double-apply**; a double-click is ONE
-//!   approval; `draft` applies DIRECTLY (no gate). Pairs the REGISTERED KN ToolDefs (the SUT) with the
-//!   REAL eight-step `PlanThenApply` pipeline (AG-P6) + the REAL HITL withhold → resume loop (AG-P9).
-//! - **KN-D12 (the trace-holder erasure leg, the M3 part of AG-D10):** erase a subject → the
-//!   content-addressed agent trace is crypto-shredded/purged; attribution falls back to the opaque
-//!   pseudonym; **0 recoverable PII, attribution intact**.
-
 use myelin_agent::{EffectKind, EffectResult, EventId, ToolDef, ToolName, ToolSurface};
 use myelin_agent_service::{
     comment_required_caps, comment_tool_def, draft_required_caps, draft_tool_def,
@@ -42,8 +20,6 @@ use myelin_tenancy::{ArtifactRef, TenantId};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-// ───────────────────────── the REAL consumed seams (the pipeline providers) ─────────────────────
-
 struct Catalogue {
     defs: Vec<ToolDef>,
 }
@@ -56,7 +32,6 @@ impl ToolSurface for Catalogue {
     }
 }
 
-/// A `check` provider that allows a fixed cap set (the 4.9 perms the KN tools require), else Deny.
 struct AllowCaps {
     allow: BTreeSet<String>,
 }
@@ -95,8 +70,6 @@ impl TenantGuard for PermitAll {
     }
 }
 
-/// The subsystem PUBLIC endpoint — the ONLY mutation path; records EVERY apply so the drill can
-/// assert 0 mutation before approval + exactly-once.
 struct Endpoint {
     applied: RefCell<Vec<String>>,
 }
@@ -129,8 +102,6 @@ impl EffectBudget for Budget {
     }
 }
 
-/// A REAL provider on the 9.4 durable HITL wait — returns the scripted decision the human made days
-/// later. A `parked` counter records that the run PARKED (state=waiting holds no runtime).
 struct ScriptedWait {
     decision: WaitDecision,
     parked: RefCell<u32>,
@@ -141,8 +112,6 @@ impl HitlWait for ScriptedWait {
         self.decision.clone()
     }
 }
-
-// ───────────────────────── fixtures (the SUT is knowledge_tool_defs(), not a local def) ───────────
 
 fn agent() -> Principal {
     Principal::stub(
@@ -162,8 +131,6 @@ fn human() -> Principal {
     )
 }
 
-/// A catalogue holding the REGISTERED KN producer ToolDefs (the SUT — register_knowledge_tools is the
-/// deliverable, so the drill registers through it, never hand-building the defs).
 fn kn_catalogue() -> Catalogue {
     let mut cat = Catalogue { defs: vec![] };
     register_knowledge_tools(&mut cat)
@@ -173,7 +140,7 @@ fn kn_catalogue() -> Catalogue {
 
 fn publish_plan() -> PlannedEffect {
     PlannedEffect {
-        tool: ToolName(PUBLISH_TOOL.into()), // "publish" under subsystem "knowledge" (the §6.3 key)
+        tool: ToolName(PUBLISH_TOOL.into()),
         object: ArtifactRef("myelin://acme/knowledge/page/onboarding".into()),
         input_json: r#"{"page":"onboarding","space":"eng"}"#.into(),
         field: None,
@@ -201,8 +168,6 @@ fn draft_plan() -> PlannedEffect {
     }
 }
 
-/// Run the apply pipeline once over the SUT catalogue for `plan` under the given `approved` set;
-/// returns the result + the TOTAL mutations the endpoint recorded after the call.
 fn apply_once(
     cat: &Catalogue,
     endpoint: &Endpoint,
@@ -240,12 +205,6 @@ fn apply_once(
     (out, muts)
 }
 
-// ───────────────────────── the registration GATE (8.1 / §6.3 — the frozen defaults on the wire) ───
-
-/// **GATE: the REGISTERED `publish` + `edit_confidential` carry `requires_approval = yes` and route
-/// through EffectApi; `draft` + `comment` carry `no` and apply directly (the frozen §6.3 defaults, ON
-/// THE CATALOGUE).** The defaults are not just in the seed table — they ride the registered ToolDef
-/// the pipeline reads.
 #[test]
 fn knowledge_tools_register_with_the_frozen_6_3_defaults() {
     let cat = kn_catalogue();
@@ -256,7 +215,7 @@ fn knowledge_tools_register_with_the_frozen_6_3_defaults() {
     assert_eq!(publish.subsystem, KNOWLEDGE_SUBSYSTEM);
     assert!(
         publish.requires_approval,
-        "publish carries requires_approval = yes (§6.3 — consequential)"
+        "publish carries requires_approval = yes (§6.3 - consequential)"
     );
     assert_eq!(
         publish.effect_kind,
@@ -285,7 +244,7 @@ fn knowledge_tools_register_with_the_frozen_6_3_defaults() {
         .expect("draft registered");
     assert!(
         !draft.requires_approval,
-        "draft carries requires_approval = no (§6.3 — reversible)"
+        "draft carries requires_approval = no (§6.3 - reversible)"
     );
     assert_eq!(draft.required_caps, draft_required_caps());
     assert_eq!(draft.required_caps, vec!["page.draft".to_string()]);
@@ -295,19 +254,12 @@ fn knowledge_tools_register_with_the_frozen_6_3_defaults() {
         .expect("comment registered");
     assert!(
         !comment.requires_approval,
-        "comment carries requires_approval = no (§6.3 — reversible)"
+        "comment carries requires_approval = no (§6.3 - reversible)"
     );
     assert_eq!(comment.required_caps, comment_required_caps());
     assert_eq!(comment.required_caps, vec!["page.comment".to_string()]);
 }
 
-// ───────────────────────── KN-D11 KN-edit leg — withhold (0 mutation) → approve → ONE publish ──────
-
-/// **KN-D11 (the KN-edit leg): a registered `publish` is GOVERNED end-to-end — WITHHELD (0 mutation
-/// before approval), the run PARKS, an APPROVAL arrives, the resume threads the tool into `approved`,
-/// a re-run APPLIES EXACTLY ONCE; a DOUBLE-CLICK on approve is ONE approval (0 double-apply).** The
-/// SUT is the catalogue `register_knowledge_tools` built — the frozen default rides the registered def
-/// into the REAL pipeline. This is the M3 "agent edit governed" drill on the KN-edit instance.
 #[test]
 fn knd11_kn_publish_is_governed_zero_ungoverned_zero_double_apply() {
     let cat = kn_catalogue();
@@ -316,7 +268,6 @@ fn knd11_kn_publish_is_governed_zero_ungoverned_zero_double_apply() {
     };
     let caps = ["page.publish"];
 
-    // 1. WITHHOLD — a fresh run (empty `approved`) proposes the registered publish → GATED.
     let (result, muts_before) =
         apply_once(&cat, &endpoint, &publish_plan(), &caps, BTreeSet::new());
     let gate_id =
@@ -327,10 +278,9 @@ fn knd11_kn_publish_is_governed_zero_ungoverned_zero_double_apply() {
     );
     assert_eq!(
         muts_before, 0,
-        "0 MUTATIONS before approval (KN-D11 — the publish did NOT apply)"
+        "0 MUTATIONS before approval (KN-D11 - the publish did NOT apply)"
     );
 
-    // 2 + 3 + 4. PARK on the durable wait (9.4) → APPROVE (days later) → thread into `approved`.
     let wait = ScriptedWait {
         decision: WaitDecision::Approve,
         parked: RefCell::new(0),
@@ -356,9 +306,8 @@ fn knd11_kn_publish_is_governed_zero_ungoverned_zero_double_apply() {
         "approval resumes: {outcome:?}"
     );
 
-    // a DOUBLE-CLICK on approve is ONE approval — admitting the same approved gate twice is idempotent.
     if let HitlOutcome::Approved(ref gate) = outcome {
-        approved.admit(gate); // re-admit (the double-click) — the gate is already in the set.
+        approved.admit(gate);
         assert_eq!(
             approved.as_set().len(),
             1,
@@ -366,7 +315,6 @@ fn knd11_kn_publish_is_governed_zero_ungoverned_zero_double_apply() {
         );
     }
 
-    // 5. RESUME — the re-run with the populated `approved` set passes step 6 → APPLIES EXACTLY ONCE.
     let (result2, muts_after) =
         apply_once(&cat, &endpoint, &publish_plan(), &caps, approved.as_set());
     assert!(
@@ -379,8 +327,6 @@ fn knd11_kn_publish_is_governed_zero_ungoverned_zero_double_apply() {
     );
 }
 
-/// **KN-D11 (rejection leg): a registered `publish` REJECTED never applies — 0 mutation across the
-/// whole flow. The publish is governed; a decline is honoured (0 ungoverned).**
 #[test]
 fn knd11_kn_publish_rejected_never_applies_zero_mutation() {
     let cat = kn_catalogue();
@@ -419,17 +365,11 @@ fn knd11_kn_publish_rejected_never_applies_zero_mutation() {
     let (result2, muts) = apply_once(&cat, &endpoint, &publish_plan(), &caps, approved.as_set());
     assert!(
         matches!(result2, EffectResult::Gated(_)),
-        "a rejected publish still GATES — never applies"
+        "a rejected publish still GATES - never applies"
     );
     assert_eq!(muts, 0, "0 MUTATIONS across the entire reject flow");
 }
 
-// ───────────────────────── draft applies DIRECTLY (no gate) ────────────────────────────────────────
-
-/// **`draft` is reversible (§6.3 = no) → it applies DIRECTLY through the pipeline: schema ✓ → cap ✓ →
-/// … → NO gate → APPLY, no HITL withhold.** The pipeline never returns `Gated` for `draft`; the
-/// effect mutates once on the first call (the contrast that proves the gate is a per-tool frozen
-/// default, not a blanket policy).
 #[test]
 fn draft_applies_directly_no_hitl_gate() {
     let cat = kn_catalogue();
@@ -437,7 +377,6 @@ fn draft_applies_directly_no_hitl_gate() {
         applied: RefCell::new(vec![]),
     };
 
-    // a FRESH run (empty `approved`) — draft applies on the FIRST call (no withhold).
     let (result, muts) = apply_once(
         &cat,
         &endpoint,
@@ -459,9 +398,6 @@ fn draft_applies_directly_no_hitl_gate() {
     );
 }
 
-/// **The CHAINED e2e (the prompt's required end-to-end): a mock agent proposes a publish → withheld →
-/// approve → EXACTLY ONE publish; a draft → applied directly.** Both flows run over the SAME registered
-/// catalogue + the SAME endpoint, proving the per-tool gate split on one catalogue.
 #[test]
 fn chained_e2e_publish_withheld_then_approved_one_apply_draft_direct() {
     let cat = kn_catalogue();
@@ -469,7 +405,6 @@ fn chained_e2e_publish_withheld_then_approved_one_apply_draft_direct() {
         applied: RefCell::new(vec![]),
     };
 
-    // publish: withheld (0 mutation) → approve → exactly one apply.
     let (gated, m0) = apply_once(
         &cat,
         &endpoint,
@@ -505,7 +440,6 @@ fn chained_e2e_publish_withheld_then_approved_one_apply_draft_direct() {
     assert!(matches!(applied, EffectResult::Applied(_)));
     assert_eq!(m1, 1, "exactly ONE publish after approval");
 
-    // draft: applied directly (no gate) on the same endpoint (now 2 total mutations).
     let (draft_res, m2) = apply_once(
         &cat,
         &endpoint,
@@ -518,16 +452,12 @@ fn chained_e2e_publish_withheld_then_approved_one_apply_draft_direct() {
         "draft applied directly"
     );
     assert_eq!(m2, 2, "the draft applied (publish=1 + draft=1)");
-    // the recorded mutation order: publish (after approval) then draft.
     assert_eq!(
         *endpoint.applied.borrow(),
         vec![PUBLISH_TOOL.to_string(), DRAFT_TOOL.to_string()]
     );
 }
 
-// ───────────────────────── KN-D12 — the trace-holder erasure leg (the M3 part of AG-D10) ───────────
-
-/// A 13.1 inline run of plain text (a [`Span::Text`] with no marks) — the reasoning prose.
 fn text(s: &str) -> Inline {
     Inline {
         spans: vec![Span::Text {
@@ -539,8 +469,6 @@ fn text(s: &str) -> Inline {
     }
 }
 
-/// A trace document carrying personal data (the agent's reasoning naming the data subject) — a 13.1
-/// block document, the holder body KN-D12 erases.
 fn pii_trace(run_id: u128) -> TraceDocument {
     TraceDocument::new(
         run_id,
@@ -560,18 +488,13 @@ fn gdpr_subject(id: &str) -> SubjectRef {
     ))
 }
 
-/// **8.8 / §4.5: `run.trace_ref` resolves to a CONTENT-ADDRESSED Knowledge document reusing the 13.1
-/// block model.** The Fabric builds the trace as a `Vec<Block>` (the frozen taxonomy) and addresses it
-/// to a `blake3:<hex>` — a genuine content hash over a 13.1 document, NOT an opaque placeholder.
 #[test]
 fn cdc_8_8_trace_ref_resolves_to_a_content_addressed_13_1_document() {
     let doc = pii_trace(7);
-    // the trace is a frozen 13.1 block document (no second document model — 13.1).
     assert!(
         matches!(doc.blocks[0], Block::Paragraph { .. }),
         "the trace reuses the 13.1 Block taxonomy"
     );
-    // run.trace_ref IS the content address (the §4.5 seam): a blake3:<hex> over the document.
     let trace_ref = trace_ref_of(&doc);
     assert!(
         trace_ref.starts_with("blake3:"),
@@ -583,19 +506,11 @@ fn cdc_8_8_trace_ref_resolves_to_a_content_addressed_13_1_document() {
     );
 }
 
-/// **KN-D12 (the trace-holder erasure leg, the M3 part of AG-D10): erase a subject → the
-/// content-addressed agent trace is crypto-shredded/purged; attribution falls back to the opaque
-/// pseudonym; 0 recoverable PII; attribution intact.** The trace holder (H17, distinct from the audit
-/// log) responds to `erase` with a content-addressed receipt; the per-subject DEK (the
-/// `CryptoShred(subject_dek)` lever on `TraceRow`) is the structural shred. The OPAQUE PSEUDONYM
-/// principal id (never a name/email) is what attribution keys on — it survives the erase (the audit
-/// fact stays; the PII body goes).
 #[test]
 fn knd12_erase_subject_crypto_shreds_the_trace_pseudonym_survives() {
     let holder = AgentTraceHolder;
-    let subject = gdpr_subject("psn:agent-subject-7"); // the OPAQUE pseudonym — never PII (EI-04 §1).
+    let subject = gdpr_subject("psn:agent-subject-7");
 
-    // the trace body BEFORE erase contains PII (the subject's email in the reasoning prose).
     let doc = pii_trace(7);
     let body = doc.canonical_bytes();
     assert!(
@@ -603,9 +518,6 @@ fn knd12_erase_subject_crypto_shreds_the_trace_pseudonym_survives() {
         "the trace body contains PII before erasure (the reasoning the brain authored)"
     );
 
-    // ERASE the subject → the trace holder responds (the M3 seam; the structural crypto-shred body is
-    // AG-P23). The receipt is content-addressed (blake3:) and NAMES the AG-D10 follow-on — never a
-    // panic, never a silent gap (VISION §3).
     let scope = EraseScope::Subject {
         subject: subject.clone(),
         tenant: GdprTenantId::from_token("acme"),
@@ -619,8 +531,6 @@ fn knd12_erase_subject_crypto_shreds_the_trace_pseudonym_survives() {
         "the erase receipt is content-addressed"
     );
 
-    // ATTRIBUTION INTACT: the receipt keys on the OPAQUE pseudonym principal id — never a name/email.
-    // The pseudonym survives the erase (the attribution fact stays; the PII trace body is shredded).
     let subject_id = &subject.principal.principal_id.0;
     assert_eq!(
         subject_id, "psn:agent-subject-7",
@@ -628,11 +538,9 @@ fn knd12_erase_subject_crypto_shreds_the_trace_pseudonym_survives() {
     );
     assert!(
         !subject_id.contains('@') && !subject_id.contains("alice"),
-        "0 recoverable PII in the attribution key — it is the opaque pseudonym (EI-04 §1)"
+        "0 recoverable PII in the attribution key - it is the opaque pseudonym (EI-04 §1)"
     );
 
-    // the erase is idempotent (the same scope → the identical content-addressed receipt) — the AG-D10
-    // structural property: erase is a well-defined, repeatable operation.
     let receipt2 = holder
         .erase(EraseScope::Subject {
             subject,
@@ -645,19 +553,12 @@ fn knd12_erase_subject_crypto_shreds_the_trace_pseudonym_survives() {
     );
 }
 
-// ───────────────────────── the consumer CDC for 4.9 (the KN ReBAC carrier supplies caps) ──────────
-
-/// **CONSUMER CDC for 4.9 — the KN producer ToolDefs' `required_caps` ARE the frozen KN ReBAC carrier
-/// permissions, sourced from `myelin-content` (the PROVIDER), never invented in the Fabric.** A rename
-/// of a `page` write permission in the carrier breaks this CDC (the contract is the names, frozen on
-/// both sides — the KN parallel to the Git 4.9 CDC).
 #[test]
 fn cdc_4_9_required_caps_are_the_kn_rebac_carrier_permissions() {
     use myelin_content::rebac_fragment::{
         object_types, page_write_fragment, COMMENT, DRAFT, EDIT, PUBLISH,
     };
 
-    // PROVIDER (4.9): the page write fragment declares publish/edit/draft/comment on `page`.
     let page = page_write_fragment();
     assert_eq!(page.object_type.0, object_types::PAGE);
     for p in [PUBLISH, EDIT, DRAFT, COMMENT] {
@@ -666,7 +567,6 @@ fn cdc_4_9_required_caps_are_the_kn_rebac_carrier_permissions() {
             "the carrier declares `page.{p}` (4.9)"
         );
     }
-    // CONSUMER: each registered KN ToolDef's required_cap is exactly `page.<permission>`.
     assert_eq!(
         publish_tool_def().required_caps,
         vec!["page.publish".to_string()]
@@ -685,9 +585,6 @@ fn cdc_4_9_required_caps_are_the_kn_rebac_carrier_permissions() {
     );
 }
 
-/// **CONSUMER CDC for 13.1 — the trace document REUSES the frozen `myelin-content` Block taxonomy
-/// (the PROVIDER).** The trace is built from `Block` (the frozen 13.1 nodes), not a bespoke transcript
-/// format; a change to the block taxonomy breaks the trace document build (one document model).
 #[test]
 fn cdc_13_1_trace_reuses_the_frozen_block_taxonomy() {
     let doc = TraceDocument::new(
@@ -708,7 +605,6 @@ fn cdc_13_1_trace_reuses_the_frozen_block_taxonomy() {
         3,
         "the trace is a Vec<Block> of frozen 13.1 nodes"
     );
-    // the document serializes deterministically over the frozen taxonomy → a stable content address.
     assert_eq!(
         doc.content_address(),
         doc.content_address(),
@@ -716,17 +612,13 @@ fn cdc_13_1_trace_reuses_the_frozen_block_taxonomy() {
     );
 }
 
-/// **NO-NEW-ENGINE check (EI-03 §4 / EI-01 §7): the whole KN producer surface is `knowledge_tool_defs()`
-/// — four `mutate` ToolDefs registered into the existing ToolSurface, differing ONLY in their frozen
-/// `requires_approval` seed. There is no second apply/gate path; the trace seam reuses the 13.1 model
-/// + the existing H17 holder.**
 #[test]
 fn kn_producer_surface_is_a_projection_four_defs_only() {
     let defs = knowledge_tool_defs();
     assert_eq!(
         defs.len(),
         4,
-        "exactly publish + edit_confidential + draft + comment — no other KN producer tool at M3"
+        "exactly publish + edit_confidential + draft + comment - no other KN producer tool at M3"
     );
     for d in &defs {
         assert_eq!(

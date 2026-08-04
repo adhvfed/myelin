@@ -1,22 +1,3 @@
-//! **CT-004 / E2.3 — the dispatch `consumer_dedup` ledger is DURABLE on real Postgres, KILL-9
-//! PROVEN.** The exactly-once-effect anchor (one push = one run, contract 2.5 / arch 01 §3.8) must
-//! survive a process crash: a delivery recorded + committed before a kill-9 must STILL dedup a
-//! re-delivery after a fresh store opens — otherwise a crash-then-redeliver would double-run.
-//!
-//! The in-memory [`DedupLedger`](myelin_ci_dispatch) is the DB-free default; CI-P6 proved the
-//! `ON CONFLICT (consumer, event_id) DO NOTHING` semantics in-tx. This proves they hold ACROSS a
-//! process boundary: the work commits through one `PgPool`, that pool is dropped without a graceful
-//! close (the process "dies"), and a brand-new pool reconnects to the SAME Postgres and re-delivers —
-//! the redelivery is a no-op (the effect lands ONCE). The DDL is the byte-identical production
-//! constant; only the table identifier is per-pid suffixed for isolation + cleanup.
-//!
-//! Gated behind the `integration` cargo feature so the default build/test stay DB-free. Run against
-//! the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   DATABASE_URL=postgres://myelin_app:myelin_app_pw@localhost:5433/myelin \
-//!     cargo test -p myelin-ci-dispatch --features integration \
-//!     --test integration_ci_p28_ct004_dedup_durability -- --nocapture
 #![cfg(feature = "integration")]
 
 use myelin_ci_dispatch::CREATE_CONSUMER_DEDUP_DDL;
@@ -31,7 +12,6 @@ fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
 
-/// Open a FRESH pool — a brand-new connection to the SAME live Postgres (models a process restart).
 async fn reopen() -> PgPool {
     sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
@@ -74,25 +54,21 @@ async fn consumer_dedup_double_delivery_lands_once_across_kill9() {
         }
     };
 
-    // ── First delivery (committed): the effect fires (1 row inserted). ──
     assert_eq!(
         deliver(&p1, "evt-push-1").await,
         1,
-        "the first delivery records the dedup row (the effect fires — one run)"
+        "the first delivery records the dedup row (the effect fires - one run)"
     );
 
-    // ── KILL-9: drop the pool without a graceful close. ──
     drop(p1);
 
-    // ── REOPEN + RE-DELIVER the SAME (consumer, event_id): a no-op (the effect already fired). ──
     let p2 = reopen().await;
     assert_eq!(
         deliver(&p2, "evt-push-1").await,
         0,
-        "after kill-9/reopen, a re-delivery of the same event is a no-op — the dedup row was durable \
+        "after kill-9/reopen, a re-delivery of the same event is a no-op - the dedup row was durable \
          (a crash-then-redeliver does NOT double-run)"
     );
-    // A genuinely NEW event still fires (the ledger isn't wedged).
     assert_eq!(
         deliver(&p2, "evt-push-2").await,
         1,

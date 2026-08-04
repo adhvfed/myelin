@@ -1,20 +1,3 @@
-//! # FLOW-D1 drill — deterministic replay/recovery + lease-based crash recovery (P-FLOW-05 → P-202)
-//!
-//! This is the failure-injection-harness drill the P-FLOW-05 TESTS field requires (the CHAINED
-//! drill, EI-01 §4): it rides the M0 **scoped-reversible dependency-break injector**
-//! ([`myelin_harness::DependencyBreaker`], `Dependency::Broker` as the worker-crash fault) to inject
-//! the **"kill a worker at activity 5 of 10 mid-run"** fault, then drives the
-//! [`myelin_flow::engine`] replay/lease loop (the P-FLOW-05 deliverable): ANOTHER worker re-leases
-//! the run, replays `wf_history` (short-circuiting every journaled command — 0 re-executed side
-//! effects), and resumes at step 6. It reads the M0 telemetry-assertion library survival signals —
-//! the **replay-rate** (emitted) and the **0-double-effect** counter on the metrics port (a typed
-//! green/red, never a swallowed pass — EI-01 §3).
-//!
-//! **The threshold is exact (testing-strategy FLOW-D1):** resume at step 6, 0 re-executed side
-//! effects, 0 lost progress, exactly-once-in-effect. A red drill is information, not a thing to
-//! weaken to pass. The replay-rate signal emitted + the 0-double-effect counter is the dated CI
-//! green artifact.
-
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef as EvArtifactRef, CausedBy, DataRole, EmitContextBase,
     EventDraft, EventType, IdMinter, MonotonicMinter, OutboxStore, Timestamp, Visibility,
@@ -64,9 +47,6 @@ fn draft() -> EventDraft {
     }
 }
 
-/// A 10-activity workflow body. Each activity records its index into `executed` (so the drill reads
-/// which steps RAN vs replayed) and emits one domain event (so the co-commit is exercised). Returns
-/// the terminal "done" ref.
 fn ten_activity_body(executed: Arc<Mutex<Vec<usize>>>) -> Box<WorkflowBody> {
     Box::new(move |ctx: &mut WfCtx| {
         for k in 0..10usize {
@@ -84,9 +64,6 @@ fn ten_activity_body(executed: Arc<Mutex<Vec<usize>>>) -> Box<WorkflowBody> {
     })
 }
 
-/// Model a worker that crashes after journaling the first `up_to` activities: it runs an `up_to`-step
-/// body on its own `WfCtx`, co-commits those steps (durable), then DIES before settling the run row —
-/// the run is left `running`, cursor bumped, lease lapsed. The journal is the source of truth.
 fn crash_after_journaling(
     outbox: &OutboxStore,
     journal: &WfJournal,
@@ -117,7 +94,6 @@ fn crash_after_journaling(
     }
     ctx.commit()
         .expect("the first steps co-commit (durable before the crash)");
-    // the worker bumped the cursor as it journaled, then DIED before settling the terminal state.
     let mut r = runs.get(&tenant(), "R1").expect("run");
     r.cursor = up_to as i64;
     runs.put(r);
@@ -125,12 +101,6 @@ fn crash_after_journaling(
     ran
 }
 
-/// **FLOW-D1 — kill a worker at activity 5/10 mid-run → another re-leases, replays, resumes at step 6
-/// with 0 re-executed side effects, 0 lost progress, exactly-once-in-effect.**
-///
-/// Rides the M0 injector (`Dependency::Broker`, tenant-scoped, as the worker-crash fault) + the M0
-/// assertion library (the replay-rate + 0-double-effect survival signals). The fault is injected at
-/// step 5; on RESTORE another worker re-leases and the replay resumes at step 6.
 #[test]
 fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
     let scope = Scope::Tenant(tenant());
@@ -148,8 +118,6 @@ fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
         0,
     ));
 
-    // (1) INJECT the fault: the worker crashes at activity 5 of 10. The first 5 steps co-commit
-    //     (durable), then the worker dies — the run is left runnable from cursor 5.
     breaker.break_dependency(Dependency::Broker, scope.clone());
     assert!(
         breaker.is_broken(&Dependency::Broker, &scope),
@@ -172,7 +140,6 @@ fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
         "the run survives runnable"
     );
 
-    // (2) RESTORE: another worker re-leases the run (the dead worker's lease lapsed) and re-drives.
     breaker.restore_dependency(Dependency::Broker, scope.clone());
     assert!(
         !breaker.is_broken(&Dependency::Broker, &scope),
@@ -203,13 +170,11 @@ fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
         body.as_ref(),
     );
 
-    // (3) ASSERT the FLOW-D1 thresholds: resumed at step 6 (only 5..=9 ran), 0 re-executed side
-    //     effects, 0 lost progress, the run completed exactly-once-in-effect.
     let ran_after_resume = executed.lock().unwrap().clone();
     assert_eq!(
         ran_after_resume,
         vec![5, 6, 7, 8, 9],
-        "resumed at step 6 — only activities 5..=9 ran; 0..=4 replayed (0 re-execution)"
+        "resumed at step 6 - only activities 5..=9 ran; 0..=4 replayed (0 re-execution)"
     );
     assert!(
         matches!(outcome, DriveOutcome::Completed(_)),
@@ -226,7 +191,6 @@ fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
         "settled completed"
     );
 
-    // The 0-double-effect counter on the metrics port — the FLOW-D1 green artifact (exactly-once).
     let mut signals = SignalSource::new();
     signals.set_scalar(SignalName::OutboxDepth, tele.double_effect_count() as i64);
     signals
@@ -238,7 +202,6 @@ fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
         "0 re-executed side effects (exactly-once-in-effect)"
     );
 
-    // The replay-rate signal is emitted: drive 2 replayed 5 commands, executed 5 → 5000 bps.
     assert_eq!(
         tele.commands_replayed(),
         5,
@@ -250,17 +213,12 @@ fn drill_flow_d1_replay_resume_at_6_zero_double_effect() {
         "the replay-rate signal is emitted (the green artifact)"
     );
 
-    // teardown: no leaked break.
     assert_eq!(breaker.broken_count(), 0, "no leaked dependency break");
     println!(
         "[2026-06-21] PASS  drill=FLOW-D1  kill@5/10 resume@6  re_executed=0 lost=0  replay_rate=5000bps double_effect=0  exactly-once-in-effect  (inject \u{2192} re-lease \u{2192} replay \u{2192} assert green)"
     );
 }
 
-/// **FLOW-D1 also asserts: the 0-double-effect counter is a REAL probe (a regression would red it).**
-/// A re-drive of a FULLY-journaled run replays ALL 10 commands and re-executes NONE — the
-/// double-effect counter stays 0. This pins the floor: a mutant that removes the replay short-circuit
-/// (re-executes a journaled activity) makes the counter non-zero and reds the drill.
 #[test]
 fn drill_flow_d1_full_replay_re_executes_zero() {
     let runs = RunStore::new();
@@ -275,7 +233,6 @@ fn drill_flow_d1_full_replay_re_executes_zero() {
         0,
     ));
 
-    // drive 1: complete the run (10 journaled commands).
     let body = ten_activity_body(Arc::new(Mutex::new(Vec::new())));
     let run = runs.get(&tenant(), "R1").unwrap();
     drive(
@@ -292,7 +249,6 @@ fn drill_flow_d1_full_replay_re_executes_zero() {
     );
     assert_eq!(journal.history_for(&tenant(), "R1").len(), 10);
 
-    // a redelivery re-drives the same journal — everything replays, 0 re-execution.
     let executed = Arc::new(Mutex::new(Vec::new()));
     let body2 = ten_activity_body(executed.clone());
     let again = runs.get(&tenant(), "R1").unwrap();
@@ -326,8 +282,6 @@ fn drill_flow_d1_full_replay_re_executes_zero() {
     println!("[2026-06-21] PASS  drill=FLOW-D1  full_replay  re_executed=0 double_effect=0");
 }
 
-/// The drill REGISTERS into the M0 every-incident-adds-a-drill registry so it re-runs forever
-/// (EI-01 §3/§5) — a regression on the replay short-circuit re-reds it loudly.
 #[test]
 fn flow_d1_registers_into_the_permanent_drill_suite() {
     use myelin_harness::{DrillRegistry, DrillScenario};
@@ -347,7 +301,6 @@ fn flow_d1_registers_into_the_permanent_drill_suite() {
             0,
         ));
 
-        // inject the worker-crash fault, journal 5 steps, restore, re-lease, replay.
         ctx.breaker
             .break_dependency(Dependency::Broker, scope.clone());
         crash_after_journaling(&outbox, &journal, &runs, 5);
@@ -375,7 +328,6 @@ fn flow_d1_registers_into_the_permanent_drill_suite() {
             "resumed at 6"
         );
 
-        // the 0-double-effect counter is the asserted survival signal.
         ctx.signals
             .set_scalar(SignalName::OutboxDepth, tele.double_effect_count() as i64);
         ctx.signals

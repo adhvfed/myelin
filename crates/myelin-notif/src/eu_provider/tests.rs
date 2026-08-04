@@ -1,13 +1,3 @@
-//! # Unit tests for the EU-sovereign provider adapter (NOTIF-P26 / P-468)
-//!
-//! Exercises the mandatory-core decision logic to the ≥ 80% mutation floor on `eu_provider.rs`: the
-//! EU-region guard (refuse to egress from a non-EU region), the stable-`provider_ref` idempotency (a
-//! re-submit after provider-ack is a no-op that returns the SAME ref), the RedactedMessage
-//! minimisation (only a redacted summary + link crosses the boundary), and the
-//! provider-side-erasure-request hook (an already-sent off-cell payload is purgeable). The
-//! whole-system NOTIF-D9 re-run under the real provider lives in
-//! `tests/drill_notif_d9_real_provider.rs`.
-
 use super::*;
 use crate::prefs::Channel;
 use crate::{Class, DeliveryAdapter, HumanisedString, RedactedMessage};
@@ -35,8 +25,6 @@ fn adapter(region: Region) -> (EuSovereignAdapter, RecordingEuTransport) {
     (adapter, transport)
 }
 
-// ---- the EU-region guard (the sovereignty invariant) -------------------------------------------
-
 #[test]
 fn guard_region_accepts_an_eu_region() {
     let (adapter, _) = adapter(eu_region());
@@ -53,7 +41,6 @@ fn guard_region_refuses_a_non_eu_region_loudly() {
     let err = adapter.guard_region().unwrap_err();
     assert_eq!(err, EuProviderError::NonEuRegion("us-east".into()));
     assert!(err.to_string().contains("us-east"));
-    // try_send refuses BEFORE the vendor is ever called — 0 off-cell egress from a non-EU region.
     let refused = adapter
         .try_send(&redacted_msg(), "itm-1:email")
         .unwrap_err();
@@ -68,8 +55,6 @@ fn guard_region_refuses_a_non_eu_region_loudly() {
 #[test]
 fn deliver_adapter_send_from_non_eu_region_is_a_refusal_not_a_silent_success() {
     let (adapter, transport) = adapter(Region("us-east".into()));
-    // The DeliveryAdapter::send shape returns a Receipt; a non-EU region is a refusal (accepted=false),
-    // never a silent off-cell egress.
     let receipt = adapter.send(&redacted_msg(), "itm-1:email");
     assert!(
         !receipt.accepted,
@@ -83,8 +68,6 @@ fn deliver_adapter_send_from_non_eu_region_is_a_refusal_not_a_silent_success() {
     );
 }
 
-// ---- the stable-provider_ref idempotency (a re-submit is a no-op) -------------------------------
-
 #[test]
 fn submit_is_idempotent_a_resubmit_returns_the_same_provider_ref() {
     let (adapter, transport) = adapter(eu_region());
@@ -92,8 +75,6 @@ fn submit_is_idempotent_a_resubmit_returns_the_same_provider_ref() {
     assert!(first.accepted);
     let ref_1 = adapter.provider_ref_for("itm-1:email").unwrap();
 
-    // A re-submit of the SAME idem_key returns the SAME provider_ref and does NOT re-send (the
-    // provider-side half of the exactly-one property).
     let retry = adapter.try_send(&redacted_msg(), "itm-1:email").unwrap();
     assert!(retry.accepted);
     let ref_2 = adapter.provider_ref_for("itm-1:email").unwrap();
@@ -127,19 +108,14 @@ fn a_bounce_is_not_remembered_so_a_retry_resubmits() {
     let adapter = EuSovereignAdapter::new(Channel::Email, eu_region(), Arc::new(transport.clone()));
     let bounced = adapter.try_send(&redacted_msg(), "itm-1:email").unwrap();
     assert!(!bounced.accepted, "the marked key bounces");
-    // A bounce leaves NO provider_ref (nothing was accepted) — there is no copy to erase.
     assert!(
         adapter.provider_ref_for("itm-1:email").is_none(),
         "a bounce is not remembered (no accepted copy)"
     );
 }
 
-// ---- the RedactedMessage minimisation (only a summary + link crosses the boundary) -------------
-
 #[test]
 fn the_adapter_only_ever_carries_a_redacted_message() {
-    // Structural: the send signature takes a RedactedMessage (rendered: HumanisedString + class) —
-    // there is NO `body` field, so a full body cannot cross the boundary by construction (Art. 5(1)(c)).
     let (adapter, _) = adapter(eu_region());
     let msg = redacted_msg();
     assert_eq!(msg.rendered.text, "you were mentioned on PROJ-1");
@@ -147,8 +123,6 @@ fn the_adapter_only_ever_carries_a_redacted_message() {
     let receipt = adapter.send(&msg, "itm-1:email");
     assert!(receipt.accepted, "the redacted summary delivers");
 }
-
-// ---- the provider-side-erasure-request hook (the §10 row 2 sub-processor obligation) -----------
 
 #[test]
 fn request_provider_erasure_purges_an_already_sent_payload() {
@@ -158,7 +132,6 @@ fn request_provider_erasure_purges_an_already_sent_payload() {
     let provider_ref = adapter.provider_ref_for("itm-1:email").unwrap();
     assert!(!transport.was_erased(&provider_ref), "not yet erased");
 
-    // The hook issues a provider-side erasure request against the durable provider_ref.
     let outcome = adapter.request_provider_erasure("itm-1:email").unwrap();
     assert_eq!(
         outcome,
@@ -170,7 +143,6 @@ fn request_provider_erasure_purges_an_already_sent_payload() {
         transport.was_erased(&provider_ref),
         "the sub-processor was asked to purge its copy (NOTIF-P27 hook)"
     );
-    // After the request, our handle is dropped (the copy is being purged) — a second request is a no-op.
     assert!(adapter.provider_ref_for("itm-1:email").is_none());
     assert_eq!(
         adapter.request_provider_erasure("itm-1:email").unwrap(),
@@ -181,8 +153,6 @@ fn request_provider_erasure_purges_an_already_sent_payload() {
 #[test]
 fn request_provider_erasure_for_an_unsent_key_is_a_surfaced_noop() {
     let (adapter, _) = adapter(eu_region());
-    // Nothing was sent off-cell for this key (e.g. an in-cell item or a never-delivered one) — there
-    // is NO sub-processor copy to erase. A surfaced no-op, not an error.
     assert_eq!(
         adapter.request_provider_erasure("never:email").unwrap(),
         ProviderErasureOutcome::NothingToErase
@@ -191,7 +161,6 @@ fn request_provider_erasure_for_an_unsent_key_is_a_surfaced_noop() {
 
 #[test]
 fn request_provider_erasure_surfaces_a_vendor_rejection_loudly() {
-    // A transport that REJECTS erasure requests — the un-purged copy is the residual, surfaced loudly.
     struct RejectingTransport(RecordingEuTransport);
     impl EuTransport for RejectingTransport {
         fn transport_id(&self) -> &str {
@@ -201,7 +170,7 @@ fn request_provider_erasure_surfaces_a_vendor_rejection_loudly() {
             self.0.submit(m, k, r)
         }
         fn request_erasure(&self, _provider_ref: &str) -> bool {
-            false // the vendor rejects — the copy is un-purged (the residual).
+            false
         }
     }
     let adapter = EuSovereignAdapter::new(
@@ -216,8 +185,6 @@ fn request_provider_erasure_surfaces_a_vendor_rejection_loudly() {
     assert!(err.to_string().contains("erasure"));
 }
 
-// ---- the adapter id + region accessors ---------------------------------------------------------
-
 #[test]
 fn adapter_id_and_channel_and_region_accessors() {
     let (adapter, _) = adapter(eu_region());
@@ -229,8 +196,6 @@ fn adapter_id_and_channel_and_region_accessors() {
         "the adapter id surfaces the sub-processor identity"
     );
 }
-
-// ---- the [OPEN — LEGAL] flag is present + dated + unresolved -----------------------------------
 
 #[test]
 fn open_legal_flag_is_present_dated_and_unresolved() {

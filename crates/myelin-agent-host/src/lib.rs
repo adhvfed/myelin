@@ -1,13 +1,3 @@
-//! Composition root for a hosted agent run: real brain → driving loop → per-turn wallet metering.
-//!
-//! Lives here (not in `myelin-agent-service`) because the service must never depend on the vendor
-//! crate `myelin-agent-model` (the `no-llm-in-platform` boundary). This crate is a leaf that depends
-//! on both, builds the real `LlmAgentRuntime`, and hands it to `handle_run` as a `&dyn MeteredRuntime`.
-//!
-//! Two invariants the types enforce: **F1** — a real run is always billed: the wallet is a
-//! non-optional `&dyn RunWallet` and the one `RunSubstrate` site sets `wallet: Some(..)`. **F2** — the
-//! wallet's region is the run's region: `AgentHost` derives both from one `SubstrateProvider`.
-
 use std::sync::{Arc, Mutex};
 
 pub mod git_read_tool;
@@ -49,29 +39,17 @@ use myelin_identity_service::{
 pub use myelin_agent_service::{RunTokenRevoker, RunWallet};
 pub use myelin_storage::agent_wallet::{CreditKind, MicroUsd, WalletError};
 
-// ── the run description + result ──────────────────────────────────────────────────────────────────
-
-/// One run's inputs, minus the region (supplied by the composition root so it can't disagree with the
-/// wallet's — F2). Reserve/lifecycle knobs default via [`LlmRunTask::new`].
 #[derive(Clone, Debug)]
 pub struct LlmRunTask {
     pub tenant: TenantId,
     pub agent: Principal,
     pub agent_id: String,
     pub run_id: String,
-    /// System framing (the task is folded into system context; empty ⇒ a default agent-labelled one).
     pub system: String,
-    /// The task, injected as the opening user message.
     pub prompt: String,
     pub token_ttl_secs: u64,
-    /// Nominal reserve estimate for the reserve/settle gate — distinct from the real micro-dollar
-    /// wallet debit.
     pub estimate: MicroUsd,
     pub now_secs: i64,
-    /// Nominal available-balance floor, retained for the no-wallet reserve shape. The REAL hosted-run
-    /// path (`dispatch_core`) IGNORES this and reads the live wallet balance minus the tenant's
-    /// outstanding reservations instead (unified-wallet slice 3) — so a hosted run's affordability gate
-    /// is the actual prepaid balance, not this constant.
     pub available: MicroUsd,
     pub max_output_tokens: Option<u32>,
 }
@@ -111,8 +89,6 @@ impl LlmRunTask {
     }
 }
 
-/// The outcome of a metered run: the loop outcome, the model's final answer, total micro-dollars
-/// debited, and the survival-signal telemetry (`reserved == settled`, trace, revocation lag).
 #[derive(Clone, Debug)]
 pub struct LlmRunReport {
     pub outcome: myelin_agent::RunOutcome,
@@ -121,8 +97,6 @@ pub struct LlmRunReport {
     pub telemetry: SkeletonTelemetry,
 }
 
-/// A run that refused or aborted (a failed mint, a spend-cap halt, an unmetered turn, …). The token
-/// is always torn down and consumed turns are always billed.
 #[derive(Clone, Debug)]
 pub enum AgentHostError {
     Run(SkeletonError),
@@ -144,9 +118,6 @@ impl From<SkeletonError> for AgentHostError {
     }
 }
 
-/// The durable-or-in-memory `RunSubstrate` pieces the caller wires: the reserve/settle ledger, the
-/// outbox the trace co-commits into, the id minter, the workflow journal. The wallet is *not* here —
-/// it is threaded separately and non-optionally (F1).
 pub struct RunSubstrateWiring<'a> {
     pub ledger: &'a mut CostLedger,
     pub outbox: &'a OutboxStore,
@@ -154,19 +125,13 @@ pub struct RunSubstrateWiring<'a> {
     pub journal: WfJournal,
 }
 
-/// The tools a run offers, or [`Tools::none`] for a tool-less run.
 pub struct Tools<'a> {
-    /// The permissioned catalogue the loop's `validate_call` resolves each call against.
     pub catalogue: &'a dyn ToolSurface,
-    /// Runs each validated call.
     pub executor: &'a dyn ToolExecutor,
-    /// What the model is told it may call (the loop leaves `conv.tools` empty, so specs are injected
-    /// at the vendor seam — the AG-P7 push-down floor).
     pub advertised: &'a [ToolSchema],
 }
 
 impl<'a> Tools<'a> {
-    /// A tool-less run: byte-identical to before tools existed.
     pub fn none() -> Tools<'static> {
         Tools {
             catalogue: &NoToolSurface,
@@ -176,9 +141,6 @@ impl<'a> Tools<'a> {
     }
 }
 
-// ── ModelClient wrapper: inject the task, capture the answer ───────────────────────────────────────
-
-/// A handle to the answer [`HostModelClient`] captures, cloned out before the wrapper is boxed.
 #[derive(Clone, Default)]
 struct AnswerSlot(Arc<Mutex<Option<String>>>);
 
@@ -191,9 +153,6 @@ impl AnswerSlot {
     }
 }
 
-/// Wraps the vendor client to (a) inject the run's system + task and (b) capture the final answer —
-/// because `handle_run` drives an empty conversation and discards the submission. Neither `handle_run`
-/// nor the runtime is touched; usage flows through verbatim so metering stays faithful.
 struct HostModelClient {
     system: String,
     prompt: String,
@@ -226,7 +185,6 @@ impl HostModelClient {
 impl ModelClient for HostModelClient {
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let mut req = request.clone();
-        // Inject framing + task only on the first step (later tool-loop steps already carry history).
         if req.turns.is_empty() {
             if req.system.trim().is_empty() {
                 req.system = self.system.clone();
@@ -237,7 +195,6 @@ impl ModelClient for HostModelClient {
                 });
             }
         }
-        // Advertise tools on every step (the model needs them on the tool-result turn too).
         if !self.tool_specs.is_empty() {
             req.tools = self.tool_specs.clone();
         }
@@ -249,9 +206,6 @@ impl ModelClient for HostModelClient {
     }
 }
 
-// ── in-process token + no-tools seams (the hermetic/dev floor; real Identity is in `AgentHost`) ─────
-
-/// Deterministic in-process token minter — the attribution floor for hermetic drills.
 #[derive(Default)]
 pub struct HostRunMinter;
 
@@ -271,7 +225,6 @@ impl RunTokenMinter for HostRunMinter {
     }
 }
 
-/// In-process revoker — idempotent (a re-revoke is a no-op success).
 #[derive(Default)]
 pub struct HostRunRevoker {
     revoked: Mutex<std::collections::HashSet<String>>,
@@ -290,7 +243,6 @@ impl RunTokenRevoker for HostRunRevoker {
     }
 }
 
-/// Empty catalogue for a no-tools run.
 #[derive(Default)]
 pub struct NoToolSurface;
 
@@ -301,7 +253,6 @@ impl ToolSurface for NoToolSurface {
     }
 }
 
-/// No-op executor for a no-tools run — fails loud if ever reached (that would be a bug).
 #[derive(Default)]
 pub struct NoToolExecutor;
 
@@ -314,7 +265,6 @@ impl ToolExecutor for NoToolExecutor {
     }
 }
 
-/// A real, `Vec`-backed catalogue a tools-enabled run validates calls against.
 #[derive(Clone, Debug, Default)]
 pub struct ToolCatalogue {
     defs: Vec<ToolDef>,
@@ -337,8 +287,6 @@ impl ToolSurface for ToolCatalogue {
     }
 }
 
-/// Model-facing [`ToolSchema`] → the vendor [`ToolSpec`] sent to the model (permissive object schema
-/// if the schema string is empty/unparseable, so the request stays wire-valid).
 fn tool_schema_to_spec(schema: &ToolSchema) -> ToolSpec {
     ToolSpec {
         name: schema.name.0.clone(),
@@ -348,13 +296,8 @@ fn tool_schema_to_spec(schema: &ToolSchema) -> ToolSpec {
     }
 }
 
-// ── cap enforcement: the ReBAC gate before a governed tool executes ─────────────────────────────────
-
-/// Derives the ReBAC resource a tool call targets from its *validated* arguments (the *what*; the
-/// *whose* is the verified token). `None` ⇒ the resource can't be derived ⇒ deny fail-closed.
 type ToolResourceResolver = dyn Fn(&ToolDef, &ToolCall) -> Option<ArtifactRef> + Send + Sync;
 
-/// The `git.read_check_status` resource is its `repo` argument.
 pub fn git_read_check_status_resource(_def: &ToolDef, call: &ToolCall) -> Option<ArtifactRef> {
     call.arguments
         .get("repo")
@@ -362,7 +305,6 @@ pub fn git_read_check_status_resource(_def: &ToolDef, call: &ToolCall) -> Option
         .map(|repo| ArtifactRef(repo.to_string()))
 }
 
-/// Strong consistency at latest — a tool authorization is never served from the fail-static cache.
 fn strong_latest() -> Consistency {
     Consistency {
         at_least: Zookie(String::new()),
@@ -370,10 +312,6 @@ fn strong_latest() -> Consistency {
     }
 }
 
-/// A [`ToolExecutor`] decorator that denies a governed call unless the run's principal holds the
-/// tool's `required_caps` on the target resource, checked on the real ReBAC engine. Fail-closed on
-/// anything but `Allow` (Deny, Conditional, check error, underivable resource); the inner executor is
-/// never reached on a denied cap. An empty `required_caps` set dispatches straight through.
 pub struct CapEnforcingExecutor<'a> {
     identity: Arc<dyn IdentityService + Send + Sync>,
     principal: Principal,
@@ -396,7 +334,6 @@ impl<'a> CapEnforcingExecutor<'a> {
         }
     }
 
-    /// For the `git.read_check_status` tool (resource = its `repo` argument).
     pub fn for_git_read_tool(
         identity: Arc<dyn IdentityService + Send + Sync>,
         principal: Principal,
@@ -420,8 +357,6 @@ impl ToolExecutor for CapEnforcingExecutor<'_> {
                     def.name.0
                 ))
             })?;
-            // Does the verified principal hold `cap` on `resource`? The check scopes (tenant, region)
-            // from the subject's token and authorizes an agent exactly as a human.
             match self.identity.check(
                 &self.principal,
                 &Permission(cap.clone()),
@@ -448,18 +383,11 @@ impl ToolExecutor for CapEnforcingExecutor<'_> {
     }
 }
 
-// ── the one metered dispatcher + the two entry points ───────────────────────────────────────────────
-
-/// The per-run token seams the loop composes the mint → run → revoke lifecycle over. The one
-/// dispatcher is generic over these, so the in-process floor and real Identity drive the same path.
 struct RunTokenSeams<'a> {
     minter: Arc<dyn RunTokenMinter + Send + Sync>,
     revoker: &'a dyn RunTokenRevoker,
 }
 
-/// Dispatch a metered run over the in-process token floor (what hermetic drills call directly). Real
-/// runs go through [`AgentHost`], which supplies real Identity seams. `region` must be the wallet's
-/// region (F2 — prefer `AgentHost`).
 pub fn dispatch_metered_llm_run(
     wallet: &dyn RunWallet,
     region: Region,
@@ -483,9 +411,6 @@ pub fn dispatch_metered_llm_run(
     )
 }
 
-/// The one `RunSubstrate` construction site (F1: `wallet: Some(..)`). Wraps the vendor client (task
-/// inject + answer capture), assembles the substrate over the caller's token `seams`, drives
-/// `handle_run`. A failed mint aborts before reserve (fail-closed).
 fn dispatch_core(
     wallet: &dyn RunWallet,
     region: Region,
@@ -511,27 +436,6 @@ fn dispatch_core(
     let mut telemetry = SkeletonTelemetry::new();
     let agent_loop = SkeletonAgent::new();
 
-    // ── REAL "no balance → no run": the reserve gate reads the ACTUAL prepaid wallet balance ────────
-    // The affordability gate's `available` is the tenant's live wallet balance MINUS the amount already
-    // committed to its unsettled reservations (`Reserved`/`InFlight`), saturating at 0. This makes the
-    // gate a real "can't afford `estimate` → can't dispatch" check, and makes it concurrency-correct: a
-    // second run reserving against the same balance sees `available` reduced by the first run's
-    // outstanding amount, so two runs cannot over-reserve past one balance. Both amounts are `MicroUsd`
-    // (unified money type) — no unit bridge, just a saturating subtract.
-    //
-    // `dispatch_core` ALWAYS has a real wallet (F1). The no-wallet skeleton/mock/drill paths build
-    // `RunSubstrate` directly with `wallet: None` and their own nominal `available` — they never reach
-    // here, so those runs stay BYTE-IDENTICAL (the reserved==settled drills are unaffected). The nominal
-    // `task.available` literal is retained only for those no-wallet shapes.
-    //
-    // ATOMICITY NOTE (v1 — documented, not built): reading `balance` + `outstanding` then reserving is
-    // three ops, NOT one atomic transaction. Under N-way concurrency (N dispatchers reading the same
-    // pre-reserve `outstanding` snapshot) the over-admission is bounded by (N−1)×`estimate`. This has
-    // NO overspend impact: over-admission only inflates reservations; the atomic `wallet.debit`
-    // (`FOR UPDATE` + checked_sub, refuses on insufficient) is the real money backstop, so an
-    // over-admitted run simply halts at its debit — the balance can never go negative. The fully-atomic
-    // reserve-against-(balance − outstanding) in one cross-ledger transaction is a named follow-on
-    // (unified-wallet slice 4+).
     let outstanding = wiring
         .ledger
         .outstanding_reservations(&task.tenant)
@@ -550,7 +454,7 @@ fn dispatch_core(
         revoker: seams.revoker,
         catalogue: tools.catalogue,
         executor: tools.executor,
-        wallet: Some(wallet), // F1
+        wallet: Some(wallet),
         gate: &mut gate,
         ledger: wiring.ledger,
         available,
@@ -576,7 +480,6 @@ fn dispatch_core(
     })
 }
 
-/// The default agent-labelled system framing (agents are never disguised as human).
 fn default_system(system: &str) -> String {
     if system.trim().is_empty() {
         "You are a hosted agent. You are labelled as an agent. Answer the user's request \
@@ -587,16 +490,9 @@ fn default_system(system: &str) -> String {
     }
 }
 
-// ── AgentHost: the F2-airtight front door ───────────────────────────────────────────────────────────
-
-/// The hosted-agent front door. Owns the durable wallet + region, derived from one provider so they
-/// can't disagree (F2). Build inside a Tokio multi-thread runtime (the wallet's per-turn debit bridges
-/// sync→async via `block_in_place`).
 pub struct AgentHost {
     region: Region,
     wallet: AgentWallet,
-    /// Real Identity mint + durable revocation — `Some` via [`AgentHost::with_identity`], `None` via
-    /// [`AgentHost::new`] (the in-process floor).
     identity: Option<HostIdentity>,
 }
 
@@ -605,8 +501,6 @@ struct HostIdentity {
     revocations: RevocationStore,
 }
 
-/// The real Identity providers refused to start — a bad seal key or unreachable store. A host is never
-/// built with a degraded signing root (it would mint unverifiable tokens).
 #[derive(Debug)]
 pub enum HostIdentityError {
     CellRootUnavailable(String),
@@ -629,8 +523,6 @@ impl core::fmt::Display for HostIdentityError {
 impl std::error::Error for HostIdentityError {}
 
 impl AgentHost {
-    /// Host over the in-process token floor (hermetic/dev — no DB, no crypto). For a real multi-tenant
-    /// agent use [`AgentHost::with_identity`].
     pub fn new(provider: SubstrateProvider) -> AgentHost {
         let region = Region(provider.config().region.clone());
         AgentHost {
@@ -640,11 +532,6 @@ impl AgentHost {
         }
     }
 
-    /// Production host wired to real per-run token mint + durable S7 revocation. The signing root is
-    /// recovered from `cell_root` under `seal_key` (the same path edge/CI use — never a fresh root that
-    /// orphans tokens); the S7 denylist is PG-backed, RLS-scoped, crash-safe. Fail-closed here, before
-    /// any run, if the root won't unseal or the store is unreachable. Needs the cell-root + identity
-    /// migrations applied.
     pub async fn with_identity(
         provider: SubstrateProvider,
         cell_id: impl Into<String>,
@@ -682,14 +569,10 @@ impl AgentHost {
         &self.region
     }
 
-    /// The durable S7 revocation store — `Some` only on a real-Identity host. Lets a drill assert a
-    /// run's token was really revoked (and durably so).
     pub fn revocations(&self) -> Option<&RevocationStore> {
         self.identity.as_ref().map(|id| &id.revocations)
     }
 
-    /// The run's real Identity seams, bound to its verified scope + agent principal, or `None` on an
-    /// in-process-floor host. The returned revoker is a local the caller keeps alive for the borrow.
     fn identity_seams(
         &self,
         task: &LlmRunTask,
@@ -707,9 +590,6 @@ impl AgentHost {
         Some((minter, IdentityRunRevoker::new(id.revocations.clone(), scope)))
     }
 
-    /// Drive one metered run over this host's wallet (F1) + region (F2), minting a real per-run token
-    /// when built with identity else the in-process floor. Pass `Tools::none()` for a reasoning-only
-    /// run, or a real catalogue/executor to let it act. Brain: `Box::new(LunaClient::from_env()?)`.
     pub fn run(
         &self,
         task: &LlmRunTask,
@@ -747,7 +627,6 @@ mod tests {
     use super::*;
     use myelin_agent_model::{ModelReply, Usage};
 
-    /// An inner client that records every request it's handed and returns a fixed final answer.
     struct Spy {
         seen: Mutex<Vec<ModelRequest>>,
         answer: String,
@@ -773,7 +652,6 @@ mod tests {
             })
         }
     }
-    /// Forwards to a shared `Spy` (the orphan rule forbids `impl ModelClient for Arc<Spy>`).
     struct SharedSpy(Arc<Spy>);
     impl ModelClient for SharedSpy {
         fn complete(&self, r: &ModelRequest) -> Result<ModelResponse, ModelError> {

@@ -1,31 +1,9 @@
-//! # STOR-D5 (extended) — the within-EU **CDN clone/bundle class** drill (P-ST-23 / global P-254):
-//! the CDN edge set is within-EU → **0 cross-region PII egress via the CDN**, with the dated green
-//! artifact.
-//!
-//! This is the STOR-D5 CDN extension (storage.md §4.2 / contract 12.4 — "residency_verify covers the
-//! CDN edge set"). It exercises the within-EU CDN clone/bundle class ([`myelin_storage::CdnCloneClass`])
-//! end-to-end and asserts the prompt's GATE — *the C3 CDN edge set is within-EU → 0 cross-region PII
-//! egress via the CDN; the residency attestation INCLUDES the CDN edge set*.
-//!
-//! Four legs, each emitting its verdict LOUDLY (a red aborts the test, EI-01 §3 — the threshold is
-//! NOT weakened to pass):
-//!   1. **CONTENT-ADDRESS IS THE VALIDITY CHECK:** a published bundle round-trips by its
-//!      content-address; a tampered bundle is REFUSED (no staleness model — the address IS the cache
-//!      validity check).
-//!   2. **WITHIN-EU EDGE SET:** an EU tenant's eligible edge set contains ONLY within-EU POPs — the
-//!      extra-EU POP is excluded by construction (no PII-bearing bundle reaches an extra-EU edge).
-//!   3. **THE ATTESTATION COVERS THE CDN EDGE SET:** the CDN report aggregates with the M1 store
-//!      reports; the attestation includes `cdn_edge_set` @ the tenant's region; egress reads 0.
-//!   4. **THE FAIL LEG (no silent pass):** a CDN edge serving an EU tenant from an extra-EU region
-//!      FAILs the SAME `verify_region_pinning` (the cross-region CDN breach reads RED).
-
 use myelin_storage::{
     verify_region_pinning, BlobError, CdnCloneClass, CdnEdgePop, ContentHash, FsBlobStore,
     ResidencyStoreClass, ResidencyVerifySignal, StoreResidencyReport, StoreSet,
 };
 use myelin_tenancy::{Region, TenantId};
 
-/// **THE STOR-D5 CDN DRILL: the within-EU CDN edge set, 0 cross-region PII egress via the CDN.**
 #[test]
 fn stor_d5_cdn_within_eu_zero_cross_region_egress() {
     let tenant = TenantId::from_token("tenant-d5-cdn");
@@ -34,11 +12,10 @@ fn stor_d5_cdn_within_eu_zero_cross_region_egress() {
     let cdn = CdnCloneClass::over(
         tenant.clone(),
         region.clone(),
-        /* tenant_is_eu */ true,
+         true,
         &store,
     );
 
-    // ── (1) CONTENT-ADDRESS IS THE VALIDITY CHECK: publish + serve by content-address; tamper → refuse.
     let bundle = b"PACK\0clone-bundle\0hot-repo-objects";
     let address = cdn.publish_bundle(bundle).expect("publish a clone bundle");
     assert_eq!(
@@ -57,14 +34,13 @@ fn stor_d5_cdn_within_eu_zero_cross_region_egress() {
     );
     assert!(
         matches!(cdn.bundle(&address), Err(BlobError::IntegrityFail { .. })),
-        "a tampered bundle is REFUSED — the content-address is the cache validity check (no staleness)"
+        "a tampered bundle is REFUSED - the content-address is the cache validity check (no staleness)"
     );
 
-    // ── (2) WITHIN-EU EDGE SET: an EU tenant's eligible edges are within-EU only.
     let candidates = vec![
         CdnEdgePop::new("par-1", Region::new("fr-par"), true),
         CdnEdgePop::new("ams-1", Region::new("nl-ams"), true),
-        CdnEdgePop::new("iad-1", Region::new("us-east"), false), // extra-EU — must be excluded
+        CdnEdgePop::new("iad-1", Region::new("us-east"), false),
     ];
     let eligible = cdn.eligible_edges(&candidates);
     assert_eq!(
@@ -77,7 +53,6 @@ fn stor_d5_cdn_within_eu_zero_cross_region_egress() {
         "STOR-D5 GATE: every eligible CDN edge is within-EU (no PII-bearing bundle reaches an extra-EU edge)"
     );
 
-    // ── (3) THE ATTESTATION COVERS THE CDN EDGE SET; egress reads 0.
     let mut reports = StoreSet::for_cell(&region).reports_for(&tenant);
     reports.push(cdn.residency_report());
     let att = verify_region_pinning(&tenant, &region, &reports)
@@ -94,7 +69,6 @@ fn stor_d5_cdn_within_eu_zero_cross_region_egress() {
         "STOR-D5 GATE: 0 cross-region PII egress via the CDN (the headline zero)"
     );
 
-    // ── (4) THE FAIL LEG (no silent pass): a cross-region CDN edge FAILs the SAME aggregation.
     let bad_cdn = StoreResidencyReport {
         tenant: tenant.clone(),
         store_class: ResidencyStoreClass::CdnEdgeSet,
@@ -109,7 +83,6 @@ fn stor_d5_cdn_within_eu_zero_cross_region_egress() {
         "the cross-region CDN breach is caught by the SAME aggregation: {fail}"
     );
 
-    // Dated green artifact (the STOR-D5 CDN PROVEN line — observability is part of the pass, EI-01 §3).
     println!(
         "[2026-06-21] PASS  drill=STOR-D5-CDN-WITHIN-EU  tenant={}  region=fr-par  \
          eligible_edges={}/{} within-EU (extra-EU excluded)  \

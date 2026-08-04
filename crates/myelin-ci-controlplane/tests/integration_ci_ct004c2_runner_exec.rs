@@ -1,31 +1,3 @@
-//! **CT-004c.2 — the durable-backed runner EXECUTES a real job in gVisor, PROVEN against live PG +
-//! real `runsc`.** This is the security-sensitive binding: the `RunnerAgent` claims from the DURABLE
-//! `job_queue` (CT-004c.1's `CiJobQueueStore`, adapted to the sandbox `LeaseStore` port) and executes
-//! the leased job in a REAL `runsc` (gVisor) guest, then delivers `job.done` through the engine signal
-//! path and settles the lease.
-//!
-//! What it proves:
-//!   1. **END TO END (requires real `runsc`):** enqueue a compute `JobSpec` into the durable queue →
-//!      the durable-backed runner CLAIMS it → a REAL `runsc` guest runs the command → the guest's
-//!      exit/output is correct → `job.done` fires ONCE via the engine signal → the durable lease is
-//!      completed. SKIPS green if `runsc`/rootfs are absent; HARD-FAILS under `MYELIN_REQUIRE_RUNSC=1`.
-//!   2. **SECURITY (a) — the tier filter survives the adapter:** a runner with trusted-only
-//!      `allowed_tiers` NEVER claims/executes an `untrusted_fork` job (the durable predicate, forwarded
-//!      unchanged). The fork row stays `queued`, never leased.
-//!   3. **SECURITY (b) — region isolation:** a runner in region A does not claim a region-B job.
-//!   4. **SECURITY (c) — stolen-lease / no double-run:** a job whose lease was stolen mid-flight fails
-//!      the runner's heartbeat (`run_one` Step-2 guard, exercised through the durable store) → the
-//!      runner would NOT proceed to a second run.
-//!   5. **SECURITY (d) — references-not-payloads:** the buffered `job.done` payload carries the pass
-//!      marker + the `ci.log.available` ref, NEVER the guest's captured stdout bytes (those ride the
-//!      firehose).
-//!
-//! Gated behind the `integration` cargo feature. Run against the docker-compose dev stack:
-//!
-//!   eval "$(scripts/dev-stack.sh env)"
-//!   export MYELIN_REQUIRE_RUNSC=1
-//!   cargo test -p myelin-ci-controlplane --features integration \
-//!     --test integration_ci_ct004c2_runner_exec -- --nocapture
 #![cfg(feature = "integration")]
 
 mod common;
@@ -64,8 +36,6 @@ use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
 use sqlx::{Executor, PgPool};
 
-// ─────────────────────────────── PG / schema plumbing (reuses CT-004c.1 shapes) ──────────────────
-
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin".into())
@@ -73,8 +43,6 @@ fn app_url() -> String {
 fn admin_url() -> String {
     app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
 }
-// A per-TEST schema name (not just per-pid): the four tests run in parallel in ONE test binary, so a
-// pid-only name collided on `CREATE SCHEMA` (the setup raced) — the `tag` makes each test's schema unique.
 fn schema_name(tag: &str) -> String {
     format!("ci_ct004c2_{}_{}", std::process::id(), tag)
 }
@@ -185,17 +153,6 @@ async fn activate_job_owner(admin: &PgPool, job: &DurableEnqueue) {
     .expect("insert active CI owner");
 }
 
-/// CT-004f capstone: also create the log index tables + the durable outbox in the schema (the live
-/// `LogPipelineSink`/`DurableLogPersist` seal to `log_segment`/`log_anchor` + emit `ci.log.available`
-/// to the outbox, all unqualified → the pinned `search_path` resolves them here).
-///
-/// Also creates `ci_job_spec`: `DurableLogPersist::resume_async` (the live sink's resume path) joins
-/// `ci_job_spec` to `job_queue` on `(tenant, region, job_id, run_id)` to resolve the log route's
-/// canonical `ci_run_id` — WITHOUT a `ci_job_spec` row for the exact job/run, that join returns no
-/// rows and the real `ship_frame` call fails closed with "no rows returned by a query that expected
-/// to return at least one row" (the bug this file's capstone test hit before this fix; see
-/// `integration_ci_ct004f_durable_log_persist.rs`'s `seed_log_route` for the sibling pattern this
-/// mirrors).
 async fn create_log_tables(admin: &PgPool) {
     for (base, ddl) in [
         ("log_segment", CREATE_LOG_SEGMENT_DDL),
@@ -220,10 +177,6 @@ async fn create_log_tables(admin: &PgPool) {
         .expect("create the durable outbox");
 }
 
-/// Seed the `ci_job_spec` row the live log sink's resume join requires: `(tenant, region, job_id,
-/// run_id)` must match the `job_queue` row exactly, and `spec->>'ci_run_id'` must be the SAME run
-/// uuid the rest of the test uses (here, the job_queue row's own `run_id` — this test has no separate
-/// ci_run identity distinct from the workflow run).
 async fn seed_log_route(admin: &PgPool, tenant: &str, region: &str, job_id: Uuid, run_id: Uuid) {
     sqlx::query(
         "INSERT INTO ci_job_spec (tenant_id, region, job_id, run_id, idem_token, spec) \
@@ -240,7 +193,6 @@ async fn seed_log_route(admin: &PgPool, tenant: &str, region: &str, job_id: Uuid
     .expect("seed the ci_job_spec log route (resume_async's job_queue join target)");
 }
 
-/// A stable uuid from a name (FNV-1a fill) — the durable `uuid` columns require real uuids.
 fn uid(name: &str) -> Uuid {
     let mut bytes = [0u8; 16];
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -285,8 +237,6 @@ fn enq(
     }
 }
 
-// ─────────────────────────────── runsc gating (mirrors gvisor_prod_exec_test) ────────────────────
-
 fn runsc_present() -> bool {
     let bin = std::env::var("MYELIN_RUNSC_BIN").unwrap_or_else(|_| "runsc".to_string());
     let on_path = if bin.contains('/') {
@@ -300,7 +250,6 @@ fn runsc_present() -> bool {
     on_path && resolved_gvisor_rootfs().exists()
 }
 
-/// HARD-FAIL under `MYELIN_REQUIRE_RUNSC=1`; else GRACEFUL SKIP. Returns whether to run the real-exec.
 fn require_or_skip(test: &str) -> bool {
     if runsc_present() {
         return true;
@@ -308,18 +257,14 @@ fn require_or_skip(test: &str) -> bool {
     if std::env::var("MYELIN_REQUIRE_RUNSC").as_deref() == Ok("1") {
         panic!(
             "[{test}] MYELIN_REQUIRE_RUNSC=1 but `runsc` is not on PATH or the staged rootfs ({}) is \
-             absent — CT-004c.2 refuses a VACUOUS green: a real `runsc` guest MUST run the leased job.",
+             absent - CT-004c.2 refuses a VACUOUS green: a real `runsc` guest MUST run the leased job.",
             resolved_gvisor_rootfs().display()
         );
     }
-    eprintln!("[{test}] SKIPPED: `runsc`/rootfs absent — this host cannot run a gVisor guest.");
+    eprintln!("[{test}] SKIPPED: `runsc`/rootfs absent - this host cannot run a gVisor guest.");
     false
 }
 
-// ─────────────────────────────── sandbox seam helpers ────────────────────────────────────────────
-
-/// A firehose sink that CAPTURES the shipped frames so the test can assert the REAL guest output flowed
-/// through the references-not-payloads firehose (never the signal payload).
 #[derive(Clone, Default)]
 struct CapturingFirehose {
     bytes: Arc<Mutex<Vec<u8>>>,
@@ -351,8 +296,6 @@ impl CapturingFirehose {
     }
 }
 
-/// A minter that yields a FIXED ULID whose string is a real uuid — so the executor's started run id ==
-/// the durable row's `run_id` (uuid column), which the `job.done` targets.
 struct FixedMinter(String);
 impl IdMinter for FixedMinter {
     fn mint(&self) -> Ulid {
@@ -364,9 +307,6 @@ fn ok_hooks() -> RunnerHooks {
     common::stage_b_compute_hooks_for_legacy_runsc_test()
 }
 
-/// The real, already-founder-pipeline-pinned `linux-small-v1` image (`.myelin/ci.toml`'s own pin).
-/// CT-007 gate 2/4 made `spec.image` the real launch authority, so this test's `GvisorBackend` needs
-/// a registry mapping this EXACT image to a real, digest-matching directory.
 fn linux_small_v1_image() -> ImageRef {
     ImageRef::pinned(format!(
         "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
@@ -386,7 +326,6 @@ fn test_registry() -> Arc<GvisorAssetRegistry> {
     )
 }
 
-/// A real compute `JobSpec` running `command` — the shape a `runsc` guest actually executes.
 fn compute_spec(command: Vec<String>, idem: &str) -> JobSpec {
     JobSpec::new(
         JobKind::Ci,
@@ -414,8 +353,6 @@ fn compute_spec(command: Vec<String>, idem: &str) -> JobSpec {
     .unwrap()
 }
 
-// ═════════════════════════════════════ 1. END-TO-END (real runsc) ════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     if !require_or_skip("ct004c2-e2e") {
@@ -432,11 +369,9 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     let store = ci_job_queue_store(admin.clone());
     let region_store = ci_region_queue_store_test_support(admin.clone());
 
-    // The durable run id is a uuid; the executor's started run must carry the SAME id (job.done target).
     let run_uuid = uid("e2e-run").to_string();
     let idem = job_idem_token(&run_uuid, "ci.pipeline:0");
 
-    // ── enqueue a real compute job into the DURABLE queue (trusted, linux). ──
     let job = enq(
         tenant,
         region,
@@ -452,7 +387,6 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     );
     activate_job_owner(&admin, &job).await;
 
-    // ── the engine executor the job.done wakes (the ONE signal path). Run id == the durable run_id. ──
     let executor = FlowExecutor::new(
         Arc::new(FixedMinter(run_uuid.clone())),
         TenantId(tenant.into()),
@@ -472,7 +406,6 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         "the started run id == the durable run_id"
     );
 
-    // ── the durable-store lease adapter (the security pass-through) + a REAL resolver → compute spec. ──
     let idem_for_resolver = idem.clone();
     let resolve: JobSpecResolver = Arc::new(move |_l: &LeasedJob| {
         Ok(compute_spec(
@@ -498,7 +431,7 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     let agent = RunnerAgent::new(
         "e2e-worker",
         vec!["linux".into()],
-        vec![TrustTier::Trusted], // trusted-only
+        vec![TrustTier::Trusted],
         Region(region.into()),
         30,
         adapter,
@@ -508,7 +441,6 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         ok_hooks(),
     );
 
-    // ── DRIVE the full claim → REAL runsc launch → job.done → settle cycle. ──
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -531,7 +463,7 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     assert_eq!(outcome.run_id, run_uuid);
     assert!(
         outcome.report.passed,
-        "the real `runsc` guest exited 0 (clean) — derived passed=true"
+        "the real `runsc` guest exited 0 (clean) - derived passed=true"
     );
     assert!(
         guest.contains("hello-ct004c2"),
@@ -550,7 +482,6 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
         "the engine buffered EXACTLY ONE job.done"
     );
 
-    // ── SECURITY (d): references-not-payloads — the job.done payload carries refs, NOT guest bytes. ──
     let row = executor
         .signals()
         .get(&TenantId(tenant.into()), &run_uuid, JOB_DONE_SIGNAL, &idem)
@@ -562,13 +493,12 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     for r in &row.payload {
         assert!(
             !r.0.contains("hello-ct004c2"),
-            "SECURITY(d): captured guest stdout MUST NEVER enter the job.done signal payload — it \
+            "SECURITY(d): captured guest stdout MUST NEVER enter the job.done signal payload - it \
              rides the firehose (references-not-payloads). offending ref: {r:?}"
         );
     }
     assert_eq!(row.payload_key_ref, None, "no inline PII payload");
 
-    // ── the durable lease was SETTLED (the row moved to terminal). ──
     let state: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1")
         .bind(uid("e2e-job"))
         .fetch_one(&admin)
@@ -587,15 +517,6 @@ async fn durable_backed_runner_executes_real_runsc_end_to_end() {
     .await;
 }
 
-// ═══════════ 1b. CT-004f CAPSTONE — real runsc guest → LIVE log sink → readable from CAS ══════════
-
-/// **The full CT-004f live path, end to end against real `runsc` + live PG + live S3.** Drives the
-/// SAME durable-claim → REAL runsc guest → `job.done` cycle as the e2e test above, but with the
-/// PRODUCTION firehose the runner now wires ([`LogPipelineSink`] over the real [`S3BlobStore`] +
-/// [`DurableLogPersist`]) instead of a capturing stub. Proves the composition that joins the
-/// independently-proven legs: a guest's stdout is redacted at the boundary (empty plan today), sealed
-/// to the real S3 CAS, indexed in `log_segment`/`log_anchor`, and the `ci.log.available` pointer is
-/// co-committed to the outbox — and the guest's output is READABLE BACK from the CAS via the index.
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_sink() {
     if !require_or_skip("ct004f-capstone") {
@@ -663,8 +584,6 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
     );
     let backend = GvisorBackend::new(test_registry());
 
-    // THE PRODUCTION FIREHOSE — the exact sink `CiRunnerLoop` now wires (sub-step 5): the per-job
-    // LogPipeline seals to the REAL S3 CAS; DurableLogPersist writes the index + the outbox pointer.
     let cfg = MyelinConfig::dev();
     let handle = tokio::runtime::Handle::current();
     let firehose = LogPipelineSink::new(
@@ -695,7 +614,6 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
         .expect("claim + REAL runsc + seal logs + job.done");
     assert!(outcome.report.passed, "the runsc guest exited 0");
 
-    // ── the index landed: a sealed segment (with a CAS blob_ref) + the step anchor closed `passed`. ──
     let run_id = uid("capstone-run");
     let job_id = uid("capstone-job");
     let seg_rows: Vec<Option<String>> =
@@ -721,7 +639,6 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
         "the anchor closed with the job verdict"
     );
 
-    // ── the ci.log.available pointer co-committed to the outbox. ──
     let aggregate = format!("ci/run/{run_uuid}/job/{}", job_id);
     let pointer_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM outbox WHERE aggregate = $1 AND envelope->>'type_' = 'ci.log.available'",
@@ -735,7 +652,6 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
         "a ci.log.available pointer rode the outbox"
     );
 
-    // ── THE PAYOFF: the guest's stdout is READABLE BACK from the real S3 CAS via the index. ──
     let cas = S3BlobStore::connect(&cfg.s3, handle);
     let mut sealed = Vec::new();
     for blob_ref in seg_rows.into_iter().flatten() {
@@ -759,8 +675,6 @@ async fn real_runsc_guest_output_seals_to_cas_and_is_readable_via_the_live_log_s
     .await;
 }
 
-// ═════════════════════════════ 2. SECURITY (a): tier filter survives the adapter ═════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     let schema = schema_name("tier");
@@ -774,7 +688,6 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     let store = ci_job_queue_store(admin.clone());
     let region_store = ci_region_queue_store_test_support(admin.clone());
 
-    // ONLY an untrusted_fork job is queued (linux, in-region).
     let fork = enq(
         tenant,
         region,
@@ -787,10 +700,7 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     store.enqueue(&fork).await.expect("enqueue fork");
     activate_job_owner(&admin, &fork).await;
 
-    // A trusted-only adapter claim (the exact seam run_one drives) must return None — the fork job is
-    // NEVER claimable by a trusted-only runner (the durable predicate, forwarded UNCHANGED).
     let resolve: JobSpecResolver = Arc::new(|l: &LeasedJob| {
-        // If we ever reach here the tier filter was breached — force a loud failure.
         panic!(
             "SECURITY BREACH: the resolver was called for a leased fork job {}!",
             l.job_id
@@ -806,7 +716,7 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     let claimed = adapter.claim_for_labels(
         "trusted-worker",
         &["linux".to_string()],
-        &[TrustTier::Trusted], // trusted-only
+        &[TrustTier::Trusted],
         &Region(region.into()),
         1000,
         30,
@@ -815,7 +725,6 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
         claimed.is_none(),
         "SECURITY(a): a trusted-only runner NEVER claims an untrusted_fork job (tier filter survives the adapter)"
     );
-    // The fork row is untouched — still queued (never leased, never executed).
     let state: String = sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1")
         .bind(uid("fork-job"))
         .fetch_one(&admin)
@@ -826,7 +735,6 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
         "the untrusted_fork job stays queued (unclaimed by the trusted-only runner)"
     );
 
-    // Control: a fork-admitting adapter DOES claim it (the gate is exact, not a blanket deny).
     let resolve_ok: JobSpecResolver =
         Arc::new(|_l: &LeasedJob| Ok(compute_spec(vec!["true".into()], "idem-fork")));
     let fork_adapter = DurableLeaseAdapter::new(
@@ -857,8 +765,6 @@ async fn trusted_only_runner_never_claims_untrusted_fork_through_adapter() {
     .await;
 }
 
-// ═════════════════════════════ 3. SECURITY (b): region isolation ═════════════════════════════════
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn region_a_runner_never_claims_region_b_job() {
     let schema = schema_name("region");
@@ -871,7 +777,6 @@ async fn region_a_runner_never_claims_region_b_job() {
     let store = ci_job_queue_store(admin.clone());
     let region_store = ci_region_queue_store_test_support(admin.clone());
 
-    // A trusted linux job in region B only.
     let jb = enq(
         tenant,
         "de-fra",
@@ -901,7 +806,7 @@ async fn region_a_runner_never_claims_region_b_job() {
         "fr-par-worker",
         &["linux".to_string()],
         &[TrustTier::Trusted],
-        &Region("fr-par".into()), // region A
+        &Region("fr-par".into()),
         1000,
         30,
     );
@@ -920,8 +825,6 @@ async fn region_a_runner_never_claims_region_b_job() {
     })
     .await;
 }
-
-// ═════════════════════════════ 4. SECURITY (c): stolen lease → no double-run ══════════════════════
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stolen_lease_fails_heartbeat_no_double_run() {
@@ -958,7 +861,6 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
         resolve,
     );
 
-    // worker-A claims the job (through the adapter — the exact run_one Step-1 path).
     let claimed = adapter_a
         .claim_for_labels(
             "worker-A",
@@ -971,7 +873,6 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
         .expect("worker-A claims the job");
     assert_eq!(claimed.job_id, uid("steal-job").to_string());
 
-    // The lease is STOLEN mid-flight: force it expired, the reaper re-queues it, worker-B re-claims it.
     admin
         .execute(
             format!(
@@ -999,8 +900,6 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
         .expect("worker-B steals the re-queued lease");
     assert_eq!(stolen.job_id, uid("steal-job"));
 
-    // worker-A's heartbeat (run_one Step-2 confirm) now FAILS — it lost the lease → it must NOT launch a
-    // second run of the job worker-B owns. This is the double-run guard, through the durable store.
     let held = adapter_a.heartbeat(
         "worker-A",
         &TenantId(tenant.into()),
@@ -1012,7 +911,6 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
         !held,
         "SECURITY(c): worker-A's heartbeat on a STOLEN lease is refused → run_one Step-2 stops (no double-run)"
     );
-    // worker-B, the true owner, CAN heartbeat (sanity: the guard is owner-exact, not a blanket deny).
     let b_held = adapter_a.heartbeat(
         "worker-B",
         &TenantId(tenant.into()),
@@ -1023,13 +921,12 @@ async fn stolen_lease_fails_heartbeat_no_double_run() {
     assert!(b_held, "the true owner (worker-B) heartbeats its own lease");
 
     println!(
-        "[CT-004c.2] PASS SECURITY(c): a stolen lease fails the heartbeat guard — no double-run"
+        "[CT-004c.2] PASS SECURITY(c): a stolen lease fails the heartbeat guard - no double-run"
     );
     })
     .await;
 }
 
-// A tiny compile/behaviour anchor so the RunnerError variants the loop matches stay in view.
 #[allow(dead_code)]
 fn _runner_error_shapes(e: &RunnerError) -> bool {
     matches!(
@@ -1041,8 +938,6 @@ fn _runner_error_shapes(e: &RunnerError) -> bool {
     )
 }
 
-/// A `LeaseStore` object-safety anchor: the durable adapter IS a `LeaseStore` (the port `run_one`
-/// drives), so the compiler proves the seam is the SAME one the in-memory floor satisfies.
 #[allow(dead_code)]
 fn _adapter_is_a_lease_store(a: &DurableLeaseAdapter) -> &dyn LeaseStore {
     a

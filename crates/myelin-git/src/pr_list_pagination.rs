@@ -1,10 +1,3 @@
-//! Canonical, scope-bound live-keyset pagination for pull-request lists.
-//!
-//! A `pl1_` cursor is a boundary in the currently authorized live relation, not a database
-//! snapshot. Inserts, deletes, filter changes and updated-time changes between requests may change
-//! totals and may move rows across a boundary. The cursor never grants authority: callers must still
-//! apply the repository/visible-set authorization predicate on every request.
-
 use base64::Engine as _;
 
 use crate::gix_backend::validate_repo_slug;
@@ -49,8 +42,6 @@ pub struct PrListCursor {
     visible_scope: [u8; 32],
 }
 
-/// Storage selector. Numeric offsets exist only as a bounded transition path; all newly minted
-/// continuations use `Keyset`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrListPage {
     Initial,

@@ -1,4 +1,3 @@
-//! Live PostgreSQL proof for CT-007 slice 5b.3-4a.2's Rust journal state machine.
 #![cfg(feature = "integration")]
 
 mod common;
@@ -431,7 +430,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         let app = pinned_pool(&app_url(), &schema).await;
         let journal = CiPrelaunchUsageJournal::new(app.clone(), REGION).unwrap();
 
-        // Fresh admission transitions a reserved row to inflight and creates exactly one attempt.
         let exact = seed_fixture(
             &app,
             &admin,
@@ -467,8 +465,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         .unwrap();
         assert_eq!(attempts, 1);
 
-        // Two simultaneous acknowledgers serialize on the reservation/advisory boundary: exactly
-        // one inserts and the other recovers the same immutable generation.
         let concurrent = seed_fixture(
             &app,
             &admin,
@@ -640,8 +636,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
             "exact transport usage plus the materialization ceiling is consumed once"
         );
 
-        // A terminal owner may either refuse an unresolved phase or atomically seal it to the
-        // immutable ceiling while holding the same queue/advisory lock order.
         let unresolved = seed_fixture(
             &app,
             &admin,
@@ -721,8 +715,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
             }
         );
 
-        // Worker-side phase mutation re-verifies the exact live queue generation before touching
-        // the journal. A requeued/stale generation is refused before an INSERT can occur.
         let stale = seed_fixture(
             &app,
             &admin,
@@ -756,7 +748,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
             CiPrelaunchUsageJournalError::ClaimUnavailable
         );
 
-        // Each authority/refusal seam is exercised independently.
         let wrong_manifest_handle = {
             let mut value = exact.reserve_handle.clone();
             let last = value.pop().unwrap();
@@ -850,7 +841,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
             CiPrelaunchUsageJournalError::ReservationAuthorityMismatch
         );
 
-        // The cap counts parent-attempt rows, including a zero-preparation generation.
         let one_attempt_policy =
             CiAttemptBudgetPolicy::new(CiAttemptBudgetRevision::V1, NonZeroU32::new(1).unwrap());
         let capped = seed_fixture(&app, &admin, 6, one_attempt_policy, FixtureMutation::None).await;
@@ -887,10 +877,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
             CiPrelaunchUsageJournalError::ParentAttemptLimitExceeded
         );
 
-        // ---- CT-007 slice 5b.3-6d: the typed exhaustion capability ----
-        // The FIRST admitted attempt transitioned the reservation reserved -> inflight, and that
-        // committed. This is the load-bearing invariant: a reserve that has ANY committed parent row
-        // is already inflight, so an exhausted terminal never strands a `reserved` reservation.
         let reservation_state = |handle: String| {
             let admin = admin.clone();
             async move {
@@ -928,8 +914,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         };
         assert_eq!(parent_rows(capped.claim.job_id.clone()).await, 1);
 
-        // `admit_parent_attempt` for the SAME exhausted, never-admitted replacement generation returns
-        // the typed AttemptsExhausted capability (NOT an error), carrying the settleable reserve.
         match journal
             .admit_parent_attempt(&replacement, &capped.reserve_handle)
             .await
@@ -942,8 +926,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
                 panic!("an exhausted budget must not admit a new parent attempt")
             }
         }
-        // The commit created NO row for the refused generation, and left the reserve inflight (never
-        // stranded reserved): the exhausted terminal path can settle it.
         assert_eq!(parent_rows(capped.claim.job_id.clone()).await, 1);
         assert_eq!(
             reservation_state(capped.reserve_handle.clone()).await,
@@ -951,8 +933,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
             "an exhausted admission commits, leaving the reserve inflight and settleable"
         );
 
-        // The Admitted arm: a fresh, non-exhausted claim admits through `admit_parent_attempt` and
-        // transitions its own reserve to inflight in the same tenant transaction.
         let admittable = seed_fixture(
             &app,
             &admin,
@@ -979,7 +959,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
             reservation_state(admittable.reserve_handle.clone()).await,
             "inflight"
         );
-        // Exact replay of the admitted generation is idempotent (Replayed, still one row).
         assert!(matches!(
             journal
                 .admit_parent_attempt(&admittable.claim, &admittable.reserve_handle)
@@ -992,10 +971,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         ));
         assert_eq!(parent_rows(admittable.claim.job_id.clone()).await, 1);
 
-        // ---- CT-007 slice 5b.3-6d: the exhausted admission COMMITS its OWN reserved -> inflight
-        // transition. A regression moving the transition AFTER exhaustion detection would strand the
-        // reserve as `reserved`. Construct a full budget whose reservation is DELIBERATELY still
-        // `reserved` (max prior rows inserted directly, never through the admit path that flips it). ----
         let stranded = seed_fixture(
             &app,
             &admin,
@@ -1014,8 +989,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         .execute(&admin)
         .await
         .unwrap();
-        // Five parent rows for OTHER generations (epochs 2..=6) fill the exact-policy budget without
-        // ever transitioning the reservation. The fixture's own claim (epoch 1) has no row.
         for epoch in 2_i64..=6 {
             sqlx::query(
                 "INSERT INTO ci_job_parent_attempt (
@@ -1054,13 +1027,11 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
             }
             CiParentAttemptAdmission::Admitted { .. } => panic!("a full budget must not admit"),
         }
-        // THE regression catch: the committed exhaustion transitioned the reserve to inflight.
         assert_eq!(
             reservation_state(stranded.reserve_handle.clone()).await,
             "inflight",
             "an exhausted admission COMMITS its own reserved -> inflight transition"
         );
-        // No row was created for the refused (current) generation.
         assert_eq!(parent_rows(stranded.claim.job_id.clone()).await, 5);
         let epoch_one_rows: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM ci_job_parent_attempt
@@ -1074,7 +1045,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         .unwrap();
         assert_eq!(epoch_one_rows, 0, "the refused generation has no parent row");
 
-        // settled / cancelled / absent reservations NEVER yield the capability and are left unchanged.
         for forced in ["settled", "cancelled"] {
             sqlx::query(
                 "UPDATE cost_reservation SET state = $4
@@ -1118,7 +1088,6 @@ async fn durable_prelaunch_usage_state_machine_is_exact_replay_safe_and_fail_clo
         );
         assert_eq!(parent_rows(stranded.claim.job_id.clone()).await, 5);
 
-        // The Rust text-cast path preserves the complete u64 domain introduced by the schema slice.
         let max_usage = seed_fixture(
             &app,
             &admin,

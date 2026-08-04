@@ -1,29 +1,3 @@
-//! **REF-P9 / P-158 — the loop-guard causal-depth stamp on every `refs.edge.*`, PROVEN against the
-//! live dev-stack Postgres outbox.**
-//!
-//! Gated behind the `integration` cargo feature so the default `cargo build --workspace` /
-//! `cargo test --workspace` stay DB-free. Run against the docker-compose dev stack:
-//!
-//!   docker compose -f docker-compose.dev.yml up -d --wait
-//!   cargo test -p myelin-refs-service --features integration \
-//!     --test integration_ref_p9_loop_guard -- --nocapture
-//!
-//! This is the REAL data-layer proof the binding policy requires for REF-P9: the loop-guard stamp
-//! rides the SAME `outbox` table co-commit contract REF-P8's emit seam already proves. The guard's
-//! [`RefsLoopGuard::guarded_emit_edges`] derives the `refs.edge.created` envelopes through the REAL
-//! [`myelin_events::OutboxTransaction`] (so the `depth = content.depth + 1` stamp is correct-by-
-//! construction via `derive_envelope`), and those envelopes are inserted into the REAL frozen §2.3
-//! `outbox` table (the SAME shape the relay drains). We then read the stamp back FROM Postgres and
-//! prove:
-//!
-//! - **The `+1` depth stamp lands in the real outbox envelope:** a content cause at `depth = 3`
-//!   commits 3 `refs.edge.created` rows whose `envelope->>'depth'` is `4` in Postgres (read back from
-//!   the durable jsonb — not just the in-memory derive).
-//! - **The depth-ceiling tripwire parks BEFORE runaway:** a content cause AT the ceiling (12) writes
-//!   ZERO `refs.edge.created` rows (the chain halts ≤ ceiling) and fires the tripwire — observable,
-//!   never a silent unbounded fork.
-//!
-//! The drill is registered red-until-proven and flips green ONLY here, against the live stack.
 #![cfg(feature = "integration")]
 
 use myelin_content::InlineNode;
@@ -107,10 +81,6 @@ fn three_node_doc() -> Vec<InlineNode> {
     ]
 }
 
-/// Drive the loop guard over a content cause at `depth` and return the staged
-/// `(event_id, aggregate, subject, envelope-json)` rows ready to insert into the real outbox, plus
-/// the guard's decision (Emitted vs CeilingParked) so the integration test asserts the SAME
-/// structural outcome that lands in Postgres.
 fn guarded_rows(
     guard: &RefsLoopGuard,
     depth: u32,
@@ -126,7 +96,7 @@ fn guarded_rows(
         .guarded_emit_edges(&mut tx, &source_doc(), &three_node_doc(), &content)
         .expect("guard ok");
     tx.commit()
-        .expect("commit ok (the in-memory derive — the real co-commit is the PG tx below)");
+        .expect("commit ok (the in-memory derive - the real co-commit is the PG tx below)");
     let ids: Vec<EventId> = match &decision {
         GuardDecision::Emitted { ids, .. } => ids.clone(),
         GuardDecision::CeilingParked { .. } => Vec::new(),
@@ -165,7 +135,6 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
     let outbox = format!("outbox_p158_{suffix}");
     let content_tbl = format!("content_p158_{suffix}");
 
-    // ── Apply the REAL frozen §2.3 outbox table (suffixed for isolation) + a content table. ──
     let outbox_ddl = OUTBOX_MIGRATION
         .replace("EXISTS outbox (", &format!("EXISTS {outbox} ("))
         .replace("ON outbox (", &format!("ON {outbox} ("))
@@ -207,7 +176,6 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
         "INSERT INTO {outbox} (event_id, aggregate, seq, subject, envelope) VALUES ($1,$2,$3,$4,$5)"
     );
 
-    // ── (1) THE +1 STAMP LANDS IN THE REAL OUTBOX: content depth 3 → 3 edges at depth 4. ──
     let guard = RefsLoopGuard::new();
     let (decision, rows) = guarded_rows(&guard, 3);
     assert!(
@@ -244,7 +212,6 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
         .await
         .expect("commit the content + stamped edges together");
 
-    // Read the stamp BACK from the durable Postgres jsonb: every refs.edge.created carries depth 4.
     let n_at_depth_4: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {outbox} \
          WHERE envelope->>'type_' = 'refs.edge.created' AND (envelope->>'depth')::int = 4"
@@ -257,7 +224,6 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
         n_at_depth_4, 3,
         "all 3 committed refs.edge.created rows carry the +1 depth stamp (4) in the real outbox"
     );
-    // No edge escaped the stamp: there is NO refs.edge.created at any other depth.
     let n_off_stamp: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {outbox} \
          WHERE envelope->>'type_' = 'refs.edge.created' AND (envelope->>'depth')::int <> 4"
@@ -268,7 +234,6 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
     .get("n");
     assert_eq!(n_off_stamp, 0, "no refs.edge.created escaped the +1 stamp");
 
-    // ── (2) THE CEILING TRIPWIRE PARKS BEFORE RUNAWAY: content AT the ceiling → 0 edge rows. ──
     let (parked_decision, parked_rows) = guarded_rows(&guard, CAUSAL_DEPTH_CEILING);
     assert!(
         matches!(
@@ -284,7 +249,6 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
         "the tripwire fired before runaway"
     );
 
-    // Nothing new lands in the real outbox for the parked hop (the chain halted ≤ ceiling).
     let mut tx2 = app.begin().await.expect("begin a parked-hop transaction");
     sqlx::query(&format!(
         "INSERT INTO {content_tbl} (id, body_ref) VALUES ('m-deep','r-deep')"
@@ -301,13 +265,12 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
             .bind(envelope)
             .execute(&mut *tx2)
             .await
-            .expect("insert (there are none — parked)");
+            .expect("insert (there are none - parked)");
     }
     tx2.commit()
         .await
         .expect("commit the deep content (0 edges)");
 
-    // Still exactly the 3 stamped edges from step 1 — the parked hop added none (runaway bounded).
     let n_total: i64 = sqlx::query(&format!(
         "SELECT count(*) AS n FROM {outbox} WHERE envelope->>'type_' = 'refs.edge.created'"
     ))
@@ -317,10 +280,9 @@ async fn depth_stamp_lands_in_real_outbox_and_ceiling_parks_zero_on_real_postgre
     .get("n");
     assert_eq!(
         n_total, 3,
-        "the ceiling park wrote 0 new edges — the reactive chain halted ≤ ceiling (no runaway)"
+        "the ceiling park wrote 0 new edges - the reactive chain halted ≤ ceiling (no runaway)"
     );
 
-    // Cleanup (a NEW forward operation — test teardown, not a down-migration).
     sqlx::query(&format!("DROP TABLE {outbox}"))
         .execute(&admin)
         .await

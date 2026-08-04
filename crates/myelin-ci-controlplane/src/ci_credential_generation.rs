@@ -1,31 +1,3 @@
-//! **CT-007 phase-credential generations: the append-only credential-generation log.**
-//!
-//! The V1 credential is bound to one claim and expires at `min(claim_started_at + 300s,
-//! claim_expires_at)`, and the same claim deterministically refuses re-minting. A checkout-bearing
-//! job whose preparation legitimately runs longer than five minutes therefore reaches workload
-//! authorization holding a dead credential. This module is the durable half of the fix: at most one
-//! immutable row per exact claim and purpose (`checkout_advertise`, `checkout_fetch`,
-//! `checkout_materialization`, `workload`), each carrying its own issuance anchor, exact expiry,
-//! digest-form generation id, and the JTI Identity is expected to return.
-//!
-//! Three properties do the security work:
-//!
-//! 1. **Exclusivity without a revocation write.** There is no status column. A generation is CURRENT
-//!    iff no row with a greater `phase_ordinal` exists for that exact claim, so appending the
-//!    successor supersedes its predecessor at every durable execution gate in the same commit.
-//! 2. **Bounded cardinality, never rotation.** `purpose` is part of the primary key, so one claim can
-//!    hold at most four credentials. An expired same-purpose generation REFUSES rather than minting a
-//!    fresh one — the parent attempt must fail and requeue for a new scheduler generation.
-//! 3. **Signed generation binding.** The signed `CredentialPurpose::CiJob`'s `run_id` becomes
-//!    `ci-credential:v1:<digest>` over the exact immutable claim identity plus purpose, ordinal,
-//!    anchor, and expiry — so a credential minted for one phase of one claim cannot be presented at
-//!    any other phase or claim, even though Identity itself learns nothing about phases.
-//!
-//! **Dormant in production.** [`CiJobCredentialGenerationStore`] defaults to
-//! [`CiJobCredentialWriteVersion::V1ClaimBound`] and refuses every V2 mint under that pin, exactly
-//! the `OperationalReservationWriteVersion`/`CiJobAccountingWriteVersion` precedent. Nothing in the
-//! production composition root opts in; 5b.3-6 composes the phase sequence after fleet convergence.
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,26 +18,12 @@ use crate::ci_run_store::CiRunStore;
 use crate::job_queue_store::CiJobQueueStore;
 use crate::job_spec_store::CiJobSpecStore;
 
-/// The domain separator for the phase-credential generation digest. Distinct from every
-/// token-authority/reservation domain, so a generation id can never collide with an authority
-/// handle even for identical field content.
 pub const CI_PHASE_CREDENTIAL_V1_DOMAIN: &[u8] = b"myelin.ci.phase-credential.v1\0";
 
-/// The `run_id` prefix Identity signs for a V2 phase-bound credential.
 pub const CI_PHASE_CREDENTIAL_GENERATION_PREFIX: &str = "ci-credential:v1:";
 
-/// The only generation-binding version this slice writes or accepts. Task #91 leaves this encoding
-/// intact: reserve identity is signed directly in the capability vector and transitively through
-/// the v3 `token_authority_handle` already hashed by the generation.
 pub const CI_PHASE_CREDENTIAL_BINDING_V1: i16 = 1;
 
-// =================================================================================================
-// Purpose vocabulary.
-// =================================================================================================
-
-/// One credential purpose under an exact claim. The ordinal is the total order supersession is
-/// defined over; it is CHECKed against `purpose` in the durable schema as well, so a hand-written
-/// row cannot claim a purpose at the wrong ordinal.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CiCredentialPurpose {
     CheckoutAdvertise,
@@ -75,7 +33,6 @@ pub enum CiCredentialPurpose {
 }
 
 impl CiCredentialPurpose {
-    /// The exact schema vocabulary token.
     pub fn token(self) -> &'static str {
         match self {
             Self::CheckoutAdvertise => "checkout_advertise",
@@ -85,7 +42,6 @@ impl CiCredentialPurpose {
         }
     }
 
-    /// The supersession ordinal. `1..=4`, matching the durable `CHECK`.
     pub fn ordinal(self) -> i16 {
         match self {
             Self::CheckoutAdvertise => 1,
@@ -95,7 +51,6 @@ impl CiCredentialPurpose {
         }
     }
 
-    /// The immediate predecessor a checkout-bearing sequence requires to already be current.
     fn required_predecessor(self) -> Option<CiCredentialPurpose> {
         match self {
             Self::CheckoutAdvertise => None,
@@ -105,7 +60,6 @@ impl CiCredentialPurpose {
         }
     }
 
-    /// Parse a durable token back to the typed purpose.
     pub fn from_token(token: &str) -> Option<CiCredentialPurpose> {
         match token {
             "checkout_advertise" => Some(Self::CheckoutAdvertise),
@@ -116,34 +70,18 @@ impl CiCredentialPurpose {
         }
     }
 
-    /// Whether this purpose belongs to checkout preparation (never the workload itself).
     pub fn is_preparation(self) -> bool {
         !matches!(self, Self::Workload)
     }
 }
 
-/// **The rolling-deploy write-version pin.** The same discipline as
-/// [`OperationalReservationWriteVersion`](crate::ci_launch_authority::OperationalReservationWriteVersion)
-/// and [`CiJobAccountingWriteVersion`](crate::job_accounting_store::CiJobAccountingWriteVersion):
-/// the durable table and the dual-reading code land first, production stays pinned to V1, and only
-/// an explicit opt-in mints a phase-bound credential.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum CiJobCredentialWriteVersion {
-    /// Production. `CredentialPurpose::CiJob.run_id == job_id`, one credential per claim.
     #[default]
     V1ClaimBound,
-    /// Explicit opt-in. `run_id == ci-credential:v1:<digest>`, one credential per claim AND purpose.
     V2PhaseBound,
 }
 
-// =================================================================================================
-// The signed generation binding.
-// =================================================================================================
-
-/// Every field the phase-credential digest binds. Deliberately EXCLUDES `lease_expires` (mutable
-/// liveness state a renewal rewrites), `claim_window_secs` (derivable from the two claim
-/// timestamps), any renewal result, and a duplicate reserve field. The reserve is already bound by
-/// the v3 `token_authority_handle` input and by the credential's signed capability vector.
 #[derive(Clone, Copy, Debug)]
 pub struct CiPhaseGenerationInputs<'a> {
     pub tenant_id: &'a str,
@@ -164,8 +102,6 @@ pub struct CiPhaseGenerationInputs<'a> {
     pub binding_version: i16,
 }
 
-/// The unambiguous, length-prefixed generation digest under
-/// [`CI_PHASE_CREDENTIAL_V1_DOMAIN`] — the value Identity signs as the credential's `run_id`.
 pub fn phase_generation_id(inputs: CiPhaseGenerationInputs<'_>) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(CI_PHASE_CREDENTIAL_V1_DOMAIN);
@@ -201,9 +137,6 @@ fn hash_length_prefixed(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-/// The exact durable generation one credential was minted under. Carried on the ephemeral
-/// [`CiJobAuthorizationContext`](myelin_ci_sandbox::CiJobAuthorizationContext) so the launch-boundary
-/// verifier can RECOMPUTE the generation id rather than trusting the signed value.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiPhaseCredentialBinding {
     pub binding_version: i16,
@@ -214,14 +147,12 @@ pub struct CiPhaseCredentialBinding {
     pub expires_at_epoch_secs: i64,
 }
 
-/// Whether a mint inserted a fresh generation or replayed an existing one byte-for-byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiCredentialGenerationOutcome {
     Applied,
     Replayed,
 }
 
-/// The complete result of one phase mint.
 #[derive(Clone, Debug)]
 pub struct MintedPhaseCredential {
     pub credential: RunTokenCredential,
@@ -230,36 +161,20 @@ pub struct MintedPhaseCredential {
     pub outcome: CiCredentialGenerationOutcome,
 }
 
-// =================================================================================================
-// Errors.
-// =================================================================================================
-
-/// Typed, non-secret refusal from the credential-generation boundary. No token material, bearer, or
-/// tenant payload ever crosses this type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiCredentialGenerationError {
-    /// The store is pinned to `V1ClaimBound`; a phase mint was requested anyway.
     WriteVersionPinned,
     InvalidClaim,
     WrongRegion,
-    /// The exact live `leased` generation, its execution lease, or its public surface is gone.
     ClaimUnavailable,
     DurableAuthorityUnavailable,
-    /// The job carries no checkout authority but a preparation purpose was requested (or vice versa).
     PurposeUnavailableForJobShape,
-    /// The required predecessor generation is not the current one, or a successor already exists.
     OutOfOrderGeneration,
-    /// The journal state required by this purpose does not hold.
     JournalPredicateUnmet,
-    /// The exact durable parent attempt required by this purpose is absent.
     MissingParentAttempt,
-    /// A same-purpose generation exists but its window has closed. Generations never rotate.
     GenerationExpired,
-    /// A same-purpose generation exists whose stored facts differ from what this call recomputes.
     GenerationDivergence,
-    /// The claim lifetime, anchor, or expiry is outside the supported range.
     ExpiryOutOfRange,
-    /// Identity refused, or returned a credential that is not exactly the persisted generation.
     IdentityRefused,
     Database,
 }
@@ -314,17 +229,9 @@ fn map_sql_error(_error: sqlx::Error) -> CiCredentialGenerationError {
     CiCredentialGenerationError::Database
 }
 
-// =================================================================================================
-// The narrow Identity-facing phase mint seam.
-// =================================================================================================
-
-/// Everything the raw Identity seam needs for ONE phase credential. The anchor and expiry are the
-/// PERSISTED values, never recomputed from a process clock, so an exact retry reproduces the same
-/// bearer.
 #[derive(Clone, Debug)]
 pub struct CiPhaseCredentialMintRequest {
     pub claim: CiJobTokenRequest,
-    /// Exact durable reservation encoded into the signed capability vector.
     pub reserve_id: String,
     pub checkout: Option<CheckoutAuthorizationScope>,
     pub purpose: CiCredentialPurpose,
@@ -333,10 +240,6 @@ pub struct CiPhaseCredentialMintRequest {
     pub expires_at_epoch_secs: i64,
 }
 
-/// The phase-aware analogue of
-/// [`CiJobCredentialMinter`](crate::ci_claim_token_issuer::CiJobCredentialMinter). Implementations
-/// must sign exactly the supplied generation id, anchor the token at exactly the supplied issuance
-/// instant, and attenuate authority to exactly this purpose's capability vector.
 pub trait CiPhaseCredentialMinter: Send + Sync {
     fn mint_phase<'a>(
         &'a self,
@@ -344,11 +247,6 @@ pub trait CiPhaseCredentialMinter: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<RunTokenCredential, CiJobTokenIssueError>> + Send + 'a>>;
 }
 
-// =================================================================================================
-// The durable store.
-// =================================================================================================
-
-/// The lock-ordered, insert-or-replay phase-credential issuer.
 #[derive(Clone)]
 pub struct CiJobCredentialGenerationStore {
     pool: PgPool,
@@ -358,8 +256,6 @@ pub struct CiJobCredentialGenerationStore {
 }
 
 impl CiJobCredentialGenerationStore {
-    /// Production constructor. Pinned to [`CiJobCredentialWriteVersion::V1ClaimBound`], so every
-    /// phase mint refuses before touching the database.
     pub fn with_pg(
         pool: PgPool,
         region: impl Into<String>,
@@ -373,7 +269,6 @@ impl CiJobCredentialGenerationStore {
         )
     }
 
-    /// Explicit opt-in used by tests (and, after fleet convergence, by 5b.3-6's composition).
     pub fn with_pg_and_write_version(
         pool: PgPool,
         region: impl Into<String>,
@@ -396,15 +291,6 @@ impl CiJobCredentialGenerationStore {
         &self.region
     }
 
-    /// **The phase mint.** One tenant-scoped transaction in the established lock order: `job_queue`
-    /// `FOR UPDATE` → `ci_run` → manifest/spec authority → per-job advisory lock → journal and
-    /// generation rows. The durable generation is inserted (or replayed) INSIDE that transaction,
-    /// Identity is invoked while the locks are still held, the returned credential is validated
-    /// exactly, and only then does the transaction commit.
-    ///
-    /// If Identity succeeds but the transaction rolls back, the orphan S7 token has no committed
-    /// generation row and therefore cannot pass any durable phase gate. If the commit succeeded but
-    /// the reply was lost, the retry finds the row and reproduces the identical credential.
     pub async fn mint_phase_credential(
         &self,
         claim: &CiJobTokenRequest,
@@ -413,10 +299,6 @@ impl CiJobCredentialGenerationStore {
         self.mint_phase_credential_inner(claim, purpose, None).await
     }
 
-    /// Mint while exact-comparing the caller's checkout scope with the durable manifest authority
-    /// inside the same locked transaction. The outer `Option` in the private seam distinguishes
-    /// "no comparison requested" (legacy direct callers) from an explicitly expected compute
-    /// scope (`None`). Production checkout composition always uses this strict path.
     pub async fn mint_phase_credential_for_checkout_scope(
         &self,
         claim: &CiJobTokenRequest,
@@ -457,7 +339,6 @@ impl CiJobCredentialGenerationStore {
 
         with_tenant_tx_error(&self.pool, &tenant_id, &region, move |connection| {
             Box::pin(async move {
-                // ---- 1. the exact live claim generation, locked ----
                 let locked = CiJobQueueStore::lock_for_token_mint_on_conn(
                     connection,
                     &claim.tenant_id,
@@ -470,14 +351,11 @@ impl CiJobCredentialGenerationStore {
                 .ok_or(CiCredentialGenerationError::ClaimUnavailable)?;
                 verify_locked_claim(&claim, &locked)
                     .map_err(|_| CiCredentialGenerationError::ClaimUnavailable)?;
-                // `verify_locked_claim` admits `running` too (the workload path re-mints under it);
-                // a PHASE credential may only be minted while the generation is still `leased`.
                 if locked.state != "leased" {
                     return Err(CiCredentialGenerationError::ClaimUnavailable);
                 }
                 let liveness = live_generation_facts(connection, &claim).await?;
 
-                // ---- 2. durable run / manifest / spec authority ----
                 let run = CiRunStore::lock_for_token_mint_on_conn(
                     connection,
                     &claim.tenant_id,
@@ -508,9 +386,6 @@ impl CiJobCredentialGenerationStore {
                 {
                     return Err(CiCredentialGenerationError::DurableAuthorityUnavailable);
                 }
-                // The landed lease/topology contract: a checkout-bearing job on a legacy NULL-window
-                // row is refused outright here too, so no phase credential can ever be bound to a
-                // claim whose window cannot cover its own topology.
                 verify_claim_window(&claim, &locked, &launch)
                     .map_err(|_| CiCredentialGenerationError::DurableAuthorityUnavailable)?;
                 let checkout_bearing = authority.checkout.is_some();
@@ -525,7 +400,6 @@ impl CiJobCredentialGenerationStore {
                     return Err(CiCredentialGenerationError::DurableAuthorityUnavailable);
                 }
 
-                // ---- 3. the per-job advisory lock, then journal + generation rows ----
                 lock_credential_generation_job(
                     connection,
                     &claim.tenant_id,
@@ -545,7 +419,6 @@ impl CiJobCredentialGenerationStore {
                 )
                 .await?;
 
-                // ---- 4. insert or replay, INSIDE the locked transaction ----
                 let inputs_of = |issued: i64, expires: i64| CiPhaseGenerationInputs {
                     tenant_id: &claim.tenant_id,
                     region: &claim.region,
@@ -580,7 +453,6 @@ impl CiJobCredentialGenerationStore {
                         if recomputed != row.generation_id || expected_jti != row.jti {
                             return Err(CiCredentialGenerationError::GenerationDivergence);
                         }
-                        // Never rotate: an expired generation refuses, forcing requeue.
                         if row.expires_at <= liveness.now_epoch_secs {
                             return Err(CiCredentialGenerationError::GenerationExpired);
                         }
@@ -630,7 +502,6 @@ impl CiJobCredentialGenerationStore {
                     }
                 };
 
-                // ---- 5. Identity, invoked while every lock is still held ----
                 let credential = minter
                     .mint_phase(CiPhaseCredentialMintRequest {
                         claim: claim.clone(),
@@ -671,8 +542,6 @@ fn verify_supplied_checkout_matches_durable(
     }
 }
 
-/// `expiry = min(anchor + MAX_CI_JOB_TOKEN_TTL_SECS, claim_expires_at)`, refused unless strictly
-/// after the anchor.
 pub(crate) fn deterministic_phase_expiry(
     anchor_epoch_secs: i64,
     claim: &CiJobTokenRequest,
@@ -686,9 +555,6 @@ pub(crate) fn deterministic_phase_expiry(
         .ok_or(CiCredentialGenerationError::ExpiryOutOfRange)
 }
 
-/// The EXACT validation the design requires: the JTI Identity returned equals the persisted expected
-/// JTI, the reported TTL equals `expiry - anchor` exactly (not merely an upper bound), and the
-/// credential never copies the public authority handle.
 pub(crate) fn validate_phase_credential(
     claim: &CiJobTokenRequest,
     binding: &CiPhaseCredentialBinding,
@@ -713,19 +579,10 @@ pub(crate) fn validate_phase_credential(
     Ok(())
 }
 
-// =================================================================================================
-// Durable helpers.
-// =================================================================================================
-
 struct LiveGenerationFacts {
     now_epoch_secs: i64,
 }
 
-/// The predicates `LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY` does not itself carry: the EXECUTION lease
-/// (not merely the claim window) is still live under the landed lease contract, nothing has been
-/// completed, and the public `ci_job` surface is still pre-workload. Runs against the row this
-/// transaction already holds `FOR UPDATE`, and returns PostgreSQL's own `statement_timestamp()`
-/// floored to seconds as the deterministic issuance anchor.
 async fn live_generation_facts(
     connection: &mut sqlx::PgConnection,
     claim: &CiJobTokenRequest,
@@ -771,8 +628,6 @@ async fn live_generation_facts(
     })
 }
 
-/// The SAME per-job advisory key the prelaunch journal takes, so credential minting joins the
-/// canonical queue → advisory → journal lock order rather than inventing a second one.
 async fn lock_credential_generation_job(
     connection: &mut sqlx::PgConnection,
     tenant_id: &str,
@@ -825,8 +680,6 @@ fn generation_from_row(
     })
 }
 
-/// The CURRENT generation for the exact claim: the row with the greatest `phase_ordinal`. `None`
-/// means no credential has ever been minted for this claim.
 async fn current_generation(
     connection: &mut sqlx::PgConnection,
     claim: &CiJobTokenRequest,
@@ -875,8 +728,6 @@ async fn existing_generation(
     row.as_ref().map(generation_from_row).transpose()
 }
 
-/// The per-purpose durable preconditions from the locked design's table. Every one of these refuses
-/// BEFORE Identity is ever called.
 async fn verify_purpose_precondition(
     connection: &mut sqlx::PgConnection,
     claim: &CiJobTokenRequest,
@@ -885,8 +736,6 @@ async fn verify_purpose_precondition(
     current: Option<&DurableGeneration>,
     replaying: bool,
 ) -> Result<(), CiCredentialGenerationError> {
-    // A superseded purpose is never mintable again, even as a replay: appending a successor is what
-    // makes the predecessor non-current.
     if let Some(current) = current {
         if current.purpose.ordinal() > purpose.ordinal() {
             return Err(CiCredentialGenerationError::OutOfOrderGeneration);
@@ -901,7 +750,6 @@ async fn verify_purpose_precondition(
             }
             Some(required) => {
                 if !checkout_bearing {
-                    // A compute job's workload credential is the FIRST generation of its claim.
                     if current.is_some() {
                         return Err(CiCredentialGenerationError::OutOfOrderGeneration);
                     }
@@ -912,13 +760,9 @@ async fn verify_purpose_precondition(
         }
     }
     if purpose == CiCredentialPurpose::CheckoutAdvertise {
-        // Advertise is minted by the resolver, BEFORE `begin_parent_attempt` can run; its parent and
-        // journal preconditions live in the EXECUTION gate, not here.
         return Ok(());
     }
     if purpose == CiCredentialPurpose::Workload && !checkout_bearing {
-        // A compute workload credential may be minted initially by the resolver; its execution gate
-        // still requires admitted parent state.
         return Ok(());
     }
     require_parent_attempt(connection, claim).await?;
@@ -1043,12 +887,6 @@ async fn insert_generation(
     }
 }
 
-// =================================================================================================
-// The retained per-boundary execution gates.
-// =================================================================================================
-
-/// The exact durable generation a preparation boundary re-verifies immediately before spawning.
-/// Built by the launch boundary from the ephemeral authorization context, never from caller memory.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiPhaseGenerationGate {
     pub tenant_id: String,
@@ -1058,8 +896,6 @@ pub struct CiPhaseGenerationGate {
     pub job_id: String,
     pub token_authority_handle: String,
     pub idem_token: String,
-    /// Exact commit re-derived at signed-context verification and compared to the immutable
-    /// dispatched `ci_job_spec` by every retained generation predicate.
     pub checkout_commit: Option<String>,
     pub lease_owner: String,
     pub lease_epoch: i64,
@@ -1074,28 +910,18 @@ pub struct CiPhaseGenerationGate {
     pub expires_at_epoch_secs: i64,
 }
 
-/// The journal statuses each preparation purpose requires at its OWN execution boundary. `None`
-/// means "this purpose imposes no requirement on that phase row".
 fn required_journal_statuses(
     purpose: CiCredentialPurpose,
 ) -> (Option<&'static str>, Option<&'static str>) {
     match purpose {
-        // Advertise/fetch both run inside the ONE `checkout_transport` journal phase.
         CiCredentialPurpose::CheckoutAdvertise | CiCredentialPurpose::CheckoutFetch => {
             (Some("started"), None)
         }
         CiCredentialPurpose::CheckoutMaterialization => (Some("measured"), Some("started")),
-        // The workload gate is folded into the launch CAS, not this query.
         CiCredentialPurpose::Workload => (Some("measured"), Some("measured")),
     }
 }
 
-/// **The retained preparation-boundary predicate.** Deliberately lazy and re-run at the spawn
-/// boundary rather than trusting a mint that may have happened minutes earlier: it re-verifies the
-/// exact queue generation (still `leased`, lease and claim both live, uncompleted), the exact
-/// credential-generation row, that NO greater ordinal exists (so an appended successor instantly
-/// retires this credential), that the generation has not itself expired, the exact durable parent
-/// attempt, the pre-workload public surface, and the journal predicate this purpose requires.
 pub const VERIFY_PHASE_GENERATION_QUERY: &str = "\
 SELECT 1
 FROM job_queue AS q
@@ -1188,20 +1014,11 @@ WHERE q.tenant_id = $1
       AND materialization.status = $20
   ))";
 
-/// Run [`VERIFY_PHASE_GENERATION_QUERY`] for one exact preparation generation as a READ-ONLY probe.
-///
-/// **This is NOT the authorization path.** It takes no lock and its transaction closes before it
-/// returns, so a requeue or successor append immediately afterwards is invisible to it. The
-/// production gate is [`acquire_phase_generation_ownership`], which holds the row through the
-/// child-release boundary (round-1 blocker 1). Use this only for diagnostics and for tests that want
-/// to observe currency at a point in time.
 pub async fn verify_phase_generation_live(
     pool: &PgPool,
     gate: &CiPhaseGenerationGate,
 ) -> Result<bool, CiCredentialGenerationError> {
     if gate.purpose == CiCredentialPurpose::Workload {
-        // The workload boundary folds its generation predicate into the launch CAS instead; routing
-        // it through the read-only preparation gate would authorize a spawn without the CAS.
         return Err(CiCredentialGenerationError::PurposeUnavailableForJobShape);
     }
     let (transport, materialization) = required_journal_statuses(gate.purpose);
@@ -1246,57 +1063,16 @@ pub async fn verify_phase_generation_live(
     Ok(live)
 }
 
-/// The `job_queue`-row-locking form of [`VERIFY_PHASE_GENERATION_QUERY`]. `FOR SHARE OF q` takes a
-/// shared row lock on the EXACT `job_queue` row the predicate verified. Every writer that could
-/// invalidate this generation THROUGH the queue row must first take a conflicting lock on it:
-///
-/// - the reaper's requeue is an `UPDATE job_queue` (`FOR UPDATE`);
-/// - a SUCCESSOR mint takes `LOCK_JOB_CLAIM_FOR_TOKEN_MINT_QUERY`'s `SELECT ... FOR UPDATE` before
-///   it can append the superseding generation row;
-/// - the workload launch CAS (V1 or V2) is an `UPDATE job_queue`.
-///
-/// This is necessary but NOT sufficient on its own: the per-purpose predicate also depends on
-/// mutable `ci_job_prelaunch_usage.status`, and the topology-deadline sealer
-/// ([`crate::CiRegionQueueStore`]'s `seal_expired_prelaunch_usage`) transitions
-/// `started → sealed_ceiling` by locking ONLY the journal row, never `job_queue` (round-2 blocker
-/// 2). The journal rows are therefore locked separately by [`lock_purpose_journal_rows`].
 pub fn lock_phase_generation_query() -> String {
     format!("{VERIFY_PHASE_GENERATION_QUERY}\nFOR SHARE OF q")
 }
 
-/// **CT-007 round-1 blocker 1 / round-2 blocker 1 & 2: retained durable ownership of one preparation
-/// generation.**
-///
-/// A plain `SELECT` verification is not enough. Its transaction closes before the launch gate
-/// releases the mechanically-blocked child, so between "this generation is current and live" and the
-/// child actually running, the reaper can requeue the claim, a successor generation can be appended,
-/// or the journal-deadline sealer can seal an overdue phase — and the child then executes under a
-/// generation whose authorization has already lapsed.
-///
-/// This is the preparation analogue of the workload fence's retained session. It holds one RAII
-/// [`sqlx::Transaction`] carrying `FOR SHARE` locks on BOTH the exact `job_queue` row AND every
-/// `ci_job_prelaunch_usage` row whose status authorizes this purpose, across
-/// [`myelin_ci_sandbox::LaunchOwnership::validate`] and the gated release. A concurrent requeue,
-/// successor mint, launch CAS, or journal seal either BLOCKS/SKIPS until release (so it cannot
-/// invalidate a generation whose child is already committed to running) or wins first (so
-/// acquisition refuses and nothing spawns at all).
-///
-/// **Cancellation safety (round-2 blocker 1).** The transaction is a `sqlx::Transaction`, whose
-/// `Drop` enqueues a `ROLLBACK` on the owned connection. If the acquisition future is aborted at any
-/// await — while setting scope, while taking either lock, or after being wrapped here — the
-/// transaction (and the `SET LOCAL` scope + row locks it carries) is rolled back before the
-/// connection is reused; it is never returned to the pool carrying an open transaction. `release`
-/// likewise consumes the transaction and rolls it back through the same RAII path.
 pub struct RetainedCiPhaseGeneration {
     transaction: Option<Transaction<'static, Postgres>>,
     gate: CiPhaseGenerationGate,
 }
 
 impl RetainedCiPhaseGeneration {
-    /// Re-run the exact predicate on the STILL-OPEN transaction immediately before the gate write.
-    /// Under the held `job_queue` AND journal row locks the answer cannot have changed, which is
-    /// precisely the guarantee being asserted — the same belt-and-braces revalidation the workload
-    /// fence performs, now covering the mutable journal status too (round-2 blocker 2).
     pub async fn validate(&mut self) -> Result<(), CiCredentialGenerationError> {
         let gate = self.gate.clone();
         let transaction = self
@@ -1310,9 +1086,6 @@ impl RetainedCiPhaseGeneration {
         }
     }
 
-    /// Release the held locks after the already-gated child has received its exec byte. The
-    /// transaction is read-only, so it is rolled back rather than committed; a cancelled rollback
-    /// still tears the transaction down through `Transaction`'s own `Drop`.
     pub async fn release(mut self) -> Result<(), CiCredentialGenerationError> {
         match self.transaction.take() {
             Some(transaction) => transaction
@@ -1324,8 +1097,6 @@ impl RetainedCiPhaseGeneration {
     }
 }
 
-/// Verify the phase predicate on an already-scoped connection, optionally taking the retaining
-/// `FOR SHARE` lock on the `job_queue` row.
 async fn phase_generation_predicate_holds(
     connection: &mut sqlx::PgConnection,
     gate: &CiPhaseGenerationGate,
@@ -1367,17 +1138,6 @@ async fn phase_generation_predicate_holds(
     Ok(row.is_some())
 }
 
-/// **Round-2 blocker 2: take a `FOR SHARE` lock on every `ci_job_prelaunch_usage` row whose status
-/// authorizes this purpose.** Run AFTER the `job_queue` lock, so the canonical queue → journal order
-/// is preserved (matching `require_live_parent_attempt_on_conn`'s queue → advisory → journal; this
-/// path is a reader that already holds the queue lock, so it needs no advisory). Locking the rows
-/// (regardless of their current status) freezes them so the immediately-following re-verification is
-/// stable.
-///
-/// The independent journal sealer uses `FOR UPDATE SKIP LOCKED`, so once these `FOR SHARE` locks are
-/// held it SKIPS the row every sweep until release; if the sealer instead holds the row first, this
-/// `FOR SHARE` waits for it, and the following re-verification then observes the sealed status and
-/// refuses. Either way no child spawns under a sealed phase.
 async fn lock_purpose_journal_rows(
     connection: &mut sqlx::PgConnection,
     gate: &CiPhaseGenerationGate,
@@ -1391,8 +1151,6 @@ async fn lock_purpose_journal_rows(
         phases.push("checkout_materialization");
     }
     if phases.is_empty() {
-        // Only the workload purpose depends on no started/measured journal row, and it never routes
-        // through this preparation gate.
         return Ok(());
     }
     sqlx::query(
@@ -1416,28 +1174,17 @@ async fn lock_purpose_journal_rows(
     Ok(())
 }
 
-/// **The production preparation-gate entry point.** Opens an RAII transaction, verifies the exact
-/// generation while taking a `FOR SHARE` lock on its `job_queue` row, then takes `FOR SHARE` locks on
-/// the journal rows this purpose depends on and RE-verifies under both locks. Returns ownership that
-/// HOLDS those locks until explicitly released. `None` means the generation is not current, has
-/// expired, or its claim/journal predicate no longer holds — nothing spawns.
 pub async fn acquire_phase_generation_ownership(
     pool: &PgPool,
     gate: &CiPhaseGenerationGate,
 ) -> Result<Option<RetainedCiPhaseGeneration>, CiCredentialGenerationError> {
     if gate.purpose == CiCredentialPurpose::Workload {
-        // The workload boundary folds its generation predicate into the launch CAS instead; routing
-        // it through the preparation gate would authorize a spawn without ever running that CAS.
         return Err(CiCredentialGenerationError::PurposeUnavailableForJobShape);
     }
-    // `pool.begin()` returns a `Transaction` whose `Drop` enqueues a rollback — so from this point
-    // on, any cancellation tears the transaction (and every lock/GUC it holds) down cleanly.
     let mut transaction = pool
         .begin()
         .await
         .map_err(|_| CiCredentialGenerationError::Database)?;
-    // Transaction-local scope: `set_config(..., true)` is the parameterizable `SET LOCAL`; it is
-    // discarded on rollback/commit, so a cancelled acquisition never leaks tenant scope either.
     sqlx::query(
         "SELECT set_config('myelin.tenant_id', $1, true),
                 set_config('myelin.region', $2, true)",
@@ -1448,7 +1195,6 @@ pub async fn acquire_phase_generation_ownership(
     .await
     .map_err(map_sql_error)?;
 
-    // (A) Lock the `job_queue` row and verify the full predicate.
     if !phase_generation_predicate_holds(&mut transaction, gate, true).await? {
         transaction
             .rollback()
@@ -1456,11 +1202,7 @@ pub async fn acquire_phase_generation_ownership(
             .map_err(|_| CiCredentialGenerationError::Database)?;
         return Ok(None);
     }
-    // (B) Lock the journal rows this purpose depends on (queue → journal order).
     lock_purpose_journal_rows(&mut transaction, gate).await?;
-    // (C) Re-verify under BOTH locks. This closes the A→B window in which the sealer could have
-    // sealed the row between the queue-locking check and the journal lock: if it did, the row is now
-    // `sealed_ceiling`, the predicate no longer holds, and acquisition refuses.
     if !phase_generation_predicate_holds(&mut transaction, gate, false).await? {
         transaction
             .rollback()
@@ -1610,9 +1352,6 @@ mod tests {
         );
     }
 
-    /// **Domain separation across all four purposes AND every claim-identity field.** Any change to
-    /// any bound field must move the generation id; two purposes of the SAME claim must never
-    /// collide.
     #[test]
     fn the_generation_digest_separates_every_purpose_and_every_bound_field() {
         let base = claim();
@@ -1665,7 +1404,6 @@ mod tests {
             );
         }
 
-        // The claim timestamps, anchor, expiry, and binding version are bound too.
         let mut started = inputs(&base, CiCredentialPurpose::Workload);
         started.claim_started_at_epoch_secs += 1;
         assert_ne!(reference, phase_generation_id(started));
@@ -1683,8 +1421,6 @@ mod tests {
         assert_ne!(reference, phase_generation_id(version));
     }
 
-    /// An external golden pin: a self-referential expectation would stay green through a silent
-    /// encoding drift, so the digest's OUTPUT for one fully fixed input is frozen as a literal.
     #[test]
     fn the_generation_digest_is_externally_pinned() {
         assert_eq!(
@@ -1696,17 +1432,14 @@ mod tests {
     #[test]
     fn the_phase_expiry_is_capped_by_both_the_ttl_and_the_claim() {
         let claim = claim();
-        // A long claim: the 300-second ceiling wins.
         assert_eq!(
             deterministic_phase_expiry(1_785_000_100, &claim).unwrap(),
             1_785_000_400
         );
-        // Late in the claim: the claim ceiling wins.
         assert_eq!(
             deterministic_phase_expiry(1_785_004_700, &claim).unwrap(),
             1_785_004_800
         );
-        // Exactly at the claim ceiling: no positive window remains.
         assert_eq!(
             deterministic_phase_expiry(1_785_004_800, &claim),
             Err(CiCredentialGenerationError::ExpiryOutOfRange)

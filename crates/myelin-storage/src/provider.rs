@@ -1,38 +1,3 @@
-//! # `SubstrateProvider` — the production composition root / real-pool provider (MR-022, SI-022)
-//!
-//! **Owning architecture doc:**
-//! `planning/05-refined-shared-systems-architecture/00-platform-substrate.md` §3.2/§3.3 (config
-//! env-first, the bounded OLTP pool, migrate-at-boot) — the P-S12/P-S15 root. Closes census SI-022
-//! ("all real backings behind `--features integration`; default build+CI 100% in-memory") at the
-//! *production* level: this is the seam every durable store is constructed through where the REAL
-//! `PgPool` (+ Valkey, + S3) is built and migrations actually run.
-//!
-//! ## The gap this fills (the census's P-S12/P-S15 finding)
-//! There was no composition root wiring a REAL pool into the substrate: the substrate's
-//! [`myelin_substrate::serve`] opens the in-memory [`crate::oltp::OltpPool`] permit MODEL and runs
-//! the boot-time [`myelin_substrate::migrations::MigrationRunner`] that executes NO DDL (SI-010). So
-//! the "production default path" was in-memory end to end. `SubstrateProvider` is the production
-//! composition seam: it reads config from the environment (the dev↔prod CONFIG SWAP,
-//! [`myelin_config::MyelinConfig`]), constructs the REAL bounded [`PgPool`] (with reset-on-release
-//! wired, [`crate::tenant_tx::connect_pool_with_reset`]), runs migrations against it at startup
-//! (deliverable A, [`PgMigrator::apply_validated`] — validate → execute), and hands the pool (and
-//! the cache / blob backings) to the stores. **On this path the in-memory impls are explicit
-//! test-doubles, not the production default.**
-//!
-//! ## Scope (the FOUNDATION + the seam, not the store bindings)
-//! MR-022 builds the foundation + the seam every durable store plugs into. BINDING the individual
-//! stores (identity principal/tuple/revocation, events outbox/dedup, control-plane registry, KMS
-//! root) to this provider's pool is **MR-007/008/023/024/025** — those land their store
-//! constructors over [`SubstrateProvider::db_pool`] + the [`crate::tenant_tx::with_tenant_tx`]
-//! convention. This module deliberately does NOT construct them; it constructs the pool + runs the
-//! migrations they will bind to, and exposes the tenant-scoped-transaction convention they acquire
-//! through.
-//!
-//! ## Feature-gated (keeps the default build DB-free)
-//! Compiled only under `--features integration` (it pulls the real sqlx client + `myelin-config`).
-//! The default `cargo build/test --workspace` compiles none of it, so the unit build stays DB-free
-//! (the real-pool path is exercised by the `--features integration` tests the make-it-real gate runs).
-
 use myelin_config::{ConfigError, Mode, MyelinConfig};
 use sqlx::postgres::PgPool;
 
@@ -44,19 +9,12 @@ use crate::pg::PgError;
 use crate::pg_migrator::PgMigrator;
 use crate::tenant_tx::{connect_pool_with_reset, with_tenant_tx, TxScope};
 
-/// The default bounded pool size the provider opens when a caller does not specify one (the §3.3
-/// bounded-pool floor — never unbounded). A service tunes this from its own config.
 pub const DEFAULT_MAX_CONNECTIONS: u32 = 32;
 
-/// An error constructing or driving the composition root. Loud + typed: a missing prod env var, a
-/// failed connection, or a failed migration is a fail-fast at boot (§3.2), never a silent fallback.
 #[derive(Debug)]
 pub enum ProviderError {
-    /// A required env var was absent / invalid (prod fail-fast, [`Mode::RequireEnv`]).
     Config(ConfigError),
-    /// The real pool could not be opened or a migration failed against the live DB.
     Pg(PgError),
-    /// Split-credential bootstrap validation failed before DDL or runtime handoff.
     Bootstrap(BootstrapError),
 }
 
@@ -90,48 +48,25 @@ impl From<BootstrapError> for ProviderError {
     }
 }
 
-/// Credential-redacted failures from the split-role PostgreSQL bootstrap.
-///
-/// Variants deliberately carry no DSN or driver error text. A malformed URL, failed login, or
-/// authorization refusal must be loud without copying credential-bearing input into logs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BootstrapError {
-    /// Runtime and migration DSNs are byte-for-byte identical.
     CredentialsNotDistinct,
-    /// The migration-only connection could not be opened.
     MigrationConnect,
-    /// The constrained runtime connection could not be opened.
     RuntimeConnect,
-    /// PostgreSQL role/server metadata could not be inspected.
     ValidationProbe,
-    /// A store requiring the constrained serving capability received a provider that did not pass
-    /// the split-role runtime handoff.
     RuntimeCapabilityUnvalidated,
-    /// Runtime and migration credentials did not reach the same database/server/schema identity.
     DatabaseIdentityMismatch,
-    /// Both credentials authenticate as the same PostgreSQL role.
     RolesNotDistinct,
-    /// The runtime role is a superuser.
     RuntimeSuperuser,
-    /// The runtime role can bypass row-level security.
     RuntimeBypassRls,
-    /// The runtime role can create databases.
     RuntimeCreateDatabase,
-    /// The runtime role can create roles.
     RuntimeCreateRole,
-    /// The runtime role owns, or can assume ownership of, the application schema.
     RuntimeOwnsSchema,
-    /// The runtime role can create objects in the application schema.
     RuntimeCanCreateSchemaObjects,
-    /// The runtime role cannot use the application schema.
     RuntimeCannotUseSchema,
-    /// The runtime role is a member of the migration role.
     RuntimeMemberOfMigrationRole,
-    /// The runtime role can assume another obviously elevated role.
     RuntimeElevatedMembership,
-    /// The migration role cannot own/manage the application schema.
     MigrationCannotManageSchema,
-    /// The migration role cannot execute the PostgreSQL advisory-lock primitive.
     MigrationCannotUseAdvisoryLock,
 }
 
@@ -187,14 +122,6 @@ impl core::fmt::Display for BootstrapError {
 
 impl std::error::Error for BootstrapError {}
 
-/// The substrate's co-located FOUNDATION migrations every service's DB carries (architecture §3.3):
-/// the transactional `outbox` and the `consumer_dedup` tables (the SAME frozen DDL the substrate
-/// boot prefixes via [`myelin_substrate::serve`]). The provider runs these at startup so the durable
-/// stores have the substrate tables to bind to. A service appends its own migrations after these
-/// (the same order the boot-time runner uses).
-///
-/// REUSES the frozen `myelin_events::{OUTBOX_MIGRATION, CONSUMER_DEDUP_MIGRATION}` (never re-defines
-/// the outbox/dedup table shape — EI-01 §7).
 pub fn foundation_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0000_outbox", myelin_events::OUTBOX_MIGRATION),
@@ -202,9 +129,6 @@ pub fn foundation_migrations() -> Migrations {
             "0001_consumer_dedup",
             myelin_events::CONSUMER_DEDUP_MIGRATION,
         ),
-        // CT-004d.2 chunk 6 / #7b: the durable consumer DEAD-LETTER set — part of the foundation set
-        // (like `consumer_dedup`, every service's embedded set needs it) so a dead-lettered event
-        // (esp. the H2 panic path) survives a restart.
         Migration::plain(
             "0002_consumer_dead_letter",
             myelin_events::CONSUMER_DEAD_LETTER_MIGRATION,
@@ -228,36 +152,6 @@ pub fn foundation_migrations() -> Migrations {
     ])
 }
 
-/// The ORDERED list of every durable migration GROUP the platform owns, each returned by its own
-/// `*_durable_migrations()` constructor, in strictly-ascending id-range order (W7.2 / doc-18 Part 5).
-/// This is the SINGLE authority the aggregate [`all_durable_migrations`] is built FROM: the aggregate
-/// is nothing but the flattened concatenation of these groups, so a group **cannot** be in the boot
-/// sequence unless it is listed here, and the aggregate can never contain a migration that is not in
-/// one of these groups. Adding a new durable subsystem = add its constructor to THIS list (and the
-/// `boot_migration_ids_*` unit tests, which iterate the SAME list, keep the aggregate honest).
-///
-/// | group                              | id range      |
-/// |------------------------------------|---------------|
-/// | `identity_durable_migrations`      | `0010`–`0019` |
-/// | `pseudonym_durable_migrations`     | `0020`–`0022` |
-/// | `placement_durable_migrations`     | `0030`–`0039` |
-/// | `kms_durable_migrations`           | `0040`–`0042` |
-/// | `reserve_settle_durable_migrations`| `0050`        |
-/// | `restore_verify_durable_migrations`| `0051`        |
-/// | `post_pit_durable_migrations`      | `0052`        |
-/// | `bus_erasure_durable_migrations`   | `0053`        |
-/// | `hitl_gate_durable_migrations`     | `0054`-`0055` |
-/// | `cell_root_durable_migrations`     | `0060`        |
-/// | `delegation_policy_durable_migrations` | `0061`–`0066` |
-/// | `authz_projection_durable_migrations` | `0067`–`0069` |
-/// | `auth_replay_durable_migrations`  | `0070`–`0071` |
-/// | `agent_wallet_migrations`         | `0080`        |
-///
-/// The substrate FOUNDATION (`0000`–`0001`, outbox + consumer_dedup) is deliberately NOT in this list:
-/// it stays the separate [`foundation_migrations`] / [`SubstrateProvider::migrate_foundation`] call
-/// (the substrate boot owns it). The full boot sequence at a service main is therefore
-/// `migrate_foundation()` THEN `migrate(&all_durable_migrations(), …)` — foundation + everything else,
-/// each exactly once.
 pub fn durable_migration_groups() -> Vec<Migrations> {
     vec![
         crate::identity_durable::identity_durable_migrations(),
@@ -277,21 +171,6 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
     ]
 }
 
-/// **The provider-level DURABLE MIGRATION AGGREGATE (W7.2 / doc-18 Part 5 — the boot-migrations fix).**
-/// Composes EVERY durable migration group ([`durable_migration_groups`]) into one ordered
-/// [`Migrations`] in strictly-ascending id order (`0010`–`0080`), so a single boot call migrates the
-/// complete durable schema every service's stores bind to — closing the doc-18 LIVE DEFECT where a
-/// service main constructed durable stores (e.g. `PrincipalStore::with_pg`, needing identity
-/// `0010`–`0019`) but never migrated their tables, so the first write failed at runtime on a fresh DB.
-///
-/// Built FROM the group constructors (not a re-listed copy of the ids) so it **cannot drift**: it is
-/// exactly the flattened concatenation of [`durable_migration_groups`]. Excludes the substrate
-/// FOUNDATION (`0000`–`0001`) — that stays the separate [`SubstrateProvider::migrate_foundation`]
-/// call. Apply order at a main: `migrate_foundation()` then `migrate(&all_durable_migrations(), …)`.
-///
-/// The [`PgMigrator`] is idempotent + advisory-locked + version-recorded, so this is safe to apply at
-/// every boot and safe alongside any pre-existing per-group `migrate` call (the aggregate REPLACES the
-/// piecemeal calls; a residual one would just no-op).
 pub fn all_durable_migrations() -> Migrations {
     Migrations::of(durable_migration_groups().into_iter().flat_map(|g| g.0))
 }
@@ -333,7 +212,6 @@ struct SchemaAccess {
 }
 
 async fn connection_identity(pool: &PgPool) -> Result<ConnectionIdentity, BootstrapError> {
-    // @tenant-cross-scope: validates PostgreSQL connection and role catalogs before tenant access.
     let row: ConnectionIdentityRow = sqlx::query_as(
         "SELECT current_database() AS database,
                 (SELECT oid::bigint FROM pg_database WHERE datname = current_database())
@@ -370,7 +248,6 @@ async fn connection_identity(pool: &PgPool) -> Result<ConnectionIdentity, Bootst
 }
 
 async fn schema_access(pool: &PgPool) -> Result<SchemaAccess, BootstrapError> {
-    // @tenant-cross-scope: validates current-role schema grants, not application tenant rows.
     let row: (bool, bool, bool) = sqlx::query_as(
         "SELECT pg_has_role(current_user, n.nspowner, 'MEMBER'),
                 has_schema_privilege(current_user, n.oid, 'CREATE'),
@@ -427,7 +304,6 @@ async fn validate_bootstrap_pair(
     {
         return Err(BootstrapError::MigrationCannotManageSchema);
     }
-    // @tenant-cross-scope: validates a PostgreSQL catalog grant for the migration role.
     let can_lock: bool = sqlx::query_scalar(
         "SELECT has_function_privilege(
              current_user,
@@ -453,7 +329,6 @@ async fn validate_bootstrap_pair(
         return Err(BootstrapError::RuntimeCannotUseSchema);
     }
 
-    // @tenant-cross-scope: rejects runtime membership in the privileged migration role.
     let member_of_migration: bool =
         sqlx::query_scalar("SELECT pg_has_role(current_user, $1, 'MEMBER')")
             .bind(&migration.user)
@@ -464,7 +339,6 @@ async fn validate_bootstrap_pair(
         return Err(BootstrapError::RuntimeMemberOfMigrationRole);
     }
 
-    // @tenant-cross-scope: rejects any elevated PostgreSQL role membership before serving.
     let elevated_membership: bool = sqlx::query_scalar(
         "SELECT EXISTS (
              SELECT 1
@@ -487,27 +361,12 @@ async fn validate_bootstrap_pair(
     Ok(())
 }
 
-/// Split-credential PostgreSQL bootstrap. This type is the only owner of the privileged migration
-/// pool; it is intentionally not cloneable and exposes no pool accessor.
-///
-/// Construction opens the migration pool and a short-lived runtime probe, then validates both roles
-/// before any migration method can mutate the database. [`PgBootstrap::into_runtime`] opens a fresh
-/// runtime pool, repeats the validation, closes the privileged pool, strips the migration DSN, and
-/// returns only a serving [`SubstrateProvider`]. The dev migration role is currently a superuser for
-/// compatibility with the existing stack; a production migration role should be a dedicated
-/// non-superuser that owns the application schema and can execute the advisory-lock functions.
 pub struct PgBootstrap {
     migration_pool: PgPool,
     config: MyelinConfig,
     max_connections: u32,
 }
 
-/// Exact PostgreSQL catalogue identity required for a concurrently-created serving index.
-///
-/// `key_columns` and `predicate` use PostgreSQL's canonical `pg_get_indexdef(..., column, false)`
-/// and `pg_get_expr(..., false)` renderings. This keeps the readiness check structural: a relation
-/// with the expected name is insufficient unless it indexes the expected table, ordered keys, and
-/// partial predicate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexReadinessSpec<'a> {
     pub index_name: &'a str,
@@ -555,13 +414,10 @@ type IndexReadinessRow = (
 );
 
 impl PgBootstrap {
-    /// Build a validated bootstrap from environment-provided split credentials.
     pub async fn from_env(mode: Mode) -> Result<PgBootstrap, ProviderError> {
         Self::connect(MyelinConfig::from_env(mode)?, DEFAULT_MAX_CONNECTIONS).await
     }
 
-    /// Build a validated bootstrap from explicit config. No DDL runs until this returns, and this
-    /// returns only after a constrained runtime connection to the same database has been proven.
     pub async fn connect(
         config: MyelinConfig,
         max_connections: u32,
@@ -598,7 +454,6 @@ impl PgBootstrap {
         })
     }
 
-    /// Validate and apply a forward-only migration set through the privileged bootstrap pool.
     pub async fn migrate(
         &self,
         migrations: &Migrations,
@@ -608,7 +463,6 @@ impl PgBootstrap {
         Ok(())
     }
 
-    /// Apply the co-located substrate foundation through the privileged bootstrap pool.
     pub async fn migrate_foundation(&self) -> Result<(), ProviderError> {
         self.migrate(
             &foundation_migrations(),
@@ -617,11 +471,7 @@ impl PgBootstrap {
         .await
     }
 
-    /// Verify a concurrently-created index reached PostgreSQL's usable state before privileged
-    /// bootstrap is destroyed. An interrupted concurrent build can leave an index relation present
-    /// but `indisvalid=false`/`indisready=false`; `IF NOT EXISTS` alone would silently accept it.
     pub async fn verify_index_ready(&self, index_name: &str) -> Result<(), ProviderError> {
-        // @tenant-cross-scope: verifies a migration-owned PostgreSQL index catalog entry.
         let ready: Option<bool> = sqlx::query_scalar(
             "SELECT i.indisvalid AND i.indisready
                FROM pg_index i
@@ -640,16 +490,10 @@ impl PgBootstrap {
         }
     }
 
-    /// Verify both usability and the exact table/key/predicate identity of a serving index.
-    ///
-    /// This is the fail-closed form for an index whose shape is part of a production query's
-    /// boundedness contract. It rejects a valid, ready index if a stale or operator-created relation
-    /// reused the expected name with different semantics.
     pub async fn verify_index_ready_exact(
         &self,
         expected: IndexReadinessSpec<'_>,
     ) -> Result<(), ProviderError> {
-        // @tenant-cross-scope: verifies a migration-owned PostgreSQL index catalogue entry.
         let actual: Option<IndexReadinessRow> = sqlx::query_as(
             "SELECT i.indisvalid,
                         i.indisready,
@@ -733,8 +577,6 @@ impl PgBootstrap {
         }
     }
 
-    /// Consume bootstrap state and return the constrained serving provider. The privileged pool is
-    /// closed before this function returns, and its credential is erased from the retained config.
     pub async fn into_runtime(self) -> Result<SubstrateProvider, ProviderError> {
         let runtime_pool = match connect_pool_with_reset(
             &self.config.database_url,
@@ -767,8 +609,6 @@ impl PgBootstrap {
     }
 }
 
-/// **The production composition root.** Holds the REAL bounded [`PgPool`] (with reset-on-release
-/// wired) + the env-driven [`MyelinConfig`] every durable store is constructed through.
 #[derive(Clone)]
 pub struct SubstrateProvider {
     pool: PgPool,
@@ -777,11 +617,6 @@ pub struct SubstrateProvider {
 }
 
 impl SubstrateProvider {
-    /// **Boot the composition root from the environment (the prod default path).** Reads
-    /// [`MyelinConfig`] (env-first, fail-fast in [`Mode::RequireEnv`]; [`Mode::DevDefaults`] points
-    /// at the docker-compose dev stack), opens the REAL bounded pool with reset-on-release wired
-    /// ([`connect_pool_with_reset`]), and returns the provider. The caller then runs
-    /// [`Self::migrate_foundation`] (+ its own migrations) at startup.
     pub async fn from_env(mode: Mode) -> Result<SubstrateProvider, ProviderError> {
         let config = MyelinConfig::from_env(mode)?;
         let pool = connect_pool_with_reset(
@@ -797,9 +632,6 @@ impl SubstrateProvider {
         })
     }
 
-    /// Build the provider over an EXPLICIT config + pool size (the test seam — e.g. the admin role
-    /// for DDL, or a bounded `max_connections` to exercise connection reuse). Opens the REAL pool
-    /// with reset-on-release wired.
     pub async fn connect(
         config: MyelinConfig,
         max_connections: u32,
@@ -813,11 +645,6 @@ impl SubstrateProvider {
         })
     }
 
-    /// **Run migrations at startup (deliverable A — the SI-010 fix wired into the boot path).**
-    /// VALIDATE (forward-only / hot-table, via [`PgMigrator::apply_validated`]) → EXECUTE the DDL
-    /// against the live pool under the advisory lock + `myelin_applied_migration` version table.
-    /// Forward-only, idempotent, serialized: after this returns the tables exist and a re-run applies
-    /// nothing (no error, no duplicate apply).
     pub async fn migrate(
         &self,
         migrations: &Migrations,
@@ -827,8 +654,6 @@ impl SubstrateProvider {
         Ok(())
     }
 
-    /// Run the substrate's co-located [`foundation_migrations`] (outbox + consumer_dedup) at startup.
-    /// The minimal "the substrate tables exist after boot" call.
     pub async fn migrate_foundation(&self) -> Result<(), ProviderError> {
         self.migrate(
             &foundation_migrations(),
@@ -837,19 +662,10 @@ impl SubstrateProvider {
         .await
     }
 
-    /// The REAL bounded OLTP pool the durable stores are constructed over (MR-007/008/023/024 build
-    /// their store constructors against this + the [`Self::with_tenant_tx`] convention). Named
-    /// `db_pool` (not `pool`) deliberately: it is the production pool every acquisition is meant to go
-    /// through the tenant-scoped-transaction convention — NOT a bare unscoped hatch.
     pub fn db_pool(&self) -> &PgPool {
         &self.pool
     }
 
-    /// Open a separately bounded connection lane with the same validated runtime credential and
-    /// reset-on-release discipline. This is for compositions that must hold one PostgreSQL lock
-    /// transaction while performing a second durable operation: using the ordinary pool for both
-    /// sides can deadlock at pool capacity. The lane is still the constrained runtime role, never
-    /// the migration credential.
     pub async fn auxiliary_runtime_lane(
         &self,
         max_connections: u32,
@@ -868,24 +684,17 @@ impl SubstrateProvider {
         })
     }
 
-    /// Execute a real, tenant-neutral PostgreSQL round trip for orchestration readiness. This never
-    /// exposes the driver error or DSN; callers need only the verdict and must keep liveness separate.
     pub async fn database_is_ready(&self) -> bool {
-        // @tenant-cross-scope: a constant readiness query reads no tenant data.
         sqlx::query_scalar::<_, i32>("SELECT 1")
             .fetch_one(&self.pool)
             .await
             .is_ok_and(|value| value == 1)
     }
 
-    /// The env-driven config (so a store can read the `region` pin / S3 / Redis endpoints).
     pub fn config(&self) -> &MyelinConfig {
         &self.config
     }
 
-    /// Prove this provider was minted by the split-role handoff after the runtime role passed the
-    /// NOSUPERUSER/NOBYPASSRLS/no-admin capability probes. Direct `connect`/`from_env` providers are
-    /// deliberately rejected by stores whose RLS boundary is security-critical.
     pub fn require_validated_runtime(&self) -> Result<(), ProviderError> {
         if self.runtime_role_validated {
             Ok(())
@@ -894,10 +703,6 @@ impl SubstrateProvider {
         }
     }
 
-    /// **The tenant-scoped-transaction convention (deliverable C), bound to this provider's pool.**
-    /// Every durable tenant-scoped store runs its op through here: acquire → BEGIN → set the
-    /// `(tenant, region)` GUC transaction-scoped → run `op` → COMMIT, with reset-on-release. `tenant`
-    /// is the VERIFIED tenant; `region` defaults to the provider's configured region pin.
     pub async fn with_tenant_tx<R, F>(&self, tenant: &str, op: F) -> Result<R, ProviderError>
     where
         F: for<'c> FnOnce(&'c mut sqlx::PgConnection) -> TxScope<'c, R> + Send,
@@ -907,24 +712,15 @@ impl SubstrateProvider {
         Ok(r)
     }
 
-    /// Build the config-selected [`Cache`] backing (the real Valkey at the config endpoint). The
-    /// production composition uses [`Backend::Real`]; the in-memory cache is the explicit test-double.
     pub fn cache(&self, rt: tokio::runtime::Handle) -> Result<Box<dyn Cache>, CacheError> {
         backend::cache(Backend::Real, &self.config, rt)
     }
 
-    /// Build the config-selected [`BlobStore`] backing (the real S3/RustFS at the config endpoint).
-    /// The production composition uses [`Backend::Real`]; the fs floor is the explicit test-double.
     pub fn blob_store(&self, rt: tokio::runtime::Handle) -> Box<dyn BlobStore + Send + Sync> {
         backend::blob_store(Backend::Real, &self.config, rt)
     }
 }
 
-// =================================================================================================
-// W7.2 — the boot-migrations aggregate is well-formed (DB-FREE unit tests, doc-18 Part 5). These run
-// on the DEFAULT `cargo test -p myelin-storage` (no `integration` feature, no DB): they inspect only
-// the migration ids the constructors return.
-// =================================================================================================
 #[cfg(test)]
 mod boot_migrations_tests {
     use super::*;
@@ -933,9 +729,6 @@ mod boot_migrations_tests {
         m.0.iter().map(|mg| mg.id).collect()
     }
 
-    /// The aggregate's ids are STRICTLY ASCENDING (so the boot sequence applies FK/trigger deps in
-    /// the numerically-ordered order the groups were authored in) and DUPLICATE-FREE (no id is
-    /// applied twice — no two groups collide on an id).
     #[test]
     fn aggregate_ids_are_strictly_ascending_and_duplicate_free() {
         let ids = ids(&all_durable_migrations());
@@ -948,19 +741,13 @@ mod boot_migrations_tests {
                 w[1]
             );
         }
-        // Non-vacuity: the full set is present (identity 0010 … auth replay 0071).
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
         assert_eq!(*ids.last().unwrap(), "0080_agent_wallet");
     }
 
-    /// STRUCTURAL anti-drift: the aggregate is EXACTLY the flattened concatenation of every group in
-    /// [`durable_migration_groups`], so it is a superset of each group AND contains nothing else. A
-    /// newly-authored group that is added to `durable_migration_groups` is folded in automatically;
-    /// one that is NOT listed there is neither migrated nor counted here — the two cannot diverge.
     #[test]
     fn aggregate_is_exactly_the_concatenation_of_every_group() {
         let groups = durable_migration_groups();
-        // (a) Each group is a contiguous, in-order SUBSET of the aggregate (nothing dropped/reordered).
         let agg = ids(&all_durable_migrations());
         let mut rebuilt: Vec<&'static str> = Vec::new();
         for g in &groups {
@@ -974,16 +761,12 @@ mod boot_migrations_tests {
             }
             rebuilt.extend(g_ids);
         }
-        // (b) The aggregate contains NOTHING beyond the groups (exact equality of the flattened list).
         assert_eq!(
             agg, rebuilt,
-            "the aggregate must be exactly the ordered concatenation of the groups — no drift"
+            "the aggregate must be exactly the ordered concatenation of the groups - no drift"
         );
     }
 
-    /// The aggregate is DISJOINT from the substrate FOUNDATION (`0000`/`0001`): the boot sequence
-    /// `migrate_foundation()` + `migrate(&all_durable_migrations())` covers each id exactly once, so
-    /// keeping foundation a separate call never double-applies.
     #[test]
     fn aggregate_is_disjoint_from_the_foundation() {
         let agg = ids(&all_durable_migrations());

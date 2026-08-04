@@ -1,28 +1,3 @@
-//! **REF-P12 / P-161 — the R2 projection-cache holder CDC + the chained resolve-through-the-cache
-//! test (DB-free; default `cargo test --workspace`).**
-//!
-//! **Contracts:** 5.6 (the projection the cache holds), 10.1 (the R2 cache AS a `PersonalDataHolder` —
-//! the cache half, owned), 11.3/11.4 (the per-tenant DEK the cache is sealed under), 1.8
-//! (`resolve_cache_hit_ratio`). This file is the CDC pair the contract-coverage scanner reads for the
-//! R2 holder side of 10.1 + the chained behavioural proof the prompt's TESTS require.
-//!
-//! What is proven here (the prompt's required TESTS):
-//! - **A chained test: cache hit → `*.updated` → miss → re-resolve.** Driven THROUGH the REF-P10
-//!   resolve chokepoint over the LIVE R2 cache (not the no-op shim): a warm `(tenant, ref)` is served
-//!   from the cache (HIT, the owner `project` is NOT called); a `*.updated` busts it via the REF-P7
-//!   invalidator; the next resolve MISSES + re-resolves through the owner (the cache is never a source
-//!   of truth).
-//! - **The cache is NEVER a source of truth (on erasure it re-resolves, never serving stale).** An
-//!   `*.erased` busts the cached title; the next resolve re-resolves (and, the artifact gone,
-//!   tombstones) — the stale pre-erasure title NEVER renders.
-//! - **The CDC pair for the R2 holder side of 10.1** — the live cache, sealed under the per-tenant DEK,
-//!   is crypto-shred-able: destroying the per-tenant DEK makes every cached title unrecoverable (a read
-//!   of the surviving blob MISSES, never plaintext). This is the cache half of 10.1 (the erase-of-cache
-//!   PII body that DRIVES it is REF-P15 — named).
-//!
-//! The DEK seal/open is exercised on the in-memory cache floor + the real `KmsEngine`; the LIVE Valkey
-//! round-trip is `tests/integration_ref_p12_r2_cache.rs` (the `integration` feature).
-
 use std::sync::Arc;
 
 use myelin_events::{
@@ -57,7 +32,7 @@ fn viewer(id: &str) -> Principal {
 
 fn threshold() -> FailStaticThreshold {
     FailStaticThreshold {
-        status: "OPEN — LEGAL".into(),
+        status: "OPEN - LEGAL".into(),
         owner: "DPO / Legal".into(),
         static_max_secs: None,
         static_max_default_secs: 300,
@@ -74,9 +49,6 @@ fn live_cache() -> R2ProjectionCache {
     R2ProjectionCache::new(Arc::new(InMemoryCache::new()), dek)
 }
 
-/// A synthetic owner subsystem (the resolve chokepoint's 5.6 + 4.2 seam). Programmable allow-list +
-/// a project outcome + a project-call counter (so we prove a HIT short-circuits the owner). Stands in
-/// for the real Git/Knowledge/Chat `project` (REF-P17/P18/P21 — named floor).
 #[derive(Default)]
 struct SyntheticOwner {
     allowed: Mutex<Vec<String>>,
@@ -171,10 +143,6 @@ fn lifecycle_event(id: &str, type_: &str, subject: &str) -> EventEnvelope {
     }
 }
 
-/// **THE chained test (the prompt's required TEST): cache hit → `*.updated` → miss → re-resolve,
-/// driven through the REF-P10 resolve chokepoint over the LIVE R2 cache.** A warm `(tenant, ref)` is
-/// served from the cache (HIT — the owner `project` is NOT called); a `*.updated` busts it (the REF-P7
-/// invalidator, now driving the LIVE cache); the next resolve MISSES + re-resolves through the owner.
 #[test]
 fn chained_hit_then_updated_then_miss_then_re_resolve_through_the_chokepoint() {
     let cache = live_cache();
@@ -186,7 +154,6 @@ fn chained_hit_then_updated_then_miss_then_re_resolve_through_the_chokepoint() {
     let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-1".into());
     let root = ref_.clone();
 
-    // ── 1: first resolve MISSES → owner project → the chokepoint FILLS the live cache. ──
     let r1 = svc.resolve(
         &tenant(),
         &region(),
@@ -206,7 +173,6 @@ fn chained_hit_then_updated_then_miss_then_re_resolve_through_the_chokepoint() {
     let (_h, _m, fills) = cache.counters();
     assert_eq!(fills, 1, "the chokepoint filled the cache after the miss");
 
-    // ── 2: second resolve of the SAME ref → a cache HIT (owner project NOT called again). ──
     let r2 = svc.resolve(
         &tenant(),
         &region(),
@@ -227,8 +193,7 @@ fn chained_hit_then_updated_then_miss_then_re_resolve_through_the_chokepoint() {
         "the HIT short-circuited the owner (no second project)"
     );
 
-    // ── 3: a *.updated busts the entry (the REF-P7 invalidator over the LIVE cache). ──
-    owner.set_outcome(SyntheticOwner::live("v2 title (fresh)")); // the owner now has a fresh title
+    owner.set_outcome(SyntheticOwner::live("v2 title (fresh)"));
     let inv = RefsProjectionInvalidator::with_cache(Arc::new(cache.clone()));
     assert_eq!(
         inv.handle(&lifecycle_event("01J-u", "issue.issue.updated", &ref_.0), &mut myelin_events::HandlerTx::none()),
@@ -236,7 +201,6 @@ fn chained_hit_then_updated_then_miss_then_re_resolve_through_the_chokepoint() {
         "the *.updated busts the live cache entry"
     );
 
-    // ── 4: the next resolve MISSES (busted) + re-resolves through the owner → the FRESH v2 title. ──
     let r3 = svc.resolve(
         &tenant(),
         &region(),
@@ -261,9 +225,6 @@ fn chained_hit_then_updated_then_miss_then_re_resolve_through_the_chokepoint() {
     );
 }
 
-/// **The cache is NEVER a source of truth: on `*.erased` it re-resolves, never serving the stale
-/// pre-erasure title.** A warm projection is busted by a `*.erased`; the owner now reports the artifact
-/// ERASED; the resolve re-resolves to a `Tombstone{erased}` — the stale title NEVER renders.
 #[test]
 fn on_erasure_the_cache_re_resolves_never_serving_stale() {
     let cache = live_cache();
@@ -275,7 +236,6 @@ fn on_erasure_the_cache_re_resolves_never_serving_stale() {
     let ref_ = ArtifactRef("myelin://acme/issue/issue/ENG-secret".into());
     let root = ref_.clone();
 
-    // warm the cache (miss → fill), then confirm a HIT.
     let _ = svc.resolve(
         &tenant(),
         &region(),
@@ -298,7 +258,6 @@ fn on_erasure_the_cache_re_resolves_never_serving_stale() {
     );
     assert!(warm.is_projection(), "warm HIT before erasure");
 
-    // the *.erased busts the entry; the owner now reports the artifact ERASED.
     let inv = RefsProjectionInvalidator::with_cache(Arc::new(cache.clone()));
     assert_eq!(
         inv.handle(&lifecycle_event("01J-e", "issue.issue.erased", &ref_.0), &mut myelin_events::HandlerTx::none()),
@@ -307,7 +266,6 @@ fn on_erasure_the_cache_re_resolves_never_serving_stale() {
     );
     owner.set_outcome(ProjectOutcome::Erased);
 
-    // the next resolve re-resolves (busted) and, the artifact gone, tombstones — never the stale title.
     let after = svc.resolve(
         &tenant(),
         &region(),
@@ -325,10 +283,6 @@ fn on_erasure_the_cache_re_resolves_never_serving_stale() {
     assert_eq!(after.tombstone_reason(), Some(TombstoneReason::Erased));
 }
 
-/// **CDC (R2 holder side of 10.1): the cache is sealed under the per-tenant DEK + crypto-shred-able.**
-/// A cached title (a name) is encrypted at rest; destroying the per-tenant DEK (tenant offboard) makes
-/// it UNRECOVERABLE — a read of the surviving blob MISSES, never plaintext. This is the cache half of
-/// 10.1; the subject-grain erase BODY that drives it (purge + Identity pseudonym shred) is REF-P15.
 #[test]
 fn cdc_r2_holder_is_dek_sealed_and_crypto_shred_able() {
     let dek = Arc::new(RefsDekPin::new(Arc::new(KmsEngine::new())));
@@ -352,13 +306,12 @@ fn cdc_r2_holder_is_dek_sealed_and_crypto_shred_able() {
         "the title decrypts while the DEK lives"
     );
 
-    // tenant offboard: destroy the per-tenant DEK (crypto-shred). The blob survives, the key does not.
     assert!(
         dek.destroy_tenant_dek(&tenant(), &region()),
         "the per-tenant DEK is shredded"
     );
     assert!(
         ProjectionCacheRead::read(&cache, &tenant(), &region(), &ref_).is_none(),
-        "a crypto-shredded cached title is unrecoverable — a MISS, never plaintext (10.1 cache half)"
+        "a crypto-shredded cached title is unrecoverable - a MISS, never plaintext (10.1 cache half)"
     );
 }

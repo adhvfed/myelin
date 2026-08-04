@@ -1,53 +1,3 @@
-//! # Contract 10.8 CDC pair + STOR-D4/STOR-D3-GA-face drills (P-GA-15 → P-115)
-//!
-//! **DATED GREEN ARTIFACT (2026-06-20).** This file is the dated green artifact the P-GA-15 GATE
-//! requires — the cross-subsystem proof that the GDPR-owned **erasure ledger (10.8)** drives
-//! Storage's **`post_restore_reerase` (11.5)** so a restore never resurrects an erased subject. The
-//! control-plane is the ONLY crate that sees BOTH subsystems (the GDPR service is a leaf consumer
-//! ABOVE the library DAG that cannot import Storage — the no-cross-store-read law — and Storage
-//! cannot import the GDPR service — an upward DAG edge), so the seam that wires them is proven HERE
-//! (the cell-orchestration / boot home that drives restores).
-//!
-//! ## The CDC pair (contract 10.8)
-//! - **PROVIDER** = `myelin-gdpr-service` — the [`ErasureLedger`] this prompt ships: on a DSR
-//!   completion the fan-out driver writes one PII-free [`ErasureLedgerEntry`] (the opaque subject +
-//!   holders + destroyed key epochs + the cross-seam completion offset); the ledger exposes the
-//!   post-PIT erasures via [`ErasureLedger::post_pit_records_after`].
-//! - **CONSUMER** = `myelin-storage` — the `post_restore_reerase` mechanism (P-100): the
-//!   [`ReErasePass`] re-applies every erasure the [`PostRestoreErasureLedger`] seam records as
-//!   completed AFTER the restore's PIT and asserts 0 resurrected.
-//!
-//! The seam binding is the [`GdprErasureLedgerSeam`] adapter below — it implements Storage's
-//! [`PostRestoreErasureLedger`] trait by reading the GDPR ledger's [`PostPitRecord`]s and mapping
-//! them 1:1 to Storage's [`ErasureRecord`] (the field shapes — `{subject, tenant,
-//! completed_at_offset}` — mirror exactly, so this is a field copy, not a translation that can
-//! drift). If the ledger's read shape, the `PostPitRecord` fields, or Storage's `ErasureRecord` /
-//! `PostRestoreErasureLedger` contract drift, this stops compiling/passing.
-//!
-//! ## The drills (the prompt's GATE)
-//! - **STOR-D4 (GA face)** — erase a subject; attempt recovery from backups → per-subject ciphertext
-//!   unrecoverable (key destroyed, excluded from backup); **0 recoverable PII in any backup**.
-//! - **STOR-D3 / ID-D8 (GA face)** — erase; restore an *older* backup → the subject is still erased
-//!   (post-restore re-erasure ran FROM the ledger); **0 resurrected**; the re-erasure receipt is the
-//!   green artifact.
-//!
-//! Measured (below): STOR-D4-GA-face — **0 recoverable in the backup snapshot** after the shred;
-//! STOR-D3/ID-D8-GA-face — a restore to an offset BEFORE the erasure resurrects the DEK, the ledger
-//! drives re-erasure, **0 resurrected**, re-erasure receipt emitted.
-//!
-//! ## Floors named (deferred → filling prompt) — VISION §3
-//! - The drills run at **M1 scale** here; they re-run at **CELL scale at M5** (P-GA-32 → P-505, under
-//!   world-scale load) + the full **H1–H18 fan-out (GA-D1)** is M5. NAMED.
-//! - The live `pg_restore` + WAL-replay restore driver + the durable Postgres `erasure_ledger` table
-//!   (excluded from the crypto-shred) is the named **P-S12/P-S15** storage floor; the seam shape
-//!   ([`PostRestoreErasureLedger`]) + the ledger read shape do not change when it lands. On this floor
-//!   the completion offset is the GDPR ledger's monotone completion-timestamp surrogate for the §7.3
-//!   WAL cursor (Storage's `ErasureRecord.completed_at_offset` carries the same value).
-//! - No `--features integration` live-stack leg is owed: this re-proves over the SAME faithful
-//!   in-memory `KmsEngine` + `InMemoryPostPitLedger`-shaped seam the storage `reerase` module
-//!   (P-100) already exercises; this prompt adds the GDPR-ledger PROVIDER side of the seam (the live
-//!   `pg_restore` binding is the named storage floor, not a GDPR-owned DB contract).
-
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef};
 use myelin_gdpr_service::holders::{
     CryptoShredKms, InMemoryShredKms, ShredKeyClass, ShredKeyHandle,
@@ -75,25 +25,12 @@ use myelin_tenancy::{Region, TenantId as StorageTenantId};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// THE SEAM ADAPTER — the contract-10.8 ⇄ 11.5 binding the control-plane (boot/cell-orchestration)
-// owns: read the GDPR-owned erasure ledger's post-PIT records and present them to Storage's
-// `post_restore_reerase` mechanism as `ErasureRecord`s. A 1:1 field copy (the shapes mirror).
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-
-/// The control-plane's binding of the GDPR erasure ledger (10.8) into Storage's
-/// [`PostRestoreErasureLedger`] seam (11.5). It reads the GDPR ledger's [`PostPitRecord`]s and maps
-/// each to a Storage [`ErasureRecord`] — `{subject, tenant, completed_at_offset}` copied verbatim.
-/// This is the wiring the cell-orchestration restore driver runs at boot; here it is the CDC subject.
 struct GdprErasureLedgerSeam<'a> {
     ledger: &'a ErasureLedger,
 }
 
 impl PostRestoreErasureLedger for GdprErasureLedgerSeam<'_> {
     fn erasures_completed_after(&self, pit: myelin_storage::WalOffset) -> Vec<ErasureRecord> {
-        // Read the GDPR ledger's post-PIT projection and map 1:1 to Storage's record (the field
-        // shapes mirror — a copy, not a translation). `WalOffset` is the same u64 the GDPR ledger's
-        // `completed_at_offset` carries (the §7.3 cursor / completion-timestamp surrogate).
         self.ledger
             .post_pit_records_after(pit)
             .into_iter()
@@ -107,8 +44,6 @@ impl PostRestoreErasureLedger for GdprErasureLedgerSeam<'_> {
             .collect()
     }
 }
-
-// ───────────────────────────── shared fixtures ─────────────────────────────
 
 fn region() -> Region {
     Region("eu-west".into())
@@ -137,7 +72,6 @@ fn subject_scope(s: &str) -> EraseScope {
     }
 }
 
-/// A KMS (GDPR holder seam) seeded with one per-subject key per upstream holder.
 fn seed_gdpr_kms(base_epoch: u64) -> InMemoryShredKms {
     let kms = InMemoryShredKms::new();
     for (i, id) in [
@@ -181,7 +115,6 @@ fn gdpr_seam_holders(kms: &InMemoryShredKms) -> Vec<(&'static str, SeamHolder<'_
     .collect()
 }
 
-/// A real-shaped data-map inventory naming the upstream holders (the map drives the checklist).
 fn inventory() -> myelin_gdpr_service::Inventory {
     use myelin_gdpr_service::{Inventory, InventoryEntry};
     let mut holders = BTreeSet::new();
@@ -204,8 +137,6 @@ fn inventory() -> myelin_gdpr_service::Inventory {
     }
 }
 
-/// Run a full DSR erase through the fan-out driver WITH the erasure ledger, returning the ledger
-/// entry written on completion (the §4.4 step-5 write). The completion offset is `clock_secs`.
 fn complete_an_erase_and_record_to_ledger(
     ledger: &ErasureLedger,
     subject_id: &str,
@@ -242,8 +173,6 @@ fn complete_an_erase_and_record_to_ledger(
         .entry(&id)
         .expect("the completion wrote a ledger entry")
 }
-
-// ── the cross-holder re-erasure seams (the §7.5 re-purge / re-tombstone / re-emit), recorded ──
 
 #[derive(Default)]
 struct Seams {
@@ -294,8 +223,6 @@ fn reachable_archiver(tail: u64) -> ContinuousArchiver {
     arch
 }
 
-/// Stand up a storage KMS with a per-subject column sealed (so a restore of the older backup
-/// RESURRECTS the subject's DEK — the §7.5 setup).
 fn storage_kms_with_subject(subject: &SubjectId) -> KmsEngine {
     let kms = KmsEngine::new();
     kms.ensure_kek(&KekId::new(storage_tenant(), region()));
@@ -310,19 +237,10 @@ fn storage_kms_with_subject(subject: &SubjectId) -> KmsEngine {
     kms
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// CDC: PROVIDER (GDPR ledger writes) ⇄ CONSUMER (Storage re-erases from the seam).
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-
-/// **PROVIDER ⇄ CONSUMER (contract 10.8):** a completed GDPR erase writes a PII-free ledger entry;
-/// the control-plane seam presents the ledger's post-PIT records to Storage's `post_restore_reerase`;
-/// the re-erasure pass re-erases the resurrected subject to 0 recoverable. The seam binding is the
-/// load-bearing contract property: the GDPR ledger drives Storage's restore re-erasure.
 #[test]
 fn cdc_gdpr_erasure_ledger_drives_storage_post_restore_reerase() {
     let subject_id = "u-post-pit";
 
-    // PROVIDER: a completed GDPR erase records a ledger entry at completion offset 140.
     let ledger = ErasureLedger::new();
     let entry = complete_an_erase_and_record_to_ledger(&ledger, subject_id, 140, 1000);
     assert_eq!(
@@ -331,9 +249,8 @@ fn cdc_gdpr_erasure_ledger_drives_storage_post_restore_reerase() {
     );
     assert_eq!(entry.completed_at_offset, 140);
 
-    // The seam (control-plane wiring) presents the ledger's post-PIT records as Storage ErasureRecords.
     let seam = GdprErasureLedgerSeam { ledger: &ledger };
-    let post_pit = seam.erasures_completed_after(100); // a restore to PIT T=100 (BEFORE the erasure).
+    let post_pit = seam.erasures_completed_after(100);
     assert_eq!(
         post_pit.len(),
         1,
@@ -346,7 +263,6 @@ fn cdc_gdpr_erasure_ledger_drives_storage_post_restore_reerase() {
     );
     assert_eq!(post_pit[0].completed_at_offset, 140, "offset copied 1:1");
 
-    // CONSUMER: Storage re-erases the resurrected subject from the seam → 0 resurrected.
     let storage_subject = SubjectId::new(subject_id);
     let kms = storage_kms_with_subject(&storage_subject);
     let subject_dek = DekId::new(
@@ -394,14 +310,6 @@ fn cdc_gdpr_erasure_ledger_drives_storage_post_restore_reerase() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// STOR-D4 (GA face): erase → recover-from-backup = 0 recoverable PII (key destroyed, excluded).
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-
-/// **STOR-D4-GA-face (the dated green artifact) — erase a subject; attempt recovery from backups →
-/// 0 recoverable PII (key destroyed, excluded from backup).** The GDPR erase crypto-shreds the
-/// per-subject key; the destroyed key is excluded from the backup snapshot by construction, so the
-/// ciphertext is unrecoverable. Measured: 0 recoverable in any backup snapshot over every driven holder.
 #[test]
 fn stor_d4_ga_face_erase_yields_zero_recoverable_in_backups() {
     let subject_id = "u-shred";
@@ -418,7 +326,6 @@ fn stor_d4_ga_face_erase_yields_zero_recoverable_in_backups() {
     let ledger = ErasureLedger::new();
     let driver = FanOutDriver::with_ledger(&dsr, &holds, &ledger);
 
-    // Before erase: the per-subject keys are recoverable in the backup snapshot (the gate is not vacuous).
     let identity_handle = ShredKeyHandle {
         tenant: gdpr_tenant(),
         class: ShredKeyClass::Subject(holder_ids::IDENTITY.to_string()),
@@ -442,7 +349,6 @@ fn stor_d4_ga_face_erase_yields_zero_recoverable_in_backups() {
         .unwrap();
     assert_eq!(dsr.state_of(&id).unwrap(), DsrState::Completed);
 
-    // STOR-D4-GA-face: 0 recoverable PII in any backup snapshot over EVERY driven holder.
     for hid in [
         holder_ids::IDENTITY,
         holder_ids::BLOB,
@@ -462,7 +368,6 @@ fn stor_d4_ga_face_erase_yields_zero_recoverable_in_backups() {
         );
     }
 
-    // The erasure ledger recorded the completion (the source that drives STOR-D3 re-erasure).
     assert_eq!(
         ledger.len(),
         1,
@@ -470,24 +375,13 @@ fn stor_d4_ga_face_erase_yields_zero_recoverable_in_backups() {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// STOR-D3 / ID-D8 (GA face): erase → restore an OLDER backup → still erased (re-erasure ran), 0 resurrected.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-
-/// **STOR-D3 / ID-D8-GA-face (the dated green artifact) — erase; restore an OLDER backup → still
-/// erased; 0 resurrected; re-erasure receipt.** A subject is erased at completion offset 140 (AFTER
-/// the backup PIT T=100); restoring T=100 resurrects the subject's DEK; the post-restore re-erasure
-/// pass reads the GDPR erasure ledger (via the seam) and re-erases the subject — 0 resurrected, and
-/// the re-erasure receipt (the green artifact) records the re-kill.
 #[test]
 fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
     let subject_id = "u-erased-after-backup";
 
-    // The GDPR erasure ledger records the erasure as completed at offset 140 (AFTER T=100).
     let ledger = ErasureLedger::new();
     complete_an_erase_and_record_to_ledger(&ledger, subject_id, 140, 3000);
 
-    // The storage copy holds the subject's pre-erasure DEK alive (resurrected by a restore of T=100).
     let storage_subject = SubjectId::new(subject_id);
     let kms = storage_kms_with_subject(&storage_subject);
     let subject_dek = DekId::new(
@@ -499,7 +393,6 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
         "the restore of the OLDER backup resurrected the subject's DEK"
     );
 
-    // Restore the OLDER backup (PIT T=100, BEFORE the erasure).
     let arch = reachable_archiver(300);
     let report = restore_to_offset(
         &arch,
@@ -511,7 +404,6 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
     )
     .unwrap();
 
-    // Post-restore re-erasure runs FROM the GDPR erasure ledger (the seam drives it).
     let seam = GdprErasureLedgerSeam { ledger: &ledger };
     let seams = Seams::default();
     let holders = EraseHolders {
@@ -526,7 +418,6 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
         .run(&report, &seam, &holders, 2_000)
         .expect("the post-restore re-erasure pass succeeds");
 
-    // STOR-D3/ID-D8-GA-face: the subject is STILL ERASED — 0 resurrected; the re-erasure receipt is green.
     assert!(
         rep.is_green(),
         "0 resurrected after restoring the older backup"
@@ -549,17 +440,12 @@ fn stor_d3_id_d8_ga_face_restore_older_backup_re_erases_zero_resurrected() {
         seams.is_erased(&storage_subject, &storage_tenant()),
         "the re-erasure re-recorded the erasure"
     );
-    // the resurrected DEK is gone from the restored copy.
     assert!(
         !kms.backup_snapshot().iter().any(|(d, _)| *d == subject_dek),
-        "the resurrected DEK is re-destroyed — the restore did NOT resurrect the subject"
+        "the resurrected DEK is re-destroyed - the restore did NOT resurrect the subject"
     );
 }
 
-/// **The PII-free, non-shred-erasable property end-to-end: the ledger SURVIVES the subject's own
-/// erase and STILL drives re-erasure.** Even after the subject is erased through the recursive
-/// ledger holder, the completion record is retained (it holds no PII), so a later restore re-erases
-/// the subject FROM it. This is why the ledger must NOT be crypto-shred-erasable (§2.3).
 #[test]
 fn the_erasure_ledger_survives_its_own_subjects_erase_and_still_drives_re_erasure() {
     let subject_id = "u-recursive";
@@ -567,8 +453,6 @@ fn the_erasure_ledger_survives_its_own_subjects_erase_and_still_drives_re_erasur
     complete_an_erase_and_record_to_ledger(&ledger, subject_id, 140, 4000);
     assert_eq!(ledger.len(), 1);
 
-    // Erase the subject THROUGH the recursive ledger holder (the per-tenant crypto-shred fan-out
-    // would reach the ledger as a registered holder). The ledger RETAINS the record (non-shred-erasable).
     ledger.erase(subject_scope(subject_id)).unwrap();
     assert_eq!(
         ledger.len(),
@@ -576,7 +460,6 @@ fn the_erasure_ledger_survives_its_own_subjects_erase_and_still_drives_re_erasur
         "the ledger erase RETAINED the PII-free record (non-shred-erasable)"
     );
 
-    // The retained record STILL drives re-erasure on a restore to before the erasure.
     let seam = GdprErasureLedgerSeam { ledger: &ledger };
     assert_eq!(
         seam.erasures_completed_after(100).len(),

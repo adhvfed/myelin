@@ -52,10 +52,6 @@ const OPERATIONAL_RESERVE_HANDLE: &str =
     "ci-reserve:v1:22222222-2222-8222-8222-222222222222:batch:33333333-3333-8333-8333-333333333333:item";
 static MIGRATION_SCENARIO_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// The real, already-founder-pipeline-pinned `linux-small-v1` image. CT-007 gate 2/4 made
-/// `spec.image` the real launch authority: only the "build" job (`/bin/false`) in this file's
-/// manifest ever actually reaches `GvisorBackend::launch` (the "package"/`skipped_job` never
-/// launches — its own name says so), so only that job's image must be genuinely verifiable.
 fn linux_small_v1_image() -> ImageRef {
     ImageRef::pinned(format!(
         "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
@@ -107,8 +103,6 @@ async fn isolated_pool(schema: &str) -> PgPool {
         .expect("connect to live development PostgreSQL")
 }
 
-/// A pool whose connections carry a unique `application_name`, so `pg_stat_activity` can identify
-/// EXACTLY which backend is lock-waiting (mirrors the definition-cutover / credential-slice drills).
 async fn tagged_isolated_pool(schema: &str, application_name: &str) -> PgPool {
     let schema = schema.to_owned();
     let application_name = application_name.to_owned();
@@ -135,9 +129,6 @@ async fn tagged_isolated_pool(schema: &str, application_name: &str) -> PgPool {
         .expect("connect tagged pool to live PostgreSQL")
 }
 
-/// Poll until a backend WITH THIS EXACT `application_name` is genuinely blocked on a lock, returning
-/// its pid. This turns "the reporter hasn't finished yet" into positive proof it is lock-WAITING on
-/// the queue row the writer holds `FOR UPDATE` — the exact ordering the finding-1 fix depends on.
 async fn wait_until_app_blocked_on_lock(observer: &PgPool, application_name: &str) -> i32 {
     for _ in 0..400 {
         let pid: Option<i32> = sqlx::query_scalar(
@@ -338,9 +329,6 @@ async fn counts(pool: &PgPool, job: &str, wf_run: &str) -> (i64, i64, i64, Strin
     (accounting, projection, signals, state)
 }
 
-/// The 14 binds of the exhausted-variant preparation CAS, so a store-layer test can drive
-/// [`myelin_ci_controlplane::scheduler::CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY`] DIRECTLY — beneath
-/// `report_preparation_terminal`'s verifiers — and observe exactly which rows the CAS itself admits.
 struct ExhaustedCasBinds<'a> {
     tenant: &'a str,
     region: &'a str,
@@ -358,8 +346,6 @@ struct ExhaustedCasBinds<'a> {
     receipt: &'a str,
 }
 
-/// Run the exhausted CAS on a caller-owned connection and return the rows it consumed (0 = refused,
-/// 1 = terminalized). Callers wrap this in a rolled-back transaction so each guard probe is isolated.
 async fn run_exhausted_cas(conn: &mut sqlx::PgConnection, b: &ExhaustedCasBinds<'_>) -> u64 {
     sqlx::query(myelin_ci_controlplane::scheduler::CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY)
         .bind(b.tenant)
@@ -382,8 +368,6 @@ async fn run_exhausted_cas(conn: &mut sqlx::PgConnection, b: &ExhaustedCasBinds<
         .rows_affected()
 }
 
-/// Drive the preparation-RETRY CAS directly (binds `$1..$13`, no receipt) so each identity/guard
-/// predicate is deletion-sensitive at the store layer, beneath report_preparation_retry's verifiers.
 async fn run_requeue_cas(conn: &mut sqlx::PgConnection, b: &ExhaustedCasBinds<'_>) -> u64 {
     sqlx::query(myelin_ci_controlplane::scheduler::REQUEUE_PREPARATION_CLAIM_QUERY)
         .bind(b.tenant)
@@ -539,14 +523,6 @@ async fn run_reporter_scenario(
         .execute(format!("CREATE SCHEMA {schema}").as_str())
         .await
         .unwrap();
-    // A cleanup-dedicated clone of `bootstrap` (a cheap `Arc` handle clone, same underlying pool):
-    // `with_schema_cleanup` unconditionally drops `schema` through it once this scenario's body
-    // (success, an early return, an assertion failure, or a panic) finishes, so the schema never
-    // outlives this call regardless of outcome. The body below still runs its own explicit
-    // `bootstrap.execute("DROP SCHEMA ...")` at each success/early-return exit exactly as before —
-    // those become harmless no-ops (`IF EXISTS`) once this wrapper's own drop has already run, or
-    // simply drop it first on the ordinary paths; only a PANIC before reaching one of them now also
-    // gets cleaned up, which previously leaked the schema.
     let cleanup_bootstrap = bootstrap.clone();
     let schema_for_cleanup = schema.clone();
     with_schema_cleanup(
@@ -573,11 +549,6 @@ async fn run_reporter_scenario(
     PgMigrator::apply(&pool, &reserve_settle_durable_migrations())
         .await
         .unwrap();
-    // This drill uses the admin-backed test scheduler adapter, not the dedicated production role.
-    // The shared helper holds CI_PRIVILEGE_FIXTURE_LOCK across the apply and then strips EVERY
-    // scheduler grant from this schema — replacing a hand-listed REVOKE that had silently fallen
-    // behind the migration set (it never covered ci_job_parent_attempt, ci_job_prelaunch_usage,
-    // ci_job, or workflow_run.wf_version).
     common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
         PgMigrator::apply_validated(
             &pool,
@@ -1296,11 +1267,6 @@ async fn run_reporter_scenario(
                 }
 
                 if preparation_scenario == "preparation_exhausted_norow" {
-                    // CT-007 slice 5b.3-6d: the NO-current-row exhaustion path. Fill the exact-policy
-                    // budget (base epoch-1 row + epochs 2..=5 == max 5), then repoint the queue at a
-                    // FRESH generation (epoch 6) that was REFUSED admission and so has NO parent row of
-                    // its own. `report_preparation_terminal(AttemptsExhausted)` must still terminalize,
-                    // recovering on "prior exact-policy rows == durable max" rather than a current row.
                     for epoch in 2_i64..=5 {
                         let nonce = format!("bbbbbbbb-bbbb-4bbb-8bbb-{epoch:012}");
                         sqlx::query(
@@ -1328,7 +1294,6 @@ async fn run_reporter_scenario(
                         .await
                         .unwrap();
                     }
-                    // Repoint the queue at epoch 6 — a generation with NO parent-attempt row.
                     sqlx::query(
                         "UPDATE job_queue
                  SET lease_owner = 'exhausted-runner-6', lease_epoch = 6,
@@ -1389,15 +1354,6 @@ async fn run_reporter_scenario(
                     exhausted_claim_request.claim_expires_at_epoch_secs =
                         exhausted_claim.get("claim_expires");
 
-                    // ---- CT-007 5b.3-6d: end-to-end DEFENSE-IN-DEPTH divergence matrix ----
-                    // Every exact-generation identity divergence must be refused SOMEWHERE in the
-                    // reporter pipeline with zero durable effect. This is NOT a CAS-isolation proof —
-                    // idem/ci_run/token-authority/reserve divergences are caught by earlier verifiers
-                    // (verify_claimed_identity / launch-template / prelaunch settlement identity), while
-                    // owner/epoch/nonce/both-timestamps reach the CAS. The exhausted CAS's own predicate
-                    // set is proven load-bearing by the byte-pin in scheduler.rs plus the direct
-                    // store-layer guard/scope tests (scenarios `preparation_exhausted_cas_direct` /
-                    // `preparation_exhausted_multigroup`).
                     let mut divergent_claims = Vec::new();
                     let mutations: [fn(&mut CiJobTokenRequest); 8] = [
                         |c: &mut CiJobTokenRequest| c.lease_owner.push_str("-different"),
@@ -1435,7 +1391,6 @@ async fn run_reporter_scenario(
                         );
                     }
 
-                    // A dispatched meter target diverging from the manifest/parent reserve is refused.
                     let original_spec: serde_json::Value =
                         sqlx::query_scalar("SELECT spec FROM ci_job_spec WHERE job_id = $1::uuid")
                             .bind(job)
@@ -1465,7 +1420,6 @@ async fn run_reporter_scenario(
                         .await
                         .unwrap();
 
-                    // state='running' (not 'leased') is refused by the CAS's `state = 'leased'` guard.
                     sqlx::query("UPDATE job_queue SET state = 'running' WHERE job_id = $1::uuid")
                         .bind(job)
                         .execute(&pool)
@@ -1484,11 +1438,6 @@ async fn run_reporter_scenario(
                         .await
                         .unwrap();
 
-                    // ---- Post-CAS accounting failure rolls the whole exhausted terminal back ----
-                    // The signal buffers and the CAS consumes BEFORE the accounting receipt insert; a
-                    // failure there must roll every durable effect back (queue stays leased, zero
-                    // signal/accounting/projection), proving the single-transaction boundary holds for
-                    // the exhausted path too.
                     sqlx::raw_sql(
                         "CREATE FUNCTION fail_exhausted_accounting_receipt() RETURNS trigger
                            LANGUAGE plpgsql AS $$
@@ -1513,10 +1462,6 @@ async fn run_reporter_scenario(
                         (0, 0, 0, "leased".into()),
                         "a post-CAS receipt failure rolls the exhausted terminal fully back"
                     );
-                    // Finding 4: the MONEY settlement (`money_ledger.settle_in_tx`) runs BEFORE the
-                    // receipt insert, so it too must be inside the one rolled-back transaction. Prove
-                    // the reservation is STILL `inflight` after the injected failure — a regression
-                    // moving settlement onto an independently-committed tx would show `settled` here.
                     let reservation_after_failure: String = sqlx::query_scalar(
                         "SELECT state FROM cost_reservation
                          WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
@@ -1539,8 +1484,6 @@ async fn run_reporter_scenario(
                     .await
                     .unwrap();
 
-                    // First delivery terminalizes; the second is an idempotent replay (terminal/requeue
-                    // exclusivity for the exhausted path — one terminal owner, exact replay after).
                     assert_eq!(
                         preparation_reporter()
                             .report_preparation_terminal(
@@ -1567,8 +1510,6 @@ async fn run_reporter_scenario(
             .await
             .unwrap();
                     assert_eq!(disposition, "preparation_attempts_exhausted");
-                    // Finding 4: ONLY the successful terminal settles the money reservation
-                    // (`inflight` -> `settled`), proving the settlement committed with the terminal.
                     let reservation_after_success: String = sqlx::query_scalar(
                         "SELECT state FROM cost_reservation
                          WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
@@ -1583,7 +1524,6 @@ async fn run_reporter_scenario(
                         reservation_after_success, "settled",
                         "the successful exhausted terminal settles the reservation in the same tx"
                     );
-                    // Still no row for the refused generation, and exactly one terminal outcome.
                     let final_total: i64 = sqlx::query_scalar(
                         "SELECT count(*) FROM ci_job_parent_attempt
                          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -1604,10 +1544,6 @@ async fn run_reporter_scenario(
                 }
 
                 if preparation_scenario == "preparation_exhausted_cas_direct" {
-                    // CT-007 5b.3-6d: drive CONSUME_PREPARATION_CLAIM_EXHAUSTED_QUERY DIRECTLY (the
-                    // store layer, beneath report_preparation_terminal's verifiers), so each CAS
-                    // predicate is genuinely deletion-sensitive rather than masked by an earlier layer.
-                    // Base seeded the epoch-1 parent row; add epochs 2..=4 → 4 rows, ONE BELOW max.
                     for epoch in 2_i64..=4 {
                         let nonce = format!("bbbbbbbb-bbbb-4bbb-8bbb-{epoch:012}");
                         sqlx::query(
@@ -1632,7 +1568,6 @@ async fn run_reporter_scenario(
                         .await
                         .unwrap();
                     }
-                    // Repoint the queue at epoch 6 — a fresh generation with no parent row.
                     sqlx::query(
                         "UPDATE job_queue
                  SET lease_owner = 'exhausted-runner-6', lease_epoch = 6,
@@ -1650,10 +1585,6 @@ async fn run_reporter_scenario(
                     .execute(&pool)
                     .await
                     .unwrap();
-                    // Cross-scope rows (another run / another reserve / another job), each (rev 1, max
-                    // 5), reusing the real ci_run (the only FK is `(tenant, ci_run)`). If ANY scope
-                    // predicate in the CAS's parent EXISTS were dropped, one of these would join the
-                    // (1,5) group and forge count==max.
                     for (other_job, other_wf, other_reserve, epoch, nonce) in [
                         (
                             job,
@@ -1699,7 +1630,6 @@ async fn run_reporter_scenario(
                         .await
                         .unwrap();
                     }
-                    // The exact epoch-6 queue identity for the CAS binds.
                     let q = sqlx::query(
                         "SELECT idem_token, stage, lease_owner, lease_epoch,
                                 claim_nonce::text AS claim_nonce,
@@ -1735,9 +1665,6 @@ async fn run_reporter_scenario(
                         receipt: "exhausted-cas-receipt",
                     };
 
-                    // (a) COUNT-SCOPING: below max (4 of 5) with cross-scope rows present → the CAS
-                    // itself refuses. A dropped job/wf_run/reserve scope predicate would let a cross
-                    // row forge count==max and this returns 1.
                     let mut tx = pool.begin().await.unwrap();
                     assert_eq!(
                         run_exhausted_cas(&mut tx, &binds).await,
@@ -1746,7 +1673,6 @@ async fn run_reporter_scenario(
                     );
                     tx.rollback().await.unwrap();
 
-                    // Add the 5th same-scope row → the reserve is exact-policy exhausted (one group of 5).
                     sqlx::query(
                         "INSERT INTO ci_job_parent_attempt (
                        tenant_id, region, job_id, wf_run_id, ci_run_id, reserve_handle,
@@ -1767,8 +1693,6 @@ async fn run_reporter_scenario(
                     .await
                     .unwrap();
 
-                    // Positive control: a satisfiable exhausted generation IS consumed (rolled back so
-                    // it does not affect the guard probes below).
                     let mut tx = pool.begin().await.unwrap();
                     assert_eq!(
                         run_exhausted_cas(&mut tx, &binds).await,
@@ -1777,10 +1701,6 @@ async fn run_reporter_scenario(
                     );
                     tx.rollback().await.unwrap();
 
-                    // Guard predicates, each isolated in a rolled-back tx that mutates ONE row fact so
-                    // the OTHER predicates still match — proving that exact predicate is load-bearing.
-                    // live-expiry: an expired claim (EXTRACT still matches $11) → the `claim_expires_at
-                    // > statement_timestamp()` guard refuses.
                     let mut tx = pool.begin().await.unwrap();
                     sqlx::query(
                         "UPDATE job_queue SET claim_expires_at = to_timestamp($2),
@@ -1802,7 +1722,6 @@ async fn run_reporter_scenario(
                     );
                     tx.rollback().await.unwrap();
 
-                    // completion_receipt already set → the `completion_receipt IS NULL` guard refuses.
                     let mut tx = pool.begin().await.unwrap();
                     sqlx::query(
                         "UPDATE job_queue SET completion_receipt = 'already-set'
@@ -1819,7 +1738,6 @@ async fn run_reporter_scenario(
                     );
                     tx.rollback().await.unwrap();
 
-                    // state='running' → the `state = 'leased'` guard refuses (exclusive with workload).
                     let mut tx = pool.begin().await.unwrap();
                     sqlx::query("UPDATE job_queue SET state = 'running' WHERE job_id = $1::uuid")
                         .bind(job)
@@ -1833,7 +1751,6 @@ async fn run_reporter_scenario(
                     );
                     tx.rollback().await.unwrap();
 
-                    // ci_job surface not pre-workload → the surface EXISTS guard refuses.
                     let mut tx = pool.begin().await.unwrap();
                     sqlx::query(
                         "UPDATE ci_job SET state = 'succeeded'
@@ -1861,12 +1778,6 @@ async fn run_reporter_scenario(
                 }
 
                 if preparation_scenario == "preparation_exhausted_multigroup" {
-                    // CT-007 5b.3-6d: the "exactly one governing policy group" requirement, in a CLEAN
-                    // fixture (all rows share the settlement identity, so resolve_prelaunch_usage does
-                    // NOT pre-reject). Base seeded epoch-1 (rev 1, max 5); fill (1,5) to 5 rows AND add
-                    // a second (rev 2, max 2) group of 2 rows. BOTH groups independently satisfy
-                    // count==max, so the ONLY thing that refuses is disposition verification's
-                    // `policies.len() != 1`; removing it would let one group through and terminalize.
                     for epoch in 2_i64..=5 {
                         let nonce = format!("bbbbbbbb-bbbb-4bbb-8bbb-{epoch:012}");
                         sqlx::query(
@@ -1968,11 +1879,6 @@ async fn run_reporter_scenario(
                 }
 
                 if preparation_scenario == "preparation_requeue" {
-                    // CT-007 5b.3-6d step 2: the base generation is an ADMITTED current generation
-                    // (parent row exists, phase resolved, count 1 < max 5) — exactly what a preparation
-                    // RETRY requeues. Drive the retry CAS DIRECTLY (store layer) so each identity/guard
-                    // predicate is deletion-sensitive, then the real reporter path, then prove the
-                    // workload retry counter is NEVER touched.
                     let stage: String =
                         sqlx::query_scalar("SELECT stage FROM job_queue WHERE job_id = $1::uuid")
                             .bind(job)
@@ -1996,7 +1902,6 @@ async fn run_reporter_scenario(
                         receipt: "unused-by-requeue",
                     };
 
-                    // Positive control (rolled back): the CAS requeues exactly one row.
                     let mut tx = pool.begin().await.unwrap();
                     assert_eq!(
                         run_requeue_cas(&mut tx, &binds).await,
@@ -2005,11 +1910,6 @@ async fn run_reporter_scenario(
                     );
                     tx.rollback().await.unwrap();
 
-                    // Guard predicates, each isolated in a rolled-back tx that mutates ONE row fact.
-                    // UNMASKED live-expiry: a FRESH generation (epoch 7) whose queue AND parent exact
-                    // expiry MATCH each other but are in the PAST — so `EXTRACT(...) = $11` and
-                    // `parent.claim_expires_at_epoch_secs = $11` both hold and ONLY the
-                    // `q.claim_expires_at > statement_timestamp()` predicate rejects it.
                     let past_started = preparation_claim.claim_started_at_epoch_secs - 100_000;
                     let past_expires = preparation_claim.claim_started_at_epoch_secs - 50_000;
                     let mut tx = pool.begin().await.unwrap();
@@ -2099,9 +1999,6 @@ async fn run_reporter_scenario(
                     assert_eq!(run_requeue_cas(&mut tx, &binds).await, 0);
                     tx.rollback().await.unwrap();
 
-                    // UNMASKED owner, probe 1 — isolate the QUEUE owner predicate: change ONLY the
-                    // queue's `lease_owner`, keep the bind (and thus the parent) on the original owner.
-                    // Only `q.lease_owner = $6` rejects (`parent.lease_owner = $6` still matches).
                     let mut tx = pool.begin().await.unwrap();
                     sqlx::query(
                         "UPDATE job_queue SET lease_owner = 'queue-owner-only-diff'
@@ -2118,9 +2015,6 @@ async fn run_reporter_scenario(
                     );
                     tx.rollback().await.unwrap();
 
-                    // UNMASKED owner, probe 2 — isolate the PARENT owner predicate: a fresh generation
-                    // (epoch 8) whose queue owner AND bind AGREE ('parent-owner-x') but whose PARENT row
-                    // carries a DIFFERENT owner. Only `parent.lease_owner = $6` rejects.
                     let mut tx = pool.begin().await.unwrap();
                     sqlx::query(
                         "INSERT INTO ci_job_parent_attempt (
@@ -2163,8 +2057,6 @@ async fn run_reporter_scenario(
                     );
                     tx.rollback().await.unwrap();
 
-                    // The workload retry_attempts JSONB (the workload retry authority) BEFORE the
-                    // preparation requeue.
                     let retry_before: Option<String> = sqlx::query_scalar(
                         "SELECT retry_attempts::text FROM job_queue WHERE job_id = $1::uuid",
                     )
@@ -2173,7 +2065,6 @@ async fn run_reporter_scenario(
                     .await
                     .unwrap();
 
-                    // The real reporter path: a permitted retry requeues the generation.
                     assert_eq!(
                         preparation_reporter()
                             .report_preparation_retry(&preparation_claim)
@@ -2192,19 +2083,14 @@ async fn run_reporter_scenario(
                     assert_eq!(after.get::<String, _>("state"), "queued");
                     assert!(after.get::<Option<String>, _>("lease_owner").is_none());
                     assert!(after.get::<Option<String>, _>("claim_nonce").is_none());
-                    // Finding 4: the lease is fully RELEASED (the SET clears `lease_expires` too).
                     assert!(after.get::<Option<String>, _>("lease_expires").is_none());
-                    // CRITICAL: the workload retry_attempts is UNTOUCHED — the parent-attempt journal,
-                    // not the workload retry counter, is the preparation retry authority.
                     assert_eq!(
                         after.get::<Option<String>, _>("retry_attempts"),
                         retry_before,
                         "a preparation requeue never touches the workload retry_attempts"
                     );
-                    // No terminal signal, no accounting, no cost projection: a requeue settles nothing.
                     assert_eq!(counts(&pool, job, wf_run).await, (0, 0, 0, "queued".into()));
 
-                    // A redelivered retry of the now-requeued generation is a benign no-op.
                     assert_eq!(
                         preparation_reporter()
                             .report_preparation_retry(&preparation_claim)
@@ -2222,11 +2108,6 @@ async fn run_reporter_scenario(
                 if preparation_scenario == "preparation_router_terminal"
                     || preparation_scenario == "preparation_router_retry"
                 {
-                    // CT-007 5b.3-6d STEP 4: drive the REGION ROUTER (a `TerminalReporter`) with a
-                    // sandbox `PreparationReportClaim`. The router maps it 1:1 onto the durable
-                    // `CiJobTokenRequest`, resolves the exact-tenant reporter, and reaches the SAME
-                    // durable preparation CAS the inherent methods make — proving the seam is genuinely
-                    // wired end-to-end, not merely type-correct.
                     let report_claim = PreparationReportClaim {
                         tenant_id: preparation_claim.tenant_id.clone(),
                         region: preparation_claim.region.clone(),
@@ -2242,9 +2123,6 @@ async fn run_reporter_scenario(
                         claim_started_at_epoch_secs: preparation_claim.claim_started_at_epoch_secs,
                         claim_expires_at_epoch_secs: preparation_claim.claim_expires_at_epoch_secs,
                     };
-                    // The factory builds the SAME v4-durable reporter `preparation_reporter()` builds,
-                    // for whatever (tenant, region) the router presents — captured by clone so the
-                    // closure is `'static`.
                     let f_pg = pg_executor.clone();
                     let f_pool = pool.clone();
                     let f_scope = scope.clone();
@@ -2302,8 +2180,6 @@ async fn run_reporter_scenario(
                             "the terminal settled once through the router"
                         );
                     } else {
-                        // preparation_router_retry: the base generation is admitted + permitted, so a
-                        // retry through the router requeues it; a redelivery is a benign NoOp.
                         let retry_claim = report_claim.clone();
                         let retry_router = router.clone();
                         let outcome = tokio::task::spawn_blocking(move || {
@@ -2350,10 +2226,6 @@ async fn run_reporter_scenario(
                 }
 
                 if preparation_scenario == "preparation_requeue_exhausted_refuses" {
-                    // CT-007 5b.3-6d step 2: the requeue-vs-terminalize boundary. Fill the budget to the
-                    // exact max (base epoch-1 + epochs 2..=5 == 5 of 5). The base generation is still
-                    // live-leased with its parent row + resolved phase, but a retry is NOT permitted
-                    // (count == max) — it must terminalize AttemptsExhausted, not requeue.
                     for epoch in 2_i64..=5 {
                         let nonce = format!("bbbbbbbb-bbbb-4bbb-8bbb-{epoch:012}");
                         sqlx::query(
@@ -2398,8 +2270,6 @@ async fn run_reporter_scenario(
                 }
 
                 if preparation_scenario == "preparation_requeue_at_max_minus_one" {
-                    // Finding 3a: the EXACT max-1 boundary (4 of 5) is still PERMITTED — a regression to
-                    // `count >= maximum - 1` would wrongly refuse this legal requeue.
                     for epoch in 2_i64..=4 {
                         let nonce = format!("bbbbbbbb-bbbb-4bbb-8bbb-{epoch:012}");
                         sqlx::query(
@@ -2440,9 +2310,6 @@ async fn run_reporter_scenario(
                 }
 
                 if preparation_scenario == "preparation_requeue_started_refuses" {
-                    // Finding 3b: an existing `started` phase for the current generation REFUSES the
-                    // requeue (removing the `status='started'` refusal would otherwise stay green). Use a
-                    // fresh generation (epoch 9) — the base generation's phase slots are both resolved.
                     let nonce9 = "eeeeeeee-9999-4999-8999-000000000009";
                     sqlx::query(
                         "INSERT INTO ci_job_parent_attempt (
@@ -2472,7 +2339,6 @@ async fn run_reporter_scenario(
                     .execute(&pool)
                     .await
                     .unwrap();
-                    // A durable `started` transport phase for THIS generation.
                     sqlx::query(
                         "INSERT INTO ci_job_prelaunch_usage (
                            tenant_id, region, job_id, lease_epoch, claim_nonce, phase, status,
@@ -2508,11 +2374,6 @@ async fn run_reporter_scenario(
                 }
 
                 if preparation_scenario == "preparation_requeue_race" {
-                    // Finding 1 (the REAL race): a concurrent `begin_phase` (which locks the queue row)
-                    // and `report_preparation_retry` must NOT both succeed — otherwise a freshly-queued
-                    // job could carry an unresolved old-generation `started` phase. The retry now locks
-                    // the exact queue generation FOR UPDATE before reading journal status, so the two
-                    // serialize on that row. Fresh generation (epoch 9), empty phase slots.
                     let nonce9 = "eeeeeeee-9999-4999-8999-000000000009";
                     sqlx::query(
                         "INSERT INTO ci_job_parent_attempt (
@@ -2547,21 +2408,6 @@ async fn run_reporter_scenario(
                     claim9.lease_epoch = 9;
                     claim9.claim_nonce = nonce9.into();
 
-                    // DETERMINISTIC forced-schedule drill. Rather than hope a simultaneous-release
-                    // barrier lands on the harmful interleaving, FORCE it: a phase writer holds the
-                    // queue row FOR UPDATE + advisory lock + an UNCOMMITTED `started` row, THEN the
-                    // reporter runs and must lock-WAIT on that same queue row (the finding-1 fix),
-                    // THEN the writer commits, THEN the reporter refuses (it now sees the started row).
-                    //
-                    // Regression sensitivity: against the PRE-FIX code (journal read BEFORE the queue
-                    // lock), the reporter would read the writer's UNCOMMITTED started row as ABSENT, not
-                    // lock-wait at the FOR UPDATE, proceed to its CAS, block only there, and requeue
-                    // after the commit — `b_result` would be `Ok(Requeued)` and the `is_err()` assertion
-                    // below turns RED. Against the fixed code it lock-waits at the FOR UPDATE (asserted
-                    // via pg_stat_activity) and refuses after the commit.
-
-                    // Connection A: the phase writer — mimics `begin_phase`'s queue→advisory→journal
-                    // ordering, held OPEN across the reporter's attempt.
                     let mut writer_tx = pool.begin().await.unwrap();
                     let locked: Option<String> = sqlx::query_scalar(
                         "SELECT q.job_id::text FROM job_queue AS q
@@ -2597,10 +2443,7 @@ async fn run_reporter_scenario(
                     .execute(&mut *writer_tx)
                     .await
                     .unwrap();
-                    // writer_tx is held OPEN (uncommitted) below.
 
-                    // Connection B: the retry reporter on a UNIQUELY TAGGED pool, so pg_stat_activity
-                    // can pinpoint its lock wait.
                     let reporter_tag = format!("retry-race-{}-{}", std::process::id(), job);
                     let tagged = tagged_isolated_pool(&schema, &reporter_tag).await;
                     let retry_reporter = CiPipelineReporter::new_accounted(
@@ -2629,8 +2472,6 @@ async fn run_reporter_scenario(
                         retry_reporter.report_preparation_retry(&claim9c)
                     });
 
-                    // Prove the reporter is genuinely LOCK-WAITING on the queue row (it cannot read
-                    // journal status until it acquires the FOR UPDATE the writer holds).
                     let blocked_pid = wait_until_app_blocked_on_lock(&pool, &reporter_tag).await;
                     let touches_job_queue: bool = sqlx::query_scalar(
                         "SELECT query ILIKE '%job_queue%' FROM pg_stat_activity WHERE pid = $1",
@@ -2644,18 +2485,14 @@ async fn run_reporter_scenario(
                         "the reporter is blocked on the job_queue generation lock, not something else"
                     );
 
-                    // Release the writer: its `started` row becomes visible.
                     writer_tx.commit().await.unwrap();
 
-                    // The reporter, now holding the lock, sees the started phase and REFUSES.
                     let b_result = retry.await.unwrap();
                     assert!(
                         b_result.is_err(),
-                        "once the started phase is visible under its own lock, the retry MUST refuse — \
+                        "once the started phase is visible under its own lock, the retry MUST refuse - \
                          never requeue a generation with an unresolved started phase"
                     );
-                    // The generation stays leased (the writer won); the forbidden queued-with-started
-                    // state never results.
                     let final_state: String =
                         sqlx::query_scalar("SELECT state FROM job_queue WHERE job_id = $1::uuid")
                             .bind(job)
@@ -3638,10 +3475,6 @@ async fn run_reporter_scenario(
     .await
     .expect("remove the injected terminal-accounting fault");
 
-    // The failed terminal transaction leaves the exact running generation live. Model runner death,
-    // recover it through the advisory-lock-aware reaper, then drive the complete production claim →
-    // Identity mint → fenced gVisor launch → exact-tenant accounting reporter path. This joins the
-    // previously separate execution and settlement proofs at their real composition seams.
     sqlx::query(
         "UPDATE job_queue SET lease_expires = statement_timestamp() - interval '1 second'
          WHERE tenant_id = $1 AND region = $2 AND job_id = $3::uuid",
@@ -3817,8 +3650,6 @@ async fn run_reporter_scenario(
     .unwrap();
     assert_eq!(skipped_after_rollback, (0, "reserved".into()));
 
-    // Model a process death after the external finalizer transaction commits but before Flow can
-    // commit the drive. Recovery must route from workflow_run, not the now-terminal ci_run.
     let precommitted = durable_finalizer.finalize(&finalization).unwrap();
     assert_eq!(precommitted.write, CiRunFinalizationWrite::Finalized);
     let split_brain_window: (String, String) = sqlx::query_as(
@@ -4089,9 +3920,6 @@ async fn exhausted_terminal_requires_exactly_one_governing_policy_group() {
     .await;
 }
 
-/// **CT-007 5b.3-6d STEP 4 (live PG): a preparation TERMINAL driven through the region router reaches
-/// the durable CAS.** The router maps the sandbox `PreparationReportClaim` onto the durable request,
-/// routes to the exact-tenant reporter, and settles the terminal once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preparation_terminal_through_the_region_router_reaches_the_durable_cas() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -4099,9 +3927,6 @@ async fn preparation_terminal_through_the_region_router_reaches_the_durable_cas(
         .await;
 }
 
-/// **CT-007 5b.3-6d STEP 4 (live PG): a preparation RETRY driven through the region router reaches the
-/// durable requeue CAS.** The router requeues the admitted+permitted generation and treats a
-/// redelivery as a benign no-op.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preparation_retry_through_the_region_router_reaches_the_durable_cas() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
@@ -4204,13 +4029,6 @@ async fn cancellation_and_preparation_completion_race_with_one_settlement_owner(
     .await;
 }
 
-/// CT-007 slice 5b.3-4a.1b: `settle_cancelled_job` must recognize a `ci-reserve:v2:...` handle
-/// exactly like the existing `ci-reserve:v1:...` handle and reach real Storage settlement, not the
-/// `CiRunSupersessionError::Settlement` refusal a pre-slice handle shape would hit. This never
-/// launches the job (no `job_queue` row is seeded at all), so `cancel_running_on_conn` takes its
-/// `None` queue-lifecycle arm and settles a full refund against the untouched `inflight` reservation
-/// — the same shape the `retry_then_supersession` v1 scenario above proves, minus the retry/launch
-/// machinery that scenario needs for its OWN assertions but this one does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;

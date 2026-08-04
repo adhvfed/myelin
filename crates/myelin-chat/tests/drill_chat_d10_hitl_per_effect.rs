@@ -1,15 +1,3 @@
-//! # CHAT-D10 — the multi-effect HITL card per-effect drill (CHAT-P18 → P-413, M4-C6)
-//!
-//! **Drill (testing-strategy/01 row CHAT-D10):** a multi-effect card approved 2-of-3 → the 2 resume
-//! APPROVED, the 1 WITHHELD, each independent `idem_key = card_id:<idx>`; no effect runs twice; the
-//! withheld never mutates. CI; the per-effect duplicate + withheld-mutation signals = 0.
-//!
-//! **A CHAINED scenario (EI-01 §4):** the card service posts three INDEPENDENT per-effect decisions
-//! onto the REAL engine; a double-click on "approve all" re-posts the SAME keys (the engine dedups);
-//! the engine's gated loop (`apply_approved_effects`) applies the 2 EXACTLY once each and WITHHOLDS
-//! the 1 (0 mutation). The CHAT face of FLOW-D4's per-effect half — chat owns the card; the apply +
-//! the dedup are the ENGINE's.
-
 use myelin_chat::hitl::{
     build_card_signal, CardClick, CardDecision, CardEffect, CardSignal, ChatApprovalCard,
     SignalDelivery, SignalPort, SignalPostError, DECLINE_MARKER,
@@ -36,8 +24,6 @@ fn minter() -> Arc<dyn IdMinter> {
     Arc::new(MonotonicMinter::new())
 }
 
-/// chat's [`SignalPort`] over the REAL engine, posting the per-effect approval signals under the
-/// engine's `approval` signal name (the §6.4 per-effect keys ride the `idem_key`).
 struct FlowSignalPort {
     ex: FlowExecutor,
 }
@@ -95,13 +81,10 @@ fn three_effect_card(run: &FlowRunId) -> ChatApprovalCard {
     ChatApprovalCard {
         run_id: IdRunId(run.0.clone()),
         card_id: "card-7".into(),
-        // post under the engine's `approval` per-effect signal name (apply_approved_effects reads it).
         effects: vec![effect("e0"), effect("e1"), effect("e2")],
     }
 }
 
-/// chat posts the per-effect decision under the engine's `approval` signal name (the per-effect keys
-/// ride the `idem_key` — the loop reads the buffered per-effect signals).
 fn post_per_effect(
     port: &FlowSignalPort,
     card: &ChatApprovalCard,
@@ -112,10 +95,6 @@ fn post_per_effect(
     port.post_signal(&sig).unwrap()
 }
 
-/// **CHAT-D10: a multi-effect card approved 2-of-3 → the 2 resume APPROVED, the 1 WITHHELD, each
-/// independent `card-7:<idx>`; no effect runs twice; the withheld never mutates.** Chat posts three
-/// independent per-effect decisions; a DOUBLE-CLICK on "approve all" re-posts the same keys (the
-/// engine dedups); the engine's gated loop applies effects 0 + 2 EXACTLY once and WITHHOLDS effect 1.
 #[test]
 fn chat_d10_partial_approval_two_of_three_per_effect_independent_zero_double_apply() {
     let ex = executor();
@@ -123,7 +102,6 @@ fn chat_d10_partial_approval_two_of_three_per_effect_independent_zero_double_app
     let card = three_effect_card(&run);
     let port = FlowSignalPort { ex: ex.clone() };
 
-    // chat posts: approve 0, decline 1, approve 2 — three INDEPENDENT per-effect signals.
     let d0 = post_per_effect(
         &port,
         &card,
@@ -155,7 +133,6 @@ fn chat_d10_partial_approval_two_of_three_per_effect_independent_zero_double_app
     assert_eq!(d1, SignalDelivery::Buffered);
     assert_eq!(d2, SignalDelivery::Buffered);
 
-    // DOUBLE-CLICK "approve all": re-post the SAME per-effect keys → the engine DEDUPS (0 double).
     assert_eq!(
         post_per_effect(
             &port,
@@ -182,13 +159,11 @@ fn chat_d10_partial_approval_two_of_three_per_effect_independent_zero_double_app
         SignalDelivery::Duplicate
     );
 
-    // three distinct buffered signals (one per per-effect key) — the §6.4 anchor.
     assert_eq!(
         ex.signals().count_for_run(&tenant(), &run.0),
         3,
         "three independent per-effect signals (card-7:0/1/2); the double-click buffered nothing new"
     );
-    // each keyed independently.
     assert!(ex
         .signals()
         .get(&tenant(), &run.0, APPROVAL_SIGNAL_NAME, "card-7:0")
@@ -202,7 +177,6 @@ fn chat_d10_partial_approval_two_of_three_per_effect_independent_zero_double_app
         .get(&tenant(), &run.0, APPROVAL_SIGNAL_NAME, "card-7:2")
         .is_some());
 
-    // --- the ENGINE's gated loop resumes the buffered decisions (apply 0+2 once, withhold 1). ---
     let engine_card = ApprovalCard {
         run_id: run.0.clone(),
         card_id: "card-7".into(),
@@ -232,7 +206,6 @@ fn chat_d10_partial_approval_two_of_three_per_effect_independent_zero_double_app
         },
     );
 
-    // effect 0 applied; effect 1 WITHHELD (0 mutation, AG-8); effect 2 applied.
     assert!(
         matches!(outcomes[0], Some(Ok(EffectOutcome::Applied(_)))),
         "effect 0 approved → applied"
@@ -247,8 +220,6 @@ fn chat_d10_partial_approval_two_of_three_per_effect_independent_zero_double_app
         "effect 2 approved → applied"
     );
 
-    // GATE: exactly TWO applies (0 and 2); the withheld effect 1 made ZERO mutation (the
-    // per-effect duplicate + withheld-mutation signals = 0).
     let applied = applied.into_inner();
     assert_eq!(
         applied.len(),

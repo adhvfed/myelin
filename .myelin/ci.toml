@@ -1,9 +1,4 @@
-# Founder-dogfood pipeline — CT-007 gate-4 cutover. A real 3-job build/test/clippy DAG on
-# Myelin's OWN workspace, executed offline in gVisor by the dogfood runner. This is the pipeline
-# that replaces GitHub Actions: `build` compiles the whole workspace from the pinned full-workspace
-# Cargo vendor (`--locked`, --network=none), then `test` (unit `--lib`) and `clippy`
-# (`--all-targets -D warnings`) fan out from it. The image is the canonical-tree SHA-256 of the
-# staged linux-rust-v1 (Rust-capable) rootfs pinned in runner-assets.toml.
+# Myelin's own pipeline, run by the self-hosted runner (offline gVisor, rootfs pinned in runner-assets.toml).
 schema_version = 2
 on = "push"
 

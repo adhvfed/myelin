@@ -1,26 +1,3 @@
-//! # KN-P31 — KN-D9/KN-D10 re-confirmed at world scale with the materialisation ACTED on
-//! (P-486, M5 — the SCHED gate's green artifact)
-//!
-//! **Drill catalogue (testing-strategy/01-…-catalogue.md, rows KN-D9 / KN-D10):** re-confirmed at
-//! world scale with the materialisation ACTED on (not merely measured) — the post-promotion p99
-//! telemetry is the green artifact.
-//!
-//! KN-P17 (KN-D9) / KN-P18 (KN-D10) MEASURED the promotion triggers (the `> 5%` facet ratio; the
-//! `rollup_read_p99_max_ms` budget). This drill is the **ACT** half (KN-P31): it
-//!
-//! 1. drives a measured-hot facet over the `> 5%` threshold and **promotes** it via the
-//!    expand→backfill→contract plan ([`promote_facet`]), then asserts the facet now lowers to its
-//!    **generated column** (the post-promotion read path) instead of the cold GIN scan — the
-//!    facet-side p99 improves by reading the indexed column;
-//! 2. drives a rollup over a large related set whose read-time recompute p99 crosses the budget,
-//!    **materialises** it ([`MaterialisedRollup`]) by feeding `knowledge.row.updated` deltas off the
-//!    bus, and asserts the **materialised read p99 is within budget AFTER promotion** while staying
-//!    **byte-identical to the read-time recompute** (parity — materialisation is behaviour-preserving).
-//!
-//! The budget + the ratio are read from `myelin_substrate::Thresholds` (the single source of truth);
-//! no gate is weakened (EI-01 §3) — materialisation makes the SAME answer faster, it never lowers a
-//! bar.
-
 use std::time::Instant;
 
 use myelin_knowledge::{
@@ -33,8 +10,6 @@ use myelin_storage::blob::FsBlobStore;
 use myelin_substrate::Thresholds;
 use myelin_tenancy::TenantId;
 
-/// World-scale knobs on the deterministic SCHED harness (large enough to exercise the promotion
-/// trigger + the post-promotion read path; single-process).
 const ROWS_PER_DB: usize = 5_000;
 const TARGETS_PER_SOURCE: usize = 5_000;
 
@@ -57,7 +32,6 @@ fn kn_p31_facet_promotion_acted_on_post_promotion_uses_generated_column() {
     let tel = FacetTelemetry::new();
     let db_id = "db:world";
 
-    // Drive `priority` over the >5% threshold: 40 priority-filtered executions, 1 status execution.
     for _ in 0..40 {
         tel.record_execution(db_id, &[FieldId::new("priority")]);
     }
@@ -69,19 +43,15 @@ fn kn_p31_facet_promotion_acted_on_post_promotion_uses_generated_column() {
         "priority freq {priority_freq:.3} crossed the >5% trigger (the MEASURE half)"
     );
 
-    // ── THE ACT (KN-P31): promote the measured-hot facet via expand→backfill→contract. ──
     let candidates: Vec<FacetIndexHint> = tel.promotion_candidates(db_id, &schema);
     let priority_hint = candidates
         .iter()
         .find(|h| h.field_id.as_str() == "priority")
         .expect("priority is a promotion candidate");
     let plan = promote_facet(priority_hint).expect("a non-PII facet promotes");
-    // The plan is online: expand→backfill→contract, no DROP.
     assert_eq!(plan.steps.len(), 3);
     assert_eq!(plan.installed_path(), FacetPath::GeneratedColumn);
 
-    // POST-PROMOTION: the lowering now routes `priority` to its generated column (the hot path),
-    // not the cold GIN scan — the p99-improving read path the promotion installed.
     let hot_facets = vec![plan.field_id.clone()];
     let lowered = myelin_knowledge::lower_view_filter(
         &myelin_query::QueryAst::compiled(myelin_query::Predicate::Cmp {
@@ -104,8 +74,6 @@ fn kn_p31_facet_promotion_acted_on_post_promotion_uses_generated_column() {
         lowered.sql_predicate
     );
 
-    // A PII facet driven hot is REFUSED promotion to a plaintext column (fail-closed, contract 10.2)
-    // — the post-promotion path for a PII facet is gated, not silently materialised.
     for _ in 0..40 {
         tel.record_execution(db_id, &[FieldId::new("assignee")]);
     }
@@ -132,20 +100,16 @@ fn kn_p31_rollup_materialisation_acted_on_within_budget_and_parity() {
     let thresholds = Thresholds::load_canonical().expect("the canonical thresholds file loads");
     let budget_ms = thresholds.flex_db.rollup_read_p99_max_ms;
 
-    // Build a large related set: one source row related to TARGETS_PER_SOURCE target rows, each with
-    // a numeric target value. The read-time recompute over this set is the SLOW path KN-P18 measured.
     let mut visible_values: Vec<i64> = Vec::with_capacity(TARGETS_PER_SOURCE);
     let mut mat = MaterialisedRollup::for_hint(
         &myelin_knowledge::MaterialisationHint {
             db_id: "db:world".into(),
             field: FieldId::new("total"),
-            measured_p99_ms: budget_ms + 100, // measured OVER budget (the promotion trigger fired)
+            measured_p99_ms: budget_ms + 100,
         },
         RollupFn::Sum,
     );
 
-    // ── THE ACT (KN-P31): materialise the rollup by feeding knowledge.row.updated deltas off the bus
-    //    (each target joining the relation is an insert delta — incremental, never a full recompute). ──
     for n in 0..TARGETS_PER_SOURCE {
         let v = (n % 100) as i64;
         visible_values.push(v);
@@ -157,9 +121,6 @@ fn kn_p31_rollup_materialisation_acted_on_within_budget_and_parity() {
         });
     }
 
-    // ── (a) the materialised read p99 is WITHIN budget AFTER promotion (the green artifact). ──
-    // Sample the materialised read many times; it is O(maintained set), not a re-scan + permission
-    // re-evaluation of the whole related set — the p99-improving path materialisation installed.
     let mut samples_ms: Vec<f64> = Vec::new();
     for _ in 0..200 {
         let start = Instant::now();
@@ -176,8 +137,6 @@ fn kn_p31_rollup_materialisation_acted_on_within_budget_and_parity() {
          budget AFTER promotion (the post-promotion green artifact)"
     );
 
-    // ── (b) PARITY: the materialised read is byte-identical to the read-time recompute over the SAME
-    //    visible set — materialisation is behaviour-preserving, never a new answer. ──
     let materialised = mat.read("src:1");
     let recomputed = read_time_recompute(RollupFn::Sum, &visible_values);
     assert_eq!(
@@ -185,7 +144,6 @@ fn kn_p31_rollup_materialisation_acted_on_within_budget_and_parity() {
         "the materialised aggregate equals the read-time recompute (parity)"
     );
 
-    // A delta (one target's value edits 0→999) is applied INCREMENTALLY and the parity still holds.
     mat.apply_delta(&RowUpdatedDelta {
         src_row: "src:1".into(),
         target_row: "t:0".into(),
@@ -209,15 +167,10 @@ fn kn_p31_rollup_materialisation_acted_on_within_budget_and_parity() {
 
 #[test]
 fn kn_p31_object_store_blob_parity_gate() {
-    // The object-store-parity gate (CI): content-addressed put/get is byte-identical to the fs floor.
-    // The CI proof runs fs↔fs deterministically (BLAKE3-of-plaintext is backing-independent); the
-    // LIVE fs↔S3 proof against the real object store is the --features integration test (the real
-    // artifact that flips the integration drill green).
     let fs = FsBlobStore::new();
     let object = FsBlobStore::new();
     let tenant = TenantId("tenant-world".into());
 
-    // A representative CRDT snapshot blob + a media blob.
     for payload in [
         b"compacted Yrs CRDT snapshot bytes".to_vec(),
         vec![0xABu8; 4096],
@@ -233,7 +186,6 @@ fn kn_p31_object_store_blob_parity_gate() {
             "the object-store swap is byte-identical to the fs floor (behaviour-preserving)"
         );
     }
-    // A per-tenant keyspace dummy to confirm distinct tenants do not collide in the parity oracle.
     let other = TenantId("tenant-other".into());
     let a = materialise_blob_store_parity(&fs, &object, &tenant, b"x").unwrap();
     let b = materialise_blob_store_parity(&fs, &object, &other, b"x").unwrap();
@@ -246,7 +198,7 @@ fn kn_p31_object_store_blob_parity_gate() {
     println!(
         "[P-486 KN-P31 GREEN] object-store BlobStore parity gate: content-addressed put/get is \
          byte-identical to the fs floor (BLAKE3-of-plaintext, behaviour-preserving). The fs floor \
-         (KN-P05/KN-P11) is RESOLVED — the swap is a one-line backing change behind the BlobStore \
+         (KN-P05/KN-P11) is RESOLVED - the swap is a one-line backing change behind the BlobStore \
          trait; the live fs↔S3 proof is tests/integration_kn_p31_blob_swap.rs (--features integration)."
     );
 }

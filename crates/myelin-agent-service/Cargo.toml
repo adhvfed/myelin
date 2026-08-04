@@ -5,149 +5,40 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The Agent-Fabric IMPLEMENTATION / SERVICE crate (AG-P2 → P-131), distinct from the glue crate
-# `myelin-agent` (AG-P1 → P-130, which owns the frozen six-trait contract surface). Like the other
-# SERVICE / SUBSYSTEM crates (myelin-identity-service, myelin-gdpr-service, myelin-git,
-# myelin-issues, myelin-notif) it is a LEAF CONSUMER above the glue crates: it depends on
-# -agent (the ToolDef/effect value types the data model references) + -gdpr (the #[personal_data]
-# classify-derive) + -storage (the forward-only online migration runner + the (tenant, region) RLS
-# guard) + -tenancy (the partition key types). NOTHING in the production library DAG depends back on
-# it; it is OUTSIDE the eleven-crate library DAG modelled by myelin-substrate::crate_graph
-# (substrate_is_root() / identity_is_sink() are preserved — a service is the graph's terminal
-# consumer). See the crate-level note in src/lib.rs.
 [dependencies]
 myelin-agent = { path = "../myelin-agent" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
-# The PersonalDataHolder REGISTRATION seam (AG-P3 → P-132): the substrate HolderRegistry (the ONE
-# door — opening IS registering, contract 1.4), the StoreClassifier (the data-map's "this OLTP store
-# is holder HN" fact), and the H1–H18 catalog (the Fabric stores classify to H11 agent-memory + H17
-# agent-trace). Mirrors myelin-refs-service / myelin-search (the M1 holder-registration pattern).
-# AG-P4 (→ P-216) also uses `serve(AppSpec)` (contract 1.1) + `consume` (the dispatch consumer) here.
 myelin-substrate = { path = "../myelin-substrate" }
 
-# AG-P4 (→ P-216) — the SKELETON runtime ties the substrate path together. NEW deps (all leaf
-# consumers above the glue crates; NO cycle — `myelin-flow` depends on `myelin-agent` [glue], NOT on
-# `myelin-agent-service`, so this crate may depend on `myelin-flow` and remains OUTSIDE the
-# eleven-crate library DAG modelled by `myelin-substrate::crate_graph`):
-#   - myelin-flow   : a run is a durable workflow (ADR-09) — the `WfCtx` loop body the SKELETON drives
-#                     + the `DurableExecutor` seam (contracts 9.1/9.2/9.5); reused, not reinvented.
-#   - myelin-events : the transactional outbox `OutboxTx::emit(draft, cause)` nested-causality emit
-#                     (contract 2.2) + the `consume` dispatch-consumer entry-point (contract 3.6).
-#   - myelin-refs   : the `ArtifactRef` the trace row is keyed by (references-not-payloads).
 myelin-flow = { path = "../myelin-flow" }
 myelin-events = { path = "../myelin-events" }
 myelin-refs = { path = "../myelin-refs" }
-# AG-P11 (→ P-223) — the ONE templating surface (C9/OQ-L). The HITL card text + every
-# agent-authored message route through Notif `humanise` (contract 7.3, the sole templating
-# surface). `myelin-notif` owns `humanise((template_key, args), viewer, locale) -> HumanisedString`,
-# the `TemplateStore`, the `RefResolvePort` resolve seam, and the `Channel` projections. This crate
-# CONSUMES that surface — it ships no second template engine. NO cycle: `myelin-notif` is itself a
-# leaf consumer (it depends on -tenancy/-events/-identity/-refs/-content/-query/-substrate) and does
-# NOT depend back on `myelin-agent` or `myelin-agent-service`, so this edge keeps the DAG acyclic.
 myelin-notif = { path = "../myelin-notif" }
-# AG-P12 (→ P-224) — the reference gate (one of the five structural loop guards) keys on the
-# FROZEN 13.1 inline ref nodes: ONLY a structured `InlineNode::ArtifactRefNode` may re-trigger a run;
-# raw typed text NEVER does. `myelin-content` owns the three platform-load-bearing inline nodes
-# (`Mention`/`ArtifactRefNode`/`Embed`, contract 13.1). It is a leaf substrate crate (depends only on
-# -events/-identity/-tenancy below this crate) and does NOT depend back on -agent/-agent-service, so
-# this edge keeps the DAG acyclic.
 myelin-content = { path = "../myelin-content" }
-# AG-P15 (→ P-226) — ToolHands::exec IS the CI runner's `kind=agent` job on the ONE unified sandbox
-# (X-6 / contract 8.4). `myelin-ci-sandbox` (CI-P1 → P-129) owns the runner seam: the `JobSpec`
-# shape (kind ∈ {Ci, Agent}, fail-closed digest-pin / pids_max / timeout), the `agent_job`
-# constructor that wires the X-6 equivalence, the `SandboxBackend` launch seam, and the
-# `RunnerHooks` through which the four uniform guarantees fire. This crate is the FABRIC CONSUMER:
-# it builds the `kind=agent` JobSpec + dispatches it through `SandboxBackend::launch`, feeding the
-# hardening profile + the four-guarantee hooks. NO cycle: `myelin-ci-sandbox` depends only on
-# `myelin-tenancy` (the Region partition type) and does NOT depend back on -agent/-agent-service,
-# so this edge keeps the DAG acyclic. The Firecracker backend (CI-P2 → P-237) + the ZERO-escapes
-# real-kernel GATE (CI-P5 / AG-P17 → P-239/P-229) are the runner IMPL/GATE follow-ons.
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
-# AG-P18 (→ P-267) — the per-producer Git ToolDefs (git.merge gated + open_pr) consume the FROZEN
-# Git ReBAC fragment (contract 4.9) for their `required_caps`: `myelin-git` (GIT-P1 → P-123) owns
-# `rebac_fragment::object_types` (the canonical `repo`/`pull_request`/... names + the frozen
-# permission set `merge`/`push`/...). This crate REGISTERS the Git producer ToolDefs into the ONE
-# ToolSurface (8.1) sourcing the cap STRINGS from that frozen fragment (one source of truth — a
-# rename in the fragment breaks our test, never a silent drift). NO cycle: `myelin-git` is a leaf
-# consumer (it depends only on glue/substrate crates below this one) and does NOT depend back on
-# -agent/-agent-service, so this edge keeps the DAG acyclic.
 myelin-git = { path = "../myelin-git" }
-# AG-P20 (→ P-347) — the per-CONSUMER ToolDefs (Issues transition ABAC / Chat explicit-first / CI
-# deploy gated) consume the FROZEN ReBAC fragments (contract 4.9) for their `required_caps`, the SAME
-# one-source-of-truth pattern the Git (AG-P18) + KN (AG-P19) producer tools use:
-#   - `myelin-issues`  (ISS-P01) owns `rebac_fragment::object_types` (issue / issue_field /
-#     issue_transition) + the `transition` / `perform_transition` permission names the Issues
-#     advisory + the SLA-bound transition-ABAC tools source their caps from;
-#   - `myelin-chat`    (CHAT-P01) owns `rebac_fragment::object_types` (channel / message) + the `post`
-#     permission the Chat post_message/react tools source their cap from;
-#   - `myelin-identity-service` (the canonical CI fragment, §5) owns the CI `environment.deploy` /
-#     `ci_project.administer` / `run.trigger` permission names the CI deploy/secret/pipeline tools
-#     source their caps from (a rename in any fragment breaks our consumer test, never a silent drift).
-# NO cycle: all three are leaf consumers that do NOT depend back on -agent-service (issues/chat already
-# depend on identity-service, so this adds no new transitive edge into the DAG).
 myelin-issues = { path = "../myelin-issues" }
 myelin-chat = { path = "../myelin-chat" }
 myelin-identity-service = { path = "../myelin-identity-service" }
-# The SKELETON's terminal trace event carries a references-not-payloads JSON payload (the trace
-# `ArtifactRef`); serde_json builds the `EventDraft.payload` value (it was a dev-dep for AG-P2's
-# round-trip test; the SKELETON's emit needs it at lib scope).
 serde_json.workspace = true
-# AG-P19 (→ P-268) — the agent-trace HOLDER seam (8.8): the execution trace is a CONTENT-ADDRESSED
-# Knowledge document reusing the frozen `myelin-content` 13.1 block model; `run.trace_ref` resolves to
-# its content hash. blake3 + hex compute the ONE platform multihash convention `blake3:<hex>` over the
-# canonical serialized trace document (the SAME convention the GDPR Receipt + BlobStore use).
 blake3.workspace = true
 hex.workspace = true
 
-# REAL Postgres backend behind the `integration` feature (Stage 1 / infra). OPTIONAL deps: the
-# DEFAULT `cargo build --workspace` stays DB-free (the binding policy floor — no DB at build). They
-# are pulled ONLY by `--features integration`, which compiles the live-PG RLS denial test
-# (tests/integration_rls.rs) run against the docker-compose dev stack.
-#   - myelin-config : the dev<->prod CONFIG SWAP seam (the DATABASE_URL the live test reads);
-#   - sqlx          : the OLTP Postgres client (RUNTIME queries — sqlx::query, NOT query!, so the
-#                     build is DB-free even with the feature off);
-#   - tokio         : the async runtime the live client needs.
 myelin-config = { path = "../myelin-config", optional = true }
 sqlx = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
-# MR-009b W6b2 — the SELF dev-dependency that turns on `test-support` for THIS crate's OWN test
-# targets (the `src/dogfood.rs` unit tests + `tests/ag_p26_dogfood_drill.rs`) that call the now-gated
-# dogfood/triage drills. The sanctioned Cargo idiom; it does NOT affect the normal `cargo build`.
 myelin-agent-service = { path = ".", features = ["test-support"] }
-# MR-009b Wave 3: enable `test-support` so this crate's DEV tests reach the events in-memory
-# `DedupLedger::new()` double (the durable `DedupLedger::durable` is the production default; the
-# in-memory `Memory` arm + `::new()` are `#[cfg(any(test, feature = "test-support"))]`). DEV-only
-# — never in the production DAG (cargo tree -e no-dev shows no test-support edge).
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
-# The migration test re-uses the storage online runner; serde_json round-trips the trace ArtifactRef.
 serde_json.workspace = true
-# AG-P12 (→ P-224, AG-D7) — the M0 failure-injection harness: the tenant-scoped DependencyBreaker
-# (Broker seam, the SAME one FLOW-D5/D6/D7 use) models the adversarial agent->agent self-trigger loop,
-# and the SignalSource/Predicate assertion library gives the AG-D7 drill a TYPED green/red (causal-depth
-# <= ceiling, 0 fork, tripwire fired) that is never a swallowed pass (EI-01 §3). Dev-dep only.
 myelin-harness = { path = "../myelin-harness" }
-# The CDC + drill build the inbound EventEnvelope / InlineNode fixtures the guards read (3.6 dispatch
-# tier, 13.1 inline ref nodes). myelin-content/-events/-identity/-tenancy are already lib deps; the
-# fixtures use them at test scope.
-# CI-P26 (P-369): the 8.1 X-6 CDC — the Fabric `requires_approval_default` seed table is RECONCILED
-# against CI's OWNED X-6 classification (`myelin_ci_controlplane::ci_requires_approval_default` + the
-# complete `ci_tool_defs`) so a gating drift on either side is a test break
-# (tests/cdc_8_1_ci_x6_tooldefs.rs). A DEV-DEP ONLY (the CDC test surface): `myelin-ci-controlplane`
-# is a producer leaf that does not depend back on `myelin-agent-service`, so the edge stays acyclic.
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 
 [features]
 default = []
-# Pull the real Postgres client + compile the live-PG (tenant, region) RLS cross-tenant denial test.
 integration = ["dep:myelin-config", "dep:sqlx", "dep:tokio"]
-# MR-009b W6b2 — the `test-support` cargo feature. The dogfood/triage in-process drills
-# (`run_myelin_triage_on_ci_failure` → `run_fabric_over_myelins_own_work` →
-# `run_fabric_truth_up_scorecard`) construct the now-`test-support`-gated in-memory `CostLedger::new()`,
-# so they are gated behind `#[cfg(any(test, feature = "test-support"))]`. Forwards to
-# `myelin-storage/test-support` (the in-memory `CostLedger` double). DEV/TEST only.
 test-support = ["myelin-storage/test-support"]

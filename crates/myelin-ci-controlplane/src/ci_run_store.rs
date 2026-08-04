@@ -1,48 +1,3 @@
-//! # `ci_run_store` — CT-004d.2 chunk 4: the durable `ci_run` writer (the CI run-of-record)
-//!
-//! **Owning architecture doc (byte-authoritative):**
-//! `planning/04-subsystem-architectures/continuous-integration/architecture/02-internals-and-algorithms.md`
-//! §1 (trigger → dispatch: match → dedup → trust-stamp → resolve → reserve/start) + arch 01 §3.1 (the
-//! `ci_run` thin index over the myelin-flow workflow run).
-//!
-//! ## The gap this closes (grounded by the CT-004b scout)
-//! The `ci-dispatch.trigger` consumer's reserve bundle is supposed to persist a durable `ci_run` row
-//! (`state = queued`) — the run-of-record every downstream reader (the surfacing scan, the run-view,
-//! the check-emitter) reads. But the PRODUCTION reserve store
-//! ([`myelin_ci_dispatch::OutboxReserveStore`]) only `stage_state_change`'d a NOTE — it NEVER wrote
-//! the row. The row was written durably ONLY in the integration test's `CoCommitReserveStore` (which
-//! CAN name `sqlx`, so it rode the co-commit connection and proved the TRUE shape). This module is the
-//! PRODUCTION durable `ci_run` writer that test proved: a `PgPool`-holding `…Store` running
-//! byte-identical SQL, mirroring [`crate::job_spec_store::CiJobSpecStore`].
-//!
-//! ## The co-commit shape (the load-bearing invariant)
-//! The `ci_run` ROW is the exactly-once RUN-OF-RECORD, so it MUST land atomically with the consumer's
-//! dedup mark (the #7 / MR-023b floor): a crash (rollback) between them leaves NEITHER, a redelivery
-//! re-runs and lands both exactly once. [`CiRunStore::co_commit_insert`] writes the row on the
-//! consumer's co-commit `HandlerTx` connection (downcast `tx.connection::<sqlx::PgConnection>()`) — the
-//! SAME `sqlx` transaction the dedup mark is in — so the row + the mark commit or roll back as ONE unit
-//! (the runtime commits the tx on `Done`, rolls it back on `Retry`/failure — `myelin_events::consumer`).
-//!
-//! [`CiRunStore::co_commit_reserve`] extends that boundary to the retry-stable `check_attempt`
-//! allocation and detached canonical outbox rows. It uses the sanctioned `PgRelay` insertion on the
-//! caller's connection, so run, attempt, queued facts, and dedup mark have one commit point.
-//!
-//! ## Idempotency + RLS (fail-closed)
-//! `ON CONFLICT (tenant_id, run_id) DO NOTHING` — a redelivered trigger mints the SAME deterministic
-//! `run_id` (derived from the triggering `event_id`), then a separate locking read verifies every
-//! immutable field before classifying it as an exact replay. A collision is typed and loud. Every
-//! write is `(tenant, region)`-scoped: the pool-based [`CiRunStore::insert_ci_run`] acquires through
-//! [`with_tenant_tx_error`] so domain errors survive the RESHAPE-002 FORCE-RLS transaction convention;
-//! [`CiRunStore::get_ci_run`] uses [`with_tenant_tx`], and the co-commit path rides the caller's scoped
-//! transaction. Named `…Store` + carries a `PgPool` so the `no-in-memory-durable-store` scanner reads
-//! it as a genuine durable store.
-//!
-//! ## Out of scope (named, not built — the CT-004d.2 chunk split)
-//! This is ONLY the durable `ci_run` writer + its co-commit wiring. It does NOT register/drive the
-//! `ci.pipeline` body (chunk 2), call `DurableExecutor::start` (chunk 3), or touch the
-//! scheduler/runner (chunk 5). The `ci_run` row it writes carries the PRE-MINTED `wf_run_id` those
-//! chunks start the workflow with.
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
@@ -65,115 +20,51 @@ use crate::job_accounting_store::{
 
 const PR_RUN_SUPERSESSION_LOCK_DOMAIN: &str = "myelin.ci.pr-run-supersession.v1";
 
-/// **The `ci_run` row a reserve/start bundle persists (all the `CREATE_CI_RUN_DDL` columns the writer
-/// binds).** Owned `String`s so the durable store binds them directly (the `uuid` columns are bound as
-/// text and cast `$n::uuid` in SQL — the SAME posture the CT-004b integration test proved). The
-/// NULLABLE columns (`repo_ref` / `commit_oid` / `cause_event_id` / `triggered_by`) are `Option` — a
-/// reserve bundle that does not carry them writes `NULL` (the DDL permits it), never a fabricated value.
-///
-/// `ci-dispatch` builds this from its `ArmedRun` (`ci_run_insert_from_armed`); the mapping lives THERE
-/// (this crate cannot name `ArmedRun` — that edge would be a cycle).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunInsert {
-    /// `ci_run.tenant_id` — the RLS/tenant partition key (the VERIFIED tenant, never a URL path).
     pub tenant_id: String,
-    /// `ci_run.region` — the residency pin (the RLS `(tenant, region)` predicate half).
     pub region: String,
-    /// `ci_run.run_id` (uuid) — the PK half; deterministic from the triggering `event_id` (the
-    /// `ON CONFLICT` idempotency anchor).
     pub run_id: String,
-    /// `ci_run.project_id` (uuid) — a deterministic placeholder from the repo ref (the repo→project
-    /// registry is the named floor).
     pub project_id: String,
-    /// `ci_run.pipeline_id` (uuid) — a deterministic placeholder (named floor).
     pub pipeline_id: String,
-    /// `ci_run.wf_run_id` (uuid) — PRE-MINTED here; CT-004d.2 chunk 3 starts the workflow with it.
     pub wf_run_id: String,
-    /// `ci_run.definition_snapshot` — the content-addressed CAS blob ref the run runs (NOT NULL).
     pub definition_snapshot: String,
-    /// `ci_run.trigger_kind` — the CHECK token (`push`/`pull_request`/…), NOT NULL.
     pub trigger_kind: String,
-    /// Canonical PR supersession identity (`pr:{repo}:{number}`). Required for every newly written
-    /// pull-request run and forbidden for other trigger kinds.
     pub concurrency_group: Option<String>,
-    /// Producer-authored positive `git_pr.version` for this PR head. Required with
-    /// `concurrency_group` for every newly written pull-request run and forbidden otherwise.
     pub pr_head_generation: Option<i64>,
-    /// `ci_run.trust_tier` — the stamped CHECK token (`trusted`/`untrusted_fork`/`self_hosted`),
-    /// NOT NULL; the SAME value stamped on every `ci.check.updated.trust_tier` (X-1).
     pub trust_tier: String,
-    /// `ci_run.state` — the lifecycle state at reserve, always `queued`, NOT NULL.
     pub state: String,
-    /// `ci_run.correlation_id` — the triggering envelope's correlation, NOT NULL.
     pub correlation_id: String,
-    /// `ci_run.cause_event_id` (nullable) — the triggering `event_id` (the cause provenance).
     pub cause_event_id: Option<String>,
-    /// Depth of the triggering envelope retained for saturating child derivation.
     pub cause_depth: i64,
-    /// Originating human/session action inherited by later lifecycle facts.
     pub caused_by: Option<String>,
-    /// `ci_run.repo_ref` (nullable) — the repo the run ran against (the check-seam / run-view key half).
     pub repo_ref: Option<String>,
-    /// `ci_run.commit_oid` (nullable) — the commit the run ran against (the CheckStatus key half).
     pub commit_oid: Option<String>,
-    /// `ci_run.triggered_by` (nullable) — the acting PSEUDONYM subject (contract 4.8), never a raw
-    /// name/email. `None` if the reserve bundle does not carry it (the CT-004b proven shape).
     pub triggered_by: Option<String>,
 }
 
-/// A `ci_run` row read back (the run-view / check-emitter resolve path). The durable columns as owned
-/// `String`s (the `uuid` columns rendered `::text`). This is a thin read record — NOT the
-/// PII-classification mirror ([`crate::schema::CiRunRow`]), which tags the same table for the GDPR lint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunRecord {
-    /// `ci_run.tenant_id` — the authoritative tenant partition carried into the per-tenant
-    /// pipeline starter. Omitting this made it possible for a composition root to stamp a
-    /// synthetic/fixed tenant onto another tenant's durable run.
     pub tenant_id: String,
-    /// `ci_run.run_id` (uuid rendered text).
     pub run_id: String,
-    /// `ci_run.region`.
     pub region: String,
-    /// `ci_run.project_id` (uuid rendered text).
     pub project_id: String,
-    /// `ci_run.pipeline_id` (uuid rendered text).
     pub pipeline_id: String,
-    /// `ci_run.wf_run_id` (uuid rendered text).
     pub wf_run_id: String,
-    /// `ci_run.repo_ref` (nullable).
     pub repo_ref: Option<String>,
-    /// `ci_run.commit_oid` (nullable).
     pub commit_oid: Option<String>,
-    /// `ci_run.cause_event_id` (nullable).
     pub cause_event_id: Option<String>,
-    /// `ci_run.cause_depth`.
     pub cause_depth: i64,
-    /// `ci_run.caused_by` (nullable).
     pub caused_by: Option<String>,
-    /// `ci_run.definition_snapshot`.
     pub definition_snapshot: String,
-    /// `ci_run.trigger_kind`.
     pub trigger_kind: String,
-    /// Canonical PR supersession identity. Historical rows may be `NULL`; production launch
-    /// authority refuses such legacy PR rows rather than inventing a group.
     pub concurrency_group: Option<String>,
-    /// Producer-authored positive PR row generation. Historical `NULL` rows written by the
-    /// immediately preceding dispatcher are legacy-oldest and may never supersede a generation.
     pub pr_head_generation: Option<i64>,
-    /// `ci_run.trust_tier`.
     pub trust_tier: String,
-    /// `ci_run.state`.
     pub state: String,
-    /// `ci_run.correlation_id`.
     pub correlation_id: String,
 }
 
-/// **INSERT a `ci_run` row, idempotent on the `(tenant_id, run_id)` PK.** Binds every column the writer
-/// sets (the `uuid` columns cast `$n::uuid` from text); the NULLABLE columns bind `Option` (→ `NULL`
-/// when `None`); `cost_settled` / `created_at` / `finished_at` take their DDL defaults.
-/// `ON CONFLICT (tenant_id, run_id) DO NOTHING` makes the initial write non-destructive. On conflict,
-/// [`VERIFY_CI_RUN_REPLAY_QUERY`] must verify the immutable identity in a separate statement before
-/// the operation can return `false`; a divergent or invisible conflict is an error.
 pub const INSERT_CI_RUN_QUERY: &str = "\
 INSERT INTO ci_run (
   tenant_id, region, run_id, project_id, pipeline_id, wf_run_id,
@@ -186,14 +77,6 @@ INSERT INTO ci_run (
 ON CONFLICT (tenant_id, run_id) DO NOTHING
 RETURNING run_id";
 
-/// Read the immutable run identity after an `INSERT ... DO NOTHING` conflict. This deliberately is
-/// a **second statement**: under PostgreSQL READ COMMITTED, the statement that lost a concurrent
-/// insert race can observe the unique conflict without being able to read the winner in that same
-/// statement's snapshot. A new statement receives a new snapshot after the winner commits.
-///
-/// The explicit `(tenant, region, run)` predicate is defence in depth alongside FORCE RLS. If the
-/// unique conflict belongs to another residency region, the row remains invisible and the caller
-/// returns [`CiRunStoreError::ConflictNotVisible`] without disclosing either region.
 pub const VERIFY_CI_RUN_REPLAY_QUERY: &str = "\
 SELECT
   region = $2                                      AS region_matches,
@@ -217,9 +100,6 @@ FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
 FOR KEY SHARE";
 
-/// **Read a `ci_run` row back by `(tenant_id, run_id)` (the run-view / check-emitter resolve path).**
-/// The `uuid` columns are rendered `::text` so the read record is a plain `String`. Keyed on the RLS
-/// tenant predicate + the run PK; `region` is the RLS scope (the `(tenant, region)` GUC the tx sets).
 pub const SELECT_CI_RUN_QUERY: &str = "\
 SELECT
   tenant_id              AS tenant_id,
@@ -242,9 +122,6 @@ SELECT
   correlation_id          AS correlation_id
 FROM ci_run WHERE tenant_id = $1 AND run_id = $2::uuid";
 
-/// Lock the exact live run while a claim-bound Identity credential is minted. The lock and the
-/// immutable-manifest read share one tenant-scoped transaction, so a terminal transition cannot
-/// race between authority verification and minting.
 pub const LOCK_CI_RUN_FOR_TOKEN_MINT_QUERY: &str = "\
 SELECT
   tenant_id              AS tenant_id,
@@ -269,8 +146,6 @@ FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND wf_run_id = $4::uuid
 FOR UPDATE";
 
-/// Lock the run-of-record before its one-way terminal transition. Any persisted completion timestamp
-/// is rendered canonically so an acknowledgement-loss replay can reuse it byte-for-byte.
 pub const LOCK_CI_RUN_FOR_FINALIZE_QUERY: &str = "\
 SELECT state, cost_settled,
        to_char(finished_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"')
@@ -279,26 +154,16 @@ FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND wf_run_id = $4::uuid
 FOR UPDATE";
 
-/// Read every immutable accounting receipt bound to the exact CI/workflow run pair. The finalizer
-/// compares this set with the manifest's complete job set before certifying `cost_settled=true`.
-/// Receipts cannot be updated or deleted, so no row lock is needed (and one would require authority
-/// intentionally absent from the runtime role).
 pub const SELECT_CI_RUN_ACCOUNTING_QUERY: &str = "\
 SELECT job_id::text AS job_id, reserve_handle, passed, timed_out, skipped
 FROM ci_job_accounting
 WHERE tenant_id = $1 AND region = $2 AND ci_run_id = $3::uuid AND wf_run_id = $4::uuid
 ORDER BY job_id";
 
-/// Read an immutable attempt already issued to this run. No row lock is required: the table grants
-/// only `SELECT, INSERT` to the runtime role and rows can never be updated or deleted. Adding
-/// `FOR SHARE` would silently require `UPDATE` privilege and make the production dispatch retry
-/// until its broker budget is exhausted.
 const SELECT_RESERVED_CHECK_ATTEMPT_QUERY: &str = "\
 SELECT repo_ref, commit_oid, run_attempt FROM ci_run_check_attempt
 WHERE tenant_id=$1 AND region=$2 AND run_id=$3 AND context=$4";
 
-/// The sole live terminal transition. It is intentionally a compare-and-set from the fully started
-/// shape; queued, already-mutated, and partially-terminal rows are refused rather than repaired.
 pub const FINALIZE_CI_RUN_QUERY: &str = "\
 UPDATE ci_run
 SET state = $5, cost_settled = true, finished_at = $6::timestamptz
@@ -307,21 +172,14 @@ WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND wf_run_id = $4::u
 RETURNING to_char(finished_at AT TIME ZONE 'UTC',
                   'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS completed_at";
 
-/// One manifest job whose exact reservation must have an immutable terminal-accounting receipt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunFinalizationJob {
-    /// Manifest job UUID.
     pub job_id: String,
-    /// Exact Storage reservation authority granted to this job.
     pub reserve_handle: String,
-    /// Whether Flow's dispatch-relative deadline won before this job's accounting signal arrived.
     pub flow_timed_out: bool,
-    /// Whether the workflow dispatched this job. False means dependency-skipped and requires a
-    /// co-committed cancellation receipt rather than runner accounting.
     pub dispatched: bool,
 }
 
-/// The terminal lifecycle state derived from the complete immutable receipt set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiRunTerminalState {
     Succeeded,
@@ -339,105 +197,56 @@ impl CiRunTerminalState {
     }
 }
 
-/// Exact inputs to the one-way `ci_run` finalization gate. `completed_at` must be the workflow's
-/// journaled clock value, never a fresh database/application clock read.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunFinalization {
-    /// Manifest tenant identity, re-bound to the finalizer's verified scope.
     pub tenant_id: String,
-    /// Manifest residency cell, re-bound to the finalizer's verified scope.
     pub region: String,
-    /// CI run-of-record UUID.
     pub run_id: String,
-    /// Flow workflow-run UUID bound by the immutable manifest.
     pub wf_run_id: String,
-    /// State expected from the complete immutable verdict set.
     pub terminal_state: CiRunTerminalState,
-    /// Journaled `WfCtx::now()` value used for the durable completion timestamp.
     pub completed_at: String,
-    /// Complete manifest job/reservation set.
     pub jobs: Vec<CiRunFinalizationJob>,
 }
 
-/// Whether the durable terminal transition was newly applied or exactly replayed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CiRunFinalizationWrite {
     Finalized,
     ExactReplay,
 }
 
-/// Durable finalization result. The completion time is always read back from PostgreSQL in canonical
-/// UTC form, so an activity retry after an acknowledgement-loss crash reuses the first committed
-/// time instead of depending on a not-yet-committed `WfCtx::now()` marker.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CiRunFinalizationOutcome {
-    /// Whether this call applied the transition or observed its exact replay.
     pub write: CiRunFinalizationWrite,
-    /// Canonical persisted UTC completion time.
     pub completed_at: String,
 }
 
-/// Synchronous effect boundary used by the deterministic Flow body. Implementations must be
-/// exact-replay safe because an effect can commit before its Flow history row does.
 pub trait CiRunFinalizer: Send + Sync {
-    /// Verify complete terminal accounting and apply (or exactly replay) the run transition.
     fn finalize(
         &self,
         finalization: &CiRunFinalization,
     ) -> Result<CiRunFinalizationOutcome, CiRunStoreError>;
 }
 
-/// A durable `ci_run`-store failure. Loud + typed — a write/read NEVER silently drops or coerces. Safe
-/// to log: carries only structural faults and immutable field names, never replay values.
-///
-/// This enum is non-exhaustive because the durable store can gain new fail-closed checks. Callers
-/// must retain a fallback arm instead of treating the current variants as the complete failure set.
 #[non_exhaustive]
 #[derive(Debug, PartialEq, Eq)]
 pub enum CiRunStoreError {
-    /// A durable-store DB error (the statement did NOT succeed) — never a silent partial write.
     Db(String),
-    /// Reserve/start may create a run only in the canonical initial state (`queued`). Checked before
-    /// opening a transaction or executing SQL.
     InvalidInitialState,
-    /// The retained triggering-envelope depth cannot be represented by the canonical `u32`
-    /// envelope depth. Checked before opening a transaction or executing SQL.
     InvalidCausalDepth,
-    /// New pull-request runs require one canonical `pr:{repo}:{number}` identity; other triggers
-    /// must not carry one.
     InvalidConcurrencyGroup,
-    /// New pull-request runs require the positive producer-authored PR row generation; other
-    /// triggers must not carry one.
     InvalidPrHeadGeneration,
-    /// The primary key already exists, but its immutable run identity differs from this replay.
-    /// Field names only: submitted and stored values are deliberately never exposed in the error.
     ReplayCollision {
-        /// Immutable fields that differ, in stable schema order.
         differing_fields: Vec<&'static str>,
     },
-    /// The insert proved a primary-key conflict, but the explicitly tenant/region-scoped verification
-    /// read could not see the row. This fails closed without disclosing where the row resides.
     ConflictNotVisible,
-    /// The co-commit [`myelin_events::HandlerTx`] carried NO connection (a durable handler on the
-    /// in-memory / no-tx path). The writer FAILS CLOSED here (never a write outside the co-commit tx —
-    /// that re-opens the at-most-once #7 bug), so the handler returns `Retry` and the redelivery
-    /// re-runs on a real co-commit tx.
     NoCoCommitTx,
-    /// Finalization input is structurally invalid (UUID, timestamp, empty/duplicate job authority).
     InvalidFinalization(&'static str),
-    /// No run exists under the exact verified tenant/region/CI-run/workflow-run identity.
     FinalizationRunNotFound,
-    /// The manifest job set and immutable accounting receipt set are not an exact match.
     IncompleteTerminalAccounting,
-    /// A receipt exists for every job, but a job/reservation binding differs from the manifest.
     TerminalAccountingDivergence,
-    /// The requested terminal state disagrees with the verdicts in the complete receipt set.
     TerminalVerdictDivergence,
-    /// The run exists but is neither the canonical running shape nor an exact terminal replay.
     FinalizationStateDivergence,
-    /// Dependency-skipped reservation cancellation or immutable receipt recording was refused.
     SkippedJobAccounting,
-    /// The requested terminal job/reservation set differs from immutable launch authority.
     FinalizationManifestDivergence,
 }
 
@@ -473,7 +282,7 @@ impl core::fmt::Display for CiRunStoreError {
                 f,
                 "durable ci_run co-commit refused: the HandlerTx carried no co-commit connection \
                  (a durable handler fails closed rather than write the run-of-record outside the \
-                 dedup mark's transaction — the #7 at-most-once floor)"
+                 dedup mark's transaction - the #7 at-most-once floor)"
             ),
             CiRunStoreError::InvalidFinalization(field) => {
                 write!(f, "durable ci_run finalization refused an invalid {field}")
@@ -518,22 +327,6 @@ impl From<PgError> for CiRunStoreError {
     }
 }
 
-/// **The REAL durable CI `ci_run` store (CT-004d.2 chunk 4) — the run-of-record writer.** Holds the
-/// OLTP [`PgPool`] and writes / reads the `ci_run` row, mirroring [`crate::job_spec_store::CiJobSpecStore`].
-/// Two write paths, both exact-replay safe on `(tenant_id, run_id)`:
-///
-/// - **[`co_commit_insert`](CiRunStore::co_commit_insert) (the PRODUCTION reserve path):** writes the
-///   row on the consumer's co-commit `HandlerTx` connection — the SAME tx as the dedup mark — so the
-///   run-of-record + the mark are ATOMIC (the load-bearing invariant). Does NOT use the pool (it rides
-///   the caller's connection); needs a `tokio` runtime handle to bridge the async `sqlx` write to the
-///   sync `ReserveStore::persist` body.
-/// - **[`insert_ci_run`](CiRunStore::insert_ci_run) (the pool-based standalone write):** acquires
-///   through [`with_tenant_tx_error`] (the typed FORCE-RLS convention) — the round-trip /
-///   control-plane-owned write.
-///
-/// Plus [`get_ci_run`](CiRunStore::get_ci_run), the run-view / check-emitter read. Cloneable (the pool
-/// is an `Arc`-backed handle). The caller must have applied the CI durable migrations (which create
-/// `ci_run` — [`crate::ci_durable_migrations`], applied at BOTH CI mains' boot).
 #[derive(Clone)]
 pub struct CiRunStore {
     pool: PgPool,
@@ -542,8 +335,6 @@ pub struct CiRunStore {
     surface_detail_test_barrier: Option<Arc<tokio::sync::Barrier>>,
 }
 
-/// Production bridge from the synchronous workflow activity to [`CiRunStore::finalize_ci_run`].
-/// It carries a verified tenant scope; the workflow manifest cannot choose or widen database scope.
 #[derive(Clone)]
 pub struct DurableCiRunFinalizer {
     store: CiRunStore,
@@ -555,7 +346,6 @@ pub struct DurableCiRunFinalizer {
 }
 
 impl DurableCiRunFinalizer {
-    /// Bind the durable store to a verified tenant scope and the service runtime.
     pub fn new(
         store: CiRunStore,
         ledger: DurableCostLedger,
@@ -690,9 +480,6 @@ impl CiRunFinalizer for DurableCiRunFinalizer {
 }
 
 impl CiRunStore {
-    /// Wrap the OLTP pool as the durable `ci_run` store (mirror [`crate::job_spec_store::CiJobSpecStore::with_pg`]).
-    /// The production composition root constructs this from the MR-022 `SubstrateProvider` pool
-    /// ([`crate::ci_run_store`]).
     pub fn with_pg(pool: PgPool) -> CiRunStore {
         CiRunStore {
             pool,
@@ -702,9 +489,6 @@ impl CiRunStore {
         }
     }
 
-    /// Bind the durable run store to the cell-secret-derived key that authenticates public CI
-    /// pagination cursors. Ordinary scheduler/control-plane stores do not need this authority;
-    /// production Edge must use this constructor before mounting the run-read surface.
     pub fn with_pg_surface_cursor_key(
         pool: PgPool,
         key: zeroize::Zeroizing<[u8; 32]>,
@@ -717,7 +501,6 @@ impl CiRunStore {
         }
     }
 
-    /// The pool this store is bound to.
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -726,8 +509,6 @@ impl CiRunStore {
         self.surface_cursor_key.as_deref().map(|key| &**key)
     }
 
-    /// Integration-only synchronization point after detail identity selection. It lets the live
-    /// race proof commit a parent mutation between the production materializer's SQL statements.
     #[cfg(any(test, feature = "integration"))]
     pub fn with_surface_detail_test_barrier(
         mut self,
@@ -742,26 +523,6 @@ impl CiRunStore {
         self.surface_detail_test_barrier.clone()
     }
 
-    /// **Co-commit the `ci_run` ROW on the consumer's co-commit connection (the run-of-record ⇄ dedup
-    /// mark atomicity — the load-bearing invariant).** Downcasts `tx.connection::<sqlx::PgConnection>()`
-    /// (the SAME `sqlx` transaction `DedupLedger::begin_co_commit` opened + inserted the dedup mark
-    /// within) and runs [`INSERT_CI_RUN_QUERY`] on it. So the row + the mark commit together (the
-    /// runtime commits the tx on `Done`) or roll back together (on `Retry`/failure) — a crash between
-    /// leaves NEITHER, and a redelivery re-runs + lands both exactly once. A primary-key conflict is
-    /// accepted only after exact immutable replay verification.
-    ///
-    /// **Fail-closed:** if the handle carries NO connection ([`CiRunStoreError::NoCoCommitTx`]) the
-    /// writer refuses — it NEVER writes the run-of-record outside the mark's tx (that re-opens the
-    /// at-most-once #7 bug). The caller (`ReserveStore::persist`) maps this to `Retry`.
-    ///
-    /// **RLS:** the co-commit tx already `set_config('myelin.tenant_id'|'myelin.region', …, true)`
-    /// (transaction-scoped) — see `DurableDedupBacking::begin_co_commit` — so this INSERT is
-    /// `(tenant, region)`-scoped WITHOUT re-opening a nested tenant transaction. Returns `true` iff a
-    /// fresh row was inserted and `false` only for a verified exact immutable replay.
-    ///
-    /// `rt` bridges the async `sqlx` write to the sync `persist` body (the `PgOutboxBacking` idiom); the
-    /// downcast + the `block_on` are HERE (this crate names `sqlx`), so the ci-dispatch leaf crate only
-    /// threads the type-erased `tx` through.
     pub fn co_commit_insert(
         &self,
         tx: &mut myelin_events::HandlerTx<'_>,
@@ -775,11 +536,6 @@ impl CiRunStore {
         tokio::task::block_in_place(|| rt.block_on(insert_on_conn(conn, row)))
     }
 
-    /// Reserve a queued run, allocate its authoritative per-context check attempts, and stage the
-    /// resulting outbox envelopes in the consumer's existing dedup transaction. The callback sees
-    /// the committed-if-this-transaction-commits attempt map and must return detached canonical
-    /// outbox rows stamped with those exact attempts. Run row, attempt allocation, queued facts,
-    /// and consumer dedup mark therefore share one PostgreSQL commit boundary.
     pub fn co_commit_reserve<F>(
         &self,
         tx: &mut myelin_events::HandlerTx<'_>,
@@ -815,11 +571,6 @@ impl CiRunStore {
         })
     }
 
-    /// **INSERT a `ci_run` row on the store's OWN pool under a tenant-scoped tx (the standalone /
-    /// round-trip write).** Acquires through [`with_tenant_tx_error`] (BEGIN → set the `(tenant,
-    /// region)` GUC transaction-scoped → INSERT/verify → COMMIT), so it is RLS-isolated, leaves no
-    /// residual scope, and preserves typed collision errors. Returns `true` iff fresh and `false`
-    /// only for a verified exact immutable replay.
     pub async fn insert_ci_run(&self, row: &CiRunInsert) -> Result<bool, CiRunStoreError> {
         validate_initial_state(row)?;
         let row = row.clone();
@@ -831,9 +582,6 @@ impl CiRunStore {
         .await
     }
 
-    /// **Read a `ci_run` row back by `(tenant, run_id)` (the run-view / check-emitter resolve path).**
-    /// Under a tenant-scoped tx (RLS). `Ok(None)` iff there is no such row for this tenant (a clean
-    /// absent — the caller decides whether that is fail-closed for its use).
     pub async fn get_ci_run(
         &self,
         tenant_id: &str,
@@ -845,7 +593,7 @@ impl CiRunStore {
         let row = with_tenant_tx(&self.pool, tenant_id, region, move |conn| {
             Box::pin(async move {
                 sqlx::query(SELECT_CI_RUN_QUERY)
-                    .bind(&tenant_id_owned) // $1 tenant_id (the RLS/tenant predicate)
+                    .bind(&tenant_id_owned)
                     .bind(&run_owned)
                     .fetch_optional(&mut *conn)
                     .await
@@ -858,8 +606,6 @@ impl CiRunStore {
         Ok(row.map(ci_run_record_from_row))
     }
 
-    /// Caller-transaction variant used only by the claim-time token issuer. The caller owns the
-    /// transaction-local tenant scope and keeps this `FOR UPDATE` lock through credential minting.
     pub(crate) async fn lock_for_token_mint_on_conn(
         connection: &mut sqlx::PgConnection,
         tenant_id: &str,
@@ -878,10 +624,6 @@ impl CiRunStore {
         Ok(row.map(ci_run_record_from_row))
     }
 
-    /// Finalize one run only after the manifest's complete job set has exact immutable accounting.
-    /// The receipt verification and lifecycle compare-and-set share one tenant-scoped transaction.
-    /// Exact replay returns the first persisted completion time so an acknowledgement-loss retry
-    /// cannot rewrite it or fail merely because the new drive proposed a later clock value.
     pub async fn finalize_ci_run(
         &self,
         scope: &TenantScope,
@@ -1227,10 +969,6 @@ async fn allocate_reserve_check_attempts(
     Ok(attempts)
 }
 
-/// The ONE `ci_run` INSERT execution — bound identically whether it runs on the co-commit connection or
-/// the pool's tenant-scoped tx (so the durable write is authored EXACTLY ONCE, no drift). Returns `true`
-/// iff a fresh row was inserted (`RETURNING run_id` present). On conflict it executes a mandatory
-/// second statement and returns `false` only for a verified exact immutable replay.
 async fn insert_on_conn(
     conn: &mut sqlx::PgConnection,
     row: &CiRunInsert,
@@ -1242,25 +980,25 @@ async fn insert_on_conn(
             .map_err(|_| CiRunStoreError::Db("PR concurrency-group lock".into()))?;
     }
     let inserted = sqlx::query(INSERT_CI_RUN_QUERY)
-        .bind(&row.tenant_id) // $1 tenant_id (RLS/tenant predicate)
-        .bind(&row.region) // $2 region
-        .bind(&row.run_id) // $3 run_id ::uuid (PK half)
-        .bind(&row.project_id) // $4 project_id ::uuid
-        .bind(&row.pipeline_id) // $5 pipeline_id ::uuid
-        .bind(&row.wf_run_id) // $6 wf_run_id ::uuid
-        .bind(&row.repo_ref) // $7 repo_ref (nullable)
-        .bind(&row.commit_oid) // $8 commit_oid (nullable)
-        .bind(&row.cause_event_id) // $9 cause_event_id (nullable)
-        .bind(row.cause_depth) // $10 cause_depth
-        .bind(&row.caused_by) // $11 caused_by (nullable)
-        .bind(&row.definition_snapshot) // $12 definition_snapshot
-        .bind(&row.trigger_kind) // $13 trigger_kind
-        .bind(&row.concurrency_group) // $14 canonical PR group (nullable for non-PR)
-        .bind(row.pr_head_generation) // $15 producer-authored PR generation
-        .bind(&row.triggered_by) // $16 triggered_by (nullable pseudonym)
-        .bind(&row.trust_tier) // $17 trust_tier
-        .bind(&row.state) // $18 state
-        .bind(&row.correlation_id) // $19 correlation_id
+        .bind(&row.tenant_id)
+        .bind(&row.region)
+        .bind(&row.run_id)
+        .bind(&row.project_id)
+        .bind(&row.pipeline_id)
+        .bind(&row.wf_run_id)
+        .bind(&row.repo_ref)
+        .bind(&row.commit_oid)
+        .bind(&row.cause_event_id)
+        .bind(row.cause_depth)
+        .bind(&row.caused_by)
+        .bind(&row.definition_snapshot)
+        .bind(&row.trigger_kind)
+        .bind(&row.concurrency_group)
+        .bind(row.pr_head_generation)
+        .bind(&row.triggered_by)
+        .bind(&row.trust_tier)
+        .bind(&row.state)
+        .bind(&row.correlation_id)
         .fetch_optional(&mut *conn)
         .await
         .map_err(|e| CiRunStoreError::Db(e.to_string()))?;
@@ -1268,8 +1006,6 @@ async fn insert_on_conn(
         return Ok(true);
     }
 
-    // This must remain a separate statement. A data-modifying CTE would reuse the losing INSERT's
-    // snapshot and can miss a concurrently committed winner under READ COMMITTED.
     let stored = sqlx::query(VERIFY_CI_RUN_REPLAY_QUERY)
         .bind(&row.tenant_id)
         .bind(&row.region)
@@ -1347,19 +1083,12 @@ async fn insert_on_conn(
     }
 }
 
-/// Serialize producer insertion and every starter/canceller for one exact canonical PR group.
-///
-/// This lock must be acquired inside the caller's transaction before either inserting a new
-/// producer generation or classifying/cancelling existing generations. Hash collisions can only
-/// serialize unrelated groups because all row authority remains exact `(tenant, region, group)`.
 pub(crate) async fn lock_pr_concurrency_group_on_conn(
     conn: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
     group: &str,
 ) -> Result<(), sqlx::Error> {
-    // @tenant-cross-scope: advisory locking reads no tenant rows. The framed key contains the
-    // already-validated exact tenant, region, and canonical PR concurrency group.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!(
             "{PR_RUN_SUPERSESSION_LOCK_DOMAIN}:{tenant}:{region}:{group}"
@@ -1486,15 +1215,12 @@ mod tests {
         }
     }
 
-    /// The INSERT binds all 19 columns + is idempotent on the `(tenant_id, run_id)` PK (the DB-free
-    /// shape assertions; the live round-trip + co-commit atomicity are the integration proofs).
     #[test]
     fn insert_query_is_idempotent_on_the_pk_and_binds_every_column() {
         assert!(
             INSERT_CI_RUN_QUERY.contains("ON CONFLICT (tenant_id, run_id) DO NOTHING"),
             "idempotent on the run-of-record PK"
         );
-        // 19 bind placeholders ($1..$19) for the 19 writer-set columns.
         for n in 1..=19 {
             assert!(INSERT_CI_RUN_QUERY.contains(&format!("${n}")), "binds ${n}");
         }
@@ -1502,9 +1228,7 @@ mod tests {
             !INSERT_CI_RUN_QUERY.contains("$20"),
             "no over-bind past $19"
         );
-        // The uuid columns are cast from text (the CT-004b proven posture).
         assert!(INSERT_CI_RUN_QUERY.contains("$3::uuid"));
-        // The row is constructable with every NOT-NULL column set + state = queued (the reserve state).
         let r = sample_row();
         assert_eq!(r.state, "queued");
         assert_eq!(r.trigger_kind, "push");
