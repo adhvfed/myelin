@@ -68,12 +68,27 @@ the real wiring, at one scale, where hardcoded placeholders stand today.
    wallet; the agent gate's `available` reads `wallet.available(tenant)` instead of a
    literal. Add the `surface` column.
 4. **Wire CI reserve/settle to the wallet**; fold `ci_cost_event` into the unified,
-   FORCE-RLS cost ledger. **Must also reconcile the reservation-ceiling scale:** slice 2
-   rescaled the Tier-P *price* to micro-dollars, but the durable reservation ceiling
-   `operational_reservation_amount` (`ci_launch_authority.rs`) is still raw resource-seconds.
-   Inert today (the CI reserve path has no live caller and nothing compares price to bound),
-   but wiring CI reserve/settle makes them meet — the ceiling must be rescaled/re-derived in
-   the same micro-dollar unit as the price, or reservations will be ~10,000× too small.
+   FORCE-RLS cost ledger.
+
+### Slice 2b (done out of order — a correctness fix to slice 2)
+The slice-2 adversarial review caught a latent bug: slice 2 rescaled the Tier-P *price* to
+micro-dollars but left the reservation ceiling (`operational_reservation_amount`, v1 + v2) in
+raw resource-seconds. The durable settle caps `billed` at `reserved`
+(`reserve_settle_durable.rs:629`), so `billed (≈reserved×10,000) > reserved` silently
+under-bills 10,000× — masked because the balance invariant still holds. Inert today (CI
+reserve path unwired, pre-cutover, nothing issued) but a live-on-activation regression, so
+fixed immediately rather than deferred, with the regression test that was missing.
+
+**Design fork (decided: Option A).** The reservation amount is hashed into the *batch* digest
+that forms the reservation handle (and flows transitively into the v3/v4 token-authority
+handle), so rescaling it changes handle bytes.
+- **Option A (chosen):** rescale the amount to micro-dollars everywhere; regenerate the
+  affected pinned golden vectors. One money scale everywhere (the unification's whole point);
+  safe because nothing is issued; not a crypto-logic change (hashing untouched, only the input
+  value scales).
+- **Option B (rejected):** keep hashing the raw amount (handles byte-frozen) but store a
+  separately-derived micro-USD ceiling. Rejected — it reintroduces the capacity-vs-money
+  duality the unification exists to remove, a future-confusion trap for slice-4 wiring.
 5. **Limits model** — the `wallet_limit` table + a reserve-time check.
 
 Ordering isolates risk: slice 1 is large but mechanically safe (pure rename, no scale
