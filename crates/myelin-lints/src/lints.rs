@@ -341,6 +341,63 @@ fn binds_identifier(statement: &str, ident: &str) -> bool {
     false
 }
 
+/// The inclusive 1-based line spans covered by each `with_tenant_tx(...)` call's argument list.
+///
+/// `with_tenant_tx(&pool, &tenant, &region, |conn| { … })` opens a transaction that SETs the
+/// transaction-scoped `myelin.tenant_id`/`myelin.region` GUCs the FORCE-RLS tenant tables enforce
+/// on. Every `sqlx::query(..)` in its closure is therefore tenant-bound (RLS-scoped) even when the
+/// binder token is not lexically on the query statement — the query runs against a connection whose
+/// row visibility is already pinned to one tenant. Statement-granularity scanning cannot see this:
+/// the `with_tenant_tx` opener terminates at its own `{` (a statement boundary), so it is a SEPARATE
+/// statement from the query nested inside it. Recognising the enclosing span closes that gap.
+///
+/// Spans are matched by BALANCED parentheses over the comment-stripped, string-blanked source, so a
+/// `(`/`)` in a string literal or comment cannot skew a span, and a query OUTSIDE every span — even
+/// when a `with_tenant_tx` call appears elsewhere in the file — is NOT covered (no cross-closure
+/// leak). This is a SHARPENING, not a weakening: it only admits queries the RLS convention already
+/// scopes; a genuinely unscoped query anywhere outside such a closure still fires.
+fn with_tenant_tx_regions(src: &str) -> Vec<(usize, usize)> {
+    const OPENER: &str = "with_tenant_tx(";
+    let lines: Vec<(usize, String)> = code_lines(src)
+        .into_iter()
+        .map(|(line, code)| (line, blank_string_literals(&code)))
+        .collect();
+    let mut regions = Vec::new();
+    let mut depth = 0usize;
+    let mut start_line = 0usize;
+    for (line, code) in &lines {
+        let bytes = code.as_bytes();
+        let mut index = 0usize;
+        while index < bytes.len() {
+            if depth == 0 {
+                // A whole-word `with_tenant_tx(` opener — not the tail of `my_with_tenant_tx(`.
+                let word_start = index == 0
+                    || !matches!(bytes[index - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
+                if word_start && bytes[index..].starts_with(OPENER.as_bytes()) {
+                    start_line = *line;
+                    index += OPENER.len();
+                    depth = 1; // the opener's own `(`
+                    continue;
+                }
+                index += 1;
+            } else {
+                match bytes[index] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            regions.push((start_line, *line));
+                        }
+                    }
+                    _ => {}
+                }
+                index += 1;
+            }
+        }
+    }
+    regions
+}
+
 fn scan_tenant_predicate(src: &str) -> Vec<Violation> {
     // The query-builder fingerprints that MUST be tenant-bound.
     const QUERY_SITES: &[&str] = &[
@@ -375,6 +432,10 @@ fn scan_tenant_predicate(src: &str) -> Vec<Violation> {
     // Scan at STATEMENT granularity so a tenant binder on a later line of the same fluent
     // query-builder chain (`sqlx::query(..)\n  .with_tenant(t)\n  .fetch_all(p);`) is seen.
     let statements = code_statements(src);
+    // The `with_tenant_tx(...)` closures whose body is RLS-tenant-scoped: a query nested inside one
+    // is tenant-bound even though the binder token sits on the SEPARATE opener statement, not the
+    // query's own (see [`with_tenant_tx_regions`]).
+    let tenant_tx_regions = with_tenant_tx_regions(src);
     for (index, (line, code)) in statements.iter().enumerate() {
         let (line, code) = (*line, code.as_str());
         let is_query = QUERY_SITES.iter().any(|s| code.contains(s));
@@ -390,7 +451,13 @@ fn scan_tenant_predicate(src: &str) -> Vec<Violation> {
         // tenant binder in either statement and still fires (see the unit tests).
         let is_tenant_bound = TENANT_BINDERS.iter().any(|b| code.contains(b))
             || hoisted_sql_statement(&statements, index, code, QUERY_SITES)
-                .is_some_and(|sql| TENANT_BINDERS.iter().any(|b| sql.contains(b)));
+                .is_some_and(|sql| TENANT_BINDERS.iter().any(|b| sql.contains(b)))
+            // The query is lexically nested inside a `with_tenant_tx(...)` RLS-scoped closure — its
+            // connection already has the tenant/region GUCs set, so the query IS tenant-bound even
+            // with no inline binder token. A query outside every such span is unaffected.
+            || tenant_tx_regions
+                .iter()
+                .any(|(start, end)| line >= *start && line <= *end);
         let idx = line.saturating_sub(1);
         let marker_here = raw_lines
             .get(idx)
@@ -2009,6 +2076,59 @@ mod tests {
         assert!(
             !tenant_predicate().run(red_shadowed).is_empty(),
             "a shadowed tenant-bound binding must not admit the later tenant-less one"
+        );
+    }
+
+    #[test]
+    fn tenant_predicate_admits_query_inside_with_tenant_tx_closure() {
+        // The RLS convention: `with_tenant_tx(&pool, &tenant, &region, |conn| { … })` opens a
+        // transaction that SETs the tenant/region GUCs the FORCE-RLS tenant tables enforce on. A
+        // query nested in its closure is tenant-bound even though the binder token lives on the
+        // SEPARATE opener statement and the SQL is a module `const`. This is the exact shape of
+        // `ci_secret_store.rs`. GREEN: it must NOT fire.
+        let green = r#"
+            bridge(runtime, async move {
+                with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                    Box::pin(async move {
+                        sqlx::query(CREATE_MANAGED_SECRET)
+                            .bind(&row_tenant)
+                            .bind(&row_region)
+                            .fetch_optional(&mut *connection)
+                            .await
+                    })
+                })
+                .await
+            })
+        "#;
+        assert!(
+            tenant_predicate().run(green).is_empty(),
+            "a query inside a with_tenant_tx RLS closure must be admitted"
+        );
+
+        // ANTI-WEAKENING guard 1: a bare tenant-less query with NO with_tenant_tx and no binder must
+        // STILL fire — recognising the closure must not blanket-pass every query.
+        let red_bare = r#"
+            let rows = sqlx::query("SELECT * FROM secret").fetch_all(&pool);
+        "#;
+        assert!(
+            !tenant_predicate().run(red_bare).is_empty(),
+            "a bare tenant-less query must still be rejected"
+        );
+
+        // ANTI-WEAKENING guard 2: a query OUTSIDE any with_tenant_tx closure must STILL fire even
+        // when a with_tenant_tx call appears elsewhere in the same file — no cross-closure leak.
+        let red_outside = r#"
+            with_tenant_tx(&pool, &tenant_id, &region, |connection| {
+                Box::pin(async move {
+                    sqlx::query(SCOPED_READ).fetch_all(&mut *connection).await
+                })
+            })
+            .await;
+            let leaked = sqlx::query("SELECT * FROM secret").fetch_all(&pool);
+        "#;
+        assert!(
+            !tenant_predicate().run(red_outside).is_empty(),
+            "a query outside the with_tenant_tx closure must still be rejected"
         );
     }
 

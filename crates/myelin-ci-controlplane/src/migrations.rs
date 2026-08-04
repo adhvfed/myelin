@@ -751,6 +751,12 @@ CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS ux_ci_secret_tenant_project_name
 /// make the database own the lifetime edge. The tenant-qualified FK uses `ci_secret`'s immutable
 /// primary key and cascades every matching binding, including rows whose non-key metadata was
 /// malformed before this constraint existed.
+///
+/// The contract step is the non-blocking form of `SET NOT NULL`: `ADD CONSTRAINT ... CHECK
+/// (secret_id IS NOT NULL) NOT VALID` takes only a brief `ACCESS EXCLUSIVE` lock (it does NOT scan
+/// existing rows), then a separate `VALIDATE CONSTRAINT` scans under a `SHARE UPDATE EXCLUSIVE` lock
+/// that does NOT block concurrent writes — the sanctioned expand→backfill→contract path, versus an
+/// in-place `ALTER COLUMN ... SET NOT NULL` which locks the whole table for a full scan.
 pub const ALTER_SECRET_BINDING_ADD_INTEGRITY_DDL: &str = "\
 ALTER TABLE secret_binding ADD COLUMN IF NOT EXISTS secret_id text;
 UPDATE secret_binding AS binding
@@ -761,7 +767,8 @@ UPDATE secret_binding AS binding
    AND binding.region = secret.region
    AND binding.value_ref = 'myelin://' || secret.tenant_id || '/ci/secret/' || secret.secret_id;
 DELETE FROM secret_binding WHERE secret_id IS NULL;
-ALTER TABLE secret_binding ALTER COLUMN secret_id SET NOT NULL;
+ALTER TABLE secret_binding ADD CONSTRAINT ck_secret_binding_secret_id_present CHECK (secret_id IS NOT NULL) NOT VALID;
+ALTER TABLE secret_binding VALIDATE CONSTRAINT ck_secret_binding_secret_id_present;
 ALTER TABLE secret_binding
   ADD CONSTRAINT fk_secret_binding_ci_secret
   FOREIGN KEY (tenant_id, secret_id)
