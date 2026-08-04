@@ -68,7 +68,12 @@ the real wiring, at one scale, where hardcoded placeholders stand today.
    wallet; the agent gate's `available` reads `wallet.available(tenant)` instead of a
    literal. Add the `surface` column.
 4. **Wire CI reserve/settle to the wallet**; fold `ci_cost_event` into the unified,
-   FORCE-RLS cost ledger.
+   FORCE-RLS cost ledger. **Also owes (from the slice-2b review):** (a) a v2 reservation
+   `reserved ≥ price` regression test — slice 2b added the v1 one; v2's multi-execution
+   aggregate pricing is manually-verified-safe but unguarded; (b) enforce the whole-GiB
+   per-execution memory precondition (documented at `operational_amount_from_ceiling`) or
+   `div_ceil` per execution before aggregating, so a future non-whole-GiB limit can't reopen a
+   small under-reserve.
 
 ### Slice 2b (done out of order — a correctness fix to slice 2)
 The slice-2 adversarial review caught a latent bug: slice 2 rescaled the Tier-P *price* to

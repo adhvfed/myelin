@@ -1701,6 +1701,14 @@ fn job_lifetime_ceiling(
 fn operational_amount_from_ceiling(
     ceiling: ResourceCeiling,
 ) -> Result<i64, CiLaunchAuthorityError> {
+    // UPPER-BOUND PRECONDITION: this `div_ceil` is applied ONCE to the aggregate (lifetime)
+    // mem-byte-seconds, while settlement may `div_ceil` per execution. The aggregate rounding is a
+    // valid upper bound on the per-execution sum ONLY while each per-execution memory ceiling is a
+    // whole-GiB multiple (true for all server-owned limits today: linux_small = 256MiB×600 = 150
+    // GiB-s exactly). If a future limit sets a non-whole-GiB `mem_bytes × timeout_secs`, aggregate
+    // `div_ceil` could dip below Σ per-execution `div_ceil` by up to (N−1) GiB-s, re-opening a small
+    // under-reserve. Slice 4 (CI reserve/settle wiring) must add a v2 reserved≥price regression test
+    // and either enforce whole-GiB ceilings or `div_ceil` per execution before aggregating.
     let memory_gib_seconds = ceiling.mem_byte_seconds.div_ceil(GIB_BYTES);
     let cpu_cost = u128::from(ceiling.cpu_seconds)
         .checked_mul(u128::from(MICRO_USD_PER_CPU_SECOND))
