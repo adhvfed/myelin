@@ -623,6 +623,49 @@ pub struct RunSubstrate<'a> {
     pub now_secs: i64,
 }
 
+/// **RAII teardown guard — the UNCONDITIONAL token revoke, fired EXACTLY ONCE on every run-exit.**
+///
+/// Constructed the instant the per-run token is minted (before dispatch); its [`Drop`] runs the
+/// teardown — revoke the token by `jti` (idempotent even on crash, belt-and-suspenders with the
+/// auto-expiring TTL) and record the revocation lag — exactly once on EVERY way out of
+/// [`SkeletonAgent::handle_run`]: a refused dispatch, each fail-closed metering exit, each mid-loop
+/// validation/executor error, max-turns exhaustion, a mid-flight KILL, and the normal completion.
+/// This collapses the thirteen hand-copied `teardown(...)` call sites to a single drop path: the
+/// "teardown fires on every exit, never zero, never twice" security invariant is now guaranteed by
+/// the type system, not by eyeballing that thirteen copies stay in agreement.
+///
+/// The guard is dropped BEFORE the `token` local (it is declared after `token`, so reverse-order
+/// drop retires the guard first) — so its `&RunTokenHandle` is always live when the revoke reads the
+/// `jti`, and the token's own zeroizing `Drop` runs only afterwards. The observable teardown (the
+/// revoke on the seam + the lag into telemetry) is independent of every other scope-exit drop
+/// (`WfCtx` and `InFlightRun` are drop-inert), so firing it at scope exit is behaviourally identical
+/// to the former explicit `teardown(...)` call at each site.
+struct RunTeardown<'a> {
+    /// The revoke seam (the idempotent-even-on-crash denylist write).
+    revoker: &'a dyn RunTokenRevoker,
+    /// The per-run token — borrowed (not owned) for its `jti` at teardown; the caller's token
+    /// outlives the guard, and its own `Drop` zeroizes the bearer material after the guard retires.
+    token: &'a RunTokenHandle,
+    /// The engine's revocation clock (the run's `now_secs`).
+    now_secs: i64,
+    /// The run's teardown instant (life-end) — the revoke must land within the bound measured from
+    /// here (the revocation-lag signal).
+    teardown_at: i64,
+    /// The run telemetry the revocation lag is recorded into — exactly once, on drop.
+    telemetry: &'a mut SkeletonTelemetry,
+}
+
+impl Drop for RunTeardown<'_> {
+    fn drop(&mut self) {
+        // The EXACT former `teardown` body, run ONCE on scope exit: revoke the per-run token
+        // idempotently and record the lag. A re-revoke (this + a crash sweep) is a no-op (lag 0).
+        let lag = self
+            .revoker
+            .revoke(&self.token.jti, self.now_secs, self.teardown_at);
+        self.telemetry.record_revoke(lag);
+    }
+}
+
 /// **The platform-owned `Agent::handle` SKELETON loop body (the durable-workflow driver).**
 ///
 /// This is the ONE platform-owned loop — identical for mock and real (the brain is the only
@@ -703,25 +746,37 @@ impl SkeletonAgent {
         // The teardown instant is the run's life-end; the revoke must land within the bound from here.
         let teardown_at = sub.now_secs;
 
-        // (2) RESERVE-at-dispatch. No balance → no run. On refusal the run is NEVER started —
-        //     but the just-minted token is STILL torn down (the teardown is unconditional). The gate
-        //     is correct-by-construction: a run cannot dispatch without going through reserve.
-        let storage_run = StorageRunId::new(sub.run_id.clone());
-        let in_flight = match sub.gate.dispatch(
-            sub.ledger,
-            sub.tenant.clone(),
-            storage_run.clone(),
-            sub.estimate,
-            sub.available,
-        ) {
-            Ok(h) => h,
-            Err(e) => {
-                // Refused: tear down the (un-dispatched) token, then surface the refusal LOUD.
-                self.teardown(sub, &token, teardown_at, telemetry);
-                return Err(e.into());
-            }
+        // ARM THE UNCONDITIONAL TEARDOWN. From here on the token exists, so its revoke MUST fire on
+        // every exit — the RAII guard makes that automatic: it drops (revoking exactly once) on the
+        // refused dispatch below, each fail-closed metering exit, each mid-loop error, the mid-flight
+        // KILL, and the normal completion. `telemetry` is MOVED into the guard; every later telemetry
+        // write goes through `teardown_guard.telemetry`. (The mint-failure path above returns BEFORE
+        // the guard exists — correct: there is no token to revoke yet.)
+        let teardown_guard = RunTeardown {
+            revoker: sub.revoker,
+            token: &token,
+            now_secs: sub.now_secs,
+            teardown_at,
+            telemetry,
         };
-        telemetry.record_reserve(in_flight.reserved().0);
+
+        // (2) RESERVE-at-dispatch. No balance → no run. On refusal the run is NEVER started —
+        //     but the just-minted token is STILL torn down (the guard revokes on the early return
+        //     below). The gate is correct-by-construction: a run cannot dispatch without reserve.
+        let storage_run = StorageRunId::new(sub.run_id.clone());
+        // On refusal `?` surfaces the refusal LOUD — and the guard tears down the (un-dispatched)
+        // token on the early return (the teardown is unconditional from the mint onward).
+        let in_flight = sub
+            .gate
+            .dispatch(
+                sub.ledger,
+                sub.tenant.clone(),
+                storage_run.clone(),
+                sub.estimate,
+                sub.available,
+            )
+            .map_err(SkeletonError::from)?;
+        teardown_guard.telemetry.record_reserve(in_flight.reserved().0);
 
         // The child environment a tool would inherit — minted from the per-run token ONLY
         // (anti-leak). Built here so it exists the moment the run is in-flight (a tool could spawn at
@@ -781,8 +836,8 @@ impl SkeletonAgent {
             // A run with `wallet: None` skips this entirely — its behaviour is byte-identical.
             if let Some(wallet) = sub.wallet {
                 if wallet.balance(&sub.tenant) <= WALLET_MIN_BALANCE_FLOOR {
-                    drop(ctx);
-                    self.teardown(sub, &token, teardown_at, telemetry);
+                    // Halt GRACEFULLY: the guard revokes on the way out; `ctx` drops un-committed
+                    // (0 ghost trace), the reservation is left in-flight — exactly as max-turns.
                     return Err(SkeletonError::WalletSpendCapReached {
                         run_id: sub.run_id.clone(),
                         stage: SpendCapStage::PreStepGate,
@@ -795,78 +850,23 @@ impl SkeletonAgent {
             // pricing, no reserve/settle touch). The SKELETON/Mock report NotReported, so their token
             // totals stay 0 and the balanced-ledger assertions are unchanged.
             let MeteredStep { outcome, usage } = runtime.step_metered(&conv);
-            telemetry.record_token_usage(&usage);
+            teardown_guard.telemetry.record_token_usage(&usage);
 
             // ── v1 METERING (per-turn WALLET DEBIT) — only when a wallet is threaded. ──
-            // Price THIS turn's real token usage into micro-dollars and DEBIT THE AGENT WALLET,
-            // run-linked (ONE debit per turn — no double-charge). The debit stands even if the run
-            // later fails (the tokens were consumed — correct billing). This is a real-billing layer
-            // LAYERED ON the untouched nominal reserve/settle gate; a `wallet: None` run skips it and
-            // stays byte-identical. Three fail-closed exits (each abandons the co-commit + tears down
-            // exactly as the max-turns path): usage NotReported, a spend-cap refusal, an arithmetic
-            // overflow. The wallet guarantees no negative balance + no partial debit — we RELY on it.
+            // `meter_turn` prices THIS turn's usage and debits the agent wallet run-linked (ONE debit
+            // per turn). A `wallet: None` run skips it entirely and stays byte-identical. Its three
+            // fail-closed exits (usage NotReported, an arithmetic overflow, a spend-cap refusal) come
+            // back as `Err` and return HERE — the guard revokes on the way out, `ctx` drops
+            // un-committed (0 ghost trace), exactly as the max-turns path. The wallet guarantees no
+            // negative balance + no partial debit — `meter_turn` relies on it.
             if let Some(wallet) = sub.wallet {
-                match &usage {
-                    // Fail-closed: a paid call the provider did not meter cannot be priced — abort
-                    // LOUD rather than fabricate or skip a charge (billing never guesses).
-                    TokenUsage::NotReported => {
-                        drop(ctx);
-                        self.teardown(sub, &token, teardown_at, telemetry);
-                        return Err(SkeletonError::MeteringUsageNotReported {
-                            run_id: sub.run_id.clone(),
-                        });
-                    }
-                    reported => {
-                        // Price the turn (checked; an overflow is LOUD, never a wrap).
-                        let priced = match price(reported, &LUNA_RATES) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                drop(ctx);
-                                self.teardown(sub, &token, teardown_at, telemetry);
-                                return Err(SkeletonError::MeteringOverflow {
-                                    run_id: sub.run_id.clone(),
-                                    reason: e.to_string(),
-                                });
-                            }
-                        };
-                        let charge = match priced.total() {
-                            Some(c) => c,
-                            None => {
-                                drop(ctx);
-                                self.teardown(sub, &token, teardown_at, telemetry);
-                                return Err(SkeletonError::MeteringOverflow {
-                                    run_id: sub.run_id.clone(),
-                                    reason: "priced wholesale + markup overflowed u64".into(),
-                                });
-                            }
-                        };
-                        // DEBIT the wallet for exactly this turn's charge, run_id-linked.
-                        match wallet.debit(&sub.tenant, charge, &sub.run_id) {
-                            Ok(_new_balance) => telemetry.record_charge(charge),
-                            // The SPEND CAP tripped MID-RUN — this turn's tokens outran the remaining
-                            // balance. Terminate GRACEFULLY; the wallet wrote NOTHING (no negative
-                            // balance), so the overspend is bounded to this one consumed turn.
-                            Err(WalletError::InsufficientBalance { .. }) => {
-                                drop(ctx);
-                                self.teardown(sub, &token, teardown_at, telemetry);
-                                return Err(SkeletonError::WalletSpendCapReached {
-                                    run_id: sub.run_id.clone(),
-                                    stage: SpendCapStage::PostDebit,
-                                });
-                            }
-                            // AmountTooLarge / BalanceOverflow — a loud refusal on a financial op,
-                            // never a silent proceed.
-                            Err(other) => {
-                                drop(ctx);
-                                self.teardown(sub, &token, teardown_at, telemetry);
-                                return Err(SkeletonError::MeteringOverflow {
-                                    run_id: sub.run_id.clone(),
-                                    reason: other.to_string(),
-                                });
-                            }
-                        }
-                    }
-                }
+                self.meter_turn(
+                    wallet,
+                    &sub.tenant,
+                    &usage,
+                    &sub.run_id,
+                    teardown_guard.telemetry,
+                )?;
             }
 
             match outcome {
@@ -888,8 +888,8 @@ impl SkeletonAgent {
                         // that don't satisfy the tool's schema, ABORT the run — the untrusted args are
                         // NEVER handed to a tool. The teardown still fires (unconditional).
                         if let Err(reason) = validate_call(sub.catalogue, call) {
-                            drop(ctx); // abandon the co-commit — 0 ghost trace, 0 lost emit.
-                            self.teardown(sub, &token, teardown_at, telemetry);
+                            // Abort the run — the guard revokes on the way out; `ctx` drops
+                            // un-committed (0 ghost trace, 0 lost emit).
                             return Err(SkeletonError::ToolValidationRejected(reason));
                         }
                         // Validated ⇒ the tool resolves; hand its ToolDef + the call to the executor.
@@ -898,12 +898,10 @@ impl SkeletonAgent {
                         let def = match sub.catalogue.resolve(&call.name) {
                             Some(def) => def,
                             None => {
-                                drop(ctx);
-                                self.teardown(sub, &token, teardown_at, telemetry);
                                 return Err(SkeletonError::ToolValidationRejected(format!(
                                     "tool `{}` vanished from the catalogue after validation",
                                     call.name.0
-                                )));
+                                )))
                             }
                         };
                         match sub.executor.execute(def, call) {
@@ -911,11 +909,7 @@ impl SkeletonAgent {
                                 call_id: call.id.clone(),
                                 result,
                             }),
-                            Err(e) => {
-                                drop(ctx);
-                                self.teardown(sub, &token, teardown_at, telemetry);
-                                return Err(SkeletonError::ToolExecFailed(e.to_string()));
-                            }
+                            Err(e) => return Err(SkeletonError::ToolExecFailed(e.to_string())),
                         }
                     }
                     // Append the routed tool results so the next step sees each keyed to its call id,
@@ -932,8 +926,8 @@ impl SkeletonAgent {
         let submission = match submission {
             Some(s) => s,
             None => {
-                drop(ctx);
-                self.teardown(sub, &token, teardown_at, telemetry);
+                // The guard revokes on the way out; `ctx` drops un-committed (0 ghost trace); the
+                // reservation is left in-flight (the never-interrupt invariant).
                 return Err(SkeletonError::MaxTurnsExhausted {
                     run_id: sub.run_id.clone(),
                     turns: DEFAULT_MAX_TURNS,
@@ -948,9 +942,10 @@ impl SkeletonAgent {
         // in-flight; the only exit is settle — but a killed SKELETON leaves it reserved-not-settled,
         // which is the never-interrupt invariant working: the gate has no tear-down-in-flight API).
         if kill == RunOutcomeKind::KilledMidFlight {
-            drop(ctx); // the co-commit transaction is abandoned — 0 ghost trace, 0 lost emit.
-            self.teardown(sub, &token, teardown_at, telemetry);
-            telemetry.runs_killed = telemetry.runs_killed.saturating_add(1);
+            // `ctx` drops un-committed (0 ghost trace, 0 lost emit) and the guard revokes the token
+            // on the way out (the no-tool kill leg). The reservation is NEVER interrupted.
+            teardown_guard.telemetry.runs_killed =
+                teardown_guard.telemetry.runs_killed.saturating_add(1);
             return Ok(RunOutcome(format!(
                 "killed-mid-flight: run={} token-revoked (no trace, reservation left in-flight)",
                 sub.run_id
@@ -989,7 +984,7 @@ impl SkeletonAgent {
         // CO-COMMIT: the trace journal row + the terminal emit become durable TOGETHER (or neither).
         ctx.commit()
             .map_err(|e| SkeletonError::CoCommit(format!("{e:?}")))?;
-        telemetry.record_trace();
+        teardown_guard.telemetry.record_trace();
 
         // (6) SETTLE the reservation. A SKELETON bills ZERO units (no model call) — it settles
         //     with an EMPTY unit slice, so billed == 0 and the WHOLE reservation is refunded. The
@@ -999,13 +994,13 @@ impl SkeletonAgent {
             .expect("a freshly-reserved in-flight run always settles (it was reserved this run)");
         // settled == billed_total + refunded == the reservation (the balanced-ledger gate).
         let settled_total = settle.billed_total.0.saturating_add(settle.refunded.0);
-        telemetry.record_settle(settled_total);
+        teardown_guard.telemetry.record_settle(settled_total);
 
-        // (7) TEARDOWN: revoke the per-run token idempotently (even on crash), belt-and-suspenders
-        //     with the auto-expiring TTL. The teardown is unconditional — it fires on the
-        //     completed path here exactly as it fired on the killed/errored paths above.
-        self.teardown(sub, &token, teardown_at, telemetry);
-        telemetry.runs_completed = telemetry.runs_completed.saturating_add(1);
+        // (7) TEARDOWN is UNCONDITIONAL: the `teardown_guard` revokes the per-run token idempotently
+        //     (belt-and-suspenders with the auto-expiring TTL) when it drops at the end of this
+        //     scope — the completed path fires it exactly as the killed/errored paths above.
+        teardown_guard.telemetry.runs_completed =
+            teardown_guard.telemetry.runs_completed.saturating_add(1);
 
         let _ = submission; // the SKELETON's submission is content-free; the trace is the artifact.
         Ok(RunOutcome(format!(
@@ -1017,19 +1012,69 @@ impl SkeletonAgent {
         )))
     }
 
-    /// **The teardown: revoke the per-run token idempotently.** Unconditional — fires on
-    /// every run-exit path (completed / killed / errored). Records the revocation lag into the
-    /// telemetry (the within-bound signal). Idempotent even on crash: a double-teardown (the
-    /// explicit revoke + a crash sweep) is a no-op success (lag 0 on the re-revoke).
-    fn teardown(
+    /// **Meter ONE turn: price the reported token usage and DEBIT the agent wallet (fail-closed).**
+    ///
+    /// The per-turn v1-metering machine — pre-priced → checked total → run-linked debit — lifted out
+    /// of the driving loop so the loop body reads as "advance a turn" rather than forcing a reader to
+    /// hold the whole pricing/debit/overflow machine in their head to follow how a turn advances.
+    /// Called only for a metered run (a `wallet: None` run never reaches here and stays
+    /// byte-identical).
+    ///
+    /// `Ok(())` = the turn was charged (the debit landed and the charge was recorded). `Err(_)` = one
+    /// of the three fail-closed exits the loop returns VERBATIM (with the RAII teardown guard firing
+    /// the revoke on the way out): the provider did not meter the turn ([`SkeletonError::
+    /// MeteringUsageNotReported`]); the priced charge overflowed `u64` or the wallet refused the op
+    /// for a non-balance reason ([`SkeletonError::MeteringOverflow`]); or the spend cap tripped
+    /// mid-run — this turn outran the remaining balance, and the wallet (no negative balance, no
+    /// partial debit — we RELY on it) wrote NOTHING ([`SkeletonError::WalletSpendCapReached`] with
+    /// [`SpendCapStage::PostDebit`]).
+    fn meter_turn(
         &self,
-        sub: &RunSubstrate<'_>,
-        token: &RunTokenHandle,
-        teardown_at: i64,
+        wallet: &dyn RunWallet,
+        tenant: &TenantId,
+        usage: &TokenUsage,
+        run_id: &str,
         telemetry: &mut SkeletonTelemetry,
-    ) {
-        let lag = sub.revoker.revoke(&token.jti, sub.now_secs, teardown_at);
-        telemetry.record_revoke(lag);
+    ) -> Result<(), SkeletonError> {
+        // Fail-closed: a paid call the provider did not meter cannot be priced — abort LOUD rather
+        // than fabricate or skip a charge (billing never guesses).
+        let reported = match usage {
+            TokenUsage::NotReported => {
+                return Err(SkeletonError::MeteringUsageNotReported {
+                    run_id: run_id.to_string(),
+                })
+            }
+            reported => reported,
+        };
+        // Price the turn (checked; an overflow is LOUD, never a wrap).
+        let priced = price(reported, &LUNA_RATES).map_err(|e| SkeletonError::MeteringOverflow {
+            run_id: run_id.to_string(),
+            reason: e.to_string(),
+        })?;
+        let charge = priced.total().ok_or_else(|| SkeletonError::MeteringOverflow {
+            run_id: run_id.to_string(),
+            reason: "priced wholesale + markup overflowed u64".into(),
+        })?;
+        // DEBIT the wallet for exactly this turn's charge, run_id-linked (ONE debit per turn).
+        match wallet.debit(tenant, charge, run_id) {
+            Ok(_new_balance) => {
+                telemetry.record_charge(charge);
+                Ok(())
+            }
+            // The SPEND CAP tripped MID-RUN — this turn's tokens outran the remaining balance.
+            // Terminate GRACEFULLY; the wallet wrote NOTHING (no negative balance), so the overspend
+            // is bounded to this one consumed turn.
+            Err(WalletError::InsufficientBalance { .. }) => Err(SkeletonError::WalletSpendCapReached {
+                run_id: run_id.to_string(),
+                stage: SpendCapStage::PostDebit,
+            }),
+            // AmountTooLarge / BalanceOverflow — a loud refusal on a financial op, never a silent
+            // proceed.
+            Err(other) => Err(SkeletonError::MeteringOverflow {
+                run_id: run_id.to_string(),
+                reason: other.to_string(),
+            }),
+        }
     }
 }
 
@@ -2305,5 +2350,98 @@ mod tests {
         assert!(ov.contains("overflow") && ov.contains("boom"), "renders the overflow: {ov}");
         assert_ne!(cap, nr);
         assert_ne!(nr, ov);
+    }
+
+    /// **The RAII teardown guard fires the revoke EXACTLY ONCE on every exit — never zero, never
+    /// twice.** The regression guard the thirteen-copy `teardown(...)` dance never had: it drives
+    /// three DIFFERENT exit paths — a normal completion, a mid-flight KILL, and an insufficient-
+    /// balance (`PostDebit`) fail-closed abort — each from a FRESH zeroed telemetry, and asserts the
+    /// revocation was recorded exactly once (`tokens_revoked() == 1`, so `0`→`1`: never skipped,
+    /// never double-fired) with the lag within the TTL bound. If a future edit drops the guard twice,
+    /// forgets a path, or reorders it away, one of these trips.
+    #[test]
+    fn teardown_guard_revokes_exactly_once_on_every_exit() {
+        let agent_loop = SkeletonAgent::new();
+        let w: i64 = 300;
+        let now: i64 = 1_000;
+
+        // Helper: run once against a fresh gate/ledger/outbox/telemetry and return the telemetry.
+        let run = |run_id: &str,
+                   runtime: &dyn MeteredRuntime,
+                   kill: RunOutcomeKind,
+                   wallet: Option<&dyn RunWallet>|
+         -> SkeletonTelemetry {
+            let revoker = FakeRevoker {
+                ttl_w: w,
+                minted_at: now,
+                ..Default::default()
+            };
+            let mut gate = AgentRunGate::new();
+            let mut ledger = CostLedger::new();
+            let outbox = myelin_events::OutboxStore::new();
+            let mut tele = SkeletonTelemetry::new();
+            let cat = MockToolSurface::with([tool_def("search"), tool_def("read")]);
+            let exec = MockToolExecutor::new();
+            let mut sub = substrate(
+                run_id, &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, now,
+            );
+            sub.wallet = wallet;
+            let _ = agent_loop.handle_run(runtime, &mut sub, &mut tele, kill);
+            tele
+        };
+
+        // (1) NORMAL COMPLETION — the SKELETON submits on turn 0, chains to trace/settle, teardown.
+        let done = run(
+            "Ronce-done",
+            &SkeletonAgentRuntime::new(),
+            RunOutcomeKind::Completed,
+            None,
+        );
+        assert_eq!(done.runs_completed(), 1, "the run completed");
+        assert_eq!(
+            done.tokens_revoked(),
+            1,
+            "completion: revoked EXACTLY once (never zero, never twice)"
+        );
+        assert!(done.max_revocation_lag() <= w as u64, "lag within bound W");
+
+        // (2) MID-FLIGHT KILL — killed after dispatch, before submit; the token is STILL revoked.
+        let killed = run(
+            "Ronce-kill",
+            &SkeletonAgentRuntime::new(),
+            RunOutcomeKind::KilledMidFlight,
+            None,
+        );
+        assert_eq!(killed.runs_killed(), 1, "the run was killed mid-flight");
+        assert_eq!(
+            killed.tokens_revoked(),
+            1,
+            "kill path: revoked EXACTLY once (never zero, never twice)"
+        );
+        assert!(killed.max_revocation_lag() <= w as u64, "lag within bound W");
+
+        // (3) INSUFFICIENT-BALANCE ABORT — the wallet funds two turns, the third debit is refused
+        //     (PostDebit); the run halts fail-closed and the token is STILL revoked exactly once.
+        let brain = MeteredScriptBrain::new(TEST_USAGE);
+        // Funds two turns (2×459=918) with 82 left over: turn 2 passes the pre-step gate (82 > 0)
+        // but its debit is REFUSED (82 < 459) → the PostDebit fail-closed abort.
+        let wallet = FakeWallet::new(1_000);
+        let capped = run(
+            "Ronce-cap",
+            &brain,
+            RunOutcomeKind::Completed,
+            Some(&wallet),
+        );
+        assert_eq!(
+            capped.runs_completed(),
+            0,
+            "the capped run did NOT complete (fail-closed abort)"
+        );
+        assert_eq!(
+            capped.tokens_revoked(),
+            1,
+            "insufficient-balance abort: revoked EXACTLY once (never zero, never twice)"
+        );
+        assert!(capped.max_revocation_lag() <= w as u64, "lag within bound W");
     }
 }
