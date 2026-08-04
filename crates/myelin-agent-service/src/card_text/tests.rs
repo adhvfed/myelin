@@ -151,15 +151,17 @@ fn risk_summary_resolves_through_humanise_for_an_authorised_viewer() {
     let r = SyntheticResolver::new();
     r.allow("lead", &confidential_pr());
     let out = humanise_risk_summary(
-        &r,
-        &tenant(),
-        &region(),
-        &store(),
+        &RenderCtx {
+            resolver: &r,
+            tenant: &tenant(),
+            region: &region(),
+            templates: &store(),
+            viewer: &viewer("lead"),
+            locale: "en",
+            at: &at(),
+            channel: Channel::Cli,
+        },
         &risk(),
-        &viewer("lead"),
-        "en",
-        &at(),
-        Channel::Cli,
     )
     .expect("a stable template key humanises");
     // the authorised viewer sees the title bound into the agent.hitl.merge_pr body.
@@ -184,15 +186,17 @@ fn agent_message_resolves_through_humanise() {
     r.allow("lead", &confidential_pr());
     let msg = AgentMessage::about("agent.msg.proposed_effect", &confidential_pr());
     let out = humanise_agent_message(
-        &r,
-        &tenant(),
-        &region(),
-        &store(),
+        &RenderCtx {
+            resolver: &r,
+            tenant: &tenant(),
+            region: &region(),
+            templates: &store(),
+            viewer: &viewer("lead"),
+            locale: "en",
+            at: &at(),
+            channel: Channel::Cli,
+        },
         &msg,
-        &viewer("lead"),
-        "en",
-        &at(),
-        Channel::Cli,
     )
     .expect("a stable template key humanises");
     assert!(
@@ -217,27 +221,31 @@ fn same_card_renders_differently_for_two_viewers() {
     let c = card();
 
     let lead_card = humanise_card(
-        &r,
-        &tenant(),
-        &region(),
-        &store(),
+        &RenderCtx {
+            resolver: &r,
+            tenant: &tenant(),
+            region: &region(),
+            templates: &store(),
+            viewer: &viewer("lead"),
+            locale: "en",
+            at: &at(),
+            channel: Channel::Cli,
+        },
         &c,
-        &viewer("lead"),
-        "en",
-        &at(),
-        Channel::Cli,
     )
     .unwrap();
     let bystander_card = humanise_card(
-        &r,
-        &tenant(),
-        &region(),
-        &store(),
+        &RenderCtx {
+            resolver: &r,
+            tenant: &tenant(),
+            region: &region(),
+            templates: &store(),
+            viewer: &viewer("bystander"),
+            locale: "en",
+            at: &at(),
+            channel: Channel::Cli,
+        },
         &c,
-        &viewer("bystander"),
-        "en",
-        &at(),
-        Channel::Cli,
     )
     .unwrap();
 
@@ -282,15 +290,17 @@ fn erased_subject_humanises_to_erased_user() {
     r.allow("lead", &confidential_pr());
     r.mark_erased(&confidential_pr()); // erased takes precedence over the allow.
     let out = humanise_risk_summary(
-        &r,
-        &tenant(),
-        &region(),
-        &store(),
+        &RenderCtx {
+            resolver: &r,
+            tenant: &tenant(),
+            region: &region(),
+            templates: &store(),
+            viewer: &viewer("lead"),
+            locale: "en",
+            at: &at(),
+            channel: Channel::Cli,
+        },
         &risk(),
-        &viewer("lead"),
-        "en",
-        &at(),
-        Channel::Cli,
     )
     .unwrap();
     assert!(
@@ -377,15 +387,17 @@ fn the_render_path_refuses_a_raw_key() {
         args: vec![("object".into(), confidential_pr())],
     };
     let res = humanise_risk_summary(
-        &r,
-        &tenant(),
-        &region(),
-        &store(),
+        &RenderCtx {
+            resolver: &r,
+            tenant: &tenant(),
+            region: &region(),
+            templates: &store(),
+            viewer: &viewer("lead"),
+            locale: "en",
+            at: &at(),
+            channel: Channel::Cli,
+        },
         &raw_risk,
-        &viewer("lead"),
-        "en",
-        &at(),
-        Channel::Cli,
     );
     assert!(
         res.is_err(),
@@ -398,15 +410,17 @@ fn the_render_path_refuses_a_raw_key() {
     };
     assert!(
         humanise_agent_message(
-            &r,
-            &tenant(),
-            &region(),
-            &store(),
+            &RenderCtx {
+                resolver: &r,
+                tenant: &tenant(),
+                region: &region(),
+                templates: &store(),
+                viewer: &viewer("lead"),
+                locale: "en",
+                at: &at(),
+                channel: Channel::Cli,
+            },
             &raw_msg,
-            &viewer("lead"),
-            "en",
-            &at(),
-            Channel::Cli,
         )
         .is_err(),
         "a raw-string agent message is refused at the render boundary"
@@ -425,15 +439,17 @@ fn the_tombstone_holds_across_every_channel() {
     let r = SyntheticResolver::new(); // bystander is denied on every channel.
     for channel in [Channel::Cli, Channel::Email, Channel::Markdown] {
         let out = humanise_risk_summary(
-            &r,
-            &tenant(),
-            &region(),
-            &store(),
+            &RenderCtx {
+                resolver: &r,
+                tenant: &tenant(),
+                region: &region(),
+                templates: &store(),
+                viewer: &viewer("bystander"),
+                locale: "en",
+                at: &at(),
+                channel,
+            },
             &risk(),
-            &viewer("bystander"),
-            "en",
-            &at(),
-            channel,
         )
         .unwrap();
         assert!(

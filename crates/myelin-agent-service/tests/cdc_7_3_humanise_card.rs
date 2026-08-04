@@ -19,6 +19,7 @@ use myelin_agent::{GateId, ToolName};
 use myelin_agent_service::{assert_no_raw_agent_surface, humanise_agent_message};
 use myelin_agent_service::{
     humanise_card, humanise_risk_summary, register_agent_templates, surface_card, AgentMessage,
+    RenderCtx,
     EffectCost, HitlGate, PlannedEffect, RiskSummary,
 };
 use myelin_identity::{
@@ -142,27 +143,31 @@ fn cdc_card_renders_per_viewer_through_humanise() {
     let card = a_card();
 
     let lead = humanise_card(
-        &prov,
-        &tenant(),
-        &region(),
-        &store(),
+        &RenderCtx {
+            resolver: &prov,
+            tenant: &tenant(),
+            region: &region(),
+            templates: &store(),
+            viewer: &viewer("lead"),
+            locale: "en",
+            at: &at(),
+            channel: Channel::Cli,
+        },
         &card,
-        &viewer("lead"),
-        "en",
-        &at(),
-        Channel::Cli,
     )
     .expect("a stable key renders");
     let other = humanise_card(
-        &prov,
-        &tenant(),
-        &region(),
-        &store(),
+        &RenderCtx {
+            resolver: &prov,
+            tenant: &tenant(),
+            region: &region(),
+            templates: &store(),
+            viewer: &viewer("bystander"),
+            locale: "en",
+            at: &at(),
+            channel: Channel::Cli,
+        },
         &card,
-        &viewer("bystander"),
-        "en",
-        &at(),
-        Channel::Cli,
     )
     .expect("a stable key renders");
 
@@ -196,15 +201,17 @@ fn cdc_agent_message_renders_through_humanise() {
     prov.allow("lead", &pr());
     let msg = AgentMessage::about("agent.msg.completed", &pr());
     let out = humanise_agent_message(
-        &prov,
-        &tenant(),
-        &region(),
-        &store(),
+        &RenderCtx {
+            resolver: &prov,
+            tenant: &tenant(),
+            region: &region(),
+            templates: &store(),
+            viewer: &viewer("lead"),
+            locale: "en",
+            at: &at(),
+            channel: Channel::Cli,
+        },
         &msg,
-        &viewer("lead"),
-        "en",
-        &at(),
-        Channel::Cli,
     )
     .unwrap();
     assert!(
@@ -235,15 +242,17 @@ fn cdc_no_raw_agent_string_reaches_humanise() {
     };
     assert!(
         humanise_risk_summary(
-            &prov,
-            &tenant(),
-            &region(),
-            &store(),
+            &RenderCtx {
+                resolver: &prov,
+                tenant: &tenant(),
+                region: &region(),
+                templates: &store(),
+                viewer: &viewer("lead"),
+                locale: "en",
+                at: &at(),
+                channel: Channel::Cli,
+            },
             &raw,
-            &viewer("lead"),
-            "en",
-            &at(),
-            Channel::Cli,
         )
         .is_err(),
         "the render boundary refuses a raw-string key (0 raw-string surfaces)"

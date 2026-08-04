@@ -437,7 +437,7 @@ pub use hitl::{
 // engine, no frontend string map. NO FLOOR — humanise is the sole templating surface.
 pub use card_text::{
     assert_no_raw_agent_surface, humanise_agent_message, humanise_card, humanise_risk_summary,
-    register_agent_templates, AgentMessage, RawAgentString, RenderedCard,
+    register_agent_templates, AgentMessage, RawAgentString, RenderCtx, RenderedCard,
     AGENT_PLATFORM_DEFAULT_TEMPLATES,
 };
 

@@ -247,93 +247,66 @@ pub fn register_agent_templates(store: &mut TemplateStore) {
 ///
 /// Refuses ([`RawAgentString`]) a key that is not a stable taxonomy token (the 0-raw-string gate runs
 /// on EVERY render — an agent cannot smuggle a raw string in as a "key").
-#[allow(clippy::too_many_arguments)]
+/// The per-viewer render context every `humanise_*` call threads: the Refs chokepoint, the
+/// `(tenant, region)` scope, the template store, and the viewer/locale/consistency/channel the text
+/// is projected for. Reifying it is what lets the render entry points read as
+/// `(context, what-to-render)` instead of eight positional args — and lets a caller build the
+/// context once and render many cards through it.
+#[derive(Clone, Copy)]
+pub struct RenderCtx<'a> {
+    /// The Refs resolution chokepoint — a denied/erased subject becomes a tombstone, never a title.
+    pub resolver: &'a dyn RefResolvePort,
+    pub tenant: &'a TenantId,
+    pub region: &'a Region,
+    pub templates: &'a TemplateStore,
+    /// The person the text is rendered for; their permissions decide title-vs-tombstone per viewer.
+    pub viewer: &'a Principal,
+    pub locale: &'a str,
+    pub at: &'a Consistency,
+    pub channel: Channel,
+}
+
 fn humanise_with_args(
-    resolver: &dyn RefResolvePort,
-    tenant: &TenantId,
-    region: &Region,
-    templates: &TemplateStore,
+    ctx: &RenderCtx<'_>,
     template_key: &str,
     args: &[(String, ArtifactRef)],
-    viewer: &Principal,
-    locale: &str,
-    at: &Consistency,
-    channel: Channel,
 ) -> Result<HumanisedString, RawAgentString> {
     // The 0-raw-string-surfaces gate runs on every render (no raw key reaches humanise).
     assert_no_raw_agent_surface(template_key)?;
     // Flatten `(name, ref)` to the ordered ref slots humanise binds to `{0}`, `{1}`, … per-viewer.
     let ref_args: Vec<ArtifactRef> = args.iter().map(|(_, r)| r.clone()).collect();
     Ok(humanise(
-        resolver,
-        tenant,
-        region,
-        templates,
+        ctx.resolver,
+        ctx.tenant,
+        ctx.region,
+        ctx.templates,
         template_key,
         &ref_args,
-        viewer,
-        locale,
-        at,
-        channel,
+        ctx.viewer,
+        ctx.locale,
+        ctx.at,
+        ctx.channel,
     ))
 }
 
-/// **Render a [`RiskSummary`] per-viewer through Notif `humanise` (C9 — the HITL card risk text).**
-/// The `hitl_gate.risk_summary` slot (a `(template_key, args)` pair, NEVER a raw string) lowers onto
-/// the ONE templating surface. The returned [`HumanisedString`] is permission-/erasure-safe: a viewer
-/// without `view` on the subject sees a tombstone, NEVER the title (NOTIF-D4, inherited for free).
-#[allow(clippy::too_many_arguments)]
+/// **Render a [`RiskSummary`] per-viewer through Notif `humanise` (the HITL card risk text).** The
+/// `hitl_gate.risk_summary` slot (a `(template_key, args)` pair, NEVER a raw string) lowers onto the
+/// ONE templating surface. The returned [`HumanisedString`] is permission-/erasure-safe: a viewer
+/// without `view` on the subject sees a tombstone, NEVER the title (inherited for free).
 pub fn humanise_risk_summary(
-    resolver: &dyn RefResolvePort,
-    tenant: &TenantId,
-    region: &Region,
-    templates: &TemplateStore,
+    ctx: &RenderCtx<'_>,
     risk: &RiskSummary,
-    viewer: &Principal,
-    locale: &str,
-    at: &Consistency,
-    channel: Channel,
 ) -> Result<HumanisedString, RawAgentString> {
-    humanise_with_args(
-        resolver,
-        tenant,
-        region,
-        templates,
-        &risk.template_key,
-        &risk.args,
-        viewer,
-        locale,
-        at,
-        channel,
-    )
+    humanise_with_args(ctx, &risk.template_key, &risk.args)
 }
 
-/// **Render an [`AgentMessage`] per-viewer through Notif `humanise` (C9 — any agent-authored
-/// message).** The SAME lowering as the risk summary (one render path). Permission-/erasure-safe.
-#[allow(clippy::too_many_arguments)]
+/// **Render an [`AgentMessage`] per-viewer through Notif `humanise` (any agent-authored message).**
+/// The SAME lowering as the risk summary (one render path). Permission-/erasure-safe.
 pub fn humanise_agent_message(
-    resolver: &dyn RefResolvePort,
-    tenant: &TenantId,
-    region: &Region,
-    templates: &TemplateStore,
+    ctx: &RenderCtx<'_>,
     msg: &AgentMessage,
-    viewer: &Principal,
-    locale: &str,
-    at: &Consistency,
-    channel: Channel,
 ) -> Result<HumanisedString, RawAgentString> {
-    humanise_with_args(
-        resolver,
-        tenant,
-        region,
-        templates,
-        &msg.template_key,
-        &msg.args,
-        viewer,
-        locale,
-        at,
-        channel,
-    )
+    humanise_with_args(ctx, &msg.template_key, &msg.args)
 }
 
 // ───────────────────────── the rendered card (the per-viewer projection of a HitlGate card) ───────
@@ -361,29 +334,11 @@ pub struct RenderedCard {
 /// (an unauthorised viewer sees a tombstone in `risk_text`, never the subject's title). The SAME card
 /// renders DIFFERENTLY for two viewers with different permissions (the per-viewer gate is proven in
 /// the tests).
-#[allow(clippy::too_many_arguments)]
 pub fn humanise_card(
-    resolver: &dyn RefResolvePort,
-    tenant: &TenantId,
-    region: &Region,
-    templates: &TemplateStore,
+    ctx: &RenderCtx<'_>,
     card: &HitlCard,
-    viewer: &Principal,
-    locale: &str,
-    at: &Consistency,
-    channel: Channel,
 ) -> Result<RenderedCard, RawAgentString> {
-    let risk_text = humanise_risk_summary(
-        resolver,
-        tenant,
-        region,
-        templates,
-        &card.risk_summary,
-        viewer,
-        locale,
-        at,
-        channel,
-    )?;
+    let risk_text = humanise_risk_summary(ctx, &card.risk_summary)?;
     Ok(RenderedCard {
         risk_text,
         action_tool: card.action_tool.clone(),
