@@ -64,11 +64,21 @@ the real wiring, at one scale, where hardcoded placeholders stand today.
    tests, not the arithmetic tests). Money-critical but small → careful review + live-PG.
    (Between slices 1 and 2 the CI pricing rule is nominally 10,000× cheap, but the path is
    unwired — no caller, no real money — so the interim is harmless pre-launch.)
-3. **Generalize the wallet + wire the real agent feed.** `agent_wallet` becomes the tenant
-   wallet; the agent gate's `available` reads `wallet.available(tenant)` instead of a
-   literal. Add the `surface` column.
+3. **Wire the real agent balance feed into the reserve gate** (no schema change). Today the
+   agent reserve/settle gate reserves against a hardcoded `available: MicroUsd(1_000_000)`
+   (`agent-host/src/lib.rs:94`), while real money moves only through the separate per-turn
+   `wallet.debit`. This slice makes the gate a real "no balance → no run" gate: `available =
+   wallet.balance(tenant) − ledger.outstanding_reservations(tenant)` (saturating), so a tenant
+   who can't afford the estimate can't dispatch and concurrent runs can't over-reserve past the
+   balance. Needs a new `CostLedger::outstanding_reservations(tenant)` (Σ `reserved` where state
+   ∈ {Reserved, InFlight}) on both the in-memory and durable-PG arms — `cost_reservation`
+   already has the columns, so NO migration. When no wallet is present (skeleton/mock/drill),
+   keep the nominal literal (byte-identical). The per-turn debit is unchanged (it is the actual
+   billing; the gate is the affordability check — no double-charge, since reserve never touches
+   the wallet). Gap: `estimate` stays nominal for now (a usage-derived estimate is a follow-on).
 4. **Wire CI reserve/settle to the wallet**; fold `ci_cost_event` into the unified,
-   FORCE-RLS cost ledger. **Also owes (from the slice-2b review):** (a) a v2 reservation
+   FORCE-RLS cost ledger; **add the `surface ∈ {ci, agent}` column** to the wallet ledger
+   (forward-only migration) now that both surfaces debit the one wallet. **Also owes (from the slice-2b review):** (a) a v2 reservation
    `reserved ≥ price` regression test — slice 2b added the v1 one; v2's multi-execution
    aggregate pricing is manually-verified-safe but unguarded; (b) enforce the whole-GiB
    per-execution memory precondition (documented at `operational_amount_from_ceiling`) or
