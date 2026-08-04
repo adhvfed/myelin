@@ -1,61 +1,35 @@
-//! # `myelin-agent` — the agent-fabric contract surface (the strategy-pattern boundary)
+//! # `myelin-agent` — the agent-fabric contract surface
 //!
-//! **Owning architecture doc:** `planning/05-refined-shared-systems-architecture/agent-fabric.md`
-//! §1 (purpose + the trait set; the only strategy-swappable members are `AgentRuntime` and
-//! `ToolHands`), §2.1/§2.2/§2.3 (brain / hands / loop trait shapes), §3 (the three runtimes
-//! SKELETON → Mock → Llm — Llm is designed-not-built). Carried forward from Phase-3 §1.3/§2.1/§4.
-//!
-//! **Contract-index cluster:** 8 — Agent fabric
-//! (`planning/05-refined-shared-systems-architecture/contract-index.md` rows 8.1 `ToolSurface` +
-//! `ToolDef`, 8.2 `EffectApi::apply`, 8.3 `AgentRuntime::step`, 8.4 `ToolHands::exec`, 8.5
-//! `Agent::handle`, 8.6 `EventInbox::deliver`, 8.7 `run --dry-run`). Bound by row 1.6, the
-//! `no-llm-in-platform` lint.
-//!
-//! ## What crosses the crate boundary here (the frozen surface — AG-P1 / P-130)
-//! The compile-time contract surface — **types and trait signatures only, NO engine logic**. This
-//! is the small trait set behind which a `MockAgentRuntime` lives today and an `LlmAgentRuntime`
-//! lives later (the strategy seam, VISION §3; ADR-08; EI-03 §1). The thesis (EI-03 preamble): if
-//! the substrate is right, an agent needs almost no special code — an agent is a `Principal` with
+//! Types and trait signatures only, **no engine logic**. This is the small trait set behind which
+//! a `MockAgentRuntime` lives today and an `LlmAgentRuntime` lives later. The thesis: if the
+//! substrate is right, an agent needs almost no special code — it is a `Principal` with
 //! `kind=agent` running through the *same* identity, gateway, event log, sandbox, and cost gate as
-//! everyone else. The six traits (architecture §1):
-//! - [`AgentRuntime::step`] (8.3) — **THE BRAIN** (AG-1), the *stateless* strategy seam; the
-//!   platform owns the [`Conversation`] history. **Strategy-swappable.**
-//! - [`Agent::handle`] (8.5) — **THE LOOP** (AG-3), platform-owned bounded multi-turn driver.
-//! - [`ToolHands::exec`] (8.4) — **THE HANDS** (AG-2), sandboxed computation with **no
-//!   host-execution bypass** (X-6; the `no-host-exec` lint enforces it). `exec` IS the CI runner's
-//!   `kind=agent` job on the unified sandbox. **Strategy-swappable.**
-//! - [`ToolSurface`] (8.1) — the one permissioned tool catalogue (register/resolve), MCP-exposable.
-//! - [`EventInbox::deliver`] (8.6) — the platform delivers matched events; agents don't poll.
-//! - [`EffectApi::apply`] (8.2) — **PLAN-THEN-APPLY** (ADR-08.3); agents NEVER mutate directly.
+//! everyone else.
 //!
-//! The **only** strategy-swappable members are `AgentRuntime` (brain) and `ToolHands` (hands).
-//! `Agent`, `ToolSurface`, `EventInbox`, `EffectApi` are platform-owned and identical for mock and
-//! real — the whole point of plan-then-apply (architecture §1).
+//! ## The six traits
+//! - [`AgentRuntime::step`] — **THE BRAIN**: the *stateless* runtime; the platform owns the
+//!   [`Conversation`] history. **Strategy-swappable.**
+//! - [`ToolHands::exec`] — **THE HANDS**: sandboxed computation, no host-execution bypass (the
+//!   `no-host-exec` lint enforces it). `exec` is the CI runner's `kind=agent` job on the unified
+//!   sandbox. **Strategy-swappable.**
+//! - [`Agent::handle`] — **THE LOOP**: the platform-owned bounded multi-turn driver.
+//! - [`ToolSurface`] — the one permissioned tool catalogue (register/resolve), MCP-exposable.
+//! - [`EventInbox::deliver`] — the platform delivers matched events; agents don't poll.
+//! - [`EffectApi::apply`] — **PLAN-THEN-APPLY**: agents never mutate directly.
 //!
-//! ## The `no-llm-in-platform` ratchet (contract 1.6) — PERMANENT gate
-//! NO model / SDK / prompt / model-name string appears anywhere in this crate. The only place such
-//! a string may ever appear is `LlmAgentRuntime` (a post-M5 floor, see below). The
-//! `no-llm-in-platform` lint (`myelin-lints`, scanned over `crates/*/src` by the committed
-//! `lint-gate` CI binary, with red+green fixtures) makes this structural and loud-never-swallowed.
+//! Only `AgentRuntime` (brain) and `ToolHands` (hands) are strategy-swappable. `Agent`,
+//! `ToolSurface`, `EventInbox`, `EffectApi` are platform-owned and identical for mock and real —
+//! the whole point of plan-then-apply.
 //!
-//! ## Floors named (designed-not-built → filling prompt)
-//! - **`LlmAgentRuntime` is designed-not-built** — the trait seam [`AgentRuntime`] exists; the real
-//!   vendor adapter (the only place a model/SDK/prompt/model-name string ever lives) is the
-//!   **post-M5 follow-on, named in AG-P25**. The [`AgentRuntime`] trait here is a *seam*, NOT a
-//!   working brain — do not mistake it for one.
-//! - **The trait BODIES land downstream of this prompt.** AG-P1 freezes the SIGNATURES (this crate);
-//!   the engine is built later: the SKELETON runtime (AG-P4 → P-216), `MockAgentRuntime` (AG-P5 →
-//!   P-217), `EffectApi::apply`'s plan-then-apply pipeline (AG-P6 → P-218), `ToolHands::exec` on the
-//!   unified sandbox + the four uniform guarantees (AG-P15 → P-226), the data model migrations
-//!   (AG-P2 → P-131), the `requires_approval` defaults seed (AG-P8 → P-220). No body is shipped here.
-//! - **The runtime workers are stateless** — a crashed worker's run resumes from the durable
-//!   workflow + the trace (architecture §3.1). Nothing in this crate holds run state.
-
-/// The post-M5 Fabric seam doc (AG-P25 → global P-481): the three named floors (`LlmAgentRuntime`,
-/// the external MCP endpoint, long-term memory/RAG) + the three `[OPEN -> LEGAL]` items, each with
-/// its trigger + follow-on band, machine-checked by the `seam_floors_gap_report` test (0 invisible
-/// gaps). Designed-not-built — NO engine code, NO model/SDK/prompt string. See [`seam`].
-pub mod seam;
+//! ## The `no-llm-in-platform` boundary
+//! NO model / SDK / prompt / model-name string appears anywhere in this crate. The only place one
+//! may ever appear is the real `LlmAgentRuntime` adapter (in `myelin-agent-model`). The
+//! `no-llm-in-platform` lint scans every `crates/*/src/*.rs`, making this structural.
+//!
+//! The trait *bodies* land in the runtimes: `MockAgentRuntime` now, the real vendor brain later.
+//! The deferred floors — the real runtime, the external MCP endpoint, long-term memory, and the
+//! open policy questions — are recorded in `docs/gaps/agent-fabric-floors.md`. Runtime workers hold
+//! no run state: a crashed run resumes from the durable workflow + the trace.
 
 use serde::{Deserialize, Serialize};
 

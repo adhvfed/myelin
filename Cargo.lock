@@ -2278,7 +2278,6 @@ version = "0.0.0"
 dependencies = [
  "myelin-events",
  "myelin-identity",
- "myelin-lints",
  "serde",
  "serde_json",
 ]

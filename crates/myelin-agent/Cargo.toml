@@ -17,10 +17,6 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-# The value-type wire-shape round-trip test (the frozen 8.1 ToolDef field list + the
-# EffectResult tag) serialises via serde_json — a renamed/dropped field fails the assertion.
+# The value-type wire-shape round-trip test (the frozen ToolDef field list + the EffectResult
+# tag) serialises via serde_json — a renamed/dropped field fails the assertion.
 serde_json.workspace = true
-# AG-P25 (→ P-481): the seam-floor gap-report test re-runs the `no-llm-in-platform` lint
-# (contract 1.6) over the new `src/seam.rs` to prove the seam doc adds no model/SDK/prompt
-# fingerprint. myelin-lints has no deps of its own, so this dev-edge opens no DAG cycle.
-myelin-lints = { path = "../myelin-lints" }
