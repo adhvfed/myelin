@@ -115,6 +115,7 @@ pub mod issues_tools;
 pub mod knowledge_tools;
 pub mod long_park;
 pub mod loop_guards;
+pub mod metering;
 pub mod migrations;
 pub mod mock;
 pub mod schema;
@@ -143,9 +144,16 @@ pub use dsr::{
 // zero cost. The brain (no model, no tools) + the platform-owned `Agent::handle` durable-workflow
 // loop body + the per-run identity (mint/revoke/anti-leak) + the contract-1.8 telemetry signals.
 pub use skeleton::{
-    ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, SkeletonAgent, SkeletonAgentRuntime,
-    SkeletonError, SkeletonTelemetry, AGENT_RUN_TRACED_EVENT, DEFAULT_MAX_TURNS, SKELETON_STEP_UNIT,
+    ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, RunWallet, SkeletonAgent,
+    SkeletonAgentRuntime, SkeletonError, SkeletonTelemetry, SpendCapStage, AGENT_RUN_TRACED_EVENT,
+    DEFAULT_MAX_TURNS, SKELETON_STEP_UNIT, WALLET_MIN_BALANCE_FLOOR,
 };
+
+// v1 TOKEN METERING (this slice): the PURE pricing half — raw token counts → a micro-dollar charge
+// (`wholesale` + `markup`). A NEW, non-disruptive layer LAYERED ON the untouched reserve/settle gate;
+// the wallet DEBIT that consumes a price is the driving loop's job (`SkeletonAgent::handle_run`, over
+// the `RunWallet` seam). Vendor-neutral rates (`LUNA_RATES` today; Anthropic slots in as a sibling).
+pub use metering::{price, ModelRates, PriceError, Priced, LUNA_RATES};
 
 // The bounded driving loop's `ToolExecutor` seam (the loop half of 8.5): turn one VALIDATED
 // `ToolCall` into a `ToolResult`. This slice ships ONLY the seam + the test doubles; the three real

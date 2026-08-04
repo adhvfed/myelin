@@ -78,6 +78,7 @@
 //!   provider impl (`tests/`).
 
 use crate::effect_api::validate_call;
+use crate::metering::{price, LUNA_RATES};
 use crate::tool_exec::ToolExecutor;
 use myelin_agent::{
     Agent, AgentRuntime, Conversation, InboxEvent, MeteredRuntime, MeteredStep, RunOutcome,
@@ -92,6 +93,7 @@ use myelin_flow::{
 use myelin_identity::Principal;
 use myelin_refs::ArtifactRef;
 use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError};
+use myelin_storage::agent_wallet::{AgentWallet, MicroUsd, WalletError};
 use myelin_storage::reserve_settle::{CostLedger, MinorUnits, RunId as StorageRunId};
 use myelin_tenancy::{Region, TenantId};
 
@@ -116,6 +118,79 @@ pub const SKELETON_STEP_UNIT: &str = "skeleton.step";
 /// alongside the run's other independent ceilings (the reserve/settle budget the gate enforces at
 /// dispatch, and the causal-depth ceiling the flow runtime enforces).
 pub const DEFAULT_MAX_TURNS: usize = 16;
+
+// ───────────────────────── v1 TOKEN METERING — the durable-wallet debit seam + the spend cap ────
+
+/// **The v1 pre-step spend-cap FLOOR (micro-dollars).** Before each paid turn the driving loop checks
+/// the tenant's wallet balance is ABOVE this floor; at/below it the run halts GRACEFULLY (no paid
+/// call — the "no balance → no run" guard, now enforced PER STEP). v1 uses [`MicroUsd::ZERO`] (halt
+/// only at an exactly-empty wallet); a larger config-driven floor is a trivial follow-on.
+///
+/// This coarse `balance > floor` gate PLUS the per-turn post-debit insufficient-halt (below) together
+/// bound a run's overspend to AT MOST one turn — a precise `max_tokens`-based next-call estimate is a
+/// named follow-on. This is the documented v1 cap.
+pub const WALLET_MIN_BALANCE_FLOOR: MicroUsd = MicroUsd::ZERO;
+
+/// **The metering-wallet seam the driving loop debits per turn (CONSUMED).** A trait — NOT the
+/// concrete [`AgentWallet`] — so the metering loop is exercised BOTH DB-free (an in-memory fake in
+/// the unit tests) AND against the real durable wallet on live Postgres (the integration test); the
+/// same decoupling [`RunTokenRevoker`] uses. Only the two ops the per-turn meter needs are on the
+/// seam: read the balance (the pre-step spend gate) and debit the priced charge (fail-closed).
+///
+/// The production impl is the durable [`AgentWallet`] (immutable ledger, `FOR UPDATE`, no negative
+/// balance — the loop RELIES on those guarantees, it never re-implements them).
+pub trait RunWallet {
+    /// The tenant's current prepaid balance in micro-dollars (the pre-step spend gate reads this).
+    fn balance(&self, tenant: &TenantId) -> MicroUsd;
+    /// **Debit `amount` micro-dollars against the tenant's balance, `run_id`-linked.** Fail-closed
+    /// ([`WalletError::InsufficientBalance`]) when the balance cannot cover it — NOTHING written, no
+    /// partial debit, no negative balance. Returns the new balance on success.
+    fn debit(
+        &self,
+        tenant: &TenantId,
+        amount: MicroUsd,
+        run_id: &str,
+    ) -> Result<MicroUsd, WalletError>;
+}
+
+/// The durable [`AgentWallet`] IS the production [`RunWallet`] — a thin forward to its inherent ops
+/// (the loop takes no new dependency; it just narrows the wallet to the two ops it needs).
+impl RunWallet for AgentWallet {
+    fn balance(&self, tenant: &TenantId) -> MicroUsd {
+        AgentWallet::balance(self, tenant)
+    }
+    fn debit(
+        &self,
+        tenant: &TenantId,
+        amount: MicroUsd,
+        run_id: &str,
+    ) -> Result<MicroUsd, WalletError> {
+        AgentWallet::debit(self, tenant, amount, run_id)
+    }
+}
+
+/// **Where a run's spend cap tripped** (observability for the graceful-halt telemetry). Both stages
+/// halt the run GRACEFULLY (teardown fires, exactly as max-turns) — the distinction is only which
+/// guard fired.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpendCapStage {
+    /// The pre-step balance gate: the wallet was at/below [`WALLET_MIN_BALANCE_FLOOR`] BEFORE the
+    /// paid call — no balance, no paid call.
+    PreStepGate,
+    /// The post-debit refusal: this turn's priced charge outran the remaining balance — the wallet
+    /// refused the debit (wrote nothing), so the overspend is bounded to this one (already-consumed)
+    /// turn.
+    PostDebit,
+}
+
+impl core::fmt::Display for SpendCapStage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            SpendCapStage::PreStepGate => write!(f, "pre-step balance gate"),
+            SpendCapStage::PostDebit => write!(f, "post-debit insufficient balance"),
+        }
+    }
+}
 
 // ───────────────────────── 8.3 — the SKELETON runtime (no model, no tools) ──────────────────────
 
@@ -252,8 +327,13 @@ pub struct SkeletonTelemetry {
     /// Total completion (output) tokens across all reported turns (saturating).
     tokens_output: u64,
     /// The number of turns whose usage was [`TokenUsage::NotReported`] (a usage-less brain, or a
-    /// provider that omitted usage). The future metering slice reads this to fail closed.
+    /// provider that omitted usage). The metering layer reads this to fail closed.
     turns_usage_not_reported: u64,
+    /// **v1 METERING — the total micro-dollars DEBITED from the agent wallet across this run's turns**
+    /// (`Σ` of each turn's `wholesale + markup`). Observability for the real per-run bill. `0` for a
+    /// run with no wallet metered (the SKELETON/Mock/drill paths) — the reserve/settle ledger above
+    /// is a SEPARATE nominal signal this never perturbs.
+    charged_micro: u64,
 }
 
 impl SkeletonTelemetry {
@@ -310,6 +390,18 @@ impl SkeletonTelemetry {
     /// The number of turns whose usage was [`TokenUsage::NotReported`] (the fail-closed signal).
     pub fn turns_usage_not_reported(&self) -> u64 {
         self.turns_usage_not_reported
+    }
+    /// **v1 METERING — the total micro-dollars debited from the wallet across this run** (`Σ` of each
+    /// turn's `wholesale + markup`). `0` when no wallet is metered.
+    pub fn charged_micro(&self) -> u64 {
+        self.charged_micro
+    }
+
+    /// **Record ONE turn's wallet DEBIT into the run's charged total (saturating).** Called once per
+    /// priced+debited turn by the driving loop (observability for the real bill). Distinct from the
+    /// reserve/settle ledger — this is the durable-wallet micro-dollar spend, not the nominal gate.
+    fn record_charge(&mut self, amount: MicroUsd) {
+        self.charged_micro = self.charged_micro.saturating_add(amount.0);
     }
 
     /// **Accumulate ONE metered turn's raw token usage (contract 8.3; observability only).** A
@@ -397,6 +489,36 @@ pub enum SkeletonError {
         /// The turn ceiling that was hit ([`DEFAULT_MAX_TURNS`]).
         turns: usize,
     },
+    /// **v1 METERING — the prepaid wallet's SPEND CAP tripped.** Either the pre-step balance gate (an
+    /// empty wallet BEFORE the paid call) or a per-turn debit refused for insufficient balance (this
+    /// turn's tokens outran the remaining balance). The run terminates GRACEFULLY — teardown STILL
+    /// fires, exactly as [`MaxTurnsExhausted`](SkeletonError::MaxTurnsExhausted); the reservation is
+    /// left in-flight (the never-interrupt invariant). NEVER an overspend, never a negative balance
+    /// (the wallet wrote nothing on the refusal). Only reachable when a wallet is metered (a run with
+    /// `wallet: None` is byte-identical to before — the reserve/settle drills are unaffected).
+    WalletSpendCapReached {
+        /// The run the spend cap stopped.
+        run_id: String,
+        /// Which guard fired (pre-step gate vs post-debit refusal) — observability.
+        stage: SpendCapStage,
+    },
+    /// **v1 METERING — a paid turn's token usage was [`TokenUsage::NotReported`].** Billing must NEVER
+    /// guess: a paid model call the provider did not meter cannot be priced, so the run FAILS CLOSED
+    /// (LOUD) rather than fabricate or skip a charge (the `AgentReported` discipline). Teardown STILL
+    /// fires. Only reachable when a wallet is metered.
+    MeteringUsageNotReported {
+        /// The run whose turn reported no usage.
+        run_id: String,
+    },
+    /// **v1 METERING — the checked micro-dollar arithmetic (pricing, or the wallet's amount/sum
+    /// bounds) overflowed.** A loud refusal on a financial op, NEVER a silent wrap: the run aborts +
+    /// tears down. Only reachable at astronomically large token counts / amounts.
+    MeteringOverflow {
+        /// The run whose charge overflowed.
+        run_id: String,
+        /// The loud arithmetic reason (from [`crate::metering::PriceError`] or [`WalletError`]).
+        reason: String,
+    },
 }
 
 impl core::fmt::Display for SkeletonError {
@@ -412,6 +534,20 @@ impl core::fmt::Display for SkeletonError {
             SkeletonError::MaxTurnsExhausted { run_id, turns } => write!(
                 f,
                 "SKELETON bounded loop exhausted: run={run_id} reached max_turns={turns} without a submit"
+            ),
+            SkeletonError::WalletSpendCapReached { run_id, stage } => write!(
+                f,
+                "SKELETON metering spend cap reached: run={run_id} halted gracefully at the {stage} \
+                 (no overspend, reservation left in-flight)"
+            ),
+            SkeletonError::MeteringUsageNotReported { run_id } => write!(
+                f,
+                "SKELETON metering failed closed: run={run_id} had a paid turn with NO reported token \
+                 usage — billing never guesses (fail-closed)"
+            ),
+            SkeletonError::MeteringOverflow { run_id, reason } => write!(
+                f,
+                "SKELETON metering arithmetic overflowed: run={run_id}: {reason} (loud, never a wrap)"
             ),
         }
     }
@@ -467,6 +603,15 @@ pub struct RunSubstrate<'a> {
     /// per-route impls (Read→subsystem read, Compute→sandbox exec, Mutate/External→EffectApi) are
     /// named-but-unwired follow-ons. Unused by the SKELETON (it never proposes a tool).
     pub executor: &'a dyn ToolExecutor,
+    /// **v1 METERING — the durable prepaid AGENT WALLET the driving loop debits per turn (OPTIONAL,
+    /// a NEW non-disruptive layer).** `None` on the SKELETON/Mock/drill paths — the run is then
+    /// BYTE-IDENTICAL to before (no pricing, no debit, the reserve/settle gate untouched, the
+    /// reserved==settled drills unaffected). `Some` on a real metered run: each paid turn's token
+    /// usage is priced into micro-dollars and DEBITED here run-linked, with a pre-step balance gate +
+    /// a per-turn insufficient-halt that bound the overspend to one turn. This is SEPARATE from the
+    /// nominal [`available`](Self::available)/[`estimate`](Self::estimate) reserve/settle below —
+    /// the wallet debit is real billing LAYERED ON TOP, it does not touch the gate.
+    pub wallet: Option<&'a dyn RunWallet>,
     /// The reserve/settle gate (11.7) that fronts the run — no balance → no run.
     pub gate: &'a mut AgentRunGate,
     /// The Storage-owned durable cost ledger the gate drives (11.7).
@@ -637,12 +782,102 @@ impl SkeletonAgent {
         //     completed / killed / refused paths.
         let mut submission: Option<Submission> = None;
         for _turn in 0..DEFAULT_MAX_TURNS {
+            // ── v1 METERING (pre-step SPEND CAP) — only when a wallet is threaded. ──
+            // No balance → no paid call (the "no balance → no run" guard, now enforced PER STEP). At
+            // or below the floor the run halts GRACEFULLY (teardown fires, exactly as max-turns) —
+            // the co-commit is abandoned (0 ghost trace), the reservation is left in-flight. This
+            // gate PLUS the per-turn post-debit halt below bound the overspend to at most one turn.
+            // A run with `wallet: None` skips this entirely — its behaviour is byte-identical.
+            if let Some(wallet) = sub.wallet {
+                if wallet.balance(&sub.tenant) <= WALLET_MIN_BALANCE_FLOOR {
+                    drop(ctx);
+                    self.teardown(sub, &token, teardown_at, telemetry);
+                    return Err(SkeletonError::WalletSpendCapReached {
+                        run_id: sub.run_id.clone(),
+                        stage: SpendCapStage::PreStepGate,
+                    });
+                }
+            }
+
             // Step the brain OBSERVABLY: the decision PLUS its raw token usage. Accumulate the usage
             // into the run telemetry (a NEW, separate observability signal — NON-FINANCIAL: no
             // pricing, no reserve/settle touch). The SKELETON/Mock report NotReported, so their token
             // totals stay 0 and the balanced-ledger assertions are unchanged.
             let MeteredStep { outcome, usage } = runtime.step_metered(&conv);
             telemetry.record_token_usage(&usage);
+
+            // ── v1 METERING (per-turn WALLET DEBIT) — only when a wallet is threaded. ──
+            // Price THIS turn's real token usage into micro-dollars and DEBIT THE AGENT WALLET,
+            // run-linked (ONE debit per turn — no double-charge). The debit stands even if the run
+            // later fails (the tokens were consumed — correct billing). This is a real-billing layer
+            // LAYERED ON the untouched nominal reserve/settle gate; a `wallet: None` run skips it and
+            // stays byte-identical. Three fail-closed exits (each abandons the co-commit + tears down
+            // exactly as the max-turns path): usage NotReported, a spend-cap refusal, an arithmetic
+            // overflow. The wallet guarantees no negative balance + no partial debit — we RELY on it.
+            if let Some(wallet) = sub.wallet {
+                match &usage {
+                    // Fail-closed: a paid call the provider did not meter cannot be priced — abort
+                    // LOUD rather than fabricate or skip a charge (billing never guesses).
+                    TokenUsage::NotReported => {
+                        drop(ctx);
+                        self.teardown(sub, &token, teardown_at, telemetry);
+                        return Err(SkeletonError::MeteringUsageNotReported {
+                            run_id: sub.run_id.clone(),
+                        });
+                    }
+                    reported => {
+                        // Price the turn (checked; an overflow is LOUD, never a wrap).
+                        let priced = match price(reported, &LUNA_RATES) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                drop(ctx);
+                                self.teardown(sub, &token, teardown_at, telemetry);
+                                return Err(SkeletonError::MeteringOverflow {
+                                    run_id: sub.run_id.clone(),
+                                    reason: e.to_string(),
+                                });
+                            }
+                        };
+                        let charge = match priced.total() {
+                            Some(c) => c,
+                            None => {
+                                drop(ctx);
+                                self.teardown(sub, &token, teardown_at, telemetry);
+                                return Err(SkeletonError::MeteringOverflow {
+                                    run_id: sub.run_id.clone(),
+                                    reason: "priced wholesale + markup overflowed u64".into(),
+                                });
+                            }
+                        };
+                        // DEBIT the wallet for exactly this turn's charge, run_id-linked.
+                        match wallet.debit(&sub.tenant, charge, &sub.run_id) {
+                            Ok(_new_balance) => telemetry.record_charge(charge),
+                            // The SPEND CAP tripped MID-RUN — this turn's tokens outran the remaining
+                            // balance. Terminate GRACEFULLY; the wallet wrote NOTHING (no negative
+                            // balance), so the overspend is bounded to this one consumed turn.
+                            Err(WalletError::InsufficientBalance { .. }) => {
+                                drop(ctx);
+                                self.teardown(sub, &token, teardown_at, telemetry);
+                                return Err(SkeletonError::WalletSpendCapReached {
+                                    run_id: sub.run_id.clone(),
+                                    stage: SpendCapStage::PostDebit,
+                                });
+                            }
+                            // AmountTooLarge / BalanceOverflow — a loud refusal on a financial op,
+                            // never a silent proceed.
+                            Err(other) => {
+                                drop(ctx);
+                                self.teardown(sub, &token, teardown_at, telemetry);
+                                return Err(SkeletonError::MeteringOverflow {
+                                    run_id: sub.run_id.clone(),
+                                    reason: other.to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
             match outcome {
                 StepOutcome::Submit(s) => {
                     // Terminal — record the model step into the transcript, then fall through to the
@@ -944,6 +1179,9 @@ mod tests {
             revoker,
             catalogue,
             executor,
+            // The metering wallet is OPTIONAL: the SKELETON/Mock unit paths pass None → the run is
+            // byte-identical to before (no pricing, no debit). The metering unit tests set it after.
+            wallet: None,
             gate,
             ledger,
             available: MinorUnits(available),
@@ -1749,5 +1987,332 @@ mod tests {
         assert_eq!(t.tokens_cached_input(), 3);
         assert_eq!(t.tokens_output(), 7);
         assert_eq!(t.turns_usage_not_reported(), 1);
+    }
+
+    // ───────── v1 TOKEN METERING — the per-turn wallet debit + the spend cap (DB-free) ────────────
+
+    /// A DB-free in-memory [`RunWallet`] fake that mirrors the durable wallet's FAIL-CLOSED debit:
+    /// refuse when `balance < amount` (write nothing, no partial debit, NEVER a negative balance),
+    /// else subtract and append a `(amount, run_id)` row. The live-PG integration test pins the SAME
+    /// contract on the real [`AgentWallet`]; this double lets the loop's metering paths run without a
+    /// database.
+    struct FakeWallet {
+        balance: std::sync::Mutex<u64>,
+        debits: std::sync::Mutex<Vec<(u64, String)>>,
+    }
+    impl FakeWallet {
+        fn new(initial: u64) -> FakeWallet {
+            FakeWallet {
+                balance: std::sync::Mutex::new(initial),
+                debits: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn balance_now(&self) -> u64 {
+            *self.balance.lock().unwrap()
+        }
+        fn debit_rows(&self) -> Vec<(u64, String)> {
+            self.debits.lock().unwrap().clone()
+        }
+    }
+    impl RunWallet for FakeWallet {
+        fn balance(&self, _tenant: &TenantId) -> MicroUsd {
+            MicroUsd(*self.balance.lock().unwrap())
+        }
+        fn debit(
+            &self,
+            _tenant: &TenantId,
+            amount: MicroUsd,
+            run_id: &str,
+        ) -> Result<MicroUsd, WalletError> {
+            let mut b = self.balance.lock().unwrap();
+            match b.checked_sub(amount.0) {
+                Some(new_balance) => {
+                    *b = new_balance;
+                    self.debits
+                        .lock()
+                        .unwrap()
+                        .push((amount.0, run_id.to_string()));
+                    Ok(MicroUsd(new_balance))
+                }
+                // Fail-closed: nothing written, balance unchanged (no negative balance).
+                None => Err(WalletError::InsufficientBalance {
+                    requested: amount,
+                    available: MicroUsd(*b),
+                }),
+            }
+        }
+    }
+
+    fn count_model_turns(conv: &Conversation) -> usize {
+        conv.turns
+            .iter()
+            .filter(|t| matches!(t, Turn::Model(_)))
+            .count()
+    }
+
+    /// A brain that reports a FIXED per-turn token usage and drives `search → read → submit` (three
+    /// metered steps), counting the steps it was asked for (so a test can prove the pre-step gate
+    /// BLOCKED the paid call).
+    struct MeteredScriptBrain {
+        usage: TokenUsage,
+        steps: std::sync::atomic::AtomicUsize,
+    }
+    impl MeteredScriptBrain {
+        fn new(usage: TokenUsage) -> MeteredScriptBrain {
+            MeteredScriptBrain {
+                usage,
+                steps: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn steps_taken(&self) -> usize {
+            self.steps.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+    impl AgentRuntime for MeteredScriptBrain {
+        fn step(&self, conv: &Conversation) -> StepOutcome {
+            match count_model_turns(conv) {
+                0 => StepOutcome::UseTools(vec![tool_call("search")]),
+                1 => StepOutcome::UseTools(vec![tool_call("read")]),
+                _ => StepOutcome::Submit(Submission("done".into())),
+            }
+        }
+    }
+    impl MeteredRuntime for MeteredScriptBrain {
+        fn step_metered(&self, conv: &Conversation) -> MeteredStep {
+            self.steps
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            MeteredStep {
+                outcome: self.step(conv),
+                usage: self.usage,
+            }
+        }
+    }
+
+    /// The Luna charge for the tests' fixed usage `{input 1000, cached 500, output 200}`:
+    /// wholesale = (1000*200_000 + 500*20_000 + 200*1_200_000)/1e6 = 450 ; markup = round(9.0) = 9 ;
+    /// total = 459 micro-USD per turn.
+    const TEST_USAGE: TokenUsage = TokenUsage::Reported {
+        input: 1_000,
+        cached_input: 500,
+        output: 200,
+    };
+    const TEST_CHARGE_PER_TURN: u64 = 459;
+
+    /// **A metered run DEBITS THE WALLET per turn for the priced usage — one debit per turn, balance
+    /// drops by exactly `wholesale + markup` each turn — while the reserve/settle ledger stays
+    /// BALANCED and UNTOUCHED (the layering).** Three metered steps × 459 = 1_377 micro-USD debited;
+    /// three run-linked debit rows; `charged_micro` telemetry == 1_377; reserved == settled == 10.
+    #[test]
+    fn metered_run_debits_wallet_per_turn_and_ledger_stays_balanced() {
+        let brain = MeteredScriptBrain::new(TEST_USAGE);
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::with([tool_def("search"), tool_def("read")]);
+        let exec = MockToolExecutor::new();
+        let wallet = FakeWallet::new(10_000);
+        let mut sub = substrate(
+            "Rmeter", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+        sub.wallet = Some(&wallet);
+
+        let out = agent_loop
+            .handle_run(&brain, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect("the metered run completes");
+        assert!(out.0.contains("completed"), "the run completed: {out:?}");
+
+        // THREE debits (one per metered turn), each exactly the per-turn charge, run-linked.
+        let rows = wallet.debit_rows();
+        assert_eq!(rows.len(), 3, "one debit per turn (no double-charge, no skip)");
+        for (amount, run_id) in &rows {
+            assert_eq!(*amount, TEST_CHARGE_PER_TURN, "each turn debits wholesale+markup");
+            assert_eq!(run_id, "Rmeter", "every debit is run_id-linked");
+        }
+        // The balance dropped by EXACTLY 3 × 459.
+        assert_eq!(
+            wallet.balance_now(),
+            10_000 - 3 * TEST_CHARGE_PER_TURN,
+            "balance dropped by exactly the sum of the per-turn charges"
+        );
+        // The run's charged-micro telemetry mirrors the total spend.
+        assert_eq!(tele.charged_micro(), 3 * TEST_CHARGE_PER_TURN);
+        // THE LAYERING: the nominal reserve/settle ledger is BALANCED + unchanged by the metering.
+        assert!(tele.ledger_balanced(), "reserved == settled is unaffected");
+        assert_eq!(tele.reserved(), 10);
+        assert_eq!(tele.settled(), 10);
+        assert_eq!(tele.traces_written(), 1);
+        assert_eq!(tele.tokens_revoked(), 1);
+        assert_eq!(tele.runs_completed(), 1);
+    }
+
+    /// **A run whose wallet runs DRY mid-loop halts GRACEFULLY (spend cap) with teardown — and NEVER a
+    /// negative balance.** The wallet funds two turns but not the third: turns 0 and 1 debit, turn 2's
+    /// debit is refused (fail-closed) → the run terminates with [`SkeletonError::WalletSpendCapReached`]
+    /// (`PostDebit`), the token is torn down, no trace is written, the balance is left non-negative
+    /// (the refused turn wrote nothing).
+    #[test]
+    fn metered_run_dry_wallet_halts_gracefully_no_negative_balance() {
+        let brain = MeteredScriptBrain::new(TEST_USAGE);
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::with([tool_def("search"), tool_def("read")]);
+        let exec = MockToolExecutor::new();
+        // Funds exactly two turns (2 × 459 = 918); the third turn's debit is refused.
+        let wallet = FakeWallet::new(1_000);
+        let mut sub = substrate(
+            "Rdry", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+        sub.wallet = Some(&wallet);
+
+        let err = agent_loop
+            .handle_run(&brain, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect_err("the dry wallet halts the run mid-loop");
+        match err {
+            SkeletonError::WalletSpendCapReached { run_id, stage } => {
+                assert_eq!(run_id, "Rdry");
+                assert_eq!(stage, SpendCapStage::PostDebit, "the mid-run debit was refused");
+            }
+            other => panic!("expected WalletSpendCapReached, got {other:?}"),
+        }
+        // Exactly TWO debits landed (the two funded turns); the third wrote NOTHING.
+        assert_eq!(wallet.debit_rows().len(), 2, "only the funded turns debited");
+        // The balance is left NON-NEGATIVE (the refused debit wrote nothing).
+        assert_eq!(
+            wallet.balance_now(),
+            1_000 - 2 * TEST_CHARGE_PER_TURN,
+            "balance = 1000 − 2×459 = 82 (never negative; the refused turn left it untouched)"
+        );
+        assert_eq!(tele.charged_micro(), 2 * TEST_CHARGE_PER_TURN);
+        // Teardown STILL fired; no trace; the run did not complete (reservation left in-flight).
+        assert_eq!(tele.tokens_revoked(), 1, "torn down on the spend-cap path");
+        assert_eq!(tele.traces_written(), 0, "no trace on a capped run");
+        assert_eq!(tele.runs_completed(), 0);
+    }
+
+    /// **A NotReported turn FAILS THE RUN CLOSED (with teardown) — billing never guesses.** With a
+    /// wallet threaded, a paid turn whose usage is `NotReported` (here the SKELETON brain) aborts the
+    /// run LOUD as [`SkeletonError::MeteringUsageNotReported`]; NO debit is made, the token is torn
+    /// down, no trace is written, the balance is untouched.
+    #[test]
+    fn metered_run_not_reported_turn_fails_closed_with_teardown() {
+        // The SKELETON reports NotReported every turn — with a wallet metered, that must fail closed.
+        let rt = SkeletonAgentRuntime::new();
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::new();
+        let exec = MockToolExecutor::new();
+        let wallet = FakeWallet::new(10_000);
+        let mut sub = substrate(
+            "Rnr", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+        sub.wallet = Some(&wallet);
+
+        let err = agent_loop
+            .handle_run(&rt, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect_err("an unmetered paid turn fails closed");
+        match err {
+            SkeletonError::MeteringUsageNotReported { run_id } => assert_eq!(run_id, "Rnr"),
+            other => panic!("expected MeteringUsageNotReported, got {other:?}"),
+        }
+        // NOTHING debited (billing never guesses); balance untouched; torn down; no trace.
+        assert!(wallet.debit_rows().is_empty(), "0 debit on a NotReported turn");
+        assert_eq!(wallet.balance_now(), 10_000, "balance untouched");
+        assert_eq!(tele.charged_micro(), 0);
+        assert_eq!(tele.tokens_revoked(), 1, "torn down on the fail-closed path");
+        assert_eq!(tele.traces_written(), 0);
+        assert_eq!(tele.runs_completed(), 0);
+    }
+
+    /// **The pre-step ZERO-BALANCE gate BLOCKS the paid call.** An empty wallet halts the run at the
+    /// top of the loop with [`SkeletonError::WalletSpendCapReached`] (`PreStepGate`) — the brain is
+    /// NEVER stepped (0 paid calls), 0 debit, the token is still torn down, no trace.
+    #[test]
+    fn metered_run_pre_step_zero_balance_gate_blocks_the_paid_call() {
+        let brain = MeteredScriptBrain::new(TEST_USAGE);
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::with([tool_def("search"), tool_def("read")]);
+        let exec = MockToolExecutor::new();
+        // An EMPTY wallet — the pre-step gate must halt BEFORE the paid call.
+        let wallet = FakeWallet::new(0);
+        let mut sub = substrate(
+            "Rzero", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+        sub.wallet = Some(&wallet);
+
+        let err = agent_loop
+            .handle_run(&brain, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect_err("a zero-balance wallet blocks the run");
+        match err {
+            SkeletonError::WalletSpendCapReached { run_id, stage } => {
+                assert_eq!(run_id, "Rzero");
+                assert_eq!(stage, SpendCapStage::PreStepGate, "halted at the pre-step gate");
+            }
+            other => panic!("expected WalletSpendCapReached(PreStepGate), got {other:?}"),
+        }
+        // THE PAID CALL WAS BLOCKED: the brain was never stepped, and nothing debited.
+        assert_eq!(brain.steps_taken(), 0, "the paid model call was never made");
+        assert!(wallet.debit_rows().is_empty(), "0 debit — the call was blocked");
+        assert_eq!(tele.charged_micro(), 0);
+        assert_eq!(tele.tokens_revoked(), 1, "torn down on the pre-step-gate path");
+        assert_eq!(tele.traces_written(), 0);
+        assert_eq!(tele.runs_completed(), 0);
+    }
+
+    /// **The new metering `SkeletonError` variants render LOUD + distinct** (a swallowed money-path
+    /// error is a silent failure, EI-01 §2).
+    #[test]
+    fn metering_error_display_is_loud_and_distinct() {
+        let cap = SkeletonError::WalletSpendCapReached {
+            run_id: "Rx".into(),
+            stage: SpendCapStage::PostDebit,
+        }
+        .to_string();
+        let nr = SkeletonError::MeteringUsageNotReported {
+            run_id: "Rx".into(),
+        }
+        .to_string();
+        let ov = SkeletonError::MeteringOverflow {
+            run_id: "Rx".into(),
+            reason: "boom".into(),
+        }
+        .to_string();
+        assert!(cap.contains("spend cap"), "renders the cap: {cap}");
+        assert!(cap.contains("post-debit"), "renders the stage: {cap}");
+        assert!(nr.contains("fail-closed"), "renders the fail-closed abort: {nr}");
+        assert!(ov.contains("overflow") && ov.contains("boom"), "renders the overflow: {ov}");
+        assert_ne!(cap, nr);
+        assert_ne!(nr, ov);
     }
 }
