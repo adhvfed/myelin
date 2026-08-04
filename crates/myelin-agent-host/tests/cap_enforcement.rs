@@ -20,9 +20,9 @@ use std::sync::{Arc, Mutex};
 
 use myelin_agent::{EffectKind, ToolCall, ToolDef, ToolResult};
 use myelin_agent_host::{
-    dispatch_metered_llm_run_with_tools, git_check_status_read_tool_def,
+    dispatch_metered_llm_run, git_check_status_read_tool_def,
     git_check_status_read_tool_schema, CapEnforcingExecutor, LlmRunTask, MicroUsd,
-    RunSubstrateWiring, RunWallet, ToolCatalogue, WalletError, GIT_READ_CHECK_STATUS_TOOL,
+    RunSubstrateWiring, RunWallet, ToolCatalogue, Tools, WalletError, GIT_READ_CHECK_STATUS_TOOL,
 };
 use myelin_agent_model::{
     ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn, ToolCallRequest,
@@ -236,15 +236,17 @@ fn tool_call_is_allowed_when_the_principal_holds_the_required_cap() {
     let outbox = OutboxStore::new();
     let mut w = wiring(&mut ledger, &outbox);
 
-    let report = dispatch_metered_llm_run_with_tools(
+    let report = dispatch_metered_llm_run(
         &wallet,
         region,
         &task(&tenant, agent, "Rcap-allow"),
         &mut w,
         Box::new(ScriptedToolBrain),
-        &catalogue,
-        &gated,
-        &advertised,
+        Tools {
+            catalogue: &catalogue,
+            executor: &gated,
+            advertised: &advertised,
+        },
     )
     .expect("a granted principal's tool run completes");
 
@@ -286,15 +288,17 @@ fn tool_call_is_denied_fail_closed_when_the_principal_lacks_the_required_cap() {
     let outbox = OutboxStore::new();
     let mut w = wiring(&mut ledger, &outbox);
 
-    let err = dispatch_metered_llm_run_with_tools(
+    let err = dispatch_metered_llm_run(
         &wallet,
         region,
         &task(&tenant, agent, "Rcap-deny"),
         &mut w,
         Box::new(ScriptedToolBrain),
-        &catalogue,
-        &gated,
-        &advertised,
+        Tools {
+            catalogue: &catalogue,
+            executor: &gated,
+            advertised: &advertised,
+        },
     )
     .expect_err("a principal without the `pull` grant is DENIED fail-closed");
 

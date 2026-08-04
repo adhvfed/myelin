@@ -13,7 +13,8 @@
 use std::sync::Mutex;
 
 use myelin_agent_host::{
-    dispatch_metered_llm_run, LlmRunTask, MicroUsd, RunSubstrateWiring, RunWallet, WalletError,
+    dispatch_metered_llm_run, LlmRunTask, MicroUsd, RunSubstrateWiring, RunWallet, Tools,
+    WalletError,
 };
 use myelin_agent_model::mock::MockModelClient;
 use myelin_agent_model::{ModelReply, ModelResponse, Usage};
@@ -150,7 +151,7 @@ fn mock_metered_run_debits_once_and_returns_the_answer() {
     .with_max_output_tokens(16)
     .with_now_secs(1000);
 
-    let report = dispatch_metered_llm_run(&wallet, region, &task, &mut wiring, Box::new(brain))
+    let report = dispatch_metered_llm_run(&wallet, region, &task, &mut wiring, Box::new(brain), Tools::none())
         .expect("the mock metered run completes");
 
     // The run SUBMITTED a non-empty text answer, captured at the ModelClient seam.
@@ -202,7 +203,7 @@ fn underfunded_wallet_halts_gracefully_without_going_negative() {
         "prompt",
     );
 
-    let err = dispatch_metered_llm_run(&wallet, region, &task, &mut wiring, Box::new(brain))
+    let err = dispatch_metered_llm_run(&wallet, region, &task, &mut wiring, Box::new(brain), Tools::none())
         .expect_err("an unfunded run cannot bill, so it halts");
     // The run halted gracefully at the spend cap — never unbilled, never negative.
     let msg = err.to_string();

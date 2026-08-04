@@ -20,7 +20,7 @@
 
 use std::sync::Arc;
 
-use myelin_agent_host::{AgentHost, CreditKind, LlmRunTask, MicroUsd, RunSubstrateWiring};
+use myelin_agent_host::{AgentHost, CreditKind, LlmRunTask, MicroUsd, RunSubstrateWiring, Tools};
 use myelin_agent_model::{LunaClient, ModelError};
 use myelin_config::MyelinConfig;
 use myelin_events::{MonotonicMinter, OutboxStore};
@@ -161,7 +161,7 @@ async fn live_luna_run_is_metered_end_to_end() {
 
     // F1: the durable wallet is threaded non-optionally — a real paid run is always billed.
     let report = host
-        .run_llm_agent(&task, &mut wiring, Box::new(luna))
+        .run(&task, &mut wiring, Box::new(luna), Tools::none())
         .expect("the live Luna run completes");
 
     // The run SUBMITTED a non-empty text answer from REAL Luna.

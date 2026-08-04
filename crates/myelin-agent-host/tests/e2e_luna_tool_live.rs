@@ -30,7 +30,7 @@ use myelin_agent::{ToolCall, ToolCallId, ToolName};
 use myelin_agent_host::{
     git_check_status_read_tool_def, git_check_status_read_tool_schema, timestamp_from_epoch,
     AgentHost, CapEnforcingExecutor, CreditKind, GitCheckStatusReadExecutor, LlmRunTask, MicroUsd,
-    RunSubstrateWiring, ToolCatalogue, GIT_READ_CHECK_STATUS_TOOL,
+    RunSubstrateWiring, ToolCatalogue, Tools, GIT_READ_CHECK_STATUS_TOOL,
 };
 use myelin_agent_model::{LunaClient, ModelError};
 use myelin_agent_service::ToolExecutor;
@@ -322,7 +322,16 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
 
     // F1: the durable wallet is threaded non-optionally — a real paid tool run is always billed.
     let report = host
-        .run_llm_agent_with_tools(&task, &mut wiring, Box::new(luna), &catalogue, &gated, &advertised)
+        .run(
+            &task,
+            &mut wiring,
+            Box::new(luna),
+            Tools {
+                catalogue: &catalogue,
+                executor: &gated,
+                advertised: &advertised,
+            },
+        )
         .expect("the live Luna tool run completes (the seeded `pull` grant ALLOWS the tool)");
 
     eprintln!("LIVE Luna tool answer: {:?}", report.answer);

@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex};
 
 use myelin_agent::{EffectKind, ToolCall, ToolDef, ToolResult};
 use myelin_agent_host::{
-    dispatch_metered_llm_run_with_tools, git_check_status_read_tool_def,
+    dispatch_metered_llm_run, git_check_status_read_tool_def,
     git_check_status_read_tool_schema, LlmRunTask, MicroUsd, RunSubstrateWiring, RunWallet,
-    ToolCatalogue, WalletError, GIT_READ_CHECK_STATUS_TOOL,
+    ToolCatalogue, Tools, WalletError, GIT_READ_CHECK_STATUS_TOOL,
 };
 use myelin_agent_model::{
     ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn, ToolCallRequest,
@@ -215,15 +215,17 @@ fn mock_tool_run_invokes_the_read_tool_and_meters_two_turns() {
     .with_max_output_tokens(64)
     .with_now_secs(1000);
 
-    let report = dispatch_metered_llm_run_with_tools(
+    let report = dispatch_metered_llm_run(
         &wallet,
         region,
         &task,
         &mut wiring,
         Box::new(ScriptedToolBrain),
-        &catalogue,
-        &executor,
-        &advertised,
+        Tools {
+            catalogue: &catalogue,
+            executor: &executor,
+            advertised: &advertised,
+        },
     )
     .expect("the mock tool run completes");
 
@@ -305,15 +307,17 @@ fn invalid_tool_arguments_are_rejected_before_the_executor_runs() {
     )
     .with_now_secs(1000);
 
-    let err = dispatch_metered_llm_run_with_tools(
+    let err = dispatch_metered_llm_run(
         &wallet,
         region,
         &task,
         &mut wiring,
         Box::new(BadArgsBrain),
-        &catalogue,
-        &executor,
-        &advertised,
+        Tools {
+            catalogue: &catalogue,
+            executor: &executor,
+            advertised: &advertised,
+        },
     )
     .expect_err("a schema-invalid tool call aborts the run fail-closed");
 
