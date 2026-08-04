@@ -69,7 +69,7 @@ use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxSto
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
 use myelin_storage::{
-    with_tenant_tx_error, DurableCostLedger, DurableSettleError, MeteredUnit, MinorUnits, PgError,
+    with_tenant_tx_error, DurableCostLedger, DurableSettleError, MeteredUnit, MicroUsd, PgError,
     RunId as CostRunId, TenantScope,
 };
 use myelin_tenancy::Region;
@@ -751,10 +751,10 @@ pub(crate) fn checked_add_accounting_usage(
 pub struct PricedCiJobUsage {
     pub pricing_revision: String,
     pub memory_gb_seconds: u64,
-    pub cpu_wholesale: MinorUnits,
-    pub cpu_markup: MinorUnits,
-    pub memory_wholesale: MinorUnits,
-    pub memory_markup: MinorUnits,
+    pub cpu_wholesale: MicroUsd,
+    pub cpu_markup: MicroUsd,
+    pub memory_wholesale: MicroUsd,
+    pub memory_markup: MicroUsd,
 }
 
 /// Frozen Tier-P settlement policy. Paired with both `ci-reserve:v1:` and (CT-007 slice 5b.3-4a.1b)
@@ -810,10 +810,10 @@ pub(crate) fn validate_reservation_pricing_policy(
     let memory_gb_seconds = usage.mem_byte_seconds.div_ceil(PRICING_GIB_BYTES);
     let exact_operational_policy = priced.pricing_revision == TIER_P_OPERATIONAL_PRICING_REVISION
         && priced.memory_gb_seconds == memory_gb_seconds
-        && priced.cpu_wholesale == MinorUnits(usage.cpu_seconds)
-        && priced.cpu_markup == MinorUnits::ZERO
-        && priced.memory_wholesale == MinorUnits(memory_gb_seconds)
-        && priced.memory_markup == MinorUnits::ZERO;
+        && priced.cpu_wholesale == MicroUsd(usage.cpu_seconds)
+        && priced.cpu_markup == MicroUsd::ZERO
+        && priced.memory_wholesale == MicroUsd(memory_gb_seconds)
+        && priced.memory_markup == MicroUsd::ZERO;
     if exact_operational_policy {
         Ok(())
     } else {

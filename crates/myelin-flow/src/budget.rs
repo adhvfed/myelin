@@ -71,7 +71,7 @@
 use crate::engine::FlowTelemetry;
 use crate::wfctx::WfCtx;
 use myelin_storage::reserve_settle::{
-    CostLedger, MeteredUnit, MinorUnits, ReserveError, RunId as LedgerRunId, SettleError,
+    CostLedger, MeteredUnit, MicroUsd, ReserveError, RunId as LedgerRunId, SettleError,
     SettleOutcome,
 };
 use myelin_tenancy::TenantId;
@@ -89,12 +89,12 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Wallet {
     /// The available balance in integer minor-units (the depleting balance reserves draw down).
-    available: MinorUnits,
+    available: MicroUsd,
 }
 
 impl Wallet {
     /// A wallet seeded with `balance` minor-units.
-    pub fn new(balance: MinorUnits) -> Wallet {
+    pub fn new(balance: MicroUsd) -> Wallet {
         Wallet { available: balance }
     }
 
@@ -102,11 +102,11 @@ impl Wallet {
     /// budget (never legal — minor-units are non-negative) is clamped to 0 (an exhausted wallet).
     pub fn from_budget(budget: &crate::RunBudget) -> Wallet {
         let units = u64::try_from(budget.minor_units).unwrap_or(0);
-        Wallet::new(MinorUnits(units))
+        Wallet::new(MicroUsd(units))
     }
 
     /// The current available balance (minor-units).
-    pub fn balance(&self) -> MinorUnits {
+    pub fn balance(&self) -> MicroUsd {
         self.available
     }
 }
@@ -125,9 +125,9 @@ pub enum BudgetError {
     /// runner. The body retries / compensates / dequeues exactly like a failed dispatch.
     Refused {
         /// The amount the dispatch asked to reserve.
-        requested: MinorUnits,
+        requested: MicroUsd,
         /// The balance available in the wallet (insufficient).
-        available: MinorUnits,
+        available: MicroUsd,
     },
     /// A reservation already exists for this `(tenant, run)` — a dispatch is reserved exactly once (the
     /// replay re-derivation must reuse the SAME ledger run-id; a double-reserve is a loud bug).
@@ -263,7 +263,7 @@ impl BudgetGate {
     }
 
     /// The current wallet balance (for the drill / consumer to observe the depletion).
-    pub fn balance(&self) -> MinorUnits {
+    pub fn balance(&self) -> MicroUsd {
         self.lock().wallet.balance()
     }
 
@@ -279,7 +279,7 @@ impl BudgetGate {
         &self,
         tenant: &TenantId,
         run: &LedgerRunId,
-        amount: MinorUnits,
+        amount: MicroUsd,
     ) -> Result<(), BudgetError> {
         if let Some(t) = &self.telemetry {
             t.record_reserve_attempt();
@@ -429,7 +429,7 @@ impl WfCtx {
     pub fn metered_activity<F>(
         &mut self,
         policy: crate::RetryPolicy,
-        cost: MinorUnits,
+        cost: MicroUsd,
         units: Vec<MeteredUnit>,
         f: F,
     ) -> crate::WfResult<Vec<myelin_refs::ArtifactRef>>
@@ -580,8 +580,8 @@ mod tests {
     fn unit(unit: &'static str, wholesale: u64, markup: u64) -> MeteredUnit {
         MeteredUnit {
             unit,
-            wholesale: MinorUnits(wholesale),
-            markup: MinorUnits(markup),
+            wholesale: MicroUsd(wholesale),
+            markup: MicroUsd(markup),
         }
     }
 
@@ -620,7 +620,7 @@ mod tests {
     fn reserve_against_empty_wallet_refuses_the_dispatch_the_activity_never_runs() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
-        let gate = BudgetGate::new(Wallet::new(MinorUnits::ZERO)); // exhausted wallet.
+        let gate = BudgetGate::new(Wallet::new(MicroUsd::ZERO)); // exhausted wallet.
         let ran = Arc::new(AtomicUsize::new(0));
         let ran_c = ran.clone();
 
@@ -628,7 +628,7 @@ mod tests {
         let err = ctx
             .metered_activity(
                 RetryPolicy::default_policy(),
-                MinorUnits(100),
+                MicroUsd(100),
                 vec![unit("llm.tokens", 80, 20)],
                 move |_idem, _att| {
                     ran_c.fetch_add(1, Ordering::SeqCst);
@@ -659,13 +659,13 @@ mod tests {
     fn funded_metered_activity_reserves_runs_and_settles_into_the_same_wallet() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(1_000)));
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
 
         let mut ctx = begin_ctx(&outbox, journal, gate.clone());
         let out = ctx
             .metered_activity(
                 RetryPolicy::default_policy(),
-                MinorUnits(100),                  // reserve 100
+                MicroUsd(100),                  // reserve 100
                 vec![unit("llm.tokens", 40, 20)], // bill 60
                 |_idem, _att| Ok(vec![ArtifactRef("myelin://acme/out".into())]),
             )
@@ -674,7 +674,7 @@ mod tests {
         // wallet: 1000 − 100 (reserve) + 40 (refund of 100−60) = 940. Billed 60 stays drawn.
         assert_eq!(
             gate.balance(),
-            MinorUnits(940),
+            MicroUsd(940),
             "settled: only the billed 60 is drawn"
         );
         let lr = LedgerRunId::new("R1/merge.queue:0");
@@ -692,7 +692,7 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         // Exactly enough for ONE reserve of 100; the second reserve has nothing left.
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(100)));
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(100)));
 
         let body_gate = gate.clone();
         let mut ctx = begin_ctx(&outbox, journal, gate.clone());
@@ -701,7 +701,7 @@ mod tests {
         let out1 = ctx
             .metered_activity(
                 RetryPolicy::default_policy(),
-                MinorUnits(100),
+                MicroUsd(100),
                 vec![unit("llm.tokens", 70, 30)], // bill exactly 100
                 |_i, _a| Ok(vec![ArtifactRef("first".into())]),
             )
@@ -709,7 +709,7 @@ mod tests {
         assert_eq!(out1, vec![ArtifactRef("first".into())]);
         assert_eq!(
             body_gate.balance(),
-            MinorUnits::ZERO,
+            MicroUsd::ZERO,
             "wallet exhausted by the first"
         );
 
@@ -719,7 +719,7 @@ mod tests {
         let err = ctx
             .metered_activity(
                 RetryPolicy::default_policy(),
-                MinorUnits(50),
+                MicroUsd(50),
                 vec![unit("llm.tokens", 30, 20)],
                 move |_i, _a| {
                     ran2_c.fetch_add(1, Ordering::SeqCst);
@@ -750,7 +750,7 @@ mod tests {
         let journal = WfJournal::new();
         let signals = SignalStore::new();
         let runner = RecordingRunner::default();
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(500)));
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(500)));
 
         // The job.done is already buffered (a fast job) under the deterministic dispatch token.
         // metered_schedule_and_run_job's first command is the RESERVE marker? No — reserve is not a
@@ -780,7 +780,7 @@ mod tests {
                 JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
                 &runner,
                 None,
-                MinorUnits(200),                  // reserve 200 for the job
+                MicroUsd(200),                  // reserve 200 for the job
                 vec![unit("ci.minute", 100, 50)], // bill 150 on completion
             )
             .expect("dispatch + complete");
@@ -795,7 +795,7 @@ mod tests {
         // wallet: 500 − 200 (reserve) + 50 (refund of 200−150) = 350.
         assert_eq!(
             gate.balance(),
-            MinorUnits(350),
+            MicroUsd(350),
             "settled the job into the same wallet"
         );
         assert_eq!(gate.inflight_interrupt_count(), 0, "0 interrupts");
@@ -810,7 +810,7 @@ mod tests {
         let journal = WfJournal::new();
         let signals = SignalStore::new();
         let runner = RecordingRunner::default();
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(500)));
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(500)));
         let spec = || JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-8");
         let units = || vec![unit("ci.minute", 100, 50)];
 
@@ -828,14 +828,14 @@ mod tests {
         .with_budget(gate.clone());
         assert_eq!(
             first
-                .metered_schedule_and_run_job(spec(), &runner, None, MinorUnits(200), units(),)
+                .metered_schedule_and_run_job(spec(), &runner, None, MicroUsd(200), units(),)
                 .unwrap(),
             JobOutcome::Parked
         );
         first.commit().unwrap();
         assert_eq!(
             gate.balance(),
-            MinorUnits(300),
+            MicroUsd(300),
             "the dispatch reserve is held"
         );
 
@@ -860,14 +860,14 @@ mod tests {
         .with_budget(gate.clone());
         assert!(matches!(
             resumed
-                .metered_schedule_and_run_job(spec(), &runner, None, MinorUnits(200), units(),)
+                .metered_schedule_and_run_job(spec(), &runner, None, MicroUsd(200), units(),)
                 .unwrap(),
             JobOutcome::Completed { .. }
         ));
         resumed.commit().unwrap();
         assert_eq!(
             gate.balance(),
-            MinorUnits(350),
+            MicroUsd(350),
             "the unused 50 is refunded once"
         );
 
@@ -886,13 +886,13 @@ mod tests {
         .with_budget(gate.clone());
         assert!(matches!(
             replay
-                .metered_schedule_and_run_job(spec(), &runner, None, MinorUnits(200), units(),)
+                .metered_schedule_and_run_job(spec(), &runner, None, MicroUsd(200), units(),)
                 .unwrap(),
             JobOutcome::Completed { .. }
         ));
         assert_eq!(
             gate.balance(),
-            MinorUnits(350),
+            MicroUsd(350),
             "replay cannot double-refund"
         );
         assert_eq!(
@@ -911,7 +911,7 @@ mod tests {
         let journal = WfJournal::new();
         let signals = SignalStore::new();
         let runner = RecordingRunner::default();
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(50))); // not enough for a 200 reserve.
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(50))); // not enough for a 200 reserve.
 
         let mut ctx = WfCtx::begin(
             &outbox,
@@ -931,7 +931,7 @@ mod tests {
                 JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-7"),
                 &runner,
                 None,
-                MinorUnits(200),
+                MicroUsd(200),
                 vec![unit("ci.minute", 100, 50)],
             )
             .expect_err("an exhausted wallet refuses the dispatch");
@@ -947,24 +947,24 @@ mod tests {
     /// same run twice refunds the over-reservation ONCE.
     #[test]
     fn double_settle_does_not_double_credit_the_wallet() {
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(1_000)));
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
         let lr = LedgerRunId::new("R1/cmd:0");
-        gate.reserve(&tenant(), &lr, MinorUnits(100)).unwrap();
+        gate.reserve(&tenant(), &lr, MicroUsd(100)).unwrap();
         gate.begin(&tenant(), &lr).unwrap();
-        assert_eq!(gate.balance(), MinorUnits(900), "reserved 100");
+        assert_eq!(gate.balance(), MicroUsd(900), "reserved 100");
 
         let units = vec![unit("u", 40, 20)]; // bill 60
         gate.settle(&tenant(), &lr, &units).unwrap();
         assert_eq!(
             gate.balance(),
-            MinorUnits(940),
+            MicroUsd(940),
             "refunded 40 once (900 + 40)"
         );
         // Re-settle: same outcome, NO further refund.
         gate.settle(&tenant(), &lr, &units).unwrap();
         assert_eq!(
             gate.balance(),
-            MinorUnits(940),
+            MicroUsd(940),
             "no double-credit on re-settle"
         );
     }
@@ -974,18 +974,18 @@ mod tests {
     #[test]
     fn reject_rate_telemetry_records_attempts_rejects_and_settles() {
         let telemetry = FlowTelemetry::new();
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(100))).with_telemetry(telemetry.clone());
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(100))).with_telemetry(telemetry.clone());
 
         // Reserve 1: admits (wallet 100 → 0).
         let lr1 = LedgerRunId::new("R1/cmd:0");
-        gate.reserve(&tenant(), &lr1, MinorUnits(100))
+        gate.reserve(&tenant(), &lr1, MicroUsd(100))
             .expect("admits");
         gate.begin(&tenant(), &lr1).unwrap();
         gate.settle(&tenant(), &lr1, &[unit("u", 100, 0)]).unwrap();
 
         // Reserve 2: refused (wallet empty).
         let lr2 = LedgerRunId::new("R1/cmd:1");
-        gate.reserve(&tenant(), &lr2, MinorUnits(50))
+        gate.reserve(&tenant(), &lr2, MicroUsd(50))
             .expect_err("refused");
 
         assert_eq!(telemetry.reserve_attempted(), 2, "two reserve attempts");
@@ -1017,7 +1017,7 @@ mod tests {
         let out = ctx
             .metered_activity(
                 RetryPolicy::default_policy(),
-                MinorUnits(100),
+                MicroUsd(100),
                 vec![unit("u", 10, 0)],
                 |_i, _a| Ok(vec![ArtifactRef("ran".into())]),
             )
@@ -1032,19 +1032,19 @@ mod tests {
     fn replay_re_keys_the_reserve_identically_no_double_debit() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(1_000)));
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
 
         // DRIVE 1: reserve 100 + bill 60 → wallet 940, journaled.
         let mut c1 = begin_ctx(&outbox, journal.clone(), gate.clone());
         c1.metered_activity(
             RetryPolicy::default_policy(),
-            MinorUnits(100),
+            MicroUsd(100),
             vec![unit("u", 40, 20)],
             |_i, _a| Ok(vec![ArtifactRef("v1".into())]),
         )
         .expect("drive 1");
         c1.commit().expect("co-commit");
-        assert_eq!(gate.balance(), MinorUnits(940), "drive 1 drew 60");
+        assert_eq!(gate.balance(), MicroUsd(940), "drive 1 drew 60");
         let history = journal.history_for(&tenant(), "R1");
 
         // DRIVE 2 (re-drive): resume over the journal. The reserve hits the duplicate guard (no
@@ -1064,7 +1064,7 @@ mod tests {
         let out2 = c2
             .metered_activity(
                 RetryPolicy::default_policy(),
-                MinorUnits(100),
+                MicroUsd(100),
                 vec![unit("u", 40, 20)],
                 |_i, _a| panic!("the activity must NOT re-run on replay"),
             )
@@ -1076,7 +1076,7 @@ mod tests {
         );
         assert_eq!(
             gate.balance(),
-            MinorUnits(940),
+            MicroUsd(940),
             "0 DOUBLE-DEBIT on replay (re-keyed identically)"
         );
     }
@@ -1095,13 +1095,13 @@ mod tests {
         let journal = WfJournal::new();
         let telemetry = FlowTelemetry::new();
         let gate =
-            BudgetGate::new(Wallet::new(MinorUnits(1_000))).with_telemetry(telemetry.clone());
+            BudgetGate::new(Wallet::new(MicroUsd(1_000))).with_telemetry(telemetry.clone());
 
         let mut ctx = begin_ctx(&outbox, journal, gate.clone());
         let err = ctx
             .metered_activity(
                 RetryPolicy { max_attempts: 2 },
-                MinorUnits(100),                  // reserve 100 (wallet 1000 → 900)
+                MicroUsd(100),                  // reserve 100 (wallet 1000 → 900)
                 vec![unit("llm.tokens", 40, 20)], // the would-be billing — NOT charged on failure
                 |_idem, attempt| Err(crate::ActivityError(format!("hard failure {attempt}"))),
             )
@@ -1116,7 +1116,7 @@ mod tests {
         // nothing). Before the fix this leaked at 900 (the reservation stayed InFlight, never refunded).
         assert_eq!(
             gate.balance(),
-            MinorUnits(1_000),
+            MicroUsd(1_000),
             "the reservation is fully refunded on exhaustion (no leak)"
         );
         // The reservation is Settled — NOT orphaned InFlight.
@@ -1146,7 +1146,7 @@ mod tests {
     fn re_drive_after_exhaustion_does_not_double_refund() {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(1_000)));
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
 
         // DRIVE 1: reserve 100 (wallet → 900), begin, activity exhausts → settle(zero units) refunds 100
         // (wallet → 1000), then journal the activity_failed on commit.
@@ -1154,7 +1154,7 @@ mod tests {
         let err1 = c1
             .metered_activity(
                 RetryPolicy { max_attempts: 1 },
-                MinorUnits(100),
+                MicroUsd(100),
                 vec![unit("u", 40, 20)],
                 |_i, _a| Err(crate::ActivityError("boom".into())),
             )
@@ -1163,7 +1163,7 @@ mod tests {
         c1.commit().expect("co-commit journals the activity_failed");
         assert_eq!(
             gate.balance(),
-            MinorUnits(1_000),
+            MicroUsd(1_000),
             "drive 1 refunded the full reservation"
         );
         let history = journal.history_for(&tenant(), "R1");
@@ -1186,7 +1186,7 @@ mod tests {
         let err2 = c2
             .metered_activity(
                 RetryPolicy { max_attempts: 1 },
-                MinorUnits(100),
+                MicroUsd(100),
                 vec![unit("u", 40, 20)],
                 |_i, _a| panic!("the activity must NOT re-run on replay"),
             )
@@ -1194,7 +1194,7 @@ mod tests {
         assert!(matches!(err2, crate::WfError::ActivityExhausted(_)));
         assert_eq!(
             gate.balance(),
-            MinorUnits(1_000),
+            MicroUsd(1_000),
             "0 DOUBLE-REFUND on replay (the settle is idempotent)"
         );
     }
@@ -1203,11 +1203,11 @@ mod tests {
     #[test]
     fn wallet_from_budget_seeds_and_clamps() {
         let w = Wallet::from_budget(&crate::RunBudget { minor_units: 500 });
-        assert_eq!(w.balance(), MinorUnits(500));
+        assert_eq!(w.balance(), MicroUsd(500));
         let neg = Wallet::from_budget(&crate::RunBudget { minor_units: -5 });
         assert_eq!(
             neg.balance(),
-            MinorUnits::ZERO,
+            MicroUsd::ZERO,
             "a negative budget is an empty wallet"
         );
     }
@@ -1220,9 +1220,9 @@ mod tests {
     #[test]
     fn begin_moves_reservation_reserved_to_in_flight() {
         use myelin_storage::reserve_settle::ReservationState;
-        let gate = BudgetGate::new(Wallet::new(MinorUnits(1_000)));
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
         let lr = LedgerRunId::new("R1/cmd:0");
-        gate.reserve(&tenant(), &lr, MinorUnits(100)).unwrap();
+        gate.reserve(&tenant(), &lr, MicroUsd(100)).unwrap();
         assert_eq!(
             gate.state_of(&tenant(), &lr),
             Some(ReservationState::Reserved),
@@ -1246,8 +1246,8 @@ mod tests {
     #[test]
     fn budget_errors_display_loud_and_specific() {
         let refused = BudgetError::Refused {
-            requested: MinorUnits(200),
-            available: MinorUnits(50),
+            requested: MicroUsd(200),
+            available: MicroUsd(50),
         }
         .to_string();
         assert!(

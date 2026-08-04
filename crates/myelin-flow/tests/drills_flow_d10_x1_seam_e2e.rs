@@ -42,7 +42,7 @@ use myelin_flow::{
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
-use myelin_storage::reserve_settle::MinorUnits;
+use myelin_storage::reserve_settle::MicroUsd;
 use myelin_tenancy::{Region, TenantId};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -117,7 +117,7 @@ fn merge_queue_body(ci: Arc<CountingCi>, merger: Arc<CountingMerger>) -> Box<Wor
                 ci.as_ref(),
                 merger.as_ref(),
                 Some(3600),
-                MinorUnits(0),
+                MicroUsd(0),
                 vec![],
             )
             .map_err(|e| format!("{e:?}"))?;

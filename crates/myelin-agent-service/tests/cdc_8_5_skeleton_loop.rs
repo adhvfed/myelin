@@ -19,7 +19,7 @@ use myelin_agent_service::{
 use myelin_flow::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenMinter, WfJournal};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_storage::agent_run_gate::AgentRunGate;
-use myelin_storage::reserve_settle::{CostLedger, MinorUnits};
+use myelin_storage::reserve_settle::{CostLedger, MicroUsd};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
@@ -107,8 +107,8 @@ fn provider_skeleton_loop_drives_the_chained_substrate_path() {
         wallet: None,
         gate: &mut gate,
         ledger: &mut ledger,
-        available: MinorUnits(100),
-        estimate: MinorUnits(10),
+        available: MicroUsd(100),
+        estimate: MicroUsd(10),
         outbox: &outbox,
         minter: Arc::new(myelin_events::MonotonicMinter::new()),
         journal: WfJournal::new(),
@@ -180,8 +180,8 @@ fn consumer_loop_drives_any_runtime_through_the_dyn_seam() {
         wallet: None,
         gate: &mut gate,
         ledger: &mut ledger,
-        available: MinorUnits(100),
-        estimate: MinorUnits(10),
+        available: MicroUsd(100),
+        estimate: MicroUsd(10),
         outbox: &outbox,
         minter: Arc::new(myelin_events::MonotonicMinter::new()),
         journal: WfJournal::new(),

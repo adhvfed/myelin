@@ -96,7 +96,7 @@
 //! retry storm), is the failure this exists to catch.
 
 use myelin_identity::Principal;
-use myelin_storage::{AgentRunGate, CostLedger, DispatchError, MinorUnits, RunId};
+use myelin_storage::{AgentRunGate, CostLedger, DispatchError, MicroUsd, RunId};
 use myelin_substrate::shed::{
     RunClass, RunClassHeader, ShedDecision, ShedLane, Surface, SurfaceBudget,
 };
@@ -223,8 +223,8 @@ impl AgentDispatchSurgeGate {
         tenant: &TenantId,
         run: RunId,
         class: RunClass,
-        estimate: MinorUnits,
-        available: MinorUnits,
+        estimate: MicroUsd,
+        available: MicroUsd,
     ) -> Result<(), DispatchFrontError> {
         // 1. The concurrency front: admit-or-shed at the per-tenant in-flight cap.
         self.admit_dispatch(tenant, class)
@@ -445,12 +445,12 @@ pub fn run_agent_dispatch_surge(
     surging: &TenantId,
     quiet: &TenantId,
     storm_agent_ops: u64,
-    per_run: MinorUnits,
-    wallet: MinorUnits,
+    per_run: MicroUsd,
+    wallet: MicroUsd,
     _multiplier: u32,
 ) -> AgentDispatchSurgeReport {
     let mut agent_shed_retry_after_secs = 0u64;
-    let mut spent = MinorUnits::ZERO;
+    let mut spent = MicroUsd::ZERO;
 
     // ── Phase 1: the concurrency front. Offer the whole burst to the lane (a simultaneous arrival).
     // The lane admits up to its non-human budget CONCURRENTLY then sheds the excess (429 + Retry-After);
@@ -476,7 +476,7 @@ pub fn run_agent_dispatch_surge(
     // in-flight funded prefix); a refused run releases its (never-started) lane slot so the lane bounds
     // STARTED-run concurrency, not refused attempts.
     for i in lane_admitted {
-        let remaining = wallet.checked_sub(spent).unwrap_or(MinorUnits::ZERO);
+        let remaining = wallet.checked_sub(spent).unwrap_or(MicroUsd::ZERO);
         let run = RunId::new(format!("01J0SURGE_{i}"));
         match reserve_gate.dispatch(ledger, surging.clone(), run, per_run, remaining) {
             Ok(_in_flight) => {
@@ -777,8 +777,8 @@ mod tests {
             &t,
             RunId::new("r1".to_string()),
             RunClass::Agent,
-            MinorUnits(100),
-            MinorUnits(1_000),
+            MicroUsd(100),
+            MicroUsd(1_000),
         )
         .expect("admitted at both fronts");
         assert_eq!(gate.runs_dispatched(), 1, "the run was fronted");
@@ -800,8 +800,8 @@ mod tests {
                 &t,
                 RunId::new("r1".to_string()),
                 RunClass::Agent,
-                MinorUnits(9_000),
-                MinorUnits(10),
+                MicroUsd(9_000),
+                MicroUsd(10),
             )
             .expect_err("the wallet refuses an over-budget dispatch");
         assert!(matches!(err, DispatchFrontError::Reserve(_)));
@@ -879,8 +879,8 @@ mod tests {
             &surging,
             &quiet,
             50,
-            MinorUnits(100),
-            MinorUnits(300),
+            MicroUsd(100),
+            MicroUsd(300),
             AGENT_DISPATCH_SURGE_MULTIPLIER,
         );
         assert!(report.is_ag_d6_green(), "{}", report.summary());
@@ -930,9 +930,9 @@ mod tests {
             &tenant("noisy"),
             &tenant("quiet"),
             100,
-            MinorUnits(100),
+            MicroUsd(100),
             // a huge wallet too, so neither front sheds — the report MUST read RED (no shed, no refusal).
-            MinorUnits(1_000_000),
+            MicroUsd(1_000_000),
             AGENT_DISPATCH_SURGE_MULTIPLIER,
         );
         assert_eq!(

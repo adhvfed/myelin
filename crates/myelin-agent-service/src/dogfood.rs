@@ -57,7 +57,7 @@
 //! test), §5 (the ratchet runs on the builders' own work). **VISION §3/§5** (dogfooding).
 
 use myelin_content::{Block, Inline, Span};
-use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MinorUnits, RunId as StorageRunId};
+use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MicroUsd, RunId as StorageRunId};
 use myelin_tenancy::TenantId;
 
 use crate::dispatch::{classify, DispatchDecision, DispatchTrigger};
@@ -168,8 +168,8 @@ pub fn run_myelin_triage_on_ci_failure(commit_oid: &str, run_id: u128) -> Triage
         .reserve(
             myelin_tenant(),
             storage_run.clone(),
-            MinorUnits(TRIAGE_ESTIMATE),
-            MinorUnits(MYELIN_WALLET),
+            MicroUsd(TRIAGE_ESTIMATE),
+            MicroUsd(MYELIN_WALLET),
         )
         .expect("the funded Myelin self-tenant wallet reserves the triage run at dispatch");
     ledger

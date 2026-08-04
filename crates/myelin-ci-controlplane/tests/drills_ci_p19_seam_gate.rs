@@ -45,7 +45,7 @@ use myelin_events::{
 use myelin_flow::engine::SignalRow;
 use myelin_flow::{
     job_idem_token, merge_attempt_id, stage_verdict_marker, ActivityError, CiDispatch,
-    CiDispatcher, CiStage, MergeOutcome, MergeRequest, MinorUnits, SignalStore, TimerStore, WfCtx,
+    CiDispatcher, CiStage, MergeOutcome, MergeRequest, MicroUsd, SignalStore, TimerStore, WfCtx,
     WfJournal, JOB_DONE_SIGNAL,
 };
 use myelin_git::check_status::{
@@ -126,13 +126,13 @@ fn ci_run(merge_idem_token: &str, trust_tier: &str) -> PipelineRun {
             PipelineStage::job(CiStage::new(
                 "build",
                 "pipeline://acme/ci/run-7#build",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(3600),
             )),
             PipelineStage::job(CiStage::new(
                 "test",
                 "pipeline://acme/ci/run-7#test",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(3600),
             )),
         ],
@@ -370,7 +370,7 @@ fn git_d10_ci_d8_full_seam_gate_from_ci_real_producer() {
         });
         let mut wf = begin_merge_queue(&outbox, mq_signals.clone());
         let out = wf
-            .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+            .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
             .expect("dispatch + dequeue");
         match out {
             MergeOutcome::Dequeued { reason } => {
@@ -417,7 +417,7 @@ fn git_d10_ci_d8_full_seam_gate_from_ci_real_producer() {
     );
     let mut wf = begin_merge_queue(&outbox2, mq_signals2.clone());
     let out = wf
-        .run_merge_attempt(&request(), &ci2, &merger, None, MinorUnits(0), vec![])
+        .run_merge_attempt(&request(), &ci2, &merger, None, MicroUsd(0), vec![])
         .expect("dispatch + merge");
     match out {
         MergeOutcome::Merged {
@@ -511,7 +511,7 @@ fn ci_d8_failure_rollup_dequeues_no_merge() {
     });
     let mut wf = begin_merge_queue(&outbox, mq_signals);
     let out = wf
-        .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+        .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
         .expect("dispatch + dequeue");
     match out {
         MergeOutcome::Dequeued { reason } => {

@@ -65,7 +65,7 @@ use myelin_ci_sandbox::{
     RunTokenCredential, TrustTier, WorkspaceSpec,
 };
 use myelin_flow::SignalStore;
-use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MinorUnits, RunId as LedgerRunId};
+use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MicroUsd, RunId as LedgerRunId};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::check_emitter::{
@@ -361,11 +361,11 @@ pub fn run_e2e2_ci_flagship_slice() -> E2eArtifact {
         .reserve(
             tenant(),
             run.clone(),
-            MinorUnits(ESTIMATE),
-            MinorUnits(WALLET),
+            MicroUsd(ESTIMATE),
+            MicroUsd(WALLET),
         )
         .expect("a funded wallet reserves the CI run at dispatch (no balance → no run)");
-    let reserved_estimate = reservation.reserved == MinorUnits(ESTIMATE);
+    let reserved_estimate = reservation.reserved == MicroUsd(ESTIMATE);
     ledger
         .begin(&tenant(), &run)
         .expect("the reserved run begins flight (the reservation's only exit is settle)");
@@ -373,13 +373,13 @@ pub fn run_e2e2_ci_flagship_slice() -> E2eArtifact {
     let units = vec![
         MeteredUnit {
             unit: "ci.cpu_second",
-            wholesale: MinorUnits(8),
-            markup: MinorUnits(2),
+            wholesale: MicroUsd(8),
+            markup: MicroUsd(2),
         },
         MeteredUnit {
             unit: "ci.artifact_byte",
-            wholesale: MinorUnits(3),
-            markup: MinorUnits(1),
+            wholesale: MicroUsd(3),
+            markup: MicroUsd(1),
         },
     ];
     let settle = ledger
@@ -549,20 +549,20 @@ mod tests {
         let mut ledger = CostLedger::new();
         let run = LedgerRunId::new(FIX_RUN);
         let r = ledger
-            .reserve(tenant(), run.clone(), MinorUnits(20), MinorUnits(100))
+            .reserve(tenant(), run.clone(), MicroUsd(20), MicroUsd(100))
             .unwrap();
-        assert_eq!(r.reserved, MinorUnits(20));
+        assert_eq!(r.reserved, MicroUsd(20));
         ledger.begin(&tenant(), &run).unwrap();
         let units = vec![
             MeteredUnit {
                 unit: "ci.cpu_second",
-                wholesale: MinorUnits(8),
-                markup: MinorUnits(2),
+                wholesale: MicroUsd(8),
+                markup: MicroUsd(2),
             },
             MeteredUnit {
                 unit: "ci.artifact_byte",
-                wholesale: MinorUnits(3),
-                markup: MinorUnits(1),
+                wholesale: MicroUsd(3),
+                markup: MicroUsd(1),
             },
         ];
         let s = ledger.settle(&tenant(), &run, &units).unwrap();

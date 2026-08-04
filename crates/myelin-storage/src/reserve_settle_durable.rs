@@ -32,7 +32,7 @@
 //! `with_tenant_tx` transaction (read current state → decide → write), so reserve/settle/cancel are
 //! atomic per `(tenant, run)`.
 //!
-//! Amounts are `u64` minor-units; Postgres `bigint` is `i64`. Values round-trip via a lossless
+//! Amounts are `u64` micro-USD; Postgres `bigint` is `i64`. Values round-trip via a lossless
 //! two's-complement reinterpret (`as i64` / `as u64`) and ALL arithmetic (sum/cap/refund) is done in
 //! Rust on the `u64` side (checked), so the full `u64` range is exact.
 
@@ -44,7 +44,7 @@ use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
 use crate::reserve_settle::{
-    CostEvent, MeteredUnit, MinorUnits, Reservation, ReservationState, ReserveError, RunId,
+    CostEvent, MeteredUnit, MicroUsd, Reservation, ReservationState, ReserveError, RunId,
     SettleError, SettleOutcome,
 };
 
@@ -198,8 +198,8 @@ impl DurableCostLedger {
         &self,
         tenant: TenantId,
         run: RunId,
-        amount: MinorUnits,
-        available: MinorUnits,
+        amount: MicroUsd,
+        available: MicroUsd,
     ) -> Result<Reservation, ReserveError> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
@@ -321,7 +321,7 @@ impl DurableCostLedger {
         conn: &mut sqlx::PgConnection,
         tenant: &TenantId,
         run: &RunId,
-    ) -> Result<MinorUnits, DurableSettleError> {
+    ) -> Result<MicroUsd, DurableSettleError> {
         let tenant_s = tenant.0.as_str();
         let region = self.region();
         let row = sqlx::query(
@@ -335,7 +335,7 @@ impl DurableCostLedger {
         .await
         .map_err(|_| DurableSettleError::Store)?
         .ok_or(DurableSettleError::Ledger(SettleError::NoSuchReservation))?;
-        let reserved = MinorUnits(
+        let reserved = MicroUsd(
             row.try_get::<i64, _>("reserved")
                 .map_err(|_| DurableSettleError::Store)? as u64,
         );
@@ -370,7 +370,7 @@ impl DurableCostLedger {
         &self,
         tenant: &TenantId,
         run: &RunId,
-    ) -> Result<MinorUnits, SettleError> {
+    ) -> Result<MicroUsd, SettleError> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
         let run_s = run.0.clone();
@@ -390,7 +390,7 @@ impl DurableCostLedger {
                     return Ok(Err(SettleError::NoSuchReservation));
                 };
                 let reserved =
-                    MinorUnits(row.try_get::<i64, _>("reserved").map_err(cost_row_decode)? as u64);
+                    MicroUsd(row.try_get::<i64, _>("reserved").map_err(cost_row_decode)? as u64);
                 let state = row.try_get::<String, _>("state").map_err(cost_row_decode)?;
                 match parse_state(&state)? {
                     ReservationState::Reserved => {
@@ -528,7 +528,7 @@ async fn settle_on_conn(
     let Some(row) = row else {
         return Ok(Err(SettleError::NoSuchReservation));
     };
-    let reserved = MinorUnits(row.try_get::<i64, _>("reserved").map_err(cost_row_decode)? as u64);
+    let reserved = MicroUsd(row.try_get::<i64, _>("reserved").map_err(cost_row_decode)? as u64);
     let state = row.try_get::<String, _>("state").map_err(cost_row_decode)?;
     let state = parse_state(&state)?;
 
@@ -614,8 +614,8 @@ async fn recorded_events(
     rows_to_events(tenant_s, run_s, &rows)
 }
 
-fn outcome_for(events: Vec<CostEvent>, reserved: MinorUnits) -> Result<SettleOutcome, SettleError> {
-    let mut billed = MinorUnits::ZERO;
+fn outcome_for(events: Vec<CostEvent>, reserved: MicroUsd) -> Result<SettleOutcome, SettleError> {
+    let mut billed = MicroUsd::ZERO;
     for e in &events {
         let t = match e.billed() {
             Some(t) => t,
@@ -662,10 +662,10 @@ fn rows_to_events(
                 // carries the durable label — no `Box::leak` (the pre-W6b2 `&'static str` workaround
                 // is gone).
                 unit,
-                wholesale: MinorUnits(
+                wholesale: MicroUsd(
                     r.try_get::<i64, _>("wholesale").map_err(cost_row_decode)? as u64
                 ),
-                markup: MinorUnits(r.try_get::<i64, _>("markup").map_err(cost_row_decode)? as u64),
+                markup: MicroUsd(r.try_get::<i64, _>("markup").map_err(cost_row_decode)? as u64),
             })
         })
         .collect()

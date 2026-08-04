@@ -25,7 +25,7 @@ use myelin_chat::tools::{
     ChatDryRun, PostCostEstimate, ARCHIVE_CHANNEL_TOOL, CHAT_TOOL_NAMES, CREATE_CHANNEL_TOOL,
     INVITE_TOOL, POST_TOOL, REACT_TOOL, REPLY_IN_THREAD_TOOL, START_DM_TOOL,
 };
-use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MinorUnits, ReserveError, RunId};
+use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MicroUsd, ReserveError, RunId};
 use myelin_tenancy::TenantId;
 
 /// The REAL fabric catalogue shape (a `myelin_agent::ToolSurface` impl) — the PROVIDER the 8.1 CDC
@@ -164,7 +164,7 @@ fn cdc_8_7_dry_run_returns_the_plan_without_applying() {
 fn cdc_11_7_reserve_settle_fronts_a_spend_bearing_post() {
     let tenant = TenantId("acme".into());
     let mut ledger = CostLedger::new();
-    let estimate = PostCostEstimate(MinorUnits(50));
+    let estimate = PostCostEstimate(MicroUsd(50));
 
     // no balance → no post (the reserve REFUSES; nothing is written).
     let refused = reserve_spend_bearing_post(
@@ -172,7 +172,7 @@ fn cdc_11_7_reserve_settle_fronts_a_spend_bearing_post() {
         tenant.clone(),
         RunId::new("run-broke"),
         estimate,
-        MinorUnits(0),
+        MicroUsd(0),
     );
     assert!(matches!(
         refused,
@@ -186,23 +186,23 @@ fn cdc_11_7_reserve_settle_fronts_a_spend_bearing_post() {
         tenant.clone(),
         run.clone(),
         estimate,
-        MinorUnits(100),
+        MicroUsd(100),
     )
     .expect("a funded post reserves");
     ledger.begin(&tenant, &run).expect("begin in-flight");
     let units = [MeteredUnit {
         unit: "agent.effect",
-        wholesale: MinorUnits(30),
-        markup: MinorUnits(5),
+        wholesale: MicroUsd(30),
+        markup: MicroUsd(5),
     }];
     let outcome = settle_spend_bearing_post(&mut ledger, &tenant, &run, &units).expect("settle");
     assert_eq!(
         outcome.billed_total,
-        MinorUnits(35),
+        MicroUsd(35),
         "billed = wholesale + markup"
     );
     assert!(
-        outcome.billed_total <= MinorUnits(50),
+        outcome.billed_total <= MicroUsd(50),
         "settle never exceeds the reserve (the gate's whole point)"
     );
     // chat never interrupts in-flight.

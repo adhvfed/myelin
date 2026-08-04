@@ -61,7 +61,7 @@ use myelin_ci_sandbox::{
 use myelin_events::{Actor, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::{
     migrations::migrations as flow_migrations, partition_for_run_id, CiStage, DriveOutcome,
-    DurableExecutor, ExecutorError, MinorUnits, PgFlowExecutor, PgFlowWorker, PgRunOnceOutcome,
+    DurableExecutor, ExecutorError, MicroUsd, PgFlowExecutor, PgFlowWorker, PgRunOnceOutcome,
     PgWorkerScope, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE, JOB_DONE_SIGNAL,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -553,7 +553,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
         stages: vec![PipelineStage::job(CiStage::new(
             "build",
             stage_target,
-            MinorUnits(0),
+            MicroUsd(0),
             Some(3600),
         ))],
         contexts: vec!["build".into()],
@@ -924,7 +924,7 @@ async fn arm_and_dispatch(
         stages: vec![PipelineStage::job(CiStage::new(
             "build",
             "pipeline://myelin/self#build",
-            MinorUnits(0),
+            MicroUsd(0),
             Some(3600),
         ))],
         contexts: vec!["build".into()],

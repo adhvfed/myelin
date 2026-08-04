@@ -31,7 +31,7 @@ use myelin_flow::{
 use myelin_harness::{Dependency, DependencyBreaker, Predicate, Scope, SignalSource};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
-use myelin_storage::reserve_settle::{MeteredUnit, MinorUnits};
+use myelin_storage::reserve_settle::{MeteredUnit, MicroUsd};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -64,8 +64,8 @@ fn ctx_base() -> EmitContextBase {
 fn unit(wholesale: u64, markup: u64) -> MeteredUnit {
     MeteredUnit {
         unit: "agent.step",
-        wholesale: MinorUnits(wholesale),
-        markup: MinorUnits(markup),
+        wholesale: MicroUsd(wholesale),
+        markup: MicroUsd(markup),
     }
 }
 
@@ -98,7 +98,7 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
     let journal = WfJournal::new();
     let telemetry = FlowTelemetry::new();
     // The depleting wallet: 300 minor-units = room for exactly THREE 100-unit dispatches.
-    let gate = BudgetGate::new(Wallet::new(MinorUnits(300))).with_telemetry(telemetry.clone());
+    let gate = BudgetGate::new(Wallet::new(MicroUsd(300))).with_telemetry(telemetry.clone());
 
     // (1) INJECT the runaway condition: the loop is "broken open" (it keeps feeding itself). The SAME
     //     tenant-scoped Broker seam BUS-D4 / FLOW-D5 use.
@@ -129,7 +129,7 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
         let ran_c = ran.clone();
         let res = ctx.metered_activity(
             RetryPolicy::default_policy(),
-            MinorUnits(100),
+            MicroUsd(100),
             vec![unit(70, 30)], // bill exactly 100 — full draw, no refund
             move |_idem, _att| {
                 ran_c.fetch_add(1, Ordering::SeqCst);
@@ -157,7 +157,7 @@ fn drill_flow_d6_runaway_activity_loop_refused_when_exhausted_inflight_never_int
         3,
         "ONLY the 3 funded activities ran (the 7 never started)"
     );
-    assert_eq!(gate.balance(), MinorUnits::ZERO, "the wallet is exhausted");
+    assert_eq!(gate.balance(), MicroUsd::ZERO, "the wallet is exhausted");
 
     let mut signals = SignalSource::new();
     // reserve-reject count > 0 (the depleting wallet refused new dispatches) — the headline green.
@@ -218,7 +218,7 @@ fn drill_flow_d6_runaway_dispatch_loop_refused_when_exhausted_runner_never_calle
     let telemetry = FlowTelemetry::new();
     let runner = CountingRunner::default();
     // The depleting wallet: 400 = room for exactly TWO 200-unit dispatches.
-    let gate = BudgetGate::new(Wallet::new(MinorUnits(400))).with_telemetry(telemetry.clone());
+    let gate = BudgetGate::new(Wallet::new(MicroUsd(400))).with_telemetry(telemetry.clone());
 
     let mut refused = 0u32;
     let mut completed = 0u32;
@@ -258,7 +258,7 @@ fn drill_flow_d6_runaway_dispatch_loop_refused_when_exhausted_runner_never_calle
             JobSpec::new(JobKind::Agent, "agent://acme/job/loop"),
             &runner,
             None,
-            MinorUnits(200),
+            MicroUsd(200),
             vec![unit(120, 80)], // bill exactly 200 — full draw
         );
         match res {
@@ -280,7 +280,7 @@ fn drill_flow_d6_runaway_dispatch_loop_refused_when_exhausted_runner_never_calle
     );
     assert_eq!(
         gate.balance(),
-        MinorUnits::ZERO,
+        MicroUsd::ZERO,
         "the wallet is exhausted (2 × 200 drawn)"
     );
 

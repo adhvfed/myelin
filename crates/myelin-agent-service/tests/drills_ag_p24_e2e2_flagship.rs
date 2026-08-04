@@ -84,7 +84,7 @@ use myelin_identity::{
     CaveatContext, Consistency, Decision, EffectivePolicy, Permission, Principal, PrincipalId,
     PrincipalKind, RuntimeRef, Zookie,
 };
-use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MinorUnits, RunId as StorageRunId};
+use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MicroUsd, RunId as StorageRunId};
 use myelin_tenancy::{ArtifactRef, TenantId};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap};
@@ -530,13 +530,13 @@ fn ag_p24_e2e2_flagship_green_end_to_end() {
         .reserve(
             tenant(),
             storage_run.clone(),
-            MinorUnits(RUN_ESTIMATE),
-            MinorUnits(FUNDED_WALLET),
+            MicroUsd(RUN_ESTIMATE),
+            MicroUsd(FUNDED_WALLET),
         )
         .expect("a funded wallet reserves the run at dispatch (no balance → no run)");
     assert_eq!(
         reservation.reserved,
-        MinorUnits(RUN_ESTIMATE),
+        MicroUsd(RUN_ESTIMATE),
         "reserved exactly the estimate at dispatch"
     );
     // mark the run in-flight (from here the reservation is NEVER interrupted; the only exit is settle).
@@ -814,18 +814,18 @@ fn ag_p24_e2e2_flagship_green_end_to_end() {
     let units = vec![
         MeteredUnit {
             unit: "issue.transition",
-            wholesale: MinorUnits(3),
-            markup: MinorUnits(1),
+            wholesale: MicroUsd(3),
+            markup: MicroUsd(1),
         },
         MeteredUnit {
             unit: "agent.effect",
-            wholesale: MinorUnits(2),
-            markup: MinorUnits(1),
+            wholesale: MicroUsd(2),
+            markup: MicroUsd(1),
         },
         MeteredUnit {
             unit: "git.merge",
-            wholesale: MinorUnits(5),
-            markup: MinorUnits(2),
+            wholesale: MicroUsd(5),
+            markup: MicroUsd(2),
         },
     ];
     let settle = ledger
@@ -880,8 +880,8 @@ fn ag_p24_e2e2_exhausted_wallet_refuses_to_start() {
     let refused = ledger.reserve(
         tenant(),
         storage_run.clone(),
-        MinorUnits(RUN_ESTIMATE),
-        MinorUnits(5),
+        MicroUsd(RUN_ESTIMATE),
+        MicroUsd(5),
     );
     assert!(
         refused.is_err(),

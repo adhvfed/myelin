@@ -11,9 +11,9 @@
 //!
 //! ## The unit — MICRO-DOLLARS (`1 unit = $0.000001`), the wallet's frozen unit
 //! Every amount here is [`MicroUsd`] (a `u64`; `$1.00 = 1_000_000`), the SAME unit the durable
-//! [`AgentWallet`](myelin_storage::agent_wallet::AgentWallet) debits — so a price composes with a
-//! debit with no unit conversion. It is deliberately DISTINCT from the cent-scaled
-//! [`MinorUnits`](myelin_storage::reserve_settle::MinorUnits) the reserve/settle ledger uses.
+//! [`AgentWallet`](myelin_storage::agent_wallet::AgentWallet) debits AND the reserve/settle cost
+//! ledger uses — one money type across the platform, so a price composes with a debit or a
+//! reservation with no unit conversion.
 //!
 //! ## The pricing math (integer, checked, documented rounding)
 //! Rates are quoted per **million tokens** (per-Mtok) as integer micro-dollars
@@ -39,7 +39,7 @@
 //!
 //! ## Follow-ons (named, NOT built here)
 //! - **Wallet reservations** (holding funds at dispatch like the reserve/settle gate does for
-//!   `MinorUnits`) — v1 debits per-turn after the fact instead.
+//!   `MicroUsd`) — v1 debits per-turn after the fact instead.
 //! - **A precise next-call estimate** (a `max_tokens`-based pre-call cap) — v1's pre-step cap is a
 //!   coarse `balance > floor` gate (see `handle_run`); the two together bound overspend to one turn.
 //! - **Anthropic (and other vendor) rates** — the [`ModelRates`] shape is vendor-neutral; only

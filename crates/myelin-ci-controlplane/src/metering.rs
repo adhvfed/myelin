@@ -73,7 +73,7 @@
 //! always returns `0` is indistinguishable from the constant `0`. Per EI-01 §3 we do NOT manufacture a
 //! false test to "kill" an equivalent mutant.
 
-use myelin_flow::{BudgetError, BudgetGate, MeteredUnit, MinorUnits};
+use myelin_flow::{BudgetError, BudgetGate, MeteredUnit, MicroUsd};
 use myelin_storage::reserve_settle::RunId as LedgerRunId;
 use myelin_tenancy::TenantId;
 
@@ -168,11 +168,11 @@ pub struct MeteredResource {
     /// — `cost_event.amount`. NEVER a float.
     pub amount: u64,
     /// The **wholesale** (provider) cost of this metered unit in minor-units — CI's `wholesale_minor_units`.
-    pub wholesale: MinorUnits,
+    pub wholesale: MicroUsd,
     /// The **markup** (Commercial's priced) cost in minor-units — `markup_minor_units`. Computed by
     /// the [`MarkupPolicy`] seam (Commercial's immutable pricing table at the markup layer, R-2);
     /// recorded DISTINCTLY from wholesale (wholesale ≠ markup is the §8 invariant).
-    pub markup: MinorUnits,
+    pub markup: MicroUsd,
 }
 
 impl MeteredResource {
@@ -190,7 +190,7 @@ impl MeteredResource {
 
     /// The billed total of this unit (`wholesale + markup`), checked — an overflow is a loud `None`
     /// (never a silent wrap; integer minor-units, arch 01 §3.7).
-    pub fn billed(self) -> Option<MinorUnits> {
+    pub fn billed(self) -> Option<MicroUsd> {
         self.wholesale.checked_add(self.markup)
     }
 }
@@ -215,10 +215,10 @@ pub struct CostEventRow {
     /// The integer quantity of the meter unit (`cost_event.amount`) — NEVER a float.
     pub amount: u64,
     /// The wholesale (provider) cost in minor-units (`cost_event.wholesale_minor_units`) — CI's column.
-    pub wholesale: MinorUnits,
+    pub wholesale: MicroUsd,
     /// The markup (Commercial-priced) cost in minor-units (`cost_event.markup_minor_units`) — R-2's
     /// column, carried distinctly.
-    pub markup: MinorUnits,
+    pub markup: MicroUsd,
     /// The run KIND (`cost_event.kind`) — `ci` | `agent` (UNIFY / X-6).
     pub kind: CostKind,
 }
@@ -226,7 +226,7 @@ pub struct CostEventRow {
 impl CostEventRow {
     /// The billed total (`wholesale + markup`), checked. The user-facing credit; the meter is the
     /// resource-second (arch 02 §8 — users see credits, the meter is resource-seconds).
-    pub fn billed(&self) -> Option<MinorUnits> {
+    pub fn billed(&self) -> Option<MicroUsd> {
         self.wholesale.checked_add(self.markup)
     }
 }
@@ -285,7 +285,7 @@ WHERE tenant_id = $1 AND cost_id = $2";
 pub trait MarkupPolicy {
     /// Price the markup minor-units for one sampled metered unit. CI calls this at settle to fill the
     /// `markup_minor_units` column; the wholesale column is CI's own (the honest cost basis).
-    fn markup_for(&self, meter: Meter, amount: u64, wholesale: MinorUnits) -> MinorUnits;
+    fn markup_for(&self, meter: Meter, amount: u64, wholesale: MicroUsd) -> MicroUsd;
 }
 
 /// A flat **basis-point** markup policy (a TEST/DEV stand-in for Commercial's pricing table). Marks
@@ -306,11 +306,11 @@ impl FlatBpsMarkup {
 }
 
 impl MarkupPolicy for FlatBpsMarkup {
-    fn markup_for(&self, _meter: Meter, _amount: u64, wholesale: MinorUnits) -> MinorUnits {
+    fn markup_for(&self, _meter: Meter, _amount: u64, wholesale: MicroUsd) -> MicroUsd {
         // wholesale * bps / 10_000, integer floor (minor-units are integer — no fractional cost). The
         // multiply is widened to u128 so a large wholesale * bps does not overflow before the divide.
         let marked = (wholesale.0 as u128 * self.bps as u128) / 10_000u128;
-        MinorUnits(u64::try_from(marked).unwrap_or(u64::MAX))
+        MicroUsd(u64::try_from(marked).unwrap_or(u64::MAX))
     }
 }
 
@@ -324,7 +324,7 @@ pub fn meter_resource_seconds(
     run_id: &str,
     job_id: &str,
     kind: CostKind,
-    samples: &[(Meter, u64, MinorUnits)],
+    samples: &[(Meter, u64, MicroUsd)],
     markup: &dyn MarkupPolicy,
 ) -> Vec<CostEventRow> {
     samples
@@ -381,7 +381,7 @@ impl<'g, M: MarkupPolicy> CiMeter<'g, M> {
         &self,
         tenant: &TenantId,
         run: &LedgerRunId,
-        estimate: MinorUnits,
+        estimate: MicroUsd,
     ) -> Result<(), BudgetError> {
         self.gate.reserve(tenant, run, estimate)?;
         // The reservation is in-flight from here — NEVER interrupted (arch §6 — never interrupt in
@@ -402,7 +402,7 @@ impl<'g, M: MarkupPolicy> CiMeter<'g, M> {
         run_id: &str,
         job_id: &str,
         kind: CostKind,
-        samples: &[(Meter, u64, MinorUnits)],
+        samples: &[(Meter, u64, MicroUsd)],
     ) -> Result<Vec<CostEventRow>, BudgetError> {
         let rows = meter_resource_seconds(tenant, run_id, job_id, kind, samples, &self.markup);
         let units = metered_units_for(&rows);
@@ -411,7 +411,7 @@ impl<'g, M: MarkupPolicy> CiMeter<'g, M> {
     }
 
     /// The shared wallet balance (for a drill / consumer to observe the depletion).
-    pub fn balance(&self) -> MinorUnits {
+    pub fn balance(&self) -> MicroUsd {
         self.gate.balance()
     }
 
@@ -450,13 +450,13 @@ pub struct ReserveSettleParitySignal {
     /// metered_units` (one event per unit).
     pub metered_units: u64,
     /// The total **wholesale** minor-units recorded — STABLE across a pricing change (CI's column).
-    pub wholesale_total: MinorUnits,
+    pub wholesale_total: MicroUsd,
     /// The total **markup** minor-units recorded BEFORE the pricing change (Commercial's column).
-    pub markup_total_before: MinorUnits,
+    pub markup_total_before: MicroUsd,
     /// The total **markup** minor-units recorded AFTER the pricing change — DIFFERENT from before (the
     /// pricing change re-prices the markup column) yet wholesale is unchanged (wholesale ≠ markup, and
     /// a pricing change moves ONLY the markup).
-    pub markup_total_after: MinorUnits,
+    pub markup_total_after: MicroUsd,
 }
 
 impl ReserveSettleParitySignal {
@@ -508,22 +508,22 @@ impl ReserveSettleParitySignal {
 #[cfg(any(test, feature = "test-support"))]
 pub fn reserve_settle_parity_drill(
     tenant: &TenantId,
-    per_run_estimate: MinorUnits,
+    per_run_estimate: MicroUsd,
     affordable_runs: u64,
-    samples: &[(Meter, u64, MinorUnits)],
+    samples: &[(Meter, u64, MicroUsd)],
     markup_before: &dyn MarkupPolicy,
     markup_after: &dyn MarkupPolicy,
 ) -> ReserveSettleParitySignal {
     // ONE wallet, ONE gate — both CI and agent runs draw it down (the same metering path, X-6).
-    let wallet_total = MinorUnits(per_run_estimate.0.saturating_mul(affordable_runs));
+    let wallet_total = MicroUsd(per_run_estimate.0.saturating_mul(affordable_runs));
     let gate = BudgetGate::new(myelin_flow::Wallet::new(wallet_total));
 
     let mut cost_events_recorded = 0u64;
     let mut ci_cost_events = 0u64;
     let mut agent_cost_events = 0u64;
     let mut metered_units = 0u64;
-    let mut wholesale_total = MinorUnits::ZERO;
-    let mut markup_total_before = MinorUnits::ZERO;
+    let mut wholesale_total = MicroUsd::ZERO;
+    let mut markup_total_before = MicroUsd::ZERO;
 
     // Alternate CI / agent kinds across the affordable runs so BOTH kinds meter into the same wallet
     // (the unified-meter property — not two budgets).
@@ -588,7 +588,7 @@ pub fn reserve_settle_parity_drill(
     // markup column ONLY (a pure function of the samples); it does NOT reach back past exhaustion (no
     // reserve happens on the re-price — the wallet is untouched). This proves replay-stability: a
     // pricing change never retroactively admits an over-exhaustion start.
-    let mut markup_total_after = MinorUnits::ZERO;
+    let mut markup_total_after = MicroUsd::ZERO;
     for i in 0..affordable_runs {
         // Re-pricing is over the wholesale samples; the markup is kind-INDEPENDENT (the kind splits
         // reporting, not the meter), so the re-price uses the run's recorded kind faithfully but the
@@ -654,7 +654,7 @@ struct FwdMarkup<'a>(&'a dyn MarkupPolicy);
 
 #[cfg(any(test, feature = "test-support"))]
 impl MarkupPolicy for FwdMarkup<'_> {
-    fn markup_for(&self, meter: Meter, amount: u64, wholesale: MinorUnits) -> MinorUnits {
+    fn markup_for(&self, meter: Meter, amount: u64, wholesale: MicroUsd) -> MicroUsd {
         self.0.markup_for(meter, amount, wholesale)
     }
 }

@@ -35,7 +35,7 @@ use myelin_ci_controlplane::{
     ci_durable_migrations, verify_ci_cost_event_shape, CiCostEventStore, CiCostStoreError,
     CostEventRow, CostKind, Meter,
 };
-use myelin_flow::MinorUnits;
+use myelin_flow::MicroUsd;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::{all_durable_migrations, reserve_settle_durable_migrations, TenantScope};
 use myelin_tenancy::{Region, TenantId};
@@ -211,8 +211,8 @@ async fn storage_cost_event_and_ci_cost_event_coexist_and_both_stores_write() {
         job_id: job.to_string(),
         meter: Meter::CpuSeconds,
         amount: 120,
-        wholesale: MinorUnits(100),
-        markup: MinorUnits(20),
+        wholesale: MicroUsd(100),
+        markup: MicroUsd(20),
         kind: CostKind::Ci,
     }];
     let affected = store

@@ -37,7 +37,7 @@ use myelin_agent_service::{
 use myelin_flow::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenMinter, WfJournal};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_storage::agent_run_gate::AgentRunGate;
-use myelin_storage::reserve_settle::{CostLedger, MinorUnits, ReservationState, RunId};
+use myelin_storage::reserve_settle::{CostLedger, MicroUsd, ReservationState, RunId};
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
@@ -114,7 +114,7 @@ fn ag_d11_runaway_mock_loop_stops_at_the_wallet_never_interrupting() {
     let mut tele = SkeletonTelemetry::new();
 
     // The wallet affords exactly 5 runs of 10; the runaway loop tries 12.
-    let limiter = RunawaySelfLimiter::new(MinorUnits(50), MinorUnits(10));
+    let limiter = RunawaySelfLimiter::new(MicroUsd(50), MicroUsd(10));
     let attempts = 12u64;
     // The runaway brain submits on turn 0 (single-turn) → an EMPTY catalogue + a no-op executor
     // (the driving loop's tool body is never entered).
@@ -265,8 +265,8 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
             &mut ledger,
             tenant(),
             RunId::new("live"),
-            MinorUnits(100),
-            MinorUnits(100),
+            MicroUsd(100),
+            MicroUsd(100),
         )
         .expect("the live run is funded and dispatched");
     assert_eq!(
@@ -282,7 +282,7 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
     let mut tele = SkeletonTelemetry::new();
     let cat = MockToolSurface::new();
     let exec = MockToolExecutor::new();
-    let limiter = RunawaySelfLimiter::new(MinorUnits(0), MinorUnits(10));
+    let limiter = RunawaySelfLimiter::new(MicroUsd(0), MicroUsd(10));
     let steps = limiter.run_loop(
         &brain,
         5,
@@ -363,17 +363,17 @@ fn ag_d11_limiter_is_brain_independent() {
     let mut tele = SkeletonTelemetry::new();
 
     // The wallet affords 3 runs of 10; the loop tries 8.
-    let wallet = MinorUnits(30);
-    let estimate = MinorUnits(10);
+    let wallet = MicroUsd(30);
+    let estimate = MicroUsd(10);
     let attempts = 8u64;
-    let mut spent = MinorUnits(0);
+    let mut spent = MicroUsd(0);
     let mut completed = 0u64;
     let mut refused = 0u64;
     // OtherBrain submits on turn 0 → an EMPTY catalogue + a no-op executor (loop body never entered).
     let cat = MockToolSurface::new();
     let exec = MockToolExecutor::new();
     for i in 0..attempts {
-        let available = MinorUnits(wallet.0.saturating_sub(spent.0));
+        let available = MicroUsd(wallet.0.saturating_sub(spent.0));
         let mut sub = RunSubstrate {
             tenant: tenant(),
             region: Region("fr-par".into()),
@@ -398,7 +398,7 @@ fn ag_d11_limiter_is_brain_independent() {
         };
         match agent_loop.handle_run(&other, &mut sub, &mut tele, RunOutcomeKind::Completed) {
             Ok(_) => {
-                spent = MinorUnits(spent.0 + estimate.0);
+                spent = MicroUsd(spent.0 + estimate.0);
                 completed += 1;
             }
             Err(SkeletonError::DispatchRefused(_)) => refused += 1,

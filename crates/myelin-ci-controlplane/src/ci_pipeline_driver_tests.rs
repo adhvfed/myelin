@@ -502,10 +502,10 @@ fn immutable_pricing_projects_exact_raw_cpu_and_split_memory_costs() {
     let priced = PricedCiJobUsage {
         pricing_revision: "commercial:2026-07-21".into(),
         memory_gb_seconds: 3,
-        cpu_wholesale: MinorUnits(11),
-        cpu_markup: MinorUnits(2),
-        memory_wholesale: MinorUnits(7),
-        memory_markup: MinorUnits(1),
+        cpu_wholesale: MicroUsd(11),
+        cpu_markup: MicroUsd(2),
+        memory_wholesale: MicroUsd(7),
+        memory_markup: MicroUsd(1),
     };
     let rows = priced_cost_rows(
         &tenant,
@@ -518,12 +518,12 @@ fn immutable_pricing_projects_exact_raw_cpu_and_split_memory_costs() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].meter, Meter::CpuSeconds);
     assert_eq!(rows[0].amount, usage.cpu_seconds);
-    assert_eq!(rows[0].wholesale, MinorUnits(11));
-    assert_eq!(rows[0].markup, MinorUnits(2));
+    assert_eq!(rows[0].wholesale, MicroUsd(11));
+    assert_eq!(rows[0].markup, MicroUsd(2));
     assert_eq!(rows[1].meter, Meter::MemGbSeconds);
     assert_eq!(rows[1].amount, 3);
-    assert_eq!(rows[1].wholesale, MinorUnits(7));
-    assert_eq!(rows[1].markup, MinorUnits(1));
+    assert_eq!(rows[1].wholesale, MicroUsd(7));
+    assert_eq!(rows[1].markup, MicroUsd(1));
 
     let mut invalid = priced;
     invalid.pricing_revision.clear();
@@ -542,10 +542,10 @@ fn tier_p_reservation_structurally_requires_its_exact_operational_settlement_pol
     let mut priced = PricedCiJobUsage {
         pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
         memory_gb_seconds: 4,
-        cpu_wholesale: MinorUnits(17),
-        cpu_markup: MinorUnits::ZERO,
-        memory_wholesale: MinorUnits(4),
-        memory_markup: MinorUnits::ZERO,
+        cpu_wholesale: MicroUsd(17),
+        cpu_markup: MicroUsd::ZERO,
+        memory_wholesale: MicroUsd(4),
+        memory_markup: MicroUsd::ZERO,
     };
     let handle = "ci-reserve:v1:run:batch:job:item";
     assert_eq!(
@@ -565,25 +565,25 @@ fn tier_p_reservation_structurally_requires_its_exact_operational_settlement_pol
         Err(CiJobPricingError::InvalidOutput)
     );
     priced.memory_gb_seconds = 4;
-    priced.cpu_wholesale = MinorUnits(16);
+    priced.cpu_wholesale = MicroUsd(16);
     assert_eq!(
         validate_reservation_pricing_policy(handle, usage, &priced),
         Err(CiJobPricingError::InvalidOutput)
     );
-    priced.cpu_wholesale = MinorUnits(17);
-    priced.cpu_markup = MinorUnits(1);
+    priced.cpu_wholesale = MicroUsd(17);
+    priced.cpu_markup = MicroUsd(1);
     assert_eq!(
         validate_reservation_pricing_policy(handle, usage, &priced),
         Err(CiJobPricingError::InvalidOutput)
     );
-    priced.cpu_markup = MinorUnits::ZERO;
-    priced.memory_wholesale = MinorUnits(3);
+    priced.cpu_markup = MicroUsd::ZERO;
+    priced.memory_wholesale = MicroUsd(3);
     assert_eq!(
         validate_reservation_pricing_policy(handle, usage, &priced),
         Err(CiJobPricingError::InvalidOutput)
     );
-    priced.memory_wholesale = MinorUnits(4);
-    priced.memory_markup = MinorUnits(1);
+    priced.memory_wholesale = MicroUsd(4);
+    priced.memory_markup = MicroUsd(1);
     assert_eq!(
         validate_reservation_pricing_policy(handle, usage, &priced),
         Err(CiJobPricingError::InvalidOutput)
@@ -608,10 +608,10 @@ fn tier_p_v2_reservation_gate_requires_the_same_exact_settlement_policy_as_v1() 
     let priced = PricedCiJobUsage {
         pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
         memory_gb_seconds: 4,
-        cpu_wholesale: MinorUnits(17),
-        cpu_markup: MinorUnits::ZERO,
-        memory_wholesale: MinorUnits(4),
-        memory_markup: MinorUnits::ZERO,
+        cpu_wholesale: MicroUsd(17),
+        cpu_markup: MicroUsd::ZERO,
+        memory_wholesale: MicroUsd(4),
+        memory_markup: MicroUsd::ZERO,
     };
     let v2_handle = "ci-reserve:v2:run:budget-v1:a5:batch:job:item";
     assert_eq!(
@@ -620,7 +620,7 @@ fn tier_p_v2_reservation_gate_requires_the_same_exact_settlement_policy_as_v1() 
     );
 
     let mut tampered = priced.clone();
-    tampered.cpu_markup = MinorUnits(1);
+    tampered.cpu_markup = MicroUsd(1);
     assert_eq!(
         validate_reservation_pricing_policy(v2_handle, usage, &tampered),
         Err(CiJobPricingError::InvalidOutput),

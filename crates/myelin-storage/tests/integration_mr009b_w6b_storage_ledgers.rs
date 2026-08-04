@@ -32,7 +32,7 @@ use myelin_storage::migration::HotTables;
 use myelin_storage::reerase::PostRestoreErasureLedger;
 use myelin_storage::reerase_durable::{post_pit_durable_migrations, DurablePostPitLedger};
 use myelin_storage::reserve_settle::{
-    MeteredUnit, MinorUnits, ReservationState, RunId, SettleError,
+    MeteredUnit, MicroUsd, ReservationState, RunId, SettleError,
 };
 use myelin_storage::reserve_settle_durable::{
     reserve_settle_durable_migrations, DurableCostLedger,
@@ -145,21 +145,21 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         .reserve(
             tenant.clone(),
             run.clone(),
-            MinorUnits(1_000),
-            MinorUnits(5_000),
+            MicroUsd(1_000),
+            MicroUsd(5_000),
         )
         .expect("a funded reserve admits on Pg");
     cost1.begin(&tenant, &run).expect("begin on Pg");
     let units = vec![
         MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(120),
-            markup: MinorUnits(30),
+            wholesale: MicroUsd(120),
+            markup: MicroUsd(30),
         },
         MeteredUnit {
             unit: "ci.minute",
-            wholesale: MinorUnits(200),
-            markup: MinorUnits(50),
+            wholesale: MicroUsd(200),
+            markup: MicroUsd(50),
         },
     ];
     let outcome = cost1.settle(&tenant, &run, &units).expect("settle on Pg");
@@ -168,8 +168,8 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         2,
         "one cost event per metered unit"
     );
-    assert_eq!(outcome.billed_total, MinorUnits(400));
-    assert_eq!(outcome.refunded, MinorUnits(600));
+    assert_eq!(outcome.billed_total, MicroUsd(400));
+    assert_eq!(outcome.refunded, MicroUsd(600));
 
     // Durability: a FRESH ledger over a FRESH pool reads the settled reservation + its events back.
     let cost2 = DurableCostLedger::new(app_provider().await);
@@ -189,15 +189,15 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     let again = cost2
         .settle(&tenant, &run, &units)
         .expect("re-settle on Pg");
-    assert_eq!(again.billed_total, MinorUnits(400));
-    assert_eq!(again.refunded, MinorUnits(600));
+    assert_eq!(again.billed_total, MicroUsd(400));
+    assert_eq!(again.refunded, MicroUsd(600));
     assert_eq!(
         cost2.cost_events_for(&tenant, &run).len(),
         2,
         "a double-settle records NO further cost events on Pg (no double-charge)"
     );
     let mut divergent_units = units.clone();
-    divergent_units[0].wholesale = MinorUnits(121);
+    divergent_units[0].wholesale = MicroUsd(121);
     assert_eq!(
         cost2.settle(&tenant, &run, &divergent_units),
         Err(SettleError::UsageDivergence),
@@ -212,15 +212,15 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         .reserve(
             tenant.clone(),
             run_tx.clone(),
-            MinorUnits(1_000),
-            MinorUnits(9_000),
+            MicroUsd(1_000),
+            MicroUsd(9_000),
         )
         .expect("reserve run_tx");
     cost2.begin(&tenant, &run_tx).expect("begin run_tx");
     let tx_units = vec![MeteredUnit {
         unit: "ci.minute",
-        wholesale: MinorUnits(200),
-        markup: MinorUnits(50),
+        wholesale: MicroUsd(200),
+        markup: MicroUsd(50),
     }];
     let mut tx = app
         .db_pool()
@@ -263,7 +263,7 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         .await
         .expect("settle inside committed caller tx");
     tx.commit().await.expect("commit settlement");
-    assert_eq!(committed.billed_total, MinorUnits(250));
+    assert_eq!(committed.billed_total, MicroUsd(250));
     assert_eq!(
         cost2.state_of(&tenant, &run_tx),
         Some(ReservationState::Settled)
@@ -277,8 +277,8 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         .reserve(
             tenant.clone(),
             run_skip.clone(),
-            MinorUnits(700),
-            MinorUnits(9_000),
+            MicroUsd(700),
+            MicroUsd(9_000),
         )
         .expect("reserve skipped run");
     let mut tx = app.db_pool().begin().await.expect("begin skip rollback tx");
@@ -296,7 +296,7 @@ async fn mr009b_w6b_storage_ledgers_durable() {
             .cancel_unstarted_in_tx(&mut tx, &tenant, &run_skip)
             .await
             .expect("cancel skipped run in caller tx"),
-        MinorUnits(700)
+        MicroUsd(700)
     );
     tx.rollback().await.expect("roll back skip cancellation");
     assert_eq!(
@@ -320,7 +320,7 @@ async fn mr009b_w6b_storage_ledgers_durable() {
                 .cancel_unstarted_in_tx(&mut tx, &tenant, &run_skip)
                 .await
                 .expect("exact cancellation replay"),
-            MinorUnits(700)
+            MicroUsd(700)
         );
     }
     tx.commit().await.expect("commit skip cancellation");
@@ -335,8 +335,8 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         .reserve(
             tenant.clone(),
             run_over.clone(),
-            MinorUnits(100),
-            MinorUnits(9_000),
+            MicroUsd(100),
+            MicroUsd(9_000),
         )
         .expect("reserve run_over");
     cost2.begin(&tenant, &run_over).expect("begin run_over");
@@ -346,17 +346,17 @@ async fn mr009b_w6b_storage_ledgers_durable() {
             &run_over,
             &[MeteredUnit {
                 unit: "llm.tokens",
-                wholesale: MinorUnits(500),
-                markup: MinorUnits(500),
+                wholesale: MicroUsd(500),
+                markup: MicroUsd(500),
             }],
         )
         .expect("settle run_over");
     assert_eq!(
         over.billed_total,
-        MinorUnits(100),
+        MicroUsd(100),
         "settle is capped at the reserved amount on Pg"
     );
-    assert_eq!(over.refunded, MinorUnits::ZERO);
+    assert_eq!(over.refunded, MicroUsd::ZERO);
 
     // Invariant 1 — never-interrupt-in-flight on Pg: cancel of an in-flight run REFUSES; count 0.
     let run_live = RunId::new(format!("run-live-{suffix}"));
@@ -364,8 +364,8 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         .reserve(
             tenant.clone(),
             run_live.clone(),
-            MinorUnits(500),
-            MinorUnits(9_000),
+            MicroUsd(500),
+            MicroUsd(9_000),
         )
         .expect("reserve run_live");
     cost2.begin(&tenant, &run_live).expect("begin run_live");

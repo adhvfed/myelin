@@ -12,7 +12,7 @@
 //! wholesale/markup split; an in-flight run is never torn down), this stops compiling/passing.
 
 use myelin_storage::{
-    AgentRunGate, CostLedger, DispatchError, MeteredUnit, MinorUnits, ReservationState,
+    AgentRunGate, CostLedger, DispatchError, MeteredUnit, MicroUsd, ReservationState,
     ReserveError, RunId, RunKind, SettleError,
 };
 use myelin_tenancy::TenantId;
@@ -38,8 +38,8 @@ impl RunDispatcher {
     fn dispatch(
         &mut self,
         run: RunId,
-        estimate: MinorUnits,
-        wallet_balance: MinorUnits,
+        estimate: MicroUsd,
+        wallet_balance: MicroUsd,
     ) -> Result<(), ReserveError> {
         self.ledger
             .reserve(self.tenant.clone(), run.clone(), estimate, wallet_balance)?;
@@ -71,29 +71,29 @@ fn dispatcher_reserves_then_settles_one_event_per_unit() {
     let run = RunId::new("01J0RUN_AGENT");
 
     dispatcher
-        .dispatch(run.clone(), MinorUnits(1_000), MinorUnits(5_000))
+        .dispatch(run.clone(), MicroUsd(1_000), MicroUsd(5_000))
         .expect("a funded dispatch reserves");
 
     let units = vec![
         MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(120),
-            markup: MinorUnits(30),
+            wholesale: MicroUsd(120),
+            markup: MicroUsd(30),
         },
         MeteredUnit {
             unit: "ci.minute",
-            wholesale: MinorUnits(200),
-            markup: MinorUnits(50),
+            wholesale: MicroUsd(200),
+            markup: MicroUsd(50),
         },
     ];
     let outcome = dispatcher.complete(&run, &units).expect("the run settles");
 
     // One cost event per metered unit; wholesale ≠ markup recorded distinctly.
     assert_eq!(outcome.cost_events.len(), 2);
-    assert_eq!(outcome.cost_events[0].wholesale, MinorUnits(120));
-    assert_eq!(outcome.cost_events[0].markup, MinorUnits(30));
-    assert_eq!(outcome.billed_total, MinorUnits(400));
-    assert_eq!(outcome.refunded, MinorUnits(600));
+    assert_eq!(outcome.cost_events[0].wholesale, MicroUsd(120));
+    assert_eq!(outcome.cost_events[0].markup, MicroUsd(30));
+    assert_eq!(outcome.billed_total, MicroUsd(400));
+    assert_eq!(outcome.refunded, MicroUsd(600));
 }
 
 /// **No balance → no run** (the runaway self-limiter, AG-D11): a dispatch whose estimate
@@ -104,7 +104,7 @@ fn dispatch_refused_on_no_balance() {
     let mut dispatcher = RunDispatcher::boot(tenant.clone());
     let run = RunId::new("01J0RUN_BROKE");
     let err = dispatcher
-        .dispatch(run.clone(), MinorUnits(9_000), MinorUnits(100))
+        .dispatch(run.clone(), MicroUsd(9_000), MicroUsd(100))
         .expect_err("an unfunded dispatch is refused");
     assert!(matches!(err, ReserveError::InsufficientBalance { .. }));
     assert!(
@@ -122,7 +122,7 @@ fn in_flight_run_is_never_interrupted() {
     let mut dispatcher = RunDispatcher::boot(tenant.clone());
     let run = RunId::new("01J0RUN_AGENT");
     dispatcher
-        .dispatch(run.clone(), MinorUnits(500), MinorUnits(1_000))
+        .dispatch(run.clone(), MicroUsd(500), MicroUsd(1_000))
         .unwrap();
     // The run is in-flight — an attempt to cancel it is refused.
     let err = dispatcher.ledger.cancel_unstarted(&tenant, &run);
@@ -164,8 +164,8 @@ fn gate_fronts_every_run_reserve_then_settle_through_the_handle() {
             &mut ledger,
             tenant.clone(),
             run.clone(),
-            MinorUnits(1_000),
-            MinorUnits(5_000),
+            MicroUsd(1_000),
+            MicroUsd(5_000),
         )
         .expect("a funded dispatch fronts the run");
     assert_eq!(handle.kind(), RunKind::AgentRun);
@@ -180,14 +180,14 @@ fn gate_fronts_every_run_reserve_then_settle_through_the_handle() {
             &mut ledger,
             &[MeteredUnit {
                 unit: "llm.tokens",
-                wholesale: MinorUnits(120),
-                markup: MinorUnits(30),
+                wholesale: MicroUsd(120),
+                markup: MicroUsd(30),
             }],
         )
         .expect("the run settles through its handle");
     assert_eq!(outcome.cost_events.len(), 1);
-    assert_eq!(outcome.billed_total, MinorUnits(150));
-    assert_eq!(outcome.refunded, MinorUnits(850));
+    assert_eq!(outcome.billed_total, MicroUsd(150));
+    assert_eq!(outcome.refunded, MicroUsd(850));
 }
 
 /// No balance → no run: the gate refuses the dispatch and mints NO handle — the run never starts
@@ -205,8 +205,8 @@ fn gate_refuses_dispatch_on_no_balance_no_handle_minted() {
             &mut ledger,
             tenant.clone(),
             run.clone(),
-            MinorUnits(9_000),
-            MinorUnits(100),
+            MicroUsd(9_000),
+            MicroUsd(100),
         )
         .expect_err("an unfunded dispatch is refused");
     assert!(matches!(err, DispatchError::NoBalance { .. }));

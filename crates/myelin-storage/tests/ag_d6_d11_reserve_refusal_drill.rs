@@ -35,7 +35,7 @@
 //! over the reference (agent-run + `SCHEDULE_AND_RUN_JOB`) dispatch shapes.
 
 use myelin_storage::{
-    AgentRunGate, AgentRunGateSignal, CostLedger, DispatchError, MeteredUnit, MinorUnits,
+    AgentRunGate, AgentRunGateSignal, CostLedger, DispatchError, MeteredUnit, MicroUsd,
     ReservationState, RunId, RunKind,
 };
 use myelin_tenancy::TenantId;
@@ -58,14 +58,14 @@ fn ag_d11_runaway_loop_stops_at_the_wallet() {
     let mut gate = AgentRunGate::new();
     let mut ledger = CostLedger::new();
 
-    let wallet = MinorUnits(500); // affords exactly 5 runs of 100
-    let per_run = MinorUnits(100);
+    let wallet = MicroUsd(500); // affords exactly 5 runs of 100
+    let per_run = MicroUsd(100);
     let attempts = 50u64; // a runaway loop tries far more than it can afford
-    let mut spent = MinorUnits::ZERO;
+    let mut spent = MicroUsd::ZERO;
     let mut live = Vec::new();
 
     for i in 0..attempts {
-        let remaining = wallet.checked_sub(spent).unwrap_or(MinorUnits::ZERO);
+        let remaining = wallet.checked_sub(spent).unwrap_or(MicroUsd::ZERO);
         match gate.dispatch(&mut ledger, tenant(), run(i as u32), per_run, remaining) {
             Ok(handle) => {
                 assert_eq!(handle.kind(), RunKind::AgentRun);
@@ -124,13 +124,13 @@ fn ag_d6_surge_sheds_over_budget_runs_others_unaffected() {
     let mut ledger = CostLedger::new();
 
     let attempts = 30u64;
-    let per_run = MinorUnits(100);
-    let wallet = MinorUnits(1_000); // affords 10
-    let mut spent = MinorUnits::ZERO;
+    let per_run = MicroUsd(100);
+    let wallet = MicroUsd(1_000); // affords 10
+    let mut spent = MicroUsd::ZERO;
     let mut live = Vec::new();
 
     for i in 0..attempts {
-        let remaining = wallet.checked_sub(spent).unwrap_or(MinorUnits::ZERO);
+        let remaining = wallet.checked_sub(spent).unwrap_or(MicroUsd::ZERO);
         match gate.dispatch(&mut ledger, tenant(), run(i as u32), per_run, remaining) {
             Ok(handle) => {
                 spent = spent.checked_add(per_run).unwrap();
@@ -164,8 +164,8 @@ fn ag_d6_surge_sheds_over_budget_runs_others_unaffected() {
                 &mut ledger,
                 &[MeteredUnit {
                     unit: "llm.tokens",
-                    wholesale: MinorUnits(60),
-                    markup: MinorUnits(15),
+                    wholesale: MicroUsd(60),
+                    markup: MicroUsd(15),
                 }],
             )
             .expect("a fronted run settles");
@@ -174,10 +174,10 @@ fn ag_d6_surge_sheds_over_budget_runs_others_unaffected() {
             1,
             "one cost event per metered unit"
         );
-        assert_eq!(outcome.billed_total, MinorUnits(75));
+        assert_eq!(outcome.billed_total, MicroUsd(75));
         assert_eq!(
             outcome.refunded,
-            MinorUnits(25),
+            MicroUsd(25),
             "the over-reservation refunds"
         );
     }
@@ -207,8 +207,8 @@ fn schedule_and_run_job_fronted_by_the_same_gate() {
             &mut ledger,
             tenant(),
             run(1),
-            MinorUnits(400),
-            MinorUnits(1_000),
+            MicroUsd(400),
+            MicroUsd(1_000),
         )
         .expect("a funded scheduled job is fronted");
     assert_eq!(handle.kind(), RunKind::ScheduleAndRunJob);
@@ -219,8 +219,8 @@ fn schedule_and_run_job_fronted_by_the_same_gate() {
             &mut ledger,
             tenant(),
             run(2),
-            MinorUnits(9_000),
-            MinorUnits(50),
+            MicroUsd(9_000),
+            MicroUsd(50),
         )
         .expect_err("an over-budget scheduled job is refused");
     assert!(matches!(err, DispatchError::NoBalance { .. }));

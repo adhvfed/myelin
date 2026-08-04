@@ -303,7 +303,7 @@ pub fn dispatch_long_compute_metered<B: SandboxBackend>(
     cmd: &Command,
     profile: LongComputeProfile,
     timeout_secs: Option<i64>,
-    cost: myelin_storage::reserve_settle::MinorUnits,
+    cost: myelin_storage::reserve_settle::MicroUsd,
     units: Vec<myelin_storage::reserve_settle::MeteredUnit>,
 ) -> Result<WfResult<LongParkOutcome>, RoutingError> {
     let job = build_long_job(def, cmd, &profile)?;

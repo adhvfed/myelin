@@ -36,7 +36,7 @@ use myelin_ci_sandbox::{
 use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
 use myelin_flow::{
-    migrations::migrations as flow_migrations, partition_for_run_id, DurableExecutor, MinorUnits,
+    migrations::migrations as flow_migrations, partition_for_run_id, DurableExecutor, MicroUsd,
     PgFlowExecutor, RunId, SignalOutcome, StartSpec, CI_PIPELINE_WF_TYPE,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
@@ -168,10 +168,10 @@ impl CiJobAccountingPricer for TestPricer {
         Ok(PricedCiJobUsage {
             pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
             memory_gb_seconds,
-            cpu_wholesale: MinorUnits(usage.cpu_seconds),
-            cpu_markup: MinorUnits::ZERO,
-            memory_wholesale: MinorUnits(memory_gb_seconds + u64::from(!self.valid)),
-            memory_markup: MinorUnits::ZERO,
+            cpu_wholesale: MicroUsd(usage.cpu_seconds),
+            cpu_markup: MicroUsd::ZERO,
+            memory_wholesale: MicroUsd(memory_gb_seconds + u64::from(!self.valid)),
+            memory_markup: MicroUsd::ZERO,
         })
     }
 }

@@ -66,7 +66,7 @@
 use crate::job::{JobKind, JobOutcome, JobRunner, JobSpec};
 use crate::wfctx::{WfCtx, WfError, WfResult};
 use myelin_refs::ArtifactRef;
-use myelin_storage::reserve_settle::{MeteredUnit, MinorUnits};
+use myelin_storage::reserve_settle::{MeteredUnit, MicroUsd};
 
 /// **The FROZEN `wf_type` the reference CI-pipeline workflow registers under (§4.9, item 6).** A CI
 /// pipeline is "ONE workflow per pipeline-run" registered under this definition name; CI's real
@@ -89,9 +89,9 @@ pub struct CiStage {
     pub target: String,
     /// **The stage's cost reserved at dispatch (contract 11.7, §4.9 step 1).** Reserved BEFORE the
     /// stage is handed to the runner — no balance → the stage is NEVER dispatched (the pipeline fails
-    /// loud). Settled on the consumed `job.done` (§4.9 step 4). `MinorUnits(0)` runs the stage
+    /// loud). Settled on the consumed `job.done` (§4.9 step 4). `MicroUsd(0)` runs the stage
     /// un-metered (the loop-cap depth is then the runaway bound, AG-6).
-    pub cost: MinorUnits,
+    pub cost: MicroUsd,
     /// **The stage's max-duration SLA in seconds (§4.9 step 2).** Arms the timeout timer that bounds a
     /// vanished runner — a runner that never reports does NOT park the pipeline forever; the timeout
     /// fails the stage (which fails the pipeline). `None` waits indefinitely (only for a stage whose
@@ -104,7 +104,7 @@ impl CiStage {
     pub fn new(
         name: impl Into<String>,
         target: impl Into<String>,
-        cost: MinorUnits,
+        cost: MicroUsd,
         timeout_secs: Option<i64>,
     ) -> Self {
         Self {
@@ -248,7 +248,7 @@ impl WfCtx {
             let units = vec![MeteredUnit {
                 unit: "ci.stage",
                 wholesale: stage.cost,
-                markup: MinorUnits(0),
+                markup: MicroUsd(0),
             }];
             let outcome = self.metered_schedule_and_run_job(
                 JobSpec::new(JobKind::Ci, stage.target.clone()),
@@ -375,19 +375,19 @@ mod tests {
             CiStage::new(
                 "build",
                 "pipeline://acme/ci/pr-7#build",
-                MinorUnits(10),
+                MicroUsd(10),
                 Some(3600),
             ),
             CiStage::new(
                 "test",
                 "pipeline://acme/ci/pr-7#test",
-                MinorUnits(20),
+                MicroUsd(20),
                 Some(3600),
             ),
             CiStage::new(
                 "lint",
                 "pipeline://acme/ci/pr-7#lint",
-                MinorUnits(5),
+                MicroUsd(5),
                 Some(600),
             ),
         ])
@@ -400,7 +400,7 @@ mod tests {
         journal: WfJournal,
         signals: SignalStore,
         timers: crate::TimerStore,
-        balance: MinorUnits,
+        balance: MicroUsd,
         now_secs: i64,
     ) -> WfCtx {
         WfCtx::begin(
@@ -453,7 +453,7 @@ mod tests {
         let timers = crate::TimerStore::new();
         let runner = RecordingCiRunner::default();
 
-        let mut ctx = begin_metered(&outbox, journal, signals, timers, MinorUnits(1000), 1000);
+        let mut ctx = begin_metered(&outbox, journal, signals, timers, MicroUsd(1000), 1000);
         let out = ctx
             .run_ci_pipeline(&pipeline(), &runner)
             .expect("dispatch the first stage + park");
@@ -498,7 +498,7 @@ mod tests {
         deliver_stage_done(&signals, &stage_token(1), "test", true);
         deliver_stage_done(&signals, &stage_token(2), "lint", true);
 
-        let mut ctx = begin_metered(&outbox, journal, signals, timers, MinorUnits(1000), 1000);
+        let mut ctx = begin_metered(&outbox, journal, signals, timers, MicroUsd(1000), 1000);
         let out = ctx
             .run_ci_pipeline(&pipeline(), &runner)
             .expect("the whole pipeline runs green");
@@ -536,7 +536,7 @@ mod tests {
         deliver_stage_done(&signals, &stage_token(1), "test", false); // test FAILS
                                                                       // NOTE: lint's job.done is NOT delivered — it must never be dispatched.
 
-        let mut ctx = begin_metered(&outbox, journal, signals, timers, MinorUnits(1000), 1000);
+        let mut ctx = begin_metered(&outbox, journal, signals, timers, MicroUsd(1000), 1000);
         let out = ctx
             .run_ci_pipeline(&pipeline(), &runner)
             .expect("the pipeline fails fast at test");
@@ -572,7 +572,7 @@ mod tests {
             journal.clone(),
             signals.clone(),
             timers.clone(),
-            MinorUnits(1000),
+            MicroUsd(1000),
             1000,
         );
         let out1 = c1
@@ -597,7 +597,7 @@ mod tests {
         )
         .with_signals(signals)
         .with_timers(timers, 0, 10_000)
-        .with_budget(BudgetGate::new(Wallet::new(MinorUnits(1000))));
+        .with_budget(BudgetGate::new(Wallet::new(MicroUsd(1000))));
         let out2 = c2
             .run_ci_pipeline(&pipeline(), &runner)
             .expect("the timeout drive");
@@ -630,7 +630,7 @@ mod tests {
         let single = CiPipelineSpec::new(vec![CiStage::new(
             "build",
             "pipeline://acme/ci/pr-7#build",
-            MinorUnits(10),
+            MicroUsd(10),
             Some(3600),
         )]);
 
@@ -647,7 +647,7 @@ mod tests {
             journal,
             signals.clone(),
             timers,
-            MinorUnits(1000),
+            MicroUsd(1000),
             1000,
         );
         let out = ctx
@@ -681,7 +681,7 @@ mod tests {
         // the runner echoed a verdict for "the-wrong-stage" under the build token.
         deliver_stage_done(&signals, &stage_token(0), "the-wrong-stage", true);
 
-        let mut ctx = begin_metered(&outbox, journal, signals, timers, MinorUnits(1000), 1000);
+        let mut ctx = begin_metered(&outbox, journal, signals, timers, MicroUsd(1000), 1000);
         let err = ctx
             .run_ci_pipeline(&pipeline(), &runner)
             .expect_err("a mis-attributed verdict is loud");
@@ -703,7 +703,7 @@ mod tests {
         let runner = RecordingCiRunner::default();
 
         // wallet has 5 minor-units; the build stage costs 10 → refused at reserve.
-        let mut ctx = begin_metered(&outbox, journal, signals, timers, MinorUnits(5), 1000);
+        let mut ctx = begin_metered(&outbox, journal, signals, timers, MicroUsd(5), 1000);
         let err = ctx
             .run_ci_pipeline(&pipeline(), &runner)
             .expect_err("an exhausted wallet refuses the dispatch");

@@ -94,7 +94,7 @@ use myelin_identity::Principal;
 use myelin_refs::ArtifactRef;
 use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError};
 use myelin_storage::agent_wallet::{AgentWallet, MicroUsd, WalletError};
-use myelin_storage::reserve_settle::{CostLedger, MinorUnits, RunId as StorageRunId};
+use myelin_storage::reserve_settle::{CostLedger, RunId as StorageRunId};
 use myelin_tenancy::{Region, TenantId};
 
 /// The frozen event type the trace-written-and-emitted activity emits (BUS §6.2 token, PII-free).
@@ -617,10 +617,10 @@ pub struct RunSubstrate<'a> {
     /// The Storage-owned durable cost ledger the gate drives (11.7).
     pub ledger: &'a mut CostLedger,
     /// The wallet balance the reserve debits (from Commercial; no balance → no run).
-    pub available: MinorUnits,
+    pub available: MicroUsd,
     /// The run's estimated upper-bound cost reserved at dispatch (integer minor-units). A SKELETON's
     /// estimate is a small floor; it settles 0 and refunds the rest (reserved == settled).
-    pub estimate: MinorUnits,
+    pub estimate: MicroUsd,
     /// The durable-workflow outbox the trace activity co-commits its emit into (BUS-2, the ONLY emit
     /// path — there is no second publish path).
     pub outbox: &'a myelin_events::OutboxStore,
@@ -1184,8 +1184,8 @@ mod tests {
             wallet: None,
             gate,
             ledger,
-            available: MinorUnits(available),
-            estimate: MinorUnits(estimate),
+            available: MicroUsd(available),
+            estimate: MicroUsd(estimate),
             outbox,
             minter: Arc::new(myelin_events::MonotonicMinter::new()),
             journal: WfJournal::new(),

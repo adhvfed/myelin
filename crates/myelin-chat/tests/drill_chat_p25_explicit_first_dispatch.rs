@@ -58,7 +58,7 @@ use myelin_identity::{
     PrincipalStatus, Result as IdResult, RevokeTarget, RunId as IdRunId, RunToken, RuntimeRef,
     TupleDelta, Zookie,
 };
-use myelin_storage::reserve_settle::{CostLedger, MinorUnits};
+use myelin_storage::reserve_settle::{CostLedger, MicroUsd};
 use myelin_tenancy::{Region, TenantId};
 
 fn tenant() -> TenantId {
@@ -356,8 +356,8 @@ fn an_explicit_action_reserves_mints_and_routes_through_effect_api_against_the_m
         tenant(),
         &agent_id(),
         "run:explicit:1",
-        MinorUnits(5),
-        MinorUnits(10), // funded wallet
+        MicroUsd(5),
+        MicroUsd(10), // funded wallet
         ProposedEffect("chat.post".into()),
     );
 
@@ -393,16 +393,16 @@ fn the_reserve_gate_refuses_an_explicit_run_with_no_balance() {
         tenant(),
         &agent_id(),
         "run:explicit:2",
-        MinorUnits(50),
-        MinorUnits(0), // exhausted wallet
+        MicroUsd(50),
+        MicroUsd(0), // exhausted wallet
         ProposedEffect("chat.post".into()),
     );
 
     assert_eq!(
         disp,
         Disposition::NoBalanceRefused {
-            requested: MinorUnits(50),
-            available: MinorUnits(0)
+            requested: MicroUsd(50),
+            available: MicroUsd(0)
         },
         "no balance → no run: reserve/settle gates even the explicit run (CHAT-D17)"
     );

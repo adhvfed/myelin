@@ -32,7 +32,7 @@
 
 use myelin_issues::{spend_bearing_run, IssueRunKind, IssueSpendGate, SpendError};
 use myelin_storage::reserve_settle::{
-    CostLedger, MeteredUnit, MinorUnits, ReservationState, RunId,
+    CostLedger, MeteredUnit, MicroUsd, ReservationState, RunId,
 };
 use myelin_tenancy::TenantId;
 
@@ -49,16 +49,16 @@ fn run(n: u32) -> RunId {
 fn brain_cost(wholesale: u64, markup: u64) -> Vec<MeteredUnit> {
     vec![MeteredUnit {
         unit: "agent.effect",
-        wholesale: MinorUnits(wholesale),
-        markup: MinorUnits(markup),
+        wholesale: MicroUsd(wholesale),
+        markup: MicroUsd(markup),
     }]
 }
 
 /// **PROVIDER side of 11.7 (Issues) — the wallet balance the Commercial control-plane reports.** The
 /// provider's promise: this is the SAME wallet CI runs draw from (a single shared balance, not an
 /// Issues-private one). The consumer reserves against exactly this number.
-fn provider_wallet_balance() -> MinorUnits {
-    MinorUnits(5_000)
+fn provider_wallet_balance() -> MicroUsd {
+    MicroUsd(5_000)
 }
 
 // ───────────────────────── the chained-mutation e2e (the ISS-P24 headline) ───────────────────────
@@ -81,7 +81,7 @@ fn e2e_dispatch_reserve_complete_settle_balances_the_wallet() {
         tenant(),
         run(1),
         IssueRunKind::Triage,
-        MinorUnits(1_000),
+        MicroUsd(1_000),
         provider_wallet_balance(),
         || brain_cost(250, 150),
     )
@@ -89,11 +89,11 @@ fn e2e_dispatch_reserve_complete_settle_balances_the_wallet() {
 
     // the wallet BALANCED: 1000 reserved = 400 billed + 600 refunded (the reserve is fully accounted —
     // none leaked; the wallet nets to 0 over the completed run).
-    assert_eq!(signal.reserved, MinorUnits(1_000));
-    assert_eq!(signal.billed, MinorUnits(400), "wholesale 250 + markup 150");
+    assert_eq!(signal.reserved, MicroUsd(1_000));
+    assert_eq!(signal.billed, MicroUsd(400), "wholesale 250 + markup 150");
     assert_eq!(
         signal.refunded,
-        MinorUnits(600),
+        MicroUsd(600),
         "the over-reservation refunds"
     );
     assert_eq!(signal.cost_events, 1, "one cost event per metered unit");
@@ -112,8 +112,8 @@ fn e2e_dispatch_reserve_complete_settle_balances_the_wallet() {
     let events = ledger.cost_events_for(&tenant(), &run(1));
     assert_eq!(events.len(), 1, "exactly one cost event recorded");
     // wholesale ≠ markup kept distinct (C-1 — never conflated into one number).
-    assert_eq!(events[0].wholesale, MinorUnits(250));
-    assert_eq!(events[0].markup, MinorUnits(150));
+    assert_eq!(events[0].wholesale, MicroUsd(250));
+    assert_eq!(events[0].markup, MicroUsd(150));
     assert_ne!(events[0].wholesale, events[0].markup, "wholesale ≠ markup");
 }
 
@@ -134,8 +134,8 @@ fn no_balance_means_the_issues_run_never_starts() {
         tenant(),
         run(1),
         IssueRunKind::Forecast,
-        MinorUnits(9_000),
-        MinorUnits(100), // the provider's wallet cannot afford the run
+        MicroUsd(9_000),
+        MicroUsd(100), // the provider's wallet cannot afford the run
         || {
             brain_ran = true; // MUST NOT execute — no balance → no start
             brain_cost(10, 0)
@@ -146,8 +146,8 @@ fn no_balance_means_the_issues_run_never_starts() {
     assert_eq!(
         err,
         SpendError::NoBalance {
-            requested: MinorUnits(9_000),
-            available: MinorUnits(100),
+            requested: MicroUsd(9_000),
+            available: MicroUsd(100),
         }
     );
     assert!(
@@ -177,7 +177,7 @@ fn the_shared_wallet_drains_across_successive_issues_runs() {
     let mut ledger = CostLedger::new();
     // the shared wallet affords exactly 2 runs of 100 each (balance 250 with refunds released on
     // settle); a third run at 100 against the remaining 50 is refused.
-    let wallet = MinorUnits(250);
+    let wallet = MicroUsd(250);
 
     // run 1: reserve 100, settle 100 (no refund) → 150 remaining.
     let s1 = spend_bearing_run(
@@ -186,7 +186,7 @@ fn the_shared_wallet_drains_across_successive_issues_runs() {
         tenant(),
         run(1),
         IssueRunKind::Triage,
-        MinorUnits(100),
+        MicroUsd(100),
         wallet,
         || brain_cost(80, 20),
     )
@@ -200,8 +200,8 @@ fn the_shared_wallet_drains_across_successive_issues_runs() {
         tenant(),
         run(2),
         IssueRunKind::Forecast,
-        MinorUnits(100),
-        MinorUnits(150),
+        MicroUsd(100),
+        MicroUsd(150),
         || brain_cost(80, 20),
     )
     .expect("run 2 funded");
@@ -214,8 +214,8 @@ fn the_shared_wallet_drains_across_successive_issues_runs() {
         tenant(),
         run(3),
         IssueRunKind::SlaDraft,
-        MinorUnits(100),
-        MinorUnits(50),
+        MicroUsd(100),
+        MicroUsd(50),
         || brain_cost(80, 20),
     )
     .expect_err("run 3 over the drained wallet is refused");

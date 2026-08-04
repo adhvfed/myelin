@@ -328,7 +328,7 @@ pub use merge_queue::{
     MergeOutcome, MergePerformer, MergeRequest, MockCiResultProducer, RealCiResultProducer,
     CI_RESULT_SIGNAL, GIT_PR_MERGED_EVENT,
 };
-pub use myelin_storage::reserve_settle::{MeteredUnit, MinorUnits};
+pub use myelin_storage::reserve_settle::{MeteredUnit, MicroUsd};
 pub use pg_drive_store::{
     ActivityAttemptWrite, CommitOutcome as PgDriveCommitOutcome, DriveCommit, DriveLease,
     DriveSnapshot, DriveStoreError, FiredTimer, HistoryWrite, LoadedHistory, PendingSignal,

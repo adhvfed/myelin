@@ -61,7 +61,7 @@ use myelin_flow::{
     merge_attempt_id, partition_for_run_id, request_approval_and_wait, run_state, BudgetGate,
     CheckFact, CiDispatch, CiDispatcher, DelegationCaveats, DriveOutcome, DurableExecutor,
     FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind, JobRunner, JobSpec, MergeOutcome,
-    MergePerformer, MergeRequest, MeteredUnit, MinorUnits, RealCiResultProducer, RetryPolicy,
+    MergePerformer, MergeRequest, MeteredUnit, MicroUsd, RealCiResultProducer, RetryPolicy,
     RunStore, RunTokenError, RunTokenHandle, RunTokenLease, RunTokenMinter, SignalSpec,
     SignalStore, TimerStore, WaitOutcome, Wallet, WfCtx, WfJournal, WorkflowBody, DECLINE_MARKER,
 };
@@ -102,8 +102,8 @@ fn ctx_base() -> EmitContextBase {
 fn unit(wholesale: u64, markup: u64) -> MeteredUnit {
     MeteredUnit {
         unit: "agent.step",
-        wholesale: MinorUnits(wholesale),
-        markup: MinorUnits(markup),
+        wholesale: MicroUsd(wholesale),
+        markup: MicroUsd(markup),
     }
 }
 
@@ -197,7 +197,7 @@ fn triage_body(runner: Arc<CountingRunner>, merged_flag: Arc<AtomicUsize>) -> Bo
                 JobSpec::new(JobKind::Agent, "agent://acme/job/triage"),
                 runner.as_ref(),
                 Some(3600),
-                MinorUnits(100),
+                MicroUsd(100),
                 vec![unit(70, 30)],
             )
             .map_err(|e| format!("{e:?}"))?;
@@ -274,7 +274,7 @@ fn merge_queue_body(ci: Arc<CountingCi>, merger: Arc<CountingMerger>) -> Box<Wor
                 ci.as_ref(),
                 merger.as_ref(),
                 Some(3600),
-                MinorUnits(50),
+                MicroUsd(50),
                 vec![unit(30, 20)],
             )
             .map_err(|e| format!("{e:?}"))?;
@@ -328,7 +328,7 @@ struct Substrate {
 #[test]
 fn e2e2_durable_workflow_hitl_spine_across_kill_and_days_later_approval() {
     // ── ONE wallet across the WHOLE run (reserve/settle parity is read off it + the telemetry).
-    let wallet_start = MinorUnits(1_000);
+    let wallet_start = MicroUsd(1_000);
     let tele = FlowTelemetry::new();
     let gate = BudgetGate::new(Wallet::new(wallet_start)).with_telemetry(tele.clone());
 
@@ -450,7 +450,7 @@ fn e2e2_durable_workflow_hitl_spine_across_kill_and_days_later_approval() {
     );
     assert_eq!(
         gate.balance(),
-        MinorUnits(wallet_start.0 - 100),
+        MicroUsd(wallet_start.0 - 100),
         "the wallet conserved: debited exactly the billed triage step cost (100) — reserve/settle balanced"
     );
     assert!(
@@ -567,7 +567,7 @@ fn e2e2_durable_workflow_hitl_spine_across_kill_and_days_later_approval() {
     );
     assert_eq!(
         gate.balance(),
-        MinorUnits(wallet_start.0 - 100),
+        MicroUsd(wallet_start.0 - 100),
         "the wallet conserved across the resume: still debited exactly 100 (reserve/settle balanced)"
     );
 
@@ -708,7 +708,7 @@ fn e2e2_durable_workflow_hitl_spine_across_kill_and_days_later_approval() {
     // any over-reservation; both billed their full reserve, so balance is start − 150.
     assert_eq!(
         gate.balance(),
-        MinorUnits(wallet_start.0 - 150),
+        MicroUsd(wallet_start.0 - 150),
         "the wallet conserved: debited exactly the billed cost of the 2 metered dispatches (100+50)"
     );
 
@@ -735,7 +735,7 @@ fn e2e2_durable_workflow_hitl_spine_across_kill_and_days_later_approval() {
 #[test]
 fn e2e2_spine_days_later_decline_withholds_the_merge_zero_mutation() {
     let tele = FlowTelemetry::new();
-    let gate = BudgetGate::new(Wallet::new(MinorUnits(1_000))).with_telemetry(tele.clone());
+    let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000))).with_telemetry(tele.clone());
     let recording_minter = Arc::new(RecordingMinter::default());
     let lease = RunTokenLease::new(
         recording_minter.clone(),
@@ -869,7 +869,7 @@ fn e2e2_spine_days_later_decline_withholds_the_merge_zero_mutation() {
     );
     assert_eq!(
         gate.balance(),
-        MinorUnits(1_000 - 100),
+        MicroUsd(1_000 - 100),
         "the wallet conserved on the decline leg: debited only the triage step (100)"
     );
     // the resume STILL re-minted (the resumed body runs the decision branch under a fresh token).

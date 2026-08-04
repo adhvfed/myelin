@@ -54,7 +54,7 @@ use myelin_events::check_seam::CiOverall;
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
-use myelin_storage::reserve_settle::MinorUnits;
+use myelin_storage::reserve_settle::MicroUsd;
 use myelin_tenancy::{Region, TenantId};
 
 use crate::merge_queue::{encode_ci_result, merge_attempt_id, MergeRequest};
@@ -137,19 +137,19 @@ fn myelin_pipeline() -> CiPipelineSpec {
         CiStage::new(
             "build",
             "pipeline://myelin/ci/self-host#build",
-            MinorUnits(0),
+            MicroUsd(0),
             Some(3600),
         ),
         CiStage::new(
             "test",
             "pipeline://myelin/ci/self-host#test",
-            MinorUnits(0),
+            MicroUsd(0),
             Some(3600),
         ),
         CiStage::new(
             "lint",
             "pipeline://myelin/ci/self-host#lint",
-            MinorUnits(0),
+            MicroUsd(0),
             Some(600),
         ),
     ])
@@ -345,7 +345,7 @@ fn merge_queue_body(ci: Arc<CountingCi>, merger: Arc<CountingMerger>) -> Box<Wor
                 ci.as_ref(),
                 merger.as_ref(),
                 Some(3600),
-                MinorUnits(0),
+                MicroUsd(0),
                 vec![],
             )
             .map_err(|e| format!("{e:?}"))?;

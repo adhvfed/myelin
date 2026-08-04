@@ -14,7 +14,7 @@ use myelin_ci_controlplane::{
     CiJobAccountingWrite, CiJobAccountingWriteVersion, CiJobTerminalDisposition, JobQueueReaper,
 };
 use myelin_ci_sandbox::ResourceUsage;
-use myelin_flow::MinorUnits;
+use myelin_flow::MicroUsd;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -522,8 +522,8 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
             mem_byte_seconds: 0,
         },
         pricing_revision: "ci-skipped:v1".into(),
-        billed: MinorUnits::ZERO,
-        refunded: MinorUnits(1),
+        billed: MicroUsd::ZERO,
+        refunded: MicroUsd(1),
         disposition: None,
         completion_receipt: format!("v3:{}", "a".repeat(64)),
         legacy_completion_receipt_v3: None,
@@ -565,8 +565,8 @@ async fn parent_attempt_and_prelaunch_usage_enforce_the_full_state_machine() {
             mem_byte_seconds: 2,
         },
         pricing_revision: "ci-test:v1".into(),
-        billed: MinorUnits(1),
-        refunded: MinorUnits::ZERO,
+        billed: MicroUsd(1),
+        refunded: MicroUsd::ZERO,
         disposition: Some(CiJobTerminalDisposition::WorkloadFailed),
         completion_receipt: format!("v4:{}", "b".repeat(64)),
         legacy_completion_receipt_v3: Some(format!("v3:{}", "c".repeat(64))),

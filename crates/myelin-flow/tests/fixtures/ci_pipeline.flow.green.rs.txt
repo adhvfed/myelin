@@ -13,7 +13,7 @@
 use myelin_flow::{
     CiPipelineSpec, CiStage, JobRunner, JobSpec, PipelineOutcome, WfCtx, WfResult,
 };
-use myelin_storage::reserve_settle::MinorUnits;
+use myelin_storage::reserve_settle::MicroUsd;
 
 // @workflow-body — a durable CI-pipeline workflow body; the flow-determinism lint is satisfied (no
 // raw clock/RNG/IO — every stage rides the WfCtx SCHEDULE_AND_RUN_JOB surface).
@@ -24,9 +24,9 @@ pub fn ci_pipeline_workflow<R: JobRunner>(
     // GREEN: the pipeline is a deterministic ordered list of stages — built from the body's input,
     // never from a raw clock/RNG. Each stage is one `kind=ci` SCHEDULE_AND_RUN_JOB long-park.
     let spec = CiPipelineSpec::new(vec![
-        CiStage::new("build", "pipeline://acme/ci/pr-7#build", MinorUnits(10), Some(3600)),
-        CiStage::new("test", "pipeline://acme/ci/pr-7#test", MinorUnits(20), Some(3600)),
-        CiStage::new("lint", "pipeline://acme/ci/pr-7#lint", MinorUnits(5), Some(600)),
+        CiStage::new("build", "pipeline://acme/ci/pr-7#build", MicroUsd(10), Some(3600)),
+        CiStage::new("test", "pipeline://acme/ci/pr-7#test", MicroUsd(20), Some(3600)),
+        CiStage::new("lint", "pipeline://acme/ci/pr-7#lint", MicroUsd(5), Some(600)),
     ]);
     // GREEN: every stage's dispatch + park + settle + verdict-read rides the deterministic WfCtx
     // surface (`run_ci_pipeline` → `metered_schedule_and_run_job` → `wait_for_signal`). The runner

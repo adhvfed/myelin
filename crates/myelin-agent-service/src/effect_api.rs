@@ -82,7 +82,7 @@ use myelin_identity::{
 };
 use myelin_identity_service::mint::RunTokenAuthorizer;
 use myelin_storage::{
-    reserve_settle::{MeteredUnit, MinorUnits},
+    reserve_settle::{MeteredUnit, MicroUsd},
     TenantScope,
 };
 use myelin_tenancy::{ArtifactRef, Region};
@@ -145,8 +145,8 @@ impl EffectCost {
     fn as_metered_unit(&self) -> MeteredUnit {
         MeteredUnit {
             unit: self.unit,
-            wholesale: MinorUnits(self.wholesale),
-            markup: MinorUnits(self.markup),
+            wholesale: MicroUsd(self.wholesale),
+            markup: MicroUsd(self.markup),
         }
     }
 }

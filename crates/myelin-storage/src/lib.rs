@@ -626,13 +626,17 @@ pub mod reserve_settle;
 pub mod agent_run_gate;
 // The durable prepaid AGENT WALLET (the hosted-agent prepaid balance the reserve/settle cost gate
 // consumes as its `available` param, storage.md §9). Micro-dollar unit (`MicroUsd`, 1 unit =
-// $0.000001) — deliberately SEPARATE from the cent-scaled `MinorUnits` cost ledger, so ZERO impact
-// on CI billing. The `agent_wallet` materialized balance cache + the append-only, IMMUTABLE
+// $0.000001) — the SAME money type the reserve/settle cost ledger now uses (they share the unit,
+// not the tables). The `agent_wallet` materialized balance cache + the append-only, IMMUTABLE
 // `agent_wallet_ledger` source of truth (REVOKE UPDATE,DELETE + a raising trigger), both
 // `(tenant, region)` FORCE-RLS. balance == Σ ledger, co-committed in one `with_tenant_tx` per op;
 // no double-spend / no partial debit (insufficient debit refused fail-closed); checked, fail-closed
 // arithmetic. Wiring into reserve/settle (reserve/settle in handle_run) + pricing are follow-on slices.
 pub mod agent_wallet;
+// The platform's single money newtype (`MicroUsd`, micro-dollars) — shared by the prepaid agent
+// wallet AND the reserve/settle cost ledger (they speak one money type, so a wallet balance flows
+// into the ledger's `available` param with no conversion).
+pub mod money;
 // Residency pinning enforced end-to-end (STOR-D5, P-ST-15 / P-102): the per-pool runtime region-pin
 // (closes the oltp/holder M0 floor), the in-process residency WRITE boundary, the per-store region
 // report, and the `myelin storage residency verify <tenant>` admin path. The control plane's
@@ -760,8 +764,9 @@ pub mod cell_root_durable;
 
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
 pub use agent_wallet::{
-    agent_wallet_migrations, AgentWallet, CreditKind, MicroUsd, WalletError, AGENT_WALLET_MIGRATION,
+    agent_wallet_migrations, AgentWallet, CreditKind, WalletError, AGENT_WALLET_MIGRATION,
 };
+pub use money::MicroUsd;
 pub use backup::{
     BackupError, BackupSet, BaseBackup, ContinuousArchiver, EpochSecs, LogTierSeal,
     ObjectTierBackup, ObjectVersion, StoreTier, WalOffset, WalSegment,
@@ -888,7 +893,7 @@ pub use reerase::{
 pub use reerase::InMemoryPostPitLedger;
 pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
 pub use reserve_settle::{
-    CostEvent, CostLedger, MeteredUnit, MinorUnits, Reservation, ReservationState, ReserveError,
+    CostEvent, CostLedger, MeteredUnit, Reservation, ReservationState, ReserveError,
     ReserveSettleSignal, RunId, SettleError, SettleOutcome,
 };
 pub use residency::{

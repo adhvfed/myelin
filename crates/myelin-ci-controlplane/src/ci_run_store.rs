@@ -50,7 +50,7 @@ use myelin_ci_sandbox::ResourceUsage;
 use myelin_events::OutboxRow;
 use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{
-    with_tenant_tx, with_tenant_tx_error, DurableCostLedger, MinorUnits, PgError,
+    with_tenant_tx, with_tenant_tx_error, DurableCostLedger, MicroUsd, PgError,
     RunId as CostRunId, TenantScope,
 };
 use sqlx::postgres::PgPool;
@@ -654,7 +654,7 @@ impl CiRunFinalizer for DurableCiRunFinalizer {
                             || existing.usage.cpu_seconds != 0
                             || existing.usage.mem_byte_seconds != 0
                             || existing.pricing_revision != "ci-skipped:v1"
-                            || existing.billed != MinorUnits::ZERO
+                            || existing.billed != MicroUsd::ZERO
                             || existing.refunded != refunded
                             || !receipt_matches
                         {
@@ -1032,7 +1032,7 @@ fn skipped_accounting_record(
     scope: &TenantScope,
     finalization: &CiRunFinalization,
     job: &CiRunFinalizationJob,
-    refunded: MinorUnits,
+    refunded: MicroUsd,
     write_version: CiJobAccountingWriteVersion,
 ) -> CiJobAccountingRecord {
     let disposition = CiJobTerminalDisposition::SkippedBeforeStart;
@@ -1053,7 +1053,7 @@ fn skipped_accounting_record(
             mem_byte_seconds: 0,
         },
         pricing_revision: "ci-skipped:v1".into(),
-        billed: MinorUnits::ZERO,
+        billed: MicroUsd::ZERO,
         refunded,
         disposition: receipt.disposition,
         completion_receipt: receipt.completion_receipt,

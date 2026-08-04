@@ -42,7 +42,7 @@ use myelin_git::check_status::{
 use myelin_git::merge_gate::MergeGatePolicy;
 use myelin_git::merge_queue::GitMergePerformer;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::reserve_settle::MinorUnits;
+use myelin_storage::reserve_settle::MicroUsd;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -199,7 +199,7 @@ fn git_d10_full_aggregate_doubly_delivered_ci_result_merges_exactly_once() {
     .with_signals(signals);
 
     let out = wf
-        .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+        .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
         .expect("dispatch + merge");
 
     match out {
@@ -288,7 +288,7 @@ fn git_d10_b_fork_self_green_is_neutral_dequeues() {
     .with_signals(signals);
 
     let out = wf
-        .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+        .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
         .expect("dispatch + dequeue");
 
     match out {
@@ -364,7 +364,7 @@ fn git_d10_c_maintainer_endorsement_flips_the_gate_green() {
     .with_signals(signals);
 
     let out = wf
-        .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+        .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
         .expect("dispatch + merge");
     assert!(
         matches!(out, MergeOutcome::Merged { .. }),

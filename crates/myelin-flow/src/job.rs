@@ -537,7 +537,7 @@ impl WfCtx {
         spec: JobSpec,
         runner: &R,
         timeout_secs: Option<i64>,
-        cost: myelin_storage::reserve_settle::MinorUnits,
+        cost: myelin_storage::reserve_settle::MicroUsd,
         units: Vec<myelin_storage::reserve_settle::MeteredUnit>,
     ) -> WfResult<JobOutcome>
     where

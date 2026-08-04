@@ -38,7 +38,7 @@ use myelin_flow::{
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs::ArtifactRef;
-use myelin_storage::reserve_settle::MinorUnits;
+use myelin_storage::reserve_settle::MicroUsd;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -74,19 +74,19 @@ fn pipeline() -> CiPipelineSpec {
         CiStage::new(
             "build",
             "pipeline://acme/ci/pr-7#build",
-            MinorUnits(0),
+            MicroUsd(0),
             Some(3600),
         ),
         CiStage::new(
             "test",
             "pipeline://acme/ci/pr-7#test",
-            MinorUnits(0),
+            MicroUsd(0),
             Some(3600),
         ),
         CiStage::new(
             "lint",
             "pipeline://acme/ci/pr-7#lint",
-            MinorUnits(0),
+            MicroUsd(0),
             Some(600),
         ),
     ])

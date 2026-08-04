@@ -36,7 +36,7 @@ use myelin_identity::{
     PrincipalKind, Result as IdResult, RevokeTarget, RewriteTrace, RunId, RunToken, SubjectTree,
     TupleDelta, Zookie,
 };
-use myelin_storage::reserve_settle::{CostLedger, MinorUnits, RunId as LedgerRunId};
+use myelin_storage::reserve_settle::{CostLedger, MicroUsd, RunId as LedgerRunId};
 use myelin_tenancy::{ArtifactRef as TArtifactRef, TenantId};
 
 use crate::dispatch::{
@@ -266,8 +266,8 @@ pub fn run_e2e_2_chat_flagship() -> ChatE2eArtifact {
         e2e_tenant(),
         &triage_agent(),
         "run:triage:1",
-        MinorUnits(5),
-        MinorUnits(10),
+        MicroUsd(5),
+        MicroUsd(10),
         ProposedEffect("chat.post:triage-discussion".into()),
     );
     let dispatched_through_one_wallet = matches!(disp, Disposition::Dispatched { .. });
@@ -277,8 +277,8 @@ pub fn run_e2e_2_chat_flagship() -> ChatE2eArtifact {
     let re_reserve = ledger.reserve(
         e2e_tenant(),
         LedgerRunId("run:triage:1".into()),
-        MinorUnits(5),
-        MinorUnits(10),
+        MicroUsd(5),
+        MicroUsd(10),
     );
     let reserve_settle_balanced = re_reserve.is_err();
 
@@ -291,8 +291,8 @@ pub fn run_e2e_2_chat_flagship() -> ChatE2eArtifact {
         e2e_tenant(),
         &triage_agent(),
         "run:triage:unfunded",
-        MinorUnits(50),
-        MinorUnits(0),
+        MicroUsd(50),
+        MicroUsd(0),
         ProposedEffect("chat.post:triage-discussion".into()),
     );
     let unfunded_run_refused =

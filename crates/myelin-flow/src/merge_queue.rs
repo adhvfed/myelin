@@ -370,7 +370,7 @@ impl WfCtx {
         ci: &D,
         merger: &M,
         timeout_secs: Option<i64>,
-        cost: myelin_storage::reserve_settle::MinorUnits,
+        cost: myelin_storage::reserve_settle::MicroUsd,
         units: Vec<myelin_storage::reserve_settle::MeteredUnit>,
     ) -> WfResult<MergeOutcome>
     where
@@ -841,7 +841,7 @@ mod tests {
         Actor, CausedBy, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp,
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-    use myelin_storage::reserve_settle::MinorUnits;
+    use myelin_storage::reserve_settle::MicroUsd;
     use myelin_tenancy::{Region, TenantId};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -933,8 +933,8 @@ mod tests {
         }
     }
 
-    fn no_cost() -> (MinorUnits, Vec<myelin_storage::reserve_settle::MeteredUnit>) {
-        (MinorUnits(0), vec![])
+    fn no_cost() -> (MicroUsd, Vec<myelin_storage::reserve_settle::MeteredUnit>) {
+        (MicroUsd(0), vec![])
     }
 
     /// **The dispatch mints the `merge_attempt_id` DETERMINISTIC on the dispatch position — producer
@@ -1182,7 +1182,7 @@ mod tests {
         let mut c1 =
             begin(&outbox, journal.clone(), signals.clone()).with_timers(timers.clone(), 0, 1000);
         let out1 = c1
-            .run_merge_attempt(&request(), &ci, &merger, Some(100), MinorUnits(0), vec![])
+            .run_merge_attempt(&request(), &ci, &merger, Some(100), MicroUsd(0), vec![])
             .expect("dispatch + park");
         assert_eq!(
             out1,
@@ -1213,7 +1213,7 @@ mod tests {
         .with_signals(signals.clone())
         .with_timers(timers.clone(), 0, 2000);
         let out2 = c2
-            .run_merge_attempt(&request(), &ci, &merger, Some(100), MinorUnits(0), vec![])
+            .run_merge_attempt(&request(), &ci, &merger, Some(100), MicroUsd(0), vec![])
             .expect("the timeout drive");
         assert_eq!(
             out2,
@@ -1257,7 +1257,7 @@ mod tests {
 
         let mut ctx = begin(&outbox, journal, signals);
         let out = ctx
-            .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+            .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
             .expect("dequeue on conflict");
         match out {
             MergeOutcome::Dequeued { reason } => {
@@ -1297,7 +1297,7 @@ mod tests {
 
         let mut ctx = begin(&outbox, journal, signals);
         let err = ctx
-            .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+            .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
             .expect_err("a mismatched ci.result idem_key is a loud error");
         assert!(
             matches!(err, WfError::CoCommit(ref m) if m.contains("does not match the dispatched")),
@@ -1321,7 +1321,7 @@ mod tests {
 
         let mut ctx = begin(&outbox, journal, signals);
         let out = ctx
-            .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+            .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
             .expect("the retried dispatch parks");
         assert_eq!(
             out,
@@ -1365,7 +1365,7 @@ mod tests {
         // DRIVE 1: dispatch + merge + emit + journal.
         let mut c1 = begin(&outbox, journal.clone(), signals.clone());
         let out1 = c1
-            .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+            .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
             .expect("drive 1");
         assert!(matches!(out1, MergeOutcome::Merged { .. }));
         c1.commit().expect("co-commit");
@@ -1385,7 +1385,7 @@ mod tests {
         )
         .with_signals(signals.clone());
         let out2 = c2
-            .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+            .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
             .expect("the replay drive");
         match out2 {
             MergeOutcome::Merged {
@@ -1460,7 +1460,7 @@ mod tests {
 
         let mut ctx = begin(&outbox, journal, signals);
         let err = ctx
-            .run_merge_attempt(&request(), &ci, &merger, None, MinorUnits(0), vec![])
+            .run_merge_attempt(&request(), &ci, &merger, None, MicroUsd(0), vec![])
             .expect_err("a verdict-less ci.result is a loud error");
         assert!(
             matches!(err, WfError::CoCommit(ref m) if m.contains("no decodable verdict")),

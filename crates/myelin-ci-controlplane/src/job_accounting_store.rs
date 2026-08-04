@@ -6,7 +6,7 @@
 //! is identical; a conflicting replay fails closed.
 
 use myelin_ci_sandbox::{PreparationPhase, PreparationTerminalDisposition, ResourceUsage};
-use myelin_flow::MinorUnits;
+use myelin_flow::MicroUsd;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::PgPool;
@@ -46,8 +46,8 @@ pub struct CiJobAccountingRecord {
     pub skipped: bool,
     pub usage: ResourceUsage,
     pub pricing_revision: String,
-    pub billed: MinorUnits,
-    pub refunded: MinorUnits,
+    pub billed: MicroUsd,
+    pub refunded: MicroUsd,
     /// Closed, machine-readable terminal meaning for v4 receipts. `None` identifies a v3-compatible
     /// row, including fresh writes while production remains activation-gated to v3.
     pub disposition: Option<CiJobTerminalDisposition>,
@@ -486,8 +486,8 @@ impl CiJobAccountingStore {
                 mem_byte_seconds: nonnegative("mem_byte_seconds")?,
             },
             pricing_revision: row.get("pricing_revision"),
-            billed: MinorUnits(nonnegative("billed_minor_units")?),
-            refunded: MinorUnits(nonnegative("refunded_minor_units")?),
+            billed: MicroUsd(nonnegative("billed_minor_units")?),
+            refunded: MicroUsd(nonnegative("refunded_minor_units")?),
             disposition,
             completion_receipt: completion_receipt_v4
                 .unwrap_or_else(|| completion_receipt_v3.clone()),
@@ -616,8 +616,8 @@ mod tests {
                 mem_byte_seconds: 11,
             },
             pricing_revision: "pricing:v1".into(),
-            billed: MinorUnits(19),
-            refunded: MinorUnits(4),
+            billed: MicroUsd(19),
+            refunded: MicroUsd(4),
             disposition: None,
             completion_receipt: format!("v3:{}", "a".repeat(64)),
             legacy_completion_receipt_v3: None,

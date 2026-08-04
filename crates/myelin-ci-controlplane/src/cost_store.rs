@@ -75,7 +75,7 @@
 //! [`TenantScope`] and use transaction-local tenant/region GUCs; a `settle_in_tx` caller supplies the
 //! same scoped transaction so the FORCE-RLS table never sees raw request authority.
 
-use myelin_flow::MinorUnits;
+use myelin_flow::MicroUsd;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::PgPool;
@@ -514,10 +514,10 @@ impl CiCostEventStore {
                 amount: u64::try_from(amount).map_err(|_| {
                     CiCostStoreError::CorruptRow(format!("negative amount {amount}"))
                 })?,
-                wholesale: MinorUnits(u64::try_from(wholesale).map_err(|_| {
+                wholesale: MicroUsd(u64::try_from(wholesale).map_err(|_| {
                     CiCostStoreError::CorruptRow(format!("negative wholesale {wholesale}"))
                 })?),
-                markup: MinorUnits(u64::try_from(markup).map_err(|_| {
+                markup: MicroUsd(u64::try_from(markup).map_err(|_| {
                     CiCostStoreError::CorruptRow(format!("negative markup {markup}"))
                 })?),
                 kind,
@@ -707,8 +707,8 @@ mod tests {
             job_id: Uuid::nil().to_string(),
             meter: Meter::CpuSeconds,
             amount: 1,
-            wholesale: MinorUnits(1),
-            markup: MinorUnits(0),
+            wholesale: MicroUsd(1),
+            markup: MicroUsd(0),
             kind: CostKind::Ci,
         }];
 

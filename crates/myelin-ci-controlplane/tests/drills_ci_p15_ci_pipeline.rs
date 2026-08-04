@@ -30,7 +30,7 @@ use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxSto
 use myelin_flow::{
     job_idem_token, partition_for_run_id, run_state, stage_verdict_marker, CiStage, DriveOutcome,
     DurableExecutor, FlowDispatcher, FlowExecutor, FlowTelemetry, JobKind, JobRunner, JobSpec,
-    MinorUnits, RunStore, SignalOutcome, SignalSpec, SignalStore, TimerStore, WfCtx, WfJournal,
+    MicroUsd, RunStore, SignalOutcome, SignalSpec, SignalStore, TimerStore, WfCtx, WfJournal,
     WorkflowBody, JOB_DONE_SIGNAL,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -82,13 +82,13 @@ fn run_spec() -> PipelineRun {
             PipelineStage::job(CiStage::new(
                 "build",
                 "pipeline://acme/ci/pr-7#build",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(3600),
             )),
             PipelineStage::job(CiStage::new(
                 "test",
                 "pipeline://acme/ci/pr-7#test",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(3600),
             )),
         ],

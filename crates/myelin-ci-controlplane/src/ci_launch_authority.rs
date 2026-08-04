@@ -29,7 +29,7 @@ use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, CheckoutAuthorizationScope, JobKind, ResourceUsage,
     WorkspaceSpec,
 };
-use myelin_flow::MinorUnits;
+use myelin_flow::MicroUsd;
 use myelin_storage::{with_tenant_tx, PgError};
 use sqlx::{PgPool, Row};
 
@@ -165,10 +165,10 @@ impl CiJobAccountingPricer for TierPOperationalCiJobPricer {
         Ok(PricedCiJobUsage {
             pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
             memory_gb_seconds,
-            cpu_wholesale: MinorUnits(usage.cpu_seconds),
-            cpu_markup: MinorUnits::ZERO,
-            memory_wholesale: MinorUnits(memory_gb_seconds),
-            memory_markup: MinorUnits::ZERO,
+            cpu_wholesale: MicroUsd(usage.cpu_seconds),
+            cpu_markup: MicroUsd::ZERO,
+            memory_wholesale: MicroUsd(memory_gb_seconds),
+            memory_markup: MicroUsd::ZERO,
         })
     }
 }
@@ -2610,10 +2610,10 @@ mod tests {
             .unwrap();
         assert_eq!(priced.pricing_revision, TIER_P_OPERATIONAL_PRICING_REVISION);
         assert_eq!(priced.memory_gb_seconds, 150);
-        assert_eq!(priced.cpu_wholesale, MinorUnits(600));
-        assert_eq!(priced.memory_wholesale, MinorUnits(150));
-        assert_eq!(priced.cpu_markup, MinorUnits::ZERO);
-        assert_eq!(priced.memory_markup, MinorUnits::ZERO);
+        assert_eq!(priced.cpu_wholesale, MicroUsd(600));
+        assert_eq!(priced.memory_wholesale, MicroUsd(150));
+        assert_eq!(priced.cpu_markup, MicroUsd::ZERO);
+        assert_eq!(priced.memory_markup, MicroUsd::ZERO);
         assert_eq!(
             operational_reservation_amount(&linux_small_limits()).unwrap(),
             750

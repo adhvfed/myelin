@@ -32,7 +32,7 @@
 //!    [`CostLedger::cancel_unstarted`] only refunds a reservation that has NOT begun
 //!    running. The `inflight_interrupt_count` the drill reads is `0` **by construction** —
 //!    there is no code path that increments it.
-//! 4. **Integer minor-units; wholesale ≠ markup.** Every amount is a [`MinorUnits`] (`u64`,
+//! 4. **Integer micro-USD; wholesale ≠ markup.** Every amount is a [`MicroUsd`] (`u64`,
 //!    no float anywhere in the arithmetic — a float cost cannot even be constructed). A
 //!    cost event records the **wholesale** (provider) cost and the **markup** (platform
 //!    margin) as two DISTINCT integer fields; the billed total is `wholesale + markup`,
@@ -73,30 +73,11 @@ use myelin_tenancy::TenantId;
 #[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
 
-/// An integer **minor-units** amount (e.g. cents) — the frozen cost/budget unit (storage.md
-/// §intro: *budgets/costs = integer minor-units*). A `u64` so the arithmetic is exact and a
-/// float cost is **unrepresentable** (you cannot construct a fractional cost). All ledger
-/// arithmetic is checked (`checked_add`/`checked_sub`) — an overflow is a loud typed error,
-/// never a silent wrap.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct MinorUnits(pub u64);
-
-impl MinorUnits {
-    /// Zero cost (the additive identity — a metered unit may legitimately cost 0).
-    pub const ZERO: MinorUnits = MinorUnits(0);
-
-    /// Checked addition — `None` on overflow (the loud-not-silent rule; the caller turns it
-    /// into a typed [`ReserveError::AmountOverflow`]).
-    pub fn checked_add(self, other: MinorUnits) -> Option<MinorUnits> {
-        self.0.checked_add(other.0).map(MinorUnits)
-    }
-
-    /// Checked subtraction — `None` if it would go negative (a refund/release can never make
-    /// a reservation owe money).
-    pub fn checked_sub(self, other: MinorUnits) -> Option<MinorUnits> {
-        self.0.checked_sub(other.0).map(MinorUnits)
-    }
-}
+// The ledger's money unit is [`MicroUsd`] (micro-dollars), the platform's single money type shared
+// with the prepaid agent wallet — re-exported here so the historical
+// `myelin_storage::reserve_settle::MicroUsd` path resolves. It carries `ZERO`/`checked_add`/
+// `checked_sub` and all the derives the ledger arithmetic needs.
+pub use crate::money::MicroUsd;
 
 /// The opaque id of a single metered run (an agent run / a CI run / a `SCHEDULE_AND_RUN_JOB`
 /// dispatch). The ledger keys reservations by `(tenant, run)`; settle/cancel are idempotent
@@ -138,7 +119,7 @@ pub struct Reservation {
     /// The metered run this reservation fronts.
     pub run: RunId,
     /// The amount reserved at dispatch (an upper bound on the eventual settled cost).
-    pub reserved: MinorUnits,
+    pub reserved: MicroUsd,
     /// The reservation's lifecycle state.
     pub state: ReservationState,
 }
@@ -159,16 +140,16 @@ pub struct CostEvent {
     /// a `'static` reference (this is what killed the `Box::leak` in `reserve_settle_durable`).
     /// The reporting-side [`MeteredUnit::unit`] STAYS `&'static str` (a compile-time constant).
     pub unit: String,
-    /// The **wholesale** (provider) cost in minor-units — what the upstream charged.
-    pub wholesale: MinorUnits,
-    /// The **markup** (platform margin) in minor-units — recorded DISTINCTLY from wholesale.
-    pub markup: MinorUnits,
+    /// The **wholesale** (provider) cost in micro-USD — what the upstream charged.
+    pub wholesale: MicroUsd,
+    /// The **markup** (platform margin) in micro-USD — recorded DISTINCTLY from wholesale.
+    pub markup: MicroUsd,
 }
 
 impl CostEvent {
     /// The billed total — `wholesale + markup`. Checked: an overflow is a loud `None` (the
     /// settle path turns it into a typed error rather than silently wrapping).
-    pub fn billed(&self) -> Option<MinorUnits> {
+    pub fn billed(&self) -> Option<MicroUsd> {
         self.wholesale.checked_add(self.markup)
     }
 }
@@ -181,14 +162,14 @@ pub struct MeteredUnit {
     /// The metered-unit label (the dimension counted).
     pub unit: &'static str,
     /// The wholesale (provider) cost of this unit.
-    pub wholesale: MinorUnits,
+    pub wholesale: MicroUsd,
     /// The markup (platform margin) on this unit.
-    pub markup: MinorUnits,
+    pub markup: MicroUsd,
 }
 
 impl MeteredUnit {
     /// The total cost of this unit (`wholesale + markup`), checked.
-    pub fn total(&self) -> Option<MinorUnits> {
+    pub fn total(&self) -> Option<MicroUsd> {
         self.wholesale.checked_add(self.markup)
     }
 }
@@ -201,14 +182,14 @@ pub enum ReserveError {
     /// dispatch** (no row is written). This is the runaway self-limiter.
     InsufficientBalance {
         /// The amount the dispatch asked to reserve.
-        requested: MinorUnits,
+        requested: MicroUsd,
         /// The balance available (from the Commercial wallet).
-        available: MinorUnits,
+        available: MicroUsd,
     },
     /// A reservation already exists for this `(tenant, run)` — a dispatch is reserved once
     /// (idempotency guard; a re-dispatch is rejected loudly rather than double-reserving).
     DuplicateReservation,
-    /// An integer-minor-units arithmetic operation overflowed `u64` — loud, never a silent
+    /// An integer micro-USD arithmetic operation overflowed `u64` — loud, never a silent
     /// wrap.
     AmountOverflow,
 }
@@ -221,7 +202,7 @@ impl core::fmt::Display for ReserveError {
                 available,
             } => write!(
                 f,
-                "reserve refused: insufficient balance (requested {} minor-units, {} available) \
+                "reserve refused: insufficient balance (requested {} micro-USD, {} available) \
                  — no balance, no run (storage §9)",
                 requested.0, available.0
             ),
@@ -232,7 +213,7 @@ impl core::fmt::Display for ReserveError {
             ),
             ReserveError::AmountOverflow => write!(
                 f,
-                "reserve refused: integer minor-units arithmetic overflowed u64 (loud, never a silent wrap)"
+                "reserve refused: integer micro-USD arithmetic overflowed u64 (loud, never a silent wrap)"
             ),
         }
     }
@@ -249,7 +230,7 @@ pub enum SettleError {
     /// A retry for an already-settled reservation supplied different ordered metered units. Exact
     /// replay is required; accepting drift would make an acknowledgement-loss retry ambiguous.
     UsageDivergence,
-    /// An integer-minor-units arithmetic operation overflowed `u64`.
+    /// An integer micro-USD arithmetic operation overflowed `u64`.
     AmountOverflow,
 }
 
@@ -267,7 +248,7 @@ impl core::fmt::Display for SettleError {
             ),
             SettleError::AmountOverflow => write!(
                 f,
-                "settle refused: integer minor-units arithmetic overflowed u64"
+                "settle refused: integer micro-USD arithmetic overflowed u64"
             ),
         }
     }
@@ -282,10 +263,10 @@ pub struct SettleOutcome {
     /// The cost events recorded — **exactly one per metered unit** supplied.
     pub cost_events: Vec<CostEvent>,
     /// The total billed (`Σ (wholesale + markup)` over the cost events).
-    pub billed_total: MinorUnits,
+    pub billed_total: MicroUsd,
     /// The amount refunded to the wallet (`reserved − billed_total`, never negative — a
     /// settle never bills MORE than was reserved; the reserve is the cap).
-    pub refunded: MinorUnits,
+    pub refunded: MicroUsd,
 }
 
 /// **The durable per-tenant reserve/settle ledger (mandatory-core) — MR-009b W6b2: a role struct
@@ -347,8 +328,8 @@ impl CostLedger {
         &mut self,
         tenant: TenantId,
         run: RunId,
-        amount: MinorUnits,
-        available: MinorUnits,
+        amount: MicroUsd,
+        available: MicroUsd,
     ) -> Result<Reservation, ReserveError> {
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
@@ -385,7 +366,7 @@ impl CostLedger {
         &mut self,
         tenant: &TenantId,
         run: &RunId,
-    ) -> Result<MinorUnits, SettleError> {
+    ) -> Result<MicroUsd, SettleError> {
         match &mut self.backend {
             #[cfg(any(test, feature = "test-support"))]
             CostBackend::Memory(m) => m.cancel_unstarted(tenant, run),
@@ -448,7 +429,7 @@ impl MemoryCostLedger {
         MemoryCostLedger::default()
     }
 
-    /// **Reserve-at-dispatch.** Debit `amount` (integer minor-units) against the supplied
+    /// **Reserve-at-dispatch.** Debit `amount` (integer micro-USD) against the supplied
     /// wallet `available` balance. If `available < amount` the reservation is **REFUSED**
     /// and nothing is written — **the run does not dispatch** (no balance → no run). On
     /// success a `Reserved` row is written and the reservation is returned.
@@ -460,8 +441,8 @@ impl MemoryCostLedger {
         &mut self,
         tenant: TenantId,
         run: RunId,
-        amount: MinorUnits,
-        available: MinorUnits,
+        amount: MicroUsd,
+        available: MicroUsd,
     ) -> Result<Reservation, ReserveError> {
         if self
             .reservations
@@ -546,7 +527,7 @@ impl MemoryCostLedger {
 
         // One cost event per metered unit (the `cost_events_per_unit == 1` invariant).
         let mut events = Vec::with_capacity(units.len());
-        let mut billed = MinorUnits::ZERO;
+        let mut billed = MicroUsd::ZERO;
         for u in units {
             let event = CostEvent {
                 tenant: tenant.clone(),
@@ -594,7 +575,7 @@ impl MemoryCostLedger {
         &self,
         tenant: &TenantId,
         run: &RunId,
-        reserved: MinorUnits,
+        reserved: MicroUsd,
     ) -> Result<SettleOutcome, SettleError> {
         let events: Vec<CostEvent> = self
             .cost_events
@@ -602,7 +583,7 @@ impl MemoryCostLedger {
             .filter(|e| &e.tenant == tenant && &e.run == run)
             .cloned()
             .collect();
-        let mut billed = MinorUnits::ZERO;
+        let mut billed = MicroUsd::ZERO;
         for e in &events {
             let t = e.billed().ok_or(SettleError::AmountOverflow)?;
             billed = billed.checked_add(t).ok_or(SettleError::AmountOverflow)?;
@@ -627,7 +608,7 @@ impl MemoryCostLedger {
         &mut self,
         tenant: &TenantId,
         run: &RunId,
-    ) -> Result<MinorUnits, SettleError> {
+    ) -> Result<MicroUsd, SettleError> {
         let key = (tenant.clone(), run.clone());
         let reservation = self
             .reservations
@@ -701,9 +682,9 @@ pub struct ReserveSettleSignal {
     /// artifact; `> 0` reads RED (an in-flight run was torn down — a contract breach).
     pub inflight_interrupt_count: u64,
     /// The total **wholesale** (provider) cost billed — recorded distinctly from markup.
-    pub wholesale_total: MinorUnits,
+    pub wholesale_total: MicroUsd,
     /// The total **markup** (platform margin) billed — recorded distinctly from wholesale.
-    pub markup_total: MinorUnits,
+    pub markup_total: MicroUsd,
 }
 
 impl ReserveSettleSignal {
@@ -734,21 +715,21 @@ mod tests {
         let mut ledger = CostLedger::new();
         // Sufficient balance: reserved.
         let res = ledger
-            .reserve(tenant(), run(), MinorUnits(500), MinorUnits(1_000))
+            .reserve(tenant(), run(), MicroUsd(500), MicroUsd(1_000))
             .expect("a funded reserve admits");
         assert_eq!(res.state, ReservationState::Reserved);
-        assert_eq!(res.reserved, MinorUnits(500));
+        assert_eq!(res.reserved, MicroUsd(500));
 
         // Insufficient balance: refused, no row written for the second run.
         let run2 = RunId::new("01J0RUN_BROKE");
         let err = ledger
-            .reserve(tenant(), run2.clone(), MinorUnits(900), MinorUnits(100))
+            .reserve(tenant(), run2.clone(), MicroUsd(900), MicroUsd(100))
             .expect_err("an unfunded reserve is refused");
         assert_eq!(
             err,
             ReserveError::InsufficientBalance {
-                requested: MinorUnits(900),
-                available: MinorUnits(100),
+                requested: MicroUsd(900),
+                available: MicroUsd(100),
             }
         );
         assert!(
@@ -762,7 +743,7 @@ mod tests {
     #[test]
     fn exact_balance_is_affordable() {
         let mut ledger = CostLedger::new();
-        let res = ledger.reserve(tenant(), run(), MinorUnits(100), MinorUnits(100));
+        let res = ledger.reserve(tenant(), run(), MicroUsd(100), MicroUsd(100));
         assert!(res.is_ok(), "available == amount must be affordable");
     }
 
@@ -772,10 +753,10 @@ mod tests {
     fn duplicate_reserve_is_rejected() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(100), MinorUnits(1_000))
+            .reserve(tenant(), run(), MicroUsd(100), MicroUsd(1_000))
             .unwrap();
         let err = ledger
-            .reserve(tenant(), run(), MinorUnits(100), MinorUnits(1_000))
+            .reserve(tenant(), run(), MicroUsd(100), MicroUsd(1_000))
             .expect_err("a second reserve for the same run is rejected");
         assert_eq!(err, ReserveError::DuplicateReservation);
     }
@@ -786,20 +767,20 @@ mod tests {
     fn settle_records_one_cost_event_per_metered_unit_with_split() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(1_000), MinorUnits(5_000))
+            .reserve(tenant(), run(), MicroUsd(1_000), MicroUsd(5_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
 
         let units = vec![
             MeteredUnit {
                 unit: "llm.tokens",
-                wholesale: MinorUnits(120),
-                markup: MinorUnits(30),
+                wholesale: MicroUsd(120),
+                markup: MicroUsd(30),
             },
             MeteredUnit {
                 unit: "ci.minute",
-                wholesale: MinorUnits(200),
-                markup: MinorUnits(50),
+                wholesale: MicroUsd(200),
+                markup: MicroUsd(50),
             },
         ];
         let outcome = ledger.settle(&tenant(), &run(), &units).unwrap();
@@ -810,14 +791,14 @@ mod tests {
 
         // wholesale ≠ markup — the two are recorded as DISTINCT fields, never conflated.
         let e0 = &outcome.cost_events[0];
-        assert_eq!(e0.wholesale, MinorUnits(120));
-        assert_eq!(e0.markup, MinorUnits(30));
-        assert_eq!(e0.billed(), Some(MinorUnits(150)));
+        assert_eq!(e0.wholesale, MicroUsd(120));
+        assert_eq!(e0.markup, MicroUsd(30));
+        assert_eq!(e0.billed(), Some(MicroUsd(150)));
         assert_ne!(e0.wholesale, e0.markup, "wholesale and markup are distinct");
 
         // billed_total = Σ(wholesale + markup) = 150 + 250 = 400; refund = 1000 − 400 = 600.
-        assert_eq!(outcome.billed_total, MinorUnits(400));
-        assert_eq!(outcome.refunded, MinorUnits(600));
+        assert_eq!(outcome.billed_total, MicroUsd(400));
+        assert_eq!(outcome.refunded, MicroUsd(600));
 
         // The reservation is now Settled.
         assert_eq!(
@@ -832,21 +813,21 @@ mod tests {
     fn settle_is_capped_at_the_reservation() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(100), MinorUnits(1_000))
+            .reserve(tenant(), run(), MicroUsd(100), MicroUsd(1_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         let units = vec![MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(500),
-            markup: MinorUnits(500),
+            wholesale: MicroUsd(500),
+            markup: MicroUsd(500),
         }];
         let outcome = ledger.settle(&tenant(), &run(), &units).unwrap();
         assert_eq!(
             outcome.billed_total,
-            MinorUnits(100),
+            MicroUsd(100),
             "billed is capped at the reserved amount"
         );
-        assert_eq!(outcome.refunded, MinorUnits::ZERO);
+        assert_eq!(outcome.refunded, MicroUsd::ZERO);
     }
 
     /// **The settle is idempotent** — a double-settle returns the same outcome and records
@@ -855,13 +836,13 @@ mod tests {
     fn double_settle_does_not_double_charge() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(1_000), MinorUnits(5_000))
+            .reserve(tenant(), run(), MicroUsd(1_000), MicroUsd(5_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         let units = vec![MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(120),
-            markup: MinorUnits(30),
+            wholesale: MicroUsd(120),
+            markup: MicroUsd(30),
         }];
         let first = ledger.settle(&tenant(), &run(), &units).unwrap();
         let second = ledger.settle(&tenant(), &run(), &units).unwrap();
@@ -876,8 +857,8 @@ mod tests {
             &run(),
             &[MeteredUnit {
                 unit: "llm.tokens",
-                wholesale: MinorUnits(121),
-                markup: MinorUnits(30),
+                wholesale: MicroUsd(121),
+                markup: MicroUsd(30),
             }],
         );
         assert_eq!(
@@ -894,7 +875,7 @@ mod tests {
     fn cancel_never_interrupts_an_in_flight_run() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(500), MinorUnits(1_000))
+            .reserve(tenant(), run(), MicroUsd(500), MicroUsd(1_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         let err = ledger
@@ -919,10 +900,10 @@ mod tests {
     fn cancel_refunds_an_unstarted_run() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(500), MinorUnits(1_000))
+            .reserve(tenant(), run(), MicroUsd(500), MicroUsd(1_000))
             .unwrap();
         let refund = ledger.cancel_unstarted(&tenant(), &run()).unwrap();
-        assert_eq!(refund, MinorUnits(500), "the full reservation is refunded");
+        assert_eq!(refund, MicroUsd(500), "the full reservation is refunded");
         assert_eq!(
             ledger.state_of(&tenant(), &run()),
             Some(ReservationState::Cancelled)
@@ -945,7 +926,7 @@ mod tests {
     fn settled_run_cannot_reenter_flight() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(100), MinorUnits(1_000))
+            .reserve(tenant(), run(), MicroUsd(100), MicroUsd(1_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         ledger.settle(&tenant(), &run(), &[]).unwrap();
@@ -955,15 +936,15 @@ mod tests {
         assert_eq!(err, SettleError::NoSuchReservation);
     }
 
-    /// **Integer minor-units arithmetic is checked** — an overflow is a loud typed error,
+    /// **Integer micro-USD arithmetic is checked** — an overflow is a loud typed error,
     /// never a silent wrap.
     #[test]
     fn minor_units_arithmetic_is_checked() {
-        assert_eq!(MinorUnits(u64::MAX).checked_add(MinorUnits(1)), None);
-        assert_eq!(MinorUnits(5).checked_sub(MinorUnits(10)), None);
+        assert_eq!(MicroUsd(u64::MAX).checked_add(MicroUsd(1)), None);
+        assert_eq!(MicroUsd(5).checked_sub(MicroUsd(10)), None);
         assert_eq!(
-            MinorUnits(u64::MAX).checked_add(MinorUnits(0)),
-            Some(MinorUnits(u64::MAX))
+            MicroUsd(u64::MAX).checked_add(MicroUsd(0)),
+            Some(MicroUsd(u64::MAX))
         );
     }
 
@@ -972,13 +953,13 @@ mod tests {
     fn settle_overflow_is_loud() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(u64::MAX), MinorUnits(u64::MAX))
+            .reserve(tenant(), run(), MicroUsd(u64::MAX), MicroUsd(u64::MAX))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         let units = vec![MeteredUnit {
             unit: "boom",
-            wholesale: MinorUnits(u64::MAX),
-            markup: MinorUnits(1),
+            wholesale: MicroUsd(u64::MAX),
+            markup: MicroUsd(1),
         }];
         let err = ledger.settle(&tenant(), &run(), &units).unwrap_err();
         assert_eq!(err, SettleError::AmountOverflow);
@@ -989,8 +970,8 @@ mod tests {
     #[test]
     fn errors_display_loud_and_specific() {
         let r = ReserveError::InsufficientBalance {
-            requested: MinorUnits(900),
-            available: MinorUnits(100),
+            requested: MicroUsd(900),
+            available: MicroUsd(100),
         }
         .to_string();
         assert!(r.contains("no balance, no run"), "must cite the floor: {r}");
@@ -1010,25 +991,25 @@ mod tests {
     fn synthetic_run_emits_a_green_drill_artifact() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(1_000), MinorUnits(5_000))
+            .reserve(tenant(), run(), MicroUsd(1_000), MicroUsd(5_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         let units = vec![
             MeteredUnit {
                 unit: "llm.tokens",
-                wholesale: MinorUnits(120),
-                markup: MinorUnits(30),
+                wholesale: MicroUsd(120),
+                markup: MicroUsd(30),
             },
             MeteredUnit {
                 unit: "ci.minute",
-                wholesale: MinorUnits(200),
-                markup: MinorUnits(50),
+                wholesale: MicroUsd(200),
+                markup: MicroUsd(50),
             },
         ];
         let outcome = ledger.settle(&tenant(), &run(), &units).unwrap();
 
-        let wholesale_total = MinorUnits(120 + 200);
-        let markup_total = MinorUnits(30 + 50);
+        let wholesale_total = MicroUsd(120 + 200);
+        let markup_total = MicroUsd(30 + 50);
         let signal = ReserveSettleSignal {
             tenant: tenant(),
             metered_units: units.len() as u64,
@@ -1047,8 +1028,8 @@ mod tests {
         assert_eq!(signal.inflight_interrupt_count, 0);
         // wholesale ≠ markup, recorded distinctly.
         assert_ne!(signal.wholesale_total, signal.markup_total);
-        assert_eq!(signal.wholesale_total, MinorUnits(320));
-        assert_eq!(signal.markup_total, MinorUnits(80));
+        assert_eq!(signal.wholesale_total, MicroUsd(320));
+        assert_eq!(signal.markup_total, MicroUsd(80));
     }
 
     /// [`MeteredUnit::total`] sums wholesale + markup (and is checked) — exercised so the
@@ -1057,14 +1038,14 @@ mod tests {
     fn metered_unit_total_sums_wholesale_and_markup() {
         let u = MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(120),
-            markup: MinorUnits(30),
+            wholesale: MicroUsd(120),
+            markup: MicroUsd(30),
         };
-        assert_eq!(u.total(), Some(MinorUnits(150)));
+        assert_eq!(u.total(), Some(MicroUsd(150)));
         let overflow = MeteredUnit {
             unit: "boom",
-            wholesale: MinorUnits(u64::MAX),
-            markup: MinorUnits(1),
+            wholesale: MicroUsd(u64::MAX),
+            markup: MicroUsd(1),
         };
         assert_eq!(
             overflow.total(),
@@ -1080,18 +1061,18 @@ mod tests {
     fn settle_billed_equal_to_reserved_is_not_clamped() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(150), MinorUnits(1_000))
+            .reserve(tenant(), run(), MicroUsd(150), MicroUsd(1_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         let units = vec![MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(120),
-            markup: MinorUnits(30),
+            wholesale: MicroUsd(120),
+            markup: MicroUsd(30),
         }];
         let outcome = ledger.settle(&tenant(), &run(), &units).unwrap();
         // billed (150) == reserved (150): bill the full amount, refund 0.
-        assert_eq!(outcome.billed_total, MinorUnits(150));
-        assert_eq!(outcome.refunded, MinorUnits::ZERO);
+        assert_eq!(outcome.billed_total, MicroUsd(150));
+        assert_eq!(outcome.refunded, MicroUsd::ZERO);
     }
 
     /// **The idempotent re-settle reconstructs the EXACT billed/refund from the durable
@@ -1103,13 +1084,13 @@ mod tests {
         let mut ledger = CostLedger::new();
         // Run A: bills 150 of a 1000 reservation → refund 850.
         ledger
-            .reserve(tenant(), run(), MinorUnits(1_000), MinorUnits(9_000))
+            .reserve(tenant(), run(), MicroUsd(1_000), MicroUsd(9_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         let units_a = vec![MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(120),
-            markup: MinorUnits(30),
+            wholesale: MicroUsd(120),
+            markup: MicroUsd(30),
         }];
         ledger.settle(&tenant(), &run(), &units_a).unwrap();
 
@@ -1120,23 +1101,23 @@ mod tests {
             .reserve(
                 tenant(),
                 run_b.clone(),
-                MinorUnits(1_000),
-                MinorUnits(9_000),
+                MicroUsd(1_000),
+                MicroUsd(9_000),
             )
             .unwrap();
         ledger.begin(&tenant(), &run_b).unwrap();
         let units_b = vec![MeteredUnit {
             unit: "ci.minute",
-            wholesale: MinorUnits(500),
-            markup: MinorUnits(0),
+            wholesale: MicroUsd(500),
+            markup: MicroUsd(0),
         }];
         ledger.settle(&tenant(), &run_b, &units_b).unwrap();
 
         // Re-settle run A: reconstructed from the durable log, EXACT amounts, run-B excluded.
         let again = ledger.settle(&tenant(), &run(), &units_a).unwrap();
         assert_eq!(again.cost_events.len(), 1, "only run A's one event");
-        assert_eq!(again.billed_total, MinorUnits(150));
-        assert_eq!(again.refunded, MinorUnits(850));
+        assert_eq!(again.billed_total, MicroUsd(150));
+        assert_eq!(again.refunded, MicroUsd(850));
         assert_eq!(again.cost_events[0].unit, "llm.tokens");
     }
 
@@ -1148,19 +1129,19 @@ mod tests {
     fn re_settle_clamps_an_over_run_to_the_reservation() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(100), MinorUnits(9_000))
+            .reserve(tenant(), run(), MicroUsd(100), MicroUsd(9_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         // The recorded cost events sum to 1000, far above the 100 reservation.
         let units = vec![MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(1_000),
-            markup: MinorUnits(0),
+            wholesale: MicroUsd(1_000),
+            markup: MicroUsd(0),
         }];
         let first = ledger.settle(&tenant(), &run(), &units).unwrap();
         assert_eq!(
             first.billed_total,
-            MinorUnits(100),
+            MicroUsd(100),
             "first settle clamps to reserved"
         );
 
@@ -1169,8 +1150,8 @@ mod tests {
         // (1000) vs reserved (100) comparison still selects the clamp here, BUT the boundary
         // is exercised distinctly from the < case in `re_settle_reconstructs_exact_amounts`.
         let again = ledger.settle(&tenant(), &run(), &units).unwrap();
-        assert_eq!(again.billed_total, MinorUnits(100));
-        assert_eq!(again.refunded, MinorUnits::ZERO);
+        assert_eq!(again.billed_total, MicroUsd(100));
+        assert_eq!(again.refunded, MicroUsd::ZERO);
     }
 
     /// A re-settle whose recorded billed EXACTLY equals the reservation is NOT clamped — the
@@ -1180,13 +1161,13 @@ mod tests {
     fn re_settle_billed_equal_to_reserved_uses_unclamped_value() {
         let mut ledger = CostLedger::new();
         ledger
-            .reserve(tenant(), run(), MinorUnits(150), MinorUnits(9_000))
+            .reserve(tenant(), run(), MicroUsd(150), MicroUsd(9_000))
             .unwrap();
         ledger.begin(&tenant(), &run()).unwrap();
         let units = vec![MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(120),
-            markup: MinorUnits(30),
+            wholesale: MicroUsd(120),
+            markup: MicroUsd(30),
         }];
         ledger.settle(&tenant(), &run(), &units).unwrap();
         let again = ledger.settle(&tenant(), &run(), &units).unwrap();
@@ -1194,8 +1175,8 @@ mod tests {
         // yield 150 here; the DISTINGUISHING case is `re_settle_reconstructs_exact_amounts`,
         // where billed (150) < reserved (1000): `>` keeps 150, `>=` would WRONGLY clamp to
         // 1000 — that test kills `>=`; this one pins the equality boundary value.)
-        assert_eq!(again.billed_total, MinorUnits(150));
-        assert_eq!(again.refunded, MinorUnits::ZERO);
+        assert_eq!(again.billed_total, MicroUsd(150));
+        assert_eq!(again.refunded, MicroUsd::ZERO);
     }
 
     /// **`cost_events_for` isolates by BOTH tenant and run** (the `&&` filter) — events for a
@@ -1212,7 +1193,7 @@ mod tests {
             (other_tenant.clone(), run(), 300),
         ] {
             ledger
-                .reserve(t.clone(), r.clone(), MinorUnits(1_000), MinorUnits(9_000))
+                .reserve(t.clone(), r.clone(), MicroUsd(1_000), MicroUsd(9_000))
                 .unwrap();
             ledger.begin(&t, &r).unwrap();
             ledger
@@ -1221,8 +1202,8 @@ mod tests {
                     &r,
                     &[MeteredUnit {
                         unit: "u",
-                        wholesale: MinorUnits(w),
-                        markup: MinorUnits(0),
+                        wholesale: MicroUsd(w),
+                        markup: MicroUsd(0),
                     }],
                 )
                 .unwrap();
@@ -1231,17 +1212,17 @@ mod tests {
         // Only (tenant, run) — not (tenant, run_b), not (other_tenant, run).
         let events = ledger.cost_events_for(&tenant(), &run());
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].wholesale, MinorUnits(100));
+        assert_eq!(events[0].wholesale, MicroUsd(100));
         // Same tenant, different run is excluded.
         assert_eq!(ledger.cost_events_for(&tenant(), &run_b).len(), 1);
         assert_eq!(
             ledger.cost_events_for(&tenant(), &run_b)[0].wholesale,
-            MinorUnits(200)
+            MicroUsd(200)
         );
         // Different tenant, same run is excluded.
         assert_eq!(
             ledger.cost_events_for(&other_tenant, &run())[0].wholesale,
-            MinorUnits(300)
+            MicroUsd(300)
         );
     }
 
@@ -1254,8 +1235,8 @@ mod tests {
             metered_units: 2,
             cost_events: 2,
             inflight_interrupt_count: 1,
-            wholesale_total: MinorUnits(320),
-            markup_total: MinorUnits(80),
+            wholesale_total: MicroUsd(320),
+            markup_total: MicroUsd(80),
         };
         assert!(!red_interrupt.is_green(), "an interrupt must read RED");
 
@@ -1264,8 +1245,8 @@ mod tests {
             metered_units: 2,
             cost_events: 1,
             inflight_interrupt_count: 0,
-            wholesale_total: MinorUnits(320),
-            markup_total: MinorUnits(80),
+            wholesale_total: MicroUsd(320),
+            markup_total: MicroUsd(80),
         };
         assert!(
             !red_mismatch.is_green(),

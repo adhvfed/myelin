@@ -7,17 +7,17 @@
 //! wallet" — this module is that wallet, co-located with the ledger it will later feed.
 //!
 //! ## THE UNIT — MICRO-DOLLARS (`1 unit = $0.000001`), a `u64`
-//! Every amount in this wallet is an integer count of **micro-dollars** (`MicroUsd`): one unit is
+//! Every amount in this wallet is an integer count of **micro-dollars** ([`MicroUsd`]): one unit is
 //! one millionth of a US dollar, so **$1.00 = 1_000_000 units** and **1 cent = 10_000 units**. This
 //! sub-cent scale is deliberate: a hosted-agent task can cost a small fraction of a cent (a ~2% cut
 //! on a sub-cent Luna task is representable at this scale but would round to zero at cent-scale). A
 //! float amount is **unrepresentable** — you cannot construct a fractional balance.
 //!
-//! **This is a DEDICATED agent wallet — deliberately SEPARATE from the shared, cent-scaled
-//! [`crate::reserve_settle::MinorUnits`] `cost_event` ledger.** The two never share a table, a unit,
-//! or an arithmetic path: `MicroUsd` (micro-dollars, this wallet) and `MinorUnits` (minor-units /
-//! cents, the CI+agent cost ledger) are distinct types so a value from one can never be mistaken for
-//! the other, and this wallet has ZERO impact on CI billing.
+//! [`MicroUsd`] is the platform's single money unit (it lives in [`crate::money`]): this wallet and
+//! the [`crate::reserve_settle`] cost ledger speak the SAME type, so the wallet balance flows into
+//! the ledger's `available` param with no conversion. The wallet still owns its OWN durable tables
+//! (`agent_wallet`/`agent_wallet_ledger`), separate from the ledger's `cost_event` tables — a shared
+//! unit, not a shared table.
 //!
 //! ## The invariants (financial correctness is the bar)
 //! 1. **`balance == Σ ledger`, always.** [`AgentWallet::balance`] reads the materialized
@@ -59,6 +59,10 @@ use sqlx::Row;
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
+
+// The money unit is shared with the reserve/settle ledger; re-exported here so the historical
+// `myelin_storage::agent_wallet::MicroUsd` path keeps resolving.
+pub use crate::money::MicroUsd;
 
 // =================================================================================================
 // Migration 0080 — the tenant-owned (FORCE-RLS) agent_wallet + IMMUTABLE agent_wallet_ledger tables.
@@ -134,59 +138,8 @@ pub fn agent_wallet_migrations() -> Migrations {
 }
 
 // =================================================================================================
-// MicroUsd — the frozen micro-dollar unit (distinct from the cent-scaled MinorUnits).
+// The money unit ([`MicroUsd`]) now lives in `crate::money` — shared with the reserve/settle ledger.
 // =================================================================================================
-
-/// An integer **micro-dollars** amount — the frozen unit of the prepaid agent wallet
-/// (`1 MicroUsd = $0.000001`; `$1.00 = 1_000_000`; `1 cent = 10_000`). A `u64` so the arithmetic is
-/// exact and a fractional balance is **unrepresentable**. All wallet arithmetic is checked
-/// (`checked_add`/`checked_sub`) — an overflow is a loud typed error, never a silent wrap.
-///
-/// **Deliberately DISTINCT from [`crate::reserve_settle::MinorUnits`]** (minor-units / cents, the
-/// shared cost ledger). They are different Rust types at a different scale, so a micro-dollar wallet
-/// amount can NEVER be confused with a cent-scaled billing amount.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct MicroUsd(pub u64);
-
-impl MicroUsd {
-    /// Zero micro-dollars (the additive identity — an empty wallet, a zero movement).
-    pub const ZERO: MicroUsd = MicroUsd(0);
-
-    /// Checked addition — `None` on `u64` overflow (the loud-not-silent rule; the caller turns it
-    /// into a typed [`WalletError::BalanceOverflow`]).
-    pub fn checked_add(self, other: MicroUsd) -> Option<MicroUsd> {
-        self.0.checked_add(other.0).map(MicroUsd)
-    }
-
-    /// Checked subtraction — `None` if it would go negative (a debit can never drive the balance
-    /// below zero; the caller turns it into [`WalletError::InsufficientBalance`]).
-    pub fn checked_sub(self, other: MicroUsd) -> Option<MicroUsd> {
-        self.0.checked_sub(other.0).map(MicroUsd)
-    }
-
-    /// Whether this amount fits Postgres `bigint` (`i64`) losslessly (`0..=i64::MAX`). Postgres
-    /// `bigint` is signed, so a `u64` above `i64::MAX` cannot round-trip — the wallet refuses it
-    /// fail-closed rather than corrupting a balance via two's-complement reinterpretation.
-    pub fn fits_bigint(self) -> bool {
-        self.0 <= i64::MAX as u64
-    }
-
-    /// The `bigint` (`i64`) wire value, or `None` if it does not fit (`> i64::MAX`).
-    fn to_bigint(self) -> Option<i64> {
-        if self.fits_bigint() {
-            Some(self.0 as i64)
-        } else {
-            None
-        }
-    }
-
-    /// Rebuild a `MicroUsd` from a `bigint` read back from the DB. The `balance_micro >= 0` /
-    /// `amount_micro >= 0` CHECK constraints guarantee the stored value is non-negative, so the
-    /// `i64 → u64` widening is lossless.
-    fn from_bigint(v: i64) -> MicroUsd {
-        MicroUsd(v as u64)
-    }
-}
 
 /// A CREDIT movement's kind — the only two ways money is ADDED to the wallet. (A `debit` is its own
 /// [`AgentWallet::debit`] op; it is never a `credit` kind, so a credit can never subtract.)
@@ -574,36 +527,7 @@ async fn write_balance(
 mod tests {
     use super::*;
 
-    // ---- MicroUsd checked arithmetic + the bigint-fit boundary (DB-free) --------------------------
-
-    /// The micro-dollar unit is checked: an overflow is a loud `None`, never a silent wrap.
-    #[test]
-    fn micro_usd_arithmetic_is_checked() {
-        assert_eq!(MicroUsd(u64::MAX).checked_add(MicroUsd(1)), None);
-        assert_eq!(MicroUsd(5).checked_sub(MicroUsd(10)), None);
-        assert_eq!(MicroUsd(10).checked_sub(MicroUsd(10)), Some(MicroUsd::ZERO));
-        assert_eq!(
-            MicroUsd(1_000_000).checked_add(MicroUsd(10_000)),
-            Some(MicroUsd(1_010_000)),
-            "$1.00 + 1 cent = 1_010_000 micro-USD"
-        );
-    }
-
-    /// The `bigint` (`i64`) fit boundary: `i64::MAX` fits, `i64::MAX + 1` does not (fail-closed).
-    #[test]
-    fn bigint_fit_boundary_is_exact() {
-        let max = MicroUsd(i64::MAX as u64);
-        assert!(max.fits_bigint(), "i64::MAX micro-USD fits bigint");
-        assert_eq!(max.to_bigint(), Some(i64::MAX));
-
-        let over = MicroUsd(i64::MAX as u64 + 1);
-        assert!(!over.fits_bigint(), "i64::MAX + 1 does NOT fit bigint");
-        assert_eq!(over.to_bigint(), None);
-
-        // A value read back from a stored non-negative bigint round-trips losslessly.
-        assert_eq!(MicroUsd::from_bigint(i64::MAX), MicroUsd(i64::MAX as u64));
-        assert_eq!(MicroUsd::from_bigint(0), MicroUsd::ZERO);
-    }
+    // ---- MicroUsd checked arithmetic + the bigint-fit boundary live in `crate::money` now. --------
 
     /// Credit kinds map to the exact ledger tokens the CHECK constraint admits — and a debit's token
     /// is distinct from both (a credit can never be a debit).

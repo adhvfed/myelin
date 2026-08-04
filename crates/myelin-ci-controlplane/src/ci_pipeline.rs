@@ -71,7 +71,7 @@
 //!   wholesale unit, [`crate::metering::CostEventRow`] is the CI `cost_event` schema row (wholesale +
 //!   markup SEPARATE columns, `kind ∈ {ci, agent}`), and [`crate::metering::CiMeter`] wraps the engine
 //!   bookend so a stage `reserve_budget()`s (refuse-to-start) + `settle_budget()`s its resource-seconds
-//!   on `job.done`. The body composes the engine bookend over a per-stage `MinorUnits` cost; the
+//!   on `job.done`. The body composes the engine bookend over a per-stage `MicroUsd` cost; the
 //!   resource-second → credit/price MARKUP mapping remains Commercial's (arch 06 R-2).
 //! - **The `check_attempt` monotonic counter + the `ci.check.updated` PRODUCER plumbing into the
 //!   outbox** is CI-P18 (P-361); **the `ci.result` rollup signal end-to-end with Git's merge queue

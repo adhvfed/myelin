@@ -42,7 +42,7 @@ use myelin_flow::{
     SignalStore, WfCtx, WfJournal, CI_RESULT_SIGNAL,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::reserve_settle::MinorUnits;
+use myelin_storage::reserve_settle::MicroUsd;
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
@@ -157,7 +157,7 @@ fn consumer_and_provider_agree_on_the_merge_attempt_id_without_coordination() {
     // CONSUMER side (the merge queue): dispatch + consume + merge.
     let mut ctx = begin(&outbox, journal, signals);
     let out = ctx
-        .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MinorUnits(0), vec![])
+        .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MicroUsd(0), vec![])
         .expect("merge");
     match out {
         MergeOutcome::Merged {
@@ -208,7 +208,7 @@ fn a_double_delivered_ci_result_wakes_the_merge_queue_once() {
 
     let mut ctx = begin(&outbox, journal, signals.clone());
     let out = ctx
-        .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MinorUnits(0), vec![])
+        .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MicroUsd(0), vec![])
         .expect("merge");
     assert!(matches!(out, MergeOutcome::Merged { .. }));
     assert_eq!(
@@ -243,7 +243,7 @@ fn a_failure_rollup_reconciles_to_a_humanised_dequeue() {
 
     let mut ctx = begin(&outbox, journal, signals);
     let out = ctx
-        .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MinorUnits(0), vec![])
+        .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MicroUsd(0), vec![])
         .expect("dequeue");
     match out {
         MergeOutcome::Dequeued { reason } => {
@@ -319,7 +319,7 @@ fn consumer_reconciles_with_the_real_ci_producer_end_to_end() {
     // CONSUMER (the merge queue): dispatch + consume the DERIVED rollup + merge.
     let mut ctx = begin(&outbox, journal, signals);
     let out = ctx
-        .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MinorUnits(0), vec![])
+        .run_merge_attempt(&request(), &OkCi, &OkMerger, None, MicroUsd(0), vec![])
         .expect("merge");
     match out {
         MergeOutcome::Merged {

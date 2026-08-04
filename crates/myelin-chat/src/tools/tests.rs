@@ -15,7 +15,7 @@
 
 use super::*;
 use myelin_agent::{DryRun as _, EffectApi, EffectResult, EventId, GateId, InboxEvent, ToolName};
-use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MinorUnits, RunId};
+use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MicroUsd, RunId};
 use myelin_tenancy::TenantId;
 
 // ───────── a real in-memory ToolSurface (the same shape the fabric catalogue uses) ─────────
@@ -217,14 +217,14 @@ fn tenant() -> TenantId {
 #[test]
 fn no_balance_means_no_post_the_reserve_refuses() {
     let mut ledger = CostLedger::new();
-    let estimate = PostCostEstimate(MinorUnits(50));
+    let estimate = PostCostEstimate(MicroUsd(50));
     // an exhausted wallet (available < estimate) REFUSES the dispatch — no post.
     let err = reserve_spend_bearing_post(
         &mut ledger,
         tenant(),
         RunId::new("run-1"),
         estimate,
-        MinorUnits(10),
+        MicroUsd(10),
     )
     .unwrap_err();
     assert!(
@@ -241,7 +241,7 @@ fn no_balance_means_no_post_the_reserve_refuses() {
 #[test]
 fn a_funded_spend_bearing_post_reserves_then_settles_within_the_reserve() {
     let mut ledger = CostLedger::new();
-    let estimate = PostCostEstimate(MinorUnits(50));
+    let estimate = PostCostEstimate(MicroUsd(50));
     let run = RunId::new("run-2");
     // funded → reserves (the dispatch is fronted).
     let reservation = reserve_spend_bearing_post(
@@ -249,27 +249,27 @@ fn a_funded_spend_bearing_post_reserves_then_settles_within_the_reserve() {
         tenant(),
         run.clone(),
         estimate,
-        MinorUnits(100),
+        MicroUsd(100),
     )
     .expect("a funded post reserves");
-    assert_eq!(reservation.reserved, MinorUnits(50));
+    assert_eq!(reservation.reserved, MicroUsd(50));
 
     // begin → in-flight → settle (the post completed). Actual cost ≤ reserve.
     ledger.begin(&tenant(), &run).expect("begin");
     let units = [MeteredUnit {
         unit: "agent.effect",
-        wholesale: MinorUnits(20),
-        markup: MinorUnits(10),
+        wholesale: MicroUsd(20),
+        markup: MicroUsd(10),
     }];
     let outcome = settle_spend_bearing_post(&mut ledger, &tenant(), &run, &units).expect("settle");
     assert_eq!(
         outcome.billed_total,
-        MinorUnits(30),
+        MicroUsd(30),
         "billed = wholesale + markup, capped at the reserve"
     );
     assert_eq!(
         outcome.refunded,
-        MinorUnits(20),
+        MicroUsd(20),
         "the over-reservation is released"
     );
     // chat never interrupts in-flight.

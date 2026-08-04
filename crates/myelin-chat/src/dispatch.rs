@@ -74,7 +74,7 @@ use myelin_identity::{
     RunId as IdRunId, RunToken,
 };
 use myelin_storage::reserve_settle::{
-    CostLedger, MinorUnits, Reservation, ReserveError, RunId as LedgerRunId,
+    CostLedger, MicroUsd, Reservation, ReserveError, RunId as LedgerRunId,
 };
 use myelin_tenancy::TenantId;
 
@@ -114,9 +114,9 @@ pub enum Disposition {
     /// ("reserve/settle gates even the explicit run").
     NoBalanceRefused {
         /// The estimate the dispatch asked to reserve.
-        requested: MinorUnits,
+        requested: MicroUsd,
         /// The wallet balance available (from Commercial).
-        available: MinorUnits,
+        available: MicroUsd,
     },
 }
 
@@ -161,8 +161,8 @@ pub fn reserve_gate(
     ledger: &mut CostLedger,
     tenant: TenantId,
     run: LedgerRunId,
-    estimate: MinorUnits,
-    available: MinorUnits,
+    estimate: MicroUsd,
+    available: MicroUsd,
 ) -> Result<Reservation, ReserveError> {
     // The reserve gate is the M1 Storage primitive; chat fronts the estimate, the ledger enforces
     // no-balance-no-run. Even the deliberate explicit run passes here (CHAT-D17's last clause).
@@ -190,8 +190,8 @@ pub fn dispatch_explicit<Id: IdentityService, Fx: EffectApi>(
     tenant: TenantId,
     agent_id: &PrincipalId,
     run_id: &str,
-    estimate: MinorUnits,
-    available: MinorUnits,
+    estimate: MicroUsd,
+    available: MicroUsd,
     output: ProposedEffect,
 ) -> (Disposition, Option<EffectResult>) {
     // (1) reserve — no balance → no run. The reserve gate bites BEFORE anything is minted or applied.
@@ -443,8 +443,8 @@ mod tests {
             &mut ledger,
             tenant(),
             LedgerRunId("run:1".into()),
-            MinorUnits(5),
-            MinorUnits(10),
+            MicroUsd(5),
+            MicroUsd(10),
         );
         assert!(ok.is_ok(), "a funded explicit run reserves");
         // exhausted balance → refused (no balance → no run).
@@ -452,8 +452,8 @@ mod tests {
             &mut ledger,
             tenant(),
             LedgerRunId("run:2".into()),
-            MinorUnits(50),
-            MinorUnits(10),
+            MicroUsd(50),
+            MicroUsd(10),
         );
         assert!(
             matches!(refused, Err(ReserveError::InsufficientBalance { .. })),
@@ -581,8 +581,8 @@ mod tests {
             tenant(),
             &agent_id(),
             "run:explicit:1",
-            MinorUnits(5),
-            MinorUnits(10),
+            MicroUsd(5),
+            MicroUsd(10),
             ProposedEffect("chat.post".into()),
         );
         // (1) the run dispatched + carries the minted per-run token (4.7).
@@ -615,16 +615,16 @@ mod tests {
             tenant(),
             &agent_id(),
             "run:explicit:2",
-            MinorUnits(50),
-            MinorUnits(10), // exhausted wallet
+            MicroUsd(50),
+            MicroUsd(10), // exhausted wallet
             ProposedEffect("chat.post".into()),
         );
         // the reserve gate bites EVEN the explicit run — no balance → no run (11.7).
         assert_eq!(
             disp,
             Disposition::NoBalanceRefused {
-                requested: MinorUnits(50),
-                available: MinorUnits(10)
+                requested: MicroUsd(50),
+                available: MicroUsd(10)
             },
             "no balance → no run: reserve/settle gates even the explicit run (CHAT-D17)"
         );

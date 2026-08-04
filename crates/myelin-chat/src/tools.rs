@@ -73,7 +73,7 @@ use myelin_agent::{
     EffectApi, EffectKind, EffectResult, ProposedEffect, RunCtx, ToolDef, ToolName, ToolSurface,
 };
 use myelin_storage::reserve_settle::{
-    CostLedger, MinorUnits, Reservation, ReserveError, RunId, SettleError, SettleOutcome,
+    CostLedger, MicroUsd, Reservation, ReserveError, RunId, SettleError, SettleOutcome,
 };
 use myelin_tenancy::TenantId;
 
@@ -387,7 +387,7 @@ pub fn register_chat_tools<S: ToolSurface>(surface: &mut S) -> Result<Vec<ToolDe
 /// fronts, expressed in integer minor-units (the frozen cost unit; a fractional cost is
 /// unrepresentable). The actual metered cost is settled on completion (≤ this reserve).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PostCostEstimate(pub MinorUnits);
+pub struct PostCostEstimate(pub MicroUsd);
 
 /// **Reserve-at-dispatch for a spend-bearing agent post (11.7 — CONSUMED).** Fronts the post's cost
 /// estimate against the Commercial wallet `available` balance via the M1 Storage ledger: **no balance
@@ -402,7 +402,7 @@ pub fn reserve_spend_bearing_post(
     tenant: TenantId,
     run: RunId,
     estimate: PostCostEstimate,
-    available: MinorUnits,
+    available: MicroUsd,
 ) -> Result<Reservation, ReserveError> {
     // The reserve gate is the M1 Storage primitive — chat fronts the estimate, the ledger enforces
     // no-balance-no-run. Chat surfaces the cost; Commercial owns the wallet (the `available` balance).

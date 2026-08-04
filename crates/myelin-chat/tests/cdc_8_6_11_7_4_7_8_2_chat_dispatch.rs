@@ -36,7 +36,7 @@ use myelin_identity::{
     ObjectId, ObjectType, Permission, Precondition, Principal, PrincipalId, Result as IdResult,
     RevokeTarget, RunId as IdRunId, RunToken, TupleDelta, Zookie,
 };
-use myelin_storage::reserve_settle::{CostLedger, MinorUnits, RunId as LedgerRunId};
+use myelin_storage::reserve_settle::{CostLedger, MicroUsd, RunId as LedgerRunId};
 use myelin_tenancy::{ArtifactRef, TenantId};
 
 fn tenant() -> TenantId {
@@ -203,8 +203,8 @@ fn cdc_an_explicit_run_consumes_reserve_mint_and_effect_api() {
         tenant(),
         &agent_id(),
         "run:cdc:1",
-        MinorUnits(5),
-        MinorUnits(10),
+        MicroUsd(5),
+        MicroUsd(10),
         ProposedEffect("chat.post".into()),
     );
 
@@ -227,8 +227,8 @@ fn cdc_an_explicit_run_consumes_reserve_mint_and_effect_api() {
     let dup = ledger.reserve(
         tenant(),
         LedgerRunId("run:cdc:1".into()),
-        MinorUnits(5),
-        MinorUnits(10),
+        MicroUsd(5),
+        MicroUsd(10),
     );
     assert!(
         dup.is_err(),
@@ -250,15 +250,15 @@ fn cdc_the_reserve_gate_refuses_an_unfunded_explicit_run() {
         tenant(),
         &agent_id(),
         "run:cdc:2",
-        MinorUnits(50),
-        MinorUnits(0),
+        MicroUsd(50),
+        MicroUsd(0),
         ProposedEffect("chat.post".into()),
     );
     assert_eq!(
         disp,
         Disposition::NoBalanceRefused {
-            requested: MinorUnits(50),
-            available: MinorUnits(0)
+            requested: MicroUsd(50),
+            available: MicroUsd(0)
         },
         "11.7 CONSUMER: no balance → no run (reserve gates even the explicit run)"
     );

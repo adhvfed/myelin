@@ -16,7 +16,7 @@ use myelin_ci_sandbox::events::{
 };
 use myelin_events::{Actor, CausedBy, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore};
 use myelin_flow::engine::SignalRow;
-use myelin_flow::MinorUnits;
+use myelin_flow::MicroUsd;
 use myelin_flow::{
     job_idem_token, stage_verdict_marker, BudgetGate, CiStage, SignalStore, TimerStore, Wallet,
     WfCtx, WfJournal,
@@ -92,13 +92,13 @@ fn job_run() -> PipelineRun {
             PipelineStage::job(CiStage::new(
                 "build",
                 "pipeline://acme/ci/run-7#build",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(3600),
             )),
             PipelineStage::job(CiStage::new(
                 "test",
                 "pipeline://acme/ci/run-7#test",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(3600),
             )),
         ],
@@ -128,7 +128,7 @@ fn begin_metered(
     outbox: &OutboxStore,
     signals: SignalStore,
     timers: TimerStore,
-    balance: MinorUnits,
+    balance: MicroUsd,
     now_secs: i64,
 ) -> WfCtx {
     begin(outbox, signals, timers, now_secs).with_budget(BudgetGate::new(Wallet::new(balance)))
@@ -441,13 +441,13 @@ fn an_approved_gate_proceeds_to_the_runner_stages() {
             PipelineStage::gate(CiStage::new(
                 "deploy-approval",
                 "gate://acme/ci/run-7#deploy",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(86_400),
             )),
             PipelineStage::job(CiStage::new(
                 "deploy",
                 "pipeline://acme/ci/run-7#deploy",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(3600),
             )),
         ],
@@ -495,13 +495,13 @@ fn a_denied_gate_rejects_the_deploy_and_never_dispatches_the_gated_stage() {
             PipelineStage::gate(CiStage::new(
                 "deploy-approval",
                 "gate://acme/ci/run-7#deploy",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(86_400),
             )),
             PipelineStage::job(CiStage::new(
                 "deploy",
                 "pipeline://acme/ci/run-7#deploy",
-                MinorUnits(0),
+                MicroUsd(0),
                 Some(3600),
             )),
         ],
@@ -552,14 +552,14 @@ fn no_balance_means_the_first_stage_is_never_dispatched() {
         stages: vec![PipelineStage::job(CiStage::new(
             "build",
             "pipeline://acme/ci/run-7#build",
-            MinorUnits(10),
+            MicroUsd(10),
             Some(3600),
         ))],
         contexts: vec!["build".into()],
         facts: facts(),
     };
 
-    let mut ctx = begin_metered(&outbox, signals, timers, MinorUnits(5), 1000);
+    let mut ctx = begin_metered(&outbox, signals, timers, MicroUsd(5), 1000);
     let err = run_ci_pipeline_body(&mut ctx, &run, &runner).expect_err("exhausted wallet");
     assert!(
         matches!(err, myelin_flow::WfError::CoCommit(ref m) if m.contains("never dispatched")),

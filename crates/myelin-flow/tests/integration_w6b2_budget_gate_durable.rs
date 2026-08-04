@@ -25,7 +25,7 @@
 use myelin_config::MyelinConfig;
 use myelin_flow::{BudgetGate, Wallet};
 use myelin_storage::migration::HotTables;
-use myelin_storage::reserve_settle::{MeteredUnit, MinorUnits, ReservationState, RunId as LedgerRunId};
+use myelin_storage::reserve_settle::{MeteredUnit, MicroUsd, ReservationState, RunId as LedgerRunId};
 use myelin_storage::reserve_settle_durable::reserve_settle_durable_migrations;
 use myelin_storage::SubstrateProvider;
 use myelin_tenancy::TenantId;
@@ -79,12 +79,12 @@ async fn w6b2_budget_gate_durable_reserve_settle_events_on_live_pg() {
     let run = LedgerRunId::new(format!("bg-run-{suffix}"));
 
     // ── Drive reserve → begin → settle → events THROUGH the DURABLE BudgetGate arm on live PG. ──
-    let gate = BudgetGate::with_pg(Wallet::new(MinorUnits(5_000)), app.clone());
-    gate.reserve(&tenant, &run, MinorUnits(1_000))
+    let gate = BudgetGate::with_pg(Wallet::new(MicroUsd(5_000)), app.clone());
+    gate.reserve(&tenant, &run, MicroUsd(1_000))
         .expect("a funded reserve admits through the durable gate");
     assert_eq!(
         gate.balance(),
-        MinorUnits(4_000),
+        MicroUsd(4_000),
         "the wallet is debited by the reserved amount"
     );
     gate.begin(&tenant, &run).expect("begin (durable) marks in-flight");
@@ -92,13 +92,13 @@ async fn w6b2_budget_gate_durable_reserve_settle_events_on_live_pg() {
     let units = vec![
         MeteredUnit {
             unit: "llm.tokens",
-            wholesale: MinorUnits(120),
-            markup: MinorUnits(30),
+            wholesale: MicroUsd(120),
+            markup: MicroUsd(30),
         },
         MeteredUnit {
             unit: "ci.minute",
-            wholesale: MinorUnits(200),
-            markup: MinorUnits(50),
+            wholesale: MicroUsd(200),
+            markup: MicroUsd(50),
         },
     ];
     let outcome = gate
@@ -109,14 +109,14 @@ async fn w6b2_budget_gate_durable_reserve_settle_events_on_live_pg() {
         2,
         "one cost event per metered unit on Pg"
     );
-    assert_eq!(outcome.billed_total, MinorUnits(400));
-    assert_eq!(outcome.refunded, MinorUnits(600));
+    assert_eq!(outcome.billed_total, MicroUsd(400));
+    assert_eq!(outcome.refunded, MicroUsd(600));
     // The unit label round-tripped through the DB as an owned String (no Box::leak).
     assert_eq!(outcome.cost_events[0].unit, "llm.tokens");
     // wallet: 5000 − 1000 (reserve) + 600 (refund of 1000−400) = 4600 (only the billed 400 is drawn).
     assert_eq!(
         gate.balance(),
-        MinorUnits(4_600),
+        MicroUsd(4_600),
         "settled into the same wallet — only the billed 400 is drawn"
     );
     assert_eq!(
@@ -128,7 +128,7 @@ async fn w6b2_budget_gate_durable_reserve_settle_events_on_live_pg() {
     // ── Survival across FRESH-pool reconstruction + idempotent double-settle. ──
     // A NEW gate over a FRESH provider (new connections) reads the settled state from PG; a re-settle
     // re-reads the SAME events (they survived) and returns the SAME outcome, recording NOTHING new.
-    let gate2 = BudgetGate::with_pg(Wallet::new(MinorUnits(5_000)), app_provider().await);
+    let gate2 = BudgetGate::with_pg(Wallet::new(MicroUsd(5_000)), app_provider().await);
     assert_eq!(
         gate2.state_of(&tenant, &run),
         Some(ReservationState::Settled),
@@ -142,22 +142,22 @@ async fn w6b2_budget_gate_durable_reserve_settle_events_on_live_pg() {
         2,
         "the re-settle re-reads the SAME 2 cost events from PG (they survived reconstruction)"
     );
-    assert_eq!(again.billed_total, MinorUnits(400));
+    assert_eq!(again.billed_total, MicroUsd(400));
     assert_eq!(
         again.refunded,
-        MinorUnits(600),
+        MicroUsd(600),
         "the same outcome — no double-charge on the durable re-read"
     );
     assert_eq!(
         gate2.balance(),
-        MinorUnits(5_000),
+        MicroUsd(5_000),
         "the idempotent re-settle does NOT re-credit the fresh wallet (no double-credit)"
     );
 
     // ── settle-capped-at-reserved through the durable BudgetGate arm: reserve 100, bill 1000 → 100. ──
     let run_over = LedgerRunId::new(format!("bg-over-{suffix}"));
     gate2
-        .reserve(&tenant, &run_over, MinorUnits(100))
+        .reserve(&tenant, &run_over, MicroUsd(100))
         .expect("reserve run_over");
     gate2.begin(&tenant, &run_over).expect("begin run_over");
     let over = gate2
@@ -166,15 +166,15 @@ async fn w6b2_budget_gate_durable_reserve_settle_events_on_live_pg() {
             &run_over,
             &[MeteredUnit {
                 unit: "llm.tokens",
-                wholesale: MinorUnits(700),
-                markup: MinorUnits(300),
+                wholesale: MicroUsd(700),
+                markup: MicroUsd(300),
             }],
         )
         .expect("settle run_over");
     assert_eq!(
         over.billed_total,
-        MinorUnits(100),
+        MicroUsd(100),
         "settle is capped at the reserved amount on Pg"
     );
-    assert_eq!(over.refunded, MinorUnits::ZERO);
+    assert_eq!(over.refunded, MicroUsd::ZERO);
 }

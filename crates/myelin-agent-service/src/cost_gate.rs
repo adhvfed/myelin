@@ -52,7 +52,7 @@
 
 use crate::mock::{MockAgentRuntime, MockScript};
 use crate::skeleton::{SkeletonError, SkeletonTelemetry};
-use myelin_storage::reserve_settle::MinorUnits;
+use myelin_storage::reserve_settle::MicroUsd;
 
 /// **The outcome of ONE attempted run in a runaway loop (the AG-D11 per-step verdict).** A run is
 /// either ADMITTED (the wallet afforded it → it ran behind the cost gate → it settled) or REFUSED
@@ -145,16 +145,16 @@ impl AgentFabricCostSignal {
 pub struct RunawaySelfLimiter {
     /// The wallet's TOTAL balance (integer minor-units). The remaining balance shrinks as live
     /// reservations hold funds; once `remaining < estimate` the next reserve is REFUSED.
-    wallet: MinorUnits,
+    wallet: MicroUsd,
     /// Each run's estimated upper-bound cost reserved at dispatch (integer minor-units).
-    per_run_estimate: MinorUnits,
+    per_run_estimate: MicroUsd,
 }
 
 impl RunawaySelfLimiter {
     /// Build a runaway self-limiter over a `wallet` total balance and a `per_run_estimate` (the
     /// upper-bound cost each run reserves at dispatch). The wallet affords `wallet / per_run_estimate`
     /// runs before the reserve refuses the rest.
-    pub fn new(wallet: MinorUnits, per_run_estimate: MinorUnits) -> RunawaySelfLimiter {
+    pub fn new(wallet: MicroUsd, per_run_estimate: MicroUsd) -> RunawaySelfLimiter {
         RunawaySelfLimiter {
             wallet,
             per_run_estimate,
@@ -187,8 +187,8 @@ impl RunawaySelfLimiter {
     where
         F: FnMut(
             String,
-            MinorUnits,
-            MinorUnits,
+            MicroUsd,
+            MicroUsd,
             &mut SkeletonTelemetry,
         ) -> Result<u64, SkeletonError>,
     {
@@ -196,9 +196,9 @@ impl RunawaySelfLimiter {
         let mut steps = Vec::with_capacity(attempts as usize);
         // `spent` is the funds held by live reservations; the wallet's REMAINING balance is
         // `wallet - spent`. A refused run does NOT increase `spent` (no balance → no run).
-        let mut spent = MinorUnits::ZERO;
+        let mut spent = MicroUsd::ZERO;
         for i in 0..attempts {
-            let remaining = self.wallet.checked_sub(spent).unwrap_or(MinorUnits::ZERO);
+            let remaining = self.wallet.checked_sub(spent).unwrap_or(MicroUsd::ZERO);
             let run_id = format!("runaway-{i}");
             match drive_one(run_id, remaining, self.per_run_estimate, telemetry) {
                 Ok(settled) => {
@@ -380,7 +380,7 @@ mod tests {
     /// `tests/drills_ag_d11_runaway_self_limiter.rs`.
     #[test]
     fn runaway_loop_admits_funded_prefix_and_sheds_the_tail() {
-        let limiter = RunawaySelfLimiter::new(MinorUnits(50), MinorUnits(10));
+        let limiter = RunawaySelfLimiter::new(MicroUsd(50), MicroUsd(10));
         let brain = runaway_brain();
         let mut tele = SkeletonTelemetry::new();
 
@@ -416,7 +416,7 @@ mod tests {
     /// completed — but it PROVES the limiter never admits an unfunded run.)
     #[test]
     fn an_empty_wallet_refuses_every_run() {
-        let limiter = RunawaySelfLimiter::new(MinorUnits(0), MinorUnits(10));
+        let limiter = RunawaySelfLimiter::new(MicroUsd(0), MicroUsd(10));
         let brain = runaway_brain();
         let mut tele = SkeletonTelemetry::new();
         let steps = limiter.run_loop(&brain, 4, &mut tele, |_r, available, estimate, _t| {

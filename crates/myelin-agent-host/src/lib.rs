@@ -35,7 +35,7 @@ use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
 };
 use myelin_storage::agent_wallet::AgentWallet;
-use myelin_storage::reserve_settle::{CostLedger, MinorUnits};
+use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::{
     DurableCellRootBacking, DurableRevocationBacking, SealKey, SubstrateProvider, TenantScope,
 };
@@ -66,10 +66,10 @@ pub struct LlmRunTask {
     pub token_ttl_secs: u64,
     /// Nominal reserve estimate for the reserve/settle gate — distinct from the real micro-dollar
     /// wallet debit.
-    pub estimate: MinorUnits,
+    pub estimate: MicroUsd,
     pub now_secs: i64,
     /// Nominal available balance the reserve gate reads.
-    pub available: MinorUnits,
+    pub available: MicroUsd,
     pub max_output_tokens: Option<u32>,
 }
 
@@ -90,8 +90,8 @@ impl LlmRunTask {
             system: system.into(),
             prompt: prompt.into(),
             token_ttl_secs: 300,
-            estimate: MinorUnits(10),
-            available: MinorUnits(100),
+            estimate: MicroUsd(10),
+            available: MicroUsd(100),
             now_secs: 0,
             max_output_tokens: None,
         }

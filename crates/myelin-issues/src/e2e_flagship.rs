@@ -67,7 +67,7 @@
 //!   HITL-gated close + the exactly-once-across-a-kill approval + the balanced wallet) is the
 //!   deliverable here; the cross-subsystem orchestration is the whole-system M5 wedge.
 
-use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MinorUnits, RunId};
+use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MicroUsd, RunId};
 use myelin_tenancy::TenantId;
 
 use crate::agent_spend::{spend_bearing_run, BalancedRunSignal, IssueRunKind, IssueSpendGate};
@@ -132,13 +132,13 @@ fn triage_metered_units() -> Vec<MeteredUnit> {
     vec![
         MeteredUnit {
             unit: IssueRunKind::Triage.metered_unit(),
-            wholesale: MinorUnits(8),
-            markup: MinorUnits(2),
+            wholesale: MicroUsd(8),
+            markup: MicroUsd(2),
         },
         MeteredUnit {
             unit: IssueRunKind::Triage.metered_unit(),
-            wholesale: MinorUnits(3),
-            markup: MinorUnits(1),
+            wholesale: MicroUsd(3),
+            markup: MicroUsd(1),
         },
     ]
 }
@@ -311,8 +311,8 @@ pub fn run_e2e_2_issues_flagship() -> IssuesE2eArtifact {
         tenant.clone(),
         RunId::new("run:triage:eng-1421"),
         IssueRunKind::Triage,
-        MinorUnits(ESTIMATE),
-        MinorUnits(WALLET),
+        MicroUsd(ESTIMATE),
+        MicroUsd(WALLET),
         triage_metered_units,
     )
     .expect("a funded wallet reserves + settles the triage run (no balance → no start)");
@@ -330,8 +330,8 @@ pub fn run_e2e_2_issues_flagship() -> IssuesE2eArtifact {
         tenant.clone(),
         RunId::new("run:triage:starved"),
         IssueRunKind::Triage,
-        MinorUnits(ESTIMATE),
-        MinorUnits(0), // an exhausted wallet → no balance → no start.
+        MicroUsd(ESTIMATE),
+        MicroUsd(0), // an exhausted wallet → no balance → no start.
         || panic!("the work must NEVER run on an exhausted wallet (no balance → no start)"),
     )
     .is_err();

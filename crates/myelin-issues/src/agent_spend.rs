@@ -93,7 +93,7 @@
 
 use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError, InFlightRun, RunKind};
 use myelin_storage::reserve_settle::{
-    CostLedger, MeteredUnit, MinorUnits, RunId, SettleError, SettleOutcome,
+    CostLedger, MeteredUnit, MicroUsd, RunId, SettleError, SettleOutcome,
 };
 use myelin_tenancy::TenantId;
 
@@ -155,9 +155,9 @@ pub enum SpendError {
     /// The runaway self-limiter (AG-D11): a loop against an exhausted wallet stops at the wallet.
     NoBalance {
         /// The amount the dispatch asked to reserve (the run's estimated upper bound, minor-units).
-        requested: MinorUnits,
+        requested: MicroUsd,
         /// The wallet balance available (from the Commercial control-plane wallet).
-        available: MinorUnits,
+        available: MicroUsd,
     },
     /// This run is already dispatched — a spend-bearing run is fronted exactly once (the idempotency
     /// guard; a re-dispatch of a live run is rejected loudly, never double-reserved).
@@ -249,7 +249,7 @@ impl DispatchedRun {
         self.handle.run()
     }
     /// The amount reserved at dispatch (the billing cap — a settle never bills more than this).
-    pub fn reserved(&self) -> MinorUnits {
+    pub fn reserved(&self) -> MicroUsd {
         self.handle.reserved()
     }
 
@@ -300,8 +300,8 @@ impl IssueSpendGate {
         tenant: TenantId,
         run: RunId,
         kind: IssueRunKind,
-        estimate: MinorUnits,
-        available: MinorUnits,
+        estimate: MicroUsd,
+        available: MicroUsd,
     ) -> Result<DispatchedRun, SpendError> {
         // An Issues agent run is an `AgentRun` to the Storage gate (the brain loop — mock now,
         // LLM post-M5); the RunKind label is the gate's observability, the IssueRunKind is ours.
@@ -347,8 +347,8 @@ pub fn spend_bearing_run<F>(
     tenant: TenantId,
     run: RunId,
     kind: IssueRunKind,
-    estimate: MinorUnits,
-    available: MinorUnits,
+    estimate: MicroUsd,
+    available: MicroUsd,
     work: F,
 ) -> Result<BalancedRunSignal, SpendError>
 where
@@ -402,11 +402,11 @@ pub struct BalancedRunSignal {
     /// The kind of spend-bearing Issues run.
     pub kind: IssueRunKind,
     /// The amount reserved at dispatch (the billing cap).
-    pub reserved: MinorUnits,
+    pub reserved: MicroUsd,
     /// The amount actually billed on settle (`Σ wholesale + markup`, capped at `reserved`).
-    pub billed: MinorUnits,
+    pub billed: MicroUsd,
     /// The amount refunded to the wallet (`reserved − billed`, the released over-reservation).
-    pub refunded: MinorUnits,
+    pub refunded: MicroUsd,
     /// The cost events recorded — the green artifact has `cost_events == metered_units`.
     pub cost_events: u64,
     /// The metered units the run reported.
@@ -483,8 +483,8 @@ mod tests {
     fn units(wholesale: u64, markup: u64) -> Vec<MeteredUnit> {
         vec![MeteredUnit {
             unit: "agent.effect",
-            wholesale: MinorUnits(wholesale),
-            markup: MinorUnits(markup),
+            wholesale: MicroUsd(wholesale),
+            markup: MicroUsd(markup),
         }]
     }
 
@@ -503,22 +503,22 @@ mod tests {
             tenant(),
             run(1),
             IssueRunKind::Triage,
-            MinorUnits(1_000),  // reserve an upper bound of 1000
-            MinorUnits(5_000),  // the wallet (shared with CI) affords it
+            MicroUsd(1_000),  // reserve an upper bound of 1000
+            MicroUsd(5_000),  // the wallet (shared with CI) affords it
             || units(300, 100), // the run actually costs 400 (wholesale 300 + markup 100)
         )
         .expect("a funded run completes");
 
         // reserve == settle: 1000 reserved = 400 billed + 600 refunded (the reserve is fully accounted).
-        assert_eq!(signal.reserved, MinorUnits(1_000));
+        assert_eq!(signal.reserved, MicroUsd(1_000));
         assert_eq!(
             signal.billed,
-            MinorUnits(400),
+            MicroUsd(400),
             "billed wholesale 300 + markup 100"
         );
         assert_eq!(
             signal.refunded,
-            MinorUnits(600),
+            MicroUsd(600),
             "the over-reservation refunds"
         );
         assert_eq!(signal.cost_events, 1, "one cost event per metered unit");
@@ -550,8 +550,8 @@ mod tests {
             tenant(),
             run(1),
             IssueRunKind::Forecast,
-            MinorUnits(9_000),
-            MinorUnits(100), // the wallet cannot afford the run
+            MicroUsd(9_000),
+            MicroUsd(100), // the wallet cannot afford the run
             || {
                 work_ran = true; // this MUST NOT execute (no balance → no start)
                 units(10, 0)
@@ -562,8 +562,8 @@ mod tests {
         assert_eq!(
             err,
             SpendError::NoBalance {
-                requested: MinorUnits(9_000),
-                available: MinorUnits(100),
+                requested: MicroUsd(9_000),
+                available: MicroUsd(100),
             }
         );
         assert!(
@@ -592,8 +592,8 @@ mod tests {
                 tenant(),
                 run(1),
                 IssueRunKind::SlaDraft,
-                MinorUnits(500),
-                MinorUnits(1_000),
+                MicroUsd(500),
+                MicroUsd(1_000),
             )
             .expect("a funded run is dispatched");
         assert_eq!(
@@ -609,7 +609,7 @@ mod tests {
         assert_eq!(ledger.inflight_interrupt_count(), 0, "0 interrupts");
         // the run STILL settles normally — it kept running.
         let outcome = dispatched.settle(&mut ledger, &units(200, 50)).unwrap();
-        assert_eq!(outcome.billed_total, MinorUnits(250));
+        assert_eq!(outcome.billed_total, MicroUsd(250));
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
             Some(ReservationState::Settled)
@@ -628,13 +628,13 @@ mod tests {
             tenant(),
             run(1),
             IssueRunKind::Automation,
-            MinorUnits(400),
-            MinorUnits(400), // available == estimate (affordable; the floor is `available < amount`)
+            MicroUsd(400),
+            MicroUsd(400), // available == estimate (affordable; the floor is `available < amount`)
             || units(300, 100), // bills exactly 400 = the reserve
         )
         .expect("a run billed at its full reserve");
-        assert_eq!(signal.billed, MinorUnits(400));
-        assert_eq!(signal.refunded, MinorUnits(0), "nothing to refund");
+        assert_eq!(signal.billed, MicroUsd(400));
+        assert_eq!(signal.refunded, MicroUsd(0), "nothing to refund");
         assert!(
             signal.is_green(),
             "reserve == billed (refund 0) is balanced"
@@ -652,8 +652,8 @@ mod tests {
             tenant(),
             run(1),
             IssueRunKind::Triage,
-            MinorUnits(100),
-            MinorUnits(1_000),
+            MicroUsd(100),
+            MicroUsd(1_000),
         )
         .unwrap();
         let err = gate
@@ -662,8 +662,8 @@ mod tests {
                 tenant(),
                 run(1),
                 IssueRunKind::Triage,
-                MinorUnits(100),
-                MinorUnits(1_000),
+                MicroUsd(100),
+                MicroUsd(1_000),
             )
             .expect_err("a second dispatch of a live run is rejected");
         assert_eq!(err, SpendError::AlreadyDispatched);
@@ -682,8 +682,8 @@ mod tests {
                 tenant(),
                 run(1),
                 IssueRunKind::Triage,
-                MinorUnits(1_000),
-                MinorUnits(1_000),
+                MicroUsd(1_000),
+                MicroUsd(1_000),
             )
             .unwrap();
         let first = dispatched.settle(&mut ledger, &units(300, 100)).unwrap();
@@ -726,9 +726,9 @@ mod tests {
             tenant: tenant(),
             run: run(1),
             kind: IssueRunKind::Triage,
-            reserved: MinorUnits(1_000),
-            billed: MinorUnits(400),
-            refunded: MinorUnits(100),
+            reserved: MicroUsd(1_000),
+            billed: MicroUsd(400),
+            refunded: MicroUsd(100),
             cost_events: 1,
             metered_units: 1,
             inflight_interrupt_count: 0,
@@ -740,9 +740,9 @@ mod tests {
             tenant: tenant(),
             run: run(1),
             kind: IssueRunKind::Triage,
-            reserved: MinorUnits(1_000),
-            billed: MinorUnits(400),
-            refunded: MinorUnits(600),
+            reserved: MicroUsd(1_000),
+            billed: MicroUsd(400),
+            refunded: MicroUsd(600),
             cost_events: 1,
             metered_units: 2,
             inflight_interrupt_count: 0,
@@ -754,9 +754,9 @@ mod tests {
             tenant: tenant(),
             run: run(1),
             kind: IssueRunKind::Triage,
-            reserved: MinorUnits(1_000),
-            billed: MinorUnits(400),
-            refunded: MinorUnits(600),
+            reserved: MicroUsd(1_000),
+            billed: MicroUsd(400),
+            refunded: MicroUsd(600),
             cost_events: 1,
             metered_units: 1,
             inflight_interrupt_count: 1,
@@ -809,8 +809,8 @@ mod tests {
     #[test]
     fn spend_error_displays_are_loud() {
         let e = SpendError::NoBalance {
-            requested: MinorUnits(9_000),
-            available: MinorUnits(100),
+            requested: MicroUsd(9_000),
+            available: MicroUsd(100),
         }
         .to_string();
         assert!(
@@ -842,12 +842,12 @@ mod tests {
         );
         assert_eq!(
             SpendError::from(DispatchError::NoBalance {
-                requested: MinorUnits(5),
-                available: MinorUnits(1),
+                requested: MicroUsd(5),
+                available: MicroUsd(1),
             }),
             SpendError::NoBalance {
-                requested: MinorUnits(5),
-                available: MinorUnits(1),
+                requested: MicroUsd(5),
+                available: MicroUsd(1),
             }
         );
     }

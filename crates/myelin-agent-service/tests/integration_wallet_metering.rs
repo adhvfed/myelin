@@ -32,7 +32,7 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_storage::agent_run_gate::AgentRunGate;
 use myelin_storage::agent_wallet::{agent_wallet_migrations, AgentWallet, CreditKind, MicroUsd};
 use myelin_storage::migration::HotTables;
-use myelin_storage::reserve_settle::{CostLedger, MinorUnits};
+use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::SubstrateProvider;
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -257,8 +257,8 @@ async fn metered_run_debits_the_durable_wallet_per_turn() {
         wallet: Some(&wallet),
         gate: &mut gate,
         ledger: &mut ledger,
-        available: MinorUnits(100),
-        estimate: MinorUnits(10),
+        available: MicroUsd(100),
+        estimate: MicroUsd(10),
         outbox: &outbox,
         minter: Arc::new(myelin_events::MonotonicMinter::new()),
         journal: WfJournal::new(),
@@ -342,8 +342,8 @@ async fn metered_run_dry_durable_wallet_halts_gracefully() {
         wallet: Some(&wallet),
         gate: &mut gate,
         ledger: &mut ledger,
-        available: MinorUnits(100),
-        estimate: MinorUnits(10),
+        available: MicroUsd(100),
+        estimate: MicroUsd(10),
         outbox: &outbox,
         minter: Arc::new(myelin_events::MonotonicMinter::new()),
         journal: WfJournal::new(),

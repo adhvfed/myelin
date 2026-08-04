@@ -44,7 +44,7 @@ use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_durable_migrations, CiCostEventStore, CiCostStoreError, CostEventRow, CostKind, Meter,
 };
-use myelin_flow::MinorUnits;
+use myelin_flow::MicroUsd;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -130,8 +130,8 @@ fn settle_rows(tenant: &TenantId, run: Uuid, job: Uuid) -> Vec<CostEventRow> {
             job_id: job.to_string(),
             meter: Meter::CpuSeconds,
             amount: 120,
-            wholesale: MinorUnits(100),
-            markup: MinorUnits(20),
+            wholesale: MicroUsd(100),
+            markup: MicroUsd(20),
             kind: CostKind::Ci,
         },
         CostEventRow {
@@ -140,8 +140,8 @@ fn settle_rows(tenant: &TenantId, run: Uuid, job: Uuid) -> Vec<CostEventRow> {
             job_id: job.to_string(),
             meter: Meter::MemGbSeconds,
             amount: 4096,
-            wholesale: MinorUnits(50),
-            markup: MinorUnits(10),
+            wholesale: MicroUsd(50),
+            markup: MicroUsd(10),
             kind: CostKind::Ci,
         },
     ]
@@ -292,8 +292,8 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
         job.to_string(),
         "attributed to its (run, job)"
     );
-    assert_eq!(read[0].wholesale, MinorUnits(100));
-    assert_eq!(read[0].markup, MinorUnits(20));
+    assert_eq!(read[0].wholesale, MicroUsd(100));
+    assert_eq!(read[0].markup, MicroUsd(20));
     assert_ne!(
         read[0].wholesale, read[0].markup,
         "wholesale ≠ markup (the two cost columns are distinct, arch 02 §8)"
@@ -304,8 +304,8 @@ async fn cost_store_settle_survives_kill9_no_ghost_no_double_bill() {
         "settled kind stays ci after reopen"
     );
     assert_eq!(read[1].meter, Meter::MemGbSeconds);
-    assert_eq!(read[1].wholesale, MinorUnits(50));
-    assert_eq!(read[1].markup, MinorUnits(10));
+    assert_eq!(read[1].wholesale, MicroUsd(50));
+    assert_eq!(read[1].markup, MicroUsd(10));
 
     // Re-delivery did NOT duplicate across the crash: still exactly two rows for the run.
     // (settle idempotency proven above; the read-back count confirms no double-billing persisted.)

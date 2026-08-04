@@ -64,7 +64,7 @@ use myelin_agent_service::{
 use myelin_harness::load_generator::{
     LoadGenerator, LoadPrincipalKind, Multiplier, PrincipalMix, RecordingSink, StormProfile,
 };
-use myelin_storage::{AgentRunGate, CostLedger, MinorUnits};
+use myelin_storage::{AgentRunGate, CostLedger, MicroUsd};
 use myelin_substrate::shed::{RunClass, Surface, SurfaceBudget};
 use myelin_substrate::thresholds::Thresholds;
 use myelin_tenancy::TenantId;
@@ -145,8 +145,8 @@ fn ag_d6_agent_dispatch_surge_human_holds_agent_sheds_reserve_refuses_cross_tena
         &surging,
         &quiet,
         storm_ops,
-        MinorUnits(100),
-        MinorUnits(800), // affords 8 funded runs; the rest are refused at reserve
+        MicroUsd(100),
+        MicroUsd(800), // affords 8 funded runs; the rest are refused at reserve
         multiplier,
     );
 
@@ -261,8 +261,8 @@ fn ag_d6_an_unbounded_lane_and_unlimited_wallet_reads_red() {
         &TenantId("noisy".into()),
         &TenantId("quiet".into()),
         100,
-        MinorUnits(100),
-        MinorUnits(1_000_000), // a huge wallet too — neither front sheds
+        MicroUsd(100),
+        MicroUsd(1_000_000), // a huge wallet too — neither front sheds
         AGENT_DISPATCH_SURGE_MULTIPLIER,
     );
     assert_eq!(

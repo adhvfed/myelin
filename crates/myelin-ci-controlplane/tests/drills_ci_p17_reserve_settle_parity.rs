@@ -44,7 +44,7 @@ use myelin_ci_controlplane::{
 };
 use myelin_events::{Actor, EmitContextBase, IdMinter, MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::{
-    BudgetGate, CiStage, JobKind, JobRunner, JobSpec, MinorUnits, TimerStore, Wallet, WfCtx,
+    BudgetGate, CiStage, JobKind, JobRunner, JobSpec, MicroUsd, TimerStore, Wallet, WfCtx,
     WfJournal,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
@@ -99,15 +99,15 @@ impl JobRunner for RecordingRunner {
 #[test]
 fn ci_d5_reserve_settle_parity_aggregate_is_green() {
     let samples = [
-        (Meter::CpuSeconds, 120u64, MinorUnits(200)),
-        (Meter::MemGbSeconds, 64, MinorUnits(40)),
-        (Meter::EgressGb, 3, MinorUnits(30)),
+        (Meter::CpuSeconds, 120u64, MicroUsd(200)),
+        (Meter::MemGbSeconds, 64, MicroUsd(40)),
+        (Meter::EgressGb, 3, MicroUsd(30)),
     ];
     let before = FlatBpsMarkup::new(2_000); // 20%
     let after = FlatBpsMarkup::new(4_000); // a PRICING CHANGE — 40%
 
     let signal =
-        reserve_settle_parity_drill(&tenant(), MinorUnits(300), 6, &samples, &before, &after);
+        reserve_settle_parity_drill(&tenant(), MicroUsd(300), 6, &samples, &before, &after);
 
     assert!(
         signal.is_green(),
@@ -158,12 +158,12 @@ fn ci_d5_ci_pipeline_body_refuses_when_shared_wallet_exhausted_by_agent() {
     let runner = RecordingRunner::default();
 
     // ONE shared wallet with exactly enough for ONE 200-unit reserve (the agent run will take it).
-    let gate = BudgetGate::new(Wallet::new(MinorUnits(200)));
+    let gate = BudgetGate::new(Wallet::new(MicroUsd(200)));
 
     // An AGENT run exhausts the shared wallet first (the same gate both kinds use). This is the
     // unified-meter property: a prior agent reserve depletes the wallet the CI body will draw.
     let agent_run = LedgerRunId::new("agent/run/storm");
-    gate.reserve(&tenant(), &agent_run, MinorUnits(200))
+    gate.reserve(&tenant(), &agent_run, MicroUsd(200))
         .expect("the agent run reserves the whole wallet");
     gate.begin(&tenant(), &agent_run)
         .expect("the agent run is in-flight (never interrupted)");
@@ -174,7 +174,7 @@ fn ci_d5_ci_pipeline_body_refuses_when_shared_wallet_exhausted_by_agent() {
         stages: vec![PipelineStage::job(CiStage::new(
             "build",
             "pipeline://acme/ci/pr-7#build",
-            MinorUnits(100), // the CI stage's reserve — refused, the wallet is empty.
+            MicroUsd(100), // the CI stage's reserve — refused, the wallet is empty.
             Some(600),
         ))],
         contexts: vec!["build".to_string()],
@@ -235,7 +235,7 @@ fn ci_d5_funded_ci_stage_starts_and_settles_into_the_shared_wallet() {
     let runner = RecordingRunner::default();
 
     // A funded shared wallet.
-    let gate = BudgetGate::new(Wallet::new(MinorUnits(1_000)));
+    let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000)));
 
     // Pre-deliver the stage's job.done (a fast job) under the deterministic dispatch token so the
     // long-park completes in one drive.
@@ -275,17 +275,17 @@ fn ci_d5_funded_ci_stage_starts_and_settles_into_the_shared_wallet() {
             JobSpec::new(JobKind::Ci, "pipeline://acme/ci/pr-10#build"),
             &runner,
             Some(600),
-            MinorUnits(300),
+            MicroUsd(300),
             vec![
                 myelin_storage::reserve_settle::MeteredUnit {
                     unit: Meter::CpuSeconds.token(),
-                    wholesale: MinorUnits(120),
-                    markup: MinorUnits(24),
+                    wholesale: MicroUsd(120),
+                    markup: MicroUsd(24),
                 },
                 myelin_storage::reserve_settle::MeteredUnit {
                     unit: Meter::MemGbSeconds.token(),
-                    wholesale: MinorUnits(40),
-                    markup: MinorUnits(8),
+                    wholesale: MicroUsd(40),
+                    markup: MicroUsd(8),
                 },
             ],
         )
@@ -308,7 +308,7 @@ fn ci_d5_funded_ci_stage_starts_and_settles_into_the_shared_wallet() {
     // wallet: 1000 − 300 (reserve) + refund(300 − billed(120+24+40+8 = 192) = 108) = 808.
     assert_eq!(
         gate.balance(),
-        MinorUnits(808),
+        MicroUsd(808),
         "settled the CI stage's resource-seconds into the SAME wallet (only the billed 192 drawn)"
     );
     assert_eq!(gate.inflight_interrupt_count(), 0, "0 in-flight interrupts");

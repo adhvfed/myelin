@@ -65,7 +65,7 @@
 //! crates/myelin-storage/src/agent_run_gate.rs`).
 
 use crate::reserve_settle::{
-    CostLedger, MeteredUnit, MinorUnits, ReserveError, RunId, SettleError, SettleOutcome,
+    CostLedger, MeteredUnit, MicroUsd, ReserveError, RunId, SettleError, SettleOutcome,
 };
 use myelin_tenancy::TenantId;
 
@@ -91,9 +91,9 @@ pub enum DispatchError {
     /// dispatched** (no in-flight handle is minted). The runaway self-limiter (AG-D11).
     NoBalance {
         /// The amount the dispatch asked to reserve (the run's estimated upper bound).
-        requested: MinorUnits,
+        requested: MicroUsd,
         /// The wallet balance available (from Commercial).
-        available: MinorUnits,
+        available: MicroUsd,
     },
     /// A run with this `(tenant, run)` is already dispatched — a dispatch is fronted once (the
     /// idempotency guard; a re-dispatch of a live run is rejected loudly, never double-reserved).
@@ -157,7 +157,7 @@ pub struct InFlightRun {
     tenant: TenantId,
     run: RunId,
     kind: RunKind,
-    reserved: MinorUnits,
+    reserved: MicroUsd,
 }
 
 impl InFlightRun {
@@ -174,7 +174,7 @@ impl InFlightRun {
         self.kind
     }
     /// The amount reserved at dispatch (the billing cap — a settle never bills more).
-    pub fn reserved(&self) -> MinorUnits {
+    pub fn reserved(&self) -> MicroUsd {
         self.reserved
     }
 
@@ -228,8 +228,8 @@ impl AgentRunGate {
         ledger: &mut CostLedger,
         tenant: TenantId,
         run: RunId,
-        estimate: MinorUnits,
-        available: MinorUnits,
+        estimate: MicroUsd,
+        available: MicroUsd,
     ) -> Result<InFlightRun, DispatchError> {
         self.dispatch_kind(ledger, tenant, run, estimate, available, RunKind::AgentRun)
     }
@@ -243,8 +243,8 @@ impl AgentRunGate {
         ledger: &mut CostLedger,
         tenant: TenantId,
         run: RunId,
-        estimate: MinorUnits,
-        available: MinorUnits,
+        estimate: MicroUsd,
+        available: MicroUsd,
     ) -> Result<InFlightRun, DispatchError> {
         self.dispatch_kind(
             ledger,
@@ -265,8 +265,8 @@ impl AgentRunGate {
         ledger: &mut CostLedger,
         tenant: TenantId,
         run: RunId,
-        estimate: MinorUnits,
-        available: MinorUnits,
+        estimate: MicroUsd,
+        available: MicroUsd,
         kind: RunKind,
     ) -> Result<InFlightRun, DispatchError> {
         // 1. Reserve-at-dispatch. No balance → no run (the run is not dispatched).
@@ -370,12 +370,12 @@ mod tests {
                 &mut ledger,
                 tenant(),
                 run(1),
-                MinorUnits(1_000),
-                MinorUnits(5_000),
+                MicroUsd(1_000),
+                MicroUsd(5_000),
             )
             .expect("a funded dispatch fronts the run");
         assert_eq!(handle.kind(), RunKind::AgentRun);
-        assert_eq!(handle.reserved(), MinorUnits(1_000));
+        assert_eq!(handle.reserved(), MicroUsd(1_000));
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
             Some(ReservationState::InFlight),
@@ -397,15 +397,15 @@ mod tests {
                 &mut ledger,
                 tenant(),
                 run(1),
-                MinorUnits(9_000),
-                MinorUnits(100),
+                MicroUsd(9_000),
+                MicroUsd(100),
             )
             .expect_err("an over-budget dispatch is refused");
         assert_eq!(
             err,
             DispatchError::NoBalance {
-                requested: MinorUnits(9_000),
-                available: MinorUnits(100),
+                requested: MicroUsd(9_000),
+                available: MicroUsd(100),
             }
         );
         assert!(
@@ -427,20 +427,20 @@ mod tests {
                 &mut ledger,
                 tenant(),
                 run(1),
-                MinorUnits(1_000),
-                MinorUnits(5_000),
+                MicroUsd(1_000),
+                MicroUsd(5_000),
             )
             .unwrap();
         let units = vec![
             MeteredUnit {
                 unit: "llm.tokens",
-                wholesale: MinorUnits(120),
-                markup: MinorUnits(30),
+                wholesale: MicroUsd(120),
+                markup: MicroUsd(30),
             },
             MeteredUnit {
                 unit: "ci.minute",
-                wholesale: MinorUnits(200),
-                markup: MinorUnits(50),
+                wholesale: MicroUsd(200),
+                markup: MicroUsd(50),
             },
         ];
         let outcome = handle.settle(&mut ledger, &units).expect("the run settles");
@@ -453,8 +453,8 @@ mod tests {
             outcome.cost_events[0].wholesale, outcome.cost_events[0].markup,
             "wholesale ≠ markup recorded distinctly"
         );
-        assert_eq!(outcome.billed_total, MinorUnits(400));
-        assert_eq!(outcome.refunded, MinorUnits(600));
+        assert_eq!(outcome.billed_total, MicroUsd(400));
+        assert_eq!(outcome.refunded, MicroUsd(600));
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
             Some(ReservationState::Settled)
@@ -475,8 +475,8 @@ mod tests {
                 &mut ledger,
                 tenant(),
                 run(1),
-                MinorUnits(500),
-                MinorUnits(1_000),
+                MicroUsd(500),
+                MicroUsd(1_000),
             )
             .unwrap();
         // The only teardown the ledger has refuses an in-flight row.
@@ -514,8 +514,8 @@ mod tests {
                 &mut ledger,
                 tenant(),
                 run(1),
-                MinorUnits(300),
-                MinorUnits(1_000),
+                MicroUsd(300),
+                MicroUsd(1_000),
             )
             .expect("a funded scheduled job is fronted");
         assert_eq!(handle.kind(), RunKind::ScheduleAndRunJob);
@@ -525,8 +525,8 @@ mod tests {
                 &mut ledger,
                 tenant(),
                 run(2),
-                MinorUnits(9_000),
-                MinorUnits(10),
+                MicroUsd(9_000),
+                MicroUsd(10),
             )
             .expect_err("an over-budget scheduled job is refused");
         assert!(matches!(err, DispatchError::NoBalance { .. }));
@@ -544,8 +544,8 @@ mod tests {
             &mut ledger,
             tenant(),
             run(1),
-            MinorUnits(100),
-            MinorUnits(1_000),
+            MicroUsd(100),
+            MicroUsd(1_000),
         )
         .unwrap();
         let err = gate
@@ -553,8 +553,8 @@ mod tests {
                 &mut ledger,
                 tenant(),
                 run(1),
-                MinorUnits(100),
-                MinorUnits(1_000),
+                MicroUsd(100),
+                MicroUsd(1_000),
             )
             .expect_err("a second dispatch of a live run is rejected");
         assert_eq!(err, DispatchError::AlreadyDispatched);
@@ -564,8 +564,8 @@ mod tests {
     #[test]
     fn dispatch_error_displays_are_loud() {
         let e = DispatchError::NoBalance {
-            requested: MinorUnits(9_000),
-            available: MinorUnits(100),
+            requested: MicroUsd(9_000),
+            available: MicroUsd(100),
         }
         .to_string();
         assert!(e.contains("no balance, no run"), "must cite the floor: {e}");
@@ -597,16 +597,16 @@ mod tests {
             &mut ledger,
             tenant(),
             run(1),
-            MinorUnits(100),
-            MinorUnits(1_000),
+            MicroUsd(100),
+            MicroUsd(1_000),
         )
         .unwrap();
         let _ = gate.dispatch(
             &mut ledger,
             tenant(),
             run(1),
-            MinorUnits(100),
-            MinorUnits(1_000),
+            MicroUsd(100),
+            MicroUsd(1_000),
         );
         assert_eq!(
             gate.reserve_refusals(),
@@ -624,9 +624,9 @@ mod tests {
         let mut gate = AgentRunGate::new();
         let mut ledger = CostLedger::new();
         // The wallet affords exactly 3 runs of 100 each (balance 300); the loop tries 6.
-        let wallet = MinorUnits(300);
-        let per_run = MinorUnits(100);
-        let mut spent = MinorUnits::ZERO;
+        let wallet = MicroUsd(300);
+        let per_run = MicroUsd(100);
+        let mut spent = MicroUsd::ZERO;
         let mut live_handles = Vec::new();
         let attempts = 6u64;
         for i in 0..attempts {
@@ -683,11 +683,11 @@ mod tests {
         let mut ledger = CostLedger::new();
         // 30 dispatches; the wallet affords 10 of them (balance 1000, 100 each).
         let attempts = 30u64;
-        let per_run = MinorUnits(100);
-        let wallet = MinorUnits(1_000);
-        let mut spent = MinorUnits::ZERO;
+        let per_run = MicroUsd(100);
+        let wallet = MicroUsd(1_000);
+        let mut spent = MicroUsd::ZERO;
         for i in 0..attempts {
-            let remaining = wallet.checked_sub(spent).unwrap_or(MinorUnits::ZERO);
+            let remaining = wallet.checked_sub(spent).unwrap_or(MicroUsd::ZERO);
             if gate
                 .dispatch(&mut ledger, tenant(), run(i as u32), per_run, remaining)
                 .is_ok()
