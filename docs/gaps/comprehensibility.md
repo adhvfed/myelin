@@ -30,6 +30,17 @@ debt). One piece at a time. Nothing is released — simplify boldly.
   `tenant-predicate` to recognize the `with_tenant_tx` RLS convention (11 secret-store
   false positives, verified safe) instead of blanket-excluding the file.
 
+## Abstraction pass — myelin-agent-service (2026-08-04, founder: "make the abstractions shine; over and under are equally bad")
+An abstraction audit → taste → verified-refactor pass on the hosted-agent crate. The audit's verdict: the CORE safety abstractions are already excellent (type-encoded routing split, type-state `AgentExecGate`, `PlanVerdict`, the dependency-breaking single-impl seams — do NOT collapse these); the real problems were all UNDER-abstraction (the same shape retyped instead of named once). Landed + pushed:
+- **`RenderCtx`** (`17957a2a`) — the per-viewer render context was 8 positional args threaded through 4 functions behind `#[allow(too_many_arguments)]`; reified to a type. API reads `(ctx, what)`.
+- **tool-def data tables** (`89c13b10`) — 6 byte-identical `register_*` fns + 17 near-identical `ToolDef` literals + a dead `requires_approval` write in each → one `mutate_tool_def`/`register_tool_defs`/`cap` in `defaults.rs`; each subsystem file is now a data table. Registered defs byte-identical (CDC-proven).
+- **`handle_run` untangled** (`91ee756e`) — the 13-site token-teardown revoke dance → ONE RAII `RunTeardown` guard (revoke-on-drop, exactly-once-on-every-path, now with a regression test the copy-paste never had); the 95-line inline metering machine → `meter_turn`. Independently adversarially reviewed (6 hazard fronts, incl. panic-unwind = strictly safer).
+- **`resolve_decision`** (`f59c8274`) — the HITL approve→admit order (the mutation-authorization decision) was duplicated verbatim across both loop drivers; extracted to one fn. Batch-specific `ledger.record` kept in the caller. HITL security tests unchanged.
+
+**Taste decisions (declined / deferred):** SKIPPED folding `ApplyLedger`+`IdempotentToolLedger` into a generic `ExactlyOnceLedger<K>` — trivial ~15-line BTreeSet wrappers with clear domain APIs; a generic + 2 delegating wrappers would be mild OVER-abstraction. Optional follow-ups (medium payoff, more risk): `ComputeHardeningProfile` (exec.rs 11-arg `for_compute`, behavioral) and `GateOpenRequest` (hitl.rs 6-arg gate-open, security) — same "reify the many-arg concept" as RenderCtx if pursued. Plus a LOW: extend the teardown-guard test to the `MaxTurnsExhausted` + validation/exec-abort exits.
+
+**Next abstraction targets** (codebase-wide directive): audit another crate the same way, and the big one — `gvisor.rs`'s remaining decomposition is an under-abstraction problem (GvisorBackend god-object) needing REAL decoupling, not pure moves.
+
 ## Known offenders
 - **`gvisor.rs` (~23k lines)** — still the biggest module. The remaining clusters
   (finalize/quiesce, workspace/mount, runsc-launch, checkout-transport) are more
