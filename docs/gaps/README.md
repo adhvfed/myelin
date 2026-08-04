@@ -7,6 +7,7 @@ Pre-release — nothing here is a production incident; it's the honest map of th
 distance between "works in a drill" and "a stranger can rely on it."
 
 - [hosted-agent.md](hosted-agent.md) — the metered tool-executing agent: what's real vs. stubbed.
+- [agent-fabric-floors.md](agent-fabric-floors.md) — designed-not-built agent floors + the open policy questions.
 - [launch-surface.md](launch-surface.md) — signup, billing top-ups, UI, deploy, pentest.
 - [ci.md](ci.md) — self-hosted CI follow-ons.
 - [comprehensibility.md](comprehensibility.md) — the zen backlog: decomposition + comment-pruning targets.
