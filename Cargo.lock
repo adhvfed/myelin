@@ -2293,9 +2293,11 @@ dependencies = [
  "myelin-config",
  "myelin-events",
  "myelin-flow",
+ "myelin-git",
  "myelin-identity",
  "myelin-storage",
  "myelin-tenancy",
+ "serde_json",
  "sqlx",
  "tokio",
 ]

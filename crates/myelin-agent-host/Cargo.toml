@@ -30,6 +30,15 @@ myelin-agent-service = { path = "../myelin-agent-service" } # the driving loop (
 myelin-agent = { path = "../myelin-agent" }
 # The durable prepaid wallet (money) + the nominal reserve/settle types the RunSubstrate carries.
 myelin-storage = { path = "../myelin-storage" }
+# The first REAL governed READ tool's subsystem: the Git check-status projection
+# (`PgCheckStatusProjection::rows_for_commit`) — a genuinely tenant-scoped (`with_tenant_tx` RLS +
+# region fail-closed) real subsystem read the `Direct`-route `GitCheckStatusReadExecutor` dispatches
+# to. The composition root (this leaf crate) is the sanctioned home for a concrete durable executor —
+# `myelin-agent-service` stays provider-agnostic (no `SubstrateProvider`/runtime edge in its src).
+myelin-git = { path = "../myelin-git" }
+# The runtime `Handle` the durable read executor threads into `PgCheckStatusProjection` for its
+# sync→async bridge (the same `block_in_place` bridge `AgentWallet` uses for the per-turn debit).
+tokio = { workspace = true }
 # The durable-workflow seams the RunSubstrate threads (token mint, delegation caveats, journal).
 myelin-flow = { path = "../myelin-flow" }
 # The transactional outbox + id-minter the trace activity co-commits through.
@@ -38,6 +47,8 @@ myelin-events = { path = "../myelin-events" }
 myelin-identity = { path = "../myelin-identity" }
 # The (tenant, region) partition types.
 myelin-tenancy = { path = "../myelin-tenancy" }
+# Parse a tool's JSON-schema STRING into the normalized object carrier the vendor tool spec sends.
+serde_json.workspace = true
 
 [dev-dependencies]
 # The MOCK ModelClient double (hermetic end-to-end, no network) — proves the composition + F1 + the

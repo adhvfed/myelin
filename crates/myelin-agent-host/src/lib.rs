@@ -45,9 +45,16 @@
 
 use std::sync::{Arc, Mutex};
 
-use myelin_agent::{MeteredRuntime, ToolCall, ToolDef, ToolName, ToolResult, ToolSurface};
+pub mod git_read_tool;
+pub use git_read_tool::{
+    git_check_status_read_tool_def, git_check_status_read_tool_schema, GitCheckStatusReadExecutor,
+    GIT_READ_CHECK_STATUS_TOOL,
+};
+
+use myelin_agent::{MeteredRuntime, ToolCall, ToolDef, ToolName, ToolResult, ToolSchema, ToolSurface};
 use myelin_agent_model::{
     LlmAgentRuntime, ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn,
+    ToolSpec,
 };
 use myelin_agent_service::{
     RunOutcomeKind, RunSubstrate, SkeletonAgent, SkeletonError, SkeletonTelemetry, ToolExecError,
@@ -242,15 +249,25 @@ impl AnswerSlot {
 struct HostModelClient {
     system: String,
     prompt: String,
+    /// The vendor tool specs the run offers the model (name + description + parsed input schema). The
+    /// platform loop drives an EMPTY [`Conversation`](myelin_agent::Conversation) — it does NOT yet
+    /// populate `conv.tools` from the catalogue (the delegation-scoped tool-list push-down is the
+    /// named AG-P7 floor). So the run's tools reach the model HERE, at the same vendor seam that
+    /// injects the system + task — on EVERY step (the model needs the tool definitions on the
+    /// tool-result turn too), WITHOUT touching `handle_run` or the runtime. Empty ⇒ a tool-less run
+    /// (byte-identical to before).
+    tool_specs: Vec<ToolSpec>,
     inner: Box<dyn ModelClient + Send + Sync>,
     answer: AnswerSlot,
 }
 
 impl HostModelClient {
     /// Wrap `inner`, returning the wrapper and a handle to read the captured answer after the run.
+    /// `tool_specs` is the model-facing tool catalogue this run offers (empty ⇒ a tool-less run).
     fn wrap(
         system: String,
         prompt: String,
+        tool_specs: Vec<ToolSpec>,
         inner: Box<dyn ModelClient + Send + Sync>,
     ) -> (HostModelClient, AnswerSlot) {
         let answer = AnswerSlot::default();
@@ -258,6 +275,7 @@ impl HostModelClient {
             HostModelClient {
                 system,
                 prompt,
+                tool_specs,
                 inner,
                 answer: answer.clone(),
             },
@@ -280,6 +298,11 @@ impl ModelClient for HostModelClient {
                     content: self.prompt.clone(),
                 });
             }
+        }
+        // Inject the run's tool specs on EVERY step so the model knows what it may call (the loop
+        // leaves `conv.tools` empty). A tool-less run carries no specs and this is a no-op.
+        if !self.tool_specs.is_empty() {
+            req.tools = self.tool_specs.clone();
         }
         let response = self.inner.complete(&req)?;
         if let ModelReply::Final { content } = &response.reply {
@@ -365,6 +388,50 @@ impl ToolExecutor for NoToolExecutor {
     }
 }
 
+// ───────────────────────── the production tool catalogue (a real ToolSurface) ─────────────────────
+
+/// **A production, `Vec`-backed [`ToolSurface`] — the real permissioned catalogue a tools-enabled run
+/// validates each proposed [`ToolCall`](myelin_agent::ToolCall) against.** Replaces [`NoToolSurface`]
+/// for a run that offers tools: register the run's [`ToolDef`]s, and the driving loop's `validate_call`
+/// security checkpoint resolves each call against them (an unregistered tool, or arguments that fail
+/// the tool's schema, abort the run fail-closed BEFORE the executor is reached). Unlike
+/// [`NoToolSurface`] this is NOT test-gated — it is the real catalogue a hosted run uses.
+#[derive(Clone, Debug, Default)]
+pub struct ToolCatalogue {
+    defs: Vec<ToolDef>,
+}
+
+impl ToolCatalogue {
+    /// A catalogue seeded with the tools this run may call.
+    pub fn new(defs: impl IntoIterator<Item = ToolDef>) -> ToolCatalogue {
+        ToolCatalogue {
+            defs: defs.into_iter().collect(),
+        }
+    }
+}
+
+impl ToolSurface for ToolCatalogue {
+    fn register_tool(&mut self, def: ToolDef) {
+        self.defs.push(def);
+    }
+    fn resolve(&self, name: &ToolName) -> Option<&ToolDef> {
+        self.defs.iter().find(|d| &d.name == name)
+    }
+}
+
+/// Convert a model-facing [`ToolSchema`] (name + description + JSON-schema STRING) into the vendor
+/// [`ToolSpec`] the client sends the model. The schema string is parsed into the normalized object
+/// carrier, falling back to a permissive object schema if it is empty/unparseable so the request
+/// stays wire-valid (mirrors the runtime's own `build_request` fallback).
+fn tool_schema_to_spec(schema: &ToolSchema) -> ToolSpec {
+    ToolSpec {
+        name: schema.name.0.clone(),
+        description: schema.description.clone(),
+        input_schema: serde_json::from_str(&schema.input_schema)
+            .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
+    }
+}
+
 // ───────────────────────── the F1 core: the ONE metered RunSubstrate dispatcher ──────────────────
 
 /// **The ONE place a hosted-agent [`RunSubstrate`](myelin_agent_service::RunSubstrate) is built and
@@ -387,11 +454,55 @@ pub fn dispatch_metered_llm_run(
     wiring: &mut RunSubstrateWiring<'_>,
     model_client: Box<dyn ModelClient + Send + Sync>,
 ) -> Result<LlmRunReport, AgentHostError> {
-    // Wrap the vendor client so the run's task is injected and its final answer captured — WITHOUT
-    // touching handle_run or the runtime.
+    // The TOOL-LESS path: the no-tools catalogue + executor + no advertised tools. Byte-identical to
+    // the original body — it funnels through the ONE tools-aware core below with empty tool wiring.
+    let catalogue = NoToolSurface;
+    let executor = NoToolExecutor;
+    dispatch_metered_llm_run_with_tools(
+        wallet,
+        region,
+        task,
+        wiring,
+        model_client,
+        &catalogue,
+        &executor,
+        &[],
+    )
+}
+
+/// **The ONE metered `RunSubstrate` dispatcher, with the run's TOOLS wired (F1 preserved).**
+///
+/// The tools-enabled superset of [`dispatch_metered_llm_run`]: same F1-structural wallet threading
+/// (`wallet: Some(wallet)`, always), same [`HostModelClient`] task-inject + answer-capture — PLUS a
+/// real permissioned [`ToolSurface`] `catalogue` (the loop `validate_call`s each proposed call against
+/// it — the security checkpoint), a [`ToolExecutor`] the loop runs each VALIDATED call through, and
+/// the `advertised` [`ToolSchema`]s the model is told it may call (injected at the vendor seam because
+/// the platform loop leaves `conv.tools` empty — the AG-P7 push-down floor). A tools-enabled run is
+/// ADDITIVE: pass `&NoToolSurface`, `&NoToolExecutor`, `&[]` and it is byte-identical to the tool-less
+/// path (that is exactly what [`dispatch_metered_llm_run`] does).
+///
+/// The loop already routes a `Read` tool `Direct` to the executor, appends each [`ToolResult`] into
+/// the conversation, and steps again — so the run is: model turn (a tool call, metered) → executor
+/// read → model turn (the answer, metered). Both turns debit the wallet (a real tool-executing run is
+/// billed for the tool turn AND the answer turn). `region` MUST be the wallet's region (F2).
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_metered_llm_run_with_tools(
+    wallet: &dyn RunWallet,
+    region: Region,
+    task: &LlmRunTask,
+    wiring: &mut RunSubstrateWiring<'_>,
+    model_client: Box<dyn ModelClient + Send + Sync>,
+    catalogue: &dyn ToolSurface,
+    executor: &dyn ToolExecutor,
+    advertised: &[ToolSchema],
+) -> Result<LlmRunReport, AgentHostError> {
+    // Wrap the vendor client so the run's task + tool specs are injected and its final answer captured
+    // — WITHOUT touching handle_run or the runtime.
+    let tool_specs = advertised.iter().map(tool_schema_to_spec).collect();
     let (host_client, answer) = HostModelClient::wrap(
         default_system(&task.system),
         task.prompt.clone(),
+        tool_specs,
         model_client,
     );
     let mut runtime = LlmAgentRuntime::new(Box::new(host_client));
@@ -399,11 +510,10 @@ pub fn dispatch_metered_llm_run(
         runtime = runtime.with_max_output_tokens(max);
     }
 
-    // The v1 in-process identity + the no-tools catalogue/executor (locals that outlive the run).
+    // The v1 in-process identity (locals that outlive the run). The catalogue + executor are the
+    // caller's (the tool-less path passes the no-tools pair).
     let minter: Arc<dyn RunTokenMinter + Send + Sync> = Arc::new(HostRunMinter);
     let revoker = HostRunRevoker::default();
-    let catalogue = NoToolSurface;
-    let executor = NoToolExecutor;
     let mut gate = myelin_storage::agent_run_gate::AgentRunGate::new();
     let mut telemetry = SkeletonTelemetry::new();
     let agent_loop = SkeletonAgent::new();
@@ -421,8 +531,8 @@ pub fn dispatch_metered_llm_run(
         caveats: DelegationCaveats(vec![]),
         token_ttl_secs: task.token_ttl_secs,
         revoker: &revoker,
-        catalogue: &catalogue,
-        executor: &executor,
+        catalogue,
+        executor,
         wallet: Some(wallet), // F1 — the metered wallet is always present for a real run.
         gate: &mut gate,
         ledger: wiring.ledger,
@@ -529,6 +639,33 @@ impl AgentHost {
     ) -> Result<LlmRunReport, AgentHostError> {
         dispatch_metered_llm_run(&self.wallet, self.region.clone(), task, wiring, model_client)
     }
+
+    /// **Drive one metered TOOL-EXECUTING hosted-agent run (F1 + F2).** The tools-enabled sibling of
+    /// [`run_llm_agent`](AgentHost::run_llm_agent): the run may `validate_call` → `execute` the
+    /// `advertised` tools through `catalogue` + `executor`, still over THIS host's durable wallet
+    /// (F1) and region (F2). Pass a real [`ToolCatalogue`] + a `Direct` [`ToolExecutor`] (e.g.
+    /// [`GitCheckStatusReadExecutor`]) + the matching [`ToolSchema`]s.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_llm_agent_with_tools(
+        &self,
+        task: &LlmRunTask,
+        wiring: &mut RunSubstrateWiring<'_>,
+        model_client: Box<dyn ModelClient + Send + Sync>,
+        catalogue: &dyn ToolSurface,
+        executor: &dyn ToolExecutor,
+        advertised: &[ToolSchema],
+    ) -> Result<LlmRunReport, AgentHostError> {
+        dispatch_metered_llm_run_with_tools(
+            &self.wallet,
+            self.region.clone(),
+            task,
+            wiring,
+            model_client,
+            catalogue,
+            executor,
+            advertised,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -566,6 +703,7 @@ mod tests {
         let (client, answer) = HostModelClient::wrap(
             "SYS".into(),
             "do the thing".into(),
+            vec![],
             Box::new(Fwd(spy.clone())),
         );
         // An empty request (what LlmAgentRuntime builds from an empty Conversation).
@@ -587,6 +725,67 @@ mod tests {
     fn empty_system_falls_back_to_the_default_framing() {
         assert!(default_system("   ").contains("labelled as an agent"));
         assert_eq!(default_system("custom"), "custom");
+    }
+
+    /// **The wrapper injects the run's tool specs on EVERY step** (the loop leaves `conv.tools`
+    /// empty, so the model would otherwise never learn the tool exists) — including a later tool-loop
+    /// step whose request already carries history.
+    #[test]
+    fn host_client_injects_tool_specs_on_every_step() {
+        struct Spy(Mutex<Vec<ModelRequest>>);
+        impl ModelClient for Spy {
+            fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+                self.0.lock().unwrap().push(request.clone());
+                Ok(ModelResponse {
+                    reply: ModelReply::Final {
+                        content: "ok".into(),
+                    },
+                    usage: Usage::NotReported,
+                })
+            }
+        }
+        let spy = Arc::new(Spy(Mutex::new(Vec::new())));
+        struct Fwd(Arc<Spy>);
+        impl ModelClient for Fwd {
+            fn complete(&self, r: &ModelRequest) -> Result<ModelResponse, ModelError> {
+                self.0.complete(r)
+            }
+        }
+        let specs = vec![tool_schema_to_spec(&git_check_status_read_tool_schema())];
+        let (client, _answer) =
+            HostModelClient::wrap("SYS".into(), "task".into(), specs, Box::new(Fwd(spy.clone())));
+
+        // First step (empty turns): tools injected.
+        client.complete(&ModelRequest::default()).unwrap();
+        // A later step that already carries history: tools STILL injected (the model needs the tool
+        // definitions on the tool-result turn too).
+        client
+            .complete(&ModelRequest {
+                turns: vec![ModelTurn::User {
+                    content: "prior".into(),
+                }],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let seen = spy.0.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for req in seen.iter() {
+            assert_eq!(req.tools.len(), 1, "the run's tool is advertised every step");
+            assert_eq!(req.tools[0].name, GIT_READ_CHECK_STATUS_TOOL);
+            assert_eq!(req.tools[0].input_schema["type"], "object");
+        }
+    }
+
+    /// **`ToolCatalogue` register/resolve round-trips** (the real permissioned catalogue a
+    /// tools-enabled run validates each call against); an unknown name is `None`.
+    #[test]
+    fn tool_catalogue_resolves_registered_tools() {
+        let cat = ToolCatalogue::new([git_check_status_read_tool_def()]);
+        assert!(cat
+            .resolve(&ToolName(GIT_READ_CHECK_STATUS_TOOL.into()))
+            .is_some());
+        assert!(cat.resolve(&ToolName("nope".into())).is_none());
     }
 
     #[test]
