@@ -135,7 +135,6 @@ async fn agent_wallet_durable_contract() {
 
     // A never-funded wallet reads 0 (no row yet).
     assert_eq!(wallet.balance(&tenant), MicroUsd::ZERO, "empty wallet is 0");
-    assert_eq!(wallet.available(&tenant), MicroUsd::ZERO, "available == balance for now");
 
     // Top-up seed ($5.00 = 5_000_000 micro-USD).
     let after_topup = wallet

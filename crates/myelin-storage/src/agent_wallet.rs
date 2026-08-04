@@ -318,14 +318,12 @@ impl AgentWallet {
         }))
         .unwrap_or(MicroUsd::ZERO)
     }
-
-    /// The **available** balance the reserve/settle gate consumes at dispatch. For THIS slice it
-    /// equals [`Self::balance`]; the reservation-integration that makes it
-    /// `balance − outstanding_reservations` is the follow-on run-lifecycle wiring slice.
-    pub fn available(&self, tenant: &TenantId) -> MicroUsd {
-        self.balance(tenant)
-    }
 }
+// NOTE: there is deliberately NO wallet-level `available()`. The netted available the reserve gate
+// consumes — `balance − outstanding_reservations` — is computed at the dispatch composition seam
+// (`myelin-agent-host::dispatch_core`), the only place that sees BOTH the wallet and the cost ledger.
+// A wallet-level `available()` could only ever return the gross balance (the wallet cannot see
+// outstanding reservations), which would be a silent trap for a caller expecting the netted value.
 
 /// Read the materialized balance for `(tenant, region)` — `None` if the wallet row does not exist.
 async fn read_balance(

@@ -1341,11 +1341,13 @@ mod tests {
         );
     }
 
-    /// **The concurrency-correctness point: a second reserve sees `available` reduced by the first's
-    /// outstanding amount.** With a balance of 1000 and a first run reserving 700, the remaining
-    /// affordable is `1000 − 700 = 300`: a second run estimating 400 is REFUSED (it cannot
-    /// over-reserve past the balance), while one estimating 300 is admitted. This is exactly the
-    /// `available = balance − outstanding` computation the agent-host gate performs.
+    /// **The netting arithmetic: a second reserve sees `available` reduced by the first's outstanding
+    /// amount.** With a balance of 1000 and a first run reserving 700, the remaining affordable is
+    /// `1000 − 700 = 300`: a second run estimating 400 is REFUSED (it cannot over-reserve past the
+    /// balance), while one estimating 300 is admitted. This exercises the `available = balance −
+    /// outstanding` computation the agent-host gate performs — SEQUENTIALLY (reserve #1, then read
+    /// outstanding, then reserve #2). It does NOT exercise the true two-dispatcher interleave, whose
+    /// bounded TOCTOU over-reserve is the documented atomicity follow-on (see `dispatch_core`).
     #[test]
     fn second_reserve_is_bounded_by_the_first_runs_outstanding() {
         let mut ledger = CostLedger::new();

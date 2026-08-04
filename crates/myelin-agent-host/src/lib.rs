@@ -525,9 +525,13 @@ fn dispatch_core(
     // `task.available` literal is retained only for those no-wallet shapes.
     //
     // ATOMICITY NOTE (v1 — documented, not built): reading `balance` + `outstanding` then reserving is
-    // three ops, NOT one atomic transaction, so under high concurrency a tiny TOCTOU over-reserve is
-    // possible, bounded by a single `estimate`. The fully-atomic reserve-against-(balance − outstanding)
-    // in one cross-ledger transaction is a named follow-on (unified-wallet slice 4+).
+    // three ops, NOT one atomic transaction. Under N-way concurrency (N dispatchers reading the same
+    // pre-reserve `outstanding` snapshot) the over-admission is bounded by (N−1)×`estimate`. This has
+    // NO overspend impact: over-admission only inflates reservations; the atomic `wallet.debit`
+    // (`FOR UPDATE` + checked_sub, refuses on insufficient) is the real money backstop, so an
+    // over-admitted run simply halts at its debit — the balance can never go negative. The fully-atomic
+    // reserve-against-(balance − outstanding) in one cross-ledger transaction is a named follow-on
+    // (unified-wallet slice 4+).
     let outstanding = wiring
         .ledger
         .outstanding_reservations(&task.tenant)
