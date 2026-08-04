@@ -33,6 +33,24 @@ const LUNA_MODEL: &str = "gpt-5.6-luna";
 /// The env var the provider key is read from (never logged).
 const API_KEY_ENV: &str = "OPENAI_API_KEY";
 
+/// Map a platform tool name to an OpenAI-valid function name. OpenAI's chat/completions rejects a
+/// `tools[*].function.name` that does not match `^[a-zA-Z0-9_-]+$` (a hard 400) — but the platform's
+/// tool names are dotted namespaces (`git.read_check_status`, `issue.transition`, `tool.use`) whose
+/// only out-of-charset character is `.`. The platform naming convention never uses `-`, so mapping
+/// the one disallowed character (`.`) to the one unused allowed character (`-`) is a total, reversible
+/// bijection over the actual name alphabet. See [`from_wire_tool_name`] for the inverse the response
+/// path applies so the loop dispatches on the original catalogue key.
+fn to_wire_tool_name(name: &str) -> String {
+    name.replace('.', "-")
+}
+
+/// Inverse of [`to_wire_tool_name`]: turn the wire function name Luna echoes back on a `tool_call`
+/// into the platform catalogue key so the tool loop resolves + dispatches it (`git-read_check_status`
+/// → `git.read_check_status`). Reverses the `.`↔`-` bijection.
+fn from_wire_tool_name(name: &str) -> String {
+    name.replace('-', ".")
+}
+
 /// A bounded response ceiling so a hostile/huge body cannot exhaust memory.
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 /// The default per-call transport deadline (connect + headers + body).
@@ -111,8 +129,11 @@ impl LunaClient {
                                     "id": c.id,
                                     "type": "function",
                                     "function": {
+                                        // The reconstructed assistant tool_call must reference the
+                                        // SAME wire name we advertised in `tools` (OpenAI validates
+                                        // this against `^[a-zA-Z0-9_-]+$` too).
+                                        "name": to_wire_tool_name(&c.name),
                                         // OpenAI wants the arguments as a JSON *string*.
-                                        "name": c.name,
                                         "arguments": c.arguments.to_string(),
                                     }
                                 })
@@ -141,7 +162,9 @@ impl LunaClient {
                 json!({
                     "type": "function",
                     "function": {
-                        "name": t.name,
+                        // Map the dotted platform name to an OpenAI-valid function name (a `.` in the
+                        // name is a hard 400 — the bug this guards against).
+                        "name": to_wire_tool_name(&t.name),
                         "description": t.description,
                         "parameters": t.input_schema,
                     }
@@ -290,8 +313,8 @@ pub(crate) fn parse_response(value: &Value) -> Result<ModelResponse, ModelError>
                 let name = function
                     .get("name")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| ModelError::Parse("tool_call missing function.name".into()))?
-                    .to_string();
+                    .map(from_wire_tool_name)
+                    .ok_or_else(|| ModelError::Parse("tool_call missing function.name".into()))?;
                 // OpenAI sends arguments as a JSON string; parse best-effort (Null if empty/invalid).
                 let arguments = function
                     .get("arguments")
@@ -432,6 +455,55 @@ mod tests {
         assert!(body.get("tool_choice").is_none(), "no tool_choice without tools");
         assert!(body.get("tools").is_none(), "no tools key without tools");
         assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    #[test]
+    fn dotted_tool_names_are_mapped_to_openai_valid_names_and_reversed() {
+        // REGRESSION: OpenAI 400s a `tools[*].function.name` that isn't `^[a-zA-Z0-9_-]+$`, and the
+        // platform's tool names are dotted namespaces (`git.read_check_status`). The wire must carry a
+        // sanitized name, the reconstructed assistant tool_call must carry the SAME sanitized name,
+        // and a `tool_call` the model echoes back must map to the ORIGINAL dotted catalogue key.
+        let client = LunaClient::new("k");
+        let request = ModelRequest {
+            system: "sys".into(),
+            turns: vec![ModelTurn::Assistant {
+                content: None,
+                tool_calls: vec![ToolCallRequest {
+                    id: "call_1".into(),
+                    name: "git.read_check_status".into(),
+                    arguments: serde_json::json!({"repo": "r", "commit": "c"}),
+                }],
+            }],
+            tools: vec![ToolSpec {
+                name: "git.read_check_status".into(),
+                description: "read checks".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+            }],
+            max_output_tokens: Some(64),
+        };
+        let body = client.body_for(&request);
+        // The advertised tool name is OpenAI-valid (no dot) — this is the exact 400 the bug caused.
+        assert_eq!(body["tools"][0]["function"]["name"], "git-read_check_status");
+        // The reconstructed assistant tool_call references the same wire name.
+        assert_eq!(
+            body["messages"][1]["tool_calls"][0]["function"]["name"],
+            "git-read_check_status"
+        );
+        let openai_pattern = |s: &str| s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        assert!(openai_pattern(body["tools"][0]["function"]["name"].as_str().unwrap()));
+
+        // The inverse: a tool_call the model returns maps back to the dotted catalogue key.
+        let value = serde_json::json!({
+            "choices": [{"message": {"content": null, "tool_calls": [{
+                "id": "call_9", "type": "function",
+                "function": {"name": "git-read_check_status", "arguments": "{}"}
+            }]}}],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 2}
+        });
+        match parse_response(&value).unwrap().reply {
+            ModelReply::ToolCalls(calls) => assert_eq!(calls[0].name, "git.read_check_status"),
+            other => panic!("expected ToolCalls, got {other:?}"),
+        }
     }
 
     #[test]

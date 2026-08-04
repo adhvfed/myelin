@@ -137,6 +137,23 @@ scripts:
         --goal "What are the exact resource limits (cpu, memory, disk, pids, timeout) of the linux-build-v1 CI execution profile, and which file+function defines them?" \
         "$@"
 
+  # Live hosted-agent TOOL-EXECUTION drill: a real Luna agent invokes the governed git
+  # check-status READ tool against seeded live-PG data and answers, metered against the wallet.
+  # No `depends_on` — it reaches the ALREADY-RUNNING PG directly (avoids a fed-isolate stack
+  # conflict); the key is injected from the vault. Runs the #[ignore] live drill:  fed run agent-tool-drill
+  agent-tool-drill:
+    environment:
+      OPENAI_API_KEY: "{{OPENAI_API_KEY}}"
+      # Hardcode the REAL myelin-postgres (:5433, the persistent dev stack), NOT {{POSTGRES_PORT}}
+      # (which fed resolves to its ephemeral isolate that lacks the myelin schema).
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:5433/myelin"
+      AWS_DEFAULT_REGION: "fr-par"
+      MYELIN_REGION: "fr-par"
+      S3_REGION: "fr-par"
+    script: |
+      set -eu
+      cargo test -p myelin-agent-host --test e2e_luna_tool_live -- --ignored --nocapture
+
   provision:outbox-publisher:
     depends_on: [postgres, nats]
     environment:
