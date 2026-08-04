@@ -294,6 +294,25 @@ const PER_LINT_EXCLUSIONS: &[(LintId, &[&str])] = &[
     // the durable launch guard above. Exclude this file from no-host-exec ONLY; every other
     // architecture lint still scans it. See the module doc in `workspace_storage.rs`.
     (NO_HOST_EXEC, &["myelin-ci-sandbox/src/workspace_storage.rs"]),
+    // The gVisor sandbox-backend SUBMODULES extracted out of the (globally-excluded) `gvisor.rs`
+    // for comprehensibility. They carry the SAME legitimate runtime-spawn mechanism the parent file
+    // is exempted for: `cgroup.rs` sets up the memory cgroup (a `/bin/sh` quiescence step);
+    // `explicit_userns.rs` verifies + invokes the pinned `runsc` binary (the isolation boundary IS
+    // that spawn). Excluded from no-host-exec ONLY — unlike `gvisor.rs`'s blanket global exclusion,
+    // these stay FULLY scanned by every other architecture lint (tenant-predicate, no-raw-publish,
+    // …). The global-exclusion substring `.../gvisor.rs` does not cover the `gvisor/` submodule dir.
+    (
+        NO_HOST_EXEC,
+        &[
+            "myelin-ci-sandbox/src/gvisor/cgroup.rs",
+            "myelin-ci-sandbox/src/gvisor/explicit_userns.rs",
+        ],
+    ),
+    // The per-job OverlayFS CoW rootfs primitive (CT-007 #26/#27). Its `Command` sites ARE the
+    // isolation mechanism — the `cfg(test-support)` deterministic-copy fallback (`cp -a` over
+    // fd-bound `/proc/self/fd` paths) for hosts without OverlayFS/`CAP_SYS_ADMIN`, exactly analogous
+    // to `workspace_storage.rs`'s btrfs invocations. no-host-exec ONLY; every other lint still scans.
+    (NO_HOST_EXEC, &["myelin-ci-sandbox/src/rootfs_overlay.rs"]),
     // The CI stage-verdict seam (`no-raw-ci-verdict`, P-FLOW CI durability). The typed `job.done`
     // verdict (`SignalPayload::CiJobDone` / `signal_typed`) is trusted by the pipeline body as the
     // runner's verified result, so naming/constructing/delivering it is forbidden everywhere EXCEPT the
