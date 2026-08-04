@@ -27,19 +27,24 @@
 use std::sync::Arc;
 
 use myelin_agent_host::{
-    git_check_status_read_tool_def, git_check_status_read_tool_schema, AgentHost, CreditKind,
-    GitCheckStatusReadExecutor, LlmRunTask, MicroUsd, RunSubstrateWiring, ToolCatalogue,
+    git_check_status_read_tool_def, git_check_status_read_tool_schema, timestamp_from_epoch,
+    AgentHost, CreditKind, GitCheckStatusReadExecutor, LlmRunTask, MicroUsd, RunSubstrateWiring,
+    ToolCatalogue,
 };
 use myelin_agent_model::{LunaClient, ModelError};
 use myelin_config::MyelinConfig;
 use myelin_events::{MonotonicMinter, OutboxStore};
 use myelin_flow::WfJournal;
 use myelin_git::check_status_store::{CHECK_STATUS_TABLE, CREATE_CHECK_STATUS_DDL};
-use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind, RevokeTarget, RunId, RuntimeRef};
+use myelin_identity_service::{run_token_jti, RevocationStore, RunTokenState};
 use myelin_storage::agent_wallet::agent_wallet_migrations;
 use myelin_storage::migration::{HotTables, Migration, Migrations};
 use myelin_storage::reserve_settle::CostLedger;
-use myelin_storage::{SubstrateProvider, TenantScope};
+use myelin_storage::{
+    cell_root_durable_migrations, identity_durable_migrations, DurableRevocationBacking, SealKey,
+    SubstrateProvider, TenantScope,
+};
 use myelin_tenancy::{Region, TenantId};
 
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
@@ -87,6 +92,18 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
         .migrate(&check_status_table, &HotTables::none())
         .await
         .expect("apply the Git check_status projection table (git_0014)");
+    // The REAL per-run token mint/revoke needs the durable S7 denylist tables (`revocation` +
+    // `run_token_teardown`, via `identity_durable_migrations`) and the cell token-authority signing
+    // root table (`cell_token_root`, via `cell_root_durable_migrations`). Idempotent on a dogfood DB
+    // that already has them applied.
+    admin
+        .migrate(&identity_durable_migrations(), &HotTables::none())
+        .await
+        .expect("apply the identity durable (S7 revocation + run-token teardown) migrations");
+    admin
+        .migrate(&cell_root_durable_migrations(), &HotTables::none())
+        .await
+        .expect("apply the cell token-authority root migration");
     Some(admin)
 }
 
@@ -197,8 +214,21 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     // SEED the readable tenant data (a distinctive `ci/build = failure` row).
     seed_check_row(&app, &tenant.0, &region_s, &repo, commit).await;
 
-    // The F2-airtight composition root: wallet + region both from THIS provider.
-    let host = AgentHost::new(app.clone());
+    // The F2-airtight composition root wired to the REAL Identity per-run token mint + durable S7
+    // revocation. A UNIQUE cell_id per run (a fresh generated signing root, never colliding with a
+    // pre-existing sealed root under a different key) + a fixed dev seal key — the SAME durable-cell +
+    // seal-key path the edge gateway / CI runner use (a production main sources these from
+    // MYELIN_CELL_ID / MYELIN_KMS_SEAL_KEY; the drill controls them so it is self-contained).
+    let cell_id = format!("cell-agenthost-{}", uniq());
+    let seal_key = SealKey::from_encoded(&"11".repeat(32)).expect("a 32-byte dev seal key");
+    let host = AgentHost::with_identity(
+        app.clone(),
+        cell_id,
+        &seal_key,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .expect("wire the REAL Identity per-run mint + durable revocation");
     let topup = MicroUsd(2_000_000); // a couple cents cap — plenty for a tool call + a short answer.
     host.wallet()
         .credit(&tenant, topup, CreditKind::Topup, None)
@@ -296,4 +326,42 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     assert_eq!(report.telemetry.traces_written(), 1);
     assert_eq!(report.telemetry.tokens_revoked(), 1, "per-run token revoked on teardown");
     assert_eq!(report.telemetry.runs_completed(), 1);
+
+    // ── THE REAL-IDENTITY GATE: the per-run token was REALLY minted + REALLY revoked on the durable
+    //    S7 denylist (not the in-process stub). The mint's `jti` is deterministic
+    //    `runtok:<agent_id>:<run_id>:<mint_instant>`, so we recompute it and consult the durable
+    //    store's lifecycle state. ──
+    let mint_now = timestamp_from_epoch(1000); // the run's `with_now_secs(1000)` mint instant.
+    let jti = run_token_jti(
+        &PrincipalId("psn:host-agent".into()),
+        &RunId(run_id.into()),
+        &mint_now,
+    );
+    let verify_agent = agent_principal(&tenant);
+    let verify_scope = TenantScope::from_verified_token(&verify_agent, Region(region_s.clone()));
+
+    // (a) THIS host's durable S7 store reports the run's token TORN DOWN (the immediate teardown deny).
+    let revocations = host
+        .revocations()
+        .expect("a with_identity host exposes the durable S7 store");
+    assert_eq!(
+        revocations.run_token_state(&verify_scope, &RevokeTarget::Jti(jti.clone()), &mint_now),
+        RunTokenState::TornDown,
+        "the REAL per-run token was torn down on the durable S7 denylist (post-run)"
+    );
+
+    // (b) DURABILITY: a FRESH S7 store instance over the SAME pool (a distinct connection / a
+    //     cold-recovered cell) still sees the teardown denylist row — the revocation survives a
+    //     process restart, and is dead for everyone in the tenant partition.
+    let fresh_revocations = RevocationStore::with_pg(
+        DurableRevocationBacking::new(app.clone()),
+        tokio::runtime::Handle::current(),
+    );
+    assert_eq!(
+        fresh_revocations.run_token_state(&verify_scope, &RevokeTarget::Jti(jti), &mint_now),
+        RunTokenState::TornDown,
+        "the durable revocation survives a fresh store instance (durable + tenant-scoped)"
+    );
+
+    eprintln!("LIVE real-Identity revocation: run token TornDown on the durable S7 denylist (durable across a fresh store instance)");
 }

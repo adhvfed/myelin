@@ -51,6 +51,10 @@ pub use git_read_tool::{
     GIT_READ_CHECK_STATUS_TOOL,
 };
 
+pub mod identity;
+pub use identity::timestamp_from_epoch;
+use identity::{IdentityRunMinter, IdentityRunRevoker};
+
 use myelin_agent::{MeteredRuntime, ToolCall, ToolDef, ToolName, ToolResult, ToolSchema, ToolSurface};
 use myelin_agent_model::{
     LlmAgentRuntime, ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn,
@@ -67,8 +71,16 @@ use myelin_flow::{
 use myelin_identity::Principal;
 use myelin_storage::agent_wallet::AgentWallet;
 use myelin_storage::reserve_settle::{CostLedger, MinorUnits};
-use myelin_storage::SubstrateProvider;
+use myelin_storage::{
+    DurableCellRootBacking, DurableRevocationBacking, SealKey, SubstrateProvider, TenantScope,
+};
 use myelin_tenancy::{Region, TenantId};
+
+// The REAL Identity per-run token providers the composition root wires behind the mint/revoke seams.
+use myelin_identity_service::{
+    CellTokenAuthority, PasetoCapabilitySigner, RevocationStore,
+    RunTokenMinter as IdentityRunTokenMinter,
+};
 
 // Re-export the seams a caller/drill composes against without a second import of the underlying
 // crate: the wallet metering seam + the teardown seam, the durable wallet's unit + kinds + error.
@@ -496,6 +508,56 @@ pub fn dispatch_metered_llm_run_with_tools(
     executor: &dyn ToolExecutor,
     advertised: &[ToolSchema],
 ) -> Result<LlmRunReport, AgentHostError> {
+    // The in-process attribution FLOOR (deterministic, DB-free): the mock/hermetic drills that call
+    // this free function directly compose the token lifecycle over the in-process stubs. A real hosted
+    // run goes through [`AgentHost`], which composes the SAME loop over the REAL Identity mint/revoke
+    // seams ([`IdentityRunMinter`] / [`IdentityRunRevoker`]) — see [`AgentHost::run_llm_agent_with_tools`].
+    let minter: Arc<dyn RunTokenMinter + Send + Sync> = Arc::new(HostRunMinter);
+    let revoker = HostRunRevoker::default();
+    dispatch_core(
+        wallet,
+        region,
+        task,
+        wiring,
+        model_client,
+        catalogue,
+        executor,
+        advertised,
+        RunTokenSeams {
+            minter,
+            revoker: &revoker,
+        },
+    )
+}
+
+/// **The per-run identity seams the driving loop composes the token lifecycle over.** The mint half
+/// ([`myelin_flow::RunTokenMinter`], `Arc` so `handle_run` can hold it) + the teardown half
+/// ([`myelin_agent_service::RunTokenRevoker`], borrowed for the run). The ONE metered dispatcher
+/// ([`dispatch_core`]) is generic over the impl behind these seams, so BOTH the in-process
+/// attribution floor (the hermetic drills' [`HostRunMinter`] / [`HostRunRevoker`]) and the REAL
+/// Identity providers ([`IdentityRunMinter`] / [`IdentityRunRevoker`], wired by [`AgentHost`]) drive
+/// the identical mint → run → revoke path.
+struct RunTokenSeams<'a> {
+    minter: Arc<dyn RunTokenMinter + Send + Sync>,
+    revoker: &'a dyn RunTokenRevoker,
+}
+
+/// **The ONE metered `RunSubstrate` dispatcher core — the single construction site (F1 preserved).**
+/// Wraps the vendor client (task inject + answer capture), assembles the run substrate with the
+/// caller-supplied identity `seams`, and drives [`handle_run`](myelin_agent_service::SkeletonAgent::handle_run).
+/// The mint is the ONLY token path: a failed mint aborts the run BEFORE any reserve (fail-closed).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_core(
+    wallet: &dyn RunWallet,
+    region: Region,
+    task: &LlmRunTask,
+    wiring: &mut RunSubstrateWiring<'_>,
+    model_client: Box<dyn ModelClient + Send + Sync>,
+    catalogue: &dyn ToolSurface,
+    executor: &dyn ToolExecutor,
+    advertised: &[ToolSchema],
+    seams: RunTokenSeams<'_>,
+) -> Result<LlmRunReport, AgentHostError> {
     // Wrap the vendor client so the run's task + tool specs are injected and its final answer captured
     // — WITHOUT touching handle_run or the runtime.
     let tool_specs = advertised.iter().map(tool_schema_to_spec).collect();
@@ -510,10 +572,8 @@ pub fn dispatch_metered_llm_run_with_tools(
         runtime = runtime.with_max_output_tokens(max);
     }
 
-    // The v1 in-process identity (locals that outlive the run). The catalogue + executor are the
-    // caller's (the tool-less path passes the no-tools pair).
-    let minter: Arc<dyn RunTokenMinter + Send + Sync> = Arc::new(HostRunMinter);
-    let revoker = HostRunRevoker::default();
+    // The per-run identity seams (the caller wired either the in-process floor or REAL Identity). The
+    // catalogue + executor are the caller's (the tool-less path passes the no-tools pair).
     let mut gate = myelin_storage::agent_run_gate::AgentRunGate::new();
     let mut telemetry = SkeletonTelemetry::new();
     let agent_loop = SkeletonAgent::new();
@@ -526,11 +586,11 @@ pub fn dispatch_metered_llm_run_with_tools(
         region,
         agent: task.agent.clone(),
         run_id: task.run_id.clone(),
-        minter_token: minter,
+        minter_token: seams.minter,
         agent_id: task.agent_id.clone(),
         caveats: DelegationCaveats(vec![]),
         token_ttl_secs: task.token_ttl_secs,
-        revoker: &revoker,
+        revoker: seams.revoker,
         catalogue,
         executor,
         wallet: Some(wallet), // F1 — the metered wallet is always present for a real run.
@@ -606,14 +666,123 @@ fn default_system(system: &str) -> String {
 pub struct AgentHost {
     region: Region,
     wallet: AgentWallet,
+    /// The REAL Identity per-run token providers (the mint + the durable S7 denylist). `Some` on a
+    /// production host built via [`AgentHost::with_identity`]; `None` on a host built via
+    /// [`AgentHost::new`] (the in-process attribution floor — the hermetic/dev path). When `Some`,
+    /// every run mints + revokes a REAL per-run token; when `None`, the deterministic in-process
+    /// stubs attribute the run (no DB, no crypto).
+    identity: Option<HostIdentity>,
 }
 
+/// **The REAL Identity per-run token providers a production [`AgentHost`] mints + revokes through.**
+/// The Identity minter ([`myelin_identity_service::RunTokenMinter`], a cloneable handle over the
+/// durable S7 store + the PASETO signer) and the durable S7 [`RevocationStore`] (the
+/// `(tenant, region)`-partitioned, RLS-scoped, PG-backed denylist). Both are run-agnostic and cheap
+/// to clone; the host binds them to each run's verified scope + agent principal per dispatch.
+struct HostIdentity {
+    minter: IdentityRunTokenMinter,
+    revocations: RevocationStore,
+}
+
+/// **An error building the REAL Identity providers for an [`AgentHost`] (fail-closed at
+/// construction).** The durable cell token-authority root could not be recovered/generated (a wrong
+/// seal key that does not unseal an existing root, or an unreachable store), or the recovered
+/// material was invalid — a host is NEVER built with a degraded/absent signing root (that would mint
+/// unverifiable or orphaned tokens).
+#[derive(Debug)]
+pub enum HostIdentityError {
+    /// The durable cell-authority root could not be recovered or generated (unreachable store, or a
+    /// seal key that does not unseal an existing sealed root — fail-closed, never a fresh root).
+    CellRootUnavailable(String),
+    /// The recovered cell-authority material was invalid (a corrupt sealed root).
+    InvalidCellRoot(String),
+}
+
+impl core::fmt::Display for HostIdentityError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            HostIdentityError::CellRootUnavailable(e) => write!(
+                f,
+                "hosted-agent Identity root refused to start (fail-closed, never a fresh/degraded \
+                 signing root): {e}"
+            ),
+            HostIdentityError::InvalidCellRoot(e) => {
+                write!(f, "hosted-agent Identity cell-authority material is invalid: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for HostIdentityError {}
+
 impl AgentHost {
-    /// Build a host from a provider — the wallet AND the region come from that ONE provider (F2).
+    /// **Build a host over the IN-PROCESS attribution floor (the hermetic / dev path).** The wallet
+    /// AND the region come from that ONE provider (F2). Per-run token mint/revoke uses the
+    /// deterministic in-process stubs ([`HostRunMinter`] / [`HostRunRevoker`]) — no DB, no crypto. For
+    /// a real multi-tenant hosted agent, use [`AgentHost::with_identity`], which mints + revokes REAL
+    /// per-run tokens through Identity's durable S7 denylist.
     pub fn new(provider: SubstrateProvider) -> AgentHost {
         let region = Region(provider.config().region.clone());
         let wallet = AgentWallet::new(provider);
-        AgentHost { region, wallet }
+        AgentHost {
+            region,
+            wallet,
+            identity: None,
+        }
+    }
+
+    /// **Build a PRODUCTION host wired to the REAL Identity per-run token mint + durable revocation
+    /// (the composition root for a real multi-tenant hosted agent).** The wallet + region come from
+    /// the provider (F2); the per-run token lifecycle is composed over:
+    ///
+    /// - Identity's real [`myelin_identity_service::RunTokenMinter`] — a PASETO-signed per-run
+    ///   attenuated token under the cell token authority (recovered durably from `cell_root` under the
+    ///   operator `seal_key`, the SAME key path the edge gateway + CI runner use — never a fresh root
+    ///   that would orphan minted tokens), whose authority is the run's delegation caveats intersected
+    ///   monotonically and bound to the run's agent principal + a per-run `run:<id>` caveat; and
+    /// - the durable S7 [`RevocationStore`] over the provider's PG pool — the `(tenant, region)`-
+    ///   partitioned, RLS-scoped denylist the teardown revokes into (durable across a process restart,
+    ///   idempotent even on a double-fire).
+    ///
+    /// The caller supplies `cell_id` + `seal_key` (from `MYELIN_CELL_ID` / `MYELIN_KMS_SEAL_KEY`, or a
+    /// test-controlled dev key) and `rt` (the runtime handle the durable store's sync→async bridge
+    /// drives on). Requires the `cell_root_durable_migrations` + `identity_durable_migrations` tables
+    /// to have been applied (via the provider's `migrate`). Fail-closed: a root that will not unseal
+    /// or an unreachable store errors here, BEFORE any run.
+    pub async fn with_identity(
+        provider: SubstrateProvider,
+        cell_id: impl Into<String>,
+        seal_key: &SealKey,
+        rt: tokio::runtime::Handle,
+    ) -> Result<AgentHost, HostIdentityError> {
+        let region = Region(provider.config().region.clone());
+        // Recover (or first-boot generate) the durable cell token-authority signing root — the SAME
+        // durable-cell-root + seal-key path the edge gateway and the CI runner compose. Fail-closed on
+        // a wrong seal key / an unreachable store (never a fresh root that orphans minted tokens).
+        let material = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id)
+            .load_or_generate(seal_key)
+            .await
+            .map_err(|e| HostIdentityError::CellRootUnavailable(e.to_string()))?;
+        let cell = Arc::new(
+            CellTokenAuthority::from_material(&material)
+                .map_err(|e| HostIdentityError::InvalidCellRoot(format!("{e:?}")))?,
+        );
+        // The durable S7 denylist over the provider's PG pool (RLS-scoped, crash-safe).
+        let revocations =
+            RevocationStore::with_pg(DurableRevocationBacking::new(provider.clone()), rt);
+        // The real minter: the monotone-intersection delegation algebra + the S7 TTL register + the
+        // REAL PASETO signer (no structural mock crypto in the production graph).
+        let signer = Arc::new(PasetoCapabilitySigner::new(cell));
+        let minter = IdentityRunTokenMinter::with_signer_and_tuples(revocations.clone(), None, signer);
+        let wallet = AgentWallet::new(provider);
+        Ok(AgentHost {
+            region,
+            wallet,
+            identity: Some(HostIdentity {
+                minter,
+                revocations,
+            }),
+        })
     }
 
     /// The durable wallet (seed it with [`AgentWallet::credit`](myelin_storage::agent_wallet::AgentWallet::credit)
@@ -627,8 +796,42 @@ impl AgentHost {
         &self.region
     }
 
+    /// The durable S7 revocation store — `Some` only on a host built via [`AgentHost::with_identity`]
+    /// (the real-Identity path). Exposed so a caller/drill can assert a run's per-run token was REALLY
+    /// revoked on teardown (its `run_token_state` is `TornDown`) and that the deny is durable (a fresh
+    /// consult over the same pool sees the denylist entry).
+    pub fn revocations(&self) -> Option<&RevocationStore> {
+        self.identity.as_ref().map(|id| &id.revocations)
+    }
+
+    /// Compose the run's per-run identity seams: the REAL Identity mint/revoke (bound to THIS run's
+    /// verified scope + agent principal + mint instant) when the host was built with identity, else
+    /// `None` (the caller falls back to the in-process floor via the free dispatch functions). The
+    /// returned revoker is a local the caller must keep alive for the borrow the seams hold.
+    fn identity_seams(&self, task: &LlmRunTask) -> Option<(Arc<dyn RunTokenMinter + Send + Sync>, IdentityRunRevoker)> {
+        let id = self.identity.as_ref()?;
+        // The run's verified `(tenant, region)` scope — tenant-from-token (the agent principal),
+        // region from THIS host (same provider as the wallet — F2). The mint's TTL register + the
+        // teardown are both scoped to it (no cross-tenant path).
+        let scope = TenantScope::from_verified_token(&task.agent, self.region.clone());
+        let now = timestamp_from_epoch(task.now_secs);
+        // The trigger actor is the agent itself (a hosted run acts as its agent); the delegation
+        // intersection is driven by the run's caveats, so this does not widen authority.
+        let minter: Arc<dyn RunTokenMinter + Send + Sync> = Arc::new(IdentityRunMinter::new(
+            id.minter.clone(),
+            scope.clone(),
+            task.agent.clone(),
+            task.agent.clone(),
+            now,
+        ));
+        let revoker = IdentityRunRevoker::new(id.revocations.clone(), scope);
+        Some((minter, revoker))
+    }
+
     /// **Drive one metered hosted-agent run (F1 + F2).** Uses THIS host's durable wallet (always
-    /// `Some` — F1) and THIS host's region (same provider as the wallet — F2). Pass
+    /// `Some` — F1) and THIS host's region (same provider as the wallet — F2). A host built with
+    /// [`AgentHost::with_identity`] mints + revokes a REAL per-run token; else the in-process floor
+    /// attributes the run. Pass
     /// `Box::new(`[`LunaClient::from_env`](myelin_agent_model::LunaClient::from_env)`()?)` as the brain
     /// for a real Luna run.
     pub fn run_llm_agent(
@@ -637,14 +840,23 @@ impl AgentHost {
         wiring: &mut RunSubstrateWiring<'_>,
         model_client: Box<dyn ModelClient + Send + Sync>,
     ) -> Result<LlmRunReport, AgentHostError> {
-        dispatch_metered_llm_run(&self.wallet, self.region.clone(), task, wiring, model_client)
+        self.run_llm_agent_with_tools(
+            task,
+            wiring,
+            model_client,
+            &NoToolSurface,
+            &NoToolExecutor,
+            &[],
+        )
     }
 
     /// **Drive one metered TOOL-EXECUTING hosted-agent run (F1 + F2).** The tools-enabled sibling of
     /// [`run_llm_agent`](AgentHost::run_llm_agent): the run may `validate_call` → `execute` the
     /// `advertised` tools through `catalogue` + `executor`, still over THIS host's durable wallet
-    /// (F1) and region (F2). Pass a real [`ToolCatalogue`] + a `Direct` [`ToolExecutor`] (e.g.
-    /// [`GitCheckStatusReadExecutor`]) + the matching [`ToolSchema`]s.
+    /// (F1) and region (F2). A host built with [`AgentHost::with_identity`] mints + revokes a REAL
+    /// per-run token bounding the run; else the in-process floor attributes it. Pass a real
+    /// [`ToolCatalogue`] + a `Direct` [`ToolExecutor`] (e.g. [`GitCheckStatusReadExecutor`]) + the
+    /// matching [`ToolSchema`]s.
     #[allow(clippy::too_many_arguments)]
     pub fn run_llm_agent_with_tools(
         &self,
@@ -655,16 +867,34 @@ impl AgentHost {
         executor: &dyn ToolExecutor,
         advertised: &[ToolSchema],
     ) -> Result<LlmRunReport, AgentHostError> {
-        dispatch_metered_llm_run_with_tools(
-            &self.wallet,
-            self.region.clone(),
-            task,
-            wiring,
-            model_client,
-            catalogue,
-            executor,
-            advertised,
-        )
+        match self.identity_seams(task) {
+            // REAL Identity mint + durable revoke (a production host).
+            Some((minter, revoker)) => dispatch_core(
+                &self.wallet,
+                self.region.clone(),
+                task,
+                wiring,
+                model_client,
+                catalogue,
+                executor,
+                advertised,
+                RunTokenSeams {
+                    minter,
+                    revoker: &revoker,
+                },
+            ),
+            // The in-process attribution floor (a hermetic/dev host built via `new`).
+            None => dispatch_metered_llm_run_with_tools(
+                &self.wallet,
+                self.region.clone(),
+                task,
+                wiring,
+                model_client,
+                catalogue,
+                executor,
+                advertised,
+            ),
+        }
     }
 }
 

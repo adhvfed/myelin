@@ -45,10 +45,18 @@ myelin-flow = { path = "../myelin-flow" }
 myelin-events = { path = "../myelin-events" }
 # The agent Principal the run acts as.
 myelin-identity = { path = "../myelin-identity" }
+# The REAL per-run token providers wired behind the mint/revoke seams at this composition root: the
+# Identity `RunTokenMinter` (PASETO-signed per-run tokens) + the durable S7 `RevocationStore`
+# (the tenant-scoped denylist) + the cell token authority (the signing root). A leaf crate, so this
+# edge cannot close a dependency cycle.
+myelin-identity-service = { path = "../myelin-identity-service" }
 # The (tenant, region) partition types.
 myelin-tenancy = { path = "../myelin-tenancy" }
 # Parse a tool's JSON-schema STRING into the normalized object carrier the vendor tool spec sends.
 serde_json.workspace = true
+# Convert the engine's epoch-seconds clock into the canonical RFC-3339 instant the Identity mint's
+# `expires_at` arithmetic + the S7 store's instant compare both parse (the mint/teardown time base).
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 # The MOCK ModelClient double (hermetic end-to-end, no network) — proves the composition + F1 + the
