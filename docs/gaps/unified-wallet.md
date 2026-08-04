@@ -110,6 +110,32 @@ Ordering isolates risk: slice 1 is large but mechanically safe (pure rename, no 
 judgment); slice 2 is the only money-meaning change and its diff is tiny and enumerated;
 slices 3–5 are additive wiring.
 
+## Status (2026-08-04): core done, remainder blocked on dependencies
+
+Slices **1, 2, 2b, 3 are landed and verified** (each: build → independent adversarial
+review → live-PG). The money unit is one micro-dollar scale across CI + agents + the
+authority-handle crypto, and the prepaid wallet now gates agent dispatch for real
+(`available = balance − outstanding`, insufficient-balance runs refused at dispatch).
+
+**Slices 4 and the fine-grained limits are BLOCKED — not deferred by choice:**
+- **Slice 4 (wire CI reserve/settle to the wallet)** — `CiMeter::reserve_budget` has NO
+  production caller (only `#[cfg(test-support)]` drills); CI billing activation is coupled
+  to the CT-007 CI cutover. There is no live CI reserve/settle to wire yet. Do slice 4 when
+  CI billing is turned on.
+- **Slice 5 per-surface limits** — need slice 4's `surface` dimension (both surfaces
+  debiting the one wallet) to be meaningful.
+- **Slice 5 per-project limits** — need a `project_id` on the agent run (`LlmRunTask` carries
+  tenant/agent/run only). Threading a project through the agent-run model is a prerequisite.
+- **Slice 5 global per-tenant limit** — cleanly buildable now, but low marginal value over
+  the prepaid balance (which already caps spend) until per-period/per-project lands.
+
+**The genuinely launch-critical UNBLOCKED next piece is wallet FUNDING** (see
+`launch-surface.md`): today the only way to add balance is the internal/admin
+`AgentWallet::credit(Topup)`. Without a self-serve top-up (Stripe for v1), every tenant
+wallet stays empty and every run is refused. Funding is a new workstream (payment
+integration, webhook idempotency, the provider cut, the EU-sovereignty question the founder
+flagged) — it deserves its own design pass, not a tail-of-slice bolt-on.
+
 ## Open sub-decisions (resolve as we build; flag any that are the founder's call)
 
 - **Limit period semantics** — absolute vs. per-period (monthly reset). Lean: support both
