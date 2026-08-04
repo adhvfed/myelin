@@ -543,42 +543,14 @@ impl WfCtx {
             return self.schedule_and_run_job(spec, runner, timeout_secs);
         };
 
-        // The dispatch activity is the FIRST command of this idiom; its command_id is the next position.
-        // Reserve under the SAME deterministic ledger run-id the dispatch will occupy (so a re-drive
-        // re-keys identically — the duplicate guard makes the replay reserve a no-op).
-        let dispatch_command_id = self.peek_next_command_id();
-        let ledger_run = self.dispatch_ledger_run(&dispatch_command_id);
-        let tenant = self.tenant_id().clone();
-
-        // ── RESERVE-AT-DISPATCH (§4.9 step 1). No balance → no dispatch: the runner is never called.
-        // A duplicate is the normal re-drive after a durable park: the first drive already moved the
-        // reservation in-flight, so this drive must preserve it and continue to the exact join.
-        match gate.reserve(&tenant, &ledger_run, cost) {
-            Ok(()) => {
-                // The reservation is in-flight from here — the job, once dispatched, is never
-                // interrupted; it settles on completion.
-                gate.begin(&tenant, &ledger_run).map_err(|e| {
-                    WfError::CoCommit(format!("schedule_and_run_job begin failed: {e}"))
-                })?;
-            }
-            Err(crate::budget::BudgetError::DuplicateReservation) => {}
-            Err(crate::budget::BudgetError::Refused {
-                requested,
-                available,
-            }) => {
-                // No balance → the job is NEVER handed to the runner (the dispatch never starts).
-                return Err(WfError::CoCommit(format!(
-                    "schedule_and_run_job refused at reserve: wallet exhausted (requested {} \
-                     minor-units, {} available) — the job was never dispatched (§4.9)",
-                    requested.0, available.0
-                )));
-            }
-            Err(other) => {
-                return Err(WfError::CoCommit(format!(
-                    "schedule_and_run_job reserve failed: {other}"
-                )));
-            }
-        }
+        // ── RESERVE → BEGIN front bracket (§4.9 step 1 — no balance → no dispatch: the runner is
+        // never called). The reserve is keyed on the SAME deterministic dispatch-position ledger run-id
+        // the dispatch will occupy, so a re-drive re-keys identically. A duplicate is the normal re-drive
+        // after a durable park: the first drive already moved the reservation in-flight, so the bracket
+        // preserves it and this drive continues to the exact join. The one spelling of the spend floor
+        // lives in [`WfCtx::reserve_and_begin`].
+        let admit =
+            self.reserve_and_begin(&gate, cost, crate::budget::DispatchNoun::LONG_PARK)?;
 
         // ── DISPATCH + PARK (the existing §4.9 idiom — composes activity/signal/timer primitives).
         let outcome = self.schedule_and_run_job(spec, runner, timeout_secs)?;
@@ -588,9 +560,10 @@ impl WfCtx {
         // expected DuplicateReservation above. A still-later replay may reach this branch again, so
         // settlement itself is deliberately idempotent (zero double-charge and zero double-refund).
         if let JobOutcome::Completed { .. } = &outcome {
-            gate.settle(&tenant, &ledger_run, &units).map_err(|e| {
-                WfError::CoCommit(format!("schedule_and_run_job settle failed: {e}"))
-            })?;
+            gate.settle(self.tenant_id(), &admit.ledger_run, &units)
+                .map_err(|e| {
+                    WfError::CoCommit(format!("schedule_and_run_job settle failed: {e}"))
+                })?;
         }
         Ok(outcome)
     }

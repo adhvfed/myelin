@@ -385,6 +385,42 @@ impl BudgetGate {
     }
 }
 
+/// **Names a metered dispatch for the reserve→begin front bracket's loud refusals.** The reserve/
+/// begin FLOW is identical for a synchronous activity and a long-park job — only the noun in the
+/// refusal differs. Each call site passes its spelling so the ONE consolidated bracket keeps the
+/// exact per-site message a test may assert (`ci_pipeline` asserts the long-park's "never dispatched").
+pub(crate) struct DispatchNoun {
+    /// The op label prefixing every refusal (`"metered_activity"` / `"schedule_and_run_job"`).
+    label: &'static str,
+    /// The no-dispatch tail clause (`"the activity never started"` / `"the job was never dispatched"`).
+    tail: &'static str,
+}
+
+impl DispatchNoun {
+    /// The synchronous [`WfCtx::metered_activity`] spelling.
+    pub(crate) const ACTIVITY: DispatchNoun = DispatchNoun {
+        label: "metered_activity",
+        tail: "the activity never started",
+    };
+    /// The long-park [`WfCtx::metered_schedule_and_run_job`] spelling.
+    pub(crate) const LONG_PARK: DispatchNoun = DispatchNoun {
+        label: "schedule_and_run_job",
+        tail: "the job was never dispatched",
+    };
+}
+
+/// **The admit half of a metered dispatch's front bracket (§4.9 step 1).** Returned by
+/// [`WfCtx::reserve_and_begin`] once the reserve admitted (a FRESH reserve, now `begin`-marked
+/// in-flight) OR re-drove an already-in-flight reservation (the duplicate-guard replay path):
+/// it carries the deterministic ledger key the dispatch reserved under so the caller's back-half
+/// settles against the SAME key. A REFUSED reserve (no balance) never yields this — it is the ONE
+/// loud [`crate::WfError::CoCommit`] the bracket returns. (Whether the drive was fresh or re-driven
+/// is fully resolved INSIDE the bracket — it decides `begin` — so the caller needs only the key.)
+pub(crate) struct ReserveAdmit {
+    /// The deterministic `(run, command)` ledger key the dispatch reserved under (and settles on).
+    pub(crate) ledger_run: LedgerRunId,
+}
+
 impl WfCtx {
     /// **Supply the reserve/settle bookend so this `WfCtx` can meter spend-bearing dispatches (contract
     /// 9.5, §4.9).** A `WfCtx` built without this runs UN-METERED (the engine still owns the loop-cap
@@ -412,6 +448,54 @@ impl WfCtx {
         LedgerRunId::new(format!("{}/{}", self.run_id(), command_id))
     }
 
+    /// **The reserve→begin front bracket every metered dispatch opens with — ONE spelling of the
+    /// no-balance → no-dispatch floor (§4.9 step 1).** Reserve `cost` at the deterministic
+    /// dispatch-position ledger key ([`WfCtx::dispatch_ledger_run`]); on a FRESH admit mark the
+    /// reservation in-flight ([`BudgetGate::begin`]) — from there it is NEVER interrupted; on a
+    /// DUPLICATE (the normal re-drive after a durable park) leave the in-flight reservation untouched
+    /// (no double-debit, no re-`begin` — the progression is monotonic). An EXHAUSTED wallet is REFUSED
+    /// here and the dispatch NEVER starts: the single loud [`crate::WfError::CoCommit`] both metered
+    /// paths surface, spelled with `noun` so each call site keeps its own message. Returns the ledger
+    /// key so the caller's back-half settles against it. Keyed deterministically so a re-drive re-keys
+    /// identically (the duplicate guard makes the replay reserve a no-op — 0 double-debit).
+    pub(crate) fn reserve_and_begin(
+        &self,
+        gate: &BudgetGate,
+        cost: MicroUsd,
+        noun: DispatchNoun,
+    ) -> crate::WfResult<ReserveAdmit> {
+        let ledger_run = self.dispatch_ledger_run(&self.peek_next_command_id());
+        let tenant = self.tenant_id().clone();
+        let fresh = match gate.reserve(&tenant, &ledger_run, cost) {
+            Ok(()) => true,
+            Err(BudgetError::DuplicateReservation) => false,
+            Err(BudgetError::Refused {
+                requested,
+                available,
+            }) => {
+                // No balance → no dispatch. The dispatch NEVER starts.
+                return Err(crate::WfError::CoCommit(format!(
+                    "{} refused at reserve: wallet exhausted (requested {} minor-units, {} available) \
+                     — {} (§4.9)",
+                    noun.label, requested.0, available.0, noun.tail
+                )));
+            }
+            Err(other) => {
+                return Err(crate::WfError::CoCommit(format!(
+                    "{} reserve failed: {other}",
+                    noun.label
+                )));
+            }
+        };
+        if fresh {
+            // The reservation is in-flight: from here it is NEVER interrupted.
+            gate.begin(&tenant, &ledger_run).map_err(|e| {
+                crate::WfError::CoCommit(format!("{} begin failed: {e}", noun.label))
+            })?;
+        }
+        Ok(ReserveAdmit { ledger_run })
+    }
+
     /// **`metered_activity(policy, cost, units, closure)` (contract 9.5, §4.4/§4.9) — a synchronous
     /// activity fronted by the reserve/settle bookend.** Reserve `cost` minor-units at dispatch (NO
     /// balance → the activity NEVER runs, [`BudgetError::Refused`] surfaces as
@@ -436,90 +520,56 @@ impl WfCtx {
     where
         F: Fn(&str, u32) -> Result<Vec<myelin_refs::ArtifactRef>, crate::ActivityError>,
     {
-        // Reserve BEFORE running (the no-balance → no-dispatch floor): if there is no gate the activity
-        // is un-metered (runs without a reserve). The reserve key is deterministic on the dispatch
-        // position so a re-drive re-keys identically (the duplicate guard makes the replay reserve a
-        // no-op rather than a double-reserve).
-        let dispatch_command_id = self.peek_next_command_id();
-        let ledger_run = self.dispatch_ledger_run(&dispatch_command_id);
-        let tenant = self.tenant_id().clone();
+        // Un-metered: no gate wired — run the activity WITHOUT a reserve (the loop-cap depth is still
+        // the runaway bound, AG-6). This is the metered_activity-specific unmetered back-half.
+        let Some(gate) = self.budget().cloned() else {
+            return self.activity(policy, f);
+        };
 
-        if let Some(gate) = self.budget().cloned() {
-            // Reserve-at-dispatch. A refused reserve means the wallet is exhausted — the activity NEVER
-            // runs (the dispatch never starts). On a re-drive the reserve hits the duplicate guard
-            // (`fresh = false`, already reserved on the first drive): there is NO double-debit and we do
-            // NOT re-`begin` (a begin on a settled row is illegal — the progression is monotonic). The
-            // settle, by contrast, IS re-run on the re-drive — it is idempotent (no double-refund) and it
-            // RECONCILES a reservation the fresh drive may have left open by crashing before its settle
-            // committed. That reconciliation is why the settle below is NOT gated on `fresh`.
-            let fresh = match gate.reserve(&tenant, &ledger_run, cost) {
-                Ok(()) => true,
-                Err(BudgetError::DuplicateReservation) => false,
-                Err(BudgetError::Refused {
-                    requested,
-                    available,
-                }) => {
-                    // No balance → no dispatch. The activity closure is NEVER invoked.
-                    return Err(crate::WfError::CoCommit(format!(
-                        "metered_activity refused at reserve: wallet exhausted (requested {} \
-                         minor-units, {} available) — the activity never started (§4.9)",
-                        requested.0, available.0
-                    )));
-                }
-                Err(other) => {
-                    return Err(crate::WfError::CoCommit(format!(
-                        "metered_activity reserve failed: {other}"
-                    )));
-                }
-            };
-            if fresh {
-                // The reservation is in-flight: from here it is NEVER interrupted.
-                gate.begin(&tenant, &ledger_run).map_err(|e| {
-                    crate::WfError::CoCommit(format!("metered_activity begin failed: {e}"))
-                })?;
-            }
+        // ── RESERVE → BEGIN front bracket (the no-balance → no-dispatch floor, §4.9 step 1). A refused
+        // reserve means the wallet is exhausted — the activity NEVER runs (the closure is not invoked).
+        // On a re-drive the reserve hits the duplicate guard and does NOT re-`begin`. The one spelling
+        // of the spend floor lives in [`WfCtx::reserve_and_begin`].
+        let admit = self.reserve_and_begin(&gate, cost, DispatchNoun::ACTIVITY)?;
 
-            // Run the activity (journaled, retried — §4.4). It short-circuits its journaled result on a
-            // re-drive (0 re-execution). It returns `Ok` on a successful completion, or
-            // `Err(WfError::ActivityExhausted)` when the retries are exhausted (or any other `WfError`).
-            let outcome = self.activity(policy, f);
+        // Run the activity (journaled, retried — §4.4). It short-circuits its journaled result on a
+        // re-drive (0 re-execution). It returns `Ok` on a successful completion, or
+        // `Err(WfError::ActivityExhausted)` when the retries are exhausted (or any other `WfError`).
+        let outcome = self.activity(policy, f);
 
-            // **Settle-on-completion reconciles the reservation on BOTH outcomes (§4.9 step 4).** A
-            // completion — success OR retry-exhaustion — is NOT an in-flight interrupt (the activity ran
-            // to the END of its retries before this point), so it SETTLES: a SUCCESS bills the actual
-            // metered `units`; a FAILURE bills ZERO metered units — a failed activity produced no
-            // artifacts, so the WHOLE reservation is refunded — releasing the reservation the exhaustion
-            // path used to orphan permanently `InFlight` (the wallet was never refunded and the ledger
-            // key, private to this bookend, could never be settled by any caller).
-            //
-            // **Replay-safe (§4.9 replay), NOT gated on `fresh`:** the settle is idempotent on
-            // `(tenant, run)`. A normal re-drive whose fresh-drive settle already committed re-settles to
-            // the SAME outcome and refunds NOTHING further (no double-refund). A crash BETWEEN the
-            // activity finishing and this settle committing leaves the reservation open on the fresh
-            // drive; the re-drive (which replays `activity_failed`, or re-runs an un-journaled activity,
-            // to the same outcome) RECONCILES the still-open key here. An unconditional idempotent settle
-            // is therefore correct where the old `fresh`-only settle leaked on every exhaustion.
-            match outcome {
-                Ok(result) => {
-                    gate.settle(&tenant, &ledger_run, &units).map_err(|e| {
+        // **Settle-on-completion reconciles the reservation on BOTH outcomes (§4.9 step 4).** A
+        // completion — success OR retry-exhaustion — is NOT an in-flight interrupt (the activity ran
+        // to the END of its retries before this point), so it SETTLES: a SUCCESS bills the actual
+        // metered `units`; a FAILURE bills ZERO metered units — a failed activity produced no
+        // artifacts, so the WHOLE reservation is refunded — releasing the reservation the exhaustion
+        // path used to orphan permanently `InFlight` (the wallet was never refunded and the ledger
+        // key, private to this bookend, could never be settled by any caller).
+        //
+        // **Replay-safe (§4.9 replay), NOT gated on the fresh/re-driven distinction:** the settle is
+        // idempotent on `(tenant, run)`. A normal re-drive whose fresh-drive settle already committed
+        // re-settles to the SAME outcome and refunds NOTHING further (no double-refund). A crash BETWEEN
+        // the activity finishing and this settle committing leaves the reservation open on the fresh
+        // drive; the re-drive (which replays `activity_failed`, or re-runs an un-journaled activity, to
+        // the same outcome) RECONCILES the still-open key here. An unconditional idempotent settle is
+        // therefore correct where the old fresh-only settle leaked on every exhaustion.
+        match outcome {
+            Ok(result) => {
+                gate.settle(self.tenant_id(), &admit.ledger_run, &units)
+                    .map_err(|e| {
                         crate::WfError::CoCommit(format!("metered_activity settle failed: {e}"))
                     })?;
-                    Ok(result)
-                }
-                Err(activity_err) => {
-                    // Release/refund the reservation (bill ZERO units) BEFORE propagating. We surface the
-                    // ORIGINAL activity error — the outcome the body branches on (retry / compensate /
-                    // dequeue) — even if this settle itself errors: a durable-ledger settle failure recurs
-                    // and is reconciled by the unconditional settle on the next re-drive, so it must not
-                    // mask the activity's own failure. (For the in-memory ledger a zero-unit settle of a
-                    // live reservation is infallible.)
-                    let _ = gate.settle(&tenant, &ledger_run, &[]);
-                    Err(activity_err)
-                }
+                Ok(result)
             }
-        } else {
-            // Un-metered: no gate wired (the loop-cap depth is still the runaway bound, AG-6).
-            self.activity(policy, f)
+            Err(activity_err) => {
+                // Release/refund the reservation (bill ZERO units) BEFORE propagating. We surface the
+                // ORIGINAL activity error — the outcome the body branches on (retry / compensate /
+                // dequeue) — even if this settle itself errors: a durable-ledger settle failure recurs
+                // and is reconciled by the unconditional settle on the next re-drive, so it must not
+                // mask the activity's own failure. (For the in-memory ledger a zero-unit settle of a
+                // live reservation is infallible.)
+                let _ = gate.settle(self.tenant_id(), &admit.ledger_run, &[]);
+                Err(activity_err)
+            }
         }
     }
 }
