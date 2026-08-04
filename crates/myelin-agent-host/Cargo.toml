@@ -66,6 +66,10 @@ myelin-agent-model = { path = "../myelin-agent-model", features = ["test-support
 # OutboxStore::new (events/test-support). The wallet stays DURABLE — the money-critical piece is real.
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
+# The REAL ReBAC decision engine the cap-enforcement gate consults: `StoreBackedCheck::new` (the
+# in-memory-tuple test-double constructor) + the real `write_tuples` grant path, so the drills seed a
+# genuine `pull` grant and exercise the SAME `IdentityService::check` a human's request flows through.
+myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 # The live Luna drill (gated on OPENAI_API_KEY + live PG :5433, mirroring integration_wallet_metering):
 myelin-config = { path = "../myelin-config" }
 sqlx = { workspace = true }

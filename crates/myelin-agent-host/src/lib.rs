@@ -68,13 +68,15 @@ use myelin_events::{IdMinter, OutboxStore};
 use myelin_flow::{
     DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenMinter, WfJournal,
 };
-use myelin_identity::Principal;
+use myelin_identity::{
+    Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
+};
 use myelin_storage::agent_wallet::AgentWallet;
 use myelin_storage::reserve_settle::{CostLedger, MinorUnits};
 use myelin_storage::{
     DurableCellRootBacking, DurableRevocationBacking, SealKey, SubstrateProvider, TenantScope,
 };
-use myelin_tenancy::{Region, TenantId};
+use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
 // The REAL Identity per-run token providers the composition root wires behind the mint/revoke seams.
 use myelin_identity_service::{
@@ -441,6 +443,169 @@ fn tool_schema_to_spec(schema: &ToolSchema) -> ToolSpec {
         description: schema.description.clone(),
         input_schema: serde_json::from_str(&schema.input_schema)
             .unwrap_or_else(|_| serde_json::json!({ "type": "object" })),
+    }
+}
+
+// ───────────────────────── cap enforcement: the ReBAC gate BEFORE a governed tool executes ───────
+
+/// A resolver that derives the ReBAC **resource** ([`ArtifactRef`]) a governed tool call targets from
+/// its already-VALIDATED arguments. Held by [`CapEnforcingExecutor`] and invoked ONCE per declared
+/// `required_cap`. Returning `None` means the resource cannot be derived — the enforcer then DENIES
+/// the call fail-closed (never guesses, never falls open). The resolver reads ONLY the tool's own
+/// arguments (the *what*); the *whose* (principal + tenant) is the run's verified token, never a
+/// model argument.
+type ToolResourceResolver = dyn Fn(&ToolDef, &ToolCall) -> Option<ArtifactRef> + Send + Sync;
+
+/// **Derive the `git.read_check_status` resource: the `repo` argument.** The tool's `required_caps =
+/// ["pull"]` are checked against the ReBAC grant on THIS repo — the resource is the `repo` ref the
+/// validated arguments carry (e.g. `myelin://<tenant>/git/repo/<id>`, which the ReBAC engine
+/// canonicalises to the `repo:<id>` tuple key). `None` if the argument is absent/non-string (the
+/// enforcer denies fail-closed) — though `validate_call` has already proven `repo` is a required
+/// string, so on the validated path this always resolves.
+pub fn git_read_check_status_resource(_def: &ToolDef, call: &ToolCall) -> Option<ArtifactRef> {
+    call.arguments
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .map(|repo| ArtifactRef(repo.to_string()))
+}
+
+/// The consistency token the cap gate reads under: **Strong at the latest snapshot** — the freshest
+/// authoritative grant, bypassing the fail-static availability cache (a tool authorization must never
+/// be served stale). An empty `at_least` zookie means "latest" (include every written grant).
+fn strong_latest() -> Consistency {
+    Consistency {
+        at_least: Zookie(String::new()),
+        mode: ConsistencyMode::Strong,
+    }
+}
+
+/// **The cap-enforcement checkpoint — a [`ToolExecutor`] decorator that DENIES a governed tool call
+/// fail-closed unless the run's agent principal actually HOLDS the tool's `required_caps` on the
+/// target resource, checked on the REAL ReBAC engine ([`IdentityService::check`]).**
+///
+/// A [`ToolDef`]'s `required_caps` (e.g. the git read tool's `["pull"]`) were declarative-but-
+/// UNENFORCED: the loop `validate_call`d the untrusted arguments (schema) and dispatched to the
+/// executor, but nothing checked that the principal was *authorized* to call the tool — only RLS/
+/// tenant scoping gated the underlying read. This decorator closes that gap. It sits at the SAME
+/// dispatch boundary as `validate_call` (the loop calls `executor.execute(def, call)` only after a
+/// call passes validation), and BEFORE the inner executor runs it consults the real ReBAC decision
+/// engine for every declared cap:
+///
+/// - the **principal** is the run's verified agent [`Principal`] (from the minted token, never model
+///   input);
+/// - the **permission** is each `required_cap` (a git `pull`, …);
+/// - the **resource** is derived from the VALIDATED arguments by [`ToolResourceResolver`] (the git
+///   read tool's `repo`) — the *what*, never the *whose*;
+/// - the **decision** is [`IdentityService::check`]'s, which derives the `(tenant, region)` scope from
+///   the subject's own verified token internally (tenant-from-token, ID-3) and authorizes an agent the
+///   SAME fail-closed way as a human (it never branches on principal kind).
+///
+/// **Fail-CLOSED everywhere:** any cap that is not an explicit [`Decision::Allow`] — a `Deny`, a
+/// `Conditional`, a check `Err`, or a resource that cannot be derived — returns an
+/// [`Err(ToolExecError)`], which the driving loop turns into an aborted run WITH teardown (the exact
+/// path a `validate_call` rejection takes). The inner executor is NEVER reached on a denied cap. A
+/// tool with an empty `required_caps` set is dispatched straight through (nothing to check).
+///
+/// It borrows the inner `&dyn `[`ToolExecutor`] for the run, so the caller keeps ownership and can
+/// still inspect it afterwards (e.g. `GitCheckStatusReadExecutor::invocations`).
+pub struct CapEnforcingExecutor<'a> {
+    /// The REAL ReBAC decision engine (a `StoreBackedCheck` in production/drills — never a stub in the
+    /// production path). Held behind `Arc<dyn IdentityService>` so the same check surface a human's
+    /// request flows through gates the agent's tool call.
+    identity: Arc<dyn IdentityService + Send + Sync>,
+    /// The run's verified agent principal — the SUBJECT of every cap check. From the minted token, so
+    /// the model can never widen *whose* authority is consulted.
+    principal: Principal,
+    /// The tool being executed (borrowed for the run).
+    inner: &'a dyn ToolExecutor,
+    /// Derives the ReBAC resource from the validated arguments (the git read tool's `repo`).
+    resource_of: Box<ToolResourceResolver>,
+}
+
+impl<'a> CapEnforcingExecutor<'a> {
+    /// Wrap `inner` so every governed call it would execute is first cap-checked on the REAL ReBAC
+    /// engine `identity` for `principal`, with the resource derived by `resource_of`.
+    pub fn new(
+        identity: Arc<dyn IdentityService + Send + Sync>,
+        principal: Principal,
+        inner: &'a dyn ToolExecutor,
+        resource_of: Box<ToolResourceResolver>,
+    ) -> CapEnforcingExecutor<'a> {
+        CapEnforcingExecutor {
+            identity,
+            principal,
+            inner,
+            resource_of,
+        }
+    }
+
+    /// Wrap `inner` for the `git.read_check_status` tool: the resource is its `repo` argument (the
+    /// common case — [`CapEnforcingExecutor::new`] with [`git_read_check_status_resource`]).
+    pub fn for_git_read_tool(
+        identity: Arc<dyn IdentityService + Send + Sync>,
+        principal: Principal,
+        inner: &'a dyn ToolExecutor,
+    ) -> CapEnforcingExecutor<'a> {
+        CapEnforcingExecutor::new(
+            identity,
+            principal,
+            inner,
+            Box::new(git_read_check_status_resource),
+        )
+    }
+}
+
+impl ToolExecutor for CapEnforcingExecutor<'_> {
+    fn execute(&self, def: &ToolDef, call: &ToolCall) -> Result<ToolResult, ToolExecError> {
+        // Enforce EVERY declared cap on the real ReBAC engine BEFORE any side-effect-free-or-not work
+        // reaches the inner executor. An empty `required_caps` set skips the loop (nothing to gate).
+        for cap in &def.required_caps {
+            // Derive the resource from the VALIDATED arguments (the *what*). A resource that cannot be
+            // derived is genuine uncertainty about WHAT is being authorized → DENY fail-closed.
+            let resource = (self.resource_of)(def, call).ok_or_else(|| {
+                ToolExecError::Failed(format!(
+                    "cap-enforcement DENY: could not derive the ReBAC resource for tool `{}` \
+                     (required cap `{cap}`) from its arguments — fail-closed (no execute)",
+                    def.name.0
+                ))
+            })?;
+
+            // THE REAL REBAC CHECK: does the run's verified principal hold `cap` on `resource`? The
+            // check derives the (tenant, region) scope from the subject's own token (tenant-from-token)
+            // and authorizes an agent exactly as it authorizes a human (never branches on kind).
+            let decision = self.identity.check(
+                &self.principal,
+                &Permission(cap.clone()),
+                &resource,
+                &strong_latest(),
+                None,
+            );
+            match decision {
+                Ok(Decision::Allow) => {} // this cap is granted — continue to the next.
+                // A Deny / Conditional (a caveat the tool path does not supply) / a check Err are ALL
+                // "not granted" → abort fail-closed. The loop tears the run down on this Err (the same
+                // teardown path a `validate_call` rejection takes); the inner executor never runs.
+                Ok(other) => {
+                    return Err(ToolExecError::Failed(format!(
+                        "cap-enforcement DENY: principal `{}` is not authorized for cap `{cap}` on \
+                         `{}` (decision {other:?}) — tool `{}` refused fail-closed",
+                        self.principal.principal_id.0,
+                        resource.0,
+                        def.name.0
+                    )));
+                }
+                Err(e) => {
+                    return Err(ToolExecError::Failed(format!(
+                        "cap-enforcement DENY: the ReBAC check for cap `{cap}` on `{}` failed \
+                         ({e:?}) — fail-closed (no execute)",
+                        resource.0
+                    )));
+                }
+            }
+        }
+
+        // Every required cap is granted (or there were none) — dispatch to the real executor.
+        self.inner.execute(def, call)
     }
 }
 

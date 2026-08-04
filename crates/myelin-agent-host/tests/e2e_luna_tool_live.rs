@@ -26,18 +26,23 @@
 
 use std::sync::Arc;
 
+use myelin_agent::{ToolCall, ToolCallId, ToolName};
 use myelin_agent_host::{
     git_check_status_read_tool_def, git_check_status_read_tool_schema, timestamp_from_epoch,
-    AgentHost, CreditKind, GitCheckStatusReadExecutor, LlmRunTask, MicroUsd, RunSubstrateWiring,
-    ToolCatalogue,
+    AgentHost, CapEnforcingExecutor, CreditKind, GitCheckStatusReadExecutor, LlmRunTask, MicroUsd,
+    RunSubstrateWiring, ToolCatalogue, GIT_READ_CHECK_STATUS_TOOL,
 };
 use myelin_agent_model::{LunaClient, ModelError};
+use myelin_agent_service::ToolExecutor;
 use myelin_config::MyelinConfig;
-use myelin_events::{MonotonicMinter, OutboxStore};
+use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
 use myelin_flow::WfJournal;
 use myelin_git::check_status_store::{CHECK_STATUS_TABLE, CREATE_CHECK_STATUS_DDL};
-use myelin_identity::{Principal, PrincipalId, PrincipalKind, RevokeTarget, RunId, RuntimeRef};
-use myelin_identity_service::{run_token_jti, RevocationStore, RunTokenState};
+use myelin_identity::{
+    IdentityService, ObjectId, Principal, PrincipalId, PrincipalKind, RelName, RelationTuple,
+    RevokeTarget, RunId, RuntimeRef, TupleDelta,
+};
+use myelin_identity_service::{run_token_jti, RevocationStore, RunTokenState, StoreBackedCheck, TupleStore};
 use myelin_storage::agent_wallet::agent_wallet_migrations;
 use myelin_storage::migration::{HotTables, Migration, Migrations};
 use myelin_storage::reserve_settle::CostLedger;
@@ -184,6 +189,40 @@ fn agent_principal(tenant: &TenantId) -> Principal {
     )
 }
 
+/// Build the REAL ReBAC decision engine (the same [`StoreBackedCheck::check`] a human's request flows
+/// through) over an in-memory tuple store. When `grant_pull` is set, seed a GENUINE
+/// `repo:core#pull@<agent>` grant through the real [`TupleStore::write_tuples`] path — under the SAME
+/// `(tenant, region)` scope the engine derives from the agent's own verified token — so the cap gate
+/// finds the grant and ALLOWS the tool. The tool's `repo` argument (`myelin://<tenant>/git/repo/core`)
+/// canonicalises to the `repo:core` tuple key, so this grant authorizes the run's exact call.
+fn rebac_engine_with_pull(agent: &Principal, grant_pull: bool) -> StoreBackedCheck {
+    let tuples = TupleStore::new(OutboxStore::new());
+    if grant_pull {
+        let scope = TenantScope::from_verified_token(agent, agent.region.clone());
+        let admin = Principal::stub(
+            PrincipalId("p-admin".into()),
+            PrincipalKind::Human,
+            agent.tenant.clone(),
+        );
+        tuples
+            .write_tuples(
+                &scope,
+                &admin,
+                &[TupleDelta::Add(RelationTuple {
+                    object: ObjectId("repo:core".into()),
+                    relation: RelName("pull".into()),
+                    subject: PrincipalId("psn:host-agent".into()),
+                    caveat: None,
+                })],
+                None,
+                None,
+                Timestamp("2026-06-19T00:00:00Z".into()),
+            )
+            .expect("seed the real `pull` grant via write_tuples");
+    }
+    StoreBackedCheck::new(tuples)
+}
+
 /// **The headline live drill: seed a check-status row, drive a real Luna run that INVOKES the read
 /// tool to fetch it, and assert the tool was CALLED, its real result reached the agent, the answer
 /// reflects it, and the wallet was debited for MULTIPLE turns — torn down cleanly.**
@@ -245,6 +284,13 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         tokio::runtime::Handle::current(),
         scope,
     );
+    // THE CAP GATE: the run's `git.read_check_status` tool declares `required_caps = ["pull"]`. Wrap
+    // the real read executor in the cap-enforcement checkpoint, which consults the REAL ReBAC engine
+    // for the agent principal's `pull` grant on the repo BEFORE the read runs — fail-closed if absent.
+    // We seed a genuine grant so the tool is ALLOWED and the drill passes end-to-end.
+    let rebac: Arc<dyn IdentityService + Send + Sync> =
+        Arc::new(rebac_engine_with_pull(&agent, /* grant_pull */ true));
+    let gated = CapEnforcingExecutor::for_git_read_tool(rebac, agent.clone(), &executor);
     let catalogue = ToolCatalogue::new([git_check_status_read_tool_def()]);
     let advertised = [git_check_status_read_tool_schema()];
 
@@ -276,8 +322,8 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
 
     // F1: the durable wallet is threaded non-optionally — a real paid tool run is always billed.
     let report = host
-        .run_llm_agent_with_tools(&task, &mut wiring, Box::new(luna), &catalogue, &executor, &advertised)
-        .expect("the live Luna tool run completes");
+        .run_llm_agent_with_tools(&task, &mut wiring, Box::new(luna), &catalogue, &gated, &advertised)
+        .expect("the live Luna tool run completes (the seeded `pull` grant ALLOWS the tool)");
 
     eprintln!("LIVE Luna tool answer: {:?}", report.answer);
     eprintln!("LIVE tool result the agent read: {:?}", executor.last_result());
@@ -364,4 +410,43 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     );
 
     eprintln!("LIVE real-Identity revocation: run token TornDown on the durable S7 denylist (durable across a fresh store instance)");
+
+    // ── THE CAP-ENFORCEMENT DENY GATE (the sibling proof): the SAME governed tool call, but with NO
+    //    `pull` grant for the agent, is DENIED fail-closed by the REAL ReBAC engine BEFORE the read
+    //    runs. This confirms the allowed run above passed BECAUSE of the seeded grant, not because the
+    //    cap is unenforced. We drive the executor directly (no second paid Luna turn) with the exact
+    //    validated arguments the run used. ──
+    let no_grant: Arc<dyn IdentityService + Send + Sync> =
+        Arc::new(rebac_engine_with_pull(&verify_agent, /* grant_pull */ false));
+    let probe_scope = TenantScope::from_verified_token(&verify_agent, Region(region_s.clone()));
+    let probe_exec = GitCheckStatusReadExecutor::new(
+        app.clone(),
+        app.clone(),
+        tokio::runtime::Handle::current(),
+        probe_scope,
+    );
+    let denied_gate =
+        CapEnforcingExecutor::for_git_read_tool(no_grant, verify_agent.clone(), &probe_exec);
+    let denied = denied_gate.execute(
+        &git_check_status_read_tool_def(),
+        &ToolCall {
+            id: ToolCallId("cap-deny-probe".into()),
+            name: ToolName(GIT_READ_CHECK_STATUS_TOOL.into()),
+            arguments: serde_json::json!({ "repo": repo, "commit": commit }),
+        },
+    );
+    assert!(
+        denied.is_err(),
+        "WITHOUT the `pull` grant the SAME tool call is DENIED fail-closed: {denied:?}"
+    );
+    assert!(
+        denied.unwrap_err().to_string().contains("cap-enforcement DENY"),
+        "the deny is the cap-enforcement gate (fail-closed)"
+    );
+    assert_eq!(
+        probe_exec.invocations(),
+        0,
+        "the real read NEVER ran on the denied cap (fail-closed, no execute)"
+    );
+    eprintln!("LIVE cap-enforcement: WITH the `pull` grant the tool was ALLOWED + executed; WITHOUT it the same call was DENIED fail-closed (real ReBAC check, no read)");
 }
