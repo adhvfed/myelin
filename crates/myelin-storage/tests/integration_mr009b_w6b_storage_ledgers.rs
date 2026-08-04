@@ -205,6 +205,77 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     );
     assert_eq!(cost2.cost_events_for(&tenant, &run).len(), 2);
 
+    // outstanding_reservations (unified-wallet slice 3) — the SUM(reserved) OVER 'reserved'/'inflight'
+    // rows, live on Pg (FORCE-RLS, with_tenant_tx). The affordability gate reads this so
+    // `available = balance − outstanding`. `run` above is already Settled → contributes 0.
+    assert_eq!(
+        cost2.outstanding_reservations(&tenant),
+        Ok(MicroUsd::ZERO),
+        "a fully-settled tenant has zero outstanding on Pg"
+    );
+    // Reserved counts; a second run marked InFlight adds to the sum.
+    let run_out_a = RunId::new(format!("run-out-a-{suffix}"));
+    let run_out_b = RunId::new(format!("run-out-b-{suffix}"));
+    cost2
+        .reserve(
+            tenant.clone(),
+            run_out_a.clone(),
+            MicroUsd(300),
+            MicroUsd(9_000),
+        )
+        .expect("reserve run_out_a");
+    assert_eq!(
+        cost2.outstanding_reservations(&tenant),
+        Ok(MicroUsd(300)),
+        "a Reserved row counts toward outstanding on Pg"
+    );
+    cost2
+        .reserve(
+            tenant.clone(),
+            run_out_b.clone(),
+            MicroUsd(500),
+            MicroUsd(9_000),
+        )
+        .expect("reserve run_out_b");
+    cost2.begin(&tenant, &run_out_b).expect("begin run_out_b");
+    assert_eq!(
+        cost2.outstanding_reservations(&tenant),
+        Ok(MicroUsd(800)),
+        "Reserved (300) + InFlight (500) = 800 outstanding on Pg"
+    );
+    // Settling run_out_a EXCLUDES it (money reconciled) → outstanding drops to run_out_b's 500.
+    cost2
+        .begin(&tenant, &run_out_a)
+        .expect("begin run_out_a before settle");
+    cost2
+        .settle(&tenant, &run_out_a, &[])
+        .expect("settle run_out_a");
+    assert_eq!(
+        cost2.outstanding_reservations(&tenant),
+        Ok(MicroUsd(500)),
+        "a Settled row is excluded from outstanding on Pg"
+    );
+    // A different tenant's live reservation is NOT summed into this tenant's outstanding (RLS +
+    // the explicit (tenant, region) predicate — no cross-tenant money path).
+    let other_tenant = TenantId(format!("01J0COSTX{suffix}"));
+    cost2
+        .reserve(
+            other_tenant.clone(),
+            RunId::new(format!("run-out-x-{suffix}")),
+            MicroUsd(7_777),
+            MicroUsd(9_000),
+        )
+        .expect("reserve for other tenant");
+    assert_eq!(
+        cost2.outstanding_reservations(&tenant),
+        Ok(MicroUsd(500)),
+        "another tenant's outstanding never bleeds into this tenant's (tenant-isolated on Pg)"
+    );
+    assert_eq!(
+        cost2.outstanding_reservations(&other_tenant),
+        Ok(MicroUsd(7_777))
+    );
+
     // Caller-transaction API: a rollback leaves both the reservation and event log untouched; the
     // same exact operation can then commit in a later scoped transaction.
     let run_tx = RunId::new(format!("run-tx-{suffix}"));

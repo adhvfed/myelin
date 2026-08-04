@@ -68,7 +68,10 @@ pub struct LlmRunTask {
     /// wallet debit.
     pub estimate: MicroUsd,
     pub now_secs: i64,
-    /// Nominal available balance the reserve gate reads.
+    /// Nominal available-balance floor, retained for the no-wallet reserve shape. The REAL hosted-run
+    /// path (`dispatch_core`) IGNORES this and reads the live wallet balance minus the tenant's
+    /// outstanding reservations instead (unified-wallet slice 3) — so a hosted run's affordability gate
+    /// is the actual prepaid balance, not this constant.
     pub available: MicroUsd,
     pub max_output_tokens: Option<u32>,
 }
@@ -508,6 +511,29 @@ fn dispatch_core(
     let mut telemetry = SkeletonTelemetry::new();
     let agent_loop = SkeletonAgent::new();
 
+    // ── REAL "no balance → no run": the reserve gate reads the ACTUAL prepaid wallet balance ────────
+    // The affordability gate's `available` is the tenant's live wallet balance MINUS the amount already
+    // committed to its unsettled reservations (`Reserved`/`InFlight`), saturating at 0. This makes the
+    // gate a real "can't afford `estimate` → can't dispatch" check, and makes it concurrency-correct: a
+    // second run reserving against the same balance sees `available` reduced by the first run's
+    // outstanding amount, so two runs cannot over-reserve past one balance. Both amounts are `MicroUsd`
+    // (unified money type) — no unit bridge, just a saturating subtract.
+    //
+    // `dispatch_core` ALWAYS has a real wallet (F1). The no-wallet skeleton/mock/drill paths build
+    // `RunSubstrate` directly with `wallet: None` and their own nominal `available` — they never reach
+    // here, so those runs stay BYTE-IDENTICAL (the reserved==settled drills are unaffected). The nominal
+    // `task.available` literal is retained only for those no-wallet shapes.
+    //
+    // ATOMICITY NOTE (v1 — documented, not built): reading `balance` + `outstanding` then reserving is
+    // three ops, NOT one atomic transaction, so under high concurrency a tiny TOCTOU over-reserve is
+    // possible, bounded by a single `estimate`. The fully-atomic reserve-against-(balance − outstanding)
+    // in one cross-ledger transaction is a named follow-on (unified-wallet slice 4+).
+    let outstanding = wiring
+        .ledger
+        .outstanding_reservations(&task.tenant)
+        .map_err(|e| AgentHostError::Run(SkeletonError::DispatchRefused(e.to_string())))?;
+    let available = MicroUsd(wallet.balance(&task.tenant).0.saturating_sub(outstanding.0));
+
     let mut sub = RunSubstrate {
         tenant: task.tenant.clone(),
         region,
@@ -523,7 +549,7 @@ fn dispatch_core(
         wallet: Some(wallet), // F1
         gate: &mut gate,
         ledger: wiring.ledger,
-        available: task.available,
+        available,
         estimate: task.estimate,
         outbox: wiring.outbox,
         minter: wiring.id_minter.clone(),

@@ -401,6 +401,18 @@ impl CostLedger {
             CostBackend::Durable(d) => d.inflight_interrupt_count(),
         }
     }
+
+    /// **Σ of this tenant's OUTSTANDING (unsettled) reservations** — dispatches to the live backend.
+    /// The affordability gate reads this so `available = balance − outstanding` (see
+    /// [`MemoryCostLedger::outstanding_reservations`]): a tenant cannot reserve past its wallet
+    /// balance, and two concurrent runs cannot both over-reserve against one balance.
+    pub fn outstanding_reservations(&self, tenant: &TenantId) -> Result<MicroUsd, ReserveError> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            CostBackend::Memory(m) => m.outstanding_reservations(tenant),
+            CostBackend::Durable(d) => d.outstanding_reservations(tenant),
+        }
+    }
 }
 
 /// **The in-memory reserve/settle core — the `test-support`-gated TEST DOUBLE (MR-009b W6b2).** A
@@ -652,6 +664,31 @@ impl MemoryCostLedger {
     /// invariant is structural, not hopeful).
     pub fn inflight_interrupt_count(&self) -> u64 {
         self.inflight_interrupt_count
+    }
+
+    /// **Σ of `reserved` over this tenant's UNSETTLED reservations** — the rows in state
+    /// [`Reserved`](ReservationState::Reserved) or [`InFlight`](ReservationState::InFlight) (a
+    /// `Settled`/`Cancelled` reservation is money already reconciled, so it is EXCLUDED). This is the
+    /// "committed-but-not-yet-billed" amount the affordability gate subtracts from the wallet balance
+    /// so `available = balance − outstanding`: a tenant cannot dispatch a run it cannot afford, and a
+    /// second concurrent reserve sees `available` reduced by the first's outstanding amount (it cannot
+    /// over-reserve past the balance). The Σ is CHECKED — an overflow is a loud
+    /// [`ReserveError::AmountOverflow`], never a silent wrap.
+    pub fn outstanding_reservations(&self, tenant: &TenantId) -> Result<MicroUsd, ReserveError> {
+        let mut total = MicroUsd::ZERO;
+        for reservation in self.reservations.values() {
+            if &reservation.tenant == tenant
+                && matches!(
+                    reservation.state,
+                    ReservationState::Reserved | ReservationState::InFlight
+                )
+            {
+                total = total
+                    .checked_add(reservation.reserved)
+                    .ok_or(ReserveError::AmountOverflow)?;
+            }
+        }
+        Ok(total)
     }
 }
 
@@ -1223,6 +1260,134 @@ mod tests {
         assert_eq!(
             ledger.cost_events_for(&other_tenant, &run())[0].wholesale,
             MicroUsd(300)
+        );
+    }
+
+    /// **`outstanding_reservations` sums the UNSETTLED reservations and EXCLUDES settled/cancelled.**
+    /// A `Reserved` and an `InFlight` reservation both count; a `Settled` and a `Cancelled` one do
+    /// not (that money is already reconciled). This is the amount the affordability gate subtracts
+    /// from the wallet balance.
+    #[test]
+    fn outstanding_sums_unsettled_and_excludes_settled_and_cancelled() {
+        let mut ledger = CostLedger::new();
+        // A funded tenant with a large ceiling so every reserve admits (we test the Σ, not the gate).
+        let big = MicroUsd(1_000_000);
+
+        // r_reserved stays Reserved (counts).
+        let r_reserved = RunId::new("01J0R_RESERVED");
+        ledger
+            .reserve(tenant(), r_reserved, MicroUsd(100), big)
+            .unwrap();
+
+        // r_inflight → InFlight (counts).
+        let r_inflight = RunId::new("01J0R_INFLIGHT");
+        ledger
+            .reserve(tenant(), r_inflight.clone(), MicroUsd(200), big)
+            .unwrap();
+        ledger.begin(&tenant(), &r_inflight).unwrap();
+
+        // r_settled → Settled (EXCLUDED — money reconciled).
+        let r_settled = RunId::new("01J0R_SETTLED");
+        ledger
+            .reserve(tenant(), r_settled.clone(), MicroUsd(400), big)
+            .unwrap();
+        ledger.begin(&tenant(), &r_settled).unwrap();
+        ledger.settle(&tenant(), &r_settled, &[]).unwrap();
+
+        // r_cancelled → Cancelled (EXCLUDED — refunded, never started).
+        let r_cancelled = RunId::new("01J0R_CANCELLED");
+        ledger
+            .reserve(tenant(), r_cancelled.clone(), MicroUsd(800), big)
+            .unwrap();
+        ledger.cancel_unstarted(&tenant(), &r_cancelled).unwrap();
+
+        // Σ = 100 (Reserved) + 200 (InFlight); the 400 Settled + 800 Cancelled are excluded.
+        assert_eq!(
+            ledger.outstanding_reservations(&tenant()),
+            Ok(MicroUsd(300))
+        );
+    }
+
+    /// **`outstanding_reservations` is tenant-isolated** — a different tenant's reservations are NOT
+    /// summed into this tenant's outstanding (the partition key; no cross-tenant money path).
+    #[test]
+    fn outstanding_is_tenant_isolated() {
+        let mut ledger = CostLedger::new();
+        let other = TenantId::from_token("01J0OTHER");
+        ledger
+            .reserve(tenant(), run(), MicroUsd(100), MicroUsd(1_000))
+            .unwrap();
+        ledger
+            .reserve(
+                other.clone(),
+                RunId::new("01J0R_OTHER"),
+                MicroUsd(500),
+                MicroUsd(1_000),
+            )
+            .unwrap();
+        assert_eq!(
+            ledger.outstanding_reservations(&tenant()),
+            Ok(MicroUsd(100)),
+            "only THIS tenant's outstanding is summed"
+        );
+        assert_eq!(
+            ledger.outstanding_reservations(&other),
+            Ok(MicroUsd(500))
+        );
+        // A tenant with no reservations has zero outstanding.
+        assert_eq!(
+            ledger.outstanding_reservations(&TenantId::from_token("01J0EMPTY")),
+            Ok(MicroUsd::ZERO)
+        );
+    }
+
+    /// **The concurrency-correctness point: a second reserve sees `available` reduced by the first's
+    /// outstanding amount.** With a balance of 1000 and a first run reserving 700, the remaining
+    /// affordable is `1000 − 700 = 300`: a second run estimating 400 is REFUSED (it cannot
+    /// over-reserve past the balance), while one estimating 300 is admitted. This is exactly the
+    /// `available = balance − outstanding` computation the agent-host gate performs.
+    #[test]
+    fn second_reserve_is_bounded_by_the_first_runs_outstanding() {
+        let mut ledger = CostLedger::new();
+        let balance = MicroUsd(1_000);
+
+        // First run reserves 700 against the full balance.
+        let run1 = RunId::new("01J0R_ONE");
+        ledger
+            .reserve(tenant(), run1, MicroUsd(700), balance)
+            .unwrap();
+
+        // The gate recomputes: available = balance − outstanding = 1000 − 700 = 300.
+        let outstanding = ledger.outstanding_reservations(&tenant()).unwrap();
+        let available = MicroUsd(balance.0.saturating_sub(outstanding.0));
+        assert_eq!(available, MicroUsd(300));
+
+        // A second run needing 400 cannot be afforded against the reduced available — REFUSED.
+        let run2 = RunId::new("01J0R_TWO");
+        let err = ledger
+            .reserve(tenant(), run2.clone(), MicroUsd(400), available)
+            .expect_err("the second run over-reserves past the balance");
+        assert_eq!(
+            err,
+            ReserveError::InsufficientBalance {
+                requested: MicroUsd(400),
+                available: MicroUsd(300),
+            }
+        );
+        assert!(
+            ledger.state_of(&tenant(), &run2).is_none(),
+            "the refused second run wrote no reservation"
+        );
+
+        // A second run needing exactly 300 IS afforded (the boundary is `available < amount`).
+        let run3 = RunId::new("01J0R_THREE");
+        ledger
+            .reserve(tenant(), run3, MicroUsd(300), available)
+            .expect("a run within the remaining balance is admitted");
+        // Outstanding now reflects both live runs: 700 + 300 = 1000.
+        assert_eq!(
+            ledger.outstanding_reservations(&tenant()),
+            Ok(MicroUsd(1_000))
         );
     }
 

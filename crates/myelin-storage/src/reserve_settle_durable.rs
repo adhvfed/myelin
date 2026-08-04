@@ -444,6 +444,39 @@ impl DurableCostLedger {
         0
     }
 
+    /// **Σ of `reserved` over this tenant's UNSETTLED reservations** — one tenant-scoped
+    /// `with_tenant_tx` (FORCE-RLS + the explicit `(tenant, region)` predicate, the module's query
+    /// convention): `SELECT COALESCE(SUM(reserved), 0)` over the rows whose `state` is `'reserved'` or
+    /// `'inflight'` (the [`state_token`] encoding — a `'settled'`/`'cancelled'` row is money already
+    /// reconciled and is EXCLUDED). The affordability gate subtracts this from the wallet balance
+    /// (`available = balance − outstanding`).
+    ///
+    /// `SUM(bigint)` is a `numeric` in Postgres; the `::bigint` cast keeps the total in the ledger's
+    /// `u64` domain and raises a LOUD (fail-static) store fault on a bigint overflow — never a silent
+    /// wrap. The `Result` is for parity with the memory arm
+    /// ([`super::reserve_settle::MemoryCostLedger::outstanding_reservations`], which returns the typed
+    /// [`ReserveError::AmountOverflow`]); the durable Σ overflow surfaces as the fail-static fault, not
+    /// this typed arm.
+    pub fn outstanding_reservations(&self, tenant: &TenantId) -> Result<MicroUsd, ReserveError> {
+        let region = self.region();
+        let tenant_s = tenant.0.clone();
+        let sum: i64 = self.block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT COALESCE(SUM(reserved), 0)::bigint FROM cost_reservation \
+                     WHERE tenant_id = $1 AND region = $2 \
+                       AND state IN ('reserved', 'inflight')",
+                )
+                .bind(&tenant_s)
+                .bind(&region)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|e| crate::pg::PgError::Query(e.to_string()))
+            })
+        }));
+        Ok(MicroUsd(sum as u64))
+    }
+
     /// Every cost event recorded for a `(tenant, run)` (the durable audit) — owned rows (the durable
     /// arm cannot lend a reference into the DB).
     pub fn cost_events_for(&self, tenant: &TenantId, run: &RunId) -> Vec<CostEvent> {
