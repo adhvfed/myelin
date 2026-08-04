@@ -485,6 +485,46 @@ pub enum HitlOutcome {
     Halted(Halted),
 }
 
+/// **RESUME: settle a `Waiting` gate on the human's [`WaitDecision`] — the ONE place the
+/// approve→admit ORDER lives.** This is the shared three-way decision block both loop drivers
+/// (single-effect [`run_hitl_loop`] and batch `run_batch_hitl_loop`) call, so the security-critical
+/// ordering — `approve()` transitions the gate THEN `admit()` threads its per-(tool, object) key into
+/// `approved` — is written once, not duplicated:
+///
+/// - `Ok(())` — the gate was APPROVED and its key ADMITTED to `approved` (the re-run applies THAT
+///   effect). The caller does any post-approval bookkeeping (e.g. the batch records the per-effect
+///   apply in its ledger) and builds its own approved-outcome.
+/// - `Err(halted)` — the gate was HALTED (`Reject` → [`Halted::Rejected`], `Expired` →
+///   [`Halted::Expired`]); the key is NEVER admitted, so the effect is never applied (0 mutation, AG-8).
+///
+/// The gate is freshly `Waiting`, so every transition is infallible — the `.expect(...)` messages are
+/// the load-bearing invariant assertions (a non-`Waiting` gate here is a caller bug).
+pub(crate) fn resolve_decision(
+    gate: &mut HitlGate,
+    decision: WaitDecision,
+    approved: &mut ApprovedTools,
+) -> Result<(), Halted> {
+    match decision {
+        WaitDecision::Approve => {
+            // approve is infallible here (the gate is freshly Waiting); admit the tool so the re-run
+            // applies the effect (the caller re-runs apply_planned with the populated approved set).
+            gate.approve().expect("a freshly-opened gate is Waiting");
+            approved.admit(gate); // thread the tool into `approved` (idempotent).
+            Ok(())
+        }
+        WaitDecision::Reject(reason) => {
+            let halted = gate
+                .reject(reason)
+                .expect("a freshly-opened gate is Waiting");
+            Err(halted)
+        }
+        WaitDecision::Expired => {
+            let halted = gate.expire().expect("a freshly-opened gate is Waiting");
+            Err(halted)
+        }
+    }
+}
+
 /// **Drive the withhold → surface → resume loop for ONE gated effect.** Given the `Gated` verdict's
 /// [`GateId`], the [`PlannedEffect`], the approver set, and the durable-wait + approved-set seams:
 ///
@@ -529,25 +569,11 @@ pub fn run_hitl_loop<W: HitlWait>(
     let _card = surface_card(&gate);
     let decision = wait.park_and_wait(&gate);
 
-    // 4. RESUME — transition the gate per the decision + thread the result.
-    match decision {
-        WaitDecision::Approve => {
-            // approve is infallible here (the gate is freshly Waiting); admit the tool so the re-run
-            // applies the effect (the caller re-runs apply_planned with the populated approved set).
-            gate.approve().expect("a freshly-opened gate is Waiting");
-            approved.admit(&gate); // thread the tool into `approved` (idempotent).
-            HitlOutcome::Approved(gate)
-        }
-        WaitDecision::Reject(reason) => {
-            let halted = gate
-                .reject(reason)
-                .expect("a freshly-opened gate is Waiting");
-            HitlOutcome::Halted(halted)
-        }
-        WaitDecision::Expired => {
-            let halted = gate.expire().expect("a freshly-opened gate is Waiting");
-            HitlOutcome::Halted(halted)
-        }
+    // 4. RESUME — transition the gate per the decision + thread the result (the approve→admit order
+    //    lives in the shared `resolve_decision`).
+    match resolve_decision(&mut gate, decision, approved) {
+        Ok(()) => HitlOutcome::Approved(gate),
+        Err(halted) => HitlOutcome::Halted(halted),
     }
 }
 

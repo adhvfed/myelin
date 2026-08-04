@@ -87,7 +87,8 @@
 
 use crate::effect_api::PlannedEffect;
 use crate::hitl::{
-    surface_card, ApprovedTools, Halted, HitlCard, HitlGate, RiskSummary, WaitDecision,
+    resolve_decision, surface_card, ApprovedTools, Halted, HitlCard, HitlGate, RiskSummary,
+    WaitDecision,
 };
 use myelin_agent::GateId;
 use myelin_identity::PrincipalId;
@@ -362,13 +363,14 @@ pub fn run_batch_hitl_loop<W: BatchHitlWait>(
         let mut gate = card.open_gate(idx);
         // 2 + 3. DECIDE — park on THIS effect's per-effect durable wait (keyed on idem_key, 9.1).
         let decision = wait.park_and_wait_effect(&gate, &idem_key);
-        // 4. RESUME — settle this effect on ITS own decision (independent of the other effects).
-        let outcome = match decision {
-            WaitDecision::Approve => {
-                gate.approve().expect("a freshly-opened gate is Waiting");
-                // thread THIS effect's per-(tool, object) gate key into `approved` (idempotent;
-                // R2.4 — never the bare tool name, so a declined sibling is never admitted).
-                approved.admit(&gate);
+        // 4. RESUME — settle this effect on ITS own decision (independent of the other effects). The
+        //    approve→admit order lives in the shared `resolve_decision`; the batch-specific ledger
+        //    record stays HERE (after admit), so the approved-set threading is byte-identical to the
+        //    single-effect driver.
+        let outcome = match resolve_decision(&mut gate, decision, approved) {
+            // approved + its per-(tool, object) gate key admitted (R2.4 — never the bare tool name,
+            // so a declined sibling is never admitted).
+            Ok(()) => {
                 // record the apply under the per-effect key — EXACTLY ONCE (a double-click re-sends
                 // the same key → `record` returns false → no second apply; AG-D5 exactly-once).
                 ledger.record(&idem_key);
@@ -377,17 +379,8 @@ pub fn run_batch_hitl_loop<W: BatchHitlWait>(
                     tool: gate.tool_name.clone(),
                 }
             }
-            WaitDecision::Reject(reason) => {
-                let halted = gate
-                    .reject(reason)
-                    .expect("a freshly-opened gate is Waiting");
-                // the declined effect is WITHHELD — never admitted, never recorded (0 mutation, AG-8).
-                EffectOutcome::Withheld { idem_key, halted }
-            }
-            WaitDecision::Expired => {
-                let halted = gate.expire().expect("a freshly-opened gate is Waiting");
-                EffectOutcome::Withheld { idem_key, halted }
-            }
+            // the declined effect is WITHHELD — never admitted, never recorded (0 mutation, AG-8).
+            Err(halted) => EffectOutcome::Withheld { idem_key, halted },
         };
         outcomes.push(outcome);
     }
