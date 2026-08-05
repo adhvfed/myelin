@@ -17,8 +17,9 @@ fn edge_shutdown_reaches_active_git_wire_containers() {
         .expect("durable Git backend");
     let executor = fs::read_to_string(root.join("crates/myelin-edge/src/git_wire_exec.rs"))
         .expect("Git wire executor");
-    let gvisor = fs::read_to_string(root.join("crates/myelin-ci-sandbox/src/gvisor.rs"))
-        .expect("gVisor backend");
+    let gvisor =
+        fs::read_to_string(root.join("crates/myelin-ci-sandbox/src/gvisor/output_capture.rs"))
+            .expect("gVisor output capture");
 
     for required in [
         "git_shutdown_for_signal.store(true, Ordering::Release)",
