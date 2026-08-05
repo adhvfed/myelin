@@ -179,7 +179,7 @@ const BASELINE: &[(&str, &str, usize)] = &[
     (
         "no-structural-crypto-in-prod",
         "crates/myelin-ci-controlplane/src/residency_drill.rs",
-        444,
+        224,
     ),
 ];
 
@@ -374,9 +374,9 @@ fn the_baseline_is_non_empty_and_internally_consistent() {
         has(
             "no-structural-crypto-in-prod",
             "crates/myelin-ci-controlplane/src/residency_drill.rs",
-            444
+            224
         ),
-        "anchor residency_drill.rs:444 (the surviving CI attestation floor) must be in the baseline"
+        "anchor residency_drill.rs:224 (the surviving CI attestation floor) must be in the baseline"
     );
     assert!(
         !has(

@@ -165,8 +165,9 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
             serde_json::json!({"provider": "ci", "name": "build"}),
             serde_json::json!({"provider": "ci", "name": "test"}),
             serde_json::json!({"provider": "ci", "name": "clippy"}),
+            serde_json::json!({"provider": "ci", "name": "gates"}),
         ],
-        "exactly the three build/test/clippy check contexts are queued"
+        "exactly the four build/test/clippy/gates check contexts are queued"
     );
 
     let snapshot_ref = &armed.handoff.run_write.definition_snapshot.0;
