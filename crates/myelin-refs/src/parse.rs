@@ -721,20 +721,16 @@ mod tests {
                         Some(s) => format!("{scheme}{body}#{s}"),
                         None => format!("{scheme}{body}"),
                     };
-                    match parse(&input) {
-                        Ok(r) => {
-                            assert!(
-                                input.starts_with(SCHEME),
-                                "guessed a scope for a scheme-less input `{input}`"
-                            );
-                            if format(&r) != input {
-                                round_trip_failures += 1;
-                            }
-                            let re = parse(&format(&r)).expect("canonical re-parses");
-                            assert_eq!(re, r, "canonical form is not a fixed point for `{input}`");
+                    if let Ok(r) = parse(&input) {
+                        assert!(
+                            input.starts_with(SCHEME),
+                            "guessed a scope for a scheme-less input `{input}`"
+                        );
+                        if format(&r) != input {
+                            round_trip_failures += 1;
                         }
-                        Err(_) => {
-                        }
+                        let re = parse(&format(&r)).expect("canonical re-parses");
+                        assert_eq!(re, r, "canonical form is not a fixed point for `{input}`");
                     }
                 }
             }
