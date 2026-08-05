@@ -958,7 +958,7 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
         advertise_command,
         cancellation,
         zero,
-        false,
+        false, // this is the FIRST hop of the whole transport -- nothing has run yet.
         advertise_permit,
         execute,
     )?;
@@ -1052,7 +1052,7 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
         fetch_command,
         cancellation,
         usage_after_advertise,
-        true,
+        true, // the advertisement hop above already completed.
         fetch_permit,
         execute,
     )?;

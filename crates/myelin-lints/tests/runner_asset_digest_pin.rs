@@ -2,7 +2,7 @@ use myelin_ci_sandbox::{canonical_tree_sha256_hex, file_sha256_hex};
 use myelin_ci_sandbox::{
     CARGO_VENDOR_SMOKE_LOCK_SHA256, CARGO_VENDOR_SMOKE_TREE_SHA256,
     CARGO_VENDOR_WORKSPACE_LOCK_SHA256, CARGO_VENDOR_WORKSPACE_TREE_SHA256, GVISOR_GIT_ROOTFS_SHA256,
-    LINUX_RUST_V1_ROOTFS_SHA256, LINUX_SMALL_V1_ROOTFS_SHA256,
+    LINUX_RUST_V1_ROOTFS_SHA256,
 };
 use serde::Deserialize;
 use std::fs;
@@ -240,21 +240,24 @@ fn rust_and_small_rootfs_constants_are_mechanically_synced_to_their_toml_sources
     );
 
     let ci = load_real_ci_toml();
-    let job = ci
-        .jobs
-        .first()
-        .expect(".myelin/ci.toml must have at least one [[jobs]] row");
-    let small_embedded = parse_sha256_digest(&job.image).unwrap_or_else(|| {
-        panic!(
-            ".myelin/ci.toml's job `image` (`{}`) must be `...@sha256:<64-hex>`",
-            job.image
-        )
-    });
-    assert_eq!(
-        LINUX_SMALL_V1_ROOTFS_SHA256, small_embedded,
-        "gvisor.rs's LINUX_SMALL_V1_ROOTFS_SHA256 constant has drifted from the digest embedded in \
-         .myelin/ci.toml's job `image` field"
+    assert!(
+        !ci.jobs.is_empty(),
+        ".myelin/ci.toml must have at least one [[jobs]] row"
     );
+    for job in &ci.jobs {
+        let embedded = parse_sha256_digest(&job.image).unwrap_or_else(|| {
+            panic!(
+                ".myelin/ci.toml's job `image` (`{}`) must be `...@sha256:<64-hex>`",
+                job.image
+            )
+        });
+        assert_eq!(
+            LINUX_RUST_V1_ROOTFS_SHA256, embedded,
+            "gvisor.rs's LINUX_RUST_V1_ROOTFS_SHA256 constant has drifted from the digest embedded \
+             in .myelin/ci.toml's `{}` job `image` field",
+            job.name
+        );
+    }
 }
 
 #[test]

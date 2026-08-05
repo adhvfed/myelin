@@ -139,6 +139,9 @@ pub(crate) use checkout_preparation::{
 #[cfg(feature = "test-support")]
 pub mod runsc_driver;
 
+// ══════ the test and test-support modules ══════
+// declared LAST: source_pins::production_source() cuts this file at this banner.
+
 #[cfg(test)]
 mod test_fixtures;
 
