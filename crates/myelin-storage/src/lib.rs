@@ -20,7 +20,7 @@ pub mod bus_shred;
 pub mod cache;
 pub mod cell_migration;
 pub mod coloc;
-pub mod dogfood;
+pub mod self_tenant;
 pub mod holder;
 pub mod key_origin;
 pub mod kms;
@@ -100,13 +100,13 @@ pub use ci_log_index::{
     CI_LOG_STREAM,
 };
 pub use coloc::{ColocError, ColocatedOltp, ColocatedTx, COLOCATED_OUTBOX_MIGRATION};
-pub use dogfood::{
-    proven_storage_rows, DogfoodCorpus, DogfoodGreenArtifact, DogfoodRecord, DogfoodStore,
+pub use self_tenant::{
+    proven_storage_rows, SelfTenantCorpus, SelfTenantGreenArtifact, SelfTenantRecord, SelfTenantStore,
     IncidentDrillTicket, IncidentIssueDraft, ProvenRow, StorageIncident, TruthUpPass, TruthUpRed,
     TruthUpVerdict,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use dogfood::run_restore_verify_on_dogfood;
+pub use self_tenant::run_restore_verify_on_self_tenant;
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e3_reindex_parity::{
     run_e2e3_storage_half, DerivedReindexSource, DerivedStoreClass, DerivedStoreParity,

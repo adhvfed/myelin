@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Myelin BACKUP/RESTORE DRILL (R4.3) — capture the LIVE dogfood data (Postgres OLTP + the on-disk git
+# Myelin BACKUP/RESTORE DRILL (R4.3) — capture the LIVE self-host data (Postgres OLTP + the on-disk git
 # object tier), RESTORE it into a CLEAN target, and VERIFY the restore reads back byte-identical.
 #
 # This is the master-plan Tier-0 promise made a REPEATABLE DRILL, not a one-off: run it on a schedule
@@ -11,20 +11,20 @@
 #
 # What it proves:
 #   • Postgres: a `pg_dump` of the live `myelin` DB restores into a FRESH database with identical row
-#     counts for every dogfood-bearing table (principals, ReBAC tuples, the cell token root, outbox, …).
+#     counts for every self-host-bearing table (principals, ReBAC tuples, the cell token root, outbox, …).
 #   • Git object tier: every on-disk bare repo under MYELIN_GIT_ROOT, archived and extracted into a
 #     CLEAN root, `git fsck`es clean and advertises byte-identical ref→oid sets (destructive-restore
 #     parity — the same property `myelin_git::backup::destructive_restore…reads_back_identical` asserts).
 #
-# Scope note: the git dogfood repos are on-disk bare repos (GT-001), so the essential git state is
+# Scope note: the git self-host repos are on-disk bare repos (GT-001), so the essential git state is
 # PG (refs/PR/authz rows) + the on-disk object tier captured here. The S3/RustFS blob tier holds large
 # LFS-class objects; a full DR runbook also snapshots the bucket (documented at the tail) — this drill
-# proves the two tiers the dogfood cutover actually populated.
+# proves the two tiers the self-host cutover actually populated.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# ── Config (env-overridable; defaults match scripts/dogfood.sh + docker-compose.dev.yml) ──
+# ── Config (env-overridable; defaults match scripts/self-host.sh + docker-compose.dev.yml) ──
 PG_CONTAINER="${MYELIN_PG_CONTAINER:-myelin-postgres}"
 PG_USER="${MYELIN_PG_ADMIN_USER:-myelin_admin}"
 PG_DB="${MYELIN_PG_DB:-myelin}"
@@ -38,13 +38,13 @@ log()  { echo "backup-drill: $*" >&2; }
 fail() { echo "backup-drill: FAIL — $*" >&2; exit 1; }
 psql_admin() { docker exec -e PGPASSWORD="${MYELIN_PG_ADMIN_PW:-myelin_dev_pw}" "${PG_CONTAINER}" psql -U "${PG_USER}" "$@"; }
 
-# The dogfood-bearing tables whose row counts must survive the round trip (loud if a table is missing).
+# The self-host-bearing tables whose row counts must survive the round trip (loud if a table is missing).
 VERIFY_TABLES=(principal rebac_tuple cell_token_root outbox kms_sealed_root revocation check_status)
 
 run_drill() {
   command -v docker >/dev/null 2>&1 || fail "docker is required (the dev PG runs in ${PG_CONTAINER})"
   docker inspect "${PG_CONTAINER}" >/dev/null 2>&1 || fail "PG container ${PG_CONTAINER} not found — bring the stack up (scripts/dev-stack.sh up)"
-  [[ -d "${GIT_ROOT}" ]] || fail "git object root ${GIT_ROOT} absent — nothing to back up (run the dogfood flow first)"
+  [[ -d "${GIT_ROOT}" ]] || fail "git object root ${GIT_ROOT} absent — nothing to back up (run the self-host flow first)"
 
   mkdir -p "${WORK}"
   log "drill ${STAMP} — capturing live state into ${WORK}"
@@ -154,6 +154,6 @@ esac
 #   systemctl --user enable --now myelin-backup-drill.timer
 # or cron:  0 4 * * *  /home/adhv/Projects/myelin/scripts/backup-drill.sh run >> ~/.local/state/myelin/backup-drill.log 2>&1
 #
-# Full-DR extension (beyond this dogfood drill): also `aws s3 sync s3://<bucket> <target>` (RustFS/
+# Full-DR extension (beyond this self-host drill): also `aws s3 sync s3://<bucket> <target>` (RustFS/
 # Scaleway Object Storage) for the T2 blob tier, and ship pg.dump + git-data.tgz off-host (the 3-2-1
 # rule). This drill proves the RESTORE PATH works; off-siting is an ops-runbook concern (R5.3).

@@ -1,6 +1,6 @@
 use myelin_substrate::thresholds::{KnowledgeSwitchTestThreshold, Thresholds};
 
-use crate::dogfood::myelin_knowledge_space;
+use crate::self_tenant::myelin_knowledge_space;
 use crate::editor::{Document, EditorBlock};
 use crate::refs_glue::{PageMeta, PageStore, Projected, Projector, TombstoneReason};
 

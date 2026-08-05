@@ -29,7 +29,7 @@ fn the_reference_graph_runs_on_myelins_own_work() {
 
     let line = artifact.summary();
     assert!(
-        line.contains("P-513 REFS DOGFOOD 2026-06-26") && line.contains("verdict=GREEN"),
+        line.contains("P-513 REFS SELF_TENANT 2026-06-26") && line.contains("verdict=GREEN"),
         "dated artifact: {line}"
     );
     println!("{line}");
@@ -71,17 +71,17 @@ fn the_truth_up_pass_confirms_every_proven_refs_row_is_dated() {
 #[test]
 fn a_refs_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     let incident = RefsIncident::new(
-        "INC-REFS-DOGFOOD-1",
+        "INC-REFS-SELF_TENANT-1",
         "REF-D1",
         "a resolve chokepoint regression leaked a denied issue title on the Myelin self-tenant",
-        "repro_ref_d1_dogfood_resolve_leak",
+        "repro_ref_d1_self_tenant_resolve_leak",
     );
 
     let draft = incident.issue_draft();
     assert_eq!(draft.gate_id, "REF-D1");
-    assert!(draft.title.contains("INC-REFS-DOGFOOD-1"));
+    assert!(draft.title.contains("INC-REFS-SELF_TENANT-1"));
     assert!(
-        draft.body.contains("repro_ref_d1_dogfood_resolve_leak"),
+        draft.body.contains("repro_ref_d1_self_tenant_resolve_leak"),
         "the issue is reference-linked to its repro drill: {}",
         draft.body
     );
@@ -92,10 +92,10 @@ fn a_refs_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     registry.register_drill(DrillScenario::new(
         drill_name.clone(),
         move |ctx: &mut DrillContext| {
-            let dogfood = run_refs_over_myelins_own_work(RUN_DATE);
+            let self_tenant = run_refs_over_myelins_own_work(RUN_DATE);
             ctx.signals.set_scalar(
                 SignalName::DeadLetterCount,
-                if dogfood.is_green() && dogfood.total_leaks() == 0 {
+                if self_tenant.is_green() && self_tenant.total_leaks() == 0 {
                     0
                 } else {
                     1
@@ -127,12 +127,12 @@ fn a_refs_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
 }
 
 #[test]
-fn dogfood_loop_end_to_end_self_hosting() {
-    let dogfood = run_refs_over_myelins_own_work(RUN_DATE);
+fn self_tenant_loop_end_to_end_self_hosting() {
+    let self_tenant = run_refs_over_myelins_own_work(RUN_DATE);
     assert!(
-        dogfood.is_green() && dogfood.total_leaks() == 0,
+        self_tenant.is_green() && self_tenant.total_leaks() == 0,
         "the reference graph is green on Myelin's own work: {}",
-        dogfood.summary()
+        self_tenant.summary()
     );
 
     let rows = proven_refs_rows(RUN_DATE);
@@ -142,10 +142,10 @@ fn dogfood_loop_end_to_end_self_hosting() {
     assert!(confirmed >= 13);
 
     let incident = RefsIncident::new(
-        "INC-REFS-DOGFOOD-E2E",
+        "INC-REFS-SELF_TENANT-E2E",
         "E2E-3",
         "a spec-to-ship lineage traverse dropped a reindex-parity node under a doc-edit surge",
-        "repro_e2e3_dogfood_lineage_reindex_parity",
+        "repro_e2e3_self_tenant_lineage_reindex_parity",
     );
     let _draft = incident.issue_draft();
     let ticket = incident.drill_ticket();
@@ -163,7 +163,7 @@ fn dogfood_loop_end_to_end_self_hosting() {
     assert!(registry.all_green(), "the incident's repro re-runs green");
 
     println!(
-        "[P-513 DOGFOOD LOOP GREEN {RUN_DATE}] self-hosting: the reference graph runs on Myelin's own \
+        "[P-513 SELF_TENANT LOOP GREEN {RUN_DATE}] self-hosting: the reference graph runs on Myelin's own \
          work (PR-pane + spec-to-ship + holder-fanout green, 0 leak); truth-up confirms {confirmed} \
          PROVEN Refs rows dated; incident→issue→repro-drill registered + re-runs green"
     );

@@ -438,23 +438,23 @@ pub fn run_myelin_sla_timer() -> SlaFace {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the dogfood artifact must be checked - an unread RED face silently claims a green the \
+#[must_use = "the self_tenant artifact must be checked - an unread RED face silently claims a green the \
               engine did not earn on Myelin's own work (EI-01 §1/§3)"]
-pub struct FlowDogfoodArtifact {
+pub struct FlowSelfTenantArtifact {
     pub date: String,
     pub pipeline: PipelineFace,
     pub merge_queue: MergeFace,
     pub sla_timer: SlaFace,
 }
 
-impl FlowDogfoodArtifact {
+impl FlowSelfTenantArtifact {
     pub fn is_green(&self) -> bool {
         self.pipeline.is_green() && self.merge_queue.is_green() && self.sla_timer.is_green()
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "P-516 FLOW DOGFOOD {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
+            "P-516 FLOW SELF_TENANT {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
              ci-pipeline={} merge-queue={} sla-timer={} verdict={}",
             self.date,
             self.pipeline.is_green(),
@@ -465,8 +465,8 @@ impl FlowDogfoodArtifact {
     }
 }
 
-pub fn run_flow_over_myelins_own_work(date: &str) -> FlowDogfoodArtifact {
-    FlowDogfoodArtifact {
+pub fn run_flow_over_myelins_own_work(date: &str) -> FlowSelfTenantArtifact {
+    FlowSelfTenantArtifact {
         date: date.to_string(),
         pipeline: run_myelin_ci_pipeline(),
         merge_queue: run_myelin_merge_queue(),
@@ -908,7 +908,7 @@ mod tests {
         );
 
         let s = artifact.summary();
-        assert!(s.contains("P-516 FLOW DOGFOOD 2026-06-26"), "dated: {s}");
+        assert!(s.contains("P-516 FLOW SELF_TENANT 2026-06-26"), "dated: {s}");
         assert!(s.contains("verdict=GREEN"), "verdict: {s}");
         assert!(
             s.contains("tenant=myelin") && s.contains("region=fr-par"),
@@ -985,22 +985,22 @@ mod tests {
     #[test]
     fn an_incident_files_an_issue_and_a_repro_drill_ticket() {
         let incident = FlowIncident::new(
-            "INC-FLOW-DOGFOOD-1",
+            "INC-FLOW-SELF_TENANT-1",
             "FLOW-D1",
             "a replay-recovery regression dropped a journaled effect on the Myelin self-tenant",
-            "repro_flow_d1_dogfood_replay_recovery",
+            "repro_flow_d1_self_tenant_replay_recovery",
         );
         let draft = incident.issue_draft();
         assert_eq!(draft.gate_id, "FLOW-D1");
-        assert!(draft.title.contains("INC-FLOW-DOGFOOD-1"));
+        assert!(draft.title.contains("INC-FLOW-SELF_TENANT-1"));
         assert!(
-            draft.body.contains("repro_flow_d1_dogfood_replay_recovery"),
+            draft.body.contains("repro_flow_d1_self_tenant_replay_recovery"),
             "the issue is reference-linked to its repro drill: {}",
             draft.body
         );
         assert!(!draft.body.to_lowercase().contains("email"));
         let ticket = incident.drill_ticket();
-        assert_eq!(ticket.drill_name, "repro_flow_d1_dogfood_replay_recovery");
+        assert_eq!(ticket.drill_name, "repro_flow_d1_self_tenant_replay_recovery");
         assert_eq!(ticket.gate_id, "FLOW-D1");
     }
 }

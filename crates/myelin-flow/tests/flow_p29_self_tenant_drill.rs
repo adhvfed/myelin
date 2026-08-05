@@ -49,7 +49,7 @@ fn myelins_own_workflows_run_on_the_self_hosting_platform() {
 
     let line = artifact.summary();
     assert!(
-        line.contains("P-516 FLOW DOGFOOD 2026-06-26") && line.contains("verdict=GREEN"),
+        line.contains("P-516 FLOW SELF_TENANT 2026-06-26") && line.contains("verdict=GREEN"),
         "dated artifact: {line}"
     );
     println!("{line}");
@@ -92,17 +92,17 @@ fn the_truth_up_pass_confirms_every_proven_flow_row_is_dated() {
 #[test]
 fn a_flow_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     let incident = FlowIncident::new(
-        "INC-FLOW-DOGFOOD-1",
+        "INC-FLOW-SELF_TENANT-1",
         "FLOW-D1",
         "a replay-recovery regression dropped a journaled effect on the Myelin self-tenant",
-        "repro_flow_d1_dogfood_replay_recovery",
+        "repro_flow_d1_self_tenant_replay_recovery",
     );
 
     let draft = incident.issue_draft();
     assert_eq!(draft.gate_id, "FLOW-D1");
-    assert!(draft.title.contains("INC-FLOW-DOGFOOD-1"));
+    assert!(draft.title.contains("INC-FLOW-SELF_TENANT-1"));
     assert!(
-        draft.body.contains("repro_flow_d1_dogfood_replay_recovery"),
+        draft.body.contains("repro_flow_d1_self_tenant_replay_recovery"),
         "the issue is reference-linked to its repro drill: {}",
         draft.body
     );
@@ -113,10 +113,10 @@ fn a_flow_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     registry.register_drill(DrillScenario::new(
         drill_name.clone(),
         move |ctx: &mut DrillContext| {
-            let dogfood = run_flow_over_myelins_own_work(RUN_DATE);
+            let self_tenant = run_flow_over_myelins_own_work(RUN_DATE);
             ctx.signals.set_scalar(
                 SignalName::DeadLetterCount,
-                if dogfood.is_green() { 0 } else { 1 },
+                if self_tenant.is_green() { 0 } else { 1 },
             );
             ctx.signals
                 .assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
@@ -144,12 +144,12 @@ fn a_flow_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
 }
 
 #[test]
-fn dogfood_loop_end_to_end_self_hosting() {
-    let dogfood = run_flow_over_myelins_own_work(RUN_DATE);
+fn self_tenant_loop_end_to_end_self_hosting() {
+    let self_tenant = run_flow_over_myelins_own_work(RUN_DATE);
     assert!(
-        dogfood.is_green(),
+        self_tenant.is_green(),
         "Myelin's pipelines/merge-queue/SLA-timers run green as myelin-flow workflows: {}",
-        dogfood.summary()
+        self_tenant.summary()
     );
 
     let rows = proven_flow_rows(RUN_DATE);
@@ -159,10 +159,10 @@ fn dogfood_loop_end_to_end_self_hosting() {
     assert!(confirmed >= 11);
 
     let incident = FlowIncident::new(
-        "INC-FLOW-DOGFOOD-E2E",
+        "INC-FLOW-SELF_TENANT-E2E",
         "E2E-2",
         "a merge-queue wake double-merged a Myelin PR under an at-least-once ci.result re-delivery",
-        "repro_e2e2_dogfood_merge_queue_exactly_once",
+        "repro_e2e2_self_tenant_merge_queue_exactly_once",
     );
     let _draft = incident.issue_draft();
     let ticket = incident.drill_ticket();
@@ -181,7 +181,7 @@ fn dogfood_loop_end_to_end_self_hosting() {
     assert!(registry.all_green(), "the incident's repro re-runs green");
 
     println!(
-        "[P-516 DOGFOOD LOOP GREEN {RUN_DATE}] self-hosting: Myelin's own pipelines/merge-queue/\
+        "[P-516 SELF_TENANT LOOP GREEN {RUN_DATE}] self-hosting: Myelin's own pipelines/merge-queue/\
          SLA-timers run as myelin-flow workflows (ci-pipeline + merge-queue(merge==1) + sla-timer fired, \
          all green); truth-up confirms {confirmed} PROVEN FLOW rows dated; incident→issue→repro-drill \
          registered + re-runs green"

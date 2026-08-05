@@ -26,7 +26,7 @@
 --
 -- `migration_role` MUST be the role behind `DATABASE_MIGRATION_URL` — the role that will run the
 -- migrations. It defaults to `myelin_admin` so Docker's `/docker-entrypoint-initdb.d` ordering
--- (00- then 01-) provisions a fresh dogfood volume with no operator action.
+-- (00- then 01-) provisions a fresh self-host volume with no operator action.
 --
 -- Requires a cluster-admin/superuser connection: it creates a role carrying BYPASSRLS.
 --

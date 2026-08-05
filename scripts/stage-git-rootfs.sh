@@ -6,11 +6,11 @@
 # --advertise-refs`/`--stateless-rpc`). That guest needs a rootfs containing `git` + its shared libs +
 # the git-core helpers. This script bakes one from the base busybox rootfs + the host's own `git`,
 # exactly as the CT-006 prod-exec tests stage it
-# (crates/myelin-ci-sandbox/tests/git_wire_prod_exec_test.rs::stage_git_rootfs) — so `dogfood.sh` can
+# (crates/myelin-ci-sandbox/tests/git_wire_prod_exec_test.rs::stage_git_rootfs) — so `self-host.sh` can
 # provision it once and point MYELIN_GVISOR_GIT_ROOTFS at it.
 #
 # PRODUCTION staging would bake an immutable, digest-pinned OCI git image; this host-git copy is the
-# single-founder dogfood floor (the guest still runs NON-ROOT as uid 65534 — the CT-002 security lesson).
+# single-founder self-host floor (the guest still runs NON-ROOT as uid 65534 — the CT-002 security lesson).
 #
 #   ./scripts/stage-git-rootfs.sh          stage into ~/.local/share/gvisor-assets/git-rootfs (idempotent)
 #   FORCE=1 ./scripts/stage-git-rootfs.sh  re-stage from scratch (removes the existing staged tree)

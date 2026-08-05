@@ -34,7 +34,7 @@ pub enum Band {
     M3Producers,
     M4Consumers,
     M5World,
-    M6Dogfood,
+    M6SelfTenant,
     MakeItReal,
 }
 
@@ -48,7 +48,7 @@ impl fmt::Display for Band {
             Band::M3Producers => write!(f, "M3 (producer subsystems)"),
             Band::M4Consumers => write!(f, "M4 (consumer subsystems)"),
             Band::M5World => write!(f, "M5 (world-scale hardening)"),
-            Band::M6Dogfood => write!(f, "M6 (dogfooding)"),
+            Band::M6SelfTenant => write!(f, "M6 (self-hosting)"),
             Band::MakeItReal => write!(f, "make-it-real (evidence spine)"),
         }
     }
@@ -64,7 +64,7 @@ impl Band {
             Band::M3Producers => m3_required_rows(),
             Band::M4Consumers => m4_required_rows(),
             Band::M5World => m5_required_rows(),
-            Band::M6Dogfood => m6_required_rows(),
+            Band::M6SelfTenant => m6_required_rows(),
             Band::MakeItReal => make_it_real_required_rows(),
         }
     }
@@ -1322,28 +1322,28 @@ pub fn m6_required_rows() -> Vec<GateRow> {
         ),
         row(
             "CI-P35-switch",
-            "CI dogfood + switch test → the CI surface driven over the real surface with measured contrast + latency",
-            &["test", "-p", "myelin-ci-controlplane", "--test", "ci_p35_dogfood_switch_test_drill"],
+            "CI self_tenant + switch test → the CI surface driven over the real surface with measured contrast + latency",
+            &["test", "-p", "myelin-ci-controlplane", "--test", "ci_p35_self_tenant_switch_test_drill"],
         ),
         row(
             "self-hosting-CI",
-            "the self-hosting CI graph is green on the platform's own commits → the dogfood loop is live; every-incident-adds-a-drill",
-            &["test", "-p", "myelin-harness", "--test", "self_hosting_ci_dogfood"],
+            "the self-hosting CI graph is green on the platform's own commits → the self_tenant loop is live; every-incident-adds-a-drill",
+            &["test", "-p", "myelin-harness", "--test", "self_hosting_ci_self_tenant"],
         ),
         row(
             "FLOW-P29",
-            "Flow dogfood → a flow incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
-            &["test", "-p", "myelin-flow", "--test", "flow_p29_dogfood_drill"],
+            "Flow self_tenant → a flow incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
+            &["test", "-p", "myelin-flow", "--test", "flow_p29_self_tenant_drill"],
         ),
         row(
             "AG-P26",
-            "Agent fabric dogfood → a fabric incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
-            &["test", "-p", "myelin-agent-service", "--test", "ag_p26_dogfood_drill"],
+            "Agent fabric self_tenant → a fabric incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
+            &["test", "-p", "myelin-agent-service", "--test", "ag_p26_self_tenant_drill"],
         ),
         row(
             "CP-D23-selfhost",
-            "Control-plane dogfood → Myelin self-hosts as one cell, residency-verify green, truth-up passes (the platform runs on its own work)",
-            &["test", "-p", "myelin-control-plane", "--test", "cp_d23_dogfood_self_host_drill"],
+            "Control-plane self_tenant → Myelin self-hosts as one cell, residency-verify green, truth-up passes (the platform runs on its own work)",
+            &["test", "-p", "myelin-control-plane", "--test", "cp_d23_self_tenant_self_host_drill"],
         ),
         GateRow {
             id: "STOR-D37",
@@ -1353,35 +1353,35 @@ pub fn m6_required_rows() -> Vec<GateRow> {
                 "-p",
                 "myelin-storage",
                 "--test",
-                "stor_d37_dogfood_restore_verify_drill",
+                "stor_d37_self_tenant_restore_verify_drill",
             ],
             permanent: true,
             floor: None,
         },
         row(
             "GA-P511",
-            "self-served DSR → the dogfood DSR loop runs end-to-end self-hosting (the platform serves its own data-subject requests)",
-            &["test", "-p", "myelin-gdpr-service", "--test", "ga_p511_dogfood_self_served_dsr_drill"],
+            "self-served DSR → the self_tenant DSR loop runs end-to-end self-hosting (the platform serves its own data-subject requests)",
+            &["test", "-p", "myelin-gdpr-service", "--test", "ga_p511_self_tenant_self_served_dsr_drill"],
         ),
         row(
             "REF-P28",
-            "Refs dogfood → a refs incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
-            &["test", "-p", "myelin-refs-service", "--test", "ref_p28_dogfood_drill"],
+            "Refs self_tenant → a refs incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
+            &["test", "-p", "myelin-refs-service", "--test", "ref_p28_self_tenant_drill"],
         ),
         row(
             "SRCH-P33",
-            "Search dogfood → a search incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
-            &["test", "-p", "myelin-search", "--test", "srch_p33_dogfood_drill"],
+            "Search self_tenant → a search incident files an issue and joins the permanent drill suite (the platform runs on its own work)",
+            &["test", "-p", "myelin-search", "--test", "srch_p33_self_tenant_drill"],
         ),
         row(
             "KN-P34",
-            "Knowledge dogfood → the every-incident loop joins the permanent suite and re-runs green (the platform runs on its own work)",
-            &["test", "-p", "myelin-knowledge", "--test", "drill_kn_p34_dogfood"],
+            "Knowledge self_tenant → the every-incident loop joins the permanent suite and re-runs green (the platform runs on its own work)",
+            &["test", "-p", "myelin-knowledge", "--test", "drill_kn_p34_self_tenant"],
         ),
         row(
             "GIT-P35",
-            "Git dogfood → the every-incident loop joins the permanent suite and re-runs green (the platform runs on its own work)",
-            &["test", "-p", "myelin-git", "--test", "git_p35_dogfood_drill"],
+            "Git self_tenant → the every-incident loop joins the permanent suite and re-runs green (the platform runs on its own work)",
+            &["test", "-p", "myelin-git", "--test", "git_p35_self_tenant_drill"],
         ),
         row(
             "GA-truth-up",
@@ -1628,9 +1628,9 @@ impl Scorecard {
                  STOR-D2 (cell scale, permanent restore gate) + contract-coverage",
                 "M6",
             ),
-            Band::M6Dogfood => (
+            Band::M6SelfTenant => (
                 "switch tests (ISS-D14/CHAT-D19/GIT-OQ-12/KN-switch/REF-switch/SRCH-switch/CI-P35-switch) + \
-                 self-hosting-CI + dogfood drills (FLOW-P29/AG-P26/CP-D23-selfhost/STOR-D37/GA-P511/REF-P28/SRCH-P33/KN-P34/GIT-P35) + \
+                 self-hosting-CI + self_tenant drills (FLOW-P29/AG-P26/CP-D23-selfhost/STOR-D37/GA-P511/REF-P28/SRCH-P33/KN-P34/GIT-P35) + \
                  truth-up pass (GA-truth-up + contract-coverage)",
                 "M7",
             ),
@@ -1883,18 +1883,18 @@ impl Scorecard {
                      promoted only on its measured trigger; not a row that reds this gate.\n",
                 );
             }
-            Band::M6Dogfood => {
+            Band::M6SelfTenant => {
                 out.push_str(
-                    "**M6 is the platform done-bar reached by DOGFOODING** - Myelin hosts its own \
+                    "**M6 is the platform done-bar reached by SELF_TENANTING** - Myelin hosts its own \
                      repos/CI/issues/docs/chat, and the switch tests are driven over the real surface \
                      (measured contrast + latency), not read off a feature list (EI-01 §4).\n\n",
                 );
                 out.push_str(
                     "**The self-hosting CI graph is green on the platform's own commits** - the \
-                     dogfood loop is live; every-incident-adds-a-drill.\n\n",
+                     self_tenant loop is live; every-incident-adds-a-drill.\n\n",
                 );
                 out.push_str(
-                    "**STOR-D37 dogfood restore-verify on Myelin's own commits** is permanent (a \
+                    "**STOR-D37 self_tenant restore-verify on Myelin's own commits** is permanent (a \
                      backup never restored is not a backup, EI-01 §3).\n\n",
                 );
                 out.push_str(
@@ -1912,7 +1912,7 @@ impl Scorecard {
                      `runsc --version` - the AG-D4 isolation boundary is proven on real hardware, but \
                      a real `JobSpec.command` does not yet flow through prod `launch()`). M7 fills each \
                      floor with a real implementation + a SEPARATE verification prompt, and gates the \
-                     first production release fail-closed (P-546). **This M6 green is dogfood-complete, \
+                     first production release fail-closed (P-546). **This M6 green is self_tenant-complete, \
                      NOT production-ready** - do not read it as the latter.\n",
                 );
             }
@@ -2929,7 +2929,7 @@ mod tests {
     }
 
     #[test]
-    fn m6_required_rows_cover_the_dogfood_families() {
+    fn m6_required_rows_cover_the_self_tenant_families() {
         let ids: Vec<&str> = m6_required_rows().iter().map(|r| r.id).collect();
         for must in [
             "ISS-D14",
@@ -2966,7 +2966,7 @@ mod tests {
             .any(|id| id.ends_with("-P29") || id.ends_with("-P26")));
         assert!(ids.contains(&"GA-truth-up"));
         assert_eq!(
-            Band::M6Dogfood
+            Band::M6SelfTenant
                 .required_rows()
                 .iter()
                 .map(|r| r.id)
@@ -2976,7 +2976,7 @@ mod tests {
     }
 
     #[test]
-    fn m6_permanent_row_is_the_dogfood_restore_gate() {
+    fn m6_permanent_row_is_the_self_tenant_restore_gate() {
         let perm: Vec<&str> = m6_required_rows()
             .into_iter()
             .filter(|r| r.permanent)
@@ -2985,7 +2985,7 @@ mod tests {
         assert_eq!(
             perm,
             vec!["STOR-D37"],
-            "the M6 permanent set is exactly the dogfood restore gate"
+            "the M6 permanent set is exactly the self_tenant restore gate"
         );
         assert!(
             m6_required_rows()
@@ -3002,7 +3002,7 @@ mod tests {
 
     #[test]
     fn m6_all_rows_proven_is_green() {
-        let mut card = Scorecard::new(Band::M6Dogfood);
+        let mut card = Scorecard::new(Band::M6SelfTenant);
         for r in m6_required_rows() {
             card.record(RowResult::pass(
                 r.id,
@@ -3014,7 +3014,7 @@ mod tests {
         assert!(card.missing_required().is_empty());
         let md = card.render_markdown("2026-06-26");
         assert!(md.contains("GREEN - M7 may start"));
-        assert!(md.contains("DOGFOODING"));
+        assert!(md.contains("SELF_TENANTING"));
         assert!(
             md.contains("self-hosting CI graph is green"),
             "the live self-hosting CI graph must be named"
@@ -3032,15 +3032,15 @@ mod tests {
             "the M7 fail-closed production-release gate must be named"
         );
         assert!(
-            md.contains("dogfood-complete") && md.contains("NOT production-ready"),
-            "the dogfood-complete-NOT-production-ready framing must be printed"
+            md.contains("self_tenant-complete") && md.contains("NOT production-ready"),
+            "the self_tenant-complete-NOT-production-ready framing must be printed"
         );
     }
 
     #[test]
     fn m6_dropping_any_row_reds_the_gate() {
         for dropped in m6_required_rows() {
-            let mut card = Scorecard::new(Band::M6Dogfood);
+            let mut card = Scorecard::new(Band::M6SelfTenant);
             for r in m6_required_rows()
                 .into_iter()
                 .filter(|r| r.id != dropped.id)
@@ -3058,7 +3058,7 @@ mod tests {
 
     #[test]
     fn m6_claimed_not_proven_row_reds_the_gate() {
-        let mut card = Scorecard::new(Band::M6Dogfood);
+        let mut card = Scorecard::new(Band::M6SelfTenant);
         for r in m6_required_rows() {
             if r.id == "STOR-D37" {
                 card.record(RowResult::claimed_not_proven(

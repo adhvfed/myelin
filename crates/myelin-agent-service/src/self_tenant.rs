@@ -9,7 +9,7 @@ pub const MYELIN_SELF_TENANT: &str = "myelin";
 
 pub const MYELIN_SELF_REGION: &str = "fr-par";
 
-pub const DOGFOOD_RUNTIME_FLOOR: &str = "the dogfood triage agents run on the MOCK runtime \
+pub const SELF_TENANT_RUNTIME_FLOOR: &str = "the self_tenant triage agents run on the MOCK runtime \
     (--use-mock MockAgentRuntime) - correct per VISION §3 during development. The real \
     LlmAgentRuntime swap (the only place a model/SDK/prompt/model-name string appears) is the named \
     post-M5 follow-on AG-P25; the external MCP endpoint + agent long-term memory/RAG are post-M5 \
@@ -112,21 +112,21 @@ pub fn run_myelin_triage_on_ci_failure(commit_oid: &str, run_id: u128) -> Triage
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the dogfood artifact must be checked - an unread RED face silently claims a green the \
+#[must_use = "the self_tenant artifact must be checked - an unread RED face silently claims a green the \
               Fabric did not earn on Myelin's own work (EI-01 §1/§3)"]
-pub struct FabricDogfoodArtifact {
+pub struct FabricSelfTenantArtifact {
     pub date: String,
     pub triage: TriageFace,
 }
 
-impl FabricDogfoodArtifact {
+impl FabricSelfTenantArtifact {
     pub fn is_green(&self) -> bool {
         self.triage.is_green()
     }
 
     pub fn summary(&self) -> String {
         format!(
-            "P-517 FABRIC DOGFOOD {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
+            "P-517 FABRIC SELF_TENANT {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
              dispatched={} reserved=={settled} balanced={} interrupts={} trace={} verdict={}",
             self.date,
             self.triage.dispatched,
@@ -140,8 +140,8 @@ impl FabricDogfoodArtifact {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn run_fabric_over_myelins_own_work(date: &str) -> FabricDogfoodArtifact {
-    FabricDogfoodArtifact {
+pub fn run_fabric_over_myelins_own_work(date: &str) -> FabricSelfTenantArtifact {
+    FabricSelfTenantArtifact {
         date: date.to_string(),
         triage: run_myelin_triage_on_ci_failure("feedface", 0x5170_u128),
     }
@@ -601,7 +601,7 @@ mod tests {
         );
 
         let s = artifact.summary();
-        assert!(s.contains("P-517 FABRIC DOGFOOD 2026-06-26"), "dated: {s}");
+        assert!(s.contains("P-517 FABRIC SELF_TENANT 2026-06-26"), "dated: {s}");
         assert!(s.contains("verdict=GREEN"), "verdict: {s}");
         assert!(
             s.contains("tenant=myelin") && s.contains("region=fr-par"),
@@ -694,18 +694,18 @@ mod tests {
     #[test]
     fn an_incident_files_an_issue_and_a_repro_drill_ticket() {
         let incident = FabricIncident::new(
-            "INC-AG-DOGFOOD-1",
+            "INC-AG-SELF_TENANT-1",
             "AG-D11",
             "a reserve/settle regression left an in-flight triage run torn down on the Myelin self-tenant",
-            "repro_ag_d11_dogfood_runaway_self_limiter",
+            "repro_ag_d11_self_tenant_runaway_self_limiter",
         );
         let draft = incident.issue_draft();
         assert_eq!(draft.gate_id, "AG-D11");
-        assert!(draft.title.contains("INC-AG-DOGFOOD-1"));
+        assert!(draft.title.contains("INC-AG-SELF_TENANT-1"));
         assert!(
             draft
                 .body
-                .contains("repro_ag_d11_dogfood_runaway_self_limiter"),
+                .contains("repro_ag_d11_self_tenant_runaway_self_limiter"),
             "the issue is reference-linked to its repro drill: {}",
             draft.body
         );
@@ -713,18 +713,18 @@ mod tests {
         let ticket = incident.drill_ticket();
         assert_eq!(
             ticket.drill_name,
-            "repro_ag_d11_dogfood_runaway_self_limiter"
+            "repro_ag_d11_self_tenant_runaway_self_limiter"
         );
         assert_eq!(ticket.gate_id, "AG-D11");
     }
 
     #[test]
     fn the_mock_runtime_floor_is_named() {
-        assert!(DOGFOOD_RUNTIME_FLOOR.contains("MOCK runtime"));
+        assert!(SELF_TENANT_RUNTIME_FLOOR.contains("MOCK runtime"));
         assert!(
-            DOGFOOD_RUNTIME_FLOOR.contains("AG-P25"),
+            SELF_TENANT_RUNTIME_FLOOR.contains("AG-P25"),
             "names the real-runtime swap follow-on"
         );
-        assert!(DOGFOOD_RUNTIME_FLOOR.contains("post-M5"));
+        assert!(SELF_TENANT_RUNTIME_FLOOR.contains("post-M5"));
     }
 }

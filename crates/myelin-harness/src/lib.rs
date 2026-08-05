@@ -1,6 +1,6 @@
 pub mod cross_language_shim;
 pub mod dependency_break;
-pub mod dogfood;
+pub mod self_tenant;
 pub mod drills;
 pub mod load_generator;
 pub mod make_it_real;
@@ -13,7 +13,7 @@ pub use cross_language_shim::{
     DivergentTierProbe, Nonnegotiable, ShimConformance, ShimEnforcement,
 };
 pub use dependency_break::{BreakOutcome, Dependency, DependencyBreaker, Scope};
-pub use dogfood::{
+pub use self_tenant::{
     outbox_relay_stall_repro, proven_substrate_rows, ProvenSubstrateRow, SubstrateIncident,
     SubstrateIncidentLoop, SubstrateTruthUpPass, SubstrateTruthUpRed, SubstrateTruthUpVerdict,
 };

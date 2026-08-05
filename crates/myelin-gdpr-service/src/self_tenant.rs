@@ -26,7 +26,7 @@ pub const TRUTH_UP_FULL_PASS_PROMPT: &str = "P-GA-38 (→ P-512)";
 pub const MYELIN_SELF_TENANT: &str = "myelin-self";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DogfoodAction {
+pub enum SelfTenantAction {
     GitCommit,
     CiRun,
     IssueChange,
@@ -34,43 +34,43 @@ pub enum DogfoodAction {
     AgentAction,
 }
 
-impl DogfoodAction {
+impl SelfTenantAction {
     pub fn label(self) -> &'static str {
         match self {
-            DogfoodAction::GitCommit => "git-commit",
-            DogfoodAction::CiRun => "ci-run",
-            DogfoodAction::IssueChange => "issue-change",
-            DogfoodAction::ChatMessage => "chat-message",
-            DogfoodAction::AgentAction => "agent-action",
+            SelfTenantAction::GitCommit => "git-commit",
+            SelfTenantAction::CiRun => "ci-run",
+            SelfTenantAction::IssueChange => "issue-change",
+            SelfTenantAction::ChatMessage => "chat-message",
+            SelfTenantAction::AgentAction => "agent-action",
         }
     }
 
     pub fn event_type(self) -> &'static str {
         match self {
-            DogfoodAction::GitCommit => "git.commit_pushed",
-            DogfoodAction::CiRun => "ci.run_completed",
-            DogfoodAction::IssueChange => "issues.transitioned",
-            DogfoodAction::ChatMessage => "chat.message_posted",
-            DogfoodAction::AgentAction => "agent.action_taken",
+            SelfTenantAction::GitCommit => "git.commit_pushed",
+            SelfTenantAction::CiRun => "ci.run_completed",
+            SelfTenantAction::IssueChange => "issues.transitioned",
+            SelfTenantAction::ChatMessage => "chat.message_posted",
+            SelfTenantAction::AgentAction => "agent.action_taken",
         }
     }
 
-    pub const ALL: [DogfoodAction; 5] = [
-        DogfoodAction::GitCommit,
-        DogfoodAction::CiRun,
-        DogfoodAction::IssueChange,
-        DogfoodAction::ChatMessage,
-        DogfoodAction::AgentAction,
+    pub const ALL: [SelfTenantAction; 5] = [
+        SelfTenantAction::GitCommit,
+        SelfTenantAction::CiRun,
+        SelfTenantAction::IssueChange,
+        SelfTenantAction::ChatMessage,
+        SelfTenantAction::AgentAction,
     ];
 }
 
-pub fn run_audit_consumer_on_dogfood(now_iso: &str) -> AuditDogfoodArtifact {
+pub fn run_audit_consumer_on_self_tenant(now_iso: &str) -> AuditSelfTenantArtifact {
     let consumer = AuditConsumer::new();
     let tenant = TenancyTenantId(MYELIN_SELF_TENANT.into());
 
-    let mut by_surface: BTreeMap<DogfoodAction, usize> = BTreeMap::new();
-    for (i, action) in DogfoodAction::ALL.iter().enumerate() {
-        let ev = dogfood_event(*action, i);
+    let mut by_surface: BTreeMap<SelfTenantAction, usize> = BTreeMap::new();
+    for (i, action) in SelfTenantAction::ALL.iter().enumerate() {
+        let ev = self_tenant_event(*action, i);
         let outcome = consumer.handle(&ev, &mut myelin_events::HandlerTx::none());
         debug_assert_eq!(outcome, myelin_events::HandleOutcome::Done);
         *by_surface.entry(*action).or_insert(0) += 1;
@@ -81,7 +81,7 @@ pub fn run_audit_consumer_on_dogfood(now_iso: &str) -> AuditDogfoodArtifact {
     let root_present = consumer.log().root(&tenant).is_some();
     let append_lag = consumer.append_lag();
 
-    AuditDogfoodArtifact {
+    AuditSelfTenantArtifact {
         date: now_iso.to_string(),
         tenant: tenant.clone(),
         actions_logged: entries.len(),
@@ -92,12 +92,12 @@ pub fn run_audit_consumer_on_dogfood(now_iso: &str) -> AuditDogfoodArtifact {
     }
 }
 
-fn dogfood_event(action: DogfoodAction, n: usize) -> EventEnvelope {
-    let actor = dogfood_principal(action, n);
+fn self_tenant_event(action: SelfTenantAction, n: usize) -> EventEnvelope {
+    let actor = self_tenant_principal(action, n);
     let tenant = actor.tenant.clone();
     let region = actor.region.clone();
     EventEnvelope {
-        event_id: EventId(format!("dogfood-{}-{n}", action.label())),
+        event_id: EventId(format!("self_tenant-{}-{n}", action.label())),
         type_: EventType(action.event_type().into()),
         schema_ver: 1,
         tenant,
@@ -106,8 +106,8 @@ fn dogfood_event(action: DogfoodAction, n: usize) -> EventEnvelope {
         subject: ArtifactRef(format!("myelin://myelin-self/{}/n{n}", action.label())),
         aggregate: AggregateKey(format!("agg:{}", action.label())),
         causation_id: None,
-        correlation_id: CorrelationId(format!("corr-dogfood-{n}")),
-        caused_by: Some(CausedBy("session:dogfood".into())),
+        correlation_id: CorrelationId(format!("corr-self_tenant-{n}")),
+        caused_by: Some(CausedBy("session:self_tenant".into())),
         depth: 0,
         contains_personal_data: false,
         data_role: DataRole::Controller,
@@ -119,11 +119,11 @@ fn dogfood_event(action: DogfoodAction, n: usize) -> EventEnvelope {
     }
 }
 
-fn dogfood_principal(action: DogfoodAction, n: usize) -> Principal {
+fn self_tenant_principal(action: SelfTenantAction, n: usize) -> Principal {
     let tenant = TenancyTenantId(MYELIN_SELF_TENANT.into());
     let kind = match action {
-        DogfoodAction::AgentAction => PrincipalKind::Agent {
-            runtime_ref: RuntimeRef("rt-dogfood".into()),
+        SelfTenantAction::AgentAction => PrincipalKind::Agent {
+            runtime_ref: RuntimeRef("rt-self_tenant".into()),
             on_behalf_of: Some(PrincipalId("u-myelin-team-1".into())),
         },
         _ => PrincipalKind::Human,
@@ -132,23 +132,23 @@ fn dogfood_principal(action: DogfoodAction, n: usize) -> Principal {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuditDogfoodArtifact {
+pub struct AuditSelfTenantArtifact {
     pub date: String,
     pub tenant: TenancyTenantId,
     pub actions_logged: usize,
     pub chain_verifies: bool,
     pub root_present: bool,
     pub append_lag: u64,
-    pub actions_by_surface: BTreeMap<DogfoodAction, usize>,
+    pub actions_by_surface: BTreeMap<SelfTenantAction, usize>,
 }
 
-impl AuditDogfoodArtifact {
+impl AuditSelfTenantArtifact {
     pub fn audit_graph_is_green(&self) -> bool {
         self.chain_verifies
             && self.root_present
             && self.append_lag == 0
-            && self.actions_logged == DogfoodAction::ALL.len()
-            && self.actions_by_surface.len() == DogfoodAction::ALL.len()
+            && self.actions_logged == SelfTenantAction::ALL.len()
+            && self.actions_by_surface.len() == SelfTenantAction::ALL.len()
     }
 
     pub fn summary(&self) -> String {
@@ -158,7 +158,7 @@ impl AuditDogfoodArtifact {
             .map(|(a, n)| format!("{}={n}", a.label()))
             .collect();
         format!(
-            "[P-511 DOGFOOD AUDIT GREEN {date}] tenant={tenant}: {logged} of Myelin's OWN actions \
+            "[P-511 SELF_TENANT AUDIT GREEN {date}] tenant={tenant}: {logged} of Myelin's OWN actions \
              logged, chain_verifies={chain} root_present={root} audit_append_lag={lag} - {breakdown}",
             date = self.date,
             tenant = self.tenant.0,
@@ -171,7 +171,7 @@ impl AuditDogfoodArtifact {
     }
 }
 
-pub fn run_self_served_dsr_on_dogfood(now_iso: &str) -> DsrDogfoodArtifact {
+pub fn run_self_served_dsr_on_self_tenant(now_iso: &str) -> DsrSelfTenantArtifact {
     let tenant = TenancyTenantId(MYELIN_SELF_TENANT.into());
     let region = Region("fr-par".into());
     let set = self_host_member_set();
@@ -207,7 +207,7 @@ pub fn run_self_served_dsr_on_dogfood(now_iso: &str) -> DsrDogfoodArtifact {
     };
     let sealed = auth.seal_dsr_certificate(&tenant, &region, &bundle, now_iso);
 
-    DsrDogfoodArtifact {
+    DsrSelfTenantArtifact {
         date: now_iso.to_string(),
         tenant,
         dsr_id,
@@ -238,13 +238,13 @@ fn pii_free_pointer() -> myelin_tenancy::CrossCellPointer {
     myelin_tenancy::CrossCellPointer::new(
         OpaqueSubjectId::from_ref(ArtifactRef("myelin://myelin-self/issues/issue/1".into())),
         ArtifactType::Issue,
-        CorrelationId("corr-dogfood-dsr".into()),
+        CorrelationId("corr-self_tenant-dsr".into()),
         CellId::from_token("cell-fr-par-self"),
     )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DsrDogfoodArtifact {
+pub struct DsrSelfTenantArtifact {
     pub date: String,
     pub tenant: TenancyTenantId,
     pub dsr_id: DsrId,
@@ -258,7 +258,7 @@ pub struct DsrDogfoodArtifact {
     pub bundle_digest: String,
 }
 
-impl DsrDogfoodArtifact {
+impl DsrSelfTenantArtifact {
     pub fn dsr_is_green(&self) -> bool {
         self.holders_missed == 0
             && self.cells_missed == 0
@@ -270,7 +270,7 @@ impl DsrDogfoodArtifact {
 
     pub fn summary(&self) -> String {
         format!(
-            "[P-511 DOGFOOD DSR GREEN {date}] tenant={tenant} dsr={dsr}: holders_missed={hm} \
+            "[P-511 SELF_TENANT DSR GREEN {date}] tenant={tenant} dsr={dsr}: holders_missed={hm} \
              cells_missed={cm} cells_total={ct} certificate=SEALED({sealed})",
             date = self.date,
             tenant = self.tenant.0,
@@ -418,7 +418,7 @@ impl GdprIncident {
         IncidentIssueDraft {
             title: format!("[gdpr incident {}] {}", self.id, self.summary),
             body: format!(
-                "A GDPR/Audit incident surfaced during dogfooding.\n\nGate touched: {}\nReproducing \
+                "A GDPR/Audit incident surfaced during self-hosting.\n\nGate touched: {}\nReproducing \
                  drill (registered into the permanent harness suite, re-runs forever): {}\n\nThe \
                  every-incident-adds-a-drill loop (EI-01 §3) requires this incident's repro join the \
                  suite - the drill below IS that repro. PII-free: this names a FAULT, never a subject.",
@@ -822,7 +822,7 @@ mod tests {
 
     #[test]
     fn audit_consumer_greens_on_myelins_own_actions() {
-        let artifact = run_audit_consumer_on_dogfood(RUN_DATE);
+        let artifact = run_audit_consumer_on_self_tenant(RUN_DATE);
 
         assert!(
             artifact.audit_graph_is_green(),
@@ -830,7 +830,7 @@ mod tests {
         );
         assert_eq!(
             artifact.actions_logged,
-            DogfoodAction::ALL.len(),
+            SelfTenantAction::ALL.len(),
             "every one of Myelin's own action surfaces is logged"
         );
         assert!(
@@ -845,13 +845,13 @@ mod tests {
             "all five own-action surfaces (incl. an agent action - EI-02 §2) covered"
         );
         assert_eq!(
-            artifact.actions_by_surface.get(&DogfoodAction::AgentAction),
+            artifact.actions_by_surface.get(&SelfTenantAction::AgentAction),
             Some(&1),
             "the coding-agent action is audited identically to a human action"
         );
         let s = artifact.summary();
         assert!(
-            s.contains("P-511 DOGFOOD AUDIT GREEN 2026-06-26"),
+            s.contains("P-511 SELF_TENANT AUDIT GREEN 2026-06-26"),
             "dated: {s}"
         );
         assert!(
@@ -862,7 +862,7 @@ mod tests {
 
     #[test]
     fn self_served_dsr_greens_and_seals_a_certificate() {
-        let artifact = run_self_served_dsr_on_dogfood(RUN_DATE);
+        let artifact = run_self_served_dsr_on_self_tenant(RUN_DATE);
 
         assert!(
             artifact.dsr_is_green(),
@@ -896,7 +896,7 @@ mod tests {
         );
         let s = artifact.summary();
         assert!(
-            s.contains("P-511 DOGFOOD DSR GREEN 2026-06-26") && s.contains("holders_missed=0"),
+            s.contains("P-511 SELF_TENANT DSR GREEN 2026-06-26") && s.contains("holders_missed=0"),
             "dated artifact: {s}"
         );
     }

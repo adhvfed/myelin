@@ -5,7 +5,7 @@ use std::process::ExitCode;
 fn main() -> ExitCode {
     let jobs = self_hosting_jobs();
     println!(
-        "== Myelin self-hosting CI graph (the dogfood loop, SUB-M6) - running the substrate \
+        "== Myelin self-hosting CI graph (the self_tenant loop, SUB-M6) - running the substrate \
          ratchet on Myelin's own commit =="
     );
     for job in &jobs {
@@ -39,11 +39,11 @@ fn main() -> ExitCode {
     println!("\nself-hosting CI artifact written to {}", path.display());
 
     if run.is_green() {
-        println!("\nGATE: GREEN - the self-hosting CI graph is green on Myelin's own commit (SUB-M6 dogfood loop).");
+        println!("\nGATE: GREEN - the self-hosting CI graph is green on Myelin's own commit (SUB-M6 self_tenant loop).");
         ExitCode::SUCCESS
     } else {
         eprintln!(
-            "\nGATE: RED - the dogfood ratchet rejected this commit; red jobs: {}.",
+            "\nGATE: RED - the self_tenant ratchet rejected this commit; red jobs: {}.",
             run.red_jobs().join(", ")
         );
         ExitCode::FAILURE

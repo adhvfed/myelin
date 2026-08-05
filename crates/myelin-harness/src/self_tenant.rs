@@ -375,5 +375,5 @@ impl std::fmt::Display for SubstrateTruthUpRed {
 impl std::error::Error for SubstrateTruthUpRed {}
 
 #[cfg(test)]
-#[path = "dogfood_tests.rs"]
-mod dogfood_tests;
+#[path = "self_tenant_tests.rs"]
+mod self_tenant_tests;

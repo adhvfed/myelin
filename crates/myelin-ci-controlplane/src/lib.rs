@@ -95,7 +95,7 @@ pub mod ci_scheduler_db;
 pub mod cost_store;
 pub mod crypto_shred_erase;
 pub mod deployment;
-pub mod dogfood;
+pub mod self_tenant;
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_flagship;
 #[cfg(any(test, feature = "test-support"))]
@@ -185,7 +185,7 @@ pub use deployment::{
     ENVIRONMENT_APPROVE_PERMISSION,
 };
 
-pub use dogfood::{
+pub use self_tenant::{
     proven_ci_rows, switch_capability_matrix, CiIncident, CiSwitchTest, CiTruthUpPass,
     CiTruthUpRed, CiTruthUpVerdict, IncidentDrillLoop, ProvenCiRow, SwitchCapability,
     SwitchVerdict,

@@ -6,7 +6,7 @@ pub mod commit_prerequisite;
 pub mod datamap;
 pub mod derivative_erasure;
 pub mod diffgate;
-pub mod dogfood;
+pub mod self_tenant;
 pub mod dsr;
 pub mod dsr_timer;
 pub mod ediscovery;
@@ -63,10 +63,10 @@ pub use diffgate::{
     check_against_baseline, diff, CommittedBaseline, DataMapDiff, GateVerdict, Reclassification,
     COMMITTED_BASELINE_FINGERPRINT,
 };
-pub use dogfood::{
-    myelin_team_holder_schemas, proven_gdpr_rows, run_audit_consumer_on_dogfood,
-    run_self_served_dsr_on_dogfood, run_truth_up_scorecard, AuditDogfoodArtifact, DogfoodAction,
-    DsrDogfoodArtifact, GdprIncident, IncidentDrillTicket, IncidentIssueDraft, KnowledgeSpacePage,
+pub use self_tenant::{
+    myelin_team_holder_schemas, proven_gdpr_rows, run_audit_consumer_on_self_tenant,
+    run_self_served_dsr_on_self_tenant, run_truth_up_scorecard, AuditSelfTenantArtifact, SelfTenantAction,
+    DsrSelfTenantArtifact, GdprIncident, IncidentDrillTicket, IncidentIssueDraft, KnowledgeSpacePage,
     ProvenGdprRow, RopaKnowledgeSpace, RowStatus, ScorecardEntry, TruthUpPass, TruthUpRed,
     TruthUpScorecard, TruthUpVerdict, MYELIN_SELF_TENANT, TRUTH_UP_FULL_PASS_PROMPT,
 };

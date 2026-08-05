@@ -35,7 +35,7 @@ pub fn myelin_knowledge_space() -> Vec<MyelinDoc> {
             title: "Myelin platform roadmap (M1..M6)",
             blocks: vec![
                 "# Myelin platform roadmap\n",
-                "The bands run *M1* through **M6**; M6 is the `dogfood` done-bar.\n",
+                "The bands run *M1* through **M6**; M6 is the `self_tenant` done-bar.\n",
                 "Each band closes on a dated green exit-gate scorecard.\n",
             ],
         },
@@ -61,9 +61,9 @@ pub fn myelin_knowledge_space() -> Vec<MyelinDoc> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the dogfood artifact must be checked - an unread RED face silently claims a green Knowledge \
+#[must_use = "the self_tenant artifact must be checked - an unread RED face silently claims a green Knowledge \
               did not earn on Myelin's own work (EI-01 §1/§3)"]
-pub struct KnowledgeDogfoodArtifact {
+pub struct KnowledgeSelfTenantArtifact {
     pub date: String,
     pub docs_round_tripped: usize,
     pub docs_total: usize,
@@ -71,7 +71,7 @@ pub struct KnowledgeDogfoodArtifact {
     pub spec_to_ship: E2eArtifact,
 }
 
-impl KnowledgeDogfoodArtifact {
+impl KnowledgeSelfTenantArtifact {
     pub fn is_green(&self) -> bool {
         self.docs_total > 0
             && self.docs_round_tripped == self.docs_total
@@ -86,7 +86,7 @@ impl KnowledgeDogfoodArtifact {
 
     pub fn summary(&self) -> String {
         format!(
-            "P-519 KNOWLEDGE DOGFOOD {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
+            "P-519 KNOWLEDGE SELF_TENANT {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
              own-docs-round-trip={}/{} pr-context-pane={} spec-to-ship={} total-leaks={} verdict={}",
             self.date,
             self.docs_round_tripped,
@@ -99,11 +99,11 @@ impl KnowledgeDogfoodArtifact {
     }
 }
 
-pub fn run_knowledge_over_myelins_own_work(date: &str) -> KnowledgeDogfoodArtifact {
+pub fn run_knowledge_over_myelins_own_work(date: &str) -> KnowledgeSelfTenantArtifact {
     let space = myelin_knowledge_space();
     let docs_total = space.len();
     let docs_round_tripped = space.iter().filter(|d| d.round_trips()).count();
-    KnowledgeDogfoodArtifact {
+    KnowledgeSelfTenantArtifact {
         date: date.to_string(),
         docs_round_tripped,
         docs_total,
@@ -569,7 +569,7 @@ mod tests {
 
         let s = artifact.summary();
         assert!(
-            s.contains("P-519 KNOWLEDGE DOGFOOD 2026-06-26"),
+            s.contains("P-519 KNOWLEDGE SELF_TENANT 2026-06-26"),
             "dated: {s}"
         );
         assert!(s.contains("verdict=GREEN"), "verdict: {s}");
@@ -657,18 +657,18 @@ mod tests {
     #[test]
     fn an_incident_files_an_issue_and_a_repro_drill_ticket() {
         let incident = KnowledgeIncident::new(
-            "INC-KN-DOGFOOD-1",
+            "INC-KN-SELF_TENANT-1",
             "KN-D2",
             "a markdown-subset corpus body silently round-tripped non-canonically on the Myelin self-tenant",
-            "repro_kn_d2_dogfood_non_canonical_round_trip",
+            "repro_kn_d2_self_tenant_non_canonical_round_trip",
         );
         let draft = incident.issue_draft();
         assert_eq!(draft.gate_id, "KN-D2");
-        assert!(draft.title.contains("INC-KN-DOGFOOD-1"));
+        assert!(draft.title.contains("INC-KN-SELF_TENANT-1"));
         assert!(
             draft
                 .body
-                .contains("repro_kn_d2_dogfood_non_canonical_round_trip"),
+                .contains("repro_kn_d2_self_tenant_non_canonical_round_trip"),
             "the issue is reference-linked to its repro drill: {}",
             draft.body
         );
@@ -677,7 +677,7 @@ mod tests {
         let ticket = incident.drill_ticket();
         assert_eq!(
             ticket.drill_name,
-            "repro_kn_d2_dogfood_non_canonical_round_trip"
+            "repro_kn_d2_self_tenant_non_canonical_round_trip"
         );
         assert_eq!(ticket.gate_id, "KN-D2");
     }

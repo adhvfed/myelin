@@ -54,6 +54,6 @@ pub mod web;
 
 pub mod api;
 
-pub mod dogfood;
+pub mod self_tenant;
 
 pub mod switch_test;

@@ -11,16 +11,16 @@ pub const EMBEDDING_ADAPTER_POSTURE: &str =
                                              adapter is the named post-M5/runtime config swap)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the dogfood artifact must be checked - an unread RED face silently claims a green Search \
+#[must_use = "the self_tenant artifact must be checked - an unread RED face silently claims a green Search \
               did not earn on Myelin's own work (EI-01 §1/§3)"]
-pub struct DogfoodArtifact {
+pub struct SelfTenantArtifact {
     pub date: String,
     pub code_and_issue: E2eArtifact,
     pub knowledge_space: E2eArtifact,
     pub dsar_fanout: E2eArtifact,
 }
 
-impl DogfoodArtifact {
+impl SelfTenantArtifact {
     pub fn is_green(&self) -> bool {
         self.code_and_issue.is_green()
             && self.knowledge_space.is_green()
@@ -33,7 +33,7 @@ impl DogfoodArtifact {
 
     pub fn summary(&self) -> String {
         format!(
-            "P-515 SEARCH DOGFOOD {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
+            "P-515 SEARCH SELF_TENANT {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
              code+issue={} knowledge-space={} dsar-fanout={} total-leaks={} embedding-adapter={} \
              verdict={}",
             self.date,
@@ -48,8 +48,8 @@ impl DogfoodArtifact {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn run_search_over_myelins_own_work(date: &str) -> DogfoodArtifact {
-    DogfoodArtifact {
+pub fn run_search_over_myelins_own_work(date: &str) -> SelfTenantArtifact {
+    SelfTenantArtifact {
         date: date.to_string(),
         code_and_issue: run_e2e_1_pr_pane(),
         knowledge_space: run_e2e_3_spec_to_ship(),
@@ -491,7 +491,7 @@ mod tests {
         assert!(artifact.dsar_fanout.is_green(), "the DSAR fan-out is green");
 
         let s = artifact.summary();
-        assert!(s.contains("P-515 SEARCH DOGFOOD 2026-06-26"), "dated: {s}");
+        assert!(s.contains("P-515 SEARCH SELF_TENANT 2026-06-26"), "dated: {s}");
         assert!(s.contains("verdict=GREEN"), "verdict: {s}");
         assert!(
             s.contains("tenant=myelin") && s.contains("region=fr-par"),
@@ -572,23 +572,23 @@ mod tests {
     #[test]
     fn an_incident_files_an_issue_and_a_repro_drill_ticket() {
         let incident = SearchIncident::new(
-            "INC-SEARCH-DOGFOOD-1",
+            "INC-SEARCH-SELF_TENANT-1",
             "SRCH-D1",
             "a pre-filter regression let a confidential issue enter the candidate set on the Myelin self-tenant",
-            "repro_srch_d1_dogfood_candidate_leak",
+            "repro_srch_d1_self_tenant_candidate_leak",
         );
         let draft = incident.issue_draft();
         assert_eq!(draft.gate_id, "SRCH-D1");
-        assert!(draft.title.contains("INC-SEARCH-DOGFOOD-1"));
+        assert!(draft.title.contains("INC-SEARCH-SELF_TENANT-1"));
         assert!(
-            draft.body.contains("repro_srch_d1_dogfood_candidate_leak"),
+            draft.body.contains("repro_srch_d1_self_tenant_candidate_leak"),
             "the issue is reference-linked to its repro drill: {}",
             draft.body
         );
         assert!(!draft.body.to_lowercase().contains("email"));
 
         let ticket = incident.drill_ticket();
-        assert_eq!(ticket.drill_name, "repro_srch_d1_dogfood_candidate_leak");
+        assert_eq!(ticket.drill_name, "repro_srch_d1_self_tenant_candidate_leak");
         assert_eq!(ticket.gate_id, "SRCH-D1");
     }
 

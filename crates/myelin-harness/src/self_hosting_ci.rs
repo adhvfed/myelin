@@ -167,7 +167,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
             ],
         },
         SelfHostJob {
-            id: "CP-D23-dogfood",
+            id: "CP-D23-self_tenant",
             title: "Myelin self-hosts as one cell + residency_verify GREEN on the team's own data \
                     + the truth-up pass (no later-band CP gate red)",
             kind: JobKind::Drill,
@@ -177,7 +177,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "-p",
                 "myelin-control-plane",
                 "--test",
-                "cp_d23_dogfood_self_host_drill",
+                "cp_d23_self_tenant_self_host_drill",
             ],
         },
         SelfHostJob {
@@ -225,7 +225,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
             ],
         },
         SelfHostJob {
-            id: "CI-P35-dogfood",
+            id: "CI-P35-self_tenant",
             title: "the CI switch test (driven against the real `myelin ci` run/log/deploy surface vs \
                     the GitHub Actions anchor, measured) + the CI truth-up pass (0 red earlier CI gate)",
             kind: JobKind::Drill,
@@ -235,11 +235,11 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "-p",
                 "myelin-ci-controlplane",
                 "--test",
-                "ci_p35_dogfood_switch_test_drill",
+                "ci_p35_self_tenant_switch_test_drill",
             ],
         },
         SelfHostJob {
-            id: "GA-P511-dogfood",
+            id: "GA-P511-self_tenant",
             title: "the GDPR/Audit machinery on Myelin's own commits - the audit consumer live on the \
                     self-hosting outbox + a self-served DSR fans out + seals a certificate + the \
                     RoPA/data-map Knowledge space + the GDPR truth-up pass (0 red earlier GDPR gate)",
@@ -250,11 +250,11 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "-p",
                 "myelin-gdpr-service",
                 "--test",
-                "ga_p511_dogfood_self_served_dsr_drill",
+                "ga_p511_self_tenant_self_served_dsr_drill",
             ],
         },
         SelfHostJob {
-            id: "REF-P28-dogfood",
+            id: "REF-P28-self_tenant",
             title: "the reference graph on Myelin's own work - the PR context pane + the spec-to-ship \
                     lineage + the holder fan-out (all green, 0 leak) + the Refs truth-up pass (0 red \
                     earlier-band Refs gate) + the self-hosted every-incident-adds-a-drill loop",
@@ -265,7 +265,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "-p",
                 "myelin-refs-service",
                 "--test",
-                "ref_p28_dogfood_drill",
+                "ref_p28_self_tenant_drill",
             ],
         },
         SelfHostJob {
@@ -284,7 +284,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
             ],
         },
         SelfHostJob {
-            id: "SRCH-P33-dogfood",
+            id: "SRCH-P33-self_tenant",
             title: "Search on Myelin's own work - code + issue search + the Knowledge-space \
                     reindex-parity + the DSAR fan-out (all green, 0 leak) + the Search truth-up pass \
                     (0 red earlier-band Search gate) + the self-hosted every-incident-adds-a-drill loop",
@@ -295,7 +295,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "-p",
                 "myelin-search",
                 "--test",
-                "srch_p33_dogfood_drill",
+                "srch_p33_self_tenant_drill",
             ],
         },
         SelfHostJob {
@@ -314,7 +314,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
             ],
         },
         SelfHostJob {
-            id: "FLOW-P29-dogfood",
+            id: "FLOW-P29-self_tenant",
             title: "Myelin's own pipelines/merge-queue/SLA-timers as myelin-flow workflows - the \
                     ci.pipeline workflow + the merge queue merging a real Myelin PR exactly once + a \
                     real Myelin SLA timer firing on a real Myelin issue (all green) + the FLOW truth-up \
@@ -326,11 +326,11 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "-p",
                 "myelin-flow",
                 "--test",
-                "flow_p29_dogfood_drill",
+                "flow_p29_self_tenant_drill",
             ],
         },
         SelfHostJob {
-            id: "AG-P26-dogfood",
+            id: "AG-P26-self_tenant",
             title: "the platform's own agents on Myelin's own work - a MOCK triage agent on a real \
                     Myelin CI failure (explicit-first dispatch + balanced reserve/settle ledger + a \
                     content-addressed trace per run) + the Fabric truth-up pass (0 red later-band \
@@ -342,11 +342,11 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "-p",
                 "myelin-agent-service",
                 "--test",
-                "ag_p26_dogfood_drill",
+                "ag_p26_self_tenant_drill",
             ],
         },
         SelfHostJob {
-            id: "GIT-P35-dogfood",
+            id: "GIT-P35-self_tenant",
             title: "git hosts Myelin's own repositories - the PR context pane + the agent-native fix-PR \
                     flagship (exactly-once merge) + the spec-to-ship lineage (all green, 0 leak) + the \
                     git truth-up pass (0 red later-band git gate) + the self-hosted \
@@ -358,7 +358,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "-p",
                 "myelin-git",
                 "--test",
-                "git_p35_dogfood_drill",
+                "git_p35_self_tenant_drill",
             ],
         },
         SelfHostJob {
@@ -377,7 +377,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
             ],
         },
         SelfHostJob {
-            id: "ISS-P37-dogfood",
+            id: "ISS-P37-self_tenant",
             title: "Myelin tracks its own issues - own work as Myelin issues (round-trip) + the PR \
                     context pane + the agent-native flagship (exactly-once close) + the spec-to-ship \
                     lineage (all green, 0 leak) + the Issues truth-up pass (0 red later-band Issues \
@@ -389,7 +389,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
                 "-p",
                 "myelin-issues",
                 "--test",
-                "iss_p37_dogfood_drill",
+                "iss_p37_self_tenant_drill",
             ],
         },
         SelfHostJob {
@@ -433,14 +433,14 @@ impl SelfHostingRun {
     pub fn render_markdown(&self) -> String {
         let mut out = String::new();
         out.push_str(
-            "# Myelin self-hosting CI graph - the dogfood loop (P-507 / P-S37, SUB-M6)\n\n",
+            "# Myelin self-hosting CI graph - the self_tenant loop (P-507 / P-S37, SUB-M6)\n\n",
         );
         out.push_str(&format!("Run date: {}\n\n", self.date));
         out.push_str(
             "The substrate ratchet (the twelve architecture lints + the contract-coverage scanner \
              + the mandatory-core cargo-mutants mutation gate) runs as Myelin CI jobs on Myelin's \
              OWN commit, and the harness drives the substrate's surge/restore/migration drills \
-             (SUB-D3/D6/D10) - the dogfood loop is live. The gate is GREEN iff every job below \
+             (SUB-D3/D6/D10) - the self_tenant loop is live. The gate is GREEN iff every job below \
              passed; a single red job reds the gate (the ratchet rejects on Myelin's own work).\n\n",
         );
         out.push_str("| Job | Verdict | Proof / reason |\n");
@@ -454,7 +454,7 @@ impl SelfHostingRun {
             out.push_str("**GATE: GREEN** - the self-hosting CI graph is green on Myelin's own commit (SUB-M6).\n");
         } else {
             out.push_str(&format!(
-                "**GATE: RED** - the dogfood ratchet rejected this commit; red jobs: {}.\n",
+                "**GATE: RED** - the self_tenant ratchet rejected this commit; red jobs: {}.\n",
                 self.red_jobs().join(", ")
             ));
         }

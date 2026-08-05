@@ -25,7 +25,7 @@ pub fn myelin_issue_backlog() -> Vec<MyelinIssue> {
             key: "MYL-1",
             title: "Myelin platform roadmap (M1..M6) as a tracked initiative",
             body_blocks: vec![
-                "The bands run **M1** through **M6**; M6 is the `dogfood` done-bar.",
+                "The bands run **M1** through **M6**; M6 is the `self_tenant` done-bar.",
                 "Each band closes on a dated green exit-gate scorecard.",
                 "The roadmap is a *timeline* view over the one `issue` table.",
             ],
@@ -52,9 +52,9 @@ pub fn myelin_issue_backlog() -> Vec<MyelinIssue> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the dogfood artifact must be checked - an unread RED face silently claims a green Issues \
+#[must_use = "the self_tenant artifact must be checked - an unread RED face silently claims a green Issues \
               did not earn on Myelin's own work (EI-01 §1/§3)"]
-pub struct IssuesDogfoodArtifact {
+pub struct IssuesSelfTenantArtifact {
     pub date: String,
     pub issues_round_tripped: usize,
     pub issues_total: usize,
@@ -63,7 +63,7 @@ pub struct IssuesDogfoodArtifact {
     pub spec_to_ship: IssuesE2eArtifact,
 }
 
-impl IssuesDogfoodArtifact {
+impl IssuesSelfTenantArtifact {
     pub fn is_green(&self) -> bool {
         self.issues_total > 0
             && self.issues_round_tripped == self.issues_total
@@ -79,7 +79,7 @@ impl IssuesDogfoodArtifact {
 
     pub fn summary(&self) -> String {
         format!(
-            "P-520 ISSUES DOGFOOD {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
+            "P-520 ISSUES SELF_TENANT {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
              own-issues-round-trip={}/{} pr-context-pane={} agent-flagship={} spec-to-ship={} \
              total-leaks={} verdict={}",
             self.date,
@@ -95,11 +95,11 @@ impl IssuesDogfoodArtifact {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn run_issues_over_myelins_own_work(date: &str) -> IssuesDogfoodArtifact {
+pub fn run_issues_over_myelins_own_work(date: &str) -> IssuesSelfTenantArtifact {
     let backlog = myelin_issue_backlog();
     let issues_total = backlog.len();
     let issues_round_tripped = backlog.iter().filter(|i| i.body_round_trips()).count();
-    IssuesDogfoodArtifact {
+    IssuesSelfTenantArtifact {
         date: date.to_string(),
         issues_round_tripped,
         issues_total,
@@ -588,7 +588,7 @@ mod tests {
         );
 
         let s = artifact.summary();
-        assert!(s.contains("P-520 ISSUES DOGFOOD 2026-06-26"), "dated: {s}");
+        assert!(s.contains("P-520 ISSUES SELF_TENANT 2026-06-26"), "dated: {s}");
         assert!(s.contains("verdict=GREEN"), "verdict: {s}");
         assert!(
             s.contains("tenant=myelin") && s.contains("region=fr-par"),
@@ -674,18 +674,18 @@ mod tests {
     #[test]
     fn an_incident_files_an_issue_and_a_repro_drill_ticket() {
         let incident = IssuesIncident::new(
-            "INC-ISS-DOGFOOD-1",
+            "INC-ISS-SELF_TENANT-1",
             "ISS-D10",
             "an issue-body corpus fixture silently round-tripped non-canonically on the Myelin self-tenant",
-            "repro_iss_d10_dogfood_non_canonical_round_trip",
+            "repro_iss_d10_self_tenant_non_canonical_round_trip",
         );
         let draft = incident.issue_draft();
         assert_eq!(draft.gate_id, "ISS-D10");
-        assert!(draft.title.contains("INC-ISS-DOGFOOD-1"));
+        assert!(draft.title.contains("INC-ISS-SELF_TENANT-1"));
         assert!(
             draft
                 .body
-                .contains("repro_iss_d10_dogfood_non_canonical_round_trip"),
+                .contains("repro_iss_d10_self_tenant_non_canonical_round_trip"),
             "the issue is reference-linked to its repro drill: {}",
             draft.body
         );
@@ -694,7 +694,7 @@ mod tests {
         let ticket = incident.drill_ticket();
         assert_eq!(
             ticket.drill_name,
-            "repro_iss_d10_dogfood_non_canonical_round_trip"
+            "repro_iss_d10_self_tenant_non_canonical_round_trip"
         );
         assert_eq!(ticket.gate_id, "ISS-D10");
     }

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use myelin_harness::telemetry::{Predicate, SignalName};
 use myelin_harness::{DrillContext, DrillRegistry, DrillScenario};
 
-use myelin_gdpr_service::dogfood::{
+use myelin_gdpr_service::self_tenant::{
     proven_gdpr_rows, run_truth_up_scorecard, RowStatus, TruthUpPass, TruthUpScorecard,
     TRUTH_UP_FULL_PASS_PROMPT,
 };

@@ -34,7 +34,7 @@ pub fn myelin_chat_channels() -> Vec<MyelinChannel> {
             channel_id: "myelin-releases",
             title: "#releases - the platform shipping itself",
             bodies: vec![
-                "Cut **M6** - the `dogfood` done-bar.",
+                "Cut **M6** - the `self_tenant` done-bar.",
                 "Each band closes on a dated green exit-gate scorecard.",
                 "~~Blocked~~ on the switch test; now green.",
             ],
@@ -52,16 +52,16 @@ pub fn myelin_chat_channels() -> Vec<MyelinChannel> {
 }
 
 #[derive(Clone, Debug)]
-#[must_use = "the dogfood artifact must be checked - an unread RED face silently claims a green Chat \
+#[must_use = "the self_tenant artifact must be checked - an unread RED face silently claims a green Chat \
               did not earn on Myelin's own work (EI-01 §1/§3)"]
-pub struct ChatDogfoodArtifact {
+pub struct ChatSelfTenantArtifact {
     pub date: String,
     pub channels_round_tripped: usize,
     pub channels_total: usize,
     pub e2e_faces: Vec<ChatE2eArtifact>,
 }
 
-impl ChatDogfoodArtifact {
+impl ChatSelfTenantArtifact {
     pub fn is_green(&self) -> bool {
         self.channels_total > 0
             && self.channels_round_tripped == self.channels_total
@@ -76,7 +76,7 @@ impl ChatDogfoodArtifact {
 
     pub fn summary(&self) -> String {
         format!(
-            "P-521 CHAT DOGFOOD {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
+            "P-521 CHAT SELF_TENANT {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
              own-channels-round-trip={}/{} e2e-faces={} total-leaks={} verdict={}",
             self.date,
             self.channels_round_tripped,
@@ -89,12 +89,12 @@ impl ChatDogfoodArtifact {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn run_chat_over_myelins_own_work(date: &str) -> ChatDogfoodArtifact {
+pub fn run_chat_over_myelins_own_work(date: &str) -> ChatSelfTenantArtifact {
     let channels = myelin_chat_channels();
     let channels_total = channels.len();
     let channels_round_tripped = channels.iter().filter(|c| c.bodies_round_trip()).count();
     let e2e_faces = run_chat_e2e_wedge();
-    ChatDogfoodArtifact {
+    ChatSelfTenantArtifact {
         date: date.to_string(),
         channels_round_tripped,
         channels_total,
@@ -146,9 +146,9 @@ mod tests {
     }
 
     #[test]
-    fn the_dogfood_summary_is_dated_and_self_tenant_framed() {
+    fn the_self_tenant_summary_is_dated_and_self_tenant_framed() {
         let s = run_chat_over_myelins_own_work(RUN_DATE).summary();
-        assert!(s.contains("P-521 CHAT DOGFOOD 2026-06-26"), "dated: {s}");
+        assert!(s.contains("P-521 CHAT SELF_TENANT 2026-06-26"), "dated: {s}");
         assert!(
             s.contains("tenant=myelin") && s.contains("region=fr-par"),
             "self-tenant framing: {s}"
@@ -157,12 +157,12 @@ mod tests {
     }
 
     #[test]
-    fn a_non_round_tripping_channel_reds_the_dogfood() {
+    fn a_non_round_tripping_channel_reds_the_self_tenant() {
         let mut artifact = run_chat_over_myelins_own_work(RUN_DATE);
         artifact.channels_round_tripped = artifact.channels_total - 1;
         assert!(
             !artifact.is_green(),
-            "a non-round-tripping channel reds the dogfood: {}",
+            "a non-round-tripping channel reds the self_tenant: {}",
             artifact.summary()
         );
     }

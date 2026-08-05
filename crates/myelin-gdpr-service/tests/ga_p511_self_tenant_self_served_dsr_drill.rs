@@ -1,8 +1,8 @@
 use myelin_harness::telemetry::{Predicate, SignalName};
 use myelin_harness::{DrillContext, DrillRegistry, DrillScenario};
 
-use myelin_gdpr_service::dogfood::{
-    proven_gdpr_rows, run_audit_consumer_on_dogfood, run_self_served_dsr_on_dogfood, GdprIncident,
+use myelin_gdpr_service::self_tenant::{
+    proven_gdpr_rows, run_audit_consumer_on_self_tenant, run_self_served_dsr_on_self_tenant, GdprIncident,
     RopaKnowledgeSpace, TruthUpPass,
 };
 use myelin_tenancy::Region;
@@ -11,7 +11,7 @@ const RUN_DATE: &str = "2026-06-26";
 
 #[test]
 fn the_audit_consumer_runs_on_myelins_own_actions() {
-    let artifact = run_audit_consumer_on_dogfood(RUN_DATE);
+    let artifact = run_audit_consumer_on_self_tenant(RUN_DATE);
 
     assert!(
         artifact.audit_graph_is_green(),
@@ -29,7 +29,7 @@ fn the_audit_consumer_runs_on_myelins_own_actions() {
 
     let line = artifact.summary();
     assert!(
-        line.contains("P-511 DOGFOOD AUDIT GREEN 2026-06-26"),
+        line.contains("P-511 SELF_TENANT AUDIT GREEN 2026-06-26"),
         "dated artifact: {line}"
     );
     println!("{line}");
@@ -37,7 +37,7 @@ fn the_audit_consumer_runs_on_myelins_own_actions() {
 
 #[test]
 fn a_self_served_dsr_over_the_teams_own_data_seals_a_certificate() {
-    let artifact = run_self_served_dsr_on_dogfood(RUN_DATE);
+    let artifact = run_self_served_dsr_on_self_tenant(RUN_DATE);
 
     assert!(
         artifact.dsr_is_green(),
@@ -60,7 +60,7 @@ fn a_self_served_dsr_over_the_teams_own_data_seals_a_certificate() {
 
     let line = artifact.summary();
     assert!(
-        line.contains("P-511 DOGFOOD DSR GREEN 2026-06-26") && line.contains("certificate=SEALED"),
+        line.contains("P-511 SELF_TENANT DSR GREEN 2026-06-26") && line.contains("certificate=SEALED"),
         "dated artifact: {line}"
     );
     println!("{line}");
@@ -91,17 +91,17 @@ fn the_ropa_and_data_map_live_as_a_myelin_knowledge_space() {
 #[test]
 fn a_synthetic_gdpr_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     let incident = GdprIncident::new(
-        "INC-GDPR-DOGFOOD-1",
+        "INC-GDPR-SELF_TENANT-1",
         "GA-D1",
         "a self-served DSR fan-out skipped a newly-registered holder on Myelin's own tenant",
-        "repro_ga_d1_dogfood_dsr_skips_holder",
+        "repro_ga_d1_self_tenant_dsr_skips_holder",
     );
 
     let draft = incident.issue_draft();
     assert_eq!(draft.gate_id, "GA-D1");
-    assert!(draft.title.contains("INC-GDPR-DOGFOOD-1"));
+    assert!(draft.title.contains("INC-GDPR-SELF_TENANT-1"));
     assert!(
-        draft.body.contains("repro_ga_d1_dogfood_dsr_skips_holder"),
+        draft.body.contains("repro_ga_d1_self_tenant_dsr_skips_holder"),
         "the issue is traceable to its repro drill: {}",
         draft.body
     );
@@ -112,7 +112,7 @@ fn a_synthetic_gdpr_incident_files_an_issue_and_joins_the_permanent_drill_suite(
     registry.register_drill(DrillScenario::new(
         drill_name.clone(),
         move |ctx: &mut DrillContext| {
-            let dsr = run_self_served_dsr_on_dogfood(RUN_DATE);
+            let dsr = run_self_served_dsr_on_self_tenant(RUN_DATE);
             ctx.signals.set_scalar(
                 SignalName::DeadLetterCount,
                 if dsr.dsr_is_green() { 0 } else { 1 },
@@ -159,11 +159,11 @@ fn the_truth_up_pass_confirms_every_proven_gdpr_row_is_dated() {
 }
 
 #[test]
-fn dogfood_loop_end_to_end_self_hosting() {
-    let audit = run_audit_consumer_on_dogfood(RUN_DATE);
+fn self_tenant_loop_end_to_end_self_hosting() {
+    let audit = run_audit_consumer_on_self_tenant(RUN_DATE);
     assert!(audit.audit_graph_is_green(), "audit green on own actions");
 
-    let dsr = run_self_served_dsr_on_dogfood(RUN_DATE);
+    let dsr = run_self_served_dsr_on_self_tenant(RUN_DATE);
     assert!(
         dsr.dsr_is_green(),
         "self-served DSR green + certificate sealed"
@@ -173,10 +173,10 @@ fn dogfood_loop_end_to_end_self_hosting() {
     assert!(space.is_populated(), "the RoPA Knowledge space lives");
 
     let incident = GdprIncident::new(
-        "INC-GDPR-DOGFOOD-E2E",
+        "INC-GDPR-SELF_TENANT-E2E",
         "GA-D8",
         "a multi-cell self-served DSR wave dropped a self-host cell under a doc-edit surge",
-        "repro_ga_d8_dogfood_cell_drop_under_surge",
+        "repro_ga_d8_self_tenant_cell_drop_under_surge",
     );
     let _draft = incident.issue_draft();
     let ticket = incident.drill_ticket();
@@ -184,7 +184,7 @@ fn dogfood_loop_end_to_end_self_hosting() {
     registry.register_drill(DrillScenario::new(
         ticket.drill_name.clone(),
         move |ctx: &mut DrillContext| {
-            let whole = run_self_served_dsr_on_dogfood(RUN_DATE).dsr_is_green();
+            let whole = run_self_served_dsr_on_self_tenant(RUN_DATE).dsr_is_green();
             ctx.signals
                 .set_scalar(SignalName::OutboxDepth, if whole { 0 } else { 1 });
             ctx.signals
@@ -199,5 +199,5 @@ fn dogfood_loop_end_to_end_self_hosting() {
         .expect("0 red earlier-band GDPR gates");
     assert!(confirmed >= 11);
 
-    println!("[P-511 DOGFOOD LOOP GREEN {RUN_DATE}] self-hosting: audit consumer green on own actions; self-served DSR green + certificate sealed; RoPA/data-map lives as a Knowledge space; incident→issue→repro-drill registered + re-runs green; truth-up confirms {confirmed} PROVEN GDPR rows dated");
+    println!("[P-511 SELF_TENANT LOOP GREEN {RUN_DATE}] self-hosting: audit consumer green on own actions; self-served DSR green + certificate sealed; RoPA/data-map lives as a Knowledge space; incident→issue→repro-drill registered + re-runs green; truth-up confirms {confirmed} PROVEN GDPR rows dated");
 }

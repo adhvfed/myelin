@@ -455,5 +455,5 @@ fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 #[cfg(test)]
-#[path = "dogfood_tests.rs"]
+#[path = "self_tenant_tests.rs"]
 mod tests;

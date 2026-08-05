@@ -29,7 +29,7 @@ fn search_runs_on_myelins_own_work() {
 
     let line = artifact.summary();
     assert!(
-        line.contains("P-515 SEARCH DOGFOOD 2026-06-26") && line.contains("verdict=GREEN"),
+        line.contains("P-515 SEARCH SELF_TENANT 2026-06-26") && line.contains("verdict=GREEN"),
         "dated artifact: {line}"
     );
     assert!(
@@ -77,17 +77,17 @@ fn the_truth_up_pass_confirms_every_proven_search_row_is_dated() {
 #[test]
 fn a_search_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     let incident = SearchIncident::new(
-        "INC-SEARCH-DOGFOOD-1",
+        "INC-SEARCH-SELF_TENANT-1",
         "SRCH-D1",
         "a pre-filter regression let a confidential issue enter the candidate set on the Myelin self-tenant",
-        "repro_srch_d1_dogfood_candidate_leak",
+        "repro_srch_d1_self_tenant_candidate_leak",
     );
 
     let draft = incident.issue_draft();
     assert_eq!(draft.gate_id, "SRCH-D1");
-    assert!(draft.title.contains("INC-SEARCH-DOGFOOD-1"));
+    assert!(draft.title.contains("INC-SEARCH-SELF_TENANT-1"));
     assert!(
-        draft.body.contains("repro_srch_d1_dogfood_candidate_leak"),
+        draft.body.contains("repro_srch_d1_self_tenant_candidate_leak"),
         "the issue is reference-linked to its repro drill: {}",
         draft.body
     );
@@ -98,10 +98,10 @@ fn a_search_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     registry.register_drill(DrillScenario::new(
         drill_name.clone(),
         move |ctx: &mut DrillContext| {
-            let dogfood = run_search_over_myelins_own_work(RUN_DATE);
+            let self_tenant = run_search_over_myelins_own_work(RUN_DATE);
             ctx.signals.set_scalar(
                 SignalName::DeadLetterCount,
-                if dogfood.is_green() && dogfood.total_leaks() == 0 {
+                if self_tenant.is_green() && self_tenant.total_leaks() == 0 {
                     0
                 } else {
                     1
@@ -133,12 +133,12 @@ fn a_search_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
 }
 
 #[test]
-fn dogfood_loop_end_to_end_self_hosting() {
-    let dogfood = run_search_over_myelins_own_work(RUN_DATE);
+fn self_tenant_loop_end_to_end_self_hosting() {
+    let self_tenant = run_search_over_myelins_own_work(RUN_DATE);
     assert!(
-        dogfood.is_green() && dogfood.total_leaks() == 0,
+        self_tenant.is_green() && self_tenant.total_leaks() == 0,
         "Search is green on Myelin's own work: {}",
-        dogfood.summary()
+        self_tenant.summary()
     );
 
     let rows = proven_search_rows(RUN_DATE);
@@ -148,10 +148,10 @@ fn dogfood_loop_end_to_end_self_hosting() {
     assert!(confirmed >= 13);
 
     let incident = SearchIncident::new(
-        "INC-SEARCH-DOGFOOD-E2E",
+        "INC-SEARCH-SELF_TENANT-E2E",
         "E2E-3",
         "a reindex-from-source rebuild dropped a Knowledge-space node so the parity hash diverged",
-        "repro_e2e3_dogfood_reindex_parity",
+        "repro_e2e3_self_tenant_reindex_parity",
     );
     let _draft = incident.issue_draft();
     let ticket = incident.drill_ticket();
@@ -169,7 +169,7 @@ fn dogfood_loop_end_to_end_self_hosting() {
     assert!(registry.all_green(), "the incident's repro re-runs green");
 
     println!(
-        "[P-515 DOGFOOD LOOP GREEN {RUN_DATE}] self-hosting: Search runs on Myelin's own work \
+        "[P-515 SELF_TENANT LOOP GREEN {RUN_DATE}] self-hosting: Search runs on Myelin's own work \
          (code+issue + Knowledge-space reindex-parity + DSAR fan-out green, 0 leak); truth-up confirms \
          {confirmed} PROVEN Search rows dated; incident→issue→repro-drill registered + re-runs green; \
          embedding-adapter={EMBEDDING_ADAPTER_POSTURE}"

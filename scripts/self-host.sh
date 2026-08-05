@@ -1,33 +1,33 @@
 #!/usr/bin/env bash
-# Myelin FOUNDER-DOGFOOD helper (R4.0) — bring the real `edge` binary up, mint an operator token,
-# point a git remote / the web app at it. The companion runbook is docs/dogfood.md.
+# Myelin FOUNDER-SELF_HOST helper (R4.0) — bring the real `edge` binary up, mint an operator token,
+# point a git remote / the web app at it. The companion runbook is docs/self-host.md.
 #
-#   ./scripts/dogfood.sh env               print the full dogfood env contract (eval-able), incl. the
+#   ./scripts/self-host.sh env               print the full self-host env contract (eval-able), incl. the
 #                                          seal-key handling (generates the key once, reuses it)
-#   ./scripts/dogfood.sh edge              build + run the edge over the dogfood env (serves :8080)
-#   ./scripts/dogfood.sh ci                build + run the opt-in CI control plane/runner in the
-#                                          foreground over the same dogfood cell
-#   ./scripts/dogfood.sh verify-ci-rootfs  prove the staged runner rootfs matches the digest pinned
+#   ./scripts/self-host.sh edge              build + run the edge over the self-host env (serves :8080)
+#   ./scripts/self-host.sh ci                build + run the opt-in CI control plane/runner in the
+#                                          foreground over the same self-host cell
+#   ./scripts/self-host.sh verify-ci-rootfs  prove the staged runner rootfs matches the digest pinned
 #                                          by the checked-in founder pipeline
-#   ./scripts/dogfood.sh publisher         provision the bounded shared JetStream stream, then run
+#   ./scripts/self-host.sh publisher         provision the bounded shared JetStream stream, then run
 #                                          the elected least-privilege outbox publisher
-#   ./scripts/dogfood.sh dispatch          build + run the Git-event→CI-run dispatch consumer
-#   ./scripts/dogfood.sh git-checks        build + run Git's CI-check projection consumer
-#   ./scripts/dogfood.sh verify-check <repo> <pr> <head-oid> [context]
+#   ./scripts/self-host.sh dispatch          build + run the Git-event→CI-run dispatch consumer
+#   ./scripts/self-host.sh git-checks        build + run Git's CI-check projection consumer
+#   ./scripts/self-host.sh verify-check <repo> <pr> <head-oid> [context]
 #                                          read-only proof that an exact PR head surfaced a required
 #                                          settled green context through the production edge
-#   ./scripts/dogfood.sh verify-ci <run> <job> <marker> [evidence-dir]
+#   ./scripts/self-host.sh verify-ci <run> <job> <marker> [evidence-dir]
 #                                          read-only proof that the exact successful/settled run has
 #                                          one byte-exact archived marker matching its live capture
-#   ./scripts/dogfood.sh bootstrap -- <flags>
-#                                          run `edge bootstrap <flags>` over the dogfood env, e.g.
-#                                            ./scripts/dogfood.sh bootstrap -- --tenant acme --principal founder \
+#   ./scripts/self-host.sh bootstrap -- <flags>
+#                                          run `edge bootstrap <flags>` over the self-host env, e.g.
+#                                            ./scripts/self-host.sh bootstrap -- --tenant acme --principal founder \
 #                                              --issues-project 20aee030-c7fa-4757-8243-700faf528690
 #                                          prints the capability token to STDOUT (nothing else)
-#   printf '%s' "$SECRET" | ./scripts/dogfood.sh secret -- <operation> <flags>
+#   printf '%s' "$SECRET" | ./scripts/self-host.sh secret -- <operation> <flags>
 #                                          run authenticated `edge secret ...`; secret material for
 #                                          create/update/rotate is read only from STDIN
-#   ./scripts/dogfood.sh web               print (or, with EXEC=1, run) the frontend start wired to
+#   ./scripts/self-host.sh web               print (or, with EXEC=1, run) the frontend start wired to
 #                                          MYELIN_EDGE_URL=http://127.0.0.1:8080
 #
 # The DATA LAYER (Postgres/Valkey/NATS/S3) must be up first — `./scripts/dev-stack.sh up`. This script
@@ -35,7 +35,7 @@
 #
 # THE SEAL KEY IS THE ROOT OF TRUST. It unseals BOTH the KMS root AND the capability-token cell root.
 # It is generated ONCE into a 0600 file and reused; LOSE IT AND YOU LOSE EVERYTHING (all encrypted
-# columns + every minted token stops verifying). Back it up (see docs/dogfood.md).
+# columns + every minted token stops verifying). Back it up (see docs/self-host.md).
 set -euo pipefail
 # Never inherit caller xtrace into a script that handles the seal key or an operator credential.
 set +x
@@ -54,9 +54,9 @@ GVISOR_ROOTFS_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/rootfs
 # The git WIRE (clone/fetch/push) runs a real `git` inside a gVisor sandbox, so it needs a git-bearing
 # rootfs staged (scripts/stage-git-rootfs.sh). Default location mirrors resolved_gvisor_git_rootfs().
 GIT_ROOTFS_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/git-rootfs"
-DOGFOOD_ISSUES_PROJECT="20aee030-c7fa-4757-8243-700faf528690"
-DOGFOOD_ISSUES_TYPE="7d457754-f6a1-4cd8-8738-21751570b627"
-DOGFOOD_ISSUES_PREFIX="MYL"
+SELF_HOST_ISSUES_PROJECT="20aee030-c7fa-4757-8243-700faf528690"
+SELF_HOST_ISSUES_TYPE="7d457754-f6a1-4cd8-8738-21751570b627"
+SELF_HOST_ISSUES_PREFIX="MYL"
 
 # Generate the seal key ONCE (0600), reuse thereafter. openssl if present, else /dev/urandom. NEVER
 # regenerated over an existing key (that would orphan the KMS root + every minted token, fail-closed).
@@ -74,11 +74,11 @@ ensure_seal_key() {
     fi
   )
   chmod 600 "${SEAL_KEY_FILE}"
-  echo "dogfood: generated a NEW seal key at ${SEAL_KEY_FILE} (0600) — BACK THIS UP (see docs/dogfood.md)" >&2
+  echo "self-host: generated a NEW seal key at ${SEAL_KEY_FILE} (0600) — BACK THIS UP (see docs/self-host.md)" >&2
 }
 
 fail() {
-  echo "dogfood: $*" >&2
+  echo "self-host: $*" >&2
   exit 1
 }
 
@@ -174,15 +174,15 @@ print_env() {
   # The edge validates the pair, runs DDL only through the latter, then closes it before serving.
   cat <<EOF
 # ── the edge (R4.0) env ──
-export MYELIN_CELL_ID="\${MYELIN_CELL_ID:-cell-dogfood}"  # a DEDICATED cell (the shared 'cell-dev' root may be sealed under a different key)
+export MYELIN_CELL_ID="\${MYELIN_CELL_ID:-cell-self-host}"  # a DEDICATED cell (the shared 'cell-dev' root may be sealed under a different key)
 export MYELIN_KMS_SEAL_KEY="${seal}"   # the operator seal key (unseals the KMS root AND the token cell root)
 export MYELIN_GIT_ROOT="${git_root}"   # on-disk bare-repo root
 export MYELIN_CI_CHECKOUT_REPO_ROOT="${git_root}"  # checkout runner's boot-validated bare-repo root
 export MYELIN_REGION="${region}"       # residency region
-export MYELIN_ISSUES_RECONCILE_TENANTS="\${MYELIN_ISSUES_RECONCILE_TENANTS:-acme}"  # explicit FORCE-RLS partitions; defaults to the runbook's canonical dogfood tenant
-export MYELIN_DOGFOOD_ISSUES_PROJECT="\${MYELIN_DOGFOOD_ISSUES_PROJECT:-${DOGFOOD_ISSUES_PROJECT}}"  # canonical founder project UUID (bootstrap reader grant)
-export MYELIN_DOGFOOD_ISSUES_TYPE="\${MYELIN_DOGFOOD_ISSUES_TYPE:-${DOGFOOD_ISSUES_TYPE}}"        # explicit v1 type UUID (no type catalogue/FK yet)
-export MYELIN_DOGFOOD_ISSUES_PREFIX="\${MYELIN_DOGFOOD_ISSUES_PREFIX:-${DOGFOOD_ISSUES_PREFIX}}"                                     # canonical founder issue-key prefix
+export MYELIN_ISSUES_RECONCILE_TENANTS="\${MYELIN_ISSUES_RECONCILE_TENANTS:-acme}"  # explicit FORCE-RLS partitions; defaults to the runbook's canonical self-host tenant
+export MYELIN_SELF_HOST_ISSUES_PROJECT="\${MYELIN_SELF_HOST_ISSUES_PROJECT:-${SELF_HOST_ISSUES_PROJECT}}"  # canonical founder project UUID (bootstrap reader grant)
+export MYELIN_SELF_HOST_ISSUES_TYPE="\${MYELIN_SELF_HOST_ISSUES_TYPE:-${SELF_HOST_ISSUES_TYPE}}"        # explicit v1 type UUID (no type catalogue/FK yet)
+export MYELIN_SELF_HOST_ISSUES_PREFIX="\${MYELIN_SELF_HOST_ISSUES_PREFIX:-${SELF_HOST_ISSUES_PREFIX}}"                                     # canonical founder issue-key prefix
 export MYELIN_EDGE_ADDR="\${MYELIN_EDGE_ADDR:-127.0.0.1:8080}"
 export MYELIN_TOKEN_LOGIN="\${MYELIN_TOKEN_LOGIN:-1}"  # surface the operator-token web login in /v1/auth/config
 export MYELIN_GVISOR_ROOTFS="\${MYELIN_GVISOR_ROOTFS:-${rootfs}}"  # immutable hosted-CI base rootfs
@@ -192,7 +192,7 @@ export MYELIN_PUBLIC_BASE_URL="\${MYELIN_PUBLIC_BASE_URL:-http://\${MYELIN_EDGE_
 EOF
 }
 
-# Load the dogfood env into THIS shell (for `edge`/`bootstrap`).
+# Load the self-host env into THIS shell (for `edge`/`bootstrap`).
 load_env() {
   ensure_seal_key
   # shellcheck disable=SC1090
@@ -210,24 +210,24 @@ case "${cmd}" in
     load_env
     # Stage the sandboxed git-wire rootfs once (idempotent) so clone/fetch/push work out of the box.
     if [[ ! -x "${MYELIN_GVISOR_GIT_ROOTFS}/usr/bin/git" ]]; then
-      echo "dogfood: staging the git-wire rootfs (${MYELIN_GVISOR_GIT_ROOTFS}) …" >&2
+      echo "self-host: staging the git-wire rootfs (${MYELIN_GVISOR_GIT_ROOTFS}) …" >&2
       "${REPO_ROOT}/scripts/stage-git-rootfs.sh" >/dev/null
     fi
-    echo "dogfood: building + serving the edge on ${MYELIN_EDGE_ADDR} (git root ${MYELIN_GIT_ROOT})" >&2
+    echo "self-host: building + serving the edge on ${MYELIN_EDGE_ADDR} (git root ${MYELIN_GIT_ROOT})" >&2
     exec cargo run --quiet -p myelin-edge --bin edge
     ;;
   ci)
     load_env
     verify_ci_rootfs >/dev/null
     export MYELIN_CI_RUNNER=1
-    echo "dogfood: building + serving the CI control plane with the runner enabled" >&2
+    echo "self-host: building + serving the CI control plane with the runner enabled" >&2
     exec cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane
     ;;
   publisher)
     load_env
-    echo "dogfood: provisioning the bounded shared event stream" >&2
+    echo "self-host: provisioning the bounded shared event stream" >&2
     cargo run --quiet -p myelin-outbox-publisher -- provision
-    echo "dogfood: serving the elected least-privilege outbox publisher" >&2
+    echo "self-host: serving the elected least-privilege outbox publisher" >&2
     exec cargo run --quiet -p myelin-outbox-publisher -- serve
     ;;
   verify-ci-rootfs)
@@ -239,12 +239,12 @@ case "${cmd}" in
     ;;
   dispatch)
     load_env
-    echo "dogfood: building + serving the Git-event → CI-run dispatch consumer" >&2
+    echo "self-host: building + serving the Git-event → CI-run dispatch consumer" >&2
     exec cargo run --quiet -p myelin-ci-dispatch --bin ci-dispatch
     ;;
   git-checks)
     load_env
-    echo "dogfood: building + serving Git's durable CI-check projection consumer" >&2
+    echo "self-host: building + serving Git's durable CI-check projection consumer" >&2
     exec cargo run --quiet -p myelin-git --bin git-check-projection
     ;;
   verify-check)
@@ -253,16 +253,16 @@ case "${cmd}" in
       exit 2
     fi
     if ! command -v curl >/dev/null 2>&1 || ! command -v jq >/dev/null 2>&1; then
-      echo "dogfood: verify-check requires curl and jq" >&2
+      echo "self-host: verify-check requires curl and jq" >&2
       exit 2
     fi
     if [[ -z "${MYELIN_TOKEN:-}" ]]; then
-      echo "dogfood: MYELIN_TOKEN is required for the read-only verification" >&2
+      echo "self-host: MYELIN_TOKEN is required for the read-only verification" >&2
       exit 2
     fi
     token_re='^v4\.public\.[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+)?$'
     if [[ ! "${MYELIN_TOKEN}" =~ ${token_re} || ! "${MYELIN_TOKEN_SCHEME:-agent}" =~ ^[a-z0-9._-]+$ ]]; then
-      echo "dogfood: token or token scheme has a noncanonical transport shape" >&2
+      echo "self-host: token or token scheme has a noncanonical transport shape" >&2
       exit 2
     fi
     repo="$1"
@@ -276,7 +276,7 @@ case "${cmd}" in
     fi
     if [[ ! "${pr_number}" =~ ^[1-9][0-9]*$ || -z "${repo}" || -z "${expected_head}" ||
           ! "${context}" =~ ^(ci|external)/[^[:space:]]+$ ]]; then
-      echo "dogfood: repo, positive PR number, head OID, and context must be non-empty" >&2
+      echo "self-host: repo, positive PR number, head OID, and context must be non-empty" >&2
       exit 2
     fi
     edge_url="${MYELIN_EDGE_URL:-http://127.0.0.1:8080}"
@@ -296,7 +296,7 @@ case "${cmd}" in
     jq -e --arg expected_head "${expected_head}" \
       '.durable == true and .head_oid == $expected_head' \
       <<<"${pr_json}" >/dev/null || {
-        echo "dogfood: PR head does not match the expected pushed commit" >&2
+        echo "self-host: PR head does not match the expected pushed commit" >&2
         exit 1
       }
     jq -e --arg context "${context}" '
@@ -305,7 +305,7 @@ case "${cmd}" in
       and (.green_contexts | index($context) != null)
       and (.fork_unendorsed_contexts | index($context) == null)
     ' <<<"${checks_json}" >/dev/null || {
-      echo "dogfood: the required context is not a surfaced settled trusted success" >&2
+      echo "self-host: the required context is not a surfaced settled trusted success" >&2
       exit 1
     }
     jq -n \
@@ -323,17 +323,17 @@ case "${cmd}" in
     fi
     for tool in curl jq base64 sha256sum grep wc mktemp awk cat chmod mkdir rmdir; do
       command -v "${tool}" >/dev/null 2>&1 || {
-        echo "dogfood: verify-ci requires ${tool}" >&2
+        echo "self-host: verify-ci requires ${tool}" >&2
         exit 2
       }
     done
     if [[ -z "${MYELIN_TOKEN:-}" ]]; then
-      echo "dogfood: MYELIN_TOKEN is required for the read-only verification" >&2
+      echo "self-host: MYELIN_TOKEN is required for the read-only verification" >&2
       exit 2
     fi
     token_re='^v4\.public\.[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+)?$'
     if [[ ! "${MYELIN_TOKEN}" =~ ${token_re} || ! "${MYELIN_TOKEN_SCHEME:-agent}" =~ ^[a-z0-9._-]+$ ]]; then
-      echo "dogfood: token or token scheme has a noncanonical transport shape" >&2
+      echo "self-host: token or token scheme has a noncanonical transport shape" >&2
       exit 2
     fi
     run="$1"
@@ -342,11 +342,11 @@ case "${cmd}" in
     evidence_dir="${4:-${XDG_STATE_HOME:-$HOME/.local/state}/myelin/acceptance}"
     uuid_re='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     if [[ ! "${run}" =~ ${uuid_re} || ! "${job}" =~ ${uuid_re} ]]; then
-      echo "dogfood: run and job must be canonical lowercase UUIDs" >&2
+      echo "self-host: run and job must be canonical lowercase UUIDs" >&2
       exit 2
     fi
     if [[ ! "${marker}" =~ ^MYELIN-CI-[0-9a-f]{32}$ ]]; then
-      echo "dogfood: marker must have the unambiguous form MYELIN-CI-<32 lowercase hex characters>" >&2
+      echo "self-host: marker must have the unambiguous form MYELIN-CI-<32 lowercase hex characters>" >&2
       exit 2
     fi
     mkdir -p "${evidence_dir}"
@@ -512,9 +512,9 @@ case "${cmd}" in
       fi
     done
     if [[ "${has_issues_project}" == "0" ]]; then
-      set -- "$@" --issues-project "${MYELIN_DOGFOOD_ISSUES_PROJECT}"
+      set -- "$@" --issues-project "${MYELIN_SELF_HOST_ISSUES_PROJECT}"
     fi
-    echo "dogfood: minting an operator token (edge bootstrap $*) — the token prints to STDOUT" >&2
+    echo "self-host: minting an operator token (edge bootstrap $*) — the token prints to STDOUT" >&2
     exec cargo run --quiet -p myelin-edge --bin edge -- bootstrap "$@"
     ;;
   secret)
@@ -523,40 +523,40 @@ case "${cmd}" in
     if [[ "${1:-}" == "--" ]]; then shift; fi
     load_env
     if [[ -z "${MYELIN_TOKEN:-}" ]]; then
-      echo "dogfood: MYELIN_TOKEN is required for secret administration" >&2
+      echo "self-host: MYELIN_TOKEN is required for secret administration" >&2
       exit 2
     fi
     token_re='^v4\.public\.[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+\|[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+)?$'
     if [[ ! "${MYELIN_TOKEN}" =~ ${token_re} || ! "${MYELIN_TOKEN_SCHEME:-agent}" =~ ^[a-z0-9._-]+$ ]]; then
-      echo "dogfood: token or token scheme has a noncanonical transport shape" >&2
+      echo "self-host: token or token scheme has a noncanonical transport shape" >&2
       exit 2
     fi
-    echo "dogfood: running authenticated edge secret operator command" >&2
+    echo "self-host: running authenticated edge secret operator command" >&2
     exec cargo run --quiet -p myelin-edge --bin edge -- secret "$@"
     ;;
   web)
     export MYELIN_EDGE_URL="http://127.0.0.1:8080"
     # The web create action injects this one server-side target. Export only these non-secret
     # canonical identifiers here (not the wider edge env / seal key).
-    export MYELIN_DOGFOOD_ISSUES_PROJECT="${MYELIN_DOGFOOD_ISSUES_PROJECT:-${DOGFOOD_ISSUES_PROJECT}}"
-    export MYELIN_DOGFOOD_ISSUES_TYPE="${MYELIN_DOGFOOD_ISSUES_TYPE:-${DOGFOOD_ISSUES_TYPE}}"
-    export MYELIN_DOGFOOD_ISSUES_PREFIX="${MYELIN_DOGFOOD_ISSUES_PREFIX:-${DOGFOOD_ISSUES_PREFIX}}"
+    export MYELIN_SELF_HOST_ISSUES_PROJECT="${MYELIN_SELF_HOST_ISSUES_PROJECT:-${SELF_HOST_ISSUES_PROJECT}}"
+    export MYELIN_SELF_HOST_ISSUES_TYPE="${MYELIN_SELF_HOST_ISSUES_TYPE:-${SELF_HOST_ISSUES_TYPE}}"
+    export MYELIN_SELF_HOST_ISSUES_PREFIX="${MYELIN_SELF_HOST_ISSUES_PREFIX:-${SELF_HOST_ISSUES_PREFIX}}"
     if [[ "${EXEC:-0}" == "1" ]]; then
-      echo "dogfood: starting the frontend (MYELIN_EDGE_URL=${MYELIN_EDGE_URL})" >&2
+      echo "self-host: starting the frontend (MYELIN_EDGE_URL=${MYELIN_EDGE_URL})" >&2
       cd "${REPO_ROOT}/frontend/apps/web"
       exec pnpm dev
     fi
     cat <<EOF
 # The web operator UI is served by pnpm/vinxi in frontend/apps/web. Point it at the edge:
 export MYELIN_EDGE_URL="http://127.0.0.1:8080"
-export MYELIN_DOGFOOD_ISSUES_PROJECT="${MYELIN_DOGFOOD_ISSUES_PROJECT}"
-export MYELIN_DOGFOOD_ISSUES_TYPE="${MYELIN_DOGFOOD_ISSUES_TYPE}"
-export MYELIN_DOGFOOD_ISSUES_PREFIX="${MYELIN_DOGFOOD_ISSUES_PREFIX}"
+export MYELIN_SELF_HOST_ISSUES_PROJECT="${MYELIN_SELF_HOST_ISSUES_PROJECT}"
+export MYELIN_SELF_HOST_ISSUES_TYPE="${MYELIN_SELF_HOST_ISSUES_TYPE}"
+export MYELIN_SELF_HOST_ISSUES_PREFIX="${MYELIN_SELF_HOST_ISSUES_PREFIX}"
 cd frontend/apps/web && pnpm install && pnpm dev
-# The operator-token login surface is gated by MYELIN_TOKEN_LOGIN=1 on the edge (see \`dogfood.sh env\`);
+# The operator-token login surface is gated by MYELIN_TOKEN_LOGIN=1 on the edge (see \`self-host.sh env\`);
 # the web login form that consumes it landed in R4.0 (paste the \`edge bootstrap\` token on /login). The
-# CLI (\`myelin login --token <token> --scheme agent\`) and a git remote (see docs/dogfood.md) also work.
-# (Re-run with EXEC=1 ./scripts/dogfood.sh web to actually start it.)
+# CLI (\`myelin login --token <token> --scheme agent\`) and a git remote (see docs/self-host.md) also work.
+# (Re-run with EXEC=1 ./scripts/self-host.sh web to actually start it.)
 EOF
     ;;
   *)

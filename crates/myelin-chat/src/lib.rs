@@ -7,7 +7,7 @@ pub mod conversation;
 pub mod cross_org;
 pub mod dek;
 pub mod dispatch;
-pub mod dogfood;
+pub mod self_tenant;
 pub mod e2e_wedge;
 pub mod erase;
 pub mod events;
@@ -58,12 +58,12 @@ pub use dispatch::{
     no_auto_spawn_path_is_wired, reserve_gate, AgentProvenance, DispatchOutcome, Disposition,
     L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
 };
-pub use dogfood::{
-    myelin_chat_channels, ChatDogfoodArtifact, MyelinChannel, MYELIN_SELF_REGION,
+pub use self_tenant::{
+    myelin_chat_channels, ChatSelfTenantArtifact, MyelinChannel, MYELIN_SELF_REGION,
     MYELIN_SELF_TENANT,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use dogfood::run_chat_over_myelins_own_work;
+pub use self_tenant::run_chat_over_myelins_own_work;
 pub use e2e_wedge::ChatE2eArtifact;
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::run_chat_e2e_wedge;

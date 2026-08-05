@@ -103,7 +103,7 @@ fn myelin_self_hosts_as_one_cell_residency_verify_green_truth_up_passes() {
         .expect_green();
 
     println!(
-        "[P-508 CP-D23/dogfood GREEN 2026-06-25] Myelin self-hosts as EXACTLY one cell \
+        "[P-508 CP-D23/self_tenant GREEN 2026-06-25] Myelin self-hosts as EXACTLY one cell \
          (cell-myelin, fr-par; registry cell_count={}): the Myelin team placed as real tenant data \
          (home_cell=cell-myelin, discover→'this cell'); residency_verify GREEN on the platform's OWN \
          data ({} M1 stores attested, region_mismatches={}, signature={}…, verifies); the truth-up \
@@ -121,7 +121,7 @@ fn myelin_self_hosts_as_one_cell_residency_verify_green_truth_up_passes() {
 }
 
 #[test]
-fn dogfood_gate_is_not_vacuous() {
+fn self_tenant_gate_is_not_vacuous() {
     let mut rows = proven_tenancy_rows("2026-06-25");
     rows.iter_mut()
         .find(|r| r.id == "CP-D3")

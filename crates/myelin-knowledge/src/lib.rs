@@ -6,7 +6,7 @@ pub mod comments;
 pub mod compaction;
 pub mod database;
 #[cfg(any(test, feature = "test-support"))]
-pub mod dogfood;
+pub mod self_tenant;
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
 pub mod editor;
@@ -55,9 +55,9 @@ pub use database::{
     ViewQuery, FACET_PROMOTION_THRESHOLD,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use dogfood::{
+pub use self_tenant::{
     myelin_knowledge_space, proven_knowledge_rows, run_knowledge_over_myelins_own_work,
-    run_knowledge_truth_up_scorecard, KnowledgeDogfoodArtifact, KnowledgeIncident,
+    run_knowledge_truth_up_scorecard, KnowledgeSelfTenantArtifact, KnowledgeIncident,
     KnowledgeIncidentDrillTicket, KnowledgeIncidentIssueDraft, KnowledgeRowStatus,
     KnowledgeScorecardEntry, KnowledgeTruthUpPass, KnowledgeTruthUpRed, KnowledgeTruthUpScorecard,
     KnowledgeTruthUpVerdict, MyelinDoc, ProvenKnowledgeRow, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,

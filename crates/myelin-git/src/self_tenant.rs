@@ -5,16 +5,16 @@ pub const MYELIN_SELF_TENANT: &str = "myelin";
 pub const MYELIN_SELF_REGION: &str = "fr-par";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the dogfood artifact must be checked - an unread RED face silently claims a green git \
+#[must_use = "the self_tenant artifact must be checked - an unread RED face silently claims a green git \
               did not earn on Myelin's own repositories (EI-01 §1/§3)"]
-pub struct GitDogfoodArtifact {
+pub struct GitSelfTenantArtifact {
     pub date: String,
     pub pr_context_pane: E2eArtifact,
     pub fix_pr_flagship: E2eArtifact,
     pub spec_to_ship: E2eArtifact,
 }
 
-impl GitDogfoodArtifact {
+impl GitSelfTenantArtifact {
     pub fn is_green(&self) -> bool {
         self.pr_context_pane.is_green()
             && self.fix_pr_flagship.is_green()
@@ -29,7 +29,7 @@ impl GitDogfoodArtifact {
 
     pub fn summary(&self) -> String {
         format!(
-            "P-518 GIT DOGFOOD {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
+            "P-518 GIT SELF_TENANT {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
              pr-pane={} fix-pr-flagship={} (merge_count={}) spec-to-ship={} total-leaks={} verdict={}",
             self.date,
             self.pr_context_pane.is_green(),
@@ -42,8 +42,8 @@ impl GitDogfoodArtifact {
     }
 }
 
-pub fn run_git_over_myelins_own_repos(date: &str) -> GitDogfoodArtifact {
-    GitDogfoodArtifact {
+pub fn run_git_over_myelins_own_repos(date: &str) -> GitSelfTenantArtifact {
+    GitSelfTenantArtifact {
         date: date.to_string(),
         pr_context_pane: run_e2e_1_pr_pane(),
         fix_pr_flagship: run_e2e_2_fix_pr(),
@@ -493,7 +493,7 @@ mod tests {
         );
 
         let s = artifact.summary();
-        assert!(s.contains("P-518 GIT DOGFOOD 2026-06-26"), "dated: {s}");
+        assert!(s.contains("P-518 GIT SELF_TENANT 2026-06-26"), "dated: {s}");
         assert!(s.contains("verdict=GREEN"), "verdict: {s}");
         assert!(
             s.contains("tenant=myelin") && s.contains("region=fr-par"),
@@ -570,23 +570,23 @@ mod tests {
     #[test]
     fn an_incident_files_an_issue_and_a_repro_drill_ticket() {
         let incident = GitIncident::new(
-            "INC-GIT-DOGFOOD-1",
+            "INC-GIT-SELF_TENANT-1",
             "GIT-D9",
             "a receive-pack regression left a ghost ref without its outbox event on the Myelin self-tenant",
-            "repro_git_d9_dogfood_ghost_ref",
+            "repro_git_d9_self_tenant_ghost_ref",
         );
         let draft = incident.issue_draft();
         assert_eq!(draft.gate_id, "GIT-D9");
-        assert!(draft.title.contains("INC-GIT-DOGFOOD-1"));
+        assert!(draft.title.contains("INC-GIT-SELF_TENANT-1"));
         assert!(
-            draft.body.contains("repro_git_d9_dogfood_ghost_ref"),
+            draft.body.contains("repro_git_d9_self_tenant_ghost_ref"),
             "the issue is reference-linked to its repro drill: {}",
             draft.body
         );
         assert!(!draft.body.to_lowercase().contains("email"));
 
         let ticket = incident.drill_ticket();
-        assert_eq!(ticket.drill_name, "repro_git_d9_dogfood_ghost_ref");
+        assert_eq!(ticket.drill_name, "repro_git_d9_self_tenant_ghost_ref");
         assert_eq!(ticket.gate_id, "GIT-D9");
     }
 

@@ -1,9 +1,9 @@
-# GREEN fixture: 1.1 covered by a real pair file; 4.3 deferred with a landing prompt.
+# GREEN fixture: 1.1 covered by a real test file; 4.3 deferred with a landing prompt.
 [[contract]]
 row = "1.1"
 title = "serve"
 status = "covered"
-cdc = ["crates/myelin-lints/tests/fixtures/cdc_pair.green.rs.txt"]
+cdc = ["crates/myelin-lints/tests/fixtures/cdc_tests.green.rs.txt"]
 
 [[contract]]
 row = "4.3"

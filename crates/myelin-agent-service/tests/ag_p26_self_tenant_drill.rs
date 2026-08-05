@@ -3,7 +3,7 @@ use myelin_harness::{DrillContext, DrillRegistry, DrillScenario};
 
 use myelin_agent_service::{
     proven_fabric_rows, run_fabric_over_myelins_own_work, run_fabric_truth_up_scorecard,
-    run_myelin_triage_on_ci_failure, FabricIncident, FabricTruthUpPass, DOGFOOD_RUNTIME_FLOOR,
+    run_myelin_triage_on_ci_failure, FabricIncident, FabricTruthUpPass, SELF_TENANT_RUNTIME_FLOOR,
 };
 
 const RUN_DATE: &str = "2026-06-26";
@@ -44,7 +44,7 @@ fn myelins_own_agent_runs_on_the_self_hosting_graph() {
 
     let line = artifact.summary();
     assert!(
-        line.contains("P-517 FABRIC DOGFOOD 2026-06-26") && line.contains("verdict=GREEN"),
+        line.contains("P-517 FABRIC SELF_TENANT 2026-06-26") && line.contains("verdict=GREEN"),
         "dated artifact: {line}"
     );
     println!("{line}");
@@ -88,19 +88,19 @@ fn the_truth_up_pass_confirms_every_proven_fabric_row_is_dated() {
 #[test]
 fn a_fabric_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     let incident = FabricIncident::new(
-        "INC-AG-DOGFOOD-1",
+        "INC-AG-SELF_TENANT-1",
         "AG-D11",
         "a reserve/settle regression left an in-flight triage run torn down on the Myelin self-tenant",
-        "repro_ag_d11_dogfood_runaway_self_limiter",
+        "repro_ag_d11_self_tenant_runaway_self_limiter",
     );
 
     let draft = incident.issue_draft();
     assert_eq!(draft.gate_id, "AG-D11");
-    assert!(draft.title.contains("INC-AG-DOGFOOD-1"));
+    assert!(draft.title.contains("INC-AG-SELF_TENANT-1"));
     assert!(
         draft
             .body
-            .contains("repro_ag_d11_dogfood_runaway_self_limiter"),
+            .contains("repro_ag_d11_self_tenant_runaway_self_limiter"),
         "the issue is reference-linked to its repro drill: {}",
         draft.body
     );
@@ -111,10 +111,10 @@ fn a_fabric_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     registry.register_drill(DrillScenario::new(
         drill_name.clone(),
         move |ctx: &mut DrillContext| {
-            let dogfood = run_fabric_over_myelins_own_work(RUN_DATE);
+            let self_tenant = run_fabric_over_myelins_own_work(RUN_DATE);
             ctx.signals.set_scalar(
                 SignalName::DeadLetterCount,
-                if dogfood.is_green() { 0 } else { 1 },
+                if self_tenant.is_green() { 0 } else { 1 },
             );
             ctx.signals
                 .assert_signal(SignalName::DeadLetterCount, Predicate::Eq(0))
@@ -142,17 +142,17 @@ fn a_fabric_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
 }
 
 #[test]
-fn dogfood_loop_end_to_end_self_hosting() {
-    let dogfood = run_myelin_triage_on_ci_failure("cafef00d", 0x5170);
+fn self_tenant_loop_end_to_end_self_hosting() {
+    let self_tenant = run_myelin_triage_on_ci_failure("cafef00d", 0x5170);
     assert!(
-        dogfood.is_green(),
-        "the platform's own triage agent runs green on a real Myelin CI failure: {dogfood:?}"
+        self_tenant.is_green(),
+        "the platform's own triage agent runs green on a real Myelin CI failure: {self_tenant:?}"
     );
     assert_eq!(
-        dogfood.reserved, dogfood.settled,
-        "reserve/settle BALANCED on the dogfood run"
+        self_tenant.reserved, self_tenant.settled,
+        "reserve/settle BALANCED on the self_tenant run"
     );
-    assert!(dogfood.trace_ref.starts_with("blake3:"), "a trace per run");
+    assert!(self_tenant.trace_ref.starts_with("blake3:"), "a trace per run");
 
     let rows = proven_fabric_rows(RUN_DATE);
     let confirmed = FabricTruthUpPass::new()
@@ -161,11 +161,11 @@ fn dogfood_loop_end_to_end_self_hosting() {
     assert!(confirmed >= 11);
 
     let incident = FabricIncident::new(
-        "INC-AG-DOGFOOD-E2E",
+        "INC-AG-SELF_TENANT-E2E",
         "E2E-2",
         "a triage run on a Myelin CI failure left the reserve/settle ledger unbalanced under an \
          at-least-once settle re-delivery",
-        "repro_e2e2_dogfood_triage_balanced_ledger",
+        "repro_e2e2_self_tenant_triage_balanced_ledger",
     );
     let _draft = incident.issue_draft();
     let ticket = incident.drill_ticket();
@@ -187,15 +187,15 @@ fn dogfood_loop_end_to_end_self_hosting() {
     assert!(registry.all_green(), "the incident's repro re-runs green");
 
     assert!(
-        DOGFOOD_RUNTIME_FLOOR.contains("MOCK runtime") && DOGFOOD_RUNTIME_FLOOR.contains("AG-P25"),
-        "the dogfood runs on the mock runtime; the real LlmAgentRuntime swap is AG-P25"
+        SELF_TENANT_RUNTIME_FLOOR.contains("MOCK runtime") && SELF_TENANT_RUNTIME_FLOOR.contains("AG-P25"),
+        "the self_tenant runs on the mock runtime; the real LlmAgentRuntime swap is AG-P25"
     );
 
     println!(
-        "[P-517 DOGFOOD LOOP GREEN {RUN_DATE}] self-hosting: the platform's own triage agent runs on \
+        "[P-517 SELF_TENANT LOOP GREEN {RUN_DATE}] self-hosting: the platform's own triage agent runs on \
          a real Myelin CI failure (explicit-first dispatch + reserved=={settled} balanced + trace per \
          run); truth-up confirms {confirmed} PROVEN Fabric rows dated; incident→issue→repro-drill \
          registered + re-runs green. FLOOR: mock runtime (real LlmAgentRuntime swap = AG-P25).",
-        settled = dogfood.settled,
+        settled = self_tenant.settled,
     );
 }

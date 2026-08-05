@@ -1,6 +1,6 @@
 use myelin_substrate::thresholds::{IssuesSwitchTestThreshold, Thresholds};
 
-use crate::dogfood::myelin_issue_backlog;
+use crate::self_tenant::myelin_issue_backlog;
 use crate::views::IssueView;
 
 const SELF_TENANT: &str = "myelin";

@@ -17,47 +17,47 @@ use crate::restore_verify::GreenArtifact;
 use myelin_tenancy::Region;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum DogfoodStore {
+pub enum SelfTenantStore {
     Monorepo,
     CiLog,
     Issue,
     Doc,
 }
 
-impl DogfoodStore {
+impl SelfTenantStore {
     pub fn label(self) -> &'static str {
         match self {
-            DogfoodStore::Monorepo => "monorepo",
-            DogfoodStore::CiLog => "ci-log",
-            DogfoodStore::Issue => "issue",
-            DogfoodStore::Doc => "doc",
+            SelfTenantStore::Monorepo => "monorepo",
+            SelfTenantStore::CiLog => "ci-log",
+            SelfTenantStore::Issue => "issue",
+            SelfTenantStore::Doc => "doc",
         }
     }
 
-    pub const ALL: [DogfoodStore; 4] = [
-        DogfoodStore::Monorepo,
-        DogfoodStore::CiLog,
-        DogfoodStore::Issue,
-        DogfoodStore::Doc,
+    pub const ALL: [SelfTenantStore; 4] = [
+        SelfTenantStore::Monorepo,
+        SelfTenantStore::CiLog,
+        SelfTenantStore::Issue,
+        SelfTenantStore::Doc,
     ];
 }
 
 #[derive(Clone, Debug)]
-pub struct DogfoodRecord {
-    pub store: DogfoodStore,
+pub struct SelfTenantRecord {
+    pub store: SelfTenantStore,
     pub row_id: String,
     pub written_at: WalOffset,
     pub bytes: Vec<u8>,
 }
 
-impl DogfoodRecord {
+impl SelfTenantRecord {
     pub fn new(
-        store: DogfoodStore,
+        store: SelfTenantStore,
         row_id: impl Into<String>,
         written_at: WalOffset,
         bytes: impl Into<Vec<u8>>,
-    ) -> DogfoodRecord {
-        DogfoodRecord {
+    ) -> SelfTenantRecord {
+        SelfTenantRecord {
             store,
             row_id: row_id.into(),
             written_at,
@@ -67,34 +67,34 @@ impl DogfoodRecord {
 }
 
 #[derive(Clone, Debug)]
-pub struct DogfoodCorpus {
+pub struct SelfTenantCorpus {
     tenant: TenantId,
     region: Region,
-    records: Vec<DogfoodRecord>,
+    records: Vec<SelfTenantRecord>,
 }
 
-impl DogfoodCorpus {
-    pub fn new(tenant: TenantId, region: Region) -> DogfoodCorpus {
-        DogfoodCorpus {
+impl SelfTenantCorpus {
+    pub fn new(tenant: TenantId, region: Region) -> SelfTenantCorpus {
+        SelfTenantCorpus {
             tenant,
             region,
             records: Vec::new(),
         }
     }
 
-    pub fn commit(&mut self, record: DogfoodRecord) -> &mut Self {
+    pub fn commit(&mut self, record: SelfTenantRecord) -> &mut Self {
         self.records.push(record);
         self
     }
 
     pub fn commit_record(
         &mut self,
-        store: DogfoodStore,
+        store: SelfTenantStore,
         row_id: impl Into<String>,
         written_at: WalOffset,
         bytes: impl Into<Vec<u8>>,
     ) -> &mut Self {
-        self.commit(DogfoodRecord::new(store, row_id, written_at, bytes))
+        self.commit(SelfTenantRecord::new(store, row_id, written_at, bytes))
     }
 
     pub fn tenant(&self) -> &TenantId {
@@ -105,7 +105,7 @@ impl DogfoodCorpus {
         &self.region
     }
 
-    pub fn records(&self) -> &[DogfoodRecord] {
+    pub fn records(&self) -> &[SelfTenantRecord] {
         &self.records
     }
 
@@ -113,7 +113,7 @@ impl DogfoodCorpus {
         self.records.iter().map(|r| r.written_at).max().unwrap_or(0)
     }
 
-    pub fn stores_present(&self) -> std::collections::BTreeSet<DogfoodStore> {
+    pub fn stores_present(&self) -> std::collections::BTreeSet<SelfTenantStore> {
         self.records.iter().map(|r| r.store).collect()
     }
 
@@ -174,10 +174,10 @@ impl DogfoodCorpus {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn run_restore_verify_on_dogfood(
-    corpus: &DogfoodCorpus,
+pub fn run_restore_verify_on_self_tenant(
+    corpus: &SelfTenantCorpus,
     now_iso: &str,
-) -> Result<DogfoodGreenArtifact, crate::restore_verify::GateFailure> {
+) -> Result<SelfTenantGreenArtifact, crate::restore_verify::GateFailure> {
     let archiver = corpus.archiver();
     let objects = corpus.restored_objects();
     let rows = corpus.wal_rows();
@@ -197,12 +197,12 @@ pub fn run_restore_verify_on_dogfood(
 
     let artifact = RestoreVerifyGate::new().run_or_fail_ci(&inputs)?;
 
-    let mut by_store: BTreeMap<DogfoodStore, usize> = BTreeMap::new();
+    let mut by_store: BTreeMap<SelfTenantStore, usize> = BTreeMap::new();
     for r in corpus.records() {
         *by_store.entry(r.store).or_insert(0) += 1;
     }
 
-    Ok(DogfoodGreenArtifact {
+    Ok(SelfTenantGreenArtifact {
         gate: artifact,
         date: now_iso.to_string(),
         tenant: corpus.tenant().clone(),
@@ -212,15 +212,15 @@ pub fn run_restore_verify_on_dogfood(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DogfoodGreenArtifact {
+pub struct SelfTenantGreenArtifact {
     pub gate: GreenArtifact,
     pub date: String,
     pub tenant: TenantId,
     pub region: Region,
-    pub records_by_store: BTreeMap<DogfoodStore, usize>,
+    pub records_by_store: BTreeMap<SelfTenantStore, usize>,
 }
 
-impl DogfoodGreenArtifact {
+impl SelfTenantGreenArtifact {
     pub fn summary(&self) -> String {
         let breakdown: Vec<String> = self
             .records_by_store
@@ -228,7 +228,7 @@ impl DogfoodGreenArtifact {
             .map(|(store, n)| format!("{}={n}", store.label()))
             .collect();
         format!(
-            "[P-506 DOGFOOD RESTORE-VERIFY GREEN {date}] tenant={tenant} region={region}: {gate} \
+            "[P-506 SELF_TENANT RESTORE-VERIFY GREEN {date}] tenant={tenant} region={region}: {gate} \
              - verified Myelin's OWN data: {breakdown}",
             date = self.date,
             tenant = self.tenant.0,
@@ -266,7 +266,7 @@ impl StorageIncident {
         IncidentIssueDraft {
             title: format!("[storage incident {}] {}", self.id, self.summary),
             body: format!(
-                "A storage incident surfaced during dogfooding.\n\nGate touched: {}\nReproducing \
+                "A storage incident surfaced during self-hosting.\n\nGate touched: {}\nReproducing \
                  drill (registered into the permanent harness suite, re-runs forever): {}\n\nThe \
                  every-incident-adds-a-drill loop (EI-01 §3) requires this incident's repro join the \
                  suite - the drill below IS that repro.",
@@ -507,29 +507,29 @@ mod tests {
         Region::new("fr-par")
     }
 
-    fn self_host_corpus() -> DogfoodCorpus {
-        let mut corpus = DogfoodCorpus::new(TenantId("myelin-self".into()), region());
+    fn self_host_corpus() -> SelfTenantCorpus {
+        let mut corpus = SelfTenantCorpus::new(TenantId("myelin-self".into()), region());
         corpus
             .commit_record(
-                DogfoodStore::Monorepo,
+                SelfTenantStore::Monorepo,
                 "commit-abc123",
                 10,
                 b"fn main() {}".to_vec(),
             )
             .commit_record(
-                DogfoodStore::CiLog,
+                SelfTenantStore::CiLog,
                 "ci-run-42-step-3",
                 20,
                 b"cargo test ... ok".to_vec(),
             )
             .commit_record(
-                DogfoodStore::Issue,
+                SelfTenantStore::Issue,
                 "issue-P-506",
                 30,
-                b"dogfood the restore gate".to_vec(),
+                b"self_tenant the restore gate".to_vec(),
             )
             .commit_record(
-                DogfoodStore::Doc,
+                SelfTenantStore::Doc,
                 "doc-storage-arch",
                 40,
                 "# Storage §7".as_bytes().to_vec(),
@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn restore_verify_greens_on_myelins_own_stores() {
         let corpus = self_host_corpus();
-        let artifact = run_restore_verify_on_dogfood(&corpus, "2026-06-25")
+        let artifact = run_restore_verify_on_self_tenant(&corpus, "2026-06-25")
             .expect("the restore-verify gate must GREEN on Myelin's own data");
 
         assert_eq!(artifact.gate.restored_to_offset, 40);
@@ -566,7 +566,7 @@ mod tests {
         );
         let s = artifact.summary();
         assert!(
-            s.contains("P-506 DOGFOOD RESTORE-VERIFY GREEN 2026-06-25"),
+            s.contains("P-506 SELF_TENANT RESTORE-VERIFY GREEN 2026-06-25"),
             "dated: {s}"
         );
         assert!(
@@ -579,21 +579,21 @@ mod tests {
     }
 
     #[test]
-    fn the_dogfood_corpus_covers_all_four_own_stores() {
+    fn the_self_tenant_corpus_covers_all_four_own_stores() {
         let corpus = self_host_corpus();
         assert_eq!(
             corpus.stores_present(),
-            DogfoodStore::ALL.into_iter().collect(),
-            "the dogfood loop covers monorepo + ci-logs + issues + docs"
+            SelfTenantStore::ALL.into_iter().collect(),
+            "the self_tenant loop covers monorepo + ci-logs + issues + docs"
         );
     }
 
     #[test]
-    fn a_corrupt_own_data_record_fails_the_dogfood_gate() {
+    fn a_corrupt_own_data_record_fails_the_self_tenant_gate() {
         use crate::restore_verify::GateFailure;
 
         let corpus = self_host_corpus();
-        assert!(run_restore_verify_on_dogfood(&corpus, "2026-06-25").is_ok());
+        assert!(run_restore_verify_on_self_tenant(&corpus, "2026-06-25").is_ok());
 
         let archiver = corpus.archiver();
         let rows = corpus.wal_rows();
@@ -617,7 +617,7 @@ mod tests {
         };
         let err = RestoreVerifyGate::new()
             .run_or_fail_ci(&inputs)
-            .expect_err("a corrupt own-data record MUST fail the dogfood restore-verify gate");
+            .expect_err("a corrupt own-data record MUST fail the self_tenant restore-verify gate");
         assert!(
             matches!(err, GateFailure::ChecksumMismatch { ref content_address, .. } if *content_address == original_addr),
             "the gate names the corrupt own-data object: {err}"

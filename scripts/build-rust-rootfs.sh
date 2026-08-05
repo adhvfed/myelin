@@ -111,7 +111,7 @@ die() { echo "build-rust-rootfs: $*" >&2; exit 1; }
 
 command -v docker >/dev/null 2>&1 || die "\`docker\` is required on PATH to pull/export the Rust image"
 
-# The exact recipe scripts/dogfood.sh's verify_ci_rootfs() uses, reused for content pins here too.
+# The exact recipe scripts/self-host.sh's verify_ci_rootfs() uses, reused for content pins here too.
 # NOTE: this hashes file MODE bits too (via the tar header), not just content — a directory promoted
 # with the wrong permissions (e.g. mktemp -d's default 0700) produces a DIFFERENT digest, which is
 # exactly how a real permission regression was caught here on 2026-07-25 (see runner-assets.toml).

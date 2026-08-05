@@ -18,7 +18,7 @@ fn render_budget_us() -> u64 {
 }
 
 #[test]
-fn ci_p35_dogfood_switch_test_and_truth_up_pass_green() {
+fn ci_p35_self_tenant_switch_test_and_truth_up_pass_green() {
     let date = today();
 
     let caps = switch_capability_matrix();
@@ -97,8 +97,8 @@ fn ci_p35_dogfood_switch_test_and_truth_up_pass_green() {
     let mut incidents = IncidentDrillLoop::new();
     incidents.record(CiIncident {
         id: "INC-self-hosting-graph-bootstrap",
-        issue_ref: Some("myelin://myelin/issues/issue/CI-DOGFOOD-1"),
-        repro_drill_id: Some("self_hosting_ci_dogfood"),
+        issue_ref: Some("myelin://myelin/issues/issue/CI-SELF_TENANT-1"),
+        repro_drill_id: Some("self_hosting_ci_self_tenant"),
     });
     assert!(
         incidents.is_satisfied(),
@@ -112,7 +112,7 @@ fn ci_p35_dogfood_switch_test_and_truth_up_pass_green() {
 }
 
 #[test]
-fn ci_p35_dogfood_gate_is_not_vacuous() {
+fn ci_p35_self_tenant_gate_is_not_vacuous() {
     let mut caps = switch_capability_matrix();
     caps[0].reached_by_driving = false;
     caps[0].deferred_named_floor = false;

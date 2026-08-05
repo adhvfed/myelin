@@ -34,24 +34,24 @@ fn production_catalog_has_no_incompatible_duplicate_migration_ids() {
 }
 
 #[tokio::test]
-async fn dogfood_applied_rows_match_every_authoritative_production_ddl() {
+async fn self_tenant_applied_rows_match_every_authoritative_production_ddl() {
     let pool = PgPoolOptions::new()
         .max_connections(4)
         .connect(&MyelinConfig::dev().database_migration_url)
         .await
-        .expect("dogfood dev PostgreSQL must be reachable for the checksum activation audit");
+        .expect("self_tenant dev PostgreSQL must be reachable for the checksum activation audit");
     let sets = production_migration_sets();
     let collisions = migration_checksum_collisions(borrowed_sets(&sets));
     assert!(
         collisions.is_empty(),
-        "refuse dogfood audit over an ambiguous migration catalog: {collisions:#?}"
+        "refuse self_tenant audit over an ambiguous migration catalog: {collisions:#?}"
     );
 
     for (set_name, migrations) in &sets {
         PgMigrator::audit_applied_checksums(&pool, migrations)
             .await
             .unwrap_or_else(|error| {
-                panic!("dogfood migration set `{set_name}` is incompatible: {error}")
+                panic!("self_tenant migration set `{set_name}` is incompatible: {error}")
             });
     }
 
@@ -59,7 +59,7 @@ async fn dogfood_applied_rows_match_every_authoritative_production_ddl() {
         sqlx::query_as("SELECT id, checksum FROM myelin_applied_migration ORDER BY id")
             .fetch_all(&pool)
             .await
-            .expect("read dogfood applied migration ledger");
+            .expect("read self_tenant applied migration ledger");
     let mut expected = BTreeMap::new();
     for (_, migrations) in &sets {
         for migration in &migrations.0 {
@@ -72,7 +72,7 @@ async fn dogfood_applied_rows_match_every_authoritative_production_ddl() {
         .map(|(id, _)| id.as_str())
         .collect();
     eprintln!(
-        "dogfood checksum activation audit: {} authoritative ids, {} applied rows, {} historical/test-only rows ignored by the runtime guard: {historical_only:?}",
+        "self_tenant checksum activation audit: {} authoritative ids, {} applied rows, {} historical/test-only rows ignored by the runtime guard: {historical_only:?}",
         expected.len(),
         applied.len(),
         historical_only.len()

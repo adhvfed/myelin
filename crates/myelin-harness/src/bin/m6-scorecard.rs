@@ -4,10 +4,10 @@ use std::process::{Command, ExitCode};
 
 fn main() -> ExitCode {
     let date = today_iso();
-    let mut card = Scorecard::new(Band::M6Dogfood);
+    let mut card = Scorecard::new(Band::M6SelfTenant);
 
     println!(
-        "== M6 dogfooding exit-gate scorecard ({date}) - re-running every switch-test / self-hosting-CI / dogfood / truth-up drill =="
+        "== M6 self-hosting exit-gate scorecard ({date}) - re-running every switch-test / self-hosting-CI / self_tenant / truth-up drill =="
     );
     println!("   (the switch tests are driven over the real surface with measured contrast + latency; the self-hosting CI graph is green on the platform's own commits. Bring the live docker-compose stack up first.)\n");
     for row in m6_required_rows() {
@@ -40,11 +40,11 @@ fn main() -> ExitCode {
     println!("\nscorecard written to {}", path.display());
 
     if card.is_green() {
-        println!("\nGATE: GREEN - every M6 dogfood drill proven-and-dated (the switch tests + self-hosting-CI + the dogfood drills + STOR-D37 restore-verify on Myelin's own commits + the truth-up pass); the platform is dogfood-complete, M7 may start.");
-        println!("       (M6 green is DOGFOOD-COMPLETE, NOT production-ready - the M7 production floors, incl. sandbox prod-exec, are named dated deferrals filled by P-522..P-546, fail-closed at P-546.)");
+        println!("\nGATE: GREEN - every M6 self_tenant drill proven-and-dated (the switch tests + self-hosting-CI + the self_tenant drills + STOR-D37 restore-verify on Myelin's own commits + the truth-up pass); the platform is self_tenant-complete, M7 may start.");
+        println!("       (M6 green is SELF_TENANT-COMPLETE, NOT production-ready - the M7 production floors, incl. sandbox prod-exec, are named dated deferrals filled by P-522..P-546, fail-closed at P-546.)");
         ExitCode::SUCCESS
     } else {
-        eprintln!("\nGATE: RED - M7 is BLOCKED (the M6→M7 dogfooding go/no-go is red).");
+        eprintln!("\nGATE: RED - M7 is BLOCKED (the M6→M7 self-hosting go/no-go is red).");
         for missing in card.missing_required() {
             eprintln!("  MISSING required row: {missing}");
         }
@@ -80,5 +80,5 @@ fn scorecard_path() -> PathBuf {
         .to_path_buf();
     root.join("testing")
         .join("scorecards")
-        .join("m6-dogfood.md")
+        .join("m6-self_tenant.md")
 }

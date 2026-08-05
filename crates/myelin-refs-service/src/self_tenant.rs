@@ -37,16 +37,16 @@ fn myelin_ctx_base() -> EmitContextBase {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the dogfood artifact must be checked - an unread RED face silently claims a green the \
+#[must_use = "the self_tenant artifact must be checked - an unread RED face silently claims a green the \
               reference graph did not earn on Myelin's own work (EI-01 §1/§3)"]
-pub struct DogfoodArtifact {
+pub struct SelfTenantArtifact {
     pub date: String,
     pub pr_pane: E2eArtifact,
     pub spec_to_ship: E2eArtifact,
     pub holder_fanout: E2eArtifact,
 }
 
-impl DogfoodArtifact {
+impl SelfTenantArtifact {
     pub fn is_green(&self) -> bool {
         self.pr_pane.is_green() && self.spec_to_ship.is_green() && self.holder_fanout.is_green()
     }
@@ -57,7 +57,7 @@ impl DogfoodArtifact {
 
     pub fn summary(&self) -> String {
         format!(
-            "P-513 REFS DOGFOOD {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
+            "P-513 REFS SELF_TENANT {} - tenant={MYELIN_SELF_TENANT} region={MYELIN_SELF_REGION} \
              pr-pane={} spec-to-ship={} holder-fanout={} total-leaks={} verdict={}",
             self.date,
             self.pr_pane.is_green(),
@@ -70,8 +70,8 @@ impl DogfoodArtifact {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub fn run_refs_over_myelins_own_work(date: &str) -> DogfoodArtifact {
-    DogfoodArtifact {
+pub fn run_refs_over_myelins_own_work(date: &str) -> SelfTenantArtifact {
+    SelfTenantArtifact {
         date: date.to_string(),
         pr_pane: run_e2e_1_pr_pane(),
         spec_to_ship: run_e2e_3_spec_to_ship(myelin_ctx_base()),
@@ -513,7 +513,7 @@ mod tests {
         );
 
         let s = artifact.summary();
-        assert!(s.contains("P-513 REFS DOGFOOD 2026-06-26"), "dated: {s}");
+        assert!(s.contains("P-513 REFS SELF_TENANT 2026-06-26"), "dated: {s}");
         assert!(s.contains("verdict=GREEN"), "verdict: {s}");
         assert!(
             s.contains("tenant=myelin") && s.contains("region=fr-par"),
@@ -590,23 +590,23 @@ mod tests {
     #[test]
     fn an_incident_files_an_issue_and_a_repro_drill_ticket() {
         let incident = RefsIncident::new(
-            "INC-REFS-DOGFOOD-1",
+            "INC-REFS-SELF_TENANT-1",
             "REF-D1",
             "a resolve chokepoint regression leaked a denied issue title on the Myelin self-tenant",
-            "repro_ref_d1_dogfood_resolve_leak",
+            "repro_ref_d1_self_tenant_resolve_leak",
         );
         let draft = incident.issue_draft();
         assert_eq!(draft.gate_id, "REF-D1");
-        assert!(draft.title.contains("INC-REFS-DOGFOOD-1"));
+        assert!(draft.title.contains("INC-REFS-SELF_TENANT-1"));
         assert!(
-            draft.body.contains("repro_ref_d1_dogfood_resolve_leak"),
+            draft.body.contains("repro_ref_d1_self_tenant_resolve_leak"),
             "the issue is reference-linked to its repro drill: {}",
             draft.body
         );
         assert!(!draft.body.to_lowercase().contains("email"));
 
         let ticket = incident.drill_ticket();
-        assert_eq!(ticket.drill_name, "repro_ref_d1_dogfood_resolve_leak");
+        assert_eq!(ticket.drill_name, "repro_ref_d1_self_tenant_resolve_leak");
         assert_eq!(ticket.gate_id, "REF-D1");
     }
 }

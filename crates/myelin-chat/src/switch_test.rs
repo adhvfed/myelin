@@ -1,6 +1,6 @@
 use myelin_substrate::thresholds::{ChatSwitchTestThreshold, Thresholds};
 
-use crate::dogfood::myelin_chat_channels;
+use crate::self_tenant::myelin_chat_channels;
 
 const SELF_TENANT: &str = "myelin";
 

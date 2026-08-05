@@ -75,7 +75,7 @@ fn switch_corpus() -> TantivyBackend {
     .unwrap();
     be.upsert(&doc(
         "myelin/kn/page/SRCH-M6",
-        "the search milestone dogfooding production hardened over Myelin own work the switch test",
+        "the search milestone self-hosting production hardened over Myelin own work the switch test",
         "published",
         "p2",
         vec![0.9, 0.1, 0.0],
@@ -388,7 +388,7 @@ impl SearchSwitchTest {
                 &ast(Predicate::Cmp {
                     op: CmpOp::Eq,
                     lhs: Expr::Var(SEMANTIC_FIELD.into()),
-                    rhs: Expr::Lit(Literal::Str("dogfooding".into())),
+                    rhs: Expr::Lit(Literal::Str("self-hosting".into())),
                 }),
                 &user,
                 &kn_ty,

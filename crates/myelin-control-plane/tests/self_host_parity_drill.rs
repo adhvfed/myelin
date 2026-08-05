@@ -118,7 +118,7 @@ fn self_host_parity_degenerate_one_cell_identical_code_path() {
          ({} M1 stores attested, region_mismatches=0, signature={}…, verifies). NO self-host fork - the \
          answers came from the SHARED Registry/PlacementService/CellGateway/residency_verify. \
          Managed-fleet-only (cross-cell tenants, fleet deploy waves) is N/A by definition, NOT a gap. \
-         CP-D2/CP-D4 re-confirmed in the dogfood band P-CP-23.",
+         CP-D2/CP-D4 re-confirmed in the self_tenant band P-CP-23.",
         sh.registry().cell_count(),
         out_of_region_writes_admitted,
         attestation.store_regions.len(),

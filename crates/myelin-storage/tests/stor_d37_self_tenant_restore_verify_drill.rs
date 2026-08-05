@@ -1,39 +1,39 @@
 use myelin_harness::telemetry::{Predicate, SignalName};
 use myelin_harness::{DrillContext, DrillRegistry, DrillScenario};
-use myelin_storage::dogfood::{
-    proven_storage_rows, run_restore_verify_on_dogfood, DogfoodCorpus, DogfoodStore,
+use myelin_storage::self_tenant::{
+    proven_storage_rows, run_restore_verify_on_self_tenant, SelfTenantCorpus, SelfTenantStore,
     StorageIncident, TruthUpPass,
 };
 use myelin_tenancy::{Region, TenantId};
 
 const RUN_DATE: &str = "2026-06-25";
 
-fn myelin_own_corpus() -> DogfoodCorpus {
-    let mut corpus = DogfoodCorpus::new(TenantId("myelin-self".into()), Region::new("fr-par"));
+fn myelin_own_corpus() -> SelfTenantCorpus {
+    let mut corpus = SelfTenantCorpus::new(TenantId("myelin-self".into()), Region::new("fr-par"));
     corpus
         .commit_record(
-            DogfoodStore::Monorepo,
+            SelfTenantStore::Monorepo,
             "commit-d3b590c",
             100,
             b"P-444 M5: restore-verify at cell scale".to_vec(),
         )
         .commit_record(
-            DogfoodStore::CiLog,
+            SelfTenantStore::CiLog,
             "ci-run-506-step-2",
             110,
             b"cargo test --workspace ... ok".to_vec(),
         )
         .commit_record(
-            DogfoodStore::Issue,
+            SelfTenantStore::Issue,
             "issue-P-506",
             120,
-            b"Dogfood: restore-verify on Myelin's own commits".to_vec(),
+            b"SelfTenant: restore-verify on Myelin's own commits".to_vec(),
         )
         .commit_record(
-            DogfoodStore::Doc,
+            SelfTenantStore::Doc,
             "doc-storage-s-m6",
             130,
-            "# Storage §2 S-M6 - the dogfood loop".as_bytes().to_vec(),
+            "# Storage §2 S-M6 - the self_tenant loop".as_bytes().to_vec(),
         );
     corpus
 }
@@ -41,8 +41,8 @@ fn myelin_own_corpus() -> DogfoodCorpus {
 #[test]
 fn restore_verify_gate_runs_on_myelins_own_commits() {
     let corpus = myelin_own_corpus();
-    let artifact = run_restore_verify_on_dogfood(&corpus, RUN_DATE)
-        .expect("the restore-verify gate must run GREEN on Myelin's own stores (the dogfood loop)");
+    let artifact = run_restore_verify_on_self_tenant(&corpus, RUN_DATE)
+        .expect("the restore-verify gate must run GREEN on Myelin's own stores (the self_tenant loop)");
 
     assert_eq!(
         artifact.gate.restored_to_offset, 130,
@@ -72,7 +72,7 @@ fn restore_verify_gate_runs_on_myelins_own_commits() {
 
     let line = artifact.summary();
     assert!(
-        line.contains("P-506 DOGFOOD RESTORE-VERIFY GREEN 2026-06-25"),
+        line.contains("P-506 SELF_TENANT RESTORE-VERIFY GREEN 2026-06-25"),
         "dated artifact: {line}"
     );
     println!("{line}");
@@ -81,7 +81,7 @@ fn restore_verify_gate_runs_on_myelins_own_commits() {
 #[test]
 fn a_synthetic_storage_incident_files_an_issue_and_joins_the_permanent_drill_suite() {
     let incident = StorageIncident::new(
-        "INC-STOR-DOGFOOD-1",
+        "INC-STOR-SELF_TENANT-1",
         "STOR-D1",
         "a restored own-monorepo commit re-hashed wrong at a base-backup boundary",
         "repro_stor_d1_own_commit_rehash_at_base_boundary",
@@ -89,7 +89,7 @@ fn a_synthetic_storage_incident_files_an_issue_and_joins_the_permanent_drill_sui
 
     let draft = incident.issue_draft();
     assert_eq!(draft.gate_id, "STOR-D1");
-    assert!(draft.title.contains("INC-STOR-DOGFOOD-1"));
+    assert!(draft.title.contains("INC-STOR-SELF_TENANT-1"));
     assert!(
         draft
             .body
@@ -110,7 +110,7 @@ fn a_synthetic_storage_incident_files_an_issue_and_joins_the_permanent_drill_sui
         drill_name.clone(),
         move |ctx: &mut DrillContext| {
             let corpus = myelin_own_corpus();
-            let whole = run_restore_verify_on_dogfood(&corpus, RUN_DATE).is_ok();
+            let whole = run_restore_verify_on_self_tenant(&corpus, RUN_DATE).is_ok();
             ctx.signals
                 .set_scalar(SignalName::DeadLetterCount, if whole { 0 } else { 1 });
             ctx.signals
@@ -155,14 +155,14 @@ fn the_truth_up_pass_confirms_every_proven_storage_row_is_dated() {
 }
 
 #[test]
-fn dogfood_loop_end_to_end_self_hosting() {
+fn self_tenant_loop_end_to_end_self_hosting() {
     let corpus = myelin_own_corpus();
-    let artifact = run_restore_verify_on_dogfood(&corpus, RUN_DATE)
+    let artifact = run_restore_verify_on_self_tenant(&corpus, RUN_DATE)
         .expect("restore-verify green on Myelin's own commits");
     assert_eq!(artifact.gate.checksum_mismatches, 0);
 
     let incident = StorageIncident::new(
-        "INC-STOR-DOGFOOD-E2E",
+        "INC-STOR-SELF_TENANT-E2E",
         "STOR-D2",
         "a self-host cell-kill restore exceeded the RTO budget under a doc-edit surge",
         "repro_stor_d2_own_cell_kill_rto_under_doc_surge",
@@ -172,7 +172,7 @@ fn dogfood_loop_end_to_end_self_hosting() {
     let mut registry = DrillRegistry::new();
     let name = ticket.drill_name.clone();
     registry.register_drill(DrillScenario::new(name, move |ctx: &mut DrillContext| {
-        let whole = run_restore_verify_on_dogfood(&myelin_own_corpus(), RUN_DATE).is_ok();
+        let whole = run_restore_verify_on_self_tenant(&myelin_own_corpus(), RUN_DATE).is_ok();
         ctx.signals
             .set_scalar(SignalName::OutboxDepth, if whole { 0 } else { 1 });
         ctx.signals
@@ -186,5 +186,5 @@ fn dogfood_loop_end_to_end_self_hosting() {
         .expect("0 red earlier-band storage gates");
     assert!(confirmed >= 14);
 
-    println!("[P-506 DOGFOOD LOOP GREEN {RUN_DATE}] self-hosting: restore-verify on own commits green; incident→issue→repro-drill registered + re-runs green; truth-up confirms {confirmed} PROVEN rows dated");
+    println!("[P-506 SELF_TENANT LOOP GREEN {RUN_DATE}] self-hosting: restore-verify on own commits green; incident→issue→repro-drill registered + re-runs green; truth-up confirms {confirmed} PROVEN rows dated");
 }
