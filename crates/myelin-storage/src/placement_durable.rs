@@ -36,21 +36,21 @@ DECLARE
 BEGIN
     -- (3) region immutability (§5.3 layer 1): a region change is a new-tenant/new-cell, never UPDATE.
     IF TG_OP = 'UPDATE' AND OLD.region IS DISTINCT FROM NEW.region THEN
-        RAISE EXCEPTION 'placement invariant REJECTED tenant %: region is immutable (§5.3 layer 1) - a region change is a new-tenant-+-DSR, never an UPDATE (was %, attempted %)', NEW.tenant_id, OLD.region, NEW.region
+        RAISE EXCEPTION 'placement invariant REJECTED tenant %: region is immutable (§5.3 layer 1) — a region change is a new-tenant-+-DSR, never an UPDATE (was %, attempted %)', NEW.tenant_id, OLD.region, NEW.region
             USING ERRCODE = 'check_violation';
     END IF;
-    -- {home_cell} ∪ member_cells - the home cell is always part of the checked set.
+    -- {home_cell} ∪ member_cells — the home cell is always part of the checked set.
     FOREACH cell_to_check IN ARRAY (ARRAY[NEW.home_cell] || NEW.member_cells)
     LOOP
         SELECT region INTO found_region FROM cell WHERE cell_id = cell_to_check;
         IF NOT FOUND THEN
             -- (1) fail-closed: never admit a placement whose region pin cannot be verified.
-            RAISE EXCEPTION 'placement invariant REJECTED tenant %: cell % is not registered - a placement whose region pin cannot be verified is refused (fail-closed, §5.3)', NEW.tenant_id, cell_to_check
+            RAISE EXCEPTION 'placement invariant REJECTED tenant %: cell % is not registered — a placement whose region pin cannot be verified is refused (fail-closed, §5.3)', NEW.tenant_id, cell_to_check
                 USING ERRCODE = 'check_violation';
         END IF;
         IF found_region <> NEW.region THEN
             -- (2) the headline invariant: 0 cross-region member cells (single-region by construction).
-            RAISE EXCEPTION 'placement invariant REJECTED tenant %: cell % is in region % but the tenant is pinned to region % - every cell in {home_cell} U member_cells must be in the tenant region (multi-cell is single-region by construction, §5.1). 0 cross-region member cells are admitted.', NEW.tenant_id, cell_to_check, found_region, NEW.region
+            RAISE EXCEPTION 'placement invariant REJECTED tenant %: cell % is in region % but the tenant is pinned to region % — every cell in {home_cell} U member_cells must be in the tenant region (multi-cell is single-region by construction, §5.1). 0 cross-region member cells are admitted.', NEW.tenant_id, cell_to_check, found_region, NEW.region
                 USING ERRCODE = 'check_violation';
         END IF;
     END LOOP;
@@ -98,16 +98,16 @@ DECLARE
 BEGIN
     SELECT region INTO tenant_region FROM tenant_placement WHERE tenant_id = NEW.tenant_id;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'repo placement REJECTED: repo % - its tenant % is not placed; a repo cannot be homed onto a region of record that does not exist (fail-closed, §5.2)', NEW.repo_ref, NEW.tenant_id
+        RAISE EXCEPTION 'repo placement REJECTED: repo % — its tenant % is not placed; a repo cannot be homed onto a region of record that does not exist (fail-closed, §5.2)', NEW.repo_ref, NEW.tenant_id
             USING ERRCODE = 'check_violation';
     END IF;
     SELECT region INTO cell_region FROM cell WHERE cell_id = NEW.cell_id;
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'repo placement REJECTED: repo % - cell % is not registered; a placement whose region pin cannot be verified is refused (fail-closed, §5.3)', NEW.repo_ref, NEW.cell_id
+        RAISE EXCEPTION 'repo placement REJECTED: repo % — cell % is not registered; a placement whose region pin cannot be verified is refused (fail-closed, §5.3)', NEW.repo_ref, NEW.cell_id
             USING ERRCODE = 'check_violation';
     END IF;
     IF cell_region <> tenant_region THEN
-        RAISE EXCEPTION 'repo placement REJECTED: repo % - cell % is in region % but the repo tenant % is pinned to region % (the residency pin holds at repo grain, §5.2; a repo never leaves its tenant region)', NEW.repo_ref, NEW.cell_id, cell_region, NEW.tenant_id, tenant_region
+        RAISE EXCEPTION 'repo placement REJECTED: repo % — cell % is in region % but the repo tenant % is pinned to region % (the residency pin holds at repo grain, §5.2; a repo never leaves its tenant region)', NEW.repo_ref, NEW.cell_id, cell_region, NEW.tenant_id, tenant_region
             USING ERRCODE = 'check_violation';
     END IF;
     RETURN NEW;

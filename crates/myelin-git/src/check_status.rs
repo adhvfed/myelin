@@ -294,7 +294,7 @@ fn check_status_subjects() -> &'static [SubjectPattern] {
     use std::sync::OnceLock;
     static SUBJECTS: OnceLock<Vec<SubjectPattern>> = OnceLock::new();
     SUBJECTS
-        .get_or_init(|| vec![SubjectPattern("myelin://".to_string())])
+        .get_or_init(|| vec![SubjectPattern("may this PR merge?".to_string())])
         .as_slice()
 }
 

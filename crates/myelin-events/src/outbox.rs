@@ -48,6 +48,7 @@ CREATE TABLE IF NOT EXISTS outbox (
     CONSTRAINT outbox_event_id_unique UNIQUE (event_id),
     CONSTRAINT outbox_aggregate_seq_unique UNIQUE (aggregate, seq)
 );
+-- the relay claims unsent rows ordered (aggregate, seq) with FOR UPDATE SKIP LOCKED:
 CREATE INDEX IF NOT EXISTS outbox_unsent_idx ON outbox (aggregate, seq) WHERE published_at IS NULL;";
 
 pub const OUTBOX_QUARANTINE_MIGRATION: &str = "\

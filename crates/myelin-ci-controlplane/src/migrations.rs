@@ -911,6 +911,17 @@ pub const GRANT_SCHEDULER_WORKFLOW_VERSION_DDL: &str =
     "GRANT SELECT (wf_version) ON workflow_run TO myelin_ci_region_scheduler";
 
 pub const CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL: &str = "\
+-- ATOMICITY: this whole script is ONE transaction, but deliberately the IMPLICIT one PostgreSQL
+-- opens around a multi-statement simple query — NOT an explicit `BEGIN`/`COMMIT`. Both are equally
+-- atomic (a failure rolls the complete script back), but an explicit `BEGIN` leaves the SESSION in
+-- an aborted transaction block when a statement raises, and `PgMigrator` returns that connection to
+-- the pool: the next user of it fails with `25P02 current transaction is aborted`, including the
+-- migrator's own `pg_advisory_unlock`. The implicit form ends the transaction on error, so a
+-- refusal here is loud and local instead of poisoning the pool.
+
+-- (1) PROVISIONING PREFLIGHT. The migration VERIFIES; it never creates or alters a cluster role,
+-- even if `current_user` happens to hold CREATEROLE. BYPASSRLS provisioning is an operator-
+-- controlled action, and migration behaviour must not vary with accidental excess privilege.
 DO $myelin$
 DECLARE
   remediation constant text :=
@@ -964,6 +975,9 @@ BEGIN
       current_user, edge.set_option, edge.inherit_option, edge.admin_option, remediation;
   END IF;
 
+  -- BOTH DIRECTIONS. Verifying only the current migrator's own edge would accept privilege drift
+  -- since provisioning: another role holding SET TRUE could adopt the same BYPASSRLS authority, and
+  -- the fence role being a member of anything else would silently widen its own reach.
   SELECT string_agg(m.rolname, ', ' ORDER BY m.rolname) INTO extra
     FROM pg_catalog.pg_auth_members a
     JOIN pg_catalog.pg_roles m ON m.oid = a.member
@@ -986,6 +1000,9 @@ BEGIN
 END
 $myelin$;
 
+-- (2) TABLE ACCESS, established only now that `workflow_run` exists. Table-level REVOKE does not
+-- remove separately granted COLUMN ACLs, so every live column is revoked explicitly before the
+-- three-column grant is (re)issued. This is what makes an adopted role's stale column grants go.
 REVOKE ALL PRIVILEGES ON TABLE public.workflow_run FROM myelin_ci_definition_fence;
 DO $myelin$
 DECLARE
@@ -1006,8 +1023,15 @@ $myelin$;
 GRANT USAGE ON SCHEMA public TO myelin_ci_definition_fence;
 GRANT SELECT (wf_type, wf_version, state) ON public.workflow_run TO myelin_ci_definition_fence;
 
+-- (3) BECOME THE FINAL OWNER. The function is BORN fence-owned, so no ownership transfer is ever
+-- needed — and the silent-adoption hazard of replacing a function that keeps a foreign owner
+-- cannot arise. Works in both postures: a dogfood superuser may set the role regardless, and a
+-- production non-superuser migrator uses its explicit `SET TRUE` membership.
 SET LOCAL ROLE myelin_ci_definition_fence;
 
+-- (4) EXACT ADOPT-OR-CREATE. Never CREATE OR REPLACE: an existing function is accepted only when
+-- every catalog field agrees exactly, and ANY divergence raises rather than overwriting something
+-- another operator or an older build put there.
 DO $myelin$
 DECLARE
   probe constant text :=
@@ -1049,6 +1073,8 @@ BEGIN
 END
 $myelin$;
 
+-- (5) FUNCTION AND SCHEMA ACLs, normalized. Every non-owner grant is stripped first so an adopted
+-- object cannot retain an execute grant from another purpose.
 DO $myelin$
 DECLARE
   probe constant text :=
@@ -1069,6 +1095,9 @@ END
 $myelin$;
 REVOKE ALL ON FUNCTION myelin_ci_security.myelin_ci_pipeline_version_has_nonterminal_runs(integer)
   FROM PUBLIC;
+-- Every non-owner grant on the security schema itself is stripped too. Granting `myelin_app` USAGE
+-- without removing anyone else's USAGE/CREATE would let privilege drift since provisioning survive
+-- a migration that claims to verify exact provisioning.
 DO $myelin$
 DECLARE
   grantee text;
@@ -1144,6 +1173,13 @@ ON job_queue (region) \
 WHERE state <> 'terminal' AND (claim_window_secs IS NULL OR reservation_write_version IS DISTINCT FROM 2)";
 
 pub const CREATE_CI_V2_ACTIVATION_READINESS_PROBE_DDL: &str = "\
+-- ATOMICITY: this whole script is ONE transaction, the IMPLICIT one PostgreSQL opens around a
+-- multi-statement simple query — NOT an explicit `BEGIN`/`COMMIT`, which would leave the pooled
+-- migration connection in an aborted transaction block on refusal (the exact `ci_0020h` reasoning).
+
+-- (1) PROVISIONING PREFLIGHT. The migration VERIFIES; it never creates or alters a cluster role.
+-- BYPASSRLS provisioning is an operator-controlled action, and migration behaviour must not vary
+-- with accidental excess privilege.
 DO $myelin$
 DECLARE
   remediation constant text :=
@@ -1197,6 +1233,8 @@ BEGIN
       current_user, edge.set_option, edge.inherit_option, edge.admin_option, remediation;
   END IF;
 
+  -- BOTH DIRECTIONS, exactly as ci_0020h: another role holding SET TRUE could adopt the same
+  -- BYPASSRLS authority, and the fence role being a member of anything else would silently widen it.
   SELECT string_agg(m.rolname, ', ' ORDER BY m.rolname) INTO extra
     FROM pg_catalog.pg_auth_members a
     JOIN pg_catalog.pg_roles m ON m.oid = a.member
@@ -1219,6 +1257,9 @@ BEGIN
 END
 $myelin$;
 
+-- (2) TABLE ACCESS, established only now that `job_queue` exists. Table-level REVOKE does not remove
+-- separately granted COLUMN ACLs, so every live column is revoked explicitly before the four-column
+-- grant is (re)issued — this is what makes an adopted role's stale column grants go.
 REVOKE ALL PRIVILEGES ON TABLE public.job_queue FROM myelin_ci_definition_fence;
 DO $myelin$
 DECLARE
@@ -1240,8 +1281,12 @@ GRANT USAGE ON SCHEMA public TO myelin_ci_definition_fence;
 GRANT SELECT (region, state, claim_window_secs, reservation_write_version)
   ON public.job_queue TO myelin_ci_definition_fence;
 
+-- (3) BECOME THE FINAL OWNER. The function is BORN fence-owned, so no ownership transfer is ever
+-- needed and the silent-adoption hazard of a foreign-owned replace cannot arise.
 SET LOCAL ROLE myelin_ci_definition_fence;
 
+-- (4) EXACT ADOPT-OR-CREATE. Never CREATE OR REPLACE: an existing function is accepted only when
+-- every catalog field agrees exactly, and ANY divergence raises rather than overwriting.
 DO $myelin$
 DECLARE
   probe constant text :=
@@ -1283,6 +1328,8 @@ BEGIN
 END
 $myelin$;
 
+-- (5) FUNCTION AND SCHEMA ACLs, normalized. Every non-owner grant is stripped first so an adopted
+-- object cannot retain an execute grant from another purpose.
 DO $myelin$
 DECLARE
   probe constant text :=
@@ -1303,6 +1350,8 @@ END
 $myelin$;
 REVOKE ALL ON FUNCTION myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count()
   FROM PUBLIC;
+-- The security schema's USAGE grant to myelin_app was established by ci_0020h and is left intact;
+-- this migration only adds the EXECUTE on its own function.
 GRANT EXECUTE ON FUNCTION
   myelin_ci_security.myelin_ci_v2_activation_readiness_unsafe_count() TO myelin_app;
 
