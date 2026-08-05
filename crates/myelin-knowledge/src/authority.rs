@@ -326,11 +326,7 @@ impl<S: IdentityService> OpAuthorizer<S> {
     }
 
     pub fn apply_if_authorized(&mut self, decision: &OpDecision) -> bool {
-        if decision.applied() {
-            true
-        } else {
-            false
-        }
+        decision.applied()
     }
 
     #[doc(hidden)]

@@ -911,7 +911,6 @@ pub const GRANT_SCHEDULER_WORKFLOW_VERSION_DDL: &str =
     "GRANT SELECT (wf_version) ON workflow_run TO myelin_ci_region_scheduler";
 
 pub const CREATE_CI_PIPELINE_VERSION_BACKLOG_PROBE_DDL: &str = "\
-
 DO $myelin$
 DECLARE
   remediation constant text :=
@@ -1145,7 +1144,6 @@ ON job_queue (region) \
 WHERE state <> 'terminal' AND (claim_window_secs IS NULL OR reservation_write_version IS DISTINCT FROM 2)";
 
 pub const CREATE_CI_V2_ACTIVATION_READINESS_PROBE_DDL: &str = "\
-
 DO $myelin$
 DECLARE
   remediation constant text :=
