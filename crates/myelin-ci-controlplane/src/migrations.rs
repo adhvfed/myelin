@@ -443,8 +443,7 @@ UPDATE secret_binding AS binding
    AND binding.region = secret.region
    AND binding.value_ref = 'myelin://' || secret.tenant_id || '/ci/secret/' || secret.secret_id;
 DELETE FROM secret_binding WHERE secret_id IS NULL;
-ALTER TABLE secret_binding ADD CONSTRAINT ck_secret_binding_secret_id_present CHECK (secret_id IS NOT NULL) NOT VALID;
-ALTER TABLE secret_binding VALIDATE CONSTRAINT ck_secret_binding_secret_id_present;
+ALTER TABLE secret_binding ALTER COLUMN secret_id SET NOT NULL;
 ALTER TABLE secret_binding
   ADD CONSTRAINT fk_secret_binding_ci_secret
   FOREIGN KEY (tenant_id, secret_id)
