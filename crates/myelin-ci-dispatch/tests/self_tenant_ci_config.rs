@@ -110,9 +110,9 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
     }
     assert_eq!(definition.on, OnTrigger::Push);
 
-    assert_eq!(definition.jobs.len(), 3, "build + test + clippy");
+    assert_eq!(definition.jobs.len(), 4, "build + test + clippy + gates");
     let authored: Vec<String> = definition.jobs.iter().map(|j| j.name.clone()).collect();
-    assert_eq!(authored, ["build", "test", "clippy"].map(String::from));
+    assert_eq!(authored, ["build", "test", "clippy", "gates"].map(String::from));
 
     for job in &definition.jobs {
         assert_eq!(
@@ -140,6 +140,11 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
         &recipe(&["clippy", "--locked", "--all-targets", "--", "-D", "warnings"])
     );
     assert_eq!(authored_job("clippy").needs, ["build"].map(String::from));
+    assert_eq!(
+        authored_job("gates").build.as_ref().unwrap(),
+        &recipe(&["test", "--locked", "-p", "myelin-lints"])
+    );
+    assert_eq!(authored_job("gates").needs, ["build"].map(String::from));
 
     let blobs = FsBlobStore::new();
     let armed = match plan_dispatch(&push_envelope(), &CheckedInRepo, &blobs) {
@@ -184,10 +189,13 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
     );
 
     let resolved_names: Vec<String> = resolved.jobs.iter().map(|j| j.name.clone()).collect();
-    assert_eq!(resolved_names, ["build", "clippy", "test"].map(String::from));
+    assert_eq!(
+        resolved_names,
+        ["build", "clippy", "gates", "test"].map(String::from)
+    );
 
     let resolved_job = |n: &str| resolved.jobs.iter().find(|j| j.name == n).unwrap();
-    for n in ["build", "test", "clippy"] {
+    for n in ["build", "test", "clippy", "gates"] {
         let j = resolved_job(n);
         assert_eq!(j.stage, n, "the authored stage name survives resolution");
         assert_eq!(j.image, ROOTFS_IMAGE);
@@ -208,13 +216,18 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
         resolved_job("clippy").build.as_ref().unwrap(),
         &recipe(&["clippy", "--locked", "--all-targets", "--", "-D", "warnings"])
     );
+    assert_eq!(
+        resolved_job("gates").build.as_ref().unwrap(),
+        &recipe(&["test", "--locked", "-p", "myelin-lints"])
+    );
 
     assert!(resolved_job("build").needs.is_empty());
     assert_eq!(resolved_job("test").needs, ["build"].map(String::from));
     assert_eq!(resolved_job("clippy").needs, ["build"].map(String::from));
+    assert_eq!(resolved_job("gates").needs, ["build"].map(String::from));
 
     let workspace_vendor = myelin_ci_sandbox::cargo_vendor_workspace_reference();
-    for n in ["build", "test", "clippy"] {
+    for n in ["build", "test", "clippy", "gates"] {
         assert_eq!(
             resolved_job(n).selected_cargo_vendor.as_deref(),
             Some(workspace_vendor.as_str()),

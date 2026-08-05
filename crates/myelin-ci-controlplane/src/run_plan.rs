@@ -843,17 +843,26 @@ fn validate_structured_build(
     match build.tool {
         StructuredBuildToolV1::Cargo => {
             let recipe: Vec<&str> = build.args.iter().map(String::as_str).collect();
-            if CARGO_RECIPE_ALLOWLIST.contains(&recipe.as_slice()) {
+            if CARGO_RECIPE_ALLOWLIST.contains(&recipe.as_slice())
+                || is_package_scoped_test_recipe(&recipe)
+            {
                 Ok(())
             } else {
                 invalid(format!(
                     "job `{job_name}` Cargo recipe is not in the platform allowlist; admitted recipes are \
-                     `build --locked`, `test --locked --lib`, `test --locked --lib --workspace`, and \
+                     `build --locked`, `test --locked --lib`, `test --locked --lib --workspace`, \
+                     `test --locked -p <package>`, and \
                      `clippy --locked --all-targets -- -D warnings`"
                 ))
             }
         }
     }
+}
+
+// `test --locked -p <package>`: package names are already constrained to the
+// structured-build argument charset, and the sandbox runs tests either way.
+fn is_package_scoped_test_recipe(recipe: &[&str]) -> bool {
+    matches!(recipe, ["test", "--locked", "-p", package] if !package.starts_with('-'))
 }
 
 const CARGO_RECIPE_ALLOWLIST: &[&[&str]] = &[
