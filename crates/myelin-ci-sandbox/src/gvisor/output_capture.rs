@@ -193,12 +193,9 @@ fn run_and_capture_impl(
         ));
     }
     let stdin_th = stdin.zip(stdin_pipe).map(|(source, mut si)| {
-        std::thread::spawn(move || {
-            let result = match source {
-                StdinSource::Bytes(bytes) => si.write_all(&bytes),
-                StdinSource::File(mut file) => std::io::copy(&mut file, &mut si).map(|_| ()),
-            };
-            result
+        std::thread::spawn(move || match source {
+            StdinSource::Bytes(bytes) => si.write_all(&bytes),
+            StdinSource::File(mut file) => std::io::copy(&mut file, &mut si).map(|_| ()),
         })
     });
 

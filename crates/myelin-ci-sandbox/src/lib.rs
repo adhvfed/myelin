@@ -198,15 +198,9 @@ pub struct SecretRef {
     pub handle: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EgressPolicy {
     pub allow: Vec<String>,
-}
-
-impl Default for EgressPolicy {
-    fn default() -> Self {
-        EgressPolicy { allow: Vec::new() }
-    }
 }
 
 impl EgressPolicy {
