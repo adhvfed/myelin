@@ -190,18 +190,11 @@ pub(crate) struct Inner {
 }
 
 #[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Default))]
 pub struct OutboxStore {
     backend: OutboxBackend,
 }
 
-#[cfg(any(test, feature = "test-support"))]
-impl Default for OutboxStore {
-    fn default() -> Self {
-        OutboxStore {
-            backend: OutboxBackend::default(),
-        }
-    }
-}
 
 pub trait DurableOutboxBacking: Send + Sync {
     fn commit_staged(&self, rows: Vec<OutboxRow>) -> Result<()>;

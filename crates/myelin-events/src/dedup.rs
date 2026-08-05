@@ -83,18 +83,11 @@ impl CoCommitTx for MemoryCoCommit {
 }
 
 #[derive(Clone)]
+#[cfg_attr(any(test, feature = "test-support"), derive(Default))]
 pub struct DedupLedger {
     backend: DedupBackend,
 }
 
-#[cfg(any(test, feature = "test-support"))]
-impl Default for DedupLedger {
-    fn default() -> Self {
-        DedupLedger {
-            backend: DedupBackend::default(),
-        }
-    }
-}
 
 impl DedupLedger {
     #[cfg(any(test, feature = "test-support"))]
