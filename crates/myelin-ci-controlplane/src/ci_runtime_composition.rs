@@ -344,6 +344,7 @@ impl CiProductionRuntimeFactory {
             ))
         })?;
 
+        // @tenant-cross-scope: a transaction-local timeout setting, not a tenant-store read.
         sqlx::query(&format!(
             "SET LOCAL lock_timeout = '{CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS}ms'"
         ))
@@ -355,6 +356,7 @@ impl CiProductionRuntimeFactory {
             ))
         })?;
 
+        // @tenant-cross-scope: `wf_definition` is the schema's one deliberate GLOBAL code
         let superseded = sqlx::query(
             "SELECT code_hash, status FROM wf_definition \
              WHERE wf_type = $1 AND version = $2 FOR UPDATE \
@@ -384,6 +386,7 @@ impl CiProductionRuntimeFactory {
         };
         let _ = superseded;
 
+        // @tenant-cross-scope: `wf_definition` is the schema's one deliberate GLOBAL code
         let backlog: bool = sqlx::query_scalar(self.backlog_probe_call.as_ref())
             .bind(plan.predecessor_version)
             .fetch_one(&mut *transaction)
@@ -407,6 +410,7 @@ impl CiProductionRuntimeFactory {
         }
 
         if let Some(readiness) = plan.activation_readiness.as_ref() {
+            // @tenant-cross-scope: `job_queue` is FORCE-RLS, but the readiness probe is a SECURITY
             let unsafe_rows: Option<i64> =
                 sqlx::query_scalar(readiness.unsafe_count_call.as_ref())
                     .fetch_one(&mut *transaction)
@@ -457,6 +461,7 @@ impl CiProductionRuntimeFactory {
         mut transaction: sqlx::Transaction<'_, sqlx::Postgres>,
     ) -> Result<(), CiSupersededDefinitionGuardError> {
         let refuse = |detail: String| CiSupersededDefinitionGuardError::ActivationRefused(detail);
+        // @tenant-cross-scope: `wf_definition` is the schema's one deliberate GLOBAL code
         sqlx::query(
             "UPDATE wf_definition SET status = 'draining' \
              WHERE wf_type = $1 AND version = $2 AND status = 'active' \
@@ -467,6 +472,7 @@ impl CiProductionRuntimeFactory {
         .execute(&mut *transaction)
         .await
         .map_err(|error| refuse(format!("drain the superseded definition: {error}")))?;
+        // @tenant-cross-scope: `wf_definition` is the schema's one deliberate GLOBAL code
         sqlx::query(
             "INSERT INTO wf_definition (wf_type, version, code_hash, status) \
              VALUES ($1, $2, $3, 'active') ON CONFLICT (wf_type, version) DO NOTHING \
@@ -479,6 +485,7 @@ impl CiProductionRuntimeFactory {
         .await
         .map_err(|error| refuse(format!("activate the current definition: {error}")))?;
 
+        // @tenant-cross-scope: `wf_definition` is the schema's one deliberate GLOBAL code
         let current = sqlx::query(
             "SELECT code_hash, status FROM wf_definition WHERE wf_type = $1 AND version = $2 \
              /* global registry: tenant_id and region do not apply */",
@@ -509,6 +516,7 @@ impl CiProductionRuntimeFactory {
                 plan.current_version
             )));
         }
+        // @tenant-cross-scope: `wf_definition` is the schema's one deliberate GLOBAL code
         let drained: String = sqlx::query_scalar(
             "SELECT status FROM wf_definition WHERE wf_type = $1 AND version = $2 \
              /* global registry: tenant_id and region do not apply */",

@@ -412,6 +412,7 @@ impl PublisherDbProvider {
             .clone()
             .application_name("myelin:outbox-publisher")
             .options([("statement_timeout", timeout_ms.as_str())]);
+        // @residency-cell-pinned: this cell-local authority is required to match the application
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .acquire_timeout(config.statement_timeout)
@@ -442,6 +443,7 @@ async fn validate_publisher_pool(
     pool: &PgPool,
     expected: &PublisherDatabaseConfig,
 ) -> Result<(), PublisherDbError> {
+    // @tenant-cross-scope: this authorization probe reads only PostgreSQL identity/catalog grants
     let row = sqlx::query(
         "SELECT current_database()::text AS database,
                 session_user::text AS session_user,

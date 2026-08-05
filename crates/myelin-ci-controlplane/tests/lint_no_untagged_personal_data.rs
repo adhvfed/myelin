@@ -61,6 +61,7 @@ fn residency_pin_is_green_over_the_ci_source() {
         include_str!("../src/migrations.rs"),
         include_str!("../src/schema.rs"),
         include_str!("../src/lib.rs"),
+        // CI-P14 (P-357): the fleet's runner-WRITE boundary (the `@residency-write` site). The fleet
         include_str!("../src/fleet.rs"),
     ] {
         assert!(

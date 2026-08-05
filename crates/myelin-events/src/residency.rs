@@ -1,3 +1,4 @@
+//!    (`@residency-write`: the residency-pin write-boundary leg applies — the pin is the cell's, not
 use crate::partition::PartitionKey;
 use myelin_tenancy::{Region, TenantId};
 

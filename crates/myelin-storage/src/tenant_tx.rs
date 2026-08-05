@@ -1,3 +1,4 @@
+//! ## `residency-pin` lint — region pinned OUT-OF-BAND (`@residency-cell-pinned:file`)
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
@@ -77,6 +78,7 @@ where
         .begin()
         .await
         .map_err(|e| PgError::Query(format!("begin tenant-scoped read transaction: {e}")))?;
+    // @tenant-cross-scope: configures the transaction snapshot before the tenant GUC is installed.
     sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
         .execute(&mut *tx)
         .await

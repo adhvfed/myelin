@@ -659,6 +659,7 @@ async fn scope_connection(
         .execute(&mut *connection)
         .await
         .map_err(|error| database("scope tenant", error))?;
+    // @tenant-cross-scope: this sets the second half of the already tenant-scoped session context;
     sqlx::query("SELECT set_config('myelin.region', $1, true)")
         .bind(&region.0)
         .execute(&mut *connection)

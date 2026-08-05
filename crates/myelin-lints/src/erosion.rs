@@ -43,12 +43,16 @@ pub fn parse_budget(source: &str) -> Result<ErosionBudget, String> {
     Ok(budget)
 }
 
-pub fn production_lines(source: &str) -> Result<usize, String> {
+pub fn test_line_ranges(source: &str) -> Result<Vec<(usize, usize)>, String> {
     let syntax = syn::parse_file(source).map_err(|error| error.to_string())?;
     let mut visitor = TestRangeVisitor::default();
     visitor.visit_file(&syntax);
+    Ok(visitor.ranges)
+}
+
+pub fn production_lines(source: &str) -> Result<usize, String> {
     let mut excluded = BTreeSet::new();
-    for (start, end) in visitor.ranges {
+    for (start, end) in test_line_ranges(source)? {
         for line in start..=end {
             excluded.insert(line);
         }

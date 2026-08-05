@@ -188,6 +188,7 @@ impl PgCheckStatusProjection {
         let mut tx = self.pool.begin().await?;
         let tenant_id = &fact.tenant.0;
 
+        // @tenant-cross-scope: consumer_dedup is consumer-internal event identity, not tenant data.
         let dedup = sqlx::query(&format!(
             "INSERT INTO {} (consumer, event_id) VALUES ($1, $2) \
              ON CONFLICT DO NOTHING",
@@ -581,6 +582,7 @@ pub(crate) async fn lock_check_admission(
         repo_ref.len(),
         commit_oid.len(),
     );
+    // @tenant-cross-scope: advisory lock state reads no tenant rows; its injective key already
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(key)
         .execute(conn)

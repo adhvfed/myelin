@@ -3,6 +3,7 @@ pub mod dependency_direction;
 pub mod engine;
 pub mod erosion;
 pub mod lints;
+pub mod policy;
 pub mod production_graph;
 
 pub use coverage::{

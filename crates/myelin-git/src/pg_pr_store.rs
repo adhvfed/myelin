@@ -3448,6 +3448,7 @@ mod tests {
             handle,
             Arc::new(UlidMinter::new()),
         );
+        // @residency-cell-pinned: integration admin pool uses the validated region-specific DSN.
         let admin = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
             .connect(&cfg.database_migration_url)

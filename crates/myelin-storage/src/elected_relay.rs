@@ -68,6 +68,7 @@ impl ElectedPgRelay {
             .await
             .map_err(|e| ElectedRelayError::Election(PgError::Query(e.to_string())))?;
 
+        // @tenant-cross-scope: the cell-local publisher election lock protects the shared outbox.
         let elected: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
             .bind(SHARED_OUTBOX_PUBLISHER_LOCK_ID)
             .fetch_one(&mut *tx)
@@ -97,6 +98,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_connection_pool_is_valid() {
+        // @residency-cell-pinned: lazy invalid test pool; the relay scope below pins its region.
         let pool = PgPoolOptions::new()
             .max_connections(1)
             .connect_lazy("postgres://myelin:myelin@127.0.0.1/myelin")

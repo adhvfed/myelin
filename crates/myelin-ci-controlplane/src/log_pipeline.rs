@@ -5,6 +5,7 @@ use myelin_tenancy::{Region, TenantId};
 
 use myelin_ci_sandbox::events::CI_LOG_AVAILABLE;
 
+// @residency-write — the residency-pin write-boundary (layer-3) leg arms on this file: a log_segment /
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrossRegionLogWrite {
     pub tenant_id: String,

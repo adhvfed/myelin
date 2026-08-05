@@ -206,6 +206,7 @@ impl RetainedCiJobLaunch {
             .connection
             .as_mut()
             .expect("launch ownership validates one database session");
+        // @tenant-cross-scope: this inspects only the current PostgreSQL session's advisory-lock
         let owned: bool = sqlx::query_scalar(
             "SELECT EXISTS (
                 SELECT 1
@@ -238,6 +239,7 @@ impl RetainedCiJobLaunch {
             .connection
             .take()
             .expect("launch ownership releases one database session");
+        // @tenant-cross-scope: this releases one PostgreSQL session advisory lock by its derived
         let released: bool = sqlx::query_scalar(
             "SELECT pg_advisory_unlock($1) /* tenant_id generation verified by launch CAS */",
         )
@@ -474,6 +476,7 @@ impl CiJobQueueStore {
         let mut connection = self.pool.acquire().await.map_err(|error| {
             JobQueueStoreError::Db(format!("acquire launch fence session: {error}"))
         })?;
+        // @tenant-cross-scope: PostgreSQL session-lock state is connection infrastructure, not a
         let clean_session: bool = sqlx::query_scalar(
             "SELECT NOT EXISTS (
                 SELECT 1
@@ -558,6 +561,7 @@ impl CiJobQueueStore {
         .fetch_one(&mut *transaction)
         .await
         .map_err(|error| JobQueueStoreError::Db(format!("derive launch session lock: {error}")))?;
+        // @tenant-cross-scope: this acquires one PostgreSQL session advisory lock by its derived
         let locked_result: Result<bool, sqlx::Error> = sqlx::query_scalar(
             "SELECT pg_try_advisory_lock($1) /* tenant_id generation verified by launch CAS */",
         )

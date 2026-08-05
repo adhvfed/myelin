@@ -167,6 +167,7 @@ impl DurableLogPersist {
         let region_bind = region.clone();
         with_tenant_tx(&self.pool, &tenant_str, &region, move |conn| {
             Box::pin(async move {
+                // @tenant-cross-scope: PostgreSQL advisory locking reads no tenant rows. The
                 sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
                     .bind(&append_lock)
                     .execute(&mut *conn)

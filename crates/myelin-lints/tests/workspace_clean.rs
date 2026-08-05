@@ -1,5 +1,5 @@
-use myelin_lints::lints::{all_twelve, NO_HOST_EXEC};
-use myelin_lints::LintId;
+use myelin_lints::lints::all_twelve;
+use myelin_lints::policy::{drop_test_span_violations, is_excluded, is_excluded_for_lint};
 use std::path::{Path, PathBuf};
 
 fn workspace_root() -> PathBuf {
@@ -8,60 +8,6 @@ fn workspace_root() -> PathBuf {
         .and_then(|p| p.parent())
         .expect("workspace root is two levels above the crate manifest dir")
         .to_path_buf()
-}
-
-const EXCLUDED_SUBSTRINGS: &[&str] = &[
-    "myelin-events/src/relay.rs",
-    "myelin-storage/src/pgrelay.rs",
-    "myelin-storage/src/events_durable.rs",
-    "myelin-storage/src/placement_durable.rs",
-    "myelin-storage/src/kms_durable.rs",
-    "myelin-storage/src/cell_root_durable.rs",
-    "myelin-storage/src/pg_migrator.rs",
-    "myelin-events/src/firehose.rs",
-    "myelin-knowledge/src/transport.rs",
-    "myelin-ci-controlplane/src/log_pipeline.rs",
-    "myelin-ci-controlplane/src/job_queue_region.rs",
-    "myelin-ci-controlplane/src/ci_run_region.rs",
-    "myelin-ci-controlplane/src/ci_scheduler_db.rs",
-    "myelin-chat-gateway/src/delivery.rs",
-    "myelin-harness/src/bin/sub-m0-scorecard.rs",
-    "myelin-harness/src/bin/id-m1-scorecard.rs",
-    "myelin-harness/src/bin/infra-scorecard.rs",
-    "myelin-harness/src/bin/m2-scorecard.rs",
-    "myelin-harness/src/bin/m3-scorecard.rs",
-    "myelin-harness/src/bin/m4-scorecard.rs",
-    "myelin-harness/src/bin/m5-scorecard.rs",
-    "myelin-harness/src/bin/m6-scorecard.rs",
-    "myelin-harness/src/bin/make-it-real-scorecard.rs",
-    "myelin-harness/src/bin/self-hosting-ci.rs",
-    "myelin-harness/src/self_hosting_ci.rs",
-    "myelin-ci-sandbox/src/firecracker.rs",
-    "myelin-ci-sandbox/src/gvisor.rs",
-    "myelin-agent-model/src/",
-    "myelin-lints/",
-    "/tests/",
-    "/fixtures/",
-];
-
-fn is_excluded(path: &Path) -> bool {
-    let s = path.to_string_lossy().replace('\\', "/");
-    EXCLUDED_SUBSTRINGS.iter().any(|ex| s.contains(ex))
-}
-
-const PER_LINT_EXCLUSIONS: &[(LintId, &[&str])] = &[(
-    NO_HOST_EXEC,
-    &[
-        "myelin-ci-sandbox/src/launch_gate.rs",
-        "myelin-ci-sandbox/src/workspace_storage.rs",
-    ],
-)];
-
-fn is_excluded_for_lint(lint: LintId, path: &Path) -> bool {
-    let path = path.to_string_lossy().replace('\\', "/");
-    PER_LINT_EXCLUSIONS
-        .iter()
-        .any(|(id, excluded)| *id == lint && excluded.iter().any(|item| path.contains(item)))
 }
 
 fn rust_source_files(root: &Path) -> Vec<PathBuf> {
@@ -107,7 +53,7 @@ fn the_twelve_lints_are_clean_over_the_workspace_source() {
             if is_excluded_for_lint(lint.id, &file) {
                 continue;
             }
-            for v in lint.run(&src) {
+            for v in drop_test_span_violations(&src, lint.run(&src)) {
                 all_violations.push(format!("{}: {v}", file.display()));
             }
         }

@@ -1,3 +1,5 @@
+// @residency-cell-pinned:file - M0 region-less pool floor: the cell's region pins data
+// per-query via the (tenant, region) TenantScope; the per-pool runtime pin lands with STOR-D5.
 use std::sync::Arc;
 
 use myelin_events::{

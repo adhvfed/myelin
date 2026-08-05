@@ -1,3 +1,4 @@
+//!   `RegionPinnedStore` seam, P-ST-15); this open is `@residency-cell-pinned` (the LOUD, named
 use std::sync::Arc;
 
 use myelin_identity::Principal;
@@ -58,16 +59,19 @@ impl KnowledgeTable {
     ];
 }
 
+/// permit-accounting layer (the `@residency-cell-pinned` waiver below).
 pub struct KnowledgeStore {
     pool: OltpPool,
     blobs: Arc<dyn BlobStore + Send + Sync>,
 }
 
 impl KnowledgeStore {
+    /// **`@residency-cell-pinned`** — the LOUD, NAMED M0-floor waiver (EI-01 §4): on this floor the
     pub fn open(
         config: OltpConfig,
         blobs: Arc<dyn BlobStore + Send + Sync>,
     ) -> Result<KnowledgeStore, OltpError> {
+        // @residency-cell-pinned: the M0 region-less pool MODEL (the TenantScope pins the region
         let pool = OltpPool::open(config)?;
         Ok(KnowledgeStore { pool, blobs })
     }

@@ -17,6 +17,7 @@ pub const COUNT_RUNNERS_BY_POOL_QUERY: &str = "\
 SELECT count(*) FROM runner
 WHERE tenant_id = $1 AND region = $2 AND pool = $3 AND health = 'healthy'";
 
+// @residency-write — the residency-pin write-boundary (layer-3) leg arms on this file: a runner
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CrossRegionRunnerWrite {
     pub tenant_id: String,

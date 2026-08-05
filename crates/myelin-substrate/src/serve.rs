@@ -675,6 +675,7 @@ pub fn boot(spec: AppSpec) -> Result<ServeHandle, ServeError> {
     } = spec;
 
     let pool_config = oltp_config_from(&config)?;
+    // @residency-cell-pinned — NAMED M0 FLOOR (residency-pin lint, P-ST-04 → P-020): the boot pool
     let pool = OltpPool::open(pool_config)
         .map_err(|e| ServeError(format!("failed to open the OLTP pool at boot: {e}")))?;
 

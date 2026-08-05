@@ -1089,6 +1089,7 @@ pub(crate) async fn lock_pr_concurrency_group_on_conn(
     region: &str,
     group: &str,
 ) -> Result<(), sqlx::Error> {
+    // @tenant-cross-scope: advisory locking reads no tenant rows. The framed key contains the
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
         .bind(format!(
             "{PR_RUN_SUPERSESSION_LOCK_DOMAIN}:{tenant}:{region}:{group}"
