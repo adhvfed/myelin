@@ -78,9 +78,9 @@ fn main() -> ExitCode {
 
     if report.is_green() && frontend_errors.is_empty() {
         eprintln!(
-            "contract-coverage: OK - {} contract rows reconciled ({} covered with a verified \
-             provider+consumer CDC pair, {} deferred with a named landing prompt), {} frontend \
-             contract(s) tied to shared provider/consumer vectors, 0 falsely-claimed.",
+            "contract-coverage: OK - {} contract rows reconciled ({} covered by existing CDC \
+             test files, {} deferred with a named landing prompt), {} frontend contract(s) tied \
+             to shared vectors, 0 falsely-claimed.",
             report.rows_checked,
             report.covered,
             report.deferred,

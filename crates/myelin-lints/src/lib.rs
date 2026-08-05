@@ -6,8 +6,8 @@ pub mod lints;
 pub mod production_graph;
 
 pub use coverage::{
-    parse_contract_index_rows, parse_manifest, scan, Coverage, CoverageError, ManifestEntry,
-    PairEvidence, RowId, ScanReport,
+    has_test_fn, parse_contract_index_rows, parse_manifest, scan, Coverage, CoverageError,
+    ManifestEntry, RowId, ScanReport,
 };
 
 pub use engine::{Lint, LintId, Violation};

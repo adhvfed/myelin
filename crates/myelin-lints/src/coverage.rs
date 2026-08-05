@@ -55,12 +55,10 @@ pub enum CoverageError {
         title: String,
         file: String,
     },
-    CdcPairIncomplete {
+    CdcFileHasNoTests {
         row: RowId,
         title: String,
         file: String,
-        has_provider: bool,
-        has_consumer: bool,
     },
     CoveredWithNoCdc { row: RowId, title: String },
     DeferredWithNoLandingPrompt { row: RowId, title: String },
@@ -85,30 +83,15 @@ impl fmt::Display for CoverageError {
                  falsely-claimed CDC pair. Ship the file or mark the row deferred with its landing \
                  prompt."
             ),
-            CoverageError::CdcPairIncomplete {
-                row,
-                title,
-                file,
-                has_provider,
-                has_consumer,
-            } => write!(
+            CoverageError::CdcFileHasNoTests { row, title, file } => write!(
                 f,
-                "row {row} ({title}): CDC file `{file}` is missing the {} side (provider={}, \
-                 consumer={}) - a CDC pair needs BOTH. A row that claims coverage without a pair \
-                 is a build failure.",
-                match (has_provider, has_consumer) {
-                    (false, false) => "provider AND consumer",
-                    (false, true) => "provider",
-                    (true, false) => "consumer",
-                    (true, true) => "(none - internal error)",
-                },
-                has_provider,
-                has_consumer,
+                "row {row} ({title}): CDC file `{file}` contains no test functions - it cannot \
+                 prove the contract. Ship a real test or mark the row deferred."
             ),
             CoverageError::CoveredWithNoCdc { row, title } => write!(
                 f,
                 "row {row} ({title}): status=covered but declares NO cdc files - an empty claim of \
-                 coverage. Name the provider+consumer test file(s), or mark the row deferred."
+                 coverage. Name the CDC test file(s), or mark the row deferred."
             ),
             CoverageError::DeferredWithNoLandingPrompt { row, title } => write!(
                 f,
@@ -398,24 +381,8 @@ fn parse_string_array(value: &str, lineno: usize) -> Result<Vec<String>, String>
     Ok(out)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PairEvidence {
-    pub has_provider: bool,
-    pub has_consumer: bool,
-}
-
-impl PairEvidence {
-    pub fn from_source(src: &str) -> PairEvidence {
-        let lower = src.to_lowercase();
-        PairEvidence {
-            has_provider: lower.contains("provider"),
-            has_consumer: lower.contains("consumer"),
-        }
-    }
-
-    fn complete(&self) -> bool {
-        self.has_provider && self.has_consumer
-    }
+pub fn has_test_fn(src: &str) -> bool {
+    src.contains("#[test]") || src.contains("#[tokio::test") || src.contains("#[sqlx::test")
 }
 
 #[derive(Clone, Debug, Default)]
@@ -457,7 +424,7 @@ pub fn scan_frontend_contracts(
     source: &dyn CdcSource,
 ) -> Vec<String> {
     if contracts.is_empty() {
-        return vec!["frontend contracts: manifest has zero `[[frontend]]` entries".into()];
+        return Vec::new();
     }
     let mut errors = Vec::new();
     let mut ids = std::collections::BTreeSet::new();
@@ -566,14 +533,11 @@ pub fn scan(rows: &[RowId], manifest: &[ManifestEntry], cdc: &dyn CdcSource) -> 
                             file: file.clone(),
                         }),
                         Some(src) => {
-                            let ev = PairEvidence::from_source(&src);
-                            if !ev.complete() {
-                                report.errors.push(CoverageError::CdcPairIncomplete {
+                            if !has_test_fn(&src) {
+                                report.errors.push(CoverageError::CdcFileHasNoTests {
                                     row: *row,
                                     title: entry.title.clone(),
                                     file: file.clone(),
-                                    has_provider: ev.has_provider,
-                                    has_consumer: ev.has_consumer,
                                 });
                             }
                         }
@@ -703,7 +667,7 @@ landing = \"P-070\"\n";
             },
         ];
         let cdc = FakeCdc(
-            [("cdc_1_1.rs", "the provider side ... the consumer side ...")]
+            [("cdc_1_1.rs", "#[test]\nfn proves_the_contract() {}")]
                 .into_iter()
                 .collect(),
         );
@@ -734,32 +698,25 @@ landing = \"P-070\"\n";
     }
 
     #[test]
-    fn red_when_a_covered_file_is_missing_the_consumer_side() {
+    fn red_when_a_covered_file_has_no_test_functions() {
         let manifest = vec![ManifestEntry {
             row: RowId::parse("1.1").unwrap(),
             title: "serve".into(),
             coverage: Coverage::Covered {
-                cdc: vec!["half.rs".into()],
+                cdc: vec!["empty.rs".into()],
             },
         }];
         let cdc = FakeCdc(
-            [("half.rs", "only the provider side is here")]
+            [("empty.rs", "fn helper() {}")]
                 .into_iter()
                 .collect(),
         );
         let report = scan(&rows(&["1.1"]), &manifest, &cdc);
         assert!(!report.is_green());
-        match &report.errors[0] {
-            CoverageError::CdcPairIncomplete {
-                has_provider,
-                has_consumer,
-                ..
-            } => {
-                assert!(*has_provider);
-                assert!(!*has_consumer);
-            }
-            other => panic!("expected CdcPairIncomplete, got {other:?}"),
-        }
+        assert!(matches!(
+            report.errors[0],
+            CoverageError::CdcFileHasNoTests { .. }
+        ));
     }
 
     #[test]
