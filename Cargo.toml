@@ -85,7 +85,7 @@ myelin-config = { path = "crates/myelin-config" }
 
 [workspace.package]
 edition = "2021"
-license = "UNLICENSED"
+license = "FSL-1.1-ALv2"
 publish = false
 
 [profile.dev]
