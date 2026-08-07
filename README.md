@@ -1,7 +1,7 @@
 # Myelin
 
 A self-hostable software collaboration platform: git hosting, issues, CI, chat,
-and agents on one substrate, built in Rust.
+and agents in one platform, built in Rust.
 
 ## What's inside
 
