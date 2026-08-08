@@ -700,11 +700,11 @@ fn is_blocking_ddl(lower: &str, hot: bool) -> bool {
 fn scan_forward_only_migration(src: &str) -> Vec<Violation> {
     let hot_tables = declared_hot_tables(src);
     let mut out = Vec::new();
-    for (line, code) in code_lines(src) {
+    for (line, code) in code_statements(src) {
         let code = blank_string_literals(&code);
         let lower = code.to_ascii_lowercase();
         let trimmed = lower.trim();
-        let is_down = trimmed.starts_with("-- down")
+        let is_down = lower.contains("-- down")
             || trimmed.starts_with("fn down(")
             || trimmed.starts_with("pub fn down(")
             || trimmed.contains(".down.sql")
@@ -1571,6 +1571,14 @@ mod tests {
         assert!(!forward_only_migration().run(red_down).is_empty());
         assert!(!forward_only_migration().run(red_alter).is_empty());
         assert!(forward_only_migration().run(green).is_empty());
+    }
+
+    #[test]
+    fn forward_only_migration_does_not_reinterpret_embedded_sql_as_rust_code() {
+        let registry = r##"pub const HISTORICAL_DDL: &str = r#"
+ALTER TABLE archived_record ALTER COLUMN source_id SET NOT NULL;
+"#;"##;
+        assert!(forward_only_migration().run(registry).is_empty());
     }
 
     #[test]
