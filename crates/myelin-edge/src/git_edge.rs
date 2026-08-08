@@ -339,7 +339,13 @@ pub(crate) fn map_method(m: GitMethod) -> Method {
 
 pub fn register_git(mut b: GatewayBuilder, state: Arc<GitEdgeState>) -> GatewayBuilder {
     for ep in http_catalogue() {
-        let pattern = reroot(ep.path);
+        let pattern = match (ep.method, ep.path) {
+            (
+                GitMethod::Get | GitMethod::Post,
+                "/api/git/repos/{repo}/blob/{ref}/{path}",
+            ) => reroot("/api/git/repos/{repo}/blob/{ref}/{...path}"),
+            _ => reroot(ep.path),
+        };
         let method = map_method(ep.method);
         let (handler, action): (Arc<dyn Handler>, &'static str) = match (ep.method, ep.path) {
             (GitMethod::Get, "/api/git/repos") => (

@@ -2965,6 +2965,9 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
             (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
                 reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
             }
+            (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
+                reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
+            }
             _ => reroot(ep.path),
         };
         let method = map_method(ep.method);
