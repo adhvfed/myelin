@@ -30,24 +30,13 @@ import { mapPrDiffContextLines, prDiffContextRange } from "~/lib/pr-diff-context
 import { PrHeader } from "~/components/PrHeader";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { Markdown } from "~/components/Markdown";
+import { SharedComposer } from "~/components/SharedComposer";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
   "border-radius": "var(--radius-1)",
   padding: "var(--space-3)",
   background: "var(--surface-raised)",
-} as const;
-
-const textareaStyle = {
-  width: "100%",
-  "font-family": "var(--font-mono)",
-  "font-size": "var(--fs-body-sm)",
-  padding: "var(--space-2)",
-  "border-radius": "var(--radius-1)",
-  border: "var(--hairline) solid var(--border)",
-  background: "var(--surface)",
-  color: "var(--text-primary)",
-  "box-sizing": "border-box",
 } as const;
 
 /** A line-anchored comment target the composer is open on. */
@@ -343,18 +332,15 @@ export default function PrDiffScreen() {
                         if (!at || at.path !== path || at.side !== side || at.line !== line) return undefined;
                         return (
                           <div data-diff-widget style={{ padding: "var(--space-2) var(--space-3)" }}>
-                            <textarea
-                              autofocus
-                              aria-label={`Comment on ${path} line ${line}`}
+                            <SharedComposer
+                              focusOnMount
+                              label={`Comment on ${path} line ${line}`}
                               value={draft()}
-                              onInput={(e) => setDraft(e.currentTarget.value)}
-                              onKeyDown={(e) => {
-                                if (e.key === "Escape") { e.preventDefault(); setCommentAt(null); }
-                                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); void submitComment(); }
-                              }}
-                              rows={3}
+                              onValue={setDraft}
+                              onSubmit={() => void submitComment()}
+                              onEscape={() => setCommentAt(null)}
+                              submitShortcut="mod-enter"
                               placeholder="Comment on this line…  (⌘⏎ to submit, Esc to cancel)"
-                              style={textareaStyle}
                             />
                             <div style={{ display: "flex", gap: "var(--space-2)", "margin-block-start": "var(--space-1)" }}>
                               <button type="button" onClick={() => void submitComment()} disabled={!draft().trim()} style={barBtn}>Add single comment</button>

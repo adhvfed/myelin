@@ -35,4 +35,21 @@ describe("BlockEditor", () => {
     expect(screen.getByText("This block was erased.")).toBeInTheDocument();
     expect(screen.queryByRole("textbox")).toBeNull();
   });
+
+  it("keeps the active editable node stable while controlled value updates arrive", async () => {
+    const Harness = () => {
+      const [blocks, setBlocks] = createSignal<EditorBlock[]>([{ type: "paragraph", markdown: "" }]);
+      return <BlockEditor value={blocks()} onChange={setBlocks} inputLabel="Comment" />;
+    };
+    render(() => <Harness />);
+    const input = screen.getByRole("textbox", { name: "Comment" });
+    input.focus();
+    input.textContent = "K";
+    await fireEvent.input(input);
+    expect(screen.getByRole("textbox", { name: "Comment" })).toBe(input);
+    input.textContent = "Ki";
+    await fireEvent.input(input);
+    expect(screen.getByRole("textbox", { name: "Comment" })).toBe(input);
+    expect(input).toHaveTextContent("Ki");
+  });
 });

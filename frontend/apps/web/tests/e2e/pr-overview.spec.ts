@@ -264,7 +264,7 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
 
     // The controlled composer is now empty (the signal cleared AND the DOM followed) — a stale DOM value
     // was the finding: a second click would duplicate-post. Empty field ⇒ the second post is a no-op.
-    await expect(box).toHaveValue("");
+    await expect(box).toHaveText("");
     await expect(submit).toBeDisabled();
     await submit.evaluate((button) => {
       if (!(button instanceof HTMLButtonElement)) {

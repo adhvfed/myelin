@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createSignal, onCleanup, type JSX } from "solid-js";
+import { For, Index, Show, createEffect, createSignal, onCleanup, type JSX } from "solid-js";
 
 export const BLOCK_TYPES = [
   "paragraph", "heading", "bullet_list", "ordered_list", "task_list", "blockquote",
@@ -19,9 +19,12 @@ export interface BlockEditorProps {
   onChange: (blocks: EditorBlock[]) => void;
   readOnly?: boolean;
   label?: string;
-  autoFocus?: boolean;
+  focusOnMount?: boolean;
   inputLabel?: string;
   onSubmit?: () => void;
+  submitShortcut?: "enter" | "mod-enter";
+  onEscape?: () => void;
+  placeholder?: string;
 }
 
 const TYPE_LABEL: Record<BlockType, string> = {
@@ -148,9 +151,16 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
     const element = event.currentTarget as HTMLElement;
     const selection = selectionOffset(element);
     if (!selection) return;
-    if (event.key === "Enter" && !event.shiftKey && props.onSubmit && !composing()) {
+    const submit = event.key === "Enter" && !composing() && props.onSubmit &&
+      (props.submitShortcut === "mod-enter" ? event.metaKey || event.ctrlKey : !event.shiftKey);
+    if (submit) {
       event.preventDefault();
-      props.onSubmit();
+      props.onSubmit?.();
+      return;
+    }
+    if (event.key === "Escape" && props.onEscape) {
+      event.preventDefault();
+      props.onEscape();
       return;
     }
     if (event.key === "Enter" && !event.shiftKey && !composing()) {
@@ -188,55 +198,56 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
 
   return (
     <div class="block-editor" aria-label={props.label ?? "Document editor"}>
-      <For each={props.value}>
+      <Index each={props.value}>
         {(block, index) => (
-          <div class="block-editor-row" data-block-type={block.type} data-state={block.state ?? "active"}>
-            <Show when={!props.readOnly && block.state !== "tombstoned"}>
+          <div class="block-editor-row" data-block-type={block().type} data-state={block().state ?? "active"}>
+            <Show when={!props.readOnly && block().state !== "tombstoned"}>
               <button
                 type="button"
                 class="block-editor-handle"
-                aria-label={`Change ${TYPE_LABEL[block.type]} block type`}
-                aria-expanded={slashAt() === index()}
-                onClick={() => setSlashAt(slashAt() === index() ? null : index())}
+                aria-label={`Change ${TYPE_LABEL[block().type]} block type`}
+                aria-expanded={slashAt() === index}
+                onClick={() => setSlashAt(slashAt() === index ? null : index)}
               >
                 ⋮⋮
               </button>
             </Show>
             <Show
-              when={block.state !== "tombstoned"}
+              when={block().state !== "tombstoned"}
               fallback={<p class="block-editor-tombstone">This block was erased.</p>}
             >
               <div
                 ref={(element) => {
-                  elements.set(index(), element);
-                  if (element.textContent !== block.markdown) element.textContent = block.markdown;
-                  if (props.autoFocus && index() === 0) queueMicrotask(() => element.focus());
+                  elements.set(index, element);
+                  if (element.textContent !== block().markdown) element.textContent = block().markdown;
+                  if (props.focusOnMount && index === 0) queueMicrotask(() => element.focus());
                 }}
                 class="block-editor-input"
-                classList={{ "block-editor-divider": block.type === "divider" }}
+                classList={{ "block-editor-divider": block().type === "divider" }}
+                data-placeholder={index === 0 ? props.placeholder : undefined}
                 contentEditable={!props.readOnly}
                 tabIndex={0}
                 role="textbox"
-                aria-label={props.inputLabel ?? `${TYPE_LABEL[block.type]} block ${index() + 1}`}
+                aria-label={props.inputLabel ?? `${TYPE_LABEL[block().type]} block ${index + 1}`}
                 aria-multiline="true"
                 dir="auto"
-                spellcheck={block.type !== "code_block"}
+                spellcheck={block().type !== "code_block"}
                 onCompositionStart={() => setComposing(true)}
                 onCompositionEnd={(event) => {
                   setComposing(false);
-                  update(index(), { markdown: cleanEditableText(event.currentTarget) });
+                  update(index, { markdown: cleanEditableText(event.currentTarget) });
                 }}
                 onInput={(event) => {
                   if (composing()) return;
                   const markdown = cleanEditableText(event.currentTarget);
-                  lastEmitted.set(index(), markdown);
-                  update(index(), { markdown });
-                  setSlashAt(markdown === "/" ? index() : null);
+                  lastEmitted.set(index, markdown);
+                  update(index, { markdown });
+                  setSlashAt(markdown === "/" ? index : null);
                 }}
-                onKeyDown={(event) => keyDown(event, index())}
+                onKeyDown={(event) => keyDown(event, index)}
               />
             </Show>
-            <Show when={!props.readOnly && slashAt() === index()}>
+            <Show when={!props.readOnly && slashAt() === index}>
               <div class="block-editor-menu" role="menu" aria-label="Block type">
                 <For each={BLOCK_TYPES}>
                   {(type) => (
@@ -244,9 +255,9 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
                       type="button"
                       role="menuitem"
                       onClick={() => {
-                        update(index(), { type, markdown: block.markdown === "/" ? "" : block.markdown });
+                        update(index, { type, markdown: block().markdown === "/" ? "" : block().markdown });
                         setSlashAt(null);
-                        focusAt(index());
+                        focusAt(index);
                       }}
                     >
                       {TYPE_LABEL[type]}
@@ -257,7 +268,7 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
             </Show>
           </div>
         )}
-      </For>
+      </Index>
     </div>
   );
 }

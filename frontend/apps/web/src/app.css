@@ -6,6 +6,7 @@
 @import "@myelin/design-system/block-editor.css";
 @import "./knowledge.css";
 @import "./profile.css";
+@import "./shared-composer.css";
 
 *,
 *::before,
