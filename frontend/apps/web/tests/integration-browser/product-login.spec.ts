@@ -50,6 +50,26 @@ async function edgeRequest(
   return object(JSON.parse(text));
 }
 
+async function waitForCiRun(
+  request: APIRequestContext,
+  repoRef: string,
+  commitOid: unknown,
+): Promise<JsonObject> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const runs = await edgeRequest(request, "GET", "/v1/ci/runs?state=all&limit=50", 200);
+    expect(Array.isArray(runs.items)).toBe(true);
+    const match = (runs.items as unknown[]).find((value) => {
+      if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+      const row = value as JsonObject;
+      return row.repo_ref === repoRef && row.commit_oid === commitOid;
+    });
+    if (match !== undefined) return object(match);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`CI run for ${repoRef} at ${String(commitOid)} did not appear within 15 seconds`);
+}
+
 test("durable product data is available and mutable after browser login", async ({
   page,
   request,
@@ -62,6 +82,33 @@ test("durable product data is available and mutable after browser login", async 
     base_oid: "",
     contents: `# ${slug}\n\nCreated through the running product.\n`,
   });
+  const pipelineCommit = await edgeRequest(
+    request,
+    "POST",
+    `${repoPath}/blob/main/.myelin/ci.toml`,
+    200,
+    {
+      base_oid: "",
+      contents: `on = "push"
+
+[[jobs]]
+name = "test"
+image = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000"
+command = ["true"]
+`,
+    },
+  );
+  const pipelineOid = object(pipelineCommit.applied).new_oid;
+  expect(pipelineOid).toMatch(/^[0-9a-f]{40}$/);
+  const ciRun = await waitForCiRun(
+    request,
+    `myelin://${tenant}/git/repo/${slug}`,
+    pipelineOid,
+  );
+  const ciRunId = String(ciRun.run_id);
+  expect(ciRun).toMatchObject({ trigger_kind: "push", state: "queued" });
+  expect(ciRunId).toMatch(/^[0-9a-f-]{36}$/);
+
   const featureCommit = await edgeRequest(
     request,
     "POST",
@@ -105,6 +152,16 @@ test("durable product data is available and mutable after browser login", async 
   await expect(page.getByRole("heading", { name: "Ship the browser journey #1" })).toBeVisible();
   await expect(page.getByText("refs/heads/feature")).toBeVisible();
   await expect(page.getByText("refs/heads/main")).toBeVisible();
+
+  await page.goto("/ci");
+  const ciRow = page.getByTestId("ci-run-row").filter({ hasText: slug });
+  await expect(ciRow).toContainText("Queued");
+  await expect(ciRow).toContainText("push");
+  await ciRow.click();
+  await expect(page).toHaveURL(new RegExp(`/ci/runs/${ciRunId}$`));
+  await expect(page.getByRole("heading", { name: `Run ${ciRunId.slice(0, 8)}` })).toBeVisible();
+  await expect(page.getByText(String(pipelineOid), { exact: true })).toBeVisible();
+  await expect(page.getByTestId("ci-jobs-empty")).toBeVisible();
 
   await page.goto("/issues");
   const issueTitle = `Track ${slug}`;
