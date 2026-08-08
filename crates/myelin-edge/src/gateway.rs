@@ -99,6 +99,9 @@ fn repo_lifecycle_event(
         "git.repo.create" => resp
             .json_body()
             .and_then(|v| {
+                if v.get("created").and_then(|created| created.as_bool()) == Some(false) {
+                    return None;
+                }
                 v.get("applied")
                     .and_then(|a| a.get("slug"))
                     .and_then(|s| s.as_str())
@@ -1261,7 +1264,7 @@ mod tests {
     fn repo_lifecycle_event_maps_create_and_push_only_on_success() {
         let created = EdgeResponse::json(
             201,
-            &json!({ "applied": { "action": "git.repo.create", "slug": "widgets" }, "durable": true }),
+            &json!({ "applied": { "action": "git.repo.create", "slug": "widgets" }, "created": true, "durable": true }),
         );
         let empty = BTreeMap::new();
         assert_eq!(
@@ -1283,6 +1286,12 @@ mod tests {
             None
         );
         assert_eq!(repo_lifecycle_event("git.pr.view", &empty, &created), None);
+
+        let repeated = EdgeResponse::json(
+            200,
+            &json!({ "applied": { "action": "git.repo.create", "slug": "widgets" }, "created": false, "durable": true }),
+        );
+        assert_eq!(repo_lifecycle_event("git.repo.create", &empty, &repeated), None);
     }
 
     #[test]

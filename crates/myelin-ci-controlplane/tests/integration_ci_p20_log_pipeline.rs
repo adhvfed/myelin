@@ -80,7 +80,7 @@ async fn log_index_rows_apply_insert_and_read_back_against_real_postgres() {
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
     let app = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect(&app_url())

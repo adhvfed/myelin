@@ -42,6 +42,11 @@ CREATE TRIGGER issue_authz_binding_invalidate_issue_view
   AFTER INSERT OR UPDATE OR DELETE ON issue_authz_binding
   FOR EACH ROW EXECUTE FUNCTION myelin_invalidate_issue_view_projection();"#;
 
+pub const NARROW_ISSUE_AUTHZ_INVALIDATION_TRIGGER_DDL: &str = r#"
+CREATE OR REPLACE TRIGGER issue_invalidate_issue_view
+  AFTER INSERT OR DELETE OR UPDATE OF project_id ON issue
+  FOR EACH ROW EXECUTE FUNCTION myelin_invalidate_issue_view_projection();"#;
+
 pub const ISSUE_BOARD_INDEX: &str = "issue_board";
 pub const ISSUE_ROADMAP_INDEX: &str = "issue_roadmap";
 pub const ISSUE_ASSIGNEE_INDEX: &str = "issue_assignee";
@@ -416,6 +421,11 @@ pub fn issues_migrations() -> Migrations {
         CREATE_ISSUE_KEY_PREFIX_LIST_INDEX_DDL,
         ISSUE_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        "iss_0022_narrow_issue_authz_invalidation",
+        NARROW_ISSUE_AUTHZ_INVALIDATION_TRIGGER_DDL,
+        ISSUE_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -546,8 +556,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            27,
-            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 4 authz migrations"
+            28,
+            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 5 authz migrations"
         );
         for m in &migrations.0 {
             assert!(
@@ -585,7 +595,7 @@ mod tests {
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
             issues.0.last().map(|migration| migration.id),
-            Some("iss_0021_issue_key_prefix_list_idx")
+            Some("iss_0022_narrow_issue_authz_invalidation")
         );
         for invariant in [
             "CREATE INDEX CONCURRENTLY",
@@ -602,6 +612,9 @@ mod tests {
         assert!(CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL
             .contains("EXECUTE FUNCTION myelin_invalidate_issue_view_projection()"));
         assert!(!CREATE_ISSUE_AUTHZ_INVALIDATION_TRIGGERS_DDL.contains("to_regprocedure"));
+        assert!(NARROW_ISSUE_AUTHZ_INVALIDATION_TRIGGER_DDL
+            .contains("AFTER INSERT OR DELETE OR UPDATE OF project_id ON issue"));
+        assert!(!NARROW_ISSUE_AUTHZ_INVALIDATION_TRIGGER_DDL.contains("state"));
         assert!(CREATE_ISSUE_AUTHZ_VISIBLE_DDL.contains("permission  text NOT NULL"));
         assert!(!CREATE_ISSUE_AUTHZ_VISIBLE_DDL.contains("relation  text NOT NULL"));
     }
@@ -617,7 +630,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            27,
+            28,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -632,7 +645,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            27,
+            28,
             "the re-apply admits every migration again"
         );
     }

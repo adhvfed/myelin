@@ -22,7 +22,7 @@ async fn iss_p15_feeder_provisions_the_generated_index_zero_downtime() {
         .max_connections(4)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let issue_tbl = format!("issue_p381_{suffix}");

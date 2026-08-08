@@ -399,13 +399,13 @@ impl PrOverviewPage {
     }
 }
 
-pub fn switch_test_representative_pr_page(tenant: &str) -> PrOverviewPage {
+pub fn representative_pr_page(tenant: &str) -> PrOverviewPage {
     use crate::check_status::{CheckContext, CheckStatus, GitOid, HumanisedRef, Timestamp};
     use myelin_tenancy::{ArtifactRef, TenantId};
     let fact = CheckStatus {
         tenant: TenantId(tenant.into()),
         repo: ArtifactRef(format!("myelin://{tenant}/git/repo/myelin")),
-        commit_oid: GitOid("blake3:switchtesthead".into()),
+        commit_oid: GitOid("blake3:representativehead".into()),
         context: CheckContext::ci("build"),
         state: CheckState::Success,
         required: true,
@@ -424,7 +424,7 @@ pub fn switch_test_representative_pr_page(tenant: &str) -> PrOverviewPage {
     let row = CheckStatusRow::from_fact(&fact);
     PrOverviewPage {
         projected: Projected::Visible(crate::project::Projection {
-            title: format!("[{tenant}] Restore-verify gate at cell scale"),
+            title: format!("[{tenant}] Verify backup recovery at cell scale"),
             state: "open".into(),
             icon: "pr".into(),
             render_hint: Some(RenderHint {

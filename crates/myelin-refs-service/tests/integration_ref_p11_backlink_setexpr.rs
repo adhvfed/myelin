@@ -20,7 +20,7 @@ async fn backlink_setexpr_join_is_one_query_leak_free_tenant_scoped_paginated() 
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let edge_tbl = format!("edge_p160_{suffix}");

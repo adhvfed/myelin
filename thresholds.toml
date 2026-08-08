@@ -18,40 +18,11 @@ hierarchical_scheduler_promotion_owed = false # CI-D2 measured the wait p99 with
 prewarm_buffer_per_arrival_rate_bps = 1000  # MEASURED (07#2 / §5.4): 10% of the recent arrival rate kept warm (replaces CI-P4's fixed floor).
 prewarm_max_buffer = 16                     # the warm-buffer ceiling — bin-packing under the per-VM memory floor (never past the zone's headroom).
 
-[ci_switch_test]
-render_budget_us = 50000                    # MEASURED-GATE: the interactive run/log view render p-latency budget; a render slower than the GitHub Actions anchor's interactive grade is a UX wall.
-
-[refs_switch_test]
-backlink_read_budget_us = 20000             # MEASURED-GATE: the per-viewer backlink "referenced-by" read that opens the jump; slower than the anchor's interactive grade is a UX wall.
-unfurl_budget_us = 16000                    # MEASURED-GATE: the "within the keyboard" single-unfurl render budget (~one keystroke at 60 fps, no spinner); slower is a wall.
-jump_no_spinner_budget_us = 100000          # MEASURED-GATE: the whole four-keystroke jump (failing-test→line→issue→conversation) within the human-perceptible "instant" ceiling so no spinner flashes.
-
-[search_switch_test]
-code_by_symbol_budget_us = 30000            # MEASURED-GATE: the per-viewer code-by-symbol trigram FT find on the git-blob corpus; slower than the GitHub code-search anchor's interactive grade is a UX wall.
-doc_by_content_budget_us = 40000           # MEASURED-GATE: the doc-by-content semantic/hybrid find on the Knowledge corpus (the vector probe costs more than an FT find); slower than a Notion content search is a wall.
-issue_by_facet_budget_us = 20000           # MEASURED-GATE: the issue-by-facet structured find on the issue corpus (status/priority/assignee); slower than a Jira facet search's interactive grade is a wall.
-
-[git_switch_test]
-pr_overview_render_budget_us = 50000        # MEASURED-GATE: the representative PR overview page render p-latency (the view the switch test drives); slower than the GitHub PR-page anchor's interactive grade is a UX wall.
-overlay_contrast_floor_bp = 450             # MEASURED-GATE: the status-overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-language §8b anchor); an overlay below it is an accessibility wall.
-
-[knowledge_switch_test]
-page_render_budget_us = 50000               # MEASURED-GATE: the representative Knowledge page render p-latency (the editor view the switch test drives, the ONE render path); slower than the Notion page anchor's interactive grade is a UX wall.
-overlay_contrast_floor_bp = 450             # MEASURED-GATE: the reference-chip / tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
-
-[issues_switch_test]
-view_render_budget_us = 50000               # MEASURED-GATE: the representative Issues canonical-view render p-latency (the board/table/roadmap view the switch test drives, a ViewSpec projection over the one issue table); slower than the Jira/Linear board anchor's interactive grade is a UX wall.
-overlay_contrast_floor_bp = 450             # MEASURED-GATE: the state-pill / priority-badge / agent-pending / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
-
-[chat_switch_test]
-perceived_send_budget_us = 100000           # MEASURED-GATE: the optimistic-send perceived p-latency (the S3 composer's optimistic echo into the timeline before the durable ack); the wireframes' "optimistic send < ~100ms perceived" target — slower than the Slack anchor's optimistic grade is a UX wall.
-overlay_contrast_floor_bp = 450             # MEASURED-GATE: the message-row / agent / unfurl / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
-
 [authz_surge]
 human_lane_p99_budget_us = 5000  # ID-D9: the protected human lane's authz-decision p99 ceiling under 30×.
 
 [fail_static]
-status = "OPEN — LEGAL"          # L-1, DPO-ratified; the VALUE is absent until counsel clears it.
+status = "OPEN - LEGAL"          # L-1, DPO-ratified; the VALUE is absent until counsel clears it.
 owner = "DPO / Legal"
 static_max_default_secs = 300    # the engineering SEED the mechanism is drilled against (P-S18/P-S25).
 agent_token_ttl_secs = 60
@@ -257,4 +228,3 @@ min_executions = 20     # the rolling-window floor: fewer executions is too nois
 promote_due_now_per_sec_per_cell = 100000 # §7.3 / OQ #5: the per-cell sustained due-now fire rate above
 degraded_wheel_lag_budget = 0             # the `timer_wheel_lag` budget: any due timer left unfired past
 promotion_owed = false                    # the 1M+ FLOW-D3-full run drained within the tick budget
-

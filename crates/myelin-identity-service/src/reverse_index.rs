@@ -199,7 +199,14 @@ impl ReverseIndex {
     }
 }
 
-static S8_SUBJECTS: &[SubjectPattern] = &[SubjectPattern(String::new())];
+fn reverse_index_subjects() -> &'static [SubjectPattern] {
+    use std::sync::OnceLock;
+
+    static SUBJECTS: OnceLock<Vec<SubjectPattern>> = OnceLock::new();
+    SUBJECTS
+        .get_or_init(|| vec![SubjectPattern("myelin://".to_string())])
+        .as_slice()
+}
 
 pub struct ReverseIndexConsumer {
     index: ReverseIndex,
@@ -329,7 +336,7 @@ impl ReverseIndexConsumer {
 
 impl EventHandler for ReverseIndexConsumer {
     fn subjects(&self) -> &'static [SubjectPattern] {
-        S8_SUBJECTS
+        reverse_index_subjects()
     }
 
     fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
@@ -473,6 +480,22 @@ mod tests {
             0,
             "reverse_index_lag returns to 0 after projection"
         );
+    }
+
+    #[test]
+    fn reverse_index_subjects_can_bind_a_consumer() {
+        use myelin_events::{ConsumerName, ConsumerSpec, DedupLedger};
+
+        let index = ReverseIndex::new();
+        let handler = ReverseIndexConsumer::new(index);
+        let subjects = handler
+            .subjects()
+            .iter()
+            .map(|subject| subject.0.as_str())
+            .collect::<Vec<_>>();
+        let spec = ConsumerSpec::new(ConsumerName(S8_CONSUMER.into()), &subjects);
+
+        assert!(myelin_events::consume(spec, handler, DedupLedger::new()).is_ok());
     }
 
     #[test]

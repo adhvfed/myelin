@@ -111,6 +111,10 @@ fn pkt(payload: &str) -> Vec<u8> {
 }
 
 #[test]
+#[cfg_attr(
+    not(feature = "privileged-host-tests"),
+    ignore = "requires a delegated cgroup, btrfs storage, and the configured sandbox runtime"
+)]
 fn production_gitcore_serves_a_real_clone_fetch_end_to_end() {
     if !require_or_skip("ct006b clone/fetch e2e") {
         return;

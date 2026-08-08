@@ -12,8 +12,6 @@ pub mod cross_cell;
 pub mod define_rule;
 pub mod delivery;
 pub mod eu_provider;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e_wedge;
 pub mod escalation;
 pub mod erasure_residual;
 pub mod holder;
@@ -51,12 +49,6 @@ pub use define_rule::{
 pub use delivery::{
     build_idem_key, channel_from_token, effective_delivery_count, is_eu_region, redact_for_offcell,
     DeliveryError, DeliveryFabric, DeliveryLedger, DeliveryOutcome, DeliveryRecord, MockAdapter,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e_wedge::{
-    e2e_live_frame_draft, run_e2e_1_pr_pane, run_e2e_2_hitl_flagship, run_e2e_4_dsar_and_stor_d2,
-    run_notif_e2e_4_dsar, run_notif_e2e_wedge, run_stor_d2_at_cell_scale, E2e4Artifact,
-    E2eArtifact, StorD2Verdict, E2E_2_SCENARIO, E2E_4_SCENARIO, E2E_SCENARIO,
 };
 pub use erasure_residual::{
     erase_residual, DeliveryShredError, ErasedNotifSubject, InMemoryDeliveryShredder,

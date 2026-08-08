@@ -723,6 +723,25 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
         .await;
         assert_eq!(wc, 200, "commit {path}: {wv}");
     }
+    let (nested_status, nested) = http(
+        addr,
+        "POST",
+        "/v1/git/repos/br/blob/main/.myelin/ci.toml",
+        &hdr(&h),
+        br#"{"base_oid":"","contents":"on = \"push\"\n","message":"add pipeline"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(nested_status, 200, "commit nested path: {nested}");
+    let (nested_read_status, nested_read) = http(
+        addr,
+        "GET",
+        "/v1/git/repos/br/blob/main/.myelin/ci.toml",
+        &hdr(&h),
+        vec![],
+    )
+    .await;
+    assert_eq!(nested_read_status, 200, "read nested path: {nested_read}");
+    assert_eq!(nested_read["contents"], "on = \"push\"\n");
 
     let (rc, rv) = http(addr, "GET", "/v1/git/repos/br/refs", &hdr(&h), vec![]).await;
     assert_eq!(rc, 200, "refs: {rv}");

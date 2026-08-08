@@ -24,7 +24,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# ── Config (env-overridable; defaults match scripts/self-host.sh + docker-compose.dev.yml) ──
+# Config is environment-overridable; defaults match the local Fed stack.
 PG_CONTAINER="${MYELIN_PG_CONTAINER:-myelin-postgres}"
 PG_USER="${MYELIN_PG_ADMIN_USER:-myelin_admin}"
 PG_DB="${MYELIN_PG_DB:-myelin}"

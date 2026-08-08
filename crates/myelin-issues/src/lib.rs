@@ -10,7 +10,6 @@ pub mod cost_bounder;
 pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
-pub mod self_tenant;
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_flagship;
 pub mod e2e_lineage;
@@ -43,7 +42,6 @@ pub mod schemes;
 pub mod sla_calendar;
 pub mod sla_escalation;
 pub mod surge;
-pub mod switch_test;
 pub mod time_axis;
 pub mod trigger;
 pub mod views;
@@ -236,17 +234,6 @@ pub use e2e_lineage::{
     LINEAGE_DEPTH_BOUND,
 };
 
-pub use self_tenant::{
-    myelin_issue_backlog, proven_issues_rows, run_issues_truth_up_scorecard, IssuesSelfTenantArtifact,
-    IssuesIncident, IssuesRowStatus, IssuesTruthUpPass, IssuesTruthUpRed, IssuesTruthUpScorecard,
-    IssuesTruthUpVerdict, MyelinIssue, ProvenIssuesRow, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use self_tenant::run_issues_over_myelins_own_work;
-pub use switch_test::{
-    switch_capability_matrix, switch_surface_drive_record, IssuesOverlay, IssuesSwitchTest,
-    IssuesSwitchVerdict, PrimaryScreenState, SwitchCapability,
-};
 
 pub use trigger::{
     default_stale_after, ArmRequest, ArmableCondition, IssueTriggerEngine, TriggerInboxItem,

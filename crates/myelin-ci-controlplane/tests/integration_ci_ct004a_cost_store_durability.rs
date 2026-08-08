@@ -50,7 +50,7 @@ async fn reopen() -> PgPool {
         })
         .connect(&admin_url())
         .await
-        .expect("reconnect to dev Postgres as admin (is the stack up? eval \"$(scripts/dev-stack.sh env)\")")
+        .expect("reconnect to dev Postgres as admin (is the stack up? `fed test:backend`)")
 }
 
 fn uid(name: &str) -> Uuid {

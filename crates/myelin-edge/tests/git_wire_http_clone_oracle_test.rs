@@ -281,6 +281,10 @@ fn git_clone(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "privileged-host-tests"),
+    ignore = "requires a delegated cgroup, btrfs storage, and the configured sandbox runtime"
+)]
 async fn real_git_clone_fetch_over_smart_http_with_auth() {
     if !require_or_skip("ct006c clone/fetch oracle") {
         return;
@@ -407,6 +411,10 @@ async fn real_git_clone_fetch_over_smart_http_with_auth() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    not(feature = "privileged-host-tests"),
+    ignore = "requires a delegated cgroup, btrfs storage, and the configured sandbox runtime"
+)]
 async fn over_cap_upload_pack_response_errors_cleanly() {
     use myelin_ci_sandbox::ResourceLimits;
     use myelin_edge::{
@@ -455,11 +463,12 @@ async fn over_cap_upload_pack_response_errors_cleanly() {
     request.extend_from_slice(b"0000");
     request.extend_from_slice(b"0009done\n");
 
-    let result = core.serve(&repo, Service::UploadPack, request);
-    println!("=== CT-006c over-cap serve result = {result:?} ===");
+    let error = core
+        .serve(&repo, Service::UploadPack, request)
+        .expect_err("an over-cap upload-pack response must be rejected");
     assert!(
-        result.is_err(),
-        "an over-the-wire-cap upload-pack response MUST error cleanly (never a silently-truncated Ok pack)"
+        error.to_string().contains("wire cap"),
+        "expected the output-size limit, got: {error}"
     );
 
     let _ = std::fs::remove_dir_all(&root);
@@ -596,6 +605,10 @@ fn r21a_push(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "privileged-host-tests"),
+    ignore = "requires a delegated cgroup, btrfs storage, and the configured sandbox runtime"
+)]
 async fn r2_1a_live_repo_authz_denies_ungranted_admits_creator_and_isolates_repos() {
     if !require_or_skip("r2.1a live repo-authz oracle") {
         return;

@@ -21,10 +21,30 @@ and agents in one platform, built in Rust.
   `myelin-edge`, `myelin-control-plane`, and friends).
 - `frontend/` — pnpm workspace with the SolidStart web app (`apps/web`).
 - `deploy/` — systemd units.
-- `scripts/` — build, drill, and dev-stack helpers.
+- `scripts/` — development, build, and operational helpers.
 
 Runtime dependencies: Postgres 16, NATS 2.10 (JetStream), Valkey 8, and an
 S3-compatible object store.
+
+## Development
+
+Install `fed`, then start the complete local application:
+
+```sh
+fed start
+```
+
+Run tests that use those services with `fed test:backend`. `fed test:integration`
+drives a TypeScript product journey through the real edge and durable services without
+AI inference. Frontend checks are available as `fed test:frontend`, and
+`fed test:browser-contract` runs the faster browser suite against its contract backend.
+Fed prints the allocated web and edge URLs when the stack is ready.
+
+Pass Cargo selectors after `--` to run a focused backend test, for example:
+
+```sh
+fed test:backend -- -p myelin-edge --test integration_issue_routes_pg
+```
 
 ## Status
 

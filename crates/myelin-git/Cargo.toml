@@ -36,6 +36,7 @@ myelin-substrate = { path = "../myelin-substrate" }
 myelin-client = { path = "../myelin-client" }
 
 [dev-dependencies]
+myelin-git = { path = ".", features = ["test-support"] }
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-events = { path = "../myelin-events", features = ["test-support"] }

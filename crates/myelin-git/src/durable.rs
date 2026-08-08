@@ -1781,6 +1781,10 @@ impl DurableGitRepo {
     ) -> Result<(Oid, Oid, Option<Oid>), DurableError> {
         let repo = self.open_git()?;
         let parent_oid = self.tip_commit(&repo, ref_name)?;
+        let clean_path = path.trim_matches('/');
+        if clean_path.is_empty() || clean_path != path || !is_safe_tree_path(clean_path) {
+            return Err(DurableError::Git("web edit path is not safe".into()));
+        }
 
         let blob_oid = repo.blob(contents).map_err(|e| git_err("write blob", e))?;
 
@@ -1791,13 +1795,8 @@ impl DurableGitRepo {
             }
             None => None,
         };
-        let mut builder = repo
-            .treebuilder(base_tree.as_ref())
-            .map_err(|e| git_err("treebuilder", e))?;
-        builder
-            .insert(path, blob_oid, 0o100644)
-            .map_err(|e| git_err(&format!("tree insert {path}"), e))?;
-        let tree_oid = builder.write().map_err(|e| git_err("write tree", e))?;
+        let segments = clean_path.split('/').collect::<Vec<_>>();
+        let tree_oid = Self::write_blob_tree(&repo, base_tree.as_ref(), &segments, blob_oid)?;
         let tree_obj = repo.find_tree(tree_oid).map_err(|e| git_err("find tree", e))?;
 
         let sig = git2::Signature::now(author_name, author_email)
@@ -1816,6 +1815,44 @@ impl DurableGitRepo {
             Oid::new(blob_oid.to_string()),
             parent_oid.map(|p| Oid::new(p.to_string())),
         ))
+    }
+
+    fn write_blob_tree(
+        repo: &git2::Repository,
+        base_tree: Option<&git2::Tree<'_>>,
+        path: &[&str],
+        blob_oid: git2::Oid,
+    ) -> Result<git2::Oid, DurableError> {
+        let (name, descendants) = path
+            .split_first()
+            .ok_or_else(|| DurableError::Git("web edit path is empty".into()))?;
+        let mut builder = repo
+            .treebuilder(base_tree)
+            .map_err(|error| git_err("treebuilder", error))?;
+        if descendants.is_empty() {
+            builder
+                .insert(name, blob_oid, 0o100644)
+                .map_err(|error| git_err(&format!("tree insert {name}"), error))?;
+        } else {
+            let child_tree = match base_tree.and_then(|tree| tree.get_name(name)) {
+                Some(entry) if entry.kind() == Some(git2::ObjectType::Tree) => Some(
+                    repo.find_tree(entry.id())
+                        .map_err(|error| git_err(&format!("find tree {name}"), error))?,
+                ),
+                Some(_) => {
+                    return Err(DurableError::Git(format!(
+                        "web edit path component {name} is not a directory"
+                    )))
+                }
+                None => None,
+            };
+            let child_oid =
+                Self::write_blob_tree(repo, child_tree.as_ref(), descendants, blob_oid)?;
+            builder
+                .insert(name, child_oid, 0o040000)
+                .map_err(|error| git_err(&format!("tree insert {name}"), error))?;
+        }
+        builder.write().map_err(|error| git_err("write tree", error))
     }
 
     pub fn object_is_commit(&self, oid: &Oid) -> bool {

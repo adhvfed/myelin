@@ -4,6 +4,7 @@ pub const SUBSYSTEM_TOKENS: &[&str] = &[
     "issue",
     "knowledge",
     "chat",
+    "notif",
     "identity",
     "refs",
 ];
@@ -75,6 +76,9 @@ pub const SEED_EVENT_NAMES: &[&str] = &[
     "knowledge.row.updated",
     "chat.message.created",
     "chat.read_state.updated",
+    "notif.item.created",
+    "notif.escalation.acked",
+    "notif.signal.snapshot",
     "identity.permission.granted",
     "identity.permission.revoked",
     "identity.member.added",
@@ -120,7 +124,7 @@ impl std::fmt::Display for TaxonomyError {
             TaxonomyError::UnknownSubsystem { name, token } => write!(
                 f,
                 "`{name}`: `{token}` is not a canonical subsystem token \
-                 (git/ci/issue/knowledge/chat/identity/refs)"
+                 (git/ci/issue/knowledge/chat/notif/identity/refs)"
             ),
             TaxonomyError::PresentTenseVerb { name, token } => write!(
                 f,
@@ -353,6 +357,7 @@ mod tests {
                 "issue",
                 "knowledge",
                 "chat",
+                "notif",
                 "identity",
                 "refs"
             ]

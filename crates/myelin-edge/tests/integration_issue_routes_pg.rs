@@ -212,7 +212,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     config.region = REGION.into();
     let bootstrap = PgBootstrap::connect(config, 8)
         .await
-        .expect("validate split database roles (is docker-compose.dev.yml up?)");
+        .expect("validate split database roles (have you run `fed test:backend`?)");
     bootstrap.migrate_foundation().await.unwrap();
     bootstrap
         .migrate(&all_durable_migrations(), &HotTables::none())
@@ -625,6 +625,16 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert_eq!(active_retry.issue.title, title);
     assert_eq!(active_retry.zookie, activated_zookie);
     assert_eq!(active_retry_writer.calls.load(Ordering::SeqCst), 0);
+    let (status, not_yet_projected) = http(
+        address,
+        "GET",
+        &authorization_path,
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 202);
+    assert_eq!(not_yet_projected["status"], "pending");
     issue_store
         .rebuild_effective_issue_view(&worker)
         .await
@@ -764,6 +774,23 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(second_close["version"], version);
+
+    let (status, closed_without_projection_rebuild) = http(
+        address,
+        "GET",
+        "/v1/issues?state=closed",
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a state change must not invalidate the authorization projection"
+    );
+    assert_eq!(
+        closed_without_projection_rebuild["items"][0]["id"],
+        issue_id
+    );
 
     let mut additional = Vec::new();
     for (prefix, extra_title) in [

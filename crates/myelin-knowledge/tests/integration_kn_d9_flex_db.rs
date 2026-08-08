@@ -23,7 +23,7 @@ async fn kn_d9_flex_db_jsonb_gin_view_filter_setexpr_conjoin_zero_leak_zero_coun
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let row_tbl = format!("db_row_p307_{suffix}");

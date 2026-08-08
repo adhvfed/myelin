@@ -20,7 +20,7 @@ async fn ci_run_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_refle
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let run_tbl = format!("ci_run_p368_{suffix}");

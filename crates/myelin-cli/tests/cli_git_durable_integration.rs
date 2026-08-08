@@ -6,6 +6,8 @@ use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
     PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
 };
+use myelin_cli::config::EdgeConfig;
+use myelin_cli::dispatch::{EdgeCall, HttpMethod};
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
@@ -142,12 +144,41 @@ fn run_cli(edge: &str, token: &str, args: &[&str]) -> (i32, String, String) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn code_search_preserves_query_bytes_and_reports_unavailable() {
+async fn code_search_preserves_query_bytes_and_returns_durable_matches() {
     let root = temp_root("search");
     let (gw, cell, _be) = build(&root);
     let addr = spawn(gw).await;
     let edge = format!("http://{addr}");
     let token = mint(&cell, "acme", "jti-search");
+    let config = EdgeConfig {
+        url: edge.clone(),
+        scheme: SCHEME.into(),
+    };
+    let create = EdgeCall {
+        method: HttpMethod::Post,
+        path: "/v1/git/repos".into(),
+        query: None,
+        payload: Some(serde_json::json!({ "slug": "searchable" }).to_string().into_bytes()),
+        idempotency_key: Some("test-search-create".into()),
+    };
+    myelin_cli::client::execute(&config, &token, &create)
+        .await
+        .expect("create searchable repository");
+    let phrase = "two words &limit=100% = 世界";
+    let write = EdgeCall {
+        method: HttpMethod::Post,
+        path: "/v1/git/repos/searchable/blob/main/README.md".into(),
+        query: None,
+        payload: Some(
+            serde_json::json!({ "base_oid": "", "contents": format!("before\n{phrase}\nafter\n") })
+                .to_string()
+                .into_bytes(),
+        ),
+        idempotency_key: Some("test-search-write".into()),
+    };
+    myelin_cli::client::execute(&config, &token, &write)
+        .await
+        .expect("write searchable content");
 
     let (code, stdout, stderr) = run_cli(
         &edge,
@@ -156,24 +187,16 @@ async fn code_search_preserves_query_bytes_and_reports_unavailable() {
             "git",
             "search",
             "code",
-            "two words &limit=100% = 世界",
+            phrase,
             "--repo",
-            "missing/repository",
+            "searchable",
         ],
     );
 
-    assert_eq!(
-        code, 1,
-        "a valid unavailable edge response exits 1; stderr={stderr}"
-    );
-    assert!(
-        stdout.is_empty(),
-        "an unavailable search has no success output"
-    );
-    assert!(
-        stderr.contains("edge error (503 unavailable): code search index is unavailable"),
-        "the encoded query reached the handler and returned its honest response; got {stderr}"
-    );
+    assert_eq!(code, 0, "durable search succeeds; stderr={stderr}");
+    assert!(stderr.is_empty(), "successful search has no stderr: {stderr}");
+    assert!(stdout.contains("searchable:README.md:2"), "match location is rendered: {stdout}");
+    assert!(stdout.contains(phrase), "the matching excerpt is rendered: {stdout}");
     assert!(
         !stderr.contains("bad_request"),
         "query bytes were not reinterpreted"
@@ -206,6 +229,24 @@ async fn durable_create_open_view_round_trip() {
     assert!(
         out.contains("git.repo.create") || out.contains("alpha"),
         "create echoed; got {out}"
+    );
+
+    let (retry_code, retry_out, retry_err) = run_cli(
+        &edge,
+        &token,
+        &[
+            "--idempotency-key",
+            "test-repo-create-alpha",
+            "git",
+            "repo",
+            "create",
+            "alpha",
+        ],
+    );
+    assert_eq!(retry_code, 0, "create retry succeeds; stderr={retry_err}");
+    assert!(
+        retry_out.contains("\"created\":false"),
+        "create retry reports the existing durable repository; got {retry_out}"
     );
 
     let (lc, lout, _) = run_cli(&edge, &token, &["--json", "git", "repo", "list"]);

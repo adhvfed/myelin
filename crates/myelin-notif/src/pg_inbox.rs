@@ -104,6 +104,7 @@ pub enum PgInboxError {
     InvalidLimit,
     MalformedCursor,
     CursorScopeMismatch,
+    NotFound,
     WriteConflict,
     NoCoCommitTx,
     CorruptStoredRow,
@@ -117,6 +118,7 @@ impl core::fmt::Display for PgInboxError {
             Self::InvalidLimit => "inbox page limit must be between 1 and 100",
             Self::MalformedCursor => "malformed inbox cursor",
             Self::CursorScopeMismatch => "inbox cursor belongs to another query scope",
+            Self::NotFound => "notification inbox item not found",
             Self::WriteConflict => "inbox collapse key conflicts with an existing row",
             Self::NoCoCommitTx => {
                 "durable inbox co-commit requires a PostgreSQL handler transaction"
@@ -224,6 +226,42 @@ impl PgInboxStore {
         let region = owned.scope.region.0.clone();
         with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
             Box::pin(async move { list_on_conn(conn, &owned, cursor.as_ref()).await })
+        })
+        .await
+    }
+
+    pub async fn mark_read(
+        &self,
+        scope: &InboxReadScope,
+        item_id: &str,
+    ) -> Result<(), PgInboxError> {
+        validate_scope(scope)?;
+        if !valid_item_id(item_id) {
+            return Err(PgInboxError::InvalidInput);
+        }
+        let owned_scope = scope.clone();
+        let owned_item_id = item_id.to_string();
+        let tenant = owned_scope.tenant.0.clone();
+        let region = owned_scope.region.0.clone();
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move {
+                let result = sqlx::query(
+                    "UPDATE notif_inbox_item SET state = 'read', snooze_until = NULL \
+                     WHERE tenant_id = $1 AND region = $2 AND recipient = $3 AND item_id = $4",
+                )
+                .bind(&owned_scope.tenant.0)
+                .bind(&owned_scope.region.0)
+                .bind(&owned_scope.recipient)
+                .bind(&owned_item_id)
+                .execute(conn)
+                .await
+                .map_err(|_| PgInboxError::Database)?;
+                if result.rows_affected() == 1 {
+                    Ok(())
+                } else {
+                    Err(PgInboxError::NotFound)
+                }
+            })
         })
         .await
     }
@@ -375,16 +413,24 @@ fn validate_request(request: &InboxReadRequest) -> Result<(), PgInboxError> {
     if !(1..=MAX_PAGE_SIZE).contains(&request.limit) {
         return Err(PgInboxError::InvalidLimit);
     }
+    validate_scope(&request.scope)
+}
+
+fn validate_scope(scope: &InboxReadScope) -> Result<(), PgInboxError> {
     for value in [
-        request.scope.tenant.0.as_str(),
-        request.scope.region.0.as_str(),
-        request.scope.recipient.as_str(),
+        scope.tenant.0.as_str(),
+        scope.region.0.as_str(),
+        scope.recipient.as_str(),
     ] {
         if value.is_empty() || value.len() > MAX_KEY_BYTES || value.chars().any(char::is_control) {
             return Err(PgInboxError::InvalidInput);
         }
     }
     Ok(())
+}
+
+fn valid_item_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_KEY_BYTES && !value.chars().any(char::is_control)
 }
 
 fn encode_cursor(
@@ -450,7 +496,7 @@ fn decode_cursor(value: &str, request: &InboxReadRequest) -> Result<CursorFrame,
 }
 
 fn valid_cursor_item_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= MAX_KEY_BYTES && !value.chars().any(char::is_control)
+    valid_item_id(value)
 }
 
 fn valid_cursor_priority(value: u8) -> bool {

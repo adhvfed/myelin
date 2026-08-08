@@ -16,7 +16,7 @@ fn stor_d13_outbound_mirror_residency_deny_zero_pii_egress() {
         .source_is_content_addressed_and_encrypted(b"PACK\0pii-bearing-repo-mirror-source")
         .expect("D-S13: mirror-source blobs are content-addressed + encrypted");
 
-    let extra_eu = PushMirrorTarget::new("github.com", Region::new("us-east"));
+    let extra_eu = PushMirrorTarget::new("mirror.example", Region::new("us-east"));
     assert!(
         mirror.crosses_boundary(&extra_eu),
         "an extra-EU target crosses the tenant's region boundary"

@@ -72,6 +72,31 @@ async fn delete_probe_rows(admin: &sqlx::PgPool, tenant: &TenantId, region: &Reg
         .expect("delete durable-inbox probe rows");
 }
 
+async fn delete_outbox_rows(admin: &sqlx::PgPool, tenant: &TenantId) {
+    for _ in 0..5 {
+        sqlx::query(
+            "DELETE FROM outbox_quarantine WHERE event_id IN \
+             (SELECT event_id FROM outbox WHERE envelope->>'tenant' = $1)",
+        )
+        .bind(&tenant.0)
+        .execute(admin)
+        .await
+        .expect("delete probe outbox quarantine rows");
+        if sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant' = $1")
+            .bind(&tenant.0)
+            .execute(admin)
+            .await
+            .is_ok()
+        {
+            return;
+        }
+    }
+    panic!(
+        "probe outbox rows remained referenced by the publisher quarantine for tenant {}",
+        tenant.0
+    );
+}
+
 fn signal_envelope(tenant: &TenantId, region: &Region, event_id: &str) -> EventEnvelope {
     let signal = Signal {
         rule_id: RuleId("durable_router_probe".into()),
@@ -281,6 +306,21 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
     assert_eq!(mentioned.items.len(), 1);
     assert_eq!(mentioned.items[0].item.item_id, "direct-a");
 
+    store.mark_read(&scope, "direct-a").await.unwrap();
+    assert_eq!(
+        store
+            .mark_read(
+                &InboxReadScope {
+                    recipient: "psn:bob".into(),
+                    ..scope.clone()
+                },
+                "direct-a",
+            )
+            .await,
+        Err(PgInboxError::NotFound),
+        "a recipient cannot mutate another recipient's inbox item"
+    );
+
     let foreign = PgInboxStore::new(app.clone())
         .list(&InboxReadRequest {
             scope: InboxReadScope {
@@ -305,6 +345,17 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
         .await
         .unwrap();
     assert_eq!(after_rebuild.items.len(), 4);
+    assert_eq!(
+        after_rebuild
+            .items
+            .iter()
+            .find(|item| item.item.item_id == "direct-a")
+            .unwrap()
+            .item
+            .state,
+        "read",
+        "read state survives a new store instance"
+    );
 
     delete_probe_rows(&admin, &tenant, &region).await;
 }
@@ -353,11 +404,7 @@ async fn durable_router_co_commits_dedup_inbox_and_outbox() {
     let first_id = format!("router-first-{nonce}");
     let second_id = format!("router-second-{nonce}");
     delete_probe_rows(&admin, &tenant, &region).await;
-    sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant' = $1")
-        .bind(&tenant.0)
-        .execute(&admin)
-        .await
-        .expect("clean probe outbox rows");
+    delete_outbox_rows(&admin, &tenant).await;
     sqlx::query("DELETE FROM consumer_dedup WHERE event_id = ANY($1)")
         .bind(vec![first_id.clone(), second_id.clone()])
         .execute(&admin)
@@ -489,11 +536,7 @@ async fn durable_router_co_commits_dedup_inbox_and_outbox() {
     assert_eq!(after_no_tx, (1, 1));
 
     delete_probe_rows(&admin, &tenant, &region).await;
-    sqlx::query("DELETE FROM outbox WHERE envelope->>'tenant' = $1")
-        .bind(&tenant.0)
-        .execute(&admin)
-        .await
-        .unwrap();
+    delete_outbox_rows(&admin, &tenant).await;
     sqlx::query("DELETE FROM consumer_dedup WHERE event_id = ANY($1)")
         .bind(vec![first_id, second_id])
         .execute(&admin)

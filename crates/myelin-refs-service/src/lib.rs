@@ -7,8 +7,6 @@ pub mod ci_producer;
 pub mod cross_cell;
 pub mod dek;
 #[cfg(any(test, feature = "test-support"))]
-pub mod self_tenant;
-#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
 pub mod edge_builder;
 pub mod emit;
@@ -31,7 +29,6 @@ pub mod resolve;
 pub mod restore_reerase;
 pub mod restrict;
 pub mod surge;
-pub mod switch_test;
 pub mod traverse;
 
 pub use backlinks::{
@@ -51,15 +48,6 @@ pub use cross_cell::{
     CROSS_CELL_RAW_ROWS_SIGNAL, CROSS_CELL_RESOLVES_SIGNAL,
 };
 pub use dek::{ref_p5_inherited_gates, InheritedGate, RefsDekPin};
-#[cfg(any(test, feature = "test-support"))]
-pub use self_tenant::{
-    proven_refs_rows, run_refs_truth_up_scorecard, SelfTenantArtifact, ProvenRefsRow, RefsIncident,
-    RefsIncidentDrillTicket, RefsIncidentIssueDraft, RefsRowStatus, RefsScorecardEntry,
-    RefsTruthUpPass, RefsTruthUpRed, RefsTruthUpScorecard, RefsTruthUpVerdict, MYELIN_SELF_REGION,
-    MYELIN_SELF_TENANT,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use self_tenant::run_refs_over_myelins_own_work;
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, E2eArtifact, E2E_SCENARIOS};
 #[cfg(any(test, feature = "test-support"))]
@@ -134,11 +122,6 @@ pub use restrict::RestrictSet;
 pub use surge::{
     run_refs_surge, RefsShedGate, RefsShedRejection, RefsSurgeReport, R4_REACH_INDEX_FOLLOW_ON,
     REFS_SURGE_MULTIPLIER, SHARD_SPLIT_IS_MEASURED_ONLY,
-};
-pub use switch_test::{
-    four_keystroke_jump_chain, switch_capability_matrix, switch_surface_drive_record,
-    BrowserDriveStatus, MeasuredLatencies, RefsSwitchTest, RefsSwitchVerdict, SwitchCapability,
-    SwitchSurfaceDrive,
 };
 pub use traverse::{
     apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,

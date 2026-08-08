@@ -6,8 +6,6 @@ pub mod cost_gate;
 pub mod defaults;
 pub mod dispatch;
 pub mod dispatch_surge;
-#[cfg(any(test, feature = "test-support"))]
-pub mod self_tenant;
 pub mod dry_run;
 pub mod dsr;
 pub mod effect_api;
@@ -54,14 +52,6 @@ pub use tool_exec::{ToolExecError, ToolExecutor};
 #[cfg(any(test, feature = "test-support"))]
 pub use tool_exec::{MockToolExecutor, MockToolSurface};
 
-#[cfg(any(test, feature = "test-support"))]
-pub use self_tenant::{
-    proven_fabric_rows, run_fabric_over_myelins_own_work, run_fabric_truth_up_scorecard,
-    run_myelin_triage_on_ci_failure, FabricSelfTenantArtifact, FabricIncident,
-    FabricIncidentDrillTicket, FabricIncidentIssueDraft, FabricRowStatus, FabricScorecardEntry,
-    FabricTruthUpPass, FabricTruthUpRed, FabricTruthUpScorecard, FabricTruthUpVerdict,
-    ProvenFabricRow, TriageFace, SELF_TENANT_RUNTIME_FLOOR, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
-};
 
 pub use cost_gate::{runaway_brain, AgentFabricCostSignal, RunawaySelfLimiter, RunawayStep};
 

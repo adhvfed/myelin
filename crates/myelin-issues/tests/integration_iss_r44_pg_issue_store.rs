@@ -153,7 +153,7 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     config.region = "fr-par".into();
     let bootstrap = PgBootstrap::connect(config, 8)
         .await
-        .expect("validate split database roles (is docker-compose.dev.yml up?)");
+        .expect("validate split database roles (have you run `fed test:backend`?)");
     bootstrap
         .migrate_foundation()
         .await

@@ -22,7 +22,7 @@ async fn drr_advance_replenish_and_in_flight_count_on_live_postgres() {
         .max_connections(4)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let fair = format!("fair_deficit_p356_{suffix}");

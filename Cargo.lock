@@ -2687,6 +2687,7 @@ dependencies = [
  "myelin-events",
  "myelin-flow",
  "myelin-gdpr",
+ "myelin-git",
  "myelin-harness",
  "myelin-identity",
  "myelin-identity-service",
@@ -2710,12 +2711,10 @@ name = "myelin-harness"
 version = "0.0.0"
 dependencies = [
  "base64",
- "blake3",
  "myelin-chat",
  "myelin-identity",
  "myelin-tenancy",
  "serde",
- "serde_json",
 ]
 
 [[package]]

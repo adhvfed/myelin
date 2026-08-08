@@ -29,7 +29,7 @@ async fn ci_d3_erase_crypto_shreds_live_pii_and_pseudonymises_structure_survives
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
     let app = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect(&app_url())

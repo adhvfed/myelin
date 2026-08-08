@@ -53,7 +53,3 @@ pub mod typed_edges;
 pub mod web;
 
 pub mod api;
-
-pub mod self_tenant;
-
-pub mod switch_test;

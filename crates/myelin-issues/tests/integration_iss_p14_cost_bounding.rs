@@ -34,7 +34,7 @@ async fn iss_d2_board_query_under_one_second_no_full_scan_over_1m_issues() {
         .max_connections(4)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let issue_tbl = format!("issue_p380_{suffix}");

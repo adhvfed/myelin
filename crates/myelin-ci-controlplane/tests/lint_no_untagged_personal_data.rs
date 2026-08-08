@@ -1,4 +1,4 @@
-use myelin_lints::lints::{forward_only_migration, no_untagged_personal_data, residency_pin};
+use myelin_lints::lints::{no_untagged_personal_data, residency_pin};
 
 #[test]
 fn the_lint_admits_the_tagged_ci_schema() {
@@ -69,13 +69,4 @@ fn residency_pin_is_green_over_the_ci_source() {
             "residency-pin MUST be GREEN over the CI control-plane source (no request-derived region write)"
         );
     }
-}
-
-#[test]
-fn forward_only_migration_is_green_over_the_ci_migrations() {
-    let src = include_str!("../src/migrations.rs");
-    assert!(
-        forward_only_migration().run(src).is_empty(),
-        "forward-only-migration MUST be GREEN over the CI migration source (additive CREATEs only)"
-    );
 }

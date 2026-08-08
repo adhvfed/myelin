@@ -290,7 +290,7 @@ struct GitWireRuntime {
 impl EdgeRuntimeConfig {
     fn from_env(serving: bool) -> Result<Self, String> {
         let config = Self::from_reader(serving, std::env::var)?;
-        if serving {
+        if config.git_wire.is_some() {
             let limits = myelin_edge::GitWireExecutor::default_limits();
             validate_git_wire_host(&limits)?;
         }
@@ -339,7 +339,16 @@ impl EdgeRuntimeConfig {
         } else {
             None
         };
-        let git_wire = if serving {
+        let git_wire_enabled = if serving {
+            optional_runtime_switch(
+                "MYELIN_GIT_WIRE_ENABLED",
+                read("MYELIN_GIT_WIRE_ENABLED"),
+                true,
+            )?
+        } else {
+            false
+        };
+        let git_wire = if git_wire_enabled {
             let rootfs = validated_git_wire_rootfs(read("MYELIN_GVISOR_GIT_ROOTFS"))?;
             let runsc = validated_runsc(read("MYELIN_RUNSC_BIN"))?;
             Some(GitWireRuntime { rootfs, runsc })
@@ -476,6 +485,22 @@ fn required_runtime_value(
         return Err(format!("env var {name} must not be empty"));
     }
     Ok(trimmed.to_string())
+}
+
+fn optional_runtime_switch(
+    name: &'static str,
+    value: Result<String, VarError>,
+    default: bool,
+) -> Result<bool, String> {
+    match value {
+        Err(VarError::NotPresent) => Ok(default),
+        Err(VarError::NotUnicode(_)) => Err(format!("env var {name} is not valid UTF-8")),
+        Ok(value) => match value.trim() {
+            "1" => Ok(true),
+            "0" => Ok(false),
+            _ => Err(format!("env var {name} must be `0` or `1`")),
+        },
+    }
 }
 
 fn runtime_config_or_exit(serving: bool) -> EdgeRuntimeConfig {
@@ -666,9 +691,7 @@ async fn main() {
             serve(
                 compose_core(runtime.cell_id).await,
                 runtime.git_root.expect("serving config carries a Git root"),
-                runtime
-                    .git_wire
-                    .expect("serving config carries a Git wire runtime"),
+                runtime.git_wire,
                 runtime
                     .public_base_url
                     .expect("serving config carries a public base URL"),
@@ -699,7 +722,7 @@ async fn main() {
 async fn serve(
     core: ComposedCore,
     git_root: PathBuf,
-    git_wire: GitWireRuntime,
+    git_wire: Option<GitWireRuntime>,
     public_base_url: String,
 ) {
     let ComposedCore {
@@ -718,11 +741,15 @@ async fn serve(
             ready: false,
         }),
     });
-    eprintln!(
-        "edge: validated Git wire sandbox runtime (runsc={}, rootfs={})",
-        git_wire.runsc.display(),
-        git_wire.rootfs.display()
-    );
+    if let Some(git_wire) = &git_wire {
+        eprintln!(
+            "edge: validated Git wire sandbox runtime (runsc={}, rootfs={})",
+            git_wire.runsc.display(),
+            git_wire.rootfs.display()
+        );
+    } else {
+        eprintln!("edge: Git wire transport disabled by configuration");
+    }
 
     let git_check_admission_provider =
         provider
@@ -957,7 +984,9 @@ async fn serve(
         ci_blobs,
         handle.clone(),
     );
-    builder = register_git_wire(builder, git_backend);
+    if git_wire.is_some() {
+        builder = register_git_wire(builder, git_backend);
+    }
     builder = register_issues(
         builder,
         issue_store.clone(),
@@ -1657,6 +1686,42 @@ mod runtime_config_tests {
         )
         .unwrap_err();
         assert_eq!(error, "MYELIN_RUNSC_BIN did not identify itself as runsc");
+    }
+
+    #[test]
+    fn serving_can_explicitly_disable_git_wire_without_sandbox_host_assets() {
+        let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let config = parse(
+            true,
+            &[
+                ("MYELIN_CELL_ID", "cell-dev".into()),
+                ("MYELIN_GIT_ROOT", root.display().to_string()),
+                ("MYELIN_GIT_WIRE_ENABLED", "0".into()),
+                ("MYELIN_PUBLIC_BASE_URL", "http://127.0.0.1:8080".into()),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(config.git_wire, None);
+    }
+
+    #[test]
+    fn git_wire_switch_rejects_ambiguous_values() {
+        let root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let error = parse(
+            true,
+            &[
+                ("MYELIN_CELL_ID", "cell-dev".into()),
+                ("MYELIN_GIT_ROOT", root.display().to_string()),
+                ("MYELIN_GIT_WIRE_ENABLED", "false".into()),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "env var MYELIN_GIT_WIRE_ENABLED must be `0` or `1`"
+        );
     }
 
     #[test]

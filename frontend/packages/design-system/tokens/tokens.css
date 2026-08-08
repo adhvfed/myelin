@@ -1,0 +1,222 @@
+/* Reviewed CSS custom-property projection of tokens.json.
+   The build compares generated output against this reference.
+
+   RULES THIS FILE EMBODIES:
+   - Components read ONLY semantic vars (--surface, --text-*, --focus-ring, …). No primitive in markup.
+   - Three themes: dark (default), light, high-contrast — each re-points the SAME semantic var names.
+   - The --focus-ring token is DERIVED AA-safe and DISTINCT from --accent (§8b.3; R-17 §3.2).
+   - Logical-property-friendly: components must use inline-start/end, so [dir="rtl"] mirrors for free
+     with NO override sheet (R-18 §4.1). This file ships the focus-ring offset/width as logical-safe.
+   - ONE z-index scale (chrome<popover<modal<toast); all overlays portal to root (§8b.1).
+   - Borders-first; shadow reserved for floating layers only (§3.5).
+   - prefers-reduced-motion zeroes durations (R-12 L4); forced-colors keeps focus + status meaning. */
+
+/* ============================================================================
+   PRIMITIVES (shared across themes; never used directly by components)
+   ============================================================================ */
+:root {
+  /* spacing — 4px base ramp */
+  --space-0:0px; --space-1:4px; --space-2:8px; --space-3:12px; --space-4:16px;
+  --space-5:24px; --space-6:32px; --space-7:48px; --space-8:64px;
+
+  /* radius — near-zero default (Instrument) */
+  --radius-0:0px; --radius-1:3px; --radius-2:6px; --radius-3:10px; --radius-pill:999px;
+
+  /* lines & targets */
+  --hairline:1px; --border-2:2px; --target-min:24px;
+
+  /* type */
+  --font-sans:"Inter",-apple-system,system-ui,"Segoe UI",sans-serif;
+  --font-mono:"JetBrains Mono","SF Mono",ui-monospace,"Cascadia Mono",monospace;
+  --weight-regular:400; --weight-medium:500; --weight-semibold:600;
+  --fs-caption:12px; --fs-body-sm:13px; --fs-body:14px; --fs-h3:16px;
+  --fs-h2:20px; --fs-h1:24px; --fs-display:30px; --fs-code:13px;
+  --lh-tight:1.3; --lh-body:1.45; --lh-reading:1.6;
+
+  /* motion — functional band, <=240ms */
+  --dur-instant:0ms; --dur-micro:90ms; --dur-fast:140ms; --dur-base:180ms; --dur-deliberate:240ms;
+  --ease-standard:cubic-bezier(0.2,0,0,1);
+  --ease-enter:cubic-bezier(0,0,0.2,1);
+  --ease-exit:cubic-bezier(0.4,0,1,1);
+  --ease-emphasized:cubic-bezier(0.2,0,0,1);  /* reserved agent signature */
+  --ease-linear:cubic-bezier(0,0,1,1);
+
+  /* z-index scale — chrome < popover < modal < toast */
+  --z-base:0; --z-chrome:100; --z-popover:200; --z-modal:300; --z-toast:400;
+
+  /* component dimensions (compact default) */
+  --control-h:28px; --row-h:32px;
+  --focus-width:var(--border-2); --focus-offset:var(--hairline);
+}
+
+/* ============================================================================
+   THEME: DARK (default) — "midnight command-deck"
+   ============================================================================ */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* surfaces */
+  --surface:#0c0d10;
+  --surface-raised:#101116;
+  --surface-overlay:#16181d;
+  --surface-hover:#1d2026;
+
+  /* text (MEASURED on --surface) */
+  --text-primary:#e7e9ee;   /* 16.00:1 */
+  --text-muted:#aeb3be;     /*  9.25:1 */
+  --text-subtle:#868d99;    /*  5.81:1 */
+
+  /* borders (decorative hairlines; focus-ring carries the 3:1 UI obligation) */
+  --border:#24272f;
+  --border-strong:#3a3f47;
+
+  /* accent (IDENTITY) vs focus-ring (DERIVED, AA-safe, DISTINCT) */
+  --accent:#5b8cff;         /* identity — 6.14:1 */
+  --on-accent:#0c0d10;
+  --accent-weak:#172238;
+  --focus-ring:#7ea6ff;     /* DERIVED — 8.13:1; THE focus/primary token */
+
+  /* functional status (always paired with glyph+label) */
+  --success:#46b277;  --on-success:#0c0d10;  --success-subtle:#10231a;  /* 7.31:1 */
+  --warning:#d6a93f;  --on-warning:#0c0d10;  --warning-subtle:#2a2110;  /* 8.89:1 */
+  --danger:#e0695c;   --on-danger:#0c0d10;   --danger-subtle:#27151a;   /* 5.87:1 */
+  --info:#7ea6ff;     --on-info:#0c0d10;     --info-subtle:#172238;     /* 8.13:1 (=focus) */
+
+  /* reserved agent treatment (NOT a status colour) */
+  --agent:#a99bf2;    --on-agent:#0c0d10;    --agent-subtle:#1c1830;    /* 8.01:1 */
+
+  /* diff */
+  --diff-add-bg:#10231a; --diff-del-bg:#27151a;
+  --diff-add-txt:#74d39b; --diff-del-txt:#f2897e;
+
+  /* elevation — shadow reserved for floating layers */
+  --shadow-popover:0 4px 12px rgba(0,0,0,0.40);
+  --shadow-overlay:0 12px 32px rgba(0,0,0,0.50);
+  --overlay-scrim:rgba(0,0,0,0.60);
+
+  /* component bindings */
+  --c-btn-primary-bg:var(--focus-ring);
+  --c-btn-primary-text:var(--on-accent);
+  --c-btn-danger-bg:var(--danger);
+  --c-btn-danger-text:var(--on-danger);
+  --c-focus-ring:var(--focus-ring);
+  --c-chip-border:var(--border);
+  --c-chip-bg:var(--surface-raised);
+  --c-agent-mark:var(--agent);
+  --c-rail-active:var(--accent);
+}
+
+/* ============================================================================
+   THEME: LIGHT
+   ============================================================================ */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --surface:#ffffff;
+  --surface-raised:#f7f8fa;
+  --surface-overlay:#eef0f3;
+  --surface-hover:#eef0f3;
+
+  --text-primary:#15171c;   /* 17.93:1 */
+  --text-muted:#4a505b;     /*  8.11:1 */
+  --text-subtle:#646b78;    /*  5.36:1 */
+
+  --border:#e3e6ea;
+  --border-strong:#9aa1ac;
+
+  --accent:#2f6bff;         /* identity — 4.50:1 (AA, identity only) */
+  --on-accent:#ffffff;
+  --accent-weak:#e7eeff;
+  --focus-ring:#1452d6;     /* DERIVED — 6.55:1; white-on-it 6.55:1 */
+
+  --success:#15794a;  --on-success:#ffffff;  --success-subtle:#e3f5ea;  /* 5.43:1 */
+  --warning:#8a5a07;  --on-warning:#ffffff;  --warning-subtle:#fbf0d8;  /* 5.92:1 */
+  --danger:#c0392b;   --on-danger:#ffffff;   --danger-subtle:#fbe6e6;   /* 5.44:1 */
+  --info:#1452d6;     --on-info:#ffffff;     --info-subtle:#e7eeff;     /* 6.55:1 */
+
+  --agent:#5b4ec9;    --on-agent:#ffffff;    --agent-subtle:#ece9fb;    /* 6.22:1 */
+
+  --diff-add-bg:#e3f5ea; --diff-del-bg:#fbe6e6;
+  --diff-add-txt:#0d6b3e; --diff-del-txt:#a32f25;
+
+  --shadow-popover:0 4px 12px rgba(15,23,42,0.12);
+  --shadow-overlay:0 12px 32px rgba(15,23,42,0.18);
+  --overlay-scrim:rgba(15,23,42,0.32);
+}
+
+/* ============================================================================
+   THEME: HIGH-CONTRAST (authored; EN 301 549 / WCAG 1.4.11)
+   pure-black base, AAA text, borders lifted to >=3:1 (essential UI)
+   ============================================================================ */
+:root[data-theme="high-contrast"] {
+  color-scheme: dark;
+
+  --surface:#000000;
+  --surface-raised:#0a0a0a;
+  --surface-overlay:#141414;
+  --surface-hover:#1f1f1f;
+
+  --text-primary:#ffffff;   /* 21.00:1 */
+  --text-muted:#d4d8e0;     /* 14.70:1 */
+  --text-subtle:#aab2c0;    /*  9.84:1 */
+
+  --border:#5a5f6b;         /* 3.28:1 — meets 1.4.11 UI floor */
+  --border-strong:#8c93a1;  /* 6.80:1 */
+
+  --accent:#93b4ff;         /* identity — 10.21:1 */
+  --on-accent:#000000;
+  --accent-weak:#1a2742;
+  --focus-ring:#aec4ff;     /* DERIVED — 12.14:1 */
+
+  --success:#5ad08c;  --on-success:#000000;  --success-subtle:#0d2a1c;  /* 10.84:1 */
+  --warning:#f0c050;  --on-warning:#000000;  --warning-subtle:#2e2410;  /* 12.36:1 */
+  --danger:#ff8a7d;   --on-danger:#000000;   --danger-subtle:#2e1417;   /*  9.18:1 */
+  --info:#aec4ff;     --on-info:#000000;     --info-subtle:#1a2742;     /* 12.14:1 */
+
+  --agent:#c3b6ff;    --on-agent:#000000;    --agent-subtle:#1f1a33;    /* 11.46:1 */
+
+  --diff-add-bg:#0d2a1c; --diff-del-bg:#2e1417;
+  --diff-add-txt:#7ff0ad; --diff-del-txt:#ffb0a6;
+
+  /* shadows are visually inert at this contrast — a border carries the layer */
+  --shadow-popover:0 0 0 1px var(--border-strong);
+  --shadow-overlay:0 0 0 2px var(--border-strong);
+  --overlay-scrim:rgba(0,0,0,0.80);
+}
+
+/* ============================================================================
+   FOUNDATION RULES (inherited by every component)
+   ============================================================================ */
+*{box-sizing:border-box}
+
+/* ONE focus-ring token, every interactive element, every theme (R-17 M2).
+   Logical offset so RTL is correct by construction. */
+:where(a,button,input,select,textarea,[tabindex],
+       [role="button"],[role="tab"],[role="option"],
+       [role="menuitem"],[role="checkbox"],[role="switch"]):focus-visible{
+  outline:var(--focus-width) solid var(--c-focus-ring, var(--focus-ring));
+  outline-offset:var(--focus-offset);
+  border-radius:var(--radius-1);
+}
+
+/* High-contrast / forced-colors: never lose focus or status meaning (§4 gap #3).
+   Map to system keywords so the OS palette wins; status keeps its glyph+label in markup. */
+@media (forced-colors: active){
+  :where(a,button,input,select,textarea,[tabindex],
+         [role="button"],[role="tab"],[role="option"]):focus-visible{
+    outline:var(--border-2) solid Highlight;
+    outline-offset:var(--focus-offset);
+  }
+  /* keep meaningful borders visible when the UA strips author colours */
+  :where([data-elevated],[role="dialog"],[role="menu"]){border:1px solid CanvasText}
+}
+
+/* Reduced motion is a first-class spelling, not a removal (R-12 L4):
+   zero the durations; components still flip state instantly + announce via live regions. */
+@media (prefers-reduced-motion: reduce){
+  :root{
+    --dur-micro:0ms; --dur-fast:0ms; --dur-base:0ms; --dur-deliberate:0ms;
+  }
+  *{animation-duration:0ms !important; transition-duration:0ms !important; scroll-behavior:auto !important}
+}

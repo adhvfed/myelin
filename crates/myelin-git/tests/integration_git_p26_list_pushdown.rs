@@ -20,7 +20,7 @@ async fn git_d11_pr_list_setexpr_join_one_query_zero_leak_tenant_scoped_revoke_r
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let pr_tbl = format!("pr_p288_{suffix}");

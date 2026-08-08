@@ -55,7 +55,7 @@ async fn connect() -> PgCheckStatusProjection {
         .max_connections(4)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres (is the stack up? `docker compose -f docker-compose.dev.yml up -d --wait`)");
+        .expect("connect to dev Postgres (is the stack up? `run `fed test:backend``)");
     let suffix = unique_suffix();
     let table = format!("check_status_p21_{suffix}");
     let dedup = format!("consumer_dedup_p21_{suffix}");

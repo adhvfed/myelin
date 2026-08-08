@@ -141,7 +141,7 @@ async fn scheduler_claim_serialize_reaper_cancel_superseded_on_live_postgres() {
         .max_connections(4)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let tbl = format!("job_queue_p355_{suffix}");

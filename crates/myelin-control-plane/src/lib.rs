@@ -3,7 +3,6 @@ pub mod cp_outage;
 pub mod cross_cell_bridge;
 pub mod cross_cell_bridge_durable;
 pub mod discover;
-pub mod self_tenant;
 pub mod four_layer;
 pub mod holder;
 pub mod isolation;
@@ -33,10 +32,6 @@ pub use cross_cell_bridge::{
 };
 pub use cross_cell_bridge_durable::{ProjectionError, ResolverFactory};
 pub use discover::{DiscoverKey, DiscoveryCache, DiscoverySignals, RouteTuple};
-pub use self_tenant::{
-    proven_tenancy_rows, MyelinSelfHost, ProvenTenancyRow, TenancyTruthUpPass, TenancyTruthUpRed,
-    TenancyTruthUpVerdict,
-};
 pub use four_layer::{
     CrossRegionPathError, FourLayerEnforcement, ResidencyWriteBoundary, ResidencyWriteRejected,
 };

@@ -159,8 +159,7 @@ impl core::fmt::Display for FreshnessFailure {
                 f,
                 "SEARCH FRESHNESS FAIL - the measured event→searchable p99 {measured_ms} ms BLEW the \
                  {budget_ms} ms seconds-grade budget under load: a just-written artifact is not \
-                 findable within the budget (\"I can't find what I just wrote\", §4.10). The budget \
-                 is NOT lowered to pass - this is a dated [[claimed_not_proven]] row"
+                 findable within the budget (\"I can't find what I just wrote\", §4.10)"
             ),
             FreshnessFailure::NoSamples => write!(
                 f,

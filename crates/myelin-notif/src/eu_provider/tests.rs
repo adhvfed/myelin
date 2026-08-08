@@ -198,7 +198,7 @@ fn adapter_id_and_channel_and_region_accessors() {
 }
 
 #[test]
-fn open_legal_flag_is_present_dated_and_unresolved() {
+fn open_legal_flag_records_when_the_unresolved_decision_was_raised() {
     let flag = OPEN_LEGAL_PROVIDER_DPA;
     assert_eq!(flag.id, "NOTIF-P26-OPEN-LEGAL");
     assert!(
@@ -207,7 +207,7 @@ fn open_legal_flag_is_present_dated_and_unresolved() {
     );
     assert_eq!(
         flag.raised, "2026-06-25",
-        "the flag is dated (a scorecard row, not a silent claim)"
+        "the unresolved decision records when it was raised"
     );
     assert_eq!(flag.owner, "counsel / DPO");
     assert!(

@@ -9,8 +9,6 @@ publish = false
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 serde.workspace = true
-blake3.workspace = true
-serde_json.workspace = true
 
 [dev-dependencies]
 myelin-chat = { path = "../myelin-chat" }

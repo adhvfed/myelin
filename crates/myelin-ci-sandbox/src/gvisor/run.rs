@@ -396,6 +396,10 @@ pub(super) fn require_oci_layout_matches_prepared_mode(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "integration")]
+    use crate::hardening::HardeningProfile;
+    #[cfg(feature = "integration")]
+    use crate::redaction::RedactionPlan;
     use crate::user_namespace::UserNamespaceConfig;
 
     use std::path::PathBuf;
@@ -636,7 +640,9 @@ mod tests {
                 runsc_root_identity
             }
         );
-        let _ = std::fs::remove_dir_all(&bundle);
+        let bundle_path = bundle.path.clone();
+        drop(bundle);
+        assert!(!bundle_path.exists());
 
         let outcome = result.unwrap_or_else(|e| {
             panic!("run_and_capture must succeed through the real production path: {e:?}")

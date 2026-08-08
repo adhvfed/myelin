@@ -34,7 +34,7 @@ async fn chat_p16_read_state_pg_authoritative_on_real_valkey_loss() {
         .await
         .expect(
             "connect to dev Postgres as admin (is the stack up? \
-             docker compose -f docker-compose.dev.yml up -d --wait)",
+             run `fed test:backend`)",
         );
     let suffix = std::process::id();
     let table = format!("read_state_p410_{suffix}");

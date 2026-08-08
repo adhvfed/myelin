@@ -54,7 +54,7 @@ async fn reopen(schema: &str) -> PgPool {
         })
         .connect(&admin_url())
         .await
-        .expect("reconnect to dev Postgres (is the stack up? eval \"$(scripts/dev-stack.sh env)\")")
+        .expect("reconnect to dev Postgres (is the stack up? `fed test:backend`)")
 }
 
 async fn reopen_app(schema: &str) -> PgPool {

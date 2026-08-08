@@ -14,13 +14,11 @@ RUN --mount=type=cache,id=myelin-web-pnpm,target=/pnpm/store \
     pnpm --dir frontend install --frozen-lockfile
 
 COPY frontend ./frontend
-COPY design-planning/08-design-system ./design-planning/08-design-system
 RUN pnpm --dir frontend --filter @myelin/web... build
 
 FROM node:22-bookworm-slim@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3 AS runtime
 
-LABEL org.opencontainers.image.source="https://github.com/adhvfed/myelin" \
-      org.opencontainers.image.title="Myelin web" \
+LABEL org.opencontainers.image.title="Myelin web" \
       org.opencontainers.image.description="Myelin's production SolidStart web gateway"
 
 ENV NODE_ENV=production

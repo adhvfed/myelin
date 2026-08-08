@@ -87,7 +87,7 @@ async fn kn_producer_edges_and_page_parent_mirror_ingest_reindex_and_reconverge_
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
     let app = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect(&app_url())

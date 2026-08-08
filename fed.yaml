@@ -1,0 +1,377 @@
+parameters:
+  MYELIN_KMS_SEAL_KEY:
+    type: secret
+    generate: openssl rand -hex 32
+  MYELIN_WEB_SESSION_KEY:
+    type: secret
+    generate: openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'
+  POSTGRES_PORT: { type: port, default: 5433 }
+  S3_PORT: { type: port, default: 9000 }
+  VALKEY_PORT: { type: port, default: 6380 }
+  NATS_PORT: { type: port, default: 4222 }
+  NATS_MONITOR_PORT: { type: port, default: 8222 }
+  EDGE_PORT: { type: port, default: 8080 }
+  WEB_PORT: { type: port, default: 3000 }
+
+services:
+  postgres:
+    image: postgres:16@sha256:78df81b1442dcc764c1104154da7162635e40cfffe67579c42a1c1b96dfc209c
+    ports: ["{{POSTGRES_PORT}}:5432"]
+    volumes:
+      - fed-myelin-pg-data:/var/lib/postgresql/data
+      - ./scripts/pg-init:/docker-entrypoint-initdb.d:ro
+    environment:
+      POSTGRES_USER: myelin_admin
+      POSTGRES_PASSWORD: myelin_dev_pw
+      POSTGRES_DB: myelin
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    healthcheck:
+      command: pg_isready -U myelin_admin -d myelin
+      timeout: 30s
+    startup_message: "Postgres: localhost:{{POSTGRES_PORT}}"
+
+  postgres-ready:
+    depends_on: [postgres]
+    migrate: >-
+      docker run --rm --network host
+      -e PGPASSWORD=myelin_dev_pw
+      -v "$PWD/scripts/pg-init:/init:ro"
+      postgres:16@sha256:78df81b1442dcc764c1104154da7162635e40cfffe67579c42a1c1b96dfc209c
+      psql -h 127.0.0.1 -p {{POSTGRES_PORT}}
+      -U myelin_admin -d myelin
+      --set=ON_ERROR_STOP=1 --set=migration_role=myelin_admin
+      --file=/init/00-rls-conventions.sql
+      --file=/init/01-ci-definition-fence.sql
+      --file=/init/02-dev-roles.sql
+
+  object-store:
+    image: rustfs/rustfs@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3
+    command: ["/data"]
+    ports: ["{{S3_PORT}}:9000"]
+    volumes:
+      - fed-myelin-rustfs-data:/data
+    environment:
+      RUSTFS_ACCESS_KEY: myelin_dev_access
+      RUSTFS_SECRET_KEY: myelin_dev_secret
+      RUSTFS_CONSOLE_ENABLE: "true"
+    healthcheck:
+      command: curl -fsS http://localhost:9000/health
+      timeout: 30s
+    startup_message: "Object storage: http://localhost:{{S3_PORT}}"
+
+  object-store-ready:
+    depends_on: [object-store]
+    migrate: >-
+      docker run --rm --network host
+      -e AWS_ACCESS_KEY_ID=myelin_dev_access
+      -e AWS_SECRET_ACCESS_KEY=myelin_dev_secret
+      -e AWS_DEFAULT_REGION=fr-par
+      amazon/aws-cli@sha256:14b197d682f59240b51c3953a3a47b19288dbbb25c2e237fc6eb2d70e8fca227
+      --endpoint-url http://127.0.0.1:{{S3_PORT}}
+      s3api create-bucket --bucket myelin-dev
+      2>/dev/null ||
+      docker run --rm --network host
+      -e AWS_ACCESS_KEY_ID=myelin_dev_access
+      -e AWS_SECRET_ACCESS_KEY=myelin_dev_secret
+      -e AWS_DEFAULT_REGION=fr-par
+      amazon/aws-cli@sha256:14b197d682f59240b51c3953a3a47b19288dbbb25c2e237fc6eb2d70e8fca227
+      --endpoint-url http://127.0.0.1:{{S3_PORT}}
+      s3api head-bucket --bucket myelin-dev
+
+  valkey:
+    image: valkey/valkey:8@sha256:c6d4637d757379a2ff040148b95c85936d85a06c129eafa5fbe582f9e720e12f
+    command: ["valkey-server", "--appendonly", "yes"]
+    ports: ["{{VALKEY_PORT}}:6379"]
+    volumes:
+      - fed-myelin-valkey-data:/data
+    healthcheck:
+      command: valkey-cli ping
+      timeout: 30s
+    startup_message: "Valkey: localhost:{{VALKEY_PORT}}"
+
+  nats:
+    image: nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "{{NATS_PORT}}:4222"
+      - "{{NATS_MONITOR_PORT}}:8222"
+    volumes:
+      - fed-myelin-nats-data:/data
+    healthcheck:
+      command: wget -q -O- http://localhost:8222/healthz
+      timeout: 30s
+    startup_message: "NATS: localhost:{{NATS_PORT}}"
+
+  data-layer:
+    depends_on: [postgres-ready, object-store-ready, valkey, nats]
+    migrate: ":"
+    startup_message: "Myelin data services are ready"
+
+  edge:
+    depends_on: [data-layer]
+    process: >-
+      sh -c 'git_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/git";
+      mkdir -p "$git_root";
+      export MYELIN_GIT_ROOT="$git_root" MYELIN_CI_CHECKOUT_REPO_ROOT="$git_root";
+      exec cargo run --quiet -p myelin-edge --bin edge'
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_GIT_WIRE_ENABLED: "0"
+      MYELIN_PUBLIC_BASE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_EDGE_ADDR: "127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_DEV_LOGIN: "1"
+      MYELIN_TOKEN_LOGIN: "1"
+      MYELIN_ISSUES_RECONCILE_TENANTS: "development-{{FED_PROJECT_ID}},integration-{{FED_PROJECT_ID}}"
+    healthcheck:
+      http_get: "http://127.0.0.1:{{EDGE_PORT}}/readyz"
+      timeout: 120s
+    startup_message: "Myelin edge: http://127.0.0.1:{{EDGE_PORT}}"
+
+  event-stream-ready:
+    depends_on: [edge]
+    migrate: cargo run --quiet -p myelin-outbox-publisher -- provision
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_OUTBOX_PUBLISHER_DATABASE_URL: "postgres://myelin_outbox_publisher_fr_par:myelin_outbox_publisher_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_OUTBOX_PROVISION_NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_OUTBOX_PUBLISH_NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_OUTBOX_PUBLISHER_BATCH: "4"
+      MYELIN_OUTBOX_PUBLISHER_POLL_MS: "100"
+      MYELIN_OUTBOX_PUBLISHER_BACKOFF_MS: "500"
+      MYELIN_OUTBOX_PUBLISHER_STATEMENT_TIMEOUT_MS: "1000"
+      MYELIN_OUTBOX_PUBLISHER_MAX_ENVELOPE_BYTES: "262144"
+      MYELIN_OUTBOX_STREAM_MAX_AGE_SECONDS: "7776000"
+      MYELIN_OUTBOX_STREAM_MAX_BYTES: "67108864"
+      MYELIN_OUTBOX_STREAM_MAX_MESSAGES: "100000"
+      MYELIN_OUTBOX_STREAM_REPLICAS: "1"
+      MYELIN_OUTBOX_STREAM_DEDUP_SECONDS: "120"
+      MYELIN_OUTBOX_PUBLISH_ACK_TIMEOUT_MS: "2000"
+      MYELIN_OUTBOX_PUBLISHER_PASS_TIMEOUT_MS: "20000"
+      MYELIN_REGION: fr-par
+    startup_message: "Myelin event stream is ready"
+
+  development-tenants-ready:
+    depends_on: [edge]
+    migrate: >-
+      docker run --rm --network host
+      -e PGPASSWORD=myelin_dev_pw
+      -v "$PWD/scripts/pg-init:/init:ro"
+      postgres:16@sha256:78df81b1442dcc764c1104154da7162635e40cfffe67579c42a1c1b96dfc209c
+      psql -h 127.0.0.1 -p {{POSTGRES_PORT}}
+      -U myelin_admin -d myelin --set=ON_ERROR_STOP=1
+      --set=fed_cell=myelin-dev-{{FED_PROJECT_ID}}
+      --set=edge_endpoint=http://127.0.0.1:{{EDGE_PORT}}
+      --set=development_tenant=development-{{FED_PROJECT_ID}}
+      --set=integration_tenant=integration-{{FED_PROJECT_ID}}
+      --file=/init/03-dev-placement.sql
+    startup_message: "Myelin development tenants are placed"
+
+  outbox-publisher:
+    depends_on: [event-stream-ready]
+    process: cargo run --quiet -p myelin-outbox-publisher -- serve
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_OUTBOX_PUBLISHER_DATABASE_URL: "postgres://myelin_outbox_publisher_fr_par:myelin_outbox_publisher_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_OUTBOX_PROVISION_NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_OUTBOX_PUBLISH_NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_OUTBOX_PUBLISHER_BATCH: "4"
+      MYELIN_OUTBOX_PUBLISHER_POLL_MS: "100"
+      MYELIN_OUTBOX_PUBLISHER_BACKOFF_MS: "500"
+      MYELIN_OUTBOX_PUBLISHER_STATEMENT_TIMEOUT_MS: "1000"
+      MYELIN_OUTBOX_PUBLISHER_MAX_ENVELOPE_BYTES: "262144"
+      MYELIN_OUTBOX_STREAM_MAX_AGE_SECONDS: "7776000"
+      MYELIN_OUTBOX_STREAM_MAX_BYTES: "67108864"
+      MYELIN_OUTBOX_STREAM_MAX_MESSAGES: "100000"
+      MYELIN_OUTBOX_STREAM_REPLICAS: "1"
+      MYELIN_OUTBOX_STREAM_DEDUP_SECONDS: "120"
+      MYELIN_OUTBOX_PUBLISH_ACK_TIMEOUT_MS: "2000"
+      MYELIN_OUTBOX_PUBLISHER_PASS_TIMEOUT_MS: "20000"
+      MYELIN_REGION: fr-par
+    startup_message: "Myelin event relay is running"
+
+  ci-dispatch:
+    depends_on: [event-stream-ready]
+    process: >-
+      sh -c 'git_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/git";
+      export MYELIN_GIT_ROOT="$git_root";
+      exec cargo run --quiet -p myelin-ci-dispatch --bin ci-dispatch'
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+    startup_message: "Myelin CI dispatcher is running"
+
+  ci-controlplane:
+    depends_on: [ci-dispatch]
+    process: cargo run --quiet -p myelin-ci-controlplane --bin ci-controlplane
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_CI_SCHEDULER_DATABASE_URL: "postgres://myelin_ci_scheduler_fr_par:myelin_ci_scheduler_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CI_RUNNER: "0"
+    startup_message: "Myelin CI control plane is running (local runner disabled)"
+
+  git-checks:
+    depends_on: [event-stream-ready]
+    process: cargo run --quiet -p myelin-git --bin git-check-projection
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+    startup_message: "Myelin check projection is running"
+
+  notifications:
+    depends_on: [event-stream-ready, development-tenants-ready]
+    process: cargo run --quiet -p myelin-notif --bin notif
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+    startup_message: "Myelin notifications are running"
+
+  web:
+    depends_on: [edge, outbox-publisher, ci-dispatch, ci-controlplane, git-checks, notifications]
+    install: pnpm --dir frontend install --frozen-lockfile
+    process: >-
+      sh -c 'set -eu;
+      token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_DEV_TENANT" --region fr-par
+      --principal developer --display-name "Myelin Developer"
+      --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
+      test -n "$token";
+      export MYELIN_DEV_ACCESS_TOKEN="$token";
+      exec pnpm --dir frontend --filter @myelin/web exec vinxi dev --host 127.0.0.1'
+    environment:
+      PORT: "{{WEB_PORT}}"
+      MYELIN_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_PUBLIC_ORIGIN: "http://127.0.0.1:{{WEB_PORT}}"
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_ISSUES_PROJECT: 20aee030-c7fa-4757-8243-700faf528690
+      MYELIN_ISSUES_TYPE: 7d457754-f6a1-4cd8-8738-21751570b627
+      MYELIN_ISSUES_PREFIX: MYL
+      MYELIN_DEV_LOGIN: "1"
+      MYELIN_DEV_TENANT: "development-{{FED_PROJECT_ID}}"
+      MYELIN_DEV_TOKEN_SCHEME: agent
+      MYELIN_DEV_DISPLAY_NAME: "Myelin Developer"
+      REDIS_URL: "redis://127.0.0.1:{{VALKEY_PORT}}"
+      MYELIN_WEB_SESSION_KEY: "{{MYELIN_WEB_SESSION_KEY}}"
+    healthcheck:
+      http_get: "http://127.0.0.1:{{WEB_PORT}}/readyz"
+      timeout: 180s
+    startup_message: "Myelin web: http://127.0.0.1:{{WEB_PORT}}"
+
+entrypoint: web
+
+scripts:
+  test:backend:
+    depends_on: [data-layer]
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_CI_SCHEDULER_DATABASE_URL: "postgres://myelin_ci_scheduler_fr_par:myelin_ci_scheduler_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_OUTBOX_PUBLISHER_DATABASE_URL: "postgres://myelin_outbox_publisher_fr_par:myelin_outbox_publisher_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+    script: cargo test --features integration "$@"
+
+  test:frontend:
+    script: pnpm --dir frontend check
+
+  test:integration:
+    depends_on: [web]
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_INTEGRATION_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_INTEGRATION_WEB_URL: "http://127.0.0.1:{{WEB_PORT}}"
+      MYELIN_INTEGRATION_TENANT: "integration-{{FED_PROJECT_ID}}"
+      MYELIN_BROWSER_TENANT: "development-{{FED_PROJECT_ID}}"
+      MYELIN_INTEGRATION_ISSUES_PROJECT: 20aee030-c7fa-4757-8243-700faf528690
+      MYELIN_INTEGRATION_ISSUES_TYPE: 7d457754-f6a1-4cd8-8738-21751570b627
+      MYELIN_INTEGRATION_ISSUES_PREFIX: MYL
+    script: >-
+      sh -c 'set -eu;
+      token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_INTEGRATION_TENANT" --region fr-par
+      --principal product-test --display-name "Product Test"
+      --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
+      test -n "$token";
+      export MYELIN_INTEGRATION_TOKEN="$token";
+      pnpm --dir frontend test:integration -- "$@";
+      browser_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_BROWSER_TENANT" --region fr-par
+      --principal developer --display-name "Myelin Developer"
+      --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
+      test -n "$browser_token";
+      export MYELIN_BROWSER_EDGE_TOKEN="$browser_token";
+      pnpm --dir frontend test:browser-integration' -- "$@"
+
+  test:browser-contract:
+    script: pnpm --dir frontend test:e2e -- "$@"

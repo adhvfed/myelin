@@ -146,7 +146,7 @@ mod tests {
         let region = Region::new("fr-par");
         let store = FsBlobStore::new();
         let mirror = PushMirrorClass::over(tenant(), region.clone(), &store);
-        let target = PushMirrorTarget::new("github.com", Region::new("us-east"));
+        let target = PushMirrorTarget::new("mirror.example", Region::new("us-east"));
 
         let report = mirror.residency_report(&target);
         assert_eq!(report.store_class, ResidencyStoreClass::PushMirror);
@@ -216,7 +216,7 @@ mod tests {
             "no crossing flagged for a same-region mirror"
         );
 
-        let extra = PushMirrorTarget::new("github.com", Region::new("us-east"));
+        let extra = PushMirrorTarget::new("mirror.example", Region::new("us-east"));
         assert!(
             mirror.flag_target(&extra, &telemetry),
             "an extra-EU mirror is a flagged crossing"
@@ -247,7 +247,7 @@ mod tests {
         let store = FsBlobStore::new();
         let mirror = PushMirrorClass::over(tenant(), region.clone(), &store);
 
-        let target = PushMirrorTarget::new("github.com", Region::new("us-east"));
+        let target = PushMirrorTarget::new("mirror.example", Region::new("us-east"));
         let report = mirror.residency_report(&target);
         assert_eq!(report.region.as_str(), "us-east");
         assert!(mirror.crosses_boundary(&target));

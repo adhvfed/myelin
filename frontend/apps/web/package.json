@@ -1,0 +1,35 @@
+{
+  "name": "@myelin/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Myelin's SolidStart web application.",
+  "scripts": {
+    "dev": "MYELIN_DEV_LOGIN=1 vinxi dev",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc --noEmit && vinxi build",
+    "start": "vinxi start",
+    "dev:edge": "node dev-edge/server.mjs",
+    "lint": "eslint src dev-edge tests",
+    "test": "vitest run",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:browser-integration": "playwright test --config playwright.integration.config.ts",
+    "test:e2e": "playwright test"
+  },
+  "dependencies": {
+    "@myelin/design-system": "workspace:*",
+    "@solidjs/meta": "^0.29.4",
+    "@solidjs/router": "^0.15.3",
+    "@solidjs/start": "^1.3.2",
+    "ioredis": "5.11.1",
+    "solid-js": "^1.9.4",
+    "vinxi": "^0.5.3"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.12.1",
+    "@playwright/test": "^1.61.1",
+    "@types/node": "22",
+    "vite": "^6.4.1",
+    "vitest": "^3.0.0"
+  }
+}

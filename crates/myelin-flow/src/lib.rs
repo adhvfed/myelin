@@ -3,8 +3,6 @@ pub mod approval;
 pub mod budget;
 pub mod ci_pipeline;
 pub mod crypto_shred;
-#[cfg(any(test, feature = "test-support"))]
-pub mod self_tenant;
 pub mod engine;
 pub mod executor;
 pub mod holder;
@@ -43,14 +41,6 @@ pub use crypto_shred::{
     aggregate_receipt as crypto_shred_receipt, history_row_has_inline_pii,
     is_inline_pii_unrecoverable, open_inline_pii, seal_inline_pii, signal_row_has_inline_pii,
     subject_dek_erasure, subject_dek_id, WfCryptoShred, WfShredReport,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use self_tenant::{
-    proven_flow_rows, run_flow_over_myelins_own_work, run_flow_truth_up_scorecard,
-    run_myelin_ci_pipeline, run_myelin_merge_queue, run_myelin_sla_timer, FlowSelfTenantArtifact,
-    FlowIncident, FlowIncidentDrillTicket, FlowIncidentIssueDraft, FlowRowStatus,
-    FlowScorecardEntry, FlowTruthUpPass, FlowTruthUpRed, FlowTruthUpScorecard, FlowTruthUpVerdict,
-    MergeFace, PipelineFace, ProvenFlowRow, SlaFace, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
 };
 pub use engine::{
     drive, drive_full, drive_versioned, drive_with_timers, run_state, DriveOutcome, FlowDispatcher,

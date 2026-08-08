@@ -23,7 +23,7 @@ async fn index_directory_migration_applies_forward_only_with_per_tenant_pk() {
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let tbl = format!("search_index_directory_p166_{suffix}");
