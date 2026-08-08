@@ -4,7 +4,7 @@ use myelin_harness::cross_language_shim::{
 };
 
 fn today() -> String {
-    myelin_harness::scorecard::today_iso()
+    myelin_harness::today_iso()
 }
 
 fn discharge_shim_against_chat_pin() -> ShimEnforcement {
