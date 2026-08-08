@@ -2747,13 +2747,23 @@ fn parse_code_search_query(query: &str) -> Result<(String, Option<String>), Edge
     ))
 }
 
-struct DCodeSearch;
+struct DCodeSearch {
+    be: Arc<DurableGitBackend>,
+}
 impl Handler for DCodeSearch {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let _validated = parse_code_search_query(&ctx.request.query)?;
-        Err(EdgeError::Unavailable(
-            "code search index is unavailable".into(),
-        ))
+        let (query, repo) = parse_code_search_query(&ctx.request.query)?;
+        let response = self
+            .be
+            .code_search_json(
+                tenant_of(ctx),
+                region_of(ctx),
+                ctx.principal,
+                &query,
+                repo.as_deref(),
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(200, &response))
     }
 }
 
@@ -2764,6 +2774,17 @@ mod code_search_boundary_tests {
     use myelin_storage::TenantScope;
     use myelin_tenancy::{Region as IdentityRegion, TenantId as IdentityTenantId};
     use std::collections::BTreeMap;
+
+    fn search_root() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "myelin-code-search-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     fn principal() -> Principal {
         Principal::new(
@@ -2776,14 +2797,14 @@ mod code_search_boundary_tests {
         )
     }
 
-    fn serve(query: &str) -> Result<EdgeResponse, EdgeError> {
+    fn serve(be: Arc<DurableGitBackend>, query: &str) -> Result<EdgeResponse, EdgeError> {
         let principal = principal();
         let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
         let params = BTreeMap::new();
         let request = EdgeRequest::new("GET", "/v1/git/search/code", query, vec![], vec![]);
         let page = Page::from_request(&request);
         let identity = crate::catalogue::test_request_identity(&principal, &scope);
-        DCodeSearch.handle(&HandlerCtx {
+        DCodeSearch { be }.handle(&HandlerCtx {
             identity: &identity,
             principal: &principal,
             scope: &scope,
@@ -2865,23 +2886,48 @@ mod code_search_boundary_tests {
     }
 
     #[test]
-    fn valid_code_search_requests_return_the_exact_unavailable_envelope_without_repo_probing() {
-        for query in ["q=two+words", "repo=missing-but-valid&q=symbol"] {
-            let error = match serve(query) {
-                Err(error) => error,
-                Ok(_) => panic!("the production search index is not mounted"),
-            };
-            assert_eq!(error.status(), 503);
-            assert_eq!(
-                error.envelope(),
-                json!({
-                    "error": {
-                        "message": "code search index is unavailable",
-                        "code": "unavailable",
-                    }
-                })
-            );
-        }
+    fn code_search_reads_the_authorized_default_branch_without_repo_probing() {
+        let root = search_root();
+        let be = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
+        let principal = principal();
+        be.create_repo_as("acme", "eu-west", "core", &principal)
+            .unwrap();
+        let repo = be
+            .store
+            .open_repo(&DurableGitBackend::loc("acme", "eu-west", "core"))
+            .unwrap();
+        let blob = repo.write_blob(b"first line\nneedle in code\n").unwrap();
+        let tree = repo.write_tree(&[("app.rs", &blob)]).unwrap();
+        let commit = repo
+            .write_commit(&tree, &[], "seed", "searcher", "searcher")
+            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&commit),
+            "seed",
+            "searcher",
+        )
+        .unwrap();
+
+        let response = serve(be.clone(), "repo=core&q=needle").unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json_body().unwrap()["items"],
+            json!([{
+                "repo": "core",
+                "ref": "refs/heads/main",
+                "snapshot_oid": commit.as_str(),
+                "path": "app.rs",
+                "line": 2,
+                "preview": "needle in code",
+            }])
+        );
+
+        let missing = serve(be, "repo=missing-but-valid&q=needle").unwrap();
+        assert_eq!(missing.status(), 200);
+        assert_eq!(missing.json_body().unwrap()["items"], json!([]));
+        std::fs::remove_dir_all(root).ok();
     }
 }
 
@@ -3026,9 +3072,12 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 guarded(&be, Push, Arc::new(DReportChecks { be: be.clone() })),
                 "git.checks.report",
             ),
-            (GitMethod::Get, "/api/git/search/code") => (Arc::new(DCodeSearch), "git.search.code"),
+            (GitMethod::Get, "/api/git/search/code") => (
+                Arc::new(DCodeSearch { be: be.clone() }),
+                "git.search.code",
+            ),
             (_, other) => (
-                Arc::new(DCodeSearch),
+                Arc::new(DCodeSearch { be: be.clone() }),
                 Box::leak(format!("git.unmapped:{other}").into_boxed_str()),
             ),
         };

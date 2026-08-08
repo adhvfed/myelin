@@ -127,6 +127,24 @@ describe("assembled product edge", () => {
       expect.arrayContaining([expect.objectContaining({ name: "README.md", is_dir: false })]),
     );
 
+    const codeSearch = await request(
+      "GET",
+      `/v1/git/search/code?repo=${encodeURIComponent(slug)}&q=${encodeURIComponent(slug)}`,
+      200,
+    );
+    expect(codeSearch).toMatchObject({
+      complete: true,
+      page: { next_cursor: null, limit: 100 },
+    });
+    expect(codeSearch.items).toEqual([
+      expect.objectContaining({
+        repo: slug,
+        ref: "refs/heads/main",
+        path: "README.md",
+        line: 1,
+      }),
+    ]);
+
     const pipeline = `on = "push"
 
 [[jobs]]

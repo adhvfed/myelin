@@ -1122,6 +1122,50 @@ impl DurableGitBackend {
         }
     }
 
+    fn code_search_json(
+        &self,
+        tenant: &str,
+        region: &str,
+        principal: &Principal,
+        query: &str,
+        repo_filter: Option<&str>,
+    ) -> Result<Value, DurableError> {
+        let mut repos = self.visible_pr_repo_slugs(tenant, region, principal)?;
+        if let Some(filter) = repo_filter {
+            repos.retain(|repo| repo == filter);
+        }
+        let mut budget = CodeSearchBudget::new();
+        if repos.len() > CODE_SEARCH_MAX_REPOS {
+            repos.truncate(CODE_SEARCH_MAX_REPOS);
+            budget.incomplete = true;
+        }
+        let mut hits = Vec::new();
+        for slug in repos {
+            let repo = self.store.open_repo(&Self::loc(tenant, region, &slug))?;
+            let summary = repo.refs_summary()?;
+            if summary.default_tip.is_none() {
+                continue;
+            }
+            let branch_ref = format!("refs/heads/{}", summary.default_branch);
+            search_repo_code(
+                &repo,
+                &slug,
+                &branch_ref,
+                query,
+                &mut hits,
+                &mut budget,
+            )?;
+            if hits.len() >= CODE_SEARCH_MAX_RESULTS || budget.exhausted {
+                break;
+            }
+        }
+        Ok(json!({
+            "items": hits,
+            "page": { "next_cursor": Value::Null, "limit": CODE_SEARCH_MAX_RESULTS },
+            "complete": !budget.incomplete,
+        }))
+    }
+
     fn blob_json(
         &self,
         tenant: &str,
@@ -3249,6 +3293,31 @@ const README_MAX_BYTES: usize = 512 * 1024;
 
 const RAW_BLOB_MAX_BYTES: usize = 64 * 1024 * 1024;
 
+const CODE_SEARCH_MAX_REPOS: usize = 100;
+const CODE_SEARCH_MAX_ENTRIES: usize = 10_000;
+const CODE_SEARCH_MAX_BLOB_BYTES: usize = 512 * 1024;
+const CODE_SEARCH_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const CODE_SEARCH_MAX_RESULTS: usize = 100;
+const CODE_SEARCH_MAX_PREVIEW_CHARS: usize = 500;
+
+struct CodeSearchBudget {
+    entries: usize,
+    bytes: usize,
+    incomplete: bool,
+    exhausted: bool,
+}
+
+impl CodeSearchBudget {
+    fn new() -> Self {
+        Self {
+            entries: 0,
+            bytes: 0,
+            incomplete: false,
+            exhausted: false,
+        }
+    }
+}
+
 fn first_root_tree_page(repo: &DurableGitRepo, branch_ref: &str) -> Result<TreePage, DurableError> {
     match repo.tree_page(branch_ref, "", TreePageRequest::default()) {
         Ok(TreePageLookup::Dir(page)) => Ok(page),
@@ -3279,6 +3348,119 @@ fn read_text_blob_at_snapshot_bounded(
         | BlobPathLookup::IsDir
         | BlobPathLookup::Missing => Ok(None),
     }
+}
+
+fn search_repo_code(
+    repo: &DurableGitRepo,
+    slug: &str,
+    branch_ref: &str,
+    query: &str,
+    hits: &mut Vec<Value>,
+    budget: &mut CodeSearchBudget,
+) -> Result<(), DurableError> {
+    let root = match repo.tree_page(
+        branch_ref,
+        "",
+        TreePageRequest {
+            limit: TREE_PAGE_MAX_LIMIT,
+            query: None,
+            cursor: None,
+        },
+    ) {
+        Ok(TreePageLookup::Dir(page)) => page,
+        Ok(TreePageLookup::IsFile | TreePageLookup::Missing) => return Ok(()),
+        Err(TreePageError::Durable(error)) => return Err(error),
+        Err(error) => return Err(DurableError::Git(format!("code search tree read: {error}"))),
+    };
+    let snapshot = root.snapshot_oid;
+    let snapshot_ref = snapshot.as_str().to_string();
+    let mut directories = vec![String::new()];
+    while let Some(directory) = directories.pop() {
+        let mut cursor = None;
+        loop {
+            let page = match repo.tree_page(
+                &snapshot_ref,
+                &directory,
+                TreePageRequest {
+                    limit: TREE_PAGE_MAX_LIMIT,
+                    query: None,
+                    cursor,
+                },
+            ) {
+                Ok(TreePageLookup::Dir(page)) => page,
+                Ok(TreePageLookup::IsFile | TreePageLookup::Missing) => break,
+                Err(TreePageError::Durable(error)) => return Err(error),
+                Err(error) => {
+                    return Err(DurableError::Git(format!("code search tree read: {error}")))
+                }
+            };
+            for entry in &page.entries {
+                budget.entries = budget.entries.saturating_add(1);
+                if budget.entries > CODE_SEARCH_MAX_ENTRIES {
+                    budget.incomplete = true;
+                    budget.exhausted = true;
+                    return Ok(());
+                }
+                let path = if directory.is_empty() {
+                    entry.name.clone()
+                } else {
+                    format!("{directory}/{}", entry.name)
+                };
+                if entry.is_dir {
+                    directories.push(path);
+                    continue;
+                }
+                let blob = match repo.read_blob_at_commit_oid_bounded(
+                    &snapshot,
+                    &path,
+                    CODE_SEARCH_MAX_BLOB_BYTES,
+                )? {
+                    BlobPathLookup::Found {
+                        bytes,
+                        is_binary: false,
+                        ..
+                    } => bytes,
+                    BlobPathLookup::TooLarge { .. } => {
+                        budget.incomplete = true;
+                        continue;
+                    }
+                    BlobPathLookup::Found { .. }
+                    | BlobPathLookup::IsDir
+                    | BlobPathLookup::Missing => continue,
+                };
+                budget.bytes = budget.bytes.saturating_add(blob.len());
+                if budget.bytes > CODE_SEARCH_MAX_TOTAL_BYTES {
+                    budget.incomplete = true;
+                    budget.exhausted = true;
+                    return Ok(());
+                }
+                let text = String::from_utf8_lossy(&blob);
+                for (index, line) in text.lines().enumerate() {
+                    if !line.contains(query) {
+                        continue;
+                    }
+                    hits.push(json!({
+                        "repo": slug,
+                        "ref": branch_ref,
+                        "snapshot_oid": snapshot.as_str(),
+                        "path": path,
+                        "line": index + 1,
+                        "preview": line.chars().take(CODE_SEARCH_MAX_PREVIEW_CHARS).collect::<String>(),
+                    }));
+                    if hits.len() >= CODE_SEARCH_MAX_RESULTS {
+                        budget.incomplete = true;
+                        budget.exhausted = true;
+                        return Ok(());
+                    }
+                }
+            }
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn short_oid12(oid: &str) -> String {
