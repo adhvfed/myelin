@@ -1174,6 +1174,8 @@ mod tests {
     fn router_emit_tokens_are_frozen() {
         assert_eq!(NOTIF_ITEM_CREATED, "notif.item.created");
         assert_eq!(NOTIF_ESCALATION_ACKED, "notif.escalation.acked");
+        assert!(myelin_events::validate_event_type(NOTIF_ITEM_CREATED).is_ok());
+        assert!(myelin_events::validate_event_type(NOTIF_ESCALATION_ACKED).is_ok());
         assert_eq!(ROUTER_CONSUMER_NAME, "notif-signal-router");
     }
 

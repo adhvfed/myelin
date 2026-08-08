@@ -78,6 +78,7 @@ fn cdc_2_9_subsystem_token_set_is_the_shared_anchor() {
             "issue",
             "knowledge",
             "chat",
+            "notif",
             "identity",
             "refs"
         ]
