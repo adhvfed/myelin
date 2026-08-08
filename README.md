@@ -34,10 +34,11 @@ Install `fed`, then start the local data services and Rust edge:
 fed start
 ```
 
-Run tests that use those services with `fed test:backend`. The frontend checks are
-available as `fed test:frontend`, and `fed test:browser-contract` runs the faster
-browser suite against its contract backend. The web application is the remaining
-process to add to the default composition.
+Run tests that use those services with `fed test:backend`. `fed test:integration`
+drives a TypeScript product journey through the real edge and durable services without
+AI inference. Frontend checks are available as `fed test:frontend`, and
+`fed test:browser-contract` runs the faster browser suite against its contract backend.
+The web application is the remaining process to add to the default composition.
 
 ## Status
 

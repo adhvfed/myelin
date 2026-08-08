@@ -155,5 +155,31 @@ scripts:
   test:frontend:
     script: pnpm --dir frontend check
 
+  test:integration:
+    depends_on: [edge]
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_INTEGRATION_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_INTEGRATION_TENANT: "integration-{{FED_PROJECT_ID}}"
+    script: >-
+      sh -c 'token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_INTEGRATION_TENANT" --region fr-par
+      --principal product-test --display-name "Product Test"
+      --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
+      test -n "$token";
+      export MYELIN_INTEGRATION_TOKEN="$token";
+      exec pnpm --dir frontend test:integration -- "$@"' -- "$@"
+
   test:browser-contract:
     script: pnpm --dir frontend test:e2e -- "$@"
