@@ -3298,7 +3298,7 @@ const CODE_SEARCH_MAX_ENTRIES: usize = 10_000;
 const CODE_SEARCH_MAX_BLOB_BYTES: usize = 512 * 1024;
 const CODE_SEARCH_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
 const CODE_SEARCH_MAX_RESULTS: usize = 100;
-const CODE_SEARCH_MAX_PREVIEW_CHARS: usize = 500;
+const CODE_SEARCH_MAX_EXCERPT_CHARS: usize = 500;
 
 struct CodeSearchBudget {
     entries: usize,
@@ -3445,7 +3445,7 @@ fn search_repo_code(
                         "snapshot_oid": snapshot.as_str(),
                         "path": path,
                         "line": index + 1,
-                        "preview": line.chars().take(CODE_SEARCH_MAX_PREVIEW_CHARS).collect::<String>(),
+                        "excerpt": line.chars().take(CODE_SEARCH_MAX_EXCERPT_CHARS).collect::<String>(),
                     }));
                     if hits.len() >= CODE_SEARCH_MAX_RESULTS {
                         budget.incomplete = true;

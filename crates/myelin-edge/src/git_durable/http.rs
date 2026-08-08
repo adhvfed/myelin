@@ -2920,7 +2920,7 @@ mod code_search_boundary_tests {
                 "snapshot_oid": commit.as_str(),
                 "path": "app.rs",
                 "line": 2,
-                "preview": "needle in code",
+                "excerpt": "needle in code",
             }])
         );
 
