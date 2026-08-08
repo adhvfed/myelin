@@ -82,6 +82,8 @@ test.describe("CT-005 CI web read surface", () => {
 
     await page.getByTestId("ci-run-row").click();
     await page.waitForURL(`**/ci/runs/${FAILED_RUN}`);
+    await expect(page).toHaveTitle("CI run · Myelin");
+    await expect(page.locator("head > title")).toHaveCount(1);
     await expect(page.getByRole("heading", { level: 1, name: "Run 91000000" })).toBeVisible();
     await expect(page.getByRole("heading", { level: 3, name: "contract" })).toBeVisible();
     await expect(page.getByText("byte 0")).toBeVisible();
