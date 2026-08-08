@@ -161,6 +161,22 @@ services:
       MYELIN_REGION: fr-par
     startup_message: "Myelin event stream is ready"
 
+  development-tenants-ready:
+    depends_on: [edge]
+    migrate: >-
+      docker run --rm --network host
+      -e PGPASSWORD=myelin_dev_pw
+      -v "$PWD/scripts/pg-init:/init:ro"
+      postgres:16@sha256:78df81b1442dcc764c1104154da7162635e40cfffe67579c42a1c1b96dfc209c
+      psql -h 127.0.0.1 -p {{POSTGRES_PORT}}
+      -U myelin_admin -d myelin --set=ON_ERROR_STOP=1
+      --set=fed_cell=myelin-dev-{{FED_PROJECT_ID}}
+      --set=edge_endpoint=http://127.0.0.1:{{EDGE_PORT}}
+      --set=development_tenant=development-{{FED_PROJECT_ID}}
+      --set=integration_tenant=integration-{{FED_PROJECT_ID}}
+      --file=/init/03-dev-placement.sql
+    startup_message: "Myelin development tenants are placed"
+
   outbox-publisher:
     depends_on: [event-stream-ready]
     process: cargo run --quiet -p myelin-outbox-publisher -- serve
@@ -238,7 +254,7 @@ services:
     startup_message: "Myelin check projection is running"
 
   notifications:
-    depends_on: [event-stream-ready]
+    depends_on: [event-stream-ready, development-tenants-ready]
     process: cargo run --quiet -p myelin-notif --bin notif
     environment:
       DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
