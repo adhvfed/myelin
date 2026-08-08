@@ -765,6 +765,23 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert_eq!(status, 200);
     assert_eq!(second_close["version"], version);
 
+    let (status, closed_without_projection_rebuild) = http(
+        address,
+        "GET",
+        "/v1/issues?state=closed",
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a state change must not invalidate the authorization projection"
+    );
+    assert_eq!(
+        closed_without_projection_rebuild["items"][0]["id"],
+        issue_id
+    );
+
     let mut additional = Vec::new();
     for (prefix, extra_title) in [
         ("ENG", "recent engineering issue"),

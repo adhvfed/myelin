@@ -24,7 +24,7 @@ describe("assembled product edge", () => {
   async function request(
     method: "GET" | "POST",
     path: string,
-    expectedStatus: number,
+    expectedStatus: number | readonly number[],
     body?: unknown,
   ): Promise<JsonObject> {
     const response = await fetch(`${edgeUrl}${path}`, {
@@ -41,13 +41,30 @@ describe("assembled product edge", () => {
       signal: AbortSignal.timeout(15_000),
     });
     const text = await response.text();
-    expect(response.status, `${method} ${path} returned ${response.status}: ${text}`).toBe(
-      expectedStatus,
-    );
+    const acceptedStatuses = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
+    expect(
+      acceptedStatuses,
+      `${method} ${path} returned ${response.status}: ${text}`,
+    ).toContain(response.status);
     return object(JSON.parse(text));
   }
 
-  test("creates, browses, commits, and opens a review through durable services", async () => {
+  async function waitForIssueActivation(requestEventId: string): Promise<JsonObject> {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const status = await request(
+        "GET",
+        `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
+        [200, 202],
+      );
+      if (status.status === "active") return object(status.issue);
+      expect(status.status).toBe("pending");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`issue authorization ${requestEventId} did not activate within 15 seconds`);
+  }
+
+  test("creates, browses, commits, reviews, and tracks work through durable services", async () => {
     const slug = `it-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
     const repoPath = `/v1/git/repos/${encodeURIComponent(slug)}`;
 
@@ -124,5 +141,43 @@ describe("assembled product edge", () => {
       head_ref: "refs/heads/feature",
       head_oid: featureOid,
     });
+
+    const issueTitle = `Ship ${slug}`;
+    const issueReceipt = await request("POST", "/v1/issues", 202, {
+      project_id: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_PROJECT"),
+      type_id: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_TYPE"),
+      prefix: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_PREFIX"),
+      title: issueTitle,
+    });
+    const issueSummary = object(issueReceipt.issue);
+    const authorization = object(issueReceipt.authorization);
+    expect(issueSummary.id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(issueSummary.key).toMatch(/^MYL-\d+$/);
+    expect(authorization).toMatchObject({ status: "pending" });
+
+    const activatedIssue = await waitForIssueActivation(String(authorization.request_event_id));
+    expect(activatedIssue).toMatchObject({
+      id: issueSummary.id,
+      key: issueSummary.key,
+      title: issueTitle,
+      state_category: "unstarted",
+    });
+
+    const issueId = encodeURIComponent(String(issueSummary.id));
+    const issue = await request("GET", `/v1/issues/${issueId}`, 200);
+    expect(issue).toMatchObject(activatedIssue);
+
+    const openIssues = await request("GET", "/v1/issues?state=open&limit=50", 200);
+    expect(openIssues.items).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: issueSummary.id, title: issueTitle })]),
+    );
+
+    const closed = await request("POST", `/v1/issues/${issueId}/close`, 200, {});
+    expect(closed).toMatchObject({ id: issueSummary.id, state_category: "completed" });
+
+    const closedIssues = await request("GET", "/v1/issues?state=closed&limit=50", 200);
+    expect(closedIssues.items).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: issueSummary.id, title: issueTitle })]),
+    );
   });
 });
