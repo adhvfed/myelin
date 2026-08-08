@@ -118,6 +118,13 @@ pub fn http_catalogue() -> Vec<Endpoint> {
         )
         .unwrap(),
         Endpoint::new(
+            Method::Get,
+            "/api/git/repos/{repo}/blame/{ref}/{path}",
+            Handler::Project,
+            true,
+        )
+        .unwrap(),
+        Endpoint::new(
             Method::Post,
             "/api/git/repos/{repo}/blob/{ref}/{path}",
             Handler::ReceivePack,

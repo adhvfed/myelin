@@ -469,6 +469,35 @@ export function blobJson(repo, ref, path) {
   };
 }
 
+/** GET /v1/git/repos/{repo}/blame/{ref}/{...path} → snapshot-pinned line attribution. */
+export function blameJson(repo, ref, path) {
+  if (repo !== "myelin") return null;
+  const hit = walkTree(path);
+  if (!hit || hit.kind !== "file" || hit.node.binary) return { __status: 404 };
+  const contents = hit.node.file ?? "";
+  const lineCount = contents === "" ? 0 : contents.split("\n").length - Number(contents.endsWith("\n"));
+  const oldCommit = {
+    oid: C1,
+    summary: "feat: land the make-it-real spine",
+    author: "u_dev_operator@acme.noreply",
+    committed_at: 1719360000,
+  };
+  const latestCommit = {
+    oid: C2,
+    summary: "docs: expand the README",
+    author: "u_dev_operator@acme.noreply",
+    committed_at: 1719446400,
+  };
+  const hunks = path === "README.md"
+    ? [
+        { start_line: 1, line_count: 2, commit: oldCommit },
+        { start_line: 3, line_count: 1, commit: latestCommit },
+        { start_line: 4, line_count: lineCount - 3, commit: oldCommit },
+      ]
+    : lineCount === 0 ? [] : [{ start_line: 1, line_count: lineCount, commit: oldCommit }];
+  return { path, ref, snapshot_oid: C2, contents, hunks };
+}
+
 /** GET raw/download bytes (R3.4) — returns `{ body, contentType, attachment }` (null = 404). */
 export function rawBytes(repo, _ref, path, attachment) {
   if (repo !== "myelin") return null;

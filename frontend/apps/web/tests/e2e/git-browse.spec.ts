@@ -68,6 +68,22 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expectNoAxeViolations(page, "blob view");
   });
 
+  test("blame traces each line to a commit without losing the file context", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/blob/main/README.md");
+    await page.getByTestId("blame-link").click();
+    await page.waitForURL("**/git/repos/myelin/blame/main/README.md");
+
+    await expect(page.getByRole("heading", { name: /Line history/ })).toContainText("README.md");
+    const viewer = page.getByTestId("blame-viewer");
+    await expect(viewer).toContainText("The make-it-real spine.");
+    await expect(viewer.getByRole("link", { name: C2.slice(0, 10) })).toBeVisible();
+    await expect(viewer.getByText("docs: expand the README")).toBeVisible();
+    await expect(page.getByText(`snapshot ${C2.slice(0, 12)}`)).toBeVisible();
+    await expect(page.getByRole("link", { name: "View file" })).toBeVisible();
+    await expectNoAxeViolations(page, "blame view");
+  });
+
   test("raw previews are inert and downloads use a proxy-owned attachment", async ({ page }) => {
     await devLogin(page);
 

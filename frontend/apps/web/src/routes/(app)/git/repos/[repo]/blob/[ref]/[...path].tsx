@@ -1,12 +1,12 @@
 // Blob view (R3.4 / G-2) — `/git/repos/{repo}/blob/{ref}/{...path}` (nested path). Full-path
 // breadcrumb; a Raw + Download toolbar (gateway-proxied, in-region — Download forces an attachment via
-// the /git-raw proxy) + a present-disabled Blame slot (under construction). Body: a BINARY file renders the
+// the /git-raw proxy) + line attribution for previewable text. Body: a BINARY file renders the
 // download fallback (NEVER split('\n') a binary into a garbled dump); a large file whose object was
 // not inflated shows an explicit metadata-only fallback; otherwise the line-numbered code view. A directory requested
 // here (the edge's redirect_to_tree hint) client-redirects to the tree route. Semantic tokens only.
 import { ErrorBoundary, For, Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
-import { Navigate, createAsync, useParams } from "@solidjs/router";
+import { A, Navigate, createAsync, useParams } from "@solidjs/router";
 import { Icon, Skeleton, SkeletonBlock } from "@myelin/design-system";
 import { getBlob } from "~/lib/api";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
@@ -40,6 +40,7 @@ export default function BlobScreen() {
   const rawHref = () => `/git-raw/${params.repo}/${encodeURIComponent(ref())}/${encPath()}?d=inline`;
   const downloadHref = () => `/git-raw/${params.repo}/${encodeURIComponent(ref())}/${encPath()}?d=attachment`;
   const treeHref = () => `/git/repos/${params.repo}/tree/${encodeURIComponent(ref())}/${encPath()}`;
+  const blameHref = () => `/git/repos/${params.repo}/blame/${encodeURIComponent(ref())}/${encPath()}`;
 
   const toolbarBtn = {
     display: "inline-flex", "align-items": "center", gap: "var(--space-1)",
@@ -72,7 +73,7 @@ export default function BlobScreen() {
                     </h1>
                     <span style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>{fmtBytes(file.size_bytes)}</span>
                     <div style={{ flex: "1" }} />
-                    {/* Raw (open) · Download (attachment, gateway-proxied) · Blame (under construction). */}
+                    {/* Raw (open) · Download (attachment, gateway-proxied) · snapshot-pinned blame. */}
                     <Show when={file.download_available !== false}>
                       <a href={rawHref()} target="_blank" rel="noreferrer" style={toolbarBtn}>
                         <Icon name="external-link" /> Raw
@@ -81,10 +82,11 @@ export default function BlobScreen() {
                         <Icon name="download" /> Download
                       </a>
                     </Show>
-                    <button type="button" aria-disabled="true" disabled data-testid="blame-under-construction" title="Blame is under construction" style={{ ...toolbarBtn, color: "var(--text-subtle)", cursor: "not-allowed" }}>
-                      <Icon name="human" /> Blame
-                      <span style={{ "font-size": "var(--fs-caption)" }}>under construction</span>
-                    </button>
+                    <Show when={!file.preview_unavailable && !file.is_binary}>
+                      <A href={blameHref()} data-testid="blame-link" style={toolbarBtn}>
+                        <Icon name="human" /> Blame
+                      </A>
+                    </Show>
                   </div>
                   <p style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)", margin: "0" }}>
                     blob <code style={{ "font-family": "var(--font-mono)" }}>{file.base_oid}</code>

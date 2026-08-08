@@ -899,6 +899,12 @@ impl DurableGitRepo {
         }
     }
 
+    pub fn resolve_commit_oid(&self, revspec: &str) -> Result<Option<Oid>, DurableError> {
+        let repo = self.open_git()?;
+        let commit = self.resolve_commit(&repo, revspec)?;
+        Ok(commit.map(|commit| Oid::new(commit.id().to_string())))
+    }
+
     fn tip_commit(&self, repo: &git2::Repository, ref_name: &str) -> Result<Option<git2::Oid>, DurableError> {
         match repo.find_reference(ref_name) {
             Ok(r) => Ok(r.target()),

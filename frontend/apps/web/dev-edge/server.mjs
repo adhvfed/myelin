@@ -20,6 +20,7 @@ import {
   parseRepoSummaryQuery,
   repoHomeJson,
   blobJson,
+  blameJson,
   commitsEnvelope,
   commitDiffJson,
   prJson,
@@ -954,6 +955,11 @@ const server = createServer((req, res) => {
     // R3.4: nested blob.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/blob\/([^/]+)\/(.+)$/))) {
       const v = blobJson(seg(m[1]), seg(m[2]), nested(m[3]));
+      if (!v || v.__status === 404) return send(res, 404, notFoundEnvelope("file"));
+      return send(res, 200, v);
+    }
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/blame\/([^/]+)\/(.+)$/))) {
+      const v = blameJson(seg(m[1]), seg(m[2]), nested(m[3]));
       if (!v || v.__status === 404) return send(res, 404, notFoundEnvelope("file"));
       return send(res, 200, v);
     }
