@@ -1,10 +1,3 @@
-// THE APP SHELL (doc 10 §7 / doc 08 §7) — the slot-based layout frame the whole UI hangs in.
-//
-// Chrome it owns, ONCE: the brand + the ⌘K command-palette trigger + the residency cue + the inbox
-// affordance + the identity menu in the header; the fixed icon NAV rail; a secondary-nav slot; and the
-// fluid main slot (the `min-height:0` scroll container). Global ⌘K opens the palette from anywhere.
-// Built from the MR-016 design-system (<Icon>, semantic tokens) + the MR-017 overlays (Dialog/Menu/
-// Toast); semantic-tokens-only; a11y per the design manual (landmarks, skip link, aria-current).
 import {
   For,
   Match,
@@ -24,6 +17,7 @@ import { Icon, Menu, Dialog, useToast, type IconName, type MenuItemSpec } from "
 import { logout, type Viewer } from "../lib/auth";
 import { createInbox } from "../lib/notifications";
 import { inboxReasonLabel } from "../lib/inbox-response";
+import { codeSearchHref } from "../lib/code-search";
 import { CommandPalette, type Command } from "./CommandPalette";
 
 /** The shell context a nested route uses to fill the shell-owned context-pane region (§1b). A route
@@ -376,7 +370,9 @@ export function AppShell(props: AppShellProps) {
           <For each={NAV}>
             {(item) => {
               const isActive = () =>
-                location.pathname === item.href || location.pathname.startsWith(item.href + "/");
+                item.href === "/git/repos"
+                  ? location.pathname.startsWith("/git/") || location.pathname === "/prs"
+                  : location.pathname === item.href || location.pathname.startsWith(item.href + "/");
               return (
                 <A
                   href={item.href}
@@ -476,7 +472,12 @@ export function AppShell(props: AppShellProps) {
         </Dialog>
       </Show>
 
-      <CommandPalette open={paletteOpen()} onClose={() => setPaletteOpen(false)} commands={commands()} />
+      <CommandPalette
+        open={paletteOpen()}
+        onClose={() => setPaletteOpen(false)}
+        commands={commands()}
+        onSearch={(query) => navigate(codeSearchHref({ q: query }))}
+      />
 
       <Dialog
         open={inboxOpen()}

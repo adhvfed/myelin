@@ -138,6 +138,19 @@ command = ["true"]
   await expect(page.getByText("fr-par", { exact: true })).toBeVisible();
   expect(await page.evaluate(() => document.cookie)).not.toContain("myelin_session");
 
+  await page.keyboard.press("ControlOrMeta+k");
+  await page.getByRole("combobox", { name: /Search or run a command/ }).fill(slug);
+  await page.keyboard.press("Enter");
+  await page.waitForURL(/\/git\/search\?q=/);
+  const searchResult = page.getByTestId("code-search-results").getByRole("link").first();
+  await expect(searchResult).toContainText(slug);
+  await expect(searchResult).toContainText("README.md:1");
+  await expect(searchResult).toContainText(`# ${slug}`);
+  await searchResult.click();
+  await expect(page).toHaveURL(/\/blob\/refs%2Fheads%2Fmain\/README\.md#L1$/);
+  await expect(page.locator("#L1")).toContainText(`# ${slug}`);
+
+  await page.goto("/git/repos");
   await page.getByRole("link", { name: new RegExp(`${tenant}/${slug}`) }).click();
   await expect(page.getByRole("heading", { name: `${tenant}/${slug}` })).toBeVisible();
   await expect(page.getByText("Created through the running product.")).toBeVisible();

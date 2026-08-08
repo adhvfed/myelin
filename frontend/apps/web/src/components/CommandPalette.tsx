@@ -1,8 +1,3 @@
-// The ⌘K command palette (doc 10 §4): a `Dialog` (MR-017) + a search-input header driving ONE
-// ↑↓/Enter keyboard surface over a command registry. Actions execute in-place (navigate / toggle
-// theme / sign out / open inbox). The Dialog primitive owns the focus-trap, scroll-lock, Escape, and
-// return-focus; this component owns the search + the roving active row. Semantic tokens only; the
-// combobox ARIA (listbox + aria-activedescendant) makes the single keyboard surface AT-legible.
 import { createMemo, createSignal, For, Show } from "solid-js";
 import { Dialog, Icon, type IconName } from "@myelin/design-system";
 
@@ -18,6 +13,7 @@ export interface CommandPaletteProps {
   open: boolean;
   onClose: () => void;
   commands: Command[];
+  onSearch?: (query: string) => void;
 }
 
 export function CommandPalette(props: CommandPaletteProps) {
@@ -25,11 +21,21 @@ export function CommandPalette(props: CommandPaletteProps) {
   const [active, setActive] = createSignal(0);
   let input: HTMLInputElement | undefined;
 
-  const matches = createMemo(() => {
+  const matches = createMemo<Command[]>(() => {
     const q = queryText().trim().toLowerCase();
     const list = props.commands;
     if (!q) return list;
-    return list.filter((c) => c.label.toLowerCase().includes(q));
+    const commands = list.filter((c) => c.label.toLowerCase().includes(q));
+    if (props.onSearch) {
+      const search = queryText().trim();
+      commands.push({
+        id: "search:code",
+        label: `Search code for “${search}”`,
+        icon: "search",
+        run: () => props.onSearch?.(search),
+      });
+    }
+    return commands;
   });
 
   const clampActive = (n: number) => {

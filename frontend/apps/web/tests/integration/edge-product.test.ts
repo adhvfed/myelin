@@ -142,6 +142,7 @@ describe("assembled product edge", () => {
         ref: "refs/heads/main",
         path: "README.md",
         line: 1,
+        excerpt: `# ${slug}`,
       }),
     ]);
 

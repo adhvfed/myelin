@@ -75,6 +75,13 @@ import {
   type CiRunsPage,
 } from "./ci-read-response";
 import {
+  codeSearchParams,
+  parseCodeSearchInput,
+  parseCodeSearchPage,
+  type CodeSearchInput,
+  type CodeSearchPage,
+} from "./code-search";
+import {
   mapPrDiffStatusToKind,
   mapStatusToKind,
   RepoRouteError,
@@ -82,6 +89,7 @@ import {
 } from "./repo-error";
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
+export type { CodeSearchHit, CodeSearchInput, CodeSearchPage } from "./code-search";
 export {
   REPO_ERR_PREFIX,
   RepoRouteError,
@@ -633,6 +641,19 @@ export const getRepos = query(async (request: GitRepoListInput = {}): Promise<Re
     return page;
   });
 }, "git-repos");
+
+export const getCodeSearch = query(async (request: CodeSearchInput): Promise<CodeSearchPage> => {
+  "use server";
+  const input = parseCodeSearchInput(request);
+  if (!input) throw new RepoRouteError("error");
+  return authed(async () => {
+    const page = parseCodeSearchPage(
+      await edgeGet(`/v1/git/search/code?${codeSearchParams(input).toString()}`),
+    );
+    if (!page) throw new RepoRouteError("error");
+    return page;
+  });
+}, "git-code-search");
 
 /** Repository-authorized durable CI run summaries, newest first under an opaque keyset cursor. */
 export const getCiRuns = query(async (request: CiRunsInput = {}): Promise<CiRunsPage> => {

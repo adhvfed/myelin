@@ -133,7 +133,7 @@ export default function BlobScreen() {
                       >
                         <For each={file.contents.split("\n")}>
                           {(line, i) => (
-                            <div style={{ display: "flex", gap: "var(--space-2)" }}>
+                            <div id={`L${i() + 1}`} style={{ display: "flex", gap: "var(--space-2)", "scroll-margin-block-start": "var(--space-5)" }}>
                               <span aria-hidden="true" style={{ color: "var(--text-subtle)", "min-width": "2.5rem", "text-align": "end", "user-select": "none" }}>{i() + 1}</span>
                               <span>{line}</span>
                             </div>
