@@ -8,7 +8,12 @@ import {
   getSessionRecord,
   issueSession,
 } from "../server/session";
-import { edgeGetPublic, edgeWhoamiWithToken } from "../server/gateway";
+import {
+  edgeGetPublic,
+  edgeWhoami,
+  edgeWhoamiWithToken,
+  isUnauthorized,
+} from "../server/gateway";
 import { beginOidcLogin, interactiveOidcConfigured } from "../server/oidc";
 import {
   DEV_ACCESS_TOKEN,
@@ -56,6 +61,21 @@ export const requireViewer = query(async (): Promise<Viewer> => {
   "use server";
   const rec = await getSessionRecord();
   if (!rec) throw redirect("/login");
+  try {
+    const who = await edgeWhoami();
+    if (
+      who.principal_id !== rec.principalId ||
+      who.tenant !== rec.tenant ||
+      who.region !== rec.region
+    ) {
+      await clearCurrentSession();
+      throw redirect("/login");
+    }
+  } catch (error) {
+    if (!isUnauthorized(error)) throw error;
+    await clearCurrentSession();
+    throw redirect("/login");
+  }
   return {
     principalId: rec.principalId,
     displayName: rec.displayName,

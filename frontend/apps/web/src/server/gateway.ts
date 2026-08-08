@@ -90,6 +90,28 @@ export interface EdgeWhoami {
   expires_at: number;
 }
 
+function validEdgeWhoami(value: unknown): value is EdgeWhoami {
+  if (typeof value !== "object" || value === null) return false;
+  const who = value as Partial<EdgeWhoami>;
+  return (
+    typeof who.principal_id === "string" &&
+    who.principal_id.length > 0 &&
+    typeof who.tenant === "string" &&
+    who.tenant.length > 0 &&
+    typeof who.region === "string" &&
+    who.region.length > 0 &&
+    typeof who.kind === "string" &&
+    who.kind.length > 0 &&
+    validCredentialExpirySeconds(who.expires_at)
+  );
+}
+
+export async function edgeWhoami(): Promise<EdgeWhoami> {
+  const who = await edgeGet<unknown>("/v1/whoami");
+  if (!validEdgeWhoami(who)) throw new Unauthorized("whoami returned an unexpected shape");
+  return who;
+}
+
 export interface EdgeOidcLogin {
   accessToken: string;
   scheme: "session";
@@ -165,17 +187,8 @@ export async function edgeWhoamiWithToken(token: string, scheme = "agent"): Prom
     // Do NOT attach the response body — it could echo the token or an internal error. Honest, opaque.
     throw new Unauthorized(`token verification failed (HTTP ${res.status})`);
   }
-  const who = parseJson(await readLimitedText(res, 64 * 1024)) as EdgeWhoami | null;
-  if (
-    !who ||
-    typeof who.principal_id !== "string" ||
-    !who.principal_id ||
-    typeof who.tenant !== "string" ||
-    !who.tenant ||
-    typeof who.region !== "string" ||
-    !who.region ||
-    !validCredentialExpirySeconds(who.expires_at)
-  ) {
+  const who = parseJson(await readLimitedText(res, 64 * 1024));
+  if (!validEdgeWhoami(who)) {
     throw new Unauthorized("token verification returned an unexpected shape");
   }
   return who;
