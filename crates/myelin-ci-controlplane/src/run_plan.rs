@@ -850,9 +850,8 @@ fn validate_structured_build(
             } else {
                 invalid(format!(
                     "job `{job_name}` Cargo recipe is not in the platform allowlist; admitted recipes are \
-                     `build --locked`, `test --locked --lib`, `test --locked --lib --workspace`, \
-                     `test --locked -p <package>`, and \
-                     `clippy --locked --all-targets -- -D warnings`"
+                     `build --locked`, workspace or library test runs, `test --locked -p <package>`, \
+                     and workspace or root clippy runs"
                 ))
             }
         }
@@ -869,9 +868,19 @@ const CARGO_RECIPE_ALLOWLIST: &[&[&str]] = &[
     &["build", "--locked"],
     &["test", "--locked", "--lib"],
     &["test", "--locked", "--lib", "--workspace"],
+    &["test", "--locked", "--workspace", "--all-targets"],
     &[
         "clippy",
         "--locked",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings",
+    ],
+    &[
+        "clippy",
+        "--locked",
+        "--workspace",
         "--all-targets",
         "--",
         "-D",

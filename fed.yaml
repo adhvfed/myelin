@@ -195,7 +195,7 @@ scripts:
       REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
       NATS_URL: "nats://localhost:{{NATS_PORT}}"
       MYELIN_REGION: fr-par
-    script: cargo test --workspace --features integration -- "$@"
+    script: cargo test --features integration "$@"
 
   test:frontend:
     script: pnpm --dir frontend check

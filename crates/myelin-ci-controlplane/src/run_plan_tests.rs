@@ -355,6 +355,28 @@ fn structured_build_validation_rejects_shell_unknown_tool_and_oversized_args() {
 }
 
 #[test]
+fn structured_build_validation_admits_full_workspace_checks() {
+    for args in [
+        vec!["test", "--locked", "--workspace", "--all-targets"],
+        vec![
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+    ] {
+        let mut plan = structured_cargo_plan_v2();
+        plan.jobs[0].build.as_mut().unwrap().args =
+            args.into_iter().map(String::from).collect();
+        plan.canonical_bytes()
+            .expect("full-workspace test and lint recipes are supported");
+    }
+}
+
+#[test]
 fn version_two_job_execution_is_exactly_one_of_command_or_build() {
     let mut both = structured_cargo_plan_v2();
     both.jobs[0].command = vec!["/bin/sh".into(), "-c".into(), "cargo build".into()];

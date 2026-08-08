@@ -61,20 +61,20 @@ fn push_envelope() -> EventEnvelope {
     )
     .unwrap();
     EventEnvelope {
-        event_id: EventId("founder-push".into()),
+        event_id: EventId("pipeline-push".into()),
         type_: EventType(myelin_git::events::GIT_REF_UPDATED.into()),
         schema_ver: 1,
         tenant: tenant.clone(),
         region: Region("fr-par".into()),
         actor: Actor(Principal::stub(
-            PrincipalId("founder".into()),
+            PrincipalId("operator".into()),
             PrincipalKind::Human,
             tenant,
         )),
         subject: ref_key.subject("myelin").unwrap(),
         aggregate: ref_key.aggregate(),
         causation_id: None,
-        correlation_id: CorrelationId("founder-acceptance".into()),
+        correlation_id: CorrelationId("pipeline-acceptance".into()),
         caused_by: None,
         depth: 0,
         contains_personal_data: false,
@@ -94,11 +94,11 @@ fn push_envelope() -> EventEnvelope {
 }
 
 #[test]
-fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
+fn checked_in_pipeline_is_a_resolvable_build_test_clippy_dag() {
     let bytes = fs::read(workspace_root().join(".myelin/ci.toml"))
-        .expect("the founder pipeline must remain checked in");
+        .expect("the pipeline must remain checked in");
     let definition =
-        parse_versioned_ci_config(&bytes, ".myelin/ci.toml").expect("founder config parses");
+        parse_versioned_ci_config(&bytes, ".myelin/ci.toml").expect("pipeline config parses");
 
     match &definition.contract {
         CiPlanContract::V2(execution) => assert_eq!(
@@ -106,13 +106,16 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
             myelin_ci_controlplane::CiExecutionProfileV1::LinuxBuildV1,
             "the cutover pipeline runs on the Rust-capable linux-build-v1 profile"
         ),
-        CiPlanContract::V1 => panic!("founder pipeline must remain a V2 execution request"),
+        CiPlanContract::V1 => panic!("the checked-in pipeline must remain a V2 execution request"),
     }
     assert_eq!(definition.on, OnTrigger::Push);
 
-    assert_eq!(definition.jobs.len(), 4, "build + test + clippy + gates");
+    assert_eq!(definition.jobs.len(), 4, "build + test + clippy + architecture");
     let authored: Vec<String> = definition.jobs.iter().map(|j| j.name.clone()).collect();
-    assert_eq!(authored, ["build", "test", "clippy", "gates"].map(String::from));
+    assert_eq!(
+        authored,
+        ["build", "test", "clippy", "architecture"].map(String::from)
+    );
 
     for job in &definition.jobs {
         assert_eq!(
@@ -132,24 +135,35 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
     assert!(authored_job("build").needs.is_empty(), "build is the DAG root");
     assert_eq!(
         authored_job("test").build.as_ref().unwrap(),
-        &recipe(&["test", "--locked", "--lib"])
+        &recipe(&["test", "--locked", "--workspace", "--all-targets"])
     );
     assert_eq!(authored_job("test").needs, ["build"].map(String::from));
     assert_eq!(
         authored_job("clippy").build.as_ref().unwrap(),
-        &recipe(&["clippy", "--locked", "--all-targets", "--", "-D", "warnings"])
+        &recipe(&[
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
     );
     assert_eq!(authored_job("clippy").needs, ["build"].map(String::from));
     assert_eq!(
-        authored_job("gates").build.as_ref().unwrap(),
+        authored_job("architecture").build.as_ref().unwrap(),
         &recipe(&["test", "--locked", "-p", "myelin-lints"])
     );
-    assert_eq!(authored_job("gates").needs, ["build"].map(String::from));
+    assert_eq!(
+        authored_job("architecture").needs,
+        ["build"].map(String::from)
+    );
 
     let blobs = FsBlobStore::new();
     let armed = match plan_dispatch(&push_envelope(), &CheckedInRepo, &blobs) {
         DispatchOutcome::Arm(armed) => armed,
-        DispatchOutcome::Skip(reason) => panic!("founder push did not arm: {reason:?}"),
+        DispatchOutcome::Skip(reason) => panic!("the checked-in push did not arm: {reason:?}"),
     };
     assert_eq!(armed.handoff.run_write.trigger_kind, "push");
 
@@ -165,9 +179,9 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
             serde_json::json!({"provider": "ci", "name": "build"}),
             serde_json::json!({"provider": "ci", "name": "test"}),
             serde_json::json!({"provider": "ci", "name": "clippy"}),
-            serde_json::json!({"provider": "ci", "name": "gates"}),
+            serde_json::json!({"provider": "ci", "name": "architecture"}),
         ],
-        "exactly the four build/test/clippy/gates check contexts are queued"
+        "exactly the four build, test, clippy, and architecture contexts are queued"
     );
 
     let snapshot_ref = &armed.handoff.run_write.definition_snapshot.0;
@@ -192,11 +206,11 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
     let resolved_names: Vec<String> = resolved.jobs.iter().map(|j| j.name.clone()).collect();
     assert_eq!(
         resolved_names,
-        ["build", "clippy", "gates", "test"].map(String::from)
+        ["architecture", "build", "clippy", "test"].map(String::from)
     );
 
     let resolved_job = |n: &str| resolved.jobs.iter().find(|j| j.name == n).unwrap();
-    for n in ["build", "test", "clippy", "gates"] {
+    for n in ["build", "test", "clippy", "architecture"] {
         let j = resolved_job(n);
         assert_eq!(j.stage, n, "the authored stage name survives resolution");
         assert_eq!(j.image, ROOTFS_IMAGE);
@@ -211,24 +225,35 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
     );
     assert_eq!(
         resolved_job("test").build.as_ref().unwrap(),
-        &recipe(&["test", "--locked", "--lib"])
+        &recipe(&["test", "--locked", "--workspace", "--all-targets"])
     );
     assert_eq!(
         resolved_job("clippy").build.as_ref().unwrap(),
-        &recipe(&["clippy", "--locked", "--all-targets", "--", "-D", "warnings"])
+        &recipe(&[
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ])
     );
     assert_eq!(
-        resolved_job("gates").build.as_ref().unwrap(),
+        resolved_job("architecture").build.as_ref().unwrap(),
         &recipe(&["test", "--locked", "-p", "myelin-lints"])
     );
 
     assert!(resolved_job("build").needs.is_empty());
     assert_eq!(resolved_job("test").needs, ["build"].map(String::from));
     assert_eq!(resolved_job("clippy").needs, ["build"].map(String::from));
-    assert_eq!(resolved_job("gates").needs, ["build"].map(String::from));
+    assert_eq!(
+        resolved_job("architecture").needs,
+        ["build"].map(String::from)
+    );
 
     let workspace_vendor = myelin_ci_sandbox::cargo_vendor_workspace_reference();
-    for n in ["build", "test", "clippy", "gates"] {
+    for n in ["build", "test", "clippy", "architecture"] {
         assert_eq!(
             resolved_job(n).selected_cargo_vendor.as_deref(),
             Some(workspace_vendor.as_str()),
@@ -249,7 +274,9 @@ fn checked_in_founder_pipeline_is_the_armed_resolvable_build_test_clippy_dag() {
         .as_ref()
         .unwrap()
         .platform_argv();
-    assert!(clippy_argv.starts_with(&["cargo", "clippy", "--locked", "--all-targets"].map(String::from)));
+    assert!(clippy_argv.starts_with(
+        &["cargo", "clippy", "--locked", "--workspace", "--all-targets"].map(String::from)
+    ));
     assert!(
         clippy_argv.ends_with(&["--", "-D", "warnings"].map(String::from)),
         "the `-- -D warnings` compiler-driver tail stays after the injected --config pairs"

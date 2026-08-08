@@ -40,6 +40,12 @@ AI inference. Frontend checks are available as `fed test:frontend`, and
 `fed test:browser-contract` runs the faster browser suite against its contract backend.
 Fed prints the allocated web and edge URLs when the stack is ready.
 
+Pass Cargo selectors after `--` to run a focused backend test, for example:
+
+```sh
+fed test:backend -- -p myelin-edge --test integration_issue_routes_pg
+```
+
 ## Status
 
 Pre-release and under heavy development. Interfaces, schemas, and deployment
