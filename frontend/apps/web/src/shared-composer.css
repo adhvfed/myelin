@@ -1,0 +1,6 @@
+.shared-composer { width: 100%; min-height: var(--control-h); overflow: auto; border: var(--hairline) solid var(--border); border-radius: var(--radius-1); background: var(--surface); color: var(--text-primary); font-size: var(--fs-body-sm); }
+.shared-composer.invalid { border-color: var(--danger); }
+.shared-composer .block-editor-row { grid-template-columns: minmax(0, 1fr); }
+.shared-composer .block-editor-handle { display: none; }
+.shared-composer .block-editor-input { grid-column: 1; min-height: 1.75rem; padding: var(--space-2); font-family: var(--font-mono); }
+.shared-composer .block-editor-input:focus { background: transparent; box-shadow: inset 2px 0 0 var(--accent); }

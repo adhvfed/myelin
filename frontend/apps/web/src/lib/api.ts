@@ -25,6 +25,7 @@ import {
 } from "./mutation-response";
 import { parseFileLinesInput, parseFileLinesResponse, type FileLine } from "./file-lines";
 import { parseBlob, parseRefs, parseRepoHome, parseTree } from "./repo-read-response";
+import { parseBlame, type BlameVM } from "./blame-response";
 import { parseRepoListPage } from "./repo-list-response";
 import { parseCommitDiff, parseCommitsPage, parsePrCommitsPage } from "./commit-read-response";
 import { parsePr, parsePrDiff, parsePrListPage } from "./pr-read-response";
@@ -99,6 +100,8 @@ export {
   mapStatusToKind,
   type RepoErrorKind,
 } from "./repo-error";
+export * from "./chat-api";
+export * from "./knowledge-api";
 
 /** A brief commit projection for the latest-commit bar / per-entry activity (R3.4). */
 export interface CommitBriefVM {
@@ -833,6 +836,23 @@ export const getBlob = query(
     });
   },
   "git-blob",
+);
+
+/** Line attribution for one text file, pinned to the ref's resolved commit snapshot. */
+export const getBlame = query(
+  async (input: { repo: string; ref: string; path: string }): Promise<BlameVM> => {
+    "use server";
+    const parsed = parseGitBrowseInput(input, false);
+    if (!parsed) throw new RepoRouteError("error");
+    return authed(async () => {
+      const blame = parseBlame(await edgeGet(
+        `/v1/git/repos/${seg(parsed.repo)}/blame/${seg(parsed.ref)}/${nestedPath(parsed.path)}`,
+      ));
+      if (!blame) throw new RepoRouteError("error");
+      return blame;
+    });
+  },
+  "git-blame",
 );
 
 /** The commit log for a ref (GET /v1/git/repos/{repo}/commits/{ref}). */

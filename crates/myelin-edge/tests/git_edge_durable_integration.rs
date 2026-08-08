@@ -797,6 +797,29 @@ async fn r34_browse_endpoints_refs_tree_blob_paging_and_raw() {
     assert_eq!(bv["download_url"], "/v1/git/repos/br/download/main/a.txt");
     assert!(bv["contents"].as_str().unwrap().contains("file 0"));
 
+    let (blame_status, blame) = http(
+        addr,
+        "GET",
+        "/v1/git/repos/br/blame/main/a.txt",
+        &hdr(&h),
+        vec![],
+    )
+    .await;
+    assert_eq!(blame_status, 200, "blame: {blame}");
+    assert_eq!(blame["path"], "a.txt");
+    assert_eq!(blame["ref"], "main");
+    assert_eq!(blame["contents"], "file 0\n");
+    assert_eq!(blame["hunks"].as_array().unwrap().len(), 1);
+    assert_eq!(blame["hunks"][0]["start_line"], 1);
+    assert_eq!(blame["hunks"][0]["line_count"], 1);
+    assert_eq!(blame["hunks"][0]["commit"]["summary"], "web edit");
+    assert!(blame["hunks"][0]["commit"]["oid"]
+        .as_str()
+        .is_some_and(|oid| oid.len() == 40));
+    assert!(blame["snapshot_oid"]
+        .as_str()
+        .is_some_and(|oid| oid.len() == 40));
+
     let (nc, _) = http(
         addr,
         "GET",

@@ -1,7 +1,7 @@
 pub mod ulid;
 
-#[cfg(feature = "integration")]
 pub mod pg;
+pub mod pg_conversation;
 
 use std::collections::BTreeMap;
 use std::sync::Mutex;

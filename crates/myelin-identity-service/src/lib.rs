@@ -65,7 +65,8 @@ pub use issue_fragment::{
     VIEW as ISSUE_VIEW, VIEW_FIELD as ISSUE_VIEW_FIELD,
 };
 pub use knowledge_fragment::{
-    field_view_caveat, knowledge_fragment, DIRECT_BLOCK, DIRECT_READER, READ as KN_READ, VIEW_FIELD,
+    field_view_caveat, knowledge_fragment, DIRECT_BLOCK, DIRECT_EDITOR, DIRECT_READER,
+    EDIT as KN_EDIT, READ as KN_READ, VIEW_FIELD,
 };
 pub use list_objects::{ListObjects, DEFAULT_IDS_CARDINALITY_CAP};
 pub use lowering::{

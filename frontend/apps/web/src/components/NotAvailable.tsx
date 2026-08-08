@@ -4,7 +4,7 @@ import { Icon } from "@myelin/design-system";
 export interface NotAvailableProps {
   subsystem?: string;
   kind?: string;
-  status?: "planned" | "missing";
+  status?: "under-construction" | "missing";
 }
 
 export function NotAvailable(props: NotAvailableProps) {
@@ -27,7 +27,7 @@ export function NotAvailable(props: NotAvailableProps) {
         "text-align": "center",
       }}
     >
-      <Icon name="gate" size={28} title={missing() ? "Not found" : "Not available yet"} />
+      <Icon name="gate" size={28} title={missing() ? "Not found" : "Under construction"} />
       <span
         data-testid="availability-status"
         style={{
@@ -40,15 +40,15 @@ export function NotAvailable(props: NotAvailableProps) {
           "border-radius": "var(--radius-pill)",
         }}
       >
-        {missing() ? "Not found" : "Coming soon"}
+        {missing() ? "Not found" : "Under construction"}
       </span>
       <h2 id="not-available-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>
-        {label()} {missing() ? "wasn’t found" : "isn’t here yet"}
+        {label()} {missing() ? "wasn’t found" : "is under construction"}
       </h2>
       <p style={{ color: "var(--text-muted)", margin: "0", "max-width": "42ch" }}>
         {missing()
           ? "Check the address or return to your repositories."
-          : "This area is planned but is not available in this build."}
+          : "This area is under active construction."}
       </p>
       <A
         href="/git/repos"

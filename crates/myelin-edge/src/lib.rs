@@ -1,6 +1,7 @@
 pub mod authz;
 pub mod bootstrap;
 pub mod catalogue;
+pub mod chat_http;
 pub mod ci_http;
 pub mod error;
 pub mod gateway;
@@ -14,6 +15,7 @@ pub mod git_wire_exec;
 pub mod git_wire_http;
 pub mod issue_authz;
 pub mod issues_http;
+pub mod knowledge_http;
 pub mod notif_http;
 pub mod repo_authz;
 pub mod repo_authz_live;
@@ -37,6 +39,7 @@ pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
 };
+pub use chat_http::register_chat;
 pub use ci_http::{register_ci, DurableCiReadApi};
 pub use error::{map_authz_error, EdgeError};
 pub use gateway::{
@@ -65,6 +68,7 @@ pub use issue_authz::{
     IssueReconciliationReport, StoreBackedIssueAuthorizer, ISSUE_RECONCILE_TENANTS_ENV,
 };
 pub use issues_http::{register_issues, MAX_ISSUE_JSON_BYTES};
+pub use knowledge_http::register_knowledge;
 pub use notif_http::register_notif;
 pub use repo_authz::{AllowAllRepos, DenyAllRepos, GrantBackedRepos, RepoAccess, RepoAuthorizer};
 pub use repo_authz_live::{

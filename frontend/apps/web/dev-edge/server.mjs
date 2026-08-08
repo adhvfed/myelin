@@ -20,6 +20,7 @@ import {
   parseRepoSummaryQuery,
   repoHomeJson,
   blobJson,
+  blameJson,
   commitsEnvelope,
   commitDiffJson,
   prJson,
@@ -60,6 +61,8 @@ import {
   parseCiLogQuery,
   parseCiRunsQuery,
 } from "./ci-contract.mjs";
+import { ChatFixtures, parseChatQuery } from "./chat-contract.mjs";
+import { KnowledgeFixtures, parseKnowledgeQuery } from "./knowledge-contract.mjs";
 
 const PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
 
@@ -101,6 +104,8 @@ const state = {
   prCommitContinuationFailures: 0,
   prCommitContinuationMalformedPages: 0,
   prCommitContinuationRequests: 0,
+  emptyChat: false,
+  emptyKnowledge: false,
   // CT-005 CI read-surface controls. Cursors bind the canonicalized concrete visible-repository set,
   // just as production does; tests mutate membership rather than a synthetic generation counter.
   emptyCi: false,
@@ -115,6 +120,9 @@ const state = {
   ciLiveRejectNextAccess: false,
   ciLiveAppends: 0,
 };
+
+const chat = new ChatFixtures();
+const knowledge = new KnowledgeFixtures();
 
 let ciLiveSegments = [{ cursor: 1n, byteStart: 0, bytes: Buffer.from(CI_LIVE_INITIAL_LOG) }];
 let ciLiveTerminal = false;
@@ -349,6 +357,23 @@ const server = createServer((req, res) => {
           resetPrCommitPagination();
         }
         if (body.resetIssues === true) resetIssues();
+        if (body.resetChat === true) {
+          state.emptyChat = false;
+          chat.reset();
+        }
+        if (typeof body.emptyChat === "boolean") {
+          state.emptyChat = body.emptyChat;
+          chat.reset({ empty: body.emptyChat });
+        }
+        if (body.resetKnowledge === true) {
+          state.emptyKnowledge = false;
+          knowledge.reset();
+        }
+        if (typeof body.emptyKnowledge === "boolean") {
+          state.emptyKnowledge = body.emptyKnowledge;
+          knowledge.reset({ empty: body.emptyKnowledge });
+        }
+        if (typeof body.bumpKnowledgePage === "string") knowledge.bump(body.bumpKnowledgePage);
         if (body.resetCi === true) resetCi();
         if (typeof body.emptyCi === "boolean") state.emptyCi = body.emptyCi;
         if (typeof body.ciUnavailable === "boolean") state.ciUnavailable = body.ciUnavailable;
@@ -410,6 +435,124 @@ const server = createServer((req, res) => {
 
   // Every data route requires a valid Bearer (the auth floor). A missing/forged token → uniform 401.
   const authed = !state.forceUnauthorized && bearer(req) === DEV_ACCESS_TOKEN;
+
+  if (method === "GET" && path === "/v1/chat/conversations") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const input = parseChatQuery(url.search.slice(1), "cursor");
+    if (!input) {
+      return send(res, 400, { error: { message: "invalid Chat topic query", code: "bad_request" } });
+    }
+    return send(res, 200, chat.listConversations(input), { "cache-control": "no-store" });
+  }
+
+  if (method === "POST" && path === "/v1/chat/conversations") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (url.search) {
+      return send(res, 400, { error: { message: "Chat mutations accept no query", code: "bad_request" } });
+    }
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return send(res, 400, { error: { message: "invalid Chat topic body", code: "bad_request" } });
+      }
+      const output = chat.createConversation(body);
+      if (output.status === 400) {
+        return send(res, 400, { error: { message: "invalid Chat topic body", code: "bad_request" } });
+      }
+      if (output.status === 409) {
+        return send(res, 409, { error: { message: "Chat topic already exists", code: "conflict" } });
+      }
+      state.emptyChat = false;
+      return send(res, output.status, output.json, { "cache-control": "no-store" });
+    });
+    return;
+  }
+
+  let chatMatch;
+  if (
+    method === "GET" &&
+    (chatMatch = path.match(/^\/v1\/chat\/conversations\/([^/]+)\/messages$/))
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const conversationId = decodeCiPathSegment(chatMatch[1]);
+    const input = parseChatQuery(url.search.slice(1), "before");
+    if (!conversationId || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(conversationId) || !input) {
+      return send(res, 400, { error: { message: "invalid Chat message query", code: "bad_request" } });
+    }
+    const output = chat.listMessages(conversationId, input);
+    return output
+      ? send(res, 200, output, { "cache-control": "no-store" })
+      : send(res, 404, notFoundEnvelope("conversation"));
+  }
+
+  if (
+    method === "POST" &&
+    (chatMatch = path.match(/^\/v1\/chat\/conversations\/([^/]+)\/messages$/))
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const conversationId = decodeCiPathSegment(chatMatch[1]);
+    if (!conversationId || !/^[0-9A-HJKMNP-TV-Z]{26}$/.test(conversationId) || url.search) {
+      return send(res, 400, { error: { message: "invalid Chat message request", code: "bad_request" } });
+    }
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return send(res, 400, { error: { message: "invalid Chat message body", code: "bad_request" } });
+      }
+      const output = chat.postMessage(conversationId, body);
+      if (output.status === 404) return send(res, 404, notFoundEnvelope("conversation"));
+      if (output.status === 400) {
+        return send(res, 400, { error: { message: "invalid Chat message body", code: "bad_request" } });
+      }
+      return send(res, output.status, output.json, { "cache-control": "no-store" });
+    });
+    return;
+  }
+
+  if (method === "GET" && path === "/v1/knowledge/pages") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const input = parseKnowledgeQuery(url.search.slice(1));
+    return input ? send(res, 200, knowledge.list(input), { "cache-control": "no-store" }) : send(res, 400, { error: { message: "invalid Knowledge page query", code: "bad_request" } });
+  }
+
+  if (method === "POST" && path === "/v1/knowledge/pages") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (url.search) return send(res, 400, { error: { message: "Knowledge mutations accept no query", code: "bad_request" } });
+    let raw = ""; req.on("data", (chunk) => (raw += chunk)); req.on("end", () => {
+      let body; try { body = JSON.parse(raw); } catch { return send(res, 400, { error: { message: "invalid Knowledge page body", code: "bad_request" } }); }
+      const output = knowledge.create(body); if (output.status === 400) return send(res, 400, { error: { message: "invalid Knowledge page body", code: "bad_request" } });
+      state.emptyKnowledge = false; return send(res, output.status, output.json, { "cache-control": "no-store" });
+    }); return;
+  }
+
+  let knowledgeMatch;
+  if (method === "GET" && (knowledgeMatch = path.match(/^\/v1\/knowledge\/pages\/([^/]+)$/))) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (url.search) return send(res, 400, { error: { message: "Knowledge page view accepts no query", code: "bad_request" } });
+    const page = knowledge.get(decodeCiPathSegment(knowledgeMatch[1]));
+    return page ? send(res, 200, { page }, { "cache-control": "no-store" }) : send(res, 404, notFoundEnvelope("Knowledge page"));
+  }
+
+  if (method === "PUT" && (knowledgeMatch = path.match(/^\/v1\/knowledge\/pages\/([^/]+)$/))) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (url.search) return send(res, 400, { error: { message: "Knowledge mutations accept no query", code: "bad_request" } });
+    const id = decodeCiPathSegment(knowledgeMatch[1]); let raw = ""; req.on("data", (chunk) => (raw += chunk)); req.on("end", () => {
+      let body; try { body = JSON.parse(raw); } catch { return send(res, 400, { error: { message: "invalid Knowledge save body", code: "bad_request" } }); }
+      const output = knowledge.save(id, body);
+      if (output.status === 400) return send(res, 400, { error: { message: "invalid Knowledge save body", code: "bad_request" } });
+      if (output.status === 404) return send(res, 404, notFoundEnvelope("Knowledge page"));
+      if (output.status === 409) return send(res, 409, { error: { message: "Knowledge page changed while editing", code: "conflict" } });
+      return send(res, 200, output.json, { "cache-control": "no-store" });
+    }); return;
+  }
 
   // CT-005 read-only CI surface. The dev implementation uses a keyed keyset cursor and the same
   // strict query grammar, response shapes, and shared golden vectors as the production Rust Edge.
@@ -954,6 +1097,11 @@ const server = createServer((req, res) => {
     // R3.4: nested blob.
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/blob\/([^/]+)\/(.+)$/))) {
       const v = blobJson(seg(m[1]), seg(m[2]), nested(m[3]));
+      if (!v || v.__status === 404) return send(res, 404, notFoundEnvelope("file"));
+      return send(res, 200, v);
+    }
+    if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)\/blame\/([^/]+)\/(.+)$/))) {
+      const v = blameJson(seg(m[1]), seg(m[2]), nested(m[3]));
       if (!v || v.__status === 404) return send(res, 404, notFoundEnvelope("file"));
       return send(res, 200, v);
     }

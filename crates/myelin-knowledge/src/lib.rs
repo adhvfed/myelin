@@ -4,6 +4,7 @@ pub mod block_tree;
 pub mod collab;
 pub mod comments;
 pub mod compaction;
+pub mod crypto;
 pub mod database;
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
@@ -15,6 +16,7 @@ pub mod list_filter;
 pub mod materialise;
 pub mod merge;
 pub mod notif_resolve;
+pub mod pg_page;
 pub mod rebac_fragment;
 pub mod refs_glue;
 pub mod replay;
@@ -44,6 +46,7 @@ pub use comments::{
 pub use compaction::{
     content_address, materialize, CompactionError, DocSnapshot, SnapshotCompactor,
 };
+pub use crypto::{decrypt_text, encrypt_text, knowledge_subject_erasure};
 pub use database::{
     execute_view_count, execute_view_query, lower_view_filter, row_matches_filter, DbRelation,
     DbRow, FacetIndexHint, FacetPath, FacetTelemetry, FieldDef, FieldSchema, LoweredViewFilter,
@@ -57,8 +60,9 @@ pub use e2e_wedge::{
 };
 pub use editor::{Document, EditOp, Editor, EditorBlock, SecondViewer, BROWSER_DRIVE_EVIDENCE};
 pub use emit::{
-    block_ref, database_ref, emit_change, page_ref, row_ref, KnowledgeChange,
-    KnowledgeLivingDocHandler, KNOWLEDGE_LIVING_DOC_TRIGGERS,
+    block_ref, database_ref, emit_change, event_actor_pseudonym, page_ref,
+    pseudonymized_event_principal, row_ref, KnowledgeChange, KnowledgeLivingDocHandler,
+    KNOWLEDGE_LIVING_DOC_TRIGGERS,
 };
 pub use export::{
     export_rows_to_csv, import_adf, AdfImportResult, ExportBlock, ExportDoc, ExportError,
@@ -102,6 +106,11 @@ pub use refs_glue::{
     REL_CLASS_REFERENCE,
 };
 pub use notif_resolve::KnowledgeRefResolver;
+pub use pg_page::{
+    knowledge_page_migrations, KnowledgeBlockRecord, KnowledgePageError, KnowledgePageRecord,
+    KnowledgePageStore, KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage,
+    KNOWLEDGE_BLOCK_TABLE, KNOWLEDGE_PAGE_RECENT_INDEX, KNOWLEDGE_PAGE_TABLE,
+};
 pub use replay::{KnowledgeReindexSource, REFS_EDGE_SNAPSHOT};
 pub use rollup::{
     compute_row, CellValue, FormulaExpr, FormulaField, FormulaSchema, FormulaSchemaError,

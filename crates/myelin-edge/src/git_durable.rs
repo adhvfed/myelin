@@ -3637,6 +3637,12 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::Git(m) if m.starts_with("commit diff computation limit exceeded:") => {
             EdgeError::PayloadTooLarge("commit diff exceeds the interactive content limit".into())
         }
+        DurableError::Git(m) if m.starts_with("blame limit exceeded:") => {
+            EdgeError::PayloadTooLarge("file exceeds the interactive blame limit".into())
+        }
+        DurableError::Git(m) if m.starts_with("blame unavailable:") => {
+            EdgeError::BadRequest(m)
+        }
         DurableError::Git(m) if m.starts_with("pull request list limit exceeded:") => {
             EdgeError::PayloadTooLarge(
                 "pull request list exceeds the interactive record limit".into(),
@@ -3850,6 +3856,7 @@ fn repo_summary_response(value: &Value) -> Result<EdgeResponse, EdgeError> {
 }
 
 mod check_projection;
+mod blame;
 mod http;
 pub use check_projection::GitDatabaseProviders;
 pub use http::register_git_durable;

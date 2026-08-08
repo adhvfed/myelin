@@ -19,6 +19,7 @@ import { createInbox } from "../lib/notifications";
 import { inboxReasonLabel } from "../lib/inbox-response";
 import { codeSearchHref } from "../lib/code-search";
 import { CommandPalette, type Command } from "./CommandPalette";
+import { cycleTheme as cycleAppearance } from "../lib/theme";
 
 /** The shell context a nested route uses to fill the shell-owned context-pane region (§1b). A route
  *  calls `setContextPane(() => <Pane/>)` in an effect (with `onCleanup(() => setContextPane(null))`);
@@ -47,22 +48,15 @@ interface NavItem {
   href: string;
   icon: IconName;
   label: string;
-  /** An unbuilt destination (R3.4 honest rail): muted + a neutral "soon" dot + a title tooltip, still
-   *  a real keyboard-reachable link that lands on the teaching NotAvailable. Never disabled, never
-   *  accent, never colour-alone (the tooltip + destination copy carry the meaning). */
-  soon?: boolean;
 }
 
-// Keep unfinished destinations reachable so their explanatory states remain discoverable.
 const NAV: NavItem[] = [
   { href: "/git/repos", icon: "nav-code", label: "Code" },
   { href: "/issues", icon: "nav-issues", label: "Issues" },
-  { href: "/chat", icon: "nav-chat", label: "Chat", soon: true },
+  { href: "/chat", icon: "nav-chat", label: "Chat" },
   { href: "/ci", icon: "nav-ci", label: "CI" },
-  { href: "/knowledge", icon: "nav-knowledge", label: "Knowledge", soon: true },
+  { href: "/knowledge", icon: "nav-knowledge", label: "Knowledge" },
 ];
-
-const THEMES = ["dark", "light", "high-contrast"] as const;
 
 export interface AppShellProps {
   viewer: Viewer;
@@ -144,10 +138,7 @@ export function AppShell(props: AppShellProps) {
   };
 
   const cycleTheme = () => {
-    const el = document.documentElement;
-    const current = (el.dataset.theme as (typeof THEMES)[number]) ?? "dark";
-    const next = THEMES[(THEMES.indexOf(current) + 1) % THEMES.length] ?? "dark";
-    el.dataset.theme = next;
+    const next = cycleAppearance();
     toast.show({ title: `Theme: ${next}`, variant: "info" });
   };
 
@@ -203,12 +194,13 @@ export function AppShell(props: AppShellProps) {
     { id: "pr:mine", label: "My pull requests", icon: "pull-request", run: () => navigate("/prs?bucket=yours") },
     { id: "issue:new", label: "Create issue", icon: "issue", run: () => navigate("/issues?new=1") },
     { id: "inbox", label: "Open inbox", icon: "inbox", run: () => setInboxOpen(true) },
+    { id: "profile", label: "Open profile", icon: "human", run: () => navigate("/profile") },
     { id: "theme", label: "Toggle theme", icon: "settings", run: cycleTheme },
     { id: "logout", label: "Sign out", icon: "human", run: () => void doLogout() },
   ];
 
   const identityItems: MenuItemSpec[] = [
-    { label: "Profile", icon: "human", onSelect: () => toast.show({ title: "Profile is a later surface", variant: "info" }) },
+    { label: "Profile", icon: "human", onSelect: () => navigate("/profile") },
     { label: "Toggle theme", icon: "settings", onSelect: cycleTheme },
     { label: "Sign out", icon: "close", onSelect: () => void doLogout() },
   ];
@@ -376,13 +368,10 @@ export function AppShell(props: AppShellProps) {
               return (
                 <A
                   href={item.href}
-                  class={item.soon ? "nav-rail-item soon" : "nav-rail-item"}
-                  aria-label={item.soon ? `${item.label} (coming soon)` : item.label}
-                  title={item.soon ? `${item.label} — coming soon` : undefined}
+                  class="nav-rail-item"
+                  aria-label={item.label}
                   aria-current={isActive() ? "page" : undefined}
-                  // Colour/active/hover come from the .nav-rail-item class (surface-hover fill +
-                  // brighter text, no accent fill — R1 binding). `.soon` mutes it + shows a neutral
-                  // dot. Only layout stays inline.
+                  // Colour/active/hover come from the .nav-rail-item class. Only layout stays inline.
                   style={{
                     position: "relative",
                     display: "flex",
@@ -394,9 +383,6 @@ export function AppShell(props: AppShellProps) {
                   }}
                 >
                   <Icon name={item.icon} title={item.label} />
-                  <Show when={item.soon}>
-                    <span class="soon-dot" aria-hidden="true" />
-                  </Show>
                 </A>
               );
             }}

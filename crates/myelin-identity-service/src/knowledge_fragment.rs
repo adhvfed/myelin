@@ -11,10 +11,12 @@ pub mod object_types {
 }
 
 pub const DIRECT_READER: &str = "direct_reader";
+pub const DIRECT_EDITOR: &str = "direct_editor";
 
 pub const DIRECT_BLOCK: &str = "direct_block";
 
 pub const READ: &str = "read";
+pub const EDIT: &str = "edit";
 
 pub const VIEW_FIELD: &str = "view_field";
 
@@ -47,11 +49,17 @@ fn frag(object_type: &str, relations: &[&str], permissions: Vec<PermissionRule>)
 pub fn space_fragment() -> FragmentDef {
     frag(
         object_types::SPACE,
-        &[DIRECT_READER, "member"],
-        vec![perm(
-            READ,
-            Userset::Union(vec![rel(DIRECT_READER), rel("member")]),
-        )],
+        &[DIRECT_READER, DIRECT_EDITOR, "member"],
+        vec![
+            perm(
+                READ,
+                Userset::Union(vec![rel(DIRECT_READER), rel(DIRECT_EDITOR), rel("member")]),
+            ),
+            perm(
+                EDIT,
+                Userset::Union(vec![rel(DIRECT_EDITOR), rel("member")]),
+            ),
+        ],
     )
     .watchable()
 }
@@ -59,18 +67,35 @@ pub fn space_fragment() -> FragmentDef {
 pub fn page_fragment() -> FragmentDef {
     frag(
         object_types::PAGE,
-        &["parent_page", "parent_space", DIRECT_READER, DIRECT_BLOCK],
-        vec![perm(
-            READ,
-            Userset::Exclusion {
-                base: Box::new(Userset::Union(vec![
-                    ttu("parent_page", READ),
-                    ttu("parent_space", READ),
-                    rel(DIRECT_READER),
-                ])),
-                subtracted: Box::new(rel(DIRECT_BLOCK)),
-            },
-        )],
+        &[
+            "parent_page",
+            "parent_space",
+            DIRECT_READER,
+            DIRECT_EDITOR,
+            DIRECT_BLOCK,
+        ],
+        vec![
+            perm(
+                READ,
+                Userset::Exclusion {
+                    base: Box::new(Userset::Union(vec![
+                        ttu("parent_page", READ),
+                        ttu("parent_space", READ),
+                        rel(DIRECT_READER),
+                        rel(DIRECT_EDITOR),
+                    ])),
+                    subtracted: Box::new(rel(DIRECT_BLOCK)),
+                },
+            ),
+            perm(
+                EDIT,
+                Userset::Union(vec![
+                    ttu("parent_page", EDIT),
+                    ttu("parent_space", EDIT),
+                    rel(DIRECT_EDITOR),
+                ]),
+            ),
+        ],
     )
     .watchable()
 }
@@ -79,7 +104,10 @@ pub fn block_fragment() -> FragmentDef {
     frag(
         object_types::BLOCK,
         &["parent_page"],
-        vec![perm(READ, ttu("parent_page", READ))],
+        vec![
+            perm(READ, ttu("parent_page", READ)),
+            perm(EDIT, ttu("parent_page", EDIT)),
+        ],
     )
 }
 
@@ -87,9 +115,13 @@ pub fn database_row_fragment() -> FragmentDef {
     let row_read = || Userset::Union(vec![rel(DIRECT_READER), ttu("parent_page", READ)]);
     frag(
         object_types::DATABASE_ROW,
-        &[DIRECT_READER, "parent_page"],
+        &[DIRECT_READER, DIRECT_EDITOR, "parent_page"],
         vec![
             perm(READ, row_read()),
+            perm(
+                EDIT,
+                Userset::Union(vec![rel(DIRECT_EDITOR), ttu("parent_page", EDIT)]),
+            ),
             perm(VIEW_FIELD, row_read()),
         ],
     )
@@ -156,8 +188,16 @@ mod tests {
             "page.read is a compiled permission"
         );
         assert!(
+            eng.resolve_permission("page", EDIT).is_some(),
+            "page.edit is a compiled permission"
+        );
+        assert!(
             eng.resolve_permission("database_row", READ).is_some(),
             "database_row.read is a compiled permission (the row-level ACL)"
+        );
+        assert!(
+            eng.resolve_permission("database_row", EDIT).is_some(),
+            "database_row.edit is a compiled permission"
         );
     }
 

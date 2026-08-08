@@ -14,13 +14,14 @@ myelin-content = { path = "../myelin-content" }
 myelin-notif = { path = "../myelin-notif" }
 serde.workspace = true
 serde_json.workspace = true
+blake3.workspace = true
 myelin-storage = { path = "../myelin-storage" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-substrate = { path = "../myelin-substrate" }
 myelin-search = { path = "../myelin-search" }
 myelin-query = { path = "../myelin-query" }
-sqlx = { workspace = true, optional = true }
+sqlx = { workspace = true }
 tokio = { workspace = true, optional = true }
 myelin-config = { path = "../myelin-config", optional = true }
 
@@ -30,7 +31,6 @@ test-support = ["myelin-storage/test-support"]
 memory = ["test-support"]
 integration = [
     "myelin-storage/integration",
-    "dep:sqlx",
     "dep:tokio",
     "dep:myelin-config",
 ]

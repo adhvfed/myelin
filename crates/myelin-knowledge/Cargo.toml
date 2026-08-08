@@ -26,8 +26,9 @@ myelin-search = { path = "../myelin-search" }
 myelin-gdpr = { path = "../myelin-gdpr" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+blake3.workspace = true
 yrs = { workspace = true }
-sqlx = { workspace = true, optional = true }
+sqlx = { workspace = true }
 tokio = { workspace = true, features = ["signal"] }
 myelin-config = { path = "../myelin-config" }
 
@@ -35,7 +36,6 @@ myelin-config = { path = "../myelin-config" }
 default = []
 test-support = ["myelin-events/test-support"]
 integration = [
-    "dep:sqlx",
     "myelin-storage/integration",
 ]
 

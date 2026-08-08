@@ -241,6 +241,26 @@ impl Handler for DBlobView {
     }
 }
 
+struct DBlameView {
+    be: Arc<DurableGitBackend>,
+}
+
+impl Handler for DBlameView {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let vm = self
+            .be
+            .blame_json(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+                param(ctx, "ref")?,
+                param(ctx, "path")?,
+            )
+            .map_err(map_durable_err)?;
+        Ok(EdgeResponse::json(200, &vm))
+    }
+}
+
 struct DRefs {
     be: Arc<DurableGitBackend>,
 }
@@ -3030,6 +3050,9 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
             (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
                 reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
             }
+            (GitMethod::Get, "/api/git/repos/{repo}/blame/{ref}/{path}") => {
+                reroot("/api/git/repos/{repo}/blame/{ref}/{...path}")
+            }
             (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
                 reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
             }
@@ -3054,6 +3077,10 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
             (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
                 guarded(&be, Pull, Arc::new(DBlobView { be: be.clone() })),
                 "git.blob.view",
+            ),
+            (GitMethod::Get, "/api/git/repos/{repo}/blame/{ref}/{path}") => (
+                guarded(&be, Pull, Arc::new(DBlameView { be: be.clone() })),
+                "git.blame.view",
             ),
             (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
                 guarded(&be, Push, Arc::new(DWebEditCommit { be: be.clone() })),

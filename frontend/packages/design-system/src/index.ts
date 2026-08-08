@@ -20,6 +20,16 @@ export {
 // PaneSection owns the W1 "the pane assembles itself" contract (label-before-content, fail-static).
 export { Chip, type ChipProps, type ChipType, type ChipState } from "./Chip";
 export { PaneSection, type PaneSectionProps } from "./PaneSection";
+export {
+  BLOCK_TYPES,
+  BlockEditor,
+  balanceInlineMarks,
+  splitBlock,
+  toggleInlineMark,
+  type BlockEditorProps,
+  type BlockType,
+  type EditorBlock,
+} from "./BlockEditor";
 // The R-17 §5.1 hard component — the ONE diff / files-changed viewer (R3.2 · G-7), consumed by the PR
 // diff (G-7), compare (G-4), and commit detail (G-3). Change kind is TEXT (SR prefix + line numbers),
 // never colour; the line grid is one tab stop (roving focus); side-by-side + unified.

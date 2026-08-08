@@ -40,6 +40,7 @@ fn the_catalogue_covers_the_arch_section_4_endpoints() {
         "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci",
         "/api/git/repos/{repo}/prs/{n}/merge",
         "/api/git/repos/{repo}/blob/{ref}/{path}",
+        "/api/git/repos/{repo}/blame/{ref}/{path}",
         "/api/git/search/code",
     ] {
         assert!(

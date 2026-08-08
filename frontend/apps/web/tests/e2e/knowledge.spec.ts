@@ -1,0 +1,68 @@
+import AxeBuilder from "@axe-core/playwright";
+import { expect, test, type Page } from "@playwright/test";
+
+const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
+async function devLogin(page: Page) { await page.goto("/login"); await page.waitForLoadState("networkidle"); await page.getByTestId("dev-login").click(); await page.waitForURL("**/git/repos"); }
+async function expectAccessible(page: Page, context: string) { const results = await new AxeBuilder({ page }).withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"]).analyze(); expect(results.violations, `${context}: ${JSON.stringify(results.violations, null, 2)}`).toEqual([]); }
+
+test.describe("Knowledge workspace", () => {
+  test.afterEach(async ({ request }) => { expect((await request.post(`${EDGE}/__test/config`, { data: { resetKnowledge: true, forceUnauthorized: false } })).ok()).toBe(true); });
+
+  test("opens organisational context in a cohesive, accessible writing workspace", async ({ page }) => {
+    await devLogin(page);
+    await page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: "Knowledge" }).click();
+    await expect(page.getByTestId("knowledge-screen")).toBeVisible();
+    await expect(page.getByText("Under construction", { exact: true })).toHaveCount(0);
+    await page.getByRole("link", { name: /Engineering principles/ }).click();
+    await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue("Engineering principles");
+    await expect(page.getByRole("textbox", { name: "Callout block 3" })).toContainText("Quality is a product feature");
+    await expectAccessible(page, "seeded Knowledge page");
+  });
+
+  test("creates from a useful template and preserves an edited draft across reload", async ({ page, request }) => {
+    expect((await request.post(`${EDGE}/__test/config`, { data: { emptyKnowledge: true } })).ok()).toBe(true);
+    await devLogin(page); await page.goto("/knowledge");
+    await expect(page.getByText("Your knowledge base is ready")).toBeVisible();
+    await page.getByRole("button", { name: "Create the first page" }).click();
+    await page.getByRole("textbox", { name: "Page title" }).fill("Payments incident runbook");
+    await page.getByText("Runbook", { exact: true }).click();
+    await page.getByLabel("Visibility").selectOption("team");
+    await page.getByRole("button", { name: "Create page" }).click();
+    await page.waitForURL(/\/knowledge\?page=[0-9A-HJKMNP-TV-Z]{26}$/);
+    const responseBlock = page.getByRole("textbox", { name: "Numbered list block 4" });
+    await expect(responseBlock).toContainText("Confirm the alert");
+    await responseBlock.fill("Confirm the alert, open an incident topic, and assign an incident lead.");
+    const saveState = page.locator(".knowledge-save-state");
+    await expect(saveState).toHaveText(/Saving|Saved|Up to date/, { timeout: 5_000 });
+    await expect(saveState).toHaveText("Saved", { timeout: 10_000 });
+    await page.reload();
+    await expect(page.getByRole("textbox", { name: "Numbered list block 4" })).toContainText("open an incident topic");
+    await expect(page.getByText("Team", { exact: true }).first()).toBeVisible();
+  });
+
+  test("uses page navigation first on a narrow viewport", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 760 }); await devLogin(page); await page.goto("/knowledge");
+    await expect(page.getByRole("heading", { name: "Knowledge", level: 1 })).toBeVisible();
+    await page.getByRole("link", { name: /EU release runbook/ }).click();
+    await expect(page.getByRole("heading", { name: "Knowledge", level: 1 })).toBeHidden();
+    await page.getByRole("link", { name: "Pages" }).click();
+    await expect(page.getByRole("heading", { name: "Knowledge", level: 1 })).toBeVisible();
+  });
+
+  test("keeps typed content visible through an optimistic save conflict", async ({ page, request }) => {
+    await devLogin(page); await page.goto("/knowledge");
+    await page.getByRole("link", { name: /Engineering principles/ }).click();
+    const title = page.getByRole("textbox", { name: "Page title" });
+    await expect(title).toHaveValue("Engineering principles");
+    const match = /page=([0-9A-HJKMNP-TV-Z]{26})/.exec(page.url());
+    expect(match?.[1]).toBeTruthy();
+    expect((await request.post(`${EDGE}/__test/config`, { data: { bumpKnowledgePage: match![1] } })).ok()).toBe(true);
+    await title.fill("Engineering principles, refined");
+    await expect(page.getByRole("alert").filter({ hasText: "This page changed elsewhere" })).toBeVisible({ timeout: 10_000 });
+    await expect(title).toHaveValue("Engineering principles, refined");
+    await page.getByRole("button", { name: "Keep my draft" }).click();
+    await expect(page.locator(".knowledge-save-state")).toHaveText("Saved", { timeout: 10_000 });
+    await page.reload();
+    await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue("Engineering principles, refined");
+  });
+});

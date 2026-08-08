@@ -1,6 +1,6 @@
 use myelin_gdpr::ErasureMethod;
 use myelin_storage::encryption::{ColumnCryptor, EncryptedColumn, KeyChoiceError, SubjectId};
-use myelin_storage::kms::{KekId, KmsEngine};
+use myelin_storage::kms::{KekId, KmsEngine, PiiKeyRef, NONCE_LEN};
 use myelin_tenancy::{Region, TenantId};
 
 pub fn subject_dek_erasure() -> ErasureMethod {
@@ -60,6 +60,80 @@ pub fn plaintext_at_rest(column: &EncryptedColumn, plaintext: &[u8]) -> bool {
     column.contains_plaintext(plaintext)
 }
 
+const BODY_ENVELOPE_MAGIC: &[u8; 5] = b"MYCH\x01";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChatBodyEnvelopeError {
+    KeyReferenceTooLong,
+    Malformed,
+}
+
+impl core::fmt::Display for ChatBodyEnvelopeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ChatBodyEnvelopeError::KeyReferenceTooLong => {
+                f.write_str("Chat encrypted-body key reference exceeds the wire limit")
+            }
+            ChatBodyEnvelopeError::Malformed => {
+                f.write_str("Chat encrypted-body envelope is malformed")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChatBodyEnvelopeError {}
+
+/// Encodes the cryptographic metadata and ciphertext stored in the opaque
+/// `body_inline` column. The versioned format keeps the PostgreSQL message
+/// store independent from the key-management implementation.
+pub fn encode_encrypted_body(column: &EncryptedColumn) -> Result<Vec<u8>, ChatBodyEnvelopeError> {
+    let key_ref = column.key_ref.to_uri();
+    let key_ref_len =
+        u16::try_from(key_ref.len()).map_err(|_| ChatBodyEnvelopeError::KeyReferenceTooLong)?;
+    let mut encoded = Vec::with_capacity(
+        BODY_ENVELOPE_MAGIC.len() + 2 + key_ref.len() + NONCE_LEN + column.ciphertext.len(),
+    );
+    encoded.extend_from_slice(BODY_ENVELOPE_MAGIC);
+    encoded.extend_from_slice(&key_ref_len.to_be_bytes());
+    encoded.extend_from_slice(key_ref.as_bytes());
+    encoded.extend_from_slice(&column.nonce);
+    encoded.extend_from_slice(&column.ciphertext);
+    Ok(encoded)
+}
+
+pub fn decode_encrypted_body(encoded: &[u8]) -> Result<EncryptedColumn, ChatBodyEnvelopeError> {
+    let header_len = BODY_ENVELOPE_MAGIC.len() + 2;
+    if encoded.len() < header_len + NONCE_LEN || !encoded.starts_with(BODY_ENVELOPE_MAGIC) {
+        return Err(ChatBodyEnvelopeError::Malformed);
+    }
+    let key_ref_len = u16::from_be_bytes([
+        encoded[BODY_ENVELOPE_MAGIC.len()],
+        encoded[BODY_ENVELOPE_MAGIC.len() + 1],
+    ]) as usize;
+    let key_ref_start = header_len;
+    let key_ref_end = key_ref_start
+        .checked_add(key_ref_len)
+        .ok_or(ChatBodyEnvelopeError::Malformed)?;
+    let nonce_end = key_ref_end
+        .checked_add(NONCE_LEN)
+        .ok_or(ChatBodyEnvelopeError::Malformed)?;
+    if key_ref_len == 0 || nonce_end > encoded.len() {
+        return Err(ChatBodyEnvelopeError::Malformed);
+    }
+    let key_ref = std::str::from_utf8(&encoded[key_ref_start..key_ref_end])
+        .ok()
+        .and_then(PiiKeyRef::parse)
+        .ok_or(ChatBodyEnvelopeError::Malformed)?;
+    let nonce: [u8; NONCE_LEN] = encoded[key_ref_end..nonce_end]
+        .try_into()
+        .map_err(|_| ChatBodyEnvelopeError::Malformed)?;
+    Ok(EncryptedColumn {
+        key_ref,
+        nonce,
+        ciphertext: encoded[nonce_end..].to_vec(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,6 +167,43 @@ mod tests {
         .expect("seal under the author's per-subject DEK");
         let opened = decrypt_body(&eng, &region(), &column).expect("open while the key lives");
         assert_eq!(opened, plaintext, "the body round-trips exactly");
+    }
+
+    #[test]
+    fn encrypted_body_envelope_round_trips_without_plaintext() {
+        let eng = engine();
+        let plaintext = b"a private release discussion";
+        let column = encrypt_body(
+            &eng,
+            &region(),
+            &tenant(),
+            &author(),
+            ChatFreeText::BodyInline,
+            plaintext,
+        )
+        .expect("seal");
+        let encoded = encode_encrypted_body(&column).expect("encode");
+        assert!(!encoded
+            .windows(plaintext.len())
+            .any(|window| window == plaintext));
+        let decoded = decode_encrypted_body(&encoded).expect("decode");
+        assert_eq!(decoded, column);
+        assert_eq!(
+            decrypt_body(&eng, &region(), &decoded).expect("open"),
+            plaintext
+        );
+    }
+
+    #[test]
+    fn encrypted_body_envelope_rejects_plaintext_and_truncation() {
+        assert_eq!(
+            decode_encrypted_body(b"a plaintext shortcut"),
+            Err(ChatBodyEnvelopeError::Malformed)
+        );
+        assert_eq!(
+            decode_encrypted_body(b"MYCH\x01\x00\x10short"),
+            Err(ChatBodyEnvelopeError::Malformed)
+        );
     }
 
     #[test]

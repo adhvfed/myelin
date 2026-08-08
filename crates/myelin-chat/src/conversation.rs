@@ -127,6 +127,7 @@ pub enum ConversationError {
     NotFound(String),
     AlreadyExists(String),
     SchemaViolation(String),
+    Storage(String),
 }
 
 impl core::fmt::Display for ConversationError {
@@ -135,6 +136,7 @@ impl core::fmt::Display for ConversationError {
             ConversationError::NotFound(id) => write!(f, "conversation {id} not found"),
             ConversationError::AlreadyExists(id) => write!(f, "conversation {id} already exists"),
             ConversationError::SchemaViolation(e) => write!(f, "schema violation: {e}"),
+            ConversationError::Storage(e) => write!(f, "conversation storage failed: {e}"),
         }
     }
 }

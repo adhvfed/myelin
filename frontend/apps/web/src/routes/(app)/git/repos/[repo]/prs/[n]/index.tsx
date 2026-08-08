@@ -54,6 +54,7 @@ import { PrHeader } from "~/components/PrHeader";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { Markdown } from "~/components/Markdown";
 import { useContextPane } from "~/components/AppShell";
+import { SharedComposer } from "~/components/SharedComposer";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -491,14 +492,7 @@ function ReviewsSection(props: {
             <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", "font-size": "var(--fs-caption)", color: "var(--text-muted)" }}>
               <Icon name="edit" /> Review in progress · Pending · only you
             </span>
-            <textarea
-              aria-label="Pending review comment"
-              value={pendingText()}
-              onInput={(e) => setPendingText(e.currentTarget.value)}
-              rows={2}
-              placeholder="Add a comment to this review…"
-              style={textareaStyle}
-            />
+            <SharedComposer value={pendingText()} onValue={setPendingText} label="Pending review comment" placeholder="Add a comment to this review…" onSubmit={() => void addPending()} submitShortcut="mod-enter" />
             <div style={{ display: "flex", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
               <button type="button" onClick={() => void addPending()} class="btn-secondary" style={barBtn}>Add comment</button>
               <button type="button" data-testid="open-verdict" onClick={() => setVerdictOpen(true)} class="btn-primary" style={barBtnPrimary}>
@@ -511,7 +505,7 @@ function ReviewsSection(props: {
                 ad-hoc role="dialog" div that had none of those). */}
             <Dialog open={verdictOpen()} onClose={() => setVerdictOpen(false)} title="Submit review" size="sm">
               <div data-testid="verdict-panel" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
-                <textarea onInput={(e) => setSummaryText(e.currentTarget.value)} aria-label="Review summary" rows={2} placeholder="Summary (optional)…" style={textareaStyle} />
+                <SharedComposer value={summaryText()} onValue={setSummaryText} label="Review summary" placeholder="Summary (optional)…" />
                 <div style={{ display: "flex", gap: "var(--space-2)", "flex-wrap": "wrap" }}>
                   <button type="button" data-testid="verdict-approve" onClick={() => void submit("approved")} class="btn-secondary" style={{ ...barBtn, color: "var(--success)" }}><Icon name="approve" /> Approve</button>
                   <button type="button" data-testid="verdict-changes" onClick={() => void submit("changes_requested")} class="btn-secondary" style={{ ...barBtn, color: "var(--danger)" }}><Icon name="reject" /> Request changes</button>
@@ -747,7 +741,7 @@ function DiscussionSection(props: {
       </Show>
       {/* The composer (a read-only viewer's write is server-rejected → the toast; the field never lies). */}
       <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)" }}>
-        <textarea aria-label="New comment" value={composer()} onInput={(e) => setComposer(e.currentTarget.value)} rows={2} placeholder="Start a discussion…" style={textareaStyle} />
+        <SharedComposer value={composer()} onValue={setComposer} label="New comment" placeholder="Start a discussion…" onSubmit={() => void post()} submitShortcut="mod-enter" />
         <button type="button" data-testid="post-thread" disabled={!composer().trim()} onClick={() => void post()} class="btn-primary" style={{ ...barBtnPrimary, "align-self": "flex-start" }}>Comment</button>
       </div>
     </section>
@@ -785,8 +779,8 @@ function ThreadView(props: { repo: string; n: number; thread: PrThreadVM; onChan
           </div>
         )}
       </For>
-      <div style={{ display: "flex", gap: "var(--space-1)" }}>
-        <input aria-label="Reply" value={reply()} onInput={(e) => setReply(e.currentTarget.value)} placeholder="Reply…" style={{ ...textareaStyle, flex: "1" }} />
+      <div style={{ display: "flex", gap: "var(--space-1)", "align-items": "flex-start" }}>
+        <SharedComposer value={reply()} onValue={setReply} label="Reply" placeholder="Reply…" onSubmit={() => void send()} submitShortcut="mod-enter" />
         <button type="button" onClick={() => void send()} class="btn-secondary" style={barBtn}>Reply</button>
       </div>
     </li>
@@ -906,18 +900,6 @@ function PrincipalBadge(props: { who: PrincipalVM }) {
     </span>
   );
 }
-
-const textareaStyle = {
-  width: "100%",
-  padding: "var(--space-2)",
-  border: "var(--hairline) solid var(--border)",
-  "border-radius": "var(--radius-1)",
-  background: "var(--surface)",
-  color: "var(--text-primary)",
-  "font-family": "inherit",
-  "font-size": "var(--fs-body)",
-  "box-sizing": "border-box",
-} as const;
 
 const barBtn = {
   display: "inline-flex",

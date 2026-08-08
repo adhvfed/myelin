@@ -1,0 +1,86 @@
+import AxeBuilder from "@axe-core/playwright";
+import { expect, test, type Page } from "@playwright/test";
+
+const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
+
+async function devLogin(page: Page) {
+  await page.goto("/login");
+  await page.waitForLoadState("networkidle");
+  await page.getByTestId("dev-login").click();
+  await page.waitForURL("**/git/repos");
+}
+
+async function expectAccessible(page: Page, context: string) {
+  const results = await new AxeBuilder({ page })
+    .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
+    .analyze();
+  expect(results.violations, `${context}: ${JSON.stringify(results.violations, null, 2)}`)
+    .toEqual([]);
+}
+
+test.describe("Chat workspace", () => {
+  test.afterEach(async ({ request }) => {
+    const response = await request.post(`${EDGE}/__test/config`, {
+      data: { resetChat: true, forceUnauthorized: false },
+    });
+    expect(response.ok()).toBe(true);
+  });
+
+  test("organizes channel topics into a durable, accessible conversation timeline", async ({ page }) => {
+    await devLogin(page);
+    await page.getByRole("navigation", { name: "Primary" }).getByRole("link", { name: "Chat" }).click();
+    await page.waitForURL("**/chat");
+
+    await expect(page.getByTestId("chat-screen")).toBeVisible();
+    await expect(page.getByText("Under construction", { exact: true })).toHaveCount(0);
+    await expect(page.getByRole("heading", { name: "engineering" })).toBeVisible();
+    await page.getByTestId("chat-topic-link").filter({ hasText: "release readiness" }).click();
+    await expect(page.getByRole("heading", { name: "release readiness", level: 2 })).toBeVisible();
+    await expect(page.getByText("The canary is healthy.", { exact: false })).toBeVisible();
+    await expect(page.getByText("I’m watching error rate", { exact: false })).toBeVisible();
+    await expect(page.getByText("Agent · 543210", { exact: true })).toBeVisible();
+    await expectAccessible(page, "seeded Chat timeline");
+  });
+
+  test("a first user can create a topic, send with Enter, and reload without losing it", async ({ page, request }) => {
+    const empty = await request.post(`${EDGE}/__test/config`, { data: { emptyChat: true } });
+    expect(empty.ok()).toBe(true);
+    await devLogin(page);
+    await page.goto("/chat");
+
+    await expect(page.getByText("No conversations yet")).toBeVisible();
+    await page.getByRole("button", { name: "Create the first topic" }).click();
+    await page.getByRole("textbox", { name: "Channel", exact: true }).fill("platform");
+    await page.getByRole("textbox", { name: "Topic", exact: true }).fill("incident follow-up");
+    await page.getByRole("button", { name: "Create topic" }).click();
+
+    await page.waitForURL(/\/chat\?conversation=[0-9A-HJKMNP-TV-Z]{26}$/);
+    await expect(page.getByRole("heading", { name: "incident follow-up" })).toBeVisible();
+    await expect(page.getByText("Start the conversation")).toBeVisible();
+
+    const composer = page.getByLabel("Message incident follow-up");
+    await composer.fill("We fixed the timeout and captured the follow-up in MYL-204.");
+    await composer.press("Enter");
+    await expect(page.getByText("We fixed the timeout and captured the follow-up in MYL-204.")).toBeVisible();
+    await expect(page.getByText("You", { exact: true })).toBeVisible();
+
+    await page.reload();
+    await expect(page.getByRole("heading", { name: "incident follow-up" })).toBeVisible();
+    await expect(page.getByText("We fixed the timeout and captured the follow-up in MYL-204.")).toBeVisible();
+    await expectAccessible(page, "created Chat topic");
+  });
+
+  test("the narrow layout moves cleanly between topic navigation and the composer", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 760 });
+    await devLogin(page);
+    await page.goto("/chat");
+    await expect(page.getByRole("heading", { name: "Chat", level: 1 })).toBeVisible();
+
+    await page.getByTestId("chat-topic-link").filter({ hasText: "agent operations" }).click();
+    await expect(page.getByRole("heading", { name: "agent operations", level: 2 })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Chat", level: 1 })).toBeHidden();
+    await page.getByRole("link", { name: "Back to topics" }).click();
+    await expect(page.getByRole("heading", { name: "Chat", level: 1 })).toBeVisible();
+    await expectAccessible(page, "narrow Chat navigation");
+  });
+});

@@ -68,6 +68,22 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expectNoAxeViolations(page, "blob view");
   });
 
+  test("blame traces each line to a commit without losing the file context", async ({ page }) => {
+    await devLogin(page);
+    await page.goto("/git/repos/myelin/blob/main/README.md");
+    await page.getByTestId("blame-link").click();
+    await page.waitForURL("**/git/repos/myelin/blame/main/README.md");
+
+    await expect(page.getByRole("heading", { name: /Line history/ })).toContainText("README.md");
+    const viewer = page.getByTestId("blame-viewer");
+    await expect(viewer).toContainText("The make-it-real spine.");
+    await expect(viewer.getByRole("link", { name: C2.slice(0, 10) })).toBeVisible();
+    await expect(viewer.getByText("docs: expand the README")).toBeVisible();
+    await expect(page.getByText(`snapshot ${C2.slice(0, 12)}`)).toBeVisible();
+    await expect(page.getByRole("link", { name: "View file" })).toBeVisible();
+    await expectNoAxeViolations(page, "blame view");
+  });
+
   test("raw previews are inert and downloads use a proxy-owned attachment", async ({ page }) => {
     await devLogin(page);
 
@@ -236,23 +252,21 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expectNoAxeViolations(page, "commit log pager");
   });
 
-  test("the catch-all route distinguishes a missing page from planned features", async ({ page }) => {
+  test("the catch-all route distinguishes a missing page from areas under construction", async ({ page }) => {
     await devLogin(page);
     await page.goto("/this/path/does/not/exist");
     await expect(page.getByTestId("not-available")).toBeVisible();
     await expect(page.getByTestId("availability-status")).toHaveText("Not found");
-    await expect(page.getByText("Coming soon", { exact: true })).toHaveCount(0);
+    await expect(page.getByText("Under construction", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("navigation", { name: "Primary" })).toBeVisible();
   });
 
-  test("planned product areas remain discoverable without looking like broken links", async ({ page }) => {
+  test("graduated product areas no longer present a construction state", async ({ page }) => {
     await devLogin(page);
-
-    for (const path of ["/chat", "/knowledge"]) {
-      await page.goto(path);
-      await expect(page.getByText("Coming soon", { exact: true })).toBeVisible();
-      await expect(page.getByText("Not found", { exact: true })).toHaveCount(0);
-    }
+    await page.goto("/knowledge");
+    await expect(page.getByTestId("knowledge-screen")).toBeVisible();
+    await expect(page.getByTestId("availability-status")).toHaveCount(0);
+    await expect(page.getByText("Under construction", { exact: true })).toHaveCount(0);
   });
 
   test("an expired access and refresh credential redirects before CSP-protected streaming", async ({ page }) => {
