@@ -239,6 +239,10 @@ fn durable_tip(root: &Path, tenant: &str, slug: &str, refname: &str) -> Option<S
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "privileged-host-tests"),
+    ignore = "requires a delegated cgroup, btrfs storage, and the configured sandbox runtime"
+)]
 async fn real_git_push_lands_durably_rejects_secrets_and_refuses_cross_tenant() {
     if !require_or_skip("ct006d push oracle") {
         return;
@@ -471,6 +475,10 @@ fn push_main(addr: SocketAddr, token: &str, work: &Path, force: bool) -> (bool, 
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "privileged-host-tests"),
+    ignore = "requires a delegated cgroup, btrfs storage, and the configured sandbox runtime"
+)]
 async fn r0_2_branch_protection_rejects_force_push_through_the_live_wire() {
     if !require_or_skip("r2.1a R0.2 protected-ref oracle") {
         return;
@@ -545,10 +553,6 @@ async fn r0_2_branch_protection_rejects_force_push_through_the_live_wire() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn writer_direct_push_to_protected_ref_is_refused_over_the_wire() {
-    if !require_or_skip("r2-exit writer→protected-push oracle") {
-        return;
-    }
-
     let root = temp_root("r2exit-writer");
     let backend = Arc::new(
         DurableGitBackend::rooted_inmem_for_test(root.to_path_buf()).with_repo_authorizer(
@@ -664,6 +668,10 @@ fn git_push_basic(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "privileged-host-tests"),
+    ignore = "requires a delegated cgroup, btrfs storage, and the configured sandbox runtime"
+)]
 async fn real_git_clone_and_push_over_http_basic_auth() {
     if !require_or_skip("r4.0 basic-auth wire oracle") {
         return;
@@ -789,6 +797,10 @@ fn git_push_via_helper(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "privileged-host-tests"),
+    ignore = "requires a delegated cgroup, btrfs storage, and the configured sandbox runtime"
+)]
 async fn f1_real_git_over_credential_helper_needs_the_basic_challenge() {
     if !require_or_skip("f1 credential-helper wire oracle") {
         return;
@@ -828,6 +840,10 @@ async fn f1_real_git_over_credential_helper_needs_the_basic_challenge() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(feature = "privileged-host-tests"),
+    ignore = "requires a delegated cgroup, btrfs storage, and the configured sandbox runtime"
+)]
 async fn f9_fresh_clone_checks_out_main_and_server_head_symref_is_main() {
     if !require_or_skip("f9 head-symref clone oracle") {
         return;
