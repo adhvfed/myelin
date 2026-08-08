@@ -1,0 +1,763 @@
+{
+  "version": 1,
+  "count": 43,
+  "icons": [
+    {
+      "name": "agent",
+      "meaning": "Agent mark \u2014 plain geometric: rounded square + centered dot",
+      "tags": [
+        "agent",
+        "ai",
+        "bot",
+        "principal",
+        "mark"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "approve",
+      "meaning": "Approve a proposed effect \u2014 bare check (HITL action)",
+      "tags": [
+        "approve",
+        "accept",
+        "confirm",
+        "check",
+        "hitl"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "branch",
+      "meaning": "Git branch / ref (high horizontal split)",
+      "tags": [
+        "git",
+        "branch",
+        "ref",
+        "fork"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "channel",
+      "meaning": "Chat channel \u2014 the named glyph (#)",
+      "tags": [
+        "channel",
+        "chat",
+        "hash",
+        "room"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "check-fail",
+      "meaning": "Check failed \u2014 cross in status ring",
+      "tags": [
+        "ci",
+        "check",
+        "fail",
+        "error",
+        "verdict",
+        "ring"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "check-pass",
+      "meaning": "Check passed \u2014 check in status ring",
+      "tags": [
+        "ci",
+        "check",
+        "pass",
+        "success",
+        "verdict",
+        "ring"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "check-pending",
+      "meaning": "Check pending / in-progress \u2014 clock in status ring",
+      "tags": [
+        "ci",
+        "check",
+        "pending",
+        "progress",
+        "clock",
+        "ring"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "chevron",
+      "meaning": "Disclosure / next-prev \u2014 one glyph, rotated by CSS",
+      "tags": [
+        "chevron",
+        "disclosure",
+        "arrow",
+        "expand",
+        "next",
+        "prev"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "close",
+      "meaning": "Dismiss / remove \u2014 bare cross (chip/dialog corner)",
+      "tags": [
+        "close",
+        "dismiss",
+        "remove",
+        "cross",
+        "cancel"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "commit",
+      "meaning": "Commit (node on a rail)",
+      "tags": [
+        "git",
+        "commit",
+        "node",
+        "revision"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "cycle",
+      "meaning": "Cycle / sprint / iteration (counter-clockwise circular arrow)",
+      "tags": [
+        "cycle",
+        "sprint",
+        "loop",
+        "iteration"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "database",
+      "meaning": "Database view (cylinder)",
+      "tags": [
+        "database",
+        "cylinder",
+        "data",
+        "store",
+        "db"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "doc",
+      "meaning": "Doc / page \u2014 the named glyph",
+      "tags": [
+        "doc",
+        "page",
+        "document",
+        "article"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "download",
+      "meaning": "Download a file to disk (attachment) \u2014 arrow into a tray",
+      "tags": [
+        "download",
+        "save",
+        "file",
+        "attachment",
+        "blob"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "edit",
+      "meaning": "Edit a proposed effect / edit affordance (pencil)",
+      "tags": [
+        "edit",
+        "pencil",
+        "modify",
+        "write"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "external-link",
+      "meaning": "Open in full / navigate away (arrow up-right)",
+      "tags": [
+        "external-link",
+        "open",
+        "navigate",
+        "new-tab",
+        "arrow"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "file",
+      "meaning": "File",
+      "tags": [
+        "file",
+        "document",
+        "page"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "folder",
+      "meaning": "Folder / space",
+      "tags": [
+        "folder",
+        "space",
+        "directory",
+        "group"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "gate",
+      "meaning": "HITL gate / awaiting approval (lock)",
+      "tags": [
+        "gate",
+        "lock",
+        "hitl",
+        "approval",
+        "secure"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "human",
+      "meaning": "Human principal / avatar fallback",
+      "tags": [
+        "human",
+        "user",
+        "person",
+        "avatar",
+        "principal"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "inbox",
+      "meaning": "Notifications (\"what needs me\")",
+      "tags": [
+        "inbox",
+        "notifications",
+        "tray",
+        "alerts"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "issue",
+      "meaning": "Issue / work item",
+      "tags": [
+        "issue",
+        "work",
+        "item",
+        "ticket"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "kebab",
+      "meaning": "Overflow / more actions (3 dots)",
+      "tags": [
+        "kebab",
+        "overflow",
+        "more",
+        "menu",
+        "dots"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "link",
+      "meaning": "Link / reference / backlink (chain)",
+      "tags": [
+        "link",
+        "reference",
+        "backlink",
+        "chain",
+        "url"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "merge",
+      "meaning": "Merge \u2014 the named glyph (deep downward convergence)",
+      "tags": [
+        "git",
+        "merge",
+        "converge",
+        "combine"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "message",
+      "meaning": "Message / comment (single bubble)",
+      "tags": [
+        "message",
+        "comment",
+        "bubble",
+        "chat"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "nav-chat",
+      "meaning": "Chat subsystem (stacked bubbles)",
+      "tags": [
+        "nav",
+        "chat",
+        "messages",
+        "conversation",
+        "subsystem"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "nav-ci",
+      "meaning": "CI subsystem (circle + play)",
+      "tags": [
+        "nav",
+        "ci",
+        "build",
+        "pipeline",
+        "subsystem"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "nav-code",
+      "meaning": "Code subsystem",
+      "tags": [
+        "nav",
+        "code",
+        "source",
+        "subsystem"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "nav-issues",
+      "meaning": "Issues subsystem",
+      "tags": [
+        "nav",
+        "issues",
+        "work",
+        "subsystem"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "nav-knowledge",
+      "meaning": "Knowledge subsystem",
+      "tags": [
+        "nav",
+        "knowledge",
+        "docs",
+        "wiki",
+        "subsystem"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "priority",
+      "meaning": "Priority marker (bars)",
+      "tags": [
+        "priority",
+        "bars",
+        "importance",
+        "rank"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "pull-request",
+      "meaning": "PR \u2014 open-state combine mark",
+      "tags": [
+        "git",
+        "pull-request",
+        "pr",
+        "merge",
+        "review"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "reject",
+      "meaning": "Reject a proposed effect \u2014 bare cross (HITL action)",
+      "tags": [
+        "reject",
+        "decline",
+        "deny",
+        "cross",
+        "hitl"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "repo",
+      "meaning": "Repository",
+      "tags": [
+        "repo",
+        "repository",
+        "project",
+        "codebase"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "rerun",
+      "meaning": "Re-run a check / job (clockwise circular arrow)",
+      "tags": [
+        "ci",
+        "rerun",
+        "retry",
+        "refresh",
+        "circular-arrow"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "roadmap",
+      "meaning": "Roadmap / timeline lens",
+      "tags": [
+        "roadmap",
+        "timeline",
+        "plan",
+        "milestones"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "run",
+      "meaning": "CI run / workflow (rounded square + play)",
+      "tags": [
+        "ci",
+        "run",
+        "workflow",
+        "play",
+        "execute"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "search",
+      "meaning": "Global / scoped search",
+      "tags": [
+        "search",
+        "find",
+        "filter",
+        "magnifier"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "settings",
+      "meaning": "Settings / admin (sliders)",
+      "tags": [
+        "settings",
+        "admin",
+        "config",
+        "sliders",
+        "preferences"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "sub-issue",
+      "meaning": "Sub-issue / child",
+      "tags": [
+        "sub-issue",
+        "child",
+        "subtask",
+        "nested"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "tag",
+      "meaning": "Git tag / release",
+      "tags": [
+        "git",
+        "tag",
+        "release",
+        "label",
+        "version"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    },
+    {
+      "name": "team",
+      "meaning": "Team principal (two people)",
+      "tags": [
+        "team",
+        "group",
+        "people",
+        "principal"
+      ],
+      "canvas": {
+        "w": 24,
+        "h": 24
+      },
+      "sizes": [
+        24
+      ]
+    }
+  ]
+}

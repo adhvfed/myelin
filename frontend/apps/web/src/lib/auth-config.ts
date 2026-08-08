@@ -1,0 +1,85 @@
+// The PURE mapping behind `getAuthConfig` (the logged-out login page's render source). Kept
+// dependency-free (no "use server", no @solidjs/router — which is a client-only API that throws when
+// imported in plain node) so it is unit-testable in isolation, exactly like `dev-login-guard.ts` and
+// `gateway-core.ts`. `auth.ts`'s `getAuthConfig` query does only the edge fetch + floor-tolerant
+// fallback, then delegates the mapping here.
+
+import { devSeamAllowed, type DevLoginEnv } from "./dev-login-guard";
+
+/** One SSO provider the login page names on its primary button (edge `GET /v1/auth/config`). */
+export interface AuthProvider {
+  id: string;
+  label: string;
+}
+
+/** The logged-out login page's honest render source — the edge's SSO posture + the two login-seam
+ *  gates (dev seam, operator-token). */
+export interface AuthConfig {
+  sso_configured: boolean;
+  providers: AuthProvider[];
+  dev_login_enabled: boolean;
+  /** R4.0 — whether the edge accepts the OPERATOR-TOKEN login (env `MYELIN_TOKEN_LOGIN=1`). When true
+   *  the login page paints the paste-your-bootstrap-token card. Unlike `dev_login_enabled` this is a
+   *  REAL working path (it verifies against the live edge), so the edge flag alone is authoritative —
+   *  no frontend build/env gate. Fail-closed: false if the edge is unreachable. */
+  token_login_enabled: boolean;
+}
+
+/** The edge's raw `/v1/auth/config` shape (its `dev_login_enabled` reflects the EDGE env). */
+export interface EdgeAuthConfig {
+  sso_configured?: boolean;
+  providers?: AuthProvider[];
+  dev_login_enabled?: boolean;
+  token_login_enabled?: boolean;
+}
+
+/**
+ * Map the edge's raw config to the login page's render source.
+ *  - `dev_login_enabled` is the FRONTEND-authoritative composition (build + frontend env + edge flag)
+ *    via {@link devSeamAllowed} — the frontend owns the dev seam.
+ *  - `token_login_enabled` is a REAL working path, so the edge flag alone gates it (no build/env kill
+ *    switch). Both default fail-closed to false (unset field, or the caller's edge-unreachable stub).
+ */
+export function toAuthConfig(
+  edge: unknown,
+  env: DevLoginEnv,
+  isProdBuild: boolean,
+  interactiveSsoConfigured = false,
+): AuthConfig {
+  const raw = edge && typeof edge === "object" && !Array.isArray(edge)
+    ? edge as Record<string, unknown>
+    : {};
+  const ssoConfigured = raw.sso_configured === true && interactiveSsoConfigured;
+  return {
+    sso_configured: ssoConfigured,
+    providers: ssoConfigured ? validProviders(raw.providers) : [],
+    dev_login_enabled: devSeamAllowed(raw.dev_login_enabled === true, env, isProdBuild),
+    token_login_enabled: raw.token_login_enabled === true,
+  };
+}
+
+function validProviders(value: unknown): AuthProvider[] {
+  if (!Array.isArray(value)) return [];
+  const providers: AuthProvider[] = [];
+  for (const candidate of value.slice(0, 16)) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const provider = candidate as Record<string, unknown>;
+    if (
+      typeof provider.id !== "string" ||
+      !/^[a-z][a-z0-9_-]{0,63}$/.test(provider.id) ||
+      !boundedLabel(provider.label)
+    ) continue;
+    providers.push({ id: provider.id, label: provider.label });
+  }
+  return providers;
+}
+
+function boundedLabel(value: unknown): value is string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 128) return false;
+  if (new TextEncoder().encode(value).byteLength > 128) return false;
+  for (const character of value) {
+    const codePoint = character.codePointAt(0)!;
+    if (codePoint <= 0x1f || codePoint === 0x7f) return false;
+  }
+  return true;
+}
