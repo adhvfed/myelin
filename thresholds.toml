@@ -51,7 +51,7 @@ overlay_contrast_floor_bp = 450             # MEASURED-GATE: the message-row / a
 human_lane_p99_budget_us = 5000  # ID-D9: the protected human lane's authz-decision p99 ceiling under 30×.
 
 [fail_static]
-status = "OPEN — LEGAL"          # L-1, DPO-ratified; the VALUE is absent until counsel clears it.
+status = "OPEN - LEGAL"          # L-1, DPO-ratified; the VALUE is absent until counsel clears it.
 owner = "DPO / Legal"
 static_max_default_secs = 300    # the engineering SEED the mechanism is drilled against (P-S18/P-S25).
 agent_token_ttl_secs = 60
