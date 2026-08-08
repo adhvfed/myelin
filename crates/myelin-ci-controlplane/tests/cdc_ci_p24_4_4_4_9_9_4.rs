@@ -35,7 +35,7 @@ impl IdentityService for RecordingId {
         _cav: Option<&CaveatContext>,
     ) -> IdResult<Decision> {
         *self.last.borrow_mut() = Some((o.0.clone(), p.0.clone()));
-        if o.0.ends_with("h:granted") {
+        if o.0 == "myelin://acme/ci/secret/granted" {
             Ok(Decision::Allow)
         } else {
             Ok(Decision::Deny)
