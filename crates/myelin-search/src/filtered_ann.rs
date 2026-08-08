@@ -197,8 +197,7 @@ impl core::fmt::Display for FilteredAnnFailure {
                 f,
                 "FILTERED-ANN FAIL - the measured recall@k {measured_bps}bps fell BELOW the \
                  {floor_bps}bps floor: a visible nearest neighbour was DROPPED under the selective \
-                 filter (§4.2.2 recall-correctness). The floor is NOT softened to pass - this is a \
-                 dated [[claimed_not_proven]] row (EI-01 §3)"
+                 filter (§4.2.2 recall-correctness)"
             ),
             FilteredAnnFailure::NoQueries => write!(
                 f,

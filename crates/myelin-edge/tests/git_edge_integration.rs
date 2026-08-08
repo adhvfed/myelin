@@ -6,7 +6,7 @@ use hyper_util::rt::TokioIo;
 use myelin_edge::{
     register_git, serve_edge, AllowAll, Gateway, GitEdgeState, Method, WhoamiHandler,
 };
-use myelin_git::web::{switch_test_representative_pr_page, RepoHome, WebEditForm};
+use myelin_git::web::{representative_pr_page, RepoHome, WebEditForm};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
@@ -90,7 +90,7 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
                 "acme",
                 "alpha",
                 1,
-                switch_test_representative_pr_page("acme"),
+                representative_pr_page("acme"),
             )
             .with_blob(
                 "acme",
@@ -109,7 +109,7 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
                 "globex",
                 "zeta",
                 7,
-                switch_test_representative_pr_page("globex"),
+                representative_pr_page("globex"),
             ),
     );
 

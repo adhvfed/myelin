@@ -4,7 +4,7 @@ use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use myelin_git::api::{http_catalogue, Method as GitMethod};
 use myelin_git::web::{
-    switch_test_representative_pr_page, PrOverviewPage, RepoHome, WebEditForm, WebEditOutcome,
+    representative_pr_page, PrOverviewPage, RepoHome, WebEditForm, WebEditOutcome,
 };
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -79,7 +79,7 @@ impl GitEdgeState {
                 clone_url,
             },
         )
-        .with_pr(tenant, "myelin", 1, switch_test_representative_pr_page(tenant))
+        .with_pr(tenant, "myelin", 1, representative_pr_page(tenant))
         .with_blob(
             tenant,
             "myelin",
