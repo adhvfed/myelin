@@ -72,10 +72,6 @@ pub struct Thresholds {
     pub timer_wheel_promotion: TimerWheelPromotion,
     #[serde(default)]
     pub ci_surge: CiSurge,
-    #[serde(default)]
-    pub ci_switch_test: CiSwitchTestThreshold,
-    #[serde(default)]
-    pub claimed_not_proven: Vec<ClaimedNotProven>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,32 +251,6 @@ impl Default for CiSurge {
             hierarchical_scheduler_promotion_owed: false,
             prewarm_buffer_per_arrival_rate_bps: Self::PREWARM_BUFFER_PER_ARRIVAL_RATE_BPS_SEED,
             prewarm_max_buffer: Self::PREWARM_MAX_BUFFER_SEED,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CiSwitchTestThreshold {
-    #[serde(default = "CiSwitchTestThreshold::default_render_budget_us")]
-    pub render_budget_us: u64,
-}
-
-impl CiSwitchTestThreshold {
-    pub const RENDER_BUDGET_US_SEED: u64 = 50_000;
-
-    pub fn default_render_budget_us() -> u64 {
-        Self::RENDER_BUDGET_US_SEED
-    }
-
-    pub fn is_well_formed(&self) -> bool {
-        self.render_budget_us > 0
-    }
-}
-
-impl Default for CiSwitchTestThreshold {
-    fn default() -> Self {
-        CiSwitchTestThreshold {
-            render_budget_us: Self::RENDER_BUDGET_US_SEED,
         }
     }
 }
@@ -592,15 +562,6 @@ impl std::fmt::Display for ResilientTuningError {
 }
 
 impl std::error::Error for ResilientTuningError {}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaimedNotProven {
-    pub gate: String,
-    pub threshold_key: String,
-    pub date: String,
-    pub owner: String,
-    pub note: String,
-}
 
 impl Thresholds {
     pub fn from_toml(s: &str) -> Result<Thresholds, ThresholdError> {
@@ -1322,15 +1283,6 @@ mod tests {
             t.resilient_config("no-such-target"),
             Err(ThresholdError::Missing(_))
         ));
-    }
-
-    #[test]
-    fn scorecard_is_honest_and_empty_at_this_commit() {
-        let t = Thresholds::load_canonical().expect("load");
-        assert!(
-            t.claimed_not_proven.is_empty(),
-            "every shipped M0 drill is green at its threshold; a red one would add a row"
-        );
     }
 
     #[test]

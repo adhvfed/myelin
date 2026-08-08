@@ -95,7 +95,6 @@ pub mod ci_scheduler_db;
 pub mod cost_store;
 pub mod crypto_shred_erase;
 pub mod deployment;
-pub mod self_tenant;
 #[cfg(any(test, feature = "test-support"))]
 pub mod e2e_flagship;
 #[cfg(any(test, feature = "test-support"))]
@@ -183,12 +182,6 @@ pub use deployment::{
     deployment_requested_draft, deployment_rolled_back_draft, deployment_started_draft,
     deployment_succeeded_draft, resolve_approvers, DeployGate, DeployGateOutcome, DeployState,
     ENVIRONMENT_APPROVE_PERMISSION,
-};
-
-pub use self_tenant::{
-    proven_ci_rows, switch_capability_matrix, CiIncident, CiSwitchTest, CiTruthUpPass,
-    CiTruthUpRed, CiTruthUpVerdict, IncidentDrillLoop, ProvenCiRow, SwitchCapability,
-    SwitchVerdict,
 };
 
 pub use schedule_and_run_job::{complete_job, JobScheduleTerms, SchedulerJobRunner};

@@ -18,9 +18,6 @@ hierarchical_scheduler_promotion_owed = false # CI-D2 measured the wait p99 with
 prewarm_buffer_per_arrival_rate_bps = 1000  # MEASURED (07#2 / §5.4): 10% of the recent arrival rate kept warm (replaces CI-P4's fixed floor).
 prewarm_max_buffer = 16                     # the warm-buffer ceiling — bin-packing under the per-VM memory floor (never past the zone's headroom).
 
-[ci_switch_test]
-render_budget_us = 50000                    # Interactive run and log render latency budget.
-
 [authz_surge]
 human_lane_p99_budget_us = 5000  # ID-D9: the protected human lane's authz-decision p99 ceiling under 30×.
 

@@ -6,7 +6,6 @@ pub mod commit_prerequisite;
 pub mod datamap;
 pub mod derivative_erasure;
 pub mod diffgate;
-pub mod self_tenant;
 pub mod dsr;
 pub mod dsr_timer;
 pub mod ediscovery;
@@ -62,13 +61,6 @@ pub use derivative_erasure::{
 pub use diffgate::{
     check_against_baseline, diff, CommittedBaseline, DataMapDiff, GateVerdict, Reclassification,
     COMMITTED_BASELINE_FINGERPRINT,
-};
-pub use self_tenant::{
-    myelin_team_holder_schemas, proven_gdpr_rows, run_audit_consumer_on_self_tenant,
-    run_self_served_dsr_on_self_tenant, run_truth_up_scorecard, AuditSelfTenantArtifact, SelfTenantAction,
-    DsrSelfTenantArtifact, GdprIncident, IncidentDrillTicket, IncidentIssueDraft, KnowledgeSpacePage,
-    ProvenGdprRow, RopaKnowledgeSpace, RowStatus, ScorecardEntry, TruthUpPass, TruthUpRed,
-    TruthUpScorecard, TruthUpVerdict, MYELIN_SELF_TENANT, TRUTH_UP_FULL_PASS_PROMPT,
 };
 pub use dsr::{
     resolve_checklist_from_map, ChecklistItem, Dsr, DsrError, DsrId, DsrKind, DsrOrchestrator,
