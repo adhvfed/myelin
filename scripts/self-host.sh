@@ -51,6 +51,7 @@ GIT_ROOT_DEFAULT="${DATA_DIR}/git-data"
 # Hosted CI uses the immutable base gVisor rootfs; Git wire layers its separate git-bearing rootfs
 # from this same staged asset.
 GVISOR_ROOTFS_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/rootfs"
+GVISOR_RUST_ROOTFS_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/rust-rootfs"
 # The git WIRE (clone/fetch/push) runs a real `git` inside a gVisor sandbox, so it needs a git-bearing
 # rootfs staged (scripts/stage-git-rootfs.sh). Default location mirrors resolved_gvisor_git_rootfs().
 GIT_ROOTFS_DEFAULT="${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/git-rootfs"
@@ -125,45 +126,65 @@ EOF
 }
 
 verify_ci_rootfs() {
-  for tool in sed tar sha256sum awk find; do
+  for tool in sed tar sha256sum awk find sort readlink; do
     command -v "${tool}" >/dev/null 2>&1 || fail "CI rootfs verification requires ${tool}"
   done
   local config="${REPO_ROOT}/.myelin/ci.toml"
-  local rootfs="${MYELIN_GVISOR_ROOTFS:-${GVISOR_ROOTFS_DEFAULT}}"
   [[ -f "${config}" && ! -L "${config}" ]] ||
-    fail "checked-in founder pipeline is absent or linked: ${config}"
-  [[ -d "${rootfs}" && ! -L "${rootfs}" ]] ||
-    fail "staged CI rootfs is absent or linked: ${rootfs}"
-  [[ -d "${rootfs}/workspace" && ! -L "${rootfs}/workspace" ]] ||
-    fail "staged CI rootfs must contain a real, precreated /workspace mountpoint: ${rootfs}/workspace"
-  [[ -z "$(find "${rootfs}/workspace" -mindepth 1 -print -quit)" ]] ||
-    fail "staged CI rootfs /workspace mountpoint must be empty before it is pinned"
-  local expected_digest actual_digest
-  expected_digest="$(
+    fail "checked-in pipeline is absent or linked: ${config}"
+
+  local images
+  images="$(
     sed -nE \
-      's|^image = "myelin\.local/linux-small-v1-rootfs@sha256:([0-9a-f]{64})"$|\1|p' \
-      "${config}"
+      's#^image = "(myelin\.local/linux-(small|rust)-v1-rootfs@sha256:[0-9a-f]{64})"$#\1#p' \
+      "${config}" | sort -u
   )"
-  [[ "${expected_digest}" =~ ^[0-9a-f]{64}$ ]] ||
-    fail "founder pipeline must contain exactly one canonical linux-small-v1 rootfs digest"
-  actual_digest="$(
-    tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu \
-      -C "${rootfs}" -cf - . |
-      sha256sum |
-      awk '{print $1}'
-  )"
-  [[ "${actual_digest}" == "${expected_digest}" ]] ||
-    fail "staged CI rootfs digest ${actual_digest} does not match founder pipeline ${expected_digest}"
-  printf '%s\n' "${actual_digest}"
+  [[ -n "${images}" ]] ||
+    fail "checked-in pipeline does not declare a supported pinned runner image"
+
+  local image image_id expected_digest rootfs resolved_rootfs actual_digest
+  while IFS= read -r image; do
+    image_id="${image%%@sha256:*}"
+    expected_digest="${image##*@sha256:}"
+    case "${image_id}" in
+      myelin.local/linux-small-v1-rootfs)
+        rootfs="${MYELIN_GVISOR_ROOTFS:-${GVISOR_ROOTFS_DEFAULT}}"
+        ;;
+      myelin.local/linux-rust-v1-rootfs)
+        rootfs="${MYELIN_GVISOR_RUST_ROOTFS:-${GVISOR_RUST_ROOTFS_DEFAULT}}"
+        ;;
+      *)
+        fail "unsupported runner image in checked-in pipeline: ${image_id}"
+        ;;
+    esac
+
+    resolved_rootfs="$(readlink -f -- "${rootfs}" 2>/dev/null || true)"
+    [[ -n "${resolved_rootfs}" && "${resolved_rootfs}" != "/" && -d "${resolved_rootfs}" ]] ||
+      fail "staged CI rootfs is absent or invalid: ${rootfs}"
+    [[ -d "${resolved_rootfs}/workspace" && ! -L "${resolved_rootfs}/workspace" ]] ||
+      fail "staged CI rootfs must contain a real, precreated /workspace mountpoint: ${resolved_rootfs}/workspace"
+    [[ -z "$(find "${resolved_rootfs}/workspace" -mindepth 1 -print -quit)" ]] ||
+      fail "staged CI rootfs /workspace mountpoint must be empty before it is pinned"
+    actual_digest="$(
+      tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner --format=gnu \
+        -C "${resolved_rootfs}" -cf - . |
+        sha256sum |
+        awk '{print $1}'
+    )"
+    [[ "${actual_digest}" == "${expected_digest}" ]] ||
+      fail "staged CI rootfs digest ${actual_digest} does not match ${image}"
+    printf '%s  %s\n' "${actual_digest}" "${image_id}"
+  done <<< "${images}"
 }
 
 # Print the eval-able env contract: the dev-stack data-layer env + the edge-only env.
 print_env() {
   ensure_seal_key
-  local seal git_root rootfs git_rootfs region runsc_bin
+  local seal git_root rootfs rust_rootfs git_rootfs region runsc_bin
   seal="$(cat "${SEAL_KEY_FILE}")"
   git_root="${MYELIN_GIT_ROOT:-${GIT_ROOT_DEFAULT}}"
   rootfs="${MYELIN_GVISOR_ROOTFS:-${GVISOR_ROOTFS_DEFAULT}}"
+  rust_rootfs="${MYELIN_GVISOR_RUST_ROOTFS:-${GVISOR_RUST_ROOTFS_DEFAULT}}"
   git_rootfs="${MYELIN_GVISOR_GIT_ROOTFS:-${GIT_ROOTFS_DEFAULT}}"
   runsc_bin="${MYELIN_RUNSC_BIN:-$(command -v runsc || true)}"
   region="${MYELIN_REGION:-fr-par}"
@@ -186,6 +207,7 @@ export MYELIN_SELF_HOST_ISSUES_PREFIX="\${MYELIN_SELF_HOST_ISSUES_PREFIX:-${SELF
 export MYELIN_EDGE_ADDR="\${MYELIN_EDGE_ADDR:-127.0.0.1:8080}"
 export MYELIN_TOKEN_LOGIN="\${MYELIN_TOKEN_LOGIN:-1}"  # surface the operator-token web login in /v1/auth/config
 export MYELIN_GVISOR_ROOTFS="\${MYELIN_GVISOR_ROOTFS:-${rootfs}}"  # immutable hosted-CI base rootfs
+export MYELIN_GVISOR_RUST_ROOTFS="\${MYELIN_GVISOR_RUST_ROOTFS:-${rust_rootfs}}"  # immutable Rust build rootfs
 export MYELIN_GVISOR_GIT_ROOTFS="\${MYELIN_GVISOR_GIT_ROOTFS:-${git_rootfs}}"  # the sandboxed git-wire rootfs (stage-git-rootfs.sh)
 export MYELIN_RUNSC_BIN="\${MYELIN_RUNSC_BIN:-${runsc_bin}}"  # absolute gVisor runtime path; edge startup validates it
 export MYELIN_PUBLIC_BASE_URL="\${MYELIN_PUBLIC_BASE_URL:-http://\${MYELIN_EDGE_ADDR:-127.0.0.1:8080}}"  # advertised clone-URL base (F3)
