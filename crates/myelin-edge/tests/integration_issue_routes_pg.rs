@@ -625,6 +625,16 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     assert_eq!(active_retry.issue.title, title);
     assert_eq!(active_retry.zookie, activated_zookie);
     assert_eq!(active_retry_writer.calls.load(Ordering::SeqCst), 0);
+    let (status, not_yet_projected) = http(
+        address,
+        "GET",
+        &authorization_path,
+        Some(&creator_token),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, 202);
+    assert_eq!(not_yet_projected["status"], "pending");
     issue_store
         .rebuild_effective_issue_view(&worker)
         .await

@@ -1157,7 +1157,27 @@ const AUTHORIZATION_STATUS_SQL: &str = r#"
 SELECT i.id, i.key, i.project_id, i.state, i.state_category,
        i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version,
        i.created_at::text AS created_at, i.updated_at::text AS updated_at,
-       b.state AS authorization_state
+       CASE
+         WHEN b.state = 'active' AND EXISTS (
+           SELECT 1
+           FROM authz_projection_state projection
+           JOIN issue_authz_visible visible
+             ON visible.tenant_id = projection.tenant_id
+            AND visible.region = projection.region
+            AND visible.projection = projection.projection
+            AND visible.revision = projection.applied_revision
+           WHERE projection.tenant_id = b.tenant_id
+             AND projection.region = b.region
+             AND projection.projection = 'issue:view'
+             AND projection.status = 'ready'
+             AND projection.applied_revision = projection.source_revision
+             AND visible.subject = $4
+             AND visible.permission = 'view'
+             AND visible.object_type = 'issue'
+             AND visible.object_id = i.id::text
+         ) THEN 'active'
+         ELSE 'pending'
+       END AS authorization_state
 FROM issue_authz_binding b
 JOIN issue i
   ON i.tenant_id = b.tenant_id AND i.region = b.region AND i.id = b.issue_id
@@ -1851,6 +1871,9 @@ mod tests {
             "b.project_userset = 'project:' || i.project_id::text || '#view'",
             "b.relation = 'parent_project'",
             "AND NOT i.archived",
+            "projection.applied_revision = projection.source_revision",
+            "visible.subject = $4",
+            "visible.object_id = i.id::text",
         ] {
             assert!(
                 AUTHORIZATION_STATUS_SQL.contains(required),
