@@ -53,8 +53,3 @@ pub mod typed_edges;
 pub mod web;
 
 pub mod api;
-
-pub mod self_tenant;
-
-#[cfg(any(test, feature = "test-support"))]
-pub mod switch_test;

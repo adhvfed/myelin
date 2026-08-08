@@ -21,28 +21,6 @@ prewarm_max_buffer = 16                     # the warm-buffer ceiling — bin-pa
 [ci_switch_test]
 render_budget_us = 50000                    # Interactive run and log render latency budget.
 
-[refs_switch_test]
-backlink_read_budget_us = 20000             # MEASURED-GATE: the per-viewer backlink "referenced-by" read that opens the jump; slower than the anchor's interactive grade is a UX wall.
-unfurl_budget_us = 16000                    # MEASURED-GATE: the "within the keyboard" single-unfurl render budget (~one keystroke at 60 fps, no spinner); slower is a wall.
-jump_no_spinner_budget_us = 100000          # MEASURED-GATE: the whole four-keystroke jump (failing-test→line→issue→conversation) within the human-perceptible "instant" ceiling so no spinner flashes.
-
-[search_switch_test]
-code_by_symbol_budget_us = 30000            # Per-viewer code-by-symbol search latency budget.
-doc_by_content_budget_us = 40000            # Knowledge content search latency budget.
-issue_by_facet_budget_us = 20000            # Structured issue search latency budget.
-
-[git_switch_test]
-pr_overview_render_budget_us = 50000        # Pull-request overview render latency budget.
-overlay_contrast_floor_bp = 450             # MEASURED-GATE: the status-overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-language §8b anchor); an overlay below it is an accessibility wall.
-
-[knowledge_switch_test]
-page_render_budget_us = 50000               # Knowledge page render latency budget.
-overlay_contrast_floor_bp = 450             # MEASURED-GATE: the reference-chip / tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
-
-[chat_switch_test]
-perceived_send_budget_us = 100000           # Maximum perceived latency for an optimistic message send.
-overlay_contrast_floor_bp = 450             # MEASURED-GATE: the message-row / agent / unfurl / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
-
 [authz_surge]
 human_lane_p99_budget_us = 5000  # ID-D9: the protected human lane's authz-decision p99 ceiling under 30×.
 

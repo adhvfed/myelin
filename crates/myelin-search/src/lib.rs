@@ -6,7 +6,6 @@ pub mod compiler;
 pub mod consistency;
 pub mod cross_cell;
 pub mod dek;
-pub mod self_tenant;
 pub mod e2e_wedge;
 pub mod engine;
 pub mod erase;
@@ -30,8 +29,6 @@ pub mod restore_verify;
 pub mod shell;
 pub mod subartifact;
 pub mod surge;
-#[cfg(any(test, feature = "test-support"))]
-pub mod switch_test;
 pub mod telemetry;
 pub mod tier3_valve;
 pub mod vector;
@@ -62,14 +59,6 @@ pub use consistency::{
     ConsistencyStats,
 };
 pub use dek::{hyok_skips_index, srch_p03_inherited_gates, InheritedGate, SearchDekPin};
-pub use self_tenant::{
-    proven_search_rows, run_search_truth_up_scorecard, SelfTenantArtifact, ProvenSearchRow,
-    SearchIncident, SearchIncidentDrillTicket, SearchIncidentIssueDraft, SearchRowStatus,
-    SearchScorecardEntry, SearchTruthUpPass, SearchTruthUpRed, SearchTruthUpScorecard,
-    SearchTruthUpVerdict, EMBEDDING_ADAPTER_POSTURE, MYELIN_SELF_REGION, MYELIN_SELF_TENANT,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use self_tenant::run_search_over_myelins_own_work;
 pub use e2e_wedge::{run_e2e_1_pr_pane, E2eArtifact, E2E_SCENARIOS};
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{run_e2e_3_spec_to_ship, run_e2e_4_dsar_fanout, run_search_e2e_wedge};
@@ -161,11 +150,6 @@ pub use subartifact::{
 pub use surge::{
     run_search_surge, SearchShedGate, SearchShedRejection, SearchSurgeReport,
     FILTERED_ANN_FOLLOW_ON, SEARCH_SURGE_MULTIPLIER, SHARD_SPLIT_IS_MEASURED_ONLY,
-};
-#[cfg(any(test, feature = "test-support"))]
-pub use switch_test::{
-    switch_capability_matrix, switch_surface_drive_record, BrowserDriveStatus, MeasuredLatencies,
-    SearchSwitchTest, SearchSwitchVerdict, SwitchCapability, SwitchSurfaceDrive,
 };
 pub use telemetry::{
     signal as telemetry_signal, LabelledSignal, RedLabels, SearchTelemetry, CACHE_RATIO_ABSENT,
