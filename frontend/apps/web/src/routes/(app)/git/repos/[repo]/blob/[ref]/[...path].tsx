@@ -1,6 +1,6 @@
 // Blob view (R3.4 / G-2) — `/git/repos/{repo}/blob/{ref}/{...path}` (nested path). Full-path
 // breadcrumb; a Raw + Download toolbar (gateway-proxied, in-region — Download forces an attachment via
-// the /git-raw proxy) + a present-disabled Blame slot ("soon"). Body: a BINARY file renders the
+// the /git-raw proxy) + a present-disabled Blame slot (under construction). Body: a BINARY file renders the
 // download fallback (NEVER split('\n') a binary into a garbled dump); a large file whose object was
 // not inflated shows an explicit metadata-only fallback; otherwise the line-numbered code view. A directory requested
 // here (the edge's redirect_to_tree hint) client-redirects to the tree route. Semantic tokens only.
@@ -72,7 +72,7 @@ export default function BlobScreen() {
                     </h1>
                     <span style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>{fmtBytes(file.size_bytes)}</span>
                     <div style={{ flex: "1" }} />
-                    {/* Raw (open) · Download (attachment, gateway-proxied) · Blame (present-disabled "soon"). */}
+                    {/* Raw (open) · Download (attachment, gateway-proxied) · Blame (under construction). */}
                     <Show when={file.download_available !== false}>
                       <a href={rawHref()} target="_blank" rel="noreferrer" style={toolbarBtn}>
                         <Icon name="external-link" /> Raw
@@ -81,9 +81,9 @@ export default function BlobScreen() {
                         <Icon name="download" /> Download
                       </a>
                     </Show>
-                    <button type="button" aria-disabled="true" disabled data-testid="blame-soon" title="Blame is coming soon" style={{ ...toolbarBtn, color: "var(--text-subtle)", cursor: "not-allowed" }}>
+                    <button type="button" aria-disabled="true" disabled data-testid="blame-under-construction" title="Blame is under construction" style={{ ...toolbarBtn, color: "var(--text-subtle)", cursor: "not-allowed" }}>
                       <Icon name="human" /> Blame
-                      <span style={{ "font-size": "var(--fs-caption)" }}>soon</span>
+                      <span style={{ "font-size": "var(--fs-caption)" }}>under construction</span>
                     </button>
                   </div>
                   <p style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)", margin: "0" }}>

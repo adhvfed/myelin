@@ -28,7 +28,7 @@ S3-compatible object store.
 
 ## Development
 
-Install `fed`, then start the complete local application:
+Install [`fed`](https://www.service-federation.com/docs/), then start the complete local application:
 
 ```sh
 fed start

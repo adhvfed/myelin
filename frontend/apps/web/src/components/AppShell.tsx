@@ -47,19 +47,19 @@ interface NavItem {
   href: string;
   icon: IconName;
   label: string;
-  /** An unbuilt destination (R3.4 honest rail): muted + a neutral "soon" dot + a title tooltip, still
+  /** An unbuilt destination (R3.4 honest rail): muted + a neutral construction dot + a title tooltip, still
    *  a real keyboard-reachable link that lands on the teaching NotAvailable. Never disabled, never
    *  accent, never colour-alone (the tooltip + destination copy carry the meaning). */
-  soon?: boolean;
+  underConstruction?: boolean;
 }
 
 // Keep unfinished destinations reachable so their explanatory states remain discoverable.
 const NAV: NavItem[] = [
   { href: "/git/repos", icon: "nav-code", label: "Code" },
   { href: "/issues", icon: "nav-issues", label: "Issues" },
-  { href: "/chat", icon: "nav-chat", label: "Chat", soon: true },
+  { href: "/chat", icon: "nav-chat", label: "Chat", underConstruction: true },
   { href: "/ci", icon: "nav-ci", label: "CI" },
-  { href: "/knowledge", icon: "nav-knowledge", label: "Knowledge", soon: true },
+  { href: "/knowledge", icon: "nav-knowledge", label: "Knowledge", underConstruction: true },
 ];
 
 const THEMES = ["dark", "light", "high-contrast"] as const;
@@ -376,12 +376,12 @@ export function AppShell(props: AppShellProps) {
               return (
                 <A
                   href={item.href}
-                  class={item.soon ? "nav-rail-item soon" : "nav-rail-item"}
-                  aria-label={item.soon ? `${item.label} (coming soon)` : item.label}
-                  title={item.soon ? `${item.label} — coming soon` : undefined}
+                  class={item.underConstruction ? "nav-rail-item under-construction" : "nav-rail-item"}
+                  aria-label={item.underConstruction ? `${item.label} (under construction)` : item.label}
+                  title={item.underConstruction ? `${item.label} — under construction` : undefined}
                   aria-current={isActive() ? "page" : undefined}
                   // Colour/active/hover come from the .nav-rail-item class (surface-hover fill +
-                  // brighter text, no accent fill — R1 binding). `.soon` mutes it + shows a neutral
+                  // brighter text, no accent fill — R1 binding). `.under-construction` mutes it + shows a neutral
                   // dot. Only layout stays inline.
                   style={{
                     position: "relative",
@@ -394,8 +394,8 @@ export function AppShell(props: AppShellProps) {
                   }}
                 >
                   <Icon name={item.icon} title={item.label} />
-                  <Show when={item.soon}>
-                    <span class="soon-dot" aria-hidden="true" />
+                  <Show when={item.underConstruction}>
+                    <span class="construction-dot" aria-hidden="true" />
                   </Show>
                 </A>
               );
