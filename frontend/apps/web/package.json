@@ -13,6 +13,7 @@
     "lint": "eslint src dev-edge tests",
     "test": "vitest run",
     "test:integration": "vitest run --config vitest.integration.config.ts",
+    "test:browser-integration": "playwright test --config playwright.integration.config.ts",
     "test:e2e": "playwright test"
   },
   "dependencies": {

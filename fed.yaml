@@ -2,12 +2,16 @@ parameters:
   MYELIN_KMS_SEAL_KEY:
     type: secret
     generate: openssl rand -hex 32
+  MYELIN_WEB_SESSION_KEY:
+    type: secret
+    generate: openssl rand -base64 32 | tr '+/' '-_' | tr -d '=\n'
   POSTGRES_PORT: { type: port, default: 5433 }
   S3_PORT: { type: port, default: 9000 }
   VALKEY_PORT: { type: port, default: 6380 }
   NATS_PORT: { type: port, default: 4222 }
   NATS_MONITOR_PORT: { type: port, default: 8222 }
   EDGE_PORT: { type: port, default: 8080 }
+  WEB_PORT: { type: port, default: 3000 }
 
 services:
   postgres:
@@ -132,7 +136,48 @@ services:
       timeout: 120s
     startup_message: "Myelin edge: http://127.0.0.1:{{EDGE_PORT}}"
 
-entrypoint: edge
+  web:
+    depends_on: [edge]
+    install: pnpm --dir frontend install --frozen-lockfile
+    process: >-
+      sh -c 'set -eu;
+      token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_DEV_TENANT" --region fr-par
+      --principal developer --display-name "Myelin Developer"
+      --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
+      test -n "$token";
+      export MYELIN_DEV_ACCESS_TOKEN="$token";
+      exec pnpm --dir frontend --filter @myelin/web exec vinxi dev --host 127.0.0.1'
+    environment:
+      PORT: "{{WEB_PORT}}"
+      MYELIN_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_PUBLIC_ORIGIN: "http://127.0.0.1:{{WEB_PORT}}"
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_ISSUES_PROJECT: 20aee030-c7fa-4757-8243-700faf528690
+      MYELIN_ISSUES_TYPE: 7d457754-f6a1-4cd8-8738-21751570b627
+      MYELIN_ISSUES_PREFIX: MYL
+      MYELIN_DEV_LOGIN: "1"
+      MYELIN_DEV_TENANT: "development-{{FED_PROJECT_ID}}"
+      MYELIN_DEV_TOKEN_SCHEME: agent
+      MYELIN_DEV_DISPLAY_NAME: "Myelin Developer"
+      REDIS_URL: "redis://127.0.0.1:{{VALKEY_PORT}}"
+      MYELIN_WEB_SESSION_KEY: "{{MYELIN_WEB_SESSION_KEY}}"
+    healthcheck:
+      http_get: "http://127.0.0.1:{{WEB_PORT}}/readyz"
+      timeout: 180s
+    startup_message: "Myelin web: http://127.0.0.1:{{WEB_PORT}}"
+
+entrypoint: web
 
 scripts:
   test:backend:
@@ -156,7 +201,7 @@ scripts:
     script: pnpm --dir frontend check
 
   test:integration:
-    depends_on: [edge]
+    depends_on: [web]
     environment:
       DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
       DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
@@ -171,15 +216,18 @@ scripts:
       MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
       MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
       MYELIN_INTEGRATION_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_INTEGRATION_WEB_URL: "http://127.0.0.1:{{WEB_PORT}}"
       MYELIN_INTEGRATION_TENANT: "integration-{{FED_PROJECT_ID}}"
     script: >-
-      sh -c 'token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      sh -c 'set -eu;
+      token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_INTEGRATION_TENANT" --region fr-par
       --principal product-test --display-name "Product Test"
       --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
       test -n "$token";
       export MYELIN_INTEGRATION_TOKEN="$token";
-      exec pnpm --dir frontend test:integration -- "$@"' -- "$@"
+      pnpm --dir frontend test:integration -- "$@";
+      pnpm --dir frontend test:browser-integration' -- "$@"
 
   test:browser-contract:
     script: pnpm --dir frontend test:e2e -- "$@"

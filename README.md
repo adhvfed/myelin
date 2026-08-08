@@ -28,7 +28,7 @@ S3-compatible object store.
 
 ## Development
 
-Install `fed`, then start the local data services and Rust edge:
+Install `fed`, then start the complete local application:
 
 ```sh
 fed start
@@ -38,7 +38,7 @@ Run tests that use those services with `fed test:backend`. `fed test:integration
 drives a TypeScript product journey through the real edge and durable services without
 AI inference. Frontend checks are available as `fed test:frontend`, and
 `fed test:browser-contract` runs the faster browser suite against its contract backend.
-The web application is the remaining process to add to the default composition.
+Fed prints the allocated web and edge URLs when the stack is ready.
 
 ## Status
 

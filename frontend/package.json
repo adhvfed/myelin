@@ -16,6 +16,7 @@
     "test": "pnpm -r test",
     "check": "pnpm lint && pnpm typecheck && pnpm test && pnpm build",
     "test:integration": "pnpm --filter @myelin/web test:integration",
+    "test:browser-integration": "pnpm --filter @myelin/web test:browser-integration",
     "test:e2e": "pnpm --filter @myelin/web test:e2e"
   },
   "pnpm": {
