@@ -12,6 +12,8 @@ pub const MEMBER: &str = "member";
 pub const TARGET: &str = "target";
 
 pub const READ: &str = "read";
+pub const POST: &str = "post";
+pub const MANAGE: &str = "manage";
 
 pub const VIEW: &str = "view";
 
@@ -49,6 +51,11 @@ pub fn channel_fragment() -> FragmentDef {
             perm(
                 READ,
                 Userset::Union(vec![rel(MEMBER), ttu("parent_project", "view")]),
+            ),
+            perm(POST, rel(MEMBER)),
+            perm(
+                MANAGE,
+                Userset::Intersect(vec![rel(MEMBER), ttu("parent_project", "view")]),
             ),
         ],
     )
@@ -103,6 +110,14 @@ mod tests {
             "channel.read is a compiled permission"
         );
         assert!(
+            eng.resolve_permission("channel", POST).is_some(),
+            "channel.post is a compiled permission"
+        );
+        assert!(
+            eng.resolve_permission("channel", MANAGE).is_some(),
+            "channel.manage is a compiled permission"
+        );
+        assert!(
             eng.resolve_permission("message", VIEW).is_some(),
             "message.view is a compiled permission"
         );
@@ -124,6 +139,27 @@ mod tests {
             read.rewrite,
             Userset::Union(vec![rel(MEMBER), ttu("parent_project", "view")]),
             "channel.read = member ∪ parent_project->view (§5)"
+        );
+    }
+
+    #[test]
+    fn channel_post_and_manage_keep_distinct_collaboration_boundaries() {
+        let channel = channel_fragment();
+        let post = channel
+            .permissions
+            .iter()
+            .find(|permission| permission.permission.0 == POST)
+            .expect("channel declares post");
+        let manage = channel
+            .permissions
+            .iter()
+            .find(|permission| permission.permission.0 == MANAGE)
+            .expect("channel declares manage");
+        assert_eq!(post.rewrite, rel(MEMBER), "channel.post = member");
+        assert_eq!(
+            manage.rewrite,
+            Userset::Intersect(vec![rel(MEMBER), ttu("parent_project", "view")]),
+            "channel.manage requires membership and project visibility"
         );
     }
 

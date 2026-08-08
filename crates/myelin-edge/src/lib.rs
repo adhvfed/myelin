@@ -1,6 +1,7 @@
 pub mod authz;
 pub mod bootstrap;
 pub mod catalogue;
+pub mod chat_http;
 pub mod ci_http;
 pub mod error;
 pub mod gateway;
@@ -37,6 +38,7 @@ pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
 };
+pub use chat_http::register_chat;
 pub use ci_http::{register_ci, DurableCiReadApi};
 pub use error::{map_authz_error, EdgeError};
 pub use gateway::{

@@ -89,6 +89,35 @@ fn production_edge_mounts_the_durable_recipient_scoped_notification_read() {
 }
 
 #[test]
+fn production_edge_mounts_encrypted_durable_chat_topics_and_messages() {
+    let main = include_str!("../src/main.rs");
+    let route = include_str!("../src/chat_http.rs");
+    let authz = include_str!("../src/authz.rs");
+
+    assert!(main.contains("&myelin_chat::store::pg_conversation::chat_migrations()"));
+    assert!(main.contains("CONVERSATION_RECENT_INDEX"));
+    let chat_migration = main
+        .split_once("&myelin_chat::store::pg_conversation::chat_migrations()")
+        .expect("Chat migrations are mounted")
+        .1;
+    assert!(chat_migration.starts_with(",\n            &HotTables::none()"));
+    assert!(main.contains("register_chat("));
+    assert!(main.contains("kms.clone()"));
+    assert!(route.contains("PgConversationStore::new(pool.clone())"));
+    assert!(route.contains("PgMessageStore::new(pool, \"edge\", MESSAGE_TABLE)"));
+    assert!(route.contains("create_co_commit("));
+    assert!(route.contains("append_co_commit("));
+    assert!(route.contains("encrypt_message_body("));
+    assert!(route.contains("decode_encrypted_body("));
+    assert!(!route.contains("body_inline: body.content.into_bytes()"));
+    assert!(
+        authz.contains("requirement!(\"chat.conversations.list\", \"chat.read\", OP_AGENT_PAT)")
+    );
+    assert!(authz.contains("requirement!(\"chat.conversation.create\", \"chat.manage\", OP_PAT)"));
+    assert!(authz.contains("requirement!(\"chat.message.post\", \"chat.post\", OP_AGENT_PAT)"));
+}
+
+#[test]
 fn production_edge_mounts_the_repo_authorized_durable_ci_reads() {
     let main = include_str!("../src/main.rs");
     let route = include_str!("../src/ci_http.rs");

@@ -264,7 +264,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
   test("product areas under construction remain discoverable without looking like broken links", async ({ page }) => {
     await devLogin(page);
 
-    for (const path of ["/chat", "/knowledge"]) {
+    for (const path of ["/knowledge"]) {
       await page.goto(path);
       await expect(page.getByTestId("availability-status")).toHaveText("Under construction");
       await expect(page.getByText("Not found", { exact: true })).toHaveCount(0);

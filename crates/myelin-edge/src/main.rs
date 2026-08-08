@@ -5,13 +5,14 @@ use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
-    bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot, register_ci,
-    register_git_durable, register_git_wire, register_issues, register_notif,
-    serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AuthProvider,
-    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
-    DurableGitBackend, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
-    ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
-    ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
+    bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
+    register_chat, register_ci, register_git_durable, register_git_wire, register_issues,
+    register_notif, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
+    AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
+    CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, GitDatabaseProviders,
+    IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
+    SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
+    TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
@@ -550,6 +551,23 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         std::process::exit(1);
     }
     if let Err(e) = bootstrap
+        .migrate(
+            &myelin_chat::store::pg_conversation::chat_migrations(),
+            &HotTables::none(),
+        )
+        .await
+    {
+        eprintln!("edge: cannot apply the Chat conversation and message migrations: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
+        .verify_index_ready(myelin_chat::store::pg_conversation::CONVERSATION_RECENT_INDEX)
+        .await
+    {
+        eprintln!("edge: Chat topic-list keyset index is not ready: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
         .verify_index_ready("notif_inbox_recipient_keyset")
         .await
     {
@@ -873,6 +891,14 @@ async fn serve(
             std::process::exit(1);
         }
     }
+    for admit in check.admit_chat_fragment() {
+        if let FragmentAdmit::Rejected { reason } = admit {
+            eprintln!(
+                "edge: the Chat ReBAC fragment did not admit (private channels would deny everything): {reason}"
+            );
+            std::process::exit(1);
+        }
+    }
     let issue_authorizer = StoreBackedIssueAuthorizer::new(check.clone());
     let issue_store = Arc::new(myelin_issues::PgIssueStore::new(
         provider.clone(),
@@ -992,6 +1018,12 @@ async fn serve(
         issue_store.clone(),
         issue_authorizer,
         handle.clone(),
+    );
+    builder = register_chat(
+        builder,
+        provider.db_pool().clone(),
+        handle.clone(),
+        kms.clone(),
     );
     builder = register_notif(
         builder,

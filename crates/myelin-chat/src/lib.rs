@@ -50,7 +50,10 @@ pub use cross_org::{
     as_propagated, channel_ref, fanned_out_carried_fields, CellLocalChannelResolution,
     ChannelProjection, CrossOrgChannel, CrossOrgPointer, FederatedMember,
 };
-pub use dek::{decrypt_body, encrypt_body, plaintext_at_rest, subject_dek_erasure, ChatFreeText};
+pub use dek::{
+    decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, plaintext_at_rest,
+    subject_dek_erasure, ChatBodyEnvelopeError, ChatFreeText,
+};
 pub use dispatch::{
     agent_provenance, dispatch_disposition_class, dispatch_explicit, mention_is_always_notify_only,
     no_auto_spawn_path_is_wired, reserve_gate, AgentProvenance, DispatchOutcome, Disposition,

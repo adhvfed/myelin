@@ -2354,6 +2354,7 @@ dependencies = [
 name = "myelin-chat"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "myelin-agent",
  "myelin-chat",
  "myelin-ci-sandbox",
@@ -2563,6 +2564,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "myelin-agent",
+ "myelin-chat",
  "myelin-ci-controlplane",
  "myelin-ci-sandbox",
  "myelin-config",

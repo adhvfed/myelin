@@ -2,6 +2,7 @@
    actual values + the three-theme re-skin + the single :focus-visible rule; this file only applies
    the semantic surface to the document root. Never a hex, never a primitive var here. */
 @import "@myelin/design-system/tokens.css";
+@import "./chat.css";
 
 *,
 *::before,
@@ -955,4 +956,5 @@ a.issue-row:hover {
   .issue-detail-actions .issues-button {
     width: 100%;
   }
+
 }

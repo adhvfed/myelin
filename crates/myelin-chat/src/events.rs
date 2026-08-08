@@ -1,4 +1,42 @@
 use myelin_events::validate_event_type;
+use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
+
+pub fn event_actor_pseudonym(tenant: &str, subject: &str) -> String {
+    event_actor_field_pseudonym("principal", tenant, subject)
+}
+
+fn event_actor_field_pseudonym(field: &str, tenant: &str, subject: &str) -> String {
+    let digest = blake3::hash(
+        format!("myelin.chat.event-actor.v1\0{field}\0{tenant}\0{subject}").as_bytes(),
+    );
+    format!("chat-author:{}", &digest.to_hex()[..32])
+}
+
+pub fn pseudonymized_event_principal(tenant: &str, principal: &Principal) -> Principal {
+    let mut projected = principal.clone();
+    projected.principal_id = PrincipalId(event_actor_pseudonym(tenant, &principal.principal_id.0));
+    if let PrincipalKind::Agent {
+        runtime_ref,
+        on_behalf_of,
+    } = &principal.kind
+    {
+        projected.kind = PrincipalKind::Agent {
+            runtime_ref: RuntimeRef(event_actor_field_pseudonym(
+                "runtime-ref",
+                tenant,
+                &runtime_ref.0,
+            )),
+            on_behalf_of: on_behalf_of.as_ref().map(|delegator| {
+                PrincipalId(event_actor_field_pseudonym(
+                    "on-behalf-of",
+                    tenant,
+                    &delegator.0,
+                ))
+            }),
+        };
+    }
+    projected
+}
 
 pub const CHAT_MESSAGE_CREATED: &str = "chat.message.created";
 pub const CHAT_MESSAGE_EDITED: &str = "chat.message.edited";

@@ -19,6 +19,20 @@ impl MessageId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn timestamp_ms(&self) -> Option<u64> {
+        if self.0.len() != 26 {
+            return None;
+        }
+        self.0
+            .bytes()
+            .take(10)
+            .try_fold(0u64, |value, byte| {
+                let digit = CROCKFORD.iter().position(|candidate| *candidate == byte)? as u64;
+                value.checked_mul(32)?.checked_add(digit)
+            })
+            .filter(|value| *value <= 0xFFFF_FFFF_FFFF)
+    }
 }
 
 pub trait UlidSource: Send + Sync {
@@ -105,5 +119,18 @@ impl UlidSource for SystemUlidSource {
         };
         *last = value;
         MessageId::from_u128(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn timestamp_round_trips_from_the_ulid_prefix() {
+        let timestamp = 1_719_446_400_123u64;
+        let id = MessageId::from_u128((timestamp as u128) << 80);
+        assert_eq!(id.timestamp_ms(), Some(timestamp));
+        assert_eq!(MessageId("not-a-ulid".into()).timestamp_ms(), None);
     }
 }
