@@ -203,25 +203,25 @@ pub fn switch_capability_matrix() -> Vec<SwitchCapability> {
     vec![
         cap(
             "code-by-symbol",
-            "GitHub code search: find a symbol by name across the repo",
+            "Find a symbol by name across a repository",
             "query(FT over the git-blob corpus) → the blob carrying the symbol (per-viewer)",
             true,
         ),
         cap(
             "doc-by-content",
-            "Notion search: find a doc by its content (full-text / semantic)",
+            "Find a knowledge page by its content using full-text or semantic search",
             "semantic(hybrid/vector over the Knowledge corpus) → the doc by content (per-viewer)",
             true,
         ),
         cap(
             "issue-by-facet",
-            "Jira/Linear search: filter issues by facet (status / priority / assignee)",
+            "Filter issues by status, priority, and assignee",
             "query(structured facet over the issue corpus) → the issue by facet (per-viewer)",
             true,
         ),
         cap(
             "per-viewer-correct",
-            "Notion/Jira shared search can surface a title you cannot open (a result you must not see)",
+            "Search never surfaces a title the viewer cannot open",
             "the pre-filter gates per-viewer: a denied doc NEVER enters the candidate set (0 leak)",
             true,
         ),

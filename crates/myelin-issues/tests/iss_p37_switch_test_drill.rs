@@ -29,7 +29,7 @@ fn the_switch_test_passes_driven_over_the_real_surface() {
     );
     assert!(
         verdict.walls().is_empty(),
-        "0 walls vs the Jira/Linear anchor: {:?}",
+        "the issue workflow must have no blocked experience requirements: {:?}",
         verdict.walls()
     );
     assert_eq!(
@@ -164,7 +164,7 @@ fn switch_test_spine_end_to_end() {
 
     println!(
         "[P-520 SWITCH-TEST GREEN {RUN_DATE}] the Issues ISS-D14 switch test driven over the real \
-         surface: 0 walls vs the Jira/Linear anchor (create→triage→plan→board→done without a manual), \
+         surface: create→triage→plan→board→done without a manual, \
          render(parse(md)) === md at 100%, every primary-screen overlay at ≥ 4.5:1 contrast, every \
          primary-screen state reached, the canonical-view render within budget; browser-driven=partial \
          (automated model driven + measured; the live <Board>/<Views> shell + a Playwright drive is the \

@@ -94,7 +94,7 @@ fn c4_mirror_gate_drill() {
     let mut gate = MirrorGate::new();
     let mut producer = MirrorProducer::new();
 
-    let extra_eu = MirrorTarget::new("github.com", Region::new("us-east"));
+    let extra_eu = MirrorTarget::new("mirror.example", Region::new("us-east"));
     let denied = producer.attempt(&mut gate, &reg, &acme, &extra_eu, "fr-par", &policy);
     assert_eq!(
         denied,

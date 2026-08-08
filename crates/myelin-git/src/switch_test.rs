@@ -63,31 +63,31 @@ pub fn switch_capability_matrix() -> Vec<SwitchCapability> {
     vec![
         cap(
             "pr-overview-render",
-            "GitHub PR page: the overview (title, checks, merge-readiness) renders interactively",
+            "The overview renders its title, checks, and merge readiness interactively",
             "PrOverviewPage::render() → the overview within the render-latency budget",
             true,
         ),
         cap(
             "markdown-wysiwyg-stable",
-            "GitHub editor: what you type is what is stored is what renders (no silent rewrite)",
+            "Pull-request descriptions round-trip without a silent rewrite",
             "Body::round_trips() → render(parse(md)) === md byte-identical (contract 13.1)",
             true,
         ),
         cap(
             "status-overlay-colourblind-safe",
-            "GitHub status badges: a green/red check is legible to a colour-blind viewer",
+            "Status badges remain legible without relying on colour",
             "StatusCue: glyph + label + colour (never colour alone, WCAG 1.4.1) at ≥ 4.5:1 contrast",
             true,
         ),
         cap(
             "merge-readiness-overlay",
-            "GitHub merge box: the merge-readiness reason (blocked/ready) is shown explicitly",
+            "Merge readiness explains explicitly whether and why a change is blocked",
             "the merge-readiness overlay renders the explicit reason (no colour-only signal)",
             true,
         ),
         cap(
             "per-viewer-correct",
-            "GitHub: a PR linking a private issue can leak the issue title to a viewer without access",
+            "A linked confidential issue never leaks its title to an unauthorized viewer",
             "the PR pane resolves a confidential linked issue to a TOMBSTONE - the title never leaks",
             true,
         ),
@@ -149,8 +149,7 @@ pub fn switch_surface_drive_record() -> Vec<SwitchSurfaceDrive> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the git switch-test verdict must be checked - a dropped RED means a migrating GitHub user \
-              hits a wall the old tool didn't have, silently (EI-01 §4: actually try the real thing)"]
+#[must_use = "the git experience verdict must be checked"]
 pub enum GitSwitchVerdict {
     Pass {
         reached: usize,

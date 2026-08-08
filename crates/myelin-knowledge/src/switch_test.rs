@@ -81,31 +81,31 @@ pub fn switch_capability_matrix() -> Vec<SwitchCapability> {
     vec![
         cap(
             "page-render",
-            "Notion page: the page (headings, blocks, marks) renders interactively as you scroll",
+            "Pages render headings, blocks, and marks interactively while scrolling",
             "Document render via the ONE render path → the page within the render-latency budget",
             true,
         ),
         cap(
             "markdown-wysiwyg-stable",
-            "Notion editor: what you type is what is stored is what renders (no silent rewrite)",
+            "Knowledge content round-trips without a silent rewrite",
             "Document::corpus_roundtrips → render(parse(md)) === md byte-identical (contract 13.1, §8b.2)",
             true,
         ),
         cap(
             "reference-chip",
-            "Notion @mention / link-to-page chips render inline and resolve",
+            "Page mentions and links render inline and resolve",
             "the reference-chip overlay (glyph + label + colour, never colour alone) at ≥ 4.5:1 contrast",
             true,
         ),
         cap(
             "embedded-database",
-            "Notion inline database (a live table/board embedded in a page)",
+            "A live table or board can be embedded in a page",
             "the /database embed resolves the live db_view organism inline (the flexible-database surface)",
             true,
         ),
         cap(
             "per-viewer-backlink-correct",
-            "Notion: a backlink to a private page can leak the page title to a viewer without access",
+            "A backlink to a private page never leaks its title",
             "the backlink/embed resolves a confidential linked doc to a TOMBSTONE - the title never leaks",
             true,
         ),
@@ -167,8 +167,7 @@ pub fn switch_surface_drive_record() -> Vec<SwitchSurfaceDrive> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the Knowledge switch-test verdict must be checked - a dropped RED means a migrating Notion \
-              user hits a wall the old tool didn't have, silently (EI-01 §4: actually try the real thing)"]
+#[must_use = "the knowledge experience verdict must be checked"]
 pub enum KnowledgeSwitchVerdict {
     Pass {
         reached: usize,

@@ -28,7 +28,7 @@ fn the_switch_test_passes_driven_over_the_real_surface() {
     );
     assert!(
         verdict.walls().is_empty(),
-        "0 walls vs the GitHub anchor: {:?}",
+        "the pull-request workflow must have no blocked experience requirements: {:?}",
         verdict.walls()
     );
     assert_eq!(
@@ -152,7 +152,7 @@ fn switch_test_spine_end_to_end() {
 
     println!(
         "[P-518 SWITCH-TEST GREEN {RUN_DATE}] the Git OQ-12 switch test driven over the real surface: 0 \
-         walls vs the GitHub anchor, render(parse(md)) === md at 100%, every status overlay at ≥ 4.5:1 \
+         workflow walls, render(parse(md)) === md at 100%, every status overlay at ≥ 4.5:1 \
          contrast, the PR overview render within budget; browser-driven=no (automated render; the git \
          web tier - the WASM editor + the <svg> icon binding - is the honest named floor)"
     );

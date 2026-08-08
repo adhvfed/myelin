@@ -28,7 +28,7 @@ fn the_switch_test_passes_driven_over_the_real_surface() {
     );
     assert!(
         verdict.walls().is_empty(),
-        "0 walls vs the Notion anchor: {:?}",
+        "the knowledge workflow must have no blocked experience requirements: {:?}",
         verdict.walls()
     );
     assert_eq!(

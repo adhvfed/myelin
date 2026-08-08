@@ -185,7 +185,7 @@ mod tests {
         let policy = PolicyDouble::new();
         let mut gate = MirrorGate::new();
 
-        let target = MirrorTarget::new("github.com", Region::new("us-east"));
+        let target = MirrorTarget::new("mirror.example", Region::new("us-east"));
         let decision =
             gate.mirror_allowed(&reg, &TenantId::from_token("01J0ACME"), &target, &policy);
 
@@ -212,7 +212,7 @@ mod tests {
         let reg = registry_with("01J0ACME", "fr-par", "cell-w-1");
         let policy = PolicyDouble::new();
         let mut gate = MirrorGate::new();
-        let target = MirrorTarget::new("github.com", Region::new("us-east"));
+        let target = MirrorTarget::new("mirror.example", Region::new("us-east"));
 
         assert!(
             !gate

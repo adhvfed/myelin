@@ -116,43 +116,43 @@ pub fn switch_capability_matrix() -> Vec<SwitchCapability> {
     vec![
         cap(
             "create",
-            "Jira/Linear: create an issue with a title + a rich body, keyboard-first",
+            "Create an issue with a title and rich body using the keyboard",
             "the create form → an issue with a markdown-subset body that round-trips (contract 13.1)",
             true,
         ),
         cap(
             "triage",
-            "Jira/Linear: triage (assign / label / priority / state) from the issue / triage view (S9)",
+            "Triage assignment, labels, priority, and state from the issue view",
             "the triage view + the workflow FSM transition (guarded by a QueryAst + CheckStatus guard)",
             true,
         ),
         cap(
             "plan",
-            "Jira/Linear: plan an issue onto a cycle/sprint + a roadmap timeline (S5/S8)",
+            "Plan an issue onto a cycle and roadmap timeline",
             "the roadmap (a timeline ViewSpec) + the cycle view - co-equal projections over the one table",
             true,
         ),
         cap(
             "board",
-            "Jira/Linear: work the board - drag-to-rank, j/k keyboard moves, real-time sync (S3)",
+            "Work the board with drag-to-rank, keyboard moves, and live synchronization",
             "the board view (a ViewSpec over the one table) + the LexoRank CAS reorder + real-time sync",
             true,
         ),
         cap(
             "done",
-            "Jira/Linear: close an issue; the close patches every co-equal view live",
+            "Closing an issue updates every active view",
             "the workflow FSM close → the board + roadmap + My-Work patch live (one issue table, ISS-D1)",
             true,
         ),
         cap(
             "markdown-wysiwyg-stable",
-            "Jira/Linear editor: what you type is what is stored is what renders (no silent rewrite)",
+            "Issue descriptions round-trip without a silent rewrite",
             "roundtrips_md → render(parse(md)) === md byte-identical (contract 13.1 / ISS-D10, ONE WASM path)",
             true,
         ),
         cap(
             "per-viewer-board-correct",
-            "Jira/Linear: a confidential issue can leak its title/count into a board/search/My-Work view",
+            "A confidential issue never leaks its title or count into shared views",
             "the SetExpr pre-filter conjoined into every tier - a confidential issue tombstones, 0 leak",
             true,
         ),
@@ -219,8 +219,7 @@ pub fn switch_surface_drive_record() -> Vec<SwitchSurfaceDrive> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the Issues switch-test verdict must be checked - a dropped RED means a migrating Jira/Linear \
-              user hits a wall the old tool didn't have, silently (EI-01 §4: actually try the real thing)"]
+#[must_use = "the issues experience verdict must be checked"]
 pub enum IssuesSwitchVerdict {
     Pass {
         reached: usize,

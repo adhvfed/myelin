@@ -68,7 +68,7 @@ fn cdc_c6_storage_flag_and_control_plane_gate_agree_on_an_extra_eu_crossing() {
         .source_is_content_addressed_and_encrypted(b"PACK\0mirror-source")
         .expect("mirror-source blobs are content-addressed + encrypted");
 
-    let storage_target = PushMirrorTarget::new("github.com", Region::new("us-east"));
+    let storage_target = PushMirrorTarget::new("mirror.example", Region::new("us-east"));
     let telemetry = MirrorTelemetry::new();
     let flagged = mirror.flag_target(&storage_target, &telemetry);
     assert!(flagged, "Storage FLAGS the extra-EU crossing");
@@ -111,7 +111,7 @@ fn cdc_c6_storage_flag_and_control_plane_gate_agree_on_an_extra_eu_crossing() {
 
     println!(
         "[P-255 CDC 10.5/12.4 C6 GREEN 2026-06-21] Storage FLAGS an extra-EU mirror crossing \
-         (github.com @ us-east) into residency_verify (PushMirror @ us-east → attestation FAILS) + \
+         (mirror.example @ us-east) into residency_verify (PushMirror @ us-east → attestation FAILS) + \
          mirror_residency_deny=1; the control-plane mirror_allowed GATE DENIES the SAME crossing by \
          default → 0 PII to an ungated extra-EU mirror. Storage flags, the control plane gates - the \
          two halves agree on the crossing."

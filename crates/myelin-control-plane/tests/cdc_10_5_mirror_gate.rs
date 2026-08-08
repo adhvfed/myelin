@@ -78,7 +78,7 @@ fn cdc_10_5_mirror_gate_git_feature_honours_deny_by_default() {
     let mut feature = GitMirrorFeature::new();
     let acme = TenantId::from_token("01J0ACME");
 
-    let extra_eu = MirrorTarget::new("github.com", Region::new("us-east"));
+    let extra_eu = MirrorTarget::new("mirror.example", Region::new("us-east"));
     let denied = feature.try_mirror_push(&mut mirror_gate, &reg, &acme, &extra_eu, &policy);
     assert!(
         !denied.is_allowed(),

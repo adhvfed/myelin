@@ -145,37 +145,37 @@ pub fn switch_capability_matrix() -> Vec<SwitchCapability> {
     vec![
         cap(
             "jump-test-to-code",
-            "GitHub: open the failing check, click into the file/line by hand",
+            "Open a failing check and jump directly to its file and line",
             "resolve(ci/check) → the #L-range sub-anchor on the blob root (one keystroke)",
             true,
         ),
         cap(
             "jump-code-to-issue",
-            "copy the PR link, switch to Jira/Linear, paste, search",
+            "Follow a change link directly to the related issue",
             "resolve(git/blob) → the linked issue unfurls live (one keystroke, per-viewer)",
             true,
         ),
         cap(
             "jump-issue-to-conversation",
-            "copy the issue key, switch to Slack, search the channel",
+            "Follow an issue reference directly to the related conversation",
             "resolve(issue) → the chat thread unfurls live (one keystroke, per-viewer)",
             true,
         ),
         cap(
             "jump-to-spec-doc",
-            "switch to Notion, find the spec page by title search",
+            "Open the referenced knowledge page without a separate title search",
             "resolve(chat/thread) → the Knowledge doc unfurls live (one keystroke)",
             true,
         ),
         cap(
             "backlinks-referenced-by",
-            "no cross-tool \"what references this\" - GitHub/Jira/Notion each silo their own links",
+            "Show every artifact that references the current item",
             "backlinks(target, viewer) - the permission-filtered referenced-by read across subsystems",
             true,
         ),
         cap(
             "per-viewer-correct",
-            "Jira/Notion share links by URL; a denied target 404s with the title still in the preview",
+            "A denied target renders a tombstone without leaking its title in a preview",
             "the resolve chokepoint gates per-viewer; a denied target TOMBSTONES (root-only, 0 leak)",
             true,
         ),

@@ -224,8 +224,7 @@ impl BrowserDriveStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[must_use = "the Chat switch-test verdict must be checked - a dropped RED means a migrating Slack user \
-              hits a wall the old tool didn't have, silently (EI-01 §4: actually try the real thing)"]
+#[must_use = "the chat experience verdict must be checked"]
 pub enum ChatSwitchVerdict {
     Pass {
         screens_reached: usize,

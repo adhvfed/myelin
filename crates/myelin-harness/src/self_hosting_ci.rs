@@ -227,7 +227,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
         SelfHostJob {
             id: "CI-P35-self_tenant",
             title: "the CI switch test (driven against the real `myelin ci` run/log/deploy surface vs \
-                    the GitHub Actions anchor, measured) + the CI truth-up pass (0 red earlier CI gate)",
+                    the interactive budget) + the CI consistency pass",
             kind: JobKind::Drill,
             tool: JobTool::Cargo,
             argv: &[
@@ -365,7 +365,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
             id: "GIT-P35-switch-test",
             title: "the Git OQ-12 switch test driven over the real surface - the PR overview render \
                     within budget + render(parse(md)) === md at 100% + every status overlay at ≥ 4.5:1 \
-                    contrast (0 walls vs the GitHub anchor)",
+                    contrast with no blocked workflow requirements",
             kind: JobKind::Drill,
             tool: JobTool::Cargo,
             argv: &[
@@ -397,7 +397,7 @@ pub fn self_hosting_jobs() -> Vec<SelfHostJob> {
             title: "the Issues ISS-D14 switch test driven over the real surface - the \
                     create→triage→plan→board→done loop without a manual + the canonical view render \
                     within budget + render(parse(md)) === md at 100% + every overlay at ≥ 4.5:1 contrast \
-                    + every primary-screen state reached (0 walls vs the Jira/Linear anchor)",
+                    + every primary-screen state reached",
             kind: JobKind::Drill,
             tool: JobTool::Cargo,
             argv: &[
