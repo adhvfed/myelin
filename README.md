@@ -26,6 +26,19 @@ and agents in one platform, built in Rust.
 Runtime dependencies: Postgres 16, NATS 2.10 (JetStream), Valkey 8, and an
 S3-compatible object store.
 
+## Development
+
+Install `fed`, then start the local data services:
+
+```sh
+fed start
+```
+
+Run tests that use those services with `fed test:backend`. The frontend checks are
+available as `fed test:frontend`, and `fed test:browser-contract` runs the faster
+browser suite against its contract backend. The project is moving toward running the
+Rust edge and web application in the default `fed start` composition.
+
 ## Status
 
 Pre-release and under heavy development. Interfaces, schemas, and deployment

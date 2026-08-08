@@ -1,43 +1,41 @@
 #!/usr/bin/env bash
-# Myelin dev data-layer stack helper (Stage 1).
+# Myelin local data-layer helper.
 #
 #   ./scripts/dev-stack.sh up      bring the stack up and block until all healthchecks pass
 #   ./scripts/dev-stack.sh down    stop and remove the stack (keeps named volumes)
 #   ./scripts/dev-stack.sh nuke    stop and remove the stack AND its volumes (data loss)
-#   ./scripts/dev-stack.sh wait    re-run the health gate (up --wait) without recreating
+#   ./scripts/dev-stack.sh wait    ensure every dependency is running and healthy
 #   ./scripts/dev-stack.sh ps      show service health
 #   ./scripts/dev-stack.sh logs    follow service logs (optionally a service name arg)
 #   ./scripts/dev-stack.sh env     print the dev env-var contract (eval-able)
 #
-# Stack: postgres:16 + rustfs + valkey:8 + nats:2.10 (JetStream). See docs/dev-stack.md.
+# `fed start` is the canonical interface; this wrapper remains for existing operator habits.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-COMPOSE_FILE="${REPO_ROOT}/docker-compose.dev.yml"
-COMPOSE=(docker compose -f "${COMPOSE_FILE}")
+cd "${REPO_ROOT}"
 
 cmd="${1:-up}"; shift || true
 
 case "${cmd}" in
   up)
-    "${COMPOSE[@]}" up -d --wait
-    "${COMPOSE[@]}" ps
+    fed start
     ;;
   wait)
-    "${COMPOSE[@]}" up -d --wait --no-recreate
-    "${COMPOSE[@]}" ps
+    fed start
     ;;
   down)
-    "${COMPOSE[@]}" down
+    fed stop
     ;;
   nuke)
-    "${COMPOSE[@]}" down -v
+    fed stop
+    fed clean
     ;;
   ps)
-    "${COMPOSE[@]}" ps
+    fed status
     ;;
   logs)
-    "${COMPOSE[@]}" logs -f "$@"
+    fed logs "$@"
     ;;
   env)
     cat <<'EOF'

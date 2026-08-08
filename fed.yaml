@@ -1,0 +1,112 @@
+parameters:
+  POSTGRES_PORT: { type: port, default: 5433 }
+  S3_PORT: { type: port, default: 9000 }
+  VALKEY_PORT: { type: port, default: 6380 }
+  NATS_PORT: { type: port, default: 4222 }
+  NATS_MONITOR_PORT: { type: port, default: 8222 }
+
+services:
+  postgres:
+    image: postgres:16@sha256:78df81b1442dcc764c1104154da7162635e40cfffe67579c42a1c1b96dfc209c
+    ports: ["{{POSTGRES_PORT}}:5432"]
+    volumes:
+      - fed-myelin-pg-data:/var/lib/postgresql/data
+      - ./scripts/pg-init:/docker-entrypoint-initdb.d:ro
+    environment:
+      POSTGRES_USER: myelin_admin
+      POSTGRES_PASSWORD: myelin_dev_pw
+      POSTGRES_DB: myelin
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    healthcheck:
+      command: pg_isready -U myelin_admin -d myelin
+      timeout: 30s
+    startup_message: "Postgres: localhost:{{POSTGRES_PORT}}"
+
+  object-store:
+    image: rustfs/rustfs@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3
+    command: ["/data"]
+    ports: ["{{S3_PORT}}:9000"]
+    volumes:
+      - fed-myelin-rustfs-data:/data
+    environment:
+      RUSTFS_ACCESS_KEY: myelin_dev_access
+      RUSTFS_SECRET_KEY: myelin_dev_secret
+      RUSTFS_CONSOLE_ENABLE: "true"
+    healthcheck:
+      command: curl -fsS http://localhost:9000/health
+      timeout: 30s
+    startup_message: "Object storage: http://localhost:{{S3_PORT}}"
+
+  object-store-ready:
+    depends_on: [object-store]
+    migrate: >-
+      docker run --rm --network host
+      -e AWS_ACCESS_KEY_ID=myelin_dev_access
+      -e AWS_SECRET_ACCESS_KEY=myelin_dev_secret
+      -e AWS_DEFAULT_REGION=fr-par
+      amazon/aws-cli@sha256:14b197d682f59240b51c3953a3a47b19288dbbb25c2e237fc6eb2d70e8fca227
+      --endpoint-url http://127.0.0.1:{{S3_PORT}}
+      s3api create-bucket --bucket myelin-dev
+      2>/dev/null ||
+      docker run --rm --network host
+      -e AWS_ACCESS_KEY_ID=myelin_dev_access
+      -e AWS_SECRET_ACCESS_KEY=myelin_dev_secret
+      -e AWS_DEFAULT_REGION=fr-par
+      amazon/aws-cli@sha256:14b197d682f59240b51c3953a3a47b19288dbbb25c2e237fc6eb2d70e8fca227
+      --endpoint-url http://127.0.0.1:{{S3_PORT}}
+      s3api head-bucket --bucket myelin-dev
+
+  valkey:
+    image: valkey/valkey:8@sha256:c6d4637d757379a2ff040148b95c85936d85a06c129eafa5fbe582f9e720e12f
+    command: ["valkey-server", "--appendonly", "yes"]
+    ports: ["{{VALKEY_PORT}}:6379"]
+    volumes:
+      - fed-myelin-valkey-data:/data
+    healthcheck:
+      command: valkey-cli ping
+      timeout: 30s
+    startup_message: "Valkey: localhost:{{VALKEY_PORT}}"
+
+  nats:
+    image: nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "{{NATS_PORT}}:4222"
+      - "{{NATS_MONITOR_PORT}}:8222"
+    volumes:
+      - fed-myelin-nats-data:/data
+    healthcheck:
+      command: wget -q -O- http://localhost:8222/healthz
+      timeout: 30s
+    startup_message: "NATS: localhost:{{NATS_PORT}}"
+
+  data-layer:
+    depends_on: [postgres, object-store-ready, valkey, nats]
+    migrate: ":"
+    startup_message: "Myelin data services are ready"
+
+entrypoint: data-layer
+
+scripts:
+  test:backend:
+    depends_on: [data-layer]
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_CI_SCHEDULER_DATABASE_URL: "postgres://myelin_ci_scheduler_fr_par:myelin_ci_scheduler_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      MYELIN_OUTBOX_PUBLISHER_DATABASE_URL: "postgres://myelin_outbox_publisher_fr_par:myelin_outbox_publisher_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+    script: cargo test --workspace --features integration -- "$@"
+
+  test:frontend:
+    script: pnpm --dir frontend check
+
+  test:browser-contract:
+    script: pnpm --dir frontend test:e2e -- "$@"
