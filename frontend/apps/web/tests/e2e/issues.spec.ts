@@ -68,8 +68,8 @@ async function expectNoAxeViolations(page: Page, context: string) {
 test.beforeEach(async () => setEdgeConfig({ resetIssues: true }));
 test.afterEach(async () => setEdgeConfig({ resetIssues: true }));
 
-test.describe("R4.4 founder Issues web floor", () => {
-  test("unauthenticated issue detail preserves the 401 to login floor", async ({ page }) => {
+test.describe("issue workflows", () => {
+  test("unauthenticated issue detail redirects to login", async ({ page }) => {
     await page.goto(`/issues/${OPEN_ID}`);
     await page.waitForURL("**/login");
     await expect(page.getByTestId("dev-login")).toBeVisible();
@@ -79,7 +79,7 @@ test.describe("R4.4 founder Issues web floor", () => {
     await devLogin(page);
     await gotoInteractive(page, "/issues");
     await expect(page.getByRole("heading", { level: 1, name: "Issues" })).toBeVisible();
-    await expect(page.getByText("Close the founder feedback loop")).toBeVisible();
+    await expect(page.getByText("Close the collaboration feedback loop")).toBeVisible();
     await expect(page.getByTitle("State: Todo").first()).toBeVisible();
     await expectNoAxeViolations(page, "Issues list");
 
@@ -92,7 +92,7 @@ test.describe("R4.4 founder Issues web floor", () => {
 
     await page.getByRole("tab", { name: "Closed" }).click();
     await page.waitForURL("**/issues?state=closed");
-    await expect(page.getByText("Retire the ledger workaround")).toBeVisible();
+    await expect(page.getByText("Consolidate issue navigation")).toBeVisible();
     await expect(page.getByTestId("issue-row").first()).toHaveAttribute("tabindex", "0");
 
     await page.getByLabel("Find by issue key").fill("myl-101");
@@ -103,7 +103,7 @@ test.describe("R4.4 founder Issues web floor", () => {
     await page.getByRole("tab", { name: "All" }).click();
     await page.waitForURL("**/issues?state=all&key=MYL-101");
     await expect(page.getByText("Verify encrypted issue titles")).toBeVisible();
-    await expect(page.getByText("Close the founder feedback loop")).toHaveCount(0);
+    await expect(page.getByText("Close the collaboration feedback loop")).toHaveCount(0);
   });
 
   test("opaque load-more appends the final authorized row without totals", async ({ page }) => {
@@ -134,7 +134,7 @@ test.describe("R4.4 founder Issues web floor", () => {
     await expect(page.getByTestId("issue-row")).toHaveCount(50);
 
     await expect(page.getByTestId("issue-row")).toHaveCount(51);
-    await expect(page.getByText("Retire the ledger workaround")).toBeVisible();
+    await expect(page.getByText("Consolidate issue navigation")).toBeVisible();
     await expect(page.getByTitle("State: Done")).toHaveCount(51);
     await expect(page.getByTitle("State: Todo")).toHaveCount(0);
   });
@@ -223,7 +223,7 @@ test.describe("R4.4 founder Issues web floor", () => {
     await expect(page.getByTestId("pending-issue")).not.toContainText("safely pending");
   });
 
-  test("ambiguous create and close failures tell the founder to check before retrying", async ({ page }) => {
+  test("ambiguous create and close failures tell the user to check before retrying", async ({ page }) => {
     await setEdgeConfig({ issueCreateUnavailable: true });
     await devLogin(page);
     await gotoInteractive(page, "/issues");
@@ -248,7 +248,7 @@ test.describe("R4.4 founder Issues web floor", () => {
   test("detail closes only after a safe-focus confirmation", async ({ page }) => {
     await devLogin(page);
     await gotoInteractive(page, `/issues/${OPEN_ID}`);
-    await expect(page.getByRole("heading", { name: "Close the founder feedback loop" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Close the collaboration feedback loop" })).toBeVisible();
     await expectNoAxeViolations(page, "Issue detail");
     await page.getByRole("button", { name: "Close issue" }).click();
     const dialog = page.getByRole("alertdialog");
@@ -282,7 +282,7 @@ test.describe("R4.4 founder Issues web floor", () => {
     await expect(page.getByText("No issues yet")).toHaveCount(0);
 
     await page.getByRole("tab", { name: "Closed" }).click();
-    await expect(page.getByText("Retire the ledger workaround")).toBeVisible();
+    await expect(page.getByText("Consolidate issue navigation")).toBeVisible();
   });
 
   test("375px layout retains key, title, state, and actions without horizontal overflow", async ({ page }) => {
@@ -290,7 +290,7 @@ test.describe("R4.4 founder Issues web floor", () => {
     await devLogin(page);
     await gotoInteractive(page, "/issues");
     await expect(page.getByText("MYL-102", { exact: true })).toBeVisible();
-    await expect(page.getByText("Close the founder feedback loop")).toBeVisible();
+    await expect(page.getByText("Close the collaboration feedback loop")).toBeVisible();
     await expect(page.getByTitle("State: Todo").first()).toBeVisible();
     await expect(page.getByRole("button", { name: "New issue" })).toBeVisible();
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);

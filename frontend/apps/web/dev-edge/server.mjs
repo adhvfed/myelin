@@ -573,8 +573,8 @@ const server = createServer((req, res) => {
       : send(res, 404, notFoundEnvelope("CI run"));
   }
 
-  // R4.4 Issues writes. The create body is contract-checked against the one server-injected dogfood
-  // target; the dev edge never accepts browser-selected scope IDs either.
+  // The create body is checked against the server-injected default project. Browser-selected scope
+  // identifiers are never accepted.
   let im;
   if (method === "POST" && path === "/v1/issues") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());

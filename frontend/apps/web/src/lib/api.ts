@@ -29,6 +29,7 @@ import { parseRepoListPage } from "./repo-list-response";
 import { parseCommitDiff, parseCommitsPage, parsePrCommitsPage } from "./commit-read-response";
 import { parsePr, parsePrDiff, parsePrListPage } from "./pr-read-response";
 import { parseIssueId, parseIssueListInput } from "./issue-read-input";
+import { issueTargetFromEnv } from "./issue-target";
 import { parseInboxPage, type InboxPage } from "./inbox-response";
 import {
   parseGitBrowseInput,
@@ -457,9 +458,8 @@ export interface PrListPage {
   counts: Record<string, number>;
 }
 
-// ── Founder Issues floor (R4.4). The v1 surface intentionally exposes only one canonical
-// dogfood target for creation; project/type/prefix are injected by the server action and never
-// accepted from browser code. Lists are authoritative key-prefix searches, not title search. ──
+// Issue creation uses a deployment-configured default project. Scope identifiers are injected by
+// the server action and never accepted from browser code.
 
 export type IssueListState = "open" | "closed" | "all";
 export type IssueStateCategory = "unstarted" | "started" | "completed" | "cancelled";
@@ -1018,29 +1018,6 @@ export type IssueMutationResult =
 
 export const ISSUE_ACTIVATION_STATUS_TIMEOUT_MS = 10_000;
 
-function isCanonicalUuid(value: string | undefined): value is string {
-  return Boolean(
-    value &&
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value),
-  );
-}
-
-/** Read and validate the one founder target. Invalid deployment config stays opaque to the client. */
-function dogfoodIssueTarget(): { project_id: string; type_id: string; prefix: string } {
-  const project = process.env.MYELIN_DOGFOOD_ISSUES_PROJECT;
-  const type = process.env.MYELIN_DOGFOOD_ISSUES_TYPE;
-  const prefix = process.env.MYELIN_DOGFOOD_ISSUES_PREFIX;
-  if (
-    !isCanonicalUuid(project) ||
-    !isCanonicalUuid(type) ||
-    !prefix ||
-    !/^[A-Z0-9]{2,10}$/.test(prefix)
-  ) {
-    throw new IssueRouteError("configuration");
-  }
-  return { project_id: project, type_id: type, prefix };
-}
-
 /** One Issues mutation action: browser inputs can carry a title or an issue UUID, never scope IDs. */
 export const issuesMutate = action(async (mutation: IssueMutation) => {
   "use server";
@@ -1049,7 +1026,8 @@ export const issuesMutate = action(async (mutation: IssueMutation) => {
     const parsed = parseIssueMutation(mutation);
     if (!parsed) return result({ ok: false, error: "bad-input" });
     if (parsed.op === "create") {
-      const target = dogfoodIssueTarget();
+      const target = issueTargetFromEnv(process.env);
+      if (!target) throw new IssueRouteError("configuration");
       const receipt = await issueAuthed(async () => {
         const response = await edgePost("/v1/issues", { ...target, title: parsed.title });
         const decoded = parseIssueCreateReceipt(response);

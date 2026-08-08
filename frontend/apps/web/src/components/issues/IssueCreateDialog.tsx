@@ -82,7 +82,7 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
       open={props.open}
       onClose={close}
       title="New issue"
-      description="Capture work in the canonical Myelin dogfood project. Access activates safely after acceptance."
+      description="Capture work in this deployment's default project. Access activates safely after acceptance."
       size="md"
       dismissable={!submitting()}
       initialFocus={() => titleInput}

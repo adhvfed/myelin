@@ -496,8 +496,7 @@ button {
   overflow-wrap: anywhere;
 }
 
-/* Founder Issues floor: compact capture + list/detail. Layout classes live here so responsive
-   behavior is possible without smuggling viewport assumptions into inline component styles. */
+/* Shared issue list/detail layout, including responsive behavior. */
 .issues-screen,
 .issue-detail {
   width: min(100%, 72rem);

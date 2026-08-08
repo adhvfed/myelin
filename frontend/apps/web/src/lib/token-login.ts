@@ -1,8 +1,4 @@
-// R4.0 — the pure decision behind the OPERATOR-TOKEN login (the browser on-ramp for dogfood: the
-// founder pastes the capability token `edge bootstrap` printed; the frontend VERIFIES it against the
-// real edge and mints a session). Kept dependency-free (no "use server", no session/cookie/fetch
-// imports) so it is unit-testable in node in isolation — exactly like `gateway-core.ts` and
-// `dev-login-guard.ts`. `auth.ts` wires the real whoami-verify + session-issue deps onto it.
+// Dependency-free token login decision. auth.ts supplies verification and session persistence.
 //
 // THE TOKEN IS A SECRET. It is only ever the caller-supplied value flowing through these deps
 // server-side; it is never logged, never returned to the client, never put in a query string.
@@ -45,8 +41,7 @@ export interface TokenLoginResult {
   redirectTo: string;
 }
 
-/** On any failure the founder is bounced back with a DISTINCT, honest error param (blames the token /
- *  the bootstrap step, never the user) — never the raw edge error, never the token. */
+/** Authentication failures return a stable error state without exposing the token or edge detail. */
 export const TOKEN_LOGIN_ERROR = "/login?error=token_invalid";
 /** A disabled or unavailable auth mode returns to the login chooser without exposing edge detail. */
 export const TOKEN_LOGIN_DISABLED = "/login";
@@ -85,8 +80,7 @@ export function deriveDisplayName(principalId: string): string {
  * 3. `verify` REJECTS (invalid/expired token or edge unreachable) → the honest error; NO session. The
  *    raw edge error is swallowed here so it can never leak to the client.
  * 4. `verify` resolves but the whoami shape is missing a principal id → the honest error; NO session.
- * 5. Otherwise mint the session (with an EMPTY refresh token — a pasted bootstrap token has none; it
- *    simply expires and the founder re-pastes, see `auth.ts`) and land in the app.
+ * 5. Otherwise mint the session. Pasted tokens have no refresh credential and expire normally.
  */
 export async function runTokenLogin(
   rawToken: string,
@@ -119,7 +113,7 @@ export async function runTokenLogin(
   try {
     who = await deps.verify(token, scheme);
   } catch {
-    // Swallow the raw edge error — the founder sees only the honest, system-blaming error copy.
+    // Raw edge errors must not reach the browser.
     return { redirectTo: TOKEN_LOGIN_ERROR };
   }
 
@@ -137,9 +131,7 @@ export async function runTokenLogin(
 
   await deps.issue({
     token,
-    // A pasted operator/bootstrap token has NO refresh credential. Empty is correct + tolerated: on a
-    // future 401 the refresh round-trip Bearers this empty string, the edge answers 401, and the
-    // gateway clears the session → /login. The founder simply re-pastes a fresh bootstrap token.
+    // Pasted tokens have no refresh credential. A later 401 clears the session and returns to login.
     refreshToken: "",
     scheme,
     credentialExpiresAtMs: who.expires_at * 1_000,

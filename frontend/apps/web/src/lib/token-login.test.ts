@@ -11,7 +11,7 @@ import {
 } from "./token-login";
 
 const whoami = (over: Partial<TokenWhoami> = {}): TokenWhoami => ({
-  principal_id: "u_founder",
+  principal_id: "u_operator",
   tenant: "acme",
   region: "eu-west",
   kind: "human",
@@ -19,7 +19,7 @@ const whoami = (over: Partial<TokenWhoami> = {}): TokenWhoami => ({
   ...over,
 });
 
-describe("runTokenLogin (R4.0 — the operator-token login decision)", () => {
+describe("runTokenLogin", () => {
   it("on a valid token (whoami 200): issues a session with the whoami facts + redirects into the app", async () => {
     const issue = vi.fn<(rec: TokenSessionInput) => void>();
     const verify = vi.fn(async () => whoami());
@@ -37,9 +37,9 @@ describe("runTokenLogin (R4.0 — the operator-token login decision)", () => {
       refreshToken: "",
       scheme: DEFAULT_TOKEN_SCHEME,
       credentialExpiresAtMs: 4_102_444_800_000,
-      principalId: "u_founder",
+      principalId: "u_operator",
       // No human name in whoami → the PII-free principal id IS the honest display label.
-      displayName: "u_founder",
+      displayName: "u_operator",
       region: "eu-west",
       tenant: "acme",
     });

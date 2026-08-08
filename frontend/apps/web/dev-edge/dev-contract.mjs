@@ -1268,9 +1268,8 @@ export function myPrsEnvelope(bucket = "needs-review", limit = 50) {
   };
 }
 
-// ── R4.4 founder Issues fixtures ────────────────────────────────────────────────────────────────
-// Deterministic durable ViewModel shapes. Titles are display fixtures only; `key` is the one
-// authoritative search field. Extra open rows make the web's real 50-row load-more path exercisable.
+// Deterministic issue fixtures. Titles are display data; `key` is the searchable field. Extra rows
+// exercise pagination.
 export const DEV_ISSUE_TARGET = {
   project_id: "20aee030-c7fa-4757-8243-700faf528690",
   type_id: "7d457754-f6a1-4cd8-8738-21751570b627",
@@ -1285,7 +1284,7 @@ const headlineIssues = [
     project_id: DEV_ISSUE_TARGET.project_id,
     state: "Todo",
     state_category: "unstarted",
-    title: "Close the founder feedback loop",
+    title: "Close the collaboration feedback loop",
     version: 1,
     created_at: "2026-07-19T11:00:00.000Z",
     updated_at: "2026-07-19T12:00:00.000Z",
@@ -1307,7 +1306,7 @@ const headlineIssues = [
     project_id: DEV_ISSUE_TARGET.project_id,
     state: "Done",
     state_category: "completed",
-    title: "Retire the ledger workaround",
+    title: "Consolidate issue navigation",
     version: 2,
     created_at: "2026-07-17T08:00:00.000Z",
     updated_at: "2026-07-18T10:00:00.000Z",
@@ -1323,7 +1322,7 @@ const pagedOpenIssues = Array.from({ length: 49 }, (_, index) => {
     project_id: DEV_ISSUE_TARGET.project_id,
     state: "Todo",
     state_category: "unstarted",
-    title: `Dogfood finding ${number}`,
+    title: `Tracked issue ${number}`,
     version: 1,
     created_at: instant,
     updated_at: instant,
@@ -1341,7 +1340,7 @@ const pagedClosedIssues = Array.from({ length: 50 }, (_, index) => {
     project_id: DEV_ISSUE_TARGET.project_id,
     state: "Done",
     state_category: "completed",
-    title: `Closed dogfood finding ${number}`,
+    title: `Completed issue ${number}`,
     version: 2,
     created_at: instant,
     updated_at: instant,

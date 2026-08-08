@@ -297,7 +297,7 @@ export default function IssuesIndex() {
       <Title>Issues · Myelin</Title>
       <header class="issues-heading-row">
         <div>
-          <p class="issues-eyebrow">Myelin dogfood</p>
+          <p class="issues-eyebrow">Plan and track work</p>
           <h1 id="issues-heading"><Icon name="issue" /> Issues</h1>
         </div>
         <button

@@ -148,17 +148,10 @@ export const getAuthConfig = query(async (): Promise<AuthConfig> => {
 }, "auth-config");
 
 /**
- * **R4.0 — THE OPERATOR-TOKEN LOGIN (the real browser on-ramp for dogfood).** The founder pastes the
- * capability token that `edge bootstrap` printed; this action VERIFIES it server-side against the real
- * edge (`GET /v1/whoami` with the pasted token) and, on a 200, mints a session carrying the token +
- * the whoami-returned principal/tenant/region — then lands in the app. Unlike the dev seam this is NOT
- * a stand-in: it authenticates against the live edge. The token is a SECRET — it flows only as the
- * submitted form value → this server function → the edge; it is never logged, never returned to the
- * client, never placed in a URL. On any failure (invalid/expired token, edge unreachable) the founder
- * is bounced to `/login?error=token_invalid` with NO session and NO leaked edge detail. The decision
- * lives in the pure {@link runTokenLogin} core; this wires the real auth-mode check + whoami-verify +
- * session-issue deps. The mode is re-read here, not trusted from the page render: a caller may invoke
- * a registered server action directly even when its form is hidden.
+ * Verify a pasted capability token against the edge, then issue a server-side session carrying the
+ * returned principal, tenant, and region. The token is never logged, returned to the client, or put
+ * in a URL. The auth mode is checked again here because actions can be invoked without rendering the
+ * login form first.
  */
 export const loginWithToken = action(async (formData: FormData) => {
   "use server";
