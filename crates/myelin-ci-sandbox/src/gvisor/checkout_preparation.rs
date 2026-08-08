@@ -993,7 +993,7 @@ mod tests {
     use crate::user_namespace::UserNamespaceAllocator;
     #[cfg(feature = "test-support")]
     use std::os::unix::fs::MetadataExt;
-    #[cfg(feature = "test-support")]
+    #[cfg(any(feature = "test-support", feature = "integration"))]
     use std::path::PathBuf;
 
     use crate::user_namespace::CheckoutSessionCleanup;
@@ -1123,7 +1123,11 @@ mod tests {
 
     mod checkout_preparation_5b2 {
         use super::*;
+        #[cfg(feature = "integration")]
+        use crate::gvisor::checkout_transport::fetch_checkout_pack;
         use crate::gvisor::checkout_transport_test_support::sha1_oid;
+        #[cfg(feature = "integration")]
+        use crate::{IdemToken, MeterTarget};
 
         #[test]
         fn expected_git_commit_id_accepts_a_valid_sha1_oid() {
