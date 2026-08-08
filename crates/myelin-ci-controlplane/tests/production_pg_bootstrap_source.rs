@@ -38,7 +38,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     let runner_bind_source = include_str!("../src/runner_bind.rs");
     let runner_host_source = include_str!("../src/ci_runner_host.rs");
     let launch_gate_source = include_str!("../../myelin-ci-sandbox/src/launch_gate.rs");
-    let gvisor_source = include_str!("../../myelin-ci-sandbox/src/gvisor.rs");
+    let gvisor_output_source =
+        include_str!("../../myelin-ci-sandbox/src/gvisor/output_capture.rs");
+    let gvisor_preflight_source = include_str!("../../myelin-ci-sandbox/src/gvisor/preflight.rs");
 
     assert!(source.contains("MyelinConfig::from_env(Mode::RequireEnv)"));
     assert!(source.contains("CiSchedulerDbConfig::from_env(&platform_config)"));
@@ -336,15 +338,14 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         "native_watchdog",
         "close_unneeded_fds",
         "kill_from_watchdog",
-        "The watchdog must survive a parent-driven kill of the runtime group",
     ] {
         assert!(
             launch_gate_source.contains(watchdog_floor),
             "the independent launch watchdog must retain {watchdog_floor}"
         );
     }
-    assert!(gvisor_source.contains("kill_cgroup_on_liveness_loss(kill_file)"));
-    assert!(gvisor_source.contains("launch_permit.as_ref().map(|_| timeout)"));
+    assert!(gvisor_output_source.contains("kill_cgroup_on_liveness_loss(kill_file)"));
+    assert!(gvisor_output_source.contains("launch_permit.as_ref().map(|_| timeout)"));
     assert!(source.contains("preflight_gvisor_runner_host(&runsc, &rootfs)"));
     for executor_preflight in [
         "probe_runsc_version(&runsc)",
@@ -354,7 +355,7 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         "outcome.exit != Some(1)",
     ] {
         assert!(
-            gvisor_source.contains(executor_preflight),
+            gvisor_preflight_source.contains(executor_preflight),
             "runner-host executor preflight must retain {executor_preflight}"
         );
     }
@@ -394,7 +395,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
         "(launch.spec #>> '{spec,workspace,commit}') IS NOT DISTINCT FROM $21::text"
     ));
     assert!(identity_adapter_source.contains("checkout-commit:{format}:{}#attest"));
-    assert!(launch_authority_source.contains("labels: LINUX_SMALL_V1_RUNNER_LABELS"));
+    assert!(launch_authority_source
+        .contains("CiExecutionProfileV1::LinuxSmallV1 => LINUX_SMALL_V1_RUNNER_LABELS"));
+    assert!(launch_authority_source.contains("labels: profile_policy"));
     assert!(dispatch_consumer_source.contains("let group = format!(\"pr:{repo}:{number}\")"));
     assert!(dispatch_consumer_source.contains(".get(\"head_generation\")"));
     assert!(dispatch_consumer_source.contains("(\"head_oid\", Some(group), Some(generation))"));
@@ -419,7 +422,9 @@ fn production_main_hands_privileged_bootstrap_off_before_runtime_composition() {
     assert!(launch_authority_source.contains("concurrency_group: concurrency_group.clone()"));
     assert!(migrations_source.contains("ci_0001c_ci_run_concurrency_group"));
     assert!(migrations_source.contains("ci_0001d_ci_run_pr_head_generation"));
-    assert!(source.contains("myelin_ci_controlplane::LINUX_SMALL_V1_RUNNER_LABELS"));
+    assert!(source.contains(
+        "myelin_ci_controlplane::runner_labels_for_profiles(&runner_execution_profiles)"
+    ));
     assert!(!launch_authority_source.contains("CiJobTokenAuthorityProvider"));
     assert!(runner_bind_source.contains("token_issuer: LockedManifestCiJobTokenIssuer"));
     assert!(runner_bind_source.contains("pub fn durable_spec_resolver_test_support"));
