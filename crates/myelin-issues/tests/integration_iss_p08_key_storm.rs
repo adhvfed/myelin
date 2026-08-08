@@ -72,7 +72,7 @@ async fn hi_lo_key_storm_zero_dup_monotonic_on_real_postgres() {
         .max_connections(4)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
     let app = sqlx::postgres::PgPoolOptions::new()
         .max_connections(8)
         .connect(&app_url())

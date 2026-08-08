@@ -18,7 +18,7 @@ async fn consumer_dedup_matches_foundation_and_enforces_exactly_once_key() {
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is docker-compose.dev.yml up?)");
+        .expect("connect to dev Postgres as admin (have you run `fed test:backend`?)");
     let table = format!("consumer_dedup_p349_{}", std::process::id());
 
     let create = CREATE_CONSUMER_DEDUP_DDL

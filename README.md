@@ -21,7 +21,7 @@ and agents in one platform, built in Rust.
   `myelin-edge`, `myelin-control-plane`, and friends).
 - `frontend/` — pnpm workspace with the SolidStart web app (`apps/web`).
 - `deploy/` — systemd units.
-- `scripts/` — build, drill, and dev-stack helpers.
+- `scripts/` — development, build, and operational helpers.
 
 Runtime dependencies: Postgres 16, NATS 2.10 (JetStream), Valkey 8, and an
 S3-compatible object store.

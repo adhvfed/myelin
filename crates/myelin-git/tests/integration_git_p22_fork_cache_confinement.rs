@@ -17,7 +17,7 @@ fn tenant(tag: &str) -> TenantId {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fork_cache_confinement_holds_on_real_valkey() {
     let valkey = ValkeyCache::connect(&redis_url(), tokio::runtime::Handle::current())
-        .expect("connect dev Valkey (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect dev Valkey (is the stack up? run `fed test:backend`)");
     let t = tenant("confine");
     let ttl = Duration::from_secs(120);
 

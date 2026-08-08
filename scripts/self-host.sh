@@ -30,7 +30,7 @@
 #   ./scripts/self-host.sh web               print (or, with EXEC=1, run) the frontend start wired to
 #                                          MYELIN_EDGE_URL=http://127.0.0.1:8080
 #
-# The DATA LAYER (Postgres/Valkey/NATS/S3) must be up first — `./scripts/dev-stack.sh up`. This script
+# The Fed stack must be up first (`fed start`). This script
 # reuses that stack's env contract and ADDS the edge-only env (seal key, git root, region, addr).
 #
 # THE SEAL KEY IS THE ROOT OF TRUST. It unseals BOTH the KMS root AND the capability-token cell root.

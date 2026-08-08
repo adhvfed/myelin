@@ -212,7 +212,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     config.region = REGION.into();
     let bootstrap = PgBootstrap::connect(config, 8)
         .await
-        .expect("validate split database roles (is docker-compose.dev.yml up?)");
+        .expect("validate split database roles (have you run `fed test:backend`?)");
     bootstrap.migrate_foundation().await.unwrap();
     bootstrap
         .migrate(&all_durable_migrations(), &HotTables::none())

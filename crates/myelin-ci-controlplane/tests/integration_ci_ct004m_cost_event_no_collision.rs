@@ -51,7 +51,7 @@ async fn pool() -> PgPool {
         })
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? eval \"$(scripts/dev-stack.sh env)\")")
+        .expect("connect to dev Postgres as admin (is the stack up? `fed test:backend`)")
 }
 
 fn uid(name: &str) -> Uuid {

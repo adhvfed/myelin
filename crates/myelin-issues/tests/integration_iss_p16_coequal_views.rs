@@ -18,7 +18,7 @@ async fn iss_d1_board_and_roadmap_are_the_same_row_zero_drift() {
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let issue_tbl = format!("issue_p382_{suffix}");

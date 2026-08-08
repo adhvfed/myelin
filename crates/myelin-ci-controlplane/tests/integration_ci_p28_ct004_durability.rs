@@ -25,7 +25,7 @@ async fn reopen() -> PgPool {
         .max_connections(4)
         .connect(&admin_url())
         .await
-        .expect("reconnect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)")
+        .expect("reconnect to dev Postgres as admin (is the stack up? run `fed test:backend`)")
 }
 
 fn uid(name: &str) -> Uuid {

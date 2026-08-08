@@ -49,7 +49,7 @@ async fn chat_body_per_subject_dek_zero_plaintext_at_rest_in_real_postgres() {
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
     let app = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .connect(&app_url())

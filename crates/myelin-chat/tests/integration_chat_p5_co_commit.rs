@@ -56,7 +56,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         .await
         .expect(
             "connect to dev Postgres as admin (is the stack up? \
-             docker compose -f docker-compose.dev.yml up -d --wait)",
+             run `fed test:backend`)",
         );
 
     let suffix = std::process::id();

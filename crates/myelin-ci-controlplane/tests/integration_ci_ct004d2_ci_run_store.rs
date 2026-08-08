@@ -39,7 +39,7 @@ async fn pool_on(url: &str, schema: &str) -> PgPool {
         })
         .connect(url)
         .await
-        .expect("connect to dev Postgres (is the stack up? eval \"$(scripts/dev-stack.sh env)\")")
+        .expect("connect to dev Postgres (is the stack up? `fed test:backend`)")
 }
 
 fn row(tenant: &str, run_id: &str) -> CiRunInsert {

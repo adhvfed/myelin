@@ -19,7 +19,7 @@ async fn check_attempt_bump_is_monotonic_on_live_postgres() {
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let tbl = format!("check_attempt_p361_{suffix}");

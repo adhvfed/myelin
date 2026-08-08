@@ -31,7 +31,7 @@ async fn iss_d3_board_setexpr_join_one_query_zero_leak_confidential_and_cross_te
         .max_connections(2)
         .connect(&admin_url())
         .await
-        .expect("connect to dev Postgres as admin (is the stack up? docker compose -f docker-compose.dev.yml up -d --wait)");
+        .expect("connect to dev Postgres as admin (is the stack up? run `fed test:backend`)");
 
     let suffix = std::process::id();
     let issue_tbl = format!("issue_p379_{suffix}");
