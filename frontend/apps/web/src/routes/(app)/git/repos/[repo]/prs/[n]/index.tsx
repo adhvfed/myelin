@@ -184,7 +184,7 @@ export default function PrOverviewScreen() {
             </Skeleton>
           }
         >
-          <Show when={ready()} fallback={<NotAvailable kind="pull request" />}>
+          <Show when={ready()} fallback={<NotAvailable kind="pull request" status="missing" />}>
             {/* NOT keyed — a mutation action auto-revalidates `pr()`; a keyed Show would re-create the
                 children (losing the reviews section's in-progress draft). Non-keyed keeps them mounted
                 and reactive, so a submitted review re-renders in place without dropping the batch. */}

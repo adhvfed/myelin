@@ -236,11 +236,23 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expectNoAxeViolations(page, "commit log pager");
   });
 
-  test("the catch-all route renders NotAvailable (not a raw framework 404)", async ({ page }) => {
+  test("the catch-all route distinguishes a missing page from planned features", async ({ page }) => {
     await devLogin(page);
     await page.goto("/this/path/does/not/exist");
     await expect(page.getByTestId("not-available")).toBeVisible();
+    await expect(page.getByTestId("availability-status")).toHaveText("Not found");
+    await expect(page.getByText("Coming soon", { exact: true })).toHaveCount(0);
     await expect(page.getByRole("navigation", { name: "Primary" })).toBeVisible();
+  });
+
+  test("planned product areas remain discoverable without looking like broken links", async ({ page }) => {
+    await devLogin(page);
+
+    for (const path of ["/chat", "/knowledge"]) {
+      await page.goto(path);
+      await expect(page.getByText("Coming soon", { exact: true })).toBeVisible();
+      await expect(page.getByText("Not found", { exact: true })).toHaveCount(0);
+    }
   });
 
   test("an expired access and refresh credential redirects before CSP-protected streaming", async ({ page }) => {

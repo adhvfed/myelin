@@ -108,7 +108,7 @@ export default function RepoPrListScreen() {
             </Skeleton>
           }
         >
-          <Show when={ready()} fallback={<NotAvailable kind="pull request list" />}>
+          <Show when={ready()} fallback={<NotAvailable kind="pull request list" status="missing" />}>
             <Show when={data()} keyed>
               {(result) => (
                 <Show

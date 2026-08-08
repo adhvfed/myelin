@@ -1,20 +1,15 @@
-// The teaching "not available yet" state (R3.4 / firstrun #1) — rendered INSIDE the shell by the
-// catch-all route and the unbuilt-subsystem indexes (Issues/Chat/CI/Knowledge), NOT a framework 404.
-// Honest chrome: a heading naming the subsystem, a neutral "soon" tag (never accent, never color-alone
-// — the tag CARRIES the meaning), a calm body, and a primary "Go to Code" action so the operator is
-// never stranded. `role="note"` (calm, not an error to fix). Semantic tokens only.
 import { A } from "@solidjs/router";
 import { Icon } from "@myelin/design-system";
 
 export interface NotAvailableProps {
-  /** The subsystem/surface name (e.g. "Issues"). Falls back to the legacy `kind` label. */
   subsystem?: string;
-  /** Legacy: a short kind label ("repository", "file", …) for missing-route-segment guards. */
   kind?: string;
+  status?: "planned" | "missing";
 }
 
 export function NotAvailable(props: NotAvailableProps) {
   const label = () => props.subsystem ?? capitalize(props.kind ?? "This page");
+  const missing = () => props.status === "missing";
   return (
     <div
       role="note"
@@ -32,10 +27,9 @@ export function NotAvailable(props: NotAvailableProps) {
         "text-align": "center",
       }}
     >
-      <Icon name="gate" size={28} title="Not available yet" />
-      {/* The neutral "soon" tag — muted fill + a text label; the meaning is the WORD, not a colour
-          (WCAG 1.4.1). */}
+      <Icon name="gate" size={28} title={missing() ? "Not found" : "Not available yet"} />
       <span
+        data-testid="availability-status"
         style={{
           display: "inline-flex",
           "align-items": "center",
@@ -46,14 +40,15 @@ export function NotAvailable(props: NotAvailableProps) {
           "border-radius": "var(--radius-pill)",
         }}
       >
-        Coming soon
+        {missing() ? "Not found" : "Coming soon"}
       </span>
       <h2 id="not-available-heading" style={{ "font-size": "var(--fs-h3)", margin: "0" }}>
-        {label()} isn&rsquo;t here yet
+        {label()} {missing() ? "wasn’t found" : "isn’t here yet"}
       </h2>
       <p style={{ color: "var(--text-muted)", margin: "0", "max-width": "42ch" }}>
-        This surface lands with its subsystem. Your place is kept &mdash; nothing here blames you for
-        its absence.
+        {missing()
+          ? "Check the address or return to your repositories."
+          : "This area is planned but is not available in this build."}
       </p>
       <A
         href="/git/repos"
@@ -68,7 +63,7 @@ export function NotAvailable(props: NotAvailableProps) {
           background: "var(--surface)",
         }}
       >
-        <Icon name="nav-code" /> Go to Code
+        <Icon name="nav-code" /> Back to repositories
       </A>
     </div>
   );
