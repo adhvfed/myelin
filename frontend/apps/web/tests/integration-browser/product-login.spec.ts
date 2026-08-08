@@ -9,6 +9,13 @@ function requiredEnvironment(name: string): string {
   return value;
 }
 
+function object(value: unknown): JsonObject {
+  expect(typeof value).toBe("object");
+  expect(value).not.toBeNull();
+  expect(Array.isArray(value)).toBe(false);
+  return value as JsonObject;
+}
+
 const edgeUrl = requiredEnvironment("MYELIN_INTEGRATION_EDGE_URL").replace(/\/$/, "");
 const token = requiredEnvironment("MYELIN_BROWSER_EDGE_TOKEN");
 const tenant = requiredEnvironment("MYELIN_BROWSER_TENANT");
@@ -17,7 +24,7 @@ async function edgeRequest(
   request: APIRequestContext,
   method: "GET" | "POST",
   path: string,
-  expectedStatus: number,
+  expectedStatus: number | readonly number[],
   body?: unknown,
 ): Promise<JsonObject> {
   const response = await request.fetch(`${edgeUrl}${path}`, {
@@ -33,13 +40,36 @@ async function edgeRequest(
     failOnStatusCode: false,
   });
   const text = await response.text();
-  expect(response.status(), `${method} ${path} returned ${response.status()}: ${text}`).toBe(
-    expectedStatus,
+  const acceptedStatuses = Array.isArray(expectedStatus) ? expectedStatus : [expectedStatus];
+  expect(
+    acceptedStatuses,
+    `${method} ${path} returned ${response.status()}: ${text}`,
+  ).toContain(
+    response.status(),
   );
-  return JSON.parse(text) as JsonObject;
+  return object(JSON.parse(text));
 }
 
-test("durable repository and review data is available after browser login", async ({
+async function waitForIssueActivation(
+  request: APIRequestContext,
+  requestEventId: string,
+): Promise<JsonObject> {
+  const deadline = Date.now() + 15_000;
+  while (Date.now() < deadline) {
+    const status = await edgeRequest(
+      request,
+      "GET",
+      `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
+      [200, 202],
+    );
+    if (status.status === "active") return object(status.issue);
+    expect(status.status).toBe("pending");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw new Error(`issue authorization ${requestEventId} did not activate within 15 seconds`);
+}
+
+test("durable product data is available and mutable after browser login", async ({
   page,
   request,
 }) => {
@@ -58,7 +88,7 @@ test("durable repository and review data is available after browser login", asyn
     200,
     { base_oid: "", contents: "export const ready = true;\n" },
   );
-  const featureOid = (featureCommit.applied as JsonObject).new_oid;
+  const featureOid = object(featureCommit.applied).new_oid;
   expect(featureOid).toMatch(/^[0-9a-f]{40}$/);
   await edgeRequest(request, "POST", `${repoPath}/prs`, 201, {
     title: "Ship the browser journey",
@@ -66,6 +96,19 @@ test("durable repository and review data is available after browser login", asyn
     head_ref: "refs/heads/feature",
     head_oid: featureOid,
   });
+
+  const issueTitle = `Track ${slug}`;
+  const issueReceipt = await edgeRequest(request, "POST", "/v1/issues", 202, {
+    project_id: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_PROJECT"),
+    type_id: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_TYPE"),
+    prefix: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_PREFIX"),
+    title: issueTitle,
+  });
+  const issueSummary = object(issueReceipt.issue);
+  const issueAuthorization = object(issueReceipt.authorization);
+  const issueId = String(issueSummary.id);
+  const issueKey = String(issueSummary.key);
+  await waitForIssueActivation(request, String(issueAuthorization.request_event_id));
 
   await page.goto("/login");
   await page.waitForLoadState("networkidle");
@@ -94,4 +137,23 @@ test("durable repository and review data is available after browser login", asyn
   await expect(page.getByRole("heading", { name: "Ship the browser journey #1" })).toBeVisible();
   await expect(page.getByText("refs/heads/feature")).toBeVisible();
   await expect(page.getByText("refs/heads/main")).toBeVisible();
+
+  await page.goto("/issues");
+  const issueRow = page.getByTestId("issue-row").filter({ hasText: issueTitle });
+  await expect(issueRow).toContainText(issueKey);
+  await issueRow.click();
+  await expect(page.getByRole("heading", { name: issueTitle })).toBeVisible();
+
+  await page.getByRole("button", { name: "Close issue" }).click();
+  await page.getByRole("alertdialog").getByRole("button", { name: "Close issue" }).click();
+  await expect(page.getByRole("button", { name: "Close issue" })).toHaveCount(0);
+  await expect(page.getByText(`${issueKey} closed`)).toBeVisible();
+
+  const closedIssue = await edgeRequest(
+    request,
+    "GET",
+    `/v1/issues/${encodeURIComponent(issueId)}`,
+    200,
+  );
+  expect(closedIssue).toMatchObject({ id: issueId, key: issueKey, state_category: "completed" });
 });
