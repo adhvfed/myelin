@@ -81,6 +81,7 @@ import {
   type CodeSearchInput,
   type CodeSearchPage,
 } from "./code-search";
+import { parseRepoCreateReceipt, parseRepositorySlug, type RepoCreateReceipt } from "./repo-create";
 import {
   mapPrDiffStatusToKind,
   mapStatusToKind,
@@ -90,6 +91,7 @@ import {
 
 export type { IssueMutation, PrMutation } from "./mutation-input";
 export type { CodeSearchHit, CodeSearchInput, CodeSearchPage } from "./code-search";
+export type { RepoCreateReceipt } from "./repo-create";
 export {
   REPO_ERR_PREFIX,
   RepoRouteError,
@@ -654,6 +656,35 @@ export const getCodeSearch = query(async (request: CodeSearchInput): Promise<Cod
     return page;
   });
 }, "git-code-search");
+
+export type RepoCreateError = "bad-input" | "exists" | "forbidden" | "error";
+export type RepoCreateResult =
+  | { ok: true; receipt: RepoCreateReceipt }
+  | { ok: false; error: RepoCreateError };
+
+export const createRepo = action(async (value: string) => {
+  "use server";
+  const result = (response: RepoCreateResult) => json(response, { revalidate: [] });
+  const slug = parseRepositorySlug(value);
+  if (!slug) return result({ ok: false, error: "bad-input" });
+  try {
+    const response = await edgePost(
+      "/v1/git/repos",
+      { slug },
+      { idempotencyKey: crypto.randomUUID() },
+    );
+    const receipt = parseRepoCreateReceipt(response, slug);
+    return result(receipt ? { ok: true, receipt } : { ok: false, error: "error" });
+  } catch (error) {
+    if (isUnauthorized(error)) throw redirect("/login");
+    if (error instanceof GatewayError) {
+      if (error.status === 400) return result({ ok: false, error: "bad-input" });
+      if (error.status === 403) return result({ ok: false, error: "forbidden" });
+      if (error.status === 409) return result({ ok: false, error: "exists" });
+    }
+    return result({ ok: false, error: "error" });
+  }
+}, "git-repo-create");
 
 /** Repository-authorized durable CI run summaries, newest first under an opaque keyset cursor. */
 export const getCiRuns = query(async (request: CiRunsInput = {}): Promise<CiRunsPage> => {

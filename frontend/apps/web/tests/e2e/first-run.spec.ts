@@ -73,29 +73,21 @@ test.describe("R3.5 first-run — login", () => {
 });
 
 test.describe("R3.5 first-run — empty tenant onboarding", () => {
-  test("a fresh empty tenant TEACHES push-to-create with copyable CTAs + a dismissable checklist; axe green", async ({ page }) => {
+  test("a fresh tenant offers repository creation and existing-repository push instructions", async ({ page }) => {
     await setEdgeConfig({ emptyRepos: true, devLoginEnabled: true });
     await page.goto("/login");
     await page.waitForLoadState("networkidle");
     await page.getByTestId("dev-login").click();
     await page.waitForURL("**/git/repos");
 
-    // The onboarding empty state (not the old one-liner): teaches remote + push, blames nothing.
     const empty = page.getByTestId("repos-empty");
     await expect(empty).toBeVisible();
+    await expect(empty.getByRole("button", { name: "Create repository" })).toBeVisible();
     await expect(page.getByTestId("cmd-remote")).toContainText("git remote add myelin");
     await expect(page.getByTestId("cmd-push")).toContainText("git push -u myelin main");
-    await expect(empty).toContainText(/the push is the create/i);
-    // Copy CTAs are labelled.
     await expect(page.getByRole("button", { name: "Copy: git remote add" })).toBeVisible();
-    // The live waiting affordance + manual Refresh fallback.
     await expect(page.getByTestId("waiting-first-push")).toBeVisible();
     await expect(page.getByTestId("repos-refresh")).toBeVisible();
-
-    // The first-run checklist is present and DISMISSABLE.
-    await expect(page.getByTestId("first-run-checklist")).toBeVisible();
-    await page.getByTestId("checklist-dismiss").click();
-    await expect(page.getByTestId("first-run-checklist")).toHaveCount(0);
 
     await expectNoAxeViolations(page, "the empty-tenant onboarding");
   });

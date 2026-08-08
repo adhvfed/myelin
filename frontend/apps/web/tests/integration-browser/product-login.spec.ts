@@ -77,7 +77,25 @@ test("durable product data is available and mutable after browser login", async 
   const slug = `browser-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
   const repoPath = `/v1/git/repos/${encodeURIComponent(slug)}`;
 
-  await edgeRequest(request, "POST", "/v1/git/repos", 201, { slug });
+  await page.goto("/login");
+  await page.waitForLoadState("networkidle");
+  await expect(page.getByTestId("dev-login")).toBeVisible();
+  await page.getByTestId("dev-login").click();
+
+  await page.waitForURL("**/git/repos");
+  await expect(page).toHaveTitle("Code · Myelin");
+  await expect(page.getByRole("heading", { name: "Repositories" })).toBeVisible();
+  await expect(page.getByText("Myelin Developer", { exact: true })).toBeVisible();
+  await expect(page.getByText("fr-par", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => document.cookie)).not.toContain("myelin_session");
+
+  await page.getByRole("button", { name: "New repository" }).click();
+  const createDialog = page.getByRole("dialog", { name: "New repository" });
+  await createDialog.getByLabel("Name or namespace/name").fill(slug);
+  await createDialog.getByRole("button", { name: "Create repository" }).click();
+  await page.waitForURL(`**/git/repos/${slug}`);
+  await expect(page.getByRole("heading", { name: `${tenant}/${slug}` })).toBeVisible();
+
   await edgeRequest(request, "POST", `${repoPath}/blob/main/README.md`, 200, {
     base_oid: "",
     contents: `# ${slug}\n\nCreated through the running product.\n`,
@@ -125,20 +143,8 @@ command = ["true"]
     head_oid: featureOid,
   });
 
-  await page.goto("/login");
-  await page.waitForLoadState("networkidle");
-
-  await expect(page.getByTestId("dev-login")).toBeVisible();
-  await page.getByTestId("dev-login").click();
-
-  await page.waitForURL("**/git/repos");
-  await expect(page).toHaveTitle("Code · Myelin");
-  await expect(page.getByRole("heading", { name: "Repositories" })).toBeVisible();
-  await expect(page.getByText("Myelin Developer", { exact: true })).toBeVisible();
-  await expect(page.getByText("fr-par", { exact: true })).toBeVisible();
-  expect(await page.evaluate(() => document.cookie)).not.toContain("myelin_session");
-
-  await page.keyboard.press("ControlOrMeta+k");
+  await page.goto("/git/repos");
+  await page.getByRole("button", { name: /Search or run a command/ }).click();
   await page.getByRole("combobox", { name: /Search or run a command/ }).fill(slug);
   await page.keyboard.press("Enter");
   await page.waitForURL(/\/git\/search\?q=/);
@@ -179,8 +185,9 @@ command = ["true"]
   await page.goto("/issues");
   const issueTitle = `Track ${slug}`;
   await page.getByRole("button", { name: "New issue" }).click();
-  await page.getByLabel("Title").fill(issueTitle);
-  await page.getByRole("button", { name: "Create issue" }).click();
+  const issueDialog = page.getByRole("dialog", { name: "New issue" });
+  await issueDialog.getByLabel("Title").fill(issueTitle);
+  await issueDialog.getByRole("button", { name: "Create issue" }).click();
 
   const issueRow = page.getByTestId("issue-row").filter({ hasText: issueTitle });
   await expect(issueRow).toBeVisible({ timeout: 20_000 });

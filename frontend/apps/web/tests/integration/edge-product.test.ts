@@ -95,6 +95,13 @@ describe("assembled product edge", () => {
     const created = await request("POST", "/v1/git/repos", 201, { slug });
     expect(created).toMatchObject({
       durable: true,
+      created: true,
+      applied: { action: "git.repo.create", slug },
+    });
+    const retriedCreate = await request("POST", "/v1/git/repos", 200, { slug });
+    expect(retriedCreate).toMatchObject({
+      durable: true,
+      created: false,
       applied: { action: "git.repo.create", slug },
     });
 

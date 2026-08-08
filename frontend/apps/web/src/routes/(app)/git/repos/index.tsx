@@ -1,10 +1,6 @@
-// The Git repos list (GT-004), rendered from the edge's RepoHome ViewModel JSON. Proves the full path:
-// shell → server-side gateway client → edge `/v1/git/repos?view=summary` → the bounded catalogue
-// envelope → this Solid render. Each repo links to its separately fetched home screen. Unglamorous states are
-// first-class (loading / error / empty-list / per-repo empty). Semantic tokens only.
-import { ErrorBoundary, For, Match, Show, Suspense, Switch } from "solid-js";
+import { ErrorBoundary, For, Match, Show, Suspense, Switch, createSignal } from "solid-js";
 import { Title } from "@solidjs/meta";
-import { A, createAsync, useSearchParams } from "@solidjs/router";
+import { A, createAsync, useNavigate, useSearchParams } from "@solidjs/router";
 import { Icon, Skeleton } from "@myelin/design-system";
 import { getRepos, RepoRouteError, type RepoListRowVM } from "~/lib/api";
 import { getViewer } from "~/lib/auth";
@@ -12,9 +8,12 @@ import { bareRepo } from "~/lib/format";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { ReposEmptyState } from "~/components/ReposEmptyState";
 import { repoListHref, repoListInputFromSearch } from "~/lib/repo-list-state";
+import { RepoCreateDialog } from "~/components/repos/RepoCreateDialog";
 
 export default function ReposScreen() {
   const [search] = useSearchParams();
+  const navigate = useNavigate();
+  const [createOpen, setCreateOpen] = createSignal(false);
   const repos = createAsync(async () => {
     const input = repoListInputFromSearch(search.limit, search.cursor);
     if (!input) throw new RepoRouteError("error");
@@ -30,6 +29,13 @@ export default function ReposScreen() {
           Repositories
         </h1>
         <div style={{ flex: "1" }} />
+        <button
+          type="button"
+          onClick={() => setCreateOpen(true)}
+          style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", padding: "var(--space-2) var(--space-3)", border: "none", "border-radius": "var(--radius-1)", background: "var(--accent)", color: "var(--on-accent)", cursor: "pointer" }}
+        >
+          <Icon name="repo" /> New repository
+        </button>
         {/* R3.1 — the cross-repo "what needs me" front door (the front door for the review job). */}
         <A href="/prs" style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)", "text-decoration": "none" }}>
           <Icon name="pull-request" /> Your pull requests
@@ -42,7 +48,7 @@ export default function ReposScreen() {
             {(page) => (
               <Show
                 when={page.items.length > 0}
-                fallback={<ReposEmptyState tenant={viewer()?.tenant ?? "your-org"} />}
+                fallback={<ReposEmptyState tenant={viewer()?.tenant ?? "your-org"} onCreate={() => setCreateOpen(true)} />}
               >
                 <ul
                   data-testid="repos-list"
@@ -68,6 +74,11 @@ export default function ReposScreen() {
           </Show>
         </Suspense>
       </ErrorBoundary>
+      <RepoCreateDialog
+        open={createOpen()}
+        onClose={() => setCreateOpen(false)}
+        onCreated={(slug) => navigate(`/git/repos/${encodeURIComponent(slug)}`)}
+      />
     </section>
   );
 }
