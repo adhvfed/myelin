@@ -30,6 +30,7 @@ pub mod restore_verify;
 pub mod shell;
 pub mod subartifact;
 pub mod surge;
+#[cfg(any(test, feature = "test-support"))]
 pub mod switch_test;
 pub mod telemetry;
 pub mod tier3_valve;
@@ -161,6 +162,7 @@ pub use surge::{
     run_search_surge, SearchShedGate, SearchShedRejection, SearchSurgeReport,
     FILTERED_ANN_FOLLOW_ON, SEARCH_SURGE_MULTIPLIER, SHARD_SPLIT_IS_MEASURED_ONLY,
 };
+#[cfg(any(test, feature = "test-support"))]
 pub use switch_test::{
     switch_capability_matrix, switch_surface_drive_record, BrowserDriveStatus, MeasuredLatencies,
     SearchSwitchTest, SearchSwitchVerdict, SwitchCapability, SwitchSurfaceDrive,

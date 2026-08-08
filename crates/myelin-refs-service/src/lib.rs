@@ -31,6 +31,7 @@ pub mod resolve;
 pub mod restore_reerase;
 pub mod restrict;
 pub mod surge;
+#[cfg(any(test, feature = "test-support"))]
 pub mod switch_test;
 pub mod traverse;
 
@@ -135,6 +136,7 @@ pub use surge::{
     run_refs_surge, RefsShedGate, RefsShedRejection, RefsSurgeReport, R4_REACH_INDEX_FOLLOW_ON,
     REFS_SURGE_MULTIPLIER, SHARD_SPLIT_IS_MEASURED_ONLY,
 };
+#[cfg(any(test, feature = "test-support"))]
 pub use switch_test::{
     four_keystroke_jump_chain, switch_capability_matrix, switch_surface_drive_record,
     BrowserDriveStatus, MeasuredLatencies, RefsSwitchTest, RefsSwitchVerdict, SwitchCapability,

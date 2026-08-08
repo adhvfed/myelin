@@ -27,6 +27,7 @@ pub mod scylla_followon;
 pub mod search;
 pub mod store;
 pub mod subs;
+#[cfg(any(test, feature = "test-support"))]
 pub mod switch_test;
 pub mod tools;
 pub mod unfurl;
@@ -133,6 +134,7 @@ pub use store::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use store::MemHotTier;
+#[cfg(any(test, feature = "test-support"))]
 pub use switch_test::{
     chat_screen_catalogue, ChatOverlay, ChatSwitchTest, ChatSwitchVerdict, ComposerAnchor,
     MeasuredLegs as ChatSwitchMeasuredLegs, ResponsiveCase, ScreenRecord, ScreenVerdict,

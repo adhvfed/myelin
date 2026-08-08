@@ -43,6 +43,7 @@ pub mod schemes;
 pub mod sla_calendar;
 pub mod sla_escalation;
 pub mod surge;
+#[cfg(any(test, feature = "test-support"))]
 pub mod switch_test;
 pub mod time_axis;
 pub mod trigger;
@@ -243,6 +244,7 @@ pub use self_tenant::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use self_tenant::run_issues_over_myelins_own_work;
+#[cfg(any(test, feature = "test-support"))]
 pub use switch_test::{
     switch_capability_matrix, switch_surface_drive_record, IssuesOverlay, IssuesSwitchTest,
     IssuesSwitchVerdict, PrimaryScreenState, SwitchCapability,
