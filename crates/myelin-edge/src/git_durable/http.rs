@@ -84,11 +84,30 @@ impl Handler for DRepoCreate {
             .create_repo_as(tenant_of(ctx), region_of(ctx), slug, ctx.principal)
             .map_err(map_durable_err)?;
         if !created {
+            let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), slug);
+            if self.be.repo_authorizer().authorize_repo_permission(
+                ctx.principal,
+                &loc,
+                RepoPermission::Push,
+            ) {
+                return Ok(EdgeResponse::json(
+                    200,
+                    &json!({
+                        "applied": { "action": "git.repo.create", "slug": slug },
+                        "created": false,
+                        "durable": true,
+                    }),
+                ));
+            }
             return Err(EdgeError::Conflict(format!("repo `{slug}` already exists")));
         }
         Ok(EdgeResponse::json(
             201,
-            &json!({ "applied": { "action": "git.repo.create", "slug": slug }, "durable": true }),
+            &json!({
+                "applied": { "action": "git.repo.create", "slug": slug },
+                "created": true,
+                "durable": true,
+            }),
         ))
     }
 }

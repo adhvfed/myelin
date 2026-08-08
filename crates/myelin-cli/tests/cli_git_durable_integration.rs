@@ -231,6 +231,24 @@ async fn durable_create_open_view_round_trip() {
         "create echoed; got {out}"
     );
 
+    let (retry_code, retry_out, retry_err) = run_cli(
+        &edge,
+        &token,
+        &[
+            "--idempotency-key",
+            "test-repo-create-alpha",
+            "git",
+            "repo",
+            "create",
+            "alpha",
+        ],
+    );
+    assert_eq!(retry_code, 0, "create retry succeeds; stderr={retry_err}");
+    assert!(
+        retry_out.contains("\"created\":false"),
+        "create retry reports the existing durable repository; got {retry_out}"
+    );
+
     let (lc, lout, _) = run_cli(&edge, &token, &["--json", "git", "repo", "list"]);
     assert_eq!(lc, 0);
     let v: serde_json::Value = serde_json::from_str(&lout).expect("--json valid");
