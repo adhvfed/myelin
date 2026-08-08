@@ -256,7 +256,7 @@ function PopulatedOrEmpty(props: {
                 </p>
                 <pre style={{ ...codeBox }}>{`git switch -c my-change\ngit push -u origin my-change`}</pre>
                 <p style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)", margin: "0" }}>
-                  Then open it here, from the command palette (<kbd style={kbd}>⌘K → New pull request</kbd>), or with <code style={mono}>gh pr create</code>.
+                  Then open it here or from the command palette (<kbd style={kbd}>⌘K → New pull request</kbd>).
                 </p>
               </div>
             }
