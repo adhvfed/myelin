@@ -62,4 +62,5 @@ base64 = "0.22"
 [features]
 default = []
 integration = ["myelin-storage/integration", "dep:sqlx"]
+privileged-host-tests = ["myelin-ci-sandbox/privileged-host-tests"]
 test-support = ["myelin-events/test-support"]
