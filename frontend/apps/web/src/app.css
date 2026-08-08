@@ -5,6 +5,7 @@
 @import "./chat.css";
 @import "@myelin/design-system/block-editor.css";
 @import "./knowledge.css";
+@import "./profile.css";
 
 *,
 *::before,
@@ -73,26 +74,6 @@ button {
   color: var(--text-primary);
   background: var(--surface-hover);
 }
-/* Honest treatment for unbuilt destinations (R3.4 §6): muted (one step below --text-muted) + a
-   neutral construction dot, NEVER accent, NEVER disabled. Active state stays R1
-   (--surface-hover fill), while the text stays muted. */
-.nav-rail-item.under-construction {
-  color: var(--text-subtle);
-}
-.nav-rail-item.under-construction[aria-current="page"] {
-  color: var(--text-muted);
-  background: var(--surface-hover);
-}
-.nav-rail-item .construction-dot {
-  position: absolute;
-  top: 4px;
-  inset-inline-end: 5px;
-  width: 5px;
-  height: 5px;
-  border-radius: var(--radius-pill);
-  background: var(--text-subtle);
-}
-
 /* The ⌘K trigger — reads as a muted search field, brightens on hover. */
 .cmdk-trigger {
   color: var(--text-muted);

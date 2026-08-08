@@ -1,13 +1,15 @@
 import { MetaProvider, Title } from "@solidjs/meta";
 import { Router, useLocation } from "@solidjs/router";
 import { FileRoutes } from "@solidjs/start/router";
-import { createEffect, Suspense, type ParentProps } from "solid-js";
+import { createEffect, onMount, Suspense, type ParentProps } from "solid-js";
 import { isServer } from "solid-js/web";
 import { ToastProvider } from "@myelin/design-system";
 import "./app.css";
+import { restoreTheme } from "./lib/theme";
 
 function AppRoot(props: ParentProps) {
   const location = useLocation();
+  onMount(() => restoreTheme());
 
   if (!isServer) {
     createEffect(() => {
