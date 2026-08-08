@@ -64,6 +64,22 @@ describe("assembled product edge", () => {
     throw new Error(`issue authorization ${requestEventId} did not activate within 15 seconds`);
   }
 
+  async function waitForCiRun(repoRef: string, commitOid: unknown): Promise<JsonObject> {
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const runs = await request("GET", "/v1/ci/runs?state=all&limit=50", 200);
+      expect(Array.isArray(runs.items)).toBe(true);
+      const match = (runs.items as unknown[]).find((value) => {
+        if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+        const row = value as JsonObject;
+        return row.repo_ref === repoRef && row.commit_oid === commitOid;
+      });
+      if (match !== undefined) return object(match);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error(`CI run for ${repoRef} at ${String(commitOid)} did not appear within 15 seconds`);
+  }
+
   test("creates, browses, commits, reviews, and tracks work through durable services", async () => {
     const slug = `it-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
     const repoPath = `/v1/git/repos/${encodeURIComponent(slug)}`;
@@ -110,6 +126,30 @@ describe("assembled product edge", () => {
     expect(populatedRepo.entries).toEqual(
       expect.arrayContaining([expect.objectContaining({ name: "README.md", is_dir: false })]),
     );
+
+    const pipeline = `on = "push"
+
+[[jobs]]
+name = "test"
+image = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000"
+command = ["true"]
+`;
+    const pipelineCommit = await request(
+      "POST",
+      `${repoPath}/blob/main/.myelin/ci.toml`,
+      200,
+      { base_oid: "", contents: pipeline },
+    );
+    const pipelineOid = object(pipelineCommit.applied).new_oid;
+    expect(pipelineOid).toMatch(/^[0-9a-f]{40}$/);
+
+    const ciRun = await waitForCiRun(`myelin://${tenant}/git/repo/${slug}`, pipelineOid);
+    expect(ciRun).toMatchObject({
+      commit_oid: pipelineOid,
+      trigger_kind: "push",
+      state: "queued",
+    });
+    expect(ciRun.run_id).toMatch(/^[0-9a-f-]{36}$/);
 
     const featureCommit = await request("POST", `${repoPath}/blob/feature/app.txt`, 200, {
       base_oid: "",
