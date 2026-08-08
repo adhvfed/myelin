@@ -50,25 +50,6 @@ async function edgeRequest(
   return object(JSON.parse(text));
 }
 
-async function waitForIssueActivation(
-  request: APIRequestContext,
-  requestEventId: string,
-): Promise<JsonObject> {
-  const deadline = Date.now() + 15_000;
-  while (Date.now() < deadline) {
-    const status = await edgeRequest(
-      request,
-      "GET",
-      `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
-      [200, 202],
-    );
-    if (status.status === "active") return object(status.issue);
-    expect(status.status).toBe("pending");
-    await new Promise((resolve) => setTimeout(resolve, 100));
-  }
-  throw new Error(`issue authorization ${requestEventId} did not activate within 15 seconds`);
-}
-
 test("durable product data is available and mutable after browser login", async ({
   page,
   request,
@@ -96,19 +77,6 @@ test("durable product data is available and mutable after browser login", async 
     head_ref: "refs/heads/feature",
     head_oid: featureOid,
   });
-
-  const issueTitle = `Track ${slug}`;
-  const issueReceipt = await edgeRequest(request, "POST", "/v1/issues", 202, {
-    project_id: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_PROJECT"),
-    type_id: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_TYPE"),
-    prefix: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_PREFIX"),
-    title: issueTitle,
-  });
-  const issueSummary = object(issueReceipt.issue);
-  const issueAuthorization = object(issueReceipt.authorization);
-  const issueId = String(issueSummary.id);
-  const issueKey = String(issueSummary.key);
-  await waitForIssueActivation(request, String(issueAuthorization.request_event_id));
 
   await page.goto("/login");
   await page.waitForLoadState("networkidle");
@@ -139,10 +107,19 @@ test("durable product data is available and mutable after browser login", async 
   await expect(page.getByText("refs/heads/main")).toBeVisible();
 
   await page.goto("/issues");
+  const issueTitle = `Track ${slug}`;
+  await page.getByRole("button", { name: "New issue" }).click();
+  await page.getByLabel("Title").fill(issueTitle);
+  await page.getByRole("button", { name: "Create issue" }).click();
+
   const issueRow = page.getByTestId("issue-row").filter({ hasText: issueTitle });
-  await expect(issueRow).toContainText(issueKey);
+  await expect(issueRow).toBeVisible({ timeout: 20_000 });
+  const issueKey = (await issueRow.locator("code").textContent())?.trim();
+  expect(issueKey).toMatch(/^MYL-\d+$/);
   await issueRow.click();
   await expect(page.getByRole("heading", { name: issueTitle })).toBeVisible();
+  const issueId = decodeURIComponent(new URL(page.url()).pathname.split("/").at(-1) ?? "");
+  expect(issueId).toMatch(/^[0-9a-f-]{36}$/);
 
   await page.getByRole("button", { name: "Close issue" }).click();
   await page.getByRole("alertdialog").getByRole("button", { name: "Close issue" }).click();
