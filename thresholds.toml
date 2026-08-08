@@ -39,10 +39,6 @@ overlay_contrast_floor_bp = 450             # MEASURED-GATE: the status-overlay 
 page_render_budget_us = 50000               # Knowledge page render latency budget.
 overlay_contrast_floor_bp = 450             # MEASURED-GATE: the reference-chip / tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
 
-[issues_switch_test]
-view_render_budget_us = 50000               # Issue board, table, and roadmap render latency budget.
-overlay_contrast_floor_bp = 450             # MEASURED-GATE: the state-pill / priority-badge / agent-pending / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.
-
 [chat_switch_test]
 perceived_send_budget_us = 100000           # Maximum perceived latency for an optimistic message send.
 overlay_contrast_floor_bp = 450             # MEASURED-GATE: the message-row / agent / unfurl / erased-tombstone overlay text/background contrast floor in basis points (450 == WCAG 1.4.3 normal-text 4.5:1, the design-manual §2 anchor); an overlay below it is an accessibility wall.

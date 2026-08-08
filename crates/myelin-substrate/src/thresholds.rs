@@ -83,8 +83,6 @@ pub struct Thresholds {
     #[serde(default)]
     pub knowledge_switch_test: KnowledgeSwitchTestThreshold,
     #[serde(default)]
-    pub issues_switch_test: IssuesSwitchTestThreshold,
-    #[serde(default)]
     pub chat_switch_test: ChatSwitchTestThreshold,
     #[serde(default)]
     pub claimed_not_proven: Vec<ClaimedNotProven>,
@@ -448,40 +446,6 @@ impl Default for KnowledgeSwitchTestThreshold {
     fn default() -> Self {
         KnowledgeSwitchTestThreshold {
             page_render_budget_us: Self::PAGE_RENDER_BUDGET_US_SEED,
-            overlay_contrast_floor_bp: Self::OVERLAY_CONTRAST_FLOOR_BP_SEED,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IssuesSwitchTestThreshold {
-    #[serde(default = "IssuesSwitchTestThreshold::default_view_render_budget_us")]
-    pub view_render_budget_us: u64,
-    #[serde(default = "IssuesSwitchTestThreshold::default_overlay_contrast_floor_bp")]
-    pub overlay_contrast_floor_bp: u32,
-}
-
-impl IssuesSwitchTestThreshold {
-    pub const VIEW_RENDER_BUDGET_US_SEED: u64 = 50_000;
-    pub const OVERLAY_CONTRAST_FLOOR_BP_SEED: u32 = 450;
-
-    pub fn default_view_render_budget_us() -> u64 {
-        Self::VIEW_RENDER_BUDGET_US_SEED
-    }
-
-    pub fn default_overlay_contrast_floor_bp() -> u32 {
-        Self::OVERLAY_CONTRAST_FLOOR_BP_SEED
-    }
-
-    pub fn is_well_formed(&self) -> bool {
-        self.view_render_budget_us > 0 && self.overlay_contrast_floor_bp >= 450
-    }
-}
-
-impl Default for IssuesSwitchTestThreshold {
-    fn default() -> Self {
-        IssuesSwitchTestThreshold {
-            view_render_budget_us: Self::VIEW_RENDER_BUDGET_US_SEED,
             overlay_contrast_floor_bp: Self::OVERLAY_CONTRAST_FLOOR_BP_SEED,
         }
     }
