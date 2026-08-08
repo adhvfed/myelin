@@ -35,12 +35,14 @@ services:
     migrate: >-
       docker run --rm --network host
       -e PGPASSWORD=myelin_dev_pw
-      -v "$PWD/scripts/pg-init/01-ci-definition-fence.sql:/init.sql:ro"
+      -v "$PWD/scripts/pg-init:/init:ro"
       postgres:16@sha256:78df81b1442dcc764c1104154da7162635e40cfffe67579c42a1c1b96dfc209c
       psql -h 127.0.0.1 -p {{POSTGRES_PORT}}
       -U myelin_admin -d myelin
       --set=ON_ERROR_STOP=1 --set=migration_role=myelin_admin
-      --file=/init.sql
+      --file=/init/00-rls-conventions.sql
+      --file=/init/01-ci-definition-fence.sql
+      --file=/init/02-dev-roles.sql
 
   object-store:
     image: rustfs/rustfs@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3
