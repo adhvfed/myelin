@@ -1,6 +1,72 @@
-import { expect, test } from "@playwright/test";
+import { randomUUID } from "node:crypto";
+import { expect, test, type APIRequestContext } from "@playwright/test";
 
-test("development login opens a real edge-backed session", async ({ page }) => {
+type JsonObject = Record<string, unknown>;
+
+function requiredEnvironment(name: string): string {
+  const value = process.env[name]?.trim();
+  if (!value) throw new Error(`${name} is required; run this test with fed test:integration`);
+  return value;
+}
+
+const edgeUrl = requiredEnvironment("MYELIN_INTEGRATION_EDGE_URL").replace(/\/$/, "");
+const token = requiredEnvironment("MYELIN_BROWSER_EDGE_TOKEN");
+const tenant = requiredEnvironment("MYELIN_BROWSER_TENANT");
+
+async function edgeRequest(
+  request: APIRequestContext,
+  method: "GET" | "POST",
+  path: string,
+  expectedStatus: number,
+  body?: unknown,
+): Promise<JsonObject> {
+  const response = await request.fetch(`${edgeUrl}${path}`, {
+    method,
+    headers: {
+      accept: "application/json",
+      authorization: `Bearer ${token}`,
+      "x-myelin-token-scheme": "agent",
+      ...(body === undefined ? {} : { "content-type": "application/json" }),
+      ...(method === "POST" ? { "idempotency-key": randomUUID() } : {}),
+    },
+    data: body,
+    failOnStatusCode: false,
+  });
+  const text = await response.text();
+  expect(response.status(), `${method} ${path} returned ${response.status()}: ${text}`).toBe(
+    expectedStatus,
+  );
+  return JSON.parse(text) as JsonObject;
+}
+
+test("durable repository and review data is available after browser login", async ({
+  page,
+  request,
+}) => {
+  const slug = `browser-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
+  const repoPath = `/v1/git/repos/${encodeURIComponent(slug)}`;
+
+  await edgeRequest(request, "POST", "/v1/git/repos", 201, { slug });
+  await edgeRequest(request, "POST", `${repoPath}/blob/main/README.md`, 200, {
+    base_oid: "",
+    contents: `# ${slug}\n\nCreated through the running product.\n`,
+  });
+  const featureCommit = await edgeRequest(
+    request,
+    "POST",
+    `${repoPath}/blob/feature/app.txt`,
+    200,
+    { base_oid: "", contents: "export const ready = true;\n" },
+  );
+  const featureOid = (featureCommit.applied as JsonObject).new_oid;
+  expect(featureOid).toMatch(/^[0-9a-f]{40}$/);
+  await edgeRequest(request, "POST", `${repoPath}/prs`, 201, {
+    title: "Ship the browser journey",
+    base_ref: "refs/heads/main",
+    head_ref: "refs/heads/feature",
+    head_oid: featureOid,
+  });
+
   await page.goto("/login");
   await page.waitForLoadState("networkidle");
 
@@ -12,6 +78,20 @@ test("development login opens a real edge-backed session", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Repositories" })).toBeVisible();
   await expect(page.getByText("Myelin Developer", { exact: true })).toBeVisible();
   await expect(page.getByText("fr-par", { exact: true })).toBeVisible();
-  await expect(page.getByTestId("repos-empty")).toBeVisible();
   expect(await page.evaluate(() => document.cookie)).not.toContain("myelin_session");
+
+  await page.getByRole("link", { name: new RegExp(`${tenant}/${slug}`) }).click();
+  await expect(page.getByRole("heading", { name: `${tenant}/${slug}` })).toBeVisible();
+  await expect(page.getByText("Created through the running product.")).toBeVisible();
+
+  await page.getByRole("link", { name: "Pull requests" }).click();
+  const review = page.getByTestId("pr-row").filter({ hasText: "Ship the browser journey" });
+  await expect(review).toBeVisible();
+  await expect(review).toContainText("feature");
+  await expect(review).toContainText("main");
+  await review.click();
+
+  await expect(page.getByRole("heading", { name: "Ship the browser journey #1" })).toBeVisible();
+  await expect(page.getByText("refs/heads/feature")).toBeVisible();
+  await expect(page.getByText("refs/heads/main")).toBeVisible();
 });

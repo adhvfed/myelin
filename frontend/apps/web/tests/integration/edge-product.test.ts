@@ -142,6 +142,21 @@ describe("assembled product edge", () => {
       head_oid: featureOid,
     });
 
+    const reviews = await request("GET", `${repoPath}/prs?state=open&sort=updated`, 200);
+    expect(reviews).toMatchObject({
+      counts: { open: 1, all: 1 },
+      page: { next_cursor: null, prev_cursor: null },
+    });
+    expect(reviews.items).toEqual([
+      expect.objectContaining({
+        number: 1,
+        title: "Add the first product change",
+        pr_state: "open",
+        base_ref: "refs/heads/main",
+        head_ref: "refs/heads/feature",
+      }),
+    ]);
+
     const issueTitle = `Ship ${slug}`;
     const issueReceipt = await request("POST", "/v1/issues", 202, {
       project_id: requiredEnvironment("MYELIN_INTEGRATION_ISSUES_PROJECT"),

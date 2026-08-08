@@ -218,6 +218,7 @@ scripts:
       MYELIN_INTEGRATION_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
       MYELIN_INTEGRATION_WEB_URL: "http://127.0.0.1:{{WEB_PORT}}"
       MYELIN_INTEGRATION_TENANT: "integration-{{FED_PROJECT_ID}}"
+      MYELIN_BROWSER_TENANT: "development-{{FED_PROJECT_ID}}"
       MYELIN_INTEGRATION_ISSUES_PROJECT: 20aee030-c7fa-4757-8243-700faf528690
       MYELIN_INTEGRATION_ISSUES_TYPE: 7d457754-f6a1-4cd8-8738-21751570b627
       MYELIN_INTEGRATION_ISSUES_PREFIX: MYL
@@ -230,6 +231,12 @@ scripts:
       test -n "$token";
       export MYELIN_INTEGRATION_TOKEN="$token";
       pnpm --dir frontend test:integration -- "$@";
+      browser_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_BROWSER_TENANT" --region fr-par
+      --principal developer --display-name "Myelin Developer"
+      --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
+      test -n "$browser_token";
+      export MYELIN_BROWSER_EDGE_TOKEN="$browser_token";
       pnpm --dir frontend test:browser-integration' -- "$@"
 
   test:browser-contract:
