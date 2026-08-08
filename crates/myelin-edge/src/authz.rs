@@ -18,6 +18,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "ci.run.log.read",
     "ci.run.log.watch",
     "notif.inbox.list",
+    "notif.inbox.mark_read",
     "git.repos.list",
     "git.repo.create",
     "git.pr.view",
@@ -119,6 +120,11 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("ci.run.log.read", "run.view", OP_AGENT_PAT),
     requirement!("ci.run.log.watch", "run.view", OP_AGENT_PAT),
     requirement!("notif.inbox.list", "notification.read", OP_AGENT_PAT),
+    requirement!(
+        "notif.inbox.mark_read",
+        "notification.write",
+        OP_AGENT_PAT
+    ),
     requirement!("git.repos.list", "repo.pull", OP_AGENT_PAT),
     requirement!("git.repo.create", "repo.create", OP_PAT),
     requirement!("git.pr.view", "repo.pull", OP_AGENT_PAT),

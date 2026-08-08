@@ -22,6 +22,11 @@ export interface InboxPage {
   page: { next_cursor: string | null; limit: number };
 }
 
+export interface InboxReadReceipt {
+  id: string;
+  state: "read";
+}
+
 const REASONS = new Set([
   "approval_requested", "escalated", "sla", "review_requested", "assigned", "mentioned",
   "replied", "agent_proposal", "watched", "state_changed", "fyi", "blocked", "unblocked",
@@ -83,6 +88,13 @@ export function parseInboxPage(value: unknown): InboxPage | null {
   return items.every((row): row is InboxItem => row !== null)
     ? { items, page: { next_cursor: page.next_cursor as string | null, limit: page.limit as number } }
     : null;
+}
+
+export function parseInboxReadReceipt(value: unknown): InboxReadReceipt | null {
+  const receipt = record(value);
+  if (!receipt || !exact(receipt, ["id", "state"]) ||
+      !boundedText(receipt.id, 512) || receipt.state !== "read") return null;
+  return receipt as unknown as InboxReadReceipt;
 }
 
 export function inboxReasonLabel(reason: string): string {

@@ -538,6 +538,16 @@ export function AppShell(props: AppShellProps) {
                         <code style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)", "overflow-wrap": "anywhere" }}>
                           {item.subject}
                         </code>
+                        <Show when={item.state === "unread"}>
+                          <button
+                            type="button"
+                            class="button-secondary"
+                            style={{ "align-self": "flex-start" }}
+                            onClick={() => void inbox.markRead(item.id)}
+                          >
+                            Mark read
+                          </button>
+                        </Show>
                       </span>
                     </li>
                   )}

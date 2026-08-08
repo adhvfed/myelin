@@ -21,6 +21,7 @@ use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 
 const DEFAULT_INBOX_LIMIT: u16 = 50;
+const MAX_INBOX_MUTATION_BYTES: usize = 1_024;
 
 #[derive(Clone)]
 struct DurableNotifHttpApi {
@@ -46,6 +47,47 @@ impl DurableNotifHttpApi {
 
 struct InboxListHandler {
     api: DurableNotifHttpApi,
+}
+
+struct InboxMarkReadHandler {
+    api: DurableNotifHttpApi,
+}
+
+impl Handler for InboxMarkReadHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.query.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "notification inbox writes accept no query parameters".into(),
+            ));
+        }
+        if ctx.request.body.len() > MAX_INBOX_MUTATION_BYTES {
+            return Err(EdgeError::PayloadTooLarge(
+                "notification inbox request body is too large".into(),
+            ));
+        }
+        if !ctx.request.body.is_empty() {
+            let value = ctx.request.json_body()?;
+            if value.as_object().is_none_or(|object| !object.is_empty()) {
+                return Err(EdgeError::BadRequest(
+                    "mark-read body must be an empty JSON object".into(),
+                ));
+            }
+        }
+        let item_id = inbox_item_param(ctx)?;
+        let scope = InboxReadScope {
+            tenant: ctx.principal.tenant.clone(),
+            region: ctx.principal.region.clone(),
+            recipient: ctx.principal.principal_id.0.clone(),
+        };
+        self.api
+            .drive(self.api.store.mark_read(&scope, item_id))
+            .map_err(map_inbox_error)?;
+        Ok(EdgeResponse::json(
+            200,
+            &json!({ "id": item_id, "state": "read" }),
+        )
+        .with_header("Cache-Control", "no-store"))
+    }
 }
 
 impl Handler for InboxListHandler {
@@ -173,6 +215,18 @@ fn inbox_item_json(row: &DurableInboxItem) -> Value {
     })
 }
 
+fn inbox_item_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
+    let value = ctx
+        .params
+        .get("item")
+        .map(String::as_str)
+        .ok_or_else(|| EdgeError::BadRequest("route did not bind an inbox item id".into()))?;
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(EdgeError::BadRequest("invalid notification inbox item id".into()));
+    }
+    Ok(value)
+}
+
 fn can_read_subject(
     identity: &StoreBackedCheck,
     principal: &Principal,
@@ -233,6 +287,7 @@ fn map_inbox_error(error: PgInboxError) -> EdgeError {
         | PgInboxError::CursorScopeMismatch => {
             EdgeError::BadRequest("invalid notification inbox page request".into())
         }
+        PgInboxError::NotFound => EdgeError::NotFound("notification not found".into()),
         PgInboxError::Database => {
             EdgeError::Unavailable("notification inbox is temporarily unavailable".into())
         }
@@ -249,18 +304,24 @@ pub fn register_notif(
     identity: StoreBackedCheck,
     runtime: Handle,
 ) -> GatewayBuilder {
-    builder.route(
-        Method::Get,
-        "/v1/notif/inbox",
-        "notif.inbox.list",
-        Arc::new(InboxListHandler {
-            api: DurableNotifHttpApi {
-                store,
-                identity,
-                runtime,
-            },
-        }),
-    )
+    let api = DurableNotifHttpApi {
+        store,
+        identity,
+        runtime,
+    };
+    builder
+        .route(
+            Method::Get,
+            "/v1/notif/inbox",
+            "notif.inbox.list",
+            Arc::new(InboxListHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/notif/inbox/{item}/read",
+            "notif.inbox.mark_read",
+            Arc::new(InboxMarkReadHandler { api }),
+        )
 }
 
 #[cfg(test)]
@@ -323,6 +384,13 @@ mod tests {
             error.envelope()["error"]["message"],
             "notification inbox is temporarily unavailable"
         );
+    }
+
+    #[test]
+    fn missing_items_are_indistinguishable_from_inaccessible_items() {
+        let error = map_inbox_error(PgInboxError::NotFound);
+        assert_eq!(error.status(), 404);
+        assert_eq!(error.envelope()["error"]["message"], "notification not found");
     }
 
     #[test]

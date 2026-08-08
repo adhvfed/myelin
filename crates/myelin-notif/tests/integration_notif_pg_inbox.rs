@@ -306,6 +306,21 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
     assert_eq!(mentioned.items.len(), 1);
     assert_eq!(mentioned.items[0].item.item_id, "direct-a");
 
+    store.mark_read(&scope, "direct-a").await.unwrap();
+    assert_eq!(
+        store
+            .mark_read(
+                &InboxReadScope {
+                    recipient: "psn:bob".into(),
+                    ..scope.clone()
+                },
+                "direct-a",
+            )
+            .await,
+        Err(PgInboxError::NotFound),
+        "a recipient cannot mutate another recipient's inbox item"
+    );
+
     let foreign = PgInboxStore::new(app.clone())
         .list(&InboxReadRequest {
             scope: InboxReadScope {
@@ -330,6 +345,17 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
         .await
         .unwrap();
     assert_eq!(after_rebuild.items.len(), 4);
+    assert_eq!(
+        after_rebuild
+            .items
+            .iter()
+            .find(|item| item.item.item_id == "direct-a")
+            .unwrap()
+            .item
+            .state,
+        "read",
+        "read state survives a new store instance"
+    );
 
     delete_probe_rows(&admin, &tenant, &region).await;
 }

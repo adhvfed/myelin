@@ -1,6 +1,7 @@
+import { useAction } from "@solidjs/router";
 import { createResource, createSignal, type Accessor } from "solid-js";
 
-import { getInbox } from "./api";
+import { getInbox, markInboxRead } from "./api";
 import type { InboxItem } from "./inbox-response";
 
 export type InboxAvailability = "loading" | "ready" | "unavailable";
@@ -11,10 +12,12 @@ export interface InboxState {
   availability: Accessor<InboxAvailability>;
   hasMore: Accessor<boolean>;
   retry: () => void;
+  markRead: (itemId: string) => Promise<boolean>;
 }
 
 /** Load the real recipient-scoped inbox through the server-only cookie-auth gateway client. */
 export function createInbox(): InboxState {
+  const markReadAction = useAction(markInboxRead);
   const [failed, setFailed] = createSignal(false);
   const [page, { refetch }] = createResource(async () => {
     try {
@@ -34,5 +37,11 @@ export function createInbox(): InboxState {
     return "ready";
   };
   const hasMore = () => page()?.page.next_cursor != null;
-  return { items, unreadCount, availability, hasMore, retry: () => void refetch() };
+  const markRead = async (itemId: string): Promise<boolean> => {
+    const result = await markReadAction(itemId);
+    if (!result.ok) return false;
+    await refetch();
+    return true;
+  };
+  return { items, unreadCount, availability, hasMore, retry: () => void refetch(), markRead };
 }

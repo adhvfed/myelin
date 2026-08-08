@@ -30,7 +30,12 @@ import { parseCommitDiff, parseCommitsPage, parsePrCommitsPage } from "./commit-
 import { parsePr, parsePrDiff, parsePrListPage } from "./pr-read-response";
 import { parseIssueId, parseIssueListInput } from "./issue-read-input";
 import { issueTargetFromEnv } from "./issue-target";
-import { parseInboxPage, type InboxPage } from "./inbox-response";
+import {
+  parseInboxPage,
+  parseInboxReadReceipt,
+  type InboxPage,
+  type InboxReadReceipt,
+} from "./inbox-response";
 import {
   parseGitBrowseInput,
   parseGitCommitInput,
@@ -678,6 +683,32 @@ export const getInbox = query(async (): Promise<InboxPage> => {
     return page;
   });
 }, "notif-inbox");
+
+export type InboxMutationResult =
+  | { ok: true; receipt: InboxReadReceipt }
+  | { ok: false };
+
+/** Mark one authenticated recipient-scoped inbox item as read. */
+export const markInboxRead = action(async (itemId: string) => {
+  "use server";
+  const result = (value: InboxMutationResult) => json(value, { revalidate: [] });
+  if (typeof itemId !== "string" || itemId.length === 0 || itemId.length > 512 ||
+      /[\p{Cc}]/u.test(itemId)) return result({ ok: false });
+  try {
+    return await inboxAuthed(async () => {
+      const response = await edgePost(
+        `/v1/notif/inbox/${seg(itemId)}/read`,
+        {},
+        { idempotencyKey: crypto.randomUUID() },
+      );
+      const receipt = parseInboxReadReceipt(response);
+      return result(receipt ? { ok: true, receipt } : { ok: false });
+    });
+  } catch (error) {
+    if (error instanceof GatewayError && error.status === 404) return result({ ok: false });
+    throw error;
+  }
+}, "notif-inbox-mark-read");
 
 /** A single repo's home (GET /v1/git/repos/{repo}) → the RepoHome ViewModel. */
 export const getRepo = query(async (repo: string): Promise<RepoHomeVM> => {

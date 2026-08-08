@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { inboxReasonLabel, parseInboxPage } from "./inbox-response";
+import { inboxReasonLabel, parseInboxPage, parseInboxReadReceipt } from "./inbox-response";
 
 const valid = {
   items: [{
@@ -35,5 +35,14 @@ describe("notification inbox response", () => {
     { ...valid, items: [{ ...valid.items[0], state: "new" }] },
   ])("rejects malformed or surplus wire data %#", (wire) => {
     expect(parseInboxPage(wire)).toBeNull();
+  });
+
+  it("accepts only the exact mark-read receipt", () => {
+    expect(parseInboxReadReceipt({ id: "01JITEM", state: "read" })).toEqual({
+      id: "01JITEM",
+      state: "read",
+    });
+    expect(parseInboxReadReceipt({ id: "01JITEM", state: "unread" })).toBeNull();
+    expect(parseInboxReadReceipt({ id: "01JITEM", state: "read", extra: true })).toBeNull();
   });
 });
