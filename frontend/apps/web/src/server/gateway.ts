@@ -60,6 +60,15 @@ export async function edgePost<T = unknown>(
   return edgeRequest<T>("POST", path, body, options);
 }
 
+/** PUT an idempotent replacement through the same cookie-authenticated gateway lifecycle. */
+export async function edgePut<T = unknown>(
+  path: string,
+  body?: unknown,
+  options?: GatewayMutationOptions,
+): Promise<T> {
+  return edgeRequest<T>("PUT", path, body, options);
+}
+
 /**
  * GET an UNAUTHENTICATED edge endpoint (no Bearer, no session) — for the logged-out `GET
  * /v1/auth/config` the login page reads before any session exists (R3.5). No auth lifecycle: a

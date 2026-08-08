@@ -47,9 +47,6 @@ interface NavItem {
   href: string;
   icon: IconName;
   label: string;
-  /** An unbuilt destination (R3.4 honest rail): muted + a neutral construction dot + a title tooltip, still
-   *  a real keyboard-reachable link that lands on the teaching NotAvailable. Never disabled, never
-   *  accent, never colour-alone (the tooltip + destination copy carry the meaning). */
   underConstruction?: boolean;
 }
 
@@ -59,7 +56,7 @@ const NAV: NavItem[] = [
   { href: "/issues", icon: "nav-issues", label: "Issues" },
   { href: "/chat", icon: "nav-chat", label: "Chat" },
   { href: "/ci", icon: "nav-ci", label: "CI" },
-  { href: "/knowledge", icon: "nav-knowledge", label: "Knowledge", underConstruction: true },
+  { href: "/knowledge", icon: "nav-knowledge", label: "Knowledge" },
 ];
 
 const THEMES = ["dark", "light", "high-contrast"] as const;

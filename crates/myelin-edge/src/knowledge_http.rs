@@ -91,6 +91,12 @@ struct BlockBody {
     #[serde(rename = "type")]
     block_type: String,
     markdown: String,
+    #[serde(default = "active_block_state")]
+    state: String,
+}
+
+fn active_block_state() -> String {
+    "active".into()
 }
 
 struct PageListHandler {
@@ -285,17 +291,21 @@ impl Handler for PageSaveHandler {
                 ));
             }
             let existing = current_blocks.get(block_id.as_str()).copied();
-            let unchanged = match existing {
+            let visible_markdown = match existing {
                 Some(block) if block.block_type == draft.block_type => open_visible(
                     self.api.kms.as_ref(),
                     &current,
                     &block.inline,
                     &block.edited_by,
                     &block_scope(&page_id, &block_id),
-                )?
-                .as_deref()
-                    == Some(draft.markdown.as_bytes()),
-                _ => false,
+                )?,
+                _ => None,
+            };
+            let unchanged = if draft.state == "tombstoned" {
+                existing.is_some_and(|block| block.block_type == draft.block_type)
+                    && visible_markdown.is_none()
+            } else {
+                visible_markdown.as_deref() == Some(draft.markdown.as_bytes())
             };
             if unchanged {
                 blocks.push(existing.expect("unchanged implies an existing block").clone());
@@ -507,6 +517,16 @@ fn validate_document(blocks: &[BlockBody]) -> Result<(), EdgeError> {
     }
     let mut total = 0usize;
     for block in blocks {
+        if !matches!(block.state.as_str(), "active" | "tombstoned") {
+            return Err(EdgeError::BadRequest(
+                "Knowledge block state must be `active` or `tombstoned`".into(),
+            ));
+        }
+        if block.state == "tombstoned" && (block.id.is_none() || !block.markdown.is_empty()) {
+            return Err(EdgeError::BadRequest(
+                "a tombstoned Knowledge block must retain its id and have no visible text".into(),
+            ));
+        }
         if block.markdown.len() > MAX_BLOCK_BYTES {
             return Err(EdgeError::PayloadTooLarge(
                 "one Knowledge block exceeds 64 KiB".into(),
@@ -749,6 +769,7 @@ mod tests {
             id: None,
             block_type: "paragraph".into(),
             markdown: "One render path".into(),
+            state: "active".into(),
         }])
         .is_ok());
         assert!(validate_document(&[]).is_err());

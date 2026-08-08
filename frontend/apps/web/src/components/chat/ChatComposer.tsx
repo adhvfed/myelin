@@ -1,4 +1,4 @@
-import { Icon } from "@myelin/design-system";
+import { BlockEditor, Icon, type EditorBlock } from "@myelin/design-system";
 import { useAction } from "@solidjs/router";
 import { createSignal, onMount, Show } from "solid-js";
 
@@ -31,7 +31,6 @@ export function ChatComposer(props: ChatComposerProps) {
   const [error, setError] = createSignal<string | null>(null);
   const [sending, setSending] = createSignal(false);
   const [interactive, setInteractive] = createSignal(false);
-  let input: HTMLTextAreaElement | undefined;
 
   onMount(() => setInteractive(true));
 
@@ -39,7 +38,6 @@ export function ChatComposer(props: ChatComposerProps) {
     if (sending()) return;
     if (!content().trim()) {
       setError("Write a message before sending.");
-      input?.focus();
       return;
     }
     const sentContent = content();
@@ -62,7 +60,6 @@ export function ChatComposer(props: ChatComposerProps) {
       }
       setContent("");
       await props.onPosted();
-      input?.focus();
     } catch {
       setError(errorCopy("error"));
     } finally {
@@ -70,31 +67,22 @@ export function ChatComposer(props: ChatComposerProps) {
     }
   };
 
-  const keydown = (event: KeyboardEvent) => {
-    if (event.key !== "Enter" || event.shiftKey || event.isComposing) return;
-    event.preventDefault();
-    void send();
-  };
+  const editorValue = (): EditorBlock[] => [{ type: "paragraph", markdown: content() }];
 
   return (
     <div class="chat-composer">
-      <label class="sr-only" for="chat-message-composer">Message {props.topic}</label>
-      <textarea
-        ref={input}
-        id="chat-message-composer"
-        rows={2}
-        value={content()}
-        onInput={(event) => {
-          setContent(event.currentTarget.value);
-          setError(null);
-        }}
-        onKeyDown={keydown}
-        disabled={!interactive() || sending()}
-        maxlength={32 * 1024}
-        placeholder={`Message ${props.topic}`}
-        aria-describedby={error() ? "chat-composer-error" : "chat-composer-hint"}
-        aria-invalid={Boolean(error())}
-      />
+      <div class="chat-composer-editor" classList={{ invalid: Boolean(error()) }}>
+        <BlockEditor
+          value={editorValue()}
+          readOnly={!interactive() || sending()}
+          inputLabel={`Message ${props.topic}`}
+          onSubmit={() => void send()}
+          onChange={(blocks) => {
+            setContent(blocks.map((block) => block.markdown).join("\n"));
+            setError(null);
+          }}
+        />
+      </div>
       <div class="chat-composer-footer">
         <Show
           when={error()}

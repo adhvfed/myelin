@@ -7,6 +7,7 @@
   "sideEffects": ["*.css"],
   "exports": {
     ".": "./src/index.ts",
+    "./block-editor.css": "./src/block-editor.css",
     "./tokens.css": "./generated/tokens.css",
     "./tokens": "./generated/tokens.ts",
     "./sprite.svg": "./generated/assets/sprite.svg"

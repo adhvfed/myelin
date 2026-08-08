@@ -101,6 +101,7 @@ export {
   type RepoErrorKind,
 } from "./repo-error";
 export * from "./chat-api";
+export * from "./knowledge-api";
 
 /** A brief commit projection for the latest-commit bar / per-entry activity (R3.4). */
 export interface CommitBriefVM {
