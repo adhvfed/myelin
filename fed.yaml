@@ -1,9 +1,13 @@
 parameters:
+  MYELIN_KMS_SEAL_KEY:
+    type: secret
+    generate: openssl rand -hex 32
   POSTGRES_PORT: { type: port, default: 5433 }
   S3_PORT: { type: port, default: 9000 }
   VALKEY_PORT: { type: port, default: 6380 }
   NATS_PORT: { type: port, default: 4222 }
   NATS_MONITOR_PORT: { type: port, default: 8222 }
+  EDGE_PORT: { type: port, default: 8080 }
 
 services:
   postgres:
@@ -21,6 +25,18 @@ services:
       command: pg_isready -U myelin_admin -d myelin
       timeout: 30s
     startup_message: "Postgres: localhost:{{POSTGRES_PORT}}"
+
+  postgres-ready:
+    depends_on: [postgres]
+    migrate: >-
+      docker run --rm --network host
+      -e PGPASSWORD=myelin_dev_pw
+      -v "$PWD/scripts/pg-init/01-ci-definition-fence.sql:/init.sql:ro"
+      postgres:16@sha256:78df81b1442dcc764c1104154da7162635e40cfffe67579c42a1c1b96dfc209c
+      psql -h 127.0.0.1 -p {{POSTGRES_PORT}}
+      -U myelin_admin -d myelin
+      --set=ON_ERROR_STOP=1 --set=migration_role=myelin_admin
+      --file=/init.sql
 
   object-store:
     image: rustfs/rustfs@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3
@@ -81,11 +97,42 @@ services:
     startup_message: "NATS: localhost:{{NATS_PORT}}"
 
   data-layer:
-    depends_on: [postgres, object-store-ready, valkey, nats]
+    depends_on: [postgres-ready, object-store-ready, valkey, nats]
     migrate: ":"
     startup_message: "Myelin data services are ready"
 
-entrypoint: data-layer
+  edge:
+    depends_on: [data-layer]
+    process: >-
+      sh -c 'git_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/git";
+      mkdir -p "$git_root";
+      export MYELIN_GIT_ROOT="$git_root" MYELIN_CI_CHECKOUT_REPO_ROOT="$git_root";
+      exec cargo run --quiet -p myelin-edge --bin edge'
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_GIT_WIRE_ENABLED: "0"
+      MYELIN_PUBLIC_BASE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_EDGE_ADDR: "127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_DEV_LOGIN: "1"
+      MYELIN_TOKEN_LOGIN: "1"
+      MYELIN_ISSUES_RECONCILE_TENANTS: acme
+    healthcheck:
+      http_get: "http://127.0.0.1:{{EDGE_PORT}}/readyz"
+      timeout: 120s
+    startup_message: "Myelin edge: http://127.0.0.1:{{EDGE_PORT}}"
+
+entrypoint: edge
 
 scripts:
   test:backend:

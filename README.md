@@ -28,7 +28,7 @@ S3-compatible object store.
 
 ## Development
 
-Install `fed`, then start the local data services:
+Install `fed`, then start the local data services and Rust edge:
 
 ```sh
 fed start
@@ -36,8 +36,8 @@ fed start
 
 Run tests that use those services with `fed test:backend`. The frontend checks are
 available as `fed test:frontend`, and `fed test:browser-contract` runs the faster
-browser suite against its contract backend. The project is moving toward running the
-Rust edge and web application in the default `fed start` composition.
+browser suite against its contract backend. The web application is the remaining
+process to add to the default composition.
 
 ## Status
 
