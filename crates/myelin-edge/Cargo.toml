@@ -23,6 +23,7 @@ myelin-git = { path = "../myelin-git" }
 myelin-issues = { path = "../myelin-issues" }
 myelin-notif = { path = "../myelin-notif" }
 myelin-chat = { path = "../myelin-chat" }
+myelin-knowledge = { path = "../myelin-knowledge" }
 myelin-agent = { path = "../myelin-agent" }
 myelin-events = { path = "../myelin-events" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }

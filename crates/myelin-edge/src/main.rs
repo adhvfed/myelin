@@ -7,8 +7,9 @@ use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
     register_chat, register_ci, register_git_durable, register_git_wire, register_issues,
-    register_notif, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
-    AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
+    register_knowledge, register_notif, serve_edge_until_shutdown_with_probe,
+    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
+    AuthenticatedActionPolicy, BootstrapParams,
     CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, GitDatabaseProviders,
     IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
     SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
@@ -561,10 +562,24 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         std::process::exit(1);
     }
     if let Err(e) = bootstrap
+        .migrate(&myelin_knowledge::knowledge_page_migrations(), &HotTables::none())
+        .await
+    {
+        eprintln!("edge: cannot apply the Knowledge page and block migrations: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
         .verify_index_ready(myelin_chat::store::pg_conversation::CONVERSATION_RECENT_INDEX)
         .await
     {
         eprintln!("edge: Chat topic-list keyset index is not ready: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
+        .verify_index_ready(myelin_knowledge::KNOWLEDGE_PAGE_RECENT_INDEX)
+        .await
+    {
+        eprintln!("edge: Knowledge page-list keyset index is not ready: {e}");
         std::process::exit(1);
     }
     if let Err(e) = bootstrap
@@ -899,6 +914,14 @@ async fn serve(
             std::process::exit(1);
         }
     }
+    for admit in check.admit_knowledge_fragment() {
+        if let FragmentAdmit::Rejected { reason } = admit {
+            eprintln!(
+                "edge: the Knowledge ReBAC fragment did not admit (page access would deny everything): {reason}"
+            );
+            std::process::exit(1);
+        }
+    }
     let issue_authorizer = StoreBackedIssueAuthorizer::new(check.clone());
     let issue_store = Arc::new(myelin_issues::PgIssueStore::new(
         provider.clone(),
@@ -1020,6 +1043,12 @@ async fn serve(
         handle.clone(),
     );
     builder = register_chat(
+        builder,
+        provider.db_pool().clone(),
+        handle.clone(),
+        kms.clone(),
+    );
+    builder = register_knowledge(
         builder,
         provider.db_pool().clone(),
         handle.clone(),

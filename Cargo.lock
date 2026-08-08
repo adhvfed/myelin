@@ -2575,6 +2575,7 @@ dependencies = [
  "myelin-identity",
  "myelin-identity-service",
  "myelin-issues",
+ "myelin-knowledge",
  "myelin-notif",
  "myelin-storage",
  "myelin-substrate",
@@ -2796,6 +2797,7 @@ dependencies = [
 name = "myelin-knowledge"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "myelin-agent",
  "myelin-agent-service",
  "myelin-config",

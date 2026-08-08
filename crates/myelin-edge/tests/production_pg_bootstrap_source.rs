@@ -118,6 +118,38 @@ fn production_edge_mounts_encrypted_durable_chat_topics_and_messages() {
 }
 
 #[test]
+fn production_edge_mounts_encrypted_durable_knowledge_pages() {
+    let main = include_str!("../src/main.rs");
+    let route = include_str!("../src/knowledge_http.rs");
+    let store = include_str!("../../myelin-knowledge/src/pg_page.rs");
+    let authz = include_str!("../src/authz.rs");
+
+    assert!(main.contains("&myelin_knowledge::knowledge_page_migrations()"));
+    assert!(main.contains("KNOWLEDGE_PAGE_RECENT_INDEX"));
+    assert!(main.contains("register_knowledge("));
+    assert!(main.contains("kms.clone()"));
+    assert!(route.contains("/v1/knowledge/pages"));
+    assert!(route.contains("KnowledgePageStore::new(pool)"));
+    assert!(route.contains("encrypt_text("));
+    assert!(route.contains("decrypt_text("));
+    assert!(route.contains("current.owner != viewer"));
+    assert!(store.contains("myelin_make_tenant_scoped"));
+    assert_eq!(
+        store.matches("PgRelay::co_commit_in_tx").count(),
+        2,
+        "create and save must each co-commit their domain event"
+    );
+    assert!(!store.contains("title_plaintext"));
+    assert!(!store.contains("body_plaintext"));
+    assert!(authz.contains(
+        "requirement!(\"knowledge.pages.list\", \"knowledge.read\", OP_AGENT_PAT)"
+    ));
+    assert!(authz.contains(
+        "requirement!(\"knowledge.page.save\", \"knowledge.edit\", OP_AGENT_PAT)"
+    ));
+}
+
+#[test]
 fn production_edge_mounts_the_repo_authorized_durable_ci_reads() {
     let main = include_str!("../src/main.rs");
     let route = include_str!("../src/ci_http.rs");
