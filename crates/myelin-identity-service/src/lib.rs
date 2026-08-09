@@ -33,8 +33,9 @@ pub mod tuple_store;
 pub mod webauthn;
 
 pub use agent_registry::{
-    agent_ref, validate_new_agent, AgentActivation, AgentRegistration, AgentRegistryError,
-    NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME, MAX_AGENT_NAME_BYTES, MAX_AGENT_TOOLS,
+    agent_ref, validate_new_agent, AgentActivation, AgentLifecycleAction, AgentLifecycleOutcome,
+    AgentLifecycleRequest, AgentRegistration, AgentRegistryError, NewAgent, PgAgentRegistry,
+    EXTERNAL_MCP_RUNTIME, MAX_AGENT_NAME_BYTES, MAX_AGENT_TOOLS,
 };
 pub use agent_session::{
     agent_run_ref, AgentSession, AgentSessionError, AgentSessionIssuer, AgentSessionRequest,

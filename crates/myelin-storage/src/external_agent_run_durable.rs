@@ -46,10 +46,52 @@ CREATE POLICY myelin_tenant_isolation ON external_agent_run
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_LIFECYCLE_COMMAND_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS agent_lifecycle_command (
+    tenant_id       text        NOT NULL,
+    region          text        NOT NULL,
+    actor_id        text        NOT NULL,
+    client_nonce    text        NOT NULL,
+    agent_id        uuid        NOT NULL,
+    requested_status text       NOT NULL,
+    changed         boolean     NOT NULL,
+    terminated_runs bigint      NOT NULL,
+    occurred_at     timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, region, actor_id, client_nonce),
+    FOREIGN KEY (tenant_id, region, agent_id)
+        REFERENCES identity_agent (tenant_id, region, agent_id),
+    CHECK (length(actor_id) BETWEEN 1 AND 255),
+    CHECK (length(client_nonce) BETWEEN 1 AND 128),
+    CHECK (requested_status IN ('Active', 'Suspended', 'Disabled')),
+    CHECK (terminated_runs >= 0)
+);
+CREATE INDEX IF NOT EXISTS agent_lifecycle_command_agent_recent
+    ON agent_lifecycle_command (tenant_id, region, agent_id, occurred_at DESC);
+"#;
+
+pub const AGENT_LIFECYCLE_COMMAND_RLS_POLICY: &str = r#"
+ALTER TABLE agent_lifecycle_command ENABLE ROW LEVEL SECURITY;
+ALTER TABLE agent_lifecycle_command FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON agent_lifecycle_command;
+CREATE POLICY myelin_tenant_isolation ON agent_lifecycle_command
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+"#;
+
 pub fn external_agent_run_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0086_external_agent_run", EXTERNAL_AGENT_RUN_MIGRATION),
         Migration::plain("0087_external_agent_run_rls", EXTERNAL_AGENT_RUN_RLS_POLICY),
+        Migration::plain(
+            "0088_agent_lifecycle_command",
+            AGENT_LIFECYCLE_COMMAND_MIGRATION,
+        ),
+        Migration::plain(
+            "0089_agent_lifecycle_command_rls",
+            AGENT_LIFECYCLE_COMMAND_RLS_POLICY,
+        ),
     ])
 }
 
@@ -138,6 +180,29 @@ impl DurableExternalAgentRunBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
+                    let active_status = serde_json::to_string(
+                        &myelin_identity::PrincipalStatus::Active,
+                    )
+                    .expect("principal status serializes");
+                    let status = sqlx::query_scalar::<_, String>(
+                        "SELECT p.status FROM identity_agent a \
+                           JOIN principal p ON p.tenant_id = a.tenant_id \
+                            AND p.region = a.region \
+                            AND p.principal_id = 'agent:' || a.agent_id::text \
+                          WHERE a.tenant_id = $1 AND a.region = $2 AND a.agent_id = $3 \
+                          FOR UPDATE OF p",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(agent_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("lock external agent before run claim"))?;
+                    if status.as_deref() != Some(active_status.as_str()) {
+                        return Err(PgError::Query(
+                            "external agent run claim refused an inactive or unknown agent".into(),
+                        ));
+                    }
                     let inserted = sqlx::query(
                         "INSERT INTO external_agent_run (\
                            tenant_id, region, run_id, agent_id, trigger_actor_id, \
@@ -428,6 +493,10 @@ mod tests {
         assert!(EXTERNAL_AGENT_RUN_MIGRATION.contains("FOREIGN KEY (tenant_id, region, agent_id)"));
         assert!(EXTERNAL_AGENT_RUN_MIGRATION.contains("CHECK (expires_at > issued_at)"));
         assert!(EXTERNAL_AGENT_RUN_MIGRATION.contains("trigger_authority text[]"));
+        assert!(AGENT_LIFECYCLE_COMMAND_MIGRATION
+            .contains("PRIMARY KEY (tenant_id, region, actor_id, client_nonce)"));
+        assert!(AGENT_LIFECYCLE_COMMAND_MIGRATION
+            .contains("REFERENCES identity_agent (tenant_id, region, agent_id)"));
         assert!(EXTERNAL_AGENT_RUN_RLS_POLICY.contains("FORCE ROW LEVEL SECURITY"));
     }
 

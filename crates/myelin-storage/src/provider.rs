@@ -753,7 +753,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0087_external_agent_run_rls");
+        assert_eq!(*ids.last().unwrap(), "0089_agent_lifecycle_command_rls");
     }
 
     #[test]

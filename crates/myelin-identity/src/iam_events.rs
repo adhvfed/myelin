@@ -11,12 +11,15 @@ pub const IDENTITY_PROJECT_CREATED: &str = "identity.project.created";
 
 pub const IDENTITY_AGENT_CREATED: &str = "identity.agent.created";
 
+pub const IDENTITY_AGENT_STATUS_CHANGED: &str = "identity.agent.status_changed";
+
 pub const IDENTITY_EVENT_TOKENS: &[&str] = &[
     IDENTITY_TUPLE_WRITTEN,
     IDENTITY_ROLE_GRANTED,
     IDENTITY_BREAK_GLASS,
     IDENTITY_PROJECT_CREATED,
     IDENTITY_AGENT_CREATED,
+    IDENTITY_AGENT_STATUS_CHANGED,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -99,11 +102,12 @@ mod tests {
                 );
             }
         }
-        assert_eq!(IDENTITY_EVENT_TOKENS.len(), 5);
+        assert_eq!(IDENTITY_EVENT_TOKENS.len(), 6);
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_TUPLE_WRITTEN));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_ROLE_GRANTED));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_BREAK_GLASS));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_PROJECT_CREATED));
+        assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_AGENT_STATUS_CHANGED));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_AGENT_CREATED));
     }
 

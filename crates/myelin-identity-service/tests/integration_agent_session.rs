@@ -7,9 +7,9 @@ use myelin_config::MyelinConfig;
 use myelin_events::Timestamp;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
-    agent_run_ref, machine_scheme, AgentSessionIssuer, AgentSessionRequest, Authority,
-    CellTokenAuthority, CredentialPurpose, NewAgent, PgAgentRegistry, RunTokenState,
-    StoreBackedCheck, EXTERNAL_MCP_RUNTIME,
+    agent_run_ref, machine_scheme, AgentLifecycleAction, AgentLifecycleRequest, AgentSessionIssuer,
+    AgentSessionRequest, Authority, CellTokenAuthority, CredentialPurpose, NewAgent,
+    PgAgentRegistry, RunTokenState, StoreBackedCheck, EXTERNAL_MCP_RUNTIME,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::{all_durable_migrations, KmsEngine, SubstrateProvider, TenantScope};
@@ -101,6 +101,7 @@ fn run_request(agent_id: &str, now: chrono::DateTime<Utc>) -> AgentSessionReques
 
 async fn cleanup(admin: &SubstrateProvider, tenant: &str) {
     for sql in [
+        "DELETE FROM agent_lifecycle_command WHERE tenant_id = $1",
         "DELETE FROM external_agent_run WHERE tenant_id = $1",
         "DELETE FROM delegation_run_snapshot WHERE tenant_id = $1",
         "DELETE FROM delegation_policy_head WHERE tenant_id = $1",
@@ -115,6 +116,18 @@ async fn cleanup(admin: &SubstrateProvider, tenant: &str) {
         "DELETE FROM outbox WHERE envelope->>'tenant' = $1",
     ] {
         let _ = sqlx::query(sql).bind(tenant).execute(admin.db_pool()).await;
+    }
+}
+
+fn lifecycle_request(
+    agent_id: &str,
+    action: AgentLifecycleAction,
+    nonce: &str,
+) -> AgentLifecycleRequest {
+    AgentLifecycleRequest {
+        agent_id: agent_id.into(),
+        action,
+        client_nonce: nonce.into(),
     }
 }
 
@@ -354,5 +367,198 @@ async fn one_click_starts_one_short_lived_agent_even_when_the_network_retries() 
         "terminal state and token teardown are committed together"
     );
 
+    cleanup(&admin, &tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_human_can_pause_and_retire_an_agent_without_leaving_a_live_run_behind() {
+    let Some((admin, app)) = providers().await else {
+        eprintln!("SKIP: dev PostgreSQL unavailable");
+        return;
+    };
+    let tenant = unique("lifecycle");
+    let region = app.config().region.clone();
+    let actor = human(&tenant, &region);
+    let registry = PgAgentRegistry::new(app.clone());
+    let agent = registry
+        .create(&actor, activation("activate-lifecycle-companion-v1"))
+        .await
+        .expect("the human activates a collaborator")
+        .agent;
+    let identity = StoreBackedCheck::with_pg(
+        app.clone(),
+        Arc::new(KmsEngine::new()),
+        Arc::new(CellTokenAuthority::generate()),
+        tokio::runtime::Handle::current(),
+    );
+    let issuer = AgentSessionIssuer::new(app, identity.clone(), 60)
+        .expect("the fail-static run lifetime is valid");
+    let now = Utc::now()
+        .with_nanosecond(0)
+        .expect("zero nanoseconds is a valid wall-clock instant");
+    let first_run = issuer
+        .start(&actor, run_request(&agent.id, now))
+        .await
+        .expect("the active agent begins useful work");
+    let active_agent = Principal::new(
+        actor.tenant.clone(),
+        actor.region.clone(),
+        PrincipalId(agent.principal_id.clone()),
+        PrincipalKind::Agent {
+            runtime_ref: myelin_identity::RuntimeRef(agent.runtime_ref.clone()),
+            on_behalf_of: Some(actor.principal_id.clone()),
+        },
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    let scope = TenantScope::from_verified_token(&active_agent, active_agent.region.clone());
+
+    let suspension = registry
+        .change_status(
+            &actor,
+            lifecycle_request(
+                &agent.id,
+                AgentLifecycleAction::Suspend,
+                "pause-lifecycle-companion-v1",
+            ),
+        )
+        .await
+        .expect("one administrative action pauses the identity and its work");
+    assert_eq!(suspension.agent.status, PrincipalStatus::Suspended);
+    assert!(suspension.changed);
+    assert_eq!(
+        suspension.terminated_runs, 1,
+        "the response tells the human that in-flight work was stopped"
+    );
+    assert_eq!(
+        identity.run_token_minter().revocation_state(
+            &scope,
+            &first_run.run_token,
+            &Timestamp((now + Duration::seconds(1)).to_rfc3339_opts(SecondsFormat::Secs, true)),
+        ),
+        RunTokenState::TornDown,
+        "suspension and bearer teardown are one durable fact"
+    );
+    assert!(matches!(
+        issuer
+            .authorize(
+                &active_agent,
+                &first_run.session.run_id,
+                &first_run.run_token.jti,
+                now + Duration::seconds(1),
+            )
+            .await,
+        Err(myelin_identity_service::AgentSessionError::RunNotFound)
+    ));
+
+    let replayed_suspension = registry
+        .change_status(
+            &actor,
+            lifecycle_request(
+                &agent.id,
+                AgentLifecycleAction::Suspend,
+                "pause-lifecycle-companion-v1",
+            ),
+        )
+        .await
+        .expect("a lost suspension response is safe to retry");
+    assert_eq!(replayed_suspension, suspension);
+    let mut refused_request = run_request(&agent.id, now + Duration::seconds(2));
+    refused_request.client_nonce = "suspended-agent-cannot-start".into();
+    assert!(matches!(
+        issuer.start(&actor, refused_request).await,
+        Err(myelin_identity_service::AgentSessionError::NotFound)
+    ));
+
+    let resumed = registry
+        .change_status(
+            &actor,
+            lifecycle_request(
+                &agent.id,
+                AgentLifecycleAction::Resume,
+                "resume-lifecycle-companion-v1",
+            ),
+        )
+        .await
+        .expect("a deliberately paused collaborator can return");
+    assert_eq!(resumed.agent.status, PrincipalStatus::Active);
+    assert!(resumed.changed);
+    assert_eq!(resumed.terminated_runs, 0);
+    let mut second_request = run_request(&agent.id, now + Duration::seconds(3));
+    second_request.client_nonce = "start-after-deliberate-resume".into();
+    let second_run = issuer
+        .start(&actor, second_request)
+        .await
+        .expect("resume permits new work without reviving the old bearer");
+    assert_ne!(second_run.session.run_id, first_run.session.run_id);
+    assert_eq!(
+        identity.run_token_minter().revocation_state(
+            &scope,
+            &first_run.run_token,
+            &Timestamp((now + Duration::seconds(4)).to_rfc3339_opts(SecondsFormat::Secs, true)),
+        ),
+        RunTokenState::TornDown,
+        "resume never resurrects an earlier run"
+    );
+
+    let retirement = registry
+        .change_status(
+            &actor,
+            lifecycle_request(
+                &agent.id,
+                AgentLifecycleAction::Retire,
+                "retire-lifecycle-companion-v1",
+            ),
+        )
+        .await
+        .expect("retirement permanently disables the collaborator");
+    assert_eq!(retirement.agent.status, PrincipalStatus::Disabled);
+    assert!(retirement.changed);
+    assert_eq!(retirement.terminated_runs, 1);
+    assert_eq!(
+        identity.run_token_minter().revocation_state(
+            &scope,
+            &second_run.run_token,
+            &Timestamp((now + Duration::seconds(4)).to_rfc3339_opts(SecondsFormat::Secs, true)),
+        ),
+        RunTokenState::TornDown
+    );
+    assert!(matches!(
+        registry
+            .change_status(
+                &actor,
+                lifecycle_request(
+                    &agent.id,
+                    AgentLifecycleAction::Resume,
+                    "retired-agent-cannot-resume",
+                ),
+            )
+            .await,
+        Err(myelin_identity_service::AgentRegistryError::Conflict(_))
+    ));
+
+    let terminal_runs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM external_agent_run \
+          WHERE tenant_id = $1 AND region = $2 AND agent_id = $3::uuid AND state = 'terminal'",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .bind(&agent.id)
+    .fetch_one(admin.db_pool())
+    .await
+    .expect("observe terminal run history after lifecycle changes");
+    let lifecycle_events: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox WHERE aggregate = $1 \
+           AND envelope->>'type_' = 'identity.agent.status_changed'",
+    )
+    .bind(format!("identity:agent:{}", agent.id))
+    .fetch_one(admin.db_pool())
+    .await
+    .expect("count durable lifecycle events");
+    assert_eq!(terminal_runs, 2);
+    assert_eq!(
+        lifecycle_events, 3,
+        "suspend, resume, and retire each emit once; retries do not"
+    );
     cleanup(&admin, &tenant).await;
 }

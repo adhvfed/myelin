@@ -220,7 +220,8 @@ pub use events_durable::{
 pub use events_serve::{EventsRuntime, EventsServeError, DEFAULT_DRAIN_BATCH};
 pub use external_agent_run_durable::{
     external_agent_run_durable_migrations, ClaimedExternalAgentRun, DurableExternalAgentRun,
-    DurableExternalAgentRunBacking, ExternalAgentRunState, EXTERNAL_AGENT_RUN_MIGRATION,
+    DurableExternalAgentRunBacking, ExternalAgentRunState, AGENT_LIFECYCLE_COMMAND_MIGRATION,
+    AGENT_LIFECYCLE_COMMAND_RLS_POLICY, EXTERNAL_AGENT_RUN_MIGRATION,
     EXTERNAL_AGENT_RUN_RLS_POLICY,
 };
 pub use identity_durable::{

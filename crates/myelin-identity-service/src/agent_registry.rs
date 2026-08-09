@@ -17,6 +17,10 @@ use myelin_tenancy::ArtifactRef;
 use sqlx::Row;
 use uuid::Uuid;
 
+mod lifecycle;
+
+pub use lifecycle::{AgentLifecycleAction, AgentLifecycleOutcome, AgentLifecycleRequest};
+
 pub const EXTERNAL_MCP_RUNTIME: &str = "external:mcp";
 pub const MAX_AGENT_NAME_BYTES: usize = 80;
 pub const MAX_AGENT_TOOLS: usize = 128;

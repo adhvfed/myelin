@@ -146,6 +146,7 @@ impl AgentSessionIssuer {
             .map_err(map_registry_error)?;
         if registration.created_by != actor.principal_id.0
             || registration.runtime_ref != EXTERNAL_MCP_RUNTIME
+            || registration.status != PrincipalStatus::Active
         {
             return Err(AgentSessionError::NotFound);
         }
