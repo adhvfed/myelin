@@ -1,71 +1,71 @@
+pub mod agent_run_gate;
+pub mod agent_wallet;
 pub mod backup;
 pub mod blob;
-pub mod replicated_blob;
+pub mod bus_shred;
+pub mod cache;
 pub mod cdn;
+pub mod cell_migration;
 pub mod ci_cache_scope;
-pub mod git_shred;
-pub mod gitpack;
-pub mod object_packs;
+#[cfg(any(test, feature = "test-support"))]
+pub mod ci_log_index;
+pub mod coloc;
+#[cfg(any(test, feature = "test-support"))]
+pub mod e2e3_reindex_parity;
 pub mod encryption;
-pub mod mirror;
 pub mod erase;
 #[cfg(any(test, feature = "test-support"))]
 pub mod firehose_archive;
-pub mod holder_fanout;
-pub mod multi_cell_erase;
-#[cfg(any(test, feature = "test-support"))]
-pub mod ci_log_index;
 pub mod gd4;
-pub mod bus_shred;
-pub mod cache;
-pub mod cell_migration;
-pub mod coloc;
+pub mod git_shred;
+pub mod gitpack;
 pub mod holder;
+pub mod holder_fanout;
 pub mod key_origin;
 pub mod kms;
 pub mod kms_failstatic;
 pub mod migration;
 pub mod migration_under_load;
+pub mod mirror;
+pub mod money;
+pub mod multi_cell_erase;
+pub mod object_packs;
 pub mod olap;
 pub mod olap_feed;
 pub mod olap_restrict;
-#[cfg(any(test, feature = "test-support"))]
-pub mod e2e3_reindex_parity;
 pub mod oltp;
 pub mod reerase;
+pub mod replicated_blob;
 pub mod reserve_settle;
-pub mod agent_run_gate;
-pub mod agent_wallet;
-pub mod money;
 pub mod residency;
 pub mod restore;
 pub mod restore_verify;
 pub mod rls;
 pub mod storage_surge;
 
+pub mod authz_projection_durable;
+pub mod backend;
+pub mod delegation_policy_durable;
+pub mod elected_relay;
+pub mod events_durable;
+#[cfg(feature = "integration")]
+pub mod events_serve;
+pub mod hitl_gate_durable;
+pub mod identity_durable;
+pub mod kms_durable;
+pub mod outbox_durable;
 pub mod pg;
 pub mod pg_migrator;
-pub mod s3blob;
-pub mod valkey;
-pub mod tenant_tx;
+pub mod pgrelay;
+pub mod placement_durable;
 pub mod provider;
-pub mod delegation_policy_durable;
-pub mod identity_durable;
 pub mod pseudonym_durable;
 pub mod reerase_durable;
 pub mod reserve_settle_durable;
 pub mod restore_verify_durable;
-pub mod hitl_gate_durable;
-pub mod authz_projection_durable;
-pub mod backend;
-pub mod elected_relay;
-pub mod pgrelay;
-pub mod events_durable;
-pub mod outbox_durable;
-#[cfg(feature = "integration")]
-pub mod events_serve;
-pub mod placement_durable;
-pub mod kms_durable;
+pub mod s3blob;
+pub mod tenant_tx;
+pub mod valkey;
 
 pub mod cell_root_durable;
 
@@ -73,16 +73,15 @@ pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlig
 pub use agent_wallet::{
     agent_wallet_migrations, AgentWallet, CreditKind, WalletError, AGENT_WALLET_MIGRATION,
 };
-pub use money::MicroUsd;
 pub use backup::{
     BackupError, BackupSet, BaseBackup, ContinuousArchiver, EpochSecs, LogTierSeal,
     ObjectTierBackup, ObjectVersion, StoreTier, WalOffset, WalSegment,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use blob::FsBlobStore;
 pub use blob::{
     BlobError, BlobMeta, BlobStore, BlobTelemetry, ContentHash, ContentWrap, HashAlgo, IdentityWrap,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use blob::FsBlobStore;
 pub use bus_shred::KmsBusShredder;
 pub use cache::{Cache, CacheError, InMemoryCache};
 pub use cdn::{CdnCloneClass, CdnEdgePop, CdnEdgeSet};
@@ -153,6 +152,7 @@ pub use migration_under_load::{
     MigrationLoadVerdict, MigrationUnderLoad, StepLockMeasure, WriteLoad,
 };
 pub use mirror::{MirrorTelemetry, PushMirrorClass, PushMirrorTarget};
+pub use money::MicroUsd;
 pub use multi_cell_erase::{
     CellEraseContext, CellEraseReceipt, MultiCellEraseFanOut, MultiCellEraseReceiptSet,
 };
@@ -172,12 +172,12 @@ pub use olap_restrict::{
     RestrictionLeakAudit,
 };
 pub use oltp::{OltpConfig, OltpError, OltpPool, PermitGuard};
+#[cfg(any(test, feature = "test-support"))]
+pub use reerase::InMemoryPostPitLedger;
 pub use reerase::{
     CellKillRestore, CellKillRtoReport, ErasureRecord, PostRestoreErasureLedger, ReErasePass,
     ReEraseReport, ReErasedSubject, RtoGrain,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use reerase::InMemoryPostPitLedger;
 pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
 pub use reserve_settle::{
     CostEvent, CostLedger, MeteredUnit, Reservation, ReservationState, ReserveError,
@@ -201,22 +201,39 @@ pub use storage_surge::{
     StorageSurgeReport, STORAGE_SURGE_MULTIPLIER,
 };
 
-pub use pg::{PgError, PgStore};
-pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
 pub use authz_projection_durable::{
     authz_projection_durable_migrations, AUTHZ_PROJECTION_STATE_MIGRATION,
 };
 pub use delegation_policy_durable::{
-    delegation_policy_durable_migrations, DurableDelegationPolicyBacking,
-    DurableDelegationPolicyBundle, DurableDelegationPolicyError, DurableDelegationPolicyHeadCursor,
-    DurableDelegationPolicyRevisions, DurableDelegationPolicySnapshot,
-    DurableDelegationPolicyVersions,
+    delegation_policy_durable_migrations, ensure_agent_policy_bundle_on_conn,
+    DurableDelegationPolicyBacking, DurableDelegationPolicyBundle, DurableDelegationPolicyError,
+    DurableDelegationPolicyHeadCursor, DurableDelegationPolicyRevisions,
+    DurableDelegationPolicySnapshot, DurableDelegationPolicyVersions,
 };
+pub use events_durable::{
+    bus_erasure_durable_migrations, consumer_dead_letter_migrations,
+    consumer_delivery_quarantine_migrations, DurableBusErasureBacking, DurableDeadLetterBacking,
+    DurableDedupBacking, DurableDeliveryQuarantineBacking, BUS_ERASURE_LEDGER_MIGRATION,
+};
+#[cfg(feature = "integration")]
+pub use events_serve::{EventsRuntime, EventsServeError, DEFAULT_DRAIN_BATCH};
 pub use identity_durable::{
-    auth_replay_durable_migrations, identity_durable_migrations,
+    auth_replay_durable_migrations, identity_agent_durable_migrations, identity_durable_migrations,
     identity_project_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow,
     DurableProfileBlob, DurableReplayBacking, DurableRevocationBacking, DurableRevocationRow,
     DurableTupleBacking, TupleEdgeOp,
+};
+pub use kms_durable::{
+    kms_durable_migrations, seal_key_from_env, DurableKmsBacking, KmsDurableError,
+    KMS_SEALED_ROOT_MIGRATION, KMS_WRAPPED_DEK_MIGRATION, KMS_WRAPPED_KEK_MIGRATION, SEAL_KEY_ENV,
+};
+pub use outbox_durable::PgOutboxBacking;
+pub use pg::{PgError, PgStore};
+pub use pg_migrator::{with_migration_lock, PgMigrator, MIGRATION_LOCK_KEY};
+pub use placement_durable::{
+    placement_durable_migrations, DurableCellProvisioningRow, DurableCellRow,
+    DurableLocalTenantRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
+    DurablePlacementBacking, DurablePlacementRow, DurableRepoPlacementRow, PlacementWriteError,
 };
 pub use provider::{
     all_durable_migrations, durable_migration_groups, foundation_migrations, BootstrapError,
@@ -226,12 +243,6 @@ pub use pseudonym_durable::{
     pseudonym_durable_migrations, DurableErasureLedgerBacking, DurableErasureLedgerRow,
     DurablePseudonymBacking, DurablePseudonymRow,
 };
-pub use events_durable::{
-    bus_erasure_durable_migrations, consumer_dead_letter_migrations,
-    consumer_delivery_quarantine_migrations, DurableBusErasureBacking, DurableDeadLetterBacking,
-    DurableDedupBacking, DurableDeliveryQuarantineBacking, BUS_ERASURE_LEDGER_MIGRATION,
-};
-pub use outbox_durable::PgOutboxBacking;
 pub use reerase_durable::{
     post_pit_durable_migrations, DurablePostPitLedger, POST_PIT_ERASURE_LEDGER_MIGRATION,
 };
@@ -245,17 +256,6 @@ pub use restore_verify_durable::{
 pub use tenant_tx::{
     connect_pool_with_reset, with_tenant_repeatable_read_tx, with_tenant_tx, with_tenant_tx_error,
     TxScope, TypedTxScope,
-};
-#[cfg(feature = "integration")]
-pub use events_serve::{EventsRuntime, EventsServeError, DEFAULT_DRAIN_BATCH};
-pub use placement_durable::{
-    placement_durable_migrations, DurableCellProvisioningRow, DurableCellRow,
-    DurableLocalTenantRow, DurableMisrouteAuditBacking, DurableMisrouteRecord,
-    DurablePlacementBacking, DurablePlacementRow, DurableRepoPlacementRow, PlacementWriteError,
-};
-pub use kms_durable::{
-    kms_durable_migrations, seal_key_from_env, DurableKmsBacking, KmsDurableError,
-    KMS_SEALED_ROOT_MIGRATION, KMS_WRAPPED_DEK_MIGRATION, KMS_WRAPPED_KEK_MIGRATION, SEAL_KEY_ENV,
 };
 
 pub use cell_root_durable::{

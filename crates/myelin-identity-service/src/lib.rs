@@ -1,3 +1,4 @@
+pub mod agent_registry;
 pub mod authenticate;
 pub mod capability_crypto;
 pub mod chat_fragment;
@@ -30,9 +31,17 @@ pub mod ssh_auth;
 pub mod tuple_store;
 pub mod webauthn;
 
+pub use agent_registry::{
+    agent_ref, validate_new_agent, AgentActivation, AgentRegistration, AgentRegistryError,
+    NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME, MAX_AGENT_NAME_BYTES, MAX_AGENT_TOOLS,
+};
 pub use authenticate::{
     scheme, AuthTelemetry, CredentialVerifier, HumanSsoAuthenticator, IdorCounters,
     StructuralVerifier, VerifiedAssertion,
+};
+pub use capability_crypto::{
+    attenuate, CapabilityMintSpec, CellAnchorSet, CellTokenAuthority, CellTrustAnchor, DpopBinding,
+    DpopClientKey, DpopReplayGuard, PasetoCapabilitySigner, PasetoCapabilityVerifier,
 };
 pub use chat_fragment::{
     channel_fragment, chat_fragment_defs, message_fragment, unfurl_fragment,
@@ -74,21 +83,6 @@ pub use lowering::{
     fall_back_to_check, is_fall_back, lower, watermark_verdict, AuthzJoin, BoundParam, Lowered,
     WatermarkVerdict,
 };
-pub use namespace::{
-    core_hierarchy, AdmitReject, FragmentDef, NamespaceEngine, PermissionRule, Userset,
-    MAX_RULE_DEPTH, WATCHER_RELATION,
-};
-pub use read_replica::{
-    AuthzReadReplica, ReadRoute, ReplicaRow, ReplicaTelemetry, ReplicaWriteRejected, S5_HOLDER,
-    S5_TABLE,
-};
-pub use reverse_index::{
-    ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_HOLDER, S8_TABLE,
-};
-pub use capability_crypto::{
-    attenuate, CapabilityMintSpec, CellAnchorSet, CellTokenAuthority, CellTrustAnchor, DpopBinding,
-    DpopClientKey, DpopReplayGuard, PasetoCapabilitySigner, PasetoCapabilityVerifier,
-};
 pub use machine_auth::{
     scheme as machine_scheme, Authority, CapabilityAuthenticator, CapabilityToken,
     CredentialAudience, CredentialContext, CredentialPurpose, DpopState, MachineKind,
@@ -102,6 +96,10 @@ pub use mint::{
 pub use multi_cell::{
     CellPartition, CrossCellAudit, CrossCellGrant, CrossCellResolution, MigrationReceipt,
     MultiCellAuthority, MultiCellDsrReceiptSet,
+};
+pub use namespace::{
+    core_hierarchy, AdmitReject, FragmentDef, NamespaceEngine, PermissionRule, Userset,
+    MAX_RULE_DEPTH, WATCHER_RELATION,
 };
 pub use oidc::{
     oidc_login_material, JwkKey, JwkSet, OidcConfig, OidcVerifier, ReplayGuard,
@@ -120,6 +118,13 @@ pub use pseudonym_erase::{
     ReErasureReceipt, ERASURE_LEDGER,
 };
 pub use pseudonym_store::{PseudonymError, PseudonymRow, PseudonymStore, S2_HOLDER, S2_TABLE};
+pub use read_replica::{
+    AuthzReadReplica, ReadRoute, ReplicaRow, ReplicaTelemetry, ReplicaWriteRejected, S5_HOLDER,
+    S5_TABLE,
+};
+pub use reverse_index::{
+    ReverseIndex, ReverseIndexConsumer, ReverseRow, S8_CONSUMER, S8_HOLDER, S8_TABLE,
+};
 pub use revocation::{
     RevocationEntry, RevocationStore, RevocationTelemetry, RevokedKind, RunTokenState,
     REVOCATION_SLA_SECS, S7_TABLE,
@@ -635,18 +640,16 @@ impl StoreBackedCheck {
                 still_resolvable += 1;
             }
         }
-        Ok(
-            pseudonym_erase::ReErasureReceipt {
-                tenant: scope.tenant().clone(),
-                region: scope.region().clone(),
-                re_erased: entries.len(),
-                resurrected: still_resolvable,
-                pre_pass_resurrected: 0,
-                per_subject,
-                ran_at: now,
-            }
-            .with_pre_pass_resurrected(resurrected),
-        )
+        Ok(pseudonym_erase::ReErasureReceipt {
+            tenant: scope.tenant().clone(),
+            region: scope.region().clone(),
+            re_erased: entries.len(),
+            resurrected: still_resolvable,
+            pre_pass_resurrected: 0,
+            per_subject,
+            ran_at: now,
+        }
+        .with_pre_pass_resurrected(resurrected))
     }
 
     pub fn index(&self) -> &ReverseIndex {

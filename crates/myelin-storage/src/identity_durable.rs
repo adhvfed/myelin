@@ -91,6 +91,41 @@ CREATE TABLE IF NOT EXISTS identity_project (
 CREATE INDEX IF NOT EXISTS identity_project_keyset
     ON identity_project (tenant_id, region, project_id DESC);";
 
+pub const IDENTITY_AGENT_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS identity_agent (
+    tenant_id   text        NOT NULL,
+    region      text        NOT NULL,
+    agent_id    uuid        NOT NULL,
+    name        text        NOT NULL,
+    runtime_ref text        NOT NULL,
+    created_by  text        NOT NULL,
+    client_nonce text       NOT NULL,
+    tools       text[]      NOT NULL,
+    grants      text[]      NOT NULL,
+    created_at  timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, region, agent_id),
+    UNIQUE (tenant_id, region, name),
+    UNIQUE (tenant_id, region, client_nonce),
+    CHECK (length(name) BETWEEN 1 AND 80),
+    CHECK (length(runtime_ref) BETWEEN 1 AND 255),
+    CHECK (length(created_by) BETWEEN 1 AND 255),
+    CHECK (length(client_nonce) BETWEEN 1 AND 128),
+    CHECK (cardinality(tools) BETWEEN 1 AND 128),
+    CHECK (cardinality(grants) BETWEEN 1 AND 512)
+);
+CREATE INDEX IF NOT EXISTS identity_agent_keyset
+    ON identity_agent (tenant_id, region, agent_id DESC);";
+
+pub const IDENTITY_AGENT_RLS_POLICY: &str = "\
+ALTER TABLE identity_agent ENABLE ROW LEVEL SECURITY;
+ALTER TABLE identity_agent FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON identity_agent;
+CREATE POLICY myelin_tenant_isolation ON identity_agent \
+  USING (tenant_id = current_setting('myelin.tenant_id', true) \
+         AND region = current_setting('myelin.region', true)) \
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
+              AND region = current_setting('myelin.region', true));";
+
 pub const IDENTITY_PROJECT_RLS_POLICY: &str = "\
 ALTER TABLE identity_project ENABLE ROW LEVEL SECURITY;
 ALTER TABLE identity_project FORCE ROW LEVEL SECURITY;
@@ -171,6 +206,13 @@ pub fn identity_project_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0082_identity_project", IDENTITY_PROJECT_MIGRATION),
         Migration::plain("0083_identity_project_rls", IDENTITY_PROJECT_RLS_POLICY),
+    ])
+}
+
+pub fn identity_agent_durable_migrations() -> Migrations {
+    Migrations::of([
+        Migration::plain("0084_identity_agent", IDENTITY_AGENT_MIGRATION),
+        Migration::plain("0085_identity_agent_rls", IDENTITY_AGENT_RLS_POLICY),
     ])
 }
 

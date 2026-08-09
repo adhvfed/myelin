@@ -169,6 +169,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::identity_durable::auth_replay_durable_migrations(),
         crate::agent_wallet::agent_wallet_migrations(),
         crate::identity_durable::identity_project_durable_migrations(),
+        crate::identity_durable::identity_agent_durable_migrations(),
     ]
 }
 
@@ -751,7 +752,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0083_identity_project_rls");
+        assert_eq!(*ids.last().unwrap(), "0085_identity_agent_rls");
     }
 
     #[test]

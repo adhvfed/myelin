@@ -174,6 +174,7 @@ pub enum DurableDelegationPolicyError {
     StaleSnapshot,
     SnapshotBindingMismatch,
     CorruptSnapshot,
+    IncompatiblePolicy(&'static str),
 }
 
 impl core::fmt::Display for DurableDelegationPolicyError {
@@ -195,8 +196,145 @@ impl core::fmt::Display for DurableDelegationPolicyError {
             Self::CorruptSnapshot => {
                 f.write_str("delegation policy snapshot failed an integrity check")
             }
+            Self::IncompatiblePolicy(slot) => write!(
+                f,
+                "delegation policy conjunct conflicts with the requested agent activation: {slot}"
+            ),
         }
     }
+}
+
+/// Ensures the four policy heads needed by one external-agent activation in the caller's
+/// transaction. Missing tenant/trigger ceilings are seeded from the supplied defaults; existing
+/// ceilings are never widened. Agent and pairwise-delegation policies are exact and idempotent.
+///
+/// The inner error is a policy conflict discovered before any policy row is written. Database
+/// errors use the outer result so the caller's transaction rolls back.
+#[allow(clippy::too_many_arguments)]
+pub async fn ensure_agent_policy_bundle_on_conn(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    agent_id: &str,
+    trigger_actor_id: &str,
+    mut agent_grants: Vec<String>,
+    mut tenant_grants_if_missing: Vec<String>,
+    mut trigger_actor_grants_if_missing: Vec<String>,
+) -> Result<
+    Result<
+        (
+            DurableDelegationPolicyVersions,
+            DurableDelegationPolicyRevisions,
+        ),
+        DurableDelegationPolicyError,
+    >,
+    PgError,
+> {
+    for grants in [
+        &mut agent_grants,
+        &mut tenant_grants_if_missing,
+        &mut trigger_actor_grants_if_missing,
+    ] {
+        if let Err(error) = canonicalize_grants(grants) {
+            return Ok(Err(error));
+        }
+    }
+    if agent_grants.is_empty()
+        || !contains_every(&tenant_grants_if_missing, &agent_grants)
+        || !contains_every(&trigger_actor_grants_if_missing, &agent_grants)
+    {
+        return Ok(Err(DurableDelegationPolicyError::IncompatiblePolicy(
+            "new policy ceiling",
+        )));
+    }
+
+    let keys = PolicyKey::all(agent_id, trigger_actor_id);
+    lock_policy_keys(conn, tenant, region, &keys, false).await?;
+    let mut heads = BTreeMap::new();
+    for key in &keys {
+        if let Some(row) = load_policy_head_for_update(conn, tenant, region, key).await? {
+            heads.insert(key.kind.to_string(), row);
+        }
+    }
+    if let Err(error) = validate_activation_heads(&heads, &agent_grants) {
+        return Ok(Err(error));
+    }
+
+    for (key, grants) in [
+        (PolicyKey::tenant(), tenant_grants_if_missing),
+        (PolicyKey::agent(agent_id), agent_grants.clone()),
+        (
+            PolicyKey::trigger_actor(trigger_actor_id),
+            trigger_actor_grants_if_missing,
+        ),
+        (
+            PolicyKey::delegation(agent_id, trigger_actor_id),
+            agent_grants,
+        ),
+    ] {
+        if !heads.contains_key(key.kind) {
+            let revision =
+                append_and_advance_head(conn, tenant, region, &key, 1, ACTIVE, grants.clone())
+                    .await?;
+            heads.insert(
+                key.kind.to_string(),
+                PolicyRow {
+                    kind: key.kind.to_string(),
+                    version: 1,
+                    revision,
+                    status: ACTIVE.to_string(),
+                    grants,
+                },
+            );
+        }
+    }
+
+    let versions = versions_of(&heads).ok_or_else(|| {
+        PgError::Query("agent activation did not produce four policy heads".into())
+    })?;
+    let revisions = revisions_of(&heads).ok_or_else(|| {
+        PgError::Query("agent activation did not produce four policy revisions".into())
+    })?;
+    Ok(Ok((versions, revisions)))
+}
+
+fn validate_activation_heads(
+    heads: &BTreeMap<String, PolicyRow>,
+    agent_grants: &[String],
+) -> Result<(), DurableDelegationPolicyError> {
+    for kind in [TENANT, TRIGGER_ACTOR] {
+        let Some(row) = heads.get(kind) else {
+            continue;
+        };
+        require_active(row, kind)?;
+        if !contains_every(&row.grants, agent_grants) {
+            return Err(DurableDelegationPolicyError::IncompatiblePolicy(kind));
+        }
+    }
+    for kind in [AGENT, DELEGATION] {
+        let Some(row) = heads.get(kind) else {
+            continue;
+        };
+        require_active(row, kind)?;
+        if row.grants != agent_grants {
+            return Err(DurableDelegationPolicyError::IncompatiblePolicy(kind));
+        }
+    }
+    Ok(())
+}
+
+fn require_active(row: &PolicyRow, kind: &'static str) -> Result<(), DurableDelegationPolicyError> {
+    match row.status.as_str() {
+        ACTIVE => Ok(()),
+        REVOKED => Err(DurableDelegationPolicyError::RevokedPolicy(kind)),
+        _ => Err(DurableDelegationPolicyError::CorruptSnapshot),
+    }
+}
+
+fn contains_every(haystack: &[String], needles: &[String]) -> bool {
+    needles
+        .iter()
+        .all(|needle| haystack.binary_search(needle).is_ok())
 }
 
 impl std::error::Error for DurableDelegationPolicyError {}
@@ -870,6 +1008,16 @@ fn row_revisions(row: SnapshotRow) -> DurableDelegationPolicyRevisions {
 mod tests {
     use super::*;
 
+    fn active(kind: &str, grants: &[&str]) -> PolicyRow {
+        PolicyRow {
+            kind: kind.into(),
+            version: 1,
+            revision: 1,
+            status: ACTIVE.into(),
+            grants: grants.iter().map(|grant| (*grant).into()).collect(),
+        }
+    }
+
     #[test]
     fn grant_sets_are_canonical_and_bounded() {
         let mut grants = vec!["b".into(), "a".into(), "a".into()];
@@ -880,6 +1028,39 @@ mod tests {
         assert!(matches!(
             canonicalize_grants(&mut grants),
             Err(DurableDelegationPolicyError::InvalidGrantSet)
+        ));
+    }
+
+    #[test]
+    fn activation_reuses_ceilings_but_requires_exact_agent_and_delegation_heads() {
+        let grants = vec!["repo.pull".into(), "repo.push".into()];
+        let mut heads = BTreeMap::from([
+            (
+                TENANT.into(),
+                active(TENANT, &["repo.administer", "repo.pull", "repo.push"]),
+            ),
+            (
+                TRIGGER_ACTOR.into(),
+                active(TRIGGER_ACTOR, &["repo.pull", "repo.push"]),
+            ),
+            (AGENT.into(), active(AGENT, &["repo.pull", "repo.push"])),
+            (
+                DELEGATION.into(),
+                active(DELEGATION, &["repo.pull", "repo.push"]),
+            ),
+        ]);
+        assert!(validate_activation_heads(&heads, &grants).is_ok());
+
+        heads.insert(AGENT.into(), active(AGENT, &["repo.pull"]));
+        assert!(matches!(
+            validate_activation_heads(&heads, &grants),
+            Err(DurableDelegationPolicyError::IncompatiblePolicy(AGENT))
+        ));
+        heads.insert(AGENT.into(), active(AGENT, &["repo.pull", "repo.push"]));
+        heads.insert(TENANT.into(), active(TENANT, &["repo.pull"]));
+        assert!(matches!(
+            validate_activation_heads(&heads, &grants),
+            Err(DurableDelegationPolicyError::IncompatiblePolicy(TENANT))
         ));
     }
 
