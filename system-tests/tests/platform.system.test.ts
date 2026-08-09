@@ -17,7 +17,7 @@ describe("running edge platform", () => {
   test("authenticates the bootstrapped system-test principal", async () => {
     const response = await systemClient.json("/v1/whoami");
     expect(response.body).toMatchObject({
-      principal_id: "system-test",
+      principal_id: systemTestConfig.principal,
       tenant: systemTestConfig.tenant,
       region: systemTestConfig.region,
       kind: "human",

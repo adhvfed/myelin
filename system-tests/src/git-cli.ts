@@ -18,13 +18,14 @@ export class GitCommandError extends Error {
 
 export function git(
   args: readonly string[],
-  options: { cwd?: string; token?: string } = {},
+  options: { cwd?: string; token?: string; username?: string } = {},
 ): Promise<GitResult> {
   const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
   if (options.token !== undefined) {
     env.GIT_CONFIG_COUNT = "1";
     env.GIT_CONFIG_KEY_0 = "http.extraHeader";
-    env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${Buffer.from(`system-test:${options.token}`).toString("base64")}`;
+    const username = options.username ?? "myelin";
+    env.GIT_CONFIG_VALUE_0 = `Authorization: Basic ${Buffer.from(`${username}:${options.token}`).toString("base64")}`;
   }
 
   return new Promise((resolve, reject) => {

@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { beforeAll, describe, expect, test } from "vitest";
 
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
+import { systemTestConfig } from "../src/config.js";
 import { GitProject } from "../src/git-project.js";
 import { array, record, string } from "../src/json.js";
 
@@ -124,7 +125,7 @@ describe.sequential("Git engineering lifecycle", () => {
         base_ref: "refs/heads/main",
         head_ref: "refs/heads/feature/system-lifecycle",
         head_oid: featureCommitOid,
-        reviewers: ["system-reviewer"],
+        reviewers: [systemTestConfig.reviewerPrincipal],
       },
       expectedStatus: 201,
     });

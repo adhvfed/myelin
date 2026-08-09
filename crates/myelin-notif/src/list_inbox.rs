@@ -82,11 +82,7 @@ impl InboxFilter {
     pub fn git_review_requests() -> InboxFilter {
         InboxFilter {
             subsystems: Some([Subsystem::Git].into_iter().collect()),
-            reasons: Some(
-                [Reason::ReviewRequested, Reason::Mentioned]
-                    .into_iter()
-                    .collect(),
-            ),
+            reasons: Some([Reason::ReviewRequested].into_iter().collect()),
         }
     }
 
@@ -463,6 +459,7 @@ mod tests {
             Reason::Assigned,
         );
         let chat_mention = item("u1", "b", "myelin://acme/chat/thread/T1", Reason::Mentioned);
+        let git_mention = item("u1", "c", "myelin://acme/git/pr/9", Reason::Mentioned);
         assert!(InboxFilter::all().matches(&issue_assigned));
         assert!(InboxFilter::all().matches(&chat_mention));
         assert!(InboxFilter::issues_my_work().matches(&issue_assigned));
@@ -470,9 +467,13 @@ mod tests {
             !InboxFilter::issues_my_work().matches(&chat_mention),
             "wrong subsystem → rejected"
         );
+        assert!(
+            !InboxFilter::git_review_requests().matches(&git_mention),
+            "a Git mention is activity, not a review request"
+        );
         let issue_state = item(
             "u1",
-            "c",
+            "d",
             "myelin://acme/issue/issue/PROJ-2",
             Reason::StateChanged,
         );

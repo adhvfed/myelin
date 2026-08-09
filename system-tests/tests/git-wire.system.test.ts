@@ -74,7 +74,7 @@ describe.sequential("Git smart-HTTP lifecycle", () => {
       })).stdout,
     ).toBe("");
 
-    const pseudonym = `system-test@${systemTestConfig.tenant}.noreply`;
+    const pseudonym = `${systemTestConfig.principal}@${systemTestConfig.tenant}.noreply`;
     await git(["config", "user.name", pseudonym], { cwd: working });
     await git(["config", "user.email", pseudonym], { cwd: working });
     await git(["commit", "--amend", "--no-edit", "--reset-author"], { cwd: working });

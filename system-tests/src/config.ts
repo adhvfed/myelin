@@ -24,6 +24,9 @@ export interface SystemTestConfig {
   tokenScheme: string;
   tenant: string;
   region: string;
+  principal: string;
+  reviewerPrincipal: string;
+  natsUrl: string;
   runId: string;
   issues: {
     projectId: string;
@@ -39,6 +42,9 @@ export const systemTestConfig: SystemTestConfig = Object.freeze({
   tokenScheme: process.env.MYELIN_SYSTEM_TEST_TOKEN_SCHEME?.trim() || "agent",
   tenant: required("MYELIN_SYSTEM_TEST_TENANT"),
   region: process.env.MYELIN_SYSTEM_TEST_REGION?.trim() || "fr-par",
+  principal: required("MYELIN_SYSTEM_TEST_PRINCIPAL"),
+  reviewerPrincipal: required("MYELIN_SYSTEM_TEST_REVIEWER_PRINCIPAL"),
+  natsUrl: url("NATS_URL"),
   runId: process.env.MYELIN_SYSTEM_TEST_RUN_ID?.trim() || randomUUID(),
   issues: Object.freeze({
     projectId: required("MYELIN_SYSTEM_TEST_ISSUES_PROJECT"),

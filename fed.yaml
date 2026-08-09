@@ -357,6 +357,8 @@ scripts:
       MYELIN_SYSTEM_TEST_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
       MYELIN_SYSTEM_TEST_TENANT: "integration-{{FED_PROJECT_ID}}"
       MYELIN_SYSTEM_TEST_REGION: fr-par
+      MYELIN_SYSTEM_TEST_PRINCIPAL: system-test
+      MYELIN_SYSTEM_TEST_REVIEWER_PRINCIPAL: system-reviewer
       MYELIN_SYSTEM_TEST_TOKEN_SCHEME: agent
       MYELIN_SYSTEM_TEST_ISSUES_PROJECT: 20aee030-c7fa-4757-8243-700faf528690
       MYELIN_SYSTEM_TEST_ISSUES_TYPE: 7d457754-f6a1-4cd8-8738-21751570b627
@@ -365,13 +367,13 @@ scripts:
       sh -c 'set -eu;
       token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_SYSTEM_TEST_TENANT" --region "$MYELIN_SYSTEM_TEST_REGION"
-      --principal system-test --display-name "System Test"
+      --principal "$MYELIN_SYSTEM_TEST_PRINCIPAL" --display-name "System Test"
       --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
       test -n "$token";
       export MYELIN_SYSTEM_TEST_TOKEN="$token";
       reviewer_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_SYSTEM_TEST_TENANT" --region "$MYELIN_SYSTEM_TEST_REGION"
-      --principal system-reviewer --display-name "System Reviewer"
+      --principal "$MYELIN_SYSTEM_TEST_REVIEWER_PRINCIPAL" --display-name "System Reviewer"
       --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
       test -n "$reviewer_token";
       export MYELIN_SYSTEM_TEST_REVIEWER_TOKEN="$reviewer_token";
