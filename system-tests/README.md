@@ -43,7 +43,8 @@ The suite is intentionally organized around externally visible contracts:
 - `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary and appears as
   one queued run. Fed disables the local sandbox runner, so this suite does not claim job execution.
 - `notification-lifecycle` publishes through the external JetStream boundary and verifies durable,
-  recipient-scoped delivery, broker de-duplication, collapse, read state, and self-suppression.
+  recipient-scoped delivery, addressable inbox items, broker de-duplication, collapse, read state,
+  and self-suppression.
 - `api-contracts` checks strict inputs, resource identifiers, payload limits, notification inbox
   scoping, and public error envelopes.
 

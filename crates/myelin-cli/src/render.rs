@@ -103,6 +103,21 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     if is_issue(value) {
         return format!("{}\n", render_issue(value));
     }
+    if is_notification(value) {
+        return format!("{}\n", render_notification(value));
+    }
+    if let (Some(id), Some(state)) = (
+        value.get("id").and_then(Value::as_str),
+        value.get("state").and_then(Value::as_str),
+    ) {
+        if value.as_object().is_some_and(|object| object.len() == 2) {
+            return format!(
+                "{} [{}]\n",
+                terminal_safe_single_line(id),
+                terminal_safe_single_line(state)
+            );
+        }
+    }
     let serialized = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
     format!("{}\n", terminal_safe_single_line(&serialized))
 }
@@ -113,6 +128,9 @@ fn render_item(item: &Value) -> String {
     }
     if is_issue(item) {
         return render_issue(item);
+    }
+    if is_notification(item) {
+        return render_notification(item);
     }
     if let Some(slug) = item.get("slug").and_then(Value::as_str) {
         let state = item.get("state").and_then(Value::as_str).unwrap_or("?");
@@ -390,6 +408,37 @@ fn is_issue(value: &Value) -> bool {
         && value.get("title").and_then(Value::as_str).is_some()
 }
 
+fn is_notification(value: &Value) -> bool {
+    value.get("id").and_then(Value::as_str).is_some()
+        && value.get("reason").and_then(Value::as_str).is_some()
+        && value.get("subject").and_then(Value::as_str).is_some()
+        && value.get("state").and_then(Value::as_str).is_some()
+}
+
+fn render_notification(value: &Value) -> String {
+    let marker = match value.get("state").and_then(Value::as_str) {
+        Some("unread") => "●",
+        Some("done" | "archived") => "✓",
+        _ => "○",
+    };
+    let reason = terminal_safe_single_line(
+        value
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("notification"),
+    );
+    let subject =
+        terminal_safe_single_line(value.get("subject").and_then(Value::as_str).unwrap_or("?"));
+    let id = terminal_safe_single_line(value.get("id").and_then(Value::as_str).unwrap_or("?"));
+    let count = value
+        .get("coalesce_count")
+        .and_then(Value::as_u64)
+        .filter(|count| *count > 1)
+        .map(|count| format!(" ×{count}"))
+        .unwrap_or_default();
+    format!("{marker} {reason}{count}  {subject}  ({id})")
+}
+
 fn render_issue(value: &Value) -> String {
     let key = terminal_safe_single_line(value.get("key").and_then(Value::as_str).unwrap_or("?"));
     let title = terminal_safe_single_line(value.get("title").and_then(Value::as_str).unwrap_or(""));
@@ -530,6 +579,32 @@ mod tests {
         assert!(row.contains("ENG-1  [open]  Founder issue"));
         let list = render(&json!({"items":[issue],"page":{"next_cursor":null}}), false);
         assert!(list.contains("ENG-1  [open]  Founder issue"));
+    }
+
+    #[test]
+    fn notification_list_show_and_read_receipt_are_human_scannable() {
+        let item = json!({
+            "id": "item-1",
+            "reason": "review_requested",
+            "class": "direct",
+            "subject": "myelin://acme/git/pr/core:42",
+            "state": "unread",
+            "coalesce_count": 2
+        });
+        let row = render(&item, false);
+        assert_eq!(
+            row,
+            "● review_requested ×2  myelin://acme/git/pr/core:42  (item-1)\n"
+        );
+        let list = render(
+            &json!({"items": [item], "page": {"next_cursor": null, "limit": 50}}),
+            false,
+        );
+        assert!(list.contains("● review_requested ×2"));
+        assert_eq!(
+            render(&json!({"id": "item-1", "state": "read"}), false),
+            "item-1 [read]\n"
+        );
     }
 
     #[test]

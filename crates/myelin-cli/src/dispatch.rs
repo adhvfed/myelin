@@ -406,19 +406,35 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
             })
         }
         "show" | "read" => {
-            let _id = rest
-                .iter()
-                .find(|a| !a.starts_with("--"))
-                .ok_or_else(|| CliError::Usage(format!("`notif {verb}` needs an <item_id>")))?;
-            Err(CliError::Unsupported(format!(
-                "notif `{verb}` is not yet wired through the edge (/v1/notif routes are a follow-on) \
-                 - deferred"
-            )))
+            let id = notif_item_id(verb, rest)?;
+            let path = format!(
+                "/v1/notif/inbox/{}",
+                utf8_percent_encode(id, FORM_QUERY_COMPONENT_ENCODE_SET)
+            );
+            if *verb == "show" {
+                Ok(EdgeCall::get(path))
+            } else {
+                Ok(EdgeCall::post_json(format!("{path}/read"), json!({})))
+            }
         }
         other => Err(CliError::Usage(format!(
             "unknown notif command `{other}` (try: list | show <id> | read <id>)"
         ))),
     }
+}
+
+fn notif_item_id<'a>(verb: &str, args: &'a [&str]) -> Result<&'a str, CliError> {
+    let [id] = args else {
+        return Err(CliError::Usage(format!(
+            "`notif {verb}` needs exactly one <item_id>"
+        )));
+    };
+    if id.is_empty() || id.len() > 512 || id.chars().any(char::is_control) {
+        return Err(CliError::Usage(
+            "notification item id must be a non-empty bounded value".into(),
+        ));
+    }
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -614,7 +630,22 @@ mod tests {
         );
         assert_eq!(notif_dispatch(&["list", "--view"]).unwrap_err().code(), 2);
         assert_eq!(notif_dispatch(&["nope"]).unwrap_err().code(), 2);
-        assert_eq!(notif_dispatch(&["show", "item-1"]).unwrap_err().code(), 4);
+        let show = notif_dispatch(&["show", "item/1"]).unwrap();
+        assert_eq!(show.method, HttpMethod::Get);
+        assert_eq!(show.path, "/v1/notif/inbox/item%2F1");
+
+        let read = notif_dispatch(&["read", "item-1"]).unwrap();
+        assert_eq!(read.method, HttpMethod::Post);
+        assert_eq!(read.path, "/v1/notif/inbox/item-1/read");
+        assert_eq!(read.payload, Some(b"{}".to_vec()));
+
+        for args in [
+            vec!["show"],
+            vec!["read", "item-1", "extra"],
+            vec!["show", "item\n1"],
+        ] {
+            assert_eq!(notif_dispatch(&args).unwrap_err().code(), 2);
+        }
     }
 
     #[test]

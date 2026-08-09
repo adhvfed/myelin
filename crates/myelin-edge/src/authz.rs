@@ -18,6 +18,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "ci.run.log.read",
     "ci.run.log.watch",
     "notif.inbox.list",
+    "notif.inbox.get",
     "notif.inbox.mark_read",
     "chat.conversations.list",
     "chat.conversation.create",
@@ -129,11 +130,8 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("ci.run.log.read", "run.view", OP_AGENT_PAT),
     requirement!("ci.run.log.watch", "run.view", OP_AGENT_PAT),
     requirement!("notif.inbox.list", "notification.read", OP_AGENT_PAT),
-    requirement!(
-        "notif.inbox.mark_read",
-        "notification.write",
-        OP_AGENT_PAT
-    ),
+    requirement!("notif.inbox.get", "notification.read", OP_AGENT_PAT),
+    requirement!("notif.inbox.mark_read", "notification.write", OP_AGENT_PAT),
     requirement!("chat.conversations.list", "chat.read", OP_AGENT_PAT),
     requirement!("chat.conversation.create", "chat.manage", OP_PAT),
     requirement!("chat.messages.list", "chat.read", OP_AGENT_PAT),

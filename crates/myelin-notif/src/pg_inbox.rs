@@ -247,6 +247,25 @@ impl PgInboxStore {
         .await
     }
 
+    pub async fn get(
+        &self,
+        scope: &InboxReadScope,
+        item_id: &str,
+    ) -> Result<DurableInboxItem, PgInboxError> {
+        validate_scope(scope)?;
+        if !valid_item_id(item_id) {
+            return Err(PgInboxError::InvalidInput);
+        }
+        let owned_scope = scope.clone();
+        let owned_item_id = item_id.to_string();
+        let tenant = owned_scope.tenant.0.clone();
+        let region = owned_scope.region.0.clone();
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move { get_on_conn(conn, &owned_scope, &owned_item_id).await })
+        })
+        .await
+    }
+
     pub async fn mark_read(
         &self,
         scope: &InboxReadScope,
@@ -597,10 +616,30 @@ async fn list_on_conn(
     Ok(DurableInboxPage { items, next_cursor })
 }
 
-fn build_list_query<'a>(
-    request: &'a InboxReadRequest,
-    cursor: Option<&'a CursorFrame>,
-) -> QueryBuilder<'a, Postgres> {
+async fn get_on_conn(
+    conn: &mut sqlx::PgConnection,
+    scope: &InboxReadScope,
+    item_id: &str,
+) -> Result<DurableInboxItem, PgInboxError> {
+    let mut query = inbox_row_query();
+    query.push(" WHERE tenant_id = ");
+    query.push_bind(&scope.tenant.0);
+    query.push(" AND region = ");
+    query.push_bind(&scope.region.0);
+    query.push(" AND recipient = ");
+    query.push_bind(&scope.recipient);
+    query.push(" AND item_id = ");
+    query.push_bind(item_id);
+    let row = query
+        .build()
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| PgInboxError::Database)?
+        .ok_or(PgInboxError::NotFound)?;
+    decode_row(&row, scope)
+}
+
+fn inbox_row_query<'a>() -> QueryBuilder<'a, Postgres> {
     let mut query = QueryBuilder::<Postgres>::new(
         "SELECT tenant_id, region, item_id, recipient, subject, subject_root, reason, class, \
          origin_event, template_key, CASE WHEN octet_length(template_args_json::text) <= 16384 \
@@ -608,7 +647,16 @@ fn build_list_query<'a>(
          coalesce_count, state, snooze_until, occurred_at, dek_ref, ",
     );
     query.push(INBOX_PRIORITY_CASE_SQL);
-    query.push(" AS priority FROM notif_inbox_item WHERE tenant_id = ");
+    query.push(" AS priority FROM notif_inbox_item");
+    query
+}
+
+fn build_list_query<'a>(
+    request: &'a InboxReadRequest,
+    cursor: Option<&'a CursorFrame>,
+) -> QueryBuilder<'a, Postgres> {
+    let mut query = inbox_row_query();
+    query.push(" WHERE tenant_id = ");
     query.push_bind(&request.scope.tenant.0);
     query.push(" AND region = ");
     query.push_bind(&request.scope.region.0);
@@ -1013,6 +1061,25 @@ mod tests {
             assert!(sql.contains("octet_length(template_args_json::text) <= 16384"));
             assert!(!sql.to_ascii_uppercase().contains("OFFSET"));
         }
+    }
+
+    #[test]
+    fn item_read_sql_is_fully_owner_scoped() {
+        let scope = request(10, InboxFilter::all()).scope;
+        let mut query = inbox_row_query();
+        query.push(" WHERE tenant_id = ");
+        query.push_bind(&scope.tenant.0);
+        query.push(" AND region = ");
+        query.push_bind(&scope.region.0);
+        query.push(" AND recipient = ");
+        query.push_bind(&scope.recipient);
+        query.push(" AND item_id = ");
+        query.push_bind("itm-7");
+        let sql = query.sql();
+        assert!(sql.contains("WHERE tenant_id = "));
+        assert!(sql.contains(" AND region = "));
+        assert!(sql.contains(" AND recipient = "));
+        assert!(sql.contains(" AND item_id = "));
     }
 
     #[test]

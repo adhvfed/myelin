@@ -51,8 +51,45 @@ struct InboxListHandler {
     api: DurableNotifHttpApi,
 }
 
+struct InboxGetHandler {
+    api: DurableNotifHttpApi,
+}
+
 struct InboxMarkReadHandler {
     api: DurableNotifHttpApi,
+}
+
+fn inbox_scope(principal: &Principal) -> InboxReadScope {
+    InboxReadScope {
+        tenant: principal.tenant.clone(),
+        region: principal.region.clone(),
+        recipient: principal.principal_id.0.clone(),
+    }
+}
+
+impl Handler for InboxGetHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.query.is_empty() || !ctx.request.body.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "notification item reads accept no query parameters or request body".into(),
+            ));
+        }
+        let row = self
+            .api
+            .drive(
+                self.api
+                    .store
+                    .get(&inbox_scope(ctx.principal), inbox_item_param(ctx)?),
+            )
+            .map_err(map_inbox_error)?;
+        if !can_read_subject(&self.api.identity, Some(&self.api.git), ctx.principal, &row) {
+            return Err(EdgeError::NotFound("notification not found".into()));
+        }
+        Ok(
+            EdgeResponse::json(200, &inbox_item_json(&row))
+                .with_header("Cache-Control", "no-store"),
+        )
+    }
 }
 
 impl Handler for InboxMarkReadHandler {
@@ -76,19 +113,14 @@ impl Handler for InboxMarkReadHandler {
             }
         }
         let item_id = inbox_item_param(ctx)?;
-        let scope = InboxReadScope {
-            tenant: ctx.principal.tenant.clone(),
-            region: ctx.principal.region.clone(),
-            recipient: ctx.principal.principal_id.0.clone(),
-        };
+        let scope = inbox_scope(ctx.principal);
         self.api
             .drive(self.api.store.mark_read(&scope, item_id))
             .map_err(map_inbox_error)?;
-        Ok(EdgeResponse::json(
-            200,
-            &json!({ "id": item_id, "state": "read" }),
+        Ok(
+            EdgeResponse::json(200, &json!({ "id": item_id, "state": "read" }))
+                .with_header("Cache-Control", "no-store"),
         )
-        .with_header("Cache-Control", "no-store"))
     }
 }
 
@@ -101,11 +133,7 @@ impl Handler for InboxListHandler {
         }
         let query = parse_inbox_query(&ctx.request.query)?;
         let request = InboxReadRequest {
-            scope: InboxReadScope {
-                tenant: ctx.principal.tenant.clone(),
-                region: ctx.principal.region.clone(),
-                recipient: ctx.principal.principal_id.0.clone(),
-            },
+            scope: inbox_scope(ctx.principal),
             filter: query.view.filter(),
             limit: query.limit,
             cursor: query.cursor,
@@ -226,7 +254,9 @@ fn inbox_item_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
         .map(String::as_str)
         .ok_or_else(|| EdgeError::BadRequest("route did not bind an inbox item id".into()))?;
     if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
-        return Err(EdgeError::BadRequest("invalid notification inbox item id".into()));
+        return Err(EdgeError::BadRequest(
+            "invalid notification inbox item id".into(),
+        ));
     }
     Ok(value)
 }
@@ -356,6 +386,12 @@ pub fn register_notif(
             Arc::new(InboxListHandler { api: api.clone() }),
         )
         .route(
+            Method::Get,
+            "/v1/notif/inbox/{item}",
+            "notif.inbox.get",
+            Arc::new(InboxGetHandler { api: api.clone() }),
+        )
+        .route(
             Method::Post,
             "/v1/notif/inbox/{item}/read",
             "notif.inbox.mark_read",
@@ -429,7 +465,10 @@ mod tests {
     fn missing_items_are_indistinguishable_from_inaccessible_items() {
         let error = map_inbox_error(PgInboxError::NotFound);
         assert_eq!(error.status(), 404);
-        assert_eq!(error.envelope()["error"]["message"], "notification not found");
+        assert_eq!(
+            error.envelope()["error"]["message"],
+            "notification not found"
+        );
     }
 
     #[test]

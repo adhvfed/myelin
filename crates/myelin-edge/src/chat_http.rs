@@ -420,7 +420,7 @@ fn validate_label(field: &str, value: &str) -> Result<(), EdgeError> {
 }
 
 fn validate_message(content: &str) -> Result<(), EdgeError> {
-    if content.as_bytes().len() > MAX_MESSAGE_BYTES || content.trim().is_empty() {
+    if content.len() > MAX_MESSAGE_BYTES || content.trim().is_empty() {
         return Err(EdgeError::BadRequest(
             "Chat message must contain 1-32768 UTF-8 bytes".into(),
         ));

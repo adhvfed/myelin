@@ -306,6 +306,22 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
     assert_eq!(mentioned.items.len(), 1);
     assert_eq!(mentioned.items[0].item.item_id, "direct-a");
 
+    let addressed = store.get(&scope, "direct-a").await.unwrap();
+    assert_eq!(addressed, mentioned.items[0]);
+    assert_eq!(
+        store
+            .get(
+                &InboxReadScope {
+                    recipient: "psn:bob".into(),
+                    ..scope.clone()
+                },
+                "direct-a",
+            )
+            .await,
+        Err(PgInboxError::NotFound),
+        "a recipient cannot address another recipient's inbox item"
+    );
+
     store.mark_read(&scope, "direct-a").await.unwrap();
     assert_eq!(
         store
