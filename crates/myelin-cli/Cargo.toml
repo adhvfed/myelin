@@ -21,8 +21,11 @@ myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 myelin-notif = { path = "../myelin-notif" }
 
 serde_json = { workspace = true }
+serde = { workspace = true }
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+rand = "0.8"
+sha2 = { workspace = true }
 
 percent-encoding = "2.3"
 

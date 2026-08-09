@@ -1,6 +1,12 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use myelin_cli::client::execute;
-use myelin_cli::config::{self, resolve_edge, resolve_token, store_token};
+use myelin_cli::config::{
+    self, remove_stored_credentials, resolve_credential, resolve_edge, store_credential,
+    SESSION_SCHEME,
+};
+use myelin_cli::device_auth::{
+    begin_authorization, new_authorization_request, wait_for_authorization,
+};
 use myelin_cli::dispatch::{
     chat_dispatch, ci_dispatch, git_dispatch, issues_dispatch, knowledge_dispatch, notif_dispatch,
     EdgeCall, HttpMethod,
@@ -26,7 +32,11 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    Login,
+    Login(LoginArgs),
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
     Whoami,
     Git {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -56,6 +66,23 @@ enum Command {
     },
 }
 
+#[derive(Args, Debug, Clone, Copy)]
+struct LoginArgs {
+    /// Explicitly use browser/device authorization (already the default without --token).
+    #[arg(long)]
+    device: bool,
+    /// Print the approval URL without trying to launch a browser.
+    #[arg(long)]
+    no_browser: bool,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthCommand {
+    Login(LoginArgs),
+    Status,
+    Logout,
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let exit = match run().await {
@@ -74,36 +101,13 @@ async fn run() -> Result<(), CliError> {
     let read_file = |p: &std::path::Path| std::fs::read_to_string(p).ok();
 
     match &cli.command {
-        Command::Login => {
-            if cli.idempotency_key.is_some() {
-                return Err(CliError::Usage(
-                    "--idempotency-key applies only to Edge mutation commands".into(),
-                ));
-            }
-            let token = cli
-                .token
-                .clone()
-                .or_else(|| getenv(config::env::TOKEN).filter(|s| !s.is_empty()))
-                .ok_or_else(|| {
-                    CliError::NotAuthenticated(
-                        "login needs a token via --token or $MYELIN_TOKEN (the human-login IdP mint \
-                         is MR-012-deferred)".into(),
-                    )
-                })?;
-            let path = store_token(&token, &getenv)?;
-            println!("stored capability token at {}", path.display());
-            Ok(())
-        }
-        Command::Whoami => {
-            let call = EdgeCall {
-                method: HttpMethod::Get,
-                path: "/v1/whoami".into(),
-                query: None,
-                payload: None,
-                idempotency_key: None,
-            };
-            run_call(&cli, &getenv, &read_file, call, None).await
-        }
+        Command::Login(args) => login(&cli, *args, &getenv).await,
+        Command::Auth { command } => match command {
+            AuthCommand::Login(args) => login(&cli, *args, &getenv).await,
+            AuthCommand::Status => run_call(&cli, &getenv, &read_file, whoami_call(), None).await,
+            AuthCommand::Logout => logout(&cli, &getenv),
+        },
+        Command::Whoami => run_call(&cli, &getenv, &read_file, whoami_call(), None).await,
         Command::Git { args } => {
             let (call, command_key) = dispatch_command(args, git_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
@@ -129,6 +133,165 @@ async fn run() -> Result<(), CliError> {
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
     }
+}
+
+async fn login(
+    cli: &Cli,
+    args: LoginArgs,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), CliError> {
+    reject_auth_mutation_flags(cli)?;
+    if cli.json {
+        return Err(CliError::Usage(
+            "interactive login does not support --json; use `myelin auth status --json` after login"
+                .into(),
+        ));
+    }
+
+    let supplied_token = cli
+        .token
+        .clone()
+        .or_else(|| getenv(config::env::TOKEN).filter(|value| !value.is_empty()));
+    if let Some(token) = supplied_token {
+        if args.device {
+            return Err(CliError::Usage(
+                "--device cannot be combined with --token or $MYELIN_TOKEN".into(),
+            ));
+        }
+        let scheme = cli
+            .scheme
+            .clone()
+            .or_else(|| getenv(config::env::SCHEME).filter(|value| !value.is_empty()))
+            .unwrap_or_else(|| config::DEFAULT_SCHEME.into());
+        let path = store_credential(&token, &scheme, getenv)?;
+        println!(
+            "Stored the {scheme} credential at {}. Run `myelin auth status` to verify it.",
+            path.display()
+        );
+        return Ok(());
+    }
+    if cli.scheme.is_some() || getenv(config::env::SCHEME).is_some() {
+        return Err(CliError::Usage(
+            "--scheme and $MYELIN_TOKEN_SCHEME apply only to a supplied token".into(),
+        ));
+    }
+
+    let edge = resolve_edge(cli.edge.as_deref(), Some(SESSION_SCHEME), getenv);
+    let request = new_authorization_request();
+    let authorization = begin_authorization(&edge, &request).await?;
+
+    println!(
+        "Confirm this code in your browser: {}",
+        authorization.user_code
+    );
+    println!("{}", authorization.verification_uri_complete);
+    if !args.no_browser {
+        if open_browser(&authorization.verification_uri_complete) {
+            println!("Opened the approval page in your browser.");
+        } else {
+            println!("Your browser could not be opened automatically; use the URL above.");
+        }
+    }
+    println!("Waiting for approval…");
+    flush_stdout()?;
+
+    let authorized = wait_for_authorization(&edge, &request, &authorization).await?;
+    let path = store_credential(
+        &authorized.credential.token,
+        &authorized.credential.scheme,
+        getenv,
+    )?;
+    let expires_at = chrono::DateTime::from_timestamp(authorized.expires_at_unix, 0)
+        .map(|value| value.to_rfc3339())
+        .unwrap_or_else(|| authorized.expires_at_unix.to_string());
+    println!("Approved. Your CLI session is ready until {expires_at}.");
+    println!("Credentials are stored owner-only at {}.", path.display());
+    Ok(())
+}
+
+fn logout(cli: &Cli, getenv: &dyn Fn(&str) -> Option<String>) -> Result<(), CliError> {
+    reject_auth_mutation_flags(cli)?;
+    let removed = remove_stored_credentials(getenv)?;
+    let environment_active = cli.token.as_deref().is_some_and(|value| !value.is_empty())
+        || getenv(config::env::TOKEN).is_some_and(|value| !value.is_empty());
+    if cli.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "logged_out": true,
+                "stored_credential_removed": removed,
+                "environment_credential_active": environment_active,
+            }))
+            .expect("logout JSON is serializable")
+        );
+    } else if environment_active {
+        println!(
+            "Removed stored credentials. A --token or $MYELIN_TOKEN credential is still active for this process."
+        );
+    } else if removed {
+        println!("Removed stored credentials from this device.");
+    } else {
+        println!("No stored credentials were present on this device.");
+    }
+    Ok(())
+}
+
+fn reject_auth_mutation_flags(cli: &Cli) -> Result<(), CliError> {
+    if cli.idempotency_key.is_some() {
+        return Err(CliError::Usage(
+            "--idempotency-key applies only to Edge mutation commands".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn whoami_call() -> EdgeCall {
+    EdgeCall {
+        method: HttpMethod::Get,
+        path: "/v1/whoami".into(),
+        query: None,
+        payload: None,
+        idempotency_key: None,
+    }
+}
+
+fn flush_stdout() -> Result<(), CliError> {
+    use std::io::Write as _;
+    std::io::stdout().flush().map_err(|error| {
+        CliError::Transport(format!("could not write login instructions: {error}"))
+    })
+}
+
+fn open_browser(url: &str) -> bool {
+    use std::process::{Command as ProcessCommand, Stdio};
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = ProcessCommand::new("rundll32");
+        command.arg("url.dll,FileProtocolHandler").arg(url);
+        command
+    };
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = ProcessCommand::new("open");
+        command.arg(url);
+        command
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut command = {
+        let mut command = ProcessCommand::new("xdg-open");
+        command.arg(url);
+        command
+    };
+    #[cfg(not(any(unix, target_os = "windows")))]
+    return false;
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
 }
 
 fn dispatch_command(
@@ -192,15 +355,26 @@ async fn run_call(
             call
         }
     };
-    let edge = resolve_edge(cli.edge.as_deref(), cli.scheme.as_deref(), getenv);
-    let token = resolve_token(cli.token.as_deref(), getenv, read_file)?;
+    let credential = resolve_credential(
+        cli.token.as_deref(),
+        cli.scheme.as_deref(),
+        getenv,
+        read_file,
+    )?;
+    let edge = resolve_edge(cli.edge.as_deref(), Some(&credential.scheme), getenv);
     if call.path.starts_with("/v1/ci/runs/") && call.path.ends_with("/log/live") {
         let stdout = std::io::stdout();
         let mut output = stdout.lock();
-        return myelin_cli::ci_watch::execute_ci_watch(&edge, &token, &call, cli.json, &mut output)
-            .await;
+        return myelin_cli::ci_watch::execute_ci_watch(
+            &edge,
+            &credential.token,
+            &call,
+            cli.json,
+            &mut output,
+        )
+        .await;
     }
-    let value = execute(&edge, &token, &call).await?;
+    let value = execute(&edge, &credential.token, &call).await?;
     print!(
         "{}",
         myelin_cli::render::render_for_call(&value, cli.json, &call)

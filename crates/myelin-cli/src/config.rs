@@ -1,8 +1,14 @@
 use crate::error::CliError;
-use std::path::PathBuf;
+use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 pub const DEFAULT_EDGE: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_SCHEME: &str = "agent";
+pub const SESSION_SCHEME: &str = "session";
+
+const CREDENTIAL_VERSION: u8 = 1;
+const MAX_TOKEN_BYTES: usize = 32 * 1024;
+const MAX_CREDENTIAL_FILE_BYTES: usize = 64 * 1024;
 
 pub mod env {
     pub const TOKEN: &str = "MYELIN_TOKEN";
@@ -17,100 +23,277 @@ pub struct EdgeConfig {
     pub scheme: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Credential {
+    pub token: String,
+    pub scheme: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredCredential {
+    version: u8,
+    token: String,
+    scheme: String,
+}
+
 pub fn config_dir(getenv: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, CliError> {
-    if let Some(dir) = getenv(env::CONFIG_DIR) {
+    if let Some(dir) = getenv(env::CONFIG_DIR).filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(dir));
     }
-    if let Some(xdg) = getenv("XDG_CONFIG_HOME").filter(|s| !s.is_empty()) {
+    if let Some(xdg) = getenv("XDG_CONFIG_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(xdg).join("myelin"));
     }
     let home = getenv("HOME")
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| CliError::Config("no $HOME, $XDG_CONFIG_HOME, or $MYELIN_CONFIG_DIR set".into()))?;
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            CliError::Config("no $HOME, $XDG_CONFIG_HOME, or $MYELIN_CONFIG_DIR set".into())
+        })?;
     Ok(PathBuf::from(home).join(".config").join("myelin"))
 }
 
-pub fn token_path(getenv: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, CliError> {
+pub fn credential_path(getenv: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, CliError> {
+    Ok(config_dir(getenv)?.join("credentials.json"))
+}
+
+/** The pre-device-login token file. Read-only compatibility keeps existing installations working. */
+pub fn legacy_token_path(getenv: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, CliError> {
     Ok(config_dir(getenv)?.join("token"))
 }
 
 pub fn resolve_edge(
     flag_url: Option<&str>,
-    flag_scheme: Option<&str>,
+    scheme: Option<&str>,
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> EdgeConfig {
     let url = flag_url
         .map(str::to_string)
-        .or_else(|| getenv(env::EDGE).filter(|s| !s.is_empty()))
+        .or_else(|| getenv(env::EDGE).filter(|value| !value.is_empty()))
         .unwrap_or_else(|| DEFAULT_EDGE.to_string());
-    let scheme = flag_scheme
-        .map(str::to_string)
-        .or_else(|| getenv(env::SCHEME).filter(|s| !s.is_empty()))
-        .unwrap_or_else(|| DEFAULT_SCHEME.to_string());
-    EdgeConfig { url, scheme }
+    EdgeConfig {
+        url,
+        scheme: scheme.unwrap_or(DEFAULT_SCHEME).to_string(),
+    }
 }
 
-pub fn resolve_token(
+pub fn resolve_credential(
     flag_token: Option<&str>,
+    flag_scheme: Option<&str>,
     getenv: &dyn Fn(&str) -> Option<String>,
-    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
-) -> Result<String, CliError> {
-    if let Some(t) = flag_token.filter(|s| !s.is_empty()) {
-        return Ok(t.to_string());
+    read_file: &dyn Fn(&Path) -> Option<String>,
+) -> Result<Credential, CliError> {
+    let supplied_scheme = flag_scheme
+        .map(str::to_string)
+        .or_else(|| getenv(env::SCHEME).filter(|value| !value.is_empty()));
+
+    if let Some(token) = flag_token
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| getenv(env::TOKEN).filter(|value| !value.is_empty()))
+    {
+        return credential(&token, supplied_scheme.as_deref().unwrap_or(DEFAULT_SCHEME));
     }
-    if let Some(t) = getenv(env::TOKEN).filter(|s| !s.is_empty()) {
-        return Ok(t);
+
+    let stored_path = credential_path(getenv)?;
+    if let Some(encoded) = read_file(&stored_path) {
+        let stored = parse_stored_credential(&encoded, &stored_path)?;
+        return credential(
+            &stored.token,
+            supplied_scheme.as_deref().unwrap_or(&stored.scheme),
+        );
     }
-    let path = token_path(getenv)?;
-    if let Some(t) = read_file(&path).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-        return Ok(t);
+
+    let legacy_path = legacy_token_path(getenv)?;
+    if let Some(token) = read_file(&legacy_path) {
+        return credential(&token, supplied_scheme.as_deref().unwrap_or(DEFAULT_SCHEME));
     }
+
     Err(CliError::NotAuthenticated(
         "no token in --token, $MYELIN_TOKEN, or the stored config".into(),
     ))
 }
 
-pub fn store_token(token: &str, getenv: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, CliError> {
+pub fn store_credential(
+    token: &str,
+    scheme: &str,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<PathBuf, CliError> {
+    let credential = credential(token, scheme)?;
+    let stored = StoredCredential {
+        version: CREDENTIAL_VERSION,
+        token: credential.token,
+        scheme: credential.scheme,
+    };
+    let encoded = serde_json::to_vec(&stored)
+        .map_err(|error| CliError::Config(format!("cannot encode credentials: {error}")))?;
     let dir = config_dir(getenv)?;
-    std::fs::create_dir_all(&dir)
-        .map_err(|e| CliError::Config(format!("cannot create config dir {}: {e}", dir.display())))?;
-    let path = dir.join("token");
-    write_owner_only(&path, token.as_bytes())?;
-    set_owner_only(&path)?;
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        CliError::Config(format!(
+            "cannot create config dir {}: {error}",
+            dir.display()
+        ))
+    })?;
+    let path = dir.join("credentials.json");
+    write_owner_only_atomic(&path, &encoded)?;
     Ok(path)
 }
 
+/** Remove every on-disk credential format. Environment and command-line credentials are untouched. */
+pub fn remove_stored_credentials(
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<bool, CliError> {
+    let mut removed = false;
+    for path in [credential_path(getenv)?, legacy_token_path(getenv)?] {
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(CliError::Config(format!(
+                    "cannot remove stored credential {}: {error}",
+                    path.display()
+                )))
+            }
+        }
+    }
+    Ok(removed)
+}
+
+fn credential(token: &str, scheme: &str) -> Result<Credential, CliError> {
+    let token = token.trim();
+    let scheme = scheme.trim();
+    if token.is_empty()
+        || token.len() > MAX_TOKEN_BYTES
+        || !token.as_bytes().iter().all(u8::is_ascii_graphic)
+    {
+        return Err(CliError::Config(
+            "credential token must be bounded printable ASCII without spaces".into(),
+        ));
+    }
+    if !valid_scheme(scheme) {
+        return Err(CliError::Config(
+            "credential scheme must match [a-z][a-z0-9_]{0,31}".into(),
+        ));
+    }
+    Ok(Credential {
+        token: token.to_string(),
+        scheme: scheme.to_string(),
+    })
+}
+
+fn valid_scheme(scheme: &str) -> bool {
+    let mut bytes = scheme.bytes();
+    bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && scheme.len() <= 32
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
+fn parse_stored_credential(encoded: &str, path: &Path) -> Result<StoredCredential, CliError> {
+    if encoded.len() > MAX_CREDENTIAL_FILE_BYTES {
+        return Err(CliError::Config(format!(
+            "stored credential {} exceeds the byte limit",
+            path.display()
+        )));
+    }
+    let stored: StoredCredential = serde_json::from_str(encoded).map_err(|_| {
+        CliError::Config(format!(
+            "stored credential {} is malformed; run `myelin auth login` again",
+            path.display()
+        ))
+    })?;
+    if stored.version != CREDENTIAL_VERSION {
+        return Err(CliError::Config(format!(
+            "stored credential {} has unsupported version {}",
+            path.display(),
+            stored.version
+        )));
+    }
+    credential(&stored.token, &stored.scheme)?;
+    Ok(stored)
+}
+
 #[cfg(unix)]
-fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<(), CliError> {
+fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| CliError::Config(format!("cannot create token file {}: {e}", path.display())))?;
-    f.write_all(bytes)
-        .map_err(|e| CliError::Config(format!("cannot write token file {}: {e}", path.display())))
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| CliError::Config("credential path has no parent directory".into()))?;
+    let mut temporary = None;
+    for attempt in 0..100 {
+        let candidate = parent.join(format!(
+            ".credentials.json.tmp-{}-{attempt}",
+            std::process::id()
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&candidate)
+        {
+            Ok(file) => {
+                temporary = Some((candidate, file));
+                break;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(CliError::Config(format!(
+                    "cannot create credential file in {}: {error}",
+                    parent.display()
+                )))
+            }
+        }
+    }
+    let (temporary_path, mut file) = temporary.ok_or_else(|| {
+        CliError::Config(format!(
+            "cannot allocate a temporary credential file in {}",
+            parent.display()
+        ))
+    })?;
+    let result = (|| {
+        file.write_all(bytes).map_err(|error| {
+            CliError::Config(format!(
+                "cannot write credential file {}: {error}",
+                temporary_path.display()
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            CliError::Config(format!(
+                "cannot sync credential file {}: {error}",
+                temporary_path.display()
+            ))
+        })?;
+        drop(file);
+        std::fs::rename(&temporary_path, path).map_err(|error| {
+            CliError::Config(format!(
+                "cannot install credential file {}: {error}",
+                path.display()
+            ))
+        })?;
+        set_owner_only(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    result
 }
 
 #[cfg(not(unix))]
-fn write_owner_only(path: &std::path::Path, bytes: &[u8]) -> Result<(), CliError> {
-    std::fs::write(path, bytes)
-        .map_err(|e| CliError::Config(format!("cannot write token file {}: {e}", path.display())))
+fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
+    std::fs::write(path, bytes).map_err(|error| {
+        CliError::Config(format!(
+            "cannot write credential file {}: {error}",
+            path.display()
+        ))
+    })
 }
 
 #[cfg(unix)]
-fn set_owner_only(path: &std::path::Path) -> Result<(), CliError> {
+fn set_owner_only(path: &Path) -> Result<(), CliError> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| CliError::Config(format!("cannot set 0600 on {}: {e}", path.display())))
-}
-
-#[cfg(not(unix))]
-fn set_owner_only(_path: &std::path::Path) -> Result<(), CliError> {
-    Ok(())
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
+        CliError::Config(format!("cannot set 0600 on {}: {error}", path.display()))
+    })
 }
 
 #[cfg(test)]
@@ -119,9 +302,15 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn env_from(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
-        let map: BTreeMap<String, String> =
-            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-        move |k: &str| map.get(k).cloned()
+        let map: BTreeMap<String, String> = pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        move |key: &str| map.get(key).cloned()
+    }
+
+    fn no_file(_: &Path) -> Option<String> {
+        None
     }
 
     #[test]
@@ -131,78 +320,106 @@ mod tests {
         let xdg = env_from(&[("XDG_CONFIG_HOME", "/xdg"), ("HOME", "/h")]);
         assert_eq!(config_dir(&xdg).unwrap(), PathBuf::from("/xdg/myelin"));
         let home = env_from(&[("HOME", "/h")]);
-        assert_eq!(config_dir(&home).unwrap(), PathBuf::from("/h/.config/myelin"));
-        let none = env_from(&[]);
-        assert!(config_dir(&none).is_err(), "no anchor → clean Config error, not a panic");
+        assert_eq!(
+            config_dir(&home).unwrap(),
+            PathBuf::from("/h/.config/myelin")
+        );
+        assert!(config_dir(&env_from(&[])).is_err());
     }
 
     #[test]
-    fn resolve_edge_precedence_flag_then_env_then_default() {
-        let e = env_from(&[("MYELIN_EDGE", "http://envhost:9"), ("MYELIN_TOKEN_SCHEME", "ci")]);
-        let c = resolve_edge(Some("http://flag:1"), Some("agent"), &e);
-        assert_eq!(c.url, "http://flag:1");
-        assert_eq!(c.scheme, "agent");
-        let c = resolve_edge(None, None, &e);
-        assert_eq!(c.url, "http://envhost:9");
-        assert_eq!(c.scheme, "ci");
-        let c = resolve_edge(None, None, &env_from(&[]));
-        assert_eq!(c.url, DEFAULT_EDGE);
-        assert_eq!(c.scheme, DEFAULT_SCHEME);
+    fn explicit_and_environment_credentials_precede_disk() {
+        let env = env_from(&[("MYELIN_TOKEN", "ENV_TOKEN"), ("MYELIN_TOKEN_SCHEME", "ci")]);
+        assert_eq!(
+            resolve_credential(Some("FLAG_TOKEN"), Some("pat"), &env, &no_file).unwrap(),
+            Credential {
+                token: "FLAG_TOKEN".into(),
+                scheme: "pat".into(),
+            }
+        );
+        assert_eq!(
+            resolve_credential(None, None, &env, &no_file).unwrap(),
+            Credential {
+                token: "ENV_TOKEN".into(),
+                scheme: "ci".into(),
+            }
+        );
     }
 
     #[test]
-    fn resolve_token_precedence_and_clean_error_when_absent() {
-        let no_file = |_: &std::path::Path| None;
+    fn a_saved_human_session_keeps_its_scheme() {
+        let env = env_from(&[("MYELIN_CONFIG_DIR", "/config")]);
+        let read = |path: &Path| {
+            (path == Path::new("/config/credentials.json"))
+                .then(|| r#"{"version":1,"token":"HUMAN_SESSION","scheme":"session"}"#.into())
+        };
         assert_eq!(
-            resolve_token(Some("TOK_FLAG"), &env_from(&[]), &no_file).unwrap(),
-            "TOK_FLAG"
+            resolve_credential(None, None, &env, &read).unwrap(),
+            Credential {
+                token: "HUMAN_SESSION".into(),
+                scheme: SESSION_SCHEME.into(),
+            }
         );
-        assert_eq!(
-            resolve_token(None, &env_from(&[("MYELIN_TOKEN", "TOK_ENV")]), &no_file).unwrap(),
-            "TOK_ENV"
-        );
-        let with_file = |_: &std::path::Path| Some("TOK_FILE\n".to_string());
-        assert_eq!(
-            resolve_token(None, &env_from(&[("MYELIN_CONFIG_DIR", "/c")]), &with_file).unwrap(),
-            "TOK_FILE"
-        );
-        let err = resolve_token(None, &env_from(&[("MYELIN_CONFIG_DIR", "/c")]), &no_file).unwrap_err();
-        assert_eq!(err.code(), 3);
     }
 
     #[test]
-    fn store_then_resolve_roundtrips_and_is_owner_only() {
-        let tmp = std::env::temp_dir().join(format!("myelin-cli-test-{}", std::process::id()));
+    fn a_legacy_token_remains_usable_as_an_agent_credential() {
+        let env = env_from(&[("MYELIN_CONFIG_DIR", "/config")]);
+        let read =
+            |path: &Path| (path == Path::new("/config/token")).then(|| "LEGACY_TOKEN\n".into());
+        assert_eq!(
+            resolve_credential(None, None, &env, &read).unwrap(),
+            Credential {
+                token: "LEGACY_TOKEN".into(),
+                scheme: DEFAULT_SCHEME.into(),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_stored_credentials_fail_honestly() {
+        let env = env_from(&[("MYELIN_CONFIG_DIR", "/config")]);
+        let read = |path: &Path| {
+            (path == Path::new("/config/credentials.json")).then(|| "not-json".into())
+        };
+        let error = resolve_credential(None, None, &env, &read).unwrap_err();
+        assert!(error.to_string().contains("malformed"));
+    }
+
+    #[test]
+    fn store_resolve_and_logout_are_owner_only_and_complete() {
+        let tmp =
+            std::env::temp_dir().join(format!("myelin-cli-credential-{}", std::process::id()));
         let dir = tmp.to_string_lossy().to_string();
-        let getenv = env_from(&[("MYELIN_CONFIG_DIR", &dir)]);
-        let path = store_token("ROUNDTRIP_TOKEN", &getenv).unwrap();
+        let env = env_from(&[("MYELIN_CONFIG_DIR", &dir)]);
+        let path = store_credential("ROUNDTRIP_TOKEN", SESSION_SCHEME, &env).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "the token file is owner-only");
+            assert_eq!(mode, 0o600, "the credential file is owner-only");
         }
-        let read = |p: &std::path::Path| std::fs::read_to_string(p).ok();
-        assert_eq!(resolve_token(None, &getenv, &read).unwrap(), "ROUNDTRIP_TOKEN");
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        assert_eq!(
+            resolve_credential(None, None, &env, &read).unwrap(),
+            Credential {
+                token: "ROUNDTRIP_TOKEN".into(),
+                scheme: SESSION_SCHEME.into(),
+            }
+        );
+        std::fs::write(tmp.join("token"), "OLD_TOKEN").unwrap();
+        assert!(remove_stored_credentials(&env).unwrap());
+        assert!(!path.exists());
+        assert!(!tmp.join("token").exists());
+        assert!(!remove_stored_credentials(&env).unwrap());
         let _ = std::fs::remove_dir_all(&tmp);
-        let _ = path;
     }
 
-    #[cfg(unix)]
     #[test]
-    fn store_token_tightens_a_preexisting_world_readable_file() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = std::env::temp_dir().join(format!("myelin-cli-test-preexist-{}", std::process::id()));
-        std::fs::create_dir_all(&tmp).unwrap();
-        let path = tmp.join("token");
-        std::fs::write(&path, b"OLD").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        let dir = tmp.to_string_lossy().to_string();
-        let getenv = env_from(&[("MYELIN_CONFIG_DIR", &dir)]);
-        let path = store_token("NEW_TOKEN", &getenv).unwrap();
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "a pre-existing 0644 token file is re-tightened to 0600");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "NEW_TOKEN");
-        let _ = std::fs::remove_dir_all(&tmp);
+    fn resolve_edge_uses_the_selected_credential_scheme() {
+        let env = env_from(&[("MYELIN_EDGE", "http://envhost:9")]);
+        let config = resolve_edge(Some("http://flag:1"), Some(SESSION_SCHEME), &env);
+        assert_eq!(config.url, "http://flag:1");
+        assert_eq!(config.scheme, SESSION_SCHEME);
     }
 }

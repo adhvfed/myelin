@@ -36,7 +36,9 @@ impl fmt::Display for CliError {
             CliError::NotAuthenticated(m) => {
                 f.write_str("not authenticated: ")?;
                 write_terminal_safe(f, m)?;
-                f.write_str("\n  hint: run `myelin login --token <token>` or set $MYELIN_TOKEN")
+                f.write_str(
+                    "\n  hint: run `myelin auth login` (or provide $MYELIN_TOKEN for automation)",
+                )
             }
             CliError::Unauthorized(m) => {
                 f.write_str("not authenticated / token invalid: ")?;

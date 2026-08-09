@@ -13,6 +13,7 @@ use std::time::Duration;
 
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_AUTH_RESPONSE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 struct Target {
@@ -92,6 +93,33 @@ pub async fn execute(config: &EdgeConfig, token: &str, call: &EdgeCall) -> Resul
     execute_with_limits(config, token, call, REQUEST_DEADLINE, MAX_RESPONSE_BYTES).await
 }
 
+/**
+ * Call one of the two deliberately unauthenticated device-login endpoints. Keeping this surface
+ * exact prevents a future caller from accidentally treating an ordinary Edge mutation as public.
+ */
+pub async fn execute_device_auth(config: &EdgeConfig, call: &EdgeCall) -> Result<Value, CliError> {
+    if call.method != crate::dispatch::HttpMethod::Post
+        || call.query.is_some()
+        || call.idempotency_key.is_some()
+        || !matches!(
+            call.path.as_str(),
+            "/v1/auth/device/authorization" | "/v1/auth/device/token"
+        )
+    {
+        return Err(CliError::Transport(
+            "device authorization attempted an unexpected Edge request".into(),
+        ));
+    }
+    send_json(
+        config,
+        None,
+        call,
+        REQUEST_DEADLINE,
+        MAX_AUTH_RESPONSE_BYTES,
+    )
+    .await
+}
+
 pub async fn open_event_stream(
     config: &EdgeConfig,
     token: &str,
@@ -161,6 +189,18 @@ async fn execute_with_limits(
         }
         _ => {}
     }
+    let body = send_json(config, Some(token), call, deadline, max_response_bytes).await?;
+    validate_ci_success(call, &body)?;
+    Ok(body)
+}
+
+async fn send_json(
+    config: &EdgeConfig,
+    token: Option<&str>,
+    call: &EdgeCall,
+    deadline: Duration,
+    max_response_bytes: usize,
+) -> Result<Value, CliError> {
     let target = target(config, call)?;
     let connector = HttpsConnectorBuilder::new()
         .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())
@@ -174,9 +214,12 @@ async fn execute_with_limits(
         .method(call.method.as_str())
         .uri(&target.uri)
         .header("host", &target.authority)
-        .header("accept", "application/json")
-        .header("authorization", format!("Bearer {token}"))
-        .header("x-myelin-token-scheme", &config.scheme);
+        .header("accept", "application/json");
+    if let Some(token) = token {
+        builder = builder
+            .header("authorization", format!("Bearer {token}"))
+            .header("x-myelin-token-scheme", &config.scheme);
+    }
     let payload = call.payload.clone().unwrap_or_default();
     if call.payload.is_some() {
         builder = builder.header("content-type", "application/json");
@@ -214,9 +257,7 @@ async fn execute_with_limits(
     })??;
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
 
-    let body = interpret(status, body)?;
-    validate_ci_success(call, &body)?;
-    Ok(body)
+    interpret(status, body)
 }
 
 fn validate_ci_success(call: &EdgeCall, body: &Value) -> Result<(), CliError> {
@@ -872,6 +913,50 @@ mod tests {
         assert!(error.to_string().contains("deadline"));
         assert!(!error.to_string().contains("sensitive-token"));
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn device_login_calls_only_the_two_public_routes_without_a_bearer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let read = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 202 Accepted\r\nContent-Length: 47\r\n\r\n{\"status\":\"authorization_pending\",\"interval\":2}",
+                )
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&request[..read]).to_string()
+        });
+        let call = EdgeCall {
+            method: HttpMethod::Post,
+            path: "/v1/auth/device/token".into(),
+            query: None,
+            payload: Some(b"{}".to_vec()),
+            idempotency_key: None,
+        };
+
+        let response = execute_device_auth(&cfg(&format!("http://{address}")), &call)
+            .await
+            .unwrap();
+        assert_eq!(response["status"], "authorization_pending");
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(!request.contains("\r\nauthorization:"));
+        assert!(!request.contains("\r\nx-myelin-token-scheme:"));
+        assert!(!request.contains("\r\nidempotency-key:"));
+
+        let mut ordinary_mutation = call;
+        ordinary_mutation.path = "/v1/git/repos".into();
+        assert!(
+            execute_device_auth(&cfg("http://127.0.0.1:1"), &ordinary_mutation)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
