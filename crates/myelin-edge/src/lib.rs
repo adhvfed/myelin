@@ -1,4 +1,5 @@
 pub mod agent_http;
+pub mod agent_mcp_http;
 pub mod authz;
 pub mod bootstrap;
 pub mod catalogue;
@@ -31,6 +32,7 @@ pub mod sse;
 pub mod tool_http;
 
 pub use agent_http::register_agents;
+pub use agent_mcp_http::{register_agent_mcp, AgentMcpServices};
 #[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
 pub use authz::{

@@ -11,6 +11,7 @@ import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { gitRepositoryUrl, systemTestConfig } from "../src/config.js";
 import { git } from "../src/git-cli.js";
 import { GitProject } from "../src/git-project.js";
+import { array, record, string } from "../src/json.js";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -535,6 +536,52 @@ describe("the CLI authentication journey", () => {
         durable: true,
         run: { id: running.run.id, ref: running.run.ref, state: "ready" },
         credential: { scheme: "agent", token: running.credential.token },
+      });
+
+      // An MCP client brings only the transient run credential. Edge recovers every other fact
+      // from durable identity state and presents exactly the tools the human selected—not a
+      // capability-equivalent sibling and never a second long-lived provider key.
+      const initialized = await systemClient.json(`/v1/agent-runs/${running.run.id}/mcp`, {
+        method: "POST",
+        body: { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
+        token: running.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 200,
+      });
+      expect(initialized.headers.get("cache-control")).toBe("no-store");
+      expect(initialized.body).toMatchObject({
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          protocolVersion: "2025-06-18",
+          serverInfo: { name: "myelin-mcp" },
+        },
+      });
+
+      const discovered = await systemClient.json(`/v1/agent-runs/${running.run.id}/mcp`, {
+        method: "POST",
+        body: { jsonrpc: "2.0", id: 2, method: "tools/list" },
+        token: running.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 200,
+      });
+      const discoveredResult = record(discovered.body.result, "MCP tools/list result");
+      const discoveredTools = array(discoveredResult.tools, "MCP tools/list tools").map(
+        (tool, index) => record(tool, `MCP tool ${index}`),
+      );
+      expect(discoveredTools.map((tool) => string(tool.name, "MCP tool name"))).toEqual([
+        "ci.read_run",
+        "git.open_pr",
+      ]);
+      expect(discoveredTools.at(0)?.inputSchema).toMatchObject({
+        type: "object",
+        required: ["run_id"],
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(1)?.inputSchema).toMatchObject({
+        type: "object",
+        required: ["repo", "title"],
+        additionalProperties: false,
       });
 
       // Finishing work destroys that transient identity as one durable operation. The run can be

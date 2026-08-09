@@ -1977,16 +1977,29 @@ mod git_wire_basic_auth_tests {
         jti: &str,
     ) -> (Gateway, String) {
         let human_session = purpose == myelin_identity_service::CredentialPurpose::HumanSession;
+        let agent_run = purpose.is_agent_run();
         let credential_scheme = if human_session { "session" } else { "agent" };
         let subject_key = if human_session {
             "svc:founder"
+        } else if agent_run {
+            "agent:00000000-0000-0000-0000-000000000001"
         } else {
             "subj-1"
         };
         let principal_kind = if human_session {
             PrincipalKind::Human
+        } else if agent_run {
+            PrincipalKind::Agent {
+                runtime_ref: myelin_identity::RuntimeRef("external:mcp".into()),
+                on_behalf_of: Some(PrincipalId("human:owner".into())),
+            }
         } else {
             PrincipalKind::Service
+        };
+        let principal_id = if agent_run {
+            PrincipalId(subject_key.into())
+        } else {
+            PrincipalId("svc:founder".into())
         };
         let cell = CellTokenAuthority::from_seed(&[3u8; 32], &[4u8; 32]).expect("cell");
         let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
@@ -2001,21 +2014,18 @@ mod git_wire_basic_auth_tests {
         store
             .put_principal(
                 &scope,
-                PrincipalId("svc:founder".into()),
+                principal_id.clone(),
                 principal_kind,
                 DataRole::Controller,
                 PrincipalStatus::Active,
                 None,
             )
             .expect("seed principal");
-        store
-            .link_credential(
-                &scope,
-                credential_scheme,
-                subject_key,
-                &PrincipalId("svc:founder".into()),
-            )
-            .expect("link credential");
+        if !agent_run {
+            store
+                .link_credential(&scope, credential_scheme, subject_key, &principal_id)
+                .expect("link credential");
+        }
         let revocations = RevocationStore::new();
         if purpose.is_run_scoped() {
             revocations.register_run_token_ttl(

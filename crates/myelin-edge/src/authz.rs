@@ -16,6 +16,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "identity.agent.view",
     "identity.agent.run.create",
     "identity.agent.run.close",
+    "identity.agent.run.mcp",
     "identity.projects.list",
     "identity.project.create",
     "identity.project.view",
@@ -157,6 +158,11 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         required_capability: None,
         accepted_purposes: AGENT_RUN_ONLY,
     },
+    ActionRequirement {
+        action: "identity.agent.run.mcp",
+        required_capability: None,
+        accepted_purposes: AGENT_RUN_ONLY,
+    },
     requirement!("identity.projects.list", "project.view", OP_AGENT_PAT),
     requirement!("identity.project.create", "project.create", OP_PAT),
     requirement!("identity.project.view", "project.view", OP_AGENT_PAT),
@@ -280,9 +286,9 @@ pub fn authorize_edge_action(
         CredentialPurpose::OperatorBootstrap => {
             capability.effective_authority.holds("edge.operator")
         }
-        _ => rule.required_capability.is_none_or(|required| {
-            capability.effective_authority.holds(required)
-        }),
+        _ => rule
+            .required_capability
+            .is_none_or(|required| capability.effective_authority.holds(required)),
     }
 }
 
@@ -457,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_run_can_only_close_itself_by_credential_purpose() {
+    fn an_agent_run_can_only_close_itself_or_carry_mcp_frames_by_credential_purpose() {
         let agent = identity(
             CredentialPurpose::AgentRun {
                 run_id: "run-close".into(),
@@ -471,6 +477,11 @@ mod tests {
             &agent,
             "identity.agent.run.close"
         ));
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &agent,
+            "identity.agent.run.mcp"
+        ));
 
         let human = identity(
             CredentialPurpose::HumanSession,
@@ -481,6 +492,11 @@ mod tests {
             &AllowAll,
             &human,
             "identity.agent.run.close"
+        ));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &human,
+            "identity.agent.run.mcp"
         ));
     }
 

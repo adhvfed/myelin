@@ -6,14 +6,14 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
-    register_agents, register_chat, register_ci, register_git_durable, register_git_wire,
-    register_issues, register_knowledge, register_notif, register_projects, register_tools,
-    serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AuthProvider,
-    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
-    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableGitBackend, Gateway,
-    GitDatabaseProviders, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe,
-    SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
-    TupleRepoBootstrap, WhoamiHandler,
+    register_agent_mcp, register_agents, register_chat, register_ci, register_git_durable,
+    register_git_wire, register_issues, register_knowledge, register_notif, register_projects,
+    register_tools, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
+    AgentMcpServices, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
+    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableCiReadApi, DurableGitBackend,
+    Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method, ReadinessCheck,
+    ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome,
+    StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
@@ -22,7 +22,7 @@ use myelin_identity::{
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, DpopReplayGuard, HumanSsoAuthenticator, JwkSet,
     OidcConfig, PasetoCapabilityVerifier, PrincipalStore, ReplayGuard, RevocationStore,
-    StoreBackedCheck, TupleStore,
+    StoreBackedCheck, TokenVerifier, TupleStore,
 };
 use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_storage::{
@@ -828,12 +828,18 @@ async fn serve(
     )));
     let git_minter: Arc<dyn myelin_events::IdMinter> = Arc::new(myelin_events::UlidMinter::new());
 
-    let authn = Arc::new(durable_capability_authenticator(
+    let (authn, run_token_authorizer) = durable_capability_authenticator(
         &provider, &kms, &cell, &handle,
-    ));
+    );
+    let authn = Arc::new(authn);
 
     let oidc_settings = provider.config().oidc.clone();
     let human_store = PrincipalStore::with_pg(
+        kms.clone(),
+        DurablePrincipalBacking::new(provider.clone()),
+        handle.clone(),
+    );
+    let mcp_principals = PrincipalStore::with_pg(
         kms.clone(),
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
@@ -1077,12 +1083,19 @@ async fn serve(
         .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
     builder = register_git_durable(builder, git_backend.clone());
     let ci_blobs: Arc<dyn BlobStore + Send + Sync> = Arc::from(provider.blob_store(handle.clone()));
+    let ci_runs = myelin_ci_controlplane::CiRunStore::with_pg_surface_cursor_key(
+        provider.db_pool().clone(),
+        ci_surface_cursor_key,
+    );
+    let mcp_ci = DurableCiReadApi::new(
+        ci_runs.clone(),
+        git_backend.clone(),
+        ci_blobs.clone(),
+        handle.clone(),
+    );
     builder = register_ci(
         builder,
-        myelin_ci_controlplane::CiRunStore::with_pg_surface_cursor_key(
-            provider.db_pool().clone(),
-            ci_surface_cursor_key,
-        ),
+        ci_runs,
         git_backend.clone(),
         ci_blobs,
         handle.clone(),
@@ -1103,9 +1116,8 @@ async fn serve(
         check.clone(),
         handle.clone(),
     );
-    builder = register_agents(
-        builder,
-        myelin_identity_service::PgAgentRegistry::new(provider.clone()),
+    let agent_registry = myelin_identity_service::PgAgentRegistry::new(provider.clone());
+    let agent_sessions =
         myelin_identity_service::AgentSessionIssuer::new(
             provider.clone(),
             check.clone(),
@@ -1114,8 +1126,26 @@ async fn serve(
         .unwrap_or_else(|error| {
             eprintln!("edge: external agent session issuer refused to start: {error}");
             std::process::exit(1);
-        }),
+        });
+    builder = register_agents(
+        builder,
+        agent_registry.clone(),
+        agent_sessions.clone(),
         handle.clone(),
+    );
+    builder = register_agent_mcp(
+        builder,
+        AgentMcpServices::new(
+            agent_registry,
+            agent_sessions,
+            check.run_token_minter().clone(),
+            Arc::new(run_token_authorizer),
+            provider.clone(),
+            mcp_principals,
+            git_backend.clone(),
+            mcp_ci,
+            handle.clone(),
+        ),
     );
     builder = register_tools(builder);
     builder = register_chat(
@@ -1375,7 +1405,7 @@ async fn operator_secret(core: ComposedCore, args: &[String]) {
             material,
         });
 
-    let authenticator = durable_capability_authenticator(&provider, &kms, &cell, &handle);
+    let (authenticator, _) = durable_capability_authenticator(&provider, &kms, &cell, &handle);
     let identity = Arc::new(StoreBackedCheck::with_pg(
         provider.clone(),
         kms.clone(),
@@ -1418,25 +1448,34 @@ fn durable_capability_authenticator(
     kms: &Arc<KmsEngine>,
     cell: &Arc<CellTokenAuthority>,
     handle: &tokio::runtime::Handle,
-) -> CapabilityAuthenticator {
-    CapabilityAuthenticator::with_verifier(
+) -> (
+    CapabilityAuthenticator,
+    myelin_identity_service::mint::RunTokenAuthorizer,
+) {
+    let verifier: Arc<dyn TokenVerifier> = Arc::new(
+        PasetoCapabilityVerifier::new(cell.trust_anchor()).with_replay_guard(
+            DpopReplayGuard::with_pg(
+                DurableReplayBacking::new(provider.clone()),
+                handle.clone(),
+            ),
+        ),
+    );
+    let revocations = RevocationStore::with_pg(
+        DurableRevocationBacking::new(provider.clone()),
+        handle.clone(),
+    );
+    let authenticator = CapabilityAuthenticator::with_verifier(
         PrincipalStore::with_pg(
             kms.clone(),
             DurablePrincipalBacking::new(provider.clone()),
             handle.clone(),
         ),
-        Arc::new(
-            PasetoCapabilityVerifier::new(cell.trust_anchor()).with_replay_guard(
-                DpopReplayGuard::with_pg(
-                    DurableReplayBacking::new(provider.clone()),
-                    handle.clone(),
-                ),
-            ),
-        ),
-        RevocationStore::with_pg(
-            DurableRevocationBacking::new(provider.clone()),
-            handle.clone(),
-        ),
+        verifier.clone(),
+        revocations.clone(),
+    );
+    (
+        authenticator,
+        myelin_identity_service::mint::RunTokenAuthorizer::new(verifier, revocations),
     )
 }
 
