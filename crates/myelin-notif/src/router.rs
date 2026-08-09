@@ -15,6 +15,7 @@ use myelin_tenancy::{Region, TenantId};
 use crate::humanise::reason_template_key;
 use crate::pg_inbox::{InboxUpsert, InboxUpsertOutcome, PgInboxStore};
 use crate::prefs::QuietHours;
+use crate::ranking::reason_base_class;
 use crate::storm_control::{
     is_self_notification, subject_root_of, RateConfig, StormContext, StormControl, StormDecision,
     SuppressReason,
@@ -324,9 +325,10 @@ impl SignalRouter {
         if mentions.is_empty() {
             return Ok(());
         }
+        let reason = notification_reason_of(signal_event)?;
         let subject_root = subject_root_of(&signal.subject.0);
         for (index, principal) in mentions.iter().enumerate() {
-            let item = self.derive_mention_item(signal_event, signal, principal);
+            let item = self.derive_direct_item(signal_event, signal, principal, reason);
             let cap_verdict = if self.durable.is_some() {
                 if index < self.hot_cap.cap() as usize {
                     CapVerdict::Admit
@@ -450,15 +452,24 @@ impl SignalRouter {
         Ok(decision)
     }
 
-    fn derive_mention_item(
+    fn derive_direct_item(
         &self,
         env: &EventEnvelope,
         signal: &Signal,
         principal: &Principal,
+        reason: Reason,
     ) -> RoutedInboxItem {
         let recipient = principal.principal_id.0.clone();
+        // `mention:` is a durable namespace: retaining it prevents an upgrade from
+        // recreating existing mention rows under new item IDs. Other explicit direct
+        // reasons use their own namespace.
+        let direct_namespace = if reason == Reason::Mentioned {
+            "mention"
+        } else {
+            "direct"
+        };
         let dedup_key = format!(
-            "mention:{}:{}:{}",
+            "{direct_namespace}:{}:{}:{}",
             signal.rule_id.0, signal.dedup_key.0, recipient
         );
         let item_id = item_id_for(&env.tenant, &recipient, &dedup_key);
@@ -468,8 +479,8 @@ impl SignalRouter {
             item_id,
             recipient,
             subject: signal.subject.clone(),
-            reason: Reason::Mentioned,
-            class: Class::Direct,
+            reason,
+            class: reason_base_class(reason).1,
             origin_event: ArtifactRef(format!(
                 "myelin://{}/bus/event/{}",
                 env.tenant.0, env.event_id.0
@@ -525,6 +536,17 @@ impl SignalRouter {
             contains_personal_data: false,
             pii_key_ref: None,
         }
+    }
+}
+
+fn notification_reason_of(signal_event: &EventEnvelope) -> Result<Reason, RouteError> {
+    match signal_event.payload.get("notification_reason") {
+        None => Ok(Reason::Mentioned),
+        Some(value) => serde_json::from_value(value.clone()).map_err(|_| {
+            RouteError::MalformedSignal(
+                "signal notification_reason is outside the closed reason vocabulary".into(),
+            )
+        }),
     }
 }
 
@@ -1297,6 +1319,46 @@ mod tests {
             1,
             "only the ambient skeleton row - 0 mention write-fanout rows"
         );
+    }
+
+    #[test]
+    fn direct_signal_reason_is_explicit_closed_and_defaults_to_mentioned() {
+        let outbox = OutboxStore::new();
+        let (consumer, inbox) = router_over(&outbox);
+        let sig = signal(
+            "git.review_requested",
+            Severity::Notice,
+            "myelin://acme/git/pr/core:9",
+            "review-core-9",
+        );
+        let mut envelope = signal_envelope("evt-review", &sig);
+        assert_eq!(notification_reason_of(&envelope), Ok(Reason::Mentioned));
+
+        envelope.payload["notification_reason"] = serde_json::json!("review_requested");
+        assert_eq!(
+            notification_reason_of(&envelope),
+            Ok(Reason::ReviewRequested)
+        );
+
+        let mut message =
+            signal_msg_with_mentions("evt-routed-review", &sig, &[mentioned("p-reviewer")]);
+        message.envelope.payload["notification_reason"] = serde_json::json!("review_requested");
+        assert_eq!(consumer.deliver(&message), Delivered::Acked);
+        let row = inbox
+            .get(
+                &tenant(),
+                "p-reviewer",
+                "direct:git.review_requested:review-core-9:p-reviewer",
+            )
+            .expect("an explicit review request is routed to its recipient");
+        assert_eq!(row.reason, Reason::ReviewRequested);
+        assert_eq!(row.class, Class::Direct);
+
+        envelope.payload["notification_reason"] = serde_json::json!("invented_reason");
+        assert!(matches!(
+            notification_reason_of(&envelope),
+            Err(RouteError::MalformedSignal(_))
+        ));
     }
 
     #[test]

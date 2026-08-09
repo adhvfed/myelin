@@ -29,8 +29,8 @@ is intentionally unsupported because it would bypass Fed's allocated environment
 The suite is intentionally organized around externally visible contracts:
 
 - `platform` verifies health, readiness, capability authentication, and bounded routing errors.
-- `git-lifecycle` follows repository creation through browsing, review by a second principal,
-  merge, and readback from the base branch.
+- `git-lifecycle` follows repository creation through browsing, delivery of a real review request
+  to a second principal, reviewer-scoped PR access, review, merge, and base-branch readback.
 - `git-wire` uses a stock Git client to verify smart-HTTP authentication, clone, fetch, and push.
 - `collaboration-lifecycle` exercises Chat, Knowledge, and the asynchronous Issues authorization
   reconciler with retries and optimistic conflicts.

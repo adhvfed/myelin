@@ -146,23 +146,27 @@ fn validate_claimed_row(
             "event actor tenant disagrees with the envelope tenant",
         ));
     }
-    let parsed_subject = myelin_refs::parse_scoped(&envelope.subject.0).map_err(|_| {
-        PermanentRowError::new(
-            "invalid_artifact_ref",
-            "event subject is not a canonical ArtifactRef",
-        )
-    })?;
-    if parsed_subject.artifact_ref != envelope.subject {
-        return Err(PermanentRowError::new(
-            "invalid_artifact_ref",
-            "event subject is not the canonical ArtifactRef spelling",
-        ));
-    }
-    if parsed_subject.tenant != envelope.tenant {
-        return Err(PermanentRowError::new(
-            "subject_tenant_mismatch",
-            "event subject tenant disagrees with the envelope tenant",
-        ));
+    if envelope.type_.0.starts_with("signal.") || envelope.type_.0 == "notif.signal.snapshot" {
+        validate_signal_subject(&envelope.subject.0, &envelope.tenant)?;
+    } else {
+        let parsed_subject = myelin_refs::parse_scoped(&envelope.subject.0).map_err(|_| {
+            PermanentRowError::new(
+                "invalid_artifact_ref",
+                "event subject is not a canonical ArtifactRef",
+            )
+        })?;
+        if parsed_subject.artifact_ref != envelope.subject {
+            return Err(PermanentRowError::new(
+                "invalid_artifact_ref",
+                "event subject is not the canonical ArtifactRef spelling",
+            ));
+        }
+        if parsed_subject.tenant != envelope.tenant {
+            return Err(PermanentRowError::new(
+                "subject_tenant_mismatch",
+                "event subject tenant disagrees with the envelope tenant",
+            ));
+        }
     }
     match (envelope.contains_personal_data, &envelope.pii_key_ref) {
         (false, None) => {}
@@ -194,6 +198,41 @@ fn validate_claimed_row(
         ));
     }
     Ok(envelope)
+}
+
+fn validate_signal_subject(
+    subject: &str,
+    tenant: &myelin_tenancy::TenantId,
+) -> Result<(), PermanentRowError> {
+    let prefix = format!("sig.{}.", tenant.0);
+    let Some(route) = subject.strip_prefix(&prefix) else {
+        return Err(PermanentRowError::new(
+            "invalid_signal_subject",
+            "signal subject is outside the envelope tenant",
+        ));
+    };
+    let mut tokens = route.split('.');
+    let severity = tokens.next().unwrap_or_default();
+    let valid_severity = matches!(
+        severity,
+        "info" | "notice" | "warning" | "error" | "critical"
+    );
+    let rules = tokens.collect::<Vec<_>>();
+    let valid_rule = !rules.is_empty()
+        && rules.iter().all(|token| {
+            let mut chars = token.chars();
+            matches!(chars.next(), Some(first) if first.is_ascii_lowercase())
+                && chars.all(|character| {
+                    character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+                })
+        });
+    if !valid_severity || !valid_rule || subject.len() > 512 {
+        return Err(PermanentRowError::new(
+            "invalid_signal_subject",
+            "signal subject does not match sig.<tenant>.<severity>.<rule>",
+        ));
+    }
+    Ok(())
 }
 
 const ROW_PROJECTION: &str = "event_id, aggregate, seq, subject, envelope, attempts, \
@@ -1131,6 +1170,26 @@ mod validation_config_tests {
         let mut cross_tenant_subject = envelope();
         cross_tenant_subject.subject = ArtifactRef("myelin://foreign/issue/issue/one".into());
         assert_eq!(reason(&cross_tenant_subject), "subject_tenant_mismatch");
+    }
+
+    #[test]
+    fn strict_validation_admits_only_tenant_bound_canonical_signal_subjects() {
+        let mut signal = envelope();
+        signal.type_ = EventType("signal.opened".into());
+        signal.subject = ArtifactRef("sig.acme.notice.git.review_requested".into());
+        signal.aggregate = AggregateKey("signal:review-one".into());
+        assert!(validate_claimed_row(&claimed(&signal), &validation()).is_ok());
+
+        for subject in [
+            "sig.other.notice.git.review_requested",
+            "sig.acme.urgent.git.review_requested",
+            "sig.acme.notice.Git.review_requested",
+            "sig.acme.notice",
+            "sig.acme.notice.git.*",
+        ] {
+            signal.subject = ArtifactRef(subject.into());
+            assert_eq!(reason(&signal), "invalid_signal_subject", "{subject}");
+        }
     }
 
     #[test]

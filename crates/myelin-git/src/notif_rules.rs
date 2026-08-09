@@ -1,16 +1,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use myelin_events::{AggregateKey, ArtifactRef, DataRole, EventDraft, EventType, Visibility};
 use myelin_identity::{
-    AuthzError, Consistency, ListObjectsResult, ObjectType, Permission, Principal, RelName,
+    AuthzError, Consistency, DataRole as IdentityDataRole, ListObjectsResult, ObjectType,
+    Permission, Principal, PrincipalId, PrincipalKind, PrincipalStatus, PseudonymHandle, RelName,
     Result as AuthzResult, SetExpr, Zookie,
 };
 use myelin_notif::{
     define_notif_rule, Class, DedupTpl, NotifRule, NotifRuleRegistry, Reason, RelationalLeaf,
     ReverseIndexAnswer, RevisionWatermark, WatcherResolvePort,
 };
-use myelin_tenancy::TenantId;
+use myelin_query::{DedupKey, RuleId, Severity, Signal, SignalState};
+use myelin_tenancy::{Region, TenantId};
 
+use crate::lifecycle::ReviewState;
+use crate::pr_store::PrRecord;
 use crate::rebac_fragment::object_types;
 
 pub const GIT_REVIEW_REQUESTED_RULE: &str = "git.review_requested";
@@ -55,6 +60,78 @@ pub fn register_git_notif_rules(
         registry.register(key, rule);
     }
     Ok(registry)
+}
+
+pub(crate) fn review_request_signal_drafts(
+    tenant: &TenantId,
+    region: &Region,
+    repo: &str,
+    record: &PrRecord,
+    recorded_at: &str,
+) -> Result<Vec<EventDraft>, myelin_notif::DefineRuleError> {
+    let rule = git_notif_rules()?
+        .into_iter()
+        .find_map(|(key, rule)| (key == GIT_REVIEW_REQUESTED_RULE).then_some(rule))
+        .expect("Git's review-request rule is part of its frozen notification set");
+    let subject = ArtifactRef(format!(
+        "myelin://{}/git/pr/{repo}:{}",
+        tenant.0, record.number
+    ));
+    let mut drafts = Vec::new();
+    for review in &record.reviews {
+        if !matches!(review.state, ReviewState::Requested) {
+            continue;
+        }
+        let Some(handle) = PseudonymHandle::parse(&review.reviewer_pseudonym) else {
+            continue;
+        };
+        if handle.tenant() != tenant.0 {
+            continue;
+        }
+        let recipient = handle.pseudonym();
+        let dedup_key = rule.dedup_key(recipient, &subject);
+        let signal = Signal {
+            rule_id: RuleId(GIT_REVIEW_REQUESTED_RULE.into()),
+            tenant: tenant.clone(),
+            severity: Severity::Notice,
+            dedup_key: DedupKey(dedup_key.clone()),
+            subject: subject.clone(),
+            count: 1,
+            state: SignalState::Open,
+            first_seen: recorded_at.to_string(),
+            last_seen: recorded_at.to_string(),
+        };
+        let recipient = Principal::new(
+            tenant.clone(),
+            region.clone(),
+            PrincipalId(recipient.to_string()),
+            PrincipalKind::Human,
+            IdentityDataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        let aggregate_id = &blake3::hash(dedup_key.as_bytes()).to_hex()[..32];
+        let mut payload =
+            serde_json::to_value(signal).expect("the closed Signal wire shape is serializable");
+        payload["mentions"] = serde_json::json!([{ "Mention": recipient }]);
+        payload["notification_reason"] = serde_json::to_value(rule.reason)
+            .expect("the closed notification reason vocabulary is serializable");
+        drafts.push(EventDraft {
+            type_: EventType("signal.opened".into()),
+            subject: ArtifactRef(format!(
+                "sig.{}.{}.{}",
+                tenant.0,
+                Severity::Notice.token(),
+                GIT_REVIEW_REQUESTED_RULE
+            )),
+            aggregate: AggregateKey(format!("signal:{aggregate_id}")),
+            payload,
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            contains_personal_data: false,
+            pii_key_ref: None,
+        });
+    }
+    Ok(drafts)
 }
 
 pub const GIT_WATCHER_RELATION: &str = myelin_notif::WATCHER_RELATION;
@@ -175,6 +252,10 @@ mod tests {
     use super::*;
     use myelin_identity::{PrincipalId, PrincipalKind};
     use myelin_notif::reason_base_class;
+    use myelin_query::Signal;
+
+    use crate::lifecycle::PullRequest;
+    use crate::pr_store::ReviewRecord;
 
     fn tenant() -> TenantId {
         TenantId("acme".into())
@@ -205,6 +286,64 @@ mod tests {
         assert_eq!(rules[1].1.default_class, Class::Direct);
         assert_eq!(rules[2].1.reason, Reason::Watched);
         assert_eq!(rules[2].1.default_class, Class::Watching);
+    }
+
+    #[test]
+    fn review_request_signals_are_recipient_scoped_and_rule_classified() {
+        let pr = PullRequest::open(
+            7,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "author@acme.noreply",
+            false,
+        );
+        let mut record = PrRecord::open(&pr, "1".repeat(40));
+        record.reviews = vec![
+            ReviewRecord {
+                reviewer_pseudonym: "alice@acme.noreply".into(),
+                state: ReviewState::Requested,
+                is_agent: false,
+            },
+            ReviewRecord {
+                reviewer_pseudonym: "bob@acme.noreply".into(),
+                state: ReviewState::Submitted(crate::lifecycle::ReviewVerdict::Approve),
+                is_agent: false,
+            },
+            ReviewRecord {
+                reviewer_pseudonym: "mallory@other.noreply".into(),
+                state: ReviewState::Requested,
+                is_agent: false,
+            },
+            ReviewRecord {
+                reviewer_pseudonym: "not-a-pseudonym".into(),
+                state: ReviewState::Requested,
+                is_agent: false,
+            },
+        ];
+
+        let drafts = review_request_signal_drafts(
+            &tenant(),
+            &Region("fr-par".into()),
+            "core",
+            &record,
+            "2026-08-09T12:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(drafts.len(), 1, "only the outstanding request is signalled");
+        let draft = &drafts[0];
+        assert_eq!(draft.type_.0, "signal.opened");
+        assert_eq!(draft.subject.0, "sig.acme.notice.git.review_requested");
+        assert!(draft.aggregate.0.starts_with("signal:"));
+        assert!(!draft.aggregate.0.contains('.'));
+        assert_eq!(draft.payload["notification_reason"], "review_requested");
+        assert_eq!(
+            draft.payload["mentions"][0]["Mention"]["principal_id"],
+            "alice"
+        );
+        let signal: Signal = serde_json::from_value(draft.payload.clone()).unwrap();
+        assert_eq!(signal.rule_id.0, GIT_REVIEW_REQUESTED_RULE);
+        assert_eq!(signal.subject.0, "myelin://acme/git/pr/core:7");
+        assert_eq!(signal.first_seen, "2026-08-09T12:00:00Z");
     }
 
     #[test]

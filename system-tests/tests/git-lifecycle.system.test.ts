@@ -4,6 +4,7 @@ import { beforeAll, describe, expect, test } from "vitest";
 
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { systemTestConfig } from "../src/config.js";
+import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import { array, record, string } from "../src/json.js";
 
@@ -136,6 +137,32 @@ describe.sequential("Git engineering lifecycle", () => {
     expect(opened.body).toMatchObject({ durable: true, applied: { action: "git.pr.open" } });
 
     const base = `${project.path}/prs/${pullRequestNumber}`;
+    const subject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`;
+    const reviewRequest = await eventually(async () => {
+      const inbox = await reviewerClient.json("/v1/notif/inbox?view=review-requests&limit=100");
+      return array(inbox.body.items, "review request inbox items")
+        .map((item) => record(item, "review request inbox item"))
+        .find((item) => item.subject === subject);
+    }, { description: "the opened pull request to reach its requested reviewer's inbox" });
+    expect(reviewRequest).toMatchObject({
+      reason: "review_requested",
+      class: "direct",
+      subsystem: "git",
+      subject,
+      state: "unread",
+    });
+
+    const reviewerOverview = await reviewerClient.json(base);
+    expect(reviewerOverview.body).toMatchObject({
+      number: pullRequestNumber,
+      title: "Ship the system-tested lifecycle",
+      head_oid: featureCommitOid,
+    });
+    const reviewerDiff = await reviewerClient.json(`${base}/diff?view=split&limit=100`);
+    expect(array(reviewerDiff.body.files, "reviewer pull request diff files")).toEqual(
+      expect.arrayContaining([expect.objectContaining({ path: "src/shipped.ts", kind: "text" })]),
+    );
+
     const overview = await systemClient.json(base);
     expect(overview.body).toMatchObject({
       number: pullRequestNumber,

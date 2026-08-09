@@ -8,6 +8,7 @@ use myelin_storage::pgrelay::PgRelay;
 
 use crate::core::RepoLoc;
 use crate::events::{GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_OPENED, GIT_PR_SYNCHRONIZED};
+use crate::notif_rules::review_request_signal_drafts;
 use crate::pr_store::PrRecord;
 
 fn pg_query(action: &'static str) -> myelin_storage::PgError {
@@ -23,6 +24,10 @@ pub(crate) async fn co_commit_event(
     event_type: &'static str,
     operation: Option<&serde_json::Value>,
 ) -> Result<(), myelin_storage::PgError> {
+    let signal_ctx = EmitContextBase {
+        schema_ver: 1,
+        ..ctx.clone()
+    };
     let safe_operation = operation.map(|value| {
         serde_json::json!({
             "operation_id": value.get("operation_id"),
@@ -69,7 +74,7 @@ pub(crate) async fn co_commit_event(
     if let Some(generation) = head_generation {
         payload["head_generation"] = generation.into();
     }
-    let mut tx = OutboxTransaction::detached(minter, ctx);
+    let mut tx = OutboxTransaction::detached(minter.clone(), ctx);
     tx.emit(
         EventDraft {
             type_: EventType(event_type.into()),
@@ -87,10 +92,33 @@ pub(crate) async fn co_commit_event(
         None,
     )
     .map_err(|_| pg_query("stage PR lifecycle event"))?;
-    let row = tx
+    let mut rows = tx
         .into_staged_rows()
-        .map_err(|_| pg_query("encode PR lifecycle event"))?
-        .pop()
+        .map_err(|_| pg_query("encode PR lifecycle event"))?;
+    let lifecycle = rows
+        .first()
+        .map(|row| row.envelope.clone())
         .ok_or_else(|| pg_query("missing PR envelope"))?;
-    PgRelay::co_commit_in_tx(conn, &row.aggregate.0, &row.envelope).await
+    if event_type == GIT_PR_OPENED {
+        let signal_drafts = review_request_signal_drafts(
+            &signal_ctx.tenant,
+            &signal_ctx.region,
+            &loc.repo,
+            record,
+            &signal_ctx.recorded_at.0,
+        )
+        .map_err(|_| pg_query("derive PR review-request signals"))?;
+        let mut signal_tx = OutboxTransaction::detached(minter, signal_ctx);
+        for draft in signal_drafts {
+            signal_tx
+                .emit(draft, Some(&lifecycle))
+                .map_err(|_| pg_query("stage PR review-request signal"))?;
+        }
+        rows.extend(
+            signal_tx
+                .into_staged_rows()
+                .map_err(|_| pg_query("encode PR review-request signals"))?,
+        );
+    }
+    PgRelay::co_commit_rows_in_tx(conn, &rows).await
 }

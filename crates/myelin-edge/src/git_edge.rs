@@ -428,7 +428,11 @@ mod tests {
         );
         let gw = b.build();
         let _ = gw;
-        assert_eq!(http_catalogue().len(), 13, "the git catalogue surface is stable");
+        assert_eq!(
+            http_catalogue().len(),
+            14,
+            "the git catalogue surface is stable"
+        );
     }
 
     fn test_authn() -> Arc<myelin_identity_service::CapabilityAuthenticator> {

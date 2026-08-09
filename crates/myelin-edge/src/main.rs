@@ -1034,7 +1034,7 @@ async fn serve(
         handle.clone(),
     );
     if git_wire.is_some() {
-        builder = register_git_wire(builder, git_backend);
+        builder = register_git_wire(builder, git_backend.clone());
     }
     builder = register_issues(
         builder,
@@ -1058,6 +1058,7 @@ async fn serve(
         builder,
         Arc::new(PgInboxStore::new(provider.db_pool().clone())),
         check.clone(),
+        git_backend,
         handle.clone(),
     );
     let gateway = Arc::new(builder.build());

@@ -18,6 +18,7 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, Method};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
+use crate::git_durable::DurableGitBackend;
 use crate::request::EdgeResponse;
 
 const DEFAULT_INBOX_LIMIT: u16 = 50;
@@ -27,6 +28,7 @@ const MAX_INBOX_MUTATION_BYTES: usize = 1_024;
 struct DurableNotifHttpApi {
     store: Arc<PgInboxStore>,
     identity: StoreBackedCheck,
+    git: Arc<DurableGitBackend>,
     runtime: Handle,
 }
 
@@ -115,7 +117,9 @@ impl Handler for InboxListHandler {
         let items = page
             .items
             .iter()
-            .filter(|row| can_read_subject(&self.api.identity, ctx.principal, row))
+            .filter(|row| {
+                can_read_subject(&self.api.identity, Some(&self.api.git), ctx.principal, row)
+            })
             .map(inbox_item_json)
             .collect::<Vec<_>>();
         Ok(EdgeResponse::json(
@@ -229,6 +233,7 @@ fn inbox_item_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
 
 fn can_read_subject(
     identity: &StoreBackedCheck,
+    git: Option<&DurableGitBackend>,
     principal: &Principal,
     row: &DurableInboxItem,
 ) -> bool {
@@ -238,6 +243,24 @@ fn can_read_subject(
         | myelin_notif::list_inbox::Subsystem::Knowledge
         | myelin_notif::list_inbox::Subsystem::Ci => ("read", row.item.subject.clone()),
         myelin_notif::list_inbox::Subsystem::Git => {
+            if row.item.reason == myelin_notif::Reason::ReviewRequested
+                && row.item.recipient == principal.principal_id.0
+            {
+                if let (Some(git), Some((repo, number))) = (
+                    git,
+                    git_pr_coordinate(&row.item.subject, &principal.tenant.0),
+                ) {
+                    if git.authorize_pr_review(
+                        &principal.tenant.0,
+                        &principal.region.0,
+                        repo,
+                        number,
+                        principal,
+                    ) {
+                        return true;
+                    }
+                }
+            }
             let Some(repo) = git_repo_subject(&row.item.subject, &principal.tenant.0) else {
                 return false;
             };
@@ -258,6 +281,20 @@ fn can_read_subject(
         ),
         Ok(Decision::Allow)
     )
+}
+
+fn git_pr_coordinate<'a>(
+    subject: &'a ArtifactRef,
+    expected_tenant: &str,
+) -> Option<(&'a str, u64)> {
+    let rest = subject
+        .0
+        .strip_prefix(&format!("myelin://{expected_tenant}/git/pr/"))?;
+    let (repo, number) = rest.split_once(':')?;
+    if repo.is_empty() || repo.contains('/') || repo.chars().any(char::is_control) {
+        return None;
+    }
+    Some((repo, number.parse().ok()?))
 }
 
 fn git_repo_subject(subject: &ArtifactRef, expected_tenant: &str) -> Option<ArtifactRef> {
@@ -302,11 +339,13 @@ pub fn register_notif(
     builder: GatewayBuilder,
     store: Arc<PgInboxStore>,
     identity: StoreBackedCheck,
+    git: Arc<DurableGitBackend>,
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = DurableNotifHttpApi {
         store,
         identity,
+        git,
         runtime,
     };
     builder
@@ -399,6 +438,10 @@ mod tests {
             git_repo_subject(&ArtifactRef("myelin://acme/git/pr/core:42".into()), "acme"),
             Some(ArtifactRef("repo:core".into()))
         );
+        assert_eq!(
+            git_pr_coordinate(&ArtifactRef("myelin://acme/git/pr/core:42".into()), "acme"),
+            Some(("core", 42))
+        );
         for subject in [
             "myelin://other/git/pr/core:42",
             "myelin://acme/git/pr/no-repo-coordinate",
@@ -406,6 +449,10 @@ mod tests {
             "myelin://acme/git/pr/team/core:42",
         ] {
             assert_eq!(git_repo_subject(&ArtifactRef(subject.into()), "acme"), None);
+            assert_eq!(
+                git_pr_coordinate(&ArtifactRef(subject.into()), "acme"),
+                None
+            );
         }
     }
 
@@ -449,7 +496,7 @@ mod tests {
             dek_ref: "kms://acme/notif/inbox".into(),
             priority: 70,
         };
-        assert!(!can_read_subject(&identity, &principal, &row));
+        assert!(!can_read_subject(&identity, None, &principal, &row));
 
         let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
         tuples
@@ -467,6 +514,6 @@ mod tests {
                 Timestamp("2026-07-22T12:00:00Z".into()),
             )
             .unwrap();
-        assert!(can_read_subject(&identity, &principal, &row));
+        assert!(can_read_subject(&identity, None, &principal, &row));
     }
 }

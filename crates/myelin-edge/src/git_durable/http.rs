@@ -3039,6 +3039,43 @@ struct PrReviewGuard {
     inner: Arc<dyn Handler>,
 }
 
+struct PrReadGuard {
+    be: Arc<DurableGitBackend>,
+    inner: Arc<dyn Handler>,
+}
+
+impl Handler for PrReadGuard {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let slug = param(ctx, "repo")?;
+        let number = num_param(ctx, "n")?;
+        let loc = DurableGitBackend::loc(tenant_of(ctx), region_of(ctx), slug);
+        let can_pull = self.be.repo_authorizer().authorize_repo_permission(
+            ctx.principal,
+            &loc,
+            RepoPermission::Pull,
+        );
+        if !can_pull
+            && !self.be.authorize_pr_review(
+                tenant_of(ctx),
+                region_of(ctx),
+                slug,
+                number,
+                ctx.principal,
+            )
+        {
+            return Err(EdgeError::NotFound("pull request not found".into()));
+        }
+        self.inner.handle(ctx)
+    }
+}
+
+fn pr_read_guarded(be: &Arc<DurableGitBackend>, inner: Arc<dyn Handler>) -> Arc<dyn Handler> {
+    Arc::new(PrReadGuard {
+        be: be.clone(),
+        inner,
+    })
+}
+
 impl Handler for PrReviewGuard {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let slug = param(ctx, "repo")?;
@@ -3086,11 +3123,11 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 (Arc::new(DRepoCreate { be: be.clone() }), "git.repo.create")
             }
             (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}") => (
-                guarded(&be, Pull, Arc::new(DPrOverview { be: be.clone() })),
+                pr_read_guarded(&be, Arc::new(DPrOverview { be: be.clone() })),
                 "git.pr.view",
             ),
             (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}/checks") => (
-                guarded(&be, Pull, Arc::new(DPrChecks { be: be.clone() })),
+                pr_read_guarded(&be, Arc::new(DPrChecks { be: be.clone() })),
                 "git.pr.checks",
             ),
             (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
@@ -3160,13 +3197,13 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         get,
         &reroot("/api/git/repos/{repo}/prs/{n}/commits"),
         "git.pr.commits",
-        guarded(&be, Pull, Arc::new(DPrCommits { be: be.clone() })),
+        pr_read_guarded(&be, Arc::new(DPrCommits { be: be.clone() })),
     );
     b = b.route(
         get,
         &reroot("/api/git/repos/{repo}/prs/{n}/diff"),
         "git.pr.diff",
-        guarded(&be, Pull, Arc::new(DPrDiff { be: be.clone() })),
+        pr_read_guarded(&be, Arc::new(DPrDiff { be: be.clone() })),
     );
     b = b.route(
         get,
@@ -3178,7 +3215,7 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
         get,
         &reroot("/api/git/repos/{repo}/prs/{n}/threads"),
         "git.pr.threads.list",
-        guarded(&be, Pull, Arc::new(DPrThreads { be: be.clone() })),
+        pr_read_guarded(&be, Arc::new(DPrThreads { be: be.clone() })),
     );
     b = b.route(
         post,
