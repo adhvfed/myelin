@@ -24,6 +24,38 @@ describe("running edge platform", () => {
     });
   });
 
+  test("advertises the working local sign-in path without requiring authentication", async () => {
+    const response = await systemClient.json("/v1/auth/config", { authenticated: false });
+    expect(response.body).toEqual({
+      sso_configured: false,
+      providers: [],
+      dev_login_enabled: true,
+      token_login_enabled: true,
+    });
+    expect(response.headers.get("cache-control")).toContain("no-store");
+  });
+
+  test("binds tenant-addressed identity to the capability scope", async () => {
+    const scoped = await systemClient.json(
+      `/v1/t/${encodeURIComponent(systemTestConfig.tenant)}/whoami`,
+    );
+    expect(scoped.body).toMatchObject({
+      principal_id: systemTestConfig.principal,
+      tenant: systemTestConfig.tenant,
+      region: systemTestConfig.region,
+    });
+
+    const crossTenant = await systemClient.json("/v1/t/not-this-capability-tenant/whoami", {
+      expectedStatus: 403,
+    });
+    expect(crossTenant.body).toEqual({
+      error: {
+        code: "forbidden",
+        message: "forbidden",
+      },
+    });
+  });
+
   test("fails closed without a valid capability", async () => {
     const missing = await systemClient.json("/v1/whoami", {
       authenticated: false,
