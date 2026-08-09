@@ -10,6 +10,7 @@ use myelin_storage::TenantScope;
 use myelin_tenancy::Region;
 use serde_json::Value;
 
+use crate::agent_delegation::is_active_delegation;
 use crate::git_durable::DurableGitBackend;
 use crate::repo_authz::RepoPermission;
 
@@ -18,6 +19,7 @@ pub struct GitEffectApi {
     tenant: String,
     region: String,
     principal: Principal,
+    delegator: Principal,
     authority: Arc<RunTokenAuthorizer>,
 }
 
@@ -27,6 +29,7 @@ impl GitEffectApi {
         tenant: impl Into<String>,
         region: impl Into<String>,
         principal: Principal,
+        delegator: Principal,
         authority: Arc<RunTokenAuthorizer>,
     ) -> GitEffectApi {
         GitEffectApi {
@@ -34,6 +37,7 @@ impl GitEffectApi {
             tenant: tenant.into(),
             region: region.into(),
             principal,
+            delegator,
             authority,
         }
     }
@@ -60,6 +64,9 @@ impl GitEffectApi {
                 "git effect adapter scope does not match its authenticated principal - denied"
                     .into(),
             );
+        }
+        if !is_active_delegation(&self.principal, &self.delegator) {
+            return Err("git effect delegation binding is not an active human relationship".into());
         }
         let def = myelin_git::api::agent_tools()
             .into_iter()
@@ -147,18 +154,15 @@ impl GitEffectApi {
                 if let Err(denied) = self.authorize_repo(repo, RepoPermission::ApproveUntrustedCi) {
                     return denied;
                 }
-                match self
-                    .backend
-                    .endorse_fork_ci_with_operation(
-                        t,
-                        r,
-                        repo,
-                        number,
-                        args,
-                        &self.principal,
-                        operation_id,
-                    )
-                {
+                match self.backend.endorse_fork_ci_with_operation(
+                    t,
+                    r,
+                    repo,
+                    number,
+                    args,
+                    &self.principal,
+                    operation_id,
+                ) {
                     Ok(rec) => applied(
                         run,
                         tool,
@@ -215,7 +219,7 @@ impl GitEffectApi {
     fn authorize_repo(&self, repo: &str, permission: RepoPermission) -> Result<(), EffectResult> {
         let loc = RepoLoc::new(&self.tenant, &self.region, repo);
         if self.backend.repo_authorizer().authorize_repo_permission(
-            &self.principal,
+            &self.delegator,
             &loc,
             permission,
         ) {
@@ -325,9 +329,8 @@ mod tests {
 
     #[test]
     fn mcp_operation_identity_is_stable_bound_and_contains_no_raw_material() {
-        let effect = ProposedEffect(
-            r#"tool:git.open_pr|args:{"repo":"alpha","title":"private"}"#.into(),
-        );
+        let effect =
+            ProposedEffect(r#"tool:git.open_pr|args:{"repo":"alpha","title":"private"}"#.into());
         let first = mcp_operation_id("acme", "agent:claude", "request-secret").unwrap();
         let retry = mcp_operation_id("acme", "agent:claude", "request-secret").unwrap();
         assert_eq!(first, retry);
@@ -342,7 +345,8 @@ mod tests {
             first,
             mcp_operation_id("other", "agent:claude", "request-secret").unwrap()
         );
-        let changed_effect = ProposedEffect(r#"tool:git.submit_review|args:{"repo":"alpha"}"#.into());
+        let changed_effect =
+            ProposedEffect(r#"tool:git.submit_review|args:{"repo":"alpha"}"#.into());
         assert_eq!(
             first,
             mcp_operation_id("acme", "agent:claude", "request-secret").unwrap(),
@@ -377,7 +381,14 @@ mod tests {
             Arc::new(StructuralTokenVerifier::new()),
             RevocationStore::new(),
         ));
-        let api = GitEffectApi::new(backend.clone(), "acme", "eu-west", principal, authorizer);
+        let api = GitEffectApi::new(
+            backend.clone(),
+            "acme",
+            "eu-west",
+            principal,
+            read_principal.clone(),
+            authorizer,
+        );
         let effect = ProposedEffect(
             r#"tool:git.open_pr|args:{"repo":"alpha","title":"blocked","head_oid":"deadbeef","base_ref":"refs/heads/main"}"#.into(),
         );

@@ -107,8 +107,9 @@ impl<F: std::future::Future> std::future::Future for CatchUnwind<F> {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.inner.as_mut().poll(cx)))
-        {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner.as_mut().poll(cx)
+        })) {
             Ok(std::task::Poll::Ready(value)) => std::task::Poll::Ready(Ok(value)),
             Ok(std::task::Poll::Pending) => std::task::Poll::Pending,
             Err(payload) => std::task::Poll::Ready(Err(payload)),
@@ -197,6 +198,7 @@ fn server(
         DataRole::Controller,
         PrincipalStatus::Active,
     );
+    let delegator = trigger.clone();
     let scope = TenantScope::from_verified_token(&agent, Region(REGION.into()));
     let grants = ["run.view"];
     let run_id = RunId("run:mcp-ci-read-integration".into());
@@ -249,7 +251,7 @@ fn server(
         )
         .with_clock(|| Timestamp(NOW.into())),
     );
-    let reads = Arc::new(McpCiReadExecutor::new(api, boundary));
+    let reads = Arc::new(McpCiReadExecutor::new(api, boundary, delegator));
     McpServer::with_router_reads_and_clock(
         ToolRegistry::with_git_and_ci_reads().expect("valid shared catalogue"),
         router,
@@ -288,53 +290,54 @@ async fn governed_ci_read_reverifies_the_run_token_at_the_durable_boundary() {
     };
     setup_schema(&admin, &schema).await;
     with_schema_cleanup(&admin, &schema, || async {
-    let app = pool(&app_url(), &schema)
-        .await
-        .expect("connect app role to isolated schema");
-    insert_run(&app).await;
+        let app = pool(&app_url(), &schema)
+            .await
+            .expect("connect app role to isolated schema");
+        insert_run(&app).await;
 
-    let git_root = std::env::temp_dir().join(format!("{schema}_git"));
-    std::fs::create_dir_all(git_root.join(TENANT).join(REGION).join("alpha.git"))
-        .expect("create visible repository");
-    let grants = GrantBackedRepos::new().grant_read(AGENT_ID, TENANT, "alpha");
-    let git = Arc::new(
-        DurableGitBackend::rooted_inmem_for_test(&git_root).with_repo_authorizer(Arc::new(grants)),
-    );
-    let api = DurableCiReadApi::new(
-        CiRunStore::with_pg(app),
-        git,
-        Arc::new(FsBlobStore::new()),
-        tokio::runtime::Handle::current(),
-    );
+        let git_root = std::env::temp_dir().join(format!("{schema}_git"));
+        std::fs::create_dir_all(git_root.join(TENANT).join(REGION).join("alpha.git"))
+            .expect("create visible repository");
+        let grants = GrantBackedRepos::new().grant_read("human:founder", TENANT, "alpha");
+        let git = Arc::new(
+            DurableGitBackend::rooted_inmem_for_test(&git_root)
+                .with_repo_authorizer(Arc::new(grants)),
+        );
+        let api = DurableCiReadApi::new(
+            CiRunStore::with_pg(app),
+            git,
+            Arc::new(FsBlobStore::new()),
+            tokio::runtime::Handle::current(),
+        );
 
-    let router_revocations = RevocationStore::new();
-    let denied = call_read_run(&server(
-        api.clone(),
-        router_revocations.clone(),
-        RevocationStore::new(),
-    ));
-    assert_eq!(denied["result"]["isError"], true);
-    assert_eq!(denied["result"]["_meta"]["reason"], "denied");
+        let router_revocations = RevocationStore::new();
+        let denied = call_read_run(&server(
+            api.clone(),
+            router_revocations.clone(),
+            RevocationStore::new(),
+        ));
+        assert_eq!(denied["result"]["isError"], true);
+        assert_eq!(denied["result"]["_meta"]["reason"], "denied");
 
-    let visible = call_read_run(&server(api, router_revocations.clone(), router_revocations));
-    assert_eq!(visible["result"]["isError"], false);
-    assert_eq!(visible["result"]["_meta"]["tool"], "ci.read_run");
-    assert!(
-        visible["result"]["_meta"]["runToken"]
-            .as_str()
-            .is_some_and(|jti| !jti.is_empty()),
-        "successful read is attributed to the signed run token"
-    );
-    let payload: Value =
-        serde_json::from_str(visible["result"]["content"][0]["text"].as_str().unwrap())
-            .expect("durable read payload");
-    assert_eq!(payload["run"]["run_id"], RUN_ID);
-    assert_eq!(
-        payload["run"]["repo_ref"],
-        format!("myelin://{TENANT}/git/repo/alpha")
-    );
+        let visible = call_read_run(&server(api, router_revocations.clone(), router_revocations));
+        assert_eq!(visible["result"]["isError"], false);
+        assert_eq!(visible["result"]["_meta"]["tool"], "ci.read_run");
+        assert!(
+            visible["result"]["_meta"]["runToken"]
+                .as_str()
+                .is_some_and(|jti| !jti.is_empty()),
+            "successful read is attributed to the signed run token"
+        );
+        let payload: Value =
+            serde_json::from_str(visible["result"]["content"][0]["text"].as_str().unwrap())
+                .expect("durable read payload");
+        assert_eq!(payload["run"]["run_id"], RUN_ID);
+        assert_eq!(
+            payload["run"]["repo_ref"],
+            format!("myelin://{TENANT}/git/repo/alpha")
+        );
 
-    let _ = std::fs::remove_dir_all(git_root);
+        let _ = std::fs::remove_dir_all(git_root);
     })
     .await;
 }

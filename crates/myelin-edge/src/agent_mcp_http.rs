@@ -130,6 +130,11 @@ impl Handler for AgentMcpHandler {
             )?
             .map_err(map_registry_error)?;
         validate_registration(ctx.principal, &registration)?;
+        let delegator = active_delegator(
+            &self.services.principals,
+            ctx.scope,
+            &PrincipalId(registration.created_by.clone()),
+        )?;
 
         let registry = ToolRegistry::for_cursors(&registration.tools)
             .map_err(|error| EdgeError::Unavailable(error.to_string()))?;
@@ -148,6 +153,7 @@ impl Handler for AgentMcpHandler {
             ctx.principal.tenant.0.clone(),
             ctx.principal.region.0.clone(),
             ctx.principal.clone(),
+            delegator.clone(),
             self.services.boundary.clone(),
         ));
         let approvers = Arc::new(CreatorApproverPolicy {
@@ -170,6 +176,7 @@ impl Handler for AgentMcpHandler {
         let reads = Arc::new(McpCiReadExecutor::new(
             self.services.ci.clone(),
             self.services.boundary.clone(),
+            delegator,
         ));
         let server = McpServer::with_router_and_reads(registry, router, reads);
         let frame = std::str::from_utf8(&ctx.request.body)
@@ -201,6 +208,31 @@ impl Handler for AgentMcpHandler {
             })),
         }
     }
+}
+
+fn active_delegator(
+    principals: &PrincipalStore,
+    scope: &myelin_storage::TenantScope,
+    id: &PrincipalId,
+) -> Result<Principal, EdgeError> {
+    let row = principals
+        .try_get_principal(scope, id)
+        .map_err(|_| EdgeError::Unavailable("agent delegator lookup is unavailable".into()))?
+        .ok_or_else(|| EdgeError::NotFound("agent run not found".into()))?;
+    let principal = Principal::new(
+        row.tenant,
+        row.region,
+        row.principal_id,
+        row.kind,
+        row.data_role,
+        row.status,
+    );
+    if !matches!(&principal.kind, PrincipalKind::Human)
+        || principal.status != PrincipalStatus::Active
+    {
+        return Err(EdgeError::NotFound("agent run not found".into()));
+    }
+    Ok(principal)
 }
 
 pub fn register_agent_mcp(builder: GatewayBuilder, services: AgentMcpServices) -> GatewayBuilder {

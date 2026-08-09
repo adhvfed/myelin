@@ -8,14 +8,25 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+use crate::agent_delegation::is_active_delegation;
+
 pub struct McpCiReadExecutor {
     api: DurableCiReadApi,
     authority: Arc<RunTokenAuthorizer>,
+    delegator: Principal,
 }
 
 impl McpCiReadExecutor {
-    pub fn new(api: DurableCiReadApi, authority: Arc<RunTokenAuthorizer>) -> Self {
-        Self { api, authority }
+    pub fn new(
+        api: DurableCiReadApi,
+        authority: Arc<RunTokenAuthorizer>,
+        delegator: Principal,
+    ) -> Self {
+        Self {
+            api,
+            authority,
+            delegator,
+        }
     }
 }
 
@@ -28,6 +39,9 @@ impl DirectReadExecutor for McpCiReadExecutor {
         arguments: &Value,
     ) -> Result<Value, DirectReadError> {
         if authority.tool() != tool {
+            return Err(DirectReadError::Denied);
+        }
+        if !is_active_delegation(principal, &self.delegator) {
             return Err(DirectReadError::Denied);
         }
         let scope = TenantScope::from_verified_token(principal, principal.region.clone());
@@ -43,7 +57,9 @@ impl DirectReadExecutor for McpCiReadExecutor {
             "ci.read_run" => {
                 exact_fields(arguments, &["run_id"], &["run_id"])?;
                 let run_id = required_string(arguments, "run_id")?;
-                self.api.read_run(principal, run_id).map_err(map_edge_error)
+                self.api
+                    .read_run(&self.delegator, run_id)
+                    .map_err(map_edge_error)
             }
             "ci.read_log" => {
                 exact_fields(
@@ -56,7 +72,7 @@ impl DirectReadExecutor for McpCiReadExecutor {
                 let start = optional_i64(arguments, "start")?.unwrap_or(0);
                 let limit = optional_u32(arguments, "limit")?.unwrap_or(CI_LOG_RANGE_DEFAULT);
                 self.api
-                    .read_log(principal, run_id, job_id, start, limit)
+                    .read_log(&self.delegator, run_id, job_id, start, limit)
                     .map_err(map_edge_error)
             }
             _ => Err(DirectReadError::Unavailable),

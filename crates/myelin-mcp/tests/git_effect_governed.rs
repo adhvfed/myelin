@@ -147,6 +147,7 @@ fn governed_git_server_with_grants_scoped_at(
 
     let agent = agent_principal_in("agent:claude", tenant, region);
     let trigger = human_principal_in("human:operator", tenant, region);
+    let delegator = trigger.clone();
     let scope = TenantScope::from_verified_token(&trigger, Region(region.into()));
 
     let input = DelegationInput {
@@ -181,7 +182,14 @@ fn governed_git_server_with_grants_scoped_at(
         },
     };
 
-    let effect = GitEffectApi::new(backend, tenant, region, agent, boundary_authorizer);
+    let effect = GitEffectApi::new(
+        backend,
+        tenant,
+        region,
+        agent,
+        delegator,
+        boundary_authorizer,
+    );
     let router = GovernedRouter::with_approver_policy(
         minter,
         principal,
@@ -291,7 +299,11 @@ fn call_with_gate(name: &str, args: serde_json::Value, gate_id: &str) -> String 
 fn open_pr_routes_through_effect_api_and_persists_durably() {
     let actor = agent_principal("agent:claude");
     let root = temp_root("openpr");
-    let backend = Arc::new(DurableGitBackend::rooted_inmem_for_test(&root));
+    let backend = Arc::new(
+        DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(
+            GrantBackedRepos::new().grant_write("human:operator", TENANT, "alpha"),
+        )),
+    );
     backend
         .create_repo(TENANT, REGION, "alpha")
         .expect("create repo");
