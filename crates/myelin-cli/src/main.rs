@@ -11,7 +11,7 @@ use myelin_cli::device_auth::{
 };
 use myelin_cli::dispatch::{
     chat_dispatch, ci_dispatch, git_dispatch, issues_dispatch, knowledge_dispatch, notif_dispatch,
-    EdgeCall, HttpMethod,
+    repo_dispatch, EdgeCall, HttpMethod,
 };
 use myelin_cli::error::CliError;
 use myelin_cli::git_credential::{
@@ -21,17 +21,22 @@ use myelin_cli::git_credential::{
 #[derive(Parser, Debug)]
 #[command(name = "myelin", version, about, long_about = None)]
 struct Cli {
+    /// Render the stable machine-readable response instead of human output.
     #[arg(long, global = true)]
     json: bool,
+    /// Override the Edge endpoint for this command.
     #[arg(long, global = true)]
     edge: Option<String>,
+    /// Use an explicit short-lived token instead of a saved credential.
     #[arg(long, global = true)]
     token: Option<String>,
+    /// Declare the explicit token's authentication scheme.
     #[arg(long, global = true)]
     scheme: Option<String>,
     /// Select a saved endpoint, context, and credential bundle.
     #[arg(long, global = true)]
     profile: Option<String>,
+    /// Give a mutation a retry-stable identity.
     #[arg(long, global = true)]
     idempotency_key: Option<String>,
     #[command(subcommand)]
@@ -40,38 +45,54 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
+    #[command(hide = true)]
     Login(LoginArgs),
+    /// Sign in, inspect the current identity, or configure native Git.
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// List, inspect, or switch saved endpoint and tenant contexts.
     Context {
         #[command(subcommand)]
         command: ContextCommand,
     },
+    /// Show the principal authenticated by the selected credential.
     Whoami,
+    #[command(hide = true)]
     Git {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    Issues {
+    /// Work with repositories, pull requests, and code search.
+    Repo {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// List, create, inspect, and close issues.
+    #[command(name = "issue", visible_alias = "issues")]
+    Issue {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Inspect CI runs and logs.
     Ci {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Work with conversations and messages.
     Chat {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    #[command(name = "kb", visible_aliases = ["doc", "knowledge"])]
+    /// Work with knowledge pages.
+    #[command(name = "doc", visible_aliases = ["kb", "knowledge"])]
     Knowledge {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    #[command(alias = "inbox")]
+    /// Read and complete personal notifications.
+    #[command(name = "inbox", visible_alias = "notif")]
     Notif {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -161,7 +182,11 @@ async fn run() -> Result<(), CliError> {
             let (call, command_key) = dispatch_command(args, git_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
-        Command::Issues { args } => {
+        Command::Repo { args } => {
+            let (call, command_key) = dispatch_command(args, repo_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
+        }
+        Command::Issue { args } => {
             let (call, command_key) = dispatch_command(args, issues_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
@@ -619,5 +644,28 @@ mod tests {
                 2
             );
         }
+    }
+
+    #[test]
+    fn canonical_product_nouns_parse_without_legacy_wrappers() {
+        for args in [
+            &["myelin", "repo", "list"][..],
+            &["myelin", "repo", "pr", "list"][..],
+            &["myelin", "issue", "list"][..],
+            &["myelin", "inbox", "list"][..],
+            &["myelin", "doc", "page", "list"][..],
+        ] {
+            Cli::try_parse_from(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+        }
+    }
+
+    #[test]
+    fn repo_noun_projects_repo_and_nested_git_commands() {
+        assert_eq!(repo_dispatch(&["list"]).unwrap().path, "/v1/git/repos");
+        assert_eq!(repo_dispatch(&["pr", "list"]).unwrap().path, "/v1/git/prs");
+        assert_eq!(
+            repo_dispatch(&["search", "code", "needle"]).unwrap().path,
+            "/v1/git/search/code"
+        );
     }
 }

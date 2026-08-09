@@ -148,6 +148,17 @@ pub fn git_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     git_command_to_call(&command)
 }
 
+/** Project the canonical `myelin repo ...` grammar onto Git's shared repo/PR/search parser. */
+pub fn repo_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
+    if matches!(args.first().copied(), Some("pr" | "search")) {
+        return git_dispatch(args);
+    }
+    let mut git_args = Vec::with_capacity(args.len() + 1);
+    git_args.push("repo");
+    git_args.extend_from_slice(args);
+    git_dispatch(&git_args)
+}
+
 pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
     match command {
         CliCommand::RepoList { limit, cursor } => {

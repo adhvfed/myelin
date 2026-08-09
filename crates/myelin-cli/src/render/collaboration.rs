@@ -50,7 +50,7 @@ pub(super) fn page_command(call: &EdgeCall, cursor: &str) -> Option<String> {
             "myelin chat list --limit {limit} --cursor {cursor}"
         )),
         "/v1/knowledge/pages" => Some(format!(
-            "myelin kb page list --limit {limit} --cursor {cursor}"
+            "myelin doc page list --limit {limit} --cursor {cursor}"
         )),
         path => {
             let conversation = path

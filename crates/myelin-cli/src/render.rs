@@ -72,7 +72,7 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
             } else if RepoListCursor::parse(cursor).is_ok() {
                 let cursor = terminal_safe_single_line(cursor);
                 out.push_str(&format!(
-                    "… (more - run: myelin git repo list --cursor {cursor})\n"
+                    "… (more - run: myelin repo list --cursor {cursor})\n"
                 ));
             } else {
                 out.push_str("… (more - pass --cursor to page)\n");
@@ -103,7 +103,7 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
             let key = terminal_safe_single_line(key);
             let status = terminal_safe_single_line(status);
             return format!(
-                "{key} staged ({id}); authorization={status}\nnot visible yet; after reconciliation: myelin issues view {id}\n"
+                "{key} staged ({id}); authorization={status}\nnot visible yet; after reconciliation: myelin issue view {id}\n"
             );
         }
     }
@@ -530,8 +530,8 @@ mod tests {
             })
             .expect("actionable next-page command");
         let words = command.split_whitespace().collect::<Vec<_>>();
-        assert_eq!(&words[..4], &["myelin", "git", "repo", "list"]);
-        let call = crate::dispatch::git_dispatch(&words[2..]).expect("hint parses and dispatches");
+        assert_eq!(&words[..3], &["myelin", "repo", "list"]);
+        let call = crate::dispatch::repo_dispatch(&words[2..]).expect("hint parses and dispatches");
         assert_eq!(call.path, "/v1/git/repos");
         assert_eq!(
             call.query.as_deref(),
@@ -573,7 +573,7 @@ mod tests {
         );
         assert!(out.contains("authorization=pending"));
         assert!(out.contains("not visible yet"));
-        assert!(out.contains(&format!("myelin issues view {id}")));
+        assert!(out.contains(&format!("myelin issue view {id}")));
         assert!(!out.contains("created successfully"));
     }
 

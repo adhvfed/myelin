@@ -274,6 +274,9 @@ describe("the CLI authentication journey", () => {
       expect(status.stdout).toContain(systemTestConfig.principal);
       expect(status.stdout).toContain(`tenant=${systemTestConfig.tenant}`);
 
+      const repositories = await runCli(configDirectory, "repo", "list");
+      expect(repositories.exitCode, repositories.stderr).toBe(0);
+
       const configureGit = await runCliWith(
         configDirectory,
         { environment: gitEnvironment },

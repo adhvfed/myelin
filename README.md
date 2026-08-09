@@ -78,15 +78,20 @@ myelin context use customer-a
 myelin context current
 myelin auth configure-git
 
+myelin repo list
+myelin repo pr list
+myelin issue list
+myelin inbox list
+
 myelin chat list
 myelin chat create engineering --topic "Release coordination" --idempotency-key release-room
 myelin chat send 01J... "Ready for review." --idempotency-key release-message
 myelin chat history 01J...
 
-myelin kb page list
-myelin kb page create --title "Deployment runbook" --template runbook \
+myelin doc page list
+myelin doc page create --title "Deployment runbook" --template runbook \
   --idempotency-key deployment-runbook
-myelin kb page get 01J...
+myelin doc page get 01J...
 ```
 
 Each named profile bundles its Edge, tenant, region, optional project, and an opaque credential
