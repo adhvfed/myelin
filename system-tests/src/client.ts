@@ -11,6 +11,7 @@ export interface RequestOptions {
   body?: unknown;
   authenticated?: boolean;
   token?: string;
+  tokenScheme?: string;
   expectedStatus?: number | readonly number[];
   idempotencyKey?: string | false;
   headers?: Readonly<Record<string, string>>;
@@ -51,7 +52,7 @@ export class SystemTestClient {
     headers.set("accept", "application/json");
     if (authenticated) {
       headers.set("authorization", `Bearer ${options.token ?? this.config.token}`);
-      headers.set("x-myelin-token-scheme", this.config.tokenScheme);
+      headers.set("x-myelin-token-scheme", options.tokenScheme ?? this.config.tokenScheme);
     }
     if (options.body !== undefined) headers.set("content-type", "application/json");
     if (method === "POST" || method === "PUT") {

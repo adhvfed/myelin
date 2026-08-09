@@ -1,5 +1,9 @@
 use crate::authz::{authorize_edge_action, human_session_authority};
 use crate::catalogue::{Handler, HandlerCtx, Method, Page};
+use crate::device_auth::{
+    ApprovalOutcome, ClaimOutcome, DeviceApproval, DeviceAuthorizationBroker,
+    DeviceAuthorizationError,
+};
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
 use crate::session::{SessionStore, SESSION_COOKIE};
@@ -50,6 +54,44 @@ impl HumanSessionIssuer {
             jti: format!("session-{}", self.jtis.mint().0),
             exp_unix: expiry,
             authority: human_session_authority(),
+            dpop_jkt: None,
+            purpose: CredentialPurpose::HumanSession,
+            audience: CredentialAudience::Edge,
+        });
+        Ok((token, expiry))
+    }
+
+    fn mint_device_session(
+        &self,
+        approval: &DeviceApproval,
+    ) -> Result<(String, i64), EdgeError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let expiry = approval
+            .source_expires_at_unix
+            .min(now.saturating_add(HUMAN_SESSION_TTL_SECS));
+        if expiry <= now {
+            return Err(EdgeError::Unauthorized(
+                "the approving browser credential has expired".into(),
+            ));
+        }
+        if !matches!(approval.principal.kind, PrincipalKind::Human)
+            || approval.principal.status != myelin_identity::PrincipalStatus::Active
+            || approval.authority.is_empty()
+        {
+            return Err(EdgeError::Unauthorized(
+                "the approved identity is not eligible for a human session".into(),
+            ));
+        }
+        let token = self.cell.mint(&CapabilityMintSpec {
+            tenant: approval.principal.tenant.0.clone(),
+            region: approval.principal.region.0.clone(),
+            subject_key: approval.principal.principal_id.0.clone(),
+            jti: format!("session-{}", self.jtis.mint().0),
+            exp_unix: expiry,
+            authority: approval.authority.clone(),
             dpop_jkt: None,
             purpose: CredentialPurpose::HumanSession,
             audience: CredentialAudience::Edge,
@@ -175,6 +217,7 @@ pub struct GatewayBuilder {
     auth_config: AuthPublicConfig,
     public_base_url: Option<String>,
     human_session_issuer: Option<HumanSessionIssuer>,
+    device_authorization: Option<DeviceAuthorizationBroker>,
 }
 
 impl GatewayBuilder {
@@ -285,6 +328,14 @@ impl GatewayBuilder {
         self
     }
 
+    pub fn with_device_authorization(
+        mut self,
+        broker: DeviceAuthorizationBroker,
+    ) -> GatewayBuilder {
+        self.device_authorization = Some(broker);
+        self
+    }
+
     pub fn with_public_base_url(
         mut self,
         public_base_url: impl Into<String>,
@@ -307,6 +358,7 @@ impl GatewayBuilder {
             auth_config: self.auth_config,
             public_base_url: self.public_base_url,
             human_session_issuer: self.human_session_issuer,
+            device_authorization: self.device_authorization,
         }
     }
 }
@@ -329,6 +381,30 @@ fn validate_public_base_url(public_base_url: &str) -> Result<String, String> {
     Ok(public_base_url.trim_end_matches('/').to_string())
 }
 
+fn bounded_auth_body(request: &EdgeRequest) -> Result<(), EdgeError> {
+    if request.body.len() > 4 * 1024 {
+        return Err(EdgeError::PayloadTooLarge(
+            "authentication request exceeds 4 KiB".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn map_device_authorization_error(error: DeviceAuthorizationError) -> EdgeError {
+    match error {
+        DeviceAuthorizationError::InvalidInput(message) => EdgeError::BadRequest(message.into()),
+        DeviceAuthorizationError::Store(_) => EdgeError::Unavailable(
+            "interactive CLI login state is temporarily unavailable".into(),
+        ),
+    }
+}
+
+fn no_store(response: EdgeResponse) -> EdgeResponse {
+    response
+        .with_header("cache-control", "no-store")
+        .with_header("pragma", "no-cache")
+}
+
 pub struct Gateway {
     authn: Arc<CapabilityAuthenticator>,
     human_login: Arc<HumanSsoAuthenticator>,
@@ -341,6 +417,7 @@ pub struct Gateway {
     auth_config: AuthPublicConfig,
     public_base_url: Option<String>,
     human_session_issuer: Option<HumanSessionIssuer>,
+    device_authorization: Option<DeviceAuthorizationBroker>,
 }
 
 impl Gateway {
@@ -361,6 +438,7 @@ impl Gateway {
             auth_config: AuthPublicConfig::default(),
             public_base_url: None,
             human_session_issuer: None,
+            device_authorization: None,
         }
     }
 
@@ -406,6 +484,15 @@ impl Gateway {
         match (method, req.path.as_str()) {
             (Method::Get, "/v1/auth/config") => return Ok(self.auth_config_response()),
             (Method::Post, "/v1/auth/login") => return self.login(req),
+            (Method::Post, "/v1/auth/device/authorization") => {
+                return self.begin_device_authorization(req)
+            }
+            (Method::Post, "/v1/auth/device/approval") => {
+                return self.approve_device_authorization(req)
+            }
+            (Method::Post, "/v1/auth/device/token") => {
+                return self.claim_device_authorization(req)
+            }
             (Method::Post, "/v1/auth/logout") => return Ok(self.logout(req)),
             (Method::Post, "/v1/auth/refresh") => return self.refresh(req),
             _ => {}
@@ -587,8 +674,147 @@ impl Gateway {
                 "providers": providers,
                 "dev_login_enabled": self.auth_config.dev_login_enabled,
                 "token_login_enabled": self.auth_config.token_login_enabled,
+                "cli_login_enabled": self.device_authorization.is_some(),
             }),
         )
+    }
+
+    fn begin_device_authorization(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
+        let broker = self.device_authorization.as_ref().ok_or_else(|| {
+            EdgeError::Unavailable("interactive CLI login is not configured".into())
+        })?;
+        bounded_auth_body(req)?;
+        let body = req.json_body()?;
+        let challenge = body
+            .get("code_challenge")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                EdgeError::BadRequest("device authorization body missing `code_challenge`".into())
+            })?;
+        let started = broker.begin(challenge).map_err(map_device_authorization_error)?;
+        Ok(no_store(EdgeResponse::json(
+            201,
+            &json!({
+                "device_code": started.device_code,
+                "user_code": started.user_code,
+                "verification_uri": started.verification_uri,
+                "verification_uri_complete": started.verification_uri_complete,
+                "expires_in": started.expires_in,
+                "interval": started.interval,
+            }),
+        )))
+    }
+
+    fn approve_device_authorization(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
+        let broker = self.device_authorization.as_ref().ok_or_else(|| {
+            EdgeError::Unavailable("interactive CLI login is not configured".into())
+        })?;
+        bounded_auth_body(req)?;
+        let identity = self.authenticate(req, None, false)?;
+        if !authorize_edge_action(
+            self.authorizer.as_ref(),
+            &identity,
+            "edge.auth.device.approve",
+        ) {
+            return Err(EdgeError::Forbidden(
+                "this credential cannot approve an interactive CLI login".into(),
+            ));
+        }
+        let authority = match identity.capability().purpose {
+            CredentialPurpose::HumanSession => {
+                let session_authority = human_session_authority();
+                identity
+                    .capability()
+                    .effective_authority
+                    .grants()
+                    .filter(|grant| session_authority.iter().any(|allowed| allowed == grant))
+                    .map(str::to_string)
+                    .collect()
+            }
+            CredentialPurpose::OperatorBootstrap if self.auth_config.dev_login_enabled => {
+                human_session_authority()
+            }
+            _ => {
+                return Err(EdgeError::Forbidden(
+                    "only a human browser session can approve an interactive CLI login".into(),
+                ))
+            }
+        };
+        let body = req.json_body()?;
+        let user_code = body
+            .get("user_code")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| {
+                EdgeError::BadRequest("device approval body missing `user_code`".into())
+            })?;
+        let approval = DeviceApproval {
+            principal: identity.principal.clone(),
+            authority,
+            source_expires_at_unix: identity.capability().expires_at_unix,
+        };
+        match broker
+            .approve(user_code, approval)
+            .map_err(map_device_authorization_error)?
+        {
+            ApprovalOutcome::Approved | ApprovalOutcome::AlreadyApproved => Ok(no_store(
+                EdgeResponse::json(200, &json!({ "approved": true })),
+            )),
+            ApprovalOutcome::Expired => Err(EdgeError::NotFound(
+                "that CLI login request has expired; start again from the CLI".into(),
+            )),
+            ApprovalOutcome::NotFound => Err(EdgeError::NotFound(
+                "that CLI login request was not found".into(),
+            )),
+        }
+    }
+
+    fn claim_device_authorization(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
+        let broker = self.device_authorization.as_ref().ok_or_else(|| {
+            EdgeError::Unavailable("interactive CLI login is not configured".into())
+        })?;
+        bounded_auth_body(req)?;
+        let body = req.json_body()?;
+        let device_code = body
+            .get("device_code")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| EdgeError::BadRequest("device token body missing `device_code`".into()))?;
+        let verifier = body
+            .get("code_verifier")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| EdgeError::BadRequest("device token body missing `code_verifier`".into()))?;
+        match broker
+            .claim(device_code, verifier)
+            .map_err(map_device_authorization_error)?
+        {
+            ClaimOutcome::Pending => Ok(no_store(EdgeResponse::json(
+                202,
+                &json!({
+                    "status": "authorization_pending",
+                    "interval": crate::device_auth::DEVICE_AUTHORIZATION_POLL_INTERVAL_SECS,
+                }),
+            ))),
+            ClaimOutcome::Approved(approval) => {
+                let issuer = self.human_session_issuer.as_ref().ok_or_else(|| {
+                    EdgeError::Unavailable("human session issuer is unavailable".into())
+                })?;
+                let (access_token, expires_at) = issuer.mint_device_session(&approval)?;
+                Ok(no_store(EdgeResponse::json(
+                    200,
+                    &json!({
+                        "access_token": access_token,
+                        "token_type": "Bearer",
+                        "scheme": myelin_identity_service::machine_scheme::SESSION,
+                        "expires_at": expires_at,
+                    }),
+                )))
+            }
+            ClaimOutcome::Expired => Err(EdgeError::Unauthorized(
+                "the CLI login request has expired".into(),
+            )),
+            ClaimOutcome::Invalid => Err(EdgeError::Unauthorized(
+                "the CLI login request is invalid".into(),
+            )),
+        }
     }
 
     fn broadcast_repo_lifecycle(
@@ -1227,6 +1453,153 @@ mod tests {
         assert_eq!(b["token_login_enabled"], true);
         assert_eq!(b["providers"][0]["id"], "oidc");
         assert_eq!(b["providers"][0]["label"], "Single sign-on");
+        assert_eq!(b["cli_login_enabled"], false);
+    }
+
+    #[test]
+    fn browser_approval_mints_one_fresh_cli_session_without_transferring_its_token() {
+        use base64::Engine as _;
+        use myelin_identity::{DataRole, PrincipalId, PrincipalStatus};
+        use sha2::{Digest as _, Sha256};
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let source_expiry = now + 300;
+        let cell = Arc::new(CellTokenAuthority::from_seed(&[41_u8; 32], &[42_u8; 32]).unwrap());
+        let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
+        let principal = Principal::new(
+            TenantId("acme".into()),
+            Region("eu-west".into()),
+            PrincipalId("p:alice".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
+        store
+            .put_principal(
+                &scope,
+                principal.principal_id.clone(),
+                PrincipalKind::Human,
+                DataRole::Controller,
+                PrincipalStatus::Active,
+                None,
+            )
+            .unwrap();
+        let browser_token = cell.mint(&CapabilityMintSpec {
+            tenant: principal.tenant.0.clone(),
+            region: principal.region.0.clone(),
+            subject_key: principal.principal_id.0.clone(),
+            jti: "browser-session".into(),
+            exp_unix: source_expiry,
+            authority: human_session_authority(),
+            dpop_jkt: None,
+            purpose: CredentialPurpose::HumanSession,
+            audience: CredentialAudience::Edge,
+        });
+        let authn = Arc::new(CapabilityAuthenticator::with_verifier(
+            store,
+            Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
+            RevocationStore::new(),
+        ));
+        let broker = DeviceAuthorizationBroker::memory("https://myelin.example/cli/auth").unwrap();
+        let gateway = Gateway::builder(authn, human_login(), Arc::new(AllowAll))
+            .with_human_session_issuer(cell)
+            .with_device_authorization(broker)
+            .route(
+                Method::Get,
+                "/v1/whoami",
+                "edge.whoami",
+                Arc::new(WhoamiHandler),
+            )
+            .build();
+
+        let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([9_u8; 32]);
+        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(Sha256::digest(verifier.as_bytes()));
+        let started = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/device/authorization",
+            "",
+            vec![],
+            serde_json::to_vec(&json!({ "code_challenge": challenge })).unwrap(),
+        ));
+        assert_eq!(started.status(), 201);
+        let started = started.json_body().unwrap();
+        let device_code = started["device_code"].as_str().unwrap();
+        let user_code = started["user_code"].as_str().unwrap();
+        assert_eq!(started["verification_uri"], "https://myelin.example/cli/auth");
+
+        let pending = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/device/token",
+            "",
+            vec![],
+            serde_json::to_vec(&json!({
+                "device_code": device_code,
+                "code_verifier": verifier,
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(pending.status(), 202);
+
+        let approved = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/device/approval",
+            "",
+            vec![
+                ("authorization".into(), format!("Bearer {browser_token}")),
+                ("x-myelin-token-scheme".into(), "session".into()),
+            ],
+            serde_json::to_vec(&json!({ "user_code": user_code })).unwrap(),
+        ));
+        assert_eq!(approved.status(), 200);
+
+        let claimed = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/device/token",
+            "",
+            vec![],
+            serde_json::to_vec(&json!({
+                "device_code": device_code,
+                "code_verifier": verifier,
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(claimed.status(), 200);
+        let claimed = claimed.json_body().unwrap();
+        let cli_token = claimed["access_token"].as_str().unwrap();
+        assert_ne!(cli_token, browser_token, "the browser token is never transferred");
+        assert_eq!(claimed["scheme"], "session");
+        assert!(claimed["expires_at"].as_i64().unwrap() <= source_expiry);
+
+        let whoami = gateway.handle(EdgeRequest::new(
+            "GET",
+            "/v1/whoami",
+            "",
+            vec![
+                ("authorization".into(), format!("Bearer {cli_token}")),
+                ("x-myelin-token-scheme".into(), "session".into()),
+            ],
+            vec![],
+        ));
+        assert_eq!(whoami.status(), 200);
+        assert_eq!(whoami.json_body().unwrap()["principal_id"], "p:alice");
+
+        let replay = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/device/token",
+            "",
+            vec![],
+            serde_json::to_vec(&json!({
+                "device_code": device_code,
+                "code_verifier": verifier,
+            }))
+            .unwrap(),
+        ));
+        assert_eq!(replay.status(), 401, "the authorization is consumed exactly once");
     }
 
     #[test]

@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod catalogue;
 pub mod chat_http;
 pub mod ci_http;
+pub mod device_auth;
 pub mod error;
 pub mod gateway;
 #[path = "git_durable/ci_surface.rs"]
@@ -41,6 +42,7 @@ pub use catalogue::{
 };
 pub use chat_http::register_chat;
 pub use ci_http::{register_ci, DurableCiReadApi};
+pub use device_auth::{device_authorization_migrations, DeviceAuthorizationBroker};
 pub use error::{map_authz_error, EdgeError};
 pub use gateway::{
     sse_scope_for_resource, sse_scope_for_tenant, AuthProvider, AuthPublicConfig, Gateway,

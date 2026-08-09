@@ -11,8 +11,8 @@ use myelin_edge::{
     spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams,
     CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, GitDatabaseProviders,
-    IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
-    SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
+    DeviceAuthorizationBroker, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe,
+    SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
     TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
@@ -124,6 +124,25 @@ fn validated_oidc_issuer(raw: &str) -> Result<String, String> {
         return Err("MYELIN_OIDC_ISSUER must not contain a query string".into());
     }
     Ok(raw.to_string())
+}
+
+fn device_verification_uri(raw_origin: &str) -> Result<String, String> {
+    let uri: Uri = raw_origin
+        .parse()
+        .map_err(|_| "MYELIN_WEB_PUBLIC_URL is not a valid absolute URI".to_string())?;
+    if !matches!(uri.scheme_str(), Some("http" | "https"))
+        || uri.authority().is_none()
+        || uri
+            .authority()
+            .is_some_and(|authority| authority.as_str().contains('@'))
+        || uri.query().is_some()
+        || !matches!(uri.path(), "" | "/")
+    {
+        return Err(
+            "MYELIN_WEB_PUBLIC_URL must be an absolute, credential-free HTTP(S) origin".into(),
+        );
+    }
+    Ok(format!("{}/cli/auth", raw_origin.trim_end_matches('/')))
 }
 
 fn parse_oidc_jwks_response(
@@ -536,6 +555,16 @@ async fn compose_core(cell_id: String) -> ComposedCore {
     }
     if let Err(e) = bootstrap
         .migrate(
+            &myelin_edge::device_authorization_migrations(),
+            &HotTables::none(),
+        )
+        .await
+    {
+        eprintln!("edge: cannot apply the interactive CLI login migration: {e}");
+        std::process::exit(1);
+    }
+    if let Err(e) = bootstrap
+        .migrate(
             &myelin_issues::issues_migrations(),
             &myelin_issues::issues_hot_tables(),
         )
@@ -815,6 +844,24 @@ async fn serve(
     let token_login_enabled = std::env::var("MYELIN_TOKEN_LOGIN")
         .map(|v| v == "1")
         .unwrap_or(false);
+    let device_authorization = std::env::var("MYELIN_WEB_PUBLIC_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|origin| {
+            let verification_uri = device_verification_uri(origin.trim()).unwrap_or_else(|error| {
+                eprintln!("edge: invalid CLI login browser origin: {error}");
+                std::process::exit(1);
+            });
+            DeviceAuthorizationBroker::with_pg(
+                provider.db_pool().clone(),
+                handle.clone(),
+                verification_uri,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("edge: invalid CLI login verification URI: {error}");
+                std::process::exit(1);
+            })
+        });
     let auth_config = public_auth_config(
         oidc_settings.is_some(),
         dev_login_enabled,
@@ -1001,6 +1048,13 @@ async fn serve(
     )
     .default_token_scheme(EDGE_DEFAULT_TOKEN_SCHEME)
     .with_human_session_issuer(cell.clone());
+    let builder = match device_authorization {
+        Some(broker) => builder.with_device_authorization(broker),
+        None => {
+            eprintln!("edge: interactive CLI login disabled - MYELIN_WEB_PUBLIC_URL is not set");
+            builder
+        }
+    };
     let mut builder = builder
         .with_public_base_url(public_base_url)
         .unwrap_or_else(|error| {

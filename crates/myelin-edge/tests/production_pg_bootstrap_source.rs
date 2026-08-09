@@ -12,6 +12,9 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
     let durable = source
         .find("bootstrap\n        .migrate(&all_durable_migrations()")
         .expect("durable aggregate must run through PgBootstrap");
+    let device_authorization = source
+        .find("&myelin_edge::device_authorization_migrations()")
+        .expect("interactive CLI login state must run through PgBootstrap");
     let issues = source
         .find("&myelin_issues::issues_migrations()")
         .expect("Issues saga schema must run through PgBootstrap");
@@ -53,6 +56,8 @@ fn production_main_destroys_the_privileged_pool_before_runtime_stores_and_bind()
         .expect("serving listener must remain wired");
 
     assert!(foundation < durable);
+    assert!(durable < device_authorization);
+    assert!(device_authorization < issues);
     assert!(durable < flow_migrations);
     assert!(flow_migrations < ci_migrations);
     assert!(durable < ci_migrations);
@@ -80,12 +85,26 @@ fn production_edge_mounts_the_durable_recipient_scoped_notification_read() {
     assert!(main.contains("PgInboxStore::new(provider.db_pool().clone())"));
     assert!(main.contains("check.clone()"));
     assert!(route.contains("/v1/notif/inbox"));
-    assert!(route.contains("tenant: ctx.principal.tenant.clone()"));
-    assert!(route.contains("region: ctx.principal.region.clone()"));
-    assert!(route.contains("recipient: ctx.principal.principal_id.0.clone()"));
+    assert!(route.contains("tenant: principal.tenant.clone()"));
+    assert!(route.contains("region: principal.region.clone()"));
+    assert!(route.contains("recipient: principal.principal_id.0.clone()"));
     assert!(route.contains("can_read_subject"));
     assert!(!route.contains("query_param(\"tenant\")"));
     assert!(!route.contains("query_param(\"recipient\")"));
+}
+
+#[test]
+fn production_edge_mounts_durable_verifier_bound_cli_login() {
+    let main = include_str!("../src/main.rs");
+    let broker = include_str!("../src/device_auth.rs");
+
+    assert!(main.contains("MYELIN_WEB_PUBLIC_URL"));
+    assert!(main.contains("DeviceAuthorizationBroker::with_pg("));
+    assert!(main.contains("provider.db_pool().clone()"));
+    assert!(broker.contains("device_digest       bytea  PRIMARY KEY"));
+    assert!(broker.contains("verifier_challenge  bytea  NOT NULL"));
+    assert!(!broker.contains("access_token"));
+    assert!(!broker.contains("browser_token"));
 }
 
 #[test]

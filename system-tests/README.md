@@ -42,6 +42,9 @@ The suite is intentionally organized around externally visible contracts:
   messages through one public retry identity, creates and edits a Knowledge page with the same
   retry convention, and exercises the asynchronous Issues authorization reconciler and optimistic
   conflicts.
+- `authentication-lifecycle` starts logged out, lets an authenticated browser identity approve one
+  verifier-bound CLI login, proves another CLI cannot claim it, and uses the fresh session exactly
+  once without copying the browser credential.
 - `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary and appears as
   one queued run. Fed disables the local sandbox runner, so this suite does not claim job execution.
 - `notification-lifecycle` publishes through the external JetStream boundary and verifies durable,

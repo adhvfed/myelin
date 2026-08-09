@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 
 pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "edge.whoami",
+    "edge.auth.device.approve",
     "edge.events.subscribe",
     "issues.list",
     "issues.create",
@@ -95,6 +96,10 @@ const OP_AGENT_PAT_DEPLOY: &[AcceptedPurpose] = &[
     AcceptedPurpose::DeployKey,
 ];
 const CI_ONLY: &[AcceptedPurpose] = &[AcceptedPurpose::CiJob];
+const HUMAN_OR_OPERATOR: &[AcceptedPurpose] = &[
+    AcceptedPurpose::HumanSession,
+    AcceptedPurpose::OperatorBootstrap,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionRequirement {
@@ -115,6 +120,11 @@ macro_rules! requirement {
 
 pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("edge.whoami", "edge.identity.read", OP_AGENT_PAT),
+    requirement!(
+        "edge.auth.device.approve",
+        "edge.auth.delegate",
+        HUMAN_OR_OPERATOR
+    ),
     requirement!(
         "edge.events.subscribe",
         "edge.events.subscribe",
