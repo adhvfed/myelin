@@ -292,7 +292,13 @@ describe("the CLI authentication journey", () => {
       );
       expect(createProject.exitCode, createProject.stderr).toBe(0);
       const createdProject = JSON.parse(createProject.stdout) as {
-        project: { id: string; ref: string; name: string; issue_prefix: string };
+        project: {
+          id: string;
+          ref: string;
+          name: string;
+          issue_prefix: string;
+          default_issue_type_id: string;
+        };
         created: boolean;
       };
       expect(createdProject).toMatchObject({
@@ -320,19 +326,7 @@ describe("the CLI authentication journey", () => {
         project: createdProject.project.id,
       });
 
-      // The project belongs to the context, so ordinary work does not repeat an opaque UUID.
-      const chooseProject = await runCli(
-        configDirectory,
-        "context",
-        "use",
-        "--project",
-        systemTestConfig.issues.projectId,
-      );
-      expect(chooseProject.exitCode, chooseProject.stderr).toBe(0);
-      expect(chooseProject.stdout).toContain(
-        `Default project: ${systemTestConfig.issues.projectId}`,
-      );
-
+      // The active project's prefix and issue type are platform metadata, not user ceremony.
       const contextualIssueTitle = uniqueName("Created from the active project");
       const contextualIssue = await runCli(
         configDirectory,
@@ -341,16 +335,14 @@ describe("the CLI authentication journey", () => {
         uniqueName("cli-context-issue"),
         "issue",
         "create",
-        "--type",
-        systemTestConfig.issues.typeId,
-        "--prefix",
-        systemTestConfig.issues.prefix,
-        "--title",
         contextualIssueTitle,
       );
       expect(contextualIssue.exitCode, contextualIssue.stderr).toBe(0);
       expect(JSON.parse(contextualIssue.stdout)).toMatchObject({
-        issue: { project_id: systemTestConfig.issues.projectId },
+        issue: {
+          project_id: createdProject.project.id,
+          key: expect.stringMatching(new RegExp(`^${createdProject.project.issue_prefix}-\\d+$`)),
+        },
         authorization: { status: "pending" },
       });
 
@@ -358,7 +350,7 @@ describe("the CLI authentication journey", () => {
       expect(contextAfterProject.exitCode, contextAfterProject.stderr).toBe(0);
       expect(JSON.parse(contextAfterProject.stdout)).toMatchObject({
         profile: "default",
-        project: systemTestConfig.issues.projectId,
+        project: createdProject.project.id,
       });
 
       // Migration uses that same browser-approved context: the file contains source records,
@@ -371,8 +363,8 @@ describe("the CLI authentication journey", () => {
           records: [
             {
               source_id: uniqueName("github-acme-platform-41"),
-              type_id: systemTestConfig.issues.typeId,
-              prefix: systemTestConfig.issues.prefix,
+              type_id: createdProject.project.default_issue_type_id,
+              prefix: createdProject.project.issue_prefix,
               title: uniqueName("Imported through the browser session"),
             },
           ],

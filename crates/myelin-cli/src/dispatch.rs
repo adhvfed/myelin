@@ -709,6 +709,16 @@ mod tests {
             serde_json::from_slice(&contextual.payload.unwrap()).unwrap();
         assert_eq!(contextual_body["project_id"], project);
 
+        let defaulted =
+            issues_dispatch_with_project(&["create", "Uses project defaults"], Some(project))
+                .unwrap();
+        let defaulted_body: serde_json::Value =
+            serde_json::from_slice(&defaulted.payload.unwrap()).unwrap();
+        assert_eq!(
+            defaulted_body,
+            json!({"project_id": project, "title": "Uses project defaults"})
+        );
+
         let explicit_project = "44444444-4444-4444-4444-444444444444";
         let explicit = issues_dispatch_with_project(
             &[

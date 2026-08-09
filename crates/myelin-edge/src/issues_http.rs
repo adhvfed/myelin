@@ -5,6 +5,7 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::{Method, StoreBackedIssueAuthorizer};
+use myelin_identity_service::{PgProjectStore, Project, ProjectError};
 use myelin_issues::{
     api::IssueListState, is_canonical_request_event_id, CreateIssue, IssueAuthorizationStatus,
     IssueAuthorizer, IssuePageRequest, IssuePermission, IssueStoreError, PgIssueStore, StoredIssue,
@@ -24,33 +25,60 @@ type ProductionIssueStore = PgIssueStore<StoreBackedIssueAuthorizer>;
 #[derive(Clone)]
 struct DurableIssueHttpApi {
     store: Arc<ProductionIssueStore>,
+    projects: PgProjectStore,
+    authorizer: StoreBackedIssueAuthorizer,
     runtime: Handle,
 }
 
 impl DurableIssueHttpApi {
-    fn new(store: Arc<ProductionIssueStore>, runtime: Handle) -> Self {
-        Self { store, runtime }
+    fn new(
+        store: Arc<ProductionIssueStore>,
+        projects: PgProjectStore,
+        authorizer: StoreBackedIssueAuthorizer,
+        runtime: Handle,
+    ) -> Self {
+        Self {
+            store,
+            projects,
+            authorizer,
+            runtime,
+        }
     }
 
     fn drive<F, T>(&self, future: F) -> Result<T, IssueStoreError>
     where
         F: Future<Output = Result<T, IssueStoreError>>,
     {
-        drive_on_runtime(&self.runtime, future)
+        drive_on_runtime(
+            &self.runtime,
+            future,
+            IssueStoreError::AuthorizationUnavailable(
+                "Issues HTTP requires the Edge multi-thread runtime".into(),
+            ),
+        )
+    }
+
+    fn drive_project<F, T>(&self, future: F) -> Result<T, ProjectError>
+    where
+        F: Future<Output = Result<T, ProjectError>>,
+    {
+        drive_on_runtime(
+            &self.runtime,
+            future,
+            ProjectError::Storage("Issues HTTP requires the Edge multi-thread runtime".into()),
+        )
     }
 }
 
-fn drive_on_runtime<F, T>(runtime: &Handle, future: F) -> Result<T, IssueStoreError>
+fn drive_on_runtime<F, T, E>(runtime: &Handle, future: F, runtime_error: E) -> Result<T, E>
 where
-    F: Future<Output = Result<T, IssueStoreError>>,
+    F: Future<Output = Result<T, E>>,
 {
     match Handle::try_current() {
         Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| runtime.block_on(future))
         }
-        Ok(_) => Err(IssueStoreError::AuthorizationUnavailable(
-            "Issues HTTP requires the Edge multi-thread runtime".into(),
-        )),
+        Ok(_) => Err(runtime_error),
         Err(_) => runtime.block_on(future),
     }
 }
@@ -59,16 +87,18 @@ where
 #[serde(deny_unknown_fields)]
 struct CreateIssueBody {
     project_id: String,
-    type_id: String,
-    prefix: String,
+    #[serde(default)]
+    type_id: Option<String>,
+    #[serde(default)]
+    prefix: Option<String>,
     title: String,
 }
 
-fn parse_create_body(ctx: &HandlerCtx<'_>) -> Result<CreateIssue, EdgeError> {
+fn parse_create_body(ctx: &HandlerCtx<'_>) -> Result<CreateIssueBody, EdgeError> {
     parse_create_bytes(&ctx.request.body)
 }
 
-fn parse_create_bytes(bytes: &[u8]) -> Result<CreateIssue, EdgeError> {
+fn parse_create_bytes(bytes: &[u8]) -> Result<CreateIssueBody, EdgeError> {
     if bytes.len() > MAX_ISSUE_JSON_BYTES {
         return Err(EdgeError::PayloadTooLarge(format!(
             "Issues request body exceeds {MAX_ISSUE_JSON_BYTES} bytes"
@@ -79,13 +109,74 @@ fn parse_create_bytes(bytes: &[u8]) -> Result<CreateIssue, EdgeError> {
             "empty request body (expected JSON)".into(),
         ));
     }
-    let body: CreateIssueBody = serde_json::from_slice(bytes)
-        .map_err(|error| EdgeError::BadRequest(format!("invalid issue create body: {error}")))?;
+    serde_json::from_slice(bytes)
+        .map_err(|error| EdgeError::BadRequest(format!("invalid issue create body: {error}")))
+}
+
+fn resolve_create(
+    api: &DurableIssueHttpApi,
+    principal: &myelin_identity::Principal,
+    request: CreateIssueBody,
+) -> Result<CreateIssue, EdgeError> {
+    if !is_canonical_uuid(&request.project_id) {
+        return Err(EdgeError::BadRequest(
+            "project_id must be a canonical UUID".into(),
+        ));
+    }
+    if !api.authorizer.may_create(principal, &request.project_id) {
+        return Err(EdgeError::NotFound("issue not found".into()));
+    }
+
+    let metadata = match api.drive_project(api.projects.get(principal, &request.project_id)) {
+        Ok(project) => Some(project),
+        Err(ProjectError::NotFound) => None,
+        Err(ProjectError::BadInput(reason)) => return Err(EdgeError::BadRequest(reason)),
+        Err(ProjectError::Conflict(_) | ProjectError::Storage(_)) => {
+            return Err(EdgeError::Internal("project metadata lookup failed".into()))
+        }
+    };
+
+    finish_create_request(request, metadata)
+}
+
+fn finish_create_request(
+    request: CreateIssueBody,
+    metadata: Option<Project>,
+) -> Result<CreateIssue, EdgeError> {
+    let (type_id, prefix) = match metadata {
+        Some(project) => {
+            if request
+                .prefix
+                .as_deref()
+                .is_some_and(|prefix| prefix != project.issue_prefix)
+            {
+                return Err(EdgeError::BadRequest(
+                    "prefix does not match the project's issue prefix".into(),
+                ));
+            }
+            (
+                request.type_id.unwrap_or(project.default_issue_type_id),
+                project.issue_prefix,
+            )
+        }
+        None => (
+            request.type_id.ok_or_else(|| {
+                EdgeError::BadRequest(
+                    "type_id is required for a project without durable metadata".into(),
+                )
+            })?,
+            request.prefix.ok_or_else(|| {
+                EdgeError::BadRequest(
+                    "prefix is required for a project without durable metadata".into(),
+                )
+            })?,
+        ),
+    };
     Ok(CreateIssue {
-        project_id: body.project_id,
-        type_id: body.type_id,
-        prefix: body.prefix,
-        title: body.title,
+        project_id: request.project_id,
+        type_id,
+        prefix,
+        title: request.title,
     })
 }
 
@@ -257,7 +348,7 @@ struct IssueCreateHandler {
 
 impl Handler for IssueCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let proposal = parse_create_body(ctx)?;
+        let proposal = resolve_create(&self.api, ctx.principal, parse_create_body(ctx)?)?;
         let receipt = self
             .api
             .drive(self.api.store.create(ctx.principal, proposal))
@@ -405,9 +496,10 @@ pub fn register_issues(
     builder: GatewayBuilder,
     store: Arc<PgIssueStore<StoreBackedIssueAuthorizer>>,
     authorizer: StoreBackedIssueAuthorizer,
+    projects: PgProjectStore,
     runtime: Handle,
 ) -> GatewayBuilder {
-    let api = DurableIssueHttpApi::new(store, runtime);
+    let api = DurableIssueHttpApi::new(store, projects, authorizer.clone(), runtime);
     let builder = builder
         .route(
             Method::Get,
@@ -533,6 +625,10 @@ mod tests {
             "title":"bounded"
         }"#;
         assert!(parse_create_bytes(valid).is_ok());
+        assert!(parse_create_bytes(
+            br#"{"project_id":"11111111-1111-1111-1111-111111111111","title":"uses project defaults"}"#
+        )
+        .is_ok());
         assert!(matches!(
             parse_create_bytes(&vec![b'x'; MAX_ISSUE_JSON_BYTES + 1]),
             Err(EdgeError::PayloadTooLarge(_))
@@ -546,6 +642,59 @@ mod tests {
             br#"{"project_id":"11111111-1111-1111-1111-111111111111","project_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","type_id":"22222222-2222-2222-2222-222222222222","prefix":"ENG","title":"x"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn durable_project_metadata_removes_issue_creation_ceremony_without_losing_overrides() {
+        let project = Project {
+            id: "11111111-1111-1111-1111-111111111111".into(),
+            name: "Developer experience".into(),
+            issue_prefix: "DX".into(),
+            default_issue_type_id: "22222222-2222-2222-2222-222222222222".into(),
+            created_by: "human:founder".into(),
+            created_at: "2026-08-09T18:00:00.000000Z".into(),
+        };
+        let request = parse_create_bytes(
+            br#"{"project_id":"11111111-1111-1111-1111-111111111111","title":"Keep the CLI calm"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            finish_create_request(request, Some(project.clone())).unwrap(),
+            CreateIssue {
+                project_id: project.id.clone(),
+                type_id: project.default_issue_type_id.clone(),
+                prefix: project.issue_prefix.clone(),
+                title: "Keep the CLI calm".into(),
+            }
+        );
+
+        let explicit_type = parse_create_bytes(
+            br#"{"project_id":"11111111-1111-1111-1111-111111111111","type_id":"33333333-3333-3333-3333-333333333333","title":"A specialized issue"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            finish_create_request(explicit_type, Some(project.clone()))
+                .unwrap()
+                .type_id,
+            "33333333-3333-3333-3333-333333333333"
+        );
+
+        let wrong_prefix = parse_create_bytes(
+            br#"{"project_id":"11111111-1111-1111-1111-111111111111","prefix":"NOPE","title":"Wrong namespace"}"#,
+        )
+        .unwrap();
+        assert!(finish_create_request(wrong_prefix, Some(project)).is_err());
+
+        let legacy = parse_create_bytes(
+            br#"{"project_id":"11111111-1111-1111-1111-111111111111","type_id":"22222222-2222-2222-2222-222222222222","prefix":"OLD","title":"Legacy bootstrap"}"#,
+        )
+        .unwrap();
+        assert!(finish_create_request(legacy, None).is_ok());
+        let incomplete_legacy = parse_create_bytes(
+            br#"{"project_id":"11111111-1111-1111-1111-111111111111","title":"Missing metadata"}"#,
+        )
+        .unwrap();
+        assert!(finish_create_request(incomplete_legacy, None).is_err());
     }
 
     #[test]
@@ -564,10 +713,14 @@ mod tests {
         let polled = Arc::new(AtomicBool::new(false));
         let polled_by_future = polled.clone();
         let result = current.block_on(async {
-            drive_on_runtime(target.handle(), async move {
-                polled_by_future.store(true, Ordering::SeqCst);
-                Ok::<_, IssueStoreError>(())
-            })
+            drive_on_runtime(
+                target.handle(),
+                async move {
+                    polled_by_future.store(true, Ordering::SeqCst);
+                    Ok::<_, IssueStoreError>(())
+                },
+                IssueStoreError::AuthorizationUnavailable("wrong runtime".into()),
+            )
         });
 
         assert!(matches!(

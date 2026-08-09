@@ -81,8 +81,10 @@ myelin auth configure-git
 
 myelin repo list
 myelin repo pr list
-myelin issue create --type 22222222-2222-2222-2222-222222222222 \
-  --prefix ENG --title "Make onboarding uneventful" --idempotency-key onboarding-issue
+myelin project create "Developer experience" --prefix DX --idempotency-key developer-experience
+myelin project show
+myelin project list
+myelin issue create "Make onboarding uneventful" --idempotency-key onboarding-issue
 myelin issue list
 myelin issue import --from jira --job 33333333-3333-3333-3333-333333333333 \
   --input jira-issues.json --dry-run
@@ -107,7 +109,9 @@ reference in `~/.config/myelin/config.toml`. The credential itself stays in the 
 credential store. `--profile` and `MYELIN_PROFILE` select a profile for one command; `context use`
 changes the default without copying a token. `context use --project` records a project on the
 active profile; `--project`, `MYELIN_PROJECT`, and that saved value override one another in that
-order. Git helpers are scoped to an exact Edge and profile.
+order. Creating a project with a saved profile makes it active for that profile; its owned issue
+prefix and default issue type then keep ordinary issue creation free of UUID and prefix ceremony.
+Git helpers are scoped to an exact Edge and profile.
 
 Issue responses include a canonical `myelin://...` reference that can be passed directly to
 `chat ref`. The conversation keeps a live pointer to the issue rather than copying a stale

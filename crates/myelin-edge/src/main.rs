@@ -1094,6 +1094,7 @@ async fn serve(
         builder,
         issue_store.clone(),
         issue_authorizer,
+        myelin_identity_service::PgProjectStore::new(provider.clone()),
         handle.clone(),
     );
     builder = register_projects(

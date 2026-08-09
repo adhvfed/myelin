@@ -188,8 +188,8 @@ pub enum CliCommand {
     },
     Create {
         project_id: String,
-        type_id: String,
-        prefix: String,
+        type_id: Option<String>,
+        prefix: Option<String>,
         title: String,
     },
     Import {
@@ -431,6 +431,16 @@ fn parse_create(args: &[&str]) -> Result<CliCommand, CliParseError> {
             "--type" => (&mut type_id, "--type"),
             "--prefix" => (&mut prefix, "--prefix"),
             "--title" => (&mut title, "--title"),
+            token if !token.starts_with('-') && title.is_none() => {
+                title = Some(token.to_string());
+                index += 1;
+                continue;
+            }
+            token if !token.starts_with('-') => {
+                return Err(CliParseError::InvalidCombination(
+                    "issue create accepts exactly one title",
+                ));
+            }
             other => {
                 return Err(CliParseError::Unknown {
                     token: other.to_string(),
@@ -445,21 +455,23 @@ fn parse_create(args: &[&str]) -> Result<CliCommand, CliParseError> {
     }
 
     let project_id = required(project_id, "--project")?;
-    let type_id = required(type_id, "--type")?;
-    let prefix = required(prefix, "--prefix")?;
-    let title = required(title, "--title")?;
+    let title = required(title, "issue title")?;
     require_uuid("project UUID", &project_id)?;
-    require_uuid("type UUID", &type_id)?;
-    if prefix.len() < 2
-        || prefix.len() > 10
-        || !prefix
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-    {
-        return Err(CliParseError::BadValue {
-            field: "prefix (expected 2..=10 uppercase ASCII letters/digits)",
-            value: prefix,
-        });
+    if let Some(type_id) = type_id.as_deref() {
+        require_uuid("type UUID", type_id)?;
+    }
+    if let Some(prefix) = prefix.as_deref() {
+        if prefix.len() < 2
+            || prefix.len() > 10
+            || !prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        {
+            return Err(CliParseError::BadValue {
+                field: "prefix (expected 2..=10 uppercase ASCII letters/digits)",
+                value: prefix.to_string(),
+            });
+        }
     }
     if title.is_empty() || title.len() > MAX_TITLE_BYTES {
         return Err(CliParseError::BadTitle);
@@ -575,9 +587,18 @@ mod tests {
             .unwrap(),
             CliCommand::Create {
                 project_id: PROJECT.into(),
-                type_id: TYPE.into(),
-                prefix: "ENG2".into(),
+                type_id: Some(TYPE.into()),
+                prefix: Some("ENG2".into()),
                 title: "Founder issue".into()
+            }
+        );
+        assert_eq!(
+            parse_cli(&["create", "A concise issue", "--project", PROJECT]).unwrap(),
+            CliCommand::Create {
+                project_id: PROJECT.into(),
+                type_id: None,
+                prefix: None,
+                title: "A concise issue".into(),
             }
         );
         assert_eq!(

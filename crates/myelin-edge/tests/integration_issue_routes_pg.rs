@@ -17,7 +17,8 @@ use myelin_identity::{
 };
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
-    PasetoCapabilityVerifier, PrincipalStore, RevocationStore, StoreBackedCheck, TupleStore,
+    PasetoCapabilityVerifier, PgProjectStore, PrincipalStore, RevocationStore, StoreBackedCheck,
+    TupleStore,
 };
 use myelin_issues::events::ISSUE_CLOSED;
 use myelin_issues::{
@@ -346,6 +347,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
         .default_token_scheme(SCHEME),
         issue_store.clone(),
         issue_authorizer,
+        PgProjectStore::new(provider.clone()),
         tokio::runtime::Handle::current(),
     );
     let gateway = Arc::new(builder.build());

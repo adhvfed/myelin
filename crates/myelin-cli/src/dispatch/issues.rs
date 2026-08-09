@@ -108,15 +108,19 @@ fn command_to_call(
             type_id,
             prefix,
             title,
-        } => EdgeCall::post_json(
-            "/v1/issues",
-            json!({
+        } => {
+            let mut payload = json!({
                 "project_id": project_id,
-                "type_id": type_id,
-                "prefix": prefix,
                 "title": title,
-            }),
-        ),
+            });
+            if let Some(type_id) = type_id {
+                payload["type_id"] = json!(type_id);
+            }
+            if let Some(prefix) = prefix {
+                payload["prefix"] = json!(prefix);
+            }
+            EdgeCall::post_json("/v1/issues", payload)
+        }
         CliCommand::Import {
             source,
             job_id,
