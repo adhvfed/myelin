@@ -299,14 +299,22 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
     let h = Harness::new("deny-all-routes");
     h.seed_repo_with_pr("subj-creator", "alpha");
 
+    let assert_denied_read_is_hidden_as = |path: &str, hidden_as: &str| {
+        let (st, v) = h.call("subj-mallory", "GET", path, b"");
+        assert_eq!(
+            st, 404,
+            "un-granted READ {path} must be the 0-leak 404: {v}"
+        );
+        assert_eq!(
+            v["error"]["message"], hidden_as,
+            "the deny body must be indistinguishable from an absent resource ({path}): {v}"
+        );
+    };
     for path in [
         "/v1/git/repos/alpha",
         "/v1/git/repos/alpha/commits/main",
         "/v1/git/repos/alpha/commit/0000000000000000000000000000000000000000",
         "/v1/git/repos/alpha/blob/main/README.md",
-        "/v1/git/repos/alpha/prs/1",
-        "/v1/git/repos/alpha/prs/1/commits",
-        "/v1/git/repos/alpha/prs/1/checks",
         "/v1/git/repos/alpha/refs",
         "/v1/git/repos/alpha/tree/main",
         "/v1/git/repos/alpha/tree/main/crates/inner",
@@ -314,15 +322,14 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
         "/v1/git/repos/alpha/raw/main/README.md",
         "/v1/git/repos/alpha/download/main/README.md",
     ] {
-        let (st, v) = h.call("subj-mallory", "GET", path, b"");
-        assert_eq!(
-            st, 404,
-            "un-granted READ {path} must be the 0-leak 404: {v}"
-        );
-        assert_eq!(
-            v["error"]["message"], "repository not found",
-            "the deny body must be indistinguishable from an absent repo ({path}): {v}"
-        );
+        assert_denied_read_is_hidden_as(path, "repository not found");
+    }
+    for path in [
+        "/v1/git/repos/alpha/prs/1",
+        "/v1/git/repos/alpha/prs/1/commits",
+        "/v1/git/repos/alpha/prs/1/checks",
+    ] {
+        assert_denied_read_is_hidden_as(path, "pull request not found");
     }
 
     let (status, body) = h.call_query(
@@ -354,7 +361,7 @@ fn ungranted_in_tenant_principal_is_denied_on_every_object_route() {
         status, 404,
         "Pull deny must precede PR commit cursor parsing: {body}"
     );
-    assert_eq!(body["error"]["message"], "repository not found");
+    assert_eq!(body["error"]["message"], "pull request not found");
 
     for (path, body) in [
         (
