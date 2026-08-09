@@ -337,7 +337,7 @@ scripts:
     script: pnpm --dir frontend check
 
   test:system:
-    depends_on: [ci-controlplane, git-checks, notifications]
+    depends_on: [outbox-publisher, ci-controlplane, git-checks, notifications]
     environment:
       DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
       DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
