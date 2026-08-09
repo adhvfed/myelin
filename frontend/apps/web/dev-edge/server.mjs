@@ -1,7 +1,7 @@
 // THE DEV EDGE — a clearly-marked stand-in for the real `myelin-edge` binary (see dev-contract.mjs).
 //
 // It implements the SUBSET of the MR-014/015 edge HTTP contract the app shell exercises:
-//   GET  /v1/git/repos      → summary catalogue (view=summary) or legacy RepoHome list (Bearer-auth)
+//   GET/POST /v1/git/repos  → summary catalogue / durable-shape repository creation (Bearer-auth)
 //   GET  /v1/whoami         → the verified principal + scope (Bearer-auth)
 //   POST /v1/auth/refresh   → the single-refresh round-trip (returns a fresh access token, or 401)
 //   GET  /healthz           → liveness for the Playwright webServer
@@ -73,6 +73,9 @@ const PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
 const state = {
   // A fresh tenant has no repos yet — the first-run onboarding empty state.
   emptyRepos: process.env.DEV_EDGE_EMPTY_REPOS === "1",
+  // Repositories created while exercising that fresh-tenant posture. Reset with `emptyRepos` so
+  // every onboarding test starts from a genuinely empty catalogue.
+  createdRepos: new Map(),
   // Whether the login page's dev seam may render (the `dev_login_enabled` server flag). Default on so
   // the harness's dev-login seam is reachable; a test flips it off to assert the seam disappears.
   devLoginEnabled: true,
@@ -348,7 +351,10 @@ const server = createServer((req, res) => {
     req.on("end", () => {
       try {
         const body = raw ? JSON.parse(raw) : {};
-        if (typeof body.emptyRepos === "boolean") state.emptyRepos = body.emptyRepos;
+        if (typeof body.emptyRepos === "boolean") {
+          state.emptyRepos = body.emptyRepos;
+          state.createdRepos.clear();
+        }
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
         if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
@@ -827,6 +833,57 @@ const server = createServer((req, res) => {
     return send(res, 200, { items: [], page: { next_cursor: null, limit: 50 } });
   }
 
+  if (method === "POST" && path === "/v1/git/repos") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    const retryKey = req.headers["idempotency-key"];
+    if (typeof retryKey !== "string" || retryKey.length < 1 || retryKey.length > 128 || /\s/.test(retryKey)) {
+      return send(res, 400, { error: { message: "invalid repository create retry key", code: "bad_request" } });
+    }
+    let raw = "";
+    let requestBytes = 0;
+    let requestTooLarge = false;
+    req.on("data", (chunk) => {
+      requestBytes += chunk.length;
+      if (requestBytes > 16 * 1024) {
+        requestTooLarge = true;
+        raw = "";
+      } else {
+        raw += chunk;
+      }
+    });
+    req.on("end", () => {
+      let body;
+      try {
+        body = requestTooLarge ? null : JSON.parse(raw);
+      } catch {
+        body = null;
+      }
+      const slug = body?.slug;
+      const valid = typeof slug === "string" && slug.length <= 255 && slug.split("/").every(
+        (part) => part !== "" && part !== "." && part !== ".." && /^[A-Za-z0-9._-]+$/.test(part),
+      );
+      if (!valid) {
+        return send(res, 400, { error: { message: "invalid repository name", code: "bad_request" } });
+      }
+      if (state.createdRepos.has(slug) || repoHomeJson(slug)) {
+        return send(res, 409, { error: { message: "repository already exists", code: "conflict" } });
+      }
+      state.createdRepos.set(slug, {
+        state: "empty",
+        slug: `acme/${slug}`,
+        default_branch: "main",
+        clone_url: `/acme/eu-west/${encodeURIComponent(slug)}.git`,
+        counts: { branches: 0, tags: 0 },
+      });
+      return send(res, 201, {
+        applied: { action: "git.repo.create", slug },
+        created: true,
+        durable: true,
+      });
+    });
+    return;
+  }
+
   if (method === "GET" && path === "/v1/git/repos") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     if (url.searchParams.has("view")) {
@@ -835,13 +892,21 @@ const server = createServer((req, res) => {
         return send(res, 400, { error: { message: "invalid repository list request", code: "bad_request" } });
       }
       if (state.emptyRepos) {
-        return send(res, 200, { items: [], page: { next_cursor: null, limit: input.limit } });
+        const items = [...state.createdRepos.values()]
+          .slice(0, input.limit)
+          .map((repo) => ({ state: "empty", slug: repo.slug }));
+        return send(res, 200, { items, page: { next_cursor: null, limit: input.limit } });
       }
       return send(res, 200, repoSummaryEnvelope(input));
     }
     const limit = Number(url.searchParams.get("limit") ?? 50);
     // A fresh tenant (test-controlled) serves the empty envelope → the onboarding empty state.
-    if (state.emptyRepos) return send(res, 200, { items: [], page: { next_cursor: null, limit } });
+    if (state.emptyRepos) {
+      return send(res, 200, {
+        items: [...state.createdRepos.values()].slice(0, limit),
+        page: { next_cursor: null, limit },
+      });
+    }
     return send(res, 200, reposEnvelope(limit));
   }
 
@@ -1114,7 +1179,8 @@ const server = createServer((req, res) => {
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("commit"));
     }
     if ((m = path.match(/^\/v1\/git\/repos\/([^/]+)$/))) {
-      const v = repoHomeJson(seg(m[1]));
+      const requestedRepo = seg(m[1]);
+      const v = state.createdRepos.get(requestedRepo) ?? repoHomeJson(requestedRepo);
       return v ? send(res, 200, v) : send(res, 404, notFoundEnvelope("repository"));
     }
   }

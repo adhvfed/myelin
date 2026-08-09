@@ -73,7 +73,7 @@ test.describe("R3.5 first-run — login", () => {
 });
 
 test.describe("R3.5 first-run — empty tenant onboarding", () => {
-  test("a fresh tenant offers repository creation and existing-repository push instructions", async ({ page }) => {
+  test("a fresh tenant creates its repository before showing exact login, push, and CI guidance", async ({ page }) => {
     await setEdgeConfig({ emptyRepos: true, devLoginEnabled: true });
     await page.goto("/login");
     await page.waitForLoadState("networkidle");
@@ -83,13 +83,28 @@ test.describe("R3.5 first-run — empty tenant onboarding", () => {
     const empty = page.getByTestId("repos-empty");
     await expect(empty).toBeVisible();
     await expect(empty.getByRole("button", { name: "Create repository" })).toBeVisible();
-    await expect(page.getByTestId("cmd-remote")).toContainText("git remote add myelin");
-    await expect(page.getByTestId("cmd-push")).toContainText("git push -u myelin main");
-    await expect(page.getByRole("button", { name: "Copy: git remote add" })).toBeVisible();
+    await expect(empty).toContainText("exact tenant, region, and Edge URL");
+    await expect(empty).toContainText("without a pasted API key");
+    await expect(empty).toContainText(".myelin/ci.toml");
+    await expect(empty).not.toContainText("git.eu.myelin.dev");
     await expect(page.getByTestId("waiting-first-push")).toBeVisible();
     await expect(page.getByTestId("repos-refresh")).toBeVisible();
 
     await expectNoAxeViolations(page, "the empty-tenant onboarding");
+
+    await empty.getByRole("button", { name: "Create repository" }).click();
+    const create = page.getByRole("dialog", { name: "New repository" });
+    await create.getByLabel("Name or namespace/name").fill("first-repository");
+    await create.getByRole("button", { name: "Create repository" }).click();
+    await page.waitForURL("**/git/repos/first-repository");
+
+    const setup = page.getByTestId("git-setup");
+    await setup.getByText("Set up Git").click();
+    await expect(setup.getByTestId("git-setup-commands")).toContainText("myelin auth login");
+    await expect(setup.getByTestId("git-setup-commands")).toContainText("myelin auth configure-git");
+    await expect(setup.getByTestId("git-setup-commands")).toContainText("git clone");
+    await expect(setup.getByTestId("git-setup-commands")).toContainText("git push -u origin 'main'");
+    await expectNoAxeViolations(page, "the first repository setup");
   });
 });
 

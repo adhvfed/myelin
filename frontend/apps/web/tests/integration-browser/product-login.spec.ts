@@ -95,6 +95,9 @@ test("durable product data is available and mutable after browser login", async 
   const gitSetup = page.getByTestId("git-setup");
   await gitSetup.getByText("Set up Git").click();
   await expect(gitSetup).toContainText(`${principal}@${tenant}.noreply`);
+  await expect(gitSetup.getByTestId("git-setup-commands"))
+    .toContainText(`myelin --edge '${edgeUrl}' auth login`);
+  await expect(gitSetup.getByTestId("git-setup-commands")).toContainText("myelin auth configure-git");
   await expect(gitSetup.getByTestId("git-setup-commands")).toContainText("git push -u origin 'main'");
 
   await edgeRequest(request, "POST", `${repoPath}/blob/main/README.md`, 200, {

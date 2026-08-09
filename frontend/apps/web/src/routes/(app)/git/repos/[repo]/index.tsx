@@ -37,7 +37,7 @@ export default function RepoHomeScreen() {
     <section aria-labelledby="repo-heading" style={{ display: "flex", "flex-direction": "column", gap: "var(--space-4)" }}>
       <Title>{params.repo} · Code · Myelin</Title>
       <nav aria-label="Breadcrumb" style={{ "font-size": "var(--fs-caption)" }}>
-        <A href="/git/repos" style={{ color: "var(--text-muted)" }}>Repositories</A>
+        <A href="/git/repos" style={{ color: "var(--text-primary)", "text-decoration": "underline" }}>Repositories</A>
         <span aria-hidden="true" style={{ color: "var(--text-subtle)", margin: "0 var(--space-1)" }}>/</span>
         <span style={{ color: "var(--text-primary)", "font-family": "var(--font-mono)" }}>{params.repo}</span>
       </nav>
