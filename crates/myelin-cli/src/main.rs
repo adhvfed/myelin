@@ -180,7 +180,7 @@ async fn login(
             .or_else(|| getenv(config::env::SCHEME).filter(|value| !value.is_empty()))
             .unwrap_or_else(|| config::DEFAULT_SCHEME.into());
         let edge = resolve_edge(cli.edge.as_deref(), Some(&scheme), None, getenv);
-        let path = store_credential(&token, &scheme, Some(&edge.url), getenv)?;
+        let path = store_credential(&token, &scheme, Some(&edge.url), None, getenv)?;
         println!(
             "Stored the {scheme} credential at {}. Run `myelin auth status` to verify it.",
             path.display()
@@ -217,11 +217,12 @@ async fn login(
         &authorized.credential.token,
         &authorized.credential.scheme,
         Some(&edge.url),
+        Some(authorized.expires_at_unix()),
         getenv,
     )?;
-    let expires_at = chrono::DateTime::from_timestamp(authorized.expires_at_unix, 0)
+    let expires_at = chrono::DateTime::from_timestamp(authorized.expires_at_unix(), 0)
         .map(|value| value.to_rfc3339())
-        .unwrap_or_else(|| authorized.expires_at_unix.to_string());
+        .unwrap_or_else(|| authorized.expires_at_unix().to_string());
     println!("Approved. Your CLI session is ready until {expires_at}.");
     println!("Credentials are stored owner-only at {}.", path.display());
     Ok(())
@@ -275,6 +276,9 @@ fn configure_git(
             "Git setup needs a saved credential; run `myelin auth login` first".into(),
         )
     })?;
+    if !remove {
+        credential.ensure_not_expired()?;
+    }
     let edge_url = credential.edge_url.as_deref().ok_or_else(|| {
         CliError::NotAuthenticated(
             "the saved credential predates Edge-aware login; run `myelin auth login` again".into(),
@@ -460,6 +464,7 @@ async fn run_call(
         getenv,
         read_file,
     )?;
+    credential.ensure_not_expired()?;
     let edge = resolve_edge(
         cli.edge.as_deref(),
         Some(&credential.scheme),

@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -173,6 +173,8 @@ describe("the CLI authentication journey", () => {
         scheme: "session",
         edge_url: systemTestConfig.edgeUrl,
       });
+      expect(stored.expires_at_unix).toEqual(expect.any(Number));
+      expect(Number(stored.expires_at_unix)).toBeGreaterThan(Math.floor(Date.now() / 1_000));
       expect(stored.token).not.toBe(systemTestConfig.token);
       if (process.platform !== "win32") {
         expect((await stat(credentialPath)).mode & 0o777).toBe(0o600);
@@ -227,6 +229,29 @@ describe("the CLI authentication journey", () => {
       );
       expect(stranger.exitCode, stranger.stderr).toBe(0);
       expect(stranger.stdout).toBe("");
+
+      // Once browser approval reaches its deadline, neither the CLI nor its Git helper pretends
+      // that the old session is still useful—and neither needs to send the secret to discover it.
+      await writeFile(
+        credentialPath,
+        `${JSON.stringify({ ...stored, expires_at_unix: 1 }, null, 2)}\n`,
+      );
+      const afterExpiry = await runCli(configDirectory, "auth", "status");
+      expect(afterExpiry.exitCode).toBe(3);
+      expect(afterExpiry.stderr).toContain("saved CLI session has expired");
+      expect(afterExpiry.stderr).not.toContain(String(stored.token));
+
+      const gitAfterExpiry = await runCliWith(
+        configDirectory,
+        {
+          input: `protocol=${edge.protocol.slice(0, -1)}\nhost=${edge.host}\npath=acme/eu/repo.git\n\n`,
+        },
+        ["auth", "git-credential", "get"],
+      );
+      expect(gitAfterExpiry.exitCode).toBe(3);
+      expect(gitAfterExpiry.stdout).toBe("");
+      expect(gitAfterExpiry.stderr).toContain("saved CLI session has expired");
+      expect(gitAfterExpiry.stderr).not.toContain(String(stored.token));
 
       const unconfigureGit = await runCliWith(
         configDirectory,

@@ -29,6 +29,22 @@ pub struct Credential {
     pub scheme: String,
     /** Edge that issued this credential. Older and externally supplied credentials may not know it. */
     pub edge_url: Option<String>,
+    /** Absolute Unix expiry. Long-lived and externally supplied credentials may not declare one. */
+    pub expires_at_unix: Option<i64>,
+}
+
+impl Credential {
+    pub fn ensure_not_expired(&self) -> Result<(), CliError> {
+        if self
+            .expires_at_unix
+            .is_some_and(|expires_at| expires_at <= unix_now())
+        {
+            return Err(CliError::NotAuthenticated(
+                "the saved CLI session has expired".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -39,6 +55,8 @@ struct StoredCredential {
     scheme: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     edge_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expires_at_unix: Option<i64>,
 }
 
 pub fn config_dir(getenv: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, CliError> {
@@ -101,12 +119,19 @@ pub fn resolve_credential(
             &token,
             supplied_scheme.as_deref().unwrap_or(DEFAULT_SCHEME),
             None,
+            None,
         );
     }
 
     if let Some(mut stored) = load_stored_credential(getenv, read_file)? {
         if let Some(scheme) = supplied_scheme {
-            stored.scheme = credential(&stored.token, &scheme, stored.edge_url.as_deref())?.scheme;
+            stored.scheme = credential(
+                &stored.token,
+                &scheme,
+                stored.edge_url.as_deref(),
+                stored.expires_at_unix,
+            )?
+            .scheme;
         }
         return Ok(stored);
     }
@@ -116,6 +141,7 @@ pub fn resolve_credential(
         return credential(
             &token,
             supplied_scheme.as_deref().unwrap_or(DEFAULT_SCHEME),
+            None,
             None,
         );
     }
@@ -136,21 +162,29 @@ pub fn load_stored_credential(
         return Ok(None);
     };
     let stored = parse_stored_credential(&encoded, &path)?;
-    credential(&stored.token, &stored.scheme, stored.edge_url.as_deref()).map(Some)
+    credential(
+        &stored.token,
+        &stored.scheme,
+        stored.edge_url.as_deref(),
+        stored.expires_at_unix,
+    )
+    .map(Some)
 }
 
 pub fn store_credential(
     token: &str,
     scheme: &str,
     edge_url: Option<&str>,
+    expires_at_unix: Option<i64>,
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> Result<PathBuf, CliError> {
-    let credential = credential(token, scheme, edge_url)?;
+    let credential = credential(token, scheme, edge_url, expires_at_unix)?;
     let stored = StoredCredential {
         version: CREDENTIAL_VERSION,
         token: credential.token,
         scheme: credential.scheme,
         edge_url: credential.edge_url,
+        expires_at_unix: credential.expires_at_unix,
     };
     let encoded = serde_json::to_vec(&stored)
         .map_err(|error| CliError::Config(format!("cannot encode credentials: {error}")))?;
@@ -186,7 +220,12 @@ pub fn remove_stored_credentials(
     Ok(removed)
 }
 
-fn credential(token: &str, scheme: &str, edge_url: Option<&str>) -> Result<Credential, CliError> {
+fn credential(
+    token: &str,
+    scheme: &str,
+    edge_url: Option<&str>,
+    expires_at_unix: Option<i64>,
+) -> Result<Credential, CliError> {
     let token = token.trim();
     let scheme = scheme.trim();
     if token.is_empty()
@@ -202,11 +241,26 @@ fn credential(token: &str, scheme: &str, edge_url: Option<&str>) -> Result<Crede
             "credential scheme must match [a-z][a-z0-9_]{0,31}".into(),
         ));
     }
+    if expires_at_unix.is_some_and(|expires_at| expires_at <= 0) {
+        return Err(CliError::Config(
+            "credential expiry must be a positive Unix timestamp".into(),
+        ));
+    }
     Ok(Credential {
         token: token.to_string(),
         scheme: scheme.to_string(),
         edge_url: edge_url.map(normalize_stored_edge_url).transpose()?,
+        expires_at_unix,
     })
+}
+
+fn unix_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 fn normalize_stored_edge_url(edge_url: &str) -> Result<String, CliError> {
@@ -249,7 +303,12 @@ fn parse_stored_credential(encoded: &str, path: &Path) -> Result<StoredCredentia
             stored.version
         )));
     }
-    credential(&stored.token, &stored.scheme, stored.edge_url.as_deref())?;
+    credential(
+        &stored.token,
+        &stored.scheme,
+        stored.edge_url.as_deref(),
+        stored.expires_at_unix,
+    )?;
     Ok(stored)
 }
 
@@ -378,6 +437,7 @@ mod tests {
                 token: "FLAG_TOKEN".into(),
                 scheme: "pat".into(),
                 edge_url: None,
+                expires_at_unix: None,
             }
         );
         assert_eq!(
@@ -386,6 +446,7 @@ mod tests {
                 token: "ENV_TOKEN".into(),
                 scheme: "ci".into(),
                 edge_url: None,
+                expires_at_unix: None,
             }
         );
     }
@@ -403,6 +464,7 @@ mod tests {
                 token: "HUMAN_SESSION".into(),
                 scheme: SESSION_SCHEME.into(),
                 edge_url: None,
+                expires_at_unix: None,
             }
         );
     }
@@ -412,7 +474,7 @@ mod tests {
         let env = env_from(&[("MYELIN_CONFIG_DIR", "/config")]);
         let read = |path: &Path| {
             (path == Path::new("/config/credentials.json")).then(|| {
-                r#"{"version":1,"token":"HUMAN_SESSION","scheme":"session","edge_url":"https://edge.example/"}"#.into()
+                r#"{"version":1,"token":"HUMAN_SESSION","scheme":"session","edge_url":"https://edge.example/","expires_at_unix":4102444800}"#.into()
             })
         };
         assert_eq!(
@@ -421,6 +483,7 @@ mod tests {
                 token: "HUMAN_SESSION".into(),
                 scheme: SESSION_SCHEME.into(),
                 edge_url: Some("https://edge.example".into()),
+                expires_at_unix: Some(4_102_444_800),
             }
         );
     }
@@ -436,6 +499,7 @@ mod tests {
                 token: "LEGACY_TOKEN".into(),
                 scheme: DEFAULT_SCHEME.into(),
                 edge_url: None,
+                expires_at_unix: None,
             }
         );
     }
@@ -451,6 +515,22 @@ mod tests {
     }
 
     #[test]
+    fn an_elapsed_session_is_loaded_but_never_considered_usable() {
+        let env = env_from(&[("MYELIN_CONFIG_DIR", "/config")]);
+        let read = |path: &Path| {
+            (path == Path::new("/config/credentials.json")).then(|| {
+                r#"{"version":1,"token":"ELAPSED_SESSION","scheme":"session","edge_url":"https://edge.example","expires_at_unix":1}"#.into()
+            })
+        };
+
+        let credential = resolve_credential(None, None, &env, &read).unwrap();
+        let error = credential.ensure_not_expired().unwrap_err();
+        assert_eq!(error.code(), 3);
+        assert!(error.to_string().contains("saved CLI session has expired"));
+        assert!(!error.to_string().contains("ELAPSED_SESSION"));
+    }
+
+    #[test]
     fn store_resolve_and_logout_are_owner_only_and_complete() {
         let tmp =
             std::env::temp_dir().join(format!("myelin-cli-credential-{}", std::process::id()));
@@ -460,6 +540,7 @@ mod tests {
             "ROUNDTRIP_TOKEN",
             SESSION_SCHEME,
             Some("https://edge.example/"),
+            Some(4_102_444_800),
             &env,
         )
         .unwrap();
@@ -476,6 +557,7 @@ mod tests {
                 token: "ROUNDTRIP_TOKEN".into(),
                 scheme: SESSION_SCHEME.into(),
                 edge_url: Some("https://edge.example".into()),
+                expires_at_unix: Some(4_102_444_800),
             }
         );
         std::fs::write(tmp.join("token"), "OLD_TOKEN").unwrap();

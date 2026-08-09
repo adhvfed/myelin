@@ -123,6 +123,7 @@ pub fn serve(
     if operation != Operation::Get {
         return Ok(());
     }
+    credential.ensure_not_expired()?;
     let edge_url = credential.edge_url.as_deref().ok_or_else(|| {
         CliError::NotAuthenticated(
             "the saved credential predates Edge-aware login; run `myelin auth login` again".into(),
@@ -312,6 +313,7 @@ mod tests {
             token: "SECRET_SESSION".into(),
             scheme: "session".into(),
             edge_url: edge_url.map(str::to_string),
+            expires_at_unix: None,
         }
     }
 
@@ -355,6 +357,25 @@ mod tests {
             .unwrap();
             assert!(output.is_empty());
         }
+    }
+
+    #[test]
+    fn an_expired_session_is_never_disclosed_to_git() {
+        let mut expired = credential(Some("https://edge.example"));
+        expired.expires_at_unix = Some(1);
+        let mut output = Vec::new();
+
+        let error = serve(
+            Operation::Get,
+            &expired,
+            "protocol=https\nhost=edge.example\n\n".as_bytes(),
+            &mut output,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), 3);
+        assert!(error.to_string().contains("saved CLI session has expired"));
+        assert!(output.is_empty());
     }
 
     #[test]

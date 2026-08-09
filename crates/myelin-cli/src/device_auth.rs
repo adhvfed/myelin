@@ -33,7 +33,14 @@ pub struct DeviceAuthorization {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedCredential {
     pub credential: Credential,
-    pub expires_at_unix: i64,
+}
+
+impl AuthorizedCredential {
+    pub fn expires_at_unix(&self) -> i64 {
+        self.credential
+            .expires_at_unix
+            .expect("an authorized session always carries its expiry")
+    }
 }
 
 enum Claim {
@@ -177,8 +184,8 @@ fn parse_claim(value: Value) -> Result<Claim, CliError> {
             token,
             scheme,
             edge_url: None,
+            expires_at_unix: Some(expires_at),
         },
-        expires_at_unix: expires_at,
     }))
 }
 
