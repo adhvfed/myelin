@@ -28,21 +28,28 @@ pub(super) struct ImportIdentity {
 }
 
 impl ImportIssue {
+    pub fn validate(&self) -> Result<(), IssueStoreError> {
+        self.identity()?;
+        super::validate_create(&self.issue)
+    }
+
     pub(super) fn into_parts(self) -> Result<(ImportIdentity, CreateIssue), IssueStoreError> {
+        let identity = self.identity()?;
+        Ok((identity, self.issue))
+    }
+
+    fn identity(&self) -> Result<ImportIdentity, IssueStoreError> {
         let job_id = parse_uuid("import_job_id", &self.import_job_id)?;
         if self.source_id.is_empty() || self.source_id.len() > MAX_SOURCE_ID_BYTES {
             return Err(IssueStoreError::BadInput(format!(
                 "import source_id must contain 1..={MAX_SOURCE_ID_BYTES} bytes"
             )));
         }
-        Ok((
-            ImportIdentity {
-                job_id,
-                source: self.source,
-                source_id: self.source_id,
-            },
-            self.issue,
-        ))
+        Ok(ImportIdentity {
+            job_id,
+            source: self.source,
+            source_id: self.source_id.clone(),
+        })
     }
 }
 

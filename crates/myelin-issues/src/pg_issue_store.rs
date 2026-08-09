@@ -319,6 +319,22 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         })
     }
 
+    pub fn validate_import(
+        &self,
+        principal: &Principal,
+        import: &ImportIssue,
+    ) -> Result<(), IssueStoreError> {
+        self.scope(principal)?;
+        import.validate()?;
+        if !self
+            .authorizer
+            .may_create(principal, &import.issue.project_id)
+        {
+            return Err(IssueStoreError::NotFound);
+        }
+        Ok(())
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub async fn create_then_abort_for_test(
         &self,

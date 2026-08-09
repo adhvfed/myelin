@@ -11,6 +11,8 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "edge.events.subscribe",
     "issues.list",
     "issues.create",
+    "issues.import.dry_run",
+    "issues.import.run",
     "issues.authorization_status",
     "issues.view",
     "issues.close",
@@ -132,6 +134,8 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     ),
     requirement!("issues.list", "issue.view", OP_AGENT_PAT),
     requirement!("issues.create", "issue.create", OP_AGENT_PAT),
+    requirement!("issues.import.dry_run", "issue.create", OP_AGENT_PAT),
+    requirement!("issues.import.run", "issue.create", OP_AGENT_PAT),
     requirement!("issues.authorization_status", "issue.view", OP_AGENT_PAT),
     requirement!("issues.view", "issue.view", OP_AGENT_PAT),
     requirement!("issues.close", "issue.transition", OP_AGENT_PAT),
@@ -533,6 +537,16 @@ mod tests {
         ));
         assert!(authorize_edge_action(&AllowAll, &view, "issues.view"));
         assert!(!authorize_edge_action(&AllowAll, &view, "issues.create"));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &view,
+            "issues.import.dry_run"
+        ));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &view,
+            "issues.import.run"
+        ));
         assert!(!authorize_edge_action(&AllowAll, &view, "issues.close"));
 
         let transition = identity(
@@ -560,6 +574,16 @@ mod tests {
             &["issue.create"],
         );
         assert!(authorize_edge_action(&AllowAll, &create, "issues.create"));
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &create,
+            "issues.import.dry_run"
+        ));
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &create,
+            "issues.import.run"
+        ));
         assert!(!authorize_edge_action(
             &AllowAll,
             &create,

@@ -1,4 +1,20 @@
 use super::*;
+
+#[test]
+fn source_tokens_are_total_and_case_sensitive() {
+    for (token, source) in [
+        ("jira", SourceSystem::Jira),
+        ("linear", SourceSystem::Linear),
+        ("github", SourceSystem::GitHub),
+        ("csv", SourceSystem::Csv),
+    ] {
+        assert_eq!(SourceSystem::parse(token), Some(source));
+        assert_eq!(source.token(), token);
+    }
+    for token in ["", "Jira", "canonical", "slack"] {
+        assert_eq!(SourceSystem::parse(token), None);
+    }
+}
 use crate::keys::{HiLoKeyAllocator, InMemoryPrefixCounter};
 use myelin_content::adf::AdfNode;
 use myelin_events::{

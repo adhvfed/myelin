@@ -17,6 +17,16 @@ pub enum SourceSystem {
 }
 
 impl SourceSystem {
+    pub fn parse(token: &str) -> Option<Self> {
+        match token {
+            "jira" => Some(SourceSystem::Jira),
+            "linear" => Some(SourceSystem::Linear),
+            "github" => Some(SourceSystem::GitHub),
+            "csv" => Some(SourceSystem::Csv),
+            _ => None,
+        }
+    }
+
     pub fn token(self) -> &'static str {
         match self {
             SourceSystem::Jira => "jira",

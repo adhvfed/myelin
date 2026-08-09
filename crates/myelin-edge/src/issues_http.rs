@@ -1,3 +1,5 @@
+mod import_http;
+
 use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
@@ -14,6 +16,7 @@ use std::sync::Arc;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 pub const MAX_ISSUE_JSON_BYTES: usize = 4 * 1024;
+pub use import_http::{MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS};
 const AUTHORIZATION_STATUS_RETRY_AFTER_MS: u64 = 1_000;
 
 type ProductionIssueStore = PgIssueStore<StoreBackedIssueAuthorizer>;
@@ -388,7 +391,7 @@ pub fn register_issues(
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = DurableIssueHttpApi::new(store, runtime);
-    builder
+    let builder = builder
         .route(
             Method::Get,
             "/v1/issues",
@@ -400,7 +403,8 @@ pub fn register_issues(
             "/v1/issues",
             "issues.create",
             Arc::new(IssueCreateHandler { api: api.clone() }),
-        )
+        );
+    import_http::register(builder, api.clone())
         .route(
             Method::Get,
             "/v1/issues/authorization-requests/{request_event_id}",
