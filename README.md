@@ -34,16 +34,30 @@ Install [`fed`](https://www.service-federation.com/docs/), then start the comple
 fed start
 ```
 
-Run tests that use those services with `fed test:backend`. `fed test:integration`
-drives a TypeScript product journey through the real edge and durable services without
-AI inference. Frontend checks are available as `fed test:frontend`, and
-`fed test:browser-contract` runs the faster browser suite against its contract backend.
-Fed prints the allocated web and edge URLs when the stack is ready.
+Fed prints the allocated web and edge URLs when the stack is ready. Use `fed ports list`
+to inspect the checkout's allocations at any time; ports are deliberately assigned by Fed
+rather than fixed in application documentation.
+
+The test entry points have separate responsibilities:
+
+- `fed test:system` runs the standalone TypeScript black-box suite against the real Edge and
+  durable services. It covers platform security, Git/PR/review/merge, Issues, Chat, Knowledge,
+  CI event delivery, notification inbox contracts, retries, conflicts, and bounded errors.
+- `fed test:integration` drives the assembled web application in a real browser.
+- `fed test:backend` runs Rust tests that require the Fed-managed infrastructure.
+- `fed test:frontend` runs frontend lint, type, unit, and build checks.
+- `fed test:browser-contract` runs the faster browser suite against its contract backend.
 
 Pass Cargo selectors after `--` to run a focused backend test, for example:
 
 ```sh
 fed test:backend -- -p myelin-edge --test integration_issue_routes_pg
+```
+
+Pass Vitest selectors in the same way to focus the external suite:
+
+```sh
+fed test:system -- tests/git-lifecycle.system.test.ts
 ```
 
 ## Status

@@ -23,3 +23,21 @@ fed test:system -- tests/platform.system.test.ts
 
 `pnpm --dir system-tests typecheck` is service-independent. Running `pnpm test` directly
 is intentionally unsupported because it would bypass Fed's allocated environment.
+
+## Scope
+
+The suite is intentionally organized around externally visible contracts:
+
+- `platform` verifies health, readiness, capability authentication, and bounded routing errors.
+- `git-lifecycle` follows repository creation through browsing, review by a second principal,
+  merge, and readback from the base branch.
+- `collaboration-lifecycle` exercises Chat, Knowledge, and the asynchronous Issues authorization
+  reconciler with retries and optimistic conflicts.
+- `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary and appears as
+  one queued run. Fed disables the local sandbox runner, so this suite does not claim job execution.
+- `api-contracts` checks strict inputs, resource identifiers, payload limits, notification inbox
+  scoping, and public error envelopes.
+
+Tests generate unique resources inside the checkout-specific integration tenant. They may run
+against an already-running stack or let Fed own the required services; either path uses the same
+resolved ports and readiness gates.

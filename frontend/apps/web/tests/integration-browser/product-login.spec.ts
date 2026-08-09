@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { expect, test, type APIRequestContext } from "@playwright/test";
+import { navigateToApp, signIn } from "./session";
 
 type JsonObject = Record<string, unknown>;
 
@@ -77,12 +78,7 @@ test("durable product data is available and mutable after browser login", async 
   const slug = `browser-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`;
   const repoPath = `/v1/git/repos/${encodeURIComponent(slug)}`;
 
-  await page.goto("/login");
-  await page.waitForLoadState("networkidle");
-  await expect(page.getByTestId("dev-login")).toBeVisible();
-  await page.getByTestId("dev-login").click();
-
-  await page.waitForURL("**/git/repos");
+  await signIn(page);
   await expect(page).toHaveTitle("Code · Myelin");
   await expect(page.getByRole("heading", { name: "Repositories" })).toBeVisible();
   await expect(page.getByText("Myelin Developer", { exact: true })).toBeVisible();
@@ -143,7 +139,7 @@ command = ["true"]
     head_oid: featureOid,
   });
 
-  await page.goto("/git/repos");
+  await navigateToApp(page, "/git/repos");
   await page.getByRole("button", { name: /Search or run a command/ }).click();
   await page.getByRole("combobox", { name: /Search or run a command/ }).fill(slug);
   await page.keyboard.press("Enter");
@@ -156,7 +152,7 @@ command = ["true"]
   await expect(page).toHaveURL(/\/blob\/refs%2Fheads%2Fmain\/README\.md#L1$/);
   await expect(page.locator("#L1")).toContainText(`# ${slug}`);
 
-  await page.goto("/git/repos");
+  await navigateToApp(page, "/git/repos");
   await page.getByRole("link", { name: new RegExp(`${tenant}/${slug}`) }).click();
   await expect(page.getByRole("heading", { name: `${tenant}/${slug}` })).toBeVisible();
   await expect(page.getByText("Created through the running product.")).toBeVisible();
@@ -172,7 +168,7 @@ command = ["true"]
   await expect(page.getByText("refs/heads/feature")).toBeVisible();
   await expect(page.getByText("refs/heads/main")).toBeVisible();
 
-  await page.goto("/ci");
+  await navigateToApp(page, "/ci");
   const ciRow = page.getByTestId("ci-run-row").filter({ hasText: slug });
   await expect(ciRow).toContainText("Queued");
   await expect(ciRow).toContainText("push");
@@ -182,7 +178,7 @@ command = ["true"]
   await expect(page.getByText(String(pipelineOid), { exact: true })).toBeVisible();
   await expect(page.getByTestId("ci-jobs-empty")).toBeVisible();
 
-  await page.goto("/issues");
+  await navigateToApp(page, "/issues");
   const issueTitle = `Track ${slug}`;
   await page.getByRole("button", { name: "New issue" }).click();
   const issueDialog = page.getByRole("dialog", { name: "New issue" });

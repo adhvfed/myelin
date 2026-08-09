@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
+import { navigateToApp, signIn, waitForAppHydration } from "./session";
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -15,9 +16,8 @@ test("a signed-in engineer creates, edits, and resumes an encrypted durable Know
   const title = `EU service runbook ${suffix}`;
   const edited = `Confirm regional placement ${suffix}, then establish an incident lead.`;
 
-  await page.goto("/login"); await page.waitForLoadState("networkidle");
-  await page.getByTestId("dev-login").click(); await page.waitForURL("**/git/repos");
-  await page.goto("/knowledge");
+  await signIn(page);
+  await navigateToApp(page, "/knowledge");
   await page.getByRole("button", { name: "Create a page" }).click();
   await page.getByRole("textbox", { name: "Page title" }).fill(title);
   await page.getByText("Runbook", { exact: true }).click();
@@ -29,6 +29,7 @@ test("a signed-in engineer creates, edits, and resumes an encrypted durable Know
   await response.fill(edited);
   await expect(page.locator(".knowledge-save-state")).toHaveText("Saved", { timeout: 10_000 });
   await page.reload();
+  await waitForAppHydration(page);
   await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue(title);
   await expect(page.getByRole("textbox", { name: "Numbered list block 4" })).toContainText(edited);
 

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { expect, test } from "@playwright/test";
+import { navigateToApp, signIn, waitForAppHydration } from "./session";
 
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
@@ -19,11 +20,8 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   const topic = `release-${suffix}`;
   const message = `Gate ${suffix} is green; continue the EU rollout.`;
 
-  await page.goto("/login");
-  await page.waitForLoadState("networkidle");
-  await page.getByTestId("dev-login").click();
-  await page.waitForURL("**/git/repos");
-  await page.goto("/chat");
+  await signIn(page);
+  await navigateToApp(page, "/chat");
 
   await page.getByRole("button", { name: "Create a topic" }).click();
   await page.getByRole("textbox", { name: "Channel", exact: true }).fill(channel);
@@ -36,6 +34,7 @@ test("a signed-in engineer creates and resumes an encrypted durable Chat topic",
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText(message)).toBeVisible();
   await page.reload();
+  await waitForAppHydration(page);
   await expect(page.getByText(message)).toBeVisible();
 
   const conversations = await request.get(`${edgeUrl}/v1/chat/conversations?limit=100`, {
