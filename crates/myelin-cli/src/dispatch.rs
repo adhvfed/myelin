@@ -8,11 +8,13 @@ mod chat;
 mod issues;
 mod knowledge;
 mod projects;
+mod tools;
 
 pub use chat::chat_dispatch;
 pub use issues::{issues_dispatch, issues_dispatch_with_context, issues_dispatch_with_project};
 pub use knowledge::knowledge_dispatch;
 pub use projects::{is_canonical_project_id, project_dispatch};
+pub use tools::{is_canonical_tool_cursor, tool_dispatch};
 
 const FORM_QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')

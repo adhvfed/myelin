@@ -275,6 +275,69 @@ describe("the CLI authentication journey", () => {
       expect(status.stdout).toContain(systemTestConfig.principal);
       expect(status.stdout).toContain(`tenant=${systemTestConfig.tenant}`);
 
+      // The same browser session explains the platform's shared vocabulary to people and agents.
+      // No GitHub token, Slack token, or separate agent credential is another prerequisite.
+      const toolList = await runCli(configDirectory, "--json", "tool", "list", "--limit", "2");
+      expect(toolList.exitCode, toolList.stderr).toBe(0);
+      const catalogue = JSON.parse(toolList.stdout) as {
+        items: Array<{
+          name: string;
+          ref: string;
+          version: number;
+          input_schema: { type?: string };
+          required_capabilities: string[];
+        }>;
+        page: { next_cursor: string | null; limit: number };
+      };
+      expect(catalogue.items).toHaveLength(2);
+      expect(catalogue.page).toMatchObject({ limit: 2 });
+      expect(catalogue.page.next_cursor).toMatch(/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*\.v\d+$/);
+      for (const tool of catalogue.items) {
+        expect(tool.name).toMatch(/^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$/);
+        expect(tool.ref).toBe(
+          `myelin://${systemTestConfig.tenant}/agent/tool/${tool.name}/v${tool.version}`,
+        );
+        expect(tool.input_schema.type).toBe("object");
+        expect(tool.required_capabilities.length).toBeGreaterThan(0);
+      }
+
+      const showTool = await runCli(
+        configDirectory,
+        "--json",
+        "tool",
+        "show",
+        catalogue.items[0]!.name,
+      );
+      expect(showTool.exitCode, showTool.stderr).toBe(0);
+      expect(JSON.parse(showTool.stdout)).toMatchObject({ tool: catalogue.items[0] });
+
+      const nextTools = await runCli(
+        configDirectory,
+        "tool",
+        "list",
+        "--limit",
+        "2",
+        "--cursor",
+        catalogue.page.next_cursor!,
+      );
+      expect(nextTools.exitCode, nextTools.stderr).toBe(0);
+      expect(nextTools.stdout).toContain("myelin://");
+
+      const mcpDescription = await runCli(configDirectory, "tool", "describe", "--mcp");
+      expect(mcpDescription.exitCode, mcpDescription.stderr).toBe(0);
+      const mcpManifest = JSON.parse(mcpDescription.stdout) as {
+        tools: Array<{
+          name: string;
+          inputSchema: { type?: string };
+          annotations: { requiresApproval?: boolean; readOnlyHint?: boolean };
+        }>;
+      };
+      expect(mcpManifest.tools.map((tool) => tool.name)).toEqual(
+        expect.arrayContaining(["git.open_pr", "git.merge", "ci.read_run", "ci.read_log"]),
+      );
+      expect(mcpManifest.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
+      expect(mcpDescription.stdout).not.toContain(systemTestConfig.token);
+
       // A founder names the first project once. Its generated identity becomes context,
       // so show and subsequent work no longer carry an operator-provided UUID.
       const cliProjectName = uniqueName("Developer experience");

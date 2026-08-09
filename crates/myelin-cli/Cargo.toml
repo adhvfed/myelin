@@ -16,6 +16,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 
 myelin-git = { path = "../myelin-git" }
+myelin-agent = { path = "../myelin-agent" }
 myelin-issues = { path = "../myelin-issues" }
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 myelin-notif = { path = "../myelin-notif" }

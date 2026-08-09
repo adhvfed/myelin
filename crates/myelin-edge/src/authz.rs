@@ -9,6 +9,8 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "edge.whoami",
     "edge.auth.device.approve",
     "edge.events.subscribe",
+    "agent.tools.list",
+    "agent.tool.view",
     "identity.projects.list",
     "identity.project.create",
     "identity.project.view",
@@ -135,6 +137,8 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         "edge.events.subscribe",
         OP_AGENT_PAT
     ),
+    requirement!("agent.tools.list", "agent.tools.read", OP_AGENT_PAT),
+    requirement!("agent.tool.view", "agent.tools.read", OP_AGENT_PAT),
     requirement!("identity.projects.list", "project.view", OP_AGENT_PAT),
     requirement!("identity.project.create", "project.create", OP_PAT),
     requirement!("identity.project.view", "project.view", OP_AGENT_PAT),

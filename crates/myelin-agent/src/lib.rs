@@ -217,6 +217,12 @@ impl ToolDef {
     }
 }
 
+pub fn is_canonical_tool_name(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(subsystem, name)| {
+        !name.contains('.') && is_catalogue_token(subsystem) && is_catalogue_token(name)
+    })
+}
+
 fn is_catalogue_token(value: &str) -> bool {
     value.len() <= 64
         && value.as_bytes().split_first().is_some_and(|(first, rest)| {
@@ -349,6 +355,9 @@ mod tests {
     fn tool_def_owns_its_canonical_name_validation_and_mcp_projection() {
         let tool = valid_tool();
         assert_eq!(tool.canonical_name(), "git.open_pr");
+        assert!(is_canonical_tool_name(&tool.canonical_name()));
+        assert!(!is_canonical_tool_name("git..open_pr"));
+        assert!(!is_canonical_tool_name("Git.open_pr"));
         assert_eq!(tool.mcp_projection().unwrap()["name"], "git.open_pr");
         assert_eq!(
             tool.mcp_projection().unwrap()["inputSchema"],

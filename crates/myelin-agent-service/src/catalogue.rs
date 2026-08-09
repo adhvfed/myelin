@@ -85,24 +85,34 @@ impl PlatformToolCatalogue {
             .find(|definition| definition.canonical_name() == canonical_name)
     }
 
+    pub fn latest_definitions(&self) -> Vec<&ToolDef> {
+        let mut seen = BTreeSet::new();
+        let mut latest = self
+            .definitions
+            .iter()
+            .rev()
+            .filter(|definition| seen.insert(definition.canonical_name()))
+            .collect::<Vec<_>>();
+        latest.reverse();
+        latest
+    }
+
     pub fn mcp_manifest(&self) -> Value {
+        self.mcp_manifest_for(|_| true)
+    }
+
+    pub fn mcp_manifest_for(&self, permitted: impl Fn(&ToolDef) -> bool) -> Value {
         json!({
             "tools": self
-                .definitions
-                .iter()
-                .rev()
-                .scan(BTreeSet::new(), |seen, definition| {
-                    seen.insert(definition.canonical_name()).then_some(definition)
-                })
+                .latest_definitions()
+                .into_iter()
                 .filter(|definition| definition.exposed_over_mcp)
+                .filter(|definition| permitted(definition))
                 .map(|definition| {
                     definition
                         .mcp_projection()
                         .expect("the platform catalogue stores only validated ToolDefs")
                 })
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
                 .collect::<Vec<_>>()
         })
     }
@@ -170,6 +180,7 @@ mod tests {
     #[test]
     fn the_mcp_projection_publishes_only_the_latest_exposed_version_of_a_tool() {
         let version_one = myelin_git::api::agent_tool_defs().remove(0);
+        let canonical_name = version_one.canonical_name();
         let mut version_two = version_one.clone();
         version_two.version = 2;
         let catalogue =
@@ -181,6 +192,10 @@ mod tests {
             .clone();
         assert_eq!(tools.len(), 1);
         assert!(tools[0]["description"].as_str().unwrap().contains(" v2;"));
+        assert_eq!(
+            catalogue.latest_definitions(),
+            vec![catalogue.resolve(&canonical_name).unwrap()]
+        );
 
         let version_one = myelin_git::api::agent_tool_defs().remove(0);
         let mut hidden_version_two = version_one.clone();
@@ -189,6 +204,13 @@ mod tests {
         let catalogue =
             PlatformToolCatalogue::try_from_definitions([version_one, hidden_version_two]).unwrap();
         assert!(catalogue.mcp_manifest()["tools"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(catalogue.mcp_manifest_for(|definition| definition
+            .required_caps
+            .iter()
+            .any(|cap| cap == "never"))["tools"]
             .as_array()
             .unwrap()
             .is_empty());

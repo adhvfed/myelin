@@ -12,7 +12,7 @@ use myelin_cli::device_auth::{
 use myelin_cli::dispatch::{
     chat_dispatch, ci_dispatch, git_dispatch, is_canonical_project_id,
     issues_dispatch_with_context, knowledge_dispatch, notif_dispatch, project_dispatch,
-    repo_dispatch, EdgeCall, HttpMethod, RetryPolicy,
+    repo_dispatch, tool_dispatch, EdgeCall, HttpMethod, RetryPolicy,
 };
 use myelin_cli::error::CliError;
 use myelin_cli::git_credential::{
@@ -104,6 +104,11 @@ enum Command {
     /// Read and complete personal notifications.
     #[command(name = "inbox", visible_alias = "notif")]
     Notif {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Discover the typed operations shared by people and agents.
+    Tool {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -238,6 +243,10 @@ async fn run() -> Result<(), CliError> {
         }
         Command::Notif { args } => {
             let (call, command_key) = dispatch_command(args, notif_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
+        }
+        Command::Tool { args } => {
+            let (call, command_key) = dispatch_command(args, tool_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
     }

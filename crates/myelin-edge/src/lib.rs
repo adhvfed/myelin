@@ -26,6 +26,7 @@ pub mod secret_admin_cmd;
 pub mod server;
 pub mod session;
 pub mod sse;
+pub mod tool_http;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
@@ -91,3 +92,4 @@ pub use server::{
 };
 pub use session::{SessionRecord, SessionStore, SESSION_COOKIE};
 pub use sse::{SseEvent, SseHub, SseSubscription};
+pub use tool_http::register_tools;

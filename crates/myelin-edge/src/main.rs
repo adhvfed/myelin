@@ -7,9 +7,9 @@ use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
     register_chat, register_ci, register_git_durable, register_git_wire, register_issues,
-    register_knowledge, register_notif, register_projects, serve_edge_until_shutdown_with_probe,
-    spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
-    AuthenticatedActionPolicy, BootstrapParams,
+    register_knowledge, register_notif, register_projects, register_tools,
+    serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler, AuthProvider,
+    AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
     CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, GitDatabaseProviders,
     DeviceAuthorizationBroker, IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe,
     SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
@@ -1103,6 +1103,7 @@ async fn serve(
         check.clone(),
         handle.clone(),
     );
+    builder = register_tools(builder);
     builder = register_chat(
         builder,
         provider.db_pool().clone(),

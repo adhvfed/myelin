@@ -27,6 +27,7 @@ myelin-content = { path = "../myelin-content" }
 myelin-refs = { path = "../myelin-refs" }
 myelin-knowledge = { path = "../myelin-knowledge" }
 myelin-agent = { path = "../myelin-agent" }
+myelin-agent-service = { path = "../myelin-agent-service" }
 myelin-events = { path = "../myelin-events" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
