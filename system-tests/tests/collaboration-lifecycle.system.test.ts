@@ -38,7 +38,8 @@ describe("collaboration lifecycle", () => {
       },
     );
     expect(first.body).toMatchObject({ durable: true });
-    expect(first.body.message_id).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
+    const firstMessageId = string(first.body.message_id, "first message id");
+    expect(firstMessageId).toMatch(/^[0-9A-HJKMNP-TV-Z]{26}$/);
 
     const replay = await systemClient.json(
       `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
@@ -50,7 +51,7 @@ describe("collaboration lifecycle", () => {
     );
     expect(replay.body).toEqual(first.body);
 
-    await reviewerClient.json(
+    const reviewerMessage = await reviewerClient.json(
       `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
       {
         method: "POST",
@@ -61,6 +62,38 @@ describe("collaboration lifecycle", () => {
         expectedStatus: 201,
       },
     );
+    const reviewerMessageId = string(reviewerMessage.body.message_id, "reviewer message id");
+
+    const finalMessage = await systemClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
+      {
+        method: "POST",
+        body: {
+          content: "The paged history is consistent.",
+          client_nonce: `author-final-${randomUUID()}`,
+        },
+        expectedStatus: 201,
+      },
+    );
+    const finalMessageId = string(finalMessage.body.message_id, "final message id");
+
+    const recent = await systemClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages?limit=2`,
+    );
+    const recentItems = array(recent.body.items, "recent conversation messages").map((item) =>
+      record(item, "recent conversation message"),
+    );
+    expect(recentItems.map((item) => item.id)).toEqual([reviewerMessageId, finalMessageId]);
+    const recentPage = record(recent.body.page, "recent message page");
+    expect(recentPage).toMatchObject({ limit: 2, next_cursor: reviewerMessageId });
+
+    const older = await systemClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages?limit=2&before=${encodeURIComponent(reviewerMessageId)}`,
+    );
+    expect(array(older.body.items, "older conversation messages")).toEqual([
+      expect.objectContaining({ id: firstMessageId }),
+    ]);
+    expect(older.body).toMatchObject({ page: { limit: 2, next_cursor: null } });
 
     const messages = await systemClient.json(
       `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages?limit=100`,
@@ -76,6 +109,11 @@ describe("collaboration lifecycle", () => {
         expect.objectContaining({
           content: "Confirmed from a second principal.",
           is_you: false,
+          state: "active",
+        }),
+        expect.objectContaining({
+          content: "The paged history is consistent.",
+          is_you: true,
           state: "active",
         }),
       ]),

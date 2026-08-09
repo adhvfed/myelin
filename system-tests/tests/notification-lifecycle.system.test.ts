@@ -129,6 +129,16 @@ describe.sequential("notification delivery lifecycle", () => {
     expect(collapsed.coalesce_count).toBe(2);
 
     const itemId = string(collapsed.id, "notification inbox item id");
+    const inaccessible = await reviewerClient.json(
+      `/v1/notif/inbox/${encodeURIComponent(itemId)}/read`,
+      {
+        method: "POST",
+        body: {},
+        expectedStatus: 404,
+      },
+    );
+    expect(inaccessible.body).toHaveProperty("error.code", "not_found");
+
     const read = await systemClient.json(`/v1/notif/inbox/${encodeURIComponent(itemId)}/read`, {
       method: "POST",
       body: {},
