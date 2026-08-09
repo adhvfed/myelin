@@ -196,6 +196,36 @@ describe.sequential("Git engineering lifecycle", () => {
     expect(checks.body).toHaveProperty("gate_admitted");
   });
 
+  test("limits requested-reviewer access to the assigned pull request", async () => {
+    const unrelatedCommitOid = (await project.writeFile(
+      "feature/unrelated-review",
+      "src/unrelated.ts",
+      "export const unrelated = true;\n",
+      { startRef: "main" },
+    )).commitOid;
+    const opened = await systemClient.json(`${project.path}/prs`, {
+      method: "POST",
+      body: {
+        title: "An unrelated pull request",
+        base_ref: "refs/heads/main",
+        head_ref: "refs/heads/feature/unrelated-review",
+        head_oid: unrelatedCommitOid,
+        reviewers: [],
+      },
+      expectedStatus: 201,
+    });
+    const unrelatedPr = record(
+      record(opened.body.applied, "unrelated PR receipt.applied").pr,
+      "unrelated PR receipt.applied.pr",
+    );
+    const unrelatedNumber = Number(unrelatedPr.number);
+    expect(unrelatedNumber).toBeGreaterThan(0);
+
+    const unrelatedBase = `${project.path}/prs/${unrelatedNumber}`;
+    await reviewerClient.json(unrelatedBase, { expectedStatus: 404 });
+    await reviewerClient.json(`${unrelatedBase}/diff?view=split&limit=100`, { expectedStatus: 404 });
+  });
+
   test("persists discussion threads and a batched review from another principal", async () => {
     const base = `${project.path}/prs/${pullRequestNumber}`;
     const threadReceipt = await reviewerClient.json(`${base}/threads`, {
