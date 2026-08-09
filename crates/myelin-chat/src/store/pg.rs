@@ -1,9 +1,10 @@
 use sqlx::postgres::PgPool;
 use sqlx::{Acquire, Row};
 
+use myelin_content::InlineNode;
 use myelin_events::{
     derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
-    EventId, EventType, Timestamp, Visibility,
+    EventId, EventType, IdMinter, Timestamp, Visibility,
 };
 
 use super::{
@@ -154,6 +155,50 @@ impl PgMessageStore {
         occurred: Timestamp,
         recorded: Timestamp,
     ) -> Result<MessageId, StoreError> {
+        self.append_co_commit_inner(minter, msg, event_id, None, &[], actor, occurred, recorded)
+            .await
+    }
+
+    /// Appends a message and its structured reference edges atomically. The
+    /// caller supplies the plaintext nodes only for event derivation; the
+    /// persisted `body_nodes` bytes remain the caller's encrypted envelope.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn append_structured_co_commit(
+        &self,
+        minter: &dyn super::UlidSource,
+        msg: NewMessage,
+        event_id: EventId,
+        related_event_ids: &dyn IdMinter,
+        structured_nodes: &[InlineNode],
+        actor: Actor,
+        occurred: Timestamp,
+        recorded: Timestamp,
+    ) -> Result<MessageId, StoreError> {
+        self.append_co_commit_inner(
+            minter,
+            msg,
+            event_id,
+            Some(related_event_ids),
+            structured_nodes,
+            actor,
+            occurred,
+            recorded,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn append_co_commit_inner(
+        &self,
+        minter: &dyn super::UlidSource,
+        msg: NewMessage,
+        event_id: EventId,
+        related_event_ids: Option<&dyn IdMinter>,
+        structured_nodes: &[InlineNode],
+        actor: Actor,
+        occurred: Timestamp,
+        recorded: Timestamp,
+    ) -> Result<MessageId, StoreError> {
         let mut conn = self
             .pool
             .acquire()
@@ -179,8 +224,42 @@ impl PgMessageStore {
         }
 
         let message_id = minter.mint();
-        let envelope =
-            self.message_created_envelope(&msg, &message_id, event_id, actor, occurred, recorded)?;
+        let envelope = self.message_created_envelope(
+            &msg,
+            &message_id,
+            event_id,
+            actor.clone(),
+            occurred.clone(),
+            recorded.clone(),
+        )?;
+        let edge_envelopes = if structured_nodes.is_empty() {
+            Vec::new()
+        } else {
+            let related_event_ids = related_event_ids.ok_or_else(|| {
+                StoreError::Cold(
+                    "structured Chat append requires an event-id source for reference edges".into(),
+                )
+            })?;
+            crate::content::extract_body_edges(&envelope.subject, structured_nodes)
+                .into_iter()
+                .map(|edge| {
+                    derive_envelope(
+                        crate::content::edge_event_draft(&edge),
+                        EmitContext {
+                            event_id: related_event_ids.mint().into(),
+                            tenant: envelope.tenant.clone(),
+                            region: envelope.region.clone(),
+                            actor: actor.clone(),
+                            schema_ver: envelope.schema_ver,
+                            occurred_at: occurred.clone(),
+                            recorded_at: recorded.clone(),
+                            caused_by: envelope.caused_by.clone(),
+                        },
+                        Some(&envelope),
+                    )
+                })
+                .collect()
+        };
 
         let mut dbtx = conn
             .begin()
@@ -215,6 +294,13 @@ impl PgMessageStore {
         )
         .await
         .map_err(|e| StoreError::Cold(format!("co-commit outbox insert: {e}")))?;
+        for edge in edge_envelopes {
+            myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut dbtx, &edge.aggregate.0, &edge)
+                .await
+                .map_err(|error| {
+                    StoreError::Cold(format!("co-commit Chat reference edge: {error}"))
+                })?;
+        }
 
         dbtx.commit()
             .await

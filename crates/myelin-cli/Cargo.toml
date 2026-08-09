@@ -19,6 +19,7 @@ myelin-git = { path = "../myelin-git" }
 myelin-issues = { path = "../myelin-issues" }
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 myelin-notif = { path = "../myelin-notif" }
+myelin-refs = { path = "../myelin-refs" }
 
 serde_json = { workspace = true }
 serde = { workspace = true }

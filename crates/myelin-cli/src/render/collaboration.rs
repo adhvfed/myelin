@@ -78,6 +78,7 @@ fn render_conversation(value: &Value) -> Option<String> {
 fn render_message(value: &Value) -> Option<String> {
     let id = value.get("id")?.as_str()?;
     let content = value.get("content")?.as_str()?;
+    let content = render_structured_content(content, value.get("nodes"))?;
     let state = value.get("state")?.as_str()?;
     let author = if value.get("is_you").and_then(Value::as_bool) == Some(true) {
         "you"
@@ -92,11 +93,45 @@ fn render_message(value: &Value) -> Option<String> {
     Some(format!(
         "{}  {}  [{}{}]  ({})",
         terminal_safe_single_line(author),
-        terminal_safe_single_line(content),
+        terminal_safe_single_line(&content),
         terminal_safe_single_line(state),
         edited,
         terminal_safe_single_line(id),
     ))
+}
+
+fn render_structured_content(content: &str, nodes: Option<&Value>) -> Option<String> {
+    let placeholder_count = content
+        .chars()
+        .filter(|character| *character == '\u{FFFC}')
+        .count();
+    let nodes = match nodes {
+        Some(value) => value.as_array()?,
+        None if placeholder_count == 0 => return Some(content.to_string()),
+        None => return None,
+    };
+    if placeholder_count != nodes.len() {
+        return None;
+    }
+
+    let mut rendered = String::with_capacity(content.len());
+    let mut nodes = nodes.iter();
+    for character in content.chars() {
+        if character != '\u{FFFC}' {
+            rendered.push(character);
+            continue;
+        }
+        let node = nodes.next()?;
+        match node.get("kind")?.as_str()? {
+            "mention" => {
+                rendered.push('@');
+                rendered.push_str(node.get("principal_id")?.as_str()?);
+            }
+            "artifact_ref" | "embed" => rendered.push_str(node.get("ref")?.as_str()?),
+            _ => return None,
+        }
+    }
+    Some(rendered)
 }
 
 fn render_page_summary(value: &Value) -> Option<String> {
@@ -163,6 +198,23 @@ mod tests {
                 "edited": false
             })),
             Some(format!("you  ready\\nnext  [active]  ({ID})"))
+        );
+        assert_eq!(
+            render_item(&json!({
+                "id": ID,
+                "author": "opaque-author",
+                "is_you": false,
+                "content": "Tracking \u{FFFC}",
+                "nodes": [{
+                    "kind": "artifact_ref",
+                    "ref": "myelin://acme/issue/issue/ENG-41"
+                }],
+                "state": "active",
+                "edited": false
+            })),
+            Some(format!(
+                "opaque-author  Tracking myelin://acme/issue/issue/ENG-41  [active]  ({ID})"
+            ))
         );
         assert_eq!(
             render_item(&json!({

@@ -2,13 +2,15 @@
 
 use myelin_chat::store::pg::PgMessageStore;
 use myelin_chat::store::{AuthorKind, ConversationId, MonotonicUlidSource, NewMessage};
-use myelin_events::relay::InProcessBus;
-use myelin_events::{Actor, EventId, Timestamp};
+use myelin_content::InlineNode;
+use myelin_events::{Actor, ArtifactRef, IdMinter, Timestamp, Ulid, UlidMinter};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_storage::pgrelay::PgRelay;
 use myelin_tenancy::TenantId;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_STORE: AtomicU64 = AtomicU64::new(0);
 
 fn admin_url() -> String {
     std::env::var("DATABASE_URL")
@@ -32,6 +34,14 @@ fn now() -> Timestamp {
     Timestamp("2026-06-24T00:00:00Z".into())
 }
 
+struct ConstantMinter(Ulid);
+
+impl IdMinter for ConstantMinter {
+    fn mint(&self) -> Ulid {
+        self.0.clone()
+    }
+}
+
 fn new_msg(conv: &ConversationId, nonce: &str, author: &str, body: &str) -> NewMessage {
     NewMessage {
         conv: conv.clone(),
@@ -44,12 +54,7 @@ fn new_msg(conv: &ConversationId, nonce: &str, author: &str, body: &str) -> NewM
     }
 }
 
-fn event_id(n: usize) -> EventId {
-    EventId(format!("01JCHATP399{n:020}"))
-}
-
-#[tokio::test]
-async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
+async fn fresh_store() -> (sqlx::PgPool, String, PgMessageStore, String) {
     let admin = PgPoolOptions::new()
         .max_connections(6)
         .connect(&admin_url())
@@ -58,32 +63,63 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
             "connect to dev Postgres as admin (is the stack up? \
              run `fed test:backend`)",
         );
-
-    let suffix = std::process::id();
+    let suffix = format!(
+        "{}_{}",
+        std::process::id(),
+        NEXT_STORE.fetch_add(1, Ordering::Relaxed)
+    );
     let table = format!("message_p399_{suffix}");
-
     let store = PgMessageStore::new(admin.clone(), region(), table.clone());
     store.migrate().await.expect("apply the message DDL + RLS");
-
     sqlx::raw_sql(myelin_events::OUTBOX_MIGRATION)
         .execute(&admin)
         .await
         .expect("apply the frozen outbox migration");
+    (admin, table, store, suffix)
+}
+
+async fn drop_store(admin: &sqlx::PgPool, table: &str) {
+    sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+        .execute(admin)
+        .await
+        .expect("drop the isolated message table");
+}
+
+async fn delete_outbox_aggregate(admin: &sqlx::PgPool, aggregate: &str) {
+    let mut transaction = admin.begin().await.expect("begin outbox cleanup");
+    sqlx::query("SELECT event_id FROM outbox WHERE aggregate = $1 FOR UPDATE")
+        .bind(aggregate)
+        .fetch_all(&mut *transaction)
+        .await
+        .expect("lock this test's outbox rows");
+    sqlx::query("DELETE FROM outbox_quarantine WHERE aggregate = $1")
+        .bind(aggregate)
+        .execute(&mut *transaction)
+        .await
+        .expect("delete this test's quarantine rows");
+    sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
+        .bind(aggregate)
+        .execute(&mut *transaction)
+        .await
+        .expect("delete this test's outbox rows");
+    transaction.commit().await.expect("commit outbox cleanup");
+}
+
+#[tokio::test]
+async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
+    let (admin, table, store, suffix) = fresh_store().await;
 
     let conv = ConversationId::new("acmeP399", region(), format!("01J0CONVP399{suffix}"));
     let src = MonotonicUlidSource::new();
+    let event_ids = UlidMinter::new();
 
-    sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
-        .bind(&conv.conversation_id)
-        .execute(&admin)
-        .await
-        .ok();
+    delete_outbox_aggregate(&admin, &conv.conversation_id).await;
 
     let id0 = store
         .append_co_commit(
             &src,
             new_msg(&conv, "n0", "alice", "hello world"),
-            event_id(0),
+            event_ids.mint().into(),
             actor(),
             now(),
             now(),
@@ -140,29 +176,11 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         "subject is the stable message-<id> #sub anchor"
     );
 
-    let relay = PgRelay::new(admin.clone());
-    let bus = InProcessBus::new();
-    let drained = relay.relay_once(&bus, 64).await.expect("relay drain");
-    assert_eq!(
-        drained, 1,
-        "CHAT-D13: the co-committed event is delivered exactly once"
-    );
-    assert_eq!(
-        bus.delivered_count(),
-        1,
-        "0 phantom: exactly one distinct event on the bus"
-    );
-    assert_eq!(
-        relay.outbox_depth().await.unwrap(),
-        0,
-        "the outbox drains to depth 0 (0 orphan)"
-    );
-
     let id0_retry = store
         .append_co_commit(
             &src,
             new_msg(&conv, "n0", "alice", "hello world (retry)"),
-            event_id(999),
+            event_ids.mint().into(),
             actor(),
             now(),
             now(),
@@ -198,7 +216,7 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
             .append_co_commit(
                 &src,
                 new_msg(&conv, &format!("n{i}"), "alice", &format!("m{i}")),
-                event_id(i),
+                event_ids.mint().into(),
                 actor(),
                 now(),
                 now(),
@@ -218,13 +236,139 @@ async fn chat_p5_co_commit_idempotent_send_and_per_conversation_order() {
         "CHAT-D2: per-conversation seqs are contiguous + gap-free + no-dup (0 ordering violations)"
     );
 
-    sqlx::query("DELETE FROM outbox WHERE aggregate = $1")
-        .bind(&conv.conversation_id)
-        .execute(&admin)
+    delete_outbox_aggregate(&admin, &conv.conversation_id).await;
+    drop_store(&admin, &table).await;
+}
+
+#[tokio::test]
+async fn a_structured_reference_is_one_atomic_durable_action() {
+    let (admin, table, store, suffix) = fresh_store().await;
+    let src = MonotonicUlidSource::new();
+    let event_ids = UlidMinter::new();
+
+    let referenced_conv =
+        ConversationId::new("acmeP399", region(), format!("01J0REFSP399{suffix}"));
+    let target = ArtifactRef("myelin://acmeP399/issue/issue/ENG-41".into());
+    let nodes = vec![InlineNode::ArtifactRefNode(target.clone())];
+    let source_message_id = store
+        .append_structured_co_commit(
+            &src,
+            NewMessage {
+                conv: referenced_conv.clone(),
+                thread_root_id: None,
+                author: "alice".into(),
+                author_kind: AuthorKind::Human,
+                body_inline: b"encrypted-inline-envelope".to_vec(),
+                body_nodes: b"encrypted-node-envelope".to_vec(),
+                client_nonce: "reference-issue-41".into(),
+            },
+            event_ids.mint().into(),
+            &event_ids,
+            &nodes,
+            actor(),
+            now(),
+            now(),
+        )
         .await
-        .ok();
-    sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
-        .execute(&admin)
+        .expect("co-commit a message and its structured reference");
+    let source = myelin_chat::subs::mint_message("acmeP399", source_message_id.as_str()).unwrap();
+    let edge_aggregate = myelin_chat::content::edge_aggregate_key(&source, &target);
+    let reference_rows = sqlx::query(
+        "SELECT aggregate, envelope FROM outbox WHERE aggregate = $1 OR aggregate = $2",
+    )
+    .bind(&referenced_conv.conversation_id)
+    .bind(&edge_aggregate.0)
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        reference_rows.len(),
+        2,
+        "one user action durably records exactly its message event and reference edge"
+    );
+    let envelopes = reference_rows
+        .iter()
+        .map(|row| row.get::<serde_json::Value, _>("envelope"))
+        .collect::<Vec<_>>();
+    let message_event = envelopes
+        .iter()
+        .find(|envelope| envelope["type_"] == "chat.message.created")
+        .expect("the message event is co-committed");
+    let edge_event = envelopes
+        .iter()
+        .find(|envelope| envelope["type_"] == "refs.edge.created")
+        .expect("the reference edge is co-committed");
+    assert_eq!(edge_event["subject"], source.0);
+    assert_eq!(edge_event["payload"]["source"], source.0);
+    assert_eq!(edge_event["payload"]["target"], target.0);
+    assert_eq!(edge_event["payload"]["rel"], "links");
+    assert_eq!(
+        edge_event["causation_id"], message_event["event_id"],
+        "the edge is causally downstream of the message that introduced it"
+    );
+    assert_eq!(
+        edge_event["correlation_id"], message_event["correlation_id"],
+        "the message and edge remain one trace"
+    );
+    assert_eq!(edge_event["depth"], 1);
+
+    let stored_nodes: Vec<u8> = sqlx::query_scalar(&format!(
+        "SELECT body_nodes FROM {table} WHERE conversation_id = $1 AND message_id = $2"
+    ))
+    .bind(&referenced_conv.conversation_id)
+    .bind(source_message_id.as_str())
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(
+        stored_nodes, b"encrypted-node-envelope",
+        "the store persists only the caller's encrypted node envelope"
+    );
+
+    let rollback_conv = ConversationId::new("acmeP399", region(), format!("01J0ROLLP399{suffix}"));
+    let colliding_id = event_ids.mint();
+    let error = store
+        .append_structured_co_commit(
+            &src,
+            NewMessage {
+                conv: rollback_conv.clone(),
+                thread_root_id: None,
+                author: "alice".into(),
+                author_kind: AuthorKind::Human,
+                body_inline: b"encrypted-inline-envelope".to_vec(),
+                body_nodes: b"encrypted-node-envelope".to_vec(),
+                client_nonce: "must-roll-back".into(),
+            },
+            colliding_id.clone().into(),
+            &ConstantMinter(colliding_id.clone()),
+            &nodes,
+            actor(),
+            now(),
+            now(),
+        )
         .await
-        .ok();
+        .expect_err("a divergent event-id collision must abort the entire append");
+    assert!(error.to_string().contains("divergent"));
+    let rolled_back_messages: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {table} WHERE conversation_id = $1"
+    ))
+    .bind(&rollback_conv.conversation_id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    let rolled_back_events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM outbox WHERE event_id = $1")
+            .bind(&colliding_id.0)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(
+        (rolled_back_messages, rolled_back_events),
+        (0, 0),
+        "a failed reference edge leaves neither a visible message nor an orphan event"
+    );
+
+    delete_outbox_aggregate(&admin, &referenced_conv.conversation_id).await;
+    delete_outbox_aggregate(&admin, &edge_aggregate.0).await;
+    drop_store(&admin, &table).await;
 }

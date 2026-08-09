@@ -7,6 +7,32 @@ import { eventually } from "../src/eventually.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
+async function awaitActiveIssue(title: string): Promise<JsonRecord> {
+  const proposed = await systemClient.json("/v1/issues", {
+    method: "POST",
+    body: {
+      project_id: systemTestConfig.issues.projectId,
+      type_id: systemTestConfig.issues.typeId,
+      prefix: systemTestConfig.issues.prefix,
+      title,
+    },
+    expectedStatus: 202,
+  });
+  const authorization = record(proposed.body.authorization, "issue authorization");
+  const requestEventId = string(authorization.request_event_id, "authorization request id");
+
+  return eventually<JsonRecord>(
+    async () => {
+      const response = await systemClient.json(
+        `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
+        { expectedStatus: [200, 202] },
+      );
+      return response.status === 200 ? record(response.body.issue, "active issue") : undefined;
+    },
+    { description: `issue authorization ${requestEventId}` },
+  );
+}
+
 describe("collaboration lifecycle", () => {
   test("creates a public conversation and exchanges durable messages", async () => {
     const channel = uniqueName("system-chat");
@@ -305,5 +331,46 @@ describe("collaboration lifecycle", () => {
     expect(array(closedList.body.items, "closed issues")).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: issueId, title })]),
     );
+  });
+
+  test("hands an issue into a shared conversation by its canonical reference", async () => {
+    const issue = await awaitActiveIssue(uniqueName("Coordinate the referenced rollout"));
+    const issueRef = string(issue.ref, "issue reference");
+    expect(issueRef).toMatch(/^myelin:\/\/[^/]+\/issue\/issue\/MYL-\d+$/);
+
+    const created = await systemClient.json("/v1/chat/conversations", {
+      method: "POST",
+      body: {
+        channel: uniqueName("system-chat-ref"),
+        topic: "Share work without copying it",
+      },
+      idempotencyKey: `conversation-ref-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const conversation = record(created.body.conversation, "reference conversation");
+    const conversationId = string(conversation.id, "reference conversation id");
+
+    await systemClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
+      {
+        method: "POST",
+        body: {
+          content: "Follow progress in \uFFFC.",
+          references: [issueRef],
+        },
+        idempotencyKey: `message-ref-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+
+    const history = await reviewerClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages?limit=10`,
+    );
+    expect(array(history.body.items, "referenced conversation messages")).toEqual([
+      expect.objectContaining({
+        content: "Follow progress in \uFFFC.",
+        nodes: [{ kind: "artifact_ref", ref: issueRef }],
+      }),
+    ]);
   });
 });

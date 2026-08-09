@@ -93,6 +93,7 @@ myelin inbox list
 myelin chat list
 myelin chat create engineering --topic "Release coordination" --idempotency-key release-room
 myelin chat send 01J... "Ready for review." --idempotency-key release-message
+myelin chat ref 01J... myelin://acme/issue/issue/ENG-41 --idempotency-key release-issue
 myelin chat history 01J...
 
 myelin doc page list
@@ -107,6 +108,10 @@ credential store. `--profile` and `MYELIN_PROFILE` select a profile for one comm
 changes the default without copying a token. `context use --project` records a project on the
 active profile; `--project`, `MYELIN_PROJECT`, and that saved value override one another in that
 order. Git helpers are scoped to an exact Edge and profile.
+
+Issue responses include a canonical `myelin://...` reference that can be passed directly to
+`chat ref`. The conversation keeps a live pointer to the issue rather than copying a stale
+snapshot.
 
 Mutation keys are the caller's single retry identity: reuse the same key after a lost response.
 Chat and Knowledge derive their bounded durable nonce from it, so callers do not need a second

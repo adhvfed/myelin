@@ -14,6 +14,7 @@ use myelin_chat::store::{
 use myelin_chat::{
     decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, ChatFreeText,
 };
+use myelin_content::{InlineNode, OBJ};
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
 use myelin_identity::{Principal, PrincipalKind};
 use myelin_storage::{KeyClass, KmsEngine, SubjectId};
@@ -26,6 +27,8 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 
 const MAX_CHAT_JSON_BYTES: usize = 36 * 1024;
 const MAX_MESSAGE_BYTES: usize = 32 * 1024;
+const MAX_MESSAGE_REFERENCES: usize = 32;
+const MAX_ARTIFACT_REF_BYTES: usize = 1024;
 const DEFAULT_PAGE_LIMIT: u32 = 50;
 const MAX_PAGE_LIMIT: u32 = 100;
 
@@ -158,6 +161,8 @@ struct CreateConversationBody {
 struct PostMessageBody {
     content: String,
     client_nonce: Option<String>,
+    #[serde(default)]
+    references: Vec<String>,
 }
 
 struct ConversationListHandler {
@@ -294,6 +299,7 @@ impl Handler for MessagePostHandler {
         let conversation_id = conversation_param(ctx)?.to_string();
         let body: PostMessageBody = parse_body(&ctx.request.body)?;
         validate_message(&body.content)?;
+        let structured_nodes = reference_nodes(ctx.principal, &body.content, &body.references)?;
         let client_nonce = client_nonce(
             ctx.request,
             &ctx.principal.principal_id.0,
@@ -314,23 +320,36 @@ impl Handler for MessagePostHandler {
             thread_root_id: None,
             author: event_principal.principal_id.0.clone(),
             author_kind,
-            body_inline: encrypt_message_body(
+            body_inline: encrypt_message_column(
                 self.api.kms.as_ref(),
                 ctx.principal,
                 &event_principal.principal_id.0,
+                ChatFreeText::BodyInline,
                 body.content.as_bytes(),
             )?,
-            body_nodes: b"[]".to_vec(),
+            body_nodes: encrypt_message_column(
+                self.api.kms.as_ref(),
+                ctx.principal,
+                &event_principal.principal_id.0,
+                ChatFreeText::BodyNodes,
+                &serde_json::to_vec(&structured_nodes).map_err(|error| {
+                    EdgeError::Internal(format!(
+                        "Chat structured nodes could not be encoded: {error}"
+                    ))
+                })?,
+            )?,
             client_nonce,
         };
         let now = now_timestamp();
         let message_id = self.api.drive(async {
             self.api
                 .messages
-                .append_co_commit(
+                .append_structured_co_commit(
                     self.api.object_ids.as_ref(),
                     new_message,
                     EventId(self.api.event_ids.mint().0),
+                    self.api.event_ids.as_ref(),
+                    &structured_nodes,
                     Actor(event_principal),
                     now.clone(),
                     now,
@@ -502,6 +521,46 @@ fn validate_message(content: &str) -> Result<(), EdgeError> {
     Ok(())
 }
 
+fn reference_nodes(
+    principal: &Principal,
+    content: &str,
+    references: &[String],
+) -> Result<Vec<InlineNode>, EdgeError> {
+    if references.len() > MAX_MESSAGE_REFERENCES {
+        return Err(EdgeError::BadRequest(format!(
+            "Chat message may contain at most {MAX_MESSAGE_REFERENCES} structured references"
+        )));
+    }
+    let placeholders = content
+        .chars()
+        .filter(|character| *character == OBJ)
+        .count();
+    if placeholders != references.len() {
+        return Err(EdgeError::BadRequest(
+            "Chat content must contain one U+FFFC placeholder for each structured reference".into(),
+        ));
+    }
+    references
+        .iter()
+        .map(|reference| {
+            if reference.len() > MAX_ARTIFACT_REF_BYTES {
+                return Err(EdgeError::BadRequest(format!(
+                    "Chat ArtifactRef exceeds {MAX_ARTIFACT_REF_BYTES} bytes"
+                )));
+            }
+            let parsed = myelin_refs::parse_scoped(reference).map_err(|error| {
+                EdgeError::BadRequest(format!("invalid Chat ArtifactRef: {error}"))
+            })?;
+            if parsed.tenant != principal.tenant {
+                return Err(EdgeError::BadRequest(
+                    "Chat cannot store a cross-tenant ArtifactRef".into(),
+                ));
+            }
+            Ok(InlineNode::ArtifactRefNode(parsed.artifact_ref))
+        })
+        .collect()
+}
+
 fn validate_nonce(value: &str) -> Result<(), EdgeError> {
     if value.is_empty()
         || value.len() > 128
@@ -555,24 +614,20 @@ fn same_public_topic(left: &Conversation, right: &Conversation) -> bool {
 }
 
 fn message_json(message: &Message, viewer: &str, kms: &KmsEngine) -> Result<Value, EdgeError> {
-    let encrypted = decode_encrypted_body(&message.body_inline).map_err(|_| {
-        EdgeError::Internal("stored Chat message has an invalid encrypted body".into())
-    })?;
-    if encrypted.key_ref.tenant.as_str() != message.conv.tenant
-        || encrypted.key_ref.class != KeyClass::Subject(message.author.clone())
+    let content = decrypt_message_column(message, kms, &message.body_inline, "body_inline")?;
+    let content = std::str::from_utf8(&content)
+        .map_err(|_| EdgeError::Internal("stored Chat message is not valid UTF-8".into()))?;
+    let nodes = decode_message_nodes(message, kms)?;
+    if content
+        .chars()
+        .filter(|character| *character == OBJ)
+        .count()
+        != nodes.len()
     {
         return Err(EdgeError::Internal(
-            "stored Chat message encryption scope does not match its author".into(),
+            "stored Chat content and structured nodes disagree".into(),
         ));
     }
-    let plaintext = decrypt_body(
-        kms,
-        &myelin_tenancy::Region(message.conv.region.clone()),
-        &encrypted,
-    )
-    .map_err(|_| EdgeError::Internal("stored Chat message cannot be decrypted".into()))?;
-    let content = std::str::from_utf8(&plaintext)
-        .map_err(|_| EdgeError::Internal("stored Chat message is not valid UTF-8".into()))?;
     Ok(json!({
         "id": message.message_id.as_str(),
         "author": message.author,
@@ -583,6 +638,7 @@ fn message_json(message: &Message, viewer: &str, kms: &KmsEngine) -> Result<Valu
         },
         "is_you": message.author == viewer,
         "content": content,
+        "nodes": nodes.iter().map(message_node_json).collect::<Vec<_>>(),
         "edited": message.edited_seq > 0,
         "state": match message.state {
             MessageState::Active => "active",
@@ -594,10 +650,66 @@ fn message_json(message: &Message, viewer: &str, kms: &KmsEngine) -> Result<Valu
     }))
 }
 
-fn encrypt_message_body(
+fn decode_message_nodes(message: &Message, kms: &KmsEngine) -> Result<Vec<InlineNode>, EdgeError> {
+    // The first public Edge floor wrote only an empty plaintext node array.
+    // It contains no personal data and remains readable during the rolling
+    // transition; every newly written node array is encrypted.
+    if message.body_nodes.is_empty() || message.body_nodes == b"[]" {
+        return Ok(Vec::new());
+    }
+    let node_bytes = decrypt_message_column(message, kms, &message.body_nodes, "body_nodes")?;
+    serde_json::from_slice(&node_bytes)
+        .map_err(|_| EdgeError::Internal("stored Chat structured nodes are not valid".into()))
+}
+
+fn message_node_json(node: &InlineNode) -> Value {
+    match node {
+        InlineNode::Mention(principal) => json!({
+            "kind": "mention",
+            "principal_id": principal.principal_id.0,
+        }),
+        InlineNode::ArtifactRefNode(reference) => json!({
+            "kind": "artifact_ref",
+            "ref": reference.0,
+        }),
+        InlineNode::Embed(reference) => json!({
+            "kind": "embed",
+            "ref": reference.0,
+        }),
+    }
+}
+
+fn decrypt_message_column(
+    message: &Message,
+    kms: &KmsEngine,
+    encoded: &[u8],
+    column: &str,
+) -> Result<Vec<u8>, EdgeError> {
+    let encrypted = decode_encrypted_body(encoded).map_err(|_| {
+        EdgeError::Internal(format!(
+            "stored Chat message has an invalid encrypted {column}"
+        ))
+    })?;
+    if encrypted.key_ref.tenant.as_str() != message.conv.tenant
+        || encrypted.key_ref.class != KeyClass::Subject(message.author.clone())
+    {
+        return Err(EdgeError::Internal(
+            "stored Chat message encryption scope does not match its author".into(),
+        ));
+    }
+    decrypt_body(
+        kms,
+        &myelin_tenancy::Region(message.conv.region.clone()),
+        &encrypted,
+    )
+    .map_err(|_| EdgeError::Internal(format!("stored Chat {column} cannot be decrypted")))
+}
+
+fn encrypt_message_column(
     kms: &KmsEngine,
     principal: &Principal,
     author: &str,
+    kind: ChatFreeText,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, EdgeError> {
     let column = encrypt_body(
@@ -605,7 +717,7 @@ fn encrypt_message_body(
         &principal.region,
         &principal.tenant,
         &SubjectId::new(author),
-        ChatFreeText::BodyInline,
+        kind,
         plaintext,
     )
     .map_err(|error| EdgeError::Internal(format!("Chat message encryption failed: {error}")))?;
@@ -647,6 +759,14 @@ fn no_store(response: EdgeResponse) -> EdgeResponse {
 mod tests {
     use super::*;
 
+    fn principal(tenant: &str) -> Principal {
+        Principal::stub(
+            myelin_identity::PrincipalId("author".into()),
+            PrincipalKind::Human,
+            myelin_tenancy::TenantId(tenant.into()),
+        )
+    }
+
     #[test]
     fn query_parser_is_bounded_and_strict() {
         assert_eq!(parse_page_query(""), Ok((50, None)));
@@ -685,5 +805,39 @@ mod tests {
             client_nonce(&request, "svc:agent", None).unwrap(),
             request.stable_idempotency_nonce("svc:agent").unwrap()
         );
+    }
+
+    #[test]
+    fn structured_references_are_positionally_complete_and_tenant_scoped() {
+        let issue_ref = "myelin://acme/issue/issue/ENG-41";
+        assert_eq!(
+            reference_nodes(&principal("acme"), "Tracking \u{FFFC}", &[issue_ref.into()]).unwrap(),
+            vec![InlineNode::ArtifactRefNode(myelin_refs::ArtifactRef(
+                issue_ref.into()
+            ))]
+        );
+
+        assert!(reference_nodes(&principal("acme"), "Tracking", &[issue_ref.into()]).is_err());
+        assert!(reference_nodes(&principal("acme"), "Tracking \u{FFFC}", &[]).is_err());
+        assert!(reference_nodes(
+            &principal("acme"),
+            "Tracking \u{FFFC}",
+            &["not-a-reference".into()]
+        )
+        .is_err());
+        assert!(reference_nodes(
+            &principal("acme"),
+            "Tracking \u{FFFC}",
+            &["myelin://other/issue/issue/ENG-41".into()]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn structured_reference_count_is_bounded_before_parsing() {
+        let references = vec!["not-a-reference".into(); MAX_MESSAGE_REFERENCES + 1];
+        let content = OBJ.to_string().repeat(references.len());
+        let error = reference_nodes(&principal("acme"), &content, &references).unwrap_err();
+        assert!(matches!(error, EdgeError::BadRequest(message) if message.contains("at most")));
     }
 }

@@ -224,7 +224,7 @@ pub fn extract_message_edges(source: &ArtifactRef, body: &MessageBody) -> Vec<Bo
     extract_body_edges(source, &nodes)
 }
 
-fn edge_event_draft(edge: &BodyEdge) -> EventDraft {
+pub(crate) fn edge_event_draft(edge: &BodyEdge) -> EventDraft {
     EventDraft {
         type_: EventType(REFS_EDGE_CREATED.into()),
         subject: edge.source.clone(),

@@ -125,8 +125,9 @@ fn production_edge_mounts_encrypted_durable_chat_topics_and_messages() {
     assert!(route.contains("PgConversationStore::new(pool.clone())"));
     assert!(route.contains("PgMessageStore::new(pool, \"edge\", MESSAGE_TABLE)"));
     assert!(route.contains("create_co_commit("));
-    assert!(route.contains("append_co_commit("));
-    assert!(route.contains("encrypt_message_body("));
+    assert!(route.contains("append_structured_co_commit("));
+    assert!(route.contains("encrypt_message_column("));
+    assert!(route.contains("ChatFreeText::BodyNodes"));
     assert!(route.contains("decode_encrypted_body("));
     assert!(!route.contains("body_inline: body.content.into_bytes()"));
     assert!(

@@ -7,7 +7,7 @@ const DEFAULT_LIMIT: u16 = 50;
 pub fn chat_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no chat command (try: list | create <channel> --topic <topic> | history <id> | send <id> <message>)"
+            "no chat command (try: list | create <channel> --topic <topic> | history <id> | send <id> <message> | ref <id> <ArtifactRef>)"
                 .into(),
         )
     })?;
@@ -27,8 +27,9 @@ pub fn chat_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
             ))
         }
         "send" | "post" => send_message(rest),
+        "ref" => reference_message(rest),
         other => Err(CliError::Usage(format!(
-            "unknown chat command `{other}` (try: list | create | history | send)"
+            "unknown chat command `{other}` (try: list | create | history | send | ref)"
         ))),
     }
 }
@@ -87,6 +88,21 @@ fn send_message(args: &[&str]) -> Result<EdgeCall, CliError> {
     Ok(EdgeCall::post_json(
         format!("/v1/chat/conversations/{conversation}/messages"),
         json!({ "content": content }),
+    ))
+}
+
+fn reference_message(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let [conversation, reference] = args else {
+        return Err(CliError::Usage(
+            "`chat ref` needs exactly one <conversation_id> and one <ArtifactRef>".into(),
+        ));
+    };
+    canonical_ulid("conversation id", conversation)?;
+    myelin_refs::parse_scoped(reference)
+        .map_err(|error| CliError::Usage(format!("invalid ArtifactRef: {error}")))?;
+    Ok(EdgeCall::post_json(
+        format!("/v1/chat/conversations/{conversation}/messages"),
+        json!({ "content": "\u{FFFC}", "references": [reference] }),
     ))
 }
 
@@ -226,7 +242,7 @@ mod tests {
     }
 
     #[test]
-    fn create_and_send_map_to_the_shared_public_mutations() {
+    fn create_send_and_ref_map_to_the_shared_public_mutations() {
         let create =
             chat_dispatch(&["create", "engineering", "--topic", "Release coordination"]).unwrap();
         assert_eq!(create.method, HttpMethod::Post);
@@ -247,6 +263,21 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(send.payload.as_deref().unwrap()).unwrap(),
             json!({"content": "Ready for review."})
         );
+
+        let reference = "myelin://acme/issue/issue/ENG-41";
+        let reference_message = chat_dispatch(&["ref", CONVERSATION, reference]).unwrap();
+        assert_eq!(reference_message.method, HttpMethod::Post);
+        assert_eq!(
+            reference_message.path,
+            format!("/v1/chat/conversations/{CONVERSATION}/messages")
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                reference_message.payload.as_deref().unwrap()
+            )
+            .unwrap(),
+            json!({"content": "\u{FFFC}", "references": [reference]})
+        );
     }
 
     #[test]
@@ -256,6 +287,8 @@ mod tests {
             vec!["history", "not-an-id"],
             vec!["send", CONVERSATION, ""],
             vec!["send", CONVERSATION],
+            vec!["ref", CONVERSATION, "not-a-reference"],
+            vec!["ref", CONVERSATION],
             vec!["create", "engineering"],
             vec!["create", " engineering", "--topic", "x"],
         ] {
