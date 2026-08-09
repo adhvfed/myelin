@@ -274,6 +274,47 @@ describe("the CLI authentication journey", () => {
       expect(status.stdout).toContain(systemTestConfig.principal);
       expect(status.stdout).toContain(`tenant=${systemTestConfig.tenant}`);
 
+      // The project belongs to the context, so ordinary work does not repeat an opaque UUID.
+      const chooseProject = await runCli(
+        configDirectory,
+        "context",
+        "use",
+        "--project",
+        systemTestConfig.issues.projectId,
+      );
+      expect(chooseProject.exitCode, chooseProject.stderr).toBe(0);
+      expect(chooseProject.stdout).toContain(
+        `Default project: ${systemTestConfig.issues.projectId}`,
+      );
+
+      const contextualIssueTitle = uniqueName("Created from the active project");
+      const contextualIssue = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        uniqueName("cli-context-issue"),
+        "issue",
+        "create",
+        "--type",
+        systemTestConfig.issues.typeId,
+        "--prefix",
+        systemTestConfig.issues.prefix,
+        "--title",
+        contextualIssueTitle,
+      );
+      expect(contextualIssue.exitCode, contextualIssue.stderr).toBe(0);
+      expect(JSON.parse(contextualIssue.stdout)).toMatchObject({
+        issue: { project_id: systemTestConfig.issues.projectId },
+        authorization: { status: "pending" },
+      });
+
+      const contextAfterProject = await runCli(configDirectory, "--json", "context", "current");
+      expect(contextAfterProject.exitCode, contextAfterProject.stderr).toBe(0);
+      expect(JSON.parse(contextAfterProject.stdout)).toMatchObject({
+        profile: "default",
+        project: systemTestConfig.issues.projectId,
+      });
+
       const repositories = await runCli(configDirectory, "repo", "list");
       expect(repositories.exitCode, repositories.stderr).toBe(0);
 

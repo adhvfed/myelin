@@ -126,6 +126,18 @@ impl ProfileCatalog {
         Ok(())
     }
 
+    pub(crate) fn set_project(&mut self, name: &str, project: &str) -> Result<(), CliError> {
+        validate_profile_name(name)?;
+        validate_context_value("project", project).map_err(CliError::Usage)?;
+        let profile = self.file.profiles.get_mut(name).ok_or_else(|| {
+            CliError::NotAuthenticated(format!(
+                "profile `{name}` is not signed in; run `myelin --profile {name} auth login`"
+            ))
+        })?;
+        profile.project = Some(project.to_string());
+        Ok(())
+    }
+
     pub(crate) fn remove(&mut self, name: &str) -> Option<Profile> {
         let removed = self.file.profiles.remove(name);
         if removed.is_some() && self.file.active_profile.as_deref() == Some(name) {
@@ -225,14 +237,8 @@ fn validate_profile(profile: &Profile) -> Result<(), CliError> {
             MAX_CONTEXT_VALUE_BYTES,
         ),
     ] {
-        if value.is_some_and(|value| {
-            value.is_empty()
-                || value.len() > maximum
-                || !value.as_bytes().iter().all(u8::is_ascii_graphic)
-        }) {
-            return Err(CliError::Config(format!(
-                "saved profile {label} must be bounded printable ASCII without spaces"
-            )));
+        if let Some(value) = value {
+            validate_bounded_context_value(label, value, maximum).map_err(CliError::Config)?;
         }
     }
     if profile
@@ -241,6 +247,22 @@ fn validate_profile(profile: &Profile) -> Result<(), CliError> {
     {
         return Err(CliError::Config(
             "saved profile expiry must be a positive Unix timestamp".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_context_value(label: &str, value: &str) -> Result<(), String> {
+    validate_bounded_context_value(label, value, MAX_CONTEXT_VALUE_BYTES)
+}
+
+fn validate_bounded_context_value(label: &str, value: &str, maximum: usize) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > maximum
+        || !value.as_bytes().iter().all(u8::is_ascii_graphic)
+    {
+        return Err(format!(
+            "{label} must be bounded printable ASCII without spaces"
         ));
     }
     Ok(())
@@ -308,11 +330,22 @@ mod tests {
         assert_eq!(loaded.active_name(), Some("personal"));
         assert_eq!(loaded.iter().count(), 2);
         loaded.activate("work").unwrap();
+        loaded
+            .set_project("work", "11111111-1111-1111-1111-111111111111")
+            .unwrap();
         loaded.save().unwrap();
+        let mut loaded = ProfileCatalog::load(&env, &read).unwrap();
+        assert_eq!(loaded.active_name(), Some("work"));
         assert_eq!(
-            ProfileCatalog::load(&env, &read).unwrap().active_name(),
-            Some("work")
+            loaded.get("work").unwrap().project.as_deref(),
+            Some("11111111-1111-1111-1111-111111111111")
         );
+        for malformed in ["", "two projects", &"x".repeat(257)] {
+            assert!(
+                loaded.set_project("work", malformed).is_err(),
+                "{malformed:?}"
+            );
+        }
 
         loaded.remove("work");
         assert_eq!(loaded.active_name(), Some("personal"));

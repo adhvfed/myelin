@@ -262,6 +262,26 @@ pub fn issues_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     Ok(issues_command_to_call(&command))
 }
 
+pub fn issues_dispatch_with_project(
+    args: &[&str],
+    default_project: Option<&str>,
+) -> Result<EdgeCall, CliError> {
+    let uses_default = args.first().copied() == Some("create") && !args.contains(&"--project");
+    if !uses_default {
+        return issues_dispatch(args);
+    }
+    let project = default_project.ok_or_else(|| {
+        CliError::Usage(
+            "issue create needs a project; pass --project or run `myelin context use --project <project>`"
+                .into(),
+        )
+    })?;
+    let mut contextual_args = Vec::with_capacity(args.len() + 2);
+    contextual_args.extend_from_slice(args);
+    contextual_args.extend(["--project", project]);
+    issues_dispatch(&contextual_args)
+}
+
 pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
     match command {
         IssuesCliCommand::List {
@@ -715,6 +735,43 @@ mod tests {
         );
         assert!(body.get("tenant").is_none() && body.get("region").is_none());
 
+        let contextual = issues_dispatch_with_project(
+            &[
+                "create",
+                "--type",
+                type_id,
+                "--prefix",
+                "ENG",
+                "--title",
+                "Uses the active project",
+            ],
+            Some(project),
+        )
+        .unwrap();
+        let contextual_body: serde_json::Value =
+            serde_json::from_slice(&contextual.payload.unwrap()).unwrap();
+        assert_eq!(contextual_body["project_id"], project);
+
+        let explicit_project = "44444444-4444-4444-4444-444444444444";
+        let explicit = issues_dispatch_with_project(
+            &[
+                "create",
+                "--project",
+                explicit_project,
+                "--type",
+                type_id,
+                "--prefix",
+                "ENG",
+                "--title",
+                "Explicit project wins",
+            ],
+            Some(project),
+        )
+        .unwrap();
+        let explicit_body: serde_json::Value =
+            serde_json::from_slice(&explicit.payload.unwrap()).unwrap();
+        assert_eq!(explicit_body["project_id"], explicit_project);
+
         let view = issues_dispatch(&["view", issue]).unwrap();
         assert_eq!(view.method, HttpMethod::Get);
         assert_eq!(view.path, format!("/v1/issues/{issue}"));
@@ -748,6 +805,21 @@ mod tests {
                 .code(),
             2
         );
+        assert!(issues_dispatch_with_project(
+            &[
+                "create",
+                "--type",
+                "22222222-2222-2222-2222-222222222222",
+                "--prefix",
+                "ENG",
+                "--title",
+                "No project"
+            ],
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("context use --project"));
     }
 
     #[test]

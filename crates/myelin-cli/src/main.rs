@@ -2,16 +2,16 @@ use clap::{Args, Parser, Subcommand};
 use myelin_cli::client::execute;
 use myelin_cli::config::{
     self, load_profile_credential, remove_profile_credential, resolve_edge,
-    resolve_profile_credential, selected_saved_profile, store_profile_credential, EdgeConfig,
-    SESSION_SCHEME,
+    resolve_profile_credential, resolve_project, selected_saved_profile, store_profile_credential,
+    EdgeConfig, SESSION_SCHEME,
 };
 use myelin_cli::context as cli_context;
 use myelin_cli::device_auth::{
     begin_authorization, new_authorization_request, wait_for_authorization,
 };
 use myelin_cli::dispatch::{
-    chat_dispatch, ci_dispatch, git_dispatch, issues_dispatch, knowledge_dispatch, notif_dispatch,
-    repo_dispatch, EdgeCall, HttpMethod,
+    chat_dispatch, ci_dispatch, git_dispatch, issues_dispatch_with_project, knowledge_dispatch,
+    notif_dispatch, repo_dispatch, EdgeCall, HttpMethod,
 };
 use myelin_cli::error::CliError;
 use myelin_cli::git_credential::{
@@ -36,6 +36,9 @@ struct Cli {
     /// Select a saved endpoint, context, and credential bundle.
     #[arg(long, global = true)]
     profile: Option<String>,
+    /// Override the active project for this command.
+    #[arg(long, global = true)]
+    project: Option<String>,
     /// Give a mutation a retry-stable identity.
     #[arg(long, global = true)]
     idempotency_key: Option<String>,
@@ -131,7 +134,7 @@ enum ContextCommand {
     /// Show the active context and verify its identity with Edge.
     Current,
     /// Make a saved profile the default for subsequent commands.
-    Use { name: String },
+    Use { name: Option<String> },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -173,8 +176,8 @@ async fn run() -> Result<(), CliError> {
                 cli_context::current(cli.json, cli.profile.as_deref(), &getenv, &read_file).await
             }
             ContextCommand::Use { name } => {
-                reject_context_flags(&cli, false)?;
-                cli_context::activate(cli.json, name, &getenv)
+                reject_context_use_flags(&cli)?;
+                cli_context::select(cli.json, name.as_deref(), cli.project.as_deref(), &getenv)
             }
         },
         Command::Whoami => run_call(&cli, &getenv, &read_file, whoami_call(), None).await,
@@ -187,7 +190,15 @@ async fn run() -> Result<(), CliError> {
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Issue { args } => {
-            let (call, command_key) = dispatch_command(args, issues_dispatch)?;
+            let project = resolve_project(
+                cli.project.as_deref(),
+                cli.profile.as_deref(),
+                &getenv,
+                &read_file,
+            )?;
+            let (call, command_key) = dispatch_command(args, |args| {
+                issues_dispatch_with_project(args, project.as_deref())
+            })?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Ci { args } => {
@@ -238,7 +249,8 @@ async fn login(
             .or_else(|| getenv(config::env::SCHEME).filter(|value| !value.is_empty()))
             .unwrap_or_else(|| config::DEFAULT_SCHEME.into());
         let edge = login_edge(cli, &scheme, getenv)?;
-        let context = cli_context::inspect(&edge, &token).await?;
+        let mut context = cli_context::inspect(&edge, &token).await?;
+        context.project = resolve_login_project(cli, getenv)?;
         let path = store_profile_credential(
             cli.profile.as_deref(),
             &token,
@@ -280,7 +292,8 @@ async fn login(
     flush_stdout()?;
 
     let authorized = wait_for_authorization(&edge, &request, &authorization).await?;
-    let context = cli_context::inspect(&edge, &authorized.credential.token).await?;
+    let mut context = cli_context::inspect(&edge, &authorized.credential.token).await?;
+    context.project = resolve_login_project(cli, getenv)?;
     let path = store_profile_credential(
         cli.profile.as_deref(),
         &authorized.credential.token,
@@ -314,6 +327,19 @@ fn login_edge(
         saved.as_ref().map(|profile| profile.edge_url.as_str()),
         getenv,
     ))
+}
+
+fn resolve_login_project(
+    cli: &Cli,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, CliError> {
+    let read = |path: &std::path::Path| std::fs::read_to_string(path).ok();
+    resolve_project(
+        cli.project.as_deref(),
+        cli.profile.as_deref(),
+        getenv,
+        &read,
+    )
 }
 
 fn logout(cli: &Cli, getenv: &dyn Fn(&str) -> Option<String>) -> Result<(), CliError> {
@@ -459,11 +485,27 @@ fn reject_context_flags(cli: &Cli, allow_profile: bool) -> Result<(), CliError> 
     if cli.edge.is_some()
         || cli.token.is_some()
         || cli.scheme.is_some()
+        || cli.project.is_some()
         || cli.idempotency_key.is_some()
         || (!allow_profile && cli.profile.is_some())
     {
         return Err(CliError::Usage(
             "context commands use saved profiles and do not accept credential or Edge overrides"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn reject_context_use_flags(cli: &Cli) -> Result<(), CliError> {
+    if cli.edge.is_some()
+        || cli.token.is_some()
+        || cli.scheme.is_some()
+        || cli.idempotency_key.is_some()
+        || cli.profile.is_some()
+    {
+        return Err(CliError::Usage(
+            "context use changes a saved profile and does not accept credential or Edge overrides"
                 .into(),
         ));
     }
@@ -657,6 +699,36 @@ mod tests {
         ] {
             Cli::try_parse_from(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
         }
+    }
+
+    #[test]
+    fn project_is_a_global_override_and_context_use_can_set_it_without_switching_profiles() {
+        let project = "11111111-1111-1111-1111-111111111111";
+        let context =
+            Cli::try_parse_from(["myelin", "context", "use", "--project", project]).unwrap();
+        assert_eq!(context.project.as_deref(), Some(project));
+        assert!(matches!(
+            context.command,
+            Command::Context {
+                command: ContextCommand::Use { name: None }
+            }
+        ));
+
+        let issue = Cli::try_parse_from([
+            "myelin",
+            "--project",
+            project,
+            "issue",
+            "create",
+            "--type",
+            "22222222-2222-2222-2222-222222222222",
+            "--prefix",
+            "ENG",
+            "--title",
+            "Contextual",
+        ])
+        .unwrap();
+        assert_eq!(issue.project.as_deref(), Some(project));
     }
 
     #[test]

@@ -75,11 +75,14 @@ myelin --edge https://myelin.example auth login
 myelin --profile customer-a --edge https://customer-a.example auth login
 myelin context list
 myelin context use customer-a
+myelin context use --project 11111111-1111-1111-1111-111111111111
 myelin context current
 myelin auth configure-git
 
 myelin repo list
 myelin repo pr list
+myelin issue create --type 22222222-2222-2222-2222-222222222222 \
+  --prefix ENG --title "Make onboarding uneventful" --idempotency-key onboarding-issue
 myelin issue list
 myelin inbox list
 
@@ -97,7 +100,9 @@ myelin doc page get 01J...
 Each named profile bundles its Edge, tenant, region, optional project, and an opaque credential
 reference in `~/.config/myelin/config.toml`. The credential itself stays in the operating-system
 credential store. `--profile` and `MYELIN_PROFILE` select a profile for one command; `context use`
-changes the default without copying a token. Git helpers are scoped to an exact Edge and profile.
+changes the default without copying a token. `context use --project` records a project on the
+active profile; `--project`, `MYELIN_PROJECT`, and that saved value override one another in that
+order. Git helpers are scoped to an exact Edge and profile.
 
 Mutation keys are the caller's single retry identity: reuse the same key after a lost response.
 Chat and Knowledge derive their bounded durable nonce from it, so callers do not need a second

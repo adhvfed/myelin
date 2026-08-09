@@ -1,6 +1,6 @@
 use crate::client::execute;
 use crate::config::{
-    activate_profile, load_profile_credential, saved_profiles, EdgeConfig, ProfileContext,
+    load_profile_credential, saved_profiles, use_profile_context, EdgeConfig, ProfileContext,
 };
 use crate::dispatch::{EdgeCall, HttpMethod};
 use crate::error::CliError;
@@ -110,22 +110,27 @@ pub async fn current(
     Ok(())
 }
 
-pub fn activate(
+pub fn select(
     json_mode: bool,
-    profile_name: &str,
+    profile_name: Option<&str>,
+    project: Option<&str>,
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(), CliError> {
-    activate_profile(profile_name, getenv)?;
+    let selected = use_profile_context(profile_name, project, getenv)?;
     if json_mode {
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
-                "active_profile": profile_name,
+                "active_profile": selected.name,
+                "project": selected.project,
             }))
             .expect("context selection JSON is serializable")
         );
     } else {
-        println!("Using CLI context `{profile_name}`.");
+        println!("Using CLI context `{}`.", selected.name);
+        if let Some(project) = selected.project {
+            println!("Default project: {project}");
+        }
     }
     Ok(())
 }

@@ -19,6 +19,7 @@ pub mod env {
     pub const EDGE: &str = "MYELIN_EDGE";
     pub const CONFIG_DIR: &str = "MYELIN_CONFIG_DIR";
     pub const PROFILE: &str = "MYELIN_PROFILE";
+    pub const PROJECT: &str = "MYELIN_PROJECT";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -423,16 +424,7 @@ pub fn saved_profiles(
     let catalog = ProfileCatalog::load(getenv, read_file)?;
     Ok(catalog
         .iter()
-        .map(|(name, profile)| SavedProfile {
-            name: name.into(),
-            active: catalog.active_name() == Some(name),
-            edge_url: profile.edge_url.clone(),
-            scheme: profile.scheme.clone(),
-            expires_at_unix: profile.expires_at_unix,
-            tenant: profile.tenant.clone(),
-            region: profile.region.clone(),
-            project: profile.project.clone(),
-        })
+        .map(|(name, profile)| saved_profile(name, profile, catalog.active_name() == Some(name)))
         .collect())
 }
 
@@ -443,26 +435,71 @@ pub fn selected_saved_profile(
 ) -> Result<Option<SavedProfile>, CliError> {
     let catalog = ProfileCatalog::load(getenv, read_file)?;
     let selected_name = catalog.selected_name(profile_name, getenv)?;
-    Ok(catalog.get(&selected_name).map(|profile| SavedProfile {
-        name: selected_name.clone(),
-        active: catalog.active_name() == Some(selected_name.as_str()),
+    Ok(catalog.get(&selected_name).map(|profile| {
+        saved_profile(
+            &selected_name,
+            profile,
+            catalog.active_name() == Some(selected_name.as_str()),
+        )
+    }))
+}
+
+fn saved_profile(name: &str, profile: &Profile, active: bool) -> SavedProfile {
+    SavedProfile {
+        name: name.into(),
+        active,
         edge_url: profile.edge_url.clone(),
         scheme: profile.scheme.clone(),
         expires_at_unix: profile.expires_at_unix,
         tenant: profile.tenant.clone(),
         region: profile.region.clone(),
         project: profile.project.clone(),
-    }))
+    }
 }
 
-pub fn activate_profile(
-    profile_name: &str,
+pub fn resolve_project(
+    flag_project: Option<&str>,
+    profile_name: Option<&str>,
     getenv: &dyn Fn(&str) -> Option<String>,
-) -> Result<(), CliError> {
+    read_file: &dyn Fn(&Path) -> Option<String>,
+) -> Result<Option<String>, CliError> {
+    if let Some(project) = flag_project {
+        return Ok(Some(project.to_string()));
+    }
+    if let Some(project) = getenv(env::PROJECT).filter(|value| !value.is_empty()) {
+        return Ok(Some(project));
+    }
+    Ok(
+        selected_saved_profile(profile_name, getenv, read_file)?
+            .and_then(|profile| profile.project),
+    )
+}
+
+pub fn use_profile_context(
+    profile_name: Option<&str>,
+    project: Option<&str>,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<SavedProfile, CliError> {
+    if profile_name.is_none() && project.is_none() {
+        return Err(CliError::Usage(
+            "context use needs a profile name or --project <project>".into(),
+        ));
+    }
     let read = |path: &Path| std::fs::read_to_string(path).ok();
     let mut catalog = ProfileCatalog::load(getenv, &read)?;
-    catalog.activate(profile_name)?;
-    catalog.save()
+    let selected_name = match profile_name {
+        Some(name) => name.to_string(),
+        None => catalog.selected_name(None, getenv)?,
+    };
+    catalog.activate(&selected_name)?;
+    if let Some(project) = project {
+        catalog.set_project(&selected_name, project)?;
+    }
+    catalog.save()?;
+    let profile = catalog
+        .get(&selected_name)
+        .expect("the activated profile was checked above");
+    Ok(saved_profile(&selected_name, profile, true))
 }
 
 fn cleanup_failed_install(
@@ -727,6 +764,39 @@ mod tests {
     }
 
     #[test]
+    fn explicit_then_environment_then_profile_project_controls_commands() {
+        let credential_ref = new_reference();
+        let encoded = format!(
+            "version = 1\nactive_profile = \"work\"\n\n[profiles.work]\ncredential_ref = \"{credential_ref}\"\nscheme = \"session\"\nedge_url = \"https://edge.example\"\nproject = \"profile-project\"\n"
+        );
+        let read =
+            |path: &Path| (path == Path::new("/config/config.toml")).then(|| encoded.clone());
+        let environment = env_from(&[
+            ("MYELIN_CONFIG_DIR", "/config"),
+            ("MYELIN_PROJECT", "environment-project"),
+        ]);
+
+        assert_eq!(
+            resolve_project(Some("explicit-project"), None, &environment, &read).unwrap(),
+            Some("explicit-project".into())
+        );
+        assert_eq!(
+            resolve_project(None, None, &environment, &read).unwrap(),
+            Some("environment-project".into())
+        );
+        assert_eq!(
+            resolve_project(
+                None,
+                None,
+                &env_from(&[("MYELIN_CONFIG_DIR", "/config")]),
+                &read,
+            )
+            .unwrap(),
+            Some("profile-project".into())
+        );
+    }
+
+    #[test]
     fn a_saved_human_session_keeps_its_scheme() {
         let env = env_from(&[("MYELIN_CONFIG_DIR", "/config")]);
         let read = |path: &Path| {
@@ -961,7 +1031,7 @@ mod tests {
             "REVIEWER_SESSION"
         );
 
-        activate_profile("work", &env).unwrap();
+        use_profile_context(Some("work"), None, &env).unwrap();
         assert_eq!(
             load_profile_credential(None, &env, &read)
                 .unwrap()
