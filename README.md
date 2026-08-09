@@ -26,6 +26,13 @@ and agents in one platform, built in Rust.
 Runtime dependencies: Postgres 16, NATS 2.10 (JetStream), Valkey 8, and an
 S3-compatible object store.
 
+The Git smart-HTTP service executes Git inside gVisor. Local development therefore
+also expects a systemd user manager, `runsc` on `PATH`, and a Git-capable root filesystem at
+`$XDG_DATA_HOME/gvisor-assets/git-rootfs` (or
+`~/.local/share/gvisor-assets/git-rootfs`). Set `MYELIN_RUNSC_BIN` or
+`MYELIN_GVISOR_GIT_ROOTFS` to override those locations. The self-hosting scripts
+stage these assets; `scripts/stage-git-rootfs.sh` can restage the Git image.
+
 ## Development
 
 Install [`fed`](https://www.service-federation.com/docs/), then start the complete local application:

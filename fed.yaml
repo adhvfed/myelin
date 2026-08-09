@@ -113,9 +113,13 @@ services:
     depends_on: [data-layer]
     process: >-
       sh -c 'git_root="$PWD/.fed/data/{{FED_PROJECT_ID}}/git";
+      git_wire_rootfs="${MYELIN_GVISOR_GIT_ROOTFS:-${XDG_DATA_HOME:-$HOME/.local/share}/gvisor-assets/git-rootfs}";
+      runsc_bin="${MYELIN_RUNSC_BIN:-$(command -v runsc)}";
       mkdir -p "$git_root";
-      export MYELIN_GIT_ROOT="$git_root" MYELIN_CI_CHECKOUT_REPO_ROOT="$git_root";
-      exec cargo run --quiet -p myelin-edge --bin edge'
+      export MYELIN_GIT_ROOT="$git_root" MYELIN_CI_CHECKOUT_REPO_ROOT="$git_root"
+      MYELIN_GVISOR_GIT_ROOTFS="$git_wire_rootfs" MYELIN_RUNSC_BIN="$runsc_bin";
+      exec systemd-run --user --scope --quiet --property=Delegate=yes
+      cargo run --quiet -p myelin-edge --bin edge'
     environment:
       DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
       DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
@@ -129,7 +133,7 @@ services:
       MYELIN_REGION: fr-par
       MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
       MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
-      MYELIN_GIT_WIRE_ENABLED: "0"
+      MYELIN_GIT_WIRE_ENABLED: "1"
       MYELIN_PUBLIC_BASE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
       MYELIN_EDGE_ADDR: "127.0.0.1:{{EDGE_PORT}}"
       MYELIN_DEV_LOGIN: "1"
@@ -392,11 +396,12 @@ scripts:
       MYELIN_INTEGRATION_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
       MYELIN_INTEGRATION_WEB_URL: "http://127.0.0.1:{{WEB_PORT}}"
       MYELIN_BROWSER_TENANT: "development-{{FED_PROJECT_ID}}"
+      MYELIN_BROWSER_PRINCIPAL: developer
     script: >-
       sh -c 'set -eu;
       browser_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_BROWSER_TENANT" --region fr-par
-      --principal developer --display-name "Myelin Developer"
+      --principal "$MYELIN_BROWSER_PRINCIPAL" --display-name "Myelin Developer"
       --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
       test -n "$browser_token";
       export MYELIN_BROWSER_EDGE_TOKEN="$browser_token";

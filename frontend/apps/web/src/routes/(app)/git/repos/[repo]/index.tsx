@@ -12,7 +12,9 @@ import { fmtDate } from "~/lib/format";
 import { RepoErrorState, errKind } from "~/components/RepoErrorState";
 import { RefSwitcher } from "~/components/RefSwitcher";
 import { Markdown } from "~/components/Markdown";
+import { CloneUrl, GitSetupGuide } from "~/components/GitCloneSetup";
 import { repoHomeContinuationHref } from "~/lib/tree-browse-state";
+import { requireViewer } from "~/lib/auth";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -27,6 +29,7 @@ export default function RepoHomeScreen() {
     async () => (params.repo ? getRepo(params.repo) : undefined),
     { deferStream: true },
   );
+  const viewer = createAsync(() => requireViewer(), { deferStream: true });
   const toast = useToast();
   const defaultBranch = () => repo()?.default_branch ?? "main";
 
@@ -65,8 +68,21 @@ export default function RepoHomeScreen() {
                     <h1 id="repo-heading" style={{ "font-size": "var(--fs-h1)", margin: "0" }}>{home.slug}</h1>
                     <div data-testid="repo-empty" style={{ ...card, display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
                       <p style={{ margin: "0", color: "var(--text-muted)" }}>This repository has no commits yet.</p>
-                      <CloneUrl url={home.clone_url} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
-                      <pre style={{ ...card, "font-family": "var(--font-mono)", margin: "0", "white-space": "pre-wrap" }}>{`git clone ${home.clone_url}\ngit push -u origin ${defaultBranch()}`}</pre>
+                      <Show when={home.clone_url} keyed>
+                        {(cloneUrl) => <>
+                          <CloneUrl url={cloneUrl} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
+                          <Show when={viewer()}>
+                            {(identity) => (
+                              <GitSetupGuide
+                                url={cloneUrl}
+                                principalId={identity().principalId}
+                                tenant={identity().tenant}
+                                defaultBranch={defaultBranch()}
+                              />
+                            )}
+                          </Show>
+                        </>}
+                      </Show>
                     </div>
                   </Match>
 
@@ -89,7 +105,21 @@ export default function RepoHomeScreen() {
                           currentFullRef={`refs/heads/${defaultBranch()}`}
                           hrefFor={(ref) => `/git/repos/${params.repo}/tree/${encodeURIComponent(ref)}`}
                         />
-                        <CloneUrl url={home.clone_url} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
+                        <Show when={home.clone_url} keyed>
+                          {(cloneUrl) => <>
+                            <CloneUrl url={cloneUrl} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
+                            <Show when={viewer()}>
+                              {(identity) => (
+                                <GitSetupGuide
+                                  url={cloneUrl}
+                                  principalId={identity().principalId}
+                                  tenant={identity().tenant}
+                                  defaultBranch={defaultBranch()}
+                                />
+                              )}
+                            </Show>
+                          </>}
+                        </Show>
                         <A href={`/git/repos/${params.repo}/commits/${encodeURIComponent(defaultBranch())}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>
                           <Icon name="commit" /> Commits
                         </A>
@@ -207,28 +237,5 @@ export function TreeList(props: {
         </For>
       </ul>
     </section>
-  );
-}
-
-function CloneUrl(props: { url?: string; onCopy: () => void }) {
-  return (
-    <span style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-2)" }}>
-      <code data-testid="clone-url" style={{ "font-family": "var(--font-mono)", color: "var(--text-muted)" }}>{props.url}</code>
-      <button
-        type="button"
-        onClick={() => {
-          if (props.url) void navigator.clipboard?.writeText(props.url).catch(() => {});
-          props.onCopy();
-        }}
-        style={{
-          display: "inline-flex", "align-items": "center", gap: "var(--space-1)",
-          padding: "var(--space-1) var(--space-2)", border: "var(--hairline) solid var(--border)",
-          "border-radius": "var(--radius-1)", background: "var(--surface)", color: "var(--text-primary)", cursor: "pointer",
-        }}
-      >
-        <Icon name="link" /> Copy
-      </button>
-      <span style={{ color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>(clone over the wire is GT-006)</span>
-    </span>
   );
 }

@@ -31,6 +31,7 @@ The suite is intentionally organized around externally visible contracts:
 - `platform` verifies health, readiness, capability authentication, and bounded routing errors.
 - `git-lifecycle` follows repository creation through browsing, review by a second principal,
   merge, and readback from the base branch.
+- `git-wire` uses a stock Git client to verify smart-HTTP authentication, clone, fetch, and push.
 - `collaboration-lifecycle` exercises Chat, Knowledge, and the asynchronous Issues authorization
   reconciler with retries and optimistic conflicts.
 - `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary and appears as

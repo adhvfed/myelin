@@ -47,9 +47,12 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await page.waitForURL("**/git/repos/myelin");
 
     await expect(page.getByRole("heading", { name: "acme/myelin", level: 1 })).toBeVisible();
-    // Clone URL (with the GT-006 honesty note) + the top-level tree from the ViewModel.
+    // Clone URL plus the viewer-specific privacy setup and top-level tree from the ViewModel.
     await expect(page.getByTestId("clone-url")).toContainText("/acme/eu-west/myelin.git");
-    await expect(page.getByText("clone over the wire is GT-006")).toBeVisible();
+    const setup = page.getByTestId("git-setup");
+    await setup.getByText("Set up Git").click();
+    await expect(setup).toContainText("u_dev_operator@acme.noreply");
+    await expect(setup).toContainText("capability token as the password");
     const tree = page.getByTestId("repo-tree");
     await expect(tree.getByText("README.md", { exact: true })).toBeVisible();
     await expect(tree.getByText("crates/", { exact: true })).toBeVisible(); // a directory entry

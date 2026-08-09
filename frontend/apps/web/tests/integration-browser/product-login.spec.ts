@@ -20,6 +20,7 @@ function object(value: unknown): JsonObject {
 const edgeUrl = requiredEnvironment("MYELIN_INTEGRATION_EDGE_URL").replace(/\/$/, "");
 const token = requiredEnvironment("MYELIN_BROWSER_EDGE_TOKEN");
 const tenant = requiredEnvironment("MYELIN_BROWSER_TENANT");
+const principal = requiredEnvironment("MYELIN_BROWSER_PRINCIPAL");
 
 async function edgeRequest(
   request: APIRequestContext,
@@ -91,6 +92,10 @@ test("durable product data is available and mutable after browser login", async 
   await createDialog.getByRole("button", { name: "Create repository" }).click();
   await page.waitForURL(`**/git/repos/${slug}`);
   await expect(page.getByRole("heading", { name: `${tenant}/${slug}` })).toBeVisible();
+  const gitSetup = page.getByTestId("git-setup");
+  await gitSetup.getByText("Set up Git").click();
+  await expect(gitSetup).toContainText(`${principal}@${tenant}.noreply`);
+  await expect(gitSetup.getByTestId("git-setup-commands")).toContainText("git push -u origin 'main'");
 
   await edgeRequest(request, "POST", `${repoPath}/blob/main/README.md`, 200, {
     base_oid: "",
