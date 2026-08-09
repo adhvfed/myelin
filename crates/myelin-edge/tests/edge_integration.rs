@@ -257,6 +257,29 @@ fn hdr<'a>(b: &'a [(&'static str, String); 2]) -> Vec<(&'a str, &'a str)> {
     b.iter().map(|(k, v)| (*k, v.as_str())).collect()
 }
 
+async fn receive_product_sse_frame(
+    body: &mut Incoming,
+    mut publish: impl FnMut(),
+) -> Option<String> {
+    for _ in 0..20 {
+        publish();
+        let Ok(Some(Ok(frame))) =
+            tokio::time::timeout(Duration::from_millis(100), body.frame()).await
+        else {
+            continue;
+        };
+        let Some(data) = frame.data_ref() else {
+            continue;
+        };
+        let frame = String::from_utf8_lossy(data).to_string();
+        if frame.starts_with(':') {
+            continue;
+        }
+        return Some(frame);
+    }
+    None
+}
+
 #[tokio::test]
 async fn valid_token_authenticates_resolves_principal_and_sets_scope() {
     let (gw, cell, _rev) = build_gateway();
@@ -446,21 +469,15 @@ async fn sse_endpoint_streams_a_frame() {
     let mut body = resp.into_body();
 
     let scope = sse_scope_for_tenant(TENANT);
-    let mut got = None;
-    for _ in 0..20 {
-        gw.sse_hub()
-            .broadcast("edge", &scope, SseEvent::typed("ping", "{\"hello\":true}"));
-        match tokio::time::timeout(Duration::from_millis(100), body.frame()).await {
-            Ok(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    got = Some(String::from_utf8_lossy(data).to_string());
-                    break;
-                }
-            }
-            _ => continue,
-        }
-    }
-    let frame = got.expect("an SSE frame should stream to the client");
+    let frame = receive_product_sse_frame(
+        &mut body,
+        || {
+            gw.sse_hub()
+                .broadcast("edge", &scope, SseEvent::typed("ping", "{\"hello\":true}"));
+        },
+    )
+    .await
+    .expect("the product SSE frame should stream after the connected comment");
     assert!(
         frame.contains("event: ping"),
         "the SSE frame carries the event type: {frame}"
@@ -492,28 +509,22 @@ async fn scoped_sse_route_isolates_per_object() {
     let coarse = sse_scope_for_tenant(TENANT);
     let other = sse_scope_for_resource(TENANT, "repo", "secrets");
     let widgets = sse_scope_for_resource(TENANT, "repo", "widgets");
-    let mut got = None;
-    for _ in 0..20 {
-        gw.sse_hub()
-            .broadcast("git", &coarse, SseEvent::typed("leak", "{\"coarse\":true}"));
-        gw.sse_hub()
-            .broadcast("git", &other, SseEvent::typed("leak", "{\"other\":true}"));
-        gw.sse_hub().broadcast(
-            "git",
-            &widgets,
-            SseEvent::typed("push", "{\"repo\":\"widgets\"}"),
-        );
-        match tokio::time::timeout(Duration::from_millis(100), body.frame()).await {
-            Ok(Some(Ok(frame))) => {
-                if let Some(data) = frame.data_ref() {
-                    got = Some(String::from_utf8_lossy(data).to_string());
-                    break;
-                }
-            }
-            _ => continue,
-        }
-    }
-    let frame = got.expect("the per-object SSE frame should stream to the client");
+    let frame = receive_product_sse_frame(
+        &mut body,
+        || {
+            gw.sse_hub()
+                .broadcast("git", &coarse, SseEvent::typed("leak", "{\"coarse\":true}"));
+            gw.sse_hub()
+                .broadcast("git", &other, SseEvent::typed("leak", "{\"other\":true}"));
+            gw.sse_hub().broadcast(
+                "git",
+                &widgets,
+                SseEvent::typed("push", "{\"repo\":\"widgets\"}"),
+            );
+        },
+    )
+    .await
+    .expect("the per-object product SSE frame should stream after the connected comment");
     assert!(
         frame.contains("data: {\"repo\":\"widgets\"}"),
         "the subscriber receives ITS object's frame: {frame}"
