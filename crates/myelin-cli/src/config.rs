@@ -502,6 +502,26 @@ pub fn use_profile_context(
     Ok(saved_profile(&selected_name, profile, true))
 }
 
+/** Update one saved profile's project without changing which profile is globally active. */
+pub fn set_profile_project(
+    profile_name: &str,
+    project: &str,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<SavedProfile, CliError> {
+    let read = |path: &Path| std::fs::read_to_string(path).ok();
+    let mut catalog = ProfileCatalog::load(getenv, &read)?;
+    catalog.set_project(profile_name, project)?;
+    catalog.save()?;
+    let profile = catalog
+        .get(profile_name)
+        .expect("the updated profile was checked above");
+    Ok(saved_profile(
+        profile_name,
+        profile,
+        catalog.active_name() == Some(profile_name),
+    ))
+}
+
 fn cleanup_failed_install(
     secret_store: &CredentialSecretStore,
     credential_ref: &str,

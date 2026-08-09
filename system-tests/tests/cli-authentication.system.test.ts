@@ -275,6 +275,51 @@ describe("the CLI authentication journey", () => {
       expect(status.stdout).toContain(systemTestConfig.principal);
       expect(status.stdout).toContain(`tenant=${systemTestConfig.tenant}`);
 
+      // A founder names the first project once. Its generated identity becomes context,
+      // so show and subsequent work no longer carry an operator-provided UUID.
+      const cliProjectName = uniqueName("Developer experience");
+      const cliProjectPrefix = `C${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`;
+      const createProject = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        `cli-project-${randomUUID()}`,
+        "project",
+        "create",
+        cliProjectName,
+        "--prefix",
+        cliProjectPrefix,
+      );
+      expect(createProject.exitCode, createProject.stderr).toBe(0);
+      const createdProject = JSON.parse(createProject.stdout) as {
+        project: { id: string; ref: string; name: string; issue_prefix: string };
+        created: boolean;
+      };
+      expect(createdProject).toMatchObject({
+        created: true,
+        project: { name: cliProjectName, issue_prefix: cliProjectPrefix },
+      });
+      expect(createdProject.project.ref).toBe(
+        `myelin://${systemTestConfig.tenant}/identity/project/${createdProject.project.id}`,
+      );
+
+      const showActiveProject = await runCli(configDirectory, "project", "show");
+      expect(showActiveProject.exitCode, showActiveProject.stderr).toBe(0);
+      expect(showActiveProject.stdout).toContain(cliProjectName);
+      expect(showActiveProject.stdout).toContain(createdProject.project.ref);
+
+      const listProjects = await runCli(configDirectory, "project", "list", "--limit", "100");
+      expect(listProjects.exitCode, listProjects.stderr).toBe(0);
+      expect(listProjects.stdout).toContain(cliProjectName);
+      expect(listProjects.stdout).toContain(createdProject.project.ref);
+
+      const contextAfterCreation = await runCli(configDirectory, "--json", "context", "current");
+      expect(contextAfterCreation.exitCode, contextAfterCreation.stderr).toBe(0);
+      expect(JSON.parse(contextAfterCreation.stdout)).toMatchObject({
+        profile: "default",
+        project: createdProject.project.id,
+      });
+
       // The project belongs to the context, so ordinary work does not repeat an opaque UUID.
       const chooseProject = await runCli(
         configDirectory,

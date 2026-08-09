@@ -2,16 +2,17 @@ use clap::{Args, Parser, Subcommand};
 use myelin_cli::client::execute;
 use myelin_cli::config::{
     self, load_profile_credential, remove_profile_credential, resolve_edge,
-    resolve_profile_credential, resolve_project, selected_saved_profile, store_profile_credential,
-    EdgeConfig, SESSION_SCHEME,
+    resolve_profile_credential, resolve_project, selected_saved_profile, set_profile_project,
+    store_profile_credential, EdgeConfig, SESSION_SCHEME,
 };
 use myelin_cli::context as cli_context;
 use myelin_cli::device_auth::{
     begin_authorization, new_authorization_request, wait_for_authorization,
 };
 use myelin_cli::dispatch::{
-    chat_dispatch, ci_dispatch, git_dispatch, issues_dispatch_with_context, knowledge_dispatch,
-    notif_dispatch, repo_dispatch, EdgeCall, HttpMethod, RetryPolicy,
+    chat_dispatch, ci_dispatch, git_dispatch, is_canonical_project_id,
+    issues_dispatch_with_context, knowledge_dispatch, notif_dispatch, project_dispatch,
+    repo_dispatch, EdgeCall, HttpMethod, RetryPolicy,
 };
 use myelin_cli::error::CliError;
 use myelin_cli::git_credential::{
@@ -60,6 +61,11 @@ enum Command {
     Context {
         #[command(subcommand)]
         command: ContextCommand,
+    },
+    /// Create, discover, and inspect authorization-scoped projects.
+    Project {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
     },
     /// Show the principal authenticated by the selected credential.
     Whoami,
@@ -181,6 +187,22 @@ async fn run() -> Result<(), CliError> {
                 cli_context::select(cli.json, name.as_deref(), cli.project.as_deref(), &getenv)
             }
         },
+        Command::Project { args } => {
+            let project = resolve_project(
+                cli.project.as_deref(),
+                cli.profile.as_deref(),
+                &getenv,
+                &read_file,
+            )?;
+            let (call, command_key) =
+                dispatch_command(args, |args| project_dispatch(args, project.as_deref()))?;
+            let effect = if call.method == HttpMethod::Post && call.path == "/v1/projects" {
+                ResponseEffect::SelectCreatedProject
+            } else {
+                ResponseEffect::None
+            };
+            run_call_with_effect(&cli, &getenv, &read_file, call, command_key, effect).await
+        }
         Command::Whoami => run_call(&cli, &getenv, &read_file, whoami_call(), None).await,
         Command::Git { args } => {
             let (call, command_key) = dispatch_command(args, git_dispatch)?;
@@ -620,6 +642,31 @@ async fn run_call(
     call: EdgeCall,
     command_key: Option<&str>,
 ) -> Result<(), CliError> {
+    run_call_with_effect(
+        cli,
+        getenv,
+        read_file,
+        call,
+        command_key,
+        ResponseEffect::None,
+    )
+    .await
+}
+
+#[derive(Clone, Copy)]
+enum ResponseEffect {
+    None,
+    SelectCreatedProject,
+}
+
+async fn run_call_with_effect(
+    cli: &Cli,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
+    call: EdgeCall,
+    command_key: Option<&str>,
+    effect: ResponseEffect,
+) -> Result<(), CliError> {
     let idempotency_key = match (cli.idempotency_key.as_deref(), command_key) {
         (Some(_), Some(_)) => return Err(CliError::Usage("duplicate --idempotency-key".into())),
         (top_level, trailing) => top_level.or(trailing),
@@ -663,6 +710,13 @@ async fn run_call(
         }),
         getenv,
     );
+    let context_profile = saved_profile
+        .as_ref()
+        .filter(|profile| {
+            credential.edge_url.as_deref() == Some(profile.edge_url.as_str())
+                && edge.url == profile.edge_url
+        })
+        .map(|profile| profile.name.clone());
     if call.path.starts_with("/v1/ci/runs/") && call.path.ends_with("/log/live") {
         let stdout = std::io::stdout();
         let mut output = stdout.lock();
@@ -676,11 +730,55 @@ async fn run_call(
         .await;
     }
     let value = execute(&edge, &credential.token, &call).await?;
+    let context_message =
+        apply_response_effect(effect, &value, context_profile.as_deref(), getenv)?;
     print!(
         "{}",
         myelin_cli::render::render_for_call(&value, cli.json, &call)
     );
+    if !cli.json {
+        if let Some(message) = context_message {
+            println!("{message}");
+        }
+    }
     Ok(())
+}
+
+fn apply_response_effect(
+    effect: ResponseEffect,
+    value: &serde_json::Value,
+    context_profile: Option<&str>,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, CliError> {
+    match effect {
+        ResponseEffect::None => Ok(None),
+        ResponseEffect::SelectCreatedProject => {
+            let project_id = value
+                .get("project")
+                .and_then(|project| project.get("id"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| is_canonical_project_id(value))
+                .ok_or_else(|| {
+                    CliError::Transport(
+                        "Edge returned a malformed project creation response: id is missing or invalid"
+                            .into(),
+                    )
+                })?;
+            let Some(profile_name) = context_profile else {
+                return Ok(Some(format!(
+                    "To make it the default for a saved context: myelin context use --project {project_id}"
+                )));
+            };
+            set_profile_project(profile_name, project_id, getenv).map_err(|error| {
+                CliError::Config(format!(
+                    "project {project_id} was created, but profile `{profile_name}` could not save it as the default: {error}; run `myelin context use --project {project_id}`"
+                ))
+            })?;
+            Ok(Some(format!(
+                "Default project for `{profile_name}`: {project_id}"
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -725,6 +823,7 @@ mod tests {
         for args in [
             &["myelin", "repo", "list"][..],
             &["myelin", "repo", "pr", "list"][..],
+            &["myelin", "project", "list"][..],
             &["myelin", "issue", "list"][..],
             &["myelin", "inbox", "list"][..],
             &["myelin", "doc", "page", "list"][..],
@@ -761,6 +860,26 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(issue.project.as_deref(), Some(project));
+    }
+
+    #[test]
+    fn successful_project_creation_without_a_saved_context_returns_an_actionable_hint() {
+        let value = serde_json::json!({
+            "project": { "id": "11111111-1111-1111-1111-111111111111" }
+        });
+        let message =
+            apply_response_effect(ResponseEffect::SelectCreatedProject, &value, None, &|_| None)
+                .unwrap()
+                .unwrap();
+        assert!(message.contains("context use --project 11111111-1111-1111-1111-111111111111"));
+
+        assert!(apply_response_effect(
+            ResponseEffect::SelectCreatedProject,
+            &serde_json::json!({"project": {"id": "not-a-uuid"}}),
+            None,
+            &|_| None,
+        )
+        .is_err());
     }
 
     #[test]
