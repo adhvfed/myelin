@@ -19,6 +19,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod import_creation;
+
+use import_creation::{ImportClaim, ImportIdentity};
+pub use import_creation::{ImportIssue, ImportIssueReceipt};
+
 pub const MAX_TITLE_BYTES: usize = 512;
 pub const MAX_PAGE_SIZE: u32 = 100;
 pub const MAX_AUTHORIZED_ISSUE_IDS: usize = 10_000;
@@ -85,6 +90,24 @@ pub struct IssueCreationReceipt {
     pub key: String,
     pub project_id: String,
     pub authorization_request_event_id: String,
+}
+
+struct IssueCreationOutcome {
+    receipt: IssueCreationReceipt,
+    created: bool,
+}
+
+enum CreationOrigin {
+    Interactive,
+    Import(ImportIdentity),
+}
+
+struct CreationTxResult {
+    id: Uuid,
+    key: String,
+    project_id: Uuid,
+    request_event_id: String,
+    created: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,7 +298,25 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         principal: &Principal,
         proposal: CreateIssue,
     ) -> Result<IssueCreationReceipt, IssueStoreError> {
-        self.create_inner(principal, proposal, false).await
+        Ok(self
+            .create_inner(principal, proposal, CreationOrigin::Interactive, false)
+            .await?
+            .receipt)
+    }
+
+    pub async fn import_issue(
+        &self,
+        principal: &Principal,
+        import: ImportIssue,
+    ) -> Result<ImportIssueReceipt, IssueStoreError> {
+        let (identity, issue) = import.into_parts()?;
+        let outcome = self
+            .create_inner(principal, issue, CreationOrigin::Import(identity), false)
+            .await?;
+        Ok(ImportIssueReceipt {
+            issue: outcome.receipt,
+            created: outcome.created,
+        })
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -284,15 +325,35 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         principal: &Principal,
         proposal: CreateIssue,
     ) -> Result<IssueCreationReceipt, IssueStoreError> {
-        self.create_inner(principal, proposal, true).await
+        Ok(self
+            .create_inner(principal, proposal, CreationOrigin::Interactive, true)
+            .await?
+            .receipt)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn import_issue_then_abort_for_test(
+        &self,
+        principal: &Principal,
+        import: ImportIssue,
+    ) -> Result<ImportIssueReceipt, IssueStoreError> {
+        let (identity, issue) = import.into_parts()?;
+        let outcome = self
+            .create_inner(principal, issue, CreationOrigin::Import(identity), true)
+            .await?;
+        Ok(ImportIssueReceipt {
+            issue: outcome.receipt,
+            created: outcome.created,
+        })
     }
 
     async fn create_inner(
         &self,
         principal: &Principal,
         proposal: CreateIssue,
+        origin: CreationOrigin,
         abort_after_outbox: bool,
-    ) -> Result<IssueCreationReceipt, IssueStoreError> {
+    ) -> Result<IssueCreationOutcome, IssueStoreError> {
         let scope = self.scope(principal)?;
         validate_create(&proposal)?;
         if !self.authorizer.may_create(principal, &proposal.project_id) {
@@ -337,10 +398,26 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let request_event_id_text = request_event_id.0.clone();
         let created_event_id_text = created_event_id.0.clone();
 
-        let row = self
+        let result = self
             .provider
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
                 Box::pin(async move {
+                    if let CreationOrigin::Import(identity) = &origin {
+                        match import_creation::claim(&mut *conn, &tenant_id, &region, identity)
+                            .await?
+                        {
+                            ImportClaim::Acquired => {}
+                            ImportClaim::Existing(existing) => {
+                                return Ok(CreationTxResult {
+                                    id: existing.id,
+                                    key: existing.key,
+                                    project_id: existing.project_id,
+                                    request_event_id: existing.request_event_id,
+                                    created: false,
+                                });
+                            }
+                        }
+                    }
                     let row = sqlx::query(
                         "WITH allocated AS (\
                            INSERT INTO prefix_counter (tenant_id, region, prefix, high_water, block_size) \
@@ -395,22 +472,42 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .await
                     .map_err(|e| myelin_storage::PgError::Query(e.to_string()))?;
 
+                    if let CreationOrigin::Import(identity) = &origin {
+                        import_creation::complete(
+                            &mut *conn,
+                            &tenant_id,
+                            &region,
+                            identity,
+                            issue_id,
+                        )
+                        .await?;
+                    }
+
                     PgRelay::co_commit_in_tx(&mut *conn, &aggregate, &request_envelope).await?;
                     if abort_after_outbox {
                         return Err(myelin_storage::PgError::Query(
                             "injected crash after authorization-request outbox stage".into(),
                         ));
                     }
-                    Ok(row)
+                    Ok(CreationTxResult {
+                        id: row.get("id"),
+                        key: row.get("key"),
+                        project_id: row.get("project_id"),
+                        request_event_id: request_event_id_text,
+                        created: true,
+                    })
                 })
             })
             .await
             .map_err(|e| IssueStoreError::Storage(e.to_string()))?;
-        Ok(IssueCreationReceipt {
-            id: row.get::<Uuid, _>("id").to_string(),
-            key: row.get("key"),
-            project_id: row.get::<Uuid, _>("project_id").to_string(),
-            authorization_request_event_id: request_event_id.0,
+        Ok(IssueCreationOutcome {
+            receipt: IssueCreationReceipt {
+                id: result.id.to_string(),
+                key: result.key,
+                project_id: result.project_id.to_string(),
+                authorization_request_event_id: result.request_event_id,
+            },
+            created: result.created,
         })
     }
 

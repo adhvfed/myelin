@@ -76,12 +76,14 @@ pub use migrations::{
     ISSUE_RECENT_LIST_INDEX, ISSUE_RELATION_TABLE, ISSUE_ROADMAP_INDEX, ISSUE_TABLE, MILESTONE_TABLE,
     OUTBOX_TABLE, PREFIX_COUNTER_TABLE, SCHEME_ASSIGNMENT_TABLE, SCHEME_TABLE,
 };
+pub use migrations::{CREATE_IMPORT_MAP_DDL, IMPORT_MAP_TABLE};
 pub use pg_issue_store::{
     is_canonical_request_event_id, CreateIssue, IssueAuthorizationBinding,
     IssueAuthorizationOutcome, IssueAuthorizationState, IssueAuthorizationStatus, IssueAuthorizer,
     IssueCreationReceipt, IssuePage, IssuePageRequest, IssuePermission, IssueStoreError,
     IssueTupleWriter, IssueViewProjectionRevision, PgIssueStore, StoredIssue, VisibleIssues,
 };
+pub use pg_issue_store::{ImportIssue, ImportIssueReceipt};
 
 pub use write_path::{
     apply_mutation, issue_aggregate_key, issue_ref, IssueDraft, MutationKind, WriteError,

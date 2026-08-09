@@ -10,9 +10,9 @@ use myelin_identity::{
 use myelin_identity_service::{StoreBackedCheck, TupleStore};
 use myelin_issues::events::{ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CREATED};
 use myelin_issues::{
-    issues_hot_tables, issues_migrations, CreateIssue, IssueAuthorizationBinding, IssueAuthorizer,
-    IssuePageRequest, IssuePermission, IssueStoreError, IssueTupleWriter, PgIssueStore,
-    VisibleIssues,
+    issues_hot_tables, issues_migrations, CreateIssue, ImportIssue, IssueAuthorizationBinding,
+    IssueAuthorizer, IssuePageRequest, IssuePermission, IssueStoreError, IssueTupleWriter,
+    PgIssueStore, SourceSystem, VisibleIssues,
 };
 use myelin_storage::{
     all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
@@ -32,6 +32,28 @@ fn admin_url() -> String {
 #[derive(Clone)]
 struct RebacAuthorizer {
     identity: Arc<StoreBackedCheck>,
+}
+
+#[derive(Clone)]
+struct AllowAuthorizer;
+
+impl IssueAuthorizer for AllowAuthorizer {
+    fn may_create(&self, _principal: &Principal, _project_id: &str) -> bool {
+        true
+    }
+
+    fn may_access(
+        &self,
+        _principal: &Principal,
+        _issue_id: &str,
+        _permission: IssuePermission,
+    ) -> bool {
+        true
+    }
+
+    fn visible_issues(&self, _principal: &Principal) -> Result<VisibleIssues, String> {
+        Ok(VisibleIssues::effective_issue_view_filter())
+    }
 }
 
 impl RebacAuthorizer {
@@ -219,6 +241,133 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .await
         .expect("admin inspection connection");
 
+    let import_job_id = sqlx::types::Uuid::new_v4().to_string();
+    let imported = ImportIssue {
+        import_job_id: import_job_id.clone(),
+        source: SourceSystem::GitHub,
+        source_id: "github:acme/platform#41".into(),
+        issue: proposal("IMP", "imported exactly once"),
+    };
+    assert!(store
+        .import_issue_then_abort_for_test(&creator, imported.clone())
+        .await
+        .is_err());
+    for (table, count) in [
+        (
+            "issue",
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM issue WHERE tenant_id = $1 AND prefix = 'IMP'",
+            )
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        ),
+        (
+            "import map",
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM import_map WHERE tenant_id = $1 AND import_job = $2::uuid",
+            )
+            .bind(&tenant)
+            .bind(&import_job_id)
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
+        ),
+    ] {
+        assert_eq!(count, 0, "an aborted import left no {table} state");
+    }
+
+    let first_import = store
+        .import_issue(&creator, imported.clone())
+        .await
+        .expect("the import creates its first source record");
+    assert!(first_import.created);
+    let resumed_import = store
+        .import_issue(&creator, imported)
+        .await
+        .expect("resuming the same source record returns its original issue");
+    assert!(!resumed_import.created);
+    assert_eq!(resumed_import.issue, first_import.issue);
+
+    let map = sqlx::query(
+        "SELECT status, source, source_id, myelin_id::text AS myelin_id \
+         FROM import_map WHERE tenant_id = $1 AND import_job = $2::uuid",
+    )
+    .bind(&tenant)
+    .bind(&import_job_id)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(map.get::<String, _>("status"), "created");
+    assert_eq!(map.get::<String, _>("source"), "github");
+    assert_eq!(map.get::<String, _>("source_id"), "github:acme/platform#41");
+    assert_eq!(map.get::<String, _>("myelin_id"), first_import.issue.id);
+    let imported_issue_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM issue WHERE tenant_id = $1 AND prefix = 'IMP'")
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(imported_issue_count, 1);
+    let imported_request_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM outbox WHERE envelope->>'tenant' = $1 \
+         AND envelope->>'type_' = $2 AND aggregate = $3",
+    )
+    .bind(&tenant)
+    .bind(ISSUE_AUTHORIZATION_REQUESTED)
+    .bind(format!("issue:{}", first_import.issue.id))
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(imported_request_count, 1);
+    store
+        .reconcile_authorization(&worker, &first_import.issue.id, &writer)
+        .await
+        .expect("the ordinary authorization saga activates an imported issue");
+
+    let raced_import = ImportIssue {
+        import_job_id: import_job_id.clone(),
+        source: SourceSystem::GitHub,
+        source_id: "github:acme/platform#42".into(),
+        issue: proposal("IRC", "concurrent import converges"),
+    };
+    let race_store = PgIssueStore::new(provider.clone(), kms.clone(), AllowAuthorizer);
+    let mut import_joins = Vec::new();
+    for _ in 0..8 {
+        let store = race_store.clone();
+        let creator = creator.clone();
+        let raced_import = raced_import.clone();
+        import_joins.push(tokio::spawn(async move {
+            store.import_issue(&creator, raced_import).await
+        }));
+    }
+    let mut imported_receipts = Vec::new();
+    let mut import_winners = 0;
+    for join in import_joins {
+        let outcome = join.await.unwrap().expect("concurrent import retry");
+        import_winners += usize::from(outcome.created);
+        imported_receipts.push(outcome.issue);
+    }
+    assert_eq!(import_winners, 1, "one source record creates one issue");
+    assert!(
+        imported_receipts
+            .iter()
+            .all(|receipt| receipt == &imported_receipts[0]),
+        "every concurrent retry receives the original creation receipt"
+    );
+    store
+        .reconcile_authorization(&worker, &imported_receipts[0].id, &writer)
+        .await
+        .expect("the concurrent import winner follows the ordinary authorization saga");
+    let raced_import_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM issue WHERE tenant_id = $1 AND prefix = 'IRC'")
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(raced_import_count, 1);
+
     assert!(store
         .create_then_abort_for_test(&creator, proposal("RBK", "must roll back"))
         .await
@@ -226,16 +375,20 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     for (table, count) in [
         (
             "issue",
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM issue WHERE tenant_id = $1")
-                .bind(&tenant)
-                .fetch_one(&admin)
-                .await
-                .unwrap(),
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM issue WHERE tenant_id = $1 AND prefix = 'RBK'",
+            )
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap(),
         ),
         (
             "binding",
             sqlx::query_scalar::<_, i64>(
-                "SELECT count(*) FROM issue_authz_binding WHERE tenant_id = $1",
+                "SELECT count(*) FROM issue_authz_binding b JOIN issue i \
+                 ON i.tenant_id = b.tenant_id AND i.id = b.issue_id \
+                 WHERE b.tenant_id = $1 AND i.prefix = 'RBK'",
             )
             .bind(&tenant)
             .fetch_one(&admin)
@@ -456,12 +609,14 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .contains(&legacy_id.to_string()));
 
     for statement in [
+        "DELETE FROM import_map WHERE tenant_id = $1",
         "DELETE FROM issue_authz_binding WHERE tenant_id = $1",
         "DELETE FROM issue WHERE tenant_id = $1",
         "DELETE FROM prefix_counter WHERE tenant_id = $1",
         "DELETE FROM rebac_tuple WHERE tenant_id = $1",
         "DELETE FROM issue_authz_visible WHERE tenant_id = $1",
         "DELETE FROM authz_projection_state WHERE tenant_id = $1",
+        "DELETE FROM outbox_quarantine WHERE event_id IN (SELECT event_id FROM outbox WHERE envelope->>'tenant' = $1)",
         "DELETE FROM outbox WHERE envelope->>'tenant' = $1",
     ] {
         sqlx::query(statement)
