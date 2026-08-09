@@ -5,8 +5,8 @@ use serde_json::{json, Value};
 
 use crate::governance::{CallOutcome, GovernedRouter, ReadAuthorization};
 use crate::protocol::{
-    error_response, parse_request, success, RpcError, GOVERNANCE_NOT_WIRED, INVALID_PARAMS,
-    INVALID_REQUEST, METHOD_NOT_FOUND,
+    error_response, parse_request, success, RpcError, AUTHORIZATION_REFUSED, GOVERNANCE_NOT_WIRED,
+    INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
 };
 use crate::registry::ToolRegistry;
 use myelin_agent::EffectKind;
@@ -120,7 +120,10 @@ impl McpServer {
         }
         let response = match req.method.as_str() {
             "initialize" => success(req.id, self.initialize_result()),
-            "tools/list" => success(req.id, self.registry.list_result()),
+            "tools/list" => match self.tools_list() {
+                Ok(result) => success(req.id, result),
+                Err(err) => error_response(req.id, err),
+            },
             "tools/call" => match self.tools_call(&req.params) {
                 Ok(result) => success(req.id, result),
                 Err(err) => error_response(req.id, err),
@@ -184,6 +187,22 @@ impl McpServer {
             "capabilities": { "tools": { "listChanged": false } },
             "serverInfo": { "name": "myelin-mcp", "version": env!("CARGO_PKG_VERSION") }
         })
+    }
+
+    fn tools_list(&self) -> Result<Value, RpcError> {
+        let Some(router) = &self.router else {
+            return Ok(self.registry.list_result());
+        };
+        if router.is_fatal() {
+            return Err(RpcError::new(
+                AUTHORIZATION_REFUSED,
+                "governed session is terminal after an indeterminate mutation outcome",
+            ));
+        }
+        let permitted = router
+            .permitted_tool_names(&self.registry, &(self.clock)())
+            .map_err(|reason| RpcError::new(AUTHORIZATION_REFUSED, reason))?;
+        Ok(self.registry.list_result_for(&permitted))
     }
 
     fn tools_call(&self, params: &Value) -> Result<Value, RpcError> {

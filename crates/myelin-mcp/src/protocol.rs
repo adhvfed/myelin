@@ -7,6 +7,7 @@ pub const INVALID_REQUEST: i64 = -32600;
 pub const METHOD_NOT_FOUND: i64 = -32601;
 pub const INVALID_PARAMS: i64 = -32602;
 pub const INTERNAL_ERROR: i64 = -32603;
+pub const AUTHORIZATION_REFUSED: i64 = -32001;
 pub const GOVERNANCE_NOT_WIRED: i64 = -32004;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,7 +27,11 @@ pub struct RpcError {
 
 impl RpcError {
     pub fn new(code: i64, message: impl Into<String>) -> RpcError {
-        RpcError { code, message: message.into(), data: None }
+        RpcError {
+            code,
+            message: message.into(),
+            data: None,
+        }
     }
 
     pub fn with_data(mut self, data: Value) -> RpcError {
@@ -39,7 +44,10 @@ pub fn parse_request(line: &str) -> Result<Request, (Value, RpcError)> {
     let value: Value = match serde_json::from_str(line) {
         Ok(v) => v,
         Err(e) => {
-            return Err((Value::Null, RpcError::new(PARSE_ERROR, format!("parse error: {e}"))));
+            return Err((
+                Value::Null,
+                RpcError::new(PARSE_ERROR, format!("parse error: {e}")),
+            ));
         }
     };
 
@@ -48,18 +56,31 @@ pub fn parse_request(line: &str) -> Result<Request, (Value, RpcError)> {
 
     if let Some(v) = value.get("jsonrpc") {
         if v.as_str() != Some(JSONRPC_VERSION) {
-            return Err((id, RpcError::new(INVALID_REQUEST, "jsonrpc version must be \"2.0\"")));
+            return Err((
+                id,
+                RpcError::new(INVALID_REQUEST, "jsonrpc version must be \"2.0\""),
+            ));
         }
     }
 
     let method = match value.get("method").and_then(Value::as_str) {
         Some(m) => m.to_string(),
-        None => return Err((id, RpcError::new(INVALID_REQUEST, "missing or non-string `method`"))),
+        None => {
+            return Err((
+                id,
+                RpcError::new(INVALID_REQUEST, "missing or non-string `method`"),
+            ))
+        }
     };
 
     let params = value.get("params").cloned().unwrap_or(Value::Null);
 
-    Ok(Request { id, method, params, is_notification: !id_present, })
+    Ok(Request {
+        id,
+        method,
+        params,
+        is_notification: !id_present,
+    })
 }
 
 pub fn success(id: Value, result: Value) -> Value {
@@ -105,7 +126,11 @@ mod tests {
     #[test]
     fn missing_method_is_invalid_request_with_recovered_id() {
         let (id, err) = parse_request(r#"{"jsonrpc":"2.0","id":7}"#).unwrap_err();
-        assert_eq!(id, json!(7), "the id is recovered so the peer can correlate the error");
+        assert_eq!(
+            id,
+            json!(7),
+            "the id is recovered so the peer can correlate the error"
+        );
         assert_eq!(err.code, INVALID_REQUEST);
     }
 

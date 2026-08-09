@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use myelin_agent::{EffectApi, EffectAuthority, EffectResult, ProposedEffect, RunCtx};
@@ -19,7 +20,7 @@ use myelin_storage::hitl_gate_durable::{
 };
 use myelin_storage::{ContentHash, TenantScope};
 
-use crate::registry::RegisteredTool;
+use crate::registry::{RegisteredTool, ToolRegistry};
 
 pub struct RunPrincipal {
     pub scope: TenantScope,
@@ -297,6 +298,29 @@ impl GovernedRouter {
 
     pub fn audit(&self) -> Vec<AuditEntry> {
         self.state.borrow().audit.clone()
+    }
+
+    pub fn permitted_tool_names(
+        &self,
+        registry: &ToolRegistry,
+        now: &Timestamp,
+    ) -> Result<BTreeSet<String>, String> {
+        let token = self.ensure_run_token(now)?;
+        if !self.minter.is_live(&self.principal.scope, &token, now) {
+            return Err("run token is revoked or expired; tool discovery is denied".into());
+        }
+
+        let state = self.state.borrow();
+        Ok(registry
+            .tools()
+            .iter()
+            .filter(|tool| {
+                tool.required_caps()
+                    .into_iter()
+                    .all(|cap| state.effective_grants.contains(cap))
+            })
+            .map(|tool| tool.name().to_string())
+            .collect())
     }
 
     fn ensure_run_token(&self, now: &Timestamp) -> Result<RunToken, String> {

@@ -1,7 +1,7 @@
 use myelin_agent::{EffectKind, ToolDef};
 use myelin_git::api::AgentToolDef;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 #[derive(Clone, Debug)]
 enum ToolSource {
@@ -202,6 +202,17 @@ impl ToolRegistry {
 
     pub fn list_result(&self) -> Value {
         json!({ "tools": self.tools.iter().map(RegisteredTool::to_mcp_json).collect::<Vec<_>>() })
+    }
+
+    pub fn list_result_for(&self, permitted_names: &BTreeSet<String>) -> Value {
+        json!({
+            "tools": self
+                .tools
+                .iter()
+                .filter(|tool| permitted_names.contains(tool.name()))
+                .map(RegisteredTool::to_mcp_json)
+                .collect::<Vec<_>>()
+        })
     }
 }
 

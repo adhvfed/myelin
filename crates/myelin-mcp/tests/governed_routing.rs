@@ -356,6 +356,65 @@ fn handshake_and_tools_list_over_the_running_protocol() {
 }
 
 #[test]
+fn tools_list_is_the_exact_delegation_scoped_subset() {
+    let grants = ["repo.push", "run.view"];
+    let router = governed_router_with_input(DelegationInput {
+        agent_policy: Authority::of(grants),
+        delegation: Authority::of(grants),
+        tenant_policy: Authority::of(grants),
+        trigger_actor_held: Authority::of(grants),
+    });
+    let server = McpServer::with_router_reads_and_clock(
+        ToolRegistry::with_git_and_ci_reads().unwrap(),
+        router,
+        Arc::new(RecordingReadExecutor {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(now),
+    );
+
+    let listed = drive(
+        &server,
+        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#],
+    );
+    let names = listed[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+
+    assert_eq!(names, ["git.open_pr", "ci.read_log", "ci.read_run"]);
+    assert!(
+        server.router().unwrap().current_token().is_some(),
+        "discovery itself belongs to an attributed per-run identity"
+    );
+}
+
+#[test]
+fn tools_list_refuses_an_expired_trigger_before_disclosing_the_catalogue() {
+    let grants = ["repo.push"];
+    let router = governed_router_with_trigger(
+        DelegationInput {
+            agent_policy: Authority::of(grants),
+            delegation: Authority::of(grants),
+            tenant_policy: Authority::of(grants),
+            trigger_actor_held: Authority::of(grants),
+        },
+        "expired-trigger",
+        1,
+    );
+    let server = McpServer::with_router_and_clock(ToolRegistry::with_git(), router, Arc::new(now));
+
+    let response = drive(
+        &server,
+        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#],
+    );
+    assert_eq!(response[0]["error"]["code"], -32001);
+    assert!(response[0].get("result").is_none());
+}
+
+#[test]
 fn ci_read_projects_shared_schema_and_routes_directly_without_idempotency() {
     let recorder = Arc::new(RecordingReadExecutor {
         calls: AtomicUsize::new(0),
