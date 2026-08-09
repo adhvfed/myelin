@@ -5,6 +5,8 @@ use myelin_git::web::RepoListCursor;
 use serde_json::Value;
 use std::fmt::Write as _;
 
+mod collaboration;
+
 fn terminal_safe_single_line(value: &str) -> String {
     let mut safe = String::with_capacity(value.len());
     for character in value.chars() {
@@ -46,8 +48,11 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     if is_ci_run_detail(value) {
         return render_ci_run_detail(value);
     }
+    if let Some(rendered) = collaboration::render_response(value) {
+        return rendered;
+    }
     if let Some(items) = value.get("items").and_then(Value::as_array) {
-        let mut out = String::new();
+        let mut out = collaboration::render_collection_header(value).unwrap_or_default();
         if items.is_empty() {
             out.push_str("(no items)\n");
         }
@@ -60,7 +65,9 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
             .and_then(|p| p.get("next_cursor"))
             .and_then(Value::as_str)
         {
-            if let Some(command) = call.and_then(|call| ci_page_command(call, cursor)) {
+            if let Some(command) = call.and_then(|call| {
+                collaboration::page_command(call, cursor).or_else(|| ci_page_command(call, cursor))
+            }) {
                 out.push_str(&format!("… (more - run: {command})\n"));
             } else if RepoListCursor::parse(cursor).is_ok() {
                 let cursor = terminal_safe_single_line(cursor);
@@ -131,6 +138,9 @@ fn render_item(item: &Value) -> String {
     }
     if is_notification(item) {
         return render_notification(item);
+    }
+    if let Some(rendered) = collaboration::render_item(item) {
+        return rendered;
     }
     if let Some(slug) = item.get("slug").and_then(Value::as_str) {
         let state = item.get("state").and_then(Value::as_str).unwrap_or("?");

@@ -72,7 +72,7 @@ struct CreatePageBody {
     title: String,
     template: String,
     visibility: String,
-    client_nonce: String,
+    client_nonce: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -139,7 +139,11 @@ impl Handler for PageCreateHandler {
         require_empty_query(ctx)?;
         let body: CreatePageBody = parse_body(&ctx.request.body)?;
         validate_title(&body.title)?;
-        validate_nonce(&body.client_nonce)?;
+        let client_nonce = client_nonce(
+            ctx.request,
+            &ctx.principal.principal_id.0,
+            body.client_nonce.as_deref(),
+        )?;
         let visibility = parse_visibility(&body.visibility)?;
         let template = template_blocks(&body.template)?;
         let page_id = self.api.mint_id();
@@ -180,7 +184,7 @@ impl Handler for PageCreateHandler {
             title,
             owner: viewer.clone(),
             visibility,
-            client_nonce: body.client_nonce,
+            client_nonce,
             blocks,
         };
         let (stored_id, created) = self.api.drive(self.api.store.create(
@@ -506,6 +510,20 @@ fn validate_nonce(value: &str) -> Result<(), EdgeError> {
         Err(EdgeError::BadRequest(
             "Knowledge client_nonce must be 1-128 URL-safe characters".into(),
         ))
+    }
+}
+
+fn client_nonce(
+    request: &crate::request::EdgeRequest,
+    principal_id: &str,
+    explicit: Option<&str>,
+) -> Result<String, EdgeError> {
+    match explicit {
+        Some(value) => {
+            validate_nonce(value)?;
+            Ok(value.to_string())
+        }
+        None => request.stable_idempotency_nonce(principal_id),
     }
 }
 

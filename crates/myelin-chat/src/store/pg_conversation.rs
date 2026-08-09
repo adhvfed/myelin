@@ -13,6 +13,7 @@ use crate::store::ConversationId;
 pub const CONVERSATION_TABLE: &str = "chat_conversation";
 pub const MESSAGE_TABLE: &str = "chat_message";
 pub const CONVERSATION_RECENT_INDEX: &str = "chat_conversation_recent";
+pub const CONVERSATION_CLIENT_NONCE_INDEX: &str = "chat_conversation_client_nonce";
 
 pub const CONVERSATION_TABLE_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS chat_conversation (
@@ -77,7 +78,7 @@ impl PgConversationStore {
             .begin()
             .await
             .map_err(storage("begin conversation create"))?;
-        if insert_conversation(&mut tx, conversation).await? == 0 {
+        if insert_conversation(&mut tx, conversation, None).await? == 0 {
             return Err(ConversationError::AlreadyExists(
                 conversation.id.conversation_id.clone(),
             ));
@@ -91,6 +92,7 @@ impl PgConversationStore {
     pub async fn create_co_commit(
         &self,
         conversation: &Conversation,
+        client_nonce: &str,
         event_id: EventId,
         actor: Actor,
         occurred: Timestamp,
@@ -142,7 +144,7 @@ impl PgConversationStore {
             .begin()
             .await
             .map_err(storage("begin conversation co-commit"))?;
-        let result = insert_conversation(&mut tx, conversation).await?;
+        let result = insert_conversation(&mut tx, conversation, Some(client_nonce)).await?;
         if result == 0 {
             return Err(ConversationError::AlreadyExists(
                 conversation.id.conversation_id.clone(),
@@ -185,6 +187,64 @@ impl PgConversationStore {
         row_to_conversation(&row)
     }
 
+    pub async fn find_public_by_name_topic(
+        &self,
+        tenant: &str,
+        region: &str,
+        name: &str,
+        topic: &str,
+    ) -> Result<Option<Conversation>, ConversationError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(storage("acquire conversation connection"))?;
+        self.set_session_scope(&mut conn, tenant, region).await?;
+        let row = sqlx::query(
+            "SELECT tenant_id, region, conversation_id, kind, home_cell, parent_project, name,
+                    topic, linked_ref, pinned_canvas, retention_days, archived, created_by, acl_zookie
+               FROM chat_conversation
+              WHERE tenant_id = $1 AND region = $2 AND kind = 'channel_public' AND NOT archived
+                AND name = $3 AND topic = $4",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(name)
+        .bind(topic)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(storage("find public conversation by name and topic"))?;
+        row.as_ref().map(row_to_conversation).transpose()
+    }
+
+    pub async fn find_public_by_client_nonce(
+        &self,
+        tenant: &str,
+        region: &str,
+        client_nonce: &str,
+    ) -> Result<Option<Conversation>, ConversationError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(storage("acquire conversation connection"))?;
+        self.set_session_scope(&mut conn, tenant, region).await?;
+        let row = sqlx::query(
+            "SELECT tenant_id, region, conversation_id, kind, home_cell, parent_project, name,
+                    topic, linked_ref, pinned_canvas, retention_days, archived, created_by, acl_zookie
+               FROM chat_conversation
+              WHERE tenant_id = $1 AND region = $2 AND kind = 'channel_public' AND NOT archived
+                AND client_nonce = $3",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(client_nonce)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(storage("find public conversation by client nonce"))?;
+        row.as_ref().map(row_to_conversation).transpose()
+    }
+
     pub async fn list_public(
         &self,
         tenant: &str,
@@ -225,12 +285,13 @@ impl PgConversationStore {
 async fn insert_conversation(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     conversation: &Conversation,
+    client_nonce: Option<&str>,
 ) -> Result<u64, ConversationError> {
     let result = sqlx::query(
         "INSERT INTO chat_conversation (
            tenant_id, region, conversation_id, kind, home_cell, parent_project, name, topic,
-           linked_ref, pinned_canvas, retention_days, archived, created_by, acl_zookie
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+           linked_ref, pinned_canvas, retention_days, archived, created_by, acl_zookie, client_nonce
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
          ON CONFLICT DO NOTHING",
     )
     .bind(&conversation.id.tenant)
@@ -247,6 +308,7 @@ async fn insert_conversation(
     .bind(conversation.archived)
     .bind(&conversation.created_by)
     .bind(&conversation.acl_zookie)
+    .bind(client_nonce)
     .execute(&mut **tx)
     .await
     .map_err(storage("insert conversation"))?;
@@ -323,9 +385,23 @@ pub fn chat_migrations() -> myelin_substrate::Migrations {
         format!("{message_ddl}\nSELECT myelin_make_tenant_scoped('{MESSAGE_TABLE}');")
             .into_boxed_str(),
     );
+    let conversation_client_nonce = Box::leak(
+        format!(
+            "ALTER TABLE {CONVERSATION_TABLE} ADD COLUMN IF NOT EXISTS client_nonce text;
+             CREATE UNIQUE INDEX IF NOT EXISTS {CONVERSATION_CLIENT_NONCE_INDEX}
+               ON {CONVERSATION_TABLE} (tenant_id, region, client_nonce)
+               WHERE client_nonce IS NOT NULL;"
+        )
+        .into_boxed_str(),
+    );
     Migrations::of([
         Migration::plain_on("chat_0001_conversation", conversation, CONVERSATION_TABLE),
         Migration::plain_on("chat_0002_message", message, MESSAGE_TABLE),
+        Migration::plain_on(
+            "chat_0003_conversation_client_nonce",
+            conversation_client_nonce,
+            CONVERSATION_TABLE,
+        ),
     ])
 }
 
@@ -336,8 +412,11 @@ mod tests {
     #[test]
     fn migrations_create_and_tenant_scope_both_tables() {
         let migrations = chat_migrations();
-        assert_eq!(migrations.0.len(), 2);
-        for (migration, table) in migrations.0.iter().zip([CONVERSATION_TABLE, MESSAGE_TABLE]) {
+        assert_eq!(migrations.0.len(), 3);
+        for (migration, table) in migrations.0[..2]
+            .iter()
+            .zip([CONVERSATION_TABLE, MESSAGE_TABLE])
+        {
             assert!(migration
                 .ddl
                 .contains(&format!("CREATE TABLE IF NOT EXISTS {table}")));
@@ -346,6 +425,9 @@ mod tests {
                 .contains(&format!("myelin_make_tenant_scoped('{table}')")));
         }
         assert!(migrations.0[0].ddl.contains(CONVERSATION_RECENT_INDEX));
+        assert!(migrations.0[2]
+            .ddl
+            .contains(CONVERSATION_CLIENT_NONCE_INDEX));
     }
 
     #[test]

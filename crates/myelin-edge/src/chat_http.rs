@@ -78,6 +78,72 @@ impl DurableChatApi {
         }
         Ok(conversation)
     }
+
+    async fn create_public_conversation(
+        &self,
+        conversation: Conversation,
+        client_nonce: &str,
+        event_id: EventId,
+        actor: Actor,
+        now: Timestamp,
+    ) -> Result<(Conversation, bool), EdgeError> {
+        match self
+            .conversations
+            .create_co_commit(
+                &conversation,
+                client_nonce,
+                event_id,
+                actor,
+                now.clone(),
+                now,
+            )
+            .await
+        {
+            Ok(()) => Ok((conversation, true)),
+            Err(ConversationError::AlreadyExists(_)) => {
+                if let Some(existing) = self
+                    .conversations
+                    .find_public_by_client_nonce(
+                        &conversation.id.tenant,
+                        &conversation.id.region,
+                        client_nonce,
+                    )
+                    .await
+                    .map_err(map_conversation_error)?
+                {
+                    if same_public_topic(&existing, &conversation) {
+                        return Ok((existing, false));
+                    }
+                    return Err(EdgeError::Conflict(
+                        "that idempotency key was already used for a different Chat conversation"
+                            .into(),
+                    ));
+                }
+                self.conversations
+                    .find_public_by_name_topic(
+                        &conversation.id.tenant,
+                        &conversation.id.region,
+                        conversation
+                            .name
+                            .as_deref()
+                            .expect("validated public channel"),
+                        conversation
+                            .topic
+                            .as_deref()
+                            .expect("validated public topic"),
+                    )
+                    .await
+                    .map_err(map_conversation_error)?
+                    .map(|existing| (existing, false))
+                    .ok_or_else(|| {
+                        EdgeError::Conflict(
+                            "a topic with that channel and name already exists".into(),
+                        )
+                    })
+            }
+            Err(error) => Err(map_conversation_error(error)),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -91,7 +157,7 @@ struct CreateConversationBody {
 #[serde(deny_unknown_fields)]
 struct PostMessageBody {
     content: String,
-    client_nonce: String,
+    client_nonce: Option<String>,
 }
 
 struct ConversationListHandler {
@@ -136,6 +202,9 @@ impl Handler for ConversationCreateHandler {
         let body: CreateConversationBody = parse_body(&ctx.request.body)?;
         validate_label("channel", &body.channel)?;
         validate_label("topic", &body.topic)?;
+        let client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
         let opaque_id = self.api.object_ids.mint();
         let event_id = EventId(self.api.event_ids.mint().0);
         let event_principal = pseudonymized_event_principal(&ctx.principal.tenant.0, ctx.principal);
@@ -156,21 +225,15 @@ impl Handler for ConversationCreateHandler {
             acl_zookie: None,
         };
         let now = now_timestamp();
-        self.api.drive(async {
-            self.api
-                .conversations
-                .create_co_commit(
-                    &conversation,
-                    event_id,
-                    Actor(event_principal),
-                    now.clone(),
-                    now,
-                )
-                .await
-                .map_err(map_conversation_error)
-        })?;
+        let (conversation, created) = self.api.drive(self.api.create_public_conversation(
+            conversation,
+            &client_nonce,
+            event_id,
+            Actor(event_principal),
+            now,
+        ))?;
         Ok(no_store(EdgeResponse::json(
-            201,
+            if created { 201 } else { 200 },
             &json!({ "conversation": conversation_json(&conversation), "durable": true }),
         )))
     }
@@ -231,7 +294,11 @@ impl Handler for MessagePostHandler {
         let conversation_id = conversation_param(ctx)?.to_string();
         let body: PostMessageBody = parse_body(&ctx.request.body)?;
         validate_message(&body.content)?;
-        validate_nonce(&body.client_nonce)?;
+        let client_nonce = client_nonce(
+            ctx.request,
+            &ctx.principal.principal_id.0,
+            body.client_nonce.as_deref(),
+        )?;
         let conversation = self.api.drive(
             self.api
                 .public_conversation(ctx.principal, &conversation_id),
@@ -254,7 +321,7 @@ impl Handler for MessagePostHandler {
                 body.content.as_bytes(),
             )?,
             body_nodes: b"[]".to_vec(),
-            client_nonce: body.client_nonce,
+            client_nonce,
         };
         let now = now_timestamp();
         let message_id = self.api.drive(async {
@@ -449,6 +516,20 @@ fn validate_nonce(value: &str) -> Result<(), EdgeError> {
     Ok(())
 }
 
+fn client_nonce(
+    request: &crate::request::EdgeRequest,
+    principal_id: &str,
+    explicit: Option<&str>,
+) -> Result<String, EdgeError> {
+    match explicit {
+        Some(value) => {
+            validate_nonce(value)?;
+            Ok(value.to_string())
+        }
+        None => request.stable_idempotency_nonce(principal_id),
+    }
+}
+
 fn require_empty_query(ctx: &HandlerCtx<'_>) -> Result<(), EdgeError> {
     if ctx.request.query.is_empty() {
         Ok(())
@@ -467,6 +548,10 @@ fn conversation_json(conversation: &Conversation) -> Value {
         "linked_ref": conversation.linked_ref,
         "pinned_canvas": conversation.pinned_canvas,
     })
+}
+
+fn same_public_topic(left: &Conversation, right: &Conversation) -> bool {
+    left.name == right.name && left.topic == right.topic
 }
 
 fn message_json(message: &Message, viewer: &str, kms: &KmsEngine) -> Result<Value, EdgeError> {
@@ -581,5 +666,24 @@ mod tests {
         assert!(validate_message("bad\0message").is_err());
         assert!(validate_nonce("01J-client_nonce").is_ok());
         assert!(validate_nonce("spaces are not stable").is_err());
+    }
+
+    #[test]
+    fn message_nonce_accepts_the_legacy_body_field_or_one_public_retry_key() {
+        let request = crate::request::EdgeRequest::new(
+            "POST",
+            "/v1/chat/conversations/01J00000000000000000000000/messages",
+            "",
+            vec![("idempotency-key".into(), "send-42".into())],
+            Vec::new(),
+        );
+        assert_eq!(
+            client_nonce(&request, "svc:agent", Some("legacy-42")).unwrap(),
+            "legacy-42"
+        );
+        assert_eq!(
+            client_nonce(&request, "svc:agent", None).unwrap(),
+            request.stable_idempotency_nonce("svc:agent").unwrap()
+        );
     }
 }

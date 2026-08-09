@@ -2,7 +2,8 @@ use clap::{Parser, Subcommand};
 use myelin_cli::client::execute;
 use myelin_cli::config::{self, resolve_edge, resolve_token, store_token};
 use myelin_cli::dispatch::{
-    ci_dispatch, git_dispatch, issues_dispatch, notif_dispatch, EdgeCall, HttpMethod,
+    chat_dispatch, ci_dispatch, git_dispatch, issues_dispatch, knowledge_dispatch, notif_dispatch,
+    EdgeCall, HttpMethod,
 };
 use myelin_cli::error::CliError;
 
@@ -36,6 +37,15 @@ enum Command {
         args: Vec<String>,
     },
     Ci {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    Chat {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    #[command(name = "kb", visible_aliases = ["doc", "knowledge"])]
+    Knowledge {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -92,29 +102,63 @@ async fn run() -> Result<(), CliError> {
                 payload: None,
                 idempotency_key: None,
             };
-            run_call(&cli, &getenv, &read_file, call).await
+            run_call(&cli, &getenv, &read_file, call, None).await
         }
         Command::Git { args } => {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let call = git_dispatch(&refs)?;
-            run_call(&cli, &getenv, &read_file, call).await
+            let (call, command_key) = dispatch_command(args, git_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Issues { args } => {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let call = issues_dispatch(&refs)?;
-            run_call(&cli, &getenv, &read_file, call).await
+            let (call, command_key) = dispatch_command(args, issues_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Ci { args } => {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let call = ci_dispatch(&refs)?;
-            run_call(&cli, &getenv, &read_file, call).await
+            let (call, command_key) = dispatch_command(args, ci_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
+        }
+        Command::Chat { args } => {
+            let (call, command_key) = dispatch_command(args, chat_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
+        }
+        Command::Knowledge { args } => {
+            let (call, command_key) = dispatch_command(args, knowledge_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Notif { args } => {
-            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            let call = notif_dispatch(&refs)?;
-            run_call(&cli, &getenv, &read_file, call).await
+            let (call, command_key) = dispatch_command(args, notif_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
         }
     }
+}
+
+fn dispatch_command(
+    args: &[String],
+    dispatch: impl FnOnce(&[&str]) -> Result<EdgeCall, CliError>,
+) -> Result<(EdgeCall, Option<&str>), CliError> {
+    let mut command_args = Vec::with_capacity(args.len());
+    let mut idempotency_key = None;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        if argument == "--idempotency-key" {
+            let value = args.get(index + 1).ok_or_else(|| {
+                CliError::Usage("--idempotency-key needs a retry-stable value".into())
+            })?;
+            if idempotency_key.replace(value.as_str()).is_some() {
+                return Err(CliError::Usage("duplicate --idempotency-key".into()));
+            }
+            index += 2;
+        } else if let Some(value) = argument.strip_prefix("--idempotency-key=") {
+            if idempotency_key.replace(value).is_some() {
+                return Err(CliError::Usage("duplicate --idempotency-key".into()));
+            }
+            index += 1;
+        } else {
+            command_args.push(argument);
+            index += 1;
+        }
+    }
+    Ok((dispatch(&command_args)?, idempotency_key))
 }
 
 async fn run_call(
@@ -122,12 +166,15 @@ async fn run_call(
     getenv: &dyn Fn(&str) -> Option<String>,
     read_file: &dyn Fn(&std::path::Path) -> Option<String>,
     call: EdgeCall,
+    command_key: Option<&str>,
 ) -> Result<(), CliError> {
-    let edge = resolve_edge(cli.edge.as_deref(), cli.scheme.as_deref(), getenv);
-    let token = resolve_token(cli.token.as_deref(), getenv, read_file)?;
+    let idempotency_key = match (cli.idempotency_key.as_deref(), command_key) {
+        (Some(_), Some(_)) => return Err(CliError::Usage("duplicate --idempotency-key".into())),
+        (top_level, trailing) => top_level.or(trailing),
+    };
     let call = match call.method {
         HttpMethod::Post => {
-            let key = cli.idempotency_key.as_deref().ok_or_else(|| {
+            let key = idempotency_key.ok_or_else(|| {
                 CliError::Usage(
                     "mutating commands require --idempotency-key <key>; reuse the same key when \
                      retrying after a lost response"
@@ -137,7 +184,7 @@ async fn run_call(
             call.with_idempotency_key(key)?
         }
         HttpMethod::Get => {
-            if cli.idempotency_key.is_some() {
+            if idempotency_key.is_some() {
                 return Err(CliError::Usage(
                     "--idempotency-key applies only to mutating commands".into(),
                 ));
@@ -145,6 +192,8 @@ async fn run_call(
             call
         }
     };
+    let edge = resolve_edge(cli.edge.as_deref(), cli.scheme.as_deref(), getenv);
+    let token = resolve_token(cli.token.as_deref(), getenv, read_file)?;
     if call.path.starts_with("/v1/ci/runs/") && call.path.ends_with("/log/live") {
         let stdout = std::io::stdout();
         let mut output = stdout.lock();
@@ -157,4 +206,42 @@ async fn run_call(
         myelin_cli::render::render_for_call(&value, cli.json, &call)
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delegated_grammars_accept_a_retry_key_in_the_natural_trailing_position() {
+        let args = [
+            "create".into(),
+            "engineering".into(),
+            "--topic".into(),
+            "Release".into(),
+            "--idempotency-key".into(),
+            "release-room".into(),
+        ];
+        let (call, key) = dispatch_command(&args, chat_dispatch).unwrap();
+        assert_eq!(call.path, "/v1/chat/conversations");
+        assert_eq!(key, Some("release-room"));
+    }
+
+    #[test]
+    fn delegated_grammars_reject_missing_and_duplicate_retry_keys() {
+        for args in [
+            vec!["list".into(), "--idempotency-key".into()],
+            vec![
+                "list".into(),
+                "--idempotency-key=one".into(),
+                "--idempotency-key".into(),
+                "two".into(),
+            ],
+        ] {
+            assert_eq!(
+                dispatch_command(&args, chat_dispatch).unwrap_err().code(),
+                2
+            );
+        }
+    }
 }

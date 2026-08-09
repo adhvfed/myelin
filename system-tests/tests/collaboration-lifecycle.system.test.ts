@@ -10,9 +10,12 @@ import { systemTestConfig } from "../src/config.js";
 describe("collaboration lifecycle", () => {
   test("creates a public conversation and exchanges durable messages", async () => {
     const channel = uniqueName("system-chat");
+    const topic = "Coordinate the externally tested release";
+    const conversationRetryKey = `conversation-${randomUUID()}`;
     const created = await systemClient.json("/v1/chat/conversations", {
       method: "POST",
-      body: { channel, topic: "Coordinate the externally tested release" },
+      body: { channel, topic },
+      idempotencyKey: conversationRetryKey,
       expectedStatus: 201,
     });
     const conversation = record(created.body.conversation, "created conversation");
@@ -20,20 +23,40 @@ describe("collaboration lifecycle", () => {
     expect(created.body).toMatchObject({ durable: true });
     expect(conversation).toMatchObject({
       channel,
-      topic: "Coordinate the externally tested release",
+      topic,
     });
+
+    const retriedCreate = await systemClient.json("/v1/chat/conversations", {
+      method: "POST",
+      body: { channel, topic },
+      idempotencyKey: conversationRetryKey,
+      expectedStatus: 200,
+    });
+    expect(retriedCreate.body).toMatchObject({
+      durable: true,
+      conversation: { id: conversationId, channel, topic },
+    });
+
+    const conflictingRetry = await systemClient.json("/v1/chat/conversations", {
+      method: "POST",
+      body: { channel: `${channel}-different`, topic },
+      idempotencyKey: conversationRetryKey,
+      expectedStatus: 409,
+    });
+    expect(conflictingRetry.body).toMatchObject({ error: { code: "conflict" } });
 
     const listed = await reviewerClient.json("/v1/chat/conversations?limit=100");
     expect(array(listed.body.items, "conversation list items")).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: conversationId, channel })]),
     );
 
-    const firstNonce = `author-${randomUUID()}`;
+    const firstRetryKey = `author-${randomUUID()}`;
     const first = await systemClient.json(
       `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
       {
         method: "POST",
-        body: { content: "The lifecycle suite is running against the real backend.", client_nonce: firstNonce },
+        body: { content: "The lifecycle suite is running against the real backend." },
+        idempotencyKey: firstRetryKey,
         expectedStatus: 201,
       },
     );
@@ -45,7 +68,8 @@ describe("collaboration lifecycle", () => {
       `/v1/chat/conversations/${encodeURIComponent(conversationId)}/messages`,
       {
         method: "POST",
-        body: { content: "The lifecycle suite is running against the real backend.", client_nonce: firstNonce },
+        body: { content: "The lifecycle suite is running against the real backend." },
+        idempotencyKey: firstRetryKey,
         expectedStatus: 201,
       },
     );
@@ -122,16 +146,16 @@ describe("collaboration lifecycle", () => {
 
   test("creates, edits, and conflict-checks a durable knowledge page", async () => {
     const title = uniqueName("System-tested product spec");
-    const nonce = `knowledge-${randomUUID()}`;
+    const retryKey = `knowledge-${randomUUID()}`;
     const createBody = {
       title,
       template: "product-spec",
       visibility: "team",
-      client_nonce: nonce,
     };
     const created = await systemClient.json("/v1/knowledge/pages", {
       method: "POST",
       body: createBody,
+      idempotencyKey: retryKey,
       expectedStatus: 201,
     });
     const page = record(created.body.page, "created knowledge page");
@@ -144,6 +168,7 @@ describe("collaboration lifecycle", () => {
     const replay = await systemClient.json("/v1/knowledge/pages", {
       method: "POST",
       body: createBody,
+      idempotencyKey: retryKey,
       expectedStatus: 200,
     });
     expect(replay.body).toMatchObject({ created: false, durable: true, page: { id: pageId } });

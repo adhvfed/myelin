@@ -44,6 +44,32 @@ impl EdgeRequest {
             .map(str::trim)
     }
 
+    /// Derive the bounded, storage-safe nonce used by mutation stores from the public retry key.
+    /// The verified principal and route scope independent callers and operations; the raw key and
+    /// principal never enter durable rows or logs.
+    pub fn stable_idempotency_nonce(&self, principal_id: &str) -> Result<String, EdgeError> {
+        let key = self.header("idempotency-key").ok_or_else(|| {
+            EdgeError::BadRequest("mutation requires an `Idempotency-Key` header".into())
+        })?;
+        if key.is_empty() || key.len() > 128 || !key.bytes().all(|byte| byte.is_ascii_graphic()) {
+            return Err(EdgeError::BadRequest(
+                "`Idempotency-Key` must be 1-128 ASCII-graphic bytes without spaces".into(),
+            ));
+        }
+        let mut digest = blake3::Hasher::new();
+        for part in [
+            b"myelin.edge.request-idempotency.v1".as_slice(),
+            principal_id.as_bytes(),
+            self.method.as_bytes(),
+            self.path.as_bytes(),
+            key.as_bytes(),
+        ] {
+            digest.update(&(part.len() as u64).to_be_bytes());
+            digest.update(part);
+        }
+        Ok(format!("request-v1-{}", digest.finalize().to_hex()))
+    }
+
     pub fn basic_password(&self) -> Option<String> {
         use base64::Engine as _;
         let raw = self.header("authorization")?;
@@ -189,6 +215,47 @@ mod tests {
         let bad = EdgeRequest::new("GET", "/", "&&=&x", vec![("cookie".into(), ";;= ;".into())], vec![]);
         assert_eq!(bad.cookie("x"), None);
         assert_eq!(bad.query_param("x"), None);
+    }
+
+    #[test]
+    fn retry_keys_derive_stable_storage_safe_nonces_without_retaining_raw_material() {
+        let request = EdgeRequest::new(
+            "POST",
+            "/v1/example",
+            "",
+            vec![("Idempotency-Key".into(), "retry/key:42".into())],
+            Vec::new(),
+        );
+        let nonce = request.stable_idempotency_nonce("svc:agent").unwrap();
+        assert_eq!(
+            nonce,
+            request.stable_idempotency_nonce("svc:agent").unwrap()
+        );
+        assert!(nonce.starts_with("request-v1-"));
+        assert_eq!(nonce.len(), 75);
+        assert!(!nonce.contains("retry/key:42"));
+        assert_ne!(
+            nonce,
+            request.stable_idempotency_nonce("svc:other").unwrap(),
+            "one caller cannot collide with another caller's retry namespace"
+        );
+
+        for key in ["", "contains space", "ø", &"x".repeat(129)] {
+            let request = EdgeRequest::new(
+                "POST",
+                "/v1/example",
+                "",
+                vec![("idempotency-key".into(), key.into())],
+                Vec::new(),
+            );
+            assert_eq!(
+                request
+                    .stable_idempotency_nonce("svc:agent")
+                    .unwrap_err()
+                    .status(),
+                400
+            );
+        }
     }
 
     #[test]

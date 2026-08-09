@@ -67,6 +67,25 @@ Pass Vitest selectors in the same way to focus the external suite:
 fed test:system -- tests/git-lifecycle.system.test.ts
 ```
 
+The `myelin` CLI mirrors the same Edge API used by the web application and agents. Alongside Git,
+Issues, CI, and Notifications, its collaboration surface includes:
+
+```sh
+myelin chat list
+myelin chat create engineering --topic "Release coordination" --idempotency-key release-room
+myelin chat send 01J... "Ready for review." --idempotency-key release-message
+myelin chat history 01J...
+
+myelin kb page list
+myelin kb page create --title "Deployment runbook" --template runbook \
+  --idempotency-key deployment-runbook
+myelin kb page get 01J...
+```
+
+Mutation keys are the caller's single retry identity: reuse the same key after a lost response.
+Chat and Knowledge derive their bounded durable nonce from it, so callers do not need a second
+backend-specific token.
+
 ## Status
 
 Pre-release and under heavy development. Interfaces, schemas, and deployment

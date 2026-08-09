@@ -5,6 +5,12 @@ use myelin_issues::api::{parse_cli as parse_issues_cli, CliCommand as IssuesCliC
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::json;
 
+mod chat;
+mod knowledge;
+
+pub use chat::chat_dispatch;
+pub use knowledge::knowledge_dispatch;
+
 const FORM_QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
     .add(b' ')
     .add(b'!')

@@ -38,8 +38,10 @@ The suite is intentionally organized around externally visible contracts:
   matches, default-branch isolation, promotion, and deletion through a stock Git push.
 - `realtime-lifecycle` subscribes as an external tenant client and verifies authenticated repository
   creation and push events over the server-sent event stream.
-- `collaboration-lifecycle` exercises Chat, Knowledge, and the asynchronous Issues authorization
-  reconciler with retries and optimistic conflicts.
+- `collaboration-lifecycle` creates and safely retries a public Chat conversation, sends and pages
+  messages through one public retry identity, creates and edits a Knowledge page with the same
+  retry convention, and exercises the asynchronous Issues authorization reconciler and optimistic
+  conflicts.
 - `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary and appears as
   one queued run. Fed disables the local sandbox runner, so this suite does not claim job execution.
 - `notification-lifecycle` publishes through the external JetStream boundary and verifies durable,
