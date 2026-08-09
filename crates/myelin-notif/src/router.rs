@@ -9,7 +9,7 @@ use myelin_events::{
     Reason as BusReason, SubjectPattern, SubscribeError, Visibility,
 };
 use myelin_identity::Principal;
-use myelin_query::signals::{Severity, Signal};
+use myelin_query::signals::{Severity, Signal, SignalState};
 use myelin_tenancy::{Region, TenantId};
 
 use crate::humanise::reason_template_key;
@@ -289,13 +289,17 @@ impl SignalRouter {
         &self,
         signal_event: &EventEnvelope,
         handler_tx: &mut myelin_events::HandlerTx<'_>,
-    ) -> Result<StormDecision, RouteError> {
+    ) -> Result<(), RouteError> {
         let signal: Signal = serde_json::from_value(signal_event.payload.clone())
             .map_err(|e| RouteError::MalformedSignal(e.to_string()))?;
         if signal.tenant != signal_event.tenant {
             return Err(RouteError::MalformedSignal(
                 "signal tenant does not match its envelope".into(),
             ));
+        }
+
+        if signal.state == SignalState::Resolved {
+            return self.resolve(signal_event, &signal, handler_tx);
         }
 
         self.write_fanout(signal_event, &signal, handler_tx)?;
@@ -312,7 +316,50 @@ impl SignalRouter {
 
         let item = self.derive_item(signal_event, &signal);
         let subject_root = subject_root_of(&item.subject.0);
-        self.route_one_candidate(signal_event, item, &subject_root, handler_tx)
+        self.route_one_candidate(signal_event, item, &subject_root, handler_tx)?;
+        Ok(())
+    }
+
+    fn resolve(
+        &self,
+        signal_event: &EventEnvelope,
+        signal: &Signal,
+        handler_tx: &mut myelin_events::HandlerTx<'_>,
+    ) -> Result<(), RouteError> {
+        let mentions = mentions_of(signal_event);
+        if !mentions.is_empty() {
+            let reason = notification_reason_of(signal_event)?;
+            for principal in &mentions {
+                let item = self.derive_direct_item(signal_event, signal, principal, reason);
+                self.mark_done(&item, handler_tx)?;
+            }
+        }
+        self.mark_done(&self.derive_item(signal_event, signal), handler_tx)?;
+        Ok(())
+    }
+
+    fn mark_done(
+        &self,
+        item: &RoutedInboxItem,
+        handler_tx: &mut myelin_events::HandlerTx<'_>,
+    ) -> Result<(), RouteError> {
+        if let Some(durable) = &self.durable {
+            durable
+                .inbox
+                .co_commit_mark_done(handler_tx, item, &durable.runtime)
+                .map_err(|_| RouteError::Transient("durable inbox resolution failed".into()))?;
+        } else {
+            self.inbox.mutate_matching(
+                &item.tenant,
+                &item.recipient,
+                |row| row.dedup_key == item.dedup_key,
+                |row| {
+                    row.state = "done".into();
+                    row.snooze_until = None;
+                },
+            );
+        }
+        Ok(())
     }
 
     fn write_fanout(
@@ -1353,6 +1400,25 @@ mod tests {
             .expect("an explicit review request is routed to its recipient");
         assert_eq!(row.reason, Reason::ReviewRequested);
         assert_eq!(row.class, Class::Direct);
+
+        let mut resolved_signal = sig.clone();
+        resolved_signal.state = SignalState::Resolved;
+        let mut resolved = signal_msg_with_mentions(
+            "evt-resolved-review",
+            &resolved_signal,
+            &[mentioned("p-reviewer")],
+        );
+        resolved.envelope.type_ = EventType("signal.resolved".into());
+        resolved.envelope.payload["notification_reason"] = serde_json::json!("review_requested");
+        assert_eq!(consumer.deliver(&resolved), Delivered::Acked);
+        let row = inbox
+            .get(
+                &tenant(),
+                "p-reviewer",
+                "direct:git.review_requested:review-core-9:p-reviewer",
+            )
+            .expect("the resolved review request retains its durable inbox history");
+        assert_eq!(row.state, "done");
 
         envelope.payload["notification_reason"] = serde_json::json!("invented_reason");
         assert!(matches!(

@@ -7,8 +7,12 @@ use myelin_events::{
 use myelin_storage::pgrelay::PgRelay;
 
 use crate::core::RepoLoc;
-use crate::events::{GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_OPENED, GIT_PR_SYNCHRONIZED};
-use crate::notif_rules::review_request_signal_drafts;
+use crate::events::{
+    GIT_PR_HEAD_TRIGGER_SCHEMA_V2, GIT_PR_OPENED, GIT_PR_SYNCHRONIZED, GIT_REVIEW_SUBMITTED,
+};
+use crate::notif_rules::{
+    review_request_opened_signal_drafts, review_request_resolved_signal_draft,
+};
 use crate::pr_store::PrRecord;
 
 fn pg_query(action: &'static str) -> myelin_storage::PgError {
@@ -99,15 +103,30 @@ pub(crate) async fn co_commit_event(
         .first()
         .map(|row| row.envelope.clone())
         .ok_or_else(|| pg_query("missing PR envelope"))?;
-    if event_type == GIT_PR_OPENED {
-        let signal_drafts = review_request_signal_drafts(
+    let signal_drafts = if event_type == GIT_PR_OPENED {
+        review_request_opened_signal_drafts(
             &signal_ctx.tenant,
             &signal_ctx.region,
             &loc.repo,
             record,
             &signal_ctx.recorded_at.0,
         )
-        .map_err(|_| pg_query("derive PR review-request signals"))?;
+        .map_err(|_| pg_query("derive PR review-request signals"))?
+    } else if event_type == GIT_REVIEW_SUBMITTED {
+        review_request_resolved_signal_draft(
+            &signal_ctx.tenant,
+            &signal_ctx.region,
+            &loc.repo,
+            record,
+            &signal_ctx.recorded_at.0,
+        )
+        .map_err(|_| pg_query("derive resolved PR review-request signal"))?
+        .into_iter()
+        .collect()
+    } else {
+        Vec::new()
+    };
+    if !signal_drafts.is_empty() {
         let mut signal_tx = OutboxTransaction::detached(minter, signal_ctx);
         for draft in signal_drafts {
             signal_tx

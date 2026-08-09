@@ -62,7 +62,7 @@ pub fn register_git_notif_rules(
     Ok(registry)
 }
 
-pub(crate) fn review_request_signal_drafts(
+pub(crate) fn review_request_opened_signal_drafts(
     tenant: &TenantId,
     region: &Region,
     repo: &str,
@@ -82,56 +82,115 @@ pub(crate) fn review_request_signal_drafts(
         if !matches!(review.state, ReviewState::Requested) {
             continue;
         }
-        let Some(handle) = PseudonymHandle::parse(&review.reviewer_pseudonym) else {
-            continue;
-        };
-        if handle.tenant() != tenant.0 {
-            continue;
+        if let Some(draft) = review_request_signal_draft(
+            tenant,
+            region,
+            &rule,
+            &subject,
+            &review.reviewer_pseudonym,
+            recorded_at,
+            SignalState::Open,
+        ) {
+            drafts.push(draft);
         }
-        let recipient = handle.pseudonym();
-        let dedup_key = rule.dedup_key(recipient, &subject);
-        let signal = Signal {
-            rule_id: RuleId(GIT_REVIEW_REQUESTED_RULE.into()),
-            tenant: tenant.clone(),
-            severity: Severity::Notice,
-            dedup_key: DedupKey(dedup_key.clone()),
-            subject: subject.clone(),
-            count: 1,
-            state: SignalState::Open,
-            first_seen: recorded_at.to_string(),
-            last_seen: recorded_at.to_string(),
-        };
-        let recipient = Principal::new(
-            tenant.clone(),
-            region.clone(),
-            PrincipalId(recipient.to_string()),
-            PrincipalKind::Human,
-            IdentityDataRole::Controller,
-            PrincipalStatus::Active,
-        );
-        let aggregate_id = &blake3::hash(dedup_key.as_bytes()).to_hex()[..32];
-        let mut payload =
-            serde_json::to_value(signal).expect("the closed Signal wire shape is serializable");
-        payload["mentions"] = serde_json::json!([{ "Mention": recipient }]);
-        payload["notification_reason"] = serde_json::to_value(rule.reason)
-            .expect("the closed notification reason vocabulary is serializable");
-        drafts.push(EventDraft {
-            type_: EventType("signal.opened".into()),
-            subject: ArtifactRef(format!(
-                "sig.{}.{}.{}",
-                tenant.0,
-                Severity::Notice.token(),
-                GIT_REVIEW_REQUESTED_RULE
-            )),
-            aggregate: AggregateKey(format!("signal:{aggregate_id}")),
-            payload,
-            data_role: DataRole::Controller,
-            visibility: Visibility::Internal,
-            contains_personal_data: false,
-            pii_key_ref: None,
-        });
     }
     Ok(drafts)
+}
+
+pub(crate) fn review_request_resolved_signal_draft(
+    tenant: &TenantId,
+    region: &Region,
+    repo: &str,
+    record: &PrRecord,
+    recorded_at: &str,
+) -> Result<Option<EventDraft>, myelin_notif::DefineRuleError> {
+    let rule = git_notif_rules()?
+        .into_iter()
+        .find_map(|(key, rule)| (key == GIT_REVIEW_REQUESTED_RULE).then_some(rule))
+        .expect("Git's review-request rule is part of its frozen notification set");
+    let Some(review) = record
+        .reviews
+        .last()
+        .filter(|review| matches!(review.state, ReviewState::Submitted(_)))
+    else {
+        return Ok(None);
+    };
+    let subject = ArtifactRef(format!(
+        "myelin://{}/git/pr/{repo}:{}",
+        tenant.0, record.number
+    ));
+    Ok(review_request_signal_draft(
+        tenant,
+        region,
+        &rule,
+        &subject,
+        &review.reviewer_pseudonym,
+        recorded_at,
+        SignalState::Resolved,
+    ))
+}
+
+fn review_request_signal_draft(
+    tenant: &TenantId,
+    region: &Region,
+    rule: &NotifRule,
+    subject: &ArtifactRef,
+    reviewer_pseudonym: &str,
+    recorded_at: &str,
+    state: SignalState,
+) -> Option<EventDraft> {
+    let handle = PseudonymHandle::parse(reviewer_pseudonym)?;
+    if handle.tenant() != tenant.0 {
+        return None;
+    }
+    let recipient_id = handle.pseudonym();
+    let dedup_key = rule.dedup_key(recipient_id, subject);
+    let signal = Signal {
+        rule_id: RuleId(GIT_REVIEW_REQUESTED_RULE.into()),
+        tenant: tenant.clone(),
+        severity: Severity::Notice,
+        dedup_key: DedupKey(dedup_key.clone()),
+        subject: subject.clone(),
+        count: 1,
+        state,
+        first_seen: recorded_at.to_string(),
+        last_seen: recorded_at.to_string(),
+    };
+    let recipient = Principal::new(
+        tenant.clone(),
+        region.clone(),
+        PrincipalId(recipient_id.to_string()),
+        PrincipalKind::Human,
+        IdentityDataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    let aggregate_id = &blake3::hash(dedup_key.as_bytes()).to_hex()[..32];
+    let mut payload =
+        serde_json::to_value(signal).expect("the closed Signal wire shape is serializable");
+    payload["mentions"] = serde_json::json!([{ "Mention": recipient }]);
+    payload["notification_reason"] = serde_json::to_value(rule.reason)
+        .expect("the closed notification reason vocabulary is serializable");
+    Some(EventDraft {
+        type_: EventType(
+            match state {
+                SignalState::Open => "signal.opened",
+                SignalState::Resolved => "signal.resolved",
+            }
+            .into(),
+        ),
+        subject: ArtifactRef(format!(
+            "sig.{}.{}.{}",
+            tenant.0,
+            Severity::Notice.token(),
+            GIT_REVIEW_REQUESTED_RULE
+        )),
+        aggregate: AggregateKey(format!("signal:{aggregate_id}")),
+        payload,
+        data_role: DataRole::Controller,
+        visibility: Visibility::Internal,
+        contains_personal_data: false,
+        pii_key_ref: None,
+    })
 }
 
 pub const GIT_WATCHER_RELATION: &str = myelin_notif::WATCHER_RELATION;
@@ -321,7 +380,7 @@ mod tests {
             },
         ];
 
-        let drafts = review_request_signal_drafts(
+        let drafts = review_request_opened_signal_drafts(
             &tenant(),
             &Region("fr-par".into()),
             "core",
@@ -344,6 +403,26 @@ mod tests {
         assert_eq!(signal.rule_id.0, GIT_REVIEW_REQUESTED_RULE);
         assert_eq!(signal.subject.0, "myelin://acme/git/pr/core:7");
         assert_eq!(signal.first_seen, "2026-08-09T12:00:00Z");
+
+        record.reviews.push(ReviewRecord {
+            reviewer_pseudonym: "alice@acme.noreply".into(),
+            state: ReviewState::Submitted(crate::lifecycle::ReviewVerdict::Approve),
+            is_agent: false,
+        });
+        let resolved = review_request_resolved_signal_draft(
+            &tenant(),
+            &Region("fr-par".into()),
+            "core",
+            &record,
+            "2026-08-09T12:05:00Z",
+        )
+        .unwrap()
+        .expect("the submitted review resolves its request signal");
+        assert_eq!(resolved.type_.0, "signal.resolved");
+        assert_eq!(resolved.aggregate, draft.aggregate);
+        let signal: Signal = serde_json::from_value(resolved.payload).unwrap();
+        assert_eq!(signal.state, SignalState::Resolved);
+        assert_eq!(signal.last_seen, "2026-08-09T12:05:00Z");
     }
 
     #[test]

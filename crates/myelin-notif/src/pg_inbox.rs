@@ -181,19 +181,7 @@ impl PgInboxStore {
         item: &RoutedInboxItem,
         runtime: &tokio::runtime::Handle,
     ) -> Result<bool, PgInboxError> {
-        for field in [
-            item.tenant.0.as_str(),
-            item.region.0.as_str(),
-            item.recipient.as_str(),
-            item.dedup_key.as_str(),
-        ] {
-            if field.is_empty()
-                || field.len() > MAX_KEY_BYTES
-                || field.chars().any(char::is_control)
-            {
-                return Err(PgInboxError::InvalidInput);
-            }
-        }
+        validate_routing_key(item)?;
         let conn = tx
             .connection::<sqlx::PgConnection>()
             .ok_or(PgInboxError::NoCoCommitTx)?;
@@ -210,6 +198,35 @@ impl PgInboxStore {
                 .fetch_one(conn)
                 .await
                 .map_err(|_| PgInboxError::Database)
+            })
+        })
+    }
+
+    pub(crate) fn co_commit_mark_done(
+        &self,
+        tx: &mut myelin_events::HandlerTx<'_>,
+        item: &RoutedInboxItem,
+        runtime: &tokio::runtime::Handle,
+    ) -> Result<bool, PgInboxError> {
+        validate_routing_key(item)?;
+        let conn = tx
+            .connection::<sqlx::PgConnection>()
+            .ok_or(PgInboxError::NoCoCommitTx)?;
+        tokio::task::block_in_place(|| {
+            runtime.block_on(async {
+                let result = sqlx::query(
+                    "UPDATE notif_inbox_item SET state = 'done', snooze_until = NULL \
+                     WHERE tenant_id = $1 AND region = $2 AND recipient = $3 AND dedup_key = $4 \
+                       AND state <> 'done'",
+                )
+                .bind(&item.tenant.0)
+                .bind(&item.region.0)
+                .bind(&item.recipient)
+                .bind(&item.dedup_key)
+                .execute(conn)
+                .await
+                .map_err(|_| PgInboxError::Database)?;
+                Ok(result.rows_affected() == 1)
             })
         })
     }
@@ -265,6 +282,20 @@ impl PgInboxStore {
         })
         .await
     }
+}
+
+fn validate_routing_key(item: &RoutedInboxItem) -> Result<(), PgInboxError> {
+    for field in [
+        item.tenant.0.as_str(),
+        item.region.0.as_str(),
+        item.recipient.as_str(),
+        item.dedup_key.as_str(),
+    ] {
+        if field.is_empty() || field.len() > MAX_KEY_BYTES || field.chars().any(char::is_control) {
+            return Err(PgInboxError::InvalidInput);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]

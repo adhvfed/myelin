@@ -16,7 +16,7 @@ use crate::core::{Oid as CoreOid, RepoLoc};
 use crate::durable::{DurableError, DurableGitRepo};
 use crate::events::{
     event_actor_pseudonym, pseudonymized_event_principal, GIT_PR_MERGED, GIT_PR_OPENED,
-    GIT_PR_UPDATED,
+    GIT_PR_UPDATED, GIT_REVIEW_SUBMITTED,
 };
 use crate::lifecycle::{BranchProtectionRuleset, PrState};
 use crate::pg_pr_event::co_commit_event;
@@ -1374,11 +1374,11 @@ impl PgPrStore {
         principal: &Principal,
     ) -> Result<PrRecord, DurableError> {
         let actor_subject_id = normalized_subject_id(principal)?;
-        let command_kind = match &mutation {
-            PrMutation::ReportChecks { .. } => "report-checks",
-            PrMutation::SubmitReview(_) => "submit-review",
-            PrMutation::EndorseContexts(_) => "endorse-contexts",
-            PrMutation::Touch => "touch",
+        let (command_kind, event_type) = match &mutation {
+            PrMutation::ReportChecks { .. } => ("report-checks", GIT_PR_UPDATED),
+            PrMutation::SubmitReview(_) => ("submit-review", GIT_REVIEW_SUBMITTED),
+            PrMutation::EndorseContexts(_) => ("endorse-contexts", GIT_PR_UPDATED),
+            PrMutation::Touch => ("touch", GIT_PR_UPDATED),
         };
         let command_hash = payload_hash(&(number, &mutation))?;
         let ctx = self.emit_context(scope, principal)?;
@@ -1391,7 +1391,7 @@ impl PgPrStore {
             command_kind,
             command_hash,
             ctx,
-            GIT_PR_UPDATED,
+            event_type,
             move |record| {
                 match mutation {
                     PrMutation::ReportChecks {

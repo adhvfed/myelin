@@ -250,6 +250,20 @@ describe.sequential("Git engineering lifecycle", () => {
       applied: { action: "git.pr.review.submit", result: { emitted: true } },
     });
 
+    const subject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`;
+    const completedRequest = await eventually(async () => {
+      const inbox = await reviewerClient.json("/v1/notif/inbox?view=review-requests&limit=100");
+      const item = array(inbox.body.items, "review request inbox items")
+        .map((value) => record(value, "review request inbox item"))
+        .find((value) => value.subject === subject);
+      return item?.state === "done" ? item : undefined;
+    }, { description: "the submitted review to complete its inbox request" });
+    expect(completedRequest).toMatchObject({
+      reason: "review_requested",
+      class: "direct",
+      state: "done",
+    });
+
     const threads = await systemClient.json(`${base}/threads`);
     expect(array(threads.body.threads, "pull request threads")).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: threadId })]),

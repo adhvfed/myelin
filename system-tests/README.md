@@ -30,7 +30,8 @@ The suite is intentionally organized around externally visible contracts:
 
 - `platform` verifies health, readiness, capability authentication, and bounded routing errors.
 - `git-lifecycle` follows repository creation through browsing, delivery of a real review request
-  to a second principal, reviewer-scoped PR access, review, merge, and base-branch readback.
+  to a second principal, reviewer-scoped PR access, review and inbox completion, merge, and
+  base-branch readback.
 - `git-wire` uses a stock Git client to verify smart-HTTP authentication, clone, fetch, and push.
 - `collaboration-lifecycle` exercises Chat, Knowledge, and the asynchronous Issues authorization
   reconciler with retries and optimistic conflicts.
