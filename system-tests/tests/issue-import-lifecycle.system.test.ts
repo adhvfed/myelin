@@ -73,6 +73,11 @@ describe("issue migration lifecycle", () => {
         ),
       };
     });
+    for (const { issue } of firstIssues) {
+      expect(string(issue.ref, "imported issue ref")).toBe(
+        `myelin://${systemTestConfig.tenant}/issue/issue/${string(issue.key, "imported issue key")}`,
+      );
+    }
 
     const resumed = await systemClient.json(`/v1/issues/imports/${jobId}/run`, {
       method: "POST",
@@ -114,6 +119,9 @@ describe("issue migration lifecycle", () => {
     expect(activeIssues.map((issue) => issue.id)).toEqual(
       firstIssues.map(({ issue }) => issue.id),
     );
+    expect(activeIssues.map((issue) => issue.ref)).toEqual(
+      firstIssues.map(({ issue }) => issue.ref),
+    );
 
     const visibleToATeammate = await reviewerClient.json(
       `/v1/issues?state=all&key=${encodeURIComponent(`${prefix}-`)}&limit=100`,
@@ -124,5 +132,10 @@ describe("issue migration lifecycle", () => {
       ),
     );
     expect(array(visibleToATeammate.body.items)).toHaveLength(2);
+    expect(
+      array(visibleToATeammate.body.items, "re-addressable imported issues").map(
+        (issue) => record(issue, "re-addressable imported issue").ref,
+      ),
+    ).toEqual(expect.arrayContaining(firstIssues.map(({ issue }) => issue.ref)));
   });
 });

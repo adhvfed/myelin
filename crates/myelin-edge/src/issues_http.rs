@@ -145,10 +145,15 @@ fn map_store_error(error: IssueStoreError) -> EdgeError {
     }
 }
 
-fn issue_json(issue: &StoredIssue) -> Value {
+pub(super) fn canonical_issue_ref(tenant: &str, key: &str) -> String {
+    myelin_issues::issue_root_ref(tenant, key).0
+}
+
+fn issue_json(tenant: &str, issue: &StoredIssue) -> Value {
     json!({
         "id": issue.id,
         "key": issue.key,
+        "ref": canonical_issue_ref(tenant, &issue.key),
         "project_id": issue.project_id,
         "state": issue.state,
         "state_category": issue.state_category,
@@ -174,7 +179,11 @@ impl Handler for IssueListHandler {
             .api
             .drive(self.api.store.list(ctx.principal, request))
             .map_err(map_store_error)?;
-        let items: Vec<Value> = page.items.iter().map(issue_json).collect();
+        let items: Vec<Value> = page
+            .items
+            .iter()
+            .map(|issue| issue_json(&ctx.principal.tenant.0, issue))
+            .collect();
         Ok(no_store(EdgeResponse::json(
             200,
             &page_envelope(json!(items), page.next_cursor, page.limit as usize),
@@ -259,6 +268,7 @@ impl Handler for IssueCreateHandler {
                 "issue": {
                     "id": receipt.id,
                     "key": receipt.key,
+                    "ref": canonical_issue_ref(&ctx.principal.tenant.0, &receipt.key),
                     "project_id": receipt.project_id,
                 },
                 "authorization": {
@@ -293,6 +303,7 @@ impl Handler for IssueAuthorizationStatusHandler {
                     "issue": {
                         "id": receipt.id,
                         "key": receipt.key,
+                        "ref": canonical_issue_ref(&ctx.principal.tenant.0, &receipt.key),
                         "project_id": receipt.project_id,
                     },
                     "retry_after_ms": AUTHORIZATION_STATUS_RETRY_AFTER_MS,
@@ -302,7 +313,7 @@ impl Handler for IssueAuthorizationStatusHandler {
                 200,
                 json!({
                     "status": "active",
-                    "issue": issue_json(&issue),
+                    "issue": issue_json(&ctx.principal.tenant.0, &issue),
                 }),
             ),
         };
@@ -321,7 +332,10 @@ impl Handler for IssueViewHandler {
             .api
             .drive(self.api.store.view(ctx.principal, id))
             .map_err(map_store_error)?;
-        Ok(no_store(EdgeResponse::json(200, &issue_json(&issue))))
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &issue_json(&ctx.principal.tenant.0, &issue),
+        )))
     }
 }
 
@@ -349,7 +363,10 @@ impl Handler for IssueCloseHandler {
             .api
             .drive(self.api.store.close(ctx.principal, id))
             .map_err(map_store_error)?;
-        Ok(no_store(EdgeResponse::json(200, &issue_json(&issue))))
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &issue_json(&ctx.principal.tenant.0, &issue),
+        )))
     }
 }
 
@@ -469,6 +486,14 @@ mod tests {
         assert!(!is_canonical_uuid("33333333-3333-3333-3333-33333333333/"));
         assert!(!is_canonical_uuid("*"));
         assert!(!is_canonical_uuid("AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"));
+    }
+
+    #[test]
+    fn issue_keys_are_re_addressable_without_reconstructing_scope() {
+        assert_eq!(
+            canonical_issue_ref("acme-eu", "ENG-41"),
+            "myelin://acme-eu/issue/issue/ENG-41"
+        );
     }
 
     #[test]

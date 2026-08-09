@@ -104,9 +104,16 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
                 .unwrap_or("pending");
             let id = terminal_safe_single_line(id);
             let key = terminal_safe_single_line(key);
+            let issue_ref = issue
+                .get("ref")
+                .and_then(Value::as_str)
+                .map(terminal_safe_single_line);
             let status = terminal_safe_single_line(status);
+            let identity = issue_ref
+                .map(|issue_ref| format!("{issue_ref}; id={id}"))
+                .unwrap_or_else(|| id.clone());
             return format!(
-                "{key} staged ({id}); authorization={status}\nnot visible yet; after reconciliation: myelin issue view {id}\n"
+                "{key} staged ({identity}); authorization={status}\nnot visible yet; after reconciliation: myelin issue view {id}\n"
             );
         }
     }
@@ -161,6 +168,10 @@ fn render_issue_import(value: &Value) -> Option<String> {
                 let issue = outcome.get("issue")?;
                 let key = terminal_safe_single_line(issue.get("key")?.as_str()?);
                 let id = terminal_safe_single_line(issue.get("id")?.as_str()?);
+                let issue_ref = issue
+                    .get("ref")
+                    .and_then(Value::as_str)
+                    .map(terminal_safe_single_line);
                 let disposition = if outcome.get("created")?.as_bool()? {
                     "created"
                 } else {
@@ -171,7 +182,10 @@ fn render_issue_import(value: &Value) -> Option<String> {
                 );
                 let _ = writeln!(
                     output,
-                    "{source_id} -> {key} staged ({id}); {disposition}; authorization={authorization}"
+                    "{source_id} -> {key} staged ({}); {disposition}; authorization={authorization}",
+                    issue_ref
+                        .map(|issue_ref| format!("{issue_ref}; id={id}"))
+                        .unwrap_or(id)
                 );
             }
             Some(output)
@@ -615,15 +629,17 @@ mod tests {
     #[test]
     fn pending_issue_receipt_never_claims_immediate_visibility() {
         let id = "33333333-3333-3333-3333-333333333333";
+        let issue_ref = "myelin://acme/issue/issue/ENG-1";
         let out = render(
             &json!({
-                "issue": {"id": id, "key": "ENG-1", "project_id": "p"},
+                "issue": {"id": id, "key": "ENG-1", "ref": issue_ref, "project_id": "p"},
                 "authorization": {"status": "pending", "request_event_id": "evt"}
             }),
             false,
         );
         assert!(out.contains("authorization=pending"));
         assert!(out.contains("not visible yet"));
+        assert!(out.contains(issue_ref));
         assert!(out.contains(&format!("myelin issue view {id}")));
         assert!(!out.contains("created successfully"));
     }

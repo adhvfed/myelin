@@ -1,4 +1,6 @@
-use super::{is_canonical_uuid, map_store_error, no_store, DurableIssueHttpApi};
+use super::{
+    canonical_issue_ref, is_canonical_uuid, map_store_error, no_store, DurableIssueHttpApi,
+};
 use crate::catalogue::{Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
@@ -172,12 +174,14 @@ impl Handler for IssueImportRunHandler {
         let issues = outcomes
             .into_iter()
             .map(|(source_id, receipt)| {
+                let issue_ref = canonical_issue_ref(&ctx.principal.tenant.0, &receipt.issue.key);
                 json!({
                     "source_id": source_id,
                     "created": receipt.created,
                     "issue": {
                         "id": receipt.issue.id,
                         "key": receipt.issue.key,
+                        "ref": issue_ref,
                         "project_id": receipt.issue.project_id,
                     },
                     "authorization": {
