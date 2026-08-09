@@ -19,6 +19,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("git", "open_pr") => false,
         ("git", "comment") => false,
         ("git", "submit_review") => false,
+        ("git", "endorse_fork_ci") => false,
         ("git", "suggest_change") => false,
         ("git", "resolve_thread") => false,
         ("git", "history_rewrite") => true,
@@ -43,7 +44,13 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("knowledge", "comment") => false,
 
         ("chat", "post_message") => false,
+        ("chat", "post") => false,
+        ("chat", "reply_in_thread") => false,
         ("chat", "react") => false,
+        ("chat", "start_dm") => false,
+        ("chat", "create_channel") => true,
+        ("chat", "invite") => true,
+        ("chat", "archive_channel") => true,
 
         _ => true,
     }
@@ -313,7 +320,7 @@ mod tests {
 
     #[test]
     fn seed_stamps_the_frozen_default_onto_the_tool_def() {
-        let wrong = tool_def("git", "merge",  false);
+        let wrong = tool_def("git", "merge", false);
         let seeded = seed_requires_approval(wrong);
         assert!(
             seeded.requires_approval,
@@ -333,7 +340,7 @@ mod tests {
 
     #[test]
     fn loosening_a_frozen_yes_without_a_deviation_is_rejected() {
-        let loosened = tool_def("git", "merge",  false);
+        let loosened = tool_def("git", "merge", false);
         let err = assert_no_silent_loosening(&loosened, &[]).unwrap_err();
         assert_eq!(err.subsystem, "git");
         assert_eq!(err.tool, "merge");
@@ -363,7 +370,7 @@ mod tests {
 
     #[test]
     fn tightening_a_frozen_no_is_always_allowed() {
-        let tightened = tool_def("git", "open_pr",  true);
+        let tightened = tool_def("git", "open_pr", true);
         assert!(
             assert_no_silent_loosening(&tightened, &[]).is_ok(),
             "tightening (no → yes) needs no deviation"

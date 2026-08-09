@@ -91,8 +91,17 @@ fn cli_parses_the_arch_section_3_2_verbs() {
         }
     );
     assert_eq!(
-        parse_cli(&["pr", "open", "core", "--title", "My change", "--head-oid", "abc", "--draft"])
-            .unwrap(),
+        parse_cli(&[
+            "pr",
+            "open",
+            "core",
+            "--title",
+            "My change",
+            "--head-oid",
+            "abc",
+            "--draft"
+        ])
+        .unwrap(),
         CliCommand::PrOpen {
             repo: "core".into(),
             title: "My change".into(),
@@ -436,4 +445,18 @@ fn agent_tool_requires_approval_defaults_are_frozen() {
         vec!["git.merge"],
         "git.merge is the ONLY HITL-gated git tool (§6.3)"
     );
+}
+
+#[test]
+fn agent_tools_project_into_the_shared_validated_catalogue_contract() {
+    let definitions = agent_tool_defs();
+    assert_eq!(definitions.len(), agent_tools().len());
+    for definition in definitions {
+        definition.validate().unwrap();
+        assert!(definition.exposed_over_mcp);
+        assert_eq!(
+            definition.mcp_projection().unwrap()["name"],
+            definition.canonical_name()
+        );
+    }
 }

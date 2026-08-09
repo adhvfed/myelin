@@ -97,6 +97,136 @@ pub struct ToolDef {
     pub exposed_over_mcp: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolDefValidationError {
+    pub tool: String,
+    pub reason: String,
+}
+
+impl core::fmt::Display for ToolDefValidationError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "tool definition `{}` is invalid: {}",
+            self.tool, self.reason
+        )
+    }
+}
+
+impl std::error::Error for ToolDefValidationError {}
+
+impl ToolDef {
+    pub fn canonical_name(&self) -> String {
+        format!("{}.{}", self.subsystem, self.name.0)
+    }
+
+    pub fn validate(&self) -> Result<(), ToolDefValidationError> {
+        let tool = self.canonical_name();
+        if !is_catalogue_token(&self.subsystem) || !is_catalogue_token(&self.name.0) {
+            return Err(ToolDefValidationError {
+                tool,
+                reason: "subsystem and name must be bounded lowercase catalogue tokens".into(),
+            });
+        }
+        if self.version == 0 {
+            return Err(ToolDefValidationError {
+                tool,
+                reason: "version must be positive".into(),
+            });
+        }
+        let schema =
+            serde_json::from_str::<serde_json::Value>(&self.input_schema).map_err(|_| {
+                ToolDefValidationError {
+                    tool: tool.clone(),
+                    reason: "input_schema must be valid JSON".into(),
+                }
+            })?;
+        if schema.get("type").and_then(serde_json::Value::as_str) != Some("object") {
+            return Err(ToolDefValidationError {
+                tool,
+                reason: "input_schema must describe an object".into(),
+            });
+        }
+        let capabilities = self
+            .required_caps
+            .iter()
+            .collect::<std::collections::HashSet<_>>();
+        if self.required_caps.is_empty()
+            || capabilities.len() != self.required_caps.len()
+            || self.required_caps.iter().any(|capability| {
+                capability.is_empty()
+                    || capability.len() > 255
+                    || capability.chars().any(char::is_whitespace)
+            })
+        {
+            return Err(ToolDefValidationError {
+                tool,
+                reason: "required_caps must contain distinct bounded non-whitespace capabilities"
+                    .into(),
+            });
+        }
+        match self.effect_kind {
+            EffectKind::Read | EffectKind::Compute
+                if self.side_effecting || self.requires_approval =>
+            {
+                Err(ToolDefValidationError {
+                    tool,
+                    reason: "read and compute tools must be non-side-effecting and non-gated"
+                        .into(),
+                })
+            }
+            EffectKind::Mutate | EffectKind::External if !self.side_effecting => {
+                Err(ToolDefValidationError {
+                    tool,
+                    reason: "mutate and external tools must declare side_effecting".into(),
+                })
+            }
+            _ => Ok(()),
+        }
+    }
+
+    pub fn mcp_projection(&self) -> Result<serde_json::Value, ToolDefValidationError> {
+        self.validate()?;
+        let route = match self.effect_kind {
+            EffectKind::Read => "direct permission-checked subsystem read",
+            EffectKind::Compute => "governed sandbox computation",
+            EffectKind::Mutate | EffectKind::External => "governed EffectApi plan-then-apply",
+        };
+        let name = self.canonical_name();
+        let description = format!(
+            "{} tool `{name}` v{}; routes through {route}.{}",
+            self.subsystem,
+            self.version,
+            if self.requires_approval {
+                " Requires HITL approval before apply."
+            } else {
+                ""
+            }
+        );
+        let input_schema = serde_json::from_str::<serde_json::Value>(&self.input_schema)
+            .expect("ToolDef::validate accepted the JSON schema");
+        Ok(serde_json::json!({
+            "name": name,
+            "description": description,
+            "inputSchema": input_schema,
+            "annotations": {
+                "requiresApproval": self.requires_approval,
+                "readOnlyHint": self.effect_kind == EffectKind::Read,
+            }
+        }))
+    }
+}
+
+fn is_catalogue_token(value: &str) -> bool {
+    value.len() <= 64
+        && value.as_bytes().split_first().is_some_and(|(first, rest)| {
+            first.is_ascii_lowercase()
+                && rest
+                    .iter()
+                    .all(|byte| byte.is_ascii_lowercase() || *byte == b'_' || byte.is_ascii_digit())
+        })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunCtx(pub String);
 
@@ -201,6 +331,46 @@ pub trait DryRun {
 mod tests {
     use super::*;
 
+    fn valid_tool() -> ToolDef {
+        ToolDef {
+            name: ToolName("open_pr".into()),
+            subsystem: "git".into(),
+            version: 1,
+            input_schema: r#"{"type":"object","required":["repo"]}"#.into(),
+            required_caps: vec!["repo.push".into()],
+            effect_kind: EffectKind::Mutate,
+            side_effecting: true,
+            requires_approval: false,
+            exposed_over_mcp: true,
+        }
+    }
+
+    #[test]
+    fn tool_def_owns_its_canonical_name_validation_and_mcp_projection() {
+        let tool = valid_tool();
+        assert_eq!(tool.canonical_name(), "git.open_pr");
+        assert_eq!(tool.mcp_projection().unwrap()["name"], "git.open_pr");
+        assert_eq!(
+            tool.mcp_projection().unwrap()["inputSchema"],
+            serde_json::json!({"type": "object", "required": ["repo"]})
+        );
+    }
+
+    #[test]
+    fn malformed_or_routing_ambiguous_tool_defs_are_rejected_centrally() {
+        let mut malformed = valid_tool();
+        malformed.input_schema = "not json".into();
+        assert!(malformed.validate().is_err());
+
+        let mut ambiguous = valid_tool();
+        ambiguous.effect_kind = EffectKind::Read;
+        assert!(ambiguous.validate().is_err());
+
+        let mut duplicate_capability = valid_tool();
+        duplicate_capability.required_caps.push("repo.push".into());
+        assert!(duplicate_capability.validate().is_err());
+    }
+
     #[test]
     fn effect_authority_debug_redacts_every_credential_and_replay_handle() {
         let authority = EffectAuthority {
@@ -253,8 +423,7 @@ mod tests {
     }
 
     impl EventInbox for Mock {
-        fn deliver(&self, _ev: InboxEvent) {
-        }
+        fn deliver(&self, _ev: InboxEvent) {}
     }
 
     impl EffectApi for Mock {
@@ -296,7 +465,10 @@ mod tests {
     fn metered_runtime_default_step_is_not_reported() {
         let m = Mock { catalogue: vec![] };
         let metered = m.step_metered(&Conversation::default());
-        assert_eq!(metered.outcome, StepOutcome::Submit(Submission("ok".into())));
+        assert_eq!(
+            metered.outcome,
+            StepOutcome::Submit(Submission("ok".into()))
+        );
         assert_eq!(metered.usage, TokenUsage::NotReported);
         assert_eq!(metered.outcome, m.step(&Conversation::default()));
     }

@@ -19,6 +19,7 @@ myelin-refs = { path = "../myelin-refs" }
 myelin-notif = { path = "../myelin-notif" }
 myelin-content = { path = "../myelin-content" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 myelin-git = { path = "../myelin-git" }
 myelin-issues = { path = "../myelin-issues" }
 myelin-chat = { path = "../myelin-chat" }
@@ -36,7 +37,6 @@ myelin-agent-service = { path = ".", features = ["test-support"] }
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
 serde_json.workspace = true
 myelin-harness = { path = "../myelin-harness" }
-myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 
 [features]
 default = []

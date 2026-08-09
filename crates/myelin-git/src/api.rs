@@ -223,21 +223,11 @@ impl CliCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliParseError {
     Empty,
-    Unknown {
-        token: String,
-    },
-    MissingArg {
-        what: &'static str,
-    },
-    DuplicateFlag {
-        flag: &'static str,
-    },
-    MissingValue {
-        flag: &'static str,
-    },
-    BadArg {
-        value: String,
-    },
+    Unknown { token: String },
+    MissingArg { what: &'static str },
+    DuplicateFlag { flag: &'static str },
+    MissingValue { flag: &'static str },
+    BadArg { value: String },
 }
 
 pub const REPO_LIST_CLI_MAX_LIMIT: usize = 100;
@@ -303,8 +293,7 @@ fn parse_repo_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
                 }
                 let value = required_flag_value(args, index, "--limit")?;
                 let parsed = value.parse::<usize>().ok().filter(|parsed| {
-                    value == parsed.to_string()
-                        && (1..=REPO_LIST_CLI_MAX_LIMIT).contains(parsed)
+                    value == parsed.to_string() && (1..=REPO_LIST_CLI_MAX_LIMIT).contains(parsed)
                 });
                 limit = Some(parsed.ok_or_else(|| CliParseError::BadArg {
                     value: value.to_string(),
@@ -485,6 +474,26 @@ pub struct AgentToolDef {
     pub handler: Handler,
 }
 
+impl AgentToolDef {
+    pub fn to_tool_def(self) -> myelin_agent::ToolDef {
+        let (subsystem, name) = self
+            .name
+            .split_once('.')
+            .expect("the frozen Git agent catalogue uses dotted names");
+        myelin_agent::ToolDef {
+            name: myelin_agent::ToolName(name.to_string()),
+            subsystem: subsystem.to_string(),
+            version: 1,
+            input_schema: r#"{"type":"object","properties":{"repo":{"type":"string","description":"the repository slug (tenant is taken from the verified run token)"},"number":{"type":"integer","description":"the pull request number, when the operation targets a pull request"}},"additionalProperties":true}"#.into(),
+            required_caps: self.required_caps.iter().map(|cap| (*cap).to_string()).collect(),
+            effect_kind: myelin_agent::EffectKind::Mutate,
+            side_effecting: true,
+            requires_approval: self.requires_approval,
+            exposed_over_mcp: true,
+        }
+    }
+}
+
 pub fn agent_tools() -> Vec<AgentToolDef> {
     vec![
         AgentToolDef {
@@ -512,6 +521,13 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
             handler: Handler::ForkEndorse,
         },
     ]
+}
+
+pub fn agent_tool_defs() -> Vec<myelin_agent::ToolDef> {
+    agent_tools()
+        .into_iter()
+        .map(AgentToolDef::to_tool_def)
+        .collect()
 }
 
 #[cfg(test)]

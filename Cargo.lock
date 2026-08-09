@@ -2922,6 +2922,7 @@ dependencies = [
  "fs4",
  "git2",
  "hex",
+ "myelin-agent",
  "myelin-client",
  "myelin-config",
  "myelin-content",

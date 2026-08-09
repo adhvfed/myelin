@@ -1,5 +1,6 @@
 pub mod app;
 pub mod card_text;
+pub mod catalogue;
 pub mod chat_tools;
 pub mod ci_tools;
 pub mod cost_gate;
@@ -33,6 +34,10 @@ pub mod trace_seam;
 pub use holder::{
     agent_store_classifier, register_agent_holders, AgentHolderRegistration, AgentOltpHolder,
     AgentTraceHolder, AGENT_OLTP_STORE, AGENT_TRACE_STORE,
+};
+
+pub use catalogue::{
+    catalogue_cursor, tool_ref, PlatformToolCatalogue, ToolCatalogueError,
 };
 
 pub use dsr::{

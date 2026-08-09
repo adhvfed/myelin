@@ -9,6 +9,7 @@ publish = false
 myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
+myelin-agent = { path = "../myelin-agent" }
 myelin-events = { path = "../myelin-events" }
 myelin-refs = { path = "../myelin-refs" }
 myelin-flow = { path = "../myelin-flow" }

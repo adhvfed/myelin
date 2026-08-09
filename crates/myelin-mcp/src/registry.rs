@@ -1,15 +1,12 @@
 use myelin_agent::{EffectKind, ToolDef};
 use myelin_git::api::AgentToolDef;
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Debug)]
 enum ToolSource {
     Shared(ToolDef),
-    LegacyGit {
-        subsystem: &'static str,
-        def: AgentToolDef,
-    },
+    Git(AgentToolDef),
 }
 
 #[derive(Clone, Debug)]
@@ -26,88 +23,41 @@ impl RegisteredTool {
     pub fn requires_approval(&self) -> bool {
         match &self.source {
             ToolSource::Shared(def) => def.requires_approval,
-            ToolSource::LegacyGit { def, .. } => def.requires_approval,
+            ToolSource::Git(def) => def.requires_approval,
         }
     }
 
     pub fn required_caps(&self) -> Vec<&str> {
         match &self.source {
             ToolSource::Shared(def) => def.required_caps.iter().map(String::as_str).collect(),
-            ToolSource::LegacyGit { def, .. } => def.required_caps.to_vec(),
+            ToolSource::Git(def) => def.required_caps.to_vec(),
         }
     }
 
     pub fn effect_kind(&self) -> EffectKind {
         match &self.source {
             ToolSource::Shared(def) => def.effect_kind,
-            ToolSource::LegacyGit { .. } => EffectKind::Mutate,
+            ToolSource::Git(_) => EffectKind::Mutate,
         }
     }
 
     pub fn side_effecting(&self) -> bool {
         match &self.source {
             ToolSource::Shared(def) => def.side_effecting,
-            ToolSource::LegacyGit { .. } => true,
+            ToolSource::Git(_) => true,
         }
     }
 
     pub fn to_mcp_json(&self) -> Value {
-        let (description, input_schema) = match &self.source {
-            ToolSource::Shared(def) => {
-                let route = match def.effect_kind {
-                    EffectKind::Read => "direct permission-checked subsystem read",
-                    EffectKind::Compute => "governed sandbox computation",
-                    EffectKind::Mutate | EffectKind::External => {
-                        "governed EffectApi plan-then-apply"
-                    }
-                };
-                (
-                    format!(
-                        "{} tool `{}` v{}; routes through {route}.{}",
-                        def.subsystem,
-                        self.name(),
-                        def.version,
-                        if def.requires_approval {
-                            " Requires HITL approval before apply."
-                        } else {
-                            ""
-                        }
-                    ),
-                    serde_json::from_str(&def.input_schema)
-                        .expect("shared ToolDef schemas are validated at registration"),
-                )
-            }
-            ToolSource::LegacyGit { subsystem, def } => (
-                format!(
-                    "{subsystem} tool `{}` (handler: {:?}). Routes through mint_run_token -> \
-                     EffectApi::apply under the same governance a human is.{}",
-                    self.name(),
-                    def.handler,
-                    if def.requires_approval {
-                        " Requires HITL approval before apply."
-                    } else {
-                        ""
-                    }
-                ),
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "repo": { "type": "string", "description": "the repository slug (tenant is from the token, never here)" },
-                        "number": { "type": "integer", "description": "the PR number, when the tool acts on a PR" }
-                    },
-                    "additionalProperties": true
-                }),
-            ),
-        };
-        json!({
-            "name": self.name(),
-            "description": description,
-            "inputSchema": input_schema,
-            "annotations": {
-                "requiresApproval": self.requires_approval(),
-                "readOnlyHint": self.effect_kind() == EffectKind::Read,
-            }
-        })
+        match &self.source {
+            ToolSource::Shared(def) => def
+                .mcp_projection()
+                .expect("shared ToolDef schemas are validated at registration"),
+            ToolSource::Git(def) => def
+                .to_tool_def()
+                .mcp_projection()
+                .expect("the frozen Git ToolDefs are validated by their provider"),
+        }
     }
 }
 
@@ -142,10 +92,7 @@ impl ToolRegistry {
         for def in myelin_git::api::agent_tools() {
             self.push(RegisteredTool {
                 mcp_name: def.name.to_string(),
-                source: ToolSource::LegacyGit {
-                    subsystem: "git",
-                    def,
-                },
+                source: ToolSource::Git(def),
             })?;
         }
         Ok(())
@@ -217,49 +164,8 @@ impl ToolRegistry {
 }
 
 fn validate_shared_def(def: &ToolDef) -> Result<(), RegistryError> {
-    let name = format!("{}.{}", def.subsystem, def.name.0);
-    if def.subsystem.is_empty()
-        || def.name.0.is_empty()
-        || def.subsystem.contains('.')
-        || def.name.0.contains('.')
-    {
-        return Err(RegistryError::InvalidDefinition(format!(
-            "shared ToolDef `{name}` has a non-canonical catalogue key"
-        )));
-    }
-    let schema: Value = serde_json::from_str(&def.input_schema).map_err(|_| {
-        RegistryError::InvalidDefinition(format!(
-            "shared ToolDef `{name}` has invalid JSON input_schema"
-        ))
-    })?;
-    if schema.get("type").and_then(Value::as_str) != Some("object") {
-        return Err(RegistryError::InvalidDefinition(format!(
-            "shared ToolDef `{name}` input_schema must describe an object"
-        )));
-    }
-    let unique_caps = def.required_caps.iter().collect::<HashSet<_>>();
-    if def.required_caps.is_empty()
-        || unique_caps.len() != def.required_caps.len()
-        || def.required_caps.iter().any(|cap| cap.is_empty())
-    {
-        return Err(RegistryError::InvalidDefinition(format!(
-            "shared ToolDef `{name}` must declare non-empty unique required_caps"
-        )));
-    }
-    match def.effect_kind {
-        EffectKind::Read if def.side_effecting || def.requires_approval => {
-            return Err(RegistryError::InvalidDefinition(format!(
-                "shared read ToolDef `{name}` must be non-side-effecting and non-gated"
-            )))
-        }
-        EffectKind::Mutate | EffectKind::External if !def.side_effecting => {
-            return Err(RegistryError::InvalidDefinition(format!(
-                "shared side-effect ToolDef `{name}` must declare side_effecting"
-            )))
-        }
-        _ => {}
-    }
-    Ok(())
+    def.validate()
+        .map_err(|error| RegistryError::InvalidDefinition(error.to_string()))
 }
 
 #[cfg(test)]
@@ -267,7 +173,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_git_catalogue_remains_verbatim() {
+    fn git_provider_catalogue_remains_verbatim() {
         let registry = ToolRegistry::with_git();
         let names = registry
             .tools()
