@@ -1,9 +1,11 @@
 use clap::{Args, Parser, Subcommand};
 use myelin_cli::client::execute;
 use myelin_cli::config::{
-    self, load_stored_credential, remove_stored_credentials, resolve_credential, resolve_edge,
-    store_credential, SESSION_SCHEME,
+    self, load_profile_credential, remove_profile_credential, resolve_edge,
+    resolve_profile_credential, selected_saved_profile, store_profile_credential, EdgeConfig,
+    SESSION_SCHEME,
 };
+use myelin_cli::context as cli_context;
 use myelin_cli::device_auth::{
     begin_authorization, new_authorization_request, wait_for_authorization,
 };
@@ -27,6 +29,9 @@ struct Cli {
     token: Option<String>,
     #[arg(long, global = true)]
     scheme: Option<String>,
+    /// Select a saved endpoint, context, and credential bundle.
+    #[arg(long, global = true)]
+    profile: Option<String>,
     #[arg(long, global = true)]
     idempotency_key: Option<String>,
     #[command(subcommand)]
@@ -39,6 +44,10 @@ enum Command {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+    Context {
+        #[command(subcommand)]
+        command: ContextCommand,
     },
     Whoami,
     Git {
@@ -94,6 +103,16 @@ enum AuthCommand {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum ContextCommand {
+    /// List the contexts saved on this device.
+    List,
+    /// Show the active context and verify its identity with Edge.
+    Current,
+    /// Make a saved profile the default for subsequent commands.
+    Use { name: String },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let exit = match run().await {
@@ -121,6 +140,20 @@ async fn run() -> Result<(), CliError> {
             AuthCommand::UnconfigureGit => configure_git(&cli, &getenv, &read_file, true),
             AuthCommand::GitCredential { operation } => {
                 serve_git_credential(&cli, operation, &getenv, &read_file)
+            }
+        },
+        Command::Context { command } => match command {
+            ContextCommand::List => {
+                reject_context_flags(&cli, true)?;
+                cli_context::list(cli.json, &getenv, &read_file)
+            }
+            ContextCommand::Current => {
+                reject_context_flags(&cli, true)?;
+                cli_context::current(cli.json, cli.profile.as_deref(), &getenv, &read_file).await
+            }
+            ContextCommand::Use { name } => {
+                reject_context_flags(&cli, false)?;
+                cli_context::activate(cli.json, name, &getenv)
             }
         },
         Command::Whoami => run_call(&cli, &getenv, &read_file, whoami_call(), None).await,
@@ -179,8 +212,17 @@ async fn login(
             .clone()
             .or_else(|| getenv(config::env::SCHEME).filter(|value| !value.is_empty()))
             .unwrap_or_else(|| config::DEFAULT_SCHEME.into());
-        let edge = resolve_edge(cli.edge.as_deref(), Some(&scheme), None, getenv);
-        let path = store_credential(&token, &scheme, Some(&edge.url), None, getenv)?;
+        let edge = login_edge(cli, &scheme, getenv)?;
+        let context = cli_context::inspect(&edge, &token).await?;
+        let path = store_profile_credential(
+            cli.profile.as_deref(),
+            &token,
+            &scheme,
+            Some(&edge.url),
+            None,
+            Some(&context),
+            getenv,
+        )?;
         println!(
             "Stored the {scheme} credential in the OS credential store; metadata is at {}. Run `myelin auth status` to verify it.",
             path.display()
@@ -193,7 +235,7 @@ async fn login(
         ));
     }
 
-    let edge = resolve_edge(cli.edge.as_deref(), Some(SESSION_SCHEME), None, getenv);
+    let edge = login_edge(cli, SESSION_SCHEME, getenv)?;
     let request = new_authorization_request();
     let authorization = begin_authorization(&edge, &request).await?;
 
@@ -213,11 +255,14 @@ async fn login(
     flush_stdout()?;
 
     let authorized = wait_for_authorization(&edge, &request, &authorization).await?;
-    let path = store_credential(
+    let context = cli_context::inspect(&edge, &authorized.credential.token).await?;
+    let path = store_profile_credential(
+        cli.profile.as_deref(),
         &authorized.credential.token,
         &authorized.credential.scheme,
         Some(&edge.url),
         Some(authorized.expires_at_unix()),
+        Some(&context),
         getenv,
     )?;
     let expires_at = chrono::DateTime::from_timestamp(authorized.expires_at_unix(), 0)
@@ -231,9 +276,24 @@ async fn login(
     Ok(())
 }
 
+fn login_edge(
+    cli: &Cli,
+    scheme: &str,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<EdgeConfig, CliError> {
+    let read = |path: &std::path::Path| std::fs::read_to_string(path).ok();
+    let saved = selected_saved_profile(cli.profile.as_deref(), getenv, &read)?;
+    Ok(resolve_edge(
+        cli.edge.as_deref(),
+        Some(scheme),
+        saved.as_ref().map(|profile| profile.edge_url.as_str()),
+        getenv,
+    ))
+}
+
 fn logout(cli: &Cli, getenv: &dyn Fn(&str) -> Option<String>) -> Result<(), CliError> {
     reject_auth_mutation_flags(cli)?;
-    let removed = remove_stored_credentials(getenv)?;
+    let removed = remove_profile_credential(cli.profile.as_deref(), getenv)?;
     let environment_active = cli.token.as_deref().is_some_and(|value| !value.is_empty())
         || getenv(config::env::TOKEN).is_some_and(|value| !value.is_empty());
     if cli.json {
@@ -248,10 +308,10 @@ fn logout(cli: &Cli, getenv: &dyn Fn(&str) -> Option<String>) -> Result<(), CliE
         );
     } else if environment_active {
         println!(
-            "Removed stored credentials. A --token or $MYELIN_TOKEN credential is still active for this process."
+            "Removed the selected profile's stored credential. A --token or $MYELIN_TOKEN credential is still active for this process."
         );
     } else if removed {
-        println!("Removed stored credentials from this device.");
+        println!("Removed the selected profile's stored credential from this device.");
     } else {
         println!("No stored credentials were present on this device.");
     }
@@ -274,11 +334,13 @@ fn configure_git(
     remove: bool,
 ) -> Result<(), CliError> {
     reject_git_auth_flags(cli)?;
-    let credential = load_stored_credential(getenv, read_file)?.ok_or_else(|| {
-        CliError::NotAuthenticated(
-            "Git setup needs a saved credential; run `myelin auth login` first".into(),
-        )
-    })?;
+    let selected =
+        load_profile_credential(cli.profile.as_deref(), getenv, read_file)?.ok_or_else(|| {
+            CliError::NotAuthenticated(
+                "Git setup needs a saved credential; run `myelin auth login` first".into(),
+            )
+        })?;
+    let credential = selected.credential;
     if !remove {
         credential.ensure_not_expired()?;
     }
@@ -291,7 +353,12 @@ fn configure_git(
     let executable = std::env::current_exe().map_err(|error| {
         CliError::Config(format!("cannot locate the Myelin executable: {error}"))
     })?;
-    let configuration = GitConfiguration::new(&scope, &executable, &credential.scheme)?;
+    let configuration = GitConfiguration::new(
+        &scope,
+        &executable,
+        &credential.scheme,
+        &selected.profile_name,
+    )?;
     let changed = if remove {
         git_credential::unconfigure(&configuration)?
     } else {
@@ -323,11 +390,13 @@ fn serve_git_credential(
 ) -> Result<(), CliError> {
     reject_git_auth_flags(cli)?;
     let operation = GitCredentialOperation::parse(operation)?;
-    let credential = load_stored_credential(getenv, read_file)?.ok_or_else(|| {
-        CliError::NotAuthenticated(
-            "Git authentication needs a saved credential; run `myelin auth login` first".into(),
-        )
-    })?;
+    let credential = load_profile_credential(cli.profile.as_deref(), getenv, read_file)?
+        .map(|selected| selected.credential)
+        .ok_or_else(|| {
+            CliError::NotAuthenticated(
+                "Git authentication needs a saved credential; run `myelin auth login` first".into(),
+            )
+        })?;
     git_credential::serve(
         operation,
         &credential,
@@ -359,6 +428,21 @@ fn whoami_call() -> EdgeCall {
         payload: None,
         idempotency_key: None,
     }
+}
+
+fn reject_context_flags(cli: &Cli, allow_profile: bool) -> Result<(), CliError> {
+    if cli.edge.is_some()
+        || cli.token.is_some()
+        || cli.scheme.is_some()
+        || cli.idempotency_key.is_some()
+        || (!allow_profile && cli.profile.is_some())
+    {
+        return Err(CliError::Usage(
+            "context commands use saved profiles and do not accept credential or Edge overrides"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn flush_stdout() -> Result<(), CliError> {
@@ -461,17 +545,23 @@ async fn run_call(
             call
         }
     };
-    let credential = resolve_credential(
+    let credential = resolve_profile_credential(
+        cli.profile.as_deref(),
         cli.token.as_deref(),
         cli.scheme.as_deref(),
         getenv,
         read_file,
     )?;
     credential.ensure_not_expired()?;
+    let saved_profile = selected_saved_profile(cli.profile.as_deref(), getenv, read_file)?;
     let edge = resolve_edge(
         cli.edge.as_deref(),
         Some(&credential.scheme),
-        credential.edge_url.as_deref(),
+        credential.edge_url.as_deref().or_else(|| {
+            saved_profile
+                .as_ref()
+                .map(|profile| profile.edge_url.as_str())
+        }),
         getenv,
     );
     if call.path.starts_with("/v1/ci/runs/") && call.path.ends_with("/log/live") {

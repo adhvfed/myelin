@@ -1,7 +1,6 @@
-use crate::credential_store::{
-    new_reference, validate_reference, write_owner_only_atomic, CredentialSecretStore,
-};
+use crate::credential_store::{new_reference, validate_reference, CredentialSecretStore};
 use crate::error::CliError;
+use crate::profiles::{Profile, ProfileCatalog, DEFAULT_PROFILE};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +18,7 @@ pub mod env {
     pub const SCHEME: &str = "MYELIN_TOKEN_SCHEME";
     pub const EDGE: &str = "MYELIN_EDGE";
     pub const CONFIG_DIR: &str = "MYELIN_CONFIG_DIR";
+    pub const PROFILE: &str = "MYELIN_PROFILE";
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,6 +35,31 @@ pub struct Credential {
     pub edge_url: Option<String>,
     /** Absolute Unix expiry. Long-lived and externally supplied credentials may not declare one. */
     pub expires_at_unix: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectedCredential {
+    pub profile_name: String,
+    pub credential: Credential,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SavedProfile {
+    pub name: String,
+    pub active: bool,
+    pub edge_url: String,
+    pub scheme: String,
+    pub expires_at_unix: Option<i64>,
+    pub tenant: Option<String>,
+    pub region: Option<String>,
+    pub project: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileContext {
+    pub tenant: String,
+    pub region: String,
+    pub project: Option<String>,
 }
 
 impl core::fmt::Debug for Credential {
@@ -141,6 +166,16 @@ pub fn resolve_credential(
     getenv: &dyn Fn(&str) -> Option<String>,
     read_file: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<Credential, CliError> {
+    resolve_profile_credential(None, flag_token, flag_scheme, getenv, read_file)
+}
+
+pub fn resolve_profile_credential(
+    profile_name: Option<&str>,
+    flag_token: Option<&str>,
+    flag_scheme: Option<&str>,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&Path) -> Option<String>,
+) -> Result<Credential, CliError> {
     let supplied_scheme = flag_scheme
         .map(str::to_string)
         .or_else(|| getenv(env::SCHEME).filter(|value| !value.is_empty()));
@@ -158,17 +193,30 @@ pub fn resolve_credential(
         );
     }
 
-    if let Some(mut stored) = load_stored_credential(getenv, read_file)? {
+    if let Some(mut stored) = load_profile_credential(profile_name, getenv, read_file)? {
         if let Some(scheme) = supplied_scheme {
-            stored.scheme = credential(
-                &stored.token,
+            stored.credential.scheme = credential(
+                &stored.credential.token,
                 &scheme,
-                stored.edge_url.as_deref(),
-                stored.expires_at_unix,
+                stored.credential.edge_url.as_deref(),
+                stored.credential.expires_at_unix,
             )?
             .scheme;
         }
-        return Ok(stored);
+        return Ok(stored.credential);
+    }
+
+    let requested_profile = profile_name
+        .map(str::to_string)
+        .or_else(|| getenv(env::PROFILE).filter(|value| !value.is_empty()));
+    if requested_profile
+        .as_deref()
+        .is_some_and(|name| name != DEFAULT_PROFILE)
+    {
+        let name = requested_profile.expect("checked above");
+        return Err(CliError::NotAuthenticated(format!(
+            "profile `{name}` is not signed in; run `myelin --profile {name} auth login`"
+        )));
     }
 
     let legacy_path = legacy_token_path(getenv)?;
@@ -192,12 +240,43 @@ pub fn load_stored_credential(
     getenv: &dyn Fn(&str) -> Option<String>,
     read_file: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<Option<Credential>, CliError> {
+    Ok(load_profile_credential(None, getenv, read_file)?.map(|stored| stored.credential))
+}
+
+pub fn load_profile_credential(
+    profile_name: Option<&str>,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&Path) -> Option<String>,
+) -> Result<Option<SelectedCredential>, CliError> {
+    let catalog = ProfileCatalog::load(getenv, read_file)?;
+    let selected_name = catalog.selected_name(profile_name, getenv)?;
+    if let Some(stored) = catalog.get(&selected_name) {
+        let directory = config_dir(getenv)?;
+        let token =
+            CredentialSecretStore::selected(&directory, getenv)?.get(&stored.credential_ref)?;
+        return credential(
+            &token,
+            &stored.scheme,
+            Some(&stored.edge_url),
+            stored.expires_at_unix,
+        )
+        .map(|credential| {
+            Some(SelectedCredential {
+                profile_name: selected_name,
+                credential,
+            })
+        });
+    }
+    if selected_name != DEFAULT_PROFILE {
+        return Ok(None);
+    }
+
     let path = credential_path(getenv)?;
     let Some(encoded) = read_file(&path) else {
         return Ok(None);
     };
     let stored = parse_stored_credential(&encoded, &path)?;
-    match stored {
+    let credential = match stored {
         StoredCredential::Legacy(stored) => credential(
             &stored.token,
             &stored.scheme,
@@ -215,8 +294,11 @@ pub fn load_stored_credential(
                 stored.expires_at_unix,
             )
         }
-    }
-    .map(Some)
+    }?;
+    Ok(Some(SelectedCredential {
+        profile_name: selected_name,
+        credential,
+    }))
 }
 
 pub fn store_credential(
@@ -226,7 +308,25 @@ pub fn store_credential(
     expires_at_unix: Option<i64>,
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> Result<PathBuf, CliError> {
+    store_profile_credential(None, token, scheme, edge_url, expires_at_unix, None, getenv)
+}
+
+pub fn store_profile_credential(
+    profile_name: Option<&str>,
+    token: &str,
+    scheme: &str,
+    edge_url: Option<&str>,
+    expires_at_unix: Option<i64>,
+    context: Option<&ProfileContext>,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<PathBuf, CliError> {
     let credential = credential(token, scheme, edge_url, expires_at_unix)?;
+    let Credential {
+        token,
+        scheme,
+        edge_url,
+        expires_at_unix,
+    } = credential;
     let dir = config_dir(getenv)?;
     std::fs::create_dir_all(&dir).map_err(|error| {
         CliError::Config(format!(
@@ -234,46 +334,151 @@ pub fn store_credential(
             dir.display()
         ))
     })?;
-    let path = dir.join("credentials.json");
-    let previous_reference = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|encoded| parse_stored_credential(&encoded, &path).ok())
-        .and_then(|stored| match stored {
-            StoredCredential::Referenced(stored) => Some(stored.credential_ref),
-            StoredCredential::Legacy(_) => None,
+    let read = |path: &Path| std::fs::read_to_string(path).ok();
+    let mut catalog = ProfileCatalog::load(getenv, &read)?;
+    let selected_name = catalog.selected_name(profile_name, getenv)?;
+    let legacy_path = credential_path(getenv)?;
+    let previous_reference = catalog
+        .get(&selected_name)
+        .map(|profile| profile.credential_ref.clone())
+        .or_else(|| {
+            (selected_name == DEFAULT_PROFILE)
+                .then(|| std::fs::read_to_string(&legacy_path).ok())
+                .flatten()
+                .and_then(|encoded| parse_stored_credential(&encoded, &legacy_path).ok())
+                .and_then(|stored| match stored {
+                    StoredCredential::Referenced(stored) => Some(stored.credential_ref),
+                    StoredCredential::Legacy(_) => None,
+                })
         });
     let credential_ref = new_reference();
-    let stored = StoredCredentialMetadata {
-        version: CREDENTIAL_VERSION,
+    let stored = Profile {
         credential_ref: credential_ref.clone(),
-        scheme: credential.scheme,
-        edge_url: credential.edge_url,
-        expires_at_unix: credential.expires_at_unix,
+        scheme,
+        edge_url: edge_url.ok_or_else(|| {
+            CliError::Config("saved profiles require the issuing Edge URL".into())
+        })?,
+        expires_at_unix,
+        tenant: context.map(|context| context.tenant.clone()),
+        region: context.map(|context| context.region.clone()),
+        project: context.and_then(|context| context.project.clone()),
     };
-    let encoded = serde_json::to_vec(&stored)
-        .map_err(|error| CliError::Config(format!("cannot encode credential metadata: {error}")))?;
     let secret_store = CredentialSecretStore::selected(&dir, getenv)?;
-    secret_store.put(&credential_ref, &credential.token)?;
-    if let Err(write_error) = write_owner_only_atomic(&path, &encoded) {
-        return match secret_store.delete(&credential_ref) {
-            Ok(_) => Err(write_error),
-            Err(_) => Err(CliError::Config(
-                "credential metadata installation failed and the new OS credential could not be cleaned up"
-                    .into(),
-            )),
-        };
+    secret_store.put(&credential_ref, &token)?;
+    if let Err(write_error) = catalog
+        .upsert(selected_name.clone(), stored)
+        .and_then(|()| catalog.save())
+    {
+        return cleanup_failed_install(&secret_store, &credential_ref, write_error);
     }
     if let Some(previous_reference) = previous_reference.filter(|old| old != &credential_ref) {
         // The new credential is already installed and usable. Treat failure to remove the old,
         // auth-bounded secret as cleanup debt rather than reporting a false login failure.
         let _ = secret_store.delete(&previous_reference);
     }
-    Ok(path)
+    if selected_name == DEFAULT_PROFILE {
+        remove_file_if_present(&legacy_path)?;
+        remove_file_if_present(&legacy_token_path(getenv)?)?;
+    }
+    Ok(dir.join("config.toml"))
 }
 
 /** Remove the referenced OS credential and every on-disk compatibility format. Environment and
  * command-line credentials are untouched. */
 pub fn remove_stored_credentials(
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<bool, CliError> {
+    remove_profile_credential(None, getenv)
+}
+
+pub fn remove_profile_credential(
+    profile_name: Option<&str>,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<bool, CliError> {
+    let read = |path: &Path| std::fs::read_to_string(path).ok();
+    let mut catalog = ProfileCatalog::load(getenv, &read)?;
+    let selected_name = catalog.selected_name(profile_name, getenv)?;
+    if let Some(stored) = catalog.get(&selected_name).cloned() {
+        let directory = config_dir(getenv)?;
+        let _ =
+            CredentialSecretStore::selected(&directory, getenv)?.delete(&stored.credential_ref)?;
+        catalog.remove(&selected_name);
+        catalog.save()?;
+        let mut removed = true;
+        if selected_name == DEFAULT_PROFILE {
+            removed |= remove_legacy_credential_files(getenv)?;
+        }
+        return Ok(removed);
+    }
+    if selected_name != DEFAULT_PROFILE {
+        return Ok(false);
+    }
+    remove_legacy_credential_files(getenv)
+}
+
+pub fn saved_profiles(
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&Path) -> Option<String>,
+) -> Result<Vec<SavedProfile>, CliError> {
+    let catalog = ProfileCatalog::load(getenv, read_file)?;
+    Ok(catalog
+        .iter()
+        .map(|(name, profile)| SavedProfile {
+            name: name.into(),
+            active: catalog.active_name() == Some(name),
+            edge_url: profile.edge_url.clone(),
+            scheme: profile.scheme.clone(),
+            expires_at_unix: profile.expires_at_unix,
+            tenant: profile.tenant.clone(),
+            region: profile.region.clone(),
+            project: profile.project.clone(),
+        })
+        .collect())
+}
+
+pub fn selected_saved_profile(
+    profile_name: Option<&str>,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&Path) -> Option<String>,
+) -> Result<Option<SavedProfile>, CliError> {
+    let catalog = ProfileCatalog::load(getenv, read_file)?;
+    let selected_name = catalog.selected_name(profile_name, getenv)?;
+    Ok(catalog.get(&selected_name).map(|profile| SavedProfile {
+        name: selected_name.clone(),
+        active: catalog.active_name() == Some(selected_name.as_str()),
+        edge_url: profile.edge_url.clone(),
+        scheme: profile.scheme.clone(),
+        expires_at_unix: profile.expires_at_unix,
+        tenant: profile.tenant.clone(),
+        region: profile.region.clone(),
+        project: profile.project.clone(),
+    }))
+}
+
+pub fn activate_profile(
+    profile_name: &str,
+    getenv: &dyn Fn(&str) -> Option<String>,
+) -> Result<(), CliError> {
+    let read = |path: &Path| std::fs::read_to_string(path).ok();
+    let mut catalog = ProfileCatalog::load(getenv, &read)?;
+    catalog.activate(profile_name)?;
+    catalog.save()
+}
+
+fn cleanup_failed_install(
+    secret_store: &CredentialSecretStore,
+    credential_ref: &str,
+    write_error: CliError,
+) -> Result<PathBuf, CliError> {
+    match secret_store.delete(credential_ref) {
+        Ok(_) => Err(write_error),
+        Err(_) => Err(CliError::Config(
+            "profile installation failed and the new OS credential could not be cleaned up".into(),
+        )),
+    }
+}
+
+fn remove_legacy_credential_files(
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> Result<bool, CliError> {
     let mut removed = false;
@@ -318,6 +523,17 @@ pub fn remove_stored_credentials(
         }
     }
     Ok(removed)
+}
+
+fn remove_file_if_present(path: &Path) -> Result<bool, CliError> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CliError::Config(format!(
+            "cannot remove stored credential {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 fn credential(
@@ -611,8 +827,9 @@ mod tests {
         .unwrap();
         let encoded = std::fs::read_to_string(&path).unwrap();
         assert!(!encoded.contains("ROUNDTRIP_TOKEN"));
-        let metadata: StoredCredentialMetadata = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(metadata.version, CREDENTIAL_VERSION);
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        let catalog = ProfileCatalog::load(&env, &read).unwrap();
+        let metadata = catalog.get(DEFAULT_PROFILE).unwrap().clone();
         let store = CredentialSecretStore::selected(&tmp, &env).unwrap();
         let secret_path = store
             .test_secret_path(&metadata.credential_ref)
@@ -646,8 +863,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rotated_path, path);
-        let rotated_metadata: StoredCredentialMetadata =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let rotated_catalog = ProfileCatalog::load(&env, &read).unwrap();
+        let rotated_metadata = rotated_catalog.get(DEFAULT_PROFILE).unwrap();
         assert_ne!(rotated_metadata.credential_ref, metadata.credential_ref);
         assert!(
             !secret_path.exists(),
@@ -661,7 +878,6 @@ mod tests {
             "ROTATED_TOKEN"
         );
 
-        let read = |path: &Path| std::fs::read_to_string(path).ok();
         assert_eq!(
             resolve_credential(None, None, &env, &read).unwrap(),
             Credential {
@@ -677,6 +893,92 @@ mod tests {
         assert!(!rotated_secret_path.exists());
         assert!(!tmp.join("token").exists());
         assert!(!remove_stored_credentials(&env).unwrap());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn named_profiles_switch_credentials_without_copying_or_exposing_them() {
+        let tmp = std::env::temp_dir().join(format!(
+            "myelin-cli-contexts-{}-{}",
+            std::process::id(),
+            new_reference()
+        ));
+        let dir = tmp.to_string_lossy().to_string();
+        let env = env_from(&[
+            ("MYELIN_CONFIG_DIR", &dir),
+            (crate::credential_store::TEST_STORE_ENV, "file"),
+        ]);
+        let context = ProfileContext {
+            tenant: "acme".into(),
+            region: "eu-north".into(),
+            project: None,
+        };
+
+        store_profile_credential(
+            Some("work"),
+            "WORK_SESSION",
+            SESSION_SCHEME,
+            Some("https://work.example"),
+            Some(4_102_444_800),
+            Some(&context),
+            &env,
+        )
+        .unwrap();
+        store_profile_credential(
+            Some("reviewer"),
+            "REVIEWER_SESSION",
+            SESSION_SCHEME,
+            Some("https://review.example"),
+            Some(4_102_444_800),
+            Some(&context),
+            &env,
+        )
+        .unwrap();
+
+        let read = |path: &Path| std::fs::read_to_string(path).ok();
+        let profiles = saved_profiles(&env, &read).unwrap();
+        assert_eq!(
+            profiles
+                .iter()
+                .map(|profile| (profile.name.as_str(), profile.active))
+                .collect::<Vec<_>>(),
+            vec![("reviewer", true), ("work", false)]
+        );
+        assert_eq!(
+            load_profile_credential(Some("work"), &env, &read)
+                .unwrap()
+                .unwrap()
+                .credential
+                .token,
+            "WORK_SESSION"
+        );
+        assert_eq!(
+            load_profile_credential(None, &env, &read)
+                .unwrap()
+                .unwrap()
+                .credential
+                .token,
+            "REVIEWER_SESSION"
+        );
+
+        activate_profile("work", &env).unwrap();
+        assert_eq!(
+            load_profile_credential(None, &env, &read)
+                .unwrap()
+                .unwrap()
+                .profile_name,
+            "work"
+        );
+        assert!(remove_profile_credential(Some("reviewer"), &env).unwrap());
+        assert_eq!(saved_profiles(&env, &read).unwrap().len(), 1);
+        assert!(remove_profile_credential(Some("work"), &env).unwrap());
+        assert!(!tmp.join("config.toml").exists());
+        assert_eq!(
+            std::fs::read_dir(tmp.join(".test-credentials"))
+                .unwrap()
+                .count(),
+            0
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

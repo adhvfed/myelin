@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 const MAX_CREDENTIAL_REQUEST_BYTES: u64 = 16 * 1024;
+const MAX_GIT_CONFIG_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
@@ -88,6 +89,8 @@ impl CredentialScope {
 pub struct GitConfiguration {
     key: String,
     helper: String,
+    owned_prefix: String,
+    legacy_helper: String,
 }
 
 impl GitConfiguration {
@@ -95,8 +98,10 @@ impl GitConfiguration {
         scope: &CredentialScope,
         executable: &Path,
         credential_scheme: &str,
+        profile_name: &str,
     ) -> Result<Self, CliError> {
         git_username(credential_scheme)?;
+        crate::profiles::validate_profile_name(profile_name)?;
         let executable = executable.to_str().ok_or_else(|| {
             CliError::Config("the Myelin executable path is not valid UTF-8".into())
         })?;
@@ -105,10 +110,24 @@ impl GitConfiguration {
                 "the Myelin executable path contains control characters".into(),
             ));
         }
+        let executable = shell_quote(executable);
         Ok(Self {
             key: format!("credential.{}.helper", scope.edge_origin),
-            helper: format!("!{} auth git-credential", shell_quote(executable)),
+            helper: format!(
+                "!{} --profile {} auth git-credential",
+                executable,
+                shell_quote(profile_name)
+            ),
+            owned_prefix: format!("!{executable} --profile "),
+            legacy_helper: format!("!{executable} auth git-credential"),
         })
+    }
+
+    fn owns(&self, helper: &str) -> bool {
+        helper == self.legacy_helper
+            || helper
+                .strip_prefix(&self.owned_prefix)
+                .is_some_and(|suffix| suffix.ends_with(" auth git-credential"))
     }
 }
 
@@ -142,56 +161,86 @@ pub fn serve(
 }
 
 pub fn configure(configuration: &GitConfiguration) -> Result<bool, CliError> {
-    if registration_exists(configuration)? {
-        return Ok(false);
+    let registered = registered_helpers(configuration)?;
+    let selected_exists = registered
+        .iter()
+        .any(|helper| helper == &configuration.helper);
+    let obsolete: Vec<_> = registered
+        .into_iter()
+        .filter(|helper| configuration.owns(helper) && helper != &configuration.helper)
+        .collect();
+    for helper in &obsolete {
+        remove_helper(configuration, helper)?;
     }
-    git_status(&[
-        "config",
-        "--global",
-        "--add",
-        &configuration.key,
-        &configuration.helper,
-    ])?;
-    Ok(true)
+    if !selected_exists {
+        git_status(&[
+            "config",
+            "--global",
+            "--add",
+            &configuration.key,
+            &configuration.helper,
+        ])?;
+    }
+    Ok(!selected_exists || !obsolete.is_empty())
 }
 
 pub fn unconfigure(configuration: &GitConfiguration) -> Result<bool, CliError> {
-    if !registration_exists(configuration)? {
-        return Ok(false);
+    let owned: Vec<_> = registered_helpers(configuration)?
+        .into_iter()
+        .filter(|helper| configuration.owns(helper))
+        .collect();
+    for helper in &owned {
+        remove_helper(configuration, helper)?;
     }
+    Ok(!owned.is_empty())
+}
+
+fn remove_helper(configuration: &GitConfiguration, helper: &str) -> Result<(), CliError> {
     git_status(&[
         "config",
         "--global",
         "--fixed-value",
         "--unset-all",
         &configuration.key,
-        &configuration.helper,
-    ])?;
-    Ok(true)
+        helper,
+    ])
 }
 
-fn registration_exists(configuration: &GitConfiguration) -> Result<bool, CliError> {
-    let status = Command::new("git")
+fn registered_helpers(configuration: &GitConfiguration) -> Result<Vec<String>, CliError> {
+    let output = Command::new("git")
         .args([
             "config",
             "--global",
-            "--fixed-value",
+            "--null",
             "--get-all",
             &configuration.key,
-            &configuration.helper,
         ])
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .output()
         .map_err(|error| CliError::Config(format!("cannot run Git: {error}")))?;
-    match status.code() {
-        Some(0) => Ok(true),
-        Some(1) => Ok(false),
-        _ => Err(CliError::Config(
-            "Git could not read the global credential-helper configuration".into(),
-        )),
+    match output.status.code() {
+        Some(1) => return Ok(Vec::new()),
+        Some(0) => {}
+        _ => {
+            return Err(CliError::Config(
+                "Git could not read the global credential-helper configuration".into(),
+            ))
+        }
     }
+    if output.stdout.len() > MAX_GIT_CONFIG_BYTES {
+        return Err(CliError::Config(
+            "Git credential-helper configuration exceeds the byte limit".into(),
+        ));
+    }
+    let encoded = std::str::from_utf8(&output.stdout).map_err(|_| {
+        CliError::Config("Git credential-helper configuration is not valid UTF-8".into())
+    })?;
+    Ok(encoded
+        .split('\0')
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect())
 }
 
 fn git_status(arguments: &[&str]) -> Result<(), CliError> {
@@ -428,12 +477,26 @@ mod tests {
             &scope,
             &PathBuf::from("/opt/Myelin's tools/myelin"),
             "session",
+            "work profile",
+        )
+        .unwrap_err();
+        assert_eq!(config.code(), 2);
+
+        let config = GitConfiguration::new(
+            &scope,
+            &PathBuf::from("/opt/Myelin's tools/myelin"),
+            "session",
+            "work",
         )
         .unwrap();
         assert_eq!(config.key, "credential.https://edge.example.helper");
         assert_eq!(
             config.helper,
-            "!'/opt/Myelin'\"'\"'s tools/myelin' auth git-credential"
+            "!'/opt/Myelin'\"'\"'s tools/myelin' --profile 'work' auth git-credential"
         );
+        assert!(config.owns("!'/opt/Myelin'\"'\"'s tools/myelin' auth git-credential"));
+        assert!(config
+            .owns("!'/opt/Myelin'\"'\"'s tools/myelin' --profile 'other' auth git-credential"));
+        assert!(!config.owns("!'/somewhere/else/myelin' auth git-credential"));
     }
 }

@@ -71,6 +71,13 @@ The `myelin` CLI mirrors the same Edge API used by the web application and agent
 Issues, CI, and Notifications, its collaboration surface includes:
 
 ```sh
+myelin --edge https://myelin.example auth login
+myelin --profile customer-a --edge https://customer-a.example auth login
+myelin context list
+myelin context use customer-a
+myelin context current
+myelin auth configure-git
+
 myelin chat list
 myelin chat create engineering --topic "Release coordination" --idempotency-key release-room
 myelin chat send 01J... "Ready for review." --idempotency-key release-message
@@ -81,6 +88,11 @@ myelin kb page create --title "Deployment runbook" --template runbook \
   --idempotency-key deployment-runbook
 myelin kb page get 01J...
 ```
+
+Each named profile bundles its Edge, tenant, region, optional project, and an opaque credential
+reference in `~/.config/myelin/config.toml`. The credential itself stays in the operating-system
+credential store. `--profile` and `MYELIN_PROFILE` select a profile for one command; `context use`
+changes the default without copying a token. Git helpers are scoped to an exact Edge and profile.
 
 Mutation keys are the caller's single retry identity: reuse the same key after a lost response.
 Chat and Knowledge derive their bounded durable nonce from it, so callers do not need a second

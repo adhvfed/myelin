@@ -179,7 +179,7 @@ pub(crate) fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), C
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
             Err(error) => {
                 return Err(CliError::Config(format!(
-                    "cannot create credential metadata in {}: {error}",
+                    "cannot create protected file in {}: {error}",
                     parent.display()
                 )))
             }
@@ -187,27 +187,27 @@ pub(crate) fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), C
     }
     let (temporary_path, mut file) = temporary.ok_or_else(|| {
         CliError::Config(format!(
-            "cannot allocate temporary credential metadata in {}",
+            "cannot allocate a temporary protected file in {}",
             parent.display()
         ))
     })?;
     let result = (|| {
         file.write_all(bytes).map_err(|error| {
             CliError::Config(format!(
-                "cannot write credential metadata {}: {error}",
+                "cannot write protected file {}: {error}",
                 temporary_path.display()
             ))
         })?;
         file.sync_all().map_err(|error| {
             CliError::Config(format!(
-                "cannot sync credential metadata {}: {error}",
+                "cannot sync protected file {}: {error}",
                 temporary_path.display()
             ))
         })?;
         drop(file);
         std::fs::rename(&temporary_path, path).map_err(|error| {
             CliError::Config(format!(
-                "cannot install credential metadata {}: {error}",
+                "cannot install protected file {}: {error}",
                 path.display()
             ))
         })
@@ -222,7 +222,7 @@ pub(crate) fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), C
 pub(crate) fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     std::fs::write(path, bytes).map_err(|error| {
         CliError::Config(format!(
-            "cannot write credential metadata {}: {error}",
+            "cannot write protected file {}: {error}",
             path.display()
         ))
     })

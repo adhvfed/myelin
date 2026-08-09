@@ -6,7 +6,7 @@ import { fileURLToPath } from "node:url";
 
 import { describe, expect, test } from "vitest";
 
-import { systemClient, uniqueName } from "../src/context.js";
+import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { gitRepositoryUrl, systemTestConfig } from "../src/config.js";
 import { git } from "../src/git-cli.js";
 import { GitProject } from "../src/git-project.js";
@@ -25,6 +25,7 @@ function cliEnvironment(
   delete environment.MYELIN_TOKEN;
   delete environment.MYELIN_TOKEN_SCHEME;
   delete environment.MYELIN_EDGE;
+  delete environment.MYELIN_PROFILE;
   return { ...environment, ...additions };
 }
 
@@ -142,6 +143,21 @@ async function askGitForCredential(
   return { exitCode, stdout, stderr };
 }
 
+function profileSection(config: string, profile: string): string {
+  const marker = `[profiles.${profile}]`;
+  const start = config.indexOf(marker);
+  if (start === -1) throw new Error(`config has no ${marker} section`);
+  const next = config.indexOf("\n[profiles.", start + marker.length);
+  return config.slice(start, next === -1 ? config.length : next);
+}
+
+function expireProfile(config: string, profile: string): string {
+  const section = profileSection(config, profile);
+  const expired = section.replace(/^expires_at_unix = \d+$/m, "expires_at_unix = 1");
+  if (expired === section) throw new Error(`profile ${profile} has no numeric expiry`);
+  return config.replace(section, expired);
+}
+
 describe("the CLI authentication journey", () => {
   test("a developer approves in the browser once, then works without copying an API key", async () => {
     const configDirectory = await mkdtemp(resolve(tmpdir(), "myelin-cli-system-"));
@@ -167,31 +183,97 @@ describe("the CLI authentication journey", () => {
       expect(loginStory).toContain("Approved. Your CLI session is ready");
       expect(loginStory).not.toContain(systemTestConfig.token);
 
-      const credentialPath = resolve(configDirectory, "credentials.json");
-      const stored = JSON.parse(await readFile(credentialPath, "utf8")) as Record<string, unknown>;
-      expect(stored).toMatchObject({
-        version: 2,
-        scheme: "session",
-        edge_url: systemTestConfig.edgeUrl,
-      });
-      expect(stored.credential_ref).toEqual(expect.any(String));
-      expect(stored.expires_at_unix).toEqual(expect.any(Number));
-      expect(Number(stored.expires_at_unix)).toBeGreaterThan(Math.floor(Date.now() / 1_000));
-      expect(stored).not.toHaveProperty("token");
+      const configPath = resolve(configDirectory, "config.toml");
+      const firstConfig = await readFile(configPath, "utf8");
+      const defaultProfile = profileSection(firstConfig, "default");
+      expect(firstConfig).toContain('active_profile = "default"');
+      expect(defaultProfile).toContain('scheme = "session"');
+      expect(defaultProfile).toContain(`edge_url = "${systemTestConfig.edgeUrl}"`);
+      expect(defaultProfile).toContain(`tenant = "${systemTestConfig.tenant}"`);
+      expect(defaultProfile).toContain(`region = "${systemTestConfig.region}"`);
+      expect(defaultProfile).toMatch(/^credential_ref = "[A-Za-z0-9_-]{22}"$/m);
+      expect(defaultProfile).toMatch(/^expires_at_unix = \d+$/m);
+      expect(firstConfig).not.toContain(systemTestConfig.token);
       if (process.platform !== "win32") {
-        expect((await stat(credentialPath)).mode & 0o777).toBe(0o600);
+        expect((await stat(configPath)).mode & 0o777).toBe(0o600);
       }
 
-      const status = await runCli(configDirectory, "auth", "status");
-      expect(status.exitCode, status.stderr).toBe(0);
-      expect(status.stdout).toContain(systemTestConfig.principal);
-      expect(status.stdout).toContain(`tenant=${systemTestConfig.tenant}`);
+      // A second browser-approved identity becomes another named context—not another copied key.
+      login = startCli(
+        configDirectory,
+        "--profile",
+        "reviewer",
+        "--edge",
+        systemTestConfig.edgeUrl,
+        "auth",
+        "login",
+        "--no-browser",
+      );
+      const reviewerOutput = await waitForCode(login);
+      await reviewerClient.json("/v1/auth/device/approval", {
+        method: "POST",
+        body: { user_code: reviewerOutput.code },
+      });
+      const reviewerLoginStory = await finish(login, reviewerOutput);
+      expect(reviewerLoginStory).toContain("Approved. Your CLI session is ready");
+      expect(reviewerLoginStory).not.toContain(systemTestConfig.reviewerToken);
+
+      const contexts = await runCli(configDirectory, "--json", "context", "list");
+      expect(contexts.exitCode, contexts.stderr).toBe(0);
+      expect(JSON.parse(contexts.stdout)).toMatchObject({
+        profiles: [
+          {
+            name: "default",
+            active: false,
+            tenant: systemTestConfig.tenant,
+            region: systemTestConfig.region,
+          },
+          {
+            name: "reviewer",
+            active: true,
+            tenant: systemTestConfig.tenant,
+            region: systemTestConfig.region,
+          },
+        ],
+      });
+      const twoProfileConfig = await readFile(configPath, "utf8");
+      expect(twoProfileConfig.match(/^credential_ref = /gm)).toHaveLength(2);
+      expect(twoProfileConfig).not.toContain(systemTestConfig.token);
+      expect(twoProfileConfig).not.toContain(systemTestConfig.reviewerToken);
+
+      const reviewerContext = await runCli(configDirectory, "--json", "context", "current");
+      expect(reviewerContext.exitCode, reviewerContext.stderr).toBe(0);
+      expect(JSON.parse(reviewerContext.stdout)).toMatchObject({
+        profile: "reviewer",
+        edge_url: systemTestConfig.edgeUrl,
+        identity: {
+          principal_id: systemTestConfig.reviewerPrincipal,
+          tenant: systemTestConfig.tenant,
+          region: systemTestConfig.region,
+        },
+      });
 
       const gitConfig = resolve(configDirectory, "gitconfig");
       const gitEnvironment = {
         GIT_CONFIG_GLOBAL: gitConfig,
         GIT_CONFIG_NOSYSTEM: "1",
       };
+      const configureReviewerGit = await runCliWith(
+        configDirectory,
+        { environment: gitEnvironment },
+        ["auth", "configure-git"],
+      );
+      expect(configureReviewerGit.exitCode, configureReviewerGit.stderr).toBe(0);
+
+      const chooseDefault = await runCli(configDirectory, "context", "use", "default");
+      expect(chooseDefault.exitCode, chooseDefault.stderr).toBe(0);
+      expect(chooseDefault.stdout).toContain("Using CLI context `default`");
+
+      const status = await runCli(configDirectory, "auth", "status");
+      expect(status.exitCode, status.stderr).toBe(0);
+      expect(status.stdout).toContain(systemTestConfig.principal);
+      expect(status.stdout).toContain(`tenant=${systemTestConfig.tenant}`);
+
       const configureGit = await runCliWith(
         configDirectory,
         { environment: gitEnvironment },
@@ -200,6 +282,16 @@ describe("the CLI authentication journey", () => {
       expect(configureGit.exitCode, configureGit.stderr).toBe(0);
       expect(configureGit.stdout).toContain("Git is ready");
       expect(configureGit.stdout).not.toContain(systemTestConfig.token);
+
+      // One Edge gets one Myelin helper. Reconfiguring replaces the old profile binding instead
+      // of letting Git accept whichever helper happens to answer first.
+      const edgeOrigin = new URL(systemTestConfig.edgeUrl).origin;
+      const helpers = await git(
+        ["config", "--global", "--get-all", `credential.${edgeOrigin}.helper`],
+        { environment: gitEnvironment },
+      );
+      expect(helpers.stdout.trim().split("\n")).toHaveLength(1);
+      expect(helpers.stdout).toContain("--profile 'default' auth git-credential");
 
       const edge = new URL(systemTestConfig.edgeUrl);
       const credential = await askGitForCredential(
@@ -236,10 +328,7 @@ describe("the CLI authentication journey", () => {
 
       // Once browser approval reaches its deadline, neither the CLI nor its Git helper pretends
       // that the old session is still useful—and neither needs to send the secret to discover it.
-      await writeFile(
-        credentialPath,
-        `${JSON.stringify({ ...stored, expires_at_unix: 1 }, null, 2)}\n`,
-      );
+      await writeFile(configPath, expireProfile(await readFile(configPath, "utf8"), "default"));
       const afterExpiry = await runCli(configDirectory, "auth", "status");
       expect(afterExpiry.exitCode).toBe(3);
       expect(afterExpiry.stderr).toContain("saved CLI session has expired");
@@ -267,8 +356,17 @@ describe("the CLI authentication journey", () => {
 
       const logout = await runCli(configDirectory, "auth", "logout");
       expect(logout.exitCode, logout.stderr).toBe(0);
-      expect(logout.stdout).toContain("Removed stored credentials");
+      expect(logout.stdout).toContain("Removed the selected profile's stored credential");
+
+      // Removing the active context falls through to the other saved identity without losing it.
+      const reviewerAfterLogout = await runCli(configDirectory, "auth", "status");
+      expect(reviewerAfterLogout.exitCode, reviewerAfterLogout.stderr).toBe(0);
+      expect(reviewerAfterLogout.stdout).toContain(systemTestConfig.reviewerPrincipal);
+
+      const finalLogout = await runCli(configDirectory, "auth", "logout");
+      expect(finalLogout.exitCode, finalLogout.stderr).toBe(0);
       expect(await readdir(resolve(configDirectory, ".test-credentials"))).toEqual([]);
+      await expect(stat(configPath)).rejects.toMatchObject({ code: "ENOENT" });
 
       const afterLogout = await runCli(configDirectory, "auth", "status");
       expect(afterLogout.exitCode).toBe(3);
@@ -277,5 +375,5 @@ describe("the CLI authentication journey", () => {
       if (login && login.exitCode === null) login.kill("SIGTERM");
       await rm(configDirectory, { recursive: true, force: true });
     }
-  }, 60_000);
+  }, 90_000);
 });

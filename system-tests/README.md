@@ -45,6 +45,9 @@ The suite is intentionally organized around externally visible contracts:
 - `authentication-lifecycle` starts logged out, lets an authenticated browser identity approve one
   verifier-bound CLI login, proves another CLI cannot claim it, and uses the fresh session exactly
   once without copying the browser credential.
+- `cli-authentication` approves two browser identities into named local contexts, switches between
+  them without exposing either secret, binds native Git to exactly one profile, refuses an expired
+  session before transport, and removes both OS-backed credentials on logout.
 - `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary and appears as
   one queued run. Fed disables the local sandbox runner, so this suite does not claim job execution.
 - `notification-lifecycle` publishes through the external JetStream boundary and verifies durable,
