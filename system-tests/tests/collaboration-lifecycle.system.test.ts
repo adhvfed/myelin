@@ -155,6 +155,26 @@ describe("collaboration lifecycle", () => {
       page: { id: pageId, title, visibility: "team", can_edit: false },
     });
 
+    const reviewerSave = await reviewerClient.json(
+      `/v1/knowledge/pages/${encodeURIComponent(pageId)}`,
+      {
+        method: "PUT",
+        body: {
+          expected_version: initialVersion,
+          title: "A reviewer must not overwrite this page",
+          visibility: "team",
+          blocks: [{ type: "paragraph", markdown: "Unauthorized replacement." }],
+        },
+        expectedStatus: 404,
+      },
+    );
+    expect(reviewerSave.body).toMatchObject({ error: { code: "not_found" } });
+
+    const unchanged = await systemClient.json(`/v1/knowledge/pages/${encodeURIComponent(pageId)}`);
+    expect(unchanged.body).toMatchObject({
+      page: { id: pageId, title, version: initialVersion, can_edit: true },
+    });
+
     const editedTitle = `${title} — approved`;
     const saved = await systemClient.json(`/v1/knowledge/pages/${encodeURIComponent(pageId)}`, {
       method: "PUT",
