@@ -384,7 +384,7 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(names, ["git.open_pr", "ci.read_log", "ci.read_run"]);
+    assert_eq!(names, ["ci.read_log", "ci.read_run", "git.open_pr"]);
     assert!(
         server.router().unwrap().current_token().is_some(),
         "discovery itself belongs to an attributed per-run identity"
@@ -471,7 +471,7 @@ fn ci_read_projects_shared_schema_and_routes_directly_without_idempotency() {
     let mutation_without_key = drive(
         &server,
         &[
-            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha"}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha","title":"Open alpha"}}}"#,
         ],
     );
     assert_eq!(mutation_without_key[0]["error"]["code"], -32602);
@@ -542,7 +542,7 @@ fn non_gated_tool_mints_a_run_token_and_routes_through_effect_api() {
     let resps = drive(
         &server,
         &[
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":7},"_meta":{"com.myelin/idempotencyKey":"review-7"}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"repo":"alpha","number":7,"verdict":"comment"},"_meta":{"com.myelin/idempotencyKey":"review-7"}}}"#,
         ],
     );
     let r = &resps[0];
@@ -811,7 +811,7 @@ fn an_approval_never_transfers_to_a_sibling_effect_and_a_reject_is_final() {
 fn a_revoked_run_token_is_denied_never_routed() {
     let server = governed_server();
     let first = server
-        .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#)
+        .handle_line(r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"repo":"alpha","number":1,"verdict":"comment"},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#)
         .unwrap();
     let first: serde_json::Value = serde_json::from_str(&first).unwrap();
     assert_eq!(first["result"]["isError"], false);
@@ -823,7 +823,7 @@ fn a_revoked_run_token_is_denied_never_routed() {
         .teardown(&router.principal().scope, &token, &now());
 
     let second = server
-        .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":2},"_meta":{"com.myelin/idempotencyKey":"review-2"}}}"#)
+        .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"repo":"alpha","number":2,"verdict":"comment"},"_meta":{"com.myelin/idempotencyKey":"review-2"}}}"#)
         .unwrap();
     let second: serde_json::Value = serde_json::from_str(&second).unwrap();
     assert_eq!(
@@ -915,7 +915,7 @@ fn malformed_request_is_a_jsonrpc_error_no_panic() {
 #[test]
 fn stdio_eof_tears_down_the_minted_run_token() {
     let server = governed_server();
-    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#;
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"repo":"alpha","number":1,"verdict":"comment"},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#;
     let mut output = Vec::new();
 
     server
@@ -939,7 +939,7 @@ fn stdio_eof_tears_down_the_minted_run_token() {
 #[test]
 fn stdio_output_error_still_tears_down_the_minted_run_token() {
     let server = governed_server();
-    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"number":1},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#;
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.submit_review","arguments":{"repo":"alpha","number":1,"verdict":"comment"},"_meta":{"com.myelin/idempotencyKey":"review-1"}}}"#;
     let error = server
         .run(request.as_bytes(), FailingWriter)
         .expect_err("broken stdout must surface");
@@ -971,7 +971,7 @@ fn post_mutation_audit_failure_is_indeterminate_terminal_and_tears_down() {
         Arc::new(FailOutcomeAudit),
     );
     let server = McpServer::with_router_and_clock(ToolRegistry::with_git(), router, Arc::new(now));
-    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha"},"_meta":{"com.myelin/idempotencyKey":"open-alpha"}}}"#;
+    let request = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.open_pr","arguments":{"repo":"alpha","title":"Open alpha"},"_meta":{"com.myelin/idempotencyKey":"open-alpha"}}}"#;
     let mut output = Vec::new();
     let error = server
         .run(request.as_bytes(), &mut output)
@@ -1164,7 +1164,7 @@ fn governed_calls_read_the_clock_afresh() {
         McpServer::with_router_and_clock(ToolRegistry::with_git(), governed_router(), clock);
     let call = |id| {
         format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"git.submit_review","arguments":{{"number":{id}}},"_meta":{{"com.myelin/idempotencyKey":"review-{id}"}}}}}}"#
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"git.submit_review","arguments":{{"repo":"alpha","number":{id},"verdict":"comment"}},"_meta":{{"com.myelin/idempotencyKey":"review-{id}"}}}}}}"#
         )
     };
 

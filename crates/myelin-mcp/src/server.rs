@@ -10,6 +10,7 @@ use crate::protocol::{
 };
 use crate::registry::ToolRegistry;
 use myelin_agent::EffectKind;
+use myelin_agent_service::validate_tool_arguments;
 use myelin_events::Timestamp;
 use myelin_identity::Principal;
 
@@ -47,7 +48,8 @@ pub struct McpServer {
 impl McpServer {
     pub fn new_catalogue_only() -> McpServer {
         McpServer {
-            registry: ToolRegistry::with_git(),
+            registry: ToolRegistry::platform()
+                .expect("the built-in MCP catalogue must remain valid"),
             router: None,
             read_executor: None,
             clock: Arc::new(system_now),
@@ -217,6 +219,9 @@ impl McpServer {
             .resolve(name)
             .ok_or_else(|| RpcError::new(INVALID_PARAMS, format!("unknown tool: {name}")))?
             .clone();
+
+        validate_tool_arguments(tool.definition(), &args)
+            .map_err(|reason| RpcError::new(INVALID_PARAMS, reason))?;
 
         let router = self.router.as_ref().ok_or_else(|| {
             RpcError::new(
@@ -454,15 +459,17 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_exposes_the_git_tools_with_requires_approval() {
+    fn tools_list_exposes_the_complete_shared_mcp_surface() {
         let s = McpServer::new_catalogue_only();
         let resp = s
             .handle_line(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
             .expect("resp");
         let v: Value = serde_json::from_str(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 6);
         let merge = tools.iter().find(|t| t["name"] == "git.merge").unwrap();
         assert_eq!(merge["annotations"]["requiresApproval"], json!(true));
+        assert!(tools.iter().any(|tool| tool["name"] == "ci.read_run"));
     }
 
     #[test]
@@ -496,11 +503,27 @@ mod tests {
         let s = McpServer::new_catalogue_only();
         let resp = s
             .handle_line(
-                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"git.merge"}}"#,
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"alpha","number":1}}}"#,
             )
             .unwrap();
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["error"]["code"], json!(GOVERNANCE_NOT_WIRED));
+    }
+
+    #[test]
+    fn tools_call_refuses_arguments_that_do_not_match_the_advertised_schema() {
+        let server = McpServer::new_catalogue_only();
+        let response = server
+            .handle_line(
+                r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"alpha","number":"one"}}}"#,
+            )
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["error"]["code"], json!(INVALID_PARAMS));
+        assert!(response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("field `number` must be of type `integer`"));
     }
 
     #[test]

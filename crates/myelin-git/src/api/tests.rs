@@ -1,4 +1,5 @@
 use super::*;
+use serde_json::json;
 
 #[test]
 fn every_write_endpoint_is_id_checked_bus2() {
@@ -459,4 +460,27 @@ fn agent_tools_project_into_the_shared_validated_catalogue_contract() {
             definition.canonical_name()
         );
     }
+}
+
+#[test]
+fn agent_tool_schemas_describe_the_arguments_the_git_adapter_consumes() {
+    let schemas = agent_tools()
+        .into_iter()
+        .map(|tool| {
+            (
+                tool.name,
+                serde_json::from_str::<serde_json::Value>(tool.input_schema).unwrap(),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+
+    assert_eq!(schemas["git.merge"]["required"], json!(["repo", "number"]));
+    assert_eq!(schemas["git.open_pr"]["required"], json!(["repo", "title"]));
+    assert_eq!(
+        schemas["git.submit_review"]["properties"]["verdict"]["enum"],
+        json!(["approve", "request_changes", "comment"])
+    );
+    assert!(schemas
+        .values()
+        .all(|schema| schema["additionalProperties"] == false));
 }

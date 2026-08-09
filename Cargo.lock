@@ -3085,6 +3085,7 @@ dependencies = [
  "chrono",
  "libc",
  "myelin-agent",
+ "myelin-agent-service",
  "myelin-ci-controlplane",
  "myelin-config",
  "myelin-edge",

@@ -469,6 +469,7 @@ fn flag_value(args: &[&str], flag: &str) -> Option<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AgentToolDef {
     pub name: &'static str,
+    pub input_schema: &'static str,
     pub requires_approval: bool,
     pub required_caps: &'static [&'static str],
     pub handler: Handler,
@@ -484,8 +485,12 @@ impl AgentToolDef {
             name: myelin_agent::ToolName(name.to_string()),
             subsystem: subsystem.to_string(),
             version: 1,
-            input_schema: r#"{"type":"object","properties":{"repo":{"type":"string","description":"the repository slug (tenant is taken from the verified run token)"},"number":{"type":"integer","description":"the pull request number, when the operation targets a pull request"}},"additionalProperties":true}"#.into(),
-            required_caps: self.required_caps.iter().map(|cap| (*cap).to_string()).collect(),
+            input_schema: self.input_schema.into(),
+            required_caps: self
+                .required_caps
+                .iter()
+                .map(|cap| (*cap).to_string())
+                .collect(),
             effect_kind: myelin_agent::EffectKind::Mutate,
             side_effecting: true,
             requires_approval: self.requires_approval,
@@ -498,24 +503,28 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
     vec![
         AgentToolDef {
             name: "git.merge",
+            input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1}},"additionalProperties":false}"#,
             requires_approval: true,
             required_caps: &["pull_request.merge"],
             handler: Handler::MergeGate,
         },
         AgentToolDef {
             name: "git.open_pr",
+            input_schema: r#"{"type":"object","required":["repo","title"],"properties":{"repo":{"type":"string","description":"the target repository slug; tenant and region come from the verified run token"},"title":{"type":"string"},"head_ref":{"type":"string"},"base_ref":{"type":"string"},"head_repo":{"type":"string"},"head_oid":{"type":"string"},"body_md":{"type":"string"},"draft":{"type":"boolean"},"reviewers":{"type":"array","items":{"type":"string"},"maxItems":100}},"additionalProperties":false}"#,
             requires_approval: false,
             required_caps: &["repo.push"],
             handler: Handler::Lifecycle,
         },
         AgentToolDef {
             name: "git.submit_review",
+            input_schema: r#"{"type":"object","required":["repo","number","verdict"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1},"verdict":{"type":"string","enum":["approve","request_changes","comment"]}},"additionalProperties":false}"#,
             requires_approval: false,
             required_caps: &["pull_request.review"],
             handler: Handler::Lifecycle,
         },
         AgentToolDef {
             name: "git.endorse_fork_ci",
+            input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1},"contexts":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}"#,
             requires_approval: false,
             required_caps: &["repo.approve_untrusted_ci"],
             handler: Handler::ForkEndorse,

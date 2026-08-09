@@ -16,6 +16,7 @@ path = "src/main.rs"
 myelin-git = { path = "../myelin-git" }
 
 myelin-agent = { path = "../myelin-agent" }
+myelin-agent-service = { path = "../myelin-agent-service" }
 
 myelin-identity-service = { path = "../myelin-identity-service" }
 

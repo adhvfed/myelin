@@ -1,82 +1,85 @@
-use myelin_agent::{EffectKind, ToolDef};
-use myelin_git::api::AgentToolDef;
-use serde_json::{json, Value};
 use std::collections::BTreeSet;
 
-#[derive(Clone, Debug)]
-enum ToolSource {
-    Shared(ToolDef),
-    Git(AgentToolDef),
-}
+use myelin_agent::{EffectKind, ToolDef};
+use myelin_agent_service::{catalogue_cursor, PlatformToolCatalogue};
+use serde_json::{json, Value};
 
 #[derive(Clone, Debug)]
 pub struct RegisteredTool {
-    mcp_name: String,
-    source: ToolSource,
+    name: String,
+    definition: ToolDef,
 }
 
 impl RegisteredTool {
     pub fn name(&self) -> &str {
-        &self.mcp_name
+        &self.name
+    }
+
+    pub fn cursor(&self) -> String {
+        catalogue_cursor(&self.definition)
+    }
+
+    pub fn definition(&self) -> &ToolDef {
+        &self.definition
     }
 
     pub fn requires_approval(&self) -> bool {
-        match &self.source {
-            ToolSource::Shared(def) => def.requires_approval,
-            ToolSource::Git(def) => def.requires_approval,
-        }
+        self.definition.requires_approval
     }
 
     pub fn required_caps(&self) -> Vec<&str> {
-        match &self.source {
-            ToolSource::Shared(def) => def.required_caps.iter().map(String::as_str).collect(),
-            ToolSource::Git(def) => def.required_caps.to_vec(),
-        }
+        self.definition
+            .required_caps
+            .iter()
+            .map(String::as_str)
+            .collect()
     }
 
     pub fn effect_kind(&self) -> EffectKind {
-        match &self.source {
-            ToolSource::Shared(def) => def.effect_kind,
-            ToolSource::Git(_) => EffectKind::Mutate,
-        }
+        self.definition.effect_kind
     }
 
     pub fn side_effecting(&self) -> bool {
-        match &self.source {
-            ToolSource::Shared(def) => def.side_effecting,
-            ToolSource::Git(_) => true,
-        }
+        self.definition.side_effecting
     }
 
     pub fn to_mcp_json(&self) -> Value {
-        match &self.source {
-            ToolSource::Shared(def) => def
-                .mcp_projection()
-                .expect("shared ToolDef schemas are validated at registration"),
-            ToolSource::Git(def) => def
-                .to_tool_def()
-                .mcp_projection()
-                .expect("the frozen Git ToolDefs are validated by their provider"),
-        }
+        self.definition
+            .mcp_projection()
+            .expect("the platform catalogue stores only validated ToolDefs")
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistryError {
-    InvalidDefinition(String),
-    DuplicateName(String),
+    Platform(String),
+    DuplicateCursor(String),
+    UnavailableCursor(String),
 }
 
 impl std::fmt::Display for RegistryError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RegistryError::InvalidDefinition(reason) => write!(f, "{reason}"),
-            RegistryError::DuplicateName(name) => {
-                write!(f, "duplicate MCP tool name `{name}`")
+            Self::Platform(reason) => {
+                write!(formatter, "platform tool catalogue refused: {reason}")
+            }
+            Self::UnavailableCursor(cursor) => {
+                write!(
+                    formatter,
+                    "selected MCP tool cursor `{cursor}` is unavailable"
+                )
+            }
+            Self::DuplicateCursor(cursor) => {
+                write!(
+                    formatter,
+                    "selected MCP tool cursor `{cursor}` is duplicated"
+                )
             }
         }
     }
 }
+
+impl std::error::Error for RegistryError {}
 
 #[derive(Clone, Debug, Default)]
 pub struct ToolRegistry {
@@ -84,59 +87,73 @@ pub struct ToolRegistry {
 }
 
 impl ToolRegistry {
-    pub fn new() -> ToolRegistry {
-        ToolRegistry { tools: Vec::new() }
+    pub fn platform() -> Result<Self, RegistryError> {
+        let catalogue = platform_catalogue()?;
+        Ok(Self::from_definitions(
+            catalogue
+                .latest_definitions()
+                .into_iter()
+                .filter(|definition| definition.exposed_over_mcp)
+                .cloned(),
+        ))
     }
 
-    pub fn register_legacy_git(&mut self) -> Result<(), RegistryError> {
-        for def in myelin_git::api::agent_tools() {
-            self.push(RegisteredTool {
-                mcp_name: def.name.to_string(),
-                source: ToolSource::Git(def),
-            })?;
+    /// Materialize precisely the versioned tools selected when the external agent was activated.
+    /// Capability equivalence is intentionally irrelevant: two tools sharing one grant remain two
+    /// distinct user choices.
+    pub fn for_cursors(cursors: &[String]) -> Result<Self, RegistryError> {
+        let catalogue = platform_catalogue()?;
+        let mut selected = Vec::with_capacity(cursors.len());
+        let mut seen = BTreeSet::new();
+        for cursor in cursors {
+            if !seen.insert(cursor) {
+                return Err(RegistryError::DuplicateCursor(cursor.clone()));
+            }
+            let definition = catalogue
+                .definitions()
+                .iter()
+                .find(|definition| catalogue_cursor(definition) == *cursor)
+                .filter(|definition| definition.exposed_over_mcp)
+                .ok_or_else(|| RegistryError::UnavailableCursor(cursor.clone()))?;
+            selected.push(definition.clone());
         }
-        Ok(())
-    }
-
-    pub fn register_tool_defs(
-        &mut self,
-        defs: impl IntoIterator<Item = ToolDef>,
-    ) -> Result<(), RegistryError> {
-        for def in defs.into_iter().filter(|def| def.exposed_over_mcp) {
-            validate_shared_def(&def)?;
-            let mcp_name = format!("{}.{}", def.subsystem, def.name.0);
-            self.push(RegisteredTool {
-                mcp_name,
-                source: ToolSource::Shared(def),
-            })?;
-        }
-        Ok(())
-    }
-
-    fn push(&mut self, tool: RegisteredTool) -> Result<(), RegistryError> {
-        if self
-            .tools
-            .iter()
-            .any(|existing| existing.name() == tool.name())
-        {
-            return Err(RegistryError::DuplicateName(tool.name().to_string()));
-        }
-        self.tools.push(tool);
-        Ok(())
+        Ok(Self::from_definitions(selected))
     }
 
     pub fn with_git() -> ToolRegistry {
-        let mut registry = ToolRegistry::new();
-        registry
-            .register_legacy_git()
-            .expect("the frozen Git catalogue has unique names");
-        registry
+        Self::filtered_platform(|definition| definition.subsystem == "git")
+            .expect("the built-in Git MCP catalogue must be valid")
     }
 
     pub fn with_git_and_ci_reads() -> Result<ToolRegistry, RegistryError> {
-        let mut registry = ToolRegistry::with_git();
-        registry.register_tool_defs(myelin_ci_controlplane::ci_tool_defs())?;
-        Ok(registry)
+        Self::filtered_platform(|definition| {
+            definition.subsystem == "git" || definition.subsystem == "ci"
+        })
+    }
+
+    fn filtered_platform(
+        include: impl Fn(&ToolDef) -> bool,
+    ) -> Result<ToolRegistry, RegistryError> {
+        let catalogue = platform_catalogue()?;
+        Ok(Self::from_definitions(
+            catalogue
+                .latest_definitions()
+                .into_iter()
+                .filter(|definition| definition.exposed_over_mcp && include(definition))
+                .cloned(),
+        ))
+    }
+
+    fn from_definitions(definitions: impl IntoIterator<Item = ToolDef>) -> Self {
+        let mut tools = definitions
+            .into_iter()
+            .map(|definition| RegisteredTool {
+                name: definition.canonical_name(),
+                definition,
+            })
+            .collect::<Vec<_>>();
+        tools.sort_by(|left, right| left.name.cmp(&right.name));
+        Self { tools }
     }
 
     pub fn tools(&self) -> &[RegisteredTool] {
@@ -163,9 +180,8 @@ impl ToolRegistry {
     }
 }
 
-fn validate_shared_def(def: &ToolDef) -> Result<(), RegistryError> {
-    def.validate()
-        .map_err(|error| RegistryError::InvalidDefinition(error.to_string()))
+fn platform_catalogue() -> Result<PlatformToolCatalogue, RegistryError> {
+    PlatformToolCatalogue::platform().map_err(|error| RegistryError::Platform(error.to_string()))
 }
 
 #[cfg(test)]
@@ -173,18 +189,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn git_provider_catalogue_remains_verbatim() {
-        let registry = ToolRegistry::with_git();
+    fn the_registry_is_the_mcp_projection_of_the_shared_platform_catalogue() {
+        let registry = ToolRegistry::platform().unwrap();
         let names = registry
             .tools()
             .iter()
             .map(RegisteredTool::name)
             .collect::<Vec<_>>();
-        let expected = myelin_git::api::agent_tools()
-            .iter()
-            .map(|def| def.name)
-            .collect::<Vec<_>>();
-        assert_eq!(names, expected);
+        assert_eq!(
+            names,
+            [
+                "ci.read_log",
+                "ci.read_run",
+                "git.endorse_fork_ci",
+                "git.merge",
+                "git.open_pr",
+                "git.submit_review",
+            ]
+        );
         assert!(registry.resolve("git.merge").unwrap().requires_approval());
         assert_eq!(
             registry.resolve("git.open_pr").unwrap().required_caps(),
@@ -193,40 +215,38 @@ mod tests {
     }
 
     #[test]
-    fn ci_projection_is_exact_and_only_exposes_implemented_reads() {
-        let registry = ToolRegistry::with_git_and_ci_reads().unwrap();
-        let read_run = registry.resolve("ci.read_run").expect("read_run exposed");
-        let read_log = registry.resolve("ci.read_log").expect("read_log exposed");
-        assert_eq!(read_run.effect_kind(), EffectKind::Read);
-        assert!(!read_run.side_effecting());
-        assert_eq!(read_run.required_caps(), ["run.view"]);
-        assert_eq!(
-            read_run.to_mcp_json()["inputSchema"],
-            serde_json::from_str::<Value>(
-                &myelin_ci_controlplane::ci_tool_def("read_run").input_schema
-            )
-            .unwrap()
+    fn a_versioned_selection_never_expands_to_a_capability_equivalent_tool() {
+        let registry = ToolRegistry::for_cursors(&["ci.read_run.v1".into()]).unwrap();
+        assert!(registry.resolve("ci.read_run").is_some());
+        assert!(
+            registry.resolve("ci.read_log").is_none(),
+            "sharing `run.view` is not consent to a second tool"
         );
-        assert!(read_log.to_mcp_json()["inputSchema"]["properties"]["limit"]["maximum"] == 262_144);
-        assert!(registry.resolve("ci.run").is_none());
-        assert!(registry.resolve("ci.validate").is_none());
+        assert!(matches!(
+            ToolRegistry::for_cursors(&["ci.missing.v1".into()]),
+            Err(RegistryError::UnavailableCursor(_))
+        ));
     }
 
     #[test]
-    fn shared_registration_rejects_malformed_or_duplicate_contracts() {
-        let mut registry = ToolRegistry::new();
-        let mut def = myelin_ci_controlplane::ci_tool_def("read_run");
-        def.input_schema = "not json".into();
-        assert!(matches!(
-            registry.register_tool_defs([def]),
-            Err(RegistryError::InvalidDefinition(_))
-        ));
+    fn git_and_ci_contracts_preserve_the_provider_schemas_exactly() {
+        let registry = ToolRegistry::with_git_and_ci_reads().unwrap();
+        let catalogue = PlatformToolCatalogue::platform().unwrap();
+        for tool in registry.tools() {
+            let provider = catalogue.resolve(tool.name()).unwrap();
+            assert_eq!(tool.cursor(), catalogue_cursor(provider));
+            assert_eq!(
+                tool.to_mcp_json()["inputSchema"],
+                serde_json::from_str::<Value>(&provider.input_schema).unwrap()
+            );
+        }
+    }
 
-        let def = myelin_ci_controlplane::ci_tool_def("read_run");
-        registry.register_tool_defs([def.clone()]).unwrap();
-        assert_eq!(
-            registry.register_tool_defs([def]),
-            Err(RegistryError::DuplicateName("ci.read_run".into()))
-        );
+    #[test]
+    fn a_corrupt_durable_selection_with_duplicate_cursors_fails_closed() {
+        assert!(matches!(
+            ToolRegistry::for_cursors(&["ci.read_run.v1".into(), "ci.read_run.v1".into()]),
+            Err(RegistryError::DuplicateCursor(cursor)) if cursor == "ci.read_run.v1"
+        ));
     }
 }
