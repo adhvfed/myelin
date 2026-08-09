@@ -1336,6 +1336,7 @@ impl DurableGitBackend {
         path: &str,
         expected_base: &str,
         contents: &str,
+        start_ref: Option<&str>,
     ) -> Result<WebEditOutcome, DurableError> {
         let RepoActorContext {
             tenant,
@@ -1346,9 +1347,22 @@ impl DurableGitBackend {
         let loc = Self::loc(tenant, region, slug);
         let repo = Arc::new(self.store.open_repo(&loc)?);
         let full = format!("refs/heads/{gitref}");
+        let start_full = start_ref.map(|value| {
+            if value.starts_with("refs/heads/") {
+                value.to_string()
+            } else {
+                format!("refs/heads/{value}")
+            }
+        });
+        let target_exists = repo.read_ref(&full)?.is_some();
+        let content_ref = if target_exists {
+            full.as_str()
+        } else {
+            start_full.as_deref().unwrap_or(full.as_str())
+        };
 
         let current_base = repo
-            .blob_oid_at_path(&full, path)?
+            .blob_oid_at_path(content_ref, path)?
             .map(|oid| oid.0)
             .unwrap_or_default();
 
@@ -1361,11 +1375,18 @@ impl DurableGitBackend {
         }
 
         let psn = Self::pseudonym(tenant, principal);
-        let (new_commit, _new_blob, parent) =
-            repo.build_file_commit(&full, path, contents.as_bytes(), "web edit", &psn, &psn)?;
+        let (new_commit, _new_blob, prior_target) = repo.build_file_commit_from_ref(
+            &full,
+            start_full.as_deref(),
+            path,
+            contents.as_bytes(),
+            "web edit",
+            &psn,
+            &psn,
+        )?;
 
         let ref_store = self.open_durable_refstore(repo, slug, tenant, region, principal);
-        let expected_old = parent
+        let expected_old = prior_target
             .map(|p| PushOid::new(p.0))
             .unwrap_or_else(PushOid::zero);
         let push = PushSession {
@@ -1535,6 +1556,41 @@ impl DurableGitBackend {
         rec.title = title;
         rec.body_md = body_md;
         rec.author_is_agent = Self::is_agent(principal);
+        if let Some(reviewers) = body.get("reviewers") {
+            let reviewers = reviewers.as_array().ok_or_else(|| {
+                DurableError::Git("open-PR `reviewers` must be an array".into())
+            })?;
+            if reviewers.len() > 100 {
+                return Err(DurableError::Git(
+                    "open-PR `reviewers` exceeds 100 entries".into(),
+                ));
+            }
+            let author = principal.principal_id.0.as_str();
+            let mut requested = std::collections::BTreeSet::new();
+            for reviewer in reviewers {
+                let reviewer = reviewer.as_str().ok_or_else(|| {
+                    DurableError::Git("open-PR reviewer ids must be strings".into())
+                })?;
+                if reviewer.trim() != reviewer
+                    || reviewer.is_empty()
+                    || reviewer.len() > 255
+                    || reviewer.chars().any(char::is_control)
+                {
+                    return Err(DurableError::Git(
+                        "open-PR reviewer ids must be 1-255 clean bytes without surrounding whitespace"
+                            .into(),
+                    ));
+                }
+                if reviewer != author {
+                    requested.insert(format!("{reviewer}@{tenant}.noreply"));
+                }
+            }
+            rec.reviews.extend(requested.into_iter().map(|reviewer_pseudonym| ReviewRecord {
+                reviewer_pseudonym,
+                state: ReviewState::Requested,
+                is_agent: false,
+            }));
+        }
         let now = now_unix();
         rec.created_at = Some(now);
         rec.updated_at = Some(now);

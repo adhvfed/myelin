@@ -365,8 +365,14 @@ scripts:
       --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
       test -n "$token";
       export MYELIN_SYSTEM_TEST_TOKEN="$token";
+      reviewer_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_SYSTEM_TEST_TENANT" --region "$MYELIN_SYSTEM_TEST_REGION"
+      --principal system-reviewer --display-name "System Reviewer"
+      --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
+      test -n "$reviewer_token";
+      export MYELIN_SYSTEM_TEST_REVIEWER_TOKEN="$reviewer_token";
       pnpm --dir system-tests install --frozen-lockfile;
-      pnpm --dir system-tests test -- "$@"' -- "$@"
+      pnpm --dir system-tests exec vitest run "$@"' -- "$@"
 
   test:integration:
     depends_on: [web]

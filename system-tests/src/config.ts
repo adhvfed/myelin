@@ -20,6 +20,7 @@ function url(name: string): string {
 export interface SystemTestConfig {
   edgeUrl: string;
   token: string;
+  reviewerToken: string;
   tokenScheme: string;
   tenant: string;
   region: string;
@@ -34,6 +35,7 @@ export interface SystemTestConfig {
 export const systemTestConfig: SystemTestConfig = Object.freeze({
   edgeUrl: url("MYELIN_SYSTEM_TEST_EDGE_URL"),
   token: required("MYELIN_SYSTEM_TEST_TOKEN"),
+  reviewerToken: required("MYELIN_SYSTEM_TEST_REVIEWER_TOKEN"),
   tokenScheme: process.env.MYELIN_SYSTEM_TEST_TOKEN_SCHEME?.trim() || "agent",
   tenant: required("MYELIN_SYSTEM_TEST_TENANT"),
   region: process.env.MYELIN_SYSTEM_TEST_REGION?.trim() || "fr-par",

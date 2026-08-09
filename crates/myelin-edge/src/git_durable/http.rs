@@ -227,7 +227,7 @@ struct DBlobView {
 }
 impl Handler for DBlobView {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let vm = self
+        let mut vm = self
             .be
             .blob_json(
                 tenant_of(ctx),
@@ -237,6 +237,19 @@ impl Handler for DBlobView {
                 param(ctx, "path")?,
             )
             .map_err(map_durable_err)?;
+        if let Some(object) = vm.as_object_mut() {
+            let loc = RepoLoc::new(
+                tenant_of(ctx),
+                region_of(ctx),
+                param(ctx, "repo")?,
+            );
+            let may_edit = self.be.repo_authorizer().authorize_repo_permission(
+                ctx.principal,
+                &loc,
+                RepoPermission::Push,
+            );
+            object.insert("viewer_may_edit".into(), Value::Bool(may_edit));
+        }
         Ok(EdgeResponse::json(200, &vm))
     }
 }
@@ -1279,6 +1292,11 @@ impl Handler for DWebEditCommit {
             .get("contents")
             .and_then(Value::as_str)
             .ok_or_else(|| EdgeError::BadRequest("commit body missing `contents`".into()))?;
+        let start_ref = body.get("start_ref").map(|value| {
+            value.as_str().ok_or_else(|| {
+                EdgeError::BadRequest("commit body `start_ref` must be a string".into())
+            })
+        }).transpose()?;
         let outcome = self
             .be
             .web_edit_commit(
@@ -1292,6 +1310,7 @@ impl Handler for DWebEditCommit {
                 param(ctx, "path")?,
                 expected_base,
                 contents,
+                start_ref,
             )
             .map_err(map_durable_err)?;
         match outcome {
@@ -4961,6 +4980,51 @@ mod pr_thread_tests {
             json!({ "body_md": "requested-reviewer comment" }),
         )
         .expect("a directly requested reviewer may review without repo Push");
+    }
+
+    #[test]
+    fn opening_a_pull_request_records_unique_requested_reviewers() {
+        let (be, writer, reader) = setup("requested-reviewers", &"0".repeat(40));
+        let opened = be
+            .open_pr(
+                TENANT,
+                REGION,
+                SLUG,
+                &json!({
+                    "title": "Request review while opening",
+                    "base_ref": "refs/heads/main",
+                    "head_ref": "refs/heads/second-feature",
+                    "head_oid": "1".repeat(40),
+                    "reviewers": ["u:reader", "u:reader", "u:writer"],
+                }),
+                &writer,
+            )
+            .expect("open pull request");
+
+        assert_eq!(opened.reviews.len(), 1, "duplicates and the author are omitted");
+        assert_eq!(opened.reviews[0].reviewer_pseudonym, "u:reader@acme.noreply");
+        assert_eq!(opened.reviews[0].state, ReviewState::Requested);
+        assert!(
+            be.authorize_pr_review(TENANT, REGION, SLUG, opened.number, &reader),
+            "a requested reader may participate in the review"
+        );
+
+        let malformed = be
+            .open_pr(
+                TENANT,
+                REGION,
+                SLUG,
+                &json!({
+                    "title": "Reject malformed reviewer",
+                    "base_ref": "refs/heads/main",
+                    "head_ref": "refs/heads/third-feature",
+                    "head_oid": "2".repeat(40),
+                    "reviewers": [" u:reader"],
+                }),
+                &writer,
+            )
+            .expect_err("reviewer ids must be canonical");
+        assert!(matches!(malformed, DurableError::Git(message) if message.contains("reviewer ids")));
     }
 
     #[test]

@@ -1785,8 +1785,40 @@ impl DurableGitRepo {
         author_name: &str,
         author_email: &str,
     ) -> Result<(Oid, Oid, Option<Oid>), DurableError> {
+        self.build_file_commit_from_ref(
+            ref_name,
+            None,
+            path,
+            contents,
+            message,
+            author_name,
+            author_email,
+        )
+    }
+
+    /// Build a file commit on `ref_name`, optionally using another ref as the first parent when the
+    /// target branch does not exist yet. The returned optional OID is always the prior target tip,
+    /// which keeps the caller's ref-CAS expectation independent from the commit's start point.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_file_commit_from_ref(
+        &self,
+        ref_name: &str,
+        start_ref: Option<&str>,
+        path: &str,
+        contents: &[u8],
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<(Oid, Oid, Option<Oid>), DurableError> {
         let repo = self.open_git()?;
-        let parent_oid = self.tip_commit(&repo, ref_name)?;
+        let target_oid = self.tip_commit(&repo, ref_name)?;
+        let parent_oid = match (&target_oid, start_ref) {
+            (Some(oid), _) => Some(*oid),
+            (None, Some(source)) => Some(self.tip_commit(&repo, source)?.ok_or_else(|| {
+                DurableError::NotFound(format!("branch start ref `{source}` does not exist"))
+            })?),
+            (None, None) => None,
+        };
         let clean_path = path.trim_matches('/');
         if clean_path.is_empty() || clean_path != path || !is_safe_tree_path(clean_path) {
             return Err(DurableError::Git("web edit path is not safe".into()));
@@ -1819,7 +1851,7 @@ impl DurableGitRepo {
         Ok((
             Oid::new(commit_oid.to_string()),
             Oid::new(blob_oid.to_string()),
-            parent_oid.map(|p| Oid::new(p.to_string())),
+            target_oid.map(|p| Oid::new(p.to_string())),
         ))
     }
 
@@ -2094,6 +2126,57 @@ mod tests {
         let tree = repo.write_tree(&[("file.txt", &blob)]).expect("tree");
         repo.write_commit(&tree, &[], "feat: seed", "psn-7@acme.noreply", "psn-7@acme.noreply")
             .expect("commit")
+    }
+
+    #[test]
+    fn a_new_branch_commit_can_start_from_an_existing_branch_without_changing_target_cas() {
+        let root = temp_root("file-commit-start-ref");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create repo");
+        let main = seed_commit(&repo, b"main branch\n");
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&main),
+            "create main",
+            "psn-7@acme.noreply",
+        )
+        .expect("create main ref");
+
+        let (feature, _, prior_target) = repo
+            .build_file_commit_from_ref(
+                "refs/heads/feature",
+                Some("refs/heads/main"),
+                "nested/feature.txt",
+                b"feature branch\n",
+                "feat: branch from main",
+                "psn-7@acme.noreply",
+                "psn-7@acme.noreply",
+            )
+            .expect("build feature commit");
+
+        assert_eq!(prior_target, None, "the target branch does not exist yet");
+        assert_eq!(
+            repo.read_ref("refs/heads/feature").expect("read feature"),
+            None,
+            "building the commit does not publish the target ref"
+        );
+        let git = repo.open_git().expect("open git");
+        let commit = git
+            .find_commit(DurableGitRepo::parse_oid(&feature).expect("feature oid"))
+            .expect("feature commit");
+        assert_eq!(commit.parent_count(), 1);
+        assert_eq!(commit.parent_id(0).expect("first parent").to_string(), main.0);
+        assert!(
+            commit
+                .tree()
+                .expect("feature tree")
+                .get_path(std::path::Path::new("file.txt"))
+                .is_ok(),
+            "the source branch tree is inherited"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     fn write_commit_at(

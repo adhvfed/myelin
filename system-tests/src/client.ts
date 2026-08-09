@@ -9,6 +9,7 @@ export interface RequestOptions {
   method?: Method;
   body?: unknown;
   authenticated?: boolean;
+  token?: string;
   expectedStatus?: number | readonly number[];
   idempotencyKey?: string | false;
   headers?: Readonly<Record<string, string>>;
@@ -48,7 +49,7 @@ export class SystemTestClient {
     const headers = new Headers(options.headers);
     headers.set("accept", "application/json");
     if (authenticated) {
-      headers.set("authorization", `Bearer ${this.config.token}`);
+      headers.set("authorization", `Bearer ${options.token ?? this.config.token}`);
       headers.set("x-myelin-token-scheme", this.config.tokenScheme);
     }
     if (options.body !== undefined) headers.set("content-type", "application/json");
