@@ -115,9 +115,16 @@ pub(crate) enum ApprovalOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ClaimOutcome {
     Pending,
-    Approved(DeviceApproval),
+    Approved(DeviceAuthorizationClaim),
     Expired,
     Invalid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceAuthorizationClaim {
+    pub approval: DeviceApproval,
+    pub session_jti: String,
+    pub authorization_expires_at_unix: i64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -277,8 +284,11 @@ impl DeviceAuthorizationStore for MemoryDeviceAuthorizationStore {
         let Some(approval) = stored.approval.clone() else {
             return Ok(ClaimOutcome::Pending);
         };
-        authorizations.remove(&device_digest);
-        Ok(ClaimOutcome::Approved(approval))
+        Ok(ClaimOutcome::Approved(DeviceAuthorizationClaim {
+            approval,
+            session_jti: device_session_jti(&device_digest),
+            authorization_expires_at_unix: stored.pending.expires_at_unix,
+        }))
     }
 }
 
@@ -503,16 +513,15 @@ impl PgDeviceAuthorizationStore {
                 DeviceAuthorizationStoreError::corrupt("approval expiry is missing")
             })?,
         )?;
-        sqlx::query("DELETE FROM auth_device_authorization WHERE device_digest = $1")
-            .bind(device_digest.as_slice())
-            .execute(&mut *transaction)
-            .await
-            .map_err(DeviceAuthorizationStoreError::database)?;
         transaction
             .commit()
             .await
             .map_err(DeviceAuthorizationStoreError::database)?;
-        Ok(ClaimOutcome::Approved(approval))
+        Ok(ClaimOutcome::Approved(DeviceAuthorizationClaim {
+            approval,
+            session_jti: device_session_jti(&device_digest),
+            authorization_expires_at_unix: expires_at_unix,
+        }))
     }
 }
 
@@ -810,6 +819,13 @@ fn digest(namespace: &str, value: &str) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
+fn device_session_jti(device_digest: &[u8; 32]) -> String {
+    format!(
+        "session-device-{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(device_digest)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,7 +856,7 @@ mod tests {
     }
 
     #[test]
-    fn a_human_approval_is_claimed_once_by_the_cli_that_holds_the_verifier() {
+    fn a_response_lost_retry_returns_the_same_approved_session_identity() {
         let broker = DeviceAuthorizationBroker::memory("https://myelin.example/cli/auth")
             .unwrap()
             .with_clock(|| 1_800_000_000);
@@ -857,14 +873,12 @@ mod tests {
                 .unwrap(),
             ApprovalOutcome::Approved
         );
+        let claimed = broker.claim(&started.device_code, &verifier).unwrap();
+        assert!(matches!(claimed, ClaimOutcome::Approved(_)));
         assert_eq!(
             broker.claim(&started.device_code, &verifier).unwrap(),
-            ClaimOutcome::Approved(approval())
-        );
-        assert_eq!(
-            broker.claim(&started.device_code, &verifier).unwrap(),
-            ClaimOutcome::Invalid,
-            "the approved identity is consumed atomically"
+            claimed,
+            "a response-lost retry resolves to the same deterministic session identity"
         );
     }
 
@@ -886,7 +900,11 @@ mod tests {
         );
         assert_eq!(
             broker.claim(&started.device_code, &verifier).unwrap(),
-            ClaimOutcome::Approved(approval()),
+            ClaimOutcome::Approved(DeviceAuthorizationClaim {
+                approval: approval(),
+                session_jti: device_session_jti(&digest("device", &started.device_code)),
+                authorization_expires_at_unix: 1_800_000_000 + DEVICE_AUTHORIZATION_TTL_SECS,
+            }),
             "a wrong verifier does not consume the authorization"
         );
     }

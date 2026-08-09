@@ -2,7 +2,7 @@ use crate::authz::{authorize_edge_action, human_session_authority};
 use crate::catalogue::{Handler, HandlerCtx, Method, Page};
 use crate::device_auth::{
     ApprovalOutcome, ClaimOutcome, DeviceApproval, DeviceAuthorizationBroker,
-    DeviceAuthorizationError,
+    DeviceAuthorizationError, DEVICE_AUTHORIZATION_TTL_SECS,
 };
 use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
@@ -64,14 +64,19 @@ impl HumanSessionIssuer {
     fn mint_device_session(
         &self,
         approval: &DeviceApproval,
+        session_jti: &str,
+        authorization_expires_at_unix: i64,
     ) -> Result<(String, i64), EdgeError> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_secs() as i64)
             .unwrap_or(0);
-        let expiry = approval
-            .source_expires_at_unix
-            .min(now.saturating_add(HUMAN_SESSION_TTL_SECS));
+        let authorization_started_at_unix = authorization_expires_at_unix
+            .checked_sub(DEVICE_AUTHORIZATION_TTL_SECS)
+            .ok_or_else(|| EdgeError::Unauthorized("the CLI login request is invalid".into()))?;
+        let expiry = approval.source_expires_at_unix.min(
+            authorization_started_at_unix.saturating_add(HUMAN_SESSION_TTL_SECS),
+        );
         if expiry <= now {
             return Err(EdgeError::Unauthorized(
                 "the approving browser credential has expired".into(),
@@ -85,11 +90,19 @@ impl HumanSessionIssuer {
                 "the approved identity is not eligible for a human session".into(),
             ));
         }
+        if !session_jti.starts_with("session-device-")
+            || session_jti.len() > 128
+            || !session_jti.as_bytes().iter().all(u8::is_ascii_graphic)
+        {
+            return Err(EdgeError::Unauthorized(
+                "the CLI login request has an invalid session identity".into(),
+            ));
+        }
         let token = self.cell.mint(&CapabilityMintSpec {
             tenant: approval.principal.tenant.0.clone(),
             region: approval.principal.region.0.clone(),
             subject_key: approval.principal.principal_id.0.clone(),
-            jti: format!("session-{}", self.jtis.mint().0),
+            jti: session_jti.to_string(),
             exp_unix: expiry,
             authority: approval.authority.clone(),
             dpop_jkt: None,
@@ -793,11 +806,15 @@ impl Gateway {
                     "interval": crate::device_auth::DEVICE_AUTHORIZATION_POLL_INTERVAL_SECS,
                 }),
             ))),
-            ClaimOutcome::Approved(approval) => {
+            ClaimOutcome::Approved(claim) => {
                 let issuer = self.human_session_issuer.as_ref().ok_or_else(|| {
                     EdgeError::Unavailable("human session issuer is unavailable".into())
                 })?;
-                let (access_token, expires_at) = issuer.mint_device_session(&approval)?;
+                let (access_token, expires_at) = issuer.mint_device_session(
+                    &claim.approval,
+                    &claim.session_jti,
+                    claim.authorization_expires_at_unix,
+                )?;
                 Ok(no_store(EdgeResponse::json(
                     200,
                     &json!({
@@ -1570,7 +1587,7 @@ mod tests {
         ));
         assert_eq!(claimed.status(), 200);
         let claimed = claimed.json_body().unwrap();
-        let cli_token = claimed["access_token"].as_str().unwrap();
+        let cli_token = claimed["access_token"].as_str().unwrap().to_string();
         assert_ne!(cli_token, browser_token, "the browser token is never transferred");
         assert_eq!(claimed["scheme"], "session");
         assert!(claimed["expires_at"].as_i64().unwrap() <= source_expiry);
@@ -1599,7 +1616,12 @@ mod tests {
             }))
             .unwrap(),
         ));
-        assert_eq!(replay.status(), 401, "the authorization is consumed exactly once");
+        assert_eq!(replay.status(), 200);
+        assert_eq!(
+            replay.json_body().unwrap()["access_token"],
+            cli_token,
+            "a response-lost retry returns the same session rather than minting another one"
+        );
     }
 
     #[test]

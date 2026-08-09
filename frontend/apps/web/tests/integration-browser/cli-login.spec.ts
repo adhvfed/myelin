@@ -103,8 +103,10 @@ test("a person signs in once and hands their CLI a fresh, separate session", asy
     device_code: deviceCode,
     code_verifier: verifier,
   });
-  expect(replay.status).toBe(401);
+  expect(replay.status).toBe(200);
   expect(replay.body).toMatchObject({
-    error: { code: "unauthorized" },
+    access_token: cliSession,
+    token_type: "Bearer",
+    scheme: "session",
   });
 });

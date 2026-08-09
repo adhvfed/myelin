@@ -88,8 +88,12 @@ describe("human and CLI authentication", () => {
       method: "POST",
       authenticated: false,
       body: { device_code: deviceCode, code_verifier: codeVerifier },
-      expectedStatus: 401,
     });
-    expect(replay.body).toMatchObject({ error: { code: "unauthorized" } });
+    expect(replay.body).toMatchObject({
+      access_token: cliToken,
+      token_type: "Bearer",
+      scheme: "session",
+      expires_at: cliCredentialExpiry,
+    });
   });
 });

@@ -84,7 +84,7 @@ pub async fn wait_for_authorization(
                 "the browser approval expired; run `myelin auth login` again".into(),
             ));
         }
-        let response = execute_device_auth(
+        let response = match execute_device_auth(
             edge,
             &auth_call(
                 "/v1/auth/device/token",
@@ -94,7 +94,12 @@ pub async fn wait_for_authorization(
                 }),
             )?,
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error) if error.is_retryable_response_loss() => continue,
+            Err(error) => return Err(error),
+        };
         match parse_claim(response)? {
             Claim::Authorized(credential) => return Ok(credential),
             Claim::Pending {

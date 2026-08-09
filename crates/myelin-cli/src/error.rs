@@ -24,6 +24,16 @@ impl CliError {
             CliError::Edge { .. } | CliError::Transport(_) | CliError::Config(_) => 1,
         }
     }
+
+    /** Only transport failures where the Edge may have completed the request are safe to retry. */
+    pub fn is_retryable_response_loss(&self) -> bool {
+        matches!(
+            self,
+            CliError::Transport(message)
+                if message.starts_with("edge request failed:")
+                    || message.starts_with("edge request exceeded the ")
+        )
+    }
 }
 
 impl fmt::Display for CliError {
@@ -134,5 +144,21 @@ mod tests {
         assert_eq!(error.lines().count(), 1);
         assert!(error.contains("conflict\\x1b"));
         assert!(error.contains("retry\\r\\n\\x1b]52;clipboard"));
+    }
+
+    #[test]
+    fn only_ambiguous_transport_failures_are_retryable() {
+        assert!(
+            CliError::Transport("edge request failed: reset".into()).is_retryable_response_loss()
+        );
+        assert!(
+            CliError::Transport("edge request exceeded the 30-second deadline".into())
+                .is_retryable_response_loss()
+        );
+        assert!(
+            !CliError::Transport("edge response exceeded the byte limit".into())
+                .is_retryable_response_loss()
+        );
+        assert!(!CliError::Unauthorized("no".into()).is_retryable_response_loss());
     }
 }
