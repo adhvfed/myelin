@@ -110,6 +110,36 @@ describe.sequential("Git engineering lifecycle", () => {
     ]);
   });
 
+  test("prevents a stale browser editor from overwriting a newer file version", async () => {
+    const opened = await project.readFile("main", "README.md");
+    const winningContents = `${readme}\nThe optimistic editor preserved this update.\n`;
+    mainCommitOid = (await project.writeFile(
+      "main",
+      "README.md",
+      winningContents,
+      { baseOid: opened.baseOid },
+    )).commitOid;
+
+    const stale = await systemClient.json(`${project.path}/blob/main/README.md`, {
+      method: "POST",
+      body: {
+        base_oid: opened.baseOid,
+        contents: `${readme}\nA stale editor must not win.\n`,
+      },
+      expectedStatus: 409,
+    });
+    expect(stale.body).toMatchObject({ error: { code: "conflict" } });
+
+    expect(await project.readFile("main", "README.md")).toEqual({
+      contents: winningContents,
+      baseOid: expect.stringMatching(oid),
+    });
+    const commits = await systemClient.json(`${project.path}/commits/main?limit=1`);
+    expect(array(commits.body.items, "latest commit")).toEqual([
+      expect.objectContaining({ oid: mainCommitOid }),
+    ]);
+  });
+
   test("opens and inspects a pull request against immutable snapshots", async () => {
     featureCommitOid = (await project.writeFile(
       "feature/system-lifecycle",
