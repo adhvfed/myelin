@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
 use myelin_edge::repo_authz::GrantBackedRepos;
-use myelin_edge::{DurableCiReadApi, DurableGitBackend};
+use myelin_edge::{DurableCiReadApi, DurableGitBackend, McpCiReadExecutor};
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{
     DataRole, DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind,
@@ -16,8 +16,8 @@ use myelin_identity_service::machine_auth::{Authority, MachineKind, StructuralTo
 use myelin_identity_service::mint::{RunTokenAuthorizer, RunTokenMinter, StructuralTokenSigner};
 use myelin_identity_service::{ResolvedDelegationPolicy, RevocationStore};
 use myelin_mcp::{
-    CiDirectReadExecutor, GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit,
-    RunPrincipal, SkeletonEffectApi, ToolRegistry,
+    GateApproverPolicy, GovernedRouter, McpServer, OutboxGovernanceAudit, RunPrincipal,
+    SkeletonEffectApi, ToolRegistry,
 };
 use myelin_storage::hitl_gate_durable::HitlVerdictStore;
 use myelin_storage::{with_tenant_tx, FsBlobStore, PgError, TenantScope};
@@ -249,7 +249,7 @@ fn server(
         )
         .with_clock(|| Timestamp(NOW.into())),
     );
-    let reads = Arc::new(CiDirectReadExecutor::new(api, boundary));
+    let reads = Arc::new(McpCiReadExecutor::new(api, boundary));
     McpServer::with_router_reads_and_clock(
         ToolRegistry::with_git_and_ci_reads().expect("valid shared catalogue"),
         router,

@@ -24,25 +24,20 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-events = { path = "../myelin-events" }
-myelin-edge = { path = "../myelin-edge" }
-myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
-myelin-flow = { path = "../myelin-flow" }
-myelin-config = { workspace = true }
-myelin-substrate = { path = "../myelin-substrate" }
-
 serde_json = { workspace = true }
 
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "sync"] }
-zeroize = "1"
-libc = "0.2"
 
 [dev-dependencies]
 myelin-edge = { path = "../myelin-edge", features = ["test-support"] }
+myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
+myelin-flow = { path = "../myelin-flow" }
+myelin-config = { workspace = true }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 sqlx = { workspace = true }
 blake3 = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]
 default = []

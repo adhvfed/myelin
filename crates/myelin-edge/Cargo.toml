@@ -32,6 +32,7 @@ myelin-events = { path = "../myelin-events" }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox" }
 myelin-ci-controlplane = { path = "../myelin-ci-controlplane" }
 myelin-flow = { path = "../myelin-flow" }
+myelin-mcp = { path = "../myelin-mcp" }
 zeroize = "1"
 serde = { workspace = true }
 serde_json = { workspace = true }

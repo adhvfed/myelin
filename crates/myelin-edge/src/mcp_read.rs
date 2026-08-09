@@ -1,26 +1,25 @@
-use crate::governance::ReadAuthorization;
-use crate::server::{DirectReadError, DirectReadExecutor};
+use crate::{DurableCiReadApi, EdgeError};
 use myelin_ci_controlplane::surfacing_store::CI_LOG_RANGE_DEFAULT;
-use myelin_edge::{error::EdgeError, DurableCiReadApi};
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
+use myelin_mcp::{DirectReadError, DirectReadExecutor, ReadAuthorization};
 use myelin_storage::TenantScope;
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-pub struct CiDirectReadExecutor {
+pub struct McpCiReadExecutor {
     api: DurableCiReadApi,
     authority: Arc<RunTokenAuthorizer>,
 }
 
-impl CiDirectReadExecutor {
+impl McpCiReadExecutor {
     pub fn new(api: DurableCiReadApi, authority: Arc<RunTokenAuthorizer>) -> Self {
         Self { api, authority }
     }
 }
 
-impl DirectReadExecutor for CiDirectReadExecutor {
+impl DirectReadExecutor for McpCiReadExecutor {
     fn execute(
         &self,
         principal: &Principal,

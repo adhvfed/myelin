@@ -2813,6 +2813,7 @@ dependencies = [
  "myelin-identity-service",
  "myelin-issues",
  "myelin-knowledge",
+ "myelin-mcp",
  "myelin-notif",
  "myelin-refs",
  "myelin-storage",
@@ -3083,7 +3084,6 @@ version = "0.0.0"
 dependencies = [
  "blake3",
  "chrono",
- "libc",
  "myelin-agent",
  "myelin-agent-service",
  "myelin-ci-controlplane",
@@ -3095,12 +3095,10 @@ dependencies = [
  "myelin-identity",
  "myelin-identity-service",
  "myelin-storage",
- "myelin-substrate",
  "myelin-tenancy",
  "serde_json",
  "sqlx",
  "tokio",
- "zeroize",
 ]
 
 [[package]]

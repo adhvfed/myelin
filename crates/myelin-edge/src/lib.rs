@@ -18,6 +18,7 @@ pub mod git_wire_http;
 pub mod issue_authz;
 pub mod issues_http;
 pub mod knowledge_http;
+pub mod mcp_read;
 pub mod notif_http;
 pub mod project_http;
 pub mod repo_authz;
@@ -77,6 +78,7 @@ pub use issues_http::{
     register_issues, MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS, MAX_ISSUE_JSON_BYTES,
 };
 pub use knowledge_http::register_knowledge;
+pub use mcp_read::McpCiReadExecutor;
 pub use notif_http::register_notif;
 pub use project_http::register_projects;
 pub use repo_authz::{AllowAllRepos, DenyAllRepos, GrantBackedRepos, RepoAccess, RepoAuthorizer};
