@@ -9,6 +9,9 @@ use super::{query_field, terminal_safe_single_line};
 pub(super) fn render_response(value: &Value) -> Option<String> {
     let agent = value.get("agent")?;
     let summary = render_agent(agent)?;
+    if let Some(action) = value.get("action") {
+        return render_lifecycle(value, action.as_str()?, agent, summary);
+    }
     let disposition = match value.get("created").and_then(Value::as_bool) {
         Some(true) => "Activated agent",
         Some(false) => "Agent already active",
@@ -30,6 +33,42 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
     output.push_str(
         "\n  Durable identity and policy are ready; no long-lived API key was created.\n",
     );
+    Some(output)
+}
+
+fn render_lifecycle(value: &Value, action: &str, agent: &Value, summary: String) -> Option<String> {
+    let status = agent.get("status")?.as_str()?;
+    let expected_status = match action {
+        "suspend" => "suspended",
+        "resume" => "active",
+        "retire" => "disabled",
+        _ => return None,
+    };
+    if status != expected_status
+        || value.get("durable").and_then(Value::as_bool) != Some(true)
+        || value.get("changed").and_then(Value::as_bool).is_none()
+    {
+        return None;
+    }
+    let terminated_runs = value.get("terminated_runs")?.as_u64()?;
+    let mut output = match action {
+        "suspend" => format!("Suspended agent: {summary}\n"),
+        "resume" => format!("Resumed agent: {summary}\n"),
+        "retire" => format!("Retired agent: {summary}\n"),
+        _ => unreachable!(),
+    };
+    if action != "resume" {
+        let noun = if terminated_runs == 1 { "run" } else { "runs" };
+        let _ = writeln!(output, "  stopped {terminated_runs} active {noun}.");
+    }
+    match action {
+        "suspend" => output.push_str("  New runs are blocked until this identity is resumed.\n"),
+        "resume" => {
+            output.push_str("  New runs are allowed; previously terminated runs remain closed.\n")
+        }
+        "retire" => output.push_str("  This identity cannot be resumed.\n"),
+        _ => unreachable!(),
+    }
     Some(output)
 }
 
@@ -143,5 +182,50 @@ mod tests {
             agent_dispatch(&words[2..]).unwrap().query.as_deref(),
             Some("limit=7&cursor=11111111-1111-1111-1111-111111111111")
         );
+    }
+
+    #[test]
+    fn lifecycle_results_explain_what_changed_without_exposing_credentials() {
+        let mut suspended = agent();
+        suspended["status"] = json!("suspended");
+        let rendered = render_response(&json!({
+            "agent": suspended,
+            "action": "suspend",
+            "changed": true,
+            "terminated_runs": 1,
+            "durable": true,
+        }))
+        .unwrap();
+        assert!(rendered.starts_with("Suspended agent: Review\\ncompanion"));
+        assert!(rendered.contains("stopped 1 active run"));
+        assert!(rendered.contains("blocked until this identity is resumed"));
+
+        let mut resumed = agent();
+        resumed["status"] = json!("active");
+        let rendered = render_response(&json!({
+            "agent": resumed,
+            "action": "resume",
+            "changed": true,
+            "terminated_runs": 0,
+            "durable": true,
+        }))
+        .unwrap();
+        assert!(rendered.starts_with("Resumed agent:"));
+        assert!(rendered.contains("previously terminated runs remain closed"));
+        assert!(!rendered.contains("stopped"));
+
+        let mut retired = agent();
+        retired["status"] = json!("disabled");
+        let rendered = render_response(&json!({
+            "agent": retired,
+            "action": "retire",
+            "changed": true,
+            "terminated_runs": 2,
+            "durable": true,
+        }))
+        .unwrap();
+        assert!(rendered.starts_with("Retired agent:"));
+        assert!(rendered.contains("stopped 2 active runs"));
+        assert!(rendered.contains("cannot be resumed"));
     }
 }

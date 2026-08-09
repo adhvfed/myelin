@@ -6,9 +6,10 @@ use myelin_agent::is_canonical_tool_name;
 use myelin_agent_service::{catalogue_cursor, tool_ref, PlatformToolCatalogue};
 use myelin_identity::PrincipalStatus;
 use myelin_identity_service::{
-    agent_ref, agent_run_ref, AgentActivation, AgentRegistration, AgentRegistryError,
-    AgentSessionError, AgentSessionIssuer, AgentSessionRequest, ClosedAgentSession,
-    IssuedAgentSession, NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
+    agent_ref, agent_run_ref, AgentActivation, AgentLifecycleAction, AgentLifecycleOutcome,
+    AgentLifecycleRequest, AgentRegistration, AgentRegistryError, AgentSessionError,
+    AgentSessionIssuer, AgentSessionRequest, ClosedAgentSession, IssuedAgentSession, NewAgent,
+    PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -59,7 +60,7 @@ struct CreateAgentBody {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct StartAgentRunBody {}
+struct EmptyJsonObject {}
 
 struct AgentCreateHandler {
     api: AgentHttpApi,
@@ -96,10 +97,15 @@ struct AgentRunCloseHandler {
     api: AgentHttpApi,
 }
 
+struct AgentLifecycleHandler {
+    api: AgentHttpApi,
+    action: AgentLifecycleAction,
+}
+
 impl Handler for AgentRunCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
-        let _: StartAgentRunBody = parse_agent_run_body(&ctx.request.body)?;
+        let _: EmptyJsonObject = parse_empty_json_object(&ctx.request.body, "agent run")?;
         let agent_id = agent_param(ctx)?.to_string();
         let client_nonce = ctx
             .request
@@ -129,7 +135,7 @@ impl Handler for AgentRunCreateHandler {
 impl Handler for AgentRunCloseHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
-        let _: StartAgentRunBody = parse_agent_run_body(&ctx.request.body)?;
+        let _: EmptyJsonObject = parse_empty_json_object(&ctx.request.body, "agent run close")?;
         let run_id = run_param(ctx)?;
         let closed = self
             .api
@@ -142,6 +148,36 @@ impl Handler for AgentRunCloseHandler {
         Ok(no_store(EdgeResponse::json(
             200,
             &closed_agent_session_json(&ctx.principal.tenant.0, &closed),
+        )))
+    }
+}
+
+impl Handler for AgentLifecycleHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let _: EmptyJsonObject = parse_empty_json_object(&ctx.request.body, "agent lifecycle")?;
+        let client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let outcome = self
+            .api
+            .drive(self.api.registry.change_status(
+                ctx.principal,
+                AgentLifecycleRequest {
+                    agent_id: agent_param(ctx)?.to_string(),
+                    action: self.action,
+                    client_nonce,
+                },
+            ))?
+            .map_err(map_registry_error)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &lifecycle_json(
+                &ctx.principal.tenant.0,
+                &self.api.catalogue,
+                self.action,
+                &outcome,
+            ),
         )))
     }
 }
@@ -230,6 +266,33 @@ pub fn register_agents(
             "/v1/agents/{agent}",
             "identity.agent.view",
             Arc::new(AgentGetHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agents/{agent}/suspend",
+            "identity.agent.suspend",
+            Arc::new(AgentLifecycleHandler {
+                api: api.clone(),
+                action: AgentLifecycleAction::Suspend,
+            }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agents/{agent}/resume",
+            "identity.agent.resume",
+            Arc::new(AgentLifecycleHandler {
+                api: api.clone(),
+                action: AgentLifecycleAction::Resume,
+            }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agents/{agent}/retire",
+            "identity.agent.retire",
+            Arc::new(AgentLifecycleHandler {
+                api: api.clone(),
+                action: AgentLifecycleAction::Retire,
+            }),
         )
         .route(
             Method::Post,
@@ -441,6 +504,25 @@ fn closed_agent_session_json(tenant: &str, closed: &ClosedAgentSession) -> Value
     })
 }
 
+fn lifecycle_json(
+    tenant: &str,
+    catalogue: &PlatformToolCatalogue,
+    action: AgentLifecycleAction,
+    outcome: &AgentLifecycleOutcome,
+) -> Value {
+    json!({
+        "agent": agent_json(tenant, catalogue, &outcome.agent),
+        "action": match action {
+            AgentLifecycleAction::Suspend => "suspend",
+            AgentLifecycleAction::Resume => "resume",
+            AgentLifecycleAction::Retire => "retire",
+        },
+        "changed": outcome.changed,
+        "terminated_runs": outcome.terminated_runs,
+        "durable": true,
+    })
+}
+
 fn selected_tool_json(tenant: &str, catalogue: &PlatformToolCatalogue, cursor: &str) -> Value {
     match catalogue
         .definitions()
@@ -479,10 +561,10 @@ fn parse_create_body(bytes: &[u8]) -> Result<CreateAgentBody, EdgeError> {
         .map_err(|error| EdgeError::BadRequest(format!("invalid agent create body: {error}")))
 }
 
-fn parse_agent_run_body(bytes: &[u8]) -> Result<StartAgentRunBody, EdgeError> {
+fn parse_empty_json_object(bytes: &[u8], operation: &str) -> Result<EmptyJsonObject, EdgeError> {
     if bytes.len() > MAX_AGENT_JSON_BYTES {
         return Err(EdgeError::PayloadTooLarge(format!(
-            "agent run request body exceeds {MAX_AGENT_JSON_BYTES} bytes"
+            "{operation} request body exceeds {MAX_AGENT_JSON_BYTES} bytes"
         )));
     }
     if bytes.is_empty() {
@@ -491,7 +573,7 @@ fn parse_agent_run_body(bytes: &[u8]) -> Result<StartAgentRunBody, EdgeError> {
         ));
     }
     serde_json::from_slice(bytes)
-        .map_err(|error| EdgeError::BadRequest(format!("invalid agent run body: {error}")))
+        .map_err(|error| EdgeError::BadRequest(format!("invalid {operation} body: {error}")))
 }
 
 fn parse_page_query(query: &str) -> Result<(usize, Option<String>), EdgeError> {
@@ -696,10 +778,11 @@ mod tests {
     }
 
     #[test]
-    fn run_start_body_is_an_exact_empty_object() {
-        assert!(parse_agent_run_body(br#"{}"#).is_ok());
-        assert!(parse_agent_run_body(br#"{"ttl":3600}"#).is_err());
-        assert!(parse_agent_run_body(b"").is_err());
+    fn state_change_bodies_are_exact_empty_objects() {
+        assert!(parse_empty_json_object(br#"{}"#, "agent lifecycle").is_ok());
+        assert!(parse_empty_json_object(br#"{"ttl":3600}"#, "agent run").is_err());
+        assert!(parse_empty_json_object(b"null", "agent run").is_err());
+        assert!(parse_empty_json_object(b"", "agent run").is_err());
     }
 
     #[test]

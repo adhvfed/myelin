@@ -13,17 +13,37 @@ const MAX_TOOLS: usize = 128;
 pub fn agent_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent command given (try: create <name> --tool <name> | list | show <id>)".into(),
+            "no agent command given (try: create <name> --tool <name> | list | show <id> | suspend|resume|retire <id>)".into(),
         )
     })?;
     match *verb {
         "create" => create_call(rest),
         "list" => list_call(rest),
         "show" => show_call(rest),
+        "suspend" => lifecycle_call(rest, "suspend"),
+        "resume" => lifecycle_call(rest, "resume"),
+        "retire" => lifecycle_call(rest, "retire"),
         other => Err(CliError::Usage(format!(
             "unknown agent command token `{other}`"
         ))),
     }
+}
+
+fn lifecycle_call(args: &[&str], action: &str) -> Result<EdgeCall, CliError> {
+    let id = match args {
+        [id] => *id,
+        [] => return Err(CliError::Usage(format!("agent {action} needs an id"))),
+        [_, extra, ..] => {
+            return Err(CliError::Usage(format!(
+                "unexpected agent {action} argument `{extra}`"
+            )))
+        }
+    };
+    require_agent_id("agent id", id)?;
+    Ok(EdgeCall::post_json(
+        format!("/v1/agents/{id}/{action}"),
+        json!({}),
+    ))
 }
 
 fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
@@ -215,6 +235,11 @@ mod tests {
             agent_dispatch(&["show", AGENT]).unwrap().path,
             format!("/v1/agents/{AGENT}")
         );
+        for action in ["suspend", "resume", "retire"] {
+            let call = agent_dispatch(&[action, AGENT]).unwrap();
+            assert_eq!(call.path, format!("/v1/agents/{AGENT}/{action}"));
+            assert_eq!(call.retry_policy, RetryPolicy::CallerKeyRequired);
+        }
     }
 
     #[test]
@@ -235,6 +260,9 @@ mod tests {
             vec!["list", "--cursor", "not-an-id"],
             vec!["show"],
             vec!["show", "not-an-id"],
+            vec!["suspend"],
+            vec!["resume", "not-an-id"],
+            vec!["retire", AGENT, "again"],
         ] {
             assert!(agent_dispatch(&args).is_err(), "accepted {args:?}");
         }

@@ -15,6 +15,25 @@ import { array, record, string } from "../src/json.js";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
+type AgentRunEnvelope = {
+  run: {
+    id: string;
+    ref: string;
+    agent_id: string;
+    agent_ref: string;
+    principal_id: string;
+    trigger_actor: string;
+    selected_tools: Array<{ name: string; version: number; ref: string }>;
+    effective_grants: string[];
+    state: string;
+    issued_at: string;
+    expires_at: string;
+  };
+  credential: { scheme: string; token: string; expires_at: string };
+  created: boolean;
+  durable: boolean;
+};
+
 function cliEnvironment(
   configDirectory: string,
   additions: NodeJS.ProcessEnv = {},
@@ -477,24 +496,7 @@ describe("the CLI authentication journey", () => {
         idempotencyKey: runRetryKey,
         expectedStatus: 201,
       });
-      const running = startRun.body as unknown as {
-        run: {
-          id: string;
-          ref: string;
-          agent_id: string;
-          agent_ref: string;
-          principal_id: string;
-          trigger_actor: string;
-          selected_tools: Array<{ name: string; version: number; ref: string }>;
-          effective_grants: string[];
-          state: string;
-          issued_at: string;
-          expires_at: string;
-        };
-        credential: { scheme: string; token: string; expires_at: string };
-        created: boolean;
-        durable: boolean;
-      };
+      const running = startRun.body as unknown as AgentRunEnvelope;
       expect(startRun.headers.get("cache-control")).toBe("no-store");
       expect(running).toMatchObject({
         created: true,
@@ -658,6 +660,157 @@ describe("the CLI authentication journey", () => {
         "CLI MCP tools/list tools",
       ).map((tool, index) => string(record(tool, `CLI MCP tool ${index}`).name, "tool name"));
       expect(bridgeTools).toEqual(["ci.read_run", "git.open_pr"]);
+
+      // Pausing a collaborator is one durable human action: new work stops and in-flight bearer
+      // authority dies with it. The same request is safe to repeat after a lost response.
+      const workBeforePause = await systemClient.json(
+        `/v1/agents/${activated.agent.id}/runs`,
+        {
+          method: "POST",
+          body: {},
+          token: browserSession,
+          tokenScheme: "session",
+          idempotencyKey: `cli-agent-before-pause-${randomUUID()}`,
+          expectedStatus: 201,
+        },
+      );
+      const pausedRun = workBeforePause.body as unknown as AgentRunEnvelope;
+      const pauseKey = `cli-agent-pause-${randomUUID()}`;
+      const pauseAgent = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        pauseKey,
+        "agent",
+        "suspend",
+        activated.agent.id,
+      );
+      expect(pauseAgent.exitCode, pauseAgent.stderr).toBe(0);
+      expect(pauseAgent.stdout).toContain(`Suspended agent: ${agentName}`);
+      expect(pauseAgent.stdout).toContain("stopped 1 active run");
+      expect(pauseAgent.stdout).toContain("blocked until this identity is resumed");
+      expect(pauseAgent.stdout).not.toContain(pausedRun.credential.token);
+
+      const replayPause = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        pauseKey,
+        "agent",
+        "suspend",
+        activated.agent.id,
+      );
+      expect(replayPause.exitCode, replayPause.stderr).toBe(0);
+      expect(replayPause.stdout).toBe(pauseAgent.stdout);
+
+      const suspendedAgent = await runCli(
+        configDirectory,
+        "--json",
+        "agent",
+        "show",
+        activated.agent.id,
+      );
+      expect(suspendedAgent.exitCode, suspendedAgent.stderr).toBe(0);
+      expect(JSON.parse(suspendedAgent.stdout)).toMatchObject({
+        agent: { id: activated.agent.id, status: "suspended" },
+      });
+      await systemClient.json("/v1/whoami", {
+        token: pausedRun.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 401,
+      });
+
+      const workWhilePaused = await runCliWith(
+        configDirectory,
+        {
+          input: `${JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: {},
+          })}\n`,
+        },
+        ["mcp", "serve", "--as", activated.agent.id],
+      );
+      expect(workWhilePaused.exitCode).toBe(1);
+      expect(workWhilePaused.stdout).toBe("");
+      expect(workWhilePaused.stderr).toContain("agent is suspended");
+
+      // Resume permits fresh work but never resurrects authority killed by the pause.
+      const resumeAgent = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        `cli-agent-resume-${randomUUID()}`,
+        "agent",
+        "resume",
+        activated.agent.id,
+      );
+      expect(resumeAgent.exitCode, resumeAgent.stderr).toBe(0);
+      expect(resumeAgent.stdout).toContain(`Resumed agent: ${agentName}`);
+      expect(resumeAgent.stdout).toContain("previously terminated runs remain closed");
+      await systemClient.json("/v1/whoami", {
+        token: pausedRun.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 401,
+      });
+
+      const workAfterResume = await systemClient.json(
+        `/v1/agents/${activated.agent.id}/runs`,
+        {
+          method: "POST",
+          body: {},
+          token: browserSession,
+          tokenScheme: "session",
+          idempotencyKey: `cli-agent-after-resume-${randomUUID()}`,
+          expectedStatus: 201,
+        },
+      );
+      const resumedRun = workAfterResume.body as unknown as AgentRunEnvelope;
+      await systemClient.json("/v1/whoami", {
+        token: resumedRun.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 200,
+      });
+
+      // Retirement is the irreversible counterpart: active work is torn down and neither the
+      // CLI nor another client can quietly revive the durable identity.
+      const retireAgent = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        `cli-agent-retire-${randomUUID()}`,
+        "agent",
+        "retire",
+        activated.agent.id,
+      );
+      expect(retireAgent.exitCode, retireAgent.stderr).toBe(0);
+      expect(retireAgent.stdout).toContain(`Retired agent: ${agentName}`);
+      expect(retireAgent.stdout).toContain("stopped 1 active run");
+      expect(retireAgent.stdout).toContain("cannot be resumed");
+      await systemClient.json("/v1/whoami", {
+        token: resumedRun.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 401,
+      });
+
+      const retiredAgent = await runCli(
+        configDirectory,
+        "--json",
+        "agent",
+        "show",
+        activated.agent.id,
+      );
+      expect(retiredAgent.exitCode, retiredAgent.stderr).toBe(0);
+      expect(JSON.parse(retiredAgent.stdout)).toMatchObject({
+        agent: { id: activated.agent.id, status: "disabled" },
+      });
+      const reviveRetiredAgent = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        `cli-agent-revive-retired-${randomUUID()}`,
+        "agent",
+        "resume",
+        activated.agent.id,
+      );
+      expect(reviveRetiredAgent.exitCode).toBe(1);
+      expect(reviveRetiredAgent.stderr).toContain("retired agent cannot be resumed");
 
       // A founder names the first project once. Its generated identity becomes context,
       // so show and subsequent work no longer carry an operator-provided UUID.
@@ -913,5 +1066,5 @@ describe("the CLI authentication journey", () => {
       if (login && login.exitCode === null) login.kill("SIGTERM");
       await rm(configDirectory, { recursive: true, force: true });
     }
-  }, 90_000);
+  }, 120_000);
 });

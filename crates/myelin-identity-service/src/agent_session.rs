@@ -146,9 +146,21 @@ impl AgentSessionIssuer {
             .map_err(map_registry_error)?;
         if registration.created_by != actor.principal_id.0
             || registration.runtime_ref != EXTERNAL_MCP_RUNTIME
-            || registration.status != PrincipalStatus::Active
         {
             return Err(AgentSessionError::NotFound);
+        }
+        match registration.status {
+            PrincipalStatus::Active => {}
+            PrincipalStatus::Suspended => {
+                return Err(AgentSessionError::Conflict(
+                    "agent is suspended; resume it before starting new work".into(),
+                ));
+            }
+            PrincipalStatus::Disabled => {
+                return Err(AgentSessionError::Conflict(
+                    "agent is retired and cannot start new work".into(),
+                ));
+            }
         }
 
         let claimed = self

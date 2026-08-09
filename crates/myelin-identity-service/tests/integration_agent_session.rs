@@ -467,7 +467,8 @@ async fn a_human_can_pause_and_retire_an_agent_without_leaving_a_live_run_behind
     refused_request.client_nonce = "suspended-agent-cannot-start".into();
     assert!(matches!(
         issuer.start(&actor, refused_request).await,
-        Err(myelin_identity_service::AgentSessionError::NotFound)
+        Err(myelin_identity_service::AgentSessionError::Conflict(reason))
+            if reason.contains("suspended")
     ));
 
     let resumed = registry
