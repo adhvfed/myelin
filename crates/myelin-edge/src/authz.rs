@@ -11,6 +11,9 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "edge.events.subscribe",
     "agent.tools.list",
     "agent.tool.view",
+    "identity.agents.list",
+    "identity.agent.create",
+    "identity.agent.view",
     "identity.projects.list",
     "identity.project.create",
     "identity.project.view",
@@ -107,6 +110,7 @@ const HUMAN_OR_OPERATOR: &[AcceptedPurpose] = &[
     AcceptedPurpose::HumanSession,
     AcceptedPurpose::OperatorBootstrap,
 ];
+const HUMAN_SESSION: &[AcceptedPurpose] = &[AcceptedPurpose::HumanSession];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionRequirement {
@@ -139,6 +143,9 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     ),
     requirement!("agent.tools.list", "agent.tools.read", OP_AGENT_PAT),
     requirement!("agent.tool.view", "agent.tools.read", OP_AGENT_PAT),
+    requirement!("identity.agents.list", "agent.view", HUMAN_SESSION),
+    requirement!("identity.agent.create", "agent.manage", HUMAN_SESSION),
+    requirement!("identity.agent.view", "agent.view", HUMAN_SESSION),
     requirement!("identity.projects.list", "project.view", OP_AGENT_PAT),
     requirement!("identity.project.create", "project.create", OP_PAT),
     requirement!("identity.project.view", "project.view", OP_AGENT_PAT),

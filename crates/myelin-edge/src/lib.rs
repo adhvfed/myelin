@@ -1,3 +1,4 @@
+pub mod agent_http;
 pub mod authz;
 pub mod bootstrap;
 pub mod catalogue;
@@ -28,6 +29,7 @@ pub mod session;
 pub mod sse;
 pub mod tool_http;
 
+pub use agent_http::register_agents;
 #[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
 pub use authz::{

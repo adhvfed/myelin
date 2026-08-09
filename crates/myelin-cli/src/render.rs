@@ -5,6 +5,7 @@ use myelin_git::web::RepoListCursor;
 use serde_json::Value;
 use std::fmt::Write as _;
 
+mod agent;
 mod collaboration;
 mod project;
 mod tool;
@@ -50,6 +51,9 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     if is_ci_run_detail(value) {
         return render_ci_run_detail(value);
     }
+    if let Some(rendered) = agent::render_response(value) {
+        return rendered;
+    }
     if let Some(rendered) = tool::render_response(value, call) {
         return rendered;
     }
@@ -78,6 +82,7 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
         {
             if let Some(command) = call.and_then(|call| {
                 project::page_command(call, cursor)
+                    .or_else(|| agent::page_command(call, cursor))
                     .or_else(|| tool::page_command(call, cursor))
                     .or_else(|| collaboration::page_command(call, cursor))
                     .or_else(|| ci_page_command(call, cursor))
@@ -206,6 +211,9 @@ fn render_issue_import(value: &Value) -> Option<String> {
 }
 
 fn render_item(item: &Value) -> String {
+    if let Some(rendered) = agent::render_item(item) {
+        return rendered;
+    }
     if let Some(rendered) = tool::render_item(item) {
         return rendered;
     }

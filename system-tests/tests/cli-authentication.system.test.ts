@@ -338,6 +338,125 @@ describe("the CLI authentication journey", () => {
       expect(mcpManifest.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
       expect(mcpDescription.stdout).not.toContain(systemTestConfig.token);
 
+      // A human activates an external collaborator by choosing from that same vocabulary.
+      // Retrying creates neither a second identity nor a long-lived credential to distribute.
+      const agentName = uniqueName("Review companion");
+      const agentRetryKey = `cli-agent-${randomUUID()}`;
+      const createAgent = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        agentRetryKey,
+        "agent",
+        "create",
+        agentName,
+        "--tool",
+        "ci.read_run",
+        "--tool",
+        "git.open_pr",
+      );
+      expect(createAgent.exitCode, createAgent.stderr).toBe(0);
+      const activated = JSON.parse(createAgent.stdout) as {
+        agent: {
+          id: string;
+          ref: string;
+          principal_id: string;
+          name: string;
+          runtime_ref: string;
+          on_behalf_of: string;
+          status: string;
+          selected_tools: Array<{ name: string; version: number; ref: string }>;
+          effective_tools: Array<{ name: string; version: number; ref: string }>;
+          grants: string[];
+        };
+        created: boolean;
+        durable: boolean;
+      };
+      expect(activated).toMatchObject({
+        created: true,
+        durable: true,
+        agent: {
+          name: agentName,
+          runtime_ref: "external:mcp",
+          on_behalf_of: systemTestConfig.principal,
+          status: "active",
+          selected_tools: [
+            { name: "ci.read_run", version: 1 },
+            { name: "git.open_pr", version: 1 },
+          ],
+          grants: expect.arrayContaining([
+            "agent.tools.read",
+            "edge.identity.read",
+            "repo.push",
+            "run.view",
+          ]),
+        },
+      });
+      expect(activated.agent.id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+      expect(activated.agent.principal_id).toBe(`agent:${activated.agent.id}`);
+      expect(activated.agent.ref).toBe(
+        `myelin://${systemTestConfig.tenant}/identity/agent/${activated.agent.id}`,
+      );
+      expect(activated.agent.effective_tools.map((tool) => tool.name)).toEqual(
+        expect.arrayContaining(["ci.read_run", "ci.read_log", "git.open_pr"]),
+      );
+      for (const tool of activated.agent.selected_tools) {
+        expect(tool.ref).toBe(
+          `myelin://${systemTestConfig.tenant}/agent/tool/${tool.name}/v${tool.version}`,
+        );
+      }
+      expect(createAgent.stdout).not.toContain(systemTestConfig.token);
+      expect(createAgent.stdout).not.toMatch(/api[_ -]?key|credential/i);
+
+      const replayAgent = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        agentRetryKey,
+        "agent",
+        "create",
+        agentName,
+        "--tool",
+        "ci.read_run",
+        "--tool",
+        "git.open_pr",
+      );
+      expect(replayAgent.exitCode, replayAgent.stderr).toBe(0);
+      expect(JSON.parse(replayAgent.stdout)).toMatchObject({
+        created: false,
+        durable: true,
+        agent: { id: activated.agent.id, ref: activated.agent.ref },
+      });
+
+      const agentRoster = await runCli(
+        configDirectory,
+        "--json",
+        "agent",
+        "list",
+        "--limit",
+        "100",
+      );
+      expect(agentRoster.exitCode, agentRoster.stderr).toBe(0);
+      const roster = JSON.parse(agentRoster.stdout) as {
+        items: Array<{ id: string; ref: string; name: string }>;
+      };
+      expect(roster.items).toContainEqual(
+        expect.objectContaining({
+          id: activated.agent.id,
+          ref: activated.agent.ref,
+          name: agentName,
+        }),
+      );
+
+      const showAgent = await runCli(configDirectory, "agent", "show", activated.agent.id);
+      expect(showAgent.exitCode, showAgent.stderr).toBe(0);
+      expect(showAgent.stdout).toContain(`Agent: ${agentName}`);
+      expect(showAgent.stdout).toContain(activated.agent.ref);
+      expect(showAgent.stdout).toContain("no long-lived API key was created");
+      expect(showAgent.stdout).not.toContain(systemTestConfig.token);
+
       // A founder names the first project once. Its generated identity becomes context,
       // so show and subsequent work no longer carry an operator-provided UUID.
       const cliProjectName = uniqueName("Developer experience");

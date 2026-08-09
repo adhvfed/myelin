@@ -10,7 +10,7 @@ use myelin_cli::device_auth::{
     begin_authorization, new_authorization_request, wait_for_authorization,
 };
 use myelin_cli::dispatch::{
-    chat_dispatch, ci_dispatch, git_dispatch, is_canonical_project_id,
+    agent_dispatch, chat_dispatch, ci_dispatch, git_dispatch, is_canonical_project_id,
     issues_dispatch_with_context, knowledge_dispatch, notif_dispatch, project_dispatch,
     repo_dispatch, tool_dispatch, EdgeCall, HttpMethod, RetryPolicy,
 };
@@ -109,6 +109,11 @@ enum Command {
     },
     /// Discover the typed operations shared by people and agents.
     Tool {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Activate and inspect durable external-agent identities.
+    Agent {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -247,6 +252,10 @@ async fn run() -> Result<(), CliError> {
         }
         Command::Tool { args } => {
             let (call, command_key) = dispatch_command(args, tool_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
+        }
+        Command::Agent { args } => {
+            let (call, command_key) = dispatch_command(args, agent_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
     }
@@ -833,6 +842,7 @@ mod tests {
             &["myelin", "repo", "list"][..],
             &["myelin", "repo", "pr", "list"][..],
             &["myelin", "project", "list"][..],
+            &["myelin", "agent", "list"][..],
             &["myelin", "issue", "list"][..],
             &["myelin", "inbox", "list"][..],
             &["myelin", "doc", "page", "list"][..],

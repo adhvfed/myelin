@@ -1,4 +1,4 @@
-use super::{CliError, EdgeCall, FormQuery, HttpMethod, RetryPolicy};
+use super::{is_canonical_uuid, CliError, EdgeCall, FormQuery, HttpMethod, RetryPolicy};
 use serde_json::json;
 
 const DEFAULT_PAGE_LIMIT: u32 = 50;
@@ -177,11 +177,7 @@ fn require_uuid(label: &str, value: &str) -> Result<(), CliError> {
 }
 
 pub fn is_canonical_project_id(value: &str) -> bool {
-    value.len() == 36
-        && value.bytes().enumerate().all(|(index, byte)| match index {
-            8 | 13 | 18 | 23 => byte == b'-',
-            _ => byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte),
-        })
+    is_canonical_uuid(value)
 }
 
 #[cfg(test)]
