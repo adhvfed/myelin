@@ -19,7 +19,10 @@ describe("external API contracts", () => {
     ["Issues", "/v1/issues?state=OPEN"],
     ["CI", "/v1/ci/runs?limit=01"],
     ["Notifications", "/v1/notif/inbox?view=everything"],
-  ])("rejects a malformed %s page request", async (_domain, path) => {
+    ["Git code search without text", "/v1/git/search/code?repo=core"],
+    ["Git code search with an unknown coordinate", "/v1/git/search/code?q=needle&limit=100"],
+    ["Git code search with an invalid repository", "/v1/git/search/code?q=needle&repo=team%2F%2Fcore"],
+  ])("rejects malformed %s input", async (_domain, path) => {
     const response = await systemClient.json(path, { expectedStatus: 400 });
     expectError(response.body, "bad_request");
   });
