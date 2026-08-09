@@ -182,7 +182,7 @@ async fn login(
         let edge = resolve_edge(cli.edge.as_deref(), Some(&scheme), None, getenv);
         let path = store_credential(&token, &scheme, Some(&edge.url), None, getenv)?;
         println!(
-            "Stored the {scheme} credential at {}. Run `myelin auth status` to verify it.",
+            "Stored the {scheme} credential in the OS credential store; metadata is at {}. Run `myelin auth status` to verify it.",
             path.display()
         );
         return Ok(());
@@ -224,7 +224,10 @@ async fn login(
         .map(|value| value.to_rfc3339())
         .unwrap_or_else(|| authorized.expires_at_unix().to_string());
     println!("Approved. Your CLI session is ready until {expires_at}.");
-    println!("Credentials are stored owner-only at {}.", path.display());
+    println!(
+        "Credential metadata is stored at {}; the secret is in the OS credential store.",
+        path.display()
+    );
     Ok(())
 }
 

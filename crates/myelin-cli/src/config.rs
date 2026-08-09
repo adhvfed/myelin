@@ -1,3 +1,6 @@
+use crate::credential_store::{
+    new_reference, validate_reference, write_owner_only_atomic, CredentialSecretStore,
+};
 use crate::error::CliError;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -6,7 +9,8 @@ pub const DEFAULT_EDGE: &str = "http://127.0.0.1:8080";
 pub const DEFAULT_SCHEME: &str = "agent";
 pub const SESSION_SCHEME: &str = "session";
 
-const CREDENTIAL_VERSION: u8 = 1;
+const LEGACY_CREDENTIAL_VERSION: u8 = 1;
+const CREDENTIAL_VERSION: u8 = 2;
 const MAX_TOKEN_BYTES: usize = 32 * 1024;
 const MAX_CREDENTIAL_FILE_BYTES: usize = 64 * 1024;
 
@@ -23,7 +27,7 @@ pub struct EdgeConfig {
     pub scheme: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Credential {
     pub token: String,
     pub scheme: String,
@@ -31,6 +35,18 @@ pub struct Credential {
     pub edge_url: Option<String>,
     /** Absolute Unix expiry. Long-lived and externally supplied credentials may not declare one. */
     pub expires_at_unix: Option<i64>,
+}
+
+impl core::fmt::Debug for Credential {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("Credential")
+            .field("token", &"<redacted>")
+            .field("scheme", &self.scheme)
+            .field("edge_url", &self.edge_url)
+            .field("expires_at_unix", &self.expires_at_unix)
+            .finish()
+    }
 }
 
 impl Credential {
@@ -47,16 +63,35 @@ impl Credential {
     }
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyStoredCredential {
+    #[serde(rename = "version")]
+    _version: u8,
+    token: String,
+    scheme: String,
+    #[serde(default)]
+    edge_url: Option<String>,
+    #[serde(default)]
+    expires_at_unix: Option<i64>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct StoredCredential {
+struct StoredCredentialMetadata {
     version: u8,
-    token: String,
+    credential_ref: String,
     scheme: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     edge_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires_at_unix: Option<i64>,
+}
+
+#[derive(Debug)]
+enum StoredCredential {
+    Legacy(LegacyStoredCredential),
+    Referenced(StoredCredentialMetadata),
 }
 
 pub fn config_dir(getenv: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, CliError> {
@@ -162,12 +197,25 @@ pub fn load_stored_credential(
         return Ok(None);
     };
     let stored = parse_stored_credential(&encoded, &path)?;
-    credential(
-        &stored.token,
-        &stored.scheme,
-        stored.edge_url.as_deref(),
-        stored.expires_at_unix,
-    )
+    match stored {
+        StoredCredential::Legacy(stored) => credential(
+            &stored.token,
+            &stored.scheme,
+            stored.edge_url.as_deref(),
+            stored.expires_at_unix,
+        ),
+        StoredCredential::Referenced(stored) => {
+            let directory = config_dir(getenv)?;
+            let token =
+                CredentialSecretStore::selected(&directory, getenv)?.get(&stored.credential_ref)?;
+            credential(
+                &token,
+                &stored.scheme,
+                stored.edge_url.as_deref(),
+                stored.expires_at_unix,
+            )
+        }
+    }
     .map(Some)
 }
 
@@ -179,15 +227,6 @@ pub fn store_credential(
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> Result<PathBuf, CliError> {
     let credential = credential(token, scheme, edge_url, expires_at_unix)?;
-    let stored = StoredCredential {
-        version: CREDENTIAL_VERSION,
-        token: credential.token,
-        scheme: credential.scheme,
-        edge_url: credential.edge_url,
-        expires_at_unix: credential.expires_at_unix,
-    };
-    let encoded = serde_json::to_vec(&stored)
-        .map_err(|error| CliError::Config(format!("cannot encode credentials: {error}")))?;
     let dir = config_dir(getenv)?;
     std::fs::create_dir_all(&dir).map_err(|error| {
         CliError::Config(format!(
@@ -196,16 +235,77 @@ pub fn store_credential(
         ))
     })?;
     let path = dir.join("credentials.json");
-    write_owner_only_atomic(&path, &encoded)?;
+    let previous_reference = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|encoded| parse_stored_credential(&encoded, &path).ok())
+        .and_then(|stored| match stored {
+            StoredCredential::Referenced(stored) => Some(stored.credential_ref),
+            StoredCredential::Legacy(_) => None,
+        });
+    let credential_ref = new_reference();
+    let stored = StoredCredentialMetadata {
+        version: CREDENTIAL_VERSION,
+        credential_ref: credential_ref.clone(),
+        scheme: credential.scheme,
+        edge_url: credential.edge_url,
+        expires_at_unix: credential.expires_at_unix,
+    };
+    let encoded = serde_json::to_vec(&stored)
+        .map_err(|error| CliError::Config(format!("cannot encode credential metadata: {error}")))?;
+    let secret_store = CredentialSecretStore::selected(&dir, getenv)?;
+    secret_store.put(&credential_ref, &credential.token)?;
+    if let Err(write_error) = write_owner_only_atomic(&path, &encoded) {
+        return match secret_store.delete(&credential_ref) {
+            Ok(_) => Err(write_error),
+            Err(_) => Err(CliError::Config(
+                "credential metadata installation failed and the new OS credential could not be cleaned up"
+                    .into(),
+            )),
+        };
+    }
+    if let Some(previous_reference) = previous_reference.filter(|old| old != &credential_ref) {
+        // The new credential is already installed and usable. Treat failure to remove the old,
+        // auth-bounded secret as cleanup debt rather than reporting a false login failure.
+        let _ = secret_store.delete(&previous_reference);
+    }
     Ok(path)
 }
 
-/** Remove every on-disk credential format. Environment and command-line credentials are untouched. */
+/** Remove the referenced OS credential and every on-disk compatibility format. Environment and
+ * command-line credentials are untouched. */
 pub fn remove_stored_credentials(
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> Result<bool, CliError> {
     let mut removed = false;
-    for path in [credential_path(getenv)?, legacy_token_path(getenv)?] {
+    let metadata_path = credential_path(getenv)?;
+    if std::fs::metadata(&metadata_path)
+        .is_ok_and(|metadata| metadata.len() > MAX_CREDENTIAL_FILE_BYTES as u64)
+    {
+        return Err(CliError::Config(format!(
+            "stored credential {} exceeds the byte limit",
+            metadata_path.display()
+        )));
+    }
+    let encoded = match std::fs::read_to_string(&metadata_path) {
+        Ok(encoded) => Some(encoded),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(CliError::Config(format!(
+                "cannot read stored credential metadata {}: {error}",
+                metadata_path.display()
+            )))
+        }
+    };
+    if let Some(encoded) = encoded {
+        if let StoredCredential::Referenced(stored) =
+            parse_stored_credential(&encoded, &metadata_path)?
+        {
+            let directory = config_dir(getenv)?;
+            removed |= CredentialSecretStore::selected(&directory, getenv)?
+                .delete(&stored.credential_ref)?;
+        }
+    }
+    for path in [metadata_path, legacy_token_path(getenv)?] {
         match std::fs::remove_file(&path) {
             Ok(()) => removed = true,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -236,16 +336,7 @@ fn credential(
             "credential token must be bounded printable ASCII without spaces".into(),
         ));
     }
-    if !valid_scheme(scheme) {
-        return Err(CliError::Config(
-            "credential scheme must match [a-z][a-z0-9_]{0,31}".into(),
-        ));
-    }
-    if expires_at_unix.is_some_and(|expires_at| expires_at <= 0) {
-        return Err(CliError::Config(
-            "credential expiry must be a positive Unix timestamp".into(),
-        ));
-    }
+    validate_metadata(scheme, edge_url, expires_at_unix)?;
     Ok(Credential {
         token: token.to_string(),
         scheme: scheme.to_string(),
@@ -290,111 +381,73 @@ fn parse_stored_credential(encoded: &str, path: &Path) -> Result<StoredCredentia
             path.display()
         )));
     }
-    let stored: StoredCredential = serde_json::from_str(encoded).map_err(|_| {
+    #[derive(Deserialize)]
+    struct Version {
+        version: u8,
+    }
+
+    let version: Version = serde_json::from_str(encoded).map_err(|_| {
         CliError::Config(format!(
             "stored credential {} is malformed; run `myelin auth login` again",
             path.display()
         ))
     })?;
-    if stored.version != CREDENTIAL_VERSION {
-        return Err(CliError::Config(format!(
-            "stored credential {} has unsupported version {}",
-            path.display(),
-            stored.version
-        )));
-    }
-    credential(
-        &stored.token,
-        &stored.scheme,
-        stored.edge_url.as_deref(),
-        stored.expires_at_unix,
-    )?;
-    Ok(stored)
-}
-
-#[cfg(unix)]
-fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let parent = path
-        .parent()
-        .ok_or_else(|| CliError::Config("credential path has no parent directory".into()))?;
-    let mut temporary = None;
-    for attempt in 0..100 {
-        let candidate = parent.join(format!(
-            ".credentials.json.tmp-{}-{attempt}",
-            std::process::id()
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&candidate)
-        {
-            Ok(file) => {
-                temporary = Some((candidate, file));
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(CliError::Config(format!(
-                    "cannot create credential file in {}: {error}",
-                    parent.display()
-                )))
-            }
+    match version.version {
+        LEGACY_CREDENTIAL_VERSION => {
+            let stored: LegacyStoredCredential = malformed_json(encoded, path)?;
+            credential(
+                &stored.token,
+                &stored.scheme,
+                stored.edge_url.as_deref(),
+                stored.expires_at_unix,
+            )?;
+            Ok(StoredCredential::Legacy(stored))
         }
+        CREDENTIAL_VERSION => {
+            let stored: StoredCredentialMetadata = malformed_json(encoded, path)?;
+            validate_reference(&stored.credential_ref)?;
+            validate_metadata(
+                &stored.scheme,
+                stored.edge_url.as_deref(),
+                stored.expires_at_unix,
+            )?;
+            Ok(StoredCredential::Referenced(stored))
+        }
+        unsupported => Err(CliError::Config(format!(
+            "stored credential {} has unsupported version {unsupported}",
+            path.display()
+        ))),
     }
-    let (temporary_path, mut file) = temporary.ok_or_else(|| {
-        CliError::Config(format!(
-            "cannot allocate a temporary credential file in {}",
-            parent.display()
-        ))
-    })?;
-    let result = (|| {
-        file.write_all(bytes).map_err(|error| {
-            CliError::Config(format!(
-                "cannot write credential file {}: {error}",
-                temporary_path.display()
-            ))
-        })?;
-        file.sync_all().map_err(|error| {
-            CliError::Config(format!(
-                "cannot sync credential file {}: {error}",
-                temporary_path.display()
-            ))
-        })?;
-        drop(file);
-        std::fs::rename(&temporary_path, path).map_err(|error| {
-            CliError::Config(format!(
-                "cannot install credential file {}: {error}",
-                path.display()
-            ))
-        })?;
-        set_owner_only(path)
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temporary_path);
-    }
-    result
 }
 
-#[cfg(not(unix))]
-fn write_owner_only_atomic(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    std::fs::write(path, bytes).map_err(|error| {
+fn malformed_json<T: for<'de> Deserialize<'de>>(encoded: &str, path: &Path) -> Result<T, CliError> {
+    serde_json::from_str(encoded).map_err(|_| {
         CliError::Config(format!(
-            "cannot write credential file {}: {error}",
+            "stored credential {} is malformed; run `myelin auth login` again",
             path.display()
         ))
     })
 }
 
-#[cfg(unix)]
-fn set_owner_only(path: &Path) -> Result<(), CliError> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|error| {
-        CliError::Config(format!("cannot set 0600 on {}: {error}", path.display()))
-    })
+fn validate_metadata(
+    scheme: &str,
+    edge_url: Option<&str>,
+    expires_at_unix: Option<i64>,
+) -> Result<(), CliError> {
+    if !valid_scheme(scheme) {
+        return Err(CliError::Config(
+            "credential scheme must match [a-z][a-z0-9_]{0,31}".into(),
+        ));
+    }
+    if let Some(edge_url) = edge_url {
+        normalize_stored_edge_url(edge_url)?;
+    }
+    if expires_at_unix.is_some_and(|expires_at| expires_at <= 0) {
+        return Err(CliError::Config(
+            "credential expiry must be a positive Unix timestamp".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -449,6 +502,12 @@ mod tests {
                 expires_at_unix: None,
             }
         );
+        let rendered = format!(
+            "{:?}",
+            resolve_credential(Some("DO_NOT_PRINT_ME"), None, &env, &no_file).unwrap()
+        );
+        assert!(rendered.contains("<redacted>"));
+        assert!(!rendered.contains("DO_NOT_PRINT_ME"));
     }
 
     #[test]
@@ -531,11 +590,17 @@ mod tests {
     }
 
     #[test]
-    fn store_resolve_and_logout_are_owner_only_and_complete() {
-        let tmp =
-            std::env::temp_dir().join(format!("myelin-cli-credential-{}", std::process::id()));
+    fn store_rotation_resolution_and_logout_keep_secrets_out_of_metadata() {
+        let tmp = std::env::temp_dir().join(format!(
+            "myelin-cli-credential-{}-{}",
+            std::process::id(),
+            new_reference()
+        ));
         let dir = tmp.to_string_lossy().to_string();
-        let env = env_from(&[("MYELIN_CONFIG_DIR", &dir)]);
+        let env = env_from(&[
+            ("MYELIN_CONFIG_DIR", &dir),
+            (crate::credential_store::TEST_STORE_ENV, "file"),
+        ]);
         let path = store_credential(
             "ROUNDTRIP_TOKEN",
             SESSION_SCHEME,
@@ -544,17 +609,63 @@ mod tests {
             &env,
         )
         .unwrap();
+        let encoded = std::fs::read_to_string(&path).unwrap();
+        assert!(!encoded.contains("ROUNDTRIP_TOKEN"));
+        let metadata: StoredCredentialMetadata = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(metadata.version, CREDENTIAL_VERSION);
+        let store = CredentialSecretStore::selected(&tmp, &env).unwrap();
+        let secret_path = store
+            .test_secret_path(&metadata.credential_ref)
+            .expect("the debug test store has an inspectable path");
+        assert_eq!(
+            std::fs::read_to_string(&secret_path).unwrap(),
+            "ROUNDTRIP_TOKEN"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "the credential file is owner-only");
+            assert_eq!(mode, 0o600, "the credential metadata is owner-only");
+            let secret_mode = std::fs::metadata(&secret_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                secret_mode, 0o600,
+                "the debug-only test secret is owner-only"
+            );
         }
+
+        let rotated_path = store_credential(
+            "ROTATED_TOKEN",
+            SESSION_SCHEME,
+            Some("https://edge.example/"),
+            Some(4_102_444_800),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(rotated_path, path);
+        let rotated_metadata: StoredCredentialMetadata =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_ne!(rotated_metadata.credential_ref, metadata.credential_ref);
+        assert!(
+            !secret_path.exists(),
+            "replacing a credential removes its old secret"
+        );
+        let rotated_secret_path = store
+            .test_secret_path(&rotated_metadata.credential_ref)
+            .expect("the debug test store has an inspectable path");
+        assert_eq!(
+            std::fs::read_to_string(&rotated_secret_path).unwrap(),
+            "ROTATED_TOKEN"
+        );
+
         let read = |path: &Path| std::fs::read_to_string(path).ok();
         assert_eq!(
             resolve_credential(None, None, &env, &read).unwrap(),
             Credential {
-                token: "ROUNDTRIP_TOKEN".into(),
+                token: "ROTATED_TOKEN".into(),
                 scheme: SESSION_SCHEME.into(),
                 edge_url: Some("https://edge.example".into()),
                 expires_at_unix: Some(4_102_444_800),
@@ -563,6 +674,7 @@ mod tests {
         std::fs::write(tmp.join("token"), "OLD_TOKEN").unwrap();
         assert!(remove_stored_credentials(&env).unwrap());
         assert!(!path.exists());
+        assert!(!rotated_secret_path.exists());
         assert!(!tmp.join("token").exists());
         assert!(!remove_stored_credentials(&env).unwrap());
         let _ = std::fs::remove_dir_all(&tmp);

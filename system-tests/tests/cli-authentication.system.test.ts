@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,7 @@ function cliEnvironment(
   const environment: NodeJS.ProcessEnv = {
     ...process.env,
     MYELIN_CONFIG_DIR: configDirectory,
+    MYELIN_TEST_CREDENTIAL_STORE: "file",
   };
   delete environment.MYELIN_TOKEN;
   delete environment.MYELIN_TOKEN_SCHEME;
@@ -169,13 +170,14 @@ describe("the CLI authentication journey", () => {
       const credentialPath = resolve(configDirectory, "credentials.json");
       const stored = JSON.parse(await readFile(credentialPath, "utf8")) as Record<string, unknown>;
       expect(stored).toMatchObject({
-        version: 1,
+        version: 2,
         scheme: "session",
         edge_url: systemTestConfig.edgeUrl,
       });
+      expect(stored.credential_ref).toEqual(expect.any(String));
       expect(stored.expires_at_unix).toEqual(expect.any(Number));
       expect(Number(stored.expires_at_unix)).toBeGreaterThan(Math.floor(Date.now() / 1_000));
-      expect(stored.token).not.toBe(systemTestConfig.token);
+      expect(stored).not.toHaveProperty("token");
       if (process.platform !== "win32") {
         expect((await stat(credentialPath)).mode & 0o777).toBe(0o600);
       }
@@ -197,7 +199,7 @@ describe("the CLI authentication journey", () => {
       );
       expect(configureGit.exitCode, configureGit.stderr).toBe(0);
       expect(configureGit.stdout).toContain("Git is ready");
-      expect(configureGit.stdout).not.toContain(stored.token);
+      expect(configureGit.stdout).not.toContain(systemTestConfig.token);
 
       const edge = new URL(systemTestConfig.edgeUrl);
       const credential = await askGitForCredential(
@@ -207,7 +209,9 @@ describe("the CLI authentication journey", () => {
       );
       expect(credential.exitCode, credential.stderr).toBe(0);
       expect(credential.stdout).toContain("username=myelin-session");
-      expect(credential.stdout).toContain(`password=${String(stored.token)}`);
+      const gitPassword = credential.stdout.match(/^password=(.+)$/m)?.[1];
+      expect(gitPassword).toBeTruthy();
+      expect(gitPassword).not.toBe(systemTestConfig.token);
 
       const project = new GitProject(uniqueName("cli-session-wire"), systemClient);
       await project.create();
@@ -218,7 +222,7 @@ describe("the CLI authentication journey", () => {
         }),
       });
       expect(remote.stdout).toBe("");
-      expect(remote.stderr).not.toContain(stored.token);
+      expect(remote.stderr).not.toContain(String(gitPassword));
 
       const stranger = await runCliWith(
         configDirectory,
@@ -239,7 +243,7 @@ describe("the CLI authentication journey", () => {
       const afterExpiry = await runCli(configDirectory, "auth", "status");
       expect(afterExpiry.exitCode).toBe(3);
       expect(afterExpiry.stderr).toContain("saved CLI session has expired");
-      expect(afterExpiry.stderr).not.toContain(String(stored.token));
+      expect(afterExpiry.stderr).not.toContain(String(gitPassword));
 
       const gitAfterExpiry = await runCliWith(
         configDirectory,
@@ -251,7 +255,7 @@ describe("the CLI authentication journey", () => {
       expect(gitAfterExpiry.exitCode).toBe(3);
       expect(gitAfterExpiry.stdout).toBe("");
       expect(gitAfterExpiry.stderr).toContain("saved CLI session has expired");
-      expect(gitAfterExpiry.stderr).not.toContain(String(stored.token));
+      expect(gitAfterExpiry.stderr).not.toContain(String(gitPassword));
 
       const unconfigureGit = await runCliWith(
         configDirectory,
@@ -264,6 +268,7 @@ describe("the CLI authentication journey", () => {
       const logout = await runCli(configDirectory, "auth", "logout");
       expect(logout.exitCode, logout.stderr).toBe(0);
       expect(logout.stdout).toContain("Removed stored credentials");
+      expect(await readdir(resolve(configDirectory, ".test-credentials"))).toEqual([]);
 
       const afterLogout = await runCli(configDirectory, "auth", "status");
       expect(afterLogout.exitCode).toBe(3);

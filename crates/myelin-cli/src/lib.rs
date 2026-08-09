@@ -1,6 +1,7 @@
 pub mod ci_watch;
 pub mod client;
 pub mod config;
+mod credential_store;
 pub mod device_auth;
 pub mod dispatch;
 pub mod error;
