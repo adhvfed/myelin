@@ -1,6 +1,6 @@
 import { beforeAll, describe, expect, test } from "vitest";
 
-import { systemClient, uniqueName } from "../src/context.js";
+import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import { array, record, string, type JsonRecord } from "../src/json.js";
@@ -71,5 +71,23 @@ describe.sequential("CI delivery lifecycle", () => {
       { expectedStatus: 404 },
     );
     expect(missing.body).toHaveProperty("error");
+  });
+
+  test("inherits repository visibility instead of exposing runs platform-wide", async () => {
+    const runId = string(run.run_id, "CI run id");
+    const reviewerRuns = await reviewerClient.json("/v1/ci/runs?state=all&limit=100");
+    expect(
+      array(reviewerRuns.body.items, "reviewer-visible CI runs")
+        .map((item) => record(item, "reviewer-visible CI run"))
+        .some((item) => item.run_id === runId),
+    ).toBe(false);
+
+    const hiddenDetail = await reviewerClient.json(
+      `/v1/ci/runs/${encodeURIComponent(runId)}`,
+      { expectedStatus: 404 },
+    );
+    expect(hiddenDetail.body).toMatchObject({
+      error: { code: "not_found" },
+    });
   });
 });
