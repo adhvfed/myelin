@@ -7,6 +7,7 @@ pub mod device_auth;
 pub mod dispatch;
 pub mod error;
 pub mod git_credential;
+pub mod mcp_bridge;
 mod profiles;
 pub mod render;
 

@@ -117,6 +117,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Serve governed MCP tools through a short-lived external-agent run.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
 }
 
 #[derive(Args, Debug, Clone, Copy)]
@@ -152,6 +157,16 @@ enum ContextCommand {
     Current,
     /// Make a saved profile the default for subsequent commands.
     Use { name: Option<String> },
+}
+
+#[derive(Subcommand, Debug)]
+enum McpCommand {
+    /// Proxy newline-delimited JSON-RPC over stdin/stdout for an activated agent.
+    Serve {
+        /// Run as this activated external-agent identity.
+        #[arg(long = "as", value_name = "AGENT_ID")]
+        agent_id: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -258,7 +273,53 @@ async fn run() -> Result<(), CliError> {
             let (call, command_key) = dispatch_command(args, agent_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
+        Command::Mcp { command } => match command {
+            McpCommand::Serve { agent_id } => serve_mcp(&cli, agent_id, &getenv, &read_file).await,
+        },
     }
+}
+
+async fn serve_mcp(
+    cli: &Cli,
+    agent_id: &str,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
+) -> Result<(), CliError> {
+    if cli.json
+        || cli.edge.is_some()
+        || cli.token.is_some()
+        || cli.scheme.is_some()
+        || cli.project.is_some()
+        || cli.idempotency_key.is_some()
+    {
+        return Err(CliError::Usage(
+            "MCP serving uses only the Edge-bound browser session saved by `myelin auth login`"
+                .into(),
+        ));
+    }
+    let selected =
+        load_profile_credential(cli.profile.as_deref(), getenv, read_file)?.ok_or_else(|| {
+            CliError::NotAuthenticated(
+                "MCP serving needs a saved browser session; run `myelin auth login` first".into(),
+            )
+        })?;
+    let credential = selected.credential;
+    credential.ensure_not_expired()?;
+    if credential.scheme != SESSION_SCHEME {
+        return Err(CliError::NotAuthenticated(
+            "MCP serving needs a browser-approved session; run `myelin auth login` first".into(),
+        ));
+    }
+    let edge_url = credential.edge_url.as_deref().ok_or_else(|| {
+        CliError::NotAuthenticated(
+            "the saved credential predates Edge-aware login; run `myelin auth login` again".into(),
+        )
+    })?;
+    let edge = EdgeConfig {
+        url: edge_url.into(),
+        scheme: SESSION_SCHEME.into(),
+    };
+    myelin_cli::mcp_bridge::serve_stdio(&edge, &credential.token, agent_id).await
 }
 
 fn read_import_input(path: &str) -> Result<String, CliError> {
@@ -843,6 +904,13 @@ mod tests {
             &["myelin", "repo", "pr", "list"][..],
             &["myelin", "project", "list"][..],
             &["myelin", "agent", "list"][..],
+            &[
+                "myelin",
+                "mcp",
+                "serve",
+                "--as",
+                "11111111-1111-1111-1111-111111111111",
+            ][..],
             &["myelin", "issue", "list"][..],
             &["myelin", "inbox", "list"][..],
             &["myelin", "doc", "page", "list"][..],

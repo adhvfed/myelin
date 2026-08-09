@@ -5,8 +5,8 @@ use base64::Engine as _;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, Response, Uri};
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::Client;
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
+use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use serde_json::Value;
 use std::time::Duration;
@@ -14,6 +14,73 @@ use std::time::Duration;
 const REQUEST_DEADLINE: Duration = Duration::from_secs(30);
 const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AUTH_RESPONSE_BYTES: usize = 64 * 1024;
+
+type JsonHttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
+
+#[derive(Clone)]
+pub struct EdgeHttpClient {
+    client: JsonHttpClient,
+}
+
+impl EdgeHttpClient {
+    pub fn new() -> Result<Self, CliError> {
+        let connector = HttpsConnectorBuilder::new()
+            .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())
+            .map_err(|error| CliError::Transport(format!("load native TLS trust roots: {error}")))?
+            .https_or_http()
+            .enable_http1()
+            .build();
+        Ok(Self {
+            client: Client::builder(TokioExecutor::new()).build(connector),
+        })
+    }
+
+    pub async fn execute(
+        &self,
+        config: &EdgeConfig,
+        token: &str,
+        call: &EdgeCall,
+    ) -> Result<Value, CliError> {
+        self.execute_with_limits(config, token, call, REQUEST_DEADLINE, MAX_RESPONSE_BYTES)
+            .await
+    }
+
+    async fn execute_with_limits(
+        &self,
+        config: &EdgeConfig,
+        token: &str,
+        call: &EdgeCall,
+        deadline: Duration,
+        max_response_bytes: usize,
+    ) -> Result<Value, CliError> {
+        match (call.retry_policy, call.idempotency_key.as_deref()) {
+            (RetryPolicy::CallerKeyRequired, None) => {
+                return Err(CliError::Usage(
+                    "mutating commands require --idempotency-key <key>; reuse the same key when \
+                     retrying after a lost response"
+                        .into(),
+                ));
+            }
+            (RetryPolicy::None, Some(_)) => {
+                return Err(CliError::Usage(
+                    "--idempotency-key applies only to mutating commands".into(),
+                ));
+            }
+            _ => {}
+        }
+        let body = send_json_with(
+            &self.client,
+            config,
+            Some(token),
+            call,
+            deadline,
+            max_response_bytes,
+        )
+        .await?;
+        validate_ci_success(call, &body)?;
+        Ok(body)
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct Target {
@@ -90,7 +157,7 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 pub async fn execute(config: &EdgeConfig, token: &str, call: &EdgeCall) -> Result<Value, CliError> {
-    execute_with_limits(config, token, call, REQUEST_DEADLINE, MAX_RESPONSE_BYTES).await
+    EdgeHttpClient::new()?.execute(config, token, call).await
 }
 
 /**
@@ -110,7 +177,9 @@ pub async fn execute_device_auth(config: &EdgeConfig, call: &EdgeCall) -> Result
             "device authorization attempted an unexpected Edge request".into(),
         ));
     }
-    send_json(
+    let client = EdgeHttpClient::new()?;
+    send_json_with(
+        &client.client,
         config,
         None,
         call,
@@ -167,6 +236,7 @@ pub async fn open_event_stream(
         .map_err(|e| CliError::Transport(format!("edge event stream request failed: {e}")))
 }
 
+#[cfg(test)]
 async fn execute_with_limits(
     config: &EdgeConfig,
     token: &str,
@@ -174,27 +244,13 @@ async fn execute_with_limits(
     deadline: Duration,
     max_response_bytes: usize,
 ) -> Result<Value, CliError> {
-    match (call.retry_policy, call.idempotency_key.as_deref()) {
-        (RetryPolicy::CallerKeyRequired, None) => {
-            return Err(CliError::Usage(
-                "mutating commands require --idempotency-key <key>; reuse the same key when \
-                 retrying after a lost response"
-                    .into(),
-            ));
-        }
-        (RetryPolicy::None, Some(_)) => {
-            return Err(CliError::Usage(
-                "--idempotency-key applies only to mutating commands".into(),
-            ));
-        }
-        _ => {}
-    }
-    let body = send_json(config, Some(token), call, deadline, max_response_bytes).await?;
-    validate_ci_success(call, &body)?;
-    Ok(body)
+    EdgeHttpClient::new()?
+        .execute_with_limits(config, token, call, deadline, max_response_bytes)
+        .await
 }
 
-async fn send_json(
+async fn send_json_with(
+    client: &JsonHttpClient,
     config: &EdgeConfig,
     token: Option<&str>,
     call: &EdgeCall,
@@ -202,14 +258,6 @@ async fn send_json(
     max_response_bytes: usize,
 ) -> Result<Value, CliError> {
     let target = target(config, call)?;
-    let connector = HttpsConnectorBuilder::new()
-        .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())
-        .map_err(|e| CliError::Transport(format!("load native TLS trust roots: {e}")))?
-        .https_or_http()
-        .enable_http1()
-        .build();
-    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(connector);
-
     let mut builder = Request::builder()
         .method(call.method.as_str())
         .uri(&target.uri)

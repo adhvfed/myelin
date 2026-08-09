@@ -620,6 +620,45 @@ describe("the CLI authentication journey", () => {
         expectedStatus: 409,
       });
 
+      // An MCP client needs only the ordinary CLI command in its server configuration. The CLI
+      // exchanges the saved browser session for a transient run behind the scenes, keeps protocol
+      // stdout clean, ignores notifications, and closes the run when the client closes stdin.
+      const bridge = await runCliWith(
+        configDirectory,
+        {
+          input: [
+            JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+            JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+            JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+            "",
+          ].join("\n"),
+        },
+        ["mcp", "serve", "--as", activated.agent.id],
+      );
+      expect(bridge.exitCode, bridge.stderr).toBe(0);
+      expect(bridge.stderr).toBe("");
+      expect(bridge.stdout).not.toMatch(/v4\.public/);
+      expect(bridge.stdout).not.toContain(browserSession);
+      expect(bridge.stdout).not.toContain(systemTestConfig.token);
+      const bridgeResponses = bridge.stdout
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as Record<string, unknown>);
+      expect(bridgeResponses).toHaveLength(2);
+      expect(bridgeResponses.at(0)).toMatchObject({
+        jsonrpc: "2.0",
+        id: 1,
+        result: {
+          protocolVersion: "2025-06-18",
+          serverInfo: { name: "myelin-mcp" },
+        },
+      });
+      const bridgeTools = array(
+        record(bridgeResponses.at(1)?.result, "CLI MCP tools/list result").tools,
+        "CLI MCP tools/list tools",
+      ).map((tool, index) => string(record(tool, `CLI MCP tool ${index}`).name, "tool name"));
+      expect(bridgeTools).toEqual(["ci.read_run", "git.open_pr"]);
+
       // A founder names the first project once. Its generated identity becomes context,
       // so show and subsequent work no longer carry an operator-provided UUID.
       const cliProjectName = uniqueName("Developer experience");

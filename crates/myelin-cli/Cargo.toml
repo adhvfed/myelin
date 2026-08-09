@@ -30,6 +30,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 keyring = "4.1.6"
 rand = "0.8"
 sha2 = { workspace = true }
+zeroize = "1"
 
 percent-encoding = "2.3"
 
@@ -39,7 +40,7 @@ hyper-rustls = { version = "0.27", default-features = false, features = ["http1"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 http-body-util = "0.1"
 bytes = "1"
-tokio = { version = "1", features = ["rt", "net", "macros", "io-util", "time"] }
+tokio = { version = "1", features = ["rt", "net", "macros", "io-util", "io-std", "time", "signal"] }
 
 [dev-dependencies]
 myelin-edge = { path = "../myelin-edge", features = ["test-support"] }
