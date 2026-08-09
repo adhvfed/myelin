@@ -778,6 +778,7 @@ fn sse_body(
     let stream = ExpiringSseStream {
         events: BroadcastStream::new(rx),
         expiry: Box::pin(tokio::time::sleep(remaining)),
+        connected: false,
         done: false,
     };
     StreamBody::new(stream).boxed()
@@ -786,6 +787,7 @@ fn sse_body(
 struct ExpiringSseStream {
     events: BroadcastStream<crate::sse::SseEvent>,
     expiry: Pin<Box<tokio::time::Sleep>>,
+    connected: bool,
     done: bool,
 }
 
@@ -797,14 +799,20 @@ impl tokio_stream::Stream for ExpiringSseStream {
         if this.done {
             return Poll::Ready(None);
         }
+        if !this.connected {
+            this.connected = true;
+            return Poll::Ready(Some(Ok(Frame::data(Bytes::from_static(
+                b": connected\n\n",
+            )))));
+        }
         if this.expiry.as_mut().poll(cx).is_ready() {
             this.done = true;
             return Poll::Ready(None);
         }
         match tokio_stream::Stream::poll_next(Pin::new(&mut this.events), cx) {
-            Poll::Ready(Some(Ok(event))) => Poll::Ready(Some(Ok(Frame::data(Bytes::from(
-                event.frame(),
-            ))))),
+            Poll::Ready(Some(Ok(event))) => {
+                Poll::Ready(Some(Ok(Frame::data(Bytes::from(event.frame())))))
+            }
             Poll::Ready(Some(Err(_))) | Poll::Ready(None) => {
                 this.done = true;
                 Poll::Ready(None)
@@ -820,6 +828,27 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn sse_body_opens_the_connection_before_the_first_product_event() {
+        let (_sender, receiver) = tokio::sync::broadcast::channel(2);
+        let future_expiry = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock after epoch")
+                .as_secs(),
+        )
+        .expect("test clock fits i64")
+            + 60;
+        let mut body = sse_body(receiver, future_expiry);
+
+        let frame = body
+            .frame()
+            .await
+            .expect("connected comment frame")
+            .expect("infallible SSE frame");
+        assert_eq!(frame.into_data().expect("data frame"), ": connected\n\n");
+    }
 
     #[tokio::test]
     async fn lagged_sse_body_terminates_instead_of_skipping_to_newer_events() {
@@ -839,6 +868,7 @@ mod tests {
         .expect("test clock fits i64")
             + 60;
         let mut body = sse_body(receiver, future_expiry);
+        let _connected = body.frame().await;
         assert!(
             body.frame().await.is_none(),
             "a lagged stream closes before exposing a newer frame after the invisible gap"
@@ -855,6 +885,7 @@ mod tests {
         let mut body = sse_body(receiver, 0);
 
         tokio::task::yield_now().await;
+        let _connected = body.frame().await;
         assert!(body.frame().await.is_none());
         drop(body);
         assert_eq!(sender.receiver_count(), 0);

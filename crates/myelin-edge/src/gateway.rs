@@ -110,7 +110,8 @@ fn repo_lifecycle_event(
             .map(|slug| ("repo.created", slug)),
         "git.wire.receive_pack" => params
             .get("repo")
-            .cloned()
+            .and_then(|repo| repo.strip_suffix(".git"))
+            .map(str::to_string)
             .map(|slug| ("repo.pushed", slug)),
         _ => None,
     }
@@ -1273,7 +1274,7 @@ mod tests {
         );
 
         let mut params = BTreeMap::new();
-        params.insert("repo".to_string(), "widgets".to_string());
+        params.insert("repo".to_string(), "widgets.git".to_string());
         let pushed = EdgeResponse::json(200, &json!({ "ok": true }));
         assert_eq!(
             repo_lifecycle_event("git.wire.receive_pack", &params, &pushed),

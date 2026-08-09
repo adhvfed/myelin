@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 
 import type { SystemTestConfig } from "./config.js";
+import { SystemEventStream } from "./event-stream.js";
 import { record, type JsonRecord } from "./json.js";
 
 type Method = "GET" | "HEAD" | "POST" | "PUT";
@@ -88,5 +89,30 @@ export class SystemTestClient {
       throw new Error(`${options.method ?? "GET"} ${path} returned invalid JSON: ${detail}`);
     }
     return { ...response, body: record(parsed, `${options.method ?? "GET"} ${path} response`) };
+  }
+
+  async eventStream(path: string): Promise<{
+    headers: Headers;
+    stream: SystemEventStream;
+  }> {
+    const abortController = new AbortController();
+    const response = await fetch(new URL(path, `${this.config.edgeUrl}/`), {
+      headers: {
+        accept: "text/event-stream",
+        authorization: `Bearer ${this.config.token}`,
+        "x-myelin-token-scheme": this.config.tokenScheme,
+      },
+      redirect: "error",
+      signal: abortController.signal,
+    });
+    if (response.status !== 200 || !response.body) {
+      const responseBody = await response.text();
+      abortController.abort();
+      throw new UnexpectedSystemResponse("GET", path, response.status, responseBody, [200]);
+    }
+    return {
+      headers: response.headers,
+      stream: new SystemEventStream(response.body, abortController),
+    };
   }
 }
