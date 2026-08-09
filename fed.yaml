@@ -37,12 +37,14 @@ services:
       -e PGPASSWORD=myelin_dev_pw
       -v "$PWD/scripts/pg-init:/init:ro"
       postgres:16@sha256:78df81b1442dcc764c1104154da7162635e40cfffe67579c42a1c1b96dfc209c
-      psql -h 127.0.0.1 -p {{POSTGRES_PORT}}
+      sh -c 'until pg_isready -h 127.0.0.1 -p {{POSTGRES_PORT}}
+      -U myelin_admin -d myelin >/dev/null 2>&1; do sleep 0.1; done;
+      exec psql -h 127.0.0.1 -p {{POSTGRES_PORT}}
       -U myelin_admin -d myelin
       --set=ON_ERROR_STOP=1 --set=migration_role=myelin_admin
       --file=/init/00-rls-conventions.sql
       --file=/init/01-ci-definition-fence.sql
-      --file=/init/02-dev-roles.sql
+      --file=/init/02-dev-roles.sql'
 
   object-store:
     image: rustfs/rustfs@sha256:fa19210ac4697c79d7ccca1ec9b0eb91aebacc6691991ffb14014bb3c67e6cc3
@@ -333,6 +335,38 @@ scripts:
 
   test:frontend:
     script: pnpm --dir frontend check
+
+  test:system:
+    depends_on: [ci-controlplane, git-checks, notifications]
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_SYSTEM_TEST_EDGE_URL: "http://127.0.0.1:{{EDGE_PORT}}"
+      MYELIN_SYSTEM_TEST_TENANT: "integration-{{FED_PROJECT_ID}}"
+      MYELIN_SYSTEM_TEST_REGION: fr-par
+      MYELIN_SYSTEM_TEST_TOKEN_SCHEME: agent
+      MYELIN_SYSTEM_TEST_ISSUES_PROJECT: 20aee030-c7fa-4757-8243-700faf528690
+      MYELIN_SYSTEM_TEST_ISSUES_TYPE: 7d457754-f6a1-4cd8-8738-21751570b627
+      MYELIN_SYSTEM_TEST_ISSUES_PREFIX: MYL
+    script: >-
+      sh -c 'set -eu;
+      token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_SYSTEM_TEST_TENANT" --region "$MYELIN_SYSTEM_TEST_REGION"
+      --principal system-test --display-name "System Test"
+      --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
+      test -n "$token";
+      export MYELIN_SYSTEM_TEST_TOKEN="$token";
+      pnpm --dir system-tests install --frozen-lockfile;
+      pnpm --dir system-tests test -- "$@"' -- "$@"
 
   test:integration:
     depends_on: [web]
