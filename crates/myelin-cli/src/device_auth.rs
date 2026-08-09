@@ -1,6 +1,6 @@
 use crate::client::execute_device_auth;
 use crate::config::{Credential, EdgeConfig, SESSION_SCHEME};
-use crate::dispatch::{EdgeCall, HttpMethod};
+use crate::dispatch::{EdgeCall, HttpMethod, RetryPolicy};
 use crate::error::CliError;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hyper::Uri;
@@ -125,6 +125,7 @@ fn auth_call(path: &str, body: Value) -> Result<EdgeCall, CliError> {
         query: None,
         payload: Some(payload),
         idempotency_key: None,
+        retry_policy: RetryPolicy::None,
     })
 }
 

@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::{CliError, EdgeCall, FormQuery, HttpMethod};
+use super::{CliError, EdgeCall, FormQuery, HttpMethod, RetryPolicy};
 
 const DEFAULT_LIMIT: u16 = 50;
 
@@ -67,6 +67,7 @@ fn list_pages(args: &[&str]) -> Result<EdgeCall, CliError> {
         query: Some(query.finish()),
         payload: None,
         idempotency_key: None,
+        retry_policy: RetryPolicy::None,
     })
 }
 

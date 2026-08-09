@@ -1,7 +1,11 @@
+use crate::import::SourceSystem;
+
 pub const DEFAULT_CLI_PAGE_LIMIT: u32 = 50;
 pub const MAX_CLI_PAGE_LIMIT: u32 = 100;
 pub const MAX_ISSUE_KEY_PREFIX_BYTES: usize = 32;
 pub const MAX_ISSUE_CURSOR_BYTES: usize = 192;
+pub const MAX_ISSUE_IMPORT_JSON_BYTES: usize = 512 * 1024;
+pub const MAX_ISSUE_IMPORT_RECORDS: usize = 256;
 const MAX_TITLE_BYTES: usize = 512;
 const CURSOR_VERSION: u8 = 1;
 const CURSOR_PREFIX: &str = "ic_";
@@ -169,6 +173,12 @@ fn decode_hex(value: u8) -> Result<u8, &'static str> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportMode {
+    DryRun,
+    Run { resume: bool },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CliCommand {
     List {
         state: IssueListState,
@@ -181,6 +191,12 @@ pub enum CliCommand {
         type_id: String,
         prefix: String,
         title: String,
+    },
+    Import {
+        source: SourceSystem,
+        job_id: String,
+        input: String,
+        mode: ImportMode,
     },
     View {
         issue_id: String,
@@ -198,6 +214,7 @@ pub enum CliParseError {
     DuplicateFlag { flag: &'static str },
     BadValue { field: &'static str, value: String },
     BadTitle,
+    InvalidCombination(&'static str),
 }
 
 impl core::fmt::Display for CliParseError {
@@ -205,7 +222,7 @@ impl core::fmt::Display for CliParseError {
         match self {
             Self::Empty => write!(
                 f,
-                "no Issues command given (try: list | create | view | close)"
+                "no Issues command given (try: list | create | import | view | close)"
             ),
             Self::Unknown { token } => write!(f, "unknown Issues command token `{token}`"),
             Self::MissingValue { flag } => write!(f, "missing value for `{flag}`"),
@@ -214,6 +231,7 @@ impl core::fmt::Display for CliParseError {
                 write!(f, "malformed {field}: `{value}`")
             }
             Self::BadTitle => write!(f, "malformed title (expected 1..=512 bytes)"),
+            Self::InvalidCombination(message) => write!(f, "{message}"),
         }
     }
 }
@@ -225,12 +243,104 @@ pub fn parse_cli(args: &[&str]) -> Result<CliCommand, CliParseError> {
     match *verb {
         "list" => parse_list(rest),
         "create" => parse_create(rest),
+        "import" => parse_import(rest),
         "view" => parse_issue_id(rest, |issue_id| CliCommand::View { issue_id }),
         "close" => parse_issue_id(rest, |issue_id| CliCommand::Close { issue_id }),
         other => Err(CliParseError::Unknown {
             token: other.to_string(),
         }),
     }
+}
+
+fn parse_import(args: &[&str]) -> Result<CliCommand, CliParseError> {
+    let mut source = None;
+    let mut job_id = None;
+    let mut input = None;
+    let mut mode = None;
+    let mut resume = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--from" => {
+                if source.is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--from" });
+                }
+                let value = flag_value(args, &mut index, "--from")?;
+                source =
+                    Some(
+                        SourceSystem::parse(value).ok_or_else(|| CliParseError::BadValue {
+                            field: "import source (expected jira|linear|github|csv)",
+                            value: value.to_string(),
+                        })?,
+                    );
+            }
+            "--job" => {
+                if job_id.is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--job" });
+                }
+                let value = flag_value(args, &mut index, "--job")?.to_string();
+                require_uuid("import job UUID", &value)?;
+                job_id = Some(value);
+            }
+            "--input" => {
+                if input.is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--input" });
+                }
+                let value = flag_value(args, &mut index, "--input")?;
+                if value.is_empty() || value.len() > 4_096 {
+                    return Err(CliParseError::BadValue {
+                        field: "import input path (expected 1..=4096 bytes)",
+                        value: value.to_string(),
+                    });
+                }
+                input = Some(value.to_string());
+            }
+            "--dry-run" => {
+                if mode.replace(ImportMode::DryRun).is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--dry-run" });
+                }
+            }
+            "--run" => {
+                if mode.replace(ImportMode::Run { resume: false }).is_some() {
+                    return Err(CliParseError::DuplicateFlag { flag: "--run" });
+                }
+            }
+            "--resume" => {
+                if resume {
+                    return Err(CliParseError::DuplicateFlag { flag: "--resume" });
+                }
+                resume = true;
+            }
+            other => {
+                return Err(CliParseError::Unknown {
+                    token: other.to_string(),
+                });
+            }
+        }
+        index += 1;
+    }
+
+    let source = source.ok_or(CliParseError::MissingValue { flag: "--from" })?;
+    let job_id = required(job_id, "--job")?;
+    let input = required(input, "--input")?;
+    let mode = match mode {
+        Some(ImportMode::Run { .. }) => ImportMode::Run { resume },
+        Some(ImportMode::DryRun) if !resume => ImportMode::DryRun,
+        Some(ImportMode::DryRun) => {
+            return Err(CliParseError::InvalidCombination("--resume requires --run"))
+        }
+        None => {
+            return Err(CliParseError::InvalidCombination(
+                "issue import requires exactly one of --dry-run or --run",
+            ))
+        }
+    };
+    Ok(CliCommand::Import {
+        source,
+        job_id,
+        input,
+        mode,
+    })
 }
 
 fn parse_list(args: &[&str]) -> Result<CliCommand, CliParseError> {
@@ -507,6 +617,62 @@ mod tests {
             parse_cli(&["close"]),
             Err(CliParseError::MissingValue { .. })
         ));
+    }
+
+    #[test]
+    fn import_grammar_makes_preview_run_and_resume_explicit() {
+        assert_eq!(
+            parse_cli(&[
+                "import",
+                "--from",
+                "jira",
+                "--job",
+                PROJECT,
+                "--input",
+                "jira-export.json",
+                "--dry-run",
+            ])
+            .unwrap(),
+            CliCommand::Import {
+                source: SourceSystem::Jira,
+                job_id: PROJECT.into(),
+                input: "jira-export.json".into(),
+                mode: ImportMode::DryRun,
+            }
+        );
+        assert_eq!(
+            parse_cli(&[
+                "import", "--from", "github", "--job", PROJECT, "--input", "-", "--run",
+                "--resume",
+            ])
+            .unwrap(),
+            CliCommand::Import {
+                source: SourceSystem::GitHub,
+                job_id: PROJECT.into(),
+                input: "-".into(),
+                mode: ImportMode::Run { resume: true },
+            }
+        );
+
+        for invalid in [
+            vec!["import", "--from", "jira", "--job", PROJECT, "--input", "x"],
+            vec![
+                "import",
+                "--from",
+                "jira",
+                "--job",
+                PROJECT,
+                "--input",
+                "x",
+                "--dry-run",
+                "--resume",
+            ],
+            vec![
+                "import", "--from", "Jira", "--job", PROJECT, "--input", "x", "--run",
+            ],
+        ] {
+            assert!(parse_cli(&invalid).is_err(), "accepted {invalid:?}");
+        }
     }
 
     #[test]

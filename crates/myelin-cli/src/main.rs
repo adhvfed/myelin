@@ -10,13 +10,14 @@ use myelin_cli::device_auth::{
     begin_authorization, new_authorization_request, wait_for_authorization,
 };
 use myelin_cli::dispatch::{
-    chat_dispatch, ci_dispatch, git_dispatch, issues_dispatch_with_project, knowledge_dispatch,
-    notif_dispatch, repo_dispatch, EdgeCall, HttpMethod,
+    chat_dispatch, ci_dispatch, git_dispatch, issues_dispatch_with_context, knowledge_dispatch,
+    notif_dispatch, repo_dispatch, EdgeCall, HttpMethod, RetryPolicy,
 };
 use myelin_cli::error::CliError;
 use myelin_cli::git_credential::{
     self, CredentialScope, GitConfiguration, Operation as GitCredentialOperation,
 };
+use myelin_issues::api::MAX_ISSUE_IMPORT_JSON_BYTES;
 
 #[derive(Parser, Debug)]
 #[command(name = "myelin", version, about, long_about = None)]
@@ -197,7 +198,7 @@ async fn run() -> Result<(), CliError> {
                 &read_file,
             )?;
             let (call, command_key) = dispatch_command(args, |args| {
-                issues_dispatch_with_project(args, project.as_deref())
+                issues_dispatch_with_context(args, project.as_deref(), &read_import_input)
             })?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
@@ -217,6 +218,36 @@ async fn run() -> Result<(), CliError> {
             let (call, command_key) = dispatch_command(args, notif_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
+    }
+}
+
+fn read_import_input(path: &str) -> Result<String, CliError> {
+    use std::io::Read as _;
+
+    fn read_bounded(reader: impl std::io::Read) -> Result<String, CliError> {
+        let mut contents = Vec::new();
+        reader
+            .take((MAX_ISSUE_IMPORT_JSON_BYTES + 1) as u64)
+            .read_to_end(&mut contents)
+            .map_err(|error| {
+                CliError::Usage(format!("could not read issue import input: {error}"))
+            })?;
+        if contents.len() > MAX_ISSUE_IMPORT_JSON_BYTES {
+            return Err(CliError::Usage(format!(
+                "issue import input exceeds the {MAX_ISSUE_IMPORT_JSON_BYTES}-byte request limit"
+            )));
+        }
+        String::from_utf8(contents)
+            .map_err(|error| CliError::Usage(format!("issue import input is not UTF-8: {error}")))
+    }
+
+    if path == "-" {
+        read_bounded(std::io::stdin().lock())
+    } else {
+        let file = std::fs::File::open(path).map_err(|error| {
+            CliError::Usage(format!("could not open issue import input: {error}"))
+        })?;
+        read_bounded(file)
     }
 }
 
@@ -478,6 +509,7 @@ fn whoami_call() -> EdgeCall {
         query: None,
         payload: None,
         idempotency_key: None,
+        retry_policy: RetryPolicy::None,
     }
 }
 
@@ -592,8 +624,8 @@ async fn run_call(
         (Some(_), Some(_)) => return Err(CliError::Usage("duplicate --idempotency-key".into())),
         (top_level, trailing) => top_level.or(trailing),
     };
-    let call = match call.method {
-        HttpMethod::Post => {
+    let call = match call.retry_policy {
+        RetryPolicy::CallerKeyRequired => {
             let key = idempotency_key.ok_or_else(|| {
                 CliError::Usage(
                     "mutating commands require --idempotency-key <key>; reuse the same key when \
@@ -603,7 +635,7 @@ async fn run_call(
             })?;
             call.with_idempotency_key(key)?
         }
-        HttpMethod::Get => {
+        RetryPolicy::None => {
             if idempotency_key.is_some() {
                 return Err(CliError::Usage(
                     "--idempotency-key applies only to mutating commands".into(),

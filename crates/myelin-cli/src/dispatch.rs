@@ -1,14 +1,17 @@
 use crate::error::CliError;
 use myelin_ci_controlplane::cli::{parse_cli as parse_ci_cli, CliCommand as CiCliCommand};
 use myelin_git::api::{parse_cli, CliCommand, CliParseError};
-use myelin_issues::api::{parse_cli as parse_issues_cli, CliCommand as IssuesCliCommand};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use serde_json::json;
 
 mod chat;
+mod issues;
 mod knowledge;
 
 pub use chat::chat_dispatch;
+pub use issues::{
+    issues_dispatch, issues_dispatch_with_context, issues_dispatch_with_project,
+};
 pub use knowledge::knowledge_dispatch;
 
 const FORM_QUERY_COMPONENT_ENCODE_SET: &AsciiSet = &CONTROLS
@@ -70,6 +73,12 @@ pub enum HttpMethod {
     Post,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryPolicy {
+    None,
+    CallerKeyRequired,
+}
+
 impl HttpMethod {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -86,6 +95,7 @@ pub struct EdgeCall {
     pub query: Option<String>,
     pub payload: Option<Vec<u8>>,
     pub idempotency_key: Option<String>,
+    pub retry_policy: RetryPolicy,
 }
 
 impl EdgeCall {
@@ -96,6 +106,7 @@ impl EdgeCall {
             query: None,
             payload: None,
             idempotency_key: None,
+            retry_policy: RetryPolicy::None,
         }
     }
 
@@ -106,11 +117,23 @@ impl EdgeCall {
             query: None,
             payload: Some(payload.to_string().into_bytes()),
             idempotency_key: None,
+            retry_policy: RetryPolicy::CallerKeyRequired,
+        }
+    }
+
+    fn post_read_json(path: impl Into<String>, payload: serde_json::Value) -> EdgeCall {
+        EdgeCall {
+            method: HttpMethod::Post,
+            path: path.into(),
+            query: None,
+            payload: Some(payload.to_string().into_bytes()),
+            idempotency_key: None,
+            retry_policy: RetryPolicy::None,
         }
     }
 
     pub fn with_idempotency_key(mut self, value: &str) -> Result<EdgeCall, CliError> {
-        if self.method != HttpMethod::Post {
+        if self.retry_policy != RetryPolicy::CallerKeyRequired {
             return Err(CliError::Usage(
                 "--idempotency-key applies only to mutating commands".into(),
             ));
@@ -176,6 +199,7 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
                 query: Some(query.finish()),
                 payload: None,
                 idempotency_key: None,
+                retry_policy: RetryPolicy::None,
             })
         }
         CliCommand::RepoView { repo } => Ok(EdgeCall::get(format!("/v1/git/repos/{repo}"))),
@@ -204,6 +228,7 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
                 query: Some(query.finish()),
                 payload: None,
                 idempotency_key: None,
+                retry_policy: RetryPolicy::None,
             })
         }
 
@@ -257,77 +282,6 @@ pub fn git_command_to_call(command: &CliCommand) -> Result<EdgeCall, CliError> {
     }
 }
 
-pub fn issues_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
-    let command = parse_issues_cli(args).map_err(|error| CliError::Usage(error.to_string()))?;
-    Ok(issues_command_to_call(&command))
-}
-
-pub fn issues_dispatch_with_project(
-    args: &[&str],
-    default_project: Option<&str>,
-) -> Result<EdgeCall, CliError> {
-    let uses_default = args.first().copied() == Some("create") && !args.contains(&"--project");
-    if !uses_default {
-        return issues_dispatch(args);
-    }
-    let project = default_project.ok_or_else(|| {
-        CliError::Usage(
-            "issue create needs a project; pass --project or run `myelin context use --project <project>`"
-                .into(),
-        )
-    })?;
-    let mut contextual_args = Vec::with_capacity(args.len() + 2);
-    contextual_args.extend_from_slice(args);
-    contextual_args.extend(["--project", project]);
-    issues_dispatch(&contextual_args)
-}
-
-pub fn issues_command_to_call(command: &IssuesCliCommand) -> EdgeCall {
-    match command {
-        IssuesCliCommand::List {
-            state,
-            key,
-            limit,
-            cursor,
-        } => {
-            let mut query = format!("state={}&limit={limit}", state.as_str());
-            if let Some(key) = key {
-                query.push_str("&key=");
-                query.push_str(key);
-            }
-            if let Some(cursor) = cursor {
-                query.push_str("&cursor=");
-                query.push_str(cursor);
-            }
-            EdgeCall {
-                method: HttpMethod::Get,
-                path: "/v1/issues".into(),
-                query: Some(query),
-                payload: None,
-                idempotency_key: None,
-            }
-        }
-        IssuesCliCommand::Create {
-            project_id,
-            type_id,
-            prefix,
-            title,
-        } => EdgeCall::post_json(
-            "/v1/issues",
-            json!({
-                "project_id": project_id,
-                "type_id": type_id,
-                "prefix": prefix,
-                "title": title,
-            }),
-        ),
-        IssuesCliCommand::View { issue_id } => EdgeCall::get(format!("/v1/issues/{issue_id}")),
-        IssuesCliCommand::Close { issue_id } => {
-            EdgeCall::post_json(format!("/v1/issues/{issue_id}/close"), json!({}))
-        }
-    }
-}
-
 pub fn ci_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let command = parse_ci_cli(args).map_err(|error| CliError::Usage(error.to_string()))?;
     Ok(ci_command_to_call(&command))
@@ -348,6 +302,7 @@ pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
                 query: Some(query.finish()),
                 payload: None,
                 idempotency_key: None,
+                retry_policy: RetryPolicy::None,
             }
         }
         CiCliCommand::View { run_id } => EdgeCall::get(format!("/v1/ci/runs/{run_id}")),
@@ -365,6 +320,7 @@ pub fn ci_command_to_call(command: &CiCliCommand) -> EdgeCall {
                 query: Some(query.finish()),
                 payload: None,
                 idempotency_key: None,
+                retry_policy: RetryPolicy::None,
             }
         }
         CiCliCommand::Watch { run_id, job_id } => {
@@ -440,6 +396,7 @@ pub fn notif_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
                 query: Some(query.finish()),
                 payload: None,
                 idempotency_key: None,
+                retry_policy: RetryPolicy::None,
             })
         }
         "show" | "read" => {

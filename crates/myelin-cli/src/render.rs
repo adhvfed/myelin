@@ -51,6 +51,9 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     if let Some(rendered) = collaboration::render_response(value) {
         return rendered;
     }
+    if let Some(rendered) = render_issue_import(value) {
+        return rendered;
+    }
     if let Some(items) = value.get("items").and_then(Value::as_array) {
         let mut out = collaboration::render_collection_header(value).unwrap_or_default();
         if items.is_empty() {
@@ -127,6 +130,54 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     }
     let serialized = serde_json::to_string(value).unwrap_or_else(|_| value.to_string());
     format!("{}\n", terminal_safe_single_line(&serialized))
+}
+
+fn render_issue_import(value: &Value) -> Option<String> {
+    let import = value.get("import")?.as_object()?;
+    let job = terminal_safe_single_line(import.get("job_id")?.as_str()?);
+    let source = terminal_safe_single_line(import.get("source")?.as_str()?);
+    match import.get("mode")?.as_str()? {
+        "dry_run" => {
+            let report = value.get("reconciliation")?.as_object()?;
+            let received = report.get("received")?.as_u64()?;
+            let ready = report.get("ready")?.as_u64()?;
+            let lossy = report.get("lossy")?.as_u64()?;
+            let dropped = report.get("dropped")?.as_u64()?;
+            Some(format!(
+                "Import preview {job} ({source}): {ready}/{received} ready, {lossy} lossy, {dropped} dropped; no data written.\n"
+            ))
+        }
+        "run" => {
+            let summary = value.get("summary")?.as_object()?;
+            let created = summary.get("created")?.as_u64()?;
+            let resumed = summary.get("resumed")?.as_u64()?;
+            let lossy = summary.get("lossy")?.as_u64()?;
+            let dropped = summary.get("dropped")?.as_u64()?;
+            let mut output = format!(
+                "Import {job} ({source}): {created} created, {resumed} resumed, {lossy} lossy, {dropped} dropped.\n"
+            );
+            for outcome in value.get("issues")?.as_array()? {
+                let source_id = terminal_safe_single_line(outcome.get("source_id")?.as_str()?);
+                let issue = outcome.get("issue")?;
+                let key = terminal_safe_single_line(issue.get("key")?.as_str()?);
+                let id = terminal_safe_single_line(issue.get("id")?.as_str()?);
+                let disposition = if outcome.get("created")?.as_bool()? {
+                    "created"
+                } else {
+                    "resumed"
+                };
+                let authorization = terminal_safe_single_line(
+                    outcome.get("authorization")?.get("status")?.as_str()?,
+                );
+                let _ = writeln!(
+                    output,
+                    "{source_id} -> {key} staged ({id}); {disposition}; authorization={authorization}"
+                );
+            }
+            Some(output)
+        }
+        _ => None,
+    }
 }
 
 fn render_item(item: &Value) -> String {
@@ -575,6 +626,43 @@ mod tests {
         assert!(out.contains("not visible yet"));
         assert!(out.contains(&format!("myelin issue view {id}")));
         assert!(!out.contains("created successfully"));
+    }
+
+    #[test]
+    fn issue_import_preview_and_resume_are_honest_human_summaries() {
+        let job = "33333333-3333-3333-3333-333333333333";
+        let preview = render(
+            &json!({
+                "import": {"job_id": job, "source": "jira", "mode": "dry_run"},
+                "reconciliation": {"received": 2, "ready": 2, "lossy": 0, "dropped": 0},
+                "losses": [],
+            }),
+            false,
+        );
+        assert_eq!(
+            preview,
+            format!(
+                "Import preview {job} (jira): 2/2 ready, 0 lossy, 0 dropped; no data written.\n"
+            )
+        );
+
+        let resumed = render(
+            &json!({
+                "import": {"job_id": job, "source": "jira", "mode": "run"},
+                "summary": {"received": 1, "created": 0, "resumed": 1, "lossy": 0, "dropped": 0},
+                "issues": [{
+                    "source_id": "JIRA-41",
+                    "created": false,
+                    "issue": {"id": "44444444-4444-4444-4444-444444444444", "key": "ENG-41"},
+                    "authorization": {"status": "requested"},
+                }],
+                "losses": [],
+            }),
+            false,
+        );
+        assert!(resumed.contains("0 created, 1 resumed"));
+        assert!(resumed.contains("JIRA-41 -> ENG-41 staged"));
+        assert!(resumed.contains("authorization=requested"));
     }
 
     #[test]

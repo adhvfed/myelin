@@ -1,6 +1,6 @@
 use crate::client::{execute, interpret, open_event_stream};
 use crate::config::EdgeConfig;
-use crate::dispatch::{EdgeCall, HttpMethod};
+use crate::dispatch::{EdgeCall, HttpMethod, RetryPolicy};
 use crate::error::CliError;
 use crate::render::terminal_safe_log_bytes;
 use base64::Engine as _;
@@ -311,6 +311,7 @@ async fn read_archive_range(
         query: Some(format!("start={start}&limit={limit}")),
         payload: None,
         idempotency_key: None,
+        retry_policy: RetryPolicy::None,
     };
     execute(config, token, &call).await
 }

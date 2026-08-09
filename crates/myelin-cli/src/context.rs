@@ -2,7 +2,7 @@ use crate::client::execute;
 use crate::config::{
     load_profile_credential, saved_profiles, use_profile_context, EdgeConfig, ProfileContext,
 };
-use crate::dispatch::{EdgeCall, HttpMethod};
+use crate::dispatch::{EdgeCall, HttpMethod, RetryPolicy};
 use crate::error::CliError;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -142,6 +142,7 @@ fn identity_call() -> EdgeCall {
         query: None,
         payload: None,
         idempotency_key: None,
+        retry_policy: RetryPolicy::None,
     }
 }
 

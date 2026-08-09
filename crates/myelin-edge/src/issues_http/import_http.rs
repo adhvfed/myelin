@@ -4,14 +4,12 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::Method;
+pub use myelin_issues::api::{MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS};
 use myelin_issues::{CreateIssue, ImportIssue, SourceSystem};
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeSet;
 use std::sync::Arc;
-
-pub const MAX_ISSUE_IMPORT_JSON_BYTES: usize = 512 * 1024;
-pub const MAX_ISSUE_IMPORT_RECORDS: usize = 256;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

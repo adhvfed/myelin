@@ -1,13 +1,13 @@
 use myelin_edge::{
     register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
+use myelin_cli::config::EdgeConfig;
+use myelin_cli::dispatch::{EdgeCall, HttpMethod, RetryPolicy};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
     PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
 };
-use myelin_cli::config::EdgeConfig;
-use myelin_cli::dispatch::{EdgeCall, HttpMethod};
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 use std::net::SocketAddr;
@@ -160,6 +160,7 @@ async fn code_search_preserves_query_bytes_and_returns_durable_matches() {
         query: None,
         payload: Some(serde_json::json!({ "slug": "searchable" }).to_string().into_bytes()),
         idempotency_key: Some("test-search-create".into()),
+        retry_policy: RetryPolicy::CallerKeyRequired,
     };
     myelin_cli::client::execute(&config, &token, &create)
         .await
@@ -175,6 +176,7 @@ async fn code_search_preserves_query_bytes_and_returns_durable_matches() {
                 .into_bytes(),
         ),
         idempotency_key: Some("test-search-write".into()),
+        retry_policy: RetryPolicy::CallerKeyRequired,
     };
     myelin_cli::client::execute(&config, &token, &write)
         .await

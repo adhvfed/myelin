@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::{CliError, EdgeCall, FormQuery};
+use super::{CliError, EdgeCall, FormQuery, RetryPolicy};
 
 const DEFAULT_LIMIT: u16 = 50;
 
@@ -144,6 +144,7 @@ impl<'a> PageArgs<'a> {
             query: Some(query.finish()),
             payload: None,
             idempotency_key: None,
+            retry_policy: RetryPolicy::None,
         }
     }
 }

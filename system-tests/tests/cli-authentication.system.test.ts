@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -314,6 +315,78 @@ describe("the CLI authentication journey", () => {
         profile: "default",
         project: systemTestConfig.issues.projectId,
       });
+
+      // Migration uses that same browser-approved context: the file contains source records,
+      // while project scope and credentials remain outside the export.
+      const importJob = randomUUID();
+      const importPath = resolve(configDirectory, "github-issues.json");
+      await writeFile(
+        importPath,
+        JSON.stringify({
+          records: [
+            {
+              source_id: uniqueName("github-acme-platform-41"),
+              type_id: systemTestConfig.issues.typeId,
+              prefix: systemTestConfig.issues.prefix,
+              title: uniqueName("Imported through the browser session"),
+            },
+          ],
+        }),
+      );
+      const importPreview = await runCli(
+        configDirectory,
+        "issue",
+        "import",
+        "--from",
+        "github",
+        "--job",
+        importJob,
+        "--input",
+        importPath,
+        "--dry-run",
+      );
+      expect(importPreview.exitCode, importPreview.stderr).toBe(0);
+      expect(importPreview.stdout).toContain("1/1 ready");
+      expect(importPreview.stdout).toContain("no data written");
+
+      const imported = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        uniqueName("cli-import-run"),
+        "issue",
+        "import",
+        "--from",
+        "github",
+        "--job",
+        importJob,
+        "--input",
+        importPath,
+        "--run",
+      );
+      expect(imported.exitCode, imported.stderr).toBe(0);
+      expect(JSON.parse(imported.stdout)).toMatchObject({
+        import: { job_id: importJob, source: "github", resumable: true },
+        summary: { received: 1, created: 1, resumed: 0 },
+      });
+
+      const resumedImport = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        uniqueName("cli-import-resume"),
+        "issue",
+        "import",
+        "--from",
+        "github",
+        "--job",
+        importJob,
+        "--input",
+        importPath,
+        "--run",
+        "--resume",
+      );
+      expect(resumedImport.exitCode, resumedImport.stderr).toBe(0);
+      expect(resumedImport.stdout).toContain("0 created, 1 resumed");
 
       const repositories = await runCli(configDirectory, "repo", "list");
       expect(repositories.exitCode, repositories.stderr).toBe(0);

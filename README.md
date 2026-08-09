@@ -84,6 +84,10 @@ myelin repo pr list
 myelin issue create --type 22222222-2222-2222-2222-222222222222 \
   --prefix ENG --title "Make onboarding uneventful" --idempotency-key onboarding-issue
 myelin issue list
+myelin issue import --from jira --job 33333333-3333-3333-3333-333333333333 \
+  --input jira-issues.json --dry-run
+myelin issue import --from jira --job 33333333-3333-3333-3333-333333333333 \
+  --input jira-issues.json --run --idempotency-key jira-import-3333
 myelin inbox list
 
 myelin chat list
@@ -107,6 +111,27 @@ order. Git helpers are scoped to an exact Edge and profile.
 Mutation keys are the caller's single retry identity: reuse the same key after a lost response.
 Chat and Knowledge derive their bounded durable nonce from it, so callers do not need a second
 backend-specific token.
+
+Issue import input is a strict JSON object containing up to 256 records. The active project is
+applied to every record, so project scope stays in the selected context rather than being repeated
+throughout an export:
+
+```json
+{
+  "records": [
+    {
+      "source_id": "JIRA-41",
+      "type_id": "22222222-2222-2222-2222-222222222222",
+      "prefix": "ENG",
+      "title": "Make onboarding uneventful"
+    }
+  ]
+}
+```
+
+`--dry-run` performs validation and authorization checks without writing. Reuse the same `--job`
+with `--run --resume` after an interruption; the durable source-ID map returns existing issues
+instead of creating duplicates. Use `--input -` to read the document from standard input.
 
 ## Status
 

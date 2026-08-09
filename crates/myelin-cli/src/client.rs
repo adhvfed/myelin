@@ -1,5 +1,5 @@
 use crate::config::EdgeConfig;
-use crate::dispatch::EdgeCall;
+use crate::dispatch::{EdgeCall, RetryPolicy};
 use crate::error::CliError;
 use base64::Engine as _;
 use bytes::Bytes;
@@ -174,15 +174,15 @@ async fn execute_with_limits(
     deadline: Duration,
     max_response_bytes: usize,
 ) -> Result<Value, CliError> {
-    match (call.method, call.idempotency_key.as_deref()) {
-        (crate::dispatch::HttpMethod::Post, None) => {
+    match (call.retry_policy, call.idempotency_key.as_deref()) {
+        (RetryPolicy::CallerKeyRequired, None) => {
             return Err(CliError::Usage(
                 "mutating commands require --idempotency-key <key>; reuse the same key when \
                  retrying after a lost response"
                     .into(),
             ));
         }
-        (crate::dispatch::HttpMethod::Get, Some(_)) => {
+        (RetryPolicy::None, Some(_)) => {
             return Err(CliError::Usage(
                 "--idempotency-key applies only to mutating commands".into(),
             ));
@@ -784,6 +784,7 @@ mod tests {
             query: query.map(str::to_string),
             payload: None,
             idempotency_key: None,
+            retry_policy: RetryPolicy::None,
         }
     }
 
@@ -939,6 +940,7 @@ mod tests {
             query: None,
             payload: Some(b"{}".to_vec()),
             idempotency_key: None,
+            retry_policy: RetryPolicy::None,
         };
 
         let response = execute_device_auth(&cfg(&format!("http://{address}")), &call)
@@ -969,6 +971,7 @@ mod tests {
             query: None,
             payload: Some(b"{}".to_vec()),
             idempotency_key: None,
+            retry_policy: RetryPolicy::CallerKeyRequired,
         };
         let error = execute_with_limits(
             &cfg("http://127.0.0.1:1"),
