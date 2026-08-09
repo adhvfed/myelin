@@ -19,6 +19,7 @@ pub mod multi_cell;
 pub mod namespace;
 pub mod oidc;
 pub mod principal_store;
+pub mod project_store;
 pub mod pseudonym_erase;
 pub mod pseudonym_store;
 pub mod read_replica;
@@ -109,6 +110,10 @@ pub use oidc::{
 pub use principal_store::{
     PrincipalCredentialProvision, PrincipalError, PrincipalProfile, PrincipalRow, PrincipalStore,
     ProfileRef, S1_HOLDER, S1_TABLE,
+};
+pub use project_store::{
+    project_ref, validate_new_project, NewProject, PgProjectStore, Project, ProjectCreation,
+    ProjectError, MAX_PROJECT_NAME_BYTES, MAX_PROJECT_PREFIX_BYTES, PROJECT_WRITER_RELATION,
 };
 pub use pseudonym_erase::{
     ErasureLedgerEntry, ErasureReceipt, PseudonymEraseError, PseudonymErasureLedger,

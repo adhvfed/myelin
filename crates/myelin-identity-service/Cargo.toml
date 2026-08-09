@@ -39,6 +39,7 @@ ciborium = "0.2"
 tokio = { workspace = true, features = ["signal"] }
 myelin-config = { workspace = true }
 sqlx = { workspace = true }
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 rand = "0.8"

@@ -7,10 +7,13 @@ pub const IDENTITY_ROLE_GRANTED: &str = "identity.role.granted";
 
 pub const IDENTITY_BREAK_GLASS: &str = "identity.break_glass.invoked";
 
+pub const IDENTITY_PROJECT_CREATED: &str = "identity.project.created";
+
 pub const IDENTITY_EVENT_TOKENS: &[&str] = &[
     IDENTITY_TUPLE_WRITTEN,
     IDENTITY_ROLE_GRANTED,
     IDENTITY_BREAK_GLASS,
+    IDENTITY_PROJECT_CREATED,
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +100,7 @@ mod tests {
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_TUPLE_WRITTEN));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_ROLE_GRANTED));
         assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_BREAK_GLASS));
+        assert!(IDENTITY_EVENT_TOKENS.contains(&IDENTITY_PROJECT_CREATED));
     }
 
     #[test]

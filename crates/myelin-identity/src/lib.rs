@@ -2,7 +2,7 @@ pub mod iam_events;
 
 pub use iam_events::{
     signals, IamEventProjection, IamSubjectRef, IDENTITY_BREAK_GLASS, IDENTITY_EVENT_TOKENS,
-    IDENTITY_ROLE_GRANTED, IDENTITY_TUPLE_WRITTEN,
+    IDENTITY_PROJECT_CREATED, IDENTITY_ROLE_GRANTED, IDENTITY_TUPLE_WRITTEN,
 };
 
 use myelin_tenancy::{ArtifactRef, Region, TenantId};

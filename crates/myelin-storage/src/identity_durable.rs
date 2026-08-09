@@ -70,6 +70,37 @@ CREATE POLICY myelin_tenant_isolation ON run_token_teardown \
   WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
               AND region = current_setting('myelin.region', true));";
 
+pub const IDENTITY_PROJECT_MIGRATION: &str = "\
+CREATE TABLE IF NOT EXISTS identity_project (
+    tenant_id             text        NOT NULL,
+    region                text        NOT NULL,
+    project_id            uuid        NOT NULL,
+    name                  text        NOT NULL,
+    issue_prefix          text        NOT NULL,
+    default_issue_type_id uuid        NOT NULL,
+    created_by            text        NOT NULL,
+    client_nonce          text        NOT NULL,
+    created_at            timestamptz NOT NULL,
+    PRIMARY KEY (tenant_id, region, project_id),
+    UNIQUE (tenant_id, region, issue_prefix),
+    UNIQUE (tenant_id, region, client_nonce),
+    CHECK (length(name) BETWEEN 1 AND 100),
+    CHECK (length(issue_prefix) BETWEEN 2 AND 10),
+    CHECK (length(client_nonce) BETWEEN 1 AND 128)
+);
+CREATE INDEX IF NOT EXISTS identity_project_keyset
+    ON identity_project (tenant_id, region, project_id DESC);";
+
+pub const IDENTITY_PROJECT_RLS_POLICY: &str = "\
+ALTER TABLE identity_project ENABLE ROW LEVEL SECURITY;
+ALTER TABLE identity_project FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON identity_project;
+CREATE POLICY myelin_tenant_isolation ON identity_project \
+  USING (tenant_id = current_setting('myelin.tenant_id', true) \
+         AND region = current_setting('myelin.region', true)) \
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true) \
+              AND region = current_setting('myelin.region', true));";
+
 pub const AUTH_REPLAY_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS auth_replay (
     tenant_id text   NOT NULL,
@@ -133,6 +164,13 @@ pub fn identity_durable_migrations() -> Migrations {
         Migration::plain("0017_revocation_rls", REVOCATION_RLS_POLICY),
         Migration::plain("0018_run_token_teardown", RUN_TOKEN_TEARDOWN_MIGRATION),
         Migration::plain("0019_run_token_teardown_rls", RUN_TOKEN_TEARDOWN_RLS_POLICY),
+    ])
+}
+
+pub fn identity_project_durable_migrations() -> Migrations {
+    Migrations::of([
+        Migration::plain("0082_identity_project", IDENTITY_PROJECT_MIGRATION),
+        Migration::plain("0083_identity_project_rls", IDENTITY_PROJECT_RLS_POLICY),
     ])
 }
 

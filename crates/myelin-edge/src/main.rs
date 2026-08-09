@@ -7,7 +7,7 @@ use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
     register_chat, register_ci, register_git_durable, register_git_wire, register_issues,
-    register_knowledge, register_notif, serve_edge_until_shutdown_with_probe,
+    register_knowledge, register_notif, register_projects, serve_edge_until_shutdown_with_probe,
     spawn_issue_authorization_reconciler, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams,
     CheckBackedRepoAuthorizer, DurableGitBackend, Gateway, GitDatabaseProviders,
@@ -1094,6 +1094,12 @@ async fn serve(
         builder,
         issue_store.clone(),
         issue_authorizer,
+        handle.clone(),
+    );
+    builder = register_projects(
+        builder,
+        myelin_identity_service::PgProjectStore::new(provider.clone()),
+        check.clone(),
         handle.clone(),
     );
     builder = register_chat(

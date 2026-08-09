@@ -34,6 +34,67 @@ async function awaitActiveIssue(title: string): Promise<JsonRecord> {
 }
 
 describe("collaboration lifecycle", () => {
+  test("lets a founder create and rediscover a project without operator-provided IDs", async () => {
+    const name = uniqueName("Developer experience");
+    const issuePrefix = `P${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`;
+    const retryKey = `project-${randomUUID()}`;
+    const created = await systemClient.json("/v1/projects", {
+      method: "POST",
+      body: { name, issue_prefix: issuePrefix },
+      idempotencyKey: retryKey,
+      expectedStatus: 201,
+    });
+    const project = record(created.body.project, "created project");
+    const projectId = string(project.id, "project id");
+    const projectRef = string(project.ref, "project ref");
+    const defaultIssueTypeId = string(project.default_issue_type_id, "default issue type id");
+
+    expect(created.body).toMatchObject({ created: true, durable: true });
+    expect(project).toMatchObject({ name, issue_prefix: issuePrefix });
+    expect(projectId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+    expect(defaultIssueTypeId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+    expect(projectRef).toBe(
+      `myelin://${systemTestConfig.tenant}/identity/project/${projectId}`,
+    );
+
+    const replay = await systemClient.json("/v1/projects", {
+      method: "POST",
+      body: { name, issue_prefix: issuePrefix },
+      idempotencyKey: retryKey,
+      expectedStatus: 200,
+    });
+    expect(replay.body).toMatchObject({
+      created: false,
+      durable: true,
+      project: { id: projectId, ref: projectRef },
+    });
+
+    const conflictingReplay = await systemClient.json("/v1/projects", {
+      method: "POST",
+      body: { name: `${name} changed`, issue_prefix: issuePrefix },
+      idempotencyKey: retryKey,
+      expectedStatus: 409,
+    });
+    expect(conflictingReplay.body).toMatchObject({ error: { code: "conflict" } });
+
+    const rediscovered = await systemClient.json(`/v1/projects/${projectId}`);
+    expect(rediscovered.body).toMatchObject({ project: { id: projectId, ref: projectRef, name } });
+
+    const listed = await systemClient.json("/v1/projects?limit=100");
+    expect(array(listed.body.items, "founder's projects")).toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: projectId, ref: projectRef, name })]),
+    );
+
+    const hiddenFromPeer = await reviewerClient.json(`/v1/projects/${projectId}`, {
+      expectedStatus: 404,
+    });
+    expect(hiddenFromPeer.body).toMatchObject({ error: { code: "not_found" } });
+    const peerProjects = await reviewerClient.json("/v1/projects?limit=100");
+    expect(array(peerProjects.body.items, "peer's projects")).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: projectId })]),
+    );
+  });
+
   test("creates a public conversation and exchanges durable messages", async () => {
     const channel = uniqueName("system-chat");
     const topic = "Coordinate the externally tested release";

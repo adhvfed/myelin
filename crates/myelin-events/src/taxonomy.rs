@@ -37,6 +37,7 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     "read_state",
     "permission",
     "member",
+    "project",
     "edge",
 ];
 
