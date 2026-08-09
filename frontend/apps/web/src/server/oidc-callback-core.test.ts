@@ -15,6 +15,7 @@ function dependencies() {
       codeVerifier: "verifier",
       nonce: "nonce",
       redirectUri,
+      returnTo: "/cli/auth?code=ABCD-EFGH",
     }),
     exchange: vi.fn().mockResolvedValue("id-token"),
     establish: vi.fn().mockResolvedValue(undefined),
@@ -30,7 +31,10 @@ describe("runOidcCallback", () => {
       cookieState: state,
       providerError: false,
       redirectUri,
-    }, deps)).toBe(true);
+    }, deps)).toEqual({
+      authenticated: true,
+      returnTo: "/cli/auth?code=ABCD-EFGH",
+    });
     expect(deps.consume).toHaveBeenCalledWith(state);
     expect(deps.exchange).toHaveBeenCalledWith("authorization-code", "verifier");
     expect(deps.establish).toHaveBeenCalledWith("id-token", "nonce");
@@ -44,7 +48,7 @@ describe("runOidcCallback", () => {
     { states: [state], codes: ["code"], cookieState: "B".repeat(43), providerError: false },
   ])("rejects ambiguous or mismatched callbacks before consumption", async (input) => {
     const deps = dependencies();
-    expect(await runOidcCallback({ ...input, redirectUri }, deps)).toBe(false);
+    expect(await runOidcCallback({ ...input, redirectUri }, deps)).toBeNull();
     expect(deps.consume).not.toHaveBeenCalled();
     expect(deps.exchange).not.toHaveBeenCalled();
   });
@@ -59,7 +63,10 @@ describe("runOidcCallback", () => {
       cookieState: state,
       redirectUri,
       ...over,
-    }, deps)).toBe(false);
+    }, deps)).toEqual({
+      authenticated: false,
+      returnTo: "/cli/auth?code=ABCD-EFGH",
+    });
     expect(deps.consume).toHaveBeenCalledWith(state);
     expect(deps.exchange).not.toHaveBeenCalled();
   });
@@ -73,8 +80,25 @@ describe("runOidcCallback", () => {
       cookieState: state,
       providerError: false,
       redirectUri,
-    }, deps)).toBe(false);
+    }, deps)).toBeNull();
     expect(deps.exchange).not.toHaveBeenCalled();
+  });
+
+  it("retains the local destination when the provider exchange fails", async () => {
+    const deps = dependencies();
+    deps.exchange.mockRejectedValue(new Error("provider unavailable"));
+
+    expect(await runOidcCallback({
+      states: [state],
+      codes: ["code"],
+      cookieState: state,
+      providerError: false,
+      redirectUri,
+    }, deps)).toEqual({
+      authenticated: false,
+      returnTo: "/cli/auth?code=ABCD-EFGH",
+    });
+    expect(deps.establish).not.toHaveBeenCalled();
   });
 
   it("uses an independent host cookie for every concurrent transaction", () => {

@@ -22,7 +22,17 @@ import {
   DEV_SCHEME,
 } from "../../dev-edge/dev-contract.mjs";
 import { devLoginAllowed, type DevLoginEnv } from "./dev-login-guard";
-import { runTokenLogin } from "./token-login";
+import {
+  runTokenLogin,
+  TOKEN_LOGIN_DISABLED,
+  TOKEN_LOGIN_ERROR,
+  TOKEN_LOGIN_SUCCESS,
+} from "./token-login";
+import {
+  authFailureDestination,
+  authenticationDestination,
+  safeAuthReturnTo,
+} from "./auth-return";
 import { SESSION_ABSOLUTE_TTL_MS } from "../server/session-store";
 import {
   toAuthConfig,
@@ -96,7 +106,7 @@ function assertDevLoginAllowed(): void {
 }
 
 /** Verify the configured development capability with the edge, then create a server-side session. */
-export const loginDev = action(async () => {
+export const loginDev = action(async (formData: FormData) => {
   "use server";
   if (import.meta.env.PROD) {
     throw redirect("/login");
@@ -119,7 +129,7 @@ export const loginDev = action(async () => {
     region: whoami.region,
     tenant: whoami.tenant,
   });
-  throw redirect("/git/repos");
+  throw redirect(safeAuthReturnTo(formData.get("return_to")));
 }, "login-dev");
 
 /**
@@ -170,7 +180,17 @@ export const loginWithToken = action(async (formData: FormData) => {
       issue: async (rec) => { await issueSession(rec); },
     },
   );
-  throw redirect(result.redirectTo);
+  const returnTo = formData.get("return_to");
+  if (result.redirectTo === TOKEN_LOGIN_SUCCESS) {
+    throw redirect(safeAuthReturnTo(returnTo));
+  }
+  if (result.redirectTo === TOKEN_LOGIN_ERROR) {
+    throw redirect(authFailureDestination("token_invalid", returnTo));
+  }
+  if (result.redirectTo === TOKEN_LOGIN_DISABLED) {
+    throw redirect(authenticationDestination(returnTo));
+  }
+  throw redirect("/login");
 }, "login-with-token");
 
 /**
@@ -179,17 +199,18 @@ export const loginWithToken = action(async (formData: FormData) => {
  * gate. State, nonce, and verifier remain server-side; only the opaque state cookie reaches the
  * browser.
  */
-export const startSso = action(async () => {
+export const startSso = action(async (formData: FormData) => {
   "use server";
+  const returnTo = formData.get("return_to");
   let destination: string;
   try {
     const edge = await edgeGetPublic<EdgeAuthConfig>("/v1/auth/config");
     if (edge.sso_configured !== true || !interactiveOidcConfigured()) {
       throw new Error("SSO is unavailable");
     }
-    destination = await beginOidcLogin();
+    destination = await beginOidcLogin(returnTo);
   } catch {
-    destination = "/login?error=sso_start_unavailable";
+    destination = authFailureDestination("sso_start_unavailable", returnTo);
   }
   throw redirect(destination);
 }, "start-sso");

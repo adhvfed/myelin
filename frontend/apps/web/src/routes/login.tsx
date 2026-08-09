@@ -13,6 +13,7 @@ import { Title } from "@solidjs/meta";
 import { createAsync, useSearchParams, useSubmission } from "@solidjs/router";
 import { Icon } from "@myelin/design-system";
 import { getAuthConfig, loginDev, loginWithToken, startSso } from "../lib/auth";
+import { safeAuthReturnTo } from "../lib/auth-return";
 
 // The card chrome, shared by every state.
 const card = {
@@ -70,6 +71,7 @@ export default function Login() {
   // R4.0 — the operator-token failure has its OWN honest copy (blames the token/bootstrap, not the
   // user), distinct from the SSO-not-wired message. Key off the `?error=` value.
   const isTokenError = () => params.error === "token_invalid";
+  const returnTo = () => safeAuthReturnTo(params.return_to);
 
   return (
     <main
@@ -180,6 +182,7 @@ export default function Login() {
                   }
                 >
                   <form action={startSso} method="post" style={{ margin: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
+                    <input type="hidden" name="return_to" value={returnTo()} />
                     <button
                       type="submit"
                       data-testid="sso-login"
@@ -209,6 +212,7 @@ export default function Login() {
                     data-testid="token-login-form"
                     style={{ margin: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}
                   >
+                    <input type="hidden" name="return_to" value={returnTo()} />
                     {/* The control is NESTED in its label (the codebase's association convention) — the
                         visible label text is the <span>; the input is the labelled control. */}
                     <label style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
@@ -285,6 +289,7 @@ export default function Login() {
                       <Icon name="gate" /> Development builds only
                     </p>
                     <form action={loginDev} method="post" style={{ margin: "0" }}>
+                      <input type="hidden" name="return_to" value={returnTo()} />
                       <button
                         type="submit"
                         data-testid="dev-login"

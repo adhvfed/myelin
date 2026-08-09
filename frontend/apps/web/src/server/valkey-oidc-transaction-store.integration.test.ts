@@ -22,6 +22,7 @@ describe.runIf(Boolean(redisUrl))("ValkeyOidcTransactionStore integration", () =
       codeVerifier: randomBytes(32).toString("base64url"),
       nonce: randomBytes(32).toString("base64url"),
       redirectUri: "https://myelin.example/auth/oidc/callback",
+      returnTo: "/cli/auth?code=ABCD-EFGH",
     };
 
     try {

@@ -121,6 +121,25 @@ export async function edgeWhoami(): Promise<EdgeWhoami> {
   return who;
 }
 
+/** Approve one CLI device request with the current browser session, entirely server-to-server. */
+export async function edgeApproveCliLogin(userCode: string): Promise<void> {
+  const response = await edgePost<unknown>("/v1/auth/device/approval", {
+    user_code: userCode,
+  });
+  if (
+    typeof response !== "object" ||
+    response === null ||
+    (response as Record<string, unknown>).approved !== true
+  ) {
+    throw new GatewayError(
+      "CLI login approval returned an unexpected shape",
+      502,
+      undefined,
+      null,
+    );
+  }
+}
+
 export interface EdgeOidcLogin {
   accessToken: string;
   scheme: "session";

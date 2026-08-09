@@ -6,6 +6,7 @@ const transaction = {
   codeVerifier: "v".repeat(43),
   nonce: "n".repeat(43),
   redirectUri: "https://myelin.example/auth/oidc/callback",
+  returnTo: "/cli/auth?code=ABCD-EFGH",
 };
 const state = "s".repeat(43);
 
@@ -25,6 +26,10 @@ describe("MemoryOidcTransactionStore", () => {
     await expect(store.issue(state, {
       ...transaction,
       redirectUri: "https://user:secret@myelin.example/callback",
+    })).rejects.toThrow(/invalid/);
+    await expect(store.issue(state, {
+      ...transaction,
+      returnTo: "https://outside.example/steal",
     })).rejects.toThrow(/invalid/);
 
     const withExtra = { ...transaction, untrusted: "drop" };

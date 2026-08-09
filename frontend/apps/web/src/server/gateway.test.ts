@@ -13,6 +13,7 @@ import {
   MAX_EDGE_JSON_RESPONSE_BYTES,
   MAX_EDGE_PUBLIC_RESPONSE_BYTES,
   MAX_EDGE_RAW_RESPONSE_BYTES,
+  edgeApproveCliLogin,
   edgeGet,
   edgeGetEventStream,
   edgeGetPublic,
@@ -400,6 +401,41 @@ describe("edgeLoginWithOidc", () => {
 
     await expect(edgeLoginWithOidc("id-token", "nonce")).rejects.toMatchObject({
       name: "Unauthorized",
+    });
+  });
+});
+
+describe("edgeApproveCliLogin", () => {
+  it("sends only the human code with the server-side browser session", async () => {
+    session.getSessionRecord.mockReturnValue({
+      token: "human-session",
+      refreshToken: "",
+      scheme: "session",
+    });
+    const fetchMock = vi.fn().mockResolvedValueOnce(new Response(
+      JSON.stringify({ approved: true }),
+      { status: 200 },
+    ));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(edgeApproveCliLogin("ABCD-EFGH")).resolves.toBeUndefined();
+
+    const [url, init] = fetchMock.mock.calls[0]!;
+    expect(String(url)).toMatch(/\/v1\/auth\/device\/approval$/);
+    expect(new Headers(init?.headers).get("authorization")).toBe("Bearer human-session");
+    expect(new Headers(init?.headers).get("x-myelin-token-scheme")).toBe("session");
+    expect(JSON.parse(String(init?.body))).toEqual({ user_code: "ABCD-EFGH" });
+  });
+
+  it("rejects a successful response that does not confirm approval", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValueOnce(new Response(
+      JSON.stringify({ approved: false }),
+      { status: 200 },
+    )));
+
+    await expect(edgeApproveCliLogin("ABCD-EFGH")).rejects.toMatchObject({
+      name: "GatewayError",
+      status: 502,
     });
   });
 });

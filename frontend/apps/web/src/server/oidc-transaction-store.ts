@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import Redis from "ioredis";
 
+import { safeAuthReturnTo } from "../lib/auth-return";
 import { SessionCipher } from "./session-cipher";
 
 export const OIDC_TRANSACTION_TTL_MS = 10 * 60 * 1_000;
@@ -15,6 +16,7 @@ export interface OidcTransaction {
   codeVerifier: string;
   nonce: string;
   redirectUri: string;
+  returnTo: string;
 }
 
 export interface OidcTransactionStore {
@@ -38,12 +40,14 @@ function validatedTransaction(value: unknown): OidcTransaction {
     !SECRET_PATTERN.test(transaction.codeVerifier) ||
     typeof transaction.nonce !== "string" ||
     !SECRET_PATTERN.test(transaction.nonce) ||
-    !validRedirectUri(transaction.redirectUri)
+    !validRedirectUri(transaction.redirectUri) ||
+    transaction.returnTo !== safeAuthReturnTo(transaction.returnTo)
   ) throw new Error("OIDC transaction is invalid");
   return {
     codeVerifier: transaction.codeVerifier,
     nonce: transaction.nonce,
     redirectUri: transaction.redirectUri,
+    returnTo: transaction.returnTo,
   };
 }
 

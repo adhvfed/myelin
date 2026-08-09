@@ -2,6 +2,7 @@ import { randomBytes } from "node:crypto";
 
 import { deleteCookie, getCookie, setCookie } from "vinxi/http";
 
+import { safeAuthReturnTo } from "../lib/auth-return";
 import { edgeLoginWithOidc, edgeWhoamiWithToken } from "./gateway";
 import { oidcClientConfig, type OidcClientConfig } from "./oidc-config";
 import { oidcAuthorizationUrl, oidcClientAuthorization } from "./oidc-core";
@@ -9,6 +10,7 @@ import {
   matchesOidcStateCookie,
   oidcStateCookieName,
   runOidcCallback,
+  type OidcCallbackResult,
 } from "./oidc-callback-core";
 import {
   MemoryOidcTransactionStore,
@@ -58,7 +60,7 @@ export async function oidcTransactionStoreReady(): Promise<void> {
   if (config()) await transactionStore().ready();
 }
 
-export async function beginOidcLogin(): Promise<string> {
+export async function beginOidcLogin(returnTo: unknown): Promise<string> {
   const oidc = config();
   if (!oidc) throw new Error("interactive OIDC is not configured");
   const store = transactionStore();
@@ -72,6 +74,7 @@ export async function beginOidcLogin(): Promise<string> {
       codeVerifier,
       nonce,
       redirectUri: oidc.redirectUri,
+      returnTo: safeAuthReturnTo(returnTo),
     });
   }
   if (!issued) throw new Error("could not allocate an OIDC transaction");
@@ -171,16 +174,16 @@ async function exchangeCode(
 }
 
 /** Complete and consume the browser transaction. Any failure is intentionally opaque to the UI. */
-export async function completeOidcLogin(requestUrl: string): Promise<boolean> {
+export async function completeOidcLogin(requestUrl: string): Promise<OidcCallbackResult | null> {
   const oidc = config();
   const callback = new URL(requestUrl);
-  if (!oidc) return false;
+  if (!oidc) return null;
   const states = callback.searchParams.getAll("state");
   const state = states.length === 1 ? states[0]! : "";
   const cookieName = oidcStateCookieName(stateCookiePrefix, state);
-  if (!cookieName) return false;
+  if (!cookieName) return null;
   const cookieState = getCookie(cookieName) ?? "";
-  if (!matchesOidcStateCookie(state, cookieState)) return false;
+  if (!matchesOidcStateCookie(state, cookieState)) return null;
   clearStateCookie(cookieName);
   return runOidcCallback(
     {

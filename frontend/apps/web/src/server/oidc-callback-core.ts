@@ -19,6 +19,11 @@ export interface OidcCallbackDependencies {
   establish(idToken: string, nonce: string): Promise<void>;
 }
 
+export interface OidcCallbackResult {
+  authenticated: boolean;
+  returnTo: string;
+}
+
 function equal(left: string, right: string): boolean {
   const a = Buffer.from(left);
   const b = Buffer.from(right);
@@ -37,23 +42,30 @@ export function matchesOidcStateCookie(state: string, cookieState: string): bool
 export async function runOidcCallback(
   input: OidcCallbackInput,
   dependencies: OidcCallbackDependencies,
-): Promise<boolean> {
+): Promise<OidcCallbackResult | null> {
   const state = input.states.length === 1 ? input.states[0]! : "";
   const code = input.codes.length === 1 ? input.codes[0]! : "";
   if (
     !STATE_PATTERN.test(state) ||
     !matchesOidcStateCookie(state, input.cookieState)
   ) {
-    return false;
+    return null;
+  }
+  let transaction: OidcTransaction | null;
+  try {
+    transaction = await dependencies.consume(state);
+  } catch {
+    return null;
+  }
+  if (!transaction || transaction.redirectUri !== input.redirectUri) return null;
+  if (input.providerError || !CODE_PATTERN.test(code)) {
+    return { authenticated: false, returnTo: transaction.returnTo };
   }
   try {
-    const transaction = await dependencies.consume(state);
-    if (!transaction || transaction.redirectUri !== input.redirectUri) return false;
-    if (input.providerError || !CODE_PATTERN.test(code)) return false;
     const idToken = await dependencies.exchange(code, transaction.codeVerifier);
     await dependencies.establish(idToken, transaction.nonce);
-    return true;
+    return { authenticated: true, returnTo: transaction.returnTo };
   } catch {
-    return false;
+    return { authenticated: false, returnTo: transaction.returnTo };
   }
 }
