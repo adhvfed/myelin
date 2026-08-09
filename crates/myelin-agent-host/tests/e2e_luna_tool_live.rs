@@ -16,7 +16,9 @@ use myelin_identity::{
     IdentityService, ObjectId, Principal, PrincipalId, PrincipalKind, RelName, RelationTuple,
     RevokeTarget, RunId, RuntimeRef, TupleDelta,
 };
-use myelin_identity_service::{run_token_jti, RevocationStore, RunTokenState, StoreBackedCheck, TupleStore};
+use myelin_identity_service::{
+    run_token_jti, RevocationStore, RunTokenState, StoreBackedCheck, TupleStore,
+};
 use myelin_storage::agent_wallet::agent_wallet_migrations;
 use myelin_storage::migration::{HotTables, Migration, Migrations};
 use myelin_storage::reserve_settle::CostLedger;
@@ -79,12 +81,14 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
 
 async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id: &str) -> i64 {
     let mut tx = pool.begin().await.expect("begin count tx");
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
-        .bind(tenant)
-        .bind(region)
-        .execute(&mut *tx)
-        .await
-        .expect("scope count tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope count tx");
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_wallet_ledger \
          WHERE tenant_id = $1 AND region = $2 AND kind = 'debit' AND run_id = $3",
@@ -203,7 +207,7 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
 
     let cell_id = format!("cell-agenthost-{}", uniq());
     let seal_key = SealKey::from_encoded(&"11".repeat(32)).expect("a 32-byte dev seal key");
-    let host = AgentHost::with_identity(
+    let host = AgentHost::new(
         app.clone(),
         cell_id,
         &seal_key,
@@ -225,7 +229,7 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         scope,
     );
     let rebac: Arc<dyn IdentityService + Send + Sync> =
-        Arc::new(rebac_engine_with_pull(&agent,  true));
+        Arc::new(rebac_engine_with_pull(&agent, true));
     let gated = CapEnforcingExecutor::for_git_read_tool(rebac, agent.clone(), &executor);
     let catalogue = ToolCatalogue::new([git_check_status_read_tool_def()]);
     let advertised = [git_check_status_read_tool_schema()];
@@ -270,7 +274,10 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         .expect("the live Luna tool run completes (the seeded `pull` grant ALLOWS the tool)");
 
     eprintln!("LIVE Luna tool answer: {:?}", report.answer);
-    eprintln!("LIVE tool result the agent read: {:?}", executor.last_result());
+    eprintln!(
+        "LIVE tool result the agent read: {:?}",
+        executor.last_result()
+    );
     eprintln!(
         "LIVE wallet: topup={} charged_micro={} balance={} tool_invocations={}",
         topup.0,
@@ -283,18 +290,26 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         executor.invocations() >= 1,
         "the agent CALLED the read tool at least once"
     );
-    let tool_text = executor.last_result().expect("the executor produced a read result");
+    let tool_text = executor
+        .last_result()
+        .expect("the executor produced a read result");
     assert!(
         tool_text.contains("ci/build = Failure"),
         "the tool returned the real seeded row: {tool_text}"
     );
-    assert!(!report.answer.trim().is_empty(), "real Luna produced an answer");
+    assert!(
+        !report.answer.trim().is_empty(),
+        "real Luna produced an answer"
+    );
     assert!(
         report.answer.to_lowercase().contains("fail"),
         "the answer reflects the seeded build=failure: {:?}",
         report.answer
     );
-    assert!(report.outcome.0.contains("completed"), "the run completed cleanly");
+    assert!(
+        report.outcome.0.contains("completed"),
+        "the run completed cleanly"
+    );
 
     assert!(report.charged_micro > 0, "the run was priced + debited");
     assert_eq!(
@@ -309,7 +324,11 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
 
     assert!(report.telemetry.ledger_balanced(), "reserved == settled");
     assert_eq!(report.telemetry.traces_written(), 1);
-    assert_eq!(report.telemetry.tokens_revoked(), 1, "per-run token revoked on teardown");
+    assert_eq!(
+        report.telemetry.tokens_revoked(),
+        1,
+        "per-run token revoked on teardown"
+    );
     assert_eq!(report.telemetry.runs_completed(), 1);
 
     let mint_now = timestamp_from_epoch(1000);
@@ -321,9 +340,7 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     let verify_agent = agent_principal(&tenant);
     let verify_scope = TenantScope::from_verified_token(&verify_agent, Region(region_s.clone()));
 
-    let revocations = host
-        .revocations()
-        .expect("a with_identity host exposes the durable S7 store");
+    let revocations = host.revocations();
     assert_eq!(
         revocations.run_token_state(&verify_scope, &RevokeTarget::Jti(jti.clone()), &mint_now),
         RunTokenState::TornDown,
@@ -343,7 +360,7 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     eprintln!("LIVE real-Identity revocation: run token TornDown on the durable S7 denylist (durable across a fresh store instance)");
 
     let no_grant: Arc<dyn IdentityService + Send + Sync> =
-        Arc::new(rebac_engine_with_pull(&verify_agent,  false));
+        Arc::new(rebac_engine_with_pull(&verify_agent, false));
     let probe_scope = TenantScope::from_verified_token(&verify_agent, Region(region_s.clone()));
     let probe_exec = GitCheckStatusReadExecutor::new(
         app.clone(),
@@ -366,7 +383,10 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         "WITHOUT the `pull` grant the SAME tool call is DENIED fail-closed: {denied:?}"
     );
     assert!(
-        denied.unwrap_err().to_string().contains("cap-enforcement DENY"),
+        denied
+            .unwrap_err()
+            .to_string()
+            .contains("cap-enforcement DENY"),
         "the deny is the cap-enforcement gate (fail-closed)"
     );
     assert_eq!(

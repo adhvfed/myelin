@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use myelin_agent::{EffectKind, ToolCall, ToolDef, ToolResult};
 use myelin_agent_host::{
-    dispatch_metered_llm_run, git_check_status_read_tool_def,
+    dispatch_test_run_with_synthetic_identity, git_check_status_read_tool_def,
     git_check_status_read_tool_schema, LlmRunTask, MicroUsd, RunSubstrateWiring, RunWallet,
     ToolCatalogue, Tools, WalletError, GIT_READ_CHECK_STATUS_TOOL,
 };
@@ -177,12 +177,14 @@ fn mock_tool_run_invokes_the_read_tool_and_meters_two_turns() {
         "psn:host-agent",
         run_id,
         "You are a hosted agent with tools. Use the read tool when asked, then answer.",
-        format!("Read the CI checks for repo {REPO} at commit {COMMIT} and report the build state."),
+        format!(
+            "Read the CI checks for repo {REPO} at commit {COMMIT} and report the build state."
+        ),
     )
     .with_max_output_tokens(64)
     .with_now_secs(1000);
 
-    let report = dispatch_metered_llm_run(
+    let report = dispatch_test_run_with_synthetic_identity(
         &wallet,
         region,
         &task,
@@ -215,7 +217,10 @@ fn mock_tool_run_invokes_the_read_tool_and_meters_two_turns() {
         "two priced turns (tool + answer)"
     );
     assert_eq!(wallet.debit_rows(run_id), 2, "two run-linked debits");
-    assert_eq!(wallet.balance(&tenant), MicroUsd(1_000_000 - per_turn.0 * 2));
+    assert_eq!(
+        wallet.balance(&tenant),
+        MicroUsd(1_000_000 - per_turn.0 * 2)
+    );
 
     assert!(report.telemetry.ledger_balanced(), "reserved == settled");
     assert_eq!(report.telemetry.traces_written(), 1);
@@ -265,7 +270,7 @@ fn invalid_tool_arguments_are_rejected_before_the_executor_runs() {
     )
     .with_now_secs(1000);
 
-    let err = dispatch_metered_llm_run(
+    let err = dispatch_test_run_with_synthetic_identity(
         &wallet,
         region,
         &task,

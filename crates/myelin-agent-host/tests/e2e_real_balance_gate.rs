@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use myelin_agent_host::{
-    dispatch_metered_llm_run, LlmRunTask, MicroUsd, RunSubstrateWiring, RunWallet, Tools,
-    WalletError,
+    dispatch_test_run_with_synthetic_identity, LlmRunTask, MicroUsd, RunSubstrateWiring, RunWallet,
+    Tools, WalletError,
 };
 use myelin_agent_model::mock::MockModelClient;
 use myelin_agent_model::{ModelReply, ModelResponse, Usage};
@@ -113,7 +113,7 @@ fn insufficient_balance_is_refused_at_dispatch_run_never_starts() {
         "prompt",
     );
 
-    let err = dispatch_metered_llm_run(
+    let err = dispatch_test_run_with_synthetic_identity(
         &wallet,
         region,
         &task,
@@ -136,7 +136,11 @@ fn insufficient_balance_is_refused_at_dispatch_run_never_starts() {
             .is_none(),
         "a refused dispatch leaves NO reservation - the run never started"
     );
-    assert_eq!(wallet.balance(&tenant), MicroUsd(50_000), "balance untouched");
+    assert_eq!(
+        wallet.balance(&tenant),
+        MicroUsd(50_000),
+        "balance untouched"
+    );
     assert_eq!(wallet.debit_rows("Rrefuse-1"), 0, "nothing was billed");
 }
 
@@ -167,7 +171,7 @@ fn sufficient_balance_dispatches_and_completes() {
     .with_max_output_tokens(16)
     .with_now_secs(1000);
 
-    let report = dispatch_metered_llm_run(
+    let report = dispatch_test_run_with_synthetic_identity(
         &wallet,
         region,
         &task,

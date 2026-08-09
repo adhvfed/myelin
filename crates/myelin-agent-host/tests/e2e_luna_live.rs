@@ -1,16 +1,19 @@
 use std::sync::Arc;
 
-use myelin_agent_host::{AgentHost, CreditKind, LlmRunTask, MicroUsd, RunSubstrateWiring, Tools};
+use myelin_agent_host::{
+    dispatch_test_run_with_synthetic_identity, CreditKind, LlmRunTask, MicroUsd,
+    RunSubstrateWiring, Tools,
+};
 use myelin_agent_model::{LunaClient, ModelError};
 use myelin_config::MyelinConfig;
 use myelin_events::{MonotonicMinter, OutboxStore};
 use myelin_flow::WfJournal;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
-use myelin_storage::agent_wallet::agent_wallet_migrations;
+use myelin_storage::agent_wallet::{agent_wallet_migrations, AgentWallet};
 use myelin_storage::migration::HotTables;
 use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::SubstrateProvider;
-use myelin_tenancy::TenantId;
+use myelin_tenancy::{Region, TenantId};
 
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
     let mut c = cfg.clone();
@@ -48,12 +51,14 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
 
 async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id: &str) -> i64 {
     let mut tx = pool.begin().await.expect("begin count tx");
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
-        .bind(tenant)
-        .bind(region)
-        .execute(&mut *tx)
-        .await
-        .expect("scope count tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope count tx");
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_wallet_ledger \
          WHERE tenant_id = $1 AND region = $2 AND kind = 'debit' AND run_id = $3",
@@ -99,11 +104,11 @@ async fn live_luna_run_is_metered_end_to_end() {
     let region_s = app.config().region.clone();
     let tenant = TenantId(format!("01J0HOSTLUNA{}", uniq()));
 
-    let host = AgentHost::new(app.clone());
-    assert_eq!(host.region().0, region_s, "F2: host region == provider region");
+    let wallet = AgentWallet::new(app.clone());
+    let region = Region(region_s.clone());
 
     let topup = MicroUsd(1_000_000);
-    host.wallet()
+    wallet
         .credit(&tenant, topup, CreditKind::Topup, None)
         .expect("topup seeds the wallet");
 
@@ -128,23 +133,38 @@ async fn live_luna_run_is_metered_end_to_end() {
     .with_max_output_tokens(16)
     .with_now_secs(1000);
 
-    let report = host
-        .run(&task, &mut wiring, Box::new(luna), Tools::none())
-        .expect("the live Luna run completes");
+    let report = dispatch_test_run_with_synthetic_identity(
+        &wallet,
+        region,
+        &task,
+        &mut wiring,
+        Box::new(luna),
+        Tools::none(),
+    )
+    .expect("the live Luna run completes");
 
     eprintln!("LIVE Luna answer: {:?}", report.answer);
     eprintln!(
         "LIVE wallet: topup={} charged_micro={} balance={}",
         topup.0,
         report.charged_micro,
-        host.wallet().balance(&tenant).0
+        wallet.balance(&tenant).0
     );
-    assert!(!report.answer.trim().is_empty(), "real Luna produced an answer");
-    assert!(report.outcome.0.contains("completed"), "the run completed cleanly");
+    assert!(
+        !report.answer.trim().is_empty(),
+        "real Luna produced an answer"
+    );
+    assert!(
+        report.outcome.0.contains("completed"),
+        "the run completed cleanly"
+    );
 
-    assert!(report.charged_micro > 0, "at least one turn was priced + debited");
+    assert!(
+        report.charged_micro > 0,
+        "at least one turn was priced + debited"
+    );
     assert_eq!(
-        host.wallet().balance(&tenant),
+        wallet.balance(&tenant),
         MicroUsd(topup.0 - report.charged_micro),
         "balance dropped by exactly the charged amount"
     );
@@ -155,6 +175,10 @@ async fn live_luna_run_is_metered_end_to_end() {
 
     assert!(report.telemetry.ledger_balanced(), "reserved == settled");
     assert_eq!(report.telemetry.traces_written(), 1);
-    assert_eq!(report.telemetry.tokens_revoked(), 1, "per-run token revoked on teardown");
+    assert_eq!(
+        report.telemetry.tokens_revoked(),
+        1,
+        "per-run token revoked on teardown"
+    );
     assert_eq!(report.telemetry.runs_completed(), 1);
 }

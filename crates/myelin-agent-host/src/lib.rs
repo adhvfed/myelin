@@ -10,7 +10,9 @@ pub mod identity;
 pub use identity::timestamp_from_epoch;
 use identity::{IdentityRunMinter, IdentityRunRevoker};
 
-use myelin_agent::{MeteredRuntime, ToolCall, ToolDef, ToolName, ToolResult, ToolSchema, ToolSurface};
+use myelin_agent::{
+    MeteredRuntime, ToolCall, ToolDef, ToolName, ToolResult, ToolSchema, ToolSurface,
+};
 use myelin_agent_model::{
     LlmAgentRuntime, ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn,
     ToolSpec,
@@ -207,9 +209,9 @@ impl ModelClient for HostModelClient {
 }
 
 #[derive(Default)]
-pub struct HostRunMinter;
+struct SyntheticRunMinter;
 
-impl RunTokenMinter for HostRunMinter {
+impl RunTokenMinter for SyntheticRunMinter {
     fn mint_run_token(
         &self,
         agent_id: &str,
@@ -226,11 +228,11 @@ impl RunTokenMinter for HostRunMinter {
 }
 
 #[derive(Default)]
-pub struct HostRunRevoker {
+struct SyntheticRunRevoker {
     revoked: Mutex<std::collections::HashSet<String>>,
 }
 
-impl RunTokenRevoker for HostRunRevoker {
+impl RunTokenRevoker for SyntheticRunRevoker {
     fn revoke(&self, jti: &str, now_secs: i64, teardown_secs: i64) -> u64 {
         let mut g = self.revoked.lock().expect("revoker lock");
         if !g.insert(jti.to_string()) {
@@ -388,7 +390,10 @@ struct RunTokenSeams<'a> {
     revoker: &'a dyn RunTokenRevoker,
 }
 
-pub fn dispatch_metered_llm_run(
+/// Test harness for the model/runtime loop. Production hosts must use [`AgentHost::new`]
+/// so the run receives a real, short-lived Identity credential and durable teardown revocation.
+#[doc(hidden)]
+pub fn dispatch_test_run_with_synthetic_identity(
     wallet: &dyn RunWallet,
     region: Region,
     task: &LlmRunTask,
@@ -396,7 +401,7 @@ pub fn dispatch_metered_llm_run(
     model_client: Box<dyn ModelClient + Send + Sync>,
     tools: Tools<'_>,
 ) -> Result<LlmRunReport, AgentHostError> {
-    let revoker = HostRunRevoker::default();
+    let revoker = SyntheticRunRevoker::default();
     dispatch_core(
         wallet,
         region,
@@ -405,7 +410,7 @@ pub fn dispatch_metered_llm_run(
         model_client,
         tools,
         RunTokenSeams {
-            minter: Arc::new(HostRunMinter),
+            minter: Arc::new(SyntheticRunMinter),
             revoker: &revoker,
         },
     )
@@ -493,7 +498,7 @@ fn default_system(system: &str) -> String {
 pub struct AgentHost {
     region: Region,
     wallet: AgentWallet,
-    identity: Option<HostIdentity>,
+    identity: HostIdentity,
 }
 
 struct HostIdentity {
@@ -511,10 +516,16 @@ impl core::fmt::Display for HostIdentityError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             HostIdentityError::CellRootUnavailable(e) => {
-                write!(f, "hosted-agent Identity root refused to start (fail-closed): {e}")
+                write!(
+                    f,
+                    "hosted-agent Identity root refused to start (fail-closed): {e}"
+                )
             }
             HostIdentityError::InvalidCellRoot(e) => {
-                write!(f, "hosted-agent Identity cell-authority material is invalid: {e}")
+                write!(
+                    f,
+                    "hosted-agent Identity cell-authority material is invalid: {e}"
+                )
             }
         }
     }
@@ -523,16 +534,7 @@ impl core::fmt::Display for HostIdentityError {
 impl std::error::Error for HostIdentityError {}
 
 impl AgentHost {
-    pub fn new(provider: SubstrateProvider) -> AgentHost {
-        let region = Region(provider.config().region.clone());
-        AgentHost {
-            region,
-            wallet: AgentWallet::new(provider),
-            identity: None,
-        }
-    }
-
-    pub async fn with_identity(
+    pub async fn new(
         provider: SubstrateProvider,
         cell_id: impl Into<String>,
         seal_key: &SealKey,
@@ -550,14 +552,15 @@ impl AgentHost {
         let revocations =
             RevocationStore::with_pg(DurableRevocationBacking::new(provider.clone()), rt);
         let signer = Arc::new(PasetoCapabilitySigner::new(cell));
-        let minter = IdentityRunTokenMinter::with_signer_and_tuples(revocations.clone(), None, signer);
+        let minter =
+            IdentityRunTokenMinter::with_signer_and_tuples(revocations.clone(), None, signer);
         Ok(AgentHost {
             region,
             wallet: AgentWallet::new(provider),
-            identity: Some(HostIdentity {
+            identity: HostIdentity {
                 minter,
                 revocations,
-            }),
+            },
         })
     }
 
@@ -569,15 +572,15 @@ impl AgentHost {
         &self.region
     }
 
-    pub fn revocations(&self) -> Option<&RevocationStore> {
-        self.identity.as_ref().map(|id| &id.revocations)
+    pub fn revocations(&self) -> &RevocationStore {
+        &self.identity.revocations
     }
 
     fn identity_seams(
         &self,
         task: &LlmRunTask,
-    ) -> Option<(Arc<dyn RunTokenMinter + Send + Sync>, IdentityRunRevoker)> {
-        let id = self.identity.as_ref()?;
+    ) -> (Arc<dyn RunTokenMinter + Send + Sync>, IdentityRunRevoker) {
+        let id = &self.identity;
         let scope = TenantScope::from_verified_token(&task.agent, self.region.clone());
         let now = timestamp_from_epoch(task.now_secs);
         let minter: Arc<dyn RunTokenMinter + Send + Sync> = Arc::new(IdentityRunMinter::new(
@@ -587,7 +590,10 @@ impl AgentHost {
             task.agent.clone(),
             now,
         ));
-        Some((minter, IdentityRunRevoker::new(id.revocations.clone(), scope)))
+        (
+            minter,
+            IdentityRunRevoker::new(id.revocations.clone(), scope),
+        )
     }
 
     pub fn run(
@@ -597,28 +603,19 @@ impl AgentHost {
         model_client: Box<dyn ModelClient + Send + Sync>,
         tools: Tools<'_>,
     ) -> Result<LlmRunReport, AgentHostError> {
-        match self.identity_seams(task) {
-            Some((minter, revoker)) => dispatch_core(
-                &self.wallet,
-                self.region.clone(),
-                task,
-                wiring,
-                model_client,
-                tools,
-                RunTokenSeams {
-                    minter,
-                    revoker: &revoker,
-                },
-            ),
-            None => dispatch_metered_llm_run(
-                &self.wallet,
-                self.region.clone(),
-                task,
-                wiring,
-                model_client,
-                tools,
-            ),
-        }
+        let (minter, revoker) = self.identity_seams(task);
+        dispatch_core(
+            &self.wallet,
+            self.region.clone(),
+            task,
+            wiring,
+            model_client,
+            tools,
+            RunTokenSeams {
+                minter,
+                revoker: &revoker,
+            },
+        )
     }
 }
 
@@ -669,8 +666,12 @@ mod tests {
                 output: 1,
             },
         );
-        let (client, answer) =
-            HostModelClient::wrap("SYS".into(), "do the thing".into(), vec![], Box::new(SharedSpy(spy.clone())));
+        let (client, answer) = HostModelClient::wrap(
+            "SYS".into(),
+            "do the thing".into(),
+            vec![],
+            Box::new(SharedSpy(spy.clone())),
+        );
         let resp = client.complete(&ModelRequest::default()).unwrap();
         assert!(matches!(resp.reply, ModelReply::Final { .. }));
         assert_eq!(answer.take().as_deref(), Some("ready"));
@@ -692,8 +693,12 @@ mod tests {
     fn host_client_injects_tool_specs_on_every_step() {
         let spy = Spy::new("ok", Usage::NotReported);
         let specs = vec![tool_schema_to_spec(&git_check_status_read_tool_schema())];
-        let (client, _) =
-            HostModelClient::wrap("SYS".into(), "task".into(), specs, Box::new(SharedSpy(spy.clone())));
+        let (client, _) = HostModelClient::wrap(
+            "SYS".into(),
+            "task".into(),
+            specs,
+            Box::new(SharedSpy(spy.clone())),
+        );
         client.complete(&ModelRequest::default()).unwrap();
         client
             .complete(&ModelRequest {
@@ -714,13 +719,15 @@ mod tests {
     #[test]
     fn tool_catalogue_resolves_registered_tools() {
         let cat = ToolCatalogue::new([git_check_status_read_tool_def()]);
-        assert!(cat.resolve(&ToolName(GIT_READ_CHECK_STATUS_TOOL.into())).is_some());
+        assert!(cat
+            .resolve(&ToolName(GIT_READ_CHECK_STATUS_TOOL.into()))
+            .is_some());
         assert!(cat.resolve(&ToolName("nope".into())).is_none());
     }
 
     #[test]
     fn revoker_is_idempotent() {
-        let r = HostRunRevoker::default();
+        let r = SyntheticRunRevoker::default();
         assert!(!r.is_dead("j1", 10));
         let _ = r.revoke("j1", 10, 5);
         assert!(r.is_dead("j1", 10));

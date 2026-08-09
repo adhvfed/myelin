@@ -1,8 +1,8 @@
 use std::sync::Mutex;
 
 use myelin_agent_host::{
-    dispatch_metered_llm_run, LlmRunTask, MicroUsd, RunSubstrateWiring, RunWallet, Tools,
-    WalletError,
+    dispatch_test_run_with_synthetic_identity, LlmRunTask, MicroUsd, RunSubstrateWiring, RunWallet,
+    Tools, WalletError,
 };
 use myelin_agent_model::mock::MockModelClient;
 use myelin_agent_model::{ModelReply, ModelResponse, Usage};
@@ -127,15 +127,33 @@ fn mock_metered_run_debits_once_and_returns_the_answer() {
     .with_max_output_tokens(16)
     .with_now_secs(1000);
 
-    let report = dispatch_metered_llm_run(&wallet, region, &task, &mut wiring, Box::new(brain), Tools::none())
-        .expect("the mock metered run completes");
+    let report = dispatch_test_run_with_synthetic_identity(
+        &wallet,
+        region,
+        &task,
+        &mut wiring,
+        Box::new(brain),
+        Tools::none(),
+    )
+    .expect("the mock metered run completes");
 
     assert_eq!(report.answer, "ready", "the captured final answer");
-    assert!(report.outcome.0.contains("completed"), "loop completed: {:?}", report.outcome);
+    assert!(
+        report.outcome.0.contains("completed"),
+        "loop completed: {:?}",
+        report.outcome
+    );
 
-    assert_eq!(report.charged_micro, per_turn.0, "one turn priced + debited");
+    assert_eq!(
+        report.charged_micro, per_turn.0,
+        "one turn priced + debited"
+    );
     assert_eq!(wallet.balance(&tenant), MicroUsd(1_000_000 - per_turn.0));
-    assert_eq!(wallet.debit_rows("Rmock-1"), 1, "exactly one run-linked debit");
+    assert_eq!(
+        wallet.debit_rows("Rmock-1"),
+        1,
+        "exactly one run-linked debit"
+    );
 
     assert!(report.telemetry.ledger_balanced(), "reserved == settled");
     assert_eq!(report.telemetry.traces_written(), 1);
@@ -172,10 +190,20 @@ fn underfunded_wallet_halts_gracefully_without_going_negative() {
         "prompt",
     );
 
-    let err = dispatch_metered_llm_run(&wallet, region, &task, &mut wiring, Box::new(brain), Tools::none())
-        .expect_err("an unfunded run cannot bill, so it halts");
+    let err = dispatch_test_run_with_synthetic_identity(
+        &wallet,
+        region,
+        &task,
+        &mut wiring,
+        Box::new(brain),
+        Tools::none(),
+    )
+    .expect_err("an unfunded run cannot bill, so it halts");
     let msg = err.to_string();
-    assert!(msg.contains("spend cap") || msg.contains("balance"), "graceful halt: {msg}");
+    assert!(
+        msg.contains("spend cap") || msg.contains("balance"),
+        "graceful halt: {msg}"
+    );
     assert_eq!(wallet.balance(&tenant), MicroUsd(0), "never negative");
     assert_eq!(wallet.debit_rows("Rdry-1"), 0, "nothing billed");
 }

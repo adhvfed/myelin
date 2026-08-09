@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use myelin_agent::{EffectKind, ToolCall, ToolDef, ToolResult};
 use myelin_agent_host::{
-    dispatch_metered_llm_run, git_check_status_read_tool_def,
+    dispatch_test_run_with_synthetic_identity, git_check_status_read_tool_def,
     git_check_status_read_tool_schema, CapEnforcingExecutor, LlmRunTask, MicroUsd,
     RunSubstrateWiring, RunWallet, ToolCatalogue, Tools, WalletError, GIT_READ_CHECK_STATUS_TOOL,
 };
@@ -158,10 +158,7 @@ fn rebac_engine(agent: &Principal, grant_pull: bool) -> StoreBackedCheck {
     StoreBackedCheck::new(tuples)
 }
 
-fn wiring<'a>(
-    ledger: &'a mut CostLedger,
-    outbox: &'a OutboxStore,
-) -> RunSubstrateWiring<'a> {
+fn wiring<'a>(ledger: &'a mut CostLedger, outbox: &'a OutboxStore) -> RunSubstrateWiring<'a> {
     RunSubstrateWiring {
         ledger,
         outbox,
@@ -177,7 +174,9 @@ fn task(tenant: &TenantId, agent: Principal, run_id: &str) -> LlmRunTask {
         AGENT_ID,
         run_id,
         "You are a hosted agent with tools. Use the read tool when asked, then answer.",
-        format!("Read the CI checks for repo {REPO} at commit {COMMIT} and report the build state."),
+        format!(
+            "Read the CI checks for repo {REPO} at commit {COMMIT} and report the build state."
+        ),
     )
     .with_max_output_tokens(64)
     .with_now_secs(1000)
@@ -190,7 +189,7 @@ fn tool_call_is_allowed_when_the_principal_holds_the_required_cap() {
     let agent = agent_principal(&tenant);
 
     let identity: Arc<dyn myelin_identity::IdentityService + Send + Sync> =
-        Arc::new(rebac_engine(&agent,  true));
+        Arc::new(rebac_engine(&agent, true));
     let inner = FakeCheckReadExecutor::new();
     let gated = CapEnforcingExecutor::for_git_read_tool(identity, agent.clone(), &inner);
 
@@ -201,7 +200,7 @@ fn tool_call_is_allowed_when_the_principal_holds_the_required_cap() {
     let outbox = OutboxStore::new();
     let mut w = wiring(&mut ledger, &outbox);
 
-    let report = dispatch_metered_llm_run(
+    let report = dispatch_test_run_with_synthetic_identity(
         &wallet,
         region,
         &task(&tenant, agent, "Rcap-allow"),
@@ -238,7 +237,7 @@ fn tool_call_is_denied_fail_closed_when_the_principal_lacks_the_required_cap() {
     let agent = agent_principal(&tenant);
 
     let identity: Arc<dyn myelin_identity::IdentityService + Send + Sync> =
-        Arc::new(rebac_engine(&agent,  false));
+        Arc::new(rebac_engine(&agent, false));
     let inner = FakeCheckReadExecutor::new();
     let gated = CapEnforcingExecutor::for_git_read_tool(identity, agent.clone(), &inner);
 
@@ -249,7 +248,7 @@ fn tool_call_is_denied_fail_closed_when_the_principal_lacks_the_required_cap() {
     let outbox = OutboxStore::new();
     let mut w = wiring(&mut ledger, &outbox);
 
-    let err = dispatch_metered_llm_run(
+    let err = dispatch_test_run_with_synthetic_identity(
         &wallet,
         region,
         &task(&tenant, agent, "Rcap-deny"),
