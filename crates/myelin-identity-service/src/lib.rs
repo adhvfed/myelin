@@ -38,7 +38,7 @@ pub use agent_registry::{
 };
 pub use agent_session::{
     agent_run_ref, AgentSession, AgentSessionError, AgentSessionIssuer, AgentSessionRequest,
-    IssuedAgentSession, MAX_EXTERNAL_AGENT_RUN_TTL_SECS,
+    ClosedAgentSession, IssuedAgentSession, MAX_EXTERNAL_AGENT_RUN_TTL_SECS,
 };
 pub use authenticate::{
     scheme, AuthTelemetry, CredentialVerifier, HumanSsoAuthenticator, IdorCounters,

@@ -59,6 +59,13 @@ pub struct IssuedAgentSession {
     pub created: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClosedAgentSession {
+    pub run_id: String,
+    pub agent_id: String,
+    pub state: ExternalAgentRunState,
+}
+
 struct MintedAgentRun {
     token: RunToken,
     effective_grants: Vec<String>,
@@ -68,6 +75,7 @@ struct MintedAgentRun {
 pub enum AgentSessionError {
     BadInput(String),
     NotFound,
+    RunNotFound,
     Conflict(String),
     Policy(String),
     Expired,
@@ -79,6 +87,7 @@ impl core::fmt::Display for AgentSessionError {
         match self {
             Self::BadInput(reason) => write!(formatter, "invalid agent session: {reason}"),
             Self::NotFound => formatter.write_str("agent not found"),
+            Self::RunNotFound => formatter.write_str("agent run not found"),
             Self::Conflict(reason) => write!(formatter, "agent session conflict: {reason}"),
             Self::Policy(reason) => write!(formatter, "agent session policy refused: {reason}"),
             Self::Expired => formatter.write_str("agent session has expired"),
@@ -163,6 +172,28 @@ impl AgentSessionIssuer {
             },
             run_token: minted.token,
             created: claimed.created,
+        })
+    }
+
+    pub async fn close(
+        &self,
+        actor: &Principal,
+        run_id: &str,
+        token_jti: &str,
+    ) -> Result<ClosedAgentSession, AgentSessionError> {
+        let agent_id = external_agent_id(actor)?;
+        let run_id = canonical_uuid("run id", run_id)?;
+        validate_token_jti(token_jti)?;
+        let closed = self
+            .runs
+            .close(&actor.tenant.0, run_id, agent_id, token_jti)
+            .await
+            .map_err(storage_error)?
+            .ok_or(AgentSessionError::RunNotFound)?;
+        Ok(ClosedAgentSession {
+            run_id: closed.run_id,
+            agent_id: closed.agent_id,
+            state: closed.state,
         })
     }
 
@@ -362,18 +393,25 @@ fn require_active_human(actor: &Principal) -> Result<(), AgentSessionError> {
     Ok(())
 }
 
-fn validate_trigger_credential(request: &AgentSessionRequest) -> Result<(), AgentSessionError> {
-    if request.trigger_credential_jti.is_empty()
-        || request.trigger_credential_jti.len() > 512
-        || !request
-            .trigger_credential_jti
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic())
+fn external_agent_id(actor: &Principal) -> Result<Uuid, AgentSessionError> {
+    if actor.status != PrincipalStatus::Active
+        || !matches!(
+            &actor.kind,
+            PrincipalKind::Agent { runtime_ref, .. } if runtime_ref.0 == EXTERNAL_MCP_RUNTIME
+        )
     {
-        return Err(AgentSessionError::BadInput(
-            "trigger credential identity is malformed".into(),
-        ));
+        return Err(AgentSessionError::NotFound);
     }
+    actor
+        .principal_id
+        .0
+        .strip_prefix("agent:")
+        .and_then(|id| canonical_uuid("agent principal id", id).ok())
+        .ok_or(AgentSessionError::NotFound)
+}
+
+fn validate_trigger_credential(request: &AgentSessionRequest) -> Result<(), AgentSessionError> {
+    validate_token_jti(&request.trigger_credential_jti)?;
     if request.trigger_authority.is_empty() {
         return Err(AgentSessionError::Policy(
             "trigger credential has no delegable authority".into(),
@@ -382,6 +420,15 @@ fn validate_trigger_credential(request: &AgentSessionRequest) -> Result<(), Agen
     if request.trigger_authority.grants().count() > 512 {
         return Err(AgentSessionError::BadInput(
             "trigger credential authority exceeds 512 grants".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_token_jti(value: &str) -> Result<(), AgentSessionError> {
+    if value.is_empty() || value.len() > 512 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(AgentSessionError::BadInput(
+            "credential identity is malformed".into(),
         ));
     }
     Ok(())
@@ -504,5 +551,23 @@ mod tests {
             agent_run_ref("acme", "run-1").0,
             "myelin://acme/agent/run/run-1"
         );
+    }
+
+    #[test]
+    fn only_a_canonical_live_external_agent_can_close_its_run() {
+        let id = "22222222-2222-2222-2222-222222222222";
+        let mut agent = human();
+        agent.principal_id = PrincipalId(format!("agent:{id}"));
+        agent.kind = PrincipalKind::Agent {
+            runtime_ref: RuntimeRef(EXTERNAL_MCP_RUNTIME.into()),
+            on_behalf_of: Some(PrincipalId("human:ada".into())),
+        };
+        assert_eq!(external_agent_id(&agent).unwrap().to_string(), id);
+
+        agent.principal_id = PrincipalId("agent:not-a-uuid".into());
+        assert!(matches!(
+            external_agent_id(&agent),
+            Err(AgentSessionError::NotFound)
+        ));
     }
 }

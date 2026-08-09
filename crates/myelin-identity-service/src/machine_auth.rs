@@ -555,15 +555,18 @@ impl CapabilityAuthenticator {
 
         self.enforce_authority_ceiling(&token)?;
 
-        let row = if matches!(token.purpose, CredentialPurpose::HumanSession) {
-            self.store
-                .try_get_principal(&scope, &PrincipalId(token.subject_key.clone()))
-        } else {
-            self.store.try_resolve_credential(
+        let row = match &token.purpose {
+            // Browser sessions and per-run agent capabilities are already signed, bounded
+            // credentials whose subject is a durable principal id. Requiring a second credential
+            // binding would turn either flow back into long-lived API-key provisioning.
+            CredentialPurpose::HumanSession | CredentialPurpose::AgentRun { .. } => self
+                .store
+                .try_get_principal(&scope, &PrincipalId(token.subject_key.clone())),
+            _ => self.store.try_resolve_credential(
                 &scope,
                 credential.scheme.as_str(),
                 &token.subject_key,
-            )
+            ),
         }
             .map_err(|e| {
                 AuthzError::FailClosed(format!(
@@ -826,22 +829,29 @@ mod tests {
     ) -> CapabilityAuthenticator {
         let st = store();
         let sc = scope("acme", "eu-west");
+        let principal_id = if credential_scheme == scheme::AGENT {
+            subject_key
+        } else {
+            "svc:agent"
+        };
         st.put_principal(
             &sc,
-            PrincipalId("svc:agent".into()),
+            PrincipalId(principal_id.into()),
             PrincipalKind::Service,
             DataRole::Controller,
             PrincipalStatus::Active,
             None,
         )
         .unwrap();
-        st.link_credential(
-            &sc,
-            credential_scheme,
-            subject_key,
-            &PrincipalId("svc:agent".into()),
-        )
-        .unwrap();
+        if credential_scheme != scheme::AGENT {
+            st.link_credential(
+                &sc,
+                credential_scheme,
+                subject_key,
+                &PrincipalId(principal_id.into()),
+            )
+            .unwrap();
+        }
         CapabilityAuthenticator::with_verifier(
             st,
             Arc::new(StructuralTokenVerifier::new()),
@@ -863,7 +873,11 @@ mod tests {
         );
         let identity = run_authenticator(live_s7, "2026-07-18T10:01:00Z")
             .authenticate_identity(&cred(scheme::AGENT, run_material("jti-live")), None)
-            .expect("a known run token inside its run life is live");
+            .expect("a known run token resolves its principal without a second API-key binding");
+        assert_eq!(
+            identity.principal.principal_id,
+            PrincipalId("run-subject".into())
+        );
         assert_eq!(identity.capability().effective_authority.len(), 1);
 
         let unknown = run_authenticator(RevocationStore::new(), "2026-07-18T10:01:00Z")

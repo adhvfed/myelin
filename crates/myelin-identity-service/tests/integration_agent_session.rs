@@ -8,11 +8,11 @@ use myelin_events::Timestamp;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     agent_run_ref, machine_scheme, AgentSessionIssuer, AgentSessionRequest, Authority,
-    CellTokenAuthority, CredentialPurpose, NewAgent, PgAgentRegistry, StoreBackedCheck,
-    EXTERNAL_MCP_RUNTIME,
+    CellTokenAuthority, CredentialPurpose, NewAgent, PgAgentRegistry, RunTokenState,
+    StoreBackedCheck, EXTERNAL_MCP_RUNTIME,
 };
 use myelin_storage::migration::HotTables;
-use myelin_storage::{all_durable_migrations, KmsEngine, SubstrateProvider};
+use myelin_storage::{all_durable_migrations, KmsEngine, SubstrateProvider, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 
 fn admin_config(config: &MyelinConfig) -> MyelinConfig {
@@ -238,6 +238,61 @@ async fn one_click_starts_one_short_lived_agent_even_when_the_network_retries() 
     .await
     .expect("count the run's immutable policy snapshot");
     assert_eq!((durable_runs, policy_snapshots), (1, 1));
+
+    let agent_actor = Principal::new(
+        actor.tenant.clone(),
+        actor.region.clone(),
+        PrincipalId(agent.principal_id.clone()),
+        PrincipalKind::Agent {
+            runtime_ref: myelin_identity::RuntimeRef(agent.runtime_ref.clone()),
+            on_behalf_of: Some(actor.principal_id.clone()),
+        },
+        DataRole::Controller,
+        agent.status,
+    );
+    let closed = issuer
+        .close(&agent_actor, &left.session.run_id, &left.run_token.jti)
+        .await
+        .expect("the running agent releases its short-lived identity");
+    assert_eq!(closed.run_id, left.session.run_id);
+    assert_eq!(closed.agent_id, agent.id);
+    assert_eq!(closed.state.token(), "closed");
+
+    let agent_scope = TenantScope::from_verified_token(&agent_actor, agent_actor.region.clone());
+    assert_eq!(
+        identity.run_token_minter().revocation_state(
+            &agent_scope,
+            &left.run_token,
+            &Timestamp((now + Duration::seconds(20)).to_rfc3339_opts(SecondsFormat::Secs, true)),
+        ),
+        RunTokenState::TornDown,
+        "closing the durable run and revoking its bearer identity are one fact"
+    );
+    let closed_runs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM external_agent_run \
+          WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid AND state = 'closed'",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .bind(&left.session.run_id)
+    .fetch_one(admin.db_pool())
+    .await
+    .expect("observe the durable closed run");
+    assert_eq!(closed_runs, 1);
+
+    let replay_after_close = issuer
+        .start(
+            &actor,
+            AgentSessionRequest {
+                now: now + Duration::seconds(20),
+                ..run_request(&agent.id, now)
+            },
+        )
+        .await;
+    assert!(matches!(
+        replay_after_close,
+        Err(myelin_identity_service::AgentSessionError::Conflict(_))
+    ));
 
     cleanup(&admin, &tenant).await;
 }

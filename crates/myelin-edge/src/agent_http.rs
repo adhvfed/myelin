@@ -7,8 +7,8 @@ use myelin_agent_service::{catalogue_cursor, tool_ref, PlatformToolCatalogue};
 use myelin_identity::PrincipalStatus;
 use myelin_identity_service::{
     agent_ref, agent_run_ref, AgentActivation, AgentRegistration, AgentRegistryError,
-    AgentSessionError, AgentSessionIssuer, AgentSessionRequest, IssuedAgentSession, NewAgent,
-    PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
+    AgentSessionError, AgentSessionIssuer, AgentSessionRequest, ClosedAgentSession,
+    IssuedAgentSession, NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -92,6 +92,10 @@ struct AgentRunCreateHandler {
     api: AgentHttpApi,
 }
 
+struct AgentRunCloseHandler {
+    api: AgentHttpApi,
+}
+
 impl Handler for AgentRunCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
@@ -118,6 +122,26 @@ impl Handler for AgentRunCreateHandler {
         Ok(no_store(EdgeResponse::json(
             if issued.created { 201 } else { 200 },
             &agent_session_json(&ctx.principal.tenant.0, &self.api.catalogue, &issued),
+        )))
+    }
+}
+
+impl Handler for AgentRunCloseHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let _: StartAgentRunBody = parse_agent_run_body(&ctx.request.body)?;
+        let run_id = run_param(ctx)?;
+        let closed = self
+            .api
+            .drive(
+                self.api
+                    .sessions
+                    .close(ctx.principal, run_id, &ctx.identity.capability().jti),
+            )?
+            .map_err(map_session_error)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &closed_agent_session_json(&ctx.principal.tenant.0, &closed),
         )))
     }
 }
@@ -211,7 +235,13 @@ pub fn register_agents(
             Method::Post,
             "/v1/agents/{agent}/runs",
             "identity.agent.run.create",
-            Arc::new(AgentRunCreateHandler { api }),
+            Arc::new(AgentRunCreateHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agent-runs/{run}/close",
+            "identity.agent.run.close",
+            Arc::new(AgentRunCloseHandler { api }),
         )
 }
 
@@ -397,6 +427,20 @@ fn agent_session_json(
     })
 }
 
+fn closed_agent_session_json(tenant: &str, closed: &ClosedAgentSession) -> Value {
+    json!({
+        "run": {
+            "id": closed.run_id,
+            "ref": agent_run_ref(tenant, &closed.run_id).0,
+            "agent_id": closed.agent_id,
+            "agent_ref": agent_ref(tenant, &closed.agent_id).0,
+            "state": closed.state.token(),
+        },
+        "closed": true,
+        "durable": true,
+    })
+}
+
 fn selected_tool_json(tenant: &str, catalogue: &PlatformToolCatalogue, cursor: &str) -> Value {
     match catalogue
         .definitions()
@@ -499,6 +543,13 @@ fn agent_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
         .ok_or_else(|| EdgeError::BadRequest("route did not bind an agent id".into()))
 }
 
+fn run_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
+    ctx.params
+        .get("run")
+        .map(String::as_str)
+        .ok_or_else(|| EdgeError::BadRequest("route did not bind a run id".into()))
+}
+
 fn require_empty_query(ctx: &HandlerCtx<'_>) -> Result<(), EdgeError> {
     if ctx.request.query.is_empty() {
         Ok(())
@@ -534,6 +585,7 @@ fn map_session_error(error: AgentSessionError) -> EdgeError {
     match error {
         AgentSessionError::BadInput(message) => EdgeError::BadRequest(message),
         AgentSessionError::NotFound => EdgeError::NotFound("agent not found".into()),
+        AgentSessionError::RunNotFound => EdgeError::NotFound("agent run not found".into()),
         AgentSessionError::Conflict(message) => EdgeError::Conflict(message),
         AgentSessionError::Policy(_) => {
             EdgeError::Forbidden("agent run delegation was refused".into())

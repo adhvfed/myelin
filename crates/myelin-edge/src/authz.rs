@@ -15,6 +15,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "identity.agent.create",
     "identity.agent.view",
     "identity.agent.run.create",
+    "identity.agent.run.close",
     "identity.projects.list",
     "identity.project.create",
     "identity.project.view",
@@ -112,11 +113,14 @@ const HUMAN_OR_OPERATOR: &[AcceptedPurpose] = &[
     AcceptedPurpose::OperatorBootstrap,
 ];
 const HUMAN_SESSION: &[AcceptedPurpose] = &[AcceptedPurpose::HumanSession];
+const AGENT_RUN_ONLY: &[AcceptedPurpose] = &[AcceptedPurpose::AgentRun];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionRequirement {
     pub action: &'static str,
-    pub required_capability: &'static str,
+    /// `None` is reserved for a credential's own scope-bound lifecycle. In that case the exact
+    /// accepted credential purpose is the authority; no tenant policy grant is manufactured.
+    pub required_capability: Option<&'static str>,
     pub accepted_purposes: &'static [AcceptedPurpose],
 }
 
@@ -124,7 +128,7 @@ macro_rules! requirement {
     ($action:literal, $capability:literal, $purposes:expr) => {
         ActionRequirement {
             action: $action,
-            required_capability: $capability,
+            required_capability: Some($capability),
             accepted_purposes: $purposes,
         }
     };
@@ -148,6 +152,11 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("identity.agent.create", "agent.manage", HUMAN_SESSION),
     requirement!("identity.agent.view", "agent.view", HUMAN_SESSION),
     requirement!("identity.agent.run.create", "agent.run", HUMAN_SESSION),
+    ActionRequirement {
+        action: "identity.agent.run.close",
+        required_capability: None,
+        accepted_purposes: AGENT_RUN_ONLY,
+    },
     requirement!("identity.projects.list", "project.view", OP_AGENT_PAT),
     requirement!("identity.project.create", "project.create", OP_PAT),
     requirement!("identity.project.view", "project.view", OP_AGENT_PAT),
@@ -240,7 +249,7 @@ pub fn human_session_authority() -> Vec<String> {
             rule.accepted_purposes
                 .contains(&AcceptedPurpose::HumanSession)
         })
-        .map(|rule| rule.required_capability.to_string())
+        .filter_map(|rule| rule.required_capability.map(str::to_string))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect()
@@ -271,9 +280,9 @@ pub fn authorize_edge_action(
         CredentialPurpose::OperatorBootstrap => {
             capability.effective_authority.holds("edge.operator")
         }
-        _ => capability
-            .effective_authority
-            .holds(rule.required_capability),
+        _ => rule.required_capability.is_none_or(|required| {
+            capability.effective_authority.holds(required)
+        }),
     }
 }
 
@@ -445,6 +454,34 @@ mod tests {
         assert!(authority.holds("issue.view"));
         assert!(!authority.holds("ci.checks.report"));
         assert!(!authority.holds("edge.operator"));
+    }
+
+    #[test]
+    fn an_agent_run_can_only_close_itself_by_credential_purpose() {
+        let agent = identity(
+            CredentialPurpose::AgentRun {
+                run_id: "run-close".into(),
+                delegation_snapshot: Some(11),
+            },
+            CredentialAudience::Edge,
+            &[],
+        );
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &agent,
+            "identity.agent.run.close"
+        ));
+
+        let human = identity(
+            CredentialPurpose::HumanSession,
+            CredentialAudience::Edge,
+            &["agent.run.close"],
+        );
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &human,
+            "identity.agent.run.close"
+        ));
     }
 
     #[test]

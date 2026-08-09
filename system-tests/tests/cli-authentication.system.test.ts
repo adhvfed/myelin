@@ -537,6 +537,42 @@ describe("the CLI authentication journey", () => {
         credential: { scheme: "agent", token: running.credential.token },
       });
 
+      // Finishing work destroys that transient identity as one durable operation. The run can be
+      // inspected as closed, while its bearer material becomes useless immediately.
+      const closeRun = await systemClient.json(`/v1/agent-runs/${running.run.id}/close`, {
+        method: "POST",
+        body: {},
+        token: running.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 200,
+      });
+      expect(closeRun.headers.get("cache-control")).toBe("no-store");
+      expect(closeRun.body).toEqual({
+        run: {
+          id: running.run.id,
+          ref: running.run.ref,
+          agent_id: activated.agent.id,
+          agent_ref: activated.agent.ref,
+          state: "closed",
+        },
+        closed: true,
+        durable: true,
+      });
+
+      await systemClient.json("/v1/whoami", {
+        token: running.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 401,
+      });
+      await systemClient.json(`/v1/agents/${activated.agent.id}/runs`, {
+        method: "POST",
+        body: {},
+        token: browserSession,
+        tokenScheme: "session",
+        idempotencyKey: runRetryKey,
+        expectedStatus: 409,
+      });
+
       // A founder names the first project once. Its generated identity becomes context,
       // so show and subsequent work no longer carry an operator-provided UUID.
       const cliProjectName = uniqueName("Developer experience");
