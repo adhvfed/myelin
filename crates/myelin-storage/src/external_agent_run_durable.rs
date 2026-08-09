@@ -216,6 +216,43 @@ impl DurableExternalAgentRunBacking {
             .await
     }
 
+    pub async fn find_ready(
+        &self,
+        tenant: &str,
+        run_id: Uuid,
+        agent_id: Uuid,
+        token_jti: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<DurableExternalAgentRun>, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let token_jti = token_jti.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT run_id, agent_id, trigger_actor_id, trigger_credential_jti, \
+                                trigger_authority, client_nonce, token_jti, state, issued_at, expires_at \
+                           FROM external_agent_run \
+                          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
+                            AND agent_id = $4 AND token_jti = $5 AND state = 'ready' \
+                            AND expires_at > $6",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(run_id)
+                    .bind(agent_id)
+                    .bind(&token_jti)
+                    .bind(now)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("load ready external agent run"))?;
+                    row.map(|row| run_from_row(&row)).transpose()
+                })
+            })
+            .await
+    }
+
     /// Close a run and revoke its bearer identity in one tenant transaction. A process crash can
     /// therefore expose neither a closed-but-live token nor a revoked-but-reported-ready run.
     pub async fn close(
@@ -225,6 +262,46 @@ impl DurableExternalAgentRunBacking {
         agent_id: Uuid,
         token_jti: &str,
     ) -> Result<Option<DurableExternalAgentRun>, ProviderError> {
+        self.finish(
+            tenant,
+            run_id,
+            agent_id,
+            token_jti,
+            ExternalAgentRunState::Closed,
+        )
+        .await
+    }
+
+    /// Mark an unsafe run terminal and revoke its bearer identity in the same tenant transaction.
+    pub async fn terminate(
+        &self,
+        tenant: &str,
+        run_id: Uuid,
+        agent_id: Uuid,
+        token_jti: &str,
+    ) -> Result<Option<DurableExternalAgentRun>, ProviderError> {
+        self.finish(
+            tenant,
+            run_id,
+            agent_id,
+            token_jti,
+            ExternalAgentRunState::Terminal,
+        )
+        .await
+    }
+
+    async fn finish(
+        &self,
+        tenant: &str,
+        run_id: Uuid,
+        agent_id: Uuid,
+        token_jti: &str,
+        requested_state: ExternalAgentRunState,
+    ) -> Result<Option<DurableExternalAgentRun>, ProviderError> {
+        debug_assert!(matches!(
+            requested_state,
+            ExternalAgentRunState::Closed | ExternalAgentRunState::Terminal
+        ));
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
         let token_jti = token_jti.to_string();
@@ -263,25 +340,29 @@ impl DurableExternalAgentRunBacking {
                     .await
                     .map_err(query_error("revoke closed external agent run token"))?;
 
-                    if observed.state != ExternalAgentRunState::Terminal {
+                    let final_state = if observed.state == ExternalAgentRunState::Terminal
+                        || requested_state == ExternalAgentRunState::Terminal
+                    {
+                        ExternalAgentRunState::Terminal
+                    } else {
+                        ExternalAgentRunState::Closed
+                    };
+                    if observed.state != final_state {
                         sqlx::query(
-                            "UPDATE external_agent_run SET state = 'closed' \
+                            "UPDATE external_agent_run SET state = $4 \
                               WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
                         )
                         .bind(&tenant)
                         .bind(&region)
                         .bind(run_id)
+                        .bind(final_state.token())
                         .execute(&mut *conn)
                         .await
-                        .map_err(query_error("close external agent run"))?;
+                        .map_err(query_error("finish external agent run"))?;
                     }
 
                     Ok(Some(DurableExternalAgentRun {
-                        state: if observed.state == ExternalAgentRunState::Terminal {
-                            ExternalAgentRunState::Terminal
-                        } else {
-                            ExternalAgentRunState::Closed
-                        },
+                        state: final_state,
                         ..observed
                     }))
                 })

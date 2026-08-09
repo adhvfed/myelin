@@ -66,6 +66,13 @@ pub struct ClosedAgentSession {
     pub state: ExternalAgentRunState,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedAgentSession {
+    pub run_id: String,
+    pub agent_id: String,
+    pub token_jti: String,
+}
+
 struct MintedAgentRun {
     token: RunToken,
     effective_grants: Vec<String>,
@@ -194,6 +201,51 @@ impl AgentSessionIssuer {
             run_id: closed.run_id,
             agent_id: closed.agent_id,
             state: closed.state,
+        })
+    }
+
+    pub async fn authorize(
+        &self,
+        actor: &Principal,
+        run_id: &str,
+        token_jti: &str,
+        now: DateTime<Utc>,
+    ) -> Result<AuthorizedAgentSession, AgentSessionError> {
+        let agent_id = external_agent_id(actor)?;
+        let run_id = canonical_uuid("run id", run_id)?;
+        validate_token_jti(token_jti)?;
+        let ready = self
+            .runs
+            .find_ready(&actor.tenant.0, run_id, agent_id, token_jti, now)
+            .await
+            .map_err(storage_error)?
+            .ok_or(AgentSessionError::RunNotFound)?;
+        Ok(AuthorizedAgentSession {
+            run_id: ready.run_id,
+            agent_id: ready.agent_id,
+            token_jti: ready.token_jti,
+        })
+    }
+
+    pub async fn terminate(
+        &self,
+        actor: &Principal,
+        run_id: &str,
+        token_jti: &str,
+    ) -> Result<ClosedAgentSession, AgentSessionError> {
+        let agent_id = external_agent_id(actor)?;
+        let run_id = canonical_uuid("run id", run_id)?;
+        validate_token_jti(token_jti)?;
+        let terminal = self
+            .runs
+            .terminate(&actor.tenant.0, run_id, agent_id, token_jti)
+            .await
+            .map_err(storage_error)?
+            .ok_or(AgentSessionError::RunNotFound)?;
+        Ok(ClosedAgentSession {
+            run_id: terminal.run_id,
+            agent_id: terminal.agent_id,
+            state: terminal.state,
         })
     }
 

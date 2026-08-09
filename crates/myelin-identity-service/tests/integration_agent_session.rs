@@ -250,6 +250,30 @@ async fn one_click_starts_one_short_lived_agent_even_when_the_network_retries() 
         DataRole::Controller,
         agent.status,
     );
+    let authorized = issuer
+        .authorize(
+            &agent_actor,
+            &left.session.run_id,
+            &left.run_token.jti,
+            now + Duration::seconds(15),
+        )
+        .await
+        .expect("a frame resolves only its exact ready durable run");
+    assert_eq!(authorized.run_id, left.session.run_id);
+    assert_eq!(authorized.agent_id, agent.id);
+    assert_eq!(authorized.token_jti, left.run_token.jti);
+    assert!(matches!(
+        issuer
+            .authorize(
+                &agent_actor,
+                &left.session.run_id,
+                "a-different-token",
+                now + Duration::seconds(15),
+            )
+            .await,
+        Err(myelin_identity_service::AgentSessionError::RunNotFound)
+    ));
+
     let closed = issuer
         .close(&agent_actor, &left.session.run_id, &left.run_token.jti)
         .await
@@ -279,6 +303,17 @@ async fn one_click_starts_one_short_lived_agent_even_when_the_network_retries() 
     .await
     .expect("observe the durable closed run");
     assert_eq!(closed_runs, 1);
+    assert!(matches!(
+        issuer
+            .authorize(
+                &agent_actor,
+                &left.session.run_id,
+                &left.run_token.jti,
+                now + Duration::seconds(20),
+            )
+            .await,
+        Err(myelin_identity_service::AgentSessionError::RunNotFound)
+    ));
 
     let replay_after_close = issuer
         .start(
@@ -293,6 +328,31 @@ async fn one_click_starts_one_short_lived_agent_even_when_the_network_retries() 
         replay_after_close,
         Err(myelin_identity_service::AgentSessionError::Conflict(_))
     ));
+
+    let mut terminal_request = run_request(&agent.id, now + Duration::seconds(21));
+    terminal_request.client_nonce = "start-release-companion-terminal-v1".into();
+    let terminal_run = issuer
+        .start(&actor, terminal_request)
+        .await
+        .expect("a later independent run starts normally");
+    let terminal = issuer
+        .terminate(
+            &agent_actor,
+            &terminal_run.session.run_id,
+            &terminal_run.run_token.jti,
+        )
+        .await
+        .expect("an indeterminate outcome terminates the exact run");
+    assert_eq!(terminal.state.token(), "terminal");
+    assert_eq!(
+        identity.run_token_minter().revocation_state(
+            &agent_scope,
+            &terminal_run.run_token,
+            &Timestamp((now + Duration::seconds(22)).to_rfc3339_opts(SecondsFormat::Secs, true)),
+        ),
+        RunTokenState::TornDown,
+        "terminal state and token teardown are committed together"
+    );
 
     cleanup(&admin, &tenant).await;
 }
