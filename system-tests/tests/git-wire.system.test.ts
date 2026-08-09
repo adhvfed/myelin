@@ -8,15 +8,12 @@ import { systemClient, uniqueName } from "../src/context.js";
 import { git, GitCommandError } from "../src/git-cli.js";
 import { GitProject } from "../src/git-project.js";
 import { array } from "../src/json.js";
-import { systemTestConfig } from "../src/config.js";
+import { gitRepositoryUrl, systemTestConfig } from "../src/config.js";
 
 describe.sequential("Git smart-HTTP lifecycle", () => {
   const slug = uniqueName("system-wire");
   const project = new GitProject(slug, systemClient);
-  const repositoryUrl = new URL(
-    `/${encodeURIComponent(systemTestConfig.tenant)}/${encodeURIComponent(systemTestConfig.region)}/${encodeURIComponent(slug)}.git`,
-    systemTestConfig.edgeUrl,
-  ).toString();
+  const repositoryUrl = gitRepositoryUrl(slug);
   let root = "";
   let working = "";
   let mainOid = "";

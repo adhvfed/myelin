@@ -52,3 +52,10 @@ export const systemTestConfig: SystemTestConfig = Object.freeze({
     prefix: required("MYELIN_SYSTEM_TEST_ISSUES_PREFIX"),
   }),
 });
+
+export function gitRepositoryUrl(slug: string): string {
+  const path = [systemTestConfig.tenant, systemTestConfig.region, `${slug}.git`]
+    .map(encodeURIComponent)
+    .join("/");
+  return new URL(`/${path}`, systemTestConfig.edgeUrl).toString();
+}

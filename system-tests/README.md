@@ -33,6 +33,8 @@ The suite is intentionally organized around externally visible contracts:
   to a second principal, reviewer-scoped PR access, review and inbox completion, merge, and
   base-branch readback.
 - `git-wire` uses a stock Git client to verify smart-HTTP authentication, clone, fetch, and push.
+- `search-lifecycle` verifies exact code coordinates, repository authorization, replacement of stale
+  matches, default-branch isolation, promotion, and deletion through a stock Git push.
 - `realtime-lifecycle` subscribes as an external tenant client and verifies authenticated repository
   creation and push events over the server-sent event stream.
 - `collaboration-lifecycle` exercises Chat, Knowledge, and the asynchronous Issues authorization
