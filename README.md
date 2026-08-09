@@ -79,6 +79,18 @@ myelin context use --project 11111111-1111-1111-1111-111111111111
 myelin context current
 myelin auth configure-git
 
+myelin tool list
+myelin tool show ci.read_run
+myelin agent create "Review companion" --tool ci.read_run --tool git.open_pr \
+  --idempotency-key review-companion
+myelin mcp serve --as 22222222-2222-2222-2222-222222222222
+myelin agent suspend 22222222-2222-2222-2222-222222222222 \
+  --idempotency-key pause-review-companion
+myelin agent resume 22222222-2222-2222-2222-222222222222 \
+  --idempotency-key resume-review-companion
+myelin agent retire 22222222-2222-2222-2222-222222222222 \
+  --idempotency-key retire-review-companion
+
 myelin repo list
 myelin repo pr list
 myelin project create "Developer experience" --prefix DX --idempotency-key developer-experience
@@ -112,6 +124,12 @@ active profile; `--project`, `MYELIN_PROJECT`, and that saved value override one
 order. Creating a project with a saved profile makes it active for that profile; its owned issue
 prefix and default issue type then keep ordinary issue creation free of UUID and prefix ceremony.
 Git helpers are scoped to an exact Edge and profile.
+
+External MCP clients can use `myelin mcp serve --as <agent-id>` as their server command. The CLI
+exchanges the saved browser-approved session for a one-minute run identity, keeps the bearer off
+protocol output, and closes it when the client disconnects. Suspending or retiring the agent also
+terminates every unfinished run atomically; resuming permits fresh work but never revives an old
+run. No provider API key or long-lived agent credential is created or copied through this flow.
 
 Issue responses include a canonical `myelin://...` reference that can be passed directly to
 `chat ref`. The conversation keeps a live pointer to the issue rather than copying a stale
