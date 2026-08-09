@@ -14,6 +14,8 @@ describe.sequential("Git smart-HTTP lifecycle", () => {
   const slug = uniqueName("system-wire");
   const project = new GitProject(slug, systemClient);
   const repositoryUrl = gitRepositoryUrl(slug);
+  const namespacedSlug = `team/${uniqueName("system-wire-nested")}`;
+  const namespacedProject = new GitProject(namespacedSlug, systemClient);
   let root = "";
   let working = "";
   let mainOid = "";
@@ -114,6 +116,18 @@ describe.sequential("Git smart-HTTP lifecycle", () => {
     );
   });
 
+  test("enforces repository read grants for an authenticated native Git client", async () => {
+    requireWorkingCopy();
+    let failure: unknown;
+    try {
+      await git(["ls-remote", repositoryUrl], { token: systemTestConfig.reviewerToken });
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(GitCommandError);
+    expect((failure as GitCommandError).stderr).not.toContain(systemTestConfig.reviewerToken);
+  });
+
   test("clones the published default branch into a clean worktree", async () => {
     requireWorkingCopy();
     const clean = join(root, "clean-clone");
@@ -125,5 +139,27 @@ describe.sequential("Git smart-HTTP lifecycle", () => {
     await expect(readFile(join(clean, "delivery.txt"), "utf8")).rejects.toMatchObject({
       code: "ENOENT",
     });
+  });
+
+  test("clones a namespaced repository from its advertised URL", async () => {
+    await namespacedProject.create();
+    const commitOid = (await namespacedProject.writeFile(
+      "main",
+      "README.md",
+      `# ${namespacedSlug}\n`,
+    )).commitOid;
+    const advertised = await systemClient.json(namespacedProject.path);
+    const namespacedUrl = gitRepositoryUrl(namespacedSlug);
+    expect(advertised.body).toMatchObject({
+      clone_url: namespacedUrl,
+      snapshot_oid: commitOid,
+    });
+
+    const clone = join(root, "namespaced-clone");
+    await git(["clone", "--branch", "main", namespacedUrl, clone], {
+      token: systemTestConfig.token,
+    });
+    expect((await git(["rev-parse", "HEAD"], { cwd: clone })).stdout.trim()).toBe(commitOid);
+    expect(await readFile(join(clone, "README.md"), "utf8")).toContain(namespacedSlug);
   });
 });

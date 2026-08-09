@@ -825,7 +825,8 @@ impl DurableGitBackend {
     }
 
     fn clone_url(&self, tenant: &str, region: &str, slug: &str) -> String {
-        format!("{}/{tenant}/{region}/{slug}.git", self.clone_base)
+        let wire_slug = slug.replace('/', "%2F");
+        format!("{}/{tenant}/{region}/{wire_slug}.git", self.clone_base)
     }
 
     fn repo_home(

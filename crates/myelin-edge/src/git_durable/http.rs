@@ -4628,6 +4628,12 @@ mod pr_list_tests {
             !advertised.contains("ssh://"),
             "no ssh in the projection: {advertised}"
         );
+
+        let namespaced = be.clone_url(TENANT, REGION, "team/widgets");
+        assert!(
+            namespaced.ends_with("/acme/eu-west/team%2Fwidgets.git"),
+            "a namespaced slug stays in the wire route's repo segment: {namespaced}"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
