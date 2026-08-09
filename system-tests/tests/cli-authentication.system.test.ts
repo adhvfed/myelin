@@ -18,22 +18,14 @@ function cliEnvironment(configDirectory: string): NodeJS.ProcessEnv {
   };
   delete environment.MYELIN_TOKEN;
   delete environment.MYELIN_TOKEN_SCHEME;
+  delete environment.MYELIN_EDGE;
   return environment;
 }
 
 function startCli(configDirectory: string, ...args: string[]): ChildProcessWithoutNullStreams {
   return spawn(
     "cargo",
-    [
-      "run",
-      "--quiet",
-      "-p",
-      "myelin-cli",
-      "--",
-      "--edge",
-      systemTestConfig.edgeUrl,
-      ...args,
-    ],
+    ["run", "--quiet", "-p", "myelin-cli", "--", ...args],
     {
       cwd: repository,
       env: cliEnvironment(configDirectory),
@@ -108,7 +100,14 @@ describe("the CLI authentication journey", () => {
     const configDirectory = await mkdtemp(resolve(tmpdir(), "myelin-cli-system-"));
     let login: ChildProcessWithoutNullStreams | undefined;
     try {
-      login = startCli(configDirectory, "auth", "login", "--no-browser");
+      login = startCli(
+        configDirectory,
+        "--edge",
+        systemTestConfig.edgeUrl,
+        "auth",
+        "login",
+        "--no-browser",
+      );
       const output = await waitForCode(login);
 
       const approved = await systemClient.json("/v1/auth/device/approval", {
@@ -123,7 +122,11 @@ describe("the CLI authentication journey", () => {
 
       const credentialPath = resolve(configDirectory, "credentials.json");
       const stored = JSON.parse(await readFile(credentialPath, "utf8")) as Record<string, unknown>;
-      expect(stored).toMatchObject({ version: 1, scheme: "session" });
+      expect(stored).toMatchObject({
+        version: 1,
+        scheme: "session",
+        edge_url: systemTestConfig.edgeUrl,
+      });
       expect(stored.token).not.toBe(systemTestConfig.token);
       if (process.platform !== "win32") {
         expect((await stat(credentialPath)).mode & 0o777).toBe(0o600);

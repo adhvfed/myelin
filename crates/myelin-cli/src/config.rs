@@ -27,6 +27,8 @@ pub struct EdgeConfig {
 pub struct Credential {
     pub token: String,
     pub scheme: String,
+    /** Edge that issued this credential. Older and externally supplied credentials may not know it. */
+    pub edge_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -35,6 +37,8 @@ struct StoredCredential {
     version: u8,
     token: String,
     scheme: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    edge_url: Option<String>,
 }
 
 pub fn config_dir(getenv: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf, CliError> {
@@ -64,11 +68,13 @@ pub fn legacy_token_path(getenv: &dyn Fn(&str) -> Option<String>) -> Result<Path
 pub fn resolve_edge(
     flag_url: Option<&str>,
     scheme: Option<&str>,
+    stored_url: Option<&str>,
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> EdgeConfig {
     let url = flag_url
         .map(str::to_string)
         .or_else(|| getenv(env::EDGE).filter(|value| !value.is_empty()))
+        .or_else(|| stored_url.map(str::to_string))
         .unwrap_or_else(|| DEFAULT_EDGE.to_string());
     EdgeConfig {
         url,
@@ -91,7 +97,11 @@ pub fn resolve_credential(
         .map(str::to_string)
         .or_else(|| getenv(env::TOKEN).filter(|value| !value.is_empty()))
     {
-        return credential(&token, supplied_scheme.as_deref().unwrap_or(DEFAULT_SCHEME));
+        return credential(
+            &token,
+            supplied_scheme.as_deref().unwrap_or(DEFAULT_SCHEME),
+            None,
+        );
     }
 
     let stored_path = credential_path(getenv)?;
@@ -100,12 +110,17 @@ pub fn resolve_credential(
         return credential(
             &stored.token,
             supplied_scheme.as_deref().unwrap_or(&stored.scheme),
+            stored.edge_url.as_deref(),
         );
     }
 
     let legacy_path = legacy_token_path(getenv)?;
     if let Some(token) = read_file(&legacy_path) {
-        return credential(&token, supplied_scheme.as_deref().unwrap_or(DEFAULT_SCHEME));
+        return credential(
+            &token,
+            supplied_scheme.as_deref().unwrap_or(DEFAULT_SCHEME),
+            None,
+        );
     }
 
     Err(CliError::NotAuthenticated(
@@ -116,13 +131,15 @@ pub fn resolve_credential(
 pub fn store_credential(
     token: &str,
     scheme: &str,
+    edge_url: Option<&str>,
     getenv: &dyn Fn(&str) -> Option<String>,
 ) -> Result<PathBuf, CliError> {
-    let credential = credential(token, scheme)?;
+    let credential = credential(token, scheme, edge_url)?;
     let stored = StoredCredential {
         version: CREDENTIAL_VERSION,
         token: credential.token,
         scheme: credential.scheme,
+        edge_url: credential.edge_url,
     };
     let encoded = serde_json::to_vec(&stored)
         .map_err(|error| CliError::Config(format!("cannot encode credentials: {error}")))?;
@@ -158,7 +175,7 @@ pub fn remove_stored_credentials(
     Ok(removed)
 }
 
-fn credential(token: &str, scheme: &str) -> Result<Credential, CliError> {
+fn credential(token: &str, scheme: &str, edge_url: Option<&str>) -> Result<Credential, CliError> {
     let token = token.trim();
     let scheme = scheme.trim();
     if token.is_empty()
@@ -177,7 +194,21 @@ fn credential(token: &str, scheme: &str) -> Result<Credential, CliError> {
     Ok(Credential {
         token: token.to_string(),
         scheme: scheme.to_string(),
+        edge_url: edge_url.map(normalize_stored_edge_url).transpose()?,
     })
+}
+
+fn normalize_stored_edge_url(edge_url: &str) -> Result<String, CliError> {
+    let edge_url = edge_url.trim().trim_end_matches('/');
+    if edge_url.is_empty()
+        || edge_url.len() > 2_048
+        || !edge_url.as_bytes().iter().all(u8::is_ascii_graphic)
+    {
+        return Err(CliError::Config(
+            "credential edge URL must be bounded printable ASCII without spaces".into(),
+        ));
+    }
+    Ok(edge_url.to_string())
 }
 
 fn valid_scheme(scheme: &str) -> bool {
@@ -207,7 +238,7 @@ fn parse_stored_credential(encoded: &str, path: &Path) -> Result<StoredCredentia
             stored.version
         )));
     }
-    credential(&stored.token, &stored.scheme)?;
+    credential(&stored.token, &stored.scheme, stored.edge_url.as_deref())?;
     Ok(stored)
 }
 
@@ -335,6 +366,7 @@ mod tests {
             Credential {
                 token: "FLAG_TOKEN".into(),
                 scheme: "pat".into(),
+                edge_url: None,
             }
         );
         assert_eq!(
@@ -342,6 +374,7 @@ mod tests {
             Credential {
                 token: "ENV_TOKEN".into(),
                 scheme: "ci".into(),
+                edge_url: None,
             }
         );
     }
@@ -358,6 +391,25 @@ mod tests {
             Credential {
                 token: "HUMAN_SESSION".into(),
                 scheme: SESSION_SCHEME.into(),
+                edge_url: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_saved_session_remembers_its_issuing_edge() {
+        let env = env_from(&[("MYELIN_CONFIG_DIR", "/config")]);
+        let read = |path: &Path| {
+            (path == Path::new("/config/credentials.json")).then(|| {
+                r#"{"version":1,"token":"HUMAN_SESSION","scheme":"session","edge_url":"https://edge.example/"}"#.into()
+            })
+        };
+        assert_eq!(
+            resolve_credential(None, None, &env, &read).unwrap(),
+            Credential {
+                token: "HUMAN_SESSION".into(),
+                scheme: SESSION_SCHEME.into(),
+                edge_url: Some("https://edge.example".into()),
             }
         );
     }
@@ -372,6 +424,7 @@ mod tests {
             Credential {
                 token: "LEGACY_TOKEN".into(),
                 scheme: DEFAULT_SCHEME.into(),
+                edge_url: None,
             }
         );
     }
@@ -392,7 +445,13 @@ mod tests {
             std::env::temp_dir().join(format!("myelin-cli-credential-{}", std::process::id()));
         let dir = tmp.to_string_lossy().to_string();
         let env = env_from(&[("MYELIN_CONFIG_DIR", &dir)]);
-        let path = store_credential("ROUNDTRIP_TOKEN", SESSION_SCHEME, &env).unwrap();
+        let path = store_credential(
+            "ROUNDTRIP_TOKEN",
+            SESSION_SCHEME,
+            Some("https://edge.example/"),
+            &env,
+        )
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -405,6 +464,7 @@ mod tests {
             Credential {
                 token: "ROUNDTRIP_TOKEN".into(),
                 scheme: SESSION_SCHEME.into(),
+                edge_url: Some("https://edge.example".into()),
             }
         );
         std::fs::write(tmp.join("token"), "OLD_TOKEN").unwrap();
@@ -416,10 +476,24 @@ mod tests {
     }
 
     #[test]
-    fn resolve_edge_uses_the_selected_credential_scheme() {
+    fn resolve_edge_precedence_is_flag_then_environment_then_saved_then_default() {
         let env = env_from(&[("MYELIN_EDGE", "http://envhost:9")]);
-        let config = resolve_edge(Some("http://flag:1"), Some(SESSION_SCHEME), &env);
+        let config = resolve_edge(
+            Some("http://flag:1"),
+            Some(SESSION_SCHEME),
+            Some("https://saved.example"),
+            &env,
+        );
         assert_eq!(config.url, "http://flag:1");
         assert_eq!(config.scheme, SESSION_SCHEME);
+
+        let config = resolve_edge(None, None, Some("https://saved.example"), &env);
+        assert_eq!(config.url, "http://envhost:9");
+
+        let config = resolve_edge(None, None, Some("https://saved.example"), &env_from(&[]));
+        assert_eq!(config.url, "https://saved.example");
+
+        let config = resolve_edge(None, None, None, &env_from(&[]));
+        assert_eq!(config.url, DEFAULT_EDGE);
     }
 }

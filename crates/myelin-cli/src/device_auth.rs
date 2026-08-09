@@ -173,7 +173,11 @@ fn parse_claim(value: Value) -> Result<Claim, CliError> {
         return malformed("authorized credential has an invalid shape");
     }
     Ok(Claim::Authorized(AuthorizedCredential {
-        credential: Credential { token, scheme },
+        credential: Credential {
+            token,
+            scheme,
+            edge_url: None,
+        },
         expires_at_unix: expires_at,
     }))
 }

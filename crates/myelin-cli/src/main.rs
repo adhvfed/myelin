@@ -163,7 +163,8 @@ async fn login(
             .clone()
             .or_else(|| getenv(config::env::SCHEME).filter(|value| !value.is_empty()))
             .unwrap_or_else(|| config::DEFAULT_SCHEME.into());
-        let path = store_credential(&token, &scheme, getenv)?;
+        let edge = resolve_edge(cli.edge.as_deref(), Some(&scheme), None, getenv);
+        let path = store_credential(&token, &scheme, Some(&edge.url), getenv)?;
         println!(
             "Stored the {scheme} credential at {}. Run `myelin auth status` to verify it.",
             path.display()
@@ -176,7 +177,7 @@ async fn login(
         ));
     }
 
-    let edge = resolve_edge(cli.edge.as_deref(), Some(SESSION_SCHEME), getenv);
+    let edge = resolve_edge(cli.edge.as_deref(), Some(SESSION_SCHEME), None, getenv);
     let request = new_authorization_request();
     let authorization = begin_authorization(&edge, &request).await?;
 
@@ -199,6 +200,7 @@ async fn login(
     let path = store_credential(
         &authorized.credential.token,
         &authorized.credential.scheme,
+        Some(&edge.url),
         getenv,
     )?;
     let expires_at = chrono::DateTime::from_timestamp(authorized.expires_at_unix, 0)
@@ -361,7 +363,12 @@ async fn run_call(
         getenv,
         read_file,
     )?;
-    let edge = resolve_edge(cli.edge.as_deref(), Some(&credential.scheme), getenv);
+    let edge = resolve_edge(
+        cli.edge.as_deref(),
+        Some(&credential.scheme),
+        credential.edge_url.as_deref(),
+        getenv,
+    );
     if call.path.starts_with("/v1/ci/runs/") && call.path.ends_with("/log/live") {
         let stdout = std::io::stdout();
         let mut output = stdout.lock();
