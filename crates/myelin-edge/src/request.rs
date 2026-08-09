@@ -40,7 +40,10 @@ impl EdgeRequest {
 
     pub fn bearer(&self) -> Option<&str> {
         self.header("authorization")
-            .and_then(|h| h.strip_prefix("Bearer ").or_else(|| h.strip_prefix("bearer ")))
+            .and_then(|h| {
+                h.strip_prefix("Bearer ")
+                    .or_else(|| h.strip_prefix("bearer "))
+            })
             .map(str::trim)
     }
 
@@ -70,22 +73,20 @@ impl EdgeRequest {
         Ok(format!("request-v1-{}", digest.finalize().to_hex()))
     }
 
-    pub fn basic_password(&self) -> Option<String> {
+    pub fn basic_credentials(&self) -> Option<(String, String)> {
         use base64::Engine as _;
         let raw = self.header("authorization")?;
         let b64 = raw
             .strip_prefix("Basic ")
             .or_else(|| raw.strip_prefix("basic "))?
             .trim();
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .ok()?;
+        let decoded = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
         let creds = String::from_utf8(decoded).ok()?;
-        let (_user, pass) = creds.split_once(':')?;
-        if pass.is_empty() {
+        let (user, pass) = creds.split_once(':')?;
+        if user.is_empty() || pass.is_empty() {
             return None;
         }
-        Some(pass.to_string())
+        Some((user.to_string(), pass.to_string()))
     }
 
     pub fn cookie(&self, name: &str) -> Option<String> {
@@ -114,7 +115,9 @@ impl EdgeRequest {
 
     pub fn json_body(&self) -> Result<Value, EdgeError> {
         if self.body.is_empty() {
-            return Err(EdgeError::BadRequest("empty request body (expected JSON)".into()));
+            return Err(EdgeError::BadRequest(
+                "empty request body (expected JSON)".into(),
+            ));
         }
         serde_json::from_slice(&self.body)
             .map_err(|e| EdgeError::BadRequest(format!("malformed JSON body: {e}")))
@@ -157,7 +160,11 @@ impl EdgeResponse {
         }
     }
 
-    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> EdgeResponse {
+    pub fn with_header(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> EdgeResponse {
         match &mut self {
             EdgeResponse::Bytes { headers, .. } | EdgeResponse::Sse { headers, .. } => {
                 headers.push((name.into(), value.into()));
@@ -200,6 +207,24 @@ mod tests {
     }
 
     #[test]
+    fn basic_credentials_preserve_the_scheme_selecting_username() {
+        use base64::Engine as _;
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode("myelin-session:opaque-session-token");
+        let request = EdgeRequest::new(
+            "GET",
+            "/acme/eu/repo.git/info/refs",
+            "",
+            vec![("Authorization".into(), format!("Basic {encoded}"))],
+            vec![],
+        );
+        assert_eq!(
+            request.basic_credentials(),
+            Some(("myelin-session".into(), "opaque-session-token".into()))
+        );
+    }
+
+    #[test]
     fn cookie_and_query_parsing_is_total() {
         let req = EdgeRequest::new(
             "GET",
@@ -212,7 +237,13 @@ mod tests {
         assert_eq!(req.cookie("missing"), None);
         assert_eq!(req.query_param("limit"), Some("10".to_string()));
         assert_eq!(req.query_param("cursor"), Some("zz".to_string()));
-        let bad = EdgeRequest::new("GET", "/", "&&=&x", vec![("cookie".into(), ";;= ;".into())], vec![]);
+        let bad = EdgeRequest::new(
+            "GET",
+            "/",
+            "&&=&x",
+            vec![("cookie".into(), ";;= ;".into())],
+            vec![],
+        );
         assert_eq!(bad.cookie("x"), None);
         assert_eq!(bad.query_param("x"), None);
     }

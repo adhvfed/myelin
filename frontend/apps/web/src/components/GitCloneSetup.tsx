@@ -15,12 +15,29 @@ export function gitSetupCommands(
   defaultBranch: string,
 ): string {
   const pseudonym = gitPseudonym(principalId, tenant);
+  const edge = edgeOriginFromCloneUrl(url);
   return [
+    edge === undefined
+      ? "myelin auth login"
+      : `myelin --edge ${shellQuote(edge)} auth login`,
+    "myelin auth configure-git",
     `git clone ${shellQuote(url)}`,
     `git config user.name ${shellQuote(pseudonym)}`,
     `git config user.email ${shellQuote(pseudonym)}`,
     `git push -u origin ${shellQuote(defaultBranch)}`,
   ].join("\n");
+}
+
+function edgeOriginFromCloneUrl(value: string): string | undefined {
+  try {
+    const url = new URL(value);
+    return (url.protocol === "http:" || url.protocol === "https:") &&
+      url.username === "" && url.password === ""
+      ? url.origin
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function CloneUrl(props: { url?: string; onCopy: () => void }) {
@@ -73,8 +90,8 @@ export function GitSetupGuide(props: {
           {commands()}
         </pre>
         <p style={{ margin: "0", color: "var(--text-subtle)", "font-size": "var(--fs-caption)" }}>
-          When Git asks for HTTPS credentials, use your Myelin principal as the username and a
-          capability token as the password. Make a commit before the first push to an empty repository.
+          Browser approval creates an Edge-scoped CLI session; Git never needs a pasted API key.
+          Make a commit before the first push to an empty repository.
         </p>
       </div>
     </details>

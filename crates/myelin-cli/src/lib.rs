@@ -4,6 +4,7 @@ pub mod config;
 pub mod device_auth;
 pub mod dispatch;
 pub mod error;
+pub mod git_credential;
 pub mod render;
 
 pub use config::EdgeConfig;

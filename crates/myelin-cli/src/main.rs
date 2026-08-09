@@ -1,8 +1,8 @@
 use clap::{Args, Parser, Subcommand};
 use myelin_cli::client::execute;
 use myelin_cli::config::{
-    self, remove_stored_credentials, resolve_credential, resolve_edge, store_credential,
-    SESSION_SCHEME,
+    self, load_stored_credential, remove_stored_credentials, resolve_credential, resolve_edge,
+    store_credential, SESSION_SCHEME,
 };
 use myelin_cli::device_auth::{
     begin_authorization, new_authorization_request, wait_for_authorization,
@@ -12,6 +12,9 @@ use myelin_cli::dispatch::{
     EdgeCall, HttpMethod,
 };
 use myelin_cli::error::CliError;
+use myelin_cli::git_credential::{
+    self, CredentialScope, GitConfiguration, Operation as GitCredentialOperation,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "myelin", version, about, long_about = None)]
@@ -81,6 +84,14 @@ enum AuthCommand {
     Login(LoginArgs),
     Status,
     Logout,
+    /// Let Git use the saved Myelin session for this Edge.
+    ConfigureGit,
+    /// Remove this Myelin session helper from global Git configuration.
+    UnconfigureGit,
+    #[command(hide = true)]
+    GitCredential {
+        operation: String,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -106,6 +117,11 @@ async fn run() -> Result<(), CliError> {
             AuthCommand::Login(args) => login(&cli, *args, &getenv).await,
             AuthCommand::Status => run_call(&cli, &getenv, &read_file, whoami_call(), None).await,
             AuthCommand::Logout => logout(&cli, &getenv),
+            AuthCommand::ConfigureGit => configure_git(&cli, &getenv, &read_file, false),
+            AuthCommand::UnconfigureGit => configure_git(&cli, &getenv, &read_file, true),
+            AuthCommand::GitCredential { operation } => {
+                serve_git_credential(&cli, operation, &getenv, &read_file)
+            }
         },
         Command::Whoami => run_call(&cli, &getenv, &read_file, whoami_call(), None).await,
         Command::Git { args } => {
@@ -242,6 +258,87 @@ fn reject_auth_mutation_flags(cli: &Cli) -> Result<(), CliError> {
     if cli.idempotency_key.is_some() {
         return Err(CliError::Usage(
             "--idempotency-key applies only to Edge mutation commands".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn configure_git(
+    cli: &Cli,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
+    remove: bool,
+) -> Result<(), CliError> {
+    reject_git_auth_flags(cli)?;
+    let credential = load_stored_credential(getenv, read_file)?.ok_or_else(|| {
+        CliError::NotAuthenticated(
+            "Git setup needs a saved credential; run `myelin auth login` first".into(),
+        )
+    })?;
+    let edge_url = credential.edge_url.as_deref().ok_or_else(|| {
+        CliError::NotAuthenticated(
+            "the saved credential predates Edge-aware login; run `myelin auth login` again".into(),
+        )
+    })?;
+    let scope = CredentialScope::from_edge_url(edge_url)?;
+    let executable = std::env::current_exe().map_err(|error| {
+        CliError::Config(format!("cannot locate the Myelin executable: {error}"))
+    })?;
+    let configuration = GitConfiguration::new(&scope, &executable, &credential.scheme)?;
+    let changed = if remove {
+        git_credential::unconfigure(&configuration)?
+    } else {
+        git_credential::configure(&configuration)?
+    };
+    match (remove, changed) {
+        (false, true) => println!(
+            "Git is ready to use your saved Myelin session for {}.",
+            scope.edge_origin()
+        ),
+        (false, false) => println!("Git was already configured for {}.", scope.edge_origin()),
+        (true, true) => println!(
+            "Removed the Myelin credential helper for {}.",
+            scope.edge_origin()
+        ),
+        (true, false) => println!(
+            "No Myelin credential helper was configured for {}.",
+            scope.edge_origin()
+        ),
+    }
+    Ok(())
+}
+
+fn serve_git_credential(
+    cli: &Cli,
+    operation: &str,
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&std::path::Path) -> Option<String>,
+) -> Result<(), CliError> {
+    reject_git_auth_flags(cli)?;
+    let operation = GitCredentialOperation::parse(operation)?;
+    let credential = load_stored_credential(getenv, read_file)?.ok_or_else(|| {
+        CliError::NotAuthenticated(
+            "Git authentication needs a saved credential; run `myelin auth login` first".into(),
+        )
+    })?;
+    git_credential::serve(
+        operation,
+        &credential,
+        std::io::stdin().lock(),
+        std::io::stdout().lock(),
+    )
+}
+
+fn reject_git_auth_flags(cli: &Cli) -> Result<(), CliError> {
+    if cli.json
+        || cli.edge.is_some()
+        || cli.token.is_some()
+        || cli.scheme.is_some()
+        || cli.idempotency_key.is_some()
+    {
+        return Err(CliError::Usage(
+            "Git credential setup uses only the Edge-bound credential saved by `myelin auth login`"
+                .into(),
         ));
     }
     Ok(())

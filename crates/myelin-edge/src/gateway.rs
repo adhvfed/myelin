@@ -8,12 +8,13 @@ use crate::error::EdgeError;
 use crate::request::{EdgeRequest, EdgeResponse};
 use crate::session::{SessionStore, SESSION_COOKIE};
 use crate::sse::{SseEvent, SseHub};
+use myelin_events::{IdMinter, UlidMinter};
 use myelin_identity::{AuthzError, Credential, Principal, PrincipalKind};
 use myelin_identity_service::{
-    CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, CredentialAudience,
-    CredentialPurpose, DpopBinding, HumanSsoAuthenticator, RequestIdentity, VerifiedAssertion,
+    machine_scheme, CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority,
+    CredentialAudience, CredentialPurpose, DpopBinding, HumanSsoAuthenticator, RequestIdentity,
+    VerifiedAssertion,
 };
-use myelin_events::{IdMinter, UlidMinter};
 use myelin_storage::TenantScope;
 use myelin_substrate::{Authorizer, InjectedIdentity, PublicSurface};
 use myelin_tenancy::{Region, TenantId};
@@ -45,7 +46,9 @@ impl HumanSessionIssuer {
             .unwrap_or_else(|| now.saturating_add(HUMAN_SESSION_TTL_SECS))
             .min(now.saturating_add(HUMAN_SESSION_TTL_SECS));
         if expiry <= now {
-            return Err(EdgeError::Unauthorized("verified login credential has expired".into()));
+            return Err(EdgeError::Unauthorized(
+                "verified login credential has expired".into(),
+            ));
         }
         let token = self.cell.mint(&CapabilityMintSpec {
             tenant: principal.tenant.0.clone(),
@@ -74,9 +77,9 @@ impl HumanSessionIssuer {
         let authorization_started_at_unix = authorization_expires_at_unix
             .checked_sub(DEVICE_AUTHORIZATION_TTL_SECS)
             .ok_or_else(|| EdgeError::Unauthorized("the CLI login request is invalid".into()))?;
-        let expiry = approval.source_expires_at_unix.min(
-            authorization_started_at_unix.saturating_add(HUMAN_SESSION_TTL_SECS),
-        );
+        let expiry = approval
+            .source_expires_at_unix
+            .min(authorization_started_at_unix.saturating_add(HUMAN_SESSION_TTL_SECS));
         if expiry <= now {
             return Err(EdgeError::Unauthorized(
                 "the approving browser credential has expired".into(),
@@ -330,10 +333,7 @@ impl GatewayBuilder {
         self
     }
 
-    pub fn with_human_session_issuer(
-        mut self,
-        cell: Arc<CellTokenAuthority>,
-    ) -> GatewayBuilder {
+    pub fn with_human_session_issuer(mut self, cell: Arc<CellTokenAuthority>) -> GatewayBuilder {
         self.human_session_issuer = Some(HumanSessionIssuer {
             cell,
             jtis: Arc::new(UlidMinter::new()),
@@ -406,9 +406,9 @@ fn bounded_auth_body(request: &EdgeRequest) -> Result<(), EdgeError> {
 fn map_device_authorization_error(error: DeviceAuthorizationError) -> EdgeError {
     match error {
         DeviceAuthorizationError::InvalidInput(message) => EdgeError::BadRequest(message.into()),
-        DeviceAuthorizationError::Store(_) => EdgeError::Unavailable(
-            "interactive CLI login state is temporarily unavailable".into(),
-        ),
+        DeviceAuthorizationError::Store(_) => {
+            EdgeError::Unavailable("interactive CLI login state is temporarily unavailable".into())
+        }
     }
 }
 
@@ -503,9 +503,7 @@ impl Gateway {
             (Method::Post, "/v1/auth/device/approval") => {
                 return self.approve_device_authorization(req)
             }
-            (Method::Post, "/v1/auth/device/token") => {
-                return self.claim_device_authorization(req)
-            }
+            (Method::Post, "/v1/auth/device/token") => return self.claim_device_authorization(req),
             (Method::Post, "/v1/auth/logout") => return Ok(self.logout(req)),
             (Method::Post, "/v1/auth/refresh") => return self.refresh(req),
             _ => {}
@@ -597,11 +595,10 @@ impl Gateway {
             htu: format!("{base}{}", req.path),
         });
         let authenticate = |credential: &Credential| match request_binding.as_ref() {
-            Some(binding) => self.authn.authenticate_identity_for_request(
-                credential,
-                path_tenant,
-                binding,
-            ),
+            Some(binding) => {
+                self.authn
+                    .authenticate_identity_for_request(credential, path_tenant, binding)
+            }
             None => self.authn.authenticate_identity(credential, path_tenant),
         };
         let scheme_of = || {
@@ -618,11 +615,13 @@ impl Gateway {
                 .map_err(|_| EdgeError::Unauthorized("authentication failed".into()));
         }
         if allow_basic {
-            if let Some(material) = req.basic_password() {
-                let cred = Credential {
-                    scheme: scheme_of(),
-                    material,
+            if let Some((username, material)) = req.basic_credentials() {
+                let scheme = match username.strip_prefix("myelin-") {
+                    Some(scheme) if machine_scheme::is_machine(scheme) => scheme.to_string(),
+                    Some(_) => return Err(EdgeError::Unauthorized("authentication failed".into())),
+                    None => scheme_of(),
                 };
+                let cred = Credential { scheme, material };
                 return authenticate(&cred)
                     .map_err(|_| EdgeError::Unauthorized("authentication failed".into()));
             }
@@ -704,7 +703,9 @@ impl Gateway {
             .ok_or_else(|| {
                 EdgeError::BadRequest("device authorization body missing `code_challenge`".into())
             })?;
-        let started = broker.begin(challenge).map_err(map_device_authorization_error)?;
+        let started = broker
+            .begin(challenge)
+            .map_err(map_device_authorization_error)?;
         Ok(no_store(EdgeResponse::json(
             201,
             &json!({
@@ -790,11 +791,15 @@ impl Gateway {
         let device_code = body
             .get("device_code")
             .and_then(|value| value.as_str())
-            .ok_or_else(|| EdgeError::BadRequest("device token body missing `device_code`".into()))?;
+            .ok_or_else(|| {
+                EdgeError::BadRequest("device token body missing `device_code`".into())
+            })?;
         let verifier = body
             .get("code_verifier")
             .and_then(|value| value.as_str())
-            .ok_or_else(|| EdgeError::BadRequest("device token body missing `code_verifier`".into()))?;
+            .ok_or_else(|| {
+                EdgeError::BadRequest("device token body missing `code_verifier`".into())
+            })?;
         match broker
             .claim(device_code, verifier)
             .map_err(map_device_authorization_error)?
@@ -868,8 +873,9 @@ impl Gateway {
                 .get("nonce")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| EdgeError::BadRequest("OIDC login body missing `nonce`".into()))?;
-            myelin_identity_service::oidc_login_material(raw_material, nonce)
-                .map_err(|_| EdgeError::BadRequest("OIDC login body has an invalid `nonce`".into()))?
+            myelin_identity_service::oidc_login_material(raw_material, nonce).map_err(|_| {
+                EdgeError::BadRequest("OIDC login body has an invalid `nonce`".into())
+            })?
         } else {
             raw_material.to_string()
         };
@@ -931,11 +937,7 @@ impl Gateway {
         Ok(EdgeResponse::json(200, &json!({ "refreshed": true })))
     }
 
-    fn match_route(
-        &self,
-        method: Method,
-        path: &str,
-    ) -> Result<Option<RouteMatch>, EdgeError> {
+    fn match_route(&self, method: Method, path: &str) -> Result<Option<RouteMatch>, EdgeError> {
         let parts: Vec<&str> = path
             .trim_matches('/')
             .split('/')
@@ -1184,10 +1186,7 @@ mod tests {
                 "GET",
                 "/v1/whoami",
                 "",
-                vec![(
-                    "Authorization".into(),
-                    format!("Bearer {material}"),
-                )],
+                vec![("Authorization".into(), format!("Bearer {material}"))],
                 vec![],
             )
         };
@@ -1547,7 +1546,10 @@ mod tests {
         let started = started.json_body().unwrap();
         let device_code = started["device_code"].as_str().unwrap();
         let user_code = started["user_code"].as_str().unwrap();
-        assert_eq!(started["verification_uri"], "https://myelin.example/cli/auth");
+        assert_eq!(
+            started["verification_uri"],
+            "https://myelin.example/cli/auth"
+        );
 
         let pending = gateway.handle(EdgeRequest::new(
             "POST",
@@ -1588,7 +1590,10 @@ mod tests {
         assert_eq!(claimed.status(), 200);
         let claimed = claimed.json_body().unwrap();
         let cli_token = claimed["access_token"].as_str().unwrap().to_string();
-        assert_ne!(cli_token, browser_token, "the browser token is never transferred");
+        assert_ne!(
+            cli_token, browser_token,
+            "the browser token is never transferred"
+        );
         assert_eq!(claimed["scheme"], "session");
         assert!(claimed["expires_at"].as_i64().unwrap() <= source_expiry);
 
@@ -1687,7 +1692,10 @@ mod tests {
             200,
             &json!({ "applied": { "action": "git.repo.create", "slug": "widgets" }, "created": false, "durable": true }),
         );
-        assert_eq!(repo_lifecycle_event("git.repo.create", &empty, &repeated), None);
+        assert_eq!(
+            repo_lifecycle_event("git.repo.create", &empty, &repeated),
+            None
+        );
     }
 
     #[test]
@@ -1742,10 +1750,7 @@ mod tests {
     }
 
     impl myelin_identity_service::CredentialVerifier for SuccessfulOidcVerifier {
-        fn verify(
-            &self,
-            credential: &Credential,
-        ) -> myelin_identity::Result<VerifiedAssertion> {
+        fn verify(&self, credential: &Credential) -> myelin_identity::Result<VerifiedAssertion> {
             assert_eq!(credential.scheme, myelin_identity_service::scheme::OIDC);
             Ok(VerifiedAssertion {
                 tenant: TenantId("acme".into()),
@@ -1971,6 +1976,18 @@ mod git_wire_basic_auth_tests {
         authority: &[&str],
         jti: &str,
     ) -> (Gateway, String) {
+        let human_session = purpose == myelin_identity_service::CredentialPurpose::HumanSession;
+        let credential_scheme = if human_session { "session" } else { "agent" };
+        let subject_key = if human_session {
+            "svc:founder"
+        } else {
+            "subj-1"
+        };
+        let principal_kind = if human_session {
+            PrincipalKind::Human
+        } else {
+            PrincipalKind::Service
+        };
         let cell = CellTokenAuthority::from_seed(&[3u8; 32], &[4u8; 32]).expect("cell");
         let store = PrincipalStore::new(Arc::new(KmsEngine::new()));
         let scope = TenantScope::from_verified_token(
@@ -1985,7 +2002,7 @@ mod git_wire_basic_auth_tests {
             .put_principal(
                 &scope,
                 PrincipalId("svc:founder".into()),
-                PrincipalKind::Service,
+                principal_kind,
                 DataRole::Controller,
                 PrincipalStatus::Active,
                 None,
@@ -1994,8 +2011,8 @@ mod git_wire_basic_auth_tests {
         store
             .link_credential(
                 &scope,
-                "agent",
-                "subj-1",
+                credential_scheme,
+                subject_key,
                 &PrincipalId("svc:founder".into()),
             )
             .expect("link credential");
@@ -2019,7 +2036,7 @@ mod git_wire_basic_auth_tests {
         let token = cell.mint(&CapabilityMintSpec {
             tenant: "acme".into(),
             region: REGION.into(),
-            subject_key: "subj-1".into(),
+            subject_key: subject_key.into(),
             jti: jti.into(),
             exp_unix: 9_999_999_999,
             authority: authority.iter().map(|grant| (*grant).into()).collect(),
@@ -2029,11 +2046,7 @@ mod git_wire_basic_auth_tests {
         });
         let gw = Gateway::builder(authn, human, Arc::new(AllowAll))
             .default_token_scheme("agent")
-            .sse_route(
-                "/v1/t/{tenant}/events",
-                "edge.events.subscribe",
-                "edge",
-            )
+            .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge")
             .route(
                 Method::Get,
                 "/v1/whoami",
@@ -2063,8 +2076,7 @@ mod git_wire_basic_auth_tests {
 
         match response {
             EdgeResponse::Sse {
-                expires_at_unix,
-                ..
+                expires_at_unix, ..
             } => assert_eq!(expires_at_unix, 9_999_999_999),
             EdgeResponse::Bytes { status, .. } => {
                 panic!("expected an authenticated SSE response, got HTTP {status}")
@@ -2096,6 +2108,40 @@ mod git_wire_basic_auth_tests {
             200,
             "the git wire accepts HTTP Basic where the password is the capability token"
         );
+    }
+
+    #[test]
+    fn basic_username_selects_the_browser_session_scheme_for_the_git_wire() {
+        let (gw, token) = seeded_gateway_with(
+            myelin_identity_service::CredentialPurpose::HumanSession,
+            &["repo.pull"],
+            "jti-basic-session",
+        );
+        let response = gw.handle(EdgeRequest::new(
+            "GET",
+            WIRE,
+            "",
+            vec![basic_header("myelin-session", &token)],
+            vec![],
+        ));
+        assert_eq!(
+            response.status(),
+            200,
+            "the CLI's browser session authenticates stock Git without a second token"
+        );
+    }
+
+    #[test]
+    fn an_unknown_myelin_basic_scheme_cannot_fall_back_to_the_default() {
+        let (gw, token) = seeded_gateway();
+        let response = gw.handle(EdgeRequest::new(
+            "GET",
+            WIRE,
+            "",
+            vec![basic_header("myelin-unknown", &token)],
+            vec![],
+        ));
+        assert_eq!(response.status(), 401);
     }
 
     #[test]

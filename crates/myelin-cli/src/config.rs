@@ -104,14 +104,11 @@ pub fn resolve_credential(
         );
     }
 
-    let stored_path = credential_path(getenv)?;
-    if let Some(encoded) = read_file(&stored_path) {
-        let stored = parse_stored_credential(&encoded, &stored_path)?;
-        return credential(
-            &stored.token,
-            supplied_scheme.as_deref().unwrap_or(&stored.scheme),
-            stored.edge_url.as_deref(),
-        );
+    if let Some(mut stored) = load_stored_credential(getenv, read_file)? {
+        if let Some(scheme) = supplied_scheme {
+            stored.scheme = credential(&stored.token, &scheme, stored.edge_url.as_deref())?.scheme;
+        }
+        return Ok(stored);
     }
 
     let legacy_path = legacy_token_path(getenv)?;
@@ -126,6 +123,20 @@ pub fn resolve_credential(
     Err(CliError::NotAuthenticated(
         "no token in --token, $MYELIN_TOKEN, or the stored config".into(),
     ))
+}
+
+/** Load only the modern credential file, without allowing flags, environment tokens, or legacy
+ * token files to silently change the credential/Edge pair. */
+pub fn load_stored_credential(
+    getenv: &dyn Fn(&str) -> Option<String>,
+    read_file: &dyn Fn(&Path) -> Option<String>,
+) -> Result<Option<Credential>, CliError> {
+    let path = credential_path(getenv)?;
+    let Some(encoded) = read_file(&path) else {
+        return Ok(None);
+    };
+    let stored = parse_stored_credential(&encoded, &path)?;
+    credential(&stored.token, &stored.scheme, stored.edge_url.as_deref()).map(Some)
 }
 
 pub fn store_credential(

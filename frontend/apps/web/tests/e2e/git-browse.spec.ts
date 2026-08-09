@@ -52,7 +52,8 @@ test.describe("GT-004 Git web UI — real browser", () => {
     const setup = page.getByTestId("git-setup");
     await setup.getByText("Set up Git").click();
     await expect(setup).toContainText("u_dev_operator@acme.noreply");
-    await expect(setup).toContainText("capability token as the password");
+    await expect(setup).toContainText("myelin auth configure-git");
+    await expect(setup).toContainText("Git never needs a pasted API key");
     const tree = page.getByTestId("repo-tree");
     await expect(tree.getByText("README.md", { exact: true })).toBeVisible();
     await expect(tree.getByText("crates/", { exact: true })).toBeVisible(); // a directory entry
