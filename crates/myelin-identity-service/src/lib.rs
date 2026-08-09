@@ -1,4 +1,5 @@
 pub mod agent_registry;
+pub mod agent_session;
 pub mod authenticate;
 pub mod capability_crypto;
 pub mod chat_fragment;
@@ -34,6 +35,10 @@ pub mod webauthn;
 pub use agent_registry::{
     agent_ref, validate_new_agent, AgentActivation, AgentRegistration, AgentRegistryError,
     NewAgent, PgAgentRegistry, EXTERNAL_MCP_RUNTIME, MAX_AGENT_NAME_BYTES, MAX_AGENT_TOOLS,
+};
+pub use agent_session::{
+    agent_run_ref, AgentSession, AgentSessionError, AgentSessionIssuer, AgentSessionRequest,
+    IssuedAgentSession, MAX_EXTERNAL_AGENT_RUN_TTL_SECS,
 };
 pub use authenticate::{
     scheme, AuthTelemetry, CredentialVerifier, HumanSsoAuthenticator, IdorCounters,

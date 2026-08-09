@@ -6,8 +6,9 @@ use myelin_agent::is_canonical_tool_name;
 use myelin_agent_service::{catalogue_cursor, tool_ref, PlatformToolCatalogue};
 use myelin_identity::PrincipalStatus;
 use myelin_identity_service::{
-    agent_ref, AgentActivation, AgentRegistration, AgentRegistryError, NewAgent, PgAgentRegistry,
-    EXTERNAL_MCP_RUNTIME,
+    agent_ref, agent_run_ref, AgentActivation, AgentRegistration, AgentRegistryError,
+    AgentSessionError, AgentSessionIssuer, AgentSessionRequest, IssuedAgentSession, NewAgent,
+    PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -25,23 +26,26 @@ const AGENT_BASELINE_GRANTS: &[&str] = &["agent.tools.read", "edge.identity.read
 #[derive(Clone)]
 struct AgentHttpApi {
     registry: PgAgentRegistry,
+    sessions: AgentSessionIssuer,
     catalogue: Arc<PlatformToolCatalogue>,
     runtime: Handle,
 }
 
 impl AgentHttpApi {
-    fn drive<F, T>(&self, future: F) -> Result<T, AgentRegistryError>
+    fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
-        F: Future<Output = Result<T, AgentRegistryError>>,
+        F: Future<Output = T>,
     {
         match Handle::try_current() {
             Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
+                Ok(tokio::task::block_in_place(|| {
+                    self.runtime.block_on(future)
+                }))
             }
-            Ok(_) => Err(AgentRegistryError::Storage(
+            Ok(_) => Err(EdgeError::Internal(
                 "agent HTTP requires the Edge multi-thread runtime".into(),
             )),
-            Err(_) => self.runtime.block_on(future),
+            Err(_) => Ok(self.runtime.block_on(future)),
         }
     }
 }
@@ -52,6 +56,10 @@ struct CreateAgentBody {
     name: String,
     tools: Vec<String>,
 }
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartAgentRunBody {}
 
 struct AgentCreateHandler {
     api: AgentHttpApi,
@@ -67,7 +75,7 @@ impl Handler for AgentCreateHandler {
         let proposal = activation_proposal(ctx, &self.api.catalogue, body, client_nonce)?;
         let activation = self
             .api
-            .drive(self.api.registry.create(ctx.principal, proposal))
+            .drive(self.api.registry.create(ctx.principal, proposal))?
             .map_err(map_registry_error)?;
         Ok(no_store(EdgeResponse::json(
             if activation.created { 201 } else { 200 },
@@ -80,6 +88,40 @@ struct AgentGetHandler {
     api: AgentHttpApi,
 }
 
+struct AgentRunCreateHandler {
+    api: AgentHttpApi,
+}
+
+impl Handler for AgentRunCreateHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let _: StartAgentRunBody = parse_agent_run_body(&ctx.request.body)?;
+        let agent_id = agent_param(ctx)?.to_string();
+        let client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let capability = ctx.identity.capability();
+        let issued = self
+            .api
+            .drive(self.api.sessions.start(
+                ctx.principal,
+                AgentSessionRequest {
+                    agent_id,
+                    client_nonce,
+                    trigger_credential_jti: capability.jti.clone(),
+                    trigger_expires_at_unix: capability.expires_at_unix,
+                    trigger_authority: capability.effective_authority.clone(),
+                    now: chrono::Utc::now(),
+                },
+            ))?
+            .map_err(map_session_error)?;
+        Ok(no_store(EdgeResponse::json(
+            if issued.created { 201 } else { 200 },
+            &agent_session_json(&ctx.principal.tenant.0, &self.api.catalogue, &issued),
+        )))
+    }
+}
+
 impl Handler for AgentGetHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
@@ -87,7 +129,7 @@ impl Handler for AgentGetHandler {
         let id = agent_param(ctx)?;
         let agent = self
             .api
-            .drive(self.api.registry.get(ctx.principal, id))
+            .drive(self.api.registry.get(ctx.principal, id))?
             .map_err(map_registry_error)?;
         Ok(no_store(EdgeResponse::json(
             200,
@@ -112,7 +154,7 @@ impl Handler for AgentListHandler {
                 self.api
                     .registry
                     .list(ctx.principal, cursor.as_deref(), limit as u32 + 1),
-            )
+            )?
             .map_err(map_registry_error)?;
         let has_more = agents.len() > limit;
         agents.truncate(limit);
@@ -133,6 +175,7 @@ impl Handler for AgentListHandler {
 pub fn register_agents(
     builder: GatewayBuilder,
     registry: PgAgentRegistry,
+    sessions: AgentSessionIssuer,
     runtime: Handle,
 ) -> GatewayBuilder {
     let catalogue = Arc::new(
@@ -141,6 +184,7 @@ pub fn register_agents(
     );
     let api = AgentHttpApi {
         registry,
+        sessions,
         catalogue,
         runtime,
     };
@@ -161,7 +205,13 @@ pub fn register_agents(
             Method::Get,
             "/v1/agents/{agent}",
             "identity.agent.view",
-            Arc::new(AgentGetHandler { api }),
+            Arc::new(AgentGetHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agents/{agent}/runs",
+            "identity.agent.run.create",
+            Arc::new(AgentRunCreateHandler { api }),
         )
 }
 
@@ -315,6 +365,38 @@ fn agent_json(tenant: &str, catalogue: &PlatformToolCatalogue, agent: &AgentRegi
     })
 }
 
+fn agent_session_json(
+    tenant: &str,
+    catalogue: &PlatformToolCatalogue,
+    issued: &IssuedAgentSession,
+) -> Value {
+    let session = &issued.session;
+    json!({
+        "run": {
+            "id": session.run_id,
+            "ref": agent_run_ref(tenant, &session.run_id).0,
+            "agent_id": session.agent_id,
+            "agent_ref": agent_ref(tenant, &session.agent_id).0,
+            "principal_id": session.agent_principal_id,
+            "trigger_actor": session.trigger_actor_id,
+            "selected_tools": session.selected_tools.iter()
+                .map(|cursor| selected_tool_json(tenant, catalogue, cursor))
+                .collect::<Vec<_>>(),
+            "effective_grants": session.effective_grants,
+            "state": session.state.token(),
+            "issued_at": session.issued_at,
+            "expires_at": session.expires_at,
+        },
+        "credential": {
+            "scheme": myelin_identity_service::machine_scheme::AGENT,
+            "token": issued.run_token.token,
+            "expires_at": session.expires_at,
+        },
+        "created": issued.created,
+        "durable": true,
+    })
+}
+
 fn selected_tool_json(tenant: &str, catalogue: &PlatformToolCatalogue, cursor: &str) -> Value {
     match catalogue
         .definitions()
@@ -351,6 +433,21 @@ fn parse_create_body(bytes: &[u8]) -> Result<CreateAgentBody, EdgeError> {
     }
     serde_json::from_slice(bytes)
         .map_err(|error| EdgeError::BadRequest(format!("invalid agent create body: {error}")))
+}
+
+fn parse_agent_run_body(bytes: &[u8]) -> Result<StartAgentRunBody, EdgeError> {
+    if bytes.len() > MAX_AGENT_JSON_BYTES {
+        return Err(EdgeError::PayloadTooLarge(format!(
+            "agent run request body exceeds {MAX_AGENT_JSON_BYTES} bytes"
+        )));
+    }
+    if bytes.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "empty request body (expected an empty JSON object)".into(),
+        ));
+    }
+    serde_json::from_slice(bytes)
+        .map_err(|error| EdgeError::BadRequest(format!("invalid agent run body: {error}")))
 }
 
 fn parse_page_query(query: &str) -> Result<(usize, Option<String>), EdgeError> {
@@ -430,6 +527,21 @@ fn map_registry_error(error: AgentRegistryError) -> EdgeError {
             EdgeError::Conflict(message)
         }
         AgentRegistryError::Storage(message) => EdgeError::Internal(message),
+    }
+}
+
+fn map_session_error(error: AgentSessionError) -> EdgeError {
+    match error {
+        AgentSessionError::BadInput(message) => EdgeError::BadRequest(message),
+        AgentSessionError::NotFound => EdgeError::NotFound("agent not found".into()),
+        AgentSessionError::Conflict(message) => EdgeError::Conflict(message),
+        AgentSessionError::Policy(_) => {
+            EdgeError::Forbidden("agent run delegation was refused".into())
+        }
+        AgentSessionError::Expired => EdgeError::Conflict(
+            "agent run has expired; start a new run with a new idempotency key".into(),
+        ),
+        AgentSessionError::Storage(message) => EdgeError::Internal(message),
     }
 }
 
@@ -529,6 +641,13 @@ mod tests {
         assert!(parse_page_query("limit=01").is_err());
         assert!(parse_page_query("limit=1&limit=2").is_err());
         assert!(parse_page_query("other=1").is_err());
+    }
+
+    #[test]
+    fn run_start_body_is_an_exact_empty_object() {
+        assert!(parse_agent_run_body(br#"{}"#).is_ok());
+        assert!(parse_agent_run_body(br#"{"ttl":3600}"#).is_err());
+        assert!(parse_agent_run_body(b"").is_err());
     }
 
     #[test]

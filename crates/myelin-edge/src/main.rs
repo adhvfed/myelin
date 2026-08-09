@@ -1106,6 +1106,15 @@ async fn serve(
     builder = register_agents(
         builder,
         myelin_identity_service::PgAgentRegistry::new(provider.clone()),
+        myelin_identity_service::AgentSessionIssuer::new(
+            provider.clone(),
+            check.clone(),
+            thresholds.fail_static.agent_token_ttl_secs,
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("edge: external agent session issuer refused to start: {error}");
+            std::process::exit(1);
+        }),
         handle.clone(),
     );
     builder = register_tools(builder);

@@ -50,6 +50,7 @@ pub mod elected_relay;
 pub mod events_durable;
 #[cfg(feature = "integration")]
 pub mod events_serve;
+pub mod external_agent_run_durable;
 pub mod hitl_gate_durable;
 pub mod identity_durable;
 pub mod kms_durable;
@@ -217,6 +218,11 @@ pub use events_durable::{
 };
 #[cfg(feature = "integration")]
 pub use events_serve::{EventsRuntime, EventsServeError, DEFAULT_DRAIN_BATCH};
+pub use external_agent_run_durable::{
+    external_agent_run_durable_migrations, ClaimedExternalAgentRun, DurableExternalAgentRun,
+    DurableExternalAgentRunBacking, ExternalAgentRunState, EXTERNAL_AGENT_RUN_MIGRATION,
+    EXTERNAL_AGENT_RUN_RLS_POLICY,
+};
 pub use identity_durable::{
     auth_replay_durable_migrations, identity_agent_durable_migrations, identity_durable_migrations,
     identity_project_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow,

@@ -457,6 +457,86 @@ describe("the CLI authentication journey", () => {
       expect(showAgent.stdout).toContain("no long-lived API key was created");
       expect(showAgent.stdout).not.toContain(systemTestConfig.token);
 
+      // Starting work exchanges that browser session for one minute of agent authority. A lost
+      // response is safe to retry: Edge returns the same run and credential, not a sibling run.
+      const defaultCredentialRef = defaultProfile.match(
+        /^credential_ref = "([A-Za-z0-9_-]{22})"$/m,
+      )?.[1];
+      expect(defaultCredentialRef).toBeTruthy();
+      const browserSession = await readFile(
+        resolve(configDirectory, ".test-credentials", defaultCredentialRef!),
+        "utf8",
+      );
+      const runRetryKey = `cli-agent-run-${randomUUID()}`;
+      const startRun = await systemClient.json(`/v1/agents/${activated.agent.id}/runs`, {
+        method: "POST",
+        body: {},
+        token: browserSession,
+        tokenScheme: "session",
+        idempotencyKey: runRetryKey,
+        expectedStatus: 201,
+      });
+      const running = startRun.body as unknown as {
+        run: {
+          id: string;
+          ref: string;
+          agent_id: string;
+          agent_ref: string;
+          principal_id: string;
+          trigger_actor: string;
+          selected_tools: Array<{ name: string; version: number; ref: string }>;
+          effective_grants: string[];
+          state: string;
+          issued_at: string;
+          expires_at: string;
+        };
+        credential: { scheme: string; token: string; expires_at: string };
+        created: boolean;
+        durable: boolean;
+      };
+      expect(startRun.headers.get("cache-control")).toBe("no-store");
+      expect(running).toMatchObject({
+        created: true,
+        durable: true,
+        run: {
+          agent_id: activated.agent.id,
+          agent_ref: activated.agent.ref,
+          principal_id: activated.agent.principal_id,
+          trigger_actor: systemTestConfig.principal,
+          selected_tools: [
+            { name: "ci.read_run", version: 1 },
+            { name: "git.open_pr", version: 1 },
+          ],
+          effective_grants: activated.agent.grants,
+          state: "ready",
+        },
+        credential: { scheme: "agent" },
+      });
+      expect(running.run.id).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+      );
+      expect(running.run.ref).toBe(
+        `myelin://${systemTestConfig.tenant}/agent/run/${running.run.id}`,
+      );
+      expect(running.credential.token).toMatch(/^v4\.public\./);
+      expect(running.credential.expires_at).toBe(running.run.expires_at);
+      expect(Date.parse(running.run.expires_at) - Date.parse(running.run.issued_at)).toBe(60_000);
+
+      const replayRun = await systemClient.json(`/v1/agents/${activated.agent.id}/runs`, {
+        method: "POST",
+        body: {},
+        token: browserSession,
+        tokenScheme: "session",
+        idempotencyKey: runRetryKey,
+        expectedStatus: 200,
+      });
+      expect(replayRun.body).toMatchObject({
+        created: false,
+        durable: true,
+        run: { id: running.run.id, ref: running.run.ref, state: "ready" },
+        credential: { scheme: "agent", token: running.credential.token },
+      });
+
       // A founder names the first project once. Its generated identity becomes context,
       // so show and subsequent work no longer carry an operator-provided UUID.
       const cliProjectName = uniqueName("Developer experience");
