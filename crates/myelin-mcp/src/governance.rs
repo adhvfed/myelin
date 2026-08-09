@@ -37,6 +37,38 @@ pub struct RunPrincipal {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GovernedRun {
+    pub scope: TenantScope,
+    pub agent_id: PrincipalId,
+    pub agent: Principal,
+    pub run_id: RunId,
+}
+
+impl GovernedRun {
+    fn from_minting_principal(principal: &RunPrincipal) -> Self {
+        Self {
+            scope: principal.scope.clone(),
+            agent_id: principal.agent_id.clone(),
+            agent: principal.agent.clone(),
+            run_id: principal.run_id.clone(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.agent_id != self.agent.principal_id {
+            return Err("governed run agent id does not match its authenticated principal".into());
+        }
+        if self.scope.tenant() != &self.agent.tenant || self.scope.region() != &self.agent.region {
+            return Err("governed run scope does not match its authenticated principal".into());
+        }
+        if self.run_id.0.is_empty() || self.run_id.0.len() > 255 {
+            return Err("governed run id must be non-empty and bounded".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallOutcome {
     Applied { event_id: String, jti: String },
     Gated { gate_id: String, jti: String },
@@ -246,7 +278,8 @@ pub trait GateApproverPolicy: Send + Sync {
 
 pub struct GovernedRouter {
     minter: RunTokenMinter,
-    principal: RunPrincipal,
+    principal: GovernedRun,
+    minting_principal: Option<RunPrincipal>,
     effect_api: Box<dyn EffectApi>,
     state: RefCell<RunState>,
     verdicts: RefCell<HitlVerdictStore>,
@@ -263,9 +296,14 @@ impl GovernedRouter {
         approver_policy: Arc<dyn GateApproverPolicy>,
         audit_sink: Arc<dyn GovernanceAudit>,
     ) -> GovernedRouter {
+        let governed_run = GovernedRun::from_minting_principal(&principal);
+        governed_run
+            .validate()
+            .expect("an internally minted run must have one coherent principal");
         GovernedRouter {
             minter,
-            principal,
+            principal: governed_run,
+            minting_principal: Some(principal),
             effect_api,
             state: RefCell::new(RunState::default()),
             verdicts: RefCell::new(verdicts),
@@ -274,11 +312,50 @@ impl GovernedRouter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_issued_run(
+        minter: RunTokenMinter,
+        principal: GovernedRun,
+        run_token: RunToken,
+        effective_grants: impl IntoIterator<Item = String>,
+        effect_api: Box<dyn EffectApi>,
+        verdicts: HitlVerdictStore,
+        approver_policy: Arc<dyn GateApproverPolicy>,
+        audit_sink: Arc<dyn GovernanceAudit>,
+    ) -> Result<GovernedRouter, String> {
+        principal.validate()?;
+        if run_token.token.is_empty() || run_token.jti.is_empty() {
+            return Err("issued governed run requires a non-empty bearer and token id".into());
+        }
+        let effective_grants = effective_grants.into_iter().collect::<BTreeSet<_>>();
+        if effective_grants.is_empty()
+            || effective_grants.iter().any(|grant| {
+                grant.is_empty() || grant.len() > 255 || grant.contains(char::is_whitespace)
+            })
+        {
+            return Err("issued governed run requires bounded effective grants".into());
+        }
+        Ok(GovernedRouter {
+            minter,
+            principal,
+            minting_principal: None,
+            effect_api,
+            state: RefCell::new(RunState {
+                token: Some(run_token),
+                effective_grants,
+                ..RunState::default()
+            }),
+            verdicts: RefCell::new(verdicts),
+            approver_policy,
+            audit_sink,
+        })
+    }
+
     pub fn minter(&self) -> &RunTokenMinter {
         &self.minter
     }
 
-    pub fn principal(&self) -> &RunPrincipal {
+    pub fn principal(&self) -> &GovernedRun {
         &self.principal
     }
 
@@ -327,7 +404,10 @@ impl GovernedRouter {
         if let Some(t) = self.state.borrow().token.clone() {
             return Ok(t);
         }
-        let p = &self.principal;
+        let p = self
+            .minting_principal
+            .as_ref()
+            .ok_or_else(|| "issued run token is unavailable".to_string())?;
         let now_unix = chrono::DateTime::parse_from_rfc3339(&now.0)
             .map_err(|_| "current time is not a valid RFC3339 instant".to_string())?
             .timestamp();

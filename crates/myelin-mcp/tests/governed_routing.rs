@@ -392,6 +392,56 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
 }
 
 #[test]
+fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection() {
+    let minting_router = ci_read_router(&["repo.push", "run.view"]);
+    minting_router
+        .permitted_tool_names(&ToolRegistry::with_git_and_ci_reads().unwrap(), &now())
+        .unwrap();
+    let issued_token = minting_router.current_token().unwrap();
+    let router = GovernedRouter::with_issued_run(
+        minting_router.minter().clone(),
+        minting_router.principal().clone(),
+        issued_token.clone(),
+        ["repo.push".into(), "run.view".into()],
+        Box::new(SkeletonEffectApi::new()),
+        HitlVerdictStore::new(),
+        Arc::new(TestApprovers(vec![PrincipalId("human:operator".into())])),
+        Arc::new(OutboxGovernanceAudit::new(
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()),
+        )),
+    )
+    .unwrap();
+    assert_eq!(
+        router.current_token(),
+        Some(issued_token),
+        "Edge's authenticated bearer is installed before the first MCP frame"
+    );
+
+    let selected =
+        ToolRegistry::for_cursors(&["ci.read_run.v1".into(), "git.open_pr.v1".into()]).unwrap();
+    let server = McpServer::with_router_reads_and_clock(
+        selected,
+        router,
+        Arc::new(RecordingReadExecutor {
+            calls: AtomicUsize::new(0),
+        }),
+        Arc::new(now),
+    );
+    let listed = drive(
+        &server,
+        &[r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#],
+    );
+    let names = listed[0]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["ci.read_run", "git.open_pr"]);
+}
+
+#[test]
 fn tools_list_refuses_an_expired_trigger_before_disclosing_the_catalogue() {
     let grants = ["repo.push"];
     let router = governed_router_with_trigger(
