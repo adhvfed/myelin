@@ -49,7 +49,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::migrations::{ISSUE_CHANGE_LOG_TABLE, ISSUE_RELATION_TABLE, ISSUE_TABLE};
+    use crate::migrations::{
+        IMPORT_MAP_TABLE, ISSUE_CHANGE_LOG_TABLE, ISSUE_RELATION_TABLE, ISSUE_TABLE,
+    };
     use myelin_substrate::{Liveness, Surface};
 
     #[test]
@@ -135,6 +137,7 @@ mod tests {
             "cycle_membership",
             "milestone",
             "prefix_counter",
+            "import_map",
             "consumer_dedup",
             "outbox",
         ] {
@@ -147,7 +150,12 @@ mod tests {
             spec.consumers.is_empty(),
             "no consumers at the shell (the rollup/SLA/trigger/feeder consumers are the per-band follow-ons)"
         );
-        for t in [ISSUE_TABLE, ISSUE_RELATION_TABLE, ISSUE_CHANGE_LOG_TABLE] {
+        for t in [
+            ISSUE_TABLE,
+            ISSUE_RELATION_TABLE,
+            ISSUE_CHANGE_LOG_TABLE,
+            IMPORT_MAP_TABLE,
+        ] {
             assert!(spec.hot_tables.is_hot(t), "`{t}` is declared hot");
         }
         let deps: Vec<&str> = spec.critical.deps().iter().map(|d| d.0.as_str()).collect();

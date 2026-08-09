@@ -14,6 +14,7 @@ pub const CONSUMER_DEDUP_TABLE: &str = "consumer_dedup";
 pub const OUTBOX_TABLE: &str = "outbox";
 pub const ISSUE_AUTHZ_BINDING_TABLE: &str = "issue_authz_binding";
 pub const ISSUE_AUTHZ_VISIBLE_TABLE: &str = "issue_authz_visible";
+pub const IMPORT_MAP_TABLE: &str = "import_map";
 
 pub const CREATE_ISSUE_AUTHZ_VISIBLE_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS issue_authz_visible (
@@ -284,6 +285,21 @@ CREATE TABLE IF NOT EXISTS prefix_counter (
   PRIMARY KEY (tenant_id, prefix)
 )";
 
+pub const CREATE_IMPORT_MAP_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS import_map (
+  tenant_id   text NOT NULL,
+  region      text NOT NULL,
+  import_job  uuid NOT NULL,
+  source      text NOT NULL CHECK (source IN ('jira','linear','github','csv','canonical')),
+  source_id   text NOT NULL CHECK (octet_length(source_id) BETWEEN 1 AND 512),
+  myelin_kind text NOT NULL CHECK (myelin_kind IN ('issue','cycle','milestone','relation','user')),
+  myelin_id   uuid,
+  status      text NOT NULL CHECK (status IN ('pending','created','wired','lossy','dropped')),
+  loss_note   text,
+  PRIMARY KEY (tenant_id, import_job, source, source_id),
+  CHECK (status NOT IN ('lossy','dropped') OR loss_note IS NOT NULL)
+)";
+
 pub const CREATE_CONSUMER_DEDUP_DDL: &str = CONSUMER_DEDUP_MIGRATION;
 
 pub fn make_tenant_scoped_ddl(table: &str) -> String {
@@ -426,11 +442,29 @@ pub fn issues_migrations() -> Migrations {
         NARROW_ISSUE_AUTHZ_INVALIDATION_TRIGGER_DDL,
         ISSUE_TABLE,
     ));
+    let import_map_ddl = Box::leak(
+        format!(
+            "{};\n{};",
+            CREATE_IMPORT_MAP_DDL,
+            make_tenant_scoped_ddl(IMPORT_MAP_TABLE)
+        )
+        .into_boxed_str(),
+    );
+    migrations.push(Migration::plain_on(
+        "iss_0023_import_map",
+        import_map_ddl,
+        IMPORT_MAP_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
 pub fn issues_hot_tables() -> HotTables {
-    HotTables::declare([ISSUE_TABLE, ISSUE_RELATION_TABLE, ISSUE_CHANGE_LOG_TABLE])
+    HotTables::declare([
+        ISSUE_TABLE,
+        ISSUE_RELATION_TABLE,
+        ISSUE_CHANGE_LOG_TABLE,
+        IMPORT_MAP_TABLE,
+    ])
 }
 
 #[cfg(test)]
@@ -556,8 +590,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            28,
-            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 5 authz migrations"
+            29,
+            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 5 authz migrations + the import map"
         );
         for m in &migrations.0 {
             assert!(
@@ -595,7 +629,7 @@ mod tests {
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
             issues.0.last().map(|migration| migration.id),
-            Some("iss_0022_narrow_issue_authz_invalidation")
+            Some("iss_0023_import_map")
         );
         for invariant in [
             "CREATE INDEX CONCURRENTLY",
@@ -620,6 +654,29 @@ mod tests {
     }
 
     #[test]
+    fn the_import_map_is_durable_scoped_and_state_constrained() {
+        let migration = issues_migrations()
+            .0
+            .into_iter()
+            .find(|migration| migration.id == "iss_0023_import_map")
+            .expect("the import map migration");
+        assert_eq!(migration.table, Some(IMPORT_MAP_TABLE));
+        for invariant in [
+            "PRIMARY KEY (tenant_id, import_job, source, source_id)",
+            "source IN ('jira','linear','github','csv','canonical')",
+            "status IN ('pending','created','wired','lossy','dropped')",
+            "status NOT IN ('lossy','dropped') OR loss_note IS NOT NULL",
+            "myelin_make_tenant_scoped('import_map')",
+        ] {
+            assert!(
+                migration.ddl.contains(invariant),
+                "the import map pins `{invariant}`"
+            );
+        }
+        assert!(issues_hot_tables().is_hot(IMPORT_MAP_TABLE));
+    }
+
+    #[test]
     fn the_runner_admits_the_whole_set_idempotently() {
         use myelin_substrate::MigrationRunner;
         let migrations = issues_migrations();
@@ -630,7 +687,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            28,
+            29,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -645,7 +702,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            28,
+            29,
             "the re-apply admits every migration again"
         );
     }
