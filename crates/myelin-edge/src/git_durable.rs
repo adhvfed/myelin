@@ -3675,6 +3675,11 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::Git(m) if m == "pull request list cursor visible set changed" => {
             EdgeError::Conflict("pull request list cursor is stale; restart pagination".into())
         }
+        DurableError::Git(m) if m == "PR operation id conflicts with durable state" => {
+            EdgeError::Conflict(
+                "idempotency key is already bound to a different pull request operation".into(),
+            )
+        }
         DurableError::Git(m) if m.starts_with("browse response limit exceeded:") => {
             EdgeError::PayloadTooLarge(
                 "repository view exceeds the interactive browse limit".into(),
@@ -3726,6 +3731,25 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::CasMismatch { .. } => EdgeError::Conflict(e.to_string()),
         DurableError::Forbidden(m) => EdgeError::Forbidden(m),
         other => EdgeError::Internal(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod durable_error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn reused_pr_operation_id_maps_to_a_public_conflict() {
+        let error = map_durable_err(DurableError::Git(
+            "PR operation id conflicts with durable state".into(),
+        ));
+
+        assert_eq!(error.status(), 409);
+        assert_eq!(error.code(), "conflict");
+        assert_eq!(
+            error.client_message(),
+            "idempotency key is already bound to a different pull request operation"
+        );
     }
 }
 

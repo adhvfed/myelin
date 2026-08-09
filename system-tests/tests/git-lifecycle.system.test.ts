@@ -119,22 +119,41 @@ describe.sequential("Git engineering lifecycle", () => {
     )).commitOid;
     expect(featureCommitOid).toMatch(oid);
 
+    const openBody = {
+      title: "Ship the system-tested lifecycle",
+      base_ref: "refs/heads/main",
+      head_ref: "refs/heads/feature/system-lifecycle",
+      head_oid: featureCommitOid,
+      reviewers: [systemTestConfig.reviewerPrincipal],
+    };
+    const openIdempotencyKey = `open-pr-${randomUUID()}`;
     const opened = await systemClient.json(`${project.path}/prs`, {
       method: "POST",
-      body: {
-        title: "Ship the system-tested lifecycle",
-        base_ref: "refs/heads/main",
-        head_ref: "refs/heads/feature/system-lifecycle",
-        head_oid: featureCommitOid,
-        reviewers: [systemTestConfig.reviewerPrincipal],
-      },
+      body: openBody,
       expectedStatus: 201,
+      idempotencyKey: openIdempotencyKey,
     });
     const applied = record(opened.body.applied, "open PR receipt.applied");
     const pullRequest = record(applied.pr, "open PR receipt.applied.pr");
     pullRequestNumber = Number(pullRequest.number);
     expect(pullRequestNumber).toBeGreaterThan(0);
     expect(opened.body).toMatchObject({ durable: true, applied: { action: "git.pr.open" } });
+
+    const replay = await systemClient.json(`${project.path}/prs`, {
+      method: "POST",
+      body: openBody,
+      expectedStatus: 201,
+      idempotencyKey: openIdempotencyKey,
+    });
+    expect(replay.body).toEqual(opened.body);
+
+    const conflictingReplay = await systemClient.json(`${project.path}/prs`, {
+      method: "POST",
+      body: { ...openBody, title: "A different operation under the same key" },
+      expectedStatus: 409,
+      idempotencyKey: openIdempotencyKey,
+    });
+    expect(conflictingReplay.body).toMatchObject({ error: { code: "conflict" } });
 
     const base = `${project.path}/prs/${pullRequestNumber}`;
     const subject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`;
@@ -149,6 +168,7 @@ describe.sequential("Git engineering lifecycle", () => {
       class: "direct",
       subsystem: "git",
       subject,
+      coalesce_count: 1,
       state: "unread",
     });
 
