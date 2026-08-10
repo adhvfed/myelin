@@ -720,6 +720,7 @@ cdc = [
     "crates/myelin-chat/tests/cdc_7_2_10_1_chat_read_state.rs",
     "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
     "crates/myelin-chat/tests/cdc_4_8_10_1_chat_mention_shred_restrict.rs",
+    "crates/myelin-storage/tests/integration_agent_trace_erasure.rs",
 ]
 
 [[contract]]
@@ -843,6 +844,7 @@ cdc = [
     "crates/myelin-issues/tests/cdc_4_8_11_4_issues_pseudonym_dek.rs",
     "crates/myelin-chat/tests/cdc_11_4_10_1_chat_body_dek_holder.rs",
     "crates/myelin-chat/tests/cdc_10_1_11_4_10_4_chat_erase_cascade.rs",
+    "crates/myelin-storage/tests/integration_agent_trace_erasure.rs",
 ]
 
 [[contract]]

@@ -195,6 +195,10 @@ with approve and reject actions in the web app and a copyable CLI command; eithe
 durable and retry-safe, completes the inbox item, and remains visible in automation history. No
 third-party integration key is created or copied into the agent.
 
+The durable trace store is also the H17 personal-data holder. Subject restriction blocks new trace
+processing before encryption; subject erasure records a durable suppression marker, deletes every
+live trace row, and destroys the subject key so ciphertext in backups remains unrecoverable.
+
 Sensitive effects such as `git.merge` have a second, narrower approval boundary. The agent may
 reason up to the effect, but Myelin withholds the mutation, parks the durable workflow without
 holding a model runtime, and places the exact pull request in every eligible human approver's

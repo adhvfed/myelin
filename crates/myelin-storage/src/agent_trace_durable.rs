@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use myelin_gdpr::ErasureMethod;
+use myelin_gdpr::{
+    DsrError, EraseReceipt, EraseScope, ErasureMethod, LocateReport, Patch, PersonalDataHolder,
+    PortableBundle, Receipt, RectifyReceipt, RestrictReceipt, Result as DsrResult, SubjectRef,
+};
 use myelin_refs::ArtifactRef;
 use myelin_tenancy::{Region, TenantId};
 use serde::{Deserialize, Serialize};
@@ -9,7 +12,7 @@ use serde_json::Value;
 use sqlx::Row;
 
 use crate::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
-use crate::kms::{DekId, KeyClass, KmsEngine, PiiKeyRef, NONCE_LEN};
+use crate::kms::{DekId, KekId, KeyClass, KmsEngine, PiiKeyRef, NONCE_LEN};
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
@@ -103,6 +106,24 @@ CREATE POLICY myelin_tenant_isolation ON knowledge_agent_trace_subject_erasure
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_TRACE_SUBJECT_RESTRICTION_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS knowledge_agent_trace_subject_restriction (
+    tenant_id     text        NOT NULL,
+    region        text        NOT NULL,
+    subject_token text        NOT NULL CHECK (length(subject_token) = 64),
+    restricted_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, region, subject_token)
+);
+ALTER TABLE knowledge_agent_trace_subject_restriction ENABLE ROW LEVEL SECURITY;
+ALTER TABLE knowledge_agent_trace_subject_restriction FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON knowledge_agent_trace_subject_restriction;
+CREATE POLICY myelin_tenant_isolation ON knowledge_agent_trace_subject_restriction
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+"#;
+
 pub fn agent_trace_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0098_knowledge_agent_trace", AGENT_TRACE_MIGRATION),
@@ -117,6 +138,10 @@ pub fn agent_trace_durable_migrations() -> Migrations {
         Migration::plain(
             "0101_knowledge_agent_trace_subject_erasure",
             AGENT_TRACE_SUBJECT_ERASURE_MIGRATION,
+        ),
+        Migration::plain(
+            "0102_knowledge_agent_trace_subject_restriction",
+            AGENT_TRACE_SUBJECT_RESTRICTION_MIGRATION,
         ),
     ])
 }
@@ -247,6 +272,7 @@ pub enum AgentTraceError {
     Invalid(&'static str),
     Conflict,
     Erased,
+    Restricted,
     Storage(String),
 }
 
@@ -257,6 +283,9 @@ impl core::fmt::Display for AgentTraceError {
             Self::Conflict => formatter
                 .write_str("agent run already has a different immutable trace; replay refused"),
             Self::Erased => formatter.write_str("agent run trace was erased; recreation refused"),
+            Self::Restricted => {
+                formatter.write_str("agent trace processing is restricted for this subject")
+            }
             Self::Storage(error) => write!(formatter, "agent trace storage failed: {error}"),
         }
     }
@@ -326,6 +355,13 @@ impl DurableAgentTraceStore {
             provider,
             runtime,
             kms,
+        }
+    }
+
+    fn drive<F: std::future::Future>(&self, future: F) -> F::Output {
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
+            Err(_) => self.runtime.block_on(future),
         }
     }
 
@@ -479,6 +515,53 @@ impl DurableAgentTraceStore {
         })
     }
 
+    pub async fn set_subject_restriction(
+        &self,
+        tenant: &str,
+        requested_by: &str,
+        restricted: bool,
+    ) -> Result<bool, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let token = subject_token(&tenant, &region, requested_by);
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |connection| {
+                Box::pin(async move {
+                    lock_subject(connection, &tenant, &region, &token).await?;
+                    let changed = if restricted {
+                        sqlx::query(
+                            "INSERT INTO knowledge_agent_trace_subject_restriction \
+                               (tenant_id, region, subject_token) VALUES ($1, $2, $3) \
+                             ON CONFLICT DO NOTHING",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&token)
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(trace_query)?
+                        .rows_affected()
+                            == 1
+                    } else {
+                        sqlx::query(
+                            "DELETE FROM knowledge_agent_trace_subject_restriction \
+                              WHERE tenant_id = $1 AND region = $2 AND subject_token = $3",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&token)
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(trace_query)?
+                        .rows_affected()
+                            == 1
+                    };
+                    Ok(changed)
+                })
+            })
+            .await
+    }
+
     fn write_blocking(
         &self,
         tenant: &TenantId,
@@ -504,11 +587,9 @@ impl DurableAgentTraceStore {
                 .await
             })
         });
-        let result = match tokio::runtime::Handle::try_current() {
-            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
-            Err(_) => self.runtime.block_on(future),
-        }
-        .map_err(|error| AgentTraceError::Storage(error.to_string()))??;
+        let result = self
+            .drive(future)
+            .map_err(|error| AgentTraceError::Storage(error.to_string()))??;
         Ok(AgentTraceReceipt {
             artifact_ref,
             replayed: result,
@@ -524,6 +605,134 @@ impl AgentTraceWriter for DurableAgentTraceStore {
     ) -> Result<AgentTraceReceipt, AgentTraceError> {
         self.write_blocking(tenant, trace)
     }
+}
+
+impl PersonalDataHolder for DurableAgentTraceStore {
+    fn locate(&self, subject: &SubjectRef, tenant: TenantId) -> DsrResult<LocateReport> {
+        ensure_subject_tenant(subject, &tenant)?;
+        let subject_id = &subject.principal.principal_id.0;
+        let count = self
+            .drive(self.count_for_subject(&tenant.0, subject_id))
+            .map_err(|error| DsrError(error.to_string()))?;
+        Ok(LocateReport {
+            receipt: Receipt::content_addressed(
+                "locate",
+                "agent_fabric_trace",
+                subject_id,
+                &tenant.0,
+                &format!("located:{count}:subject-keyed-agent-traces"),
+                None,
+                0,
+            ),
+        })
+    }
+
+    fn export(&self, subject: &SubjectRef, tenant: TenantId) -> DsrResult<PortableBundle> {
+        ensure_subject_tenant(subject, &tenant)?;
+        let subject_id = &subject.principal.principal_id.0;
+        let count = self
+            .drive(self.count_for_subject(&tenant.0, subject_id))
+            .map_err(|error| DsrError(error.to_string()))?;
+        Ok(PortableBundle {
+            receipt: Receipt::content_addressed(
+                "export",
+                "agent_fabric_trace",
+                subject_id,
+                &tenant.0,
+                &format!("exported:{count}:content-addressed-agent-traces"),
+                None,
+                0,
+            ),
+        })
+    }
+
+    fn rectify(&self, subject: &SubjectRef, _patch: Patch) -> DsrResult<RectifyReceipt> {
+        Ok(RectifyReceipt {
+            receipt: Receipt::content_addressed(
+                "rectify",
+                "agent_fabric_trace",
+                &subject.principal.principal_id.0,
+                &subject.principal.tenant.0,
+                "immutable trace: rectify by writing a corrected content-addressed source",
+                None,
+                0,
+            ),
+        })
+    }
+
+    fn restrict(&self, subject: &SubjectRef, on: bool) -> DsrResult<RestrictReceipt> {
+        let subject_id = &subject.principal.principal_id.0;
+        let tenant = &subject.principal.tenant;
+        let changed = self
+            .drive(self.set_subject_restriction(&tenant.0, subject_id, on))
+            .map_err(|error| DsrError(error.to_string()))?;
+        Ok(RestrictReceipt {
+            receipt: Receipt::content_addressed(
+                "restrict",
+                "agent_fabric_trace",
+                subject_id,
+                &tenant.0,
+                &format!("trace-processing-restricted:{on};changed:{changed}"),
+                None,
+                0,
+            ),
+        })
+    }
+
+    fn erase(&self, scope: EraseScope) -> DsrResult<EraseReceipt> {
+        match scope {
+            EraseScope::Subject { subject, tenant } => {
+                ensure_subject_tenant(&subject, &tenant)?;
+                let subject_id = subject.principal.principal_id.0;
+                let erased = self
+                    .drive(self.erase_for_subject(&tenant.0, &subject_id))
+                    .map_err(|error| DsrError(error.to_string()))?;
+                if !erased.key_unrecoverable {
+                    return Err(DsrError(
+                        "agent trace subject key still resolves after erasure".into(),
+                    ));
+                }
+                Ok(EraseReceipt {
+                    receipt: Receipt::content_addressed(
+                        "erase",
+                        "agent_fabric_trace",
+                        &subject_id,
+                        &tenant.0,
+                        &format!(
+                            "crypto-shredded:{}:traces;subject-marker:durable",
+                            erased.traces_erased
+                        ),
+                        Some(0),
+                        0,
+                    ),
+                })
+            }
+            EraseScope::Tenant(tenant) => {
+                let region = Region(self.provider.config().region.clone());
+                self.kms.destroy_kek(&KekId::new(tenant.clone(), region));
+                Ok(EraseReceipt {
+                    receipt: Receipt::content_addressed(
+                        "erase",
+                        "agent_fabric_trace",
+                        "",
+                        &tenant.0,
+                        "tenant KEK destroyed; agent traces are unrecoverable with tenant offboarding",
+                        Some(0),
+                        0,
+                    ),
+                })
+            }
+        }
+    }
+}
+
+fn ensure_subject_tenant(subject: &SubjectRef, tenant: &TenantId) -> DsrResult<()> {
+    if &subject.principal.tenant != tenant {
+        return Err(DsrError(
+            "agent trace DSR tenant does not match the data subject".into(),
+        ));
+    }
+    Ok(())
 }
 
 async fn write_on_connection(
@@ -548,6 +757,19 @@ async fn write_on_connection(
     .map_err(trace_query)?;
     if subject_erased {
         return Ok(Err(AgentTraceError::Erased));
+    }
+    let subject_restricted = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_restriction \
+          WHERE tenant_id = $1 AND region = $2 AND subject_token = $3)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&token)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    if subject_restricted {
+        return Ok(Err(AgentTraceError::Restricted));
     }
     lock_trace(connection, tenant, region, &trace.run_id).await?;
     let erased = sqlx::query_scalar::<_, bool>(
@@ -1045,5 +1267,7 @@ mod tests {
         assert!(AGENT_TRACE_ENCRYPTION_MIGRATION.contains("answer IS NULL AND trace_body IS NULL"));
         assert!(AGENT_TRACE_SUBJECT_ERASURE_MIGRATION.contains("subject_token text"));
         assert!(AGENT_TRACE_SUBJECT_ERASURE_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
+        assert!(AGENT_TRACE_SUBJECT_RESTRICTION_MIGRATION.contains("restricted_at"));
+        assert!(AGENT_TRACE_SUBJECT_RESTRICTION_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
     }
 }

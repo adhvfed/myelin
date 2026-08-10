@@ -1,4 +1,6 @@
 use myelin_config::MyelinConfig;
+use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef};
+use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::{
     all_durable_migrations, AgentTraceError, AgentTraceWrite, AgentTraceWriter,
     DurableAgentTraceStore, DurableKmsBacking, HotTables, SealKey, SubstrateProvider,
@@ -163,6 +165,25 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         tokio::runtime::Handle::current(),
         kms.clone(),
     );
+    let subject = SubjectRef::new(Principal::stub(
+        PrincipalId("founder".into()),
+        PrincipalKind::Human,
+        tenant.clone(),
+    ));
+    let holder: &dyn PersonalDataHolder = &store;
+    holder
+        .restrict(&subject, true)
+        .expect("restriction reaches the durable trace holder");
+    assert_eq!(
+        store
+            .write(&tenant, trace("00000000-0000-4000-8000-000000000000"))
+            .unwrap_err(),
+        AgentTraceError::Restricted,
+        "restricted subjects cannot enter agent trace processing"
+    );
+    holder
+        .restrict(&subject, false)
+        .expect("lifting restriction reaches the durable trace holder");
     for run_id in [
         "11111111-1111-4111-8111-111111111111",
         "22222222-2222-4222-8222-222222222222",
@@ -175,6 +196,14 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         store.count_for_subject(&tenant.0, "founder").await.unwrap(),
         2,
         "both final answers are discoverable through the subject locator"
+    );
+    assert_eq!(
+        holder
+            .locate(&subject, tenant.clone())
+            .expect("the DSR holder locates durable traces")
+            .receipt
+            .operation,
+        "locate"
     );
 
     let erased = store
@@ -207,6 +236,17 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
     assert!(replay.already_erased);
     assert_eq!(replay.traces_erased, 0);
     assert!(replay.key_unrecoverable);
+    assert_eq!(
+        holder
+            .erase(EraseScope::Subject {
+                subject,
+                tenant: tenant.clone(),
+            })
+            .expect("the PersonalDataHolder seam reaches the same idempotent erasure")
+            .receipt
+            .operation,
+        "erase"
+    );
 
     let cleanup_tenant = tenant.0.clone();
     provider
@@ -215,6 +255,7 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
                 for statement in [
                     "DELETE FROM knowledge_agent_trace_erasure WHERE tenant_id = $1",
                     "DELETE FROM knowledge_agent_trace_subject_erasure WHERE tenant_id = $1",
+                    "DELETE FROM knowledge_agent_trace_subject_restriction WHERE tenant_id = $1",
                 ] {
                     sqlx::query(statement)
                         .bind(&cleanup_tenant)
