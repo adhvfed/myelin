@@ -6,7 +6,10 @@ mod durable_tool;
 pub mod supervision;
 mod tool_broker;
 
-pub use activity_executor::{AgentHostActivityExecutor, HostedModelFactory, LunaModelFactory};
+pub use activity_executor::{
+    AgentHostActivityExecutor, DeadlineClock, HostedModelFactory, LunaModelFactory,
+    SystemDeadlineClock,
+};
 pub use tool_broker::EdgeMcpToolExecutor;
 
 pub mod git_read_tool;

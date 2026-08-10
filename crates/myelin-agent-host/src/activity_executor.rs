@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use myelin_agent::{ToolCall, ToolDef, ToolName, ToolResult, ToolSchema};
 use myelin_agent_model::{LunaClient, ModelClient, ModelError};
@@ -46,6 +47,24 @@ pub trait HostedModelFactory: Send + Sync {
     fn client(&self) -> Result<Box<dyn ModelClient + Send + Sync>, ModelError>;
 }
 
+/// Supplies live time for security decisions made outside deterministic workflow replay.
+pub trait DeadlineClock: Send + Sync {
+    fn now_unix_secs(&self) -> Result<i64, String>;
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SystemDeadlineClock;
+
+impl DeadlineClock for SystemDeadlineClock {
+    fn now_unix_secs(&self) -> Result<i64, String> {
+        let seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| "system clock is before the Unix epoch".to_string())?
+            .as_secs();
+        i64::try_from(seconds).map_err(|_| "system clock exceeds the supported range".to_string())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LunaModelFactory;
 
@@ -64,6 +83,7 @@ pub struct AgentHostActivityExecutor {
     runtime: tokio::runtime::Handle,
     models: Arc<dyn HostedModelFactory>,
     tools: Arc<dyn ToolExecutor>,
+    deadline_clock: Arc<dyn DeadlineClock>,
 }
 
 impl AgentHostActivityExecutor {
@@ -86,11 +106,17 @@ impl AgentHostActivityExecutor {
             runtime,
             models,
             tools: Arc::new(HostedToolBrokerUnavailable),
+            deadline_clock: Arc::new(SystemDeadlineClock),
         }
     }
 
     pub fn with_tool_executor(mut self, tools: Arc<dyn ToolExecutor>) -> Self {
         self.tools = tools;
+        self
+    }
+
+    pub fn with_deadline_clock(mut self, clock: Arc<dyn DeadlineClock>) -> Self {
+        self.deadline_clock = clock;
         self
     }
 
@@ -228,7 +254,7 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
         input: &HostedAgentWorkflowInput,
         activity_key: &str,
         attempt: u32,
-        now_secs: i64,
+        _workflow_time_secs: i64,
     ) -> Result<HostedAgentActivityOutcome, String> {
         if !activity_key.starts_with(&format!("{}/", input.run_id)) {
             return Err("hosted activity key belongs to a different run".into());
@@ -250,6 +276,7 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
         }
         let (catalogue, advertised) = Self::selected_tools(&input.selected_tools)?;
         let model = self.models.client().map_err(|error| error.to_string())?;
+        let deadline_now_secs = self.deadline_clock.now_unix_secs()?;
         let mut wiring = RunSubstrateWiring {
             ledger: &mut ledger,
             outbox: &self.outbox,
@@ -258,7 +285,7 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
         };
         match self.host.run(
             &input
-                .llm_task(now_secs)
+                .llm_task(deadline_now_secs)
                 .with_credential_attempt(format!("{activity_key}/{attempt}")),
             &mut wiring,
             model,
@@ -294,7 +321,7 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
         &self,
         input: &HostedAgentWorkflowInput,
         activity_key: &str,
-        now_secs: i64,
+        _workflow_time_secs: i64,
         gate_id: &str,
         reason: HostedAgentStopReason,
     ) -> Result<ArtifactRef, String> {
@@ -302,7 +329,7 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
             return Err("hosted stop activity key belongs to a different run".into());
         }
         if reason == HostedAgentStopReason::Expired {
-            self.expire_gate(input, gate_id, now_secs)?;
+            self.expire_gate(input, gate_id, self.deadline_clock.now_unix_secs()?)?;
         }
         let mut ledger = CostLedger::with_pg(self.provider.clone());
         ledger

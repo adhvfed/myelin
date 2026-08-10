@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use myelin_agent_host::{
-    AgentHost, AgentHostActivityExecutor, HostedAgentActivityOutcome, HostedAgentRunExecutor,
-    HostedAgentStopReason, HostedAgentWorkflowInput, HostedModelFactory,
+    AgentHost, AgentHostActivityExecutor, DeadlineClock, HostedAgentActivityOutcome,
+    HostedAgentRunExecutor, HostedAgentStopReason, HostedAgentWorkflowInput, HostedModelFactory,
 };
 use myelin_agent_model::{ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, Usage};
 use myelin_config::MyelinConfig;
@@ -102,6 +102,14 @@ struct FinalModelFactory {
 
 struct FinalModelClient {
     provider_calls: Arc<AtomicUsize>,
+}
+
+struct FixedDeadlineClock(i64);
+
+impl DeadlineClock for FixedDeadlineClock {
+    fn now_unix_secs(&self) -> Result<i64, String> {
+        Ok(self.0)
+    }
 }
 
 impl HostedModelFactory for FinalModelFactory {
@@ -589,24 +597,27 @@ async fn an_expired_hosted_approval_settles_once_and_leaves_no_actionable_card()
         Arc::new(RefusingModelFactory {
             calls: AtomicUsize::new(0),
         }),
-    );
+    )
+    .with_deadline_clock(Arc::new(FixedDeadlineClock(101)));
     let stop_key = format!("{run_id}/agent.run:2/expire");
 
     let first = executor
         .stop(
             &input,
             &stop_key,
-            100,
+            90,
             &gate_id,
             HostedAgentStopReason::Expired,
         )
-        .expect("the timer closes every durable surface");
+        .expect("recovery closes every durable surface against live time");
+    let expired_gate = HitlVerdictStore::with_pg(app.clone())
+        .fetch(&scope, &gate_id)
+        .expect("the gate remains queryable");
+    assert_eq!(expired_gate.state, GateState::Expired);
     assert_eq!(
-        HitlVerdictStore::with_pg(app.clone())
-            .fetch(&scope, &gate_id)
-            .expect("the gate remains queryable")
-            .state,
-        GateState::Expired,
+        expired_gate.decided_at_unix,
+        Some(101),
+        "journaled workflow time cannot freeze an approval deadline",
     );
     assert_eq!(
         CostLedger::with_pg(app.clone()).state_of(&tenant, &cost_run),

@@ -51,19 +51,23 @@ impl HostedAgentStopReason {
 }
 
 pub trait HostedAgentRunExecutor: Send + Sync {
+    /// Executes an activity with deterministic workflow time as replay metadata.
+    ///
+    /// Implementations must obtain live time independently for credential and deadline checks.
     fn execute(
         &self,
         input: &HostedAgentWorkflowInput,
         activity_key: &str,
         attempt: u32,
-        now_secs: i64,
+        workflow_time_secs: i64,
     ) -> Result<HostedAgentActivityOutcome, String>;
 
+    /// Stops an activity without treating deterministic workflow time as wall time.
     fn stop(
         &self,
         input: &HostedAgentWorkflowInput,
         activity_key: &str,
-        now_secs: i64,
+        workflow_time_secs: i64,
         gate_id: &str,
         reason: HostedAgentStopReason,
     ) -> Result<myelin_refs::ArtifactRef, String>;
