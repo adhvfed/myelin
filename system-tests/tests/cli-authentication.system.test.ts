@@ -425,6 +425,7 @@ describe("the CLI authentication journey", () => {
           "git.merge",
           "ci.read_run",
           "ci.read_log",
+          "issues.create",
           "issues.list",
           "issues.view",
           "knowledge.list_pages",
@@ -459,6 +460,8 @@ describe("the CLI authentication journey", () => {
         "git.read_file",
         "--tool",
         "git.search_code",
+        "--tool",
+        "issues.create",
         "--tool",
         "issues.list",
         "--tool",
@@ -508,6 +511,7 @@ describe("the CLI authentication journey", () => {
             { name: "git.open_pr", version: 1 },
             { name: "git.read_file", version: 1 },
             { name: "git.search_code", version: 1 },
+            { name: "issues.create", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
@@ -518,6 +522,7 @@ describe("the CLI authentication journey", () => {
             "chat.read",
             "chat.post",
             "edge.identity.read",
+            "issue.create",
             "issue.view",
             "knowledge.read",
             "repo.pull",
@@ -541,6 +546,7 @@ describe("the CLI authentication journey", () => {
           "git.list_repositories",
           "git.read_file",
           "git.search_code",
+          "issues.create",
           "issues.list",
           "issues.view",
           "knowledge.list_pages",
@@ -576,6 +582,8 @@ describe("the CLI authentication journey", () => {
         "git.read_file",
         "--tool",
         "git.search_code",
+        "--tool",
+        "issues.create",
         "--tool",
         "issues.list",
         "--tool",
@@ -663,6 +671,7 @@ describe("the CLI authentication journey", () => {
             { name: "git.open_pr", version: 1 },
             { name: "git.read_file", version: 1 },
             { name: "git.search_code", version: 1 },
+            { name: "issues.create", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
@@ -738,6 +747,7 @@ describe("the CLI authentication journey", () => {
         "git.open_pr",
         "git.read_file",
         "git.search_code",
+        "issues.create",
         "issues.list",
         "issues.view",
         "knowledge.list_pages",
@@ -783,18 +793,23 @@ describe("the CLI authentication journey", () => {
       });
       expect(discoveredTools.at(8)?.inputSchema).toMatchObject({
         type: "object",
+        required: ["project_id", "title"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(9)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["issue_id"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(10)?.inputSchema).toMatchObject({
         type: "object",
+        required: ["issue_id"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(11)?.inputSchema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(12)?.inputSchema).toMatchObject({
         type: "object",
         required: ["page_id"],
         additionalProperties: false,
@@ -882,6 +897,7 @@ describe("the CLI authentication journey", () => {
         "git.open_pr",
         "git.read_file",
         "git.search_code",
+        "issues.create",
         "issues.list",
         "issues.view",
         "knowledge.list_pages",
@@ -1327,11 +1343,72 @@ describe("the CLI authentication journey", () => {
         preview_unavailable: false,
       });
 
+      // The collaborator can now turn what it learned into durable team work. Project metadata
+      // supplies the issue type and prefix, the human's live project access bounds the write, and
+      // a lost MCP response can be retried without creating a second ticket.
+      const agentIssueTitle = uniqueName("Investigate the credentialless release failure");
+      const agentIssueKey = `agent-issue-${randomUUID()}`;
+      const createdByAgent = await askAgentToAct(
+        resumedRun,
+        12,
+        "issues.create",
+        {
+          project_id: createdProject.project.id,
+          title: agentIssueTitle,
+        },
+        agentIssueKey,
+      );
+      const replayedAgentIssue = await askAgentToAct(
+        resumedRun,
+        13,
+        "issues.create",
+        {
+          project_id: createdProject.project.id,
+          title: agentIssueTitle,
+        },
+        agentIssueKey,
+      );
+      expect(replayedAgentIssue.eventId).toBe(createdByAgent.eventId);
+      expect(string(createdByAgent.eventId, "agent-created issue event id")).toMatch(
+        /^issue\.create:[0-9a-f-]{36}\|/,
+      );
+
+      const humanVisibleAgentIssue = await eventually<JsonRecord>(
+        async () => {
+          const listed = await runCli(
+            configDirectory,
+            "--json",
+            "issue",
+            "list",
+            "--state",
+            "all",
+            "--limit",
+            "100",
+          );
+          expect(listed.exitCode, listed.stderr).toBe(0);
+          const matching = array(
+            record(JSON.parse(listed.stdout), "human issue list").items,
+            "human-visible issues",
+          )
+            .map((issue, index) => record(issue, `human-visible issue ${index}`))
+            .filter((issue) => issue.title === agentIssueTitle);
+          return matching.length === 1 ? matching[0] : undefined;
+        },
+        { description: "the agent-created issue to become visible exactly once in the human CLI" },
+      );
+      expect(humanVisibleAgentIssue).toMatchObject({
+        project_id: createdProject.project.id,
+        title: agentIssueTitle,
+        created_by: activated.agent.principal_id,
+        creator_kind: "agent",
+        key: expect.stringMatching(new RegExp(`^${createdProject.project.issue_prefix}-\\d+$`)),
+      });
+
       const agentChatMessage = `${uniqueName("Agent verified the release context")} \u{FFFC} \u{FFFC}`;
       const agentPostKey = `agent-chat-${randomUUID()}`;
       const postedByAgent = await askAgentToAct(
         resumedRun,
-        12,
+        14,
         "chat.post",
         {
           conversation_id: conversationId,
@@ -1345,7 +1422,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentPost = await askAgentToAct(
         resumedRun,
-        13,
+        15,
         "chat.post",
         {
           conversation_id: conversationId,

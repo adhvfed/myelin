@@ -1,5 +1,5 @@
 use super::{
-    canonical_issue_ref, is_canonical_uuid, map_store_error, no_store, DurableIssueHttpApi,
+    canonical_issue_ref, is_canonical_uuid, map_store_error, no_store, DurableIssueMutationApi,
 };
 use crate::catalogue::{Handler, HandlerCtx};
 use crate::error::EdgeError;
@@ -105,7 +105,7 @@ fn import_job_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
 }
 
 struct IssueImportDryRunHandler {
-    api: DurableIssueHttpApi,
+    api: DurableIssueMutationApi,
 }
 
 impl Handler for IssueImportDryRunHandler {
@@ -138,7 +138,7 @@ impl Handler for IssueImportDryRunHandler {
 }
 
 struct IssueImportRunHandler {
-    api: DurableIssueHttpApi,
+    api: DurableIssueMutationApi,
 }
 
 impl Handler for IssueImportRunHandler {
@@ -214,7 +214,7 @@ impl Handler for IssueImportRunHandler {
     }
 }
 
-pub(super) fn register(builder: GatewayBuilder, api: DurableIssueHttpApi) -> GatewayBuilder {
+pub(super) fn register(builder: GatewayBuilder, api: DurableIssueMutationApi) -> GatewayBuilder {
     builder
         .route(
             Method::Post,

@@ -261,6 +261,13 @@ fn audit_event_type(
         ("chat.post", "gated") => Ok(myelin_chat::events::CHAT_POST_GATED),
         ("chat.post", "denied") => Ok(myelin_chat::events::CHAT_POST_DENIED),
         ("chat.post", "indeterminate") => Ok(myelin_chat::events::CHAT_POST_INDETERMINATE),
+        ("issues.create", "attempted") => Ok(myelin_issues::events::ISSUE_CREATE_ATTEMPTED),
+        ("issues.create", "applied") => Ok(myelin_issues::events::ISSUE_CREATE_APPLIED),
+        ("issues.create", "gated") => Ok(myelin_issues::events::ISSUE_CREATE_GATED),
+        ("issues.create", "denied") => Ok(myelin_issues::events::ISSUE_CREATE_DENIED),
+        ("issues.create", "indeterminate") => {
+            Ok(myelin_issues::events::ISSUE_CREATE_INDETERMINATE)
+        }
         _ => Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
     }
 }

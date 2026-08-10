@@ -12,7 +12,7 @@ use myelin_edge::{
     AgentMcpAuthority, AgentMcpResources, AgentMcpServices, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
     DeviceAuthorizationBroker, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi,
-    DurableGitBackend, DurableIssueReadApi, DurableKnowledgeReadApi, Gateway, GitDatabaseProviders,
+    DurableGitBackend, DurableKnowledgeReadApi, Gateway, GitDatabaseProviders,
     IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
     SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
     TupleRepoBootstrap, WhoamiHandler,
@@ -1105,13 +1105,13 @@ async fn serve(
     if git_wire.is_some() {
         builder = register_git_wire(builder, git_backend.clone());
     }
-    builder = register_issues(
-        builder,
+    let issue_mutations = myelin_edge::DurableIssueMutationApi::new(
         issue_store.clone(),
-        issue_authorizer,
         myelin_identity_service::PgProjectStore::new(provider.clone()),
+        issue_authorizer.clone(),
         handle.clone(),
     );
+    builder = register_issues(builder, issue_mutations.clone());
     builder = register_projects(
         builder,
         myelin_identity_service::PgProjectStore::new(provider.clone()),
@@ -1150,7 +1150,7 @@ async fn serve(
             AgentMcpResources::new(
                 git_backend.clone(),
                 mcp_ci,
-                DurableIssueReadApi::new(issue_store.clone(), handle.clone()),
+                issue_mutations,
                 DurableKnowledgeReadApi::new(
                     provider.db_pool().clone(),
                     handle.clone(),

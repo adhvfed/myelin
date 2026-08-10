@@ -43,6 +43,7 @@ const REGION: &str = "fr-par";
 const PROJECT_ID: &str = "11111111-1111-1111-1111-111111111111";
 const TYPE_ID: &str = "22222222-2222-2222-2222-222222222222";
 const SCHEME: &str = "agent";
+static REQUEST_NONCE: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Default)]
 struct CountingTupleWriter {
@@ -157,6 +158,12 @@ async fn open(
         builder = builder
             .header("authorization", format!("Bearer {token}"))
             .header("x-myelin-token-scheme", SCHEME);
+    }
+    if method == "POST" && path == "/v1/issues" {
+        builder = builder.header(
+            "idempotency-key",
+            format!("issue-route-test-{}", REQUEST_NONCE.fetch_add(1, Ordering::SeqCst)),
+        );
     }
     sender
         .send_request(builder.body(Full::new(Bytes::from(body))).unwrap())
@@ -338,6 +345,12 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
         kms.clone(),
     )));
+    let issue_api = myelin_edge::DurableIssueMutationApi::new(
+        issue_store.clone(),
+        PgProjectStore::new(provider.clone()),
+        issue_authorizer,
+        tokio::runtime::Handle::current(),
+    );
     let builder = register_issues(
         Gateway::builder(
             authn,
@@ -345,10 +358,7 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
             Arc::new(AuthenticatedActionPolicy::mounted()),
         )
         .default_token_scheme(SCHEME),
-        issue_store.clone(),
-        issue_authorizer,
-        PgProjectStore::new(provider.clone()),
-        tokio::runtime::Handle::current(),
+        issue_api,
     );
     let gateway = Arc::new(builder.build());
     let address = spawn(gateway).await;
@@ -687,6 +697,8 @@ async fn durable_issue_routes_are_scoped_leak_free_and_emit_once() {
     .await;
     assert_eq!(status, 200);
     assert_eq!(issue["title"], title);
+    assert_eq!(issue["created_by"], creator.principal_id.0);
+    assert_eq!(issue["creator_kind"], "human");
     let (status, page) = http(
         address,
         "GET",

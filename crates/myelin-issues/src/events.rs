@@ -15,6 +15,19 @@ pub const ISSUE_ARCHIVED: &str = "issue.issue.archived";
 pub const ISSUE_REORDERED: &str = "issue.issue.reordered";
 pub const ISSUE_AUTHORIZATION_REQUESTED: &str = "issue.issue.authorization_requested";
 
+pub const ISSUE_CREATE_ATTEMPTED: &str = "issue.create.attempted";
+pub const ISSUE_CREATE_APPLIED: &str = "issue.create.applied";
+pub const ISSUE_CREATE_GATED: &str = "issue.create.gated";
+pub const ISSUE_CREATE_DENIED: &str = "issue.create.denied";
+pub const ISSUE_CREATE_INDETERMINATE: &str = "issue.create.indeterminate";
+pub const ISSUE_CREATE_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
+    ISSUE_CREATE_ATTEMPTED,
+    ISSUE_CREATE_APPLIED,
+    ISSUE_CREATE_GATED,
+    ISSUE_CREATE_DENIED,
+    ISSUE_CREATE_INDETERMINATE,
+];
+
 pub const ISSUE_TRIAGED: &str = "issue.issue.triaged";
 pub const ISSUE_DUPLICATE_SUSPECTED: &str = "issue.issue.duplicate_suspected";
 pub const ISSUE_LABELLED_BY_AGENT: &str = "issue.issue.labelled_by_agent";
@@ -81,6 +94,11 @@ pub const ISSUE_EVENT_TOKENS: &[&str] = &[
     ISSUE_ARCHIVED,
     ISSUE_REORDERED,
     ISSUE_AUTHORIZATION_REQUESTED,
+    ISSUE_CREATE_ATTEMPTED,
+    ISSUE_CREATE_APPLIED,
+    ISSUE_CREATE_GATED,
+    ISSUE_CREATE_DENIED,
+    ISSUE_CREATE_INDETERMINATE,
     ISSUE_TRIAGED,
     ISSUE_DUPLICATE_SUSPECTED,
     ISSUE_LABELLED_BY_AGENT,

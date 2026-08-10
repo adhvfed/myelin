@@ -8,7 +8,8 @@ use crate::{Method, StoreBackedIssueAuthorizer};
 use myelin_identity_service::{PgProjectStore, Project, ProjectError};
 use myelin_issues::{
     api::IssueListState, is_canonical_request_event_id, CreateIssue, IssueAuthorizationStatus,
-    IssueAuthorizer, IssuePageRequest, IssuePermission, IssueStoreError, PgIssueStore, StoredIssue,
+    IssueAuthorizer, IssueCreationOutcome, IssuePageRequest, IssuePermission, IssueStoreError,
+    PgIssueStore, StoredIssue,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -79,15 +80,15 @@ impl DurableIssueReadApi {
 }
 
 #[derive(Clone)]
-struct DurableIssueHttpApi {
+pub struct DurableIssueMutationApi {
     store: Arc<ProductionIssueStore>,
     projects: PgProjectStore,
     authorizer: StoreBackedIssueAuthorizer,
     runtime: Handle,
 }
 
-impl DurableIssueHttpApi {
-    fn new(
+impl DurableIssueMutationApi {
+    pub fn new(
         store: Arc<ProductionIssueStore>,
         projects: PgProjectStore,
         authorizer: StoreBackedIssueAuthorizer,
@@ -99,6 +100,25 @@ impl DurableIssueHttpApi {
             authorizer,
             runtime,
         }
+    }
+
+    pub fn reads(&self) -> DurableIssueReadApi {
+        DurableIssueReadApi::new(self.store.clone(), self.runtime.clone())
+    }
+
+    pub fn create_issue(
+        &self,
+        actor: &myelin_identity::Principal,
+        authorized_viewer: &myelin_identity::Principal,
+        request: IssueCreateRequest,
+        caller_key: &str,
+    ) -> Result<IssueCreationOutcome, EdgeError> {
+        let proposal = resolve_create(self, authorized_viewer, request)?;
+        self.drive(
+            self.store
+                .create_idempotent(actor, authorized_viewer, proposal, caller_key),
+        )
+        .map_err(map_store_error)
     }
 
     fn drive<F, T>(&self, future: F) -> Result<T, IssueStoreError>
@@ -141,20 +161,20 @@ where
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CreateIssueBody {
-    project_id: String,
+pub struct IssueCreateRequest {
+    pub project_id: String,
     #[serde(default)]
-    type_id: Option<String>,
+    pub type_id: Option<String>,
     #[serde(default)]
-    prefix: Option<String>,
-    title: String,
+    pub prefix: Option<String>,
+    pub title: String,
 }
 
-fn parse_create_body(ctx: &HandlerCtx<'_>) -> Result<CreateIssueBody, EdgeError> {
+fn parse_create_body(ctx: &HandlerCtx<'_>) -> Result<IssueCreateRequest, EdgeError> {
     parse_create_bytes(&ctx.request.body)
 }
 
-fn parse_create_bytes(bytes: &[u8]) -> Result<CreateIssueBody, EdgeError> {
+fn parse_create_bytes(bytes: &[u8]) -> Result<IssueCreateRequest, EdgeError> {
     if bytes.len() > MAX_ISSUE_JSON_BYTES {
         return Err(EdgeError::PayloadTooLarge(format!(
             "Issues request body exceeds {MAX_ISSUE_JSON_BYTES} bytes"
@@ -170,9 +190,9 @@ fn parse_create_bytes(bytes: &[u8]) -> Result<CreateIssueBody, EdgeError> {
 }
 
 fn resolve_create(
-    api: &DurableIssueHttpApi,
+    api: &DurableIssueMutationApi,
     principal: &myelin_identity::Principal,
-    request: CreateIssueBody,
+    request: IssueCreateRequest,
 ) -> Result<CreateIssue, EdgeError> {
     if !is_canonical_uuid(&request.project_id) {
         return Err(EdgeError::BadRequest(
@@ -196,7 +216,7 @@ fn resolve_create(
 }
 
 fn finish_create_request(
-    request: CreateIssueBody,
+    request: IssueCreateRequest,
     metadata: Option<Project>,
 ) -> Result<CreateIssue, EdgeError> {
     let (type_id, prefix) = match metadata {
@@ -306,6 +326,12 @@ fn issue_json(tenant: &str, issue: &StoredIssue) -> Value {
         "state": issue.state,
         "state_category": issue.state_category,
         "title": issue.title,
+        "created_by": issue.created_by_principal,
+        "creator_kind": if issue.created_by_principal.starts_with("agent:") {
+            "agent"
+        } else {
+            "human"
+        },
         "version": issue.version,
         "created_at": issue.created_at,
         "updated_at": issue.updated_at,
@@ -391,24 +417,20 @@ fn parse_issue_list_query(query: &str) -> Result<IssuePageRequest, EdgeError> {
 }
 
 struct IssueCreateHandler {
-    api: DurableIssueHttpApi,
+    api: DurableIssueMutationApi,
 }
 
 impl Handler for IssueCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let proposal = resolve_create(&self.api, ctx.principal, parse_create_body(ctx)?)?;
         let client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
-        let outcome = self
-            .api
-            .drive(self.api.store.create_idempotent(
-                ctx.principal,
-                ctx.principal,
-                proposal,
-                &client_nonce,
-            ))
-            .map_err(map_store_error)?;
+        let outcome = self.api.create_issue(
+            ctx.principal,
+            ctx.principal,
+            parse_create_body(ctx)?,
+            &client_nonce,
+        )?;
         let receipt = outcome.receipt;
         Ok(no_store(EdgeResponse::json(
             if outcome.created { 202 } else { 200 },
@@ -431,7 +453,7 @@ impl Handler for IssueCreateHandler {
 }
 
 struct IssueAuthorizationStatusHandler {
-    api: DurableIssueHttpApi,
+    api: DurableIssueMutationApi,
 }
 
 impl Handler for IssueAuthorizationStatusHandler {
@@ -486,7 +508,7 @@ impl Handler for IssueViewHandler {
 }
 
 struct IssueCloseHandler {
-    api: DurableIssueHttpApi,
+    api: DurableIssueMutationApi,
 }
 
 impl Handler for IssueCloseHandler {
@@ -549,13 +571,10 @@ fn guarded(
 
 pub fn register_issues(
     builder: GatewayBuilder,
-    store: Arc<PgIssueStore<StoreBackedIssueAuthorizer>>,
-    authorizer: StoreBackedIssueAuthorizer,
-    projects: PgProjectStore,
-    runtime: Handle,
+    api: DurableIssueMutationApi,
 ) -> GatewayBuilder {
-    let api = DurableIssueHttpApi::new(store, projects, authorizer.clone(), runtime);
-    let reads = DurableIssueReadApi::new(api.store.clone(), api.runtime.clone());
+    let authorizer = api.authorizer.clone();
+    let reads = api.reads();
     let builder = builder
         .route(
             Method::Get,

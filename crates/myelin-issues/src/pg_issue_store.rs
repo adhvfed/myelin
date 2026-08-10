@@ -224,6 +224,7 @@ pub struct StoredIssue {
     pub state: String,
     pub state_category: String,
     pub title: String,
+    pub created_by_principal: String,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -554,7 +555,8 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                            true, 1 \
                          FROM allocated \
                          RETURNING id, key, project_id, state, state_category, title_nonce, \
-                           title_ciphertext, pii_key_ref, version, created_at::text, updated_at::text",
+                           title_ciphertext, created_by_principal, pii_key_ref, version, \
+                           created_at::text, updated_at::text",
                     )
                     .bind(&tenant_id)
                     .bind(&region)
@@ -765,8 +767,8 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         "SELECT b.issue_id, b.state AS authz_state, b.zookie AS authz_zookie, \
                                 b.project_id AS binding_project_id, b.issue_object, \
                                 b.project_userset, b.relation, b.request_event_id, \
-                                b.created_event_id, b.attempts, i.created_by_principal, \
-                                o.envelope AS request_envelope, {columns} \
+                                b.created_event_id, b.attempts, o.envelope AS request_envelope, \
+                                {columns} \
                          FROM issue_authz_binding b \
                          JOIN issue i ON i.tenant_id = b.tenant_id AND i.region = b.region \
                                            AND i.id = b.issue_id \
@@ -1384,12 +1386,13 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
 }
 
 const SELECT_COLUMNS: &str = "id, key, project_id, state, state_category, title_nonce, \
-title_ciphertext, pii_key_ref, version, created_at::text, updated_at::text";
+title_ciphertext, created_by_principal, pii_key_ref, version, created_at::text, updated_at::text";
 const SELECT_COLUMNS_QUALIFIED: &str = "i.id, i.key, i.project_id, i.state, i.state_category, \
-i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version, i.created_at::text, i.updated_at::text";
+i.title_nonce, i.title_ciphertext, i.created_by_principal, i.pii_key_ref, i.version, \
+i.created_at::text, i.updated_at::text";
 const AUTHORIZATION_STATUS_SQL: &str = r#"
 SELECT i.id, i.key, i.project_id, i.state, i.state_category,
-       i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version,
+       i.title_nonce, i.title_ciphertext, i.created_by_principal, i.pii_key_ref, i.version,
        i.created_at::text AS created_at, i.updated_at::text AS updated_at,
        CASE
          WHEN b.state = 'active' AND EXISTS (
@@ -1435,7 +1438,7 @@ gate AS MATERIALIZED (
 ),
 authorized AS (
   SELECT i.id, i.key, i.project_id, i.state, i.state_category,
-         i.title_nonce, i.title_ciphertext, i.pii_key_ref, i.version,
+         i.title_nonce, i.title_ciphertext, i.created_by_principal, i.pii_key_ref, i.version,
          i.created_at::text AS created_at, i.updated_at::text AS updated_at,
          floor(extract(epoch from i.updated_at) * 1000000)::bigint AS updated_at_micros
   FROM gate g
@@ -1475,12 +1478,12 @@ SELECT 0::int AS sort_key,
        NULL::uuid AS id, NULL::text AS key, NULL::uuid AS project_id,
        NULL::text AS state, NULL::text AS state_category,
        NULL::bytea AS title_nonce, NULL::bytea AS title_ciphertext,
-       NULL::text AS pii_key_ref, NULL::bigint AS version,
+       NULL::text AS created_by_principal, NULL::text AS pii_key_ref, NULL::bigint AS version,
        NULL::text AS created_at, NULL::text AS updated_at,
        NULL::bigint AS updated_at_micros
 UNION ALL
 SELECT 1, 'ready', id, key, project_id, state, state_category,
-       title_nonce, title_ciphertext, pii_key_ref, version, created_at, updated_at,
+       title_nonce, title_ciphertext, created_by_principal, pii_key_ref, version, created_at, updated_at,
        updated_at_micros
 FROM authorized
 ORDER BY sort_key ASC, updated_at_micros DESC NULLS FIRST, id DESC NULLS FIRST
@@ -1962,6 +1965,7 @@ fn decode_row(
         state: row.get("state"),
         state_category: row.get("state_category"),
         title,
+        created_by_principal: row.get("created_by_principal"),
         version: row.get("version"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),

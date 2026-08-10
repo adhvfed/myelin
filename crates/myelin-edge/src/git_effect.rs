@@ -11,6 +11,7 @@ use myelin_tenancy::Region;
 use serde_json::Value;
 
 use crate::agent_delegation::is_active_delegation;
+use crate::effect_carrier::parse_proposed;
 use crate::git_durable::DurableGitBackend;
 use crate::repo_authz::RepoPermission;
 
@@ -279,13 +280,6 @@ fn mcp_operation_id(
             idempotency_key.as_bytes(),
         ],
     )
-}
-
-fn parse_proposed(s: &str) -> Option<(String, Value)> {
-    let rest = s.strip_prefix("tool:")?;
-    let (tool, args_str) = rest.split_once("|args:")?;
-    let args = serde_json::from_str(args_str).unwrap_or(Value::Null);
-    Some((tool.to_string(), args))
 }
 
 fn applied(run: &RunCtx, _tool: &str, action: &str) -> EffectResult {

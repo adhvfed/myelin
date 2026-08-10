@@ -180,3 +180,56 @@ fn chat_post_governance_has_a_durable_registered_taxonomy() {
         );
     }
 }
+
+#[test]
+fn issue_create_governance_has_a_durable_registered_taxonomy() {
+    let store = OutboxStore::new();
+    let audit = OutboxGovernanceAudit::new(store.clone(), Arc::new(MonotonicMinter::new()));
+    let actor = actor();
+    let scope = TenantScope::from_verified_token(&actor, actor.region.clone());
+    let run = RunId("run:issue-create".into());
+    let now = Timestamp("2026-07-18T00:00:00Z".into());
+
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            gate_id: None,
+            tool: "issues.create",
+            jti: "jti:issue-create",
+            phase: AuditPhase::Attempt,
+            outcome: None,
+            now: &now,
+        })
+        .unwrap();
+    let applied = CallOutcome::Applied {
+        event_id: "issue.create:11111111-1111-1111-1111-111111111111".into(),
+        jti: "jti:issue-create".into(),
+    };
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            gate_id: None,
+            tool: "issues.create",
+            jti: "jti:issue-create",
+            phase: AuditPhase::Outcome,
+            outcome: Some(&applied),
+            now: &now,
+        })
+        .unwrap();
+
+    let rows = store.committed_rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].envelope.type_.0, "issue.create.attempted");
+    assert_eq!(rows[1].envelope.type_.0, "issue.create.applied");
+    for row in rows {
+        assert!(
+            myelin_issues::events::ISSUE_CREATE_GOVERNANCE_AUDIT_EVENT_TOKENS
+                .contains(&row.envelope.type_.0.as_str()),
+            "every Issue create governance event belongs to Issues' durable taxonomy"
+        );
+    }
+}

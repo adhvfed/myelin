@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 myelin-chat = { path = "../myelin-chat" }
 myelin-git = { path = "../myelin-git" }
+myelin-issues = { path = "../myelin-issues" }
 
 myelin-agent = { path = "../myelin-agent" }
 myelin-agent-service = { path = "../myelin-agent-service" }

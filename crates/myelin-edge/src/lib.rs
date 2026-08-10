@@ -8,6 +8,7 @@ pub mod chat_effect;
 pub mod chat_http;
 pub mod ci_http;
 pub mod device_auth;
+mod effect_carrier;
 pub mod effect_router;
 pub mod error;
 pub mod gateway;
@@ -20,6 +21,7 @@ pub mod git_receive_pack;
 pub mod git_wire_exec;
 pub mod git_wire_http;
 pub mod issue_authz;
+pub mod issue_effect;
 pub mod issues_http;
 pub mod knowledge_http;
 pub mod mcp_read;
@@ -83,9 +85,10 @@ pub use issue_authz::{
     IssueReconciliationHandle, IssueReconciliationMetrics, IssueReconciliationMetricsSnapshot,
     IssueReconciliationReport, StoreBackedIssueAuthorizer, ISSUE_RECONCILE_TENANTS_ENV,
 };
+pub use issue_effect::IssueEffectApi;
 pub use issues_http::{
-    register_issues, DurableIssueReadApi, MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS,
-    MAX_ISSUE_JSON_BYTES,
+    register_issues, DurableIssueMutationApi, DurableIssueReadApi, IssueCreateRequest,
+    MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS, MAX_ISSUE_JSON_BYTES,
 };
 pub use knowledge_http::{register_knowledge, DurableKnowledgeReadApi};
 pub use mcp_read::McpReadExecutor;

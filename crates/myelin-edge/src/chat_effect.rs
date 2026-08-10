@@ -7,6 +7,7 @@ use myelin_storage::TenantScope;
 use serde_json::Value;
 
 use crate::agent_delegation::is_active_delegation;
+use crate::effect_carrier::parse_proposed;
 use crate::DurableChatMutationApi;
 
 pub struct ChatEffectApi {
@@ -125,19 +126,11 @@ impl EffectApi for ChatEffectApi {
         let Some((tool, arguments)) = parse_proposed(&effect.0) else {
             return EffectResult::Denied("malformed proposed Chat effect".into());
         };
-        match self.authorize(authority, tool) {
-            Ok(()) => self.apply_tool(run, tool, &arguments, &authority.idempotency_key),
+        match self.authorize(authority, &tool) {
+            Ok(()) => self.apply_tool(run, &tool, &arguments, &authority.idempotency_key),
             Err(reason) => EffectResult::Denied(reason),
         }
     }
-}
-
-fn parse_proposed(value: &str) -> Option<(&str, Value)> {
-    let rest = value.strip_prefix("tool:")?;
-    let (tool, arguments) = rest.split_once("|args:")?;
-    serde_json::from_str(arguments)
-        .ok()
-        .map(|arguments| (tool, arguments))
 }
 
 fn string_argument<'a>(arguments: &'a Value, field: &str) -> Option<&'a str> {

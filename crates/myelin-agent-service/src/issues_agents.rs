@@ -36,15 +36,23 @@ pub fn assign_required_caps() -> Vec<String> {
 }
 
 fn crud_tool_def(name: &str, caps: Vec<String>, input_schema: &str) -> ToolDef {
-    mutate_tool_def(ISSUES_SUBSYSTEM, name, ISSUES_TOOL_VERSION, input_schema, caps)
+    mutate_tool_def(
+        ISSUES_SUBSYSTEM,
+        name,
+        ISSUES_TOOL_VERSION,
+        input_schema,
+        caps,
+    )
 }
 
 pub fn create_tool_def() -> ToolDef {
-    crud_tool_def(
+    let mut definition = crud_tool_def(
         CREATE_TOOL,
         create_required_caps(),
-        r#"{"type":"object","required":["project","title"],"properties":{"project":{"type":"string"},"title":{"type":"string"},"type":{"type":"string"}}}"#,
-    )
+        r#"{"type":"object","required":["project_id","title"],"properties":{"project_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"type_id":{"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},"prefix":{"type":"string","pattern":"^[A-Z][A-Z0-9]{1,9}$"},"title":{"type":"string","minLength":1,"maxLength":512}},"additionalProperties":false}"#,
+    );
+    definition.exposed_over_mcp = true;
+    definition
 }
 
 pub fn update_tool_def() -> ToolDef {
@@ -312,8 +320,28 @@ mod tests {
             assert_eq!(d.effect_kind, EffectKind::Mutate);
             assert!(d.side_effecting);
             assert_eq!(d.version, ISSUES_TOOL_VERSION);
-            assert!(!d.exposed_over_mcp, "v1 Issues tools are not MCP-exposed");
+            assert_eq!(
+                d.exposed_over_mcp,
+                d.canonical_name() == "issues.create",
+                "only the implemented Issues create mutation is MCP-exposed"
+            );
         }
+    }
+
+    #[test]
+    fn create_is_the_strict_project_native_mcp_contract() {
+        let definition = create_tool_def();
+        let schema: serde_json::Value = serde_json::from_str(&definition.input_schema).unwrap();
+        assert_eq!(definition.canonical_name(), "issues.create");
+        assert!(definition.exposed_over_mcp);
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["project_id", "title"])
+        );
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["title"]["maxLength"], 512);
+        assert!(schema["properties"].get("project").is_none());
+        assert!(schema["properties"].get("type").is_none());
     }
 
     #[test]

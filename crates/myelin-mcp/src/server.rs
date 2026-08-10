@@ -466,11 +466,12 @@ mod tests {
             .expect("resp");
         let v: Value = serde_json::from_str(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 16);
+        assert_eq!(tools.len(), 17);
         let merge = tools.iter().find(|t| t["name"] == "git.merge").unwrap();
         assert_eq!(merge["annotations"]["requiresApproval"], json!(true));
         assert!(tools.iter().any(|tool| tool["name"] == "ci.read_run"));
         assert!(tools.iter().any(|tool| tool["name"] == "issues.list"));
+        assert!(tools.iter().any(|tool| tool["name"] == "issues.create"));
         assert!(tools
             .iter()
             .any(|tool| tool["name"] == "knowledge.read_page"));

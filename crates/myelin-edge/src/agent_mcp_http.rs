@@ -25,7 +25,8 @@ use crate::repo_authz::{RepoAuthorizer, RepoPermission};
 use crate::request::EdgeResponse;
 use crate::{
     ChatEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
-    DurableIssueReadApi, DurableKnowledgeReadApi, GitEffectApi, McpReadExecutor, RoutedEffectApi,
+    DurableIssueMutationApi, DurableKnowledgeReadApi, GitEffectApi, IssueEffectApi,
+    McpReadExecutor, RoutedEffectApi,
 };
 
 #[derive(Clone)]
@@ -59,7 +60,7 @@ impl AgentMcpAuthority {
 pub struct AgentMcpResources {
     git: Arc<DurableGitBackend>,
     ci: DurableCiReadApi,
-    issues: DurableIssueReadApi,
+    issues: DurableIssueMutationApi,
     knowledge: DurableKnowledgeReadApi,
     chat: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
@@ -69,7 +70,7 @@ impl AgentMcpResources {
     pub fn new(
         git: Arc<DurableGitBackend>,
         ci: DurableCiReadApi,
-        issues: DurableIssueReadApi,
+        issues: DurableIssueMutationApi,
         knowledge: DurableKnowledgeReadApi,
         chat: DurableChatReadApi,
         chat_mutations: DurableChatMutationApi,
@@ -215,6 +216,15 @@ impl Handler for AgentMcpHandler {
                         self.services.authority.boundary.clone(),
                     )) as Box<dyn myelin_agent::EffectApi>,
                 ),
+                (
+                    "issues",
+                    Box::new(IssueEffectApi::new(
+                        self.services.resources.issues.clone(),
+                        ctx.principal.clone(),
+                        delegator.clone(),
+                        self.services.authority.boundary.clone(),
+                    )) as Box<dyn myelin_agent::EffectApi>,
+                ),
             ])
             .map_err(EdgeError::Unavailable)?,
         );
@@ -241,7 +251,7 @@ impl Handler for AgentMcpHandler {
                 self.services.authority.boundary.clone(),
                 delegator,
             )
-            .with_issues(self.services.resources.issues.clone())
+            .with_issues(self.services.resources.issues.reads())
             .with_knowledge(self.services.resources.knowledge.clone())
             .with_chat(self.services.resources.chat.clone())
             .with_git(self.services.resources.git.clone()),
