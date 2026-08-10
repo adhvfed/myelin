@@ -547,6 +547,9 @@ async function inboxAuthed<T>(fetcher: () => Promise<T>): Promise<T> {
     return await fetcher();
   } catch (e) {
     if (isUnauthorized(e)) throw redirect("/login");
+    // Mutation callers deliberately distinguish stale/missing approvals (404/409) from transport
+    // outages. Preserve the status here; read queries map it to an opaque availability error below.
+    if (e instanceof GatewayError) throw e;
     throw new Error("INBOX_UNAVAILABLE");
   }
 }
@@ -654,11 +657,16 @@ export const getCiLog = query(async (request: CiLogInput): Promise<CiLogRangeVM>
 /** The first bounded page of the authenticated viewer's unified inbox. */
 export const getInbox = query(async (): Promise<InboxPage> => {
   "use server";
-  return inboxAuthed(async () => {
-    const page = parseInboxPage(await edgeGet("/v1/notif/inbox?view=all&limit=50"));
-    if (!page) throw new Error("INBOX_INVALID_RESPONSE");
-    return page;
-  });
+  try {
+    return await inboxAuthed(async () => {
+      const page = parseInboxPage(await edgeGet("/v1/notif/inbox?view=all&limit=50"));
+      if (!page) throw new Error("INBOX_INVALID_RESPONSE");
+      return page;
+    });
+  } catch (error) {
+    if (error instanceof GatewayError) throw new Error("INBOX_UNAVAILABLE");
+    throw error;
+  }
 }, "notif-inbox");
 
 export type InboxMutationResult =

@@ -9,7 +9,13 @@ import AxeBuilder from "@axe-core/playwright";
 
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 
-async function setEdgeConfig(cfg: { emptyRepos?: boolean; devLoginEnabled?: boolean }) {
+async function setEdgeConfig(cfg: {
+  emptyRepos?: boolean;
+  devLoginEnabled?: boolean;
+  whoamiUnavailable?: boolean;
+  seedInboxAgentApproval?: boolean;
+  inboxMutationUnavailable?: boolean;
+}): Promise<void> {
   const ctx = await pwRequest.newContext();
   const res = await ctx.post(`${EDGE}/__test/config`, { data: cfg });
   expect(res.ok(), "dev-edge test-control must accept the config").toBeTruthy();
@@ -25,7 +31,13 @@ async function expectNoAxeViolations(page: Page, context?: string) {
 
 test.afterEach(async () => {
   // Reset the dev-double to the default populated / dev-seam-on posture for the rest of the suite.
-  await setEdgeConfig({ emptyRepos: false, devLoginEnabled: true });
+  await setEdgeConfig({
+    emptyRepos: false,
+    devLoginEnabled: true,
+    whoamiUnavailable: false,
+    seedInboxAgentApproval: false,
+    inboxMutationUnavailable: false,
+  });
 });
 
 test.describe("R3.5 first-run — login", () => {
@@ -130,5 +142,57 @@ test.describe("R3.5 first-run — honest inbox", () => {
     await expect(dialog).not.toContainText("CI passed on acme/myelin");
 
     await expectNoAxeViolations(page, "the honest inbox (inbox-zero)");
+  });
+
+  test("an approval failure stays visible and safely retryable until the decision is saved", async ({ page }) => {
+    await setEdgeConfig({
+      seedInboxAgentApproval: true,
+      inboxMutationUnavailable: true,
+    });
+    await page.goto("/login");
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("dev-login").click();
+    await page.waitForURL("**/git/repos");
+
+    const inboxButton = page.getByRole("button", { name: /Inbox/ });
+    await expect(inboxButton).toHaveAttribute("aria-label", /1 unread notification/i);
+    await inboxButton.click();
+    const dialog = page.getByRole("dialog", { name: "Inbox" });
+
+    await dialog.getByRole("button", { name: "Approve" }).click();
+    await expect(dialog.getByTestId("inbox-mutation-error")).toContainText(
+      /couldn’t save that change/i,
+    );
+    await expect(page.getByText("Inbox change wasn’t saved")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Approve" })).toBeEnabled();
+
+    await setEdgeConfig({ inboxMutationUnavailable: false });
+    await dialog.getByRole("button", { name: "Approve" }).click();
+    await expect(page.getByText("Approval saved")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Approve" })).toHaveCount(0);
+    await expect(dialog.getByTestId("inbox-mutation-error")).toHaveCount(0);
+    await expectNoAxeViolations(page, "a recovered inbox approval");
+  });
+});
+
+test.describe("R3.5 signed-in shell recovery", () => {
+  test("a transient viewer-verification failure keeps the user’s place and recovers on retry", async ({ page }) => {
+    await page.goto("/login");
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("dev-login").click();
+    await page.waitForURL("**/git/repos");
+
+    await setEdgeConfig({ whoamiUnavailable: true });
+    await page.goto("/git/repos?recovery=1");
+    const unavailable = page.getByTestId("app-unavailable");
+    await expect(unavailable).toBeVisible();
+    await expect(unavailable).toContainText(/your place is kept/i);
+    await expect(page.getByRole("navigation", { name: "Primary" })).toHaveCount(0);
+
+    await setEdgeConfig({ whoamiUnavailable: false });
+    await unavailable.getByRole("link", { name: "Try again" }).click();
+    await expect(page).toHaveURL(/\/git\/repos\?recovery=1$/);
+    await expect(page.getByRole("navigation", { name: "Primary" })).toBeVisible();
+    await expectNoAxeViolations(page, "the recovered signed-in shell");
   });
 });

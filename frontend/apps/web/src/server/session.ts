@@ -23,8 +23,9 @@ export const SESSION_COOKIE = cookie.name;
 
 /** Backed on `globalThis` so the SSR bundle and the server-functions bundle — which vinxi/Nitro loads
  * as SEPARATE module graphs in the SAME process — share ONE store. Without this, a session written by a
- * server action (server-fns bundle) is invisible to the SSR `requireViewer` on a full-reload/deep-link
- * navigation. In production that process-local reference points to the shared Valkey transport. */
+ * server action (server-fns bundle) is invisible to the app layout's SSR viewer verification on a
+ * full-reload/deep-link navigation. In production that process-local reference points to the shared
+ * Valkey transport. */
 const globalStore = globalThis as unknown as {
   __myelinSessionStore?: SessionStore;
 };

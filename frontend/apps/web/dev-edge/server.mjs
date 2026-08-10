@@ -88,6 +88,11 @@ const state = {
   // Test-only token-expiry switch: reject both access and refresh credentials so the browser harness
   // can verify the full expired-session redirect under streaming SSR and a strict CSP.
   forceUnauthorized: false,
+  // App-shell recovery and inbox-mutation controls. These model transient product failures against
+  // the same browser/server-action path as production; they never exist on the real Edge.
+  whoamiUnavailable: false,
+  inboxAgentApprovalState: null,
+  inboxMutationUnavailable: false,
   // Issues test controls: empty/projection-unavailable states and how many status reads precede
   // activation. Two proves the UI renders a genuine pending interval before active.
   emptyIssues: false,
@@ -381,6 +386,15 @@ const server = createServer((req, res) => {
         if (typeof body.devLoginEnabled === "boolean") state.devLoginEnabled = body.devLoginEnabled;
         if (typeof body.tokenLoginEnabled === "boolean") state.tokenLoginEnabled = body.tokenLoginEnabled;
         if (typeof body.forceUnauthorized === "boolean") state.forceUnauthorized = body.forceUnauthorized;
+        if (typeof body.whoamiUnavailable === "boolean") {
+          state.whoamiUnavailable = body.whoamiUnavailable;
+        }
+        if (typeof body.seedInboxAgentApproval === "boolean") {
+          state.inboxAgentApprovalState = body.seedInboxAgentApproval ? "unread" : null;
+        }
+        if (typeof body.inboxMutationUnavailable === "boolean") {
+          state.inboxMutationUnavailable = body.inboxMutationUnavailable;
+        }
         if (body.resetPrFixtures === true) {
           resetPrFixtures();
           resetPrCommitPagination();
@@ -929,6 +943,11 @@ const server = createServer((req, res) => {
 
   if (method === "GET" && path === "/v1/whoami") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.whoamiUnavailable) {
+      return send(res, 503, {
+        error: { message: "viewer verification is temporarily unavailable", code: "unavailable" },
+      });
+    }
     return send(res, 200, whoamiJson());
   }
 
@@ -937,7 +956,55 @@ const server = createServer((req, res) => {
     if (url.search !== "?view=all&limit=50") {
       return send(res, 400, { error: { message: "invalid inbox request", code: "bad_request" } });
     }
-    return send(res, 200, { items: [], page: { next_cursor: null, limit: 50 } });
+    const items = state.inboxAgentApprovalState === null ? [] : [{
+      id: "notice-agent-effect-1",
+      reason: "approval_requested",
+      class: "direct",
+      subsystem: "git",
+      subject: "myelin://acme/git/pr/myelin:42",
+      subject_root: "myelin://acme/git/pr/myelin:42",
+      coalesce_count: 1,
+      state: state.inboxAgentApprovalState,
+      snooze_until: null,
+      occurred_at: "2026-08-10T18:00:00.000Z",
+      priority: 70,
+      action: {
+        kind: "agent_effect_approval",
+        gate_id: "gate:0123456789abcdef0123456789abcdef",
+        run_id: "hosted-run-42",
+      },
+    }];
+    return send(res, 200, { items, page: { next_cursor: null, limit: 50 } });
+  }
+
+  if (
+    method === "POST" &&
+    path === "/v1/agent-approvals/gate%3A0123456789abcdef0123456789abcdef/decision"
+  ) {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return send(res, 400, { error: { message: "invalid approval decision", code: "bad_request" } });
+      }
+      if (body?.decision !== "approve" && body?.decision !== "reject") {
+        return send(res, 400, { error: { message: "invalid approval decision", code: "bad_request" } });
+      }
+      if (state.inboxMutationUnavailable) {
+        return send(res, 409, { error: { message: "approval changed", code: "conflict" } });
+      }
+      state.inboxAgentApprovalState = "done";
+      return send(res, 200, {
+        gate_id: "gate:0123456789abcdef0123456789abcdef",
+        state: body.decision === "approve" ? "approved" : "rejected",
+        changed: true,
+      });
+    });
+    return;
   }
 
   if (method === "POST" && path === "/v1/git/repos") {

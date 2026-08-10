@@ -1,8 +1,9 @@
 import { Icon, useToast, type IconName } from "@myelin/design-system";
 import { Title } from "@solidjs/meta";
-import { createAsync, useAction } from "@solidjs/router";
-import { createSignal, For, onMount, Show, type JSX } from "solid-js";
-import { logout, requireViewer } from "~/lib/auth";
+import { useAction } from "@solidjs/router";
+import { createSignal, For, onMount, type JSX } from "solid-js";
+import { useAppViewer } from "~/components/AppShell";
+import { logout } from "~/lib/auth";
 import { applyTheme, restoreTheme, THEMES, type Theme } from "~/lib/theme";
 
 const THEME_COPY: Record<Theme, { label: string; copy: string }> = {
@@ -12,7 +13,7 @@ const THEME_COPY: Record<Theme, { label: string; copy: string }> = {
 };
 
 export default function Profile() {
-  const viewer = createAsync(() => requireViewer(), { deferStream: true });
+  const viewer = useAppViewer();
   const signOut = useAction(logout);
   const toast = useToast();
   const [theme, setTheme] = createSignal<Theme>("dark");
@@ -26,16 +27,16 @@ export default function Profile() {
 
   return <>
     <Title>Profile · Myelin</Title>
-    <Show when={viewer()}>{(identity) => <div class="profile-screen">
-      <header class="profile-hero"><div class="profile-avatar" aria-hidden="true"><Icon name="human" size={30} /></div><div><p>Signed-in identity</p><h1>{identity().displayName}</h1><span>Engineering workspace member</span></div></header>
+    <div class="profile-screen">
+      <header class="profile-hero"><div class="profile-avatar" aria-hidden="true"><Icon name="human" size={30} /></div><div><p>Signed-in identity</p><h1>{viewer.displayName}</h1><span>Engineering workspace member</span></div></header>
       <div class="profile-grid">
-        <ProfileCard icon="human" title="Identity" copy="The identity Myelin uses for attribution and authorization."><dl><div><dt>Display name</dt><dd>{identity().displayName}</dd></div><div><dt>Principal</dt><dd><code>{identity().principalId}</code></dd></div></dl></ProfileCard>
-        <ProfileCard icon="team" title="Workspace" copy="Your current organization boundary. Data from another tenant is never mixed into this session."><dl><div><dt>Tenant</dt><dd><code>{identity().tenant}</code></dd></div><div><dt>Role</dt><dd>Member</dd></div></dl></ProfileCard>
-        <ProfileCard icon="gate" title="Data residency" copy="Myelin keeps execution and durable product data inside the assigned region."><dl><div><dt>Active region</dt><dd><strong>{identity().region}</strong></dd></div><div><dt>Residency</dt><dd>EU sovereign boundary</dd></div></dl></ProfileCard>
+        <ProfileCard icon="human" title="Identity" copy="The identity Myelin uses for attribution and authorization."><dl><div><dt>Display name</dt><dd>{viewer.displayName}</dd></div><div><dt>Principal</dt><dd><code>{viewer.principalId}</code></dd></div></dl></ProfileCard>
+        <ProfileCard icon="team" title="Workspace" copy="Your current organization boundary. Data from another tenant is never mixed into this session."><dl><div><dt>Tenant</dt><dd><code>{viewer.tenant}</code></dd></div><div><dt>Role</dt><dd>Member</dd></div></dl></ProfileCard>
+        <ProfileCard icon="gate" title="Data residency" copy="Myelin keeps execution and durable product data inside the assigned region."><dl><div><dt>Active region</dt><dd><strong>{viewer.region}</strong></dd></div><div><dt>Residency</dt><dd>EU sovereign boundary</dd></div></dl></ProfileCard>
         <ProfileCard icon="settings" title="Appearance" copy="Choose a mode for this browser. The setting persists without changing your organization profile."><div class="profile-theme-options" role="radiogroup" aria-label="Appearance"><For each={THEMES}>{(option) => <button type="button" role="radio" aria-checked={theme() === option} disabled={!interactive()} onClick={() => chooseTheme(option)}><span class={`profile-theme-swatch ${option}`} aria-hidden="true" /><strong>{THEME_COPY[option].label}</strong><small>{THEME_COPY[option].copy}</small></button>}</For></div></ProfileCard>
         <ProfileCard icon="approve" title="Session security" copy="Your capability stays in Myelin’s encrypted server-side session. Browser JavaScript never receives it."><ul class="profile-security-list"><li><Icon name="check-pass" /> Edge identity verified for this session</li><li><Icon name="check-pass" /> Tenant and region bound to every request</li><li><Icon name="check-pass" /> Unsafe requests require same-origin verification</li></ul><button type="button" class="profile-signout" disabled={!interactive()} onClick={() => void signOut()}><Icon name="close" /> Sign out of Myelin</button></ProfileCard>
       </div>
-    </div>}</Show>
+    </div>
   </>;
 }
 

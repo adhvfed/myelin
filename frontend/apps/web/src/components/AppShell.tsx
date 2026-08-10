@@ -1,14 +1,13 @@
 import {
   For,
-  Match,
   Show,
-  Switch,
   createContext,
   createEffect,
   createSignal,
   on,
   onCleanup,
   onMount,
+  untrack,
   useContext,
   type JSX,
 } from "solid-js";
@@ -16,9 +15,9 @@ import { A, useAction, useLocation, useNavigate } from "@solidjs/router";
 import { Icon, Menu, Dialog, useToast, type IconName, type MenuItemSpec } from "@myelin/design-system";
 import { logout, type Viewer } from "../lib/auth";
 import { createInbox } from "../lib/notifications";
-import { inboxReasonLabel } from "../lib/inbox-response";
 import { codeSearchHref } from "../lib/code-search";
 import { CommandPalette, type Command } from "./CommandPalette";
+import { InboxDialog } from "./InboxDialog";
 import { cycleTheme as cycleAppearance } from "../lib/theme";
 
 /** The shell context a nested route uses to fill the shell-owned context-pane region (§1b). A route
@@ -33,6 +32,7 @@ interface ContextPaneApi {
   setContextPaneLabel: (label: string) => void;
 }
 const ContextPaneContext = createContext<ContextPaneApi>();
+const ViewerContext = createContext<Viewer>();
 
 /** Consume the shell's context-pane slot from a nested route (no-op setters off the shell). */
 export function useContextPane(): ContextPaneApi {
@@ -42,6 +42,14 @@ export function useContextPane(): ContextPaneApi {
       setContextPaneLabel: () => {},
     }
   );
+}
+
+/** Read the identity already verified by the authenticated layout, without issuing another server
+ * query from a nested route. */
+export function useAppViewer(): Viewer {
+  const viewer = useContext(ViewerContext);
+  if (!viewer) throw new Error("useAppViewer must be used inside AppShell");
+  return viewer;
 }
 
 interface NavItem {
@@ -89,6 +97,8 @@ function paneColumns(hasSecondary: boolean, hasPaneColumn: boolean): string {
 }
 
 export function AppShell(props: AppShellProps) {
+  // The verified identity is fixed for this shell's lifetime; a session change replaces the route.
+  const contextViewer = untrack(() => props.viewer);
   const location = useLocation();
   const navigate = useNavigate();
   const toast = useToast();
@@ -212,6 +222,8 @@ export function AppShell(props: AppShellProps) {
       <div
         class="app-shell"
         data-shortcuts-ready={shortcutsReady() ? "true" : undefined}
+        inert={!shortcutsReady()}
+        aria-busy={!shortcutsReady() ? "true" : undefined}
         style={{
           display: "grid",
           "grid-template-columns": "auto 1fr",
@@ -420,9 +432,11 @@ export function AppShell(props: AppShellProps) {
             tabindex="-1"
             style={{ "min-height": "0", "min-width": "0", overflow: "auto", padding: "var(--space-5)" }}
           >
-            <ContextPaneContext.Provider value={paneApi}>
-              {props.children}
-            </ContextPaneContext.Provider>
+            <ViewerContext.Provider value={contextViewer}>
+              <ContextPaneContext.Provider value={paneApi}>
+                {props.children}
+              </ContextPaneContext.Provider>
+            </ViewerContext.Provider>
           </main>
           {/* The context pane — a `complementary` landmark that owns its own scroller (§1b). Rendered
               inline only when wide; when narrow it lives in the drawer (below), never in both places. */}
@@ -466,132 +480,11 @@ export function AppShell(props: AppShellProps) {
         onSearch={(query) => navigate(codeSearchHref({ q: query }))}
       />
 
-      <Dialog
+      <InboxDialog
         open={inboxOpen()}
         onClose={() => setInboxOpen(false)}
-        title="Inbox"
-        description="Things that need you land here."
-        size="sm"
-      >
-        <Switch>
-          <Match when={inbox.availability() === "loading"}>
-            <div
-              role="status"
-              data-testid="inbox-loading"
-              style={{ display: "flex", "flex-direction": "column", "align-items": "center", gap: "var(--space-2)", padding: "var(--space-5) var(--space-3)", "text-align": "center", color: "var(--text-muted)" }}
-            >
-              <Icon name="inbox" />
-              <strong style={{ color: "var(--text-primary)" }}>Loading your inbox…</strong>
-            </div>
-          </Match>
-          <Match when={inbox.availability() === "unavailable"}>
-            <div
-              role="alert"
-              data-testid="inbox-unavailable"
-              style={{ display: "flex", "flex-direction": "column", "align-items": "center", gap: "var(--space-2)", padding: "var(--space-5) var(--space-3)", "text-align": "center", color: "var(--text-muted)" }}
-            >
-              <Icon name="inbox" />
-              <strong style={{ color: "var(--text-primary)" }}>Inbox unavailable</strong>
-              <span style={{ "font-size": "var(--fs-body-sm)" }}>
-                We couldn't confirm your notifications. Nothing has been marked as read.
-              </span>
-              <button type="button" class="button-secondary" onClick={inbox.retry}>Try again</button>
-            </div>
-          </Match>
-          <Match when={inbox.items().length === 0}>
-            <div
-              role="status"
-              data-testid="inbox-empty"
-              style={{ display: "flex", "flex-direction": "column", "align-items": "center", gap: "var(--space-2)", padding: "var(--space-5) var(--space-3)", "text-align": "center", color: "var(--text-muted)" }}
-            >
-              <Icon name="inbox" />
-              <strong style={{ color: "var(--text-primary)" }}>You're all caught up</strong>
-              <span style={{ "font-size": "var(--fs-body-sm)" }}>
-                When a pull request needs your review or someone mentions you, it'll show up here.
-              </span>
-            </div>
-          </Match>
-          <Match when={true}>
-            <div style={{ display: "flex", "flex-direction": "column", gap: "var(--space-3)" }}>
-              <ul style={{ "list-style": "none", margin: "0", padding: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
-                <For each={inbox.items()}>
-                  {(item) => (
-                    <li style={{ display: "flex", gap: "var(--space-2)", "align-items": "flex-start", padding: "var(--space-2) 0" }}>
-                      <Icon name="inbox" />
-                      <span style={{ display: "flex", "flex-direction": "column", gap: "var(--space-1)", "min-width": "0" }}>
-                        <strong style={{ color: "var(--text-primary)" }}>
-                          {inboxReasonLabel(item.reason)}
-                          <Show when={item.coalesce_count > 1}> · {item.coalesce_count} events</Show>
-                        </strong>
-                        <code style={{ color: "var(--text-muted)", "font-size": "var(--fs-caption)", "overflow-wrap": "anywhere" }}>
-                          {item.subject}
-                        </code>
-                        <Show when={item.state === "unread"}>
-                          <button
-                            type="button"
-                            class="button-secondary"
-                            style={{ "align-self": "flex-start" }}
-                            onClick={() => void inbox.markRead(item.id)}
-                          >
-                            Mark read
-                          </button>
-                        </Show>
-                        <Show when={item.state !== "done" && item.action}>
-                          {(action) => (
-                            <span style={{ display: "flex", gap: "var(--space-2)" }}>
-                              <button
-                                type="button"
-                                class="button-primary"
-                                onClick={() => {
-                                  const approval = action();
-                                  if (approval.kind === "agent_effect_approval") {
-                                    void inbox.decideAgentEffect(approval.gate_id, "approve");
-                                  } else {
-                                    void inbox.decideAutomation(
-                                      approval.automation_id,
-                                      approval.event_id,
-                                      "approve",
-                                    );
-                                  }
-                                }}
-                              >
-                                Approve
-                              </button>
-                              <button
-                                type="button"
-                                class="button-secondary"
-                                onClick={() => {
-                                  const approval = action();
-                                  if (approval.kind === "agent_effect_approval") {
-                                    void inbox.decideAgentEffect(approval.gate_id, "reject");
-                                  } else {
-                                    void inbox.decideAutomation(
-                                      approval.automation_id,
-                                      approval.event_id,
-                                      "reject",
-                                    );
-                                  }
-                                }}
-                              >
-                                Reject
-                              </button>
-                            </span>
-                          )}
-                        </Show>
-                      </span>
-                    </li>
-                  )}
-                </For>
-              </ul>
-              <Show when={inbox.hasMore()}>
-                <p role="status" style={{ margin: "0", color: "var(--text-muted)", "font-size": "var(--fs-body-sm)" }}>
-                  More notifications are available. Pagination is not yet available in this panel.
-                </p>
-              </Show>
-            </div>
-          </Match>
-        </Switch>
-      </Dialog>
+        inbox={inbox}
+      />
     </>
   );
 }

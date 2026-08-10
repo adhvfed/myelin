@@ -14,7 +14,7 @@ import { RefSwitcher } from "~/components/RefSwitcher";
 import { Markdown } from "~/components/Markdown";
 import { CloneUrl, GitSetupGuide } from "~/components/GitCloneSetup";
 import { repoHomeContinuationHref } from "~/lib/tree-browse-state";
-import { requireViewer } from "~/lib/auth";
+import { useAppViewer } from "~/components/AppShell";
 
 const card = {
   border: "var(--hairline) solid var(--border)",
@@ -29,7 +29,7 @@ export default function RepoHomeScreen() {
     async () => (params.repo ? getRepo(params.repo) : undefined),
     { deferStream: true },
   );
-  const viewer = createAsync(() => requireViewer(), { deferStream: true });
+  const viewer = useAppViewer();
   const toast = useToast();
   const defaultBranch = () => repo()?.default_branch ?? "main";
 
@@ -71,16 +71,12 @@ export default function RepoHomeScreen() {
                       <Show when={home.clone_url} keyed>
                         {(cloneUrl) => <>
                           <CloneUrl url={cloneUrl} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
-                          <Show when={viewer()}>
-                            {(identity) => (
-                              <GitSetupGuide
-                                url={cloneUrl}
-                                principalId={identity().principalId}
-                                tenant={identity().tenant}
-                                defaultBranch={defaultBranch()}
-                              />
-                            )}
-                          </Show>
+                          <GitSetupGuide
+                            url={cloneUrl}
+                            principalId={viewer.principalId}
+                            tenant={viewer.tenant}
+                            defaultBranch={defaultBranch()}
+                          />
                         </>}
                       </Show>
                     </div>
@@ -108,16 +104,12 @@ export default function RepoHomeScreen() {
                         <Show when={home.clone_url} keyed>
                           {(cloneUrl) => <>
                             <CloneUrl url={cloneUrl} onCopy={() => toast.show({ title: "Clone URL copied", variant: "info" })} />
-                            <Show when={viewer()}>
-                              {(identity) => (
-                                <GitSetupGuide
-                                  url={cloneUrl}
-                                  principalId={identity().principalId}
-                                  tenant={identity().tenant}
-                                  defaultBranch={defaultBranch()}
-                                />
-                              )}
-                            </Show>
+                            <GitSetupGuide
+                              url={cloneUrl}
+                              principalId={viewer.principalId}
+                              tenant={viewer.tenant}
+                              defaultBranch={defaultBranch()}
+                            />
                           </>}
                         </Show>
                         <A href={`/git/repos/${params.repo}/commits/${encodeURIComponent(defaultBranch())}`} style={{ display: "inline-flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-primary)" }}>

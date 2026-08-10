@@ -166,6 +166,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
   test("keyboard: Enter on the repo-home tree file link activates the blob view", async ({ page }) => {
     await devLogin(page);
     await page.goto("/git/repos/myelin");
+    await expect(page.locator(".app-shell")).toHaveAttribute("data-shortcuts-ready", "true");
     const fileLink = page.getByTestId("repo-tree").getByRole("link", { name: "README.md" });
     // Locator.press focuses the semantic link and dispatches a real Enter key event. The resulting
     // navigation is the user-observable proof; a programmatic focus assertion proves nothing more.
@@ -230,7 +231,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
 
     await page.goto(`${target.pathname}${target.search}`);
     await expect(page.getByTestId("repo-error")).toHaveAttribute("data-kind", "stale-tree");
-    await page.getByRole("button", { name: "Reload directory" }).click();
+    await page.getByRole("link", { name: "Reload directory" }).click();
 
     await expect(page).not.toHaveURL(/(?:\?|&)cursor=/);
     await expect(page.getByTestId("repo-tree")).toBeVisible();

@@ -1,4 +1,4 @@
-import { useAction } from "@solidjs/router";
+import { revalidate, useAction } from "@solidjs/router";
 import { createResource, createSignal, type Accessor } from "solid-js";
 
 import {
@@ -54,10 +54,14 @@ export function createInbox(): InboxState {
     return "ready";
   };
   const hasMore = () => page()?.page.next_cursor != null;
+  const reload = async (): Promise<void> => {
+    await revalidate(getInbox.key);
+    await refetch();
+  };
   const markRead = async (itemId: string): Promise<boolean> => {
     const result = await markReadAction(itemId);
     if (!result.ok) return false;
-    await refetch();
+    await reload();
     return true;
   };
   const decideAutomation = async (
@@ -67,7 +71,7 @@ export function createInbox(): InboxState {
   ): Promise<boolean> => {
     const result = await decideAutomationAction({ automationId, eventId, decision });
     if (!result.ok) return false;
-    await refetch();
+    await reload();
     return true;
   };
   const decideAgentEffect = async (
@@ -76,7 +80,7 @@ export function createInbox(): InboxState {
   ): Promise<boolean> => {
     const result = await decideAgentEffectAction({ gateId, decision });
     if (!result.ok) return false;
-    await refetch();
+    await reload();
     return true;
   };
   return {
@@ -84,7 +88,7 @@ export function createInbox(): InboxState {
     unreadCount,
     availability,
     hasMore,
-    retry: () => void refetch(),
+    retry: () => void reload(),
     markRead,
     decideAutomation,
     decideAgentEffect,

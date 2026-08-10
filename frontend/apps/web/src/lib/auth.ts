@@ -14,6 +14,7 @@ import {
   edgeWhoami,
   edgeWhoamiWithToken,
   isUnauthorized,
+  type EdgeWhoami,
 } from "../server/gateway";
 import { beginOidcLogin, interactiveOidcConfigured } from "../server/oidc";
 import {
@@ -66,27 +67,33 @@ export const getViewer = query(async (): Promise<Viewer | null> => {
   };
 }, "viewer");
 
-/** Like `getViewer`, but for the authenticated app layout: a missing session throws a `/login`
- *  redirect (the auth guard the whole app shell sits behind). */
-export const requireViewer = query(async (): Promise<Viewer> => {
+/** Verify the authenticated app shell's viewer with the edge. `null` means verification is
+ * temporarily unavailable and is safe to retry; missing, rejected, or mismatched sessions redirect. */
+export const requireViewer = query(async (): Promise<Viewer | null> => {
   "use server";
   const rec = await getSessionRecord();
   if (!rec) throw redirect("/login");
+
+  let who: EdgeWhoami;
   try {
-    const who = await edgeWhoami();
-    if (
-      who.principal_id !== rec.principalId ||
-      who.tenant !== rec.tenant ||
-      who.region !== rec.region
-    ) {
+    who = await edgeWhoami();
+  } catch (error) {
+    if (isUnauthorized(error)) {
       await clearCurrentSession();
       throw redirect("/login");
     }
-  } catch (error) {
-    if (!isUnauthorized(error)) throw error;
+    return null;
+  }
+
+  if (
+    who.principal_id !== rec.principalId ||
+    who.tenant !== rec.tenant ||
+    who.region !== rec.region
+  ) {
     await clearCurrentSession();
     throw redirect("/login");
   }
+
   return {
     principalId: rec.principalId,
     displayName: rec.displayName,

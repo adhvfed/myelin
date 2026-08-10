@@ -82,6 +82,15 @@ export default function TreeScreen() {
     { deferStream: true },
   );
 
+  const staleCursorReloadHref = () => treeReloadHref({
+    repo: params.repo!,
+    ref: ref(),
+    path: path(),
+    limit: limit(),
+    q: query(),
+    cursor: cursor(),
+  });
+
   const parentHref = () => {
     const segs = path().split("/").filter(Boolean);
     if (segs.length === 0) return undefined; // the root has no parent row
@@ -132,19 +141,8 @@ export default function TreeScreen() {
           <RepoErrorState
             kind={kind}
             repo={params.repo}
-            onRetry={kind === "stale-tree"
-              ? () => {
-                  navigate(treeReloadHref({
-                    repo: params.repo!,
-                    ref: ref(),
-                    path: path(),
-                    limit: limit(),
-                    q: query(),
-                    cursor: cursor(),
-                  }));
-                  reset();
-                }
-              : reset}
+            retryHref={kind === "stale-tree" ? staleCursorReloadHref() : undefined}
+            onRetry={kind === "stale-tree" ? undefined : reset}
           />
         );
       }}>

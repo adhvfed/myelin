@@ -56,6 +56,8 @@ export interface RepoErrorStateProps {
   repo?: string;
   /** PR number when the error state can offer the overview as a context-preserving escape hatch. */
   prNumber?: number;
+  /** A recovery destination that must work before hydration (for example, dropping a stale cursor). */
+  retryHref?: string;
   /** Retry handler (the ErrorBoundary `reset`) — wired on the retryable `error` kind. */
   onRetry?: () => void;
 }
@@ -141,10 +143,21 @@ function StaleOrError(props: RepoErrorStateProps) {
         <p style={{ color: "var(--text-muted)", margin: "0", "max-width": "40ch" }}>
           The directory changed while you were paging. Reload it to continue from the latest version.
         </p>
-        <Show when={props.onRetry}>
-          <button type="button" style={btn} onClick={() => props.onRetry?.()}>
-            <Icon name="cycle" /> Reload directory
-          </button>
+        <Show
+          when={props.retryHref}
+          fallback={(
+            <Show when={props.onRetry}>
+              <button type="button" style={btn} onClick={() => props.onRetry?.()}>
+                <Icon name="cycle" /> Reload directory
+              </button>
+            </Show>
+          )}
+        >
+          {(href) => (
+            <a href={href()} rel="external" style={btn}>
+              <Icon name="cycle" /> Reload directory
+            </a>
+          )}
         </Show>
       </div>
     </Show>
