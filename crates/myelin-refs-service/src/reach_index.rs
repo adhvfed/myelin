@@ -15,14 +15,8 @@ pub const R4_READ_BUDGET_FANOUT: u64 = 1000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum R4Verdict {
-    ServeFromR4 {
-        measured_fanout: u64,
-        budget: u64,
-    },
-    ServeFromCte {
-        measured_fanout: u64,
-        budget: u64,
-    },
+    ServeFromR4 { measured_fanout: u64, budget: u64 },
+    ServeFromCte { measured_fanout: u64, budget: u64 },
 }
 
 impl R4Verdict {

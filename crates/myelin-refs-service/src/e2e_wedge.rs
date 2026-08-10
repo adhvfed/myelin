@@ -1,4 +1,7 @@
-#![cfg_attr(not(any(test, feature = "test-support")), allow(unused_imports, dead_code))]
+#![cfg_attr(
+    not(any(test, feature = "test-support")),
+    allow(unused_imports, dead_code)
+)]
 
 use std::sync::Arc;
 use std::time::Duration;

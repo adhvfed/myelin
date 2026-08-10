@@ -105,12 +105,10 @@ fn dropping_the_issue_relation_mirror_flips_parity_red() {
     let mut truth = RefsReindexSource::new();
     for edge in &corpus.reference_edges {
         truth.record(edge.clone());
-        live.handle(&super::live_reference_event(
-            &tenant(),
-            &region(),
-            edge,
-            &ctx_base(),
-        ), &mut myelin_events::HandlerTx::none());
+        live.handle(
+            &super::live_reference_event(&tenant(), &region(), edge, &ctx_base()),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
     for ev in &corpus.page_parent_snapshot {
         project_typed_event(live.projection(), &tenant(), &region(), ev).unwrap();

@@ -102,15 +102,14 @@ impl IssueOwner {
         let projection = Self::projection(ref_);
         match sub {
             None => SubState::Live(projection),
-            Some(Sub::Field(_)) | Some(Sub::Row(_)) => {
-                self.anchors
-                    .lock()
-                    .unwrap()
-                    .get(&ref_.0)
-                    .copied()
-                    .map(|s| s.into_sub_state(projection.clone()))
-                    .unwrap_or(SubState::Gone)
-            }
+            Some(Sub::Field(_)) | Some(Sub::Row(_)) => self
+                .anchors
+                .lock()
+                .unwrap()
+                .get(&ref_.0)
+                .copied()
+                .map(|s| s.into_sub_state(projection.clone()))
+                .unwrap_or(SubState::Gone),
             Some(_) => SubState::Live(projection),
         }
     }

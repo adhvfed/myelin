@@ -175,7 +175,10 @@ fn missed_ledger_entry_resurrects_pii_red_counter_case() {
     let corpus = build_backup_scale_corpus(&tenant(), &region(), 4, 2);
 
     for edge in &corpus.edges {
-        builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
+        builder.handle(
+            &corpus.edge_event(edge),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
     let projection = builder.projection().clone();
     for subject_id in &corpus.subjects {
@@ -211,7 +214,10 @@ fn missed_ledger_entry_resurrects_pii_red_counter_case() {
         cache
             .fill(&tenant(), &region(), &edge.source, &proj)
             .unwrap();
-        builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
+        builder.handle(
+            &corpus.edge_event(edge),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
 
     let mut still_recoverable = 0usize;

@@ -1,5 +1,13 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "integration")]
+use myelin_events::OutboxStore;
+#[cfg(feature = "integration")]
+use myelin_substrate::{
+    AppSpec, Config, ConsumerReg, CriticalDependencies, InternalRpc, OutboxSpec, PublicRoutes,
+    StoreManifest,
+};
+
 pub mod backlinks;
 pub mod cache;
 pub mod chat_producer;
@@ -20,6 +28,8 @@ pub mod ladder;
 pub mod loop_guard;
 pub mod migration;
 pub mod mirror;
+#[cfg(feature = "integration")]
+pub mod pg_edge;
 pub mod reach_index;
 pub mod reindex;
 #[cfg(any(test, feature = "test-support"))]
@@ -53,8 +63,8 @@ pub use e2e_wedge::{run_e2e_1_pr_pane, run_e2e_3_spec_to_ship, E2eArtifact, E2E_
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::{run_e2e_4_dsar_fanout, run_refs_e2e_wedge};
 pub use edge_builder::{
-    edge_id, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder, RelClass,
-    EDGE_BUILDER_CONSUMER, EDGE_BUILDER_SUBJECTS, EDGE_BUILDER_SUBJECT_PREFIXES,
+    edge_id, edge_mutation, EdgeMutation, EdgeProjection, EdgeRow, ProjectError, RefsEdgeBuilder,
+    RelClass, EDGE_BUILDER_CONSUMER, EDGE_BUILDER_SUBJECTS, EDGE_BUILDER_SUBJECT_PREFIXES,
 };
 pub use emit::{
     edge_aggregate_key, emit_edges, extract_edges, EdgeDraft, EdgeRel, REFS_EDGE_CREATED,
@@ -96,6 +106,8 @@ pub use mirror::{
     mirror_edges, project_typed_event, reconverge, Inverse, LifecycleRel, MirrorError,
     SyntheticTypedEvent,
 };
+#[cfg(feature = "integration")]
+pub use pg_edge::{build_pg_edge_consumer, PgEdgeProjector, PgEdgeStore};
 pub use reach_index::{R4ReachIndex, R4Verdict, R4_READ_BUDGET_FANOUT};
 pub use reindex::{
     RefsReindexSource, RefsReindexer, ReindexError, ReindexReceipt, SourceEdge,
@@ -127,3 +139,40 @@ pub use traverse::{
     apply_post_filter, depth_ceiling_from_thresholds, max_nodes_from_thresholds, Traverse,
     TraverseFilter, TraverseNode, TraverseResult, TRAVERSE_DEPTH_CEILING, TRAVERSE_MAX_NODES,
 };
+
+pub const SERVICE_NAME: &str = "refs";
+pub const EVENT_STREAM_NAME: &str = "MYELIN_EVENTS";
+pub const EVENT_SUBJECT_ROOT: &str = "myelin.events";
+pub const EVENT_DURABLE_CONSUMER: &str = "refs-edge-builder-intake";
+
+pub fn refs_intake_filter() -> String {
+    format!("{EVENT_SUBJECT_ROOT}.evt.*.refs.>")
+}
+
+#[cfg(feature = "integration")]
+pub async fn run_refs_ingestion_until_shutdown<F>(
+    config: Config,
+    outbox: OutboxStore,
+    consumers: Vec<ConsumerReg>,
+    intake: Box<dyn myelin_events::EventConsumer>,
+    delivery_quarantine: std::sync::Arc<dyn myelin_events::DurableDeliveryQuarantine>,
+    shutdown: F,
+) -> Result<(), myelin_substrate::ServeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    let spec = AppSpec {
+        name: SERVICE_NAME,
+        config,
+        migrations: edge_table_migrations(),
+        hot_tables: myelin_substrate::HotTables::none(),
+        public: PublicRoutes::default(),
+        internal: InternalRpc::default(),
+        consumers,
+        holders: AppSpec::auto(),
+        stores: StoreManifest::new(),
+        outbox: OutboxSpec::external_relay_with_consumer(outbox, intake, delivery_quarantine),
+        critical: CriticalDependencies::default(),
+    };
+    myelin_substrate::serve_until_shutdown(spec, shutdown).await
+}

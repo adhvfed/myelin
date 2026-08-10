@@ -189,7 +189,7 @@ pub struct BodyEdge {
 }
 
 pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> AggregateKey {
-    AggregateKey(format!("edge:{}->{}", source.0, target.0))
+    myelin_refs::edge_aggregate_key(source, target)
 }
 
 fn principal_member_ref(p: &Principal) -> ArtifactRef {
@@ -552,7 +552,7 @@ mod tests {
         assert_eq!(draft.payload["target"], target.0);
         assert_eq!(draft.payload["rel"], "embeds");
         assert_eq!(draft.payload["rel_class"], "reference");
-        assert_eq!(draft.aggregate.0, format!("edge:{}->{}", src.0, target.0));
+        assert_eq!(draft.aggregate, edge_aggregate_key(&src, &target));
         assert!(
             !draft.contains_personal_data,
             "references-not-payloads: no inline PII"

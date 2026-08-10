@@ -247,14 +247,8 @@ pub fn git_replay_scope(grain: GitReplayGrain) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitReplayGrain {
     Repo(String),
-    Blob {
-        repo: String,
-        oid: String,
-    },
-    Pr {
-        repo: String,
-        number: u64,
-    },
+    Blob { repo: String, oid: String },
+    Pr { repo: String, number: u64 },
 }
 
 pub const GIT_OWNER_TOKEN: &str = GIT_SUBSYSTEM;

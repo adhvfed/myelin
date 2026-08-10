@@ -135,14 +135,18 @@ fn erased_aggregate_is_not_re_snapshotted_x7() {
 #[test]
 fn reindex_from_source_rebuilds_byte_parity_cold_equals_live() {
     let live_builder = RefsEdgeBuilder::new(EdgeProjection::new());
-    live_builder.handle(&live_edge_event("01J-1", "s1", "t1", "mentions"), &mut myelin_events::HandlerTx::none());
-    live_builder.handle(&live_edge_event("01J-2", "s2", "t2", "embeds"), &mut myelin_events::HandlerTx::none());
-    live_builder.handle(&live_edge_event(
-        "01J-3",
-        "s3#block-9",
-        "t3#block-3",
-        "embeds",
-    ), &mut myelin_events::HandlerTx::none());
+    live_builder.handle(
+        &live_edge_event("01J-1", "s1", "t1", "mentions"),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    live_builder.handle(
+        &live_edge_event("01J-2", "s2", "t2", "embeds"),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    live_builder.handle(
+        &live_edge_event("01J-3", "s3#block-9", "t3#block-3", "embeds"),
+        &mut myelin_events::HandlerTx::none(),
+    );
     let live = live_builder.projection().clone();
     assert_eq!(
         live.live_count(&tenant(), &region()),
@@ -151,9 +155,10 @@ fn reindex_from_source_rebuilds_byte_parity_cold_equals_live() {
     );
 
     let reindexer = RefsReindexer::new(RefsEdgeBuilder::new(EdgeProjection::new()));
-    reindexer
-        .builder()
-        .handle(&live_edge_event("stale-1", "GONE", "GONE2", "links"), &mut myelin_events::HandlerTx::none());
+    reindexer.builder().handle(
+        &live_edge_event("stale-1", "GONE", "GONE2", "links"),
+        &mut myelin_events::HandlerTx::none(),
+    );
     assert_eq!(
         reindexer.projection().live_count(&tenant(), &region()),
         1,
@@ -206,7 +211,10 @@ fn reindex_from_source_rebuilds_byte_parity_cold_equals_live() {
 #[test]
 fn reindex_rerun_emits_zero_new_and_stays_byte_parity() {
     let live_builder = RefsEdgeBuilder::new(EdgeProjection::new());
-    live_builder.handle(&live_edge_event("01J-1", "s1", "t1", "mentions"), &mut myelin_events::HandlerTx::none());
+    live_builder.handle(
+        &live_edge_event("01J-1", "s1", "t1", "mentions"),
+        &mut myelin_events::HandlerTx::none(),
+    );
     let live = live_builder.projection().clone();
 
     let reindexer = RefsReindexer::new(RefsEdgeBuilder::new(EdgeProjection::new()));
@@ -237,8 +245,14 @@ fn reindex_rerun_emits_zero_new_and_stays_byte_parity() {
 #[test]
 fn reindex_parity_telemetry_is_zero_on_drift() {
     let live_builder = RefsEdgeBuilder::new(EdgeProjection::new());
-    live_builder.handle(&live_edge_event("01J-1", "s1", "t1", "mentions"), &mut myelin_events::HandlerTx::none());
-    live_builder.handle(&live_edge_event("01J-2", "s2", "t2", "embeds"), &mut myelin_events::HandlerTx::none());
+    live_builder.handle(
+        &live_edge_event("01J-1", "s1", "t1", "mentions"),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    live_builder.handle(
+        &live_edge_event("01J-2", "s2", "t2", "embeds"),
+        &mut myelin_events::HandlerTx::none(),
+    );
     let live = live_builder.projection().clone();
 
     let reindexer = RefsReindexer::new(RefsEdgeBuilder::new(EdgeProjection::new()));
@@ -267,7 +281,10 @@ fn malformed_snapshot_fails_the_rebuild_loudly() {
     let mut malformed = live_edge_event("01J-bad", "s", "t", "mentions");
     malformed.type_ = myelin_events::EventType("refs.edge.snapshot".into());
     malformed.payload = serde_json::json!({ "target": "t", "rel": "mentions" });
-    match reindexer.builder().handle(&malformed, &mut myelin_events::HandlerTx::none()) {
+    match reindexer
+        .builder()
+        .handle(&malformed, &mut myelin_events::HandlerTx::none())
+    {
         myelin_events::HandleOutcome::NonRetryable(myelin_events::Reason(r)) => {
             assert!(
                 r.contains("source"),
@@ -330,12 +347,15 @@ fn te7_drift_reconverges_to_typed_table_typed_wins() {
 #[test]
 fn reconverge_leaves_reference_class_edges_untouched() {
     let reindexer = RefsReindexer::new(RefsEdgeBuilder::new(EdgeProjection::new()));
-    reindexer.builder().handle(&live_edge_event(
-        "01J-ref",
-        "myelin://acme/chat/message/m1",
-        "myelin://acme/issue/issue/ENG-2",
-        "mentions",
-    ), &mut myelin_events::HandlerTx::none());
+    reindexer.builder().handle(
+        &live_edge_event(
+            "01J-ref",
+            "myelin://acme/chat/message/m1",
+            "myelin://acme/issue/issue/ENG-2",
+            "mentions",
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     let covered = vec![ArtifactRef("myelin://acme/issue/issue/ENG-2".into())];
 
     let (_re, tombstoned) = reindexer
@@ -355,9 +375,10 @@ fn reconverge_leaves_reference_class_edges_untouched() {
 #[test]
 fn incremental_backfill_extends_does_not_wipe() {
     let reindexer = RefsReindexer::new(RefsEdgeBuilder::new(EdgeProjection::new()));
-    reindexer
-        .builder()
-        .handle(&live_edge_event("01J-existing", "s0", "t0", "links"), &mut myelin_events::HandlerTx::none());
+    reindexer.builder().handle(
+        &live_edge_event("01J-existing", "s0", "t0", "links"),
+        &mut myelin_events::HandlerTx::none(),
+    );
     assert_eq!(reindexer.projection().live_count(&tenant(), &region()), 1);
 
     let mut src = RefsReindexSource::new();

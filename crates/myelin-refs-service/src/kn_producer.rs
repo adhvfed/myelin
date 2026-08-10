@@ -122,15 +122,14 @@ impl KnOwner {
             Some(Sub::Block(_))
             | Some(Sub::Heading(_))
             | Some(Sub::Row(_))
-            | Some(Sub::Field(_)) => {
-                self.anchors
-                    .lock()
-                    .unwrap()
-                    .get(&ref_.0)
-                    .copied()
-                    .map(|s| s.into_sub_state(projection.clone()))
-                    .unwrap_or(SubState::Gone)
-            }
+            | Some(Sub::Field(_)) => self
+                .anchors
+                .lock()
+                .unwrap()
+                .get(&ref_.0)
+                .copied()
+                .map(|s| s.into_sub_state(projection.clone()))
+                .unwrap_or(SubState::Gone),
             Some(_) => SubState::Live(projection),
         }
     }
@@ -264,10 +263,7 @@ pub fn kn_replay_scope(grain: KnReplayGrain) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KnReplayGrain {
     Page(String),
-    Block {
-        page: String,
-        id: String,
-    },
+    Block { page: String, id: String },
     Subtree(String),
 }
 

@@ -244,7 +244,10 @@ mod tests {
         let inv = RefsProjectionInvalidator::with_cache(Arc::new(shim.clone()));
         let ref_ = "myelin://acme/issue/issue/ENG-1";
         let ev = lifecycle_event("01J-e1", "issue.issue.erased", ref_);
-        assert_eq!(inv.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            inv.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(
             shim.call_count(),
             1,
@@ -259,7 +262,10 @@ mod tests {
         let inv = RefsProjectionInvalidator::with_cache(Arc::new(shim.clone()));
         let ref_ = "myelin://acme/knowledge/page/7c2#block-9";
         let ev = lifecycle_event("01J-u2", "knowledge.page.updated", ref_);
-        assert_eq!(inv.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            inv.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(
             shim.invalidations()[0].ref_.0,
             ref_,
@@ -311,7 +317,10 @@ mod tests {
         let mut ev = lifecycle_event("01J-u3", "chat.message.updated", "");
         ev.subject = ArtifactRef(String::new());
         ev.payload = serde_json::json!({ "ref": "myelin://acme/chat/message/m1" });
-        assert_eq!(inv.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            inv.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(
             shim.invalidations()[0].ref_.0,
             "myelin://acme/chat/message/m1"
@@ -343,11 +352,14 @@ mod tests {
         let shim = NoOpCacheShim::new();
         assert_eq!(shim.call_count(), 0, "a fresh shim has recorded nothing");
         let inv = RefsProjectionInvalidator::with_cache(Arc::new(shim.clone()));
-        inv.handle(&lifecycle_event(
-            "01J-u",
-            "issue.issue.updated",
-            "myelin://acme/issue/issue/E1",
-        ), &mut myelin_events::HandlerTx::none());
+        inv.handle(
+            &lifecycle_event(
+                "01J-u",
+                "issue.issue.updated",
+                "myelin://acme/issue/issue/E1",
+            ),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(
             shim.call_count(),
             1,

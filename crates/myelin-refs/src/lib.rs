@@ -4,7 +4,7 @@ mod parse;
 use myelin_identity::Principal;
 use serde::{Deserialize, Serialize};
 
-pub use myelin_events::ArtifactRef;
+pub use myelin_events::{AggregateKey, ArtifactRef};
 
 pub use parse::{
     format, mint, parse, parse_scoped, strip_sub, sub_kind, ParseError, ParsedArtifactRef, Sub,
@@ -12,6 +12,21 @@ pub use parse::{
 };
 
 pub use object_key::{object_key, ObjectKey};
+
+/// A bounded, privacy-preserving ordering key for all events about one directed edge.
+///
+/// Artifact refs are intentionally absent from the broker subject derived from this aggregate.
+/// Apart from avoiding metadata disclosure, hashing keeps long `#sub` references inside the event
+/// envelope instead of exceeding the event-stream token limit.
+pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> AggregateKey {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"myelin.refs.edge.aggregate.v1\0");
+    for value in [&source.0, &target.0] {
+        hash.update(&(value.len() as u64).to_be_bytes());
+        hash.update(value.as_bytes());
+    }
+    AggregateKey(format!("refs-edge:{}", hash.finalize().to_hex()))
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubKindRegistration {
@@ -21,13 +36,9 @@ pub struct SubKindRegistration {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RegistrationError {
-    UnknownSubsystem {
-        token: String,
-    },
+    UnknownSubsystem { token: String },
     NoKinds,
-    DuplicateKind {
-        kind: &'static str,
-    },
+    DuplicateKind { kind: &'static str },
 }
 
 impl core::fmt::Display for RegistrationError {
@@ -162,6 +173,27 @@ mod tests {
             codec.backlinks(&r, &viewer),
             Err(RefError::ProjectionUnavailable)
         );
+    }
+
+    #[test]
+    fn edge_aggregate_keys_are_bounded_opaque_and_stable() {
+        let source = ArtifactRef(format!(
+            "myelin://acme/chat/message/{}#{}",
+            "m".repeat(180),
+            "block-9".repeat(20)
+        ));
+        let target = ArtifactRef(format!(
+            "myelin://acme/knowledge/page/{}#{}",
+            "p".repeat(180),
+            "block-3".repeat(20)
+        ));
+
+        let first = edge_aggregate_key(&source, &target);
+        let replay = edge_aggregate_key(&source, &target);
+        assert_eq!(first, replay);
+        assert_eq!(first.0.len(), "refs-edge:".len() + 64);
+        assert!(!first.0.contains("myelin://"));
+        assert_ne!(first, edge_aggregate_key(&target, &source));
     }
 
     #[test]

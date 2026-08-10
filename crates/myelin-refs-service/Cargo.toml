@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "refs"
+path = "src/main.rs"
+required-features = ["integration"]
+
 [dependencies]
 myelin-gdpr = { path = "../myelin-gdpr" }
 myelin-storage = { path = "../myelin-storage" }
@@ -13,6 +18,7 @@ myelin-refs = { path = "../myelin-refs" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
+myelin-config = { workspace = true, optional = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 myelin-content = { path = "../myelin-content" }
@@ -23,7 +29,7 @@ blake3 = { workspace = true }
 hex = { workspace = true }
 
 sqlx = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["signal"] }
 
 [dev-dependencies]
 myelin-harness = { path = "../myelin-harness" }
@@ -35,4 +41,10 @@ myelin-refs-service = { path = ".", features = ["test-support"] }
 default = []
 test-support = ["myelin-storage/test-support", "myelin-events/test-support"]
 memory = ["test-support"]
-integration = ["dep:sqlx", "dep:tokio", "myelin-storage/integration"]
+integration = [
+    "dep:myelin-config",
+    "dep:sqlx",
+    "dep:tokio",
+    "myelin-events/nats",
+    "myelin-storage/integration",
+]

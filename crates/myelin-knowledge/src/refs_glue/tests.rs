@@ -197,10 +197,10 @@ fn each_inline_node_emits_one_reference_edge() {
     let e = store.row(&ids[2]).expect("embed edge row");
     assert_eq!(e.envelope.payload["rel"], "embeds");
     assert_eq!(
-        e.aggregate.0,
-        format!(
-            "edge:{}->{}",
-            source.0, "myelin://acme/knowledge/page/incident-runbook"
+        e.aggregate,
+        edge_aggregate_key(
+            &source,
+            &ArtifactRef("myelin://acme/knowledge/page/incident-runbook".into())
         )
     );
     assert_eq!(e.envelope.payload["source"], source.0);

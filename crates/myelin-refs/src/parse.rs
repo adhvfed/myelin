@@ -6,25 +6,13 @@ pub const SCHEME: &str = "myelin://";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParseError {
-    MissingScheme {
-        input: String,
-    },
-    IncompleteScope {
-        got_segments: usize,
-    },
-    EmptySegment {
-        segment: &'static str,
-    },
-    UnknownSubsystem {
-        token: String,
-    },
-    UnknownType {
-        token: String,
-    },
+    MissingScheme { input: String },
+    IncompleteScope { got_segments: usize },
+    EmptySegment { segment: &'static str },
+    UnknownSubsystem { token: String },
+    UnknownType { token: String },
     EmptySub,
-    UnknownSubKind {
-        sub: String,
-    },
+    UnknownSubKind { sub: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,10 +82,7 @@ pub enum Sub {
     Heading(String),
     Row(String),
     Field(String),
-    LineRange {
-        start: u64,
-        end: u64,
-    },
+    LineRange { start: u64, end: u64 },
     Check(String),
     CommitCheck { commit_oid: String, context: String },
     CommitCiResult { commit_oid: String },

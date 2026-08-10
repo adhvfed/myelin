@@ -277,8 +277,25 @@ services:
       MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
     startup_message: "Myelin notifications are running"
 
+  refs:
+    depends_on: [event-stream-ready, development-tenants-ready]
+    process: cargo run --quiet -p myelin-refs-service --features integration --bin refs
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+    startup_message: "Myelin reference graph is projecting durable edges"
+
   web:
-    depends_on: [edge, outbox-publisher, ci-dispatch, ci-controlplane, git-checks, notifications]
+    depends_on: [edge, outbox-publisher, ci-dispatch, ci-controlplane, git-checks, notifications, refs]
     install: pnpm --dir frontend install --frozen-lockfile
     process: >-
       sh -c 'set -eu;
@@ -342,7 +359,7 @@ scripts:
     script: pnpm --dir frontend check
 
   test:system:
-    depends_on: [outbox-publisher, ci-controlplane, git-checks, notifications]
+    depends_on: [outbox-publisher, ci-controlplane, git-checks, notifications, refs]
     environment:
       DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
       DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"

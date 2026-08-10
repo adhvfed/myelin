@@ -709,7 +709,7 @@ mod tests {
             &viewer("insider"),
             ResolveMode::Live,
             &bounded_stale(),
-             true,
+            true,
         );
         assert!(
             r.is_tombstone(),

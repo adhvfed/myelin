@@ -157,7 +157,10 @@ pub fn run_full_scale_reindex_parity(
     let mut truth = RefsReindexSource::new();
     for edge in &corpus.reference_edges {
         truth.record(edge.clone());
-        live.handle(&live_reference_event(tenant, region, edge, &ctx_base), &mut myelin_events::HandlerTx::none());
+        live.handle(
+            &live_reference_event(tenant, region, edge, &ctx_base),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
     let live_proj = live.projection();
     for ev in &corpus.page_parent_snapshot {

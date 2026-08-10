@@ -98,7 +98,11 @@ impl KnowledgeReindexSource {
     }
 
     pub fn upsert_edge(&mut self, source: &str, target: &str, rel: &str, version: u64) {
-        let aggregate = format!("edge:{source}->{target}");
+        let aggregate = myelin_refs::edge_aggregate_key(
+            &myelin_refs::ArtifactRef(source.into()),
+            &myelin_refs::ArtifactRef(target.into()),
+        )
+        .0;
         let payload = serde_json::json!({
             "source": source,
             "target": target,
@@ -134,7 +138,13 @@ impl KnowledgeReindexSource {
 
     pub fn remove_edge(&mut self, source: &str, target: &str) -> bool {
         self.edges
-            .remove(&format!("edge:{source}->{target}"))
+            .remove(
+                &myelin_refs::edge_aggregate_key(
+                    &myelin_refs::ArtifactRef(source.into()),
+                    &myelin_refs::ArtifactRef(target.into()),
+                )
+                .0,
+            )
             .is_some()
     }
 

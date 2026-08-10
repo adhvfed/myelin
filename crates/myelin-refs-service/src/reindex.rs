@@ -184,7 +184,10 @@ impl RefsReindexer {
             let row = outbox.row(&id).ok_or_else(|| {
                 ReindexError::Bus(format!("snapshot row {} absent after emit", id.0))
             })?;
-            match self.builder.handle(&row.envelope, &mut myelin_events::HandlerTx::none()) {
+            match self
+                .builder
+                .handle(&row.envelope, &mut myelin_events::HandlerTx::none())
+            {
                 myelin_events::HandleOutcome::Done => ingested += 1,
                 myelin_events::HandleOutcome::NonRetryable(myelin_events::Reason(r)) => {
                     return Err(ReindexError::Poison(r));

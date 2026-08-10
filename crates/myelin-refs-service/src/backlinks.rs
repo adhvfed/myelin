@@ -267,10 +267,7 @@ impl AuthzVisibleIndex {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WatermarkVerdict {
     JoinServes,
-    FallBackToCheck {
-        required: String,
-        watermark: String,
-    },
+    FallBackToCheck { required: String, watermark: String },
 }
 
 pub fn watermark_verdict(

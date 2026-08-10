@@ -30,7 +30,7 @@ pub struct LifecycleEdge {
 }
 
 pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> AggregateKey {
-    AggregateKey(format!("edge:{}->{}", source.0, target.0))
+    myelin_refs::edge_aggregate_key(source, target)
 }
 
 pub fn parse_closes_trailers(message: &str) -> Result<Vec<String>, TrailerParseError> {
@@ -299,7 +299,7 @@ mod tests {
             draft.payload["rel_class"], "lifecycle",
             "a lifecycle mirror edge is lifecycle-class"
         );
-        assert_eq!(draft.aggregate.0, format!("edge:{}->{}", src.0, target.0));
+        assert_eq!(draft.aggregate, edge_aggregate_key(&src, &target));
         assert!(
             !draft.contains_personal_data,
             "references-not-payloads: no inline PII"

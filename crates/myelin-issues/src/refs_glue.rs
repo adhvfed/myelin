@@ -60,7 +60,7 @@ pub const REL_CLASS_REFERENCE: &str = "reference";
 pub const REL_CLASS_LIFECYCLE: &str = "lifecycle";
 
 pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> AggregateKey {
-    AggregateKey(format!("edge:{}->{}", source.0, target.0))
+    myelin_refs::edge_aggregate_key(source, target)
 }
 
 fn node_rel(node: &InlineNode) -> &'static str {
@@ -336,12 +336,8 @@ impl Projected {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectError {
-    NotAnIssueArtifact {
-        reference: String,
-    },
-    UnknownIssueType {
-        ty: String,
-    },
+    NotAnIssueArtifact { reference: String },
+    UnknownIssueType { ty: String },
 }
 
 impl std::fmt::Display for ProjectError {
@@ -477,7 +473,7 @@ impl<I: IdentityService> Projector<I> {
         };
         let permission = Permission(VIEW.to_string());
         match self.id.check(viewer, &permission, &root, &at, None) {
-            Ok(Decision::Allow) => {  }
+            Ok(Decision::Allow) => {}
             Ok(Decision::Deny) | Ok(Decision::Conditional) | Err(_) => {
                 return Ok(Projected::Tombstoned(Tombstone {
                     reason: TombstoneReason::Denied,

@@ -25,7 +25,7 @@ impl EdgeRel {
 }
 
 pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> AggregateKey {
-    AggregateKey(format!("edge:{}->{}", source.0, target.0))
+    myelin_refs::edge_aggregate_key(source, target)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

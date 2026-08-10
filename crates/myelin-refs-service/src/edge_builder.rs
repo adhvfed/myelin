@@ -61,6 +61,93 @@ pub struct EdgeRow {
     pub tombstoned: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EdgeMutation {
+    Upsert(EdgeRow),
+    Tombstone { edge_id: String },
+    Ignore,
+}
+
+/// Interpret an event once, independently of the projection backing.
+///
+/// The memory projection, PostgreSQL consumer, and reindex path all use this function so a live
+/// event and a replay cannot acquire different edge semantics.
+pub fn edge_mutation(ev: &EventEnvelope) -> Result<EdgeMutation, ProjectError> {
+    let event_name = ev.type_.0.rsplit('.').next().unwrap_or("");
+    match event_name {
+        "erased" | "removed" => removed_edge_mutation(ev),
+        "created" | "set" | "parent_set" | "updated" | "snapshot" => created_edge_mutation(ev),
+        _ => Ok(EdgeMutation::Ignore),
+    }
+}
+
+fn created_edge_mutation(ev: &EventEnvelope) -> Result<EdgeMutation, ProjectError> {
+    let payload = &ev.payload;
+    let has_edge_payload = payload.get("source").is_some() || payload.get("target").is_some();
+    let is_edge_subject = ev.type_.0.starts_with("refs.edge.");
+    if !has_edge_payload {
+        return if is_edge_subject {
+            Err(ProjectError(format!(
+                "{} carries no edge payload (source/target/rel)",
+                ev.type_.0
+            )))
+        } else {
+            Ok(EdgeMutation::Ignore)
+        };
+    }
+
+    let source = required_field(ev, "source")?;
+    let target = required_field(ev, "target")?;
+    let rel = required_field(ev, "rel")?;
+    let source_ref = ArtifactRef(source.clone());
+    let target_ref = ArtifactRef(target.clone());
+    Ok(EdgeMutation::Upsert(EdgeRow {
+        edge_id: edge_id(&ev.tenant, &source, &target, &rel),
+        source_root: strip_sub(&source_ref),
+        target_root: strip_sub(&target_ref),
+        source: source_ref,
+        target: target_ref,
+        rel,
+        rel_class: if ev.type_.0.starts_with("refs.edge.") {
+            RelClass::Reference
+        } else {
+            RelClass::Lifecycle
+        },
+        origin_event: ev.event_id.0.clone(),
+        origin_actor: str_field(payload, "origin_actor")
+            .unwrap_or_else(|| ev.actor.0.principal_id.0.clone()),
+        zookie: str_field(payload, "zookie"),
+        tombstoned: false,
+    }))
+}
+
+fn removed_edge_mutation(ev: &EventEnvelope) -> Result<EdgeMutation, ProjectError> {
+    let edge_id = match str_field(&ev.payload, "edge_id") {
+        Some(edge_id) => edge_id,
+        None => {
+            let source = required_removal_field(ev, "source")?;
+            let target = required_removal_field(ev, "target")?;
+            let rel = required_removal_field(ev, "rel")?;
+            edge_id(&ev.tenant, &source, &target, &rel)
+        }
+    };
+    Ok(EdgeMutation::Tombstone { edge_id })
+}
+
+fn required_field(ev: &EventEnvelope, field: &str) -> Result<String, ProjectError> {
+    str_field(&ev.payload, field)
+        .ok_or_else(|| ProjectError(format!("{} edge payload is missing `{field}`", ev.type_.0)))
+}
+
+fn required_removal_field(ev: &EventEnvelope, field: &str) -> Result<String, ProjectError> {
+    str_field(&ev.payload, field).ok_or_else(|| {
+        ProjectError(format!(
+            "{} removal is missing `edge_id`/`{field}`",
+            ev.type_.0
+        ))
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct PartKey {
     tenant: TenantId,
@@ -291,99 +378,15 @@ impl RefsEdgeBuilder {
     }
 
     fn project_inner(&self, ev: &EventEnvelope) -> Result<(), ProjectError> {
-        let type_ = ev.type_.0.as_str();
-        let event_name = type_.rsplit('.').next().unwrap_or("");
-
-        match event_name {
-            "erased" => self.apply_erased(ev),
-            "removed" => self.apply_removed(ev),
-            "created" | "set" | "parent_set" | "updated" | "snapshot" => self.apply_created(ev),
-            _ => Ok(()),
-        }
-    }
-
-    fn rel_class_of(type_: &str) -> RelClass {
-        if type_.starts_with("refs.edge.") {
-            RelClass::Reference
-        } else {
-            RelClass::Lifecycle
-        }
-    }
-
-    fn apply_created(&self, ev: &EventEnvelope) -> Result<(), ProjectError> {
-        let p = &ev.payload;
-        let has_edge_payload = p.get("source").is_some() || p.get("target").is_some();
-        let is_edge_subject = ev.type_.0.starts_with("refs.edge.");
-        if !has_edge_payload {
-            if is_edge_subject {
-                return Err(ProjectError(format!(
-                    "{} carries no edge payload (source/target/rel)",
-                    ev.type_.0
-                )));
+        match edge_mutation(ev)? {
+            EdgeMutation::Upsert(row) => self.projection.upsert(&ev.tenant, &ev.region, row),
+            EdgeMutation::Tombstone { edge_id } => {
+                self.projection
+                    .tombstone(&ev.tenant, &ev.region, &edge_id, &ev.event_id.0)
             }
-            return Ok(());
+            EdgeMutation::Ignore => {}
         }
-
-        let source = str_field(p, "source").ok_or_else(|| {
-            ProjectError(format!("{} edge payload is missing `source`", ev.type_.0))
-        })?;
-        let target = str_field(p, "target").ok_or_else(|| {
-            ProjectError(format!("{} edge payload is missing `target`", ev.type_.0))
-        })?;
-        let rel = str_field(p, "rel")
-            .ok_or_else(|| ProjectError(format!("{} edge payload is missing `rel`", ev.type_.0)))?;
-
-        let source_ref = ArtifactRef(source.clone());
-        let target_ref = ArtifactRef(target.clone());
-        let rel_class = Self::rel_class_of(ev.type_.0.as_str());
-
-        let row = EdgeRow {
-            edge_id: edge_id(&ev.tenant, &source, &target, &rel),
-            source_root: strip_sub(&source_ref),
-            target_root: strip_sub(&target_ref),
-            source: source_ref,
-            target: target_ref,
-            rel,
-            rel_class,
-            origin_event: ev.event_id.0.clone(),
-            origin_actor: str_field(p, "origin_actor")
-                .unwrap_or_else(|| ev.actor.0.principal_id.0.clone()),
-            zookie: str_field(p, "zookie"),
-            tombstoned: false,
-        };
-        self.projection.upsert(&ev.tenant, &ev.region, row);
         Ok(())
-    }
-
-    fn apply_removed(&self, ev: &EventEnvelope) -> Result<(), ProjectError> {
-        let p = &ev.payload;
-        let id = if let Some(id) = str_field(p, "edge_id") {
-            id
-        } else {
-            let source = str_field(p, "source").ok_or_else(|| {
-                ProjectError(format!(
-                    "{} removal is missing `edge_id`/`source`",
-                    ev.type_.0
-                ))
-            })?;
-            let target = str_field(p, "target").ok_or_else(|| {
-                ProjectError(format!(
-                    "{} removal is missing `edge_id`/`target`",
-                    ev.type_.0
-                ))
-            })?;
-            let rel = str_field(p, "rel").ok_or_else(|| {
-                ProjectError(format!("{} removal is missing `edge_id`/`rel`", ev.type_.0))
-            })?;
-            edge_id(&ev.tenant, &source, &target, &rel)
-        };
-        self.projection
-            .tombstone(&ev.tenant, &ev.region, &id, &ev.event_id.0);
-        Ok(())
-    }
-
-    fn apply_erased(&self, ev: &EventEnvelope) -> Result<(), ProjectError> {
-        self.apply_removed(ev)
     }
 }
 
@@ -491,8 +494,14 @@ mod tests {
         let tgt = "myelin://acme/knowledge/page/7c2#block-3";
         let ev = edge_event("01J-1", "refs.edge.created", src, tgt, "embeds");
 
-        assert_eq!(b.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
-        assert_eq!(b.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            b.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
+        assert_eq!(
+            b.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(
             b.projection().live_count(&tenant(), &region()),
             1,
@@ -531,7 +540,10 @@ mod tests {
         let src = "myelin://acme/issue/issue/ENG-1";
         let tgt = "myelin://acme/issue/issue/ENG-2";
         let ev = edge_event("01J-rel", "issue.relation.created", src, tgt, "blocks");
-        assert_eq!(b.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            b.handle(&ev, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         let id = edge_id(&tenant(), src, tgt, "blocks");
         let row = b
             .projection()
@@ -580,17 +592,17 @@ mod tests {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         let src = "myelin://acme/chat/message/m1";
         let tgt = "myelin://acme/issue/issue/ENG-1";
-        b.handle(&edge_event(
-            "01J-c",
-            "refs.edge.created",
-            src,
-            tgt,
-            "mentions",
-        ), &mut myelin_events::HandlerTx::none());
+        b.handle(
+            &edge_event("01J-c", "refs.edge.created", src, tgt, "mentions"),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(b.projection().live_count(&tenant(), &region()), 1);
 
         let rm = edge_event("01J-r", "refs.edge.removed", src, tgt, "mentions");
-        assert_eq!(b.handle(&rm, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            b.handle(&rm, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(
             b.projection().live_count(&tenant(), &region()),
             0,
@@ -601,7 +613,10 @@ mod tests {
             1,
             "row retained for audit"
         );
-        assert_eq!(b.handle(&rm, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            b.handle(&rm, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(b.projection().total_count(&tenant(), &region()), 1);
 
         let id = edge_id(&tenant(), src, tgt, "mentions");
@@ -630,15 +645,15 @@ mod tests {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         let src = "myelin://acme/chat/message/m1";
         let tgt = "myelin://acme/issue/issue/ENG-1";
-        b.handle(&edge_event(
-            "01J-c",
-            "refs.edge.created",
-            src,
-            tgt,
-            "mentions",
-        ), &mut myelin_events::HandlerTx::none());
+        b.handle(
+            &edge_event("01J-c", "refs.edge.created", src, tgt, "mentions"),
+            &mut myelin_events::HandlerTx::none(),
+        );
         let er = edge_event("01J-e", "chat.message.erased", src, tgt, "mentions");
-        assert_eq!(b.handle(&er, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            b.handle(&er, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(
             b.projection().live_count(&tenant(), &region()),
             0,
@@ -650,13 +665,10 @@ mod tests {
     fn index_lag_is_zero_in_steady_state_and_named() {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
         assert_eq!(b.index_lag(), 0, "a fresh builder has no lag");
-        b.handle(&edge_event(
-            "01J-1",
-            "refs.edge.created",
-            "s",
-            "t",
-            "mentions",
-        ), &mut myelin_events::HandlerTx::none());
+        b.handle(
+            &edge_event("01J-1", "refs.edge.created", "s", "t", "mentions"),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(b.index_lag(), 0, "index_lag returns to 0 after projection");
         assert_eq!(
             RefsEdgeBuilder::INDEX_LAG_SIGNAL,

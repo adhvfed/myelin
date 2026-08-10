@@ -176,7 +176,7 @@ impl BackupScaleErasureCorpus {
 
     fn edge_event(&self, edge: &CorpusEdge) -> EventEnvelope {
         use myelin_events::{
-            Actor, AggregateKey, CorrelationId, DataRole, EventId, EventType, Timestamp, Visibility,
+            Actor, CorrelationId, DataRole, EventId, EventType, Timestamp, Visibility,
         };
         use myelin_identity::{Principal, PrincipalId, PrincipalKind};
         EventEnvelope {
@@ -191,7 +191,7 @@ impl BackupScaleErasureCorpus {
                 self.tenant.clone(),
             )),
             subject: edge.source.clone(),
-            aggregate: AggregateKey(format!("edge:{}->{}", edge.source.0, edge.target.0)),
+            aggregate: myelin_refs::edge_aggregate_key(&edge.source, &edge.target),
             causation_id: None,
             correlation_id: CorrelationId(format!("live-{}", edge.edge_id)),
             caused_by: None,
@@ -329,7 +329,10 @@ pub fn re_erase_at_backup_scale(
     let projection = builder.projection().clone();
 
     for edge in &corpus.edges {
-        builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
+        builder.handle(
+            &corpus.edge_event(edge),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
     let mut subject_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for subject_id in &corpus.subjects {
@@ -380,7 +383,10 @@ pub fn re_erase_at_backup_scale(
     }
     for edge in &corpus.edges {
         if subjects_to_erase.contains(&edge.subject_id) {
-            builder.handle(&corpus.edge_event(edge), &mut myelin_events::HandlerTx::none());
+            builder.handle(
+                &corpus.edge_event(edge),
+                &mut myelin_events::HandlerTx::none(),
+            );
         }
     }
 

@@ -177,7 +177,11 @@ impl ChatReadModelConsumer {
             (version, (proj.body_text.clone(), proj.channel_id.clone())),
         );
         for (target, rel) in &proj.edges {
-            let key = format!("edge:{message_ref}->{target}");
+            let key = myelin_refs::edge_aggregate_key(
+                &myelin_refs::ArtifactRef(message_ref.clone()),
+                &myelin_refs::ArtifactRef(target.clone()),
+            )
+            .0;
             changed |= lww_insert(&mut self.refs, key, version, (version, rel.clone()));
         }
         for member in &proj.mentions {

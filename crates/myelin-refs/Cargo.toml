@@ -10,3 +10,4 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-identity = { path = "../myelin-identity" }
 myelin-events = { path = "../myelin-events" }
 serde.workspace = true
+blake3.workspace = true
