@@ -1,4 +1,5 @@
 pub mod agent_run_gate;
+pub mod agent_trigger_durable;
 pub mod agent_wallet;
 pub mod backup;
 pub mod blob;
@@ -204,6 +205,12 @@ pub use storage_surge::{
 
 pub use authz_projection_durable::{
     authz_projection_durable_migrations, AUTHZ_PROJECTION_STATE_MIGRATION,
+};
+pub use agent_trigger_durable::{
+    agent_trigger_durable_migrations, AgentTriggerFiringState, CreateAgentTriggerBindingOutcome,
+    DurableAgentTriggerBacking, DurableAgentTriggerBinding, NewAgentTriggerBinding,
+    ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring, AGENT_TRIGGER_MIGRATION,
+    AGENT_TRIGGER_RLS_POLICY,
 };
 pub use delegation_policy_durable::{
     delegation_policy_durable_migrations, ensure_agent_policy_bundle_on_conn,
