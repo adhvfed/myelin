@@ -88,24 +88,12 @@ impl ToolExecutor for GitCheckStatusReadExecutor {
             )));
         }
 
-        let repo = call
-            .arguments
-            .get("repo")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ToolExecError::Failed(
-                    "git.read_check_status requires a string `repo` argument".into(),
-                )
-            })?;
-        let commit = call
-            .arguments
-            .get("commit")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                ToolExecError::Failed(
-                    "git.read_check_status requires a string `commit` argument".into(),
-                )
-            })?;
+        let repo = call.arguments.get("repo").and_then(|v| v.as_str()).ok_or_else(|| {
+            ToolExecError::Failed("git.read_check_status requires a string `repo` argument".into())
+        })?;
+        let commit = call.arguments.get("commit").and_then(|v| v.as_str()).ok_or_else(|| {
+            ToolExecError::Failed("git.read_check_status requires a string `commit` argument".into())
+        })?;
 
         let rows = self
             .projection
@@ -131,10 +119,7 @@ impl ToolExecutor for GitCheckStatusReadExecutor {
                 )
             })
             .collect();
-        let text = format!(
-            "check status for commit {commit} in repo {repo}: {}",
-            parts.join("; ")
-        );
+        let text = format!("check status for commit {commit} in repo {repo}: {}", parts.join("; "));
 
         *self.last_result.lock().expect("last_result lock") = Some(text.clone());
         Ok(ToolResult(text))
