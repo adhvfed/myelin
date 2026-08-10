@@ -134,10 +134,17 @@ pub struct DurableAgentTriggerFiring {
     pub state: AgentTriggerFiringState,
     pub run_id: Option<String>,
     pub outcome: Option<AgentTriggerRunOutcome>,
+    pub terminal_reason: Option<String>,
     pub approval_decision: Option<AgentTriggerApprovalDecision>,
     pub approval_decided_by: Option<String>,
     pub approval_decided_at: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalizeAgentTriggerClaimOutcome {
+    Terminalized,
+    ClaimUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

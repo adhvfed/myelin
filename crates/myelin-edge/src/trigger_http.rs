@@ -824,6 +824,7 @@ fn firing_json(
         }),
         "outcome": firing.outcome.map(|outcome| outcome.token()),
         "result_state": result.map(AgentTraceAvailability::token),
+        "terminal_reason": firing.terminal_reason,
         "approval": firing.approval_decision.map(|decision| json!({
             "decision": decision.token(),
             "decided_by": firing.approval_decided_by,

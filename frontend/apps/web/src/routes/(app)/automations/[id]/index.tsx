@@ -213,11 +213,7 @@ function FiringRow(props: { automationId: string; firing: AutomationFiringVM }) 
       </span>
       <span class="automation-firing-main">
         <code>{props.firing.event_id}</code>
-        <span>
-          {props.firing.approval
-            ? `${props.firing.approval.decision} by ${props.firing.approval.decided_by}`
-            : props.firing.state === "awaiting_approval" ? "Waiting for its owner’s decision" : "No human decision required"}
-        </span>
+        <span>{firingDetail(props.firing)}</span>
       </span>
       <span class="automation-firing-meta">
         <time datetime={props.firing.created_at}>{formatAutomationTime(props.firing.created_at)}</time>
@@ -232,8 +228,16 @@ function FiringRow(props: { automationId: string; firing: AutomationFiringVM }) 
   );
 }
 
+function firingDetail(firing: AutomationFiringVM): string {
+  if (firing.terminal_reason) return firing.terminal_reason;
+  if (firing.approval) return `${firing.approval.decision} by ${firing.approval.decided_by}`;
+  if (firing.state === "awaiting_approval") return "Waiting for its owner’s decision";
+  return "No human decision required";
+}
+
 function firingLabel(firing: AutomationFiringVM): string {
   if (firing.outcome) return firing.outcome.replaceAll("_", " ");
+  if (firing.terminal_reason) return "could not start";
   if (firing.state === "terminal" && firing.run_id === null) return "canceled before start";
   return firing.state.replaceAll("_", " ");
 }

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use myelin_agent_host::supervision::PollBackoff;
 use myelin_agent_host::{
     register_hosted_agent_workflow, AgentHost, AgentHostActivityExecutor, EdgeMcpToolExecutor,
     HostedAgentInputResolver, HostedAgentRunExecutor, HostedModelFactory, LunaModelFactory,
@@ -9,7 +10,7 @@ use myelin_agent_model::{
     ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn, ToolCallRequest,
     Usage,
 };
-use myelin_agent_service::trigger_handoff::TriggerRunHandoff;
+use myelin_agent_service::trigger_handoff::{TriggerHandoffDisposition, TriggerRunHandoff};
 use myelin_config::Mode;
 use myelin_events::{Actor, UlidMinter};
 use myelin_flow::{PgFlowWorker, PgWorkerScope, PARTITION_COUNT};
@@ -17,6 +18,7 @@ use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, Principal
 use myelin_storage::{
     all_durable_migrations, seal_key_from_env, AgentTriggerClaimRequest,
     DurableAgentTriggerBacking, DurablePlacementBacking, HotTables, PgBootstrap, SubstrateProvider,
+    TerminalizeAgentTriggerClaimOutcome,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -139,6 +141,7 @@ async fn run_workers(
                 .map_err(|error| error.to_string())
         });
     }
+    let handoff_worker_id = format!("hosted-agent-handoff-{}", uuid::Uuid::new_v4());
     for tenant in tenants {
         let mut receiver = shutdown_rx.clone();
         let triggers = DurableAgentTriggerBacking::new(provider.clone());
@@ -149,52 +152,24 @@ async fn run_workers(
         let handoff_tenant = tenant.clone();
         let handoff_triggers = triggers.clone();
         let mut handoff_shutdown = shutdown_rx.clone();
+        let claim_request = AgentTriggerClaimRequest::new(
+            myelin_identity_service::HOSTED_LUNA_RUNTIME,
+            handoff_worker_id.clone(),
+            30,
+        )
+        .unwrap_or_else(|error| refuse_start("trigger claim identity", error));
         tasks.spawn(async move {
-            let claim_request = AgentTriggerClaimRequest::new(
-                myelin_identity_service::HOSTED_LUNA_RUNTIME,
-                "hosted-agent-handoff",
-                30,
+            run_trigger_handoffs(
+                handoff_tenant,
+                handoff_triggers,
+                handoff,
+                claim_request,
+                &mut handoff_shutdown,
             )
-            .map_err(str::to_string)?;
-            loop {
-                tokio::select! {
-                    changed = handoff_shutdown.changed() => {
-                        if changed.is_err() || *handoff_shutdown.borrow() {
-                            return Ok(());
-                        }
-                    }
-                    () = tokio::time::sleep(Duration::from_millis(100)) => {
-                        if let Some(claim) = handoff_triggers
-                            .claim_next_firing(&handoff_tenant.0, claim_request.clone())
-                            .await
-                            .map_err(|error| error.to_string())?
-                        {
-                            handoff
-                                .start(&handoff_tenant, &claim)
-                                .await
-                                .map_err(|error| error.to_string())?;
-                        }
-                    }
-                }
-            }
+            .await
         });
-        tasks.spawn(async move {
-            loop {
-                tokio::select! {
-                    changed = receiver.changed() => {
-                        if changed.is_err() || *receiver.borrow() {
-                            return Ok(());
-                        }
-                    }
-                    () = tokio::time::sleep(Duration::from_millis(250)) => {
-                        triggers
-                            .reconcile_terminal_firings(&tenant.0, 100)
-                            .await
-                            .map_err(|error| error.to_string())?;
-                    }
-                }
-            }
-        });
+        tasks
+            .spawn(async move { reconcile_trigger_firings(tenant, triggers, &mut receiver).await });
     }
 
     let early_failure = tokio::select! {
@@ -223,6 +198,107 @@ async fn run_workers(
     .await;
     if drained.is_err() {
         refuse_start("workflow worker drain", "did not finish within 10 seconds");
+    }
+}
+
+async fn run_trigger_handoffs(
+    tenant: TenantId,
+    triggers: DurableAgentTriggerBacking,
+    handoff: TriggerRunHandoff,
+    claim_request: AgentTriggerClaimRequest,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut backoff = PollBackoff::new(Duration::from_millis(100), Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            () = tokio::time::sleep(backoff.next_delay()) => {
+                let claim = match triggers.claim_next_firing(&tenant.0, claim_request.clone()).await {
+                    Ok(claim) => {
+                        backoff.succeeded();
+                        claim
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "hosted-agent-worker: trigger queue unavailable for tenant {}: {error}",
+                            tenant.0,
+                        );
+                        backoff.failed();
+                        continue;
+                    }
+                };
+                let Some(claim) = claim else { continue };
+                let Err(error) = handoff.start(&tenant, &claim).await else { continue };
+                match error.disposition() {
+                    TriggerHandoffDisposition::ClaimLost => eprintln!(
+                        "hosted-agent-worker: trigger claim was canceled or reclaimed for tenant {}",
+                        tenant.0,
+                    ),
+                    TriggerHandoffDisposition::Retry => eprintln!(
+                        "hosted-agent-worker: trigger handoff will retry after its lease for tenant {}: {error}",
+                        tenant.0,
+                    ),
+                    TriggerHandoffDisposition::Terminal { reason } => {
+                        isolate_poison_firing(&triggers, &tenant, &claim, &reason).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn isolate_poison_firing(
+    triggers: &DurableAgentTriggerBacking,
+    tenant: &TenantId,
+    claim: &myelin_storage::ClaimedAgentTriggerFiring,
+    reason: &str,
+) {
+    match triggers.terminalize_claim(&tenant.0, claim, reason).await {
+        Ok(TerminalizeAgentTriggerClaimOutcome::Terminalized) => eprintln!(
+            "hosted-agent-worker: isolated an invalid trigger firing for tenant {}: {reason}",
+            tenant.0,
+        ),
+        Ok(TerminalizeAgentTriggerClaimOutcome::ClaimUnavailable) => eprintln!(
+            "hosted-agent-worker: invalid trigger claim was already canceled or reclaimed for tenant {}",
+            tenant.0,
+        ),
+        Err(error) => eprintln!(
+            "hosted-agent-worker: could not isolate an invalid trigger firing for tenant {}: {error}",
+            tenant.0,
+        ),
+    }
+}
+
+async fn reconcile_trigger_firings(
+    tenant: TenantId,
+    triggers: DurableAgentTriggerBacking,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let mut backoff = PollBackoff::new(Duration::from_millis(250), Duration::from_secs(5));
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Ok(());
+                }
+            }
+            () = tokio::time::sleep(backoff.next_delay()) => {
+                match triggers.reconcile_terminal_firings(&tenant.0, 100).await {
+                    Ok(_) => backoff.succeeded(),
+                    Err(error) => {
+                        eprintln!(
+                            "hosted-agent-worker: trigger reconciliation unavailable for tenant {}: {error}",
+                            tenant.0,
+                        );
+                        backoff.failed();
+                    }
+                }
+            }
+        }
     }
 }
 

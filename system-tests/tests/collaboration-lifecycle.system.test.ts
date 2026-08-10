@@ -207,6 +207,7 @@ command = ["true"]
       event_id: eventId,
       state: "awaiting_approval",
       run_id: null,
+      terminal_reason: null,
       approval: null,
     });
 
@@ -267,6 +268,7 @@ command = ["true"]
       state: "terminal",
       outcome: "succeeded",
       result_state: "available",
+      terminal_reason: null,
       approval: {
         decision: "approved",
         decided_by: expect.any(String),

@@ -36,6 +36,30 @@ pub enum TriggerHandoffError {
     Storage(PgError),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TriggerHandoffDisposition {
+    /// The firing was canceled or reclaimed while this worker was handing it off.
+    ClaimLost,
+    /// Infrastructure failed. Preserve the claim lease so expiry can retry the firing.
+    Retry,
+    /// The firing itself can never start and should be isolated from the queue.
+    Terminal { reason: String },
+}
+
+impl TriggerHandoffError {
+    pub fn disposition(&self) -> TriggerHandoffDisposition {
+        match self {
+            Self::ClaimUnavailable => TriggerHandoffDisposition::ClaimLost,
+            Self::Storage(_) | Self::Workflow(ExecutorError::Storage(_)) => {
+                TriggerHandoffDisposition::Retry
+            }
+            Self::InvalidClaim(_) | Self::Workflow(_) => TriggerHandoffDisposition::Terminal {
+                reason: bounded_terminal_reason(&self.to_string()),
+            },
+        }
+    }
+}
+
 impl core::fmt::Display for TriggerHandoffError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -48,6 +72,19 @@ impl core::fmt::Display for TriggerHandoffError {
 }
 
 impl std::error::Error for TriggerHandoffError {}
+
+fn bounded_terminal_reason(reason: &str) -> String {
+    const MAX_BYTES: usize = 1024;
+    if reason.len() <= MAX_BYTES {
+        return reason.to_string();
+    }
+
+    let mut end = MAX_BYTES;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_string()
+}
 
 impl From<PgError> for TriggerHandoffError {
     fn from(error: PgError) -> Self {
@@ -307,5 +344,46 @@ mod tests {
             &crossed,
         )
         .is_err());
+    }
+
+    #[test]
+    fn handoff_failures_name_their_recovery_policy() {
+        assert_eq!(
+            TriggerHandoffError::ClaimUnavailable.disposition(),
+            TriggerHandoffDisposition::ClaimLost
+        );
+        assert_eq!(
+            TriggerHandoffError::Storage(PgError::Query("database unavailable".into()))
+                .disposition(),
+            TriggerHandoffDisposition::Retry
+        );
+        assert_eq!(
+            TriggerHandoffError::Workflow(ExecutorError::Storage("database unavailable".into()))
+                .disposition(),
+            TriggerHandoffDisposition::Retry
+        );
+
+        let terminal = TriggerHandoffError::InvalidClaim("broken envelope".into()).disposition();
+        assert_eq!(
+            terminal,
+            TriggerHandoffDisposition::Terminal {
+                reason: "invalid trigger claim: broken envelope".into(),
+            }
+        );
+        assert!(matches!(
+            TriggerHandoffError::Workflow(ExecutorError::DefinitionDrift("v2".into()))
+                .disposition(),
+            TriggerHandoffDisposition::Terminal { .. }
+        ));
+    }
+
+    #[test]
+    fn poison_reasons_fit_the_durable_user_visible_bound() {
+        let disposition = TriggerHandoffError::InvalidClaim("ø".repeat(1_024)).disposition();
+        let TriggerHandoffDisposition::Terminal { reason } = disposition else {
+            panic!("an invalid firing must be terminal");
+        };
+        assert!(reason.len() <= 1_024);
+        assert!(reason.is_char_boundary(reason.len()));
     }
 }

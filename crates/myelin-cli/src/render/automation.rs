@@ -206,6 +206,11 @@ fn render_firing(value: &Value) -> Option<String> {
     let event_id = terminal_safe_single_line(value.get("event_id")?.as_str()?);
     let state = value.get("state")?.as_str()?;
     let outcome = value.get("outcome").and_then(Value::as_str);
+    let terminal_reason = value
+        .get("terminal_reason")
+        .and_then(Value::as_str)
+        .filter(|reason| !reason.is_empty())
+        .map(terminal_safe_single_line);
     let result_state = match value.get("result_state")? {
         Value::Null => None,
         Value::String(state) if matches!(state.as_str(), "available" | "erased") => {
@@ -217,15 +222,17 @@ fn render_firing(value: &Value) -> Option<String> {
         Some("succeeded") => "✓",
         Some("failed" | "terminated" | "nondeterministic") => "✗",
         Some(_) => "?",
+        None if terminal_reason.is_some() => "✗",
         None if state == "terminal" && value.get("run_id").is_some_and(Value::is_null) => "-",
         None => "…",
     };
-    let canceled_before_start =
-        state == "terminal" && value.get("run_id").is_some_and(Value::is_null);
-    let result = outcome.unwrap_or(if canceled_before_start {
-        "canceled-before-start"
-    } else {
-        state
+    let canceled_before_start = state == "terminal"
+        && value.get("run_id").is_some_and(Value::is_null)
+        && terminal_reason.is_none();
+    let result = outcome.unwrap_or(match (terminal_reason.as_ref(), canceled_before_start) {
+        (Some(_), _) => "could-not-start",
+        (None, true) => "canceled-before-start",
+        (None, false) => state,
     });
     let destination = value
         .get("run_ref")
@@ -241,8 +248,11 @@ fn render_firing(value: &Value) -> Option<String> {
         Some("erased") => "  result:erased",
         _ => "",
     };
+    let reason_suffix = terminal_reason
+        .map(|reason| format!("  reason:{reason}"))
+        .unwrap_or_default();
     Some(format!(
-        "{marker} {}  {}  {}{result_suffix}",
+        "{marker} {}  {}  {}{result_suffix}{reason_suffix}",
         terminal_safe_single_line(result),
         event_id,
         terminal_safe_single_line(destination),
@@ -364,6 +374,7 @@ mod tests {
             "run_ref": "myelin://acme/agent/run/33333333-3333-4333-8333-333333333333",
             "outcome": "succeeded",
             "result_state": "available",
+            "terminal_reason": null,
         }))
         .unwrap();
         assert_eq!(
@@ -384,6 +395,7 @@ mod tests {
                 "run_ref": null,
                 "outcome": null,
                 "result_state": null,
+                "terminal_reason": null,
                 "approval": {
                     "decision": "approved",
                     "decided_by": "ada",
@@ -393,6 +405,27 @@ mod tests {
         }))
         .unwrap();
         assert!(approval.starts_with("Approved automation firing: … queued  ci-failed-2"));
+
+        let poison = render_item(&json!({
+            "event_id": "ci-failed-poison",
+            "event_type": "ci.run.failed",
+            "trigger_ref": format!("myelin://acme/identity/trigger/{AUTOMATION}"),
+            "state": "terminal",
+            "run_id": null,
+            "run_ref": null,
+            "outcome": null,
+            "result_state": null,
+            "terminal_reason": "invalid trigger claim: envelope identity mismatch",
+        }))
+        .unwrap();
+        assert_eq!(
+            poison,
+            concat!(
+                "✗ could-not-start  ci-failed-poison  ",
+                "myelin://acme/identity/trigger/22222222-2222-4222-8222-222222222222",
+                "  reason:invalid trigger claim: envelope identity mismatch",
+            )
+        );
     }
 
     #[test]

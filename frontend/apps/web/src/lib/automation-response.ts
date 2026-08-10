@@ -52,6 +52,7 @@ export interface AutomationFiringVM {
   run_ref: string | null;
   outcome: AutomationRunOutcome | null;
   result_state: "available" | "erased" | null;
+  terminal_reason: string | null;
   approval: AutomationApprovalVM | null;
   created_at: string;
 }
@@ -189,7 +190,7 @@ function firing(value: unknown): AutomationFiringVM | null {
   const runTenant = row?.run_id === null ? null : referencePart(row?.run_ref, "agent", "run", row?.run_id);
   if (!row || !exact(row, [
     "event_id", "event_type", "trigger_ref", "state", "run_id", "run_ref", "outcome",
-    "result_state", "approval", "created_at",
+    "result_state", "terminal_reason", "approval", "created_at",
   ]) || !text(row.event_id, 255) || !text(row.event_type, 255) || !triggerTenant ||
       !isAutomationId(triggerId) ||
       !["queued", "awaiting_approval", "claimed", "started", "terminal"].includes(row.state as string) ||
@@ -199,6 +200,8 @@ function firing(value: unknown): AutomationFiringVM | null {
       (row.outcome !== null && !["succeeded", "failed", "terminated", "nondeterministic"].includes(row.outcome as string)) ||
       (row.result_state !== null && !["available", "erased"].includes(row.result_state as string)) ||
       (row.result_state !== null && row.run_id === null) ||
+      (row.terminal_reason !== null && !text(row.terminal_reason, 1_024, true)) ||
+      (row.terminal_reason !== null && (row.state !== "terminal" || row.run_id !== null)) ||
       (row.approval !== null && approval(row.approval) === null) || !timestamp(row.created_at)) return null;
   return row as unknown as AutomationFiringVM;
 }

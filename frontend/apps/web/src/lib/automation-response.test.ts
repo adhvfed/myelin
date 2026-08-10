@@ -42,6 +42,7 @@ const firing = {
   run_ref: `myelin://${tenant}/agent/run/${runId}`,
   outcome: "succeeded",
   result_state: "available",
+  terminal_reason: null,
   approval: {
     decision: "approved",
     decided_by: "founder",
@@ -111,6 +112,27 @@ describe("automation response decoding", () => {
       .toBeNull();
     expect(parseAutomationFiringPage({
       items: [{ ...firing, approval: { decision: "approved", decided_by: "founder" } }],
+      page: { next_cursor: null, limit: 25 },
+    })).toBeNull();
+  });
+
+  it("makes a firing that could not start understandable to its owner", () => {
+    const poison = {
+      ...firing,
+      state: "terminal",
+      run_id: null,
+      run_ref: null,
+      outcome: null,
+      result_state: null,
+      terminal_reason: "invalid trigger claim: envelope identity does not match its firing record",
+      approval: null,
+    };
+    expect(parseAutomationFiringPage({
+      items: [poison],
+      page: { next_cursor: null, limit: 25 },
+    })).toEqual({ items: [poison], page: { next_cursor: null, limit: 25 } });
+    expect(parseAutomationFiringPage({
+      items: [{ ...firing, terminal_reason: "cannot accompany a completed run" }],
       page: { next_cursor: null, limit: 25 },
     })).toBeNull();
   });

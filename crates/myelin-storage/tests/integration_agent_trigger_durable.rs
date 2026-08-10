@@ -8,7 +8,7 @@ use myelin_storage::{
     AgentTriggerFiringState, AgentTriggerLifecycleAction, ChangeAgentTriggerApprovalOutcome,
     ChangeAgentTriggerLifecycleOutcome, CreateAgentTriggerBindingOutcome,
     DurableAgentTriggerBacking, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
-    SubstrateProvider,
+    SubstrateProvider, TerminalizeAgentTriggerClaimOutcome,
 };
 use sqlx::types::chrono::Utc;
 use sqlx::types::Uuid;
@@ -90,6 +90,30 @@ async fn seed_people_and_agent(
         })
         .await
         .expect("seed one active human and the explicitly selected active agent");
+}
+
+async fn clean_tenant(provider: &SubstrateProvider, tenant: &str) {
+    let cleanup_tenant = tenant.to_string();
+    provider
+        .with_tenant_tx(tenant, move |conn| {
+            Box::pin(async move {
+                for table in [
+                    "agent_trigger_firing",
+                    "agent_trigger_binding",
+                    "identity_agent",
+                    "principal",
+                ] {
+                    sqlx::query(&format!("DELETE FROM {table} WHERE tenant_id = $1"))
+                        .bind(&cleanup_tenant)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .expect("clean the isolated tenant story");
 }
 
 fn red_mainline_binding(agent_id: Uuid) -> NewAgentTriggerBinding {
@@ -658,32 +682,101 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         ChangeAgentTriggerLifecycleOutcome::InvalidTransition
     );
 
-    let cleanup_tenant = tenant.clone();
-    app.with_tenant_tx(&tenant, move |conn| {
-        Box::pin(async move {
-            sqlx::query("DELETE FROM agent_trigger_firing WHERE tenant_id = $1")
-                .bind(&cleanup_tenant)
-                .execute(&mut *conn)
-                .await
-                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
-            sqlx::query("DELETE FROM agent_trigger_binding WHERE tenant_id = $1")
-                .bind(&cleanup_tenant)
-                .execute(&mut *conn)
-                .await
-                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
-            sqlx::query("DELETE FROM identity_agent WHERE tenant_id = $1")
-                .bind(&cleanup_tenant)
-                .execute(&mut *conn)
-                .await
-                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
-            sqlx::query("DELETE FROM principal WHERE tenant_id = $1")
-                .bind(&cleanup_tenant)
-                .execute(&mut *conn)
-                .await
-                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
-            Ok(())
-        })
-    })
-    .await
-    .expect("clean the isolated tenant story");
+    clean_tenant(&app, &tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_poison_firing_becomes_explainable_history_without_harming_the_queue() {
+    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
+        Ok(provider) => provider,
+        Err(_) => {
+            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
+            return;
+        }
+    };
+    admin
+        .migrate_foundation()
+        .await
+        .expect("the event foundation is present");
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .expect("the terminal-reason migration is part of the durable platform");
+
+    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+        .await
+        .expect("open the constrained app provider");
+    let tenant = unique_tenant();
+    let agent_id = Uuid::new_v4();
+    seed_people_and_agent(&app, &tenant, agent_id, "hosted:luna").await;
+    let triggers = DurableAgentTriggerBacking::new(app.clone());
+    let mut proposal = red_mainline_binding(agent_id);
+    proposal.binding_id = Uuid::new_v4();
+    proposal.client_nonce = "poison-firing-isolation".into();
+    triggers
+        .create(&tenant, proposal.clone())
+        .await
+        .expect("the founder creates one narrow automation");
+    triggers
+        .reserve_firing(
+            &tenant,
+            proposal.binding_id,
+            "malformed-event",
+            "ci.run.failed",
+            serde_json::json!({"event_id": "malformed-event"}),
+            1,
+            false,
+            Utc::now(),
+        )
+        .await
+        .expect("the event consumer reserves the matching firing");
+    let claim = triggers
+        .claim_next_firing(
+            &tenant,
+            AgentTriggerClaimRequest::new("hosted:luna", "worker-a", 30).unwrap(),
+        )
+        .await
+        .expect("the worker can reach its queue")
+        .expect("the firing is claimable");
+
+    let mut stale_replica = claim.clone();
+    stale_replica.claim_owner = "worker-b".into();
+    assert_eq!(
+        triggers
+            .terminalize_claim(&tenant, &stale_replica, "invalid trigger claim")
+            .await
+            .expect("a stale replica gets a fenced answer"),
+        TerminalizeAgentTriggerClaimOutcome::ClaimUnavailable,
+        "a worker can only isolate the exact claim it owns"
+    );
+    let reason = "invalid trigger claim: envelope identity does not match its firing record";
+    assert_eq!(
+        triggers
+            .terminalize_claim(&tenant, &claim, reason)
+            .await
+            .expect("the owning worker isolates poison work"),
+        TerminalizeAgentTriggerClaimOutcome::Terminalized
+    );
+    assert_eq!(
+        triggers
+            .claim_next_firing(
+                &tenant,
+                AgentTriggerClaimRequest::new("hosted:luna", "worker-b", 30).unwrap(),
+            )
+            .await
+            .expect("the healthy worker keeps polling"),
+        None,
+        "poison work never crash-loops after its lease"
+    );
+
+    let history = triggers
+        .list_firings_for_owner(&tenant, "founder", proposal.binding_id, None, 25)
+        .await
+        .expect("the owner can understand why no run appeared");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].state, AgentTriggerFiringState::Terminal);
+    assert_eq!(history[0].run_id, None);
+    assert_eq!(history[0].terminal_reason.as_deref(), Some(reason));
+
+    clean_tenant(&app, &tenant).await;
 }

@@ -8,13 +8,13 @@ pub use model::{
     ChangeAgentTriggerLifecycleOutcome, ClaimedAgentTriggerFiring,
     CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
     NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
-    StartAgentTriggerFiringOutcome, StartedAgentTriggerRun, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
-    MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    StartAgentTriggerFiringOutcome, StartedAgentTriggerRun, TerminalizeAgentTriggerClaimOutcome,
+    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use schema::{
     agent_trigger_durable_migrations, AGENT_TRIGGER_APPROVAL_MIGRATION,
     AGENT_TRIGGER_BUDGET_MIGRATION, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
-    AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION,
+    AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION, AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
 };
 
 use sqlx::types::chrono::{DateTime, Utc};
@@ -526,6 +526,7 @@ impl DurableAgentTriggerBacking {
                 Box::pin(async move {
                     let rows = sqlx::query(
                         "SELECT f.binding_id, f.event_id, f.event_type, f.state, f.run_id, \
+                                f.terminal_reason, \
                                 f.approval_decision, f.approval_decided_by, \
                                 f.approval_decided_at, f.created_at, \
                                 run.state AS workflow_state \
@@ -575,6 +576,7 @@ impl DurableAgentTriggerBacking {
                 Box::pin(async move {
                     let row = sqlx::query(
                         "SELECT f.binding_id, f.event_id, f.event_type, f.state, f.run_id, \
+                                f.terminal_reason, \
                                 f.approval_decision, f.approval_decided_by, \
                                 f.approval_decided_at, f.created_at, \
                                 NULL::text AS workflow_state \
@@ -762,6 +764,62 @@ impl DurableAgentTriggerBacking {
                     .await
                     .map_err(query_error("claim next governed agent firing"))?;
                     row.as_ref().map(claimed_firing_from_row).transpose()
+                })
+            })
+            .await
+    }
+
+    /// Permanently isolates one malformed or otherwise non-retryable claimed firing.
+    ///
+    /// The exact claim owner is the fence: a late worker cannot terminalize a claim that another
+    /// process has already reclaimed. Transient failures should leave the lease intact instead so
+    /// the ordinary expiry path can retry them.
+    pub async fn terminalize_claim(
+        &self,
+        tenant: &str,
+        claim: &ClaimedAgentTriggerFiring,
+        reason: &str,
+    ) -> Result<TerminalizeAgentTriggerClaimOutcome, ProviderError> {
+        let binding_id = Uuid::parse_str(&claim.binding_id)
+            .map_err(|_| PgError::Query("claimed trigger binding_id is not a UUID".into()))?;
+        let reason = reason.trim();
+        if reason.is_empty() || reason.len() > 1024 {
+            return Err(PgError::Query(
+                "trigger terminal reason must contain 1..=1024 bytes".into(),
+            )
+            .into());
+        }
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let event_id = claim.event_id.clone();
+        let claim_owner = claim.claim_owner.clone();
+        let reason = reason.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let changed = sqlx::query(
+                        "UPDATE agent_trigger_firing \
+                            SET state = 'terminal', terminal_reason = $6, \
+                                claim_owner = NULL, claim_until = NULL \
+                          WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                            AND event_id = $4 AND state = 'claimed' AND claim_owner = $5",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(binding_id)
+                    .bind(&event_id)
+                    .bind(&claim_owner)
+                    .bind(&reason)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(query_error("terminalize invalid governed agent firing"))?
+                    .rows_affected()
+                        == 1;
+                    Ok(if changed {
+                        TerminalizeAgentTriggerClaimOutcome::Terminalized
+                    } else {
+                        TerminalizeAgentTriggerClaimOutcome::ClaimUnavailable
+                    })
                 })
             })
             .await
@@ -1017,6 +1075,9 @@ fn firing_from_row(row: &sqlx::postgres::PgRow) -> Result<DurableAgentTriggerFir
                 .map_err(row_error("workflow_state"))?
                 .as_deref(),
         )?,
+        terminal_reason: row
+            .try_get("terminal_reason")
+            .map_err(row_error("terminal_reason"))?,
         approval_decision,
         approval_decided_by: row
             .try_get("approval_decided_by")

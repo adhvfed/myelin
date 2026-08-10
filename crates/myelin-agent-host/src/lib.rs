@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 mod activity_executor;
 mod durable_model;
+pub mod supervision;
 mod tool_broker;
 
 pub use activity_executor::{AgentHostActivityExecutor, HostedModelFactory, LunaModelFactory};

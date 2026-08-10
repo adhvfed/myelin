@@ -227,10 +227,10 @@ pub use agent_trigger_durable::{
     CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, DurableAgentTriggerBinding,
     DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
     ReservedAgentTriggerFiring, StartAgentTriggerFiringOutcome, StartedAgentTriggerRun,
-    AGENT_TRIGGER_APPROVAL_MIGRATION, AGENT_TRIGGER_BUDGET_MIGRATION,
-    AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION, AGENT_TRIGGER_RLS_POLICY,
-    AGENT_TRIGGER_RUN_MIGRATION, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
-    MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    TerminalizeAgentTriggerClaimOutcome, AGENT_TRIGGER_APPROVAL_MIGRATION,
+    AGENT_TRIGGER_BUDGET_MIGRATION, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
+    AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION, AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
+    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use delegation_policy_durable::{
     delegation_policy_durable_migrations, ensure_agent_policy_bundle_on_conn,

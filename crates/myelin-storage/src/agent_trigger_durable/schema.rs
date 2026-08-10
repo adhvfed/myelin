@@ -137,6 +137,18 @@ ALTER TABLE agent_trigger_firing
     );
 "#;
 
+pub const AGENT_TRIGGER_TERMINAL_REASON_MIGRATION: &str = r#"
+ALTER TABLE agent_trigger_firing
+    ADD COLUMN IF NOT EXISTS terminal_reason text;
+ALTER TABLE agent_trigger_firing
+    DROP CONSTRAINT IF EXISTS agent_trigger_firing_terminal_reason_shape;
+ALTER TABLE agent_trigger_firing
+    ADD CONSTRAINT agent_trigger_firing_terminal_reason_shape CHECK (
+        terminal_reason IS NULL
+        OR (state = 'terminal' AND length(terminal_reason) BETWEEN 1 AND 1024)
+    );
+"#;
+
 pub fn agent_trigger_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0090_agent_trigger", AGENT_TRIGGER_MIGRATION),
@@ -147,6 +159,10 @@ pub fn agent_trigger_durable_migrations() -> Migrations {
         Migration::plain(
             "0095_agent_trigger_approval",
             AGENT_TRIGGER_APPROVAL_MIGRATION,
+        ),
+        Migration::plain(
+            "0103_agent_trigger_terminal_reason",
+            AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
         ),
     ])
 }
@@ -177,6 +193,7 @@ mod tests {
         assert!(AGENT_TRIGGER_APPROVAL_MIGRATION.contains("approval_decided_by"));
         assert!(AGENT_TRIGGER_APPROVAL_MIGRATION.contains("approval_decision = 'approved'"));
         assert!(AGENT_TRIGGER_APPROVAL_MIGRATION.contains("approval_decision = 'rejected'"));
+        assert!(AGENT_TRIGGER_TERMINAL_REASON_MIGRATION.contains("state = 'terminal'"));
         assert_eq!(
             AGENT_TRIGGER_RLS_POLICY
                 .matches("FORCE ROW LEVEL SECURITY")
