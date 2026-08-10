@@ -1,6 +1,9 @@
 use std::sync::{Arc, Mutex};
 
+mod activity_executor;
 mod durable_model;
+
+pub use activity_executor::{AgentHostActivityExecutor, HostedModelFactory, LunaModelFactory};
 
 pub mod git_read_tool;
 pub use git_read_tool::{
@@ -317,7 +320,9 @@ impl ToolSurface for ToolCatalogue {
         self.defs.push(def);
     }
     fn resolve(&self, name: &ToolName) -> Option<&ToolDef> {
-        self.defs.iter().find(|d| &d.name == name)
+        self.defs
+            .iter()
+            .find(|definition| &definition.name == name || definition.canonical_name() == name.0)
     }
 }
 
