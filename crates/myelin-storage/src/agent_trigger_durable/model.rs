@@ -102,7 +102,40 @@ pub struct DurableAgentTriggerFiring {
     pub event_type: String,
     pub state: AgentTriggerFiringState,
     pub run_id: Option<String>,
+    pub outcome: Option<AgentTriggerRunOutcome>,
     pub created_at: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTriggerRunOutcome {
+    Succeeded,
+    Failed,
+    Terminated,
+    Nondeterministic,
+}
+
+impl AgentTriggerRunOutcome {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Terminated => "terminated",
+            Self::Nondeterministic => "nondeterministic",
+        }
+    }
+
+    pub(crate) fn from_workflow_state(value: Option<&str>) -> Result<Option<Self>, PgError> {
+        match value {
+            None | Some("running" | "waiting") => Ok(None),
+            Some("completed") => Ok(Some(Self::Succeeded)),
+            Some("failed") => Ok(Some(Self::Failed)),
+            Some("terminated") => Ok(Some(Self::Terminated)),
+            Some("nondeterministic") => Ok(Some(Self::Nondeterministic)),
+            Some(_) => Err(PgError::Query(
+                "agent trigger firing has an invalid workflow outcome".into(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -263,5 +296,22 @@ mod tests {
         assert_eq!(request.event_id, claim.event_id);
         assert_eq!(request.claim_owner, claim.claim_owner);
         assert_eq!(request.run_id, run_id);
+    }
+
+    #[test]
+    fn terminal_workflow_states_become_user_facing_run_outcomes() {
+        assert_eq!(
+            AgentTriggerRunOutcome::from_workflow_state(Some("completed")).unwrap(),
+            Some(AgentTriggerRunOutcome::Succeeded)
+        );
+        assert_eq!(
+            AgentTriggerRunOutcome::from_workflow_state(Some("failed")).unwrap(),
+            Some(AgentTriggerRunOutcome::Failed)
+        );
+        assert_eq!(
+            AgentTriggerRunOutcome::from_workflow_state(Some("running")).unwrap(),
+            None
+        );
+        assert!(AgentTriggerRunOutcome::from_workflow_state(Some("mystery")).is_err());
     }
 }

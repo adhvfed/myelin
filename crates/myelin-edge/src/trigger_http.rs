@@ -385,6 +385,7 @@ fn firing_json(tenant: &str, firing: &DurableAgentTriggerFiring) -> Value {
         "run_ref": firing.run_id.as_ref().map(|run_id| {
             format!("myelin://{tenant}/agent/run/{run_id}")
         }),
+        "outcome": firing.outcome.map(|outcome| outcome.token()),
         "created_at": firing.created_at,
     })
 }

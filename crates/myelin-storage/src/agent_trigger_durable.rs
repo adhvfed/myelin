@@ -2,11 +2,12 @@ mod model;
 mod schema;
 
 pub use model::{
-    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerStartRequest,
-    ClaimedAgentTriggerFiring, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding,
-    DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
-    ReservedAgentTriggerFiring, StartAgentTriggerFiringOutcome, StartedAgentTriggerRun,
-    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerRunOutcome,
+    AgentTriggerStartRequest, ClaimedAgentTriggerFiring, CreateAgentTriggerBindingOutcome,
+    DurableAgentTriggerBinding, DurableAgentTriggerFiring, NewAgentTriggerBinding,
+    ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring, StartAgentTriggerFiringOutcome,
+    StartedAgentTriggerRun, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use schema::{
     agent_trigger_durable_migrations, AGENT_TRIGGER_BUDGET_MIGRATION,
@@ -406,10 +407,13 @@ impl DurableAgentTriggerBacking {
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
                     let rows = sqlx::query(
-                        "SELECT f.binding_id, f.event_id, f.event_type, f.state, f.run_id, f.created_at \
+                        "SELECT f.binding_id, f.event_id, f.event_type, f.state, f.run_id, \
+                                f.created_at, run.state AS workflow_state \
                            FROM agent_trigger_firing f \
                            JOIN agent_trigger_binding b ON b.tenant_id = f.tenant_id \
                             AND b.region = f.region AND b.binding_id = f.binding_id \
+                           LEFT JOIN workflow_run run ON run.tenant_id = f.tenant_id \
+                            AND run.region = f.region AND run.run_id = f.run_id::text \
                           WHERE f.tenant_id = $1 AND f.region = $2 \
                             AND f.binding_id = $3 AND b.owner_principal_id = $4 \
                             AND ($5::text IS NULL OR (f.created_at, f.event_id) < (\
@@ -780,6 +784,11 @@ fn firing_from_row(row: &sqlx::postgres::PgRow) -> Result<DurableAgentTriggerFir
             .try_get::<Option<Uuid>, _>("run_id")
             .map_err(row_error("run_id"))?
             .map(|id| id.to_string()),
+        outcome: AgentTriggerRunOutcome::from_workflow_state(
+            row.try_get::<Option<String>, _>("workflow_state")
+                .map_err(row_error("workflow_state"))?
+                .as_deref(),
+        )?,
         created_at: row
             .try_get::<DateTime<Utc>, _>("created_at")
             .map_err(row_error("created_at"))?

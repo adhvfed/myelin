@@ -208,6 +208,7 @@ command = ["true"]
       event_type: "ci.run.failed",
       trigger_ref: `myelin://${systemTestConfig.tenant}/identity/trigger/${triggerId}`,
       state: "terminal",
+      outcome: "succeeded",
       run_ref: `myelin://${systemTestConfig.tenant}/agent/run/${hostedRunId}`,
     });
     const triageTitle = `CI failure ${runId} needs triage`;
