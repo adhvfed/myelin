@@ -134,7 +134,48 @@ pub struct DurableAgentTriggerFiring {
     pub state: AgentTriggerFiringState,
     pub run_id: Option<String>,
     pub outcome: Option<AgentTriggerRunOutcome>,
+    pub approval_decision: Option<AgentTriggerApprovalDecision>,
+    pub approval_decided_by: Option<String>,
+    pub approval_decided_at: Option<String>,
     pub created_at: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTriggerApprovalDecision {
+    Approve,
+    Reject,
+}
+
+impl AgentTriggerApprovalDecision {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Approve => "approved",
+            Self::Reject => "rejected",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, PgError> {
+        match value {
+            "approved" => Ok(Self::Approve),
+            "rejected" => Ok(Self::Reject),
+            _ => Err(PgError::Query(
+                "agent trigger firing has an invalid approval decision".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentTriggerApprovalOutcome {
+    pub firing: DurableAgentTriggerFiring,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChangeAgentTriggerApprovalOutcome {
+    Complete(Box<AgentTriggerApprovalOutcome>),
+    NotFound,
+    InvalidTransition,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

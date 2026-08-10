@@ -41,7 +41,8 @@ The suite is intentionally organized around externally visible contracts:
 - `collaboration-lifecycle` creates and safely retries a public Chat conversation, sends and pages
   messages through one public retry identity, creates and edits a Knowledge page with the same
   retry convention, exercises the asynchronous Issues authorization reconciler and optimistic
-  conflicts, and follows red mainline CI through a governed hosted agent into one attributed issue.
+  conflicts, and follows red mainline CI through a durable, retry-safe human approval into one
+  governed hosted-agent run and one attributed issue.
 - `authentication-lifecycle` starts logged out, lets an authenticated browser identity approve one
   verifier-bound CLI login, proves another CLI cannot claim it, and uses the fresh session exactly
   once without copying the browser credential.

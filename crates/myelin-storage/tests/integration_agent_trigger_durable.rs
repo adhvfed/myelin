@@ -4,10 +4,11 @@ use myelin_config::MyelinConfig;
 use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
-    all_durable_migrations, AgentTriggerClaimRequest, AgentTriggerFiringState,
-    AgentTriggerLifecycleAction, ChangeAgentTriggerLifecycleOutcome,
-    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, NewAgentTriggerBinding,
-    ReserveAgentTriggerFiringOutcome, SubstrateProvider,
+    all_durable_migrations, AgentTriggerApprovalDecision, AgentTriggerClaimRequest,
+    AgentTriggerFiringState, AgentTriggerLifecycleAction, ChangeAgentTriggerApprovalOutcome,
+    ChangeAgentTriggerLifecycleOutcome, CreateAgentTriggerBindingOutcome,
+    DurableAgentTriggerBacking, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
+    SubstrateProvider,
 };
 use sqlx::types::chrono::Utc;
 use sqlx::types::Uuid;
@@ -278,6 +279,164 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         ChangeAgentTriggerLifecycleOutcome::Complete(ref outcome)
             if outcome.changed && outcome.binding.state == "active"
     ));
+
+    let mut guarded = proposal.clone();
+    guarded.binding_id = Uuid::parse_str("10000000-0000-4000-8000-000000000010").unwrap();
+    guarded.client_nonce = "red-main-needs-a-human".into();
+    guarded.max_firings = 2;
+    guarded.require_human_approval = true;
+    triggers
+        .create(&tenant, guarded.clone())
+        .await
+        .expect("the founder creates a guarded variant");
+    for event_id in ["guarded-red-approved", "guarded-red-rejected"] {
+        let reserved = triggers
+            .reserve_firing(
+                &tenant,
+                guarded.binding_id,
+                event_id,
+                "ci.run.failed",
+                serde_json::json!({"event_id": event_id}),
+                1,
+                false,
+                Utc::now(),
+            )
+            .await
+            .expect("a matching guarded event waits for a person");
+        assert!(matches!(
+            reserved,
+            ReserveAgentTriggerFiringOutcome::Reserved(ref firing)
+                if firing.state == AgentTriggerFiringState::AwaitingApproval
+        ));
+    }
+    assert_eq!(
+        triggers
+            .claim_next_firing(
+                &tenant,
+                AgentTriggerClaimRequest::new("hosted:luna", "host-before-approval", 30).unwrap(),
+            )
+            .await
+            .expect("the worker checks its queue"),
+        None,
+        "human-gated work cannot race ahead of its decision"
+    );
+    assert_eq!(
+        triggers
+            .change_firing_approval(
+                &tenant,
+                "reviewer",
+                guarded.binding_id,
+                "guarded-red-approved",
+                AgentTriggerApprovalDecision::Approve,
+            )
+            .await
+            .expect("a peer cannot infer or decide another person's guarded work"),
+        ChangeAgentTriggerApprovalOutcome::NotFound
+    );
+    let approved = triggers
+        .change_firing_approval(
+            &tenant,
+            "founder",
+            guarded.binding_id,
+            "guarded-red-approved",
+            AgentTriggerApprovalDecision::Approve,
+        )
+        .await
+        .expect("the owner approves the exact event");
+    let ChangeAgentTriggerApprovalOutcome::Complete(approved) = approved else {
+        panic!("an awaiting firing must be approvable, got {approved:?}");
+    };
+    assert!(approved.changed);
+    assert_eq!(approved.firing.state, AgentTriggerFiringState::Queued);
+    assert_eq!(
+        approved.firing.approval_decision,
+        Some(AgentTriggerApprovalDecision::Approve)
+    );
+    assert_eq!(
+        approved.firing.approval_decided_by.as_deref(),
+        Some("founder")
+    );
+    assert!(approved.firing.approval_decided_at.is_some());
+    let replayed_approval = triggers
+        .change_firing_approval(
+            &tenant,
+            "founder",
+            guarded.binding_id,
+            "guarded-red-approved",
+            AgentTriggerApprovalDecision::Approve,
+        )
+        .await
+        .expect("the CLI safely retries its approval");
+    assert!(matches!(
+        replayed_approval,
+        ChangeAgentTriggerApprovalOutcome::Complete(ref outcome) if !outcome.changed
+    ));
+    let approved_claim = triggers
+        .claim_next_firing(
+            &tenant,
+            AgentTriggerClaimRequest::new("hosted:luna", "host-after-approval", 30).unwrap(),
+        )
+        .await
+        .expect("the worker checks its queue after approval")
+        .expect("approved work becomes claimable");
+    assert_eq!(approved_claim.event_id, "guarded-red-approved");
+
+    let rejected = triggers
+        .change_firing_approval(
+            &tenant,
+            "founder",
+            guarded.binding_id,
+            "guarded-red-rejected",
+            AgentTriggerApprovalDecision::Reject,
+        )
+        .await
+        .expect("the owner rejects the other exact event");
+    assert!(matches!(
+        rejected,
+        ChangeAgentTriggerApprovalOutcome::Complete(ref outcome)
+            if outcome.changed
+                && outcome.firing.state == AgentTriggerFiringState::Terminal
+                && outcome.firing.run_id.is_none()
+                && outcome.firing.approval_decision == Some(AgentTriggerApprovalDecision::Reject)
+    ));
+    assert_eq!(
+        triggers
+            .change_firing_approval(
+                &tenant,
+                "founder",
+                guarded.binding_id,
+                "guarded-red-rejected",
+                AgentTriggerApprovalDecision::Approve,
+            )
+            .await
+            .expect("a rejected decision is final"),
+        ChangeAgentTriggerApprovalOutcome::InvalidTransition
+    );
+    let guarded_disabled = triggers
+        .change_lifecycle(
+            &tenant,
+            "founder",
+            guarded.binding_id,
+            AgentTriggerLifecycleAction::Disable,
+        )
+        .await
+        .expect("retire the completed approval exercise");
+    assert!(matches!(
+        guarded_disabled,
+        ChangeAgentTriggerLifecycleOutcome::Complete(ref outcome)
+            if outcome.canceled_firings == 1
+    ));
+    let guarded_history = triggers
+        .list_firings_for_owner(&tenant, "founder", guarded.binding_id, None, 100)
+        .await
+        .expect("the approval decisions remain inspectable");
+    assert_eq!(guarded_history.len(), 2);
+    assert!(guarded_history
+        .iter()
+        .all(|firing| firing.state == AgentTriggerFiringState::Terminal));
+    assert!(guarded_history
+        .iter()
+        .all(|firing| firing.approval_decision.is_some()));
 
     let event = serde_json::json!({
         "event_id": "ci-failed-1",

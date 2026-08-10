@@ -4,7 +4,8 @@ use std::sync::Arc;
 use myelin_identity::{Literal, ObjectType};
 use myelin_query::{CmpOp, EventMatcher, Expr, Predicate};
 use myelin_storage::{
-    AgentTriggerFiringState, AgentTriggerLifecycleAction, ChangeAgentTriggerLifecycleOutcome,
+    AgentTriggerApprovalDecision, AgentTriggerFiringState, AgentTriggerLifecycleAction,
+    ChangeAgentTriggerApprovalOutcome, ChangeAgentTriggerLifecycleOutcome,
     CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, DurableAgentTriggerBinding,
     DurableAgentTriggerFiring, NewAgentTriggerBinding, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
     MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
@@ -140,6 +141,17 @@ struct TriggerFiringListHandler {
 struct TriggerLifecycleHandler {
     api: TriggerHttpApi,
     action: AgentTriggerLifecycleAction,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TriggerApprovalBody {
+    event_id: String,
+}
+
+struct TriggerApprovalHandler {
+    api: TriggerHttpApi,
+    decision: AgentTriggerApprovalDecision,
 }
 
 impl Handler for TriggerListHandler {
@@ -283,6 +295,48 @@ impl Handler for TriggerLifecycleHandler {
     }
 }
 
+impl Handler for TriggerApprovalHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.query.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "trigger approval accepts no query parameters".into(),
+            ));
+        }
+        let body = parse_approval_body(&ctx.request.body)?;
+        let binding_id = parse_uuid(trigger_param(ctx)?)?;
+        let outcome = self
+            .api
+            .drive(self.api.backing.change_firing_approval(
+                &ctx.principal.tenant.0,
+                &ctx.principal.principal_id.0,
+                binding_id,
+                &body.event_id,
+                self.decision,
+            ))?
+            .map_err(|error| EdgeError::Internal(error.to_string()))?;
+        let outcome = match outcome {
+            ChangeAgentTriggerApprovalOutcome::Complete(outcome) => outcome,
+            ChangeAgentTriggerApprovalOutcome::NotFound => {
+                return Err(EdgeError::NotFound("trigger firing not found".into()))
+            }
+            ChangeAgentTriggerApprovalOutcome::InvalidTransition => {
+                return Err(EdgeError::Conflict(
+                    "trigger firing approval transition is not allowed".into(),
+                ))
+            }
+        };
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "action": approval_action_token(self.decision),
+                "changed": outcome.changed,
+                "durable": true,
+                "firing": firing_json(&ctx.principal.tenant.0, &outcome.firing),
+            }),
+        )))
+    }
+}
+
 pub fn register_triggers(
     builder: GatewayBuilder,
     backing: DurableAgentTriggerBacking,
@@ -337,8 +391,26 @@ pub fn register_triggers(
             "/v1/triggers/{trigger}/disable",
             "identity.trigger.disable",
             Arc::new(TriggerLifecycleHandler {
-                api,
+                api: api.clone(),
                 action: AgentTriggerLifecycleAction::Disable,
+            }),
+        )
+        .route(
+            Method::Post,
+            "/v1/triggers/{trigger}/firings/approve",
+            "identity.trigger.firing.approve",
+            Arc::new(TriggerApprovalHandler {
+                api: api.clone(),
+                decision: AgentTriggerApprovalDecision::Approve,
+            }),
+        )
+        .route(
+            Method::Post,
+            "/v1/triggers/{trigger}/firings/reject",
+            "identity.trigger.firing.reject",
+            Arc::new(TriggerApprovalHandler {
+                api,
+                decision: AgentTriggerApprovalDecision::Reject,
             }),
         )
 }
@@ -348,6 +420,13 @@ fn lifecycle_action_token(action: AgentTriggerLifecycleAction) -> &'static str {
         AgentTriggerLifecycleAction::Pause => "pause",
         AgentTriggerLifecycleAction::Resume => "resume",
         AgentTriggerLifecycleAction::Disable => "disable",
+    }
+}
+
+fn approval_action_token(decision: AgentTriggerApprovalDecision) -> &'static str {
+    match decision {
+        AgentTriggerApprovalDecision::Approve => "approve",
+        AgentTriggerApprovalDecision::Reject => "reject",
     }
 }
 
@@ -461,6 +540,27 @@ fn parse_create_body(bytes: &[u8]) -> Result<CreateTriggerBody, EdgeError> {
         .map_err(|error| EdgeError::BadRequest(format!("invalid trigger create body: {error}")))
 }
 
+fn parse_approval_body(bytes: &[u8]) -> Result<TriggerApprovalBody, EdgeError> {
+    if bytes.len() > MAX_TRIGGER_JSON_BYTES {
+        return Err(EdgeError::PayloadTooLarge(format!(
+            "trigger approval body exceeds {MAX_TRIGGER_JSON_BYTES} bytes"
+        )));
+    }
+    let body: TriggerApprovalBody = serde_json::from_slice(bytes)
+        .map_err(|error| EdgeError::BadRequest(format!("invalid trigger approval body: {error}")))?;
+    if body.event_id.is_empty()
+        || body.event_id.len() > 255
+        || body.event_id.trim() != body.event_id
+        || body.event_id.chars().any(char::is_control)
+    {
+        return Err(EdgeError::BadRequest(
+            "event_id must contain 1..=255 bytes without surrounding whitespace or control characters"
+                .into(),
+        ));
+    }
+    Ok(body)
+}
+
 fn parse_uuid(value: &str) -> Result<Uuid, EdgeError> {
     let parsed = Uuid::parse_str(value).map_err(|_| {
         EdgeError::BadRequest("agent and trigger ids must be lowercase UUIDs".into())
@@ -509,6 +609,11 @@ fn firing_json(tenant: &str, firing: &DurableAgentTriggerFiring) -> Value {
             format!("myelin://{tenant}/agent/run/{run_id}")
         }),
         "outcome": firing.outcome.map(|outcome| outcome.token()),
+        "approval": firing.approval_decision.map(|decision| json!({
+            "decision": decision.token(),
+            "decided_by": firing.approval_decided_by,
+            "decided_at": firing.approval_decided_at,
+        })),
         "created_at": firing.created_at,
     })
 }
@@ -641,5 +746,17 @@ mod tests {
             "max_firings":1
         }"#;
         assert!(parse_create_body(missing_budget).is_err());
+    }
+
+    #[test]
+    fn approval_names_one_exact_event_without_accepting_shape_drift() {
+        assert_eq!(
+            parse_approval_body(br#"{"event_id":"ci-failed:one/two"}"#)
+                .unwrap()
+                .event_id,
+            "ci-failed:one/two"
+        );
+        assert!(parse_approval_body(br#"{"event_id":" ci-failed"}"#).is_err());
+        assert!(parse_approval_body(br#"{"event_id":"ci-failed","approve":true}"#).is_err());
     }
 }

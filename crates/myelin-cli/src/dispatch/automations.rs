@@ -16,7 +16,7 @@ const MAX_CAUSAL_DEPTH: u32 = 64;
 pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no automation command given (try: create | list | show | history | pause | resume | disable)"
+            "no automation command given (try: create | list | show | history | approve | reject | pause | resume | disable)"
                 .into(),
         )
     })?;
@@ -25,6 +25,7 @@ pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
         "list" => list_call(rest),
         "show" => show_call(rest),
         "history" => history_call(rest),
+        "approve" | "reject" => approval_call(rest, verb),
         "pause" | "resume" | "disable" => lifecycle_call(rest, verb),
         other => Err(CliError::Usage(format!(
             "unknown automation command token `{other}`"
@@ -198,6 +199,37 @@ fn lifecycle_call(args: &[&str], action: &str) -> Result<EdgeCall, CliError> {
     Ok(EdgeCall::post_json(
         format!("/v1/triggers/{id}/{action}"),
         json!({}),
+    ))
+}
+
+fn approval_call(args: &[&str], action: &str) -> Result<EdgeCall, CliError> {
+    let (id, event_id) = match args {
+        [id, event_id] => (*id, *event_id),
+        [] | [_] => {
+            return Err(CliError::Usage(format!(
+                "automation {action} needs an automation id and event id"
+            )))
+        }
+        [_, _, extra, ..] => {
+            return Err(CliError::Usage(format!(
+                "unexpected automation {action} argument `{extra}`"
+            )))
+        }
+    };
+    require_automation_id("automation id", id)?;
+    if event_id.is_empty()
+        || event_id.len() > 255
+        || event_id.trim() != event_id
+        || event_id.chars().any(char::is_control)
+    {
+        return Err(CliError::Usage(
+            "event id must contain 1..=255 bytes without surrounding whitespace or control characters"
+                .into(),
+        ));
+    }
+    Ok(EdgeCall::post_json(
+        format!("/v1/triggers/{id}/firings/{action}"),
+        json!({ "event_id": event_id }),
     ))
 }
 
@@ -433,6 +465,19 @@ mod tests {
             assert_eq!(call.path, format!("/v1/triggers/{AUTOMATION}/{action}"));
             assert_eq!(call.retry_policy, RetryPolicy::CallerKeyRequired);
         }
+        for action in ["approve", "reject"] {
+            let call = automation_dispatch(&[action, AUTOMATION, "evt:failed/1"]).unwrap();
+            assert_eq!(
+                call.path,
+                format!("/v1/triggers/{AUTOMATION}/firings/{action}")
+            );
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(call.payload.as_ref().unwrap())
+                    .unwrap(),
+                json!({ "event_id": "evt:failed/1" })
+            );
+            assert_eq!(call.retry_policy, RetryPolicy::CallerKeyRequired);
+        }
     }
 
     #[test]
@@ -485,6 +530,8 @@ mod tests {
             vec!["show", "not-an-id"],
             vec!["history", AUTOMATION, "--cursor", " bad"],
             vec!["disable", AUTOMATION, "again"],
+            vec!["approve", AUTOMATION],
+            vec!["reject", AUTOMATION, " bad"],
         ] {
             assert!(automation_dispatch(&args).is_err(), "accepted {args:?}");
         }

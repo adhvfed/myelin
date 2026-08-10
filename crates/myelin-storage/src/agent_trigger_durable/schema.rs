@@ -116,6 +116,27 @@ ALTER TABLE agent_trigger_binding
     CHECK (budget_minor_units BETWEEN 1 AND 1000000000000);
 "#;
 
+pub const AGENT_TRIGGER_APPROVAL_MIGRATION: &str = r#"
+ALTER TABLE agent_trigger_firing
+    ADD COLUMN IF NOT EXISTS approval_decision text,
+    ADD COLUMN IF NOT EXISTS approval_decided_by text,
+    ADD COLUMN IF NOT EXISTS approval_decided_at timestamptz;
+ALTER TABLE agent_trigger_firing
+    DROP CONSTRAINT IF EXISTS agent_trigger_firing_approval_shape;
+ALTER TABLE agent_trigger_firing
+    ADD CONSTRAINT agent_trigger_firing_approval_shape CHECK (
+        (approval_decision IS NULL
+          AND approval_decided_by IS NULL
+          AND approval_decided_at IS NULL)
+        OR
+        (((approval_decision = 'approved'
+             AND state IN ('queued', 'claimed', 'started', 'terminal'))
+           OR (approval_decision = 'rejected' AND state = 'terminal'))
+          AND length(approval_decided_by) BETWEEN 1 AND 255
+          AND approval_decided_at IS NOT NULL)
+    );
+"#;
+
 pub fn agent_trigger_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0090_agent_trigger", AGENT_TRIGGER_MIGRATION),
@@ -123,6 +144,10 @@ pub fn agent_trigger_durable_migrations() -> Migrations {
         Migration::plain("0092_agent_trigger_claim", AGENT_TRIGGER_CLAIM_MIGRATION),
         Migration::plain("0093_agent_trigger_run", AGENT_TRIGGER_RUN_MIGRATION),
         Migration::plain("0094_agent_trigger_budget", AGENT_TRIGGER_BUDGET_MIGRATION),
+        Migration::plain(
+            "0095_agent_trigger_approval",
+            AGENT_TRIGGER_APPROVAL_MIGRATION,
+        ),
     ])
 }
 
@@ -149,6 +174,9 @@ mod tests {
             "BETWEEN {MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS} AND \
              {MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS}"
         )));
+        assert!(AGENT_TRIGGER_APPROVAL_MIGRATION.contains("approval_decided_by"));
+        assert!(AGENT_TRIGGER_APPROVAL_MIGRATION.contains("approval_decision = 'approved'"));
+        assert!(AGENT_TRIGGER_APPROVAL_MIGRATION.contains("approval_decision = 'rejected'"));
         assert_eq!(
             AGENT_TRIGGER_RLS_POLICY
                 .matches("FORCE ROW LEVEL SECURITY")

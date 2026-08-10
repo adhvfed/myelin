@@ -68,6 +68,7 @@ describe("collaboration lifecycle", () => {
       max_firings: 10,
       max_causal_depth: 4,
       delegation_caveats: ["repo:core", "issue:create"],
+      require_human_approval: true,
     };
     const created = await founder.json("/v1/triggers", {
       method: "POST",
@@ -86,6 +87,7 @@ describe("collaboration lifecycle", () => {
       max_firings: 10,
       firings_used: 0,
       require_no_personal_data: true,
+      require_human_approval: true,
       state: "active",
     });
 
@@ -193,6 +195,60 @@ command = ["true"]
       state: "active",
     });
 
+    const awaitingApproval = await eventually<JsonRecord>(async () => {
+      const response = await founder.json(
+        `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+      );
+      return array(response.body.items, "guarded trigger firing history")
+        .map((item) => record(item, "guarded trigger firing"))
+        .find((item) => item.event_id === eventId && item.state === "awaiting_approval");
+    }, { description: "the red mainline event to wait without spending its agent budget" });
+    expect(awaitingApproval).toMatchObject({
+      event_id: eventId,
+      state: "awaiting_approval",
+      run_id: null,
+      approval: null,
+    });
+
+    const peerApproval = await reviewerClient.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings/approve`,
+      { method: "POST", body: { event_id: eventId }, expectedStatus: 403 },
+    );
+    expect(peerApproval.body).toMatchObject({ error: { code: "forbidden" } });
+
+    const approved = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings/approve`,
+      { method: "POST", body: { event_id: eventId }, expectedStatus: 200 },
+    );
+    expect(approved.body).toMatchObject({
+      action: "approve",
+      changed: true,
+      durable: true,
+      firing: {
+        event_id: eventId,
+        state: "queued",
+        run_id: null,
+        approval: {
+          decision: "approved",
+          decided_by: expect.any(String),
+          decided_at: expect.any(String),
+        },
+      },
+    });
+    const retriedApproval = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings/approve`,
+      { method: "POST", body: { event_id: eventId }, expectedStatus: 200 },
+    );
+    expect(retriedApproval.body).toMatchObject({
+      action: "approve",
+      changed: false,
+      firing: { event_id: eventId, approval: { decision: "approved" } },
+    });
+    await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings/reject`,
+      { method: "POST", body: { event_id: eventId }, expectedStatus: 409 },
+    );
+
     const completedFiring = await eventually<JsonRecord>(async () => {
       const response = await founder.json(
         `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
@@ -209,6 +265,11 @@ command = ["true"]
       trigger_ref: `myelin://${systemTestConfig.tenant}/identity/trigger/${triggerId}`,
       state: "terminal",
       outcome: "succeeded",
+      approval: {
+        decision: "approved",
+        decided_by: expect.any(String),
+        decided_at: expect.any(String),
+      },
       run_ref: `myelin://${systemTestConfig.tenant}/agent/run/${hostedRunId}`,
     });
     const triageTitle = `CI failure ${runId} needs triage`;

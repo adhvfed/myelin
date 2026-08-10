@@ -100,11 +100,16 @@ myelin agent create "Mainline triage" --runtime hosted \
 myelin automation create --event ci.run.failed --branch main \
   --run-as 33333333-3333-3333-3333-333333333333 \
   --task "Read the failed run and open one focused issue." \
-  --budget-minor-units 250000 --max-firings 10 \
+  --budget-minor-units 250000 --max-firings 10 --require-human-approval \
   --idempotency-key red-mainline-triage
 myelin automation list
 myelin automation show 44444444-4444-4444-4444-444444444444
 myelin automation history 44444444-4444-4444-4444-444444444444
+myelin automation approve 44444444-4444-4444-4444-444444444444 ci-failed-01J... \
+  --idempotency-key approve-red-mainline
+# Or end that exact pending firing without starting an agent run:
+myelin automation reject 44444444-4444-4444-4444-444444444444 ci-failed-01K... \
+  --idempotency-key reject-red-mainline
 myelin automation pause 44444444-4444-4444-4444-444444444444 \
   --idempotency-key pause-red-mainline
 myelin automation resume 44444444-4444-4444-4444-444444444444 \
@@ -159,7 +164,9 @@ Hosted agents use the same identity and tool catalogue, but Myelin owns their ex
 integer minor-unit budget, optional delegation caveats, and safety gates. Each firing receives a
 short-lived run identity and reaches Git, CI, Issues, Chat, and Knowledge only through governed
 Myelin tools. Owners can inspect durable firing history and outcomes, pause new reservations for
-maintenance, resume them, or irreversibly disable an automation. No third-party integration key is
+maintenance, resume them, or irreversibly disable an automation. A human-approval gate parks the
+exact event without starting or paying for an agent run; its owner can approve or reject it with a
+durable, retry-safe decision that remains visible in history. No third-party integration key is
 created or copied into the agent.
 
 Issue responses include a canonical `myelin://...` reference that can be passed directly to

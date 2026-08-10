@@ -7,6 +7,9 @@ use crate::dispatch::{is_canonical_automation_id, EdgeCall};
 use super::{query_field, terminal_safe_single_line};
 
 pub(super) fn render_response(value: &Value) -> Option<String> {
+    if value.get("firing").is_some() {
+        return render_approval(value);
+    }
     let automation = value.get("trigger")?;
     let summary = render_automation(automation)?;
     if let Some(action) = value.get("action").and_then(Value::as_str) {
@@ -24,6 +27,24 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
     Some(format!(
         "{disposition}: {summary}\n  task: {task}\n  firings: {used}/{maximum}; per-run budget: {budget} minor-units\n  Myelin owns the integration credentials and gives each run only its governed tools.\n"
     ))
+}
+
+fn render_approval(value: &Value) -> Option<String> {
+    if !value.get("durable")?.as_bool()? {
+        return None;
+    }
+    let action = value.get("action")?.as_str()?;
+    let changed = value.get("changed")?.as_bool()?;
+    let firing = value.get("firing")?;
+    let summary = render_firing(firing)?;
+    let disposition = match (action, changed) {
+        ("approve", true) => "Approved automation firing",
+        ("approve", false) => "Automation firing already approved",
+        ("reject", true) => "Rejected automation firing",
+        ("reject", false) => "Automation firing already rejected",
+        _ => return None,
+    };
+    Some(format!("{disposition}: {summary}\n"))
 }
 
 fn render_lifecycle(value: &Value, action: &str, summary: String) -> Option<String> {
@@ -218,6 +239,28 @@ mod tests {
             succeeded,
             "✓ succeeded  ci-failed-1  myelin://acme/agent/run/33333333-3333-4333-8333-333333333333"
         );
+
+        let approval = render_response(&json!({
+            "action": "approve",
+            "changed": true,
+            "durable": true,
+            "firing": {
+                "event_id": "ci-failed-2",
+                "event_type": "ci.run.failed",
+                "trigger_ref": format!("myelin://acme/identity/trigger/{AUTOMATION}"),
+                "state": "queued",
+                "run_id": null,
+                "run_ref": null,
+                "outcome": null,
+                "approval": {
+                    "decision": "approved",
+                    "decided_by": "ada",
+                    "decided_at": "2026-08-10T10:00:00Z"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(approval.starts_with("Approved automation firing: … queued  ci-failed-2"));
     }
 
     #[test]

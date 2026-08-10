@@ -2,8 +2,9 @@ mod model;
 mod schema;
 
 pub use model::{
-    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerLifecycleAction,
-    AgentTriggerLifecycleOutcome, AgentTriggerRunOutcome, AgentTriggerStartRequest,
+    AgentTriggerApprovalDecision, AgentTriggerApprovalOutcome, AgentTriggerClaimRequest,
+    AgentTriggerFiringState, AgentTriggerLifecycleAction, AgentTriggerLifecycleOutcome,
+    AgentTriggerRunOutcome, AgentTriggerStartRequest, ChangeAgentTriggerApprovalOutcome,
     ChangeAgentTriggerLifecycleOutcome, ClaimedAgentTriggerFiring,
     CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
     NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
@@ -11,9 +12,9 @@ pub use model::{
     MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use schema::{
-    agent_trigger_durable_migrations, AGENT_TRIGGER_BUDGET_MIGRATION,
-    AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION, AGENT_TRIGGER_RLS_POLICY,
-    AGENT_TRIGGER_RUN_MIGRATION,
+    agent_trigger_durable_migrations, AGENT_TRIGGER_APPROVAL_MIGRATION,
+    AGENT_TRIGGER_BUDGET_MIGRATION, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
+    AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION,
 };
 
 use sqlx::types::chrono::{DateTime, Utc};
@@ -525,7 +526,9 @@ impl DurableAgentTriggerBacking {
                 Box::pin(async move {
                     let rows = sqlx::query(
                         "SELECT f.binding_id, f.event_id, f.event_type, f.state, f.run_id, \
-                                f.created_at, run.state AS workflow_state \
+                                f.approval_decision, f.approval_decided_by, \
+                                f.approval_decided_at, f.created_at, \
+                                run.state AS workflow_state \
                            FROM agent_trigger_firing f \
                            JOIN agent_trigger_binding b ON b.tenant_id = f.tenant_id \
                             AND b.region = f.region AND b.binding_id = f.binding_id \
@@ -550,6 +553,96 @@ impl DurableAgentTriggerBacking {
                     .await
                     .map_err(query_error("list agent trigger firings for owner"))?;
                     rows.iter().map(firing_from_row).collect()
+                })
+            })
+            .await
+    }
+
+    pub async fn change_firing_approval(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        binding_id: Uuid,
+        event_id: &str,
+        decision: AgentTriggerApprovalDecision,
+    ) -> Result<ChangeAgentTriggerApprovalOutcome, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner_principal_id = owner_principal_id.to_string();
+        let event_id = event_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT f.binding_id, f.event_id, f.event_type, f.state, f.run_id, \
+                                f.approval_decision, f.approval_decided_by, \
+                                f.approval_decided_at, f.created_at, \
+                                NULL::text AS workflow_state \
+                           FROM agent_trigger_firing f \
+                           JOIN agent_trigger_binding b ON b.tenant_id = f.tenant_id \
+                            AND b.region = f.region AND b.binding_id = f.binding_id \
+                          WHERE f.tenant_id = $1 AND f.region = $2 AND f.binding_id = $3 \
+                            AND f.event_id = $4 AND b.owner_principal_id = $5 \
+                          FOR UPDATE OF f, b",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(binding_id)
+                    .bind(&event_id)
+                    .bind(&owner_principal_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("lock governed firing approval"))?;
+                    let Some(row) = row else {
+                        return Ok(ChangeAgentTriggerApprovalOutcome::NotFound);
+                    };
+                    let mut firing = firing_from_row(&row)?;
+                    if firing.approval_decision == Some(decision) {
+                        return Ok(ChangeAgentTriggerApprovalOutcome::Complete(Box::new(
+                            AgentTriggerApprovalOutcome {
+                                firing,
+                                changed: false,
+                            },
+                        )));
+                    }
+                    if firing.state != AgentTriggerFiringState::AwaitingApproval
+                        || firing.approval_decision.is_some()
+                    {
+                        return Ok(ChangeAgentTriggerApprovalOutcome::InvalidTransition);
+                    }
+
+                    let target_state = match decision {
+                        AgentTriggerApprovalDecision::Approve => AgentTriggerFiringState::Queued,
+                        AgentTriggerApprovalDecision::Reject => AgentTriggerFiringState::Terminal,
+                    };
+                    let decided_at = sqlx::query_scalar::<_, DateTime<Utc>>(
+                        "UPDATE agent_trigger_firing \
+                            SET state = $6, approval_decision = $7, \
+                                approval_decided_by = $5, approval_decided_at = clock_timestamp() \
+                          WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                            AND event_id = $4 \
+                      RETURNING approval_decided_at",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(binding_id)
+                    .bind(&event_id)
+                    .bind(&owner_principal_id)
+                    .bind(target_state.token())
+                    .bind(decision.token())
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(query_error("decide governed firing approval"))?;
+                    firing.state = target_state;
+                    firing.approval_decision = Some(decision);
+                    firing.approval_decided_by = Some(owner_principal_id);
+                    firing.approval_decided_at = Some(decided_at.to_rfc3339());
+                    Ok(ChangeAgentTriggerApprovalOutcome::Complete(Box::new(
+                        AgentTriggerApprovalOutcome {
+                            firing,
+                            changed: true,
+                        },
+                    )))
                 })
             })
             .await
@@ -898,6 +991,12 @@ async fn load_firing(
 }
 
 fn firing_from_row(row: &sqlx::postgres::PgRow) -> Result<DurableAgentTriggerFiring, PgError> {
+    let approval_decision = row
+        .try_get::<Option<String>, _>("approval_decision")
+        .map_err(row_error("approval_decision"))?
+        .as_deref()
+        .map(AgentTriggerApprovalDecision::parse)
+        .transpose()?;
     Ok(DurableAgentTriggerFiring {
         binding_id: row
             .try_get::<Uuid, _>("binding_id")
@@ -918,6 +1017,14 @@ fn firing_from_row(row: &sqlx::postgres::PgRow) -> Result<DurableAgentTriggerFir
                 .map_err(row_error("workflow_state"))?
                 .as_deref(),
         )?,
+        approval_decision,
+        approval_decided_by: row
+            .try_get("approval_decided_by")
+            .map_err(row_error("approval_decided_by"))?,
+        approval_decided_at: row
+            .try_get::<Option<DateTime<Utc>>, _>("approval_decided_at")
+            .map_err(row_error("approval_decided_at"))?
+            .map(|at| at.to_rfc3339()),
         created_at: row
             .try_get::<DateTime<Utc>, _>("created_at")
             .map_err(row_error("created_at"))?
