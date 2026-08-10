@@ -4,8 +4,8 @@ use std::sync::Arc;
 use myelin_identity::{Literal, ObjectType};
 use myelin_query::{CmpOp, EventMatcher, Expr, Predicate};
 use myelin_storage::{
-    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, DurableAgentTriggerBinding,
-    NewAgentTriggerBinding,
+    AgentTriggerFiringState, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking,
+    DurableAgentTriggerBinding, DurableAgentTriggerFiring, NewAgentTriggerBinding,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -126,6 +126,10 @@ struct TriggerListHandler {
     api: TriggerHttpApi,
 }
 
+struct TriggerFiringListHandler {
+    api: TriggerHttpApi,
+}
+
 impl Handler for TriggerListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         if !ctx.request.body.is_empty() {
@@ -160,6 +164,41 @@ impl Handler for TriggerListHandler {
     }
 }
 
+impl Handler for TriggerFiringListHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.body.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "trigger firing listing accepts no request body".into(),
+            ));
+        }
+        let binding_id = parse_uuid(trigger_param(ctx)?)?;
+        let limit = ctx.page.limit.min(MAX_PAGE_LIMIT);
+        let mut firings = self
+            .api
+            .drive(self.api.backing.list_firings_for_owner(
+                &ctx.principal.tenant.0,
+                &ctx.principal.principal_id.0,
+                binding_id,
+                ctx.page.cursor.as_deref(),
+                limit as u32 + 1,
+            ))?
+            .map_err(|error| EdgeError::Internal(error.to_string()))?;
+        let has_more = firings.len() > limit;
+        firings.truncate(limit);
+        let next = has_more
+            .then(|| firings.last().map(|firing| firing.event_id.clone()))
+            .flatten();
+        let items = firings
+            .iter()
+            .map(|firing| firing_json(&ctx.principal.tenant.0, firing))
+            .collect::<Vec<_>>();
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &page_envelope(json!(items), next, limit),
+        )))
+    }
+}
+
 pub fn register_triggers(
     builder: GatewayBuilder,
     backing: DurableAgentTriggerBacking,
@@ -177,7 +216,13 @@ pub fn register_triggers(
             Method::Post,
             "/v1/triggers",
             "identity.trigger.create",
-            Arc::new(TriggerCreateHandler { api }),
+            Arc::new(TriggerCreateHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/triggers/{trigger}/firings",
+            "identity.triggers.list",
+            Arc::new(TriggerFiringListHandler { api }),
         )
 }
 
@@ -308,6 +353,40 @@ fn binding_json(tenant: &str, binding: &DurableAgentTriggerBinding) -> Value {
         "state": binding.state,
         "created_at": binding.created_at,
     })
+}
+
+fn firing_json(tenant: &str, firing: &DurableAgentTriggerFiring) -> Value {
+    json!({
+        "event_id": firing.event_id,
+        "event_type": firing.event_type,
+        "trigger_ref": format!(
+            "myelin://{tenant}/identity/trigger/{}",
+            firing.binding_id,
+        ),
+        "state": firing_state_token(firing.state),
+        "run_id": firing.run_id,
+        "run_ref": firing.run_id.as_ref().map(|run_id| {
+            format!("myelin://{tenant}/agent/run/{run_id}")
+        }),
+        "created_at": firing.created_at,
+    })
+}
+
+fn firing_state_token(state: AgentTriggerFiringState) -> &'static str {
+    match state {
+        AgentTriggerFiringState::Queued => "queued",
+        AgentTriggerFiringState::AwaitingApproval => "awaiting_approval",
+        AgentTriggerFiringState::Claimed => "claimed",
+        AgentTriggerFiringState::Started => "started",
+        AgentTriggerFiringState::Terminal => "terminal",
+    }
+}
+
+fn trigger_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
+    ctx.params
+        .get("trigger")
+        .map(String::as_str)
+        .ok_or_else(|| EdgeError::BadRequest("route did not bind a trigger id".into()))
 }
 
 fn no_store(response: EdgeResponse) -> EdgeResponse {

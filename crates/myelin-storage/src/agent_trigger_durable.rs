@@ -3,7 +3,8 @@ mod schema;
 
 pub use model::{
     AgentTriggerFiringState, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding,
-    NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
+    DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
+    ReservedAgentTriggerFiring,
 };
 pub use schema::{
     agent_trigger_durable_migrations, AGENT_TRIGGER_MIGRATION, AGENT_TRIGGER_RLS_POLICY,
@@ -369,6 +370,51 @@ impl DurableAgentTriggerBacking {
             })
             .await
     }
+
+    pub async fn list_firings_for_owner(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        binding_id: Uuid,
+        before_event_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<DurableAgentTriggerFiring>, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner_principal_id = owner_principal_id.to_string();
+        let before_event_id = before_event_id.map(str::to_string);
+        let limit = i64::from(limit.clamp(1, 1_001));
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        "SELECT f.binding_id, f.event_id, f.event_type, f.state, f.run_id, f.created_at \
+                           FROM agent_trigger_firing f \
+                           JOIN agent_trigger_binding b ON b.tenant_id = f.tenant_id \
+                            AND b.region = f.region AND b.binding_id = f.binding_id \
+                          WHERE f.tenant_id = $1 AND f.region = $2 \
+                            AND f.binding_id = $3 AND b.owner_principal_id = $4 \
+                            AND ($5::text IS NULL OR (f.created_at, f.event_id) < (\
+                                SELECT cursor.created_at, cursor.event_id \
+                                  FROM agent_trigger_firing cursor \
+                                 WHERE cursor.tenant_id = $1 AND cursor.region = $2 \
+                                   AND cursor.binding_id = $3 AND cursor.event_id = $5)) \
+                          ORDER BY f.created_at DESC, f.event_id DESC LIMIT $6",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(binding_id)
+                    .bind(&owner_principal_id)
+                    .bind(&before_event_id)
+                    .bind(limit)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(query_error("list agent trigger firings for owner"))?;
+                    rows.iter().map(firing_from_row).collect()
+                })
+            })
+            .await
+    }
 }
 
 fn binding_matches(
@@ -471,6 +517,29 @@ async fn load_firing(
         })
     })
     .transpose()
+}
+
+fn firing_from_row(row: &sqlx::postgres::PgRow) -> Result<DurableAgentTriggerFiring, PgError> {
+    Ok(DurableAgentTriggerFiring {
+        binding_id: row
+            .try_get::<Uuid, _>("binding_id")
+            .map_err(row_error("binding_id"))?
+            .to_string(),
+        event_id: row.try_get("event_id").map_err(row_error("event_id"))?,
+        event_type: row.try_get("event_type").map_err(row_error("event_type"))?,
+        state: AgentTriggerFiringState::parse(
+            &row.try_get::<String, _>("state")
+                .map_err(row_error("state"))?,
+        )?,
+        run_id: row
+            .try_get::<Option<Uuid>, _>("run_id")
+            .map_err(row_error("run_id"))?
+            .map(|id| id.to_string()),
+        created_at: row
+            .try_get::<DateTime<Utc>, _>("created_at")
+            .map_err(row_error("created_at"))?
+            .to_rfc3339(),
+    })
 }
 
 fn query_error(operation: &'static str) -> impl FnOnce(sqlx::Error) -> PgError {

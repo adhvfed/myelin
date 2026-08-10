@@ -91,6 +91,16 @@ pub struct ReservedAgentTriggerFiring {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct DurableAgentTriggerFiring {
+    pub binding_id: String,
+    pub event_id: String,
+    pub event_type: String,
+    pub state: AgentTriggerFiringState,
+    pub run_id: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum ReserveAgentTriggerFiringOutcome {
     Reserved(ReservedAgentTriggerFiring),
     AlreadyReserved(ReservedAgentTriggerFiring),

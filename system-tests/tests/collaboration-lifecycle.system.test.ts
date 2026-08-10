@@ -186,6 +186,27 @@ command = ["true"]
       firings_used: 1,
       state: "active",
     });
+
+    const firingHistory = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+    );
+    expect(array(firingHistory.body.items, "governed trigger firing history")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          event_id: eventId,
+          event_type: "ci.run.failed",
+          trigger_ref: `myelin://${systemTestConfig.tenant}/identity/trigger/${triggerId}`,
+          state: "queued",
+          run_id: null,
+          run_ref: null,
+        }),
+      ]),
+    );
+    const peerHistory = await reviewerClient.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+      { expectedStatus: 403 },
+    );
+    expect(peerHistory.body).toMatchObject({ error: { code: "forbidden" } });
   });
 
   test("lets a founder create and rediscover a project without operator-provided IDs", async () => {

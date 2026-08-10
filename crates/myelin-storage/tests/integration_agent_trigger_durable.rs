@@ -225,6 +225,18 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         "the same durable event wakes no second agent run"
     );
 
+    let history = triggers
+        .list_firings_for_owner(&tenant, "founder", proposal.binding_id, None, 100)
+        .await
+        .expect("the owner can inspect what the trigger actually reserved");
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].event_id, "ci-failed-1");
+    assert_eq!(history[0].state, AgentTriggerFiringState::Queued);
+    assert_eq!(
+        history[0].run_id, None,
+        "queued is not misreported as started"
+    );
+
     let later_failure = triggers
         .reserve_firing(
             &tenant,
