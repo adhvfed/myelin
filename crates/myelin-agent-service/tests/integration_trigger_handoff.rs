@@ -176,6 +176,7 @@ async fn one_red_build_becomes_one_durable_agent_workflow() {
                 matcher: serde_json::json!({}),
                 task: "Explain the failure and prepare the smallest safe fix.".into(),
                 delegation_caveats: vec!["repo:core".into(), "issue:create".into()],
+                budget_minor_units: 250_000,
                 max_firings: 1,
                 max_causal_depth: 4,
                 require_no_personal_data: true,
@@ -263,7 +264,7 @@ async fn one_red_build_becomes_one_durable_agent_workflow() {
         .with_tenant_tx(&tenant.0, move |conn| {
             Box::pin(async move {
                 let row = sqlx::query(
-                    "SELECT state, input, idem_key FROM workflow_run \
+                    "SELECT state, input, budget, idem_key FROM workflow_run \
                       WHERE tenant_id = $1 AND run_id = $2",
                 )
                 .bind(&inspect_tenant)
@@ -274,6 +275,7 @@ async fn one_red_build_becomes_one_durable_agent_workflow() {
                 Ok((
                     row.try_get::<String, _>("state").unwrap(),
                     row.try_get::<serde_json::Value, _>("input").unwrap(),
+                    row.try_get::<serde_json::Value, _>("budget").unwrap(),
                     row.try_get::<String, _>("idem_key").unwrap(),
                 ))
             })
@@ -282,8 +284,9 @@ async fn one_red_build_becomes_one_durable_agent_workflow() {
         .expect("the started firing names a real workflow row");
     assert_eq!(workflow.0, "running");
     assert_eq!(workflow.1, serde_json::json!([expected_subject]));
+    assert_eq!(workflow.2, serde_json::json!({"minor_units": 250_000}));
     assert_eq!(
-        workflow.2,
+        workflow.3,
         format!("agent-trigger:{binding_id}:{}", event.event_id.0)
     );
 

@@ -106,18 +106,32 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_trigger_firing_run
     WHERE run_id IS NOT NULL;
 "#;
 
+pub const AGENT_TRIGGER_BUDGET_MIGRATION: &str = r#"
+ALTER TABLE agent_trigger_binding
+    ADD COLUMN IF NOT EXISTS budget_minor_units bigint NOT NULL DEFAULT 1000000;
+ALTER TABLE agent_trigger_binding
+    DROP CONSTRAINT IF EXISTS agent_trigger_binding_budget_bound;
+ALTER TABLE agent_trigger_binding
+    ADD CONSTRAINT agent_trigger_binding_budget_bound
+    CHECK (budget_minor_units BETWEEN 1 AND 1000000000000);
+"#;
+
 pub fn agent_trigger_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0090_agent_trigger", AGENT_TRIGGER_MIGRATION),
         Migration::plain("0091_agent_trigger_rls", AGENT_TRIGGER_RLS_POLICY),
         Migration::plain("0092_agent_trigger_claim", AGENT_TRIGGER_CLAIM_MIGRATION),
         Migration::plain("0093_agent_trigger_run", AGENT_TRIGGER_RUN_MIGRATION),
+        Migration::plain("0094_agent_trigger_budget", AGENT_TRIGGER_BUDGET_MIGRATION),
     ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_trigger_durable::{
+        MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    };
 
     #[test]
     fn governance_and_effectively_once_firing_are_structural() {
@@ -130,6 +144,11 @@ mod tests {
         assert!(AGENT_TRIGGER_CLAIM_MIGRATION.contains("state IN ('queued', 'claimed')"));
         assert!(AGENT_TRIGGER_CLAIM_MIGRATION.contains("claim_until"));
         assert!(AGENT_TRIGGER_RUN_MIGRATION.contains("UNIQUE INDEX"));
+        assert!(AGENT_TRIGGER_BUDGET_MIGRATION.contains("budget_minor_units"));
+        assert!(AGENT_TRIGGER_BUDGET_MIGRATION.contains(&format!(
+            "BETWEEN {MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS} AND \
+             {MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS}"
+        )));
         assert_eq!(
             AGENT_TRIGGER_RLS_POLICY
                 .matches("FORCE ROW LEVEL SECURITY")

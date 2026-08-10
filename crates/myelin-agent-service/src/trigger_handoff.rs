@@ -4,11 +4,12 @@ pub use crate::hosted_run_contract::{
     agent_run_definition_hash, AGENT_RUN_WORKFLOW, AGENT_RUN_WORKFLOW_VERSION,
 };
 use myelin_events::{EventEnvelope, HandlerTx, UlidMinter};
-use myelin_flow::{ExecutorError, PgFlowExecutor, RunId, StartSpec};
+use myelin_flow::{ExecutorError, PgFlowExecutor, RunBudget, RunId, StartSpec};
 use myelin_identity_service::HOSTED_LUNA_RUNTIME;
 use myelin_storage::{
     with_tenant_tx_error, AgentTriggerStartRequest, ClaimedAgentTriggerFiring,
     DurableAgentTriggerBacking, PgError, StartAgentTriggerFiringOutcome, SubstrateProvider,
+    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
@@ -93,10 +94,21 @@ impl TriggerRunHandoff {
         let run_uuid = run_id_for(tenant, claim)?;
         let start_request = AgentTriggerStartRequest::from_claim(claim, run_uuid)
             .map_err(|reason| TriggerHandoffError::InvalidClaim(reason.into()))?;
+        if !(MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS..=MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS)
+            .contains(&claim.budget_minor_units)
+        {
+            return Err(TriggerHandoffError::InvalidClaim(
+                "budget_minor_units is outside its durable bound".into(),
+            ));
+        }
+        let budget = i64::try_from(claim.budget_minor_units)
+            .expect("the durable trigger budget bound fits i64");
         let start_spec = StartSpec {
             wf_type: AGENT_RUN_WORKFLOW.into(),
             input: vec![event.subject],
-            budget: None,
+            budget: Some(RunBudget {
+                minor_units: budget,
+            }),
             idem_key: firing_idempotency_key(claim),
         };
         let executor = self.executor(tenant);
@@ -257,6 +269,7 @@ mod tests {
             runtime_ref: HOSTED_AGENT_RUNTIME.into(),
             task: "Fix the failure.".into(),
             delegation_caveats: vec!["repo:core".into()],
+            budget_minor_units: 250_000,
             claim_owner: "host-1".into(),
             claim_until: "2026-08-10T00:00:30Z".into(),
             claim_attempts: 1,

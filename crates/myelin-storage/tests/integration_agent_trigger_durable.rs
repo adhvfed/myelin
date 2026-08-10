@@ -108,6 +108,7 @@ fn red_mainline_binding(agent_id: Uuid) -> NewAgentTriggerBinding {
         }),
         task: "Find the failure, open an issue, and prepare the smallest safe fix.".into(),
         delegation_caveats: vec!["repo:core".into(), "issue:create".into()],
+        budget_minor_units: 250_000,
         max_firings: 1,
         max_causal_depth: 4,
         require_no_personal_data: true,

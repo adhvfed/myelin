@@ -3,6 +3,9 @@ use sqlx::types::Uuid;
 
 use crate::pg::PgError;
 
+pub const MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS: u64 = 1;
+pub const MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS: u64 = 1_000_000_000_000;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewAgentTriggerBinding {
     pub binding_id: Uuid,
@@ -13,6 +16,7 @@ pub struct NewAgentTriggerBinding {
     pub matcher: serde_json::Value,
     pub task: String,
     pub delegation_caveats: Vec<String>,
+    pub budget_minor_units: u64,
     pub max_firings: u64,
     pub max_causal_depth: u32,
     pub require_no_personal_data: bool,
@@ -30,6 +34,7 @@ pub struct DurableAgentTriggerBinding {
     pub matcher: serde_json::Value,
     pub task: String,
     pub delegation_caveats: Vec<String>,
+    pub budget_minor_units: u64,
     pub max_firings: u64,
     pub firings_used: u64,
     pub max_causal_depth: u32,
@@ -111,6 +116,7 @@ pub struct ClaimedAgentTriggerFiring {
     pub runtime_ref: String,
     pub task: String,
     pub delegation_caveats: Vec<String>,
+    pub budget_minor_units: u64,
     pub claim_owner: String,
     pub claim_until: String,
     pub claim_attempts: u32,
@@ -128,6 +134,7 @@ pub struct StartedAgentTriggerRun {
     pub selected_tools: Vec<String>,
     pub task: String,
     pub delegation_caveats: Vec<String>,
+    pub budget_minor_units: u64,
     pub run_id: String,
 }
 
@@ -245,6 +252,7 @@ mod tests {
             runtime_ref: "hosted:luna".into(),
             task: "Fix it.".into(),
             delegation_caveats: vec![],
+            budget_minor_units: 250_000,
             claim_owner: "host-1".into(),
             claim_until: "2026-08-10T00:00:30Z".into(),
             claim_attempts: 1,

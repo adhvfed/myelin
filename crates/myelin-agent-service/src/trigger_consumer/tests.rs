@@ -95,6 +95,7 @@ fn binding(branch: &str) -> DurableAgentTriggerBinding {
         matcher: serde_json::to_value(matcher).unwrap(),
         task: "Find the failure and prepare the smallest safe fix.".into(),
         delegation_caveats: vec!["repo:core".into()],
+        budget_minor_units: 250_000,
         max_firings: 10,
         firings_used: 0,
         max_causal_depth: 4,

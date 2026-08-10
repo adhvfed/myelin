@@ -170,6 +170,7 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
                 matcher: serde_json::json!({}),
                 task: "Explain the failure and prepare the smallest safe fix.".into(),
                 delegation_caveats: vec!["repo:core".into(), "issue:create".into()],
+                budget_minor_units: 250_000,
                 max_firings: 1,
                 max_causal_depth: 4,
                 require_no_personal_data: true,
@@ -233,7 +234,7 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
         wf_type: AGENT_RUN_WORKFLOW.into(),
         wf_version: AGENT_RUN_WORKFLOW_VERSION,
         input: vec![event.subject.clone()],
-        budget: None,
+        budget: Some(serde_json::json!({"minor_units": 250_000})),
         correlation_id: event.correlation_id.0.clone(),
         causation_id: Some(event.event_id.0.clone()),
         caused_by: None,
@@ -256,6 +257,7 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
     assert_eq!(work.agent_id, agent_id.to_string());
     assert_eq!(work.delegation_caveats, ["repo:core", "issue:create"]);
     assert_eq!(work.selected_tools, ["git.read", "issue.create"]);
+    assert_eq!(work.budget_minor_units, 250_000);
     assert_eq!(work.event, event);
 
     let mut forged_input = claimed_input;

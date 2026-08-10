@@ -98,6 +98,11 @@ impl LlmRunTask {
         self
     }
 
+    pub fn with_reservation_budget(mut self, budget: MicroUsd) -> LlmRunTask {
+        self.estimate = budget;
+        self
+    }
+
     pub fn with_delegation(
         mut self,
         trigger_actor: Principal,

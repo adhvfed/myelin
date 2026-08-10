@@ -6,10 +6,12 @@ pub use model::{
     ClaimedAgentTriggerFiring, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding,
     DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
     ReservedAgentTriggerFiring, StartAgentTriggerFiringOutcome, StartedAgentTriggerRun,
+    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use schema::{
-    agent_trigger_durable_migrations, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
-    AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION,
+    agent_trigger_durable_migrations, AGENT_TRIGGER_BUDGET_MIGRATION,
+    AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION, AGENT_TRIGGER_RLS_POLICY,
+    AGENT_TRIGGER_RUN_MIGRATION,
 };
 
 use sqlx::types::chrono::{DateTime, Utc};
@@ -34,6 +36,13 @@ impl DurableAgentTriggerBacking {
         tenant: &str,
         proposal: NewAgentTriggerBinding,
     ) -> Result<CreateAgentTriggerBindingOutcome, ProviderError> {
+        if !(MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS..=MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS)
+            .contains(&proposal.budget_minor_units)
+        {
+            return Err(
+                PgError::Query("trigger budget is outside its durable bound".into()).into(),
+            );
+        }
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
         self.provider
@@ -78,14 +87,17 @@ impl DurableAgentTriggerBacking {
 
                     let max_firings = i64::try_from(proposal.max_firings)
                         .map_err(|_| PgError::Query("trigger max_firings exceeds i64".into()))?;
+                    let budget_minor_units = i64::try_from(proposal.budget_minor_units)
+                        .map_err(|_| PgError::Query("trigger budget exceeds i64".into()))?;
                     let max_causal_depth = i32::try_from(proposal.max_causal_depth)
                         .map_err(|_| PgError::Query("trigger max_causal_depth exceeds i32".into()))?;
                     let created = sqlx::query(
                         "INSERT INTO agent_trigger_binding (\
                            tenant_id, region, binding_id, owner_principal_id, run_as_agent_id, \
-                           client_nonce, event_type, matcher, task, delegation_caveats, max_firings, \
-                           max_causal_depth, require_no_personal_data, require_human_approval, created_at\
-                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) \
+                           client_nonce, event_type, matcher, task, delegation_caveats, \
+                           budget_minor_units, max_firings, max_causal_depth, \
+                           require_no_personal_data, require_human_approval, created_at\
+                         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) \
                          ON CONFLICT (tenant_id, region, owner_principal_id, client_nonce) DO NOTHING",
                     )
                     .bind(&tenant)
@@ -98,6 +110,7 @@ impl DurableAgentTriggerBacking {
                     .bind(&proposal.matcher)
                     .bind(&proposal.task)
                     .bind(&proposal.delegation_caveats)
+                    .bind(budget_minor_units)
                     .bind(max_firings)
                     .bind(max_causal_depth)
                     .bind(proposal.require_no_personal_data)
@@ -110,7 +123,8 @@ impl DurableAgentTriggerBacking {
                         == 1;
                     let row = sqlx::query(
                         "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
-                                event_type, matcher, task, delegation_caveats, max_firings, \
+                                event_type, matcher, task, delegation_caveats, \
+                                budget_minor_units, max_firings, \
                                 firings_used, max_causal_depth, require_no_personal_data, \
                                 require_human_approval, state, created_at \
                            FROM agent_trigger_binding \
@@ -160,7 +174,8 @@ impl DurableAgentTriggerBacking {
                     let rows = sqlx::query(
                         "SELECT b.binding_id, b.owner_principal_id, b.run_as_agent_id, \
                                 b.client_nonce, b.event_type, b.matcher, b.task, \
-                                b.delegation_caveats, b.max_firings, b.firings_used, \
+                                b.delegation_caveats, b.budget_minor_units, \
+                                b.max_firings, b.firings_used, \
                                 b.max_causal_depth, b.require_no_personal_data, \
                                 b.require_human_approval, b.state, b.created_at \
                            FROM agent_trigger_binding b \
@@ -206,7 +221,8 @@ impl DurableAgentTriggerBacking {
                 Box::pin(async move {
                     let rows = sqlx::query(
                         "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
-                                event_type, matcher, task, delegation_caveats, max_firings, \
+                                event_type, matcher, task, delegation_caveats, \
+                                budget_minor_units, max_firings, \
                                 firings_used, max_causal_depth, require_no_personal_data, \
                                 require_human_approval, state, created_at \
                            FROM agent_trigger_binding \
@@ -436,6 +452,7 @@ impl DurableAgentTriggerBacking {
                         "WITH candidate AS (\
                             SELECT f.binding_id, f.event_id, b.owner_principal_id, \
                                    b.run_as_agent_id, b.task, b.delegation_caveats, \
+                                   b.budget_minor_units, \
                                    agent_row.runtime_ref \
                               FROM agent_trigger_firing f \
                               JOIN agent_trigger_binding b ON b.tenant_id = f.tenant_id \
@@ -468,6 +485,7 @@ impl DurableAgentTriggerBacking {
                       RETURNING f.binding_id, f.event_id, f.event_type, f.event_envelope, \
                                 candidate.owner_principal_id, candidate.run_as_agent_id, \
                                 candidate.runtime_ref, candidate.task, candidate.delegation_caveats, \
+                                candidate.budget_minor_units, \
                                 f.claim_owner, f.claim_until, f.claim_attempts",
                     )
                     .bind(&tenant)
@@ -563,7 +581,7 @@ impl DurableAgentTriggerBacking {
                     let row = sqlx::query(
                         "SELECT f.binding_id, f.event_id, f.event_type, f.event_envelope, f.run_id, \
                                 b.owner_principal_id, b.run_as_agent_id, b.task, \
-                                b.delegation_caveats, a.runtime_ref, a.tools \
+                                b.delegation_caveats, b.budget_minor_units, a.runtime_ref, a.tools \
                            FROM agent_trigger_firing f \
                            JOIN agent_trigger_binding b ON b.tenant_id = f.tenant_id \
                             AND b.region = f.region AND b.binding_id = f.binding_id \
@@ -602,6 +620,7 @@ fn binding_matches(
         && binding.matcher == proposal.matcher
         && binding.task == proposal.task
         && binding.delegation_caveats == proposal.delegation_caveats
+        && binding.budget_minor_units == proposal.budget_minor_units
         && binding.max_firings == proposal.max_firings
         && binding.max_causal_depth == proposal.max_causal_depth
         && binding.require_no_personal_data == proposal.require_no_personal_data
@@ -639,6 +658,7 @@ fn binding_from_row(row: &sqlx::postgres::PgRow) -> Result<DurableAgentTriggerBi
         delegation_caveats: row
             .try_get("delegation_caveats")
             .map_err(row_error("delegation_caveats"))?,
+        budget_minor_units: positive_u64(row, "budget_minor_units")?,
         max_firings: u64::try_from(max_firings)
             .map_err(|_| PgError::Query("negative durable trigger max_firings".into()))?,
         firings_used: u64::try_from(firings_used)
@@ -748,6 +768,7 @@ fn claimed_firing_from_row(
         delegation_caveats: row
             .try_get("delegation_caveats")
             .map_err(row_error("delegation_caveats"))?,
+        budget_minor_units: positive_u64(row, "budget_minor_units")?,
         claim_owner: row
             .try_get("claim_owner")
             .map_err(row_error("claim_owner"))?,
@@ -786,11 +807,17 @@ fn started_run_from_row(row: &sqlx::postgres::PgRow) -> Result<StartedAgentTrigg
         delegation_caveats: row
             .try_get("delegation_caveats")
             .map_err(row_error("delegation_caveats"))?,
+        budget_minor_units: positive_u64(row, "budget_minor_units")?,
         run_id: row
             .try_get::<Uuid, _>("run_id")
             .map_err(row_error("run_id"))?
             .to_string(),
     })
+}
+
+fn positive_u64(row: &sqlx::postgres::PgRow, column: &'static str) -> Result<u64, PgError> {
+    let value = row.try_get::<i64, _>(column).map_err(row_error(column))?;
+    u64::try_from(value).map_err(|_| PgError::Query(format!("negative agent trigger `{column}`")))
 }
 
 fn query_error(operation: &'static str) -> impl FnOnce(sqlx::Error) -> PgError {

@@ -28,6 +28,7 @@ pub struct HostedAgentWorkflowInput {
     pub task: String,
     pub delegation_caveats: Vec<String>,
     pub selected_tools: Vec<String>,
+    pub budget_minor_units: u64,
     pub event: EventEnvelope,
 }
 
@@ -49,6 +50,7 @@ impl HostedAgentWorkflowInput {
             self.trigger_actor.clone(),
             DelegationCaveats(self.delegation_caveats.clone()),
         )
+        .with_reservation_budget(myelin_storage::MicroUsd(self.budget_minor_units))
         .with_now_secs(now_secs)
     }
 }
@@ -89,6 +91,21 @@ impl HostedAgentInputResolver {
                     "agent workflow has no live governed firing authority".into(),
                 )
             })?;
+        let workflow_budget = input
+            .budget
+            .as_ref()
+            .and_then(|budget| budget.get("minor_units"))
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                PgInputResolveError::Permanent(
+                    "hosted agent workflow has no positive integer run budget".into(),
+                )
+            })?;
+        if workflow_budget != started.budget_minor_units {
+            return Err(PgInputResolveError::Permanent(
+                "agent workflow budget does not match its governed trigger".into(),
+            ));
+        }
         if started.runtime_ref != HOSTED_LUNA_RUNTIME || started.run_id != input.run_id {
             return Err(PgInputResolveError::Permanent(
                 "agent workflow resolved to a different runtime or run".into(),
@@ -141,6 +158,7 @@ impl HostedAgentInputResolver {
             task: started.task,
             delegation_caveats: started.delegation_caveats,
             selected_tools: started.selected_tools,
+            budget_minor_units: started.budget_minor_units,
             event,
         })
         .map_err(|error| {
@@ -274,11 +292,13 @@ mod tests {
             task: "Prepare the smallest safe fix.".into(),
             delegation_caveats: vec!["repo:core".into()],
             selected_tools: vec!["git.open_pr.v1".into()],
+            budget_minor_units: 250_000,
             event,
         };
         let task = resolved.llm_task(42);
         assert_eq!(task.trigger_actor, founder);
         assert_eq!(task.delegation_caveats.0, ["repo:core"]);
+        assert_eq!(task.estimate, myelin_storage::MicroUsd(250_000));
         assert!(task.prompt.contains("Prepare the smallest safe fix."));
         assert!(task.prompt.contains("ci.run.failed"));
         assert!(task.prompt.contains("refs/heads/main"));

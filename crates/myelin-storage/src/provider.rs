@@ -754,7 +754,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0093_agent_trigger_run");
+        assert_eq!(*ids.last().unwrap(), "0094_agent_trigger_budget");
     }
 
     #[test]

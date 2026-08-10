@@ -47,7 +47,11 @@ describe("collaboration lifecycle", () => {
     const agentRetryKey = `agent-${randomUUID()}`;
     const activated = await founder.json("/v1/agents", {
       method: "POST",
-      body: { name: agentName, tools: ["ci.read_run", "issues.create"] },
+      body: {
+        name: agentName,
+        runtime: "hosted",
+        tools: ["ci.read_run", "issues.create"],
+      },
       idempotencyKey: agentRetryKey,
       expectedStatus: 201,
     });
@@ -60,6 +64,7 @@ describe("collaboration lifecycle", () => {
       source_branch: "main",
       run_as_agent_id: agentId,
       task: "Find the failure, open an issue, and prepare the smallest safe fix.",
+      budget_minor_units: 250_000,
       max_firings: 10,
       max_causal_depth: 4,
       delegation_caveats: ["repo:core", "issue:create"],
@@ -77,6 +82,7 @@ describe("collaboration lifecycle", () => {
       run_as_agent_id: agentId,
       event_type: "ci.run.failed",
       task: intent.task,
+      budget_minor_units: 250_000,
       max_firings: 10,
       firings_used: 0,
       require_no_personal_data: true,
@@ -97,7 +103,7 @@ describe("collaboration lifecycle", () => {
 
     const conflict = await founder.json("/v1/triggers", {
       method: "POST",
-      body: { ...intent, task: "Take broader action." },
+      body: { ...intent, budget_minor_units: 500_000 },
       idempotencyKey: triggerRetryKey,
       expectedStatus: 409,
     });

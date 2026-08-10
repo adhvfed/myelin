@@ -6,6 +6,7 @@ use myelin_query::{CmpOp, EventMatcher, Expr, Predicate};
 use myelin_storage::{
     AgentTriggerFiringState, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking,
     DurableAgentTriggerBinding, DurableAgentTriggerFiring, NewAgentTriggerBinding,
+    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -53,6 +54,7 @@ struct CreateTriggerBody {
     source_branch: Option<String>,
     run_as_agent_id: String,
     task: String,
+    budget_minor_units: u64,
     max_firings: u64,
     #[serde(default = "default_max_causal_depth")]
     max_causal_depth: u32,
@@ -237,6 +239,7 @@ fn create_proposal(
             "task must contain 1..=4096 bytes without surrounding whitespace".into(),
         ));
     }
+    validate_budget_minor_units(body.budget_minor_units)?;
     if !(1..=1_000_000).contains(&body.max_firings) || body.max_causal_depth > 64 {
         return Err(EdgeError::BadRequest(
             "trigger budget or causal-depth limit is outside its supported bound".into(),
@@ -264,12 +267,25 @@ fn create_proposal(
             .map_err(|error| EdgeError::Internal(format!("serialize trigger matcher: {error}")))?,
         task: body.task,
         delegation_caveats: body.delegation_caveats,
+        budget_minor_units: body.budget_minor_units,
         max_firings: body.max_firings,
         max_causal_depth: body.max_causal_depth,
         require_no_personal_data: body.require_no_personal_data,
         require_human_approval: body.require_human_approval,
         created_at: chrono::Utc::now(),
     })
+}
+
+fn validate_budget_minor_units(value: u64) -> Result<(), EdgeError> {
+    if !(MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS..=MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS)
+        .contains(&value)
+    {
+        return Err(EdgeError::BadRequest(format!(
+            "trigger budget must be {MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS}..=\
+                 {MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS} integer minor-units"
+        )));
+    }
+    Ok(())
 }
 
 fn compile_matcher(
@@ -345,6 +361,7 @@ fn binding_json(tenant: &str, binding: &DurableAgentTriggerBinding) -> Value {
         "matcher": binding.matcher,
         "task": binding.task,
         "delegation_caveats": binding.delegation_caveats,
+        "budget_minor_units": binding.budget_minor_units,
         "max_firings": binding.max_firings,
         "firings_used": binding.firings_used,
         "max_causal_depth": binding.max_causal_depth,
@@ -484,5 +501,21 @@ mod tests {
         assert!(compile_matcher("ci.result", None).is_ok());
         assert!(compile_matcher("CI.run.failed", None).is_err());
         assert!(compile_matcher("unknown.run.failed", None).is_err());
+    }
+
+    #[test]
+    fn every_automation_names_a_positive_bounded_spend_budget() {
+        assert!(validate_budget_minor_units(1).is_ok());
+        assert!(validate_budget_minor_units(250_000).is_ok());
+        assert!(validate_budget_minor_units(0).is_err());
+        assert!(validate_budget_minor_units(MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS + 1).is_err());
+
+        let missing_budget = br#"{
+            "event_type":"ci.run.failed",
+            "run_as_agent_id":"20000000-0000-4000-8000-000000000002",
+            "task":"Triage the failure.",
+            "max_firings":1
+        }"#;
+        assert!(parse_create_body(missing_budget).is_err());
     }
 }
