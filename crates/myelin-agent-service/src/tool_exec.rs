@@ -4,12 +4,19 @@ use myelin_flow::RunTokenHandle;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolExecError {
     Failed(String),
+    ApprovalRequired { gate_id: String },
 }
 
 impl core::fmt::Display for ToolExecError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ToolExecError::Failed(m) => write!(f, "tool execution failed: {m}"),
+            ToolExecError::ApprovalRequired { gate_id } => {
+                write!(
+                    f,
+                    "tool execution is waiting for approval at gate `{gate_id}`"
+                )
+            }
         }
     }
 }

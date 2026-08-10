@@ -435,12 +435,27 @@ impl HitlVerdictStore {
         &self,
         scope: &TenantScope,
         run_id: &str,
+        requester: &str,
         effect_id: &str,
     ) -> Option<GateRecord> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            HitlVerdictBackend::Memory(m) => m.find_waiting(scope, run_id, effect_id),
-            HitlVerdictBackend::Durable(d) => d.find_waiting(scope, run_id, effect_id),
+            HitlVerdictBackend::Memory(m) => m.find_waiting(scope, run_id, requester, effect_id),
+            HitlVerdictBackend::Durable(d) => d.find_waiting(scope, run_id, requester, effect_id),
+        }
+    }
+
+    pub fn find_approved(
+        &self,
+        scope: &TenantScope,
+        run_id: &str,
+        requester: &str,
+        effect_id: &str,
+    ) -> Option<GateRecord> {
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            HitlVerdictBackend::Memory(m) => m.find_approved(scope, run_id, requester, effect_id),
+            HitlVerdictBackend::Durable(d) => d.find_approved(scope, run_id, requester, effect_id),
         }
     }
 }
@@ -561,6 +576,7 @@ impl MemoryHitlGates {
         &self,
         scope: &TenantScope,
         run_id: &str,
+        requester: &str,
         effect_id: &str,
     ) -> Option<GateRecord> {
         let (t, rg) = (scope.tenant().0.as_str(), scope.region().0.as_str());
@@ -569,7 +585,32 @@ impl MemoryHitlGates {
             .filter(|((kt, kr, _), _)| kt == t && kr == rg)
             .map(|(_, v)| v)
             .find(|v| {
-                v.state == GateState::Waiting && v.run_id == run_id && v.effect_id == effect_id
+                v.state == GateState::Waiting
+                    && v.run_id == run_id
+                    && v.requested_by == requester
+                    && v.effect_id == effect_id
+            })
+            .cloned()
+    }
+
+    fn find_approved(
+        &self,
+        scope: &TenantScope,
+        run_id: &str,
+        requester: &str,
+        effect_id: &str,
+    ) -> Option<GateRecord> {
+        let (tenant, region) = (scope.tenant().0.as_str(), scope.region().0.as_str());
+        self.rows
+            .iter()
+            .filter(|((row_tenant, row_region, _), _)| row_tenant == tenant && row_region == region)
+            .map(|(_, record)| record)
+            .find(|record| {
+                record.state == GateState::Approved
+                    && record.approval_consumed_at_unix.is_none()
+                    && record.run_id == run_id
+                    && record.requested_by == requester
+                    && record.effect_id == effect_id
             })
             .cloned()
     }
@@ -804,11 +845,13 @@ impl DurableHitlGates {
         &self,
         scope: &TenantScope,
         run_id: &str,
+        requester: &str,
         effect_id: &str,
     ) -> Option<GateRecord> {
         let region = self.region();
         let tenant = scope.tenant().0.clone();
         let run_id = run_id.to_string();
+        let requester = requester.to_string();
         let effect_id = effect_id.to_string();
         self.block(
             self.provider
@@ -821,16 +864,64 @@ impl DurableHitlGates {
                             approval_consumed_at_unix \
                      FROM agent_hitl_gate \
                      WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_id = $4 \
-                       AND state = 'waiting' \
+                       AND requested_by = $5 AND state = 'waiting' \
                      ORDER BY gate_id LIMIT 1",
                         )
                         .bind(&tenant)
                         .bind(&region)
                         .bind(&run_id)
                         .bind(&effect_id)
+                        .bind(&requester)
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                        let Some(row) = row else {
+                            return Ok(None);
+                        };
+                        use sqlx::Row as _;
+                        let gate_id: String = row.try_get("gate_id").map_err(hitl_row_decode)?;
+                        row_to_record(&gate_id, &row).map(Some)
+                    })
+                }),
+        )
+    }
+
+    fn find_approved(
+        &self,
+        scope: &TenantScope,
+        run_id: &str,
+        requester: &str,
+        effect_id: &str,
+    ) -> Option<GateRecord> {
+        let region = self.region();
+        let tenant = scope.tenant().0.clone();
+        let run_id = run_id.to_string();
+        let requester = requester.to_string();
+        let effect_id = effect_id.to_string();
+        self.block(
+            self.provider
+                .with_tenant_tx(&scope.tenant().0, move |conn| {
+                    Box::pin(async move {
+                        let row = sqlx::query(
+                            "SELECT gate_id, run_id, effect_id, risk_summary, cost_estimate, \
+                                    approver_filter, state, card_ref, requested_by, decided_by, \
+                                    opened_at_unix, decided_at_unix, expires_at_unix, \
+                                    approval_consumed_at_unix \
+                             FROM agent_hitl_gate \
+                             WHERE tenant_id = $1 AND region = $2 AND run_id = $3 \
+                               AND effect_id = $4 AND requested_by = $5 \
+                               AND state = 'approved' \
+                               AND approval_consumed_at_unix IS NULL \
+                             ORDER BY gate_id LIMIT 1",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(&run_id)
+                        .bind(&effect_id)
+                        .bind(&requester)
+                        .fetch_optional(&mut *conn)
+                        .await
+                        .map_err(|error| crate::pg::PgError::Query(error.to_string()))?;
                         let Some(row) = row else {
                             return Ok(None);
                         };
@@ -1091,7 +1182,10 @@ mod tests {
     fn unknown_durable_state_is_a_redacted_error_not_a_panic() {
         let error = GateState::parse("attacker-controlled-state")
             .expect_err("an unknown durable state must fail closed");
-        assert_eq!(error.to_string(), "agent_hitl_gate row has an invalid state");
+        assert_eq!(
+            error.to_string(),
+            "agent_hitl_gate row has an invalid state"
+        );
         assert!(!error.to_string().contains("attacker-controlled-state"));
     }
 
@@ -1473,6 +1567,7 @@ mod tests {
             .find_waiting(
                 &scope(),
                 "mcp-run-1",
+                "agent:claude",
                 "gate:git.merge:myelin://acme/git/pr/40",
             )
             .expect("the pending gate is resurfaced (no duplicate spawn)");
@@ -1486,6 +1581,7 @@ mod tests {
             s.find_waiting(
                 &scope(),
                 "mcp-run-1",
+                "agent:claude",
                 "gate:git.merge:myelin://acme/git/pr/40"
             )
             .is_none(),

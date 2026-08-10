@@ -386,7 +386,12 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
 
     assert_eq!(
         names,
-        ["ci.read_log", "ci.read_run", "git.open_pr", "git.write_file"]
+        [
+            "ci.read_log",
+            "ci.read_run",
+            "git.open_pr",
+            "git.write_file"
+        ]
     );
     assert!(
         server.router().unwrap().current_token().is_some(),
@@ -778,13 +783,22 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
     assert_eq!(rec.state, GateState::Approved);
     assert_eq!(rec.decided_by.as_deref(), Some("human:operator"));
 
-    let applied = drive(&server, &[redrive.as_str()]);
+    let applied = drive(&server, &[call]);
     let event_id = applied[0]["result"]["_meta"]["eventId"]
         .as_str()
         .expect("applied");
     assert!(
         event_id.contains("tool:git.merge"),
-        "the approved effect applied: {event_id}"
+        "the resumed host finds the exact durable approval without carrying a caller assertion: \
+         {event_id}"
+    );
+    assert!(
+        router
+            .gate_verdict(&gate_id)
+            .unwrap()
+            .approval_consumed_at_unix
+            .is_some(),
+        "the one-shot server verdict was consumed by the effect"
     );
 }
 

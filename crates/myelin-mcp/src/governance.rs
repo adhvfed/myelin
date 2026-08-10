@@ -589,33 +589,61 @@ impl GovernedRouter {
             }
             match presented_gate_id {
                 None => {
-                    if self
-                        .audit_sink
-                        .record(GovernanceAuditRecord {
-                            scope: &self.principal.scope,
-                            actor: &self.principal.agent,
-                            run_id: &self.principal.run_id,
-                            gate_id: None,
-                            tool: tool.name(),
-                            jti: &jti,
-                            phase: AuditPhase::Attempt,
-                            outcome: None,
-                            now,
-                        })
-                        .is_err()
-                    {
-                        return self.push_local_audit(
-                            tool.name(),
-                            CallOutcome::Denied {
-                                reason: "durable pre-gate audit is unavailable; effect withheld"
-                                    .into(),
-                                jti,
-                            },
-                        );
+                    let approved = self.verdicts.borrow().find_approved(
+                        &self.principal.scope,
+                        &self.principal.run_id.0,
+                        &self.principal.agent_id.0,
+                        &effect_key,
+                    );
+                    if let Some(record) = approved {
+                        if !record.authorizes(
+                            &effect_key,
+                            &self.principal.run_id.0,
+                            &self.principal.agent_id.0,
+                        ) {
+                            return self.record(
+                                tool.name(),
+                                CallOutcome::Denied {
+                                    reason: "stored HITL approval failed its exact effect binding"
+                                        .into(),
+                                    jti,
+                                },
+                                now,
+                            );
+                        }
+                        approval_to_consume = Some(record.gate_id);
                     }
-                    let gate_id =
-                        match self.open_or_resurface_gate(tool.name(), args, &effect_key, now_unix)
+                    if approval_to_consume.is_none() {
+                        if self
+                            .audit_sink
+                            .record(GovernanceAuditRecord {
+                                scope: &self.principal.scope,
+                                actor: &self.principal.agent,
+                                run_id: &self.principal.run_id,
+                                gate_id: None,
+                                tool: tool.name(),
+                                jti: &jti,
+                                phase: AuditPhase::Attempt,
+                                outcome: None,
+                                now,
+                            })
+                            .is_err()
                         {
+                            return self.push_local_audit(
+                                tool.name(),
+                                CallOutcome::Denied {
+                                    reason: "durable pre-gate audit is unavailable; effect withheld"
+                                        .into(),
+                                    jti,
+                                },
+                            );
+                        }
+                        let gate_id = match self.open_or_resurface_gate(
+                            tool.name(),
+                            args,
+                            &effect_key,
+                            now_unix,
+                        ) {
                             Ok(gate) => gate,
                             Err(reason) => {
                                 return self.record(
@@ -625,15 +653,16 @@ impl GovernedRouter {
                                 )
                             }
                         };
-                    let outcome = CallOutcome::Gated {
-                        gate_id: gate_id.0,
-                        jti,
-                    };
-                    return if gate_id.1 {
-                        self.record_after_mutation(tool.name(), outcome, now)
-                    } else {
-                        self.record(tool.name(), outcome, now)
-                    };
+                        let outcome = CallOutcome::Gated {
+                            gate_id: gate_id.0,
+                            jti,
+                        };
+                        return if gate_id.1 {
+                            self.record_after_mutation(tool.name(), outcome, now)
+                        } else {
+                            self.record(tool.name(), outcome, now)
+                        };
+                    }
                 }
                 Some(gid) => {
                     let verdict = self.verdicts.borrow().fetch(&self.principal.scope, gid);
@@ -777,9 +806,12 @@ impl GovernedRouter {
             );
         }
         let mut verdicts = self.verdicts.borrow_mut();
-        if let Some(existing) =
-            verdicts.find_waiting(&self.principal.scope, &self.principal.run_id.0, effect_key)
-        {
+        if let Some(existing) = verdicts.find_waiting(
+            &self.principal.scope,
+            &self.principal.run_id.0,
+            &requested_by,
+            effect_key,
+        ) {
             return Ok((existing.gate_id, false));
         }
         let gate_id = opaque_gate_id();

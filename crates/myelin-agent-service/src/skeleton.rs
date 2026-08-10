@@ -1,6 +1,6 @@
 use crate::effect_api::validate_call;
 use crate::metering::{price, LUNA_RATES};
-use crate::tool_exec::{ToolExecutionContext, ToolExecutor};
+use crate::tool_exec::{ToolExecError, ToolExecutionContext, ToolExecutor};
 use myelin_agent::{
     Agent, AgentRuntime, Conversation, InboxEvent, MeteredRuntime, MeteredStep, RunOutcome,
     StepOutcome, Submission, TokenUsage, ToolOutcome, ToolSurface, Turn,
@@ -223,6 +223,7 @@ pub enum SkeletonError {
     CoCommit(String),
     ToolValidationRejected(String),
     ToolExecFailed(String),
+    ApprovalRequired { gate_id: String },
     MaxTurnsExhausted {
         run_id: String,
         turns: usize,
@@ -250,6 +251,10 @@ impl core::fmt::Display for SkeletonError {
                 write!(f, "SKELETON tool-call validation rejected (fail-closed): {m}")
             }
             SkeletonError::ToolExecFailed(m) => write!(f, "SKELETON tool execution failed: {m}"),
+            SkeletonError::ApprovalRequired { gate_id } => write!(
+                f,
+                "SKELETON run is waiting for human approval at gate `{gate_id}`"
+            ),
             SkeletonError::MaxTurnsExhausted { run_id, turns } => write!(
                 f,
                 "SKELETON bounded loop exhausted: run={run_id} reached max_turns={turns} without a submit"
@@ -467,7 +472,12 @@ impl SkeletonAgent {
                                 call_id: call.id.clone(),
                                 result,
                             }),
-                            Err(e) => return Err(SkeletonError::ToolExecFailed(e.to_string())),
+                            Err(ToolExecError::ApprovalRequired { gate_id }) => {
+                                return Err(SkeletonError::ApprovalRequired { gate_id });
+                            }
+                            Err(ToolExecError::Failed(reason)) => {
+                                return Err(SkeletonError::ToolExecFailed(reason));
+                            }
                         }
                     }
                     conv.turns.push(Turn::ToolResults(outcomes));
@@ -1271,6 +1281,45 @@ mod tests {
         assert_eq!(exec.call_count(), 1, "the failing call was attempted once");
         assert_eq!(tele.tokens_revoked(), 1, "torn down on the executor-error path");
         assert_eq!(tele.traces_written(), 0);
+        assert_eq!(tele.runs_completed(), 0);
+    }
+
+    #[test]
+    fn a_human_gate_parks_the_effect_without_becoming_a_model_tool_result() {
+        let brain = AlwaysUseTool(ToolName("merge".into()));
+        let agent_loop = SkeletonAgent::new();
+        let revoker = FakeRevoker {
+            ttl_w: 300,
+            minted_at: 1000,
+            ..Default::default()
+        };
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let outbox = myelin_events::OutboxStore::new();
+        let mut tele = SkeletonTelemetry::new();
+        let cat = MockToolSurface::with([tool_def("merge")]);
+        let exec = MockToolExecutor::with_results([Err(ToolExecError::ApprovalRequired {
+            gate_id: "gate-merge-42".into(),
+        })]);
+        let mut sub = substrate(
+            "Rgate", &revoker, &cat, &exec, &mut gate, &mut ledger, &outbox, 100, 10, 1000,
+        );
+
+        let error = agent_loop
+            .handle_run(&brain, &mut sub, &mut tele, RunOutcomeKind::Completed)
+            .expect_err("the host must yield as soon as a human decision is required");
+
+        assert_eq!(
+            error,
+            SkeletonError::ApprovalRequired {
+                gate_id: "gate-merge-42".into(),
+            }
+        );
+        assert_eq!(exec.call_count(), 1, "the proposed effect was planned once");
+        assert_eq!(tele.reserved(), 10, "the run remains admitted for a resume");
+        assert_eq!(tele.settled(), 0, "a parked run is not called complete");
+        assert_eq!(tele.tokens_revoked(), 1, "the runtime credential is torn down");
+        assert_eq!(tele.traces_written(), 0, "the unfinished run has no final trace");
         assert_eq!(tele.runs_completed(), 0);
     }
 

@@ -238,6 +238,23 @@ fn parse_tool_result(response: &[u8], expected_call_id: &str) -> Result<ToolResu
     let result = envelope
         .get("result")
         .ok_or_else(|| failed("governed MCP response contains neither result nor error"))?;
+    if let Some(gate_id) = result
+        .get("_meta")
+        .and_then(|meta| meta.get("gateId"))
+        .and_then(Value::as_str)
+    {
+        if gate_id.is_empty()
+            || gate_id.len() > 256
+            || !gate_id.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(failed(
+                "governed MCP response contains an invalid approval gate ID",
+            ));
+        }
+        return Err(ToolExecError::ApprovalRequired {
+            gate_id: gate_id.to_string(),
+        });
+    }
     let mut text = result
         .get("content")
         .and_then(Value::as_array)
@@ -345,6 +362,26 @@ mod tests {
         let result = parse_tool_result(response.to_string().as_bytes(), "call-1").unwrap();
         assert!(result.0.contains("refused"));
         assert!(result.0.contains("denied"));
+    }
+
+    #[test]
+    fn governed_approval_gates_interrupt_the_host_before_another_model_turn() {
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": "call-1",
+            "result": {
+                "content": [{"type": "text", "text": "The effect is waiting for approval."}],
+                "isError": false,
+                "_meta": {"gateId": "gate-merge-42"},
+            },
+        });
+
+        assert_eq!(
+            parse_tool_result(response.to_string().as_bytes(), "call-1"),
+            Err(ToolExecError::ApprovalRequired {
+                gate_id: "gate-merge-42".into(),
+            })
+        );
     }
 
     #[test]
