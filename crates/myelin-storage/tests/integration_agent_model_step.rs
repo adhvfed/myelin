@@ -2,15 +2,24 @@
 
 use myelin_config::MyelinConfig;
 use myelin_storage::agent_model_step::{
-    agent_model_step_migrations, AgentModelStepStore, ModelStepBegin, ModelStepCompletion,
-    ModelStepError,
+    AgentModelStepStore, ModelStepBegin, ModelStepCompletion, ModelStepError,
 };
 use myelin_storage::migration::HotTables;
-use myelin_storage::SubstrateProvider;
+use myelin_storage::{all_durable_migrations, SubstrateProvider};
 use myelin_tenancy::TenantId;
 
-fn admin_config(config: &MyelinConfig) -> MyelinConfig {
-    let mut admin = config.clone();
+fn app_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
+fn admin_config() -> MyelinConfig {
+    let mut admin = app_config();
     admin.database_url = admin
         .database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
@@ -26,8 +35,8 @@ fn unique_suffix() -> u128 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
-    let config = MyelinConfig::dev();
-    let admin = match SubstrateProvider::connect(admin_config(&config), 4).await {
+    let config = app_config();
+    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
         Ok(provider) => provider,
         Err(_) => {
             eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
@@ -35,13 +44,14 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
         }
     };
     admin
-        .migrate(&agent_model_step_migrations(), &HotTables::none())
+        .migrate(&all_durable_migrations(), &HotTables::none())
         .await
         .expect("apply the durable model-step migration");
 
     let tenant = TenantId(format!("01J0MODEL{}", unique_suffix()));
     let run_id = format!("run-{}", unique_suffix());
     let request_hash = "a".repeat(64);
+    let requested_by = "founder";
     let response = serde_json::json!({
         "reply": { "Final": { "content": "prepare the one-line fix" } },
         "usage": { "Reported": { "input": 10, "cached_input": 2, "output": 3 } }
@@ -53,7 +63,13 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
     );
 
     assert_eq!(
-        first.begin(&tenant, &run_id, "model-turn/0", &request_hash),
+        first.begin(
+            &tenant,
+            &run_id,
+            "model-turn/0",
+            &request_hash,
+            requested_by,
+        ),
         Ok(ModelStepBegin::Started),
         "the provider request earns a durable intent before it may leave the process",
     );
@@ -64,7 +80,13 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
             .expect("restart with a fresh database pool"),
     );
     assert_eq!(
-        restarted.begin(&tenant, &run_id, "model-turn/0", &request_hash),
+        restarted.begin(
+            &tenant,
+            &run_id,
+            "model-turn/0",
+            &request_hash,
+            requested_by,
+        ),
         Ok(ModelStepBegin::InDoubt),
         "a crash after durable intent but before durable response is never guessed safe to retry",
     );
@@ -74,6 +96,7 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
             &run_id,
             "model-turn/0",
             &request_hash,
+            requested_by,
             &response,
         ),
         Ok(ModelStepCompletion::Applied),
@@ -86,7 +109,13 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
             .expect("replay from another fresh database pool"),
     );
     assert_eq!(
-        replay.begin(&tenant, &run_id, "model-turn/0", &request_hash),
+        replay.begin(
+            &tenant,
+            &run_id,
+            "model-turn/0",
+            &request_hash,
+            requested_by,
+        ),
         Ok(ModelStepBegin::Completed(response.clone())),
         "completed work returns its durable response without another provider request",
     );
@@ -96,14 +125,32 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
             &run_id,
             "model-turn/0",
             &request_hash,
+            requested_by,
             &response,
         ),
         Ok(ModelStepCompletion::Replayed),
     );
     assert_eq!(
-        replay.begin(&tenant, &run_id, "model-turn/0", &"b".repeat(64)),
+        replay.begin(
+            &tenant,
+            &run_id,
+            "model-turn/0",
+            &"b".repeat(64),
+            requested_by,
+        ),
         Err(ModelStepError::Conflict),
         "the same turn cannot be rebound to a different prompt",
+    );
+    assert_eq!(
+        replay.begin(
+            &tenant,
+            &run_id,
+            "model-turn/0",
+            &request_hash,
+            "another-human",
+        ),
+        Err(ModelStepError::Conflict),
+        "a replay position cannot be reassigned to another data subject",
     );
     assert_eq!(
         replay.complete(
@@ -111,6 +158,7 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
             &run_id,
             "model-turn/0",
             &request_hash,
+            requested_by,
             &serde_json::json!({"different": "answer"}),
         ),
         Err(ModelStepError::Conflict),
@@ -122,6 +170,7 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
             &run_id,
             "model-turn/1",
             &request_hash,
+            requested_by,
             &response,
         ),
         Err(ModelStepError::Missing),
@@ -147,11 +196,9 @@ async fn completed_model_work_replays_but_ambiguous_work_stays_in_doubt() {
     .bind(&run_id)
     .execute(&mut *mutation)
     .await;
-    assert!(
-        rewrite
-            .expect_err("even the table owner cannot rewrite a completed provider response")
-            .to_string()
-            .contains("one-way completion transition"),
-    );
+    assert!(rewrite
+        .expect_err("even the table owner cannot rewrite a completed provider response")
+        .to_string()
+        .contains("one-way completion transition"),);
     mutation.rollback().await.ok();
 }

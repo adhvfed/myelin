@@ -28,6 +28,16 @@ pub const DEFAULT_MAX_TURNS: usize = 16;
 
 pub const WALLET_MIN_BALANCE_FLOOR: MicroUsd = MicroUsd::ZERO;
 
+pub fn requesting_subject(agent: &Principal) -> &str {
+    match &agent.kind {
+        PrincipalKind::Agent {
+            on_behalf_of: Some(principal),
+            ..
+        } => &principal.0,
+        _ => &agent.principal_id.0,
+    }
+}
+
 pub trait RunWallet {
     fn balance(&self, tenant: &TenantId) -> MicroUsd;
     fn debit_once(
@@ -604,13 +614,7 @@ fn completed_trace(
     submission: &Submission,
     telemetry: &SkeletonTelemetry,
 ) -> AgentTraceWrite {
-    let requested_by = match &sub.agent.kind {
-        PrincipalKind::Agent {
-            on_behalf_of: Some(principal),
-            ..
-        } => principal.0.clone(),
-        _ => sub.agent.principal_id.0.clone(),
-    };
+    let requested_by = requesting_subject(&sub.agent).to_string();
     let blocks = vec![Block::Paragraph {
         inline: Inline {
             spans: vec![Span::Text {

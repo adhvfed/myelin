@@ -2,11 +2,13 @@ use myelin_tenancy::TenantId;
 use serde_json::Value;
 use sqlx::Row;
 
+use crate::agent_journal_privacy::{agent_subject_status, AgentSubjectStatus};
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
 
 const MAX_ID_BYTES: usize = 512;
+const MAX_PRINCIPAL_BYTES: usize = 255;
 const REQUEST_HASH_BYTES: usize = 64;
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -86,6 +88,9 @@ pub enum ModelStepError {
     InvalidInput(&'static str),
     Conflict,
     Missing,
+    Erased,
+    Restricted,
+    Storage(String),
 }
 
 impl core::fmt::Display for ModelStepError {
@@ -97,6 +102,11 @@ impl core::fmt::Display for ModelStepError {
                 "model step identity was already used for different immutable content"
             ),
             Self::Missing => write!(formatter, "model step was completed before it was started"),
+            Self::Erased => formatter.write_str("the requesting subject was erased"),
+            Self::Restricted => {
+                formatter.write_str("model processing is restricted for the requesting subject")
+            }
+            Self::Storage(detail) => write!(formatter, "model step journal unavailable: {detail}"),
         }
     }
 }
@@ -122,14 +132,15 @@ impl AgentModelStepStore {
         self.provider.config().region.clone()
     }
 
-    fn block<T>(&self, future: impl std::future::Future<Output = Result<T, ProviderError>>) -> T {
+    fn block<T>(
+        &self,
+        future: impl std::future::Future<Output = Result<T, ProviderError>>,
+    ) -> Result<T, ModelStepError> {
         match tokio::runtime::Handle::try_current() {
             Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
             Err(_) => self.runtime.block_on(future),
         }
-        .unwrap_or_else(|error| {
-            panic!("FAIL-STATIC: durable model-step store fault (step state did not commit): {error}")
-        })
+        .map_err(|error| ModelStepError::Storage(error.to_string()))
     }
 
     pub fn begin(
@@ -138,13 +149,15 @@ impl AgentModelStepStore {
         run_id: &str,
         step_key: &str,
         request_hash: &str,
+        requested_by: &str,
     ) -> Result<ModelStepBegin, ModelStepError> {
-        validate_identity(run_id, step_key, request_hash)?;
+        validate_identity(run_id, step_key, request_hash, requested_by)?;
         let region = self.region();
         let tenant_s = tenant.0.clone();
         let run_id = run_id.to_string();
         let step_key = step_key.to_string();
         let request_hash = request_hash.to_string();
+        let requested_by = requested_by.to_string();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
                 begin_on_connection(
@@ -154,10 +167,11 @@ impl AgentModelStepStore {
                     &run_id,
                     &step_key,
                     &request_hash,
+                    &requested_by,
                 )
                 .await
             })
-        }))
+        }))?
     }
 
     pub fn complete(
@@ -166,9 +180,10 @@ impl AgentModelStepStore {
         run_id: &str,
         step_key: &str,
         request_hash: &str,
+        requested_by: &str,
         response: &Value,
     ) -> Result<ModelStepCompletion, ModelStepError> {
-        validate_identity(run_id, step_key, request_hash)?;
+        validate_identity(run_id, step_key, request_hash, requested_by)?;
         let encoded = serde_json::to_vec(response)
             .map_err(|_| ModelStepError::InvalidInput("response is not valid JSON"))?;
         if encoded.len() > MAX_RESPONSE_BYTES {
@@ -179,6 +194,7 @@ impl AgentModelStepStore {
         let run_id = run_id.to_string();
         let step_key = step_key.to_string();
         let request_hash = request_hash.to_string();
+        let requested_by = requested_by.to_string();
         let response = response.clone();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
@@ -189,11 +205,12 @@ impl AgentModelStepStore {
                     &run_id,
                     &step_key,
                     &request_hash,
+                    &requested_by,
                     &response,
                 )
                 .await
             })
-        }))
+        }))?
     }
 }
 
@@ -201,18 +218,28 @@ fn validate_identity(
     run_id: &str,
     step_key: &str,
     request_hash: &str,
+    requested_by: &str,
 ) -> Result<(), ModelStepError> {
     if run_id.is_empty() || run_id.len() > MAX_ID_BYTES {
-        return Err(ModelStepError::InvalidInput("run id must contain 1 to 512 bytes"));
+        return Err(ModelStepError::InvalidInput(
+            "run id must contain 1 to 512 bytes",
+        ));
     }
     if step_key.is_empty() || step_key.len() > MAX_ID_BYTES {
-        return Err(ModelStepError::InvalidInput("step key must contain 1 to 512 bytes"));
+        return Err(ModelStepError::InvalidInput(
+            "step key must contain 1 to 512 bytes",
+        ));
     }
     if request_hash.len() != REQUEST_HASH_BYTES
         || !request_hash.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
         return Err(ModelStepError::InvalidInput(
             "request hash must be 64 hexadecimal bytes",
+        ));
+    }
+    if requested_by.is_empty() || requested_by.len() > MAX_PRINCIPAL_BYTES {
+        return Err(ModelStepError::InvalidInput(
+            "requesting principal must contain 1 to 255 bytes",
         ));
     }
     Ok(())
@@ -225,17 +252,24 @@ async fn begin_on_connection(
     run_id: &str,
     step_key: &str,
     request_hash: &str,
+    requested_by: &str,
 ) -> Result<Result<ModelStepBegin, ModelStepError>, PgError> {
+    match agent_subject_status(connection, tenant, region, requested_by).await? {
+        AgentSubjectStatus::Active => {}
+        AgentSubjectStatus::Erased => return Ok(Err(ModelStepError::Erased)),
+        AgentSubjectStatus::Restricted => return Ok(Err(ModelStepError::Restricted)),
+    }
     let inserted = sqlx::query(
         "INSERT INTO agent_model_step
-           (tenant_id, region, run_id, step_key, request_hash, state)
-         VALUES ($1, $2, $3, $4, $5, 'started') ON CONFLICT DO NOTHING",
+           (tenant_id, region, run_id, step_key, request_hash, requested_by, state)
+         VALUES ($1, $2, $3, $4, $5, $6, 'started') ON CONFLICT DO NOTHING",
     )
     .bind(tenant)
     .bind(region)
     .bind(run_id)
     .bind(step_key)
     .bind(request_hash)
+    .bind(requested_by)
     .execute(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -244,7 +278,7 @@ async fn begin_on_connection(
     }
 
     let row = sqlx::query(
-        "SELECT request_hash, state, response FROM agent_model_step
+        "SELECT request_hash, requested_by, state, response FROM agent_model_step
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4",
     )
     .bind(tenant)
@@ -255,10 +289,15 @@ async fn begin_on_connection(
     .await
     .map_err(store_query)?;
     let stored_hash: String = row.try_get("request_hash").map_err(store_query)?;
-    if stored_hash != request_hash {
+    let stored_subject: String = row.try_get("requested_by").map_err(store_query)?;
+    if stored_hash != request_hash || stored_subject != requested_by {
         return Ok(Err(ModelStepError::Conflict));
     }
-    match row.try_get::<String, _>("state").map_err(store_query)?.as_str() {
+    match row
+        .try_get::<String, _>("state")
+        .map_err(store_query)?
+        .as_str()
+    {
         "started" => Ok(Ok(ModelStepBegin::InDoubt)),
         "completed" => {
             let response = row
@@ -278,10 +317,16 @@ async fn complete_on_connection(
     run_id: &str,
     step_key: &str,
     request_hash: &str,
+    requested_by: &str,
     response: &Value,
 ) -> Result<Result<ModelStepCompletion, ModelStepError>, PgError> {
+    match agent_subject_status(connection, tenant, region, requested_by).await? {
+        AgentSubjectStatus::Active => {}
+        AgentSubjectStatus::Erased => return Ok(Err(ModelStepError::Erased)),
+        AgentSubjectStatus::Restricted => return Ok(Err(ModelStepError::Restricted)),
+    }
     let row = sqlx::query(
-        "SELECT request_hash, state, response FROM agent_model_step
+        "SELECT request_hash, requested_by, state, response FROM agent_model_step
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4 FOR UPDATE",
     )
     .bind(tenant)
@@ -295,7 +340,8 @@ async fn complete_on_connection(
         return Ok(Err(ModelStepError::Missing));
     };
     let stored_hash: String = row.try_get("request_hash").map_err(store_query)?;
-    if stored_hash != request_hash {
+    let stored_subject: String = row.try_get("requested_by").map_err(store_query)?;
+    if stored_hash != request_hash || stored_subject != requested_by {
         return Ok(Err(ModelStepError::Conflict));
     }
     let state: String = row.try_get("state").map_err(store_query)?;
@@ -353,14 +399,15 @@ mod tests {
 
     #[test]
     fn malformed_operation_identity_is_rejected_before_storage() {
-        assert!(validate_identity("run", "step", &"a".repeat(64)).is_ok());
+        assert!(validate_identity("run", "step", &"a".repeat(64), "founder").is_ok());
         assert_eq!(
-            validate_identity("run", "step", "not-a-hash"),
+            validate_identity("run", "step", "not-a-hash", "founder"),
             Err(ModelStepError::InvalidInput(
                 "request hash must be 64 hexadecimal bytes"
             )),
         );
-        assert!(validate_identity("", "step", &"a".repeat(64)).is_err());
-        assert!(validate_identity("run", "", &"a".repeat(64)).is_err());
+        assert!(validate_identity("", "step", &"a".repeat(64), "founder").is_err());
+        assert!(validate_identity("run", "", &"a".repeat(64), "founder").is_err());
+        assert!(validate_identity("run", "step", &"a".repeat(64), "").is_err());
     }
 }

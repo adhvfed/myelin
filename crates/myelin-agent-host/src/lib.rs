@@ -34,8 +34,8 @@ use myelin_agent_model::{
     ToolSpec,
 };
 use myelin_agent_service::{
-    RunOutcomeKind, RunSubstrate, SkeletonAgent, SkeletonError, SkeletonTelemetry, ToolExecError,
-    ToolExecutor,
+    requesting_subject, RunOutcomeKind, RunSubstrate, SkeletonAgent, SkeletonError,
+    SkeletonTelemetry, ToolExecError, ToolExecutor,
 };
 use myelin_events::{IdMinter, OutboxStore};
 use myelin_flow::{DelegationCaveats, RunTokenError, RunTokenHandle, RunTokenMinter, WfJournal};
@@ -715,14 +715,17 @@ impl AgentHost {
         tools: Tools<'_>,
     ) -> Result<LlmRunReport, AgentHostError> {
         let (minter, revoker) = self.identity_seams(task)?;
+        let requested_by = requesting_subject(&task.agent).to_string();
         let model_client = Box::new(DurableModelClient::new(
             task.tenant.clone(),
             task.run_id.clone(),
+            requested_by.clone(),
             self.model_steps.clone(),
             model_client,
         ));
         let durable_tools = DurableToolExecutor::new(
             task.tenant.clone(),
+            requested_by,
             self.tool_effects.clone(),
             tools.executor,
         );

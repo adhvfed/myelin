@@ -2,15 +2,24 @@
 
 use myelin_config::MyelinConfig;
 use myelin_storage::agent_tool_effect::{
-    agent_tool_effect_migrations, AgentToolEffectStore, ToolEffectBegin, ToolEffectCompletion,
-    ToolEffectError,
+    AgentToolEffectStore, ToolEffectBegin, ToolEffectCompletion, ToolEffectError,
 };
 use myelin_storage::migration::HotTables;
-use myelin_storage::SubstrateProvider;
+use myelin_storage::{all_durable_migrations, SubstrateProvider};
 use myelin_tenancy::TenantId;
 
-fn admin_config(config: &MyelinConfig) -> MyelinConfig {
-    let mut admin = config.clone();
+fn app_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
+fn admin_config() -> MyelinConfig {
+    let mut admin = app_config();
     admin.database_url = admin
         .database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
@@ -26,8 +35,8 @@ fn unique_suffix() -> u128 {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
-    let config = MyelinConfig::dev();
-    let admin = match SubstrateProvider::connect(admin_config(&config), 4).await {
+    let config = app_config();
+    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
         Ok(provider) => provider,
         Err(_) => {
             eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
@@ -35,7 +44,7 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
         }
     };
     admin
-        .migrate(&agent_tool_effect_migrations(), &HotTables::none())
+        .migrate(&all_durable_migrations(), &HotTables::none())
         .await
         .expect("apply the durable tool-effect migrations");
 
@@ -43,6 +52,7 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
     let run_id = format!("run-{}", unique_suffix());
     let effect_key = "model-turn/0/tool/0";
     let request_hash = "a".repeat(64);
+    let requested_by = "founder";
     let first_process = AgentToolEffectStore::new(
         SubstrateProvider::connect(config.clone(), 4)
             .await
@@ -50,7 +60,7 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
     );
 
     assert_eq!(
-        first_process.begin(&tenant, &run_id, effect_key, &request_hash),
+        first_process.begin(&tenant, &run_id, effect_key, &request_hash, requested_by,),
         Ok(ToolEffectBegin::Execute),
         "the external request earns a durable identity before it may leave the process",
     );
@@ -61,7 +71,13 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
             .expect("restart with a fresh database pool"),
     );
     assert_eq!(
-        restarted_process.begin(&tenant, &run_id, effect_key, &request_hash),
+        restarted_process.begin(
+            &tenant,
+            &run_id,
+            effect_key,
+            &request_hash,
+            requested_by,
+        ),
         Ok(ToolEffectBegin::Execute),
         "unfinished tool work retries with the same logical identity and downstream idempotency key",
     );
@@ -71,6 +87,7 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
             &run_id,
             effect_key,
             &request_hash,
+            requested_by,
             "first snapshot",
         ),
         Ok(ToolEffectCompletion::Applied),
@@ -83,7 +100,7 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
             .expect("replay from another fresh database pool"),
     );
     assert_eq!(
-        replay_process.begin(&tenant, &run_id, effect_key, &request_hash),
+        replay_process.begin(&tenant, &run_id, effect_key, &request_hash, requested_by,),
         Ok(ToolEffectBegin::Completed("first snapshot".into())),
         "completed work returns its exact bytes without another external request",
     );
@@ -93,15 +110,27 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
             &run_id,
             effect_key,
             &request_hash,
+            requested_by,
             "a later, nondeterministic snapshot",
         ),
         Ok(ToolEffectCompletion::Replayed("first snapshot".into())),
         "a racing completion cannot replace the first durable observation",
     );
     assert_eq!(
-        replay_process.begin(&tenant, &run_id, effect_key, &"b".repeat(64)),
+        replay_process.begin(&tenant, &run_id, effect_key, &"b".repeat(64), requested_by,),
         Err(ToolEffectError::Conflict),
         "one logical position cannot be rebound to different tool input",
+    );
+    assert_eq!(
+        replay_process.begin(
+            &tenant,
+            &run_id,
+            effect_key,
+            &request_hash,
+            "another-human",
+        ),
+        Err(ToolEffectError::Conflict),
+        "a replay position cannot be reassigned to another data subject",
     );
     assert_eq!(
         replay_process.complete(
@@ -109,6 +138,7 @@ async fn a_restarted_agent_retries_pending_work_but_replays_completed_work() {
             &run_id,
             "model-turn/0/tool/1",
             &request_hash,
+            requested_by,
             "invented result",
         ),
         Err(ToolEffectError::Missing),

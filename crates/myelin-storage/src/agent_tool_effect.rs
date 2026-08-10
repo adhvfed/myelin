@@ -1,12 +1,14 @@
 use myelin_tenancy::TenantId;
 use sqlx::Row;
 
+use crate::agent_journal_privacy::{agent_subject_status, AgentSubjectStatus};
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
 
 const MAX_RUN_ID_BYTES: usize = 512;
 const MAX_EFFECT_KEY_BYTES: usize = 1024;
+const MAX_PRINCIPAL_BYTES: usize = 255;
 const REQUEST_HASH_BYTES: usize = 64;
 const MAX_RESULT_BYTES: usize = 256 * 1024;
 
@@ -87,6 +89,8 @@ pub enum ToolEffectError {
     InvalidInput(&'static str),
     Conflict,
     Missing,
+    Erased,
+    Restricted,
     Storage(String),
 }
 
@@ -97,6 +101,10 @@ impl core::fmt::Display for ToolEffectError {
             Self::Conflict => formatter
                 .write_str("tool effect identity was already used for different immutable content"),
             Self::Missing => formatter.write_str("tool effect completed before it was started"),
+            Self::Erased => formatter.write_str("the requesting subject was erased"),
+            Self::Restricted => {
+                formatter.write_str("tool processing is restricted for the requesting subject")
+            }
             Self::Storage(detail) => write!(formatter, "tool effect journal unavailable: {detail}"),
         }
     }
@@ -125,13 +133,15 @@ impl AgentToolEffectStore {
         run_id: &str,
         effect_key: &str,
         request_hash: &str,
+        requested_by: &str,
     ) -> Result<ToolEffectBegin, ToolEffectError> {
-        validate_identity(run_id, effect_key, request_hash)?;
+        validate_identity(run_id, effect_key, request_hash, requested_by)?;
         let region = self.provider.config().region.clone();
         let tenant_id = tenant.0.clone();
         let run_id = run_id.to_string();
         let effect_key = effect_key.to_string();
         let request_hash = request_hash.to_string();
+        let requested_by = requested_by.to_string();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
                 begin_on_connection(
@@ -141,6 +151,7 @@ impl AgentToolEffectStore {
                     &run_id,
                     &effect_key,
                     &request_hash,
+                    &requested_by,
                 )
                 .await
             })
@@ -153,9 +164,10 @@ impl AgentToolEffectStore {
         run_id: &str,
         effect_key: &str,
         request_hash: &str,
+        requested_by: &str,
         result: &str,
     ) -> Result<ToolEffectCompletion, ToolEffectError> {
-        validate_identity(run_id, effect_key, request_hash)?;
+        validate_identity(run_id, effect_key, request_hash, requested_by)?;
         if result.len() > MAX_RESULT_BYTES {
             return Err(ToolEffectError::InvalidInput(
                 "result exceeds its 256 KiB bound",
@@ -166,6 +178,7 @@ impl AgentToolEffectStore {
         let run_id = run_id.to_string();
         let effect_key = effect_key.to_string();
         let request_hash = request_hash.to_string();
+        let requested_by = requested_by.to_string();
         let result = result.to_string();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
@@ -176,6 +189,7 @@ impl AgentToolEffectStore {
                     &run_id,
                     &effect_key,
                     &request_hash,
+                    &requested_by,
                     &result,
                 )
                 .await
@@ -199,6 +213,7 @@ fn validate_identity(
     run_id: &str,
     effect_key: &str,
     request_hash: &str,
+    requested_by: &str,
 ) -> Result<(), ToolEffectError> {
     if run_id.is_empty() || run_id.len() > MAX_RUN_ID_BYTES {
         return Err(ToolEffectError::InvalidInput(
@@ -217,6 +232,11 @@ fn validate_identity(
             "request hash must be 64 hexadecimal bytes",
         ));
     }
+    if requested_by.is_empty() || requested_by.len() > MAX_PRINCIPAL_BYTES {
+        return Err(ToolEffectError::InvalidInput(
+            "requesting principal must contain 1 to 255 bytes",
+        ));
+    }
     Ok(())
 }
 
@@ -227,17 +247,24 @@ async fn begin_on_connection(
     run_id: &str,
     effect_key: &str,
     request_hash: &str,
+    requested_by: &str,
 ) -> Result<Result<ToolEffectBegin, ToolEffectError>, PgError> {
+    match agent_subject_status(connection, tenant, region, requested_by).await? {
+        AgentSubjectStatus::Active => {}
+        AgentSubjectStatus::Erased => return Ok(Err(ToolEffectError::Erased)),
+        AgentSubjectStatus::Restricted => return Ok(Err(ToolEffectError::Restricted)),
+    }
     let inserted = sqlx::query(
         "INSERT INTO agent_tool_effect
-           (tenant_id, region, run_id, effect_key, request_hash, state)
-         VALUES ($1, $2, $3, $4, $5, 'started') ON CONFLICT DO NOTHING",
+           (tenant_id, region, run_id, effect_key, request_hash, requested_by, state)
+         VALUES ($1, $2, $3, $4, $5, $6, 'started') ON CONFLICT DO NOTHING",
     )
     .bind(tenant)
     .bind(region)
     .bind(run_id)
     .bind(effect_key)
     .bind(request_hash)
+    .bind(requested_by)
     .execute(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -246,7 +273,7 @@ async fn begin_on_connection(
     }
 
     let row = sqlx::query(
-        "SELECT request_hash, state, result_text FROM agent_tool_effect
+        "SELECT request_hash, requested_by, state, result_text FROM agent_tool_effect
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_key = $4",
     )
     .bind(tenant)
@@ -260,6 +287,10 @@ async fn begin_on_connection(
         .try_get::<String, _>("request_hash")
         .map_err(store_query)?
         != request_hash
+        || row
+            .try_get::<String, _>("requested_by")
+            .map_err(store_query)?
+            != requested_by
     {
         return Ok(Err(ToolEffectError::Conflict));
     }
@@ -286,10 +317,16 @@ async fn complete_on_connection(
     run_id: &str,
     effect_key: &str,
     request_hash: &str,
+    requested_by: &str,
     result: &str,
 ) -> Result<Result<ToolEffectCompletion, ToolEffectError>, PgError> {
+    match agent_subject_status(connection, tenant, region, requested_by).await? {
+        AgentSubjectStatus::Active => {}
+        AgentSubjectStatus::Erased => return Ok(Err(ToolEffectError::Erased)),
+        AgentSubjectStatus::Restricted => return Ok(Err(ToolEffectError::Restricted)),
+    }
     let row = sqlx::query(
-        "SELECT request_hash, state, result_text FROM agent_tool_effect
+        "SELECT request_hash, requested_by, state, result_text FROM agent_tool_effect
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_key = $4 FOR UPDATE",
     )
     .bind(tenant)
@@ -306,6 +343,10 @@ async fn complete_on_connection(
         .try_get::<String, _>("request_hash")
         .map_err(store_query)?
         != request_hash
+        || row
+            .try_get::<String, _>("requested_by")
+            .map_err(store_query)?
+            != requested_by
     {
         return Ok(Err(ToolEffectError::Conflict));
     }
@@ -361,9 +402,12 @@ mod tests {
 
     #[test]
     fn malformed_effect_identity_is_rejected_before_storage() {
-        assert!(validate_identity("run", "model-turn/0/tool/0", &"a".repeat(64)).is_ok());
-        assert!(validate_identity("", "effect", &"a".repeat(64)).is_err());
-        assert!(validate_identity("run", "", &"a".repeat(64)).is_err());
-        assert!(validate_identity("run", "effect", "not-a-hash").is_err());
+        assert!(
+            validate_identity("run", "model-turn/0/tool/0", &"a".repeat(64), "founder").is_ok()
+        );
+        assert!(validate_identity("", "effect", &"a".repeat(64), "founder").is_err());
+        assert!(validate_identity("run", "", &"a".repeat(64), "founder").is_err());
+        assert!(validate_identity("run", "effect", "not-a-hash", "founder").is_err());
+        assert!(validate_identity("run", "effect", &"a".repeat(64), "").is_err());
     }
 }

@@ -1,3 +1,4 @@
+pub mod agent_journal_privacy;
 pub mod agent_model_step;
 pub mod agent_run_gate;
 pub mod agent_tool_effect;
@@ -74,6 +75,9 @@ pub mod valkey;
 
 pub mod cell_root_durable;
 
+pub use agent_journal_privacy::{
+    agent_journal_privacy_migrations, AGENT_JOURNAL_SUBJECT_MIGRATION,
+};
 pub use agent_model_step::{
     agent_model_step_migrations, AgentModelStepStore, ModelStepBegin, ModelStepCompletion,
     ModelStepError, AGENT_MODEL_STEP_GUARD_MIGRATION, AGENT_MODEL_STEP_MIGRATION,
@@ -90,8 +94,8 @@ pub use agent_trace_durable::{
     InMemoryAgentTraceStore,
 };
 pub use agent_wallet::{
-    agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind,
-    DebitOutcome, WalletError, AGENT_WALLET_CHARGE_KEY_MIGRATION, AGENT_WALLET_MIGRATION,
+    agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind, DebitOutcome,
+    WalletError, AGENT_WALLET_CHARGE_KEY_MIGRATION, AGENT_WALLET_MIGRATION,
 };
 pub use backup::{
     BackupError, BackupSet, BaseBackup, ContinuousArchiver, EpochSecs, LogTierSeal,
@@ -221,9 +225,6 @@ pub use storage_surge::{
     StorageSurgeReport, STORAGE_SURGE_MULTIPLIER,
 };
 
-pub use authz_projection_durable::{
-    authz_projection_durable_migrations, AUTHZ_PROJECTION_STATE_MIGRATION,
-};
 pub use agent_trigger_durable::{
     agent_trigger_durable_migrations, agent_trigger_terminal_reason_migrations,
     AgentTriggerApprovalDecision, AgentTriggerApprovalOutcome, AgentTriggerClaimRequest,
@@ -237,6 +238,9 @@ pub use agent_trigger_durable::{
     AGENT_TRIGGER_BUDGET_MIGRATION, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
     AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION, AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
     MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+};
+pub use authz_projection_durable::{
+    authz_projection_durable_migrations, AUTHZ_PROJECTION_STATE_MIGRATION,
 };
 pub use delegation_policy_durable::{
     delegation_policy_durable_migrations, ensure_agent_policy_bundle_on_conn,

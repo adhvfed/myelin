@@ -14,6 +14,7 @@ trait ToolEffectJournal: Send + Sync {
         run_id: &str,
         effect_key: &str,
         request_hash: &str,
+        requested_by: &str,
     ) -> Result<ToolEffectBegin, ToolEffectError>;
 
     fn complete(
@@ -22,6 +23,7 @@ trait ToolEffectJournal: Send + Sync {
         run_id: &str,
         effect_key: &str,
         request_hash: &str,
+        requested_by: &str,
         result: &str,
     ) -> Result<ToolEffectCompletion, ToolEffectError>;
 }
@@ -33,8 +35,9 @@ impl ToolEffectJournal for AgentToolEffectStore {
         run_id: &str,
         effect_key: &str,
         request_hash: &str,
+        requested_by: &str,
     ) -> Result<ToolEffectBegin, ToolEffectError> {
-        AgentToolEffectStore::begin(self, tenant, run_id, effect_key, request_hash)
+        AgentToolEffectStore::begin(self, tenant, run_id, effect_key, request_hash, requested_by)
     }
 
     fn complete(
@@ -43,14 +46,24 @@ impl ToolEffectJournal for AgentToolEffectStore {
         run_id: &str,
         effect_key: &str,
         request_hash: &str,
+        requested_by: &str,
         result: &str,
     ) -> Result<ToolEffectCompletion, ToolEffectError> {
-        AgentToolEffectStore::complete(self, tenant, run_id, effect_key, request_hash, result)
+        AgentToolEffectStore::complete(
+            self,
+            tenant,
+            run_id,
+            effect_key,
+            request_hash,
+            requested_by,
+            result,
+        )
     }
 }
 
 pub(crate) struct DurableToolExecutor<'a> {
     tenant: TenantId,
+    requested_by: String,
     journal: Arc<dyn ToolEffectJournal>,
     inner: &'a dyn ToolExecutor,
 }
@@ -58,19 +71,22 @@ pub(crate) struct DurableToolExecutor<'a> {
 impl<'a> DurableToolExecutor<'a> {
     pub(crate) fn new(
         tenant: TenantId,
+        requested_by: String,
         journal: AgentToolEffectStore,
         inner: &'a dyn ToolExecutor,
     ) -> Self {
-        Self::with_journal(tenant, Arc::new(journal), inner)
+        Self::with_journal(tenant, requested_by, Arc::new(journal), inner)
     }
 
     fn with_journal(
         tenant: TenantId,
+        requested_by: String,
         journal: Arc<dyn ToolEffectJournal>,
         inner: &'a dyn ToolExecutor,
     ) -> Self {
         Self {
             tenant,
+            requested_by,
             journal,
             inner,
         }
@@ -92,6 +108,7 @@ impl ToolExecutor for DurableToolExecutor<'_> {
                 context.run_id,
                 context.effect_key,
                 &request_hash,
+                &self.requested_by,
             )
             .map_err(journal_failed)?
         {
@@ -107,6 +124,7 @@ impl ToolExecutor for DurableToolExecutor<'_> {
                 context.run_id,
                 context.effect_key,
                 &request_hash,
+                &self.requested_by,
                 &observed.0,
             )
             .map_err(journal_failed)?
@@ -176,6 +194,7 @@ mod tests {
             run_id: &str,
             effect_key: &str,
             request_hash: &str,
+            _requested_by: &str,
         ) -> Result<ToolEffectBegin, ToolEffectError> {
             let identity = (tenant.0.clone(), run_id.into(), effect_key.into());
             let mut effects = self.effects.lock().unwrap();
@@ -198,6 +217,7 @@ mod tests {
             run_id: &str,
             effect_key: &str,
             request_hash: &str,
+            _requested_by: &str,
             result: &str,
         ) -> Result<ToolEffectCompletion, ToolEffectError> {
             let identity = (tenant.0.clone(), run_id.into(), effect_key.into());
@@ -309,6 +329,7 @@ mod tests {
         let first_process = ScriptedExecutor::with([Ok(ToolResult("first snapshot".into()))]);
         let first = DurableToolExecutor::with_journal(
             TenantId("acme".into()),
+            "founder".into(),
             journal.clone(),
             &first_process,
         );
@@ -321,8 +342,12 @@ mod tests {
 
         let restarted_process =
             ScriptedExecutor::with([Ok(ToolResult("a changed snapshot".into()))]);
-        let replay =
-            DurableToolExecutor::with_journal(TenantId("acme".into()), journal, &restarted_process);
+        let replay = DurableToolExecutor::with_journal(
+            TenantId("acme".into()),
+            "founder".into(),
+            journal,
+            &restarted_process,
+        );
         assert_eq!(
             replay.execute(&context(), &definition(), &call("provider-b")),
             Ok(ToolResult("first snapshot".into())),
@@ -344,8 +369,12 @@ mod tests {
             }),
             Ok(ToolResult("merged once".into())),
         ]);
-        let durable =
-            DurableToolExecutor::with_journal(TenantId("acme".into()), journal, &external);
+        let durable = DurableToolExecutor::with_journal(
+            TenantId("acme".into()),
+            "founder".into(),
+            journal,
+            &external,
+        );
 
         assert_eq!(
             durable.execute(&context(), &definition(), &call("provider-a")),

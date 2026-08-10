@@ -2,8 +2,9 @@ use myelin_config::MyelinConfig;
 use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::{
-    all_durable_migrations, AgentTraceError, AgentTraceWrite, AgentTraceWriter,
-    DurableAgentTraceStore, DurableKmsBacking, HotTables, SealKey, SubstrateProvider,
+    all_durable_migrations, AgentModelStepStore, AgentToolEffectStore, AgentTraceError,
+    AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore, DurableKmsBacking, HotTables,
+    ModelStepError, SealKey, SubstrateProvider, ToolEffectError,
 };
 use myelin_tenancy::TenantId;
 use std::sync::Arc;
@@ -165,6 +166,8 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         tokio::runtime::Handle::current(),
         kms.clone(),
     );
+    let model_steps = AgentModelStepStore::new(provider.clone());
+    let tool_effects = AgentToolEffectStore::new(provider.clone());
     let subject = SubjectRef::new(Principal::stub(
         PrincipalId("founder".into()),
         PrincipalKind::Human,
@@ -181,6 +184,28 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         AgentTraceError::Restricted,
         "restricted subjects cannot enter agent trace processing"
     );
+    assert_eq!(
+        model_steps.begin(
+            &tenant,
+            "00000000-0000-4000-8000-000000000000",
+            "model-turn/0",
+            &"a".repeat(64),
+            "founder",
+        ),
+        Err(ModelStepError::Restricted),
+        "restriction is enforced before any model request can be journaled",
+    );
+    assert_eq!(
+        tool_effects.begin(
+            &tenant,
+            "00000000-0000-4000-8000-000000000000",
+            "model-turn/0/tool/0",
+            &"b".repeat(64),
+            "founder",
+        ),
+        Err(ToolEffectError::Restricted),
+        "restriction is enforced before any external effect can be journaled",
+    );
     holder
         .restrict(&subject, false)
         .expect("lifting restriction reaches the durable trace holder");
@@ -192,10 +217,48 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
             .write(&tenant, trace(run_id))
             .expect("a subject-keyed trace is durable");
     }
+    model_steps
+        .begin(
+            &tenant,
+            "11111111-1111-4111-8111-111111111111",
+            "model-turn/0",
+            &"a".repeat(64),
+            "founder",
+        )
+        .expect("the subject owns the model intent");
+    model_steps
+        .complete(
+            &tenant,
+            "11111111-1111-4111-8111-111111111111",
+            "model-turn/0",
+            &"a".repeat(64),
+            "founder",
+            &serde_json::json!({"answer": "private model reply"}),
+        )
+        .expect("the subject owns the replayable model answer");
+    tool_effects
+        .begin(
+            &tenant,
+            "22222222-2222-4222-8222-222222222222",
+            "model-turn/0/tool/0",
+            &"b".repeat(64),
+            "founder",
+        )
+        .expect("the subject owns the tool intent");
+    tool_effects
+        .complete(
+            &tenant,
+            "22222222-2222-4222-8222-222222222222",
+            "model-turn/0/tool/0",
+            &"b".repeat(64),
+            "founder",
+            "private tool observation",
+        )
+        .expect("the subject owns the replayable tool result");
     assert_eq!(
         store.count_for_subject(&tenant.0, "founder").await.unwrap(),
-        2,
-        "both final answers are discoverable through the subject locator"
+        4,
+        "final traces and their replay journals are discoverable through one subject locator"
     );
     assert_eq!(
         holder
@@ -211,6 +274,8 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         .await
         .expect("the subject erasure completes");
     assert_eq!(erased.traces_erased, 2);
+    assert_eq!(erased.model_steps_erased, 1);
+    assert_eq!(erased.tool_effects_erased, 1);
     assert!(!erased.already_erased);
     assert!(erased.key_destroyed, "the durable subject DEK existed");
     assert!(
@@ -220,7 +285,7 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
     assert_eq!(
         store.count_for_subject(&tenant.0, "founder").await.unwrap(),
         0,
-        "no live trace rows remain"
+        "no live trace or replay-journal rows remain"
     );
     assert_eq!(
         store
@@ -229,12 +294,36 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         AgentTraceError::Erased,
         "the durable subject marker refuses a later worker retry before it can recreate a key"
     );
+    assert_eq!(
+        model_steps.begin(
+            &tenant,
+            "33333333-3333-4333-8333-333333333333",
+            "model-turn/0",
+            &"c".repeat(64),
+            "founder",
+        ),
+        Err(ModelStepError::Erased),
+        "erasure is checked before a replay journal can admit another provider call",
+    );
+    assert_eq!(
+        tool_effects.begin(
+            &tenant,
+            "33333333-3333-4333-8333-333333333333",
+            "model-turn/0/tool/0",
+            &"d".repeat(64),
+            "founder",
+        ),
+        Err(ToolEffectError::Erased),
+        "erasure is checked before a replay journal can admit another tool effect",
+    );
     let replay = store
         .erase_for_subject(&tenant.0, "founder")
         .await
         .expect("subject erasure is idempotent");
     assert!(replay.already_erased);
     assert_eq!(replay.traces_erased, 0);
+    assert_eq!(replay.model_steps_erased, 0);
+    assert_eq!(replay.tool_effects_erased, 0);
     assert!(replay.key_unrecoverable);
     assert_eq!(
         holder

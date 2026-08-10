@@ -2,9 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use myelin_agent_model::{ModelClient, ModelError, ModelRequest, ModelResponse};
-use myelin_storage::{
-    AgentModelStepStore, ModelStepBegin, ModelStepCompletion, ModelStepError,
-};
+use myelin_storage::{AgentModelStepStore, ModelStepBegin, ModelStepCompletion, ModelStepError};
 use myelin_tenancy::TenantId;
 
 trait ModelStepJournal: Send + Sync {
@@ -14,6 +12,7 @@ trait ModelStepJournal: Send + Sync {
         run_id: &str,
         step_key: &str,
         request_hash: &str,
+        requested_by: &str,
     ) -> Result<ModelStepBegin, ModelStepError>;
 
     fn complete(
@@ -22,6 +21,7 @@ trait ModelStepJournal: Send + Sync {
         run_id: &str,
         step_key: &str,
         request_hash: &str,
+        requested_by: &str,
         response: &serde_json::Value,
     ) -> Result<ModelStepCompletion, ModelStepError>;
 }
@@ -33,8 +33,9 @@ impl ModelStepJournal for AgentModelStepStore {
         run_id: &str,
         step_key: &str,
         request_hash: &str,
+        requested_by: &str,
     ) -> Result<ModelStepBegin, ModelStepError> {
-        AgentModelStepStore::begin(self, tenant, run_id, step_key, request_hash)
+        AgentModelStepStore::begin(self, tenant, run_id, step_key, request_hash, requested_by)
     }
 
     fn complete(
@@ -43,15 +44,25 @@ impl ModelStepJournal for AgentModelStepStore {
         run_id: &str,
         step_key: &str,
         request_hash: &str,
+        requested_by: &str,
         response: &serde_json::Value,
     ) -> Result<ModelStepCompletion, ModelStepError> {
-        AgentModelStepStore::complete(self, tenant, run_id, step_key, request_hash, response)
+        AgentModelStepStore::complete(
+            self,
+            tenant,
+            run_id,
+            step_key,
+            request_hash,
+            requested_by,
+            response,
+        )
     }
 }
 
 pub(crate) struct DurableModelClient {
     tenant: TenantId,
     run_id: String,
+    requested_by: String,
     journal: Arc<dyn ModelStepJournal>,
     inner: Box<dyn ModelClient + Send + Sync>,
     next_turn: AtomicUsize,
@@ -61,21 +72,24 @@ impl DurableModelClient {
     pub(crate) fn new(
         tenant: TenantId,
         run_id: String,
+        requested_by: String,
         journal: AgentModelStepStore,
         inner: Box<dyn ModelClient + Send + Sync>,
     ) -> Self {
-        Self::with_journal(tenant, run_id, Arc::new(journal), inner)
+        Self::with_journal(tenant, run_id, requested_by, Arc::new(journal), inner)
     }
 
     fn with_journal(
         tenant: TenantId,
         run_id: String,
+        requested_by: String,
         journal: Arc<dyn ModelStepJournal>,
         inner: Box<dyn ModelClient + Send + Sync>,
     ) -> Self {
         Self {
             tenant,
             run_id,
+            requested_by,
             journal,
             inner,
             next_turn: AtomicUsize::new(0),
@@ -99,11 +113,20 @@ impl ModelClient for DurableModelClient {
 
         match self
             .journal
-            .begin(&self.tenant, &self.run_id, &step_key, &request_hash)
+            .begin(
+                &self.tenant,
+                &self.run_id,
+                &step_key,
+                &request_hash,
+                &self.requested_by,
+            )
             .map_err(Self::replay_refused)?
         {
-            ModelStepBegin::Completed(response) => serde_json::from_value(response)
-                .map_err(|error| Self::replay_refused(format!("stored response is corrupt: {error}"))),
+            ModelStepBegin::Completed(response) => {
+                serde_json::from_value(response).map_err(|error| {
+                    Self::replay_refused(format!("stored response is corrupt: {error}"))
+                })
+            }
             ModelStepBegin::InDoubt => Err(Self::replay_refused(
                 "the prior process durably started this turn but did not durably finish it",
             )),
@@ -118,6 +141,7 @@ impl ModelClient for DurableModelClient {
                         &self.run_id,
                         &step_key,
                         &request_hash,
+                        &self.requested_by,
                         &encoded,
                     )
                     .map_err(Self::replay_refused)?;
@@ -145,6 +169,7 @@ mod tests {
             _run_id: &str,
             _step_key: &str,
             request_hash: &str,
+            _requested_by: &str,
         ) -> Result<ModelStepBegin, ModelStepError> {
             let mut state = self.state.lock().unwrap();
             match state.as_ref() {
@@ -166,6 +191,7 @@ mod tests {
             _run_id: &str,
             _step_key: &str,
             request_hash: &str,
+            _requested_by: &str,
             response: &serde_json::Value,
         ) -> Result<ModelStepCompletion, ModelStepError> {
             let mut state = self.state.lock().unwrap();
@@ -212,13 +238,11 @@ mod tests {
         }
     }
 
-    fn client(
-        journal: Arc<MemoryJournal>,
-        calls: Arc<AtomicUsize>,
-    ) -> DurableModelClient {
+    fn client(journal: Arc<MemoryJournal>, calls: Arc<AtomicUsize>) -> DurableModelClient {
         DurableModelClient::with_journal(
             TenantId("acme".into()),
             "run-1".into(),
+            "founder".into(),
             journal,
             Box::new(CountingClient { calls }),
         )
@@ -230,8 +254,14 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let request = ModelRequest::default();
 
-        assert_eq!(client(journal.clone(), calls.clone()).complete(&request), Ok(answer()));
-        assert_eq!(client(journal, calls.clone()).complete(&request), Ok(answer()));
+        assert_eq!(
+            client(journal.clone(), calls.clone()).complete(&request),
+            Ok(answer())
+        );
+        assert_eq!(
+            client(journal, calls.clone()).complete(&request),
+            Ok(answer())
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
             1,
@@ -247,7 +277,13 @@ mod tests {
             .to_hex()
             .to_string();
         assert_eq!(
-            journal.begin(&TenantId("acme".into()), "run-1", "model-turn/0", &request_hash),
+            journal.begin(
+                &TenantId("acme".into()),
+                "run-1",
+                "model-turn/0",
+                &request_hash,
+                "founder",
+            ),
             Ok(ModelStepBegin::Started),
         );
         let calls = Arc::new(AtomicUsize::new(0));
@@ -256,6 +292,10 @@ mod tests {
             .complete(&request)
             .expect_err("an indeterminate prior call is never repeated automatically");
         assert!(matches!(error, ModelError::UnsafeReplay(_)));
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "no second provider call escaped");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no second provider call escaped"
+        );
     }
 }

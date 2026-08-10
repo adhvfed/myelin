@@ -52,9 +52,9 @@ pub use dsr::{
 };
 
 pub use skeleton::{
-    ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, RunWallet, SkeletonAgent,
-    SkeletonAgentRuntime, SkeletonError, SkeletonTelemetry, SpendCapStage, AGENT_RUN_TRACED_EVENT,
-    DEFAULT_MAX_TURNS, SKELETON_STEP_UNIT, WALLET_MIN_BALANCE_FLOOR,
+    requesting_subject, ChildEnv, RunOutcomeKind, RunSubstrate, RunTokenRevoker, RunWallet,
+    SkeletonAgent, SkeletonAgentRuntime, SkeletonError, SkeletonTelemetry, SpendCapStage,
+    AGENT_RUN_TRACED_EVENT, DEFAULT_MAX_TURNS, SKELETON_STEP_UNIT, WALLET_MIN_BALANCE_FLOOR,
 };
 
 pub use metering::{price, ModelRates, PriceError, Priced, LUNA_RATES};
