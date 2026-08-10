@@ -50,6 +50,7 @@ impl PlatformToolCatalogue {
         definitions.extend(crate::full_issues_tool_defs());
         definitions.extend(crate::knowledge_read_tool_defs());
         definitions.extend(crate::knowledge_tool_defs());
+        definitions.extend(crate::chat_read_tool_defs());
         definitions.extend(myelin_chat::tools::chat_tool_defs());
         Self::try_from_definitions(definitions)
     }
@@ -140,7 +141,7 @@ mod tests {
     #[test]
     fn the_platform_catalogue_is_one_sorted_validated_cross_subsystem_surface() {
         let catalogue = PlatformToolCatalogue::platform().unwrap();
-        assert_eq!(catalogue.definitions().len(), 48);
+        assert_eq!(catalogue.definitions().len(), 50);
         let keys = catalogue
             .definitions()
             .iter()
@@ -174,6 +175,8 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap())
             .collect::<BTreeSet<_>>();
         for expected in [
+            "chat.list_conversations",
+            "chat.read_messages",
             "git.merge",
             "git.open_pr",
             "ci.read_run",

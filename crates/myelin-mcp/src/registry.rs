@@ -199,6 +199,8 @@ mod tests {
         assert_eq!(
             names,
             [
+                "chat.list_conversations",
+                "chat.read_messages",
                 "ci.read_log",
                 "ci.read_run",
                 "git.endorse_fork_ci",

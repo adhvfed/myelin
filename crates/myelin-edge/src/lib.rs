@@ -50,7 +50,7 @@ pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
 };
-pub use chat_http::register_chat;
+pub use chat_http::{register_chat, DurableChatReadApi};
 pub use ci_http::{register_ci, DurableCiReadApi};
 pub use device_auth::{device_authorization_migrations, DeviceAuthorizationBroker};
 pub use error::{map_authz_error, EdgeError};

@@ -12,7 +12,8 @@ use myelin_chat::store::{
     StoreError, SystemUlidSource, UlidSource,
 };
 use myelin_chat::{
-    decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body, ChatFreeText,
+    channel_ref, decode_encrypted_body, decrypt_body, encode_encrypted_body, encrypt_body,
+    ChatFreeText,
 };
 use myelin_content::{InlineNode, OBJ};
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
@@ -33,16 +34,23 @@ const DEFAULT_PAGE_LIMIT: u32 = 50;
 const MAX_PAGE_LIMIT: u32 = 100;
 
 #[derive(Clone)]
-struct DurableChatApi {
+pub struct DurableChatReadApi {
     conversations: PgConversationStore,
     messages: PgMessageStore,
     runtime: Handle,
-    event_ids: Arc<dyn IdMinter>,
-    object_ids: Arc<dyn UlidSource>,
     kms: Arc<KmsEngine>,
 }
 
-impl DurableChatApi {
+impl DurableChatReadApi {
+    pub fn new(pool: PgPool, runtime: Handle, kms: Arc<KmsEngine>) -> Self {
+        Self {
+            conversations: PgConversationStore::new(pool.clone()),
+            messages: PgMessageStore::new(pool, "edge", MESSAGE_TABLE),
+            runtime,
+            kms,
+        }
+    }
+
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
         F: Future<Output = Result<T, EdgeError>>,
@@ -82,6 +90,98 @@ impl DurableChatApi {
         Ok(conversation)
     }
 
+    pub fn list_conversations(
+        &self,
+        principal: &Principal,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Value, EdgeError> {
+        validate_query(limit, cursor.as_deref())?;
+        let rows = self.drive(async {
+            self.conversations
+                .list_public(
+                    &principal.tenant.0,
+                    &principal.region.0,
+                    cursor.as_deref(),
+                    limit + 1,
+                )
+                .await
+                .map_err(map_conversation_error)
+        })?;
+        let has_more = rows.len() > limit as usize;
+        let visible = &rows[..rows.len().min(limit as usize)];
+        let next = has_more
+            .then(|| visible.last().map(|row| row.id.conversation_id.clone()))
+            .flatten();
+        let items = visible.iter().map(conversation_json).collect::<Vec<_>>();
+        Ok(page_envelope(json!(items), next, limit as usize))
+    }
+
+    pub fn read_messages(
+        &self,
+        principal: &Principal,
+        conversation_id: &str,
+        limit: u32,
+        before: Option<String>,
+    ) -> Result<Value, EdgeError> {
+        validate_ulid(conversation_id)?;
+        validate_query(limit, before.as_deref())?;
+        let conversation = self.drive(self.public_conversation(principal, conversation_id))?;
+        let range = before
+            .map(|cursor| RangeCursor::Before(MessageId(cursor)))
+            .unwrap_or(RangeCursor::Recent);
+        let messages = self.drive(async {
+            self.messages
+                .range(&conversation.id, range, limit + 1)
+                .await
+                .map_err(map_store_error)
+        })?;
+        let has_more = messages.len() > limit as usize;
+        let start = messages.len().saturating_sub(limit as usize);
+        let visible = &messages[start..];
+        let next = has_more
+            .then(|| visible.first().map(|message| message.message_id.0.clone()))
+            .flatten();
+        let viewer = event_actor_pseudonym(&principal.tenant.0, &principal.principal_id.0);
+        let items = visible
+            .iter()
+            .map(|message| message_json(message, &viewer, self.kms.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(json!({
+            "conversation": conversation_json(&conversation),
+            "items": items,
+            "page": { "next_cursor": next, "limit": limit },
+        }))
+    }
+}
+
+#[derive(Clone)]
+struct DurableChatApi {
+    reads: DurableChatReadApi,
+    event_ids: Arc<dyn IdMinter>,
+    object_ids: Arc<dyn UlidSource>,
+}
+
+impl DurableChatApi {
+    fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
+    where
+        F: Future<Output = Result<T, EdgeError>>,
+    {
+        self.reads.drive(future)
+    }
+
+    fn conversation_id(&self, principal: &Principal, opaque_id: &str) -> ConversationId {
+        self.reads.conversation_id(principal, opaque_id)
+    }
+
+    async fn public_conversation(
+        &self,
+        principal: &Principal,
+        opaque_id: &str,
+    ) -> Result<Conversation, EdgeError> {
+        self.reads.public_conversation(principal, opaque_id).await
+    }
+
     async fn create_public_conversation(
         &self,
         conversation: Conversation,
@@ -91,6 +191,7 @@ impl DurableChatApi {
         now: Timestamp,
     ) -> Result<(Conversation, bool), EdgeError> {
         match self
+            .reads
             .conversations
             .create_co_commit(
                 &conversation,
@@ -105,6 +206,7 @@ impl DurableChatApi {
             Ok(()) => Ok((conversation, true)),
             Err(ConversationError::AlreadyExists(_)) => {
                 if let Some(existing) = self
+                    .reads
                     .conversations
                     .find_public_by_client_nonce(
                         &conversation.id.tenant,
@@ -122,7 +224,8 @@ impl DurableChatApi {
                             .into(),
                     ));
                 }
-                self.conversations
+                self.reads
+                    .conversations
                     .find_public_by_name_topic(
                         &conversation.id.tenant,
                         &conversation.id.region,
@@ -166,33 +269,15 @@ struct PostMessageBody {
 }
 
 struct ConversationListHandler {
-    api: DurableChatApi,
+    api: DurableChatReadApi,
 }
 
 impl Handler for ConversationListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let (limit, cursor) = parse_page_query(&ctx.request.query)?;
-        let rows = self.api.drive(async {
-            self.api
-                .conversations
-                .list_public(
-                    &ctx.principal.tenant.0,
-                    &ctx.principal.region.0,
-                    cursor.as_deref(),
-                    limit + 1,
-                )
-                .await
-                .map_err(map_conversation_error)
-        })?;
-        let has_more = rows.len() > limit as usize;
-        let visible = &rows[..rows.len().min(limit as usize)];
-        let next = has_more
-            .then(|| visible.last().map(|row| row.id.conversation_id.clone()))
-            .flatten();
-        let items = visible.iter().map(conversation_json).collect::<Vec<_>>();
         Ok(no_store(EdgeResponse::json(
             200,
-            &page_envelope(json!(items), next, limit as usize),
+            &self.api.list_conversations(ctx.principal, limit, cursor)?,
         )))
     }
 }
@@ -245,46 +330,18 @@ impl Handler for ConversationCreateHandler {
 }
 
 struct MessageListHandler {
-    api: DurableChatApi,
+    api: DurableChatReadApi,
 }
 
 impl Handler for MessageListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let conversation_id = conversation_param(ctx)?.to_string();
         let (limit, before) = parse_messages_query(&ctx.request.query)?;
-        let conversation = self.api.drive(
-            self.api
-                .public_conversation(ctx.principal, &conversation_id),
-        )?;
-        let range = before
-            .as_deref()
-            .map(|cursor| RangeCursor::Before(MessageId(cursor.to_string())))
-            .unwrap_or(RangeCursor::Recent);
-        let messages = self.api.drive(async {
-            self.api
-                .messages
-                .range(&conversation.id, range, limit + 1)
-                .await
-                .map_err(map_store_error)
-        })?;
-        let has_more = messages.len() > limit as usize;
-        let start = messages.len().saturating_sub(limit as usize);
-        let visible = &messages[start..];
-        let next = has_more
-            .then(|| visible.first().map(|message| message.message_id.0.clone()))
-            .flatten();
-        let viewer = event_actor_pseudonym(&ctx.principal.tenant.0, &ctx.principal.principal_id.0);
-        let items = visible
-            .iter()
-            .map(|message| message_json(message, &viewer, self.api.kms.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(no_store(EdgeResponse::json(
             200,
-            &json!({
-                "conversation": conversation_json(&conversation),
-                "items": items,
-                "page": { "next_cursor": next, "limit": limit },
-            }),
+            &self
+                .api
+                .read_messages(ctx.principal, &conversation_id, limit, before)?,
         )))
     }
 }
@@ -321,14 +378,14 @@ impl Handler for MessagePostHandler {
             author: event_principal.principal_id.0.clone(),
             author_kind,
             body_inline: encrypt_message_column(
-                self.api.kms.as_ref(),
+                self.api.reads.kms.as_ref(),
                 ctx.principal,
                 &event_principal.principal_id.0,
                 ChatFreeText::BodyInline,
                 body.content.as_bytes(),
             )?,
             body_nodes: encrypt_message_column(
-                self.api.kms.as_ref(),
+                self.api.reads.kms.as_ref(),
                 ctx.principal,
                 &event_principal.principal_id.0,
                 ChatFreeText::BodyNodes,
@@ -343,6 +400,7 @@ impl Handler for MessagePostHandler {
         let now = now_timestamp();
         let message_id = self.api.drive(async {
             self.api
+                .reads
                 .messages
                 .append_structured_co_commit(
                     self.api.object_ids.as_ref(),
@@ -370,20 +428,18 @@ pub fn register_chat(
     runtime: Handle,
     kms: Arc<KmsEngine>,
 ) -> GatewayBuilder {
+    let reads = DurableChatReadApi::new(pool, runtime, kms);
     let api = DurableChatApi {
-        conversations: PgConversationStore::new(pool.clone()),
-        messages: PgMessageStore::new(pool, "edge", MESSAGE_TABLE),
-        runtime,
+        reads: reads.clone(),
         event_ids: Arc::new(myelin_events::UlidMinter::new()),
         object_ids: Arc::new(SystemUlidSource::new()),
-        kms,
     };
     builder
         .route(
             Method::Get,
             "/v1/chat/conversations",
             "chat.conversations.list",
-            Arc::new(ConversationListHandler { api: api.clone() }),
+            Arc::new(ConversationListHandler { api: reads.clone() }),
         )
         .route(
             Method::Post,
@@ -395,7 +451,7 @@ pub fn register_chat(
             Method::Get,
             "/v1/chat/conversations/{conversation}/messages",
             "chat.messages.list",
-            Arc::new(MessageListHandler { api: api.clone() }),
+            Arc::new(MessageListHandler { api: reads }),
         )
         .route(
             Method::Post,
@@ -441,7 +497,6 @@ fn parse_query(query: &str, cursor_name: &str) -> Result<(u32, Option<String>), 
                     })?);
                 }
                 name if name == cursor_name && cursor.is_none() => {
-                    validate_ulid(value)?;
                     cursor = Some(value.to_string());
                 }
                 "limit" => return Err(EdgeError::BadRequest("duplicate Chat limit".into())),
@@ -459,12 +514,20 @@ fn parse_query(query: &str, cursor_name: &str) -> Result<(u32, Option<String>), 
         }
     }
     let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    validate_query(limit, cursor.as_deref())?;
+    Ok((limit, cursor))
+}
+
+fn validate_query(limit: u32, cursor: Option<&str>) -> Result<(), EdgeError> {
     if !(1..=MAX_PAGE_LIMIT).contains(&limit) {
         return Err(EdgeError::BadRequest(
             "Chat limit must be between 1 and 100".into(),
         ));
     }
-    Ok((limit, cursor))
+    if let Some(cursor) = cursor {
+        validate_ulid(cursor)?;
+    }
+    Ok(())
 }
 
 fn conversation_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
@@ -602,6 +665,7 @@ fn require_empty_query(ctx: &HandlerCtx<'_>) -> Result<(), EdgeError> {
 fn conversation_json(conversation: &Conversation) -> Value {
     json!({
         "id": conversation.id.conversation_id,
+        "ref": channel_ref(&conversation.id).0,
         "channel": conversation.name,
         "topic": conversation.topic,
         "linked_ref": conversation.linked_ref,

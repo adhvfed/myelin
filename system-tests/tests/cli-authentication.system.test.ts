@@ -394,6 +394,8 @@ describe("the CLI authentication journey", () => {
           "issues.view",
           "knowledge.list_pages",
           "knowledge.read_page",
+          "chat.list_conversations",
+          "chat.read_messages",
         ]),
       );
       expect(mcpManifest.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
@@ -423,6 +425,10 @@ describe("the CLI authentication journey", () => {
         "knowledge.list_pages",
         "--tool",
         "knowledge.read_page",
+        "--tool",
+        "chat.list_conversations",
+        "--tool",
+        "chat.read_messages",
       );
       expect(createAgent.exitCode, createAgent.stderr).toBe(0);
       const activated = JSON.parse(createAgent.stdout) as {
@@ -450,6 +456,8 @@ describe("the CLI authentication journey", () => {
           on_behalf_of: systemTestConfig.principal,
           status: "active",
           selected_tools: [
+            { name: "chat.list_conversations", version: 1 },
+            { name: "chat.read_messages", version: 1 },
             { name: "ci.read_run", version: 1 },
             { name: "git.open_pr", version: 1 },
             { name: "issues.list", version: 1 },
@@ -459,6 +467,7 @@ describe("the CLI authentication journey", () => {
           ],
           grants: expect.arrayContaining([
             "agent.tools.read",
+            "chat.read",
             "edge.identity.read",
             "issue.view",
             "knowledge.read",
@@ -483,6 +492,8 @@ describe("the CLI authentication journey", () => {
           "issues.view",
           "knowledge.list_pages",
           "knowledge.read_page",
+          "chat.list_conversations",
+          "chat.read_messages",
         ]),
       );
       for (const tool of activated.agent.selected_tools) {
@@ -513,6 +524,10 @@ describe("the CLI authentication journey", () => {
         "knowledge.list_pages",
         "--tool",
         "knowledge.read_page",
+        "--tool",
+        "chat.list_conversations",
+        "--tool",
+        "chat.read_messages",
       );
       expect(replayAgent.exitCode, replayAgent.stderr).toBe(0);
       expect(JSON.parse(replayAgent.stdout)).toMatchObject({
@@ -578,6 +593,8 @@ describe("the CLI authentication journey", () => {
           principal_id: activated.agent.principal_id,
           trigger_actor: systemTestConfig.principal,
           selected_tools: [
+            { name: "chat.list_conversations", version: 1 },
+            { name: "chat.read_messages", version: 1 },
             { name: "ci.read_run", version: 1 },
             { name: "git.open_pr", version: 1 },
             { name: "issues.list", version: 1 },
@@ -647,6 +664,8 @@ describe("the CLI authentication journey", () => {
         (tool, index) => record(tool, `MCP tool ${index}`),
       );
       expect(discoveredTools.map((tool) => string(tool.name, "MCP tool name"))).toEqual([
+        "chat.list_conversations",
+        "chat.read_messages",
         "ci.read_run",
         "git.open_pr",
         "issues.list",
@@ -656,21 +675,21 @@ describe("the CLI authentication journey", () => {
       ]);
       expect(discoveredTools.at(0)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["run_id"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(1)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["repo", "title"],
+        required: ["conversation_id"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(2)?.inputSchema).toMatchObject({
         type: "object",
+        required: ["run_id"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(3)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["issue_id"],
+        required: ["repo", "title"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(4)?.inputSchema).toMatchObject({
@@ -678,6 +697,15 @@ describe("the CLI authentication journey", () => {
         additionalProperties: false,
       });
       expect(discoveredTools.at(5)?.inputSchema).toMatchObject({
+        type: "object",
+        required: ["issue_id"],
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(6)?.inputSchema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(7)?.inputSchema).toMatchObject({
         type: "object",
         required: ["page_id"],
         additionalProperties: false,
@@ -757,6 +785,8 @@ describe("the CLI authentication journey", () => {
         "CLI MCP tools/list tools",
       ).map((tool, index) => string(record(tool, `CLI MCP tool ${index}`).name, "tool name"));
       expect(bridgeTools).toEqual([
+        "chat.list_conversations",
+        "chat.read_messages",
         "ci.read_run",
         "git.open_pr",
         "issues.list",
@@ -981,10 +1011,51 @@ describe("the CLI authentication journey", () => {
       expect(pageEnvelope).toMatchObject({ created: true, durable: true });
       expect(knowledgePage).toMatchObject({ title: knowledgeTitle, visibility: "team" });
 
-      // Once resumed, the collaborator reads the founder's issue and durable delivery context
+      const chatChannel = `delivery-${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+      const chatTopic = uniqueName("Release coordination");
+      const contextualConversation = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        `cli-context-chat-${randomUUID()}`,
+        "chat",
+        "create",
+        chatChannel,
+        "--topic",
+        chatTopic,
+      );
+      expect(contextualConversation.exitCode, contextualConversation.stderr).toBe(0);
+      const conversationEnvelope = record(
+        JSON.parse(contextualConversation.stdout),
+        "CLI Chat conversation",
+      );
+      const conversation = record(conversationEnvelope.conversation, "CLI Chat channel");
+      const conversationId = string(conversation.id, "CLI Chat conversation id");
+      expect(conversationEnvelope).toMatchObject({ durable: true });
+      expect(conversation).toMatchObject({
+        channel: chatChannel,
+        topic: chatTopic,
+        ref: `myelin://${systemTestConfig.tenant}/chat/channel/${conversationId}`,
+      });
+
+      const chatMessage = uniqueName("The release train is ready");
+      const sentMessage = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        `cli-context-message-${randomUUID()}`,
+        "chat",
+        "send",
+        conversationId,
+        chatMessage,
+      );
+      expect(sentMessage.exitCode, sentMessage.stderr).toBe(0);
+      expect(JSON.parse(sentMessage.stdout)).toMatchObject({ durable: true });
+
+      // Once resumed, the collaborator reads the founder's issue, product spec, and release room
       // through Myelin itself. The run credential and the founder's live permissions intersect at
-      // Edge; no Linear or Notion token, copied browser session, tenant selector, or provider setup
-      // reaches the agent.
+      // Edge; no Linear, Notion, or Slack token, copied browser session, tenant selector, or
+      // provider setup reaches the agent.
       const workAfterResume = await systemClient.json(
         `/v1/agents/${activated.agent.id}/runs`,
         {
@@ -1047,6 +1118,38 @@ describe("the CLI authentication journey", () => {
           expect.objectContaining({ type: "heading", markdown: "Problem", state: "active" }),
         ]),
       );
+
+      const conversations = await askAgent(resumedRun, 7, "chat.list_conversations", {
+        limit: 10,
+      });
+      expect(array(conversations.items, "agent-visible Chat conversations")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: conversationId,
+            channel: chatChannel,
+            topic: chatTopic,
+            ref: `myelin://${systemTestConfig.tenant}/chat/channel/${conversationId}`,
+          }),
+        ]),
+      );
+      expect(conversations.page).toMatchObject({ limit: 10 });
+
+      const chatHistory = await askAgent(resumedRun, 8, "chat.read_messages", {
+        conversation_id: conversationId,
+        limit: 10,
+      });
+      expect(chatHistory.conversation).toMatchObject({
+        id: conversationId,
+        channel: chatChannel,
+        topic: chatTopic,
+        ref: `myelin://${systemTestConfig.tenant}/chat/channel/${conversationId}`,
+      });
+      expect(array(chatHistory.items, "agent-visible Chat messages")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ content: chatMessage, state: "active" }),
+        ]),
+      );
+      expect(chatHistory.page).toMatchObject({ limit: 10 });
 
       // Retirement is the irreversible counterpart: active work is torn down and neither the
       // CLI nor another client can quietly revive the durable identity.

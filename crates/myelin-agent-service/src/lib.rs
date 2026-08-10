@@ -1,6 +1,7 @@
 pub mod app;
 pub mod card_text;
 pub mod catalogue;
+pub mod chat_read_tools;
 pub mod chat_tools;
 pub mod ci_tools;
 pub mod cost_gate;
@@ -122,6 +123,8 @@ pub use issues_agents::{
 pub use issues_read_tools::{issues_read_tool_defs, LIST_ISSUES_TOOL, VIEW_ISSUE_TOOL};
 
 pub use knowledge_read_tools::{knowledge_read_tool_defs, LIST_PAGES_TOOL, READ_PAGE_TOOL};
+
+pub use chat_read_tools::{chat_read_tool_defs, LIST_CONVERSATIONS_TOOL, READ_MESSAGES_TOOL};
 
 pub use chat_tools::{
     chat_tool_defs, landing_requires_approval, post_message_tool_def, post_required_caps,

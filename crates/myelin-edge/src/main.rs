@@ -11,10 +11,11 @@ use myelin_edge::{
     register_tools, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
     AgentMcpAuthority, AgentMcpResources, AgentMcpServices, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
-    DeviceAuthorizationBroker, DurableCiReadApi, DurableGitBackend, DurableIssueReadApi,
-    DurableKnowledgeReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
-    ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
-    ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
+    DeviceAuthorizationBroker, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
+    DurableIssueReadApi, DurableKnowledgeReadApi, Gateway, GitDatabaseProviders,
+    IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
+    SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
+    TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
@@ -1150,6 +1151,11 @@ async fn serve(
                 mcp_ci,
                 DurableIssueReadApi::new(issue_store.clone(), handle.clone()),
                 DurableKnowledgeReadApi::new(
+                    provider.db_pool().clone(),
+                    handle.clone(),
+                    kms.clone(),
+                ),
+                DurableChatReadApi::new(
                     provider.db_pool().clone(),
                     handle.clone(),
                     kms.clone(),

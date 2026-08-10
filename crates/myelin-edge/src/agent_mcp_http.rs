@@ -24,8 +24,8 @@ use crate::gateway::GatewayBuilder;
 use crate::repo_authz::{RepoAuthorizer, RepoPermission};
 use crate::request::EdgeResponse;
 use crate::{
-    DurableCiReadApi, DurableGitBackend, DurableIssueReadApi, DurableKnowledgeReadApi, GitEffectApi,
-    McpReadExecutor,
+    DurableChatReadApi, DurableCiReadApi, DurableGitBackend, DurableIssueReadApi,
+    DurableKnowledgeReadApi, GitEffectApi, McpReadExecutor,
 };
 
 #[derive(Clone)]
@@ -61,6 +61,7 @@ pub struct AgentMcpResources {
     ci: DurableCiReadApi,
     issues: DurableIssueReadApi,
     knowledge: DurableKnowledgeReadApi,
+    chat: DurableChatReadApi,
 }
 
 impl AgentMcpResources {
@@ -69,12 +70,14 @@ impl AgentMcpResources {
         ci: DurableCiReadApi,
         issues: DurableIssueReadApi,
         knowledge: DurableKnowledgeReadApi,
+        chat: DurableChatReadApi,
     ) -> Self {
         Self {
             git,
             ci,
             issues,
             knowledge,
+            chat,
         }
     }
 }
@@ -219,7 +222,8 @@ impl Handler for AgentMcpHandler {
                 delegator,
             )
             .with_issues(self.services.resources.issues.clone())
-            .with_knowledge(self.services.resources.knowledge.clone()),
+            .with_knowledge(self.services.resources.knowledge.clone())
+            .with_chat(self.services.resources.chat.clone()),
         );
         let server = McpServer::with_router_and_reads(registry, router, reads);
         let frame = std::str::from_utf8(&ctx.request.body)

@@ -84,6 +84,7 @@ myelin tool show ci.read_run
 myelin agent create "Review companion" --tool ci.read_run --tool git.open_pr \
   --tool issues.list --tool issues.view \
   --tool knowledge.list_pages --tool knowledge.read_page \
+  --tool chat.list_conversations --tool chat.read_messages \
   --idempotency-key review-companion
 myelin mcp serve --as 22222222-2222-2222-2222-222222222222
 myelin agent suspend 22222222-2222-2222-2222-222222222222 \

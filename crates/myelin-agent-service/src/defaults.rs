@@ -51,6 +51,8 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("chat", "post") => false,
         ("chat", "reply_in_thread") => false,
         ("chat", "react") => false,
+        ("chat", "list_conversations") => false,
+        ("chat", "read_messages") => false,
         ("chat", "start_dm") => false,
         ("chat", "create_channel") => true,
         ("chat", "invite") => true,
@@ -286,6 +288,12 @@ mod tests {
             assert!(
                 !requires_approval_default("knowledge", read),
                 "knowledge.{read} is read-only → NOT gated"
+            );
+        }
+        for read in ["list_conversations", "read_messages"] {
+            assert!(
+                !requires_approval_default("chat", read),
+                "chat.{read} is read-only → NOT gated"
             );
         }
 

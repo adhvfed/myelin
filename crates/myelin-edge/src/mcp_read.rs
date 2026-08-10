@@ -1,4 +1,6 @@
-use crate::{DurableCiReadApi, DurableIssueReadApi, DurableKnowledgeReadApi, EdgeError};
+use crate::{
+    DurableChatReadApi, DurableCiReadApi, DurableIssueReadApi, DurableKnowledgeReadApi, EdgeError,
+};
 use myelin_ci_controlplane::surfacing_store::CI_LOG_RANGE_DEFAULT;
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
@@ -18,6 +20,7 @@ pub struct McpReadExecutor {
     ci: DurableCiReadApi,
     issues: Option<DurableIssueReadApi>,
     knowledge: Option<DurableKnowledgeReadApi>,
+    chat: Option<DurableChatReadApi>,
     authority: Arc<RunTokenAuthorizer>,
     delegator: Principal,
 }
@@ -32,6 +35,7 @@ impl McpReadExecutor {
             ci,
             issues: None,
             knowledge: None,
+            chat: None,
             authority,
             delegator,
         }
@@ -44,6 +48,11 @@ impl McpReadExecutor {
 
     pub fn with_knowledge(mut self, knowledge: DurableKnowledgeReadApi) -> Self {
         self.knowledge = Some(knowledge);
+        self
+    }
+
+    pub fn with_chat(mut self, chat: DurableChatReadApi) -> Self {
+        self.chat = Some(chat);
         self
     }
 }
@@ -128,6 +137,31 @@ impl DirectReadExecutor for McpReadExecutor {
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
                     .read_page(&self.delegator, page_id)
+                    .map_err(map_edge_error)
+            }
+            "chat.list_conversations" => {
+                exact_fields(arguments, &[], &["limit", "cursor"])?;
+                let limit = optional_u32(arguments, "limit")?.unwrap_or(50);
+                let cursor = optional_string(arguments, "cursor")?.map(str::to_string);
+                self.chat
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .list_conversations(&self.delegator, limit, cursor)
+                    .map_err(map_edge_error)
+            }
+            "chat.read_messages" => {
+                exact_fields(
+                    arguments,
+                    &["conversation_id"],
+                    &["conversation_id", "limit", "before"],
+                )?;
+                let conversation_id = required_string(arguments, "conversation_id")?;
+                let limit = optional_u32(arguments, "limit")?.unwrap_or(50);
+                let before = optional_string(arguments, "before")?.map(str::to_string);
+                self.chat
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .read_messages(&self.delegator, conversation_id, limit, before)
                     .map_err(map_edge_error)
             }
             _ => Err(DirectReadError::Unavailable),
