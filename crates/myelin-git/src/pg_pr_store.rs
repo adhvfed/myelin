@@ -1103,7 +1103,7 @@ impl PgPrStore {
         record.author_subject_id = normalized_subject_id(principal)?;
         let actor_subject_id = record.author_subject_id.clone();
         record.number = 0;
-        let payload_hash = payload_hash(&record)?;
+        let payload_hash = open_payload_hash(&record)?;
         let ctx = self.emit_context(scope, principal)?;
         self.open_inner(
             scope,
@@ -1129,7 +1129,7 @@ impl PgPrStore {
         record.author_subject_id = normalized_subject_id(principal)?;
         let actor_subject_id = record.author_subject_id.clone();
         record.number = 0;
-        let payload_hash = payload_hash(&record)?;
+        let payload_hash = open_payload_hash(&record)?;
         let ctx = self.emit_context(scope, principal)?;
         self.open_inner(
             scope,
@@ -2703,6 +2703,19 @@ fn payload_hash(value: &impl serde::Serialize) -> Result<String, DurableError> {
     Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
+/// Hash only the caller's durable open intent.
+///
+/// Edge stamps a fresh observation time onto every request. Those timestamps belong in the PR
+/// record, but they must not make a retry with the same idempotency key look like a different
+/// command after the wall clock advances.
+fn open_payload_hash(record: &PrRecord) -> Result<String, DurableError> {
+    let mut intent = record.clone();
+    intent.number = 0;
+    intent.created_at = None;
+    intent.updated_at = None;
+    payload_hash(&intent)
+}
+
 fn merge_payload_hash(number: u64, intent: &MergeIntent) -> Result<String, DurableError> {
     payload_hash(&(
         number,
@@ -3248,6 +3261,37 @@ mod tests {
         assert!(validate_merge_intent(&intent).is_ok());
         intent.operation_id.clear();
         assert!(validate_merge_intent(&intent).is_err());
+    }
+
+    #[test]
+    fn open_command_hash_survives_a_retry_in_a_later_second() {
+        let pull_request = crate::lifecycle::PullRequest::open(
+            0,
+            "refs/heads/main",
+            "refs/heads/feature",
+            "agent@acme.noreply",
+            true,
+        );
+        let mut first = PrRecord::open(&pull_request, "a".repeat(40));
+        first.title = "Repair the release".into();
+        first.head_repo_slug = "core".into();
+        first.created_at = Some(100);
+        first.updated_at = Some(100);
+        let mut retry = first.clone();
+        retry.created_at = Some(101);
+        retry.updated_at = Some(101);
+
+        assert_eq!(
+            open_payload_hash(&first).unwrap(),
+            open_payload_hash(&retry).unwrap(),
+            "server observation time is not caller intent"
+        );
+        retry.title = "A different change".into();
+        assert_ne!(
+            open_payload_hash(&first).unwrap(),
+            open_payload_hash(&retry).unwrap(),
+            "a genuinely different open intent still conflicts"
+        );
     }
 
     #[test]
