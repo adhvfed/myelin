@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use myelin_agent::{EffectKind, ToolCall, ToolDef, ToolName, ToolResult, ToolSchema};
-use myelin_agent_service::{ToolExecError, ToolExecutor};
+use myelin_agent_service::{ToolExecError, ToolExecutionContext, ToolExecutor};
 use myelin_git::check_status::GitOid;
 use myelin_git::check_status_store::PgCheckStatusProjection;
 use myelin_storage::{SubstrateProvider, TenantScope};
@@ -73,7 +73,12 @@ impl GitCheckStatusReadExecutor {
 }
 
 impl ToolExecutor for GitCheckStatusReadExecutor {
-    fn execute(&self, def: &ToolDef, call: &ToolCall) -> Result<ToolResult, ToolExecError> {
+    fn execute(
+        &self,
+        _context: &ToolExecutionContext<'_>,
+        def: &ToolDef,
+        call: &ToolCall,
+    ) -> Result<ToolResult, ToolExecError> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
 
         if def.effect_kind != EffectKind::Read {
@@ -83,12 +88,24 @@ impl ToolExecutor for GitCheckStatusReadExecutor {
             )));
         }
 
-        let repo = call.arguments.get("repo").and_then(|v| v.as_str()).ok_or_else(|| {
-            ToolExecError::Failed("git.read_check_status requires a string `repo` argument".into())
-        })?;
-        let commit = call.arguments.get("commit").and_then(|v| v.as_str()).ok_or_else(|| {
-            ToolExecError::Failed("git.read_check_status requires a string `commit` argument".into())
-        })?;
+        let repo = call
+            .arguments
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ToolExecError::Failed(
+                    "git.read_check_status requires a string `repo` argument".into(),
+                )
+            })?;
+        let commit = call
+            .arguments
+            .get("commit")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                ToolExecError::Failed(
+                    "git.read_check_status requires a string `commit` argument".into(),
+                )
+            })?;
 
         let rows = self
             .projection
@@ -114,7 +131,10 @@ impl ToolExecutor for GitCheckStatusReadExecutor {
                 )
             })
             .collect();
-        let text = format!("check status for commit {commit} in repo {repo}: {}", parts.join("; "));
+        let text = format!(
+            "check status for commit {commit} in repo {repo}: {}",
+            parts.join("; ")
+        );
 
         *self.last_result.lock().expect("last_result lock") = Some(text.clone());
         Ok(ToolResult(text))

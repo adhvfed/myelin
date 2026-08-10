@@ -110,7 +110,12 @@ struct FakeCheckReadExecutor {
 }
 
 impl ToolExecutor for FakeCheckReadExecutor {
-    fn execute(&self, def: &ToolDef, call: &ToolCall) -> Result<ToolResult, ToolExecError> {
+    fn execute(
+        &self,
+        _context: &myelin_agent_service::ToolExecutionContext<'_>,
+        def: &ToolDef,
+        call: &ToolCall,
+    ) -> Result<ToolResult, ToolExecError> {
         self.invocations.fetch_add(1, Ordering::SeqCst);
         assert_eq!(def.effect_kind, EffectKind::Read);
         let repo = call.arguments.get("repo").and_then(|v| v.as_str()).unwrap();

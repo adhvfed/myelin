@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use myelin_agent::{ToolCall, ToolDef, ToolName, ToolResult, ToolSchema};
 use myelin_agent_model::{LunaClient, ModelClient, ModelError};
-use myelin_agent_service::{catalogue_cursor, PlatformToolCatalogue, ToolExecError, ToolExecutor};
+use myelin_agent_service::{
+    catalogue_cursor, PlatformToolCatalogue, ToolExecError, ToolExecutionContext, ToolExecutor,
+};
 use myelin_events::{OutboxStore, UlidMinter};
 use myelin_flow::WfJournal;
 use myelin_storage::reserve_settle::{CostLedger, ReservationState, RunId as CostRunId};
@@ -17,7 +19,12 @@ use crate::{
 struct HostedToolBrokerUnavailable;
 
 impl ToolExecutor for HostedToolBrokerUnavailable {
-    fn execute(&self, definition: &ToolDef, _call: &ToolCall) -> Result<ToolResult, ToolExecError> {
+    fn execute(
+        &self,
+        _context: &ToolExecutionContext<'_>,
+        definition: &ToolDef,
+        _call: &ToolCall,
+    ) -> Result<ToolResult, ToolExecError> {
         Err(ToolExecError::Failed(format!(
             "hosted tool broker is not connected for `{}`; the call was not executed",
             definition.canonical_name()

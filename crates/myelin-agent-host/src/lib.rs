@@ -294,7 +294,12 @@ impl ToolSurface for NoToolSurface {
 pub struct NoToolExecutor;
 
 impl ToolExecutor for NoToolExecutor {
-    fn execute(&self, def: &ToolDef, _call: &ToolCall) -> Result<ToolResult, ToolExecError> {
+    fn execute(
+        &self,
+        _context: &myelin_agent_service::ToolExecutionContext<'_>,
+        def: &ToolDef,
+        _call: &ToolCall,
+    ) -> Result<ToolResult, ToolExecError> {
         Err(ToolExecError::Failed(format!(
             "no-tools run attempted to execute `{}` (bug)",
             def.name.0
@@ -388,7 +393,12 @@ impl<'a> CapEnforcingExecutor<'a> {
 }
 
 impl ToolExecutor for CapEnforcingExecutor<'_> {
-    fn execute(&self, def: &ToolDef, call: &ToolCall) -> Result<ToolResult, ToolExecError> {
+    fn execute(
+        &self,
+        context: &myelin_agent_service::ToolExecutionContext<'_>,
+        def: &ToolDef,
+        call: &ToolCall,
+    ) -> Result<ToolResult, ToolExecError> {
         for cap in &def.required_caps {
             let resource = (self.resource_of)(def, call).ok_or_else(|| {
                 ToolExecError::Failed(format!(
@@ -418,7 +428,7 @@ impl ToolExecutor for CapEnforcingExecutor<'_> {
                 }
             }
         }
-        self.inner.execute(def, call)
+        self.inner.execute(context, def, call)
     }
 }
 

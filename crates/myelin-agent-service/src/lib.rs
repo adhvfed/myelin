@@ -61,7 +61,7 @@ pub use metering::{price, ModelRates, PriceError, Priced, LUNA_RATES};
 
 #[cfg(any(test, feature = "test-support"))]
 pub use tool_exec::{MockToolExecutor, MockToolSurface};
-pub use tool_exec::{ToolExecError, ToolExecutor};
+pub use tool_exec::{ToolExecError, ToolExecutionContext, ToolExecutor};
 
 pub use cost_gate::{runaway_brain, AgentFabricCostSignal, RunawaySelfLimiter, RunawayStep};
 

@@ -7,10 +7,10 @@ use myelin_agent_host::{
     RunSubstrateWiring, ToolCatalogue, Tools, GIT_READ_CHECK_STATUS_TOOL,
 };
 use myelin_agent_model::{LunaClient, ModelError};
-use myelin_agent_service::ToolExecutor;
+use myelin_agent_service::{ToolExecutionContext, ToolExecutor};
 use myelin_config::MyelinConfig;
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
-use myelin_flow::WfJournal;
+use myelin_flow::{RunTokenHandle, WfJournal};
 use myelin_git::check_status_store::{CHECK_STATUS_TABLE, CREATE_CHECK_STATUS_DDL};
 use myelin_identity::{
     IdentityService, ObjectId, Principal, PrincipalId, PrincipalKind, RelName, RelationTuple,
@@ -378,7 +378,16 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     );
     let denied_gate =
         CapEnforcingExecutor::for_git_read_tool(no_grant, verify_agent.clone(), &probe_exec);
+    let probe_token = RunTokenHandle {
+        token: "unused-capability-probe".into(),
+        jti: "unused-capability-probe".into(),
+        ttl_secs: 1,
+    };
     let denied = denied_gate.execute(
+        &ToolExecutionContext {
+            run_id: &run_id,
+            run_token: &probe_token,
+        },
         &git_check_status_read_tool_def(),
         &ToolCall {
             id: ToolCallId("cap-deny-probe".into()),

@@ -1,4 +1,5 @@
 use myelin_agent::{ToolCall, ToolDef, ToolResult};
+use myelin_flow::RunTokenHandle;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolExecError {
@@ -16,7 +17,17 @@ impl core::fmt::Display for ToolExecError {
 impl std::error::Error for ToolExecError {}
 
 pub trait ToolExecutor {
-    fn execute(&self, def: &ToolDef, call: &ToolCall) -> Result<ToolResult, ToolExecError>;
+    fn execute(
+        &self,
+        context: &ToolExecutionContext<'_>,
+        def: &ToolDef,
+        call: &ToolCall,
+    ) -> Result<ToolResult, ToolExecError>;
+}
+
+pub struct ToolExecutionContext<'a> {
+    pub run_id: &'a str,
+    pub run_token: &'a RunTokenHandle,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -90,7 +101,12 @@ impl Default for MockToolExecutor {
 
 #[cfg(any(test, feature = "test-support"))]
 impl ToolExecutor for MockToolExecutor {
-    fn execute(&self, _def: &ToolDef, call: &ToolCall) -> Result<ToolResult, ToolExecError> {
+    fn execute(
+        &self,
+        _context: &ToolExecutionContext<'_>,
+        _def: &ToolDef,
+        call: &ToolCall,
+    ) -> Result<ToolResult, ToolExecError> {
         self.seen.lock().unwrap().push(call.clone());
         match self.scripted.lock().unwrap().pop_front() {
             Some(result) => result,
@@ -126,6 +142,18 @@ mod tests {
         }
     }
 
+    fn context() -> ToolExecutionContext<'static> {
+        let token = Box::leak(Box::new(RunTokenHandle {
+            token: "secret-test-token".into(),
+            jti: "test-jti".into(),
+            ttl_secs: 60,
+        }));
+        ToolExecutionContext {
+            run_id: "test-run",
+            run_token: token,
+        }
+    }
+
     #[test]
     fn mock_tool_surface_resolves_registered_tools() {
         let mut cat = MockToolSurface::new();
@@ -147,13 +175,17 @@ mod tests {
         ]);
         let d = def("t");
 
-        assert_eq!(exec.execute(&d, &call("t")), Ok(ToolResult("first".into())));
+        let context = context();
         assert_eq!(
-            exec.execute(&d, &call("t")),
+            exec.execute(&context, &d, &call("t")),
+            Ok(ToolResult("first".into()))
+        );
+        assert_eq!(
+            exec.execute(&context, &d, &call("t")),
             Err(ToolExecError::Failed("boom".into()))
         );
         assert_eq!(
-            exec.execute(&d, &call("search")),
+            exec.execute(&context, &d, &call("search")),
             Ok(ToolResult("mock-exec:search:ok".into()))
         );
 
