@@ -514,6 +514,14 @@ fn safe_cli_uuid(value: &str) -> bool {
         })
 }
 
+fn safe_cli_event_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
 fn is_issue(value: &Value) -> bool {
     value.get("id").and_then(Value::as_str).is_some()
         && value.get("key").and_then(Value::as_str).is_some()
@@ -548,7 +556,22 @@ fn render_notification(value: &Value) -> String {
         .filter(|count| *count > 1)
         .map(|count| format!(" ×{count}"))
         .unwrap_or_default();
-    format!("{marker} {reason}{count}  {subject}  ({id})")
+    let mut rendered = format!("{marker} {reason}{count}  {subject}  ({id})");
+    if let Some(action) = value.get("action").and_then(Value::as_object) {
+        let automation_id = action.get("automation_id").and_then(Value::as_str);
+        let event_id = action.get("event_id").and_then(Value::as_str);
+        if action.get("kind").and_then(Value::as_str) == Some("automation_firing_approval")
+            && automation_id.is_some_and(safe_cli_uuid)
+            && event_id.is_some_and(safe_cli_event_id)
+        {
+            rendered.push_str(&format!(
+                "\n  decide: myelin automation approve {} {}  (or: reject)",
+                automation_id.unwrap(),
+                event_id.unwrap(),
+            ));
+        }
+    }
+    rendered
 }
 
 fn render_issue(value: &Value) -> String {
@@ -756,6 +779,39 @@ mod tests {
             render(&json!({"id": "item-1", "state": "read"}), false),
             "item-1 [read]\n"
         );
+    }
+
+    #[test]
+    fn automation_approval_notification_carries_a_copyable_safe_decision() {
+        let item = json!({
+            "id": "approval-1",
+            "reason": "approval_requested",
+            "subject": "myelin://acme/issue/issue/ENG-41",
+            "state": "unread",
+            "action": {
+                "kind": "automation_firing_approval",
+                "automation_id": "44444444-4444-4444-8444-444444444444",
+                "event_id": "issue-owner-updated-1",
+            },
+        });
+        let output = render(&item, false);
+        assert!(output.contains(
+            "myelin automation approve 44444444-4444-4444-8444-444444444444 \
+             issue-owner-updated-1"
+        ));
+
+        let unsafe_item = json!({
+            "id": "approval-2",
+            "reason": "approval_requested",
+            "subject": "myelin://acme/issue/issue/ENG-42",
+            "state": "unread",
+            "action": {
+                "kind": "automation_firing_approval",
+                "automation_id": "44444444-4444-4444-8444-444444444444",
+                "event_id": "event; touch /tmp/surprise",
+            },
+        });
+        assert!(!render(&unsafe_item, false).contains("decide:"));
     }
 
     #[test]

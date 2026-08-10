@@ -7,6 +7,7 @@ use myelin_substrate::{
 use myelin_tenancy::TenantId;
 use serde::{Deserialize, Serialize};
 
+pub mod automation_approval;
 pub mod cli;
 pub mod cross_cell;
 pub mod define_rule;
@@ -31,6 +32,11 @@ pub mod storm_control;
 pub mod surge;
 pub mod write_fanout;
 pub mod watch;
+
+pub use automation_approval::{
+    automation_approval_action, automation_approval_item_id, pending_automation_approval,
+    AutomationApprovalAction,
+};
 
 pub use cli::{
     inbox_list, inbox_read, inbox_show, inbox_snooze, inbox_watch, notify_prefs, notify_prefs_set,

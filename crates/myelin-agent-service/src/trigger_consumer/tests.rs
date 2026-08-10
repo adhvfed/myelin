@@ -13,7 +13,9 @@ use myelin_storage::{
 };
 use myelin_tenancy::{Region, TenantId};
 
-use super::{GovernedTriggerConsumer, TriggerBindingStore, TriggerOwnerVisibility};
+use super::{
+    GovernedTriggerConsumer, TriggerApprovalInbox, TriggerBindingStore, TriggerOwnerVisibility,
+};
 
 struct RecordingStore {
     bindings: Vec<DurableAgentTriggerBinding>,
@@ -46,18 +48,59 @@ impl TriggerBindingStore for RecordingStore {
             .lock()
             .unwrap()
             .push((binding_id.into(), envelope.event_id.0.clone()));
+        let state = self
+            .bindings
+            .iter()
+            .find(|binding| binding.binding_id == binding_id)
+            .filter(|binding| binding.require_human_approval)
+            .map_or(AgentTriggerFiringState::Queued, |_| {
+                AgentTriggerFiringState::AwaitingApproval
+            });
         Ok(ReserveAgentTriggerFiringOutcome::Reserved(
             ReservedAgentTriggerFiring {
                 binding_id: binding_id.into(),
                 event_id: envelope.event_id.0.clone(),
                 event_type: envelope.type_.0.clone(),
-                state: AgentTriggerFiringState::Queued,
+                state,
             },
         ))
     }
 }
 
 struct Visible(bool);
+
+struct IgnoringApprovalInbox;
+
+impl TriggerApprovalInbox for IgnoringApprovalInbox {
+    fn ensure_pending(
+        &self,
+        _binding: &DurableAgentTriggerBinding,
+        _envelope: &EventEnvelope,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RecordingApprovalInbox(Mutex<Vec<(String, String)>>);
+
+impl TriggerApprovalInbox for RecordingApprovalInbox {
+    fn ensure_pending(
+        &self,
+        binding: &DurableAgentTriggerBinding,
+        envelope: &EventEnvelope,
+    ) -> Result<(), String> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((binding.binding_id.clone(), envelope.event_id.0.clone()));
+        Ok(())
+    }
+}
+
+fn ignoring_approvals() -> Arc<dyn TriggerApprovalInbox> {
+    Arc::new(IgnoringApprovalInbox)
+}
 
 impl TriggerOwnerVisibility for Visible {
     fn can_view(
@@ -140,8 +183,13 @@ fn one_visible_red_mainline_event_reserves_one_exact_binding() {
         bindings: vec![binding("refs/heads/main")],
         reservations: Mutex::new(Vec::new()),
     });
-    let consumer =
-        GovernedTriggerConsumer::new("acme", "fr-par", store.clone(), Arc::new(Visible(true)));
+    let consumer = GovernedTriggerConsumer::new(
+        "acme",
+        "fr-par",
+        store.clone(),
+        Arc::new(Visible(true)),
+        ignoring_approvals(),
+    );
 
     assert_eq!(
         consumer.handle(
@@ -176,6 +224,7 @@ fn green_feature_and_revoked_visibility_are_quiet() {
             "fr-par",
             store.clone(),
             Arc::new(Visible(visible)),
+            ignoring_approvals(),
         );
         assert_eq!(
             consumer.handle(
@@ -212,8 +261,13 @@ fn one_imperfect_rule_cannot_starve_another_rule() {
         bindings: vec![brittle, healthy],
         reservations: Mutex::new(Vec::new()),
     });
-    let consumer =
-        GovernedTriggerConsumer::new("acme", "fr-par", store.clone(), Arc::new(Visible(true)));
+    let consumer = GovernedTriggerConsumer::new(
+        "acme",
+        "fr-par",
+        store.clone(),
+        Arc::new(Visible(true)),
+        ignoring_approvals(),
+    );
 
     assert_eq!(
         consumer.handle(
@@ -272,6 +326,7 @@ fn exact_fanout_cap_is_allowed_and_one_more_is_refused_loudly() {
             "fr-par",
             Arc::new(FanoutStore(count)),
             Arc::new(Visible(true)),
+            ignoring_approvals(),
         );
         assert_eq!(
             consumer.handle(
@@ -281,4 +336,38 @@ fn exact_fanout_cap_is_allowed_and_one_more_is_refused_loudly() {
             expected,
         );
     }
+}
+
+#[test]
+fn a_parked_firing_becomes_one_actionable_approval_for_its_owner() {
+    let mut approval_binding = binding("refs/heads/main");
+    approval_binding.require_human_approval = true;
+    let store = Arc::new(RecordingStore {
+        bindings: vec![approval_binding],
+        reservations: Mutex::new(Vec::new()),
+    });
+    let approvals = Arc::new(RecordingApprovalInbox::default());
+    let consumer = GovernedTriggerConsumer::new(
+        "acme",
+        "fr-par",
+        store,
+        Arc::new(Visible(true)),
+        approvals.clone(),
+    );
+
+    assert_eq!(
+        consumer.handle(
+            &event("ci.run.failed", "refs/heads/main", "red-main-needs-human"),
+            &mut myelin_events::HandlerTx::none(),
+        ),
+        HandleOutcome::Done
+    );
+    assert_eq!(
+        *approvals.0.lock().unwrap(),
+        vec![(
+            "632cf5b2-207f-42f4-9f89-eedcd79f395f".into(),
+            "red-main-needs-human".into(),
+        )],
+        "the durable firing and the human's inbox point at the same exact decision"
+    );
 }

@@ -172,9 +172,10 @@ integer minor-unit budget, optional delegation caveats, and safety gates. Each f
 short-lived run identity and reaches Git, CI, Issues, Chat, and Knowledge only through governed
 Myelin tools. Owners can inspect durable firing history and outcomes, pause new reservations for
 maintenance, resume them, or irreversibly disable an automation. A human-approval gate parks the
-exact event without starting or paying for an agent run; its owner can approve or reject it with a
-durable, retry-safe decision that remains visible in history. No third-party integration key is
-created or copied into the agent.
+exact event without starting or paying for an agent run. It appears in the owner's shared inbox
+with approve and reject actions in the web app and a copyable CLI command; either decision is
+durable and retry-safe, completes the inbox item, and remains visible in automation history. No
+third-party integration key is created or copied into the agent.
 
 Three-segment events carry their subject type in the name, so `issue.issue.updated`,
 `knowledge.page.updated`, and `chat.message.created` need no extra matcher ceremony. Ambiguous

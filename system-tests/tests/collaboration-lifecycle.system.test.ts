@@ -467,11 +467,38 @@ command = ["true"]
     }, { description: "the visible issue event to reach its exact human gate" });
     expect(awaiting).toMatchObject({ event_id: eventId, run_id: null, approval: null });
 
+    const approvalNotice = await eventually<JsonRecord>(async () => {
+      const response = await founder.json("/v1/notif/inbox?view=all&limit=100");
+      return array(response.body.items, "one human inbox")
+        .map((item) => record(item, "inbox item"))
+        .find((item) => item.action !== null && typeof item.action === "object" &&
+          record(item.action, "inbox action").event_id === eventId);
+    }, { description: "the exact parked automation to appear in its owner's inbox" });
+    expect(approvalNotice).toMatchObject({
+      reason: "approval_requested",
+      class: "critical",
+      subject: issueRef,
+      state: "unread",
+      coalesce_count: 1,
+      action: {
+        kind: "automation_firing_approval",
+        automation_id: triggerId,
+        event_id: eventId,
+      },
+    });
+    const approvalNoticeId = string(approvalNotice.id, "automation approval inbox item id");
+
     const history = await founder.json(
       `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
     );
     expect(array(history.body.items, "filtered issue automation history")).not.toEqual(
       expect.arrayContaining([expect.objectContaining({ event_id: ignoredEventId })]),
+    );
+    const inboxBeforeDecision = await founder.json("/v1/notif/inbox?view=all&limit=100");
+    expect(array(inboxBeforeDecision.body.items, "filtered human inbox")).not.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ action: expect.objectContaining({ event_id: ignoredEventId }) }),
+      ]),
     );
     const afterMatch = await founder.json(`/v1/triggers/${encodeURIComponent(triggerId)}`);
     expect(afterMatch.body).toMatchObject({ trigger: { id: triggerId, firings_used: 1 } });
@@ -489,6 +516,17 @@ command = ["true"]
         run_id: null,
         approval: { decision: "rejected", decided_by: expect.any(String) },
       },
+    });
+    const completedNotice = await eventually<JsonRecord>(async () => {
+      const response = await founder.json("/v1/notif/inbox?view=all&limit=100");
+      return array(response.body.items, "one human inbox")
+        .map((item) => record(item, "inbox item"))
+        .find((item) => item.id === approvalNoticeId && item.state === "done");
+    }, { description: "the decided automation approval to leave the active inbox" });
+    expect(completedNotice.action).toEqual({
+      kind: "automation_firing_approval",
+      automation_id: triggerId,
+      event_id: eventId,
     });
   });
 

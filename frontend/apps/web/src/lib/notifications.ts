@@ -1,7 +1,12 @@
 import { useAction } from "@solidjs/router";
 import { createResource, createSignal, type Accessor } from "solid-js";
 
-import { getInbox, markInboxRead } from "./api";
+import {
+  decideAutomationApproval,
+  getInbox,
+  markInboxRead,
+  type AutomationApprovalDecision,
+} from "./api";
 import type { InboxItem } from "./inbox-response";
 
 export type InboxAvailability = "loading" | "ready" | "unavailable";
@@ -13,11 +18,17 @@ export interface InboxState {
   hasMore: Accessor<boolean>;
   retry: () => void;
   markRead: (itemId: string) => Promise<boolean>;
+  decideAutomation: (
+    automationId: string,
+    eventId: string,
+    decision: AutomationApprovalDecision,
+  ) => Promise<boolean>;
 }
 
 /** Load the real recipient-scoped inbox through the server-only cookie-auth gateway client. */
 export function createInbox(): InboxState {
   const markReadAction = useAction(markInboxRead);
+  const decideAutomationAction = useAction(decideAutomationApproval);
   const [failed, setFailed] = createSignal(false);
   const [page, { refetch }] = createResource(async () => {
     try {
@@ -43,5 +54,23 @@ export function createInbox(): InboxState {
     await refetch();
     return true;
   };
-  return { items, unreadCount, availability, hasMore, retry: () => void refetch(), markRead };
+  const decideAutomation = async (
+    automationId: string,
+    eventId: string,
+    decision: AutomationApprovalDecision,
+  ): Promise<boolean> => {
+    const result = await decideAutomationAction({ automationId, eventId, decision });
+    if (!result.ok) return false;
+    await refetch();
+    return true;
+  };
+  return {
+    items,
+    unreadCount,
+    availability,
+    hasMore,
+    retry: () => void refetch(),
+    markRead,
+    decideAutomation,
+  };
 }

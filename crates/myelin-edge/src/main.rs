@@ -1139,9 +1139,11 @@ async fn serve(
         agent_sessions.clone(),
         handle.clone(),
     );
+    let inbox_store = Arc::new(PgInboxStore::new(provider.db_pool().clone()));
     builder = myelin_edge::register_triggers(
         builder,
         myelin_storage::DurableAgentTriggerBacking::new(provider.clone()),
+        inbox_store.clone(),
         handle.clone(),
     );
     let mcp_chat = DurableChatReadApi::new(provider.db_pool().clone(), handle.clone(), kms.clone());
@@ -1187,7 +1189,7 @@ async fn serve(
     );
     builder = register_notif(
         builder,
-        Arc::new(PgInboxStore::new(provider.db_pool().clone())),
+        inbox_store,
         check.clone(),
         git_backend,
         handle.clone(),

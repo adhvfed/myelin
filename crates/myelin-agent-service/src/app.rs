@@ -108,6 +108,7 @@ pub fn governed_trigger_consumer_reg(
     region: &myelin_tenancy::Region,
     store: std::sync::Arc<dyn crate::trigger_consumer::TriggerBindingStore>,
     visibility: std::sync::Arc<dyn crate::trigger_consumer::TriggerOwnerVisibility>,
+    approvals: std::sync::Arc<dyn crate::trigger_consumer::TriggerApprovalInbox>,
     dedup: myelin_events::DedupLedger,
     dead_letters: std::sync::Arc<dyn myelin_events::DurableDeadLetter>,
 ) -> Result<myelin_substrate::ConsumerReg, myelin_events::SubscribeError> {
@@ -117,6 +118,7 @@ pub fn governed_trigger_consumer_reg(
         region.0.clone(),
         store,
         visibility,
+        approvals,
     );
     let subscription = myelin_events::consumer::Subscription::bind(
         myelin_events::ConsumerName(format!(

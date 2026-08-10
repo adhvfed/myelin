@@ -743,6 +743,14 @@ export type InboxMutationResult =
   | { ok: true; receipt: InboxReadReceipt }
   | { ok: false };
 
+export type AutomationApprovalDecision = "approve" | "reject";
+
+export interface AutomationApprovalInput {
+  automationId: string;
+  eventId: string;
+  decision: AutomationApprovalDecision;
+}
+
 /** Mark one authenticated recipient-scoped inbox item as read. */
 export const markInboxRead = action(async (itemId: string) => {
   "use server";
@@ -764,6 +772,37 @@ export const markInboxRead = action(async (itemId: string) => {
     throw error;
   }
 }, "notif-inbox-mark-read");
+
+/** Decide one exact automation firing surfaced by the inbox. */
+export const decideAutomationApproval = action(async (input: AutomationApprovalInput) => {
+  "use server";
+  const result = (value: { ok: boolean }) => json(value, { revalidate: [] });
+  if (!input ||
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+        input.automationId,
+      ) ||
+      typeof input.eventId !== "string" || input.eventId.length === 0 ||
+      new TextEncoder().encode(input.eventId).byteLength > 255 ||
+      /[\p{Cc}]/u.test(input.eventId) ||
+      (input.decision !== "approve" && input.decision !== "reject")) return result({ ok: false });
+  try {
+    return await inboxAuthed(async () => {
+      const response = await edgePost(
+        `/v1/triggers/${seg(input.automationId)}/firings/${input.decision}`,
+        { event_id: input.eventId },
+        { idempotencyKey: crypto.randomUUID() },
+      );
+      const receipt = response !== null && typeof response === "object" &&
+        !Array.isArray(response) ? response as Record<string, unknown> : null;
+      return result({ ok: receipt?.action === input.decision });
+    });
+  } catch (error) {
+    if (error instanceof GatewayError && (error.status === 404 || error.status === 409)) {
+      return result({ ok: false });
+    }
+    throw error;
+  }
+}, "notif-automation-approval");
 
 /** A single repo's home (GET /v1/git/repos/{repo}) → the RepoHome ViewModel. */
 export const getRepo = query(async (repo: string): Promise<RepoHomeVM> => {

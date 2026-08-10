@@ -34,12 +34,21 @@ pub trait TriggerOwnerVisibility: Send + Sync {
     ) -> Result<bool, String>;
 }
 
+pub trait TriggerApprovalInbox: Send + Sync {
+    fn ensure_pending(
+        &self,
+        binding: &DurableAgentTriggerBinding,
+        envelope: &EventEnvelope,
+    ) -> Result<(), String>;
+}
+
 pub struct GovernedTriggerConsumer {
     tenant: String,
     region: String,
     subjects: &'static [SubjectPattern],
     store: Arc<dyn TriggerBindingStore>,
     visibility: Arc<dyn TriggerOwnerVisibility>,
+    approvals: Arc<dyn TriggerApprovalInbox>,
 }
 
 impl GovernedTriggerConsumer {
@@ -48,6 +57,7 @@ impl GovernedTriggerConsumer {
         region: impl Into<String>,
         store: Arc<dyn TriggerBindingStore>,
         visibility: Arc<dyn TriggerOwnerVisibility>,
+        approvals: Arc<dyn TriggerApprovalInbox>,
     ) -> Self {
         let tenant = tenant.into();
         let subjects =
@@ -58,6 +68,7 @@ impl GovernedTriggerConsumer {
             subjects,
             store,
             visibility,
+            approvals,
         }
     }
 
@@ -110,9 +121,22 @@ impl GovernedTriggerConsumer {
             if !matches {
                 continue;
             }
-            self.store
+            let reservation = self
+                .store
                 .reserve_firing(&self.tenant, &binding.binding_id, event, recorded_at)
                 .map_err(|_| TriggerDeliveryError::Unavailable)?;
+            let awaits_approval = match &reservation {
+                ReserveAgentTriggerFiringOutcome::Reserved(firing)
+                | ReserveAgentTriggerFiringOutcome::AlreadyReserved(firing) => {
+                    firing.state == myelin_storage::AgentTriggerFiringState::AwaitingApproval
+                }
+                _ => false,
+            };
+            if awaits_approval {
+                self.approvals
+                    .ensure_pending(&binding, event)
+                    .map_err(|_| TriggerDeliveryError::Unavailable)?;
+            }
         }
         Ok(())
     }

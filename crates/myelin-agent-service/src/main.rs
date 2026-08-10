@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use myelin_agent_service::trigger_consumer::durable::{
-    DurableOwnerVisibility, DurableTriggerBindingStore,
+    DurableApprovalInbox, DurableOwnerVisibility, DurableTriggerBindingStore,
 };
 use myelin_agent_service::{
     governed_trigger_consumer_reg, run_agent_ingestion_until_shutdown, trigger_intake_filter,
@@ -99,6 +99,11 @@ async fn main() {
             identity,
             runtime.clone(),
         ));
+    let approvals: Arc<dyn myelin_agent_service::trigger_consumer::TriggerApprovalInbox> =
+        Arc::new(DurableApprovalInbox::new(
+            myelin_notif::pg_inbox::PgInboxStore::new(provider.db_pool().clone()),
+            runtime.clone(),
+        ));
     let dedup = DedupLedger::durable(Arc::new(
         myelin_storage::events_durable::DurableDedupBacking::new(
             provider.db_pool().clone(),
@@ -120,6 +125,7 @@ async fn main() {
                 &region,
                 trigger_store.clone(),
                 visibility.clone(),
+                approvals.clone(),
                 dedup.clone(),
                 dead_letters.clone(),
             )

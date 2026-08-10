@@ -3,6 +3,12 @@ type WireRecord = Record<string, unknown>;
 
 export type InboxStateToken = "unread" | "seen" | "read" | "snoozed" | "archived" | "done";
 
+export interface AutomationApprovalAction {
+  kind: "automation_firing_approval";
+  automation_id: string;
+  event_id: string;
+}
+
 export interface InboxItem {
   id: string;
   reason: string;
@@ -15,6 +21,7 @@ export interface InboxItem {
   snooze_until: string | null;
   occurred_at: string;
   priority: 15 | 35 | 55 | 70 | 90;
+  action: AutomationApprovalAction | null;
 }
 
 export interface InboxPage {
@@ -61,8 +68,17 @@ function item(value: unknown): InboxItem | null {
   const row = record(value);
   if (!row || !exact(row, [
     "id", "reason", "class", "subsystem", "subject", "subject_root", "coalesce_count",
-    "state", "snooze_until", "occurred_at", "priority",
+    "state", "snooze_until", "occurred_at", "priority", "action",
   ])) return null;
+  const action = row.action === null ? null : record(row.action);
+  if (action !== null &&
+      (!exact(action, ["kind", "automation_id", "event_id"]) ||
+       action.kind !== "automation_firing_approval" ||
+       !boundedText(action.automation_id, 36) ||
+       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+         action.automation_id,
+       ) ||
+       !boundedText(action.event_id, 255))) return null;
   if (!boundedText(row.id, 512) || !REASONS.has(row.reason as string) ||
       !CLASSES.has(row.class as string) || !SUBSYSTEMS.has(row.subsystem as string) ||
       !boundedText(row.subject, 512) || !row.subject.startsWith("myelin://") ||

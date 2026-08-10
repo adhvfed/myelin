@@ -49,6 +49,28 @@ WHERE notif_inbox_item.region = EXCLUDED.region
   AND notif_inbox_item.coalesce_count < 2147483647
 RETURNING coalesce_count";
 
+const ENSURE_SQL: &str = "INSERT INTO notif_inbox_item (
+ tenant_id, region, item_id, recipient, subject, subject_root, reason, class, origin_event,
+ template_key, template_args_json, dedup_key, coalesce_count, state, snooze_until, occurred_at,
+ dek_ref
+) VALUES (
+ $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, 1, 'unread', NULL, $13, $14
+)
+ON CONFLICT (tenant_id, recipient, dedup_key) DO UPDATE
+SET item_id = notif_inbox_item.item_id
+WHERE notif_inbox_item.region = EXCLUDED.region
+  AND notif_inbox_item.item_id = EXCLUDED.item_id
+  AND notif_inbox_item.subject = EXCLUDED.subject
+  AND notif_inbox_item.subject_root = EXCLUDED.subject_root
+  AND notif_inbox_item.reason = EXCLUDED.reason
+  AND notif_inbox_item.class = EXCLUDED.class
+  AND notif_inbox_item.origin_event = EXCLUDED.origin_event
+  AND notif_inbox_item.template_key = EXCLUDED.template_key
+  AND notif_inbox_item.template_args_json = EXCLUDED.template_args_json
+  AND notif_inbox_item.occurred_at = EXCLUDED.occurred_at
+  AND notif_inbox_item.dek_ref = EXCLUDED.dek_ref
+RETURNING coalesce_count";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InboxUpsert {
     pub item: RoutedInboxItem,
@@ -158,6 +180,18 @@ impl PgInboxStore {
         let region = prepared.region.clone();
         with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
             Box::pin(async move { upsert_on_conn(conn, &prepared).await })
+        })
+        .await
+    }
+
+    /// Ensures one exact source event has one inbox row without treating a redelivery as a
+    /// repeated notification. A conflicting reuse of the deduplication key is refused.
+    pub async fn ensure(&self, input: &InboxUpsert) -> Result<(), PgInboxError> {
+        let prepared = PreparedUpsert::try_from(input)?;
+        let tenant = prepared.tenant_id.0.clone();
+        let region = prepared.region.clone();
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move { ensure_on_conn(conn, &prepared).await })
         })
         .await
     }
@@ -301,6 +335,41 @@ impl PgInboxStore {
         })
         .await
     }
+
+    /// Completes an actionable inbox item if it exists. Missing rows are valid for work created
+    /// before the projection was introduced, and an already-completed row is retry-safe.
+    pub async fn complete_if_present(
+        &self,
+        scope: &InboxReadScope,
+        item_id: &str,
+    ) -> Result<bool, PgInboxError> {
+        validate_scope(scope)?;
+        if !valid_item_id(item_id) {
+            return Err(PgInboxError::InvalidInput);
+        }
+        let owned_scope = scope.clone();
+        let owned_item_id = item_id.to_string();
+        let tenant = owned_scope.tenant.0.clone();
+        let region = owned_scope.region.0.clone();
+        with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
+            Box::pin(async move {
+                let result = sqlx::query(
+                    "UPDATE notif_inbox_item SET state = 'done', snooze_until = NULL \
+                     WHERE tenant_id = $1 AND region = $2 AND recipient = $3 AND item_id = $4 \
+                       AND state <> 'done'",
+                )
+                .bind(&owned_scope.tenant.0)
+                .bind(&owned_scope.region.0)
+                .bind(&owned_scope.recipient)
+                .bind(&owned_item_id)
+                .execute(conn)
+                .await
+                .map_err(|_| PgInboxError::Database)?;
+                Ok(result.rows_affected() == 1)
+            })
+        })
+        .await
+    }
 }
 
 fn validate_routing_key(item: &RoutedInboxItem) -> Result<(), PgInboxError> {
@@ -439,6 +508,32 @@ async fn upsert_on_conn(
     } else {
         Err(PgInboxError::CorruptStoredRow)
     }
+}
+
+async fn ensure_on_conn(
+    conn: &mut sqlx::PgConnection,
+    row: &PreparedUpsert,
+) -> Result<(), PgInboxError> {
+    sqlx::query_scalar::<_, i32>(ENSURE_SQL)
+        .bind(&row.tenant_id.0)
+        .bind(&row.region)
+        .bind(&row.item_id)
+        .bind(&row.recipient)
+        .bind(&row.subject)
+        .bind(&row.subject_root)
+        .bind(row.reason)
+        .bind(row.class)
+        .bind(&row.origin_event)
+        .bind(&row.template_key)
+        .bind(&row.template_args_json)
+        .bind(&row.dedup_key)
+        .bind(row.occurred_at)
+        .bind(&row.dek_ref)
+        .fetch_optional(conn)
+        .await
+        .map_err(map_upsert_database_error)?
+        .ok_or(PgInboxError::WriteConflict)?;
+    Ok(())
 }
 
 fn map_upsert_database_error(error: sqlx::Error) -> PgInboxError {

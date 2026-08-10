@@ -2,6 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use myelin_identity::{Literal, ObjectType};
+use myelin_notif::pg_inbox::{InboxReadScope, PgInboxStore};
 use myelin_query::{CmpOp, EventMatcher, Expr, Predicate, QueryAst};
 use myelin_storage::{
     AgentTriggerApprovalDecision, AgentTriggerFiringState, AgentTriggerLifecycleAction,
@@ -27,6 +28,7 @@ const MAX_TRIGGER_FILTER_BYTES: usize = 4 * 1024;
 #[derive(Clone)]
 struct TriggerHttpApi {
     backing: DurableAgentTriggerBacking,
+    inbox: Arc<PgInboxStore>,
     runtime: Handle,
 }
 
@@ -330,6 +332,26 @@ impl Handler for TriggerApprovalHandler {
                 ))
             }
         };
+        let approval_item_id = myelin_notif::automation_approval_item_id(
+            &ctx.principal.tenant,
+            &ctx.principal.principal_id.0,
+            &binding_id.to_string(),
+            &body.event_id,
+        );
+        self.api
+            .drive(self.api.inbox.complete_if_present(
+                &InboxReadScope {
+                    tenant: ctx.principal.tenant.clone(),
+                    region: ctx.principal.region.clone(),
+                    recipient: ctx.principal.principal_id.0.clone(),
+                },
+                &approval_item_id,
+            ))?
+            .map_err(|_| {
+                EdgeError::Unavailable(
+                    "automation approval inbox is temporarily unavailable".into(),
+                )
+            })?;
         Ok(no_store(EdgeResponse::json(
             200,
             &json!({
@@ -345,9 +367,14 @@ impl Handler for TriggerApprovalHandler {
 pub fn register_triggers(
     builder: GatewayBuilder,
     backing: DurableAgentTriggerBacking,
+    inbox: Arc<PgInboxStore>,
     runtime: Handle,
 ) -> GatewayBuilder {
-    let api = TriggerHttpApi { backing, runtime };
+    let api = TriggerHttpApi {
+        backing,
+        inbox,
+        runtime,
+    };
     builder
         .route(
             Method::Get,

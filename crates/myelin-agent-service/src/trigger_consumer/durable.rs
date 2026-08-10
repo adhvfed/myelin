@@ -6,6 +6,7 @@ use myelin_identity::{
     PrincipalId, PrincipalKind, PrincipalStatus, Zookie,
 };
 use myelin_identity_service::StoreBackedCheck;
+use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_storage::{
     DurableAgentTriggerBacking, DurableAgentTriggerBinding, DurablePrincipalBacking,
     ReserveAgentTriggerFiringOutcome, SubstrateProvider,
@@ -14,7 +15,7 @@ use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use sqlx::types::Uuid;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
-use super::{TriggerBindingStore, TriggerOwnerVisibility};
+use super::{TriggerApprovalInbox, TriggerBindingStore, TriggerOwnerVisibility};
 
 pub struct DurableTriggerBindingStore {
     backing: DurableAgentTriggerBacking,
@@ -28,6 +29,11 @@ pub struct DurableOwnerVisibility {
     identity: StoreBackedCheck,
     runtime: Handle,
     region: String,
+}
+
+pub struct DurableApprovalInbox {
+    store: PgInboxStore,
+    runtime: Handle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,6 +197,16 @@ impl DurableOwnerVisibility {
     }
 }
 
+impl DurableApprovalInbox {
+    pub fn new(store: PgInboxStore, runtime: Handle) -> Self {
+        Self { store, runtime }
+    }
+
+    fn drive<F: std::future::Future>(&self, future: F) -> Result<F::Output, String> {
+        drive_with_runtime(&self.runtime, future, "trigger approval inbox")
+    }
+}
+
 fn drive_with_runtime<F: std::future::Future>(
     runtime: &Handle,
     future: F,
@@ -238,6 +254,22 @@ impl TriggerBindingStore for DurableTriggerBindingStore {
             recorded_at,
         ))?
         .map_err(|_| "durable trigger reservation is unavailable".into())
+    }
+}
+
+impl TriggerApprovalInbox for DurableApprovalInbox {
+    fn ensure_pending(
+        &self,
+        binding: &DurableAgentTriggerBinding,
+        envelope: &EventEnvelope,
+    ) -> Result<(), String> {
+        let notice = myelin_notif::pending_automation_approval(
+            &binding.binding_id,
+            &binding.owner_principal_id,
+            envelope,
+        );
+        self.drive(self.store.ensure(&notice))?
+            .map_err(|_| "durable trigger approval inbox is unavailable".into())
     }
 }
 

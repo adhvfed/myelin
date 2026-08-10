@@ -6,13 +6,16 @@ use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
 };
 use myelin_identity_service::StoreBackedCheck;
+use myelin_notif::automation_approval_action;
 use myelin_notif::cli::CliView;
 use myelin_notif::list_inbox::subsystem_of;
 use myelin_notif::pg_inbox::{
     DurableInboxItem, InboxReadRequest, InboxReadScope, PgInboxError, PgInboxStore,
 };
 use myelin_notif::prefs::{class_token, reason_token, subsystem_token};
+use myelin_storage::with_tenant_tx_error;
 use serde_json::{json, Value};
+use sqlx::types::Uuid;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, Method};
@@ -44,6 +47,68 @@ impl DurableNotifHttpApi {
             Ok(_) => Err(PgInboxError::Database),
             Err(_) => self.runtime.block_on(future),
         }
+    }
+
+    fn can_read_subject(
+        &self,
+        principal: &Principal,
+        row: &DurableInboxItem,
+    ) -> Result<bool, PgInboxError> {
+        let issue_object =
+            if subsystem_of(&row.item.subject) == myelin_notif::list_inbox::Subsystem::Issue {
+                self.issue_authorization_object(principal, &row.item.subject)?
+            } else {
+                None
+            };
+        Ok(can_read_subject(
+            &self.identity,
+            Some(&self.git),
+            principal,
+            row,
+            issue_object,
+        ))
+    }
+
+    fn issue_authorization_object(
+        &self,
+        principal: &Principal,
+        subject: &ArtifactRef,
+    ) -> Result<Option<ArtifactRef>, PgInboxError> {
+        let Some(key) = myelin_refs::object_key(subject) else {
+            return Ok(None);
+        };
+        if key.tenant.as_deref() != Some(principal.tenant.as_str())
+            || key.subsystem.as_deref() != Some("issue")
+            || key.object_type.as_deref() != Some("issue")
+        {
+            return Ok(None);
+        }
+        let tenant = principal.tenant.0.clone();
+        let region = principal.region.0.clone();
+        let issue_key = key.id;
+        let query_tenant = tenant.clone();
+        let query_region = region.clone();
+        let issue_id = self.drive(with_tenant_tx_error(
+            self.store.pool(),
+            &tenant,
+            &region,
+            move |conn| {
+                Box::pin(async move {
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT id FROM issue \
+                         WHERE tenant_id = $1 AND region = $2 AND key = $3 \
+                           AND deleted_at IS NULL",
+                    )
+                    .bind(&query_tenant)
+                    .bind(&query_region)
+                    .bind(&issue_key)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|_| PgInboxError::Database)
+                })
+            },
+        ))?;
+        Ok(issue_id.map(|id| ArtifactRef(format!("issue:{id}"))))
     }
 }
 
@@ -82,7 +147,11 @@ impl Handler for InboxGetHandler {
                     .get(&inbox_scope(ctx.principal), inbox_item_param(ctx)?),
             )
             .map_err(map_inbox_error)?;
-        if !can_read_subject(&self.api.identity, Some(&self.api.git), ctx.principal, &row) {
+        if !self
+            .api
+            .can_read_subject(ctx.principal, &row)
+            .map_err(map_inbox_error)?
+        {
             return Err(EdgeError::NotFound("notification not found".into()));
         }
         Ok(
@@ -142,14 +211,16 @@ impl Handler for InboxListHandler {
             .api
             .drive(self.api.store.list(&request))
             .map_err(map_inbox_error)?;
-        let items = page
-            .items
-            .iter()
-            .filter(|row| {
-                can_read_subject(&self.api.identity, Some(&self.api.git), ctx.principal, row)
-            })
-            .map(inbox_item_json)
-            .collect::<Vec<_>>();
+        let mut items = Vec::with_capacity(page.items.len());
+        for row in &page.items {
+            if self
+                .api
+                .can_read_subject(ctx.principal, row)
+                .map_err(map_inbox_error)?
+            {
+                items.push(inbox_item_json(row));
+            }
+        }
         Ok(EdgeResponse::json(
             200,
             &page_envelope(json!(items), page.next_cursor, usize::from(query.limit)),
@@ -232,6 +303,13 @@ fn parse_inbox_query(query: &str) -> Result<InboxQuery, EdgeError> {
 }
 
 fn inbox_item_json(row: &DurableInboxItem) -> Value {
+    let action = automation_approval_action(row).map(|action| {
+        json!({
+            "kind": "automation_firing_approval",
+            "automation_id": action.automation_id,
+            "event_id": action.event_id,
+        })
+    });
     json!({
         "id": row.item.item_id,
         "reason": reason_token(row.item.reason),
@@ -244,6 +322,7 @@ fn inbox_item_json(row: &DurableInboxItem) -> Value {
         "snooze_until": row.item.snooze_until,
         "occurred_at": row.occurred_at,
         "priority": row.priority,
+        "action": action,
     })
 }
 
@@ -266,9 +345,15 @@ fn can_read_subject(
     git: Option<&DurableGitBackend>,
     principal: &Principal,
     row: &DurableInboxItem,
+    issue_object: Option<ArtifactRef>,
 ) -> bool {
     let (permission, object) = match subsystem_of(&row.item.subject) {
-        myelin_notif::list_inbox::Subsystem::Issue => ("view", row.item.subject.clone()),
+        myelin_notif::list_inbox::Subsystem::Issue => {
+            let Some(object) = issue_object else {
+                return false;
+            };
+            ("view", object)
+        }
         myelin_notif::list_inbox::Subsystem::Chat
         | myelin_notif::list_inbox::Subsystem::Knowledge
         | myelin_notif::list_inbox::Subsystem::Ci => ("read", row.item.subject.clone()),
@@ -535,7 +620,7 @@ mod tests {
             dek_ref: "kms://acme/notif/inbox".into(),
             priority: 70,
         };
-        assert!(!can_read_subject(&identity, None, &principal, &row));
+        assert!(!can_read_subject(&identity, None, &principal, &row, None));
 
         let scope = TenantScope::from_verified_token(&principal, principal.region.clone());
         tuples
@@ -553,6 +638,6 @@ mod tests {
                 Timestamp("2026-07-22T12:00:00Z".into()),
             )
             .unwrap();
-        assert!(can_read_subject(&identity, None, &principal, &row));
+        assert!(can_read_subject(&identity, None, &principal, &row, None));
     }
 }

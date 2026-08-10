@@ -535,6 +535,34 @@ export function AppShell(props: AppShellProps) {
                             Mark read
                           </button>
                         </Show>
+                        <Show when={item.state !== "done" && item.action}>
+                          {(action) => (
+                            <span style={{ display: "flex", gap: "var(--space-2)" }}>
+                              <button
+                                type="button"
+                                class="button-primary"
+                                onClick={() => void inbox.decideAutomation(
+                                  action().automation_id,
+                                  action().event_id,
+                                  "approve",
+                                )}
+                              >
+                                Approve automation
+                              </button>
+                              <button
+                                type="button"
+                                class="button-secondary"
+                                onClick={() => void inbox.decideAutomation(
+                                  action().automation_id,
+                                  action().event_id,
+                                  "reject",
+                                )}
+                              >
+                                Reject
+                              </button>
+                            </span>
+                          )}
+                        </Show>
                       </span>
                     </li>
                   )}
