@@ -21,6 +21,7 @@ serde_json.workspace = true
 serde.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = "1"
+blake3.workspace = true
 
 [dev-dependencies]
 myelin-agent-model = { path = "../myelin-agent-model", features = ["test-support"] }

@@ -2514,6 +2514,7 @@ dependencies = [
 name = "myelin-agent-host"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "chrono",
  "myelin-agent",
  "myelin-agent-model",

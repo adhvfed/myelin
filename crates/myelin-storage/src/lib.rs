@@ -1,3 +1,4 @@
+pub mod agent_model_step;
 pub mod agent_run_gate;
 pub mod agent_trigger_durable;
 pub mod agent_wallet;
@@ -71,6 +72,10 @@ pub mod valkey;
 
 pub mod cell_root_durable;
 
+pub use agent_model_step::{
+    agent_model_step_migrations, AgentModelStepStore, ModelStepBegin, ModelStepCompletion,
+    ModelStepError, AGENT_MODEL_STEP_GUARD_MIGRATION, AGENT_MODEL_STEP_MIGRATION,
+};
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
 pub use agent_wallet::{
     agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind,

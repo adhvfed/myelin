@@ -173,6 +173,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::external_agent_run_durable::external_agent_run_durable_migrations(),
         crate::agent_trigger_durable::agent_trigger_durable_migrations(),
         crate::agent_wallet::agent_wallet_charge_migrations(),
+        crate::agent_model_step::agent_model_step_migrations(),
     ]
 }
 
@@ -755,7 +756,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0095_agent_wallet_charge_key");
+        assert_eq!(*ids.last().unwrap(), "0097_agent_model_step_guard");
     }
 
     #[test]

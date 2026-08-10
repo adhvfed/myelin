@@ -66,6 +66,7 @@ pub enum ModelError {
     Transport(String),
     Http { status: u16, body: String },
     Parse(String),
+    UnsafeReplay(String),
 }
 
 impl core::fmt::Display for ModelError {
@@ -79,6 +80,7 @@ impl core::fmt::Display for ModelError {
                 write!(f, "model provider returned HTTP {status}: {body}")
             }
             ModelError::Parse(m) => write!(f, "model response parse error: {m}"),
+            ModelError::UnsafeReplay(m) => write!(f, "model replay refused: {m}"),
         }
     }
 }

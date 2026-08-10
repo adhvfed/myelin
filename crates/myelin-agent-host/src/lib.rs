@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+mod durable_model;
+
 pub mod git_read_tool;
 pub use git_read_tool::{
     git_check_status_read_tool_def, git_check_status_read_tool_schema, GitCheckStatusReadExecutor,
@@ -9,6 +11,7 @@ pub use git_read_tool::{
 pub mod identity;
 pub use identity::timestamp_from_epoch;
 pub mod workflow;
+use durable_model::DurableModelClient;
 use identity::{IdentityRunMinter, IdentityRunRevoker};
 pub use workflow::{HostedAgentInputResolver, HostedAgentWorkflowInput};
 
@@ -29,6 +32,7 @@ use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
 };
 use myelin_storage::agent_wallet::AgentWallet;
+use myelin_storage::AgentModelStepStore;
 use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::{
     DurableCellRootBacking, DurableDelegationPolicyBacking, DurableRevocationBacking, SealKey,
@@ -523,6 +527,7 @@ fn default_system(system: &str) -> String {
 pub struct AgentHost {
     region: Region,
     wallet: AgentWallet,
+    model_steps: AgentModelStepStore,
     identity: HostIdentity,
     runtime: tokio::runtime::Handle,
 }
@@ -585,7 +590,8 @@ impl AgentHost {
             DelegationPolicySource::with_pg(DurableDelegationPolicyBacking::new(provider.clone()));
         Ok(AgentHost {
             region,
-            wallet: AgentWallet::new(provider),
+            wallet: AgentWallet::new(provider.clone()),
+            model_steps: AgentModelStepStore::with_runtime(provider, rt.clone()),
             identity: HostIdentity {
                 minter,
                 revocations,
@@ -646,6 +652,12 @@ impl AgentHost {
         tools: Tools<'_>,
     ) -> Result<LlmRunReport, AgentHostError> {
         let (minter, revoker) = self.identity_seams(task)?;
+        let model_client = Box::new(DurableModelClient::new(
+            task.tenant.clone(),
+            task.run_id.clone(),
+            self.model_steps.clone(),
+            model_client,
+        ));
         dispatch_core(
             &self.wallet,
             self.region.clone(),
