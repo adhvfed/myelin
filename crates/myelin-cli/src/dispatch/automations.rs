@@ -17,7 +17,7 @@ const MAX_FILTER_BYTES: usize = 4 * 1024;
 pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no automation command given (try: create | list | show | history | approve | reject | pause | resume | disable)"
+            "no automation command given (try: create | list | show | history | result | approve | reject | pause | resume | disable)"
                 .into(),
         )
     })?;
@@ -26,6 +26,7 @@ pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
         "list" => list_call(rest),
         "show" => show_call(rest),
         "history" => history_call(rest),
+        "result" => result_call(rest),
         "approve" | "reject" => approval_call(rest, verb),
         "pause" | "resume" | "disable" => lifecycle_call(rest, verb),
         other => Err(CliError::Usage(format!(
@@ -230,6 +231,19 @@ fn history_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     })
 }
 
+fn result_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let [automation_id, run_id] = args else {
+        return Err(CliError::Usage(
+            "automation result needs an automation id and run id".into(),
+        ));
+    };
+    require_automation_id("automation id", automation_id)?;
+    require_automation_id("run id", run_id)?;
+    Ok(EdgeCall::get(format!(
+        "/v1/triggers/{automation_id}/runs/{run_id}/result"
+    )))
+}
+
 fn lifecycle_call(args: &[&str], action: &str) -> Result<EdgeCall, CliError> {
     let id = exact_id(args, action)?;
     Ok(EdgeCall::post_json(
@@ -432,6 +446,7 @@ mod tests {
 
     const AGENT: &str = "11111111-1111-4111-8111-111111111111";
     const AUTOMATION: &str = "22222222-2222-4222-8222-222222222222";
+    const RUN: &str = "33333333-3333-4333-8333-333333333333";
 
     #[test]
     fn one_command_captures_a_governed_automation_intent() {
@@ -537,6 +552,13 @@ mod tests {
                 .as_deref(),
             Some("limit=50&cursor=evt%3Afailed%2F1")
         );
+        assert_eq!(
+            automation_dispatch(&["result", AUTOMATION, RUN])
+                .unwrap()
+                .path,
+            format!("/v1/triggers/{AUTOMATION}/runs/{RUN}/result")
+        );
+        assert!(automation_dispatch(&["result", AUTOMATION]).is_err());
         for action in ["pause", "resume", "disable"] {
             let call = automation_dispatch(&[action, AUTOMATION]).unwrap();
             assert_eq!(call.path, format!("/v1/triggers/{AUTOMATION}/{action}"));

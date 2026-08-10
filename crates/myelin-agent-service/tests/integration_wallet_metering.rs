@@ -226,6 +226,7 @@ async fn metered_run_debits_the_durable_wallet_per_turn() {
         outbox: &outbox,
         minter: Arc::new(myelin_events::MonotonicMinter::new()),
         journal: WfJournal::new(),
+        trace_writer: Arc::new(myelin_storage::InMemoryAgentTraceStore::new()),
         now_secs: 1000,
     };
 
@@ -301,6 +302,7 @@ async fn metered_run_dry_durable_wallet_halts_gracefully() {
         outbox: &outbox,
         minter: Arc::new(myelin_events::MonotonicMinter::new()),
         journal: WfJournal::new(),
+        trace_writer: Arc::new(myelin_storage::InMemoryAgentTraceStore::new()),
         now_secs: 2000,
     };
 

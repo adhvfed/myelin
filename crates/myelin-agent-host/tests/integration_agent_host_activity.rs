@@ -393,6 +393,34 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
         CostLedger::with_pg(app.clone()).state_of(&tenant, &RunId::new(run_id.clone())),
         Some(myelin_storage::reserve_settle::ReservationState::Settled)
     );
+    let trace_tenant = tenant.0.clone();
+    let trace_run = run_id.clone();
+    let trace = app
+        .with_tenant_tx(&tenant.0, move |conn| {
+            Box::pin(async move {
+                sqlx::query_as::<_, (String, String, String, i64)>(
+                    "SELECT artifact_ref, requested_by, answer, charged_micro \
+                       FROM knowledge_agent_trace \
+                      WHERE tenant_id = $1 AND run_id = $2",
+                )
+                .bind(&trace_tenant)
+                .bind(&trace_run)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+            })
+        })
+        .await
+        .expect("the completed agent leaves one durable human-readable result");
+    assert!(trace
+        .0
+        .starts_with(&format!("myelin://{}/knowledge/doc/blake3:", tenant.0)));
+    assert_eq!(trace.1, "founder");
+    assert_eq!(
+        trace.2,
+        "The governed run was explained without an external credential."
+    );
+    assert!(trace.3 > 0, "the result carries its exact metered cost");
 
     assert_eq!(
         executor
@@ -403,6 +431,25 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
     assert_eq!(host.wallet().balance(&tenant), balance_after_run);
     assert_eq!(clients.load(Ordering::SeqCst), 1);
     assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
+    let replay_trace_tenant = tenant.0.clone();
+    let replay_trace_run = run_id.clone();
+    let trace_count = app
+        .with_tenant_tx(&tenant.0, move |conn| {
+            Box::pin(async move {
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT count(*) FROM knowledge_agent_trace \
+                      WHERE tenant_id = $1 AND run_id = $2",
+                )
+                .bind(&replay_trace_tenant)
+                .bind(&replay_trace_run)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+            })
+        })
+        .await
+        .expect("the recovered activity keeps exactly one result");
+    assert_eq!(trace_count, 1);
 
     let cleanup_tenant = tenant.0.clone();
     app.with_tenant_tx(&tenant.0, move |conn| {
@@ -412,6 +459,7 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
                  (SELECT event_id FROM outbox WHERE envelope->>'tenant' = $1)",
                 "DELETE FROM outbox WHERE envelope->>'tenant' = $1",
                 "DELETE FROM agent_model_step WHERE tenant_id = $1",
+                "DELETE FROM knowledge_agent_trace WHERE tenant_id = $1",
                 "DELETE FROM cost_event WHERE tenant_id = $1",
                 "DELETE FROM cost_reservation WHERE tenant_id = $1",
                 "DELETE FROM agent_wallet WHERE tenant_id = $1",

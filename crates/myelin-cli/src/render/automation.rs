@@ -7,6 +7,9 @@ use crate::dispatch::{is_canonical_automation_id, EdgeCall};
 use super::{query_field, terminal_safe_single_line};
 
 pub(super) fn render_response(value: &Value) -> Option<String> {
+    if let Some(result) = value.get("result") {
+        return render_result(result);
+    }
     if value.get("firing").is_some() {
         return render_approval(value);
     }
@@ -41,6 +44,34 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
         "  Myelin owns the integration credentials and gives each run only its governed tools.\n",
     );
     Some(output)
+}
+
+fn render_result(result: &Value) -> Option<String> {
+    let run_ref = result.get("run_ref")?.as_str()?;
+    let trace_ref = result.get("trace_ref")?.as_str()?;
+    let answer = result.get("answer")?.as_str()?;
+    let agent = result.get("agent_principal")?.as_str()?;
+    let charged = result.get("charged_micro")?.as_u64()?;
+    if !run_ref.starts_with("myelin://")
+        || !run_ref.contains("/agent/run/")
+        || !trace_ref.starts_with("myelin://")
+        || !trace_ref.contains("/knowledge/doc/")
+    {
+        return None;
+    }
+    let answer = answer
+        .split('\n')
+        .map(terminal_safe_single_line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "Agent result from {}:\n{}\n\n  run: {}\n  trace: {}\n  charged: {} micro-units\n",
+        terminal_safe_single_line(agent),
+        answer,
+        terminal_safe_single_line(run_ref),
+        terminal_safe_single_line(trace_ref),
+        charged,
+    ))
 }
 
 fn render_approval(value: &Value) -> Option<String> {
@@ -226,6 +257,27 @@ mod tests {
         assert!(output.contains("task: Triage CI.\\nOpen one issue."));
         assert!(output.contains("firings: 1/10; per-run budget: 250000 minor-units"));
         assert!(output.contains("Myelin owns the integration credentials"));
+    }
+
+    #[test]
+    fn a_completed_agent_answer_reads_as_the_work_product_not_runtime_plumbing() {
+        let output = render_response(&json!({
+            "result": {
+                "run_id": "33333333-3333-4333-8333-333333333333",
+                "run_ref": "myelin://acme/agent/run/33333333-3333-4333-8333-333333333333",
+                "trace_ref": "myelin://acme/knowledge/doc/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "agent_principal": format!("agent:{AGENT}"),
+                "answer": "I read the failed run.\nI opened one issue.",
+                "charged_micro": 42,
+                "recorded_at": "2026-08-10T12:00:00Z"
+            }
+        }))
+        .unwrap();
+
+        assert!(output.starts_with(&format!("Agent result from agent:{AGENT}:")));
+        assert!(output.contains("I read the failed run.\nI opened one issue."));
+        assert!(output.contains("trace: myelin://acme/knowledge/doc/blake3:"));
+        assert!(output.contains("charged: 42 micro-units"));
     }
 
     #[test]

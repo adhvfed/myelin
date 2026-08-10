@@ -1,5 +1,6 @@
 pub mod agent_model_step;
 pub mod agent_run_gate;
+pub mod agent_trace_durable;
 pub mod agent_trigger_durable;
 pub mod agent_wallet;
 pub mod backup;
@@ -77,6 +78,10 @@ pub use agent_model_step::{
     ModelStepError, AGENT_MODEL_STEP_GUARD_MIGRATION, AGENT_MODEL_STEP_MIGRATION,
 };
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
+pub use agent_trace_durable::{
+    agent_trace_durable_migrations, AgentTraceError, AgentTraceReceipt, AgentTraceResult,
+    AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore, InMemoryAgentTraceStore,
+};
 pub use agent_wallet::{
     agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind,
     DebitOutcome, WalletError, AGENT_WALLET_CHARGE_KEY_MIGRATION, AGENT_WALLET_MIGRATION,

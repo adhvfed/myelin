@@ -89,6 +89,7 @@ fn provider_skeleton_loop_drives_the_chained_substrate_path() {
         outbox: &outbox,
         minter: Arc::new(myelin_events::MonotonicMinter::new()),
         journal: WfJournal::new(),
+        trace_writer: Arc::new(myelin_storage::InMemoryAgentTraceStore::new()),
         now_secs: 1000,
     };
 
@@ -154,6 +155,7 @@ fn consumer_loop_drives_any_runtime_through_the_dyn_seam() {
         outbox: &outbox,
         minter: Arc::new(myelin_events::MonotonicMinter::new()),
         journal: WfJournal::new(),
+        trace_writer: Arc::new(myelin_storage::InMemoryAgentTraceStore::new()),
         now_secs: 2000,
     };
     let dyn_rt: &dyn MeteredRuntime = &OtherSubmit;

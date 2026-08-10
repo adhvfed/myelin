@@ -7,9 +7,9 @@ use myelin_query::{CmpOp, EventMatcher, Expr, Predicate, QueryAst};
 use myelin_storage::{
     AgentTriggerApprovalDecision, AgentTriggerFiringState, AgentTriggerLifecycleAction,
     ChangeAgentTriggerApprovalOutcome, ChangeAgentTriggerLifecycleOutcome,
-    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, DurableAgentTriggerBinding,
-    DurableAgentTriggerFiring, NewAgentTriggerBinding, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
-    MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    CreateAgentTriggerBindingOutcome, DurableAgentTraceStore, DurableAgentTriggerBacking,
+    DurableAgentTriggerBinding, DurableAgentTriggerFiring, NewAgentTriggerBinding,
+    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -28,6 +28,7 @@ const MAX_TRIGGER_FILTER_BYTES: usize = 4 * 1024;
 #[derive(Clone)]
 struct TriggerHttpApi {
     backing: DurableAgentTriggerBacking,
+    traces: DurableAgentTraceStore,
     inbox: Arc<PgInboxStore>,
     runtime: Handle,
 }
@@ -145,6 +146,10 @@ struct TriggerFiringListHandler {
     api: TriggerHttpApi,
 }
 
+struct TriggerRunResultHandler {
+    api: TriggerHttpApi,
+}
+
 struct TriggerLifecycleHandler {
     api: TriggerHttpApi,
     action: AgentTriggerLifecycleAction,
@@ -252,6 +257,46 @@ impl Handler for TriggerFiringListHandler {
         Ok(no_store(EdgeResponse::json(
             200,
             &page_envelope(json!(items), next, limit),
+        )))
+    }
+}
+
+impl Handler for TriggerRunResultHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.query.is_empty() || !ctx.request.body.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "agent result lookup accepts no query parameters or request body".into(),
+            ));
+        }
+        let binding_id = parse_uuid(trigger_param(ctx)?)?;
+        let run_id = parse_uuid(run_param(ctx)?)?.to_string();
+        let result = self
+            .api
+            .drive(self.api.traces.fetch_for_owner(
+                &ctx.principal.tenant.0,
+                &ctx.principal.principal_id.0,
+                binding_id,
+                &run_id,
+            ))?
+            .map_err(|error| EdgeError::Internal(error.to_string()))?
+            .ok_or_else(|| EdgeError::NotFound("agent run result not found".into()))?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "result": {
+                    "run_id": result.run_id,
+                    "run_ref": format!(
+                        "myelin://{}/agent/run/{}",
+                        ctx.principal.tenant.0,
+                        result.run_id,
+                    ),
+                    "trace_ref": result.artifact_ref,
+                    "agent_principal": result.agent_principal,
+                    "answer": result.answer,
+                    "charged_micro": result.charged_micro,
+                    "recorded_at": result.created_at,
+                },
+            }),
         )))
     }
 }
@@ -367,11 +412,13 @@ impl Handler for TriggerApprovalHandler {
 pub fn register_triggers(
     builder: GatewayBuilder,
     backing: DurableAgentTriggerBacking,
+    traces: DurableAgentTraceStore,
     inbox: Arc<PgInboxStore>,
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = TriggerHttpApi {
         backing,
+        traces,
         inbox,
         runtime,
     };
@@ -399,6 +446,12 @@ pub fn register_triggers(
             "/v1/triggers/{trigger}/firings",
             "identity.triggers.list",
             Arc::new(TriggerFiringListHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/triggers/{trigger}/runs/{run}/result",
+            "identity.triggers.list",
+            Arc::new(TriggerRunResultHandler { api: api.clone() }),
         )
         .route(
             Method::Post,
@@ -710,6 +763,13 @@ fn trigger_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
         .get("trigger")
         .map(String::as_str)
         .ok_or_else(|| EdgeError::BadRequest("route did not bind a trigger id".into()))
+}
+
+fn run_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
+    ctx.params
+        .get("run")
+        .map(String::as_str)
+        .ok_or_else(|| EdgeError::BadRequest("route did not bind a run id".into()))
 }
 
 fn no_store(response: EdgeResponse) -> EdgeResponse {

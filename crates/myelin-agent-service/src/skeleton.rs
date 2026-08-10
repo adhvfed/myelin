@@ -5,17 +5,19 @@ use myelin_agent::{
     Agent, AgentRuntime, Conversation, InboxEvent, MeteredRuntime, MeteredStep, RunOutcome,
     StepOutcome, Submission, TokenUsage, ToolOutcome, ToolSurface, Turn,
 };
+use myelin_content::{Block, Inline, Span};
 use myelin_events::{
     Actor, AggregateKey, DataRole, EmitContextBase, EventDraft, EventType, Timestamp, Visibility,
 };
 use myelin_flow::{
     DelegationCaveats, RetryPolicy, RunTokenError, RunTokenHandle, RunTokenMinter, WfCtx, WfJournal,
 };
-use myelin_identity::Principal;
+use myelin_identity::{Principal, PrincipalKind};
 use myelin_refs::ArtifactRef;
 use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError};
 use myelin_storage::agent_wallet::{AgentWallet, DebitOutcome, MicroUsd, WalletError};
 use myelin_storage::reserve_settle::{CostLedger, RunId as StorageRunId};
+use myelin_storage::{AgentTraceWrite, AgentTraceWriter};
 use myelin_tenancy::{Region, TenantId};
 
 pub const AGENT_RUN_TRACED_EVENT: &str = "agent.run.traced";
@@ -311,6 +313,7 @@ pub struct RunSubstrate<'a> {
     pub outbox: &'a myelin_events::OutboxStore,
     pub minter: std::sync::Arc<dyn myelin_events::IdMinter>,
     pub journal: WfJournal,
+    pub trace_writer: std::sync::Arc<dyn AgentTraceWriter>,
     pub now_secs: i64,
 }
 
@@ -504,8 +507,13 @@ impl SkeletonAgent {
             )));
         }
 
-        let trace_ref = format!("myelin://{}/agent/trace/{}", sub.tenant.0, sub.run_id);
-        let trace_artifact = ArtifactRef(trace_ref.clone());
+        let trace = completed_trace(sub, &submission, teardown_guard.telemetry);
+        let trace_artifact = sub
+            .trace_writer
+            .write(&sub.tenant, trace)
+            .map_err(|error| SkeletonError::CoCommit(error.to_string()))?
+            .artifact_ref;
+        let trace_ref = trace_artifact.0.clone();
         ctx.activity(RetryPolicy::default_policy(), {
             let tr = trace_artifact.clone();
             move |_id: &str, _attempt: u32| Ok(vec![tr.clone()])
@@ -538,7 +546,6 @@ impl SkeletonAgent {
         teardown_guard.telemetry.runs_completed =
             teardown_guard.telemetry.runs_completed.saturating_add(1);
 
-        let _ = submission;
         Ok(RunOutcome(format!(
             "completed: run={} trace={} reserved={} settled={} token-revoked",
             sub.run_id,
@@ -587,6 +594,47 @@ impl SkeletonAgent {
                 reason: other.to_string(),
             }),
         }
+    }
+}
+
+fn completed_trace(
+    sub: &RunSubstrate<'_>,
+    submission: &Submission,
+    telemetry: &SkeletonTelemetry,
+) -> AgentTraceWrite {
+    let requested_by = match &sub.agent.kind {
+        PrincipalKind::Agent {
+            on_behalf_of: Some(principal),
+            ..
+        } => principal.0.clone(),
+        _ => sub.agent.principal_id.0.clone(),
+    };
+    let blocks = vec![Block::Paragraph {
+        inline: Inline {
+            spans: vec![Span::Text {
+                text: submission.0.clone(),
+                marks: vec![],
+                link: None,
+            }],
+            nodes: vec![],
+        },
+    }];
+    let trace_body = serde_json::json!({
+        "schema": "myelin.agent_trace.v1",
+        "run_id": sub.run_id,
+        "actor": sub.agent.principal_id.0,
+        "requested_by": requested_by,
+        "answer": submission.0,
+        "charged_micro": telemetry.charged_micro(),
+        "blocks": blocks,
+    });
+    AgentTraceWrite {
+        run_id: sub.run_id.clone(),
+        agent_principal: sub.agent.principal_id.0.clone(),
+        requested_by,
+        answer: submission.0.clone(),
+        trace_body,
+        charged_micro: telemetry.charged_micro(),
     }
 }
 
@@ -707,6 +755,7 @@ mod tests {
             outbox,
             minter: Arc::new(myelin_events::MonotonicMinter::new()),
             journal: WfJournal::new(),
+            trace_writer: Arc::new(myelin_storage::InMemoryAgentTraceStore::new()),
             now_secs,
         }
     }

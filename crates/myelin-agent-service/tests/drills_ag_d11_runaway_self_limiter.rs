@@ -102,6 +102,7 @@ fn ag_d11_runaway_mock_loop_stops_at_the_wallet_never_interrupting() {
                 outbox: &outbox,
                 minter: minter.clone(),
                 journal: WfJournal::new(),
+                trace_writer: Arc::new(myelin_storage::InMemoryAgentTraceStore::new()),
                 now_secs: 1000,
             };
             let before = telemetry.settled();
@@ -243,6 +244,7 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
                 outbox: &outbox,
                 minter: minter.clone(),
                 journal: WfJournal::new(),
+                trace_writer: Arc::new(myelin_storage::InMemoryAgentTraceStore::new()),
                 now_secs: 2000,
             };
             let before = telemetry.settled();
@@ -321,6 +323,7 @@ fn ag_d11_limiter_is_brain_independent() {
             outbox: &outbox,
             minter: minter.clone(),
             journal: WfJournal::new(),
+            trace_writer: Arc::new(myelin_storage::InMemoryAgentTraceStore::new()),
             now_secs: 3000,
         };
         match agent_loop.handle_run(&other, &mut sub, &mut tele, RunOutcomeKind::Completed) {

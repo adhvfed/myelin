@@ -272,6 +272,29 @@ command = ["true"]
       },
       run_ref: `myelin://${systemTestConfig.tenant}/agent/run/${hostedRunId}`,
     });
+    const resultResponse = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/runs/${encodeURIComponent(hostedRunId)}/result`,
+    );
+    const result = record(resultResponse.body.result, "completed hosted agent result");
+    expect(result).toMatchObject({
+      run_id: hostedRunId,
+      run_ref: `myelin://${systemTestConfig.tenant}/agent/run/${hostedRunId}`,
+      trace_ref: expect.stringMatching(
+        new RegExp(`^myelin://${systemTestConfig.tenant}/knowledge/doc/blake3:[0-9a-f]{64}$`),
+      ),
+      agent_principal: `agent:${agentId}`,
+      answer: "Read the failing CI run and opened one governed triage issue.",
+      charged_micro: expect.any(Number),
+      recorded_at: expect.any(String),
+    });
+    expect(integer(result.charged_micro, "hosted agent result charge")).toBeGreaterThan(0);
+    expect((await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/runs/${encodeURIComponent(hostedRunId)}/result`,
+    )).body).toEqual(resultResponse.body);
+    await reviewerClient.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/runs/${encodeURIComponent(hostedRunId)}/result`,
+      { expectedStatus: 403 },
+    );
     const triageTitle = `CI failure ${runId} needs triage`;
     const triageIssues = await eventually<JsonRecord[]>(async () => {
       const response = await systemClient.json("/v1/issues?state=open&limit=100");

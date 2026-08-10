@@ -41,7 +41,9 @@ use myelin_identity::{
 };
 use myelin_storage::agent_wallet::AgentWallet;
 use myelin_storage::reserve_settle::CostLedger;
-use myelin_storage::AgentModelStepStore;
+use myelin_storage::{
+    AgentModelStepStore, AgentTraceWriter, DurableAgentTraceStore, InMemoryAgentTraceStore,
+};
 use myelin_storage::{
     DurableCellRootBacking, DurableDelegationPolicyBacking, DurableRevocationBacking, SealKey,
     SubstrateProvider, TenantScope,
@@ -450,6 +452,7 @@ impl ToolExecutor for CapEnforcingExecutor<'_> {
 struct RunTokenSeams<'a> {
     minter: Arc<dyn RunTokenMinter + Send + Sync>,
     revoker: &'a dyn RunTokenRevoker,
+    trace_writer: Arc<dyn AgentTraceWriter>,
 }
 
 /// Test harness for the model/runtime loop. Production hosts must use [`AgentHost::new`]
@@ -464,6 +467,7 @@ pub fn dispatch_test_run_with_synthetic_identity(
     tools: Tools<'_>,
 ) -> Result<LlmRunReport, AgentHostError> {
     let revoker = SyntheticRunRevoker::default();
+    let traces: Arc<dyn AgentTraceWriter> = Arc::new(InMemoryAgentTraceStore::new());
     dispatch_core(
         wallet,
         region,
@@ -474,6 +478,7 @@ pub fn dispatch_test_run_with_synthetic_identity(
         RunTokenSeams {
             minter: Arc::new(SyntheticRunMinter),
             revoker: &revoker,
+            trace_writer: traces,
         },
     )
 }
@@ -529,6 +534,7 @@ fn dispatch_core(
         outbox: wiring.outbox,
         minter: wiring.id_minter.clone(),
         journal: wiring.journal.clone(),
+        trace_writer: seams.trace_writer,
         now_secs: task.now_secs,
     };
 
@@ -561,6 +567,7 @@ pub struct AgentHost {
     region: Region,
     wallet: AgentWallet,
     model_steps: AgentModelStepStore,
+    traces: Arc<DurableAgentTraceStore>,
     identity: HostIdentity,
     runtime: tokio::runtime::Handle,
 }
@@ -624,7 +631,11 @@ impl AgentHost {
         Ok(AgentHost {
             region,
             wallet: AgentWallet::new(provider.clone()),
-            model_steps: AgentModelStepStore::with_runtime(provider, rt.clone()),
+            model_steps: AgentModelStepStore::with_runtime(provider.clone(), rt.clone()),
+            traces: Arc::new(DurableAgentTraceStore::with_runtime(
+                provider.clone(),
+                rt.clone(),
+            )),
             identity: HostIdentity {
                 minter,
                 revocations,
@@ -702,6 +713,7 @@ impl AgentHost {
             RunTokenSeams {
                 minter,
                 revoker: &revoker,
+                trace_writer: self.traces.clone(),
             },
         )
     }
