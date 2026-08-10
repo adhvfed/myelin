@@ -205,6 +205,8 @@ mod tests {
                 "git.merge",
                 "git.open_pr",
                 "git.submit_review",
+                "issues.list",
+                "issues.view",
             ]
         );
         assert!(registry.resolve("git.merge").unwrap().requires_approval());

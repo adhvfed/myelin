@@ -210,6 +210,66 @@ async fn one_human_activation_is_retry_safe_durable_and_ready_for_a_governed_run
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_platform_managed_tenant_ceiling_learns_new_catalogue_grants_additively() {
+    let Some((admin, app)) = providers().await else {
+        eprintln!("SKIP: dev PostgreSQL unavailable");
+        return;
+    };
+    let tenant = unique("platform-policy-upgrade");
+    let region = app.config().region.clone();
+    let actor = human(&tenant, &region);
+    let registry = PgAgentRegistry::new(app);
+
+    let mut before_catalogue_growth = proposal("before-catalogue-growth");
+    before_catalogue_growth
+        .trigger_actor_policy_if_missing
+        .push("issue.view".into());
+    let before = registry
+        .create(&actor, before_catalogue_growth)
+        .await
+        .expect("the old catalogue seeds a platform-managed tenant default");
+
+    let mut after_catalogue_growth = proposal("after-catalogue-growth");
+    after_catalogue_growth.name = "Issue companion".into();
+    after_catalogue_growth.tools.push("issues.view".into());
+    after_catalogue_growth.grants.push("issue.view".into());
+    after_catalogue_growth
+        .tenant_policy_if_missing
+        .push("issue.view".into());
+    after_catalogue_growth
+        .trigger_actor_policy_if_missing
+        .push("issue.view".into());
+    let after = registry
+        .create(&actor, after_catalogue_growth)
+        .await
+        .expect("a platform catalogue addition evolves its managed default");
+
+    assert_eq!(
+        after.policy_versions.tenant,
+        before.policy_versions.tenant + 1
+    );
+    let (grants, platform_managed): (Vec<String>, bool) = sqlx::query_as(
+        "SELECT v.grants, h.platform_managed \
+           FROM delegation_policy_head h \
+           JOIN delegation_policy_version v \
+             ON v.tenant_id = h.tenant_id AND v.region = h.region \
+            AND v.policy_kind = h.policy_kind AND v.subject_id = h.subject_id \
+            AND v.trigger_actor_id = h.trigger_actor_id AND v.version = h.version \
+          WHERE h.tenant_id = $1 AND h.region = $2 AND h.policy_kind = 'tenant'",
+    )
+    .bind(&tenant)
+    .bind(&region)
+    .fetch_one(admin.db_pool())
+    .await
+    .expect("read evolved tenant policy");
+    assert!(platform_managed);
+    assert!(grants.binary_search(&"issue.view".into()).is_ok());
+    assert!(grants.binary_search(&"repo.push".into()).is_ok());
+
+    cleanup(&admin, &tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_ceiling_refusal_leaves_no_half_activated_agent() {
     let Some((admin, app)) = providers().await else {
         eprintln!("SKIP: dev PostgreSQL unavailable");

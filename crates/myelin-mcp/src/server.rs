@@ -405,7 +405,7 @@ fn read_result_json(tool: &str, jti: &str, result: Result<Value, DirectReadError
         ),
         Err(DirectReadError::Denied) => (format!("`{tool}` was denied."), true, Some("denied")),
         Err(DirectReadError::NotFound) => (
-            format!("`{tool}` did not find a visible CI run."),
+            format!("`{tool}` did not find a visible resource."),
             true,
             Some("not_found"),
         ),
@@ -466,10 +466,11 @@ mod tests {
             .expect("resp");
         let v: Value = serde_json::from_str(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 6);
+        assert_eq!(tools.len(), 8);
         let merge = tools.iter().find(|t| t["name"] == "git.merge").unwrap();
         assert_eq!(merge["annotations"]["requiresApproval"], json!(true));
         assert!(tools.iter().any(|tool| tool["name"] == "ci.read_run"));
+        assert!(tools.iter().any(|tool| tool["name"] == "issues.list"));
     }
 
     #[test]

@@ -55,6 +55,35 @@ CREATE TABLE IF NOT EXISTS delegation_policy_head (
             (tenant_id, region, policy_kind, subject_id, trigger_actor_id, version)
 );"#;
 
+/// Marks tenant ceilings seeded by the pre-0067 agent activation path. That path had no operator
+/// policy endpoint: its one exact grant set was the platform's MCP catalogue at the time. Narrow
+/// ceilings provisioned through the policy API remain operator-managed and are never widened.
+const DELEGATION_POLICY_MANAGEMENT_MIGRATION: &str = r#"
+ALTER TABLE delegation_policy_head
+  ADD COLUMN IF NOT EXISTS platform_managed boolean NOT NULL DEFAULT false;
+
+UPDATE delegation_policy_head h
+   SET platform_managed = true
+  FROM delegation_policy_version v
+ WHERE h.policy_kind = 'tenant'
+   AND h.tenant_id = v.tenant_id
+   AND h.region = v.region
+   AND h.policy_kind = v.policy_kind
+   AND h.subject_id = v.subject_id
+   AND h.trigger_actor_id = v.trigger_actor_id
+   AND h.version = v.version
+   AND v.status = 'active'
+   AND v.grants = ARRAY[
+       'agent.tools.read',
+       'edge.identity.read',
+       'pull_request.merge',
+       'pull_request.review',
+       'repo.approve_untrusted_ci',
+       'repo.push',
+       'run.view'
+   ]::text[];
+"#;
+
 pub const DELEGATION_RUN_SNAPSHOT_MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS delegation_run_snapshot (
     tenant_id                text NOT NULL,
@@ -123,6 +152,10 @@ pub fn delegation_policy_durable_migrations() -> Migrations {
             DELEGATION_RUN_SNAPSHOT_MIGRATION,
         ),
         Migration::plain("0066_delegation_run_snapshot_rls", SNAPSHOT_RLS),
+        Migration::plain(
+            "0066z_delegation_policy_management",
+            DELEGATION_POLICY_MANAGEMENT_MIGRATION,
+        ),
     ])
 }
 
@@ -256,26 +289,76 @@ pub async fn ensure_agent_policy_bundle_on_conn(
             heads.insert(key.kind.to_string(), row);
         }
     }
+    let tenant_upgrade = match platform_tenant_upgrade(
+        heads.get(TENANT),
+        &agent_grants,
+        &tenant_grants_if_missing,
+    ) {
+        Ok(upgrade) => upgrade,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Some(upgraded) = tenant_upgrade {
+        let current = heads
+            .get(TENANT)
+            .expect("a platform-managed upgrade requires an existing tenant head");
+        let version = current.version + 1;
+        let revision = append_and_advance_head(
+            conn,
+            tenant,
+            region,
+            &PolicyKey::tenant(),
+            PolicyUpdate {
+                version,
+                status: ACTIVE,
+                grants: upgraded.clone(),
+                platform_managed: true,
+            },
+        )
+        .await?;
+        heads.insert(
+            TENANT.into(),
+            PolicyRow {
+                kind: TENANT.into(),
+                version,
+                revision,
+                status: ACTIVE.into(),
+                grants: upgraded,
+                platform_managed: true,
+            },
+        );
+    }
     if let Err(error) = validate_activation_heads(&heads, &agent_grants) {
         return Ok(Err(error));
     }
 
-    for (key, grants) in [
-        (PolicyKey::tenant(), tenant_grants_if_missing),
-        (PolicyKey::agent(agent_id), agent_grants.clone()),
+    for (key, grants, platform_managed) in [
+        (PolicyKey::tenant(), tenant_grants_if_missing, true),
+        (PolicyKey::agent(agent_id), agent_grants.clone(), false),
         (
             PolicyKey::trigger_actor(trigger_actor_id),
             trigger_actor_grants_if_missing,
+            false,
         ),
         (
             PolicyKey::delegation(agent_id, trigger_actor_id),
             agent_grants,
+            false,
         ),
     ] {
         if !heads.contains_key(key.kind) {
-            let revision =
-                append_and_advance_head(conn, tenant, region, &key, 1, ACTIVE, grants.clone())
-                    .await?;
+            let revision = append_and_advance_head(
+                conn,
+                tenant,
+                region,
+                &key,
+                PolicyUpdate {
+                    version: 1,
+                    status: ACTIVE,
+                    grants: grants.clone(),
+                    platform_managed,
+                },
+            )
+            .await?;
             heads.insert(
                 key.kind.to_string(),
                 PolicyRow {
@@ -284,6 +367,7 @@ pub async fn ensure_agent_policy_bundle_on_conn(
                     revision,
                     status: ACTIVE.to_string(),
                     grants,
+                    platform_managed,
                 },
             );
         }
@@ -296,6 +380,26 @@ pub async fn ensure_agent_policy_bundle_on_conn(
         PgError::Query("agent activation did not produce four policy revisions".into())
     })?;
     Ok(Ok((versions, revisions)))
+}
+
+fn platform_tenant_upgrade(
+    tenant: Option<&PolicyRow>,
+    agent_grants: &[String],
+    current_platform_grants: &[String],
+) -> Result<Option<Vec<String>>, DurableDelegationPolicyError> {
+    let Some(tenant) = tenant else {
+        return Ok(None);
+    };
+    if contains_every(&tenant.grants, agent_grants) || !tenant.platform_managed {
+        return Ok(None);
+    }
+    require_active(tenant, TENANT)?;
+    if !contains_every(current_platform_grants, &tenant.grants)
+        || !contains_every(current_platform_grants, agent_grants)
+    {
+        return Err(DurableDelegationPolicyError::IncompatiblePolicy(TENANT));
+    }
+    Ok(Some(current_platform_grants.to_vec()))
 }
 
 fn validate_activation_heads(
@@ -352,6 +456,7 @@ struct PolicyRow {
     revision: i64,
     status: String,
     grants: Vec<String>,
+    platform_managed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -536,7 +641,16 @@ impl DurableDelegationPolicyBacking {
 
                     let version = expected.map_or(1, |cursor| cursor.version + 1);
                     let revision = append_and_advance_head(
-                        conn, &tenant, &region, &key, version, status, grants,
+                        conn,
+                        &tenant,
+                        &region,
+                        &key,
+                        PolicyUpdate {
+                            version,
+                            status,
+                            grants,
+                            platform_managed: false,
+                        },
                     )
                     .await?;
                     Ok(Ok(DurableDelegationPolicyHeadCursor { version, revision }))
@@ -727,14 +841,19 @@ fn canonicalize_grants(grants: &mut Vec<String>) -> Result<(), DurableDelegation
     Ok(())
 }
 
+struct PolicyUpdate<'a> {
+    version: i64,
+    status: &'a str,
+    grants: Vec<String>,
+    platform_managed: bool,
+}
+
 async fn append_and_advance_head(
     conn: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
     key: &PolicyKey,
-    version: i64,
-    status: &str,
-    grants: Vec<String>,
+    update: PolicyUpdate<'_>,
 ) -> Result<i64, PgError> {
     let revision: i64 = sqlx::query_scalar(
         "INSERT INTO delegation_policy_version \
@@ -746,26 +865,29 @@ async fn append_and_advance_head(
     .bind(key.kind)
     .bind(&key.subject)
     .bind(&key.actor)
-    .bind(version)
-    .bind(status)
-    .bind(grants)
+    .bind(update.version)
+    .bind(update.status)
+    .bind(update.grants)
     .fetch_one(&mut *conn)
     .await
     .map_err(|error| PgError::Query(error.to_string()))?;
     sqlx::query(
         "INSERT INTO delegation_policy_head \
-         (tenant_id, region, policy_kind, subject_id, trigger_actor_id, version, revision) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7) \
+         (tenant_id, region, policy_kind, subject_id, trigger_actor_id, version, revision, \
+          platform_managed) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
          ON CONFLICT (tenant_id, region, policy_kind, subject_id, trigger_actor_id) \
-         DO UPDATE SET version = EXCLUDED.version, revision = EXCLUDED.revision",
+         DO UPDATE SET version = EXCLUDED.version, revision = EXCLUDED.revision, \
+                       platform_managed = EXCLUDED.platform_managed",
     )
     .bind(tenant)
     .bind(region)
     .bind(key.kind)
     .bind(&key.subject)
     .bind(&key.actor)
-    .bind(version)
+    .bind(update.version)
     .bind(revision)
+    .bind(update.platform_managed)
     .execute(&mut *conn)
     .await
     .map_err(|error| PgError::Query(error.to_string()))?;
@@ -779,7 +901,7 @@ async fn load_policy_head_for_update(
     key: &PolicyKey,
 ) -> Result<Option<PolicyRow>, PgError> {
     let row = sqlx::query(
-        "SELECT h.policy_kind, h.version, h.revision, v.status, v.grants \
+        "SELECT h.policy_kind, h.version, h.revision, h.platform_managed, v.status, v.grants \
          FROM delegation_policy_head h \
          JOIN delegation_policy_version v \
            ON v.tenant_id = h.tenant_id AND v.region = h.region \
@@ -803,6 +925,7 @@ async fn load_policy_head_for_update(
         revision: row.get("revision"),
         status: row.get("status"),
         grants: row.get("grants"),
+        platform_managed: row.get("platform_managed"),
     }))
 }
 
@@ -814,7 +937,7 @@ async fn load_heads_for_share(
     actor: &str,
 ) -> Result<BTreeMap<String, PolicyRow>, PgError> {
     let rows = sqlx::query(
-        "SELECT h.policy_kind, h.version, h.revision, v.status, v.grants \
+        "SELECT h.policy_kind, h.version, h.revision, h.platform_managed, v.status, v.grants \
          FROM delegation_policy_head h \
          JOIN delegation_policy_version v \
            ON v.tenant_id = h.tenant_id AND v.region = h.region \
@@ -843,6 +966,7 @@ async fn load_heads_for_share(
                 revision: row.get("revision"),
                 status: row.get("status"),
                 grants: row.get("grants"),
+                platform_managed: row.get("platform_managed"),
             };
             (policy.kind.clone(), policy)
         })
@@ -1015,6 +1139,14 @@ mod tests {
             revision: 1,
             status: ACTIVE.into(),
             grants: grants.iter().map(|grant| (*grant).into()).collect(),
+            platform_managed: false,
+        }
+    }
+
+    fn platform_tenant(grants: &[&str]) -> PolicyRow {
+        PolicyRow {
+            platform_managed: true,
+            ..active(TENANT, grants)
         }
     }
 
@@ -1065,6 +1197,41 @@ mod tests {
     }
 
     #[test]
+    fn only_platform_managed_tenant_defaults_evolve_and_only_additively() {
+        let requested = vec!["agent.tools.read".into(), "issue.view".into()];
+        let current_platform = vec![
+            "agent.tools.read".into(),
+            "issue.view".into(),
+            "repo.push".into(),
+        ];
+        assert_eq!(
+            platform_tenant_upgrade(
+                Some(&platform_tenant(&["agent.tools.read", "repo.push"])),
+                &requested,
+                &current_platform,
+            )
+            .unwrap(),
+            Some(current_platform.clone())
+        );
+
+        let operator_ceiling = active(TENANT, &["agent.tools.read", "repo.push"]);
+        assert_eq!(
+            platform_tenant_upgrade(Some(&operator_ceiling), &requested, &current_platform,)
+                .unwrap(),
+            None,
+            "an operator-managed ceiling is never widened implicitly"
+        );
+        assert!(matches!(
+            platform_tenant_upgrade(
+                Some(&platform_tenant(&["agent.tools.read", "repo.push"])),
+                &requested,
+                &["agent.tools.read".into(), "issue.view".into()],
+            ),
+            Err(DurableDelegationPolicyError::IncompatiblePolicy(TENANT))
+        ));
+    }
+
+    #[test]
     fn migration_ids_follow_cell_root_and_are_forward_only() {
         let migrations = delegation_policy_durable_migrations();
         assert_eq!(
@@ -1073,7 +1240,7 @@ mod tests {
         );
         assert_eq!(
             migrations.0.last().unwrap().id,
-            "0066_delegation_run_snapshot_rls"
+            "0066z_delegation_policy_management"
         );
         assert!(migrations
             .0

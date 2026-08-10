@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use myelin_ci_controlplane::{ci_controlplane_migrations, CiRunStore};
 use myelin_edge::repo_authz::GrantBackedRepos;
-use myelin_edge::{DurableCiReadApi, DurableGitBackend, McpCiReadExecutor};
+use myelin_edge::{DurableCiReadApi, DurableGitBackend, McpReadExecutor};
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{
     DataRole, DelegationCaveats, FailStaticBound, Principal, PrincipalId, PrincipalKind,
@@ -251,7 +251,7 @@ fn server(
         )
         .with_clock(|| Timestamp(NOW.into())),
     );
-    let reads = Arc::new(McpCiReadExecutor::new(api, boundary, delegator));
+    let reads = Arc::new(McpReadExecutor::new(api, boundary, delegator));
     McpServer::with_router_reads_and_clock(
         ToolRegistry::with_git_and_ci_reads().expect("valid shared catalogue"),
         router,

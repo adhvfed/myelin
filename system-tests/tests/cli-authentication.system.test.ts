@@ -9,9 +9,10 @@ import { describe, expect, test } from "vitest";
 
 import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
 import { gitRepositoryUrl, systemTestConfig } from "../src/config.js";
+import { eventually } from "../src/eventually.js";
 import { git } from "../src/git-cli.js";
 import { GitProject } from "../src/git-project.js";
-import { array, record, string } from "../src/json.js";
+import { array, record, string, type JsonRecord } from "../src/json.js";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -33,6 +34,37 @@ type AgentRunEnvelope = {
   created: boolean;
   durable: boolean;
 };
+
+async function askAgent(
+  run: AgentRunEnvelope,
+  id: number,
+  tool: string,
+  arguments_: JsonRecord,
+): Promise<JsonRecord> {
+  const response = await systemClient.json(`/v1/agent-runs/${run.run.id}/mcp`, {
+    method: "POST",
+    body: {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: { name: tool, arguments: arguments_ },
+    },
+    token: run.credential.token,
+    tokenScheme: "agent",
+    expectedStatus: 200,
+  });
+  expect(JSON.stringify(response.body)).not.toContain(run.credential.token);
+  const result = record(response.body.result, `${tool} MCP result`);
+  expect(result, `${tool} MCP call failed: ${JSON.stringify(result)}`).toMatchObject({
+    isError: false,
+    _meta: { tool },
+  });
+  const content = array(result.content, `${tool} MCP content`);
+  expect(content).toHaveLength(1);
+  const text = string(record(content[0], `${tool} MCP content item`).text, `${tool} MCP text`);
+  expect(text).not.toContain(run.credential.token);
+  return record(JSON.parse(text), `${tool} payload`);
+}
 
 function cliEnvironment(
   configDirectory: string,
@@ -353,7 +385,14 @@ describe("the CLI authentication journey", () => {
         }>;
       };
       expect(mcpManifest.tools.map((tool) => tool.name)).toEqual(
-        expect.arrayContaining(["git.open_pr", "git.merge", "ci.read_run", "ci.read_log"]),
+        expect.arrayContaining([
+          "git.open_pr",
+          "git.merge",
+          "ci.read_run",
+          "ci.read_log",
+          "issues.list",
+          "issues.view",
+        ]),
       );
       expect(mcpManifest.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
       expect(mcpDescription.stdout).not.toContain(systemTestConfig.token);
@@ -374,6 +413,10 @@ describe("the CLI authentication journey", () => {
         "ci.read_run",
         "--tool",
         "git.open_pr",
+        "--tool",
+        "issues.list",
+        "--tool",
+        "issues.view",
       );
       expect(createAgent.exitCode, createAgent.stderr).toBe(0);
       const activated = JSON.parse(createAgent.stdout) as {
@@ -403,10 +446,13 @@ describe("the CLI authentication journey", () => {
           selected_tools: [
             { name: "ci.read_run", version: 1 },
             { name: "git.open_pr", version: 1 },
+            { name: "issues.list", version: 1 },
+            { name: "issues.view", version: 1 },
           ],
           grants: expect.arrayContaining([
             "agent.tools.read",
             "edge.identity.read",
+            "issue.view",
             "repo.push",
             "run.view",
           ]),
@@ -420,7 +466,13 @@ describe("the CLI authentication journey", () => {
         `myelin://${systemTestConfig.tenant}/identity/agent/${activated.agent.id}`,
       );
       expect(activated.agent.effective_tools.map((tool) => tool.name)).toEqual(
-        expect.arrayContaining(["ci.read_run", "ci.read_log", "git.open_pr"]),
+        expect.arrayContaining([
+          "ci.read_run",
+          "ci.read_log",
+          "git.open_pr",
+          "issues.list",
+          "issues.view",
+        ]),
       );
       for (const tool of activated.agent.selected_tools) {
         expect(tool.ref).toBe(
@@ -442,6 +494,10 @@ describe("the CLI authentication journey", () => {
         "ci.read_run",
         "--tool",
         "git.open_pr",
+        "--tool",
+        "issues.list",
+        "--tool",
+        "issues.view",
       );
       expect(replayAgent.exitCode, replayAgent.stderr).toBe(0);
       expect(JSON.parse(replayAgent.stdout)).toMatchObject({
@@ -509,6 +565,8 @@ describe("the CLI authentication journey", () => {
           selected_tools: [
             { name: "ci.read_run", version: 1 },
             { name: "git.open_pr", version: 1 },
+            { name: "issues.list", version: 1 },
+            { name: "issues.view", version: 1 },
           ],
           effective_grants: activated.agent.grants,
           state: "ready",
@@ -574,6 +632,8 @@ describe("the CLI authentication journey", () => {
       expect(discoveredTools.map((tool) => string(tool.name, "MCP tool name"))).toEqual([
         "ci.read_run",
         "git.open_pr",
+        "issues.list",
+        "issues.view",
       ]);
       expect(discoveredTools.at(0)?.inputSchema).toMatchObject({
         type: "object",
@@ -583,6 +643,15 @@ describe("the CLI authentication journey", () => {
       expect(discoveredTools.at(1)?.inputSchema).toMatchObject({
         type: "object",
         required: ["repo", "title"],
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(2)?.inputSchema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(3)?.inputSchema).toMatchObject({
+        type: "object",
+        required: ["issue_id"],
         additionalProperties: false,
       });
 
@@ -659,7 +728,12 @@ describe("the CLI authentication journey", () => {
         record(bridgeResponses.at(1)?.result, "CLI MCP tools/list result").tools,
         "CLI MCP tools/list tools",
       ).map((tool, index) => string(record(tool, `CLI MCP tool ${index}`).name, "tool name"));
-      expect(bridgeTools).toEqual(["ci.read_run", "git.open_pr"]);
+      expect(bridgeTools).toEqual([
+        "ci.read_run",
+        "git.open_pr",
+        "issues.list",
+        "issues.view",
+      ]);
 
       // Pausing a collaborator is one durable human action: new work stops and in-flight bearer
       // authority dies with it. The same request is safe to repeat after a lost response.
@@ -752,66 +826,6 @@ describe("the CLI authentication journey", () => {
         expectedStatus: 401,
       });
 
-      const workAfterResume = await systemClient.json(
-        `/v1/agents/${activated.agent.id}/runs`,
-        {
-          method: "POST",
-          body: {},
-          token: browserSession,
-          tokenScheme: "session",
-          idempotencyKey: `cli-agent-after-resume-${randomUUID()}`,
-          expectedStatus: 201,
-        },
-      );
-      const resumedRun = workAfterResume.body as unknown as AgentRunEnvelope;
-      await systemClient.json("/v1/whoami", {
-        token: resumedRun.credential.token,
-        tokenScheme: "agent",
-        expectedStatus: 200,
-      });
-
-      // Retirement is the irreversible counterpart: active work is torn down and neither the
-      // CLI nor another client can quietly revive the durable identity.
-      const retireAgent = await runCli(
-        configDirectory,
-        "--idempotency-key",
-        `cli-agent-retire-${randomUUID()}`,
-        "agent",
-        "retire",
-        activated.agent.id,
-      );
-      expect(retireAgent.exitCode, retireAgent.stderr).toBe(0);
-      expect(retireAgent.stdout).toContain(`Retired agent: ${agentName}`);
-      expect(retireAgent.stdout).toContain("stopped 1 active run");
-      expect(retireAgent.stdout).toContain("cannot be resumed");
-      await systemClient.json("/v1/whoami", {
-        token: resumedRun.credential.token,
-        tokenScheme: "agent",
-        expectedStatus: 401,
-      });
-
-      const retiredAgent = await runCli(
-        configDirectory,
-        "--json",
-        "agent",
-        "show",
-        activated.agent.id,
-      );
-      expect(retiredAgent.exitCode, retiredAgent.stderr).toBe(0);
-      expect(JSON.parse(retiredAgent.stdout)).toMatchObject({
-        agent: { id: activated.agent.id, status: "disabled" },
-      });
-      const reviveRetiredAgent = await runCli(
-        configDirectory,
-        "--idempotency-key",
-        `cli-agent-revive-retired-${randomUUID()}`,
-        "agent",
-        "resume",
-        activated.agent.id,
-      );
-      expect(reviveRetiredAgent.exitCode).toBe(1);
-      expect(reviveRetiredAgent.stderr).toContain("retired agent cannot be resumed");
-
       // A founder names the first project once. Its generated identity becomes context,
       // so show and subsequent work no longer carry an operator-provided UUID.
       const cliProjectName = uniqueName("Developer experience");
@@ -875,7 +889,19 @@ describe("the CLI authentication journey", () => {
         contextualIssueTitle,
       );
       expect(contextualIssue.exitCode, contextualIssue.stderr).toBe(0);
-      expect(JSON.parse(contextualIssue.stdout)).toMatchObject({
+      const issueProposal = record(JSON.parse(contextualIssue.stdout), "CLI issue proposal");
+      const issueSummary = record(issueProposal.issue, "CLI issue summary");
+      const issueAuthorization = record(
+        issueProposal.authorization,
+        "CLI issue authorization",
+      );
+      const issueId = string(issueSummary.id, "CLI issue id");
+      const issueKey = string(issueSummary.key, "CLI issue key");
+      const requestEventId = string(
+        issueAuthorization.request_event_id,
+        "CLI issue authorization request id",
+      );
+      expect(issueProposal).toMatchObject({
         issue: {
           project_id: createdProject.project.id,
           key: expect.stringMatching(new RegExp(`^${createdProject.project.issue_prefix}-\\d+$`)),
@@ -889,6 +915,102 @@ describe("the CLI authentication journey", () => {
         profile: "default",
         project: createdProject.project.id,
       });
+
+      const activeIssue = await eventually<JsonRecord>(
+        async () => {
+          const response = await systemClient.json(
+            `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
+            { expectedStatus: [200, 202] },
+          );
+          return response.status === 200
+            ? record(response.body.issue, "authorized CLI issue")
+            : undefined;
+        },
+        { description: `authorization for CLI issue ${issueKey}` },
+      );
+      expect(activeIssue).toMatchObject({ id: issueId, key: issueKey, title: contextualIssueTitle });
+
+      // Once resumed, the collaborator reads the founder's issue through Myelin itself. The run
+      // credential and the founder's live project membership intersect at Edge; no Linear token,
+      // copied browser session, tenant selector, or provider-specific setup reaches the agent.
+      const workAfterResume = await systemClient.json(
+        `/v1/agents/${activated.agent.id}/runs`,
+        {
+          method: "POST",
+          body: {},
+          token: browserSession,
+          tokenScheme: "session",
+          idempotencyKey: `cli-agent-after-resume-${randomUUID()}`,
+          expectedStatus: 201,
+        },
+      );
+      const resumedRun = workAfterResume.body as unknown as AgentRunEnvelope;
+      const issuePage = await askAgent(resumedRun, 3, "issues.list", {
+        key: createdProject.project.issue_prefix,
+        limit: 10,
+      });
+      expect(array(issuePage.items, "agent-visible issues")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: issueId,
+            key: issueKey,
+            title: contextualIssueTitle,
+            ref: `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`,
+          }),
+        ]),
+      );
+      expect(issuePage.page).toMatchObject({ limit: 10 });
+
+      const viewedIssue = await askAgent(resumedRun, 4, "issues.view", { issue_id: issueId });
+      expect(viewedIssue).toMatchObject({
+        id: issueId,
+        key: issueKey,
+        title: contextualIssueTitle,
+        project_id: createdProject.project.id,
+        ref: `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`,
+      });
+
+      // Retirement is the irreversible counterpart: active work is torn down and neither the
+      // CLI nor another client can quietly revive the durable identity.
+      const retireAgent = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        `cli-agent-retire-${randomUUID()}`,
+        "agent",
+        "retire",
+        activated.agent.id,
+      );
+      expect(retireAgent.exitCode, retireAgent.stderr).toBe(0);
+      expect(retireAgent.stdout).toContain(`Retired agent: ${agentName}`);
+      expect(retireAgent.stdout).toContain("stopped 1 active run");
+      expect(retireAgent.stdout).toContain("cannot be resumed");
+      await systemClient.json("/v1/whoami", {
+        token: resumedRun.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 401,
+      });
+
+      const retiredAgent = await runCli(
+        configDirectory,
+        "--json",
+        "agent",
+        "show",
+        activated.agent.id,
+      );
+      expect(retiredAgent.exitCode, retiredAgent.stderr).toBe(0);
+      expect(JSON.parse(retiredAgent.stdout)).toMatchObject({
+        agent: { id: activated.agent.id, status: "disabled" },
+      });
+      const reviveRetiredAgent = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        `cli-agent-revive-retired-${randomUUID()}`,
+        "agent",
+        "resume",
+        activated.agent.id,
+      );
+      expect(reviveRetiredAgent.exitCode).toBe(1);
+      expect(reviveRetiredAgent.stderr).toContain("retired agent cannot be resumed");
 
       // Migration uses that same browser-approved context: the file contains source records,
       // while project scope and credentials remain outside the export.

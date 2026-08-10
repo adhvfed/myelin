@@ -23,7 +23,9 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::repo_authz::{RepoAuthorizer, RepoPermission};
 use crate::request::EdgeResponse;
-use crate::{DurableCiReadApi, DurableGitBackend, GitEffectApi, McpCiReadExecutor};
+use crate::{
+    DurableCiReadApi, DurableGitBackend, DurableIssueReadApi, GitEffectApi, McpReadExecutor,
+};
 
 #[derive(Clone)]
 pub struct AgentMcpServices {
@@ -35,6 +37,7 @@ pub struct AgentMcpServices {
     principals: PrincipalStore,
     git: Arc<DurableGitBackend>,
     ci: DurableCiReadApi,
+    issues: DurableIssueReadApi,
     audit: Arc<OutboxGovernanceAudit>,
     runtime: Handle,
 }
@@ -50,6 +53,7 @@ impl AgentMcpServices {
         principals: PrincipalStore,
         git: Arc<DurableGitBackend>,
         ci: DurableCiReadApi,
+        issues: DurableIssueReadApi,
         runtime: Handle,
     ) -> Self {
         let audit = Arc::new(OutboxGovernanceAudit::new(
@@ -68,6 +72,7 @@ impl AgentMcpServices {
             principals,
             git,
             ci,
+            issues,
             audit,
             runtime,
         }
@@ -173,11 +178,14 @@ impl Handler for AgentMcpHandler {
             self.services.audit.clone(),
         )
         .map_err(EdgeError::Unavailable)?;
-        let reads = Arc::new(McpCiReadExecutor::new(
-            self.services.ci.clone(),
-            self.services.boundary.clone(),
-            delegator,
-        ));
+        let reads = Arc::new(
+            McpReadExecutor::new(
+                self.services.ci.clone(),
+                self.services.boundary.clone(),
+                delegator,
+            )
+            .with_issues(self.services.issues.clone()),
+        );
         let server = McpServer::with_router_and_reads(registry, router, reads);
         let frame = std::str::from_utf8(&ctx.request.body)
             .map_err(|_| EdgeError::BadRequest("MCP frame must be valid UTF-8".into()))?;

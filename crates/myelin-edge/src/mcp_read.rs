@@ -1,7 +1,11 @@
-use crate::{DurableCiReadApi, EdgeError};
+use crate::{DurableCiReadApi, DurableIssueReadApi, EdgeError};
 use myelin_ci_controlplane::surfacing_store::CI_LOG_RANGE_DEFAULT;
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
+use myelin_issues::{
+    api::{is_canonical_uuid, IssueListState},
+    IssuePageRequest,
+};
 use myelin_mcp::{DirectReadError, DirectReadExecutor, ReadAuthorization};
 use myelin_storage::TenantScope;
 use serde_json::Value;
@@ -10,27 +14,34 @@ use std::sync::Arc;
 
 use crate::agent_delegation::is_active_delegation;
 
-pub struct McpCiReadExecutor {
-    api: DurableCiReadApi,
+pub struct McpReadExecutor {
+    ci: DurableCiReadApi,
+    issues: Option<DurableIssueReadApi>,
     authority: Arc<RunTokenAuthorizer>,
     delegator: Principal,
 }
 
-impl McpCiReadExecutor {
+impl McpReadExecutor {
     pub fn new(
-        api: DurableCiReadApi,
+        ci: DurableCiReadApi,
         authority: Arc<RunTokenAuthorizer>,
         delegator: Principal,
     ) -> Self {
         Self {
-            api,
+            ci,
+            issues: None,
             authority,
             delegator,
         }
     }
+
+    pub fn with_issues(mut self, issues: DurableIssueReadApi) -> Self {
+        self.issues = Some(issues);
+        self
+    }
 }
 
-impl DirectReadExecutor for McpCiReadExecutor {
+impl DirectReadExecutor for McpReadExecutor {
     fn execute(
         &self,
         principal: &Principal,
@@ -57,7 +68,7 @@ impl DirectReadExecutor for McpCiReadExecutor {
             "ci.read_run" => {
                 exact_fields(arguments, &["run_id"], &["run_id"])?;
                 let run_id = required_string(arguments, "run_id")?;
-                self.api
+                self.ci
                     .read_run(&self.delegator, run_id)
                     .map_err(map_edge_error)
             }
@@ -71,13 +82,47 @@ impl DirectReadExecutor for McpCiReadExecutor {
                 let job_id = required_string(arguments, "job_id")?;
                 let start = optional_i64(arguments, "start")?.unwrap_or(0);
                 let limit = optional_u32(arguments, "limit")?.unwrap_or(CI_LOG_RANGE_DEFAULT);
-                self.api
+                self.ci
                     .read_log(&self.delegator, run_id, job_id, start, limit)
+                    .map_err(map_edge_error)
+            }
+            "issues.list" => self
+                .issues
+                .as_ref()
+                .ok_or(DirectReadError::Unavailable)?
+                .list(&self.delegator, issue_page(arguments)?)
+                .map_err(map_edge_error),
+            "issues.view" => {
+                exact_fields(arguments, &["issue_id"], &["issue_id"])?;
+                let issue_id = required_string(arguments, "issue_id")?;
+                if !is_canonical_uuid(issue_id) {
+                    return Err(invalid("`issue_id` must be a canonical lowercase UUID"));
+                }
+                self.issues
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .view(&self.delegator, issue_id)
                     .map_err(map_edge_error)
             }
             _ => Err(DirectReadError::Unavailable),
         }
     }
+}
+
+fn issue_page(arguments: &Value) -> Result<IssuePageRequest, DirectReadError> {
+    exact_fields(arguments, &[], &["state", "key", "limit", "cursor"])?;
+    let state = optional_string(arguments, "state")?
+        .map(|value| {
+            IssueListState::parse(value)
+                .ok_or_else(|| invalid("`state` must be open, closed, or all"))
+        })
+        .transpose()?
+        .unwrap_or(IssueListState::Open);
+    let key = optional_string(arguments, "key")?.map(str::to_string);
+    let limit = optional_u32(arguments, "limit")?.unwrap_or(50);
+    let cursor = optional_string(arguments, "cursor")?.map(str::to_string);
+    IssuePageRequest::filtered(state, key, limit, cursor)
+        .map_err(|error| invalid(error.to_string()))
 }
 
 fn exact_fields(
@@ -106,6 +151,20 @@ fn required_string<'a>(arguments: &'a Value, field: &str) -> Result<&'a str, Dir
         .get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| invalid(format!("`{field}` must be a string")))
+}
+
+fn optional_string<'a>(
+    arguments: &'a Value,
+    field: &str,
+) -> Result<Option<&'a str>, DirectReadError> {
+    arguments
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| invalid(format!("`{field}` must be a string")))
+        })
+        .transpose()
 }
 
 fn optional_i64(arguments: &Value, field: &str) -> Result<Option<i64>, DirectReadError> {
@@ -177,5 +236,29 @@ mod tests {
         );
         assert!(optional_u32(&json!({"limit": -1}), "limit").is_err());
         assert!(optional_u32(&json!({"limit": 4294967296_u64}), "limit").is_err());
+    }
+
+    #[test]
+    fn issue_list_arguments_are_a_small_normalized_query_language() {
+        assert_eq!(
+            issue_page(&json!({})).unwrap(),
+            IssuePageRequest::filtered(IssueListState::Open, None, 50, None).unwrap()
+        );
+        assert_eq!(
+            issue_page(&json!({"state":"closed","key":"eng-","limit":7})).unwrap(),
+            IssuePageRequest::filtered(IssueListState::Closed, Some("ENG-".into()), 7, None)
+                .unwrap()
+        );
+
+        for arguments in [
+            json!({"state":"OPEN"}),
+            json!({"key":"title search"}),
+            json!({"limit":0}),
+            json!({"limit":"7"}),
+            json!({"cursor":7}),
+            json!({"tenant":"other"}),
+        ] {
+            assert!(issue_page(&arguments).is_err(), "accepted {arguments}");
+        }
     }
 }

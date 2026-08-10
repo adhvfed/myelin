@@ -78,10 +78,11 @@ pub use issue_authz::{
     IssueReconciliationReport, StoreBackedIssueAuthorizer, ISSUE_RECONCILE_TENANTS_ENV,
 };
 pub use issues_http::{
-    register_issues, MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS, MAX_ISSUE_JSON_BYTES,
+    register_issues, DurableIssueReadApi, MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS,
+    MAX_ISSUE_JSON_BYTES,
 };
 pub use knowledge_http::register_knowledge;
-pub use mcp_read::McpCiReadExecutor;
+pub use mcp_read::McpReadExecutor;
 pub use notif_http::register_notif;
 pub use project_http::register_projects;
 pub use repo_authz::{AllowAllRepos, DenyAllRepos, GrantBackedRepos, RepoAccess, RepoAuthorizer};

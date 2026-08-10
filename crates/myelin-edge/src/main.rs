@@ -11,9 +11,9 @@ use myelin_edge::{
     register_tools, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
     AgentMcpServices, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
     CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableCiReadApi, DurableGitBackend,
-    Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method, ReadinessCheck,
-    ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget, ShutdownOutcome,
-    StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
+    DurableIssueReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
+    ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
+    ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
@@ -1144,6 +1144,7 @@ async fn serve(
             mcp_principals,
             git_backend.clone(),
             mcp_ci,
+            DurableIssueReadApi::new(issue_store.clone(), handle.clone()),
             handle.clone(),
         ),
     );

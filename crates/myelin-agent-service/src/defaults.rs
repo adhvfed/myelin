@@ -26,6 +26,8 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("git", "scip_index") => false,
 
         ("issues", "forecast") => false,
+        ("issues", "list") => false,
+        ("issues", "view") => false,
         ("issues", "triage") => false,
         ("issues", "sla_draft") => false,
         ("issues", "create") => false,

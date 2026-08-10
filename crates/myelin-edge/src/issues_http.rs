@@ -23,6 +23,62 @@ const AUTHORIZATION_STATUS_RETRY_AFTER_MS: u64 = 1_000;
 type ProductionIssueStore = PgIssueStore<StoreBackedIssueAuthorizer>;
 
 #[derive(Clone)]
+pub struct DurableIssueReadApi {
+    store: Arc<ProductionIssueStore>,
+    runtime: Handle,
+}
+
+impl DurableIssueReadApi {
+    pub fn new(store: Arc<ProductionIssueStore>, runtime: Handle) -> Self {
+        Self { store, runtime }
+    }
+
+    fn drive<F, T>(&self, future: F) -> Result<T, IssueStoreError>
+    where
+        F: Future<Output = Result<T, IssueStoreError>>,
+    {
+        drive_on_runtime(
+            &self.runtime,
+            future,
+            IssueStoreError::AuthorizationUnavailable(
+                "Issues read API requires the Edge multi-thread runtime".into(),
+            ),
+        )
+    }
+
+    pub fn list(
+        &self,
+        principal: &myelin_identity::Principal,
+        request: IssuePageRequest,
+    ) -> Result<Value, EdgeError> {
+        let page = self
+            .drive(self.store.list(principal, request))
+            .map_err(map_store_error)?;
+        let items = page
+            .items
+            .iter()
+            .map(|issue| issue_json(&principal.tenant.0, issue))
+            .collect::<Vec<_>>();
+        Ok(page_envelope(
+            json!(items),
+            page.next_cursor,
+            page.limit as usize,
+        ))
+    }
+
+    pub fn view(
+        &self,
+        principal: &myelin_identity::Principal,
+        issue_id: &str,
+    ) -> Result<Value, EdgeError> {
+        let issue = self
+            .drive(self.store.view(principal, issue_id))
+            .map_err(map_store_error)?;
+        Ok(issue_json(&principal.tenant.0, &issue))
+    }
+}
+
+#[derive(Clone)]
 struct DurableIssueHttpApi {
     store: Arc<ProductionIssueStore>,
     projects: PgProjectStore,
@@ -260,24 +316,15 @@ fn no_store(response: EdgeResponse) -> EdgeResponse {
 }
 
 struct IssueListHandler {
-    api: DurableIssueHttpApi,
+    api: DurableIssueReadApi,
 }
 
 impl Handler for IssueListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let request = parse_issue_list_query(&ctx.request.query)?;
-        let page = self
-            .api
-            .drive(self.api.store.list(ctx.principal, request))
-            .map_err(map_store_error)?;
-        let items: Vec<Value> = page
-            .items
-            .iter()
-            .map(|issue| issue_json(&ctx.principal.tenant.0, issue))
-            .collect();
         Ok(no_store(EdgeResponse::json(
             200,
-            &page_envelope(json!(items), page.next_cursor, page.limit as usize),
+            &self.api.list(ctx.principal, request)?,
         )))
     }
 }
@@ -413,19 +460,15 @@ impl Handler for IssueAuthorizationStatusHandler {
 }
 
 struct IssueViewHandler {
-    api: DurableIssueHttpApi,
+    api: DurableIssueReadApi,
 }
 
 impl Handler for IssueViewHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let id = issue_param(ctx)?;
-        let issue = self
-            .api
-            .drive(self.api.store.view(ctx.principal, id))
-            .map_err(map_store_error)?;
         Ok(no_store(EdgeResponse::json(
             200,
-            &issue_json(&ctx.principal.tenant.0, &issue),
+            &self.api.view(ctx.principal, id)?,
         )))
     }
 }
@@ -500,12 +543,13 @@ pub fn register_issues(
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = DurableIssueHttpApi::new(store, projects, authorizer.clone(), runtime);
+    let reads = DurableIssueReadApi::new(api.store.clone(), api.runtime.clone());
     let builder = builder
         .route(
             Method::Get,
             "/v1/issues",
             "issues.list",
-            Arc::new(IssueListHandler { api: api.clone() }),
+            Arc::new(IssueListHandler { api: reads.clone() }),
         )
         .route(
             Method::Post,
@@ -527,7 +571,7 @@ pub fn register_issues(
             guarded(
                 &authorizer,
                 IssuePermission::View,
-                Arc::new(IssueViewHandler { api: api.clone() }),
+                Arc::new(IssueViewHandler { api: reads }),
             ),
         )
         .route(

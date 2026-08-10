@@ -51,6 +51,43 @@ CREATE TRIGGER rebac_tuple_invalidate_issue_view
 AFTER INSERT OR UPDATE OR DELETE ON rebac_tuple
 FOR EACH ROW EXECUTE FUNCTION myelin_invalidate_issue_view_projection();"#;
 
+/// Once per-run grants shared `rebac_tuple`, the original broad invalidator made issue lists
+/// unavailable after every `run:*` insert. The trigger function is shared by the Issues tables, so
+/// it scopes only ReBAC changes: issue rows always invalidate, while unrelated tuple families do
+/// not.
+pub const AUTHZ_PROJECTION_SCOPED_INVALIDATOR_MIGRATION: &str = r#"
+CREATE OR REPLACE FUNCTION myelin_invalidate_issue_view_projection()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY INVOKER
+AS $$
+DECLARE
+    scoped_tenant text;
+    scoped_region text;
+BEGIN
+    IF TG_TABLE_NAME = 'rebac_tuple' THEN
+        IF split_part(COALESCE(NEW.object_id, ''), ':', 1)
+               NOT IN ('issue', 'project', 'team', 'org')
+           AND split_part(COALESCE(OLD.object_id, ''), ':', 1)
+               NOT IN ('issue', 'project', 'team', 'org') THEN
+            RETURN COALESCE(NEW, OLD);
+        END IF;
+    END IF;
+
+    scoped_tenant := COALESCE(NEW.tenant_id, OLD.tenant_id);
+    scoped_region := COALESCE(NEW.region, OLD.region);
+    INSERT INTO authz_projection_state
+        (tenant_id, region, projection, source_revision, applied_revision, status, rebuilt_at)
+    VALUES (scoped_tenant, scoped_region, 'issue:view', 1, 0, 'pending', NULL)
+    ON CONFLICT (tenant_id, region, projection) DO UPDATE
+       SET source_revision = authz_projection_state.source_revision + 1,
+           status = 'pending',
+           rebuilt_at = NULL;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$;
+"#;
+
 pub fn authz_projection_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain(
@@ -65,12 +102,27 @@ pub fn authz_projection_durable_migrations() -> Migrations {
             "0069_authz_projection_invalidator",
             AUTHZ_PROJECTION_INVALIDATOR_MIGRATION,
         ),
+        Migration::plain(
+            "0069c_authz_projection_scoped_invalidator",
+            AUTHZ_PROJECTION_SCOPED_INVALIDATOR_MIGRATION,
+        ),
     ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_issue_projection_invalidator_names_only_its_dependency_graph() {
+        for relevant in ["issue", "project", "team", "org"] {
+            assert!(AUTHZ_PROJECTION_SCOPED_INVALIDATOR_MIGRATION.contains(relevant));
+        }
+        assert!(
+            AUTHZ_PROJECTION_SCOPED_INVALIDATOR_MIGRATION.contains("TG_TABLE_NAME = 'rebac_tuple'")
+        );
+        assert!(!AUTHZ_PROJECTION_SCOPED_INVALIDATOR_MIGRATION.contains("'run'"));
+    }
 
     #[test]
     fn migration_ids_follow_delegation_range_and_rows_are_effective_permissions() {
@@ -80,6 +132,9 @@ mod tests {
             .map(|migration| migration.id)
             .collect();
         assert_eq!(ids.first(), Some(&"0067_authz_projection_state"));
-        assert_eq!(ids.last(), Some(&"0069_authz_projection_invalidator"));
+        assert_eq!(
+            ids.last(),
+            Some(&"0069c_authz_projection_scoped_invalidator")
+        );
     }
 }

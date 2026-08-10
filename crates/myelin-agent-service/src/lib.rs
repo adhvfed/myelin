@@ -18,6 +18,7 @@ pub mod hitl_batch;
 pub mod holder;
 pub mod identity;
 pub mod issues_agents;
+pub mod issues_read_tools;
 pub mod issues_tools;
 pub mod knowledge_tools;
 pub mod long_park;
@@ -116,6 +117,8 @@ pub use issues_agents::{
     ForecastInput, ForecastOutput, LinearForecast, ASSIGN_TOOL, CLOSE_TOOL, CREATE_TOOL,
     ESTIMATE_TOOL, LINK_TOOL, REORDER_TOOL, UPDATE_TOOL,
 };
+
+pub use issues_read_tools::{issues_read_tool_defs, LIST_ISSUES_TOOL, VIEW_ISSUE_TOOL};
 
 pub use chat_tools::{
     chat_tool_defs, landing_requires_approval, post_message_tool_def, post_required_caps,
