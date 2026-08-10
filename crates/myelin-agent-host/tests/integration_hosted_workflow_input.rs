@@ -218,7 +218,7 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
                 event_type: "ci.run.failed".into(),
                 matcher: serde_json::json!({}),
                 task: "Explain the failure and prepare the smallest safe fix.".into(),
-                delegation_caveats: vec!["repo:core".into(), "issue:create".into()],
+                delegation_caveats: vec!["repo:core".into(), "issue.create".into()],
                 budget_minor_units: 250_000,
                 max_firings: 1,
                 max_causal_depth: 4,
@@ -299,7 +299,7 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
     );
     assert_eq!(work.trigger_actor.principal_id.0, "founder");
     assert_eq!(work.agent_id, agent_id.to_string());
-    assert_eq!(work.delegation_caveats, ["repo:core", "issue:create"]);
+    assert_eq!(work.delegation_caveats, ["repo:core", "issue.create"]);
     assert_eq!(work.selected_tools, ["git.read", "issue.create"]);
     assert_eq!(work.budget_minor_units, 250_000);
     assert_eq!(work.event, event);

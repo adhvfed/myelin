@@ -49,6 +49,7 @@ impl GitEffectApi {
         &self,
         authority: &EffectAuthority,
         proposed_tool: &str,
+        arguments: &Value,
     ) -> Result<(), String> {
         if authority.tool != proposed_tool {
             return Err(format!(
@@ -80,13 +81,17 @@ impl GitEffectApi {
             .iter()
             .map(|cap| (*cap).to_string())
             .collect();
+        let repository = str_arg(arguments, "repo").ok_or_else(|| {
+            "git tool argument `repo` is required at the authority boundary".to_string()
+        })?;
         let scope = TenantScope::from_verified_token(&self.principal, Region(self.region.clone()));
         self.authority
-            .authorize(
+            .authorize_repository(
                 &scope,
                 &self.principal.principal_id,
                 &authority.run_token,
                 &required_caps,
+                repository,
             )
             .map(|_| ())
     }
@@ -308,7 +313,7 @@ impl EffectApi for GitEffectApi {
         effect: ProposedEffect,
     ) -> EffectResult {
         match parse_proposed(&effect.0) {
-            Some((tool, args)) => match self.authorize_effect(authority, &tool) {
+            Some((tool, args)) => match self.authorize_effect(authority, &tool, &args) {
                 Ok(()) => match mcp_operation_id(
                     &self.tenant,
                     &authority.principal_id.0,

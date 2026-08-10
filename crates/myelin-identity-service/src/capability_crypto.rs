@@ -869,6 +869,15 @@ impl crate::mint::TokenSigner for PasetoCapabilitySigner {
             audience,
         })
     }
+
+    fn attenuate(&self, material: &str, grants: &[String]) -> Result<String, String> {
+        attenuate(material, grants.iter().cloned()).map_err(|error| match error {
+            AuthzError::BadRequest(reason)
+            | AuthzError::Unavailable(reason)
+            | AuthzError::FailClosed(reason) => reason,
+            AuthzError::NotYetImplemented(reason) => reason.to_string(),
+        })
+    }
 }
 
 #[derive(Clone, Default)]

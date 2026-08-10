@@ -35,7 +35,9 @@ use myelin_mcp::{
     GovernanceAudit, GovernanceAuditRecord, GovernedRouter, McpServer, OutboxGovernanceAudit,
     ReadAuthorization, RunPrincipal, ToolRegistry,
 };
-use myelin_storage::hitl_gate_durable::{GateDecideError, GateRecord, GateState, HitlVerdictStore};
+use myelin_storage::hitl_gate_durable::{
+    gate_ref_token, GateDecideError, GateRecord, GateState, HitlVerdictStore,
+};
 
 fn now() -> Timestamp {
     Timestamp("2026-06-26T00:00:00Z".into())
@@ -191,6 +193,27 @@ fn governed_router_with_verdicts(
     run_ttl_secs: u64,
     verdicts: HitlVerdictStore,
 ) -> GovernedRouter {
+    let caveats = DelegationCaveats(input.delegation.grants().map(str::to_string).collect());
+    governed_router_with_caveats_and_verdicts(
+        input,
+        caveats,
+        trigger_jti,
+        trigger_expires_at_unix,
+        audit,
+        run_ttl_secs,
+        verdicts,
+    )
+}
+
+fn governed_router_with_caveats_and_verdicts(
+    input: DelegationInput,
+    caveats: DelegationCaveats,
+    trigger_jti: &str,
+    trigger_expires_at_unix: i64,
+    audit: Arc<dyn GovernanceAudit>,
+    run_ttl_secs: u64,
+    verdicts: HitlVerdictStore,
+) -> GovernedRouter {
     let s7 = RevocationStore::new();
     let minter =
         RunTokenMinter::with_signer_and_tuples(s7, None, Arc::new(StructuralTokenSigner::new()));
@@ -198,8 +221,6 @@ fn governed_router_with_verdicts(
     let agent = agent_principal("agent:claude", "acme");
     let trigger = human_principal("human:operator", "acme");
     let scope = TenantScope::from_verified_token(&trigger, Region("eu-west".into()));
-
-    let caveats = input.delegation.grants().map(str::to_string).collect();
 
     let run_id = RunId("mcp-run-1".into());
     let agent_id = PrincipalId("agent:claude".into());
@@ -219,7 +240,7 @@ fn governed_router_with_verdicts(
         trigger_expires_at_unix,
         run_id,
         resolved_policy,
-        caveats: DelegationCaveats(caveats),
+        caveats,
         kind: MachineKind::Agent,
         ttl: FailStaticBound {
             static_max_secs: run_ttl_secs,
@@ -270,6 +291,23 @@ impl DirectReadExecutor for RecordingReadExecutor {
     }
 }
 
+struct CountingReadExecutor {
+    calls: AtomicUsize,
+}
+
+impl DirectReadExecutor for CountingReadExecutor {
+    fn execute(
+        &self,
+        _principal: &Principal,
+        _authority: &ReadAuthorization,
+        _tool: &str,
+        _arguments: &serde_json::Value,
+    ) -> Result<serde_json::Value, DirectReadError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!({"unexpected": true}))
+    }
+}
+
 fn ci_read_router(grants: &[&str]) -> GovernedRouter {
     governed_router_with_input(DelegationInput {
         agent_policy: Authority::of(grants.iter().copied()),
@@ -277,6 +315,27 @@ fn ci_read_router(grants: &[&str]) -> GovernedRouter {
         tenant_policy: Authority::of(grants.iter().copied()),
         trigger_actor_held: Authority::of(grants.iter().copied()),
     })
+}
+
+fn caveated_router(grants: &[&str], caveats: &[&str]) -> GovernedRouter {
+    let input = DelegationInput {
+        agent_policy: Authority::of(grants.iter().copied()),
+        delegation: Authority::of(grants.iter().copied()),
+        tenant_policy: Authority::of(grants.iter().copied()),
+        trigger_actor_held: Authority::of(grants.iter().copied()),
+    };
+    governed_router_with_caveats_and_verdicts(
+        input,
+        DelegationCaveats(caveats.iter().map(|caveat| (*caveat).to_string()).collect()),
+        "trigger-jti",
+        i64::MAX,
+        Arc::new(OutboxGovernanceAudit::new(
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()),
+        )),
+        300,
+        HitlVerdictStore::new(),
+    )
 }
 
 #[test]
@@ -319,6 +378,70 @@ fn declared_caps_fail_closed_for_missing_and_attenuated_delegation() {
         CallOutcome::Denied { reason, .. } => assert!(reason.contains("repo.push")),
         other => panic!("attenuated-away capability must deny: {other:?}"),
     }
+}
+
+#[test]
+fn a_repository_caveat_denies_a_merge_before_asking_a_human_to_approve_it() {
+    let server = McpServer::with_router_and_clock(
+        ToolRegistry::for_cursors(&["git.merge.v1".into()]).unwrap(),
+        caveated_router(
+            &["pull_request.merge"],
+            &["pull_request.merge", "repo:acme/web"],
+        ),
+        Arc::new(now),
+    );
+
+    let response = drive(
+        &server,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.merge","arguments":{"repo":"acme/payroll","number":7},"_meta":{"com.myelin/idempotencyKey":"merge-payroll-7"}}}"#,
+        ],
+    );
+
+    assert_eq!(response[0]["result"]["isError"], true);
+    assert!(response[0]["result"]["_meta"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("outside the signed delegation scope"));
+    assert!(
+        response[0]["result"]["_meta"]["gateId"].is_null(),
+        "an impossible operation must not leave a misleading approval card"
+    );
+    assert!(matches!(
+        server.router().unwrap().audit()[0].outcome,
+        CallOutcome::Denied { .. }
+    ));
+}
+
+#[test]
+fn a_repository_caveat_denies_a_read_before_the_storage_adapter_sees_it() {
+    let recorder = Arc::new(CountingReadExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let server = McpServer::with_router_reads_and_clock(
+        ToolRegistry::for_cursors(&["git.read_file.v1".into()]).unwrap(),
+        caveated_router(&["repo.pull"], &["repo.pull", "repo:acme/web"]),
+        recorder.clone(),
+        Arc::new(now),
+    );
+
+    let response = drive(
+        &server,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"git.read_file","arguments":{"repo":"acme/payroll","ref":"main","path":"README.md"}}}"#,
+        ],
+    );
+
+    assert_eq!(response[0]["result"]["isError"], true);
+    assert!(response[0]["result"]["_meta"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("outside the signed delegation scope"));
+    assert_eq!(
+        recorder.calls.load(Ordering::SeqCst),
+        0,
+        "the adapter cannot accidentally broaden a signed repository scope"
+    );
 }
 
 fn drive(server: &McpServer, lines: &[&str]) -> Vec<serde_json::Value> {
@@ -1210,9 +1333,10 @@ fn mcp_expiry_leaves_unrelated_shared_gate_untouched_and_audits_exact_gate() {
         router.gate_verdict("gate:shared-due").unwrap().state,
         GateState::Waiting
     );
+    let due_gate_ref = format!(":hitl-gate:{}", gate_ref_token("gate:mcp-due"));
     assert!(audit_store.committed_rows().iter().any(|row| {
         row.envelope.type_.0 == "git.merge.expired"
-            && row.envelope.subject.0.ends_with("/hitl-gate/gate:mcp-due")
+            && row.envelope.subject.0.ends_with(&due_gate_ref)
     }));
 }
 

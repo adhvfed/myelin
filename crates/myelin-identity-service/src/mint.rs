@@ -9,11 +9,34 @@ use myelin_identity::{
     RelName, RelationTuple, RevokeTarget, RunId, RunToken, TupleDelta,
 };
 use myelin_storage::TenantScope;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 pub const SELFHOSTED_GRANT_PREFIX: &str = "selfhosted:";
 
 pub const RUN_GRANT_RELATION: &str = "run_bound";
+
+pub const REPOSITORY_SCOPE_GRANT_PREFIX: &str = "myelin.scope.repository:";
+
+pub fn repository_scope_grant(repository: &str) -> String {
+    format!("{REPOSITORY_SCOPE_GRANT_PREFIX}{repository}")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttenuatedRunAuthority {
+    capabilities: crate::machine_auth::Authority,
+    repositories: BTreeSet<String>,
+}
+
+impl AttenuatedRunAuthority {
+    pub fn capabilities(&self) -> &crate::machine_auth::Authority {
+        &self.capabilities
+    }
+
+    pub fn repositories(&self) -> impl Iterator<Item = &str> {
+        self.repositories.iter().map(String::as_str)
+    }
+}
 
 #[derive(Clone)]
 pub struct RunTokenAuthorizer {
@@ -163,6 +186,35 @@ impl RunTokenAuthorizer {
         Ok(verified)
     }
 
+    pub fn authorize_repository(
+        &self,
+        scope: &TenantScope,
+        expected_principal: &PrincipalId,
+        run_token: &RunToken,
+        required_caps: &[String],
+        repository: &str,
+    ) -> Result<CapabilityToken, String> {
+        let verified = self.authorize(scope, expected_principal, run_token, required_caps)?;
+        if !Self::allows_repository(&verified, repository) {
+            return Err(format!(
+                "repository `{repository}` is outside the signed delegation scope"
+            ));
+        }
+        Ok(verified)
+    }
+
+    pub fn is_repository_scoped(token: &CapabilityToken) -> bool {
+        token
+            .authority
+            .grants()
+            .any(|grant| grant.starts_with(REPOSITORY_SCOPE_GRANT_PREFIX))
+    }
+
+    pub fn allows_repository(token: &CapabilityToken, repository: &str) -> bool {
+        !Self::is_repository_scoped(token)
+            || token.authority.holds(&repository_scope_grant(repository))
+    }
+
     pub fn authorize_ci_job(
         &self,
         scope: &TenantScope,
@@ -268,6 +320,7 @@ pub enum MintError {
     UnsupportedRunKind(MachineKind),
     ResolvedPolicyBindingMismatch,
     InvalidMintAttempt,
+    InvalidDelegationCaveat(String),
 }
 
 impl core::fmt::Display for MintError {
@@ -298,6 +351,9 @@ impl core::fmt::Display for MintError {
             MintError::InvalidMintAttempt => f.write_str(
                 "run-token mint attempt must be a non-empty bounded printable token - refused",
             ),
+            MintError::InvalidDelegationCaveat(reason) => {
+                write!(f, "invalid delegation caveat: {reason} - refused")
+            }
         }
     }
 }
@@ -306,6 +362,8 @@ impl std::error::Error for MintError {}
 
 pub trait TokenSigner: Send + Sync {
     fn sign(&self, request: &TokenSignRequest) -> String;
+
+    fn attenuate(&self, material: &str, grants: &[String]) -> Result<String, String>;
 }
 
 #[derive(Clone)]
@@ -409,6 +467,10 @@ impl TokenSigner for StructuralTokenSigner {
                 _ => String::new(),
             },
         )
+    }
+
+    fn attenuate(&self, material: &str, _grants: &[String]) -> Result<String, String> {
+        Ok(material.to_string())
     }
 }
 
@@ -673,10 +735,27 @@ impl RunTokenMinter {
         if ttl.static_max_secs == 0 {
             return Err(MintError::NonPositiveTtl);
         }
-        let _ = delegation_caveats;
-
-        let (effective_policy, proof) = self.algebra.delegation_proved(agent, trigger_actor, input);
-        let effective = authority_of(&effective_policy);
+        let (effective_policy, mut proof) =
+            self.algebra.delegation_proved(agent, trigger_actor, input);
+        let attenuated = attenuate_for_caveats(
+            authority_of(&effective_policy),
+            delegation_caveats,
+            scope,
+            run_id,
+            trigger_actor,
+        )?;
+        if kind != MachineKind::Agent && attenuated.repositories().next().is_some() {
+            return Err(MintError::InvalidDelegationCaveat(
+                "repository scopes apply only to agent run tokens".into(),
+            ));
+        }
+        let effective = attenuated.capabilities();
+        proof.effective = effective.grants().map(str::to_string).collect();
+        proof.subset_of_every_conjunct = proof.subset_of_every_conjunct
+            && effective.is_subset_of(&input.agent_policy)
+            && effective.is_subset_of(&input.delegation)
+            && effective.is_subset_of(&input.tenant_policy)
+            && effective.is_subset_of(&input.trigger_actor_held);
 
         if kind.is_self_hosted_runner() {
             let own = format!("{SELFHOSTED_GRANT_PREFIX}{}", scope.tenant().0);
@@ -710,15 +789,26 @@ impl RunTokenMinter {
             }
         };
 
+        let grants = effective
+            .grants()
+            .map(str::to_string)
+            .chain(attenuated.repositories().map(repository_scope_grant));
         let request = TokenSignRequest::new(
             scope,
             agent_id.clone(),
             &jti,
             purpose,
             expires_at.clone(),
-            effective.grants(),
+            grants,
         );
         let material = self.signer.sign(&request);
+        let material = if delegation_caveats.0.is_empty() {
+            material
+        } else {
+            self.signer
+                .attenuate(&material, request.grants())
+                .map_err(MintError::InvalidDelegationCaveat)?
+        };
 
         self.revocations
             .register_run_token_ttl(scope, &jti, now.clone(), expires_at.clone());
@@ -798,6 +888,68 @@ impl RunTokenMinter {
         let target = RevokeTarget::Jti(token.jti.clone());
         self.revocations.run_token_state(scope, &target, now)
     }
+}
+
+pub fn attenuate_for_caveats(
+    effective: crate::machine_auth::Authority,
+    caveats: &DelegationCaveats,
+    scope: &TenantScope,
+    run_id: &RunId,
+    trigger_actor: &Principal,
+) -> Result<AttenuatedRunAuthority, MintError> {
+    let mut requested_capabilities = BTreeSet::new();
+    let mut repositories = BTreeSet::new();
+    for caveat in &caveats.0 {
+        if let Some(expected_run) = caveat.strip_prefix("run:") {
+            if expected_run != run_id.0 {
+                return Err(MintError::InvalidDelegationCaveat(
+                    "run binding does not match the minted run".into(),
+                ));
+            }
+            continue;
+        }
+        if let Some(expected_tenant) = caveat.strip_prefix("tenant:") {
+            if expected_tenant != scope.tenant().0 {
+                return Err(MintError::InvalidDelegationCaveat(
+                    "tenant binding does not match the verified scope".into(),
+                ));
+            }
+            continue;
+        }
+        if let Some(expected_delegator) = caveat.strip_prefix("delegated:") {
+            if expected_delegator != trigger_actor.principal_id.0 {
+                return Err(MintError::InvalidDelegationCaveat(
+                    "delegator binding does not match the verified trigger actor".into(),
+                ));
+            }
+            continue;
+        }
+        if let Some(repository) = caveat.strip_prefix("repo:") {
+            if !repository.contains('#') {
+                if repository.is_empty()
+                    || repository.len() > 255
+                    || repository.chars().any(char::is_control)
+                {
+                    return Err(MintError::InvalidDelegationCaveat(
+                        "repository scope must contain a bounded repository name".into(),
+                    ));
+                }
+                repositories.insert(repository.to_string());
+                continue;
+            }
+        }
+        requested_capabilities.insert(caveat.clone());
+    }
+
+    let effective = if requested_capabilities.is_empty() {
+        effective
+    } else {
+        effective.attenuate(&crate::machine_auth::Authority::of(requested_capabilities))
+    };
+    Ok(AttenuatedRunAuthority {
+        capabilities: effective,
+        repositories,
+    })
 }
 
 pub fn run_token_jti(agent_id: &PrincipalId, run_id: &RunId, mint_instant: &Timestamp) -> String {
@@ -1671,6 +1823,101 @@ mod tests {
     }
 
     #[test]
+    fn automation_caveats_narrow_the_signed_capability_set() {
+        let minter = RunTokenMinter::new(RevocationStore::new());
+        let grants = ["issue.create", "repo.pull"];
+        let (token, proof) = minter
+            .mint_proved(
+                &scope("acme"),
+                &PrincipalId("p:agent".into()),
+                &RunId("run-1".into()),
+                &agent("p:agent", "acme"),
+                &human("p:human", "acme"),
+                &input(&grants, &grants, &grants, &grants),
+                &caveats(&["issue.create"]),
+                MachineKind::Agent,
+                &ttl(60),
+                &ts("2026-06-19T00:00:00Z"),
+            )
+            .expect("the automation selects one capability it was delegated");
+
+        assert_eq!(token.token.split('|').nth(5), Some("issue.create"));
+        assert_eq!(proof.effective, ["issue.create"]);
+        assert!(proof.holds());
+    }
+
+    #[test]
+    fn repository_caveats_are_signed_and_rechecked_at_the_final_boundary() {
+        let s7 = RevocationStore::new();
+        let minter = RunTokenMinter::new(s7.clone());
+        let acme = scope("acme");
+        let run_agent = agent("p:agent", "acme");
+        let founder = human("p:human", "acme");
+        let policy = resolved_policy(
+            "run-1",
+            &run_agent,
+            &founder,
+            input(
+                &["repo.pull"],
+                &["repo.pull"],
+                &["repo.pull"],
+                &["repo.pull"],
+            ),
+            42,
+        );
+        let token = minter
+            .mint_from_resolved_policy(
+                &acme,
+                &run_agent.principal_id,
+                &RunId("run-1".into()),
+                &run_agent,
+                &founder,
+                &policy,
+                &caveats(&["repo:core"]),
+                MachineKind::Agent,
+                &ttl(60),
+                &ts("2026-06-19T00:00:00Z"),
+            )
+            .expect("the repository scope is part of the signed run token");
+        let authorizer = RunTokenAuthorizer::new(Arc::new(StructuralTokenVerifier::new()), s7)
+            .with_clock(|| ts("2026-06-19T00:00:01Z"));
+
+        authorizer
+            .authorize_repository(
+                &acme,
+                &run_agent.principal_id,
+                &token,
+                &["repo.pull".into()],
+                "core",
+            )
+            .expect("the named repository remains available");
+        assert!(authorizer
+            .authorize_repository(
+                &acme,
+                &run_agent.principal_id,
+                &token,
+                &["repo.pull".into()],
+                "payroll",
+            )
+            .expect_err("another repository is outside the automation scope")
+            .contains("outside the signed delegation scope"));
+    }
+
+    #[test]
+    fn contextual_caveats_must_match_the_verified_run() {
+        let error = attenuate_for_caveats(
+            auth(&["repo.pull"]),
+            &caveats(&["run:someone-elses-run"]),
+            &scope("acme"),
+            &RunId("run-1".into()),
+            &human("p:human", "acme"),
+        )
+        .expect_err("a caveat cannot rewrite the signed run binding");
+
+        assert!(matches!(error, MintError::InvalidDelegationCaveat(_)));
+    }
+
+    #[test]
     fn self_hosted_runner_token_cannot_act_cross_tenant() {
         let s7 = RevocationStore::new();
         let minter = RunTokenMinter::new(s7);
@@ -2061,7 +2308,7 @@ mod tests {
             "the grants are the attenuated effective authority"
         );
         assert_eq!(parts[6], "agent_run");
-        assert_eq!(parts[7], "edge");
+        assert_eq!(parts[7], "mcp", "agent run tokens are MCP-only credentials");
         assert_eq!(parts[8], "run-9");
         assert_eq!(
             parts[9], "",

@@ -188,10 +188,13 @@ Hosted agents use the same identity and tool catalogue, but Myelin owns their ex
 `automation` binds a canonical platform event to one hosted agent, a plain-language task, an
 integer minor-unit budget, optional delegation caveats, and safety gates. Each firing receives a
 short-lived run identity and reaches Git, CI, Issues, Chat, and Knowledge only through governed
-Myelin tools. Owners can inspect durable firing history and outcomes, pause new reservations for
-maintenance, resume them, or irreversibly disable an automation from either the CLI or the web
-Automations workspace. Every run that reaches a final
-agent answer writes it before cost settlement as one immutable, content-addressed Knowledge
+Myelin tools. Repeating `--caveat` with capabilities such as `issue.create` narrows which selected
+tools reach the model and the signed run identity; `--caveat repo:platform/api` additionally binds
+every Git read and mutation to that repository. Invalid or merely decorative caveats are refused
+when the automation is created. Owners can inspect durable firing history and outcomes, pause new
+reservations for maintenance, resume them, or irreversibly disable an automation from either the
+CLI or the web Automations workspace. Every run that reaches a final agent answer writes it before
+cost settlement as one immutable, content-addressed Knowledge
 trace. Its answer and block-model body rest only as authenticated ciphertext under the
 requesting human's durable subject key. The automation owner can retrieve that work product and
 its exact metered cost in the web firing history or with `automation result`; other users cannot

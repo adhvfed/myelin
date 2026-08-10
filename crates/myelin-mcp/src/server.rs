@@ -247,7 +247,7 @@ impl McpServer {
                         "direct read routing is not wired into this server instance",
                     )
                 })?;
-                let authorization = match router.authorize_read(&tool, &(self.clock)()) {
+                let authorization = match router.authorize_read(&tool, &args, &(self.clock)()) {
                     Ok(authorization) => authorization,
                     Err(outcome) => return Ok(call_result_json(name, &outcome)),
                 };

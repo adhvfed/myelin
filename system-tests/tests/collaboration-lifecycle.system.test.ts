@@ -93,7 +93,7 @@ describe("collaboration lifecycle", () => {
       budget_minor_units: 250_000,
       max_firings: 10,
       max_causal_depth: 4,
-      delegation_caveats: ["repo:core", "issue:create"],
+      delegation_caveats: ["repo:core", "issue.create"],
       require_human_approval: true,
     };
     const created = await founder.json("/v1/triggers", {

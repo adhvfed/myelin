@@ -175,7 +175,7 @@ async fn one_red_build_becomes_one_durable_agent_workflow() {
                 event_type: "ci.run.failed".into(),
                 matcher: serde_json::json!({}),
                 task: "Explain the failure and prepare the smallest safe fix.".into(),
-                delegation_caveats: vec!["repo:core".into(), "issue:create".into()],
+                delegation_caveats: vec!["repo:core".into(), "issue.create".into()],
                 budget_minor_units: 250_000,
                 max_firings: 1,
                 max_causal_depth: 4,

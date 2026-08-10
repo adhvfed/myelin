@@ -8,7 +8,8 @@ use myelin_identity::{
 use myelin_identity_service::mint::RunTokenAuthorizer;
 use myelin_identity_service::{
     Authority, CiJobAuthorizationError, CredentialPurpose, DelegationInput, MachineKind,
-    PasetoCapabilityVerifier, RunTokenState, StoreBackedCheck, TupleStore,
+    PasetoCapabilityVerifier, ResolvedDelegationPolicy, RunTokenState, StoreBackedCheck,
+    TupleStore,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -119,6 +120,69 @@ fn cdc_4_7_minted_token_honoured_within_run_life() {
         dispatch_under_token_is_honoured(&svc, &s, &token, &ts("2026-06-19T00:02:00Z")),
         "the CI-dispatch consumer honours a live per-run token"
     );
+}
+
+#[test]
+fn cdc_4_7_repository_caveat_survives_the_real_signed_token_boundary() {
+    let s = scope("acme");
+    let svc = provider();
+    let run_id = RunId("run-repo-scope".into());
+    let run_agent = agent("p:agent", "acme");
+    let founder = human("p:human", "acme");
+    let policy = ResolvedDelegationPolicy::synthetic_for_test(
+        run_id.clone(),
+        run_agent.principal_id.clone(),
+        founder.principal_id.clone(),
+        input(
+            &["repo.pull"],
+            &["repo.pull"],
+            &["repo.pull"],
+            &["repo.pull"],
+        ),
+        42,
+    );
+    let token = svc
+        .mint_run_token_from_resolved_policy_in(
+            &s,
+            &run_agent.principal_id,
+            &run_id,
+            &run_agent,
+            &founder,
+            &policy,
+            &caveats(&["repo.pull", "repo:core"]),
+            MachineKind::Agent,
+            &ttl(300),
+            &ts("2026-06-19T00:00:00Z"),
+        )
+        .expect("the scoped agent token is signed by the cell authority");
+    assert_ne!(
+        token.token.split('|').nth(1),
+        Some("W10"),
+        "the trigger restriction is carried by the monotonic caveat chain"
+    );
+    let verifier =
+        PasetoCapabilityVerifier::new(svc.token_trust_anchor()).with_clock(|| 1_781_827_260);
+    let authorizer = RunTokenAuthorizer::new(Arc::new(verifier), svc.revocations().clone())
+        .with_clock(|| ts("2026-06-19T00:01:00Z"));
+
+    authorizer
+        .authorize_repository(
+            &s,
+            &PrincipalId("p:agent".into()),
+            &token,
+            &["repo.pull".into()],
+            "core",
+        )
+        .expect("the signed repository remains usable");
+    assert!(authorizer
+        .authorize_repository(
+            &s,
+            &PrincipalId("p:agent".into()),
+            &token,
+            &["repo.pull".into()],
+            "payroll",
+        )
+        .is_err());
 }
 
 #[test]

@@ -416,6 +416,21 @@ fn validate_caveats(caveats: &[&str]) -> Result<(), CliError> {
                 "automation caveat `{caveat}` was selected more than once"
             )));
         }
+        let repository_scope = caveat
+            .strip_prefix("repo:")
+            .is_some_and(|repo| myelin_git::gix_backend::validate_repo_slug(repo).is_ok());
+        let capability = caveat.split('.').count() >= 2
+            && caveat.split('.').all(|segment| {
+                !segment.is_empty()
+                    && segment.bytes().all(|byte| {
+                        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            });
+        if !repository_scope && !capability {
+            return Err(CliError::Usage(format!(
+                "automation caveat `{caveat}` must be a canonical capability such as `issue.create` or a `repo:<slug>` scope"
+            )));
+        }
     }
     Ok(())
 }
@@ -661,6 +676,21 @@ mod tests {
                 "1",
                 "--max-firings",
                 "1",
+            ],
+            vec![
+                "create",
+                "--event",
+                "ci.run.failed",
+                "--run-as",
+                AGENT,
+                "--task",
+                "Triage.",
+                "--budget-minor-units",
+                "1",
+                "--max-firings",
+                "1",
+                "--caveat",
+                "issue:create",
             ],
             vec!["list", "--limit", "01"],
             vec!["show", "not-an-id"],

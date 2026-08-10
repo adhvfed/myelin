@@ -2195,14 +2195,11 @@ mod git_wire_basic_auth_tests {
     #[test]
     fn receive_pack_advertisement_requires_push_capability_not_pull() {
         let (gw, pull_only) = seeded_gateway_with(
-            myelin_identity_service::CredentialPurpose::AgentRun {
-                run_id: "run-wire".into(),
-                delegation_snapshot: Some(11),
-            },
+            myelin_identity_service::CredentialPurpose::HumanSession,
             &["repo.pull"],
             "jti-pull-only",
         );
-        let header = vec![("authorization".into(), format!("Bearer {pull_only}"))];
+        let header = vec![basic_header("myelin-session", &pull_only)];
         let fetch = gw.handle(EdgeRequest::new(
             "GET",
             WIRE,

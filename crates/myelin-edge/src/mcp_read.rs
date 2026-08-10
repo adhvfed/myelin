@@ -80,7 +80,8 @@ impl DirectReadExecutor for McpReadExecutor {
             return Err(DirectReadError::Denied);
         }
         let scope = TenantScope::from_verified_token(principal, principal.region.clone());
-        self.authority
+        let run_token = self
+            .authority
             .authorize(
                 &scope,
                 &principal.principal_id,
@@ -174,6 +175,9 @@ impl DirectReadExecutor for McpReadExecutor {
             }
             "git.list_repositories" => {
                 exact_fields(arguments, &[], &["limit", "cursor"])?;
+                if RunTokenAuthorizer::is_repository_scoped(&run_token) {
+                    return Err(DirectReadError::Denied);
+                }
                 let limit = optional_u32(arguments, "limit")?.unwrap_or(50);
                 let cursor = optional_string(arguments, "cursor")?.map(str::to_string);
                 self.git
@@ -186,6 +190,11 @@ impl DirectReadExecutor for McpReadExecutor {
                 exact_fields(arguments, &["query"], &["query", "repo"])?;
                 let query = required_string(arguments, "query")?;
                 let repo = optional_string(arguments, "repo")?;
+                match repo {
+                    Some(repo) if RunTokenAuthorizer::allows_repository(&run_token, repo) => {}
+                    None if !RunTokenAuthorizer::is_repository_scoped(&run_token) => {}
+                    _ => return Err(DirectReadError::Denied),
+                }
                 self.git
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
@@ -199,6 +208,9 @@ impl DirectReadExecutor for McpReadExecutor {
                     &["repo", "ref", "path"],
                 )?;
                 let repo = required_string(arguments, "repo")?;
+                if !RunTokenAuthorizer::allows_repository(&run_token, repo) {
+                    return Err(DirectReadError::Denied);
+                }
                 let gitref = required_string(arguments, "ref")?;
                 let path = required_string(arguments, "path")?;
                 self.git

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use myelin_identity::{Literal, ObjectType};
+use myelin_identity_service::{AgentRegistryError, PgAgentRegistry};
 use myelin_notif::pg_inbox::{InboxReadScope, PgInboxStore};
 use myelin_query::{CmpOp, EventMatcher, Expr, Predicate, QueryAst};
 use myelin_storage::{
@@ -29,6 +30,7 @@ const MAX_TRIGGER_FILTER_BYTES: usize = 4 * 1024;
 #[derive(Clone)]
 struct TriggerHttpApi {
     backing: DurableAgentTriggerBacking,
+    agents: PgAgentRegistry,
     traces: DurableAgentTraceStore,
     inbox: Arc<PgInboxStore>,
     runtime: Handle,
@@ -87,6 +89,11 @@ impl Handler for TriggerCreateHandler {
             ));
         }
         let body = parse_create_body(&ctx.request.body)?;
+        let agent = self
+            .api
+            .drive(self.api.agents.get(ctx.principal, &body.run_as_agent_id))?
+            .map_err(map_agent_registry_error)?;
+        validate_delegation_caveats(&body.delegation_caveats, &agent.grants)?;
         let client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
@@ -476,12 +483,14 @@ impl Handler for TriggerApprovalHandler {
 pub fn register_triggers(
     builder: GatewayBuilder,
     backing: DurableAgentTriggerBacking,
+    agents: PgAgentRegistry,
     traces: DurableAgentTraceStore,
     inbox: Arc<PgInboxStore>,
     runtime: Handle,
 ) -> GatewayBuilder {
     let api = TriggerHttpApi {
         backing,
+        agents,
         traces,
         inbox,
         runtime,
@@ -568,6 +577,52 @@ pub fn register_triggers(
                 decision: AgentTriggerApprovalDecision::Reject,
             }),
         )
+}
+
+fn validate_delegation_caveats(
+    caveats: &[String],
+    delegated_capabilities: &[String],
+) -> Result<(), EdgeError> {
+    let mut distinct = std::collections::BTreeSet::new();
+    for caveat in caveats {
+        if !distinct.insert(caveat) {
+            return Err(EdgeError::BadRequest(format!(
+                "delegation caveat `{caveat}` is duplicated"
+            )));
+        }
+        if delegated_capabilities
+            .iter()
+            .any(|capability| capability == caveat)
+        {
+            continue;
+        }
+        if let Some(repository) = caveat.strip_prefix("repo:") {
+            if !repository.contains('#')
+                && myelin_git::gix_backend::validate_repo_slug(repository).is_ok()
+            {
+                continue;
+            }
+        }
+        return Err(EdgeError::BadRequest(format!(
+            "delegation caveat `{caveat}` must name one of the agent's delegated capabilities or a `repo:<slug>` scope"
+        )));
+    }
+    Ok(())
+}
+
+fn map_agent_registry_error(error: AgentRegistryError) -> EdgeError {
+    match error {
+        AgentRegistryError::BadInput(reason) => EdgeError::BadRequest(reason),
+        AgentRegistryError::NotFound => {
+            EdgeError::Conflict("the selected run-as agent is unavailable".into())
+        }
+        AgentRegistryError::Conflict(reason) | AgentRegistryError::Policy(reason) => {
+            EdgeError::Conflict(reason)
+        }
+        AgentRegistryError::Storage(_) => {
+            EdgeError::Unavailable("the run-as agent could not be verified".into())
+        }
+    }
 }
 
 fn lifecycle_action_token(action: AgentTriggerLifecycleAction) -> &'static str {
@@ -1016,6 +1071,28 @@ mod tests {
             "max_firings":1
         }"#;
         assert!(parse_create_body(missing_budget).is_err());
+    }
+
+    #[test]
+    fn automation_caveats_name_real_capabilities_or_exact_repositories() {
+        let grants = vec!["issue.create".into(), "pull_request.merge".into()];
+        assert!(validate_delegation_caveats(
+            &["issue.create".into(), "repo:platform/api".into()],
+            &grants,
+        )
+        .is_ok());
+
+        for caveats in [
+            vec!["issue:create".into()],
+            vec!["repo:../payroll".into()],
+            vec!["run:another-run".into()],
+            vec!["issue.create".into(), "issue.create".into()],
+        ] {
+            assert!(
+                validate_delegation_caveats(&caveats, &grants).is_err(),
+                "accepted misleading caveats {caveats:?}",
+            );
+        }
     }
 
     #[test]

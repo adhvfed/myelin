@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -129,8 +130,10 @@ impl AgentHostActivityExecutor {
 
     fn selected_tools(
         selected_tools: &[String],
+        delegation_caveats: &[String],
     ) -> Result<(ToolCatalogue, Vec<ToolSchema>), String> {
         let platform = PlatformToolCatalogue::platform().map_err(|error| error.to_string())?;
+        let capability_ceiling = delegation_capability_ceiling(delegation_caveats);
         let mut definitions = Vec::with_capacity(selected_tools.len());
         let mut schemas = Vec::with_capacity(selected_tools.len());
         for cursor in selected_tools {
@@ -144,6 +147,14 @@ impl AgentHostActivityExecutor {
                     format!("selected hosted-agent tool `{cursor}` is no longer available")
                 })?;
             let canonical_name = definition.canonical_name();
+            if capability_ceiling.as_ref().is_some_and(|ceiling| {
+                definition
+                    .required_caps
+                    .iter()
+                    .any(|capability| !ceiling.contains(capability.as_str()))
+            }) {
+                continue;
+            }
             let description = definition
                 .mcp_projection()
                 .ok()
@@ -274,7 +285,8 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
                 );
             }
         }
-        let (catalogue, advertised) = Self::selected_tools(&input.selected_tools)?;
+        let (catalogue, advertised) =
+            Self::selected_tools(&input.selected_tools, &input.delegation_caveats)?;
         let model = self.models.client().map_err(|error| error.to_string())?;
         let deadline_now_secs = self.deadline_clock.now_unix_secs()?;
         let mut wiring = RunSubstrateWiring {
@@ -347,10 +359,10 @@ mod tests {
 
     #[test]
     fn governed_tool_cursors_become_canonical_model_tools() {
-        let (catalogue, schemas) = AgentHostActivityExecutor::selected_tools(&[
-            "ci.read_run.v1".into(),
-            "issues.create.v1".into(),
-        ])
+        let (catalogue, schemas) = AgentHostActivityExecutor::selected_tools(
+            &["ci.read_run.v1".into(), "issues.create.v1".into()],
+            &[],
+        )
         .expect("the tools selected at agent creation still exist");
 
         assert_eq!(
@@ -368,8 +380,40 @@ mod tests {
 
     #[test]
     fn stale_selected_tools_fail_closed_before_a_model_run() {
-        let error = AgentHostActivityExecutor::selected_tools(&["ci.retired.v1".into()])
+        let error = AgentHostActivityExecutor::selected_tools(&["ci.retired.v1".into()], &[])
             .expect_err("a removed tool cannot silently become a different tool");
         assert!(error.contains("no longer available"));
     }
+
+    #[test]
+    fn capability_caveats_hide_tools_outside_the_automation_scope() {
+        let (catalogue, schemas) = AgentHostActivityExecutor::selected_tools(
+            &["ci.read_run.v1".into(), "issues.create.v1".into()],
+            &["issue.create".into(), "repo:core".into()],
+        )
+        .expect("the selected tools still exist");
+
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].name.0, "issues.create");
+        assert!(catalogue
+            .resolve(&ToolName("issues.create".into()))
+            .is_some());
+        assert!(catalogue.resolve(&ToolName("ci.read_run".into())).is_none());
+    }
+}
+
+fn delegation_capability_ceiling(caveats: &[String]) -> Option<BTreeSet<&str>> {
+    let capabilities = caveats
+        .iter()
+        .map(String::as_str)
+        .filter(|caveat| {
+            !caveat.starts_with("run:")
+                && !caveat.starts_with("tenant:")
+                && !caveat.starts_with("delegated:")
+                && caveat
+                    .strip_prefix("repo:")
+                    .is_none_or(|repository| repository.contains('#'))
+        })
+        .collect::<BTreeSet<_>>();
+    (!capabilities.is_empty()).then_some(capabilities)
 }

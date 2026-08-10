@@ -13,7 +13,9 @@ use myelin_identity::{
 use myelin_identity_service::delegation::authority_of;
 use myelin_identity_service::delegation_policy::ResolvedDelegationPolicy;
 use myelin_identity_service::machine_auth::MachineKind;
-use myelin_identity_service::mint::RunTokenMinter;
+use myelin_identity_service::mint::{
+    attenuate_for_caveats, repository_scope_grant, RunTokenMinter, REPOSITORY_SCOPE_GRANT_PREFIX,
+};
 use myelin_storage::hitl_gate_durable::{
     gate_ref_token, opaque_gate_id, GateDecideError, GateRecord, GateState, HitlVerdictStore,
     DEFAULT_HITL_GATE_TTL_SECS,
@@ -532,6 +534,14 @@ impl GovernedRouter {
         let ttl = FailStaticBound {
             static_max_secs: p.ttl.static_max_secs.min(remaining),
         };
+        let attenuated = attenuate_for_caveats(
+            authority_of(p.resolved_policy.effective_policy()),
+            &p.caveats,
+            &p.scope,
+            &p.run_id,
+            &p.trigger_actor,
+        )
+        .map_err(|error| format!("per-run delegation caveat refused: {error}"))?;
         let token = self
             .minter
             .mint_from_resolved_policy(
@@ -548,9 +558,11 @@ impl GovernedRouter {
             )
             .map_err(|e| format!("per-run token mint refused: {e}"))?;
         let mut state = self.state.borrow_mut();
-        state.effective_grants = authority_of(p.resolved_policy.effective_policy())
+        state.effective_grants = attenuated
+            .capabilities()
             .grants()
             .map(str::to_string)
+            .chain(attenuated.repositories().map(repository_scope_grant))
             .collect();
         state.token = Some(token.clone());
         Ok(token)
@@ -559,6 +571,7 @@ impl GovernedRouter {
     pub fn authorize_read(
         &self,
         tool: &RegisteredTool,
+        args: &serde_json::Value,
         now: &Timestamp,
     ) -> Result<ReadAuthorization, CallOutcome> {
         if tool.effect_kind() != myelin_agent::EffectKind::Read || tool.side_effecting() {
@@ -571,6 +584,10 @@ impl GovernedRouter {
             });
         }
         self.authorize_declared_tool(tool, now)
+            .and_then(|token| match self.authorize_resource_scope(tool, args) {
+                Ok(()) => Ok(token),
+                Err(reason) => Err((reason, token.jti.clone())),
+            })
             .map(|run_token| ReadAuthorization {
                 run_token,
                 tool: tool.name().to_string(),
@@ -616,6 +633,38 @@ impl GovernedRouter {
         Ok(token)
     }
 
+    fn authorize_resource_scope(
+        &self,
+        tool: &RegisteredTool,
+        args: &serde_json::Value,
+    ) -> Result<(), String> {
+        if !tool.name().starts_with("git.") {
+            return Ok(());
+        }
+        let state = self.state.borrow();
+        let scopes = state
+            .effective_grants
+            .iter()
+            .filter_map(|grant| grant.strip_prefix(REPOSITORY_SCOPE_GRANT_PREFIX))
+            .collect::<BTreeSet<_>>();
+        if scopes.is_empty() {
+            return Ok(());
+        }
+        let Some(repository) = args.get("repo").and_then(serde_json::Value::as_str) else {
+            return Err(format!(
+                "tool `{}` needs an exact repository under this automation's delegation scope",
+                tool.name()
+            ));
+        };
+        if scopes.contains(repository) {
+            Ok(())
+        } else {
+            Err(format!(
+                "repository `{repository}` is outside the signed delegation scope"
+            ))
+        }
+    }
+
     pub fn call(
         &self,
         tool: &RegisteredTool,
@@ -643,6 +692,9 @@ impl GovernedRouter {
             }
         };
         let jti = token.jti.clone();
+        if let Err(reason) = self.authorize_resource_scope(tool, args) {
+            return self.record(tool.name(), CallOutcome::Denied { reason, jti }, now);
+        }
 
         let mut approval_to_consume = None;
         if tool.requires_approval() {
