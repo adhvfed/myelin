@@ -49,10 +49,19 @@ fn lifecycle_call(args: &[&str], action: &str) -> Result<EdgeCall, CliError> {
 fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     let mut name = None;
     let mut tools = Vec::new();
+    let mut runtime = None;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
             "--tool" => tools.push(flag_value(args, &mut index, "--tool")?),
+            "--runtime" if runtime.is_none() => {
+                runtime = Some(flag_value(args, &mut index, "--runtime")?)
+            }
+            "--runtime" => {
+                return Err(CliError::Usage(
+                    "agent create accepts --runtime only once".into(),
+                ))
+            }
             token if !token.starts_with('-') && name.is_none() => name = Some(token),
             token if !token.starts_with('-') => {
                 return Err(CliError::Usage(format!(
@@ -102,10 +111,19 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
         }
     }
 
-    Ok(EdgeCall::post_json(
-        "/v1/agents",
-        json!({ "name": name, "tools": tools }),
-    ))
+    if let Some(runtime) = runtime {
+        if !matches!(runtime, "external" | "hosted") {
+            return Err(CliError::Usage(
+                "agent runtime must be `external` or `hosted`".into(),
+            ));
+        }
+    }
+
+    let mut body = json!({ "name": name, "tools": tools });
+    if let Some(runtime) = runtime {
+        body["runtime"] = json!(runtime);
+    }
+    Ok(EdgeCall::post_json("/v1/agents", body))
 }
 
 fn list_call(args: &[&str]) -> Result<EdgeCall, CliError> {
@@ -226,6 +244,24 @@ mod tests {
             })
         );
 
+        let hosted = agent_dispatch(&[
+            "create",
+            "CI fixer",
+            "--runtime",
+            "hosted",
+            "--tool",
+            "git.open_pr",
+        ])
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(hosted.payload.as_ref().unwrap()).unwrap(),
+            json!({
+                "name": "CI fixer",
+                "runtime": "hosted",
+                "tools": ["git.open_pr"],
+            })
+        );
+
         let list = agent_dispatch(&["list", "--limit", "7", "--cursor", AGENT]).unwrap();
         assert_eq!(
             list.query.as_deref(),
@@ -248,6 +284,24 @@ mod tests {
             vec![],
             vec!["create", "Reviewer"],
             vec!["create", "Reviewer", "--tool", "Git.open_pr"],
+            vec![
+                "create",
+                "Reviewer",
+                "--runtime",
+                "somewhere",
+                "--tool",
+                "git.open_pr",
+            ],
+            vec![
+                "create",
+                "Reviewer",
+                "--runtime",
+                "hosted",
+                "--runtime",
+                "external",
+                "--tool",
+                "git.open_pr",
+            ],
             vec![
                 "create",
                 "Reviewer",

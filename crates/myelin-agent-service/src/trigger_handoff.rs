@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use myelin_events::{EventEnvelope, HandlerTx, UlidMinter};
 use myelin_flow::{ExecutorError, PgFlowExecutor, RunId, StartSpec};
+use myelin_identity_service::HOSTED_LUNA_RUNTIME;
 use myelin_storage::{
     with_tenant_tx_error, AgentTriggerStartRequest, ClaimedAgentTriggerFiring,
     DurableAgentTriggerBacking, PgError, StartAgentTriggerFiringOutcome, SubstrateProvider,
@@ -9,7 +10,7 @@ use myelin_storage::{
 use myelin_tenancy::{Region, TenantId};
 use sqlx::types::Uuid;
 
-pub const HOSTED_AGENT_RUNTIME: &str = "hosted:luna";
+pub const HOSTED_AGENT_RUNTIME: &str = HOSTED_LUNA_RUNTIME;
 pub const AGENT_RUN_WORKFLOW: &str = "agent.run";
 const AGENT_RUN_VERSION: i32 = 1;
 

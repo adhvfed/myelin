@@ -9,7 +9,7 @@ use myelin_identity_service::{
     agent_ref, agent_run_ref, AgentActivation, AgentLifecycleAction, AgentLifecycleOutcome,
     AgentLifecycleRequest, AgentRegistration, AgentRegistryError, AgentSessionError,
     AgentSessionIssuer, AgentSessionRequest, ClosedAgentSession, IssuedAgentSession, NewAgent,
-    PgAgentRegistry, EXTERNAL_MCP_RUNTIME,
+    PgAgentRegistry, EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -56,6 +56,25 @@ impl AgentHttpApi {
 struct CreateAgentBody {
     name: String,
     tools: Vec<String>,
+    #[serde(default)]
+    runtime: AgentRuntimeSelection,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentRuntimeSelection {
+    #[default]
+    External,
+    Hosted,
+}
+
+impl AgentRuntimeSelection {
+    fn runtime_ref(self) -> &'static str {
+        match self {
+            Self::External => EXTERNAL_MCP_RUNTIME,
+            Self::Hosted => HOSTED_LUNA_RUNTIME,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -384,7 +403,7 @@ fn activation_proposal(
         .collect::<Vec<_>>();
     Ok(NewAgent {
         name: body.name,
-        runtime_ref: EXTERNAL_MCP_RUNTIME.into(),
+        runtime_ref: body.runtime.runtime_ref().into(),
         tools: selected,
         grants: grants.into_iter().collect(),
         tenant_policy_if_missing: tenant_policy.into_iter().collect(),
@@ -736,6 +755,7 @@ mod tests {
             CreateAgentBody {
                 name: "Review companion".into(),
                 tools: tools.iter().map(|tool| (*tool).into()).collect(),
+                runtime: AgentRuntimeSelection::External,
             },
             "retry-safe".into(),
         )
@@ -768,6 +788,19 @@ mod tests {
             .tenant_policy_if_missing
             .iter()
             .all(|grant| !grant.is_empty()));
+    }
+
+    #[test]
+    fn hosted_execution_is_an_explicit_bounded_runtime_choice() {
+        assert_eq!(
+            AgentRuntimeSelection::Hosted.runtime_ref(),
+            HOSTED_LUNA_RUNTIME
+        );
+        assert_eq!(
+            AgentRuntimeSelection::default().runtime_ref(),
+            EXTERNAL_MCP_RUNTIME,
+            "existing CLI and API callers keep the interactive MCP runtime"
+        );
     }
 
     #[test]

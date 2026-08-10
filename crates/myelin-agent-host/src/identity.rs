@@ -7,7 +7,7 @@ use myelin_identity::{
     RevokeTarget, RunId,
 };
 use myelin_identity_service::{
-    Authority, DelegationInput, MachineKind, RevocationStore,
+    MachineKind, ResolvedDelegationPolicy, RevocationStore,
     RunTokenMinter as IdentityRunTokenMinter, RunTokenState,
 };
 use myelin_storage::TenantScope;
@@ -23,6 +23,7 @@ pub struct IdentityRunMinter {
     scope: TenantScope,
     agent: Principal,
     trigger_actor: Principal,
+    resolved_policy: ResolvedDelegationPolicy,
     now: Timestamp,
 }
 
@@ -32,6 +33,7 @@ impl IdentityRunMinter {
         scope: TenantScope,
         agent: Principal,
         trigger_actor: Principal,
+        resolved_policy: ResolvedDelegationPolicy,
         now: Timestamp,
     ) -> IdentityRunMinter {
         IdentityRunMinter {
@@ -39,6 +41,7 @@ impl IdentityRunMinter {
             scope,
             agent,
             trigger_actor,
+            resolved_policy,
             now,
         }
     }
@@ -52,23 +55,16 @@ impl RunTokenMinter for IdentityRunMinter {
         caveats: &DelegationCaveats,
         ttl_secs: u64,
     ) -> Result<RunTokenHandle, RunTokenError> {
-        let authority = Authority::of(caveats.0.iter().cloned());
-        let input = DelegationInput {
-            agent_policy: authority.clone(),
-            delegation: authority.clone(),
-            tenant_policy: authority.clone(),
-            trigger_actor_held: authority,
-        };
         let identity_caveats = IdentityDelegationCaveats(caveats.0.clone());
         let token = self
             .minter
-            .mint_run_token(
+            .mint_from_resolved_policy(
                 &self.scope,
                 &PrincipalId(agent_id.to_string()),
                 &RunId(run_id.to_string()),
                 &self.agent,
                 &self.trigger_actor,
-                &input,
+                &self.resolved_policy,
                 &identity_caveats,
                 MachineKind::Agent,
                 &FailStaticBound {

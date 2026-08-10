@@ -22,6 +22,7 @@ mod lifecycle;
 pub use lifecycle::{AgentLifecycleAction, AgentLifecycleOutcome, AgentLifecycleRequest};
 
 pub const EXTERNAL_MCP_RUNTIME: &str = "external:mcp";
+pub const HOSTED_LUNA_RUNTIME: &str = "hosted:luna";
 pub const MAX_AGENT_NAME_BYTES: usize = 80;
 pub const MAX_AGENT_TOOLS: usize = 128;
 const MAX_AGENT_LIST_ROWS: u32 = 101;

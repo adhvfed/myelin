@@ -29,12 +29,13 @@ use myelin_identity::{
 use myelin_storage::agent_wallet::AgentWallet;
 use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::{
-    DurableCellRootBacking, DurableRevocationBacking, SealKey, SubstrateProvider, TenantScope,
+    DurableCellRootBacking, DurableDelegationPolicyBacking, DurableRevocationBacking, SealKey,
+    SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
 use myelin_identity_service::{
-    CellTokenAuthority, PasetoCapabilitySigner, RevocationStore,
+    CellTokenAuthority, DelegationPolicySource, PasetoCapabilitySigner, RevocationStore,
     RunTokenMinter as IdentityRunTokenMinter,
 };
 
@@ -117,12 +118,14 @@ pub struct LlmRunReport {
 #[derive(Clone, Debug)]
 pub enum AgentHostError {
     Run(SkeletonError),
+    Identity(String),
 }
 
 impl core::fmt::Display for AgentHostError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             AgentHostError::Run(e) => write!(f, "hosted-agent run failed: {e}"),
+            AgentHostError::Identity(e) => write!(f, "hosted-agent identity failed: {e}"),
         }
     }
 }
@@ -514,11 +517,13 @@ pub struct AgentHost {
     region: Region,
     wallet: AgentWallet,
     identity: HostIdentity,
+    runtime: tokio::runtime::Handle,
 }
 
 struct HostIdentity {
     minter: IdentityRunTokenMinter,
     revocations: RevocationStore,
+    policies: DelegationPolicySource,
 }
 
 #[derive(Debug)]
@@ -565,17 +570,21 @@ impl AgentHost {
                 .map_err(|e| HostIdentityError::InvalidCellRoot(format!("{e:?}")))?,
         );
         let revocations =
-            RevocationStore::with_pg(DurableRevocationBacking::new(provider.clone()), rt);
+            RevocationStore::with_pg(DurableRevocationBacking::new(provider.clone()), rt.clone());
         let signer = Arc::new(PasetoCapabilitySigner::new(cell));
         let minter =
             IdentityRunTokenMinter::with_signer_and_tuples(revocations.clone(), None, signer);
+        let policies =
+            DelegationPolicySource::with_pg(DurableDelegationPolicyBacking::new(provider.clone()));
         Ok(AgentHost {
             region,
             wallet: AgentWallet::new(provider),
             identity: HostIdentity {
                 minter,
                 revocations,
+                policies,
             },
+            runtime: rt,
         })
     }
 
@@ -594,21 +603,32 @@ impl AgentHost {
     fn identity_seams(
         &self,
         task: &LlmRunTask,
-    ) -> (Arc<dyn RunTokenMinter + Send + Sync>, IdentityRunRevoker) {
+    ) -> Result<(Arc<dyn RunTokenMinter + Send + Sync>, IdentityRunRevoker), AgentHostError> {
         let id = &self.identity;
         let scope = TenantScope::from_verified_token(&task.agent, self.region.clone());
         let now = timestamp_from_epoch(task.now_secs);
+        let resolved_policy = bridge(
+            &self.runtime,
+            id.policies.resolve_for_run(
+                &scope,
+                &task.agent,
+                &task.trigger_actor,
+                &myelin_identity::RunId(task.run_id.clone()),
+            ),
+        )
+        .map_err(|error| AgentHostError::Identity(error.to_string()))?;
         let minter: Arc<dyn RunTokenMinter + Send + Sync> = Arc::new(IdentityRunMinter::new(
             id.minter.clone(),
             scope.clone(),
             task.agent.clone(),
             task.trigger_actor.clone(),
+            resolved_policy,
             now,
         ));
-        (
+        Ok((
             minter,
             IdentityRunRevoker::new(id.revocations.clone(), scope),
-        )
+        ))
     }
 
     pub fn run(
@@ -618,7 +638,7 @@ impl AgentHost {
         model_client: Box<dyn ModelClient + Send + Sync>,
         tools: Tools<'_>,
     ) -> Result<LlmRunReport, AgentHostError> {
-        let (minter, revoker) = self.identity_seams(task);
+        let (minter, revoker) = self.identity_seams(task)?;
         dispatch_core(
             &self.wallet,
             self.region.clone(),
@@ -631,6 +651,13 @@ impl AgentHost {
                 revoker: &revoker,
             },
         )
+    }
+}
+
+fn bridge<F: std::future::Future>(runtime: &tokio::runtime::Handle, future: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => tokio::task::block_in_place(|| runtime.block_on(future)),
+        Err(_) => runtime.block_on(future),
     }
 }
 
