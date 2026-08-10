@@ -824,6 +824,50 @@ impl DurableGitBackend {
         Ok((rows, next_slug))
     }
 
+    pub fn list_repositories(
+        &self,
+        principal: &Principal,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Value, EdgeError> {
+        let limit = usize::try_from(limit)
+            .ok()
+            .filter(|limit| (1..=MAX_PAGE_LIMIT).contains(limit))
+            .ok_or_else(|| {
+                EdgeError::BadRequest(format!(
+                    "repository summary limit must be within 1..={MAX_PAGE_LIMIT}"
+                ))
+            })?;
+        let tenant = &principal.tenant.0;
+        let region = &principal.region.0;
+        let cursor = cursor
+            .as_deref()
+            .map(|value| parse_repo_summary_cursor(value, tenant, region))
+            .transpose()?;
+        let (rows, next_slug) = self
+            .list_repo_summaries_visible(
+                tenant,
+                region,
+                principal,
+                cursor.as_ref().map(RepoListCursor::last_slug),
+                limit,
+            )
+            .map_err(map_repo_summary_durable_err)?;
+        let items = rows.iter().map(RepoListRow::to_json).collect::<Vec<_>>();
+        let next_cursor = next_slug
+            .map(|last_slug| {
+                RepoListCursor::new(repo_summary_cursor_scope(tenant, region), last_slug)
+                    .map(|cursor| cursor.encode())
+                    .map_err(|error| {
+                        EdgeError::Internal(format!(
+                            "mint repository summary cursor failed: {error}"
+                        ))
+                    })
+            })
+            .transpose()?;
+        Ok(page_envelope(json!(items), next_cursor, limit))
+    }
+
     fn clone_url(&self, tenant: &str, region: &str, slug: &str) -> String {
         let wire_slug = slug.replace('/', "%2F");
         format!("{}/{tenant}/{region}/{wire_slug}.git", self.clone_base)
@@ -1167,6 +1211,30 @@ impl DurableGitBackend {
         }))
     }
 
+    pub fn search_code(
+        &self,
+        principal: &Principal,
+        query: &str,
+        repo: Option<&str>,
+    ) -> Result<Value, EdgeError> {
+        if !valid_code_search_query(query) {
+            return Err(EdgeError::BadRequest("code search query is invalid".into()));
+        }
+        if repo.is_some_and(|repo| !valid_code_search_repo(repo)) {
+            return Err(EdgeError::BadRequest(
+                "code search repository filter is invalid".into(),
+            ));
+        }
+        self.code_search_json(
+            &principal.tenant.0,
+            &principal.region.0,
+            principal,
+            query,
+            repo,
+        )
+        .map_err(map_durable_err)
+    }
+
     fn blob_json(
         &self,
         tenant: &str,
@@ -1186,6 +1254,50 @@ impl DurableGitBackend {
                 maximum_transfer_bytes: RAW_BLOB_MAX_BYTES,
             },
         )
+    }
+
+    pub fn read_file(
+        &self,
+        principal: &Principal,
+        repo: &str,
+        gitref: &str,
+        path: &str,
+    ) -> Result<Value, EdgeError> {
+        if !valid_code_search_repo(repo) {
+            return Err(EdgeError::BadRequest("repository slug is invalid".into()));
+        }
+        if gitref.is_empty() || gitref.len() > 1024 || gitref.chars().any(char::is_control) {
+            return Err(EdgeError::BadRequest("Git ref is invalid".into()));
+        }
+        if !valid_anchor_path(path) {
+            return Err(EdgeError::BadRequest("file path is invalid".into()));
+        }
+        let location = Self::loc(&principal.tenant.0, &principal.region.0, repo);
+        if !self.repo_authz.authorize_repo_permission(
+            principal,
+            &location,
+            RepoPermission::Pull,
+        ) {
+            return Err(EdgeError::NotFound("repository not found".into()));
+        }
+        let mut file = self
+            .blob_json(
+                &principal.tenant.0,
+                &principal.region.0,
+                repo,
+                gitref,
+                path,
+            )
+            .map_err(map_durable_err)?;
+        if let Some(object) = file.as_object_mut() {
+            let may_edit = self.repo_authz.authorize_repo_permission(
+                principal,
+                &location,
+                RepoPermission::Push,
+            );
+            object.insert("viewer_may_edit".into(), Value::Bool(may_edit));
+        }
+        Ok(file)
     }
 
     fn blob_json_bounded(

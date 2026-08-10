@@ -82,6 +82,7 @@ myelin auth configure-git
 myelin tool list
 myelin tool show ci.read_run
 myelin agent create "Review companion" --tool ci.read_run --tool git.open_pr \
+  --tool git.list_repositories --tool git.search_code --tool git.read_file \
   --tool issues.list --tool issues.view \
   --tool knowledge.list_pages --tool knowledge.read_page \
   --tool chat.list_conversations --tool chat.read_messages \

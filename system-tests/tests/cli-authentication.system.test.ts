@@ -387,6 +387,9 @@ describe("the CLI authentication journey", () => {
       expect(mcpManifest.tools.map((tool) => tool.name)).toEqual(
         expect.arrayContaining([
           "git.open_pr",
+          "git.list_repositories",
+          "git.read_file",
+          "git.search_code",
           "git.merge",
           "ci.read_run",
           "ci.read_log",
@@ -417,6 +420,12 @@ describe("the CLI authentication journey", () => {
         "ci.read_run",
         "--tool",
         "git.open_pr",
+        "--tool",
+        "git.list_repositories",
+        "--tool",
+        "git.read_file",
+        "--tool",
+        "git.search_code",
         "--tool",
         "issues.list",
         "--tool",
@@ -459,7 +468,10 @@ describe("the CLI authentication journey", () => {
             { name: "chat.list_conversations", version: 1 },
             { name: "chat.read_messages", version: 1 },
             { name: "ci.read_run", version: 1 },
+            { name: "git.list_repositories", version: 1 },
             { name: "git.open_pr", version: 1 },
+            { name: "git.read_file", version: 1 },
+            { name: "git.search_code", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
@@ -471,6 +483,7 @@ describe("the CLI authentication journey", () => {
             "edge.identity.read",
             "issue.view",
             "knowledge.read",
+            "repo.pull",
             "repo.push",
             "run.view",
           ]),
@@ -488,6 +501,9 @@ describe("the CLI authentication journey", () => {
           "ci.read_run",
           "ci.read_log",
           "git.open_pr",
+          "git.list_repositories",
+          "git.read_file",
+          "git.search_code",
           "issues.list",
           "issues.view",
           "knowledge.list_pages",
@@ -516,6 +532,12 @@ describe("the CLI authentication journey", () => {
         "ci.read_run",
         "--tool",
         "git.open_pr",
+        "--tool",
+        "git.list_repositories",
+        "--tool",
+        "git.read_file",
+        "--tool",
+        "git.search_code",
         "--tool",
         "issues.list",
         "--tool",
@@ -596,7 +618,10 @@ describe("the CLI authentication journey", () => {
             { name: "chat.list_conversations", version: 1 },
             { name: "chat.read_messages", version: 1 },
             { name: "ci.read_run", version: 1 },
+            { name: "git.list_repositories", version: 1 },
             { name: "git.open_pr", version: 1 },
+            { name: "git.read_file", version: 1 },
+            { name: "git.search_code", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
@@ -667,7 +692,10 @@ describe("the CLI authentication journey", () => {
         "chat.list_conversations",
         "chat.read_messages",
         "ci.read_run",
+        "git.list_repositories",
         "git.open_pr",
+        "git.read_file",
+        "git.search_code",
         "issues.list",
         "issues.view",
         "knowledge.list_pages",
@@ -689,23 +717,37 @@ describe("the CLI authentication journey", () => {
       });
       expect(discoveredTools.at(3)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["repo", "title"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(4)?.inputSchema).toMatchObject({
         type: "object",
+        required: ["repo", "title"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(5)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["issue_id"],
+        required: ["repo", "ref", "path"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(6)?.inputSchema).toMatchObject({
         type: "object",
+        required: ["query"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(7)?.inputSchema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(8)?.inputSchema).toMatchObject({
+        type: "object",
+        required: ["issue_id"],
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(9)?.inputSchema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(10)?.inputSchema).toMatchObject({
         type: "object",
         required: ["page_id"],
         additionalProperties: false,
@@ -788,7 +830,10 @@ describe("the CLI authentication journey", () => {
         "chat.list_conversations",
         "chat.read_messages",
         "ci.read_run",
+        "git.list_repositories",
         "git.open_pr",
+        "git.read_file",
+        "git.search_code",
         "issues.list",
         "issues.view",
         "knowledge.list_pages",
@@ -1052,10 +1097,21 @@ describe("the CLI authentication journey", () => {
       expect(sentMessage.exitCode, sentMessage.stderr).toBe(0);
       expect(JSON.parse(sentMessage.stdout)).toMatchObject({ durable: true });
 
-      // Once resumed, the collaborator reads the founder's issue, product spec, and release room
-      // through Myelin itself. The run credential and the founder's live permissions intersect at
-      // Edge; no Linear, Notion, or Slack token, copied browser session, tenant selector, or
-      // provider setup reaches the agent.
+      const sourceRepository = new GitProject(uniqueName("agent-context"), systemClient);
+      expect(await sourceRepository.create()).toMatchObject({ durable: true });
+      const sourceMarker = `credentialless_release_${randomUUID().replaceAll("-", "")}`;
+      const sourcePath = "src/release.ts";
+      const sourceContents = [
+        `export const releaseMarker = "${sourceMarker}";`,
+        "export const providerCredentialsRequired = false;",
+        "",
+      ].join("\n");
+      await sourceRepository.writeFile("main", sourcePath, sourceContents);
+
+      // Once resumed, the collaborator reads the founder's issue, product spec, release room, and
+      // source through Myelin itself. The run credential and the founder's live permissions
+      // intersect at Edge; no GitHub, Linear, Notion, or Slack token, copied browser session,
+      // tenant selector, or provider setup reaches the agent.
       const workAfterResume = await systemClient.json(
         `/v1/agents/${activated.agent.id}/runs`,
         {
@@ -1150,6 +1206,46 @@ describe("the CLI authentication journey", () => {
         ]),
       );
       expect(chatHistory.page).toMatchObject({ limit: 10 });
+
+      const agentRepositories = await askAgent(resumedRun, 9, "git.list_repositories", {
+        limit: 100,
+      });
+      expect(array(agentRepositories.items, "agent-visible repositories")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            state: "populated",
+            slug: `${systemTestConfig.tenant}/${sourceRepository.slug}`,
+          }),
+        ]),
+      );
+      expect(agentRepositories.page).toMatchObject({ limit: 100 });
+
+      const codeSearch = await askAgent(resumedRun, 10, "git.search_code", {
+        query: sourceMarker,
+        repo: sourceRepository.slug,
+      });
+      expect(array(codeSearch.items, "agent-visible code search results")).toEqual([
+        expect.objectContaining({
+          repo: sourceRepository.slug,
+          ref: "refs/heads/main",
+          path: sourcePath,
+          excerpt: expect.stringContaining(sourceMarker),
+        }),
+      ]);
+      expect(codeSearch).toMatchObject({ complete: true });
+
+      const sourceFile = await askAgent(resumedRun, 11, "git.read_file", {
+        repo: sourceRepository.slug,
+        ref: "main",
+        path: sourcePath,
+      });
+      expect(sourceFile).toMatchObject({
+        path: sourcePath,
+        contents: sourceContents,
+        is_binary: false,
+        is_truncated: false,
+        preview_unavailable: false,
+      });
 
       // Retirement is the irreversible counterpart: active work is torn down and neither the
       // CLI nor another client can quietly revive the durable identity.

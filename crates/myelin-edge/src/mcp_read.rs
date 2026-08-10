@@ -15,12 +15,14 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::agent_delegation::is_active_delegation;
+use crate::DurableGitBackend;
 
 pub struct McpReadExecutor {
     ci: DurableCiReadApi,
     issues: Option<DurableIssueReadApi>,
     knowledge: Option<DurableKnowledgeReadApi>,
     chat: Option<DurableChatReadApi>,
+    git: Option<Arc<DurableGitBackend>>,
     authority: Arc<RunTokenAuthorizer>,
     delegator: Principal,
 }
@@ -36,6 +38,7 @@ impl McpReadExecutor {
             issues: None,
             knowledge: None,
             chat: None,
+            git: None,
             authority,
             delegator,
         }
@@ -53,6 +56,11 @@ impl McpReadExecutor {
 
     pub fn with_chat(mut self, chat: DurableChatReadApi) -> Self {
         self.chat = Some(chat);
+        self
+    }
+
+    pub fn with_git(mut self, git: Arc<DurableGitBackend>) -> Self {
+        self.git = Some(git);
         self
     }
 }
@@ -162,6 +170,37 @@ impl DirectReadExecutor for McpReadExecutor {
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
                     .read_messages(&self.delegator, conversation_id, limit, before)
+                    .map_err(map_edge_error)
+            }
+            "git.list_repositories" => {
+                exact_fields(arguments, &[], &["limit", "cursor"])?;
+                let limit = optional_u32(arguments, "limit")?.unwrap_or(50);
+                let cursor = optional_string(arguments, "cursor")?.map(str::to_string);
+                self.git
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .list_repositories(&self.delegator, limit, cursor)
+                    .map_err(map_edge_error)
+            }
+            "git.search_code" => {
+                exact_fields(arguments, &["query"], &["query", "repo"])?;
+                let query = required_string(arguments, "query")?;
+                let repo = optional_string(arguments, "repo")?;
+                self.git
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .search_code(&self.delegator, query, repo)
+                    .map_err(map_edge_error)
+            }
+            "git.read_file" => {
+                exact_fields(arguments, &["repo", "ref", "path"], &["repo", "ref", "path"])?;
+                let repo = required_string(arguments, "repo")?;
+                let gitref = required_string(arguments, "ref")?;
+                let path = required_string(arguments, "path")?;
+                self.git
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .read_file(&self.delegator, repo, gitref, path)
                     .map_err(map_edge_error)
             }
             _ => Err(DirectReadError::Unavailable),

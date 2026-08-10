@@ -223,7 +223,8 @@ impl Handler for AgentMcpHandler {
             )
             .with_issues(self.services.resources.issues.clone())
             .with_knowledge(self.services.resources.knowledge.clone())
-            .with_chat(self.services.resources.chat.clone()),
+            .with_chat(self.services.resources.chat.clone())
+            .with_git(self.services.resources.git.clone()),
         );
         let server = McpServer::with_router_and_reads(registry, router, reads);
         let frame = std::str::from_utf8(&ctx.request.body)

@@ -13,6 +13,7 @@ pub mod dsr;
 pub mod effect_api;
 pub mod escape_gate;
 pub mod exec;
+pub mod git_read_tools;
 pub mod git_tools;
 pub mod hitl;
 pub mod hitl_batch;
@@ -125,6 +126,10 @@ pub use issues_read_tools::{issues_read_tool_defs, LIST_ISSUES_TOOL, VIEW_ISSUE_
 pub use knowledge_read_tools::{knowledge_read_tool_defs, LIST_PAGES_TOOL, READ_PAGE_TOOL};
 
 pub use chat_read_tools::{chat_read_tool_defs, LIST_CONVERSATIONS_TOOL, READ_MESSAGES_TOOL};
+
+pub use git_read_tools::{
+    git_read_tool_defs, LIST_REPOSITORIES_TOOL, READ_FILE_TOOL, SEARCH_CODE_TOOL,
+};
 
 pub use chat_tools::{
     chat_tool_defs, landing_requires_approval, post_message_tool_def, post_required_caps,

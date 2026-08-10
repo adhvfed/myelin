@@ -7,37 +7,13 @@ impl Handler for DRepoList {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         if repo_summary_requested(&ctx.request.query) {
             let query = parse_repo_summary_query(&ctx.request.query)?;
-            let cursor = query
-                .cursor
-                .as_deref()
-                .map(|value| parse_repo_summary_cursor(value, tenant_of(ctx), region_of(ctx)))
-                .transpose()?;
-            let (rows, next_slug) = self
+            let envelope = self
                 .be
-                .list_repo_summaries_visible(
-                    tenant_of(ctx),
-                    region_of(ctx),
+                .list_repositories(
                     ctx.principal,
-                    cursor.as_ref().map(RepoListCursor::last_slug),
-                    query.limit,
-                )
-                .map_err(map_repo_summary_durable_err)?;
-            let items = rows.iter().map(RepoListRow::to_json).collect::<Vec<_>>();
-            let next_cursor = next_slug
-                .map(|last_slug| {
-                    RepoListCursor::new(
-                        repo_summary_cursor_scope(tenant_of(ctx), region_of(ctx)),
-                        last_slug,
-                    )
-                    .map(|cursor| cursor.encode())
-                    .map_err(|error| {
-                        EdgeError::Internal(format!(
-                            "mint repository summary cursor failed: {error}"
-                        ))
-                    })
-                })
-                .transpose()?;
-            let envelope = page_envelope(json!(items), next_cursor, query.limit);
+                    u32::try_from(query.limit).expect("bounded repository summary limit"),
+                    query.cursor,
+                )?;
             return repo_summary_response(&envelope);
         }
         let offset = ctx
@@ -227,29 +203,12 @@ struct DBlobView {
 }
 impl Handler for DBlobView {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let mut vm = self
-            .be
-            .blob_json(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                param(ctx, "ref")?,
-                param(ctx, "path")?,
-            )
-            .map_err(map_durable_err)?;
-        if let Some(object) = vm.as_object_mut() {
-            let loc = RepoLoc::new(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-            );
-            let may_edit = self.be.repo_authorizer().authorize_repo_permission(
-                ctx.principal,
-                &loc,
-                RepoPermission::Push,
-            );
-            object.insert("viewer_may_edit".into(), Value::Bool(may_edit));
-        }
+        let vm = self.be.read_file(
+            ctx.principal,
+            param(ctx, "repo")?,
+            param(ctx, "ref")?,
+            param(ctx, "path")?,
+        )?;
         Ok(EdgeResponse::json(200, &vm))
     }
 }
@@ -2813,14 +2772,7 @@ impl Handler for DCodeSearch {
         let (query, repo) = parse_code_search_query(&ctx.request.query)?;
         let response = self
             .be
-            .code_search_json(
-                tenant_of(ctx),
-                region_of(ctx),
-                ctx.principal,
-                &query,
-                repo.as_deref(),
-            )
-            .map_err(map_durable_err)?;
+            .search_code(ctx.principal, &query, repo.as_deref())?;
         Ok(EdgeResponse::json(200, &response))
     }
 }
@@ -3131,7 +3083,7 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 "git.pr.checks",
             ),
             (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
-                guarded(&be, Pull, Arc::new(DBlobView { be: be.clone() })),
+                Arc::new(DBlobView { be: be.clone() }),
                 "git.blob.view",
             ),
             (GitMethod::Get, "/api/git/repos/{repo}/blame/{ref}/{path}") => (

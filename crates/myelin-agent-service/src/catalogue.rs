@@ -45,6 +45,7 @@ impl PlatformToolCatalogue {
             .filter(|definition| !mcp_names.contains(&definition.canonical_name()))
             .collect::<Vec<_>>();
         definitions.extend(git_mcp);
+        definitions.extend(crate::git_read_tool_defs());
         definitions.extend(myelin_ci_controlplane::ci_tool_defs());
         definitions.extend(crate::issues_read_tool_defs());
         definitions.extend(crate::full_issues_tool_defs());
@@ -141,7 +142,7 @@ mod tests {
     #[test]
     fn the_platform_catalogue_is_one_sorted_validated_cross_subsystem_surface() {
         let catalogue = PlatformToolCatalogue::platform().unwrap();
-        assert_eq!(catalogue.definitions().len(), 50);
+        assert_eq!(catalogue.definitions().len(), 53);
         let keys = catalogue
             .definitions()
             .iter()
@@ -177,6 +178,9 @@ mod tests {
         for expected in [
             "chat.list_conversations",
             "chat.read_messages",
+            "git.list_repositories",
+            "git.read_file",
+            "git.search_code",
             "git.merge",
             "git.open_pr",
             "ci.read_run",
