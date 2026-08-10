@@ -12,13 +12,16 @@ import type { SystemTestClient } from "../src/client.js";
 async function createVisibleIssue(
   person: SystemTestClient,
   title: string,
+  projectId: string,
+  typeId: string,
+  prefix: string,
 ): Promise<JsonRecord> {
   const proposed = await person.json("/v1/issues", {
     method: "POST",
     body: {
-      project_id: systemTestConfig.issues.projectId,
-      type_id: systemTestConfig.issues.typeId,
-      prefix: systemTestConfig.issues.prefix,
+      project_id: projectId,
+      type_id: typeId,
+      prefix,
       title,
     },
     expectedStatus: 202,
@@ -94,7 +97,20 @@ describe("a person's agent-data privacy lifecycle", () => {
       },
     });
 
-    const issue = await createVisibleIssue(person, uniqueName("Private agent work"));
+    const prefix = `PR${randomUUID().replaceAll("-", "").slice(0, 6).toUpperCase()}`;
+    const projectResponse = await person.json("/v1/projects", {
+      method: "POST",
+      body: { name: uniqueName("Private work"), issue_prefix: prefix },
+      expectedStatus: 201,
+    });
+    const project = record(projectResponse.body.project, "private work project");
+    const issue = await createVisibleIssue(
+      person,
+      uniqueName("Private agent work"),
+      string(project.id, "private work project id"),
+      string(project.default_issue_type_id, "private work issue type id"),
+      prefix,
+    );
     const issueRef = string(issue.ref, "privacy test issue ref");
     const issueKey = string(issue.key, "privacy test issue key");
     const agentResponse = await person.json("/v1/agents", {
