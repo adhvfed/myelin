@@ -376,7 +376,7 @@ impl SkeletonAgent {
         let storage_run = StorageRunId::new(sub.run_id.clone());
         let in_flight = sub
             .gate
-            .dispatch(
+            .dispatch_or_resume_workflow(
                 sub.ledger,
                 sub.tenant.clone(),
                 storage_run.clone(),

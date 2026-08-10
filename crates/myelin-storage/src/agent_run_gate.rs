@@ -1,5 +1,6 @@
 use crate::reserve_settle::{
-    CostLedger, MeteredUnit, MicroUsd, ReserveError, RunId, SettleError, SettleOutcome,
+    CostLedger, MeteredUnit, MicroUsd, ReservationState, ReserveError, RunId, SettleError,
+    SettleOutcome,
 };
 use myelin_tenancy::TenantId;
 
@@ -99,6 +100,24 @@ pub struct AgentRunGate {
     runs_dispatched: u64,
 }
 
+#[derive(Clone, Copy)]
+enum DispatchAdmission {
+    Fresh(RunKind),
+    WorkflowReplay(RunKind),
+}
+
+impl DispatchAdmission {
+    fn kind(self) -> RunKind {
+        match self {
+            Self::Fresh(kind) | Self::WorkflowReplay(kind) => kind,
+        }
+    }
+
+    fn may_resume(self) -> bool {
+        matches!(self, Self::WorkflowReplay(_))
+    }
+}
+
 impl AgentRunGate {
     pub fn new() -> AgentRunGate {
         AgentRunGate::default()
@@ -112,7 +131,32 @@ impl AgentRunGate {
         estimate: MicroUsd,
         available: MicroUsd,
     ) -> Result<InFlightRun, DispatchError> {
-        self.dispatch_kind(ledger, tenant, run, estimate, available, RunKind::AgentRun)
+        self.dispatch_kind(
+            ledger,
+            tenant,
+            run,
+            estimate,
+            available,
+            DispatchAdmission::Fresh(RunKind::AgentRun),
+        )
+    }
+
+    pub fn dispatch_or_resume_workflow(
+        &mut self,
+        ledger: &mut CostLedger,
+        tenant: TenantId,
+        run: RunId,
+        estimate: MicroUsd,
+        available: MicroUsd,
+    ) -> Result<InFlightRun, DispatchError> {
+        self.dispatch_kind(
+            ledger,
+            tenant,
+            run,
+            estimate,
+            available,
+            DispatchAdmission::WorkflowReplay(RunKind::AgentRun),
+        )
     }
 
     pub fn schedule_and_run_job(
@@ -129,7 +173,7 @@ impl AgentRunGate {
             run,
             estimate,
             available,
-            RunKind::ScheduleAndRunJob,
+            DispatchAdmission::Fresh(RunKind::ScheduleAndRunJob),
         )
     }
 
@@ -140,31 +184,49 @@ impl AgentRunGate {
         run: RunId,
         estimate: MicroUsd,
         available: MicroUsd,
-        kind: RunKind,
+        admission: DispatchAdmission,
     ) -> Result<InFlightRun, DispatchError> {
-        match ledger.reserve(tenant.clone(), run.clone(), estimate, available) {
-            Ok(_reservation) => {}
+        let newly_reserved = match ledger.reserve(tenant.clone(), run.clone(), estimate, available) {
+            Ok(_reservation) => true,
+            Err(ReserveError::DuplicateReservation) if admission.may_resume() => {
+                let Some(existing) = ledger.reservation_of(&tenant, &run) else {
+                    return Err(DispatchError::AlreadyDispatched);
+                };
+                if existing.reserved != estimate
+                    || !matches!(existing.state, ReservationState::Reserved | ReservationState::InFlight)
+                {
+                    return Err(DispatchError::AlreadyDispatched);
+                }
+                false
+            }
+            Err(ReserveError::DuplicateReservation) => {
+                return Err(DispatchError::AlreadyDispatched);
+            }
             Err(e) => {
                 if matches!(e, ReserveError::InsufficientBalance { .. }) {
                     self.reserve_refusals += 1;
                 }
                 return Err(e.into());
             }
-        }
+        };
 
         match ledger.begin(&tenant, &run) {
             Ok(()) => {}
             Err(_) => {
-                let _ = ledger.cancel_unstarted(&tenant, &run);
+                if newly_reserved {
+                    let _ = ledger.cancel_unstarted(&tenant, &run);
+                }
                 return Err(DispatchError::AlreadyDispatched);
             }
         }
 
-        self.runs_dispatched += 1;
+        if newly_reserved {
+            self.runs_dispatched += 1;
+        }
         Ok(InFlightRun {
             tenant,
             run,
-            kind,
+            kind: admission.kind(),
             reserved: estimate,
         })
     }
@@ -229,6 +291,64 @@ mod tests {
         );
         assert_eq!(gate.runs_dispatched(), 1);
         assert_eq!(gate.reserve_refusals(), 0);
+    }
+
+    #[test]
+    fn the_same_inflight_dispatch_resumes_without_reserving_twice() {
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        let first = gate
+            .dispatch_or_resume_workflow(
+                &mut ledger,
+                tenant(),
+                run(1),
+                MicroUsd(1_000),
+                MicroUsd(5_000),
+            )
+            .expect("the first drive reserves and begins the run");
+        let replay = gate
+            .dispatch_or_resume_workflow(
+                &mut ledger,
+                tenant(),
+                run(1),
+                MicroUsd(1_000),
+                MicroUsd::ZERO,
+            )
+            .expect("a workflow replay resumes its exact in-flight reservation");
+
+        assert_eq!(replay.reserved(), first.reserved());
+        assert_eq!(gate.runs_dispatched(), 1, "replay is not a second dispatch");
+        assert_eq!(
+            ledger.reservation_of(&tenant(), &run(1)).unwrap().reserved,
+            MicroUsd(1_000),
+            "the original reservation remains the only reservation",
+        );
+    }
+
+    #[test]
+    fn replay_cannot_change_an_inflight_reservation() {
+        let mut gate = AgentRunGate::new();
+        let mut ledger = CostLedger::new();
+        gate.dispatch_or_resume_workflow(
+            &mut ledger,
+            tenant(),
+            run(1),
+            MicroUsd(1_000),
+            MicroUsd(5_000),
+        )
+        .unwrap();
+
+        assert_eq!(
+            gate.dispatch_or_resume_workflow(
+                &mut ledger,
+                tenant(),
+                run(1),
+                MicroUsd(2_000),
+                MicroUsd(5_000),
+            ),
+            Err(DispatchError::AlreadyDispatched),
+        );
+        assert_eq!(ledger.reservation_of(&tenant(), &run(1)).unwrap().reserved, MicroUsd(1_000));
     }
 
     #[test]

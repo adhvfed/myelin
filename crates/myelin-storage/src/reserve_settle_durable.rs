@@ -324,13 +324,17 @@ impl DurableCostLedger {
     }
 
     pub fn state_of(&self, tenant: &TenantId, run: &RunId) -> Option<ReservationState> {
+        self.reservation_of(tenant, run).map(|reservation| reservation.state)
+    }
+
+    pub fn reservation_of(&self, tenant: &TenantId, run: &RunId) -> Option<Reservation> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
         let run_s = run.0.clone();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
             Box::pin(async move {
-                let state: Option<String> = sqlx::query_scalar(
-                    "SELECT state FROM cost_reservation \
+                let row = sqlx::query(
+                    "SELECT reserved, state FROM cost_reservation \
                      WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
                 )
                 .bind(&tenant_s)
@@ -339,7 +343,17 @@ impl DurableCostLedger {
                 .fetch_optional(&mut *conn)
                 .await
                 .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                state.map(|state| parse_state(&state)).transpose()
+                let Some(row) = row else {
+                    return Ok(None);
+                };
+                let reserved = row.try_get::<i64, _>("reserved").map_err(cost_row_decode)?;
+                let state = row.try_get::<String, _>("state").map_err(cost_row_decode)?;
+                Ok(Some(Reservation {
+                    tenant: TenantId(tenant_s),
+                    run: RunId(run_s),
+                    reserved: MicroUsd(reserved as u64),
+                    state: parse_state(&state)?,
+                }))
             })
         }))
     }

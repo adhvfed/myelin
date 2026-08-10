@@ -211,10 +211,14 @@ impl CostLedger {
     }
 
     pub fn state_of(&self, tenant: &TenantId, run: &RunId) -> Option<ReservationState> {
+        self.reservation_of(tenant, run).map(|reservation| reservation.state)
+    }
+
+    pub fn reservation_of(&self, tenant: &TenantId, run: &RunId) -> Option<Reservation> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            CostBackend::Memory(m) => m.state_of(tenant, run),
-            CostBackend::Durable(d) => d.state_of(tenant, run),
+            CostBackend::Memory(m) => m.reservation_of(tenant, run),
+            CostBackend::Durable(d) => d.reservation_of(tenant, run),
         }
     }
 
@@ -417,9 +421,13 @@ impl MemoryCostLedger {
     }
 
     pub fn state_of(&self, tenant: &TenantId, run: &RunId) -> Option<ReservationState> {
+        self.reservation_of(tenant, run).map(|reservation| reservation.state)
+    }
+
+    pub fn reservation_of(&self, tenant: &TenantId, run: &RunId) -> Option<Reservation> {
         self.reservations
             .get(&(tenant.clone(), run.clone()))
-            .map(|r| r.state)
+            .cloned()
     }
 
     pub fn cost_events_for(&self, tenant: &TenantId, run: &RunId) -> Vec<CostEvent> {
