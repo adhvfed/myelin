@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use myelin_agent::{EffectKind, ToolCall, ToolDef, ToolResult};
 use myelin_agent_host::{
     dispatch_test_run_with_synthetic_identity, git_check_status_read_tool_def,
-    git_check_status_read_tool_schema, LlmRunTask, MicroUsd, RunSubstrateWiring, RunWallet,
-    ToolCatalogue, Tools, WalletError, GIT_READ_CHECK_STATUS_TOOL,
+    git_check_status_read_tool_schema, DebitOutcome, LlmRunTask, MicroUsd, RunSubstrateWiring,
+    RunWallet, ToolCatalogue, Tools, WalletError, GIT_READ_CHECK_STATUS_TOOL,
 };
 use myelin_agent_model::{
     ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn, ToolCallRequest,
@@ -53,12 +53,13 @@ impl RunWallet for MemWallet {
     fn balance(&self, _tenant: &TenantId) -> MicroUsd {
         MicroUsd(*self.balance.lock().unwrap())
     }
-    fn debit(
+    fn debit_once(
         &self,
         _tenant: &TenantId,
         amount: MicroUsd,
         run_id: &str,
-    ) -> Result<MicroUsd, WalletError> {
+        _charge_key: &str,
+    ) -> Result<DebitOutcome, WalletError> {
         let mut bal = self.balance.lock().unwrap();
         match bal.checked_sub(amount.0) {
             None => Err(WalletError::InsufficientBalance {
@@ -71,7 +72,7 @@ impl RunWallet for MemWallet {
                     .lock()
                     .unwrap()
                     .push((run_id.to_string(), amount.0));
-                Ok(MicroUsd(new))
+                Ok(DebitOutcome::Applied(MicroUsd(new)))
             }
         }
     }

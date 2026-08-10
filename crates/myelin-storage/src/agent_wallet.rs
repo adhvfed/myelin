@@ -59,6 +59,25 @@ pub fn agent_wallet_migrations() -> Migrations {
     Migrations::of([Migration::plain("0080_agent_wallet", AGENT_WALLET_MIGRATION)])
 }
 
+pub const AGENT_WALLET_CHARGE_KEY_MIGRATION: &str = "\
+ALTER TABLE agent_wallet_ledger
+    ADD COLUMN IF NOT EXISTS charge_key text;
+ALTER TABLE agent_wallet_ledger
+    DROP CONSTRAINT IF EXISTS agent_wallet_ledger_charge_key_bound;
+ALTER TABLE agent_wallet_ledger
+    ADD CONSTRAINT agent_wallet_ledger_charge_key_bound
+    CHECK (charge_key IS NULL OR length(charge_key) BETWEEN 1 AND 512);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_wallet_ledger_charge_once
+    ON agent_wallet_ledger (tenant_id, region, charge_key)
+    WHERE charge_key IS NOT NULL;";
+
+pub fn agent_wallet_charge_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0095_agent_wallet_charge_key",
+        AGENT_WALLET_CHARGE_KEY_MIGRATION,
+    )])
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CreditKind {
     Topup,
@@ -84,6 +103,8 @@ pub enum WalletError {
     },
     AmountTooLarge,
     BalanceOverflow,
+    InvalidChargeKey,
+    ChargeConflict,
 }
 
 impl core::fmt::Display for WalletError {
@@ -107,11 +128,33 @@ impl core::fmt::Display for WalletError {
                 f,
                 "wallet credit refused: the running balance sum overflowed u64 (loud, never a silent wrap)"
             ),
+            WalletError::InvalidChargeKey => write!(
+                f,
+                "wallet debit refused: charge key must contain between 1 and 512 bytes"
+            ),
+            WalletError::ChargeConflict => write!(
+                f,
+                "wallet charge key was already used for a different run or amount"
+            ),
         }
     }
 }
 
 impl std::error::Error for WalletError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DebitOutcome {
+    Applied(MicroUsd),
+    Replayed(MicroUsd),
+}
+
+impl DebitOutcome {
+    pub fn balance(self) -> MicroUsd {
+        match self {
+            Self::Applied(balance) | Self::Replayed(balance) => balance,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct AgentWallet {
@@ -164,9 +207,31 @@ impl AgentWallet {
         let region = self.region();
         let tenant_s = tenant.0.clone();
         let run_id = run_id.to_string();
+        let outcome = self.block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
+            Box::pin(
+                async move { debit_on_conn(conn, &tenant_s, &region, amount, &run_id, None).await },
+            )
+        }))?;
+        Ok(outcome.balance())
+    }
+
+    pub fn debit_once(
+        &self,
+        tenant: &TenantId,
+        amount: MicroUsd,
+        run_id: &str,
+        charge_key: &str,
+    ) -> Result<DebitOutcome, WalletError> {
+        if charge_key.is_empty() || charge_key.len() > 512 {
+            return Err(WalletError::InvalidChargeKey);
+        }
+        let region = self.region();
+        let tenant_s = tenant.0.clone();
+        let run_id = run_id.to_string();
+        let charge_key = charge_key.to_string();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
             Box::pin(async move {
-                debit_on_conn(conn, &tenant_s, &region, amount, &run_id).await
+                debit_on_conn(conn, &tenant_s, &region, amount, &run_id, Some(&charge_key)).await
             })
         }))
     }
@@ -244,13 +309,39 @@ async fn debit_on_conn(
     region: &str,
     amount: MicroUsd,
     run_id: &str,
-) -> Result<Result<MicroUsd, WalletError>, PgError> {
+    charge_key: Option<&str>,
+) -> Result<Result<DebitOutcome, WalletError>, PgError> {
     let Some(current) = lock_balance_optional(conn, tenant_s, region).await? else {
         return Ok(Err(WalletError::InsufficientBalance {
             requested: amount,
             available: MicroUsd::ZERO,
         }));
     };
+    let amount_bigint = match amount.to_bigint() {
+        Some(value) => value,
+        None => return Ok(Err(WalletError::AmountTooLarge)),
+    };
+    if let Some(charge_key) = charge_key {
+        let existing = sqlx::query_as::<_, (i64, Option<String>)>(
+            "SELECT amount_micro, run_id FROM agent_wallet_ledger \
+             WHERE tenant_id = $1 AND region = $2 AND charge_key = $3",
+        )
+        .bind(tenant_s)
+        .bind(region)
+        .bind(charge_key)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        if let Some((existing_amount, existing_run)) = existing {
+            return Ok(
+                if existing_amount == amount_bigint && existing_run.as_deref() == Some(run_id) {
+                    Ok(DebitOutcome::Replayed(current))
+                } else {
+                    Err(WalletError::ChargeConflict)
+                },
+            );
+        }
+    }
 
     let new_balance = match current.checked_sub(amount) {
         Some(b) => b,
@@ -265,25 +356,22 @@ async fn debit_on_conn(
         Some(v) => v,
         None => return Ok(Err(WalletError::AmountTooLarge)),
     };
-    let amount_bigint = match amount.to_bigint() {
-        Some(v) => v,
-        None => return Ok(Err(WalletError::AmountTooLarge)),
-    };
-
     sqlx::query(
-        "INSERT INTO agent_wallet_ledger (tenant_id, region, kind, amount_micro, run_id) \
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO agent_wallet_ledger \
+           (tenant_id, region, kind, amount_micro, run_id, charge_key) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
     )
     .bind(tenant_s)
     .bind(region)
     .bind(DEBIT_KIND)
     .bind(amount_bigint)
     .bind(run_id)
+    .bind(charge_key)
     .execute(&mut *conn)
     .await
     .map_err(|e| PgError::Query(e.to_string()))?;
     write_balance(conn, tenant_s, region, new_bigint).await?;
-    Ok(Ok(new_balance))
+    Ok(Ok(DebitOutcome::Applied(new_balance)))
 }
 
 async fn ensure_wallet_row(
@@ -418,5 +506,19 @@ mod tests {
         let ms = agent_wallet_migrations();
         assert_eq!(ms.0.len(), 1);
         assert_eq!(ms.0[0].id, "0080_agent_wallet");
+    }
+
+    #[test]
+    fn charge_key_migration_makes_one_logical_charge_unique() {
+        let ddl = AGENT_WALLET_CHARGE_KEY_MIGRATION;
+        assert!(ddl.contains("ADD COLUMN IF NOT EXISTS charge_key text"));
+        assert!(ddl.contains("length(charge_key) BETWEEN 1 AND 512"));
+        assert!(ddl.contains("CREATE UNIQUE INDEX IF NOT EXISTS agent_wallet_ledger_charge_once"));
+        assert!(ddl.contains("(tenant_id, region, charge_key)"));
+        assert!(ddl.contains("WHERE charge_key IS NOT NULL"));
+
+        let migrations = agent_wallet_charge_migrations();
+        assert_eq!(migrations.0.len(), 1);
+        assert_eq!(migrations.0[0].id, "0095_agent_wallet_charge_key");
     }
 }

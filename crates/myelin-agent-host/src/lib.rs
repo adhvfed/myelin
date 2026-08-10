@@ -42,7 +42,7 @@ use myelin_identity_service::{
 };
 
 pub use myelin_agent_service::{RunTokenRevoker, RunWallet};
-pub use myelin_storage::agent_wallet::{CreditKind, MicroUsd, WalletError};
+pub use myelin_storage::agent_wallet::{CreditKind, DebitOutcome, MicroUsd, WalletError};
 
 #[derive(Clone, Debug)]
 pub struct LlmRunTask {

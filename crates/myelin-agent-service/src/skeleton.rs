@@ -14,7 +14,7 @@ use myelin_flow::{
 use myelin_identity::Principal;
 use myelin_refs::ArtifactRef;
 use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError};
-use myelin_storage::agent_wallet::{AgentWallet, MicroUsd, WalletError};
+use myelin_storage::agent_wallet::{AgentWallet, DebitOutcome, MicroUsd, WalletError};
 use myelin_storage::reserve_settle::{CostLedger, RunId as StorageRunId};
 use myelin_tenancy::{Region, TenantId};
 
@@ -28,25 +28,28 @@ pub const WALLET_MIN_BALANCE_FLOOR: MicroUsd = MicroUsd::ZERO;
 
 pub trait RunWallet {
     fn balance(&self, tenant: &TenantId) -> MicroUsd;
-    fn debit(
+    fn debit_once(
         &self,
         tenant: &TenantId,
         amount: MicroUsd,
         run_id: &str,
-    ) -> Result<MicroUsd, WalletError>;
+        charge_key: &str,
+    ) -> Result<DebitOutcome, WalletError>;
 }
 
 impl RunWallet for AgentWallet {
     fn balance(&self, tenant: &TenantId) -> MicroUsd {
         AgentWallet::balance(self, tenant)
     }
-    fn debit(
+
+    fn debit_once(
         &self,
         tenant: &TenantId,
         amount: MicroUsd,
         run_id: &str,
-    ) -> Result<MicroUsd, WalletError> {
-        AgentWallet::debit(self, tenant, amount, run_id)
+        charge_key: &str,
+    ) -> Result<DebitOutcome, WalletError> {
+        AgentWallet::debit_once(self, tenant, amount, run_id, charge_key)
     }
 }
 
@@ -408,7 +411,7 @@ impl SkeletonAgent {
         let mut conv = Conversation::default();
 
         let mut submission: Option<Submission> = None;
-        for _turn in 0..DEFAULT_MAX_TURNS {
+        for turn in 0..DEFAULT_MAX_TURNS {
             if let Some(wallet) = sub.wallet {
                 if wallet.balance(&sub.tenant) <= WALLET_MIN_BALANCE_FLOOR {
                     return Err(SkeletonError::WalletSpendCapReached {
@@ -427,6 +430,7 @@ impl SkeletonAgent {
                     &sub.tenant,
                     &usage,
                     &sub.run_id,
+                    &format!("{}/model-turn/{turn}", sub.run_id),
                     teardown_guard.telemetry,
                 )?;
             }
@@ -536,6 +540,7 @@ impl SkeletonAgent {
         tenant: &TenantId,
         usage: &TokenUsage,
         run_id: &str,
+        charge_key: &str,
         telemetry: &mut SkeletonTelemetry,
     ) -> Result<(), SkeletonError> {
         let reported = match usage {
@@ -554,8 +559,8 @@ impl SkeletonAgent {
             run_id: run_id.to_string(),
             reason: "priced wholesale + markup overflowed u64".into(),
         })?;
-        match wallet.debit(tenant, charge, run_id) {
-            Ok(_new_balance) => {
+        match wallet.debit_once(tenant, charge, run_id, charge_key) {
+            Ok(DebitOutcome::Applied(_new_balance) | DebitOutcome::Replayed(_new_balance)) => {
                 telemetry.record_charge(charge);
                 Ok(())
             }
@@ -1391,12 +1396,14 @@ mod tests {
     struct FakeWallet {
         balance: std::sync::Mutex<u64>,
         debits: std::sync::Mutex<Vec<(u64, String)>>,
+        charge_keys: std::sync::Mutex<Vec<String>>,
     }
     impl FakeWallet {
         fn new(initial: u64) -> FakeWallet {
             FakeWallet {
                 balance: std::sync::Mutex::new(initial),
                 debits: std::sync::Mutex::new(Vec::new()),
+                charge_keys: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn balance_now(&self) -> u64 {
@@ -1405,17 +1412,21 @@ mod tests {
         fn debit_rows(&self) -> Vec<(u64, String)> {
             self.debits.lock().unwrap().clone()
         }
+        fn charge_keys(&self) -> Vec<String> {
+            self.charge_keys.lock().unwrap().clone()
+        }
     }
     impl RunWallet for FakeWallet {
         fn balance(&self, _tenant: &TenantId) -> MicroUsd {
             MicroUsd(*self.balance.lock().unwrap())
         }
-        fn debit(
+        fn debit_once(
             &self,
             _tenant: &TenantId,
             amount: MicroUsd,
             run_id: &str,
-        ) -> Result<MicroUsd, WalletError> {
+            charge_key: &str,
+        ) -> Result<DebitOutcome, WalletError> {
             let mut b = self.balance.lock().unwrap();
             match b.checked_sub(amount.0) {
                 Some(new_balance) => {
@@ -1424,7 +1435,8 @@ mod tests {
                         .lock()
                         .unwrap()
                         .push((amount.0, run_id.to_string()));
-                    Ok(MicroUsd(new_balance))
+                    self.charge_keys.lock().unwrap().push(charge_key.to_string());
+                    Ok(DebitOutcome::Applied(MicroUsd(new_balance)))
                 }
                 None => Err(WalletError::InsufficientBalance {
                     requested: amount,
@@ -1515,6 +1527,15 @@ mod tests {
             assert_eq!(*amount, TEST_CHARGE_PER_TURN, "each turn debits wholesale+markup");
             assert_eq!(run_id, "Rmeter", "every debit is run_id-linked");
         }
+        assert_eq!(
+            wallet.charge_keys(),
+            [
+                "Rmeter/model-turn/0",
+                "Rmeter/model-turn/1",
+                "Rmeter/model-turn/2",
+            ],
+            "each turn receives a deterministic identity that survives workflow replay",
+        );
         assert_eq!(
             wallet.balance_now(),
             10_000 - 3 * TEST_CHARGE_PER_TURN,

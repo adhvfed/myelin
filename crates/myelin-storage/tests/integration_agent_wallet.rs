@@ -2,7 +2,8 @@
 
 use myelin_config::MyelinConfig;
 use myelin_storage::agent_wallet::{
-    agent_wallet_migrations, AgentWallet, CreditKind, MicroUsd, WalletError,
+    agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind,
+    DebitOutcome, MicroUsd, WalletError,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::SubstrateProvider;
@@ -39,6 +40,10 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
         .migrate(&agent_wallet_migrations(), &HotTables::none())
         .await
         .expect("apply the agent-wallet migration (0080)");
+    admin
+        .migrate(&agent_wallet_charge_migrations(), &HotTables::none())
+        .await
+        .expect("apply replay-safe charge keys (0095)");
     Some(admin)
 }
 
@@ -87,6 +92,64 @@ async fn ledger_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str) -> i6
     .expect("count the ledger rows");
     tx.commit().await.expect("commit count tx");
     n
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_wallet_charges_each_model_turn_once() {
+    let Some(_admin) = migrate_admin().await else {
+        return;
+    };
+    let app = app_provider().await;
+    let region = app.config().region.clone();
+    let suffix = uniq();
+    let tenant = TenantId(format!("01J0ONCE{suffix}"));
+    let run_id = format!("run-keyed-{suffix}");
+    let charge_key = format!("{run_id}/model-turn/0");
+    let wallet = AgentWallet::new(app.clone());
+
+    wallet
+        .credit(&tenant, MicroUsd(1_000), CreditKind::Topup, None)
+        .expect("the organization funds its agent wallet");
+    assert_eq!(
+        wallet.debit_once(&tenant, MicroUsd(500), &run_id, &charge_key),
+        Ok(DebitOutcome::Applied(MicroUsd(500))),
+        "the first observation of a model turn spends its measured cost",
+    );
+
+    let rows_after_first_charge = ledger_row_count(app.db_pool(), &tenant.0, &region).await;
+    assert_eq!(
+        wallet.debit_once(&tenant, MicroUsd(500), &run_id, &charge_key),
+        Ok(DebitOutcome::Replayed(MicroUsd(500))),
+        "workflow replay recognizes the same logical charge",
+    );
+    assert_eq!(wallet.balance(&tenant), MicroUsd(500), "replay spends nothing");
+    assert_eq!(
+        ledger_row_count(app.db_pool(), &tenant.0, &region).await,
+        rows_after_first_charge,
+        "one logical model turn leaves exactly one immutable debit row",
+    );
+
+    assert_eq!(
+        wallet.debit_once(&tenant, MicroUsd(501), &run_id, &charge_key),
+        Err(WalletError::ChargeConflict),
+        "replay cannot reinterpret the amount behind a charge key",
+    );
+    assert_eq!(
+        wallet.debit_once(
+            &tenant,
+            MicroUsd(500),
+            &format!("different-{run_id}"),
+            &charge_key,
+        ),
+        Err(WalletError::ChargeConflict),
+        "replay cannot move a durable charge to a different run",
+    );
+    assert_eq!(
+        wallet.debit_once(&tenant, MicroUsd(1), &run_id, ""),
+        Err(WalletError::InvalidChargeKey),
+        "an empty operation identity is never silently downgraded to an ordinary debit",
+    );
+    assert_eq!(wallet.balance(&tenant), MicroUsd(500));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
