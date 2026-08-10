@@ -16,7 +16,7 @@ impl core::fmt::Display for ToolExecError {
 
 impl std::error::Error for ToolExecError {}
 
-pub trait ToolExecutor {
+pub trait ToolExecutor: Send + Sync {
     fn execute(
         &self,
         context: &ToolExecutionContext<'_>,

@@ -385,7 +385,7 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
     };
     let denied = denied_gate.execute(
         &ToolExecutionContext {
-            run_id: &run_id,
+            run_id,
             run_token: &probe_token,
         },
         &git_check_status_read_tool_def(),

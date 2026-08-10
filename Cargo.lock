@@ -2515,7 +2515,12 @@ name = "myelin-agent-host"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "bytes",
  "chrono",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "myelin-agent",
  "myelin-agent-model",
  "myelin-agent-service",
@@ -2528,6 +2533,7 @@ dependencies = [
  "myelin-refs",
  "myelin-storage",
  "myelin-tenancy",
+ "rustls",
  "serde",
  "serde_json",
  "sqlx",

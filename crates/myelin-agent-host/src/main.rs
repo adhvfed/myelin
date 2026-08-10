@@ -2,10 +2,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use myelin_agent_host::{
-    register_hosted_agent_workflow, AgentHost, AgentHostActivityExecutor, HostedAgentInputResolver,
-    HostedAgentRunExecutor, HostedModelFactory, LunaModelFactory,
+    register_hosted_agent_workflow, AgentHost, AgentHostActivityExecutor, EdgeMcpToolExecutor,
+    HostedAgentInputResolver, HostedAgentRunExecutor, HostedModelFactory, LunaModelFactory,
 };
-use myelin_agent_model::{ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, Usage};
+use myelin_agent_model::{
+    ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn, ToolCallRequest,
+    Usage,
+};
 use myelin_agent_service::trigger_handoff::TriggerRunHandoff;
 use myelin_config::Mode;
 use myelin_events::{Actor, UlidMinter};
@@ -63,12 +66,17 @@ async fn main() {
             .unwrap_or_else(|error| refuse_start("hosted run identity", error)),
     );
     let models = model_factory().unwrap_or_else(|error| refuse_start("model mode", error));
-    let activity: Arc<dyn HostedAgentRunExecutor> = Arc::new(AgentHostActivityExecutor::new(
-        host,
-        provider.clone(),
-        runtime.clone(),
-        models,
-    ));
+    let edge_url = std::env::var("MYELIN_PUBLIC_BASE_URL").unwrap_or_else(|_| {
+        refuse_start("governed tool broker", "MYELIN_PUBLIC_BASE_URL is missing")
+    });
+    let tool_executor = Arc::new(
+        EdgeMcpToolExecutor::new(edge_url)
+            .unwrap_or_else(|error| refuse_start("governed tool broker", error)),
+    );
+    let activity: Arc<dyn HostedAgentRunExecutor> = Arc::new(
+        AgentHostActivityExecutor::new(host, provider.clone(), runtime.clone(), models)
+            .with_tool_executor(tool_executor),
+    );
     let region = Region(provider.config().region.clone());
     let mut workers = Vec::with_capacity(tenants.len() * PARTITION_COUNT as usize);
     for tenant in &tenants {
@@ -247,11 +255,42 @@ impl HostedModelFactory for DeterministicDevelopmentModelFactory {
 struct DeterministicDevelopmentModel;
 
 impl ModelClient for DeterministicDevelopmentModel {
-    fn complete(&self, _request: &ModelRequest) -> Result<ModelResponse, ModelError> {
-        Ok(ModelResponse {
-            reply: ModelReply::Final {
-                content: "The deterministic development host accepted the governed run.".into(),
+    fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+        let has_ci_triage_tools = ["ci.read_run", "issues.create"]
+            .iter()
+            .all(|name| request.tools.iter().any(|tool| tool.name == *name));
+        let tool_results = request
+            .turns
+            .iter()
+            .filter(|turn| matches!(turn, ModelTurn::ToolResults(_)))
+            .count();
+        let reply = match (has_ci_triage_tools, tool_results) {
+            (true, 0) => ModelReply::ToolCalls(vec![ToolCallRequest {
+                id: "read-triggering-ci-run".into(),
+                name: "ci.read_run".into(),
+                arguments: serde_json::json!({
+                    "run_id": triggering_ci_run_id(request)?,
+                }),
+            }]),
+            (true, 1) => ModelReply::ToolCalls(vec![ToolCallRequest {
+                id: "open-triage-issue".into(),
+                name: "issues.create".into(),
+                arguments: serde_json::json!({
+                    "project_id": required_development_value("MYELIN_ISSUES_PROJECT")?,
+                    "type_id": required_development_value("MYELIN_ISSUES_TYPE")?,
+                    "prefix": required_development_value("MYELIN_ISSUES_PREFIX")?,
+                    "title": format!(
+                        "CI failure {} needs triage",
+                        triggering_ci_run_id(request)?
+                    ),
+                }),
+            }]),
+            _ => ModelReply::Final {
+                content: "Read the failing CI run and opened one governed triage issue.".into(),
             },
+        };
+        Ok(ModelResponse {
+            reply,
             usage: Usage::Reported {
                 input: 100,
                 cached_input: 0,
@@ -259,6 +298,41 @@ impl ModelClient for DeterministicDevelopmentModel {
             },
         })
     }
+}
+
+fn triggering_ci_run_id(request: &ModelRequest) -> Result<String, ModelError> {
+    let prompt = request
+        .turns
+        .iter()
+        .find_map(|turn| match turn {
+            ModelTurn::User { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| ModelError::Parse("development run has no user prompt".into()))?;
+    let marker = "/ci/run/";
+    let start = prompt
+        .find(marker)
+        .map(|index| index + marker.len())
+        .ok_or_else(|| ModelError::Parse("development trigger has no CI run reference".into()))?;
+    let run_id = prompt[start..]
+        .chars()
+        .take_while(|character| character.is_ascii_hexdigit() || *character == '-')
+        .collect::<String>();
+    let parsed = uuid::Uuid::parse_str(&run_id)
+        .map_err(|_| ModelError::Parse("development trigger CI run is not a UUID".into()))?;
+    if parsed.to_string() != run_id {
+        return Err(ModelError::Parse(
+            "development trigger CI run is not canonical".into(),
+        ));
+    }
+    Ok(run_id)
+}
+
+fn required_development_value(name: &str) -> Result<String, ModelError> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty() && !value.contains("{{"))
+        .ok_or_else(|| ModelError::Parse(format!("development model requires {name}")))
 }
 
 fn required_cell_id() -> Result<String, &'static str> {

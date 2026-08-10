@@ -41,7 +41,7 @@ async function awaitActiveIssue(title: string): Promise<JsonRecord> {
 }
 
 describe("collaboration lifecycle", () => {
-  test("turns red mainline CI into one governed hosted run without an integration API key", async () => {
+  test("reads red mainline CI and opens one governed issue without an integration API key", async () => {
     const founder = await browserApprovedCliClient();
     const agentName = uniqueName("triage-bot");
     const agentRetryKey = `agent-${randomUUID()}`;
@@ -209,6 +209,23 @@ command = ["true"]
       trigger_ref: `myelin://${systemTestConfig.tenant}/identity/trigger/${triggerId}`,
       state: "terminal",
       run_ref: `myelin://${systemTestConfig.tenant}/agent/run/${hostedRunId}`,
+    });
+    const triageTitle = `CI failure ${runId} needs triage`;
+    const triageIssues = await eventually<JsonRecord[]>(async () => {
+      const response = await systemClient.json("/v1/issues?state=open&limit=100");
+      const matching = array(response.body.items, "open issues after the governed hosted run")
+        .map((item) => record(item, "open issue after the governed hosted run"))
+        .filter(
+          (item) => item.title === triageTitle && item.created_by === `agent:${agentId}`,
+        );
+      return matching.length > 0 ? matching : undefined;
+    }, { description: "the hosted agent to read CI and open exactly one governed issue" });
+    expect(triageIssues).toHaveLength(1);
+    expect(triageIssues[0]).toMatchObject({
+      title: triageTitle,
+      state: "Todo",
+      created_by: `agent:${agentId}`,
+      creator_kind: "agent",
     });
     const peerHistory = await reviewerClient.json(
       `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,

@@ -29,6 +29,12 @@ serde.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 uuid = "1"
 blake3.workspace = true
+hyper = { version = "1", features = ["client", "http1"] }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "native-tokio", "aws-lc-rs", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [dev-dependencies]
 myelin-agent-model = { path = "../myelin-agent-model", features = ["test-support"] }

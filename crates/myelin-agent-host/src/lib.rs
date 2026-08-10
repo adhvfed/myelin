@@ -2,8 +2,10 @@ use std::sync::{Arc, Mutex};
 
 mod activity_executor;
 mod durable_model;
+mod tool_broker;
 
 pub use activity_executor::{AgentHostActivityExecutor, HostedModelFactory, LunaModelFactory};
+pub use tool_broker::EdgeMcpToolExecutor;
 
 pub mod git_read_tool;
 pub use git_read_tool::{
@@ -222,15 +224,21 @@ impl HostModelClient {
 impl ModelClient for HostModelClient {
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let mut req = request.clone();
-        if req.turns.is_empty() {
-            if req.system.trim().is_empty() {
-                req.system = self.system.clone();
-            }
-            if !self.prompt.is_empty() {
-                req.turns.push(ModelTurn::User {
+        if req.system.trim().is_empty() {
+            req.system = self.system.clone();
+        }
+        if !self.prompt.is_empty()
+            && !req
+                .turns
+                .iter()
+                .any(|turn| matches!(turn, ModelTurn::User { .. }))
+        {
+            req.turns.insert(
+                0,
+                ModelTurn::User {
                     content: self.prompt.clone(),
-                });
-            }
+                },
+            );
         }
         if !self.tool_specs.is_empty() {
             req.tools = self.tool_specs.clone();
@@ -736,7 +744,7 @@ mod tests {
     }
 
     #[test]
-    fn host_client_injects_system_and_prompt_on_the_first_step() {
+    fn every_stateless_model_step_keeps_the_governed_system_and_prompt() {
         let spy = Spy::new(
             "ready",
             Usage::Reported {
@@ -754,11 +762,24 @@ mod tests {
         let resp = client.complete(&ModelRequest::default()).unwrap();
         assert!(matches!(resp.reply, ModelReply::Final { .. }));
         assert_eq!(answer.take().as_deref(), Some("ready"));
-        let seen = spy.seen.lock().unwrap()[0].clone();
-        assert_eq!(seen.system, "SYS");
-        match &seen.turns[..] {
-            [ModelTurn::User { content }] => assert_eq!(content, "do the thing"),
-            other => panic!("expected one injected user turn, got {other:?}"),
+        client
+            .complete(&ModelRequest {
+                turns: vec![ModelTurn::Assistant {
+                    content: None,
+                    tool_calls: Vec::new(),
+                }],
+                ..ModelRequest::default()
+            })
+            .unwrap();
+
+        let seen = spy.seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for request in seen.iter() {
+            assert_eq!(request.system, "SYS");
+            assert!(matches!(
+                request.turns.first(),
+                Some(ModelTurn::User { content }) if content == "do the thing"
+            ));
         }
     }
 

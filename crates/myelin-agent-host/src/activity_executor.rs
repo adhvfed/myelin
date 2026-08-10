@@ -50,6 +50,7 @@ pub struct AgentHostActivityExecutor {
     provider: SubstrateProvider,
     outbox: OutboxStore,
     models: Arc<dyn HostedModelFactory>,
+    tools: Arc<dyn ToolExecutor>,
 }
 
 impl AgentHostActivityExecutor {
@@ -68,7 +69,13 @@ impl AgentHostActivityExecutor {
             provider,
             outbox,
             models,
+            tools: Arc::new(HostedToolBrokerUnavailable),
         }
+    }
+
+    pub fn with_tool_executor(mut self, tools: Arc<dyn ToolExecutor>) -> Self {
+        self.tools = tools;
+        self
     }
 
     fn selected_tools(
@@ -156,7 +163,7 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
                 model,
                 Tools {
                     catalogue: &catalogue,
-                    executor: &HostedToolBrokerUnavailable,
+                    executor: self.tools.as_ref(),
                     advertised: &advertised,
                 },
             )
