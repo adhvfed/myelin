@@ -888,6 +888,19 @@ describe("the CLI authentication journey", () => {
       expect(running.credential.expires_at).toBe(running.run.expires_at);
       expect(Date.parse(running.run.expires_at) - Date.parse(running.run.issued_at)).toBe(60_000);
 
+      // One transient credential opens one governed door. Even when the agent selected an Issues
+      // or Chat tool, its bearer cannot walk around MCP and call that tool's ordinary REST twin.
+      await systemClient.json("/v1/issues?limit=1", {
+        token: running.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 403,
+      });
+      await systemClient.json("/v1/chat/conversations?limit=1", {
+        token: running.credential.token,
+        tokenScheme: "agent",
+        expectedStatus: 403,
+      });
+
       const replayRun = await systemClient.json(`/v1/agents/${activated.agent.id}/runs`, {
         method: "POST",
         body: {},

@@ -103,21 +103,14 @@ pub enum AcceptedPurpose {
     DeployKey,
 }
 
-const OP_AGENT_PAT: &[AcceptedPurpose] = &[
-    AcceptedPurpose::HumanSession,
-    AcceptedPurpose::OperatorBootstrap,
-    AcceptedPurpose::AgentRun,
-    AcceptedPurpose::Pat,
-];
 const OP_PAT: &[AcceptedPurpose] = &[
     AcceptedPurpose::HumanSession,
     AcceptedPurpose::OperatorBootstrap,
     AcceptedPurpose::Pat,
 ];
-const OP_AGENT_PAT_DEPLOY: &[AcceptedPurpose] = &[
+const OP_PAT_DEPLOY: &[AcceptedPurpose] = &[
     AcceptedPurpose::HumanSession,
     AcceptedPurpose::OperatorBootstrap,
-    AcceptedPurpose::AgentRun,
     AcceptedPurpose::Pat,
     AcceptedPurpose::DeployKey,
 ];
@@ -149,19 +142,15 @@ macro_rules! requirement {
 }
 
 pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
-    requirement!("edge.whoami", "edge.identity.read", OP_AGENT_PAT),
+    requirement!("edge.whoami", "edge.identity.read", OP_PAT),
     requirement!(
         "edge.auth.device.approve",
         "edge.auth.delegate",
         HUMAN_OR_OPERATOR
     ),
-    requirement!(
-        "edge.events.subscribe",
-        "edge.events.subscribe",
-        OP_AGENT_PAT
-    ),
-    requirement!("agent.tools.list", "agent.tools.read", OP_AGENT_PAT),
-    requirement!("agent.tool.view", "agent.tools.read", OP_AGENT_PAT),
+    requirement!("edge.events.subscribe", "edge.events.subscribe", OP_PAT),
+    requirement!("agent.tools.list", "agent.tools.read", OP_PAT),
+    requirement!("agent.tool.view", "agent.tools.read", OP_PAT),
     requirement!("identity.agents.list", "agent.view", HUMAN_SESSION),
     requirement!("identity.agent.create", "agent.manage", HUMAN_SESSION),
     requirement!("identity.agent.view", "agent.view", HUMAN_SESSION),
@@ -204,72 +193,72 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         required_capability: None,
         accepted_purposes: AGENT_RUN_ONLY,
     },
-    requirement!("identity.projects.list", "project.view", OP_AGENT_PAT),
+    requirement!("identity.projects.list", "project.view", OP_PAT),
     requirement!("identity.project.create", "project.create", OP_PAT),
-    requirement!("identity.project.view", "project.view", OP_AGENT_PAT),
-    requirement!("issues.list", "issue.view", OP_AGENT_PAT),
-    requirement!("issues.create", "issue.create", OP_AGENT_PAT),
-    requirement!("issues.import.dry_run", "issue.create", OP_AGENT_PAT),
-    requirement!("issues.import.run", "issue.create", OP_AGENT_PAT),
-    requirement!("issues.authorization_status", "issue.view", OP_AGENT_PAT),
-    requirement!("issues.view", "issue.view", OP_AGENT_PAT),
-    requirement!("issues.close", "issue.transition", OP_AGENT_PAT),
-    requirement!("ci.runs.list", "run.view", OP_AGENT_PAT),
-    requirement!("ci.run.view", "run.view", OP_AGENT_PAT),
-    requirement!("ci.run.log.read", "run.view", OP_AGENT_PAT),
-    requirement!("ci.run.log.watch", "run.view", OP_AGENT_PAT),
-    requirement!("notif.inbox.list", "notification.read", OP_AGENT_PAT),
-    requirement!("notif.inbox.get", "notification.read", OP_AGENT_PAT),
-    requirement!("notif.inbox.mark_read", "notification.write", OP_AGENT_PAT),
-    requirement!("chat.conversations.list", "chat.read", OP_AGENT_PAT),
+    requirement!("identity.project.view", "project.view", OP_PAT),
+    requirement!("issues.list", "issue.view", OP_PAT),
+    requirement!("issues.create", "issue.create", OP_PAT),
+    requirement!("issues.import.dry_run", "issue.create", OP_PAT),
+    requirement!("issues.import.run", "issue.create", OP_PAT),
+    requirement!("issues.authorization_status", "issue.view", OP_PAT),
+    requirement!("issues.view", "issue.view", OP_PAT),
+    requirement!("issues.close", "issue.transition", OP_PAT),
+    requirement!("ci.runs.list", "run.view", OP_PAT),
+    requirement!("ci.run.view", "run.view", OP_PAT),
+    requirement!("ci.run.log.read", "run.view", OP_PAT),
+    requirement!("ci.run.log.watch", "run.view", OP_PAT),
+    requirement!("notif.inbox.list", "notification.read", OP_PAT),
+    requirement!("notif.inbox.get", "notification.read", OP_PAT),
+    requirement!("notif.inbox.mark_read", "notification.write", OP_PAT),
+    requirement!("chat.conversations.list", "chat.read", OP_PAT),
     requirement!("chat.conversation.create", "chat.manage", OP_PAT),
-    requirement!("chat.messages.list", "chat.read", OP_AGENT_PAT),
-    requirement!("chat.message.post", "chat.post", OP_AGENT_PAT),
-    requirement!("knowledge.pages.list", "knowledge.read", OP_AGENT_PAT),
-    requirement!("knowledge.page.create", "knowledge.edit", OP_AGENT_PAT),
-    requirement!("knowledge.page.view", "knowledge.read", OP_AGENT_PAT),
-    requirement!("knowledge.page.save", "knowledge.edit", OP_AGENT_PAT),
-    requirement!("refs.backlinks.list", "refs.read", OP_AGENT_PAT),
-    requirement!("git.repos.list", "repo.pull", OP_AGENT_PAT),
+    requirement!("chat.messages.list", "chat.read", OP_PAT),
+    requirement!("chat.message.post", "chat.post", OP_PAT),
+    requirement!("knowledge.pages.list", "knowledge.read", OP_PAT),
+    requirement!("knowledge.page.create", "knowledge.edit", OP_PAT),
+    requirement!("knowledge.page.view", "knowledge.read", OP_PAT),
+    requirement!("knowledge.page.save", "knowledge.edit", OP_PAT),
+    requirement!("refs.backlinks.list", "refs.read", OP_PAT),
+    requirement!("git.repos.list", "repo.pull", OP_PAT),
     requirement!("git.repo.create", "repo.create", OP_PAT),
-    requirement!("git.pr.view", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.pr.checks", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.blob.view", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.blame.view", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.blob.commit", "repo.push", OP_AGENT_PAT),
-    requirement!("git.pr.open", "repo.push", OP_AGENT_PAT),
-    requirement!("git.pr.review", "pull_request.review", OP_AGENT_PAT),
+    requirement!("git.pr.view", "repo.pull", OP_PAT),
+    requirement!("git.pr.checks", "repo.pull", OP_PAT),
+    requirement!("git.blob.view", "repo.pull", OP_PAT),
+    requirement!("git.blame.view", "repo.pull", OP_PAT),
+    requirement!("git.blob.commit", "repo.push", OP_PAT),
+    requirement!("git.pr.open", "repo.push", OP_PAT),
+    requirement!("git.pr.review", "pull_request.review", OP_PAT),
     requirement!(
         "git.pr.endorse_fork_ci",
         "repo.approve_untrusted_ci",
-        OP_AGENT_PAT
+        OP_PAT
     ),
-    requirement!("git.pr.merge", "pull_request.merge", OP_AGENT_PAT),
+    requirement!("git.pr.merge", "pull_request.merge", OP_PAT),
     requirement!("git.repo.branch_protection.set", "repo.administer", OP_PAT),
     requirement!("git.checks.report", "ci.checks.report", CI_ONLY),
-    requirement!("git.search.code", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.repo.view", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.commits.log", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.commit.diff", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.prs.list", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.prs.mine", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.pr.commits", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.pr.diff", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.file.lines", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.pr.threads.list", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.pr.thread.create", "pull_request.review", OP_AGENT_PAT),
-    requirement!("git.pr.comment.create", "pull_request.review", OP_AGENT_PAT),
-    requirement!("git.pr.thread.resolve", "pull_request.review", OP_AGENT_PAT),
-    requirement!("git.pr.review.start", "pull_request.review", OP_AGENT_PAT),
-    requirement!("git.pr.review.comment", "pull_request.review", OP_AGENT_PAT),
-    requirement!("git.pr.review.submit", "pull_request.review", OP_AGENT_PAT),
-    requirement!("git.pr.review.discard", "pull_request.review", OP_AGENT_PAT),
-    requirement!("git.refs.list", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.tree.view", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.blob.raw", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.blob.download", "repo.pull", OP_AGENT_PAT),
-    requirement!("git.wire.upload_pack", "repo.pull", OP_AGENT_PAT_DEPLOY),
-    requirement!("git.wire.receive_pack", "repo.push", OP_AGENT_PAT_DEPLOY),
+    requirement!("git.search.code", "repo.pull", OP_PAT),
+    requirement!("git.repo.view", "repo.pull", OP_PAT),
+    requirement!("git.commits.log", "repo.pull", OP_PAT),
+    requirement!("git.commit.diff", "repo.pull", OP_PAT),
+    requirement!("git.prs.list", "repo.pull", OP_PAT),
+    requirement!("git.prs.mine", "repo.pull", OP_PAT),
+    requirement!("git.pr.commits", "repo.pull", OP_PAT),
+    requirement!("git.pr.diff", "repo.pull", OP_PAT),
+    requirement!("git.file.lines", "repo.pull", OP_PAT),
+    requirement!("git.pr.threads.list", "repo.pull", OP_PAT),
+    requirement!("git.pr.thread.create", "pull_request.review", OP_PAT),
+    requirement!("git.pr.comment.create", "pull_request.review", OP_PAT),
+    requirement!("git.pr.thread.resolve", "pull_request.review", OP_PAT),
+    requirement!("git.pr.review.start", "pull_request.review", OP_PAT),
+    requirement!("git.pr.review.comment", "pull_request.review", OP_PAT),
+    requirement!("git.pr.review.submit", "pull_request.review", OP_PAT),
+    requirement!("git.pr.review.discard", "pull_request.review", OP_PAT),
+    requirement!("git.refs.list", "repo.pull", OP_PAT),
+    requirement!("git.tree.view", "repo.pull", OP_PAT),
+    requirement!("git.blob.raw", "repo.pull", OP_PAT),
+    requirement!("git.blob.download", "repo.pull", OP_PAT),
+    requirement!("git.wire.upload_pack", "repo.pull", OP_PAT_DEPLOY),
+    requirement!("git.wire.receive_pack", "repo.push", OP_PAT_DEPLOY),
 ];
 
 pub fn action_requirement(action: &str) -> Option<&'static ActionRequirement> {
@@ -312,7 +301,11 @@ pub fn authorize_edge_action(
         return false;
     }
     let capability: &VerifiedCapabilityContext = identity.capability();
-    if capability.audience != CredentialAudience::Edge {
+    let expected_audience = match capability.purpose {
+        CredentialPurpose::AgentRun { .. } => CredentialAudience::Mcp,
+        _ => CredentialAudience::Edge,
+    };
+    if capability.audience != expected_audience {
         return false;
     }
     let Some(rule) = action_requirement(action) else {
@@ -505,14 +498,14 @@ mod tests {
     }
 
     #[test]
-    fn an_agent_run_can_only_close_itself_or_carry_mcp_frames_by_credential_purpose() {
+    fn an_agent_run_credential_opens_only_its_governed_mcp_lifecycle() {
         let agent = identity(
             CredentialPurpose::AgentRun {
                 run_id: "run-close".into(),
                 delegation_snapshot: Some(11),
             },
-            CredentialAudience::Edge,
-            &[],
+            CredentialAudience::Mcp,
+            &["issue.view", "chat.post"],
         );
         assert!(authorize_edge_action(
             &AllowAll,
@@ -522,6 +515,26 @@ mod tests {
         assert!(authorize_edge_action(
             &AllowAll,
             &agent,
+            "identity.agent.run.mcp"
+        ));
+        assert!(!authorize_edge_action(&AllowAll, &agent, "issues.list"));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &agent,
+            "chat.message.post"
+        ));
+
+        let legacy_edge_audience = identity(
+            CredentialPurpose::AgentRun {
+                run_id: "run-close".into(),
+                delegation_snapshot: Some(11),
+            },
+            CredentialAudience::Edge,
+            &[],
+        );
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &legacy_edge_audience,
             "identity.agent.run.mcp"
         ));
 
@@ -549,10 +562,10 @@ mod tests {
                 run_id: "run-1".into(),
                 delegation_snapshot: Some(7),
             },
-            CredentialAudience::Edge,
+            CredentialAudience::Mcp,
             &["repo.pull"],
         );
-        assert!(authorize_edge_action(
+        assert!(!authorize_edge_action(
             &AllowAll,
             &agent_pull,
             "git.pr.commits"
@@ -636,10 +649,7 @@ mod tests {
     #[test]
     fn issues_actions_require_their_exact_signed_capability() {
         let view = identity(
-            CredentialPurpose::AgentRun {
-                run_id: "run-issues-view".into(),
-                delegation_snapshot: Some(9),
-            },
+            CredentialPurpose::Pat,
             CredentialAudience::Edge,
             &["issue.view"],
         );
@@ -664,10 +674,7 @@ mod tests {
         assert!(!authorize_edge_action(&AllowAll, &view, "issues.close"));
 
         let transition = identity(
-            CredentialPurpose::AgentRun {
-                run_id: "run-issues-close".into(),
-                delegation_snapshot: Some(10),
-            },
+            CredentialPurpose::Pat,
             CredentialAudience::Edge,
             &["issue.transition"],
         );

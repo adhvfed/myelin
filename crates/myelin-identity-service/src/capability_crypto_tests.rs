@@ -579,6 +579,7 @@ fn signer_verifier_seam_round_trip() {
             delegation_snapshot: Some(42),
         }
     );
+    assert_eq!(token.audience, CredentialAudience::Mcp);
     assert!(
         !token.dpop_bound,
         "a per-run token is TTL-constrained, not DPoP-bound"

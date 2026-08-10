@@ -853,6 +853,10 @@ impl crate::mint::TokenSigner for PasetoCapabilitySigner {
         let exp = chrono::DateTime::parse_from_rfc3339(&request.expires_at().0)
             .map(|instant| instant.timestamp())
             .unwrap_or_else(|_| (self.now)());
+        let audience = match request.purpose() {
+            CredentialPurpose::AgentRun { .. } => CredentialAudience::Mcp,
+            _ => CredentialAudience::Edge,
+        };
         self.authority.mint(&CapabilityMintSpec {
             tenant: request.scope().tenant().0.clone(),
             region: request.scope().region().0.clone(),
@@ -862,7 +866,7 @@ impl crate::mint::TokenSigner for PasetoCapabilitySigner {
             authority: request.grants().to_vec(),
             dpop_jkt: None,
             purpose: request.purpose().clone(),
-            audience: CredentialAudience::Edge,
+            audience,
         })
     }
 }

@@ -392,8 +392,12 @@ impl TokenSigner for StructuralTokenSigner {
         let subject_key = &request.subject().0;
         let jti = request.jti();
         let purpose = request.purpose();
+        let audience = match purpose {
+            crate::machine_auth::CredentialPurpose::AgentRun { .. } => "mcp",
+            _ => "edge",
+        };
         format!(
-            "{tenant}|{region}|{subject_key}|{jti}|0|{}|{}|edge|{}|{}",
+            "{tenant}|{region}|{subject_key}|{jti}|0|{}|{}|{audience}|{}|{}",
             request.grants().join(","),
             purpose.claim(),
             purpose.run_id().unwrap_or_default(),
