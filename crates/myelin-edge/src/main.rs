@@ -7,8 +7,8 @@ use myelin_config::{Mode, OIDC_JWKS_MAX_BYTES};
 use myelin_edge::{
     bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
     register_agent_mcp, register_agents, register_chat, register_ci, register_git_durable,
-    register_git_wire, register_issues, register_knowledge, register_notif, register_projects,
-    register_refs, register_tools, serve_edge_until_shutdown_with_probe,
+    register_git_wire, register_issues, register_knowledge, register_notif, register_privacy,
+    register_projects, register_refs, register_tools, serve_edge_until_shutdown_with_probe,
     spawn_issue_authorization_reconciler, AgentMcpAuthority, AgentMcpResources, AgentMcpServices,
     AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
     CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableChatMutationApi,
@@ -1140,17 +1140,19 @@ async fn serve(
         handle.clone(),
     );
     let inbox_store = Arc::new(PgInboxStore::new(provider.db_pool().clone()));
+    let agent_traces = myelin_storage::DurableAgentTraceStore::with_runtime(
+        provider.clone(),
+        handle.clone(),
+        kms.clone(),
+    );
     builder = myelin_edge::register_triggers(
         builder,
         myelin_storage::DurableAgentTriggerBacking::new(provider.clone()),
-        myelin_storage::DurableAgentTraceStore::with_runtime(
-            provider.clone(),
-            handle.clone(),
-            kms.clone(),
-        ),
+        agent_traces.clone(),
         inbox_store.clone(),
         handle.clone(),
     );
+    builder = register_privacy(builder, agent_traces, handle.clone());
     let mcp_chat = DurableChatReadApi::new(provider.db_pool().clone(), handle.clone(), kms.clone());
     builder = register_agent_mcp(
         builder,

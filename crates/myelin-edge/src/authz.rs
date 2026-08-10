@@ -29,6 +29,8 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "identity.trigger.result.erase",
     "identity.trigger.firing.approve",
     "identity.trigger.firing.reject",
+    "privacy.agent_data.read",
+    "privacy.agent_data.erase",
     "identity.projects.list",
     "identity.project.create",
     "identity.project.view",
@@ -125,8 +127,9 @@ const AGENT_RUN_ONLY: &[AcceptedPurpose] = &[AcceptedPurpose::AgentRun];
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ActionRequirement {
     pub action: &'static str,
-    /// `None` is reserved for a credential's own scope-bound lifecycle. In that case the exact
-    /// accepted credential purpose is the authority; no tenant policy grant is manufactured.
+    /// `None` is reserved for a principal or credential's own scope-bound lifecycle. In that case
+    /// the exact accepted credential purpose is the authority; no tenant policy grant is
+    /// manufactured.
     pub required_capability: Option<&'static str>,
     pub accepted_purposes: &'static [AcceptedPurpose],
 }
@@ -192,6 +195,16 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
         action: "identity.agent.run.mcp",
         required_capability: None,
         accepted_purposes: AGENT_RUN_ONLY,
+    },
+    ActionRequirement {
+        action: "privacy.agent_data.read",
+        required_capability: None,
+        accepted_purposes: HUMAN_SESSION,
+    },
+    ActionRequirement {
+        action: "privacy.agent_data.erase",
+        required_capability: None,
+        accepted_purposes: HUMAN_SESSION,
     },
     requirement!("identity.projects.list", "project.view", OP_PAT),
     requirement!("identity.project.create", "project.create", OP_PAT),
@@ -553,6 +566,40 @@ mod tests {
             &human,
             "identity.agent.run.mcp"
         ));
+    }
+
+    #[test]
+    fn a_human_controls_their_own_agent_data_without_an_organization_grant() {
+        let human = identity(
+            CredentialPurpose::HumanSession,
+            CredentialAudience::Edge,
+            &[],
+        );
+        for action in ["privacy.agent_data.read", "privacy.agent_data.erase"] {
+            assert!(authorize_edge_action(&AllowAll, &human, action));
+        }
+
+        let pat = identity(CredentialPurpose::Pat, CredentialAudience::Edge, &[]);
+        let operator = identity(
+            CredentialPurpose::OperatorBootstrap,
+            CredentialAudience::Edge,
+            &["edge.operator"],
+        );
+        let agent = identity(
+            CredentialPurpose::AgentRun {
+                run_id: "run-private".into(),
+                delegation_snapshot: Some(1),
+            },
+            CredentialAudience::Mcp,
+            &[],
+        );
+        for identity in [&pat, &operator, &agent] {
+            assert!(!authorize_edge_action(
+                &AllowAll,
+                identity,
+                "privacy.agent_data.erase"
+            ));
+        }
     }
 
     #[test]

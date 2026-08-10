@@ -287,6 +287,29 @@ pub struct AgentTraceSubjectEraseReceipt {
     pub key_unrecoverable: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTraceSubjectState {
+    Active,
+    Restricted,
+    Erased,
+}
+
+impl AgentTraceSubjectState {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Restricted => "restricted",
+            Self::Erased => "erased",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTraceSubjectSummary {
+    pub state: AgentTraceSubjectState,
+    pub recoverable_records: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentTraceError {
     Invalid(&'static str),
@@ -547,23 +570,43 @@ impl DurableAgentTraceStore {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |connection| {
                 Box::pin(async move {
-                    let count = sqlx::query_scalar::<_, i64>(
-                        "SELECT \
-                           (SELECT count(*) FROM knowledge_agent_trace \
-                             WHERE tenant_id = $1 AND region = $2 AND requested_by = $3) + \
-                           (SELECT count(*) FROM agent_model_step \
-                             WHERE tenant_id = $1 AND region = $2 AND requested_by = $3) + \
-                           (SELECT count(*) FROM agent_tool_effect \
-                             WHERE tenant_id = $1 AND region = $2 AND requested_by = $3)",
+                    count_subject_records_on_connection(connection, &tenant, &region, &requested_by)
+                        .await
+                })
+            })
+            .await
+    }
+
+    pub async fn summarize_subject(
+        &self,
+        tenant: &str,
+        requested_by: &str,
+    ) -> Result<AgentTraceSubjectSummary, ProviderError> {
+        let tenant = tenant.to_string();
+        let requested_by = requested_by.to_string();
+        let region = self.provider.config().region.clone();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |connection| {
+                Box::pin(async move {
+                    let state =
+                        match agent_subject_status(connection, &tenant, &region, &requested_by)
+                            .await?
+                        {
+                            AgentSubjectStatus::Active => AgentTraceSubjectState::Active,
+                            AgentSubjectStatus::Restricted => AgentTraceSubjectState::Restricted,
+                            AgentSubjectStatus::Erased => AgentTraceSubjectState::Erased,
+                        };
+                    let recoverable_records = count_subject_records_on_connection(
+                        connection,
+                        &tenant,
+                        &region,
+                        &requested_by,
                     )
-                    .bind(&tenant)
-                    .bind(&region)
-                    .bind(&requested_by)
-                    .fetch_one(connection)
-                    .await
-                    .map_err(trace_query)?;
-                    u64::try_from(count)
-                        .map_err(|_| PgError::Query("agent trace count is negative".into()))
+                    .await?;
+                    Ok(AgentTraceSubjectSummary {
+                        state,
+                        recoverable_records,
+                    })
                 })
             })
             .await
@@ -945,6 +988,30 @@ struct DatabaseSubjectEraseReceipt {
     model_steps_erased: u64,
     tool_effects_erased: u64,
     already_erased: bool,
+}
+
+async fn count_subject_records_on_connection(
+    connection: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    requested_by: &str,
+) -> Result<u64, PgError> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT \
+           (SELECT count(*) FROM knowledge_agent_trace \
+             WHERE tenant_id = $1 AND region = $2 AND requested_by = $3) + \
+           (SELECT count(*) FROM agent_model_step \
+             WHERE tenant_id = $1 AND region = $2 AND requested_by = $3) + \
+           (SELECT count(*) FROM agent_tool_effect \
+             WHERE tenant_id = $1 AND region = $2 AND requested_by = $3)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(requested_by)
+    .fetch_one(connection)
+    .await
+    .map_err(trace_query)?;
+    u64::try_from(count).map_err(|_| PgError::Query("agent trace count is negative".into()))
 }
 
 async fn erase_subject_on_connection(

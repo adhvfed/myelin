@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::sync::Arc;
 
 use myelin_identity::{Literal, ObjectType};
@@ -15,12 +14,13 @@ use myelin_storage::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::types::Uuid;
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
 
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, MAX_PAGE_LIMIT};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
+use crate::runtime::drive_edge_future;
 use crate::Method;
 
 const MAX_TRIGGER_JSON_BYTES: usize = 16 * 1024;
@@ -37,19 +37,9 @@ struct TriggerHttpApi {
 impl TriggerHttpApi {
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
-        F: Future<Output = T>,
+        F: std::future::Future<Output = T>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                Ok(tokio::task::block_in_place(|| {
-                    self.runtime.block_on(future)
-                }))
-            }
-            Ok(_) => Err(EdgeError::Internal(
-                "trigger HTTP requires the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => Ok(self.runtime.block_on(future)),
-        }
+        drive_edge_future(&self.runtime, future, "trigger HTTP")
     }
 }
 

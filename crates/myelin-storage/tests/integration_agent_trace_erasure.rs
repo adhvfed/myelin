@@ -3,8 +3,9 @@ use myelin_gdpr::{EraseScope, PersonalDataHolder, SubjectRef};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::{
     all_durable_migrations, AgentModelStepStore, AgentToolEffectStore, AgentTraceError,
-    AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore, DurableKmsBacking, HotTables,
-    ModelStepError, PiiKeyRef, SealKey, SubstrateProvider, ToolEffectError,
+    AgentTraceSubjectState, AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore,
+    DurableKmsBacking, HotTables, ModelStepError, PiiKeyRef, SealKey, SubstrateProvider,
+    ToolEffectError,
 };
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
@@ -285,6 +286,12 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         4,
         "final traces and their replay journals are discoverable through one subject locator"
     );
+    let before = store
+        .summarize_subject(&tenant.0, "founder")
+        .await
+        .expect("the production privacy boundary can describe the subject's agent data");
+    assert_eq!(before.state, AgentTraceSubjectState::Active);
+    assert_eq!(before.recoverable_records, 4);
     assert_eq!(
         holder
             .locate(&subject, tenant.clone())
@@ -316,6 +323,12 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         0,
         "no live trace or replay-journal rows remain"
     );
+    let after = store
+        .summarize_subject(&tenant.0, "founder")
+        .await
+        .expect("the erased state remains observable without reopening any data");
+    assert_eq!(after.state, AgentTraceSubjectState::Erased);
+    assert_eq!(after.recoverable_records, 0);
     assert_eq!(
         store
             .write(&tenant, trace("33333333-3333-4333-8333-333333333333"))

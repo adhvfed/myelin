@@ -91,8 +91,8 @@ pub use agent_tool_effect::{
 pub use agent_trace_durable::{
     agent_trace_durable_migrations, AgentTraceAvailability, AgentTraceEraseReceipt,
     AgentTraceError, AgentTraceReceipt, AgentTraceResult, AgentTraceSubjectEraseReceipt,
-    AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore, EraseAgentTraceOutcome,
-    InMemoryAgentTraceStore,
+    AgentTraceSubjectState, AgentTraceSubjectSummary, AgentTraceWrite, AgentTraceWriter,
+    DurableAgentTraceStore, EraseAgentTraceOutcome, InMemoryAgentTraceStore,
 };
 pub use agent_wallet::{
     agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind, DebitOutcome,
