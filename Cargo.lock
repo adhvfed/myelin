@@ -2730,6 +2730,7 @@ dependencies = [
  "myelin-agent",
  "myelin-ci-controlplane",
  "myelin-edge",
+ "myelin-events",
  "myelin-git",
  "myelin-identity",
  "myelin-identity-service",

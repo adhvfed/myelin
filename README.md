@@ -95,6 +95,23 @@ myelin agent resume 22222222-2222-2222-2222-222222222222 \
 myelin agent retire 22222222-2222-2222-2222-222222222222 \
   --idempotency-key retire-review-companion
 
+myelin agent create "Mainline triage" --runtime hosted \
+  --tool ci.read_run --tool issues.create --idempotency-key mainline-triage
+myelin automation create --event ci.run.failed --branch main \
+  --run-as 33333333-3333-3333-3333-333333333333 \
+  --task "Read the failed run and open one focused issue." \
+  --budget-minor-units 250000 --max-firings 10 \
+  --idempotency-key red-mainline-triage
+myelin automation list
+myelin automation show 44444444-4444-4444-4444-444444444444
+myelin automation history 44444444-4444-4444-4444-444444444444
+myelin automation pause 44444444-4444-4444-4444-444444444444 \
+  --idempotency-key pause-red-mainline
+myelin automation resume 44444444-4444-4444-4444-444444444444 \
+  --idempotency-key resume-red-mainline
+myelin automation disable 44444444-4444-4444-4444-444444444444 \
+  --idempotency-key retire-red-mainline
+
 myelin repo list
 myelin repo pr list
 myelin project create "Developer experience" --prefix DX --idempotency-key developer-experience
@@ -136,6 +153,14 @@ terminates every unfinished run atomically; resuming permits fresh work but neve
 run. No provider API key or long-lived agent credential is created or copied through this flow.
 Selected read tools resolve CI runs, issues, and Knowledge pages through the human delegator's
 live Myelin permissions, returning canonical references without GitHub, Linear, or Notion keys.
+
+Hosted agents use the same identity and tool catalogue, but Myelin owns their execution. An
+`automation` binds a canonical platform event to one hosted agent, a plain-language task, an
+integer minor-unit budget, optional delegation caveats, and safety gates. Each firing receives a
+short-lived run identity and reaches Git, CI, Issues, Chat, and Knowledge only through governed
+Myelin tools. Owners can inspect durable firing history and outcomes, pause new reservations for
+maintenance, resume them, or irreversibly disable an automation. No third-party integration key is
+created or copied into the agent.
 
 Issue responses include a canonical `myelin://...` reference that can be passed directly to
 `chat ref`. The conversation keeps a live pointer to the issue rather than copying a stale

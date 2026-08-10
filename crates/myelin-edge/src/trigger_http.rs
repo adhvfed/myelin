@@ -129,6 +129,10 @@ struct TriggerListHandler {
     api: TriggerHttpApi,
 }
 
+struct TriggerGetHandler {
+    api: TriggerHttpApi,
+}
+
 struct TriggerFiringListHandler {
     api: TriggerHttpApi,
 }
@@ -168,6 +172,32 @@ impl Handler for TriggerListHandler {
         Ok(no_store(EdgeResponse::json(
             200,
             &page_envelope(json!(items), next, limit),
+        )))
+    }
+}
+
+impl Handler for TriggerGetHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.query.is_empty() || !ctx.request.body.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "trigger lookup accepts no query parameters or request body".into(),
+            ));
+        }
+        let binding_id = parse_uuid(trigger_param(ctx)?)?;
+        let binding = self
+            .api
+            .drive(self.api.backing.get_for_owner(
+                &ctx.principal.tenant.0,
+                &ctx.principal.principal_id.0,
+                binding_id,
+            ))?
+            .map_err(|error| EdgeError::Internal(error.to_string()))?
+            .ok_or_else(|| EdgeError::NotFound("trigger not found".into()))?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "trigger": binding_json(&ctx.principal.tenant.0, &binding),
+            }),
         )))
     }
 }
@@ -271,6 +301,12 @@ pub fn register_triggers(
             "/v1/triggers",
             "identity.trigger.create",
             Arc::new(TriggerCreateHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/triggers/{trigger}",
+            "identity.triggers.list",
+            Arc::new(TriggerGetHandler { api: api.clone() }),
         )
         .route(
             Method::Get,

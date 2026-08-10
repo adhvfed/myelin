@@ -10,9 +10,10 @@ use myelin_cli::device_auth::{
     begin_authorization, new_authorization_request, wait_for_authorization,
 };
 use myelin_cli::dispatch::{
-    agent_dispatch, chat_dispatch, ci_dispatch, git_dispatch, is_canonical_project_id,
-    issues_dispatch_with_context, knowledge_dispatch, notif_dispatch, project_dispatch,
-    refs_dispatch, repo_dispatch, tool_dispatch, EdgeCall, HttpMethod, RetryPolicy,
+    agent_dispatch, automation_dispatch, chat_dispatch, ci_dispatch, git_dispatch,
+    is_canonical_project_id, issues_dispatch_with_context, knowledge_dispatch, notif_dispatch,
+    project_dispatch, refs_dispatch, repo_dispatch, tool_dispatch, EdgeCall, HttpMethod,
+    RetryPolicy,
 };
 use myelin_cli::error::CliError;
 use myelin_cli::git_credential::{
@@ -120,6 +121,12 @@ enum Command {
     },
     /// Activate and inspect durable external-agent identities.
     Agent {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Create, inspect, pause, and retire governed event-driven agent work.
+    #[command(visible_alias = "trigger")]
+    Automation {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -281,6 +288,10 @@ async fn run() -> Result<(), CliError> {
         }
         Command::Agent { args } => {
             let (call, command_key) = dispatch_command(args, agent_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
+        }
+        Command::Automation { args } => {
+            let (call, command_key) = dispatch_command(args, automation_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Mcp { command } => match command {

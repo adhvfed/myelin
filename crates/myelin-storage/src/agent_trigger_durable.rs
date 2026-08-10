@@ -246,6 +246,40 @@ impl DurableAgentTriggerBacking {
             .await
     }
 
+    pub async fn get_for_owner(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        binding_id: Uuid,
+    ) -> Result<Option<DurableAgentTriggerBinding>, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner_principal_id = owner_principal_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
+                                event_type, matcher, task, delegation_caveats, \
+                                budget_minor_units, max_firings, firings_used, max_causal_depth, \
+                                require_no_personal_data, require_human_approval, state, created_at \
+                           FROM agent_trigger_binding \
+                          WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                            AND owner_principal_id = $4",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(binding_id)
+                    .bind(&owner_principal_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("get agent trigger binding for owner"))?;
+                    row.as_ref().map(binding_from_row).transpose()
+                })
+            })
+            .await
+    }
+
     pub async fn change_lifecycle(
         &self,
         tenant: &str,

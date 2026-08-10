@@ -155,6 +155,20 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
     assert_eq!(binding.owner_principal_id, "founder");
     assert_eq!(binding.run_as_agent_id, agent_id.to_string());
     assert_eq!(binding.firings_used, 0);
+    assert_eq!(
+        triggers
+            .get_for_owner(&tenant, "founder", proposal.binding_id)
+            .await
+            .expect("the owner addresses the new automation directly"),
+        Some(binding.clone())
+    );
+    assert_eq!(
+        triggers
+            .get_for_owner(&tenant, "reviewer", proposal.binding_id)
+            .await
+            .expect("a peer cannot discover the automation through direct lookup"),
+        None
+    );
     let candidates = triggers
         .active_for_event(&tenant, "ci.run.failed", 100)
         .await

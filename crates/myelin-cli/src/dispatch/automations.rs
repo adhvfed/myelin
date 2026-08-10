@@ -1,0 +1,492 @@
+use std::collections::BTreeSet;
+
+use serde_json::json;
+
+use super::{is_canonical_uuid, CliError, EdgeCall, FormQuery, HttpMethod, RetryPolicy};
+
+const DEFAULT_PAGE_LIMIT: u32 = 50;
+const MAX_PAGE_LIMIT: u32 = 100;
+const MAX_TASK_BYTES: usize = 4096;
+const MAX_CAVEATS: usize = 128;
+const MAX_CAVEAT_BYTES: usize = 255;
+const MAX_BUDGET_MINOR_UNITS: u64 = 1_000_000_000_000;
+const MAX_FIRINGS: u64 = 1_000_000;
+const MAX_CAUSAL_DEPTH: u32 = 64;
+
+pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let (verb, rest) = args.split_first().ok_or_else(|| {
+        CliError::Usage(
+            "no automation command given (try: create | list | show | history | pause | resume | disable)"
+                .into(),
+        )
+    })?;
+    match *verb {
+        "create" => create_call(rest),
+        "list" => list_call(rest),
+        "show" => show_call(rest),
+        "history" => history_call(rest),
+        "pause" | "resume" | "disable" => lifecycle_call(rest, verb),
+        other => Err(CliError::Usage(format!(
+            "unknown automation command token `{other}`"
+        ))),
+    }
+}
+
+#[derive(Default)]
+struct CreateOptions<'a> {
+    event_type: Option<&'a str>,
+    source_branch: Option<&'a str>,
+    run_as_agent_id: Option<&'a str>,
+    task: Option<&'a str>,
+    budget_minor_units: Option<&'a str>,
+    max_firings: Option<&'a str>,
+    max_causal_depth: Option<&'a str>,
+    caveats: Vec<&'a str>,
+    allow_personal_data: bool,
+    require_human_approval: bool,
+}
+
+fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let mut options = CreateOptions::default();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--event" => singleton_value(&mut options.event_type, args, &mut index, "--event")?,
+            "--branch" => {
+                singleton_value(&mut options.source_branch, args, &mut index, "--branch")?
+            }
+            "--run-as" => {
+                singleton_value(&mut options.run_as_agent_id, args, &mut index, "--run-as")?
+            }
+            "--task" => singleton_value(&mut options.task, args, &mut index, "--task")?,
+            "--budget-minor-units" => singleton_value(
+                &mut options.budget_minor_units,
+                args,
+                &mut index,
+                "--budget-minor-units",
+            )?,
+            "--max-firings" => {
+                singleton_value(&mut options.max_firings, args, &mut index, "--max-firings")?
+            }
+            "--max-causal-depth" => singleton_value(
+                &mut options.max_causal_depth,
+                args,
+                &mut index,
+                "--max-causal-depth",
+            )?,
+            "--caveat" => options
+                .caveats
+                .push(flag_value(args, &mut index, "--caveat")?),
+            "--allow-personal-data" if !options.allow_personal_data => {
+                options.allow_personal_data = true
+            }
+            "--require-human-approval" if !options.require_human_approval => {
+                options.require_human_approval = true
+            }
+            "--allow-personal-data" | "--require-human-approval" => {
+                return Err(CliError::Usage(format!(
+                    "duplicate automation create flag `{}`",
+                    args[index]
+                )))
+            }
+            token => {
+                return Err(CliError::Usage(format!(
+                    "unknown automation create argument `{token}`"
+                )))
+            }
+        }
+        index += 1;
+    }
+
+    let event_type = required(options.event_type, "--event")?;
+    myelin_events::validate_event_type(event_type).map_err(|_| {
+        CliError::Usage("--event must be a canonical registered Myelin event name".into())
+    })?;
+    let run_as_agent_id = required(options.run_as_agent_id, "--run-as")?;
+    require_automation_id("--run-as", run_as_agent_id)?;
+    let task = required(options.task, "--task")?;
+    if task.is_empty() || task.len() > MAX_TASK_BYTES || task.trim() != task {
+        return Err(CliError::Usage(format!(
+            "--task must contain 1..={MAX_TASK_BYTES} bytes without surrounding whitespace"
+        )));
+    }
+    let budget_minor_units = bounded_u64(
+        required(options.budget_minor_units, "--budget-minor-units")?,
+        "--budget-minor-units",
+        1,
+        MAX_BUDGET_MINOR_UNITS,
+    )?;
+    let max_firings = bounded_u64(
+        required(options.max_firings, "--max-firings")?,
+        "--max-firings",
+        1,
+        MAX_FIRINGS,
+    )?;
+    let max_causal_depth = options
+        .max_causal_depth
+        .map(|value| bounded_u32(value, "--max-causal-depth", 0, MAX_CAUSAL_DEPTH))
+        .transpose()?;
+    validate_caveats(&options.caveats)?;
+    if let Some(branch) = options.source_branch {
+        validate_branch(branch)?;
+    }
+
+    let mut body = json!({
+        "event_type": event_type,
+        "run_as_agent_id": run_as_agent_id,
+        "task": task,
+        "budget_minor_units": budget_minor_units,
+        "max_firings": max_firings,
+        "delegation_caveats": options.caveats,
+        "require_no_personal_data": !options.allow_personal_data,
+        "require_human_approval": options.require_human_approval,
+    });
+    if let Some(branch) = options.source_branch {
+        body["source_branch"] = json!(branch);
+    }
+    if let Some(depth) = max_causal_depth {
+        body["max_causal_depth"] = json!(depth);
+    }
+    Ok(EdgeCall::post_json("/v1/triggers", body))
+}
+
+fn list_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let (limit, cursor) = page_options(args, true)?;
+    let mut query = FormQuery::default();
+    query.push("limit", &limit.to_string());
+    if let Some(cursor) = cursor {
+        query.push("cursor", cursor);
+    }
+    Ok(EdgeCall {
+        method: HttpMethod::Get,
+        path: "/v1/triggers".into(),
+        query: Some(query.finish()),
+        payload: None,
+        idempotency_key: None,
+        retry_policy: RetryPolicy::None,
+    })
+}
+
+fn show_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let id = exact_id(args, "show")?;
+    Ok(EdgeCall::get(format!("/v1/triggers/{id}")))
+}
+
+fn history_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let (id, rest) = args
+        .split_first()
+        .ok_or_else(|| CliError::Usage("automation history needs an id".into()))?;
+    require_automation_id("automation id", id)?;
+    let (limit, cursor) = page_options(rest, false)?;
+    let mut query = FormQuery::default();
+    query.push("limit", &limit.to_string());
+    if let Some(cursor) = cursor {
+        query.push("cursor", cursor);
+    }
+    Ok(EdgeCall {
+        method: HttpMethod::Get,
+        path: format!("/v1/triggers/{id}/firings"),
+        query: Some(query.finish()),
+        payload: None,
+        idempotency_key: None,
+        retry_policy: RetryPolicy::None,
+    })
+}
+
+fn lifecycle_call(args: &[&str], action: &str) -> Result<EdgeCall, CliError> {
+    let id = exact_id(args, action)?;
+    Ok(EdgeCall::post_json(
+        format!("/v1/triggers/{id}/{action}"),
+        json!({}),
+    ))
+}
+
+fn exact_id<'a>(args: &'a [&str], action: &str) -> Result<&'a str, CliError> {
+    let id = match args {
+        [id] => *id,
+        [] => return Err(CliError::Usage(format!("automation {action} needs an id"))),
+        [_, extra, ..] => {
+            return Err(CliError::Usage(format!(
+                "unexpected automation {action} argument `{extra}`"
+            )))
+        }
+    };
+    require_automation_id("automation id", id)?;
+    Ok(id)
+}
+
+fn page_options<'a>(
+    args: &'a [&str],
+    uuid_cursor: bool,
+) -> Result<(u32, Option<&'a str>), CliError> {
+    let mut limit = None;
+    let mut cursor = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--limit" => singleton_value(&mut limit, args, &mut index, "--limit")?,
+            "--cursor" => singleton_value(&mut cursor, args, &mut index, "--cursor")?,
+            token => {
+                return Err(CliError::Usage(format!(
+                    "unknown automation page flag `{token}`"
+                )))
+            }
+        }
+        index += 1;
+    }
+    let limit = limit
+        .map(|value| bounded_u32(value, "--limit", 1, MAX_PAGE_LIMIT))
+        .transpose()?
+        .unwrap_or(DEFAULT_PAGE_LIMIT);
+    if let Some(cursor) = cursor {
+        if uuid_cursor {
+            require_automation_id("automation cursor", cursor)?;
+        } else if cursor.is_empty()
+            || cursor.len() > 255
+            || cursor.trim() != cursor
+            || cursor.chars().any(char::is_control)
+        {
+            return Err(CliError::Usage(
+                "automation history cursor must be a bounded event id".into(),
+            ));
+        }
+    }
+    Ok((limit, cursor))
+}
+
+fn singleton_value<'a>(
+    slot: &mut Option<&'a str>,
+    args: &'a [&str],
+    index: &mut usize,
+    flag: &str,
+) -> Result<(), CliError> {
+    if slot.is_some() {
+        return Err(CliError::Usage(format!(
+            "automation command accepts `{flag}` only once"
+        )));
+    }
+    *slot = Some(flag_value(args, index, flag)?);
+    Ok(())
+}
+
+fn flag_value<'a>(args: &'a [&str], index: &mut usize, flag: &str) -> Result<&'a str, CliError> {
+    *index += 1;
+    args.get(*index)
+        .copied()
+        .ok_or_else(|| CliError::Usage(format!("`{flag}` needs a value")))
+}
+
+fn required<'a>(value: Option<&'a str>, flag: &str) -> Result<&'a str, CliError> {
+    value.ok_or_else(|| CliError::Usage(format!("automation create needs `{flag}`")))
+}
+
+fn bounded_u64(value: &str, flag: &str, min: u64, max: u64) -> Result<u64, CliError> {
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|parsed| parsed.to_string() == value)
+        .filter(|parsed| (min..=max).contains(parsed))
+        .ok_or_else(|| CliError::Usage(format!("`{flag}` must be an integer from {min} to {max}")))
+}
+
+fn bounded_u32(value: &str, flag: &str, min: u32, max: u32) -> Result<u32, CliError> {
+    value
+        .parse::<u32>()
+        .ok()
+        .filter(|parsed| parsed.to_string() == value)
+        .filter(|parsed| (min..=max).contains(parsed))
+        .ok_or_else(|| CliError::Usage(format!("`{flag}` must be an integer from {min} to {max}")))
+}
+
+fn validate_caveats(caveats: &[&str]) -> Result<(), CliError> {
+    if caveats.len() > MAX_CAVEATS {
+        return Err(CliError::Usage(format!(
+            "automation create accepts at most {MAX_CAVEATS} caveats"
+        )));
+    }
+    let mut distinct = BTreeSet::new();
+    for caveat in caveats {
+        if caveat.is_empty()
+            || caveat.len() > MAX_CAVEAT_BYTES
+            || caveat.chars().any(char::is_control)
+        {
+            return Err(CliError::Usage(format!(
+                "automation caveats must contain 1..={MAX_CAVEAT_BYTES} bytes without control characters"
+            )));
+        }
+        if !distinct.insert(*caveat) {
+            return Err(CliError::Usage(format!(
+                "automation caveat `{caveat}` was selected more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_branch(branch: &str) -> Result<(), CliError> {
+    let reference = if branch.starts_with("refs/heads/") {
+        branch.to_string()
+    } else if branch.starts_with("refs/") {
+        return Err(CliError::Usage(
+            "--branch must name a branch, not another kind of ref".into(),
+        ));
+    } else {
+        format!("refs/heads/{branch}")
+    };
+    if myelin_git::receive_pack::RefName::new(&reference)
+        .validate()
+        .is_err()
+    {
+        return Err(CliError::Usage(
+            "--branch must be a canonical Git branch name".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_automation_id(label: &str, value: &str) -> Result<(), CliError> {
+    if is_canonical_automation_id(value) {
+        Ok(())
+    } else {
+        Err(CliError::Usage(format!(
+            "{label} must be a canonical lowercase UUID"
+        )))
+    }
+}
+
+pub fn is_canonical_automation_id(value: &str) -> bool {
+    is_canonical_uuid(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AGENT: &str = "11111111-1111-4111-8111-111111111111";
+    const AUTOMATION: &str = "22222222-2222-4222-8222-222222222222";
+
+    #[test]
+    fn one_command_captures_a_governed_automation_intent() {
+        let call = automation_dispatch(&[
+            "create",
+            "--event",
+            "ci.run.failed",
+            "--branch",
+            "main",
+            "--run-as",
+            AGENT,
+            "--task",
+            "Triage the failure and open one issue.",
+            "--budget-minor-units",
+            "250000",
+            "--max-firings",
+            "10",
+            "--max-causal-depth",
+            "4",
+            "--caveat",
+            "repo:core",
+            "--require-human-approval",
+        ])
+        .unwrap();
+
+        assert_eq!(call.path, "/v1/triggers");
+        assert_eq!(call.retry_policy, RetryPolicy::CallerKeyRequired);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(call.payload.as_ref().unwrap()).unwrap(),
+            json!({
+                "event_type": "ci.run.failed",
+                "source_branch": "main",
+                "run_as_agent_id": AGENT,
+                "task": "Triage the failure and open one issue.",
+                "budget_minor_units": 250000,
+                "max_firings": 10,
+                "max_causal_depth": 4,
+                "delegation_caveats": ["repo:core"],
+                "require_no_personal_data": true,
+                "require_human_approval": true,
+            })
+        );
+    }
+
+    #[test]
+    fn automation_operations_are_addressable_pageable_and_retry_safe() {
+        assert_eq!(
+            automation_dispatch(&["show", AUTOMATION]).unwrap().path,
+            format!("/v1/triggers/{AUTOMATION}")
+        );
+        assert_eq!(
+            automation_dispatch(&["list", "--limit", "7", "--cursor", AUTOMATION])
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("limit=7&cursor=22222222-2222-4222-8222-222222222222")
+        );
+        assert_eq!(
+            automation_dispatch(&["history", AUTOMATION, "--cursor", "evt:failed/1"])
+                .unwrap()
+                .query
+                .as_deref(),
+            Some("limit=50&cursor=evt%3Afailed%2F1")
+        );
+        for action in ["pause", "resume", "disable"] {
+            let call = automation_dispatch(&[action, AUTOMATION]).unwrap();
+            assert_eq!(call.path, format!("/v1/triggers/{AUTOMATION}/{action}"));
+            assert_eq!(call.retry_policy, RetryPolicy::CallerKeyRequired);
+        }
+    }
+
+    #[test]
+    fn malformed_automation_intent_never_reaches_edge() {
+        for args in [
+            vec![],
+            vec!["create"],
+            vec![
+                "create",
+                "--event",
+                "CI.run.failed",
+                "--run-as",
+                AGENT,
+                "--task",
+                "Triage.",
+                "--budget-minor-units",
+                "1",
+                "--max-firings",
+                "1",
+            ],
+            vec![
+                "create",
+                "--event",
+                "ci.run.failed",
+                "--run-as",
+                "not-an-agent",
+                "--task",
+                "Triage.",
+                "--budget-minor-units",
+                "1",
+                "--max-firings",
+                "1",
+            ],
+            vec![
+                "create",
+                "--event",
+                "ci.run.failed",
+                "--branch",
+                "refs/tags/release",
+                "--run-as",
+                AGENT,
+                "--task",
+                "Triage.",
+                "--budget-minor-units",
+                "1",
+                "--max-firings",
+                "1",
+            ],
+            vec!["list", "--limit", "01"],
+            vec!["show", "not-an-id"],
+            vec!["history", AUTOMATION, "--cursor", " bad"],
+            vec!["disable", AUTOMATION, "again"],
+        ] {
+            assert!(automation_dispatch(&args).is_err(), "accepted {args:?}");
+        }
+    }
+}

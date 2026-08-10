@@ -643,6 +643,191 @@ describe("the CLI authentication journey", () => {
       expect(showAgent.stdout).toContain("no long-lived API key was created");
       expect(showAgent.stdout).not.toContain(systemTestConfig.token);
 
+      // Hosted work is ordinary product configuration too: the developer names an agent and
+      // the event that should wake it. There is no GitHub app key, issue-tracker key, runner
+      // credential, or copied bearer hidden between these two commands.
+      const hostedAgentName = uniqueName("Mainline triage");
+      const createHostedAgent = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        `cli-hosted-agent-${randomUUID()}`,
+        "agent",
+        "create",
+        hostedAgentName,
+        "--runtime",
+        "hosted",
+        "--tool",
+        "ci.read_run",
+        "--tool",
+        "issues.create",
+      );
+      expect(createHostedAgent.exitCode, createHostedAgent.stderr).toBe(0);
+      const hostedAgent = record(
+        record(JSON.parse(createHostedAgent.stdout), "hosted agent activation").agent,
+        "hosted agent",
+      );
+      const hostedAgentId = string(hostedAgent.id, "hosted agent id");
+      expect(hostedAgent).toMatchObject({
+        name: hostedAgentName,
+        runtime_ref: "hosted:luna",
+        status: "active",
+      });
+
+      const automationKey = `cli-automation-${randomUUID()}`;
+      const automationTask = "Read the failed mainline run and open one focused issue.";
+      const createAutomation = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        automationKey,
+        "automation",
+        "create",
+        "--event",
+        "ci.run.failed",
+        "--branch",
+        "main",
+        "--run-as",
+        hostedAgentId,
+        "--task",
+        automationTask,
+        "--budget-minor-units",
+        "250000",
+        "--max-firings",
+        "10",
+        "--max-causal-depth",
+        "4",
+        "--caveat",
+        "repo:core",
+      );
+      expect(createAutomation.exitCode, createAutomation.stderr).toBe(0);
+      const automationEnvelope = record(
+        JSON.parse(createAutomation.stdout),
+        "CLI automation creation",
+      );
+      const automation = record(automationEnvelope.trigger, "CLI automation");
+      const automationId = string(automation.id, "CLI automation id");
+      expect(automationEnvelope).toMatchObject({ created: true, durable: true });
+      expect(automation).toMatchObject({
+        run_as_agent_id: hostedAgentId,
+        event_type: "ci.run.failed",
+        task: automationTask,
+        budget_minor_units: 250000,
+        max_firings: 10,
+        firings_used: 0,
+        state: "active",
+      });
+
+      const replayAutomation = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        automationKey,
+        "automation",
+        "create",
+        "--event",
+        "ci.run.failed",
+        "--branch",
+        "main",
+        "--run-as",
+        hostedAgentId,
+        "--task",
+        automationTask,
+        "--budget-minor-units",
+        "250000",
+        "--max-firings",
+        "10",
+        "--max-causal-depth",
+        "4",
+        "--caveat",
+        "repo:core",
+      );
+      expect(replayAutomation.exitCode, replayAutomation.stderr).toBe(0);
+      expect(JSON.parse(replayAutomation.stdout)).toMatchObject({
+        created: false,
+        durable: true,
+        trigger: { id: automationId, run_as_agent_id: hostedAgentId },
+      });
+
+      const automationRoster = await runCli(
+        configDirectory,
+        "--json",
+        "automation",
+        "list",
+        "--limit",
+        "100",
+      );
+      expect(automationRoster.exitCode, automationRoster.stderr).toBe(0);
+      expect(
+        array(record(JSON.parse(automationRoster.stdout), "automation roster").items, "automations"),
+      ).toEqual(expect.arrayContaining([expect.objectContaining({ id: automationId })]));
+
+      const showAutomation = await runCli(
+        configDirectory,
+        "automation",
+        "show",
+        automationId,
+      );
+      expect(showAutomation.exitCode, showAutomation.stderr).toBe(0);
+      expect(showAutomation.stdout).toContain("Automation: ci.run.failed -> agent:");
+      expect(showAutomation.stdout).toContain(automationTask);
+      expect(showAutomation.stdout).toContain("Myelin owns the integration credentials");
+
+      const emptyHistory = await runCli(
+        configDirectory,
+        "automation",
+        "history",
+        automationId,
+      );
+      expect(emptyHistory.exitCode, emptyHistory.stderr).toBe(0);
+      expect(emptyHistory.stdout).toBe("(no items)\n");
+
+      const pauseAutomation = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        `cli-automation-pause-${randomUUID()}`,
+        "automation",
+        "pause",
+        automationId,
+      );
+      expect(pauseAutomation.exitCode, pauseAutomation.stderr).toBe(0);
+      expect(pauseAutomation.stdout).toContain("Paused automation:");
+      expect(pauseAutomation.stdout).toContain("will not reserve work until resumed");
+
+      const resumeAutomation = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        `cli-automation-resume-${randomUUID()}`,
+        "automation",
+        "resume",
+        automationId,
+      );
+      expect(resumeAutomation.exitCode, resumeAutomation.stderr).toBe(0);
+      expect(resumeAutomation.stdout).toContain("Resumed automation:");
+
+      const disableAutomation = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        `cli-automation-disable-${randomUUID()}`,
+        "automation",
+        "disable",
+        automationId,
+      );
+      expect(disableAutomation.exitCode, disableAutomation.stderr).toBe(0);
+      expect(disableAutomation.stdout).toContain("Disabled automation:");
+      expect(disableAutomation.stdout).toContain("cannot be resumed");
+
+      const retireHostedAgent = await runCli(
+        configDirectory,
+        "--idempotency-key",
+        `cli-hosted-agent-retire-${randomUUID()}`,
+        "agent",
+        "retire",
+        hostedAgentId,
+      );
+      expect(retireHostedAgent.exitCode, retireHostedAgent.stderr).toBe(0);
+      expect(retireHostedAgent.stdout).toContain(`Retired agent: ${hostedAgentName}`);
+
       // Starting work exchanges that browser session for one minute of agent authority. A lost
       // response is safe to retry: Edge returns the same run and credential, not a sibling run.
       const defaultCredentialRef = defaultProfile.match(
