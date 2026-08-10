@@ -453,7 +453,7 @@ impl SkeletonAgent {
                     conv.turns
                         .push(Turn::Model(StepOutcome::UseTools(calls.clone())));
                     let mut outcomes: Vec<ToolOutcome> = Vec::with_capacity(calls.len());
-                    for call in &calls {
+                    for (call_index, call) in calls.iter().enumerate() {
                         if let Err(reason) = validate_call(sub.catalogue, call) {
                             return Err(SkeletonError::ToolValidationRejected(reason));
                         }
@@ -466,9 +466,11 @@ impl SkeletonAgent {
                                 )))
                             }
                         };
+                        let effect_key = crate::tool_exec::logical_tool_effect_key(turn, call_index);
                         let tool_context = ToolExecutionContext {
                             run_id: &sub.run_id,
                             run_token: &token,
+                            effect_key: &effect_key,
                         };
                         match sub.executor.execute(&tool_context, def, call) {
                             Ok(result) => outcomes.push(ToolOutcome {

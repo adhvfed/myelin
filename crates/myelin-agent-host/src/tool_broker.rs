@@ -70,7 +70,7 @@ impl EdgeMcpToolExecutor {
                 "model tool call does not match its governed definition",
             ));
         }
-        let idempotency_key = stable_idempotency_key(context.run_id, call, &name)?;
+        let idempotency_key = stable_idempotency_key(context, call, definition)?;
         let body = json!({
             "jsonrpc": "2.0",
             "id": call.id.0,
@@ -198,24 +198,30 @@ fn is_loopback_host(host: &str) -> bool {
 }
 
 fn stable_idempotency_key(
-    run_id: &str,
+    context: &ToolExecutionContext<'_>,
     call: &ToolCall,
-    canonical_name: &str,
+    definition: &ToolDef,
 ) -> Result<String, ToolExecError> {
-    let arguments = serde_json::to_vec(&call.arguments)
-        .map_err(|error| failed(format!("serialize tool arguments: {error}")))?;
+    if context.effect_key.is_empty() || context.effect_key.len() > 1024 {
+        return Err(failed(
+            "hosted tool effect key is outside its 1..=1024 byte bound",
+        ));
+    }
+    let request_hash = crate::durable_tool::tool_request_hash(definition, call)?;
     let mut digest = blake3::Hasher::new();
     for part in [
-        run_id.as_bytes(),
-        call.id.0.as_bytes(),
-        canonical_name.as_bytes(),
+        context.run_id.as_bytes(),
+        context.effect_key.as_bytes(),
+        request_hash.as_bytes(),
     ] {
         digest.update(&(part.len() as u64).to_be_bytes());
         digest.update(part);
     }
-    digest.update(&(arguments.len() as u64).to_be_bytes());
-    digest.update(&arguments);
-    Ok(format!("hosted:{run_id}:{}", digest.finalize().to_hex()))
+    Ok(format!(
+        "hosted:{}:{}",
+        context.run_id,
+        digest.finalize().to_hex()
+    ))
 }
 
 fn parse_tool_result(response: &[u8], expected_call_id: &str) -> Result<ToolResult, ToolExecError> {
@@ -309,6 +315,19 @@ mod tests {
         )
     }
 
+    fn context(effect_key: &'static str) -> ToolExecutionContext<'static> {
+        let token = Box::leak(Box::new(myelin_flow::RunTokenHandle {
+            token: "secret-test-token".into(),
+            jti: "test-jti".into(),
+            ttl_secs: 60,
+        }));
+        ToolExecutionContext {
+            run_id: "01234567-89ab-cdef-0123-456789abcdef",
+            run_token: token,
+            effect_key,
+        }
+    }
+
     #[test]
     fn bearer_transport_refuses_cleartext_beyond_loopback() {
         assert!(EdgeMcpToolExecutor::new("https://edge.example.test").is_ok());
@@ -321,31 +340,38 @@ mod tests {
     #[test]
     fn mutation_retry_key_is_stable_bounded_and_request_specific() {
         let (definition, call) = read_call();
-        let first = stable_idempotency_key(
-            "01234567-89ab-cdef-0123-456789abcdef",
-            &call,
-            &definition.canonical_name(),
-        )
-        .unwrap();
-        let replay = stable_idempotency_key(
-            "01234567-89ab-cdef-0123-456789abcdef",
-            &call,
-            &definition.canonical_name(),
-        )
-        .unwrap();
+        let base_context = context("model-turn/0/tool/0");
+        let first =
+            stable_idempotency_key(&base_context, &call, &definition).unwrap();
+        let replay =
+            stable_idempotency_key(&base_context, &call, &definition).unwrap();
         let mut changed = call.clone();
         changed.arguments = json!({"run_id": "another-run"});
-        let different = stable_idempotency_key(
-            "01234567-89ab-cdef-0123-456789abcdef",
-            &changed,
-            &definition.canonical_name(),
-        )
-        .unwrap();
+        let different =
+            stable_idempotency_key(&base_context, &changed, &definition).unwrap();
 
         assert_eq!(first, replay);
         assert_ne!(first, different);
         assert!(first.len() <= 256);
         assert!(first.bytes().all(|byte| byte.is_ascii_graphic()));
+
+        let mut renamed = call.clone();
+        renamed.id.0 = "provider-chose-another-id".into();
+        assert_eq!(
+            first,
+            stable_idempotency_key(&base_context, &renamed, &definition).unwrap(),
+            "provider correlation IDs do not define durable effects",
+        );
+        assert_ne!(
+            first,
+            stable_idempotency_key(
+                &context("model-turn/0/tool/1"),
+                &call,
+                &definition,
+            )
+            .unwrap(),
+            "two calls with the same arguments remain distinct logical effects",
+        );
     }
 
     #[test]

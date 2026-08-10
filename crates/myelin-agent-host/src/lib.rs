@@ -2,6 +2,7 @@ use std::sync::{Arc, Mutex};
 
 mod activity_executor;
 mod durable_model;
+mod durable_tool;
 pub mod supervision;
 mod tool_broker;
 
@@ -18,6 +19,7 @@ pub mod identity;
 pub use identity::timestamp_from_epoch;
 pub mod workflow;
 use durable_model::DurableModelClient;
+use durable_tool::DurableToolExecutor;
 use identity::{IdentityRunMinter, IdentityRunRevoker};
 pub use workflow::{
     register_hosted_agent_workflow, HostedAgentActivityOutcome, HostedAgentInputResolver,
@@ -43,7 +45,8 @@ use myelin_identity::{
 use myelin_storage::agent_wallet::AgentWallet;
 use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::{
-    AgentModelStepStore, AgentTraceWriter, DurableAgentTraceStore, InMemoryAgentTraceStore,
+    AgentModelStepStore, AgentToolEffectStore, AgentTraceWriter, DurableAgentTraceStore,
+    InMemoryAgentTraceStore,
 };
 use myelin_storage::{
     DurableCellRootBacking, DurableDelegationPolicyBacking, DurableKmsBacking,
@@ -568,6 +571,7 @@ pub struct AgentHost {
     region: Region,
     wallet: AgentWallet,
     model_steps: AgentModelStepStore,
+    tool_effects: AgentToolEffectStore,
     traces: Arc<DurableAgentTraceStore>,
     identity: HostIdentity,
     runtime: tokio::runtime::Handle,
@@ -644,6 +648,7 @@ impl AgentHost {
             region,
             wallet: AgentWallet::new(provider.clone()),
             model_steps: AgentModelStepStore::with_runtime(provider.clone(), rt.clone()),
+            tool_effects: AgentToolEffectStore::with_runtime(provider.clone(), rt.clone()),
             traces: Arc::new(DurableAgentTraceStore::with_runtime(
                 provider.clone(),
                 rt.clone(),
@@ -716,13 +721,22 @@ impl AgentHost {
             self.model_steps.clone(),
             model_client,
         ));
+        let durable_tools = DurableToolExecutor::new(
+            task.tenant.clone(),
+            self.tool_effects.clone(),
+            tools.executor,
+        );
         dispatch_core(
             &self.wallet,
             self.region.clone(),
             task,
             wiring,
             model_client,
-            tools,
+            Tools {
+                catalogue: tools.catalogue,
+                executor: &durable_tools,
+                advertised: tools.advertised,
+            },
             RunTokenSeams {
                 minter,
                 revoker: &revoker,

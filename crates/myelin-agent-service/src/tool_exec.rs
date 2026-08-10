@@ -35,6 +35,12 @@ pub trait ToolExecutor: Send + Sync {
 pub struct ToolExecutionContext<'a> {
     pub run_id: &'a str,
     pub run_token: &'a RunTokenHandle,
+    /// Stable logical position of this effect within the run, independent of provider call IDs.
+    pub effect_key: &'a str,
+}
+
+pub fn logical_tool_effect_key(model_turn: usize, call_index: usize) -> String {
+    format!("model-turn/{model_turn}/tool/{call_index}")
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -158,6 +164,7 @@ mod tests {
         ToolExecutionContext {
             run_id: "test-run",
             run_token: token,
+            effect_key: "model-turn/0/tool/0",
         }
     }
 
@@ -207,5 +214,10 @@ mod tests {
         let e = ToolExecError::Failed("subsystem down".into()).to_string();
         assert!(e.contains("tool execution failed"), "loud reason: {e}");
         assert!(e.contains("subsystem down"));
+    }
+
+    #[test]
+    fn logical_effect_identity_comes_from_position_not_provider_naming() {
+        assert_eq!(logical_tool_effect_key(3, 2), "model-turn/3/tool/2");
     }
 }

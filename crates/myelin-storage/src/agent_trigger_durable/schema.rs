@@ -160,11 +160,14 @@ pub fn agent_trigger_durable_migrations() -> Migrations {
             "0095_agent_trigger_approval",
             AGENT_TRIGGER_APPROVAL_MIGRATION,
         ),
-        Migration::plain(
-            "0103_agent_trigger_terminal_reason",
-            AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
-        ),
     ])
+}
+
+pub fn agent_trigger_terminal_reason_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0103_agent_trigger_terminal_reason",
+        AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
+    )])
 }
 
 #[cfg(test)]

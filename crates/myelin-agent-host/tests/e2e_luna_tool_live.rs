@@ -387,6 +387,7 @@ async fn live_luna_tool_run_reads_real_tenant_data_and_is_metered() {
         &ToolExecutionContext {
             run_id,
             run_token: &probe_token,
+            effect_key: "model-turn/0/tool/0",
         },
         &git_check_status_read_tool_def(),
         &ToolCall {
