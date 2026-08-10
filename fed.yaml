@@ -225,6 +225,25 @@ services:
       MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
     startup_message: "Myelin governed agent trigger consumer is running"
 
+  hosted-agent-worker:
+    depends_on: [agent-service, development-tenants-ready]
+    process: cargo run --quiet -p myelin-agent-host --features integration --bin hosted-agent-worker
+    environment:
+      DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
+      S3_ENDPOINT: "http://localhost:{{S3_PORT}}"
+      S3_REGION: fr-par
+      S3_ACCESS_KEY: myelin_dev_access
+      S3_SECRET_KEY: myelin_dev_secret
+      S3_BUCKET: myelin-dev
+      REDIS_URL: "redis://localhost:{{VALKEY_PORT}}"
+      NATS_URL: "nats://localhost:{{NATS_PORT}}"
+      MYELIN_REGION: fr-par
+      MYELIN_CELL_ID: "myelin-dev-{{FED_PROJECT_ID}}"
+      MYELIN_KMS_SEAL_KEY: "{{MYELIN_KMS_SEAL_KEY}}"
+      MYELIN_HOSTED_MODEL_MODE: deterministic-development
+    startup_message: "Myelin hosted agent workflow workers are running"
+
   ci-dispatch:
     depends_on: [event-stream-ready]
     process: >-
@@ -377,7 +396,7 @@ scripts:
     script: pnpm --dir frontend check
 
   test:system:
-    depends_on: [outbox-publisher, agent-service, ci-controlplane, git-checks, notifications, refs]
+    depends_on: [outbox-publisher, agent-service, hosted-agent-worker, ci-controlplane, git-checks, notifications, refs]
     environment:
       DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
       DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"

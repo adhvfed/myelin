@@ -434,6 +434,55 @@ impl DurableAgentTriggerBacking {
             .await
     }
 
+    /// Projects terminal workflow state back onto its governed firing.
+    ///
+    /// This is intentionally replayable. The workflow commit remains the source of truth; if the
+    /// worker dies between that commit and this projection, the next reconciliation pass closes
+    /// the same firing without re-running agent work.
+    pub async fn reconcile_terminal_firings(
+        &self,
+        tenant: &str,
+        limit: u32,
+    ) -> Result<u64, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let limit = i64::from(limit.clamp(1, 1_001));
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let updated = sqlx::query(
+                        "WITH terminal AS (\
+                            SELECT firing.binding_id, firing.event_id \
+                              FROM agent_trigger_firing firing \
+                              JOIN workflow_run run ON run.tenant_id = firing.tenant_id \
+                               AND run.region = firing.region \
+                               AND run.run_id = firing.run_id::text \
+                             WHERE firing.tenant_id = $1 AND firing.region = $2 \
+                               AND firing.state = 'started' \
+                               AND run.state IN ('completed','failed','terminated','nondeterministic') \
+                             ORDER BY firing.created_at, firing.binding_id, firing.event_id \
+                             FOR UPDATE OF firing SKIP LOCKED LIMIT $3\
+                         ) \
+                         UPDATE agent_trigger_firing firing SET state = 'terminal' \
+                           FROM terminal \
+                          WHERE firing.tenant_id = $1 AND firing.region = $2 \
+                            AND firing.binding_id = terminal.binding_id \
+                            AND firing.event_id = terminal.event_id \
+                            AND firing.state = 'started'",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(limit)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(query_error("reconcile terminal governed agent firings"))?
+                    .rows_affected();
+                    Ok(updated)
+                })
+            })
+            .await
+    }
+
     pub async fn claim_next_firing(
         &self,
         tenant: &str,

@@ -41,7 +41,7 @@ async function awaitActiveIssue(title: string): Promise<JsonRecord> {
 }
 
 describe("collaboration lifecycle", () => {
-  test("binds red mainline CI to one governed agent without an integration API key", async () => {
+  test("turns red mainline CI into one governed hosted run without an integration API key", async () => {
     const founder = await browserApprovedCliClient();
     const agentName = uniqueName("triage-bot");
     const agentRetryKey = `agent-${randomUUID()}`;
@@ -193,21 +193,23 @@ command = ["true"]
       state: "active",
     });
 
-    const firingHistory = await founder.json(
-      `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
-    );
-    expect(array(firingHistory.body.items, "governed trigger firing history")).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          event_id: eventId,
-          event_type: "ci.run.failed",
-          trigger_ref: `myelin://${systemTestConfig.tenant}/identity/trigger/${triggerId}`,
-          state: "queued",
-          run_id: null,
-          run_ref: null,
-        }),
-      ]),
-    );
+    const completedFiring = await eventually<JsonRecord>(async () => {
+      const response = await founder.json(
+        `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+      );
+      return array(response.body.items, "governed trigger firing history")
+        .map((item) => record(item, "governed trigger firing"))
+        .find((item) => item.event_id === eventId && item.state === "terminal");
+    }, { description: "the hosted agent to complete its one governed workflow" });
+    const hostedRunId = string(completedFiring.run_id, "completed hosted run id");
+    expect(hostedRunId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
+    expect(completedFiring).toMatchObject({
+      event_id: eventId,
+      event_type: "ci.run.failed",
+      trigger_ref: `myelin://${systemTestConfig.tenant}/identity/trigger/${triggerId}`,
+      state: "terminal",
+      run_ref: `myelin://${systemTestConfig.tenant}/agent/run/${hostedRunId}`,
+    });
     const peerHistory = await reviewerClient.json(
       `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
       { expectedStatus: 403 },

@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "hosted-agent-worker"
+path = "src/main.rs"
+required-features = ["integration"]
+
 [dependencies]
 myelin-agent-model = { path = "../myelin-agent-model" }
 myelin-agent-service = { path = "../myelin-agent-service" }
@@ -18,6 +23,7 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-refs = { path = "../myelin-refs" }
+myelin-config = { path = "../myelin-config" }
 serde_json.workspace = true
 serde.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
@@ -30,10 +36,9 @@ myelin-agent-service = { path = "../myelin-agent-service", features = ["integrat
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
-myelin-config = { path = "../myelin-config" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 
 [features]
 default = []
-integration = []
+integration = ["myelin-agent-service/integration"]

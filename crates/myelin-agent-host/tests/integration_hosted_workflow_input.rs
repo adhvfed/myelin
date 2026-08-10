@@ -355,6 +355,23 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
         PgRunOnceOutcome::Idle
     ));
     assert_eq!(agent.executions.lock().unwrap().len(), 1);
+    assert_eq!(
+        triggers
+            .reconcile_terminal_firings(&tenant.0, 100)
+            .await
+            .expect("workflow completion is projected to its firing"),
+        1
+    );
+    let history = triggers
+        .list_firings_for_owner(&tenant.0, "founder", binding_id, None, 100)
+        .await
+        .expect("the founder can read the completed firing");
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].state,
+        myelin_storage::AgentTriggerFiringState::Terminal
+    );
+    assert_eq!(history[0].run_id.as_deref(), Some(run_id.as_str()));
 
     let cleanup_tenant = tenant.0.clone();
     app.with_tenant_tx(&tenant.0, move |conn| {

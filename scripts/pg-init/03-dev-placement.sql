@@ -35,4 +35,19 @@ ON CONFLICT (cell_id, tenant_id) DO UPDATE SET
   isolation_tier = EXCLUDED.isolation_tier,
   active = EXCLUDED.active;
 
+-- Local hosted-agent credit is explicit development fixture data. The immutable
+-- ledger entry has a stable identity, so restarting Fed never mints more credit.
+INSERT INTO agent_wallet (tenant_id, region, balance_micro) VALUES
+  (:'development_tenant', 'fr-par', 10000000),
+  (:'integration_tenant', 'fr-par', 10000000)
+ON CONFLICT (tenant_id, region) DO NOTHING;
+
+INSERT INTO agent_wallet_ledger
+  (tenant_id, region, entry_id, kind, amount_micro, run_id) VALUES
+  (:'development_tenant', 'fr-par', md5(:'development_tenant' || ':hosted-dev-credit')::uuid,
+   'topup', 10000000, NULL),
+  (:'integration_tenant', 'fr-par', md5(:'integration_tenant' || ':hosted-dev-credit')::uuid,
+   'topup', 10000000, NULL)
+ON CONFLICT (tenant_id, entry_id) DO NOTHING;
+
 COMMIT;
