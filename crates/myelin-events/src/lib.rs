@@ -69,7 +69,8 @@ pub use relay::{
 pub use residency::{BusRegionReport, BusResidencySignal, BusStreamResidency, ResidencyError};
 pub use retention::{RetentionTuning, StreamClass};
 pub use taxonomy::{
-    validate as validate_event_type, TaxonomyError, ARTIFACT_TYPE_TOKENS, SEED_EVENT_NAMES,
+    resolve_automation_subject_type, validate as validate_event_type, AutomationSubjectTypeError,
+    TaxonomyError, ARTIFACT_TYPE_TOKENS, AUTOMATION_SUBJECT_TYPE_TOKENS, SEED_EVENT_NAMES,
     SUBSYSTEM_TOKENS,
 };
 pub use telemetry::{

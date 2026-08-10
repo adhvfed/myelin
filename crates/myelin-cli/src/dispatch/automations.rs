@@ -36,6 +36,7 @@ pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
 #[derive(Default)]
 struct CreateOptions<'a> {
     event_type: Option<&'a str>,
+    subject_type: Option<&'a str>,
     source_branch: Option<&'a str>,
     run_as_agent_id: Option<&'a str>,
     task: Option<&'a str>,
@@ -53,6 +54,12 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     while index < args.len() {
         match args[index] {
             "--event" => singleton_value(&mut options.event_type, args, &mut index, "--event")?,
+            "--subject-type" => singleton_value(
+                &mut options.subject_type,
+                args,
+                &mut index,
+                "--subject-type",
+            )?,
             "--branch" => {
                 singleton_value(&mut options.source_branch, args, &mut index, "--branch")?
             }
@@ -103,6 +110,7 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     myelin_events::validate_event_type(event_type).map_err(|_| {
         CliError::Usage("--event must be a canonical registered Myelin event name".into())
     })?;
+    resolve_subject_type(event_type, options.subject_type)?;
     let run_as_agent_id = required(options.run_as_agent_id, "--run-as")?;
     require_automation_id("--run-as", run_as_agent_id)?;
     let task = required(options.task, "--task")?;
@@ -145,10 +153,18 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     if let Some(branch) = options.source_branch {
         body["source_branch"] = json!(branch);
     }
+    if let Some(subject_type) = options.subject_type {
+        body["subject_type"] = json!(subject_type);
+    }
     if let Some(depth) = max_causal_depth {
         body["max_causal_depth"] = json!(depth);
     }
     Ok(EdgeCall::post_json("/v1/triggers", body))
+}
+
+fn resolve_subject_type(event_type: &str, explicit: Option<&str>) -> Result<String, CliError> {
+    myelin_events::resolve_automation_subject_type(event_type, explicit)
+        .map_err(|error| CliError::Usage(error.to_string()))
 }
 
 fn list_call(args: &[&str]) -> Result<EdgeCall, CliError> {
@@ -438,6 +454,44 @@ mod tests {
                 "require_human_approval": true,
             })
         );
+    }
+
+    #[test]
+    fn event_subjects_are_inferred_when_unambiguous_and_explicit_when_not() {
+        assert_eq!(
+            resolve_subject_type("issue.issue.updated", None).unwrap(),
+            "issue"
+        );
+        assert_eq!(
+            resolve_subject_type("ci.result", Some("run")).unwrap(),
+            "run"
+        );
+        assert!(resolve_subject_type("ci.result", None).is_err());
+        assert!(resolve_subject_type("issue.issue.updated", Some("run")).is_err());
+        assert!(resolve_subject_type("ci.deployment.finished", None).is_err());
+
+        let mut args = vec![
+            "create",
+            "--event",
+            "ci.result",
+            "--subject-type",
+            "run",
+            "--run-as",
+            AGENT,
+            "--task",
+            "Summarize the completed rollup.",
+            "--budget-minor-units",
+            "1",
+            "--max-firings",
+            "1",
+        ];
+        let call = automation_dispatch(&args).unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(call.payload.as_ref().unwrap()).unwrap();
+        assert_eq!(body["subject_type"], "run");
+
+        args.drain(3..5);
+        assert!(automation_dispatch(&args).is_err());
     }
 
     #[test]

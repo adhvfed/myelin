@@ -362,6 +362,108 @@ command = ["true"]
     );
   });
 
+  test("holds a visible issue event for a human decision without pretending it is CI", async () => {
+    const founder = await browserApprovedCliClient();
+    const issue = await awaitActiveIssue(uniqueName("Automation review"));
+    const issueRef = string(issue.ref, "visible issue ref");
+    const issueKey = string(issue.key, "visible issue key");
+
+    const activated = await founder.json("/v1/agents", {
+      method: "POST",
+      body: {
+        name: uniqueName("Issue change companion"),
+        runtime: "hosted",
+        tools: ["issues.view"],
+      },
+      idempotencyKey: `issue-event-agent-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const agentId = string(record(activated.body.agent, "issue agent").id, "issue agent id");
+    const created = await founder.json("/v1/triggers", {
+      method: "POST",
+      body: {
+        event_type: "issue.issue.updated",
+        run_as_agent_id: agentId,
+        task: "Read the changed issue and propose the next smallest useful step.",
+        budget_minor_units: 100_000,
+        max_firings: 1,
+        require_human_approval: true,
+      },
+      idempotencyKey: `issue-event-trigger-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const trigger = record(created.body.trigger, "issue automation");
+    const triggerId = string(trigger.id, "issue automation id");
+    expect(trigger).toMatchObject({
+      event_type: "issue.issue.updated",
+      subject_type: "issue",
+      require_human_approval: true,
+      firings_used: 0,
+    });
+
+    const eventId = `issue-updated-${randomUUID()}`;
+    const now = new Date().toISOString();
+    const changedIssue: ExternalEventEnvelope = {
+      event_id: eventId,
+      type_: "issue.issue.updated",
+      schema_ver: 1,
+      tenant: systemTestConfig.tenant,
+      region: systemTestConfig.region,
+      actor: {
+        tenant: systemTestConfig.tenant,
+        region: systemTestConfig.region,
+        principal_id: "issues-service",
+        kind: "Service",
+        data_role: "Controller",
+        status: "Active",
+      },
+      subject: issueRef,
+      aggregate: `issue:${issueKey}`,
+      causation_id: null,
+      correlation_id: eventId,
+      caused_by: null,
+      depth: 1,
+      contains_personal_data: false,
+      data_role: "Controller",
+      visibility: "Internal",
+      pii_key_ref: null,
+      occurred_at: now,
+      recorded_at: now,
+      payload: { issue: issueRef, changed_fields: ["title"] },
+    };
+    const bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
+    try {
+      expect((await bus.publish(changedIssue)).duplicate).toBe(false);
+    } finally {
+      await bus.close();
+    }
+
+    const awaiting = await eventually<JsonRecord>(async () => {
+      const response = await founder.json(
+        `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+      );
+      return array(response.body.items, "issue automation history")
+        .map((item) => record(item, "issue automation firing"))
+        .find((item) => item.event_id === eventId && item.state === "awaiting_approval");
+    }, { description: "the visible issue event to reach its exact human gate" });
+    expect(awaiting).toMatchObject({ event_id: eventId, run_id: null, approval: null });
+
+    const rejected = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings/reject`,
+      { method: "POST", body: { event_id: eventId }, expectedStatus: 200 },
+    );
+    expect(rejected.body).toMatchObject({
+      action: "reject",
+      changed: true,
+      firing: {
+        event_id: eventId,
+        state: "terminal",
+        run_id: null,
+        approval: { decision: "rejected", decided_by: expect.any(String) },
+      },
+    });
+  });
+
   test("lets a founder create and rediscover a project without operator-provided IDs", async () => {
     const name = uniqueName("Developer experience");
     const issuePrefix = `P${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`;

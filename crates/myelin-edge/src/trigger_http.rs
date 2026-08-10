@@ -53,6 +53,8 @@ impl TriggerHttpApi {
 struct CreateTriggerBody {
     event_type: String,
     #[serde(default)]
+    subject_type: Option<String>,
+    #[serde(default)]
     source_branch: Option<String>,
     run_as_agent_id: String,
     task: String,
@@ -458,7 +460,11 @@ fn create_proposal(
         ));
     }
 
-    let matcher = compile_matcher(&body.event_type, body.source_branch.as_deref())?;
+    let matcher = compile_matcher(
+        &body.event_type,
+        body.subject_type.as_deref(),
+        body.source_branch.as_deref(),
+    )?;
     Ok(NewAgentTriggerBinding {
         binding_id: Uuid::new_v4(),
         owner_principal_id: ctx.principal.principal_id.0.clone(),
@@ -492,6 +498,7 @@ fn validate_budget_minor_units(value: u64) -> Result<(), EdgeError> {
 
 fn compile_matcher(
     event_type: &str,
+    subject_type: Option<&str>,
     source_branch: Option<&str>,
 ) -> Result<EventMatcher, EdgeError> {
     if event_type.len() > 255 || myelin_events::validate_event_type(event_type).is_err() {
@@ -499,6 +506,7 @@ fn compile_matcher(
             "event_type must be a bounded canonical Myelin event name".into(),
         ));
     }
+    let subject_type = resolve_subject_type(event_type, subject_type)?;
     let mut predicates = vec![Predicate::Cmp {
         op: CmpOp::Eq,
         lhs: Expr::Var("event.type".into()),
@@ -526,8 +534,13 @@ fn compile_matcher(
             rhs: Expr::Lit(Literal::Str(source_ref)),
         });
     }
-    EventMatcher::compile(ObjectType("run".into()), Predicate::And(predicates))
+    EventMatcher::compile(ObjectType(subject_type), Predicate::And(predicates))
         .map_err(|error| EdgeError::BadRequest(format!("invalid trigger matcher: {error}")))
+}
+
+fn resolve_subject_type(event_type: &str, explicit: Option<&str>) -> Result<String, EdgeError> {
+    myelin_events::resolve_automation_subject_type(event_type, explicit)
+        .map_err(|error| EdgeError::BadRequest(error.to_string()))
 }
 
 fn parse_create_body(bytes: &[u8]) -> Result<CreateTriggerBody, EdgeError> {
@@ -546,8 +559,9 @@ fn parse_approval_body(bytes: &[u8]) -> Result<TriggerApprovalBody, EdgeError> {
             "trigger approval body exceeds {MAX_TRIGGER_JSON_BYTES} bytes"
         )));
     }
-    let body: TriggerApprovalBody = serde_json::from_slice(bytes)
-        .map_err(|error| EdgeError::BadRequest(format!("invalid trigger approval body: {error}")))?;
+    let body: TriggerApprovalBody = serde_json::from_slice(bytes).map_err(|error| {
+        EdgeError::BadRequest(format!("invalid trigger approval body: {error}"))
+    })?;
     if body.event_id.is_empty()
         || body.event_id.len() > 255
         || body.event_id.trim() != body.event_id
@@ -581,6 +595,7 @@ fn binding_json(tenant: &str, binding: &DurableAgentTriggerBinding) -> Value {
         "owner_principal_id": binding.owner_principal_id,
         "run_as_agent_id": binding.run_as_agent_id,
         "event_type": binding.event_type,
+        "subject_type": binding.matcher.get("object_type").and_then(Value::as_str),
         "matcher": binding.matcher,
         "task": binding.task,
         "delegation_caveats": binding.delegation_caveats,
@@ -683,7 +698,7 @@ mod tests {
 
     #[test]
     fn red_mainline_trigger_is_exactly_red_and_exactly_mainline() {
-        let matcher = compile_matcher("ci.run.failed", Some("main")).unwrap();
+        let matcher = compile_matcher("ci.run.failed", None, Some("main")).unwrap();
 
         assert_eq!(
             matcher.matches(
@@ -717,19 +732,28 @@ mod tests {
     #[test]
     fn branch_inputs_are_canonicalized_or_refused_before_persistence() {
         assert_eq!(
-            compile_matcher("ci.run.failed", Some("main")).unwrap(),
-            compile_matcher("ci.run.failed", Some("refs/heads/main")).unwrap(),
+            compile_matcher("ci.run.failed", None, Some("main")).unwrap(),
+            compile_matcher("ci.run.failed", None, Some("refs/heads/main")).unwrap(),
             "friendly and fully-qualified mainline names compile to one durable intent"
         );
-        assert!(compile_matcher("ci.run.failed", Some("refs/tags/release")).is_err());
-        assert!(compile_matcher("ci.run.failed", Some("feature/../main")).is_err());
+        assert!(compile_matcher("ci.run.failed", None, Some("refs/tags/release")).is_err());
+        assert!(compile_matcher("ci.run.failed", None, Some("feature/../main")).is_err());
     }
 
     #[test]
     fn event_names_share_the_platform_taxonomy_instead_of_a_trigger_only_dialect() {
-        assert!(compile_matcher("ci.result", None).is_ok());
-        assert!(compile_matcher("CI.run.failed", None).is_err());
-        assert!(compile_matcher("unknown.run.failed", None).is_err());
+        assert!(compile_matcher("ci.result", Some("run"), None).is_ok());
+        assert!(compile_matcher("ci.result", None, None).is_err());
+        assert!(compile_matcher("CI.run.failed", None, None).is_err());
+        assert!(compile_matcher("unknown.run.failed", None, None).is_err());
+    }
+
+    #[test]
+    fn matcher_subjects_follow_the_event_artifact_instead_of_silently_assuming_ci() {
+        let issue = compile_matcher("issue.issue.updated", None, None).unwrap();
+        assert_eq!(issue.object_type().0, "issue");
+        assert!(compile_matcher("issue.issue.updated", Some("run"), None).is_err());
+        assert!(compile_matcher("ci.deployment.finished", None, None).is_err());
     }
 
     #[test]

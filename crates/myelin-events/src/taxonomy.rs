@@ -41,6 +41,79 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
     "edge",
 ];
 
+/// Artifact subjects whose live read boundary is implemented for governed automations.
+pub const AUTOMATION_SUBJECT_TYPE_TOKENS: &[&str] = &[
+    "run", "repo", "pr", "comment", "issue", "page", "row", "channel", "message",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AutomationSubjectTypeError {
+    Ambiguous {
+        event_type: String,
+    },
+    Conflict {
+        event_type: String,
+        explicit: String,
+        inferred: String,
+    },
+    Unsupported {
+        subject_type: String,
+    },
+}
+
+impl std::fmt::Display for AutomationSubjectTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Ambiguous { event_type } => write!(
+                f,
+                "two-segment event type `{event_type}` requires an explicit subject_type"
+            ),
+            Self::Conflict {
+                event_type,
+                explicit,
+                inferred,
+            } => write!(
+                f,
+                "subject_type `{explicit}` conflicts with event_type `{event_type}`; expected `{inferred}`"
+            ),
+            Self::Unsupported { subject_type } => write!(
+                f,
+                "subject_type `{subject_type}` does not yet have an automation visibility adapter"
+            ),
+        }
+    }
+}
+
+pub fn resolve_automation_subject_type(
+    event_type: &str,
+    explicit: Option<&str>,
+) -> Result<String, AutomationSubjectTypeError> {
+    let segments = event_type.split('.').collect::<Vec<_>>();
+    let inferred = (segments.len() == 3).then(|| segments[1]);
+    let subject_type = match (explicit, inferred) {
+        (Some(explicit), Some(inferred)) if explicit != inferred => {
+            return Err(AutomationSubjectTypeError::Conflict {
+                event_type: event_type.into(),
+                explicit: explicit.into(),
+                inferred: inferred.into(),
+            });
+        }
+        (Some(explicit), _) => explicit,
+        (None, Some(inferred)) => inferred,
+        (None, None) => {
+            return Err(AutomationSubjectTypeError::Ambiguous {
+                event_type: event_type.into(),
+            });
+        }
+    };
+    if !AUTOMATION_SUBJECT_TYPE_TOKENS.contains(&subject_type) {
+        return Err(AutomationSubjectTypeError::Unsupported {
+            subject_type: subject_type.into(),
+        });
+    }
+    Ok(subject_type.into())
+}
+
 pub mod new_tokens {
     pub const CI_CHECK_UPDATED: &str = "ci.check.updated";
     pub const CI_RESULT: &str = "ci.result";
@@ -324,6 +397,30 @@ mod tests {
     }
 
     #[test]
+    fn automation_subjects_are_inferred_only_when_the_event_name_carries_one() {
+        assert_eq!(
+            resolve_automation_subject_type("issue.issue.updated", None).unwrap(),
+            "issue"
+        );
+        assert_eq!(
+            resolve_automation_subject_type("ci.result", Some("run")).unwrap(),
+            "run"
+        );
+        assert!(matches!(
+            resolve_automation_subject_type("ci.result", None),
+            Err(AutomationSubjectTypeError::Ambiguous { .. })
+        ));
+        assert!(matches!(
+            resolve_automation_subject_type("issue.issue.updated", Some("run")),
+            Err(AutomationSubjectTypeError::Conflict { .. })
+        ));
+        assert!(matches!(
+            resolve_automation_subject_type("ci.deployment.finished", None),
+            Err(AutomationSubjectTypeError::Unsupported { .. })
+        ));
+    }
+
+    #[test]
     fn underscored_tokens_are_well_formed() {
         assert!(token_is_well_formed("break_glass"));
         assert!(token_is_well_formed("read_state"));
@@ -336,7 +433,10 @@ mod tests {
     #[test]
     fn identity_tuple_written_and_siblings_are_admitted_by_the_grammar() {
         for tok in myelin_identity::iam_events::IDENTITY_EVENT_TOKENS {
-            assert!(validate(tok).is_ok(), "token `{tok}` must be admitted by this grammar");
+            assert!(
+                validate(tok).is_ok(),
+                "token `{tok}` must be admitted by this grammar"
+            );
         }
         assert!(matches!(
             validate("iam.tuple.written"),

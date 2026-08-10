@@ -42,7 +42,8 @@ The suite is intentionally organized around externally visible contracts:
   messages through one public retry identity, creates and edits a Knowledge page with the same
   retry convention, exercises the asynchronous Issues authorization reconciler and optimistic
   conflicts, and follows red mainline CI through a durable, retry-safe human approval into one
-  governed hosted-agent run and one attributed issue.
+  governed hosted-agent run and one attributed issue. It also proves a visible Issues event uses
+  the Issues permission boundary—not a hidden CI-only matcher assumption—before reaching its gate.
 - `authentication-lifecycle` starts logged out, lets an authenticated browser identity approve one
   verifier-bound CLI login, proves another CLI cannot claim it, and uses the fresh session exactly
   once without copying the browser credential.

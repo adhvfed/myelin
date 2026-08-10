@@ -73,9 +73,16 @@ async fn main() {
 
     let runtime = tokio::runtime::Handle::current();
     let identity = StoreBackedCheck::with_pg(provider.clone(), kms, cell, runtime.clone());
-    for admission in identity.admit_git_fragment() {
-        if let FragmentAdmit::Rejected { reason } = admission {
-            refuse_start("Git authorization schema", reason);
+    for (name, admissions) in [
+        ("Git", identity.admit_git_fragment()),
+        ("Issues", identity.admit_issue_fragment()),
+        ("Knowledge", identity.admit_knowledge_fragment()),
+        ("Chat", identity.admit_chat_fragment()),
+    ] {
+        for admission in admissions {
+            if let FragmentAdmit::Rejected { reason } = admission {
+                refuse_start(&format!("{name} authorization schema"), reason);
+            }
         }
     }
     let runs =

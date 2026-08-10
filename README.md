@@ -169,6 +169,13 @@ exact event without starting or paying for an agent run; its owner can approve o
 durable, retry-safe decision that remains visible in history. No third-party integration key is
 created or copied into the agent.
 
+Three-segment events carry their subject type in the name, so `issue.issue.updated`,
+`knowledge.page.updated`, and `chat.message.created` need no extra matcher ceremony. Ambiguous
+two-segment events such as `ci.result` use `--subject-type run`. Myelin currently admits subjects
+whose live visibility can be checked end to end: CI runs; Git repositories, pull requests, and
+comments; Issues issues; Knowledge pages and rows; and Chat channels and messages. Other artifact
+types are refused at creation instead of becoming automations that can never fire.
+
 Issue responses include a canonical `myelin://...` reference that can be passed directly to
 `chat ref`. The conversation keeps a live pointer to the issue rather than copying a stale
 snapshot.

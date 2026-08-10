@@ -22,11 +22,84 @@ pub struct DurableTriggerBindingStore {
 }
 
 pub struct DurableOwnerVisibility {
+    provider: SubstrateProvider,
     principals: DurablePrincipalBacking,
     runs: CiRunStore,
     identity: StoreBackedCheck,
     runtime: Handle,
     region: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerVisibilityRule {
+    CiRunRepository,
+    Direct {
+        subsystem: &'static str,
+        identity_object_type: &'static str,
+        permission: &'static str,
+        address: TriggerSubjectAddress,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerSubjectAddress {
+    SubjectId,
+    IssueKey,
+}
+
+pub fn trigger_visibility_rule(subject_type: &str) -> Option<TriggerVisibilityRule> {
+    match subject_type {
+        "run" => Some(TriggerVisibilityRule::CiRunRepository),
+        "repo" => Some(TriggerVisibilityRule::Direct {
+            subsystem: "git",
+            identity_object_type: "repo",
+            permission: "pull",
+            address: TriggerSubjectAddress::SubjectId,
+        }),
+        "pr" => Some(TriggerVisibilityRule::Direct {
+            subsystem: "git",
+            identity_object_type: "pull_request",
+            permission: "view",
+            address: TriggerSubjectAddress::SubjectId,
+        }),
+        "comment" => Some(TriggerVisibilityRule::Direct {
+            subsystem: "git",
+            identity_object_type: "pr_comment",
+            permission: "view",
+            address: TriggerSubjectAddress::SubjectId,
+        }),
+        "issue" => Some(TriggerVisibilityRule::Direct {
+            subsystem: "issue",
+            identity_object_type: "issue",
+            permission: "view",
+            address: TriggerSubjectAddress::IssueKey,
+        }),
+        "page" => Some(TriggerVisibilityRule::Direct {
+            subsystem: "knowledge",
+            identity_object_type: "page",
+            permission: "read",
+            address: TriggerSubjectAddress::SubjectId,
+        }),
+        "row" => Some(TriggerVisibilityRule::Direct {
+            subsystem: "knowledge",
+            identity_object_type: "database_row",
+            permission: "read",
+            address: TriggerSubjectAddress::SubjectId,
+        }),
+        "channel" => Some(TriggerVisibilityRule::Direct {
+            subsystem: "chat",
+            identity_object_type: "channel",
+            permission: "read",
+            address: TriggerSubjectAddress::SubjectId,
+        }),
+        "message" => Some(TriggerVisibilityRule::Direct {
+            subsystem: "chat",
+            identity_object_type: "message",
+            permission: "view",
+            address: TriggerSubjectAddress::SubjectId,
+        }),
+        _ => None,
+    }
 }
 
 impl DurableTriggerBindingStore {
@@ -47,6 +120,7 @@ impl DurableOwnerVisibility {
         runtime: Handle,
     ) -> Self {
         Self {
+            provider: provider.clone(),
             principals: DurablePrincipalBacking::new(provider.clone()),
             runs,
             identity,
@@ -77,6 +151,43 @@ impl DurableOwnerVisibility {
             ))
         })
         .transpose()
+    }
+
+    fn direct_identity_object(
+        &self,
+        tenant: &str,
+        subject_id: &str,
+        identity_object_type: &str,
+        address: TriggerSubjectAddress,
+    ) -> Result<Option<String>, String> {
+        if address == TriggerSubjectAddress::SubjectId {
+            return Ok(Some(format!("{identity_object_type}:{subject_id}")));
+        }
+        let tenant = tenant.to_string();
+        let region = self.region.clone();
+        let issue_key = subject_id.to_string();
+        let issue_id = self
+            .drive(self.provider.with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT id FROM issue \
+                          WHERE tenant_id = $1 AND region = $2 AND key = $3 \
+                            AND deleted_at IS NULL",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&issue_key)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|_| {
+                        myelin_storage::PgError::Query(
+                            "resolve trigger issue authorization object".into(),
+                        )
+                    })
+                })
+            }))?
+            .map_err(|_| "trigger issue lookup is unavailable".to_string())?;
+        Ok(issue_id.map(|id| format!("{identity_object_type}:{id}")))
     }
 }
 
@@ -136,24 +247,52 @@ impl TriggerOwnerVisibility for DurableOwnerVisibility {
         binding: &DurableAgentTriggerBinding,
         envelope: &EventEnvelope,
     ) -> Result<bool, String> {
-        let Some(run_key) = myelin_refs::object_key(&envelope.subject) else {
+        let Some(subject_key) = myelin_refs::object_key(&envelope.subject) else {
             return Ok(false);
         };
-        if run_key.tenant.as_deref() != Some(envelope.tenant.as_str())
-            || run_key.object_type.as_deref() != Some("run")
-        {
+        if subject_key.tenant.as_deref() != Some(envelope.tenant.as_str()) {
             return Ok(false);
         }
+        let Some(subject_type) = subject_key.object_type.as_deref() else {
+            return Ok(false);
+        };
+        let Some(rule) = trigger_visibility_rule(subject_type) else {
+            return Ok(false);
+        };
         let Some(owner) = self.owner(&envelope.tenant.0, &binding.owner_principal_id)? else {
             return Ok(false);
         };
         if owner.kind != PrincipalKind::Human || owner.status != PrincipalStatus::Active {
             return Ok(false);
         }
+        if let TriggerVisibilityRule::Direct {
+            subsystem,
+            identity_object_type,
+            permission,
+            address,
+        } = rule
+        {
+            if subject_key.subsystem.as_deref() != Some(subsystem) {
+                return Ok(false);
+            }
+            let Some(object) = self.direct_identity_object(
+                &envelope.tenant.0,
+                &subject_key.id,
+                identity_object_type,
+                address,
+            )?
+            else {
+                return Ok(false);
+            };
+            return Ok(self.identity_allows(&owner, permission, &object));
+        }
+        if subject_key.subsystem.as_deref() != Some("ci") {
+            return Ok(false);
+        }
         let Some(run) = self
             .drive(
                 self.runs
-                    .get_ci_run(&envelope.tenant.0, &envelope.region.0, &run_key.id),
+                    .get_ci_run(&envelope.tenant.0, &envelope.region.0, &subject_key.id),
             )?
             .map_err(|_| "trigger CI run lookup is unavailable".to_string())?
         else {
@@ -173,19 +312,60 @@ impl TriggerOwnerVisibility for DurableOwnerVisibility {
         {
             return Ok(false);
         }
+        Ok(self.identity_allows(&owner, "pull", &format!("repo:{}", repo_key.id)))
+    }
+}
+
+impl DurableOwnerVisibility {
+    fn identity_allows(&self, owner: &Principal, permission: &str, object: &str) -> bool {
         let at = Consistency {
             at_least: Zookie(String::new()),
             mode: ConsistencyMode::Strong,
         };
-        Ok(matches!(
+        matches!(
             self.identity.check(
-                &owner,
-                &Permission("pull".into()),
-                &ArtifactRef(format!("repo:{}", repo_key.id)),
+                owner,
+                &Permission(permission.into()),
+                &ArtifactRef(object.into()),
                 &at,
                 None,
             ),
             Ok(Decision::Allow)
-        ))
+        )
+    }
+}
+
+#[cfg(test)]
+mod visibility_rule_tests {
+    use super::*;
+
+    #[test]
+    fn event_artifact_types_translate_to_their_live_read_boundary() {
+        assert_eq!(
+            trigger_visibility_rule("issue"),
+            Some(TriggerVisibilityRule::Direct {
+                subsystem: "issue",
+                identity_object_type: "issue",
+                permission: "view",
+                address: TriggerSubjectAddress::IssueKey,
+            })
+        );
+        assert_eq!(
+            trigger_visibility_rule("row"),
+            Some(TriggerVisibilityRule::Direct {
+                subsystem: "knowledge",
+                identity_object_type: "database_row",
+                permission: "read",
+                address: TriggerSubjectAddress::SubjectId,
+            })
+        );
+        assert_eq!(
+            trigger_visibility_rule("run"),
+            Some(TriggerVisibilityRule::CiRunRepository)
+        );
+        assert_eq!(trigger_visibility_rule("deployment"), None);
+        assert!(myelin_events::AUTOMATION_SUBJECT_TYPE_TOKENS
+            .iter()
+            .all(|subject_type| trigger_visibility_rule(subject_type).is_some()));
     }
 }
