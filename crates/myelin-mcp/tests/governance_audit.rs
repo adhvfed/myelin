@@ -91,11 +91,11 @@ fn governance_audit_uses_minimized_tool_facts_never_trace_or_raw_reason() {
         } else {
             assert_eq!(
                 row.envelope.subject.0,
-                "myelin://acme/agent/run/run:audit/hitl-gate/hitl:gate-audit"
+                "myelin://acme/agent/run/run:audit:hitl-gate:6869746c3a676174652d6175646974"
             );
             assert_eq!(
                 row.envelope.payload["gate_ref"],
-                "myelin://acme/agent/run/run:audit/hitl-gate/hitl:gate-audit"
+                "myelin://acme/agent/run/run:audit:hitl-gate:6869746c3a676174652d6175646974"
             );
         }
         let payload = row.envelope.payload.to_string();
@@ -104,6 +104,13 @@ fn governance_audit_uses_minimized_tool_facts_never_trace_or_raw_reason() {
         assert!(!payload.contains("customer argument"));
         assert!(!payload.contains("psn:mcp-agent"));
     }
+    assert_eq!(
+        store.committed_rows()[1].envelope.payload["outcome"],
+        serde_json::json!({
+            "kind": "denied",
+            "reason_category": "effect_denied",
+        })
+    );
 }
 
 #[test]

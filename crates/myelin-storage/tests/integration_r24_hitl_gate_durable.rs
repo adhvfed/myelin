@@ -3,7 +3,8 @@
 use myelin_config::MyelinConfig;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RuntimeRef};
 use myelin_storage::hitl_gate_durable::{
-    hitl_gate_durable_migrations, GateDecideError, GateRecord, GateState, HitlVerdictStore,
+    hitl_gate_durable_migrations, DurableHitlGateBacking, GateDecideError, GateRecord, GateState,
+    HitlVerdictStore,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::{SubstrateProvider, TenantScope};
@@ -160,6 +161,74 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         !rec2.authorizes(effect2, &rec2.run_id, "agent:claude"),
         "a rejected gate never authorizes"
     );
+
+    let gate3 = format!("gate:{suffix}-async");
+    store1
+        .open(&scope, waiting(&suffix, &gate3, effect2))
+        .expect("third gate opens for the async HTTP-facing seam");
+    let durable = DurableHitlGateBacking::new(app.clone());
+    let first = durable
+        .decide(
+            &scope,
+            &gate3,
+            GateState::Approved,
+            "psn:lead",
+            PrincipalKind::Human,
+            200,
+        )
+        .await
+        .expect("the tenant transaction succeeds")
+        .expect("the eligible human decides the exact gate");
+    assert!(first.changed);
+    assert_eq!(first.record.state, GateState::Approved);
+
+    let replay = durable
+        .decide(
+            &scope,
+            &gate3,
+            GateState::Approved,
+            "psn:lead",
+            PrincipalKind::Human,
+            201,
+        )
+        .await
+        .expect("the replay transaction succeeds")
+        .expect("an exact decision replay is idempotent");
+    assert!(!replay.changed);
+    assert_eq!(replay.record.decided_at_unix, Some(200));
+    assert_eq!(
+        durable
+            .decide(
+                &scope,
+                &gate3,
+                GateState::Rejected,
+                "psn:lead",
+                PrincipalKind::Human,
+                202,
+            )
+            .await
+            .expect("the conflicting transaction itself succeeds"),
+        Err(GateDecideError::AlreadyDecided(GateState::Approved)),
+        "idempotency never turns a conflicting retry into a second verdict"
+    );
+
+    let gate4 = format!("gate:{suffix}-expiry");
+    let mut expiring = waiting(&suffix, &gate4, effect2);
+    expiring.expires_at_unix = 250;
+    store1.open(&scope, expiring).expect("expiring gate opens");
+    let expired = durable
+        .expire_if_due(&scope, &gate4, 250)
+        .await
+        .expect("the expiry transaction succeeds")
+        .expect("the exact due gate expires");
+    assert!(expired.changed);
+    assert_eq!(expired.record.state, GateState::Expired);
+    let expiry_replay = durable
+        .expire_if_due(&scope, &gate4, 251)
+        .await
+        .expect("the expiry replay transaction succeeds")
+        .expect("expiry is retry-idempotent");
+    assert!(!expiry_replay.changed);
 
     let _ = sqlx::query("DELETE FROM agent_hitl_gate WHERE tenant_id = $1 AND region = $2")
         .bind(&tenant)

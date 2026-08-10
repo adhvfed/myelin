@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use myelin_agent_host::{
-    AgentHost, AgentHostActivityExecutor, HostedAgentRunExecutor, HostedAgentWorkflowInput,
-    HostedModelFactory,
+    AgentHost, AgentHostActivityExecutor, HostedAgentActivityOutcome, HostedAgentRunExecutor,
+    HostedAgentWorkflowInput, HostedModelFactory,
 };
 use myelin_agent_model::{ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, Usage};
 use myelin_config::MyelinConfig;
@@ -204,9 +204,14 @@ async fn a_settled_agent_activity_replays_without_touching_the_model() {
     let expected = ArtifactRef(format!("myelin://{}/agent/run/{run_id}", tenant.0));
     assert_eq!(
         executor
-            .execute(&input, &format!("{run_id}/agent.run:1/act"), 1_786_352_400)
+            .execute(
+                &input,
+                &format!("{run_id}/agent.run:1/act"),
+                1,
+                1_786_352_400,
+            )
             .expect("the outer workflow can recover its lost activity result"),
-        expected
+        HostedAgentActivityOutcome::Completed(expected)
     );
     assert_eq!(
         models.calls.load(Ordering::SeqCst),
@@ -220,6 +225,7 @@ async fn a_settled_agent_activity_replays_without_touching_the_model() {
         .execute(
             &changed_budget,
             &format!("{run_id}/agent.run:1/act"),
+            1,
             1_786_352_400,
         )
         .expect_err("a replay cannot change its governed reservation")
@@ -366,9 +372,9 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
 
     assert_eq!(
         executor
-            .execute(&input, &activity_key, 1_786_352_400)
+            .execute(&input, &activity_key, 1, 1_786_352_400)
             .expect("governed input runs with attenuated Identity and durable accounting"),
-        expected
+        HostedAgentActivityOutcome::Completed(expected.clone())
     );
     let balance_after_run = host.wallet().balance(&tenant);
     assert!(balance_after_run < MicroUsd(1_000_000));
@@ -381,9 +387,9 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
 
     assert_eq!(
         executor
-            .execute(&input, &activity_key, 1_786_352_400)
+            .execute(&input, &activity_key, 1, 1_786_352_400)
             .expect("a lost outer workflow commit recovers the completed activity"),
-        expected
+        HostedAgentActivityOutcome::Completed(expected)
     );
     assert_eq!(host.wallet().balance(&tenant), balance_after_run);
     assert_eq!(clients.load(Ordering::SeqCst), 1);

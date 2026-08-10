@@ -541,22 +541,36 @@ export function AppShell(props: AppShellProps) {
                               <button
                                 type="button"
                                 class="button-primary"
-                                onClick={() => void inbox.decideAutomation(
-                                  action().automation_id,
-                                  action().event_id,
-                                  "approve",
-                                )}
+                                onClick={() => {
+                                  const approval = action();
+                                  if (approval.kind === "agent_effect_approval") {
+                                    void inbox.decideAgentEffect(approval.gate_id, "approve");
+                                  } else {
+                                    void inbox.decideAutomation(
+                                      approval.automation_id,
+                                      approval.event_id,
+                                      "approve",
+                                    );
+                                  }
+                                }}
                               >
-                                Approve automation
+                                Approve
                               </button>
                               <button
                                 type="button"
                                 class="button-secondary"
-                                onClick={() => void inbox.decideAutomation(
-                                  action().automation_id,
-                                  action().event_id,
-                                  "reject",
-                                )}
+                                onClick={() => {
+                                  const approval = action();
+                                  if (approval.kind === "agent_effect_approval") {
+                                    void inbox.decideAgentEffect(approval.gate_id, "reject");
+                                  } else {
+                                    void inbox.decideAutomation(
+                                      approval.automation_id,
+                                      approval.event_id,
+                                      "reject",
+                                    );
+                                  }
+                                }}
                               >
                                 Reject
                               </button>

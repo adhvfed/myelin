@@ -247,12 +247,9 @@ impl GitEffectApi {
                 if let Err(denied) = self.authorize_repo(repo, RepoPermission::ProtectedPush) {
                     return denied;
                 }
-                match self.backend.merge_with_operation(
-                    t,
-                    r,
-                    repo,
-                    number,
-                    &self.principal,
+                match self.backend.merge_for_actor_with_operation(
+                    RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
+                    &self.delegator,
                     operation_id,
                 ) {
                     Ok(MergeAttempt::Merged { base_ref, new_oid, .. }) => {

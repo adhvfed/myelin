@@ -2443,14 +2443,42 @@ impl DurableGitBackend {
         principal: &Principal,
         operation_id: &PrOperationId,
     ) -> Result<MergeAttempt, DurableError> {
+        self.merge_for_actor_with_operation(
+            RepoActorContext::new(tenant, region, slug, principal).for_pr(number),
+            principal,
+            operation_id,
+        )
+    }
+
+    /// Merges as `actor` while resolving source-repository visibility through an independently
+    /// validated authority principal. Agent callers must establish that delegation before this
+    /// seam; Git continues to attribute the mutation to the agent itself.
+    pub(crate) fn merge_for_actor_with_operation(
+        &self,
+        target: PrActorContext<'_>,
+        repo_reader: &Principal,
+        operation_id: &PrOperationId,
+    ) -> Result<MergeAttempt, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal: actor,
+        } = repo;
+        if actor.tenant != repo_reader.tenant || actor.region != repo_reader.region {
+            return Err(DurableError::Git(
+                "merge actor and repository authority belong to different scopes".into(),
+            ));
+        }
         let loc = Self::loc(tenant, region, slug);
         let repo = Arc::new(self.store.open_repo(&loc)?);
-        let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
+        let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, actor);
         if let Some(store) = &self.pg_prs {
-            let scope = Self::verified_pr_scope(principal, &loc)?;
+            let scope = Self::verified_pr_scope(actor, &loc)?;
             if let Some(intent) = store.pending_merge_intent(&scope, slug, number)? {
                 if intent.operation_id != operation_id.digest()
-                    || intent.actor_subject_id != principal.principal_id.0.trim()
+                    || intent.actor_subject_id != actor.principal_id.0.trim()
                 {
                     return Err(DurableError::Git(
                         "a different merge operation is already pending".into(),
@@ -2458,22 +2486,18 @@ impl DurableGitBackend {
                 }
                 return store
                     .recover_pending_merge_target(
-                        &scope, slug, number, principal, &loc, &repo, &ref_store,
+                        &scope, slug, number, actor, &loc, &repo, &ref_store,
                     )?
                     .ok_or_else(|| {
                         DurableError::Io("pending merge disappeared during recovery".into())
                     });
             }
             let rec = self
-                .pr_get(&loc, number, principal)?
+                .pr_get(&loc, number, actor)?
                 .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
-            let source_loc = Self::loc(
-                &principal.tenant.0,
-                &principal.region.0,
-                &rec.head_repo_slug,
-            );
+            let source_loc = Self::loc(&actor.tenant.0, &actor.region.0, &rec.head_repo_slug);
             if !self.repo_authz.authorize_repo_permission(
-                principal,
+                repo_reader,
                 &source_loc,
                 RepoPermission::Pull,
             ) {
@@ -2487,13 +2511,13 @@ impl DurableGitBackend {
                 slug,
                 number,
                 operation_id,
-                principal,
+                actor,
                 &self.prs,
                 &loc,
                 &repo,
                 &source_repo,
                 &ref_store,
-                &Self::pseudonym(tenant, principal),
+                &Self::pseudonym(tenant, actor),
                 self.checks.is_some(),
             );
         }
@@ -2503,7 +2527,7 @@ impl DurableGitBackend {
             number,
             &ref_store,
             &repo,
-            &Self::pseudonym(tenant, principal),
+            &Self::pseudonym(tenant, actor),
         )
     }
 

@@ -9,6 +9,14 @@ export interface AutomationApprovalAction {
   event_id: string;
 }
 
+export interface AgentEffectApprovalAction {
+  kind: "agent_effect_approval";
+  gate_id: string;
+  run_id: string;
+}
+
+export type InboxAction = AutomationApprovalAction | AgentEffectApprovalAction;
+
 export interface InboxItem {
   id: string;
   reason: string;
@@ -21,7 +29,7 @@ export interface InboxItem {
   snooze_until: string | null;
   occurred_at: string;
   priority: 15 | 35 | 55 | 70 | 90;
-  action: AutomationApprovalAction | null;
+  action: InboxAction | null;
 }
 
 export interface InboxPage {
@@ -71,14 +79,19 @@ function item(value: unknown): InboxItem | null {
     "state", "snooze_until", "occurred_at", "priority", "action",
   ])) return null;
   const action = row.action === null ? null : record(row.action);
-  if (action !== null &&
-      (!exact(action, ["kind", "automation_id", "event_id"]) ||
-       action.kind !== "automation_firing_approval" ||
-       !boundedText(action.automation_id, 36) ||
-       !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
-         action.automation_id,
-       ) ||
-       !boundedText(action.event_id, 255))) return null;
+  if (action !== null) {
+    const automation = action.kind === "automation_firing_approval" &&
+      exact(action, ["kind", "automation_id", "event_id"]) &&
+      boundedText(action.automation_id, 36) &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(
+        action.automation_id,
+      ) && boundedText(action.event_id, 255);
+    const agentEffect = action.kind === "agent_effect_approval" &&
+      exact(action, ["kind", "gate_id", "run_id"]) &&
+      boundedText(action.gate_id, 37) && /^gate:[0-9a-f]{32}$/.test(action.gate_id) &&
+      boundedText(action.run_id, 255) && !action.run_id.includes("/");
+    if (!automation && !agentEffect) return null;
+  }
   if (!boundedText(row.id, 512) || !REASONS.has(row.reason as string) ||
       !CLASSES.has(row.class as string) || !SUBSYSTEMS.has(row.subsystem as string) ||
       !boundedText(row.subject, 512) || !row.subject.startsWith("myelin://") ||

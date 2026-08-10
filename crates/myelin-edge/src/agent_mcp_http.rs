@@ -2,7 +2,11 @@ use std::future::Future;
 use std::sync::Arc;
 
 use chrono::Utc;
-use myelin_events::{OutboxStore, UlidMinter};
+use myelin_agent_service::hosted_run_contract::{
+    hosted_agent_decision_ref, HostedAgentDecision, HOSTED_AGENT_APPROVAL_SIGNAL,
+};
+use myelin_events::{IdMinter, OutboxStore, Timestamp, Ulid, UlidMinter};
+use myelin_flow::{DurableExecutor, PgFlowExecutor, RunId as FlowRunId, SignalSpec};
 use myelin_git::core::RepoLoc;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PrincipalStatus, RunId, RunToken};
 use myelin_identity_service::mint::{RunTokenAuthorizer, RunTokenMinter};
@@ -11,11 +15,17 @@ use myelin_identity_service::{
     PrincipalStore, EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME,
 };
 use myelin_mcp::{
-    GateApproverPolicy, GovernedRouter, GovernedRun, McpServer, OutboxGovernanceAudit,
+    git_merge_repo_from_effect_key, AuditPhase, GateApproverPolicy, GovernanceAudit,
+    GovernanceAuditRecord, GovernedRouter, GovernedRun, McpServer, OutboxGovernanceAudit,
     ToolRegistry, MAX_FRAME_BYTES,
 };
-use myelin_storage::hitl_gate_durable::HitlVerdictStore;
+use myelin_notif::pg_inbox::{InboxReadScope, PgInboxStore};
+use myelin_notif::{agent_effect_approval_item_id, pending_agent_effect_approval};
+use myelin_storage::hitl_gate_durable::{
+    DurableHitlGateBacking, GateDecideError, GateDecisionOutcome, GateState, HitlVerdictStore,
+};
 use myelin_storage::{DurableAgentTriggerBacking, PgOutboxBacking, SubstrateProvider};
+use serde_json::json;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::catalogue::{Handler, HandlerCtx, Method};
@@ -94,7 +104,10 @@ pub struct AgentMcpServices {
     authority: AgentMcpAuthority,
     provider: SubstrateProvider,
     resources: AgentMcpResources,
+    outbox: OutboxStore,
     audit: Arc<OutboxGovernanceAudit>,
+    gates: DurableHitlGateBacking,
+    inbox: PgInboxStore,
     runtime: Handle,
 }
 
@@ -105,17 +118,21 @@ impl AgentMcpServices {
         resources: AgentMcpResources,
         runtime: Handle,
     ) -> Self {
+        let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
+            provider.db_pool().clone(),
+            runtime.clone(),
+        )));
         let audit = Arc::new(OutboxGovernanceAudit::new(
-            OutboxStore::durable(Arc::new(PgOutboxBacking::new(
-                provider.db_pool().clone(),
-                runtime.clone(),
-            ))),
+            outbox.clone(),
             Arc::new(UlidMinter::new()),
         ));
         Self {
             authority,
+            gates: DurableHitlGateBacking::new(provider.clone()),
+            inbox: PgInboxStore::new(provider.db_pool().clone()),
             provider,
             resources,
+            outbox,
             audit,
             runtime,
         }
@@ -137,10 +154,251 @@ impl AgentMcpServices {
             Err(_) => Ok(self.runtime.block_on(future)),
         }
     }
+
+    fn project_gate(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        gate_id: &str,
+    ) -> Result<(), EdgeError> {
+        let gate = self
+            .drive(self.gates.fetch(scope, gate_id))?
+            .map_err(|_| EdgeError::Unavailable("agent approval lookup is unavailable".into()))?
+            .ok_or_else(|| EdgeError::Unavailable("agent approval gate disappeared".into()))?;
+        if gate.state != GateState::Waiting {
+            return Ok(());
+        }
+        for recipient in &gate.approver_filter {
+            let item =
+                pending_agent_effect_approval(scope.tenant(), scope.region(), recipient, &gate);
+            self.drive(self.inbox.ensure(&item))?.map_err(|_| {
+                EdgeError::Unavailable("agent approval inbox is unavailable".into())
+            })?;
+        }
+        Ok(())
+    }
+
+    fn decide_gate(
+        &self,
+        ctx: &HandlerCtx<'_>,
+        gate_id: &str,
+        decision: HostedAgentDecision,
+    ) -> Result<GateDecisionOutcome, EdgeError> {
+        let state = match decision {
+            HostedAgentDecision::Approved => GateState::Approved,
+            HostedAgentDecision::Rejected => GateState::Rejected,
+            HostedAgentDecision::Expired => {
+                return Err(EdgeError::BadRequest(
+                    "humans may approve or reject an agent effect".into(),
+                ))
+            }
+        };
+        let decided_at_unix = Utc::now().timestamp();
+        let outcome = self
+            .drive(self.gates.decide(
+                ctx.scope,
+                gate_id,
+                state,
+                &ctx.principal.principal_id.0,
+                ctx.principal.kind.clone(),
+                decided_at_unix,
+            ))?
+            .map_err(|_| EdgeError::Unavailable("agent approval decision is unavailable".into()))?
+            .map_err(map_gate_decision_error)?;
+        self.audit_gate_decision(ctx, &outcome.record, decision)?;
+        self.wake_hosted_run(ctx, &outcome.record, decision)?;
+        let item_id = agent_effect_approval_item_id(
+            &ctx.principal.tenant,
+            &ctx.principal.principal_id.0,
+            gate_id,
+        );
+        self.drive(self.inbox.complete_if_present(
+            &InboxReadScope {
+                tenant: ctx.principal.tenant.clone(),
+                region: ctx.principal.region.clone(),
+                recipient: ctx.principal.principal_id.0.clone(),
+            },
+            &item_id,
+        ))?
+        .map_err(|_| EdgeError::Unavailable("agent approval inbox is unavailable".into()))?;
+        Ok(outcome)
+    }
+
+    fn audit_gate_decision(
+        &self,
+        ctx: &HandlerCtx<'_>,
+        gate: &myelin_storage::hitl_gate_durable::GateRecord,
+        decision: HostedAgentDecision,
+    ) -> Result<(), EdgeError> {
+        let tool = if git_merge_repo_from_effect_key(&gate.effect_id).is_some() {
+            "git.merge"
+        } else {
+            return Err(EdgeError::Conflict(
+                "agent approval has no registered governance audit taxonomy".into(),
+            ));
+        };
+        let phase = match decision {
+            HostedAgentDecision::Approved => AuditPhase::Approved,
+            HostedAgentDecision::Rejected => AuditPhase::Rejected,
+            HostedAgentDecision::Expired => AuditPhase::Expired,
+        };
+        let timestamp = chrono::DateTime::from_timestamp(
+            gate.decided_at_unix.unwrap_or(gate.expires_at_unix),
+            0,
+        )
+        .ok_or_else(|| EdgeError::Internal("agent approval timestamp is invalid".into()))?
+        .to_rfc3339();
+        let audit = OutboxGovernanceAudit::new(
+            self.outbox.clone(),
+            Arc::new(GateDecisionMinter::new(
+                ctx.scope.tenant().as_str(),
+                &gate.gate_id,
+                decision,
+            )),
+        );
+        audit
+            .record(GovernanceAuditRecord {
+                scope: ctx.scope,
+                actor: ctx.principal,
+                run_id: &RunId(gate.run_id.clone()),
+                gate_id: Some(&gate.gate_id),
+                tool,
+                jti: &format!("human-decision:{}", gate.gate_id),
+                phase,
+                outcome: None,
+                now: &Timestamp(timestamp),
+            })
+            .map_err(|_| EdgeError::Unavailable("agent approval audit is unavailable".into()))
+    }
+
+    fn wake_hosted_run(
+        &self,
+        ctx: &HandlerCtx<'_>,
+        gate: &myelin_storage::hitl_gate_durable::GateRecord,
+        decision: HostedAgentDecision,
+    ) -> Result<(), EdgeError> {
+        let hosted = self
+            .drive(
+                self.authority
+                    .hosted_runs
+                    .started_for_run(&ctx.principal.tenant.0, &gate.run_id),
+            )?
+            .map_err(|_| EdgeError::Unavailable("hosted agent run lookup is unavailable".into()))?;
+        if hosted.is_none() {
+            return Ok(());
+        }
+        PgFlowExecutor::new(
+            self.provider.db_pool().clone(),
+            self.runtime.clone(),
+            Arc::new(UlidMinter::new()),
+            ctx.principal.tenant.clone(),
+            ctx.principal.region.clone(),
+        )
+        .signal(SignalSpec {
+            run: FlowRunId(gate.run_id.clone()),
+            signal_name: HOSTED_AGENT_APPROVAL_SIGNAL.into(),
+            idem_key: gate.gate_id.clone(),
+            payload: vec![hosted_agent_decision_ref(
+                &ctx.principal.tenant,
+                &gate.run_id,
+                &gate.gate_id,
+                decision,
+            )],
+            payload_key_ref: None,
+        })
+        .map(|_| ())
+        .map_err(|error| {
+            eprintln!(
+                "edge: failed to wake hosted agent run {} after gate {}: {error}",
+                gate.run_id, gate.gate_id
+            );
+            EdgeError::Unavailable("hosted agent approval wake is unavailable".into())
+        })
+    }
+}
+
+struct GateDecisionMinter(Ulid);
+
+impl GateDecisionMinter {
+    fn new(tenant: &str, gate_id: &str, decision: HostedAgentDecision) -> Self {
+        let digest = blake3::hash(format!("{tenant}\0{gate_id}\0{}", decision.as_str()).as_bytes());
+        Self(Ulid(digest.to_hex().as_str()[..26].to_ascii_uppercase()))
+    }
+}
+
+impl IdMinter for GateDecisionMinter {
+    fn mint(&self) -> Ulid {
+        self.0.clone()
+    }
 }
 
 struct AgentMcpHandler {
     services: AgentMcpServices,
+}
+
+struct AgentApprovalDecisionHandler {
+    services: AgentMcpServices,
+}
+
+impl Handler for AgentApprovalDecisionHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if ctx.principal.kind != PrincipalKind::Human
+            || ctx.principal.status != PrincipalStatus::Active
+        {
+            return Err(EdgeError::Forbidden(
+                "agent effects require an active human approver".into(),
+            ));
+        }
+        let gate_id = ctx
+            .params
+            .get("gate")
+            .map(String::as_str)
+            .filter(|gate_id| {
+                !gate_id.is_empty()
+                    && gate_id.len() <= 256
+                    && gate_id.bytes().all(|byte| byte.is_ascii_graphic())
+                    && !gate_id.contains('/')
+            })
+            .ok_or_else(|| EdgeError::BadRequest("invalid agent approval gate ID".into()))?;
+        let _request_key = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        if ctx.request.body.len() > 256 {
+            return Err(EdgeError::PayloadTooLarge(
+                "agent approval decision body exceeds 256 bytes".into(),
+            ));
+        }
+        let body: serde_json::Value =
+            serde_json::from_slice(&ctx.request.body).map_err(|error| {
+                EdgeError::BadRequest(format!("invalid agent approval body: {error}"))
+            })?;
+        let object = body.as_object().ok_or_else(|| {
+            EdgeError::BadRequest("agent approval body must be a JSON object".into())
+        })?;
+        if object.len() != 1 {
+            return Err(EdgeError::BadRequest(
+                "agent approval body accepts only `decision`".into(),
+            ));
+        }
+        let decision = match object.get("decision").and_then(serde_json::Value::as_str) {
+            Some("approve") => HostedAgentDecision::Approved,
+            Some("reject") => HostedAgentDecision::Rejected,
+            _ => {
+                return Err(EdgeError::BadRequest(
+                    "agent approval decision must be `approve` or `reject`".into(),
+                ))
+            }
+        };
+        let outcome = self.services.decide_gate(ctx, gate_id, decision)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "gate_id": outcome.record.gate_id,
+                "run_id": outcome.record.run_id,
+                "state": outcome.record.state.as_str(),
+                "changed": outcome.changed,
+            }),
+        )))
+    }
 }
 
 impl Handler for AgentMcpHandler {
@@ -267,12 +525,17 @@ impl Handler for AgentMcpHandler {
         }
 
         match response {
-            Some(response) => Ok(no_store(EdgeResponse::Bytes {
-                status: 200,
-                content_type: "application/json".into(),
-                headers: Vec::new(),
-                body: response.into_bytes(),
-            })),
+            Some(response) => {
+                if let Some(gate_id) = response_gate_id(&response) {
+                    self.services.project_gate(ctx.scope, &gate_id)?;
+                }
+                Ok(no_store(EdgeResponse::Bytes {
+                    status: 200,
+                    content_type: "application/json".into(),
+                    headers: Vec::new(),
+                    body: response.into_bytes(),
+                }))
+            }
             None => Ok(no_store(EdgeResponse::Bytes {
                 status: 204,
                 content_type: "application/json".into(),
@@ -281,6 +544,16 @@ impl Handler for AgentMcpHandler {
             })),
         }
     }
+}
+
+fn response_gate_id(response: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(response)
+        .ok()?
+        .get("result")?
+        .get("_meta")?
+        .get("gateId")?
+        .as_str()
+        .map(str::to_string)
 }
 
 enum AuthorizedAgentRun {
@@ -395,12 +668,21 @@ fn active_delegator(
 }
 
 pub fn register_agent_mcp(builder: GatewayBuilder, services: AgentMcpServices) -> GatewayBuilder {
-    builder.route(
-        Method::Post,
-        "/v1/agent-runs/{run}/mcp",
-        "identity.agent.run.mcp",
-        Arc::new(AgentMcpHandler { services }),
-    )
+    builder
+        .route(
+            Method::Post,
+            "/v1/agent-runs/{run}/mcp",
+            "identity.agent.run.mcp",
+            Arc::new(AgentMcpHandler {
+                services: services.clone(),
+            }),
+        )
+        .route(
+            Method::Post,
+            "/v1/agent-approvals/{gate}/decision",
+            "identity.agent.approval.decide",
+            Arc::new(AgentApprovalDecisionHandler { services }),
+        )
 }
 
 struct CreatorApproverPolicy {
@@ -524,6 +806,23 @@ fn map_session_error(error: AgentSessionError) -> EdgeError {
         AgentSessionError::Policy(_) => EdgeError::Forbidden("agent run was refused".into()),
         AgentSessionError::Expired => EdgeError::Conflict("agent run has expired".into()),
         AgentSessionError::Storage(message) => EdgeError::Internal(message),
+    }
+}
+
+fn map_gate_decision_error(error: GateDecideError) -> EdgeError {
+    match error {
+        GateDecideError::NotFound => EdgeError::NotFound("agent approval not found".into()),
+        GateDecideError::SelfApproval
+        | GateDecideError::NotEligible
+        | GateDecideError::MachineApproverRefused => {
+            EdgeError::Forbidden("principal is not eligible to decide this agent effect".into())
+        }
+        GateDecideError::ApprovalWindowExpired => {
+            EdgeError::Conflict("agent approval window has expired".into())
+        }
+        GateDecideError::AlreadyDecided(state) => {
+            EdgeError::Conflict(format!("agent approval is already {}", state.as_str()))
+        }
     }
 }
 

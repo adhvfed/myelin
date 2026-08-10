@@ -38,6 +38,19 @@ describe("notification inbox response", () => {
     })?.items[0]?.action).toEqual(action);
   });
 
+  it("accepts one exact agent effect approval action", () => {
+    const action = {
+      kind: "agent_effect_approval",
+      gate_id: "gate:0123456789abcdef0123456789abcdef",
+      run_id: "run-7",
+    };
+    const parsed = parseInboxPage({
+      ...valid,
+      items: [{ ...valid.items[0], reason: "approval_requested", action }],
+    });
+    expect(parsed?.items[0]?.action).toEqual(action);
+  });
+
   it.each([
     { ...valid, extra: true },
     { ...valid, page: { next_cursor: "opaque", limit: 50 } },

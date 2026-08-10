@@ -522,6 +522,15 @@ fn safe_cli_event_id(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
+fn safe_cli_gate_id(value: &str) -> bool {
+    value.strip_prefix("gate:").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
 fn is_issue(value: &Value) -> bool {
     value.get("id").and_then(Value::as_str).is_some()
         && value.get("key").and_then(Value::as_str).is_some()
@@ -558,6 +567,16 @@ fn render_notification(value: &Value) -> String {
         .unwrap_or_default();
     let mut rendered = format!("{marker} {reason}{count}  {subject}  ({id})");
     if let Some(action) = value.get("action").and_then(Value::as_object) {
+        let gate_id = action.get("gate_id").and_then(Value::as_str);
+        if action.get("kind").and_then(Value::as_str) == Some("agent_effect_approval")
+            && gate_id.is_some_and(safe_cli_gate_id)
+        {
+            rendered.push_str(&format!(
+                "\n  decide: myelin agent approve {}  (or: reject)",
+                gate_id.unwrap(),
+            ));
+            return rendered;
+        }
         let automation_id = action.get("automation_id").and_then(Value::as_str);
         let event_id = action.get("event_id").and_then(Value::as_str);
         if action.get("kind").and_then(Value::as_str) == Some("automation_firing_approval")
@@ -812,6 +831,23 @@ mod tests {
             },
         });
         assert!(!render(&unsafe_item, false).contains("decide:"));
+    }
+
+    #[test]
+    fn agent_effect_approval_notification_carries_a_copyable_safe_decision() {
+        let item = json!({
+            "id": "agent-approval-1",
+            "reason": "approval_requested",
+            "subject": "myelin://acme/git/pr/acme/web:42",
+            "state": "unread",
+            "action": {
+                "kind": "agent_effect_approval",
+                "gate_id": "gate:0123456789abcdef0123456789abcdef",
+                "run_id": "run-7",
+            },
+        });
+        assert!(render(&item, false)
+            .contains("myelin agent approve gate:0123456789abcdef0123456789abcdef"));
     }
 
     #[test]

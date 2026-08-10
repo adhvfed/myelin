@@ -804,6 +804,38 @@ export const decideAutomationApproval = action(async (input: AutomationApprovalI
   }
 }, "notif-automation-approval");
 
+export interface AgentEffectApprovalInput {
+  gateId: string;
+  decision: AutomationApprovalDecision;
+}
+
+/** Decide one exact agent-proposed effect surfaced by the shared inbox. */
+export const decideAgentEffectApproval = action(async (input: AgentEffectApprovalInput) => {
+  "use server";
+  const result = (value: { ok: boolean }) => json(value, { revalidate: [] });
+  if (!input || !/^gate:[0-9a-f]{32}$/.test(input.gateId) ||
+      (input.decision !== "approve" && input.decision !== "reject")) {
+    return result({ ok: false });
+  }
+  try {
+    return await inboxAuthed(async () => {
+      const response = await edgePost(
+        `/v1/agent-approvals/${seg(input.gateId)}/decision`,
+        { decision: input.decision },
+        { idempotencyKey: crypto.randomUUID() },
+      );
+      const receipt = response !== null && typeof response === "object" &&
+        !Array.isArray(response) ? response as Record<string, unknown> : null;
+      return result({ ok: receipt?.gate_id === input.gateId });
+    });
+  } catch (error) {
+    if (error instanceof GatewayError && (error.status === 404 || error.status === 409)) {
+      return result({ ok: false });
+    }
+    throw error;
+  }
+}, "notif-agent-effect-approval");
+
 /** A single repo's home (GET /v1/git/repos/{repo}) → the RepoHome ViewModel. */
 export const getRepo = query(async (repo: string): Promise<RepoHomeVM> => {
   "use server";

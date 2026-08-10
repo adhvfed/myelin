@@ -7,14 +7,15 @@ use myelin_substrate::{
 use myelin_tenancy::TenantId;
 use serde::{Deserialize, Serialize};
 
+mod agent_approval;
 pub mod automation_approval;
 pub mod cli;
 pub mod cross_cell;
 pub mod define_rule;
 pub mod delivery;
-pub mod eu_provider;
-pub mod escalation;
 pub mod erasure_residual;
+pub mod escalation;
+pub mod eu_provider;
 pub mod holder;
 pub mod humanise;
 pub mod list_inbox;
@@ -22,17 +23,21 @@ pub mod migrations;
 pub mod pg_inbox;
 pub mod prefs;
 pub mod ranking;
-pub mod reindex;
 pub mod read_fanout;
 pub mod read_state;
+pub mod reindex;
 pub mod router;
 pub mod schema;
 pub mod snooze_resurface;
 pub mod storm_control;
 pub mod surge;
-pub mod write_fanout;
 pub mod watch;
+pub mod write_fanout;
 
+pub use agent_approval::{
+    agent_effect_approval_action, agent_effect_approval_item_id, pending_agent_effect_approval,
+    AgentEffectApprovalAction,
+};
 pub use automation_approval::{
     automation_approval_action, automation_approval_item_id, pending_automation_approval,
     AutomationApprovalAction,

@@ -15,7 +15,7 @@ use myelin_identity_service::delegation_policy::ResolvedDelegationPolicy;
 use myelin_identity_service::machine_auth::MachineKind;
 use myelin_identity_service::mint::RunTokenMinter;
 use myelin_storage::hitl_gate_durable::{
-    opaque_gate_id, GateDecideError, GateRecord, GateState, HitlVerdictStore,
+    gate_ref_token, opaque_gate_id, GateDecideError, GateRecord, GateState, HitlVerdictStore,
     DEFAULT_HITL_GATE_TTL_SECS,
 };
 use myelin_storage::{ContentHash, TenantScope};
@@ -184,7 +184,8 @@ impl GovernanceAudit for OutboxGovernanceAudit {
         } = record;
         let event_type = audit_event_type(tool, phase, outcome)?;
         let run_ref = format!("myelin://{}/agent/run/{}", scope.tenant().0, run_id.0);
-        let gate_ref = gate_id.map(|gate_id| format!("{run_ref}/hitl-gate/{gate_id}"));
+        let gate_ref =
+            gate_id.map(|gate_id| format!("{run_ref}:hitl-gate:{}", gate_ref_token(gate_id)));
         let subject_ref = gate_ref.clone().unwrap_or_else(|| run_ref.clone());
         let mut payload = serde_json::json!({
             "run_ref": run_ref,
@@ -192,6 +193,27 @@ impl GovernanceAudit for OutboxGovernanceAudit {
         });
         if let Some(gate_ref) = gate_ref {
             payload["gate_ref"] = serde_json::Value::String(gate_ref);
+        }
+        if let Some(outcome) = outcome {
+            payload["outcome"] = match outcome {
+                CallOutcome::Applied {
+                    event_id, resource, ..
+                } => serde_json::json!({
+                    "kind": "applied",
+                    "event_id": event_id,
+                    "resource_ref": resource.as_ref().map(|resource| &resource.artifact_ref.0),
+                }),
+                CallOutcome::Gated { gate_id, .. } => {
+                    serde_json::json!({ "kind": "gated", "gate_id": gate_id })
+                }
+                CallOutcome::Denied { reason, .. } => serde_json::json!({
+                    "kind": "denied",
+                    "reason_category": denial_reason_category(reason),
+                }),
+                CallOutcome::Indeterminate { .. } => {
+                    serde_json::json!({ "kind": "indeterminate" })
+                }
+            };
         }
         let mut tx = self.outbox.begin(
             self.minter.clone(),
@@ -219,7 +241,35 @@ impl GovernanceAudit for OutboxGovernanceAudit {
             None,
         )
         .map_err(|error| error.0)?;
-        tx.commit().map_err(|error| error.0)
+        tx.commit_absorb().map_err(|error| error.0)
+    }
+}
+
+fn denial_reason_category(reason: &str) -> &'static str {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("not found") || reason.contains("unknown") {
+        "not_found"
+    } else if reason.contains("permission")
+        || reason.contains("authoriz")
+        || reason.contains("capab")
+        || reason.contains("delegat")
+        || reason.contains("credential")
+        || reason.contains("revoked")
+    {
+        "authorization"
+    } else if reason.contains("budget") || reason.contains("cost") {
+        "budget"
+    } else if reason.contains("invalid")
+        || reason.contains("malformed")
+        || reason.contains("missing")
+        || reason.contains("required")
+        || reason.contains("schema")
+    {
+        "invalid_request"
+    } else if reason.contains("conflict") || reason.contains("blocked") {
+        "conflict"
+    } else {
+        "effect_denied"
     }
 }
 
@@ -632,8 +682,9 @@ impl GovernedRouter {
                             return self.push_local_audit(
                                 tool.name(),
                                 CallOutcome::Denied {
-                                    reason: "durable pre-gate audit is unavailable; effect withheld"
-                                        .into(),
+                                    reason:
+                                        "durable pre-gate audit is unavailable; effect withheld"
+                                            .into(),
                                     jti,
                                 },
                             );
@@ -815,15 +866,17 @@ impl GovernedRouter {
             return Ok((existing.gate_id, false));
         }
         let gate_id = opaque_gate_id();
+        let card_ref = approval_card_ref(&self.principal.scope, tool, args);
+        let risk_summary = approval_risk_summary(tool, args);
         let record = GateRecord {
             gate_id: gate_id.clone(),
             run_id: self.principal.run_id.0.clone(),
             effect_id: effect_key.to_string(),
-            risk_summary: Vec::new(),
+            risk_summary,
             cost_estimate: 0,
             approver_filter: approvers,
             state: GateState::Waiting,
-            card_ref: None,
+            card_ref,
             requested_by,
             decided_by: None,
             opened_at_unix,
@@ -963,6 +1016,33 @@ impl GovernedRouter {
             outcome: outcome.clone(),
         });
         outcome
+    }
+}
+
+fn approval_card_ref(scope: &TenantScope, tool: &str, args: &serde_json::Value) -> Option<String> {
+    match tool {
+        "git.merge" => Some(format!(
+            "myelin://{}/git/pr/{}:{}",
+            scope.tenant().0,
+            args.get("repo")?.as_str()?,
+            args.get("number")?.as_u64()?,
+        )),
+        _ => None,
+    }
+}
+
+fn approval_risk_summary(tool: &str, args: &serde_json::Value) -> Vec<u8> {
+    match tool {
+        "git.merge" => match (
+            args.get("repo").and_then(serde_json::Value::as_str),
+            args.get("number").and_then(serde_json::Value::as_u64),
+        ) {
+            (Some(repo), Some(number)) => {
+                format!("Merge pull request {repo}#{number}").into_bytes()
+            }
+            _ => b"Merge a pull request".to_vec(),
+        },
+        _ => format!("Apply governed tool {tool}").into_bytes(),
     }
 }
 

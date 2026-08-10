@@ -267,6 +267,7 @@ pub enum MintError {
     InvalidDelegationSnapshot(i64),
     UnsupportedRunKind(MachineKind),
     ResolvedPolicyBindingMismatch,
+    InvalidMintAttempt,
 }
 
 impl core::fmt::Display for MintError {
@@ -293,6 +294,9 @@ impl core::fmt::Display for MintError {
             ),
             MintError::ResolvedPolicyBindingMismatch => f.write_str(
                 "resolved delegation policy does not match the requested run/principal/scope binding - refused",
+            ),
+            MintError::InvalidMintAttempt => f.write_str(
+                "run-token mint attempt must be a non-empty bounded printable token - refused",
             ),
         }
     }
@@ -522,6 +526,7 @@ impl RunTokenMinter {
             ttl,
             now,
             None,
+            None,
         )
     }
 
@@ -538,6 +543,76 @@ impl RunTokenMinter {
         kind: MachineKind,
         ttl: &FailStaticBound,
         now: &Timestamp,
+    ) -> Result<RunToken, MintError> {
+        self.mint_from_resolved_policy_at_attempt(
+            scope,
+            agent_id,
+            run_id,
+            agent,
+            trigger_actor,
+            resolved,
+            delegation_caveats,
+            kind,
+            ttl,
+            now,
+            None,
+        )
+    }
+
+    /// Mints a credential for one deterministic workflow activity attempt.
+    ///
+    /// The attempt token changes credential identity, never authority. It prevents a credential
+    /// torn down after a park or failure from being reissued to a later activity attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mint_from_resolved_policy_for_attempt(
+        &self,
+        scope: &TenantScope,
+        agent_id: &PrincipalId,
+        run_id: &RunId,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        resolved: &ResolvedDelegationPolicy,
+        delegation_caveats: &DelegationCaveats,
+        kind: MachineKind,
+        ttl: &FailStaticBound,
+        now: &Timestamp,
+        mint_attempt: &str,
+    ) -> Result<RunToken, MintError> {
+        if mint_attempt.is_empty()
+            || mint_attempt.len() > 512
+            || !mint_attempt.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(MintError::InvalidMintAttempt);
+        }
+        self.mint_from_resolved_policy_at_attempt(
+            scope,
+            agent_id,
+            run_id,
+            agent,
+            trigger_actor,
+            resolved,
+            delegation_caveats,
+            kind,
+            ttl,
+            now,
+            Some(mint_attempt),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn mint_from_resolved_policy_at_attempt(
+        &self,
+        scope: &TenantScope,
+        agent_id: &PrincipalId,
+        run_id: &RunId,
+        agent: &Principal,
+        trigger_actor: &Principal,
+        resolved: &ResolvedDelegationPolicy,
+        delegation_caveats: &DelegationCaveats,
+        kind: MachineKind,
+        ttl: &FailStaticBound,
+        now: &Timestamp,
+        mint_attempt: Option<&str>,
     ) -> Result<RunToken, MintError> {
         let snapshot = resolved.cursor.snapshot;
         if snapshot <= 0 {
@@ -570,6 +645,7 @@ impl RunTokenMinter {
             ttl,
             now,
             Some(snapshot),
+            mint_attempt,
         )?;
         Ok(token)
     }
@@ -588,6 +664,7 @@ impl RunTokenMinter {
         ttl: &FailStaticBound,
         now: &Timestamp,
         delegation_snapshot: Option<i64>,
+        mint_attempt: Option<&str>,
     ) -> Result<(RunToken, IntersectionProof), MintError> {
         if ttl.static_max_secs == 0 {
             return Err(MintError::NonPositiveTtl);
@@ -606,7 +683,10 @@ impl RunTokenMinter {
             }
         }
 
-        let jti = run_token_jti(agent_id, run_id, now);
+        let jti = mint_attempt.map_or_else(
+            || run_token_jti(agent_id, run_id, now),
+            |attempt| run_token_attempt_jti(agent_id, run_id, now, attempt),
+        );
 
         let expires_at = expires_at_of(now, ttl);
 
@@ -718,6 +798,21 @@ impl RunTokenMinter {
 
 pub fn run_token_jti(agent_id: &PrincipalId, run_id: &RunId, mint_instant: &Timestamp) -> String {
     format!("runtok:{}:{}:{}", agent_id.0, run_id.0, mint_instant.0)
+}
+
+pub fn run_token_attempt_jti(
+    agent_id: &PrincipalId,
+    run_id: &RunId,
+    mint_instant: &Timestamp,
+    mint_attempt: &str,
+) -> String {
+    format!(
+        "runtok:{}:{}:{}:attempt:{}",
+        agent_id.0,
+        run_id.0,
+        mint_instant.0,
+        blake3::hash(mint_attempt.as_bytes()).to_hex()
+    )
 }
 
 pub fn expires_at_of(now: &Timestamp, ttl: &FailStaticBound) -> Timestamp {
@@ -892,6 +987,27 @@ mod tests {
 
     fn ts(s: &str) -> Timestamp {
         Timestamp(s.into())
+    }
+
+    #[test]
+    fn workflow_attempts_have_stable_but_distinct_run_token_identities() {
+        let agent = PrincipalId("agent:reviewer".into());
+        let run = RunId("run-7".into());
+        let now = ts("2026-08-10T09:37:00Z");
+        let first = run_token_attempt_jti(&agent, &run, &now, "run-7/agent.run:1/act/1");
+
+        assert_eq!(
+            first,
+            run_token_attempt_jti(&agent, &run, &now, "run-7/agent.run:1/act/1")
+        );
+        assert_ne!(
+            first,
+            run_token_attempt_jti(&agent, &run, &now, "run-7/agent.run:3/act/1")
+        );
+        assert_ne!(
+            first,
+            run_token_attempt_jti(&agent, &run, &now, "run-7/agent.run:1/act/2")
+        );
     }
 
     fn ttl(secs: u64) -> FailStaticBound {

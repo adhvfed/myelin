@@ -3,17 +3,20 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use myelin_agent_service::hosted_run_contract::{
-    agent_run_definition_hash, AGENT_RUN_WORKFLOW, AGENT_RUN_WORKFLOW_VERSION,
+    agent_run_definition_hash, gate_ref_token, hosted_agent_decision_ref,
+    legacy_agent_run_definition_hash, HostedAgentDecision, AGENT_RUN_WORKFLOW,
+    AGENT_RUN_WORKFLOW_VERSION, HOSTED_AGENT_APPROVAL_SIGNAL, LEGACY_AGENT_RUN_WORKFLOW_VERSION,
 };
 use myelin_events::EventEnvelope;
 use myelin_flow::{
     ActivityError, DelegationCaveats, PgClaimedDriveInput, PgFlowWorker, PgInputResolveError,
-    PgResolvedDriveInput, PgWorkerError, PgWorkflowInputResolver, RetryPolicy,
+    PgResolvedDriveInput, PgWorkerError, PgWorkflowInputResolver, RetryPolicy, WaitOutcome,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::HOSTED_LUNA_RUNTIME;
 use myelin_storage::{
-    DurableAgentTriggerBacking, DurablePrincipalBacking, DurablePrincipalRow, SubstrateProvider,
+    hitl_gate_durable::gate_id_from_ref_token, DurableAgentTriggerBacking, DurablePrincipalBacking,
+    DurablePrincipalRow, SubstrateProvider,
 };
 use myelin_tenancy::{Region, TenantId};
 use serde::{Deserialize, Serialize};
@@ -21,12 +24,48 @@ use uuid::Uuid;
 
 use crate::LlmRunTask;
 
+const MAX_APPROVALS_PER_HOSTED_RUN: usize = 16;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostedAgentActivityOutcome {
+    Completed(myelin_refs::ArtifactRef),
+    ApprovalRequired {
+        gate_id: String,
+        expires_at_unix: i64,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostedAgentStopReason {
+    Rejected,
+    Expired,
+}
+
+impl HostedAgentStopReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+}
+
 pub trait HostedAgentRunExecutor: Send + Sync {
     fn execute(
         &self,
         input: &HostedAgentWorkflowInput,
         activity_key: &str,
+        attempt: u32,
         now_secs: i64,
+    ) -> Result<HostedAgentActivityOutcome, String>;
+
+    fn stop(
+        &self,
+        input: &HostedAgentWorkflowInput,
+        activity_key: &str,
+        now_secs: i64,
+        gate_id: &str,
+        reason: HostedAgentStopReason,
     ) -> Result<myelin_refs::ArtifactRef, String>;
 }
 
@@ -35,6 +74,27 @@ pub fn register_hosted_agent_workflow(
     resolver: HostedAgentInputResolver,
     executor: Arc<dyn HostedAgentRunExecutor>,
 ) -> Result<(), PgWorkerError> {
+    let legacy_executor = executor.clone();
+    worker.register_definition_with_input_resolver(
+        AGENT_RUN_WORKFLOW,
+        LEGACY_AGENT_RUN_WORKFLOW_VERSION,
+        &legacy_agent_run_definition_hash(),
+        resolver.clone(),
+        move |resolved, ctx| {
+            let input = decode_hosted_agent_workflow_input(resolved)?;
+            let now_secs = workflow_now_secs(ctx)?;
+            ctx.activity(RetryPolicy { max_attempts: 1 }, |activity_key, attempt| {
+                match legacy_executor.execute(&input, activity_key, attempt, now_secs) {
+                    Ok(HostedAgentActivityOutcome::Completed(run_ref)) => Ok(vec![run_ref]),
+                    Ok(HostedAgentActivityOutcome::ApprovalRequired { gate_id, .. }) => Err(
+                        ActivityError(format!("hosted agent requires approval at `{gate_id}`")),
+                    ),
+                    Err(error) => Err(ActivityError(error)),
+                }
+            })
+            .map_err(|error| format!("legacy hosted agent activity failed: {error:?}"))
+        },
+    )?;
     worker.register_definition_with_input_resolver(
         AGENT_RUN_WORKFLOW,
         AGENT_RUN_WORKFLOW_VERSION,
@@ -42,19 +102,198 @@ pub fn register_hosted_agent_workflow(
         resolver,
         move |resolved, ctx| {
             let input = decode_hosted_agent_workflow_input(resolved)?;
-            let now = ctx.now();
-            let now_secs = chrono::DateTime::parse_from_rfc3339(&now)
-                .map_err(|error| format!("hosted workflow clock is invalid: {error}"))?
-                .timestamp();
-            ctx.activity(RetryPolicy { max_attempts: 1 }, |activity_key, _attempt| {
-                executor
-                    .execute(&input, activity_key, now_secs)
-                    .map(|run_ref| vec![run_ref])
-                    .map_err(ActivityError)
-            })
-            .map_err(|error| format!("hosted agent activity failed: {error:?}"))
+            for _ in 0..MAX_APPROVALS_PER_HOSTED_RUN {
+                let now_secs = workflow_now_secs(ctx)?;
+                let activity_output = ctx
+                    .activity(RetryPolicy::default_policy(), |activity_key, attempt| {
+                        executor
+                            .execute(&input, activity_key, attempt, now_secs)
+                            .map(|outcome| vec![encode_activity_outcome(&input, outcome)])
+                            .map_err(ActivityError)
+                    })
+                    .map_err(|error| format!("hosted agent activity failed: {error:?}"))?;
+                match decode_activity_outcome(&input, &activity_output)? {
+                    HostedAgentActivityOutcome::Completed(run_ref) => return Ok(vec![run_ref]),
+                    HostedAgentActivityOutcome::ApprovalRequired {
+                        gate_id,
+                        expires_at_unix,
+                    } => {
+                        match ctx
+                            .wait_for_signal_exact_until(
+                                HOSTED_AGENT_APPROVAL_SIGNAL,
+                                &gate_id,
+                                Some(expires_at_unix),
+                            )
+                            .map_err(|error| {
+                                format!("hosted agent approval wait failed: {error:?}")
+                            })?
+                        {
+                            WaitOutcome::Parked => return Ok(Vec::new()),
+                            WaitOutcome::Signalled { payload, .. } => {
+                                let Some(reason) = decode_decision(&input, &gate_id, &payload)? else {
+                                    continue;
+                                };
+                                return ctx
+                                    .activity(
+                                        RetryPolicy::default_policy(),
+                                        |activity_key, _attempt| {
+                                            executor
+                                                .stop(
+                                                    &input,
+                                                    activity_key,
+                                                    now_secs,
+                                                    &gate_id,
+                                                    reason,
+                                                )
+                                                .map(|run_ref| vec![run_ref])
+                                                .map_err(ActivityError)
+                                        },
+                                    )
+                                    .map_err(|error| {
+                                        format!("stop rejected hosted agent run: {error:?}")
+                                    });
+                            }
+                            WaitOutcome::TimedOut => return ctx
+                                .activity(
+                                    RetryPolicy::default_policy(),
+                                    |activity_key, _attempt| {
+                                        executor
+                                            .stop(
+                                                &input,
+                                                activity_key,
+                                                expires_at_unix,
+                                                &gate_id,
+                                                HostedAgentStopReason::Expired,
+                                            )
+                                            .map(|run_ref| vec![run_ref])
+                                            .map_err(ActivityError)
+                                    },
+                                )
+                                .map_err(|error| {
+                                    format!("expire hosted agent approval: {error:?}")
+                                }),
+                        }
+                    }
+                }
+            }
+            Err(format!(
+                "hosted agent exceeded its bounded {MAX_APPROVALS_PER_HOSTED_RUN} approval decisions"
+            ))
         },
     )
+}
+
+fn workflow_now_secs(ctx: &mut myelin_flow::WfCtx) -> Result<i64, String> {
+    chrono::DateTime::parse_from_rfc3339(&ctx.now())
+        .map_err(|error| format!("hosted workflow clock is invalid: {error}"))
+        .map(|now| now.timestamp())
+}
+
+fn run_ref(input: &HostedAgentWorkflowInput) -> myelin_refs::ArtifactRef {
+    hosted_agent_run_ref(&input.tenant, &input.run_id)
+}
+
+fn hosted_agent_run_ref(tenant: &TenantId, run_id: &str) -> myelin_refs::ArtifactRef {
+    myelin_refs::ArtifactRef(format!("myelin://{}/agent/run/{}", tenant.0, run_id))
+}
+
+fn gate_ref(
+    input: &HostedAgentWorkflowInput,
+    gate_id: &str,
+    expires_at_unix: i64,
+) -> myelin_refs::ArtifactRef {
+    myelin_refs::ArtifactRef(format!(
+        "{}:hitl-gate:{}:expires:{expires_at_unix}",
+        run_ref(input).0,
+        gate_ref_token(gate_id)
+    ))
+}
+
+fn encode_activity_outcome(
+    input: &HostedAgentWorkflowInput,
+    outcome: HostedAgentActivityOutcome,
+) -> myelin_refs::ArtifactRef {
+    match outcome {
+        HostedAgentActivityOutcome::Completed(run_ref) => run_ref,
+        HostedAgentActivityOutcome::ApprovalRequired {
+            gate_id,
+            expires_at_unix,
+        } => gate_ref(input, &gate_id, expires_at_unix),
+    }
+}
+
+fn decode_activity_outcome(
+    input: &HostedAgentWorkflowInput,
+    output: &[myelin_refs::ArtifactRef],
+) -> Result<HostedAgentActivityOutcome, String> {
+    let [artifact] = output else {
+        return Err("hosted agent activity must return exactly one artifact".into());
+    };
+    if artifact == &run_ref(input) {
+        return Ok(HostedAgentActivityOutcome::Completed(artifact.clone()));
+    }
+    let prefix = format!("{}:hitl-gate:", run_ref(input).0);
+    let encoded_with_expiry = artifact
+        .0
+        .strip_prefix(&prefix)
+        .ok_or_else(|| "hosted agent activity returned an unbound artifact".to_string())?;
+    let (encoded, expires_at_unix) = encoded_with_expiry
+        .split_once(":expires:")
+        .ok_or_else(|| "hosted agent gate artifact has no expiry".to_string())?;
+    let expires_at_unix = expires_at_unix
+        .parse::<i64>()
+        .ok()
+        .filter(|deadline| *deadline > 0)
+        .ok_or_else(|| "hosted agent gate artifact has an invalid expiry".to_string())?;
+    let gate_id = gate_id_from_ref_token(encoded)
+        .ok_or_else(|| "hosted agent activity returned an invalid gate ID".to_string())?;
+    Ok(HostedAgentActivityOutcome::ApprovalRequired {
+        gate_id,
+        expires_at_unix,
+    })
+}
+
+fn decode_decision(
+    input: &HostedAgentWorkflowInput,
+    gate_id: &str,
+    payload: &[myelin_refs::ArtifactRef],
+) -> Result<Option<HostedAgentStopReason>, String> {
+    let [artifact] = payload else {
+        return Err(
+            "hosted agent approval signal must contain exactly one decision artifact".into(),
+        );
+    };
+    if artifact
+        == &hosted_agent_decision_ref(
+            &input.tenant,
+            &input.run_id,
+            gate_id,
+            HostedAgentDecision::Approved,
+        )
+    {
+        return Ok(None);
+    }
+    if artifact
+        == &hosted_agent_decision_ref(
+            &input.tenant,
+            &input.run_id,
+            gate_id,
+            HostedAgentDecision::Rejected,
+        )
+    {
+        return Ok(Some(HostedAgentStopReason::Rejected));
+    }
+    if artifact
+        == &hosted_agent_decision_ref(
+            &input.tenant,
+            &input.run_id,
+            gate_id,
+            HostedAgentDecision::Expired,
+        )
+    {
+        return Ok(Some(HostedAgentStopReason::Expired));
+    }
+    Err("hosted agent approval signal is not bound to this gate and run".into())
 }
 
 fn decode_hosted_agent_workflow_input(
@@ -127,7 +366,12 @@ impl HostedAgentInputResolver {
         &self,
         input: PgClaimedDriveInput,
     ) -> Result<Vec<u8>, PgInputResolveError> {
-        if input.wf_type != AGENT_RUN_WORKFLOW || input.wf_version != AGENT_RUN_WORKFLOW_VERSION {
+        if input.wf_type != AGENT_RUN_WORKFLOW
+            || !matches!(
+                input.wf_version,
+                LEGACY_AGENT_RUN_WORKFLOW_VERSION | AGENT_RUN_WORKFLOW_VERSION
+            )
+        {
             return Err(PgInputResolveError::Permanent(
                 "hosted resolver received a different workflow definition".into(),
             ));
@@ -288,8 +532,7 @@ mod tests {
     use myelin_identity::RuntimeRef;
     use myelin_tenancy::ArtifactRef;
 
-    #[test]
-    fn resolved_work_becomes_a_clear_agent_prompt_without_losing_delegation() {
+    fn workflow_input() -> HostedAgentWorkflowInput {
         let tenant = TenantId("acme".into());
         let region = Region("fr-par".into());
         let founder = Principal::new(
@@ -336,7 +579,7 @@ mod tests {
             recorded_at: Timestamp("2026-08-10T00:00:01Z".into()),
             payload: serde_json::json!({"source_ref": "refs/heads/main"}),
         };
-        let resolved = HostedAgentWorkflowInput {
+        HostedAgentWorkflowInput {
             tenant,
             region,
             run_id: "run-1".into(),
@@ -348,7 +591,13 @@ mod tests {
             selected_tools: vec!["git.open_pr.v1".into()],
             budget_minor_units: 250_000,
             event,
-        };
+        }
+    }
+
+    #[test]
+    fn resolved_work_becomes_a_clear_agent_prompt_without_losing_delegation() {
+        let resolved = workflow_input();
+        let founder = resolved.trigger_actor.clone();
         let task = resolved.llm_task(42);
         assert_eq!(task.trigger_actor, founder);
         assert_eq!(task.delegation_caveats.0, ["repo:core"]);
@@ -356,5 +605,59 @@ mod tests {
         assert!(task.prompt.contains("Prepare the smallest safe fix."));
         assert!(task.prompt.contains("ci.run.failed"));
         assert!(task.prompt.contains("refs/heads/main"));
+    }
+
+    #[test]
+    fn an_approval_activity_returns_one_canonical_exact_gate_artifact() {
+        let input = workflow_input();
+        let outcome = HostedAgentActivityOutcome::ApprovalRequired {
+            gate_id: "gate:merge-7".into(),
+            expires_at_unix: 1_800_000_000,
+        };
+        let artifact = encode_activity_outcome(&input, outcome.clone());
+
+        myelin_refs::parse_scoped(&artifact.0)
+            .expect("an activity marker must cross the ArtifactRef boundary");
+        assert_eq!(
+            decode_activity_outcome(&input, &[artifact]).expect("the marker is replayable"),
+            outcome
+        );
+    }
+
+    #[test]
+    fn a_human_decision_is_bound_to_one_run_and_one_gate() {
+        let input = workflow_input();
+        let approved = hosted_agent_decision_ref(
+            &input.tenant,
+            &input.run_id,
+            "gate:merge-7",
+            HostedAgentDecision::Approved,
+        );
+        let rejected = hosted_agent_decision_ref(
+            &input.tenant,
+            &input.run_id,
+            "gate:merge-7",
+            HostedAgentDecision::Rejected,
+        );
+
+        assert_eq!(
+            decode_decision(&input, "gate:merge-7", &[approved]),
+            Ok(None)
+        );
+        assert_eq!(
+            decode_decision(&input, "gate:merge-7", &[rejected]),
+            Ok(Some(HostedAgentStopReason::Rejected))
+        );
+        assert!(decode_decision(
+            &input,
+            "gate:another-effect",
+            &[hosted_agent_decision_ref(
+                &input.tenant,
+                &input.run_id,
+                "gate:merge-7",
+                HostedAgentDecision::Approved,
+            )],
+        )
+        .is_err());
     }
 }

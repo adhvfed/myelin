@@ -1,8 +1,8 @@
 use std::sync::{Arc, Mutex};
 
 use myelin_agent_host::{
-    register_hosted_agent_workflow, HostedAgentInputResolver, HostedAgentRunExecutor,
-    HostedAgentWorkflowInput,
+    register_hosted_agent_workflow, HostedAgentActivityOutcome, HostedAgentInputResolver,
+    HostedAgentRunExecutor, HostedAgentStopReason, HostedAgentWorkflowInput,
 };
 use myelin_agent_service::hosted_run_contract::{AGENT_RUN_WORKFLOW, AGENT_RUN_WORKFLOW_VERSION};
 use myelin_agent_service::trigger_handoff::TriggerRunHandoff;
@@ -149,15 +149,33 @@ impl HostedAgentRunExecutor for RecordingHostedAgent {
         &self,
         input: &HostedAgentWorkflowInput,
         activity_key: &str,
+        _attempt: u32,
         now_secs: i64,
-    ) -> Result<ArtifactRef, String> {
+    ) -> Result<HostedAgentActivityOutcome, String> {
         self.executions
             .lock()
             .unwrap()
             .push((input.clone(), activity_key.to_string(), now_secs));
-        Ok(ArtifactRef(format!(
+        Ok(HostedAgentActivityOutcome::Completed(ArtifactRef(format!(
             "myelin://{}/agent/run/{}",
             input.tenant.0, input.run_id
+        ))))
+    }
+
+    fn stop(
+        &self,
+        input: &HostedAgentWorkflowInput,
+        _activity_key: &str,
+        _now_secs: i64,
+        gate_id: &str,
+        reason: HostedAgentStopReason,
+    ) -> Result<ArtifactRef, String> {
+        Ok(ArtifactRef(format!(
+            "myelin://{}/agent/run/{}:stopped:{}:gate:{}",
+            input.tenant.0,
+            input.run_id,
+            reason.as_str(),
+            myelin_agent_service::hosted_run_contract::gate_ref_token(gate_id)
         )))
     }
 }

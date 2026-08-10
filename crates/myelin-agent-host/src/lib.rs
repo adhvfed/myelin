@@ -19,8 +19,8 @@ pub mod workflow;
 use durable_model::DurableModelClient;
 use identity::{IdentityRunMinter, IdentityRunRevoker};
 pub use workflow::{
-    register_hosted_agent_workflow, HostedAgentInputResolver, HostedAgentRunExecutor,
-    HostedAgentWorkflowInput,
+    register_hosted_agent_workflow, HostedAgentActivityOutcome, HostedAgentInputResolver,
+    HostedAgentRunExecutor, HostedAgentStopReason, HostedAgentWorkflowInput,
 };
 
 use myelin_agent::{
@@ -69,6 +69,7 @@ pub struct LlmRunTask {
     pub token_ttl_secs: u64,
     pub estimate: MicroUsd,
     pub now_secs: i64,
+    pub credential_attempt: Option<String>,
     pub available: MicroUsd,
     pub max_output_tokens: Option<u32>,
 }
@@ -96,6 +97,7 @@ impl LlmRunTask {
             estimate: MicroUsd(100_000),
             available: MicroUsd(1_000_000),
             now_secs: 0,
+            credential_attempt: None,
             max_output_tokens: None,
         }
     }
@@ -107,6 +109,11 @@ impl LlmRunTask {
 
     pub fn with_now_secs(mut self, now_secs: i64) -> LlmRunTask {
         self.now_secs = now_secs;
+        self
+    }
+
+    pub fn with_credential_attempt(mut self, attempt: impl Into<String>) -> LlmRunTask {
+        self.credential_attempt = Some(attempt.into());
         self
     }
 
@@ -663,6 +670,7 @@ impl AgentHost {
             task.trigger_actor.clone(),
             resolved_policy,
             now,
+            task.credential_attempt.clone(),
         ));
         Ok((
             minter,

@@ -2,6 +2,7 @@ import { useAction } from "@solidjs/router";
 import { createResource, createSignal, type Accessor } from "solid-js";
 
 import {
+  decideAgentEffectApproval,
   decideAutomationApproval,
   getInbox,
   markInboxRead,
@@ -23,12 +24,17 @@ export interface InboxState {
     eventId: string,
     decision: AutomationApprovalDecision,
   ) => Promise<boolean>;
+  decideAgentEffect: (
+    gateId: string,
+    decision: AutomationApprovalDecision,
+  ) => Promise<boolean>;
 }
 
 /** Load the real recipient-scoped inbox through the server-only cookie-auth gateway client. */
 export function createInbox(): InboxState {
   const markReadAction = useAction(markInboxRead);
   const decideAutomationAction = useAction(decideAutomationApproval);
+  const decideAgentEffectAction = useAction(decideAgentEffectApproval);
   const [failed, setFailed] = createSignal(false);
   const [page, { refetch }] = createResource(async () => {
     try {
@@ -64,6 +70,15 @@ export function createInbox(): InboxState {
     await refetch();
     return true;
   };
+  const decideAgentEffect = async (
+    gateId: string,
+    decision: AutomationApprovalDecision,
+  ): Promise<boolean> => {
+    const result = await decideAgentEffectAction({ gateId, decision });
+    if (!result.ok) return false;
+    await refetch();
+    return true;
+  };
   return {
     items,
     unreadCount,
@@ -72,5 +87,6 @@ export function createInbox(): InboxState {
     retry: () => void refetch(),
     markRead,
     decideAutomation,
+    decideAgentEffect,
   };
 }

@@ -3,17 +3,20 @@ use std::sync::Arc;
 use myelin_agent::{ToolCall, ToolDef, ToolName, ToolResult, ToolSchema};
 use myelin_agent_model::{LunaClient, ModelClient, ModelError};
 use myelin_agent_service::{
-    catalogue_cursor, PlatformToolCatalogue, ToolExecError, ToolExecutionContext, ToolExecutor,
+    catalogue_cursor, hosted_run_contract::gate_ref_token, PlatformToolCatalogue, ToolExecError,
+    ToolExecutionContext, ToolExecutor,
 };
 use myelin_events::{OutboxStore, UlidMinter};
 use myelin_flow::WfJournal;
+use myelin_storage::hitl_gate_durable::{DurableHitlGateBacking, GateState};
 use myelin_storage::reserve_settle::{CostLedger, ReservationState, RunId as CostRunId};
-use myelin_storage::{PgOutboxBacking, SubstrateProvider};
+use myelin_storage::{PgOutboxBacking, SubstrateProvider, TenantScope};
 use myelin_tenancy::ArtifactRef;
 
 use crate::{
-    AgentHost, HostedAgentRunExecutor, HostedAgentWorkflowInput, RunSubstrateWiring, ToolCatalogue,
-    Tools,
+    AgentHost, AgentHostError, HostedAgentActivityOutcome, HostedAgentRunExecutor,
+    HostedAgentStopReason, HostedAgentWorkflowInput, RunSubstrateWiring, SkeletonError,
+    ToolCatalogue, Tools,
 };
 
 struct HostedToolBrokerUnavailable;
@@ -49,6 +52,8 @@ pub struct AgentHostActivityExecutor {
     host: Arc<AgentHost>,
     provider: SubstrateProvider,
     outbox: OutboxStore,
+    gates: DurableHitlGateBacking,
+    runtime: tokio::runtime::Handle,
     models: Arc<dyn HostedModelFactory>,
     tools: Arc<dyn ToolExecutor>,
 }
@@ -62,12 +67,14 @@ impl AgentHostActivityExecutor {
     ) -> Self {
         let outbox = OutboxStore::durable(Arc::new(PgOutboxBacking::new(
             provider.db_pool().clone(),
-            runtime,
+            runtime.clone(),
         )));
         Self {
             host,
+            gates: DurableHitlGateBacking::new(provider.clone()),
             provider,
             outbox,
+            runtime,
             models,
             tools: Arc::new(HostedToolBrokerUnavailable),
         }
@@ -76,6 +83,13 @@ impl AgentHostActivityExecutor {
     pub fn with_tool_executor(mut self, tools: Arc<dyn ToolExecutor>) -> Self {
         self.tools = tools;
         self
+    }
+
+    fn drive<F: std::future::Future>(&self, future: F) -> F::Output {
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| self.runtime.block_on(future)),
+            Err(_) => self.runtime.block_on(future),
+        }
     }
 
     fn selected_tools(
@@ -121,6 +135,20 @@ impl AgentHostActivityExecutor {
             input.tenant.0, input.run_id
         ))
     }
+
+    fn stopped_ref(
+        input: &HostedAgentWorkflowInput,
+        gate_id: &str,
+        reason: HostedAgentStopReason,
+    ) -> ArtifactRef {
+        ArtifactRef(format!(
+            "myelin://{}/agent/run/{}:stopped:{}:gate:{}",
+            input.tenant.0,
+            input.run_id,
+            reason.as_str(),
+            gate_ref_token(gate_id)
+        ))
+    }
 }
 
 impl HostedAgentRunExecutor for AgentHostActivityExecutor {
@@ -128,8 +156,9 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
         &self,
         input: &HostedAgentWorkflowInput,
         activity_key: &str,
+        attempt: u32,
         now_secs: i64,
-    ) -> Result<ArtifactRef, String> {
+    ) -> Result<HostedAgentActivityOutcome, String> {
         if !activity_key.starts_with(&format!("{}/", input.run_id)) {
             return Err("hosted activity key belongs to a different run".into());
         }
@@ -140,7 +169,7 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
             if existing.state == ReservationState::Settled
                 && existing.reserved.0 == input.budget_minor_units
             {
-                return Ok(Self::run_ref(input));
+                return Ok(HostedAgentActivityOutcome::Completed(Self::run_ref(input)));
             }
             if existing.state == ReservationState::Settled {
                 return Err(
@@ -156,19 +185,62 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
             id_minter: Arc::new(UlidMinter::new()),
             journal: WfJournal::new(),
         };
-        self.host
-            .run(
-                &input.llm_task(now_secs),
-                &mut wiring,
-                model,
-                Tools {
-                    catalogue: &catalogue,
-                    executor: self.tools.as_ref(),
-                    advertised: &advertised,
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        Ok(Self::run_ref(input))
+        match self.host.run(
+            &input
+                .llm_task(now_secs)
+                .with_credential_attempt(format!("{activity_key}/{attempt}")),
+            &mut wiring,
+            model,
+            Tools {
+                catalogue: &catalogue,
+                executor: self.tools.as_ref(),
+                advertised: &advertised,
+            },
+        ) {
+            Ok(_) => Ok(HostedAgentActivityOutcome::Completed(Self::run_ref(input))),
+            Err(AgentHostError::Run(SkeletonError::ApprovalRequired { gate_id })) => {
+                let scope = TenantScope::from_verified_token(&input.agent, input.region.clone());
+                let gate = self
+                    .drive(self.gates.fetch(&scope, &gate_id))
+                    .map_err(|error| format!("load hosted approval gate: {error}"))?
+                    .ok_or_else(|| "hosted approval gate disappeared".to_string())?;
+                if gate.run_id != input.run_id
+                    || gate.requested_by != input.agent.principal_id.0
+                    || gate.state != GateState::Waiting
+                {
+                    return Err("hosted approval gate is not bound to this waiting run".into());
+                }
+                Ok(HostedAgentActivityOutcome::ApprovalRequired {
+                    gate_id,
+                    expires_at_unix: gate.expires_at_unix,
+                })
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn stop(
+        &self,
+        input: &HostedAgentWorkflowInput,
+        activity_key: &str,
+        now_secs: i64,
+        gate_id: &str,
+        reason: HostedAgentStopReason,
+    ) -> Result<ArtifactRef, String> {
+        if !activity_key.starts_with(&format!("{}/", input.run_id)) {
+            return Err("hosted stop activity key belongs to a different run".into());
+        }
+        if reason == HostedAgentStopReason::Expired {
+            let scope = TenantScope::from_verified_token(&input.agent, input.region.clone());
+            self.drive(self.gates.expire_if_due(&scope, gate_id, now_secs))
+                .map_err(|error| format!("expire hosted approval gate: {error}"))?
+                .map_err(|error| format!("expire hosted approval gate: {error}"))?;
+        }
+        let mut ledger = CostLedger::with_pg(self.provider.clone());
+        ledger
+            .settle(&input.tenant, &CostRunId::new(input.run_id.clone()), &[])
+            .map_err(|error| format!("settle stopped hosted run: {error}"))?;
+        Ok(Self::stopped_ref(input, gate_id, reason))
     }
 }
 

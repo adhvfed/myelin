@@ -2996,6 +2996,7 @@ name = "myelin-identity-service"
 version = "0.0.0"
 dependencies = [
  "base64",
+ "blake3",
  "chrono",
  "ciborium",
  "hmac 0.12.1",

@@ -123,6 +123,11 @@ myelin automation resume 44444444-4444-4444-4444-444444444444 \
   --idempotency-key resume-red-mainline
 myelin automation disable 44444444-4444-4444-4444-444444444444 \
   --idempotency-key retire-red-mainline
+# A hosted run that reaches a sensitive effect parks until this exact gate is decided:
+myelin agent approve gate:0123456789abcdef0123456789abcdef \
+  --idempotency-key approve-exact-merge
+myelin agent reject gate:fedcba9876543210fedcba9876543210 \
+  --idempotency-key reject-exact-merge
 
 myelin repo list
 myelin repo pr list
@@ -176,6 +181,14 @@ exact event without starting or paying for an agent run. It appears in the owner
 with approve and reject actions in the web app and a copyable CLI command; either decision is
 durable and retry-safe, completes the inbox item, and remains visible in automation history. No
 third-party integration key is created or copied into the agent.
+
+Sensitive effects such as `git.merge` have a second, narrower approval boundary. The agent may
+reason up to the effect, but Myelin withholds the mutation, parks the durable workflow without
+holding a model runtime, and places the exact pull request in every eligible human approver's
+shared inbox. Web and CLI decisions are durable and idempotent. Approval wakes the same workflow
+with a fresh attempt-scoped run credential and can authorize only that effect once; rejection or
+expiry settles the run without applying it. The agent remains the attributed actor while its
+active human delegation supplies repository visibility, so neither side needs a GitHub token.
 
 Three-segment events carry their subject type in the name, so `issue.issue.updated`,
 `knowledge.page.updated`, and `chat.message.created` need no extra matcher ceremony. Ambiguous

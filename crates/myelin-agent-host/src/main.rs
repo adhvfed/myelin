@@ -259,20 +259,21 @@ impl ModelClient for DeterministicDevelopmentModel {
         let has_ci_triage_tools = ["ci.read_run", "issues.create"]
             .iter()
             .all(|name| request.tools.iter().any(|tool| tool.name == *name));
+        let has_merge_tool = request.tools.iter().any(|tool| tool.name == "git.merge");
         let tool_results = request
             .turns
             .iter()
             .filter(|turn| matches!(turn, ModelTurn::ToolResults(_)))
             .count();
-        let reply = match (has_ci_triage_tools, tool_results) {
-            (true, 0) => ModelReply::ToolCalls(vec![ToolCallRequest {
+        let reply = match (has_ci_triage_tools, has_merge_tool, tool_results) {
+            (true, _, 0) => ModelReply::ToolCalls(vec![ToolCallRequest {
                 id: "read-triggering-ci-run".into(),
                 name: "ci.read_run".into(),
                 arguments: serde_json::json!({
                     "run_id": triggering_ci_run_id(request)?,
                 }),
             }]),
-            (true, 1) => ModelReply::ToolCalls(vec![ToolCallRequest {
+            (true, _, 1) => ModelReply::ToolCalls(vec![ToolCallRequest {
                 id: "open-triage-issue".into(),
                 name: "issues.create".into(),
                 arguments: serde_json::json!({
@@ -285,6 +286,17 @@ impl ModelClient for DeterministicDevelopmentModel {
                     ),
                 }),
             }]),
+            (false, true, 0) => {
+                let (repo, number) = triggering_merge_target(request)?;
+                ModelReply::ToolCalls(vec![ToolCallRequest {
+                    id: "merge-approved-pull-request".into(),
+                    name: "git.merge".into(),
+                    arguments: serde_json::json!({ "repo": repo, "number": number }),
+                }])
+            }
+            (false, true, _) => ModelReply::Final {
+                content: "Applied the exact pull-request merge approved by a human.".into(),
+            },
             _ => ModelReply::Final {
                 content: "Read the failing CI run and opened one governed triage issue.".into(),
             },
@@ -298,6 +310,47 @@ impl ModelClient for DeterministicDevelopmentModel {
             },
         })
     }
+}
+
+fn triggering_merge_target(request: &ModelRequest) -> Result<(String, u64), ModelError> {
+    let prompt = request
+        .turns
+        .iter()
+        .find_map(|turn| match turn {
+            ModelTurn::User { content } => Some(content.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| ModelError::Parse("development run has no user prompt".into()))?;
+    let marker = "Merge pull request ";
+    let target = prompt
+        .find(marker)
+        .map(|start| &prompt[start + marker.len()..])
+        .and_then(|remainder| remainder.split_whitespace().next())
+        .and_then(|target| target.trim_end_matches('.').split_once('#'))
+        .ok_or_else(|| {
+            ModelError::Parse(
+                "development merge task must contain `Merge pull request <repo>#<number>`".into(),
+            )
+        })?;
+    let (repo, number) = target;
+    if repo.is_empty()
+        || repo.len() > 255
+        || !repo
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.'))
+    {
+        return Err(ModelError::Parse(
+            "development merge task has an invalid repository slug".into(),
+        ));
+    }
+    let number = number
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| {
+            ModelError::Parse("development merge task has an invalid PR number".into())
+        })?;
+    Ok((repo.to_string(), number))
 }
 
 fn triggering_ci_run_id(request: &ModelRequest) -> Result<String, ModelError> {

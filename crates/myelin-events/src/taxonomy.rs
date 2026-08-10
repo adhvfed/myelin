@@ -7,6 +7,7 @@ pub const SUBSYSTEM_TOKENS: &[&str] = &[
     "notif",
     "signal",
     "identity",
+    "agent",
     "refs",
 ];
 
@@ -202,7 +203,7 @@ impl std::fmt::Display for TaxonomyError {
             TaxonomyError::UnknownSubsystem { name, token } => write!(
                 f,
                 "`{name}`: `{token}` is not a canonical subsystem token \
-                 (git/ci/issue/knowledge/chat/notif/signal/identity/refs)"
+                 (git/ci/issue/knowledge/chat/notif/signal/identity/agent/refs)"
             ),
             TaxonomyError::PresentTenseVerb { name, token } => write!(
                 f,
@@ -468,6 +469,7 @@ mod tests {
                 "notif",
                 "signal",
                 "identity",
+                "agent",
                 "refs"
             ]
         );

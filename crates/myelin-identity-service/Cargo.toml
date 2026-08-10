@@ -18,6 +18,7 @@ required-features = ["integration"]
 path = "src/lib.rs"
 
 [dependencies]
+blake3.workspace = true
 myelin-identity = { path = "../myelin-identity" }
 myelin-substrate = { path = "../myelin-substrate" }
 myelin-tenancy = { path = "../myelin-tenancy" }

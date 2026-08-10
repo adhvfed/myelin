@@ -231,8 +231,8 @@ The names/units authority is unchanged from Phase 3 and remains binding (directi
 - **Canonical envelope field list + units** — `00 §2.10` + Bus §3.1 (timestamps RFC-3339 UTC; costs integer
   minor-units; TTLs/timers seconds; client timeouts ms; `pii_key_ref` shape).
 - **`ArtifactRef` subsystem/type token table** — Bus §6.2 (canonical singular tokens
-  `git`/`ci`/`issue`/`knowledge`/`chat`/`identity`/`refs`; CLI aliases render-time only; **+ `initiative`**
-  type token). Refs is the validator, not a second authority.
+  `git`/`ci`/`issue`/`knowledge`/`chat`/`notif`/`signal`/`identity`/`agent`/`refs`; CLI aliases
+  render-time only; **+ `initiative`** type token). Refs is the validator, not a second authority.
 
 The two highest-fan-in contracts (and thus highest drift-risk), now both **frozen with their concrete
 shapes**: **2.1 `EventEnvelope`** (every emitter + consumer) and **4.3 `list_objects`** with the `SetExpr`

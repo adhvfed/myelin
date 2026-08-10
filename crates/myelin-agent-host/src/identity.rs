@@ -25,6 +25,7 @@ pub struct IdentityRunMinter {
     trigger_actor: Principal,
     resolved_policy: ResolvedDelegationPolicy,
     now: Timestamp,
+    mint_attempt: Option<String>,
 }
 
 impl IdentityRunMinter {
@@ -35,6 +36,7 @@ impl IdentityRunMinter {
         trigger_actor: Principal,
         resolved_policy: ResolvedDelegationPolicy,
         now: Timestamp,
+        mint_attempt: Option<String>,
     ) -> IdentityRunMinter {
         IdentityRunMinter {
             minter,
@@ -43,6 +45,7 @@ impl IdentityRunMinter {
             trigger_actor,
             resolved_policy,
             now,
+            mint_attempt,
         }
     }
 }
@@ -56,9 +59,8 @@ impl RunTokenMinter for IdentityRunMinter {
         ttl_secs: u64,
     ) -> Result<RunTokenHandle, RunTokenError> {
         let identity_caveats = IdentityDelegationCaveats(caveats.0.clone());
-        let token = self
-            .minter
-            .mint_from_resolved_policy(
+        let mint = |attempt: Option<&str>| match attempt {
+            Some(attempt) => self.minter.mint_from_resolved_policy_for_attempt(
                 &self.scope,
                 &PrincipalId(agent_id.to_string()),
                 &RunId(run_id.to_string()),
@@ -71,8 +73,24 @@ impl RunTokenMinter for IdentityRunMinter {
                     static_max_secs: ttl_secs,
                 },
                 &self.now,
-            )
-            .map_err(|e| RunTokenError(e.to_string()))?;
+                attempt,
+            ),
+            None => self.minter.mint_from_resolved_policy(
+                &self.scope,
+                &PrincipalId(agent_id.to_string()),
+                &RunId(run_id.to_string()),
+                &self.agent,
+                &self.trigger_actor,
+                &self.resolved_policy,
+                &identity_caveats,
+                MachineKind::Agent,
+                &FailStaticBound {
+                    static_max_secs: ttl_secs,
+                },
+                &self.now,
+            ),
+        };
+        let token = mint(self.mint_attempt.as_deref()).map_err(|e| RunTokenError(e.to_string()))?;
         let (token, jti) = token.into_parts();
         Ok(RunTokenHandle {
             token,
@@ -89,10 +107,7 @@ pub struct IdentityRunRevoker {
 
 impl IdentityRunRevoker {
     pub(crate) fn new(revocations: RevocationStore, scope: TenantScope) -> IdentityRunRevoker {
-        IdentityRunRevoker {
-            revocations,
-            scope,
-        }
+        IdentityRunRevoker { revocations, scope }
     }
 }
 

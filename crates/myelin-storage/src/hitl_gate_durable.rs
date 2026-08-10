@@ -60,6 +60,43 @@ pub fn opaque_gate_id() -> String {
     s
 }
 
+/// Encodes an opaque gate ID as one ArtifactRef-safe identifier component.
+pub fn gate_ref_token(gate_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = gate_id.as_bytes();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+/// Recovers a bounded opaque gate ID from an ArtifactRef identifier component.
+pub fn gate_id_from_ref_token(encoded: &str) -> Option<String> {
+    if !encoded.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| Some((hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?))
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok().filter(|gate_id| {
+        !gate_id.is_empty()
+            && gate_id.len() <= 256
+            && gate_id.bytes().all(|byte| byte.is_ascii_graphic())
+    })
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GateState {
     Waiting,
@@ -678,6 +715,201 @@ fn system_unix_now() -> i64 {
         .expect("system clock must be after the Unix epoch")
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GateDecisionOutcome {
+    pub record: GateRecord,
+    pub changed: bool,
+}
+
+#[derive(Clone)]
+pub struct DurableHitlGateBacking {
+    provider: crate::provider::SubstrateProvider,
+}
+
+impl DurableHitlGateBacking {
+    pub fn new(provider: crate::provider::SubstrateProvider) -> Self {
+        Self { provider }
+    }
+
+    pub async fn fetch(
+        &self,
+        scope: &TenantScope,
+        gate_id: &str,
+    ) -> Result<Option<GateRecord>, crate::provider::ProviderError> {
+        let tenant = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        let gate_id = gate_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT run_id, effect_id, risk_summary, cost_estimate, approver_filter, \
+                                state, card_ref, requested_by, decided_by, opened_at_unix, \
+                                decided_at_unix, expires_at_unix, approval_consumed_at_unix \
+                         FROM agent_hitl_gate \
+                         WHERE tenant_id = $1 AND region = $2 AND gate_id = $3",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&gate_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| crate::pg::PgError::Query(error.to_string()))?;
+                    row.map(|row| row_to_record(&gate_id, &row)).transpose()
+                })
+            })
+            .await
+    }
+
+    pub async fn decide(
+        &self,
+        scope: &TenantScope,
+        gate_id: &str,
+        decision: GateState,
+        decider: &str,
+        decider_kind: PrincipalKind,
+        decided_at_unix: i64,
+    ) -> Result<Result<GateDecisionOutcome, GateDecideError>, crate::provider::ProviderError> {
+        if !matches!(decision, GateState::Approved | GateState::Rejected) {
+            return Ok(Err(GateDecideError::NotEligible));
+        }
+        let tenant = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        let gate_id = gate_id.to_string();
+        let decider = decider.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT run_id, effect_id, risk_summary, cost_estimate, approver_filter, \
+                                state, card_ref, requested_by, decided_by, opened_at_unix, \
+                                decided_at_unix, expires_at_unix, approval_consumed_at_unix \
+                         FROM agent_hitl_gate \
+                         WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 FOR UPDATE",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&gate_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| crate::pg::PgError::Query(error.to_string()))?;
+                    let Some(row) = row else {
+                        return Ok(Err(GateDecideError::NotFound));
+                    };
+                    let mut record = row_to_record(&gate_id, &row)?;
+                    if record.state == decision
+                        && record.decided_by.as_deref() == Some(decider.as_str())
+                    {
+                        return Ok(Ok(GateDecisionOutcome {
+                            record,
+                            changed: false,
+                        }));
+                    }
+                    if let Err(error) = decide_rules(
+                        &record,
+                        decision,
+                        Some(&decider),
+                        decider_kind == PrincipalKind::Human,
+                        decided_at_unix,
+                    ) {
+                        return Ok(Err(error));
+                    }
+                    sqlx::query(
+                        "UPDATE agent_hitl_gate \
+                         SET state = $4, decided_by = $5, decided_at_unix = $6 \
+                         WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 \
+                           AND state = 'waiting'",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&gate_id)
+                    .bind(decision.as_str())
+                    .bind(&decider)
+                    .bind(decided_at_unix)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|error| crate::pg::PgError::Query(error.to_string()))?;
+                    record.state = decision;
+                    record.decided_by = Some(decider);
+                    record.decided_at_unix = Some(decided_at_unix);
+                    Ok(Ok(GateDecisionOutcome {
+                        record,
+                        changed: true,
+                    }))
+                })
+            })
+            .await
+    }
+
+    pub async fn expire_if_due(
+        &self,
+        scope: &TenantScope,
+        gate_id: &str,
+        now_unix: i64,
+    ) -> Result<Result<GateDecisionOutcome, GateDecideError>, crate::provider::ProviderError> {
+        let tenant = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        let gate_id = gate_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT run_id, effect_id, risk_summary, cost_estimate, approver_filter, \
+                                state, card_ref, requested_by, decided_by, opened_at_unix, \
+                                decided_at_unix, expires_at_unix, approval_consumed_at_unix \
+                         FROM agent_hitl_gate \
+                         WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 FOR UPDATE",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&gate_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| crate::pg::PgError::Query(error.to_string()))?;
+                    let Some(row) = row else {
+                        return Ok(Err(GateDecideError::NotFound));
+                    };
+                    let mut record = row_to_record(&gate_id, &row)?;
+                    if record.state == GateState::Expired {
+                        return Ok(Ok(GateDecisionOutcome {
+                            record,
+                            changed: false,
+                        }));
+                    }
+                    if record.expires_at_unix > now_unix {
+                        return Ok(Err(GateDecideError::ApprovalWindowExpired));
+                    }
+                    if !matches!(record.state, GateState::Waiting | GateState::Approved)
+                        || record.approval_consumed_at_unix.is_some()
+                    {
+                        return Ok(Err(GateDecideError::AlreadyDecided(record.state)));
+                    }
+                    sqlx::query(
+                        "UPDATE agent_hitl_gate \
+                         SET state = 'expired', decided_at_unix = $4 \
+                         WHERE tenant_id = $1 AND region = $2 AND gate_id = $3 \
+                           AND state IN ('waiting', 'approved') \
+                           AND approval_consumed_at_unix IS NULL",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&gate_id)
+                    .bind(now_unix)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|error| crate::pg::PgError::Query(error.to_string()))?;
+                    record.state = GateState::Expired;
+                    record.decided_at_unix = Some(now_unix);
+                    Ok(Ok(GateDecisionOutcome {
+                        record,
+                        changed: true,
+                    }))
+                })
+            })
+            .await
+    }
+}
+
 #[derive(Clone)]
 pub struct DurableHitlGates {
     provider: crate::provider::SubstrateProvider,
@@ -1139,6 +1371,16 @@ mod tests {
     use super::*;
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use myelin_tenancy::{Region, TenantId};
+
+    #[test]
+    fn gate_reference_tokens_round_trip_without_admitting_ambiguous_ids() {
+        let gate_id = "gate:0123456789abcdef0123456789abcdef";
+        let token = gate_ref_token(gate_id);
+        assert_eq!(gate_id_from_ref_token(&token).as_deref(), Some(gate_id));
+        assert_eq!(gate_id_from_ref_token("abc"), None);
+        assert_eq!(gate_id_from_ref_token("zz"), None);
+        assert_eq!(gate_id_from_ref_token("00"), None);
+    }
 
     fn scope() -> TenantScope {
         let p = Principal::stub(

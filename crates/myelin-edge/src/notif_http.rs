@@ -6,13 +6,13 @@ use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
 };
 use myelin_identity_service::StoreBackedCheck;
-use myelin_notif::automation_approval_action;
 use myelin_notif::cli::CliView;
 use myelin_notif::list_inbox::subsystem_of;
 use myelin_notif::pg_inbox::{
     DurableInboxItem, InboxReadRequest, InboxReadScope, PgInboxError, PgInboxStore,
 };
 use myelin_notif::prefs::{class_token, reason_token, subsystem_token};
+use myelin_notif::{agent_effect_approval_action, automation_approval_action};
 use myelin_storage::with_tenant_tx_error;
 use serde_json::{json, Value};
 use sqlx::types::Uuid;
@@ -303,13 +303,23 @@ fn parse_inbox_query(query: &str) -> Result<InboxQuery, EdgeError> {
 }
 
 fn inbox_item_json(row: &DurableInboxItem) -> Value {
-    let action = automation_approval_action(row).map(|action| {
-        json!({
-            "kind": "automation_firing_approval",
-            "automation_id": action.automation_id,
-            "event_id": action.event_id,
+    let action = agent_effect_approval_action(row)
+        .map(|action| {
+            json!({
+                "kind": "agent_effect_approval",
+                "gate_id": action.gate_id,
+                "run_id": action.run_id,
+            })
         })
-    });
+        .or_else(|| {
+            automation_approval_action(row).map(|action| {
+                json!({
+                    "kind": "automation_firing_approval",
+                    "automation_id": action.automation_id,
+                    "event_id": action.event_id,
+                })
+            })
+        });
     json!({
         "id": row.item.item_id,
         "reason": reason_token(row.item.reason),

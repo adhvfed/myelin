@@ -13,7 +13,7 @@ const MAX_TOOLS: usize = 128;
 pub fn agent_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no agent command given (try: create <name> --tool <name> | list | show <id> | suspend|resume|retire <id>)".into(),
+            "no agent command given (try: create <name> --tool <name> | list | show <id> | approve|reject <gate>)".into(),
         )
     })?;
     match *verb {
@@ -23,10 +23,41 @@ pub fn agent_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
         "suspend" => lifecycle_call(rest, "suspend"),
         "resume" => lifecycle_call(rest, "resume"),
         "retire" => lifecycle_call(rest, "retire"),
+        "approve" | "reject" => approval_call(rest, verb),
         other => Err(CliError::Usage(format!(
             "unknown agent command token `{other}`"
         ))),
     }
+}
+
+fn approval_call(args: &[&str], decision: &str) -> Result<EdgeCall, CliError> {
+    let gate_id = match args {
+        [gate_id] => *gate_id,
+        [] => return Err(CliError::Usage(format!("agent {decision} needs a gate id"))),
+        [_, extra, ..] => {
+            return Err(CliError::Usage(format!(
+                "unexpected agent {decision} argument `{extra}`"
+            )))
+        }
+    };
+    if !is_canonical_gate_id(gate_id) {
+        return Err(CliError::Usage(
+            "agent approval gate id must be `gate:` followed by 32 lowercase hex characters".into(),
+        ));
+    }
+    Ok(EdgeCall::post_json(
+        format!("/v1/agent-approvals/{gate_id}/decision"),
+        json!({ "decision": decision }),
+    ))
+}
+
+fn is_canonical_gate_id(value: &str) -> bool {
+    value.strip_prefix("gate:").is_some_and(|suffix| {
+        suffix.len() == 32
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn lifecycle_call(args: &[&str], action: &str) -> Result<EdgeCall, CliError> {
@@ -320,5 +351,21 @@ mod tests {
         ] {
             assert!(agent_dispatch(&args).is_err(), "accepted {args:?}");
         }
+    }
+
+    #[test]
+    fn a_human_can_decide_the_exact_gate_copied_from_the_inbox() {
+        let gate = "gate:0123456789abcdef0123456789abcdef";
+        for decision in ["approve", "reject"] {
+            let call = agent_dispatch(&[decision, gate]).unwrap();
+            assert_eq!(call.path, format!("/v1/agent-approvals/{gate}/decision"));
+            assert_eq!(call.retry_policy, RetryPolicy::CallerKeyRequired);
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(call.payload.as_ref().unwrap())
+                    .unwrap(),
+                json!({ "decision": decision })
+            );
+        }
+        assert!(agent_dispatch(&["approve", "gate:$(touch bad)"]).is_err());
     }
 }
