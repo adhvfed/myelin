@@ -368,6 +368,111 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
             .unwrap();
     assert_eq!(raced_import_count, 1);
 
+    let retry_key = "interactive-create-retry";
+    assert!(race_store
+        .create_idempotent_then_abort_for_test(
+            &creator,
+            &creator,
+            proposal("IDM", "retry-safe interactive issue"),
+            retry_key,
+        )
+        .await
+        .is_err());
+    let aborted_ledger_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM issue_create_idempotency \
+         WHERE tenant_id = $1 AND request_hash ~ '^blake3:'",
+    )
+    .bind(&tenant)
+    .fetch_one(&admin)
+    .await
+    .unwrap();
+    assert_eq!(aborted_ledger_count, 0, "the failed transaction left no claim");
+
+    let first_create = race_store
+        .create_idempotent(
+            &creator,
+            &creator,
+            proposal("IDM", "retry-safe interactive issue"),
+            retry_key,
+        )
+        .await
+        .expect("the first interactive request creates an issue");
+    assert!(first_create.created);
+    let replayed_create = race_store
+        .create_idempotent(
+            &creator,
+            &creator,
+            proposal("IDM", "retry-safe interactive issue"),
+            retry_key,
+        )
+        .await
+        .expect("the retry returns its original issue");
+    assert!(!replayed_create.created);
+    assert_eq!(replayed_create.receipt, first_create.receipt);
+    assert!(matches!(
+        race_store
+            .create_idempotent(
+                &creator,
+                &creator,
+                proposal("IDM", "same key but different work"),
+                retry_key,
+            )
+            .await,
+        Err(IssueStoreError::Conflict(_))
+    ));
+    let retry_safe_issue_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM issue WHERE tenant_id = $1 AND prefix = 'IDM'")
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(retry_safe_issue_count, 1);
+    store
+        .reconcile_authorization(&worker, &first_create.receipt.id, &writer)
+        .await
+        .expect("the retry-safe issue follows the ordinary authorization saga");
+
+    let mut create_joins = Vec::new();
+    for _ in 0..8 {
+        let store = race_store.clone();
+        let creator = creator.clone();
+        create_joins.push(tokio::spawn(async move {
+            store
+                .create_idempotent(
+                    &creator,
+                    &creator,
+                    proposal("IDC", "concurrent interactive retry"),
+                    "concurrent-interactive-create",
+                )
+                .await
+        }));
+    }
+    let mut create_receipts = Vec::new();
+    let mut create_winners = 0;
+    for join in create_joins {
+        let outcome = join.await.unwrap().expect("concurrent interactive retry");
+        create_winners += usize::from(outcome.created);
+        create_receipts.push(outcome.receipt);
+    }
+    assert_eq!(create_winners, 1, "one caller intent creates one issue");
+    assert!(
+        create_receipts
+            .iter()
+            .all(|receipt| receipt == &create_receipts[0]),
+        "every concurrent retry receives the original creation receipt"
+    );
+    let raced_create_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM issue WHERE tenant_id = $1 AND prefix = 'IDC'")
+            .bind(&tenant)
+            .fetch_one(&admin)
+            .await
+            .unwrap();
+    assert_eq!(raced_create_count, 1);
+    store
+        .reconcile_authorization(&worker, &create_receipts[0].id, &writer)
+        .await
+        .expect("the concurrent retry winner follows the ordinary authorization saga");
+
     assert!(store
         .create_then_abort_for_test(&creator, proposal("RBK", "must roll back"))
         .await

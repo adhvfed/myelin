@@ -282,6 +282,7 @@ fn is_canonical_uuid(value: &str) -> bool {
 fn map_store_error(error: IssueStoreError) -> EdgeError {
     match error {
         IssueStoreError::BadInput(reason) => EdgeError::BadRequest(reason),
+        IssueStoreError::Conflict(reason) => EdgeError::Conflict(reason),
         IssueStoreError::NotFound => EdgeError::NotFound("issue not found".into()),
         IssueStoreError::AuthorizationUnavailable(_) => {
             EdgeError::Unavailable("issue authorization is temporarily unavailable".into())
@@ -396,12 +397,21 @@ struct IssueCreateHandler {
 impl Handler for IssueCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let proposal = resolve_create(&self.api, ctx.principal, parse_create_body(ctx)?)?;
-        let receipt = self
+        let client_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let outcome = self
             .api
-            .drive(self.api.store.create(ctx.principal, proposal))
+            .drive(self.api.store.create_idempotent(
+                ctx.principal,
+                ctx.principal,
+                proposal,
+                &client_nonce,
+            ))
             .map_err(map_store_error)?;
+        let receipt = outcome.receipt;
         Ok(no_store(EdgeResponse::json(
-            202,
+            if outcome.created { 202 } else { 200 },
             &json!({
                 "issue": {
                     "id": receipt.id,
@@ -412,7 +422,9 @@ impl Handler for IssueCreateHandler {
                 "authorization": {
                     "status": "pending",
                     "request_event_id": receipt.authorization_request_event_id,
-                }
+                },
+                "created": outcome.created,
+                "durable": true,
             }),
         )))
     }

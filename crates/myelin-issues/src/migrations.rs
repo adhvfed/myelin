@@ -15,6 +15,7 @@ pub const OUTBOX_TABLE: &str = "outbox";
 pub const ISSUE_AUTHZ_BINDING_TABLE: &str = "issue_authz_binding";
 pub const ISSUE_AUTHZ_VISIBLE_TABLE: &str = "issue_authz_visible";
 pub const IMPORT_MAP_TABLE: &str = "import_map";
+pub const ISSUE_CREATE_IDEMPOTENCY_TABLE: &str = "issue_create_idempotency";
 
 pub const CREATE_ISSUE_AUTHZ_VISIBLE_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS issue_authz_visible (
@@ -300,6 +301,20 @@ CREATE TABLE IF NOT EXISTS import_map (
   CHECK (status NOT IN ('lossy','dropped') OR loss_note IS NOT NULL)
 )";
 
+pub const CREATE_ISSUE_CREATE_IDEMPOTENCY_DDL: &str = "\
+CREATE TABLE IF NOT EXISTS issue_create_idempotency (
+  tenant_id     text        NOT NULL,
+  region        text        NOT NULL,
+  storage_nonce text        NOT NULL CHECK (storage_nonce ~ '^blake3:[0-9a-f]{64}$'),
+  request_hash  text        NOT NULL CHECK (request_hash ~ '^blake3:[0-9a-f]{64}$'),
+  issue_id      uuid,
+  status        text        NOT NULL CHECK (status IN ('pending','created')),
+  created_at    timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (tenant_id, region, storage_nonce),
+  CHECK ((status = 'pending' AND issue_id IS NULL) OR
+         (status = 'created' AND issue_id IS NOT NULL))
+)";
+
 pub const CREATE_CONSUMER_DEDUP_DDL: &str = CONSUMER_DEDUP_MIGRATION;
 
 pub fn make_tenant_scoped_ddl(table: &str) -> String {
@@ -455,6 +470,19 @@ pub fn issues_migrations() -> Migrations {
         import_map_ddl,
         IMPORT_MAP_TABLE,
     ));
+    let create_idempotency_ddl = Box::leak(
+        format!(
+            "{};\n{};",
+            CREATE_ISSUE_CREATE_IDEMPOTENCY_DDL,
+            make_tenant_scoped_ddl(ISSUE_CREATE_IDEMPOTENCY_TABLE)
+        )
+        .into_boxed_str(),
+    );
+    migrations.push(Migration::plain_on(
+        "iss_0024_issue_create_idempotency",
+        create_idempotency_ddl,
+        ISSUE_CREATE_IDEMPOTENCY_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -464,6 +492,7 @@ pub fn issues_hot_tables() -> HotTables {
         ISSUE_RELATION_TABLE,
         ISSUE_CHANGE_LOG_TABLE,
         IMPORT_MAP_TABLE,
+        ISSUE_CREATE_IDEMPOTENCY_TABLE,
     ])
 }
 
@@ -590,8 +619,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            29,
-            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 5 authz migrations + the import map"
+            30,
+            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 5 authz migrations + the import map + the create retry ledger"
         );
         for m in &migrations.0 {
             assert!(
@@ -629,7 +658,7 @@ mod tests {
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
             issues.0.last().map(|migration| migration.id),
-            Some("iss_0023_import_map")
+            Some("iss_0024_issue_create_idempotency")
         );
         for invariant in [
             "CREATE INDEX CONCURRENTLY",
@@ -677,6 +706,33 @@ mod tests {
     }
 
     #[test]
+    fn interactive_create_idempotency_is_durable_scoped_and_state_constrained() {
+        let migration = issues_migrations()
+            .0
+            .into_iter()
+            .find(|migration| migration.id == "iss_0024_issue_create_idempotency")
+            .expect("the interactive create idempotency migration");
+        assert_eq!(migration.table, Some(ISSUE_CREATE_IDEMPOTENCY_TABLE));
+        for invariant in [
+            "PRIMARY KEY (tenant_id, region, storage_nonce)",
+            "status IN ('pending','created')",
+            "status = 'pending' AND issue_id IS NULL",
+            "status = 'created' AND issue_id IS NOT NULL",
+            "myelin_make_tenant_scoped('issue_create_idempotency')",
+        ] {
+            assert!(
+                migration.ddl.contains(invariant),
+                "the interactive create ledger pins `{invariant}`"
+            );
+        }
+        assert!(issues_hot_tables().is_hot(ISSUE_CREATE_IDEMPOTENCY_TABLE));
+        assert!(
+            !migration.ddl.contains("REFERENCES issue"),
+            "the privacy-safe retry receipt survives issue deletion so a retry cannot recreate work"
+        );
+    }
+
+    #[test]
     fn the_runner_admits_the_whole_set_idempotently() {
         use myelin_substrate::MigrationRunner;
         let migrations = issues_migrations();
@@ -687,7 +743,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            29,
+            30,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -702,7 +758,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            29,
+            30,
             "the re-apply admits every migration again"
         );
     }

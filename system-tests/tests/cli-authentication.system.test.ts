@@ -1032,11 +1032,12 @@ describe("the CLI authentication journey", () => {
 
       // The active project's prefix and issue type are platform metadata, not user ceremony.
       const contextualIssueTitle = uniqueName("Created from the active project");
+      const contextualIssueKey = uniqueName("cli-context-issue");
       const contextualIssue = await runCli(
         configDirectory,
         "--json",
         "--idempotency-key",
-        uniqueName("cli-context-issue"),
+        contextualIssueKey,
         "issue",
         "create",
         contextualIssueTitle,
@@ -1055,12 +1056,43 @@ describe("the CLI authentication journey", () => {
         "CLI issue authorization request id",
       );
       expect(issueProposal).toMatchObject({
+        created: true,
+        durable: true,
         issue: {
           project_id: createdProject.project.id,
           key: expect.stringMatching(new RegExp(`^${createdProject.project.issue_prefix}-\\d+$`)),
         },
         authorization: { status: "pending" },
       });
+
+      const replayedContextualIssue = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        contextualIssueKey,
+        "issue",
+        "create",
+        contextualIssueTitle,
+      );
+      expect(replayedContextualIssue.exitCode, replayedContextualIssue.stderr).toBe(0);
+      expect(JSON.parse(replayedContextualIssue.stdout)).toEqual({
+        ...issueProposal,
+        created: false,
+      });
+      const conflictingContextualIssue = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        contextualIssueKey,
+        "issue",
+        "create",
+        `${contextualIssueTitle} but changed`,
+      );
+      expect(conflictingContextualIssue.exitCode).toBe(1);
+      expect(conflictingContextualIssue.stdout).toBe("");
+      expect(conflictingContextualIssue.stderr).toContain(
+        "idempotency key was already used for a different issue",
+      );
 
       const contextAfterProject = await runCli(configDirectory, "--json", "context", "current");
       expect(contextAfterProject.exitCode, contextAfterProject.stderr).toBe(0);

@@ -19,8 +19,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+mod create_idempotency;
 mod import_creation;
 
+use create_idempotency::{CreateClaim, CreateIdentity};
 use import_creation::{ImportClaim, ImportIdentity};
 pub use import_creation::{ImportIssue, ImportIssueReceipt};
 
@@ -92,22 +94,26 @@ pub struct IssueCreationReceipt {
     pub authorization_request_event_id: String,
 }
 
-struct IssueCreationOutcome {
-    receipt: IssueCreationReceipt,
-    created: bool,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueCreationOutcome {
+    pub receipt: IssueCreationReceipt,
+    pub created: bool,
 }
 
 enum CreationOrigin {
-    Interactive,
+    Interactive(Option<CreateIdentity>),
     Import(ImportIdentity),
 }
 
-struct CreationTxResult {
-    id: Uuid,
-    key: String,
-    project_id: Uuid,
-    request_event_id: String,
-    created: bool,
+enum CreationTxResult {
+    Stored {
+        id: Uuid,
+        key: String,
+        project_id: Uuid,
+        request_event_id: String,
+        created: bool,
+    },
+    Conflict,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -233,6 +239,7 @@ pub struct IssuePage {
 #[derive(Debug, PartialEq, Eq)]
 pub enum IssueStoreError {
     BadInput(String),
+    Conflict(String),
     NotFound,
     AuthorizationUnavailable(String),
     Storage(String),
@@ -243,6 +250,7 @@ impl core::fmt::Display for IssueStoreError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             IssueStoreError::BadInput(reason) => write!(f, "invalid issue request: {reason}"),
+            IssueStoreError::Conflict(reason) => write!(f, "issue request conflicts: {reason}"),
             IssueStoreError::NotFound => f.write_str("issue not found"),
             IssueStoreError::AuthorizationUnavailable(reason) => {
                 write!(f, "issue authorization unavailable: {reason}")
@@ -299,9 +307,33 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         proposal: CreateIssue,
     ) -> Result<IssueCreationReceipt, IssueStoreError> {
         Ok(self
-            .create_inner(principal, proposal, CreationOrigin::Interactive, false)
+            .create_inner(
+                principal,
+                principal,
+                proposal,
+                CreationOrigin::Interactive(None),
+                false,
+            )
             .await?
             .receipt)
+    }
+
+    pub async fn create_idempotent(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        proposal: CreateIssue,
+        caller_key: &str,
+    ) -> Result<IssueCreationOutcome, IssueStoreError> {
+        let identity = CreateIdentity::new(actor, caller_key, &proposal)?;
+        self.create_inner(
+            actor,
+            authorized_viewer,
+            proposal,
+            CreationOrigin::Interactive(Some(identity)),
+            false,
+        )
+        .await
     }
 
     pub async fn import_issue(
@@ -311,7 +343,13 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
     ) -> Result<ImportIssueReceipt, IssueStoreError> {
         let (identity, issue) = import.into_parts()?;
         let outcome = self
-            .create_inner(principal, issue, CreationOrigin::Import(identity), false)
+            .create_inner(
+                principal,
+                principal,
+                issue,
+                CreationOrigin::Import(identity),
+                false,
+            )
             .await?;
         Ok(ImportIssueReceipt {
             issue: outcome.receipt,
@@ -342,9 +380,34 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         proposal: CreateIssue,
     ) -> Result<IssueCreationReceipt, IssueStoreError> {
         Ok(self
-            .create_inner(principal, proposal, CreationOrigin::Interactive, true)
+            .create_inner(
+                principal,
+                principal,
+                proposal,
+                CreationOrigin::Interactive(None),
+                true,
+            )
             .await?
             .receipt)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn create_idempotent_then_abort_for_test(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        proposal: CreateIssue,
+        caller_key: &str,
+    ) -> Result<IssueCreationOutcome, IssueStoreError> {
+        let identity = CreateIdentity::new(actor, caller_key, &proposal)?;
+        self.create_inner(
+            actor,
+            authorized_viewer,
+            proposal,
+            CreationOrigin::Interactive(Some(identity)),
+            true,
+        )
+        .await
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -355,7 +418,13 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
     ) -> Result<ImportIssueReceipt, IssueStoreError> {
         let (identity, issue) = import.into_parts()?;
         let outcome = self
-            .create_inner(principal, issue, CreationOrigin::Import(identity), true)
+            .create_inner(
+                principal,
+                principal,
+                issue,
+                CreationOrigin::Import(identity),
+                true,
+            )
             .await?;
         Ok(ImportIssueReceipt {
             issue: outcome.receipt,
@@ -365,22 +434,31 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
 
     async fn create_inner(
         &self,
-        principal: &Principal,
+        actor: &Principal,
+        authorized_viewer: &Principal,
         proposal: CreateIssue,
         origin: CreationOrigin,
         abort_after_outbox: bool,
     ) -> Result<IssueCreationOutcome, IssueStoreError> {
-        let scope = self.scope(principal)?;
+        let scope = self.scope(actor)?;
+        if self.scope(authorized_viewer)? != scope {
+            return Err(IssueStoreError::BadInput(
+                "issue actor and authorized viewer must share one tenant and region".into(),
+            ));
+        }
         validate_create(&proposal)?;
-        if !self.authorizer.may_create(principal, &proposal.project_id) {
+        if !self
+            .authorizer
+            .may_create(authorized_viewer, &proposal.project_id)
+        {
             return Err(IssueStoreError::NotFound);
         }
 
-        let tenant = principal.tenant.clone();
-        let subject = SubjectId::new(title_dek_subject(principal));
+        let tenant = actor.tenant.clone();
+        let subject = SubjectId::new(title_dek_subject(actor));
         let sealed = encrypt_free_text(
             &self.kms,
-            &principal.region,
+            &actor.region,
             &tenant,
             &subject,
             IssueFreeText::Title,
@@ -394,7 +472,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let type_id = parse_uuid("type_id", &proposal.type_id)?;
         let issue_id = Uuid::new_v4();
         let prefix = proposal.prefix;
-        let created_by = principal.principal_id.0.clone();
+        let created_by = actor.principal_id.0.clone();
         let nonce = sealed.nonce.to_vec();
         let ciphertext = sealed.ciphertext;
         let key_ref = sealed.key_ref.to_uri();
@@ -403,7 +481,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let request_event_id: EventId = self.minter.mint().into();
         let created_event_id: EventId = self.minter.mint().into();
         let request_envelope = authorization_request_envelope(
-            principal,
+            actor,
             issue_id,
             project_id,
             &issue_object,
@@ -418,13 +496,35 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .provider
             .with_tenant_tx(&tenant_id.clone(), move |conn| {
                 Box::pin(async move {
+                    if let CreationOrigin::Interactive(Some(identity)) = &origin {
+                        match create_idempotency::claim(
+                            &mut *conn,
+                            &tenant_id,
+                            &region,
+                            identity,
+                        )
+                        .await?
+                        {
+                            CreateClaim::Acquired => {}
+                            CreateClaim::Existing(existing) => {
+                                return Ok(CreationTxResult::Stored {
+                                    id: existing.id,
+                                    key: existing.key,
+                                    project_id: existing.project_id,
+                                    request_event_id: existing.request_event_id,
+                                    created: false,
+                                });
+                            }
+                            CreateClaim::Conflict => return Ok(CreationTxResult::Conflict),
+                        }
+                    }
                     if let CreationOrigin::Import(identity) = &origin {
                         match import_creation::claim(&mut *conn, &tenant_id, &region, identity)
                             .await?
                         {
                             ImportClaim::Acquired => {}
                             ImportClaim::Existing(existing) => {
-                                return Ok(CreationTxResult {
+                                return Ok(CreationTxResult::Stored {
                                     id: existing.id,
                                     key: existing.key,
                                     project_id: existing.project_id,
@@ -498,6 +598,16 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                         )
                         .await?;
                     }
+                    if let CreationOrigin::Interactive(Some(identity)) = &origin {
+                        create_idempotency::complete(
+                            &mut *conn,
+                            &tenant_id,
+                            &region,
+                            identity,
+                            issue_id,
+                        )
+                        .await?;
+                    }
 
                     PgRelay::co_commit_in_tx(&mut *conn, &aggregate, &request_envelope).await?;
                     if abort_after_outbox {
@@ -505,7 +615,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                             "injected crash after authorization-request outbox stage".into(),
                         ));
                     }
-                    Ok(CreationTxResult {
+                    Ok(CreationTxResult::Stored {
                         id: row.get("id"),
                         key: row.get("key"),
                         project_id: row.get("project_id"),
@@ -516,15 +626,26 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             })
             .await
             .map_err(|e| IssueStoreError::Storage(e.to_string()))?;
-        Ok(IssueCreationOutcome {
-            receipt: IssueCreationReceipt {
-                id: result.id.to_string(),
-                key: result.key,
-                project_id: result.project_id.to_string(),
-                authorization_request_event_id: result.request_event_id,
-            },
-            created: result.created,
-        })
+        match result {
+            CreationTxResult::Stored {
+                id,
+                key,
+                project_id,
+                request_event_id,
+                created,
+            } => Ok(IssueCreationOutcome {
+                receipt: IssueCreationReceipt {
+                    id: id.to_string(),
+                    key,
+                    project_id: project_id.to_string(),
+                    authorization_request_event_id: request_event_id,
+                },
+                created,
+            }),
+            CreationTxResult::Conflict => Err(IssueStoreError::Conflict(
+                "that idempotency key was already used for a different issue".into(),
+            )),
+        }
     }
 
     pub async fn reconcile_authorization<W: IssueTupleWriter>(
