@@ -41,6 +41,7 @@ const firing = {
   run_id: runId,
   run_ref: `myelin://${tenant}/agent/run/${runId}`,
   outcome: "succeeded",
+  result_state: "available",
   approval: {
     decision: "approved",
     decided_by: "founder",
@@ -99,6 +100,10 @@ describe("automation response decoding", () => {
       page: { next_cursor: null, limit: 25 },
     })).toBeNull();
     expect(parseAutomationResult({ result: { ...result, charged_micro: -1 } })).toBeNull();
+    expect(parseAutomationFiringPage({
+      items: [{ ...firing, run_id: null, run_ref: null, result_state: "available" }],
+      page: { next_cursor: null, limit: 25 },
+    })).toBeNull();
   });
 
   it("rejects malformed pagination and partial approvals", () => {

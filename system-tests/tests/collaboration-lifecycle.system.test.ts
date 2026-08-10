@@ -255,8 +255,9 @@ command = ["true"]
       );
       return array(response.body.items, "governed trigger firing history")
         .map((item) => record(item, "governed trigger firing"))
-        .find((item) => item.event_id === eventId && item.state === "terminal");
-    }, { description: "the hosted agent to complete its one governed workflow" });
+        .find((item) => item.event_id === eventId && item.state === "terminal" &&
+          item.result_state === "available");
+    }, { description: "the hosted agent to complete with one readable durable work product" });
     const hostedRunId = string(completedFiring.run_id, "completed hosted run id");
     expect(hostedRunId).toMatch(/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
     expect(completedFiring).toMatchObject({
@@ -265,6 +266,7 @@ command = ["true"]
       trigger_ref: `myelin://${systemTestConfig.tenant}/identity/trigger/${triggerId}`,
       state: "terminal",
       outcome: "succeeded",
+      result_state: "available",
       approval: {
         decision: "approved",
         decided_by: expect.any(String),
@@ -355,6 +357,18 @@ command = ["true"]
       `/v1/triggers/${encodeURIComponent(triggerId)}/runs/${encodeURIComponent(hostedRunId)}/result`,
       { expectedStatus: 404 },
     );
+    const historyAfterErasure = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+    );
+    expect(array(historyAfterErasure.body.items, "history after agent result erasure"))
+      .toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          event_id: eventId,
+          run_id: hostedRunId,
+          outcome: "succeeded",
+          result_state: "erased",
+        }),
+      ]));
     const peerHistory = await reviewerClient.json(
       `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
       { expectedStatus: 403 },

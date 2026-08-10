@@ -204,7 +204,7 @@ export default function AutomationDetail() {
 }
 
 function FiringRow(props: { automationId: string; firing: AutomationFiringVM }) {
-  const resultAvailable = () => props.firing.outcome === "succeeded" && props.firing.run_id !== null;
+  const resultAvailable = () => props.firing.result_state === "available" && props.firing.run_id !== null;
   return (
     <li class="automation-firing-row">
       <span class="automation-status" data-state={props.firing.outcome ?? props.firing.state}>
@@ -223,6 +223,9 @@ function FiringRow(props: { automationId: string; firing: AutomationFiringVM }) 
         <time datetime={props.firing.created_at}>{formatAutomationTime(props.firing.created_at)}</time>
         <Show when={resultAvailable()}>
           <A href={`/automations/${props.automationId}/runs/${props.firing.run_id}`}>Read result</A>
+        </Show>
+        <Show when={props.firing.result_state === "erased"}>
+          <span>Result erased</span>
         </Show>
       </span>
     </li>

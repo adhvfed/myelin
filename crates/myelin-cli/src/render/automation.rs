@@ -206,6 +206,13 @@ fn render_firing(value: &Value) -> Option<String> {
     let event_id = terminal_safe_single_line(value.get("event_id")?.as_str()?);
     let state = value.get("state")?.as_str()?;
     let outcome = value.get("outcome").and_then(Value::as_str);
+    let result_state = match value.get("result_state")? {
+        Value::Null => None,
+        Value::String(state) if matches!(state.as_str(), "available" | "erased") => {
+            Some(state.as_str())
+        }
+        _ => return None,
+    };
     let marker = match outcome {
         Some("succeeded") => "✓",
         Some("failed" | "terminated" | "nondeterministic") => "✗",
@@ -229,8 +236,13 @@ fn render_firing(value: &Value) -> Option<String> {
                 .and_then(Value::as_str)
                 .unwrap_or("?")
         });
+    let result_suffix = match result_state {
+        Some("available") => "  result:available",
+        Some("erased") => "  result:erased",
+        _ => "",
+    };
     Some(format!(
-        "{marker} {}  {}  {}",
+        "{marker} {}  {}  {}{result_suffix}",
         terminal_safe_single_line(result),
         event_id,
         terminal_safe_single_line(destination),
@@ -351,11 +363,12 @@ mod tests {
             "run_id": "33333333-3333-4333-8333-333333333333",
             "run_ref": "myelin://acme/agent/run/33333333-3333-4333-8333-333333333333",
             "outcome": "succeeded",
+            "result_state": "available",
         }))
         .unwrap();
         assert_eq!(
             succeeded,
-            "✓ succeeded  ci-failed-1  myelin://acme/agent/run/33333333-3333-4333-8333-333333333333"
+            "✓ succeeded  ci-failed-1  myelin://acme/agent/run/33333333-3333-4333-8333-333333333333  result:available"
         );
 
         let approval = render_response(&json!({
@@ -370,6 +383,7 @@ mod tests {
                 "run_id": null,
                 "run_ref": null,
                 "outcome": null,
+                "result_state": null,
                 "approval": {
                     "decision": "approved",
                     "decided_by": "ada",

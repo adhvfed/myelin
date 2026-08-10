@@ -253,6 +253,21 @@ pub struct AgentTraceEraseReceipt {
     pub already_erased: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTraceAvailability {
+    Available,
+    Erased,
+}
+
+impl AgentTraceAvailability {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Available => "available",
+            Self::Erased => "erased",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EraseAgentTraceOutcome {
     Erased(AgentTraceEraseReceipt),
@@ -436,6 +451,81 @@ impl DurableAgentTraceStore {
                         &run_id,
                     )
                     .await
+                })
+            })
+            .await
+    }
+
+    /// Resolve one firing page's owner-visible result state in a single tenant-scoped query.
+    /// Missing entries deliberately remain absent: a run may still be settling, may have failed
+    /// before producing an answer, or may predate durable traces.
+    pub async fn availability_for_owner(
+        &self,
+        tenant: &str,
+        owner_principal: &str,
+        binding_id: sqlx::types::Uuid,
+        run_ids: &[String],
+    ) -> Result<BTreeMap<String, AgentTraceAvailability>, ProviderError> {
+        if run_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let tenant = tenant.to_string();
+        let owner_principal = owner_principal.to_string();
+        let run_ids = run_ids.to_vec();
+        let region = self.provider.config().region.clone();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |connection| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        "SELECT firing.run_id::text AS run_id, \
+                                trace.run_id IS NOT NULL AS available, \
+                                erasure.run_id IS NOT NULL AS erased \
+                           FROM agent_trigger_firing firing \
+                           JOIN agent_trigger_binding binding \
+                             ON binding.tenant_id = firing.tenant_id \
+                            AND binding.region = firing.region \
+                            AND binding.binding_id = firing.binding_id \
+                           LEFT JOIN knowledge_agent_trace trace \
+                             ON trace.tenant_id = firing.tenant_id \
+                            AND trace.region = firing.region \
+                            AND trace.run_id = firing.run_id::text \
+                           LEFT JOIN knowledge_agent_trace_erasure erasure \
+                             ON erasure.tenant_id = firing.tenant_id \
+                            AND erasure.region = firing.region \
+                            AND erasure.run_id = firing.run_id::text \
+                          WHERE firing.tenant_id = $1 AND firing.region = $2 \
+                            AND firing.binding_id = $3 \
+                            AND binding.owner_principal_id = $4 \
+                            AND firing.run_id::text = ANY($5::text[])",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(binding_id)
+                    .bind(&owner_principal)
+                    .bind(&run_ids)
+                    .fetch_all(&mut *connection)
+                    .await
+                    .map_err(trace_query)?;
+                    let mut availability = BTreeMap::new();
+                    for row in rows {
+                        let run_id = row.try_get::<String, _>("run_id").map_err(trace_query)?;
+                        let available = row.try_get::<bool, _>("available").map_err(trace_query)?;
+                        let erased = row.try_get::<bool, _>("erased").map_err(trace_query)?;
+                        let state = match (available, erased) {
+                            (true, false) => Some(AgentTraceAvailability::Available),
+                            (false, true) => Some(AgentTraceAvailability::Erased),
+                            (false, false) => None,
+                            (true, true) => {
+                                return Err(PgError::Query(
+                                    "agent trace is both live and erased".into(),
+                                ))
+                            }
+                        };
+                        if let Some(state) = state {
+                            availability.insert(run_id, state);
+                        }
+                    }
+                    Ok(availability)
                 })
             })
             .await

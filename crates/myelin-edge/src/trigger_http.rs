@@ -5,11 +5,11 @@ use myelin_identity::{Literal, ObjectType};
 use myelin_notif::pg_inbox::{InboxReadScope, PgInboxStore};
 use myelin_query::{CmpOp, EventMatcher, Expr, Predicate, QueryAst};
 use myelin_storage::{
-    AgentTriggerApprovalDecision, AgentTriggerFiringState, AgentTriggerLifecycleAction,
-    ChangeAgentTriggerApprovalOutcome, ChangeAgentTriggerLifecycleOutcome,
-    CreateAgentTriggerBindingOutcome, DurableAgentTraceStore, DurableAgentTriggerBacking,
-    DurableAgentTriggerBinding, DurableAgentTriggerFiring, EraseAgentTraceOutcome,
-    NewAgentTriggerBinding, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    AgentTraceAvailability, AgentTriggerApprovalDecision, AgentTriggerFiringState,
+    AgentTriggerLifecycleAction, ChangeAgentTriggerApprovalOutcome,
+    ChangeAgentTriggerLifecycleOutcome, CreateAgentTriggerBindingOutcome, DurableAgentTraceStore,
+    DurableAgentTriggerBacking, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
+    EraseAgentTraceOutcome, NewAgentTriggerBinding, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
     MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 use serde::Deserialize;
@@ -255,9 +255,29 @@ impl Handler for TriggerFiringListHandler {
         let next = has_more
             .then(|| firings.last().map(|firing| firing.event_id.clone()))
             .flatten();
+        let run_ids = firings
+            .iter()
+            .filter_map(|firing| firing.run_id.clone())
+            .collect::<Vec<_>>();
+        let availability = self
+            .api
+            .drive(self.api.traces.availability_for_owner(
+                &ctx.principal.tenant.0,
+                &ctx.principal.principal_id.0,
+                binding_id,
+                &run_ids,
+            ))?
+            .map_err(|error| EdgeError::Internal(error.to_string()))?;
         let items = firings
             .iter()
-            .map(|firing| firing_json(&ctx.principal.tenant.0, firing))
+            .map(|firing| {
+                let result = firing
+                    .run_id
+                    .as_ref()
+                    .and_then(|run_id| availability.get(run_id))
+                    .copied();
+                firing_json(&ctx.principal.tenant.0, firing, result)
+            })
             .collect::<Vec<_>>();
         Ok(no_store(EdgeResponse::json(
             200,
@@ -457,7 +477,7 @@ impl Handler for TriggerApprovalHandler {
                 "action": approval_action_token(self.decision),
                 "changed": outcome.changed,
                 "durable": true,
-                "firing": firing_json(&ctx.principal.tenant.0, &outcome.firing),
+                "firing": firing_json(&ctx.principal.tenant.0, &outcome.firing, None),
             }),
         )))
     }
@@ -785,7 +805,11 @@ fn binding_json(tenant: &str, binding: &DurableAgentTriggerBinding) -> Value {
     })
 }
 
-fn firing_json(tenant: &str, firing: &DurableAgentTriggerFiring) -> Value {
+fn firing_json(
+    tenant: &str,
+    firing: &DurableAgentTriggerFiring,
+    result: Option<AgentTraceAvailability>,
+) -> Value {
     json!({
         "event_id": firing.event_id,
         "event_type": firing.event_type,
@@ -799,6 +823,7 @@ fn firing_json(tenant: &str, firing: &DurableAgentTriggerFiring) -> Value {
             format!("myelin://{tenant}/agent/run/{run_id}")
         }),
         "outcome": firing.outcome.map(|outcome| outcome.token()),
+        "result_state": result.map(AgentTraceAvailability::token),
         "approval": firing.approval_decision.map(|decision| json!({
             "decision": decision.token(),
             "decided_by": firing.approval_decided_by,
