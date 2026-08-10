@@ -8,14 +8,14 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind, PrincipalStatus, Ru
 use myelin_identity_service::mint::{RunTokenAuthorizer, RunTokenMinter};
 use myelin_identity_service::{
     AgentRegistryError, AgentSessionError, AgentSessionIssuer, CredentialPurpose, PgAgentRegistry,
-    PrincipalStore, EXTERNAL_MCP_RUNTIME,
+    PrincipalStore, EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME,
 };
 use myelin_mcp::{
     GateApproverPolicy, GovernedRouter, GovernedRun, McpServer, OutboxGovernanceAudit,
     ToolRegistry, MAX_FRAME_BYTES,
 };
 use myelin_storage::hitl_gate_durable::HitlVerdictStore;
-use myelin_storage::{PgOutboxBacking, SubstrateProvider};
+use myelin_storage::{DurableAgentTriggerBacking, PgOutboxBacking, SubstrateProvider};
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::catalogue::{Handler, HandlerCtx, Method};
@@ -36,6 +36,7 @@ pub struct AgentMcpAuthority {
     run_tokens: RunTokenMinter,
     boundary: Arc<RunTokenAuthorizer>,
     principals: PrincipalStore,
+    hosted_runs: DurableAgentTriggerBacking,
 }
 
 impl AgentMcpAuthority {
@@ -45,6 +46,7 @@ impl AgentMcpAuthority {
         run_tokens: RunTokenMinter,
         boundary: Arc<RunTokenAuthorizer>,
         principals: PrincipalStore,
+        hosted_runs: DurableAgentTriggerBacking,
     ) -> Self {
         Self {
             registry,
@@ -52,6 +54,7 @@ impl AgentMcpAuthority {
             run_tokens,
             boundary,
             principals,
+            hosted_runs,
         }
     }
 }
@@ -157,29 +160,21 @@ impl Handler for AgentMcpHandler {
             .bearer()
             .filter(|bearer| !bearer.is_empty())
             .ok_or_else(|| EdgeError::Unauthorized("agent run bearer is missing".into()))?;
-        let authorized = self
-            .services
-            .drive(self.services.authority.sessions.authorize(
-                ctx.principal,
-                run_id,
-                &capability.jti,
-                Utc::now(),
-            ))?
-            .map_err(map_session_error)?;
+        let authorized = self.authorize_run(ctx, run_id, &capability.jti)?;
         let registration = self
             .services
             .drive(
                 self.services
                     .authority
                     .registry
-                    .get(ctx.principal, &authorized.agent_id),
+                    .get(ctx.principal, authorized.agent_id()),
             )?
             .map_err(map_registry_error)?;
-        validate_registration(ctx.principal, &registration)?;
+        validate_registration(ctx.principal, &registration, authorized.runtime_ref())?;
         let delegator = active_delegator(
             &self.services.authority.principals,
             ctx.scope,
-            &PrincipalId(registration.created_by.clone()),
+            &PrincipalId(authorized.delegator_id(&registration).to_string()),
         )?;
 
         let registry = ToolRegistry::for_cursors(&registration.tools)
@@ -192,7 +187,7 @@ impl Handler for AgentMcpHandler {
             scope: ctx.scope.clone(),
             agent_id: ctx.principal.principal_id.clone(),
             agent: ctx.principal.clone(),
-            run_id: RunId(authorized.run_id.clone()),
+            run_id: RunId(run_id.to_string()),
         };
         let effect_api = Box::new(
             RoutedEffectApi::try_new([
@@ -229,7 +224,7 @@ impl Handler for AgentMcpHandler {
             .map_err(EdgeError::Unavailable)?,
         );
         let approvers = Arc::new(CreatorApproverPolicy {
-            creator_id: PrincipalId(registration.created_by),
+            creator_id: PrincipalId(authorized.delegator_id(&registration).to_string()),
             scope: ctx.scope.clone(),
             principals: self.services.authority.principals.clone(),
             repos: self.services.resources.git.repo_authorizer().clone(),
@@ -261,7 +256,7 @@ impl Handler for AgentMcpHandler {
             .map_err(|_| EdgeError::BadRequest("MCP frame must be valid UTF-8".into()))?;
         let response = server.handle_line(frame);
 
-        if server.router().is_some_and(GovernedRouter::is_fatal) {
+        if authorized.is_external() && server.router().is_some_and(GovernedRouter::is_fatal) {
             self.services
                 .drive(self.services.authority.sessions.terminate(
                     ctx.principal,
@@ -284,6 +279,92 @@ impl Handler for AgentMcpHandler {
                 headers: Vec::new(),
                 body: Vec::new(),
             })),
+        }
+    }
+}
+
+enum AuthorizedAgentRun {
+    External {
+        agent_id: String,
+    },
+    Hosted {
+        agent_id: String,
+        delegator_id: String,
+    },
+}
+
+impl AuthorizedAgentRun {
+    fn agent_id(&self) -> &str {
+        match self {
+            Self::External { agent_id } | Self::Hosted { agent_id, .. } => agent_id,
+        }
+    }
+
+    fn delegator_id<'a>(
+        &'a self,
+        registration: &'a myelin_identity_service::AgentRegistration,
+    ) -> &'a str {
+        match self {
+            Self::External { .. } => &registration.created_by,
+            Self::Hosted { delegator_id, .. } => delegator_id,
+        }
+    }
+
+    fn runtime_ref(&self) -> &str {
+        match self {
+            Self::External { .. } => EXTERNAL_MCP_RUNTIME,
+            Self::Hosted { .. } => HOSTED_LUNA_RUNTIME,
+        }
+    }
+
+    fn is_external(&self) -> bool {
+        matches!(self, Self::External { .. })
+    }
+}
+
+impl AgentMcpHandler {
+    fn authorize_run(
+        &self,
+        ctx: &HandlerCtx<'_>,
+        run_id: &str,
+        token_jti: &str,
+    ) -> Result<AuthorizedAgentRun, EdgeError> {
+        match self
+            .services
+            .drive(self.services.authority.sessions.authorize(
+                ctx.principal,
+                run_id,
+                token_jti,
+                Utc::now(),
+            ))? {
+            Ok(run) => Ok(AuthorizedAgentRun::External {
+                agent_id: run.agent_id,
+            }),
+            Err(AgentSessionError::NotFound | AgentSessionError::RunNotFound) => {
+                let hosted = self
+                    .services
+                    .drive(
+                        self.services
+                            .authority
+                            .hosted_runs
+                            .started_for_run(&ctx.principal.tenant.0, run_id),
+                    )?
+                    .map_err(|_| {
+                        EdgeError::Unavailable("hosted agent run lookup is unavailable".into())
+                    })?
+                    .ok_or_else(|| EdgeError::NotFound("agent run not found".into()))?;
+                let expected_principal = format!("agent:{}", hosted.run_as_agent_id);
+                if hosted.runtime_ref != HOSTED_LUNA_RUNTIME
+                    || ctx.principal.principal_id.0 != expected_principal
+                {
+                    return Err(EdgeError::NotFound("agent run not found".into()));
+                }
+                Ok(AuthorizedAgentRun::Hosted {
+                    agent_id: hosted.run_as_agent_id,
+                    delegator_id: hosted.owner_principal_id,
+                })
+            }
+            Err(error) => Err(map_session_error(error)),
         }
     }
 }
@@ -411,9 +492,10 @@ fn run_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
 fn validate_registration(
     principal: &Principal,
     registration: &myelin_identity_service::AgentRegistration,
+    expected_runtime: &str,
 ) -> Result<(), EdgeError> {
     if registration.principal_id != principal.principal_id.0
-        || registration.runtime_ref != EXTERNAL_MCP_RUNTIME
+        || registration.runtime_ref != expected_runtime
         || registration.status != PrincipalStatus::Active
     {
         return Err(EdgeError::NotFound("agent run not found".into()));

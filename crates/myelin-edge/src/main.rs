@@ -1154,6 +1154,7 @@ async fn serve(
                 check.run_token_minter().clone(),
                 Arc::new(run_token_authorizer),
                 mcp_principals,
+                myelin_storage::DurableAgentTriggerBacking::new(provider.clone()),
             ),
             provider.clone(),
             AgentMcpResources::new(
