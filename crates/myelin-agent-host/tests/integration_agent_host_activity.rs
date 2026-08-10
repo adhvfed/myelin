@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use myelin_agent_host::{
     AgentHost, AgentHostActivityExecutor, HostedAgentActivityOutcome, HostedAgentRunExecutor,
-    HostedAgentWorkflowInput, HostedModelFactory,
+    HostedAgentStopReason, HostedAgentWorkflowInput, HostedModelFactory,
 };
 use myelin_agent_model::{ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, Usage};
 use myelin_config::MyelinConfig;
@@ -15,13 +15,28 @@ use myelin_identity::{
     DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef,
 };
 use myelin_identity_service::{NewAgent, PgAgentRegistry, HOSTED_LUNA_RUNTIME};
+use myelin_notif::pg_inbox::PgInboxStore;
+use myelin_notif::{agent_effect_approval_targets, pending_agent_effect_approval};
+use myelin_storage::hitl_gate_durable::{opaque_gate_id, GateRecord, GateState, HitlVerdictStore};
 use myelin_storage::migration::HotTables;
-use myelin_storage::reserve_settle::{CostLedger, RunId};
-use myelin_storage::{all_durable_migrations, CreditKind, MicroUsd, SealKey, SubstrateProvider};
+use myelin_storage::reserve_settle::{CostLedger, ReservationState, RunId};
+use myelin_storage::{
+    all_durable_migrations, CreditKind, MicroUsd, SealKey, SubstrateProvider, TenantScope,
+};
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
-fn admin_config() -> MyelinConfig {
+fn app_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
+fn admin_config() -> MyelinConfig {
+    let mut config = app_config();
     config.database_url = config
         .database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
@@ -36,6 +51,26 @@ fn unique(label: &str) -> String {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock follows the epoch")
             .as_nanos()
+    )
+}
+
+async fn test_provider() -> Option<SubstrateProvider> {
+    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
+        Ok(provider) => provider,
+        Err(_) => {
+            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
+            return None;
+        }
+    };
+    admin.migrate_foundation().await.unwrap();
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .unwrap();
+    Some(
+        SubstrateProvider::connect(app_config(), 8)
+            .await
+            .expect("open the constrained app provider"),
     )
 }
 
@@ -143,22 +178,9 @@ fn governed_input(tenant: &TenantId, region: &Region, run_id: &str) -> HostedAge
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_settled_agent_activity_replays_without_touching_the_model() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
+    let Some(app) = test_provider().await else {
+        return;
     };
-    admin.migrate_foundation().await.unwrap();
-    admin
-        .migrate(&all_durable_migrations(), &HotTables::none())
-        .await
-        .unwrap();
-
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
-        .await
-        .expect("open the constrained app provider");
     let tenant = TenantId(unique("hosted-activity"));
     let region = Region(app.config().region.clone());
     let run_id = unique("run");
@@ -253,22 +275,9 @@ async fn a_settled_agent_activity_replays_without_touching_the_model() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays_cleanly() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
+    let Some(app) = test_provider().await else {
+        return;
     };
-    admin.migrate_foundation().await.unwrap();
-    admin
-        .migrate(&all_durable_migrations(), &HotTables::none())
-        .await
-        .unwrap();
-
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
-        .await
-        .expect("open the constrained app provider");
     let tenant = TenantId(unique("hosted-execution"));
     let region = Region(app.config().region.clone());
     let founder = Principal::new(
@@ -424,4 +433,170 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
     })
     .await
     .expect("clean the isolated tenant story");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_expired_hosted_approval_settles_once_and_leaves_no_actionable_card() {
+    let Some(app) = test_provider().await else {
+        return;
+    };
+    let tenant = TenantId(unique("hosted-expiry"));
+    let region = Region(app.config().region.clone());
+    let run_id = unique("expired-run");
+    let input = governed_input(&tenant, &region, &run_id);
+    let cost_run = RunId::new(run_id.clone());
+    let mut ledger = CostLedger::with_pg(app.clone());
+    ledger
+        .reserve(
+            tenant.clone(),
+            cost_run.clone(),
+            MicroUsd(input.budget_minor_units),
+            MicroUsd(input.budget_minor_units),
+        )
+        .expect("the waiting run has a governed reservation");
+    ledger
+        .begin(&tenant, &cost_run)
+        .expect("the waiting run started before asking a human");
+
+    let gate_id = opaque_gate_id();
+    let scope = TenantScope::from_verified_token(&input.agent, region.clone());
+    let gate = GateRecord {
+        gate_id: gate_id.clone(),
+        run_id: run_id.clone(),
+        effect_id: myelin_mcp::governance::mcp_effect_key(
+            "git.merge",
+            &serde_json::json!({"repo": "platform", "number": 7}),
+        ),
+        risk_summary: b"Merge pull request platform#7".to_vec(),
+        cost_estimate: 0,
+        approver_filter: vec!["founder".into(), "maintainer".into()],
+        state: GateState::Waiting,
+        card_ref: Some(format!("myelin://{}/git/pr/platform:7", tenant.0)),
+        requested_by: input.agent.principal_id.0.clone(),
+        decided_by: None,
+        opened_at_unix: 90,
+        decided_at_unix: None,
+        expires_at_unix: 100,
+        approval_consumed_at_unix: None,
+    };
+    HitlVerdictStore::with_pg(app.clone())
+        .open(&scope, gate.clone())
+        .expect("the exact effect waits durably");
+    let inbox = PgInboxStore::new(app.db_pool().clone());
+    for recipient in &gate.approver_filter {
+        inbox
+            .ensure(&pending_agent_effect_approval(
+                &tenant, &region, recipient, &gate,
+            ))
+            .await
+            .expect("each eligible human sees the same exact decision");
+    }
+
+    let seal_key = SealKey::from_encoded(&"66".repeat(32)).expect("a 32-byte test seal key");
+    let host = Arc::new(
+        AgentHost::new(
+            app.clone(),
+            unique("hosted-expiry-cell"),
+            &seal_key,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .expect("the production host starts"),
+    );
+    let executor = AgentHostActivityExecutor::new(
+        host,
+        app.clone(),
+        tokio::runtime::Handle::current(),
+        Arc::new(RefusingModelFactory {
+            calls: AtomicUsize::new(0),
+        }),
+    );
+    let stop_key = format!("{run_id}/agent.run:2/expire");
+
+    let first = executor
+        .stop(
+            &input,
+            &stop_key,
+            100,
+            &gate_id,
+            HostedAgentStopReason::Expired,
+        )
+        .expect("the timer closes every durable surface");
+    assert_eq!(
+        HitlVerdictStore::with_pg(app.clone())
+            .fetch(&scope, &gate_id)
+            .expect("the gate remains queryable")
+            .state,
+        GateState::Expired,
+    );
+    assert_eq!(
+        CostLedger::with_pg(app.clone()).state_of(&tenant, &cost_run),
+        Some(ReservationState::Settled),
+    );
+    for target in agent_effect_approval_targets(&tenant, &region, &gate) {
+        assert_eq!(
+            inbox
+                .get(&target.scope, &target.item_id)
+                .await
+                .expect("the projected approval remains in history")
+                .item
+                .state,
+            "done",
+            "expiry never leaves another eligible human with a stale action",
+        );
+    }
+
+    assert_eq!(
+        executor
+            .stop(
+                &input,
+                &stop_key,
+                101,
+                &gate_id,
+                HostedAgentStopReason::Expired,
+            )
+            .expect("timer replay is idempotent"),
+        first,
+    );
+    let aggregate = format!("mcp-run:{run_id}");
+    let expiry_audits: i64 = app
+        .with_tenant_tx(&tenant.0, move |conn| {
+            Box::pin(async move {
+                sqlx::query_scalar(
+                    "SELECT count(*) FROM outbox \
+                     WHERE aggregate = $1 AND envelope->>'type_' = 'git.merge.expired'",
+                )
+                .bind(&aggregate)
+                .fetch_one(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+            })
+        })
+        .await
+        .expect("read the expiry audit");
+    assert_eq!(expiry_audits, 1, "timer replay emits one governance fact");
+
+    let cleanup_tenant = tenant.0.clone();
+    app.with_tenant_tx(&tenant.0, move |conn| {
+        Box::pin(async move {
+            for statement in [
+                "DELETE FROM outbox_quarantine WHERE event_id IN \
+                 (SELECT event_id FROM outbox WHERE envelope->>'tenant' = $1)",
+                "DELETE FROM outbox WHERE envelope->>'tenant' = $1",
+                "DELETE FROM notif_inbox_item WHERE tenant_id = $1",
+                "DELETE FROM agent_hitl_gate WHERE tenant_id = $1",
+                "DELETE FROM cost_event WHERE tenant_id = $1",
+                "DELETE FROM cost_reservation WHERE tenant_id = $1",
+            ] {
+                sqlx::query(statement)
+                    .bind(&cleanup_tenant)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .expect("clean the isolated expiry story");
 }

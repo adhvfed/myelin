@@ -35,8 +35,8 @@ pub mod watch;
 pub mod write_fanout;
 
 pub use agent_approval::{
-    agent_effect_approval_action, agent_effect_approval_item_id, pending_agent_effect_approval,
-    AgentEffectApprovalAction,
+    agent_effect_approval_action, agent_effect_approval_item_id, agent_effect_approval_targets,
+    pending_agent_effect_approval, AgentEffectApprovalAction, AgentEffectApprovalTarget,
 };
 pub use automation_approval::{
     automation_approval_action, automation_approval_item_id, pending_automation_approval,

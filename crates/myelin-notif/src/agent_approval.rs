@@ -3,7 +3,7 @@ use myelin_storage::hitl_gate_durable::{gate_id_from_ref_token, gate_ref_token, 
 use myelin_tenancy::{Region, TenantId};
 
 use crate::humanise::reason_template_key;
-use crate::pg_inbox::{DurableInboxItem, InboxUpsert};
+use crate::pg_inbox::{DurableInboxItem, InboxReadScope, InboxUpsert};
 use crate::ranking::reason_base_class;
 use crate::router::RoutedInboxItem;
 use crate::storm_control::subject_root_of;
@@ -17,6 +17,12 @@ pub struct AgentEffectApprovalAction {
     pub run_id: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentEffectApprovalTarget {
+    pub scope: InboxReadScope,
+    pub item_id: String,
+}
+
 pub fn agent_effect_approval_item_id(tenant: &TenantId, recipient: &str, gate_id: &str) -> String {
     let mut material = Vec::new();
     for component in [&tenant.0, recipient, gate_id] {
@@ -27,6 +33,24 @@ pub fn agent_effect_approval_item_id(tenant: &TenantId, recipient: &str, gate_id
         "agent-approval-{}",
         &blake3::hash(&material).to_hex().as_str()[..24]
     )
+}
+
+pub fn agent_effect_approval_targets(
+    tenant: &TenantId,
+    region: &Region,
+    gate: &GateRecord,
+) -> Vec<AgentEffectApprovalTarget> {
+    gate.approver_filter
+        .iter()
+        .map(|recipient| AgentEffectApprovalTarget {
+            scope: InboxReadScope {
+                tenant: tenant.clone(),
+                region: region.clone(),
+                recipient: recipient.clone(),
+            },
+            item_id: agent_effect_approval_item_id(tenant, recipient, &gate.gate_id),
+        })
+        .collect()
 }
 
 pub fn pending_agent_effect_approval(
@@ -140,5 +164,19 @@ mod tests {
                 run_id: "run-7".into(),
             })
         );
+    }
+
+    #[test]
+    fn one_decision_targets_every_eligible_approvers_copy_of_the_card() {
+        let tenant = TenantId("acme".into());
+        let region = Region("eu-north".into());
+        let mut gate = gate();
+        gate.approver_filter = vec!["founder".into(), "maintainer".into()];
+
+        let targets = agent_effect_approval_targets(&tenant, &region, &gate);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].scope.recipient, "founder");
+        assert_eq!(targets[1].scope.recipient, "maintainer");
+        assert_ne!(targets[0].item_id, targets[1].item_id);
     }
 }

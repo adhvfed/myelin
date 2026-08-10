@@ -5,7 +5,7 @@ use chrono::Utc;
 use myelin_agent_service::hosted_run_contract::{
     hosted_agent_decision_ref, HostedAgentDecision, HOSTED_AGENT_APPROVAL_SIGNAL,
 };
-use myelin_events::{IdMinter, OutboxStore, Timestamp, Ulid, UlidMinter};
+use myelin_events::{OutboxStore, Timestamp, UlidMinter};
 use myelin_flow::{DurableExecutor, PgFlowExecutor, RunId as FlowRunId, SignalSpec};
 use myelin_git::core::RepoLoc;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, PrincipalStatus, RunId, RunToken};
@@ -15,12 +15,12 @@ use myelin_identity_service::{
     PrincipalStore, EXTERNAL_MCP_RUNTIME, HOSTED_LUNA_RUNTIME,
 };
 use myelin_mcp::{
-    git_merge_repo_from_effect_key, AuditPhase, GateApproverPolicy, GovernanceAudit,
-    GovernanceAuditRecord, GovernedRouter, GovernedRun, McpServer, OutboxGovernanceAudit,
-    ToolRegistry, MAX_FRAME_BYTES,
+    git_merge_repo_from_effect_key, AuditPhase, GateApproverPolicy, GateAuditMinter,
+    GovernanceAudit, GovernanceAuditRecord, GovernedRouter, GovernedRun, McpServer,
+    OutboxGovernanceAudit, ToolRegistry, MAX_FRAME_BYTES,
 };
-use myelin_notif::pg_inbox::{InboxReadScope, PgInboxStore};
-use myelin_notif::{agent_effect_approval_item_id, pending_agent_effect_approval};
+use myelin_notif::pg_inbox::PgInboxStore;
+use myelin_notif::{agent_effect_approval_targets, pending_agent_effect_approval};
 use myelin_storage::hitl_gate_durable::{
     DurableHitlGateBacking, GateDecideError, GateDecisionOutcome, GateState, HitlVerdictStore,
 };
@@ -206,21 +206,23 @@ impl AgentMcpServices {
             .map_err(map_gate_decision_error)?;
         self.audit_gate_decision(ctx, &outcome.record, decision)?;
         self.wake_hosted_run(ctx, &outcome.record, decision)?;
-        let item_id = agent_effect_approval_item_id(
-            &ctx.principal.tenant,
-            &ctx.principal.principal_id.0,
-            gate_id,
-        );
-        self.drive(self.inbox.complete_if_present(
-            &InboxReadScope {
-                tenant: ctx.principal.tenant.clone(),
-                region: ctx.principal.region.clone(),
-                recipient: ctx.principal.principal_id.0.clone(),
-            },
-            &item_id,
-        ))?
-        .map_err(|_| EdgeError::Unavailable("agent approval inbox is unavailable".into()))?;
+        self.complete_gate_notifications(ctx.scope, &outcome.record)?;
         Ok(outcome)
+    }
+
+    fn complete_gate_notifications(
+        &self,
+        scope: &myelin_storage::TenantScope,
+        gate: &myelin_storage::hitl_gate_durable::GateRecord,
+    ) -> Result<(), EdgeError> {
+        for target in agent_effect_approval_targets(scope.tenant(), scope.region(), gate) {
+            self.drive(
+                self.inbox
+                    .complete_if_present(&target.scope, &target.item_id),
+            )?
+            .map_err(|_| EdgeError::Unavailable("agent approval inbox is unavailable".into()))?;
+        }
+        Ok(())
     }
 
     fn audit_gate_decision(
@@ -249,10 +251,10 @@ impl AgentMcpServices {
         .to_rfc3339();
         let audit = OutboxGovernanceAudit::new(
             self.outbox.clone(),
-            Arc::new(GateDecisionMinter::new(
+            Arc::new(GateAuditMinter::new(
                 ctx.scope.tenant().as_str(),
                 &gate.gate_id,
-                decision,
+                phase,
             )),
         );
         audit
@@ -313,21 +315,6 @@ impl AgentMcpServices {
             );
             EdgeError::Unavailable("hosted agent approval wake is unavailable".into())
         })
-    }
-}
-
-struct GateDecisionMinter(Ulid);
-
-impl GateDecisionMinter {
-    fn new(tenant: &str, gate_id: &str, decision: HostedAgentDecision) -> Self {
-        let digest = blake3::hash(format!("{tenant}\0{gate_id}\0{}", decision.as_str()).as_bytes());
-        Self(Ulid(digest.to_hex().as_str()[..26].to_ascii_uppercase()))
-    }
-}
-
-impl IdMinter for GateDecisionMinter {
-    fn mint(&self) -> Ulid {
-        self.0.clone()
     }
 }
 

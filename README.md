@@ -187,8 +187,9 @@ reason up to the effect, but Myelin withholds the mutation, parks the durable wo
 holding a model runtime, and places the exact pull request in every eligible human approver's
 shared inbox. Web and CLI decisions are durable and idempotent. Approval wakes the same workflow
 with a fresh attempt-scoped run credential and can authorize only that effect once; rejection or
-expiry settles the run without applying it. The agent remains the attributed actor while its
-active human delegation supplies repository visibility, so neither side needs a GitHub token.
+expiry settles the run without applying it and closes every approver's copy of the card. The agent
+remains the attributed actor while its active human delegation supplies repository visibility, so
+neither side needs a GitHub token.
 
 Three-segment events carry their subject type in the name, so `issue.issue.updated`,
 `knowledge.page.updated`, and `chat.message.created` need no extra matcher ceremony. Ambiguous

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use myelin_agent::{EffectApi, EffectAuthority, EffectResult, ProposedEffect, RunCtx};
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EventDraft, EventType, IdMinter,
-    OutboxStore, OutboxTx, Timestamp, Visibility,
+    OutboxStore, OutboxTx, Timestamp, Ulid, Visibility,
 };
 use myelin_identity::{
     DelegationCaveats, FailStaticBound, Principal, PrincipalId, RevokeTarget, RunId, RunToken,
@@ -140,6 +140,34 @@ pub enum AuditPhase {
     Approved,
     Rejected,
     Expired,
+}
+
+impl AuditPhase {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Attempt => "attempted",
+            Self::Outcome => "outcome",
+            Self::Approved => "approved",
+            Self::Rejected => "rejected",
+            Self::Expired => "expired",
+        }
+    }
+}
+
+/// Produces a stable event identity for a retryable gate lifecycle audit.
+pub struct GateAuditMinter(Ulid);
+
+impl GateAuditMinter {
+    pub fn new(tenant: &str, gate_id: &str, phase: AuditPhase) -> Self {
+        let digest = blake3::hash(format!("{tenant}\0{gate_id}\0{}", phase.as_str()).as_bytes());
+        Self(Ulid(digest.to_hex().as_str()[..26].to_ascii_uppercase()))
+    }
+}
+
+impl IdMinter for GateAuditMinter {
+    fn mint(&self) -> Ulid {
+        self.0.clone()
+    }
 }
 
 pub struct GovernanceAuditRecord<'a> {
@@ -1177,7 +1205,26 @@ impl EffectApi for SkeletonEffectApi {
 
 #[cfg(test)]
 mod security_tests {
-    use super::{git_merge_repo_from_effect_key, mcp_effect_key};
+    use myelin_events::IdMinter;
+
+    use super::{git_merge_repo_from_effect_key, mcp_effect_key, AuditPhase, GateAuditMinter};
+
+    #[test]
+    fn gate_lifecycle_audits_have_retry_stable_but_exact_event_identities() {
+        let approved = GateAuditMinter::new("acme", "gate:one", AuditPhase::Approved).mint();
+        assert_eq!(
+            approved,
+            GateAuditMinter::new("acme", "gate:one", AuditPhase::Approved).mint()
+        );
+        assert_ne!(
+            approved,
+            GateAuditMinter::new("acme", "gate:one", AuditPhase::Expired).mint()
+        );
+        assert_ne!(
+            approved,
+            GateAuditMinter::new("acme", "gate:two", AuditPhase::Approved).mint()
+        );
+    }
 
     #[test]
     fn effect_key_is_canonical_bounded_and_binds_the_validated_repo() {

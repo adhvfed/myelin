@@ -27,6 +27,7 @@ myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-events = { path = "../myelin-events" }
 serde_json = { workspace = true }
+blake3 = { workspace = true }
 
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 
@@ -38,7 +39,6 @@ myelin-config = { workspace = true }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 sqlx = { workspace = true }
-blake3 = { workspace = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 
 [features]

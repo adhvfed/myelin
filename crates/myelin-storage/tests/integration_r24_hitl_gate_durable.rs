@@ -10,8 +10,18 @@ use myelin_storage::migration::HotTables;
 use myelin_storage::{SubstrateProvider, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 
-fn admin_config() -> MyelinConfig {
+fn app_config() -> MyelinConfig {
     let mut c = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            c.database_url = database_url;
+        }
+    }
+    c
+}
+
+fn admin_config() -> MyelinConfig {
+    let mut c = app_config();
     c.database_url = c
         .database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
@@ -71,7 +81,7 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         .await
         .expect("migration 0054 applies (idempotent)");
 
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 4)
+    let app = SubstrateProvider::connect(app_config(), 4)
         .await
         .expect("open the app-role provider");
     let region = app.config().region.clone();
@@ -87,7 +97,7 @@ async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_
         .open(&scope, waiting(&suffix, &gate_id, effect))
         .expect("the pending gate row INSERTs");
 
-    let app2 = SubstrateProvider::connect(MyelinConfig::dev(), 4)
+    let app2 = SubstrateProvider::connect(app_config(), 4)
         .await
         .expect("open a second app-role provider (simulated second process)");
     let mut store2 = HitlVerdictStore::with_pg(app2);

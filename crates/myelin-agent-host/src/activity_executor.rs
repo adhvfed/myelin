@@ -6,8 +6,15 @@ use myelin_agent_service::{
     catalogue_cursor, hosted_run_contract::gate_ref_token, PlatformToolCatalogue, ToolExecError,
     ToolExecutionContext, ToolExecutor,
 };
-use myelin_events::{OutboxStore, UlidMinter};
+use myelin_events::{OutboxStore, Timestamp, UlidMinter};
 use myelin_flow::WfJournal;
+use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RunId};
+use myelin_mcp::{
+    git_merge_repo_from_effect_key, AuditPhase, GateAuditMinter, GovernanceAudit,
+    GovernanceAuditRecord, OutboxGovernanceAudit,
+};
+use myelin_notif::agent_effect_approval_targets;
+use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_storage::hitl_gate_durable::{DurableHitlGateBacking, GateState};
 use myelin_storage::reserve_settle::{CostLedger, ReservationState, RunId as CostRunId};
 use myelin_storage::{PgOutboxBacking, SubstrateProvider, TenantScope};
@@ -53,6 +60,7 @@ pub struct AgentHostActivityExecutor {
     provider: SubstrateProvider,
     outbox: OutboxStore,
     gates: DurableHitlGateBacking,
+    inbox: PgInboxStore,
     runtime: tokio::runtime::Handle,
     models: Arc<dyn HostedModelFactory>,
     tools: Arc<dyn ToolExecutor>,
@@ -72,6 +80,7 @@ impl AgentHostActivityExecutor {
         Self {
             host,
             gates: DurableHitlGateBacking::new(provider.clone()),
+            inbox: PgInboxStore::new(provider.db_pool().clone()),
             provider,
             outbox,
             runtime,
@@ -148,6 +157,68 @@ impl AgentHostActivityExecutor {
             reason.as_str(),
             gate_ref_token(gate_id)
         ))
+    }
+
+    fn expire_gate(
+        &self,
+        input: &HostedAgentWorkflowInput,
+        gate_id: &str,
+        now_secs: i64,
+    ) -> Result<(), String> {
+        let scope = TenantScope::from_verified_token(&input.agent, input.region.clone());
+        let outcome = self
+            .drive(self.gates.expire_if_due(&scope, gate_id, now_secs))
+            .map_err(|error| format!("expire hosted approval gate: {error}"))?
+            .map_err(|error| format!("expire hosted approval gate: {error}"))?;
+        let gate = outcome.record;
+        if gate.run_id != input.run_id || gate.requested_by != input.agent.principal_id.0 {
+            return Err("expired approval gate is not bound to this hosted run".into());
+        }
+        let tool = if git_merge_repo_from_effect_key(&gate.effect_id).is_some() {
+            "git.merge"
+        } else {
+            return Err("expired approval gate has no governance audit taxonomy".into());
+        };
+        let audited_at_unix = gate.decided_at_unix.unwrap_or(gate.expires_at_unix);
+        let audited_at = chrono::DateTime::from_timestamp(audited_at_unix, 0)
+            .ok_or_else(|| "hosted approval expiry timestamp is invalid".to_string())?
+            .to_rfc3339();
+        let actor = Principal::new(
+            input.tenant.clone(),
+            input.region.clone(),
+            PrincipalId("service:mcp-hitl-expiry".into()),
+            PrincipalKind::Service,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        OutboxGovernanceAudit::new(
+            self.outbox.clone(),
+            Arc::new(GateAuditMinter::new(
+                input.tenant.as_str(),
+                &gate.gate_id,
+                AuditPhase::Expired,
+            )),
+        )
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &RunId(gate.run_id.clone()),
+            gate_id: Some(&gate.gate_id),
+            tool,
+            jti: "system:hitl-expiry",
+            phase: AuditPhase::Expired,
+            outcome: None,
+            now: &Timestamp(audited_at),
+        })
+        .map_err(|error| format!("audit hosted approval expiry: {error}"))?;
+        for target in agent_effect_approval_targets(&input.tenant, &input.region, &gate) {
+            self.drive(
+                self.inbox
+                    .complete_if_present(&target.scope, &target.item_id),
+            )
+            .map_err(|error| format!("complete expired approval inbox item: {error:?}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -231,10 +302,7 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
             return Err("hosted stop activity key belongs to a different run".into());
         }
         if reason == HostedAgentStopReason::Expired {
-            let scope = TenantScope::from_verified_token(&input.agent, input.region.clone());
-            self.drive(self.gates.expire_if_due(&scope, gate_id, now_secs))
-                .map_err(|error| format!("expire hosted approval gate: {error}"))?
-                .map_err(|error| format!("expire hosted approval gate: {error}"))?;
+            self.expire_gate(input, gate_id, now_secs)?;
         }
         let mut ledger = CostLedger::with_pg(self.provider.clone());
         ledger
