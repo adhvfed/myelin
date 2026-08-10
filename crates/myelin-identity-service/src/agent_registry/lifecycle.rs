@@ -106,7 +106,8 @@ impl PgAgentRegistry {
                         };
                     }
 
-                    let Some(mut agent) = lock_agent(conn, &tenant, &region, agent_id).await?
+                    let Some(mut agent) =
+                        lock_owned_agent(conn, &tenant, &region, &actor_id, agent_id).await?
                     else {
                         return Ok(LifecycleTx::NotFound);
                     };
@@ -297,10 +298,11 @@ async fn lifecycle_by_nonce(
     .transpose()
 }
 
-async fn lock_agent(
+async fn lock_owned_agent(
     conn: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
+    owner_principal_id: &str,
     agent_id: Uuid,
 ) -> Result<Option<AgentRegistration>, myelin_storage::PgError> {
     let row = sqlx::query(
@@ -310,11 +312,13 @@ async fn lock_agent(
            JOIN principal p ON p.tenant_id = a.tenant_id AND p.region = a.region \
             AND p.principal_id = 'agent:' || a.agent_id::text \
           WHERE a.tenant_id = $1 AND a.region = $2 AND a.agent_id = $3 \
+            AND a.created_by = $4 \
           FOR UPDATE OF p",
     )
     .bind(tenant)
     .bind(region)
     .bind(agent_id)
+    .bind(owner_principal_id)
     .fetch_optional(&mut *conn)
     .await
     .map_err(query_error("lock agent for lifecycle change"))?;

@@ -413,6 +413,40 @@ async fn a_human_can_pause_and_retire_an_agent_without_leaving_a_live_run_behind
     );
     let scope = TenantScope::from_verified_token(&active_agent, active_agent.region.clone());
 
+    let colleague = Principal::new(
+        actor.tenant.clone(),
+        actor.region.clone(),
+        PrincipalId("human:curious-colleague".into()),
+        PrincipalKind::Human,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    assert!(matches!(
+        registry
+            .change_status(
+                &colleague,
+                lifecycle_request(
+                    &agent.id,
+                    AgentLifecycleAction::Retire,
+                    "a-colleague-cannot-retire-this-agent",
+                ),
+            )
+            .await,
+        Err(myelin_identity_service::AgentRegistryError::NotFound)
+    ));
+    assert!(
+        issuer
+            .authorize(
+                &active_agent,
+                &first_run.session.run_id,
+                &first_run.run_token.jti,
+                now + Duration::seconds(1),
+            )
+            .await
+            .is_ok(),
+        "another human cannot disturb the owner’s live collaborator"
+    );
+
     let suspension = registry
         .change_status(
             &actor,

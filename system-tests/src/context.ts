@@ -10,7 +10,9 @@ export const reviewerClient = new SystemTestClient({
   token: systemTestConfig.reviewerToken,
 });
 
-export async function browserApprovedCliClient(): Promise<SystemTestClient> {
+export async function browserApprovedCliClient(
+  approver: SystemTestClient = systemClient,
+): Promise<SystemTestClient> {
   const codeVerifier = randomBytes(32).toString("base64url");
   const codeChallenge = createHash("sha256").update(codeVerifier, "utf8").digest("base64url");
   const started = await systemClient.json("/v1/auth/device/authorization", {
@@ -22,7 +24,7 @@ export async function browserApprovedCliClient(): Promise<SystemTestClient> {
   const deviceCode = string(started.body.device_code, "CLI device code");
   const userCode = string(started.body.user_code, "browser approval code");
 
-  await systemClient.json("/v1/auth/device/approval", {
+  await approver.json("/v1/auth/device/approval", {
     method: "POST",
     body: { user_code: userCode },
   });

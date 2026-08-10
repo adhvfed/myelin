@@ -58,6 +58,7 @@ async fn seed_people_and_agent(
                     "INSERT INTO principal \
                        (tenant_id, region, principal_id, kind, data_role, status) VALUES \
                        ($1, $2, 'founder', $3, $4, $5), \
+                       ($1, $2, 'reviewer', $3, $4, $5), \
                        ($1, $2, $6, $7, $8, $5)",
                 )
                 .bind(&tenant)
@@ -169,6 +170,16 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
     seed_people_and_agent(&app, &tenant, agent_id, "hosted:luna").await;
     let triggers = DurableAgentTriggerBacking::new(app.clone());
     let proposal = red_mainline_binding(agent_id);
+
+    let mut borrowed_agent = proposal.clone();
+    borrowed_agent.binding_id = Uuid::new_v4();
+    borrowed_agent.owner_principal_id = "reviewer".into();
+    borrowed_agent.client_nonce = "reviewer-cannot-spend-founders-agent".into();
+    assert_eq!(
+        triggers.create(&tenant, borrowed_agent).await.unwrap(),
+        CreateAgentTriggerBindingOutcome::AgentUnavailable,
+        "a colleague cannot author prompts or spend through an agent they do not own"
+    );
 
     let created = triggers
         .create(&tenant, proposal.clone())

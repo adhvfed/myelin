@@ -76,11 +76,13 @@ impl DurableAgentTriggerBacking {
                             AND p.region = a.region \
                             AND p.principal_id = 'agent:' || a.agent_id::text \
                           WHERE a.tenant_id = $1 AND a.region = $2 AND a.agent_id = $3 \
+                            AND a.created_by = $4 \
                           FOR UPDATE OF p",
                     )
                     .bind(&tenant)
                     .bind(&region)
                     .bind(proposal.run_as_agent_id)
+                    .bind(&proposal.owner_principal_id)
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("verify trigger run-as agent"))?;

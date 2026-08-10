@@ -57,6 +57,32 @@ describe("collaboration lifecycle", () => {
     });
     const agent = record(activated.body.agent, "activated triage agent");
     const agentId = string(agent.id, "triage agent id");
+    const colleague = await browserApprovedCliClient(reviewerClient);
+
+    const colleagueRetirement = await colleague.json(
+      `/v1/agents/${encodeURIComponent(agentId)}/retire`,
+      {
+        method: "POST",
+        body: {},
+        idempotencyKey: `colleague-agent-retire-${randomUUID()}`,
+        expectedStatus: 404,
+      },
+    );
+    expect(colleagueRetirement.body).toMatchObject({ error: { code: "not_found" } });
+
+    const borrowedAgentTrigger = await colleague.json("/v1/triggers", {
+      method: "POST",
+      body: {
+        event_type: "ci.run.failed",
+        run_as_agent_id: agentId,
+        task: "Spend somebody else’s agent budget.",
+        budget_minor_units: 1,
+        max_firings: 1,
+      },
+      idempotencyKey: `colleague-trigger-${randomUUID()}`,
+      expectedStatus: 409,
+    });
+    expect(borrowedAgentTrigger.body).toMatchObject({ error: { code: "conflict" } });
 
     const triggerRetryKey = `trigger-${randomUUID()}`;
     const intent = {
