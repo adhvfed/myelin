@@ -2,7 +2,12 @@ import { randomUUID } from "node:crypto";
 
 import { describe, expect, test } from "vitest";
 
-import { reviewerClient, systemClient, uniqueName } from "../src/context.js";
+import {
+  browserApprovedCliClient,
+  reviewerClient,
+  systemClient,
+  uniqueName,
+} from "../src/context.js";
 import { eventually } from "../src/eventually.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
@@ -34,6 +39,76 @@ async function awaitActiveIssue(title: string): Promise<JsonRecord> {
 }
 
 describe("collaboration lifecycle", () => {
+  test("binds red mainline CI to one governed agent without an integration API key", async () => {
+    const founder = await browserApprovedCliClient();
+    const agentName = uniqueName("triage-bot");
+    const agentRetryKey = `agent-${randomUUID()}`;
+    const activated = await founder.json("/v1/agents", {
+      method: "POST",
+      body: { name: agentName, tools: ["ci.read_run", "issues.create"] },
+      idempotencyKey: agentRetryKey,
+      expectedStatus: 201,
+    });
+    const agent = record(activated.body.agent, "activated triage agent");
+    const agentId = string(agent.id, "triage agent id");
+
+    const triggerRetryKey = `trigger-${randomUUID()}`;
+    const intent = {
+      event_type: "ci.run.failed",
+      source_branch: "main",
+      run_as_agent_id: agentId,
+      task: "Find the failure, open an issue, and prepare the smallest safe fix.",
+      max_firings: 10,
+      max_causal_depth: 4,
+      delegation_caveats: ["repo:core", "issue:create"],
+    };
+    const created = await founder.json("/v1/triggers", {
+      method: "POST",
+      body: intent,
+      idempotencyKey: triggerRetryKey,
+      expectedStatus: 201,
+    });
+    const trigger = record(created.body.trigger, "created CI trigger");
+    const triggerId = string(trigger.id, "CI trigger id");
+    expect(created.body).toMatchObject({ created: true, durable: true });
+    expect(trigger).toMatchObject({
+      run_as_agent_id: agentId,
+      event_type: "ci.run.failed",
+      task: intent.task,
+      max_firings: 10,
+      firings_used: 0,
+      require_no_personal_data: true,
+      state: "active",
+    });
+
+    const replay = await founder.json("/v1/triggers", {
+      method: "POST",
+      body: intent,
+      idempotencyKey: triggerRetryKey,
+      expectedStatus: 200,
+    });
+    expect(replay.body).toMatchObject({
+      created: false,
+      durable: true,
+      trigger: { id: triggerId, run_as_agent_id: agentId },
+    });
+
+    const conflict = await founder.json("/v1/triggers", {
+      method: "POST",
+      body: { ...intent, task: "Take broader action." },
+      idempotencyKey: triggerRetryKey,
+      expectedStatus: 409,
+    });
+    expect(conflict.body).toMatchObject({ error: { code: "conflict" } });
+
+    const rediscovered = await founder.json("/v1/triggers?limit=100");
+    expect(array(rediscovered.body.items, "founder's agent triggers")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: triggerId, run_as_agent_id: agentId }),
+      ]),
+    );
+  });
+
   test("lets a founder create and rediscover a project without operator-provided IDs", async () => {
     const name = uniqueName("Developer experience");
     const issuePrefix = `P${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`;

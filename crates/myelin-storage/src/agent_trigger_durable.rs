@@ -185,6 +185,44 @@ impl DurableAgentTriggerBacking {
             .await
     }
 
+    pub async fn list_for_owner(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<Vec<DurableAgentTriggerBinding>, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner_principal_id = owner_principal_id.to_string();
+        let limit = i64::from(limit.clamp(1, 1_000));
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let rows = sqlx::query(
+                        "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
+                                event_type, matcher, task, delegation_caveats, max_firings, \
+                                firings_used, max_causal_depth, require_no_personal_data, \
+                                require_human_approval, state, created_at \
+                           FROM agent_trigger_binding \
+                          WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3 \
+                            AND ($4::uuid IS NULL OR binding_id > $4::uuid) \
+                          ORDER BY binding_id LIMIT $5",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&owner_principal_id)
+                    .bind(after)
+                    .bind(limit)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(query_error("list agent trigger bindings for owner"))?;
+                    rows.iter().map(binding_from_row).collect()
+                })
+            })
+            .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn reserve_firing(
         &self,

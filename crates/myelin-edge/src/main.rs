@@ -1139,6 +1139,11 @@ async fn serve(
         agent_sessions.clone(),
         handle.clone(),
     );
+    builder = myelin_edge::register_triggers(
+        builder,
+        myelin_storage::DurableAgentTriggerBacking::new(provider.clone()),
+        handle.clone(),
+    );
     let mcp_chat = DurableChatReadApi::new(provider.db_pool().clone(), handle.clone(), kms.clone());
     builder = register_agent_mcp(
         builder,

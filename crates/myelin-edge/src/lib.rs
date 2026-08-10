@@ -36,6 +36,7 @@ pub mod server;
 pub mod session;
 pub mod sse;
 pub mod tool_http;
+pub mod trigger_http;
 
 pub use agent_http::register_agents;
 pub use agent_mcp_http::{
@@ -112,3 +113,4 @@ pub use server::{
 pub use session::{SessionRecord, SessionStore, SESSION_COOKIE};
 pub use sse::{SseEvent, SseHub, SseSubscription};
 pub use tool_http::register_tools;
+pub use trigger_http::register_triggers;
