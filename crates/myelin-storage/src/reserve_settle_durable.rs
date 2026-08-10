@@ -226,6 +226,52 @@ impl DurableCostLedger {
             .map_err(DurableSettleError::Ledger)
     }
 
+    pub async fn stop_if_present_in_tx(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<bool, DurableSettleError> {
+        let region = self.region();
+        let state = sqlx::query_scalar::<_, String>(
+            "SELECT state FROM cost_reservation \
+             WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
+        )
+        .bind(&tenant.0)
+        .bind(&region)
+        .bind(&run.0)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(|_| DurableSettleError::Store)?;
+        let Some(state) = state else {
+            return Ok(false);
+        };
+        match parse_state(&state).map_err(|_| DurableSettleError::Store)? {
+            ReservationState::Reserved => {
+                sqlx::query(
+                    "UPDATE cost_reservation SET state = $4 \
+                     WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+                )
+                .bind(&tenant.0)
+                .bind(&region)
+                .bind(&run.0)
+                .bind(state_token(ReservationState::Cancelled))
+                .execute(&mut *conn)
+                .await
+                .map_err(|_| DurableSettleError::Store)?;
+                Ok(true)
+            }
+            ReservationState::InFlight => {
+                settle_on_conn(conn, &tenant.0, &region, &run.0, &[])
+                    .await
+                    .map_err(|_| DurableSettleError::Store)?
+                    .map_err(DurableSettleError::Ledger)?;
+                Ok(true)
+            }
+            ReservationState::Settled | ReservationState::Cancelled => Ok(false),
+        }
+    }
+
     pub async fn cancel_unstarted_in_tx(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -324,7 +370,8 @@ impl DurableCostLedger {
     }
 
     pub fn state_of(&self, tenant: &TenantId, run: &RunId) -> Option<ReservationState> {
-        self.reservation_of(tenant, run).map(|reservation| reservation.state)
+        self.reservation_of(tenant, run)
+            .map(|reservation| reservation.state)
     }
 
     pub fn reservation_of(&self, tenant: &TenantId, run: &RunId) -> Option<Reservation> {

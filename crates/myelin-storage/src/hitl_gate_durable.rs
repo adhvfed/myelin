@@ -761,6 +761,52 @@ impl DurableHitlGateBacking {
             .await
     }
 
+    pub async fn reject_waiting_for_runs_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+        run_ids: &[String],
+        decider: &str,
+    ) -> Result<Vec<GateRecord>, crate::pg::PgError> {
+        if run_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "UPDATE agent_hitl_gate \
+                SET state = 'rejected', decided_by = $4, \
+                    decided_at_unix = EXTRACT(EPOCH FROM clock_timestamp())::bigint \
+              WHERE tenant_id = $1 AND region = $2 AND run_id = ANY($3) \
+                AND state = 'waiting' \
+          RETURNING gate_id, run_id, effect_id, risk_summary, cost_estimate, approver_filter, \
+                    state, card_ref, requested_by, decided_by, opened_at_unix, \
+                    decided_at_unix, expires_at_unix, approval_consumed_at_unix",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(run_ids)
+        .bind(decider)
+        .fetch_all(&mut *conn)
+        .await
+        .map_err(|error| {
+            crate::pg::PgError::Query(format!(
+                "reject approval gates for disabled automation: {error}"
+            ))
+        })?;
+        let mut gates = rows
+            .iter()
+            .map(|row| {
+                use sqlx::Row as _;
+                let gate_id = row
+                    .try_get::<String, _>("gate_id")
+                    .map_err(hitl_row_decode)?;
+                row_to_record(&gate_id, row)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        gates.sort_by(|left, right| left.gate_id.cmp(&right.gate_id));
+        Ok(gates)
+    }
+
     pub async fn decide(
         &self,
         scope: &TenantScope,

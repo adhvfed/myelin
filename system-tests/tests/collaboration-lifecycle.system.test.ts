@@ -93,7 +93,7 @@ describe("collaboration lifecycle", () => {
       budget_minor_units: 250_000,
       max_firings: 10,
       max_causal_depth: 4,
-      delegation_caveats: ["repo:core", "issue.create"],
+      delegation_caveats: ["repo:core", "run.view", "issue.create"],
       require_human_approval: true,
     };
     const created = await founder.json("/v1/triggers", {
@@ -638,7 +638,7 @@ command = ["true"]
     });
   });
 
-  test("lets an agent propose one merge, sleep, and continue only after its founder approves", async () => {
+  test("keeps every proposed merge asleep until its founder explicitly decides its fate", async () => {
     const founder = await browserApprovedCliClient();
     const issue = await awaitActiveIssue(uniqueName("Merge handoff"));
     const issueRef = string(issue.ref, "merge handoff issue ref");
@@ -699,18 +699,19 @@ command = ["true"]
       expectedStatus: 201,
     });
     const agentId = string(record(activated.body.agent, "merge agent").id, "merge agent id");
+    const mergeIntent = {
+      event_type: "issue.issue.updated",
+      filter: "payload.change_kind == 'merge_request'",
+      run_as_agent_id: agentId,
+      task: `Merge pull request ${slug}#${pullRequestNumber}.`,
+      budget_minor_units: 100_000,
+      max_firings: 2,
+      delegation_caveats: [`repo:${slug}`, "pull_request.merge"],
+      require_human_approval: false,
+    };
     const created = await founder.json("/v1/triggers", {
       method: "POST",
-      body: {
-        event_type: "issue.issue.updated",
-        filter: "payload.change_kind == 'merge_request'",
-        run_as_agent_id: agentId,
-        task: `Merge pull request ${slug}#${pullRequestNumber}.`,
-        budget_minor_units: 100_000,
-        max_firings: 2,
-        delegation_caveats: [`repo:${slug}`, "pull_request.merge"],
-        require_human_approval: false,
-      },
+      body: mergeIntent,
       idempotencyKey: `merge-trigger-${randomUUID()}`,
       expectedStatus: 201,
     });
@@ -763,10 +764,14 @@ command = ["true"]
           item.action !== null && typeof item.action === "object" &&
           record(item.action, "agent approval action").kind === "agent_effect_approval");
     }, { description });
-    const awaitTerminalFiring = (eventId: string, description: string) =>
+    const awaitTerminalFiring = (
+      automationId: string,
+      eventId: string,
+      description: string,
+    ) =>
       eventually<JsonRecord>(async () => {
         const response = await founder.json(
-          `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+          `/v1/triggers/${encodeURIComponent(automationId)}/firings?limit=100`,
         );
         return array(response.body.items, "merge trigger history")
           .map((item) => record(item, "merge trigger firing"))
@@ -829,10 +834,67 @@ command = ["true"]
       return response.body.pr_state === "open" && done ? true : undefined;
     }, { description: "the rejected effect to finish without touching the pull request" });
     expect(await awaitTerminalFiring(
+      triggerId,
       rejectedEventId,
       "the rejected hosted workflow to settle and free its firing slot",
     )).toMatchObject({ outcome: "succeeded" });
 
+    const stoppedEventId = `merge-request-stopped-${randomUUID()}`;
+    await publishMergeRequest(stoppedEventId);
+    const stoppedNotice = await awaitUnreadApproval(
+      "the next agent to park before its automation is switched off",
+    );
+    const stoppedAction = record(stoppedNotice.action, "stopped agent merge action");
+    const stoppedGateId = string(stoppedAction.gate_id, "stopped agent merge gate id");
+    const disabled = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/disable`,
+      { method: "POST", body: {}, expectedStatus: 200 },
+    );
+    expect(disabled.body).toMatchObject({
+      action: "disable",
+      changed: true,
+      canceled_firings: 1,
+      trigger: { id: triggerId, state: "disabled", firings_used: 2 },
+    });
+    expect(await awaitTerminalFiring(
+      triggerId,
+      stoppedEventId,
+      "the disabled automation to close its parked workflow",
+    )).toMatchObject({
+      outcome: "terminated",
+      terminal_reason: "automation disabled by owner",
+    });
+    const lateApproval = await founder.json(
+      `/v1/agent-approvals/${encodeURIComponent(stoppedGateId)}/decision`,
+      {
+        method: "POST",
+        body: { decision: "approve" },
+        idempotencyKey: `late-agent-approval-${randomUUID()}`,
+        expectedStatus: 409,
+      },
+    );
+    expect(lateApproval.body).toMatchObject({ error: { code: "conflict" } });
+    await eventually(async () => {
+      const notices = await founder.json("/v1/notif/inbox?view=all&limit=100");
+      return array(notices.body.items, "inbox after automation disable")
+          .map((item) => record(item, "approval after automation disable"))
+          .some((item) => item.id === stoppedNotice.id && item.state === "done")
+        ? true
+        : undefined;
+    }, { description: "disable to remove its stale approval card" });
+    expect((await founder.json(`${project.path}/prs/${pullRequestNumber}`)).body)
+      .toMatchObject({ pr_state: "open" });
+
+    const replacement = await founder.json("/v1/triggers", {
+      method: "POST",
+      body: { ...mergeIntent, max_firings: 1 },
+      idempotencyKey: `replacement-merge-trigger-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const replacementTriggerId = string(
+      record(replacement.body.trigger, "replacement merge trigger").id,
+      "replacement merge trigger id",
+    );
     const eventId = `merge-request-approved-${randomUUID()}`;
     await publishMergeRequest(eventId);
     const approvalNotice = await awaitUnreadApproval(
@@ -883,6 +945,7 @@ command = ["true"]
     expect(completedNotice.action).toEqual(action);
 
     const completedFiring = await awaitTerminalFiring(
+      replacementTriggerId,
       eventId,
       "the resumed hosted workflow to finish after the approved effect",
     );

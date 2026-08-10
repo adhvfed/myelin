@@ -373,8 +373,12 @@ impl ModelClient for DeterministicDevelopmentModel {
             (false, true, _) => ModelReply::Final {
                 content: "Applied the exact pull-request merge approved by a human.".into(),
             },
-            _ => ModelReply::Final {
+            (true, false, _) => ModelReply::Final {
                 content: "Read the failing CI run and opened one governed triage issue.".into(),
+            },
+            _ => ModelReply::Final {
+                content: "The delegated tools do not match a scripted development workflow; no action was taken."
+                    .into(),
             },
         };
         Ok(ModelResponse {
@@ -503,5 +507,43 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     if let Err(error) = tokio::signal::ctrl_c().await {
         refuse_start("shutdown handler", error);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use myelin_agent_model::ToolSpec;
+
+    fn request_with_tools(names: &[&str]) -> ModelRequest {
+        ModelRequest {
+            turns: vec![ModelTurn::User {
+                content: "Triage one build failure.".into(),
+            }],
+            tools: names
+                .iter()
+                .map(|name| ToolSpec {
+                    name: (*name).into(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({}),
+                })
+                .collect(),
+            ..ModelRequest::default()
+        }
+    }
+
+    #[test]
+    fn the_development_model_never_claims_actions_hidden_by_delegation() {
+        let response = DeterministicDevelopmentModel
+            .complete(&request_with_tools(&["issues.create"]))
+            .expect("the explicit development model responds without provider I/O");
+
+        assert_eq!(
+            response.reply,
+            ModelReply::Final {
+                content: "The delegated tools do not match a scripted development workflow; no action was taken."
+                    .into(),
+            }
+        );
     }
 }

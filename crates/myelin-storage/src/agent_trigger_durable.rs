@@ -292,78 +292,153 @@ impl DurableAgentTriggerBacking {
         action: AgentTriggerLifecycleAction,
     ) -> Result<ChangeAgentTriggerLifecycleOutcome, ProviderError> {
         let tenant = tenant.to_string();
-        let region = self.provider.config().region.clone();
         let owner_principal_id = owner_principal_id.to_string();
+        let backing = self.clone();
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
-                    let row = sqlx::query(
-                        "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
-                                event_type, matcher, task, delegation_caveats, \
-                                budget_minor_units, max_firings, firings_used, max_causal_depth, \
-                                require_no_personal_data, require_human_approval, state, created_at \
-                           FROM agent_trigger_binding \
-                          WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
-                            AND owner_principal_id = $4 FOR UPDATE",
-                    )
-                    .bind(&tenant)
-                    .bind(&region)
-                    .bind(binding_id)
-                    .bind(&owner_principal_id)
-                    .fetch_optional(&mut *conn)
-                    .await
-                    .map_err(query_error("lock agent trigger lifecycle"))?;
-                    let Some(row) = row else {
-                        return Ok(ChangeAgentTriggerLifecycleOutcome::NotFound);
-                    };
-                    let mut binding = binding_from_row(&row)?;
-                    let Some(changed) = lifecycle_transition(&binding.state, action) else {
-                        return Ok(ChangeAgentTriggerLifecycleOutcome::InvalidTransition);
-                    };
-                    let target = action.target();
-                    if changed {
-                        sqlx::query(
-                            "UPDATE agent_trigger_binding SET state = $5 \
-                              WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
-                                AND owner_principal_id = $4",
+                    let outcome = backing
+                        .change_lifecycle_on_conn(
+                            conn,
+                            &tenant,
+                            &owner_principal_id,
+                            binding_id,
+                            action,
                         )
-                        .bind(&tenant)
-                        .bind(&region)
-                        .bind(binding_id)
-                        .bind(&owner_principal_id)
-                        .bind(target)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(query_error("change agent trigger lifecycle"))?;
-                        binding.state = target.to_string();
+                        .await?;
+                    if matches!(
+                        outcome,
+                        ChangeAgentTriggerLifecycleOutcome::Complete(ref lifecycle)
+                            if !lifecycle.canceled_run_ids.is_empty()
+                    ) {
+                        return Err(PgError::Query(
+                            "disabling an automation with started runs requires coordinated lifecycle cleanup"
+                                .into(),
+                        ));
                     }
-                    let canceled_firings = if action == AgentTriggerLifecycleAction::Disable {
-                        sqlx::query(
-                            "UPDATE agent_trigger_firing \
-                                SET state = 'terminal', claim_owner = NULL, claim_until = NULL \
-                              WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
-                                AND state IN ('queued','awaiting_approval','claimed')",
-                        )
-                        .bind(&tenant)
-                        .bind(&region)
-                        .bind(binding_id)
-                        .execute(&mut *conn)
-                        .await
-                        .map_err(query_error("cancel disabled agent trigger firings"))?
-                        .rows_affected()
-                    } else {
-                        0
-                    };
-                    Ok(ChangeAgentTriggerLifecycleOutcome::Complete(Box::new(
-                        AgentTriggerLifecycleOutcome {
-                            binding,
-                            changed,
-                            canceled_firings,
-                        },
-                    )))
+                    Ok(outcome)
                 })
             })
             .await
+    }
+
+    /// Changes one owned binding and fences all of its unfinished firings on the caller's
+    /// transaction. Run IDs are returned so the control plane can terminate the corresponding
+    /// workflows, gates, reservations, and approval projections before that transaction commits.
+    pub async fn change_lifecycle_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        owner_principal_id: &str,
+        binding_id: Uuid,
+        action: AgentTriggerLifecycleAction,
+    ) -> Result<ChangeAgentTriggerLifecycleOutcome, PgError> {
+        let region = self.provider.config().region.as_str();
+        let row = sqlx::query(
+            "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
+                    event_type, matcher, task, delegation_caveats, \
+                    budget_minor_units, max_firings, firings_used, max_causal_depth, \
+                    require_no_personal_data, require_human_approval, state, created_at \
+               FROM agent_trigger_binding \
+              WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                AND owner_principal_id = $4 FOR UPDATE",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(binding_id)
+        .bind(owner_principal_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(query_error("lock agent trigger lifecycle"))?;
+        let Some(row) = row else {
+            return Ok(ChangeAgentTriggerLifecycleOutcome::NotFound);
+        };
+        let mut binding = binding_from_row(&row)?;
+        let Some(changed) = lifecycle_transition(&binding.state, action) else {
+            return Ok(ChangeAgentTriggerLifecycleOutcome::InvalidTransition);
+        };
+        let target = action.target();
+        if changed {
+            sqlx::query(
+                "UPDATE agent_trigger_binding SET state = $5 \
+                  WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                    AND owner_principal_id = $4",
+            )
+            .bind(tenant)
+            .bind(region)
+            .bind(binding_id)
+            .bind(owner_principal_id)
+            .bind(target)
+            .execute(&mut *conn)
+            .await
+            .map_err(query_error("change agent trigger lifecycle"))?;
+            binding.state = target.to_string();
+        }
+        let canceled = if action == AgentTriggerLifecycleAction::Disable {
+            sqlx::query_scalar::<_, String>(
+                "SELECT run.run_id FROM agent_trigger_firing firing \
+                   JOIN workflow_run run ON run.tenant_id = firing.tenant_id \
+                    AND run.region = firing.region AND run.run_id = firing.run_id::text \
+                  WHERE firing.tenant_id = $1 AND firing.region = $2 \
+                    AND firing.binding_id = $3 AND firing.state = 'started' \
+                  ORDER BY firing.event_id FOR UPDATE OF firing, run",
+            )
+            .bind(tenant)
+            .bind(region)
+            .bind(binding_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(query_error("lock started automation workflows"))?;
+            sqlx::query(
+                "UPDATE agent_trigger_firing firing SET state = 'terminal' \
+                  WHERE firing.tenant_id = $1 AND firing.region = $2 \
+                    AND firing.binding_id = $3 AND firing.state = 'started' \
+                    AND EXISTS (SELECT 1 FROM workflow_run run \
+                         WHERE run.tenant_id = firing.tenant_id \
+                           AND run.region = firing.region \
+                           AND run.run_id = firing.run_id::text \
+                           AND run.state IN ('completed','failed','terminated','nondeterministic'))",
+            )
+            .bind(tenant)
+            .bind(region)
+            .bind(binding_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(query_error(
+                "project completed workflows before disabling automation",
+            ))?;
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "UPDATE agent_trigger_firing \
+                    SET state = 'terminal', terminal_reason = \
+                          COALESCE(terminal_reason, 'automation disabled by owner'), \
+                        claim_owner = NULL, claim_until = NULL \
+                  WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                    AND state IN ('queued','awaiting_approval','claimed','started') \
+              RETURNING run_id",
+            )
+            .bind(tenant)
+            .bind(region)
+            .bind(binding_id)
+            .fetch_all(&mut *conn)
+            .await
+            .map_err(query_error("cancel disabled agent trigger firings"))?
+        } else {
+            Vec::new()
+        };
+        let canceled_firings = canceled.len() as u64;
+        let canceled_run_ids = canceled
+            .into_iter()
+            .flatten()
+            .map(|run_id| run_id.to_string())
+            .collect();
+        Ok(ChangeAgentTriggerLifecycleOutcome::Complete(Box::new(
+            AgentTriggerLifecycleOutcome {
+                binding,
+                changed,
+                canceled_firings,
+                canceled_run_ids,
+            },
+        )))
     }
 
     #[allow(clippy::too_many_arguments)]

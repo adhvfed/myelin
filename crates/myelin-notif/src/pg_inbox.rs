@@ -351,24 +351,40 @@ impl PgInboxStore {
         let owned_item_id = item_id.to_string();
         let tenant = owned_scope.tenant.0.clone();
         let region = owned_scope.region.0.clone();
+        let store = self.clone();
         with_tenant_tx_error(&self.pool, &tenant, &region, move |conn| {
             Box::pin(async move {
-                let result = sqlx::query(
-                    "UPDATE notif_inbox_item SET state = 'done', snooze_until = NULL \
-                     WHERE tenant_id = $1 AND region = $2 AND recipient = $3 AND item_id = $4 \
-                       AND state <> 'done'",
-                )
-                .bind(&owned_scope.tenant.0)
-                .bind(&owned_scope.region.0)
-                .bind(&owned_scope.recipient)
-                .bind(&owned_item_id)
-                .execute(conn)
-                .await
-                .map_err(|_| PgInboxError::Database)?;
-                Ok(result.rows_affected() == 1)
+                store
+                    .complete_if_present_on_conn(conn, &owned_scope, &owned_item_id)
+                    .await
             })
         })
         .await
+    }
+
+    pub async fn complete_if_present_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        scope: &InboxReadScope,
+        item_id: &str,
+    ) -> Result<bool, PgInboxError> {
+        validate_scope(scope)?;
+        if !valid_item_id(item_id) {
+            return Err(PgInboxError::InvalidInput);
+        }
+        let result = sqlx::query(
+            "UPDATE notif_inbox_item SET state = 'done', snooze_until = NULL \
+             WHERE tenant_id = $1 AND region = $2 AND recipient = $3 AND item_id = $4 \
+               AND state <> 'done'",
+        )
+        .bind(&scope.tenant.0)
+        .bind(&scope.region.0)
+        .bind(&scope.recipient)
+        .bind(item_id)
+        .execute(conn)
+        .await
+        .map_err(|_| PgInboxError::Database)?;
+        Ok(result.rows_affected() == 1)
     }
 }
 

@@ -39,6 +39,7 @@ pub mod session;
 pub mod sse;
 pub mod tool_http;
 pub mod trigger_http;
+mod trigger_lifecycle;
 
 pub use agent_http::register_agents;
 pub use agent_mcp_http::{

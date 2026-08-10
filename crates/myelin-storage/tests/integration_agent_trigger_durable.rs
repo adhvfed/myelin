@@ -5,10 +5,11 @@ use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus, Run
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
     all_durable_migrations, AgentTriggerApprovalDecision, AgentTriggerClaimRequest,
-    AgentTriggerFiringState, AgentTriggerLifecycleAction, ChangeAgentTriggerApprovalOutcome,
-    ChangeAgentTriggerLifecycleOutcome, CreateAgentTriggerBindingOutcome,
-    DurableAgentTriggerBacking, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
-    SubstrateProvider, TerminalizeAgentTriggerClaimOutcome,
+    AgentTriggerFiringState, AgentTriggerLifecycleAction, AgentTriggerStartRequest,
+    ChangeAgentTriggerApprovalOutcome, ChangeAgentTriggerLifecycleOutcome,
+    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, NewAgentTriggerBinding,
+    ReserveAgentTriggerFiringOutcome, StartAgentTriggerFiringOutcome, SubstrateProvider,
+    TerminalizeAgentTriggerClaimOutcome,
 };
 use sqlx::types::chrono::Utc;
 use sqlx::types::Uuid;
@@ -598,6 +599,22 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
     assert_eq!(reclaimed.event_id, "ci-failed-1");
     assert_eq!(reclaimed.claim_attempts, 2);
     assert_eq!(reclaimed.claim_owner, "host-2");
+    let run_id = Uuid::new_v4();
+    let start = AgentTriggerStartRequest::from_claim(&reclaimed, run_id).unwrap();
+    let start_tenant = tenant.clone();
+    let start_backing = triggers.clone();
+    assert_eq!(
+        app.with_tenant_tx(&tenant, move |conn| {
+            Box::pin(async move {
+                start_backing
+                    .start_claimed_firing_on_conn(conn, &start_tenant, &start)
+                    .await
+            })
+        })
+        .await
+        .expect("promote the reclaimed firing to durable started work"),
+        StartAgentTriggerFiringOutcome::Started
+    );
 
     let later_failure = triggers
         .reserve_firing(
@@ -655,7 +672,7 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         "a durable trigger never wakes an agent whose identity is no longer active"
     );
 
-    let disabled = triggers
+    let refused = triggers
         .change_lifecycle(
             &tenant,
             "founder",
@@ -663,7 +680,42 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
             AgentTriggerLifecycleAction::Disable,
         )
         .await
-        .expect("the owner permanently retires the automation");
+        .expect_err("a storage-only lifecycle call cannot strand started workflow state");
+    assert!(
+        refused
+            .to_string()
+            .contains("coordinated lifecycle cleanup"),
+        "the refusal explains how live work must be closed: {refused}"
+    );
+    assert_eq!(
+        triggers
+            .get_for_owner(&tenant, "founder", proposal.binding_id)
+            .await
+            .expect("the refused transaction leaves the binding readable")
+            .expect("the binding still exists")
+            .state,
+        "active",
+        "the whole storage-only disable rolls back"
+    );
+
+    let lifecycle_tenant = tenant.clone();
+    let lifecycle_backing = triggers.clone();
+    let disabled = app
+        .with_tenant_tx(&tenant, move |conn| {
+            Box::pin(async move {
+                lifecycle_backing
+                    .change_lifecycle_on_conn(
+                        conn,
+                        &lifecycle_tenant,
+                        "founder",
+                        proposal.binding_id,
+                        AgentTriggerLifecycleAction::Disable,
+                    )
+                    .await
+            })
+        })
+        .await
+        .expect("the control-plane transaction fences the automation and its live run");
     let ChangeAgentTriggerLifecycleOutcome::Complete(disabled) = disabled else {
         panic!("an active trigger can be disabled, got {disabled:?}");
     };
@@ -671,14 +723,15 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
     assert_eq!(disabled.binding.state, "disabled");
     assert_eq!(
         disabled.canceled_firings, 1,
-        "the claimed but not started run is atomically canceled"
+        "the started run is fenced for coordinated cleanup"
     );
+    assert_eq!(disabled.canceled_run_ids, [run_id.to_string()]);
     let final_history = triggers
         .list_firings_for_owner(&tenant, "founder", proposal.binding_id, None, 100)
         .await
         .expect("the owner sees the retired automation's final history");
     assert_eq!(final_history[0].state, AgentTriggerFiringState::Terminal);
-    assert_eq!(final_history[0].run_id, None);
+    assert_eq!(final_history[0].run_id, Some(run_id.to_string()));
     assert_eq!(final_history[0].outcome, None);
     assert_eq!(
         triggers

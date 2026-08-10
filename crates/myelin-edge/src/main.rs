@@ -1147,6 +1147,7 @@ async fn serve(
     );
     builder = myelin_edge::register_triggers(
         builder,
+        provider.clone(),
         myelin_storage::DurableAgentTriggerBacking::new(provider.clone()),
         agent_registry.clone(),
         agent_traces.clone(),

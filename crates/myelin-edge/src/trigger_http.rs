@@ -9,8 +9,8 @@ use myelin_storage::{
     AgentTriggerLifecycleAction, ChangeAgentTriggerApprovalOutcome,
     ChangeAgentTriggerLifecycleOutcome, CreateAgentTriggerBindingOutcome, DurableAgentTraceStore,
     DurableAgentTriggerBacking, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
-    EraseAgentTraceOutcome, NewAgentTriggerBinding, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
-    MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    EraseAgentTraceOutcome, NewAgentTriggerBinding, SubstrateProvider,
+    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -22,6 +22,7 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
+use crate::trigger_lifecycle::TriggerLifecycle;
 use crate::Method;
 
 const MAX_TRIGGER_JSON_BYTES: usize = 16 * 1024;
@@ -30,6 +31,7 @@ const MAX_TRIGGER_FILTER_BYTES: usize = 4 * 1024;
 #[derive(Clone)]
 struct TriggerHttpApi {
     backing: DurableAgentTriggerBacking,
+    lifecycle: TriggerLifecycle,
     agents: PgAgentRegistry,
     traces: DurableAgentTraceStore,
     inbox: Arc<PgInboxStore>,
@@ -387,8 +389,8 @@ impl Handler for TriggerLifecycleHandler {
         let binding_id = parse_uuid(trigger_param(ctx)?)?;
         let outcome = self
             .api
-            .drive(self.api.backing.change_lifecycle(
-                &ctx.principal.tenant.0,
+            .drive(self.api.lifecycle.change(
+                &ctx.principal.tenant,
                 &ctx.principal.principal_id.0,
                 binding_id,
                 self.action,
@@ -482,14 +484,18 @@ impl Handler for TriggerApprovalHandler {
 
 pub fn register_triggers(
     builder: GatewayBuilder,
+    provider: SubstrateProvider,
     backing: DurableAgentTriggerBacking,
     agents: PgAgentRegistry,
     traces: DurableAgentTraceStore,
     inbox: Arc<PgInboxStore>,
     runtime: Handle,
 ) -> GatewayBuilder {
+    let lifecycle =
+        TriggerLifecycle::new(provider, backing.clone(), inbox.clone(), runtime.clone());
     let api = TriggerHttpApi {
         backing,
+        lifecycle,
         agents,
         traces,
         inbox,

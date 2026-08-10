@@ -75,6 +75,7 @@ pub struct AgentTriggerLifecycleOutcome {
     pub binding: DurableAgentTriggerBinding,
     pub changed: bool,
     pub canceled_firings: u64,
+    pub canceled_run_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
