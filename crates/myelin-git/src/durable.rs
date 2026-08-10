@@ -307,7 +307,7 @@ pub const REFLOG_MAX_ENTRIES_PER_REF: usize = 100_000;
 pub const REFLOG_MAX_BYTES_PER_REF: usize = 32 * 1024 * 1024;
 pub const REFLOG_MAX_TOTAL_ENTRIES: usize = 100_000;
 pub const REFLOG_MAX_TOTAL_BYTES: usize = 32 * 1024 * 1024;
-pub(crate) const TREE_OBJECT_MAX_BYTES: usize = 8 * 1024 * 1024;
+pub const TREE_OBJECT_MAX_BYTES: usize = 8 * 1024 * 1024;
 pub const PR_DIFF_MAX_FILES: usize = 1_000;
 pub const COMMIT_META_MAX_PARENTS: usize = 64;
 pub const COMMIT_META_MAX_SUMMARY_BYTES: usize = 8 * 1024;
@@ -326,6 +326,13 @@ pub const COMMIT_DIFF_MAX_LINES_PER_FILE: usize = 4_000;
 pub const DIFF_MAX_LINE_BYTES: usize = 64 * 1024;
 pub const DIFF_MAX_RENDERED_BYTES: usize = 4 * 1024 * 1024;
 pub const COMMIT_DIFF_MAX_MESSAGE_BYTES: usize = 512 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedFileCommit {
+    pub commit: Oid,
+    pub blob: Oid,
+    pub trees: Vec<Oid>,
+}
 
 #[derive(Clone, Copy)]
 struct CommitDiffLimits {
@@ -1868,28 +1875,65 @@ impl DurableGitRepo {
             })?),
             (None, None) => None,
         };
+        let parent = parent_oid.map(|oid| Oid::new(oid.to_string()));
+        let prepared = self.prepare_file_commit(
+            parent.as_ref(),
+            path,
+            contents,
+            message,
+            author_name,
+            author_email,
+        )?;
+        Ok((
+            prepared.commit,
+            prepared.blob,
+            target_oid.map(|p| Oid::new(p.to_string())),
+        ))
+    }
+
+    /// Constructs an immutable file commit in this repository's object database without moving a
+    /// ref. Callers that accept untrusted content should invoke this on a quarantine repository,
+    /// evaluate the complete returned object set, and promote it only after admission succeeds.
+    pub fn prepare_file_commit(
+        &self,
+        parent_oid: Option<&Oid>,
+        path: &str,
+        contents: &[u8],
+        message: &str,
+        author_name: &str,
+        author_email: &str,
+    ) -> Result<PreparedFileCommit, DurableError> {
+        let repo = self.open_git()?;
         let clean_path = path.trim_matches('/');
         if clean_path.is_empty() || clean_path != path || !is_safe_tree_path(clean_path) {
             return Err(DurableError::Git("web edit path is not safe".into()));
         }
 
         let blob_oid = repo.blob(contents).map_err(|e| git_err("write blob", e))?;
-
+        let parent_oid = parent_oid.map(Self::parse_oid).transpose()?;
         let base_tree = match parent_oid {
-            Some(p) => {
-                let c = repo.find_commit(p).map_err(|e| git_err("find parent", e))?;
-                Some(c.tree().map_err(|e| git_err("parent tree", e))?)
+            Some(parent) => {
+                let commit = repo
+                    .find_commit(parent)
+                    .map_err(|e| git_err("find parent", e))?;
+                Some(commit.tree().map_err(|e| git_err("parent tree", e))?)
             }
             None => None,
         };
         let segments = clean_path.split('/').collect::<Vec<_>>();
-        let tree_oid = Self::write_blob_tree(&repo, base_tree.as_ref(), &segments, blob_oid)?;
-        let tree_obj = repo.find_tree(tree_oid).map_err(|e| git_err("find tree", e))?;
+        let mut trees = Vec::with_capacity(segments.len());
+        let tree_oid =
+            Self::write_blob_tree(&repo, base_tree.as_ref(), &segments, blob_oid, &mut trees)?;
+        let tree_obj = repo
+            .find_tree(tree_oid)
+            .map_err(|e| git_err("find tree", e))?;
 
-        let sig = git2::Signature::now(author_name, author_email)
-            .map_err(|e| git_err("signature", e))?;
+        let sig =
+            git2::Signature::now(author_name, author_email).map_err(|e| git_err("signature", e))?;
         let parent_commits: Vec<git2::Commit<'_>> = match parent_oid {
-            Some(p) => vec![repo.find_commit(p).map_err(|e| git_err("find parent", e))?],
+            Some(parent) => vec![repo
+                .find_commit(parent)
+                .map_err(|e| git_err("find parent", e))?],
             None => Vec::new(),
         };
         let parent_refs: Vec<&git2::Commit<'_>> = parent_commits.iter().collect();
@@ -1897,11 +1941,11 @@ impl DurableGitRepo {
             .commit(None, &sig, &sig, message, &tree_obj, &parent_refs)
             .map_err(|e| git_err("write commit", e))?;
 
-        Ok((
-            Oid::new(commit_oid.to_string()),
-            Oid::new(blob_oid.to_string()),
-            target_oid.map(|p| Oid::new(p.to_string())),
-        ))
+        Ok(PreparedFileCommit {
+            commit: Oid::new(commit_oid.to_string()),
+            blob: Oid::new(blob_oid.to_string()),
+            trees,
+        })
     }
 
     fn write_blob_tree(
@@ -1909,6 +1953,7 @@ impl DurableGitRepo {
         base_tree: Option<&git2::Tree<'_>>,
         path: &[&str],
         blob_oid: git2::Oid,
+        written_trees: &mut Vec<Oid>,
     ) -> Result<git2::Oid, DurableError> {
         let (name, descendants) = path
             .split_first()
@@ -1933,13 +1978,22 @@ impl DurableGitRepo {
                 }
                 None => None,
             };
-            let child_oid =
-                Self::write_blob_tree(repo, child_tree.as_ref(), descendants, blob_oid)?;
+            let child_oid = Self::write_blob_tree(
+                repo,
+                child_tree.as_ref(),
+                descendants,
+                blob_oid,
+                written_trees,
+            )?;
             builder
                 .insert(name, child_oid, 0o040000)
                 .map_err(|error| git_err(&format!("tree insert {name}"), error))?;
         }
-        builder.write().map_err(|error| git_err("write tree", error))
+        let oid = builder
+            .write()
+            .map_err(|error| git_err("write tree", error))?;
+        written_trees.push(Oid::new(oid.to_string()));
+        Ok(oid)
     }
 
     pub fn object_is_commit(&self, oid: &Oid) -> bool {

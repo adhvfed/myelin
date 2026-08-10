@@ -19,7 +19,8 @@ use myelin_git::durable::{
     BlobPathLookup, CommitDetail, CommitMeta, FileLinesLookup, PrCommitPageError, PrCommitSnapshot,
     PrDiff, TreePage, TreePageError, TreePageLookup, TreePageRequest, COMMIT_LOG_MAX_OFFSET,
     FILE_LINES_MAX_RANGE, REFS_PAGE_DEFAULT_LIMIT, REFS_PAGE_MAX_LIMIT, REFS_PAGE_MAX_QUERY_BYTES,
-    TREE_PAGE_DEFAULT_LIMIT, TREE_PAGE_MAX_LIMIT, TREE_PAGE_MAX_QUERY_BYTES, WIRE_MAX_REFS,
+    TREE_OBJECT_MAX_BYTES, TREE_PAGE_DEFAULT_LIMIT, TREE_PAGE_MAX_LIMIT, TREE_PAGE_MAX_QUERY_BYTES,
+    WIRE_MAX_REFS,
 };
 use myelin_git::durable::{
     CatalogueRepoState, DurableError, DurableGitRepo, DurableGitStore, RefKind, RefsPageError,
@@ -45,9 +46,8 @@ use myelin_git::pr_threads::{
     ThreadPrincipal, ThreadRecord, ViewedThreads,
 };
 use myelin_git::receive_pack::{
-    evaluate_protected_ref_push, CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate,
-    PushOutcome, PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
-    RejectReason,
+    evaluate_protected_ref_push, CrashPoint, Oid as PushOid, ProposedRefUpdate, PushOutcome,
+    PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore, RejectReason,
 };
 use myelin_git::refs_pagination::WIRE_MAX_REF_NAME_BYTES;
 use myelin_git::web::{
@@ -1590,17 +1590,21 @@ impl DurableGitBackend {
                 format!("refs/heads/{value}")
             }
         });
-        let target_exists = repo.read_ref(&full)?.is_some();
-        let content_ref = if target_exists {
-            full.as_str()
-        } else {
-            start_full.as_deref().unwrap_or(full.as_str())
+        let prior_target = repo.read_ref(&full)?;
+        let parent = match (&prior_target, start_full.as_deref()) {
+            (Some(target), _) => Some(target.clone()),
+            (None, Some(source)) => Some(repo.read_ref(source)?.ok_or_else(|| {
+                DurableError::NotFound(format!("branch start ref `{source}` does not exist"))
+            })?),
+            (None, None) => None,
         };
-
-        let current_base = repo
-            .blob_oid_at_path(content_ref, path)?
-            .map(|oid| oid.0)
-            .unwrap_or_default();
+        let current_base = match &parent {
+            Some(parent) => repo
+                .blob_oid_at_path(parent.as_str(), path)?
+                .map(|oid| oid.0)
+                .unwrap_or_default(),
+            None => String::new(),
+        };
 
         let probe = WebEditOutcome::evaluate(expected_base, &current_base, "pending", true);
         if let WebEditOutcome::StaleBase { current_oid } = probe {
@@ -1611,19 +1615,50 @@ impl DurableGitBackend {
         }
 
         let psn = Self::pseudonym(tenant, principal);
-        let (new_commit, new_blob, prior_target) = repo.build_file_commit_from_ref(
-            &full,
-            start_full.as_deref(),
+        let quarantine = FileEditQuarantine::new(&repo)?;
+        let prepared = quarantine.repo.prepare_file_commit(
+            parent.as_ref(),
             path,
             contents.as_bytes(),
             message,
             &psn,
             &psn,
         )?;
+        let mut objects = Vec::with_capacity(prepared.trees.len() + 2);
+        objects.push((
+            prepared.blob.0.clone(),
+            "blob".to_string(),
+            quarantine
+                .repo
+                .read_object_bounded(&prepared.blob, AGENT_FILE_WRITE_MAX_BYTES)?,
+        ));
+        for tree in &prepared.trees {
+            objects.push((
+                tree.0.clone(),
+                "tree".to_string(),
+                quarantine
+                    .repo
+                    .read_object_bounded(tree, TREE_OBJECT_MAX_BYTES)?,
+            ));
+        }
+        objects.push((
+            prepared.commit.0.clone(),
+            "commit".to_string(),
+            quarantine
+                .repo
+                .read_object_bounded(&prepared.commit, 64 * 1024)?,
+        ));
+        let quarantine_objects = objects
+            .iter()
+            .map(|(oid, _, bytes)| QuarantineObject {
+                oid: PushOid::new(oid.clone()),
+                bytes: bytes.clone(),
+            })
+            .collect();
 
         let loc = Self::loc(tenant, region, slug);
         let ref_name = RefName::new(full.clone());
-        self.admit_file_ref_update(&loc, principal, actor_is_agent, &ref_name, &new_commit)?;
+        self.admit_file_ref_update(&loc, principal, actor_is_agent, &ref_name, &prepared.commit)?;
 
         let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
         let expected_old = prior_target
@@ -1633,31 +1668,26 @@ impl DurableGitBackend {
             updates: vec![ProposedRefUpdate {
                 ref_name,
                 expected_old,
-                new_oid: PushOid::new(new_commit.0.clone()),
+                new_oid: PushOid::new(prepared.commit.0.clone()),
                 forced: false,
-                commit_oids: vec![PushOid::new(new_commit.0.clone())],
+                commit_oids: vec![PushOid::new(prepared.commit.0.clone())],
             }],
-            quarantine: vec![
-                QuarantineObject {
-                    oid: PushOid::new(new_blob.0),
-                    bytes: contents.as_bytes().to_vec(),
-                },
-                QuarantineObject {
-                    oid: PushOid::new(new_commit.0.clone()),
-                    bytes: repo.read_object_bounded(&new_commit, 64 * 1024)?,
-                },
-            ],
+            quarantine: quarantine_objects,
             pusher: Pusher {
                 pseudonym: psn,
                 is_agent: actor_is_agent,
             },
         };
+        let migration = ObjectPromotion {
+            repo: &repo,
+            objects: &objects,
+        };
         match ref_store
-            .receive(&push, &InMemoryObjectDb::new(), CrashPoint::None)
+            .receive(&push, &migration, CrashPoint::None)
             .map_err(|e| DurableError::Git(format!("ref-CAS: {e:?}")))?
         {
             PushOutcome::Accepted { .. } => Ok(WebEditOutcome::Committed {
-                new_oid: new_commit.0,
+                new_oid: prepared.commit.0,
             }),
             PushOutcome::Rejected(RejectReason::NonFastForward { .. }) => {
                 Ok(WebEditOutcome::StaleBase {
@@ -3180,6 +3210,30 @@ impl DurableGitBackend {
     }
 }
 
+struct FileEditQuarantine {
+    repo: DurableGitRepo,
+    _directory: tempfile::TempDir,
+}
+
+impl FileEditQuarantine {
+    fn new(durable_repo: &DurableGitRepo) -> Result<Self, DurableError> {
+        let directory = tempfile::Builder::new()
+            .prefix("myelin-file-edit-quarantine-")
+            .tempdir()
+            .map_err(|error| {
+                DurableError::Io(format!("create file-edit quarantine directory: {error}"))
+            })?;
+        let repo = DurableGitRepo::init_quarantine(
+            directory.path(),
+            &durable_repo.path().join("objects"),
+        )?;
+        Ok(Self {
+            repo,
+            _directory: directory,
+        })
+    }
+}
+
 struct ObjectPromotion<'a> {
     repo: &'a DurableGitRepo,
     objects: &'a [(String, String, Vec<u8>)],
@@ -4204,6 +4258,11 @@ mod agent_file_write_tests {
 
         let secret_operation = PrOperationId::parse("write-secret").unwrap();
         let secret = ["AK", "IAIOSFODNN7EXAMPLE"].concat();
+        let secret_blob_oid = FileEditQuarantine::new(&repo)
+            .unwrap()
+            .repo
+            .write_blob(secret.as_bytes())
+            .unwrap();
         let rejected_secret = backend
             .write_file_with_operation(AgentFileWrite {
                 target: RepoActorContext::new(TENANT, REGION, REPO, &actor),
@@ -4220,6 +4279,13 @@ mod agent_file_write_tests {
             repo.read_ref("refs/heads/agent/unsafe-fix").unwrap(),
             None,
             "the shared receive policy rejects secrets before exposing a branch"
+        );
+        assert!(
+            !repo.has_object(&secret_blob_oid)
+                && repo
+                    .read_object_bounded(&secret_blob_oid, secret.len())
+                    .is_err(),
+            "rejected content never enters the durable object database or remains readable by OID"
         );
 
         backend

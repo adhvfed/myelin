@@ -818,17 +818,6 @@ impl RefStore {
             return Ok(PushOutcome::Crashed(InjectedCrash { at: crash }));
         }
 
-        if let Err(e) = migration.migrate(&push.quarantine) {
-            return Ok(PushOutcome::Rejected(RejectReason::SecretDetected {
-                oid: Oid::zero(),
-                pattern: format!("object-migration-not-durable: {e}"),
-            }));
-        }
-
-        if crash == CrashPoint::BeforeCommit {
-            return Ok(PushOutcome::Crashed(InjectedCrash { at: crash }));
-        }
-
         let mut targets: Vec<RefName> = push.updates.iter().map(|u| u.ref_name.clone()).collect();
         targets.sort();
         targets.dedup();
@@ -862,6 +851,17 @@ impl RefStore {
                     actual,
                 }));
             }
+        }
+
+        if let Err(e) = migration.migrate(&push.quarantine) {
+            return Ok(PushOutcome::Rejected(RejectReason::SecretDetected {
+                oid: Oid::zero(),
+                pattern: format!("object-migration-not-durable: {e}"),
+            }));
+        }
+
+        if crash == CrashPoint::BeforeCommit {
+            return Ok(PushOutcome::Crashed(InjectedCrash { at: crash }));
         }
 
         let mut tx = self
@@ -1851,6 +1851,7 @@ mod tests {
             .unwrap();
         assert_eq!(outbox.committed_count(), 1);
 
+        let migrated_before_stale_push = db.len();
         let stale = human_push("refs/heads/feature", Oid::zero(), Oid::new("v2"));
         match store.receive(&stale, &db, CrashPoint::None).unwrap() {
             PushOutcome::Rejected(RejectReason::NonFastForward {
@@ -1872,6 +1873,11 @@ mod tests {
             outbox.committed_count(),
             1,
             "the rejected stale push emitted nothing"
+        );
+        assert_eq!(
+            db.len(),
+            migrated_before_stale_push,
+            "a stale ref comparison rejects before quarantine promotion"
         );
     }
 

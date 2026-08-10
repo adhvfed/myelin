@@ -1,5 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, resolve } from "node:path";
@@ -128,6 +128,14 @@ async function askAgentToBeDenied(
   const content = array(result.content, `${tool} denied MCP content`);
   expect(content).toHaveLength(1);
   return string(record(content[0], `${tool} denied MCP content item`).text, `${tool} denial`);
+}
+
+function gitBlobOid(contents: string): string {
+  const bytes = Buffer.from(contents);
+  return createHash("sha1")
+    .update(`blob ${bytes.length}\0`)
+    .update(bytes)
+    .digest("hex");
 }
 
 function cliEnvironment(
@@ -1631,13 +1639,36 @@ describe("the CLI authentication journey", () => {
       );
       expect(protectedWrite).toContain("branch protection refused");
 
+      // A rejected write is absent, not merely unreferenced. Even a caller who knows the exact
+      // Git object ID cannot recover rejected secret bytes through the object-addressed diff API.
+      const rejectedSecret = ["AK", "IA", randomUUID().replaceAll("-", "")].join("");
+      await askAgentToBeDenied(
+        resumedRun,
+        13,
+        "git.write_file",
+        {
+          repo: sourceRepository.slug,
+          ref: `agent/rejected-${randomUUID().replaceAll("-", "").slice(0, 8)}`,
+          path: sourcePath,
+          contents: rejectedSecret,
+          base_oid: string(sourceFile.base_oid, "agent-visible source blob OID"),
+          start_ref: "main",
+        },
+      );
+      const rejectedObject = await systemClient.json(
+        `${sourceRepository.path}/file-lines/${gitBlobOid(rejectedSecret)}`
+          + `?path=${encodeURIComponent(sourcePath)}&start=1&end=1`,
+        { expectedStatus: 200 },
+      );
+      expect(rejectedObject.body).toEqual({ lines: [] });
+
       // The collaborator authors the proposed change through the governed Git surface. The
       // optimistic blob OID prevents lost updates, while start_ref creates a review branch without
       // granting the agent a reusable Git credential.
       const agentWriteKey = `agent-write-${randomUUID()}`;
       const writtenByAgent = await askAgentToAct(
         resumedRun,
-        13,
+        14,
         "git.write_file",
         {
           repo: sourceRepository.slug,
@@ -1651,7 +1682,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentWrite = await askAgentToAct(
         resumedRun,
-        14,
+        15,
         "git.write_file",
         {
           repo: sourceRepository.slug,
@@ -1678,7 +1709,7 @@ describe("the CLI authentication journey", () => {
       const agentPullRequestKey = `agent-pr-${randomUUID()}`;
       const openedByAgent = await askAgentToAct(
         resumedRun,
-        15,
+        16,
         "git.open_pr",
         {
           repo: sourceRepository.slug,
@@ -1691,7 +1722,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentPullRequest = await askAgentToAct(
         resumedRun,
-        16,
+        17,
         "git.open_pr",
         {
           repo: sourceRepository.slug,
@@ -1755,7 +1786,7 @@ describe("the CLI authentication journey", () => {
       const agentIssueKey = `agent-issue-${randomUUID()}`;
       const createdByAgent = await askAgentToAct(
         resumedRun,
-        17,
+        18,
         "issues.create",
         {
           project_id: createdProject.project.id,
@@ -1765,7 +1796,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentIssue = await askAgentToAct(
         resumedRun,
-        18,
+        19,
         "issues.create",
         {
           project_id: createdProject.project.id,
