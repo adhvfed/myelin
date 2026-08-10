@@ -1,4 +1,4 @@
-use crate::{DurableCiReadApi, DurableIssueReadApi, EdgeError};
+use crate::{DurableCiReadApi, DurableIssueReadApi, DurableKnowledgeReadApi, EdgeError};
 use myelin_ci_controlplane::surfacing_store::CI_LOG_RANGE_DEFAULT;
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
@@ -17,6 +17,7 @@ use crate::agent_delegation::is_active_delegation;
 pub struct McpReadExecutor {
     ci: DurableCiReadApi,
     issues: Option<DurableIssueReadApi>,
+    knowledge: Option<DurableKnowledgeReadApi>,
     authority: Arc<RunTokenAuthorizer>,
     delegator: Principal,
 }
@@ -30,6 +31,7 @@ impl McpReadExecutor {
         Self {
             ci,
             issues: None,
+            knowledge: None,
             authority,
             delegator,
         }
@@ -37,6 +39,11 @@ impl McpReadExecutor {
 
     pub fn with_issues(mut self, issues: DurableIssueReadApi) -> Self {
         self.issues = Some(issues);
+        self
+    }
+
+    pub fn with_knowledge(mut self, knowledge: DurableKnowledgeReadApi) -> Self {
+        self.knowledge = Some(knowledge);
         self
     }
 }
@@ -102,6 +109,25 @@ impl DirectReadExecutor for McpReadExecutor {
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
                     .view(&self.delegator, issue_id)
+                    .map_err(map_edge_error)
+            }
+            "knowledge.list_pages" => {
+                exact_fields(arguments, &[], &["limit", "cursor"])?;
+                let limit = optional_u32(arguments, "limit")?.unwrap_or(50);
+                let cursor = optional_string(arguments, "cursor")?.map(str::to_string);
+                self.knowledge
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .list_pages(&self.delegator, limit, cursor)
+                    .map_err(map_edge_error)
+            }
+            "knowledge.read_page" => {
+                exact_fields(arguments, &["page_id"], &["page_id"])?;
+                let page_id = required_string(arguments, "page_id")?;
+                self.knowledge
+                    .as_ref()
+                    .ok_or(DirectReadError::Unavailable)?
+                    .read_page(&self.delegator, page_id)
                     .map_err(map_edge_error)
             }
             _ => Err(DirectReadError::Unavailable),

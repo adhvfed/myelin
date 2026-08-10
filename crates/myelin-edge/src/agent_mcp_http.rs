@@ -24,36 +24,75 @@ use crate::gateway::GatewayBuilder;
 use crate::repo_authz::{RepoAuthorizer, RepoPermission};
 use crate::request::EdgeResponse;
 use crate::{
-    DurableCiReadApi, DurableGitBackend, DurableIssueReadApi, GitEffectApi, McpReadExecutor,
+    DurableCiReadApi, DurableGitBackend, DurableIssueReadApi, DurableKnowledgeReadApi, GitEffectApi,
+    McpReadExecutor,
 };
 
 #[derive(Clone)]
-pub struct AgentMcpServices {
+pub struct AgentMcpAuthority {
     registry: PgAgentRegistry,
     sessions: AgentSessionIssuer,
     run_tokens: RunTokenMinter,
     boundary: Arc<RunTokenAuthorizer>,
-    provider: SubstrateProvider,
     principals: PrincipalStore,
-    git: Arc<DurableGitBackend>,
-    ci: DurableCiReadApi,
-    issues: DurableIssueReadApi,
-    audit: Arc<OutboxGovernanceAudit>,
-    runtime: Handle,
 }
 
-impl AgentMcpServices {
-    #[allow(clippy::too_many_arguments)]
+impl AgentMcpAuthority {
     pub fn new(
         registry: PgAgentRegistry,
         sessions: AgentSessionIssuer,
         run_tokens: RunTokenMinter,
         boundary: Arc<RunTokenAuthorizer>,
-        provider: SubstrateProvider,
         principals: PrincipalStore,
+    ) -> Self {
+        Self {
+            registry,
+            sessions,
+            run_tokens,
+            boundary,
+            principals,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AgentMcpResources {
+    git: Arc<DurableGitBackend>,
+    ci: DurableCiReadApi,
+    issues: DurableIssueReadApi,
+    knowledge: DurableKnowledgeReadApi,
+}
+
+impl AgentMcpResources {
+    pub fn new(
         git: Arc<DurableGitBackend>,
         ci: DurableCiReadApi,
         issues: DurableIssueReadApi,
+        knowledge: DurableKnowledgeReadApi,
+    ) -> Self {
+        Self {
+            git,
+            ci,
+            issues,
+            knowledge,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AgentMcpServices {
+    authority: AgentMcpAuthority,
+    provider: SubstrateProvider,
+    resources: AgentMcpResources,
+    audit: Arc<OutboxGovernanceAudit>,
+    runtime: Handle,
+}
+
+impl AgentMcpServices {
+    pub fn new(
+        authority: AgentMcpAuthority,
+        provider: SubstrateProvider,
+        resources: AgentMcpResources,
         runtime: Handle,
     ) -> Self {
         let audit = Arc::new(OutboxGovernanceAudit::new(
@@ -64,15 +103,9 @@ impl AgentMcpServices {
             Arc::new(UlidMinter::new()),
         ));
         Self {
-            registry,
-            sessions,
-            run_tokens,
-            boundary,
+            authority,
             provider,
-            principals,
-            git,
-            ci,
-            issues,
+            resources,
             audit,
             runtime,
         }
@@ -119,7 +152,7 @@ impl Handler for AgentMcpHandler {
             .ok_or_else(|| EdgeError::Unauthorized("agent run bearer is missing".into()))?;
         let authorized = self
             .services
-            .drive(self.services.sessions.authorize(
+            .drive(self.services.authority.sessions.authorize(
                 ctx.principal,
                 run_id,
                 &capability.jti,
@@ -130,13 +163,14 @@ impl Handler for AgentMcpHandler {
             .services
             .drive(
                 self.services
+                    .authority
                     .registry
                     .get(ctx.principal, &authorized.agent_id),
             )?
             .map_err(map_registry_error)?;
         validate_registration(ctx.principal, &registration)?;
         let delegator = active_delegator(
-            &self.services.principals,
+            &self.services.authority.principals,
             ctx.scope,
             &PrincipalId(registration.created_by.clone()),
         )?;
@@ -154,21 +188,21 @@ impl Handler for AgentMcpHandler {
             run_id: RunId(authorized.run_id.clone()),
         };
         let effect_api = Box::new(GitEffectApi::new(
-            self.services.git.clone(),
+            self.services.resources.git.clone(),
             ctx.principal.tenant.0.clone(),
             ctx.principal.region.0.clone(),
             ctx.principal.clone(),
             delegator.clone(),
-            self.services.boundary.clone(),
+            self.services.authority.boundary.clone(),
         ));
         let approvers = Arc::new(CreatorApproverPolicy {
             creator_id: PrincipalId(registration.created_by),
             scope: ctx.scope.clone(),
-            principals: self.services.principals.clone(),
-            repos: self.services.git.repo_authorizer().clone(),
+            principals: self.services.authority.principals.clone(),
+            repos: self.services.resources.git.repo_authorizer().clone(),
         });
         let router = GovernedRouter::with_issued_run(
-            self.services.run_tokens.clone(),
+            self.services.authority.run_tokens.clone(),
             principal,
             run_token,
             capability.effective_authority.grants().map(str::to_string),
@@ -180,11 +214,12 @@ impl Handler for AgentMcpHandler {
         .map_err(EdgeError::Unavailable)?;
         let reads = Arc::new(
             McpReadExecutor::new(
-                self.services.ci.clone(),
-                self.services.boundary.clone(),
+                self.services.resources.ci.clone(),
+                self.services.authority.boundary.clone(),
                 delegator,
             )
-            .with_issues(self.services.issues.clone()),
+            .with_issues(self.services.resources.issues.clone())
+            .with_knowledge(self.services.resources.knowledge.clone()),
         );
         let server = McpServer::with_router_and_reads(registry, router, reads);
         let frame = std::str::from_utf8(&ctx.request.body)
@@ -195,6 +230,7 @@ impl Handler for AgentMcpHandler {
             self.services
                 .drive(
                     self.services
+                        .authority
                         .sessions
                         .terminate(ctx.principal, run_id, &capability.jti),
                 )?

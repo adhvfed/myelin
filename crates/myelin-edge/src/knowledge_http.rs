@@ -6,14 +6,14 @@ use crate::Method;
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
 use myelin_identity::Principal;
 use myelin_knowledge::{
-    decrypt_text, encrypt_text, event_actor_pseudonym, pseudonymized_event_principal,
+    decrypt_text, encrypt_text, event_actor_pseudonym, page_ref, pseudonymized_event_principal,
     KnowledgeBlockRecord, KnowledgePageError, KnowledgePageRecord, KnowledgePageStore,
     KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage,
 };
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
 use myelin_storage::encryption::KeyChoiceError;
 use myelin_storage::kms::{KeyClass, KmsEngine, KmsError};
-use myelin_tenancy::Region;
+use myelin_tenancy::{Region, TenantId};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
@@ -31,14 +31,21 @@ const DEFAULT_PAGE_LIMIT: u32 = 50;
 const MAX_PAGE_LIMIT: u32 = 100;
 
 #[derive(Clone)]
-struct DurableKnowledgeApi {
+pub struct DurableKnowledgeReadApi {
     store: KnowledgePageStore,
     runtime: Handle,
-    ids: Arc<dyn IdMinter>,
     kms: Arc<KmsEngine>,
 }
 
-impl DurableKnowledgeApi {
+impl DurableKnowledgeReadApi {
+    pub fn new(pool: PgPool, runtime: Handle, kms: Arc<KmsEngine>) -> Self {
+        Self {
+            store: KnowledgePageStore::new(pool),
+            runtime,
+            kms,
+        }
+    }
+
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
         F: Future<Output = Result<T, KnowledgePageError>>,
@@ -57,12 +64,78 @@ impl DurableKnowledgeApi {
         result.map_err(map_page_error)
     }
 
+    fn viewer(&self, principal: &Principal) -> String {
+        event_actor_pseudonym(&principal.tenant.0, &principal.principal_id.0)
+    }
+
+    pub fn list_pages(
+        &self,
+        principal: &Principal,
+        limit: u32,
+        cursor: Option<String>,
+    ) -> Result<Value, EdgeError> {
+        validate_page_query(limit, cursor.as_deref())?;
+        let viewer = self.viewer(principal);
+        let pages = self.drive(self.store.list_visible(
+            &principal.tenant.0,
+            &principal.region.0,
+            &viewer,
+            cursor.as_deref(),
+            limit + 1,
+        ))?;
+        let has_more = pages.len() > limit as usize;
+        let visible = &pages[..pages.len().min(limit as usize)];
+        let next = has_more
+            .then(|| visible.last().map(|page| page.page_id.clone()))
+            .flatten();
+        let items = visible
+            .iter()
+            .map(|page| summary_json(page, &viewer, self.kms.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(page_envelope(json!(items), next, limit as usize))
+    }
+
+    pub fn read_page(&self, principal: &Principal, page_id: &str) -> Result<Value, EdgeError> {
+        validate_ulid(page_id)?;
+        let viewer = self.viewer(principal);
+        let page = self.drive(self.store.get_visible(
+            &principal.tenant.0,
+            &principal.region.0,
+            &viewer,
+            page_id,
+        ))?;
+        document_json(&page, &viewer, self.kms.as_ref())
+    }
+}
+
+#[derive(Clone)]
+struct DurableKnowledgeApi {
+    reads: DurableKnowledgeReadApi,
+    ids: Arc<dyn IdMinter>,
+}
+
+impl DurableKnowledgeApi {
+    fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
+    where
+        F: Future<Output = Result<T, KnowledgePageError>>,
+    {
+        self.reads.drive(future)
+    }
+
     fn mint_id(&self) -> String {
         self.ids.mint().0
     }
 
+    fn store(&self) -> &KnowledgePageStore {
+        &self.reads.store
+    }
+
+    fn kms(&self) -> &KmsEngine {
+        self.reads.kms.as_ref()
+    }
+
     fn viewer(&self, principal: &Principal) -> String {
-        event_actor_pseudonym(&principal.tenant.0, &principal.principal_id.0)
+        self.reads.viewer(principal)
     }
 }
 
@@ -100,32 +173,15 @@ fn active_block_state() -> String {
 }
 
 struct PageListHandler {
-    api: DurableKnowledgeApi,
+    api: DurableKnowledgeReadApi,
 }
 
 impl Handler for PageListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let (limit, cursor) = parse_page_query(&ctx.request.query)?;
-        let viewer = self.api.viewer(ctx.principal);
-        let pages = self.api.drive(self.api.store.list_visible(
-            &ctx.principal.tenant.0,
-            &ctx.principal.region.0,
-            &viewer,
-            cursor.as_deref(),
-            limit + 1,
-        ))?;
-        let has_more = pages.len() > limit as usize;
-        let visible = &pages[..pages.len().min(limit as usize)];
-        let next = has_more
-            .then(|| visible.last().map(|page| page.page_id.clone()))
-            .flatten();
-        let items = visible
-            .iter()
-            .map(|page| summary_json(page, &viewer, self.api.kms.as_ref()))
-            .collect::<Result<Vec<_>, _>>()?;
         Ok(no_store(EdgeResponse::json(
             200,
-            &page_envelope(json!(items), next, limit as usize),
+            &self.api.list_pages(ctx.principal, limit, cursor)?,
         )))
     }
 }
@@ -149,7 +205,7 @@ impl Handler for PageCreateHandler {
         let page_id = self.api.mint_id();
         let viewer = self.api.viewer(ctx.principal);
         let title = seal(
-            self.api.kms.as_ref(),
+            self.api.kms(),
             ctx.principal,
             &viewer,
             &title_scope(&page_id),
@@ -161,7 +217,7 @@ impl Handler for PageCreateHandler {
                 let block_id = self.api.mint_id();
                 Ok(KnowledgeBlockRecord {
                     inline: seal(
-                        self.api.kms.as_ref(),
+                        self.api.kms(),
                         ctx.principal,
                         &viewer,
                         &block_scope(&page_id, &block_id),
@@ -187,22 +243,17 @@ impl Handler for PageCreateHandler {
             client_nonce,
             blocks,
         };
-        let (stored_id, created) = self.api.drive(self.api.store.create(
+        let (stored_id, created) = self.api.drive(self.api.store().create(
             &page,
             EventId(self.api.mint_id()),
             Actor(event_actor),
             now_timestamp(),
         ))?;
-        let stored = self.api.drive(self.api.store.get_visible(
-            &ctx.principal.tenant.0,
-            &ctx.principal.region.0,
-            &viewer,
-            &stored_id,
-        ))?;
+        let stored = self.api.reads.read_page(ctx.principal, &stored_id)?;
         Ok(no_store(EdgeResponse::json(
             if created { 201 } else { 200 },
             &json!({
-                "page": document_json(&stored, &viewer, self.api.kms.as_ref())?,
+                "page": stored,
                 "created": created,
                 "durable": true,
             }),
@@ -211,23 +262,16 @@ impl Handler for PageCreateHandler {
 }
 
 struct PageGetHandler {
-    api: DurableKnowledgeApi,
+    api: DurableKnowledgeReadApi,
 }
 
 impl Handler for PageGetHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
         let page_id = page_param(ctx)?;
-        let viewer = self.api.viewer(ctx.principal);
-        let page = self.api.drive(self.api.store.get_visible(
-            &ctx.principal.tenant.0,
-            &ctx.principal.region.0,
-            &viewer,
-            page_id,
-        ))?;
         Ok(no_store(EdgeResponse::json(
             200,
-            &json!({ "page": document_json(&page, &viewer, self.api.kms.as_ref())? }),
+            &json!({ "page": self.api.read_page(ctx.principal, page_id)? }),
         )))
     }
 }
@@ -245,7 +289,7 @@ impl Handler for PageSaveHandler {
         validate_document(&body.blocks)?;
         let visibility = parse_visibility(&body.visibility)?;
         let viewer = self.api.viewer(ctx.principal);
-        let current = self.api.drive(self.api.store.get_visible(
+        let current = self.api.drive(self.api.store().get_visible(
             &ctx.principal.tenant.0,
             &ctx.principal.region.0,
             &viewer,
@@ -256,7 +300,7 @@ impl Handler for PageSaveHandler {
         }
 
         let current_title = open_visible(
-            self.api.kms.as_ref(),
+            self.api.kms(),
             &current,
             &current.title,
             &current.owner,
@@ -266,7 +310,7 @@ impl Handler for PageSaveHandler {
             current.title.clone()
         } else {
             seal(
-                self.api.kms.as_ref(),
+                self.api.kms(),
                 ctx.principal,
                 &viewer,
                 &title_scope(&page_id),
@@ -297,7 +341,7 @@ impl Handler for PageSaveHandler {
             let existing = current_blocks.get(block_id.as_str()).copied();
             let visible_markdown = match existing {
                 Some(block) if block.block_type == draft.block_type => open_visible(
-                    self.api.kms.as_ref(),
+                    self.api.kms(),
                     &current,
                     &block.inline,
                     &block.edited_by,
@@ -316,7 +360,7 @@ impl Handler for PageSaveHandler {
             } else {
                 blocks.push(KnowledgeBlockRecord {
                     inline: seal(
-                        self.api.kms.as_ref(),
+                        self.api.kms(),
                         ctx.principal,
                         &viewer,
                         &block_scope(&page_id, &block_id),
@@ -333,7 +377,7 @@ impl Handler for PageSaveHandler {
         }
 
         let event_actor = pseudonymized_event_principal(&ctx.principal.tenant.0, ctx.principal);
-        let version = self.api.drive(self.api.store.save(
+        let version = self.api.drive(self.api.store().save(
             &SaveKnowledgePage {
                 tenant: ctx.principal.tenant.0.clone(),
                 region: ctx.principal.region.0.clone(),
@@ -348,16 +392,11 @@ impl Handler for PageSaveHandler {
             Actor(event_actor),
             now_timestamp(),
         ))?;
-        let saved = self.api.drive(self.api.store.get_visible(
-            &ctx.principal.tenant.0,
-            &ctx.principal.region.0,
-            &viewer,
-            &page_id,
-        ))?;
+        let saved = self.api.reads.read_page(ctx.principal, &page_id)?;
         Ok(no_store(EdgeResponse::json(
             200,
             &json!({
-                "page": document_json(&saved, &viewer, self.api.kms.as_ref())?,
+                "page": saved,
                 "version": version,
                 "durable": true,
             }),
@@ -371,18 +410,17 @@ pub fn register_knowledge(
     runtime: Handle,
     kms: Arc<KmsEngine>,
 ) -> GatewayBuilder {
+    let reads = DurableKnowledgeReadApi::new(pool, runtime, kms);
     let api = DurableKnowledgeApi {
-        store: KnowledgePageStore::new(pool),
-        runtime,
+        reads: reads.clone(),
         ids: Arc::new(myelin_events::UlidMinter::new()),
-        kms,
     };
     builder
         .route(
             Method::Get,
             "/v1/knowledge/pages",
             "knowledge.pages.list",
-            Arc::new(PageListHandler { api: api.clone() }),
+            Arc::new(PageListHandler { api: reads.clone() }),
         )
         .route(
             Method::Post,
@@ -394,7 +432,7 @@ pub fn register_knowledge(
             Method::Get,
             "/v1/knowledge/pages/{page}",
             "knowledge.page.view",
-            Arc::new(PageGetHandler { api: api.clone() }),
+            Arc::new(PageGetHandler { api: reads }),
         )
         .route(
             Method::Put,
@@ -434,7 +472,6 @@ fn parse_page_query(query: &str) -> Result<(u32, Option<String>), EdgeError> {
                     })?);
                 }
                 "cursor" if cursor.is_none() => {
-                    validate_ulid(value)?;
                     cursor = Some(value.to_string());
                 }
                 "limit" | "cursor" => {
@@ -451,12 +488,20 @@ fn parse_page_query(query: &str) -> Result<(u32, Option<String>), EdgeError> {
         }
     }
     let limit = limit.unwrap_or(DEFAULT_PAGE_LIMIT);
+    validate_page_query(limit, cursor.as_deref())?;
+    Ok((limit, cursor))
+}
+
+fn validate_page_query(limit: u32, cursor: Option<&str>) -> Result<(), EdgeError> {
     if !(1..=MAX_PAGE_LIMIT).contains(&limit) {
         return Err(EdgeError::BadRequest(
             "Knowledge limit must be between 1 and 100".into(),
         ));
     }
-    Ok((limit, cursor))
+    if let Some(cursor) = cursor {
+        validate_ulid(cursor)?;
+    }
+    Ok(())
 }
 
 fn page_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
@@ -688,6 +733,7 @@ fn summary_json(
     .map_err(|_| EdgeError::Internal("stored Knowledge title is not valid UTF-8".into()))?;
     Ok(json!({
         "id": page.page_id,
+        "ref": page_ref(&TenantId(page.tenant.clone()), &page.page_id).0,
         "space": page.space_key,
         "parent_page_id": page.parent_page_id,
         "title": title.as_deref().unwrap_or("[erased page title]"),

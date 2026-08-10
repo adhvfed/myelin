@@ -33,7 +33,9 @@ pub mod sse;
 pub mod tool_http;
 
 pub use agent_http::register_agents;
-pub use agent_mcp_http::{register_agent_mcp, AgentMcpServices};
+pub use agent_mcp_http::{
+    register_agent_mcp, AgentMcpAuthority, AgentMcpResources, AgentMcpServices,
+};
 #[cfg(any(test, feature = "test-support"))]
 pub use authz::AllowAll;
 pub use authz::{
@@ -81,7 +83,7 @@ pub use issues_http::{
     register_issues, DurableIssueReadApi, MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS,
     MAX_ISSUE_JSON_BYTES,
 };
-pub use knowledge_http::register_knowledge;
+pub use knowledge_http::{register_knowledge, DurableKnowledgeReadApi};
 pub use mcp_read::McpReadExecutor;
 pub use notif_http::register_notif;
 pub use project_http::register_projects;

@@ -20,6 +20,7 @@ pub mod identity;
 pub mod issues_agents;
 pub mod issues_read_tools;
 pub mod issues_tools;
+pub mod knowledge_read_tools;
 pub mod knowledge_tools;
 pub mod long_park;
 pub mod loop_guards;
@@ -119,6 +120,8 @@ pub use issues_agents::{
 };
 
 pub use issues_read_tools::{issues_read_tool_defs, LIST_ISSUES_TOOL, VIEW_ISSUE_TOOL};
+
+pub use knowledge_read_tools::{knowledge_read_tool_defs, LIST_PAGES_TOOL, READ_PAGE_TOOL};
 
 pub use chat_tools::{
     chat_tool_defs, landing_requires_approval, post_message_tool_def, post_required_caps,

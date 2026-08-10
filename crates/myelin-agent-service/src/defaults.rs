@@ -44,6 +44,8 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("knowledge", "edit_confidential") => true,
         ("knowledge", "draft") => false,
         ("knowledge", "comment") => false,
+        ("knowledge", "list_pages") => false,
+        ("knowledge", "read_page") => false,
 
         ("chat", "post_message") => false,
         ("chat", "post") => false,
@@ -280,6 +282,12 @@ mod tests {
             !requires_approval_default("knowledge", "comment"),
             "comment is reversible → NOT gated"
         );
+        for read in ["list_pages", "read_page"] {
+            assert!(
+                !requires_approval_default("knowledge", read),
+                "knowledge.{read} is read-only → NOT gated"
+            );
+        }
 
         assert!(
             !requires_approval_default("chat", "post_message"),

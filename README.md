@@ -82,6 +82,8 @@ myelin auth configure-git
 myelin tool list
 myelin tool show ci.read_run
 myelin agent create "Review companion" --tool ci.read_run --tool git.open_pr \
+  --tool issues.list --tool issues.view \
+  --tool knowledge.list_pages --tool knowledge.read_page \
   --idempotency-key review-companion
 myelin mcp serve --as 22222222-2222-2222-2222-222222222222
 myelin agent suspend 22222222-2222-2222-2222-222222222222 \
@@ -130,6 +132,8 @@ exchanges the saved browser-approved session for a one-minute run identity, keep
 protocol output, and closes it when the client disconnects. Suspending or retiring the agent also
 terminates every unfinished run atomically; resuming permits fresh work but never revives an old
 run. No provider API key or long-lived agent credential is created or copied through this flow.
+Selected read tools resolve CI runs, issues, and Knowledge pages through the human delegator's
+live Myelin permissions, returning canonical references without GitHub, Linear, or Notion keys.
 
 Issue responses include a canonical `myelin://...` reference that can be passed directly to
 `chat ref`. The conversation keeps a live pointer to the issue rather than copying a stale

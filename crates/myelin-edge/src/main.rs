@@ -9,9 +9,10 @@ use myelin_edge::{
     register_agent_mcp, register_agents, register_chat, register_ci, register_git_durable,
     register_git_wire, register_issues, register_knowledge, register_notif, register_projects,
     register_tools, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
-    AgentMcpServices, AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
-    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableCiReadApi, DurableGitBackend,
-    DurableIssueReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
+    AgentMcpAuthority, AgentMcpResources, AgentMcpServices, AuthProvider, AuthPublicConfig,
+    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
+    DeviceAuthorizationBroker, DurableCiReadApi, DurableGitBackend, DurableIssueReadApi,
+    DurableKnowledgeReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
     ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
     ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
@@ -1136,15 +1137,24 @@ async fn serve(
     builder = register_agent_mcp(
         builder,
         AgentMcpServices::new(
-            agent_registry,
-            agent_sessions,
-            check.run_token_minter().clone(),
-            Arc::new(run_token_authorizer),
+            AgentMcpAuthority::new(
+                agent_registry,
+                agent_sessions,
+                check.run_token_minter().clone(),
+                Arc::new(run_token_authorizer),
+                mcp_principals,
+            ),
             provider.clone(),
-            mcp_principals,
-            git_backend.clone(),
-            mcp_ci,
-            DurableIssueReadApi::new(issue_store.clone(), handle.clone()),
+            AgentMcpResources::new(
+                git_backend.clone(),
+                mcp_ci,
+                DurableIssueReadApi::new(issue_store.clone(), handle.clone()),
+                DurableKnowledgeReadApi::new(
+                    provider.db_pool().clone(),
+                    handle.clone(),
+                    kms.clone(),
+                ),
+            ),
             handle.clone(),
         ),
     );

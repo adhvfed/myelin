@@ -392,6 +392,8 @@ describe("the CLI authentication journey", () => {
           "ci.read_log",
           "issues.list",
           "issues.view",
+          "knowledge.list_pages",
+          "knowledge.read_page",
         ]),
       );
       expect(mcpManifest.tools.every((tool) => tool.inputSchema.type === "object")).toBe(true);
@@ -417,6 +419,10 @@ describe("the CLI authentication journey", () => {
         "issues.list",
         "--tool",
         "issues.view",
+        "--tool",
+        "knowledge.list_pages",
+        "--tool",
+        "knowledge.read_page",
       );
       expect(createAgent.exitCode, createAgent.stderr).toBe(0);
       const activated = JSON.parse(createAgent.stdout) as {
@@ -448,11 +454,14 @@ describe("the CLI authentication journey", () => {
             { name: "git.open_pr", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
+            { name: "knowledge.list_pages", version: 1 },
+            { name: "knowledge.read_page", version: 1 },
           ],
           grants: expect.arrayContaining([
             "agent.tools.read",
             "edge.identity.read",
             "issue.view",
+            "knowledge.read",
             "repo.push",
             "run.view",
           ]),
@@ -472,6 +481,8 @@ describe("the CLI authentication journey", () => {
           "git.open_pr",
           "issues.list",
           "issues.view",
+          "knowledge.list_pages",
+          "knowledge.read_page",
         ]),
       );
       for (const tool of activated.agent.selected_tools) {
@@ -498,6 +509,10 @@ describe("the CLI authentication journey", () => {
         "issues.list",
         "--tool",
         "issues.view",
+        "--tool",
+        "knowledge.list_pages",
+        "--tool",
+        "knowledge.read_page",
       );
       expect(replayAgent.exitCode, replayAgent.stderr).toBe(0);
       expect(JSON.parse(replayAgent.stdout)).toMatchObject({
@@ -567,6 +582,8 @@ describe("the CLI authentication journey", () => {
             { name: "git.open_pr", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
+            { name: "knowledge.list_pages", version: 1 },
+            { name: "knowledge.read_page", version: 1 },
           ],
           effective_grants: activated.agent.grants,
           state: "ready",
@@ -634,6 +651,8 @@ describe("the CLI authentication journey", () => {
         "git.open_pr",
         "issues.list",
         "issues.view",
+        "knowledge.list_pages",
+        "knowledge.read_page",
       ]);
       expect(discoveredTools.at(0)?.inputSchema).toMatchObject({
         type: "object",
@@ -652,6 +671,15 @@ describe("the CLI authentication journey", () => {
       expect(discoveredTools.at(3)?.inputSchema).toMatchObject({
         type: "object",
         required: ["issue_id"],
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(4)?.inputSchema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(5)?.inputSchema).toMatchObject({
+        type: "object",
+        required: ["page_id"],
         additionalProperties: false,
       });
 
@@ -733,6 +761,8 @@ describe("the CLI authentication journey", () => {
         "git.open_pr",
         "issues.list",
         "issues.view",
+        "knowledge.list_pages",
+        "knowledge.read_page",
       ]);
 
       // Pausing a collaborator is one durable human action: new work stops and in-flight bearer
@@ -930,9 +960,31 @@ describe("the CLI authentication journey", () => {
       );
       expect(activeIssue).toMatchObject({ id: issueId, key: issueKey, title: contextualIssueTitle });
 
-      // Once resumed, the collaborator reads the founder's issue through Myelin itself. The run
-      // credential and the founder's live project membership intersect at Edge; no Linear token,
-      // copied browser session, tenant selector, or provider-specific setup reaches the agent.
+      const knowledgeTitle = uniqueName("How we ship safely");
+      const contextualPage = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        `cli-context-page-${randomUUID()}`,
+        "doc",
+        "page",
+        "create",
+        "--title",
+        knowledgeTitle,
+        "--template",
+        "product-spec",
+      );
+      expect(contextualPage.exitCode, contextualPage.stderr).toBe(0);
+      const pageEnvelope = record(JSON.parse(contextualPage.stdout), "CLI knowledge page");
+      const knowledgePage = record(pageEnvelope.page, "CLI knowledge document");
+      const knowledgePageId = string(knowledgePage.id, "CLI knowledge page id");
+      expect(pageEnvelope).toMatchObject({ created: true, durable: true });
+      expect(knowledgePage).toMatchObject({ title: knowledgeTitle, visibility: "team" });
+
+      // Once resumed, the collaborator reads the founder's issue and durable delivery context
+      // through Myelin itself. The run credential and the founder's live permissions intersect at
+      // Edge; no Linear or Notion token, copied browser session, tenant selector, or provider setup
+      // reaches the agent.
       const workAfterResume = await systemClient.json(
         `/v1/agents/${activated.agent.id}/runs`,
         {
@@ -969,6 +1021,32 @@ describe("the CLI authentication journey", () => {
         project_id: createdProject.project.id,
         ref: `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`,
       });
+
+      const pageList = await askAgent(resumedRun, 5, "knowledge.list_pages", { limit: 10 });
+      expect(array(pageList.items, "agent-visible knowledge pages")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            id: knowledgePageId,
+            title: knowledgeTitle,
+            ref: `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`,
+          }),
+        ]),
+      );
+      expect(pageList.page).toMatchObject({ limit: 10 });
+
+      const readPage = await askAgent(resumedRun, 6, "knowledge.read_page", {
+        page_id: knowledgePageId,
+      });
+      expect(readPage).toMatchObject({
+        id: knowledgePageId,
+        title: knowledgeTitle,
+        ref: `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`,
+      });
+      expect(array(readPage.blocks, "agent-visible knowledge blocks")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ type: "heading", markdown: "Problem", state: "active" }),
+        ]),
+      );
 
       // Retirement is the irreversible counterpart: active work is torn down and neither the
       // CLI nor another client can quietly revive the durable identity.
