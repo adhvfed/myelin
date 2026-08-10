@@ -127,7 +127,6 @@ CREATE TABLE IF NOT EXISTS ci_run (
   run_id              uuid NOT NULL,
   project_id          uuid NOT NULL,
   repo_ref            text,
-  source_ref          text,
   commit_oid          text,
   pipeline_id         uuid NOT NULL,
   wf_run_id           uuid NOT NULL,
