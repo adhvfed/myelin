@@ -193,7 +193,11 @@ impl DirectReadExecutor for McpReadExecutor {
                     .map_err(map_edge_error)
             }
             "git.read_file" => {
-                exact_fields(arguments, &["repo", "ref", "path"], &["repo", "ref", "path"])?;
+                exact_fields(
+                    arguments,
+                    &["repo", "ref", "path"],
+                    &["repo", "ref", "path"],
+                )?;
                 let repo = required_string(arguments, "repo")?;
                 let gitref = required_string(arguments, "ref")?;
                 let path = required_string(arguments, "path")?;

@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-const E1_1_NOTE: &str = "edge route + handler are real and run under the verified tenant scope; the \
+const E1_1_NOTE: &str =
+    "edge route + handler are real and run under the verified tenant scope; the \
                          durable git effect (RefStore ref-CAS / WireExecutor / PR-row persistence) \
                          lands with the Git subsystem track (E1.1)";
 
@@ -51,8 +52,10 @@ impl GitEdgeState {
         path: &str,
         form: WebEditForm,
     ) -> GitEdgeState {
-        self.blobs
-            .insert((tenant.into(), repo.into(), gitref.into(), path.into()), form);
+        self.blobs.insert(
+            (tenant.into(), repo.into(), gitref.into(), path.into()),
+            form,
+        );
         self
     }
 
@@ -232,7 +235,11 @@ struct CodeSearchHandler {
 impl Handler for CodeSearchHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let tenant = tenant_of(ctx);
-        let q = ctx.request.query_param("q").unwrap_or_default().to_lowercase();
+        let q = ctx
+            .request
+            .query_param("q")
+            .unwrap_or_default()
+            .to_lowercase();
         let hits: Vec<Value> = self
             .state
             .code
@@ -244,7 +251,10 @@ impl Handler for CodeSearchHandler {
             .collect();
         let limit = ctx.page.limit;
         let page: Vec<Value> = hits.into_iter().take(limit).collect();
-        Ok(EdgeResponse::json(200, &page_envelope(json!(page), None, limit)))
+        Ok(EdgeResponse::json(
+            200,
+            &page_envelope(json!(page), None, limit),
+        ))
     }
 }
 
@@ -340,60 +350,83 @@ pub(crate) fn map_method(m: GitMethod) -> Method {
 pub fn register_git(mut b: GatewayBuilder, state: Arc<GitEdgeState>) -> GatewayBuilder {
     for ep in http_catalogue() {
         let pattern = match (ep.method, ep.path) {
-            (
-                GitMethod::Get | GitMethod::Post,
-                "/api/git/repos/{repo}/blob/{ref}/{path}",
-            ) => reroot("/api/git/repos/{repo}/blob/{ref}/{...path}"),
+            (GitMethod::Get | GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
+                reroot("/api/git/repos/{repo}/blob/{ref}/{...path}")
+            }
             _ => reroot(ep.path),
         };
         let method = map_method(ep.method);
         let (handler, action): (Arc<dyn Handler>, &'static str) = match (ep.method, ep.path) {
             (GitMethod::Get, "/api/git/repos") => (
-                Arc::new(RepoListHandler { state: state.clone() }),
+                Arc::new(RepoListHandler {
+                    state: state.clone(),
+                }),
                 "git.repos.list",
             ),
             (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}") => (
-                Arc::new(PrOverviewHandler { state: state.clone() }),
+                Arc::new(PrOverviewHandler {
+                    state: state.clone(),
+                }),
                 "git.pr.view",
             ),
             (GitMethod::Get, "/api/git/repos/{repo}/prs/{n}/checks") => (
-                Arc::new(PrChecksHandler { state: state.clone() }),
+                Arc::new(PrChecksHandler {
+                    state: state.clone(),
+                }),
                 "git.pr.checks",
             ),
             (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
-                Arc::new(BlobViewHandler { state: state.clone() }),
+                Arc::new(BlobViewHandler {
+                    state: state.clone(),
+                }),
                 "git.blob.view",
             ),
             (GitMethod::Get, "/api/git/search/code") => (
-                Arc::new(CodeSearchHandler { state: state.clone() }),
+                Arc::new(CodeSearchHandler {
+                    state: state.clone(),
+                }),
                 "git.search.code",
             ),
             (GitMethod::Post, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
-                Arc::new(WebEditCommitHandler { state: state.clone() }),
+                Arc::new(WebEditCommitHandler {
+                    state: state.clone(),
+                }),
                 "git.blob.commit",
             ),
             (GitMethod::Post, "/api/git/repos") => (
-                Arc::new(DeferredWriteHandler { action: "git.repo.create" }),
+                Arc::new(DeferredWriteHandler {
+                    action: "git.repo.create",
+                }),
                 "git.repo.create",
             ),
             (GitMethod::Post, "/api/git/repos/{repo}/prs") => (
-                Arc::new(DeferredWriteHandler { action: "git.pr.open" }),
+                Arc::new(DeferredWriteHandler {
+                    action: "git.pr.open",
+                }),
                 "git.pr.open",
             ),
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/reviews") => (
-                Arc::new(DeferredWriteHandler { action: "git.pr.review" }),
+                Arc::new(DeferredWriteHandler {
+                    action: "git.pr.review",
+                }),
                 "git.pr.review",
             ),
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/endorse-fork-ci") => (
-                Arc::new(DeferredWriteHandler { action: "git.pr.endorse_fork_ci" }),
+                Arc::new(DeferredWriteHandler {
+                    action: "git.pr.endorse_fork_ci",
+                }),
                 "git.pr.endorse_fork_ci",
             ),
             (GitMethod::Post, "/api/git/repos/{repo}/prs/{n}/merge") => (
-                Arc::new(DeferredWriteHandler { action: "git.pr.merge" }),
+                Arc::new(DeferredWriteHandler {
+                    action: "git.pr.merge",
+                }),
                 "git.pr.merge",
             ),
             (_, other) => (
-                Arc::new(DeferredWriteHandler { action: "git.unmapped" }),
+                Arc::new(DeferredWriteHandler {
+                    action: "git.unmapped",
+                }),
                 Box::leak(format!("git.unmapped:{other}").into_boxed_str()),
             ),
         };
@@ -419,11 +452,7 @@ mod tests {
     fn every_catalogue_entry_is_mapped_and_rerooted() {
         let state = Arc::new(GitEdgeState::new());
         let b = register_git(
-            crate::gateway::Gateway::builder(
-                test_authn(),
-                test_human(),
-                Arc::new(crate::AllowAll),
-            ),
+            crate::gateway::Gateway::builder(test_authn(), test_human(), Arc::new(crate::AllowAll)),
             state,
         );
         let gw = b.build();

@@ -25,6 +25,7 @@ myelin-notif = { path = "../myelin-notif" }
 myelin-chat = { path = "../myelin-chat" }
 myelin-content = { path = "../myelin-content" }
 myelin-refs = { path = "../myelin-refs" }
+myelin-refs-service = { path = "../myelin-refs-service", features = ["integration"] }
 myelin-knowledge = { path = "../myelin-knowledge" }
 myelin-agent = { path = "../myelin-agent" }
 myelin-agent-service = { path = "../myelin-agent-service" }

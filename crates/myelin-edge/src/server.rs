@@ -12,10 +12,10 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
@@ -124,14 +124,8 @@ pub async fn serve_edge_until_shutdown<F, T>(
 where
     F: Future<Output = T>,
 {
-    serve_edge_until_shutdown_with_probe(
-        listener,
-        gateway,
-        Arc::new(AlwaysReady),
-        shutdown,
-        grace,
-    )
-    .await
+    serve_edge_until_shutdown_with_probe(listener, gateway, Arc::new(AlwaysReady), shutdown, grace)
+        .await
 }
 
 pub async fn serve_edge_until_shutdown_with_probe<F, T>(
@@ -248,13 +242,7 @@ async fn handle_connection(
     let method = observable_method(req.method());
     let route_class = route_class(req.uri().path());
     let started = std::time::Instant::now();
-    let mut response = handle_connection_inner(
-        gw,
-        readiness,
-        admission,
-        req,
-    )
-    .await;
+    let mut response = handle_connection_inner(gw, readiness, admission, req).await;
     harden_response_headers(&mut response);
     response.headers_mut().insert(
         hyper::header::HeaderName::from_static("x-request-id"),
@@ -358,17 +346,15 @@ async fn handle_connection_inner(
         Err(BoundedCollectError::TimedOut) => return request_timeout(body_deadline),
     };
     let edge_req = EdgeRequest::new(method, path, query, headers, bytes);
-    let large_response_permit =
-        if requires_large_response_budget(&edge_req.method, &edge_req.path) {
-            match admission.large_response.clone().try_acquire_owned() {
-                Ok(permit) => Some(permit),
-                Err(_) => {
-                    return overloaded("the large response service is at capacity; retry later")
-                }
-            }
-        } else {
-            None
-        };
+    let large_response_permit = if requires_large_response_budget(&edge_req.method, &edge_req.path)
+    {
+        match admission.large_response.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return overloaded("the large response service is at capacity; retry later"),
+        }
+    } else {
+        None
+    };
     let git_wire_permit = if is_git_wire {
         match admission.git_wire.clone().try_acquire_owned() {
             Ok(permit) => Some(permit),
@@ -387,10 +373,7 @@ async fn handle_connection_inner(
         let _git_wire_permit = git_wire_permit;
         let _request_body_permit = request_body_permit;
         let _git_push_body_permit = git_push_body_permit;
-        (
-            handle_gateway_safely(&gw, edge_req),
-            large_response_permit,
-        )
+        (handle_gateway_safely(&gw, edge_req), large_response_permit)
     })
     .await
     {
@@ -542,9 +525,10 @@ fn overloaded(message: &str) -> Response<EdgeBody> {
 
 fn unread_body_overloaded(message: &str) -> Response<EdgeBody> {
     let mut response = overloaded(message);
-    response
-        .headers_mut()
-        .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
+    response.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
     response
 }
 
@@ -554,18 +538,20 @@ fn request_timeout(deadline: Duration) -> Response<EdgeBody> {
         deadline.as_secs()
     ));
     let mut response = to_hyper(EdgeResponse::error(&err));
-    response
-        .headers_mut()
-        .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
+    response.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
     response
 }
 
 fn request_body_read_error() -> Response<EdgeBody> {
     let err = EdgeError::BadRequest("request body could not be read".into());
     let mut response = to_hyper(EdgeResponse::error(&err));
-    response
-        .headers_mut()
-        .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
+    response.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
     response
 }
 
@@ -602,13 +588,13 @@ fn request_has_body(headers: &hyper::HeaderMap) -> bool {
 }
 
 fn payload_too_large(cap: usize) -> Response<EdgeBody> {
-    let err = EdgeError::PayloadTooLarge(format!(
-        "request body exceeds the {cap}-byte route limit"
-    ));
+    let err =
+        EdgeError::PayloadTooLarge(format!("request body exceeds the {cap}-byte route limit"));
     let mut response = to_hyper(EdgeResponse::error(&err));
-    response
-        .headers_mut()
-        .insert(hyper::header::CONNECTION, hyper::header::HeaderValue::from_static("close"));
+    response.headers_mut().insert(
+        hyper::header::CONNECTION,
+        hyper::header::HeaderValue::from_static("close"),
+    );
     response
 }
 
@@ -621,7 +607,12 @@ fn to_hyper_with_permit(
     large_response_permit: Option<OwnedSemaphorePermit>,
 ) -> Response<EdgeBody> {
     match resp {
-        EdgeResponse::Bytes { status, content_type, headers, body } => {
+        EdgeResponse::Bytes {
+            status,
+            content_type,
+            headers,
+            body,
+        } => {
             if !response_content_type_is_safe(&content_type)
                 || !handler_response_headers_are_safe(&headers)
             {
@@ -988,7 +979,9 @@ mod tests {
         let total_chunks = 4096usize;
         let pulled = Arc::new(AtomicUsize::new(0));
         let counter = pulled.clone();
-        let chunks: Vec<Bytes> = (0..total_chunks).map(|_| Bytes::from(vec![0u8; chunk])).collect();
+        let chunks: Vec<Bytes> = (0..total_chunks)
+            .map(|_| Bytes::from(vec![0u8; chunk]))
+            .collect();
         let stream = tokio_stream::iter(chunks).map(move |b| {
             counter.fetch_add(b.len(), Ordering::SeqCst);
             Ok::<Frame<Bytes>, std::io::Error>(Frame::data(b))
@@ -996,7 +989,11 @@ mod tests {
         let body = StreamBody::new(stream);
 
         let res = collect_bounded(body, cap, Duration::from_secs(1)).await;
-        assert_eq!(res, Err(BoundedCollectError::TooLarge), "over-cap body is rejected");
+        assert_eq!(
+            res,
+            Err(BoundedCollectError::TooLarge),
+            "over-cap body is rejected"
+        );
 
         let consumed = pulled.load(Ordering::SeqCst);
         assert!(
@@ -1029,7 +1026,11 @@ mod tests {
         ];
         let body = StreamBody::new(tokio_stream::iter(frames));
         let res = collect_bounded(body, 1024, Duration::from_secs(1)).await;
-        assert_eq!(res, Err(BoundedCollectError::Read), "a mid-body read error is Read, not TooLarge");
+        assert_eq!(
+            res,
+            Err(BoundedCollectError::Read),
+            "a mid-body read error is Read, not TooLarge"
+        );
     }
 
     #[tokio::test]
@@ -1044,13 +1045,28 @@ mod tests {
         let cap = 4096usize;
         let mk = |val: &str| {
             let mut h = hyper::HeaderMap::new();
-            h.insert(hyper::header::CONTENT_LENGTH, hyper::header::HeaderValue::from_str(val).unwrap());
+            h.insert(
+                hyper::header::CONTENT_LENGTH,
+                hyper::header::HeaderValue::from_str(val).unwrap(),
+            );
             h
         };
-        assert!(content_length_over_cap(&mk("4097"), cap), "declared > cap rejects");
-        assert!(!content_length_over_cap(&mk("4096"), cap), "declared == cap does not reject");
-        assert!(!content_length_over_cap(&mk("10"), cap), "declared < cap does not reject");
-        assert!(!content_length_over_cap(&mk("not-a-number"), cap), "unparseable does not fast-reject");
+        assert!(
+            content_length_over_cap(&mk("4097"), cap),
+            "declared > cap rejects"
+        );
+        assert!(
+            !content_length_over_cap(&mk("4096"), cap),
+            "declared == cap does not reject"
+        );
+        assert!(
+            !content_length_over_cap(&mk("10"), cap),
+            "declared < cap does not reject"
+        );
+        assert!(
+            !content_length_over_cap(&mk("not-a-number"), cap),
+            "unparseable does not fast-reject"
+        );
         assert!(
             !content_length_over_cap(&hyper::HeaderMap::new(), cap),
             "absent Content-Length does not fast-reject (streaming bound enforces)"
@@ -1084,7 +1100,11 @@ mod tests {
             "/acme/eu-west/widgets.git/git-upload-pack",
             "/livez",
         ] {
-            assert_eq!(request_body_cap(path), MAX_JSON_REQUEST_BODY_BYTES, "{path}");
+            assert_eq!(
+                request_body_cap(path),
+                MAX_JSON_REQUEST_BODY_BYTES,
+                "{path}"
+            );
         }
     }
 
@@ -1121,9 +1141,8 @@ mod tests {
 
     #[test]
     fn pre_read_body_overload_closes_the_connection() {
-        let response = unread_body_overloaded(
-            "the Git push upload service is at capacity; retry later",
-        );
+        let response =
+            unread_body_overloaded("the Git push upload service is at capacity; retry later");
         assert_eq!(response.status(), 503);
         assert_eq!(response.headers()[hyper::header::RETRY_AFTER], "1");
         assert_eq!(response.headers()[hyper::header::CONNECTION], "close");
@@ -1165,7 +1184,10 @@ mod tests {
                 .with_header("x-invalid", "line\nbreak"),
         );
         assert_eq!(response.status(), 500);
-        assert_eq!(response.headers()[hyper::header::CONTENT_TYPE], "application/json");
+        assert_eq!(
+            response.headers()[hyper::header::CONTENT_TYPE],
+            "application/json"
+        );
     }
 
     #[test]
@@ -1205,10 +1227,16 @@ mod tests {
             "application/x-git-receive-pack-advertisement",
             "application/x-git-receive-pack-result",
         ] {
-            assert!(response_content_type_is_safe(content_type), "{content_type}");
+            assert!(
+                response_content_type_is_safe(content_type),
+                "{content_type}"
+            );
         }
         for content_type in ["text/html", "image/svg+xml", "text/javascript"] {
-            assert!(!response_content_type_is_safe(content_type), "{content_type}");
+            assert!(
+                !response_content_type_is_safe(content_type),
+                "{content_type}"
+            );
         }
     }
 

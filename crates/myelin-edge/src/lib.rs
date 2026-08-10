@@ -27,6 +27,7 @@ pub mod knowledge_http;
 pub mod mcp_read;
 pub mod notif_http;
 pub mod project_http;
+pub mod refs_http;
 pub mod repo_authz;
 pub mod repo_authz_live;
 pub mod request;
@@ -94,6 +95,7 @@ pub use knowledge_http::{register_knowledge, DurableKnowledgeReadApi};
 pub use mcp_read::McpReadExecutor;
 pub use notif_http::register_notif;
 pub use project_http::register_projects;
+pub use refs_http::{register_refs, DurableRefsReadApi};
 pub use repo_authz::{AllowAllRepos, DenyAllRepos, GrantBackedRepos, RepoAccess, RepoAuthorizer};
 pub use repo_authz_live::{
     repo_object_id, repo_object_ref, CheckBackedRepoAuthorizer, NoRepoBootstrap,

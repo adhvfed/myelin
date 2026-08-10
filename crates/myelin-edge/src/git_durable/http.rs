@@ -7,13 +7,11 @@ impl Handler for DRepoList {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         if repo_summary_requested(&ctx.request.query) {
             let query = parse_repo_summary_query(&ctx.request.query)?;
-            let envelope = self
-                .be
-                .list_repositories(
-                    ctx.principal,
-                    u32::try_from(query.limit).expect("bounded repository summary limit"),
-                    query.cursor,
-                )?;
+            let envelope = self.be.list_repositories(
+                ctx.principal,
+                u32::try_from(query.limit).expect("bounded repository summary limit"),
+                query.cursor,
+            )?;
             return repo_summary_response(&envelope);
         }
         let offset = ctx
@@ -1251,11 +1249,14 @@ impl Handler for DWebEditCommit {
             .get("contents")
             .and_then(Value::as_str)
             .ok_or_else(|| EdgeError::BadRequest("commit body missing `contents`".into()))?;
-        let start_ref = body.get("start_ref").map(|value| {
-            value.as_str().ok_or_else(|| {
-                EdgeError::BadRequest("commit body `start_ref` must be a string".into())
+        let start_ref = body
+            .get("start_ref")
+            .map(|value| {
+                value.as_str().ok_or_else(|| {
+                    EdgeError::BadRequest("commit body `start_ref` must be a string".into())
+                })
             })
-        }).transpose()?;
+            .transpose()?;
         let outcome = self
             .be
             .web_edit_commit(
@@ -2911,14 +2912,8 @@ mod code_search_boundary_tests {
         let commit = repo
             .write_commit(&tree, &[], "seed", "searcher", "searcher")
             .unwrap();
-        repo.update_ref_cas(
-            "refs/heads/main",
-            None,
-            Some(&commit),
-            "seed",
-            "searcher",
-        )
-        .unwrap();
+        repo.update_ref_cas("refs/heads/main", None, Some(&commit), "seed", "searcher")
+            .unwrap();
 
         let response = serve(be.clone(), "repo=core&q=needle").unwrap();
         assert_eq!(response.status(), 200);
@@ -3082,10 +3077,9 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 pr_read_guarded(&be, Arc::new(DPrChecks { be: be.clone() })),
                 "git.pr.checks",
             ),
-            (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => (
-                Arc::new(DBlobView { be: be.clone() }),
-                "git.blob.view",
-            ),
+            (GitMethod::Get, "/api/git/repos/{repo}/blob/{ref}/{path}") => {
+                (Arc::new(DBlobView { be: be.clone() }), "git.blob.view")
+            }
             (GitMethod::Get, "/api/git/repos/{repo}/blame/{ref}/{path}") => (
                 guarded(&be, Pull, Arc::new(DBlameView { be: be.clone() })),
                 "git.blame.view",
@@ -3126,10 +3120,9 @@ pub fn register_git_durable(mut b: GatewayBuilder, be: Arc<DurableGitBackend>) -
                 guarded(&be, Push, Arc::new(DReportChecks { be: be.clone() })),
                 "git.checks.report",
             ),
-            (GitMethod::Get, "/api/git/search/code") => (
-                Arc::new(DCodeSearch { be: be.clone() }),
-                "git.search.code",
-            ),
+            (GitMethod::Get, "/api/git/search/code") => {
+                (Arc::new(DCodeSearch { be: be.clone() }), "git.search.code")
+            }
             (_, other) => (
                 Arc::new(DCodeSearch { be: be.clone() }),
                 Box::leak(format!("git.unmapped:{other}").into_boxed_str()),
@@ -4996,8 +4989,15 @@ mod pr_thread_tests {
             )
             .expect("open pull request");
 
-        assert_eq!(opened.reviews.len(), 1, "duplicates and the author are omitted");
-        assert_eq!(opened.reviews[0].reviewer_pseudonym, "u:reader@acme.noreply");
+        assert_eq!(
+            opened.reviews.len(),
+            1,
+            "duplicates and the author are omitted"
+        );
+        assert_eq!(
+            opened.reviews[0].reviewer_pseudonym,
+            "u:reader@acme.noreply"
+        );
         assert_eq!(opened.reviews[0].state, ReviewState::Requested);
         assert!(
             be.authorize_pr_review(TENANT, REGION, SLUG, opened.number, &reader),
@@ -5019,7 +5019,9 @@ mod pr_thread_tests {
                 &writer,
             )
             .expect_err("reviewer ids must be canonical");
-        assert!(matches!(malformed, DurableError::Git(message) if message.contains("reviewer ids")));
+        assert!(
+            matches!(malformed, DurableError::Git(message) if message.contains("reviewer ids"))
+        );
     }
 
     #[test]

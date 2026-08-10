@@ -10,8 +10,8 @@ use myelin_knowledge::{
     KnowledgeBlockRecord, KnowledgePageError, KnowledgePageRecord, KnowledgePageStore,
     KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage,
 };
-use myelin_storage::encryption::{EncryptedColumn, SubjectId};
 use myelin_storage::encryption::KeyChoiceError;
+use myelin_storage::encryption::{EncryptedColumn, SubjectId};
 use myelin_storage::kms::{KeyClass, KmsEngine, KmsError};
 use myelin_tenancy::{Region, TenantId};
 use serde::Deserialize;
@@ -356,7 +356,11 @@ impl Handler for PageSaveHandler {
                 visible_markdown.as_deref() == Some(draft.markdown.as_bytes())
             };
             if unchanged {
-                blocks.push(existing.expect("unchanged implies an existing block").clone());
+                blocks.push(
+                    existing
+                        .expect("unchanged implies an existing block")
+                        .clone(),
+                );
             } else {
                 blocks.push(KnowledgeBlockRecord {
                     inline: seal(
@@ -505,11 +509,10 @@ fn validate_page_query(limit: u32, cursor: Option<&str>) -> Result<(), EdgeError
 }
 
 fn page_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
-    let page = ctx
-        .params
-        .get("page")
-        .map(String::as_str)
-        .ok_or_else(|| EdgeError::BadRequest("route did not bind a Knowledge page id".into()))?;
+    let page =
+        ctx.params.get("page").map(String::as_str).ok_or_else(|| {
+            EdgeError::BadRequest("route did not bind a Knowledge page id".into())
+        })?;
     validate_ulid(page)?;
     Ok(page)
 }
@@ -537,8 +540,7 @@ fn validate_title(value: &str) -> Result<(), EdgeError> {
         Ok(())
     } else {
         Err(EdgeError::BadRequest(
-            "Knowledge title must be 1-512 clean UTF-8 bytes without surrounding whitespace"
-                .into(),
+            "Knowledge title must be 1-512 clean UTF-8 bytes without surrounding whitespace".into(),
         ))
     }
 }

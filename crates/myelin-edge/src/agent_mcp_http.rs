@@ -263,12 +263,11 @@ impl Handler for AgentMcpHandler {
 
         if server.router().is_some_and(GovernedRouter::is_fatal) {
             self.services
-                .drive(
-                    self.services
-                        .authority
-                        .sessions
-                        .terminate(ctx.principal, run_id, &capability.jti),
-                )?
+                .drive(self.services.authority.sessions.terminate(
+                    ctx.principal,
+                    run_id,
+                    &capability.jti,
+                ))?
                 .map_err(map_session_error)?;
         }
 

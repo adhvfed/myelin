@@ -82,12 +82,10 @@ impl RepoAuthorizer for CheckBackedRepoAuthorizer {
                 &strong_at(Zookie(String::new())),
                 revoked,
             ),
-            RepoPermission::ApproveUntrustedCi => self.gate.fork_endorsement_check(
-                principal,
-                &object,
-                Zookie(String::new()),
-                revoked,
-            ),
+            RepoPermission::ApproveUntrustedCi => {
+                self.gate
+                    .fork_endorsement_check(principal, &object, Zookie(String::new()), revoked)
+            }
         };
         is_allow(&decision)
     }
@@ -347,7 +345,9 @@ mod tests {
             !authz.authorize_repo(&creator, &repo, RepoAccess::Read),
             "pre-grant: denied (the admit below is the grant's doing)"
         );
-        bootstrap.grant_creator(&creator, &repo).expect("bootstrap grant on team/app");
+        bootstrap
+            .grant_creator(&creator, &repo)
+            .expect("bootstrap grant on team/app");
         assert!(
             authz.authorize_repo(&creator, &repo, RepoAccess::Read),
             "the namespaced-slug bootstrap grant admits its creator (pull)"

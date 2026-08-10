@@ -107,7 +107,7 @@ pub use mirror::{
     SyntheticTypedEvent,
 };
 #[cfg(feature = "integration")]
-pub use pg_edge::{build_pg_edge_consumer, PgEdgeProjector, PgEdgeStore};
+pub use pg_edge::{build_pg_edge_consumer, PgEdgeProjector, PgEdgeStore, StoredBacklink};
 pub use reach_index::{R4ReachIndex, R4Verdict, R4_READ_BUDGET_FANOUT};
 pub use reindex::{
     RefsReindexSource, RefsReindexer, ReindexError, ReindexReceipt, SourceEdge,

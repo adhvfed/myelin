@@ -18,13 +18,18 @@ fn read_pkt(buf: &[u8]) -> Result<(Option<&[u8]>, &[u8]), String> {
     if buf.len() < 4 {
         return Err("truncated pkt-line length prefix".into());
     }
-    let hdr = std::str::from_utf8(&buf[..4]).map_err(|_| "non-ascii pkt-line length".to_string())?;
-    let len = usize::from_str_radix(hdr, 16).map_err(|_| format!("bad pkt-line hex length {hdr:?}"))?;
+    let hdr =
+        std::str::from_utf8(&buf[..4]).map_err(|_| "non-ascii pkt-line length".to_string())?;
+    let len =
+        usize::from_str_radix(hdr, 16).map_err(|_| format!("bad pkt-line hex length {hdr:?}"))?;
     if len == 0 {
         return Ok((None, &buf[4..]));
     }
     if len < 4 || len > buf.len() {
-        return Err(format!("pkt-line length {len} out of range (buf {})", buf.len()));
+        return Err(format!(
+            "pkt-line length {len} out of range (buf {})",
+            buf.len()
+        ));
     }
     Ok((Some(&buf[4..len]), &buf[len..]))
 }
@@ -50,14 +55,15 @@ pub(crate) fn parse_push_request(body: &[u8]) -> Result<(Vec<RefCommand>, Vec<u8
             .map_err(|_| "non-utf8 ref-update command".to_string())?
             .trim_end_matches('\n');
         let parts: Vec<&str> = s.splitn(3, ' ').collect();
-        let valid_oid = |oid: &str| {
-            oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit())
-        };
+        let valid_oid =
+            |oid: &str| oid.len() == 40 && oid.bytes().all(|byte| byte.is_ascii_hexdigit());
         if parts.len() != 3
             || !valid_oid(parts[0])
             || !valid_oid(parts[1])
             || !parts[2].starts_with("refs/")
-            || parts[2].bytes().any(|byte| byte.is_ascii_control() || byte == b' ')
+            || parts[2]
+                .bytes()
+                .any(|byte| byte.is_ascii_control() || byte == b' ')
         {
             return Err(format!("malformed ref-update command {s:?}"));
         }
@@ -74,7 +80,9 @@ pub(crate) fn parse_push_request(body: &[u8]) -> Result<(Vec<RefCommand>, Vec<u8
     Ok((cmds, rest.to_vec()))
 }
 
-pub(crate) fn parse_cat_file_batch(mut buf: &[u8]) -> Result<Vec<(String, String, Vec<u8>)>, String> {
+pub(crate) fn parse_cat_file_batch(
+    mut buf: &[u8],
+) -> Result<Vec<(String, String, Vec<u8>)>, String> {
     let mut out = Vec::new();
     while !buf.is_empty() {
         let nl = buf
@@ -87,9 +95,13 @@ pub(crate) fn parse_cat_file_batch(mut buf: &[u8]) -> Result<Vec<(String, String
         buf = &buf[nl + 1..];
         let parts: Vec<&str> = header.split(' ').collect();
         if parts.len() != 3 {
-            return Err(format!("cat-file reported a non-resolvable object: {header:?}"));
+            return Err(format!(
+                "cat-file reported a non-resolvable object: {header:?}"
+            ));
         }
-        let size: usize = parts[2].parse().map_err(|_| format!("bad cat-file size in {header:?}"))?;
+        let size: usize = parts[2]
+            .parse()
+            .map_err(|_| format!("bad cat-file size in {header:?}"))?;
         if buf.len() < size + 1 {
             return Err("truncated cat-file payload".into());
         }
@@ -106,7 +118,10 @@ pub(crate) fn parse_cat_file_batch(mut buf: &[u8]) -> Result<Vec<(String, String
 pub(crate) fn build_receive_pack_refs(refs: &[(String, String)]) -> Vec<u8> {
     let mut out = Vec::new();
     if refs.is_empty() {
-        out.extend(pkt_line(&format!("{} capabilities^{{}}\0{RECV_CAPS}\n", "0".repeat(40))));
+        out.extend(pkt_line(&format!(
+            "{} capabilities^{{}}\0{RECV_CAPS}\n",
+            "0".repeat(40)
+        )));
     } else {
         for (i, (name, oid)) in refs.iter().enumerate() {
             if i == 0 {
@@ -196,11 +211,9 @@ mod tests {
         let malformed = format!("{z} {non_hex} refs/heads/topic\n");
         let mut body = format!("{:04x}{malformed}", malformed.len() + 4).into_bytes();
         body.extend_from_slice(b"0000PACKmust-not-be-ingested");
-        assert!(
-            parse_push_request(&body)
-                .expect_err("non-hex object id must fail at the protocol boundary")
-                .contains("malformed ref-update command")
-        );
+        assert!(parse_push_request(&body)
+            .expect_err("non-hex object id must fail at the protocol boundary")
+            .contains("malformed ref-update command"));
 
         let first = format!("{z} {} refs/heads/one\n", "1".repeat(40));
         let second = format!("{z} {} refs/heads/two\0report-status\n", "2".repeat(40));

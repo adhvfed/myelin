@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 mod agent;
 mod collaboration;
 mod project;
+mod refs;
 mod tool;
 
 fn terminal_safe_single_line(value: &str) -> String {
@@ -58,6 +59,9 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
         return rendered;
     }
     if let Some(rendered) = project::render_response(value) {
+        return rendered;
+    }
+    if let Some(rendered) = refs::render_response(value, call) {
         return rendered;
     }
     if let Some(rendered) = collaboration::render_response(value) {

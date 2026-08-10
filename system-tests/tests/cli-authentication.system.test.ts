@@ -1617,6 +1617,77 @@ describe("the CLI authentication journey", () => {
         }),
       ]);
 
+      // References are not merely syntax inside the message. Once projected, either artifact can
+      // lead the developer back to the same visible piece of agent-authored context. The graph is
+      // read through the CLI under the developer's session, so a hidden source could never appear
+      // here just because its edge exists.
+      for (const linkedArtifact of [agentIssueRef, agentPullRequestRef]) {
+        const backlink = await eventually<JsonRecord>(
+          async () => {
+            const listed = await runCli(
+              configDirectory,
+              "--json",
+              "ref",
+              "backlinks",
+              linkedArtifact,
+            );
+            expect(listed.exitCode, listed.stderr).toBe(0);
+            const response = record(JSON.parse(listed.stdout), "permission-filtered backlinks");
+            const links = array(
+              response.items,
+              "visible backlink items",
+            )
+              .map((item, index) => record(item, `visible backlink ${index}`))
+              .filter((item) => item.root_ref === postedByAgent.ref);
+            return links.length === 1 ? links[0] : undefined;
+          },
+          { description: `${linkedArtifact} to lead back to the agent's context message` },
+        );
+        expect(backlink).toMatchObject({
+          root_ref: postedByAgent.ref,
+          target_ref: linkedArtifact,
+          relation: "links",
+          relation_class: "reference",
+        });
+      }
+
+      // The target is gated too. Knowing (or guessing) a private canonical ref cannot turn the
+      // graph into an existence oracle for another developer.
+      const privatePage = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        `private-ref-target-${randomUUID()}`,
+        "doc",
+        "page",
+        "create",
+        "--title",
+        uniqueName("Private release notes"),
+        "--template",
+        "blank",
+        "--visibility",
+        "private",
+      );
+      expect(privatePage.exitCode, privatePage.stderr).toBe(0);
+      const privatePageRef = string(
+        record(record(JSON.parse(privatePage.stdout), "private page envelope").page, "private page")
+          .ref,
+        "private page ref",
+      );
+      const ownerBacklinks = await runCli(
+        configDirectory,
+        "--json",
+        "ref",
+        "backlinks",
+        privatePageRef,
+      );
+      expect(ownerBacklinks.exitCode, ownerBacklinks.stderr).toBe(0);
+      expect(array(record(JSON.parse(ownerBacklinks.stdout), "owner backlinks").items)).toEqual([]);
+      await reviewerClient.json(
+        `/v1/refs/backlinks?ref=${encodeURIComponent(privatePageRef)}`,
+        { expectedStatus: 404 },
+      );
+
       // Retirement is the irreversible counterpart: active work is torn down and neither the
       // CLI nor another client can quietly revive the durable identity.
       const retireAgent = await runCli(

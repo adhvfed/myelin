@@ -8,14 +8,14 @@ use myelin_edge::{
     bootstrap_principal_and_mint, execute_secret_command, recover_placed_git_at_boot,
     register_agent_mcp, register_agents, register_chat, register_ci, register_git_durable,
     register_git_wire, register_issues, register_knowledge, register_notif, register_projects,
-    register_tools, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
-    AgentMcpAuthority, AgentMcpResources, AgentMcpServices, AuthProvider, AuthPublicConfig,
-    AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
-    DeviceAuthorizationBroker, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi,
-    DurableGitBackend, DurableKnowledgeReadApi, Gateway, GitDatabaseProviders,
-    IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
-    SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
-    TupleRepoBootstrap, WhoamiHandler,
+    register_refs, register_tools, serve_edge_until_shutdown_with_probe,
+    spawn_issue_authorization_reconciler, AgentMcpAuthority, AgentMcpResources, AgentMcpServices,
+    AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
+    CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableChatMutationApi,
+    DurableChatReadApi, DurableCiReadApi, DurableGitBackend, DurableKnowledgeReadApi,
+    DurableRefsReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
+    ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
+    ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
@@ -413,8 +413,7 @@ fn validated_public_base_url(value: Result<String, VarError>) -> Result<String, 
 }
 
 fn validate_git_wire_host(limits: &myelin_ci_sandbox::ResourceLimits) -> Result<(), String> {
-    let cgroup =
-        myelin_ci_sandbox::MemoryCgroup::create(1024 * 1024, limits.cpu_millis)
+    let cgroup = myelin_ci_sandbox::MemoryCgroup::create(1024 * 1024, limits.cpu_millis)
         .map_err(|error| format!("Git wire sandbox host preflight failed: {error}"))?;
     drop(cgroup);
     Ok(())
@@ -593,7 +592,10 @@ async fn compose_core(cell_id: String) -> ComposedCore {
         std::process::exit(1);
     }
     if let Err(e) = bootstrap
-        .migrate(&myelin_knowledge::knowledge_page_migrations(), &HotTables::none())
+        .migrate(
+            &myelin_knowledge::knowledge_page_migrations(),
+            &HotTables::none(),
+        )
         .await
     {
         eprintln!("edge: cannot apply the Knowledge page and block migrations: {e}");
@@ -830,9 +832,8 @@ async fn serve(
     )));
     let git_minter: Arc<dyn myelin_events::IdMinter> = Arc::new(myelin_events::UlidMinter::new());
 
-    let (authn, run_token_authorizer) = durable_capability_authenticator(
-        &provider, &kms, &cell, &handle,
-    );
+    let (authn, run_token_authorizer) =
+        durable_capability_authenticator(&provider, &kms, &cell, &handle);
     let authn = Arc::new(authn);
 
     let oidc_settings = provider.config().oidc.clone();
@@ -1030,7 +1031,7 @@ async fn serve(
             eprintln!("edge: PostgreSQL Git PR store refused to construct: {error}");
             std::process::exit(1);
         })
-        .with_repo_authorizer(repo_authz)
+        .with_repo_authorizer(repo_authz.clone())
         .with_repo_bootstrap(repo_bootstrap)
         .with_git_wire_credential_issuer(git_wire_credentials)
         .with_git_shutdown_signal(git_shutdown.clone()),
@@ -1118,17 +1119,20 @@ async fn serve(
         check.clone(),
         handle.clone(),
     );
+    builder = register_refs(
+        builder,
+        DurableRefsReadApi::new(provider.db_pool().clone(), repo_authz, handle.clone()),
+    );
     let agent_registry = myelin_identity_service::PgAgentRegistry::new(provider.clone());
-    let agent_sessions =
-        myelin_identity_service::AgentSessionIssuer::new(
-            provider.clone(),
-            check.clone(),
-            thresholds.fail_static.agent_token_ttl_secs,
-        )
-        .unwrap_or_else(|error| {
-            eprintln!("edge: external agent session issuer refused to start: {error}");
-            std::process::exit(1);
-        });
+    let agent_sessions = myelin_identity_service::AgentSessionIssuer::new(
+        provider.clone(),
+        check.clone(),
+        thresholds.fail_static.agent_token_ttl_secs,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("edge: external agent session issuer refused to start: {error}");
+        std::process::exit(1);
+    });
     builder = register_agents(
         builder,
         agent_registry.clone(),
@@ -1469,10 +1473,7 @@ fn durable_capability_authenticator(
 ) {
     let verifier: Arc<dyn TokenVerifier> = Arc::new(
         PasetoCapabilityVerifier::new(cell.trust_anchor()).with_replay_guard(
-            DpopReplayGuard::with_pg(
-                DurableReplayBacking::new(provider.clone()),
-                handle.clone(),
-            ),
+            DpopReplayGuard::with_pg(DurableReplayBacking::new(provider.clone()), handle.clone()),
         ),
     );
     let revocations = RevocationStore::with_pg(
@@ -1910,10 +1911,7 @@ mod runtime_config_tests {
         )
         .unwrap_err();
 
-        assert_eq!(
-            error,
-            "env var MYELIN_GIT_WIRE_ENABLED must be `0` or `1`"
-        );
+        assert_eq!(error, "env var MYELIN_GIT_WIRE_ENABLED must be `0` or `1`");
     }
 
     #[test]

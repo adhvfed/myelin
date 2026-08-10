@@ -23,10 +23,13 @@ impl SessionStore {
 
     pub fn issue(&self, scheme: impl Into<String>, material: impl Into<String>) -> String {
         let id = self.fresh_id();
-        self.inner
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id.clone(), SessionRecord { scheme: scheme.into(), material: material.into() });
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            id.clone(),
+            SessionRecord {
+                scheme: scheme.into(),
+                material: material.into(),
+            },
+        );
         id
     }
 
@@ -83,7 +86,10 @@ mod tests {
     #[test]
     fn set_cookie_is_httponly_and_carries_only_the_id() {
         let h = SessionStore::set_cookie_header("sess-1");
-        assert!(h.contains("HttpOnly"), "the cookie is httpOnly (no client JS access)");
+        assert!(
+            h.contains("HttpOnly"),
+            "the cookie is httpOnly (no client JS access)"
+        );
         assert!(h.contains("SameSite=Strict"));
         assert!(h.starts_with("myelin_session=sess-1"));
         assert!(!h.contains("v4.public"), "no token material in the cookie");

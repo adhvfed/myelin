@@ -21,12 +21,10 @@ pub(crate) fn raw(status: u16, content_type: &str, body: Vec<u8>) -> EdgeRespons
     EdgeResponse::Bytes {
         status,
         content_type: content_type.to_string(),
-        headers: vec![
-            (
-                "cache-control".to_string(),
-                "no-cache, max-age=0, must-revalidate".to_string(),
-            ),
-        ],
+        headers: vec![(
+            "cache-control".to_string(),
+            "no-cache, max-age=0, must-revalidate".to_string(),
+        )],
         body,
     }
 }

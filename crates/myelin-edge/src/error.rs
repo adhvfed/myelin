@@ -111,9 +111,15 @@ mod tests {
         assert_eq!(EdgeError::Conflict("x".into()).status(), 409);
         assert_eq!(EdgeError::Unprocessable("x".into()).status(), 422);
         assert_eq!(EdgeError::PayloadTooLarge("x".into()).status(), 413);
-        assert_eq!(EdgeError::PayloadTooLarge("x".into()).code(), "payload_too_large");
+        assert_eq!(
+            EdgeError::PayloadTooLarge("x".into()).code(),
+            "payload_too_large"
+        );
         assert_eq!(EdgeError::RequestTimeout("x".into()).status(), 408);
-        assert_eq!(EdgeError::RequestTimeout("x".into()).code(), "request_timeout");
+        assert_eq!(
+            EdgeError::RequestTimeout("x".into()).code(),
+            "request_timeout"
+        );
         assert_eq!(EdgeError::Unavailable("x".into()).status(), 503);
         assert_eq!(EdgeError::Internal("x".into()).status(), 500);
         assert_eq!(EdgeError::Unauthorized("x".into()).code(), "unauthorized");
@@ -135,7 +141,14 @@ mod tests {
 
         let forged = EdgeError::Unauthorized("signature verification failed (forged)".into());
         let revoked = EdgeError::Unauthorized("token jti revoked (durable S7)".into());
-        assert_eq!(forged.envelope(), revoked.envelope(), "401 is an oracle-free uniform message");
-        assert_eq!(forged.envelope()["error"]["message"], "authentication required");
+        assert_eq!(
+            forged.envelope(),
+            revoked.envelope(),
+            "401 is an oracle-free uniform message"
+        );
+        assert_eq!(
+            forged.envelope()["error"]["message"],
+            "authentication required"
+        );
     }
 }

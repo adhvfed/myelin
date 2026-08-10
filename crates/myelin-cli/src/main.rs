@@ -12,7 +12,7 @@ use myelin_cli::device_auth::{
 use myelin_cli::dispatch::{
     agent_dispatch, chat_dispatch, ci_dispatch, git_dispatch, is_canonical_project_id,
     issues_dispatch_with_context, knowledge_dispatch, notif_dispatch, project_dispatch,
-    repo_dispatch, tool_dispatch, EdgeCall, HttpMethod, RetryPolicy,
+    refs_dispatch, repo_dispatch, tool_dispatch, EdgeCall, HttpMethod, RetryPolicy,
 };
 use myelin_cli::error::CliError;
 use myelin_cli::git_credential::{
@@ -98,6 +98,12 @@ enum Command {
     /// Work with knowledge pages.
     #[command(name = "doc", visible_aliases = ["kb", "knowledge"])]
     Knowledge {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Follow permission-filtered links between Myelin artifacts.
+    #[command(name = "ref", visible_alias = "refs")]
+    Ref {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -259,6 +265,10 @@ async fn run() -> Result<(), CliError> {
         }
         Command::Knowledge { args } => {
             let (call, command_key) = dispatch_command(args, knowledge_dispatch)?;
+            run_call(&cli, &getenv, &read_file, call, command_key).await
+        }
+        Command::Ref { args } => {
+            let (call, command_key) = dispatch_command(args, refs_dispatch)?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Notif { args } => {
@@ -955,9 +965,11 @@ mod tests {
             "project": { "id": "11111111-1111-1111-1111-111111111111" }
         });
         let message =
-            apply_response_effect(ResponseEffect::SelectCreatedProject, &value, None, &|_| None)
-                .unwrap()
-                .unwrap();
+            apply_response_effect(ResponseEffect::SelectCreatedProject, &value, None, &|_| {
+                None
+            })
+            .unwrap()
+            .unwrap();
         assert!(message.contains("context use --project 11111111-1111-1111-1111-111111111111"));
 
         assert!(apply_response_effect(

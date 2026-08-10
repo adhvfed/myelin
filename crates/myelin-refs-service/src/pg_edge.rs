@@ -26,6 +26,75 @@ impl PgEdgeStore {
         &self.pool
     }
 
+    pub async fn inbound_live(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        target_root: &myelin_events::ArtifactRef,
+        limit: u32,
+    ) -> Result<Vec<StoredBacklink>, myelin_storage::PgError> {
+        let scope_tenant = tenant.0.clone();
+        let scope_region = region.0.clone();
+        let tenant_id = scope_tenant.clone();
+        let region_id = scope_region.clone();
+        let target = target_root.0.clone();
+        myelin_storage::with_tenant_tx(
+            &self.pool,
+            &scope_tenant,
+            &scope_region,
+            move |connection| {
+                Box::pin(async move {
+                    sqlx::query_as::<_, (String, String, String, String, String, String, String, String)>(
+                        "SELECT edge_id, source, source_root, target, target_root, rel, rel_class, \
+                                origin_actor
+                           FROM edge
+                          WHERE tenant_id = $1 AND region = $2 AND target_root = $3
+                            AND NOT tombstoned
+                          ORDER BY edge_id
+                          LIMIT $4",
+                    )
+                    .bind(tenant_id)
+                    .bind(region_id)
+                    .bind(target)
+                    .bind(i64::from(limit))
+                    .fetch_all(connection)
+                    .await
+                    .map(|rows| {
+                        rows.into_iter()
+                            .map(
+                                |(
+                                    edge_id,
+                                    source,
+                                    source_root,
+                                    target,
+                                    target_root,
+                                    rel,
+                                    rel_class,
+                                    origin_actor,
+                                )| StoredBacklink {
+                                    edge_id,
+                                    source,
+                                    source_root,
+                                    target,
+                                    target_root,
+                                    rel,
+                                    rel_class,
+                                    origin_actor,
+                                },
+                            )
+                            .collect()
+                    })
+                    .map_err(|error| {
+                        myelin_storage::PgError::Query(format!(
+                            "read live inbound reference edges: {error}"
+                        ))
+                    })
+                })
+            },
+        )
+        .await
+    }
+
     fn co_commit_project(
         &self,
         tx: &mut HandlerTx<'_>,
@@ -40,6 +109,18 @@ impl PgEdgeStore {
             runtime.block_on(project_on_connection(connection, event, mutation))
         })
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredBacklink {
+    pub edge_id: String,
+    pub source: String,
+    pub source_root: String,
+    pub target: String,
+    pub target_root: String,
+    pub rel: String,
+    pub rel_class: String,
+    pub origin_actor: String,
 }
 
 #[derive(Clone)]

@@ -569,10 +569,7 @@ fn guarded(
     })
 }
 
-pub fn register_issues(
-    builder: GatewayBuilder,
-    api: DurableIssueMutationApi,
-) -> GatewayBuilder {
+pub fn register_issues(builder: GatewayBuilder, api: DurableIssueMutationApi) -> GatewayBuilder {
     let authorizer = api.authorizer.clone();
     let reads = api.reads();
     let builder = builder

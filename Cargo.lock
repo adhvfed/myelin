@@ -2817,6 +2817,7 @@ dependencies = [
  "myelin-mcp",
  "myelin-notif",
  "myelin-refs",
+ "myelin-refs-service",
  "myelin-storage",
  "myelin-substrate",
  "myelin-tenancy",

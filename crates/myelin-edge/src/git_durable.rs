@@ -2,14 +2,14 @@ use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, M
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_edge::{map_method, num_param, param, reroot, tenant_of};
-use crate::repo_authz::{DenyAllRepos, RepoAuthorizer, RepoPermission};
 #[cfg(any(test, feature = "test-support"))]
 use crate::repo_authz::AllowAllRepos;
+use crate::repo_authz::{DenyAllRepos, RepoAuthorizer, RepoPermission};
 use crate::repo_authz_live::{NoRepoBootstrap, RepoBootstrapGrants};
 use crate::request::{EdgeRequest, EdgeResponse};
-use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
 #[cfg(any(test, feature = "test-support"))]
 use myelin_events::MonotonicMinter;
+use myelin_events::{Actor, EmitContextBase, IdMinter, OutboxStore, Region, TenantId, Timestamp};
 use myelin_git::api::{
     http_catalogue, valid_code_search_query, valid_code_search_repo, Method as GitMethod,
 };
@@ -1216,14 +1216,7 @@ impl DurableGitBackend {
                 continue;
             }
             let branch_ref = format!("refs/heads/{}", summary.default_branch);
-            search_repo_code(
-                &repo,
-                &slug,
-                &branch_ref,
-                query,
-                &mut hits,
-                &mut budget,
-            )?;
+            search_repo_code(&repo, &slug, &branch_ref, query, &mut hits, &mut budget)?;
             if hits.len() >= CODE_SEARCH_MAX_RESULTS || budget.exhausted {
                 break;
             }
@@ -1297,21 +1290,14 @@ impl DurableGitBackend {
             return Err(EdgeError::BadRequest("file path is invalid".into()));
         }
         let location = Self::loc(&principal.tenant.0, &principal.region.0, repo);
-        if !self.repo_authz.authorize_repo_permission(
-            principal,
-            &location,
-            RepoPermission::Pull,
-        ) {
+        if !self
+            .repo_authz
+            .authorize_repo_permission(principal, &location, RepoPermission::Pull)
+        {
             return Err(EdgeError::NotFound("repository not found".into()));
         }
         let mut file = self
-            .blob_json(
-                &principal.tenant.0,
-                &principal.region.0,
-                repo,
-                gitref,
-                path,
-            )
+            .blob_json(&principal.tenant.0, &principal.region.0, repo, gitref, path)
             .map_err(map_durable_err)?;
         if let Some(object) = file.as_object_mut() {
             let may_edit = self.repo_authz.authorize_repo_permission(
@@ -1635,8 +1621,7 @@ impl DurableGitBackend {
             &psn,
         )?;
 
-        let ref_store =
-            self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
+        let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
         let expected_old = prior_target
             .map(|p| PushOid::new(p.0))
             .unwrap_or_else(PushOid::zero);
@@ -1784,10 +1769,11 @@ impl DurableGitBackend {
             ));
         }
         let head_loc = Self::loc(tenant, region, head_repo_slug);
-        if !self
-            .repo_authz
-            .authorize_repo_permission(authorization_basis, &head_loc, RepoPermission::Pull)
-        {
+        if !self.repo_authz.authorize_repo_permission(
+            authorization_basis,
+            &head_loc,
+            RepoPermission::Pull,
+        ) {
             return Err(DurableError::NotFound("repository not found".into()));
         }
         let head_repo = self.store.open_repo(&head_loc)?;
@@ -1856,9 +1842,9 @@ impl DurableGitBackend {
         rec.body_md = body_md;
         rec.author_is_agent = Self::is_agent(actor);
         if let Some(reviewers) = body.get("reviewers") {
-            let reviewers = reviewers.as_array().ok_or_else(|| {
-                DurableError::Git("open-PR `reviewers` must be an array".into())
-            })?;
+            let reviewers = reviewers
+                .as_array()
+                .ok_or_else(|| DurableError::Git("open-PR `reviewers` must be an array".into()))?;
             if reviewers.len() > 100 {
                 return Err(DurableError::Git(
                     "open-PR `reviewers` exceeds 100 entries".into(),
@@ -1884,11 +1870,15 @@ impl DurableGitBackend {
                     requested.insert(format!("{reviewer}@{tenant}.noreply"));
                 }
             }
-            rec.reviews.extend(requested.into_iter().map(|reviewer_pseudonym| ReviewRecord {
-                reviewer_pseudonym,
-                state: ReviewState::Requested,
-                is_agent: false,
-            }));
+            rec.reviews.extend(
+                requested
+                    .into_iter()
+                    .map(|reviewer_pseudonym| ReviewRecord {
+                        reviewer_pseudonym,
+                        state: ReviewState::Requested,
+                        is_agent: false,
+                    }),
+            );
         }
         let now = now_unix();
         rec.created_at = Some(now);
@@ -4050,9 +4040,7 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::Git(m) if m.starts_with("blame limit exceeded:") => {
             EdgeError::PayloadTooLarge("file exceeds the interactive blame limit".into())
         }
-        DurableError::Git(m) if m.starts_with("blame unavailable:") => {
-            EdgeError::BadRequest(m)
-        }
+        DurableError::Git(m) if m.starts_with("blame unavailable:") => EdgeError::BadRequest(m),
         DurableError::Git(m) if m.starts_with("pull request list limit exceeded:") => {
             EdgeError::PayloadTooLarge(
                 "pull request list exceeds the interactive record limit".into(),
@@ -4460,8 +4448,8 @@ fn repo_summary_response(value: &Value) -> Result<EdgeResponse, EdgeError> {
     })
 }
 
-mod check_projection;
 mod blame;
+mod check_projection;
 mod http;
 pub use check_projection::GitDatabaseProviders;
 pub use http::register_git_durable;
