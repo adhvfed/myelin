@@ -1575,6 +1575,42 @@ impl DurableGitBackend {
         principal: &Principal,
         operation_id: &PrOperationId,
     ) -> Result<PrRecord, DurableError> {
+        self.open_pr_for_actor_with_operation(
+            tenant,
+            region,
+            slug,
+            body,
+            principal,
+            principal,
+            operation_id,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Opens a PR attributed to `actor`, using `authorization_basis` only to read its source.
+    ///
+    /// Agent effects deliberately keep these principals separate: delegation conveys authority,
+    /// but never changes who performed the mutation.
+    pub(crate) fn open_pr_for_actor_with_operation(
+        &self,
+        tenant: &str,
+        region: &str,
+        slug: &str,
+        body: &Value,
+        actor: &Principal,
+        authorization_basis: &Principal,
+        operation_id: &PrOperationId,
+    ) -> Result<PrRecord, DurableError> {
+        if actor.tenant.0 != tenant
+            || actor.region.0 != region
+            || authorization_basis.tenant != actor.tenant
+            || authorization_basis.region != actor.region
+        {
+            return Err(DurableError::Git(
+                "open-PR actor and authorization basis must share the requested tenant and region"
+                    .into(),
+            ));
+        }
         let loc = Self::loc(tenant, region, slug);
         self.store.open_repo(&loc)?;
         let base_ref = body
@@ -1597,10 +1633,10 @@ impl DurableGitBackend {
                 "open-PR head repository slug must be non-empty".into(),
             ));
         }
-        let head_loc = Self::loc(&principal.tenant.0, &principal.region.0, head_repo_slug);
+        let head_loc = Self::loc(tenant, region, head_repo_slug);
         if !self
             .repo_authz
-            .authorize_repo_permission(principal, &head_loc, RepoPermission::Pull)
+            .authorize_repo_permission(authorization_basis, &head_loc, RepoPermission::Pull)
         {
             return Err(DurableError::NotFound("repository not found".into()));
         }
@@ -1661,14 +1697,14 @@ impl DurableGitBackend {
             number,
             base_ref,
             head_ref,
-            Self::pseudonym(tenant, principal),
+            Self::pseudonym(tenant, actor),
             body.get("draft").and_then(Value::as_bool).unwrap_or(false),
         );
         let mut rec = PrRecord::open(&pr, head_oid);
         rec.head_repo_slug = head_repo_slug.to_string();
         rec.title = title;
         rec.body_md = body_md;
-        rec.author_is_agent = Self::is_agent(principal);
+        rec.author_is_agent = Self::is_agent(actor);
         if let Some(reviewers) = body.get("reviewers") {
             let reviewers = reviewers.as_array().ok_or_else(|| {
                 DurableError::Git("open-PR `reviewers` must be an array".into())
@@ -1678,7 +1714,7 @@ impl DurableGitBackend {
                     "open-PR `reviewers` exceeds 100 entries".into(),
                 ));
             }
-            let author = principal.principal_id.0.as_str();
+            let author = actor.principal_id.0.as_str();
             let mut requested = std::collections::BTreeSet::new();
             for reviewer in reviewers {
                 let reviewer = reviewer.as_str().ok_or_else(|| {
@@ -1707,7 +1743,7 @@ impl DurableGitBackend {
         let now = now_unix();
         rec.created_at = Some(now);
         rec.updated_at = Some(now);
-        self.pr_open(&loc, rec, operation_id, principal)
+        self.pr_open(&loc, rec, operation_id, actor)
     }
 
     fn list_prs_for_repo(

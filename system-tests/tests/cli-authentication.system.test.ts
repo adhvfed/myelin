@@ -1203,6 +1203,17 @@ describe("the CLI authentication journey", () => {
         "",
       ].join("\n");
       await sourceRepository.writeFile("main", sourcePath, sourceContents);
+      const agentBranch = `agent/investigate-${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+      const proposedSourceContents = sourceContents.replace(
+        "providerCredentialsRequired = false",
+        "providerCredentialsRequired = false as const",
+      );
+      const agentBranchCommit = await sourceRepository.updateFile(
+        agentBranch,
+        sourcePath,
+        proposedSourceContents,
+        { startRef: "main" },
+      );
 
       // Once resumed, the collaborator reads the founder's issue, product spec, release room, and
       // source through Myelin itself. The run credential and the founder's live permissions
@@ -1343,6 +1354,70 @@ describe("the CLI authentication journey", () => {
         preview_unavailable: false,
       });
 
+      // Authorship and authorization stay separate: the PR is authored by the agent, while the
+      // founder's live repository grant is the authorization basis. The agent receives neither a
+      // copied Git credential nor a durable repository grant of its own.
+      const agentPullRequestTitle = uniqueName("Make credentialless intent explicit");
+      const agentPullRequestKey = `agent-pr-${randomUUID()}`;
+      const openedByAgent = await askAgentToAct(
+        resumedRun,
+        12,
+        "git.open_pr",
+        {
+          repo: sourceRepository.slug,
+          title: agentPullRequestTitle,
+          base_ref: "refs/heads/main",
+          head_ref: `refs/heads/${agentBranch}`,
+          head_oid: agentBranchCommit.commitOid,
+        },
+        agentPullRequestKey,
+      );
+      const replayedAgentPullRequest = await askAgentToAct(
+        resumedRun,
+        13,
+        "git.open_pr",
+        {
+          repo: sourceRepository.slug,
+          title: agentPullRequestTitle,
+          base_ref: "refs/heads/main",
+          head_ref: `refs/heads/${agentBranch}`,
+          head_oid: agentBranchCommit.commitOid,
+        },
+        agentPullRequestKey,
+      );
+      expect(replayedAgentPullRequest.eventId).toBe(openedByAgent.eventId);
+
+      const humanVisibleAgentPullRequest = await eventually<JsonRecord>(
+        async () => {
+          const listed = await runCli(
+            configDirectory,
+            "--json",
+            "git",
+            "pr",
+            "list",
+            "--repo",
+            sourceRepository.slug,
+          );
+          expect(listed.exitCode, listed.stderr).toBe(0);
+          const matching = array(
+            record(JSON.parse(listed.stdout), "human pull request list").items,
+            "human-visible pull requests",
+          )
+            .map((pullRequest, index) =>
+              record(pullRequest, `human-visible pull request ${index}`),
+            )
+            .filter((pullRequest) => pullRequest.title === agentPullRequestTitle);
+          return matching.length === 1 ? matching[0] : undefined;
+        },
+        { description: "the agent-authored pull request to appear exactly once in the human CLI" },
+      );
+      expect(humanVisibleAgentPullRequest).toMatchObject({
+        title: agentPullRequestTitle,
+        head_ref: `refs/heads/${agentBranch}`,
+        author_is_agent: true,
+        author: `${activated.agent.principal_id}@${systemTestConfig.tenant}.noreply`,
+      });
+
       // The collaborator can now turn what it learned into durable team work. Project metadata
       // supplies the issue type and prefix, the human's live project access bounds the write, and
       // a lost MCP response can be retried without creating a second ticket.
@@ -1350,7 +1425,7 @@ describe("the CLI authentication journey", () => {
       const agentIssueKey = `agent-issue-${randomUUID()}`;
       const createdByAgent = await askAgentToAct(
         resumedRun,
-        12,
+        14,
         "issues.create",
         {
           project_id: createdProject.project.id,
@@ -1360,7 +1435,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentIssue = await askAgentToAct(
         resumedRun,
-        13,
+        15,
         "issues.create",
         {
           project_id: createdProject.project.id,
@@ -1408,7 +1483,7 @@ describe("the CLI authentication journey", () => {
       const agentPostKey = `agent-chat-${randomUUID()}`;
       const postedByAgent = await askAgentToAct(
         resumedRun,
-        14,
+        16,
         "chat.post",
         {
           conversation_id: conversationId,
@@ -1422,7 +1497,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentPost = await askAgentToAct(
         resumedRun,
-        15,
+        17,
         "chat.post",
         {
           conversation_id: conversationId,

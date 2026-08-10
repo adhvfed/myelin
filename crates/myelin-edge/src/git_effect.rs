@@ -106,12 +106,13 @@ impl GitEffectApi {
                 if let Err(denied) = self.authorize_repo(repo, RepoPermission::Push) {
                     return denied;
                 }
-                match self.backend.open_pr_with_operation(
+                match self.backend.open_pr_for_actor_with_operation(
                     t,
                     r,
                     repo,
                     args,
                     &self.principal,
+                    &self.delegator,
                     operation_id,
                 ) {
                     Ok(rec) => applied(run, tool, &format!("git.pr.open:#{}", rec.number)),
