@@ -383,6 +383,7 @@ command = ["true"]
       method: "POST",
       body: {
         event_type: "issue.issue.updated",
+        filter: "payload.change_kind == 'ownership'",
         run_as_agent_id: agentId,
         task: "Read the changed issue and propose the next smallest useful step.",
         budget_minor_units: 100_000,
@@ -397,13 +398,16 @@ command = ["true"]
     expect(trigger).toMatchObject({
       event_type: "issue.issue.updated",
       subject_type: "issue",
+      condition:
+        "event.type == 'issue.issue.updated' AND (payload.change_kind == 'ownership')",
       require_human_approval: true,
       firings_used: 0,
     });
 
-    const eventId = `issue-updated-${randomUUID()}`;
+    const ignoredEventId = `issue-title-updated-${randomUUID()}`;
+    const eventId = `issue-owner-updated-${randomUUID()}`;
     const now = new Date().toISOString();
-    const changedIssue: ExternalEventEnvelope = {
+    const ownershipChange: ExternalEventEnvelope = {
       event_id: eventId,
       type_: "issue.issue.updated",
       schema_ver: 1,
@@ -429,11 +433,26 @@ command = ["true"]
       pii_key_ref: null,
       occurred_at: now,
       recorded_at: now,
-      payload: { issue: issueRef, changed_fields: ["title"] },
+      payload: {
+        issue: issueRef,
+        change_kind: "ownership",
+        changed_fields: ["assignee"],
+      },
     };
     const bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
     try {
-      expect((await bus.publish(changedIssue)).duplicate).toBe(false);
+      const ignoredTitleChange = await bus.publish({
+        ...ownershipChange,
+        event_id: ignoredEventId,
+        correlation_id: ignoredEventId,
+        payload: {
+          issue: issueRef,
+          change_kind: "title",
+          changed_fields: ["title"],
+        },
+      });
+      expect(ignoredTitleChange.duplicate).toBe(false);
+      expect((await bus.publish(ownershipChange)).duplicate).toBe(false);
     } finally {
       await bus.close();
     }
@@ -447,6 +466,15 @@ command = ["true"]
         .find((item) => item.event_id === eventId && item.state === "awaiting_approval");
     }, { description: "the visible issue event to reach its exact human gate" });
     expect(awaiting).toMatchObject({ event_id: eventId, run_id: null, approval: null });
+
+    const history = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+    );
+    expect(array(history.body.items, "filtered issue automation history")).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ event_id: ignoredEventId })]),
+    );
+    const afterMatch = await founder.json(`/v1/triggers/${encodeURIComponent(triggerId)}`);
+    expect(afterMatch.body).toMatchObject({ trigger: { id: triggerId, firings_used: 1 } });
 
     const rejected = await founder.json(
       `/v1/triggers/${encodeURIComponent(triggerId)}/firings/reject`,

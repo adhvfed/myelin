@@ -106,12 +106,7 @@ impl GovernedTriggerConsumer {
             let no_relations = no_relation as fn(&RelMembership) -> bool;
             let matches = matcher
                 .matches(event, &SetExpr::All, &no_relations)
-                .map_err(|_| {
-                    TriggerDeliveryError::Malformed(format!(
-                        "trigger binding {} could not evaluate within the matcher budget",
-                        binding.binding_id
-                    ))
-                })?;
+                .unwrap_or(false);
             if !matches {
                 continue;
             }

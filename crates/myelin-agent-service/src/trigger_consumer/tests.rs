@@ -191,6 +191,47 @@ fn green_feature_and_revoked_visibility_are_quiet() {
     }
 }
 
+#[test]
+fn one_imperfect_rule_cannot_starve_another_rule() {
+    let mut brittle = binding("refs/heads/main");
+    brittle.binding_id = "4bf441cb-33e1-49e1-91bc-bbb8b5a5217d".into();
+    brittle.matcher = serde_json::to_value(
+        EventMatcher::compile(
+            ObjectType("run".into()),
+            Predicate::Cmp {
+                op: CmpOp::Eq,
+                lhs: Expr::Var("payload.field_this_event_does_not_carry".into()),
+                rhs: Expr::Lit(Literal::Bool(true)),
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let healthy = binding("refs/heads/main");
+    let store = Arc::new(RecordingStore {
+        bindings: vec![brittle, healthy],
+        reservations: Mutex::new(Vec::new()),
+    });
+    let consumer =
+        GovernedTriggerConsumer::new("acme", "fr-par", store.clone(), Arc::new(Visible(true)));
+
+    assert_eq!(
+        consumer.handle(
+            &event("ci.run.failed", "refs/heads/main", "red-main-2"),
+            &mut myelin_events::HandlerTx::none(),
+        ),
+        HandleOutcome::Done
+    );
+    assert_eq!(
+        *store.reservations.lock().unwrap(),
+        vec![(
+            "632cf5b2-207f-42f4-9f89-eedcd79f395f".into(),
+            "red-main-2".into(),
+        )],
+        "a rule that cannot evaluate fails closed by itself while healthy rules still run"
+    );
+}
+
 struct FanoutStore(usize);
 
 impl TriggerBindingStore for FanoutStore {

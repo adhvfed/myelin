@@ -12,6 +12,7 @@ const MAX_CAVEAT_BYTES: usize = 255;
 const MAX_BUDGET_MINOR_UNITS: u64 = 1_000_000_000_000;
 const MAX_FIRINGS: u64 = 1_000_000;
 const MAX_CAUSAL_DEPTH: u32 = 64;
+const MAX_FILTER_BYTES: usize = 4 * 1024;
 
 pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
@@ -38,6 +39,7 @@ struct CreateOptions<'a> {
     event_type: Option<&'a str>,
     subject_type: Option<&'a str>,
     source_branch: Option<&'a str>,
+    filter: Option<&'a str>,
     run_as_agent_id: Option<&'a str>,
     task: Option<&'a str>,
     budget_minor_units: Option<&'a str>,
@@ -63,6 +65,7 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
             "--branch" => {
                 singleton_value(&mut options.source_branch, args, &mut index, "--branch")?
             }
+            "--where" => singleton_value(&mut options.filter, args, &mut index, "--where")?,
             "--run-as" => {
                 singleton_value(&mut options.run_as_agent_id, args, &mut index, "--run-as")?
             }
@@ -139,6 +142,9 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     if let Some(branch) = options.source_branch {
         validate_branch(branch)?;
     }
+    if let Some(filter) = options.filter {
+        validate_filter(filter)?;
+    }
 
     let mut body = json!({
         "event_type": event_type,
@@ -153,6 +159,9 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     if let Some(branch) = options.source_branch {
         body["source_branch"] = json!(branch);
     }
+    if let Some(filter) = options.filter {
+        body["filter"] = json!(filter);
+    }
     if let Some(subject_type) = options.subject_type {
         body["subject_type"] = json!(subject_type);
     }
@@ -165,6 +174,17 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
 fn resolve_subject_type(event_type: &str, explicit: Option<&str>) -> Result<String, CliError> {
     myelin_events::resolve_automation_subject_type(event_type, explicit)
         .map_err(|error| CliError::Usage(error.to_string()))
+}
+
+fn validate_filter(filter: &str) -> Result<(), CliError> {
+    if filter.is_empty() || filter.len() > MAX_FILTER_BYTES || filter.trim() != filter {
+        return Err(CliError::Usage(format!(
+            "--where must contain 1..={MAX_FILTER_BYTES} bytes without surrounding whitespace"
+        )));
+    }
+    myelin_query::parse_query(filter)
+        .map(|_| ())
+        .map_err(|error| CliError::Usage(format!("--where is not a valid Myelin query: {error}")))
 }
 
 fn list_call(args: &[&str]) -> Result<EdgeCall, CliError> {
@@ -421,6 +441,8 @@ mod tests {
             "ci.run.failed",
             "--branch",
             "main",
+            "--where",
+            "payload.retryable == true",
             "--run-as",
             AGENT,
             "--task",
@@ -444,6 +466,7 @@ mod tests {
             json!({
                 "event_type": "ci.run.failed",
                 "source_branch": "main",
+                "filter": "payload.retryable == true",
                 "run_as_agent_id": AGENT,
                 "task": "Triage the failure and open one issue.",
                 "budget_minor_units": 250000,
@@ -571,6 +594,21 @@ mod tests {
                 "ci.run.failed",
                 "--branch",
                 "refs/tags/release",
+                "--run-as",
+                AGENT,
+                "--task",
+                "Triage.",
+                "--budget-minor-units",
+                "1",
+                "--max-firings",
+                "1",
+            ],
+            vec![
+                "create",
+                "--event",
+                "ci.run.failed",
+                "--where",
+                "payload.retryable = true",
                 "--run-as",
                 AGENT,
                 "--task",

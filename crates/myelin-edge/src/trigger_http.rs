@@ -2,7 +2,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use myelin_identity::{Literal, ObjectType};
-use myelin_query::{CmpOp, EventMatcher, Expr, Predicate};
+use myelin_query::{CmpOp, EventMatcher, Expr, Predicate, QueryAst};
 use myelin_storage::{
     AgentTriggerApprovalDecision, AgentTriggerFiringState, AgentTriggerLifecycleAction,
     ChangeAgentTriggerApprovalOutcome, ChangeAgentTriggerLifecycleOutcome,
@@ -22,6 +22,7 @@ use crate::request::EdgeResponse;
 use crate::Method;
 
 const MAX_TRIGGER_JSON_BYTES: usize = 16 * 1024;
+const MAX_TRIGGER_FILTER_BYTES: usize = 4 * 1024;
 
 #[derive(Clone)]
 struct TriggerHttpApi {
@@ -56,6 +57,8 @@ struct CreateTriggerBody {
     subject_type: Option<String>,
     #[serde(default)]
     source_branch: Option<String>,
+    #[serde(default)]
+    filter: Option<String>,
     run_as_agent_id: String,
     task: String,
     budget_minor_units: u64,
@@ -464,6 +467,7 @@ fn create_proposal(
         &body.event_type,
         body.subject_type.as_deref(),
         body.source_branch.as_deref(),
+        body.filter.as_deref(),
     )?;
     Ok(NewAgentTriggerBinding {
         binding_id: Uuid::new_v4(),
@@ -500,6 +504,7 @@ fn compile_matcher(
     event_type: &str,
     subject_type: Option<&str>,
     source_branch: Option<&str>,
+    filter: Option<&str>,
 ) -> Result<EventMatcher, EdgeError> {
     if event_type.len() > 255 || myelin_events::validate_event_type(event_type).is_err() {
         return Err(EdgeError::BadRequest(
@@ -507,6 +512,7 @@ fn compile_matcher(
         ));
     }
     let subject_type = resolve_subject_type(event_type, subject_type)?;
+    let mut condition_sources = vec![format!("event.type == {}", quote_query_string(event_type))];
     let mut predicates = vec![Predicate::Cmp {
         op: CmpOp::Eq,
         lhs: Expr::Var("event.type".into()),
@@ -528,14 +534,38 @@ fn compile_matcher(
                 "source_branch is not a canonical branch name".into(),
             ));
         }
+        condition_sources.push(format!(
+            "payload.source_ref == {}",
+            quote_query_string(&source_ref)
+        ));
         predicates.push(Predicate::Cmp {
             op: CmpOp::Eq,
             lhs: Expr::Var("payload.source_ref".into()),
             rhs: Expr::Lit(Literal::Str(source_ref)),
         });
     }
-    EventMatcher::compile(ObjectType(subject_type), Predicate::And(predicates))
-        .map_err(|error| EdgeError::BadRequest(format!("invalid trigger matcher: {error}")))
+    if let Some(filter) = filter {
+        if filter.is_empty() || filter.len() > MAX_TRIGGER_FILTER_BYTES || filter.trim() != filter {
+            return Err(EdgeError::BadRequest(format!(
+                "filter must contain 1..={MAX_TRIGGER_FILTER_BYTES} bytes without surrounding whitespace"
+            )));
+        }
+        predicates.push(myelin_query::parse_predicate(filter).map_err(|error| {
+            EdgeError::BadRequest(format!("filter is not a valid Myelin query: {error}"))
+        })?);
+        condition_sources.push(format!("({filter})"));
+    }
+    let predicate = Predicate::And(predicates);
+    QueryAst::validate(&predicate)
+        .map_err(|error| EdgeError::BadRequest(format!("invalid trigger matcher: {error}")))?;
+    Ok(EventMatcher::new(
+        ObjectType(subject_type),
+        QueryAst::compiled_with_source(predicate, condition_sources.join(" AND ")),
+    ))
+}
+
+fn quote_query_string(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 fn resolve_subject_type(event_type: &str, explicit: Option<&str>) -> Result<String, EdgeError> {
@@ -596,6 +626,11 @@ fn binding_json(tenant: &str, binding: &DurableAgentTriggerBinding) -> Value {
         "run_as_agent_id": binding.run_as_agent_id,
         "event_type": binding.event_type,
         "subject_type": binding.matcher.get("object_type").and_then(Value::as_str),
+        "condition": binding
+            .matcher
+            .pointer("/predicate/raw")
+            .and_then(Value::as_str)
+            .filter(|condition| !condition.is_empty()),
         "matcher": binding.matcher,
         "task": binding.task,
         "delegation_caveats": binding.delegation_caveats,
@@ -698,7 +733,7 @@ mod tests {
 
     #[test]
     fn red_mainline_trigger_is_exactly_red_and_exactly_mainline() {
-        let matcher = compile_matcher("ci.run.failed", None, Some("main")).unwrap();
+        let matcher = compile_matcher("ci.run.failed", None, Some("main"), None).unwrap();
 
         assert_eq!(
             matcher.matches(
@@ -732,28 +767,76 @@ mod tests {
     #[test]
     fn branch_inputs_are_canonicalized_or_refused_before_persistence() {
         assert_eq!(
-            compile_matcher("ci.run.failed", None, Some("main")).unwrap(),
-            compile_matcher("ci.run.failed", None, Some("refs/heads/main")).unwrap(),
+            compile_matcher("ci.run.failed", None, Some("main"), None).unwrap(),
+            compile_matcher("ci.run.failed", None, Some("refs/heads/main"), None).unwrap(),
             "friendly and fully-qualified mainline names compile to one durable intent"
         );
-        assert!(compile_matcher("ci.run.failed", None, Some("refs/tags/release")).is_err());
-        assert!(compile_matcher("ci.run.failed", None, Some("feature/../main")).is_err());
+        assert!(compile_matcher("ci.run.failed", None, Some("refs/tags/release"), None).is_err());
+        assert!(compile_matcher("ci.run.failed", None, Some("feature/../main"), None).is_err());
     }
 
     #[test]
     fn event_names_share_the_platform_taxonomy_instead_of_a_trigger_only_dialect() {
-        assert!(compile_matcher("ci.result", Some("run"), None).is_ok());
-        assert!(compile_matcher("ci.result", None, None).is_err());
-        assert!(compile_matcher("CI.run.failed", None, None).is_err());
-        assert!(compile_matcher("unknown.run.failed", None, None).is_err());
+        assert!(compile_matcher("ci.result", Some("run"), None, None).is_ok());
+        assert!(compile_matcher("ci.result", None, None, None).is_err());
+        assert!(compile_matcher("CI.run.failed", None, None, None).is_err());
+        assert!(compile_matcher("unknown.run.failed", None, None, None).is_err());
     }
 
     #[test]
     fn matcher_subjects_follow_the_event_artifact_instead_of_silently_assuming_ci() {
-        let issue = compile_matcher("issue.issue.updated", None, None).unwrap();
+        let issue = compile_matcher("issue.issue.updated", None, None, None).unwrap();
         assert_eq!(issue.object_type().0, "issue");
-        assert!(compile_matcher("issue.issue.updated", Some("run"), None).is_err());
-        assert!(compile_matcher("ci.deployment.finished", None, None).is_err());
+        assert!(compile_matcher("issue.issue.updated", Some("run"), None, None).is_err());
+        assert!(compile_matcher("ci.deployment.finished", None, None, None).is_err());
+    }
+
+    #[test]
+    fn one_bounded_query_language_filters_every_event_domain() {
+        let matcher = compile_matcher(
+            "issue.issue.updated",
+            None,
+            None,
+            Some("payload.change_kind == 'ownership' AND event.depth <= 2"),
+        )
+        .unwrap();
+        let mut event = ci_event("issue.issue.updated", "refs/heads/main");
+        event.subject = ArtifactRef("myelin://acme/issue/issue/ENG-41".into());
+        event.payload = json!({ "change_kind": "ownership" });
+
+        assert_eq!(
+            matcher.matches(&event, &SetExpr::All, &no_relation),
+            Ok(true),
+            "the shared QueryAst can express useful issue intent without an issue-only DSL"
+        );
+        event.payload = json!({ "change_kind": "title" });
+        assert_eq!(
+            matcher.matches(&event, &SetExpr::All, &no_relation),
+            Ok(false)
+        );
+        assert_eq!(
+            matcher.predicate().source(),
+            concat!(
+                "event.type == 'issue.issue.updated' AND ",
+                "(payload.change_kind == 'ownership' AND event.depth <= 2)"
+            ),
+            "operators can rediscover the complete effective condition"
+        );
+
+        assert!(compile_matcher(
+            "issue.issue.updated",
+            None,
+            None,
+            Some(" payload.change_kind == 'ownership'")
+        )
+        .is_err());
+        assert!(compile_matcher(
+            "issue.issue.updated",
+            None,
+            None,
+            Some("payload.change_kind = 'ownership'")
+        )
+        .is_err());
     }
 
     #[test]

@@ -24,9 +24,23 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
     let used = automation.get("firings_used")?.as_u64()?;
     let maximum = automation.get("max_firings")?.as_u64()?;
     let budget = automation.get("budget_minor_units")?.as_u64()?;
-    Some(format!(
-        "{disposition}: {summary}\n  task: {task}\n  firings: {used}/{maximum}; per-run budget: {budget} minor-units\n  Myelin owns the integration credentials and gives each run only its governed tools.\n"
-    ))
+    let mut output = format!("{disposition}: {summary}\n");
+    if let Some(condition) = automation
+        .get("condition")
+        .and_then(Value::as_str)
+        .filter(|condition| !condition.is_empty())
+    {
+        let _ = writeln!(output, "  when: {}", terminal_safe_single_line(condition));
+    }
+    let _ = writeln!(output, "  task: {task}");
+    let _ = writeln!(
+        output,
+        "  firings: {used}/{maximum}; per-run budget: {budget} minor-units"
+    );
+    output.push_str(
+        "  Myelin owns the integration credentials and gives each run only its governed tools.\n",
+    );
+    Some(output)
 }
 
 fn render_approval(value: &Value) -> Option<String> {
@@ -188,6 +202,7 @@ mod tests {
             "owner_principal_id": "ada",
             "run_as_agent_id": AGENT,
             "event_type": "ci.run.failed",
+            "condition": "event.type == 'ci.run.failed' AND payload.source_ref == 'refs/heads/main'",
             "task": "Triage CI.\nOpen one issue.",
             "budget_minor_units": 250000,
             "max_firings": 10,
@@ -205,6 +220,9 @@ mod tests {
         }))
         .unwrap();
         assert!(output.starts_with("Created automation: ci.run.failed -> agent:"));
+        assert!(output.contains(
+            "when: event.type == 'ci.run.failed' AND payload.source_ref == 'refs/heads/main'"
+        ));
         assert!(output.contains("task: Triage CI.\\nOpen one issue."));
         assert!(output.contains("firings: 1/10; per-run budget: 250000 minor-units"));
         assert!(output.contains("Myelin owns the integration credentials"));

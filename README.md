@@ -102,6 +102,13 @@ myelin automation create --event ci.run.failed --branch main \
   --task "Read the failed run and open one focused issue." \
   --budget-minor-units 250000 --max-firings 10 --require-human-approval \
   --idempotency-key red-mainline-triage
+# Every event domain uses the same bounded query language for finer intent:
+myelin automation create --event issue.issue.updated \
+  --where "payload.change_kind == 'ownership'" \
+  --run-as 33333333-3333-3333-3333-333333333333 \
+  --task "Read the ownership change and suggest the next useful step." \
+  --budget-minor-units 100000 --max-firings 10 \
+  --idempotency-key issue-ownership-review
 myelin automation list
 myelin automation show 44444444-4444-4444-4444-444444444444
 myelin automation history 44444444-4444-4444-4444-444444444444
@@ -175,6 +182,13 @@ two-segment events such as `ci.result` use `--subject-type run`. Myelin currentl
 whose live visibility can be checked end to end: CI runs; Git repositories, pull requests, and
 comments; Issues issues; Knowledge pages and rows; and Chat channels and messages. Other artifact
 types are refused at creation instead of becoming automations that can never fire.
+
+`--where` adds a bounded `myelin-query` predicate to the exact event match. It can compare scalar
+envelope fields such as `event.depth` and scalar payload fields such as `payload.change_kind`,
+using `==`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, and parentheses. A missing or
+wrongly-typed field closes only that rule as a non-match; it cannot prevent another automation
+from seeing the event. `--branch main` remains concise sugar for
+`payload.source_ref == 'refs/heads/main'`.
 
 Issue responses include a canonical `myelin://...` reference that can be passed directly to
 `chat ref`. The conversation keeps a live pointer to the issue rather than copying a stale
