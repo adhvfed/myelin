@@ -398,8 +398,9 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
     let trace = app
         .with_tenant_tx(&tenant.0, move |conn| {
             Box::pin(async move {
-                sqlx::query_as::<_, (String, String, String, i64)>(
-                    "SELECT artifact_ref, requested_by, answer, charged_micro \
+                sqlx::query_as::<_, (String, String, bool, bool, Vec<u8>, i64)>(
+                    "SELECT artifact_ref, requested_by, answer IS NULL, trace_body IS NULL, \
+                            payload_ciphertext, charged_micro \
                        FROM knowledge_agent_trace \
                       WHERE tenant_id = $1 AND run_id = $2",
                 )
@@ -416,11 +417,24 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
         .0
         .starts_with(&format!("myelin://{}/knowledge/doc/blake3:", tenant.0)));
     assert_eq!(trace.1, "founder");
-    assert_eq!(
+    assert!(
         trace.2,
-        "The governed run was explained without an external credential."
+        "the answer does not rest in its plaintext compatibility column"
     );
-    assert!(trace.3 > 0, "the result carries its exact metered cost");
+    assert!(
+        trace.3,
+        "the block-model body does not rest in its plaintext compatibility column"
+    );
+    let answer = b"The governed run was explained without an external credential.";
+    assert!(
+        !trace.4.is_empty(),
+        "the private payload rests as ciphertext"
+    );
+    assert!(
+        !trace.4.windows(answer.len()).any(|window| window == answer),
+        "ciphertext does not contain the final answer in plaintext"
+    );
+    assert!(trace.5 > 0, "the result carries its exact metered cost");
 
     assert_eq!(
         executor

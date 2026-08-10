@@ -45,8 +45,8 @@ use myelin_storage::{
     AgentModelStepStore, AgentTraceWriter, DurableAgentTraceStore, InMemoryAgentTraceStore,
 };
 use myelin_storage::{
-    DurableCellRootBacking, DurableDelegationPolicyBacking, DurableRevocationBacking, SealKey,
-    SubstrateProvider, TenantScope,
+    DurableCellRootBacking, DurableDelegationPolicyBacking, DurableKmsBacking,
+    DurableRevocationBacking, SealKey, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 
@@ -582,6 +582,7 @@ struct HostIdentity {
 pub enum HostIdentityError {
     CellRootUnavailable(String),
     InvalidCellRoot(String),
+    KmsUnavailable(String),
 }
 
 impl core::fmt::Display for HostIdentityError {
@@ -599,6 +600,9 @@ impl core::fmt::Display for HostIdentityError {
                     "hosted-agent Identity cell-authority material is invalid: {e}"
                 )
             }
+            HostIdentityError::KmsUnavailable(e) => {
+                write!(f, "hosted-agent KMS refused to start (fail-closed): {e}")
+            }
         }
     }
 }
@@ -612,8 +616,9 @@ impl AgentHost {
         seal_key: &SealKey,
         rt: tokio::runtime::Handle,
     ) -> Result<AgentHost, HostIdentityError> {
+        let cell_id = cell_id.into();
         let region = Region(provider.config().region.clone());
-        let material = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id)
+        let material = DurableCellRootBacking::new(provider.db_pool().clone(), cell_id.clone())
             .load_or_generate(seal_key)
             .await
             .map_err(|e| HostIdentityError::CellRootUnavailable(e.to_string()))?;
@@ -628,6 +633,12 @@ impl AgentHost {
             IdentityRunTokenMinter::with_signer_and_tuples(revocations.clone(), None, signer);
         let policies =
             DelegationPolicySource::with_pg(DurableDelegationPolicyBacking::new(provider.clone()));
+        let kms = Arc::new(
+            DurableKmsBacking::new(provider.db_pool().clone(), cell_id)
+                .load_or_generate(seal_key)
+                .await
+                .map_err(|error| HostIdentityError::KmsUnavailable(error.to_string()))?,
+        );
         Ok(AgentHost {
             region,
             wallet: AgentWallet::new(provider.clone()),
@@ -635,6 +646,7 @@ impl AgentHost {
             traces: Arc::new(DurableAgentTraceStore::with_runtime(
                 provider.clone(),
                 rt.clone(),
+                kms,
             )),
             identity: HostIdentity {
                 minter,

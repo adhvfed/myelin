@@ -1,7 +1,7 @@
 use myelin_config::MyelinConfig;
 use myelin_storage::{
     all_durable_migrations, AgentTraceError, AgentTraceWrite, AgentTraceWriter,
-    DurableAgentTraceStore, HotTables, SubstrateProvider,
+    DurableAgentTraceStore, DurableKmsBacking, HotTables, SealKey, SubstrateProvider,
 };
 use myelin_tenancy::TenantId;
 
@@ -112,8 +112,16 @@ async fn an_erasure_marker_refuses_to_resurrect_a_trace_on_worker_retry() {
         .await
         .expect("record the durable erasure marker");
 
-    let store =
-        DurableAgentTraceStore::with_runtime(provider.clone(), tokio::runtime::Handle::current());
+    let seal_key = SealKey::from_encoded(&"66".repeat(32)).expect("a 32-byte test seal key");
+    let kms = DurableKmsBacking::new(provider.db_pool().clone(), unique("trace-erasure-cell"))
+        .load_or_generate(&seal_key)
+        .await
+        .expect("the durable test KMS starts");
+    let store = DurableAgentTraceStore::with_runtime(
+        provider.clone(),
+        tokio::runtime::Handle::current(),
+        std::sync::Arc::new(kms),
+    );
     assert_eq!(
         store.write(&tenant, erased_trace).unwrap_err(),
         AgentTraceError::Erased,
