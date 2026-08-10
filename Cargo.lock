@@ -2552,6 +2552,7 @@ name = "myelin-agent-service"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "chrono",
  "hex",
  "myelin-agent",
  "myelin-agent-service",
@@ -2569,6 +2570,7 @@ dependencies = [
  "myelin-identity-service",
  "myelin-issues",
  "myelin-notif",
+ "myelin-query",
  "myelin-refs",
  "myelin-storage",
  "myelin-substrate",

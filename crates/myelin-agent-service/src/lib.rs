@@ -34,15 +34,14 @@ pub mod skeleton;
 pub mod tool_exec;
 pub mod tool_scope;
 pub mod trace_seam;
+pub mod trigger_consumer;
 
 pub use holder::{
     agent_store_classifier, register_agent_holders, AgentHolderRegistration, AgentOltpHolder,
     AgentTraceHolder, AGENT_OLTP_STORE, AGENT_TRACE_STORE,
 };
 
-pub use catalogue::{
-    catalogue_cursor, tool_ref, PlatformToolCatalogue, ToolCatalogueError,
-};
+pub use catalogue::{catalogue_cursor, tool_ref, PlatformToolCatalogue, ToolCatalogueError};
 
 pub use dsr::{
     subject_dek_ref, AgentFabricHolder, AgentFabricStore, FabricEraseReceipt, FabricErasureLedger,
@@ -57,10 +56,9 @@ pub use skeleton::{
 
 pub use metering::{price, ModelRates, PriceError, Priced, LUNA_RATES};
 
-pub use tool_exec::{ToolExecError, ToolExecutor};
 #[cfg(any(test, feature = "test-support"))]
 pub use tool_exec::{MockToolExecutor, MockToolSurface};
-
+pub use tool_exec::{ToolExecError, ToolExecutor};
 
 pub use cost_gate::{runaway_brain, AgentFabricCostSignal, RunawaySelfLimiter, RunawayStep};
 
@@ -195,6 +193,8 @@ pub use tool_scope::{
 };
 
 pub use app::{
-    agent_app_spec, agent_dispatch_consumer_reg, boot_agent, run_agent, SkeletonDispatchConsumer,
-    AGENT_DISPATCH_SUBJECT_PREFIX, SERVICE_NAME,
+    agent_app_spec, agent_app_spec_with_ingestion, agent_dispatch_consumer_reg, boot_agent,
+    governed_trigger_consumer_reg, run_agent, run_agent_ingestion_until_shutdown,
+    trigger_intake_filter, SkeletonDispatchConsumer, AGENT_DISPATCH_SUBJECT_PREFIX,
+    EVENT_DURABLE_CONSUMER, EVENT_STREAM_NAME, EVENT_SUBJECT_ROOT, SERVICE_NAME,
 };

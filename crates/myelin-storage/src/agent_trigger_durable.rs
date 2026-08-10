@@ -144,7 +144,9 @@ impl DurableAgentTriggerBacking {
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
         let event_type = event_type.to_string();
-        let limit = i64::from(limit.clamp(1, 1_000));
+        // Consumers may ask for one row beyond their own fanout bound so they can
+        // distinguish an exact-cap batch from an overflow without unbounded reads.
+        let limit = i64::from(limit.clamp(1, 1_001));
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {

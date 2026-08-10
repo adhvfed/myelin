@@ -7,6 +7,13 @@ use myelin_substrate::{
 pub const SERVICE_NAME: &str = "myelin-agent";
 
 pub const AGENT_DISPATCH_SUBJECT_PREFIX: &str = "agent.dispatch.";
+pub const EVENT_STREAM_NAME: &str = "MYELIN_EVENTS";
+pub const EVENT_SUBJECT_ROOT: &str = "myelin.events";
+pub const EVENT_DURABLE_CONSUMER: &str = "agent-governed-trigger-intake";
+
+pub fn trigger_intake_filter() -> String {
+    format!("{EVENT_SUBJECT_ROOT}.evt.>")
+}
 
 fn agent_service_migrations() -> Migrations {
     use crate::migrations::{
@@ -94,6 +101,67 @@ pub fn agent_dispatch_consumer_reg(
         dedup,
     )?;
     Ok(myelin_substrate::ConsumerReg::new(runtime))
+}
+
+pub fn governed_trigger_consumer_reg(
+    tenant: &myelin_tenancy::TenantId,
+    region: &myelin_tenancy::Region,
+    store: std::sync::Arc<dyn crate::trigger_consumer::TriggerBindingStore>,
+    visibility: std::sync::Arc<dyn crate::trigger_consumer::TriggerOwnerVisibility>,
+    dedup: myelin_events::DedupLedger,
+    dead_letters: std::sync::Arc<dyn myelin_events::DurableDeadLetter>,
+) -> Result<myelin_substrate::ConsumerReg, myelin_events::SubscribeError> {
+    let subject = format!("myelin://{}/", tenant.0);
+    let handler = crate::trigger_consumer::GovernedTriggerConsumer::new(
+        tenant.0.clone(),
+        region.0.clone(),
+        store,
+        visibility,
+    );
+    let subscription = myelin_events::consumer::Subscription::bind(
+        myelin_events::ConsumerName(format!(
+            "{}-{}",
+            crate::trigger_consumer::TRIGGER_CONSUMER_NAME,
+            tenant.0
+        )),
+        &[subject.as_str()],
+        myelin_events::PrefetchBound::DEFAULT,
+    )?;
+    Ok(myelin_substrate::ConsumerReg::new(
+        myelin_events::Consumer::new(handler, subscription, dedup)
+            .with_dead_letter_sink(myelin_events::DeadLetterSink::durable(dead_letters)),
+    ))
+}
+
+pub fn agent_app_spec_with_ingestion(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+    consumers: Vec<myelin_substrate::ConsumerReg>,
+    intake: Box<dyn myelin_events::EventConsumer>,
+    delivery_quarantine: std::sync::Arc<dyn myelin_events::DurableDeliveryQuarantine>,
+) -> AppSpec {
+    let mut spec = agent_app_spec(config, outbox.clone());
+    spec.outbox = OutboxSpec::external_relay_with_consumer(outbox, intake, delivery_quarantine);
+    spec.consumers = consumers;
+    spec
+}
+
+pub async fn run_agent_ingestion_until_shutdown<F>(
+    config: Config,
+    outbox: myelin_events::OutboxStore,
+    consumers: Vec<myelin_substrate::ConsumerReg>,
+    intake: Box<dyn myelin_events::EventConsumer>,
+    delivery_quarantine: std::sync::Arc<dyn myelin_events::DurableDeliveryQuarantine>,
+    shutdown: F,
+) -> Result<(), ServeError>
+where
+    F: std::future::Future<Output = ()>,
+{
+    myelin_substrate::serve_until_shutdown(
+        agent_app_spec_with_ingestion(config, outbox, consumers, intake, delivery_quarantine),
+        shutdown,
+    )
+    .await
 }
 
 pub fn boot_agent(

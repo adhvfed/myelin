@@ -10,15 +10,22 @@ describe("external event-bus routing", () => {
       tenant: "tenant-one",
       aggregate: "signal:dedup-one",
     })).toBe("myelin.events.evt.tenant-one.signal.signal.dedup-one.opened");
+
+    expect(eventBusSubject({
+      event_id: "event-2",
+      type_: "ci.run.failed",
+      tenant: "tenant-one",
+      aggregate: "run:run-one",
+    })).toBe("myelin.events.evt.tenant-one.ci.run.run-one.failed");
   });
 
   test("refuses ambiguous or non-canonical routing components", () => {
     expect(() => eventBusSubject({
       event_id: "event-1",
-      type_: "signal.opened.extra",
+      type_: "opened",
       tenant: "tenant-one",
       aggregate: "signal:dedup-one",
-    })).toThrow("exactly two components");
+    })).toThrow("at least two components");
     expect(() => eventBusSubject({
       event_id: "event-1",
       type_: "signal.opened",

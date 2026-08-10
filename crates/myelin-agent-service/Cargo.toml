@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[[bin]]
+name = "agent-service"
+path = "src/main.rs"
+required-features = ["integration"]
+
 [dependencies]
 myelin-agent = { path = "../myelin-agent" }
 myelin-gdpr = { path = "../myelin-gdpr" }
@@ -15,6 +20,7 @@ myelin-substrate = { path = "../myelin-substrate" }
 
 myelin-flow = { path = "../myelin-flow" }
 myelin-events = { path = "../myelin-events" }
+myelin-query = { path = "../myelin-query" }
 myelin-refs = { path = "../myelin-refs" }
 myelin-notif = { path = "../myelin-notif" }
 myelin-content = { path = "../myelin-content" }
@@ -27,6 +33,7 @@ myelin-identity-service = { path = "../myelin-identity-service" }
 serde_json.workspace = true
 blake3.workspace = true
 hex.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 myelin-config = { path = "../myelin-config", optional = true }
 sqlx = { workspace = true, optional = true }

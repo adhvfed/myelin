@@ -8,7 +8,9 @@ import {
   systemClient,
   uniqueName,
 } from "../src/context.js";
+import { ExternalEventBus, type ExternalEventEnvelope } from "../src/event-bus.js";
 import { eventually } from "../src/eventually.js";
+import { GitProject } from "../src/git-project.js";
 import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 import { systemTestConfig } from "../src/config.js";
 
@@ -107,6 +109,83 @@ describe("collaboration lifecycle", () => {
         expect.objectContaining({ id: triggerId, run_as_agent_id: agentId }),
       ]),
     );
+
+    const slug = uniqueName("triggered-ci");
+    const project = new GitProject(slug, systemClient);
+    const repoRef = `myelin://${systemTestConfig.tenant}/git/repo/${slug}`;
+    await project.create();
+    await project.writeFile("main", "README.md", `# ${slug}\n`);
+    const commitOid = (await project.writeFile("main", ".myelin/ci.toml", `on = "push"
+
+[[jobs]]
+name = "contract"
+image = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000"
+command = ["true"]
+`)).commitOid;
+    const run = await eventually<JsonRecord>(async () => {
+      const response = await systemClient.json("/v1/ci/runs?state=all&limit=100");
+      return array(response.body.items, "visible CI runs")
+        .map((item) => record(item, "visible CI run"))
+        .find((item) => item.repo_ref === repoRef && item.commit_oid === commitOid);
+    }, { description: "the founder's mainline CI run to become visible" });
+    const runId = string(run.run_id, "triggering CI run id");
+    const eventId = `ci-failed-${randomUUID()}`;
+    const now = new Date().toISOString();
+    const failedMainline: ExternalEventEnvelope = {
+      event_id: eventId,
+      type_: "ci.run.failed",
+      schema_ver: 1,
+      tenant: systemTestConfig.tenant,
+      region: systemTestConfig.region,
+      actor: {
+        tenant: systemTestConfig.tenant,
+        region: systemTestConfig.region,
+        principal_id: "ci-controlplane",
+        kind: "Service",
+        data_role: "Controller",
+        status: "Active",
+      },
+      subject: `myelin://${systemTestConfig.tenant}/ci/run/${runId}`,
+      aggregate: `run:${runId}`,
+      causation_id: null,
+      correlation_id: eventId,
+      caused_by: null,
+      depth: 1,
+      contains_personal_data: false,
+      data_role: "Controller",
+      visibility: "Internal",
+      pii_key_ref: null,
+      occurred_at: now,
+      recorded_at: now,
+      payload: {
+        run: `myelin://${systemTestConfig.tenant}/ci/run/${runId}`,
+        commit_oid: commitOid,
+        source_ref: "refs/heads/main",
+        structured_failure: { failed_stage: "contract" },
+      },
+    };
+
+    const bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
+    try {
+      expect((await bus.publish(failedMainline)).duplicate).toBe(false);
+      expect((await bus.publish(failedMainline)).duplicate).toBe(true);
+    } finally {
+      await bus.close();
+    }
+
+    const fired = await eventually<JsonRecord>(async () => {
+      const response = await founder.json("/v1/triggers?limit=100");
+      const binding = array(response.body.items, "founder's agent triggers")
+        .map((item) => record(item, "founder's agent trigger"))
+        .find((item) => item.id === triggerId);
+      return binding?.firings_used === 1 ? binding : undefined;
+    }, { description: "the governed agent binding to reserve the red mainline event exactly once" });
+    expect(fired).toMatchObject({
+      id: triggerId,
+      run_as_agent_id: agentId,
+      firings_used: 1,
+      state: "active",
+    });
   });
 
   test("lets a founder create and rediscover a project without operator-provided IDs", async () => {

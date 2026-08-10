@@ -17,13 +17,15 @@ function token(value: string, field: string): string {
 }
 
 export function eventBusSubject(envelope: ExternalEventEnvelope): string {
-  const [subsystem, eventName, ...extraType] = envelope.type_.split(".");
+  const typeComponents = envelope.type_.split(".");
+  const subsystem = typeComponents.at(0);
+  const eventName = typeComponents.at(-1);
   const [aggregateType, aggregateId, ...extraAggregate] = envelope.aggregate.split(":");
   if (
-    !subsystem || !eventName || extraType.length > 0 ||
+    !subsystem || !eventName || typeComponents.length < 2 ||
     !aggregateType || !aggregateId || extraAggregate.length > 0
   ) {
-    throw new Error("event type and aggregate must each contain exactly two components");
+    throw new Error("event type needs at least two components and aggregate exactly two");
   }
   return [
     "myelin",
