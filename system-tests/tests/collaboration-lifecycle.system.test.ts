@@ -861,7 +861,7 @@ command = ["true"]
     expect(completedFiring).toMatchObject({ outcome: "succeeded" });
   });
 
-  test("lets a founder create and rediscover a project without operator-provided IDs", async () => {
+  test("lets a founder start a project and its first issue without operator-provided IDs", async () => {
     const name = uniqueName("Developer experience");
     const issuePrefix = `P${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`;
     const retryKey = `project-${randomUUID()}`;
@@ -911,6 +911,34 @@ command = ["true"]
     expect(array(listed.body.items, "founder's projects")).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: projectId, ref: projectRef, name })]),
     );
+
+    const firstIssueTitle = uniqueName("Make the first project useful");
+    const firstIssue = await systemClient.json("/v1/issues", {
+      method: "POST",
+      body: { project_id: projectId, title: firstIssueTitle },
+      idempotencyKey: `first-project-issue-${randomUUID()}`,
+      expectedStatus: 202,
+    });
+    const issue = record(firstIssue.body.issue, "first project issue");
+    const issueAuthorization = record(firstIssue.body.authorization, "first project issue authorization");
+    expect(issue).toMatchObject({
+      project_id: projectId,
+      key: expect.stringMatching(new RegExp(`^${issuePrefix}-\\d+$`)),
+    });
+    expect(firstIssue.body).not.toHaveProperty("type_id");
+    const requestEventId = string(issueAuthorization.request_event_id, "first issue authorization id");
+    const activeIssue = await eventually<JsonRecord>(async () => {
+      const response = await systemClient.json(
+        `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,
+        { expectedStatus: [200, 202] },
+      );
+      return response.status === 200 ? record(response.body.issue, "active first project issue") : undefined;
+    }, { description: "the first project issue to become ordinary visible work" });
+    expect(activeIssue).toMatchObject({
+      id: issue.id,
+      project_id: projectId,
+      title: firstIssueTitle,
+    });
 
     const hiddenFromPeer = await reviewerClient.json(`/v1/projects/${projectId}`, {
       expectedStatus: 404,

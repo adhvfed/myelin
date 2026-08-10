@@ -34,7 +34,7 @@ import {
   type IssueListState,
   type IssuesPage,
   type IssueVM,
-} from "~/lib/api";
+} from "~/lib/issue-api";
 import {
   issueErrorKind,
   issueKeyError,

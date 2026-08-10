@@ -13,6 +13,9 @@ async function setEdgeConfig(cfg: {
   issueActivationUnavailable?: boolean;
   issueCreateUnavailable?: boolean;
   issueCloseUnavailable?: boolean;
+  emptyProjects?: boolean;
+  projectsUnavailable?: boolean;
+  projectCreateUnavailable?: boolean;
   issueListFirstPageHolds?: number;
   releaseIssueListFirstPages?: boolean;
   issueListFirstPageDelaysMs?: number[];
@@ -161,6 +164,45 @@ test.describe("issue workflows", () => {
     await page.waitForURL("**/issues?new=1");
     await expect(page.getByRole("dialog", { name: "New issue" })).toBeVisible();
     await expect(page.getByLabel("Title")).toBeFocused();
+  });
+
+  test("a fresh organization creates its first project before capturing its first issue", async ({ page }) => {
+    await setEdgeConfig({ emptyProjects: true, emptyIssues: true });
+    await devLogin(page);
+    await gotoInteractive(page, "/issues");
+    await page.getByRole("button", { name: "New issue" }).click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toHaveAccessibleName("Set up issue tracking");
+    await expect(dialog.getByLabel("Project name")).toBeFocused();
+    await dialog.getByLabel("Project name").fill("Developer experience");
+    await dialog.getByLabel("Issue key").fill("DX");
+    await expect(dialog).toContainText("Issues will look like DX-1");
+    await dialog.getByRole("button", { name: "Create project" }).click();
+
+    await expect(dialog).toHaveAccessibleName("New issue");
+    await expect(dialog.getByLabel("Title")).toBeFocused();
+    await expect(dialog.getByLabel("Project")).toContainText("Developer experience — DX");
+    await dialog.getByLabel("Title").fill("Make onboarding uneventful");
+    await dialog.getByRole("button", { name: "Create issue" }).click();
+
+    await expect(page.getByTestId("pending-issue")).toContainText(/^DX-/);
+    await expect(page.getByText("Make onboarding uneventful")).toBeVisible();
+    await expectNoAxeViolations(page, "first project and issue journey");
+  });
+
+  test("project discovery failure never guesses an issue destination", async ({ page }) => {
+    await setEdgeConfig({ projectsUnavailable: true });
+    await devLogin(page);
+    await gotoInteractive(page, "/issues");
+    await page.getByRole("button", { name: "New issue" }).click();
+
+    const dialog = page.getByRole("dialog", { name: "New issue" });
+    await expect(dialog.getByRole("alert")).toContainText("No issue destination has been guessed");
+    await expect(dialog.getByRole("button", { name: "Create issue" })).toHaveCount(0);
+    await setEdgeConfig({ projectsUnavailable: false });
+    await dialog.getByRole("button", { name: "Try again" }).click();
+    await expect(dialog.getByLabel("Title")).toBeFocused();
   });
 
   test("202 create remains visibly pending until fresh polling observes active", async ({ page }) => {

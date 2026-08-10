@@ -3,16 +3,18 @@
 // state. Extra response fields are deliberately discarded.
 
 import type {
-  IssueAuthorizationStatus,
-  IssueCreateReceipt,
-  IssueVM,
   PrChecksVM,
   PrCommentVM,
   PrReviewVM,
   PrThreadVM,
   PrThreadsVM,
-  IssuesPage,
 } from "./api";
+import type {
+  IssueAuthorizationStatus,
+  IssueCreateReceipt,
+  IssueVM,
+  IssuesPage,
+} from "./issue-api";
 
 type WireRecord = Record<string, unknown>;
 

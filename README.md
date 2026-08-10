@@ -167,6 +167,9 @@ changes the default without copying a token. `context use --project` records a p
 active profile; `--project`, `MYELIN_PROJECT`, and that saved value override one another in that
 order. Creating a project with a saved profile makes it active for that profile; its owned issue
 prefix and default issue type then keep ordinary issue creation free of UUID and prefix ceremony.
+The web Issues workspace discovers the same authorized project catalogue. A new organization can
+create its first project inside the New issue flow; established organizations choose a project by
+name and key. The browser never needs deployment-provided project, type, or prefix identifiers.
 Git helpers are scoped to an exact Edge and profile.
 
 External MCP clients can use `myelin mcp serve --as <agent-id>` as their server command. The CLI

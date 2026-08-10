@@ -2,6 +2,7 @@
 //
 // It implements the SUBSET of the MR-014/015 edge HTTP contract the app shell exercises:
 //   GET/POST /v1/git/repos  → summary catalogue / durable-shape repository creation (Bearer-auth)
+//   GET/POST /v1/projects   → authorized project catalogue / first-project creation
 //   GET  /v1/whoami         → the verified principal + scope (Bearer-auth)
 //   POST /v1/auth/refresh   → the single-refresh round-trip (returns a fresh access token, or 401)
 //   GET  /healthz           → liveness for the Playwright webServer
@@ -96,6 +97,9 @@ const state = {
   issueActivationUnavailable: false,
   issueCreateUnavailable: false,
   issueCloseUnavailable: false,
+  emptyProjects: false,
+  projectsUnavailable: false,
+  projectCreateUnavailable: false,
   issueListFirstPageHolds: 0,
   issueListFirstPageDelaysMs: [],
   issueListCursorDelaysMs: [],
@@ -139,6 +143,24 @@ const heldIssueListResponses = new Set();
 let issueListDelayGeneration = 0;
 let issueSequence = 200;
 const ISSUE_BASE_TIME_FOR_CREATE = Date.parse("2026-07-20T00:00:00.000Z");
+const DEFAULT_PROJECT = {
+  id: DEV_ISSUE_TARGET.project_id,
+  ref: `myelin://acme/identity/project/${DEV_ISSUE_TARGET.project_id}`,
+  name: "Myelin",
+  issue_prefix: DEV_ISSUE_TARGET.prefix,
+  default_issue_type_id: DEV_ISSUE_TARGET.type_id,
+  created_at: "2026-07-01T00:00:00.000Z",
+};
+let projectRows = [{ ...DEFAULT_PROJECT }];
+let projectSequence = 300;
+
+function resetProjects() {
+  projectRows = [{ ...DEFAULT_PROJECT }];
+  projectSequence = 300;
+  state.emptyProjects = false;
+  state.projectsUnavailable = false;
+  state.projectCreateUnavailable = false;
+}
 
 function cancelIssueListDelays() {
   issueListDelayGeneration += 1;
@@ -177,6 +199,7 @@ function resetIssues() {
   state.issueListCursorRequests = 0;
   state.issueListCursorResponses = 0;
   state.issueListCursorRequestsByState = { open: 0, closed: 0, all: 0 };
+  resetProjects();
 }
 
 function resetPrCommitPagination() {
@@ -403,6 +426,12 @@ const server = createServer((req, res) => {
         if (typeof body.issueActivationUnavailable === "boolean") state.issueActivationUnavailable = body.issueActivationUnavailable;
         if (typeof body.issueCreateUnavailable === "boolean") state.issueCreateUnavailable = body.issueCreateUnavailable;
         if (typeof body.issueCloseUnavailable === "boolean") state.issueCloseUnavailable = body.issueCloseUnavailable;
+        if (typeof body.emptyProjects === "boolean") {
+          state.emptyProjects = body.emptyProjects;
+          projectRows = body.emptyProjects ? [] : [{ ...DEFAULT_PROJECT }];
+        }
+        if (typeof body.projectsUnavailable === "boolean") state.projectsUnavailable = body.projectsUnavailable;
+        if (typeof body.projectCreateUnavailable === "boolean") state.projectCreateUnavailable = body.projectCreateUnavailable;
         if (Number.isInteger(body.prCommitContinuationFailures) && body.prCommitContinuationFailures >= 0) {
           state.prCommitContinuationFailures = body.prCommitContinuationFailures;
         }
@@ -722,11 +751,89 @@ const server = createServer((req, res) => {
       : send(res, 404, notFoundEnvelope("CI run"));
   }
 
-  // The create body is checked against the server-injected default project. Browser-selected scope
-  // identifiers are never accepted.
+  if (method === "GET" && path === "/v1/projects") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (state.projectsUnavailable) {
+      return send(res, 503, { error: { message: "projects are temporarily unavailable", code: "unavailable" } });
+    }
+    const names = [...url.searchParams.keys()];
+    if (names.some((name) => name !== "limit" && name !== "cursor") ||
+        url.searchParams.getAll("limit").length > 1 || url.searchParams.getAll("cursor").length > 1) {
+      return send(res, 400, { error: { message: "invalid project list query", code: "bad_request" } });
+    }
+    const limit = Number(url.searchParams.get("limit") ?? 50);
+    const cursor = url.searchParams.get("cursor");
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100 ||
+        (cursor !== null && !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(cursor))) {
+      return send(res, 400, { error: { message: "invalid project list query", code: "bad_request" } });
+    }
+    const sorted = [...projectRows].sort((left, right) => right.id.localeCompare(left.id));
+    const start = cursor === null ? 0 : sorted.findIndex((project) => project.id === cursor) + 1;
+    if (cursor !== null && start === 0) {
+      return send(res, 400, { error: { message: "invalid project cursor", code: "bad_request" } });
+    }
+    const items = sorted.slice(start, start + limit);
+    const nextCursor = start + items.length < sorted.length ? items.at(-1)?.id ?? null : null;
+    return send(res, 200, { items, page: { next_cursor: nextCursor, limit } });
+  }
+
+  if (method === "POST" && path === "/v1/projects") {
+    if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (!validPrOperationId(req.headers["idempotency-key"])) {
+      return send(res, 400, { error: { message: "project creation requires an idempotency key", code: "bad_request" } });
+    }
+    if (state.projectCreateUnavailable) {
+      return send(res, 503, { error: { message: "project creation is temporarily unavailable", code: "unavailable" } });
+    }
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      let body;
+      try {
+        body = JSON.parse(raw);
+      } catch {
+        return send(res, 400, { error: { message: "invalid project create body", code: "bad_request" } });
+      }
+      if (body === null || typeof body !== "object" || Array.isArray(body) ||
+          Object.keys(body).length !== 2 || !Object.hasOwn(body, "name") ||
+          !Object.hasOwn(body, "issue_prefix") || typeof body.name !== "string" ||
+          body.name.trim() !== body.name || body.name.length === 0 ||
+          Buffer.byteLength(body.name) > 100 ||
+          [...body.name].some((character) => {
+            const point = character.codePointAt(0);
+            return point <= 0x1f || point === 0x7f;
+          }) ||
+          typeof body.issue_prefix !== "string" || !/^[A-Z0-9]{2,10}$/.test(body.issue_prefix)) {
+        return send(res, 400, { error: { message: "invalid project create body", code: "bad_request" } });
+      }
+      if (projectRows.some((project) => project.issue_prefix === body.issue_prefix)) {
+        return send(res, 409, { error: { message: "issue prefix already exists", code: "conflict" } });
+      }
+      const sequence = ++projectSequence;
+      const id = `30000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`;
+      const project = {
+        id,
+        ref: `myelin://acme/identity/project/${id}`,
+        name: body.name,
+        issue_prefix: body.issue_prefix,
+        default_issue_type_id: `40000000-0000-4000-8000-${String(sequence).padStart(12, "0")}`,
+        created_at: new Date(ISSUE_BASE_TIME_FOR_CREATE + sequence * 1_000).toISOString(),
+      };
+      projectRows.push(project);
+      state.emptyProjects = false;
+      return send(res, 201, { project, created: true, durable: true });
+    });
+    return;
+  }
+
+  // Issue creation accepts one visible project. Production Edge resolves its durable prefix and
+  // default type after authorization; this double mirrors that boundary.
   let im;
   if (method === "POST" && path === "/v1/issues") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
+    if (!validPrOperationId(req.headers["idempotency-key"])) {
+      return send(res, 400, { error: { message: "issue creation requires an idempotency key", code: "bad_request" } });
+    }
     if (state.issueCreateUnavailable) {
       return send(res, 503, { error: { message: "issue creation is temporarily unavailable", code: "unavailable" } });
     }
@@ -739,10 +846,10 @@ const server = createServer((req, res) => {
       } catch {
         return send(res, 400, { error: { message: "invalid issue create body", code: "bad_request" } });
       }
+      const project = projectRows.find((row) => row.id === body.project_id);
       if (
-        body.project_id !== DEV_ISSUE_TARGET.project_id ||
-        body.type_id !== DEV_ISSUE_TARGET.type_id ||
-        body.prefix !== DEV_ISSUE_TARGET.prefix ||
+        Object.keys(body).length !== 2 ||
+        !project ||
         typeof body.title !== "string" ||
         !body.title.trim()
       ) {
@@ -750,12 +857,12 @@ const server = createServer((req, res) => {
       }
       const number = ++issueSequence;
       const id = `10000000-0000-4000-8000-${String(number).padStart(12, "0")}`;
-      const key = `${DEV_ISSUE_TARGET.prefix}-${number}`;
+      const key = `${project.issue_prefix}-${number}`;
       const now = new Date(ISSUE_BASE_TIME_FOR_CREATE + number * 1_000).toISOString();
       const row = {
         id,
         key,
-        project_id: DEV_ISSUE_TARGET.project_id,
+        project_id: project.id,
         state: "Todo",
         state_category: "unstarted",
         title: body.title.trim(),
@@ -972,6 +1079,7 @@ const server = createServer((req, res) => {
     ) {
       receipt.active = true;
       if (!issueJson(issueRows, receipt.row.id)) issueRows.push(receipt.row);
+      state.emptyIssues = false;
     }
     return receipt.active
       ? send(res, 200, { status: "active", issue: receipt.row })

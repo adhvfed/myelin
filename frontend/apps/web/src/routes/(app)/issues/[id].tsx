@@ -9,7 +9,7 @@ import {
   useToast,
 } from "@myelin/design-system";
 import { ErrorBoundary, Show, Suspense, createMemo, createSignal, onMount } from "solid-js";
-import { getIssue, issuesMutate, type IssueErrorKind, type IssueVM } from "~/lib/api";
+import { getIssue, issuesMutate, type IssueErrorKind, type IssueVM } from "~/lib/issue-api";
 import { isClosedCategory, issueErrorKind, issueTimestamp } from "~/lib/issue-view";
 
 export default function IssueDetail() {

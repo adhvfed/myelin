@@ -5,7 +5,7 @@ import type {
   IssueStateCategory,
   IssueVM,
   IssuesPage,
-} from "./api";
+} from "./issue-api";
 
 const ISSUE_ERR_PREFIX = "ISSUE_ERR:";
 
@@ -227,8 +227,7 @@ export function issueErrorKind(error: unknown): IssueErrorKind {
     : "";
   return encoded === "bad-input" ||
     encoded === "not-found" ||
-    encoded === "unavailable" ||
-    encoded === "configuration"
+    encoded === "unavailable"
     ? encoded
     : "error";
 }

@@ -1,6 +1,6 @@
-import type { IssueListState } from "./api";
-
 type WireRecord = Record<string, unknown>;
+
+export type IssueListState = "open" | "closed" | "all";
 
 export interface IssueListInput {
   state: IssueListState;

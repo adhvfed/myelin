@@ -187,16 +187,25 @@ command = ["true"]
   await expect(page.getByTestId("ci-jobs-empty")).toBeVisible();
 
   await navigateToApp(page, "/issues");
+  const issuePrefix = `B${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`;
   const issueTitle = `Track ${slug}`;
   await page.getByRole("button", { name: "New issue" }).click();
-  const issueDialog = page.getByRole("dialog", { name: "New issue" });
+  const issueDialog = page.getByRole("dialog");
+  const firstProjectSetup = issueDialog.getByText("Issues live in projects");
+  if (!await firstProjectSetup.isVisible().catch(() => false)) {
+    await issueDialog.getByRole("button", { name: "New project" }).click();
+  }
+  await issueDialog.getByLabel("Project name").fill(`Browser ${slug}`);
+  await issueDialog.getByLabel("Issue key").fill(issuePrefix);
+  await issueDialog.getByRole("button", { name: "Create project" }).click();
+  await expect(issueDialog.getByLabel("Project")).toHaveValue(/^[0-9a-f-]{36}$/);
   await issueDialog.getByLabel("Title").fill(issueTitle);
   await issueDialog.getByRole("button", { name: "Create issue" }).click();
 
   const issueRow = page.getByTestId("issue-row").filter({ hasText: issueTitle });
   await expect(issueRow).toBeVisible({ timeout: 20_000 });
   const issueKey = (await issueRow.locator("code").textContent())?.trim();
-  expect(issueKey).toMatch(/^MYL-\d+$/);
+  expect(issueKey).toMatch(new RegExp(`^${issuePrefix}-\\d+$`));
   await issueRow.click();
   await expect(page.getByRole("heading", { name: issueTitle })).toBeVisible();
   const issueId = decodeURIComponent(new URL(page.url()).pathname.split("/").at(-1) ?? "");

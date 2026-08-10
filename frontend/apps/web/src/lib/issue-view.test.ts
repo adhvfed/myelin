@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { IssueAuthorizationStatus, IssueVM, IssuesPage } from "./api";
+import type { IssueAuthorizationStatus, IssueVM, IssuesPage } from "./issue-api";
 import {
   awaitWithAbort,
   isClosedCategory,

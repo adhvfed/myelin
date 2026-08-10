@@ -5,8 +5,12 @@ import {
   issuesMutate,
   type IssueCreateReceipt,
   type IssueErrorKind,
-} from "~/lib/api";
+} from "~/lib/issue-api";
 import { issueTitleError } from "~/lib/issue-view";
+import { createProject, type ProjectErrorKind } from "~/lib/project-api";
+import { projectNameError, projectPrefixError } from "~/lib/project-contract";
+import { IssueDraftFields, ProjectSetupFields } from "./IssueCreateFields";
+import { createProjectCatalogue } from "./project-catalogue";
 
 export interface IssueCreateDialogProps {
   open: boolean;
@@ -14,51 +18,105 @@ export interface IssueCreateDialogProps {
   onAccepted: (receipt: IssueCreateReceipt) => void;
 }
 
-function actionError(kind: IssueErrorKind): string {
+function issueActionError(kind: IssueErrorKind): string {
   switch (kind) {
     case "bad-input":
-      return "Check the title and try again.";
+      return "Check the title and project, then try again.";
     case "not-found":
-      return "Issue creation isn't available to you.";
-    case "configuration":
-      return "Issue creation isn't configured on this deployment.";
+      return "That project is no longer available to you.";
     default:
       return "We couldn't confirm whether the issue was created. Check the list before retrying.";
   }
 }
 
+function projectActionError(kind: ProjectErrorKind): string {
+  switch (kind) {
+    case "bad-input":
+      return "Check the project name and issue key, then try again.";
+    case "conflict":
+      return "That issue key is already used by another project.";
+    case "not-found":
+      return "Project creation isn't available to you.";
+    default:
+      return "We couldn't confirm whether the project was created. Reload and check your projects before retrying.";
+  }
+}
+
 export function IssueCreateDialog(props: IssueCreateDialogProps) {
-  const mutate = useAction(issuesMutate);
+  const mutateIssue = useAction(issuesMutate);
+  const mutateProject = useAction(createProject);
+  const catalogue = createProjectCatalogue();
   const [title, setTitle] = createSignal("");
+  const [projectName, setProjectName] = createSignal("");
+  const [projectPrefix, setProjectPrefix] = createSignal("");
   const [error, setError] = createSignal<string | null>(null);
-  const [submitting, setSubmitting] = createSignal(false);
+  const [submitting, setSubmitting] = createSignal<"project" | "issue" | null>(null);
+  const [creatingProject, setCreatingProject] = createSignal(false);
   let titleInput: HTMLInputElement | undefined;
+  let projectNameInput: HTMLInputElement | undefined;
+  let projectPrefixInput: HTMLInputElement | undefined;
+  let focusStep = "";
 
   createEffect(() => {
     if (!props.open) return;
     setTitle("");
+    setProjectName("");
+    setProjectPrefix("");
     setError(null);
-    setSubmitting(false);
+    setSubmitting(null);
+    setCreatingProject(false);
   });
 
-  const close = () => {
-    if (!submitting()) props.onClose();
-  };
+  const showProjectSetup = () => catalogue.empty() || creatingProject();
 
-  const submit = async (event: SubmitEvent) => {
-    event.preventDefault();
-    const validation = issueTitleError(title());
-    if (validation) {
-      setError(validation);
-      titleInput?.focus();
+  createEffect(() => {
+    if (!props.open) {
+      focusStep = "";
       return;
     }
-    setSubmitting(true);
+    const step = catalogue.loading() || catalogue.unavailable()
+      ? "waiting"
+      : showProjectSetup() ? "project" : "issue";
+    if (step === focusStep) return;
+    focusStep = step;
+    queueMicrotask(() => {
+      if (step === "project") projectNameInput?.focus();
+      if (step === "issue") titleInput?.focus();
+    });
+  });
+
+  const busy = () => submitting() !== null;
+  const close = () => {
+    if (!busy()) props.onClose();
+  };
+  const backOrClose = () => {
+    if (busy()) return;
+    if (creatingProject() && !catalogue.empty()) {
+      setCreatingProject(false);
+      setError(null);
+    } else {
+      props.onClose();
+    }
+  };
+  const clearError = () => {
+    if (error()) setError(null);
+  };
+
+  const submitIssue = async (event: SubmitEvent) => {
+    event.preventDefault();
+    const project = catalogue.selected();
+    const validation = issueTitleError(title());
+    if (validation || !project) {
+      setError(validation ?? "Choose a project for this issue.");
+      (validation ? titleInput : undefined)?.focus();
+      return;
+    }
+    setSubmitting("issue");
     setError(null);
     try {
-      const result = await mutate({ op: "create", title: title() });
+      const result = await mutateIssue({ op: "create", projectId: project.id, title: title() });
       if (!result.ok) {
-        setError(actionError(result.error));
+        setError(issueActionError(result.error));
         titleInput?.focus();
         return;
       }
@@ -73,70 +131,133 @@ export function IssueCreateDialog(props: IssueCreateDialogProps) {
       setError("We couldn't confirm whether the issue was created. Check the list before retrying.");
       titleInput?.focus();
     } finally {
-      setSubmitting(false);
+      setSubmitting(null);
     }
   };
+
+  const submitProject = async (event: SubmitEvent) => {
+    event.preventDefault();
+    const nameError = projectNameError(projectName());
+    const prefixError = projectPrefixError(projectPrefix());
+    if (nameError || prefixError) {
+      setError(nameError ?? prefixError);
+      (nameError ? projectNameInput : projectPrefixInput)?.focus();
+      return;
+    }
+    setSubmitting("project");
+    setError(null);
+    try {
+      const result = await mutateProject({ name: projectName(), issuePrefix: projectPrefix() });
+      if (!result.ok) {
+        setError(projectActionError(result.error));
+        (result.error === "conflict" ? projectPrefixInput : projectNameInput)?.focus();
+        return;
+      }
+      catalogue.add(result.receipt.project);
+      setCreatingProject(false);
+      setError(null);
+    } catch {
+      setError("We couldn't confirm whether the project was created. Reload and check your projects before retrying.");
+      projectNameInput?.focus();
+    } finally {
+      setSubmitting(null);
+    }
+  };
+
+  const formId = () => showProjectSetup() ? "project-create-form" : "issue-create-form";
 
   return (
     <Dialog
       open={props.open}
       onClose={close}
-      title="New issue"
-      description="Capture work in this deployment's default project. Access activates safely after acceptance."
+      title={catalogue.empty() ? "Set up issue tracking" : creatingProject() ? "New project" : "New issue"}
+      description={showProjectSetup()
+        ? catalogue.empty()
+          ? "Issues live in projects. Create your first one, then capture its first piece of work."
+          : "Create another project, then capture work in it."
+        : "Capture work in a project you can access. Access activates safely after acceptance."}
       size="md"
-      dismissable={!submitting()}
-      initialFocus={() => titleInput}
+      dismissable={!busy()}
+      initialFocus={() => showProjectSetup() ? projectNameInput : titleInput}
       footer={
         <>
-          <button
-            type="button"
-            onClick={close}
-            disabled={submitting()}
-            class="issues-button issues-button-secondary"
-          >
-            Cancel
+          <button type="button" onClick={backOrClose} disabled={busy()} class="issues-button issues-button-secondary">
+            {creatingProject() && !catalogue.empty() ? "Back" : "Cancel"}
           </button>
-          <button
-            type="submit"
-            form="issue-create-form"
-            disabled={submitting()}
-            class="issues-button issues-button-primary"
-          >
-            <Show when={submitting()} fallback={<Icon name="issue" />}>
-              <Icon name="cycle" />
-            </Show>
-            {submitting() ? "Creating…" : "Create issue"}
-          </button>
+          <Show when={catalogue.unavailable()}>
+            <button
+              type="button"
+              onClick={() => void catalogue.retry()}
+              class="issues-button issues-button-primary"
+            >
+              Try again
+            </button>
+          </Show>
+          <Show when={!catalogue.loading() && !catalogue.unavailable()}>
+            <button
+              type="submit"
+              form={formId()}
+              disabled={busy()}
+              class="issues-button issues-button-primary"
+            >
+              <Show when={busy()} fallback={<Icon name="issue" />}><Icon name="cycle" /></Show>
+              {submitting() === "project"
+                ? "Creating project…"
+                : submitting() === "issue"
+                  ? "Creating issue…"
+                  : showProjectSetup() ? "Create project" : "Create issue"}
+            </button>
+          </Show>
         </>
       }
     >
-      <form id="issue-create-form" onSubmit={submit}>
-        <label class="issues-field-label">
-          Title
-          <input
-            ref={titleInput}
-            id="issue-title"
-            name="title"
-            type="text"
-            value={title()}
-            onInput={(event) => {
-              setTitle(event.currentTarget.value);
-              if (error()) setError(null);
-            }}
-            aria-invalid={Boolean(error())}
-            aria-describedby={error() ? "issue-title-error" : "issue-title-hint"}
-            disabled={submitting()}
-            autocomplete="off"
-            class="issues-text-input"
-          />
-        </label>
-        <p id="issue-title-hint" class="issues-field-hint">
-          Up to 512 UTF-8 bytes. Project, type, and key prefix are set by this deployment.
+      <Show when={catalogue.loading()}>
+        <p role="status" class="issues-dialog-status"><Icon name="cycle" /> Loading projects…</p>
+      </Show>
+      <Show when={catalogue.unavailable()}>
+        <p role="alert" class="issues-field-error">
+          We couldn't load your projects. No issue destination has been guessed.
         </p>
-        <Show when={error()}>
-          {(message) => <p id="issue-title-error" role="alert" class="issues-field-error">{message()}</p>}
-        </Show>
-      </form>
+      </Show>
+      <Show when={!catalogue.loading() && !catalogue.unavailable() && showProjectSetup()}>
+        <form id="project-create-form" onSubmit={submitProject} class="issues-project-setup">
+          <ProjectSetupFields
+            name={projectName()}
+            prefix={projectPrefix()}
+            error={error()}
+            disabled={busy()}
+            nameRef={(element) => { projectNameInput = element; }}
+            prefixRef={(element) => { projectPrefixInput = element; }}
+            onName={(value) => { setProjectName(value); clearError(); }}
+            onPrefix={(value) => { setProjectPrefix(value); clearError(); }}
+          />
+        </form>
+      </Show>
+      <Show when={!catalogue.loading() && !catalogue.unavailable() && !showProjectSetup()}>
+        <form id="issue-create-form" onSubmit={submitIssue} class="issues-project-setup">
+          <IssueDraftFields
+            projects={catalogue.projects()}
+            selectedId={catalogue.selectedId()}
+            selectedPrefix={catalogue.selected()?.issue_prefix}
+            title={title()}
+            error={error()}
+            disabled={busy()}
+            hasMore={catalogue.nextCursor() !== null}
+            loadingMore={catalogue.loadingMore()}
+            loadMoreError={catalogue.loadMoreError()}
+            titleRef={(element) => { titleInput = element; }}
+            onProject={(value) => { catalogue.select(value); clearError(); }}
+            onTitle={(value) => { setTitle(value); clearError(); }}
+            onLoadMore={() => void catalogue.loadMore()}
+            onCreateProject={() => {
+              setProjectName("");
+              setProjectPrefix("");
+              setError(null);
+              setCreatingProject(true);
+            }}
+          />
+        </form>
+      </Show>
     </Dialog>
   );
 }

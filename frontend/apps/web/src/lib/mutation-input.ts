@@ -8,7 +8,7 @@ export const MAX_REPO_SLUG_BYTES = 255;
 export const MAX_GIT_PATH_BYTES = 4 * 1024;
 
 export type IssueMutation =
-  | { op: "create"; title: string }
+  | { op: "create"; projectId: string; title: string }
   | { op: "close"; issueId: string }
   | { op: "activation"; requestEventId: string };
 
@@ -112,11 +112,14 @@ export function parseIssueMutation(value: unknown): IssueMutation | null {
   if (!input || typeof input.op !== "string") return null;
   switch (input.op) {
     case "create": {
-      if (!exactKeys(input, ["op", "title"]) || !bounded(input.title, MAX_ISSUE_TITLE_BYTES)) {
+      if (!exactKeys(input, ["op", "projectId", "title"]) ||
+          !canonicalUuid(input.projectId) || !bounded(input.title, MAX_ISSUE_TITLE_BYTES)) {
         return null;
       }
       const title = input.title.trim();
-      return !title || hasControl(title) ? null : { op: "create", title };
+      return !title || hasControl(title)
+        ? null
+        : { op: "create", projectId: input.projectId, title };
     }
     case "close":
       return exactKeys(input, ["op", "issueId"]) && canonicalUuid(input.issueId)
