@@ -5,6 +5,7 @@ use myelin_storage::kms_durable::{kms_durable_migrations, DurableKmsBacking, Kms
 use myelin_storage::migration::HotTables;
 use myelin_storage::{KekId, KeyClass, SealKey, SubstrateProvider};
 use myelin_tenancy::{Region, TenantId};
+use std::sync::Arc;
 
 const SEAL_K_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
 const SEAL_WRONG_HEX: &str = "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100";
@@ -376,6 +377,73 @@ async fn running_processes_observe_key_creation_and_crypto_shred_without_restart
         "OK [6]: live processes discover durable key creation and immediately stop resolving a \
          crypto-shredded subject key."
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_processes_converge_on_one_new_subject_key() {
+    let Some(provider) = admin_provider().await else {
+        return;
+    };
+    let suffix = uniq();
+    let cell = format!("cell-{suffix}");
+    let tenant = TenantId(format!("01J0RACE{suffix}"));
+    let region = Region("eu-west".into());
+    let seal = seal_k();
+    let first = Arc::new(
+        DurableKmsBacking::new(provider.db_pool().clone(), &cell)
+            .load_or_generate(&seal)
+            .await
+            .expect("the first process boots before the key exists"),
+    );
+    let second = Arc::new(
+        DurableKmsBacking::new(fresh_pool().await, &cell)
+            .load_or_generate(&seal)
+            .await
+            .expect("the second process boots before the key exists"),
+    );
+
+    let provision = |engine: Arc<myelin_storage::KmsEngine>| {
+        let tenant = tenant.clone();
+        let region = region.clone();
+        tokio::task::spawn_blocking(move || {
+            engine
+                .ensure_dek(&tenant, &region, KeyClass::Subject("u-race".into()))
+                .expect("concurrent provisioning converges")
+        })
+    };
+    let (first_ref, second_ref) = tokio::join!(provision(first.clone()), provision(second.clone()));
+    let first_ref = first_ref.expect("first provisioning task joins");
+    let second_ref = second_ref.expect("second provisioning task joins");
+    assert_eq!(
+        first_ref, second_ref,
+        "both processes publish the same key ref"
+    );
+
+    let (nonce, ciphertext) = first
+        .resolve_dek(&first_ref, &region)
+        .expect("the first process resolves the winning key")
+        .seal(b"one winner, no split-brain ciphertext");
+    assert_eq!(
+        second
+            .resolve_dek(&second_ref, &region)
+            .expect("the second process resolves the same winning key")
+            .open(&nonce, &ciphertext)
+            .expect("ciphertext crosses the process boundary"),
+        b"one winner, no split-brain ciphertext"
+    );
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kms_wrapped_dek \
+          WHERE cell_id = $1 AND tenant_id = $2 AND class = 'subject:u-race'",
+    )
+    .bind(&cell)
+    .bind(tenant.as_str())
+    .fetch_one(provider.db_pool())
+    .await
+    .expect("count the canonical subject key");
+    assert_eq!(rows, 1, "one durable key wins concurrent provisioning");
+
+    cleanup(provider.db_pool(), &cell).await;
+    println!("OK [7]: concurrent processes converge on one durable subject key.");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

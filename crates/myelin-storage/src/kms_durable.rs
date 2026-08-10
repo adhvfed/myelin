@@ -218,6 +218,51 @@ impl DurableKmsBacking {
         self.upsert_kek_row_on(&self.pool, id, k).await
     }
 
+    async fn insert_kek_if_absent(&self, id: &KekId, k: &ExportedKek) -> Result<(), PgError> {
+        sqlx::query(
+            "INSERT INTO kms_wrapped_kek (cell_id, tenant_id, region, nonce, wrapped, epoch) \
+             VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .bind(id.region.as_str())
+        .bind(k.nonce.as_slice())
+        .bind(&k.wrapped)
+        .bind(k.epoch as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn read_kek(&self, id: &KekId) -> Result<Option<ExportedKek>, PgError> {
+        let row = sqlx::query(
+            "SELECT nonce, wrapped, epoch FROM kms_wrapped_kek \
+              WHERE cell_id = $1 AND tenant_id = $2 AND region = $3",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .bind(id.region.as_str())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        row.map(|row| {
+            let nonce = row.try_get::<Vec<u8>, _>("nonce").map_err(kms_row_decode)?;
+            let epoch = row.try_get::<i64, _>("epoch").map_err(kms_row_decode)?;
+            if epoch < 0 {
+                return Err(PgError::Query(
+                    "durable KMS row has a negative key epoch".into(),
+                ));
+            }
+            Ok(ExportedKek {
+                nonce: nonce_from(&nonce)?,
+                wrapped: row.try_get("wrapped").map_err(kms_row_decode)?,
+                epoch: epoch as u64,
+            })
+        })
+        .transpose()
+    }
+
     async fn upsert_kek_row_on<'e, E: sqlx::PgExecutor<'e>>(
         &self,
         ex: E,
@@ -369,6 +414,30 @@ impl DurableKmsBacking {
         dek_epoch: u64,
     ) -> Result<(), PgError> {
         self.upsert_dek_row_on(&self.pool, id, w, dek_epoch).await
+    }
+
+    async fn insert_dek_if_absent(
+        &self,
+        id: &DekId,
+        wrapped: &WrappedDek,
+        dek_epoch: u64,
+    ) -> Result<(), PgError> {
+        sqlx::query(
+            "INSERT INTO kms_wrapped_dek \
+               (cell_id, tenant_id, class, nonce, wrapped, kek_epoch, dek_epoch) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .bind(id.class.as_token())
+        .bind(wrapped.nonce.as_slice())
+        .bind(&wrapped.wrapped)
+        .bind(wrapped.kek_epoch as i64)
+        .bind(dek_epoch as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        Ok(())
     }
 
     async fn upsert_dek_row_on<'e, E: sqlx::PgExecutor<'e>>(
@@ -544,46 +613,37 @@ impl DurableKms {
         }
     }
 
-    async fn persist_kek_row(&self, id: &KekId) -> Result<(), KmsDurableError> {
-        let k = self.core.export_kek(id).ok_or_else(|| {
-            KmsDurableError::Db(PgError::Query(format!(
-                "no KEK to persist for tenant={} region={}",
+    pub(crate) fn ensure_kek(&self, id: &KekId) -> u64 {
+        if let Some(stored) = self
+            .block(self.backing.read_kek(id))
+            .unwrap_or_else(|error| panic!("KMS DURABILITY FAILURE: cannot read KEK: {error}"))
+        {
+            self.core
+                .install_wrapped_kek(id.clone(), stored.nonce, stored.wrapped, stored.epoch);
+            return stored.epoch;
+        }
+        self.core.destroy_kek(id);
+        let (epoch, _) = self.core.ensure_kek_tracked(id);
+        let candidate = self.core.export_kek(id).expect("fresh KEK is exportable");
+        if let Err(error) = self.block(self.backing.insert_kek_if_absent(id, &candidate)) {
+            self.core.destroy_kek(id);
+            panic!(
+                "KMS DURABILITY FAILURE (fail-static hard-down): freshly minted KEK for \
+                 tenant={} region={} could not be persisted to the durable store - the \
+                 in-memory mint was rolled back and the operation REFUSED (a KEK that does not \
+                 survive a restart is silent key loss, SI-006): {error}",
                 id.tenant.as_str(),
                 id.region.as_str()
-            )))
-        })?;
-        self.backing.upsert_kek_row(id, &k).await?;
-        Ok(())
-    }
-
-    async fn persist_dek_row(&self, id: &DekId) -> Result<(), KmsDurableError> {
-        let (w, dek_epoch) = self.core.export_dek(id).ok_or_else(|| {
-            KmsDurableError::Db(PgError::Query(format!(
-                "no DEK to persist for tenant={} class={}",
-                id.tenant.as_str(),
-                id.class.as_token()
-            )))
-        })?;
-        self.backing.upsert_dek_row(id, &w, dek_epoch).await?;
-        Ok(())
-    }
-
-    pub(crate) fn ensure_kek(&self, id: &KekId) -> u64 {
-        let (epoch, fresh) = self.core.ensure_kek_tracked(id);
-        if fresh {
-            if let Err(e) = self.block(self.persist_kek_row(id)) {
-                self.core.destroy_kek(id);
-                panic!(
-                    "KMS DURABILITY FAILURE (fail-static hard-down): freshly minted KEK for \
-                     tenant={} region={} could not be persisted to the durable store - the \
-                     in-memory mint was rolled back and the operation REFUSED (a KEK that does not \
-                     survive a restart is silent key loss, SI-006): {e}",
-                    id.tenant.as_str(),
-                    id.region.as_str()
-                );
-            }
+            );
         }
-        epoch
+        let winner = self
+            .block(self.backing.read_kek(id))
+            .unwrap_or_else(|error| panic!("KMS DURABILITY FAILURE: cannot reread KEK: {error}"))
+            .expect("inserted or concurrently won KEK must exist");
+        self.core
+            .install_wrapped_kek(id.clone(), winner.nonce, winner.wrapped, winner.epoch);
+        debug_assert_eq!(epoch, winner.epoch);
+        winner.epoch
     }
 
     pub(crate) fn ensure_dek(
@@ -592,20 +652,45 @@ impl DurableKms {
         region: &Region,
         class: KeyClass,
     ) -> Result<PiiKeyRef, KmsError> {
-        let (key_ref, fresh) = self.core.ensure_dek_tracked(tenant, region, class)?;
-        if fresh {
-            let kek_id = KekId::new(tenant.clone(), region.clone());
-            let dek_id = DekId::new(tenant.clone(), key_ref.class.clone());
-            let res = self.block(async {
-                self.persist_kek_row(&kek_id).await?;
-                self.persist_dek_row(&dek_id).await
-            });
-            if let Err(e) = res {
-                self.core.destroy_dek(&dek_id);
-                return Err(KmsError::Durability(e.to_string()));
-            }
+        let kek_id = KekId::new(tenant.clone(), region.clone());
+        self.ensure_kek(&kek_id);
+        let dek_id = DekId::new(tenant.clone(), class.clone());
+        if let Some((kek, dek, dek_epoch)) = self
+            .block(self.backing.read_dek_material(&dek_id, region))
+            .map_err(|error| KmsError::Durability(error.to_string()))?
+        {
+            self.core
+                .install_wrapped_kek(kek_id, kek.nonce, kek.wrapped, kek.epoch);
+            self.core.install_wrapped_dek(dek_id, dek, dek_epoch);
+            return Ok(PiiKeyRef::new(tenant.clone(), dek_epoch, class));
         }
-        Ok(key_ref)
+        self.core.destroy_dek(&dek_id);
+        let (candidate_ref, _) = self
+            .core
+            .ensure_dek_tracked(tenant, region, class.clone())?;
+        let (candidate, candidate_epoch) = self
+            .core
+            .export_dek(&dek_id)
+            .expect("fresh DEK is exportable");
+        if let Err(error) = self.block(self.backing.insert_dek_if_absent(
+            &dek_id,
+            &candidate,
+            candidate_epoch,
+        )) {
+            self.core.destroy_dek(&dek_id);
+            return Err(KmsError::Durability(error.to_string()));
+        }
+        let (kek, winner, winner_epoch) = self
+            .block(self.backing.read_dek_material(&dek_id, region))
+            .map_err(|error| KmsError::Durability(error.to_string()))?
+            .ok_or_else(|| {
+                KmsError::Durability("inserted or concurrently won DEK vanished".into())
+            })?;
+        self.core
+            .install_wrapped_kek(kek_id, kek.nonce, kek.wrapped, kek.epoch);
+        self.core.install_wrapped_dek(dek_id, winner, winner_epoch);
+        debug_assert_eq!(candidate_ref.dek_epoch, candidate_epoch);
+        Ok(PiiKeyRef::new(tenant.clone(), winner_epoch, class))
     }
 
     pub(crate) fn resolve_dek(
