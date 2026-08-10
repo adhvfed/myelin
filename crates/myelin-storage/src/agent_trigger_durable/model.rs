@@ -120,8 +120,44 @@ pub struct ClaimedAgentTriggerFiring {
 pub struct AgentTriggerClaimRequest {
     pub runtime_ref: String,
     pub worker_id: String,
-    pub now: DateTime<Utc>,
-    pub claim_until: DateTime<Utc>,
+    pub lease_seconds: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTriggerStartRequest {
+    pub binding_id: Uuid,
+    pub event_id: String,
+    pub claim_owner: String,
+    pub run_id: Uuid,
+}
+
+impl AgentTriggerStartRequest {
+    pub fn from_claim(
+        claim: &ClaimedAgentTriggerFiring,
+        run_id: Uuid,
+    ) -> Result<Self, &'static str> {
+        let binding_id = Uuid::parse_str(&claim.binding_id)
+            .map_err(|_| "claimed trigger binding_id is not a UUID")?;
+        if claim.event_id.is_empty() || claim.event_id.len() > 255 {
+            return Err("claimed trigger event_id is outside its durable bound");
+        }
+        if claim.claim_owner.is_empty() || claim.claim_owner.len() > 128 {
+            return Err("claimed trigger owner is outside its durable bound");
+        }
+        Ok(Self {
+            binding_id,
+            event_id: claim.event_id.clone(),
+            claim_owner: claim.claim_owner.clone(),
+            run_id,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartAgentTriggerFiringOutcome {
+    Started,
+    AlreadyStarted,
+    ClaimUnavailable,
 }
 
 impl AgentTriggerClaimRequest {
@@ -130,7 +166,6 @@ impl AgentTriggerClaimRequest {
     pub fn new(
         runtime_ref: impl Into<String>,
         worker_id: impl Into<String>,
-        now: DateTime<Utc>,
         lease_seconds: u64,
     ) -> Result<Self, &'static str> {
         let runtime_ref = runtime_ref.into();
@@ -144,20 +179,12 @@ impl AgentTriggerClaimRequest {
         if !(1..=Self::MAX_LEASE_SECONDS).contains(&lease_seconds) {
             return Err("trigger claim lease is outside its bounded lifetime");
         }
-        let seconds = i64::try_from(lease_seconds)
+        let lease_seconds = u32::try_from(lease_seconds)
             .map_err(|_| "trigger claim lease is outside its bounded lifetime")?;
-        let claim_until = now
-            .timestamp()
-            .checked_add(seconds)
-            .and_then(|timestamp| {
-                DateTime::<Utc>::from_timestamp(timestamp, now.timestamp_subsec_nanos())
-            })
-            .ok_or("trigger claim lease overflows the timestamp range")?;
         Ok(Self {
             runtime_ref,
             worker_id,
-            now,
-            claim_until,
+            lease_seconds,
         })
     }
 }
@@ -178,18 +205,40 @@ mod tests {
 
     #[test]
     fn firing_claim_leases_are_short_and_canonically_identified() {
-        let now = Utc::now();
-        let claim = AgentTriggerClaimRequest::new("hosted:luna", "worker-1", now, 30).unwrap();
-        assert_eq!(claim.claim_until.timestamp() - now.timestamp(), 30);
+        let claim = AgentTriggerClaimRequest::new("hosted:luna", "worker-1", 30).unwrap();
+        assert_eq!(claim.lease_seconds, 30);
 
-        assert!(AgentTriggerClaimRequest::new(" external:mcp", "worker-1", now, 30).is_err());
-        assert!(AgentTriggerClaimRequest::new("hosted:luna", "", now, 30).is_err());
+        assert!(AgentTriggerClaimRequest::new(" external:mcp", "worker-1", 30).is_err());
+        assert!(AgentTriggerClaimRequest::new("hosted:luna", "", 30).is_err());
         assert!(AgentTriggerClaimRequest::new(
             "hosted:luna",
             "worker-1",
-            now,
             AgentTriggerClaimRequest::MAX_LEASE_SECONDS + 1,
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_run_start_is_anchored_to_the_exact_claim_receipt() {
+        let claim = ClaimedAgentTriggerFiring {
+            binding_id: "10000000-0000-4000-8000-000000000001".into(),
+            event_id: "event-1".into(),
+            event_type: "ci.run.failed".into(),
+            event_envelope: serde_json::json!({}),
+            owner_principal_id: "founder".into(),
+            run_as_agent_id: "20000000-0000-4000-8000-000000000002".into(),
+            runtime_ref: "hosted:luna".into(),
+            task: "Fix it.".into(),
+            delegation_caveats: vec![],
+            claim_owner: "host-1".into(),
+            claim_until: "2026-08-10T00:00:30Z".into(),
+            claim_attempts: 1,
+        };
+        let run_id = Uuid::parse_str("30000000-0000-4000-8000-000000000003").unwrap();
+        let request = AgentTriggerStartRequest::from_claim(&claim, run_id).unwrap();
+        assert_eq!(request.binding_id.to_string(), claim.binding_id);
+        assert_eq!(request.event_id, claim.event_id);
+        assert_eq!(request.claim_owner, claim.claim_owner);
+        assert_eq!(request.run_id, run_id);
     }
 }

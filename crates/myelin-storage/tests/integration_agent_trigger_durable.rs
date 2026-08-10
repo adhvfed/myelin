@@ -8,7 +8,7 @@ use myelin_storage::{
     CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, NewAgentTriggerBinding,
     ReserveAgentTriggerFiringOutcome, SubstrateProvider,
 };
-use sqlx::types::chrono::{DateTime, Utc};
+use sqlx::types::chrono::Utc;
 use sqlx::types::Uuid;
 
 fn admin_config() -> MyelinConfig {
@@ -244,11 +244,10 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         "queued is not misreported as started"
     );
 
-    let now = Utc::now();
     let incompatible = triggers
         .claim_next_firing(
             &tenant,
-            AgentTriggerClaimRequest::new("external:mcp", "external-worker", now, 30).unwrap(),
+            AgentTriggerClaimRequest::new("external:mcp", "external-worker", 30).unwrap(),
         )
         .await
         .expect("look for work for an incompatible runtime");
@@ -260,7 +259,7 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
     let first_claim = triggers
         .claim_next_firing(
             &tenant,
-            AgentTriggerClaimRequest::new("hosted:luna", "host-1", now, 30).unwrap(),
+            AgentTriggerClaimRequest::new("hosted:luna", "host-1", 30).unwrap(),
         )
         .await
         .expect("claim the firing for its exact runtime")
@@ -275,21 +274,33 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
     let held = triggers
         .claim_next_firing(
             &tenant,
-            AgentTriggerClaimRequest::new("hosted:luna", "host-2", now, 30).unwrap(),
+            AgentTriggerClaimRequest::new("hosted:luna", "host-2", 30).unwrap(),
         )
         .await
         .expect("another worker observes the live lease");
     assert_eq!(held, None, "a live claim is never double-delivered");
 
-    let after_expiry = DateTime::<Utc>::from_timestamp(
-        now.timestamp().checked_add(31).unwrap(),
-        now.timestamp_subsec_nanos(),
-    )
-    .unwrap();
+    let expiry_tenant = tenant.clone();
+    app.with_tenant_tx(&tenant, move |conn| {
+        Box::pin(async move {
+            sqlx::query(
+                "UPDATE agent_trigger_firing \
+                    SET claim_until = clock_timestamp() - INTERVAL '1 second' \
+                  WHERE tenant_id = $1 AND event_id = 'ci-failed-1'",
+            )
+            .bind(&expiry_tenant)
+            .execute(&mut *conn)
+            .await
+            .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+            Ok(())
+        })
+    })
+    .await
+    .expect("the database clock expires the abandoned worker lease");
     let reclaimed = triggers
         .claim_next_firing(
             &tenant,
-            AgentTriggerClaimRequest::new("hosted:luna", "host-2", after_expiry, 30).unwrap(),
+            AgentTriggerClaimRequest::new("hosted:luna", "host-2", 30).unwrap(),
         )
         .await
         .expect("reclaim work after its worker disappears")

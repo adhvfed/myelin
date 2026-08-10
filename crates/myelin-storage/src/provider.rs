@@ -754,7 +754,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0091_agent_trigger_rls");
+        assert_eq!(*ids.last().unwrap(), "0092_agent_trigger_claim");
     }
 
     #[test]

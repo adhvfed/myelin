@@ -2,9 +2,10 @@ mod model;
 mod schema;
 
 pub use model::{
-    AgentTriggerClaimRequest, AgentTriggerFiringState, ClaimedAgentTriggerFiring,
-    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
-    NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
+    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerStartRequest,
+    ClaimedAgentTriggerFiring, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding,
+    DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
+    ReservedAgentTriggerFiring, StartAgentTriggerFiringOutcome,
 };
 pub use schema::{
     agent_trigger_durable_migrations, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
@@ -452,12 +453,13 @@ impl DurableAgentTriggerBacking {
                                AND agent_row.runtime_ref = $3 AND b.state = 'active' \
                                AND owner.kind = $4 AND owner.status = $5 AND agent.status = $5 \
                                AND (f.state = 'queued' \
-                                 OR (f.state = 'claimed' AND f.claim_until <= $6)) \
+                                 OR (f.state = 'claimed' AND f.claim_until <= clock_timestamp())) \
                              ORDER BY f.created_at, f.binding_id, f.event_id \
                              FOR UPDATE OF f SKIP LOCKED LIMIT 1\
                          ) \
                          UPDATE agent_trigger_firing f \
-                            SET state = 'claimed', claim_owner = $7, claim_until = $8, \
+                            SET state = 'claimed', claim_owner = $6, \
+                                claim_until = clock_timestamp() + ($7 * INTERVAL '1 second'), \
                                 claim_attempts = claim_attempts + 1 \
                            FROM candidate \
                           WHERE f.tenant_id = $1 AND f.region = $2 \
@@ -473,9 +475,8 @@ impl DurableAgentTriggerBacking {
                     .bind(&request.runtime_ref)
                     .bind(&human)
                     .bind(&active)
-                    .bind(request.now)
                     .bind(&request.worker_id)
-                    .bind(request.claim_until)
+                    .bind(i64::from(request.lease_seconds))
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("claim next governed agent firing"))?;
@@ -483,6 +484,64 @@ impl DurableAgentTriggerBacking {
                 })
             })
             .await
+    }
+
+    /// Promotes one live firing claim to a run on the caller's transaction.
+    ///
+    /// The caller must insert the durable workflow on the same transaction. If
+    /// either write fails, both are rolled back, so `started` always means that
+    /// a run-of-record exists and a reclaimed lease can never create a second
+    /// workflow.
+    pub async fn start_claimed_firing_on_conn(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        tenant: &str,
+        request: &AgentTriggerStartRequest,
+    ) -> Result<StartAgentTriggerFiringOutcome, PgError> {
+        let region = self.provider.config().region.as_str();
+        let updated = sqlx::query_scalar::<_, Uuid>(
+            "UPDATE agent_trigger_firing \
+                SET state = 'started', run_id = $6, claim_owner = NULL, claim_until = NULL \
+              WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 AND event_id = $4 \
+                AND state = 'claimed' AND claim_owner = $5 \
+                AND claim_until > clock_timestamp() \
+          RETURNING run_id",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(request.binding_id)
+        .bind(&request.event_id)
+        .bind(&request.claim_owner)
+        .bind(request.run_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(query_error("promote governed agent firing to started"))?;
+        if updated.is_some() {
+            return Ok(StartAgentTriggerFiringOutcome::Started);
+        }
+
+        let existing = sqlx::query_as::<_, (String, Option<Uuid>)>(
+            "SELECT state, run_id FROM agent_trigger_firing \
+              WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 AND event_id = $4",
+        )
+        .bind(tenant)
+        .bind(region)
+        .bind(request.binding_id)
+        .bind(&request.event_id)
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(query_error(
+            "inspect unavailable governed agent firing claim",
+        ))?;
+        Ok(match existing {
+            Some((state, Some(run_id)))
+                if state == AgentTriggerFiringState::Started.token()
+                    && run_id == request.run_id =>
+            {
+                StartAgentTriggerFiringOutcome::AlreadyStarted
+            }
+            _ => StartAgentTriggerFiringOutcome::ClaimUnavailable,
+        })
     }
 }
 
