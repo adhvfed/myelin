@@ -101,6 +101,35 @@ async function askAgentToAct(
   return receipt;
 }
 
+async function askAgentToBeDenied(
+  run: AgentRunEnvelope,
+  id: number,
+  tool: string,
+  arguments_: JsonRecord,
+): Promise<string> {
+  const response = await systemClient.json(`/v1/agent-runs/${run.run.id}/mcp`, {
+    method: "POST",
+    body: {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: tool,
+        arguments: arguments_,
+        _meta: { "com.myelin/idempotencyKey": `system-denied-${tool}-${randomUUID()}` },
+      },
+    },
+    token: run.credential.token,
+    tokenScheme: "agent",
+    expectedStatus: 200,
+  });
+  const result = record(response.body.result, `${tool} denied MCP result`);
+  expect(result).toMatchObject({ isError: true, _meta: { tool } });
+  const content = array(result.content, `${tool} denied MCP content`);
+  expect(content).toHaveLength(1);
+  return string(record(content[0], `${tool} denied MCP content item`).text, `${tool} denial`);
+}
+
 function cliEnvironment(
   configDirectory: string,
   additions: NodeJS.ProcessEnv = {},
@@ -1425,6 +1454,21 @@ describe("the CLI authentication journey", () => {
       ].join("\n");
       await sourceRepository.writeFile("main", sourcePath, sourceContents);
       const agentBranch = `agent/investigate-${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+      const protectedAgentBranch = `protected/${randomUUID().replaceAll("-", "").slice(0, 8)}`;
+      await systemClient.json(`${sourceRepository.path}/branch-protection`, {
+        method: "POST",
+        body: {
+          rulesets: [{
+            ref_pattern: `refs/heads/${protectedAgentBranch}`,
+            required_contexts: [],
+            required_approvals: 1,
+            require_codeowner_review: false,
+            require_conversation_resolution: false,
+            allow_force_push: false,
+          }],
+        },
+        expectedStatus: 200,
+      });
       const proposedSourceContents = sourceContents.replace(
         "providerCredentialsRequired = false",
         "providerCredentialsRequired = false as const",
@@ -1569,13 +1613,31 @@ describe("the CLI authentication journey", () => {
         preview_unavailable: false,
       });
 
+      // Protection is repository policy, not a convention attached only to `main`. A selected
+      // write tool can propose work on an ordinary branch, but cannot sidestep a custom protected
+      // ref through the convenient file-edit door.
+      const protectedWrite = await askAgentToBeDenied(
+        resumedRun,
+        12,
+        "git.write_file",
+        {
+          repo: sourceRepository.slug,
+          ref: protectedAgentBranch,
+          path: sourcePath,
+          contents: proposedSourceContents,
+          base_oid: string(sourceFile.base_oid, "agent-visible source blob OID"),
+          start_ref: "main",
+        },
+      );
+      expect(protectedWrite).toContain("branch protection refused");
+
       // The collaborator authors the proposed change through the governed Git surface. The
       // optimistic blob OID prevents lost updates, while start_ref creates a review branch without
       // granting the agent a reusable Git credential.
       const agentWriteKey = `agent-write-${randomUUID()}`;
       const writtenByAgent = await askAgentToAct(
         resumedRun,
-        12,
+        13,
         "git.write_file",
         {
           repo: sourceRepository.slug,
@@ -1589,7 +1651,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentWrite = await askAgentToAct(
         resumedRun,
-        13,
+        14,
         "git.write_file",
         {
           repo: sourceRepository.slug,
@@ -1616,7 +1678,7 @@ describe("the CLI authentication journey", () => {
       const agentPullRequestKey = `agent-pr-${randomUUID()}`;
       const openedByAgent = await askAgentToAct(
         resumedRun,
-        14,
+        15,
         "git.open_pr",
         {
           repo: sourceRepository.slug,
@@ -1629,7 +1691,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentPullRequest = await askAgentToAct(
         resumedRun,
-        15,
+        16,
         "git.open_pr",
         {
           repo: sourceRepository.slug,
@@ -1693,7 +1755,7 @@ describe("the CLI authentication journey", () => {
       const agentIssueKey = `agent-issue-${randomUUID()}`;
       const createdByAgent = await askAgentToAct(
         resumedRun,
-        16,
+        17,
         "issues.create",
         {
           project_id: createdProject.project.id,
@@ -1703,7 +1765,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentIssue = await askAgentToAct(
         resumedRun,
-        17,
+        18,
         "issues.create",
         {
           project_id: createdProject.project.id,

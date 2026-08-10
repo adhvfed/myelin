@@ -1621,13 +1621,17 @@ impl DurableGitBackend {
             &psn,
         )?;
 
+        let loc = Self::loc(tenant, region, slug);
+        let ref_name = RefName::new(full.clone());
+        self.admit_file_ref_update(&loc, principal, actor_is_agent, &ref_name, &new_commit)?;
+
         let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
         let expected_old = prior_target
             .map(|p| PushOid::new(p.0))
             .unwrap_or_else(PushOid::zero);
         let push = PushSession {
             updates: vec![ProposedRefUpdate {
-                ref_name: RefName::new(full.clone()),
+                ref_name,
                 expected_old,
                 new_oid: PushOid::new(new_commit.0.clone()),
                 forced: false,
@@ -1663,6 +1667,52 @@ impl DurableGitBackend {
             PushOutcome::Rejected(_) => Ok(WebEditOutcome::Denied),
             PushOutcome::Crashed(_) => Err(DurableError::Git("web-edit ref-CAS crashed".into())),
         }
+    }
+
+    fn admit_file_ref_update(
+        &self,
+        loc: &RepoLoc,
+        principal: &Principal,
+        actor_is_agent: bool,
+        ref_name: &RefName,
+        new_commit: &CoreOid,
+    ) -> Result<(), DurableError> {
+        let protection = self.prs.get_protection(loc)?;
+        let is_configured = protection
+            .as_ref()
+            .and_then(|config| config.resolve(&ref_name.0))
+            .is_some();
+        if !is_configured && !ref_name.is_protected() {
+            return Ok(());
+        }
+
+        // Agent file edits are proposals. The human delegator's repository administration grant
+        // must not silently turn an ungated `git.write_file` call into a protected direct push.
+        let pusher_has_protected_push = !actor_is_agent
+            && self.repo_authz.authorize_repo_permission(
+                principal,
+                loc,
+                RepoPermission::ProtectedPush,
+            );
+        let (green, fork_unendorsed, endorsed) =
+            self.check_facts_for_head(loc, new_commit.as_str(), principal);
+        evaluate_protected_ref_push(
+            ref_name,
+            false,
+            false,
+            pusher_has_protected_push,
+            &effective_ruleset(protection.as_ref(), &ref_name.0),
+            &GitOid(new_commit.0.clone()),
+            &green,
+            &fork_unendorsed,
+            &endorsed,
+        )
+        .map_err(|reason| {
+            DurableError::Forbidden(format!(
+                "branch protection refused a direct file write to `{}`: {reason:?}",
+                ref_name.0
+            ))
+        })
     }
 
     pub fn get_pr(
@@ -4170,6 +4220,43 @@ mod agent_file_write_tests {
             repo.read_ref("refs/heads/agent/unsafe-fix").unwrap(),
             None,
             "the shared receive policy rejects secrets before exposing a branch"
+        );
+
+        backend
+            .set_branch_protection(
+                TENANT,
+                REGION,
+                REPO,
+                &serde_json::json!({
+                    "rulesets": [{
+                        "ref_pattern": "refs/heads/develop",
+                        "required_contexts": [],
+                        "required_approvals": 1,
+                        "require_codeowner_review": false,
+                        "require_conversation_resolution": false,
+                        "allow_force_push": false,
+                    }],
+                }),
+            )
+            .unwrap();
+        let configured_protection = backend
+            .write_file_with_operation(AgentFileWrite {
+                target: RepoActorContext::new(TENANT, REGION, REPO, &actor),
+                gitref: "develop",
+                path: PATH,
+                expected_base: &base_blob.0,
+                contents: "export const ready = true;\n",
+                start_ref: Some("main"),
+                operation_id: &PrOperationId::parse("write-develop").unwrap(),
+            })
+            .unwrap_err();
+        assert!(configured_protection
+            .to_string()
+            .contains("branch protection refused"));
+        assert_eq!(
+            repo.read_ref("refs/heads/develop").unwrap(),
+            None,
+            "configured protection is identical at the file-edit and Git-wire doors"
         );
 
         let first_operation = PrOperationId::parse("write-ready").unwrap();
