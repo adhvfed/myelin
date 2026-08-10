@@ -312,6 +312,49 @@ command = ["true"]
       created_by: `agent:${agentId}`,
       creator_kind: "agent",
     });
+    const erasePath =
+      `/v1/triggers/${encodeURIComponent(triggerId)}`
+      + `/runs/${encodeURIComponent(hostedRunId)}/result/erase`;
+    await reviewerClient.json(erasePath, {
+      method: "POST",
+      body: {},
+      expectedStatus: 403,
+    });
+    const erased = await founder.json(erasePath, {
+      method: "POST",
+      body: {},
+      expectedStatus: 200,
+    });
+    expect(erased.body).toMatchObject({
+      erasure: {
+        run_id: hostedRunId,
+        run_ref: `myelin://${systemTestConfig.tenant}/agent/run/${hostedRunId}`,
+        trace_ref: result.trace_ref,
+        erased: true,
+        already_erased: false,
+        available_results: 0,
+        recreation_blocked: true,
+      },
+    });
+    const replayedErasure = await founder.json(erasePath, {
+      method: "POST",
+      body: {},
+      expectedStatus: 200,
+    });
+    expect(replayedErasure.body).toMatchObject({
+      erasure: {
+        run_id: hostedRunId,
+        trace_ref: result.trace_ref,
+        erased: true,
+        already_erased: true,
+        available_results: 0,
+        recreation_blocked: true,
+      },
+    });
+    await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/runs/${encodeURIComponent(hostedRunId)}/result`,
+      { expectedStatus: 404 },
+    );
     const peerHistory = await reviewerClient.json(
       `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
       { expectedStatus: 403 },

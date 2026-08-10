@@ -7,6 +7,9 @@ use crate::dispatch::{is_canonical_automation_id, EdgeCall};
 use super::{query_field, terminal_safe_single_line};
 
 pub(super) fn render_response(value: &Value) -> Option<String> {
+    if let Some(erasure) = value.get("erasure") {
+        return render_erasure(erasure);
+    }
     if let Some(result) = value.get("result") {
         return render_result(result);
     }
@@ -44,6 +47,32 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
         "  Myelin owns the integration credentials and gives each run only its governed tools.\n",
     );
     Some(output)
+}
+
+fn render_erasure(erasure: &Value) -> Option<String> {
+    let run_ref = erasure.get("run_ref")?.as_str()?;
+    let trace_ref = erasure.get("trace_ref")?.as_str()?;
+    let already_erased = erasure.get("already_erased")?.as_bool()?;
+    if !erasure.get("erased")?.as_bool()?
+        || erasure.get("available_results")?.as_u64()? != 0
+        || !erasure.get("recreation_blocked")?.as_bool()?
+        || !run_ref.starts_with("myelin://")
+        || !run_ref.contains("/agent/run/")
+        || !trace_ref.starts_with("myelin://")
+        || !trace_ref.contains("/knowledge/doc/")
+    {
+        return None;
+    }
+    let disposition = if already_erased {
+        "Agent result was already erased"
+    } else {
+        "Erased agent result"
+    };
+    Some(format!(
+        "{disposition}: {}\n  trace: {}\n  available results: 0; recreation blocked\n",
+        terminal_safe_single_line(run_ref),
+        terminal_safe_single_line(trace_ref),
+    ))
 }
 
 fn render_result(result: &Value) -> Option<String> {
@@ -278,6 +307,25 @@ mod tests {
         assert!(output.contains("I read the failed run.\nI opened one issue."));
         assert!(output.contains("trace: myelin://acme/knowledge/doc/blake3:"));
         assert!(output.contains("charged: 42 micro-units"));
+    }
+
+    #[test]
+    fn an_erased_agent_answer_is_explicitly_irrecoverable_and_replay_safe() {
+        let output = render_response(&json!({
+            "erasure": {
+                "run_id": "33333333-3333-4333-8333-333333333333",
+                "run_ref": "myelin://acme/agent/run/33333333-3333-4333-8333-333333333333",
+                "trace_ref": "myelin://acme/knowledge/doc/blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "erased": true,
+                "already_erased": false,
+                "available_results": 0,
+                "recreation_blocked": true
+            }
+        }))
+        .unwrap();
+
+        assert!(output.starts_with("Erased agent result: myelin://acme/agent/run/"));
+        assert!(output.contains("available results: 0; recreation blocked"));
     }
 
     #[test]

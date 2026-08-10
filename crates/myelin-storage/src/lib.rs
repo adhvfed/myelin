@@ -79,8 +79,9 @@ pub use agent_model_step::{
 };
 pub use agent_run_gate::{AgentRunGate, AgentRunGateSignal, DispatchError, InFlightRun, RunKind};
 pub use agent_trace_durable::{
-    agent_trace_durable_migrations, AgentTraceError, AgentTraceReceipt, AgentTraceResult,
-    AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore, InMemoryAgentTraceStore,
+    agent_trace_durable_migrations, AgentTraceEraseReceipt, AgentTraceError, AgentTraceReceipt,
+    AgentTraceResult, AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore,
+    EraseAgentTraceOutcome, InMemoryAgentTraceStore,
 };
 pub use agent_wallet::{
     agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind,

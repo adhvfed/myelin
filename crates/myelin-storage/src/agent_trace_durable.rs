@@ -41,11 +41,33 @@ CREATE POLICY myelin_tenant_isolation ON knowledge_agent_trace
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_TRACE_ERASURE_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS knowledge_agent_trace_erasure (
+    tenant_id    text        NOT NULL,
+    region       text        NOT NULL,
+    run_id       text        NOT NULL CHECK (length(run_id) BETWEEN 1 AND 512),
+    artifact_ref text        NOT NULL CHECK (length(artifact_ref) BETWEEN 1 AND 1024),
+    erased_at    timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, region, run_id)
+);
+ALTER TABLE knowledge_agent_trace_erasure ENABLE ROW LEVEL SECURITY;
+ALTER TABLE knowledge_agent_trace_erasure FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON knowledge_agent_trace_erasure;
+CREATE POLICY myelin_tenant_isolation ON knowledge_agent_trace_erasure
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+"#;
+
 pub fn agent_trace_durable_migrations() -> Migrations {
-    Migrations::of([Migration::plain(
-        "0098_knowledge_agent_trace",
-        AGENT_TRACE_MIGRATION,
-    )])
+    Migrations::of([
+        Migration::plain("0098_knowledge_agent_trace", AGENT_TRACE_MIGRATION),
+        Migration::plain(
+            "0099_knowledge_agent_trace_erasure",
+            AGENT_TRACE_ERASURE_MIGRATION,
+        ),
+    ])
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -138,9 +160,22 @@ pub struct AgentTraceResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTraceEraseReceipt {
+    pub artifact_ref: ArtifactRef,
+    pub already_erased: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EraseAgentTraceOutcome {
+    Erased(AgentTraceEraseReceipt),
+    NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AgentTraceError {
     Invalid(&'static str),
     Conflict,
+    Erased,
     Storage(String),
 }
 
@@ -150,6 +185,7 @@ impl core::fmt::Display for AgentTraceError {
             Self::Invalid(field) => write!(formatter, "invalid agent trace {field}"),
             Self::Conflict => formatter
                 .write_str("agent run already has a different immutable trace; replay refused"),
+            Self::Erased => formatter.write_str("agent run trace was erased; recreation refused"),
             Self::Storage(error) => write!(formatter, "agent trace storage failed: {error}"),
         }
     }
@@ -261,6 +297,34 @@ impl DurableAgentTraceStore {
             .await
     }
 
+    pub async fn erase_for_owner(
+        &self,
+        tenant: &str,
+        owner_principal: &str,
+        binding_id: sqlx::types::Uuid,
+        run_id: &str,
+    ) -> Result<EraseAgentTraceOutcome, ProviderError> {
+        let tenant = tenant.to_string();
+        let owner_principal = owner_principal.to_string();
+        let run_id = run_id.to_string();
+        let region = self.provider.config().region.clone();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |connection| {
+                Box::pin(async move {
+                    erase_for_owner_on_connection(
+                        connection,
+                        &tenant,
+                        &region,
+                        &owner_principal,
+                        binding_id,
+                        &run_id,
+                    )
+                    .await
+                })
+            })
+            .await
+    }
+
     fn write_blocking(
         &self,
         tenant: &TenantId,
@@ -306,6 +370,20 @@ async fn write_on_connection(
     artifact_ref: &ArtifactRef,
     trace: &AgentTraceWrite,
 ) -> Result<Result<bool, AgentTraceError>, PgError> {
+    lock_trace(connection, tenant, region, &trace.run_id).await?;
+    let erased = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM knowledge_agent_trace_erasure \
+          WHERE tenant_id = $1 AND region = $2 AND run_id = $3)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&trace.run_id)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    if erased {
+        return Ok(Err(AgentTraceError::Erased));
+    }
     let charged_micro = i64::try_from(trace.charged_micro)
         .map_err(|_| PgError::Query("agent trace charge exceeds i64".into()))?;
     let inserted = sqlx::query(
@@ -373,6 +451,117 @@ async fn write_on_connection(
     } else {
         Err(AgentTraceError::Conflict)
     })
+}
+
+async fn erase_for_owner_on_connection(
+    connection: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    owner_principal: &str,
+    binding_id: sqlx::types::Uuid,
+    run_id: &str,
+) -> Result<EraseAgentTraceOutcome, PgError> {
+    let owns_run = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (\
+             SELECT 1 FROM agent_trigger_firing firing \
+             JOIN agent_trigger_binding binding \
+               ON binding.tenant_id = firing.tenant_id \
+              AND binding.region = firing.region \
+              AND binding.binding_id = firing.binding_id \
+             WHERE firing.tenant_id = $1 AND firing.region = $2 \
+               AND firing.binding_id = $3 AND firing.run_id::text = $4 \
+               AND binding.owner_principal_id = $5\
+         )",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(binding_id)
+    .bind(run_id)
+    .bind(owner_principal)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    if !owns_run {
+        return Ok(EraseAgentTraceOutcome::NotFound);
+    }
+
+    lock_trace(connection, tenant, region, run_id).await?;
+    if let Some(artifact_ref) = sqlx::query_scalar::<_, String>(
+        "SELECT artifact_ref FROM knowledge_agent_trace_erasure \
+          WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(run_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(trace_query)?
+    {
+        return Ok(EraseAgentTraceOutcome::Erased(AgentTraceEraseReceipt {
+            artifact_ref: ArtifactRef(artifact_ref),
+            already_erased: true,
+        }));
+    }
+
+    let Some(artifact_ref) = sqlx::query_scalar::<_, String>(
+        "SELECT artifact_ref FROM knowledge_agent_trace \
+          WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(run_id)
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(trace_query)?
+    else {
+        return Ok(EraseAgentTraceOutcome::NotFound);
+    };
+
+    sqlx::query(
+        "INSERT INTO knowledge_agent_trace_erasure \
+           (tenant_id, region, run_id, artifact_ref) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(run_id)
+    .bind(&artifact_ref)
+    .execute(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    let deleted = sqlx::query(
+        "DELETE FROM knowledge_agent_trace \
+          WHERE tenant_id = $1 AND region = $2 AND run_id = $3",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(run_id)
+    .execute(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    if deleted.rows_affected() != 1 {
+        return Err(PgError::Query(
+            "agent trace disappeared during serialized erasure".into(),
+        ));
+    }
+    Ok(EraseAgentTraceOutcome::Erased(AgentTraceEraseReceipt {
+        artifact_ref: ArtifactRef(artifact_ref),
+        already_erased: false,
+    }))
+}
+
+async fn lock_trace(
+    connection: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    run_id: &str,
+) -> Result<(), PgError> {
+    let lock_key = format!("agent-trace\u{1f}{tenant}\u{1f}{region}\u{1f}{run_id}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(connection)
+        .await
+        .map_err(trace_query)?;
+    Ok(())
 }
 
 fn agent_trace_result_from_row(row: sqlx::postgres::PgRow) -> Result<AgentTraceResult, PgError> {
@@ -461,5 +650,7 @@ mod tests {
         assert!(AGENT_TRACE_MIGRATION.contains("UNIQUE (tenant_id, region, artifact_ref)"));
         assert!(AGENT_TRACE_MIGRATION.contains("octet_length(answer) BETWEEN 1 AND 65536"));
         assert!(AGENT_TRACE_MIGRATION.contains("octet_length(trace_body::text) <= 262144"));
+        assert!(AGENT_TRACE_ERASURE_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
+        assert!(AGENT_TRACE_ERASURE_MIGRATION.contains("PRIMARY KEY (tenant_id, region, run_id)"));
     }
 }

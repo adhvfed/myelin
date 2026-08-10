@@ -26,6 +26,7 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "identity.trigger.pause",
     "identity.trigger.resume",
     "identity.trigger.disable",
+    "identity.trigger.result.erase",
     "identity.trigger.firing.approve",
     "identity.trigger.firing.reject",
     "identity.projects.list",
@@ -178,6 +179,11 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("identity.trigger.pause", "agent.manage", HUMAN_SESSION),
     requirement!("identity.trigger.resume", "agent.manage", HUMAN_SESSION),
     requirement!("identity.trigger.disable", "agent.manage", HUMAN_SESSION),
+    requirement!(
+        "identity.trigger.result.erase",
+        "agent.manage",
+        HUMAN_SESSION
+    ),
     requirement!(
         "identity.trigger.firing.approve",
         "agent.manage",

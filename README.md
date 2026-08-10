@@ -115,6 +115,9 @@ myelin automation history 44444444-4444-4444-4444-444444444444
 # Read the completed run id from history, then inspect the agent's durable work product:
 myelin automation result 44444444-4444-4444-4444-444444444444 \
   55555555-5555-4555-8555-555555555555
+# Erase that result and leave a durable marker that prevents a retry from recreating it:
+myelin automation erase-result 44444444-4444-4444-4444-444444444444 \
+  55555555-5555-4555-8555-555555555555 --idempotency-key erase-triage-result
 myelin automation approve 44444444-4444-4444-4444-444444444444 ci-failed-01J... \
   --idempotency-key approve-red-mainline
 # Or end that exact pending firing without starting an agent run:
@@ -182,8 +185,10 @@ Myelin tools. Owners can inspect durable firing history and outcomes, pause new 
 maintenance, resume them, or irreversibly disable an automation. Every run that reaches a final
 agent answer writes it before cost settlement as one immutable, content-addressed Knowledge
 trace. The automation owner can retrieve that work product and its exact metered cost with
-`automation result`; other users cannot read it through the run reference. A human-approval gate
-parks the exact event without starting or paying for an agent run. It appears in the owner's shared inbox
+`automation result`; other users cannot read it through the run reference. The owner can erase one
+result with `automation erase-result`; a durable erasure marker makes the operation idempotent and
+refuses any later hosted-worker attempt to recreate the trace. A human-approval gate parks the exact
+event without starting or paying for an agent run. It appears in the owner's shared inbox
 with approve and reject actions in the web app and a copyable CLI command; either decision is
 durable and retry-safe, completes the inbox item, and remains visible in automation history. No
 third-party integration key is created or copied into the agent.

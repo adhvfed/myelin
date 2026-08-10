@@ -8,8 +8,9 @@ use myelin_storage::{
     AgentTriggerApprovalDecision, AgentTriggerFiringState, AgentTriggerLifecycleAction,
     ChangeAgentTriggerApprovalOutcome, ChangeAgentTriggerLifecycleOutcome,
     CreateAgentTriggerBindingOutcome, DurableAgentTraceStore, DurableAgentTriggerBacking,
-    DurableAgentTriggerBinding, DurableAgentTriggerFiring, NewAgentTriggerBinding,
-    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    DurableAgentTriggerBinding, DurableAgentTriggerFiring, EraseAgentTraceOutcome,
+    NewAgentTriggerBinding, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -147,6 +148,10 @@ struct TriggerFiringListHandler {
 }
 
 struct TriggerRunResultHandler {
+    api: TriggerHttpApi,
+}
+
+struct TriggerRunResultEraseHandler {
     api: TriggerHttpApi,
 }
 
@@ -295,6 +300,55 @@ impl Handler for TriggerRunResultHandler {
                     "answer": result.answer,
                     "charged_micro": result.charged_micro,
                     "recorded_at": result.created_at,
+                },
+            }),
+        )))
+    }
+}
+
+impl Handler for TriggerRunResultEraseHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.query.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "agent result erasure accepts no query parameters".into(),
+            ));
+        }
+        crate::request::require_empty_json_object(
+            &ctx.request.body,
+            "agent result erasure",
+            MAX_TRIGGER_JSON_BYTES,
+        )?;
+        let binding_id = parse_uuid(trigger_param(ctx)?)?;
+        let run_id = parse_uuid(run_param(ctx)?)?.to_string();
+        let receipt = match self
+            .api
+            .drive(self.api.traces.erase_for_owner(
+                &ctx.principal.tenant.0,
+                &ctx.principal.principal_id.0,
+                binding_id,
+                &run_id,
+            ))?
+            .map_err(|error| EdgeError::Internal(error.to_string()))?
+        {
+            EraseAgentTraceOutcome::Erased(receipt) => receipt,
+            EraseAgentTraceOutcome::NotFound => {
+                return Err(EdgeError::NotFound("agent run result not found".into()))
+            }
+        };
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "erasure": {
+                    "run_id": run_id,
+                    "run_ref": format!(
+                        "myelin://{}/agent/run/{run_id}",
+                        ctx.principal.tenant.0,
+                    ),
+                    "trace_ref": receipt.artifact_ref,
+                    "erased": true,
+                    "already_erased": receipt.already_erased,
+                    "available_results": 0,
+                    "recreation_blocked": true,
                 },
             }),
         )))
@@ -452,6 +506,12 @@ pub fn register_triggers(
             "/v1/triggers/{trigger}/runs/{run}/result",
             "identity.triggers.list",
             Arc::new(TriggerRunResultHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/triggers/{trigger}/runs/{run}/result/erase",
+            "identity.trigger.result.erase",
+            Arc::new(TriggerRunResultEraseHandler { api: api.clone() }),
         )
         .route(
             Method::Post,

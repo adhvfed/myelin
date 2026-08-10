@@ -660,6 +660,7 @@ cdc = [
     "crates/myelin-agent-service/tests/drills_ag_p19_knowledge_tools.rs",
     "crates/myelin-knowledge/tests/cdc_8_8_knowledge_agent_trace.rs",
     "crates/myelin-agent-host/tests/integration_agent_host_activity.rs",
+    "crates/myelin-storage/tests/integration_agent_trace_erasure.rs",
 ]
 
 [[contract]]

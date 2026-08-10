@@ -17,7 +17,7 @@ const MAX_FILTER_BYTES: usize = 4 * 1024;
 pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
-            "no automation command given (try: create | list | show | history | result | approve | reject | pause | resume | disable)"
+            "no automation command given (try: create | list | show | history | result | erase-result | approve | reject | pause | resume | disable)"
                 .into(),
         )
     })?;
@@ -27,6 +27,7 @@ pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
         "show" => show_call(rest),
         "history" => history_call(rest),
         "result" => result_call(rest),
+        "erase-result" => erase_result_call(rest),
         "approve" | "reject" => approval_call(rest, verb),
         "pause" | "resume" | "disable" => lifecycle_call(rest, verb),
         other => Err(CliError::Usage(format!(
@@ -242,6 +243,20 @@ fn result_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     Ok(EdgeCall::get(format!(
         "/v1/triggers/{automation_id}/runs/{run_id}/result"
     )))
+}
+
+fn erase_result_call(args: &[&str]) -> Result<EdgeCall, CliError> {
+    let [automation_id, run_id] = args else {
+        return Err(CliError::Usage(
+            "automation erase-result needs an automation id and run id".into(),
+        ));
+    };
+    require_automation_id("automation id", automation_id)?;
+    require_automation_id("run id", run_id)?;
+    Ok(EdgeCall::post_json(
+        format!("/v1/triggers/{automation_id}/runs/{run_id}/result/erase"),
+        json!({}),
+    ))
 }
 
 fn lifecycle_call(args: &[&str], action: &str) -> Result<EdgeCall, CliError> {
@@ -559,6 +574,13 @@ mod tests {
             format!("/v1/triggers/{AUTOMATION}/runs/{RUN}/result")
         );
         assert!(automation_dispatch(&["result", AUTOMATION]).is_err());
+        let erase = automation_dispatch(&["erase-result", AUTOMATION, RUN]).unwrap();
+        assert_eq!(
+            erase.path,
+            format!("/v1/triggers/{AUTOMATION}/runs/{RUN}/result/erase")
+        );
+        assert_eq!(erase.retry_policy, RetryPolicy::CallerKeyRequired);
+        assert!(automation_dispatch(&["erase-result", AUTOMATION]).is_err());
         for action in ["pause", "resume", "disable"] {
             let call = automation_dispatch(&[action, AUTOMATION]).unwrap();
             assert_eq!(call.path, format!("/v1/triggers/{AUTOMATION}/{action}"));
