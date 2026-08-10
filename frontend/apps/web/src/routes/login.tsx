@@ -1,13 +1,5 @@
-// THE /login ROUTE (outside the authenticated `(app)` group) — the first-run entry (R3.5).
-// Honestly-labelled paths, driven by the UNAUTHENTICATED `GET /v1/auth/config`:
-//   1. The real OIDC/SSO login is the PRIMARY affordance — it rides the DERIVED button token
-//      (`--c-btn-primary-bg`, R3.6 fix preserved), never raw --accent. When SSO is configured it is
-//      enabled and posts to the `startSso` seam; when it is NOT, it is `aria-disabled` with a VISIBLE
-//      reason (never a title tooltip) so keyboard/touch/AT users all see why.
-//   2. The DEV-SESSION SEAM is relegated below a divider and RENDERS ONLY when the server flag
-//      (`auth/config.dev_login_enabled`, itself belt-and-braced with the build-time PROD kill switch)
-//      allows it — a production build never even paints it.
-// Full-height (100dvh), honest error/loading states. Semantic tokens only.
+// Public login route. The edge config controls the available methods; development login also
+// requires a non-production build.
 import { Show, Suspense } from "solid-js";
 import { Title } from "@solidjs/meta";
 import { createAsync, useSearchParams, useSubmission } from "@solidjs/router";
@@ -15,7 +7,6 @@ import { Icon } from "@myelin/design-system";
 import { getAuthConfig, loginDev, loginWithToken, startSso } from "../lib/auth";
 import { safeAuthReturnTo } from "../lib/auth-return";
 
-// The card chrome, shared by every state.
 const card = {
   width: "100%",
   "max-width": "24rem",
@@ -37,15 +28,12 @@ const primaryBtn = {
   padding: "var(--space-2) var(--space-3)",
   border: "none",
   "border-radius": "var(--radius-1)",
-  // Primary rides the DERIVED button token (→ focus-ring, contrast floor), never raw --accent.
   background: "var(--c-btn-primary-bg)",
   color: "var(--c-btn-primary-text)",
   "font-weight": "600",
   cursor: "pointer",
 } as const;
 
-// A secondary (outline) button — used for the operator-token submit WHEN SSO is the primary. When SSO
-// is unconfigured, the token card is the primary affordance instead and rides `primaryBtn`.
 const secondaryBtn = {
   display: "inline-flex",
   "align-items": "center",
@@ -68,8 +56,7 @@ export default function Login() {
   const tokenPending = useSubmission(loginWithToken);
 
   const hasError = () => Boolean(params.error);
-  // R4.0 — the operator-token failure has its OWN honest copy (blames the token/bootstrap, not the
-  // user), distinct from the SSO-not-wired message. Key off the `?error=` value.
+  // Token failures use different guidance from SSO failures.
   const isTokenError = () => params.error === "token_invalid";
   const returnTo = () => safeAuthReturnTo(params.return_to);
 
@@ -77,7 +64,7 @@ export default function Login() {
     <main
       class="login-main"
       style={{
-        // 100dvh (not 100vh) so mobile browser chrome never clips the card — a11y #7.
+        // Account for dynamic mobile browser chrome.
         "min-height": "100dvh",
         display: "flex",
         "flex-direction": "column",
@@ -97,8 +84,7 @@ export default function Login() {
           <Icon name="human" /> Sign in to Myelin
         </h1>
 
-        {/* Login failure (error) — system-blaming, one line + a path; NEVER a raw err.message.
-            role=alert announces assertively. */}
+        {/* Announce login failures without exposing raw server errors. */}
         <Show when={hasError()}>
           <p
             role="alert"
@@ -140,8 +126,6 @@ export default function Login() {
           <Show when={config()} keyed>
             {(cfg) => (
               <>
-                {/* PRIMARY — real OIDC/SSO. Enabled when configured (posts to the startSso seam);
-                    otherwise aria-disabled with a VISIBLE reason. */}
                 <Show
                   when={cfg.sso_configured}
                   fallback={
@@ -155,7 +139,6 @@ export default function Login() {
                       >
                         <Icon name="human" /> Continue with single sign-on
                       </button>
-                      {/* The reason is VISIBLE TEXT referenced by aria-describedby, not a title. */}
                       <p
                         id="sso-reason"
                         data-testid="sso-reason"
@@ -202,9 +185,6 @@ export default function Login() {
                   </form>
                 </Show>
 
-                {/* R4.0 — OPERATOR-TOKEN LOGIN. A REAL working path (verifies against the live edge),
-                    gated on the edge flag. When SSO is unconfigured this is the PRIMARY affordance and
-                    rides the derived primary token; otherwise it's the secondary/outline alternative. */}
                 <Show when={cfg.token_login_enabled}>
                   <form
                     action={loginWithToken}
@@ -213,8 +193,6 @@ export default function Login() {
                     style={{ margin: "0", display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}
                   >
                     <input type="hidden" name="return_to" value={returnTo()} />
-                    {/* The control is NESTED in its label (the codebase's association convention) — the
-                        visible label text is the <span>; the input is the labelled control. */}
                     <label style={{ display: "flex", "flex-direction": "column", gap: "var(--space-2)" }}>
                       <span style={{ display: "flex", "align-items": "center", gap: "var(--space-1)", "font-size": "var(--fs-body-sm)", "font-weight": "500", color: "var(--text-primary)" }}>
                         <Icon name="agent" /> Operator token
@@ -230,8 +208,6 @@ export default function Login() {
                         spellcheck={false}
                         data-testid="token-input"
                         placeholder="Paste your capability token"
-                        // The error alert (when present) + the helper are both referenced — the reason
-                        // is VISIBLE TEXT, never a title tooltip.
                         aria-describedby={isTokenError() ? "login-error-msg token-help" : "token-help"}
                         aria-invalid={isTokenError() ? "true" : undefined}
                         style={{
@@ -263,15 +239,11 @@ export default function Login() {
                   </form>
                 </Show>
 
-                {/* Ambient residency cue (P9, T0) — glyph + text, never colour-alone. */}
                 <p style={{ margin: "0", display: "flex", "align-items": "center", gap: "var(--space-1)", color: "var(--text-muted)", "font-size": "var(--fs-caption)" }}>
                   <Icon name="database" />
                   Data region: <strong style={{ color: "var(--text-primary)", "font-weight": "500" }}>EU-West</strong>
                 </p>
 
-                {/* DEV SEAM — relegated below the divider and RENDERED ONLY when the server flag
-                    allows it (belt-and-braces with the build-time PROD kill switch). A prod build
-                    never paints it; a non-prod build without the opt-in doesn't either. */}
                 <Show when={cfg.dev_login_enabled}>
                   <hr style={{ border: "0", "border-block-start": "var(--hairline) solid var(--border)", margin: "0" }} />
                   <div
