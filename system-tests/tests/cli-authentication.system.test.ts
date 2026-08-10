@@ -12,7 +12,7 @@ import { gitRepositoryUrl, systemTestConfig } from "../src/config.js";
 import { eventually } from "../src/eventually.js";
 import { git } from "../src/git-cli.js";
 import { GitProject } from "../src/git-project.js";
-import { array, record, string, type JsonRecord } from "../src/json.js";
+import { array, integer, record, string, type JsonRecord } from "../src/json.js";
 
 const repository = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
@@ -95,7 +95,10 @@ async function askAgentToAct(
     isError: false,
     _meta: { tool, eventId: expect.any(String) },
   });
-  return record(result._meta, `${tool} MCP result metadata`);
+  const metadata = record(result._meta, `${tool} MCP result metadata`);
+  const receipt = record(result.structuredContent, `${tool} MCP structured receipt`);
+  expect(receipt).toMatchObject({ event_id: metadata.eventId });
+  return receipt;
 }
 
 function cliEnvironment(
@@ -1400,12 +1403,13 @@ describe("the CLI authentication journey", () => {
         },
         agentWriteKey,
       );
-      expect(replayedAgentWrite.eventId).toBe(writtenByAgent.eventId);
-      const agentBranchCommit = string(
-        writtenByAgent.eventId,
-        "agent file-write event id",
-      ).match(/^git\.file\.write:([0-9a-f]{40})\|/)?.[1];
-      expect(agentBranchCommit).toBeTruthy();
+      expect(replayedAgentWrite).toEqual(writtenByAgent);
+      const agentWrite = record(writtenByAgent.data, "agent file-write receipt data");
+      const agentBranchCommit = string(agentWrite.commit_oid, "agent branch commit OID");
+      expect(agentBranchCommit).toMatch(/^[0-9a-f]{40}$/);
+      expect(writtenByAgent.ref).toBe(
+        `myelin://${systemTestConfig.tenant}/git/commit/${sourceRepository.slug}:${agentBranchCommit}`,
+      );
 
       // Authorship and authorization stay separate: the PR is authored by the agent, while the
       // founder's live repository grant is the authorization basis. The agent receives neither a
@@ -1438,7 +1442,19 @@ describe("the CLI authentication journey", () => {
         },
         agentPullRequestKey,
       );
-      expect(replayedAgentPullRequest.eventId).toBe(openedByAgent.eventId);
+      expect(replayedAgentPullRequest).toEqual(openedByAgent);
+      const agentPullRequestRef = string(openedByAgent.ref, "agent pull request ref");
+      const agentPullRequestReceipt = record(
+        openedByAgent.data,
+        "agent pull request receipt data",
+      );
+      const agentPullRequestNumber = integer(
+        agentPullRequestReceipt.number,
+        "agent pull request number",
+      );
+      expect(agentPullRequestRef).toBe(
+        `myelin://${systemTestConfig.tenant}/git/pr/${sourceRepository.slug}:${agentPullRequestNumber}`,
+      );
 
       const humanVisibleAgentPullRequest = await eventually<JsonRecord>(
         async () => {
@@ -1470,6 +1486,7 @@ describe("the CLI authentication journey", () => {
         author_is_agent: true,
         author: `${activated.agent.principal_id}@${systemTestConfig.tenant}.noreply`,
       });
+      expect(humanVisibleAgentPullRequest.number).toBe(agentPullRequestNumber);
 
       // The collaborator can now turn what it learned into durable team work. Project metadata
       // supplies the issue type and prefix, the human's live project access bounds the write, and
@@ -1496,9 +1513,14 @@ describe("the CLI authentication journey", () => {
         },
         agentIssueKey,
       );
-      expect(replayedAgentIssue.eventId).toBe(createdByAgent.eventId);
-      expect(string(createdByAgent.eventId, "agent-created issue event id")).toMatch(
-        /^issue\.create:[0-9a-f-]{36}\|/,
+      expect(replayedAgentIssue).toEqual(createdByAgent);
+      const agentIssueRef = string(createdByAgent.ref, "agent-created issue ref");
+      const agentIssueReceipt = record(createdByAgent.data, "agent-created issue receipt data");
+      expect(agentIssueRef).toBe(
+        `myelin://${systemTestConfig.tenant}/issue/issue/${string(
+          agentIssueReceipt.key,
+          "agent-created issue key",
+        )}`,
       );
 
       const humanVisibleAgentIssue = await eventually<JsonRecord>(
@@ -1531,6 +1553,12 @@ describe("the CLI authentication journey", () => {
         creator_kind: "agent",
         key: expect.stringMatching(new RegExp(`^${createdProject.project.issue_prefix}-\\d+$`)),
       });
+      expect(agentIssueRef).toBe(
+        `myelin://${systemTestConfig.tenant}/issue/issue/${string(
+          humanVisibleAgentIssue.key,
+          "human-visible agent issue key",
+        )}`,
+      );
 
       const agentChatMessage = `${uniqueName("Agent verified the release context")} \u{FFFC} \u{FFFC}`;
       const agentPostKey = `agent-chat-${randomUUID()}`;
@@ -1541,10 +1569,7 @@ describe("the CLI authentication journey", () => {
         {
           conversation_id: conversationId,
           content: agentChatMessage,
-          references: [
-            `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`,
-            `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`,
-          ],
+          references: [agentIssueRef, agentPullRequestRef],
         },
         agentPostKey,
       );
@@ -1555,14 +1580,14 @@ describe("the CLI authentication journey", () => {
         {
           conversation_id: conversationId,
           content: agentChatMessage,
-          references: [
-            `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`,
-            `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`,
-          ],
+          references: [agentIssueRef, agentPullRequestRef],
         },
         agentPostKey,
       );
-      expect(replayedAgentPost.eventId).toBe(postedByAgent.eventId);
+      expect(replayedAgentPost).toEqual(postedByAgent);
+      expect(postedByAgent.ref).toMatch(
+        new RegExp(`^myelin://${systemTestConfig.tenant}/chat/message/[0-9A-Z]{26}$`),
+      );
 
       const humanHistory = await runCli(
         configDirectory,

@@ -70,10 +70,23 @@ impl GovernedRun {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallOutcome {
-    Applied { event_id: String, jti: String },
-    Gated { gate_id: String, jti: String },
-    Denied { reason: String, jti: String },
-    Indeterminate { reason: String, jti: String },
+    Applied {
+        event_id: String,
+        resource: Option<myelin_agent::EffectResource>,
+        jti: String,
+    },
+    Gated {
+        gate_id: String,
+        jti: String,
+    },
+    Denied {
+        reason: String,
+        jti: String,
+    },
+    Indeterminate {
+        reason: String,
+        jti: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -244,9 +257,7 @@ fn audit_event_type(
         ("git.write_file", "applied") => Ok(myelin_git::events::GIT_WRITE_FILE_APPLIED),
         ("git.write_file", "gated") => Ok(myelin_git::events::GIT_WRITE_FILE_GATED),
         ("git.write_file", "denied") => Ok(myelin_git::events::GIT_WRITE_FILE_DENIED),
-        ("git.write_file", "indeterminate") => {
-            Ok(myelin_git::events::GIT_WRITE_FILE_INDETERMINATE)
-        }
+        ("git.write_file", "indeterminate") => Ok(myelin_git::events::GIT_WRITE_FILE_INDETERMINATE),
         ("git.submit_review", "attempted") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_ATTEMPTED),
         ("git.submit_review", "applied") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_APPLIED),
         ("git.submit_review", "gated") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_GATED),
@@ -272,9 +283,7 @@ fn audit_event_type(
         ("issues.create", "applied") => Ok(myelin_issues::events::ISSUE_CREATE_APPLIED),
         ("issues.create", "gated") => Ok(myelin_issues::events::ISSUE_CREATE_GATED),
         ("issues.create", "denied") => Ok(myelin_issues::events::ISSUE_CREATE_DENIED),
-        ("issues.create", "indeterminate") => {
-            Ok(myelin_issues::events::ISSUE_CREATE_INDETERMINATE)
-        }
+        ("issues.create", "indeterminate") => Ok(myelin_issues::events::ISSUE_CREATE_INDETERMINATE),
         _ => Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
     }
 }
@@ -731,6 +740,12 @@ impl GovernedRouter {
         {
             EffectResult::Applied(ev) => CallOutcome::Applied {
                 event_id: ev.0,
+                resource: None,
+                jti,
+            },
+            EffectResult::AppliedResource { event_id, resource } => CallOutcome::Applied {
+                event_id: event_id.0,
+                resource: Some(resource),
                 jti,
             },
             EffectResult::Gated(g) => CallOutcome::Gated { gate_id: g.0, jti },

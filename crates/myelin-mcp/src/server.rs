@@ -359,10 +359,21 @@ fn write_response(writer: &mut impl Write, response: &str) -> std::io::Result<()
 
 fn call_result_json(tool: &str, outcome: &CallOutcome) -> Value {
     let (text, is_error) = match outcome {
-        CallOutcome::Applied { event_id, .. } => (
-            format!("`{tool}` applied through EffectApi (event {event_id})."),
-            false,
-        ),
+        CallOutcome::Applied {
+            event_id, resource, ..
+        } => match resource {
+            Some(resource) => (
+                format!(
+                    "`{tool}` applied through EffectApi (event {event_id}); resource {}.",
+                    resource.artifact_ref.0
+                ),
+                false,
+            ),
+            None => (
+                format!("`{tool}` applied through EffectApi (event {event_id})."),
+                false,
+            ),
+        },
         CallOutcome::Gated { gate_id, .. } => (
             format!("`{tool}` is withheld pending HITL approval (gate {gate_id}); not applied."),
             false,
@@ -383,11 +394,25 @@ fn call_result_json(tool: &str, outcome: &CallOutcome) -> Value {
             meta["fatal"] = json!(true);
         }
     }
-    json!({
+    let mut result = json!({
         "content": [ { "type": "text", "text": text } ],
         "isError": is_error,
         "_meta": meta
-    })
+    });
+    if let CallOutcome::Applied {
+        event_id, resource, ..
+    } = outcome
+    {
+        result["structuredContent"] = match resource {
+            Some(resource) => json!({
+                "data": resource.data,
+                "ref": resource.artifact_ref.0,
+                "event_id": event_id,
+            }),
+            None => json!({ "event_id": event_id }),
+        };
+    }
+    result
 }
 
 fn read_result_json(tool: &str, jti: &str, result: Result<Value, DirectReadError>) -> Value {
@@ -456,6 +481,34 @@ mod tests {
         assert_eq!(v["result"]["protocolVersion"], json!(MCP_PROTOCOL_VERSION));
         assert!(v["result"]["capabilities"]["tools"].is_object());
         assert_eq!(v["result"]["serverInfo"]["name"], json!("myelin-mcp"));
+    }
+
+    #[test]
+    fn applied_resources_are_addressable_without_parsing_the_event_id() {
+        let result = call_result_json(
+            "issues.create",
+            &CallOutcome::Applied {
+                event_id: "issue.create:internal-event|run-1".into(),
+                resource: Some(myelin_agent::EffectResource::new(
+                    "myelin://acme/issue/issue/ENG-41",
+                    json!({ "id": "internal-id", "key": "ENG-41" }),
+                )),
+                jti: "run-token-jti".into(),
+            },
+        );
+
+        assert_eq!(
+            result["structuredContent"],
+            json!({
+                "data": { "id": "internal-id", "key": "ENG-41" },
+                "ref": "myelin://acme/issue/issue/ENG-41",
+                "event_id": "issue.create:internal-event|run-1",
+            })
+        );
+        assert_eq!(
+            result["_meta"]["eventId"],
+            "issue.create:internal-event|run-1"
+        );
     }
 
     #[test]

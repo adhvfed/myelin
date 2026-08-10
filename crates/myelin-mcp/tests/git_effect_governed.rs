@@ -323,6 +323,12 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
         .unwrap();
     let v: serde_json::Value = serde_json::from_str(&resp).unwrap();
     assert_eq!(v["result"]["isError"], false, "open_pr applied: {v}");
+    assert_eq!(
+        v["result"]["structuredContent"]["ref"],
+        "myelin://acme/git/pr/alpha:1"
+    );
+    assert_eq!(v["result"]["structuredContent"]["data"]["number"], 1);
+    assert_eq!(v["result"]["structuredContent"]["data"]["repo"], "alpha");
 
     let jti = v["result"]["_meta"]["runToken"].as_str().unwrap();
     let event_id = v["result"]["_meta"]["eventId"].as_str().unwrap();
@@ -408,6 +414,14 @@ fn agent_file_write_creates_a_branch_and_replays_from_git_provenance() {
     )
     .unwrap();
     assert_eq!(first["result"]["isError"], false, "{first}");
+    assert_eq!(
+        first["result"]["structuredContent"]["data"]["repo"],
+        "alpha"
+    );
+    assert_eq!(
+        first["result"]["structuredContent"]["data"]["ref"],
+        "agent/fix"
+    );
     let replay: serde_json::Value = serde_json::from_str(
         &server
             .handle_line(&call_with_key("git.write_file", args.clone(), "write-1"))
@@ -415,17 +429,17 @@ fn agent_file_write_creates_a_branch_and_replays_from_git_provenance() {
     )
     .unwrap();
     assert_eq!(
-        replay["result"]["_meta"]["eventId"],
-        first["result"]["_meta"]["eventId"],
+        replay["result"]["_meta"]["eventId"], first["result"]["_meta"]["eventId"],
         "a lost response replays the same durable commit"
     );
 
-    let event_id = first["result"]["_meta"]["eventId"].as_str().unwrap();
-    let commit_oid = event_id
-        .split_once("git.file.write:")
-        .and_then(|(_, tail)| tail.split_once('|'))
-        .map(|(oid, _)| oid)
-        .expect("event carries the written commit OID");
+    let commit_oid = first["result"]["structuredContent"]["data"]["commit_oid"]
+        .as_str()
+        .expect("structured receipt carries the written commit OID");
+    assert_eq!(
+        first["result"]["structuredContent"]["ref"],
+        format!("myelin://acme/git/commit/alpha:{commit_oid}")
+    );
     let detail = repo.commit_detail(commit_oid).unwrap().unwrap();
     assert_eq!(detail.meta.author_email, "agent:claude@acme.noreply");
     assert!(detail.message.contains("Myelin-Operation:"));

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use myelin_agent::{EffectApi, EffectAuthority, EffectResult, EventId, ProposedEffect, RunCtx};
+use myelin_agent::{
+    EffectApi, EffectAuthority, EffectResource, EffectResult, EventId, ProposedEffect, RunCtx,
+};
 use myelin_git::core::RepoLoc;
 use myelin_git::pg_pr_store::PrOperationId;
 use myelin_git::pr_store::MergeAttempt;
@@ -133,9 +135,17 @@ impl GitEffectApi {
                     operation_id,
                 };
                 match self.backend.write_file_with_operation(request) {
-                    Ok(commit_oid) => {
-                        applied(run, tool, &format!("git.file.write:{commit_oid}"))
-                    }
+                    Ok(commit_oid) => applied_resource(
+                        run,
+                        &format!("git.file.write:{commit_oid}"),
+                        format!("myelin://{t}/git/commit/{repo}:{commit_oid}"),
+                        serde_json::json!({
+                            "commit_oid": commit_oid,
+                            "repo": repo,
+                            "ref": gitref,
+                            "path": path,
+                        }),
+                    ),
                     Err(error) => EffectResult::Denied(error.to_string()),
                 }
             }
@@ -156,7 +166,18 @@ impl GitEffectApi {
                     &self.delegator,
                     operation_id,
                 ) {
-                    Ok(rec) => applied(run, tool, &format!("git.pr.open:#{}", rec.number)),
+                    Ok(rec) => applied_resource(
+                        run,
+                        &format!("git.pr.open:#{}", rec.number),
+                        format!("myelin://{t}/git/pr/{repo}:{}", rec.number),
+                        serde_json::json!({
+                            "number": rec.number,
+                            "repo": repo,
+                            "base_ref": rec.base_ref,
+                            "head_ref": rec.head_ref,
+                            "head_oid": rec.head_oid,
+                        }),
+                    ),
                     Err(e) => EffectResult::Denied(e.to_string()),
                 }
             }
@@ -326,6 +347,13 @@ fn mcp_operation_id(
 
 fn applied(run: &RunCtx, _tool: &str, action: &str) -> EffectResult {
     EffectResult::Applied(EventId(format!("{action}|{}", run.0)))
+}
+
+fn applied_resource(run: &RunCtx, action: &str, artifact_ref: String, data: Value) -> EffectResult {
+    EffectResult::AppliedResource {
+        event_id: EventId(format!("{action}|{}", run.0)),
+        resource: EffectResource::new(artifact_ref, data),
+    }
 }
 
 fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {

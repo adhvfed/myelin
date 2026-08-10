@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use myelin_agent::{EffectApi, EffectAuthority, EffectResult, EventId, ProposedEffect, RunCtx};
+use myelin_agent::{
+    EffectApi, EffectAuthority, EffectResource, EffectResult, EventId, ProposedEffect, RunCtx,
+};
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
 use myelin_storage::TenantScope;
@@ -84,10 +86,23 @@ impl IssueEffectApi {
             .issues
             .create_issue(&self.principal, &self.delegator, request, idempotency_key)
         {
-            Ok(outcome) => EffectResult::Applied(EventId(format!(
-                "issue.create:{}|{}",
-                outcome.receipt.id, run.0
-            ))),
+            Ok(outcome) => {
+                let receipt = outcome.receipt;
+                EffectResult::AppliedResource {
+                    event_id: EventId(format!("issue.create:{}|{}", receipt.id, run.0)),
+                    resource: EffectResource::new(
+                        format!(
+                            "myelin://{}/issue/issue/{}",
+                            self.principal.tenant.0, receipt.key
+                        ),
+                        serde_json::json!({
+                            "id": receipt.id,
+                            "key": receipt.key,
+                            "project_id": receipt.project_id,
+                        }),
+                    ),
+                }
+            }
             Err(error) => EffectResult::Denied(error.client_message()),
         }
     }

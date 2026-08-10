@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use myelin_agent::{EffectApi, EffectAuthority, EffectResult, EventId, ProposedEffect, RunCtx};
+use myelin_agent::{
+    EffectApi, EffectAuthority, EffectResource, EffectResult, EventId, ProposedEffect, RunCtx,
+};
 use myelin_identity::Principal;
 use myelin_identity_service::mint::RunTokenAuthorizer;
 use myelin_storage::TenantScope;
@@ -95,11 +97,24 @@ impl ChatEffectApi {
                     &references,
                     nonce,
                 ) {
-                    Ok(message_id) => EffectResult::Applied(EventId(format!(
-                        "chat.message.post:{}|{}",
-                        message_id.as_str(),
-                        run.0
-                    ))),
+                    Ok(message_id) => EffectResult::AppliedResource {
+                        event_id: EventId(format!(
+                            "chat.message.post:{}|{}",
+                            message_id.as_str(),
+                            run.0
+                        )),
+                        resource: EffectResource::new(
+                            format!(
+                                "myelin://{}/chat/message/{}",
+                                self.principal.tenant.0,
+                                message_id.as_str()
+                            ),
+                            serde_json::json!({
+                                "id": message_id.as_str(),
+                                "conversation_id": conversation_id,
+                            }),
+                        ),
+                    },
                     Err(error) => EffectResult::Denied(error.client_message()),
                 }
             }

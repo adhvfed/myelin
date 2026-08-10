@@ -261,12 +261,37 @@ pub struct ProposedEffect(pub String);
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventId(pub String);
 
+/// The primary resource produced or changed by an applied effect.
+///
+/// Effect adapters construct this from their authoritative write receipt.  Keeping it beside the
+/// event id means callers never need to decode an implementation-specific event name to address
+/// the resource in a later tool call.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectResource {
+    #[serde(rename = "ref")]
+    pub artifact_ref: myelin_events::ArtifactRef,
+    pub data: serde_json::Value,
+}
+
+impl EffectResource {
+    pub fn new(artifact_ref: impl Into<String>, data: serde_json::Value) -> Self {
+        Self {
+            artifact_ref: myelin_events::ArtifactRef(artifact_ref.into()),
+            data,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateId(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectResult {
     Applied(EventId),
+    AppliedResource {
+        event_id: EventId,
+        resource: EffectResource,
+    },
     Gated(GateId),
     Denied(String),
 }

@@ -384,7 +384,9 @@ pub fn persist_gate_decision(
 pub fn gate_id_of(result: &EffectResult) -> Option<GateId> {
     match result {
         EffectResult::Gated(g) => Some(g.clone()),
-        EffectResult::Applied(_) | EffectResult::Denied(_) => None,
+        EffectResult::Applied(_)
+        | EffectResult::AppliedResource { .. }
+        | EffectResult::Denied(_) => None,
     }
 }
 

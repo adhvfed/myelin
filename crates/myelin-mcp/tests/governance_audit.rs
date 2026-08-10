@@ -152,6 +152,7 @@ fn chat_post_governance_has_a_durable_registered_taxonomy() {
         .unwrap();
     let applied = CallOutcome::Applied {
         event_id: "chat.message.post:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+        resource: None,
         jti: "jti:chat-post".into(),
     };
     audit
@@ -205,6 +206,7 @@ fn issue_create_governance_has_a_durable_registered_taxonomy() {
         .unwrap();
     let applied = CallOutcome::Applied {
         event_id: "issue.create:11111111-1111-1111-1111-111111111111".into(),
+        resource: None,
         jti: "jti:issue-create".into(),
     };
     audit
