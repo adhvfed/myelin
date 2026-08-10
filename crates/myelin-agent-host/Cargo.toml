@@ -18,7 +18,9 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 serde_json.workspace = true
+serde.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
+uuid = "1"
 
 [dev-dependencies]
 myelin-agent-model = { path = "../myelin-agent-model", features = ["test-support"] }
@@ -28,3 +30,7 @@ myelin-identity-service = { path = "../myelin-identity-service", features = ["te
 myelin-config = { path = "../myelin-config" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
+
+[features]
+default = []
+integration = []

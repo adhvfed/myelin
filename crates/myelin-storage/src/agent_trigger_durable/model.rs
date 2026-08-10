@@ -117,6 +117,21 @@ pub struct ClaimedAgentTriggerFiring {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct StartedAgentTriggerRun {
+    pub binding_id: String,
+    pub event_id: String,
+    pub event_type: String,
+    pub event_envelope: serde_json::Value,
+    pub owner_principal_id: String,
+    pub run_as_agent_id: String,
+    pub runtime_ref: String,
+    pub selected_tools: Vec<String>,
+    pub task: String,
+    pub delegation_caveats: Vec<String>,
+    pub run_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentTriggerClaimRequest {
     pub runtime_ref: String,
     pub worker_id: String,

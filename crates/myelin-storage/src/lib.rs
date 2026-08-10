@@ -211,8 +211,8 @@ pub use agent_trigger_durable::{
     AgentTriggerStartRequest, ClaimedAgentTriggerFiring, CreateAgentTriggerBindingOutcome,
     DurableAgentTriggerBacking, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
     NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
-    StartAgentTriggerFiringOutcome, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
-    AGENT_TRIGGER_RLS_POLICY,
+    StartAgentTriggerFiringOutcome, StartedAgentTriggerRun, AGENT_TRIGGER_CLAIM_MIGRATION,
+    AGENT_TRIGGER_MIGRATION, AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION,
 };
 pub use delegation_policy_durable::{
     delegation_policy_durable_migrations, ensure_agent_policy_bundle_on_conn,

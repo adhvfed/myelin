@@ -18,6 +18,7 @@ pub mod git_tools;
 pub mod hitl;
 pub mod hitl_batch;
 pub mod holder;
+pub mod hosted_run_contract;
 pub mod identity;
 pub mod issues_agents;
 pub mod issues_read_tools;

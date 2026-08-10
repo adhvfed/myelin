@@ -100,11 +100,18 @@ CREATE INDEX IF NOT EXISTS agent_trigger_firing_claimable
     WHERE state IN ('queued', 'claimed');
 "#;
 
+pub const AGENT_TRIGGER_RUN_MIGRATION: &str = r#"
+CREATE UNIQUE INDEX IF NOT EXISTS agent_trigger_firing_run
+    ON agent_trigger_firing (tenant_id, region, run_id)
+    WHERE run_id IS NOT NULL;
+"#;
+
 pub fn agent_trigger_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0090_agent_trigger", AGENT_TRIGGER_MIGRATION),
         Migration::plain("0091_agent_trigger_rls", AGENT_TRIGGER_RLS_POLICY),
         Migration::plain("0092_agent_trigger_claim", AGENT_TRIGGER_CLAIM_MIGRATION),
+        Migration::plain("0093_agent_trigger_run", AGENT_TRIGGER_RUN_MIGRATION),
     ])
 }
 
@@ -122,6 +129,7 @@ mod tests {
         assert!(AGENT_TRIGGER_MIGRATION.contains("firings_used BETWEEN 0 AND max_firings"));
         assert!(AGENT_TRIGGER_CLAIM_MIGRATION.contains("state IN ('queued', 'claimed')"));
         assert!(AGENT_TRIGGER_CLAIM_MIGRATION.contains("claim_until"));
+        assert!(AGENT_TRIGGER_RUN_MIGRATION.contains("UNIQUE INDEX"));
         assert_eq!(
             AGENT_TRIGGER_RLS_POLICY
                 .matches("FORCE ROW LEVEL SECURITY")

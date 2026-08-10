@@ -8,7 +8,9 @@ pub use git_read_tool::{
 
 pub mod identity;
 pub use identity::timestamp_from_epoch;
+pub mod workflow;
 use identity::{IdentityRunMinter, IdentityRunRevoker};
+pub use workflow::{HostedAgentInputResolver, HostedAgentWorkflowInput};
 
 use myelin_agent::{
     MeteredRuntime, ToolCall, ToolDef, ToolName, ToolResult, ToolSchema, ToolSurface,
