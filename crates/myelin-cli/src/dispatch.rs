@@ -9,6 +9,7 @@ mod automations;
 mod chat;
 mod issues;
 mod knowledge;
+mod privacy;
 mod projects;
 mod refs;
 mod tools;
@@ -18,6 +19,7 @@ pub use automations::{automation_dispatch, is_canonical_automation_id};
 pub use chat::chat_dispatch;
 pub use issues::{issues_dispatch, issues_dispatch_with_context, issues_dispatch_with_project};
 pub use knowledge::knowledge_dispatch;
+pub use privacy::privacy_dispatch;
 pub use projects::{is_canonical_project_id, project_dispatch};
 pub use refs::refs_dispatch;
 pub use tools::{is_canonical_tool_cursor, tool_dispatch};
@@ -137,7 +139,7 @@ impl EdgeCall {
         }
     }
 
-    fn post_read_json(path: impl Into<String>, payload: serde_json::Value) -> EdgeCall {
+    fn post_retry_safe_json(path: impl Into<String>, payload: serde_json::Value) -> EdgeCall {
         EdgeCall {
             method: HttpMethod::Post,
             path: path.into(),

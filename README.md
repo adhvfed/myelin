@@ -135,6 +135,10 @@ myelin agent approve gate:0123456789abcdef0123456789abcdef \
 myelin agent reject gate:fedcba9876543210fedcba9876543210 \
   --idempotency-key reject-exact-merge
 
+# Inspect the agent data held for the signed-in person, then erase that narrow scope:
+myelin privacy agent-data status
+myelin privacy agent-data erase --confirm
+
 myelin repo list
 myelin repo pr list
 myelin project create "Developer experience" --prefix DX --idempotency-key developer-experience
@@ -199,9 +203,13 @@ with approve and reject actions in the web app and a copyable CLI command; eithe
 durable and retry-safe, completes the inbox item, and remains visible in automation history. No
 third-party integration key is created or copied into the agent.
 
-The durable trace store is also the H17 personal-data holder. Subject restriction blocks new trace
-processing before encryption; subject erasure records a durable suppression marker, deletes every
-live trace row, and destroys the subject key so ciphertext in backups remains unrecoverable.
+The durable trace store is also the H17 personal-data holder. A signed-in person can inspect this
+narrow agent-data scope and irreversibly erase their own traces, model replay steps, and tool-effect
+journals through Edge or `myelin privacy agent-data`. Erasure records a durable suppression marker,
+deletes every live record, destroys the subject key so ciphertext in backups remains unrecoverable,
+and permanently blocks later agent processing for that person. This self-service operation is not
+presented as full account or organization erasure; other personal-data holders remain outside its
+explicit scope.
 
 Sensitive effects such as `git.merge` have a second, narrower approval boundary. The agent may
 reason up to the effect, but Myelin withholds the mutation, parks the durable workflow without

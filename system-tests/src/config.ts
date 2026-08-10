@@ -21,11 +21,13 @@ export interface SystemTestConfig {
   edgeUrl: string;
   token: string;
   reviewerToken: string;
+  privacyToken: string;
   tokenScheme: string;
   tenant: string;
   region: string;
   principal: string;
   reviewerPrincipal: string;
+  privacyPrincipal: string;
   natsUrl: string;
   runId: string;
   issues: {
@@ -39,11 +41,13 @@ export const systemTestConfig: SystemTestConfig = Object.freeze({
   edgeUrl: url("MYELIN_SYSTEM_TEST_EDGE_URL"),
   token: required("MYELIN_SYSTEM_TEST_TOKEN"),
   reviewerToken: required("MYELIN_SYSTEM_TEST_REVIEWER_TOKEN"),
+  privacyToken: required("MYELIN_SYSTEM_TEST_PRIVACY_TOKEN"),
   tokenScheme: process.env.MYELIN_SYSTEM_TEST_TOKEN_SCHEME?.trim() || "agent",
   tenant: required("MYELIN_SYSTEM_TEST_TENANT"),
   region: process.env.MYELIN_SYSTEM_TEST_REGION?.trim() || "fr-par",
   principal: required("MYELIN_SYSTEM_TEST_PRINCIPAL"),
   reviewerPrincipal: required("MYELIN_SYSTEM_TEST_REVIEWER_PRINCIPAL"),
+  privacyPrincipal: required("MYELIN_SYSTEM_TEST_PRIVACY_PRINCIPAL"),
   natsUrl: url("NATS_URL"),
   runId: process.env.MYELIN_SYSTEM_TEST_RUN_ID?.trim() || randomUUID(),
   issues: Object.freeze({

@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 mod agent;
 mod automation;
 mod collaboration;
+mod privacy;
 mod project;
 mod refs;
 mod tool;
@@ -52,6 +53,9 @@ fn render_with_call(value: &Value, json_mode: bool, call: Option<&EdgeCall>) -> 
     }
     if is_ci_run_detail(value) {
         return render_ci_run_detail(value);
+    }
+    if let Some(rendered) = privacy::render_response(value) {
+        return rendered;
     }
     if let Some(rendered) = agent::render_response(value) {
         return rendered;

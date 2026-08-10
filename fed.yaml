@@ -433,6 +433,14 @@ scripts:
       --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
       test -n "$reviewer_token";
       export MYELIN_SYSTEM_TEST_REVIEWER_TOKEN="$reviewer_token";
+      privacy_principal="privacy-system-test-$(date +%s)-$$";
+      export MYELIN_SYSTEM_TEST_PRIVACY_PRINCIPAL="$privacy_principal";
+      privacy_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
+      --tenant "$MYELIN_SYSTEM_TEST_TENANT" --region "$MYELIN_SYSTEM_TEST_REGION"
+      --principal "$privacy_principal" --display-name "Privacy System Test"
+      --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
+      test -n "$privacy_token";
+      export MYELIN_SYSTEM_TEST_PRIVACY_TOKEN="$privacy_token";
       pnpm --dir system-tests install --frozen-lockfile;
       pnpm --dir system-tests exec vitest run "$@"' -- "$@"
 

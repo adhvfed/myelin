@@ -9,6 +9,11 @@ export const reviewerClient = new SystemTestClient({
   ...systemTestConfig,
   token: systemTestConfig.reviewerToken,
 });
+export const privacyClient = new SystemTestClient({
+  ...systemTestConfig,
+  token: systemTestConfig.privacyToken,
+  principal: systemTestConfig.privacyPrincipal,
+});
 
 export async function browserApprovedCliClient(
   approver: SystemTestClient = systemClient,

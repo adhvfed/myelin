@@ -170,7 +170,7 @@ fn command_to_call(
                 ImportMode::Run { .. } => format!("/v1/issues/imports/{job_id}/run"),
             };
             match mode {
-                ImportMode::DryRun => EdgeCall::post_read_json(path, payload),
+                ImportMode::DryRun => EdgeCall::post_retry_safe_json(path, payload),
                 ImportMode::Run { .. } => EdgeCall::post_json(path, payload),
             }
         }
