@@ -16,8 +16,8 @@ use myelin_identity_service::{
 };
 use myelin_mcp::{
     git_merge_repo_from_effect_key, AuditPhase, GateApproverPolicy, GateAuditMinter,
-    GovernanceAudit, GovernanceAuditRecord, GovernedRouter, GovernedRun, McpServer,
-    OutboxGovernanceAudit, ToolRegistry, MAX_FRAME_BYTES,
+    GovernanceAudit, GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter, GovernedRun,
+    McpServer, OutboxGovernanceAudit, ToolRegistry, MAX_FRAME_BYTES,
 };
 use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_notif::{agent_effect_approval_targets, pending_agent_effect_approval};
@@ -262,7 +262,7 @@ impl AgentMcpServices {
                 scope: ctx.scope,
                 actor: ctx.principal,
                 run_id: &RunId(gate.run_id.clone()),
-                gate_id: Some(&gate.gate_id),
+                target: GovernanceAuditTarget::Gate(&gate.gate_id),
                 tool,
                 jti: &format!("human-decision:{}", gate.gate_id),
                 phase,

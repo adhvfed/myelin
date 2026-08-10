@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub mod events;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Conversation {
     pub system: SystemContext,

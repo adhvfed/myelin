@@ -224,6 +224,18 @@ mod tests {
             registry.resolve("git.open_pr").unwrap().required_caps(),
             ["repo.push"]
         );
+
+        let read_names = registry
+            .tools()
+            .iter()
+            .filter(|tool| tool.effect_kind() == EffectKind::Read)
+            .map(RegisteredTool::name)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            read_names,
+            crate::governance::GOVERNED_DIRECT_READ_TOOLS,
+            "adding a direct read also requires a durable governance-audit route"
+        );
     }
 
     #[test]

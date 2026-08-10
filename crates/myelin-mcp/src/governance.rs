@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use myelin_agent::{EffectApi, EffectAuthority, EffectResult, ProposedEffect, RunCtx};
+use myelin_agent::{EffectApi, EffectAuthority, EffectKind, EffectResult, ProposedEffect, RunCtx};
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EventDraft, EventType, IdMinter,
     OutboxStore, OutboxTx, Timestamp, Ulid, Visibility,
@@ -96,6 +96,7 @@ pub struct ReadAuthorization {
     run_token: RunToken,
     tool: String,
     required_caps: Vec<String>,
+    resource_ref: Option<ArtifactRef>,
 }
 
 impl ReadAuthorization {
@@ -114,6 +115,41 @@ impl ReadAuthorization {
     pub fn required_caps(&self) -> &[String] {
         &self.required_caps
     }
+
+    pub fn resource_ref(&self) -> Option<&ArtifactRef> {
+        self.resource_ref.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadRefusalCategory {
+    Authorization,
+    InvalidInput,
+    NotFound,
+    Unavailable,
+}
+
+impl ReadRefusalCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Authorization => "authorization",
+            Self::InvalidInput => "invalid_request",
+            Self::NotFound => "not_found",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadAuditOutcome {
+    Succeeded,
+    Refused(ReadRefusalCategory),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernanceAuditOutcome<'a> {
+    Effect(&'a CallOutcome),
+    Read(ReadAuditOutcome),
 }
 
 impl CallOutcome {
@@ -176,12 +212,19 @@ pub struct GovernanceAuditRecord<'a> {
     pub scope: &'a TenantScope,
     pub actor: &'a Principal,
     pub run_id: &'a RunId,
-    pub gate_id: Option<&'a str>,
+    pub target: GovernanceAuditTarget<'a>,
     pub tool: &'a str,
     pub jti: &'a str,
     pub phase: AuditPhase,
-    pub outcome: Option<&'a CallOutcome>,
+    pub outcome: Option<GovernanceAuditOutcome<'a>>,
     pub now: &'a Timestamp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GovernanceAuditTarget<'a> {
+    Run,
+    Gate(&'a str),
+    Resource(&'a ArtifactRef),
 }
 
 pub trait GovernanceAudit: Send + Sync {
@@ -205,7 +248,7 @@ impl GovernanceAudit for OutboxGovernanceAudit {
             scope,
             actor,
             run_id,
-            gate_id,
+            target,
             tool,
             jti,
             phase,
@@ -214,34 +257,56 @@ impl GovernanceAudit for OutboxGovernanceAudit {
         } = record;
         let event_type = audit_event_type(tool, phase, outcome)?;
         let run_ref = format!("myelin://{}/agent/run/{}", scope.tenant().0, run_id.0);
-        let gate_ref =
-            gate_id.map(|gate_id| format!("{run_ref}:hitl-gate:{}", gate_ref_token(gate_id)));
-        let subject_ref = gate_ref.clone().unwrap_or_else(|| run_ref.clone());
+        let (subject_ref, gate_ref, resource_ref) = match target {
+            GovernanceAuditTarget::Run => (run_ref.clone(), None, None),
+            GovernanceAuditTarget::Gate(gate_id) => {
+                let gate_ref = format!("{run_ref}:hitl-gate:{}", gate_ref_token(gate_id));
+                (gate_ref.clone(), Some(gate_ref), None)
+            }
+            GovernanceAuditTarget::Resource(resource_ref) => {
+                (resource_ref.0.clone(), None, Some(resource_ref))
+            }
+        };
         let mut payload = serde_json::json!({
             "run_ref": run_ref,
             "token_ref": format!("jti:{jti}"),
+            "tool": tool,
         });
         if let Some(gate_ref) = gate_ref {
             payload["gate_ref"] = serde_json::Value::String(gate_ref);
         }
+        if let Some(resource_ref) = resource_ref {
+            payload["resource_ref"] = serde_json::Value::String(resource_ref.0.clone());
+        }
         if let Some(outcome) = outcome {
             payload["outcome"] = match outcome {
-                CallOutcome::Applied {
+                GovernanceAuditOutcome::Effect(CallOutcome::Applied {
                     event_id, resource, ..
-                } => serde_json::json!({
+                }) => serde_json::json!({
                     "kind": "applied",
                     "event_id": event_id,
                     "resource_ref": resource.as_ref().map(|resource| &resource.artifact_ref.0),
                 }),
-                CallOutcome::Gated { gate_id, .. } => {
+                GovernanceAuditOutcome::Effect(CallOutcome::Gated { gate_id, .. }) => {
                     serde_json::json!({ "kind": "gated", "gate_id": gate_id })
                 }
-                CallOutcome::Denied { reason, .. } => serde_json::json!({
-                    "kind": "denied",
-                    "reason_category": denial_reason_category(reason),
-                }),
-                CallOutcome::Indeterminate { .. } => {
+                GovernanceAuditOutcome::Effect(CallOutcome::Denied { reason, .. }) => {
+                    serde_json::json!({
+                        "kind": "denied",
+                        "reason_category": denial_reason_category(reason),
+                    })
+                }
+                GovernanceAuditOutcome::Effect(CallOutcome::Indeterminate { .. }) => {
                     serde_json::json!({ "kind": "indeterminate" })
+                }
+                GovernanceAuditOutcome::Read(ReadAuditOutcome::Succeeded) => {
+                    serde_json::json!({ "kind": "succeeded" })
+                }
+                GovernanceAuditOutcome::Read(ReadAuditOutcome::Refused(category)) => {
+                    serde_json::json!({
+                        "kind": "denied",
+                        "reason_category": category.as_str(),
+                    })
                 }
             };
         }
@@ -306,14 +371,38 @@ fn denial_reason_category(reason: &str) -> &'static str {
 fn audit_event_type(
     tool: &str,
     phase: AuditPhase,
-    outcome: Option<&CallOutcome>,
+    outcome: Option<GovernanceAuditOutcome<'_>>,
 ) -> Result<&'static str, String> {
+    if GOVERNED_DIRECT_READ_TOOLS.contains(&tool) {
+        return match (phase, outcome) {
+            (AuditPhase::Attempt, None) => Ok(myelin_agent::events::AGENT_TOOL_READ_ATTEMPTED),
+            (
+                AuditPhase::Outcome,
+                Some(GovernanceAuditOutcome::Read(ReadAuditOutcome::Succeeded)),
+            ) => Ok(myelin_agent::events::AGENT_TOOL_READ_SUCCEEDED),
+            (
+                AuditPhase::Outcome,
+                Some(GovernanceAuditOutcome::Read(ReadAuditOutcome::Refused(_))),
+            ) => Ok(myelin_agent::events::AGENT_TOOL_READ_DENIED),
+            _ => Err("invalid governed read audit phase/outcome pairing".into()),
+        };
+    }
     let suffix = match (phase, outcome) {
         (AuditPhase::Attempt, None) => "attempted",
-        (AuditPhase::Outcome, Some(CallOutcome::Applied { .. })) => "applied",
-        (AuditPhase::Outcome, Some(CallOutcome::Gated { .. })) => "gated",
-        (AuditPhase::Outcome, Some(CallOutcome::Denied { .. })) => "denied",
-        (AuditPhase::Outcome, Some(CallOutcome::Indeterminate { .. })) => "indeterminate",
+        (
+            AuditPhase::Outcome,
+            Some(GovernanceAuditOutcome::Effect(CallOutcome::Applied { .. })),
+        ) => "applied",
+        (AuditPhase::Outcome, Some(GovernanceAuditOutcome::Effect(CallOutcome::Gated { .. }))) => {
+            "gated"
+        }
+        (AuditPhase::Outcome, Some(GovernanceAuditOutcome::Effect(CallOutcome::Denied { .. }))) => {
+            "denied"
+        }
+        (
+            AuditPhase::Outcome,
+            Some(GovernanceAuditOutcome::Effect(CallOutcome::Indeterminate { .. })),
+        ) => "indeterminate",
         (AuditPhase::Approved, None) => "approved",
         (AuditPhase::Rejected, None) => "rejected",
         (AuditPhase::Expired, None) => "expired",
@@ -366,6 +455,44 @@ fn audit_event_type(
         ("issues.create", "indeterminate") => Ok(myelin_issues::events::ISSUE_CREATE_INDETERMINATE),
         _ => Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
     }
+}
+
+pub const GOVERNED_DIRECT_READ_TOOLS: &[&str] = &[
+    "chat.list_conversations",
+    "chat.read_messages",
+    "ci.read_log",
+    "ci.read_run",
+    "git.list_repositories",
+    "git.read_file",
+    "git.search_code",
+    "issues.list",
+    "issues.view",
+    "knowledge.list_pages",
+    "knowledge.read_page",
+];
+
+fn read_resource_ref(
+    scope: &TenantScope,
+    tool: &str,
+    args: &serde_json::Value,
+) -> Option<ArtifactRef> {
+    let (subsystem, resource_type, id) = match tool {
+        "ci.read_run" | "ci.read_log" => ("ci", "run", args.get("run_id")?.as_str()?),
+        "git.read_file" => ("git", "repo", args.get("repo")?.as_str()?),
+        "git.search_code" => ("git", "repo", args.get("repo")?.as_str()?),
+        "issues.view" => ("issue", "issue", args.get("issue_id")?.as_str()?),
+        "knowledge.read_page" => ("knowledge", "page", args.get("page_id")?.as_str()?),
+        "chat.read_messages" => ("chat", "channel", args.get("conversation_id")?.as_str()?),
+        _ => return None,
+    };
+    Some(ArtifactRef(format!(
+        "myelin://{}/{subsystem}/{resource_type}/{id}",
+        scope.tenant().0
+    )))
+}
+
+fn read_audit_target(resource_ref: Option<&ArtifactRef>) -> GovernanceAuditTarget<'_> {
+    resource_ref.map_or(GovernanceAuditTarget::Run, GovernanceAuditTarget::Resource)
 }
 
 #[derive(Default)]
@@ -574,30 +701,98 @@ impl GovernedRouter {
         args: &serde_json::Value,
         now: &Timestamp,
     ) -> Result<ReadAuthorization, CallOutcome> {
-        if tool.effect_kind() != myelin_agent::EffectKind::Read || tool.side_effecting() {
-            return Err(CallOutcome::Denied {
-                reason: format!(
-                    "tool `{}` is not a non-side-effecting direct read",
-                    tool.name()
-                ),
-                jti: "<unminted>".into(),
-            });
+        let resource_ref = read_resource_ref(&self.principal.scope, tool.name(), args);
+        if tool.effect_kind() != EffectKind::Read
+            || tool.side_effecting()
+            || !GOVERNED_DIRECT_READ_TOOLS.contains(&tool.name())
+        {
+            return Err(self.push_local_audit(
+                tool.name(),
+                CallOutcome::Denied {
+                    reason: format!(
+                        "tool `{}` is not a registered non-side-effecting direct read",
+                        tool.name()
+                    ),
+                    jti: "<unminted>".into(),
+                },
+            ));
         }
-        self.authorize_declared_tool(tool, now)
-            .and_then(|token| match self.authorize_resource_scope(tool, args) {
-                Ok(()) => Ok(token),
-                Err(reason) => Err((reason, token.jti.clone())),
+        let run_token = match self.authorize_declared_tool(tool, now) {
+            Ok(token) => token,
+            Err((reason, jti)) => {
+                return Err(self.record_read_refusal(
+                    tool.name(),
+                    resource_ref.as_ref(),
+                    CallOutcome::Denied { reason, jti },
+                    ReadRefusalCategory::Authorization,
+                    now,
+                ))
+            }
+        };
+        if let Err(reason) = self.authorize_resource_scope(tool, args) {
+            return Err(self.record_read_refusal(
+                tool.name(),
+                resource_ref.as_ref(),
+                CallOutcome::Denied {
+                    reason,
+                    jti: run_token.jti.clone(),
+                },
+                ReadRefusalCategory::Authorization,
+                now,
+            ));
+        }
+        if self
+            .audit_sink
+            .record(GovernanceAuditRecord {
+                scope: &self.principal.scope,
+                actor: &self.principal.agent,
+                run_id: &self.principal.run_id,
+                target: read_audit_target(resource_ref.as_ref()),
+                tool: tool.name(),
+                jti: &run_token.jti,
+                phase: AuditPhase::Attempt,
+                outcome: None,
+                now,
             })
-            .map(|run_token| ReadAuthorization {
-                run_token,
-                tool: tool.name().to_string(),
-                required_caps: tool
-                    .required_caps()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-            })
-            .map_err(|(reason, jti)| CallOutcome::Denied { reason, jti })
+            .is_err()
+        {
+            return Err(self.push_local_audit(
+                tool.name(),
+                CallOutcome::Denied {
+                    reason: "durable pre-read audit is unavailable; read withheld".into(),
+                    jti: run_token.jti.clone(),
+                },
+            ));
+        }
+        Ok(ReadAuthorization {
+            run_token,
+            tool: tool.name().to_string(),
+            required_caps: tool
+                .required_caps()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            resource_ref,
+        })
+    }
+
+    pub fn complete_read(
+        &self,
+        authorization: &ReadAuthorization,
+        outcome: ReadAuditOutcome,
+        now: &Timestamp,
+    ) -> Result<(), String> {
+        self.audit_sink.record(GovernanceAuditRecord {
+            scope: &self.principal.scope,
+            actor: &self.principal.agent,
+            run_id: &self.principal.run_id,
+            target: read_audit_target(authorization.resource_ref()),
+            tool: authorization.tool(),
+            jti: authorization.jti(),
+            phase: AuditPhase::Outcome,
+            outcome: Some(GovernanceAuditOutcome::Read(outcome)),
+            now,
+        })
     }
 
     fn authorize_declared_tool(
@@ -750,7 +945,7 @@ impl GovernedRouter {
                                 scope: &self.principal.scope,
                                 actor: &self.principal.agent,
                                 run_id: &self.principal.run_id,
-                                gate_id: None,
+                                target: GovernanceAuditTarget::Run,
                                 tool: tool.name(),
                                 jti: &jti,
                                 phase: AuditPhase::Attempt,
@@ -857,7 +1052,7 @@ impl GovernedRouter {
                 scope: &self.principal.scope,
                 actor: &self.principal.agent,
                 run_id: &self.principal.run_id,
-                gate_id: None,
+                target: GovernanceAuditTarget::Run,
                 tool: tool.name(),
                 jti: &jti,
                 phase: AuditPhase::Attempt,
@@ -1026,7 +1221,7 @@ impl GovernedRouter {
                 scope: &self.principal.scope,
                 actor: &actor,
                 run_id: &run_id,
-                gate_id: Some(&gate.gate_id),
+                target: GovernanceAuditTarget::Gate(&gate.gate_id),
                 tool,
                 jti: "system:hitl-expiry",
                 phase: AuditPhase::Expired,
@@ -1042,16 +1237,46 @@ impl GovernedRouter {
             scope: &self.principal.scope,
             actor: &self.principal.agent,
             run_id: &self.principal.run_id,
-            gate_id: None,
+            target: GovernanceAuditTarget::Run,
             tool,
             jti: outcome.jti(),
             phase: AuditPhase::Outcome,
-            outcome: Some(&outcome),
+            outcome: Some(GovernanceAuditOutcome::Effect(&outcome)),
             now,
         }) {
             Ok(()) => outcome,
             Err(_) => CallOutcome::Denied {
                 reason: "durable governance audit is unavailable; no effect was attempted".into(),
+                jti: outcome.jti().to_string(),
+            },
+        };
+        self.push_local_audit(tool, recorded)
+    }
+
+    fn record_read_refusal(
+        &self,
+        tool: &str,
+        resource_ref: Option<&ArtifactRef>,
+        outcome: CallOutcome,
+        category: ReadRefusalCategory,
+        now: &Timestamp,
+    ) -> CallOutcome {
+        let recorded = match self.audit_sink.record(GovernanceAuditRecord {
+            scope: &self.principal.scope,
+            actor: &self.principal.agent,
+            run_id: &self.principal.run_id,
+            target: read_audit_target(resource_ref),
+            tool,
+            jti: outcome.jti(),
+            phase: AuditPhase::Outcome,
+            outcome: Some(GovernanceAuditOutcome::Read(ReadAuditOutcome::Refused(
+                category,
+            ))),
+            now,
+        }) {
+            Ok(()) => outcome,
+            Err(_) => CallOutcome::Denied {
+                reason: "durable governance audit is unavailable; read denied".into(),
                 jti: outcome.jti().to_string(),
             },
         };
@@ -1068,11 +1293,11 @@ impl GovernedRouter {
             scope: &self.principal.scope,
             actor: &self.principal.agent,
             run_id: &self.principal.run_id,
-            gate_id: None,
+            target: GovernanceAuditTarget::Run,
             tool,
             jti: outcome.jti(),
             phase: AuditPhase::Outcome,
-            outcome: Some(&outcome),
+            outcome: Some(GovernanceAuditOutcome::Effect(&outcome)),
             now,
         }) {
             Ok(()) => outcome,

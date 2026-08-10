@@ -13,7 +13,7 @@ use myelin_flow::WfJournal;
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RunId};
 use myelin_mcp::{
     git_merge_repo_from_effect_key, AuditPhase, GateAuditMinter, GovernanceAudit,
-    GovernanceAuditRecord, OutboxGovernanceAudit,
+    GovernanceAuditRecord, GovernanceAuditTarget, OutboxGovernanceAudit,
 };
 use myelin_notif::agent_effect_approval_targets;
 use myelin_notif::pg_inbox::PgInboxStore;
@@ -240,7 +240,7 @@ impl AgentHostActivityExecutor {
             scope: &scope,
             actor: &actor,
             run_id: &RunId(gate.run_id.clone()),
-            gate_id: Some(&gate.gate_id),
+            target: GovernanceAuditTarget::Gate(&gate.gate_id),
             tool,
             jti: "system:hitl-expiry",
             phase: AuditPhase::Expired,
@@ -351,6 +351,22 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
     }
 }
 
+fn delegation_capability_ceiling(caveats: &[String]) -> Option<BTreeSet<&str>> {
+    let capabilities = caveats
+        .iter()
+        .map(String::as_str)
+        .filter(|caveat| {
+            !caveat.starts_with("run:")
+                && !caveat.starts_with("tenant:")
+                && !caveat.starts_with("delegated:")
+                && caveat
+                    .strip_prefix("repo:")
+                    .is_none_or(|repository| repository.contains('#'))
+        })
+        .collect::<BTreeSet<_>>();
+    (!capabilities.is_empty()).then_some(capabilities)
+}
+
 #[cfg(test)]
 mod tests {
     use myelin_agent::{ToolName, ToolSurface};
@@ -400,20 +416,4 @@ mod tests {
             .is_some());
         assert!(catalogue.resolve(&ToolName("ci.read_run".into())).is_none());
     }
-}
-
-fn delegation_capability_ceiling(caveats: &[String]) -> Option<BTreeSet<&str>> {
-    let capabilities = caveats
-        .iter()
-        .map(String::as_str)
-        .filter(|caveat| {
-            !caveat.starts_with("run:")
-                && !caveat.starts_with("tenant:")
-                && !caveat.starts_with("delegated:")
-                && caveat
-                    .strip_prefix("repo:")
-                    .is_none_or(|repository| repository.contains('#'))
-        })
-        .collect::<BTreeSet<_>>();
-    (!capabilities.is_empty()).then_some(capabilities)
 }

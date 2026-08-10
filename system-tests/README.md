@@ -52,6 +52,9 @@ The suite is intentionally organized around externally visible contracts:
   them without exposing either secret, configures and operates external and hosted agents plus
   event-driven automations without integration keys, binds native Git to exactly one profile,
   refuses an expired session before transport, and removes both OS-backed credentials on logout.
+- `automation-delegation` proves automation caveats are enforceable authority and that a
+  short-lived agent can use its founder's repository visibility only through an audited MCP read,
+  never by impersonating the founder at an ordinary product endpoint.
 - `ci-lifecycle` proves that a Git push crosses the outbox/NATS/dispatcher boundary and appears as
   one queued run. Fed disables the local sandbox runner, so this suite does not claim job execution.
 - `notification-lifecycle` publishes through the external JetStream boundary and verifies durable,

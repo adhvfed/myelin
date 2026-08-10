@@ -1,23 +1,46 @@
 use myelin_identity::{Principal, PrincipalKind, PrincipalStatus};
 
+pub(crate) struct ActiveDelegation<'a> {
+    actor: &'a Principal,
+    access_subject: &'a Principal,
+}
+
+impl<'a> ActiveDelegation<'a> {
+    pub(crate) fn establish(actor: &'a Principal, access_subject: &'a Principal) -> Option<Self> {
+        (actor.tenant == access_subject.tenant
+            && actor.region == access_subject.region
+            && actor.status == PrincipalStatus::Active
+            && access_subject.status == PrincipalStatus::Active
+            && matches!(&access_subject.kind, PrincipalKind::Human)
+            && matches!(
+                &actor.kind,
+                PrincipalKind::Agent {
+                    on_behalf_of: Some(id),
+                    ..
+                } if id == &access_subject.principal_id
+            ))
+        .then_some(Self {
+            actor,
+            access_subject,
+        })
+    }
+
+    pub(crate) fn actor(&self) -> &Principal {
+        self.actor
+    }
+
+    pub(crate) fn access_subject(&self) -> &Principal {
+        self.access_subject
+    }
+}
+
 /// The resource-side half of agent authority.
 ///
 /// A run token proves the agent's attenuated capability set. Resource authorization is evaluated
 /// against the still-active human named by the durable `on_behalf_of` binding; both conjuncts are
 /// required at the final boundary.
 pub(crate) fn is_active_delegation(agent: &Principal, delegator: &Principal) -> bool {
-    agent.tenant == delegator.tenant
-        && agent.region == delegator.region
-        && agent.status == PrincipalStatus::Active
-        && delegator.status == PrincipalStatus::Active
-        && matches!(&delegator.kind, PrincipalKind::Human)
-        && matches!(
-            &agent.kind,
-            PrincipalKind::Agent {
-                on_behalf_of: Some(id),
-                ..
-            } if id == &delegator.principal_id
-        )
+    ActiveDelegation::establish(agent, delegator).is_some()
 }
 
 #[cfg(test)]

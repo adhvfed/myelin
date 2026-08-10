@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
-use crate::governance::{CallOutcome, GovernedRouter, ReadAuthorization};
+use crate::governance::{
+    CallOutcome, GovernedRouter, ReadAuditOutcome, ReadAuthorization, ReadRefusalCategory,
+};
 use crate::protocol::{
     error_response, parse_request, success, RpcError, AUTHORIZATION_REFUSED, GOVERNANCE_NOT_WIRED,
     INVALID_PARAMS, INVALID_REQUEST, METHOD_NOT_FOUND,
@@ -251,8 +253,15 @@ impl McpServer {
                     Ok(authorization) => authorization,
                     Err(outcome) => return Ok(call_result_json(name, &outcome)),
                 };
-                let result =
+                let mut result =
                     executor.execute(&router.principal().agent, &authorization, name, &args);
+                let audit_outcome = read_audit_outcome(&result);
+                if router
+                    .complete_read(&authorization, audit_outcome, &(self.clock)())
+                    .is_err()
+                {
+                    result = Err(DirectReadError::Unavailable);
+                }
                 return Ok(read_result_json(name, authorization.jti(), result));
             }
             EffectKind::Compute => {
@@ -449,6 +458,22 @@ fn read_result_json(tool: &str, jti: &str, result: Result<Value, DirectReadError
         "isError": is_error,
         "_meta": meta
     })
+}
+
+fn read_audit_outcome(result: &Result<Value, DirectReadError>) -> ReadAuditOutcome {
+    match result {
+        Ok(_) => ReadAuditOutcome::Succeeded,
+        Err(DirectReadError::InvalidInput(_)) => {
+            ReadAuditOutcome::Refused(ReadRefusalCategory::InvalidInput)
+        }
+        Err(DirectReadError::Denied) => {
+            ReadAuditOutcome::Refused(ReadRefusalCategory::Authorization)
+        }
+        Err(DirectReadError::NotFound) => ReadAuditOutcome::Refused(ReadRefusalCategory::NotFound),
+        Err(DirectReadError::Unavailable) => {
+            ReadAuditOutcome::Refused(ReadRefusalCategory::Unavailable)
+        }
+    }
 }
 
 fn write_value(v: &Value) -> String {

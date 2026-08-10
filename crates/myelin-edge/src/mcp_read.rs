@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::agent_delegation::is_active_delegation;
+use crate::agent_delegation::ActiveDelegation;
 use crate::DurableGitBackend;
 
 pub struct McpReadExecutor {
@@ -24,14 +24,14 @@ pub struct McpReadExecutor {
     chat: Option<DurableChatReadApi>,
     git: Option<Arc<DurableGitBackend>>,
     authority: Arc<RunTokenAuthorizer>,
-    delegator: Principal,
+    access_subject: Principal,
 }
 
 impl McpReadExecutor {
     pub fn new(
         ci: DurableCiReadApi,
         authority: Arc<RunTokenAuthorizer>,
-        delegator: Principal,
+        access_subject: Principal,
     ) -> Self {
         Self {
             ci,
@@ -40,7 +40,7 @@ impl McpReadExecutor {
             chat: None,
             git: None,
             authority,
-            delegator,
+            access_subject,
         }
     }
 
@@ -76,10 +76,11 @@ impl DirectReadExecutor for McpReadExecutor {
         if authority.tool() != tool {
             return Err(DirectReadError::Denied);
         }
-        if !is_active_delegation(principal, &self.delegator) {
-            return Err(DirectReadError::Denied);
-        }
-        let scope = TenantScope::from_verified_token(principal, principal.region.clone());
+        let delegation = ActiveDelegation::establish(principal, &self.access_subject)
+            .ok_or(DirectReadError::Denied)?;
+        let scope =
+            TenantScope::from_verified_token(delegation.actor(), delegation.actor().region.clone());
+        let access_subject = delegation.access_subject();
         let run_token = self
             .authority
             .authorize(
@@ -94,7 +95,7 @@ impl DirectReadExecutor for McpReadExecutor {
                 exact_fields(arguments, &["run_id"], &["run_id"])?;
                 let run_id = required_string(arguments, "run_id")?;
                 self.ci
-                    .read_run(&self.delegator, run_id)
+                    .read_run(access_subject, run_id)
                     .map_err(map_edge_error)
             }
             "ci.read_log" => {
@@ -108,14 +109,14 @@ impl DirectReadExecutor for McpReadExecutor {
                 let start = optional_i64(arguments, "start")?.unwrap_or(0);
                 let limit = optional_u32(arguments, "limit")?.unwrap_or(CI_LOG_RANGE_DEFAULT);
                 self.ci
-                    .read_log(&self.delegator, run_id, job_id, start, limit)
+                    .read_log(access_subject, run_id, job_id, start, limit)
                     .map_err(map_edge_error)
             }
             "issues.list" => self
                 .issues
                 .as_ref()
                 .ok_or(DirectReadError::Unavailable)?
-                .list(&self.delegator, issue_page(arguments)?)
+                .list(access_subject, issue_page(arguments)?)
                 .map_err(map_edge_error),
             "issues.view" => {
                 exact_fields(arguments, &["issue_id"], &["issue_id"])?;
@@ -126,7 +127,7 @@ impl DirectReadExecutor for McpReadExecutor {
                 self.issues
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
-                    .view(&self.delegator, issue_id)
+                    .view(access_subject, issue_id)
                     .map_err(map_edge_error)
             }
             "knowledge.list_pages" => {
@@ -136,7 +137,7 @@ impl DirectReadExecutor for McpReadExecutor {
                 self.knowledge
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
-                    .list_pages(&self.delegator, limit, cursor)
+                    .list_pages(access_subject, limit, cursor)
                     .map_err(map_edge_error)
             }
             "knowledge.read_page" => {
@@ -145,7 +146,7 @@ impl DirectReadExecutor for McpReadExecutor {
                 self.knowledge
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
-                    .read_page(&self.delegator, page_id)
+                    .read_page(access_subject, page_id)
                     .map_err(map_edge_error)
             }
             "chat.list_conversations" => {
@@ -155,7 +156,7 @@ impl DirectReadExecutor for McpReadExecutor {
                 self.chat
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
-                    .list_conversations(&self.delegator, limit, cursor)
+                    .list_conversations(access_subject, limit, cursor)
                     .map_err(map_edge_error)
             }
             "chat.read_messages" => {
@@ -170,7 +171,7 @@ impl DirectReadExecutor for McpReadExecutor {
                 self.chat
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
-                    .read_messages(&self.delegator, conversation_id, limit, before)
+                    .read_messages(access_subject, conversation_id, limit, before)
                     .map_err(map_edge_error)
             }
             "git.list_repositories" => {
@@ -183,7 +184,7 @@ impl DirectReadExecutor for McpReadExecutor {
                 self.git
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
-                    .list_repositories(&self.delegator, limit, cursor)
+                    .list_repositories(access_subject, limit, cursor)
                     .map_err(map_edge_error)
             }
             "git.search_code" => {
@@ -198,7 +199,7 @@ impl DirectReadExecutor for McpReadExecutor {
                 self.git
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
-                    .search_code(&self.delegator, query, repo)
+                    .search_code(access_subject, query, repo)
                     .map_err(map_edge_error)
             }
             "git.read_file" => {
@@ -216,7 +217,7 @@ impl DirectReadExecutor for McpReadExecutor {
                 self.git
                     .as_ref()
                     .ok_or(DirectReadError::Unavailable)?
-                    .read_file(&self.delegator, repo, gitref, path)
+                    .read_file(access_subject, repo, gitref, path)
                     .map_err(map_edge_error)
             }
             _ => Err(DirectReadError::Unavailable),

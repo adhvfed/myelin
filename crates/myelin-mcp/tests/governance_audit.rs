@@ -3,7 +3,8 @@ use std::sync::Arc;
 use myelin_events::{MonotonicMinter, OutboxStore, Timestamp};
 use myelin_identity::{Principal, PrincipalId, PrincipalKind, RunId};
 use myelin_mcp::{
-    AuditPhase, CallOutcome, GovernanceAudit, GovernanceAuditRecord, OutboxGovernanceAudit,
+    AuditPhase, CallOutcome, GovernanceAudit, GovernanceAuditOutcome, GovernanceAuditRecord,
+    GovernanceAuditTarget, OutboxGovernanceAudit,
 };
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
@@ -31,7 +32,7 @@ fn governance_audit_uses_minimized_tool_facts_never_trace_or_raw_reason() {
             scope: &scope,
             actor: &actor,
             run_id: &run,
-            gate_id: None,
+            target: GovernanceAuditTarget::Run,
             tool: "git.open_pr",
             jti: "jti:audit",
             phase: AuditPhase::Attempt,
@@ -48,11 +49,11 @@ fn governance_audit_uses_minimized_tool_facts_never_trace_or_raw_reason() {
             scope: &scope,
             actor: &actor,
             run_id: &run,
-            gate_id: None,
+            target: GovernanceAuditTarget::Run,
             tool: "git.open_pr",
             jti: "jti:audit",
             phase: AuditPhase::Outcome,
-            outcome: Some(&denied),
+            outcome: Some(GovernanceAuditOutcome::Effect(&denied)),
             now: &now,
         })
         .unwrap();
@@ -66,7 +67,7 @@ fn governance_audit_uses_minimized_tool_facts_never_trace_or_raw_reason() {
                 scope: &scope,
                 actor: &actor,
                 run_id: &run,
-                gate_id: Some("hitl:gate-audit"),
+                target: GovernanceAuditTarget::Gate("hitl:gate-audit"),
                 tool: "git.merge",
                 jti: "jti:audit",
                 phase,
@@ -124,7 +125,7 @@ fn governance_audit_refuses_unregistered_dynamic_tool_taxonomy() {
             scope: &scope,
             actor: &actor,
             run_id: &RunId("run:audit".into()),
-            gate_id: None,
+            target: GovernanceAuditTarget::Run,
             tool: "caller.controlled.tool",
             jti: "jti:audit",
             phase: AuditPhase::Attempt,
@@ -149,7 +150,7 @@ fn chat_post_governance_has_a_durable_registered_taxonomy() {
             scope: &scope,
             actor: &actor,
             run_id: &run,
-            gate_id: None,
+            target: GovernanceAuditTarget::Run,
             tool: "chat.post",
             jti: "jti:chat-post",
             phase: AuditPhase::Attempt,
@@ -167,11 +168,11 @@ fn chat_post_governance_has_a_durable_registered_taxonomy() {
             scope: &scope,
             actor: &actor,
             run_id: &run,
-            gate_id: None,
+            target: GovernanceAuditTarget::Run,
             tool: "chat.post",
             jti: "jti:chat-post",
             phase: AuditPhase::Outcome,
-            outcome: Some(&applied),
+            outcome: Some(GovernanceAuditOutcome::Effect(&applied)),
             now: &now,
         })
         .unwrap();
@@ -203,7 +204,7 @@ fn issue_create_governance_has_a_durable_registered_taxonomy() {
             scope: &scope,
             actor: &actor,
             run_id: &run,
-            gate_id: None,
+            target: GovernanceAuditTarget::Run,
             tool: "issues.create",
             jti: "jti:issue-create",
             phase: AuditPhase::Attempt,
@@ -221,11 +222,11 @@ fn issue_create_governance_has_a_durable_registered_taxonomy() {
             scope: &scope,
             actor: &actor,
             run_id: &run,
-            gate_id: None,
+            target: GovernanceAuditTarget::Run,
             tool: "issues.create",
             jti: "jti:issue-create",
             phase: AuditPhase::Outcome,
-            outcome: Some(&applied),
+            outcome: Some(GovernanceAuditOutcome::Effect(&applied)),
             now: &now,
         })
         .unwrap();

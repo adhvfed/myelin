@@ -32,8 +32,8 @@ use myelin_tenancy::{Region, TenantId};
 use myelin_mcp::governance::{mcp_effect_key, SkeletonEffectApi};
 use myelin_mcp::{
     AuditPhase, CallOutcome, DirectReadError, DirectReadExecutor, GateApproverPolicy,
-    GovernanceAudit, GovernanceAuditRecord, GovernedRouter, McpServer, OutboxGovernanceAudit,
-    ReadAuthorization, RunPrincipal, ToolRegistry,
+    GovernanceAudit, GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter, McpServer,
+    OutboxGovernanceAudit, ReadAuthorization, RunPrincipal, ToolRegistry,
 };
 use myelin_storage::hitl_gate_durable::{
     gate_ref_token, GateDecideError, GateRecord, GateState, HitlVerdictStore,
@@ -69,13 +69,25 @@ impl GovernanceAudit for FailOutcomeAudit {
     }
 }
 
+struct FailAttemptAudit;
+
+impl GovernanceAudit for FailAttemptAudit {
+    fn record(&self, record: GovernanceAuditRecord<'_>) -> Result<(), String> {
+        if record.phase == AuditPhase::Attempt {
+            Err("injected durable audit outage".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 struct FailExpiryAudit;
 
 impl GovernanceAudit for FailExpiryAudit {
     fn record(&self, record: GovernanceAuditRecord<'_>) -> Result<(), String> {
         if record.phase == AuditPhase::Expired {
             assert!(
-                record.gate_id.is_some(),
+                matches!(record.target, GovernanceAuditTarget::Gate(_)),
                 "an expiry fact must identify the exact durable gate"
             );
             Err("injected expiry-audit outage".into())
@@ -309,12 +321,23 @@ impl DirectReadExecutor for CountingReadExecutor {
 }
 
 fn ci_read_router(grants: &[&str]) -> GovernedRouter {
-    governed_router_with_input(DelegationInput {
+    ci_read_router_with_audit(
+        grants,
+        Arc::new(OutboxGovernanceAudit::new(
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()),
+        )),
+    )
+}
+
+fn ci_read_router_with_audit(grants: &[&str], audit: Arc<dyn GovernanceAudit>) -> GovernedRouter {
+    let input = DelegationInput {
         agent_policy: Authority::of(grants.iter().copied()),
         delegation: Authority::of(grants.iter().copied()),
         tenant_policy: Authority::of(grants.iter().copied()),
         trigger_actor_held: Authority::of(grants.iter().copied()),
-    })
+    };
+    governed_router_with_trigger_and_audit(input, "trigger-jti", i64::MAX, audit)
 }
 
 fn caveated_router(grants: &[&str], caveats: &[&str]) -> GovernedRouter {
@@ -656,6 +679,148 @@ fn ci_read_projects_shared_schema_and_routes_directly_without_idempotency() {
         ],
     );
     assert_eq!(mutation_without_key[0]["error"]["code"], -32602);
+}
+
+#[test]
+fn an_agent_read_leaves_a_durable_trace_around_the_exact_resource() {
+    let audit_store = OutboxStore::new();
+    let recorder = Arc::new(RecordingReadExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let server = McpServer::with_router_reads_and_clock(
+        ToolRegistry::for_cursors(&["ci.read_run.v1".into()]).unwrap(),
+        ci_read_router_with_audit(
+            &["run.view"],
+            Arc::new(OutboxGovernanceAudit::new(
+                audit_store.clone(),
+                Arc::new(MonotonicMinter::new()),
+            )),
+        ),
+        recorder.clone(),
+        Arc::new(now),
+    );
+
+    let response = drive(
+        &server,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ci.read_run","arguments":{"run_id":"01234567-89ab-cdef-0123-456789abcdef"}}}"#,
+        ],
+    );
+
+    assert_eq!(response[0]["result"]["isError"], false);
+    assert_eq!(recorder.calls.load(Ordering::SeqCst), 1);
+    let rows = audit_store.committed_rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].envelope.type_.0, "agent.tool.read_attempted");
+    assert_eq!(rows[1].envelope.type_.0, "agent.tool.read_succeeded");
+    for row in rows {
+        assert_eq!(row.envelope.actor.0.principal_id.0, "agent:claude");
+        assert_eq!(
+            row.envelope.subject.0,
+            "myelin://acme/ci/run/01234567-89ab-cdef-0123-456789abcdef"
+        );
+        assert_eq!(row.envelope.payload["tool"], "ci.read_run");
+        assert_eq!(row.envelope.payload["resource_ref"], row.envelope.subject.0);
+        assert!(row.envelope.payload["token_ref"]
+            .as_str()
+            .is_some_and(|token| token.starts_with("jti:runtok:agent:claude:mcp-run-1")));
+    }
+}
+
+#[test]
+fn a_refused_read_is_audited_without_touching_the_resource_adapter() {
+    let audit_store = OutboxStore::new();
+    let recorder = Arc::new(RecordingReadExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let server = McpServer::with_router_reads_and_clock(
+        ToolRegistry::for_cursors(&["ci.read_run.v1".into()]).unwrap(),
+        ci_read_router_with_audit(
+            &["repo.push"],
+            Arc::new(OutboxGovernanceAudit::new(
+                audit_store.clone(),
+                Arc::new(MonotonicMinter::new()),
+            )),
+        ),
+        recorder.clone(),
+        Arc::new(now),
+    );
+
+    let response = drive(
+        &server,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ci.read_run","arguments":{"run_id":"01234567-89ab-cdef-0123-456789abcdef"}}}"#,
+        ],
+    );
+
+    assert_eq!(response[0]["result"]["isError"], true);
+    assert_eq!(recorder.calls.load(Ordering::SeqCst), 0);
+    let rows = audit_store.committed_rows();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].envelope.type_.0, "agent.tool.read_denied");
+    assert_eq!(rows[0].envelope.actor.0.principal_id.0, "agent:claude");
+    assert_eq!(
+        rows[0].envelope.payload["outcome"],
+        serde_json::json!({
+            "kind": "denied",
+            "reason_category": "authorization",
+        })
+    );
+}
+
+#[test]
+fn no_durable_attempt_means_no_resource_read() {
+    let recorder = Arc::new(RecordingReadExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let server = McpServer::with_router_reads_and_clock(
+        ToolRegistry::for_cursors(&["ci.read_run.v1".into()]).unwrap(),
+        ci_read_router_with_audit(&["run.view"], Arc::new(FailAttemptAudit)),
+        recorder.clone(),
+        Arc::new(now),
+    );
+
+    let response = drive(
+        &server,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ci.read_run","arguments":{"run_id":"01234567-89ab-cdef-0123-456789abcdef"}}}"#,
+        ],
+    );
+
+    assert_eq!(response[0]["result"]["isError"], true);
+    assert!(response[0]["result"]["_meta"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("pre-read audit"));
+    assert_eq!(recorder.calls.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn an_unaudited_read_result_never_leaves_the_server() {
+    let recorder = Arc::new(RecordingReadExecutor {
+        calls: AtomicUsize::new(0),
+    });
+    let server = McpServer::with_router_reads_and_clock(
+        ToolRegistry::for_cursors(&["ci.read_run.v1".into()]).unwrap(),
+        ci_read_router_with_audit(&["run.view"], Arc::new(FailOutcomeAudit)),
+        recorder.clone(),
+        Arc::new(now),
+    );
+
+    let response = drive(
+        &server,
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"ci.read_run","arguments":{"run_id":"01234567-89ab-cdef-0123-456789abcdef"}}}"#,
+        ],
+    );
+
+    assert_eq!(recorder.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(response[0]["result"]["isError"], true);
+    assert_eq!(response[0]["result"]["_meta"]["reason"], "unavailable");
+    assert!(!response[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap()
+        .contains("01234567-89ab-cdef-0123-456789abcdef"));
 }
 
 #[test]
