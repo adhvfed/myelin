@@ -4,9 +4,10 @@ use std::sync::Arc;
 use myelin_identity::{Literal, ObjectType};
 use myelin_query::{CmpOp, EventMatcher, Expr, Predicate};
 use myelin_storage::{
-    AgentTriggerFiringState, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking,
-    DurableAgentTriggerBinding, DurableAgentTriggerFiring, NewAgentTriggerBinding,
-    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    AgentTriggerFiringState, AgentTriggerLifecycleAction, ChangeAgentTriggerLifecycleOutcome,
+    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, DurableAgentTriggerBinding,
+    DurableAgentTriggerFiring, NewAgentTriggerBinding, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -132,6 +133,11 @@ struct TriggerFiringListHandler {
     api: TriggerHttpApi,
 }
 
+struct TriggerLifecycleHandler {
+    api: TriggerHttpApi,
+    action: AgentTriggerLifecycleAction,
+}
+
 impl Handler for TriggerListHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         if !ctx.request.body.is_empty() {
@@ -201,6 +207,52 @@ impl Handler for TriggerFiringListHandler {
     }
 }
 
+impl Handler for TriggerLifecycleHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.query.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "trigger lifecycle accepts no query parameters".into(),
+            ));
+        }
+        crate::request::require_empty_json_object(
+            &ctx.request.body,
+            "trigger lifecycle",
+            MAX_TRIGGER_JSON_BYTES,
+        )?;
+        let binding_id = parse_uuid(trigger_param(ctx)?)?;
+        let outcome = self
+            .api
+            .drive(self.api.backing.change_lifecycle(
+                &ctx.principal.tenant.0,
+                &ctx.principal.principal_id.0,
+                binding_id,
+                self.action,
+            ))?
+            .map_err(|error| EdgeError::Internal(error.to_string()))?;
+        let outcome = match outcome {
+            ChangeAgentTriggerLifecycleOutcome::Complete(outcome) => outcome,
+            ChangeAgentTriggerLifecycleOutcome::NotFound => {
+                return Err(EdgeError::NotFound("trigger not found".into()))
+            }
+            ChangeAgentTriggerLifecycleOutcome::InvalidTransition => {
+                return Err(EdgeError::Conflict(
+                    "trigger lifecycle transition is not allowed".into(),
+                ))
+            }
+        };
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &json!({
+                "action": lifecycle_action_token(self.action),
+                "changed": outcome.changed,
+                "canceled_firings": outcome.canceled_firings,
+                "durable": true,
+                "trigger": binding_json(&ctx.principal.tenant.0, &outcome.binding),
+            }),
+        )))
+    }
+}
+
 pub fn register_triggers(
     builder: GatewayBuilder,
     backing: DurableAgentTriggerBacking,
@@ -224,8 +276,43 @@ pub fn register_triggers(
             Method::Get,
             "/v1/triggers/{trigger}/firings",
             "identity.triggers.list",
-            Arc::new(TriggerFiringListHandler { api }),
+            Arc::new(TriggerFiringListHandler { api: api.clone() }),
         )
+        .route(
+            Method::Post,
+            "/v1/triggers/{trigger}/pause",
+            "identity.trigger.pause",
+            Arc::new(TriggerLifecycleHandler {
+                api: api.clone(),
+                action: AgentTriggerLifecycleAction::Pause,
+            }),
+        )
+        .route(
+            Method::Post,
+            "/v1/triggers/{trigger}/resume",
+            "identity.trigger.resume",
+            Arc::new(TriggerLifecycleHandler {
+                api: api.clone(),
+                action: AgentTriggerLifecycleAction::Resume,
+            }),
+        )
+        .route(
+            Method::Post,
+            "/v1/triggers/{trigger}/disable",
+            "identity.trigger.disable",
+            Arc::new(TriggerLifecycleHandler {
+                api,
+                action: AgentTriggerLifecycleAction::Disable,
+            }),
+        )
+}
+
+fn lifecycle_action_token(action: AgentTriggerLifecycleAction) -> &'static str {
+    match action {
+        AgentTriggerLifecycleAction::Pause => "pause",
+        AgentTriggerLifecycleAction::Resume => "resume",
+        AgentTriggerLifecycleAction::Disable => "disable",
+    }
 }
 
 fn create_proposal(

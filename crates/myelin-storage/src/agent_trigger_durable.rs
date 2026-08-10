@@ -2,11 +2,12 @@ mod model;
 mod schema;
 
 pub use model::{
-    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerRunOutcome,
-    AgentTriggerStartRequest, ClaimedAgentTriggerFiring, CreateAgentTriggerBindingOutcome,
-    DurableAgentTriggerBinding, DurableAgentTriggerFiring, NewAgentTriggerBinding,
-    ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring, StartAgentTriggerFiringOutcome,
-    StartedAgentTriggerRun, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerLifecycleAction,
+    AgentTriggerLifecycleOutcome, AgentTriggerRunOutcome, AgentTriggerStartRequest,
+    ChangeAgentTriggerLifecycleOutcome, ClaimedAgentTriggerFiring,
+    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
+    NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
+    StartAgentTriggerFiringOutcome, StartedAgentTriggerRun, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
     MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use schema::{
@@ -240,6 +241,88 @@ impl DurableAgentTriggerBacking {
                     .await
                     .map_err(query_error("list agent trigger bindings for owner"))?;
                     rows.iter().map(binding_from_row).collect()
+                })
+            })
+            .await
+    }
+
+    pub async fn change_lifecycle(
+        &self,
+        tenant: &str,
+        owner_principal_id: &str,
+        binding_id: Uuid,
+        action: AgentTriggerLifecycleAction,
+    ) -> Result<ChangeAgentTriggerLifecycleOutcome, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let owner_principal_id = owner_principal_id.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let row = sqlx::query(
+                        "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
+                                event_type, matcher, task, delegation_caveats, \
+                                budget_minor_units, max_firings, firings_used, max_causal_depth, \
+                                require_no_personal_data, require_human_approval, state, created_at \
+                           FROM agent_trigger_binding \
+                          WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                            AND owner_principal_id = $4 FOR UPDATE",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(binding_id)
+                    .bind(&owner_principal_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("lock agent trigger lifecycle"))?;
+                    let Some(row) = row else {
+                        return Ok(ChangeAgentTriggerLifecycleOutcome::NotFound);
+                    };
+                    let mut binding = binding_from_row(&row)?;
+                    let Some(changed) = lifecycle_transition(&binding.state, action) else {
+                        return Ok(ChangeAgentTriggerLifecycleOutcome::InvalidTransition);
+                    };
+                    let target = action.target();
+                    if changed {
+                        sqlx::query(
+                            "UPDATE agent_trigger_binding SET state = $5 \
+                              WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                                AND owner_principal_id = $4",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(binding_id)
+                        .bind(&owner_principal_id)
+                        .bind(target)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(query_error("change agent trigger lifecycle"))?;
+                        binding.state = target.to_string();
+                    }
+                    let canceled_firings = if action == AgentTriggerLifecycleAction::Disable {
+                        sqlx::query(
+                            "UPDATE agent_trigger_firing \
+                                SET state = 'terminal', claim_owner = NULL, claim_until = NULL \
+                              WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                                AND state IN ('queued','awaiting_approval','claimed')",
+                        )
+                        .bind(&tenant)
+                        .bind(&region)
+                        .bind(binding_id)
+                        .execute(&mut *conn)
+                        .await
+                        .map_err(query_error("cancel disabled agent trigger firings"))?
+                        .rows_affected()
+                    } else {
+                        0
+                    };
+                    Ok(ChangeAgentTriggerLifecycleOutcome::Complete(Box::new(
+                        AgentTriggerLifecycleOutcome {
+                            binding,
+                            changed,
+                            canceled_firings,
+                        },
+                    )))
                 })
             })
             .await
@@ -525,7 +608,7 @@ impl DurableAgentTriggerBacking {
                                AND (f.state = 'queued' \
                                  OR (f.state = 'claimed' AND f.claim_until <= clock_timestamp())) \
                              ORDER BY f.created_at, f.binding_id, f.event_id \
-                             FOR UPDATE OF f SKIP LOCKED LIMIT 1\
+                             FOR UPDATE OF f, b SKIP LOCKED LIMIT 1\
                          ) \
                          UPDATE agent_trigger_firing f \
                             SET state = 'claimed', claim_owner = $6, \
@@ -678,6 +761,18 @@ fn binding_matches(
         && binding.max_causal_depth == proposal.max_causal_depth
         && binding.require_no_personal_data == proposal.require_no_personal_data
         && binding.require_human_approval == proposal.require_human_approval
+}
+
+fn lifecycle_transition(current: &str, action: AgentTriggerLifecycleAction) -> Option<bool> {
+    match (current, action) {
+        ("active", AgentTriggerLifecycleAction::Pause)
+        | ("paused", AgentTriggerLifecycleAction::Resume)
+        | ("active" | "paused", AgentTriggerLifecycleAction::Disable) => Some(true),
+        ("paused", AgentTriggerLifecycleAction::Pause)
+        | ("active", AgentTriggerLifecycleAction::Resume)
+        | ("disabled", AgentTriggerLifecycleAction::Disable) => Some(false),
+        _ => None,
+    }
 }
 
 fn binding_from_row(row: &sqlx::postgres::PgRow) -> Result<DurableAgentTriggerBinding, PgError> {
@@ -884,4 +979,46 @@ fn query_error(operation: &'static str) -> impl FnOnce(sqlx::Error) -> PgError {
 
 fn row_error(column: &'static str) -> impl FnOnce(sqlx::Error) -> PgError {
     move |error| PgError::Query(format!("decode agent trigger `{column}`: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trigger_lifecycle_has_idempotent_targets_and_irreversible_disablement() {
+        assert_eq!(
+            lifecycle_transition("active", AgentTriggerLifecycleAction::Pause),
+            Some(true)
+        );
+        assert_eq!(
+            lifecycle_transition("paused", AgentTriggerLifecycleAction::Pause),
+            Some(false)
+        );
+        assert_eq!(
+            lifecycle_transition("paused", AgentTriggerLifecycleAction::Resume),
+            Some(true)
+        );
+        assert_eq!(
+            lifecycle_transition("active", AgentTriggerLifecycleAction::Resume),
+            Some(false)
+        );
+        assert_eq!(
+            lifecycle_transition("active", AgentTriggerLifecycleAction::Disable),
+            Some(true)
+        );
+        assert_eq!(
+            lifecycle_transition("paused", AgentTriggerLifecycleAction::Disable),
+            Some(true)
+        );
+        assert_eq!(
+            lifecycle_transition("disabled", AgentTriggerLifecycleAction::Disable),
+            Some(false)
+        );
+        assert_eq!(
+            lifecycle_transition("disabled", AgentTriggerLifecycleAction::Resume),
+            None,
+            "a retired automation cannot be revived accidentally"
+        );
+    }
 }

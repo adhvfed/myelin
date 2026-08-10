@@ -77,10 +77,6 @@ impl AgentRuntimeSelection {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct EmptyJsonObject {}
-
 struct AgentCreateHandler {
     api: AgentHttpApi,
 }
@@ -124,7 +120,11 @@ struct AgentLifecycleHandler {
 impl Handler for AgentRunCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
-        let _: EmptyJsonObject = parse_empty_json_object(&ctx.request.body, "agent run")?;
+        crate::request::require_empty_json_object(
+            &ctx.request.body,
+            "agent run",
+            MAX_AGENT_JSON_BYTES,
+        )?;
         let agent_id = agent_param(ctx)?.to_string();
         let client_nonce = ctx
             .request
@@ -154,7 +154,11 @@ impl Handler for AgentRunCreateHandler {
 impl Handler for AgentRunCloseHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
-        let _: EmptyJsonObject = parse_empty_json_object(&ctx.request.body, "agent run close")?;
+        crate::request::require_empty_json_object(
+            &ctx.request.body,
+            "agent run close",
+            MAX_AGENT_JSON_BYTES,
+        )?;
         let run_id = run_param(ctx)?;
         let closed = self
             .api
@@ -174,7 +178,11 @@ impl Handler for AgentRunCloseHandler {
 impl Handler for AgentLifecycleHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
-        let _: EmptyJsonObject = parse_empty_json_object(&ctx.request.body, "agent lifecycle")?;
+        crate::request::require_empty_json_object(
+            &ctx.request.body,
+            "agent lifecycle",
+            MAX_AGENT_JSON_BYTES,
+        )?;
         let client_nonce = ctx
             .request
             .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
@@ -580,21 +588,6 @@ fn parse_create_body(bytes: &[u8]) -> Result<CreateAgentBody, EdgeError> {
         .map_err(|error| EdgeError::BadRequest(format!("invalid agent create body: {error}")))
 }
 
-fn parse_empty_json_object(bytes: &[u8], operation: &str) -> Result<EmptyJsonObject, EdgeError> {
-    if bytes.len() > MAX_AGENT_JSON_BYTES {
-        return Err(EdgeError::PayloadTooLarge(format!(
-            "{operation} request body exceeds {MAX_AGENT_JSON_BYTES} bytes"
-        )));
-    }
-    if bytes.is_empty() {
-        return Err(EdgeError::BadRequest(
-            "empty request body (expected an empty JSON object)".into(),
-        ));
-    }
-    serde_json::from_slice(bytes)
-        .map_err(|error| EdgeError::BadRequest(format!("invalid {operation} body: {error}")))
-}
-
 fn parse_page_query(query: &str) -> Result<(usize, Option<String>), EdgeError> {
     let mut limit = None;
     let mut cursor = None;
@@ -808,14 +801,6 @@ mod tests {
         assert!(parse_page_query("limit=01").is_err());
         assert!(parse_page_query("limit=1&limit=2").is_err());
         assert!(parse_page_query("other=1").is_err());
-    }
-
-    #[test]
-    fn state_change_bodies_are_exact_empty_objects() {
-        assert!(parse_empty_json_object(br#"{}"#, "agent lifecycle").is_ok());
-        assert!(parse_empty_json_object(br#"{"ttl":3600}"#, "agent run").is_err());
-        assert!(parse_empty_json_object(b"null", "agent run").is_err());
-        assert!(parse_empty_json_object(b"", "agent run").is_err());
     }
 
     #[test]

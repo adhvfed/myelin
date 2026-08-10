@@ -233,6 +233,72 @@ command = ["true"]
       { expectedStatus: 403 },
     );
     expect(peerHistory.body).toMatchObject({ error: { code: "forbidden" } });
+
+    const peerPause = await reviewerClient.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/pause`,
+      { method: "POST", body: {}, expectedStatus: 403 },
+    );
+    expect(peerPause.body).toMatchObject({ error: { code: "forbidden" } });
+
+    const paused = await founder.json(`/v1/triggers/${encodeURIComponent(triggerId)}/pause`, {
+      method: "POST",
+      body: {},
+      expectedStatus: 200,
+    });
+    expect(paused.body).toMatchObject({
+      action: "pause",
+      changed: true,
+      canceled_firings: 0,
+      durable: true,
+      trigger: { id: triggerId, state: "paused", firings_used: 1 },
+    });
+
+    const retriedPause = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/pause`,
+      { method: "POST", body: {}, expectedStatus: 200 },
+    );
+    expect(retriedPause.body).toMatchObject({
+      action: "pause",
+      changed: false,
+      canceled_firings: 0,
+      trigger: { id: triggerId, state: "paused" },
+    });
+
+    const resumed = await founder.json(`/v1/triggers/${encodeURIComponent(triggerId)}/resume`, {
+      method: "POST",
+      body: {},
+      expectedStatus: 200,
+    });
+    expect(resumed.body).toMatchObject({
+      action: "resume",
+      changed: true,
+      trigger: { id: triggerId, state: "active" },
+    });
+
+    const disabled = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/disable`,
+      { method: "POST", body: {}, expectedStatus: 200 },
+    );
+    expect(disabled.body).toMatchObject({
+      action: "disable",
+      changed: true,
+      canceled_firings: 0,
+      durable: true,
+      trigger: { id: triggerId, state: "disabled", firings_used: 1 },
+    });
+
+    const cannotRevive = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/resume`,
+      { method: "POST", body: {}, expectedStatus: 409 },
+    );
+    expect(cannotRevive.body).toMatchObject({ error: { code: "conflict" } });
+
+    const retired = await founder.json("/v1/triggers?limit=100");
+    expect(array(retired.body.items, "founder's retired agent triggers")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: triggerId, state: "disabled", firings_used: 1 }),
+      ]),
+    );
   });
 
   test("lets a founder create and rediscover a project without operator-provided IDs", async () => {

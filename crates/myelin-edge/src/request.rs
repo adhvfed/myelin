@@ -2,6 +2,32 @@ use crate::error::EdgeError;
 use crate::sse::SseSubscription;
 use serde_json::Value;
 
+pub(crate) fn require_empty_json_object(
+    bytes: &[u8],
+    operation: &str,
+    max_bytes: usize,
+) -> Result<(), EdgeError> {
+    if bytes.len() > max_bytes {
+        return Err(EdgeError::PayloadTooLarge(format!(
+            "{operation} request body exceeds {max_bytes} bytes"
+        )));
+    }
+    if bytes.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "empty request body (expected an empty JSON object)".into(),
+        ));
+    }
+    match serde_json::from_slice::<Value>(bytes) {
+        Ok(Value::Object(object)) if object.is_empty() => Ok(()),
+        Ok(_) => Err(EdgeError::BadRequest(format!(
+            "invalid {operation} body: expected an empty JSON object"
+        ))),
+        Err(error) => Err(EdgeError::BadRequest(format!(
+            "invalid {operation} body: {error}"
+        ))),
+    }
+}
+
 pub struct EdgeRequest {
     pub method: String,
     pub path: String,
@@ -204,6 +230,19 @@ mod tests {
         assert_eq!(req.method, "GET");
         assert_eq!(req.header("AUTHORIZATION"), Some("Bearer abc.def"));
         assert_eq!(req.bearer(), Some("abc.def"));
+    }
+
+    #[test]
+    fn empty_mutations_accept_exactly_an_empty_json_object() {
+        assert!(require_empty_json_object(br#"{}"#, "lifecycle", 128).is_ok());
+        assert!(require_empty_json_object(br#" { } "#, "lifecycle", 128).is_ok());
+        assert!(require_empty_json_object(br#"{"ttl":30}"#, "lifecycle", 128).is_err());
+        assert!(require_empty_json_object(b"null", "lifecycle", 128).is_err());
+        assert!(require_empty_json_object(b"", "lifecycle", 128).is_err());
+        assert!(matches!(
+            require_empty_json_object(br#"{}"#, "lifecycle", 1),
+            Err(EdgeError::PayloadTooLarge(_))
+        ));
     }
 
     #[test]

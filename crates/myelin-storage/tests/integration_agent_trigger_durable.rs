@@ -5,6 +5,7 @@ use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus, Run
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
     all_durable_migrations, AgentTriggerClaimRequest, AgentTriggerFiringState,
+    AgentTriggerLifecycleAction, ChangeAgentTriggerLifecycleOutcome,
     CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, NewAgentTriggerBinding,
     ReserveAgentTriggerFiringOutcome, SubstrateProvider,
 };
@@ -183,6 +184,86 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         CreateAgentTriggerBindingOutcome::Conflict,
         "one idempotency key cannot silently acquire a different task"
     );
+
+    let paused = triggers
+        .change_lifecycle(
+            &tenant,
+            "founder",
+            proposal.binding_id,
+            AgentTriggerLifecycleAction::Pause,
+        )
+        .await
+        .expect("the owner pauses the automation before maintenance");
+    let ChangeAgentTriggerLifecycleOutcome::Complete(paused) = paused else {
+        panic!("an owned active trigger must pause, got {paused:?}");
+    };
+    assert!(paused.changed);
+    assert_eq!(paused.binding.state, "paused");
+    assert_eq!(paused.canceled_firings, 0);
+    assert!(
+        triggers
+            .active_for_event(&tenant, "ci.run.failed", 100)
+            .await
+            .expect("event intake observes the pause")
+            .is_empty(),
+        "a paused automation is quiet without losing its intent"
+    );
+    assert_eq!(
+        triggers
+            .reserve_firing(
+                &tenant,
+                proposal.binding_id,
+                "ci-failed-during-maintenance",
+                "ci.run.failed",
+                serde_json::json!({"event_id": "ci-failed-during-maintenance"}),
+                1,
+                false,
+                Utc::now(),
+            )
+            .await
+            .expect("a matching event arrives while maintenance is active"),
+        ReserveAgentTriggerFiringOutcome::BindingUnavailable,
+        "events cannot sneak into the queue after pause returns"
+    );
+    let paused_again = triggers
+        .change_lifecycle(
+            &tenant,
+            "founder",
+            proposal.binding_id,
+            AgentTriggerLifecycleAction::Pause,
+        )
+        .await
+        .expect("the CLI safely retries pause");
+    assert!(matches!(
+        paused_again,
+        ChangeAgentTriggerLifecycleOutcome::Complete(ref outcome) if !outcome.changed
+    ));
+    assert_eq!(
+        triggers
+            .change_lifecycle(
+                &tenant,
+                "reviewer",
+                proposal.binding_id,
+                AgentTriggerLifecycleAction::Disable,
+            )
+            .await
+            .expect("another person cannot discover ownership through mutation"),
+        ChangeAgentTriggerLifecycleOutcome::NotFound
+    );
+    let resumed = triggers
+        .change_lifecycle(
+            &tenant,
+            "founder",
+            proposal.binding_id,
+            AgentTriggerLifecycleAction::Resume,
+        )
+        .await
+        .expect("the owner resumes normal operation");
+    assert!(matches!(
+        resumed,
+        ChangeAgentTriggerLifecycleOutcome::Complete(ref outcome)
+            if outcome.changed && outcome.binding.state == "active"
+    ));
 
     let event = serde_json::json!({
         "event_id": "ci-failed-1",
@@ -364,6 +445,44 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         unavailable,
         ReserveAgentTriggerFiringOutcome::BindingUnavailable,
         "a durable trigger never wakes an agent whose identity is no longer active"
+    );
+
+    let disabled = triggers
+        .change_lifecycle(
+            &tenant,
+            "founder",
+            proposal.binding_id,
+            AgentTriggerLifecycleAction::Disable,
+        )
+        .await
+        .expect("the owner permanently retires the automation");
+    let ChangeAgentTriggerLifecycleOutcome::Complete(disabled) = disabled else {
+        panic!("an active trigger can be disabled, got {disabled:?}");
+    };
+    assert!(disabled.changed);
+    assert_eq!(disabled.binding.state, "disabled");
+    assert_eq!(
+        disabled.canceled_firings, 1,
+        "the claimed but not started run is atomically canceled"
+    );
+    let final_history = triggers
+        .list_firings_for_owner(&tenant, "founder", proposal.binding_id, None, 100)
+        .await
+        .expect("the owner sees the retired automation's final history");
+    assert_eq!(final_history[0].state, AgentTriggerFiringState::Terminal);
+    assert_eq!(final_history[0].run_id, None);
+    assert_eq!(final_history[0].outcome, None);
+    assert_eq!(
+        triggers
+            .change_lifecycle(
+                &tenant,
+                "founder",
+                proposal.binding_id,
+                AgentTriggerLifecycleAction::Resume,
+            )
+            .await
+            .expect("retirement remains fail-closed"),
+        ChangeAgentTriggerLifecycleOutcome::InvalidTransition
     );
 
     let cleanup_tenant = tenant.clone();

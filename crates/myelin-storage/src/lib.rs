@@ -214,12 +214,13 @@ pub use authz_projection_durable::{
 };
 pub use agent_trigger_durable::{
     agent_trigger_durable_migrations, AgentTriggerClaimRequest, AgentTriggerFiringState,
-    AgentTriggerStartRequest, ClaimedAgentTriggerFiring, CreateAgentTriggerBindingOutcome,
-    DurableAgentTriggerBacking, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
-    NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
-    StartAgentTriggerFiringOutcome, StartedAgentTriggerRun, AGENT_TRIGGER_BUDGET_MIGRATION,
-    AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION, AGENT_TRIGGER_RLS_POLICY,
-    AGENT_TRIGGER_RUN_MIGRATION, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    AgentTriggerLifecycleAction, AgentTriggerLifecycleOutcome, AgentTriggerStartRequest,
+    ChangeAgentTriggerLifecycleOutcome, ClaimedAgentTriggerFiring,
+    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, DurableAgentTriggerBinding,
+    DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
+    ReservedAgentTriggerFiring, StartAgentTriggerFiringOutcome, StartedAgentTriggerRun,
+    AGENT_TRIGGER_BUDGET_MIGRATION, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
+    AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
     MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use delegation_policy_durable::{

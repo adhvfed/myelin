@@ -54,6 +54,37 @@ pub enum CreateAgentTriggerBindingOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTriggerLifecycleAction {
+    Pause,
+    Resume,
+    Disable,
+}
+
+impl AgentTriggerLifecycleAction {
+    pub(crate) fn target(self) -> &'static str {
+        match self {
+            Self::Pause => "paused",
+            Self::Resume => "active",
+            Self::Disable => "disabled",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentTriggerLifecycleOutcome {
+    pub binding: DurableAgentTriggerBinding,
+    pub changed: bool,
+    pub canceled_firings: u64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ChangeAgentTriggerLifecycleOutcome {
+    Complete(Box<AgentTriggerLifecycleOutcome>),
+    NotFound,
+    InvalidTransition,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentTriggerFiringState {
     Queued,
     AwaitingApproval,
