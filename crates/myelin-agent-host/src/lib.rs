@@ -45,8 +45,10 @@ pub use myelin_storage::agent_wallet::{CreditKind, MicroUsd, WalletError};
 pub struct LlmRunTask {
     pub tenant: TenantId,
     pub agent: Principal,
+    pub trigger_actor: Principal,
     pub agent_id: String,
     pub run_id: String,
+    pub delegation_caveats: DelegationCaveats,
     pub system: String,
     pub prompt: String,
     pub token_ttl_secs: u64,
@@ -65,11 +67,14 @@ impl LlmRunTask {
         system: impl Into<String>,
         prompt: impl Into<String>,
     ) -> LlmRunTask {
+        let trigger_actor = agent.clone();
         LlmRunTask {
             tenant,
             agent,
+            trigger_actor,
             agent_id: agent_id.into(),
             run_id: run_id.into(),
+            delegation_caveats: DelegationCaveats(vec![]),
             system: system.into(),
             prompt: prompt.into(),
             token_ttl_secs: 300,
@@ -87,6 +92,16 @@ impl LlmRunTask {
 
     pub fn with_now_secs(mut self, now_secs: i64) -> LlmRunTask {
         self.now_secs = now_secs;
+        self
+    }
+
+    pub fn with_delegation(
+        mut self,
+        trigger_actor: Principal,
+        caveats: DelegationCaveats,
+    ) -> LlmRunTask {
+        self.trigger_actor = trigger_actor;
+        self.delegation_caveats = caveats;
         self
     }
 }
@@ -454,7 +469,7 @@ fn dispatch_core(
         run_id: task.run_id.clone(),
         minter_token: seams.minter,
         agent_id: task.agent_id.clone(),
-        caveats: DelegationCaveats(vec![]),
+        caveats: task.delegation_caveats.clone(),
         token_ttl_secs: task.token_ttl_secs,
         revoker: seams.revoker,
         catalogue: tools.catalogue,
@@ -587,7 +602,7 @@ impl AgentHost {
             id.minter.clone(),
             scope.clone(),
             task.agent.clone(),
-            task.agent.clone(),
+            task.trigger_actor.clone(),
             now,
         ));
         (
@@ -687,6 +702,34 @@ mod tests {
     fn empty_system_falls_back_to_the_default_framing() {
         assert!(default_system("   ").contains("labelled as an agent"));
         assert_eq!(default_system("custom"), "custom");
+    }
+
+    #[test]
+    fn automated_work_keeps_its_human_trigger_and_attenuation() {
+        let tenant = TenantId("acme".into());
+        let agent = Principal::stub(
+            myelin_identity::PrincipalId("agent:triage".into()),
+            myelin_identity::PrincipalKind::Agent {
+                runtime_ref: myelin_identity::RuntimeRef("hosted:luna".into()),
+                on_behalf_of: Some(myelin_identity::PrincipalId("founder".into())),
+            },
+            tenant.clone(),
+        );
+        let founder = Principal::stub(
+            myelin_identity::PrincipalId("founder".into()),
+            myelin_identity::PrincipalKind::Human,
+            tenant.clone(),
+        );
+        let task = LlmRunTask::new(tenant, agent, "agent:triage", "run-1", "", "Fix CI")
+            .with_delegation(
+                founder.clone(),
+                DelegationCaveats(vec!["repo:core".into(), "issue:create".into()]),
+            );
+        assert_eq!(task.trigger_actor, founder);
+        assert_eq!(
+            task.delegation_caveats.0,
+            vec!["repo:core".to_string(), "issue:create".to_string()]
+        );
     }
 
     #[test]
