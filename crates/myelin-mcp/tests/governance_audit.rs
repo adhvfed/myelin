@@ -127,3 +127,56 @@ fn governance_audit_refuses_unregistered_dynamic_tool_taxonomy() {
         .is_err());
     assert_eq!(store.committed_count(), 0);
 }
+
+#[test]
+fn chat_post_governance_has_a_durable_registered_taxonomy() {
+    let store = OutboxStore::new();
+    let audit = OutboxGovernanceAudit::new(store.clone(), Arc::new(MonotonicMinter::new()));
+    let actor = actor();
+    let scope = TenantScope::from_verified_token(&actor, actor.region.clone());
+    let run = RunId("run:chat-post".into());
+    let now = Timestamp("2026-07-18T00:00:00Z".into());
+
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            gate_id: None,
+            tool: "chat.post",
+            jti: "jti:chat-post",
+            phase: AuditPhase::Attempt,
+            outcome: None,
+            now: &now,
+        })
+        .unwrap();
+    let applied = CallOutcome::Applied {
+        event_id: "chat.message.post:01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+        jti: "jti:chat-post".into(),
+    };
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            gate_id: None,
+            tool: "chat.post",
+            jti: "jti:chat-post",
+            phase: AuditPhase::Outcome,
+            outcome: Some(&applied),
+            now: &now,
+        })
+        .unwrap();
+
+    let rows = store.committed_rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].envelope.type_.0, "chat.post.attempted");
+    assert_eq!(rows[1].envelope.type_.0, "chat.post.applied");
+    for row in rows {
+        assert!(
+            myelin_chat::events::CHAT_GOVERNANCE_AUDIT_EVENT_TOKENS
+                .contains(&row.envelope.type_.0.as_str()),
+            "every Chat governance event must be registered in Chat's durable taxonomy"
+        );
+    }
+}

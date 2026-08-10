@@ -13,6 +13,7 @@ name = "myelin-mcp"
 path = "src/main.rs"
 
 [dependencies]
+myelin-chat = { path = "../myelin-chat" }
 myelin-git = { path = "../myelin-git" }
 
 myelin-agent = { path = "../myelin-agent" }

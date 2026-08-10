@@ -61,7 +61,11 @@ fn every_tool_def_carries_its_frozen_default_and_is_a_mutate() {
         );
         assert_eq!(def.effect_kind, EffectKind::Mutate);
         assert!(def.side_effecting);
-        assert!(!def.exposed_over_mcp, "MCP endpoint is a post-M5 floor");
+        assert_eq!(
+            def.exposed_over_mcp,
+            def.name.0 == POST_TOOL,
+            "only the implemented credentialless Chat post is exposed over MCP"
+        );
         assert_eq!(def.subsystem, CHAT_SUBSYSTEM);
         assert_eq!(def.version, CHAT_TOOL_VERSION);
     }
@@ -70,8 +74,8 @@ fn every_tool_def_carries_its_frozen_default_and_is_a_mutate() {
 }
 
 #[test]
-fn required_caps_come_from_the_frozen_chat_rebac_fragment() {
-    assert_eq!(chat_tool_def(POST_TOOL).required_caps, vec!["channel.post"]);
+fn required_caps_keep_platform_actions_and_channel_permissions_distinct() {
+    assert_eq!(chat_tool_def(POST_TOOL).required_caps, vec!["chat.post"]);
     assert_eq!(
         chat_tool_def(REACT_TOOL).required_caps,
         vec!["channel.post"]

@@ -200,6 +200,7 @@ mod tests {
             names,
             [
                 "chat.list_conversations",
+                "chat.post",
                 "chat.read_messages",
                 "ci.read_log",
                 "ci.read_run",

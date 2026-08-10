@@ -256,6 +256,11 @@ fn audit_event_type(
         ("git.endorse_fork_ci", "indeterminate") => {
             Ok(myelin_git::events::GIT_ENDORSE_FORK_CI_INDETERMINATE)
         }
+        ("chat.post", "attempted") => Ok(myelin_chat::events::CHAT_POST_ATTEMPTED),
+        ("chat.post", "applied") => Ok(myelin_chat::events::CHAT_POST_APPLIED),
+        ("chat.post", "gated") => Ok(myelin_chat::events::CHAT_POST_GATED),
+        ("chat.post", "denied") => Ok(myelin_chat::events::CHAT_POST_DENIED),
+        ("chat.post", "indeterminate") => Ok(myelin_chat::events::CHAT_POST_INDETERMINATE),
         _ => Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
     }
 }

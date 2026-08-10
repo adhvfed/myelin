@@ -11,8 +11,8 @@ use myelin_edge::{
     register_tools, serve_edge_until_shutdown_with_probe, spawn_issue_authorization_reconciler,
     AgentMcpAuthority, AgentMcpResources, AgentMcpServices, AuthProvider, AuthPublicConfig,
     AuthenticatedActionPolicy, BootstrapParams, CheckBackedRepoAuthorizer,
-    DeviceAuthorizationBroker, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
-    DurableIssueReadApi, DurableKnowledgeReadApi, Gateway, GitDatabaseProviders,
+    DeviceAuthorizationBroker, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi,
+    DurableGitBackend, DurableIssueReadApi, DurableKnowledgeReadApi, Gateway, GitDatabaseProviders,
     IssueReconciliationConfig, Method, ReadinessCheck, ReadinessProbe, SecretCommand,
     SecretCommandError, SecretTarget, ShutdownOutcome, StoreBackedIssueAuthorizer,
     TupleRepoBootstrap, WhoamiHandler,
@@ -1135,6 +1135,7 @@ async fn serve(
         agent_sessions.clone(),
         handle.clone(),
     );
+    let mcp_chat = DurableChatReadApi::new(provider.db_pool().clone(), handle.clone(), kms.clone());
     builder = register_agent_mcp(
         builder,
         AgentMcpServices::new(
@@ -1155,11 +1156,8 @@ async fn serve(
                     handle.clone(),
                     kms.clone(),
                 ),
-                DurableChatReadApi::new(
-                    provider.db_pool().clone(),
-                    handle.clone(),
-                    kms.clone(),
-                ),
+                mcp_chat.clone(),
+                DurableChatMutationApi::new(mcp_chat),
             ),
             handle.clone(),
         ),

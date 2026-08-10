@@ -66,6 +66,38 @@ async function askAgent(
   return record(JSON.parse(text), `${tool} payload`);
 }
 
+async function askAgentToAct(
+  run: AgentRunEnvelope,
+  id: number,
+  tool: string,
+  arguments_: JsonRecord,
+  idempotencyKey: string = `system-${tool}-${randomUUID()}`,
+): Promise<JsonRecord> {
+  const response = await systemClient.json(`/v1/agent-runs/${run.run.id}/mcp`, {
+    method: "POST",
+    body: {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: tool,
+        arguments: arguments_,
+        _meta: { "com.myelin/idempotencyKey": idempotencyKey },
+      },
+    },
+    token: run.credential.token,
+    tokenScheme: "agent",
+    expectedStatus: 200,
+  });
+  expect(JSON.stringify(response.body)).not.toContain(run.credential.token);
+  const result = record(response.body.result, `${tool} MCP result`);
+  expect(result, `${tool} MCP call failed: ${JSON.stringify(result)}`).toMatchObject({
+    isError: false,
+    _meta: { tool, eventId: expect.any(String) },
+  });
+  return record(result._meta, `${tool} MCP result metadata`);
+}
+
 function cliEnvironment(
   configDirectory: string,
   additions: NodeJS.ProcessEnv = {},
@@ -398,6 +430,7 @@ describe("the CLI authentication journey", () => {
           "knowledge.list_pages",
           "knowledge.read_page",
           "chat.list_conversations",
+          "chat.post",
           "chat.read_messages",
         ]),
       );
@@ -437,6 +470,8 @@ describe("the CLI authentication journey", () => {
         "--tool",
         "chat.list_conversations",
         "--tool",
+        "chat.post",
+        "--tool",
         "chat.read_messages",
       );
       expect(createAgent.exitCode, createAgent.stderr).toBe(0);
@@ -466,6 +501,7 @@ describe("the CLI authentication journey", () => {
           status: "active",
           selected_tools: [
             { name: "chat.list_conversations", version: 1 },
+            { name: "chat.post", version: 1 },
             { name: "chat.read_messages", version: 1 },
             { name: "ci.read_run", version: 1 },
             { name: "git.list_repositories", version: 1 },
@@ -480,6 +516,7 @@ describe("the CLI authentication journey", () => {
           grants: expect.arrayContaining([
             "agent.tools.read",
             "chat.read",
+            "chat.post",
             "edge.identity.read",
             "issue.view",
             "knowledge.read",
@@ -509,6 +546,7 @@ describe("the CLI authentication journey", () => {
           "knowledge.list_pages",
           "knowledge.read_page",
           "chat.list_conversations",
+          "chat.post",
           "chat.read_messages",
         ]),
       );
@@ -548,6 +586,8 @@ describe("the CLI authentication journey", () => {
         "knowledge.read_page",
         "--tool",
         "chat.list_conversations",
+        "--tool",
+        "chat.post",
         "--tool",
         "chat.read_messages",
       );
@@ -616,6 +656,7 @@ describe("the CLI authentication journey", () => {
           trigger_actor: systemTestConfig.principal,
           selected_tools: [
             { name: "chat.list_conversations", version: 1 },
+            { name: "chat.post", version: 1 },
             { name: "chat.read_messages", version: 1 },
             { name: "ci.read_run", version: 1 },
             { name: "git.list_repositories", version: 1 },
@@ -690,6 +731,7 @@ describe("the CLI authentication journey", () => {
       );
       expect(discoveredTools.map((tool) => string(tool.name, "MCP tool name"))).toEqual([
         "chat.list_conversations",
+        "chat.post",
         "chat.read_messages",
         "ci.read_run",
         "git.list_repositories",
@@ -707,47 +749,52 @@ describe("the CLI authentication journey", () => {
       });
       expect(discoveredTools.at(1)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["conversation_id"],
+        required: ["conversation_id", "content"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(2)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["run_id"],
+        required: ["conversation_id"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(3)?.inputSchema).toMatchObject({
         type: "object",
+        required: ["run_id"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(4)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["repo", "title"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(5)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["repo", "ref", "path"],
+        required: ["repo", "title"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(6)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["query"],
+        required: ["repo", "ref", "path"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(7)?.inputSchema).toMatchObject({
         type: "object",
+        required: ["query"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(8)?.inputSchema).toMatchObject({
         type: "object",
-        required: ["issue_id"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(9)?.inputSchema).toMatchObject({
         type: "object",
+        required: ["issue_id"],
         additionalProperties: false,
       });
       expect(discoveredTools.at(10)?.inputSchema).toMatchObject({
+        type: "object",
+        additionalProperties: false,
+      });
+      expect(discoveredTools.at(11)?.inputSchema).toMatchObject({
         type: "object",
         required: ["page_id"],
         additionalProperties: false,
@@ -828,6 +875,7 @@ describe("the CLI authentication journey", () => {
       ).map((tool, index) => string(record(tool, `CLI MCP tool ${index}`).name, "tool name"));
       expect(bridgeTools).toEqual([
         "chat.list_conversations",
+        "chat.post",
         "chat.read_messages",
         "ci.read_run",
         "git.list_repositories",
@@ -1246,6 +1294,66 @@ describe("the CLI authentication journey", () => {
         is_truncated: false,
         preview_unavailable: false,
       });
+
+      const agentChatMessage = `${uniqueName("Agent verified the release context")} \u{FFFC} \u{FFFC}`;
+      const agentPostKey = `agent-chat-${randomUUID()}`;
+      const postedByAgent = await askAgentToAct(
+        resumedRun,
+        12,
+        "chat.post",
+        {
+          conversation_id: conversationId,
+          content: agentChatMessage,
+          references: [
+            `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`,
+            `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`,
+          ],
+        },
+        agentPostKey,
+      );
+      const replayedAgentPost = await askAgentToAct(
+        resumedRun,
+        13,
+        "chat.post",
+        {
+          conversation_id: conversationId,
+          content: agentChatMessage,
+          references: [
+            `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`,
+            `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`,
+          ],
+        },
+        agentPostKey,
+      );
+      expect(replayedAgentPost.eventId).toBe(postedByAgent.eventId);
+
+      const humanHistory = await runCli(
+        configDirectory,
+        "--json",
+        "chat",
+        "history",
+        conversationId,
+        "--limit",
+        "100",
+      );
+      expect(humanHistory.exitCode, humanHistory.stderr).toBe(0);
+      const humanVisibleMessages = array(
+        record(JSON.parse(humanHistory.stdout), "human-visible Chat history").items,
+        "human-visible Chat messages",
+      ).map((message, index) => record(message, `human-visible Chat message ${index}`));
+      expect(
+        humanVisibleMessages.filter((message) => message.content === agentChatMessage),
+      ).toEqual([
+        expect.objectContaining({
+          author_kind: "agent",
+          is_you: false,
+          state: "active",
+          nodes: [
+            expect.objectContaining({ kind: "artifact_ref" }),
+            expect.objectContaining({ kind: "artifact_ref" }),
+          ],
+        }),
+      ]);
 
       // Retirement is the irreversible counterpart: active work is torn down and neither the
       // CLI nor another client can quietly revive the durable identity.

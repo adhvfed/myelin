@@ -156,13 +156,21 @@ impl DurableChatReadApi {
 }
 
 #[derive(Clone)]
-struct DurableChatApi {
+pub struct DurableChatMutationApi {
     reads: DurableChatReadApi,
     event_ids: Arc<dyn IdMinter>,
     object_ids: Arc<dyn UlidSource>,
 }
 
-impl DurableChatApi {
+impl DurableChatMutationApi {
+    pub fn new(reads: DurableChatReadApi) -> Self {
+        Self {
+            reads,
+            event_ids: Arc::new(myelin_events::UlidMinter::new()),
+            object_ids: Arc::new(SystemUlidSource::new()),
+        }
+    }
+
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
         F: Future<Output = Result<T, EdgeError>>,
@@ -250,6 +258,76 @@ impl DurableChatApi {
             Err(error) => Err(map_conversation_error(error)),
         }
     }
+
+    pub fn post_message(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        conversation_id: &str,
+        content: &str,
+        references: &[String],
+        client_nonce: String,
+    ) -> Result<MessageId, EdgeError> {
+        if actor.tenant != authorized_viewer.tenant || actor.region != authorized_viewer.region {
+            return Err(EdgeError::Forbidden(
+                "Chat actor and delegated viewer must share one tenant and region".into(),
+            ));
+        }
+        validate_ulid(conversation_id)?;
+        validate_message(content)?;
+        validate_nonce(&client_nonce)?;
+        let structured_nodes = reference_nodes(actor, content, references)?;
+        let conversation =
+            self.drive(self.public_conversation(authorized_viewer, conversation_id))?;
+        let event_principal = pseudonymized_event_principal(&actor.tenant.0, actor);
+        let author_kind = match actor.kind {
+            PrincipalKind::Human => AuthorKind::Human,
+            PrincipalKind::Agent { .. } => AuthorKind::Agent,
+            PrincipalKind::Service => AuthorKind::Service,
+        };
+        let new_message = NewMessage {
+            conv: conversation.id,
+            thread_root_id: None,
+            author: event_principal.principal_id.0.clone(),
+            author_kind,
+            body_inline: encrypt_message_column(
+                self.reads.kms.as_ref(),
+                actor,
+                &event_principal.principal_id.0,
+                ChatFreeText::BodyInline,
+                content.as_bytes(),
+            )?,
+            body_nodes: encrypt_message_column(
+                self.reads.kms.as_ref(),
+                actor,
+                &event_principal.principal_id.0,
+                ChatFreeText::BodyNodes,
+                &serde_json::to_vec(&structured_nodes).map_err(|error| {
+                    EdgeError::Internal(format!(
+                        "Chat structured nodes could not be encoded: {error}"
+                    ))
+                })?,
+            )?,
+            client_nonce,
+        };
+        let now = now_timestamp();
+        self.drive(async {
+            self.reads
+                .messages
+                .append_structured_co_commit(
+                    self.object_ids.as_ref(),
+                    new_message,
+                    EventId(self.event_ids.mint().0),
+                    self.event_ids.as_ref(),
+                    &structured_nodes,
+                    Actor(event_principal),
+                    now.clone(),
+                    now,
+                )
+                .await
+                .map_err(map_store_error)
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -283,7 +361,7 @@ impl Handler for ConversationListHandler {
 }
 
 struct ConversationCreateHandler {
-    api: DurableChatApi,
+    api: DurableChatMutationApi,
 }
 
 impl Handler for ConversationCreateHandler {
@@ -347,7 +425,7 @@ impl Handler for MessageListHandler {
 }
 
 struct MessagePostHandler {
-    api: DurableChatApi,
+    api: DurableChatMutationApi,
 }
 
 impl Handler for MessagePostHandler {
@@ -355,66 +433,19 @@ impl Handler for MessagePostHandler {
         require_empty_query(ctx)?;
         let conversation_id = conversation_param(ctx)?.to_string();
         let body: PostMessageBody = parse_body(&ctx.request.body)?;
-        validate_message(&body.content)?;
-        let structured_nodes = reference_nodes(ctx.principal, &body.content, &body.references)?;
         let client_nonce = client_nonce(
             ctx.request,
             &ctx.principal.principal_id.0,
             body.client_nonce.as_deref(),
         )?;
-        let conversation = self.api.drive(
-            self.api
-                .public_conversation(ctx.principal, &conversation_id),
-        )?;
-        let event_principal = pseudonymized_event_principal(&ctx.principal.tenant.0, ctx.principal);
-        let author_kind = match ctx.principal.kind {
-            PrincipalKind::Human => AuthorKind::Human,
-            PrincipalKind::Agent { .. } => AuthorKind::Agent,
-            PrincipalKind::Service => AuthorKind::Service,
-        };
-        let new_message = NewMessage {
-            conv: conversation.id,
-            thread_root_id: None,
-            author: event_principal.principal_id.0.clone(),
-            author_kind,
-            body_inline: encrypt_message_column(
-                self.api.reads.kms.as_ref(),
-                ctx.principal,
-                &event_principal.principal_id.0,
-                ChatFreeText::BodyInline,
-                body.content.as_bytes(),
-            )?,
-            body_nodes: encrypt_message_column(
-                self.api.reads.kms.as_ref(),
-                ctx.principal,
-                &event_principal.principal_id.0,
-                ChatFreeText::BodyNodes,
-                &serde_json::to_vec(&structured_nodes).map_err(|error| {
-                    EdgeError::Internal(format!(
-                        "Chat structured nodes could not be encoded: {error}"
-                    ))
-                })?,
-            )?,
+        let message_id = self.api.post_message(
+            ctx.principal,
+            ctx.principal,
+            &conversation_id,
+            &body.content,
+            &body.references,
             client_nonce,
-        };
-        let now = now_timestamp();
-        let message_id = self.api.drive(async {
-            self.api
-                .reads
-                .messages
-                .append_structured_co_commit(
-                    self.api.object_ids.as_ref(),
-                    new_message,
-                    EventId(self.api.event_ids.mint().0),
-                    self.api.event_ids.as_ref(),
-                    &structured_nodes,
-                    Actor(event_principal),
-                    now.clone(),
-                    now,
-                )
-                .await
-                .map_err(map_store_error)
-        })?;
+        )?;
         Ok(no_store(EdgeResponse::json(
             201,
             &json!({ "message_id": message_id.as_str(), "durable": true }),
@@ -429,11 +460,7 @@ pub fn register_chat(
     kms: Arc<KmsEngine>,
 ) -> GatewayBuilder {
     let reads = DurableChatReadApi::new(pool, runtime, kms);
-    let api = DurableChatApi {
-        reads: reads.clone(),
-        event_ids: Arc::new(myelin_events::UlidMinter::new()),
-        object_ids: Arc::new(SystemUlidSource::new()),
-    };
+    let api = DurableChatMutationApi::new(reads.clone());
     builder
         .route(
             Method::Get,

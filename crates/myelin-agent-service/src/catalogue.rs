@@ -177,6 +177,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         for expected in [
             "chat.list_conversations",
+            "chat.post",
             "chat.read_messages",
             "git.list_repositories",
             "git.read_file",

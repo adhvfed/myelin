@@ -4,9 +4,11 @@ pub mod agent_mcp_http;
 pub mod authz;
 pub mod bootstrap;
 pub mod catalogue;
+pub mod chat_effect;
 pub mod chat_http;
 pub mod ci_http;
 pub mod device_auth;
+pub mod effect_router;
 pub mod error;
 pub mod gateway;
 #[path = "git_durable/ci_surface.rs"]
@@ -50,9 +52,11 @@ pub use catalogue::{
     page_envelope, Handler, HandlerCtx, Method, Page, API_VERSION, DEFAULT_PAGE_LIMIT,
     MAX_PAGE_LIMIT,
 };
-pub use chat_http::{register_chat, DurableChatReadApi};
+pub use chat_effect::ChatEffectApi;
+pub use chat_http::{register_chat, DurableChatMutationApi, DurableChatReadApi};
 pub use ci_http::{register_ci, DurableCiReadApi};
 pub use device_auth::{device_authorization_migrations, DeviceAuthorizationBroker};
+pub use effect_router::RoutedEffectApi;
 pub use error::{map_authz_error, EdgeError};
 pub use gateway::{
     sse_scope_for_resource, sse_scope_for_tenant, AuthProvider, AuthPublicConfig, Gateway,

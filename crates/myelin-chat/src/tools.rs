@@ -78,7 +78,11 @@ pub fn assert_routes_through_effect_api(def: &ToolDef) -> Result<(), MutationSea
 
 fn required_caps(tool: &str) -> Vec<String> {
     match tool {
-        POST_TOOL | REPLY_IN_THREAD_TOOL | REACT_TOOL | START_DM_TOOL => {
+        // `chat.post` is the public platform action granted to human callers and
+        // delegated agents. The Edge adapter separately proves that the human
+        // delegator can see the target conversation before it writes there.
+        POST_TOOL => vec!["chat.post".to_string()],
+        REPLY_IN_THREAD_TOOL | REACT_TOOL | START_DM_TOOL => {
             vec![format!("{}.post", chat_objects::CHANNEL)]
         }
         CREATE_CHANNEL_TOOL | INVITE_TOOL | ARCHIVE_CHANNEL_TOOL => {
@@ -91,7 +95,7 @@ fn required_caps(tool: &str) -> Vec<String> {
 fn input_schema(tool: &str) -> &'static str {
     match tool {
         POST_TOOL => {
-            r#"{"type":"object","required":["channel","body"],"properties":{"channel":{"type":"string"},"body":{"type":"string"}}}"#
+            r#"{"type":"object","required":["conversation_id","content"],"properties":{"conversation_id":{"type":"string","pattern":"^[0-9A-HJKMNP-TV-Z]{26}$"},"content":{"type":"string","minLength":1,"maxLength":32768},"references":{"type":"array","maxItems":32,"items":{"type":"string","minLength":1,"maxLength":1024}}},"additionalProperties":false}"#
         }
         REPLY_IN_THREAD_TOOL => {
             r#"{"type":"object","required":["channel","thread_root","body"],"properties":{"channel":{"type":"string"},"thread_root":{"type":"string"},"body":{"type":"string"}}}"#
@@ -125,7 +129,7 @@ pub fn chat_tool_def(tool: &str) -> ToolDef {
         effect_kind: EffectKind::Mutate,
         side_effecting: true,
         requires_approval: requires_approval_default(tool),
-        exposed_over_mcp: false,
+        exposed_over_mcp: tool == POST_TOOL,
     }
 }
 

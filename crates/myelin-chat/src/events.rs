@@ -58,6 +58,20 @@ pub const CHAT_CHANNEL_LINKED: &str = "chat.channel.linked";
 
 pub const CHAT_READ_STATE_UPDATED: &str = "chat.read_state.updated";
 
+pub const CHAT_POST_ATTEMPTED: &str = "chat.post.attempted";
+pub const CHAT_POST_APPLIED: &str = "chat.post.applied";
+pub const CHAT_POST_GATED: &str = "chat.post.gated";
+pub const CHAT_POST_DENIED: &str = "chat.post.denied";
+pub const CHAT_POST_INDETERMINATE: &str = "chat.post.indeterminate";
+
+pub const CHAT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
+    CHAT_POST_ATTEMPTED,
+    CHAT_POST_APPLIED,
+    CHAT_POST_GATED,
+    CHAT_POST_DENIED,
+    CHAT_POST_INDETERMINATE,
+];
+
 pub const CHAT_CHANNEL_SNAPSHOT: &str = "chat.channel.snapshot";
 pub const CHAT_MESSAGE_SNAPSHOT: &str = "chat.message.snapshot";
 pub const CHAT_THREAD_SNAPSHOT: &str = "chat.thread.snapshot";
@@ -78,6 +92,11 @@ pub const CHAT_DURABLE_TOKENS: &[&str] = &[
     CHAT_CHANNEL_MEMBER_REMOVED,
     CHAT_CHANNEL_LINKED,
     CHAT_READ_STATE_UPDATED,
+    CHAT_POST_ATTEMPTED,
+    CHAT_POST_APPLIED,
+    CHAT_POST_GATED,
+    CHAT_POST_DENIED,
+    CHAT_POST_INDETERMINATE,
     CHAT_CHANNEL_SNAPSHOT,
     CHAT_MESSAGE_SNAPSHOT,
     CHAT_THREAD_SNAPSHOT,
@@ -236,6 +255,9 @@ mod tests {
         assert!(CHAT_DURABLE_TOKENS.contains(&CHAT_CHANNEL_MEMBER_REMOVED));
         assert!(CHAT_DURABLE_TOKENS.contains(&CHAT_MESSAGE_ERASED));
         assert!(CHAT_DURABLE_TOKENS.contains(&CHAT_MESSAGE_SNAPSHOT));
+        for token in CHAT_GOVERNANCE_AUDIT_EVENT_TOKENS {
+            assert!(CHAT_DURABLE_TOKENS.contains(token));
+        }
         assert!(CHAT_FIREHOSE_TOKENS.contains(&CHAT_PRESENCE_CHANGED));
         assert!(CHAT_FIREHOSE_TOKENS.contains(&CHAT_READ_STATE_VIEWED));
     }

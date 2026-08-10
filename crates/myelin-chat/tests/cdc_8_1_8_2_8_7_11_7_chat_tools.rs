@@ -68,7 +68,7 @@ fn cdc_8_1_chat_tool_set_registers_into_the_real_tool_surface() {
             "chat.{tool} is a Mutate"
         );
         assert!(def.side_effecting);
-        assert!(!def.exposed_over_mcp);
+        assert_eq!(def.exposed_over_mcp, def.name.0 == POST_TOOL);
     }
 }
 

@@ -24,8 +24,8 @@ use crate::gateway::GatewayBuilder;
 use crate::repo_authz::{RepoAuthorizer, RepoPermission};
 use crate::request::EdgeResponse;
 use crate::{
-    DurableChatReadApi, DurableCiReadApi, DurableGitBackend, DurableIssueReadApi,
-    DurableKnowledgeReadApi, GitEffectApi, McpReadExecutor,
+    ChatEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
+    DurableIssueReadApi, DurableKnowledgeReadApi, GitEffectApi, McpReadExecutor, RoutedEffectApi,
 };
 
 #[derive(Clone)]
@@ -62,6 +62,7 @@ pub struct AgentMcpResources {
     issues: DurableIssueReadApi,
     knowledge: DurableKnowledgeReadApi,
     chat: DurableChatReadApi,
+    chat_mutations: DurableChatMutationApi,
 }
 
 impl AgentMcpResources {
@@ -71,6 +72,7 @@ impl AgentMcpResources {
         issues: DurableIssueReadApi,
         knowledge: DurableKnowledgeReadApi,
         chat: DurableChatReadApi,
+        chat_mutations: DurableChatMutationApi,
     ) -> Self {
         Self {
             git,
@@ -78,6 +80,7 @@ impl AgentMcpResources {
             issues,
             knowledge,
             chat,
+            chat_mutations,
         }
     }
 }
@@ -190,14 +193,31 @@ impl Handler for AgentMcpHandler {
             agent: ctx.principal.clone(),
             run_id: RunId(authorized.run_id.clone()),
         };
-        let effect_api = Box::new(GitEffectApi::new(
-            self.services.resources.git.clone(),
-            ctx.principal.tenant.0.clone(),
-            ctx.principal.region.0.clone(),
-            ctx.principal.clone(),
-            delegator.clone(),
-            self.services.authority.boundary.clone(),
-        ));
+        let effect_api = Box::new(
+            RoutedEffectApi::try_new([
+                (
+                    "git",
+                    Box::new(GitEffectApi::new(
+                        self.services.resources.git.clone(),
+                        ctx.principal.tenant.0.clone(),
+                        ctx.principal.region.0.clone(),
+                        ctx.principal.clone(),
+                        delegator.clone(),
+                        self.services.authority.boundary.clone(),
+                    )) as Box<dyn myelin_agent::EffectApi>,
+                ),
+                (
+                    "chat",
+                    Box::new(ChatEffectApi::new(
+                        self.services.resources.chat_mutations.clone(),
+                        ctx.principal.clone(),
+                        delegator.clone(),
+                        self.services.authority.boundary.clone(),
+                    )) as Box<dyn myelin_agent::EffectApi>,
+                ),
+            ])
+            .map_err(EdgeError::Unavailable)?,
+        );
         let approvers = Arc::new(CreatorApproverPolicy {
             creator_id: PrincipalId(registration.created_by),
             scope: ctx.scope.clone(),
