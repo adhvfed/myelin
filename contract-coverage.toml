@@ -826,7 +826,10 @@ cdc = [
 row = "11.3"
 title = "KMS hierarchy + KeyOrigin trait"
 status = "covered"
-cdc = ["crates/myelin-storage/tests/cdc_11_3_kms.rs"]
+cdc = [
+    "crates/myelin-storage/tests/cdc_11_3_kms.rs",
+    "crates/myelin-storage/tests/integration_mr025_kms_durable.rs",
+]
 
 [[contract]]
 row = "11.4"

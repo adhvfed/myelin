@@ -114,13 +114,11 @@ impl DurableKmsBacking {
 
     pub async fn load_or_generate(&self, seal_key: &SealKey) -> Result<KmsEngine, KmsDurableError> {
         let root = match self.read_sealed_root().await? {
-            Some(sealed) => {
-                CellRoot::unseal(seal_key, &sealed).ok_or_else(|| {
-                    KmsDurableError::WrongSealKey {
-                        cell_id: self.cell_id.clone(),
-                    }
-                })?
-            }
+            Some(sealed) => CellRoot::unseal(seal_key, &sealed).ok_or_else(|| {
+                KmsDurableError::WrongSealKey {
+                    cell_id: self.cell_id.clone(),
+                }
+            })?,
             None => {
                 let fresh = CellRoot::generate();
                 self.insert_sealed_root_if_absent(&fresh.seal(seal_key))
@@ -301,6 +299,69 @@ impl DurableKmsBacking {
         Ok(())
     }
 
+    async fn read_dek_material(
+        &self,
+        id: &DekId,
+        region: &Region,
+    ) -> Result<Option<(ExportedKek, WrappedDek, u64)>, PgError> {
+        let row = sqlx::query(
+            "SELECT kek.nonce AS kek_nonce, kek.wrapped AS kek_wrapped, kek.epoch AS kek_epoch, \
+                    dek.nonce AS dek_nonce, dek.wrapped AS dek_wrapped, \
+                    dek.kek_epoch AS dek_kek_epoch, dek.dek_epoch \
+               FROM kms_wrapped_kek kek \
+               JOIN kms_wrapped_dek dek \
+                 ON dek.cell_id = kek.cell_id AND dek.tenant_id = kek.tenant_id \
+              WHERE kek.cell_id = $1 AND kek.tenant_id = $2 AND kek.region = $3 \
+                AND dek.class = $4",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .bind(region.as_str())
+        .bind(id.class.as_token())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        row.map(|row| {
+            let kek_epoch = row.try_get::<i64, _>("kek_epoch").map_err(kms_row_decode)?;
+            let dek_kek_epoch = row
+                .try_get::<i64, _>("dek_kek_epoch")
+                .map_err(kms_row_decode)?;
+            if kek_epoch != dek_kek_epoch {
+                return Err(PgError::Query(format!(
+                    "durable KMS rows disagree on KEK epoch for tenant={} class={}",
+                    id.tenant.as_str(),
+                    id.class.as_token(),
+                )));
+            }
+            let dek_epoch = row.try_get::<i64, _>("dek_epoch").map_err(kms_row_decode)?;
+            if kek_epoch < 0 || dek_epoch < 0 {
+                return Err(PgError::Query(
+                    "durable KMS row has a negative key epoch".into(),
+                ));
+            }
+            let kek_nonce = row
+                .try_get::<Vec<u8>, _>("kek_nonce")
+                .map_err(kms_row_decode)?;
+            let dek_nonce = row
+                .try_get::<Vec<u8>, _>("dek_nonce")
+                .map_err(kms_row_decode)?;
+            Ok((
+                ExportedKek {
+                    nonce: nonce_from(&kek_nonce)?,
+                    wrapped: row.try_get("kek_wrapped").map_err(kms_row_decode)?,
+                    epoch: kek_epoch as u64,
+                },
+                WrappedDek {
+                    nonce: nonce_from(&dek_nonce)?,
+                    wrapped: row.try_get("dek_wrapped").map_err(kms_row_decode)?,
+                    kek_epoch: dek_kek_epoch as u64,
+                },
+                dek_epoch as u64,
+            ))
+        })
+        .transpose()
+    }
+
     async fn upsert_dek_row(
         &self,
         id: &DekId,
@@ -477,7 +538,10 @@ impl DurableKms {
     }
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
-        tokio::task::block_in_place(|| self.rt.block_on(fut))
+        match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| self.rt.block_on(fut)),
+            Err(_) => self.rt.block_on(fut),
+        }
     }
 
     async fn persist_kek_row(&self, id: &KekId) -> Result<(), KmsDurableError> {
@@ -542,6 +606,29 @@ impl DurableKms {
             }
         }
         Ok(key_ref)
+    }
+
+    pub(crate) fn resolve_dek(
+        &self,
+        key_ref: &PiiKeyRef,
+        region: &Region,
+    ) -> Result<crate::kms::DekHandle, KmsError> {
+        let dek_id = DekId::new(key_ref.tenant.clone(), key_ref.class.clone());
+        let material = self
+            .block(self.backing.read_dek_material(&dek_id, region))
+            .map_err(|error| KmsError::Durability(error.to_string()))?;
+        let Some((kek, dek, dek_epoch)) = material else {
+            self.core.destroy_dek(&dek_id);
+            return Err(KmsError::DekUnavailable(dek_id));
+        };
+        self.core.install_wrapped_kek(
+            KekId::new(key_ref.tenant.clone(), region.clone()),
+            kek.nonce,
+            kek.wrapped,
+            kek.epoch,
+        );
+        self.core.install_wrapped_dek(dek_id, dek, dek_epoch);
+        self.core.resolve_dek(key_ref, region)
     }
 
     pub(crate) fn rotate_kek(&self, id: &KekId) -> Result<u64, KmsError> {

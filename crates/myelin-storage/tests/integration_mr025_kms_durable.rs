@@ -3,7 +3,7 @@
 use myelin_config::MyelinConfig;
 use myelin_storage::kms_durable::{kms_durable_migrations, DurableKmsBacking, KmsDurableError};
 use myelin_storage::migration::HotTables;
-use myelin_storage::{KeyClass, KekId, SealKey, SubstrateProvider};
+use myelin_storage::{KekId, KeyClass, SealKey, SubstrateProvider};
 use myelin_tenancy::{Region, TenantId};
 
 const SEAL_K_HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -15,6 +15,16 @@ fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
         .database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
     c
+}
+
+fn test_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
 }
 
 fn uniq() -> String {
@@ -33,7 +43,7 @@ fn seal_k() -> SealKey {
 }
 
 async fn admin_provider() -> Option<SubstrateProvider> {
-    let cfg = admin_config(&MyelinConfig::dev());
+    let cfg = admin_config(&test_config());
     let provider = match SubstrateProvider::connect(cfg, 6).await {
         Ok(p) => p,
         Err(_) => {
@@ -49,7 +59,7 @@ async fn admin_provider() -> Option<SubstrateProvider> {
 }
 
 async fn fresh_pool() -> sqlx::postgres::PgPool {
-    SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 2)
+    SubstrateProvider::connect(admin_config(&test_config()), 2)
         .await
         .expect("fresh pool")
         .db_pool()
@@ -112,7 +122,10 @@ async fn wrong_seal_key_fails_closed_and_never_generates_a_new_root() {
     let seal = seal_k();
 
     let backing = DurableKmsBacking::new(provider.db_pool().clone(), &cell);
-    let engine1 = backing.load_or_generate(&seal).await.expect("first boot under K");
+    let engine1 = backing
+        .load_or_generate(&seal)
+        .await
+        .expect("first boot under K");
     backing
         .ensure_kek(&engine1, &KekId::new(tenant.clone(), region.clone()))
         .await
@@ -146,7 +159,10 @@ async fn wrong_seal_key_fails_closed_and_never_generates_a_new_root() {
             .fetch_one(provider.db_pool())
             .await
             .expect("count sealed roots");
-    assert_eq!(root_rows, 1, "the wrong-key boot did NOT mint a second root");
+    assert_eq!(
+        root_rows, 1,
+        "the wrong-key boot did NOT mint a second root"
+    );
 
     let engine_ok = DurableKmsBacking::new(fresh_pool().await, &cell)
         .load_or_generate(&seal)
@@ -185,7 +201,12 @@ async fn backup_snapshot_restore_recovers_data_and_keeps_a_shredded_key_dead() {
         .await
         .expect("tenant dek");
     let doomed_ref = backing
-        .ensure_dek(&engine1, &tenant, &region, KeyClass::Subject("u-doomed".into()))
+        .ensure_dek(
+            &engine1,
+            &tenant,
+            &region,
+            KeyClass::Subject("u-doomed".into()),
+        )
         .await
         .expect("subject dek");
     let (nonce, ct) = engine1
@@ -305,6 +326,59 @@ async fn keys_minted_through_the_default_sync_api_survive_engine_reconstruction(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn running_processes_observe_key_creation_and_crypto_shred_without_restart() {
+    let Some(provider) = admin_provider().await else {
+        return;
+    };
+    let suffix = uniq();
+    let cell = format!("cell-{suffix}");
+    let tenant = TenantId(format!("01J0LIVE{suffix}"));
+    let region = Region("eu-west".into());
+    let seal = seal_k();
+
+    let reader = DurableKmsBacking::new(provider.db_pool().clone(), &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("the long-running reader boots before the subject key exists");
+    let writer = DurableKmsBacking::new(fresh_pool().await, &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("a second process shares the sealed cell root");
+    writer.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    let key_ref = writer
+        .ensure_dek(&tenant, &region, KeyClass::Subject("u-live".into()))
+        .expect("the writer creates and durably publishes the subject key");
+    let (nonce, ciphertext) = writer
+        .resolve_dek(&key_ref, &region)
+        .expect("the writer resolves its key")
+        .seal(b"visible only while the subject key is live");
+
+    assert_eq!(
+        reader
+            .resolve_dek(&key_ref, &region)
+            .expect("an already-running reader discovers the new durable key")
+            .open(&nonce, &ciphertext)
+            .expect("the reader decrypts through the shared key"),
+        b"visible only while the subject key is live"
+    );
+
+    assert!(writer.destroy_dek(&myelin_storage::DekId::new(
+        tenant.clone(),
+        KeyClass::Subject("u-live".into()),
+    )));
+    assert!(
+        reader.resolve_dek(&key_ref, &region).is_err(),
+        "a reader that cached the key still observes the durable crypto-shred without restarting"
+    );
+
+    cleanup(provider.db_pool(), &cell).await;
+    println!(
+        "OK [6]: live processes discover durable key creation and immediately stop resolving a \
+         crypto-shredded subject key."
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotation_persists_kek_and_all_rewrapped_deks_atomically_and_survives_restart() {
     let Some(provider) = admin_provider().await else {
         return;
@@ -335,16 +409,19 @@ async fn rotation_persists_kek_and_all_rewrapped_deks_atomically_and_survives_re
         .resolve_dek(&tenant_ref, &region)
         .expect("resolve pre-rotation")
         .seal(b"sealed before rotation");
-    let new_epoch = engine1.rotate_kek(&kek_id).expect("rotation (durable path)");
+    let new_epoch = engine1
+        .rotate_kek(&kek_id)
+        .expect("rotation (durable path)");
     assert!(new_epoch > mint_epoch, "rotation bumped the KEK epoch");
 
-    let kek_epoch: i64 =
-        sqlx::query_scalar("SELECT epoch FROM kms_wrapped_kek WHERE cell_id = $1 AND tenant_id = $2")
-            .bind(&cell)
-            .bind(tenant.0.as_str())
-            .fetch_one(provider.db_pool())
-            .await
-            .expect("KEK row present");
+    let kek_epoch: i64 = sqlx::query_scalar(
+        "SELECT epoch FROM kms_wrapped_kek WHERE cell_id = $1 AND tenant_id = $2",
+    )
+    .bind(&cell)
+    .bind(tenant.0.as_str())
+    .fetch_one(provider.db_pool())
+    .await
+    .expect("KEK row present");
     let dek_epochs: Vec<i64> = sqlx::query_scalar(
         "SELECT kek_epoch FROM kms_wrapped_dek WHERE cell_id = $1 AND tenant_id = $2",
     )

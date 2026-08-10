@@ -331,11 +331,7 @@ impl DekHandle {
         self.seal_with_aad(plaintext, &[])
     }
 
-    pub fn seal_with_aad(
-        &self,
-        plaintext: &[u8],
-        aad: &[u8],
-    ) -> ([u8; NONCE_LEN], Vec<u8>) {
+    pub fn seal_with_aad(&self, plaintext: &[u8], aad: &[u8]) -> ([u8; NONCE_LEN], Vec<u8>) {
         let nonce = Aes256Gcm::generate_nonce(OsRng);
         let ct = self
             .key
@@ -448,7 +444,7 @@ pub struct KmsDurableSnapshot {
 pub(crate) struct KmsCore {
     root: CellRoot,
     keks: Mutex<BTreeMap<KekId, StoredKek>>,
-    deks: Mutex<BTreeMap<DekId, (WrappedDek, u64 )>>,
+    deks: Mutex<BTreeMap<DekId, (WrappedDek, u64)>>,
 }
 
 impl KmsCore {
@@ -672,9 +668,7 @@ impl KmsCore {
         let keks = self.keks.lock().expect("KMS keks poisoned");
         let deks = self.deks.lock().expect("KMS deks poisoned");
         deks.iter()
-            .filter(|(dek_id, _)| {
-                keks.keys().any(|k| k.tenant == dek_id.tenant)
-            })
+            .filter(|(dek_id, _)| keks.keys().any(|k| k.tenant == dek_id.tenant))
             .map(|(dek_id, (wrapped, _epoch))| (dek_id.clone(), wrapped.clone()))
             .collect()
     }
@@ -846,7 +840,11 @@ impl KmsEngine {
     }
 
     pub fn resolve_dek(&self, key_ref: &PiiKeyRef, region: &Region) -> Result<DekHandle, KmsError> {
-        self.core().resolve_dek(key_ref, region)
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.resolve_dek(key_ref, region),
+            KmsBackend::Durable(durable) => durable.resolve_dek(key_ref, region),
+        }
     }
 
     pub fn rotate_kek(&self, id: &KekId) -> Result<u64, KmsError> {
