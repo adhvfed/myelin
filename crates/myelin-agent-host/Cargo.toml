@@ -17,6 +17,7 @@ myelin-events = { path = "../myelin-events" }
 myelin-identity = { path = "../myelin-identity" }
 myelin-identity-service = { path = "../myelin-identity-service" }
 myelin-tenancy = { path = "../myelin-tenancy" }
+myelin-refs = { path = "../myelin-refs" }
 serde_json.workspace = true
 serde.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
@@ -25,6 +26,7 @@ blake3.workspace = true
 
 [dev-dependencies]
 myelin-agent-model = { path = "../myelin-agent-model", features = ["test-support"] }
+myelin-agent-service = { path = "../myelin-agent-service", features = ["integration"] }
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }

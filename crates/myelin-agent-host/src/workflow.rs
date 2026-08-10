@@ -1,10 +1,14 @@
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
-use myelin_agent_service::hosted_run_contract::{AGENT_RUN_WORKFLOW, AGENT_RUN_WORKFLOW_VERSION};
+use myelin_agent_service::hosted_run_contract::{
+    agent_run_definition_hash, AGENT_RUN_WORKFLOW, AGENT_RUN_WORKFLOW_VERSION,
+};
 use myelin_events::EventEnvelope;
 use myelin_flow::{
-    DelegationCaveats, PgClaimedDriveInput, PgInputResolveError, PgWorkflowInputResolver,
+    ActivityError, DelegationCaveats, PgClaimedDriveInput, PgFlowWorker, PgInputResolveError,
+    PgResolvedDriveInput, PgWorkerError, PgWorkflowInputResolver, RetryPolicy,
 };
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::HOSTED_LUNA_RUNTIME;
@@ -16,6 +20,56 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::LlmRunTask;
+
+pub trait HostedAgentRunExecutor: Send + Sync {
+    fn execute(
+        &self,
+        input: &HostedAgentWorkflowInput,
+        activity_key: &str,
+        now_secs: i64,
+    ) -> Result<myelin_refs::ArtifactRef, String>;
+}
+
+pub fn register_hosted_agent_workflow(
+    worker: &mut PgFlowWorker,
+    resolver: HostedAgentInputResolver,
+    executor: Arc<dyn HostedAgentRunExecutor>,
+) -> Result<(), PgWorkerError> {
+    worker.register_definition_with_input_resolver(
+        AGENT_RUN_WORKFLOW,
+        AGENT_RUN_WORKFLOW_VERSION,
+        &agent_run_definition_hash(),
+        resolver,
+        move |resolved, ctx| {
+            let input = decode_hosted_agent_workflow_input(resolved)?;
+            let now = ctx.now();
+            let now_secs = chrono::DateTime::parse_from_rfc3339(&now)
+                .map_err(|error| format!("hosted workflow clock is invalid: {error}"))?
+                .timestamp();
+            ctx.activity(RetryPolicy { max_attempts: 1 }, |activity_key, _attempt| {
+                executor
+                    .execute(&input, activity_key, now_secs)
+                    .map(|run_ref| vec![run_ref])
+                    .map_err(ActivityError)
+            })
+            .map_err(|error| format!("hosted agent activity failed: {error:?}"))
+        },
+    )
+}
+
+fn decode_hosted_agent_workflow_input(
+    resolved: &PgResolvedDriveInput,
+) -> Result<HostedAgentWorkflowInput, String> {
+    let input: HostedAgentWorkflowInput = serde_json::from_slice(&resolved.material)
+        .map_err(|error| format!("decode governed hosted-agent input: {error}"))?;
+    if input.tenant != resolved.claimed.tenant
+        || input.region != resolved.claimed.region
+        || input.run_id != resolved.claimed.run_id
+    {
+        return Err("resolved hosted-agent identity differs from its claimed workflow".into());
+    }
+    Ok(input)
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HostedAgentWorkflowInput {

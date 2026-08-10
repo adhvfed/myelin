@@ -2525,6 +2525,7 @@ dependencies = [
  "myelin-git",
  "myelin-identity",
  "myelin-identity-service",
+ "myelin-refs",
  "myelin-storage",
  "myelin-tenancy",
  "serde",

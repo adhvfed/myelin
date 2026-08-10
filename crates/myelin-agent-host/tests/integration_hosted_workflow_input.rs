@@ -1,20 +1,29 @@
-use myelin_agent_host::{HostedAgentInputResolver, HostedAgentWorkflowInput};
+use std::sync::{Arc, Mutex};
+
+use myelin_agent_host::{
+    register_hosted_agent_workflow, HostedAgentInputResolver, HostedAgentRunExecutor,
+    HostedAgentWorkflowInput,
+};
 use myelin_agent_service::hosted_run_contract::{AGENT_RUN_WORKFLOW, AGENT_RUN_WORKFLOW_VERSION};
+use myelin_agent_service::trigger_handoff::TriggerRunHandoff;
 use myelin_config::MyelinConfig;
 use myelin_events::{
     Actor, AggregateKey, CorrelationId, DataRole as EventDataRole, EventEnvelope, EventId,
-    EventType, Timestamp, Visibility,
+    EventType, IdMinter, MonotonicMinter, Timestamp, Visibility,
 };
-use myelin_flow::{PgClaimedDriveInput, PgInputResolveError, PgWorkflowInputResolver};
+use myelin_flow::{
+    partition_for_run_id, DriveOutcome, PgClaimedDriveInput, PgFlowWorker, PgInputResolveError,
+    PgRunOnceOutcome, PgWorkerScope, PgWorkflowInputResolver,
+};
 use myelin_identity::{
     DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef,
 };
 use myelin_identity_service::HOSTED_LUNA_RUNTIME;
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
-    all_durable_migrations, AgentTriggerClaimRequest, AgentTriggerStartRequest,
-    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, NewAgentTriggerBinding,
-    ReserveAgentTriggerFiringOutcome, StartAgentTriggerFiringOutcome, SubstrateProvider,
+    all_durable_migrations, AgentTriggerClaimRequest, CreateAgentTriggerBindingOutcome,
+    DurableAgentTriggerBacking, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
+    SubstrateProvider,
 };
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use sqlx::types::chrono::Utc;
@@ -130,6 +139,29 @@ fn the_main_build_failed(tenant: &TenantId, region: &str) -> EventEnvelope {
     }
 }
 
+#[derive(Default)]
+struct RecordingHostedAgent {
+    executions: Mutex<Vec<(HostedAgentWorkflowInput, String, i64)>>,
+}
+
+impl HostedAgentRunExecutor for RecordingHostedAgent {
+    fn execute(
+        &self,
+        input: &HostedAgentWorkflowInput,
+        activity_key: &str,
+        now_secs: i64,
+    ) -> Result<ArtifactRef, String> {
+        self.executions
+            .lock()
+            .unwrap()
+            .push((input.clone(), activity_key.to_string(), now_secs));
+        Ok(ArtifactRef(format!(
+            "myelin://{}/agent/run/{}",
+            input.tenant.0, input.run_id
+        )))
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
     let admin = match SubstrateProvider::connect(admin_config(), 4).await {
@@ -154,7 +186,6 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
     let tenant = unique_tenant();
     let agent_id = Uuid::parse_str("20000000-0000-4000-8000-000000000012").unwrap();
     let binding_id = Uuid::parse_str("10000000-0000-4000-8000-000000000011").unwrap();
-    let run_id = Uuid::parse_str("30000000-0000-4000-8000-000000000013").unwrap();
     a_founder_has_one_hosted_agent(&app, &tenant, agent_id).await;
 
     let triggers = DurableAgentTriggerBacking::new(app.clone());
@@ -212,25 +243,20 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
         .await
         .expect("the hosted lane is available")
         .expect("the repair bot is woken");
-    let start = AgentTriggerStartRequest::from_claim(&claim, run_id).unwrap();
-    let triggers_for_start = triggers.clone();
-    let tenant_for_start = tenant.0.clone();
-    let started = app
-        .with_tenant_tx(&tenant.0, move |conn| {
-            Box::pin(async move {
-                triggers_for_start
-                    .start_claimed_firing_on_conn(conn, &tenant_for_start, &start)
-                    .await
-            })
-        })
+    let handoff = TriggerRunHandoff::new(app.clone(), tokio::runtime::Handle::current());
+    handoff
+        .register_workflow(&tenant)
+        .expect("the hosted workflow definition is known before dispatch");
+    let receipt = handoff
+        .start(&tenant, &claim)
         .await
-        .expect("the firing becomes the run of record");
-    assert_eq!(started, StartAgentTriggerFiringOutcome::Started);
+        .expect("the firing and workflow start together");
+    let run_id = receipt.run_id;
 
     let claimed_input = PgClaimedDriveInput {
         tenant: tenant.clone(),
         region: event.region.clone(),
-        run_id: run_id.to_string(),
+        run_id: run_id.clone(),
         wf_type: AGENT_RUN_WORKFLOW.into(),
         wf_version: AGENT_RUN_WORKFLOW_VERSION,
         input: vec![event.subject.clone()],
@@ -239,7 +265,7 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
         causation_id: Some(event.event_id.0.clone()),
         caused_by: None,
         depth: i32::try_from(event.depth).expect("bounded event depth fits the workflow schema"),
-        partition: 0,
+        partition: partition_for_run_id(&run_id),
     };
     let resolver = HostedAgentInputResolver::new(app.clone());
     let material = resolver
@@ -271,10 +297,72 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
             if reason.contains("immutable trigger event")
     ));
 
+    let agent = Arc::new(RecordingHostedAgent::default());
+    let worker_actor = Actor(Principal::new(
+        tenant.clone(),
+        event.region.clone(),
+        PrincipalId("svc:hosted-agent-worker".into()),
+        PrincipalKind::Service,
+        DataRole::Processor,
+        PrincipalStatus::Active,
+    ));
+    let scope = PgWorkerScope::new(
+        tenant.clone(),
+        event.region.clone(),
+        partition_for_run_id(&run_id),
+        "hosted-agent-worker-1",
+        30,
+        worker_actor,
+        1,
+    )
+    .expect("the hosted worker has one exact tenant partition");
+    let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
+    let mut worker = PgFlowWorker::new(
+        app.db_pool().clone(),
+        tokio::runtime::Handle::current(),
+        minter,
+        scope,
+    );
+    register_hosted_agent_workflow(&mut worker, resolver, agent.clone())
+        .expect("the worker owns the hosted-agent definition");
+
+    let run_ref = ArtifactRef(format!("myelin://{}/agent/run/{run_id}", tenant.0));
+    let driven = worker
+        .run_once(1_786_352_400, "2026-08-10T09:00:00Z")
+        .await
+        .expect("the governed work reaches its hosted agent");
+    assert!(matches!(
+        driven,
+        PgRunOnceOutcome::Driven {
+            run_id: ref driven_id,
+            outcome: DriveOutcome::Completed(ref refs),
+            ..
+        } if driven_id == &run_id && refs == &[run_ref]
+    ));
+
+    {
+        let executions = agent.executions.lock().unwrap();
+        assert_eq!(executions.len(), 1, "one firing becomes one agent run");
+        assert_eq!(executions[0].0, work);
+        assert_eq!(executions[0].1, format!("{run_id}/agent.run:1/act"));
+        assert_eq!(executions[0].2, 1_786_352_400);
+    }
+    assert!(matches!(
+        worker
+            .run_once(1_786_352_401, "2026-08-10T09:00:01Z")
+            .await
+            .expect("a completed workflow stays quiet"),
+        PgRunOnceOutcome::Idle
+    ));
+    assert_eq!(agent.executions.lock().unwrap().len(), 1);
+
     let cleanup_tenant = tenant.0.clone();
     app.with_tenant_tx(&tenant.0, move |conn| {
         Box::pin(async move {
             for statement in [
+                "DELETE FROM wf_activity_attempt WHERE tenant_id = $1",
+                "DELETE FROM wf_history WHERE tenant_id = $1",
+                "DELETE FROM workflow_run WHERE tenant_id = $1",
                 "DELETE FROM agent_trigger_firing WHERE tenant_id = $1",
                 "DELETE FROM agent_trigger_binding WHERE tenant_id = $1",
                 "DELETE FROM identity_agent WHERE tenant_id = $1",

@@ -13,7 +13,10 @@ pub use identity::timestamp_from_epoch;
 pub mod workflow;
 use durable_model::DurableModelClient;
 use identity::{IdentityRunMinter, IdentityRunRevoker};
-pub use workflow::{HostedAgentInputResolver, HostedAgentWorkflowInput};
+pub use workflow::{
+    register_hosted_agent_workflow, HostedAgentInputResolver, HostedAgentRunExecutor,
+    HostedAgentWorkflowInput,
+};
 
 use myelin_agent::{
     MeteredRuntime, ToolCall, ToolDef, ToolName, ToolResult, ToolSchema, ToolSurface,
@@ -32,8 +35,8 @@ use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Principal, Zookie,
 };
 use myelin_storage::agent_wallet::AgentWallet;
-use myelin_storage::AgentModelStepStore;
 use myelin_storage::reserve_settle::CostLedger;
+use myelin_storage::AgentModelStepStore;
 use myelin_storage::{
     DurableCellRootBacking, DurableDelegationPolicyBacking, DurableRevocationBacking, SealKey,
     SubstrateProvider, TenantScope,
