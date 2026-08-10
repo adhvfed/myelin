@@ -1,23 +1,18 @@
-// Pure view-model mapping for the PR list screens (R3.1). Kept side-effect-free + DOM-free so it runs
-// under the node vitest harness (the a11y/render layer is the Playwright + design-system jsdom gates).
-// The rules here are the honest ones: a missing title becomes `#number` (never fabricated), and the
-// row's href resolves the repo from the row (cross-repo) or the route (per-repo).
+// Side-effect-free view-model mapping for PR list screens.
 import { fmtDate } from "./format";
 import type { PrListRowVM } from "./api";
 
-/** The row's display title. A legacy record has `title === null` → render `#number` (honest, never a
- *  fabricated title). When a title exists the `#number` is shown separately by the row, so this is the
- *  TITLE text only. */
+/** Use the PR number when a legacy row has no title. */
 export function prTitleText(row: Pick<PrListRowVM, "title" | "number">): string {
   return row.title ?? `#${row.number}`;
 }
 
-/** Whether the row is showing the honest `#number` fallback (no stored title). */
+/** Whether the row is using the PR-number fallback. */
 export function isTitleFallback(row: Pick<PrListRowVM, "title">): boolean {
   return row.title == null || row.title === "";
 }
 
-/** The deep link to a PR overview. On the cross-repo front door the repo comes from the ROW
+/** The deep link to a PR overview. On the cross-repo page the repo comes from the row
  *  (`row.repo`); on a per-repo list it comes from the route (`routeRepo`). */
 export function prHref(
   row: Pick<PrListRowVM, "number" | "repo">,
@@ -64,8 +59,7 @@ export function reviewMarker(
   return null;
 }
 
-/** Whether a bucket/tab yielded no rows because of a FILTER (distinct from a truly-empty list) — the
- *  screen shows "no results" (offer Clear filters), never the teaching empty state. */
+/** Whether filtering, rather than an empty collection, produced no rows. */
 export function isFilteredNoResults(
   itemsLen: number,
   counts: Record<string, number> | undefined,
@@ -74,20 +68,15 @@ export function isFilteredNoResults(
   return itemsLen === 0 && total > 0;
 }
 
-/** The honest count + truncation state for one cross-repo bucket (peer-review #21a). The count CHIP
- *  must show the TRUE total (`page.total`), not the page size (`items.length`) — otherwise a limited
- *  response reads as if it were complete. `truncated` is true when fewer rows are shown than the total
- *  (or the server offers a `next_cursor`), so the screen can DISCLOSE the shortfall instead of silently
- *  dropping the rest. Falls back to the shown count when the server sends no `total` (then nothing is
- *  hidden, so `truncated` is false). Pure — unit-tested; the endpoint returns everything today, but this
- *  keeps the surface honest-by-construction if/when the cross-repo list starts paginating. */
+/** Count and truncation state for a cross-repo bucket. Prefer the server total, but never report
+ * fewer rows than are present. A next cursor also marks the result as truncated. */
 export function bucketPageSummary(page: {
   items: { length: number };
   page: { total?: number; next_cursor?: string | null };
 }): { count: number; shown: number; truncated: boolean } {
   const shown = page.items.length;
   const total = page.page.total ?? shown;
-  const count = Math.max(total, shown); // never report fewer than we actually show
+  const count = Math.max(total, shown);
   const truncated = shown < count || (page.page.next_cursor != null);
   return { count, shown, truncated };
 }

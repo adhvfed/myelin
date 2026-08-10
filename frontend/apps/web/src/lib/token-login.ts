@@ -1,7 +1,5 @@
 // Dependency-free token login decision. auth.ts supplies verification and session persistence.
-//
-// THE TOKEN IS A SECRET. It is only ever the caller-supplied value flowing through these deps
-// server-side; it is never logged, never returned to the client, never put in a query string.
+// Tokens remain server-side and must not be logged or returned to the client.
 
 /** The edge's `GET /v1/whoami` view-model for a valid token (crates/myelin-edge gateway.rs). */
 export interface TokenWhoami {
@@ -24,19 +22,18 @@ export interface TokenSessionInput {
   tenant: string;
 }
 
-/** The injectable dependencies (the real ones live in `auth.ts`; tests fake them). */
+/** Dependencies supplied by `auth.ts` and replaced in tests. */
 export interface TokenLoginDeps {
   /** Re-read the edge's authoritative auth posture immediately before verification. Only an
    *  explicit `true` admits token login; false/missing config and transport errors fail closed. */
   isEnabled: () => Promise<boolean>;
-  /** Verify a CALLER-SUPPLIED token against the real edge whoami. Resolves with the viewer facts on a
-   *  200; REJECTS on any non-200 / network error (invalid or expired token). Never leaks the raw error. */
+  /** Verify the supplied token with the edge. Rejects on a non-200 response or network error. */
   verify: (token: string, scheme: string) => Promise<TokenWhoami>;
   /** Issue the session server-side (store record + set the httpOnly cookie). */
   issue: (rec: TokenSessionInput) => void | Promise<void>;
 }
 
-/** Where the login sends the browser next. Success → the repos home; failure → the honest error state. */
+/** Where the login sends the browser next. */
 export interface TokenLoginResult {
   redirectTo: string;
 }
@@ -45,7 +42,7 @@ export interface TokenLoginResult {
 export const TOKEN_LOGIN_ERROR = "/login?error=token_invalid";
 /** A disabled or unavailable auth mode returns to the login chooser without exposing edge detail. */
 export const TOKEN_LOGIN_DISABLED = "/login";
-/** On success, land in the app exactly where the dev seam lands. */
+/** Successful login destination. */
 export const TOKEN_LOGIN_SUCCESS = "/git/repos";
 /** The edge's default capability-token scheme; the paste form defaults here but may override. */
 export const DEFAULT_TOKEN_SCHEME = "agent";
@@ -65,8 +62,7 @@ function hasControlCharacter(value: string): boolean {
   return false;
 }
 
-/** Derive an honest identity-menu label from the principal id — whoami carries no human display name
- *  for a capability token, so the PII-free principal id IS the honest label (never a fabricated name). */
+/** Capability-token responses have no display name, so use the principal ID. */
 export function deriveDisplayName(principalId: string): string {
   return principalId;
 }
@@ -74,13 +70,11 @@ export function deriveDisplayName(principalId: string): string {
 /**
  * Run the operator-token login decision.
  *
- * 1. Empty token → the honest error (nothing to verify).
+ * 1. Empty or malformed token: return an authentication error.
  * 2. Re-read the authoritative edge config. Anything except explicit enabled (including a config
- *    fetch error) → the login chooser; `verify` and `issue` are NEVER called.
- * 3. `verify` REJECTS (invalid/expired token or edge unreachable) → the honest error; NO session. The
- *    raw edge error is swallowed here so it can never leak to the client.
- * 4. `verify` resolves but the whoami shape is missing a principal id → the honest error; NO session.
- * 5. Otherwise mint the session. Pasted tokens have no refresh credential and expire normally.
+ *    fetch error): return to the login chooser without verification.
+ * 3. Verification failure or an invalid identity response: return an authentication error.
+ * 4. Otherwise mint the session. Pasted tokens have no refresh credential and expire normally.
  */
 export async function runTokenLogin(
   rawToken: string,

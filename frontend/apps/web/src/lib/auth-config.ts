@@ -1,8 +1,4 @@
-// The PURE mapping behind `getAuthConfig` (the logged-out login page's render source). Kept
-// dependency-free (no "use server", no @solidjs/router — which is a client-only API that throws when
-// imported in plain node) so it is unit-testable in isolation, exactly like `dev-login-guard.ts` and
-// `gateway-core.ts`. `auth.ts`'s `getAuthConfig` query does only the edge fetch + floor-tolerant
-// fallback, then delegates the mapping here.
+// Dependency-free mapping for `getAuthConfig`, kept separate for Node tests.
 
 import { devSeamAllowed, type DevLoginEnv } from "./dev-login-guard";
 
@@ -12,20 +8,16 @@ export interface AuthProvider {
   label: string;
 }
 
-/** The logged-out login page's honest render source — the edge's SSO posture + the two login-seam
- *  gates (dev seam, operator-token). */
+/** Authentication methods available on the logged-out page. */
 export interface AuthConfig {
   sso_configured: boolean;
   providers: AuthProvider[];
   dev_login_enabled: boolean;
-  /** R4.0 — whether the edge accepts the OPERATOR-TOKEN login (env `MYELIN_TOKEN_LOGIN=1`). When true
-   *  the login page paints the paste-your-bootstrap-token card. Unlike `dev_login_enabled` this is a
-   *  REAL working path (it verifies against the live edge), so the edge flag alone is authoritative —
-   *  no frontend build/env gate. Fail-closed: false if the edge is unreachable. */
+  /** Whether the edge accepts operator-token login. Defaults to false when config is unavailable. */
   token_login_enabled: boolean;
 }
 
-/** The edge's raw `/v1/auth/config` shape (its `dev_login_enabled` reflects the EDGE env). */
+/** The edge's raw `/v1/auth/config` response. */
 export interface EdgeAuthConfig {
   sso_configured?: boolean;
   providers?: AuthProvider[];
@@ -35,10 +27,8 @@ export interface EdgeAuthConfig {
 
 /**
  * Map the edge's raw config to the login page's render source.
- *  - `dev_login_enabled` is the FRONTEND-authoritative composition (build + frontend env + edge flag)
- *    via {@link devSeamAllowed} — the frontend owns the dev seam.
- *  - `token_login_enabled` is a REAL working path, so the edge flag alone gates it (no build/env kill
- *    switch). Both default fail-closed to false (unset field, or the caller's edge-unreachable stub).
+ * Development login requires the edge flag, frontend environment, and a non-production build.
+ * Operator-token login depends only on the edge flag. Missing values default to false.
  */
 export function toAuthConfig(
   edge: unknown,
