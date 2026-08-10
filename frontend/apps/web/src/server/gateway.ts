@@ -146,6 +146,78 @@ export interface EdgeOidcLogin {
   expiresAt: number;
 }
 
+/** Exchange an explicitly configured development bootstrap capability for the bounded human
+ * session the browser application is designed to carry. The operator capability approves one
+ * PKCE-bound device request server-to-server and is never stored in the browser session. */
+export async function edgeMintDevSession(
+  bootstrapToken: string,
+  bootstrapScheme: string,
+): Promise<EdgeOidcLogin> {
+  const verifierBytes = crypto.getRandomValues(new Uint8Array(32));
+  const verifier = Buffer.from(verifierBytes).toString("base64url");
+  const challengeBytes = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier));
+  const challenge = Buffer.from(challengeBytes).toString("base64url");
+  const call = async (
+    path: string,
+    body: unknown,
+    authorization?: { token: string; scheme: string },
+  ): Promise<unknown> => {
+    const response = await fetch(`${edgeOrigin()}${path}`, {
+      method: "POST",
+      headers: {
+        accept: "application/json",
+        "content-type": "application/json",
+        ...(authorization
+          ? {
+              authorization: `Bearer ${authorization.token}`,
+              "x-myelin-token-scheme": authorization.scheme,
+            }
+          : {}),
+      },
+      body: JSON.stringify(body),
+      redirect: "error",
+      signal: gatewayRequestSignal(),
+    });
+    const value = parseJson(await readLimitedText(response, 64 * 1024));
+    if (response.status < 200 || response.status >= 300) {
+      throw new Unauthorized(`development session exchange failed (HTTP ${response.status})`);
+    }
+    return value;
+  };
+
+  const started = await call("/v1/auth/device/authorization", { code_challenge: challenge });
+  if (started === null || typeof started !== "object" ||
+      typeof (started as Record<string, unknown>).device_code !== "string" ||
+      typeof (started as Record<string, unknown>).user_code !== "string") {
+    throw new Unauthorized("development session exchange returned an unexpected authorization");
+  }
+  const deviceCode = (started as Record<string, unknown>).device_code as string;
+  const userCode = (started as Record<string, unknown>).user_code as string;
+  const approved = await call(
+    "/v1/auth/device/approval",
+    { user_code: userCode },
+    { token: bootstrapToken, scheme: bootstrapScheme },
+  );
+  if (approved === null || typeof approved !== "object" ||
+      (approved as Record<string, unknown>).approved !== true) {
+    throw new Unauthorized("development session exchange was not approved");
+  }
+  const claimed = await call("/v1/auth/device/token", {
+    device_code: deviceCode,
+    code_verifier: verifier,
+  });
+  const session = claimed as Record<string, unknown> | null;
+  if (!session || !validSessionToken(session.access_token) || session.scheme !== "session" ||
+      session.token_type !== "Bearer" || !validCredentialExpirySeconds(session.expires_at)) {
+    throw new Unauthorized("development session exchange returned an unexpected credential");
+  }
+  return {
+    accessToken: session.access_token,
+    scheme: "session",
+    expiresAt: session.expires_at as number,
+  };
+}
+
 function validCredentialExpirySeconds(value: unknown): value is number {
   return (
     Number.isSafeInteger(value) &&

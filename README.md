@@ -182,14 +182,15 @@ Hosted agents use the same identity and tool catalogue, but Myelin owns their ex
 integer minor-unit budget, optional delegation caveats, and safety gates. Each firing receives a
 short-lived run identity and reaches Git, CI, Issues, Chat, and Knowledge only through governed
 Myelin tools. Owners can inspect durable firing history and outcomes, pause new reservations for
-maintenance, resume them, or irreversibly disable an automation. Every run that reaches a final
+maintenance, resume them, or irreversibly disable an automation from either the CLI or the web
+Automations workspace. Every run that reaches a final
 agent answer writes it before cost settlement as one immutable, content-addressed Knowledge
 trace. Its answer and block-model body rest only as authenticated ciphertext under the
 requesting human's durable subject key. The automation owner can retrieve that work product and
-its exact metered cost with
-`automation result`; other users cannot read it through the run reference. The owner can erase one
-result with `automation erase-result`; a durable erasure marker makes the operation idempotent and
-refuses any later hosted-worker attempt to recreate the trace. A human-approval gate parks the exact
+its exact metered cost in the web firing history or with `automation result`; other users cannot
+read it through the run reference. The owner can erase one result from that result view or with
+`automation erase-result`; a durable erasure marker makes the operation idempotent and refuses any
+later hosted-worker attempt to recreate the trace. A human-approval gate parks the exact
 event without starting or paying for an agent run. It appears in the owner's shared inbox
 with approve and reject actions in the web app and a copyable CLI command; either decision is
 durable and retry-safe, completes the inbox item, and remains visible in automation history. No

@@ -10,6 +10,7 @@ import {
 } from "../server/session";
 import {
   edgeGetPublic,
+  edgeMintDevSession,
   edgeWhoami,
   edgeWhoamiWithToken,
   isUnauthorized,
@@ -116,12 +117,17 @@ export const loginDev = action(async (formData: FormData) => {
   const token = configuredToken || DEV_ACCESS_TOKEN;
   const scheme = process.env.MYELIN_DEV_TOKEN_SCHEME?.trim() || DEV_SCHEME;
   const whoami = await edgeWhoamiWithToken(token, scheme);
+  // The real assembled stack configures an operator bootstrap capability for local development.
+  // Exchange it immediately for a HumanSession so browser actions use the same least-privilege
+  // purpose as OIDC. The in-process contract edge has no device broker, so its fixed fixture keeps
+  // the legacy refresh pair solely inside that test harness.
+  const delegated = configuredToken ? await edgeMintDevSession(token, scheme) : null;
   await issueSession({
-    token,
-    refreshToken: configuredToken ? "" : DEV_REFRESH_TOKEN,
-    scheme,
+    token: delegated?.accessToken ?? token,
+    refreshToken: delegated ? "" : DEV_REFRESH_TOKEN,
+    scheme: delegated?.scheme ?? scheme,
     credentialExpiresAtMs: Math.min(
-      whoami.expires_at * 1_000,
+      (delegated?.expiresAt ?? whoami.expires_at) * 1_000,
       Date.now() + SESSION_ABSOLUTE_TTL_MS,
     ),
     principalId: whoami.principal_id,

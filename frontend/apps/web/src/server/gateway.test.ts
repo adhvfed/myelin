@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createHash } from "node:crypto";
 
 const session = vi.hoisted(() => ({
   clearCurrentSession: vi.fn(),
@@ -19,6 +20,7 @@ import {
   edgeGetPublic,
   edgeGetRaw,
   edgeLoginWithOidc,
+  edgeMintDevSession,
   edgePost,
   gatewayRequestSignal,
 } from "./gateway";
@@ -400,6 +402,63 @@ describe("edgeLoginWithOidc", () => {
     }), { status: 200 })));
 
     await expect(edgeLoginWithOidc("id-token", "nonce")).rejects.toMatchObject({
+      name: "Unauthorized",
+    });
+  });
+});
+
+describe("edgeMintDevSession", () => {
+  it("keeps the bootstrap credential on the approval hop and returns only a PKCE-bound session", async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        device_code: "device-code",
+        user_code: "ABCD-EFGH",
+      }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ approved: true }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: "bounded-human-session",
+        token_type: "Bearer",
+        scheme: "session",
+        expires_at: 1_800_000_000,
+      }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(edgeMintDevSession("operator-bootstrap", "agent")).resolves.toEqual({
+      accessToken: "bounded-human-session",
+      scheme: "session",
+      expiresAt: 1_800_000_000,
+    });
+
+    const begin = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body)) as { code_challenge: string };
+    const approvalHeaders = new Headers(fetchMock.mock.calls[1]?.[1]?.headers);
+    const claim = JSON.parse(String(fetchMock.mock.calls[2]?.[1]?.body)) as {
+      device_code: string;
+      code_verifier: string;
+    };
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).has("authorization")).toBe(false);
+    expect(approvalHeaders.get("authorization")).toBe("Bearer operator-bootstrap");
+    expect(approvalHeaders.get("x-myelin-token-scheme")).toBe("agent");
+    expect(new Headers(fetchMock.mock.calls[2]?.[1]?.headers).has("authorization")).toBe(false);
+    expect(claim.device_code).toBe("device-code");
+    expect(createHash("sha256").update(claim.code_verifier).digest("base64url"))
+      .toBe(begin.code_challenge);
+  });
+
+  it("refuses a claimed credential with a non-human purpose", async () => {
+    vi.stubGlobal("fetch", vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        device_code: "device-code",
+        user_code: "ABCD-EFGH",
+      }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ approved: true }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        access_token: "wrong-purpose",
+        token_type: "Bearer",
+        scheme: "agent",
+        expires_at: 1_800_000_000,
+      }), { status: 200 })));
+
+    await expect(edgeMintDevSession("operator-bootstrap", "agent")).rejects.toMatchObject({
       name: "Unauthorized",
     });
   });
