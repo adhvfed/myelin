@@ -4,6 +4,7 @@ use myelin_storage::{
     DurableAgentTraceStore, DurableKmsBacking, HotTables, SealKey, SubstrateProvider,
 };
 use myelin_tenancy::TenantId;
+use std::sync::Arc;
 
 fn app_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
@@ -142,4 +143,88 @@ async fn an_erasure_marker_refuses_to_resurrect_a_trace_on_worker_retry() {
         })
         .await
         .expect("clean the isolated erasure story");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_ones() {
+    let Some(provider) = test_provider().await else {
+        return;
+    };
+    let tenant = TenantId(unique("trace-subject-erasure"));
+    let seal_key = SealKey::from_encoded(&"77".repeat(32)).expect("a 32-byte test seal key");
+    let kms = Arc::new(
+        DurableKmsBacking::new(provider.db_pool().clone(), unique("trace-subject-cell"))
+            .load_or_generate(&seal_key)
+            .await
+            .expect("the durable test KMS starts"),
+    );
+    let store = DurableAgentTraceStore::with_runtime(
+        provider.clone(),
+        tokio::runtime::Handle::current(),
+        kms.clone(),
+    );
+    for run_id in [
+        "11111111-1111-4111-8111-111111111111",
+        "22222222-2222-4222-8222-222222222222",
+    ] {
+        store
+            .write(&tenant, trace(run_id))
+            .expect("a subject-keyed trace is durable");
+    }
+    assert_eq!(
+        store.count_for_subject(&tenant.0, "founder").await.unwrap(),
+        2,
+        "both final answers are discoverable through the subject locator"
+    );
+
+    let erased = store
+        .erase_for_subject(&tenant.0, "founder")
+        .await
+        .expect("the subject erasure completes");
+    assert_eq!(erased.traces_erased, 2);
+    assert!(!erased.already_erased);
+    assert!(erased.key_destroyed, "the durable subject DEK existed");
+    assert!(
+        erased.key_unrecoverable,
+        "the subject DEK no longer resolves"
+    );
+    assert_eq!(
+        store.count_for_subject(&tenant.0, "founder").await.unwrap(),
+        0,
+        "no live trace rows remain"
+    );
+    assert_eq!(
+        store
+            .write(&tenant, trace("33333333-3333-4333-8333-333333333333"))
+            .unwrap_err(),
+        AgentTraceError::Erased,
+        "the durable subject marker refuses a later worker retry before it can recreate a key"
+    );
+    let replay = store
+        .erase_for_subject(&tenant.0, "founder")
+        .await
+        .expect("subject erasure is idempotent");
+    assert!(replay.already_erased);
+    assert_eq!(replay.traces_erased, 0);
+    assert!(replay.key_unrecoverable);
+
+    let cleanup_tenant = tenant.0.clone();
+    provider
+        .with_tenant_tx(&tenant.0, move |connection| {
+            Box::pin(async move {
+                for statement in [
+                    "DELETE FROM knowledge_agent_trace_erasure WHERE tenant_id = $1",
+                    "DELETE FROM knowledge_agent_trace_subject_erasure WHERE tenant_id = $1",
+                ] {
+                    sqlx::query(statement)
+                        .bind(&cleanup_tenant)
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .expect("clean the isolated subject-erasure story");
 }

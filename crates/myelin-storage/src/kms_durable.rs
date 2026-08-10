@@ -502,8 +502,8 @@ impl DurableKmsBacking {
         Ok(())
     }
 
-    async fn delete_dek_row(&self, id: &DekId) -> Result<(), PgError> {
-        sqlx::query(
+    async fn delete_dek_row(&self, id: &DekId) -> Result<bool, PgError> {
+        let deleted = sqlx::query(
             "DELETE FROM kms_wrapped_dek WHERE cell_id = $1 AND tenant_id = $2 AND class = $3",
         )
         .bind(&self.cell_id)
@@ -512,7 +512,7 @@ impl DurableKmsBacking {
         .execute(&self.pool)
         .await
         .map_err(|e| PgError::Query(e.to_string()))?;
-        Ok(())
+        Ok(deleted.rows_affected() > 0)
     }
 
     pub async fn ensure_kek(&self, engine: &KmsEngine, id: &KekId) -> Result<u64, KmsDurableError> {
@@ -570,8 +570,8 @@ impl DurableKmsBacking {
         id: &DekId,
     ) -> Result<bool, KmsDurableError> {
         let removed = engine.destroy_dek(id);
-        self.delete_dek_row(id).await?;
-        Ok(removed)
+        let durable_removed = self.delete_dek_row(id).await?;
+        Ok(removed || durable_removed)
     }
 
     pub async fn restore(&self, snap: &KmsDurableSnapshot) -> Result<(), KmsDurableError> {
@@ -753,16 +753,18 @@ impl DurableKms {
     }
 
     pub(crate) fn destroy_dek(&self, id: &DekId) -> bool {
-        if let Err(e) = self.block(self.backing.delete_dek_row(id)) {
-            panic!(
-                "KMS DURABILITY FAILURE (fail-static hard-down): crypto-shred of DEK tenant={} \
-                 class={} could NOT delete the durable row - the shred was REFUSED (a shred that \
-                 does not reach the store silently resurrects the key on restart, §7.5): {e}",
-                id.tenant.as_str(),
-                id.class.as_token()
-            );
-        }
-        self.core.destroy_dek(id)
+        let durable_removed = self
+            .block(self.backing.delete_dek_row(id))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "KMS DURABILITY FAILURE (fail-static hard-down): crypto-shred of DEK tenant={} \
+                     class={} could NOT delete the durable row - the shred was REFUSED (a shred that \
+                     does not reach the store silently resurrects the key on restart, §7.5): {error}",
+                    id.tenant.as_str(),
+                    id.class.as_token()
+                )
+            });
+        self.core.destroy_dek(id) || durable_removed
     }
 
     pub(crate) fn wrap_dek_material(

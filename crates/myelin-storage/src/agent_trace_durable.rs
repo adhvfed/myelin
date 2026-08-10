@@ -9,7 +9,7 @@ use serde_json::Value;
 use sqlx::Row;
 
 use crate::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
-use crate::kms::{KeyClass, KmsEngine, PiiKeyRef, NONCE_LEN};
+use crate::kms::{DekId, KeyClass, KmsEngine, PiiKeyRef, NONCE_LEN};
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
@@ -85,6 +85,24 @@ ALTER TABLE knowledge_agent_trace
     );
 "#;
 
+pub const AGENT_TRACE_SUBJECT_ERASURE_MIGRATION: &str = r#"
+CREATE TABLE IF NOT EXISTS knowledge_agent_trace_subject_erasure (
+    tenant_id     text        NOT NULL,
+    region        text        NOT NULL,
+    subject_token text        NOT NULL CHECK (length(subject_token) = 64),
+    erased_at     timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (tenant_id, region, subject_token)
+);
+ALTER TABLE knowledge_agent_trace_subject_erasure ENABLE ROW LEVEL SECURITY;
+ALTER TABLE knowledge_agent_trace_subject_erasure FORCE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS myelin_tenant_isolation ON knowledge_agent_trace_subject_erasure;
+CREATE POLICY myelin_tenant_isolation ON knowledge_agent_trace_subject_erasure
+  USING (tenant_id = current_setting('myelin.tenant_id', true)
+         AND region = current_setting('myelin.region', true))
+  WITH CHECK (tenant_id = current_setting('myelin.tenant_id', true)
+              AND region = current_setting('myelin.region', true));
+"#;
+
 pub fn agent_trace_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0098_knowledge_agent_trace", AGENT_TRACE_MIGRATION),
@@ -95,6 +113,10 @@ pub fn agent_trace_durable_migrations() -> Migrations {
         Migration::plain(
             "0100_knowledge_agent_trace_encryption",
             AGENT_TRACE_ENCRYPTION_MIGRATION,
+        ),
+        Migration::plain(
+            "0101_knowledge_agent_trace_subject_erasure",
+            AGENT_TRACE_SUBJECT_ERASURE_MIGRATION,
         ),
     ])
 }
@@ -210,6 +232,14 @@ pub struct AgentTraceEraseReceipt {
 pub enum EraseAgentTraceOutcome {
     Erased(AgentTraceEraseReceipt),
     NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTraceSubjectEraseReceipt {
+    pub traces_erased: u64,
+    pub already_erased: bool,
+    pub key_destroyed: bool,
+    pub key_unrecoverable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -375,6 +405,80 @@ impl DurableAgentTraceStore {
             .await
     }
 
+    pub async fn count_for_subject(
+        &self,
+        tenant: &str,
+        requested_by: &str,
+    ) -> Result<u64, ProviderError> {
+        let tenant = tenant.to_string();
+        let requested_by = requested_by.to_string();
+        let region = self.provider.config().region.clone();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |connection| {
+                Box::pin(async move {
+                    let count = sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM knowledge_agent_trace \
+                          WHERE tenant_id = $1 AND region = $2 AND requested_by = $3",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&requested_by)
+                    .fetch_one(connection)
+                    .await
+                    .map_err(trace_query)?;
+                    u64::try_from(count)
+                        .map_err(|_| PgError::Query("agent trace count is negative".into()))
+                })
+            })
+            .await
+    }
+
+    pub async fn erase_for_subject(
+        &self,
+        tenant: &str,
+        requested_by: &str,
+    ) -> Result<AgentTraceSubjectEraseReceipt, AgentTraceError> {
+        let tenant_id = tenant.to_string();
+        let subject = requested_by.to_string();
+        let region = self.provider.config().region.clone();
+        let subject_token = subject_token(&tenant_id, &region, &subject);
+        let transaction_tenant = tenant_id.clone();
+        let database_receipt = self
+            .provider
+            .with_tenant_tx(&transaction_tenant, move |connection| {
+                Box::pin(async move {
+                    erase_subject_on_connection(
+                        connection,
+                        &tenant_id,
+                        &region,
+                        &subject,
+                        &subject_token,
+                    )
+                    .await
+                })
+            })
+            .await
+            .map_err(|error| AgentTraceError::Storage(error.to_string()))?;
+        let tenant = TenantId(tenant.to_string());
+        let class = KeyClass::Subject(requested_by.to_string());
+        let key_destroyed = self
+            .kms
+            .destroy_dek(&DekId::new(tenant.clone(), class.clone()));
+        let key_unrecoverable = self
+            .kms
+            .resolve_dek(
+                &PiiKeyRef::new(tenant, 0, class),
+                &Region(self.provider.config().region.clone()),
+            )
+            .is_err();
+        Ok(AgentTraceSubjectEraseReceipt {
+            traces_erased: database_receipt.traces_erased,
+            already_erased: database_receipt.already_erased,
+            key_destroyed,
+            key_unrecoverable,
+        })
+    }
+
     fn write_blocking(
         &self,
         tenant: &TenantId,
@@ -383,9 +487,9 @@ impl DurableAgentTraceStore {
         let tenant_id = tenant.0.clone();
         let region = self.provider.config().region.clone();
         let artifact_ref = trace.artifact_ref(tenant)?;
-        let sealed = seal_trace(&self.kms, tenant, &region, &artifact_ref, &trace)?;
         let persisted_ref = artifact_ref.clone();
         let provider = self.provider.clone();
+        let kms = self.kms.clone();
         let transaction_tenant = tenant_id.clone();
         let future = provider.with_tenant_tx(&transaction_tenant, move |connection| {
             Box::pin(async move {
@@ -395,7 +499,7 @@ impl DurableAgentTraceStore {
                     &region,
                     &persisted_ref,
                     &trace,
-                    &sealed,
+                    &kms,
                 )
                 .await
             })
@@ -428,8 +532,23 @@ async fn write_on_connection(
     region: &str,
     artifact_ref: &ArtifactRef,
     trace: &AgentTraceWrite,
-    sealed: &SealedAgentTrace,
+    kms: &KmsEngine,
 ) -> Result<Result<bool, AgentTraceError>, PgError> {
+    let token = subject_token(tenant, region, &trace.requested_by);
+    lock_subject(connection, tenant, region, &token).await?;
+    let subject_erased = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_erasure \
+          WHERE tenant_id = $1 AND region = $2 AND subject_token = $3)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(&token)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    if subject_erased {
+        return Ok(Err(AgentTraceError::Erased));
+    }
     lock_trace(connection, tenant, region, &trace.run_id).await?;
     let erased = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM knowledge_agent_trace_erasure \
@@ -444,6 +563,16 @@ async fn write_on_connection(
     if erased {
         return Ok(Err(AgentTraceError::Erased));
     }
+    let sealed = match seal_trace(
+        kms,
+        &TenantId(tenant.to_string()),
+        region,
+        artifact_ref,
+        trace,
+    ) {
+        Ok(sealed) => sealed,
+        Err(error) => return Ok(Err(error)),
+    };
     let charged_micro = i64::try_from(trace.charged_micro)
         .map_err(|_| PgError::Query("agent trace charge exceeds i64".into()))?;
     let inserted = sqlx::query(
@@ -505,6 +634,68 @@ async fn write_on_connection(
         Ok(true)
     } else {
         Err(AgentTraceError::Conflict)
+    })
+}
+
+struct DatabaseSubjectEraseReceipt {
+    traces_erased: u64,
+    already_erased: bool,
+}
+
+async fn erase_subject_on_connection(
+    connection: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    requested_by: &str,
+    subject_token: &str,
+) -> Result<DatabaseSubjectEraseReceipt, PgError> {
+    lock_subject(connection, tenant, region, subject_token).await?;
+    let already_erased = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_erasure \
+          WHERE tenant_id = $1 AND region = $2 AND subject_token = $3)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(subject_token)
+    .fetch_one(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    sqlx::query(
+        "INSERT INTO knowledge_agent_trace_subject_erasure \
+           (tenant_id, region, subject_token) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(subject_token)
+    .execute(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    sqlx::query(
+        "INSERT INTO knowledge_agent_trace_erasure \
+           (tenant_id, region, run_id, artifact_ref) \
+         SELECT tenant_id, region, run_id, artifact_ref FROM knowledge_agent_trace \
+          WHERE tenant_id = $1 AND region = $2 AND requested_by = $3 \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(requested_by)
+    .execute(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    let deleted = sqlx::query(
+        "DELETE FROM knowledge_agent_trace \
+          WHERE tenant_id = $1 AND region = $2 AND requested_by = $3",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(requested_by)
+    .execute(&mut *connection)
+    .await
+    .map_err(trace_query)?;
+    Ok(DatabaseSubjectEraseReceipt {
+        traces_erased: deleted.rows_affected(),
+        already_erased,
     })
 }
 
@@ -617,6 +808,27 @@ async fn lock_trace(
         .await
         .map_err(trace_query)?;
     Ok(())
+}
+
+async fn lock_subject(
+    connection: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    subject_token: &str,
+) -> Result<(), PgError> {
+    let lock_key = format!("agent-trace-subject\u{1f}{tenant}\u{1f}{region}\u{1f}{subject_token}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(lock_key)
+        .execute(connection)
+        .await
+        .map_err(trace_query)?;
+    Ok(())
+}
+
+fn subject_token(tenant: &str, region: &str, requested_by: &str) -> String {
+    let body =
+        format!("myelin.agent_trace.subject.v1\u{1f}{tenant}\u{1f}{region}\u{1f}{requested_by}");
+    blake3::hash(body.as_bytes()).to_hex().to_string()
 }
 
 fn seal_trace(
@@ -831,5 +1043,7 @@ mod tests {
         assert!(AGENT_TRACE_ERASURE_MIGRATION.contains("PRIMARY KEY (tenant_id, region, run_id)"));
         assert!(AGENT_TRACE_ENCRYPTION_MIGRATION.contains("payload_ciphertext bytea"));
         assert!(AGENT_TRACE_ENCRYPTION_MIGRATION.contains("answer IS NULL AND trace_body IS NULL"));
+        assert!(AGENT_TRACE_SUBJECT_ERASURE_MIGRATION.contains("subject_token text"));
+        assert!(AGENT_TRACE_SUBJECT_ERASURE_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
     }
 }
