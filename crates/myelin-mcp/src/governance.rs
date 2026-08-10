@@ -240,6 +240,13 @@ fn audit_event_type(
         ("git.open_pr", "gated") => Ok(myelin_git::events::GIT_OPEN_PR_GATED),
         ("git.open_pr", "denied") => Ok(myelin_git::events::GIT_OPEN_PR_DENIED),
         ("git.open_pr", "indeterminate") => Ok(myelin_git::events::GIT_OPEN_PR_INDETERMINATE),
+        ("git.write_file", "attempted") => Ok(myelin_git::events::GIT_WRITE_FILE_ATTEMPTED),
+        ("git.write_file", "applied") => Ok(myelin_git::events::GIT_WRITE_FILE_APPLIED),
+        ("git.write_file", "gated") => Ok(myelin_git::events::GIT_WRITE_FILE_GATED),
+        ("git.write_file", "denied") => Ok(myelin_git::events::GIT_WRITE_FILE_DENIED),
+        ("git.write_file", "indeterminate") => {
+            Ok(myelin_git::events::GIT_WRITE_FILE_INDETERMINATE)
+        }
         ("git.submit_review", "attempted") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_ATTEMPTED),
         ("git.submit_review", "applied") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_APPLIED),
         ("git.submit_review", "gated") => Ok(myelin_git::events::GIT_SUBMIT_REVIEW_GATED),

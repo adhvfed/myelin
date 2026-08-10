@@ -419,6 +419,7 @@ describe("the CLI authentication journey", () => {
       expect(mcpManifest.tools.map((tool) => tool.name)).toEqual(
         expect.arrayContaining([
           "git.open_pr",
+          "git.write_file",
           "git.list_repositories",
           "git.read_file",
           "git.search_code",
@@ -454,6 +455,8 @@ describe("the CLI authentication journey", () => {
         "ci.read_run",
         "--tool",
         "git.open_pr",
+        "--tool",
+        "git.write_file",
         "--tool",
         "git.list_repositories",
         "--tool",
@@ -511,6 +514,7 @@ describe("the CLI authentication journey", () => {
             { name: "git.open_pr", version: 1 },
             { name: "git.read_file", version: 1 },
             { name: "git.search_code", version: 1 },
+            { name: "git.write_file", version: 1 },
             { name: "issues.create", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
@@ -543,6 +547,7 @@ describe("the CLI authentication journey", () => {
           "ci.read_run",
           "ci.read_log",
           "git.open_pr",
+          "git.write_file",
           "git.list_repositories",
           "git.read_file",
           "git.search_code",
@@ -576,6 +581,8 @@ describe("the CLI authentication journey", () => {
         "ci.read_run",
         "--tool",
         "git.open_pr",
+        "--tool",
+        "git.write_file",
         "--tool",
         "git.list_repositories",
         "--tool",
@@ -671,6 +678,7 @@ describe("the CLI authentication journey", () => {
             { name: "git.open_pr", version: 1 },
             { name: "git.read_file", version: 1 },
             { name: "git.search_code", version: 1 },
+            { name: "git.write_file", version: 1 },
             { name: "issues.create", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
@@ -747,69 +755,80 @@ describe("the CLI authentication journey", () => {
         "git.open_pr",
         "git.read_file",
         "git.search_code",
+        "git.write_file",
         "issues.create",
         "issues.list",
         "issues.view",
         "knowledge.list_pages",
         "knowledge.read_page",
       ]);
-      expect(discoveredTools.at(0)?.inputSchema).toMatchObject({
+      const toolsByName = new Map(
+        discoveredTools.map((tool) => [string(tool.name, "MCP tool name"), tool]),
+      );
+      const schemaFor = (name: string) =>
+        record(toolsByName.get(name)?.inputSchema, `${name} input schema`);
+      expect(schemaFor("chat.list_conversations")).toMatchObject({
         type: "object",
         additionalProperties: false,
       });
-      expect(discoveredTools.at(1)?.inputSchema).toMatchObject({
+      expect(schemaFor("chat.post")).toMatchObject({
         type: "object",
         required: ["conversation_id", "content"],
         additionalProperties: false,
       });
-      expect(discoveredTools.at(2)?.inputSchema).toMatchObject({
+      expect(schemaFor("chat.read_messages")).toMatchObject({
         type: "object",
         required: ["conversation_id"],
         additionalProperties: false,
       });
-      expect(discoveredTools.at(3)?.inputSchema).toMatchObject({
+      expect(schemaFor("ci.read_run")).toMatchObject({
         type: "object",
         required: ["run_id"],
         additionalProperties: false,
       });
-      expect(discoveredTools.at(4)?.inputSchema).toMatchObject({
+      expect(schemaFor("git.list_repositories")).toMatchObject({
         type: "object",
         additionalProperties: false,
       });
-      expect(discoveredTools.at(5)?.inputSchema).toMatchObject({
+      expect(schemaFor("git.open_pr")).toMatchObject({
         type: "object",
         required: ["repo", "title"],
         additionalProperties: false,
       });
-      expect(discoveredTools.at(6)?.inputSchema).toMatchObject({
+      expect(schemaFor("git.read_file")).toMatchObject({
         type: "object",
         required: ["repo", "ref", "path"],
         additionalProperties: false,
       });
-      expect(discoveredTools.at(7)?.inputSchema).toMatchObject({
+      expect(schemaFor("git.search_code")).toMatchObject({
         type: "object",
         required: ["query"],
         additionalProperties: false,
       });
-      expect(discoveredTools.at(8)?.inputSchema).toMatchObject({
+      expect(schemaFor("git.write_file")).toMatchObject({
+        type: "object",
+        required: ["repo", "ref", "path", "contents", "base_oid"],
+        additionalProperties: false,
+      });
+      expect(schemaFor("issues.create")).toMatchObject({
         type: "object",
         required: ["project_id", "title"],
         additionalProperties: false,
       });
-      expect(discoveredTools.at(9)?.inputSchema).toMatchObject({
+      expect(schemaFor("issues.list")).toMatchObject({
         type: "object",
         additionalProperties: false,
       });
-      expect(discoveredTools.at(10)?.inputSchema).toMatchObject({
+      expect(schemaFor("issues.view")).toMatchObject({
         type: "object",
         required: ["issue_id"],
         additionalProperties: false,
       });
-      expect(discoveredTools.at(11)?.inputSchema).toMatchObject({
+      expect(schemaFor("knowledge.list_pages")).toMatchObject({
         type: "object",
         additionalProperties: false,
       });
-      expect(discoveredTools.at(12)?.inputSchema).toMatchObject({
+      expect(schemaFor("knowledge.read_page")).toMatchObject({
         type: "object",
         required: ["page_id"],
         additionalProperties: false,
@@ -897,6 +916,7 @@ describe("the CLI authentication journey", () => {
         "git.open_pr",
         "git.read_file",
         "git.search_code",
+        "git.write_file",
         "issues.create",
         "issues.list",
         "issues.view",
@@ -1208,12 +1228,6 @@ describe("the CLI authentication journey", () => {
         "providerCredentialsRequired = false",
         "providerCredentialsRequired = false as const",
       );
-      const agentBranchCommit = await sourceRepository.updateFile(
-        agentBranch,
-        sourcePath,
-        proposedSourceContents,
-        { startRef: "main" },
-      );
 
       // Once resumed, the collaborator reads the founder's issue, product spec, release room, and
       // source through Myelin itself. The run credential and the founder's live permissions
@@ -1354,6 +1368,45 @@ describe("the CLI authentication journey", () => {
         preview_unavailable: false,
       });
 
+      // The collaborator authors the proposed change through the governed Git surface. The
+      // optimistic blob OID prevents lost updates, while start_ref creates a review branch without
+      // granting the agent a reusable Git credential.
+      const agentWriteKey = `agent-write-${randomUUID()}`;
+      const writtenByAgent = await askAgentToAct(
+        resumedRun,
+        12,
+        "git.write_file",
+        {
+          repo: sourceRepository.slug,
+          ref: agentBranch,
+          path: sourcePath,
+          contents: proposedSourceContents,
+          base_oid: string(sourceFile.base_oid, "agent-visible source blob OID"),
+          start_ref: "main",
+        },
+        agentWriteKey,
+      );
+      const replayedAgentWrite = await askAgentToAct(
+        resumedRun,
+        13,
+        "git.write_file",
+        {
+          repo: sourceRepository.slug,
+          ref: agentBranch,
+          path: sourcePath,
+          contents: proposedSourceContents,
+          base_oid: string(sourceFile.base_oid, "agent-visible source blob OID"),
+          start_ref: "main",
+        },
+        agentWriteKey,
+      );
+      expect(replayedAgentWrite.eventId).toBe(writtenByAgent.eventId);
+      const agentBranchCommit = string(
+        writtenByAgent.eventId,
+        "agent file-write event id",
+      ).match(/^git\.file\.write:([0-9a-f]{40})\|/)?.[1];
+      expect(agentBranchCommit).toBeTruthy();
+
       // Authorship and authorization stay separate: the PR is authored by the agent, while the
       // founder's live repository grant is the authorization basis. The agent receives neither a
       // copied Git credential nor a durable repository grant of its own.
@@ -1361,27 +1414,27 @@ describe("the CLI authentication journey", () => {
       const agentPullRequestKey = `agent-pr-${randomUUID()}`;
       const openedByAgent = await askAgentToAct(
         resumedRun,
-        12,
+        14,
         "git.open_pr",
         {
           repo: sourceRepository.slug,
           title: agentPullRequestTitle,
           base_ref: "refs/heads/main",
           head_ref: `refs/heads/${agentBranch}`,
-          head_oid: agentBranchCommit.commitOid,
+          head_oid: agentBranchCommit,
         },
         agentPullRequestKey,
       );
       const replayedAgentPullRequest = await askAgentToAct(
         resumedRun,
-        13,
+        15,
         "git.open_pr",
         {
           repo: sourceRepository.slug,
           title: agentPullRequestTitle,
           base_ref: "refs/heads/main",
           head_ref: `refs/heads/${agentBranch}`,
-          head_oid: agentBranchCommit.commitOid,
+          head_oid: agentBranchCommit,
         },
         agentPullRequestKey,
       );
@@ -1425,7 +1478,7 @@ describe("the CLI authentication journey", () => {
       const agentIssueKey = `agent-issue-${randomUUID()}`;
       const createdByAgent = await askAgentToAct(
         resumedRun,
-        14,
+        16,
         "issues.create",
         {
           project_id: createdProject.project.id,
@@ -1435,7 +1488,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentIssue = await askAgentToAct(
         resumedRun,
-        15,
+        17,
         "issues.create",
         {
           project_id: createdProject.project.id,
@@ -1483,7 +1536,7 @@ describe("the CLI authentication journey", () => {
       const agentPostKey = `agent-chat-${randomUUID()}`;
       const postedByAgent = await askAgentToAct(
         resumedRun,
-        16,
+        18,
         "chat.post",
         {
           conversation_id: conversationId,
@@ -1497,7 +1550,7 @@ describe("the CLI authentication journey", () => {
       );
       const replayedAgentPost = await askAgentToAct(
         resumedRun,
-        17,
+        19,
         "chat.post",
         {
           conversation_id: conversationId,

@@ -211,6 +211,7 @@ mod tests {
                 "git.read_file",
                 "git.search_code",
                 "git.submit_review",
+                "git.write_file",
                 "issues.create",
                 "issues.list",
                 "issues.view",

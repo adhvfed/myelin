@@ -47,6 +47,7 @@ use myelin_git::pr_threads::{
 use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate,
     PushOutcome, PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
+    RejectReason,
 };
 use myelin_git::refs_pagination::WIRE_MAX_REF_NAME_BYTES;
 use myelin_git::web::{
@@ -125,6 +126,29 @@ pub struct DurableGitBackend {
     repo_authz: Arc<dyn RepoAuthorizer>,
     bootstrap: Arc<dyn RepoBootstrapGrants>,
 }
+
+pub(crate) struct AgentFileWrite<'a> {
+    pub target: RepoActorContext<'a>,
+    pub gitref: &'a str,
+    pub path: &'a str,
+    pub expected_base: &'a str,
+    pub contents: &'a str,
+    pub start_ref: Option<&'a str>,
+    pub operation_id: &'a PrOperationId,
+}
+
+struct FileCommit<'a> {
+    target: RepoActorContext<'a>,
+    gitref: &'a str,
+    path: &'a str,
+    expected_base: &'a str,
+    contents: &'a str,
+    start_ref: Option<&'a str>,
+    message: &'a str,
+    actor_is_agent: bool,
+}
+
+const AGENT_FILE_WRITE_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GitBootRecoveryReport {
@@ -1451,15 +1475,128 @@ impl DurableGitBackend {
         contents: &str,
         start_ref: Option<&str>,
     ) -> Result<WebEditOutcome, DurableError> {
+        self.commit_file(FileCommit {
+            target,
+            gitref,
+            path,
+            expected_base,
+            contents,
+            start_ref,
+            message: "web edit",
+            actor_is_agent: false,
+        })
+    }
+
+    pub(crate) fn write_file_with_operation(
+        &self,
+        request: AgentFileWrite<'_>,
+    ) -> Result<String, DurableError> {
+        let AgentFileWrite {
+            target,
+            gitref,
+            path,
+            expected_base,
+            contents,
+            start_ref,
+            operation_id,
+        } = request;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal: actor,
+        } = target;
+        if actor.tenant.0 != tenant || actor.region.0 != region {
+            return Err(DurableError::Git(
+                "file-write actor must share the requested tenant and region".into(),
+            ));
+        }
+        if contents.len() > AGENT_FILE_WRITE_MAX_BYTES {
+            return Err(DurableError::Git(format!(
+                "file contents exceed the {AGENT_FILE_WRITE_MAX_BYTES}-byte agent write limit"
+            )));
+        }
+        let full_ref = branch_ref(gitref);
+        let request_hash = file_write_request_hash(
+            tenant,
+            &actor.principal_id.0,
+            slug,
+            &full_ref,
+            path,
+            expected_base,
+            contents,
+            start_ref,
+        );
+        let operation_trailer = format!("Myelin-Operation: {}", operation_id.digest());
+        let request_trailer = format!("Myelin-Request: {request_hash}");
+        let loc = Self::loc(tenant, region, slug);
+        let repo = Arc::new(self.store.open_repo(&loc)?);
+        if let Some(previous) = repo.find_reflog_commit_by_trailer(&full_ref, &operation_trailer)? {
+            return replayed_file_write(previous.oid.0, &previous.message, &request_trailer);
+        }
+
+        let message = format!("agent file edit\n\n{operation_trailer}\n{request_trailer}");
+        let outcome = self.commit_file_in_repo(
+            repo.clone(),
+            FileCommit {
+                target,
+                gitref,
+                path,
+                expected_base,
+                contents,
+                start_ref,
+                message: &message,
+                actor_is_agent: true,
+            },
+        )?;
+        match outcome {
+            WebEditOutcome::Committed { new_oid } => Ok(new_oid),
+            WebEditOutcome::StaleBase { .. } => {
+                if let Some(previous) =
+                    repo.find_reflog_commit_by_trailer(&full_ref, &operation_trailer)?
+                {
+                    replayed_file_write(previous.oid.0, &previous.message, &request_trailer)
+                } else {
+                    Err(DurableError::Git(
+                        "the file changed since it was read; nothing was overwritten".into(),
+                    ))
+                }
+            }
+            WebEditOutcome::Denied => Err(DurableError::Forbidden(
+                "no write permission for this ref".into(),
+            )),
+        }
+    }
+
+    fn commit_file(&self, request: FileCommit<'_>) -> Result<WebEditOutcome, DurableError> {
+        let target = request.target;
+        let loc = Self::loc(target.tenant, target.region, target.slug);
+        let repo = Arc::new(self.store.open_repo(&loc)?);
+        self.commit_file_in_repo(repo, request)
+    }
+
+    fn commit_file_in_repo(
+        &self,
+        repo: Arc<DurableGitRepo>,
+        request: FileCommit<'_>,
+    ) -> Result<WebEditOutcome, DurableError> {
+        let FileCommit {
+            target,
+            gitref,
+            path,
+            expected_base,
+            contents,
+            start_ref,
+            message,
+            actor_is_agent,
+        } = request;
         let RepoActorContext {
             tenant,
             region,
             slug,
             principal,
         } = target;
-        let loc = Self::loc(tenant, region, slug);
-        let repo = Arc::new(self.store.open_repo(&loc)?);
-        let full = format!("refs/heads/{gitref}");
+        let full = branch_ref(gitref);
         let start_full = start_ref.map(|value| {
             if value.starts_with("refs/heads/") {
                 value.to_string()
@@ -1488,17 +1625,18 @@ impl DurableGitBackend {
         }
 
         let psn = Self::pseudonym(tenant, principal);
-        let (new_commit, _new_blob, prior_target) = repo.build_file_commit_from_ref(
+        let (new_commit, new_blob, prior_target) = repo.build_file_commit_from_ref(
             &full,
             start_full.as_deref(),
             path,
             contents.as_bytes(),
-            "web edit",
+            message,
             &psn,
             &psn,
         )?;
 
-        let ref_store = self.open_durable_refstore(repo, slug, tenant, region, principal);
+        let ref_store =
+            self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
         let expected_old = prior_target
             .map(|p| PushOid::new(p.0))
             .unwrap_or_else(PushOid::zero);
@@ -1510,10 +1648,19 @@ impl DurableGitBackend {
                 forced: false,
                 commit_oids: vec![PushOid::new(new_commit.0.clone())],
             }],
-            quarantine: Vec::new(),
+            quarantine: vec![
+                QuarantineObject {
+                    oid: PushOid::new(new_blob.0),
+                    bytes: contents.as_bytes().to_vec(),
+                },
+                QuarantineObject {
+                    oid: PushOid::new(new_commit.0.clone()),
+                    bytes: repo.read_object_bounded(&new_commit, 64 * 1024)?,
+                },
+            ],
             pusher: Pusher {
                 pseudonym: psn,
-                is_agent: false,
+                is_agent: actor_is_agent,
             },
         };
         match ref_store
@@ -1523,9 +1670,12 @@ impl DurableGitBackend {
             PushOutcome::Accepted { .. } => Ok(WebEditOutcome::Committed {
                 new_oid: new_commit.0,
             }),
-            PushOutcome::Rejected(_) => Ok(WebEditOutcome::StaleBase {
-                current_oid: current_base,
-            }),
+            PushOutcome::Rejected(RejectReason::NonFastForward { .. }) => {
+                Ok(WebEditOutcome::StaleBase {
+                    current_oid: current_base,
+                })
+            }
+            PushOutcome::Rejected(_) => Ok(WebEditOutcome::Denied),
             PushOutcome::Crashed(_) => Err(DurableError::Git("web-edit ref-CAS crashed".into())),
         }
     }
@@ -3000,6 +3150,56 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+fn branch_ref(gitref: &str) -> String {
+    if gitref.starts_with("refs/heads/") {
+        gitref.to_string()
+    } else {
+        format!("refs/heads/{gitref}")
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn file_write_request_hash(
+    tenant: &str,
+    actor: &str,
+    repo: &str,
+    gitref: &str,
+    path: &str,
+    expected_base: &str,
+    contents: &str,
+    start_ref: Option<&str>,
+) -> String {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"myelin.git.file-write-request.v1\0");
+    for part in [
+        tenant,
+        actor,
+        repo,
+        gitref,
+        path,
+        expected_base,
+        contents,
+        start_ref.unwrap_or(""),
+    ] {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
+}
+
+fn replayed_file_write(
+    commit_oid: String,
+    commit_message: &str,
+    request_trailer: &str,
+) -> Result<String, DurableError> {
+    if !commit_message.lines().any(|line| line == request_trailer) {
+        return Err(DurableError::Git(
+            "idempotency key is already bound to a different file write".into(),
+        ));
+    }
+    Ok(commit_oid)
+}
+
 fn require_body_md(body: &Value) -> Result<String, DurableError> {
     body.get("body_md")
         .or_else(|| body.get("body"))
@@ -3880,6 +4080,182 @@ fn map_durable_err(e: DurableError) -> EdgeError {
         DurableError::CasMismatch { .. } => EdgeError::Conflict(e.to_string()),
         DurableError::Forbidden(m) => EdgeError::Forbidden(m),
         other => EdgeError::Internal(other.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod agent_file_write_tests {
+    use super::*;
+    use myelin_identity::RuntimeRef;
+    use myelin_tenancy::TenantId;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TENANT: &str = "acme";
+    const REGION: &str = "fr-par";
+    const REPO: &str = "product";
+    const PATH: &str = "src/release.ts";
+
+    #[test]
+    fn a_retry_finds_its_commit_after_restart_and_later_branch_work() {
+        let root = temp_root();
+        let backend = DurableGitBackend::rooted_inmem_for_test(&root);
+        backend.create_repo(TENANT, REGION, REPO).unwrap();
+        let repo = backend.store.open_repo(&repo_loc()).unwrap();
+        let (main_commit, base_blob, _) = repo
+            .build_file_commit(
+                "refs/heads/main",
+                PATH,
+                b"export const ready = false;\n",
+                "seed",
+                "human:founder@acme.noreply",
+                "human:founder@acme.noreply",
+            )
+            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&main_commit),
+            "seed main",
+            "human:founder@acme.noreply",
+        )
+        .unwrap();
+
+        let actor = agent();
+        let protected_operation = PrOperationId::parse("write-main").unwrap();
+        let protected = backend
+            .write_file_with_operation(AgentFileWrite {
+                target: RepoActorContext::new(TENANT, REGION, REPO, &actor),
+                gitref: "main",
+                path: PATH,
+                expected_base: &base_blob.0,
+                contents: "export const ready = true;\n",
+                start_ref: None,
+                operation_id: &protected_operation,
+            })
+            .unwrap_err();
+        assert!(matches!(protected, DurableError::Forbidden(_)));
+        assert_eq!(
+            repo.read_ref("refs/heads/main").unwrap(),
+            Some(main_commit),
+            "an agent cannot bypass protected-branch review"
+        );
+
+        let secret_operation = PrOperationId::parse("write-secret").unwrap();
+        let secret = ["AK", "IAIOSFODNN7EXAMPLE"].concat();
+        let rejected_secret = backend
+            .write_file_with_operation(AgentFileWrite {
+                target: RepoActorContext::new(TENANT, REGION, REPO, &actor),
+                gitref: "agent/unsafe-fix",
+                path: PATH,
+                expected_base: &base_blob.0,
+                contents: &secret,
+                start_ref: Some("main"),
+                operation_id: &secret_operation,
+            })
+            .unwrap_err();
+        assert!(matches!(rejected_secret, DurableError::Forbidden(_)));
+        assert_eq!(
+            repo.read_ref("refs/heads/agent/unsafe-fix").unwrap(),
+            None,
+            "the shared receive policy rejects secrets before exposing a branch"
+        );
+
+        let first_operation = PrOperationId::parse("write-ready").unwrap();
+        let first_commit = backend
+            .write_file_with_operation(AgentFileWrite {
+                target: RepoActorContext::new(TENANT, REGION, REPO, &actor),
+                gitref: "agent/release-fix",
+                path: PATH,
+                expected_base: &base_blob.0,
+                contents: "export const ready = true;\n",
+                start_ref: Some("main"),
+                operation_id: &first_operation,
+            })
+            .unwrap();
+        let first_blob = repo
+            .blob_oid_at_path("refs/heads/agent/release-fix", PATH)
+            .unwrap()
+            .unwrap();
+
+        let later_operation = PrOperationId::parse("write-note").unwrap();
+        let later_commit = backend
+            .write_file_with_operation(AgentFileWrite {
+                target: RepoActorContext::new(TENANT, REGION, REPO, &actor),
+                gitref: "agent/release-fix",
+                path: PATH,
+                expected_base: &first_blob.0,
+                contents: "export const ready = true; // verified\n",
+                start_ref: None,
+                operation_id: &later_operation,
+            })
+            .unwrap();
+        assert_ne!(later_commit, first_commit);
+        drop(backend);
+
+        let restarted = DurableGitBackend::rooted_inmem_for_test(&root);
+        let replayed = restarted
+            .write_file_with_operation(AgentFileWrite {
+                target: RepoActorContext::new(TENANT, REGION, REPO, &actor),
+                gitref: "agent/release-fix",
+                path: PATH,
+                expected_base: &base_blob.0,
+                contents: "export const ready = true;\n",
+                start_ref: Some("main"),
+                operation_id: &first_operation,
+            })
+            .unwrap();
+        assert_eq!(replayed, first_commit);
+        assert_eq!(
+            repo.read_ref("refs/heads/agent/release-fix")
+                .unwrap()
+                .unwrap()
+                .0,
+            later_commit,
+            "replaying an older write reports its commit without rewinding the branch"
+        );
+
+        let conflict = restarted
+            .write_file_with_operation(AgentFileWrite {
+                target: RepoActorContext::new(TENANT, REGION, REPO, &actor),
+                gitref: "agent/release-fix",
+                path: PATH,
+                expected_base: &base_blob.0,
+                contents: "export const ready = 'different';\n",
+                start_ref: Some("main"),
+                operation_id: &first_operation,
+            })
+            .unwrap_err();
+        assert!(conflict
+            .to_string()
+            .contains("idempotency key is already bound to a different file write"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn agent() -> Principal {
+        Principal::new(
+            TenantId(TENANT.into()),
+            Region(REGION.into()),
+            PrincipalId("agent:release-helper".into()),
+            PrincipalKind::Agent {
+                runtime_ref: RuntimeRef("runtime:local".into()),
+                on_behalf_of: Some(PrincipalId("human:founder".into())),
+            },
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        )
+    }
+
+    fn repo_loc() -> RepoLoc {
+        RepoLoc::new(TENANT, REGION, REPO)
+    }
+
+    fn temp_root() -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!("myelin-agent-file-write-{nonce}"))
     }
 }
 

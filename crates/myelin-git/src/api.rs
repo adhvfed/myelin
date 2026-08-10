@@ -516,6 +516,13 @@ pub fn agent_tools() -> Vec<AgentToolDef> {
             handler: Handler::Lifecycle,
         },
         AgentToolDef {
+            name: "git.write_file",
+            input_schema: r#"{"type":"object","required":["repo","ref","path","contents","base_oid"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"ref":{"type":"string","description":"the branch to update or create"},"path":{"type":"string","minLength":1,"maxLength":4096},"contents":{"type":"string","maxLength":1048576},"base_oid":{"type":"string","description":"the blob OID read before editing; use an empty string only when the file does not exist"},"start_ref":{"type":"string","description":"the existing branch used as the first parent when creating ref"}},"additionalProperties":false}"#,
+            requires_approval: false,
+            required_caps: &["repo.push"],
+            handler: Handler::ReceivePack,
+        },
+        AgentToolDef {
             name: "git.submit_review",
             input_schema: r#"{"type":"object","required":["repo","number","verdict"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1},"verdict":{"type":"string","enum":["approve","request_changes","comment"]}},"additionalProperties":false}"#,
             requires_approval: false,

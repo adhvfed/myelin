@@ -137,6 +137,12 @@ pub struct DurableReflogEntry {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReflogCommitMessage {
+    pub oid: Oid,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitMeta {
     pub oid: String,
     pub summary: String,
@@ -789,6 +795,49 @@ impl DurableGitRepo {
             Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(0),
             Err(e) => Err(git_err(&format!("reflog {name}"), e)),
         }
+    }
+
+    /// Finds the earliest commit named by a ref's durable reflog whose message contains an exact
+    /// trailer line. Choosing the original match keeps later commits from shadowing an operation;
+    /// the reflog also lets retries recognize it after the branch advances or is force-updated.
+    pub fn find_reflog_commit_by_trailer(
+        &self,
+        ref_name: &str,
+        trailer: &str,
+    ) -> Result<Option<ReflogCommitMessage>, DurableError> {
+        if trailer.is_empty()
+            || trailer.len() > 512
+            || trailer.contains('\n')
+            || trailer.contains('\r')
+        {
+            return Err(DurableError::Git(
+                "commit operation trailer is invalid".into(),
+            ));
+        }
+        let (entries, _, _) = self.reflog_entries_bounded(
+            ref_name,
+            REFLOG_MAX_ENTRIES_PER_REF,
+            REFLOG_MAX_BYTES_PER_REF,
+        )?;
+        let repo = self.open_git()?;
+        for entry in entries {
+            let oid = Self::parse_oid(&entry.new_oid)?;
+            let commit = match repo.find_commit(oid) {
+                Ok(commit) => commit,
+                Err(error) if error.code() == git2::ErrorCode::NotFound => continue,
+                Err(error) => return Err(git_err("find reflog operation commit", error)),
+            };
+            let message = commit.message().map_err(|_| {
+                DurableError::Git("reflog operation commit message is not UTF-8".into())
+            })?;
+            if message.lines().any(|line| line == trailer) {
+                return Ok(Some(ReflogCommitMessage {
+                    oid: entry.new_oid,
+                    message: message.to_string(),
+                }));
+            }
+        }
+        Ok(None)
     }
 
     pub(crate) fn reflog_entries_bounded(
@@ -3086,6 +3135,62 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn reflog_operation_lookup_keeps_the_original_match() {
+        let root = temp_root("reflog-operation");
+        let store = DurableGitStore::rooted(&root);
+        let repo = store.create_repo(&loc()).expect("create");
+        let blob = repo.write_blob(b"versioned\n").unwrap();
+        let tree = repo.write_tree(&[("file.txt", &blob)]).unwrap();
+        let trailer = "Myelin-Operation: opaque-digest";
+        let first = repo
+            .write_commit(
+                &tree,
+                &[],
+                &format!("first\n\n{trailer}"),
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
+            .unwrap();
+        let later = repo
+            .write_commit(
+                &tree,
+                &[&first],
+                &format!("later copy\n\n{trailer}"),
+                "psn@acme.noreply",
+                "psn@acme.noreply",
+            )
+            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&first),
+            "first",
+            "psn@acme.noreply",
+        )
+        .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            Some(&first),
+            Some(&later),
+            "later",
+            "psn@acme.noreply",
+        )
+        .unwrap();
+
+        let found = repo
+            .find_reflog_commit_by_trailer("refs/heads/main", trailer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.oid, first, "a copied trailer cannot shadow its origin");
+        assert!(repo
+            .find_reflog_commit_by_trailer("refs/heads/main", "Myelin-Operation: opaque")
+            .unwrap()
+            .is_none());
+
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

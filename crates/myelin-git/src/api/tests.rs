@@ -477,6 +477,10 @@ fn agent_tool_schemas_describe_the_arguments_the_git_adapter_consumes() {
     assert_eq!(schemas["git.merge"]["required"], json!(["repo", "number"]));
     assert_eq!(schemas["git.open_pr"]["required"], json!(["repo", "title"]));
     assert_eq!(
+        schemas["git.write_file"]["required"],
+        json!(["repo", "ref", "path", "contents", "base_oid"])
+    );
+    assert_eq!(
         schemas["git.submit_review"]["properties"]["verdict"]["enum"],
         json!(["approve", "request_changes", "comment"])
     );

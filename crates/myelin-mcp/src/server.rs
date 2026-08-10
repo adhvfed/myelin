@@ -466,7 +466,7 @@ mod tests {
             .expect("resp");
         let v: Value = serde_json::from_str(&resp).unwrap();
         let tools = v["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         let merge = tools.iter().find(|t| t["name"] == "git.merge").unwrap();
         assert_eq!(merge["annotations"]["requiresApproval"], json!(true));
         assert!(tools.iter().any(|tool| tool["name"] == "ci.read_run"));
@@ -480,6 +480,7 @@ mod tests {
             .any(|tool| tool["name"] == "chat.read_messages"));
         assert!(tools.iter().any(|tool| tool["name"] == "chat.post"));
         assert!(tools.iter().any(|tool| tool["name"] == "git.read_file"));
+        assert!(tools.iter().any(|tool| tool["name"] == "git.write_file"));
     }
 
     #[test]

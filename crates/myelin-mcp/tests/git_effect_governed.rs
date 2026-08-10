@@ -360,6 +360,109 @@ fn open_pr_routes_through_effect_api_and_persists_durably() {
 }
 
 #[test]
+fn agent_file_write_creates_a_branch_and_replays_from_git_provenance() {
+    use myelin_git::durable::{BlobPathLookup, DurableGitStore};
+
+    let root = temp_root("write-file");
+    let backend = Arc::new(
+        DurableGitBackend::rooted_inmem_for_test(&root).with_repo_authorizer(Arc::new(
+            GrantBackedRepos::new().grant_write("human:operator", TENANT, "alpha"),
+        )),
+    );
+    backend.create_repo(TENANT, REGION, "alpha").unwrap();
+    let repo = DurableGitStore::rooted(&root)
+        .open_repo(&myelin_git::core::RepoLoc::new(TENANT, REGION, "alpha"))
+        .unwrap();
+    let (main_commit, base_blob, _) = repo
+        .build_file_commit(
+            "refs/heads/main",
+            "src/release.ts",
+            b"export const ready = false;\n",
+            "seed",
+            "human:operator@acme.noreply",
+            "human:operator@acme.noreply",
+        )
+        .unwrap();
+    repo.update_ref_cas(
+        "refs/heads/main",
+        None,
+        Some(&main_commit),
+        "seed main",
+        "human:operator@acme.noreply",
+    )
+    .unwrap();
+
+    let server = governed_git_server(backend);
+    let args = serde_json::json!({
+        "repo": "alpha",
+        "ref": "agent/fix",
+        "path": "src/release.ts",
+        "contents": "export const ready = true;\n",
+        "base_oid": base_blob.0,
+        "start_ref": "main"
+    });
+    let first: serde_json::Value = serde_json::from_str(
+        &server
+            .handle_line(&call_with_key("git.write_file", args.clone(), "write-1"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(first["result"]["isError"], false, "{first}");
+    let replay: serde_json::Value = serde_json::from_str(
+        &server
+            .handle_line(&call_with_key("git.write_file", args.clone(), "write-1"))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        replay["result"]["_meta"]["eventId"],
+        first["result"]["_meta"]["eventId"],
+        "a lost response replays the same durable commit"
+    );
+
+    let event_id = first["result"]["_meta"]["eventId"].as_str().unwrap();
+    let commit_oid = event_id
+        .split_once("git.file.write:")
+        .and_then(|(_, tail)| tail.split_once('|'))
+        .map(|(oid, _)| oid)
+        .expect("event carries the written commit OID");
+    let detail = repo.commit_detail(commit_oid).unwrap().unwrap();
+    assert_eq!(detail.meta.author_email, "agent:claude@acme.noreply");
+    assert!(detail.message.contains("Myelin-Operation:"));
+    assert!(!detail.message.contains("write-1"));
+    assert!(matches!(
+        repo.read_blob_at_path_bounded("refs/heads/agent/fix", "src/release.ts", 1024)
+            .unwrap(),
+        BlobPathLookup::Found { bytes, .. } if bytes == b"export const ready = true;\n"
+    ));
+
+    let conflicting: serde_json::Value = serde_json::from_str(
+        &server
+            .handle_line(&call_with_key(
+                "git.write_file",
+                serde_json::json!({
+                    "repo": "alpha",
+                    "ref": "agent/fix",
+                    "path": "src/release.ts",
+                    "contents": "export const ready = 'different';\n",
+                    "base_oid": base_blob.0,
+                    "start_ref": "main"
+                }),
+                "write-1",
+            ))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(conflicting["result"]["isError"], true);
+    assert!(conflicting["result"]["_meta"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("different file write"));
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
 fn caller_keys_distinguish_intentional_identical_calls() {
     let actor = agent_principal("agent:claude");
     let root = temp_root("invocation-keys");

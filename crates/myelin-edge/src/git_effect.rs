@@ -12,7 +12,7 @@ use serde_json::Value;
 
 use crate::agent_delegation::is_active_delegation;
 use crate::effect_carrier::parse_proposed;
-use crate::git_durable::DurableGitBackend;
+use crate::git_durable::{AgentFileWrite, DurableGitBackend, RepoActorContext};
 use crate::repo_authz::RepoPermission;
 
 pub struct GitEffectApi {
@@ -98,6 +98,47 @@ impl GitEffectApi {
     ) -> EffectResult {
         let (t, r) = (self.tenant.as_str(), self.region.as_str());
         match tool {
+            "git.write_file" => {
+                let required = |name| {
+                    str_arg(args, name).ok_or_else(|| {
+                        EffectResult::Denied(format!("git tool argument `{name}` is required"))
+                    })
+                };
+                let (repo, gitref, path, contents, base_oid) = match (
+                    required("repo"),
+                    required("ref"),
+                    required("path"),
+                    required("contents"),
+                    required("base_oid"),
+                ) {
+                    (Ok(repo), Ok(gitref), Ok(path), Ok(contents), Ok(base_oid)) => {
+                        (repo, gitref, path, contents, base_oid)
+                    }
+                    (Err(error), _, _, _, _)
+                    | (_, Err(error), _, _, _)
+                    | (_, _, Err(error), _, _)
+                    | (_, _, _, Err(error), _)
+                    | (_, _, _, _, Err(error)) => return error,
+                };
+                if let Err(denied) = self.authorize_repo(repo, RepoPermission::Push) {
+                    return denied;
+                }
+                let request = AgentFileWrite {
+                    target: RepoActorContext::new(t, r, repo, &self.principal),
+                    gitref,
+                    path,
+                    expected_base: base_oid,
+                    contents,
+                    start_ref: str_arg(args, "start_ref"),
+                    operation_id,
+                };
+                match self.backend.write_file_with_operation(request) {
+                    Ok(commit_oid) => {
+                        applied(run, tool, &format!("git.file.write:{commit_oid}"))
+                    }
+                    Err(error) => EffectResult::Denied(error.to_string()),
+                }
+            }
             "git.open_pr" => {
                 let repo = match str_arg(args, "repo") {
                     Some(s) => s,

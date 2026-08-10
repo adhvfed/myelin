@@ -98,6 +98,11 @@ pub const GIT_OPEN_PR_APPLIED: &str = "git.open_pr.applied";
 pub const GIT_OPEN_PR_GATED: &str = "git.open_pr.gated";
 pub const GIT_OPEN_PR_DENIED: &str = "git.open_pr.denied";
 pub const GIT_OPEN_PR_INDETERMINATE: &str = "git.open_pr.indeterminate";
+pub const GIT_WRITE_FILE_ATTEMPTED: &str = "git.write_file.attempted";
+pub const GIT_WRITE_FILE_APPLIED: &str = "git.write_file.applied";
+pub const GIT_WRITE_FILE_GATED: &str = "git.write_file.gated";
+pub const GIT_WRITE_FILE_DENIED: &str = "git.write_file.denied";
+pub const GIT_WRITE_FILE_INDETERMINATE: &str = "git.write_file.indeterminate";
 pub const GIT_SUBMIT_REVIEW_ATTEMPTED: &str = "git.submit_review.attempted";
 pub const GIT_SUBMIT_REVIEW_APPLIED: &str = "git.submit_review.applied";
 pub const GIT_SUBMIT_REVIEW_GATED: &str = "git.submit_review.gated";
@@ -123,6 +128,11 @@ pub const GIT_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
     GIT_OPEN_PR_GATED,
     GIT_OPEN_PR_DENIED,
     GIT_OPEN_PR_INDETERMINATE,
+    GIT_WRITE_FILE_ATTEMPTED,
+    GIT_WRITE_FILE_APPLIED,
+    GIT_WRITE_FILE_GATED,
+    GIT_WRITE_FILE_DENIED,
+    GIT_WRITE_FILE_INDETERMINATE,
     GIT_SUBMIT_REVIEW_ATTEMPTED,
     GIT_SUBMIT_REVIEW_APPLIED,
     GIT_SUBMIT_REVIEW_GATED,
@@ -189,6 +199,11 @@ pub const GIT_EVENT_TOKENS: &[&str] = &[
     GIT_OPEN_PR_GATED,
     GIT_OPEN_PR_DENIED,
     GIT_OPEN_PR_INDETERMINATE,
+    GIT_WRITE_FILE_ATTEMPTED,
+    GIT_WRITE_FILE_APPLIED,
+    GIT_WRITE_FILE_GATED,
+    GIT_WRITE_FILE_DENIED,
+    GIT_WRITE_FILE_INDETERMINATE,
     GIT_SUBMIT_REVIEW_ATTEMPTED,
     GIT_SUBMIT_REVIEW_APPLIED,
     GIT_SUBMIT_REVIEW_GATED,

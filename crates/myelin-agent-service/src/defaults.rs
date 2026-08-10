@@ -17,6 +17,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
 
         ("git", "merge") => true,
         ("git", "open_pr") => false,
+        ("git", "write_file") => false,
         ("git", "comment") => false,
         ("git", "submit_review") => false,
         ("git", "endorse_fork_ci") => false,

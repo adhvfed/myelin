@@ -384,7 +384,10 @@ fn tools_list_is_the_exact_delegation_scoped_subset() {
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
 
-    assert_eq!(names, ["ci.read_log", "ci.read_run", "git.open_pr"]);
+    assert_eq!(
+        names,
+        ["ci.read_log", "ci.read_run", "git.open_pr", "git.write_file"]
+    );
     assert!(
         server.router().unwrap().current_token().is_some(),
         "discovery itself belongs to an attributed per-run identity"
