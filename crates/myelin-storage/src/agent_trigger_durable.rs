@@ -335,8 +335,7 @@ fn binding_matches(
     binding: &DurableAgentTriggerBinding,
     proposal: &NewAgentTriggerBinding,
 ) -> bool {
-    binding.binding_id == proposal.binding_id.to_string()
-        && binding.run_as_agent_id == proposal.run_as_agent_id.to_string()
+    binding.run_as_agent_id == proposal.run_as_agent_id.to_string()
         && binding.event_type == proposal.event_type
         && binding.matcher == proposal.matcher
         && binding.task == proposal.task

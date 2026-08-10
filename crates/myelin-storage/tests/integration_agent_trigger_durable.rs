@@ -159,12 +159,14 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         "event intake sees the one explicitly named run-as agent, never an arbitrary active agent"
     );
 
+    let mut exact_retry = proposal.clone();
+    exact_retry.binding_id = Uuid::parse_str("90000000-0000-4000-8000-000000000009").unwrap();
     assert!(
         matches!(
-            triggers.create(&tenant, proposal.clone()).await.unwrap(),
+            triggers.create(&tenant, exact_retry).await.unwrap(),
             CreateAgentTriggerBindingOutcome::Replayed(_)
         ),
-        "retrying the same CLI request finds the same durable binding"
+        "retrying the same CLI request finds the same durable binding despite a fresh server candidate id"
     );
     let mut conflicting_retry = proposal.clone();
     conflicting_retry.task = "Do something broader.".into();
