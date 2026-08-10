@@ -59,6 +59,7 @@ pub const CI_JOB_RUN_LEDGER_VALIDATION_MIGRATION_ID: &str = "ci_0002b_validate_c
 pub const CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID: &str = "ci_0001b_ci_run_causal_provenance";
 pub const CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID: &str = "ci_0001c_ci_run_concurrency_group";
 pub const CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID: &str = "ci_0001d_ci_run_pr_head_generation";
+pub const CI_RUN_SOURCE_REF_MIGRATION_ID: &str = "ci_0001e_ci_run_source_ref";
 pub const CI_JOB_SPEC_STAGE_MIGRATION_ID: &str = "ci_0015a_ci_job_spec_stage";
 pub const CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID: &str = "ci_0017a_ci_job_accounting_skipped";
 pub const CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID: &str =
@@ -126,6 +127,7 @@ CREATE TABLE IF NOT EXISTS ci_run (
   run_id              uuid NOT NULL,
   project_id          uuid NOT NULL,
   repo_ref            text,
+  source_ref          text,
   commit_oid          text,
   pipeline_id         uuid NOT NULL,
   wf_run_id           uuid NOT NULL,
@@ -159,6 +161,15 @@ pub const ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL: &str = "ALTER TABLE ci_run \
 ADD COLUMN pr_head_generation bigint \
 CHECK (pr_head_generation IS NULL OR (\
 trigger_kind = 'pull_request' AND pr_head_generation > 0))";
+
+pub const ALTER_CI_RUN_ADD_SOURCE_REF_DDL: &str = "ALTER TABLE ci_run \
+ADD COLUMN IF NOT EXISTS source_ref text \
+CHECK (source_ref IS NULL OR (\
+trigger_kind = 'push' \
+AND source_ref ~ '^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$' \
+AND octet_length(source_ref) BETWEEN 12 AND 1024 \
+AND source_ref !~ '(^|/)\\.\\.?(/|$)' \
+AND source_ref !~ '[[:cntrl:] ~^:?*\\[]'))";
 
 pub const CREATE_CI_DRIVE_MANIFEST_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS ci_drive_manifest (
@@ -1874,6 +1885,11 @@ pub fn ci_controlplane_migrations() -> Migrations {
         ALTER_CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_DDL,
         CI_JOB_ACCOUNTING_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_SOURCE_REF_MIGRATION_ID,
+        ALTER_CI_RUN_ADD_SOURCE_REF_DDL,
+        CI_RUN_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -1907,6 +1923,11 @@ pub fn ci_durable_migrations() -> Migrations {
             CI_RUN_TABLE,
         ),
     );
+    migrations.push(Migration::plain_on(
+        CI_RUN_SOURCE_REF_MIGRATION_ID,
+        ALTER_CI_RUN_ADD_SOURCE_REF_DDL,
+        CI_RUN_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -2565,15 +2586,15 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .iter()
             .position(|id| *id == CI_JOB_QUEUE_CLAIM_WINDOW_VALIDATE_MIGRATION_ID)
             .expect("the claim-window validation is in the set");
-        assert_eq!(expand, ids.len() - 17);
-        assert_eq!(validate, ids.len() - 16);
+        assert_eq!(expand, ids.len() - 18);
+        assert_eq!(validate, ids.len() - 17);
         assert_eq!(
-            ids[ids.len() - 13],
+            ids[ids.len() - 14],
             CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "the cutover fence's predecessor-row seed precedes only the ci_0022* chassis"
         );
         assert_eq!(
-            &ids[ids.len() - 12..ids.len() - 8],
+            &ids[ids.len() - 13..ids.len() - 9],
             &[
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID,
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID,
@@ -2583,17 +2604,17 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             "the CT-007 5b.3-6e.1 activation chassis retains expand→validate→index→probe order"
         );
         assert_eq!(
-            ids[ids.len() - 8],
+            ids[ids.len() - 9],
             CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "Stage B appends the retired-v3 sentinel after the activation chassis"
         );
         assert_eq!(
-            ids[ids.len() - 7],
+            ids[ids.len() - 8],
             CI_SECRET_MIGRATION_ID,
             "the new encrypted secret store is appended after every migration shipped at the base"
         );
         assert_eq!(
-            &ids[ids.len() - 6..ids.len() - 1],
+            &ids[ids.len() - 7..ids.len() - 2],
             &[
                 CI_SECRET_ADMIN_SCOPE_MIGRATION_ID,
                 CI_SECRET_ADMIN_UNIQUE_MIGRATION_ID,
@@ -2604,9 +2625,14 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             "SecretAdmin appends ownership, uniqueness, binding integrity, tombstones, then the universal version high-water"
         );
         assert_eq!(
-            ids[ids.len() - 1],
+            ids[ids.len() - 2],
             CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_MIGRATION_ID,
-            "the ci_0017d secret-resolution disposition widening is appended LAST of all (after every previously shipped id, including the secret store) so no applied sequence is reordered"
+            "the previously shipped ci_0017d disposition widening keeps its position"
+        );
+        assert_eq!(
+            ids[ids.len() - 1],
+            CI_RUN_SOURCE_REF_MIGRATION_ID,
+            "new CI provenance appends after every previously shipped migration"
         );
         assert!(
             expand
@@ -2623,8 +2649,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            70,
-            "24 table/RLS (including encrypted secrets, tombstones, and universal high-water) + 3 secret-admin scope/index/integrity migrations + the previously shipped CI follow-ons + the ci_0017d disposition widening"
+            71,
+            "the existing 70 migrations plus the appended source-ref provenance migration"
         );
         fn constraint_names(upper_ddl: &str, keyword: &str) -> Vec<String> {
             upper_ddl
@@ -2698,6 +2724,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL);
             } else if m.id == CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL);
+            } else if m.id == CI_RUN_SOURCE_REF_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_RUN_ADD_SOURCE_REF_DDL);
             } else if m.id == CI_JOB_SPEC_STAGE_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL);
             } else if m.id == CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID {
@@ -2791,8 +2819,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            70,
-            "the runner applied the complete 24-table schema plus every additive follow-on"
+            71,
+            "the runner applied the complete schema plus every additive follow-on"
         );
         assert_eq!(
             runner.applied()[0],
@@ -3250,8 +3278,9 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 "ci_0003_check_attempt",
                 "ci_0003a_ci_run_check_attempt",
                 "ci_0014_ci_cost_event",
+                CI_RUN_SOURCE_REF_MIGRATION_ID,
             ],
-            "the subset is exactly the writer-critical creates plus ci_run's forward ALTERs"
+            "the subset is exactly the writer-critical creates plus ci_run's forward ALTERs, with new provenance appended"
         );
         for m in &subset.0 {
             let full_m = full
@@ -3281,8 +3310,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let subset = ci_durable_migrations();
         assert_eq!(
             subset.0.len(),
-            7,
-            "four writer-critical CI tables plus three forward ci_run ALTERs"
+            8,
+            "four writer-critical CI tables plus four forward ci_run ALTERs"
         );
         for m in &subset.0 {
             assert!(
@@ -3296,6 +3325,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL);
             } else if m.id == CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL);
+            } else if m.id == CI_RUN_SOURCE_REF_MIGRATION_ID {
+                assert_eq!(m.ddl, ALTER_CI_RUN_ADD_SOURCE_REF_DDL);
             } else {
                 assert!(
                     m.ddl.contains("myelin_make_tenant_scoped"),
@@ -3308,6 +3339,6 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         runner
             .run(&subset, &ci_durable_hot_tables())
             .expect("the CI durable writer subset applies forward-only");
-        assert_eq!(runner.applied().len(), 7);
+        assert_eq!(runner.applied().len(), 8);
     }
 }

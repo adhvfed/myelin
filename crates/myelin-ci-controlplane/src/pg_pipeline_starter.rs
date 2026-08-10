@@ -33,7 +33,7 @@ use crate::surfacing::{ci_artifact_ref, ci_run_ref};
 
 const SELECT_QUEUED_RUN: &str = "\
 SELECT tenant_id, run_id::text AS run_id, region, project_id::text AS project_id,
-       pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, commit_oid,
+       pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, source_ref, commit_oid,
        cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, concurrency_group,
        pr_head_generation,
        triggered_by, trust_tier, state,
@@ -47,7 +47,7 @@ LIMIT 1";
 
 const LOCK_EXACT_QUEUED_RUN: &str = "\
 SELECT tenant_id, run_id::text AS run_id, region, project_id::text AS project_id,
-       pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, commit_oid,
+       pipeline_id::text AS pipeline_id, wf_run_id::text AS wf_run_id, repo_ref, source_ref, commit_oid,
        cause_event_id, cause_depth, caused_by, definition_snapshot, trigger_kind, concurrency_group,
        pr_head_generation,
        triggered_by, trust_tier, state,
@@ -1162,6 +1162,7 @@ fn decode_candidate(row: &sqlx::postgres::PgRow) -> Result<StarterCandidate, PgC
             pipeline_id: field!("pipeline_id"),
             wf_run_id: field!("wf_run_id"),
             repo_ref: field!("repo_ref"),
+            source_ref: field!("source_ref"),
             commit_oid: field!("commit_oid"),
             cause_event_id: field!("cause_event_id"),
             cause_depth: field!("cause_depth"),
@@ -1604,6 +1605,7 @@ fn build_drive_manifest_v1(
         workflow_code_hash: definition.code_hash().into(),
         authority_policy_revision: authority.policy_revision.clone(),
         repo_ref,
+        source_ref: record.source_ref.clone(),
         commit_oid,
         run_ref: ci_run_ref(&record.tenant_id, &record.run_id).0,
         started_at: started_at.into(),
@@ -2090,6 +2092,7 @@ mod tests {
             pipeline_id: "33333333-3333-3333-3333-333333333333".into(),
             wf_run_id: "20000000-0000-0000-0000-000000000001".into(),
             repo_ref: Some("repo-1".into()),
+            source_ref: None,
             commit_oid: Some("deadbeef".into()),
             cause_event_id: None,
             cause_depth: 0,
@@ -2183,6 +2186,7 @@ mod tests {
             pipeline_id: "33333333-3333-3333-3333-333333333333".into(),
             wf_run_id: "20000000-0000-0000-0000-000000000001".into(),
             repo_ref: Some("myelin://acme/git/repo/core".into()),
+            source_ref: Some("refs/heads/main".into()),
             commit_oid: Some("deadbeef".into()),
             cause_event_id: None,
             cause_depth: 0,

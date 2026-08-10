@@ -39,6 +39,7 @@ pub struct CiRunInsert {
     pub cause_depth: i64,
     pub caused_by: Option<String>,
     pub repo_ref: Option<String>,
+    pub source_ref: Option<String>,
     pub commit_oid: Option<String>,
     pub triggered_by: Option<String>,
 }
@@ -52,6 +53,7 @@ pub struct CiRunRecord {
     pub pipeline_id: String,
     pub wf_run_id: String,
     pub repo_ref: Option<String>,
+    pub source_ref: Option<String>,
     pub commit_oid: Option<String>,
     pub cause_event_id: Option<String>,
     pub cause_depth: i64,
@@ -68,11 +70,11 @@ pub struct CiRunRecord {
 pub const INSERT_CI_RUN_QUERY: &str = "\
 INSERT INTO ci_run (
   tenant_id, region, run_id, project_id, pipeline_id, wf_run_id,
-  repo_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot,
+  repo_ref, source_ref, commit_oid, cause_event_id, cause_depth, caused_by, definition_snapshot,
   trigger_kind, concurrency_group, pr_head_generation, triggered_by, trust_tier, state, correlation_id
 ) VALUES (
   $1, $2, $3::uuid, $4::uuid, $5::uuid, $6::uuid,
-  $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
+  $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
 )
 ON CONFLICT (tenant_id, run_id) DO NOTHING
 RETURNING run_id";
@@ -84,18 +86,19 @@ SELECT
   pipeline_id = $5::uuid                           AS pipeline_id_matches,
   wf_run_id = $6::uuid                             AS wf_run_id_matches,
   repo_ref IS NOT DISTINCT FROM $7::text           AS repo_ref_matches,
-  commit_oid IS NOT DISTINCT FROM $8::text         AS commit_oid_matches,
-  cause_event_id IS NOT DISTINCT FROM $9::text     AS cause_event_id_matches,
-  cause_depth = $10                                 AS cause_depth_matches,
-  caused_by IS NOT DISTINCT FROM $11::text          AS caused_by_matches,
-  definition_snapshot = $12                        AS definition_snapshot_matches,
-  trigger_kind = $13                               AS trigger_kind_matches,
-  concurrency_group IS NOT DISTINCT FROM $14::text AS concurrency_group_matches,
-  pr_head_generation IS NOT DISTINCT FROM $15::bigint AS pr_head_generation_matches,
-  trust_tier = $16                                 AS trust_tier_matches,
-  correlation_id = $17                             AS correlation_id_matches,
-  (triggered_by IS NOT DISTINCT FROM $18::text
-    OR triggered_by = $19::text)                   AS triggered_by_matches
+  source_ref IS NOT DISTINCT FROM $8::text          AS source_ref_matches,
+  commit_oid IS NOT DISTINCT FROM $9::text          AS commit_oid_matches,
+  cause_event_id IS NOT DISTINCT FROM $10::text     AS cause_event_id_matches,
+  cause_depth = $11                                 AS cause_depth_matches,
+  caused_by IS NOT DISTINCT FROM $12::text          AS caused_by_matches,
+  definition_snapshot = $13                        AS definition_snapshot_matches,
+  trigger_kind = $14                               AS trigger_kind_matches,
+  concurrency_group IS NOT DISTINCT FROM $15::text AS concurrency_group_matches,
+  pr_head_generation IS NOT DISTINCT FROM $16::bigint AS pr_head_generation_matches,
+  trust_tier = $17                                 AS trust_tier_matches,
+  correlation_id = $18                             AS correlation_id_matches,
+  (triggered_by IS NOT DISTINCT FROM $19::text
+    OR triggered_by = $20::text)                   AS triggered_by_matches
 FROM ci_run
 WHERE tenant_id = $1 AND region = $2 AND run_id = $3::uuid
 FOR KEY SHARE";
@@ -109,6 +112,7 @@ SELECT
   pipeline_id::text       AS pipeline_id,
   wf_run_id::text         AS wf_run_id,
   repo_ref                AS repo_ref,
+  source_ref              AS source_ref,
   commit_oid              AS commit_oid,
   cause_event_id          AS cause_event_id,
   cause_depth             AS cause_depth,
@@ -131,6 +135,7 @@ SELECT
   pipeline_id::text       AS pipeline_id,
   wf_run_id::text         AS wf_run_id,
   repo_ref                AS repo_ref,
+  source_ref              AS source_ref,
   commit_oid              AS commit_oid,
   cause_event_id          AS cause_event_id,
   cause_depth             AS cause_depth,
@@ -665,6 +670,7 @@ fn ci_run_record_from_row(row: sqlx::postgres::PgRow) -> CiRunRecord {
         pipeline_id: row.get("pipeline_id"),
         wf_run_id: row.get("wf_run_id"),
         repo_ref: row.get("repo_ref"),
+        source_ref: row.get("source_ref"),
         commit_oid: row.get("commit_oid"),
         cause_event_id: row.get("cause_event_id"),
         cause_depth: row.get("cause_depth"),
@@ -987,6 +993,7 @@ async fn insert_on_conn(
         .bind(&row.pipeline_id)
         .bind(&row.wf_run_id)
         .bind(&row.repo_ref)
+        .bind(&row.source_ref)
         .bind(&row.commit_oid)
         .bind(&row.cause_event_id)
         .bind(row.cause_depth)
@@ -1014,6 +1021,7 @@ async fn insert_on_conn(
         .bind(&row.pipeline_id)
         .bind(&row.wf_run_id)
         .bind(&row.repo_ref)
+        .bind(&row.source_ref)
         .bind(&row.commit_oid)
         .bind(&row.cause_event_id)
         .bind(row.cause_depth)
@@ -1038,6 +1046,7 @@ async fn insert_on_conn(
         ("pipeline_id", stored.get::<bool, _>("pipeline_id_matches")),
         ("wf_run_id", stored.get::<bool, _>("wf_run_id_matches")),
         ("repo_ref", stored.get::<bool, _>("repo_ref_matches")),
+        ("source_ref", stored.get::<bool, _>("source_ref_matches")),
         ("commit_oid", stored.get::<bool, _>("commit_oid_matches")),
         (
             "cause_event_id",
@@ -1194,6 +1203,7 @@ mod tests {
             cause_depth: 0,
             caused_by: None,
             repo_ref: Some("web".into()),
+            source_ref: Some("refs/heads/main".into()),
             commit_oid: Some("deadbeef".into()),
             triggered_by: None,
         }
@@ -1222,12 +1232,12 @@ mod tests {
             INSERT_CI_RUN_QUERY.contains("ON CONFLICT (tenant_id, run_id) DO NOTHING"),
             "idempotent on the run-of-record PK"
         );
-        for n in 1..=19 {
+        for n in 1..=20 {
             assert!(INSERT_CI_RUN_QUERY.contains(&format!("${n}")), "binds ${n}");
         }
         assert!(
-            !INSERT_CI_RUN_QUERY.contains("$20"),
-            "no over-bind past $19"
+            !INSERT_CI_RUN_QUERY.contains("$21"),
+            "no over-bind past $20"
         );
         assert!(INSERT_CI_RUN_QUERY.contains("$3::uuid"));
         let r = sample_row();
@@ -1251,6 +1261,7 @@ mod tests {
             "pipeline_id",
             "wf_run_id",
             "repo_ref",
+            "source_ref",
             "commit_oid",
             "cause_event_id",
             "cause_depth",

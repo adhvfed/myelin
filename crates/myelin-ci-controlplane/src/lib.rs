@@ -356,6 +356,7 @@ pub use migrations::{
     ALTER_CI_JOB_ACCOUNTING_ADD_SKIPPED_DDL, ALTER_CI_JOB_PRELAUNCH_USAGE_ADD_SEAL_DEADLINE_DDL,
     ALTER_CI_JOB_SPEC_ADD_STAGE_DDL, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
+    ALTER_CI_RUN_ADD_SOURCE_REF_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_AUTHORITY_DDL, ALTER_JOB_QUEUE_ADD_CLAIM_TIME_DDL,
     ALTER_JOB_QUEUE_ADD_CLAIM_WINDOW_DDL, ALTER_JOB_QUEUE_ADD_COMPLETION_DDL,
     ALTER_JOB_QUEUE_ADD_RESERVATION_WRITE_VERSION_DDL, ALTER_JOB_QUEUE_ADD_RETRY_ATTEMPTS_DDL,
@@ -372,6 +373,7 @@ pub use migrations::{
     CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID, CI_REGION_SCHEDULER_RLS_MIGRATION_ID,
     CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID, CI_RUN_CHECK_ATTEMPT_TABLE,
     CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID, CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
+    CI_RUN_SOURCE_REF_MIGRATION_ID,
     CI_RUN_QUEUED_REGION_INDEX, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
     CI_RUN_SURFACE_REPO_CREATED_INDEX, CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID,
     CI_RUN_TABLE, CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID,
@@ -626,8 +628,8 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            70,
-            "all 24 tables (including encrypted secrets, tombstones, and universal high-water), 3 secret-admin scope/index/integrity migrations, every previously shipped CI follow-on, and the ci_0017d disposition widening are present"
+            71,
+            "the complete CI schema and every append-only provenance follow-on are present"
         );
         assert!(
             spec.consumers.is_empty(),

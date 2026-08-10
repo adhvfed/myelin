@@ -463,6 +463,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
             cause_depth: 0,
             caused_by: None,
             repo_ref: Some(format!("myelin://{tenant}/git/repo/myelin-self")),
+            source_ref: Some("refs/heads/main".into()),
             commit_oid: Some("deadbeefcafe".into()),
             triggered_by: None,
         })
@@ -811,6 +812,7 @@ async fn arm_and_dispatch(
             cause_depth: 0,
             caused_by: None,
             repo_ref: Some("myelin/self".into()),
+            source_ref: Some("refs/heads/main".into()),
             commit_oid: Some("deadbeefcafe".into()),
             triggered_by: None,
         })

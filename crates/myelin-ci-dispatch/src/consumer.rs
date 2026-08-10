@@ -171,6 +171,7 @@ pub struct ReserveFacts {
     pub wf_run_id: String,
     pub correlation_id: String,
     pub repo_ref: String,
+    pub source_ref: Option<String>,
     pub commit_oid: String,
     pub concurrency_group: Option<String>,
     pub pr_head_generation: Option<i64>,
@@ -293,6 +294,7 @@ pub fn ci_run_insert_from_armed(armed: &ArmedRun) -> myelin_ci_controlplane::CiR
         cause_depth: i64::from(armed.cause.depth),
         caused_by: armed.cause.caused_by.as_ref().map(|value| value.0.clone()),
         repo_ref: Some(armed.reserve.repo_ref.clone()),
+        source_ref: armed.reserve.source_ref.clone(),
         commit_oid: Some(armed.reserve.commit_oid.clone()),
         triggered_by: Some(armed.actor.0.principal_id.0.clone()),
     }
@@ -413,6 +415,7 @@ struct TriggerFacts {
     repo: String,
     new_oid: String,
     is_fork: bool,
+    source_ref: Option<String>,
     concurrency_group: Option<String>,
     pr_head_generation: Option<i64>,
 }
@@ -429,7 +432,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         SkipReason::InvalidProvenance(format!("invalid payload repository {repo:?}: {error}"))
     })?;
 
-    let (oid_field, concurrency_group, pr_head_generation) =
+    let (oid_field, source_ref, concurrency_group, pr_head_generation) =
         if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
             let ref_name = p
                 .get("ref")
@@ -451,7 +454,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
                     .0,
                 &ref_key.aggregate().0,
             )?;
-            ("new_oid", None, None)
+            ("new_oid", Some(ref_name.0.clone()), None, None)
         } else {
             let number = p
                 .get("number")
@@ -485,7 +488,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
                         "PR `head_generation` must be a positive signed 64-bit integer".into(),
                     )
                 })?;
-            ("head_oid", Some(group), Some(generation))
+            ("head_oid", None, Some(group), Some(generation))
         };
 
     let raw_oid = p
@@ -501,6 +504,7 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         repo,
         new_oid,
         is_fork,
+        source_ref,
         concurrency_group,
         pr_head_generation,
     })
@@ -686,6 +690,7 @@ pub fn plan_dispatch(
         run_id: run_id.clone(),
         tenant_id: tenant.0.clone(),
         repo_ref: repo_ref.clone(),
+        source_ref: facts.source_ref.clone(),
         commit_oid: facts.new_oid.clone(),
         contexts,
         cause_event_id: ev.event_id.clone(),
@@ -700,6 +705,7 @@ pub fn plan_dispatch(
         wf_run_id,
         correlation_id: ev.correlation_id.0.clone(),
         repo_ref,
+        source_ref: facts.source_ref,
         commit_oid: facts.new_oid,
         concurrency_group: facts.concurrency_group,
         pr_head_generation: facts.pr_head_generation,
@@ -1938,9 +1944,15 @@ mod tests {
         assert_eq!(armed.reserve.wf_run_id, deterministic_uuid("wf:ev-push-1"));
         assert_eq!(armed.reserve.correlation_id, "corr-1");
         assert_eq!(armed.reserve.repo_ref, "myelin://acme/git/repo/web");
+        assert_eq!(
+            armed.reserve.source_ref.as_deref(),
+            Some("refs/heads/main"),
+            "the immutable branch identity survives Git intake"
+        );
         assert_eq!(armed.reserve.commit_oid, TEST_OID);
         assert!(armed.reserve.concurrency_group.is_none());
         let insert = ci_run_insert_from_armed(&armed);
+        assert_eq!(insert.source_ref, armed.reserve.source_ref);
         assert_eq!(insert.triggered_by.as_deref(), Some("pusher"));
         assert!(insert.concurrency_group.is_none());
         assert_eq!(armed.tenant, TenantId("acme".into()));

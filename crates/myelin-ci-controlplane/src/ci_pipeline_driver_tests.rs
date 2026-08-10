@@ -30,6 +30,7 @@ fn ci_run_record(tenant_id: &str) -> CiRunRecord {
         pipeline_id: "33333333-3333-3333-3333-333333333333".into(),
         wf_run_id: "44444444-4444-4444-4444-444444444444".into(),
         repo_ref: Some("repo".into()),
+        source_ref: None,
         commit_oid: Some("deadbeef".into()),
         cause_event_id: Some("event-1".into()),
         cause_depth: 0,

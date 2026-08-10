@@ -32,6 +32,7 @@ fn facts(snapshot_run_id: &str) -> RunFacts {
         run_id: snapshot_run_id.into(),
         tenant_id: "acme".into(),
         repo_ref: "myelin://acme/git/repo/web".into(),
+        source_ref: None,
         commit_oid: "deadbeef".into(),
         contexts: vec![CheckContext::ci("build"), CheckContext::ci("test/unit")],
         cause_event_id: EventId("ev-pr-1".into()),

@@ -152,6 +152,7 @@ fn run_for(hash: &ContentHash) -> CiRunRecord {
         pipeline_id: "00000000-0000-0000-0000-000000000003".into(),
         wf_run_id: "00000000-0000-0000-0000-000000000004".into(),
         repo_ref: Some("repo_01".into()),
+        source_ref: None,
         commit_oid: Some("abc123".into()),
         cause_event_id: Some("event_01".into()),
         cause_depth: 0,

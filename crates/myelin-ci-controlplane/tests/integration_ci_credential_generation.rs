@@ -321,6 +321,7 @@ async fn seed_fixture(app: &PgPool, admin: &PgPool, seed: u64, claim_age_secs: i
         workflow_code_hash: authority.workflow_code_hash.clone(),
         authority_policy_revision: authority.policy_revision.clone(),
         repo_ref: REPO_REF.into(),
+        source_ref: Some("refs/heads/main".into()),
         commit_oid: COMMIT_OID.into(),
         run_ref: format!("myelin://{TENANT}/ci/run/{ci_run_id}"),
         started_at: "2026-07-30T12:00:00.000000Z".into(),

@@ -446,6 +446,9 @@ fn emit_terminal_facts(
         "run": manifest.run_ref,
         "commit_oid": manifest.commit_oid,
     });
+    if let Some(source_ref) = &manifest.source_ref {
+        payload["source_ref"] = serde_json::json!(source_ref);
+    }
     if let Some(job) = failed_job {
         payload["structured_failure"] = serde_json::json!({"failed_stage": job});
     }

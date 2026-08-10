@@ -617,6 +617,7 @@ fn injected_material_is_absent_from_durable_ci_records_and_result_records() {
         workflow_code_hash: "d".repeat(64),
         authority_policy_revision: "policy:v1".into(),
         repo_ref: "myelin://acme/git/repo/core".into(),
+        source_ref: Some("refs/heads/main".into()),
         commit_oid: "deadbeef".into(),
         run_ref: "myelin://acme/ci/run/44444444-4444-8444-8444-444444444444".into(),
         started_at: "2026-08-02T00:00:00Z".into(),
@@ -684,6 +685,7 @@ fn injected_material_is_absent_from_durable_ci_records_and_result_records() {
         cause_depth: 0,
         caused_by: None,
         repo_ref: Some("myelin://acme/git/repo/core".into()),
+        source_ref: Some("refs/heads/main".into()),
         commit_oid: Some("deadbeef".into()),
         triggered_by: None,
     };

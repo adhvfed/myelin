@@ -2388,6 +2388,7 @@ mod tests {
             pipeline_id: "30000000-0000-0000-0000-000000000001".into(),
             wf_run_id: "40000000-0000-0000-0000-000000000001".into(),
             repo_ref: Some("myelin://acme/git/repo/core".into()),
+            source_ref: Some("refs/heads/main".into()),
             commit_oid: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
             cause_event_id: None,
             cause_depth: 0,

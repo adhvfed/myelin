@@ -192,6 +192,7 @@ fn manifest(
         workflow_code_hash: workflow_code_hash.into(),
         authority_policy_revision: "ci-policy:2026-07-21".into(),
         repo_ref: format!("myelin://{tenant}/git/repo/core"),
+        source_ref: Some("refs/heads/main".into()),
         commit_oid: "deadbeef00deadbeef00deadbeef00deadbeef00".into(),
         run_ref: format!("myelin://{tenant}/ci/run/{ci_run}"),
         started_at: "2026-07-21T12:34:56.000000Z".into(),
@@ -603,6 +604,7 @@ async fn run_reporter_scenario(
             cause_depth: 0,
             caused_by: None,
             repo_ref: Some(format!("myelin://{}/git/repo/core", tenant.0)),
+            source_ref: Some("refs/heads/main".into()),
             commit_oid: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
             triggered_by: None,
         })
@@ -2919,6 +2921,7 @@ async fn run_reporter_scenario(
                     cause_depth: 0,
                     caused_by: None,
                     repo_ref: Some(format!("myelin://{poison_tenant}/git/repo/core")),
+                    source_ref: Some("refs/heads/main".into()),
                     commit_oid: Some("badc0de".into()),
                     triggered_by: None,
                 })
@@ -4111,6 +4114,7 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
                 cause_depth: 0,
                 caused_by: None,
                 repo_ref: Some(format!("myelin://{}/git/repo/core", tenant.0)),
+                source_ref: Some("refs/heads/main".into()),
                 commit_oid: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
                 triggered_by: None,
             })

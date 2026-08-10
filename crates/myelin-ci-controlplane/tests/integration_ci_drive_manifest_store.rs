@@ -183,6 +183,7 @@ fn manifest() -> CiDriveManifestV1 {
         workflow_code_hash: authority.workflow_code_hash.clone(),
         authority_policy_revision: authority.policy_revision.clone(),
         repo_ref: repo_ref.clone(),
+        source_ref: Some("refs/heads/main".into()),
         commit_oid: COMMIT_OID.into(),
         run_ref: "myelin://manifest-live/ci/run/22222222-2222-8222-8222-222222222222".into(),
         started_at: "2026-07-21T12:34:56.000000Z".into(),

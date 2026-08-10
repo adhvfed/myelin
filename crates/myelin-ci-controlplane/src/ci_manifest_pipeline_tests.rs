@@ -103,6 +103,7 @@ fn manifest() -> CiDriveManifestV1 {
         workflow_code_hash: format!("blake3:{}", "c".repeat(64)),
         authority_policy_revision: "ci-policy-2026-07-21".into(),
         repo_ref: "myelin://acme/git/repo/core".into(),
+        source_ref: Some("refs/heads/main".into()),
         commit_oid: "deadbeef".into(),
         run_ref: "myelin://acme/ci/run/44444444-4444-8444-8444-444444444444".into(),
         started_at: "2026-07-21T12:34:56.000000Z".into(),
@@ -291,6 +292,16 @@ fn dag_dispatches_roots_together_replays_out_of_order_completions_then_launches_
     assert_eq!(
         finalizer.finalizations()[0].terminal_state,
         CiRunTerminalState::Succeeded
+    );
+    let terminal = outbox
+        .committed_rows()
+        .into_iter()
+        .find(|row| row.envelope.type_.0 == myelin_ci_sandbox::events::CI_RUN_SUCCEEDED)
+        .expect("the successful run publishes its terminal fact");
+    assert_eq!(
+        terminal.envelope.payload["source_ref"],
+        "refs/heads/main",
+        "an automation can match the branch that actually triggered this run"
     );
 
     let check_attempts: BTreeMap<String, u64> = outbox

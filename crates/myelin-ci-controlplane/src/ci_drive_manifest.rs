@@ -155,6 +155,8 @@ pub struct CiDriveManifestV1 {
     pub workflow_code_hash: String,
     pub authority_policy_revision: String,
     pub repo_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_ref: Option<String>,
     pub commit_oid: String,
     pub run_ref: String,
     pub started_at: String,
@@ -195,6 +197,11 @@ impl CiDriveManifestV1 {
             return invalid("source_snapshot_ref has a noncanonical BLAKE3 digest");
         }
         validate_canonical_ref("repo_ref", &self.repo_ref, &self.tenant_id, "git", "repo")?;
+        if let Some(source_ref) = &self.source_ref {
+            if !is_canonical_branch_ref(source_ref) {
+                return invalid("source_ref is not a branch ref");
+            }
+        }
         validate_canonical_ref("run_ref", &self.run_ref, &self.tenant_id, "ci", "run")?;
         let run = myelin_refs::parse_scoped(&self.run_ref)
             .map_err(|error| CiDriveManifestError::Invalid(format!("run_ref: {error}")))?;
@@ -375,6 +382,25 @@ impl CiDriveManifestV1 {
         }
         Ok(manifest)
     }
+}
+
+fn is_canonical_branch_ref(value: &str) -> bool {
+    value.starts_with("refs/heads/")
+        && value.len() <= 1024
+        && !value.ends_with('/')
+        && !value.ends_with('.')
+        && !value.contains("//")
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !value.contains([':', '\\'])
+        && !value
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+        && !value.chars().any(|character| {
+            character.is_ascii_control()
+                || character.is_ascii_whitespace()
+                || matches!(character, '~' | '^' | '?' | '*' | '[')
+        })
 }
 
 #[derive(Clone)]
@@ -929,6 +955,7 @@ mod tests {
             workflow_code_hash: digest('c'),
             authority_policy_revision: "ci-policy-2026-07-21".into(),
             repo_ref: "myelin://acme/git/repo/core".into(),
+            source_ref: Some("refs/heads/main".into()),
             commit_oid: "deadbeef".into(),
             run_ref: "myelin://acme/ci/run/44444444-4444-8444-8444-444444444444".into(),
             started_at: "2026-07-21T12:34:56.000000Z".into(),
@@ -940,6 +967,23 @@ mod tests {
                 job(test, "test", vec![build.into()]),
             ],
         }
+    }
+
+    #[test]
+    fn source_ref_is_an_optional_canonical_branch_not_mutable_head_state() {
+        let mut push = manifest();
+        push.source_ref = Some("refs/heads/main".into());
+        push.validate().expect("a canonical source branch is preserved");
+
+        push.source_ref = Some("refs/tags/release".into());
+        assert!(matches!(
+            push.validate(),
+            Err(CiDriveManifestError::Invalid(reason)) if reason == "source_ref is not a branch ref"
+        ));
+
+        push.source_ref = None;
+        push.validate()
+            .expect("older and non-push manifests remain readable without a source ref");
     }
 
     #[test]

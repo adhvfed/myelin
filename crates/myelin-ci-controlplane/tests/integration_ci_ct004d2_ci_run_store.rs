@@ -6,7 +6,7 @@ use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_run_store_factory, CiRunInsert, CiRunStoreError, ALTER_CI_RUN_ADD_CAUSAL_PROVENANCE_DDL,
     ALTER_CI_RUN_ADD_CONCURRENCY_GROUP_DDL, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL,
-    CREATE_CI_RUN_DDL, ERASED_PSEUDONYM,
+    ALTER_CI_RUN_ADD_SOURCE_REF_DDL, CREATE_CI_RUN_DDL, ERASED_PSEUDONYM,
 };
 use myelin_events::{HandlerTx, CONSUMER_DEDUP_MIGRATION};
 use sqlx::{Executor, PgPool};
@@ -61,6 +61,7 @@ fn row(tenant: &str, run_id: &str) -> CiRunInsert {
         cause_depth: 0,
         caused_by: None,
         repo_ref: Some("web".into()),
+        source_ref: Some("refs/heads/main".into()),
         commit_oid: Some("deadbeefcafe".into()),
         triggered_by: Some("psn:actor-8a2f".into()),
     }
@@ -102,6 +103,10 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         .execute(ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL)
         .await
         .expect("add ci_run PR ordering authority");
+    admin
+        .execute(ALTER_CI_RUN_ADD_SOURCE_REF_DDL)
+        .await
+        .expect("add immutable push branch provenance");
     admin
         .execute(CONSUMER_DEDUP_MIGRATION)
         .await
@@ -148,6 +153,11 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
     assert_eq!(got.pipeline_id, "33333333-3333-3333-3333-333333333333");
     assert_eq!(got.wf_run_id, "44444444-4444-4444-4444-444444444444");
     assert_eq!(got.repo_ref.as_deref(), Some("web"));
+    assert_eq!(
+        got.source_ref.as_deref(),
+        Some("refs/heads/main"),
+        "the run remembers the branch that caused it, even after HEAD moves"
+    );
     assert_eq!(got.commit_oid.as_deref(), Some("deadbeefcafe"));
     assert_eq!(got.cause_event_id.as_deref(), Some("ev-push-1"));
     assert_eq!(got.definition_snapshot, "blake3:snap-abcd");
@@ -174,6 +184,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
 
     let mut pr = row("tenantA", &run_id(3));
     pr.trigger_kind = "pull_request".into();
+    pr.source_ref = None;
     pr.concurrency_group = Some("pr:team/web:42".into());
     pr.pr_head_generation = Some(7);
     assert!(store.insert_ci_run(&pr).await.unwrap());
@@ -192,6 +203,10 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         Some(7),
         "producer-authored PR ordering authority round-trips durably"
     );
+    assert!(
+        stored_pr.source_ref.is_none(),
+        "a pull request cannot masquerade as a branch push"
+    );
 
     let mut held_group = admin.begin().await.unwrap();
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -201,6 +216,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         .unwrap();
     let mut later_pr = row("tenantA", &run_id(4));
     later_pr.trigger_kind = "pull_request".into();
+    later_pr.source_ref = None;
     later_pr.concurrency_group = Some("pr:team/web:43".into());
     later_pr.pr_head_generation = Some(8);
     let lock_store = store.clone();
@@ -320,6 +336,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         "pipeline_id",
         "wf_run_id",
         "repo_ref",
+        "source_ref",
         "commit_oid",
         "cause_event_id",
         "definition_snapshot",
@@ -335,6 +352,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
         let mut original = row("tenantA", &collision_run);
         if matches!(field, "concurrency_group" | "pr_head_generation") {
             original.trigger_kind = "pull_request".into();
+            original.source_ref = None;
             original.concurrency_group = Some("pr:web:42".into());
             original.pr_head_generation = Some(7);
         }
@@ -349,6 +367,7 @@ async fn chunk4_ci_run_store_verifies_exact_replays_and_rejects_collisions() {
             "pipeline_id" => replay.pipeline_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb".into(),
             "wf_run_id" => replay.wf_run_id = "cccccccc-cccc-cccc-cccc-cccccccccccc".into(),
             "repo_ref" => replay.repo_ref = None,
+            "source_ref" => replay.source_ref = Some("refs/heads/release".into()),
             "commit_oid" => replay.commit_oid = None,
             "cause_event_id" => replay.cause_event_id = None,
             "definition_snapshot" => replay.definition_snapshot = "blake3:other".into(),
