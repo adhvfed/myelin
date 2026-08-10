@@ -760,7 +760,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0105_agent_journal_subject");
+        assert_eq!(*ids.last().unwrap(), "0106_agent_journal_encryption");
     }
 
     #[test]

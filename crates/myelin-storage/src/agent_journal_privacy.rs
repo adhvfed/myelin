@@ -1,5 +1,9 @@
+use myelin_gdpr::ErasureMethod;
+use myelin_tenancy::{Region, TenantId};
 use sqlx::Row;
 
+use crate::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
+use crate::kms::{KeyClass, KmsEngine, PiiKeyRef, NONCE_LEN};
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 
@@ -115,11 +119,94 @@ BEFORE UPDATE ON agent_tool_effect
 FOR EACH ROW EXECUTE FUNCTION myelin_guard_agent_tool_effect_update();
 "#;
 
+pub const AGENT_JOURNAL_ENCRYPTION_MIGRATION: &str = r#"
+DROP TRIGGER IF EXISTS agent_model_step_guard_update ON agent_model_step;
+DROP TRIGGER IF EXISTS agent_tool_effect_guard_update ON agent_tool_effect;
+
+ALTER TABLE agent_model_step
+    ADD COLUMN response_key_ref text,
+    ADD COLUMN response_nonce bytea,
+    ADD COLUMN response_ciphertext bytea,
+    DROP CONSTRAINT agent_model_step_check,
+    DROP CONSTRAINT agent_model_step_state_check;
+ALTER TABLE agent_tool_effect
+    ADD COLUMN result_key_ref text,
+    ADD COLUMN result_nonce bytea,
+    ADD COLUMN result_ciphertext bytea,
+    DROP CONSTRAINT agent_tool_effect_check,
+    DROP CONSTRAINT agent_tool_effect_state_check;
+
+UPDATE agent_model_step
+   SET state = 'redacted', response = NULL
+ WHERE state = 'completed';
+UPDATE agent_tool_effect
+   SET state = 'redacted', result_text = NULL
+ WHERE state = 'completed';
+
+ALTER TABLE agent_model_step
+    ADD CONSTRAINT agent_model_step_encrypted_state
+      CHECK (state IN ('started','completed','redacted')),
+    ADD CONSTRAINT agent_model_step_encrypted_payload_shape CHECK (
+      response IS NULL AND (
+        (state = 'started' AND completed_at IS NULL
+          AND response_key_ref IS NULL AND response_nonce IS NULL
+          AND response_ciphertext IS NULL)
+        OR
+        (state = 'completed' AND completed_at IS NOT NULL
+          AND response_key_ref IS NOT NULL
+          AND response_nonce IS NOT NULL
+          AND response_ciphertext IS NOT NULL
+          AND length(response_key_ref) BETWEEN 1 AND 1024
+          AND octet_length(response_nonce) = 12
+          AND octet_length(response_ciphertext) BETWEEN 17 AND 4194320)
+        OR
+        (state = 'redacted' AND completed_at IS NOT NULL
+          AND response_key_ref IS NULL AND response_nonce IS NULL
+          AND response_ciphertext IS NULL)
+      )
+    );
+ALTER TABLE agent_tool_effect
+    ADD CONSTRAINT agent_tool_effect_encrypted_state
+      CHECK (state IN ('started','completed','redacted')),
+    ADD CONSTRAINT agent_tool_effect_encrypted_payload_shape CHECK (
+      result_text IS NULL AND (
+        (state = 'started' AND completed_at IS NULL
+          AND result_key_ref IS NULL AND result_nonce IS NULL
+          AND result_ciphertext IS NULL)
+        OR
+        (state = 'completed' AND completed_at IS NOT NULL
+          AND result_key_ref IS NOT NULL
+          AND result_nonce IS NOT NULL
+          AND result_ciphertext IS NOT NULL
+          AND length(result_key_ref) BETWEEN 1 AND 1024
+          AND octet_length(result_nonce) = 12
+          AND octet_length(result_ciphertext) BETWEEN 16 AND 262160)
+        OR
+        (state = 'redacted' AND completed_at IS NOT NULL
+          AND result_key_ref IS NULL AND result_nonce IS NULL
+          AND result_ciphertext IS NULL)
+      )
+    );
+
+CREATE TRIGGER agent_model_step_guard_update
+BEFORE UPDATE ON agent_model_step
+FOR EACH ROW EXECUTE FUNCTION myelin_guard_agent_model_step_update();
+CREATE TRIGGER agent_tool_effect_guard_update
+BEFORE UPDATE ON agent_tool_effect
+FOR EACH ROW EXECUTE FUNCTION myelin_guard_agent_tool_effect_update();
+"#;
+
 pub fn agent_journal_privacy_migrations() -> Migrations {
-    Migrations::of([Migration::plain(
-        "0105_agent_journal_subject",
-        AGENT_JOURNAL_SUBJECT_MIGRATION,
-    )])
+    Migrations::of([
+        Migration::plain(
+            "0105_agent_journal_subject",
+            AGENT_JOURNAL_SUBJECT_MIGRATION,
+        ),
+        Migration::plain(
+            "0106_agent_journal_encryption",
+            AGENT_JOURNAL_ENCRYPTION_MIGRATION,
+        ),
+    ])
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,6 +214,97 @@ pub(crate) enum AgentSubjectStatus {
     Active,
     Erased,
     Restricted,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum JournalPayloadKind {
+    ModelResponse,
+    ToolResult,
+}
+
+impl JournalPayloadKind {
+    fn token(self) -> &'static str {
+        match self {
+            Self::ModelResponse => "model-response",
+            Self::ToolResult => "tool-result",
+        }
+    }
+}
+
+pub(crate) struct JournalPayloadContext<'a> {
+    pub tenant: &'a str,
+    pub region: &'a str,
+    pub run_id: &'a str,
+    pub position_key: &'a str,
+    pub request_hash: &'a str,
+    pub requested_by: &'a str,
+    pub kind: JournalPayloadKind,
+}
+
+pub(crate) fn seal_journal_payload(
+    kms: &KmsEngine,
+    context: &JournalPayloadContext<'_>,
+    plaintext: &[u8],
+) -> Result<EncryptedColumn, PgError> {
+    ColumnCryptor::new(kms, Region(context.region.to_string()))
+        .encrypt_with_aad(
+            &TenantId(context.tenant.to_string()),
+            Some(&SubjectId::new(context.requested_by)),
+            &ErasureMethod::CryptoShred("subject_dek".into()),
+            plaintext,
+            &journal_payload_aad(context),
+        )
+        .map_err(|error| PgError::Query(format!("agent journal encryption failed: {error}")))
+}
+
+pub(crate) fn open_journal_payload(
+    kms: &KmsEngine,
+    context: &JournalPayloadContext<'_>,
+    key_ref: &str,
+    nonce: &[u8],
+    ciphertext: Vec<u8>,
+) -> Result<Vec<u8>, PgError> {
+    let key_ref = PiiKeyRef::parse(key_ref).ok_or_else(|| {
+        PgError::Query("agent journal has an invalid subject key reference".into())
+    })?;
+    if key_ref.tenant.as_str() != context.tenant
+        || key_ref.class != KeyClass::Subject(context.requested_by.to_string())
+    {
+        return Err(PgError::Query(
+            "agent journal key reference does not match its immutable subject".into(),
+        ));
+    }
+    let nonce: [u8; NONCE_LEN] = nonce
+        .try_into()
+        .map_err(|_| PgError::Query("agent journal has an invalid encryption nonce".into()))?;
+    ColumnCryptor::new(kms, Region(context.region.to_string()))
+        .decrypt_with_aad(
+            &EncryptedColumn {
+                key_ref,
+                nonce,
+                ciphertext,
+            },
+            &journal_payload_aad(context),
+        )
+        .map_err(|error| PgError::Query(format!("agent journal decryption failed: {error}")))
+}
+
+fn journal_payload_aad(context: &JournalPayloadContext<'_>) -> Vec<u8> {
+    let mut aad = Vec::new();
+    for field in [
+        "myelin.agent-journal.payload.v1",
+        context.kind.token(),
+        context.tenant,
+        context.region,
+        context.run_id,
+        context.position_key,
+        context.request_hash,
+        context.requested_by,
+    ] {
+        aad.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        aad.extend_from_slice(field.as_bytes());
+    }
+    aad
 }
 
 pub(crate) async fn lock_agent_subject(
@@ -212,5 +390,39 @@ mod tests {
         assert_eq!(first, agent_subject_token("acme", "eu", "founder"));
         assert_ne!(first, agent_subject_token("other", "eu", "founder"));
         assert_ne!(first, agent_subject_token("acme", "eu", "someone-else"));
+    }
+
+    #[test]
+    fn journal_aad_is_injective_across_record_identity() {
+        let context = JournalPayloadContext {
+            tenant: "acme",
+            region: "eu",
+            run_id: "run-1",
+            position_key: "model-turn/0",
+            request_hash: "hash",
+            requested_by: "founder",
+            kind: JournalPayloadKind::ModelResponse,
+        };
+        let first = journal_payload_aad(&context);
+        let moved = journal_payload_aad(&JournalPayloadContext {
+            run_id: "run-2",
+            ..context
+        });
+        assert_ne!(first, moved);
+    }
+
+    #[test]
+    fn plaintext_legacy_payloads_become_unreplayable_instead_of_surviving_the_upgrade() {
+        assert!(
+            AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("SET state = 'redacted', response = NULL")
+        );
+        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION
+            .contains("SET state = 'redacted', result_text = NULL"));
+        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("response IS NULL"));
+        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("result_text IS NULL"));
+        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("response_ciphertext"));
+        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("result_ciphertext"));
+        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("response_key_ref IS NOT NULL"));
+        assert!(AGENT_JOURNAL_ENCRYPTION_MIGRATION.contains("result_key_ref IS NOT NULL"));
     }
 }

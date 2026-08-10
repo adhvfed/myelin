@@ -483,6 +483,35 @@ impl KmsCore {
         deks.insert(id, (dek, dek_epoch));
     }
 
+    pub(crate) fn replace_tenant_key_state(
+        &self,
+        kek_id: &KekId,
+        kek: Option<ExportedKek>,
+        durable_deks: Vec<(DekId, WrappedDek, u64)>,
+    ) {
+        let mut keks = self.keks.lock().expect("KMS keks poisoned");
+        let mut deks = self.deks.lock().expect("KMS deks poisoned");
+        keks.remove(kek_id);
+        deks.retain(|id, _| id.tenant != kek_id.tenant);
+        if let Some(kek) = kek {
+            keks.insert(
+                kek_id.clone(),
+                StoredKek {
+                    wrapped: WrappedKey {
+                        nonce: kek.nonce,
+                        wrapped: kek.wrapped,
+                    },
+                    epoch: kek.epoch,
+                },
+            );
+        }
+        deks.extend(
+            durable_deks
+                .into_iter()
+                .map(|(id, wrapped, epoch)| (id, (wrapped, epoch))),
+        );
+    }
+
     pub fn export_sealed_root(&self, seal_key: &SealKey) -> SealedRoot {
         self.root.seal(seal_key)
     }
@@ -807,15 +836,27 @@ impl KmsEngine {
     }
 
     pub fn export_kek(&self, id: &KekId) -> Option<ExportedKek> {
-        self.core().export_kek(id)
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.export_kek(id),
+            KmsBackend::Durable(durable) => durable.export_kek(id),
+        }
     }
 
     pub fn export_dek(&self, id: &DekId) -> Option<(WrappedDek, u64)> {
-        self.core().export_dek(id)
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.export_dek(id),
+            KmsBackend::Durable(durable) => durable.export_dek(id),
+        }
     }
 
     pub fn export_deks(&self) -> Vec<(DekId, WrappedDek, u64)> {
-        self.core().export_deks()
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.export_deks(),
+            KmsBackend::Durable(durable) => durable.export_deks(),
+        }
     }
 
     pub fn ensure_kek(&self, id: &KekId) -> u64 {
@@ -872,11 +913,19 @@ impl KmsEngine {
     }
 
     pub fn backup_snapshot(&self) -> Vec<(DekId, WrappedDek)> {
-        self.core().backup_snapshot()
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.backup_snapshot(),
+            KmsBackend::Durable(durable) => durable.backup_snapshot(),
+        }
     }
 
     pub fn backup_snapshot_durable(&self, seal_key: &SealKey) -> KmsDurableSnapshot {
-        self.core().backup_snapshot_durable(seal_key)
+        match &self.backend {
+            #[cfg(any(test, feature = "test-support"))]
+            KmsBackend::Memory(core) => core.backup_snapshot_durable(seal_key),
+            KmsBackend::Durable(durable) => durable.backup_snapshot_durable(),
+        }
     }
 
     pub fn wrap_dek_material(

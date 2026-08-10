@@ -1,4 +1,4 @@
-use sqlx::postgres::PgPool;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
 
 use myelin_tenancy::{Region, TenantId};
@@ -39,6 +39,15 @@ CREATE TABLE IF NOT EXISTS kms_wrapped_dek (
     dek_epoch bigint NOT NULL,
     PRIMARY KEY (cell_id, tenant_id, class)
 );";
+
+const READ_BACKUP_DEKS_SQL: &str = "\
+SELECT tenant_id, class, nonce, wrapped, kek_epoch, dek_epoch
+  FROM kms_wrapped_dek dek
+ WHERE cell_id = $1
+   AND EXISTS (SELECT 1 FROM kms_wrapped_kek kek
+                WHERE kek.cell_id = dek.cell_id
+                  AND kek.tenant_id = dek.tenant_id)
+ ORDER BY tenant_id, class";
 
 pub fn kms_durable_migrations() -> crate::migration::Migrations {
     use crate::migration::{Migration, Migrations};
@@ -102,8 +111,11 @@ pub struct DurableKmsBacking {
 
 impl DurableKmsBacking {
     pub fn new(pool: PgPool, cell_id: impl Into<String>) -> DurableKmsBacking {
+        let connect_options = (*pool.connect_options()).clone();
         DurableKmsBacking {
-            pool,
+            pool: PgPoolOptions::new()
+                .max_connections(2)
+                .connect_lazy_with(connect_options),
             cell_id: cell_id.into(),
         }
     }
@@ -151,15 +163,7 @@ impl DurableKmsBacking {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
-        row.map(|row| {
-            let nonce: Vec<u8> = row.try_get("nonce").map_err(kms_row_decode)?;
-            let ciphertext: Vec<u8> = row.try_get("ciphertext").map_err(kms_row_decode)?;
-            Ok(SealedRoot {
-                nonce: nonce_from(&nonce)?,
-                ciphertext,
-            })
-        })
-        .transpose()
+        row.map(sealed_root_from_row).transpose()
     }
 
     async fn insert_sealed_root_if_absent(&self, sealed: &SealedRoot) -> Result<(), PgError> {
@@ -344,6 +348,110 @@ impl DurableKmsBacking {
         Ok(())
     }
 
+    async fn read_dek(&self, id: &DekId) -> Result<Option<(WrappedDek, u64)>, PgError> {
+        let row = sqlx::query(
+            "SELECT nonce, wrapped, kek_epoch, dek_epoch FROM kms_wrapped_dek \
+              WHERE cell_id = $1 AND tenant_id = $2 AND class = $3",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .bind(id.class.as_token())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        row.map(dek_material_from_row).transpose()
+    }
+
+    async fn read_deks_for_tenant(
+        &self,
+        tenant: &TenantId,
+    ) -> Result<Vec<(DekId, WrappedDek, u64)>, PgError> {
+        let rows = sqlx::query(
+            "SELECT class, nonce, wrapped, kek_epoch, dek_epoch FROM kms_wrapped_dek \
+              WHERE cell_id = $1 AND tenant_id = $2 ORDER BY class",
+        )
+        .bind(&self.cell_id)
+        .bind(tenant.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        rows.into_iter()
+            .map(|row| {
+                let class_token: String = row.try_get("class").map_err(kms_row_decode)?;
+                let class = KeyClass::parse_token(&class_token).ok_or_else(|| {
+                    PgError::Query("kms_wrapped_dek row has an invalid key class".into())
+                })?;
+                let (wrapped, epoch) = dek_material_from_row(row)?;
+                Ok((DekId::new(tenant.clone(), class), wrapped, epoch))
+            })
+            .collect()
+    }
+
+    async fn read_all_deks(&self) -> Result<Vec<(DekId, WrappedDek, u64)>, PgError> {
+        let rows = sqlx::query(READ_BACKUP_DEKS_SQL)
+            .bind(&self.cell_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        rows.into_iter().map(dek_with_identity_from_row).collect()
+    }
+
+    async fn read_snapshot(&self) -> Result<KmsDurableSnapshot, PgError> {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+
+        let sealed_root =
+            sqlx::query("SELECT nonce, ciphertext FROM kms_sealed_root WHERE cell_id = $1")
+                .bind(&self.cell_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|error| PgError::Query(error.to_string()))?
+                .map(sealed_root_from_row)
+                .transpose()?
+                .ok_or_else(|| {
+                    PgError::Query("durable KMS sealed root is absent during snapshot".into())
+                })?;
+
+        let kek_rows = sqlx::query(
+            "SELECT tenant_id, region, nonce, wrapped, epoch FROM kms_wrapped_kek \
+              WHERE cell_id = $1 ORDER BY tenant_id, region",
+        )
+        .bind(&self.cell_id)
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        let keks = kek_rows
+            .into_iter()
+            .map(kek_with_identity_from_row)
+            .collect::<Result<Vec<_>, PgError>>()?;
+
+        let dek_rows = sqlx::query(READ_BACKUP_DEKS_SQL)
+            .bind(&self.cell_id)
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        let deks = dek_rows
+            .into_iter()
+            .map(dek_with_identity_from_row)
+            .collect::<Result<Vec<_>, PgError>>()?;
+
+        tx.commit()
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+        Ok(KmsDurableSnapshot {
+            sealed_root,
+            keks,
+            deks,
+        })
+    }
+
     async fn read_dek_material(
         &self,
         id: &DekId,
@@ -479,10 +587,90 @@ impl DurableKmsBacking {
             .begin()
             .await
             .map_err(|e| PgError::Query(e.to_string()))?;
-        self.upsert_kek_row_on(&mut *tx, id, kek).await?;
+        let current_kek_epoch = sqlx::query_scalar::<_, i64>(
+            "SELECT epoch FROM kms_wrapped_kek \
+              WHERE cell_id = $1 AND tenant_id = $2 AND region = $3 FOR UPDATE",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .bind(id.region.as_str())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        let expected_kek_epoch = kek.epoch.checked_sub(1).ok_or_else(|| {
+            PgError::Query("KMS rotation candidate did not advance its KEK epoch".into())
+        })?;
+        if current_kek_epoch != Some(expected_kek_epoch as i64) {
+            return Err(PgError::Query(
+                "KMS rotation refused stale durable KEK state".into(),
+            ));
+        }
+        let durable_deks = sqlx::query_as::<_, (String, i64)>(
+            "SELECT class, dek_epoch FROM kms_wrapped_dek \
+              WHERE cell_id = $1 AND tenant_id = $2 ORDER BY class FOR UPDATE",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        let mut candidate_deks = deks
+            .iter()
+            .map(|(dek_id, _, epoch)| {
+                epoch
+                    .checked_sub(1)
+                    .map(|prior| (dek_id.class.as_token(), prior as i64))
+            })
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| PgError::Query("KMS rotation candidate did not advance a DEK".into()))?;
+        candidate_deks.sort_unstable();
+        if durable_deks != candidate_deks {
+            return Err(PgError::Query(
+                "KMS rotation refused stale durable DEK membership".into(),
+            ));
+        }
+        let updated_kek = sqlx::query(
+            "UPDATE kms_wrapped_kek SET nonce = $4, wrapped = $5, epoch = $6 \
+              WHERE cell_id = $1 AND tenant_id = $2 AND region = $3 AND epoch = $7",
+        )
+        .bind(&self.cell_id)
+        .bind(id.tenant.as_str())
+        .bind(id.region.as_str())
+        .bind(kek.nonce.as_slice())
+        .bind(&kek.wrapped)
+        .bind(kek.epoch as i64)
+        .bind(expected_kek_epoch as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| PgError::Query(error.to_string()))?;
+        if updated_kek.rows_affected() != 1 {
+            return Err(PgError::Query(
+                "KMS rotation lost its durable KEK compare-and-swap".into(),
+            ));
+        }
         for (dek_id, w, dek_epoch) in deks {
-            self.upsert_dek_row_on(&mut *tx, dek_id, w, *dek_epoch)
-                .await?;
+            let previous_epoch = dek_epoch - 1;
+            let updated = sqlx::query(
+                "UPDATE kms_wrapped_dek \
+                    SET nonce = $4, wrapped = $5, kek_epoch = $6, dek_epoch = $7 \
+                  WHERE cell_id = $1 AND tenant_id = $2 AND class = $3 AND dek_epoch = $8",
+            )
+            .bind(&self.cell_id)
+            .bind(dek_id.tenant.as_str())
+            .bind(dek_id.class.as_token())
+            .bind(w.nonce.as_slice())
+            .bind(&w.wrapped)
+            .bind(w.kek_epoch as i64)
+            .bind(*dek_epoch as i64)
+            .bind(previous_epoch as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|error| PgError::Query(error.to_string()))?;
+            if updated.rows_affected() != 1 {
+                return Err(PgError::Query(
+                    "KMS rotation lost a durable DEK compare-and-swap".into(),
+                ));
+            }
         }
         tx.commit()
             .await
@@ -538,6 +726,13 @@ impl DurableKmsBacking {
 
     pub async fn rotate_kek(&self, engine: &KmsEngine, id: &KekId) -> Result<u64, KmsDurableError> {
         let epoch = engine.rotate_kek(id).map_err(KmsDurableError::Kms)?;
+        if self
+            .read_kek(id)
+            .await?
+            .is_some_and(|kek| kek.epoch == epoch)
+        {
+            return Ok(epoch);
+        }
         let kek = engine.export_kek(id).ok_or_else(|| {
             KmsDurableError::Db(PgError::Query(format!(
                 "no KEK to persist after rotation for tenant={} region={}",
@@ -604,6 +799,62 @@ pub(crate) struct DurableKms {
 impl DurableKms {
     pub(crate) fn core(&self) -> &KmsCore {
         &self.core
+    }
+
+    pub(crate) fn export_kek(&self, id: &KekId) -> Option<ExportedKek> {
+        let durable = self
+            .block(self.backing.read_kek(id))
+            .unwrap_or_else(|error| panic!("KMS DURABILITY FAILURE: cannot export KEK: {error}"));
+        match durable {
+            Some(kek) => {
+                self.core.install_wrapped_kek(
+                    id.clone(),
+                    kek.nonce,
+                    kek.wrapped.clone(),
+                    kek.epoch,
+                );
+                Some(kek)
+            }
+            None => {
+                self.core.destroy_kek(id);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn export_dek(&self, id: &DekId) -> Option<(WrappedDek, u64)> {
+        let durable = self
+            .block(self.backing.read_dek(id))
+            .unwrap_or_else(|error| panic!("KMS DURABILITY FAILURE: cannot export DEK: {error}"));
+        match durable {
+            Some((wrapped, epoch)) => {
+                self.core
+                    .install_wrapped_dek(id.clone(), wrapped.clone(), epoch);
+                Some((wrapped, epoch))
+            }
+            None => {
+                self.core.destroy_dek(id);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn export_deks(&self) -> Vec<(DekId, WrappedDek, u64)> {
+        self.block(self.backing.read_all_deks())
+            .unwrap_or_else(|error| panic!("KMS DURABILITY FAILURE: cannot export DEKs: {error}"))
+    }
+
+    pub(crate) fn backup_snapshot(&self) -> Vec<(DekId, WrappedDek)> {
+        self.backup_snapshot_durable()
+            .deks
+            .into_iter()
+            .map(|(id, wrapped, _)| (id, wrapped))
+            .collect()
+    }
+
+    pub(crate) fn backup_snapshot_durable(&self) -> KmsDurableSnapshot {
+        self.block(self.backing.read_snapshot())
+            .unwrap_or_else(|error| panic!("KMS DURABILITY FAILURE: cannot snapshot keys: {error}"))
     }
 
     fn block<F: std::future::Future>(&self, fut: F) -> F::Output {
@@ -717,6 +968,14 @@ impl DurableKms {
     }
 
     pub(crate) fn rotate_kek(&self, id: &KekId) -> Result<u64, KmsError> {
+        let durable_kek = self
+            .block(self.backing.read_kek(id))
+            .map_err(|error| KmsError::Durability(error.to_string()))?;
+        let durable_deks = self
+            .block(self.backing.read_deks_for_tenant(&id.tenant))
+            .map_err(|error| KmsError::Durability(error.to_string()))?;
+        self.core
+            .replace_tenant_key_state(id, durable_kek, durable_deks);
         let epoch = self.core.rotate_kek(id)?;
         let res = self.block(async {
             let kek = self.core.export_kek(id).ok_or_else(|| {
@@ -777,6 +1036,65 @@ impl DurableKms {
         self.ensure_kek(&kek_id);
         self.core.wrap_dek_material(tenant, region, material)
     }
+}
+
+fn dek_material_from_row(row: sqlx::postgres::PgRow) -> Result<(WrappedDek, u64), PgError> {
+    let kek_epoch = row.try_get::<i64, _>("kek_epoch").map_err(kms_row_decode)?;
+    let dek_epoch = row.try_get::<i64, _>("dek_epoch").map_err(kms_row_decode)?;
+    if kek_epoch < 0 || dek_epoch < 0 {
+        return Err(PgError::Query(
+            "durable KMS row has a negative key epoch".into(),
+        ));
+    }
+    let nonce = row.try_get::<Vec<u8>, _>("nonce").map_err(kms_row_decode)?;
+    Ok((
+        WrappedDek {
+            nonce: nonce_from(&nonce)?,
+            wrapped: row.try_get("wrapped").map_err(kms_row_decode)?,
+            kek_epoch: kek_epoch as u64,
+        },
+        dek_epoch as u64,
+    ))
+}
+
+fn sealed_root_from_row(row: sqlx::postgres::PgRow) -> Result<SealedRoot, PgError> {
+    let nonce = row.try_get::<Vec<u8>, _>("nonce").map_err(kms_row_decode)?;
+    Ok(SealedRoot {
+        nonce: nonce_from(&nonce)?,
+        ciphertext: row.try_get("ciphertext").map_err(kms_row_decode)?,
+    })
+}
+
+fn kek_with_identity_from_row(row: sqlx::postgres::PgRow) -> Result<(KekId, ExportedKek), PgError> {
+    let epoch = row.try_get::<i64, _>("epoch").map_err(kms_row_decode)?;
+    if epoch < 0 {
+        return Err(PgError::Query(
+            "durable KMS row has a negative key epoch".into(),
+        ));
+    }
+    let nonce = row.try_get::<Vec<u8>, _>("nonce").map_err(kms_row_decode)?;
+    Ok((
+        KekId::new(
+            TenantId(row.try_get("tenant_id").map_err(kms_row_decode)?),
+            Region(row.try_get("region").map_err(kms_row_decode)?),
+        ),
+        ExportedKek {
+            nonce: nonce_from(&nonce)?,
+            wrapped: row.try_get("wrapped").map_err(kms_row_decode)?,
+            epoch: epoch as u64,
+        },
+    ))
+}
+
+fn dek_with_identity_from_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<(DekId, WrappedDek, u64), PgError> {
+    let tenant = TenantId(row.try_get("tenant_id").map_err(kms_row_decode)?);
+    let class_token: String = row.try_get("class").map_err(kms_row_decode)?;
+    let class = KeyClass::parse_token(&class_token)
+        .ok_or_else(|| PgError::Query("kms_wrapped_dek row has an invalid key class".into()))?;
+    let (wrapped, epoch) = dek_material_from_row(row)?;
+    Ok((DekId::new(tenant, class), wrapped, epoch))
 }
 
 fn nonce_from(bytes: &[u8]) -> Result<[u8; NONCE_LEN], PgError> {

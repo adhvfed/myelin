@@ -130,6 +130,9 @@ impl ModelClient for DurableModelClient {
             ModelStepBegin::InDoubt => Err(Self::replay_refused(
                 "the prior process durably started this turn but did not durably finish it",
             )),
+            ModelStepBegin::Unreplayable => Err(Self::replay_refused(
+                "the legacy response was privacy-redacted during the ciphertext-only migration",
+            )),
             ModelStepBegin::Started => {
                 let response = self.inner.complete(request)?;
                 let encoded = serde_json::to_value(&response).map_err(|error| {

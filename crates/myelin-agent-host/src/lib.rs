@@ -647,8 +647,16 @@ impl AgentHost {
         Ok(AgentHost {
             region,
             wallet: AgentWallet::new(provider.clone()),
-            model_steps: AgentModelStepStore::with_runtime(provider.clone(), rt.clone()),
-            tool_effects: AgentToolEffectStore::with_runtime(provider.clone(), rt.clone()),
+            model_steps: AgentModelStepStore::with_runtime(
+                provider.clone(),
+                rt.clone(),
+                kms.clone(),
+            ),
+            tool_effects: AgentToolEffectStore::with_runtime(
+                provider.clone(),
+                rt.clone(),
+                kms.clone(),
+            ),
             traces: Arc::new(DurableAgentTraceStore::with_runtime(
                 provider.clone(),
                 rt.clone(),

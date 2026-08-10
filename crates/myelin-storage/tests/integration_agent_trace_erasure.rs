@@ -4,9 +4,9 @@ use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_storage::{
     all_durable_migrations, AgentModelStepStore, AgentToolEffectStore, AgentTraceError,
     AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore, DurableKmsBacking, HotTables,
-    ModelStepError, SealKey, SubstrateProvider, ToolEffectError,
+    ModelStepError, PiiKeyRef, SealKey, SubstrateProvider, ToolEffectError,
 };
-use myelin_tenancy::TenantId;
+use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
 fn app_config() -> MyelinConfig {
@@ -52,9 +52,9 @@ async fn test_provider() -> Option<SubstrateProvider> {
         .await
         .unwrap();
     Some(
-        SubstrateProvider::connect(app_config(), 4)
+        SubstrateProvider::connect(app_config(), 1)
             .await
-            .expect("open the constrained app provider"),
+            .expect("open the deliberately single-connection app provider"),
     )
 }
 
@@ -166,8 +166,8 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
         tokio::runtime::Handle::current(),
         kms.clone(),
     );
-    let model_steps = AgentModelStepStore::new(provider.clone());
-    let tool_effects = AgentToolEffectStore::new(provider.clone());
+    let model_steps = AgentModelStepStore::new(provider.clone(), kms.clone());
+    let tool_effects = AgentToolEffectStore::new(provider.clone(), kms.clone());
     let subject = SubjectRef::new(Principal::stub(
         PrincipalId("founder".into()),
         PrincipalKind::Human,
@@ -255,6 +255,31 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
             "private tool observation",
         )
         .expect("the subject owns the replayable tool result");
+    let inspected_tenant = tenant.0.clone();
+    let journal_key_ref = provider
+        .with_tenant_tx(&tenant.0, move |connection| {
+            Box::pin(async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT response_key_ref FROM agent_model_step \
+                      WHERE tenant_id = $1 AND run_id = \
+                        '11111111-1111-4111-8111-111111111111' \
+                        AND step_key = 'model-turn/0'",
+                )
+                .bind(&inspected_tenant)
+                .fetch_one(connection)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+            })
+        })
+        .await
+        .expect("capture the replay ciphertext's durable subject-key reference");
+    let journal_key_ref =
+        PiiKeyRef::parse(&journal_key_ref).expect("the stored key reference parses");
+    let region = Region(provider.config().region.clone());
+    assert!(
+        kms.resolve_dek(&journal_key_ref, &region).is_ok(),
+        "the subject can replay the encrypted result before erasure",
+    );
     assert_eq!(
         store.count_for_subject(&tenant.0, "founder").await.unwrap(),
         4,
@@ -281,6 +306,10 @@ async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_one
     assert!(
         erased.key_unrecoverable,
         "the subject DEK no longer resolves"
+    );
+    assert!(
+        kms.resolve_dek(&journal_key_ref, &region).is_err(),
+        "captured journal ciphertext is unreadable after the subject key is destroyed",
     );
     assert_eq!(
         store.count_for_subject(&tenant.0, "founder").await.unwrap(),

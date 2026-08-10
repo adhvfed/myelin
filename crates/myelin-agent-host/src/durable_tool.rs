@@ -113,6 +113,9 @@ impl ToolExecutor for DurableToolExecutor<'_> {
             .map_err(journal_failed)?
         {
             ToolEffectBegin::Completed(result) => return Ok(ToolResult(result)),
+            ToolEffectBegin::Unreplayable => {
+                return Err(journal_failed(ToolEffectError::Unreplayable));
+            }
             ToolEffectBegin::Execute => {}
         }
 

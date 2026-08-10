@@ -76,7 +76,8 @@ pub mod valkey;
 pub mod cell_root_durable;
 
 pub use agent_journal_privacy::{
-    agent_journal_privacy_migrations, AGENT_JOURNAL_SUBJECT_MIGRATION,
+    agent_journal_privacy_migrations, AGENT_JOURNAL_ENCRYPTION_MIGRATION,
+    AGENT_JOURNAL_SUBJECT_MIGRATION,
 };
 pub use agent_model_step::{
     agent_model_step_migrations, AgentModelStepStore, ModelStepBegin, ModelStepCompletion,

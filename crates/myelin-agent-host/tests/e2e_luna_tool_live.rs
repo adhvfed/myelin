@@ -19,12 +19,10 @@ use myelin_identity::{
 use myelin_identity_service::{
     run_token_jti, RevocationStore, RunTokenState, StoreBackedCheck, TupleStore,
 };
-use myelin_storage::agent_wallet::{agent_wallet_charge_migrations, agent_wallet_migrations};
 use myelin_storage::migration::{HotTables, Migration, Migrations};
 use myelin_storage::reserve_settle::CostLedger;
 use myelin_storage::{
-    agent_model_step_migrations, cell_root_durable_migrations, identity_durable_migrations,
-    DurableRevocationBacking, SealKey, SubstrateProvider, TenantScope,
+    all_durable_migrations, DurableRevocationBacking, SealKey, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -56,17 +54,9 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
         }
     };
     admin
-        .migrate(&agent_wallet_migrations(), &HotTables::none())
+        .migrate(&all_durable_migrations(), &HotTables::none())
         .await
-        .expect("apply the agent-wallet migration (0080)");
-    admin
-        .migrate(&agent_wallet_charge_migrations(), &HotTables::none())
-        .await
-        .expect("apply replay-safe wallet charges (0095)");
-    admin
-        .migrate(&agent_model_step_migrations(), &HotTables::none())
-        .await
-        .expect("apply durable model steps (0096-0097)");
+        .expect("apply the complete durable host schema");
     let check_status_table = Migrations::of([Migration::plain_on(
         "git_0014_check_status",
         CREATE_CHECK_STATUS_DDL,
@@ -76,14 +66,6 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
         .migrate(&check_status_table, &HotTables::none())
         .await
         .expect("apply the Git check_status projection table (git_0014)");
-    admin
-        .migrate(&identity_durable_migrations(), &HotTables::none())
-        .await
-        .expect("apply the identity durable (S7 revocation + run-token teardown) migrations");
-    admin
-        .migrate(&cell_root_durable_migrations(), &HotTables::none())
-        .await
-        .expect("apply the cell token-authority root migration");
     Some(admin)
 }
 

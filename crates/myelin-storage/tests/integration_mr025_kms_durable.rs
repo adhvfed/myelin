@@ -447,6 +447,72 @@ async fn concurrent_processes_converge_on_one_new_subject_key() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_process_cannot_rotate_a_shredded_subject_key_back_into_the_database() {
+    let Some(provider) = admin_provider().await else {
+        return;
+    };
+    let suffix = uniq();
+    let cell = format!("cell-{suffix}");
+    let tenant = TenantId(format!("01J0SHRED{suffix}"));
+    let region = Region("eu-west".into());
+    let seal = seal_k();
+    let stale = DurableKmsBacking::new(provider.db_pool().clone(), &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("the soon-to-be-stale process boots");
+    let doomed_ref = stale
+        .ensure_dek(&tenant, &region, KeyClass::Subject("u-shredded".into()))
+        .expect("the subject key exists in the stale process cache");
+    let shredder = DurableKmsBacking::new(fresh_pool().await, &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("a second process sees the same durable keys");
+    assert!(shredder.destroy_dek(&myelin_storage::DekId::new(
+        tenant.clone(),
+        KeyClass::Subject("u-shredded".into()),
+    )));
+
+    stale
+        .rotate_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("rotation refreshes durable membership before rewrapping keys");
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM kms_wrapped_dek \
+          WHERE cell_id = $1 AND tenant_id = $2 AND class = 'subject:u-shredded'",
+    )
+    .bind(&cell)
+    .bind(tenant.as_str())
+    .fetch_one(provider.db_pool())
+    .await
+    .expect("count the shredded durable key rows");
+    assert_eq!(rows, 0, "rotation never UPSERTs a deleted subject key");
+    assert!(
+        stale
+            .backup_snapshot_durable(&seal)
+            .deks
+            .iter()
+            .all(|(id, ..)| id.class != KeyClass::Subject("u-shredded".into())),
+        "a snapshot reads durable membership, not the process's stale cache",
+    );
+    assert!(
+        stale
+            .backup_snapshot()
+            .iter()
+            .all(|(id, _)| id.class != KeyClass::Subject("u-shredded".into())),
+        "the application backup path also reads durable membership",
+    );
+    let restarted = DurableKmsBacking::new(fresh_pool().await, &cell)
+        .load_or_generate(&seal)
+        .await
+        .expect("the post-rotation process restarts");
+    assert!(
+        restarted.resolve_dek(&doomed_ref, &region).is_err(),
+        "the shredded ciphertext remains unrecoverable after rotation and restart",
+    );
+
+    cleanup(provider.db_pool(), &cell).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rotation_persists_kek_and_all_rewrapped_deks_atomically_and_survives_restart() {
     let Some(provider) = admin_provider().await else {
         return;

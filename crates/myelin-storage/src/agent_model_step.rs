@@ -1,8 +1,14 @@
+use std::sync::Arc;
+
 use myelin_tenancy::TenantId;
 use serde_json::Value;
 use sqlx::Row;
 
-use crate::agent_journal_privacy::{agent_subject_status, AgentSubjectStatus};
+use crate::agent_journal_privacy::{
+    agent_subject_status, open_journal_payload, seal_journal_payload, AgentSubjectStatus,
+    JournalPayloadContext, JournalPayloadKind,
+};
+use crate::kms::KmsEngine;
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
@@ -75,6 +81,7 @@ pub enum ModelStepBegin {
     Started,
     Completed(Value),
     InDoubt,
+    Unreplayable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -117,15 +124,24 @@ impl std::error::Error for ModelStepError {}
 pub struct AgentModelStepStore {
     provider: SubstrateProvider,
     runtime: tokio::runtime::Handle,
+    kms: Arc<KmsEngine>,
 }
 
 impl AgentModelStepStore {
-    pub fn new(provider: SubstrateProvider) -> Self {
-        Self::with_runtime(provider, tokio::runtime::Handle::current())
+    pub fn new(provider: SubstrateProvider, kms: Arc<KmsEngine>) -> Self {
+        Self::with_runtime(provider, tokio::runtime::Handle::current(), kms)
     }
 
-    pub fn with_runtime(provider: SubstrateProvider, runtime: tokio::runtime::Handle) -> Self {
-        Self { provider, runtime }
+    pub fn with_runtime(
+        provider: SubstrateProvider,
+        runtime: tokio::runtime::Handle,
+        kms: Arc<KmsEngine>,
+    ) -> Self {
+        Self {
+            provider,
+            runtime,
+            kms,
+        }
     }
 
     fn region(&self) -> String {
@@ -158,6 +174,7 @@ impl AgentModelStepStore {
         let step_key = step_key.to_string();
         let request_hash = request_hash.to_string();
         let requested_by = requested_by.to_string();
+        let kms = self.kms.clone();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
                 begin_on_connection(
@@ -168,6 +185,7 @@ impl AgentModelStepStore {
                     &step_key,
                     &request_hash,
                     &requested_by,
+                    &kms,
                 )
                 .await
             })
@@ -196,6 +214,7 @@ impl AgentModelStepStore {
         let request_hash = request_hash.to_string();
         let requested_by = requested_by.to_string();
         let response = response.clone();
+        let kms = self.kms.clone();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
                 complete_on_connection(
@@ -207,6 +226,7 @@ impl AgentModelStepStore {
                     &request_hash,
                     &requested_by,
                     &response,
+                    &kms,
                 )
                 .await
             })
@@ -253,6 +273,7 @@ async fn begin_on_connection(
     step_key: &str,
     request_hash: &str,
     requested_by: &str,
+    kms: &KmsEngine,
 ) -> Result<Result<ModelStepBegin, ModelStepError>, PgError> {
     match agent_subject_status(connection, tenant, region, requested_by).await? {
         AgentSubjectStatus::Active => {}
@@ -278,7 +299,8 @@ async fn begin_on_connection(
     }
 
     let row = sqlx::query(
-        "SELECT request_hash, requested_by, state, response FROM agent_model_step
+        "SELECT request_hash, requested_by, state, response_key_ref, response_nonce, \
+                response_ciphertext FROM agent_model_step
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4",
     )
     .bind(tenant)
@@ -299,13 +321,22 @@ async fn begin_on_connection(
         .as_str()
     {
         "started" => Ok(Ok(ModelStepBegin::InDoubt)),
-        "completed" => {
-            let response = row
-                .try_get::<Option<Value>, _>("response")
-                .map_err(store_query)?
-                .ok_or_else(|| PgError::Query("completed model step has no response".into()))?;
-            Ok(Ok(ModelStepBegin::Completed(response)))
-        }
+        "redacted" => Ok(Ok(ModelStepBegin::Unreplayable)),
+        "completed" => model_response_from_row(
+            &row,
+            kms,
+            &JournalPayloadContext {
+                tenant,
+                region,
+                run_id,
+                position_key: step_key,
+                request_hash,
+                requested_by,
+                kind: JournalPayloadKind::ModelResponse,
+            },
+        )
+        .map(ModelStepBegin::Completed)
+        .map(Ok),
         _ => Err(PgError::Query("model step has an invalid state".into())),
     }
 }
@@ -319,6 +350,7 @@ async fn complete_on_connection(
     request_hash: &str,
     requested_by: &str,
     response: &Value,
+    kms: &KmsEngine,
 ) -> Result<Result<ModelStepCompletion, ModelStepError>, PgError> {
     match agent_subject_status(connection, tenant, region, requested_by).await? {
         AgentSubjectStatus::Active => {}
@@ -326,7 +358,8 @@ async fn complete_on_connection(
         AgentSubjectStatus::Restricted => return Ok(Err(ModelStepError::Restricted)),
     }
     let row = sqlx::query(
-        "SELECT request_hash, requested_by, state, response FROM agent_model_step
+        "SELECT request_hash, requested_by, state, response_key_ref, response_nonce, \
+                response_ciphertext FROM agent_model_step
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4 FOR UPDATE",
     )
     .bind(tenant)
@@ -346,10 +379,19 @@ async fn complete_on_connection(
     }
     let state: String = row.try_get("state").map_err(store_query)?;
     if state == "completed" {
-        let stored = row
-            .try_get::<Option<Value>, _>("response")
-            .map_err(store_query)?
-            .ok_or_else(|| PgError::Query("completed model step has no response".into()))?;
+        let stored = model_response_from_row(
+            &row,
+            kms,
+            &JournalPayloadContext {
+                tenant,
+                region,
+                run_id,
+                position_key: step_key,
+                request_hash,
+                requested_by,
+                kind: JournalPayloadKind::ModelResponse,
+            },
+        )?;
         return Ok(if stored == *response {
             Ok(ModelStepCompletion::Replayed)
         } else {
@@ -357,22 +399,64 @@ async fn complete_on_connection(
         });
     }
     if state != "started" {
-        return Err(PgError::Query("model step has an invalid state".into()));
+        return Ok(Err(ModelStepError::Conflict));
     }
 
+    let plaintext = serde_json::to_vec(response)
+        .map_err(|_| PgError::Query("model response failed canonical serialization".into()))?;
+    let sealed = seal_journal_payload(
+        kms,
+        &JournalPayloadContext {
+            tenant,
+            region,
+            run_id,
+            position_key: step_key,
+            request_hash,
+            requested_by,
+            kind: JournalPayloadKind::ModelResponse,
+        },
+        &plaintext,
+    )?;
+
     sqlx::query(
-        "UPDATE agent_model_step SET state = 'completed', response = $5, completed_at = now()
+        "UPDATE agent_model_step \
+            SET state = 'completed', response = NULL, response_key_ref = $5, \
+                response_nonce = $6, response_ciphertext = $7, completed_at = now()
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4",
     )
     .bind(tenant)
     .bind(region)
     .bind(run_id)
     .bind(step_key)
-    .bind(response)
+    .bind(sealed.key_ref.to_uri())
+    .bind(sealed.nonce.as_slice())
+    .bind(sealed.ciphertext)
     .execute(connection)
     .await
     .map_err(store_query)?;
     Ok(Ok(ModelStepCompletion::Applied))
+}
+
+fn model_response_from_row(
+    row: &sqlx::postgres::PgRow,
+    kms: &KmsEngine,
+    context: &JournalPayloadContext<'_>,
+) -> Result<Value, PgError> {
+    let key_ref = row
+        .try_get::<Option<String>, _>("response_key_ref")
+        .map_err(store_query)?
+        .ok_or_else(|| PgError::Query("completed model step has no encryption key".into()))?;
+    let nonce = row
+        .try_get::<Option<Vec<u8>>, _>("response_nonce")
+        .map_err(store_query)?
+        .ok_or_else(|| PgError::Query("completed model step has no encryption nonce".into()))?;
+    let ciphertext = row
+        .try_get::<Option<Vec<u8>>, _>("response_ciphertext")
+        .map_err(store_query)?
+        .ok_or_else(|| PgError::Query("completed model step has no ciphertext".into()))?;
+    let plaintext = open_journal_payload(kms, context, &key_ref, &nonce, ciphertext)?;
+    serde_json::from_slice(&plaintext)
+        .map_err(|_| PgError::Query("decrypted model response is invalid JSON".into()))
 }
 
 fn store_query(error: sqlx::Error) -> PgError {

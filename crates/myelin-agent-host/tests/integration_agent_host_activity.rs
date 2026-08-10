@@ -18,12 +18,15 @@ use myelin_identity_service::{NewAgent, PgAgentRegistry, HOSTED_LUNA_RUNTIME};
 use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_notif::{agent_effect_approval_targets, pending_agent_effect_approval};
 use myelin_storage::hitl_gate_durable::{opaque_gate_id, GateRecord, GateState, HitlVerdictStore};
-use myelin_storage::migration::HotTables;
+use myelin_storage::migration::{HotTables, Migrations};
 use myelin_storage::reserve_settle::{CostLedger, ReservationState, RunId};
 use myelin_storage::{
     all_durable_migrations, CreditKind, MicroUsd, SealKey, SubstrateProvider, TenantScope,
 };
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
+use tokio::sync::OnceCell;
+
+static HOST_SCHEMA_READY: OnceCell<()> = OnceCell::const_new();
 
 fn app_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
@@ -62,11 +65,25 @@ async fn test_provider() -> Option<SubstrateProvider> {
             return None;
         }
     };
-    admin.migrate_foundation().await.unwrap();
-    admin
-        .migrate(&all_durable_migrations(), &HotTables::none())
-        .await
-        .unwrap();
+    HOST_SCHEMA_READY
+        .get_or_init(|| async move {
+            admin.migrate_foundation().await.unwrap();
+            let host_migrations = Migrations::of(
+                all_durable_migrations()
+                    .0
+                    .into_iter()
+                    .chain(myelin_notif::migrations::migrations().0),
+            );
+            admin
+                .migrate(&host_migrations, &HotTables::none())
+                .await
+                .unwrap();
+            sqlx::query("GRANT SELECT, INSERT, UPDATE, DELETE ON notif_inbox_item TO myelin_app")
+                .execute(admin.db_pool())
+                .await
+                .expect("grant the runtime role access to hosted approval cards");
+        })
+        .await;
     Some(
         SubstrateProvider::connect(app_config(), 8)
             .await
