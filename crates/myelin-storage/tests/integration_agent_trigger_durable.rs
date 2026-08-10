@@ -4,11 +4,11 @@ use myelin_config::MyelinConfig;
 use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
-    all_durable_migrations, AgentTriggerFiringState, CreateAgentTriggerBindingOutcome,
-    DurableAgentTriggerBacking, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
-    SubstrateProvider,
+    all_durable_migrations, AgentTriggerClaimRequest, AgentTriggerFiringState,
+    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, NewAgentTriggerBinding,
+    ReserveAgentTriggerFiringOutcome, SubstrateProvider,
 };
-use sqlx::types::chrono::Utc;
+use sqlx::types::chrono::{DateTime, Utc};
 use sqlx::types::Uuid;
 
 fn admin_config() -> MyelinConfig {
@@ -30,12 +30,17 @@ fn unique_tenant() -> String {
     )
 }
 
-async fn seed_people_and_agent(provider: &SubstrateProvider, tenant: &str, agent_id: Uuid) {
+async fn seed_people_and_agent(
+    provider: &SubstrateProvider,
+    tenant: &str,
+    agent_id: Uuid,
+    runtime_ref: &str,
+) {
     let tenant = tenant.to_string();
     let region = provider.config().region.clone();
     let human_kind = serde_json::to_string(&PrincipalKind::Human).unwrap();
     let agent_kind = serde_json::to_string(&PrincipalKind::Agent {
-        runtime_ref: RuntimeRef("external:mcp".into()),
+        runtime_ref: RuntimeRef(runtime_ref.into()),
         on_behalf_of: Some(PrincipalId("founder".into())),
     })
     .unwrap();
@@ -43,6 +48,7 @@ async fn seed_people_and_agent(provider: &SubstrateProvider, tenant: &str, agent
     let processor = serde_json::to_string(&DataRole::Processor).unwrap();
     let active = serde_json::to_string(&PrincipalStatus::Active).unwrap();
     let agent_principal = format!("agent:{agent_id}");
+    let runtime_ref = runtime_ref.to_string();
     provider
         .with_tenant_tx(&tenant.clone(), move |conn| {
             Box::pin(async move {
@@ -67,12 +73,13 @@ async fn seed_people_and_agent(provider: &SubstrateProvider, tenant: &str, agent
                     "INSERT INTO identity_agent \
                        (tenant_id, region, agent_id, name, runtime_ref, created_by, client_nonce, \
                         tools, grants, created_at) \
-                     VALUES ($1, $2, $3, 'triage-bot', 'external:mcp', 'founder', 'agent-create', \
+                     VALUES ($1, $2, $3, 'triage-bot', $4, 'founder', 'agent-create', \
                              ARRAY['issue.create'], ARRAY['issue.create'], clock_timestamp())",
                 )
                 .bind(&tenant)
                 .bind(&region)
                 .bind(agent_id)
+                .bind(&runtime_ref)
                 .execute(&mut *conn)
                 .await
                 .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
@@ -132,7 +139,7 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         .expect("open the constrained app provider");
     let tenant = unique_tenant();
     let agent_id = Uuid::parse_str("20000000-0000-4000-8000-000000000002").unwrap();
-    seed_people_and_agent(&app, &tenant, agent_id).await;
+    seed_people_and_agent(&app, &tenant, agent_id, "hosted:luna").await;
     let triggers = DurableAgentTriggerBacking::new(app.clone());
     let proposal = red_mainline_binding(agent_id);
 
@@ -236,6 +243,60 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
         history[0].run_id, None,
         "queued is not misreported as started"
     );
+
+    let now = Utc::now();
+    let incompatible = triggers
+        .claim_next_firing(
+            &tenant,
+            AgentTriggerClaimRequest::new("external:mcp", "external-worker", now, 30).unwrap(),
+        )
+        .await
+        .expect("look for work for an incompatible runtime");
+    assert_eq!(
+        incompatible, None,
+        "an external MCP worker cannot steal a hosted agent's firing"
+    );
+
+    let first_claim = triggers
+        .claim_next_firing(
+            &tenant,
+            AgentTriggerClaimRequest::new("hosted:luna", "host-1", now, 30).unwrap(),
+        )
+        .await
+        .expect("claim the firing for its exact runtime")
+        .expect("one hosted firing is claimable");
+    assert_eq!(first_claim.event_id, "ci-failed-1");
+    assert_eq!(first_claim.run_as_agent_id, agent_id.to_string());
+    assert_eq!(first_claim.owner_principal_id, "founder");
+    assert_eq!(first_claim.runtime_ref, "hosted:luna");
+    assert_eq!(first_claim.claim_attempts, 1);
+    assert_eq!(first_claim.claim_owner, "host-1");
+
+    let held = triggers
+        .claim_next_firing(
+            &tenant,
+            AgentTriggerClaimRequest::new("hosted:luna", "host-2", now, 30).unwrap(),
+        )
+        .await
+        .expect("another worker observes the live lease");
+    assert_eq!(held, None, "a live claim is never double-delivered");
+
+    let after_expiry = DateTime::<Utc>::from_timestamp(
+        now.timestamp().checked_add(31).unwrap(),
+        now.timestamp_subsec_nanos(),
+    )
+    .unwrap();
+    let reclaimed = triggers
+        .claim_next_firing(
+            &tenant,
+            AgentTriggerClaimRequest::new("hosted:luna", "host-2", after_expiry, 30).unwrap(),
+        )
+        .await
+        .expect("reclaim work after its worker disappears")
+        .expect("the expired claim returns to the runtime queue");
+    assert_eq!(reclaimed.event_id, "ci-failed-1");
+    assert_eq!(reclaimed.claim_attempts, 2);
+    assert_eq!(reclaimed.claim_owner, "host-2");
 
     let later_failure = triggers
         .reserve_firing(

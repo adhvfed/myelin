@@ -82,10 +82,29 @@ CREATE POLICY myelin_tenant_isolation ON agent_trigger_firing
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_TRIGGER_CLAIM_MIGRATION: &str = r#"
+ALTER TABLE agent_trigger_firing
+    ADD COLUMN IF NOT EXISTS claim_owner text,
+    ADD COLUMN IF NOT EXISTS claim_until timestamptz,
+    ADD COLUMN IF NOT EXISTS claim_attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE agent_trigger_firing
+    DROP CONSTRAINT IF EXISTS agent_trigger_firing_claim_shape;
+ALTER TABLE agent_trigger_firing
+    ADD CONSTRAINT agent_trigger_firing_claim_shape CHECK (
+        claim_attempts >= 0
+        AND ((state = 'claimed' AND claim_owner IS NOT NULL AND claim_until IS NOT NULL)
+          OR (state <> 'claimed' AND claim_owner IS NULL AND claim_until IS NULL))
+    );
+CREATE INDEX IF NOT EXISTS agent_trigger_firing_claimable
+    ON agent_trigger_firing (tenant_id, region, created_at, binding_id, event_id)
+    WHERE state IN ('queued', 'claimed');
+"#;
+
 pub fn agent_trigger_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0090_agent_trigger", AGENT_TRIGGER_MIGRATION),
         Migration::plain("0091_agent_trigger_rls", AGENT_TRIGGER_RLS_POLICY),
+        Migration::plain("0092_agent_trigger_claim", AGENT_TRIGGER_CLAIM_MIGRATION),
     ])
 }
 
@@ -101,6 +120,8 @@ mod tests {
         assert!(AGENT_TRIGGER_MIGRATION
             .contains("PRIMARY KEY (tenant_id, region, binding_id, event_id)"));
         assert!(AGENT_TRIGGER_MIGRATION.contains("firings_used BETWEEN 0 AND max_firings"));
+        assert!(AGENT_TRIGGER_CLAIM_MIGRATION.contains("state IN ('queued', 'claimed')"));
+        assert!(AGENT_TRIGGER_CLAIM_MIGRATION.contains("claim_until"));
         assert_eq!(
             AGENT_TRIGGER_RLS_POLICY
                 .matches("FORCE ROW LEVEL SECURITY")

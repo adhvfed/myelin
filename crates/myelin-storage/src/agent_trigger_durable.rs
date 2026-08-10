@@ -2,12 +2,13 @@ mod model;
 mod schema;
 
 pub use model::{
-    AgentTriggerFiringState, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding,
-    DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
-    ReservedAgentTriggerFiring,
+    AgentTriggerClaimRequest, AgentTriggerFiringState, ClaimedAgentTriggerFiring,
+    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
+    NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
 };
 pub use schema::{
-    agent_trigger_durable_migrations, AGENT_TRIGGER_MIGRATION, AGENT_TRIGGER_RLS_POLICY,
+    agent_trigger_durable_migrations, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
+    AGENT_TRIGGER_RLS_POLICY,
 };
 
 use sqlx::types::chrono::{DateTime, Utc};
@@ -415,6 +416,74 @@ impl DurableAgentTriggerBacking {
             })
             .await
     }
+
+    pub async fn claim_next_firing(
+        &self,
+        tenant: &str,
+        request: AgentTriggerClaimRequest,
+    ) -> Result<Option<ClaimedAgentTriggerFiring>, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let active = serde_json::to_string(&myelin_identity::PrincipalStatus::Active)
+                        .expect("principal status serializes");
+                    let human = serde_json::to_string(&myelin_identity::PrincipalKind::Human)
+                        .expect("principal kind serializes");
+                    let row = sqlx::query(
+                        "WITH candidate AS (\
+                            SELECT f.binding_id, f.event_id, b.owner_principal_id, \
+                                   b.run_as_agent_id, b.task, b.delegation_caveats, \
+                                   agent_row.runtime_ref \
+                              FROM agent_trigger_firing f \
+                              JOIN agent_trigger_binding b ON b.tenant_id = f.tenant_id \
+                               AND b.region = f.region AND b.binding_id = f.binding_id \
+                              JOIN identity_agent agent_row ON agent_row.tenant_id = b.tenant_id \
+                               AND agent_row.region = b.region \
+                               AND agent_row.agent_id = b.run_as_agent_id \
+                              JOIN principal owner ON owner.tenant_id = b.tenant_id \
+                               AND owner.region = b.region \
+                               AND owner.principal_id = b.owner_principal_id \
+                              JOIN principal agent ON agent.tenant_id = b.tenant_id \
+                               AND agent.region = b.region \
+                               AND agent.principal_id = 'agent:' || b.run_as_agent_id::text \
+                             WHERE f.tenant_id = $1 AND f.region = $2 \
+                               AND agent_row.runtime_ref = $3 AND b.state = 'active' \
+                               AND owner.kind = $4 AND owner.status = $5 AND agent.status = $5 \
+                               AND (f.state = 'queued' \
+                                 OR (f.state = 'claimed' AND f.claim_until <= $6)) \
+                             ORDER BY f.created_at, f.binding_id, f.event_id \
+                             FOR UPDATE OF f SKIP LOCKED LIMIT 1\
+                         ) \
+                         UPDATE agent_trigger_firing f \
+                            SET state = 'claimed', claim_owner = $7, claim_until = $8, \
+                                claim_attempts = claim_attempts + 1 \
+                           FROM candidate \
+                          WHERE f.tenant_id = $1 AND f.region = $2 \
+                            AND f.binding_id = candidate.binding_id \
+                            AND f.event_id = candidate.event_id \
+                      RETURNING f.binding_id, f.event_id, f.event_type, f.event_envelope, \
+                                candidate.owner_principal_id, candidate.run_as_agent_id, \
+                                candidate.runtime_ref, candidate.task, candidate.delegation_caveats, \
+                                f.claim_owner, f.claim_until, f.claim_attempts",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(&request.runtime_ref)
+                    .bind(&human)
+                    .bind(&active)
+                    .bind(request.now)
+                    .bind(&request.worker_id)
+                    .bind(request.claim_until)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("claim next governed agent firing"))?;
+                    row.as_ref().map(claimed_firing_from_row).transpose()
+                })
+            })
+            .await
+    }
 }
 
 fn binding_matches(
@@ -539,6 +608,48 @@ fn firing_from_row(row: &sqlx::postgres::PgRow) -> Result<DurableAgentTriggerFir
             .try_get::<DateTime<Utc>, _>("created_at")
             .map_err(row_error("created_at"))?
             .to_rfc3339(),
+    })
+}
+
+fn claimed_firing_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<ClaimedAgentTriggerFiring, PgError> {
+    let attempts = row
+        .try_get::<i32, _>("claim_attempts")
+        .map_err(row_error("claim_attempts"))?;
+    Ok(ClaimedAgentTriggerFiring {
+        binding_id: row
+            .try_get::<Uuid, _>("binding_id")
+            .map_err(row_error("binding_id"))?
+            .to_string(),
+        event_id: row.try_get("event_id").map_err(row_error("event_id"))?,
+        event_type: row.try_get("event_type").map_err(row_error("event_type"))?,
+        event_envelope: row
+            .try_get("event_envelope")
+            .map_err(row_error("event_envelope"))?,
+        owner_principal_id: row
+            .try_get("owner_principal_id")
+            .map_err(row_error("owner_principal_id"))?,
+        run_as_agent_id: row
+            .try_get::<Uuid, _>("run_as_agent_id")
+            .map_err(row_error("run_as_agent_id"))?
+            .to_string(),
+        runtime_ref: row
+            .try_get("runtime_ref")
+            .map_err(row_error("runtime_ref"))?,
+        task: row.try_get("task").map_err(row_error("task"))?,
+        delegation_caveats: row
+            .try_get("delegation_caveats")
+            .map_err(row_error("delegation_caveats"))?,
+        claim_owner: row
+            .try_get("claim_owner")
+            .map_err(row_error("claim_owner"))?,
+        claim_until: row
+            .try_get::<DateTime<Utc>, _>("claim_until")
+            .map_err(row_error("claim_until"))?
+            .to_rfc3339(),
+        claim_attempts: u32::try_from(attempts)
+            .map_err(|_| PgError::Query("negative durable trigger claim_attempts".into()))?,
     })
 }
 
