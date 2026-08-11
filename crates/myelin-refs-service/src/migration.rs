@@ -6,8 +6,10 @@ use crate::dek::RefsDekPin;
 pub const EDGE_TABLE: &str = "edge";
 
 pub const EDGE_MIGRATION_ID: &str = "refs_0001_edge";
+pub const EDGE_INBOUND_KEYSET_MIGRATION_ID: &str = "refs_0002_inbound_keyset";
 
 pub const EDGE_INBOUND_INDEX: &str = "edge_inbound";
+pub const EDGE_INBOUND_KEYSET_INDEX: &str = "edge_inbound_keyset";
 pub const EDGE_OUTBOUND_INDEX: &str = "edge_outbound";
 pub const EDGE_BY_REL_INDEX: &str = "edge_by_rel";
 
@@ -47,6 +49,10 @@ pub const CREATE_EDGE_INDEXES_DDL: &[(&str, &str)] = &[
     ),
 ];
 
+pub const CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_inbound_keyset \
+     ON edge (tenant_id, region, target_root, edge_id) WHERE NOT tombstoned";
+
 pub const MAKE_EDGE_TENANT_SCOPED_DDL: &str = "SELECT myelin_make_tenant_scoped('edge')";
 
 pub fn edge_table_migrations() -> Migrations {
@@ -62,12 +68,15 @@ pub fn edge_table_migrations() -> Migrations {
     ddl.push_str(MAKE_EDGE_TENANT_SCOPED_DDL);
     ddl.push(';');
     let ddl: &'static str = Box::leak(ddl.into_boxed_str());
-    Migrations::of([Migration::phased(
-        EDGE_MIGRATION_ID,
-        ddl,
-        MigrationPhase::Plain,
-        EDGE_TABLE,
-    )])
+    Migrations::of([
+        Migration::phased(EDGE_MIGRATION_ID, ddl, MigrationPhase::Plain, EDGE_TABLE),
+        Migration::phased(
+            EDGE_INBOUND_KEYSET_MIGRATION_ID,
+            CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL,
+            MigrationPhase::Expand,
+            EDGE_TABLE,
+        ),
+    ])
 }
 
 pub fn edge_table_dek_ref(
@@ -177,16 +186,14 @@ mod tests {
                 "index `{name}` must be tenant-first (no cross-tenant query path): {ddl}"
             );
         }
+        assert!(CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL
+            .contains("ON edge (tenant_id, region, target_root, edge_id)"));
     }
 
     #[test]
     fn the_edge_migration_is_forward_only() {
         let migrations = edge_table_migrations();
-        assert_eq!(
-            migrations.0.len(),
-            1,
-            "one forward migration: create the edge schema"
-        );
+        assert_eq!(migrations.0.len(), 2);
         let m = &migrations.0[0];
         assert_eq!(m.id, EDGE_MIGRATION_ID);
         assert_eq!(m.table, Some(EDGE_TABLE));
@@ -214,6 +221,13 @@ mod tests {
             m.ddl.contains("myelin_make_tenant_scoped('edge')"),
             "the RLS scoping rides the migration"
         );
+        let keyset = &migrations.0[1];
+        assert_eq!(keyset.id, EDGE_INBOUND_KEYSET_MIGRATION_ID);
+        assert_eq!(keyset.table, Some(EDGE_TABLE));
+        assert_eq!(keyset.phase, MigrationPhase::Expand);
+        assert_eq!(keyset.ddl, CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL);
+        assert!(keyset.ddl.contains("CREATE INDEX CONCURRENTLY"));
+        assert!(edge_ddl_is_forward_only(keyset.ddl));
     }
 
     #[test]
@@ -226,8 +240,8 @@ mod tests {
             .expect("the edge schema migration applies forward-only");
         assert_eq!(
             runner.applied(),
-            &[EDGE_MIGRATION_ID],
-            "the runner applied the edge migration"
+            &[EDGE_MIGRATION_ID, EDGE_INBOUND_KEYSET_MIGRATION_ID],
+            "the runner applied the edge schema and its online keyset index"
         );
     }
 

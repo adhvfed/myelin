@@ -1329,27 +1329,66 @@ command = ["true"]
         expected_version: initialVersion,
         title,
         visibility: "team",
-        blocks: [{
-          type: "paragraph",
-          markdown: "Follow the delivery issue ￼ through completion.",
-          references: [issueRef],
-        }],
+        blocks: [
+          {
+            type: "paragraph",
+            markdown: "Follow the delivery issue ￼ through completion.",
+            references: [issueRef],
+          },
+          {
+            type: "paragraph",
+            markdown: "Record what we learn beside ￼ while the work is fresh.",
+            references: [issueRef],
+          },
+        ],
       },
     });
     const linkedPage = record(linked.body.page, "knowledge page with delivery link");
     const linkedVersion = integer(linked.body.version, "linked knowledge version");
-    const linkedBlock = record(
-      array(linkedPage.blocks, "linked knowledge blocks")[0],
-      "linked knowledge block",
-    );
-    const linkedBlockId = string(linkedBlock.id, "linked knowledge block id");
-    const linkedBlockRef = `${pageRef}#b${linkedBlockId}`;
-    expect(linkedBlock).toMatchObject({ references: [issueRef] });
-    expect(await awaitBacklink(issueRef, pageRef, "links")).toMatchObject({
-      relation_class: "reference",
-      ref: linkedBlockRef,
-      target_ref: issueRef,
+    const linkedBlocks = array(linkedPage.blocks, "linked knowledge blocks")
+      .map((block) => record(block, "linked knowledge block"));
+    const linkedBlockIds = linkedBlocks
+      .map((block) => string(block.id, "linked knowledge block id"));
+    const linkedBlockRefs = linkedBlockIds.map((blockId) => `${pageRef}#b${blockId}`);
+    expect(linkedBlocks).toEqual([
+      expect.objectContaining({ references: [issueRef] }),
+      expect.objectContaining({ references: [issueRef] }),
+    ]);
+
+    const firstPage = await eventually<JsonRecord>(async () => {
+      const response = await systemClient.json(
+        `/v1/refs/backlinks?ref=${encodeURIComponent(issueRef)}&limit=1`,
+      );
+      const body = record(response.body, "first backlink page");
+      const items = array(body.items, "first backlink page items");
+      const page = record(body.page, "first backlink page cursor");
+      return items.length === 1 && typeof page.next_cursor === "string" ? body : undefined;
+    }, {
+      description: "both passages to become independently pageable issue backlinks",
     });
+    const firstItems = array(firstPage.items, "first backlink page items")
+      .map((item) => record(item, "first paged backlink"));
+    const firstCursor = string(
+      record(firstPage.page, "first backlink page cursor").next_cursor,
+      "first backlink cursor",
+    );
+    const secondPage = await systemClient.json(
+      `/v1/refs/backlinks?ref=${encodeURIComponent(issueRef)}&limit=1&cursor=${encodeURIComponent(firstCursor)}`,
+    );
+    const secondItems = array(secondPage.body.items, "second backlink page items")
+      .map((item) => record(item, "second paged backlink"));
+    const pagedRefs = [...firstItems, ...secondItems]
+      .map((item) => string(item.ref, "paged backlink ref"));
+    expect(pagedRefs.sort()).toEqual([...linkedBlockRefs].sort());
+    expect(secondPage.body).toMatchObject({ page: { limit: 1, next_cursor: null } });
+    for (const backlink of [...firstItems, ...secondItems]) {
+      expect(backlink).toMatchObject({
+        root_ref: pageRef,
+        relation: "links",
+        relation_class: "reference",
+        target_ref: issueRef,
+      });
+    }
 
     const unlinked = await systemClient.json(`/v1/knowledge/pages/${encodeURIComponent(pageId)}`, {
       method: "PUT",
@@ -1357,16 +1396,28 @@ command = ["true"]
         expected_version: linkedVersion,
         title,
         visibility: "team",
-        blocks: [{
-          id: linkedBlockId,
-          type: "paragraph",
-          markdown: "Delivery is complete; this runbook now stands on its own.",
-        }],
+        blocks: [
+          {
+            id: linkedBlockIds[0],
+            type: "paragraph",
+            markdown: "Delivery is complete; this runbook now stands on its own.",
+          },
+          {
+            id: linkedBlockIds[1],
+            type: "paragraph",
+            markdown: "The lasting lesson no longer needs a live work-item link.",
+          },
+        ],
       },
     });
     expect(unlinked.body).toMatchObject({
       durable: true,
-      page: { blocks: [expect.objectContaining({ references: [] })] },
+      page: {
+        blocks: [
+          expect.objectContaining({ references: [] }),
+          expect.objectContaining({ references: [] }),
+        ],
+      },
     });
     await awaitBacklinkGone(issueRef, pageRef, "links");
   });

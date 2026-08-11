@@ -33,11 +33,24 @@ impl PgEdgeStore {
         target_root: &myelin_events::ArtifactRef,
         limit: u32,
     ) -> Result<Vec<StoredBacklink>, myelin_storage::PgError> {
+        self.inbound_live_after(tenant, region, target_root, None, limit)
+            .await
+    }
+
+    pub async fn inbound_live_after(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        target_root: &myelin_events::ArtifactRef,
+        after_edge_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<StoredBacklink>, myelin_storage::PgError> {
         let scope_tenant = tenant.0.clone();
         let scope_region = region.0.clone();
         let tenant_id = scope_tenant.clone();
         let region_id = scope_region.clone();
         let target = target_root.0.clone();
+        let after_edge_id = after_edge_id.map(str::to_string);
         myelin_storage::with_tenant_tx(
             &self.pool,
             &scope_tenant,
@@ -50,12 +63,14 @@ impl PgEdgeStore {
                            FROM edge
                           WHERE tenant_id = $1 AND region = $2 AND target_root = $3
                             AND NOT tombstoned
+                            AND ($4::text IS NULL OR edge_id > $4)
                           ORDER BY edge_id
-                          LIMIT $4",
+                          LIMIT $5",
                     )
                     .bind(tenant_id)
                     .bind(region_id)
                     .bind(target)
+                    .bind(after_edge_id)
                     .bind(i64::from(limit))
                     .fetch_all(connection)
                     .await

@@ -98,9 +98,11 @@ pub use loop_guard::{
     GuardDecision, RefsLoopGuard, CAUSAL_DEPTH_CEILING,
 };
 pub use migration::{
-    edge_ddl_is_forward_only, edge_table_dek_ref, edge_table_migrations, CREATE_EDGE_INDEXES_DDL,
-    CREATE_EDGE_TABLE_DDL, EDGE_BY_REL_INDEX, EDGE_INBOUND_INDEX, EDGE_MIGRATION_ID,
-    EDGE_OUTBOUND_INDEX, EDGE_TABLE, MAKE_EDGE_TENANT_SCOPED_DDL,
+    edge_ddl_is_forward_only, edge_table_dek_ref, edge_table_migrations,
+    CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL, CREATE_EDGE_INDEXES_DDL, CREATE_EDGE_TABLE_DDL,
+    EDGE_BY_REL_INDEX, EDGE_INBOUND_INDEX, EDGE_INBOUND_KEYSET_INDEX,
+    EDGE_INBOUND_KEYSET_MIGRATION_ID, EDGE_MIGRATION_ID, EDGE_OUTBOUND_INDEX, EDGE_TABLE,
+    MAKE_EDGE_TENANT_SCOPED_DDL,
 };
 pub use mirror::{
     mirror_edges, project_typed_event, reconverge, Inverse, LifecycleRel, MirrorError,

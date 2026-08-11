@@ -14,6 +14,9 @@ use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacki
 use myelin_storage::PgMigrator;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use sqlx::PgPool;
+use tokio::sync::OnceCell;
+
+static MIGRATED: OnceCell<()> = OnceCell::const_new();
 
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
@@ -41,9 +44,14 @@ impl ProjectorHarness {
             .connect(&admin_url())
             .await
             .expect("connect as migration role");
-        PgMigrator::apply(&admin, &edge_table_migrations())
-            .await
-            .expect("apply the production edge migration");
+        let migration_pool = admin.clone();
+        MIGRATED
+            .get_or_init(|| async move {
+                PgMigrator::apply(&migration_pool, &edge_table_migrations())
+                    .await
+                    .expect("apply the production edge migration");
+            })
+            .await;
 
         let app = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
@@ -246,6 +254,51 @@ async fn a_removed_issue_dependency_stays_gone_when_its_creation_arrives_late() 
         ],
         "both navigable directions remain tombstoned by the newer fact"
     );
+
+    story.clean_up().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hot_reference_can_be_read_forward_without_rescanning_or_duplicates() {
+    let story = ProjectorHarness::start("keyset").await;
+    let target = story.issue("ENG-41");
+    for sequence in 1..=3 {
+        let source = ArtifactRef(format!(
+            "myelin://{}/chat/message/M{sequence}",
+            story.tenant.0
+        ));
+        let event = story.event(
+            &format!("refs-keyset-{sequence}-{}", std::process::id()),
+            "refs.edge.created",
+            &format!("2026-08-10T00:00:0{sequence}Z"),
+            &source,
+            &target,
+            "links",
+            "reference",
+        );
+        assert_eq!(story.deliver(&event), Delivered::Acked);
+    }
+
+    let graph = PgEdgeStore::new(story.app.clone());
+    let first = graph
+        .inbound_live_after(&story.tenant, &story.region, &target, None, 2)
+        .await
+        .expect("read the first bounded page");
+    assert_eq!(first.len(), 2);
+    assert!(first[0].edge_id < first[1].edge_id);
+
+    let second = graph
+        .inbound_live_after(
+            &story.tenant,
+            &story.region,
+            &target,
+            Some(&first[1].edge_id),
+            2,
+        )
+        .await
+        .expect("continue strictly after the first page");
+    assert_eq!(second.len(), 1);
+    assert!(second[0].edge_id > first[1].edge_id);
 
     story.clean_up().await;
 }

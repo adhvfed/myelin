@@ -77,37 +77,27 @@ impl DurableRefsReadApi {
 
             let candidates = self
                 .graph
-                .inbound_live(
+                .inbound_live_after(
                     &principal.tenant,
                     &principal.region,
                     &target_root,
+                    cursor,
                     MAX_AUTHORIZATION_SCAN + 1,
                 )
                 .await
                 .map_err(|error| EdgeError::Internal(error.to_string()))?;
-            if candidates.len() > MAX_AUTHORIZATION_SCAN as usize {
-                return Err(EdgeError::Unavailable(
-                    "this hot reference requires pushed-down authorization before it can be read"
-                        .into(),
-                ));
-            }
+            let scan_has_more = candidates.len() > MAX_AUTHORIZATION_SCAN as usize;
+            let mut candidates = candidates;
+            candidates.truncate(MAX_AUTHORIZATION_SCAN as usize);
 
             let roots = candidates
                 .iter()
                 .map(|edge| ArtifactRef(edge.source_root.clone()))
                 .collect::<Vec<_>>();
             let visible = self.visibility.readable_roots(principal, &roots).await?;
-            let mut authorized = candidates
-                .into_iter()
-                .filter(|edge| visible.contains(&edge.source_root))
-                .filter(|edge| cursor.is_none_or(|cursor| edge.edge_id.as_str() > cursor))
-                .collect::<Vec<_>>();
-            let has_more = authorized.len() > limit;
-            authorized.truncate(limit);
-            let next_cursor = has_more
-                .then(|| authorized.last().map(|edge| edge.edge_id.clone()))
-                .flatten();
-            let items = authorized
+            let page = paginate_authorized_scan(candidates, &visible, limit, scan_has_more);
+            let items = page
+                .items
                 .into_iter()
                 .map(backlink_json)
                 .collect::<Vec<_>>();
@@ -115,10 +105,38 @@ impl DurableRefsReadApi {
                 "ref": parsed.artifact_ref.0,
                 "root_ref": target_root.0,
                 "items": items,
-                "page": { "next_cursor": next_cursor, "limit": limit },
+                "page": { "next_cursor": page.next_cursor, "limit": limit },
             }))
         })
     }
+}
+
+struct AuthorizedBacklinkPage {
+    items: Vec<StoredBacklink>,
+    next_cursor: Option<String>,
+}
+
+fn paginate_authorized_scan(
+    candidates: Vec<StoredBacklink>,
+    visible_roots: &BTreeSet<String>,
+    limit: usize,
+    scan_has_more: bool,
+) -> AuthorizedBacklinkPage {
+    let scanned_through = candidates.last().map(|edge| edge.edge_id.clone());
+    let mut items = candidates
+        .into_iter()
+        .filter(|edge| visible_roots.contains(&edge.source_root))
+        .collect::<Vec<_>>();
+    let authorized_has_more = items.len() > limit;
+    items.truncate(limit);
+    let next_cursor = if authorized_has_more {
+        items.last().map(|edge| edge.edge_id.clone())
+    } else if scan_has_more {
+        scanned_through
+    } else {
+        None
+    };
+    AuthorizedBacklinkPage { items, next_cursor }
 }
 
 fn backlink_json(edge: StoredBacklink) -> Value {
@@ -466,6 +484,19 @@ pub fn register_refs(builder: GatewayBuilder, api: DurableRefsReadApi) -> Gatewa
 mod tests {
     use super::*;
 
+    fn backlink(edge_id: &str, source_root: &str) -> StoredBacklink {
+        StoredBacklink {
+            edge_id: edge_id.into(),
+            source: source_root.into(),
+            source_root: source_root.into(),
+            target: "myelin://acme/issue/issue/ENG-41".into(),
+            target_root: "myelin://acme/issue/issue/ENG-41".into(),
+            rel: "links".into(),
+            rel_class: "reference".into(),
+            origin_actor: "psn:alice".into(),
+        }
+    }
+
     #[test]
     fn backlink_query_is_strict_and_decodes_one_canonical_ref() {
         assert_eq!(
@@ -498,5 +529,58 @@ mod tests {
         assert_eq!(git_repo_slug(&repo), Some("core"));
         assert_eq!(git_repo_slug(&pr), Some("core"));
         assert_eq!(git_repo_slug(&issue), None);
+    }
+
+    #[test]
+    fn backlink_pages_advance_without_duplicates_or_unauthorized_rows() {
+        let visible = BTreeSet::from([
+            "myelin://acme/knowledge/page/visible-1".into(),
+            "myelin://acme/knowledge/page/visible-2".into(),
+            "myelin://acme/knowledge/page/visible-3".into(),
+        ]);
+        let first = paginate_authorized_scan(
+            vec![
+                backlink("01", "myelin://acme/knowledge/page/hidden"),
+                backlink("02", "myelin://acme/knowledge/page/visible-1"),
+                backlink("03", "myelin://acme/knowledge/page/visible-2"),
+                backlink("04", "myelin://acme/knowledge/page/visible-3"),
+            ],
+            &visible,
+            2,
+            false,
+        );
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|edge| edge.edge_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["02", "03"]
+        );
+        assert_eq!(first.next_cursor.as_deref(), Some("03"));
+
+        let second = paginate_authorized_scan(
+            vec![backlink("04", "myelin://acme/knowledge/page/visible-3")],
+            &visible,
+            2,
+            false,
+        );
+        assert_eq!(second.items[0].edge_id, "04");
+        assert_eq!(second.next_cursor, None);
+    }
+
+    #[test]
+    fn an_empty_authorized_page_still_advances_its_bounded_scan() {
+        let page = paginate_authorized_scan(
+            vec![
+                backlink("01", "myelin://acme/knowledge/page/hidden-1"),
+                backlink("02", "myelin://acme/knowledge/page/hidden-2"),
+            ],
+            &BTreeSet::new(),
+            2,
+            true,
+        );
+        assert!(page.items.is_empty());
+        assert_eq!(page.next_cursor.as_deref(), Some("02"));
     }
 }
