@@ -24,7 +24,7 @@ use myelin_git::durable::{
 };
 use myelin_git::durable::{
     CatalogueRepoState, DurableError, DurableGitRepo, DurableGitStore, RefKind, RefsPageError,
-    RefsPageRequest,
+    RefsPageRequest, RepoCreationClaim,
 };
 use myelin_git::events::pseudonymized_event_principal;
 use myelin_git::lifecycle::{
@@ -709,26 +709,32 @@ impl DurableGitBackend {
         slug: &str,
         creator: &Principal,
     ) -> Result<bool, DurableError> {
-        let loc = Self::loc(tenant, region, slug);
-        if self.store.repo_exists(&loc) {
-            return Ok(false);
+        if creator.tenant.0 != tenant || creator.region.0 != region {
+            return Err(DurableError::Forbidden(
+                "repository creation scope does not match the verified creator".into(),
+            ));
         }
+        let loc = Self::loc(tenant, region, slug);
+        let owner = serde_json::to_string(&(
+            creator.tenant.0.as_str(),
+            creator.region.0.as_str(),
+            creator.principal_id.0.as_str(),
+        ))
+        .map_err(|error| {
+            DurableError::Git(format!("encode repository creation owner: {error}"))
+        })?;
+        let claim = match self.store.claim_repo_creation(&loc, &owner)? {
+            RepoCreationClaim::Existing(_) => return Ok(false),
+            RepoCreationClaim::Acquired(claim) => claim,
+        };
+        claim.initialize()?;
         self.bootstrap.grant_creator(creator, &loc).map_err(|e| {
             DurableError::Git(format!(
-                "creator bootstrap grant refused (repo NOT created - fail-closed): {e}"
+                "creator bootstrap grant refused; the owner-bound repository claim remains retryable: {e}"
             ))
         })?;
-        match self.store.create_repo(&loc) {
-            Ok(_repo) => Ok(true),
-            Err(create_err) => match self.bootstrap.revoke_creator(creator, &loc) {
-                Ok(()) => Err(create_err),
-                Err(revoke_err) => Err(DurableError::Git(format!(
-                    "repo create FAILED and the compensating bootstrap-grant removal ALSO failed - \
-                     an admin grant on `{slug}` is ORPHANED (reachable by slug reuse; a reconciler \
-                     must revoke it): create error: {create_err}; compensation error: {revoke_err}"
-                ))),
-            },
-        }
+        claim.complete()?;
+        Ok(true)
     }
 
     fn scan_repo_slugs(&self, tenant: &str, region: &str) -> Result<Vec<String>, DurableError> {
@@ -4194,6 +4200,7 @@ fn map_durable_err(e: DurableError) -> EdgeError {
             EdgeError::BadRequest(m)
         }
         DurableError::CasMismatch { .. } => EdgeError::Conflict(e.to_string()),
+        DurableError::Conflict(m) => EdgeError::Conflict(m),
         DurableError::Forbidden(m) => EdgeError::Forbidden(m),
         other => EdgeError::Internal(other.to_string()),
     }
@@ -4427,6 +4434,20 @@ mod agent_file_write_tests {
 #[cfg(test)]
 mod durable_error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn an_owner_bound_creation_claim_is_a_public_conflict() {
+        let error = map_durable_err(DurableError::Conflict(
+            "repository `core` is already being created by another principal".into(),
+        ));
+
+        assert_eq!(error.status(), 409);
+        assert_eq!(error.code(), "conflict");
+        assert_eq!(
+            error.client_message(),
+            "repository `core` is already being created by another principal"
+        );
+    }
 
     #[test]
     fn reused_pr_operation_id_maps_to_a_public_conflict() {

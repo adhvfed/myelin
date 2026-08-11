@@ -126,17 +126,12 @@ impl RepoAuthorizer for CheckBackedRepoAuthorizer {
 
 pub trait RepoBootstrapGrants: Send + Sync {
     fn grant_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String>;
-
-    fn revoke_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String>;
 }
 
 pub struct NoRepoBootstrap;
 
 impl RepoBootstrapGrants for NoRepoBootstrap {
     fn grant_creator(&self, _creator: &Principal, _repo: &RepoLoc) -> Result<(), String> {
-        Ok(())
-    }
-    fn revoke_creator(&self, _creator: &Principal, _repo: &RepoLoc) -> Result<(), String> {
         Ok(())
     }
 }
@@ -181,15 +176,6 @@ impl RepoBootstrapGrants for TupleRepoBootstrap {
             .map_err(|e| e.to_string())
     }
 
-    fn revoke_creator(&self, creator: &Principal, repo: &RepoLoc) -> Result<(), String> {
-        Self::tenant_pin(creator, repo)?;
-        let delta = TupleDelta::Remove(Self::admin_tuple(creator, repo));
-        let scope = TenantScope::from_verified_token(creator, creator.region.clone());
-        self.tuples
-            .write_tuples(&scope, creator, &[delta], None, None, now_rfc3339())
-            .map(|_zookie| ())
-            .map_err(|e| e.to_string())
-    }
 }
 
 fn now_rfc3339() -> Timestamp {
@@ -290,47 +276,6 @@ mod tests {
             authz.authorize_repo(&creator, &repo, RepoAccess::Write),
             "admin ⊆ push: the creator pushes to its fresh repo"
         );
-    }
-
-    #[test]
-    fn revoke_creator_removes_the_grant_the_checker_resolves() {
-        let sbc = check_with_git_fragment();
-        let bootstrap = TupleRepoBootstrap::new(sbc.tuples().clone());
-        let authz = authorizer(sbc);
-        let creator = principal("svc:creator", "acme");
-        let repo = RepoLoc::new("acme", "eu-west", "widgets");
-
-        bootstrap.grant_creator(&creator, &repo).expect("grant");
-        assert!(authz.authorize_repo(&creator, &repo, RepoAccess::Read));
-
-        bootstrap
-            .revoke_creator(&creator, &repo)
-            .expect("the compensating remove writes");
-        assert!(
-            !authz.authorize_repo(&creator, &repo, RepoAccess::Read),
-            "the removed grant no longer admits"
-        );
-        assert!(!authz.authorize_repo(&creator, &repo, RepoAccess::Write));
-    }
-
-    #[test]
-    fn revoke_creator_on_never_granted_is_a_noop_ok() {
-        let sbc = check_with_git_fragment();
-        let bootstrap = TupleRepoBootstrap::new(sbc.tuples().clone());
-        let creator = principal("svc:creator", "acme");
-        let repo = RepoLoc::new("acme", "eu-west", "widgets");
-        bootstrap
-            .revoke_creator(&creator, &repo)
-            .expect("remove of an absent tuple is a no-op Ok");
-    }
-
-    #[test]
-    fn revoke_creator_refuses_a_foreign_tenant() {
-        let sbc = check_with_git_fragment();
-        let bootstrap = TupleRepoBootstrap::new(sbc.tuples().clone());
-        let creator = principal("svc:creator", "acme");
-        let foreign = RepoLoc::new("globex", "eu-west", "widgets");
-        assert!(bootstrap.revoke_creator(&creator, &foreign).is_err());
     }
 
     #[test]

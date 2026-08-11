@@ -19,6 +19,7 @@ pub use crate::tree_pagination::{
 pub enum DurableError {
     Git(String),
     Io(String),
+    Conflict(String),
     CasMismatch {
         ref_name: String,
         expected: Option<String>,
@@ -33,6 +34,7 @@ impl std::fmt::Display for DurableError {
         match self {
             DurableError::Git(m) => write!(f, "durable git op failed: {m}"),
             DurableError::Io(m) => write!(f, "durable git io failed: {m}"),
+            DurableError::Conflict(m) => write!(f, "durable git conflict: {m}"),
             DurableError::CasMismatch {
                 ref_name,
                 expected,
@@ -2157,6 +2159,66 @@ pub struct DurableGitStore<P: RepoPathResolver = RootedResolver> {
     resolver: P,
 }
 
+pub enum RepoCreationClaim {
+    Existing(DurableGitRepo),
+    Acquired(RepoCreationGuard),
+}
+
+pub struct RepoCreationGuard {
+    repo_path: PathBuf,
+    owner_path: PathBuf,
+    _lock: std::fs::File,
+}
+
+impl RepoCreationGuard {
+    pub fn initialize(&self) -> Result<DurableGitRepo, DurableError> {
+        init_bare_repo(&self.repo_path)
+    }
+
+    pub fn complete(self) -> Result<(), DurableError> {
+        match std::fs::remove_file(&self.owner_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(DurableError::Io(format!(
+                    "remove completed repository claim {}: {error}",
+                    self.owner_path.display()
+                )))
+            }
+        }
+        let parent = self.owner_path.parent().ok_or_else(|| {
+            DurableError::Io("repository creation claim has no parent directory".into())
+        })?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                DurableError::Io(format!(
+                    "sync completed repository claim directory {}: {error}",
+                    parent.display()
+                ))
+            })?;
+        Ok(())
+    }
+
+    pub fn create(self) -> Result<DurableGitRepo, DurableError> {
+        let repo = self.initialize()?;
+        self.complete()?;
+        Ok(repo)
+    }
+}
+
+fn init_bare_repo(path: &Path) -> Result<DurableGitRepo, DurableError> {
+    let git_repo = git2::Repository::init_bare(path)
+        .map_err(|error| git_err(&format!("init_bare {}", path.display()), error))?;
+    git_repo
+        .config()
+        .and_then(|mut config| config.set_bool("core.logallrefupdates", true))
+        .map_err(|error| git_err("enable logallrefupdates", error))?;
+    Ok(DurableGitRepo {
+        path: path.to_path_buf(),
+    })
+}
+
 impl DurableGitStore<RootedResolver> {
     pub fn rooted(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -2177,18 +2239,100 @@ impl<P: RepoPathResolver> DurableGitStore<P> {
     }
 
     pub fn create_repo(&self, repo: &RepoLoc) -> Result<DurableGitRepo, DurableError> {
-        let path = self.repo_path(repo)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|e| DurableError::Io(format!("create parent {}: {e}", parent.display())))?;
+        match self.claim_repo_creation(repo, "myelin:internal")? {
+            RepoCreationClaim::Existing(repo) => Ok(repo),
+            RepoCreationClaim::Acquired(claim) => claim.create(),
         }
-        let git_repo = git2::Repository::init_bare(&path)
-            .map_err(|e| git_err(&format!("init_bare {}", path.display()), e))?;
-        git_repo
-            .config()
-            .and_then(|mut c| c.set_bool("core.logallrefupdates", true))
-            .map_err(|e| git_err("enable logallrefupdates", e))?;
-        Ok(DurableGitRepo { path })
+    }
+
+    pub fn claim_repo_creation(
+        &self,
+        repo: &RepoLoc,
+        owner: &str,
+    ) -> Result<RepoCreationClaim, DurableError> {
+        const MAX_OWNER_BYTES: usize = 4096;
+        const OWNER_FINGERPRINT_BYTES: u64 = 64;
+
+        if owner.is_empty() || owner.len() > MAX_OWNER_BYTES {
+            return Err(DurableError::Git(
+                "repository creation owner is missing or exceeds its storage limit".into(),
+            ));
+        }
+        let owner = blake3::hash(owner.as_bytes()).to_hex().to_string();
+        let repo_path = self.repo_path(repo)?;
+        let parent = repo_path.parent().ok_or_else(|| {
+            DurableError::Io("repository path has no parent directory".into())
+        })?;
+        std::fs::create_dir_all(parent).map_err(|error| {
+            DurableError::Io(format!(
+                "create repository parent {}: {error}",
+                parent.display()
+            ))
+        })?;
+        let repo_name = repo_path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
+            DurableError::Io("repository path has no UTF-8 file name".into())
+        })?;
+        let lock_path = parent.join(format!(".{repo_name}.creation.lock"));
+        let owner_path = parent.join(format!(".{repo_name}.creation-owner"));
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                DurableError::Io(format!(
+                    "open repository creation lock {}: {error}",
+                    lock_path.display()
+                ))
+            })?;
+        fs4::fs_std::FileExt::lock_exclusive(&lock).map_err(|error| {
+            DurableError::Io(format!(
+                "acquire repository creation lock {}: {error}",
+                lock_path.display()
+            ))
+        })?;
+
+        match std::fs::metadata(&owner_path) {
+            Ok(metadata) => {
+                if metadata.len() != OWNER_FINGERPRINT_BYTES {
+                    return Err(DurableError::Git(
+                        "repository creation claim is malformed".into(),
+                    ));
+                }
+                let claimed_owner = std::fs::read_to_string(&owner_path).map_err(|error| {
+                    DurableError::Io(format!(
+                        "read repository creation claim {}: {error}",
+                        owner_path.display()
+                    ))
+                })?;
+                if claimed_owner != owner {
+                    return Err(DurableError::Conflict(format!(
+                        "repository `{}` is already being created by another principal",
+                        repo.repo
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Ok(repository) = git2::Repository::open(&repo_path) {
+                    drop(repository);
+                    return Ok(RepoCreationClaim::Existing(DurableGitRepo { path: repo_path }));
+                }
+                write_file_atomic(parent, &owner_path, owner.as_bytes())?;
+            }
+            Err(error) => {
+                return Err(DurableError::Io(format!(
+                    "inspect repository creation claim {}: {error}",
+                    owner_path.display()
+                )))
+            }
+        }
+
+        Ok(RepoCreationClaim::Acquired(RepoCreationGuard {
+            repo_path,
+            owner_path,
+            _lock: lock,
+        }))
     }
 
     pub fn open_repo(&self, repo: &RepoLoc) -> Result<DurableGitRepo, DurableError> {
@@ -2357,6 +2501,48 @@ mod tests {
         assert!(repo.path().is_dir(), "the bare repo is a real on-disk directory");
         assert!(store.repo_exists(&loc()), "present after create");
         assert!(store.create_repo(&loc()).is_ok());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn an_initialized_but_unfinished_repo_remains_bound_to_its_creator() {
+        let root = temp_root("unfinished-create");
+        let store = DurableGitStore::rooted(&root);
+        let interrupted = match store
+            .claim_repo_creation(&loc(), "principal:alice")
+            .expect("alice claims the repository")
+        {
+            RepoCreationClaim::Acquired(claim) => claim,
+            RepoCreationClaim::Existing(_) => panic!("the repository starts absent"),
+        };
+        let on_disk_claim = std::fs::read_to_string(&interrupted.owner_path)
+            .expect("the durable claim is readable");
+        assert_eq!(on_disk_claim.len(), 64);
+        assert!(!on_disk_claim.contains("alice"), "the claim stores only an owner fingerprint");
+        interrupted
+            .initialize()
+            .expect("Git initialization reached disk");
+        drop(interrupted);
+
+        assert!(matches!(
+            store.claim_repo_creation(&loc(), "principal:bob"),
+            Err(DurableError::Conflict(_))
+        ));
+        let resumed = match store
+            .claim_repo_creation(&loc(), "principal:alice")
+            .expect("alice resumes the unfinished create")
+        {
+            RepoCreationClaim::Acquired(claim) => claim,
+            RepoCreationClaim::Existing(_) => panic!("the durable claim still marks it unfinished"),
+        };
+        resumed.create().expect("the original creator finishes the repository");
+        assert!(matches!(
+            store
+                .claim_repo_creation(&loc(), "principal:bob")
+                .expect("a finished repository is reported normally"),
+            RepoCreationClaim::Existing(_)
+        ));
 
         std::fs::remove_dir_all(&root).ok();
     }

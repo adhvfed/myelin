@@ -27,6 +27,46 @@ describe.sequential("Git engineering lifecycle", () => {
     });
   });
 
+  test("lets exactly one teammate own a repository name when they begin together", async () => {
+    const sharedSlug = uniqueName("system-simultaneous-create");
+    const path = `/v1/git/repos/${encodeURIComponent(sharedSlug)}`;
+    const contenders = [systemClient, reviewerClient];
+    const attempts = await Promise.all(
+      contenders.map((contender) =>
+        contender.json("/v1/git/repos", {
+          method: "POST",
+          body: { slug: sharedSlug },
+          expectedStatus: [201, 409],
+        }),
+      ),
+    );
+
+    expect(attempts.map((attempt) => attempt.status).sort()).toEqual([201, 409]);
+    const winnerIndex = attempts.findIndex((attempt) => attempt.status === 201);
+    const loserIndex = 1 - winnerIndex;
+    expect(attempts[winnerIndex]?.body).toMatchObject({
+      created: true,
+      durable: true,
+      applied: { action: "git.repo.create", slug: sharedSlug },
+    });
+    expect(attempts[loserIndex]?.body).toMatchObject({ error: { code: "conflict" } });
+
+    const winner = await contenders[winnerIndex]!.json(path);
+    expect(winner.body).toMatchObject({
+      slug: expect.stringContaining(sharedSlug),
+      state: "empty",
+    });
+    const hiddenFromLoser = await contenders[loserIndex]!.json(path, { expectedStatus: 404 });
+    expect(hiddenFromLoser.body).toMatchObject({ error: { code: "not_found" } });
+
+    const loserRetry = await contenders[loserIndex]!.json("/v1/git/repos", {
+      method: "POST",
+      body: { slug: sharedSlug },
+      expectedStatus: 409,
+    });
+    expect(loserRetry.body).toMatchObject({ error: { code: "conflict" } });
+  });
+
   test("creates a durable repository with retry-safe duplicate handling", async () => {
     const replayKey = `system-create-${randomUUID()}`;
     const firstSlug = uniqueName("system-replay");
