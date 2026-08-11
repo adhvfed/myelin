@@ -41,6 +41,9 @@ pub const MOUNTED_EDGE_ACTIONS: &[&str] = &[
     "issues.authorization_status",
     "issues.view",
     "issues.close",
+    "issues.relations.list",
+    "issues.relations.create",
+    "issues.relations.remove",
     "ci.runs.list",
     "ci.run.view",
     "ci.run.log.read",
@@ -216,6 +219,9 @@ pub const ACTION_REQUIREMENTS: &[ActionRequirement] = &[
     requirement!("issues.authorization_status", "issue.view", OP_PAT),
     requirement!("issues.view", "issue.view", OP_PAT),
     requirement!("issues.close", "issue.transition", OP_PAT),
+    requirement!("issues.relations.list", "issue.view", OP_PAT),
+    requirement!("issues.relations.create", "issue.transition", OP_PAT),
+    requirement!("issues.relations.remove", "issue.transition", OP_PAT),
     requirement!("ci.runs.list", "run.view", OP_PAT),
     requirement!("ci.run.view", "run.view", OP_PAT),
     requirement!("ci.run.log.read", "run.view", OP_PAT),
@@ -707,6 +713,11 @@ mod tests {
             "issues.authorization_status"
         ));
         assert!(authorize_edge_action(&AllowAll, &view, "issues.view"));
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &view,
+            "issues.relations.list"
+        ));
         assert!(!authorize_edge_action(&AllowAll, &view, "issues.create"));
         assert!(!authorize_edge_action(
             &AllowAll,
@@ -719,6 +730,11 @@ mod tests {
             "issues.import.run"
         ));
         assert!(!authorize_edge_action(&AllowAll, &view, "issues.close"));
+        assert!(!authorize_edge_action(
+            &AllowAll,
+            &view,
+            "issues.relations.create"
+        ));
 
         let transition = identity(
             CredentialPurpose::Pat,
@@ -729,6 +745,16 @@ mod tests {
             &AllowAll,
             &transition,
             "issues.close"
+        ));
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &transition,
+            "issues.relations.create"
+        ));
+        assert!(authorize_edge_action(
+            &AllowAll,
+            &transition,
+            "issues.relations.remove"
         ));
         assert!(!authorize_edge_action(
             &AllowAll,

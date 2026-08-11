@@ -8,11 +8,13 @@ use myelin_identity::{
     TupleDelta, Zookie,
 };
 use myelin_identity_service::{StoreBackedCheck, TupleStore};
-use myelin_issues::events::{ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CREATED};
+use myelin_issues::events::{
+    ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CREATED, RELATION_CREATED, RELATION_REMOVED,
+};
 use myelin_issues::{
     issues_hot_tables, issues_migrations, CreateIssue, ImportIssue, IssueAuthorizationBinding,
-    IssueAuthorizer, IssuePageRequest, IssuePermission, IssueStoreError, IssueTupleWriter,
-    PgIssueStore, SourceSystem, VisibleIssues,
+    IssueAuthorizer, IssueLifecycleRel, IssuePageRequest, IssuePermission, IssueStoreError,
+    IssueTupleWriter, PgIssueStore, SourceSystem, VisibleIssues,
 };
 use myelin_storage::{
     all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
@@ -87,7 +89,7 @@ impl IssueAuthorizer for RebacAuthorizer {
     ) -> bool {
         let permission = match permission {
             IssuePermission::View => "view",
-            IssuePermission::Close => "manage",
+            IssuePermission::Close | IssuePermission::ManageRelations => "manage",
         };
         self.allows(principal, permission, format!("issue:{issue_id}"))
     }
@@ -386,7 +388,10 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     .fetch_one(&admin)
     .await
     .unwrap();
-    assert_eq!(aborted_ledger_count, 0, "the failed transaction left no claim");
+    assert_eq!(
+        aborted_ledger_count, 0,
+        "the failed transaction left no claim"
+    );
 
     let first_create = race_store
         .create_idempotent(
@@ -675,6 +680,88 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     .await
     .unwrap();
     assert_eq!(race_created, 1);
+
+    let target_ref = myelin_issues::issue_root_ref(&tenant, &raced.key).0;
+    let relation = restarted
+        .create_relation(&creator, &staged.id, &target_ref, IssueLifecycleRel::Blocks)
+        .await
+        .expect("a manager relates two visible issues");
+    assert!(relation.created);
+    assert_eq!(
+        relation.relation.source_ref,
+        myelin_issues::issue_root_ref(&tenant, &staged.key).0
+    );
+    assert_eq!(relation.relation.target_ref, target_ref);
+    assert_eq!(relation.relation.relation, "blocks");
+    assert_eq!(relation.relation.created_by, creator.principal_id.0);
+
+    let retry = restarted
+        .create_relation(&creator, &staged.id, &target_ref, IssueLifecycleRel::Blocks)
+        .await
+        .expect("retrying the same relation returns its durable identity");
+    assert!(!retry.created);
+    assert_eq!(retry.relation, relation.relation);
+    assert_eq!(
+        restarted
+            .list_relations(&creator, &staged.id)
+            .await
+            .unwrap(),
+        vec![relation.relation.clone()]
+    );
+
+    for event_type in [RELATION_CREATED, "refs.edge.created"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox
+              WHERE envelope->>'tenant' = $1 AND envelope->>'type_' = $2
+                AND envelope->'payload'->>'relation_id' = $3",
+        )
+        .bind(&tenant)
+        .bind(event_type)
+        .bind(&relation.relation.id)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "the idempotent source-of-truth write emits `{event_type}` once"
+        );
+    }
+
+    let removed = restarted
+        .remove_relation(&creator, &staged.id, &relation.relation.id)
+        .await
+        .expect("remove the dependency")
+        .expect("the dependency existed");
+    assert_eq!(removed, relation.relation);
+    assert!(restarted
+        .list_relations(&creator, &staged.id)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        restarted
+            .remove_relation(&creator, &staged.id, &relation.relation.id)
+            .await
+            .expect("removal retries are safe"),
+        None
+    );
+    for event_type in [RELATION_REMOVED, "refs.edge.removed"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox
+              WHERE envelope->>'tenant' = $1 AND envelope->>'type_' = $2
+                AND envelope->'payload'->>'relation_id' = $3",
+        )
+        .bind(&tenant)
+        .bind(event_type)
+        .bind(&relation.relation.id)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(
+            count, 1,
+            "the idempotent source-of-truth removal emits `{event_type}` once"
+        );
+    }
 
     let legacy_id = sqlx::types::Uuid::new_v4();
     sqlx::query(

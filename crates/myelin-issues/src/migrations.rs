@@ -1,5 +1,5 @@
 use myelin_events::{CONSUMER_DEDUP_MIGRATION, OUTBOX_MIGRATION};
-use myelin_substrate::{HotTables, Migration, Migrations};
+use myelin_substrate::{HotTables, Migration, MigrationPhase, Migrations};
 
 pub const ISSUE_TABLE: &str = "issue";
 pub const ISSUE_RELATION_TABLE: &str = "issue_relation";
@@ -136,6 +136,9 @@ ALTER TABLE issue ADD COLUMN IF NOT EXISTS created_by_principal text;";
 
 pub const EXPAND_NULLABLE_REPORTER_DDL: &str =
     "ALTER TABLE issue ALTER COLUMN reporter DROP NOT NULL;";
+
+pub const EXPAND_ISSUE_RELATION_ACTOR_DDL: &str =
+    "ALTER TABLE issue_relation ADD COLUMN IF NOT EXISTS created_by_principal text;";
 
 pub const CREATE_ISSUE_AUTHZ_BINDING_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS issue_authz_binding (
@@ -483,6 +486,12 @@ pub fn issues_migrations() -> Migrations {
         create_idempotency_ddl,
         ISSUE_CREATE_IDEMPOTENCY_TABLE,
     ));
+    migrations.push(Migration::phased(
+        "iss_0025_issue_relation_actor",
+        EXPAND_ISSUE_RELATION_ACTOR_DDL,
+        MigrationPhase::Expand,
+        ISSUE_RELATION_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -619,8 +628,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            30,
-            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 5 authz migrations + the import map + the create retry ledger"
+            31,
+            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 5 authz migrations + the import map + create retry ledger + relation actor expansion"
         );
         for m in &migrations.0 {
             assert!(
@@ -658,7 +667,7 @@ mod tests {
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
             issues.0.last().map(|migration| migration.id),
-            Some("iss_0024_issue_create_idempotency")
+            Some("iss_0025_issue_relation_actor")
         );
         for invariant in [
             "CREATE INDEX CONCURRENTLY",
@@ -743,7 +752,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            30,
+            31,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -758,7 +767,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            30,
+            31,
             "the re-apply admits every migration again"
         );
     }
@@ -856,6 +865,17 @@ mod tests {
             CREATE_ISSUE_RELATION_DDL.contains("dst_ref     text"),
             "dst_ref is an ArtifactRef text (may be cross-subsystem, §4)"
         );
+        let actor_expansion = issues_migrations()
+            .0
+            .into_iter()
+            .find(|migration| migration.id == "iss_0025_issue_relation_actor")
+            .expect("issue relation actor expansion");
+        assert_eq!(actor_expansion.ddl, EXPAND_ISSUE_RELATION_ACTOR_DDL);
+        assert!(
+            actor_expansion.ddl.contains("created_by_principal text"),
+            "human, agent, and service principal ids retain their canonical attribution"
+        );
+        assert_eq!(actor_expansion.phase, MigrationPhase::Expand);
     }
 
     #[test]

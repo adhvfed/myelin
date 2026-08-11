@@ -130,11 +130,9 @@ fn production_edge_mounts_encrypted_durable_chat_topics_and_messages() {
     assert!(route.contains("ChatFreeText::BodyNodes"));
     assert!(route.contains("decode_encrypted_body("));
     assert!(!route.contains("body_inline: body.content.into_bytes()"));
-    assert!(
-        authz.contains("requirement!(\"chat.conversations.list\", \"chat.read\", OP_AGENT_PAT)")
-    );
+    assert!(authz.contains("requirement!(\"chat.conversations.list\", \"chat.read\", OP_PAT)"));
     assert!(authz.contains("requirement!(\"chat.conversation.create\", \"chat.manage\", OP_PAT)"));
-    assert!(authz.contains("requirement!(\"chat.message.post\", \"chat.post\", OP_AGENT_PAT)"));
+    assert!(authz.contains("requirement!(\"chat.message.post\", \"chat.post\", OP_PAT)"));
 }
 
 #[test]
@@ -161,12 +159,8 @@ fn production_edge_mounts_encrypted_durable_knowledge_pages() {
     );
     assert!(!store.contains("title_plaintext"));
     assert!(!store.contains("body_plaintext"));
-    assert!(authz.contains(
-        "requirement!(\"knowledge.pages.list\", \"knowledge.read\", OP_AGENT_PAT)"
-    ));
-    assert!(authz.contains(
-        "requirement!(\"knowledge.page.save\", \"knowledge.edit\", OP_AGENT_PAT)"
-    ));
+    assert!(authz.contains("requirement!(\"knowledge.pages.list\", \"knowledge.read\", OP_PAT)"));
+    assert!(authz.contains("requirement!(\"knowledge.page.save\", \"knowledge.edit\", OP_PAT)"));
 }
 
 #[test]
@@ -185,13 +179,15 @@ fn production_edge_mounts_the_repo_authorized_durable_ci_reads() {
     assert!(route.contains("fn authorized_repo_ref("));
     assert!(route.contains("self.api.read_run(ctx.principal, run_id)"));
     assert!(route.contains(".open_log_tail(ctx.principal, run_id, job_id, cursor)"));
-    assert!(route.contains(".read_log(ctx.principal, run_id, job_id, request.start, request.limit)"));
+    assert!(
+        route.contains(".read_log(ctx.principal, run_id, job_id, request.start, request.limit)")
+    );
     assert!(route.contains("ctx.principal.tenant.as_str()"));
     assert!(route.contains("ctx.principal.region.as_str()"));
     assert!(!route.contains("query_param(\"tenant\")"));
     assert!(!route.contains("query_param(\"region\")"));
-    assert!(authz.contains("requirement!(\"ci.runs.list\", \"run.view\", OP_AGENT_PAT)"));
-    assert!(authz.contains("requirement!(\"ci.run.view\", \"run.view\", OP_AGENT_PAT)"));
+    assert!(authz.contains("requirement!(\"ci.runs.list\", \"run.view\", OP_PAT)"));
+    assert!(authz.contains("requirement!(\"ci.run.view\", \"run.view\", OP_PAT)"));
 }
 
 #[test]
@@ -230,6 +226,7 @@ fn production_runtime_identity_and_git_storage_are_explicit_before_database_boot
 fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallback() {
     let main = include_str!("../src/main.rs");
     let adapter = include_str!("../src/issue_authz.rs");
+    let authz = include_str!("../src/authz.rs");
 
     assert!(main.contains("StoreBackedIssueAuthorizer::new(check.clone())"));
     assert!(main.contains("myelin_issues::PgIssueStore::new("));
@@ -252,17 +249,28 @@ fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallb
 
     let routes = include_str!("../src/issues_http.rs");
     assert!(routes.contains("/v1/issues"));
-    assert!(routes.contains("self.api.store.list(ctx.principal, request)"));
-    assert!(routes.contains("self.api.store.create(ctx.principal, proposal)"));
-    assert!(routes.contains("self.api.store.view(ctx.principal, id)"));
+    assert!(routes.contains("self.store.list(principal, request)"));
+    assert!(routes.contains(".create_idempotent(actor, authorized_viewer, proposal, caller_key)"));
+    assert!(routes.contains("self.store.view(principal, issue_id)"));
     assert!(routes.contains("self.api.store.close(ctx.principal, id)"));
+    assert!(routes.contains("/v1/issues/{issue}/relations"));
+    assert!(routes.contains("/v1/issues/{issue}/relations/{relation}"));
     assert!(routes.contains("IssuePermission::View"));
     assert!(routes.contains("IssuePermission::Close"));
+    assert!(routes.contains("IssuePermission::ManageRelations"));
     assert!(!routes.contains("VisibleIssues::All"));
 
     assert!(adapter.contains("VisibleIssues::effective_issue_view_filter()"));
+    assert!(adapter.contains("IssuePermission::ManageRelations => \"manage\""));
     assert!(!adapter.contains("Ok(VisibleIssues::All)"));
     assert!(adapter.contains("MYELIN_ISSUES_RECONCILE_TENANTS"));
+    assert!(authz.contains("requirement!(\"issues.relations.list\", \"issue.view\", OP_PAT)"));
+    assert!(
+        authz.contains("requirement!(\"issues.relations.create\", \"issue.transition\", OP_PAT)")
+    );
+    assert!(
+        authz.contains("requirement!(\"issues.relations.remove\", \"issue.transition\", OP_PAT)")
+    );
 }
 
 #[test]

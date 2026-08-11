@@ -2,7 +2,10 @@ use crate::api::{
     decode_issue_page_cursor, encode_issue_page_cursor, normalize_issue_key_prefix, IssueListState,
 };
 use crate::dek::{decrypt_free_text, encrypt_free_text, IssueFreeText};
-use crate::events::{ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CLOSED, ISSUE_CREATED};
+use crate::events::{
+    ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CLOSED, ISSUE_CREATED, RELATION_CREATED, RELATION_REMOVED,
+};
+use crate::refs_glue::{issue_root_ref, IssueLifecycleRel, REFS_EDGE_CREATED};
 use myelin_events::{
     derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
     EventId, EventType, IdMinter, Timestamp, UlidMinter, Visibility,
@@ -29,11 +32,14 @@ pub use import_creation::{ImportIssue, ImportIssueReceipt};
 pub const MAX_TITLE_BYTES: usize = 512;
 pub const MAX_PAGE_SIZE: u32 = 100;
 pub const MAX_AUTHORIZED_ISSUE_IDS: usize = 10_000;
+pub const MAX_RELATIONS_PER_ISSUE: i64 = 100;
+const REFS_EDGE_REMOVED: &str = "refs.edge.removed";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IssuePermission {
     View,
     Close,
+    ManageRelations,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -228,6 +234,40 @@ pub struct StoredIssue {
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredIssueRelation {
+    pub id: String,
+    pub source_ref: String,
+    pub target_ref: String,
+    pub relation: String,
+    pub created_by: String,
+    pub created_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IssueRelationCreationOutcome {
+    pub relation: StoredIssueRelation,
+    pub created: bool,
+}
+
+struct RelationRecord {
+    relation_id: Uuid,
+    source_ref: String,
+    target_ref: String,
+    relation: String,
+    created_by: String,
+    created_at: String,
+}
+
+enum CreateRelationTxResult {
+    Stored {
+        record: RelationRecord,
+        created: bool,
+    },
+    IssueMissing,
+    LimitReached,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1044,6 +1084,327 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         }
     }
 
+    pub async fn create_relation(
+        &self,
+        principal: &Principal,
+        source_issue_id: &str,
+        target_ref: &str,
+        relation: IssueLifecycleRel,
+    ) -> Result<IssueRelationCreationOutcome, IssueStoreError> {
+        let scope = self.scope(principal)?;
+        let source_id = parse_uuid("source issue id", source_issue_id)?;
+        if !self
+            .authorizer
+            .may_access(principal, source_issue_id, IssuePermission::ManageRelations)
+        {
+            return Err(IssueStoreError::NotFound);
+        }
+        let target = parse_issue_relation_target(principal, target_ref)?;
+        let target_id = self.active_issue_id_by_key(&scope, &target.id).await?;
+        if target_id == source_id {
+            return Err(IssueStoreError::BadInput(
+                "an issue cannot relate to itself".into(),
+            ));
+        }
+        if !self
+            .authorizer
+            .may_access(principal, &target_id.to_string(), IssuePermission::View)
+        {
+            return Err(IssueStoreError::NotFound);
+        }
+
+        let tenant_id = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        let actor = principal.clone();
+        let target_ref = target.artifact_ref.0;
+        let relation_token = relation.as_str().to_string();
+        let minter = Arc::clone(&self.minter);
+        let result = self
+            .provider
+            .with_tenant_tx(&tenant_id.clone(), move |conn| {
+                Box::pin(async move {
+                    let Some(source) =
+                        select_one_for_update(&mut *conn, &tenant_id, &region, source_id)
+                            .await
+                            .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?
+                    else {
+                        return Ok(CreateRelationTxResult::IssueMissing);
+                    };
+                    if select_one(&mut *conn, &tenant_id, &region, target_id)
+                        .await
+                        .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?
+                        .is_none()
+                    {
+                        return Ok(CreateRelationTxResult::IssueMissing);
+                    }
+                    let source_key: String = source.get("key");
+                    let source_ref = issue_root_ref(&tenant_id, &source_key).0;
+                    let existing = sqlx::query(
+                        "SELECT relation_id, dst_ref, rel,
+                                COALESCE(created_by_principal, created_by::text) AS created_by,
+                                created_at::text AS created_at
+                           FROM issue_relation
+                          WHERE tenant_id = $1 AND region = $2 AND src_issue = $3
+                            AND dst_ref = $4 AND rel = $5",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(source_id)
+                    .bind(&target_ref)
+                    .bind(&relation_token)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                    if let Some(row) = existing {
+                        return Ok(CreateRelationTxResult::Stored {
+                            record: relation_record(row, source_ref),
+                            created: false,
+                        });
+                    }
+                    let count = sqlx::query_scalar::<_, i64>(
+                        "SELECT count(*) FROM issue_relation
+                          WHERE tenant_id = $1 AND region = $2 AND src_issue = $3",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(source_id)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                    if count >= MAX_RELATIONS_PER_ISSUE {
+                        return Ok(CreateRelationTxResult::LimitReached);
+                    }
+
+                    let relation_id = Uuid::new_v4();
+                    let row = sqlx::query(
+                        "INSERT INTO issue_relation
+                            (tenant_id, region, relation_id, src_issue, dst_ref, rel,
+                             created_by, created_by_principal)
+                         VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid(), $7)
+                         RETURNING relation_id, dst_ref, rel,
+                                   COALESCE(created_by_principal, created_by::text) AS created_by,
+                                   created_at::text AS created_at",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(relation_id)
+                    .bind(source_id)
+                    .bind(&target_ref)
+                    .bind(&relation_token)
+                    .bind(&actor.principal_id.0)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                    let record = relation_record(row, source_ref);
+                    let typed = issue_relation_envelope(
+                        &actor,
+                        &record,
+                        RELATION_CREATED,
+                        minter.mint().into(),
+                    );
+                    PgRelay::co_commit_in_tx(&mut *conn, &typed.aggregate.0, &typed).await?;
+                    let projected = issue_relation_envelope(
+                        &actor,
+                        &record,
+                        REFS_EDGE_CREATED,
+                        minter.mint().into(),
+                    );
+                    PgRelay::co_commit_in_tx(&mut *conn, &projected.aggregate.0, &projected)
+                        .await?;
+                    Ok(CreateRelationTxResult::Stored {
+                        record,
+                        created: true,
+                    })
+                })
+            })
+            .await
+            .map_err(|error| IssueStoreError::Storage(error.to_string()))?;
+        match result {
+            CreateRelationTxResult::Stored { record, created } => {
+                Ok(IssueRelationCreationOutcome {
+                    relation: record.into(),
+                    created,
+                })
+            }
+            CreateRelationTxResult::IssueMissing => Err(IssueStoreError::NotFound),
+            CreateRelationTxResult::LimitReached => Err(IssueStoreError::Conflict(format!(
+                "an issue may have at most {MAX_RELATIONS_PER_ISSUE} relations"
+            ))),
+        }
+    }
+
+    pub async fn list_relations(
+        &self,
+        principal: &Principal,
+        source_issue_id: &str,
+    ) -> Result<Vec<StoredIssueRelation>, IssueStoreError> {
+        let scope = self.scope(principal)?;
+        let source_id = parse_uuid("source issue id", source_issue_id)?;
+        if !self
+            .authorizer
+            .may_access(principal, source_issue_id, IssuePermission::View)
+        {
+            return Err(IssueStoreError::NotFound);
+        }
+        let tenant_id = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        self.provider
+            .with_tenant_tx(&tenant_id.clone(), move |conn| {
+                Box::pin(async move {
+                    let Some(source) = select_one(&mut *conn, &tenant_id, &region, source_id)
+                        .await
+                        .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?
+                    else {
+                        return Ok(None);
+                    };
+                    let source_key: String = source.get("key");
+                    let source_ref = issue_root_ref(&tenant_id, &source_key).0;
+                    let rows = sqlx::query(
+                        "SELECT relation_id, dst_ref, rel,
+                                COALESCE(created_by_principal, created_by::text) AS created_by,
+                                created_at::text AS created_at
+                           FROM issue_relation
+                          WHERE tenant_id = $1 AND region = $2 AND src_issue = $3
+                          ORDER BY created_at, relation_id
+                          LIMIT $4",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(source_id)
+                    .bind(MAX_RELATIONS_PER_ISSUE)
+                    .fetch_all(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                    Ok(Some(
+                        rows.into_iter()
+                            .map(|row| relation_record(row, source_ref.clone()).into())
+                            .collect::<Vec<_>>(),
+                    ))
+                })
+            })
+            .await
+            .map_err(|error| IssueStoreError::Storage(error.to_string()))?
+            .ok_or(IssueStoreError::NotFound)
+    }
+
+    pub async fn remove_relation(
+        &self,
+        principal: &Principal,
+        source_issue_id: &str,
+        relation_id: &str,
+    ) -> Result<Option<StoredIssueRelation>, IssueStoreError> {
+        let scope = self.scope(principal)?;
+        let source_id = parse_uuid("source issue id", source_issue_id)?;
+        let relation_id = parse_uuid("relation id", relation_id)?;
+        if !self
+            .authorizer
+            .may_access(principal, source_issue_id, IssuePermission::ManageRelations)
+        {
+            return Err(IssueStoreError::NotFound);
+        }
+        let tenant_id = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        let actor = principal.clone();
+        let minter = Arc::clone(&self.minter);
+        self.provider
+            .with_tenant_tx(&tenant_id.clone(), move |conn| {
+                Box::pin(async move {
+                    let Some(source) =
+                        select_one_for_update(&mut *conn, &tenant_id, &region, source_id)
+                            .await
+                            .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?
+                    else {
+                        return Ok(None);
+                    };
+                    let source_key: String = source.get("key");
+                    let source_ref = issue_root_ref(&tenant_id, &source_key).0;
+                    let row = sqlx::query(
+                        "SELECT relation_id, dst_ref, rel,
+                                COALESCE(created_by_principal, created_by::text) AS created_by,
+                                created_at::text AS created_at
+                           FROM issue_relation
+                          WHERE tenant_id = $1 AND region = $2
+                            AND src_issue = $3 AND relation_id = $4
+                          FOR UPDATE",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(source_id)
+                    .bind(relation_id)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                    let Some(row) = row else {
+                        return Ok(None);
+                    };
+                    let record = relation_record(row, source_ref);
+                    sqlx::query(
+                        "DELETE FROM issue_relation
+                          WHERE tenant_id = $1 AND region = $2
+                            AND src_issue = $3 AND relation_id = $4",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(source_id)
+                    .bind(relation_id)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                    let typed = issue_relation_envelope(
+                        &actor,
+                        &record,
+                        RELATION_REMOVED,
+                        minter.mint().into(),
+                    );
+                    PgRelay::co_commit_in_tx(&mut *conn, &typed.aggregate.0, &typed).await?;
+                    let projected = issue_relation_envelope(
+                        &actor,
+                        &record,
+                        REFS_EDGE_REMOVED,
+                        minter.mint().into(),
+                    );
+                    PgRelay::co_commit_in_tx(&mut *conn, &projected.aggregate.0, &projected)
+                        .await?;
+                    Ok(Some(record.into()))
+                })
+            })
+            .await
+            .map_err(|error| IssueStoreError::Storage(error.to_string()))
+    }
+
+    async fn active_issue_id_by_key(
+        &self,
+        scope: &TenantScope,
+        key: &str,
+    ) -> Result<Uuid, IssueStoreError> {
+        let tenant_id = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        let key = key.to_string();
+        self.provider
+            .with_tenant_tx(&tenant_id.clone(), move |conn| {
+                Box::pin(async move {
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT i.id
+                           FROM issue i
+                           JOIN issue_authz_binding b
+                             ON b.tenant_id = i.tenant_id AND b.region = i.region
+                            AND b.issue_id = i.id AND b.state = 'active'
+                          WHERE i.tenant_id = $1 AND i.region = $2 AND i.key = $3
+                            AND i.deleted_at IS NULL AND NOT i.archived",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(&key)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+                })
+            })
+            .await
+            .map_err(|error| IssueStoreError::Storage(error.to_string()))?
+            .ok_or(IssueStoreError::NotFound)
+    }
+
     pub async fn list(
         &self,
         principal: &Principal,
@@ -1383,6 +1744,88 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .ok_or(IssueStoreError::NotFound)?;
         decode_row(&self.kms, &principal.region, row)
     }
+}
+
+fn parse_issue_relation_target(
+    principal: &Principal,
+    target_ref: &str,
+) -> Result<myelin_refs::ParsedArtifactRef, IssueStoreError> {
+    let parsed = myelin_refs::parse_scoped(target_ref)
+        .map_err(|error| IssueStoreError::BadInput(format!("invalid target_ref: {error}")))?;
+    if parsed.tenant != principal.tenant
+        || parsed.subsystem != "issue"
+        || parsed.type_ != "issue"
+        || parsed.sub.is_some()
+    {
+        return Err(IssueStoreError::BadInput(
+            "target_ref must name an issue root in the current tenant".into(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn relation_record(row: sqlx::postgres::PgRow, source_ref: String) -> RelationRecord {
+    RelationRecord {
+        relation_id: row.get("relation_id"),
+        source_ref,
+        target_ref: row.get("dst_ref"),
+        relation: row.get("rel"),
+        created_by: row.get("created_by"),
+        created_at: row.get("created_at"),
+    }
+}
+
+impl From<RelationRecord> for StoredIssueRelation {
+    fn from(record: RelationRecord) -> Self {
+        Self {
+            id: record.relation_id.to_string(),
+            source_ref: record.source_ref,
+            target_ref: record.target_ref,
+            relation: record.relation,
+            created_by: record.created_by,
+            created_at: record.created_at,
+        }
+    }
+}
+
+fn issue_relation_envelope(
+    actor: &Principal,
+    record: &RelationRecord,
+    event_type: &str,
+    event_id: EventId,
+) -> EventEnvelope {
+    let timestamp = now_rfc3339();
+    let source = ArtifactRef(record.source_ref.clone());
+    let target = ArtifactRef(record.target_ref.clone());
+    derive_envelope(
+        EventDraft {
+            type_: EventType(event_type.into()),
+            subject: source.clone(),
+            aggregate: myelin_refs::edge_aggregate_key(&source, &target),
+            payload: serde_json::json!({
+                "relation_id": record.relation_id.to_string(),
+                "source": source.0,
+                "target": target.0,
+                "rel": record.relation,
+                "rel_class": "lifecycle",
+            }),
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            contains_personal_data: false,
+            pii_key_ref: None,
+        },
+        EmitContext {
+            event_id,
+            tenant: actor.tenant.clone(),
+            region: actor.region.clone(),
+            actor: Actor(actor.clone()),
+            schema_ver: 1,
+            occurred_at: timestamp.clone(),
+            recorded_at: timestamp,
+            caused_by: None,
+        },
+        None,
+    )
 }
 
 const SELECT_COLUMNS: &str = "id, key, project_id, state, state_category, title_nonce, \

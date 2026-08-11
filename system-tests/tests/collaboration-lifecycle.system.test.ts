@@ -1340,6 +1340,96 @@ command = ["true"]
     );
   });
 
+  test("lets one issue block another until their dependency is removed", async () => {
+    const planning = await awaitActiveIssue(uniqueName("Plan the shared release"));
+    const delivery = await awaitActiveIssue(uniqueName("Ship the shared release"));
+    const planningId = string(planning.id, "planning issue id");
+    const planningRef = string(planning.ref, "planning issue ref");
+    const deliveryRef = string(delivery.ref, "delivery issue ref");
+    const intent = { target_ref: deliveryRef, relation: "blocks" };
+
+    const created = await systemClient.json(
+      `/v1/issues/${encodeURIComponent(planningId)}/relations`,
+      {
+        method: "POST",
+        body: intent,
+        idempotencyKey: `issue-relation-${randomUUID()}`,
+        expectedStatus: 201,
+      },
+    );
+    const relation = record(created.body.relation, "created issue dependency");
+    const relationId = string(relation.id, "issue dependency id");
+    expect(created.body).toMatchObject({ created: true, durable: true });
+    expect(relation).toMatchObject({
+      source_ref: planningRef,
+      target_ref: deliveryRef,
+      relation: "blocks",
+    });
+
+    const replay = await systemClient.json(
+      `/v1/issues/${encodeURIComponent(planningId)}/relations`,
+      { method: "POST", body: intent, expectedStatus: 200 },
+    );
+    expect(replay.body).toMatchObject({
+      created: false,
+      relation: { id: relationId },
+    });
+
+    const listed = await reviewerClient.json(
+      `/v1/issues/${encodeURIComponent(planningId)}/relations`,
+    );
+    expect(array(listed.body.items, "visible issue dependencies")).toEqual([
+      expect.objectContaining({ id: relationId, target_ref: deliveryRef, relation: "blocks" }),
+    ]);
+
+    const awaitBacklink = (targetRef: string, sourceRef: string, relationName: string) =>
+      eventually<JsonRecord>(async () => {
+        const response = await systemClient.json(
+          `/v1/refs/backlinks?ref=${encodeURIComponent(targetRef)}`,
+        );
+        return array(response.body.items, `backlinks for ${targetRef}`)
+          .map((item) => record(item, "issue dependency backlink"))
+          .find(
+            (item) => item.root_ref === sourceRef && item.relation === relationName,
+          );
+      }, { description: `${sourceRef} to become a ${relationName} backlink of ${targetRef}` });
+
+    expect(await awaitBacklink(deliveryRef, planningRef, "blocks")).toMatchObject({
+      relation_class: "lifecycle",
+      target_ref: deliveryRef,
+    });
+    expect(await awaitBacklink(planningRef, deliveryRef, "blocked_by")).toMatchObject({
+      relation_class: "lifecycle",
+      target_ref: planningRef,
+    });
+
+    const removed = await systemClient.json(
+      `/v1/issues/${encodeURIComponent(planningId)}/relations/${encodeURIComponent(relationId)}`,
+      { method: "DELETE" },
+    );
+    expect(removed.body).toMatchObject({ removed: true, durable: true });
+
+    const awaitBacklinkGone = (targetRef: string, sourceRef: string, relationName: string) =>
+      eventually<boolean>(async () => {
+        const response = await systemClient.json(
+          `/v1/refs/backlinks?ref=${encodeURIComponent(targetRef)}`,
+        );
+        const remains = array(response.body.items, `backlinks for ${targetRef}`)
+          .map((item) => record(item, "remaining issue dependency backlink"))
+          .some((item) => item.root_ref === sourceRef && item.relation === relationName);
+        return remains ? undefined : true;
+      }, { description: `${relationName} between the issues to disappear` });
+
+    await awaitBacklinkGone(deliveryRef, planningRef, "blocks");
+    await awaitBacklinkGone(planningRef, deliveryRef, "blocked_by");
+
+    const removalReplay = await systemClient.json(
+      `/v1/issues/${encodeURIComponent(planningId)}/relations/${encodeURIComponent(relationId)}`,
+      { method: "DELETE" },
+    );
+    expect(removalReplay.body).toMatchObject({ relation_id: relationId, removed: false });
+  });
+
   test("hands an issue into a shared conversation by its canonical reference", async () => {
     const issue = await awaitActiveIssue(uniqueName("Coordinate the referenced rollout"));
     const issueRef = string(issue.ref, "issue reference");

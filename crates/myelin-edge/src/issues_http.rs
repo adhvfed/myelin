@@ -8,8 +8,9 @@ use crate::{Method, StoreBackedIssueAuthorizer};
 use myelin_identity_service::{PgProjectStore, Project, ProjectError};
 use myelin_issues::{
     api::IssueListState, is_canonical_request_event_id, CreateIssue, IssueAuthorizationStatus,
-    IssueAuthorizer, IssueCreationOutcome, IssuePageRequest, IssuePermission, IssueStoreError,
-    PgIssueStore, StoredIssue,
+    IssueAuthorizer, IssueCreationOutcome, IssueLifecycleRel, IssuePageRequest, IssuePermission,
+    IssueRelationCreationOutcome, IssueStoreError, PgIssueStore, StoredIssue, StoredIssueRelation,
+    MAX_RELATIONS_PER_ISSUE,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -77,6 +78,21 @@ impl DurableIssueReadApi {
             .map_err(map_store_error)?;
         Ok(issue_json(&principal.tenant.0, &issue))
     }
+
+    pub fn list_relations(
+        &self,
+        principal: &myelin_identity::Principal,
+        issue_id: &str,
+    ) -> Result<Value, EdgeError> {
+        let relations = self
+            .drive(self.store.list_relations(principal, issue_id))
+            .map_err(map_store_error)?;
+        Ok(page_envelope(
+            json!(relations.iter().map(relation_json).collect::<Vec<_>>()),
+            None,
+            MAX_RELATIONS_PER_ISSUE as usize,
+        ))
+    }
 }
 
 #[derive(Clone)]
@@ -119,6 +135,30 @@ impl DurableIssueMutationApi {
                 .create_idempotent(actor, authorized_viewer, proposal, caller_key),
         )
         .map_err(map_store_error)
+    }
+
+    pub fn create_relation(
+        &self,
+        actor: &myelin_identity::Principal,
+        issue_id: &str,
+        target_ref: &str,
+        relation: IssueLifecycleRel,
+    ) -> Result<IssueRelationCreationOutcome, EdgeError> {
+        self.drive(
+            self.store
+                .create_relation(actor, issue_id, target_ref, relation),
+        )
+        .map_err(map_store_error)
+    }
+
+    pub fn remove_relation(
+        &self,
+        actor: &myelin_identity::Principal,
+        issue_id: &str,
+        relation_id: &str,
+    ) -> Result<Option<StoredIssueRelation>, EdgeError> {
+        self.drive(self.store.remove_relation(actor, issue_id, relation_id))
+            .map_err(map_store_error)
     }
 
     fn drive<F, T>(&self, future: F) -> Result<T, IssueStoreError>
@@ -170,6 +210,24 @@ pub struct IssueCreateRequest {
     pub title: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssueRelationCreateRequest {
+    target_ref: String,
+    relation: String,
+}
+
+impl IssueRelationCreateRequest {
+    fn relation(&self) -> Result<IssueLifecycleRel, EdgeError> {
+        IssueLifecycleRel::from_token(&self.relation).ok_or_else(|| {
+            EdgeError::BadRequest(
+                "relation must be parent, blocks, blocked_by, closes, depends_on, or relates"
+                    .into(),
+            )
+        })
+    }
+}
+
 fn parse_create_body(ctx: &HandlerCtx<'_>) -> Result<IssueCreateRequest, EdgeError> {
     parse_create_bytes(&ctx.request.body)
 }
@@ -187,6 +245,33 @@ fn parse_create_bytes(bytes: &[u8]) -> Result<IssueCreateRequest, EdgeError> {
     }
     serde_json::from_slice(bytes)
         .map_err(|error| EdgeError::BadRequest(format!("invalid issue create body: {error}")))
+}
+
+fn parse_relation_create_body(
+    ctx: &HandlerCtx<'_>,
+) -> Result<IssueRelationCreateRequest, EdgeError> {
+    if !ctx.request.query.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "issue relation creation accepts no query parameters".into(),
+        ));
+    }
+    parse_relation_create_bytes(&ctx.request.body)
+}
+
+fn parse_relation_create_bytes(bytes: &[u8]) -> Result<IssueRelationCreateRequest, EdgeError> {
+    if bytes.len() > MAX_ISSUE_JSON_BYTES {
+        return Err(EdgeError::PayloadTooLarge(format!(
+            "Issues request body exceeds {MAX_ISSUE_JSON_BYTES} bytes"
+        )));
+    }
+    if bytes.is_empty() {
+        return Err(EdgeError::BadRequest(
+            "empty request body (expected an issue relation)".into(),
+        ));
+    }
+    serde_json::from_slice(bytes).map_err(|error| {
+        EdgeError::BadRequest(format!("invalid issue relation create body: {error}"))
+    })
 }
 
 fn resolve_create(
@@ -270,6 +355,20 @@ fn issue_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
     Ok(value)
 }
 
+fn relation_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
+    let value = ctx
+        .params
+        .get("relation")
+        .map(String::as_str)
+        .ok_or_else(|| EdgeError::BadRequest("route did not bind a relation id".into()))?;
+    if !is_canonical_uuid(value) {
+        return Err(EdgeError::BadRequest(
+            "relation id must be a canonical UUID".into(),
+        ));
+    }
+    Ok(value)
+}
+
 fn authorization_request_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
     if !ctx.request.query.is_empty() || !ctx.request.body.is_empty() {
         return Err(EdgeError::BadRequest(
@@ -335,6 +434,17 @@ fn issue_json(tenant: &str, issue: &StoredIssue) -> Value {
         "version": issue.version,
         "created_at": issue.created_at,
         "updated_at": issue.updated_at,
+    })
+}
+
+fn relation_json(relation: &StoredIssueRelation) -> Value {
+    json!({
+        "id": relation.id,
+        "source_ref": relation.source_ref,
+        "target_ref": relation.target_ref,
+        "relation": relation.relation,
+        "created_by": relation.created_by,
+        "created_at": relation.created_at,
     })
 }
 
@@ -538,6 +648,84 @@ impl Handler for IssueCloseHandler {
     }
 }
 
+struct IssueRelationListHandler {
+    api: DurableIssueReadApi,
+}
+
+impl Handler for IssueRelationListHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.query.is_empty() || !ctx.request.body.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "issue relation listing accepts no query parameters or request body".into(),
+            ));
+        }
+        let issue_id = issue_param(ctx)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &self.api.list_relations(ctx.principal, issue_id)?,
+        )))
+    }
+}
+
+struct IssueRelationCreateHandler {
+    api: DurableIssueMutationApi,
+}
+
+impl Handler for IssueRelationCreateHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        let issue_id = issue_param(ctx)?;
+        let request = parse_relation_create_body(ctx)?;
+        let outcome = self.api.create_relation(
+            ctx.principal,
+            issue_id,
+            &request.target_ref,
+            request.relation()?,
+        )?;
+        Ok(no_store(EdgeResponse::json(
+            if outcome.created { 201 } else { 200 },
+            &json!({
+                "relation": relation_json(&outcome.relation),
+                "created": outcome.created,
+                "durable": true,
+            }),
+        )))
+    }
+}
+
+struct IssueRelationRemoveHandler {
+    api: DurableIssueMutationApi,
+}
+
+impl Handler for IssueRelationRemoveHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        if !ctx.request.query.is_empty() || !ctx.request.body.is_empty() {
+            return Err(EdgeError::BadRequest(
+                "issue relation removal accepts no query parameters or request body".into(),
+            ));
+        }
+        let issue_id = issue_param(ctx)?;
+        let relation_id = relation_param(ctx)?;
+        let removed = self
+            .api
+            .remove_relation(ctx.principal, issue_id, relation_id)?;
+        Ok(no_store(EdgeResponse::json(
+            200,
+            &match removed {
+                Some(relation) => json!({
+                    "relation": relation_json(&relation),
+                    "removed": true,
+                    "durable": true,
+                }),
+                None => json!({
+                    "relation_id": relation_id,
+                    "removed": false,
+                    "durable": true,
+                }),
+            },
+        )))
+    }
+}
+
 struct IssueObjectGuard {
     authorizer: StoreBackedIssueAuthorizer,
     permission: IssuePermission,
@@ -591,6 +779,36 @@ pub fn register_issues(builder: GatewayBuilder, api: DurableIssueMutationApi) ->
             "/v1/issues/authorization-requests/{request_event_id}",
             "issues.authorization_status",
             Arc::new(IssueAuthorizationStatusHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Get,
+            "/v1/issues/{issue}/relations",
+            "issues.relations.list",
+            guarded(
+                &authorizer,
+                IssuePermission::View,
+                Arc::new(IssueRelationListHandler { api: reads.clone() }),
+            ),
+        )
+        .route(
+            Method::Post,
+            "/v1/issues/{issue}/relations",
+            "issues.relations.create",
+            guarded(
+                &authorizer,
+                IssuePermission::ManageRelations,
+                Arc::new(IssueRelationCreateHandler { api: api.clone() }),
+            ),
+        )
+        .route(
+            Method::Delete,
+            "/v1/issues/{issue}/relations/{relation}",
+            "issues.relations.remove",
+            guarded(
+                &authorizer,
+                IssuePermission::ManageRelations,
+                Arc::new(IssueRelationRemoveHandler { api: api.clone() }),
+            ),
         )
         .route(
             Method::Get,
@@ -714,6 +932,29 @@ mod tests {
             br#"{"project_id":"11111111-1111-1111-1111-111111111111","project_id":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa","type_id":"22222222-2222-2222-2222-222222222222","prefix":"ENG","title":"x"}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn relation_body_names_one_visible_target_and_one_typed_relation() {
+        let request = parse_relation_create_bytes(
+            br#"{"target_ref":"myelin://acme/issue/issue/ENG-2","relation":"blocks"}"#,
+        )
+        .unwrap();
+        assert_eq!(request.target_ref, "myelin://acme/issue/issue/ENG-2");
+        assert_eq!(request.relation().unwrap(), IssueLifecycleRel::Blocks);
+        for body in [
+            br#"{}"#.as_slice(),
+            br#"{"target_ref":"myelin://acme/issue/issue/ENG-2","relation":"follows"}"#,
+            br#"{"target_ref":"myelin://acme/issue/issue/ENG-2","relation":"blocks","tenant":"other"}"#,
+        ] {
+            let parsed = parse_relation_create_bytes(body);
+            assert!(
+                parsed
+                    .and_then(|request| request.relation())
+                    .is_err(),
+                "an untyped or scope-smuggling relation body was accepted"
+            );
+        }
     }
 
     #[test]

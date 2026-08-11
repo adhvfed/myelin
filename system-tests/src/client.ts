@@ -4,7 +4,7 @@ import type { SystemTestConfig } from "./config.js";
 import { SystemEventStream } from "./event-stream.js";
 import { record, type JsonRecord } from "./json.js";
 
-type Method = "GET" | "HEAD" | "POST" | "PUT";
+type Method = "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE";
 
 export interface RequestOptions {
   method?: Method;
@@ -55,7 +55,7 @@ export class SystemTestClient {
       headers.set("x-myelin-token-scheme", options.tokenScheme ?? this.config.tokenScheme);
     }
     if (options.body !== undefined) headers.set("content-type", "application/json");
-    if (method === "POST" || method === "PUT") {
+    if (method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE") {
       const key = options.idempotencyKey === undefined ? randomUUID() : options.idempotencyKey;
       if (key !== false) headers.set("idempotency-key", key);
     }
