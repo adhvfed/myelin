@@ -4245,7 +4245,7 @@ fn pr_diff_vm(number: u64, base_ref: &str, diff: PrDiff, offset: usize, limit: u
     }
 }
 
-fn map_durable_err(e: DurableError) -> EdgeError {
+pub(crate) fn map_durable_err(e: DurableError) -> EdgeError {
     match e {
         DurableError::NotFound(m) => EdgeError::NotFound(m),
         DurableError::InvalidInput(m) => EdgeError::BadRequest(m),

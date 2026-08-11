@@ -5,6 +5,7 @@ use myelin_agent::{
     ProposedEffect, RunCtx,
 };
 use myelin_git::core::RepoLoc;
+use myelin_git::durable::DurableError;
 use myelin_git::pg_pr_store::PrOperationId;
 use myelin_git::pr_store::MergeAttempt;
 use myelin_identity::Principal;
@@ -15,7 +16,7 @@ use serde_json::Value;
 
 use crate::agent_delegation::is_active_delegation;
 use crate::effect_carrier::parse_proposed;
-use crate::git_durable::{AgentFileWrite, DurableGitBackend, RepoActorContext};
+use crate::git_durable::{map_durable_err, AgentFileWrite, DurableGitBackend, RepoActorContext};
 use crate::repo_authz::RepoPermission;
 
 pub struct GitEffectApi {
@@ -157,7 +158,7 @@ impl GitEffectApi {
                             "path": path,
                         }),
                     ),
-                    Err(error) => EffectResult::Denied(error.to_string()),
+                    Err(error) => deny_durable_error(error),
                 }
             }
             "git.open_pr" => {
@@ -189,7 +190,7 @@ impl GitEffectApi {
                             "head_oid": rec.head_oid,
                         }),
                     ),
-                    Err(e) => EffectResult::Denied(e.to_string()),
+                    Err(error) => deny_durable_error(error),
                 }
             }
             "git.submit_review" => {
@@ -218,7 +219,7 @@ impl GitEffectApi {
                         tool,
                         &format!("git.pr.review:#{}:{}", rec.number, verdict),
                     ),
-                    Err(e) => EffectResult::Denied(e.to_string()),
+                    Err(error) => deny_durable_error(error),
                 }
             }
             "git.endorse_fork_ci" => {
@@ -247,7 +248,7 @@ impl GitEffectApi {
                             rec.endorsed_contexts.len()
                         ),
                     ),
-                    Err(e) => EffectResult::Denied(e.to_string()),
+                    Err(error) => deny_durable_error(error),
                 }
             }
             "git.merge" => {
@@ -278,7 +279,7 @@ impl GitEffectApi {
                     Ok(MergeAttempt::InvalidHead(why)) => {
                         EffectResult::Denied(format!("invalid merge head: {why}"))
                     }
-                    Err(e) => EffectResult::Denied(e.to_string()),
+                    Err(error) => deny_durable_error(error),
                 }
             }
             other => EffectResult::Denied(format!(
@@ -326,7 +327,7 @@ impl EffectApi for GitEffectApi {
                     &authority.idempotency_key,
                 ) {
                     Ok(operation_id) => self.apply_tool(run, &tool, &args, &operation_id),
-                    Err(error) => EffectResult::Denied(error.to_string()),
+                    Err(error) => deny_durable_error(error),
                 },
                 Err(reason) => EffectResult::Denied(reason),
             },
@@ -372,6 +373,10 @@ fn deny_missing(field: &str) -> EffectResult {
     EffectResult::Denied(format!("git tool argument `{field}` is required"))
 }
 
+fn deny_durable_error(error: DurableError) -> EffectResult {
+    EffectResult::Denied(map_durable_err(error).client_message())
+}
+
 fn repo_and_number(args: &Value) -> Result<(&str, u64), EffectResult> {
     let repo = str_arg(args, "repo").ok_or_else(|| deny_missing("repo"))?;
     let number = args
@@ -389,6 +394,30 @@ mod tests {
     use myelin_identity_service::revocation::RevocationStore;
     use myelin_tenancy::TenantId;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn durable_failures_cross_the_mcp_boundary_as_public_errors_only() {
+        for private_failure in [
+            DurableError::Io(
+                "open /srv/myelin/private/repositories/acme/core.git: permission denied".into(),
+            ),
+            DurableError::Git("postgres relation agent_command_ledger is unavailable".into()),
+        ] {
+            assert_eq!(
+                deny_durable_error(private_failure),
+                EffectResult::Denied("internal error".into()),
+            );
+        }
+        assert_eq!(
+            deny_durable_error(DurableError::InvalidInput(
+                "file edit path contains a reserved Git administrative component".into(),
+            )),
+            EffectResult::Denied(
+                "file edit path contains a reserved Git administrative component".into(),
+            ),
+            "safe recovery guidance remains actionable"
+        );
+    }
 
     #[test]
     fn parse_proposed_round_trips_the_mcp_carrier() {
