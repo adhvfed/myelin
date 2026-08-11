@@ -78,7 +78,7 @@ pub(super) async fn claim(
         "INSERT INTO import_map (\
            tenant_id, region, import_job, source, source_id, request_hash, myelin_kind, status\
          ) VALUES ($1, $2, $3, $4, $5, $6, 'issue', 'pending') \
-         ON CONFLICT (tenant_id, import_job, source, source_id) DO NOTHING \
+         ON CONFLICT (tenant_id, region, import_job, source, source_id, myelin_kind) DO NOTHING \
          RETURNING source_id",
     )
     .bind(tenant_id)

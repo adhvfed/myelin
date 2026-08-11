@@ -309,6 +309,15 @@ ALTER TABLE import_map
   ADD COLUMN IF NOT EXISTS request_hash text
   CHECK (request_hash IS NULL OR request_hash ~ '^blake3:[0-9a-f]{64}$')";
 
+pub const EXPAND_IMPORT_MAP_IDENTITY_INDEX_DDL: &str = "\
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS import_map_identity_v2
+  ON import_map (tenant_id, region, import_job, source, source_id, myelin_kind)";
+
+pub const CONTRACT_IMPORT_MAP_IDENTITY_DDL: &str = "\
+ALTER TABLE import_map DROP CONSTRAINT import_map_pkey;
+ALTER TABLE import_map ADD CONSTRAINT import_map_pkey_v2
+  PRIMARY KEY USING INDEX import_map_identity_v2";
+
 pub const CREATE_ISSUE_CREATE_IDEMPOTENCY_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS issue_create_idempotency (
   tenant_id     text        NOT NULL,
@@ -501,6 +510,18 @@ pub fn issues_migrations() -> Migrations {
         "iss_0026_import_request_hash",
         EXPAND_IMPORT_MAP_REQUEST_HASH_DDL,
         MigrationPhase::Expand,
+        IMPORT_MAP_TABLE,
+    ));
+    migrations.push(Migration::phased(
+        "iss_0027_import_identity_index",
+        EXPAND_IMPORT_MAP_IDENTITY_INDEX_DDL,
+        MigrationPhase::Expand,
+        IMPORT_MAP_TABLE,
+    ));
+    migrations.push(Migration::phased(
+        "iss_0028_import_identity_contract",
+        CONTRACT_IMPORT_MAP_IDENTITY_DDL,
+        MigrationPhase::Contract,
         IMPORT_MAP_TABLE,
     ));
     Migrations::of(migrations)
@@ -733,6 +754,30 @@ mod tests {
             .ddl
             .contains("ADD COLUMN IF NOT EXISTS request_hash"));
         assert!(request_hash_expansion.ddl.contains("request_hash IS NULL"));
+
+        let identity_index = issues_migrations()
+            .0
+            .into_iter()
+            .find(|migration| migration.id == "iss_0027_import_identity_index")
+            .expect("the region-and-kind import identity index");
+        assert_eq!(identity_index.phase, MigrationPhase::Expand);
+        assert!(identity_index.ddl.contains("UNIQUE INDEX CONCURRENTLY"));
+        assert!(identity_index
+            .ddl
+            .contains("tenant_id, region, import_job, source, source_id, myelin_kind"));
+
+        let identity_contract = issues_migrations()
+            .0
+            .into_iter()
+            .find(|migration| migration.id == "iss_0028_import_identity_contract")
+            .expect("the region-and-kind import identity contract");
+        assert_eq!(identity_contract.phase, MigrationPhase::Contract);
+        assert!(identity_contract
+            .ddl
+            .contains("DROP CONSTRAINT import_map_pkey"));
+        assert!(identity_contract
+            .ddl
+            .contains("PRIMARY KEY USING INDEX import_map_identity_v2"));
     }
 
     #[test]

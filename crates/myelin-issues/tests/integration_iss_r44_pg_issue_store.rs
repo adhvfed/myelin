@@ -280,6 +280,18 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         assert_eq!(count, 0, "an aborted import left no {table} state");
     }
 
+    sqlx::query(
+        "INSERT INTO import_map (tenant_id, region, import_job, source, source_id, \
+           myelin_kind, status) \
+         VALUES ($1, 'fr-par', $2::uuid, 'github', 'github:acme/platform#41', \
+           'cycle', 'pending')",
+    )
+    .bind(&tenant)
+    .bind(&import_job_id)
+    .execute(&admin)
+    .await
+    .expect("another artifact kind may own the same external source identity");
+
     let first_import = store
         .import_issue(&creator, imported.clone())
         .await
@@ -300,7 +312,8 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
 
     let map = sqlx::query(
         "SELECT status, source, source_id, request_hash, myelin_id::text AS myelin_id \
-         FROM import_map WHERE tenant_id = $1 AND import_job = $2::uuid",
+         FROM import_map WHERE tenant_id = $1 AND import_job = $2::uuid \
+           AND myelin_kind = 'issue'",
     )
     .bind(&tenant)
     .bind(&import_job_id)
@@ -312,6 +325,18 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     assert_eq!(map.get::<String, _>("source_id"), "github:acme/platform#41");
     assert!(map.get::<String, _>("request_hash").starts_with("blake3:"));
     assert_eq!(map.get::<String, _>("myelin_id"), first_import.issue.id);
+    let mapped_kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT myelin_kind FROM import_map \
+         WHERE tenant_id = $1 AND import_job = $2::uuid \
+           AND source = 'github' AND source_id = 'github:acme/platform#41' \
+         ORDER BY myelin_kind",
+    )
+    .bind(&tenant)
+    .bind(&import_job_id)
+    .fetch_all(&admin)
+    .await
+    .unwrap();
+    assert_eq!(mapped_kinds, vec!["cycle".to_string(), "issue".to_string()]);
     let imported_issue_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM issue WHERE tenant_id = $1 AND prefix = 'IMP'")
             .bind(&tenant)
