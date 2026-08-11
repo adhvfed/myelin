@@ -200,10 +200,10 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
 
     let write_effect = id_effect("repo:secret#write", "repo:secret");
     match effect_api.apply(&run, write_effect) {
-        EffectResult::Applied(_) => {
+        EffectResult::Applied(_) | EffectResult::AppliedResource { .. } => {
             escapes += 1;
         }
-        EffectResult::Denied(_) | EffectResult::Gated(_) => {  }
+        EffectResult::Denied(_) | EffectResult::Gated(_) => {}
     }
     if let EffectResult::Applied(_) =
         effect_api.apply(&run, id_effect("repo:secret#admin", "repo:secret"))
@@ -271,8 +271,7 @@ fn id_d5_rerun_and_srch_ref_notif_rides_as_composed() {
                 leaks += 1;
             }
         }
-        Ok(ListObjectsResult::Filter { .. }) => {
-        }
+        Ok(ListObjectsResult::Filter { .. }) => {}
         Err(e) => panic!("a revoked subject's list_objects must serve (empty), not error: {e:?}"),
     }
     let post_revoke = id

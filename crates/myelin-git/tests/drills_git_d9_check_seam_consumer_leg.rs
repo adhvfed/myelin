@@ -72,18 +72,15 @@ fn synthetic_check_updated(
 }
 
 fn bind_consumer() -> Consumer<CheckStatusConsumer> {
-    let subjects: Vec<&str> = CheckStatusConsumer::new()
-        .subjects()
-        .iter()
-        .map(|p| p.0.as_str())
-        .collect();
+    let handler = CheckStatusConsumer::new();
+    let subjects: Vec<&str> = handler.subjects().iter().map(|p| p.0.as_str()).collect();
     let sub = Subscription::bind(
         ConsumerName("git.check_status".into()),
         &subjects,
         PrefetchBound::new(64).unwrap(),
     )
     .expect("the ci.check.updated whitelist binds (never a wildcard)");
-    Consumer::new(CheckStatusConsumer::new(), sub, DedupLedger::new())
+    Consumer::new(handler, sub, DedupLedger::new())
 }
 
 #[test]
@@ -199,7 +196,9 @@ fn consumer_leg_dead_letters_a_foreign_type() {
     let mut env = synthetic_check_updated("build", 1, CheckState::Success, TrustTier::Trusted);
     env.type_ = EventType("git.ref.updated".into());
     assert!(matches!(
-        consumer.handler().handle(&env, &mut myelin_events::HandlerTx::none()),
+        consumer
+            .handler()
+            .handle(&env, &mut myelin_events::HandlerTx::none()),
         myelin_events::HandleOutcome::NonRetryable(_)
     ));
 }

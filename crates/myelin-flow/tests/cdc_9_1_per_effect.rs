@@ -110,12 +110,14 @@ fn partial_approval_maps_each_approved_effect_to_exactly_one_apply() {
                 ApprovalDecision::Approve,
             ],
         ),
-        &|eff: &ArtifactRef| {
-            match consumer.apply(&run_ctx, ProposedEffect(eff.0.clone())) {
-                EffectResult::Applied(EventId(id)) => Ok(id),
-                EffectResult::Gated(g) => Err(format!("gated:{}", g.0)),
-                EffectResult::Denied(r) => Err(r),
-            }
+        &|eff: &ArtifactRef| match consumer.apply(&run_ctx, ProposedEffect(eff.0.clone())) {
+            EffectResult::Applied(EventId(id)) => Ok(id),
+            EffectResult::AppliedResource {
+                event_id: EventId(id),
+                ..
+            } => Ok(id),
+            EffectResult::Gated(g) => Err(format!("gated:{}", g.0)),
+            EffectResult::Denied(r) => Err(r),
         },
     );
 
@@ -171,6 +173,10 @@ fn double_click_drives_the_real_effect_api_exactly_once_per_effect() {
         ),
         &|eff: &ArtifactRef| match consumer.apply(&run_ctx, ProposedEffect(eff.0.clone())) {
             EffectResult::Applied(EventId(id)) => Ok(id),
+            EffectResult::AppliedResource {
+                event_id: EventId(id),
+                ..
+            } => Ok(id),
             other => Err(format!("{other:?}")),
         },
     );
