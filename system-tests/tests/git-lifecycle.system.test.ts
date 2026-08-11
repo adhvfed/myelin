@@ -318,9 +318,12 @@ describe.sequential("Git engineering lifecycle", () => {
 
   test("persists discussion threads and a batched review from another principal", async () => {
     const base = `${project.path}/prs/${pullRequestNumber}`;
-    const threadReceipt = await reviewerClient.json(`${base}/threads`, {
+    const threadPath = `${base}/threads`;
+    const threadRetryKey = `discussion-${randomUUID()}`;
+    const threadReceipt = await reviewerClient.json(threadPath, {
       method: "POST",
       body: { body_md: "The externally observed contract looks coherent." },
+      idempotencyKey: threadRetryKey,
       expectedStatus: 201,
     });
     const thread = record(
@@ -328,17 +331,54 @@ describe.sequential("Git engineering lifecycle", () => {
       "thread receipt.applied.thread",
     );
     const threadId = string(thread.id, "thread id");
+    const openingCommentId = string(
+      record(array(thread.comments, "opening comments")[0], "opening comment").id,
+      "opening comment id",
+    );
     expect(threadReceipt.body).toMatchObject({ durable: true, applied: { action: "git.pr.thread.create" } });
+    const retriedThread = await reviewerClient.json(threadPath, {
+      method: "POST",
+      body: { body_md: "The externally observed contract looks coherent." },
+      idempotencyKey: threadRetryKey,
+      expectedStatus: 201,
+    });
+    expect(retriedThread.body).toMatchObject({
+      applied: { action: "git.pr.thread.create", thread: { id: threadId } },
+    });
 
-    const commentReceipt = await systemClient.json(`${base}/threads/${encodeURIComponent(threadId)}/comments`, {
+    const commentPath = `${base}/threads/${encodeURIComponent(threadId)}/comments`;
+    const commentRetryKey = `discussion-reply-${randomUUID()}`;
+    const commentReceipt = await systemClient.json(commentPath, {
       method: "POST",
       body: { body_md: "Confirmed against the durable edge." },
+      idempotencyKey: commentRetryKey,
       expectedStatus: 201,
     });
     expect(commentReceipt.body).toMatchObject({
       durable: true,
       applied: { action: "git.pr.comment.create" },
     });
+    const commentId = string(
+      record(record(commentReceipt.body.applied, "comment receipt").comment, "comment").id,
+      "comment id",
+    );
+    const retriedComment = await systemClient.json(commentPath, {
+      method: "POST",
+      body: { body_md: "Confirmed against the durable edge." },
+      idempotencyKey: commentRetryKey,
+      expectedStatus: 201,
+    });
+    expect(retriedComment.body).toMatchObject({
+      applied: { action: "git.pr.comment.create", comment: { id: commentId } },
+    });
+
+    const conversation = await reviewerClient.json(`${base}/threads`);
+    const discussion = array(conversation.body.discussion, "discussion threads")
+      .map((value) => record(value, "discussion thread"))
+      .find((value) => value.id === threadId);
+    expect(discussion).toBeDefined();
+    expect(array(discussion?.comments, "discussion comments").map((value) => record(value, "comment").id))
+      .toEqual([openingCommentId, commentId]);
 
     const reviewStart = await reviewerClient.json(`${base}/reviews/start`, {
       method: "POST",

@@ -2714,6 +2714,7 @@ impl DurableGitBackend {
         region: &str,
         slug: &str,
         number: u64,
+        operation_nonce: &str,
         body: &Value,
         principal: &Principal,
     ) -> Result<Value, DurableError> {
@@ -2725,17 +2726,26 @@ impl DurableGitBackend {
             .map(|anchor| self.resolve_thread_anchor(&loc, &rec, anchor))
             .transpose()?;
         let author = Self::thread_principal(tenant, principal);
-        let thread = self
-            .threads
-            .create_thread(&loc, &key, anchor, author, body_md, now_unix())?;
-        self.bump_pr_updated(&loc, number, principal);
-        Ok(thread_json(&thread))
+        let outcome = self.threads.create_thread(
+            &loc,
+            &key,
+            anchor,
+            author,
+            body_md,
+            operation_nonce,
+            now_unix(),
+        )?;
+        if outcome.applied {
+            self.bump_pr_updated(&loc, number, principal);
+        }
+        Ok(thread_json(&outcome.value))
     }
 
     pub fn add_thread_comment(
         &self,
         target: PrActorContext<'_>,
         thread_id: &str,
+        operation_nonce: &str,
         body: &Value,
     ) -> Result<Value, DurableError> {
         let PrActorContext { repo, number } = target;
@@ -2750,11 +2760,19 @@ impl DurableGitBackend {
         let key = Self::pr_object_key(slug, number);
         let body_md = require_body_md(body)?;
         let author = Self::thread_principal(tenant, principal);
-        let comment =
-            self.threads
-                .add_comment(&loc, &key, thread_id, author, body_md, now_unix())?;
-        self.bump_pr_updated(&loc, number, principal);
-        Ok(comment_json(&comment))
+        let outcome = self.threads.add_comment(
+            &loc,
+            &key,
+            thread_id,
+            author,
+            body_md,
+            operation_nonce,
+            now_unix(),
+        )?;
+        if outcome.applied {
+            self.bump_pr_updated(&loc, number, principal);
+        }
+        Ok(comment_json(&outcome.value))
     }
 
     pub fn resolve_thread(

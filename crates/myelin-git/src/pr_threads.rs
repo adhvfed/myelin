@@ -16,6 +16,28 @@ pub const MAX_THREADS_PER_SUBJECT: usize = 4_096;
 pub const MAX_COMMENTS_PER_SUBJECT: usize = 8_192;
 pub const MAX_REVIEWS_PER_SUBJECT: usize = 1_024;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandOutcome<T> {
+    pub value: T,
+    pub applied: bool,
+}
+
+impl<T> CommandOutcome<T> {
+    fn applied(value: T) -> Self {
+        Self {
+            value,
+            applied: true,
+        }
+    }
+
+    fn replayed(value: T) -> Self {
+        Self {
+            value,
+            applied: false,
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct PendingCommentRequest {
     repo: RepoLoc,
@@ -78,12 +100,37 @@ impl core::fmt::Debug for PendingCommentRequest {
 fn operation_digest(value: &str) -> Result<String, DurableError> {
     if value.is_empty() || value.len() > 256 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
         return Err(DurableError::Git(
-            "review comment idempotency key must contain 1..=256 printable ASCII bytes".into(),
+            "conversation idempotency key must contain 1..=256 printable ASCII bytes".into(),
         ));
     }
     Ok(digest_parts(
         "myelin.git.review-comment.operation.v1",
         &[value.as_bytes()],
+    ))
+}
+
+fn thread_request_hash(
+    anchor: &Option<ThreadAnchor>,
+    author: &ThreadPrincipal,
+    body_md: &str,
+) -> Result<String, DurableError> {
+    let anchor = encode_anchor_intent(anchor)?;
+    let author = encode_author(author)?;
+    Ok(digest_parts(
+        "myelin.git.thread-create.request.v1",
+        &[anchor.as_slice(), author.as_slice(), body_md.as_bytes()],
+    ))
+}
+
+fn reply_request_hash(
+    thread_id: &str,
+    author: &ThreadPrincipal,
+    body_md: &str,
+) -> Result<String, DurableError> {
+    let author = encode_author(author)?;
+    Ok(digest_parts(
+        "myelin.git.thread-reply.request.v1",
+        &[thread_id.as_bytes(), author.as_slice(), body_md.as_bytes()],
     ))
 }
 
@@ -93,13 +140,8 @@ fn pending_comment_request_hash(
     author: &ThreadPrincipal,
     body_md: &str,
 ) -> Result<String, DurableError> {
-    let anchor_intent = anchor
-        .as_ref()
-        .map(|anchor| (&anchor.path, anchor.line, anchor.side));
-    let anchor = serde_json::to_vec(&anchor_intent)
-        .map_err(|_| DurableError::Git("encode review comment anchor".into()))?;
-    let author = serde_json::to_vec(author)
-        .map_err(|_| DurableError::Git("encode review comment author".into()))?;
+    let anchor = encode_anchor_intent(anchor)?;
+    let author = encode_author(author)?;
     Ok(digest_parts(
         "myelin.git.review-comment.request.v1",
         &[
@@ -109,6 +151,17 @@ fn pending_comment_request_hash(
             body_md.as_bytes(),
         ],
     ))
+}
+
+fn encode_anchor_intent(anchor: &Option<ThreadAnchor>) -> Result<Vec<u8>, DurableError> {
+    let intent = anchor
+        .as_ref()
+        .map(|anchor| (&anchor.path, anchor.line, anchor.side));
+    serde_json::to_vec(&intent).map_err(|_| DurableError::Git("encode comment anchor".into()))
+}
+
+fn encode_author(author: &ThreadPrincipal) -> Result<Vec<u8>, DurableError> {
+    serde_json::to_vec(author).map_err(|_| DurableError::Git("encode comment author".into()))
 }
 
 fn digest_parts(domain: &str, parts: &[&[u8]]) -> String {
@@ -364,14 +417,17 @@ pub struct SubjectThreads {
     pub reviews: Vec<ReviewBatch>,
     #[serde(default)]
     pub seq: u64,
-    #[serde(default)]
-    pending_comment_commands: BTreeMap<String, PendingCommentCommand>,
+    #[serde(default, alias = "pending_comment_commands")]
+    conversation_commands: BTreeMap<String, ConversationCommand>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct PendingCommentCommand {
+struct ConversationCommand {
     request_hash: String,
-    comment_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comment_id: Option<String>,
 }
 
 impl SubjectThreads {
@@ -393,14 +449,23 @@ impl SubjectThreads {
             .sum()
     }
 
-    fn validate_cardinality(&self) -> Result<(), DurableError> {
+    fn validate(&self) -> Result<(), DurableError> {
         if self.threads.len() > MAX_THREADS_PER_SUBJECT
             || self.comment_count() > MAX_COMMENTS_PER_SUBJECT
             || self.reviews.len() > MAX_REVIEWS_PER_SUBJECT
-            || self.pending_comment_commands.len() > MAX_COMMENTS_PER_SUBJECT
+            || self.conversation_commands.len() > MAX_COMMENTS_PER_SUBJECT
         {
             return Err(DurableError::Git(
                 "PR conversation exceeds its cardinality limit".into(),
+            ));
+        }
+        if self
+            .conversation_commands
+            .values()
+            .any(|command| command.thread_id.is_some() == command.comment_id.is_some())
+        {
+            return Err(DurableError::Git(
+                "PR conversation contains a malformed command receipt".into(),
             ));
         }
         Ok(())
@@ -538,8 +603,8 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
                         doc.object_key
                     )));
                 }
-                doc.validate_cardinality().map_err(|_| {
-                    DurableError::Io("stored PR conversation exceeds its cardinality limit".into())
+                doc.validate().map_err(|error| {
+                    DurableError::Io(format!("invalid stored PR conversation: {error}"))
                 })?;
                 Ok(doc)
             }
@@ -552,7 +617,7 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
     }
 
     fn save(&self, repo: &RepoLoc, doc: &SubjectThreads) -> Result<(), DurableError> {
-        doc.validate_cardinality()?;
+        doc.validate()?;
         let dir = self.threads_dir(repo)?;
         let file = self.subject_path(repo, &doc.object_key)?;
         let bytes = serde_json::to_vec_pretty(doc)
@@ -572,12 +637,36 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         anchor: Option<ThreadAnchor>,
         author: ThreadPrincipal,
         body_md: impl Into<String>,
+        operation_nonce: &str,
         now: i64,
-    ) -> Result<ThreadRecord, DurableError> {
+    ) -> Result<CommandOutcome<ThreadRecord>, DurableError> {
         let body_md = validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?;
+        let operation_id = operation_digest(operation_nonce)?;
+        let request_hash = thread_request_hash(&anchor, &author, &body_md)?;
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
+        if let Some(command) = doc.conversation_commands.get(&operation_id) {
+            if command.request_hash != request_hash {
+                return Err(DurableError::Conflict(
+                    "idempotency key is already bound to a different conversation write".into(),
+                ));
+            }
+            let thread_id = command.thread_id.as_deref().ok_or_else(|| {
+                DurableError::Io("thread idempotency receipt contains the wrong result type".into())
+            })?;
+            let thread = doc
+                .threads
+                .iter()
+                .find(|thread| thread.id == thread_id)
+                .cloned()
+                .ok_or_else(|| {
+                    DurableError::Io(
+                        "thread idempotency receipt references a missing thread".into(),
+                    )
+                })?;
+            return Ok(CommandOutcome::replayed(thread));
+        }
         if doc.threads.len() >= MAX_THREADS_PER_SUBJECT
             || doc.comment_count() >= MAX_COMMENTS_PER_SUBJECT
         {
@@ -603,8 +692,16 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             }],
         };
         doc.threads.push(thread.clone());
+        doc.conversation_commands.insert(
+            operation_id,
+            ConversationCommand {
+                request_hash,
+                thread_id: Some(thread.id.clone()),
+                comment_id: None,
+            },
+        );
         self.save(repo, &doc)?;
-        Ok(thread)
+        Ok(CommandOutcome::applied(thread))
     }
 
     pub fn add_comment(
@@ -614,12 +711,39 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         thread_id: &str,
         author: ThreadPrincipal,
         body_md: impl Into<String>,
+        operation_nonce: &str,
         now: i64,
-    ) -> Result<CommentRecord, DurableError> {
+    ) -> Result<CommandOutcome<CommentRecord>, DurableError> {
         let body_md = validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?;
+        let operation_id = operation_digest(operation_nonce)?;
+        let request_hash = reply_request_hash(thread_id, &author, &body_md)?;
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(repo, object_key)?;
+        if let Some(command) = doc.conversation_commands.get(&operation_id) {
+            if command.request_hash != request_hash {
+                return Err(DurableError::Conflict(
+                    "idempotency key is already bound to a different conversation write".into(),
+                ));
+            }
+            let comment_id = command.comment_id.as_deref().ok_or_else(|| {
+                DurableError::Io(
+                    "comment idempotency receipt contains the wrong result type".into(),
+                )
+            })?;
+            let comment = doc
+                .threads
+                .iter()
+                .flat_map(|thread| thread.comments.iter())
+                .find(|comment| comment.id == comment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    DurableError::Io(
+                        "comment idempotency receipt references a missing comment".into(),
+                    )
+                })?;
+            return Ok(CommandOutcome::replayed(comment));
+        }
         if doc.comment_count() >= MAX_COMMENTS_PER_SUBJECT {
             return Err(DurableError::Git(
                 "PR conversation exceeds its comment limit".into(),
@@ -642,8 +766,16 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             pending: false,
         };
         thread.comments.push(comment.clone());
+        doc.conversation_commands.insert(
+            operation_id,
+            ConversationCommand {
+                request_hash,
+                thread_id: None,
+                comment_id: Some(comment.id.clone()),
+            },
+        );
         self.save(repo, &doc)?;
-        Ok(comment)
+        Ok(CommandOutcome::applied(comment))
     }
 
     pub fn resolve_thread(
@@ -719,17 +851,22 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         let lock = self.subject_lock(&repo, &object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(&repo, &object_key)?;
-        if let Some(command) = doc.pending_comment_commands.get(&operation_id) {
+        if let Some(command) = doc.conversation_commands.get(&operation_id) {
             if command.request_hash != request_hash {
                 return Err(DurableError::Conflict(
                     "idempotency key is already bound to a different review comment".into(),
                 ));
             }
+            let comment_id = command.comment_id.as_deref().ok_or_else(|| {
+                DurableError::Io(
+                    "review comment idempotency receipt contains the wrong result type".into(),
+                )
+            })?;
             return doc
                 .threads
                 .iter()
                 .flat_map(|thread| thread.comments.iter())
-                .find(|comment| comment.id == command.comment_id)
+                .find(|comment| comment.id == comment_id)
                 .cloned()
                 .ok_or_else(|| {
                     DurableError::Io(
@@ -776,11 +913,12 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             resolved: false,
             comments: vec![comment.clone()],
         });
-        doc.pending_comment_commands.insert(
+        doc.conversation_commands.insert(
             operation_id,
-            PendingCommentCommand {
+            ConversationCommand {
                 request_hash,
-                comment_id: comment.id.clone(),
+                thread_id: None,
+                comment_id: Some(comment.id.clone()),
             },
         );
         self.save(&repo, &doc)?;
@@ -879,8 +1017,12 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         }
         doc.threads.retain(|t| !t.comments.is_empty());
         doc.reviews.retain(|r| r.id != review_id);
-        doc.pending_comment_commands
-            .retain(|_, command| !discarded_comment_ids.contains(&command.comment_id));
+        doc.conversation_commands.retain(|_, command| {
+            command
+                .comment_id
+                .as_ref()
+                .is_none_or(|comment_id| !discarded_comment_ids.contains(comment_id))
+        });
         self.save(repo, &doc)?;
         Ok(())
     }
@@ -1094,7 +1236,15 @@ mod tests {
         let root = temp_root("rt");
         let store = DurablePrThreadStore::rooted(&root);
         store
-            .create_thread(&loc(), KEY, None, human("psn:a@acme"), "first post", 100)
+            .create_thread(
+                &loc(),
+                KEY,
+                None,
+                human("psn:a@acme"),
+                "first post",
+                "round-trip",
+                100,
+            )
             .unwrap();
 
         let back = DurablePrThreadStore::rooted(&root)
@@ -1103,6 +1253,88 @@ mod tests {
         assert_eq!(back.threads.len(), 1);
         assert!(back.threads[0].is_discussion());
         assert_eq!(back.threads[0].comments[0].body_md, "first post");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn discussion_writes_converge_on_the_first_durable_result() {
+        let root = temp_root("discussion-retries");
+        let store = DurablePrThreadStore::rooted(&root);
+        let author = human("psn:a@acme");
+        let first = store
+            .create_thread(
+                &loc(),
+                KEY,
+                None,
+                author.clone(),
+                "Can we make this invariant explicit?",
+                "private-thread-key",
+                100,
+            )
+            .unwrap();
+        let retried = store
+            .create_thread(
+                &loc(),
+                KEY,
+                None,
+                author.clone(),
+                "Can we make this invariant explicit?",
+                "private-thread-key",
+                999,
+            )
+            .unwrap();
+        assert!(first.applied);
+        assert!(!retried.applied);
+        assert_eq!(retried.value, first.value);
+        assert!(matches!(
+            store.create_thread(
+                &loc(),
+                KEY,
+                None,
+                author.clone(),
+                "A different thread.",
+                "private-thread-key",
+                1_000,
+            ),
+            Err(DurableError::Conflict(_))
+        ));
+
+        let first_reply = store
+            .add_comment(
+                &loc(),
+                KEY,
+                &first.value.id,
+                author.clone(),
+                "Yes; the durable boundary is the right place.",
+                "private-reply-key",
+                101,
+            )
+            .unwrap();
+        let retried_reply = DurablePrThreadStore::rooted(&root)
+            .add_comment(
+                &loc(),
+                KEY,
+                &first.value.id,
+                author,
+                "Yes; the durable boundary is the right place.",
+                "private-reply-key",
+                1_001,
+            )
+            .unwrap();
+        assert!(first_reply.applied);
+        assert!(!retried_reply.applied);
+        assert_eq!(retried_reply.value, first_reply.value);
+
+        let document = std::fs::read_to_string(store.subject_path(&loc(), KEY).unwrap()).unwrap();
+        assert!(!document.contains("private-thread-key"));
+        assert!(!document.contains("private-reply-key"));
+        let stored = store.load(&loc(), KEY).unwrap();
+        assert_eq!(stored.threads.len(), 1, "one question leaves one thread");
+        assert_eq!(
+            stored.comment_count(),
+            2,
+            "one answer leaves one additional comment"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1124,6 +1356,7 @@ mod tests {
                     None,
                     human(&format!("psn:writer-{writer}@acme")),
                     format!("comment-{writer}"),
+                    &format!("writer-{writer}"),
                     writer as i64,
                 )
             }));
@@ -1211,6 +1444,40 @@ mod tests {
         assert_eq!(c.state, CommentState::Visible);
         assert!(!c.pending);
         assert_eq!(c.review_id, None);
+    }
+
+    #[test]
+    fn pending_comment_receipts_upgrade_into_the_shared_command_ledger() {
+        let stored = serde_json::json!({
+            "object_key": "pr:core:1",
+            "threads": [{
+                "id": "t-1",
+                "comments": [{
+                    "id": "c-1",
+                    "author": { "kind": "human", "display": "psn:a@acme" },
+                    "body_md": "A pending observation.",
+                    "created_at": 1,
+                    "review_id": "r-1",
+                    "pending": true
+                }]
+            }],
+            "pending_comment_commands": {
+                "operation-digest": {
+                    "request_hash": "request-digest",
+                    "comment_id": "c-1"
+                }
+            }
+        });
+
+        let document: SubjectThreads =
+            serde_json::from_value(stored).expect("the previous receipt shape remains readable");
+        document.validate().expect("the migrated receipt is valid");
+        let upgraded = serde_json::to_value(document).unwrap();
+        assert!(upgraded.get("pending_comment_commands").is_none());
+        assert_eq!(
+            upgraded["conversation_commands"]["operation-digest"]["comment_id"],
+            "c-1"
+        );
     }
 
     #[test]
@@ -1431,8 +1698,17 @@ mod tests {
         let root = temp_root("resolve");
         let store = DurablePrThreadStore::rooted(&root);
         let t = store
-            .create_thread(&loc(), KEY, None, human("psn:a@acme"), "q?", 1)
-            .unwrap();
+            .create_thread(
+                &loc(),
+                KEY,
+                None,
+                human("psn:a@acme"),
+                "q?",
+                "resolve-thread",
+                1,
+            )
+            .unwrap()
+            .value;
         store.resolve_thread(&loc(), KEY, &t.id, true).unwrap();
         let doc = store.load(&loc(), KEY).unwrap();
         assert!(doc.threads[0].resolved);
@@ -1460,7 +1736,15 @@ mod tests {
         );
 
         store
-            .create_thread(&loc(), first, None, human("psn:a@acme"), "private", 1)
+            .create_thread(
+                &loc(),
+                first,
+                None,
+                human("psn:a@acme"),
+                "private",
+                "filename-collision",
+                1,
+            )
             .unwrap();
         let err = store
             .load(&loc(), colliding)

@@ -2190,6 +2190,9 @@ struct DPrThreadCreate {
 impl Handler for DPrThreadCreate {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let body = ctx.request.json_body()?;
+        let operation_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
         let vm = self
             .be
             .create_thread(
@@ -2197,6 +2200,7 @@ impl Handler for DPrThreadCreate {
                 region_of(ctx),
                 param(ctx, "repo")?,
                 num_param(ctx, "n")?,
+                &operation_nonce,
                 &body,
                 ctx.principal,
             )
@@ -2214,6 +2218,9 @@ struct DPrThreadComment {
 impl Handler for DPrThreadComment {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let body = ctx.request.json_body()?;
+        let operation_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
         let vm = self
             .be
             .add_thread_comment(
@@ -2225,6 +2232,7 @@ impl Handler for DPrThreadComment {
                 )
                 .for_pr(num_param(ctx, "n")?),
                 param(ctx, "tid")?,
+                &operation_nonce,
                 &body,
             )
             .map_err(map_durable_err)?;
@@ -5339,6 +5347,7 @@ mod pr_thread_tests {
                 REGION,
                 SLUG,
                 1,
+                "new-side-anchor",
                 &json!({
                     "body_md": "new-side note",
                     "anchor": { "path": "file.txt", "line": 4, "side": "new" },
@@ -5356,6 +5365,7 @@ mod pr_thread_tests {
                 REGION,
                 SLUG,
                 1,
+                "old-side-anchor",
                 &json!({
                     "body_md": "old-side note",
                     "anchor": { "path": "file.txt", "line": 2, "side": "old" },
@@ -5365,13 +5375,24 @@ mod pr_thread_tests {
             .expect("a displayed old-side line resolves");
         assert_eq!(old_side["anchor"]["side"], "old");
 
-        for invalid in [
+        for (index, invalid) in [
             json!({ "body_md": "missing side", "anchor": { "path": "file.txt", "line": 2 } }),
             json!({ "body_md": "stale line", "anchor": { "path": "file.txt", "line": 99, "side": "new" } }),
             json!({ "body_md": "unsafe path", "anchor": { "path": "../secret", "line": 1, "side": "new" } }),
-        ] {
+        ]
+        .into_iter()
+        .enumerate()
+        {
             let error = be
-                .create_thread(TENANT, REGION, SLUG, 1, &invalid, &reviewer)
+                .create_thread(
+                    TENANT,
+                    REGION,
+                    SLUG,
+                    1,
+                    &format!("invalid-anchor-{index}"),
+                    &invalid,
+                    &reviewer,
+                )
                 .expect_err("malformed or stale anchor must be rejected");
             assert!(error.to_string().contains("anchor"), "got {error:?}");
         }
