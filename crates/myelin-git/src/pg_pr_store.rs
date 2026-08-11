@@ -3510,14 +3510,10 @@ mod tests {
         let repo = "core";
 
         let abort_op = PrOperationId::parse("abort-open").unwrap();
+        let mut abort_record = record(&"1".repeat(40), "abort-secret", repo);
+        abort_record.body_md = Some("Closes ENG-41".into());
         assert!(store
-            .open_then_abort_for_test(
-                &scope_a,
-                repo,
-                record(&"1".repeat(40), "abort-secret", repo),
-                &abort_op,
-                &actor,
-            )
+            .open_then_abort_for_test(&scope_a, repo, abort_record, &abort_op, &actor,)
             .is_err());
         assert!(store
             .list_bounded(
@@ -3537,6 +3533,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(abort_events, 0, "aborted open emitted no ghost event");
+        let abort_edges: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox WHERE envelope->>'tenant'=$1 AND envelope->>'type_'=$2",
+        )
+        .bind(&tenant_a)
+        .bind(crate::typed_edges::REFS_EDGE_CREATED)
+        .fetch_one(&admin)
+        .await
+        .unwrap();
+        assert_eq!(abort_edges, 0, "aborted open emitted no ghost edge");
 
         let projection_slug = format!("projection-admission-{suffix}");
         let projection_loc = RepoLoc::new(&tenant_a, &region, &projection_slug);
@@ -3745,9 +3750,12 @@ mod tests {
             )
             .unwrap();
         let lifecycle_events: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM outbox WHERE envelope->>'tenant'=$1 AND envelope->>'type_' LIKE 'git.pr.%'",
+            "SELECT count(*) FROM outbox
+              WHERE envelope->>'tenant'=$1
+                AND (envelope->>'type_' LIKE 'git.pr.%' OR envelope->>'type_'=$2)",
         )
         .bind(&tenant_a)
+        .bind(GIT_REVIEW_SUBMITTED)
         .fetch_one(&admin)
         .await
         .unwrap();

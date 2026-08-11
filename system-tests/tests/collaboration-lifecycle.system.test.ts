@@ -1422,6 +1422,50 @@ command = ["true"]
     await awaitBacklinkGone(issueRef, pageRef, "links");
   });
 
+  test("lets a pull request promise issue delivery without an integration key", async () => {
+    const issue = await awaitActiveIssue(uniqueName("Deliver the promised change"));
+    const issueKey = string(issue.key, "promised delivery issue key");
+    const issueRef = string(issue.ref, "promised delivery issue ref");
+    const slug = uniqueName("promised-delivery");
+    const project = new GitProject(slug, systemClient);
+    await project.create();
+    await project.writeFile("main", "README.md", `# ${slug}\n`);
+    const headOid = (await project.writeFile(
+      "feature/promised-delivery",
+      "delivery.txt",
+      "This change belongs to its delivery issue.\n",
+      { startRef: "main" },
+    )).commitOid;
+
+    const opened = await systemClient.json(`${project.path}/prs`, {
+      method: "POST",
+      body: {
+        title: "Carry the promised delivery",
+        body_md: `The implementation and its work item stay navigable.\n\nCloses ${issueKey}\n`,
+        base_ref: "refs/heads/main",
+        head_ref: "refs/heads/feature/promised-delivery",
+        head_oid: headOid,
+        reviewers: [],
+      },
+      expectedStatus: 201,
+    });
+    const pullRequest = record(
+      record(opened.body.applied, "promised delivery PR receipt").pr,
+      "promised delivery pull request",
+    );
+    const pullRequestNumber = integer(pullRequest.number, "promised delivery PR number");
+    const pullRequestRef =
+      `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`;
+
+    expect(await awaitBacklink(issueRef, pullRequestRef, "closes")).toMatchObject({
+      ref: pullRequestRef,
+      root_ref: pullRequestRef,
+      target_ref: issueRef,
+      relation: "closes",
+      relation_class: "lifecycle",
+    });
+  });
+
   test("moves an issue through authorization, discovery, and completion", async () => {
     const title = uniqueName("Ship the backend lifecycle suite");
     const proposed = await systemClient.json("/v1/issues", {

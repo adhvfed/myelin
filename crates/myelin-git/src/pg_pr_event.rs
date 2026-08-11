@@ -14,6 +14,7 @@ use crate::notif_rules::{
     review_request_opened_signal_drafts, review_request_resolved_signal_draft,
 };
 use crate::pr_store::PrRecord;
+use crate::typed_edges::{closes_issue_targets, emit_lifecycle_edges};
 
 fn pg_query(action: &'static str) -> myelin_storage::PgError {
     myelin_storage::PgError::Query(action.into())
@@ -126,17 +127,31 @@ pub(crate) async fn co_commit_event(
     } else {
         Vec::new()
     };
-    if !signal_drafts.is_empty() {
-        let mut signal_tx = OutboxTransaction::detached(minter, signal_ctx);
+    let closes_targets = if event_type == GIT_PR_OPENED {
+        closes_issue_targets(&loc.tenant, record.body_md.as_deref().unwrap_or_default())
+            .map_err(|_| pg_query("parse PR lifecycle trailers"))?
+    } else {
+        Vec::new()
+    };
+    if !signal_drafts.is_empty() || !closes_targets.is_empty() {
+        let mut derived_tx = OutboxTransaction::detached(minter, signal_ctx);
         for draft in signal_drafts {
-            signal_tx
+            derived_tx
                 .emit(draft, Some(&lifecycle))
                 .map_err(|_| pg_query("stage PR review-request signal"))?;
         }
+        emit_lifecycle_edges(
+            &mut derived_tx,
+            &lifecycle.subject,
+            &closes_targets,
+            &[],
+            &lifecycle,
+        )
+        .map_err(|_| pg_query("stage PR lifecycle reference edges"))?;
         rows.extend(
-            signal_tx
+            derived_tx
                 .into_staged_rows()
-                .map_err(|_| pg_query("encode PR review-request signals"))?,
+                .map_err(|_| pg_query("encode PR derived events"))?,
         );
     }
     PgRelay::co_commit_rows_in_tx(conn, &rows).await

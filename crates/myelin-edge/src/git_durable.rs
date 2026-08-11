@@ -720,9 +720,7 @@ impl DurableGitBackend {
             creator.region.0.as_str(),
             creator.principal_id.0.as_str(),
         ))
-        .map_err(|error| {
-            DurableError::Git(format!("encode repository creation owner: {error}"))
-        })?;
+        .map_err(|error| DurableError::Git(format!("encode repository creation owner: {error}")))?;
         let claim = match self.store.claim_repo_creation(&loc, &owner)? {
             RepoCreationClaim::Existing(_) => return Ok(false),
             RepoCreationClaim::Acquired(claim) => claim,
@@ -1910,6 +1908,15 @@ impl DurableGitBackend {
             .or_else(|| body.get("body"))
             .and_then(Value::as_str)
             .map(str::to_string);
+        if body_md
+            .as_ref()
+            .is_some_and(|body| body.len() > myelin_git::typed_edges::MAX_CLOSES_MESSAGE_BYTES)
+        {
+            return Err(DurableError::Git(format!(
+                "open-PR `body_md` exceeds {} bytes",
+                myelin_git::typed_edges::MAX_CLOSES_MESSAGE_BYTES
+            )));
+        }
         let number = if self.pg_prs.is_some() {
             0
         } else {

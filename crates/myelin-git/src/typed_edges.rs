@@ -7,6 +7,8 @@ pub const REFS_EDGE_CREATED: &str = "refs.edge.created";
 
 pub const REL_CLASS_LIFECYCLE: &str = "lifecycle";
 
+pub const MAX_CLOSES_MESSAGE_BYTES: usize = 64 * 1024;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LifecycleRel {
     Closes,
@@ -34,11 +36,10 @@ pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> Aggrega
 }
 
 pub fn parse_closes_trailers(message: &str) -> Result<Vec<String>, TrailerParseError> {
-    const MAX_MESSAGE_BYTES: usize = 64 * 1024;
     const MAX_KEYS: usize = 100;
     const MAX_KEY_BYTES: usize = 256;
     const MAX_TOTAL_KEY_BYTES: usize = 8 * 1024;
-    if message.len() > MAX_MESSAGE_BYTES {
+    if message.len() > MAX_CLOSES_MESSAGE_BYTES {
         return Err(TrailerParseError::LimitExceeded("message bytes"));
     }
     let mut keys: Vec<String> = Vec::new();
@@ -72,6 +73,35 @@ pub fn parse_closes_trailers(message: &str) -> Result<Vec<String>, TrailerParseE
         }
     }
     Ok(keys)
+}
+
+pub fn closes_issue_targets(
+    tenant: &str,
+    message: &str,
+) -> Result<Vec<ArtifactRef>, TrailerParseError> {
+    Ok(parse_closes_trailers(message)?
+        .into_iter()
+        .filter_map(|key| canonical_issue_key(&key))
+        .map(|key| ArtifactRef(format!("myelin://{tenant}/issue/issue/{key}")))
+        .collect())
+}
+
+fn canonical_issue_key(value: &str) -> Option<String> {
+    let value = value.to_ascii_uppercase();
+    let (prefix, sequence) = value.rsplit_once('-')?;
+    if prefix.is_empty()
+        || prefix.len() > 32
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return None;
+    }
+    let sequence_number = sequence.parse::<u64>().ok()?;
+    if sequence_number == 0 || sequence_number.to_string() != sequence {
+        return None;
+    }
+    Some(value)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,6 +246,20 @@ mod tests {
                 .unwrap()
                 .is_empty(),
             "an undelimited `Closesthebug` is NOT the trailer keyword"
+        );
+    }
+
+    #[test]
+    fn closes_targets_keep_only_canonical_issue_keys_and_normalize_human_case() {
+        let targets = closes_issue_targets(
+            "acme",
+            "Closes eng-41, ENG-0042, this-discussion, ENG-0\nCloses PLATFORM-7\n",
+        )
+        .unwrap();
+        assert_eq!(
+            targets,
+            vec![issue("ENG-41"), issue("PLATFORM-7")],
+            "prose and non-canonical sequence spellings never become dangling graph targets"
         );
     }
 
