@@ -871,6 +871,12 @@ fn binding_json(tenant: &str, binding: &DurableAgentTriggerBinding) -> Value {
         "require_human_approval": binding.require_human_approval,
         "state": binding.state,
         "created_at": binding.created_at,
+        "last_evaluation_error": binding.last_evaluation_error.as_ref().map(|diagnostic| json!({
+            "code": diagnostic.code.token(),
+            "detail": diagnostic.detail,
+            "event_id": diagnostic.event_id,
+            "event_recorded_at": diagnostic.event_recorded_at,
+        })),
     })
 }
 

@@ -43,6 +43,15 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
         output,
         "  firings: {used}/{maximum}; per-run budget: {budget} minor-units"
     );
+    if let Some((code, detail, event_id, event_recorded_at)) = evaluation_diagnostic(automation) {
+        let _ = writeln!(
+            output,
+            "  last evaluation error [{code}]: {} (event {} at {})",
+            terminal_safe_single_line(detail),
+            terminal_safe_single_line(event_id),
+            terminal_safe_single_line(event_recorded_at),
+        );
+    }
     output.push_str(
         "  Myelin owns the integration credentials and gives each run only its governed tools.\n",
     );
@@ -193,12 +202,26 @@ fn render_automation(value: &Value) -> Option<String> {
     {
         return None;
     }
+    let diagnostic = evaluation_diagnostic(value)
+        .map(|(code, _, _, _)| format!("  [evaluation:{code}]"))
+        .unwrap_or_default();
     Some(format!(
-        "{} -> agent:{}  [{}]  {}",
+        "{} -> agent:{}  [{}]  {}{}",
         terminal_safe_single_line(event_type),
         terminal_safe_single_line(agent_id),
         terminal_safe_single_line(state),
         terminal_safe_single_line(reference),
+        diagnostic,
+    ))
+}
+
+fn evaluation_diagnostic(value: &Value) -> Option<(&str, &str, &str, &str)> {
+    let diagnostic = value.get("last_evaluation_error")?.as_object()?;
+    Some((
+        diagnostic.get("code")?.as_str()?,
+        diagnostic.get("detail")?.as_str()?,
+        diagnostic.get("event_id")?.as_str()?,
+        diagnostic.get("event_recorded_at")?.as_str()?,
     ))
 }
 
@@ -308,6 +331,27 @@ mod tests {
         assert!(output.contains("task: Triage CI.\\nOpen one issue."));
         assert!(output.contains("firings: 1/10; per-run budget: 250000 minor-units"));
         assert!(output.contains("Myelin owns the integration credentials"));
+    }
+
+    #[test]
+    fn automation_output_explains_the_last_rule_evaluation_failure() {
+        let mut automation = automation();
+        automation["last_evaluation_error"] = json!({
+            "code": "type_error",
+            "detail": "comparison is not defined over the operand types",
+            "event_id": "push-main-42",
+            "event_recorded_at": "2026-08-10T12:00:00Z",
+        });
+        let output = render_response(&json!({
+            "durable": true,
+            "trigger": automation,
+        }))
+        .unwrap();
+
+        assert!(output.contains("[evaluation:type_error]"));
+        assert!(output.contains("last evaluation error [type_error]"));
+        assert!(output.contains("comparison is not defined over the operand types"));
+        assert!(output.contains("event push-main-42 at 2026-08-10T12:00:00Z"));
     }
 
     #[test]

@@ -3,9 +3,9 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use myelin_events::{Backoff, EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
 use myelin_identity::SetExpr;
-use myelin_query::{EventMatcher, RelMembership};
+use myelin_query::{EvalError, EventMatcher, RelMembership};
 use myelin_storage::{
-    DurableAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
+    AgentTriggerEvaluationErrorCode, DurableAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
     MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT,
 };
 
@@ -27,6 +27,16 @@ pub trait TriggerBindingStore: Send + Sync {
         envelope: &EventEnvelope,
         recorded_at: DateTime<Utc>,
     ) -> Result<ReserveAgentTriggerFiringOutcome, String>;
+
+    fn record_evaluation_error(
+        &self,
+        tenant: &str,
+        binding_id: &str,
+        event_id: &str,
+        code: AgentTriggerEvaluationErrorCode,
+        detail: &str,
+        event_recorded_at: DateTime<Utc>,
+    ) -> Result<(), String>;
 }
 
 pub trait TriggerOwnerVisibility: Send + Sync {
@@ -102,13 +112,6 @@ impl GovernedTriggerConsumer {
             .with_timezone(&Utc);
 
         for binding in bindings {
-            let matcher: EventMatcher =
-                serde_json::from_value(binding.matcher.clone()).map_err(|_| {
-                    TriggerDeliveryError::Malformed(format!(
-                        "trigger binding {} contains an invalid compiled matcher",
-                        binding.binding_id
-                    ))
-                })?;
             if !self
                 .visibility
                 .can_view(&binding, event)
@@ -116,10 +119,28 @@ impl GovernedTriggerConsumer {
             {
                 continue;
             }
+            let matcher: EventMatcher = match serde_json::from_value(binding.matcher.clone()) {
+                Ok(matcher) => matcher,
+                Err(_) => {
+                    self.record_evaluation_error(
+                        &binding,
+                        event,
+                        recorded_at,
+                        AgentTriggerEvaluationErrorCode::InvalidMatcher,
+                        "stored matcher could not be decoded; recreate the automation",
+                    )?;
+                    continue;
+                }
+            };
             let no_relations = no_relation as fn(&RelMembership) -> bool;
-            let matches = matcher
-                .matches(event, &SetExpr::All, &no_relations)
-                .unwrap_or(false);
+            let matches = match matcher.matches(event, &SetExpr::All, &no_relations) {
+                Ok(matches) => matches,
+                Err(error) => {
+                    let (code, detail) = evaluation_diagnostic(&error);
+                    self.record_evaluation_error(&binding, event, recorded_at, code, &detail)?;
+                    continue;
+                }
+            };
             if !matches {
                 continue;
             }
@@ -141,6 +162,26 @@ impl GovernedTriggerConsumer {
             }
         }
         Ok(())
+    }
+
+    fn record_evaluation_error(
+        &self,
+        binding: &DurableAgentTriggerBinding,
+        event: &EventEnvelope,
+        recorded_at: DateTime<Utc>,
+        code: AgentTriggerEvaluationErrorCode,
+        detail: &str,
+    ) -> Result<(), TriggerDeliveryError> {
+        self.store
+            .record_evaluation_error(
+                &self.tenant,
+                &binding.binding_id,
+                &event.event_id.0,
+                code,
+                &bounded_evaluation_detail(detail),
+                recorded_at,
+            )
+            .map_err(|_| TriggerDeliveryError::Unavailable)
     }
 }
 
@@ -166,6 +207,28 @@ impl EventHandler for GovernedTriggerConsumer {
 
 fn no_relation(_: &RelMembership) -> bool {
     false
+}
+
+fn evaluation_diagnostic(error: &EvalError) -> (AgentTriggerEvaluationErrorCode, String) {
+    let code = match error {
+        EvalError::MissingContext { .. } => AgentTriggerEvaluationErrorCode::MissingContext,
+        EvalError::TypeError => AgentTriggerEvaluationErrorCode::TypeError,
+        EvalError::CostExceeded => AgentTriggerEvaluationErrorCode::CostExceeded,
+        EvalError::NotCompiled => AgentTriggerEvaluationErrorCode::NotCompiled,
+    };
+    (code, error.to_string())
+}
+
+fn bounded_evaluation_detail(detail: &str) -> String {
+    const MAX_BYTES: usize = 1024;
+    if detail.len() <= MAX_BYTES {
+        return detail.to_string();
+    }
+    let mut end = MAX_BYTES;
+    while !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    detail[..end].to_string()
 }
 
 enum TriggerDeliveryError {

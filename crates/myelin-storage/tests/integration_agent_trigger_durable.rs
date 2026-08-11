@@ -5,8 +5,8 @@ use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus, Run
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
     all_durable_migrations, AgentTriggerApprovalDecision, AgentTriggerCapacityScope,
-    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerLifecycleAction,
-    AgentTriggerStartRequest, ChangeAgentTriggerApprovalOutcome,
+    AgentTriggerClaimRequest, AgentTriggerEvaluationErrorCode, AgentTriggerFiringState,
+    AgentTriggerLifecycleAction, AgentTriggerStartRequest, ChangeAgentTriggerApprovalOutcome,
     ChangeAgentTriggerLifecycleOutcome, CreateAgentTriggerBindingOutcome,
     DurableAgentTriggerBacking, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
     StartAgentTriggerFiringOutcome, SubstrateProvider, TerminalizeAgentTriggerClaimOutcome,
@@ -1095,6 +1095,93 @@ async fn one_poison_firing_becomes_explainable_history_without_harming_the_queue
     assert_eq!(history[0].state, AgentTriggerFiringState::Terminal);
     assert_eq!(history[0].run_id, None);
     assert_eq!(history[0].terminal_reason.as_deref(), Some(reason));
+
+    clean_tenant(&app, &tenant).await;
+}
+
+#[tokio::test]
+async fn an_automation_owner_sees_the_newest_rule_evaluation_error() {
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("open the migration provider");
+    admin
+        .migrate_foundation()
+        .await
+        .expect("foundation is present");
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .expect("the automation diagnostic is part of the durable platform");
+
+    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+        .await
+        .expect("open the constrained app provider");
+    let tenant = unique_tenant();
+    let agent_id = Uuid::new_v4();
+    seed_people_and_agent(&app, &tenant, agent_id, "hosted:luna").await;
+    let triggers = DurableAgentTriggerBacking::new(app.clone());
+    let mut proposal = red_mainline_binding(agent_id);
+    proposal.binding_id = Uuid::new_v4();
+    proposal.client_nonce = "visible-evaluation-diagnostic".into();
+    triggers
+        .create(&tenant, proposal.clone())
+        .await
+        .expect("the founder creates one narrow automation");
+
+    let older = sqlx::types::chrono::DateTime::parse_from_rfc3339("2026-08-10T08:00:01Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    let newer = sqlx::types::chrono::DateTime::parse_from_rfc3339("2026-08-10T08:00:02Z")
+        .unwrap()
+        .with_timezone(&Utc);
+    assert!(triggers
+        .record_evaluation_error(
+            &tenant,
+            proposal.binding_id,
+            "event-newer",
+            AgentTriggerEvaluationErrorCode::TypeError,
+            "comparison is not defined over the operand types",
+            newer,
+        )
+        .await
+        .expect("the evaluation failure is recorded"));
+    assert!(!triggers
+        .record_evaluation_error(
+            &tenant,
+            proposal.binding_id,
+            "event-older",
+            AgentTriggerEvaluationErrorCode::MissingContext,
+            "an older delivery cannot replace a newer diagnosis",
+            older,
+        )
+        .await
+        .expect("an older delivery is ignored deterministically"));
+
+    let binding = triggers
+        .get_for_owner(&tenant, "founder", proposal.binding_id)
+        .await
+        .expect("the owner can inspect the automation")
+        .expect("the automation remains present");
+    let diagnostic = binding
+        .last_evaluation_error
+        .expect("the owner receives an actionable evaluation diagnostic");
+    assert_eq!(diagnostic.code, AgentTriggerEvaluationErrorCode::TypeError);
+    assert_eq!(diagnostic.event_id, "event-newer");
+    assert_eq!(
+        diagnostic.detail,
+        "comparison is not defined over the operand types"
+    );
+    assert!(diagnostic
+        .event_recorded_at
+        .starts_with("2026-08-10T08:00:02"));
+    assert!(
+        triggers
+            .get_for_owner(&tenant, "reviewer", proposal.binding_id)
+            .await
+            .expect("another human gets a scoped answer")
+            .is_none(),
+        "diagnostics follow automation ownership rather than becoming tenant-wide telemetry"
+    );
 
     clean_tenant(&app, &tenant).await;
 }

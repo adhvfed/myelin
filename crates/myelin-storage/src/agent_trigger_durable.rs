@@ -3,21 +3,22 @@ mod schema;
 
 pub use model::{
     AgentTriggerApprovalDecision, AgentTriggerApprovalOutcome, AgentTriggerCapacityScope,
-    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerLifecycleAction,
-    AgentTriggerLifecycleOutcome, AgentTriggerRunOutcome, AgentTriggerStartRequest,
-    ChangeAgentTriggerApprovalOutcome, ChangeAgentTriggerLifecycleOutcome,
-    ClaimedAgentTriggerFiring, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding,
-    DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
-    ReservedAgentTriggerFiring, StartAgentTriggerFiringOutcome, StartedAgentTriggerRun,
-    TerminalizeAgentTriggerClaimOutcome, MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT,
-    MAX_ACTIVE_AGENT_TRIGGERS_PER_OWNER_EVENT, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
-    MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    AgentTriggerClaimRequest, AgentTriggerEvaluationDiagnostic, AgentTriggerEvaluationErrorCode,
+    AgentTriggerFiringState, AgentTriggerLifecycleAction, AgentTriggerLifecycleOutcome,
+    AgentTriggerRunOutcome, AgentTriggerStartRequest, ChangeAgentTriggerApprovalOutcome,
+    ChangeAgentTriggerLifecycleOutcome, ClaimedAgentTriggerFiring,
+    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
+    NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
+    StartAgentTriggerFiringOutcome, StartedAgentTriggerRun, TerminalizeAgentTriggerClaimOutcome,
+    MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT, MAX_ACTIVE_AGENT_TRIGGERS_PER_OWNER_EVENT,
+    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use schema::{
-    agent_trigger_durable_migrations, agent_trigger_terminal_reason_migrations,
-    AGENT_TRIGGER_APPROVAL_MIGRATION, AGENT_TRIGGER_BUDGET_MIGRATION,
-    AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION, AGENT_TRIGGER_RLS_POLICY,
-    AGENT_TRIGGER_RUN_MIGRATION, AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
+    agent_trigger_durable_migrations, agent_trigger_evaluation_diagnostic_migrations,
+    agent_trigger_terminal_reason_migrations, AGENT_TRIGGER_APPROVAL_MIGRATION,
+    AGENT_TRIGGER_BUDGET_MIGRATION, AGENT_TRIGGER_CLAIM_MIGRATION,
+    AGENT_TRIGGER_EVALUATION_DIAGNOSTIC_MIGRATION, AGENT_TRIGGER_MIGRATION,
+    AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION, AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
 };
 
 use sqlx::types::chrono::{DateTime, Utc};
@@ -239,7 +240,10 @@ impl DurableAgentTriggerBacking {
                                 b.delegation_caveats, b.budget_minor_units, \
                                 b.max_firings, b.firings_used, \
                                 b.max_causal_depth, b.require_no_personal_data, \
-                                b.require_human_approval, b.state, b.created_at \
+                                b.require_human_approval, b.state, b.created_at, \
+                                b.last_evaluation_error_code, \
+                                b.last_evaluation_error_detail, \
+                                b.last_evaluation_error_event_id, b.last_evaluation_error_at \
                            FROM agent_trigger_binding b \
                            JOIN principal owner ON owner.tenant_id = b.tenant_id \
                             AND owner.region = b.region \
@@ -267,6 +271,50 @@ impl DurableAgentTriggerBacking {
             .await
     }
 
+    pub async fn record_evaluation_error(
+        &self,
+        tenant: &str,
+        binding_id: Uuid,
+        event_id: &str,
+        code: AgentTriggerEvaluationErrorCode,
+        detail: &str,
+        event_recorded_at: DateTime<Utc>,
+    ) -> Result<bool, ProviderError> {
+        let tenant = tenant.to_string();
+        let region = self.provider.config().region.clone();
+        let event_id = event_id.to_string();
+        let code = code.token().to_string();
+        let detail = detail.to_string();
+        self.provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let updated = sqlx::query(
+                        "UPDATE agent_trigger_binding \
+                            SET last_evaluation_error_code = $5, \
+                                last_evaluation_error_detail = $6, \
+                                last_evaluation_error_event_id = $4, \
+                                last_evaluation_error_at = $7 \
+                          WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
+                            AND (last_evaluation_error_at IS NULL \
+                              OR (last_evaluation_error_at, last_evaluation_error_event_id) \
+                                 <= ($7, $4))",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(binding_id)
+                    .bind(&event_id)
+                    .bind(&code)
+                    .bind(&detail)
+                    .bind(event_recorded_at)
+                    .execute(&mut *conn)
+                    .await
+                    .map_err(query_error("record agent trigger evaluation error"))?;
+                    Ok(updated.rows_affected() == 1)
+                })
+            })
+            .await
+    }
+
     pub async fn list_for_owner(
         &self,
         tenant: &str,
@@ -286,7 +334,9 @@ impl DurableAgentTriggerBacking {
                                 event_type, matcher, task, delegation_caveats, \
                                 budget_minor_units, max_firings, \
                                 firings_used, max_causal_depth, require_no_personal_data, \
-                                require_human_approval, state, created_at \
+                                require_human_approval, state, created_at, \
+                                last_evaluation_error_code, last_evaluation_error_detail, \
+                                last_evaluation_error_event_id, last_evaluation_error_at \
                            FROM agent_trigger_binding \
                           WHERE tenant_id = $1 AND region = $2 AND owner_principal_id = $3 \
                             AND ($4::uuid IS NULL OR binding_id > $4::uuid) \
@@ -322,7 +372,9 @@ impl DurableAgentTriggerBacking {
                         "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
                                 event_type, matcher, task, delegation_caveats, \
                                 budget_minor_units, max_firings, firings_used, max_causal_depth, \
-                                require_no_personal_data, require_human_approval, state, created_at \
+                                require_no_personal_data, require_human_approval, state, created_at, \
+                                last_evaluation_error_code, last_evaluation_error_detail, \
+                                last_evaluation_error_event_id, last_evaluation_error_at \
                            FROM agent_trigger_binding \
                           WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
                             AND owner_principal_id = $4",
@@ -394,7 +446,9 @@ impl DurableAgentTriggerBacking {
             "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
                     event_type, matcher, task, delegation_caveats, \
                     budget_minor_units, max_firings, firings_used, max_causal_depth, \
-                    require_no_personal_data, require_human_approval, state, created_at \
+                    require_no_personal_data, require_human_approval, state, created_at, \
+                    last_evaluation_error_code, last_evaluation_error_detail, \
+                    last_evaluation_error_event_id, last_evaluation_error_at \
                FROM agent_trigger_binding \
               WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
                 AND owner_principal_id = $4 FOR UPDATE",
@@ -1110,7 +1164,9 @@ async fn binding_for_nonce_on_connection(
         "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
                 event_type, matcher, task, delegation_caveats, \
                 budget_minor_units, max_firings, firings_used, max_causal_depth, \
-                require_no_personal_data, require_human_approval, state, created_at \
+                require_no_personal_data, require_human_approval, state, created_at, \
+                last_evaluation_error_code, last_evaluation_error_detail, \
+                last_evaluation_error_event_id, last_evaluation_error_at \
            FROM agent_trigger_binding \
           WHERE tenant_id = $1 AND region = $2 \
             AND owner_principal_id = $3 AND client_nonce = $4",
@@ -1244,7 +1300,39 @@ fn binding_from_row(row: &sqlx::postgres::PgRow) -> Result<DurableAgentTriggerBi
             .try_get::<DateTime<Utc>, _>("created_at")
             .map_err(row_error("created_at"))?
             .to_rfc3339(),
+        last_evaluation_error: evaluation_diagnostic_from_row(row)?,
     })
+}
+
+fn evaluation_diagnostic_from_row(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<AgentTriggerEvaluationDiagnostic>, PgError> {
+    let code = row
+        .try_get::<Option<String>, _>("last_evaluation_error_code")
+        .map_err(row_error("last_evaluation_error_code"))?;
+    let detail = row
+        .try_get::<Option<String>, _>("last_evaluation_error_detail")
+        .map_err(row_error("last_evaluation_error_detail"))?;
+    let event_id = row
+        .try_get::<Option<String>, _>("last_evaluation_error_event_id")
+        .map_err(row_error("last_evaluation_error_event_id"))?;
+    let event_recorded_at = row
+        .try_get::<Option<DateTime<Utc>>, _>("last_evaluation_error_at")
+        .map_err(row_error("last_evaluation_error_at"))?;
+    match (code, detail, event_id, event_recorded_at) {
+        (None, None, None, None) => Ok(None),
+        (Some(code), Some(detail), Some(event_id), Some(event_recorded_at)) => {
+            Ok(Some(AgentTriggerEvaluationDiagnostic {
+                code: AgentTriggerEvaluationErrorCode::parse(&code)?,
+                detail,
+                event_id,
+                event_recorded_at: event_recorded_at.to_rfc3339(),
+            }))
+        }
+        _ => Err(PgError::Query(
+            "agent trigger has an incomplete evaluation diagnostic".into(),
+        )),
+    }
 }
 
 async fn load_firing(

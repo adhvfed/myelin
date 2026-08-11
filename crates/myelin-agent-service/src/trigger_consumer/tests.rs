@@ -8,8 +8,8 @@ use myelin_events::{
 use myelin_identity::{Literal, ObjectType, Principal, PrincipalId, PrincipalKind};
 use myelin_query::{CmpOp, EventMatcher, Expr, Predicate};
 use myelin_storage::{
-    AgentTriggerFiringState, DurableAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
-    ReservedAgentTriggerFiring,
+    AgentTriggerEvaluationErrorCode, AgentTriggerFiringState, DurableAgentTriggerBinding,
+    ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
 };
 use myelin_tenancy::{Region, TenantId};
 
@@ -20,6 +20,7 @@ use super::{
 struct RecordingStore {
     bindings: Vec<DurableAgentTriggerBinding>,
     reservations: Mutex<Vec<(String, String)>>,
+    diagnostics: Mutex<Vec<(String, String, AgentTriggerEvaluationErrorCode, String)>>,
 }
 
 impl TriggerBindingStore for RecordingStore {
@@ -64,6 +65,24 @@ impl TriggerBindingStore for RecordingStore {
                 state,
             },
         ))
+    }
+
+    fn record_evaluation_error(
+        &self,
+        _tenant: &str,
+        binding_id: &str,
+        event_id: &str,
+        code: AgentTriggerEvaluationErrorCode,
+        detail: &str,
+        _event_recorded_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        self.diagnostics.lock().unwrap().push((
+            binding_id.into(),
+            event_id.into(),
+            code,
+            detail.into(),
+        ));
+        Ok(())
     }
 }
 
@@ -146,6 +165,7 @@ fn binding(branch: &str) -> DurableAgentTriggerBinding {
         require_human_approval: false,
         state: "active".into(),
         created_at: "2026-08-10T08:00:00Z".into(),
+        last_evaluation_error: None,
     }
 }
 
@@ -182,6 +202,7 @@ fn one_visible_red_mainline_event_reserves_one_exact_binding() {
     let store = Arc::new(RecordingStore {
         bindings: vec![binding("refs/heads/main")],
         reservations: Mutex::new(Vec::new()),
+        diagnostics: Mutex::new(Vec::new()),
     });
     let consumer = GovernedTriggerConsumer::new(
         "acme",
@@ -218,6 +239,7 @@ fn green_feature_and_revoked_visibility_are_quiet() {
         let store = Arc::new(RecordingStore {
             bindings: vec![binding("refs/heads/main")],
             reservations: Mutex::new(Vec::new()),
+            diagnostics: Mutex::new(Vec::new()),
         });
         let consumer = GovernedTriggerConsumer::new(
             "acme",
@@ -260,6 +282,7 @@ fn one_imperfect_rule_cannot_starve_another_rule() {
     let store = Arc::new(RecordingStore {
         bindings: vec![brittle, healthy],
         reservations: Mutex::new(Vec::new()),
+        diagnostics: Mutex::new(Vec::new()),
     });
     let consumer = GovernedTriggerConsumer::new(
         "acme",
@@ -284,6 +307,16 @@ fn one_imperfect_rule_cannot_starve_another_rule() {
         )],
         "a rule that cannot evaluate fails closed by itself while healthy rules still run"
     );
+    assert_eq!(
+        *store.diagnostics.lock().unwrap(),
+        vec![(
+            "4bf441cb-33e1-49e1-91bc-bbb8b5a5217d".into(),
+            "red-main-2".into(),
+            AgentTriggerEvaluationErrorCode::MissingContext,
+            "predicate references unbound variable `payload.field_this_event_does_not_carry` (missing context)".into(),
+        )],
+        "the owner gets one exact explanation without starving a healthy rule"
+    );
 }
 
 struct FanoutStore(usize);
@@ -307,6 +340,18 @@ impl TriggerBindingStore for FanoutStore {
         _recorded_at: DateTime<Utc>,
     ) -> Result<ReserveAgentTriggerFiringOutcome, String> {
         Ok(ReserveAgentTriggerFiringOutcome::BudgetExhausted)
+    }
+
+    fn record_evaluation_error(
+        &self,
+        _tenant: &str,
+        _binding_id: &str,
+        _event_id: &str,
+        _code: AgentTriggerEvaluationErrorCode,
+        _detail: &str,
+        _event_recorded_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        Ok(())
     }
 }
 
@@ -346,6 +391,7 @@ fn a_parked_firing_becomes_one_actionable_approval_for_its_owner() {
     let store = Arc::new(RecordingStore {
         bindings: vec![approval_binding],
         reservations: Mutex::new(Vec::new()),
+        diagnostics: Mutex::new(Vec::new()),
     });
     let approvals = Arc::new(RecordingApprovalInbox::default());
     let consumer = GovernedTriggerConsumer::new(

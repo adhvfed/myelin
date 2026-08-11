@@ -50,6 +50,7 @@ pub enum TriggerVisibilityRule {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TriggerSubjectAddress {
     SubjectId,
+    GitRefRepository,
     IssueKey,
 }
 
@@ -61,6 +62,12 @@ pub fn trigger_visibility_rule(subject_type: &str) -> Option<TriggerVisibilityRu
             identity_object_type: "repo",
             permission: "pull",
             address: TriggerSubjectAddress::SubjectId,
+        }),
+        "ref" => Some(TriggerVisibilityRule::Direct {
+            subsystem: "git",
+            identity_object_type: "repo",
+            permission: "pull",
+            address: TriggerSubjectAddress::GitRefRepository,
         }),
         "pr" => Some(TriggerVisibilityRule::Direct {
             subsystem: "git",
@@ -166,8 +173,17 @@ impl DurableOwnerVisibility {
         identity_object_type: &str,
         address: TriggerSubjectAddress,
     ) -> Result<Option<String>, String> {
-        if address == TriggerSubjectAddress::SubjectId {
-            return Ok(Some(format!("{identity_object_type}:{subject_id}")));
+        match address {
+            TriggerSubjectAddress::SubjectId => {
+                return Ok(Some(format!("{identity_object_type}:{subject_id}")));
+            }
+            TriggerSubjectAddress::GitRefRepository => {
+                return Ok(git_ref_repository_identity_object(
+                    subject_id,
+                    identity_object_type,
+                ));
+            }
+            TriggerSubjectAddress::IssueKey => {}
         }
         let tenant = tenant.to_string();
         let region = self.region.clone();
@@ -195,6 +211,15 @@ impl DurableOwnerVisibility {
             .map_err(|_| "trigger issue lookup is unavailable".to_string())?;
         Ok(issue_id.map(|id| format!("{identity_object_type}:{id}")))
     }
+}
+
+fn git_ref_repository_identity_object(
+    subject_id: &str,
+    identity_object_type: &str,
+) -> Option<String> {
+    myelin_git::receive_pack::GitRefEventKey::parse_id(subject_id)
+        .ok()
+        .map(|(repo, _)| format!("{identity_object_type}:{repo}"))
 }
 
 impl DurableApprovalInbox {
@@ -254,6 +279,29 @@ impl TriggerBindingStore for DurableTriggerBindingStore {
             recorded_at,
         ))?
         .map_err(|_| "durable trigger reservation is unavailable".into())
+    }
+
+    fn record_evaluation_error(
+        &self,
+        tenant: &str,
+        binding_id: &str,
+        event_id: &str,
+        code: myelin_storage::AgentTriggerEvaluationErrorCode,
+        detail: &str,
+        event_recorded_at: DateTime<Utc>,
+    ) -> Result<(), String> {
+        let binding_id = Uuid::parse_str(binding_id)
+            .map_err(|_| "durable trigger binding id is not a UUID".to_string())?;
+        self.drive(self.backing.record_evaluation_error(
+            tenant,
+            binding_id,
+            event_id,
+            code,
+            detail,
+            event_recorded_at,
+        ))?
+        .map(|_| ())
+        .map_err(|_| "durable trigger evaluation diagnostic is unavailable".into())
     }
 }
 
@@ -395,9 +443,31 @@ mod visibility_rule_tests {
             trigger_visibility_rule("run"),
             Some(TriggerVisibilityRule::CiRunRepository)
         );
+        assert_eq!(
+            trigger_visibility_rule("ref"),
+            Some(TriggerVisibilityRule::Direct {
+                subsystem: "git",
+                identity_object_type: "repo",
+                permission: "pull",
+                address: TriggerSubjectAddress::GitRefRepository,
+            })
+        );
         assert_eq!(trigger_visibility_rule("deployment"), None);
         assert!(myelin_events::AUTOMATION_SUBJECT_TYPE_TOKENS
             .iter()
             .all(|subject_type| trigger_visibility_rule(subject_type).is_some()));
+    }
+
+    #[test]
+    fn a_git_ref_is_authorized_as_the_repository_that_contains_it() {
+        assert_eq!(
+            git_ref_repository_identity_object("team%2Fapi:refs%2Fheads%2Fmain", "repo"),
+            Some("repo:team/api".into())
+        );
+        assert_eq!(
+            git_ref_repository_identity_object("missing-ref-separator", "repo"),
+            None,
+            "a malformed subject fails closed instead of naming another repository"
+        );
     }
 }

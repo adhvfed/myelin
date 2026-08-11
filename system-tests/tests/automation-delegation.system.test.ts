@@ -5,6 +5,7 @@ import { describe, expect, test } from "vitest";
 import { findAutomation } from "../src/automations.js";
 import { systemTestConfig } from "../src/config.js";
 import { browserApprovedCliClient, privacyClient, uniqueName } from "../src/context.js";
+import { eventually } from "../src/eventually.js";
 import { GitProject } from "../src/git-project.js";
 import { array, record, string } from "../src/json.js";
 
@@ -151,6 +152,91 @@ describe("automation delegation", () => {
     expect(
       await findAutomation(founder, string(trigger.id, "scoped automation id")),
     ).toMatchObject({ id: trigger.id, task });
+  });
+
+  test("explains one broken rule without silencing its healthy neighbour", async () => {
+    const founder = await browserApprovedCliClient();
+    const repository = new GitProject(uniqueName("diagnosable-automation"), founder);
+    await repository.create();
+    await repository.writeFile("main", "README.md", "# Diagnosable automation\n");
+    const activated = await founder.json("/v1/agents", {
+      method: "POST",
+      body: {
+        name: uniqueName("branch-observer"),
+        runtime: "hosted",
+        tools: ["git.read_file"],
+      },
+      idempotencyKey: `diagnostic-agent-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const agentId = string(record(activated.body.agent, "branch observer").id, "agent id");
+    const createAutomation = async (filter: string, task: string) => {
+      const created = await founder.json("/v1/triggers", {
+        method: "POST",
+        body: {
+          event_type: "git.ref.updated",
+          filter,
+          run_as_agent_id: agentId,
+          task,
+          budget_minor_units: 10_000,
+          max_firings: 1,
+          require_human_approval: true,
+        },
+        idempotencyKey: `diagnostic-trigger-${randomUUID()}`,
+        expectedStatus: 201,
+      });
+      return string(record(created.body.trigger, task).id, `${task} id`);
+    };
+    const brokenId = await createAutomation(
+      "payload.ref > 1",
+      "Explain why this branch rule cannot be evaluated.",
+    );
+    const healthyId = await createAutomation(
+      "payload.ref == 'refs/heads/main'",
+      "Park one visible main-branch update for review.",
+    );
+
+    try {
+      const update = await repository.updateFile(
+        "main",
+        "README.md",
+        "# Diagnosable automation\n\nOne rule must not silence another.\n",
+      );
+      const diagnostic = await eventually(async () => {
+        const automation = await findAutomation(founder, brokenId);
+        return automation?.last_evaluation_error === null
+          ? undefined
+          : automation?.last_evaluation_error;
+      }, { description: "the owner-visible rule evaluation error" });
+      expect(record(diagnostic, "rule evaluation diagnostic")).toMatchObject({
+        code: "type_error",
+        detail: "comparison is not defined over the operand types",
+        event_id: expect.any(String),
+        event_recorded_at: expect.any(String),
+      });
+
+      const healthyFiring = await eventually(async () => {
+        const history = await founder.json(
+          `/v1/triggers/${encodeURIComponent(healthyId)}/firings?limit=100`,
+        );
+        return array(history.body.items, "healthy automation history")
+          .map((item) => record(item, "healthy automation firing"))
+          .find((item) => item.state === "awaiting_approval");
+      }, { description: "the healthy neighbouring automation to remain actionable" });
+      expect(healthyFiring).toMatchObject({
+        event_type: "git.ref.updated",
+        state: "awaiting_approval",
+        run_id: null,
+      });
+      expect(update.commitOid).toMatch(/^[0-9a-f]{40}$/);
+    } finally {
+      for (const triggerId of [brokenId, healthyId]) {
+        await founder.json(`/v1/triggers/${encodeURIComponent(triggerId)}/disable`, {
+          method: "POST",
+          body: {},
+        });
+      }
+    }
   });
 
   test("keeps one owner from crowding every collaborator out of an event", async () => {

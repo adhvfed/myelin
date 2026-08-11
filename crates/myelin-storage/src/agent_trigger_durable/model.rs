@@ -8,6 +8,48 @@ pub const MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS: u64 = 1_000_000_000_000;
 pub const MAX_ACTIVE_AGENT_TRIGGERS_PER_OWNER_EVENT: u32 = 100;
 pub const MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT: u32 = 1_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTriggerEvaluationErrorCode {
+    InvalidMatcher,
+    MissingContext,
+    TypeError,
+    CostExceeded,
+    NotCompiled,
+}
+
+impl AgentTriggerEvaluationErrorCode {
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::InvalidMatcher => "invalid_matcher",
+            Self::MissingContext => "missing_context",
+            Self::TypeError => "type_error",
+            Self::CostExceeded => "cost_exceeded",
+            Self::NotCompiled => "not_compiled",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, PgError> {
+        match value {
+            "invalid_matcher" => Ok(Self::InvalidMatcher),
+            "missing_context" => Ok(Self::MissingContext),
+            "type_error" => Ok(Self::TypeError),
+            "cost_exceeded" => Ok(Self::CostExceeded),
+            "not_compiled" => Ok(Self::NotCompiled),
+            _ => Err(PgError::Query(
+                "agent trigger has an invalid evaluation error code".into(),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentTriggerEvaluationDiagnostic {
+    pub code: AgentTriggerEvaluationErrorCode,
+    pub detail: String,
+    pub event_id: String,
+    pub event_recorded_at: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewAgentTriggerBinding {
     pub binding_id: Uuid,
@@ -44,6 +86,7 @@ pub struct DurableAgentTriggerBinding {
     pub require_human_approval: bool,
     pub state: String,
     pub created_at: String,
+    pub last_evaluation_error: Option<AgentTriggerEvaluationDiagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

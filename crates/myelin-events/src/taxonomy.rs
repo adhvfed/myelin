@@ -44,7 +44,7 @@ pub const ARTIFACT_TYPE_TOKENS: &[&str] = &[
 
 /// Artifact subjects whose live read boundary is implemented for governed automations.
 pub const AUTOMATION_SUBJECT_TYPE_TOKENS: &[&str] = &[
-    "run", "repo", "pr", "comment", "issue", "page", "row", "channel", "message",
+    "run", "repo", "ref", "pr", "comment", "issue", "page", "row", "channel", "message",
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -402,6 +402,11 @@ mod tests {
         assert_eq!(
             resolve_automation_subject_type("issue.issue.updated", None).unwrap(),
             "issue"
+        );
+        assert_eq!(
+            resolve_automation_subject_type("git.ref.updated", None).unwrap(),
+            "ref",
+            "a branch update is governed through its repository"
         );
         assert_eq!(
             resolve_automation_subject_type("ci.result", Some("run")).unwrap(),

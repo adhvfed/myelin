@@ -149,6 +149,29 @@ ALTER TABLE agent_trigger_firing
     );
 "#;
 
+pub const AGENT_TRIGGER_EVALUATION_DIAGNOSTIC_MIGRATION: &str = r#"
+ALTER TABLE agent_trigger_binding
+    ADD COLUMN IF NOT EXISTS last_evaluation_error_code text,
+    ADD COLUMN IF NOT EXISTS last_evaluation_error_detail text,
+    ADD COLUMN IF NOT EXISTS last_evaluation_error_event_id text,
+    ADD COLUMN IF NOT EXISTS last_evaluation_error_at timestamptz;
+ALTER TABLE agent_trigger_binding
+    DROP CONSTRAINT IF EXISTS agent_trigger_binding_evaluation_error_shape;
+ALTER TABLE agent_trigger_binding
+    ADD CONSTRAINT agent_trigger_binding_evaluation_error_shape CHECK (
+        (last_evaluation_error_code IS NULL
+          AND last_evaluation_error_detail IS NULL
+          AND last_evaluation_error_event_id IS NULL
+          AND last_evaluation_error_at IS NULL)
+        OR
+        (last_evaluation_error_code IN
+           ('invalid_matcher','missing_context','type_error','cost_exceeded','not_compiled')
+          AND octet_length(last_evaluation_error_detail) BETWEEN 1 AND 1024
+          AND octet_length(last_evaluation_error_event_id) BETWEEN 1 AND 255
+          AND last_evaluation_error_at IS NOT NULL)
+    );
+"#;
+
 pub fn agent_trigger_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0090_agent_trigger", AGENT_TRIGGER_MIGRATION),
@@ -167,6 +190,13 @@ pub fn agent_trigger_terminal_reason_migrations() -> Migrations {
     Migrations::of([Migration::plain(
         "0103_agent_trigger_terminal_reason",
         AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
+    )])
+}
+
+pub fn agent_trigger_evaluation_diagnostic_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0109_agent_trigger_evaluation_diagnostic",
+        AGENT_TRIGGER_EVALUATION_DIAGNOSTIC_MIGRATION,
     )])
 }
 
@@ -197,6 +227,11 @@ mod tests {
         assert!(AGENT_TRIGGER_APPROVAL_MIGRATION.contains("approval_decision = 'approved'"));
         assert!(AGENT_TRIGGER_APPROVAL_MIGRATION.contains("approval_decision = 'rejected'"));
         assert!(AGENT_TRIGGER_TERMINAL_REASON_MIGRATION.contains("state = 'terminal'"));
+        assert!(
+            AGENT_TRIGGER_EVALUATION_DIAGNOSTIC_MIGRATION.contains("last_evaluation_error_code IN")
+        );
+        assert!(AGENT_TRIGGER_EVALUATION_DIAGNOSTIC_MIGRATION
+            .contains("octet_length(last_evaluation_error_detail) BETWEEN 1 AND 1024"));
         assert_eq!(
             AGENT_TRIGGER_RLS_POLICY
                 .matches("FORCE ROW LEVEL SECURITY")
