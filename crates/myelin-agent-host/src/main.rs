@@ -6,6 +6,7 @@ use myelin_agent_host::{
     register_hosted_agent_workflow, AgentHost, AgentHostActivityExecutor, EdgeMcpToolExecutor,
     HostedAgentInputResolver, HostedAgentRunExecutor, HostedModelFactory, LunaModelFactory,
 };
+#[cfg(any(test, feature = "deterministic-development-model"))]
 use myelin_agent_model::{
     ModelClient, ModelError, ModelReply, ModelRequest, ModelResponse, ModelTurn, ToolCallRequest,
     Usage,
@@ -303,33 +304,49 @@ async fn reconcile_trigger_firings(
 }
 
 fn model_factory() -> Result<Arc<dyn HostedModelFactory>, String> {
-    match std::env::var(MODEL_MODE_ENV)
-        .unwrap_or_else(|_| "luna".into())
-        .as_str()
-    {
+    let mode = std::env::var(MODEL_MODE_ENV).unwrap_or_else(|_| "luna".into());
+    model_factory_for(&mode)
+}
+
+fn model_factory_for(mode: &str) -> Result<Arc<dyn HostedModelFactory>, String> {
+    match mode {
         "luna" => Ok(Arc::new(LunaModelFactory)),
-        DETERMINISTIC_DEVELOPMENT_MODE => {
-            eprintln!(
-                "hosted-agent-worker: using explicit deterministic development model; no provider call will be made"
-            );
-            Ok(Arc::new(DeterministicDevelopmentModelFactory))
-        }
+        DETERMINISTIC_DEVELOPMENT_MODE => deterministic_development_model_factory(),
         value => Err(format!(
             "{MODEL_MODE_ENV} must be `luna` or `{DETERMINISTIC_DEVELOPMENT_MODE}`, got `{value}`"
         )),
     }
 }
 
+#[cfg(any(test, feature = "deterministic-development-model"))]
+fn deterministic_development_model_factory() -> Result<Arc<dyn HostedModelFactory>, String> {
+    eprintln!(
+        "hosted-agent-worker: using explicit deterministic development model; no provider call will be made"
+    );
+    Ok(Arc::new(DeterministicDevelopmentModelFactory))
+}
+
+#[cfg(not(any(test, feature = "deterministic-development-model")))]
+fn deterministic_development_model_factory() -> Result<Arc<dyn HostedModelFactory>, String> {
+    Err(format!(
+        "{DETERMINISTIC_DEVELOPMENT_MODE} is unavailable in this worker build"
+    ))
+}
+
+#[cfg(any(test, feature = "deterministic-development-model"))]
 struct DeterministicDevelopmentModelFactory;
 
+#[cfg(any(test, feature = "deterministic-development-model"))]
 impl HostedModelFactory for DeterministicDevelopmentModelFactory {
     fn client(&self) -> Result<Box<dyn ModelClient + Send + Sync>, ModelError> {
         Ok(Box::new(DeterministicDevelopmentModel))
     }
 }
 
+#[cfg(any(test, feature = "deterministic-development-model"))]
 struct DeterministicDevelopmentModel;
 
+#[cfg(any(test, feature = "deterministic-development-model"))]
 impl ModelClient for DeterministicDevelopmentModel {
     fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let has_ci_triage_tools = ["ci.read_run", "issues.create"]
@@ -392,6 +409,7 @@ impl ModelClient for DeterministicDevelopmentModel {
     }
 }
 
+#[cfg(any(test, feature = "deterministic-development-model"))]
 fn triggering_merge_target(request: &ModelRequest) -> Result<(String, u64), ModelError> {
     let prompt = request
         .turns
@@ -433,6 +451,7 @@ fn triggering_merge_target(request: &ModelRequest) -> Result<(String, u64), Mode
     Ok((repo.to_string(), number))
 }
 
+#[cfg(any(test, feature = "deterministic-development-model"))]
 fn triggering_ci_run_id(request: &ModelRequest) -> Result<String, ModelError> {
     let prompt = request
         .turns
@@ -461,6 +480,7 @@ fn triggering_ci_run_id(request: &ModelRequest) -> Result<String, ModelError> {
     Ok(run_id)
 }
 
+#[cfg(any(test, feature = "deterministic-development-model"))]
 fn required_development_value(name: &str) -> Result<String, ModelError> {
     std::env::var(name)
         .ok()

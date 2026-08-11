@@ -227,7 +227,7 @@ services:
 
   hosted-agent-worker:
     depends_on: [agent-service, development-tenants-ready]
-    process: cargo run --quiet -p myelin-agent-host --features integration --bin hosted-agent-worker
+    process: cargo run --quiet -p myelin-agent-host --features integration,deterministic-development-model --bin hosted-agent-worker
     environment:
       DATABASE_URL: "postgres://myelin_app:myelin_app_pw@localhost:{{POSTGRES_PORT}}/myelin"
       DATABASE_MIGRATION_URL: "postgres://myelin_admin:myelin_dev_pw@localhost:{{POSTGRES_PORT}}/myelin"
