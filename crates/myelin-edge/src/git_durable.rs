@@ -47,7 +47,8 @@ use myelin_git::pr_threads::{
 };
 use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, Oid as PushOid, ProposedRefUpdate, PushOutcome,
-    PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore, RejectReason,
+    PushProvenance, PushSession, Pusher, QuarantineMigration, QuarantineObject, RefName, RefStore,
+    RejectReason,
 };
 use myelin_git::refs_pagination::WIRE_MAX_REF_NAME_BYTES;
 use myelin_git::web::{
@@ -1679,10 +1680,7 @@ impl DurableGitBackend {
                 commit_oids: vec![PushOid::new(prepared.commit.0.clone())],
             }],
             quarantine: quarantine_objects,
-            pusher: Pusher {
-                pseudonym: psn,
-                is_agent: actor_is_agent,
-            },
+            pusher: Pusher::direct(psn, actor_is_agent),
         };
         let migration = ObjectPromotion {
             repo: &repo,
@@ -2542,17 +2540,38 @@ impl DurableGitBackend {
             RepoActorContext::new(tenant, region, slug, principal).for_pr(number),
             principal,
             operation_id,
+            PushProvenance::direct(Self::is_agent(principal)),
         )
     }
 
-    /// Merges as `actor` while resolving source-repository visibility through an independently
-    /// validated authority principal. Agent callers must establish that delegation before this
-    /// seam; Git continues to attribute the mutation to the agent itself.
-    pub(crate) fn merge_for_actor_with_operation(
+    pub(crate) fn merge_human_approved_agent_with_operation(
         &self,
         target: PrActorContext<'_>,
         repo_reader: &Principal,
         operation_id: &PrOperationId,
+    ) -> Result<MergeAttempt, DurableError> {
+        if !Self::is_agent(target.repo.principal) {
+            return Err(DurableError::Git(
+                "human-approved agent merge requires an agent actor".into(),
+            ));
+        }
+        self.merge_for_actor_with_operation(
+            target,
+            repo_reader,
+            operation_id,
+            PushProvenance::HumanApprovedAgent,
+        )
+    }
+
+    /// Merges as `actor` while resolving source-repository visibility through an independently
+    /// validated authority principal. The provenance controls protected-ref admission without
+    /// replacing the actor that Git attributes the mutation to.
+    fn merge_for_actor_with_operation(
+        &self,
+        target: PrActorContext<'_>,
+        repo_reader: &Principal,
+        operation_id: &PrOperationId,
+        ref_update_provenance: PushProvenance,
     ) -> Result<MergeAttempt, DurableError> {
         let PrActorContext { repo, number } = target;
         let RepoActorContext {
@@ -2574,6 +2593,7 @@ impl DurableGitBackend {
             if let Some(intent) = store.pending_merge_intent(&scope, slug, number)? {
                 if intent.operation_id != operation_id.digest()
                     || intent.actor_subject_id != actor.principal_id.0.trim()
+                    || intent.ref_update_provenance != ref_update_provenance
                 {
                     return Err(DurableError::Git(
                         "a different merge operation is already pending".into(),
@@ -2613,6 +2633,7 @@ impl DurableGitBackend {
                 &source_repo,
                 &ref_store,
                 &Self::pseudonym(tenant, actor),
+                ref_update_provenance,
                 self.checks.is_some(),
             );
         }
@@ -2623,6 +2644,7 @@ impl DurableGitBackend {
             &ref_store,
             &repo,
             &Self::pseudonym(tenant, actor),
+            ref_update_provenance,
         )
     }
 
@@ -3154,10 +3176,10 @@ impl DurableGitBackend {
         let push = PushSession {
             updates,
             quarantine,
-            pusher: Pusher {
-                pseudonym: Self::pseudonym(tenant, principal),
-                is_agent: false,
-            },
+            pusher: Pusher::direct(
+                Self::pseudonym(tenant, principal),
+                Self::is_agent(principal),
+            ),
         };
         let outcome = if self.checks.is_some() {
             match self.receive_with_check_admission(
@@ -4437,6 +4459,111 @@ mod agent_file_write_tests {
             .to_string()
             .contains("idempotency key is already bound to a different file write"));
 
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn only_the_human_approved_agent_merge_crosses_the_protected_ref_seam() {
+        let root = temp_root();
+        let backend = DurableGitBackend::rooted_inmem_for_test(&root);
+        backend.create_repo(TENANT, REGION, REPO).unwrap();
+        let repo = backend.store.open_repo(&repo_loc()).unwrap();
+        let (main, _, _) = repo
+            .build_file_commit(
+                "refs/heads/main",
+                "README.md",
+                b"# Product\n",
+                "seed",
+                "human:founder@acme.noreply",
+                "human:founder@acme.noreply",
+            )
+            .unwrap();
+        repo.update_ref_cas(
+            "refs/heads/main",
+            None,
+            Some(&main),
+            "seed main",
+            "human:founder@acme.noreply",
+        )
+        .unwrap();
+        let (head, _, _) = repo
+            .build_file_commit(
+                "refs/heads/main",
+                "approved.txt",
+                b"A human approved this exact effect.\n",
+                "prepare change",
+                "agent:release-helper@acme.noreply",
+                "agent:release-helper@acme.noreply",
+            )
+            .unwrap();
+        backend
+            .set_branch_protection(
+                TENANT,
+                REGION,
+                REPO,
+                &serde_json::json!({
+                    "rulesets": [{
+                        "ref_pattern": "refs/heads/main",
+                        "required_contexts": [],
+                        "required_approvals": 0,
+                        "require_codeowner_review": false,
+                        "require_conversation_resolution": false,
+                        "allow_force_push": false
+                    }]
+                }),
+            )
+            .unwrap();
+        let actor = agent();
+        let opened = backend
+            .open_pr_with_operation(
+                TENANT,
+                REGION,
+                REPO,
+                &serde_json::json!({
+                    "title": "Ship the approved change",
+                    "base_ref": "refs/heads/main",
+                    "head_ref": "refs/heads/agent/release-helper",
+                    "head_oid": head.0.clone()
+                }),
+                &actor,
+                &PrOperationId::parse("open-agent-pr").unwrap(),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            backend
+                .merge_with_operation(
+                    TENANT,
+                    REGION,
+                    REPO,
+                    opened.number,
+                    &actor,
+                    &PrOperationId::parse("direct-agent-merge").unwrap(),
+                )
+                .unwrap(),
+            MergeAttempt::RefRefused(RejectReason::AgentNeedsHuman { .. })
+        ));
+        assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(main));
+
+        let founder = Principal::new(
+            TenantId(TENANT.into()),
+            Region(REGION.into()),
+            PrincipalId("human:founder".into()),
+            PrincipalKind::Human,
+            DataRole::Controller,
+            PrincipalStatus::Active,
+        );
+        assert!(matches!(
+            backend
+                .merge_human_approved_agent_with_operation(
+                    RepoActorContext::new(TENANT, REGION, REPO, &actor).for_pr(opened.number),
+                    &founder,
+                    &PrOperationId::parse("approved-agent-merge").unwrap(),
+                )
+                .unwrap(),
+            MergeAttempt::Merged { .. }
+        ));
+        assert_eq!(repo.read_ref("refs/heads/main").unwrap(), Some(head));
         std::fs::remove_dir_all(root).ok();
     }
 

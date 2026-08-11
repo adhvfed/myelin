@@ -17,8 +17,8 @@ use crate::lifecycle::{
 };
 use crate::merge_gate::{evaluate_merge_gate, MergeGateOutcome, MergeGatePolicy};
 use crate::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
-    Pusher, RefName, RefStore,
+    CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushProvenance,
+    PushSession, Pusher, RefName, RefStore,
 };
 
 pub(crate) const PR_RECORD_MAX_BYTES: usize = 2 * 1024 * 1024;
@@ -1059,6 +1059,7 @@ pub fn merge_pr<P: RepoPathResolver>(
     ref_store: &RefStore,
     repo: &DurableGitRepo,
     merger_pseudonym: &str,
+    provenance: PushProvenance,
 ) -> Result<MergeAttempt, DurableError> {
     let mut rec = store
         .get(repo_loc, number)?
@@ -1100,10 +1101,7 @@ pub fn merge_pr<P: RepoPathResolver>(
             commit_oids: vec![head.clone()],
         }],
         quarantine: Vec::new(),
-        pusher: Pusher {
-            pseudonym: merger_pseudonym.to_string(),
-            is_agent: false,
-        },
+        pusher: Pusher::new(merger_pseudonym, provenance),
     };
     let outcome = ref_store
         .receive(&push, &InMemoryObjectDb::new(), CrashPoint::None)
@@ -1663,10 +1661,90 @@ mod tests {
             )
             .unwrap();
         let rs = durable_ref_store(repo.clone());
-        let attempt = merge_pr(&store, &loc(), 1, &rs, &repo, "psn:author@acme").unwrap();
+        let attempt = merge_pr(
+            &store,
+            &loc(),
+            1,
+            &rs,
+            &repo,
+            "psn:author@acme",
+            PushProvenance::NonAgent,
+        )
+        .unwrap();
         assert!(
             matches!(attempt, MergeAttempt::Blocked(_)),
             "default-closed blocks: {attempt:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn protected_merge_needs_human_provenance_without_losing_agent_authorship() {
+        let root = temp_root("agent-merge-provenance");
+        let gitstore = DurableGitStore::rooted(&root);
+        let repo = Arc::new(gitstore.create_repo(&loc()).unwrap());
+        let (base, head) = seed_main_then_descendant(&repo);
+        let store = DurablePrStore::rooted(&root);
+        store
+            .put_protection(
+                &loc(),
+                &BranchProtectionConfig {
+                    rulesets: vec![BranchProtectionRuleset {
+                        ref_pattern: "refs/heads/main".into(),
+                        required_contexts: Vec::new(),
+                        required_approvals: 0,
+                        require_codeowner_review: false,
+                        require_conversation_resolution: false,
+                        allow_force_push: false,
+                    }],
+                },
+            )
+            .unwrap();
+        store
+            .open_pr(
+                &loc(),
+                &open_record(1, "refs/heads/main", &head.0, "psn:author@acme"),
+            )
+            .unwrap();
+        let refs = durable_ref_store(repo.clone());
+
+        assert_eq!(
+            merge_pr(
+                &store,
+                &loc(),
+                1,
+                &refs,
+                &repo,
+                "agent-7@acme.noreply",
+                PushProvenance::Agent,
+            )
+            .unwrap(),
+            MergeAttempt::RefRefused(crate::receive_pack::RejectReason::AgentNeedsHuman {
+                ref_name: RefName::new("refs/heads/main"),
+            })
+        );
+        assert_eq!(
+            refs.tip(&RefName::new("refs/heads/main")),
+            Some(PushOid::new(base.0))
+        );
+        assert_eq!(store.get(&loc(), 1).unwrap().unwrap().state, PrState::Open);
+
+        assert!(matches!(
+            merge_pr(
+                &store,
+                &loc(),
+                1,
+                &refs,
+                &repo,
+                "agent-7@acme.noreply",
+                PushProvenance::HumanApprovedAgent,
+            )
+            .unwrap(),
+            MergeAttempt::Merged { .. }
+        ));
+        assert_eq!(
+            refs.tip(&RefName::new("refs/heads/main")),
+            Some(PushOid::new(head.0))
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1702,7 +1780,16 @@ mod tests {
         let rs = durable_ref_store(repo.clone());
 
         assert!(matches!(
-            merge_pr(&store, &loc(), 1, &rs, &repo, "psn:m@acme").unwrap(),
+            merge_pr(
+                &store,
+                &loc(),
+                1,
+                &rs,
+                &repo,
+                "psn:m@acme",
+                PushProvenance::NonAgent,
+            )
+            .unwrap(),
             MergeAttempt::Blocked(_)
         ));
 
@@ -1716,7 +1803,16 @@ mod tests {
         store.put(&loc(), &rec).unwrap();
         assert!(
             matches!(
-                merge_pr(&store, &loc(), 1, &rs, &repo, "psn:m@acme").unwrap(),
+                merge_pr(
+                    &store,
+                    &loc(),
+                    1,
+                    &rs,
+                    &repo,
+                    "psn:m@acme",
+                    PushProvenance::NonAgent,
+                )
+                .unwrap(),
                 MergeAttempt::Blocked(_)
             ),
             "a self-approval must NOT satisfy the approval threshold"
@@ -1729,7 +1825,17 @@ mod tests {
             is_agent: false,
         });
         store.put(&loc(), &rec).unwrap();
-        match merge_pr(&store, &loc(), 1, &rs, &repo, "psn:m@acme").unwrap() {
+        match merge_pr(
+            &store,
+            &loc(),
+            1,
+            &rs,
+            &repo,
+            "psn:m@acme",
+            PushProvenance::NonAgent,
+        )
+        .unwrap()
+        {
             MergeAttempt::Merged { new_oid, .. } => assert_eq!(new_oid, c2.0),
             other => panic!("expected Merged, got {other:?}"),
         }
@@ -1826,10 +1932,7 @@ mod tests {
                     commit_oids: vec![PushOid::new(c2.0.clone())],
                 }],
                 quarantine: vec![],
-                pusher: Pusher {
-                    pseudonym: "psn:m@acme".into(),
-                    is_agent: false,
-                },
+                pusher: Pusher::direct("psn:m@acme", false),
             },
             &InMemoryObjectDb::new(),
             CrashPoint::None,
@@ -1844,7 +1947,16 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            merge_pr(&store, &loc(), 1, &rs, &repo, "psn:m@acme").unwrap(),
+            merge_pr(
+                &store,
+                &loc(),
+                1,
+                &rs,
+                &repo,
+                "psn:m@acme",
+                PushProvenance::NonAgent,
+            )
+            .unwrap(),
             MergeAttempt::InvalidHead(_)
         ));
 
@@ -1856,7 +1968,16 @@ mod tests {
             .unwrap();
         assert!(
             matches!(
-                merge_pr(&store, &loc(), 2, &rs, &repo, "psn:m@acme").unwrap(),
+                merge_pr(
+                    &store,
+                    &loc(),
+                    2,
+                    &rs,
+                    &repo,
+                    "psn:m@acme",
+                    PushProvenance::NonAgent,
+                )
+                .unwrap(),
                 MergeAttempt::InvalidHead(_)
             ),
             "an ancestor (non-descendant) head is refused"

@@ -63,7 +63,7 @@ impl EffectApi for RoutedEffectApi {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_agent::EventId;
+    use myelin_agent::{EffectApproval, EventId};
     use myelin_identity::{PrincipalId, RunToken};
 
     struct Applied(&'static str);
@@ -92,6 +92,7 @@ mod tests {
             principal_id: PrincipalId("agent:a".into()),
             tool: tool.into(),
             idempotency_key: "retry-1".into(),
+            approval: EffectApproval::NotRequired,
         }
     }
 

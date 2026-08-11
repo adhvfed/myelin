@@ -48,10 +48,7 @@ fn commit_push(ref_name: &str, identity_line: &str) -> PushSession {
             oid: Oid::new("c0"),
             bytes,
         }],
-        pusher: Pusher {
-            pseudonym: "psn-7@acme.noreply".into(),
-            is_agent: false,
-        },
+        pusher: Pusher::direct("psn-7@acme.noreply", false),
     }
 }
 

@@ -94,10 +94,7 @@ fn git_ref_updated_provider_consumer_wire_shape_round_trips() {
             oid: Oid::new("abc123"),
             bytes: b"commit".to_vec(),
         }],
-        pusher: Pusher {
-            pseudonym: "anon-9@acme.noreply".into(),
-            is_agent: false,
-        },
+        pusher: Pusher::direct("anon-9@acme.noreply", false),
     };
 
     let id = match store.receive(&push, &db, CrashPoint::None).unwrap() {
@@ -163,10 +160,7 @@ fn git_ref_updated_per_ref_ordering_is_consumed_in_order() {
                 commit_oids: vec![new],
             }],
             quarantine: vec![],
-            pusher: Pusher {
-                pseudonym: "anon-1@acme.noreply".into(),
-                is_agent: false,
-            },
+            pusher: Pusher::direct("anon-1@acme.noreply", false),
         };
         match store.receive(&p, &db, CrashPoint::None).unwrap() {
             PushOutcome::Accepted { emitted, .. } => ids.push(emitted[0].clone()),
@@ -223,10 +217,7 @@ fn git_ref_updated_per_ref_ordering_survives_a_concurrent_burst() {
                         commit_oids: vec![new],
                     }],
                     quarantine: vec![],
-                    pusher: Pusher {
-                        pseudonym: "anon-1@acme.noreply".into(),
-                        is_agent: false,
-                    },
+                    pusher: Pusher::direct("anon-1@acme.noreply", false),
                 };
                 barrier.wait();
                 store.receive(&p, &db, CrashPoint::None).unwrap()

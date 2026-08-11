@@ -61,10 +61,7 @@ fn push_create(ref_name: &str, new: &Oid, tenant: &str) -> PushSession {
             commit_oids: vec![new.clone()],
         }],
         quarantine: vec![],
-        pusher: Pusher {
-            pseudonym: format!("psn-7@{tenant}.noreply"),
-            is_agent: false,
-        },
+        pusher: Pusher::direct(format!("psn-7@{tenant}.noreply"), false),
     }
 }
 

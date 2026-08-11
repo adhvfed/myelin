@@ -27,8 +27,8 @@ use crate::pr_store::{
     PrListSlice, PrListSort, PrListState, PrRecord, PR_LIST_OFFSET_MAX,
 };
 use crate::receive_pack::{
-    CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
-    Pusher, RefName, RefStore,
+    CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushProvenance,
+    PushSession, Pusher, RefName, RefStore,
 };
 
 mod check_admission;
@@ -560,10 +560,16 @@ impl PrOperationId {
 pub struct MergeIntent {
     pub operation_id: String,
     pub actor_subject_id: String,
+    #[serde(default = "untrusted_merge_provenance")]
+    pub ref_update_provenance: PushProvenance,
     pub base_ref: String,
     pub expected_old_oid: String,
     pub head_oid: String,
     pub head_repo_slug: String,
+}
+
+fn untrusted_merge_provenance() -> PushProvenance {
+    PushProvenance::Agent
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1538,6 +1544,7 @@ impl PgPrStore {
         source_repo: &DurableGitRepo,
         ref_store: &RefStore,
         merger_pseudonym: &str,
+        ref_update_provenance: PushProvenance,
         project_checks: bool,
     ) -> Result<MergeAttempt, DurableError> {
         let loc = self.scoped_loc(scope, repo)?;
@@ -1550,6 +1557,7 @@ impl PgPrStore {
             validate_merge_intent(intent)?;
             if intent.operation_id != operation_id.as_str()
                 || intent.actor_subject_id != actor_subject_id
+                || intent.ref_update_provenance != ref_update_provenance
             {
                 return Err(DurableError::Git(
                     "a different merge operation is already pending".into(),
@@ -1576,6 +1584,7 @@ impl PgPrStore {
         let command_intent = pending.clone().unwrap_or_else(|| MergeIntent {
             operation_id: operation_id.as_str().to_owned(),
             actor_subject_id: actor_subject_id.clone(),
+            ref_update_provenance,
             base_ref: record.base_ref.clone(),
             expected_old_oid: PushOid::zero().0,
             head_oid: record.head_oid.clone(),
@@ -1677,6 +1686,7 @@ impl PgPrStore {
         let intent = pending.unwrap_or_else(|| MergeIntent {
             operation_id: operation_id.as_str().to_owned(),
             actor_subject_id,
+            ref_update_provenance,
             base_ref: record.base_ref.clone(),
             expected_old_oid: actual_before
                 .as_ref()
@@ -1823,10 +1833,7 @@ impl PgPrStore {
                 commit_oids: vec![head.clone()],
             }],
             quarantine: Vec::new(),
-            pusher: Pusher {
-                pseudonym: merger_pseudonym.to_owned(),
-                is_agent: false,
-            },
+            pusher: Pusher::new(merger_pseudonym, intent.ref_update_provenance),
         };
         match ref_store
             .receive(&push, &InMemoryObjectDb::new(), CrashPoint::None)
@@ -3253,6 +3260,7 @@ mod tests {
         let mut intent = MergeIntent {
             operation_id: operation.as_str().into(),
             actor_subject_id: "principal-123".into(),
+            ref_update_provenance: PushProvenance::NonAgent,
             base_ref: "refs/heads/main".into(),
             expected_old_oid: "a".repeat(40),
             head_oid: "b".repeat(40),
@@ -3261,6 +3269,22 @@ mod tests {
         assert!(validate_merge_intent(&intent).is_ok());
         intent.operation_id.clear();
         assert!(validate_merge_intent(&intent).is_err());
+    }
+
+    #[test]
+    fn legacy_pending_merges_resume_with_fail_closed_agent_provenance() {
+        let operation = PrOperationId::parse("legacy-merge").unwrap();
+        let legacy = serde_json::json!({
+            "operation_id": operation.as_str(),
+            "actor_subject_id": "principal-123",
+            "base_ref": "refs/heads/main",
+            "expected_old_oid": "a".repeat(40),
+            "head_oid": "b".repeat(40),
+            "head_repo_slug": "fork"
+        });
+
+        let intent: MergeIntent = serde_json::from_value(legacy).unwrap();
+        assert_eq!(intent.ref_update_provenance, PushProvenance::Agent);
     }
 
     #[test]
@@ -3300,6 +3324,7 @@ mod tests {
         let mut intent = MergeIntent {
             operation_id: operation.as_str().into(),
             actor_subject_id: "principal-123".into(),
+            ref_update_provenance: PushProvenance::NonAgent,
             base_ref: "refs/heads/main".into(),
             expected_old_oid: "a".repeat(40),
             head_oid: "b".repeat(40),
@@ -3579,6 +3604,7 @@ mod tests {
         let projection_intent = MergeIntent {
             operation_id: projection_op.as_str().into(),
             actor_subject_id: actor.principal_id.0.clone(),
+            ref_update_provenance: PushProvenance::NonAgent,
             base_ref: projected_pr.base_ref.clone(),
             expected_old_oid: PushOid::zero().0,
             head_oid: projected_pr.head_oid.clone(),
@@ -3896,6 +3922,7 @@ mod tests {
             let intent = MergeIntent {
                 operation_id: op.as_str().into(),
                 actor_subject_id: actor.principal_id.0.clone(),
+                ref_update_provenance: PushProvenance::NonAgent,
                 base_ref: "refs/heads/main".into(),
                 expected_old_oid: base.0.clone(),
                 head_oid: head.0.clone(),
@@ -4091,6 +4118,7 @@ mod tests {
                         &target,
                         &ref_store,
                         "merger@tenant.noreply",
+                        PushProvenance::NonAgent,
                         false,
                     )
                     .unwrap();

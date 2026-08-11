@@ -51,10 +51,7 @@ fn push(ref_name: &str, old: Oid, new: Oid, forced: bool) -> PushSession {
             commit_oids: vec![new],
         }],
         quarantine: vec![],
-        pusher: Pusher {
-            pseudonym: "anon-3@acme.noreply".into(),
-            is_agent: false,
-        },
+        pusher: Pusher::direct("anon-3@acme.noreply", false),
     }
 }
 

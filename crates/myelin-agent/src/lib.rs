@@ -238,12 +238,20 @@ fn is_catalogue_token(value: &str) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct RunCtx(pub String);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EffectApproval {
+    #[default]
+    NotRequired,
+    HumanApproved,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct EffectAuthority {
     pub run_token: myelin_identity::RunToken,
     pub principal_id: myelin_identity::PrincipalId,
     pub tool: String,
     pub idempotency_key: String,
+    pub approval: EffectApproval,
 }
 
 impl core::fmt::Debug for EffectAuthority {
@@ -253,6 +261,7 @@ impl core::fmt::Debug for EffectAuthority {
             .field("principal_id", &self.principal_id)
             .field("tool", &self.tool)
             .field("idempotency_key", &"<redacted>")
+            .field("approval", &self.approval)
             .finish_non_exhaustive()
     }
 }
@@ -417,6 +426,7 @@ mod tests {
             principal_id: myelin_identity::PrincipalId("principal".into()),
             tool: "issue.close".into(),
             idempotency_key: "secret-idempotency-key".into(),
+            approval: EffectApproval::HumanApproved,
         };
         let rendered = format!("{authority:?}");
         for secret in ["secret-bearer", "secret-jti", "secret-idempotency-key"] {

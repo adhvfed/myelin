@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use myelin_agent::{
-    EffectApi, EffectAuthority, EffectResource, EffectResult, EventId, ProposedEffect, RunCtx,
+    EffectApi, EffectApproval, EffectAuthority, EffectResource, EffectResult, EventId,
+    ProposedEffect, RunCtx,
 };
 use myelin_git::core::RepoLoc;
 use myelin_git::pg_pr_store::PrOperationId;
@@ -76,6 +77,11 @@ impl GitEffectApi {
             .into_iter()
             .find(|def| def.name == proposed_tool)
             .ok_or_else(|| format!("unknown git tool `{proposed_tool}` at authority boundary"))?;
+        if def.requires_approval && authority.approval != EffectApproval::HumanApproved {
+            return Err(format!(
+                "git tool `{proposed_tool}` requires a consumed human approval"
+            ));
+        }
         let required_caps: Vec<String> = def
             .required_caps
             .iter()
@@ -252,7 +258,7 @@ impl GitEffectApi {
                 if let Err(denied) = self.authorize_repo(repo, RepoPermission::ProtectedPush) {
                     return denied;
                 }
-                match self.backend.merge_for_actor_with_operation(
+                match self.backend.merge_human_approved_agent_with_operation(
                     RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
                     &self.delegator,
                     operation_id,
@@ -476,6 +482,7 @@ mod tests {
                 principal_id: PrincipalId("agent:claude".into()),
                 tool: "git.submit_review".into(),
                 idempotency_key: "mismatch-1".into(),
+                approval: EffectApproval::NotRequired,
             },
             effect,
         );
@@ -493,6 +500,7 @@ mod tests {
                 principal_id: PrincipalId("agent:other".into()),
                 tool: "git.open_pr".into(),
                 idempotency_key: "principal-mismatch-1".into(),
+                approval: EffectApproval::NotRequired,
             },
             ProposedEffect(
                 r#"tool:git.open_pr|args:{"repo":"alpha","title":"blocked","head_oid":"deadbeef","base_ref":"refs/heads/main"}"#.into(),

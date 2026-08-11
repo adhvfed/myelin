@@ -49,10 +49,7 @@ fn push(ref_name: &str, old: Oid, new: Oid) -> PushSession {
             oid: Oid::new("feed"),
             bytes: b"a benign commit object".to_vec(),
         }],
-        pusher: Pusher {
-            pseudonym: "anon-3@acme.noreply".into(),
-            is_agent: false,
-        },
+        pusher: Pusher::direct("anon-3@acme.noreply", false),
     }
 }
 

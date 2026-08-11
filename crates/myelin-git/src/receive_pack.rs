@@ -174,10 +174,53 @@ pub struct ProposedRefUpdate {
     pub commit_oids: Vec<Oid>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PushProvenance {
+    NonAgent,
+    Agent,
+    HumanApprovedAgent,
+}
+
+impl PushProvenance {
+    pub fn direct(is_agent: bool) -> Self {
+        if is_agent {
+            Self::Agent
+        } else {
+            Self::NonAgent
+        }
+    }
+
+    pub fn requires_human_approval(self) -> bool {
+        self == Self::Agent
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pusher {
     pub pseudonym: String,
-    pub is_agent: bool,
+    provenance: PushProvenance,
+}
+
+impl Pusher {
+    pub fn new(pseudonym: impl Into<String>, provenance: PushProvenance) -> Self {
+        Self {
+            pseudonym: pseudonym.into(),
+            provenance,
+        }
+    }
+
+    pub fn direct(pseudonym: impl Into<String>, is_agent: bool) -> Self {
+        Self::new(pseudonym, PushProvenance::direct(is_agent))
+    }
+
+    pub fn human_approved_agent(pseudonym: impl Into<String>) -> Self {
+        Self::new(pseudonym, PushProvenance::HumanApprovedAgent)
+    }
+
+    pub fn provenance(&self) -> PushProvenance {
+        self.provenance
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -275,7 +318,7 @@ impl PushPolicy {
                         ref_name: u.ref_name.clone(),
                     });
                 }
-                if self.protected_needs_human && push.pusher.is_agent {
+                if self.protected_needs_human && push.pusher.provenance.requires_human_approval() {
                     return Err(RejectReason::AgentNeedsHuman {
                         ref_name: u.ref_name.clone(),
                     });
@@ -980,10 +1023,7 @@ mod tests {
                 oid: Oid::new("cafe"),
                 bytes: b"a normal commit blob".to_vec(),
             }],
-            pusher: Pusher {
-                pseudonym: "anon-7@acme.noreply".into(),
-                is_agent: false,
-            },
+            pusher: Pusher::direct("anon-7@acme.noreply", false),
         }
     }
 
@@ -1068,8 +1108,8 @@ mod tests {
         let rs = protected_ruleset(&["ci/build", "ci/test"], false);
         match evaluate_protected_ref_push(
             &RefName::new("refs/heads/main"),
-            false,
-            false,
+             false,
+             false,
             WRITER,
             &rs,
             &head,
@@ -1085,8 +1125,8 @@ mod tests {
         assert!(matches!(
             evaluate_protected_ref_push(
                 &RefName::new("refs/heads/main"),
-                false,
-                false,
+                 false,
+                 false,
                 WRITER,
                 &rs,
                 &head,
@@ -1202,8 +1242,8 @@ mod tests {
         let rs = strict_protected_ruleset();
         match evaluate_protected_ref_push(
             &RefName::new("refs/heads/main"),
-             false,
-             false,
+            false,
+            false,
             WRITER,
             &rs,
             &head,
@@ -1254,8 +1294,8 @@ mod tests {
         assert_eq!(
             evaluate_protected_ref_push(
                 &RefName::new("refs/heads/main"),
-                 false,
-                 false,
+                false,
+                false,
                 ADMIN,
                 &strict_protected_ruleset(),
                 &head,
@@ -1587,10 +1627,7 @@ mod tests {
                 commit_oids: vec![],
             }],
             quarantine: vec![],
-            pusher: Pusher {
-                pseudonym: "anon-1@acme.noreply".into(),
-                is_agent: false,
-            },
+            pusher: Pusher::direct("anon-1@acme.noreply", false),
         };
         assert_eq!(
             store.receive(&del, &db, CrashPoint::None).unwrap(),
@@ -1621,10 +1658,7 @@ mod tests {
                 oid: Oid::new("bad"),
                 bytes: [b"export AWS_KEY=AK".as_slice(), b"IAIOSFODNN7EXAMPLE"].concat(),
             }],
-            pusher: Pusher {
-                pseudonym: "anon-1@acme.noreply".into(),
-                is_agent: false,
-            },
+            pusher: Pusher::direct("anon-1@acme.noreply", false),
         };
         match store.receive(&push, &db, CrashPoint::None).unwrap() {
             PushOutcome::Rejected(RejectReason::SecretDetected { oid, pattern }) => {
@@ -1675,13 +1709,27 @@ mod tests {
         let (store, _outbox) = store();
         let db = InMemoryObjectDb::new();
         let mut push = human_push("refs/heads/main", Oid::zero(), Oid::new("aaaa"));
-        push.pusher.is_agent = true;
+        push.pusher = Pusher::direct("anon-7@acme.noreply", true);
         assert_eq!(
             store.receive(&push, &db, CrashPoint::None).unwrap(),
             PushOutcome::Rejected(RejectReason::AgentNeedsHuman {
                 ref_name: RefName::new("refs/heads/main")
             })
         );
+    }
+
+    #[test]
+    fn a_human_approved_agent_keeps_agent_authorship_without_being_refused() {
+        let (store, _outbox) = store();
+        let db = InMemoryObjectDb::new();
+        let mut push = human_push("refs/heads/main", Oid::zero(), Oid::new("aaaa"));
+        push.pusher = Pusher::human_approved_agent("agent-7@acme.noreply");
+
+        assert!(matches!(
+            store.receive(&push, &db, CrashPoint::None).unwrap(),
+            PushOutcome::Accepted { .. }
+        ));
+        assert_eq!(push.pusher.provenance(), PushProvenance::HumanApprovedAgent);
     }
 
     fn push_with_commit_identity(ref_name: &str, identity_line: &str) -> PushSession {
@@ -1701,10 +1749,7 @@ mod tests {
                 oid: Oid::new("c0"),
                 bytes: commit_bytes,
             }],
-            pusher: Pusher {
-                pseudonym: "psn-7@acme.noreply".into(),
-                is_agent: false,
-            },
+            pusher: Pusher::direct("psn-7@acme.noreply", false),
         }
     }
 
@@ -1812,10 +1857,7 @@ mod tests {
                 oid: Oid::new("blob0"),
                 bytes: b"contact: ada@example.com for support\n".to_vec(),
             }],
-            pusher: Pusher {
-                pseudonym: "psn-7@acme.noreply".into(),
-                is_agent: false,
-            },
+            pusher: Pusher::direct("psn-7@acme.noreply", false),
         };
         assert!(
             matches!(
@@ -1912,10 +1954,7 @@ mod tests {
                 },
             ],
             quarantine: vec![],
-            pusher: Pusher {
-                pseudonym: "anon-1@acme.noreply".into(),
-                is_agent: false,
-            },
+            pusher: Pusher::direct("anon-1@acme.noreply", false),
         };
         assert!(matches!(
             store.receive(&atomic, &db, CrashPoint::None).unwrap(),
@@ -2184,10 +2223,7 @@ mod tests {
                 commit_oids: vec![],
             }],
             quarantine: vec![],
-            pusher: Pusher {
-                pseudonym: "anon-1@acme.noreply".into(),
-                is_agent: false,
-            },
+            pusher: Pusher::direct("anon-1@acme.noreply", false),
         };
         assert!(matches!(
             store.receive(&del, &db, CrashPoint::None).unwrap(),
@@ -2528,10 +2564,7 @@ mod tests {
                 oid: Oid::new("x"),
                 bytes: vec![0u8; 8],
             }],
-            pusher: Pusher {
-                pseudonym: "p@acme.noreply".into(),
-                is_agent: false,
-            },
+            pusher: Pusher::direct("p@acme.noreply", false),
         };
         assert!(
             policy.evaluate(&at_limit).is_ok(),

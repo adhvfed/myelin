@@ -2,7 +2,9 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use myelin_agent::{EffectApi, EffectAuthority, EffectKind, EffectResult, ProposedEffect, RunCtx};
+use myelin_agent::{
+    EffectApi, EffectApproval, EffectAuthority, EffectKind, EffectResult, ProposedEffect, RunCtx,
+};
 use myelin_events::{
     Actor, AggregateKey, ArtifactRef, CausedBy, DataRole, EventDraft, EventType, IdMinter,
     OutboxStore, OutboxTx, Timestamp, Ulid, Visibility,
@@ -1039,12 +1041,6 @@ impl GovernedRouter {
         }
 
         let run_ctx = run_ctx_for(&jti, &self.principal.agent_id.0, tool.name());
-        let authority = EffectAuthority {
-            run_token: token,
-            principal_id: self.principal.agent_id.clone(),
-            tool: tool.name().to_string(),
-            idempotency_key: idempotency_key.to_string(),
-        };
         let effect = proposed_effect_for(tool.name(), args);
         if self
             .audit_sink
@@ -1070,25 +1066,36 @@ impl GovernedRouter {
                 now,
             );
         }
-        if let Some(gate_id) = approval_to_consume {
-            if let Err(error) = self.verdicts.borrow_mut().consume_approval(
-                &self.principal.scope,
-                &gate_id,
-                &mcp_effect_key(tool.name(), args),
-                &self.principal.run_id.0,
-                &self.principal.agent_id.0,
-                now_unix,
-            ) {
-                return self.record(
-                    tool.name(),
-                    CallOutcome::Denied {
-                        reason: format!("HITL approval consumption refused: {error}"),
-                        jti,
-                    },
-                    now,
-                );
+        let approval = match approval_to_consume {
+            Some(gate_id) => {
+                if let Err(error) = self.verdicts.borrow_mut().consume_approval(
+                    &self.principal.scope,
+                    &gate_id,
+                    &mcp_effect_key(tool.name(), args),
+                    &self.principal.run_id.0,
+                    &self.principal.agent_id.0,
+                    now_unix,
+                ) {
+                    return self.record(
+                        tool.name(),
+                        CallOutcome::Denied {
+                            reason: format!("HITL approval consumption refused: {error}"),
+                            jti,
+                        },
+                        now,
+                    );
+                }
+                EffectApproval::HumanApproved
             }
-        }
+            None => EffectApproval::NotRequired,
+        };
+        let authority = EffectAuthority {
+            run_token: token,
+            principal_id: self.principal.agent_id.clone(),
+            tool: tool.name().to_string(),
+            idempotency_key: idempotency_key.to_string(),
+            approval,
+        };
         let outcome = match self
             .effect_api
             .apply_authorized(&run_ctx, &authority, effect)

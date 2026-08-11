@@ -42,10 +42,7 @@ fn push_to_main(store: &RefStore, db: &InMemoryObjectDb, old: Oid, new: Oid) -> 
             oid: new.clone(),
             bytes: b"a normal commit".to_vec(),
         }],
-        pusher: Pusher {
-            pseudonym: "anon-7@acme.noreply".into(),
-            is_agent: false,
-        },
+        pusher: Pusher::direct("anon-7@acme.noreply", false),
     };
     match store.receive(&push, db, CrashPoint::None).unwrap() {
         PushOutcome::Accepted { moved, .. } => moved[0].1 .0.clone(),
@@ -238,10 +235,7 @@ fn a_feature_branch_push_indexes_no_code() {
             oid: Oid::new("f1"),
             bytes: b"x".to_vec(),
         }],
-        pusher: Pusher {
-            pseudonym: "anon-1@acme.noreply".into(),
-            is_agent: false,
-        },
+        pusher: Pusher::direct("anon-1@acme.noreply", false),
     };
     store.receive(&push, &db, CrashPoint::None).unwrap();
 

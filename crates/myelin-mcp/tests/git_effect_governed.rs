@@ -936,10 +936,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
             commit_oids: vec![PushOid::new(head.0.clone())],
         }],
         quarantine: Vec::new(),
-        pusher: Pusher {
-            pseudonym: "git-event:test-recovery".into(),
-            is_agent: false,
-        },
+        pusher: Pusher::direct("git-event:test-recovery", false),
     };
     assert!(matches!(
         ref_store
