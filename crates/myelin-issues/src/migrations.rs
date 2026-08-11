@@ -304,6 +304,11 @@ CREATE TABLE IF NOT EXISTS import_map (
   CHECK (status NOT IN ('lossy','dropped') OR loss_note IS NOT NULL)
 )";
 
+pub const EXPAND_IMPORT_MAP_REQUEST_HASH_DDL: &str = "\
+ALTER TABLE import_map
+  ADD COLUMN IF NOT EXISTS request_hash text
+  CHECK (request_hash IS NULL OR request_hash ~ '^blake3:[0-9a-f]{64}$')";
+
 pub const CREATE_ISSUE_CREATE_IDEMPOTENCY_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS issue_create_idempotency (
   tenant_id     text        NOT NULL,
@@ -491,6 +496,12 @@ pub fn issues_migrations() -> Migrations {
         EXPAND_ISSUE_RELATION_ACTOR_DDL,
         MigrationPhase::Expand,
         ISSUE_RELATION_TABLE,
+    ));
+    migrations.push(Migration::phased(
+        "iss_0026_import_request_hash",
+        EXPAND_IMPORT_MAP_REQUEST_HASH_DDL,
+        MigrationPhase::Expand,
+        IMPORT_MAP_TABLE,
     ));
     Migrations::of(migrations)
 }
@@ -712,6 +723,16 @@ mod tests {
             );
         }
         assert!(issues_hot_tables().is_hot(IMPORT_MAP_TABLE));
+        let request_hash_expansion = issues_migrations()
+            .0
+            .into_iter()
+            .find(|migration| migration.id == "iss_0026_import_request_hash")
+            .expect("the import request fingerprint expansion");
+        assert_eq!(request_hash_expansion.phase, MigrationPhase::Expand);
+        assert!(request_hash_expansion
+            .ddl
+            .contains("ADD COLUMN IF NOT EXISTS request_hash"));
+        assert!(request_hash_expansion.ddl.contains("request_hash IS NULL"));
     }
 
     #[test]

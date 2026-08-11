@@ -648,6 +648,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                                     created: false,
                                 });
                             }
+                            ImportClaim::Conflict => return Ok(CreationTxResult::Conflict),
                         }
                     }
                     let row = sqlx::query(
@@ -760,7 +761,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                 created,
             }),
             CreationTxResult::Conflict => Err(IssueStoreError::Conflict(
-                "that idempotency key was already used for a different issue".into(),
+                "that durable creation identity is already bound to a different issue".into(),
             )),
         }
     }

@@ -286,14 +286,20 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .expect("the import creates its first source record");
     assert!(first_import.created);
     let resumed_import = store
-        .import_issue(&creator, imported)
+        .import_issue(&creator, imported.clone())
         .await
         .expect("resuming the same source record returns its original issue");
     assert!(!resumed_import.created);
     assert_eq!(resumed_import.issue, first_import.issue);
+    let mut corrected_import = imported;
+    corrected_import.issue.title = "corrected source title".into();
+    assert!(matches!(
+        store.import_issue(&creator, corrected_import).await,
+        Err(IssueStoreError::Conflict(_))
+    ));
 
     let map = sqlx::query(
-        "SELECT status, source, source_id, myelin_id::text AS myelin_id \
+        "SELECT status, source, source_id, request_hash, myelin_id::text AS myelin_id \
          FROM import_map WHERE tenant_id = $1 AND import_job = $2::uuid",
     )
     .bind(&tenant)
@@ -304,6 +310,7 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     assert_eq!(map.get::<String, _>("status"), "created");
     assert_eq!(map.get::<String, _>("source"), "github");
     assert_eq!(map.get::<String, _>("source_id"), "github:acme/platform#41");
+    assert!(map.get::<String, _>("request_hash").starts_with("blake3:"));
     assert_eq!(map.get::<String, _>("myelin_id"), first_import.issue.id);
     let imported_issue_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM issue WHERE tenant_id = $1 AND prefix = 'IMP'")

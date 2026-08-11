@@ -40,9 +40,13 @@ describe("issue migration lifecycle", () => {
       losses: [],
     });
 
-    const stillEmpty = await systemClient.json(
-      `/v1/issues?state=all&key=${encodeURIComponent(`${prefix}-`)}&limit=100`,
-    );
+    const stillEmpty = await eventually(async () => {
+      const response = await systemClient.json(
+        `/v1/issues?state=all&key=${encodeURIComponent(`${prefix}-`)}&limit=100`,
+        { expectedStatus: [200, 503] },
+      );
+      return response.status === 200 ? response : undefined;
+    }, { description: "fresh login grants to reach the issue visibility projection" });
     expect(array(stillEmpty.body.items, "issues after dry-run")).toEqual([]);
 
     const firstRun = await systemClient.json(`/v1/issues/imports/${jobId}/run`, {
@@ -100,6 +104,17 @@ describe("issue migration lifecycle", () => {
       firstIssues.map(({ sourceId, issue }) => ({ sourceId, issue })),
     );
 
+    const correctedSource = {
+      source: "github",
+      records: [{ ...records[0], title: uniqueName("A corrected source title") }],
+    };
+    const conflictingResume = await systemClient.json(`/v1/issues/imports/${jobId}/run`, {
+      method: "POST",
+      body: correctedSource,
+      expectedStatus: 409,
+    });
+    expect(conflictingResume.body).toMatchObject({ error: { code: "conflict" } });
+
     const activeIssues = await Promise.all(
       firstIssues.map(({ requestEventId }) =>
         eventually<JsonRecord>(
@@ -122,6 +137,7 @@ describe("issue migration lifecycle", () => {
     expect(activeIssues.map((issue) => issue.ref)).toEqual(
       firstIssues.map(({ issue }) => issue.ref),
     );
+    expect(activeIssues.map((issue) => issue.title)).toEqual(records.map((record) => record.title));
 
     const visibleToATeammate = await reviewerClient.json(
       `/v1/issues?state=all&key=${encodeURIComponent(`${prefix}-`)}&limit=100`,

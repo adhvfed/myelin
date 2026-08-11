@@ -1,6 +1,6 @@
 use super::{parse_uuid, CreateIssue, IssueCreationReceipt, IssueStoreError};
 use crate::import::SourceSystem;
-use myelin_storage::PgError;
+use myelin_storage::{ContentHash, PgError};
 use sqlx::types::Uuid;
 use sqlx::{PgConnection, Row};
 
@@ -25,6 +25,7 @@ pub(super) struct ImportIdentity {
     pub job_id: Uuid,
     pub source: SourceSystem,
     pub source_id: String,
+    pub request_hash: String,
 }
 
 impl ImportIssue {
@@ -49,6 +50,7 @@ impl ImportIssue {
             job_id,
             source: self.source,
             source_id: self.source_id.clone(),
+            request_hash: issue_request_hash(&self.issue),
         })
     }
 }
@@ -56,6 +58,7 @@ impl ImportIssue {
 pub(super) enum ImportClaim {
     Acquired,
     Existing(ExistingIssueCreation),
+    Conflict,
 }
 
 pub(super) struct ExistingIssueCreation {
@@ -73,8 +76,8 @@ pub(super) async fn claim(
 ) -> Result<ImportClaim, PgError> {
     let acquired = sqlx::query_scalar::<_, String>(
         "INSERT INTO import_map (\
-           tenant_id, region, import_job, source, source_id, myelin_kind, status\
-         ) VALUES ($1, $2, $3, $4, $5, 'issue', 'pending') \
+           tenant_id, region, import_job, source, source_id, request_hash, myelin_kind, status\
+         ) VALUES ($1, $2, $3, $4, $5, $6, 'issue', 'pending') \
          ON CONFLICT (tenant_id, import_job, source, source_id) DO NOTHING \
          RETURNING source_id",
     )
@@ -83,6 +86,7 @@ pub(super) async fn claim(
     .bind(identity.job_id)
     .bind(identity.source.token())
     .bind(&identity.source_id)
+    .bind(&identity.request_hash)
     .fetch_optional(&mut *connection)
     .await
     .map_err(|error| PgError::Query(error.to_string()))?;
@@ -91,7 +95,7 @@ pub(super) async fn claim(
     }
 
     let existing = sqlx::query(
-        "SELECT m.status, m.myelin_id, i.key, i.project_id, b.request_event_id \
+        "SELECT m.request_hash, m.status, m.myelin_id, i.key, i.project_id, b.request_event_id \
          FROM import_map m \
          LEFT JOIN issue i \
            ON i.tenant_id = m.tenant_id AND i.region = m.region AND i.id = m.myelin_id \
@@ -110,6 +114,15 @@ pub(super) async fn claim(
     .map_err(|error| PgError::Query(error.to_string()))?
     .ok_or_else(|| PgError::Query("import claim disappeared during conflict resolution".into()))?;
 
+    let stored_hash = existing
+        .try_get::<Option<String>, _>("request_hash")
+        .map_err(|error| PgError::Query(error.to_string()))?;
+    if stored_hash
+        .as_ref()
+        .is_some_and(|request_hash| request_hash != &identity.request_hash)
+    {
+        return Ok(ImportClaim::Conflict);
+    }
     let status: String = existing.get("status");
     if !matches!(status.as_str(), "created" | "wired" | "lossy") {
         return Err(PgError::Query(format!(
@@ -148,7 +161,7 @@ pub(super) async fn complete(
         "UPDATE import_map SET myelin_id = $6, status = 'created' \
          WHERE tenant_id = $1 AND region = $2 AND import_job = $3 \
            AND source = $4 AND source_id = $5 AND myelin_kind = 'issue' \
-           AND status = 'pending' AND myelin_id IS NULL",
+           AND request_hash = $7 AND status = 'pending' AND myelin_id IS NULL",
     )
     .bind(tenant_id)
     .bind(region)
@@ -156,6 +169,7 @@ pub(super) async fn complete(
     .bind(identity.source.token())
     .bind(&identity.source_id)
     .bind(issue_id)
+    .bind(&identity.request_hash)
     .execute(&mut *connection)
     .await
     .map_err(|error| PgError::Query(error.to_string()))?;
@@ -165,6 +179,21 @@ pub(super) async fn complete(
         ));
     }
     Ok(())
+}
+
+fn issue_request_hash(issue: &CreateIssue) -> String {
+    let mut bytes = Vec::new();
+    for part in [
+        b"myelin.issue.import.request.v1".as_slice(),
+        issue.project_id.as_bytes(),
+        issue.type_id.as_bytes(),
+        issue.prefix.as_bytes(),
+        issue.title.as_bytes(),
+    ] {
+        bytes.extend_from_slice(&(part.len() as u64).to_be_bytes());
+        bytes.extend_from_slice(part);
+    }
+    ContentHash::blake3(&bytes).to_multihash_string()
 }
 
 #[cfg(test)]
@@ -187,7 +216,17 @@ mod tests {
 
     #[test]
     fn import_identity_is_bounded_before_it_reaches_postgres() {
-        assert!(import("external-41".into()).into_parts().is_ok());
+        let original = import("external-41".into());
+        let original_identity = original.identity().unwrap();
+        let mut corrected = original.clone();
+        corrected.issue.title = "Corrected imported title".into();
+        let corrected_identity = corrected.identity().unwrap();
+        assert_ne!(
+            original_identity.request_hash,
+            corrected_identity.request_hash
+        );
+        assert!(!original_identity.request_hash.contains("Imported"));
+        assert!(original.into_parts().is_ok());
         for source_id in [String::new(), "x".repeat(MAX_SOURCE_ID_BYTES + 1)] {
             assert!(matches!(
                 import(source_id).into_parts(),
