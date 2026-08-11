@@ -4,7 +4,7 @@ use myelin_config::Mode;
 use myelin_events::nats::{JetStreamConsumerConfig, NatsJetStreamBus};
 use myelin_events::{DedupLedger, OutboxStore};
 use myelin_refs_service::{
-    build_pg_edge_consumer, edge_table_migrations, refs_intake_filter,
+    build_pg_cell_edge_consumer, edge_table_migrations, refs_intake_filter,
     run_refs_ingestion_until_shutdown, PgEdgeStore, EVENT_DURABLE_CONSUMER, EVENT_STREAM_NAME,
     EVENT_SUBJECT_ROOT,
 };
@@ -12,7 +12,6 @@ use myelin_storage::{
     all_durable_migrations, DurablePlacementBacking, HotTables, PgBootstrap, PgOutboxBacking,
 };
 use myelin_substrate::{Config, ConsumerReg};
-use myelin_tenancy::TenantId;
 
 #[tokio::main]
 async fn main() {
@@ -38,18 +37,30 @@ async fn main() {
         .unwrap_or_else(|error| refuse_start("database runtime handoff", error));
 
     let cell_id = required_cell_id().unwrap_or_else(|error| refuse_start("cell binding", error));
-    let tenants = DurablePlacementBacking::new(provider.db_pool().clone())
-        .local_tenants(&cell_id)
+    let cell = DurablePlacementBacking::new(provider.db_pool().clone())
+        .get_cell(&cell_id)
         .await
-        .unwrap_or_else(|error| refuse_start("local-tenant directory", error))
-        .into_iter()
-        .filter(|placement| placement.active)
-        .map(|placement| TenantId(placement.tenant_id))
-        .collect::<Vec<_>>();
-    if tenants.is_empty() {
+        .unwrap_or_else(|error| refuse_start("cell directory", error))
+        .unwrap_or_else(|| {
+            refuse_start(
+                "cell binding",
+                format!("cell `{cell_id}` is absent from the placement directory"),
+            )
+        });
+    if cell.status != "Active" {
         refuse_start(
-            "local-tenant directory",
-            format!("cell `{cell_id}` has no active tenants"),
+            "cell binding",
+            format!("cell `{cell_id}` is `{}` instead of Active", cell.status),
+        );
+    }
+    if cell.region != provider.config().region {
+        refuse_start(
+            "cell binding",
+            format!(
+                "cell `{cell_id}` belongs to region `{}` instead of `{}`",
+                cell.region,
+                provider.config().region
+            ),
         );
     }
 
@@ -72,23 +83,16 @@ async fn main() {
     );
     let store = PgEdgeStore::new(provider.db_pool().clone());
     let region = myelin_tenancy::Region(provider.config().region.clone());
-    let consumers = tenants
-        .iter()
-        .map(|tenant| {
-            build_pg_edge_consumer(
-                tenant,
-                &region,
-                store.clone(),
-                dedup.clone(),
-                dead_letters.clone(),
-                runtime.clone(),
-            )
-            .map(ConsumerReg::new)
-            .unwrap_or_else(|error| {
-                refuse_start("tenant-bound edge consumer", format!("{error:?}"))
-            })
-        })
-        .collect();
+    let consumers = vec![build_pg_cell_edge_consumer(
+        &cell_id,
+        &region,
+        store,
+        dedup,
+        dead_letters,
+        runtime.clone(),
+    )
+    .map(ConsumerReg::new)
+    .unwrap_or_else(|error| refuse_start("cell-bound edge consumer", format!("{error:?}")))];
     let intake = NatsJetStreamBus::connect_consumer(
         JetStreamConsumerConfig::bounded(
             &provider.config().nats_url,

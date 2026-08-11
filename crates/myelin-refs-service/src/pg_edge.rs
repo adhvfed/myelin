@@ -115,13 +115,14 @@ impl PgEdgeStore {
         tx: &mut HandlerTx<'_>,
         event: &EventEnvelope,
         runtime: &tokio::runtime::Handle,
+        cell_id: Option<&str>,
     ) -> Result<(), PgEdgeError> {
         let mutation = edge_mutation(event).map_err(PgEdgeError::Malformed)?;
         let connection = tx
             .connection::<sqlx::PgConnection>()
             .ok_or(PgEdgeError::NoCoCommitTransaction)?;
         tokio::task::block_in_place(|| {
-            runtime.block_on(project_on_connection(connection, event, mutation))
+            runtime.block_on(project_on_connection(connection, event, mutation, cell_id))
         })
     }
 }
@@ -140,23 +141,29 @@ pub struct StoredBacklink {
 
 #[derive(Clone)]
 pub struct PgEdgeProjector {
-    tenant: TenantId,
+    scope: ProjectorScope,
     region: Region,
     store: PgEdgeStore,
     runtime: tokio::runtime::Handle,
     subjects: &'static [SubjectPattern],
 }
 
+#[derive(Clone)]
+enum ProjectorScope {
+    Tenant(TenantId),
+    Cell(String),
+}
+
 impl PgEdgeProjector {
     fn new(
-        tenant: TenantId,
+        scope: ProjectorScope,
         region: Region,
         store: PgEdgeStore,
         runtime: tokio::runtime::Handle,
         subjects: &'static [SubjectPattern],
     ) -> Self {
         Self {
-            tenant,
+            scope,
             region,
             store,
             runtime,
@@ -171,7 +178,9 @@ impl EventHandler for PgEdgeProjector {
     }
 
     fn handle(&self, event: &EventEnvelope, tx: &mut HandlerTx<'_>) -> HandleOutcome {
-        if event.tenant != self.tenant || event.region != self.region {
+        if event.region != self.region
+            || matches!(&self.scope, ProjectorScope::Tenant(tenant) if event.tenant != *tenant)
+        {
             return HandleOutcome::NonRetryable(Reason(
                 "Refs event is outside the projector's tenant/region binding".into(),
             ));
@@ -181,14 +190,23 @@ impl EventHandler for PgEdgeProjector {
                 "Refs projector received an event outside refs.edge.*".into(),
             ));
         }
-        match self.store.co_commit_project(tx, event, &self.runtime) {
+        let cell_id = match &self.scope {
+            ProjectorScope::Tenant(_) => None,
+            ProjectorScope::Cell(cell_id) => Some(cell_id.as_str()),
+        };
+        match self
+            .store
+            .co_commit_project(tx, event, &self.runtime, cell_id)
+        {
             Ok(()) => HandleOutcome::Done,
             Err(PgEdgeError::Malformed(error)) => HandleOutcome::NonRetryable(Reason(error.0)),
-            Err(PgEdgeError::NoCoCommitTransaction | PgEdgeError::Database) => {
-                HandleOutcome::Retry(Backoff {
-                    seconds: DATABASE_RETRY_SECONDS,
-                })
-            }
+            Err(
+                PgEdgeError::TenantNotActiveInCell
+                | PgEdgeError::NoCoCommitTransaction
+                | PgEdgeError::Database,
+            ) => HandleOutcome::Retry(Backoff {
+                seconds: DATABASE_RETRY_SECONDS,
+            }),
         }
     }
 }
@@ -204,7 +222,43 @@ pub fn build_pg_edge_consumer(
     let artifact_prefix = format!("myelin://{}/", tenant.0);
     let subjects: &'static [SubjectPattern] =
         Box::leak(vec![SubjectPattern(artifact_prefix.clone())].into_boxed_slice());
-    let projector = PgEdgeProjector::new(tenant.clone(), region.clone(), store, runtime, subjects);
+    let projector = PgEdgeProjector::new(
+        ProjectorScope::Tenant(tenant.clone()),
+        region.clone(),
+        store,
+        runtime,
+        subjects,
+    );
+    build_consumer(projector, artifact_prefix, dedup, dead_letters)
+}
+
+pub fn build_pg_cell_edge_consumer(
+    cell_id: &str,
+    region: &Region,
+    store: PgEdgeStore,
+    dedup: DedupLedger,
+    dead_letters: Arc<dyn myelin_events::DurableDeadLetter>,
+    runtime: tokio::runtime::Handle,
+) -> Result<Consumer<PgEdgeProjector>, SubscribeError> {
+    let artifact_prefix = "myelin://".to_string();
+    let subjects: &'static [SubjectPattern] =
+        Box::leak(vec![SubjectPattern(artifact_prefix.clone())].into_boxed_slice());
+    let projector = PgEdgeProjector::new(
+        ProjectorScope::Cell(cell_id.to_string()),
+        region.clone(),
+        store,
+        runtime,
+        subjects,
+    );
+    build_consumer(projector, artifact_prefix, dedup, dead_letters)
+}
+
+fn build_consumer(
+    projector: PgEdgeProjector,
+    artifact_prefix: String,
+    dedup: DedupLedger,
+    dead_letters: Arc<dyn myelin_events::DurableDeadLetter>,
+) -> Result<Consumer<PgEdgeProjector>, SubscribeError> {
     consume(
         ConsumerSpec::new(
             ConsumerName(crate::edge_builder::EDGE_BUILDER_CONSUMER.into()),
@@ -221,6 +275,7 @@ pub fn build_pg_edge_consumer(
 #[derive(Debug)]
 enum PgEdgeError {
     Malformed(ProjectError),
+    TenantNotActiveInCell,
     NoCoCommitTransaction,
     Database,
 }
@@ -229,7 +284,11 @@ async fn project_on_connection(
     connection: &mut sqlx::PgConnection,
     event: &EventEnvelope,
     mutation: EdgeMutation,
+    cell_id: Option<&str>,
 ) -> Result<(), PgEdgeError> {
+    if let Some(cell_id) = cell_id {
+        ensure_tenant_is_active_in_cell(connection, cell_id, &event.tenant).await?;
+    }
     match mutation {
         EdgeMutation::Apply(rows) => {
             for row in rows {
@@ -256,6 +315,28 @@ async fn project_on_connection(
             Ok(())
         }
         EdgeMutation::Ignore => Ok(()),
+    }
+}
+
+async fn ensure_tenant_is_active_in_cell(
+    connection: &mut sqlx::PgConnection,
+    cell_id: &str,
+    tenant: &TenantId,
+) -> Result<(), PgEdgeError> {
+    let active = sqlx::query_scalar::<_, bool>(
+        "SELECT active
+           FROM local_tenant
+          WHERE cell_id = $1 AND tenant_id = $2
+          FOR SHARE",
+    )
+    .bind(cell_id)
+    .bind(&tenant.0)
+    .fetch_optional(connection)
+    .await
+    .map_err(|_| PgEdgeError::Database)?;
+    match active {
+        Some(true) => Ok(()),
+        Some(false) | None => Err(PgEdgeError::TenantNotActiveInCell),
     }
 }
 

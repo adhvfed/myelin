@@ -8,9 +8,11 @@ use myelin_events::{
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{
-    build_pg_edge_consumer, edge_table_migrations, PgEdgeProjector, PgEdgeStore,
+    build_pg_cell_edge_consumer, build_pg_edge_consumer, edge_table_migrations, PgEdgeProjector,
+    PgEdgeStore,
 };
 use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
+use myelin_storage::placement_durable::placement_durable_migrations;
 use myelin_storage::PgMigrator;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
 use sqlx::PgPool;
@@ -29,6 +31,73 @@ fn admin_url() -> String {
     })
 }
 
+async fn migrated_admin_pool() -> PgPool {
+    let admin = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&admin_url())
+        .await
+        .expect("connect as migration role");
+    let migration_pool = admin.clone();
+    MIGRATED
+        .get_or_init(|| async move {
+            PgMigrator::apply(&migration_pool, &placement_durable_migrations())
+                .await
+                .expect("apply the production placement migrations");
+            PgMigrator::apply(&migration_pool, &edge_table_migrations())
+                .await
+                .expect("apply the production edge migration");
+        })
+        .await;
+    admin
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edge_event(
+    tenant: &TenantId,
+    region: &Region,
+    event_id: &str,
+    event_type: &str,
+    recorded_at: &str,
+    source: &ArtifactRef,
+    target: &ArtifactRef,
+    rel: &str,
+    rel_class: &str,
+) -> EventEnvelope {
+    EventEnvelope {
+        event_id: EventId(event_id.into()),
+        type_: EventType(event_type.into()),
+        schema_ver: 1,
+        tenant: tenant.clone(),
+        region: region.clone(),
+        actor: Actor(Principal::stub(
+            PrincipalId("agent:release-helper".into()),
+            PrincipalKind::Agent {
+                runtime_ref: myelin_identity::RuntimeRef("runtime:test".into()),
+                on_behalf_of: Some(PrincipalId("human:operator".into())),
+            },
+            tenant.clone(),
+        )),
+        subject: source.clone(),
+        aggregate: AggregateKey(format!("refs-edge:{}:{}", source.0, target.0)),
+        causation_id: None,
+        correlation_id: CorrelationId(format!("story:{event_id}")),
+        caused_by: None,
+        depth: 1,
+        contains_personal_data: false,
+        data_role: DataRole::Controller,
+        visibility: Visibility::Internal,
+        pii_key_ref: None,
+        occurred_at: Timestamp(recorded_at.into()),
+        recorded_at: Timestamp(recorded_at.into()),
+        payload: serde_json::json!({
+            "source": source.0,
+            "target": target.0,
+            "rel": rel,
+            "rel_class": rel_class,
+        }),
+    }
+}
+
 struct ProjectorHarness {
     admin: PgPool,
     app: PgPool,
@@ -39,19 +108,7 @@ struct ProjectorHarness {
 
 impl ProjectorHarness {
     async fn start(story: &str) -> Self {
-        let admin = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&admin_url())
-            .await
-            .expect("connect as migration role");
-        let migration_pool = admin.clone();
-        MIGRATED
-            .get_or_init(|| async move {
-                PgMigrator::apply(&migration_pool, &edge_table_migrations())
-                    .await
-                    .expect("apply the production edge migration");
-            })
-            .await;
+        let admin = migrated_admin_pool().await;
 
         let app = sqlx::postgres::PgPoolOptions::new()
             .max_connections(4)
@@ -99,39 +156,17 @@ impl ProjectorHarness {
         rel: &str,
         rel_class: &str,
     ) -> EventEnvelope {
-        EventEnvelope {
-            event_id: EventId(event_id.into()),
-            type_: EventType(event_type.into()),
-            schema_ver: 1,
-            tenant: self.tenant.clone(),
-            region: self.region.clone(),
-            actor: Actor(Principal::stub(
-                PrincipalId("agent:release-helper".into()),
-                PrincipalKind::Agent {
-                    runtime_ref: myelin_identity::RuntimeRef("runtime:test".into()),
-                    on_behalf_of: Some(PrincipalId("human:operator".into())),
-                },
-                self.tenant.clone(),
-            )),
-            subject: source.clone(),
-            aggregate: AggregateKey(format!("refs-edge:{}:{}", source.0, target.0)),
-            causation_id: None,
-            correlation_id: CorrelationId(format!("story:{event_id}")),
-            caused_by: None,
-            depth: 1,
-            contains_personal_data: false,
-            data_role: DataRole::Controller,
-            visibility: Visibility::Internal,
-            pii_key_ref: None,
-            occurred_at: Timestamp(recorded_at.into()),
-            recorded_at: Timestamp(recorded_at.into()),
-            payload: serde_json::json!({
-                "source": source.0,
-                "target": target.0,
-                "rel": rel,
-                "rel_class": rel_class,
-            }),
-        }
+        edge_event(
+            &self.tenant,
+            &self.region,
+            event_id,
+            event_type,
+            recorded_at,
+            source,
+            target,
+            rel,
+            rel_class,
+        )
     }
 
     fn deliver(&self, event: &EventEnvelope) -> Delivered {
@@ -301,4 +336,92 @@ async fn a_hot_reference_can_be_read_forward_without_rescanning_or_duplicates() 
     assert!(second[0].edge_id > first[1].edge_id);
 
     story.clean_up().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_tenant_can_start_linking_work_without_restarting_refs() {
+    let admin = migrated_admin_pool().await;
+    let app = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&app_url())
+        .await
+        .expect("connect as runtime role");
+    let suffix = format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time follows the Unix epoch")
+            .as_nanos()
+    );
+    let cell_id = format!("refs-live-cell-{suffix}");
+    let tenant = TenantId(format!("refs-live-tenant-{suffix}"));
+    let region = Region("fr-par".into());
+    let runtime = tokio::runtime::Handle::current();
+    let consumer = build_pg_cell_edge_consumer(
+        &cell_id,
+        &region,
+        PgEdgeStore::new(app.clone()),
+        DedupLedger::durable(Arc::new(DurableDedupBacking::new(
+            app.clone(),
+            runtime.clone(),
+        ))),
+        Arc::new(DurableDeadLetterBacking::new(app.clone(), runtime.clone())),
+        runtime,
+    )
+    .expect("build one cell-bound projector before the tenant exists");
+    let source = ArtifactRef(format!("myelin://{}/chat/message/M1", tenant.0));
+    let target = ArtifactRef(format!("myelin://{}/issue/issue/ENG-41", tenant.0));
+    let event = edge_event(
+        &tenant,
+        &region,
+        &format!("refs-live-tenant-{suffix}"),
+        "refs.edge.created",
+        "2026-08-11T00:00:01Z",
+        &source,
+        &target,
+        "links",
+        "reference",
+    );
+    let message = Message {
+        subject: source.0.clone(),
+        envelope: event,
+    };
+
+    assert_eq!(
+        consumer.deliver(&message),
+        Delivered::Retried(2),
+        "work for a tenant still converging into the cell waits instead of being discarded"
+    );
+
+    sqlx::query(
+        "INSERT INTO local_tenant (cell_id, tenant_id, isolation_tier, active)
+         VALUES ($1, $2, 'Pool', true)",
+    )
+    .bind(&cell_id)
+    .bind(&tenant.0)
+    .execute(&admin)
+    .await
+    .expect("finish placing the new tenant while the Refs worker stays alive");
+
+    assert_eq!(consumer.deliver(&message), Delivered::Acked);
+    let backlinks = PgEdgeStore::new(app)
+        .inbound_live(&tenant, &region, &target, 10)
+        .await
+        .expect("the newly placed tenant can immediately read its projected backlink");
+    assert_eq!(backlinks.len(), 1);
+    assert_eq!(backlinks[0].source, source.0);
+    assert_eq!(backlinks[0].target, target.0);
+
+    sqlx::query("DELETE FROM edge WHERE tenant_id = $1")
+        .bind(&tenant.0)
+        .execute(&admin)
+        .await
+        .expect("clean up the tenant's projected edge");
+    sqlx::query("DELETE FROM local_tenant WHERE cell_id = $1 AND tenant_id = $2")
+        .bind(&cell_id)
+        .bind(&tenant.0)
+        .execute(&admin)
+        .await
+        .expect("clean up the late placement");
 }
