@@ -200,6 +200,9 @@ impl EventHandler for PgEdgeProjector {
         {
             Ok(()) => HandleOutcome::Done,
             Err(PgEdgeError::Malformed(error)) => HandleOutcome::NonRetryable(Reason(error.0)),
+            Err(PgEdgeError::IdentityCollision(edge_id)) => HandleOutcome::NonRetryable(Reason(
+                format!("reference edge identity collision for `{edge_id}`"),
+            )),
             Err(
                 PgEdgeError::TenantNotActiveInCell
                 | PgEdgeError::NoCoCommitTransaction
@@ -273,6 +276,7 @@ fn build_consumer(
 #[derive(Debug)]
 enum PgEdgeError {
     Malformed(ProjectError),
+    IdentityCollision(String),
     TenantNotActiveInCell,
     NoCoCommitTransaction,
     Database,
@@ -351,12 +355,9 @@ async fn upsert(
              tenant_id, region, edge_id, source, source_root, target, target_root, rel,
              rel_class, origin_event, origin_actor, created_at, zookie, tombstoned, dek_ref
          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$13,$14,$15)
-         ON CONFLICT (tenant_id, region, edge_id) DO UPDATE SET
-             source = EXCLUDED.source,
+         ON CONFLICT (tenant_id, region, source, target, rel) DO UPDATE SET
              source_root = EXCLUDED.source_root,
-             target = EXCLUDED.target,
              target_root = EXCLUDED.target_root,
-             rel = EXCLUDED.rel,
              rel_class = EXCLUDED.rel_class,
              origin_event = EXCLUDED.origin_event,
              origin_actor = EXCLUDED.origin_actor,
@@ -388,5 +389,15 @@ async fn upsert(
     .execute(connection)
     .await
     .map(|_| ())
-    .map_err(|_| PgEdgeError::Database)
+    .map_err(|error| {
+        let identity_collision = error.as_database_error().is_some_and(|database| {
+            database.code().is_some_and(|code| code == "23505")
+                && database.constraint() == Some("edge_region_identity")
+        });
+        if identity_collision {
+            PgEdgeError::IdentityCollision(row.edge_id.clone())
+        } else {
+            PgEdgeError::Database
+        }
+    })
 }

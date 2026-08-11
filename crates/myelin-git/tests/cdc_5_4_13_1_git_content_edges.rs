@@ -12,21 +12,18 @@ use myelin_git::subs::mint_pr_comment;
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 
 fn consumer_edge_id(tenant: &str, source: &str, target: &str, rel: &str) -> String {
-    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
-    const PRIME: u128 = 0x0000000001000000000000000000013b;
-    let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u128;
-            h = h.wrapping_mul(PRIME);
-        }
-        h ^= 0x00;
-        h = h.wrapping_mul(PRIME);
-    };
-    feed(tenant.as_bytes());
-    feed(source.as_bytes());
-    feed(target.as_bytes());
-    feed(rel.as_bytes());
-    format!("{h:032x}")
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"myelin.refs.edge.v2");
+    for field in [
+        tenant.as_bytes(),
+        source.as_bytes(),
+        target.as_bytes(),
+        rel.as_bytes(),
+    ] {
+        hasher.update(&(field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 #[derive(Debug, PartialEq, Eq)]

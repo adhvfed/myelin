@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use myelin_events::{
     Actor, AggregateKey, Consumer, CorrelationId, DataRole, DedupLedger, Delivered, EventEnvelope,
-    EventId, EventType, Message, Timestamp, Visibility,
+    EventId, EventType, Message, Reason, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_refs_service::{
-    build_pg_cell_edge_consumer, build_pg_edge_consumer, edge_table_migrations, PgEdgeProjector,
-    PgEdgeStore,
+    build_pg_cell_edge_consumer, build_pg_edge_consumer, edge_id, edge_table_migrations,
+    PgEdgeProjector, PgEdgeStore,
 };
 use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
 use myelin_storage::placement_durable::placement_durable_migrations;
@@ -29,6 +29,24 @@ fn admin_url() -> String {
     std::env::var("DATABASE_MIGRATION_URL").unwrap_or_else(|_| {
         app_url().replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw")
     })
+}
+
+fn legacy_edge_id(tenant: &TenantId, source: &str, target: &str, rel: &str) -> String {
+    let mut hash: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013b;
+    for field in [
+        tenant.0.as_bytes(),
+        source.as_bytes(),
+        target.as_bytes(),
+        rel.as_bytes(),
+    ] {
+        for byte in field {
+            hash ^= u128::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash = hash.wrapping_mul(PRIME);
+    }
+    format!("{hash:032x}")
 }
 
 async fn migrated_admin_pool() -> PgPool {
@@ -256,6 +274,151 @@ async fn a_delivered_reference_edge_and_its_dedup_record_commit_together() {
             event.event_id.0.clone(),
         )]
     );
+
+    story.clean_up().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_existing_reference_keeps_its_legacy_handle_as_new_events_converge() {
+    let story = ProjectorHarness::start("legacy-identity").await;
+    let source = ArtifactRef(format!("myelin://{}/chat/message/M1", story.tenant.0));
+    let target = story.issue("ENG-41");
+    let created = story.event(
+        &format!("refs-legacy-create-{}", std::process::id()),
+        "refs.edge.created",
+        "2026-08-11T00:00:01Z",
+        &source,
+        &target,
+        "links",
+        "reference",
+    );
+    assert_eq!(story.deliver(&created), Delivered::Acked);
+
+    let strong_id = edge_id(&story.tenant, &source.0, &target.0, "links");
+    let legacy_id = legacy_edge_id(&story.tenant, &source.0, &target.0, "links");
+    assert_ne!(strong_id, legacy_id);
+    sqlx::query(
+        "UPDATE edge
+            SET edge_id = $4
+          WHERE tenant_id = $1 AND region = $2 AND edge_id = $3",
+    )
+    .bind(&story.tenant.0)
+    .bind(&story.region.0)
+    .bind(&strong_id)
+    .bind(&legacy_id)
+    .execute(&story.admin)
+    .await
+    .expect("stand in for a reference persisted by the previous identity scheme");
+
+    let refreshed = story.event(
+        &format!("refs-legacy-refresh-{}", std::process::id()),
+        "refs.edge.created",
+        "2026-08-11T00:00:02Z",
+        &source,
+        &target,
+        "links",
+        "reference",
+    );
+    assert_eq!(story.deliver(&refreshed), Delivered::Acked);
+    let graph = PgEdgeStore::new(story.app.clone());
+    let backlinks = graph
+        .inbound_live(&story.tenant, &story.region, &target, 10)
+        .await
+        .expect("read the converged reference");
+    assert_eq!(backlinks.len(), 1, "replay never forks the old reference");
+    assert_eq!(
+        backlinks[0].edge_id, legacy_id,
+        "opaque handles already handed to clients remain stable"
+    );
+
+    let mut removed = story.event(
+        &format!("refs-legacy-remove-{}", std::process::id()),
+        "refs.edge.removed",
+        "2026-08-11T00:00:03Z",
+        &source,
+        &target,
+        "links",
+        "reference",
+    );
+    removed.payload = serde_json::json!({ "edge_id": legacy_id });
+    assert_eq!(story.deliver(&removed), Delivered::Acked);
+    assert!(graph
+        .inbound_live(&story.tenant, &story.region, &target, 10)
+        .await
+        .expect("read after removing through the legacy handle")
+        .is_empty());
+
+    story.clean_up().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identity_collision_is_parked_without_overwriting_either_reference() {
+    let story = ProjectorHarness::start("identity-collision").await;
+    let protected_source = ArtifactRef(format!(
+        "myelin://{}/chat/message/protected",
+        story.tenant.0
+    ));
+    let protected_target = story.issue("SAFE-1");
+    let protected = story.event(
+        &format!("refs-collision-protected-{}", std::process::id()),
+        "refs.edge.created",
+        "2026-08-11T00:00:01Z",
+        &protected_source,
+        &protected_target,
+        "links",
+        "reference",
+    );
+    assert_eq!(story.deliver(&protected), Delivered::Acked);
+
+    let incoming_source = ArtifactRef(format!("myelin://{}/chat/message/incoming", story.tenant.0));
+    let incoming_target = story.issue("NEW-1");
+    let colliding_id = edge_id(
+        &story.tenant,
+        &incoming_source.0,
+        &incoming_target.0,
+        "links",
+    );
+    sqlx::query(
+        "UPDATE edge
+            SET edge_id = $3
+          WHERE tenant_id = $1 AND region = $2",
+    )
+    .bind(&story.tenant.0)
+    .bind(&story.region.0)
+    .bind(&colliding_id)
+    .execute(&story.admin)
+    .await
+    .expect("simulate a digest collision without needing to break BLAKE3");
+
+    let incoming = story.event(
+        &format!("refs-collision-incoming-{}", std::process::id()),
+        "refs.edge.created",
+        "2026-08-11T00:00:02Z",
+        &incoming_source,
+        &incoming_target,
+        "links",
+        "reference",
+    );
+    match story.deliver(&incoming) {
+        Delivered::DeadLettered(Reason(reason)) => assert!(
+            reason.contains("identity collision"),
+            "the parked event explains the permanent conflict: {reason}"
+        ),
+        other => panic!("a durable identity collision must be parked, got {other:?}"),
+    }
+
+    let graph = PgEdgeStore::new(story.app.clone());
+    assert!(graph
+        .inbound_live(&story.tenant, &story.region, &incoming_target, 10)
+        .await
+        .expect("look for the rejected reference")
+        .is_empty());
+    let protected_backlinks = graph
+        .inbound_live(&story.tenant, &story.region, &protected_target, 10)
+        .await
+        .expect("read the protected reference");
+    assert_eq!(protected_backlinks.len(), 1);
+    assert_eq!(protected_backlinks[0].source, protected_source.0);
 
     story.clean_up().await;
 }

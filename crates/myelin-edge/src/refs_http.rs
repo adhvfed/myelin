@@ -395,6 +395,20 @@ fn canonical_root(tenant: &str, subsystem: &str, type_: &str, id: &str) -> Strin
     format!("myelin://{tenant}/{subsystem}/{type_}/{id}")
 }
 
+fn is_canonical_edge_cursor(value: &str) -> bool {
+    fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+        value.len() == expected_len
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    is_lower_hex(value, 32)
+        || value
+            .strip_prefix("blake3:")
+            .is_some_and(|digest| is_lower_hex(digest, 64))
+}
+
 fn parse_query(query: &str) -> Result<(String, usize, Option<String>), EdgeError> {
     let mut reference = None;
     let mut limit = None;
@@ -420,7 +434,7 @@ fn parse_query(query: &str) -> Result<(String, usize, Option<String>), EdgeError
                 limit = Some(parsed);
             }
             "cursor" if cursor.is_none() => {
-                if value.len() != 32 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                if !is_canonical_edge_cursor(&value) {
                     return Err(EdgeError::BadRequest(
                         "References cursor is not a canonical edge cursor".into(),
                     ));
@@ -514,6 +528,32 @@ mod tests {
             "ref=x&cursor=y",
         ] {
             assert!(parse_query(query).is_err(), "accepted `{query}`");
+        }
+    }
+
+    #[test]
+    fn backlink_cursors_accept_both_durable_identity_generations() {
+        let legacy = "0123456789abcdef0123456789abcdef";
+        let strong = format!("blake3:{}", "0123456789abcdef".repeat(4));
+        for cursor in [legacy, strong.as_str()] {
+            let query = format!("ref=x&cursor={cursor}");
+            assert_eq!(
+                parse_query(&query).unwrap().2.as_deref(),
+                Some(cursor),
+                "the cursor remains an opaque handle across the identity migration"
+            );
+        }
+        for cursor in [
+            "0123456789ABCDEF0123456789ABCDEF",
+            "0123456789abcdef0123456789abcde",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blake3:0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef",
+            "blake3:0123456789abcdef",
+        ] {
+            assert!(
+                parse_query(&format!("ref=x&cursor={cursor}")).is_err(),
+                "non-canonical cursor `{cursor}` was accepted"
+            );
         }
     }
 

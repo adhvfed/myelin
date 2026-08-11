@@ -15,6 +15,8 @@ pub const EDGE_BUILDER_CONSUMER: &str = "refs-edge-builder";
 pub const EDGE_BUILDER_SUBJECT_PREFIXES: &[&str] =
     &["refs.edge.", "issue.relation.", "knowledge.page."];
 
+const EDGE_ID_DOMAIN: &[u8] = b"myelin.refs.edge.v2";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum RelClass {
     Reference,
@@ -31,21 +33,18 @@ impl RelClass {
 }
 
 pub fn edge_id(tenant: &TenantId, source: &str, target: &str, rel: &str) -> String {
-    let mut h: u128 = 0x6c62272e07bb014262b821756295c58d;
-    const PRIME: u128 = 0x0000000001000000000000000000013b;
-    let mut feed = |bytes: &[u8]| {
-        for &b in bytes {
-            h ^= b as u128;
-            h = h.wrapping_mul(PRIME);
-        }
-        h ^= 0x00;
-        h = h.wrapping_mul(PRIME);
-    };
-    feed(tenant.0.as_bytes());
-    feed(source.as_bytes());
-    feed(target.as_bytes());
-    feed(rel.as_bytes());
-    format!("{h:032x}")
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(EDGE_ID_DOMAIN);
+    for field in [
+        tenant.0.as_bytes(),
+        source.as_bytes(),
+        target.as_bytes(),
+        rel.as_bytes(),
+    ] {
+        hasher.update(&(field.len() as u64).to_be_bytes());
+        hasher.update(field);
+    }
+    format!("blake3:{}", hasher.finalize().to_hex())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -612,8 +611,13 @@ mod tests {
         assert_ne!(
             edge_id(&t, "ab", "c", "mentions"),
             edge_id(&t, "a", "bc", "mentions"),
-            "field boundaries are unambiguous (NUL-separated)"
+            "length-prefixed field boundaries are unambiguous"
         );
+        assert!(
+            a.starts_with("blake3:"),
+            "the durable identity names its digest"
+        );
+        assert_eq!(a.len(), 71, "the full 256-bit digest is retained");
     }
 
     #[test]
