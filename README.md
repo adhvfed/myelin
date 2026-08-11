@@ -230,15 +230,19 @@ neither side needs a GitHub token.
 Three-segment events carry their subject type in the name, so `issue.issue.updated`,
 `knowledge.page.updated`, and `chat.message.created` need no extra matcher ceremony. Ambiguous
 two-segment events such as `ci.result` use `--subject-type run`. Myelin currently admits subjects
-whose live visibility can be checked end to end: CI runs; Git repositories, pull requests, and
-comments; Issues issues; Knowledge pages and rows; and Chat channels and messages. Other artifact
+whose live visibility can be checked end to end: CI runs; Git repositories and references; Git
+pull requests and comments; Issues issues; Knowledge pages and rows; and Chat
+channels and messages. Git-reference visibility follows the containing repository, so a branch
+automation cannot reveal an update from a repository its owner cannot pull. Other artifact
 types are refused at creation instead of becoming automations that can never fire.
 
 `--where` adds a bounded `myelin-query` predicate to the exact event match. It can compare scalar
 envelope fields such as `event.depth` and scalar payload fields such as `payload.change_kind`,
 using `==`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, and parentheses. A missing or
 wrongly-typed field closes only that rule as a non-match; it cannot prevent another automation
-from seeing the event. `--branch main` remains concise sugar for
+from seeing the event. The automation retains the newest evaluation error for its owner in the
+web/API and CLI output, including the event and time that exposed it. `--branch main` remains
+concise sugar for
 `payload.source_ref == 'refs/heads/main'`. CI runs keep that scope consistent: it is the pushed
 branch for push runs and the target branch for pull-request runs.
 
