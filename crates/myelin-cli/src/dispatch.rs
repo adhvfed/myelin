@@ -16,7 +16,7 @@ mod tools;
 
 pub use agents::{agent_dispatch, is_canonical_agent_id};
 pub use automations::{automation_dispatch, is_canonical_automation_id};
-pub use chat::chat_dispatch;
+pub use chat::{chat_dispatch, chat_dispatch_with_project};
 pub use issues::{issues_dispatch, issues_dispatch_with_context, issues_dispatch_with_project};
 pub use knowledge::knowledge_dispatch;
 pub use privacy::privacy_dispatch;

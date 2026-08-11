@@ -1,4 +1,5 @@
 use crate::catalogue::{page_envelope, Handler, HandlerCtx};
+use crate::chat_authz::ChatAuthorization;
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
@@ -17,7 +18,8 @@ use myelin_chat::{
 };
 use myelin_content::{InlineNode, OBJ};
 use myelin_events::{Actor, EventId, IdMinter, Timestamp};
-use myelin_identity::{Principal, PrincipalKind};
+use myelin_identity::{Principal, PrincipalKind, PrincipalStatus};
+use myelin_identity_service::StoreBackedCheck;
 use myelin_storage::{KeyClass, KmsEngine, SubjectId};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -39,15 +41,22 @@ pub struct DurableChatReadApi {
     messages: PgMessageStore,
     runtime: Handle,
     kms: Arc<KmsEngine>,
+    authorization: ChatAuthorization,
 }
 
 impl DurableChatReadApi {
-    pub fn new(pool: PgPool, runtime: Handle, kms: Arc<KmsEngine>) -> Self {
+    pub fn new(
+        pool: PgPool,
+        runtime: Handle,
+        kms: Arc<KmsEngine>,
+        identity: StoreBackedCheck,
+    ) -> Self {
         Self {
             conversations: PgConversationStore::new(pool.clone()),
             messages: PgMessageStore::new(pool, "edge", MESSAGE_TABLE),
             runtime,
             kms,
+            authorization: ChatAuthorization::new(identity),
         }
     }
 
@@ -87,6 +96,33 @@ impl DurableChatReadApi {
         if conversation.kind != ConversationKind::ChannelPublic || conversation.archived {
             return Err(EdgeError::NotFound("conversation not found".into()));
         }
+        if !self
+            .authorization
+            .may_read_channel(principal, &conversation)
+        {
+            return Err(EdgeError::NotFound("conversation not found".into()));
+        }
+        Ok(conversation)
+    }
+
+    async fn postable_public_conversation(
+        &self,
+        principal: &Principal,
+        opaque_id: &str,
+    ) -> Result<Conversation, EdgeError> {
+        let conversation = self
+            .conversations
+            .get(&self.conversation_id(principal, opaque_id))
+            .await
+            .map_err(map_conversation_error)?;
+        if conversation.kind != ConversationKind::ChannelPublic
+            || conversation.archived
+            || !self
+                .authorization
+                .may_post_to_channel(principal, &conversation)
+        {
+            return Err(EdgeError::NotFound("conversation not found".into()));
+        }
         Ok(conversation)
     }
 
@@ -97,11 +133,15 @@ impl DurableChatReadApi {
         cursor: Option<String>,
     ) -> Result<Value, EdgeError> {
         validate_query(limit, cursor.as_deref())?;
+        if principal.status != PrincipalStatus::Active {
+            return Ok(page_envelope(json!([]), None, limit as usize));
+        }
         let rows = self.drive(async {
             self.conversations
-                .list_public(
+                .list_visible_public(
                     &principal.tenant.0,
                     &principal.region.0,
+                    &principal.principal_id.0,
                     cursor.as_deref(),
                     limit + 1,
                 )
@@ -182,81 +222,105 @@ impl DurableChatMutationApi {
         self.reads.conversation_id(principal, opaque_id)
     }
 
-    async fn public_conversation(
+    fn create_public_conversation(
         &self,
         principal: &Principal,
-        opaque_id: &str,
-    ) -> Result<Conversation, EdgeError> {
-        self.reads.public_conversation(principal, opaque_id).await
-    }
-
-    async fn create_public_conversation(
-        &self,
         conversation: Conversation,
         client_nonce: &str,
         event_id: EventId,
         actor: Actor,
         now: Timestamp,
     ) -> Result<(Conversation, bool), EdgeError> {
-        match self
+        let project_id = conversation
+            .parent_project
+            .as_deref()
+            .expect("validated public conversation project");
+        if !self
             .reads
-            .conversations
-            .create_co_commit(
-                &conversation,
-                client_nonce,
-                event_id,
-                actor,
-                now.clone(),
-                now,
-            )
-            .await
+            .authorization
+            .may_view_project(principal, project_id)
         {
-            Ok(()) => Ok((conversation, true)),
-            Err(ConversationError::AlreadyExists(_)) => {
-                if let Some(existing) = self
-                    .reads
-                    .conversations
-                    .find_public_by_client_nonce(
-                        &conversation.id.tenant,
-                        &conversation.id.region,
-                        client_nonce,
-                    )
-                    .await
-                    .map_err(map_conversation_error)?
-                {
-                    if same_public_topic(&existing, &conversation) {
-                        return Ok((existing, false));
-                    }
-                    return Err(EdgeError::Conflict(
-                        "that idempotency key was already used for a different Chat conversation"
-                            .into(),
-                    ));
-                }
-                self.reads
-                    .conversations
-                    .find_public_by_name_topic(
-                        &conversation.id.tenant,
-                        &conversation.id.region,
-                        conversation
-                            .name
-                            .as_deref()
-                            .expect("validated public channel"),
-                        conversation
-                            .topic
-                            .as_deref()
-                            .expect("validated public topic"),
-                    )
-                    .await
-                    .map_err(map_conversation_error)?
-                    .map(|existing| (existing, false))
-                    .ok_or_else(|| {
-                        EdgeError::Conflict(
-                            "a topic with that channel and name already exists".into(),
-                        )
-                    })
-            }
-            Err(error) => Err(map_conversation_error(error)),
+            return Err(EdgeError::NotFound("project not found".into()));
         }
+        let (mut persisted, created) = self.drive(async {
+            match self
+                .reads
+                .conversations
+                .create_co_commit(
+                    &conversation,
+                    client_nonce,
+                    event_id,
+                    actor,
+                    now.clone(),
+                    now.clone(),
+                )
+                .await
+            {
+                Ok(()) => Ok((conversation, true)),
+                Err(ConversationError::AlreadyExists(_)) => {
+                    if let Some(existing) = self
+                        .reads
+                        .conversations
+                        .find_public_by_client_nonce(
+                            &conversation.id.tenant,
+                            &conversation.id.region,
+                            client_nonce,
+                        )
+                        .await
+                        .map_err(map_conversation_error)?
+                    {
+                        if same_public_topic(&existing, &conversation) {
+                            return Ok((existing, false));
+                        }
+                        return Err(EdgeError::Conflict(
+                            "that idempotency key was already used for a different Chat conversation"
+                                .into(),
+                        ));
+                    }
+                    self.reads
+                        .conversations
+                        .find_public_by_name_topic(
+                            &conversation.id.tenant,
+                            &conversation.id.region,
+                            conversation
+                                .parent_project
+                                .as_deref()
+                                .expect("validated public project"),
+                            conversation
+                                .name
+                                .as_deref()
+                                .expect("validated public channel"),
+                            conversation
+                                .topic
+                                .as_deref()
+                                .expect("validated public topic"),
+                        )
+                        .await
+                        .map_err(map_conversation_error)?
+                        .filter(|existing| same_public_topic(existing, &conversation))
+                        .map(|existing| (existing, false))
+                        .ok_or_else(|| {
+                            EdgeError::Conflict(
+                                "a topic with that channel and name already exists".into(),
+                            )
+                        })
+                }
+                Err(error) => Err(map_conversation_error(error)),
+            }
+        })?;
+        let zookie = self
+            .reads
+            .authorization
+            .bind_public_project(principal, &persisted, now)?;
+        self.drive(async {
+            self.reads
+                .conversations
+                .stamp_acl_zookie(&persisted.id, &zookie.0)
+                .await
+                .map_err(map_conversation_error)
+        })?;
+        persisted.acl_zookie = Some(zookie.0);
+        Ok((persisted, created))
     }
 
     pub fn post_message(
@@ -277,8 +341,10 @@ impl DurableChatMutationApi {
         validate_message(content)?;
         validate_nonce(&client_nonce)?;
         let structured_nodes = reference_nodes(actor, content, references)?;
-        let conversation =
-            self.drive(self.public_conversation(authorized_viewer, conversation_id))?;
+        let conversation = self.drive(
+            self.reads
+                .postable_public_conversation(authorized_viewer, conversation_id),
+        )?;
         let event_principal = pseudonymized_event_principal(&actor.tenant.0, actor);
         let author_kind = match actor.kind {
             PrincipalKind::Human => AuthorKind::Human,
@@ -333,6 +399,7 @@ impl DurableChatMutationApi {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CreateConversationBody {
+    project_id: String,
     channel: String,
     topic: String,
 }
@@ -368,6 +435,7 @@ impl Handler for ConversationCreateHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         require_empty_query(ctx)?;
         let body: CreateConversationBody = parse_body(&ctx.request.body)?;
+        validate_project_id(&body.project_id)?;
         validate_label("channel", &body.channel)?;
         validate_label("topic", &body.topic)?;
         let client_nonce = ctx
@@ -382,7 +450,7 @@ impl Handler for ConversationCreateHandler {
             home_cell: Conversation::home_cell_for(
                 &self.api.conversation_id(ctx.principal, opaque_id.as_str()),
             ),
-            parent_project: None,
+            parent_project: Some(body.project_id),
             name: Some(body.channel),
             topic: Some(body.topic),
             linked_ref: None,
@@ -393,13 +461,14 @@ impl Handler for ConversationCreateHandler {
             acl_zookie: None,
         };
         let now = now_timestamp();
-        let (conversation, created) = self.api.drive(self.api.create_public_conversation(
+        let (conversation, created) = self.api.create_public_conversation(
+            ctx.principal,
             conversation,
             &client_nonce,
             event_id,
             Actor(event_principal),
             now,
-        ))?;
+        )?;
         Ok(no_store(EdgeResponse::json(
             if created { 201 } else { 200 },
             &json!({ "conversation": conversation_json(&conversation), "durable": true }),
@@ -458,8 +527,9 @@ pub fn register_chat(
     pool: PgPool,
     runtime: Handle,
     kms: Arc<KmsEngine>,
+    identity: StoreBackedCheck,
 ) -> GatewayBuilder {
-    let reads = DurableChatReadApi::new(pool, runtime, kms);
+    let reads = DurableChatReadApi::new(pool, runtime, kms, identity);
     let api = DurableChatMutationApi::new(reads.clone());
     builder
         .route(
@@ -595,6 +665,17 @@ fn validate_label(field: &str, value: &str) -> Result<(), EdgeError> {
     }
 }
 
+fn validate_project_id(value: &str) -> Result<(), EdgeError> {
+    let parsed = sqlx::types::Uuid::parse_str(value)
+        .map_err(|_| EdgeError::BadRequest("Chat project_id must be a canonical UUID".into()))?;
+    if parsed.to_string() != value {
+        return Err(EdgeError::BadRequest(
+            "Chat project_id must be a canonical UUID".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_message(content: &str) -> Result<(), EdgeError> {
     if content.len() > MAX_MESSAGE_BYTES || content.trim().is_empty() {
         return Err(EdgeError::BadRequest(
@@ -693,6 +774,7 @@ fn conversation_json(conversation: &Conversation) -> Value {
     json!({
         "id": conversation.id.conversation_id,
         "ref": channel_ref(&conversation.id).0,
+        "project_id": conversation.parent_project,
         "channel": conversation.name,
         "topic": conversation.topic,
         "linked_ref": conversation.linked_ref,
@@ -701,7 +783,9 @@ fn conversation_json(conversation: &Conversation) -> Value {
 }
 
 fn same_public_topic(left: &Conversation, right: &Conversation) -> bool {
-    left.name == right.name && left.topic == right.topic
+    left.parent_project == right.parent_project
+        && left.name == right.name
+        && left.topic == right.topic
 }
 
 fn message_json(message: &Message, viewer: &str, kms: &KmsEngine) -> Result<Value, EdgeError> {
@@ -870,6 +954,8 @@ mod tests {
 
     #[test]
     fn mutation_input_rejects_blank_oversized_and_controls() {
+        assert!(validate_project_id("11111111-1111-1111-1111-111111111111").is_ok());
+        assert!(validate_project_id("11111111-1111-1111-1111-11111111111A").is_err());
         assert!(validate_label("channel", "engineering").is_ok());
         assert!(validate_label("channel", " engineering").is_err());
         assert!(validate_message("Ship it\nwith care").is_ok());

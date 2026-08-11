@@ -10,7 +10,7 @@ use myelin_cli::device_auth::{
     begin_authorization, new_authorization_request, wait_for_authorization,
 };
 use myelin_cli::dispatch::{
-    agent_dispatch, automation_dispatch, chat_dispatch, ci_dispatch, git_dispatch,
+    agent_dispatch, automation_dispatch, chat_dispatch_with_project, ci_dispatch, git_dispatch,
     is_canonical_project_id, issues_dispatch_with_context, knowledge_dispatch, notif_dispatch,
     privacy_dispatch, project_dispatch, refs_dispatch, repo_dispatch, tool_dispatch, EdgeCall,
     HttpMethod, RetryPolicy,
@@ -272,7 +272,15 @@ async fn run() -> Result<(), CliError> {
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Chat { args } => {
-            let (call, command_key) = dispatch_command(args, chat_dispatch)?;
+            let project = resolve_project(
+                cli.project.as_deref(),
+                cli.profile.as_deref(),
+                &getenv,
+                &read_file,
+            )?;
+            let (call, command_key) = dispatch_command(args, |args| {
+                chat_dispatch_with_project(args, project.as_deref())
+            })?;
             run_call(&cli, &getenv, &read_file, call, command_key).await
         }
         Command::Knowledge { args } => {
@@ -904,7 +912,10 @@ mod tests {
             "--idempotency-key".into(),
             "release-room".into(),
         ];
-        let (call, key) = dispatch_command(&args, chat_dispatch).unwrap();
+        let (call, key) = dispatch_command(&args, |args| {
+            chat_dispatch_with_project(args, Some("11111111-1111-1111-1111-111111111111"))
+        })
+        .unwrap();
         assert_eq!(call.path, "/v1/chat/conversations");
         assert_eq!(key, Some("release-room"));
     }
@@ -921,7 +932,9 @@ mod tests {
             ],
         ] {
             assert_eq!(
-                dispatch_command(&args, chat_dispatch).unwrap_err().code(),
+                dispatch_command(&args, myelin_cli::dispatch::chat_dispatch)
+                    .unwrap_err()
+                    .code(),
                 2
             );
         }

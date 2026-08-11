@@ -3,6 +3,8 @@
 const ULID_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const AUTHOR = "chat-author:0123456789abcdef0123456789abcdef";
 const OTHER_AUTHOR = "chat-author:fedcba9876543210fedcba9876543210";
+const TENANT = "acme";
+const PROJECT_ID = "20aee030-c7fa-4757-8243-700faf528690";
 
 function encodeBase32(value, length) {
   let current = BigInt(value);
@@ -28,6 +30,11 @@ function cleanLabel(value) {
     value.trim() === value && !/\p{Cc}/u.test(value);
 }
 
+function canonicalProjectId(value) {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value);
+}
+
 function cleanMessage(value) {
   return typeof value === "string" && value.trim().length > 0 &&
     Buffer.byteLength(value, "utf8") <= 32 * 1024 &&
@@ -40,6 +47,8 @@ function cleanMessage(value) {
 function conversationJson(row) {
   return {
     id: row.id,
+    ref: `myelin://${TENANT}/chat/channel/${row.id}`,
+    project_id: row.project_id,
     channel: row.channel,
     topic: row.topic,
     linked_ref: null,
@@ -68,9 +77,9 @@ export class ChatFixtures {
   reset({ empty = false } = {}) {
     this.sequence = 20;
     this.conversations = empty ? [] : [
-      { id: fixtureUlid(1), channel: "engineering", topic: "release readiness" },
-      { id: fixtureUlid(2), channel: "engineering", topic: "agent operations" },
-      { id: fixtureUlid(3), channel: "product", topic: "customer feedback" },
+      { id: fixtureUlid(1), project_id: PROJECT_ID, channel: "engineering", topic: "release readiness" },
+      { id: fixtureUlid(2), project_id: PROJECT_ID, channel: "engineering", topic: "agent operations" },
+      { id: fixtureUlid(3), project_id: PROJECT_ID, channel: "product", topic: "customer feedback" },
     ];
     this.messages = new Map();
     if (!empty) {
@@ -117,12 +126,19 @@ export class ChatFixtures {
   }
 
   createConversation(body) {
-    if (!exactObject(body, ["channel", "topic"]) ||
+    if (!exactObject(body, ["project_id", "channel", "topic"]) ||
+        !canonicalProjectId(body.project_id) ||
         !cleanLabel(body.channel) || !cleanLabel(body.topic)) return { status: 400 };
-    if (this.conversations.some((row) => row.channel === body.channel && row.topic === body.topic)) {
+    if (this.conversations.some((row) => row.project_id === body.project_id &&
+        row.channel === body.channel && row.topic === body.topic)) {
       return { status: 409 };
     }
-    const row = { id: fixtureUlid(++this.sequence), channel: body.channel, topic: body.topic };
+    const row = {
+      id: fixtureUlid(++this.sequence),
+      project_id: body.project_id,
+      channel: body.channel,
+      topic: body.topic,
+    };
     this.conversations.push(row);
     this.messages.set(row.id, []);
     return {

@@ -4,6 +4,7 @@ pub mod agent_mcp_http;
 pub mod authz;
 pub mod bootstrap;
 pub mod catalogue;
+mod chat_authz;
 pub mod chat_effect;
 pub mod chat_http;
 pub mod ci_http;

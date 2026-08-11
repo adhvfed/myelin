@@ -11,6 +11,8 @@ import {
 
 const conversation = (id: string, channel: string, topic: string): ChatConversation => ({
   id,
+  ref: `myelin://acme/chat/channel/${id}`,
+  project_id: "11111111-1111-1111-1111-111111111111",
   channel,
   topic,
   linked_ref: null,

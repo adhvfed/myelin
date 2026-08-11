@@ -5,6 +5,13 @@ use super::{CliError, EdgeCall, FormQuery, RetryPolicy};
 const DEFAULT_LIMIT: u16 = 50;
 
 pub fn chat_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
+    chat_dispatch_with_project(args, None)
+}
+
+pub fn chat_dispatch_with_project(
+    args: &[&str],
+    default_project: Option<&str>,
+) -> Result<EdgeCall, CliError> {
     let (verb, rest) = args.split_first().ok_or_else(|| {
         CliError::Usage(
             "no chat command (try: list | create <channel> --topic <topic> | history <id> | send <id> <message> | ref <id> <ArtifactRef>)"
@@ -16,7 +23,7 @@ pub fn chat_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
             let page = PageArgs::parse(rest, "--cursor")?;
             Ok(page.call("/v1/chat/conversations", "cursor"))
         }
-        "create" => create_conversation(rest),
+        "create" => create_conversation(rest, default_project),
         "history" => {
             let (conversation, flags) = target_and_flags("history", rest)?;
             canonical_ulid("conversation id", conversation)?;
@@ -34,7 +41,7 @@ pub fn chat_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
     }
 }
 
-fn create_conversation(args: &[&str]) -> Result<EdgeCall, CliError> {
+fn create_conversation(args: &[&str], default_project: Option<&str>) -> Result<EdgeCall, CliError> {
     let Some((channel, flags)) = args.split_first() else {
         return Err(CliError::Usage(
             "`chat create` needs a <channel> and --topic <topic>".into(),
@@ -42,6 +49,7 @@ fn create_conversation(args: &[&str]) -> Result<EdgeCall, CliError> {
     };
     clean_text("channel", channel, 255)?;
     let mut topic = None;
+    let mut project = None;
     let mut index = 0;
     while index < flags.len() {
         let flag = flags[index];
@@ -51,6 +59,8 @@ fn create_conversation(args: &[&str]) -> Result<EdgeCall, CliError> {
         match flag {
             "--topic" if topic.is_none() => topic = Some(*value),
             "--topic" => return Err(CliError::Usage("duplicate chat flag `--topic`".into())),
+            "--project" if project.is_none() => project = Some(*value),
+            "--project" => return Err(CliError::Usage("duplicate chat flag `--project`".into())),
             other => {
                 return Err(CliError::Usage(format!(
                     "unknown chat create flag `{other}`"
@@ -62,9 +72,20 @@ fn create_conversation(args: &[&str]) -> Result<EdgeCall, CliError> {
     let topic =
         topic.ok_or_else(|| CliError::Usage("`chat create` needs --topic <topic>".into()))?;
     clean_text("topic", topic, 255)?;
+    let project = project.or(default_project).ok_or_else(|| {
+        CliError::Usage(
+            "chat create needs a project; pass --project or run `myelin context use --project <project>`"
+                .into(),
+        )
+    })?;
+    if !super::is_canonical_project_id(project) {
+        return Err(CliError::Usage(
+            "chat project must be a canonical lowercase UUID".into(),
+        ));
+    }
     Ok(EdgeCall::post_json(
         "/v1/chat/conversations",
-        json!({ "channel": channel, "topic": topic }),
+        json!({ "project_id": project, "channel": channel, "topic": topic }),
     ))
 }
 
@@ -211,6 +232,8 @@ mod tests {
     use crate::dispatch::HttpMethod;
 
     const CONVERSATION: &str = "01J00000000000000000000000";
+    const PROJECT: &str = "11111111-1111-1111-1111-111111111111";
+    const OTHER_PROJECT: &str = "22222222-2222-2222-2222-222222222222";
 
     #[test]
     fn list_and_history_map_to_bounded_cursor_routes() {
@@ -243,14 +266,40 @@ mod tests {
 
     #[test]
     fn create_send_and_ref_map_to_the_shared_public_mutations() {
-        let create =
-            chat_dispatch(&["create", "engineering", "--topic", "Release coordination"]).unwrap();
+        let create = chat_dispatch_with_project(
+            &["create", "engineering", "--topic", "Release coordination"],
+            Some(PROJECT),
+        )
+        .unwrap();
         assert_eq!(create.method, HttpMethod::Post);
         assert_eq!(create.path, "/v1/chat/conversations");
         assert_eq!(
             serde_json::from_slice::<serde_json::Value>(create.payload.as_deref().unwrap())
                 .unwrap(),
-            json!({"channel": "engineering", "topic": "Release coordination"})
+            json!({
+                "project_id": PROJECT,
+                "channel": "engineering",
+                "topic": "Release coordination"
+            })
+        );
+        let explicit_project = chat_dispatch_with_project(
+            &[
+                "create",
+                "engineering",
+                "--topic",
+                "Release coordination",
+                "--project",
+                OTHER_PROJECT,
+            ],
+            Some(PROJECT),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                explicit_project.payload.as_deref().unwrap()
+            )
+            .unwrap()["project_id"],
+            OTHER_PROJECT,
         );
 
         let send = chat_dispatch(&["send", CONVERSATION, "Ready for review."]).unwrap();
@@ -290,6 +339,7 @@ mod tests {
             vec!["ref", CONVERSATION, "not-a-reference"],
             vec!["ref", CONVERSATION],
             vec!["create", "engineering"],
+            vec!["create", "engineering", "--topic", "x"],
             vec!["create", " engineering", "--topic", "x"],
         ] {
             assert_eq!(chat_dispatch(&args).unwrap_err().code(), 2, "{args:?}");

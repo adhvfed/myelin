@@ -60,7 +60,7 @@ function segment(value: string): string {
   return encodeURIComponent(value);
 }
 
-/** Public channel topics visible to the authenticated tenant member. */
+/** Public channel topics visible through the authenticated principal's projects. */
 export const getChatConversations = query(async (request: {
   cursor?: string;
   limit?: number;
@@ -136,14 +136,22 @@ export const chatMutate = action(async (mutation: ChatMutation) => {
       return result({ ok: false, error: "bad-input" });
     }
     if (mutation.op === "create-conversation") {
-      const parsed = parseChatConversationDraft({ channel: mutation.channel, topic: mutation.topic });
+      const parsed = parseChatConversationDraft({
+        projectId: mutation.projectId,
+        channel: mutation.channel,
+        topic: mutation.topic,
+      });
       if (!parsed || Object.keys(mutation).some((key) =>
-        !["op", "channel", "topic"].includes(key))) {
+        !["op", "projectId", "channel", "topic"].includes(key))) {
         return result({ ok: false, error: "bad-input" });
       }
       const receipt = await chatAuthed(async () => {
         const decoded = parseChatConversationReceipt(
-          await edgePost("/v1/chat/conversations", parsed),
+          await edgePost("/v1/chat/conversations", {
+            project_id: parsed.projectId,
+            channel: parsed.channel,
+            topic: parsed.topic,
+          }),
         );
         if (!decoded) throw new ChatRouteError("error");
         return decoded;

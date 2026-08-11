@@ -1155,7 +1155,12 @@ async fn serve(
         handle.clone(),
     );
     builder = register_privacy(builder, agent_traces, handle.clone());
-    let mcp_chat = DurableChatReadApi::new(provider.db_pool().clone(), handle.clone(), kms.clone());
+    let mcp_chat = DurableChatReadApi::new(
+        provider.db_pool().clone(),
+        handle.clone(),
+        kms.clone(),
+        check.clone(),
+    );
     builder = register_agent_mcp(
         builder,
         AgentMcpServices::new(
@@ -1189,6 +1194,7 @@ async fn serve(
         provider.db_pool().clone(),
         handle.clone(),
         kms.clone(),
+        check.clone(),
     );
     builder = register_knowledge(
         builder,

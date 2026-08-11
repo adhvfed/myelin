@@ -1,8 +1,12 @@
+import { isProjectId } from "./project-contract";
+
 const utf8 = new TextEncoder();
 type WireRecord = Record<string, unknown>;
 
 export interface ChatConversation {
   id: string;
+  ref: string;
+  project_id: string;
   channel: string;
   topic: string;
   linked_ref: string | null;
@@ -45,6 +49,7 @@ export interface ChatMessageReceipt {
 }
 
 export interface ChatConversationDraft {
+  projectId: string;
   channel: string;
   topic: string;
 }
@@ -86,8 +91,9 @@ function nullableText(value: unknown, maximum: number): value is string | null {
 
 function conversation(value: unknown): ChatConversation | null {
   const row = record(value);
-  if (!row || !exact(row, ["id", "channel", "topic", "linked_ref", "pinned_canvas"]) ||
-      !isChatUlid(row.id) || !cleanText(row.channel, 255) || !cleanText(row.topic, 255) ||
+  if (!row || !exact(row, ["id", "ref", "project_id", "channel", "topic", "linked_ref", "pinned_canvas"]) ||
+      !isChatUlid(row.id) || !cleanText(row.ref, 4 * 1024) || !isProjectId(row.project_id) ||
+      !cleanText(row.channel, 255) || !cleanText(row.topic, 255) ||
       !nullableText(row.linked_ref, 4 * 1024) || !nullableText(row.pinned_canvas, 4 * 1024)) {
     return null;
   }
@@ -160,10 +166,11 @@ export function parseChatMessageReceipt(value: unknown): ChatMessageReceipt | nu
 
 export function parseChatConversationDraft(value: unknown): ChatConversationDraft | null {
   const draft = record(value);
-  if (!draft || !exact(draft, ["channel", "topic"]) ||
-      !cleanText(draft.channel, 255) || !cleanText(draft.topic, 255) ||
+  if (!draft || !exact(draft, ["projectId", "channel", "topic"]) ||
+      !isProjectId(draft.projectId) || !cleanText(draft.channel, 255) ||
+      !cleanText(draft.topic, 255) ||
       draft.channel.trim() !== draft.channel || draft.topic.trim() !== draft.topic) return null;
-  return { channel: draft.channel, topic: draft.topic };
+  return { projectId: draft.projectId, channel: draft.channel, topic: draft.topic };
 }
 
 export function parseChatMessageDraft(value: unknown): ChatMessageDraft | null {

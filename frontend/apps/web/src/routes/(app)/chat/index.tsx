@@ -222,6 +222,7 @@ export default function ChatIndex() {
 
       <ChatTopicDialog
         open={createOpen()}
+        preferredProjectId={selectedConversation()?.project_id}
         onClose={closeCreate}
         onCreated={(receipt) => {
           void revalidate("chat-conversations");

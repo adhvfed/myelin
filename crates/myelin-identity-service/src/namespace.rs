@@ -417,10 +417,28 @@ impl NamespaceEngine {
         }
         match rewrite {
             Userset::Relation(r) => {
-                matches!(
+                if matches!(
                     engine.check(scope, subject, r, object, at, None),
                     myelin_identity::Decision::Allow
-                )
+                ) {
+                    return true;
+                }
+                engine
+                    .direct_subjects(scope, object, r, at)
+                    .iter()
+                    .filter_map(|userset| crate::check_engine::parse_userset(userset))
+                    .any(|(parent_id, parent_relation)| {
+                        self.eval(
+                            engine,
+                            scope,
+                            subject,
+                            &type_of_object_id(parent_id),
+                            parent_relation,
+                            &ArtifactRef(parent_id.into()),
+                            at,
+                            depth + 1,
+                        )
+                    })
             }
             Userset::Union(arms) => arms
                 .iter()
@@ -639,6 +657,42 @@ mod tests {
             "project",
             "view",
             &ArtifactRef("project:web".into()),
+            &latest(),
+        ));
+    }
+
+    #[test]
+    fn a_relation_can_name_a_computed_userset() {
+        let mut ns = NamespaceEngine::with_core_hierarchy();
+        assert!(matches!(
+            ns.admit(&crate::chat_fragment::channel_fragment()),
+            FragmentAdmit::Admitted { .. }
+        ));
+        let s = scope("acme");
+        let eng = engine_with(
+            &s,
+            &[
+                add("project:web", "reader", "p:alice"),
+                add("channel:release", "member", "project:web#view"),
+            ],
+        );
+
+        assert!(ns.permits(
+            &eng,
+            &s,
+            &subject("p:alice"),
+            "channel",
+            "post",
+            &ArtifactRef("channel:release".into()),
+            &latest(),
+        ));
+        assert!(!ns.permits(
+            &eng,
+            &s,
+            &subject("p:bob"),
+            "channel",
+            "post",
+            &ArtifactRef("channel:release".into()),
             &latest(),
         ));
     }

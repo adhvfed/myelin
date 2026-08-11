@@ -1100,13 +1100,14 @@ command = ["true"]
     );
   });
 
-  test("creates a public conversation and exchanges durable messages", async () => {
+  test("lets project collaborators talk while private project rooms stay absent", async () => {
     const channel = uniqueName("system-chat");
     const topic = "Coordinate the externally tested release";
+    const projectId = systemTestConfig.issues.projectId;
     const conversationRetryKey = `conversation-${randomUUID()}`;
     const created = await systemClient.json("/v1/chat/conversations", {
       method: "POST",
-      body: { channel, topic },
+      body: { project_id: projectId, channel, topic },
       idempotencyKey: conversationRetryKey,
       expectedStatus: 201,
     });
@@ -1114,24 +1115,26 @@ command = ["true"]
     const conversationId = string(conversation.id, "conversation id");
     expect(created.body).toMatchObject({ durable: true });
     expect(conversation).toMatchObject({
+      ref: `myelin://${systemTestConfig.tenant}/chat/channel/${conversationId}`,
+      project_id: projectId,
       channel,
       topic,
     });
 
     const retriedCreate = await systemClient.json("/v1/chat/conversations", {
       method: "POST",
-      body: { channel, topic },
+      body: { project_id: projectId, channel, topic },
       idempotencyKey: conversationRetryKey,
       expectedStatus: 200,
     });
     expect(retriedCreate.body).toMatchObject({
       durable: true,
-      conversation: { id: conversationId, channel, topic },
+      conversation: { id: conversationId, project_id: projectId, channel, topic },
     });
 
     const conflictingRetry = await systemClient.json("/v1/chat/conversations", {
       method: "POST",
-      body: { channel: `${channel}-different`, topic },
+      body: { project_id: projectId, channel: `${channel}-different`, topic },
       idempotencyKey: conversationRetryKey,
       expectedStatus: 409,
     });
@@ -1141,6 +1144,60 @@ command = ["true"]
     expect(array(listed.body.items, "conversation list items")).toEqual(
       expect.arrayContaining([expect.objectContaining({ id: conversationId, channel })]),
     );
+
+    const privateProject = await systemClient.json("/v1/projects", {
+      method: "POST",
+      body: {
+        name: uniqueName("Private project room"),
+        issue_prefix: `C${randomUUID().replaceAll("-", "").slice(0, 7).toUpperCase()}`,
+      },
+      idempotencyKey: `private-chat-project-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const privateProjectId = string(
+      record(privateProject.body.project, "private Chat project").id,
+      "private Chat project id",
+    );
+    const privateRoom = await systemClient.json("/v1/chat/conversations", {
+      method: "POST",
+      body: {
+        project_id: privateProjectId,
+        channel,
+        topic,
+      },
+      idempotencyKey: `private-chat-room-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const privateRoomId = string(
+      record(privateRoom.body.conversation, "private project conversation").id,
+      "private project conversation id",
+    );
+    const foundersRooms = await systemClient.json("/v1/chat/conversations?limit=100");
+    expect(array(foundersRooms.body.items, "founder's project conversations")).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: conversationId, project_id: projectId, channel, topic }),
+        expect.objectContaining({ id: privateRoomId, project_id: privateProjectId, channel, topic }),
+      ]),
+    );
+    const peerRooms = await reviewerClient.json("/v1/chat/conversations?limit=100");
+    expect(array(peerRooms.body.items, "peer's project conversations")).not.toEqual(
+      expect.arrayContaining([expect.objectContaining({ id: privateRoomId })]),
+    );
+    const absentPrivateHistory = await reviewerClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(privateRoomId)}/messages?limit=10`,
+      { expectedStatus: 404 },
+    );
+    expect(absentPrivateHistory.body).toMatchObject({ error: { code: "not_found" } });
+    const absentPrivatePost = await reviewerClient.json(
+      `/v1/chat/conversations/${encodeURIComponent(privateRoomId)}/messages`,
+      {
+        method: "POST",
+        body: { content: "I should not be able to discover this room." },
+        idempotencyKey: `private-chat-probe-${randomUUID()}`,
+        expectedStatus: 404,
+      },
+    );
+    expect(absentPrivatePost.body).toMatchObject({ error: { code: "not_found" } });
 
     const firstRetryKey = `author-${randomUUID()}`;
     const first = await systemClient.json(
@@ -1679,6 +1736,7 @@ command = ["true"]
     const created = await systemClient.json("/v1/chat/conversations", {
       method: "POST",
       body: {
+        project_id: systemTestConfig.issues.projectId,
         channel: uniqueName("system-chat-ref"),
         topic: "Share work without copying it",
       },

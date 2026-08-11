@@ -11,8 +11,12 @@ import {
 
 const ID = "01J00000000000000000000000";
 const NEXT = "01J00000000000000000000001";
+const PROJECT = "11111111-1111-1111-1111-111111111111";
+const REF = `myelin://acme/chat/channel/${ID}`;
 const conversation = {
   id: ID,
+  ref: REF,
+  project_id: PROJECT,
   channel: "engineering",
   topic: "release readiness",
   linked_ref: null,
@@ -71,7 +75,12 @@ describe("Chat wire projection", () => {
 
 describe("Chat mutation input", () => {
   it("accepts clean topic and message drafts", () => {
-    expect(parseChatConversationDraft({ channel: "engineering", topic: "release" })).toEqual({
+    expect(parseChatConversationDraft({
+      projectId: PROJECT,
+      channel: "engineering",
+      topic: "release",
+    })).toEqual({
+      projectId: PROJECT,
       channel: "engineering",
       topic: "release",
     });
@@ -83,7 +92,11 @@ describe("Chat mutation input", () => {
   });
 
   it("rejects whitespace labels, blank messages, controls, and extra scope", () => {
-    expect(parseChatConversationDraft({ channel: " engineering", topic: "release" })).toBeNull();
+    expect(parseChatConversationDraft({
+      projectId: PROJECT,
+      channel: " engineering",
+      topic: "release",
+    })).toBeNull();
     expect(parseChatMessageDraft({
       conversationId: ID,
       content: "  ",
@@ -94,7 +107,12 @@ describe("Chat mutation input", () => {
       content: "bad\0message",
       clientNonce: "nonce",
     })).toBeNull();
-    expect(parseChatConversationDraft({ channel: "engineering", topic: "release", tenant: "x" }))
+    expect(parseChatConversationDraft({
+      projectId: PROJECT,
+      channel: "engineering",
+      topic: "release",
+      tenant: "x",
+    }))
       .toBeNull();
   });
 });

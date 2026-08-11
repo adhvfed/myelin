@@ -8,8 +8,7 @@ function mergeProjects(created: ProjectVM[], first?: ProjectPage, extra: Project
   return [...new Map(rows.map((project) => [project.id, project])).values()];
 }
 
-/** Reactive, authorized project choices for mutation dialogs. Pagination and local creation are
- * kept here so the issue form only coordinates its two deliberate user steps. */
+/** Reactive, authorized project choices shared by project-scoped mutation dialogs. */
 export function createProjectCatalogue() {
   const initial = createAsync(() => getProjects({ limit: 50 }), { deferStream: true });
   const [extraPages, setExtraPages] = createSignal<ProjectPage[]>([]);

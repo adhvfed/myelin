@@ -1,6 +1,7 @@
 import { Dialog, Icon } from "@myelin/design-system";
 import { useAction } from "@solidjs/router";
 import { createEffect, createSignal, Show } from "solid-js";
+import { createProjectCatalogue } from "~/components/projects/project-catalogue";
 import {
   issuesMutate,
   type IssueCreateReceipt,
@@ -10,7 +11,6 @@ import { issueTitleError } from "~/lib/issue-view";
 import { createProject, type ProjectErrorKind } from "~/lib/project-api";
 import { projectNameError, projectPrefixError } from "~/lib/project-contract";
 import { IssueDraftFields, ProjectSetupFields } from "./IssueCreateFields";
-import { createProjectCatalogue } from "./project-catalogue";
 
 export interface IssueCreateDialogProps {
   open: boolean;
