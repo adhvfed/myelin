@@ -93,6 +93,46 @@ pub struct CreateIssue {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CreateIssueIntent {
+    pub project_id: String,
+    pub type_id: Option<String>,
+    pub prefix: Option<String>,
+    pub title: String,
+}
+
+impl CreateIssueIntent {
+    pub fn explicit(proposal: &CreateIssue) -> Self {
+        Self {
+            project_id: proposal.project_id.clone(),
+            type_id: Some(proposal.type_id.clone()),
+            prefix: Some(proposal.prefix.clone()),
+            title: proposal.title.clone(),
+        }
+    }
+
+    fn validate_resolution(&self, proposal: &CreateIssue) -> Result<(), IssueStoreError> {
+        let type_matches = self
+            .type_id
+            .as_ref()
+            .is_none_or(|type_id| type_id == &proposal.type_id);
+        let prefix_matches = self
+            .prefix
+            .as_ref()
+            .is_none_or(|prefix| prefix == &proposal.prefix);
+        if self.project_id != proposal.project_id
+            || self.title != proposal.title
+            || !type_matches
+            || !prefix_matches
+        {
+            return Err(IssueStoreError::BadInput(
+                "resolved issue does not match the caller's create intent".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IssueCreationReceipt {
     pub id: String,
     pub key: String,
@@ -366,7 +406,21 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         proposal: CreateIssue,
         caller_key: &str,
     ) -> Result<IssueCreationOutcome, IssueStoreError> {
-        let identity = CreateIdentity::new(actor, caller_key, &proposal)?;
+        let intent = CreateIssueIntent::explicit(&proposal);
+        self.create_idempotent_from_intent(actor, authorized_viewer, proposal, intent, caller_key)
+            .await
+    }
+
+    pub async fn create_idempotent_from_intent(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        proposal: CreateIssue,
+        intent: CreateIssueIntent,
+        caller_key: &str,
+    ) -> Result<IssueCreationOutcome, IssueStoreError> {
+        intent.validate_resolution(&proposal)?;
+        let identity = CreateIdentity::new(actor, caller_key, &intent, &proposal)?;
         self.create_inner(
             actor,
             authorized_viewer,
@@ -440,7 +494,28 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         proposal: CreateIssue,
         caller_key: &str,
     ) -> Result<IssueCreationOutcome, IssueStoreError> {
-        let identity = CreateIdentity::new(actor, caller_key, &proposal)?;
+        let intent = CreateIssueIntent::explicit(&proposal);
+        self.create_idempotent_from_intent_then_abort_for_test(
+            actor,
+            authorized_viewer,
+            proposal,
+            intent,
+            caller_key,
+        )
+        .await
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn create_idempotent_from_intent_then_abort_for_test(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        proposal: CreateIssue,
+        intent: CreateIssueIntent,
+        caller_key: &str,
+    ) -> Result<IssueCreationOutcome, IssueStoreError> {
+        intent.validate_resolution(&proposal)?;
+        let identity = CreateIdentity::new(actor, caller_key, &intent, &proposal)?;
         self.create_inner(
             actor,
             authorized_viewer,

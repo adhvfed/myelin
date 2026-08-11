@@ -1035,10 +1035,11 @@ command = ["true"]
     );
 
     const firstIssueTitle = uniqueName("Make the first project useful");
+    const firstIssueRetryKey = `first-project-issue-${randomUUID()}`;
     const firstIssue = await systemClient.json("/v1/issues", {
       method: "POST",
       body: { project_id: projectId, title: firstIssueTitle },
-      idempotencyKey: `first-project-issue-${randomUUID()}`,
+      idempotencyKey: firstIssueRetryKey,
       expectedStatus: 202,
     });
     const issue = record(firstIssue.body.issue, "first project issue");
@@ -1049,6 +1050,18 @@ command = ["true"]
     });
     expect(firstIssue.body).not.toHaveProperty("type_id");
     const requestEventId = string(issueAuthorization.request_event_id, "first issue authorization id");
+    const retriedFirstIssue = await systemClient.json("/v1/issues", {
+      method: "POST",
+      body: { project_id: projectId, title: firstIssueTitle },
+      idempotencyKey: firstIssueRetryKey,
+      expectedStatus: 200,
+    });
+    expect(retriedFirstIssue.body).toMatchObject({
+      created: false,
+      durable: true,
+      issue: { id: issue.id, key: issue.key, project_id: projectId },
+      authorization: { status: "pending", request_event_id: requestEventId },
+    });
     const activeIssue = await eventually<JsonRecord>(async () => {
       const response = await systemClient.json(
         `/v1/issues/authorization-requests/${encodeURIComponent(requestEventId)}`,

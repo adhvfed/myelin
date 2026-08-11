@@ -7,10 +7,10 @@ use crate::request::EdgeResponse;
 use crate::{Method, StoreBackedIssueAuthorizer};
 use myelin_identity_service::{PgProjectStore, Project, ProjectError};
 use myelin_issues::{
-    api::IssueListState, is_canonical_request_event_id, CreateIssue, IssueAuthorizationStatus,
-    IssueAuthorizer, IssueCreationOutcome, IssueLifecycleRel, IssuePageRequest, IssuePermission,
-    IssueRelationCreationOutcome, IssueStoreError, PgIssueStore, StoredIssue, StoredIssueRelation,
-    MAX_RELATIONS_PER_ISSUE,
+    api::IssueListState, is_canonical_request_event_id, CreateIssue, CreateIssueIntent,
+    IssueAuthorizationStatus, IssueAuthorizer, IssueCreationOutcome, IssueLifecycleRel,
+    IssuePageRequest, IssuePermission, IssueRelationCreationOutcome, IssueStoreError, PgIssueStore,
+    StoredIssue, StoredIssueRelation, MAX_RELATIONS_PER_ISSUE,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -129,11 +129,20 @@ impl DurableIssueMutationApi {
         request: IssueCreateRequest,
         caller_key: &str,
     ) -> Result<IssueCreationOutcome, EdgeError> {
+        let intent = CreateIssueIntent {
+            project_id: request.project_id.clone(),
+            type_id: request.type_id.clone(),
+            prefix: request.prefix.clone(),
+            title: request.title.clone(),
+        };
         let proposal = resolve_create(self, authorized_viewer, request)?;
-        self.drive(
-            self.store
-                .create_idempotent(actor, authorized_viewer, proposal, caller_key),
-        )
+        self.drive(self.store.create_idempotent_from_intent(
+            actor,
+            authorized_viewer,
+            proposal,
+            intent,
+            caller_key,
+        ))
         .map_err(map_store_error)
     }
 

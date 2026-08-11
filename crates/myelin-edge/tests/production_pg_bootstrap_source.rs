@@ -253,7 +253,7 @@ fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallb
     let routes = include_str!("../src/issues_http.rs");
     assert!(routes.contains("/v1/issues"));
     assert!(routes.contains("self.store.list(principal, request)"));
-    assert!(routes.contains(".create_idempotent(actor, authorized_viewer, proposal, caller_key)"));
+    assert!(routes.contains(".create_idempotent_from_intent("));
     assert!(routes.contains("self.store.view(principal, issue_id)"));
     assert!(routes.contains("self.api.store.close(ctx.principal, id)"));
     assert!(routes.contains("/v1/issues/{issue}/relations"));

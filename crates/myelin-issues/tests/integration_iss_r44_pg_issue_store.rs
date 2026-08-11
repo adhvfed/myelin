@@ -12,9 +12,9 @@ use myelin_issues::events::{
     ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CREATED, RELATION_CREATED, RELATION_REMOVED,
 };
 use myelin_issues::{
-    issues_hot_tables, issues_migrations, CreateIssue, ImportIssue, IssueAuthorizationBinding,
-    IssueAuthorizer, IssueLifecycleRel, IssuePageRequest, IssuePermission, IssueStoreError,
-    IssueTupleWriter, PgIssueStore, SourceSystem, VisibleIssues,
+    issues_hot_tables, issues_migrations, CreateIssue, CreateIssueIntent, ImportIssue,
+    IssueAuthorizationBinding, IssueAuthorizer, IssueLifecycleRel, IssuePageRequest,
+    IssuePermission, IssueStoreError, IssueTupleWriter, PgIssueStore, SourceSystem, VisibleIssues,
 };
 use myelin_storage::{
     all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
@@ -414,6 +414,47 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .expect("the retry returns its original issue");
     assert!(!replayed_create.created);
     assert_eq!(replayed_create.receipt, first_create.receipt);
+
+    let original_defaults = proposal("DFT", "retry across changed project defaults");
+    let defaulted_intent = CreateIssueIntent {
+        project_id: original_defaults.project_id.clone(),
+        type_id: None,
+        prefix: None,
+        title: original_defaults.title.clone(),
+    };
+    let first_defaulted = race_store
+        .create_idempotent_from_intent(
+            &creator,
+            &creator,
+            original_defaults.clone(),
+            defaulted_intent.clone(),
+            "create-with-project-defaults",
+        )
+        .await
+        .expect("the original project defaults create one issue");
+    let mut changed_defaults = original_defaults;
+    changed_defaults.type_id = "33333333-3333-3333-3333-333333333333".into();
+    let replayed_after_default_change = race_store
+        .create_idempotent_from_intent(
+            &creator,
+            &creator,
+            changed_defaults,
+            defaulted_intent,
+            "create-with-project-defaults",
+        )
+        .await
+        .expect("a changed project default cannot strand the caller's receipt");
+    assert!(first_defaulted.created);
+    assert!(!replayed_after_default_change.created);
+    assert_eq!(
+        replayed_after_default_change.receipt, first_defaulted.receipt,
+        "the durable caller intent, not today's defaults, identifies the request"
+    );
+    store
+        .reconcile_authorization(&worker, &first_defaulted.receipt.id, &writer)
+        .await
+        .expect("the default-backed issue follows the ordinary authorization saga");
+
     assert!(matches!(
         race_store
             .create_idempotent(

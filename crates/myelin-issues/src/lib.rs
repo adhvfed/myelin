@@ -78,7 +78,7 @@ pub use migrations::{
 };
 pub use migrations::{CREATE_IMPORT_MAP_DDL, IMPORT_MAP_TABLE};
 pub use pg_issue_store::{
-    is_canonical_request_event_id, CreateIssue, IssueAuthorizationBinding,
+    is_canonical_request_event_id, CreateIssue, CreateIssueIntent, IssueAuthorizationBinding,
     IssueAuthorizationOutcome, IssueAuthorizationState, IssueAuthorizationStatus, IssueAuthorizer,
     IssueCreationOutcome, IssueCreationReceipt, IssuePage, IssuePageRequest, IssuePermission,
     IssueRelationCreationOutcome, IssueStoreError, IssueTupleWriter, IssueViewProjectionRevision,
