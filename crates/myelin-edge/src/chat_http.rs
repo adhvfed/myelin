@@ -24,9 +24,10 @@ use myelin_storage::{KeyClass, KmsEngine, SubjectId};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
-use std::future::Future;
 use std::sync::Arc;
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
+
+use crate::runtime::drive_result_on_runtime;
 
 const MAX_CHAT_JSON_BYTES: usize = 36 * 1024;
 const MAX_MESSAGE_BYTES: usize = 32 * 1024;
@@ -62,17 +63,13 @@ impl DurableChatReadApi {
 
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
-        F: Future<Output = Result<T, EdgeError>>,
+        F: std::future::Future<Output = Result<T, EdgeError>>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
-            }
-            Ok(_) => Err(EdgeError::Unavailable(
-                "Chat requires the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => self.runtime.block_on(future),
-        }
+        drive_result_on_runtime(
+            &self.runtime,
+            future,
+            EdgeError::Unavailable("Chat requires the Edge multi-thread runtime".into()),
+        )
     }
 
     fn conversation_id(&self, principal: &Principal, opaque_id: &str) -> ConversationId {
@@ -213,7 +210,7 @@ impl DurableChatMutationApi {
 
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
-        F: Future<Output = Result<T, EdgeError>>,
+        F: std::future::Future<Output = Result<T, EdgeError>>,
     {
         self.reads.drive(future)
     }

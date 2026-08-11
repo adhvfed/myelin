@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::future::Future;
 use std::sync::Arc;
 
 use myelin_agent::is_canonical_tool_name;
@@ -13,12 +12,13 @@ use myelin_identity_service::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
 
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
+use crate::runtime::drive_edge_future;
 use crate::Method;
 
 const MAX_AGENT_JSON_BYTES: usize = 16 * 1024;
@@ -35,19 +35,9 @@ struct AgentHttpApi {
 impl AgentHttpApi {
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
-        F: Future<Output = T>,
+        F: std::future::Future<Output = T>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                Ok(tokio::task::block_in_place(|| {
-                    self.runtime.block_on(future)
-                }))
-            }
-            Ok(_) => Err(EdgeError::Internal(
-                "agent HTTP requires the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => Ok(self.runtime.block_on(future)),
-        }
+        drive_edge_future(&self.runtime, future, "agent HTTP")
     }
 }
 

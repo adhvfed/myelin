@@ -16,10 +16,11 @@ use myelin_identity::Principal;
 use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
 use serde_json::{json, Value};
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
+
+use crate::runtime::drive_result_on_runtime;
 
 const CI_LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const CI_LOG_TAIL_CHANNEL_CAPACITY: usize = CI_LOG_TAIL_BATCH_MAX * 2 + 2;
@@ -49,32 +50,24 @@ impl DurableCiReadApi {
 
     fn drive<F, T>(&self, future: F) -> Result<T, CiRunSurfaceError>
     where
-        F: Future<Output = Result<T, CiRunSurfaceError>>,
+        F: std::future::Future<Output = Result<T, CiRunSurfaceError>>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
-            }
-            Ok(_) => Err(CiRunSurfaceError::Storage(
-                "CI HTTP requires the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => self.runtime.block_on(future),
-        }
+        drive_result_on_runtime(
+            &self.runtime,
+            future,
+            CiRunSurfaceError::Storage("CI HTTP requires the Edge multi-thread runtime".into()),
+        )
     }
 
     fn drive_run<F, T>(&self, future: F) -> Result<T, CiRunStoreError>
     where
-        F: Future<Output = Result<T, CiRunStoreError>>,
+        F: std::future::Future<Output = Result<T, CiRunStoreError>>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
-            }
-            Ok(_) => Err(CiRunStoreError::Db(
-                "CI HTTP requires the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => self.runtime.block_on(future),
-        }
+        drive_result_on_runtime(
+            &self.runtime,
+            future,
+            CiRunStoreError::Db("CI HTTP requires the Edge multi-thread runtime".into()),
+        )
     }
 
     pub fn read_run(&self, principal: &Principal, run_id: &str) -> Result<Value, EdgeError> {

@@ -2,6 +2,7 @@ use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
+use crate::runtime::drive_result_on_runtime;
 use crate::Method;
 use myelin_identity::{
     Consistency, ConsistencyMode, Decision, IdentityService, Permission, Zookie,
@@ -11,9 +12,8 @@ use myelin_identity_service::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::future::Future;
 use std::sync::Arc;
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
 
 const MAX_PROJECT_JSON_BYTES: usize = 4 * 1024;
 const DEFAULT_PAGE_LIMIT: u32 = 50;
@@ -29,17 +29,13 @@ struct ProjectHttpApi {
 impl ProjectHttpApi {
     fn drive<F, T>(&self, future: F) -> Result<T, ProjectError>
     where
-        F: Future<Output = Result<T, ProjectError>>,
+        F: std::future::Future<Output = Result<T, ProjectError>>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
-            }
-            Ok(_) => Err(ProjectError::Storage(
-                "project HTTP requires the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => self.runtime.block_on(future),
-        }
+        drive_result_on_runtime(
+            &self.runtime,
+            future,
+            ProjectError::Storage("project HTTP requires the Edge multi-thread runtime".into()),
+        )
     }
 
     fn may_view(&self, ctx: &HandlerCtx<'_>, project_id: &str) -> bool {

@@ -1,5 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::future::Future;
 use std::sync::Arc;
 
 use myelin_identity::Principal;
@@ -9,13 +8,14 @@ use myelin_storage::with_tenant_tx;
 use percent_encoding::percent_decode_str;
 use serde_json::{json, Value};
 use sqlx::{PgConnection, PgPool};
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
 
 use crate::catalogue::{Handler, HandlerCtx, MAX_PAGE_LIMIT};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::repo_authz::RepoAuthorizer;
 use crate::request::EdgeResponse;
+use crate::runtime::drive_result_on_runtime;
 use crate::Method;
 
 const DEFAULT_BACKLINK_LIMIT: usize = 50;
@@ -39,17 +39,13 @@ impl DurableRefsReadApi {
 
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
-        F: Future<Output = Result<T, EdgeError>>,
+        F: std::future::Future<Output = Result<T, EdgeError>>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
-            }
-            Ok(_) => Err(EdgeError::Unavailable(
-                "References require the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => self.runtime.block_on(future),
-        }
+        drive_result_on_runtime(
+            &self.runtime,
+            future,
+            EdgeError::Unavailable("References require the Edge multi-thread runtime".into()),
+        )
     }
 
     pub fn backlinks(

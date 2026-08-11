@@ -7,11 +7,12 @@ use sqlx::{PgPool, Row};
 use std::collections::BTreeSet;
 #[cfg(test)]
 use std::collections::HashMap;
-use std::future::Future;
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
+
+use crate::runtime::drive_result_on_runtime;
 
 pub const DEVICE_AUTHORIZATION_TTL_SECS: i64 = 10 * 60;
 pub const DEVICE_AUTHORIZATION_POLL_INTERVAL_SECS: u64 = 2;
@@ -391,17 +392,15 @@ impl PgDeviceAuthorizationStore {
 
     fn drive<F, T>(&self, future: F) -> Result<T, DeviceAuthorizationStoreError>
     where
-        F: Future<Output = Result<T, DeviceAuthorizationStoreError>>,
+        F: std::future::Future<Output = Result<T, DeviceAuthorizationStoreError>>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
-            }
-            Ok(_) => Err(DeviceAuthorizationStoreError(
+        drive_result_on_runtime(
+            &self.runtime,
+            future,
+            DeviceAuthorizationStoreError(
                 "device authorization requires the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => self.runtime.block_on(future),
-        }
+            ),
+        )
     }
 
     async fn issue_async(

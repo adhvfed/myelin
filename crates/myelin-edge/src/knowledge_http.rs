@@ -2,6 +2,7 @@ use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
+use crate::runtime::drive_future_on_runtime;
 use crate::Method;
 use myelin_events::{Actor, ArtifactRef, EventId, IdMinter, Timestamp};
 use myelin_identity::Principal;
@@ -19,9 +20,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::sync::Arc;
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
 
 const MAX_KNOWLEDGE_JSON_BYTES: usize = 320 * 1024;
 const MAX_TITLE_BYTES: usize = 512;
@@ -50,19 +50,13 @@ impl DurableKnowledgeReadApi {
 
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
-        F: Future<Output = Result<T, KnowledgePageError>>,
+        F: std::future::Future<Output = Result<T, KnowledgePageError>>,
     {
-        let result = match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
-            }
-            Ok(_) => {
-                return Err(EdgeError::Unavailable(
-                    "Knowledge requires the Edge multi-thread runtime".into(),
-                ))
-            }
-            Err(_) => self.runtime.block_on(future),
-        };
+        let result = drive_future_on_runtime(
+            &self.runtime,
+            future,
+            EdgeError::Unavailable("Knowledge requires the Edge multi-thread runtime".into()),
+        )?;
         result.map_err(map_page_error)
     }
 
@@ -119,7 +113,7 @@ struct DurableKnowledgeApi {
 impl DurableKnowledgeApi {
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
-        F: Future<Output = Result<T, KnowledgePageError>>,
+        F: std::future::Future<Output = Result<T, KnowledgePageError>>,
     {
         self.reads.drive(future)
     }

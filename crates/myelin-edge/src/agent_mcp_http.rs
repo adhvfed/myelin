@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -26,13 +25,14 @@ use myelin_storage::hitl_gate_durable::{
 };
 use myelin_storage::{DurableAgentTriggerBacking, PgOutboxBacking, SubstrateProvider};
 use serde_json::json;
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
 
 use crate::catalogue::{Handler, HandlerCtx, Method};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::repo_authz::{RepoAuthorizer, RepoPermission};
 use crate::request::EdgeResponse;
+use crate::runtime::drive_edge_future;
 use crate::{
     ChatEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
     DurableIssueMutationApi, DurableKnowledgeReadApi, GitEffectApi, IssueEffectApi,
@@ -140,19 +140,9 @@ impl AgentMcpServices {
 
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
-        F: Future<Output = T>,
+        F: std::future::Future<Output = T>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                Ok(tokio::task::block_in_place(|| {
-                    self.runtime.block_on(future)
-                }))
-            }
-            Ok(_) => Err(EdgeError::Internal(
-                "agent MCP requires the Edge multi-thread runtime".into(),
-            )),
-            Err(_) => Ok(self.runtime.block_on(future)),
-        }
+        drive_edge_future(&self.runtime, future, "agent MCP")
     }
 
     fn project_gate(

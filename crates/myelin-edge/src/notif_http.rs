@@ -1,4 +1,3 @@
-use std::future::Future;
 use std::sync::Arc;
 
 use myelin_events::ArtifactRef;
@@ -16,13 +15,14 @@ use myelin_notif::{agent_effect_approval_action, automation_approval_action};
 use myelin_storage::with_tenant_tx_error;
 use serde_json::{json, Value};
 use sqlx::types::Uuid;
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
 
 use crate::catalogue::{page_envelope, Handler, HandlerCtx, Method};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::git_durable::DurableGitBackend;
 use crate::request::EdgeResponse;
+use crate::runtime::drive_result_on_runtime;
 
 const DEFAULT_INBOX_LIMIT: u16 = 50;
 const MAX_INBOX_MUTATION_BYTES: usize = 1_024;
@@ -38,15 +38,9 @@ struct DurableNotifHttpApi {
 impl DurableNotifHttpApi {
     fn drive<F, T>(&self, future: F) -> Result<T, PgInboxError>
     where
-        F: Future<Output = Result<T, PgInboxError>>,
+        F: std::future::Future<Output = Result<T, PgInboxError>>,
     {
-        match Handle::try_current() {
-            Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-                tokio::task::block_in_place(|| self.runtime.block_on(future))
-            }
-            Ok(_) => Err(PgInboxError::Database),
-            Err(_) => self.runtime.block_on(future),
-        }
+        drive_result_on_runtime(&self.runtime, future, PgInboxError::Database)
     }
 
     fn can_read_subject(

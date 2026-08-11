@@ -4,6 +4,7 @@ use crate::catalogue::{page_envelope, Handler, HandlerCtx};
 use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
+use crate::runtime::drive_result_on_runtime;
 use crate::{Method, StoreBackedIssueAuthorizer};
 use myelin_identity_service::{PgProjectStore, Project, ProjectError};
 use myelin_issues::{
@@ -14,9 +15,8 @@ use myelin_issues::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::future::Future;
 use std::sync::Arc;
-use tokio::runtime::{Handle, RuntimeFlavor};
+use tokio::runtime::Handle;
 
 pub const MAX_ISSUE_JSON_BYTES: usize = 4 * 1024;
 pub use import_http::{MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS};
@@ -37,9 +37,9 @@ impl DurableIssueReadApi {
 
     fn drive<F, T>(&self, future: F) -> Result<T, IssueStoreError>
     where
-        F: Future<Output = Result<T, IssueStoreError>>,
+        F: std::future::Future<Output = Result<T, IssueStoreError>>,
     {
-        drive_on_runtime(
+        drive_result_on_runtime(
             &self.runtime,
             future,
             IssueStoreError::AuthorizationUnavailable(
@@ -175,9 +175,9 @@ impl DurableIssueMutationApi {
 
     fn drive<F, T>(&self, future: F) -> Result<T, IssueStoreError>
     where
-        F: Future<Output = Result<T, IssueStoreError>>,
+        F: std::future::Future<Output = Result<T, IssueStoreError>>,
     {
-        drive_on_runtime(
+        drive_result_on_runtime(
             &self.runtime,
             future,
             IssueStoreError::AuthorizationUnavailable(
@@ -188,26 +188,13 @@ impl DurableIssueMutationApi {
 
     fn drive_project<F, T>(&self, future: F) -> Result<T, ProjectError>
     where
-        F: Future<Output = Result<T, ProjectError>>,
+        F: std::future::Future<Output = Result<T, ProjectError>>,
     {
-        drive_on_runtime(
+        drive_result_on_runtime(
             &self.runtime,
             future,
             ProjectError::Storage("Issues HTTP requires the Edge multi-thread runtime".into()),
         )
-    }
-}
-
-fn drive_on_runtime<F, T, E>(runtime: &Handle, future: F, runtime_error: E) -> Result<T, E>
-where
-    F: Future<Output = Result<T, E>>,
-{
-    match Handle::try_current() {
-        Ok(current) if current.runtime_flavor() == RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| runtime.block_on(future))
-        }
-        Ok(_) => Err(runtime_error),
-        Err(_) => runtime.block_on(future),
     }
 }
 
@@ -1053,38 +1040,5 @@ mod tests {
         )
         .unwrap();
         assert!(finish_create_request(incomplete_legacy, None).is_err());
-    }
-
-    #[test]
-    fn current_thread_runtime_refuses_without_polling_or_panicking() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let current = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let target = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .unwrap();
-        let polled = Arc::new(AtomicBool::new(false));
-        let polled_by_future = polled.clone();
-        let result = current.block_on(async {
-            drive_on_runtime(
-                target.handle(),
-                async move {
-                    polled_by_future.store(true, Ordering::SeqCst);
-                    Ok::<_, IssueStoreError>(())
-                },
-                IssueStoreError::AuthorizationUnavailable("wrong runtime".into()),
-            )
-        });
-
-        assert!(matches!(
-            result,
-            Err(IssueStoreError::AuthorizationUnavailable(_))
-        ));
-        assert!(!polled.load(Ordering::SeqCst));
     }
 }
