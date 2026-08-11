@@ -763,13 +763,18 @@ fn compile_matcher(
                 "source_branch is not a canonical branch name".into(),
             ));
         }
+        let branch_field = if subject_type == "ref" {
+            "payload.ref"
+        } else {
+            "payload.source_ref"
+        };
         condition_sources.push(format!(
-            "payload.source_ref == {}",
+            "{branch_field} == {}",
             quote_query_string(&source_ref)
         ));
         predicates.push(Predicate::Cmp {
             op: CmpOp::Eq,
-            lhs: Expr::Var("payload.source_ref".into()),
+            lhs: Expr::Var(branch_field.into()),
             rhs: Expr::Lit(Literal::Str(source_ref)),
         });
     }
@@ -1037,6 +1042,24 @@ mod tests {
         );
         assert!(compile_matcher("ci.run.failed", None, Some("refs/tags/release"), None).is_err());
         assert!(compile_matcher("ci.run.failed", None, Some("feature/../main"), None).is_err());
+    }
+
+    #[test]
+    fn a_git_ref_branch_filter_reads_the_git_ref_payload() {
+        let matcher = compile_matcher("git.ref.updated", None, Some("main"), None).unwrap();
+        let mut event = ci_event("git.ref.updated", "unused");
+        event.subject = ArtifactRef("myelin://acme/git/ref/core:refs%2Fheads%2Fmain".into());
+        event.payload = json!({ "ref": "refs/heads/main" });
+
+        assert_eq!(
+            matcher.matches(&event, &SetExpr::All, &no_relation),
+            Ok(true),
+            "the friendly branch option matches the field emitted by Git"
+        );
+        assert_eq!(
+            matcher.predicate().source(),
+            "event.type == 'git.ref.updated' AND payload.ref == 'refs/heads/main'"
+        );
     }
 
     #[test]

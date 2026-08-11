@@ -242,8 +242,8 @@ using `==`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, and parentheses. A m
 wrongly-typed field closes only that rule as a non-match; it cannot prevent another automation
 from seeing the event. The automation retains the newest evaluation error for its owner in the
 web/API and CLI output, including the event and time that exposed it. `--branch main` remains
-concise sugar for
-`payload.source_ref == 'refs/heads/main'`. CI runs keep that scope consistent: it is the pushed
+concise sugar for the platform's canonical branch field. It matches `payload.ref` on Git-reference
+events and `payload.source_ref` on CI events. CI runs keep that scope consistent: it is the pushed
 branch for push runs and the target branch for pull-request runs.
 
 Issue responses include a canonical `myelin://...` reference that can be passed directly to

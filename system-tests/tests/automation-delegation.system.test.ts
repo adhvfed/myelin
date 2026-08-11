@@ -170,12 +170,15 @@ describe("automation delegation", () => {
       expectedStatus: 201,
     });
     const agentId = string(record(activated.body.agent, "branch observer").id, "agent id");
-    const createAutomation = async (filter: string, task: string) => {
+    const createAutomation = async (
+      branchRule: { filter?: string; source_branch?: string },
+      task: string,
+    ) => {
       const created = await founder.json("/v1/triggers", {
         method: "POST",
         body: {
           event_type: "git.ref.updated",
-          filter,
+          ...branchRule,
           run_as_agent_id: agentId,
           task,
           budget_minor_units: 10_000,
@@ -188,11 +191,11 @@ describe("automation delegation", () => {
       return string(record(created.body.trigger, task).id, `${task} id`);
     };
     const brokenId = await createAutomation(
-      "payload.ref > 1",
+      { filter: "payload.ref > 1" },
       "Explain why this branch rule cannot be evaluated.",
     );
     const healthyId = await createAutomation(
-      "payload.ref == 'refs/heads/main'",
+      { source_branch: "main" },
       "Park one visible main-branch update for review.",
     );
 
