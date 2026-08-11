@@ -440,7 +440,7 @@ fn creator_bootstrap_admin_is_admitted_per_permission() {
 }
 
 #[test]
-fn push_grant_does_not_admit_merge_branch_protection_or_endorse() {
+fn a_writer_uses_a_feature_branch_without_crossing_repository_administration() {
     let h = Harness::new("writer-split");
     h.seed_repo_with_pr("subj-creator", "alpha");
     h.write_relation("svc:dev", "writer", "alpha");
@@ -451,7 +451,17 @@ fn push_grant_does_not_admit_merge_branch_protection_or_endorse() {
         "/v1/git/repos/alpha/blob/main/NOTES.md",
         br#"{"base_oid":"","contents":"dev notes\n"}"#,
     );
-    assert_eq!(st, 200, "writer web-edit: {v}");
+    assert_eq!(
+        st, 403,
+        "a push-only writer cannot web-edit the protected default branch: {v}"
+    );
+    let (st, v) = h.call(
+        "subj-dev",
+        "POST",
+        "/v1/git/repos/alpha/blob/dev-notes/NOTES.md",
+        br#"{"base_oid":"","contents":"dev notes\n","start_ref":"main"}"#,
+    );
+    assert_eq!(st, 200, "the writer can work on a feature branch: {v}");
     let (st, v) = h.call(
         "subj-dev",
         "POST",
