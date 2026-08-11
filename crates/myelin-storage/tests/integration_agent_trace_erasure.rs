@@ -59,6 +59,45 @@ async fn test_provider() -> Option<SubstrateProvider> {
     )
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_database_has_no_plaintext_door_for_an_agent_answer() {
+    let Some(provider) = test_provider().await else {
+        return;
+    };
+    let tenant = unique("trace-plaintext-refused");
+    let region = provider.config().region.clone();
+    let transaction_tenant = tenant.clone();
+    let attempted = provider
+        .with_tenant_tx(&transaction_tenant, move |connection| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO knowledge_agent_trace \
+                       (tenant_id, region, run_id, artifact_ref, agent_principal, requested_by, \
+                        answer, trace_body, charged_micro) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 42)",
+                )
+                .bind(&tenant)
+                .bind(&region)
+                .bind("plaintext-run")
+                .bind(format!("myelin://{tenant}/knowledge/doc/plaintext"))
+                .bind("agent:privacy-test")
+                .bind("founder")
+                .bind("A result the database must refuse.")
+                .bind(serde_json::json!({ "answer": "still plaintext" }))
+                .execute(connection)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        })
+        .await;
+
+    assert!(
+        attempted.is_err(),
+        "an application path cannot persist a plaintext agent answer after the privacy migration"
+    );
+}
+
 fn trace(run_id: &str) -> AgentTraceWrite {
     let answer = "A result that must stay erased.";
     AgentTraceWrite {

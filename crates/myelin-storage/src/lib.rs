@@ -89,10 +89,11 @@ pub use agent_tool_effect::{
     ToolEffectError, AGENT_TOOL_EFFECT_GUARD_MIGRATION, AGENT_TOOL_EFFECT_MIGRATION,
 };
 pub use agent_trace_durable::{
-    agent_trace_durable_migrations, AgentTraceAvailability, AgentTraceEraseReceipt,
-    AgentTraceError, AgentTraceReceipt, AgentTraceResult, AgentTraceSubjectEraseReceipt,
-    AgentTraceSubjectState, AgentTraceSubjectSummary, AgentTraceWrite, AgentTraceWriter,
-    DurableAgentTraceStore, EraseAgentTraceOutcome, InMemoryAgentTraceStore,
+    agent_trace_durable_migrations, agent_trace_encrypted_only_migrations, AgentTraceAvailability,
+    AgentTraceEraseReceipt, AgentTraceError, AgentTraceReceipt, AgentTraceResult,
+    AgentTraceSubjectEraseReceipt, AgentTraceSubjectState, AgentTraceSubjectSummary,
+    AgentTraceWrite, AgentTraceWriter, DurableAgentTraceStore, EraseAgentTraceOutcome,
+    InMemoryAgentTraceStore, AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION,
 };
 pub use agent_wallet::{
     agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind, DebitOutcome,

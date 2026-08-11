@@ -127,6 +127,32 @@ CREATE POLICY myelin_tenant_isolation ON knowledge_agent_trace_subject_restricti
               AND region = current_setting('myelin.region', true));
 "#;
 
+pub const AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION: &str = r#"
+INSERT INTO knowledge_agent_trace_erasure
+       (tenant_id, region, run_id, artifact_ref)
+SELECT tenant_id, region, run_id, artifact_ref
+  FROM knowledge_agent_trace
+ WHERE answer IS NOT NULL OR trace_body IS NOT NULL
+ON CONFLICT DO NOTHING;
+
+DELETE FROM knowledge_agent_trace
+ WHERE answer IS NOT NULL OR trace_body IS NOT NULL;
+
+ALTER TABLE knowledge_agent_trace
+    DROP CONSTRAINT IF EXISTS knowledge_agent_trace_payload_shape;
+ALTER TABLE knowledge_agent_trace
+    ALTER COLUMN payload_key_ref SET NOT NULL,
+    ALTER COLUMN payload_nonce SET NOT NULL,
+    ALTER COLUMN payload_ciphertext SET NOT NULL;
+ALTER TABLE knowledge_agent_trace
+    ADD CONSTRAINT knowledge_agent_trace_payload_shape CHECK (
+        answer IS NULL AND trace_body IS NULL
+        AND length(payload_key_ref) BETWEEN 1 AND 1024
+        AND octet_length(payload_nonce) = 12
+        AND octet_length(payload_ciphertext) BETWEEN 17 AND 524288
+    );
+"#;
+
 pub fn agent_trace_durable_migrations() -> Migrations {
     Migrations::of([
         Migration::plain("0098_knowledge_agent_trace", AGENT_TRACE_MIGRATION),
@@ -147,6 +173,13 @@ pub fn agent_trace_durable_migrations() -> Migrations {
             AGENT_TRACE_SUBJECT_RESTRICTION_MIGRATION,
         ),
     ])
+}
+
+pub fn agent_trace_encrypted_only_migrations() -> Migrations {
+    Migrations::of([Migration::plain(
+        "0107_agent_trace_encrypted_only",
+        AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION,
+    )])
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -419,14 +452,15 @@ impl DurableAgentTraceStore {
         let owner_principal = owner_principal.to_string();
         let run_id = run_id.to_string();
         let region = self.provider.config().region.clone();
-        let kms = self.kms.clone();
-        self.provider
+        let query_tenant = tenant.clone();
+        let query_region = region.clone();
+        let row = self
+            .provider
             .with_tenant_tx(&tenant.clone(), move |connection| {
                 Box::pin(async move {
-                    let row = sqlx::query(
+                    sqlx::query(
                         "SELECT trace.run_id, trace.artifact_ref, trace.agent_principal, \
-                                trace.requested_by, trace.answer, trace.trace_body, \
-                                trace.payload_key_ref, trace.payload_nonce, \
+                                trace.requested_by, trace.payload_key_ref, trace.payload_nonce, \
                                 trace.payload_ciphertext, trace.charged_micro, trace.created_at \
                            FROM knowledge_agent_trace trace \
                            JOIN agent_trigger_firing firing \
@@ -441,19 +475,20 @@ impl DurableAgentTraceStore {
                             AND trace.run_id = $3 AND binding.binding_id = $4 \
                             AND binding.owner_principal_id = $5",
                     )
-                    .bind(&tenant)
-                    .bind(&region)
+                    .bind(&query_tenant)
+                    .bind(&query_region)
                     .bind(&run_id)
                     .bind(binding_id)
                     .bind(&owner_principal)
                     .fetch_optional(&mut *connection)
                     .await
-                    .map_err(trace_query)?;
-                    row.map(|row| agent_trace_result_from_row(row, &kms, &tenant, &region))
-                        .transpose()
+                    .map_err(trace_query)
                 })
             })
-            .await
+            .await?;
+        Ok(row
+            .map(|row| agent_trace_result_from_row(row, &self.kms, &tenant, &region))
+            .transpose()?)
     }
 
     pub async fn erase_for_owner(
@@ -924,9 +959,8 @@ async fn write_on_connection(
     let inserted = sqlx::query(
         "INSERT INTO knowledge_agent_trace \
            (tenant_id, region, run_id, artifact_ref, agent_principal, requested_by, \
-            answer, trace_body, charged_micro, payload_key_ref, payload_nonce, \
-            payload_ciphertext) \
-         VALUES ($1, $2, $3, $4, $5, $6, NULL, NULL, $7, $8, $9, $10) \
+            charged_micro, payload_key_ref, payload_nonce, payload_ciphertext) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
          ON CONFLICT DO NOTHING",
     )
     .bind(tenant)
@@ -1286,85 +1320,66 @@ fn agent_trace_result_from_row(
         .map_err(trace_query)?;
     let charged_micro = u64::try_from(charged)
         .map_err(|_| PgError::Query("agent trace has a negative charge".into()))?;
-    let answer = match (
-        row.try_get::<Option<String>, _>("answer")
-            .map_err(trace_query)?,
-        row.try_get::<Option<Value>, _>("trace_body")
-            .map_err(trace_query)?,
-    ) {
-        (Some(answer), Some(_)) => answer,
-        (None, None) => {
-            let key_ref = row
-                .try_get::<Option<String>, _>("payload_key_ref")
-                .map_err(trace_query)?
-                .and_then(|value| PiiKeyRef::parse(&value))
-                .ok_or_else(|| PgError::Query("agent trace has an invalid key reference".into()))?;
-            if key_ref.tenant.as_str() != tenant
-                || key_ref.class != KeyClass::Subject(requested_by.clone())
-            {
-                return Err(PgError::Query(
-                    "agent trace encryption scope does not match its attribution".into(),
-                ));
-            }
-            let nonce = row
-                .try_get::<Option<Vec<u8>>, _>("payload_nonce")
-                .map_err(trace_query)?
-                .ok_or_else(|| PgError::Query("agent trace has no encryption nonce".into()))?;
-            let nonce: [u8; NONCE_LEN] = nonce
-                .try_into()
-                .map_err(|_| PgError::Query("agent trace has an invalid nonce".into()))?;
-            let ciphertext = row
-                .try_get::<Option<Vec<u8>>, _>("payload_ciphertext")
-                .map_err(trace_query)?
-                .ok_or_else(|| PgError::Query("agent trace has no ciphertext".into()))?;
-            let aad = trace_aad(tenant, region, &run_id, &artifact_ref.0);
-            let plaintext = ColumnCryptor::new(kms, Region(region.to_string()))
-                .decrypt_with_aad(
-                    &EncryptedColumn {
-                        key_ref,
-                        nonce,
-                        ciphertext,
-                    },
-                    &aad,
-                )
-                .map_err(|error| PgError::Query(format!("agent trace decrypt failed: {error}")))?;
-            let payload: AgentTracePrivatePayload =
-                serde_json::from_slice(&plaintext).map_err(|error| {
-                    PgError::Query(format!("agent trace payload is invalid: {error}"))
-                })?;
-            let candidate = AgentTraceWrite {
-                run_id: run_id.clone(),
-                agent_principal: agent_principal.clone(),
-                requested_by,
-                answer: payload.answer.clone(),
-                trace_body: payload.trace_body,
-                charged_micro,
-            };
-            candidate
-                .validate()
-                .map_err(|error| PgError::Query(error.to_string()))?;
-            if candidate
-                .artifact_ref(&TenantId(tenant.to_string()))
-                .map_err(|error| PgError::Query(error.to_string()))?
-                != artifact_ref
-            {
-                return Err(PgError::Query(
-                    "agent trace payload does not match its content address".into(),
-                ));
-            }
-            payload.answer
-        }
-        _ => {
-            return Err(PgError::Query(
-                "agent trace has a mixed plaintext/encrypted payload".into(),
-            ))
-        }
+    let key_ref = row
+        .try_get::<String, _>("payload_key_ref")
+        .map_err(trace_query)
+        .and_then(|value| {
+            PiiKeyRef::parse(&value)
+                .ok_or_else(|| PgError::Query("agent trace has an invalid key reference".into()))
+        })?;
+    if key_ref.tenant.as_str() != tenant || key_ref.class != KeyClass::Subject(requested_by.clone())
+    {
+        return Err(PgError::Query(
+            "agent trace encryption scope does not match its attribution".into(),
+        ));
+    }
+    let nonce = row
+        .try_get::<Vec<u8>, _>("payload_nonce")
+        .map_err(trace_query)?;
+    let nonce: [u8; NONCE_LEN] = nonce
+        .try_into()
+        .map_err(|_| PgError::Query("agent trace has an invalid nonce".into()))?;
+    let ciphertext = row
+        .try_get::<Vec<u8>, _>("payload_ciphertext")
+        .map_err(trace_query)?;
+    let aad = trace_aad(tenant, region, &run_id, &artifact_ref.0);
+    let plaintext = ColumnCryptor::new(kms, Region(region.to_string()))
+        .decrypt_with_aad(
+            &EncryptedColumn {
+                key_ref,
+                nonce,
+                ciphertext,
+            },
+            &aad,
+        )
+        .map_err(|error| PgError::Query(format!("agent trace decrypt failed: {error}")))?;
+    let payload: AgentTracePrivatePayload = serde_json::from_slice(&plaintext)
+        .map_err(|error| PgError::Query(format!("agent trace payload is invalid: {error}")))?;
+    let candidate = AgentTraceWrite {
+        run_id: run_id.clone(),
+        agent_principal: agent_principal.clone(),
+        requested_by,
+        answer: payload.answer.clone(),
+        trace_body: payload.trace_body,
+        charged_micro,
     };
+    candidate
+        .validate()
+        .map_err(|error| PgError::Query(error.to_string()))?;
+    if candidate
+        .artifact_ref(&TenantId(tenant.to_string()))
+        .map_err(|error| PgError::Query(error.to_string()))?
+        != artifact_ref
+    {
+        return Err(PgError::Query(
+            "agent trace payload does not match its content address".into(),
+        ));
+    }
     Ok(AgentTraceResult {
         run_id,
         artifact_ref,
         agent_principal,
-        answer,
+        answer: payload.answer,
         charged_micro,
         created_at: row
             .try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>("created_at")
@@ -1454,5 +1469,13 @@ mod tests {
         assert!(AGENT_TRACE_SUBJECT_ERASURE_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
         assert!(AGENT_TRACE_SUBJECT_RESTRICTION_MIGRATION.contains("restricted_at"));
         assert!(AGENT_TRACE_SUBJECT_RESTRICTION_MIGRATION.contains("FORCE ROW LEVEL SECURITY"));
+        assert!(AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION
+            .contains("INSERT INTO knowledge_agent_trace_erasure"));
+        assert!(AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION.contains("DELETE FROM knowledge_agent_trace"));
+        assert!(AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION
+            .contains("ALTER COLUMN payload_ciphertext SET NOT NULL"));
+        assert!(
+            AGENT_TRACE_ENCRYPTED_ONLY_MIGRATION.contains("answer IS NULL AND trace_body IS NULL")
+        );
     }
 }
