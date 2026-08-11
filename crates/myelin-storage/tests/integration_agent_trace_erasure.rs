@@ -124,6 +124,122 @@ fn trace(run_id: &str) -> AgentTraceWrite {
     }
 }
 
+fn legacy_subject_token(tenant: &str, region: &str, requested_by: &str) -> String {
+    let body =
+        format!("myelin.agent_trace.subject.v1\u{1f}{tenant}\u{1f}{region}\u{1f}{requested_by}");
+    blake3::hash(body.as_bytes()).to_hex().to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn subject_markers_are_blinded_without_reopening_legacy_privacy_choices() {
+    let Some(provider) = test_provider().await else {
+        return;
+    };
+    let tenant = TenantId(unique("trace-blind-subject"));
+    let region = provider.config().region.clone();
+    let seal_key = SealKey::from_encoded(&"99".repeat(32)).expect("a 32-byte test seal key");
+    let kms = Arc::new(
+        DurableKmsBacking::new(provider.db_pool().clone(), unique("trace-blind-cell"))
+            .load_or_generate(&seal_key)
+            .await
+            .expect("the durable test KMS starts"),
+    );
+    let store = DurableAgentTraceStore::with_runtime(
+        provider.clone(),
+        tokio::runtime::Handle::current(),
+        kms,
+    );
+
+    assert!(
+        store
+            .set_subject_restriction(&tenant.0, "founder", true)
+            .await
+            .expect("restrict the subject"),
+        "the first privacy choice changes state"
+    );
+    let inspected_tenant = tenant.0.clone();
+    let stored_token = provider
+        .with_tenant_tx(&tenant.0, move |connection| {
+            Box::pin(async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT subject_token FROM knowledge_agent_trace_subject_restriction \
+                      WHERE tenant_id = $1 AND region = $2",
+                )
+                .bind(&inspected_tenant)
+                .bind(&region)
+                .fetch_one(connection)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+            })
+        })
+        .await
+        .expect("inspect the opaque durable locator");
+    assert_ne!(
+        stored_token,
+        legacy_subject_token(&tenant.0, provider.config().region.as_str(), "founder"),
+        "a database reader cannot enumerate the marker by hashing candidate principal IDs"
+    );
+
+    assert!(store
+        .set_subject_restriction(&tenant.0, "founder", false)
+        .await
+        .expect("lift the new-format restriction"));
+    let legacy_tenant = tenant.0.clone();
+    let legacy_region = provider.config().region.clone();
+    let legacy_token = legacy_subject_token(&legacy_tenant, &legacy_region, "founder");
+    provider
+        .with_tenant_tx(&tenant.0, move |connection| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO knowledge_agent_trace_subject_restriction \
+                       (tenant_id, region, subject_token) VALUES ($1, $2, $3)",
+                )
+                .bind(&legacy_tenant)
+                .bind(&legacy_region)
+                .bind(&legacy_token)
+                .execute(connection)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("represent a privacy choice made before keyed locators existed");
+
+    assert_eq!(
+        store
+            .summarize_subject(&tenant.0, "founder")
+            .await
+            .expect("read the legacy choice"),
+        myelin_storage::AgentTraceSubjectSummary {
+            state: AgentTraceSubjectState::Restricted,
+            recoverable_records: 0,
+        },
+        "an upgrade never reopens a subject whose old marker is still durable"
+    );
+    assert_eq!(
+        store
+            .write(&tenant, trace("66666666-6666-4666-8666-666666666666"))
+            .unwrap_err(),
+        AgentTraceError::Restricted,
+    );
+    assert!(
+        store
+            .set_subject_restriction(&tenant.0, "founder", false)
+            .await
+            .expect("one request removes either locator generation"),
+        "the legacy marker was removed"
+    );
+    assert_eq!(
+        store
+            .summarize_subject(&tenant.0, "founder")
+            .await
+            .expect("the explicit lift is visible")
+            .state,
+        AgentTraceSubjectState::Active
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_erasure_marker_refuses_to_resurrect_a_trace_on_worker_retry() {
     let Some(provider) = test_provider().await else {

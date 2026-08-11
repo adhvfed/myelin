@@ -215,6 +215,11 @@ impl CellRoot {
             root: RawKey(bytes),
         })
     }
+
+    fn blind_index(&self, context: &str, value: &[u8]) -> String {
+        let key = Zeroizing::new(blake3::derive_key(context, &self.root.0));
+        blake3::keyed_hash(&key, value).to_hex().to_string()
+    }
 }
 
 #[derive(Clone)]
@@ -538,6 +543,10 @@ impl KmsCore {
         self.root.seal(seal_key)
     }
 
+    fn blind_index(&self, context: &str, value: &[u8]) -> String {
+        self.root.blind_index(context, value)
+    }
+
     pub fn export_kek(&self, id: &KekId) -> Option<ExportedKek> {
         let keks = self.keks.lock().expect("KMS keks poisoned");
         keks.get(id).map(|sk| ExportedKek {
@@ -859,6 +868,10 @@ impl KmsEngine {
 
     pub fn export_sealed_root(&self, seal_key: &SealKey) -> SealedRoot {
         self.core().export_sealed_root(seal_key)
+    }
+
+    pub(crate) fn blind_index(&self, context: &str, value: &[u8]) -> String {
+        self.core().blind_index(context, value)
     }
 
     pub fn export_kek(&self, id: &KekId) -> Option<ExportedKek> {

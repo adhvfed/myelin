@@ -308,7 +308,41 @@ fn journal_payload_aad(context: &JournalPayloadContext<'_>) -> Vec<u8> {
     aad
 }
 
-pub(crate) async fn lock_agent_subject(
+const AGENT_SUBJECT_LOCATOR_CONTEXT: &str = "myelin.agent-trace.subject-locator.v2";
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AgentSubjectLocator {
+    current: String,
+    legacy: String,
+}
+
+impl AgentSubjectLocator {
+    pub(crate) fn new(kms: &KmsEngine, tenant: &str, region: &str, requested_by: &str) -> Self {
+        let legacy = legacy_agent_subject_token(tenant, region, requested_by);
+        let current = kms.blind_index(AGENT_SUBJECT_LOCATOR_CONTEXT, legacy.as_bytes());
+        Self { current, legacy }
+    }
+
+    pub(crate) fn current(&self) -> &str {
+        &self.current
+    }
+
+    pub(crate) fn legacy(&self) -> &str {
+        &self.legacy
+    }
+
+    pub(crate) async fn lock(
+        &self,
+        connection: &mut sqlx::PgConnection,
+        tenant: &str,
+        region: &str,
+    ) -> Result<(), PgError> {
+        lock_agent_subject(connection, tenant, region, &self.legacy).await?;
+        lock_agent_subject(connection, tenant, region, &self.current).await
+    }
+}
+
+async fn lock_agent_subject(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
@@ -328,30 +362,35 @@ pub(crate) async fn agent_subject_status(
     tenant: &str,
     region: &str,
     requested_by: &str,
+    kms: &KmsEngine,
 ) -> Result<AgentSubjectStatus, PgError> {
-    let token = agent_subject_token(tenant, region, requested_by);
-    lock_agent_subject(connection, tenant, region, &token).await?;
+    let locator = AgentSubjectLocator::new(kms, tenant, region, requested_by);
+    locator.lock(connection, tenant, region).await?;
     let row = sqlx::query(
         "SELECT \
            EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_erasure \
-                    WHERE tenant_id = $1 AND region = $2 AND subject_token = $3 \
+                    WHERE tenant_id = $1 AND region = $2 \
+                      AND subject_token IN ($3, $4) \
                       AND completed_at IS NULL) AS erasing, \
            EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_erasure \
-                    WHERE tenant_id = $1 AND region = $2 AND subject_token = $3 \
+                    WHERE tenant_id = $1 AND region = $2 \
+                      AND subject_token IN ($3, $4) \
                       AND completed_at IS NOT NULL) AS erased, \
            EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_restriction \
-                    WHERE tenant_id = $1 AND region = $2 AND subject_token = $3) AS restricted",
+                    WHERE tenant_id = $1 AND region = $2 \
+                      AND subject_token IN ($3, $4)) AS restricted",
     )
     .bind(tenant)
     .bind(region)
-    .bind(token)
+    .bind(locator.current())
+    .bind(locator.legacy())
     .fetch_one(connection)
     .await
     .map_err(privacy_query)?;
-    if row.try_get::<bool, _>("erasing").map_err(privacy_query)? {
-        Ok(AgentSubjectStatus::Erasing)
-    } else if row.try_get::<bool, _>("erased").map_err(privacy_query)? {
+    if row.try_get::<bool, _>("erased").map_err(privacy_query)? {
         Ok(AgentSubjectStatus::Erased)
+    } else if row.try_get::<bool, _>("erasing").map_err(privacy_query)? {
+        Ok(AgentSubjectStatus::Erasing)
     } else if row
         .try_get::<bool, _>("restricted")
         .map_err(privacy_query)?
@@ -362,7 +401,7 @@ pub(crate) async fn agent_subject_status(
     }
 }
 
-pub(crate) fn agent_subject_token(tenant: &str, region: &str, requested_by: &str) -> String {
+fn legacy_agent_subject_token(tenant: &str, region: &str, requested_by: &str) -> String {
     let body =
         format!("myelin.agent_trace.subject.v1\u{1f}{tenant}\u{1f}{region}\u{1f}{requested_by}");
     blake3::hash(body.as_bytes()).to_hex().to_string()
@@ -392,11 +431,31 @@ mod tests {
     }
 
     #[test]
-    fn subject_locator_is_stable_and_tenant_scoped() {
-        let first = agent_subject_token("acme", "eu", "founder");
-        assert_eq!(first, agent_subject_token("acme", "eu", "founder"));
-        assert_ne!(first, agent_subject_token("other", "eu", "founder"));
-        assert_ne!(first, agent_subject_token("acme", "eu", "someone-else"));
+    fn subject_locator_is_stable_tenant_scoped_and_not_offline_enumerable() {
+        let kms = KmsEngine::new();
+        let first = AgentSubjectLocator::new(&kms, "acme", "eu", "founder");
+        assert_eq!(
+            first,
+            AgentSubjectLocator::new(&kms, "acme", "eu", "founder")
+        );
+        assert_ne!(
+            first,
+            AgentSubjectLocator::new(&kms, "other", "eu", "founder")
+        );
+        assert_ne!(
+            first,
+            AgentSubjectLocator::new(&kms, "acme", "eu", "someone-else")
+        );
+        assert_ne!(
+            first.current(),
+            first.legacy(),
+            "the durable locator is not the enumerable legacy subject hash"
+        );
+        assert_ne!(
+            first.current(),
+            AgentSubjectLocator::new(&KmsEngine::new(), "acme", "eu", "founder").current(),
+            "the same principal has a different locator under another cell root"
+        );
     }
 
     #[test]

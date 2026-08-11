@@ -275,7 +275,7 @@ async fn begin_on_connection(
     requested_by: &str,
     kms: &KmsEngine,
 ) -> Result<Result<ModelStepBegin, ModelStepError>, PgError> {
-    match agent_subject_status(connection, tenant, region, requested_by).await? {
+    match agent_subject_status(connection, tenant, region, requested_by, kms).await? {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ModelStepError::Erased))
@@ -354,7 +354,7 @@ async fn complete_on_connection(
     response: &Value,
     kms: &KmsEngine,
 ) -> Result<Result<ModelStepCompletion, ModelStepError>, PgError> {
-    match agent_subject_status(connection, tenant, region, requested_by).await? {
+    match agent_subject_status(connection, tenant, region, requested_by, kms).await? {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ModelStepError::Erased))

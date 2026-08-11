@@ -11,9 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
 
-use crate::agent_journal_privacy::{
-    agent_subject_status, agent_subject_token, lock_agent_subject, AgentSubjectStatus,
-};
+use crate::agent_journal_privacy::{agent_subject_status, AgentSubjectLocator, AgentSubjectStatus};
 use crate::encryption::{ColumnCryptor, EncryptedColumn, SubjectId};
 use crate::kms::{DekId, KekId, KeyClass, KmsEngine, KmsError, PiiKeyRef, NONCE_LEN};
 use crate::migration::{Migration, Migrations};
@@ -659,18 +657,24 @@ impl DurableAgentTraceStore {
         let tenant = tenant.to_string();
         let requested_by = requested_by.to_string();
         let region = self.provider.config().region.clone();
+        let kms = self.kms.clone();
         self.provider
             .with_tenant_tx(&tenant.clone(), move |connection| {
                 Box::pin(async move {
-                    let state =
-                        match agent_subject_status(connection, &tenant, &region, &requested_by)
-                            .await?
-                        {
-                            AgentSubjectStatus::Active => AgentTraceSubjectState::Active,
-                            AgentSubjectStatus::Restricted => AgentTraceSubjectState::Restricted,
-                            AgentSubjectStatus::Erasing => AgentTraceSubjectState::Erasing,
-                            AgentSubjectStatus::Erased => AgentTraceSubjectState::Erased,
-                        };
+                    let state = match agent_subject_status(
+                        connection,
+                        &tenant,
+                        &region,
+                        &requested_by,
+                        &kms,
+                    )
+                    .await?
+                    {
+                        AgentSubjectStatus::Active => AgentTraceSubjectState::Active,
+                        AgentSubjectStatus::Restricted => AgentTraceSubjectState::Restricted,
+                        AgentSubjectStatus::Erasing => AgentTraceSubjectState::Erasing,
+                        AgentSubjectStatus::Erased => AgentTraceSubjectState::Erased,
+                    };
                     let recoverable_records = count_subject_records_on_connection(
                         connection,
                         &tenant,
@@ -695,11 +699,10 @@ impl DurableAgentTraceStore {
         let tenant_id = tenant.to_string();
         let subject = requested_by.to_string();
         let region = self.provider.config().region.clone();
-        let subject_token = agent_subject_token(&tenant_id, &region, &subject);
+        let marker_locator = AgentSubjectLocator::new(&self.kms, &tenant_id, &region, &subject);
         let marker_tenant = tenant_id.clone();
         let marker_region = region.clone();
-        let marker_token = subject_token.clone();
-        let marker_was_complete = self
+        let marker = self
             .provider
             .with_tenant_tx(&tenant_id, move |connection| {
                 Box::pin(async move {
@@ -707,7 +710,7 @@ impl DurableAgentTraceStore {
                         connection,
                         &marker_tenant,
                         &marker_region,
-                        &marker_token,
+                        marker_locator,
                     )
                     .await
                 })
@@ -735,10 +738,11 @@ impl DurableAgentTraceStore {
                 ))
             }
         }
+        let marker_was_complete = marker.was_complete;
         let cleanup_tenant = tenant_id.clone();
         let cleanup_region = region.clone();
         let cleanup_subject = subject.clone();
-        let cleanup_token = subject_token.clone();
+        let cleanup_marker = marker;
         let database_receipt = self
             .provider
             .with_tenant_tx(&tenant_id, move |connection| {
@@ -748,7 +752,7 @@ impl DurableAgentTraceStore {
                         &cleanup_tenant,
                         &cleanup_region,
                         &cleanup_subject,
-                        &cleanup_token,
+                        &cleanup_marker,
                     )
                     .await
                 })
@@ -778,33 +782,50 @@ impl DurableAgentTraceStore {
     ) -> Result<bool, ProviderError> {
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
-        let token = agent_subject_token(&tenant, &region, requested_by);
+        let locator = AgentSubjectLocator::new(&self.kms, &tenant, &region, requested_by);
         self.provider
             .with_tenant_tx(&tenant.clone(), move |connection| {
                 Box::pin(async move {
-                    lock_agent_subject(connection, &tenant, &region, &token).await?;
+                    locator.lock(connection, &tenant, &region).await?;
                     let changed = if restricted {
-                        sqlx::query(
-                            "INSERT INTO knowledge_agent_trace_subject_restriction \
-                               (tenant_id, region, subject_token) VALUES ($1, $2, $3) \
-                             ON CONFLICT DO NOTHING",
+                        let exists = sqlx::query_scalar::<_, bool>(
+                            "SELECT EXISTS (SELECT 1 \
+                               FROM knowledge_agent_trace_subject_restriction \
+                              WHERE tenant_id = $1 AND region = $2 \
+                                AND subject_token IN ($3, $4))",
                         )
                         .bind(&tenant)
                         .bind(&region)
-                        .bind(&token)
-                        .execute(&mut *connection)
+                        .bind(locator.current())
+                        .bind(locator.legacy())
+                        .fetch_one(&mut *connection)
                         .await
-                        .map_err(trace_query)?
-                        .rows_affected()
-                            == 1
+                        .map_err(trace_query)?;
+                        if exists {
+                            false
+                        } else {
+                            sqlx::query(
+                                "INSERT INTO knowledge_agent_trace_subject_restriction \
+                                   (tenant_id, region, subject_token) VALUES ($1, $2, $3)",
+                            )
+                            .bind(&tenant)
+                            .bind(&region)
+                            .bind(locator.current())
+                            .execute(&mut *connection)
+                            .await
+                            .map_err(trace_query)?;
+                            true
+                        }
                     } else {
                         sqlx::query(
                             "DELETE FROM knowledge_agent_trace_subject_restriction \
-                              WHERE tenant_id = $1 AND region = $2 AND subject_token = $3",
+                              WHERE tenant_id = $1 AND region = $2 \
+                                AND subject_token IN ($3, $4)",
                         )
                         .bind(&tenant)
                         .bind(&region)
-                        .bind(&token)
+                        .bind(locator.current())
+                        .bind(locator.legacy())
                         .execute(&mut *connection)
                         .await
                         .map_err(trace_query)?
@@ -1002,7 +1023,7 @@ async fn write_on_connection(
     trace: &AgentTraceWrite,
     kms: &KmsEngine,
 ) -> Result<Result<bool, AgentTraceError>, PgError> {
-    match agent_subject_status(connection, tenant, region, &trace.requested_by).await? {
+    match agent_subject_status(connection, tenant, region, &trace.requested_by, kms).await? {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(AgentTraceError::Erased))
@@ -1102,6 +1123,12 @@ struct DatabaseSubjectEraseReceipt {
     tool_effects_erased: u64,
 }
 
+struct SubjectErasureMarker {
+    locator: AgentSubjectLocator,
+    token: String,
+    was_complete: bool,
+}
+
 async fn count_subject_records_on_connection(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
@@ -1130,33 +1157,46 @@ async fn mark_subject_erasure_on_connection(
     connection: &mut sqlx::PgConnection,
     tenant: &str,
     region: &str,
-    subject_token: &str,
-) -> Result<bool, PgError> {
-    lock_agent_subject(connection, tenant, region, subject_token).await?;
-    let completion = sqlx::query_scalar::<_, bool>(
-        "SELECT completed_at IS NOT NULL FROM knowledge_agent_trace_subject_erasure \
-          WHERE tenant_id = $1 AND region = $2 AND subject_token = $3",
+    locator: AgentSubjectLocator,
+) -> Result<SubjectErasureMarker, PgError> {
+    locator.lock(connection, tenant, region).await?;
+    let marker = sqlx::query_as::<_, (String, bool)>(
+        "SELECT subject_token, completed_at IS NOT NULL \
+           FROM knowledge_agent_trace_subject_erasure \
+          WHERE tenant_id = $1 AND region = $2 AND subject_token IN ($3, $4) \
+          ORDER BY completed_at IS NOT NULL DESC, subject_token = $3 DESC \
+          LIMIT 1",
     )
     .bind(tenant)
     .bind(region)
-    .bind(subject_token)
+    .bind(locator.current())
+    .bind(locator.legacy())
     .fetch_optional(&mut *connection)
     .await
     .map_err(trace_query)?;
-    if let Some(completed) = completion {
-        return Ok(completed);
+    if let Some((token, completed)) = marker {
+        return Ok(SubjectErasureMarker {
+            locator,
+            token,
+            was_complete: completed,
+        });
     }
+    let token = locator.current().to_string();
     sqlx::query(
         "INSERT INTO knowledge_agent_trace_subject_erasure \
            (tenant_id, region, subject_token) VALUES ($1, $2, $3)",
     )
     .bind(tenant)
     .bind(region)
-    .bind(subject_token)
+    .bind(&token)
     .execute(&mut *connection)
     .await
     .map_err(trace_query)?;
-    Ok(false)
+    Ok(SubjectErasureMarker {
+        locator,
+        token,
+        was_complete: false,
+    })
 }
 
 async fn complete_subject_erasure_on_connection(
@@ -1164,16 +1204,16 @@ async fn complete_subject_erasure_on_connection(
     tenant: &str,
     region: &str,
     requested_by: &str,
-    subject_token: &str,
+    marker: &SubjectErasureMarker,
 ) -> Result<DatabaseSubjectEraseReceipt, PgError> {
-    lock_agent_subject(connection, tenant, region, subject_token).await?;
+    marker.locator.lock(connection, tenant, region).await?;
     let marker_exists = sqlx::query_scalar::<_, bool>(
         "SELECT EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_erasure \
           WHERE tenant_id = $1 AND region = $2 AND subject_token = $3)",
     )
     .bind(tenant)
     .bind(region)
-    .bind(subject_token)
+    .bind(&marker.token)
     .fetch_one(&mut *connection)
     .await
     .map_err(trace_query)?;
@@ -1232,7 +1272,7 @@ async fn complete_subject_erasure_on_connection(
     )
     .bind(tenant)
     .bind(region)
-    .bind(subject_token)
+    .bind(&marker.token)
     .execute(&mut *connection)
     .await
     .map_err(trace_query)?;
