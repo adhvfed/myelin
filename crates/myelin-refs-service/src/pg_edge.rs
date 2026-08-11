@@ -216,19 +216,30 @@ async fn project_on_connection(
     mutation: EdgeMutation,
 ) -> Result<(), PgEdgeError> {
     match mutation {
-        EdgeMutation::Upsert(row) => upsert(connection, event, &row).await,
-        EdgeMutation::Tombstone { edge_id } => sqlx::query(
-            "UPDATE edge
-                    SET tombstoned = true, origin_event = $3
-                  WHERE tenant_id = $1 AND edge_id = $2",
-        )
-        .bind(&event.tenant.0)
-        .bind(edge_id)
-        .bind(&event.event_id.0)
-        .execute(connection)
-        .await
-        .map(|_| ())
-        .map_err(|_| PgEdgeError::Database),
+        EdgeMutation::Apply(rows) => {
+            for row in rows {
+                upsert(&mut *connection, event, &row).await?;
+            }
+            Ok(())
+        }
+        EdgeMutation::TombstoneIds(edge_ids) => {
+            for edge_id in edge_ids {
+                sqlx::query(
+                    "UPDATE edge
+                        SET tombstoned = true, origin_event = $3, created_at = $4::timestamptz
+                      WHERE tenant_id = $1 AND edge_id = $2
+                        AND (created_at, origin_event) <= ($4::timestamptz, $3)",
+                )
+                .bind(&event.tenant.0)
+                .bind(edge_id)
+                .bind(&event.event_id.0)
+                .bind(&event.recorded_at.0)
+                .execute(&mut *connection)
+                .await
+                .map_err(|_| PgEdgeError::Database)?;
+            }
+            Ok(())
+        }
         EdgeMutation::Ignore => Ok(()),
     }
 }
@@ -244,7 +255,7 @@ async fn upsert(
         "INSERT INTO edge (
              tenant_id, region, edge_id, source, source_root, target, target_root, rel,
              rel_class, origin_event, origin_actor, created_at, zookie, tombstoned, dek_ref
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$13,false,$14)
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$13,$14,$15)
          ON CONFLICT (tenant_id, edge_id) DO UPDATE SET
              region = EXCLUDED.region,
              source = EXCLUDED.source,
@@ -257,8 +268,10 @@ async fn upsert(
              origin_actor = EXCLUDED.origin_actor,
              created_at = EXCLUDED.created_at,
              zookie = EXCLUDED.zookie,
-             tombstoned = false,
-             dek_ref = EXCLUDED.dek_ref",
+             tombstoned = EXCLUDED.tombstoned,
+             dek_ref = EXCLUDED.dek_ref
+         WHERE (edge.created_at, edge.origin_event)
+            <= (EXCLUDED.created_at, EXCLUDED.origin_event)",
     )
     .bind(&event.tenant.0)
     .bind(&event.region.0)
@@ -276,6 +289,7 @@ async fn upsert(
     .bind(&row.origin_actor)
     .bind(&event.recorded_at.0)
     .bind(&row.zookie)
+    .bind(row.tombstoned)
     .bind(dek_ref)
     .execute(connection)
     .await

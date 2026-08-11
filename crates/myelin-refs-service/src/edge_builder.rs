@@ -6,6 +6,8 @@ use myelin_events::{EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectP
 use myelin_refs::{strip_sub, ArtifactRef};
 use myelin_tenancy::{Region, TenantId};
 
+use crate::mirror::{mirror_edges, LifecycleRel, SyntheticTypedEvent};
+
 pub static EDGE_BUILDER_SUBJECTS: &[SubjectPattern] = &[];
 
 pub const EDGE_BUILDER_CONSUMER: &str = "refs-edge-builder";
@@ -63,8 +65,8 @@ pub struct EdgeRow {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EdgeMutation {
-    Upsert(EdgeRow),
-    Tombstone { edge_id: String },
+    Apply(Vec<EdgeRow>),
+    TombstoneIds(Vec<String>),
     Ignore,
 }
 
@@ -96,42 +98,96 @@ fn created_edge_mutation(ev: &EventEnvelope) -> Result<EdgeMutation, ProjectErro
         };
     }
 
-    let source = required_field(ev, "source")?;
-    let target = required_field(ev, "target")?;
-    let rel = required_field(ev, "rel")?;
+    Ok(EdgeMutation::Apply(edge_rows(ev, false)?))
+}
+
+fn removed_edge_mutation(ev: &EventEnvelope) -> Result<EdgeMutation, ProjectError> {
+    if let Some(edge_id) = str_field(&ev.payload, "edge_id") {
+        return Ok(EdgeMutation::TombstoneIds(vec![edge_id]));
+    }
+    Ok(EdgeMutation::Apply(edge_rows(ev, true)?))
+}
+
+fn edge_rows(ev: &EventEnvelope, tombstoned: bool) -> Result<Vec<EdgeRow>, ProjectError> {
+    let field = |name| {
+        if tombstoned {
+            required_removal_field(ev, name)
+        } else {
+            required_field(ev, name)
+        }
+    };
+    let source = field("source")?;
+    let target = field("target")?;
+    let rel = field("rel")?;
     let source_ref = ArtifactRef(source.clone());
     let target_ref = ArtifactRef(target.clone());
-    Ok(EdgeMutation::Upsert(EdgeRow {
+    let rel_class = rel_class(ev)?;
+    let origin_actor =
+        str_field(&ev.payload, "origin_actor").unwrap_or_else(|| ev.actor.0.principal_id.0.clone());
+    let zookie = str_field(&ev.payload, "zookie");
+    if rel_class == RelClass::Lifecycle {
+        let rel = LifecycleRel::parse(&rel)
+            .ok_or_else(|| ProjectError(format!("unknown lifecycle relation `{rel}`")))?;
+        let mut rows = mirror_edges(
+            &ev.tenant,
+            &SyntheticTypedEvent {
+                source: source_ref,
+                target: target_ref,
+                rel,
+                origin_event: ev.event_id.0.clone(),
+                origin_actor,
+                zookie,
+            },
+        );
+        for row in &mut rows {
+            row.tombstoned = tombstoned;
+        }
+        return Ok(rows);
+    }
+    let rel = reference_rel(&rel)?;
+    let row = EdgeRow {
         edge_id: edge_id(&ev.tenant, &source, &target, &rel),
         source_root: strip_sub(&source_ref),
         target_root: strip_sub(&target_ref),
         source: source_ref,
         target: target_ref,
         rel,
-        rel_class: if ev.type_.0.starts_with("refs.edge.") {
-            RelClass::Reference
-        } else {
-            RelClass::Lifecycle
-        },
+        rel_class,
         origin_event: ev.event_id.0.clone(),
-        origin_actor: str_field(payload, "origin_actor")
-            .unwrap_or_else(|| ev.actor.0.principal_id.0.clone()),
-        zookie: str_field(payload, "zookie"),
-        tombstoned: false,
-    }))
+        origin_actor,
+        zookie,
+        tombstoned,
+    };
+    Ok(vec![row])
 }
 
-fn removed_edge_mutation(ev: &EventEnvelope) -> Result<EdgeMutation, ProjectError> {
-    let edge_id = match str_field(&ev.payload, "edge_id") {
-        Some(edge_id) => edge_id,
-        None => {
-            let source = required_removal_field(ev, "source")?;
-            let target = required_removal_field(ev, "target")?;
-            let rel = required_removal_field(ev, "rel")?;
-            edge_id(&ev.tenant, &source, &target, &rel)
-        }
-    };
-    Ok(EdgeMutation::Tombstone { edge_id })
+fn reference_rel(rel: &str) -> Result<String, ProjectError> {
+    match rel {
+        "mentions" | "links" | "embeds" => Ok(rel.to_string()),
+        "references" => Ok("links".into()),
+        other => Err(ProjectError(format!(
+            "unknown reference relation `{other}`"
+        ))),
+    }
+}
+
+fn rel_class(ev: &EventEnvelope) -> Result<RelClass, ProjectError> {
+    match ev.payload.get("rel_class").and_then(|value| value.as_str()) {
+        Some("reference") => Ok(RelClass::Reference),
+        Some("lifecycle") => Ok(RelClass::Lifecycle),
+        Some(other) => Err(ProjectError(format!(
+            "{} carries unknown edge relation class `{other}`",
+            ev.type_.0
+        ))),
+        None if is_legacy_lifecycle_event(&ev.type_.0) => Ok(RelClass::Lifecycle),
+        None => Ok(RelClass::Reference),
+    }
+}
+
+fn is_legacy_lifecycle_event(event_type: &str) -> bool {
+    event_type.starts_with("issue.relation.")
+        || event_type.starts_with("knowledge.relation.")
+        || event_type == "knowledge.page.parent_set"
 }
 
 fn required_field(ev: &EventEnvelope, field: &str) -> Result<String, ProjectError> {
@@ -154,9 +210,21 @@ struct PartKey {
     region: Region,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EventOrder {
+    recorded_at: String,
+    event_id: String,
+}
+
+#[derive(Default)]
+struct EdgePartition {
+    rows: HashMap<String, EdgeRow>,
+    event_orders: HashMap<String, EventOrder>,
+}
+
 #[derive(Clone, Default)]
 pub struct EdgeProjection {
-    inner: Arc<Mutex<HashMap<PartKey, HashMap<String, EdgeRow>>>>,
+    inner: Arc<Mutex<HashMap<PartKey, EdgePartition>>>,
 }
 
 impl EdgeProjection {
@@ -164,7 +232,7 @@ impl EdgeProjection {
         EdgeProjection::default()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PartKey, HashMap<String, EdgeRow>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<PartKey, EdgePartition>> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
@@ -174,10 +242,53 @@ impl EdgeProjection {
             region: region.clone(),
         };
         let mut inner = self.lock();
-        inner
-            .entry(pk)
-            .or_default()
-            .insert(row.edge_id.clone(), row);
+        let part = inner.entry(pk).or_default();
+        part.event_orders.remove(&row.edge_id);
+        part.rows.insert(row.edge_id.clone(), row);
+    }
+
+    fn apply_event(&self, ev: &EventEnvelope, row: EdgeRow) {
+        let pk = PartKey {
+            tenant: ev.tenant.clone(),
+            region: ev.region.clone(),
+        };
+        let order = event_order(ev);
+        let mut inner = self.lock();
+        let part = inner.entry(pk).or_default();
+        if part
+            .event_orders
+            .get(&row.edge_id)
+            .is_some_and(|applied| order <= *applied)
+        {
+            return;
+        }
+        part.event_orders.insert(row.edge_id.clone(), order);
+        part.rows.insert(row.edge_id.clone(), row);
+    }
+
+    fn tombstone_event(&self, ev: &EventEnvelope, edge_id: &str) {
+        let pk = PartKey {
+            tenant: ev.tenant.clone(),
+            region: ev.region.clone(),
+        };
+        let order = event_order(ev);
+        let mut inner = self.lock();
+        let Some(part) = inner.get_mut(&pk) else {
+            return;
+        };
+        if part
+            .event_orders
+            .get(edge_id)
+            .is_some_and(|applied| order <= *applied)
+        {
+            return;
+        }
+        let Some(row) = part.rows.get_mut(edge_id) else {
+            return;
+        };
+        row.tombstoned = true;
+        row.origin_event = ev.event_id.0.clone();
+        part.event_orders.insert(edge_id.to_string(), order);
     }
 
     pub fn tombstone(&self, tenant: &TenantId, region: &Region, edge_id: &str, origin_event: &str) {
@@ -187,9 +298,10 @@ impl EdgeProjection {
         };
         let mut inner = self.lock();
         if let Some(part) = inner.get_mut(&pk) {
-            if let Some(row) = part.get_mut(edge_id) {
+            if let Some(row) = part.rows.get_mut(edge_id) {
                 row.tombstoned = true;
                 row.origin_event = origin_event.to_string();
+                part.event_orders.remove(edge_id);
             }
         }
     }
@@ -199,7 +311,9 @@ impl EdgeProjection {
             tenant: tenant.clone(),
             region: region.clone(),
         };
-        self.lock().get(&pk).and_then(|p| p.get(edge_id).cloned())
+        self.lock()
+            .get(&pk)
+            .and_then(|p| p.rows.get(edge_id).cloned())
     }
 
     pub fn live_count(&self, tenant: &TenantId, region: &Region) -> usize {
@@ -209,7 +323,7 @@ impl EdgeProjection {
         };
         self.lock()
             .get(&pk)
-            .map(|p| p.values().filter(|r| !r.tombstoned).count())
+            .map(|p| p.rows.values().filter(|r| !r.tombstoned).count())
             .unwrap_or(0)
     }
 
@@ -218,7 +332,7 @@ impl EdgeProjection {
             tenant: tenant.clone(),
             region: region.clone(),
         };
-        self.lock().get(&pk).map(|p| p.len()).unwrap_or(0)
+        self.lock().get(&pk).map(|p| p.rows.len()).unwrap_or(0)
     }
 
     pub fn parity_bytes(&self, tenant: &TenantId, region: &Region) -> Vec<u8> {
@@ -229,7 +343,7 @@ impl EdgeProjection {
         let mut rows: Vec<EdgeRow> = self
             .lock()
             .get(&pk)
-            .map(|p| p.values().cloned().collect())
+            .map(|p| p.rows.values().cloned().collect())
             .unwrap_or_default();
         rows.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
         let mut out = Vec::new();
@@ -280,7 +394,8 @@ impl EdgeProjection {
             .lock()
             .get(&pk)
             .map(|p| {
-                p.values()
+                p.rows
+                    .values()
                     .filter(|r| r.origin_actor == subject_id)
                     .cloned()
                     .collect()
@@ -308,7 +423,8 @@ impl EdgeProjection {
             .lock()
             .get(&pk)
             .map(|p| {
-                p.values()
+                p.rows
+                    .values()
                     .filter(|r| !r.tombstoned && &r.target_root == target_root)
                     .cloned()
                     .collect()
@@ -332,7 +448,8 @@ impl EdgeProjection {
             .lock()
             .get(&pk)
             .map(|p| {
-                p.values()
+                p.rows
+                    .values()
                     .filter(|r| !r.tombstoned && &r.source_root == source_root)
                     .cloned()
                     .collect()
@@ -340,6 +457,13 @@ impl EdgeProjection {
             .unwrap_or_default();
         rows.sort_by(|a, b| a.edge_id.cmp(&b.edge_id));
         rows
+    }
+}
+
+fn event_order(ev: &EventEnvelope) -> EventOrder {
+    EventOrder {
+        recorded_at: ev.recorded_at.0.clone(),
+        event_id: ev.event_id.0.clone(),
     }
 }
 
@@ -379,10 +503,15 @@ impl RefsEdgeBuilder {
 
     fn project_inner(&self, ev: &EventEnvelope) -> Result<(), ProjectError> {
         match edge_mutation(ev)? {
-            EdgeMutation::Upsert(row) => self.projection.upsert(&ev.tenant, &ev.region, row),
-            EdgeMutation::Tombstone { edge_id } => {
-                self.projection
-                    .tombstone(&ev.tenant, &ev.region, &edge_id, &ev.event_id.0)
+            EdgeMutation::Apply(rows) => {
+                for row in rows {
+                    self.projection.apply_event(ev, row);
+                }
+            }
+            EdgeMutation::TombstoneIds(edge_ids) => {
+                for edge_id in edge_ids {
+                    self.projection.tombstone_event(ev, &edge_id);
+                }
             }
             EdgeMutation::Ignore => {}
         }
@@ -629,15 +758,83 @@ mod tests {
     }
 
     #[test]
-    fn tombstone_of_absent_edge_is_a_noop() {
+    fn removal_arriving_first_leaves_a_fence_for_its_delayed_creation() {
         let b = RefsEdgeBuilder::new(EdgeProjection::new());
-        let rm = edge_event("01J-r", "refs.edge.removed", "s", "t", "mentions");
+        let mut created = edge_event("01J-1", "refs.edge.created", "s", "t", "mentions");
+        created.recorded_at = Timestamp("2026-06-20T00:00:01Z".into());
+        let mut removed = edge_event("01J-2", "refs.edge.removed", "s", "t", "mentions");
+        removed.recorded_at = Timestamp("2026-06-20T00:00:02Z".into());
+
         assert_eq!(
-            b.handle(&rm, &mut myelin_events::HandlerTx::none()),
+            b.handle(&removed, &mut myelin_events::HandlerTx::none()),
             HandleOutcome::Done,
-            "removal of absent edge is a no-op"
+            "a removal can be projected before its creation"
         );
-        assert_eq!(b.projection().total_count(&tenant(), &region()), 0);
+        assert_eq!(b.projection().live_count(&tenant(), &region()), 0);
+        assert_eq!(b.projection().total_count(&tenant(), &region()), 1);
+
+        assert_eq!(
+            b.handle(&created, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done,
+            "the delayed broker delivery is harmless"
+        );
+        let row = b
+            .projection()
+            .get(
+                &tenant(),
+                &region(),
+                &edge_id(&tenant(), "s", "t", "mentions"),
+            )
+            .expect("the removal fence remains inspectable");
+        assert!(row.tombstoned, "old creation cannot resurrect the edge");
+        assert_eq!(row.origin_event, "01J-2");
+    }
+
+    #[test]
+    fn a_lifecycle_relation_appears_both_ways_and_disappears_both_ways() {
+        let b = RefsEdgeBuilder::new(EdgeProjection::new());
+        let planning = "myelin://acme/issue/issue/PLAN-1";
+        let delivery = "myelin://acme/issue/issue/SHIP-1";
+        let mut created = edge_event("01J-1", "refs.edge.created", planning, delivery, "blocks");
+        created.payload["rel_class"] = serde_json::json!("lifecycle");
+
+        assert_eq!(
+            b.handle(&created, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
+        let forward = b
+            .projection()
+            .get(
+                &tenant(),
+                &region(),
+                &edge_id(&tenant(), planning, delivery, "blocks"),
+            )
+            .expect("planning blocks delivery");
+        let inverse = b
+            .projection()
+            .get(
+                &tenant(),
+                &region(),
+                &edge_id(&tenant(), delivery, planning, "blocked_by"),
+            )
+            .expect("delivery is blocked by planning");
+        assert_eq!(forward.rel_class, RelClass::Lifecycle);
+        assert_eq!(inverse.rel_class, RelClass::Lifecycle);
+        assert_eq!(b.projection().live_count(&tenant(), &region()), 2);
+
+        let mut removed = edge_event("01J-2", "refs.edge.removed", planning, delivery, "blocks");
+        removed.recorded_at = Timestamp("2026-06-20T00:00:02Z".into());
+        removed.payload["rel_class"] = serde_json::json!("lifecycle");
+        assert_eq!(
+            b.handle(&removed, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
+        assert_eq!(
+            b.projection().live_count(&tenant(), &region()),
+            0,
+            "removing the typed relation removes both navigable directions"
+        );
+        assert_eq!(b.projection().total_count(&tenant(), &region()), 2);
     }
 
     #[test]

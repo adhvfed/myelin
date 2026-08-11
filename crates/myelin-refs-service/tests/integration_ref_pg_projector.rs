@@ -3,14 +3,17 @@
 use std::sync::Arc;
 
 use myelin_events::{
-    Actor, AggregateKey, CorrelationId, DataRole, DedupLedger, Delivered, EventEnvelope, EventId,
-    EventType, Message, Timestamp, Visibility,
+    Actor, AggregateKey, Consumer, CorrelationId, DataRole, DedupLedger, Delivered, EventEnvelope,
+    EventId, EventType, Message, Timestamp, Visibility,
 };
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
-use myelin_refs_service::{build_pg_edge_consumer, edge_table_migrations, PgEdgeStore};
+use myelin_refs_service::{
+    build_pg_edge_consumer, edge_table_migrations, PgEdgeProjector, PgEdgeStore,
+};
 use myelin_storage::events_durable::{DurableDeadLetterBacking, DurableDedupBacking};
 use myelin_storage::PgMigrator;
 use myelin_tenancy::{ArtifactRef, Region, TenantId};
+use sqlx::PgPool;
 
 fn app_url() -> String {
     std::env::var("DATABASE_URL")
@@ -23,112 +26,226 @@ fn admin_url() -> String {
     })
 }
 
+struct ProjectorHarness {
+    admin: PgPool,
+    app: PgPool,
+    tenant: TenantId,
+    region: Region,
+    consumer: Consumer<PgEdgeProjector>,
+}
+
+impl ProjectorHarness {
+    async fn start(story: &str) -> Self {
+        let admin = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&admin_url())
+            .await
+            .expect("connect as migration role");
+        PgMigrator::apply(&admin, &edge_table_migrations())
+            .await
+            .expect("apply the production edge migration");
+
+        let app = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&app_url())
+            .await
+            .expect("connect as runtime role");
+        let tenant = TenantId(format!("refs-{story}-{}", std::process::id()));
+        let region = Region("fr-par".into());
+        let runtime = tokio::runtime::Handle::current();
+        let dedup = DedupLedger::durable(Arc::new(DurableDedupBacking::new(
+            app.clone(),
+            runtime.clone(),
+        )));
+        let dead_letters: Arc<dyn myelin_events::DurableDeadLetter> =
+            Arc::new(DurableDeadLetterBacking::new(app.clone(), runtime.clone()));
+        let consumer = build_pg_edge_consumer(
+            &tenant,
+            &region,
+            PgEdgeStore::new(app.clone()),
+            dedup,
+            dead_letters,
+            runtime,
+        )
+        .expect("build the tenant-bound projector");
+        Self {
+            admin,
+            app,
+            tenant,
+            region,
+            consumer,
+        }
+    }
+
+    fn issue(&self, key: &str) -> ArtifactRef {
+        ArtifactRef(format!("myelin://{}/issue/issue/{key}", self.tenant.0))
+    }
+
+    fn event(
+        &self,
+        event_id: &str,
+        event_type: &str,
+        recorded_at: &str,
+        source: &ArtifactRef,
+        target: &ArtifactRef,
+        rel: &str,
+        rel_class: &str,
+    ) -> EventEnvelope {
+        EventEnvelope {
+            event_id: EventId(event_id.into()),
+            type_: EventType(event_type.into()),
+            schema_ver: 1,
+            tenant: self.tenant.clone(),
+            region: self.region.clone(),
+            actor: Actor(Principal::stub(
+                PrincipalId("agent:release-helper".into()),
+                PrincipalKind::Agent {
+                    runtime_ref: myelin_identity::RuntimeRef("runtime:test".into()),
+                    on_behalf_of: Some(PrincipalId("human:operator".into())),
+                },
+                self.tenant.clone(),
+            )),
+            subject: source.clone(),
+            aggregate: AggregateKey(format!("refs-edge:{}:{}", source.0, target.0)),
+            causation_id: None,
+            correlation_id: CorrelationId(format!("story:{event_id}")),
+            caused_by: None,
+            depth: 1,
+            contains_personal_data: false,
+            data_role: DataRole::Controller,
+            visibility: Visibility::Internal,
+            pii_key_ref: None,
+            occurred_at: Timestamp(recorded_at.into()),
+            recorded_at: Timestamp(recorded_at.into()),
+            payload: serde_json::json!({
+                "source": source.0,
+                "target": target.0,
+                "rel": rel,
+                "rel_class": rel_class,
+            }),
+        }
+    }
+
+    fn deliver(&self, event: &EventEnvelope) -> Delivered {
+        self.consumer.deliver(&Message {
+            subject: event.subject.0.clone(),
+            envelope: event.clone(),
+        })
+    }
+
+    async fn edge_states(&self) -> Vec<(String, String, bool, String)> {
+        let mut connection = self.app.acquire().await.expect("acquire app connection");
+        sqlx::query(
+            "SELECT set_config('myelin.tenant_id',$1,false), set_config('myelin.region',$2,false)",
+        )
+        .bind(&self.tenant.0)
+        .bind(&self.region.0)
+        .execute(&mut *connection)
+        .await
+        .expect("bind tenant scope");
+        sqlx::query_as(
+            "SELECT rel, rel_class, tombstoned, origin_event
+               FROM edge
+              WHERE tenant_id = $1
+              ORDER BY rel",
+        )
+        .bind(&self.tenant.0)
+        .fetch_all(&mut *connection)
+        .await
+        .expect("read the projected edges")
+    }
+
+    async fn clean_up(self) {
+        sqlx::query("DELETE FROM edge WHERE tenant_id = $1")
+            .bind(&self.tenant.0)
+            .execute(&self.admin)
+            .await
+            .expect("clean up story edges");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn delivered_reference_edges_and_their_dedup_tombstone_commit_together() {
-    let admin = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&admin_url())
-        .await
-        .expect("connect as migration role");
-    PgMigrator::apply(&admin, &edge_table_migrations())
-        .await
-        .expect("apply the production edge migration");
+async fn a_delivered_reference_edge_and_its_dedup_record_commit_together() {
+    let story = ProjectorHarness::start("reference").await;
+    let source = ArtifactRef(format!("myelin://{}/chat/message/M1", story.tenant.0));
+    let target = story.issue("ENG-41");
+    let event = story.event(
+        &format!("refs-reference-create-{}", std::process::id()),
+        "refs.edge.created",
+        "2026-08-10T00:00:01Z",
+        &source,
+        &target,
+        "links",
+        "reference",
+    );
 
-    let app = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(4)
-        .connect(&app_url())
-        .await
-        .expect("connect as runtime role");
-    let tenant = TenantId(format!("refs-projector-{}", std::process::id()));
-    let region = Region("fr-par".into());
-    let source = ArtifactRef(format!("myelin://{}/chat/message/M1", tenant.0));
-    let target = ArtifactRef(format!("myelin://{}/issue/issue/ENG-41", tenant.0));
-    let event = EventEnvelope {
-        event_id: EventId(format!("refs-projector-event-{}", std::process::id())),
-        type_: EventType("refs.edge.created".into()),
-        schema_ver: 1,
-        tenant: tenant.clone(),
-        region: region.clone(),
-        actor: Actor(Principal::stub(
-            PrincipalId("agent:release-helper".into()),
-            PrincipalKind::Agent {
-                runtime_ref: myelin_identity::RuntimeRef("runtime:test".into()),
-                on_behalf_of: Some(PrincipalId("human:operator".into())),
-            },
-            tenant.clone(),
-        )),
-        subject: source.clone(),
-        aggregate: AggregateKey("refs-edge:M1-ENG-41".into()),
-        causation_id: None,
-        correlation_id: CorrelationId("release-failure".into()),
-        caused_by: None,
-        depth: 1,
-        contains_personal_data: false,
-        data_role: DataRole::Controller,
-        visibility: Visibility::Internal,
-        pii_key_ref: None,
-        occurred_at: Timestamp("2026-08-10T00:00:00Z".into()),
-        recorded_at: Timestamp("2026-08-10T00:00:01Z".into()),
-        payload: serde_json::json!({
-            "source": source.0,
-            "target": target.0,
-            "rel": "links",
-        }),
-    };
-    let runtime = tokio::runtime::Handle::current();
-    let dedup = DedupLedger::durable(Arc::new(DurableDedupBacking::new(
-        app.clone(),
-        runtime.clone(),
-    )));
-    let dead_letters: Arc<dyn myelin_events::DurableDeadLetter> =
-        Arc::new(DurableDeadLetterBacking::new(app.clone(), runtime.clone()));
-    let consumer = build_pg_edge_consumer(
-        &tenant,
-        &region,
-        PgEdgeStore::new(app.clone()),
-        dedup,
-        dead_letters,
-        runtime,
-    )
-    .expect("build the tenant-bound projector");
-    let message = Message {
-        subject: source.0.clone(),
-        envelope: event.clone(),
-    };
-
-    assert_eq!(consumer.deliver(&message), Delivered::Acked);
+    assert_eq!(story.deliver(&event), Delivered::Acked);
     assert_eq!(
-        consumer.deliver(&message),
+        story.deliver(&event),
         Delivered::Deduplicated,
         "a broker replay does not rewrite the projection"
     );
+    assert_eq!(
+        story.edge_states().await,
+        vec![(
+            "links".into(),
+            "reference".into(),
+            false,
+            event.event_id.0.clone(),
+        )]
+    );
 
-    let mut connection = app.acquire().await.unwrap();
-    sqlx::query(
-        "SELECT set_config('myelin.tenant_id',$1,false), set_config('myelin.region',$2,false)",
-    )
-    .bind(&tenant.0)
-    .bind(&region.0)
-    .execute(&mut *connection)
-    .await
-    .unwrap();
-    let row: (String, String, String, String, bool) = sqlx::query_as(
-        "SELECT source, target, rel, origin_actor, tombstoned
-           FROM edge WHERE tenant_id = $1",
-    )
-    .bind(&tenant.0)
-    .fetch_one(&mut *connection)
-    .await
-    .expect("the consumer committed one queryable edge");
-    assert_eq!(row.0, source.0);
-    assert_eq!(row.1, target.0);
-    assert_eq!(row.2, "links");
-    assert_eq!(row.3, "agent:release-helper");
-    assert!(!row.4);
+    story.clean_up().await;
+}
 
-    sqlx::query("DELETE FROM edge WHERE tenant_id = $1")
-        .bind(&tenant.0)
-        .execute(&admin)
-        .await
-        .unwrap();
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_issue_dependency_stays_gone_when_its_creation_arrives_late() {
+    let story = ProjectorHarness::start("lifecycle").await;
+    let planning = story.issue("PLAN-1");
+    let delivery = story.issue("SHIP-1");
+    let created = story.event(
+        &format!("refs-lifecycle-create-{}", std::process::id()),
+        "refs.edge.created",
+        "2026-08-10T00:00:01Z",
+        &planning,
+        &delivery,
+        "blocks",
+        "lifecycle",
+    );
+    let removed = story.event(
+        &format!("refs-lifecycle-remove-{}", std::process::id()),
+        "refs.edge.removed",
+        "2026-08-10T00:00:02Z",
+        &planning,
+        &delivery,
+        "blocks",
+        "lifecycle",
+    );
+
+    assert_eq!(story.deliver(&removed), Delivered::Acked);
+    assert_eq!(
+        story.deliver(&created),
+        Delivered::Acked,
+        "the broker may deliver an older creation after its removal"
+    );
+    assert_eq!(
+        story.edge_states().await,
+        vec![
+            (
+                "blocked_by".into(),
+                "lifecycle".into(),
+                true,
+                removed.event_id.0.clone(),
+            ),
+            (
+                "blocks".into(),
+                "lifecycle".into(),
+                true,
+                removed.event_id.0.clone(),
+            ),
+        ],
+        "both navigable directions remain tombstoned by the newer fact"
+    );
+
+    story.clean_up().await;
 }
