@@ -175,7 +175,7 @@ fn decode_hex(value: u8) -> Result<u8, &'static str> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ImportMode {
     DryRun,
-    Run { resume: bool },
+    Run,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -257,7 +257,6 @@ fn parse_import(args: &[&str]) -> Result<CliCommand, CliParseError> {
     let mut job_id = None;
     let mut input = None;
     let mut mode = None;
-    let mut resume = false;
     let mut index = 0;
     while index < args.len() {
         match args[index] {
@@ -301,15 +300,9 @@ fn parse_import(args: &[&str]) -> Result<CliCommand, CliParseError> {
                 }
             }
             "--run" => {
-                if mode.replace(ImportMode::Run { resume: false }).is_some() {
+                if mode.replace(ImportMode::Run).is_some() {
                     return Err(CliParseError::DuplicateFlag { flag: "--run" });
                 }
-            }
-            "--resume" => {
-                if resume {
-                    return Err(CliParseError::DuplicateFlag { flag: "--resume" });
-                }
-                resume = true;
             }
             other => {
                 return Err(CliParseError::Unknown {
@@ -323,18 +316,9 @@ fn parse_import(args: &[&str]) -> Result<CliCommand, CliParseError> {
     let source = source.ok_or(CliParseError::MissingValue { flag: "--from" })?;
     let job_id = required(job_id, "--job")?;
     let input = required(input, "--input")?;
-    let mode = match mode {
-        Some(ImportMode::Run { .. }) => ImportMode::Run { resume },
-        Some(ImportMode::DryRun) if !resume => ImportMode::DryRun,
-        Some(ImportMode::DryRun) => {
-            return Err(CliParseError::InvalidCombination("--resume requires --run"))
-        }
-        None => {
-            return Err(CliParseError::InvalidCombination(
-                "issue import requires exactly one of --dry-run or --run",
-            ))
-        }
-    };
+    let mode = mode.ok_or(CliParseError::InvalidCombination(
+        "issue import requires exactly one of --dry-run or --run",
+    ))?;
     Ok(CliCommand::Import {
         source,
         job_id,
@@ -641,7 +625,7 @@ mod tests {
     }
 
     #[test]
-    fn import_grammar_makes_preview_run_and_resume_explicit() {
+    fn import_grammar_makes_preview_and_resumable_run_explicit() {
         assert_eq!(
             parse_cli(&[
                 "import",
@@ -662,31 +646,20 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_cli(&[
-                "import", "--from", "github", "--job", PROJECT, "--input", "-", "--run",
-                "--resume",
-            ])
-            .unwrap(),
+            parse_cli(&["import", "--from", "github", "--job", PROJECT, "--input", "-", "--run",])
+                .unwrap(),
             CliCommand::Import {
                 source: SourceSystem::GitHub,
                 job_id: PROJECT.into(),
                 input: "-".into(),
-                mode: ImportMode::Run { resume: true },
+                mode: ImportMode::Run,
             }
         );
 
         for invalid in [
             vec!["import", "--from", "jira", "--job", PROJECT, "--input", "x"],
             vec![
-                "import",
-                "--from",
-                "jira",
-                "--job",
-                PROJECT,
-                "--input",
-                "x",
-                "--dry-run",
-                "--resume",
+                "import", "--from", "jira", "--job", PROJECT, "--input", "x", "--run", "--resume",
             ],
             vec![
                 "import", "--from", "Jira", "--job", PROJECT, "--input", "x", "--run",

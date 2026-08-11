@@ -167,11 +167,11 @@ fn command_to_call(
             }
             let path = match mode {
                 ImportMode::DryRun => format!("/v1/issues/imports/{job_id}/dry-run"),
-                ImportMode::Run { .. } => format!("/v1/issues/imports/{job_id}/run"),
+                ImportMode::Run => format!("/v1/issues/imports/{job_id}/run"),
             };
             match mode {
                 ImportMode::DryRun => EdgeCall::post_retry_safe_json(path, payload),
-                ImportMode::Run { .. } => EdgeCall::post_json(path, payload),
+                ImportMode::Run => EdgeCall::post_json(path, payload),
             }
         }
         CliCommand::View { issue_id } => EdgeCall::get(format!("/v1/issues/{issue_id}")),
@@ -252,7 +252,6 @@ mod tests {
                 "--input",
                 "jira.json",
                 "--run",
-                "--resume",
             ],
             Some(PROJECT),
             &document,

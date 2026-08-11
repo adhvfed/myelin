@@ -2088,7 +2088,6 @@ describe("the CLI authentication journey", () => {
         "--input",
         importPath,
         "--run",
-        "--resume",
       );
       expect(resumedImport.exitCode, resumedImport.stderr).toBe(0);
       expect(resumedImport.stdout).toContain("0 created, 1 resumed");

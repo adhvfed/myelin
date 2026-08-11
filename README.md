@@ -264,9 +264,10 @@ throughout an export:
 }
 ```
 
-`--dry-run` performs validation and authorization checks without writing. Reuse the same `--job`
-with `--run --resume` after an interruption; the durable source-ID map returns existing issues
-instead of creating duplicates. Use `--input -` to read the document from standard input.
+`--dry-run` performs validation and authorization checks without writing. Every `--run` is
+resumable: reuse the same `--job` after an interruption and the durable source-ID map returns
+existing issues instead of creating duplicates. Use `--input -` to read the document from standard
+input.
 
 ## Status
 
