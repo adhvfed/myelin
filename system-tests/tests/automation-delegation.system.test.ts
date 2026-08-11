@@ -2,8 +2,9 @@ import { randomUUID } from "node:crypto";
 
 import { describe, expect, test } from "vitest";
 
+import { findAutomation } from "../src/automations.js";
 import { systemTestConfig } from "../src/config.js";
-import { browserApprovedCliClient, uniqueName } from "../src/context.js";
+import { browserApprovedCliClient, privacyClient, uniqueName } from "../src/context.js";
 import { GitProject } from "../src/git-project.js";
 import { array, record, string } from "../src/json.js";
 
@@ -147,15 +148,13 @@ describe("automation delegation", () => {
       delegation_caveats: ["issue.create", "repo:platform/api"],
     });
 
-    const rediscovered = await founder.json("/v1/triggers?limit=100");
-    const matching = array(rediscovered.body.items, "founder's automations")
-      .map((item) => record(item, "automation"))
-      .filter((item) => item.task === task);
-    expect(matching).toEqual([expect.objectContaining({ id: trigger.id })]);
+    expect(
+      await findAutomation(founder, string(trigger.id, "scoped automation id")),
+    ).toMatchObject({ id: trigger.id, task });
   });
 
   test("keeps one owner from crowding every collaborator out of an event", async () => {
-    const founder = await browserApprovedCliClient();
+    const founder = await browserApprovedCliClient(privacyClient);
     const activated = await founder.json("/v1/agents", {
       method: "POST",
       body: {

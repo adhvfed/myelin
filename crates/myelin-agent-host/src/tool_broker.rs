@@ -20,6 +20,7 @@ type JsonHttpClient = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
 pub struct EdgeMcpToolExecutor {
     client: JsonHttpClient,
     base_url: String,
+    runtime: tokio::runtime::Handle,
 }
 
 impl core::fmt::Debug for EdgeMcpToolExecutor {
@@ -32,7 +33,10 @@ impl core::fmt::Debug for EdgeMcpToolExecutor {
 }
 
 impl EdgeMcpToolExecutor {
-    pub fn new(base_url: impl Into<String>) -> Result<Self, ToolExecError> {
+    pub fn new(
+        base_url: impl Into<String>,
+        runtime: tokio::runtime::Handle,
+    ) -> Result<Self, ToolExecError> {
         let base_url = validate_base_url(base_url.into())?;
         let connector = HttpsConnectorBuilder::new()
             .with_provider_and_native_roots(rustls::crypto::aws_lc_rs::default_provider())
@@ -43,6 +47,7 @@ impl EdgeMcpToolExecutor {
         Ok(Self {
             client: Client::builder(TokioExecutor::new()).build(connector),
             base_url,
+            runtime,
         })
     }
 
@@ -94,47 +99,27 @@ impl EdgeMcpToolExecutor {
 
     fn post(&self, uri: Uri, bearer: &str, body: Bytes) -> Result<(u16, Bytes), ToolExecError> {
         let client = self.client.clone();
-        std::thread::scope(|scope| {
-            scope
-                .spawn(move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| failed(format!("build MCP client runtime: {error}")))?;
-                    runtime.block_on(async move {
-                        let request = Request::builder()
-                            .method("POST")
-                            .uri(uri)
-                            .header("accept", "application/json")
-                            .header("content-type", "application/json")
-                            .header("authorization", format!("Bearer {bearer}"))
-                            .header("x-myelin-token-scheme", "agent")
-                            .body(Full::new(body))
-                            .map_err(|error| {
-                                failed(format!("build governed MCP request: {error}"))
-                            })?;
-                        let response =
-                            tokio::time::timeout(REQUEST_DEADLINE, client.request(request))
-                                .await
-                                .map_err(|_| {
-                                    failed("governed MCP request exceeded its 30-second deadline")
-                                })?
-                                .map_err(|error| {
-                                    failed(format!("governed MCP request failed: {error}"))
-                                })?;
-                        let status = response.status().as_u16();
-                        let bytes = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
-                            .collect()
-                            .await
-                            .map_err(|error| {
-                                failed(format!("read governed MCP response: {error}"))
-                            })?
-                            .to_bytes();
-                        Ok((status, bytes))
-                    })
-                })
-                .join()
-                .map_err(|_| failed("governed MCP request worker panicked"))?
+        crate::bridge(&self.runtime, async move {
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("accept", "application/json")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {bearer}"))
+                .header("x-myelin-token-scheme", "agent")
+                .body(Full::new(body))
+                .map_err(|error| failed(format!("build governed MCP request: {error}")))?;
+            let response = tokio::time::timeout(REQUEST_DEADLINE, client.request(request))
+                .await
+                .map_err(|_| failed("governed MCP request exceeded its 30-second deadline"))?
+                .map_err(|error| failed(format!("governed MCP request failed: {error}")))?;
+            let status = response.status().as_u16();
+            let bytes = Limited::new(response.into_body(), MAX_RESPONSE_BYTES)
+                .collect()
+                .await
+                .map_err(|error| failed(format!("read governed MCP response: {error}")))?
+                .to_bytes();
+            Ok((status, bytes))
         })
     }
 }
@@ -330,25 +315,29 @@ mod tests {
 
     #[test]
     fn bearer_transport_refuses_cleartext_beyond_loopback() {
-        assert!(EdgeMcpToolExecutor::new("https://edge.example.test").is_ok());
-        assert!(EdgeMcpToolExecutor::new("http://127.0.0.1:8080").is_ok());
-        assert!(EdgeMcpToolExecutor::new("http://edge.example.test").is_err());
-        assert!(EdgeMcpToolExecutor::new("https://user@edge.example.test").is_err());
-        assert!(EdgeMcpToolExecutor::new("https://edge.example.test/path").is_err());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        assert!(EdgeMcpToolExecutor::new("https://edge.example.test", handle.clone()).is_ok());
+        assert!(EdgeMcpToolExecutor::new("http://127.0.0.1:8080", handle.clone()).is_ok());
+        assert!(EdgeMcpToolExecutor::new("http://edge.example.test", handle.clone()).is_err());
+        assert!(
+            EdgeMcpToolExecutor::new("https://user@edge.example.test", handle.clone()).is_err()
+        );
+        assert!(EdgeMcpToolExecutor::new("https://edge.example.test/path", handle).is_err());
     }
 
     #[test]
     fn mutation_retry_key_is_stable_bounded_and_request_specific() {
         let (definition, call) = read_call();
         let base_context = context("model-turn/0/tool/0");
-        let first =
-            stable_idempotency_key(&base_context, &call, &definition).unwrap();
-        let replay =
-            stable_idempotency_key(&base_context, &call, &definition).unwrap();
+        let first = stable_idempotency_key(&base_context, &call, &definition).unwrap();
+        let replay = stable_idempotency_key(&base_context, &call, &definition).unwrap();
         let mut changed = call.clone();
         changed.arguments = json!({"run_id": "another-run"});
-        let different =
-            stable_idempotency_key(&base_context, &changed, &definition).unwrap();
+        let different = stable_idempotency_key(&base_context, &changed, &definition).unwrap();
 
         assert_eq!(first, replay);
         assert_ne!(first, different);
@@ -364,12 +353,7 @@ mod tests {
         );
         assert_ne!(
             first,
-            stable_idempotency_key(
-                &context("model-turn/0/tool/1"),
-                &call,
-                &definition,
-            )
-            .unwrap(),
+            stable_idempotency_key(&context("model-turn/0/tool/1"), &call, &definition,).unwrap(),
             "two calls with the same arguments remain distinct logical effects",
         );
     }

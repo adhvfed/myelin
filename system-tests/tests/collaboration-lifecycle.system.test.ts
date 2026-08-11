@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 
 import { describe, expect, test } from "vitest";
 
+import { findAutomation } from "../src/automations.js";
 import {
   browserApprovedCliClient,
   reviewerClient,
@@ -179,12 +180,10 @@ describe("collaboration lifecycle", () => {
     });
     expect(conflict.body).toMatchObject({ error: { code: "conflict" } });
 
-    const rediscovered = await founder.json("/v1/triggers?limit=100");
-    expect(array(rediscovered.body.items, "founder's agent triggers")).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ id: triggerId, run_as_agent_id: agentId }),
-      ]),
-    );
+    expect(await findAutomation(founder, triggerId)).toMatchObject({
+      id: triggerId,
+      run_as_agent_id: agentId,
+    });
 
     const slug = uniqueName("triggered-ci");
     const project = new GitProject(slug, systemClient);
@@ -250,10 +249,7 @@ command = ["true"]
     }
 
     const fired = await eventually<JsonRecord>(async () => {
-      const response = await founder.json("/v1/triggers?limit=100");
-      const binding = array(response.body.items, "founder's agent triggers")
-        .map((item) => record(item, "founder's agent trigger"))
-        .find((item) => item.id === triggerId);
+      const binding = await findAutomation(founder, triggerId);
       return binding?.firings_used === 1 ? binding : undefined;
     }, { description: "the governed agent binding to reserve the red mainline event exactly once" });
     expect(fired).toMatchObject({
@@ -508,12 +504,11 @@ command = ["true"]
     );
     expect(cannotRevive.body).toMatchObject({ error: { code: "conflict" } });
 
-    const retired = await founder.json("/v1/triggers?limit=100");
-    expect(array(retired.body.items, "founder's retired agent triggers")).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({ id: triggerId, state: "disabled", firings_used: 1 }),
-      ]),
-    );
+    expect(await findAutomation(founder, triggerId)).toMatchObject({
+      id: triggerId,
+      state: "disabled",
+      firings_used: 1,
+    });
   });
 
   test("holds a visible issue event for a human decision without pretending it is CI", async () => {

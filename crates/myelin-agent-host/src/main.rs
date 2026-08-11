@@ -72,7 +72,7 @@ async fn main() {
         refuse_start("governed tool broker", "MYELIN_PUBLIC_BASE_URL is missing")
     });
     let tool_executor = Arc::new(
-        EdgeMcpToolExecutor::new(edge_url)
+        EdgeMcpToolExecutor::new(edge_url, runtime.clone())
             .unwrap_or_else(|error| refuse_start("governed tool broker", error)),
     );
     let activity: Arc<dyn HostedAgentRunExecutor> = Arc::new(
