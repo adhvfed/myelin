@@ -7,6 +7,9 @@ pub const EDGE_TABLE: &str = "edge";
 
 pub const EDGE_MIGRATION_ID: &str = "refs_0001_edge";
 pub const EDGE_INBOUND_KEYSET_MIGRATION_ID: &str = "refs_0002_inbound_keyset";
+pub const EDGE_REGION_IDENTITY_INDEX_MIGRATION_ID: &str = "refs_0003_region_identity_index";
+pub const EDGE_REGION_SEMANTICS_INDEX_MIGRATION_ID: &str = "refs_0004_region_semantics_index";
+pub const EDGE_REGION_IDENTITY_CONTRACT_MIGRATION_ID: &str = "refs_0005_region_identity_contract";
 
 pub const EDGE_INBOUND_INDEX: &str = "edge_inbound";
 pub const EDGE_INBOUND_KEYSET_INDEX: &str = "edge_inbound_keyset";
@@ -53,6 +56,22 @@ pub const CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL: &str =
     "CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_inbound_keyset \
      ON edge (tenant_id, region, target_root, edge_id) WHERE NOT tombstoned";
 
+pub const CREATE_EDGE_REGION_IDENTITY_INDEX_DDL: &str =
+    "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS edge_region_identity \
+     ON edge (tenant_id, region, edge_id)";
+
+pub const CREATE_EDGE_REGION_SEMANTICS_INDEX_DDL: &str =
+    "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS edge_region_semantics \
+     ON edge (tenant_id, region, source, target, rel)";
+
+pub const CONTRACT_EDGE_REGION_IDENTITY_DDL: &str = "\
+ALTER TABLE edge DROP CONSTRAINT edge_pkey;
+ALTER TABLE edge ADD CONSTRAINT edge_region_identity
+  PRIMARY KEY USING INDEX edge_region_identity;
+ALTER TABLE edge DROP CONSTRAINT edge_tenant_id_source_target_rel_key;
+ALTER TABLE edge ADD CONSTRAINT edge_region_semantics
+  UNIQUE USING INDEX edge_region_semantics";
+
 pub const MAKE_EDGE_TENANT_SCOPED_DDL: &str = "SELECT myelin_make_tenant_scoped('edge')";
 
 pub fn edge_table_migrations() -> Migrations {
@@ -74,6 +93,24 @@ pub fn edge_table_migrations() -> Migrations {
             EDGE_INBOUND_KEYSET_MIGRATION_ID,
             CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL,
             MigrationPhase::Expand,
+            EDGE_TABLE,
+        ),
+        Migration::phased(
+            EDGE_REGION_IDENTITY_INDEX_MIGRATION_ID,
+            CREATE_EDGE_REGION_IDENTITY_INDEX_DDL,
+            MigrationPhase::Expand,
+            EDGE_TABLE,
+        ),
+        Migration::phased(
+            EDGE_REGION_SEMANTICS_INDEX_MIGRATION_ID,
+            CREATE_EDGE_REGION_SEMANTICS_INDEX_DDL,
+            MigrationPhase::Expand,
+            EDGE_TABLE,
+        ),
+        Migration::phased(
+            EDGE_REGION_IDENTITY_CONTRACT_MIGRATION_ID,
+            CONTRACT_EDGE_REGION_IDENTITY_DDL,
+            MigrationPhase::Contract,
             EDGE_TABLE,
         ),
     ])
@@ -193,7 +230,7 @@ mod tests {
     #[test]
     fn the_edge_migration_is_forward_only() {
         let migrations = edge_table_migrations();
-        assert_eq!(migrations.0.len(), 2);
+        assert_eq!(migrations.0.len(), 5);
         let m = &migrations.0[0];
         assert_eq!(m.id, EDGE_MIGRATION_ID);
         assert_eq!(m.table, Some(EDGE_TABLE));
@@ -228,6 +265,31 @@ mod tests {
         assert_eq!(keyset.ddl, CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL);
         assert!(keyset.ddl.contains("CREATE INDEX CONCURRENTLY"));
         assert!(edge_ddl_is_forward_only(keyset.ddl));
+
+        let identity_index = &migrations.0[2];
+        assert_eq!(identity_index.id, EDGE_REGION_IDENTITY_INDEX_MIGRATION_ID);
+        assert_eq!(identity_index.phase, MigrationPhase::Expand);
+        assert!(identity_index.ddl.contains("tenant_id, region, edge_id"));
+        assert!(identity_index.ddl.contains("UNIQUE INDEX CONCURRENTLY"));
+
+        let semantics_index = &migrations.0[3];
+        assert_eq!(semantics_index.id, EDGE_REGION_SEMANTICS_INDEX_MIGRATION_ID);
+        assert_eq!(semantics_index.phase, MigrationPhase::Expand);
+        assert!(semantics_index
+            .ddl
+            .contains("tenant_id, region, source, target, rel"));
+        assert!(semantics_index.ddl.contains("UNIQUE INDEX CONCURRENTLY"));
+
+        let contract = &migrations.0[4];
+        assert_eq!(contract.id, EDGE_REGION_IDENTITY_CONTRACT_MIGRATION_ID);
+        assert_eq!(contract.phase, MigrationPhase::Contract);
+        assert!(contract
+            .ddl
+            .contains("PRIMARY KEY USING INDEX edge_region_identity"));
+        assert!(contract
+            .ddl
+            .contains("UNIQUE USING INDEX edge_region_semantics"));
+        assert!(edge_ddl_is_forward_only(contract.ddl));
     }
 
     #[test]
@@ -240,8 +302,14 @@ mod tests {
             .expect("the edge schema migration applies forward-only");
         assert_eq!(
             runner.applied(),
-            &[EDGE_MIGRATION_ID, EDGE_INBOUND_KEYSET_MIGRATION_ID],
-            "the runner applied the edge schema and its online keyset index"
+            &[
+                EDGE_MIGRATION_ID,
+                EDGE_INBOUND_KEYSET_MIGRATION_ID,
+                EDGE_REGION_IDENTITY_INDEX_MIGRATION_ID,
+                EDGE_REGION_SEMANTICS_INDEX_MIGRATION_ID,
+                EDGE_REGION_IDENTITY_CONTRACT_MIGRATION_ID,
+            ],
+            "the runner applied the edge schema, online indexes, and regional identity contract"
         );
     }
 

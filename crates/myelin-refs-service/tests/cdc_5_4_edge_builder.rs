@@ -110,13 +110,13 @@ fn chained_created_removed_created_across_restart_is_exactly_once_in_effect() {
     let tgt = "myelin://acme/knowledge/page/7c2";
     let id = edge_id(&tenant(), src, tgt, "embeds");
 
-    let created = edge_event("01J-c", "refs.edge.created", src, tgt, "embeds");
+    let created = edge_event("01J-1-created", "refs.edge.created", src, tgt, "embeds");
     let removed = {
-        let mut e = edge_event("01J-r", "refs.edge.removed", src, tgt, "embeds");
+        let mut e = edge_event("01J-2-removed", "refs.edge.removed", src, tgt, "embeds");
         e.payload = serde_json::json!({ "source": src, "target": tgt, "rel": "embeds" });
         e
     };
-    let recreated = edge_event("01J-c2", "refs.edge.created", src, tgt, "embeds");
+    let recreated = edge_event("01J-3-recreated", "refs.edge.created", src, tgt, "embeds");
 
     {
         let builder = RefsEdgeBuilder::new(projection.clone());

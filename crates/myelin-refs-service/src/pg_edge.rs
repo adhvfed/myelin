@@ -298,11 +298,12 @@ async fn project_on_connection(
             for edge_id in edge_ids {
                 sqlx::query(
                     "UPDATE edge
-                        SET tombstoned = true, origin_event = $3, created_at = $4::timestamptz
-                      WHERE tenant_id = $1 AND edge_id = $2
-                        AND (created_at, origin_event) <= ($4::timestamptz, $3)",
+                        SET tombstoned = true, origin_event = $4, created_at = $5::timestamptz
+                      WHERE tenant_id = $1 AND region = $2 AND edge_id = $3
+                        AND (created_at, origin_event) <= ($5::timestamptz, $4)",
                 )
                 .bind(&event.tenant.0)
+                .bind(&event.region.0)
                 .bind(edge_id)
                 .bind(&event.event_id.0)
                 .bind(&event.recorded_at.0)
@@ -350,8 +351,7 @@ async fn upsert(
              tenant_id, region, edge_id, source, source_root, target, target_root, rel,
              rel_class, origin_event, origin_actor, created_at, zookie, tombstoned, dek_ref
          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::timestamptz,$13,$14,$15)
-         ON CONFLICT (tenant_id, edge_id) DO UPDATE SET
-             region = EXCLUDED.region,
+         ON CONFLICT (tenant_id, region, edge_id) DO UPDATE SET
              source = EXCLUDED.source,
              source_root = EXCLUDED.source_root,
              target = EXCLUDED.target,

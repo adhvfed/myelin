@@ -176,6 +176,25 @@ impl ProjectorHarness {
         })
     }
 
+    fn consumer_for(&self, region: &Region) -> Consumer<PgEdgeProjector> {
+        let runtime = tokio::runtime::Handle::current();
+        build_pg_edge_consumer(
+            &self.tenant,
+            region,
+            PgEdgeStore::new(self.app.clone()),
+            DedupLedger::durable(Arc::new(DurableDedupBacking::new(
+                self.app.clone(),
+                runtime.clone(),
+            ))),
+            Arc::new(DurableDeadLetterBacking::new(
+                self.app.clone(),
+                runtime.clone(),
+            )),
+            runtime,
+        )
+        .expect("build another region-bound projector")
+    }
+
     async fn edge_states(&self) -> Vec<(String, String, bool, String)> {
         let mut connection = self.app.acquire().await.expect("acquire app connection");
         sqlx::query(
@@ -334,6 +353,90 @@ async fn a_hot_reference_can_be_read_forward_without_rescanning_or_duplicates() 
         .expect("continue strictly after the first page");
     assert_eq!(second.len(), 1);
     assert!(second[0].edge_id > first[1].edge_id);
+
+    story.clean_up().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_link_can_live_in_two_regions_and_disappear_from_only_one() {
+    let story = ProjectorHarness::start("regional-identity").await;
+    let second_region = Region("us-east".into());
+    let second_consumer = story.consumer_for(&second_region);
+    let source = ArtifactRef(format!("myelin://{}/chat/message/M1", story.tenant.0));
+    let target = story.issue("ENG-41");
+    let first_created = story.event(
+        &format!("refs-region-first-create-{}", std::process::id()),
+        "refs.edge.created",
+        "2026-08-11T00:00:01Z",
+        &source,
+        &target,
+        "links",
+        "reference",
+    );
+    let second_created = edge_event(
+        &story.tenant,
+        &second_region,
+        &format!("refs-region-second-create-{}", std::process::id()),
+        "refs.edge.created",
+        "2026-08-11T00:00:02Z",
+        &source,
+        &target,
+        "links",
+        "reference",
+    );
+
+    assert_eq!(story.deliver(&first_created), Delivered::Acked);
+    assert_eq!(
+        second_consumer.deliver(&Message {
+            subject: source.0.clone(),
+            envelope: second_created,
+        }),
+        Delivered::Acked,
+        "the same semantic link is independent work in another tenant region"
+    );
+
+    let graph = PgEdgeStore::new(story.app.clone());
+    assert_eq!(
+        graph
+            .inbound_live(&story.tenant, &story.region, &target, 10)
+            .await
+            .expect("read the first region")
+            .len(),
+        1
+    );
+    assert_eq!(
+        graph
+            .inbound_live(&story.tenant, &second_region, &target, 10)
+            .await
+            .expect("read the second region")
+            .len(),
+        1
+    );
+
+    let first_removed = story.event(
+        &format!("refs-region-first-remove-{}", std::process::id()),
+        "refs.edge.removed",
+        "2026-08-11T00:00:03Z",
+        &source,
+        &target,
+        "links",
+        "reference",
+    );
+    assert_eq!(story.deliver(&first_removed), Delivered::Acked);
+    assert!(graph
+        .inbound_live(&story.tenant, &story.region, &target, 10)
+        .await
+        .expect("the removal is visible in its own region")
+        .is_empty());
+    assert_eq!(
+        graph
+            .inbound_live(&story.tenant, &second_region, &target, 10)
+            .await
+            .expect("the other region remains intact")
+            .len(),
+        1,
+        "regional deletion must not erase a separate regional projection"
+    );
 
     story.clean_up().await;
 }
