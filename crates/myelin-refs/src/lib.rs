@@ -1,3 +1,4 @@
+mod edge;
 mod object_key;
 mod parse;
 
@@ -5,6 +6,11 @@ use myelin_identity::Principal;
 use serde::{Deserialize, Serialize};
 
 pub use myelin_events::{AggregateKey, ArtifactRef};
+
+pub use edge::{
+    identity_member_ref, reference_edge_draft, EdgeChange, ReferenceRel, REFS_EDGE_CREATED,
+    REFS_EDGE_REMOVED, REL_CLASS_REFERENCE,
+};
 
 pub use parse::{
     format, mint, parse, parse_scoped, strip_sub, sub_kind, ParseError, ParsedArtifactRef, Sub,

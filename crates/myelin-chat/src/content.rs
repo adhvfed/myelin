@@ -2,10 +2,9 @@ use myelin_content::{
     parse_inline, serialize_inline, wasm, Block, Cell, Column, Inline, InlineNode, ListItem,
 };
 use myelin_events::{
-    AggregateKey, ArtifactRef, DataRole, EventDraft, EventEnvelope, EventId, EventType, OutboxTx,
-    Result as BusResult, Visibility,
+    AggregateKey, ArtifactRef, EventDraft, EventEnvelope, EventId, OutboxTx, Result as BusResult,
 };
-use myelin_identity::Principal;
+pub use myelin_refs::{ReferenceRel as EdgeRel, REFS_EDGE_CREATED, REL_CLASS_REFERENCE};
 
 pub const CHAT_EXCLUDED_BLOCKS: [&str; 3] = ["db_view", "sync_block", "toggle"];
 
@@ -160,27 +159,6 @@ pub fn paragraph_body(md: &str, nodes: Vec<InlineNode>) -> MessageBody {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum EdgeRel {
-    Mentions,
-    Links,
-    Embeds,
-}
-
-impl EdgeRel {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EdgeRel::Mentions => "mentions",
-            EdgeRel::Links => "links",
-            EdgeRel::Embeds => "embeds",
-        }
-    }
-}
-
-pub const REL_CLASS_REFERENCE: &str = "reference";
-
-pub const REFS_EDGE_CREATED: &str = "refs.edge.created";
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BodyEdge {
     pub source: ArtifactRef,
@@ -192,21 +170,15 @@ pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> Aggrega
     myelin_refs::edge_aggregate_key(source, target)
 }
 
-fn principal_member_ref(p: &Principal) -> ArtifactRef {
-    ArtifactRef(format!(
-        "myelin://{}/identity/member/{}",
-        p.tenant.0, p.principal_id.0
-    ))
-}
-
 pub fn extract_body_edges(source: &ArtifactRef, nodes: &[InlineNode]) -> Vec<BodyEdge> {
     nodes
         .iter()
         .map(|node| {
             let (target, rel) = match node {
-                InlineNode::Mention(principal) => {
-                    (principal_member_ref(principal), EdgeRel::Mentions)
-                }
+                InlineNode::Mention(principal) => (
+                    myelin_refs::identity_member_ref(&principal.tenant, &principal.principal_id),
+                    EdgeRel::Mentions,
+                ),
                 InlineNode::ArtifactRefNode(target) => (target.clone(), EdgeRel::Links),
                 InlineNode::Embed(target) => (target.clone(), EdgeRel::Embeds),
             };
@@ -225,21 +197,12 @@ pub fn extract_message_edges(source: &ArtifactRef, body: &MessageBody) -> Vec<Bo
 }
 
 pub(crate) fn edge_event_draft(edge: &BodyEdge) -> EventDraft {
-    EventDraft {
-        type_: EventType(REFS_EDGE_CREATED.into()),
-        subject: edge.source.clone(),
-        aggregate: edge_aggregate_key(&edge.source, &edge.target),
-        payload: serde_json::json!({
-            "source": edge.source.0,
-            "target": edge.target.0,
-            "rel": edge.rel.as_str(),
-            "rel_class": REL_CLASS_REFERENCE,
-        }),
-        data_role: DataRole::Controller,
-        visibility: Visibility::Internal,
-        contains_personal_data: false,
-        pii_key_ref: None,
-    }
+    myelin_refs::reference_edge_draft(
+        &edge.source,
+        &edge.target,
+        edge.rel,
+        myelin_refs::EdgeChange::Created,
+    )
 }
 
 pub fn emit_body_edges(
@@ -262,8 +225,9 @@ mod tests {
     use super::*;
     use myelin_content::{CalloutTone, HeadingLevel, TaskItem, OBJ};
     use myelin_events::{
-        Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, EmitContextBase, EventEnvelope,
-        MonotonicMinter, OutboxStore, Region, TenantId, Timestamp,
+        Actor, AggregateKey, ArtifactRef, CausedBy, CorrelationId, DataRole, EmitContextBase,
+        EventEnvelope, EventType, MonotonicMinter, OutboxStore, Region, TenantId, Timestamp,
+        Visibility,
     };
     use myelin_identity::{Principal, PrincipalId, PrincipalKind};
     use std::sync::Arc;

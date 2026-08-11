@@ -3202,6 +3202,7 @@ dependencies = [
  "myelin-identity",
  "myelin-tenancy",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -53,9 +53,7 @@ pub fn row_sub_ref(
     myelin_refs::mint(issue_root, myelin_refs::Sub::Row(row_id.to_string()))
 }
 
-pub const REFS_EDGE_CREATED: &str = "refs.edge.created";
-
-pub const REL_CLASS_REFERENCE: &str = "reference";
+pub use myelin_refs::{REFS_EDGE_CREATED, REL_CLASS_REFERENCE};
 
 pub const REL_CLASS_LIFECYCLE: &str = "lifecycle";
 
@@ -63,41 +61,31 @@ pub fn edge_aggregate_key(source: &ArtifactRef, target: &ArtifactRef) -> Aggrega
     myelin_refs::edge_aggregate_key(source, target)
 }
 
-fn node_rel(node: &InlineNode) -> &'static str {
+fn node_rel(node: &InlineNode) -> myelin_refs::ReferenceRel {
     match node {
-        InlineNode::Mention(_) => "mentions",
-        InlineNode::ArtifactRefNode(_) => "references",
-        InlineNode::Embed(_) => "embeds",
+        InlineNode::Mention(_) => myelin_refs::ReferenceRel::Mentions,
+        InlineNode::ArtifactRefNode(_) => myelin_refs::ReferenceRel::Links,
+        InlineNode::Embed(_) => myelin_refs::ReferenceRel::Embeds,
     }
 }
 
 fn node_target(node: &InlineNode, tenant: &TenantId) -> ArtifactRef {
     match node {
-        InlineNode::Mention(p) => ArtifactRef(format!(
-            "myelin://{}/identity/principal/{}",
-            tenant.0, p.principal_id.0
-        )),
+        InlineNode::Mention(principal) => {
+            myelin_refs::identity_member_ref(tenant, &principal.principal_id)
+        }
         InlineNode::ArtifactRefNode(r) | InlineNode::Embed(r) => r.clone(),
     }
 }
 
 fn content_edge_draft(source: &ArtifactRef, node: &InlineNode, tenant: &TenantId) -> EventDraft {
     let target = node_target(node, tenant);
-    EventDraft {
-        type_: EventType(REFS_EDGE_CREATED.into()),
-        subject: source.clone(),
-        aggregate: edge_aggregate_key(source, &target),
-        payload: serde_json::json!({
-            "source": source.0,
-            "target": target.0,
-            "rel": node_rel(node),
-            "rel_class": REL_CLASS_REFERENCE,
-        }),
-        data_role: DataRole::Controller,
-        visibility: Visibility::Internal,
-        contains_personal_data: false,
-        pii_key_ref: None,
-    }
+    myelin_refs::reference_edge_draft(
+        source,
+        &target,
+        node_rel(node),
+        myelin_refs::EdgeChange::Created,
+    )
 }
 
 pub fn emit_content_edges(

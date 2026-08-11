@@ -180,7 +180,7 @@ fn each_inline_node_emits_one_reference_edge() {
     assert_eq!(m.envelope.payload["rel_class"], "reference");
     assert_eq!(
         m.envelope.payload["target"],
-        "myelin://acme/identity/principal/alice"
+        "myelin://acme/identity/member/alice"
     );
     assert!(
         !m.envelope.contains_personal_data,
@@ -188,7 +188,7 @@ fn each_inline_node_emits_one_reference_edge() {
     );
 
     let a = store.row(&ids[1]).expect("artifact_ref edge row");
-    assert_eq!(a.envelope.payload["rel"], "references");
+    assert_eq!(a.envelope.payload["rel"], "links");
     assert_eq!(
         a.envelope.payload["target"],
         "myelin://acme/issue/issue/ENG-1"

@@ -213,7 +213,7 @@ fn cdc_5_4_content_nodes_produce_reference_edges() {
     let mention = store.row(&ids[0]).unwrap();
     let expected_agg = edge_aggregate_key(
         &source,
-        &ArtifactRef("myelin://acme/identity/principal/alice".into()),
+        &ArtifactRef("myelin://acme/identity/member/alice".into()),
     );
     assert_eq!(mention.aggregate, expected_agg);
 }

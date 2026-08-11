@@ -247,11 +247,11 @@ fn each_inline_node_emits_one_reference_edge() {
     assert_eq!(mention.envelope.payload["rel_class"], REL_CLASS_REFERENCE);
     assert_eq!(
         mention.envelope.payload["target"],
-        "myelin://acme/identity/principal/alice"
+        "myelin://acme/identity/member/alice"
     );
     assert!(!mention.envelope.contains_personal_data, "no inline PII");
     let aref = store.row(&ids[1]).unwrap();
-    assert_eq!(aref.envelope.payload["rel"], "references");
+    assert_eq!(aref.envelope.payload["rel"], "links");
     assert_eq!(aref.envelope.payload["target"], "myelin://acme/git/pr/4291");
     let embed = store.row(&ids[2]).unwrap();
     assert_eq!(embed.envelope.payload["rel"], "embeds");
