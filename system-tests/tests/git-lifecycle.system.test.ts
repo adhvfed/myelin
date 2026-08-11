@@ -351,14 +351,35 @@ describe.sequential("Git engineering lifecycle", () => {
     );
     const reviewId = string(review.id, "review id");
 
-    const pending = await reviewerClient.json(`${base}/reviews/${encodeURIComponent(reviewId)}/comments`, {
+    const pendingPath = `${base}/reviews/${encodeURIComponent(reviewId)}/comments`;
+    const pendingRetryKey = `pending-review-comment-${randomUUID()}`;
+    const pending = await reviewerClient.json(pendingPath, {
       method: "POST",
       body: { body_md: "Approving after the lifecycle checks." },
+      idempotencyKey: pendingRetryKey,
       expectedStatus: 201,
     });
     expect(pending.body).toMatchObject({
       durable: true,
       applied: { action: "git.pr.review.comment", comment: { pending: true } },
+    });
+    const pendingComment = record(
+      record(pending.body.applied, "pending review comment receipt").comment,
+      "pending review comment",
+    );
+    const pendingCommentId = string(pendingComment.id, "pending review comment id");
+    const retriedPending = await reviewerClient.json(pendingPath, {
+      method: "POST",
+      body: { body_md: "Approving after the lifecycle checks." },
+      idempotencyKey: pendingRetryKey,
+      expectedStatus: 201,
+    });
+    expect(retriedPending.body).toMatchObject({
+      durable: true,
+      applied: {
+        action: "git.pr.review.comment",
+        comment: { id: pendingCommentId, pending: true },
+      },
     });
 
     const submitted = await reviewerClient.json(`${base}/reviews/${encodeURIComponent(reviewId)}/submit`, {
@@ -369,6 +390,12 @@ describe.sequential("Git engineering lifecycle", () => {
       durable: true,
       applied: { action: "git.pr.review.submit", result: { emitted: true } },
     });
+    const submittedResult = record(
+      record(submitted.body.applied, "submitted review receipt").result,
+      "submitted review result",
+    );
+    expect(array(submittedResult.comment_ids, "submitted review comment ids"))
+      .toEqual([pendingCommentId]);
 
     const subject = `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${pullRequestNumber}`;
     const completedRequest = await eventually(async () => {

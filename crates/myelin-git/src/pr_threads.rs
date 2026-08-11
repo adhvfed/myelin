@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, Weak};
@@ -24,6 +24,8 @@ pub struct PendingCommentRequest {
     anchor: Option<ThreadAnchor>,
     author: ThreadPrincipal,
     body_md: String,
+    operation_id: String,
+    request_hash: String,
     now: i64,
 }
 
@@ -35,12 +37,15 @@ impl PendingCommentRequest {
         anchor: Option<ThreadAnchor>,
         author: ThreadPrincipal,
         body_md: impl Into<String>,
+        operation_nonce: &str,
         now: i64,
     ) -> Result<Self, DurableError> {
         let object_key = object_key.into();
         let review_id = review_id.into();
         let body_md = validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?;
         validate_review_target(&repo, &object_key, &review_id)?;
+        let operation_id = operation_digest(operation_nonce)?;
+        let request_hash = pending_comment_request_hash(&review_id, &anchor, &author, &body_md)?;
         Ok(Self {
             repo,
             object_key,
@@ -48,6 +53,8 @@ impl PendingCommentRequest {
             anchor,
             author,
             body_md,
+            operation_id,
+            request_hash,
             now,
         })
     }
@@ -62,9 +69,56 @@ impl core::fmt::Debug for PendingCommentRequest {
             .field("anchor", &self.anchor)
             .field("author", &"<redacted>")
             .field("body_md", &"<redacted>")
+            .field("operation_id", &self.operation_id)
             .field("now", &self.now)
             .finish()
     }
+}
+
+fn operation_digest(value: &str) -> Result<String, DurableError> {
+    if value.is_empty() || value.len() > 256 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(DurableError::Git(
+            "review comment idempotency key must contain 1..=256 printable ASCII bytes".into(),
+        ));
+    }
+    Ok(digest_parts(
+        "myelin.git.review-comment.operation.v1",
+        &[value.as_bytes()],
+    ))
+}
+
+fn pending_comment_request_hash(
+    review_id: &str,
+    anchor: &Option<ThreadAnchor>,
+    author: &ThreadPrincipal,
+    body_md: &str,
+) -> Result<String, DurableError> {
+    let anchor_intent = anchor
+        .as_ref()
+        .map(|anchor| (&anchor.path, anchor.line, anchor.side));
+    let anchor = serde_json::to_vec(&anchor_intent)
+        .map_err(|_| DurableError::Git("encode review comment anchor".into()))?;
+    let author = serde_json::to_vec(author)
+        .map_err(|_| DurableError::Git("encode review comment author".into()))?;
+    Ok(digest_parts(
+        "myelin.git.review-comment.request.v1",
+        &[
+            review_id.as_bytes(),
+            anchor.as_slice(),
+            author.as_slice(),
+            body_md.as_bytes(),
+        ],
+    ))
+}
+
+fn digest_parts(domain: &str, parts: &[&[u8]]) -> String {
+    let mut digest = blake3::Hasher::new();
+    digest.update(domain.as_bytes());
+    for part in parts {
+        digest.update(&(part.len() as u64).to_be_bytes());
+        digest.update(part);
+    }
+    digest.finalize().to_hex().to_string()
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -310,6 +364,14 @@ pub struct SubjectThreads {
     pub reviews: Vec<ReviewBatch>,
     #[serde(default)]
     pub seq: u64,
+    #[serde(default)]
+    pending_comment_commands: BTreeMap<String, PendingCommentCommand>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PendingCommentCommand {
+    request_hash: String,
+    comment_id: String,
 }
 
 impl SubjectThreads {
@@ -335,6 +397,7 @@ impl SubjectThreads {
         if self.threads.len() > MAX_THREADS_PER_SUBJECT
             || self.comment_count() > MAX_COMMENTS_PER_SUBJECT
             || self.reviews.len() > MAX_REVIEWS_PER_SUBJECT
+            || self.pending_comment_commands.len() > MAX_COMMENTS_PER_SUBJECT
         {
             return Err(DurableError::Git(
                 "PR conversation exceeds its cardinality limit".into(),
@@ -649,11 +712,31 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             anchor,
             author,
             body_md,
+            operation_id,
+            request_hash,
             now,
         } = request;
         let lock = self.subject_lock(&repo, &object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut doc = self.load(&repo, &object_key)?;
+        if let Some(command) = doc.pending_comment_commands.get(&operation_id) {
+            if command.request_hash != request_hash {
+                return Err(DurableError::Conflict(
+                    "idempotency key is already bound to a different review comment".into(),
+                ));
+            }
+            return doc
+                .threads
+                .iter()
+                .flat_map(|thread| thread.comments.iter())
+                .find(|comment| comment.id == command.comment_id)
+                .cloned()
+                .ok_or_else(|| {
+                    DurableError::Io(
+                        "review comment idempotency receipt references a missing comment".into(),
+                    )
+                });
+        }
         if doc.threads.len() >= MAX_THREADS_PER_SUBJECT
             || doc.comment_count() >= MAX_COMMENTS_PER_SUBJECT
         {
@@ -693,6 +776,13 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             resolved: false,
             comments: vec![comment.clone()],
         });
+        doc.pending_comment_commands.insert(
+            operation_id,
+            PendingCommentCommand {
+                request_hash,
+                comment_id: comment.id.clone(),
+            },
+        );
         self.save(&repo, &doc)?;
         Ok(comment)
     }
@@ -776,12 +866,21 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
             }
             Some(_) => {}
         }
+        let discarded_comment_ids: BTreeSet<String> = doc
+            .threads
+            .iter()
+            .flat_map(|thread| thread.comments.iter())
+            .filter(|comment| comment.review_id.as_deref() == Some(review_id))
+            .map(|comment| comment.id.clone())
+            .collect();
         for t in &mut doc.threads {
             t.comments
                 .retain(|c| c.review_id.as_deref() != Some(review_id));
         }
         doc.threads.retain(|t| !t.comments.is_empty());
         doc.reviews.retain(|r| r.id != review_id);
+        doc.pending_comment_commands
+            .retain(|_, command| !discarded_comment_ids.contains(&command.comment_id));
         self.save(repo, &doc)?;
         Ok(())
     }
@@ -817,7 +916,17 @@ mod tests {
         body_md: impl Into<String>,
         now: i64,
     ) -> PendingCommentRequest {
-        PendingCommentRequest::new(loc(), KEY, review_id, None, author, body_md, now).unwrap()
+        PendingCommentRequest::new(
+            loc(),
+            KEY,
+            review_id,
+            None,
+            author,
+            body_md,
+            &format!("operation-{now}"),
+            now,
+        )
+        .unwrap()
     }
 
     fn submitted_review(
@@ -839,6 +948,7 @@ mod tests {
             None,
             human("psn:secret-author@acme"),
             "sensitive draft body",
+            "secret-operation",
             1,
         )
         .unwrap();
@@ -867,6 +977,7 @@ mod tests {
             None,
             human("psn:r@acme"),
             "draft",
+            "incomplete-target",
             3,
         )
         .is_err());
@@ -887,6 +998,7 @@ mod tests {
             None,
             human("psn:r@acme"),
             "x".repeat(MAX_COMMENT_BODY_BYTES + 1),
+            "oversized-comment",
             5,
         )
         .is_err());
@@ -913,6 +1025,52 @@ mod tests {
 
         assert_eq!(retry.id, first.id);
         assert_eq!(store.load(&loc(), KEY).unwrap().reviews.len(), 1);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn retried_pending_comment_returns_its_original_receipt_without_a_duplicate() {
+        let root = temp_root("pending-comment-retry");
+        let store = DurablePrThreadStore::rooted(&root);
+        let reviewer = human("psn:reviewer@acme");
+        let review = store.start_review(&loc(), KEY, reviewer.clone()).unwrap();
+
+        let request = |body: &str, now| {
+            PendingCommentRequest::new(
+                loc(),
+                KEY,
+                &review.id,
+                None,
+                reviewer.clone(),
+                body,
+                "private-retry-key",
+                now,
+            )
+            .unwrap()
+        };
+        let first = store
+            .add_pending_comment(request("One durable observation.", 100))
+            .unwrap();
+        let replayed = DurablePrThreadStore::rooted(&root)
+            .add_pending_comment(request("One durable observation.", 999))
+            .unwrap();
+
+        assert_eq!(
+            replayed, first,
+            "a retry returns the first timestamp and id"
+        );
+        let stored = store.load(&loc(), KEY).unwrap();
+        assert_eq!(stored.threads.len(), 1);
+        assert_eq!(stored.comment_count(), 1, "one intent leaves one comment");
+        assert!(matches!(
+            store.add_pending_comment(request("Different work.", 1_000)),
+            Err(DurableError::Conflict(_))
+        ));
+        let document = std::fs::read_to_string(store.subject_path(&loc(), KEY).unwrap()).unwrap();
+        assert!(
+            !document.contains("private-retry-key"),
+            "raw caller keys never enter the review document"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -971,18 +1129,33 @@ mod tests {
             }));
         }
         for handle in handles {
-            handle.join().expect("writer must not panic").expect("writer must persist");
+            handle
+                .join()
+                .expect("writer must not panic")
+                .expect("writer must persist");
         }
 
         let doc = store.load(&loc(), KEY).unwrap();
-        assert_eq!(doc.threads.len(), WRITERS, "no concurrent write may be lost");
-        assert_eq!(doc.seq, (WRITERS * 2) as u64, "thread and comment ids stay monotonic");
+        assert_eq!(
+            doc.threads.len(),
+            WRITERS,
+            "no concurrent write may be lost"
+        );
+        assert_eq!(
+            doc.seq,
+            (WRITERS * 2) as u64,
+            "thread and comment ids stay monotonic"
+        );
         let bodies: std::collections::BTreeSet<_> = doc
             .threads
             .iter()
             .map(|thread| thread.comments[0].body_md.as_str())
             .collect();
-        assert_eq!(bodies.len(), WRITERS, "every writer remains distinguishable");
+        assert_eq!(
+            bodies.len(),
+            WRITERS,
+            "every writer remains distinguishable"
+        );
         drop(store);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -994,7 +1167,10 @@ mod tests {
 
         let first = store.subject_lock(&loc(), "pr:core:1").unwrap();
         let same = store.subject_lock(&loc(), "pr:core:1").unwrap();
-        assert!(Arc::ptr_eq(&first, &same), "overlapping operations share one lock");
+        assert!(
+            Arc::ptr_eq(&first, &same),
+            "overlapping operations share one lock"
+        );
         drop(first);
         drop(same);
 
@@ -1005,10 +1181,16 @@ mod tests {
             drop(lock);
         }
 
-        let locks = store.subject_locks.lock().unwrap_or_else(|e| e.into_inner());
+        let locks = store
+            .subject_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         assert_eq!(locks.len(), 1, "dead subject keys must not accumulate");
         assert_eq!(
-            locks.values().filter(|weak| weak.strong_count() > 0).count(),
+            locks
+                .values()
+                .filter(|weak| weak.strong_count() > 0)
+                .count(),
             0,
             "the final inactive entry is only a weak cache placeholder"
         );
@@ -1052,8 +1234,16 @@ mod tests {
         assert_eq!(mine.threads.len(), 1, "author sees their own pending draft");
         assert_eq!(mine.reviews.len(), 1);
         let other = doc.view_for("psn:other@acme");
-        assert_eq!(other.threads.len(), 0, "a pending comment must be invisible to others");
-        assert_eq!(other.reviews.len(), 0, "a draft batch is hidden from others");
+        assert_eq!(
+            other.threads.len(),
+            0,
+            "a pending comment must be invisible to others"
+        );
+        assert_eq!(
+            other.reviews.len(),
+            0,
+            "a draft batch is hidden from others"
+        );
 
         store
             .submit_review(submitted_review(
@@ -1066,7 +1256,11 @@ mod tests {
             .unwrap();
         let doc = store.load(&loc(), KEY).unwrap();
         let other = doc.view_for("psn:other@acme");
-        assert_eq!(other.threads.len(), 1, "submit makes the batch's comments public");
+        assert_eq!(
+            other.threads.len(),
+            1,
+            "submit makes the batch's comments public"
+        );
         assert_eq!(other.reviews[0].verdict, BatchVerdict::ChangesRequested);
         assert!(!other.reviews[0].advisory, "a human batch is not advisory");
         std::fs::remove_dir_all(&root).ok();
@@ -1099,7 +1293,11 @@ mod tests {
             ))
             .unwrap();
         let ev = first.expect("first submit yields exactly one batch event");
-        assert_eq!(ev.comment_ids.len(), 3, "the ONE event carries the whole batch");
+        assert_eq!(
+            ev.comment_ids.len(),
+            3,
+            "the ONE event carries the whole batch"
+        );
         assert_eq!(ev.review.verdict, BatchVerdict::Approved);
         assert_eq!(ev.review.summary_md.as_deref(), Some("LGTM"));
         let second = store
@@ -1134,14 +1332,11 @@ mod tests {
     fn discard_removes_a_draft_but_not_a_submitted_batch() {
         let root = temp_root("discard");
         let store = DurablePrThreadStore::rooted(&root);
-        let batch = store.start_review(&loc(), KEY, human("psn:r@acme")).unwrap();
+        let batch = store
+            .start_review(&loc(), KEY, human("psn:r@acme"))
+            .unwrap();
         store
-            .add_pending_comment(pending_comment(
-                &batch.id,
-                human("psn:r@acme"),
-                "draft",
-                1,
-            ))
+            .add_pending_comment(pending_comment(&batch.id, human("psn:r@acme"), "draft", 1))
             .unwrap();
         store
             .discard_review(&loc(), KEY, &batch.id, &human("psn:r@acme"))
@@ -1150,7 +1345,9 @@ mod tests {
         assert_eq!(doc.threads.len(), 0, "discard removes the draft's threads");
         assert_eq!(doc.reviews.len(), 0);
 
-        let b2 = store.start_review(&loc(), KEY, human("psn:r@acme")).unwrap();
+        let b2 = store
+            .start_review(&loc(), KEY, human("psn:r@acme"))
+            .unwrap();
         store
             .submit_review(submitted_review(
                 &b2.id,
@@ -1198,18 +1395,21 @@ mod tests {
             Err(DurableError::Forbidden(_))
         ));
         assert!(matches!(
-            store.add_pending_comment(pending_comment(
-                &batch.id,
-                attacker.clone(),
-                "injected",
-                3,
-            )),
+            store.add_pending_comment(pending_comment(&batch.id, attacker.clone(), "injected", 3,)),
             Err(DurableError::Forbidden(_))
         ));
 
         let doc = store.load(&loc(), KEY).unwrap();
-        assert_eq!(doc.view_for("psn:attacker@acme").reviews.len(), 0, "still hidden from the attacker");
-        assert_eq!(doc.view_for("psn:author@acme").reviews.len(), 1, "author still owns their draft");
+        assert_eq!(
+            doc.view_for("psn:attacker@acme").reviews.len(),
+            0,
+            "still hidden from the attacker"
+        );
+        assert_eq!(
+            doc.view_for("psn:author@acme").reviews.len(),
+            1,
+            "author still owns their draft"
+        );
         let submitted = store
             .submit_review(submitted_review(
                 &batch.id,
@@ -1219,7 +1419,10 @@ mod tests {
                 4,
             ))
             .unwrap();
-        assert!(submitted.is_some(), "the real author can still submit their own batch");
+        assert!(
+            submitted.is_some(),
+            "the real author can still submit their own batch"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -1250,7 +1453,11 @@ mod tests {
         let store = DurablePrThreadStore::rooted(&root);
         let first = "pr:a/b";
         let colliding = "pr:a:b";
-        assert_eq!(key_stem(first), key_stem(colliding), "the regression needs a collision");
+        assert_eq!(
+            key_stem(first),
+            key_stem(colliding),
+            "the regression needs a collision"
+        );
 
         store
             .create_thread(&loc(), first, None, human("psn:a@acme"), "private", 1)
@@ -1272,6 +1479,10 @@ mod tests {
             .next_id("c")
             .expect_err("the sequence must not wrap and reuse an existing id");
         assert!(err.to_string().contains("sequence exhausted"));
-        assert_eq!(doc.seq, u64::MAX, "a refused allocation leaves state unchanged");
+        assert_eq!(
+            doc.seq,
+            u64::MAX,
+            "a refused allocation leaves state unchanged"
+        );
     }
 }

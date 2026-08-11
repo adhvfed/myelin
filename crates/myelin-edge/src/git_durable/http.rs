@@ -2294,6 +2294,9 @@ struct DPrReviewComment {
 impl Handler for DPrReviewComment {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let body = ctx.request.json_body()?;
+        let operation_nonce = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
         let vm = self
             .be
             .add_pending_comment(
@@ -2305,6 +2308,7 @@ impl Handler for DPrReviewComment {
                 )
                 .for_pr(num_param(ctx, "n")?),
                 param(ctx, "rid")?,
+                &operation_nonce,
                 &body,
             )
             .map_err(map_durable_err)?;

@@ -2802,6 +2802,7 @@ impl DurableGitBackend {
         &self,
         target: PrActorContext<'_>,
         review_id: &str,
+        operation_nonce: &str,
         body: &Value,
     ) -> Result<Value, DurableError> {
         let PrActorContext { repo, number } = target;
@@ -2819,8 +2820,16 @@ impl DurableGitBackend {
             .map(|anchor| self.resolve_thread_anchor(&loc, &rec, anchor))
             .transpose()?;
         let author = Self::thread_principal(tenant, principal);
-        let request =
-            PendingCommentRequest::new(loc, key, review_id, anchor, author, body_md, now_unix())?;
+        let request = PendingCommentRequest::new(
+            loc,
+            key,
+            review_id,
+            anchor,
+            author,
+            body_md,
+            operation_nonce,
+            now_unix(),
+        )?;
         let comment = self.threads.add_pending_comment(request)?;
         Ok(comment_json(&comment))
     }
