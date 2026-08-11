@@ -373,7 +373,8 @@ pub use migrations::{
     CI_PIPELINE_VERSION_BACKLOG_PROBE_MIGRATION_ID, CI_REGION_SCHEDULER_RLS_MIGRATION_ID,
     CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID, CI_RUN_CHECK_ATTEMPT_TABLE,
     CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID, CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
-    CI_RUN_SOURCE_REF_MIGRATION_ID,
+    CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID,
+    CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID, CI_RUN_SOURCE_REF_MIGRATION_ID,
     CI_RUN_QUEUED_REGION_INDEX, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
     CI_RUN_SURFACE_REPO_CREATED_INDEX, CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID,
     CI_RUN_TABLE, CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID,
@@ -628,7 +629,7 @@ mod tests {
         let spec = controlplane_app_spec(Config::default(), myelin_events::OutboxStore::new());
         assert_eq!(
             spec.migrations.0.len(),
-            71,
+            73,
             "the complete CI schema and every append-only provenance follow-on are present"
         );
         assert!(

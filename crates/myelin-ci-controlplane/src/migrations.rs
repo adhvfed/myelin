@@ -60,6 +60,9 @@ pub const CI_RUN_CAUSAL_PROVENANCE_MIGRATION_ID: &str = "ci_0001b_ci_run_causal_
 pub const CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID: &str = "ci_0001c_ci_run_concurrency_group";
 pub const CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID: &str = "ci_0001d_ci_run_pr_head_generation";
 pub const CI_RUN_SOURCE_REF_MIGRATION_ID: &str = "ci_0001e_ci_run_source_ref";
+pub const CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID: &str = "ci_0025_ci_run_source_ref_constraint";
+pub const CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID: &str =
+    "ci_0025a_ci_run_source_ref_constraint_validate";
 pub const CI_JOB_SPEC_STAGE_MIGRATION_ID: &str = "ci_0015a_ci_job_spec_stage";
 pub const CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID: &str = "ci_0017a_ci_job_accounting_skipped";
 pub const CI_JOB_ACCOUNTING_DISPOSITION_V4_MIGRATION_ID: &str =
@@ -169,6 +172,62 @@ AND source_ref ~ '^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$' \
 AND octet_length(source_ref) BETWEEN 12 AND 1024 \
 AND source_ref !~ '(^|/)\\.\\.?(/|$)' \
 AND source_ref !~ '[[:cntrl:] ~^:?*\\[]'))";
+
+pub const REPAIR_CI_RUN_SOURCE_REF_CONSTRAINT_DDL: &str = r#"DO $myelin$
+DECLARE
+  expected_definition constant text :=
+    'CHECK (((source_ref IS NULL) OR ((trigger_kind = ''push''::text) AND (source_ref ~ ''^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$''::text) AND ((octet_length(source_ref) >= 12) AND (octet_length(source_ref) <= 1024)) AND (source_ref !~ ''(^|/)\.\.?(/|$)''::text) AND (source_ref !~ ''[[:cntrl:] ~^:?*\[]''::text))))';
+  existing_definition text;
+  equivalent_constraint name;
+BEGIN
+  SELECT pg_catalog.pg_get_constraintdef(constraint_catalog.oid)
+    INTO existing_definition
+    FROM pg_catalog.pg_constraint AS constraint_catalog
+   WHERE constraint_catalog.conrelid = 'ci_run'::regclass
+     AND constraint_catalog.conname = 'ci_run_source_ref_shape';
+
+  IF existing_definition IS NOT NULL THEN
+    IF existing_definition IS DISTINCT FROM expected_definition
+       AND existing_definition IS DISTINCT FROM expected_definition || ' NOT VALID' THEN
+      RAISE EXCEPTION
+        'ci_run_source_ref_shape already exists with a DIVERGENT definition: % (expected: %)',
+        existing_definition, expected_definition;
+    END IF;
+  ELSE
+    SELECT constraint_catalog.conname
+      INTO equivalent_constraint
+      FROM pg_catalog.pg_constraint AS constraint_catalog
+     WHERE constraint_catalog.conrelid = 'ci_run'::regclass
+       AND constraint_catalog.contype = 'c'
+       AND pg_catalog.pg_get_constraintdef(constraint_catalog.oid) IN (
+         expected_definition,
+         expected_definition || ' NOT VALID'
+       )
+     ORDER BY constraint_catalog.convalidated DESC, constraint_catalog.oid
+     LIMIT 1;
+
+    IF equivalent_constraint IS NOT NULL THEN
+      EXECUTE format(
+        'ALTER TABLE ci_run RENAME CONSTRAINT %I TO ci_run_source_ref_shape',
+        equivalent_constraint
+      );
+    ELSE
+      ALTER TABLE ci_run
+        ADD CONSTRAINT ci_run_source_ref_shape
+        CHECK (source_ref IS NULL OR (
+          trigger_kind = 'push'
+          AND source_ref ~ '^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]*$'
+          AND octet_length(source_ref) BETWEEN 12 AND 1024
+          AND source_ref !~ '(^|/)\.\.?(/|$)'
+          AND source_ref !~ '[[:cntrl:] ~^:?*\[]'
+        )) NOT VALID;
+    END IF;
+  END IF;
+END
+$myelin$"#;
+
+pub const VALIDATE_CI_RUN_SOURCE_REF_CONSTRAINT_DDL: &str =
+    "ALTER TABLE ci_run VALIDATE CONSTRAINT ci_run_source_ref_shape";
 
 pub const CREATE_CI_DRIVE_MANIFEST_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS ci_drive_manifest (
@@ -1889,6 +1948,16 @@ pub fn ci_controlplane_migrations() -> Migrations {
         ALTER_CI_RUN_ADD_SOURCE_REF_DDL,
         CI_RUN_TABLE,
     ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID,
+        REPAIR_CI_RUN_SOURCE_REF_CONSTRAINT_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID,
+        VALIDATE_CI_RUN_SOURCE_REF_CONSTRAINT_DDL,
+        CI_RUN_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -1925,6 +1994,16 @@ pub fn ci_durable_migrations() -> Migrations {
     migrations.push(Migration::plain_on(
         CI_RUN_SOURCE_REF_MIGRATION_ID,
         ALTER_CI_RUN_ADD_SOURCE_REF_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID,
+        REPAIR_CI_RUN_SOURCE_REF_CONSTRAINT_DDL,
+        CI_RUN_TABLE,
+    ));
+    migrations.push(Migration::plain_on(
+        CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID,
+        VALIDATE_CI_RUN_SOURCE_REF_CONSTRAINT_DDL,
         CI_RUN_TABLE,
     ));
     Migrations::of(migrations)
@@ -2585,15 +2664,15 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .iter()
             .position(|id| *id == CI_JOB_QUEUE_CLAIM_WINDOW_VALIDATE_MIGRATION_ID)
             .expect("the claim-window validation is in the set");
-        assert_eq!(expand, ids.len() - 18);
-        assert_eq!(validate, ids.len() - 17);
+        assert_eq!(expand, ids.len() - 20);
+        assert_eq!(validate, ids.len() - 19);
         assert_eq!(
-            ids[ids.len() - 14],
+            ids[ids.len() - 16],
             CI_PIPELINE_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "the cutover fence's predecessor-row seed precedes only the ci_0022* chassis"
         );
         assert_eq!(
-            &ids[ids.len() - 13..ids.len() - 9],
+            &ids[ids.len() - 15..ids.len() - 11],
             &[
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_MIGRATION_ID,
                 CI_JOB_QUEUE_RESERVATION_WRITE_VERSION_VALIDATE_MIGRATION_ID,
@@ -2603,17 +2682,17 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             "the CT-007 5b.3-6e.1 activation chassis retains expand→validate→index→probe order"
         );
         assert_eq!(
-            ids[ids.len() - 9],
+            ids[ids.len() - 11],
             CI_PIPELINE_V3_CUTOVER_FENCE_ROW_MIGRATION_ID,
             "Stage B appends the retired-v3 sentinel after the activation chassis"
         );
         assert_eq!(
-            ids[ids.len() - 8],
+            ids[ids.len() - 10],
             CI_SECRET_MIGRATION_ID,
             "the new encrypted secret store is appended after every migration shipped at the base"
         );
         assert_eq!(
-            &ids[ids.len() - 7..ids.len() - 2],
+            &ids[ids.len() - 9..ids.len() - 4],
             &[
                 CI_SECRET_ADMIN_SCOPE_MIGRATION_ID,
                 CI_SECRET_ADMIN_UNIQUE_MIGRATION_ID,
@@ -2624,14 +2703,22 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             "SecretAdmin appends ownership, uniqueness, binding integrity, tombstones, then the universal version high-water"
         );
         assert_eq!(
-            ids[ids.len() - 2],
+            ids[ids.len() - 4],
             CI_JOB_ACCOUNTING_DISPOSITION_V4_SECRET_RESOLUTION_MIGRATION_ID,
             "the previously shipped ci_0017d disposition widening keeps its position"
         );
         assert_eq!(
-            ids[ids.len() - 1],
+            ids[ids.len() - 3],
             CI_RUN_SOURCE_REF_MIGRATION_ID,
             "new CI provenance appends after every previously shipped migration"
+        );
+        assert_eq!(
+            &ids[ids.len() - 2..],
+            &[
+                CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID,
+                CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID,
+            ],
+            "the source-ref contract is repaired online, then validated"
         );
         assert!(
             expand
@@ -2644,12 +2731,43 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
     }
 
     #[test]
+    fn source_ref_contract_repairs_intermediate_schemas_without_rewriting_history() {
+        assert!(
+            ALTER_CI_RUN_ADD_SOURCE_REF_DDL
+                .starts_with("ALTER TABLE ci_run ADD COLUMN IF NOT EXISTS source_ref text"),
+            "the immutable migration that shipped the column remains byte-for-byte available"
+        );
+
+        let repair = REPAIR_CI_RUN_SOURCE_REF_CONSTRAINT_DDL;
+        for required in [
+            "pg_get_constraintdef",
+            "RENAME CONSTRAINT %I TO ci_run_source_ref_shape",
+            "ADD CONSTRAINT ci_run_source_ref_shape",
+            "NOT VALID",
+            "DIVERGENT definition",
+        ] {
+            assert!(
+                repair.contains(required),
+                "the repair must contain `{required}`"
+            );
+        }
+        assert!(
+            !repair.contains("DROP CONSTRAINT"),
+            "an equivalent check is adopted without a gap in enforcement"
+        );
+        assert_eq!(
+            VALIDATE_CI_RUN_SOURCE_REF_CONSTRAINT_DDL,
+            "ALTER TABLE ci_run VALIDATE CONSTRAINT ci_run_source_ref_shape"
+        );
+    }
+
+    #[test]
     fn the_migration_set_is_forward_only_and_rls_scoped() {
         let migrations = ci_controlplane_migrations();
         assert_eq!(
             migrations.0.len(),
-            71,
-            "the existing 70 migrations plus the appended source-ref provenance migration"
+            73,
+            "the existing 70 migrations plus source-ref provenance and its two repair phases"
         );
         fn constraint_names(upper_ddl: &str, keyword: &str) -> Vec<String> {
             upper_ddl
@@ -2725,6 +2843,10 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL);
             } else if m.id == CI_RUN_SOURCE_REF_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_SOURCE_REF_DDL);
+            } else if m.id == CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID {
+                assert_eq!(m.ddl, REPAIR_CI_RUN_SOURCE_REF_CONSTRAINT_DDL);
+            } else if m.id == CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID {
+                assert_eq!(m.ddl, VALIDATE_CI_RUN_SOURCE_REF_CONSTRAINT_DDL);
             } else if m.id == CI_JOB_SPEC_STAGE_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_JOB_SPEC_ADD_STAGE_DDL);
             } else if m.id == CI_JOB_ACCOUNTING_SKIPPED_MIGRATION_ID {
@@ -2818,7 +2940,7 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
             .expect("the full CI control-plane schema applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            71,
+            73,
             "the runner applied the complete schema plus every additive follow-on"
         );
         assert_eq!(
@@ -3278,8 +3400,10 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 "ci_0003a_ci_run_check_attempt",
                 "ci_0014_ci_cost_event",
                 CI_RUN_SOURCE_REF_MIGRATION_ID,
+                CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID,
+                CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID,
             ],
-            "the subset is exactly the writer-critical creates plus ci_run's forward ALTERs, with new provenance appended"
+            "the subset is exactly the writer-critical creates plus ci_run's forward ALTERs and repaired provenance contract"
         );
         for m in &subset.0 {
             let full_m = full
@@ -3309,8 +3433,8 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         let subset = ci_durable_migrations();
         assert_eq!(
             subset.0.len(),
-            8,
-            "four writer-critical CI tables plus four forward ci_run ALTERs"
+            10,
+            "four writer-critical CI tables plus six forward ci_run ALTERs"
         );
         for m in &subset.0 {
             assert!(
@@ -3326,6 +3450,10 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_PR_HEAD_GENERATION_DDL);
             } else if m.id == CI_RUN_SOURCE_REF_MIGRATION_ID {
                 assert_eq!(m.ddl, ALTER_CI_RUN_ADD_SOURCE_REF_DDL);
+            } else if m.id == CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID {
+                assert_eq!(m.ddl, REPAIR_CI_RUN_SOURCE_REF_CONSTRAINT_DDL);
+            } else if m.id == CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID {
+                assert_eq!(m.ddl, VALIDATE_CI_RUN_SOURCE_REF_CONSTRAINT_DDL);
             } else {
                 assert!(
                     m.ddl.contains("myelin_make_tenant_scoped"),
@@ -3338,6 +3466,6 @@ ON ci_job_prelaunch_usage (region, seal_after) WHERE status = 'started' AND seal
         runner
             .run(&subset, &ci_durable_hot_tables())
             .expect("the CI durable writer subset applies forward-only");
-        assert_eq!(runner.applied().len(), 8);
+        assert_eq!(runner.applied().len(), 10);
     }
 }
