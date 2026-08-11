@@ -96,6 +96,31 @@ describe.sequential("Git engineering lifecycle", () => {
     );
   });
 
+  test("keeps every repository namespace outside another repository's storage", async () => {
+    const ownerSlug = uniqueName("system-namespace-owner");
+    const owner = new GitProject(ownerSlug, systemClient);
+    await owner.create();
+
+    const nestedSlug = `${ownerSlug}.git/tools`;
+    const refused = await systemClient.json("/v1/git/repos", {
+      method: "POST",
+      body: { slug: nestedSlug },
+      expectedStatus: 400,
+    });
+    expect(refused.body).toMatchObject({
+      error: {
+        code: "bad_request",
+        message: expect.stringContaining("namespace segment"),
+      },
+    });
+
+    const untouchedOwner = await systemClient.json(owner.path);
+    expect(untouchedOwner.body).toMatchObject({
+      slug: expect.stringContaining(ownerSlug),
+      state: "empty",
+    });
+  });
+
   test("commits and reads a snapshot through every primary browse projection", async () => {
     mainCommitOid = (await project.writeFile("main", "README.md", readme)).commitOid;
     expect(mainCommitOid).toMatch(oid);

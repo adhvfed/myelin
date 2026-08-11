@@ -68,6 +68,16 @@ pub fn validate_repo_slug(repo: &str) -> Result<Vec<String>, GitCoreError> {
     for piece in &pieces {
         validate_path_segment("repo", piece)?;
     }
+    if pieces
+        .iter()
+        .take(pieces.len().saturating_sub(1))
+        .any(|piece| piece.to_ascii_lowercase().ends_with(".git"))
+    {
+        return Err(GitCoreError::Read(format!(
+            "invalid repo slug {repo:?}: a namespace segment cannot end in `.git` because it \
+             would resolve inside another bare repository (fail-closed)"
+        )));
+    }
     Ok(pieces)
 }
 
@@ -324,6 +334,24 @@ mod tests {
             std::path::Path::new("/srv/git-root/acme/fr-par/team/app.git")
         );
         assert!(p.starts_with("/srv/git-root/acme/fr-par"));
+    }
+
+    #[test]
+    fn a_namespace_cannot_resolve_inside_another_bare_repository() {
+        for slug in ["victim.git/tools", "victim.GIT/tools"] {
+            let resolved = root().repo_path(&RepoLoc::new("acme", "fr-par", slug));
+            assert!(
+                matches!(resolved, Err(GitCoreError::Read(_))),
+                "{slug:?} must not resolve beneath victim.git, got {resolved:?}"
+            );
+        }
+
+        assert_eq!(
+            root()
+                .repo_path(&RepoLoc::new("acme", "fr-par", "team/service.git"))
+                .expect("a final .git suffix cannot create a nested repository"),
+            std::path::Path::new("/srv/git-root/acme/fr-par/team/service.git.git")
+        );
     }
 
     #[test]
