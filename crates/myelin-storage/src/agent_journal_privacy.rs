@@ -212,6 +212,7 @@ pub fn agent_journal_privacy_migrations() -> Migrations {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AgentSubjectStatus {
     Active,
+    Erasing,
     Erased,
     Restricted,
 }
@@ -333,7 +334,11 @@ pub(crate) async fn agent_subject_status(
     let row = sqlx::query(
         "SELECT \
            EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_erasure \
-                    WHERE tenant_id = $1 AND region = $2 AND subject_token = $3) AS erased, \
+                    WHERE tenant_id = $1 AND region = $2 AND subject_token = $3 \
+                      AND completed_at IS NULL) AS erasing, \
+           EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_erasure \
+                    WHERE tenant_id = $1 AND region = $2 AND subject_token = $3 \
+                      AND completed_at IS NOT NULL) AS erased, \
            EXISTS (SELECT 1 FROM knowledge_agent_trace_subject_restriction \
                     WHERE tenant_id = $1 AND region = $2 AND subject_token = $3) AS restricted",
     )
@@ -343,7 +348,9 @@ pub(crate) async fn agent_subject_status(
     .fetch_one(connection)
     .await
     .map_err(privacy_query)?;
-    if row.try_get::<bool, _>("erased").map_err(privacy_query)? {
+    if row.try_get::<bool, _>("erasing").map_err(privacy_query)? {
+        Ok(AgentSubjectStatus::Erasing)
+    } else if row.try_get::<bool, _>("erased").map_err(privacy_query)? {
         Ok(AgentSubjectStatus::Erased)
     } else if row
         .try_get::<bool, _>("restricted")

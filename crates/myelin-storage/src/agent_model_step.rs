@@ -277,7 +277,9 @@ async fn begin_on_connection(
 ) -> Result<Result<ModelStepBegin, ModelStepError>, PgError> {
     match agent_subject_status(connection, tenant, region, requested_by).await? {
         AgentSubjectStatus::Active => {}
-        AgentSubjectStatus::Erased => return Ok(Err(ModelStepError::Erased)),
+        AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
+            return Ok(Err(ModelStepError::Erased))
+        }
         AgentSubjectStatus::Restricted => return Ok(Err(ModelStepError::Restricted)),
     }
     let inserted = sqlx::query(
@@ -354,7 +356,9 @@ async fn complete_on_connection(
 ) -> Result<Result<ModelStepCompletion, ModelStepError>, PgError> {
     match agent_subject_status(connection, tenant, region, requested_by).await? {
         AgentSubjectStatus::Active => {}
-        AgentSubjectStatus::Erased => return Ok(Err(ModelStepError::Erased)),
+        AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
+            return Ok(Err(ModelStepError::Erased))
+        }
         AgentSubjectStatus::Restricted => return Ok(Err(ModelStepError::Restricted)),
     }
     let row = sqlx::query(

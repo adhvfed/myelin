@@ -185,6 +185,17 @@ mod tests {
     }
 
     #[test]
+    fn status_makes_an_interrupted_erasure_resumable() {
+        let body = agent_data_summary_json(AgentTraceSubjectSummary {
+            state: AgentTraceSubjectState::Erasing,
+            recoverable_records: 2,
+        });
+        assert_eq!(body["agent_data"]["state"], "erasing");
+        assert_eq!(body["agent_data"]["recoverable_records"], 2);
+        assert_eq!(body["agent_data"]["new_processing_allowed"], false);
+    }
+
+    #[test]
     fn erasure_receipt_totals_every_agent_data_holder() {
         let body = agent_data_erasure_json(AgentTraceSubjectEraseReceipt {
             traces_erased: 2,

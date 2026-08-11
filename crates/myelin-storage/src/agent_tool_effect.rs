@@ -276,7 +276,9 @@ async fn begin_on_connection(
 ) -> Result<Result<ToolEffectBegin, ToolEffectError>, PgError> {
     match agent_subject_status(connection, tenant, region, requested_by).await? {
         AgentSubjectStatus::Active => {}
-        AgentSubjectStatus::Erased => return Ok(Err(ToolEffectError::Erased)),
+        AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
+            return Ok(Err(ToolEffectError::Erased))
+        }
         AgentSubjectStatus::Restricted => return Ok(Err(ToolEffectError::Restricted)),
     }
     let inserted = sqlx::query(
@@ -359,7 +361,9 @@ async fn complete_on_connection(
 ) -> Result<Result<ToolEffectCompletion, ToolEffectError>, PgError> {
     match agent_subject_status(connection, tenant, region, requested_by).await? {
         AgentSubjectStatus::Active => {}
-        AgentSubjectStatus::Erased => return Ok(Err(ToolEffectError::Erased)),
+        AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
+            return Ok(Err(ToolEffectError::Erased))
+        }
         AgentSubjectStatus::Restricted => return Ok(Err(ToolEffectError::Restricted)),
     }
     let row = sqlx::query(

@@ -897,18 +897,40 @@ impl KmsEngine {
     }
 
     pub fn destroy_kek(&self, id: &KekId) -> bool {
+        self.try_destroy_kek(id).unwrap_or_else(|error| {
+            panic!(
+                "KMS DURABILITY FAILURE (fail-static hard-down): crypto-shred of KEK tenant={} \
+                 region={} was refused: {error}",
+                id.tenant.as_str(),
+                id.region.as_str()
+            )
+        })
+    }
+
+    pub fn try_destroy_kek(&self, id: &KekId) -> Result<bool, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            KmsBackend::Memory(core) => core.destroy_kek(id),
-            KmsBackend::Durable(d) => d.destroy_kek(id),
+            KmsBackend::Memory(core) => Ok(core.destroy_kek(id)),
+            KmsBackend::Durable(d) => d.try_destroy_kek(id),
         }
     }
 
     pub fn destroy_dek(&self, id: &DekId) -> bool {
+        self.try_destroy_dek(id).unwrap_or_else(|error| {
+            panic!(
+                "KMS DURABILITY FAILURE (fail-static hard-down): crypto-shred of DEK tenant={} \
+                 class={} was refused: {error}",
+                id.tenant.as_str(),
+                id.class.as_token()
+            )
+        })
+    }
+
+    pub fn try_destroy_dek(&self, id: &DekId) -> Result<bool, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            KmsBackend::Memory(core) => core.destroy_dek(id),
-            KmsBackend::Durable(d) => d.destroy_dek(id),
+            KmsBackend::Memory(core) => Ok(core.destroy_dek(id)),
+            KmsBackend::Durable(d) => d.try_destroy_dek(id),
         }
     }
 

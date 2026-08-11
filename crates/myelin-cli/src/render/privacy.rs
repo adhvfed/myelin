@@ -23,6 +23,11 @@ fn render_status(agent_data: &Value) -> Option<String> {
             "Agent data restricted: {}; new agent processing is blocked.\n",
             recoverable_records(count)
         ),
+        ("erasing", false) => format!(
+            "Agent data erasure is incomplete: {}; new agent processing is blocked. \
+             Retry `myelin privacy agent-data erase` to finish crypto-shredding.\n",
+            recoverable_records(count)
+        ),
         ("erased", false) => format!(
             "Agent data erased: {}; new agent processing is permanently blocked.\n",
             recoverable_records(count)
@@ -101,6 +106,22 @@ mod tests {
         assert!(rendered.contains("3 recoverable records"));
         assert!(rendered.contains("not full account erasure"));
         assert!(rendered.contains("irreversible"));
+    }
+
+    #[test]
+    fn interrupted_erasure_names_the_safe_recovery_command() {
+        let rendered = render_response(&json!({
+            "agent_data": {
+                "scope": "agent_data",
+                "state": "erasing",
+                "recoverable_records": 2,
+                "new_processing_allowed": false
+            }
+        }))
+        .unwrap();
+        assert!(rendered.contains("erasure is incomplete"));
+        assert!(rendered.contains("myelin privacy agent-data erase"));
+        assert!(rendered.contains("new agent processing is blocked"));
     }
 
     #[test]

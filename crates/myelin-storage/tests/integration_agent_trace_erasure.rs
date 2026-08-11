@@ -189,6 +189,118 @@ async fn an_erasure_marker_refuses_to_resurrect_a_trace_on_worker_retry() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_interrupted_subject_erasure_stays_blocked_and_finishes_on_retry() {
+    let Some(provider) = test_provider().await else {
+        return;
+    };
+    let tenant = TenantId(unique("trace-erasure-resume"));
+    let seal_key = SealKey::from_encoded(&"88".repeat(32)).expect("a 32-byte test seal key");
+    let kms = Arc::new(
+        DurableKmsBacking::new(provider.db_pool().clone(), unique("trace-resume-cell"))
+            .load_or_generate(&seal_key)
+            .await
+            .expect("the durable test KMS starts"),
+    );
+    let store = DurableAgentTraceStore::with_runtime(
+        provider.clone(),
+        tokio::runtime::Handle::current(),
+        kms,
+    );
+    store
+        .write(&tenant, trace("44444444-4444-4444-8444-444444444444"))
+        .expect("one subject-owned trace exists before erasure");
+    store
+        .set_subject_restriction(&tenant.0, "founder", true)
+        .await
+        .expect("create the subject token through the production path");
+
+    let interrupted_tenant = tenant.0.clone();
+    let interrupted_region = provider.config().region.clone();
+    provider
+        .with_tenant_tx(&tenant.0, move |connection| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO knowledge_agent_trace_subject_erasure \
+                       (tenant_id, region, subject_token) \
+                     SELECT tenant_id, region, subject_token \
+                       FROM knowledge_agent_trace_subject_restriction \
+                      WHERE tenant_id = $1 AND region = $2",
+                )
+                .bind(&interrupted_tenant)
+                .bind(&interrupted_region)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                sqlx::query(
+                    "DELETE FROM knowledge_agent_trace_subject_restriction \
+                      WHERE tenant_id = $1 AND region = $2",
+                )
+                .bind(&interrupted_tenant)
+                .bind(&interrupted_region)
+                .execute(&mut *connection)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("simulate a process stopping after it durably blocked new processing");
+
+    let interrupted = store
+        .summarize_subject(&tenant.0, "founder")
+        .await
+        .expect("the interrupted state is visible to its owner");
+    assert_eq!(interrupted.state, AgentTraceSubjectState::Erasing);
+    assert_eq!(interrupted.recoverable_records, 1);
+    assert_eq!(
+        store
+            .write(&tenant, trace("55555555-5555-4555-8555-555555555555"))
+            .unwrap_err(),
+        AgentTraceError::Erased,
+        "a pending erasure never reopens agent processing"
+    );
+
+    let resumed = store
+        .erase_for_subject(&tenant.0, "founder")
+        .await
+        .expect("repeating the same request finishes key destruction and cleanup");
+    assert!(!resumed.already_erased);
+    assert_eq!(resumed.traces_erased, 1);
+    assert!(resumed.key_destroyed);
+    assert!(resumed.key_unrecoverable);
+    assert_eq!(
+        store
+            .summarize_subject(&tenant.0, "founder")
+            .await
+            .expect("the completed state is durable"),
+        myelin_storage::AgentTraceSubjectSummary {
+            state: AgentTraceSubjectState::Erased,
+            recoverable_records: 0,
+        }
+    );
+
+    let cleanup_tenant = tenant.0.clone();
+    provider
+        .with_tenant_tx(&tenant.0, move |connection| {
+            Box::pin(async move {
+                for statement in [
+                    "DELETE FROM knowledge_agent_trace_erasure WHERE tenant_id = $1",
+                    "DELETE FROM knowledge_agent_trace_subject_erasure WHERE tenant_id = $1",
+                ] {
+                    sqlx::query(statement)
+                        .bind(&cleanup_tenant)
+                        .execute(&mut *connection)
+                        .await
+                        .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .expect("clean the interrupted-erasure story");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn erasing_a_subject_shreds_every_trace_and_permanently_suppresses_new_ones() {
     let Some(provider) = test_provider().await else {
         return;

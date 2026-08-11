@@ -179,6 +179,7 @@ pub fn durable_migration_groups() -> Vec<Migrations> {
         crate::agent_tool_effect::agent_tool_effect_migrations(),
         crate::agent_journal_privacy::agent_journal_privacy_migrations(),
         crate::agent_trace_durable::agent_trace_encrypted_only_migrations(),
+        crate::agent_trace_durable::agent_trace_erasure_progress_migrations(),
     ]
 }
 
@@ -761,7 +762,7 @@ mod boot_migrations_tests {
             );
         }
         assert_eq!(*ids.first().unwrap(), "0010_rebac_tuple");
-        assert_eq!(*ids.last().unwrap(), "0107_agent_trace_encrypted_only");
+        assert_eq!(*ids.last().unwrap(), "0108_agent_trace_erasure_progress");
     }
 
     #[test]
