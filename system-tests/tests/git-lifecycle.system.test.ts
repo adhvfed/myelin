@@ -175,6 +175,33 @@ describe.sequential("Git engineering lifecycle", () => {
     ]);
   });
 
+  test("keeps Git's administrative directory outside every repository edit", async () => {
+    const guarded = new GitProject(uniqueName("system-no-dot-git-edit"), systemClient);
+    await guarded.create();
+    const beforeOid = (await guarded.writeFile("main", "README.md", "# Safe project\n"))
+      .commitOid;
+
+    const refused = await systemClient.json(`${guarded.path}/blob/main/.git/config`, {
+      method: "POST",
+      body: {
+        base_oid: "",
+        contents: "[core]\n\trepositoryformatversion = 0\n",
+      },
+      expectedStatus: 400,
+    });
+    expect(refused.body).toMatchObject({
+      error: {
+        code: "bad_request",
+        message: expect.stringContaining("reserved Git administrative component"),
+      },
+    });
+
+    const after = await systemClient.json(`${guarded.path}/commits/main?limit=1`);
+    expect(array(after.body.items, "commit after refused edit")).toEqual([
+      expect.objectContaining({ oid: beforeOid }),
+    ]);
+  });
+
   test("prevents a stale browser editor from overwriting a newer file version", async () => {
     const opened = await project.readFile("main", "README.md");
     const winningContents = `${readme}\nThe optimistic editor preserved this update.\n`;

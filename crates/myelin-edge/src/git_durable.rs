@@ -4203,6 +4203,7 @@ fn pr_diff_vm(number: u64, base_ref: &str, diff: PrDiff, offset: usize, limit: u
 fn map_durable_err(e: DurableError) -> EdgeError {
     match e {
         DurableError::NotFound(m) => EdgeError::NotFound(m),
+        DurableError::InvalidInput(m) => EdgeError::BadRequest(m),
         DurableError::Git(m) if m == "pull request list cursor visible set changed" => {
             EdgeError::Conflict("pull request list cursor is stale; restart pagination".into())
         }
@@ -4597,6 +4598,20 @@ mod agent_file_write_tests {
 #[cfg(test)]
 mod durable_error_mapping_tests {
     use super::*;
+
+    #[test]
+    fn invalid_file_edit_paths_are_public_bad_requests() {
+        let error = map_durable_err(DurableError::InvalidInput(
+            "file edit path contains a reserved Git administrative component".into(),
+        ));
+
+        assert_eq!(error.status(), 400);
+        assert_eq!(error.code(), "bad_request");
+        assert_eq!(
+            error.client_message(),
+            "file edit path contains a reserved Git administrative component"
+        );
+    }
 
     #[test]
     fn an_owner_bound_creation_claim_is_a_public_conflict() {

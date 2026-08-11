@@ -61,6 +61,7 @@ fn map_durable_to_wire(e: myelin_git::durable::DurableError) -> EdgeError {
     use myelin_git::durable::DurableError;
     match e {
         DurableError::NotFound(_) => EdgeError::NotFound("repository not found".into()),
+        DurableError::InvalidInput(m) => EdgeError::BadRequest(m),
         DurableError::Git(m)
             if m.contains("traversal") || m.contains("segment") || m.contains("slug") =>
         {

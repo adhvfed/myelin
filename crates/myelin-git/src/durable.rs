@@ -19,6 +19,7 @@ pub use crate::tree_pagination::{
 pub enum DurableError {
     Git(String),
     Io(String),
+    InvalidInput(String),
     Conflict(String),
     CasMismatch {
         ref_name: String,
@@ -34,6 +35,7 @@ impl std::fmt::Display for DurableError {
         match self {
             DurableError::Git(m) => write!(f, "durable git op failed: {m}"),
             DurableError::Io(m) => write!(f, "durable git io failed: {m}"),
+            DurableError::InvalidInput(m) => write!(f, "durable git input refused: {m}"),
             DurableError::Conflict(m) => write!(f, "durable git conflict: {m}"),
             DurableError::CasMismatch {
                 ref_name,
@@ -360,6 +362,24 @@ fn is_safe_tree_path(clean: &str) -> bool {
     clean
         .split('/')
         .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+fn validate_file_edit_path(path: &str) -> Result<(), DurableError> {
+    let clean = path.trim_matches('/');
+    if clean.is_empty() || clean != path || !is_safe_tree_path(clean) {
+        return Err(DurableError::InvalidInput(
+            "file edit path is not safe".into(),
+        ));
+    }
+    if clean
+        .split('/')
+        .any(|component| component.eq_ignore_ascii_case(".git"))
+    {
+        return Err(DurableError::InvalidInput(
+            "file edit path contains a reserved Git administrative component".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn utf8_prefix(value: &str, maximum_bytes: usize) -> String {
@@ -1905,11 +1925,9 @@ impl DurableGitRepo {
         author_name: &str,
         author_email: &str,
     ) -> Result<PreparedFileCommit, DurableError> {
+        validate_file_edit_path(path)?;
+        let clean_path = path;
         let repo = self.open_git()?;
-        let clean_path = path.trim_matches('/');
-        if clean_path.is_empty() || clean_path != path || !is_safe_tree_path(clean_path) {
-            return Err(DurableError::Git("web edit path is not safe".into()));
-        }
 
         let blob_oid = repo.blob(contents).map_err(|e| git_err("write blob", e))?;
         let parent_oid = parent_oid.map(Self::parse_oid).transpose()?;
@@ -2373,6 +2391,33 @@ mod tests {
         let tree = repo.write_tree(&[("file.txt", &blob)]).expect("tree");
         repo.write_commit(&tree, &[], "feat: seed", "psn-7@acme.noreply", "psn-7@acme.noreply")
             .expect("commit")
+    }
+
+    #[test]
+    fn file_edits_distinguish_project_metadata_from_git_administration() {
+        for path in [
+            "README.md",
+            ".gitignore",
+            ".github/workflows/test.yml",
+            "docs/.gitkeep",
+        ] {
+            assert!(
+                validate_file_edit_path(path).is_ok(),
+                "ordinary project path `{path}` remains editable"
+            );
+        }
+
+        for path in [".git/config", ".GIT/config", "nested/.GiT/hooks/pre-commit"] {
+            assert!(matches!(
+                validate_file_edit_path(path),
+                Err(DurableError::InvalidInput(message))
+                    if message.contains("reserved Git administrative component")
+            ));
+        }
+        assert!(matches!(
+            validate_file_edit_path("docs/../secrets.txt"),
+            Err(DurableError::InvalidInput(message)) if message == "file edit path is not safe"
+        ));
     }
 
     #[test]
