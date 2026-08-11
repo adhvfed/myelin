@@ -4953,7 +4953,22 @@ mod pr_thread_tests {
         } else {
             serde_json::to_vec(&body).unwrap()
         };
-        let req = EdgeRequest::new(method, "/v1/git/x", "", vec![], bytes);
+        let headers = if method == "GET" {
+            vec![]
+        } else {
+            let mut retry_key = blake3::Hasher::new();
+            retry_key.update(method.as_bytes());
+            for (name, value) in params {
+                retry_key.update(name.as_bytes());
+                retry_key.update(value.as_bytes());
+            }
+            retry_key.update(&bytes);
+            vec![(
+                "idempotency-key".into(),
+                format!("pr-thread-test-{}", retry_key.finalize().to_hex()),
+            )]
+        };
+        let req = EdgeRequest::new(method, "/v1/git/x", "", headers, bytes);
         let page = Page::from_request(&req);
         let identity = crate::catalogue::test_request_identity(viewer, &scope);
         let ctx = HandlerCtx {
