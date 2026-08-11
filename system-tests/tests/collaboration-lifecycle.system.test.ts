@@ -71,6 +71,17 @@ async function awaitBacklinkGone(
   }, { description: `${relationName} between ${sourceRef} and ${targetRef} to disappear` });
 }
 
+function expectOpaqueIssueAuthor(value: unknown, label: string): string {
+  const author = string(value, label);
+  const prefix = "issue-author-";
+  const suffix = `@${systemTestConfig.tenant}.noreply`;
+  expect(author.startsWith(prefix), `${label} prefix`).toBe(true);
+  expect(author.endsWith(suffix), `${label} tenant scope`).toBe(true);
+  expect(author.slice(prefix.length, -suffix.length), `${label} opaque token`)
+    .toMatch(/^[0-9a-f]{32}$/);
+  return author;
+}
+
 describe("collaboration lifecycle", () => {
   test("reads red mainline CI and opens one governed issue without an integration API key", async () => {
     const founder = await browserApprovedCliClient();
@@ -361,18 +372,22 @@ command = ["true"]
       const response = await systemClient.json("/v1/issues?state=open&limit=100");
       const matching = array(response.body.items, "open issues after the governed hosted run")
         .map((item) => record(item, "open issue after the governed hosted run"))
-        .filter(
-          (item) => item.title === triageTitle && item.created_by === `agent:${agentId}`,
-        );
+        .filter((item) => item.title === triageTitle);
       return matching.length > 0 ? matching : undefined;
     }, { description: "the hosted agent to read CI and open exactly one governed issue" });
     expect(triageIssues).toHaveLength(1);
-    expect(triageIssues[0]).toMatchObject({
+    const triageIssue = record(triageIssues[0], "the agent's one governed issue");
+    expect(triageIssue).toMatchObject({
       title: triageTitle,
       state: "Todo",
-      created_by: `agent:${agentId}`,
       creator_kind: "agent",
     });
+    const publicAgentAuthor = expectOpaqueIssueAuthor(
+      triageIssue.created_by,
+      "hosted agent issue author",
+    );
+    expect(publicAgentAuthor).not.toContain(agentId);
+    expect(JSON.stringify(triageIssue)).not.toContain(`agent:${agentId}`);
     const erasePath =
       `/v1/triggers/${encodeURIComponent(triggerId)}`
       + `/runs/${encodeURIComponent(hostedRunId)}/result/erase`;
@@ -1599,7 +1614,13 @@ command = ["true"]
       source_ref: planningRef,
       target_ref: deliveryRef,
       relation: "blocks",
+      creator_kind: "human",
     });
+    const publicRelationAuthor = expectOpaqueIssueAuthor(
+      relation.created_by,
+      "created issue dependency author",
+    );
+    expect(publicRelationAuthor).not.toContain(systemTestConfig.principal);
 
     const replay = await systemClient.json(
       `/v1/issues/${encodeURIComponent(planningId)}/relations`,
@@ -1613,9 +1634,17 @@ command = ["true"]
     const listed = await reviewerClient.json(
       `/v1/issues/${encodeURIComponent(planningId)}/relations`,
     );
-    expect(array(listed.body.items, "visible issue dependencies")).toEqual([
-      expect.objectContaining({ id: relationId, target_ref: deliveryRef, relation: "blocks" }),
+    const visibleRelations = array(listed.body.items, "visible issue dependencies");
+    expect(visibleRelations).toEqual([
+      expect.objectContaining({
+        id: relationId,
+        target_ref: deliveryRef,
+        relation: "blocks",
+        created_by: publicRelationAuthor,
+        creator_kind: "human",
+      }),
     ]);
+    expect(JSON.stringify(visibleRelations)).not.toContain(systemTestConfig.principal);
 
     expect(await awaitBacklink(deliveryRef, planningRef, "blocks")).toMatchObject({
       relation_class: "lifecycle",

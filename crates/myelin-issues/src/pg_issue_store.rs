@@ -5,6 +5,7 @@ use crate::dek::{decrypt_free_text, encrypt_free_text, IssueFreeText};
 use crate::events::{
     ISSUE_AUTHORIZATION_REQUESTED, ISSUE_CLOSED, ISSUE_CREATED, RELATION_CREATED, RELATION_REMOVED,
 };
+use crate::pseudonym::IssueActorKind;
 use crate::refs_glue::{issue_root_ref, IssueLifecycleRel, REFS_EDGE_CREATED};
 use myelin_events::{
     derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventEnvelope,
@@ -271,6 +272,7 @@ pub struct StoredIssue {
     pub state_category: String,
     pub title: String,
     pub created_by_principal: String,
+    pub creator_kind: IssueActorKind,
     pub version: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -283,6 +285,7 @@ pub struct StoredIssueRelation {
     pub target_ref: String,
     pub relation: String,
     pub created_by: String,
+    pub creator_kind: IssueActorKind,
     pub created_at: String,
 }
 
@@ -298,6 +301,7 @@ struct RelationRecord {
     target_ref: String,
     relation: String,
     created_by: String,
+    creator_kind: IssueActorKind,
     created_at: String,
 }
 
@@ -589,6 +593,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         let issue_id = Uuid::new_v4();
         let prefix = proposal.prefix;
         let created_by = actor.principal_id.0.clone();
+        let created_by_kind = IssueActorKind::from_principal(actor).as_str().to_owned();
         let nonce = sealed.nonce.to_vec();
         let ciphertext = sealed.ciphertext;
         let key_ref = sealed.key_ref.to_uri();
@@ -662,16 +667,16 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                          INSERT INTO issue (\
                            tenant_id, region, id, key, prefix, type_id, type_rank, state, \
                            state_category, reporter, project_id, rank, title, title_nonce, \
-                           title_ciphertext, created_by_principal, pii_key_ref, \
+                           title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, \
                            contains_personal_data, version\
                          ) \
-                         SELECT $1, $2, $10, $3 || '-' || high_water::text, $3, $4, \
+                         SELECT $1, $2, $11, $3 || '-' || high_water::text, $3, $4, \
                            0, 'Todo', 'unstarted', NULL, $5, \
-                           '0|' || lpad(high_water::text, 20, '0'), '<encrypted>', $6, $7, $8, $9, \
+                           '0|' || lpad(high_water::text, 20, '0'), '<encrypted>', $6, $7, $8, $9, $10, \
                            true, 1 \
                          FROM allocated \
                          RETURNING id, key, project_id, state, state_category, title_nonce, \
-                           title_ciphertext, created_by_principal, pii_key_ref, version, \
+                           title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, version, \
                            created_at::text, updated_at::text",
                     )
                     .bind(&tenant_id)
@@ -682,6 +687,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(nonce)
                     .bind(ciphertext)
                     .bind(created_by)
+                    .bind(created_by_kind)
                     .bind(key_ref)
                     .bind(issue_id)
                     .fetch_one(&mut *conn)
@@ -1216,7 +1222,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     let source_key: String = source.get("key");
                     let source_ref = issue_root_ref(&tenant_id, &source_key).0;
                     let existing = sqlx::query(
-                        "SELECT relation_id, dst_ref, rel,
+                        "SELECT relation_id, dst_ref, rel, created_by_kind,
                                 COALESCE(created_by_principal, created_by::text) AS created_by,
                                 created_at::text AS created_at
                            FROM issue_relation
@@ -1255,9 +1261,9 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     let row = sqlx::query(
                         "INSERT INTO issue_relation
                             (tenant_id, region, relation_id, src_issue, dst_ref, rel,
-                             created_by, created_by_principal)
-                         VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid(), $7)
-                         RETURNING relation_id, dst_ref, rel,
+                             created_by, created_by_principal, created_by_kind)
+                         VALUES ($1, $2, $3, $4, $5, $6, gen_random_uuid(), $7, $8)
+                         RETURNING relation_id, dst_ref, rel, created_by_kind,
                                    COALESCE(created_by_principal, created_by::text) AS created_by,
                                    created_at::text AS created_at",
                     )
@@ -1268,6 +1274,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     .bind(&target_ref)
                     .bind(&relation_token)
                     .bind(&actor.principal_id.0)
+                    .bind(IssueActorKind::from_principal(&actor).as_str())
                     .fetch_one(&mut *conn)
                     .await
                     .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
@@ -1336,7 +1343,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     let source_key: String = source.get("key");
                     let source_ref = issue_root_ref(&tenant_id, &source_key).0;
                     let rows = sqlx::query(
-                        "SELECT relation_id, dst_ref, rel,
+                        "SELECT relation_id, dst_ref, rel, created_by_kind,
                                 COALESCE(created_by_principal, created_by::text) AS created_by,
                                 created_at::text AS created_at
                            FROM issue_relation
@@ -1395,7 +1402,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                     let source_key: String = source.get("key");
                     let source_ref = issue_root_ref(&tenant_id, &source_key).0;
                     let row = sqlx::query(
-                        "SELECT relation_id, dst_ref, rel,
+                        "SELECT relation_id, dst_ref, rel, created_by_kind,
                                 COALESCE(created_by_principal, created_by::text) AS created_by,
                                 created_at::text AS created_at
                            FROM issue_relation
@@ -1841,12 +1848,14 @@ fn parse_issue_relation_target(
 }
 
 fn relation_record(row: sqlx::postgres::PgRow, source_ref: String) -> RelationRecord {
+    let stored_kind: String = row.get("created_by_kind");
     RelationRecord {
         relation_id: row.get("relation_id"),
         source_ref,
         target_ref: row.get("dst_ref"),
         relation: row.get("rel"),
         created_by: row.get("created_by"),
+        creator_kind: IssueActorKind::from_stored(&stored_kind).unwrap_or(IssueActorKind::Unknown),
         created_at: row.get("created_at"),
     }
 }
@@ -1859,6 +1868,7 @@ impl From<RelationRecord> for StoredIssueRelation {
             target_ref: record.target_ref,
             relation: record.relation,
             created_by: record.created_by,
+            creator_kind: record.creator_kind,
             created_at: record.created_at,
         }
     }
@@ -1905,13 +1915,13 @@ fn issue_relation_envelope(
 }
 
 const SELECT_COLUMNS: &str = "id, key, project_id, state, state_category, title_nonce, \
-title_ciphertext, created_by_principal, pii_key_ref, version, created_at::text, updated_at::text";
+title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, version, created_at::text, updated_at::text";
 const SELECT_COLUMNS_QUALIFIED: &str = "i.id, i.key, i.project_id, i.state, i.state_category, \
-i.title_nonce, i.title_ciphertext, i.created_by_principal, i.pii_key_ref, i.version, \
+i.title_nonce, i.title_ciphertext, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version, \
 i.created_at::text, i.updated_at::text";
 const AUTHORIZATION_STATUS_SQL: &str = r#"
 SELECT i.id, i.key, i.project_id, i.state, i.state_category,
-       i.title_nonce, i.title_ciphertext, i.created_by_principal, i.pii_key_ref, i.version,
+       i.title_nonce, i.title_ciphertext, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version,
        i.created_at::text AS created_at, i.updated_at::text AS updated_at,
        CASE
          WHEN b.state = 'active' AND EXISTS (
@@ -1957,7 +1967,7 @@ gate AS MATERIALIZED (
 ),
 authorized AS (
   SELECT i.id, i.key, i.project_id, i.state, i.state_category,
-         i.title_nonce, i.title_ciphertext, i.created_by_principal, i.pii_key_ref, i.version,
+         i.title_nonce, i.title_ciphertext, i.created_by_principal, i.created_by_kind, i.pii_key_ref, i.version,
          i.created_at::text AS created_at, i.updated_at::text AS updated_at,
          floor(extract(epoch from i.updated_at) * 1000000)::bigint AS updated_at_micros
   FROM gate g
@@ -1997,12 +2007,13 @@ SELECT 0::int AS sort_key,
        NULL::uuid AS id, NULL::text AS key, NULL::uuid AS project_id,
        NULL::text AS state, NULL::text AS state_category,
        NULL::bytea AS title_nonce, NULL::bytea AS title_ciphertext,
-       NULL::text AS created_by_principal, NULL::text AS pii_key_ref, NULL::bigint AS version,
+       NULL::text AS created_by_principal, NULL::text AS created_by_kind,
+       NULL::text AS pii_key_ref, NULL::bigint AS version,
        NULL::text AS created_at, NULL::text AS updated_at,
        NULL::bigint AS updated_at_micros
 UNION ALL
 SELECT 1, 'ready', id, key, project_id, state, state_category,
-       title_nonce, title_ciphertext, created_by_principal, pii_key_ref, version, created_at, updated_at,
+       title_nonce, title_ciphertext, created_by_principal, created_by_kind, pii_key_ref, version, created_at, updated_at,
        updated_at_micros
 FROM authorized
 ORDER BY sort_key ASC, updated_at_micros DESC NULLS FIRST, id DESC NULLS FIRST
@@ -2485,6 +2496,10 @@ fn decode_row(
         state_category: row.get("state_category"),
         title,
         created_by_principal: row.get("created_by_principal"),
+        creator_kind: IssueActorKind::from_stored(&row.get::<String, _>("created_by_kind"))
+            .ok_or_else(|| {
+                IssueStoreError::Storage("stored issue creator kind is invalid".into())
+            })?,
         version: row.get("version"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),

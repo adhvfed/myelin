@@ -69,7 +69,8 @@ pub use migrations::{
     CREATE_ISSUE_RELATION_DDL, CREATE_ISSUE_RELATION_INDEXES_DDL, CREATE_MILESTONE_DDL,
     CREATE_PREFIX_COUNTER_DDL, CREATE_SCHEME_ASSIGNMENT_DDL, CREATE_SCHEME_DDL,
     CYCLE_MEMBERSHIP_TABLE, CYCLE_TABLE, EXPAND_ISSUE_AUTHZ_CREATED_EVENT_DDL,
-    EXPAND_ISSUE_RELATION_ACTOR_DDL, ISSUE_ASSIGNEE_INDEX, ISSUE_AUTHZ_BINDING_TABLE,
+    EXPAND_ISSUE_CREATOR_KIND_DDL, EXPAND_ISSUE_RELATION_ACTOR_DDL,
+    EXPAND_ISSUE_RELATION_CREATOR_KIND_DDL, ISSUE_ASSIGNEE_INDEX, ISSUE_AUTHZ_BINDING_TABLE,
     ISSUE_AUTHZ_VISIBLE_TABLE, ISSUE_BOARD_INDEX, ISSUE_CHANGE_LOG_TABLE,
     ISSUE_CREATE_IDEMPOTENCY_TABLE, ISSUE_CYCLE_INDEX, ISSUE_KEY_PREFIX_LIST_INDEX,
     ISSUE_PARENT_INDEX, ISSUE_PROPS_GIN_INDEX, ISSUE_RECENT_LIST_INDEX, ISSUE_RELATION_TABLE,
@@ -95,7 +96,8 @@ pub use dek::{
     decrypt_free_text, encrypt_free_text, plaintext_at_rest, subject_dek_erasure, IssueFreeText,
 };
 pub use pseudonym::{
-    is_raw_principal_id, is_resolvable_pseudonym, pseudonymise, IssuePseudonym, PseudonymError,
+    is_raw_principal_id, is_resolvable_pseudonym, pseudonymise, public_issue_actor, IssueActorKind,
+    IssuePseudonym, PseudonymError,
 };
 pub use write_path::{apply_mutation_sealed, SealError, SealedCreate};
 

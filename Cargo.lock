@@ -3032,6 +3032,7 @@ dependencies = [
 name = "myelin-issues"
 version = "0.0.0"
 dependencies = [
+ "blake3",
  "myelin-config",
  "myelin-content",
  "myelin-events",

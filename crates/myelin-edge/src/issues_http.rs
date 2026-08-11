@@ -7,10 +7,10 @@ use crate::request::EdgeResponse;
 use crate::{Method, StoreBackedIssueAuthorizer};
 use myelin_identity_service::{PgProjectStore, Project, ProjectError};
 use myelin_issues::{
-    api::IssueListState, is_canonical_request_event_id, CreateIssue, CreateIssueIntent,
-    IssueAuthorizationStatus, IssueAuthorizer, IssueCreationOutcome, IssueLifecycleRel,
-    IssuePageRequest, IssuePermission, IssueRelationCreationOutcome, IssueStoreError, PgIssueStore,
-    StoredIssue, StoredIssueRelation, MAX_RELATIONS_PER_ISSUE,
+    api::IssueListState, is_canonical_request_event_id, public_issue_actor, CreateIssue,
+    CreateIssueIntent, IssueAuthorizationStatus, IssueAuthorizer, IssueCreationOutcome,
+    IssueLifecycleRel, IssuePageRequest, IssuePermission, IssueRelationCreationOutcome,
+    IssueStoreError, PgIssueStore, StoredIssue, StoredIssueRelation, MAX_RELATIONS_PER_ISSUE,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -88,7 +88,10 @@ impl DurableIssueReadApi {
             .drive(self.store.list_relations(principal, issue_id))
             .map_err(map_store_error)?;
         Ok(page_envelope(
-            json!(relations.iter().map(relation_json).collect::<Vec<_>>()),
+            json!(relations
+                .iter()
+                .map(|relation| relation_json(&principal.tenant.0, relation))
+                .collect::<Vec<_>>()),
             None,
             MAX_RELATIONS_PER_ISSUE as usize,
         ))
@@ -434,25 +437,22 @@ fn issue_json(tenant: &str, issue: &StoredIssue) -> Value {
         "state": issue.state,
         "state_category": issue.state_category,
         "title": issue.title,
-        "created_by": issue.created_by_principal,
-        "creator_kind": if issue.created_by_principal.starts_with("agent:") {
-            "agent"
-        } else {
-            "human"
-        },
+        "created_by": public_issue_actor(tenant, &issue.created_by_principal),
+        "creator_kind": issue.creator_kind.as_str(),
         "version": issue.version,
         "created_at": issue.created_at,
         "updated_at": issue.updated_at,
     })
 }
 
-fn relation_json(relation: &StoredIssueRelation) -> Value {
+fn relation_json(tenant: &str, relation: &StoredIssueRelation) -> Value {
     json!({
         "id": relation.id,
         "source_ref": relation.source_ref,
         "target_ref": relation.target_ref,
         "relation": relation.relation,
-        "created_by": relation.created_by,
+        "created_by": public_issue_actor(tenant, &relation.created_by),
+        "creator_kind": relation.creator_kind.as_str(),
         "created_at": relation.created_at,
     })
 }
@@ -693,7 +693,7 @@ impl Handler for IssueRelationCreateHandler {
         Ok(no_store(EdgeResponse::json(
             if outcome.created { 201 } else { 200 },
             &json!({
-                "relation": relation_json(&outcome.relation),
+                "relation": relation_json(&ctx.principal.tenant.0, &outcome.relation),
                 "created": outcome.created,
                 "durable": true,
             }),
@@ -721,7 +721,7 @@ impl Handler for IssueRelationRemoveHandler {
             200,
             &match removed {
                 Some(relation) => json!({
-                    "relation": relation_json(&relation),
+                    "relation": relation_json(&ctx.principal.tenant.0, &relation),
                     "removed": true,
                     "durable": true,
                 }),
@@ -885,6 +885,42 @@ mod tests {
             canonical_issue_ref("acme-eu", "ENG-41"),
             "myelin://acme-eu/issue/issue/ENG-41"
         );
+    }
+
+    #[test]
+    fn public_attribution_is_opaque_while_durable_actor_kind_stays_legible() {
+        let raw_actor = "opaque-actor-without-a-kind-prefix";
+        let issue = StoredIssue {
+            id: "33333333-3333-3333-3333-333333333333".into(),
+            key: "ENG-41".into(),
+            project_id: "11111111-1111-1111-1111-111111111111".into(),
+            state: "Todo".into(),
+            state_category: "unstarted".into(),
+            title: "Keep attribution private".into(),
+            created_by_principal: raw_actor.into(),
+            creator_kind: myelin_issues::IssueActorKind::Agent,
+            version: 1,
+            created_at: "2026-08-11T00:00:00Z".into(),
+            updated_at: "2026-08-11T00:00:00Z".into(),
+        };
+        let relation = StoredIssueRelation {
+            id: "44444444-4444-4444-4444-444444444444".into(),
+            source_ref: "myelin://acme/issue/issue/ENG-41".into(),
+            target_ref: "myelin://acme/issue/issue/ENG-42".into(),
+            relation: "blocks".into(),
+            created_by: raw_actor.into(),
+            creator_kind: myelin_issues::IssueActorKind::Agent,
+            created_at: "2026-08-11T00:00:00Z".into(),
+        };
+
+        let projected_issue = issue_json("acme", &issue);
+        let projected_relation = relation_json("acme", &relation);
+        let public_actor = projected_issue["created_by"].as_str().unwrap();
+        assert_ne!(public_actor, raw_actor);
+        assert!(myelin_issues::is_resolvable_pseudonym(public_actor));
+        assert_eq!(projected_relation["created_by"], public_actor);
+        assert_eq!(projected_issue["creator_kind"], "agent");
+        assert_eq!(projected_relation["creator_kind"], "agent");
     }
 
     #[test]

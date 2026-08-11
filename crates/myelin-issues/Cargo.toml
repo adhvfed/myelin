@@ -24,6 +24,7 @@ myelin-search = { path = "../myelin-search" }
 myelin-notif = { path = "../myelin-notif" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-refs = { path = "../myelin-refs" }
+blake3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 yrs = { workspace = true }

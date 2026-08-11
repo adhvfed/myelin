@@ -1,5 +1,48 @@
-use myelin_identity::{IdentityService, PrincipalId, PseudonymHandle};
+use myelin_identity::{IdentityService, Principal, PrincipalId, PrincipalKind, PseudonymHandle};
 use myelin_tenancy::TenantId;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IssueActorKind {
+    Human,
+    Agent,
+    Service,
+    Unknown,
+}
+
+impl IssueActorKind {
+    pub fn from_principal(principal: &Principal) -> Self {
+        match principal.kind {
+            PrincipalKind::Human => Self::Human,
+            PrincipalKind::Agent { .. } => Self::Agent,
+            PrincipalKind::Service => Self::Service,
+        }
+    }
+
+    pub fn from_stored(value: &str) -> Option<Self> {
+        match value {
+            "human" => Some(Self::Human),
+            "agent" => Some(Self::Agent),
+            "service" => Some(Self::Service),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Human => "human",
+            Self::Agent => "agent",
+            Self::Service => "service",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+pub fn public_issue_actor(tenant: &str, principal_id: &str) -> String {
+    let digest =
+        blake3::hash(format!("myelin.issue.public-actor.v1\0{tenant}\0{principal_id}").as_bytes());
+    format!("issue-author-{}@{tenant}.noreply", &digest.to_hex()[..32])
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct IssuePseudonym(PseudonymHandle);
@@ -252,5 +295,38 @@ mod tests {
         let _ = PrincipalKind::Human;
         let column = pseudonymise(&id, &pid("agent-1"), &tenant()).expect("agent resolves");
         assert!(!is_raw_principal_id(&column.render()));
+    }
+
+    #[test]
+    fn public_issue_attribution_is_stable_scoped_and_opaque() {
+        let alice = public_issue_actor("acme", "human:alice@example.com");
+        assert_eq!(alice, public_issue_actor("acme", "human:alice@example.com"));
+        assert_ne!(
+            alice,
+            public_issue_actor("globex", "human:alice@example.com")
+        );
+        assert!(!alice.contains("alice"));
+        assert!(is_resolvable_pseudonym(&alice));
+    }
+
+    #[test]
+    fn attribution_kind_comes_from_identity_not_an_identifier_prefix() {
+        let agent = Principal::stub(
+            PrincipalId("an-opaque-id-without-a-kind-prefix".into()),
+            PrincipalKind::Agent {
+                runtime_ref: myelin_identity::RuntimeRef("hosted:luna".into()),
+                on_behalf_of: None,
+            },
+            tenant(),
+        );
+        assert_eq!(
+            IssueActorKind::from_principal(&agent),
+            IssueActorKind::Agent
+        );
+        assert_eq!(
+            IssueActorKind::from_stored("agent"),
+            Some(IssueActorKind::Agent)
+        );
+        assert_eq!(IssueActorKind::from_stored("invented"), None);
     }
 }

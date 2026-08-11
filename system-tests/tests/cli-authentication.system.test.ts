@@ -1840,10 +1840,17 @@ describe("the CLI authentication journey", () => {
       expect(humanVisibleAgentIssue).toMatchObject({
         project_id: createdProject.project.id,
         title: agentIssueTitle,
-        created_by: activated.agent.principal_id,
         creator_kind: "agent",
         key: expect.stringMatching(new RegExp(`^${createdProject.project.issue_prefix}-\\d+$`)),
       });
+      const publicIssueAuthor = string(
+        humanVisibleAgentIssue.created_by,
+        "human-visible agent issue author",
+      );
+      expect(publicIssueAuthor.startsWith("issue-author-")).toBe(true);
+      expect(publicIssueAuthor.endsWith(`@${systemTestConfig.tenant}.noreply`)).toBe(true);
+      expect(publicIssueAuthor).not.toContain(activated.agent.principal_id);
+      expect(JSON.stringify(humanVisibleAgentIssue)).not.toContain(activated.agent.principal_id);
       expect(agentIssueRef).toBe(
         `myelin://${systemTestConfig.tenant}/issue/issue/${string(
           humanVisibleAgentIssue.key,

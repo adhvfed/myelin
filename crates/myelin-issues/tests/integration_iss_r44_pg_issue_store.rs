@@ -13,8 +13,9 @@ use myelin_issues::events::{
 };
 use myelin_issues::{
     issues_hot_tables, issues_migrations, CreateIssue, CreateIssueIntent, ImportIssue,
-    IssueAuthorizationBinding, IssueAuthorizer, IssueLifecycleRel, IssuePageRequest,
-    IssuePermission, IssueStoreError, IssueTupleWriter, PgIssueStore, SourceSystem, VisibleIssues,
+    IssueActorKind, IssueAuthorizationBinding, IssueAuthorizer, IssueLifecycleRel,
+    IssuePageRequest, IssuePermission, IssueStoreError, IssueTupleWriter, PgIssueStore,
+    SourceSystem, VisibleIssues,
 };
 use myelin_storage::{
     all_durable_migrations, DurableTupleBacking, KmsEngine, PgBootstrap, TenantScope,
@@ -653,6 +654,7 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
         .expect("retry activates after idempotent tuple add");
     assert!(activated.newly_activated);
     assert_eq!(activated.issue.title, "private staged title");
+    assert_eq!(activated.issue.creator_kind, IssueActorKind::Service);
     assert!(
         !restarted
             .reconcile_authorization(&worker, &staged.id, &writer)
@@ -767,6 +769,7 @@ async fn saga_is_fail_closed_rollback_safe_restartable_idempotent_and_concurrent
     assert_eq!(relation.relation.target_ref, target_ref);
     assert_eq!(relation.relation.relation, "blocks");
     assert_eq!(relation.relation.created_by, creator.principal_id.0);
+    assert_eq!(relation.relation.creator_kind, IssueActorKind::Service);
 
     let retry = restarted
         .create_relation(&creator, &staged.id, &target_ref, IssueLifecycleRel::Blocks)

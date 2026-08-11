@@ -140,6 +140,56 @@ pub const EXPAND_NULLABLE_REPORTER_DDL: &str =
 pub const EXPAND_ISSUE_RELATION_ACTOR_DDL: &str =
     "ALTER TABLE issue_relation ADD COLUMN IF NOT EXISTS created_by_principal text;";
 
+pub const EXPAND_ISSUE_CREATOR_KIND_DDL: &str = r#"
+ALTER TABLE issue
+  ADD COLUMN IF NOT EXISTS created_by_kind text NOT NULL DEFAULT 'unknown'
+  CHECK (created_by_kind IN ('human','agent','service','unknown'));
+WITH historic_kind AS (
+  SELECT b.tenant_id, b.region, b.issue_id,
+         CASE
+           WHEN o.envelope #> '{actor,kind}' = '"Human"'::jsonb THEN 'human'
+           WHEN (o.envelope #> '{actor,kind}') ? 'Agent' THEN 'agent'
+           WHEN o.envelope #> '{actor,kind}' = '"Service"'::jsonb THEN 'service'
+           ELSE 'unknown'
+         END AS actor_kind
+  FROM issue_authz_binding b
+  LEFT JOIN outbox o ON o.event_id = b.created_event_id
+)
+UPDATE issue AS i
+   SET created_by_kind = historic_kind.actor_kind
+  FROM historic_kind
+ WHERE i.tenant_id = historic_kind.tenant_id
+   AND i.region = historic_kind.region
+   AND i.id = historic_kind.issue_id
+   AND i.created_by_kind = 'unknown';
+"#;
+
+pub const EXPAND_ISSUE_RELATION_CREATOR_KIND_DDL: &str = r#"
+ALTER TABLE issue_relation
+  ADD COLUMN IF NOT EXISTS created_by_kind text NOT NULL DEFAULT 'unknown'
+  CHECK (created_by_kind IN ('human','agent','service','unknown'));
+WITH historic_kind AS (
+  SELECT envelope #>> '{tenant}' AS tenant_id,
+         envelope #>> '{region}' AS region,
+         envelope #>> '{payload,relation_id}' AS relation_id,
+         CASE
+           WHEN envelope #> '{actor,kind}' = '"Human"'::jsonb THEN 'human'
+           WHEN (envelope #> '{actor,kind}') ? 'Agent' THEN 'agent'
+           WHEN envelope #> '{actor,kind}' = '"Service"'::jsonb THEN 'service'
+           ELSE 'unknown'
+         END AS actor_kind
+  FROM outbox
+  WHERE envelope #>> '{type_}' = 'issue.relation.created'
+)
+UPDATE issue_relation AS relation
+   SET created_by_kind = historic_kind.actor_kind
+  FROM historic_kind
+ WHERE relation.tenant_id = historic_kind.tenant_id
+   AND relation.region = historic_kind.region
+   AND relation.relation_id::text = historic_kind.relation_id
+   AND relation.created_by_kind = 'unknown';
+"#;
+
 pub const CREATE_ISSUE_AUTHZ_BINDING_DDL: &str = "\
 CREATE TABLE IF NOT EXISTS issue_authz_binding (
   tenant_id        text        NOT NULL,
@@ -524,6 +574,18 @@ pub fn issues_migrations() -> Migrations {
         MigrationPhase::Contract,
         IMPORT_MAP_TABLE,
     ));
+    migrations.push(Migration::phased(
+        "iss_0029_issue_creator_kind",
+        EXPAND_ISSUE_CREATOR_KIND_DDL,
+        MigrationPhase::Expand,
+        ISSUE_TABLE,
+    ));
+    migrations.push(Migration::phased(
+        "iss_0030_issue_relation_creator_kind",
+        EXPAND_ISSUE_RELATION_CREATOR_KIND_DDL,
+        MigrationPhase::Expand,
+        ISSUE_RELATION_TABLE,
+    ));
     Migrations::of(migrations)
 }
 
@@ -660,8 +722,8 @@ mod tests {
         let migrations = issues_migrations();
         assert_eq!(
             migrations.0.len(),
-            31,
-            "11 spine-table creates + 10 concurrent indexes + 2 issue expands + 5 authz migrations + the import map + create retry ledger + relation actor expansion"
+            36,
+            "the complete append-only Issues migration history remains intact"
         );
         for m in &migrations.0 {
             assert!(
@@ -699,7 +761,7 @@ mod tests {
             .any(|migration| migration.id == "iss_0018_issue_authz_visible"));
         assert_eq!(
             issues.0.last().map(|migration| migration.id),
-            Some("iss_0025_issue_relation_actor")
+            Some("iss_0030_issue_relation_creator_kind")
         );
         for invariant in [
             "CREATE INDEX CONCURRENTLY",
@@ -818,7 +880,7 @@ mod tests {
             .expect("the full Issue-Tracker spine applies forward-only");
         assert_eq!(
             runner.applied().len(),
-            31,
+            36,
             "the runner applied every table/index/expand migration"
         );
         assert_eq!(
@@ -833,7 +895,7 @@ mod tests {
             .expect("the spine re-applies idempotently");
         assert_eq!(
             runner2.applied().len(),
-            31,
+            36,
             "the re-apply admits every migration again"
         );
     }
@@ -942,6 +1004,26 @@ mod tests {
             "human, agent, and service principal ids retain their canonical attribution"
         );
         assert_eq!(actor_expansion.phase, MigrationPhase::Expand);
+    }
+
+    #[test]
+    fn creator_kind_is_durable_and_legacy_backfill_reads_typed_event_provenance() {
+        let migrations = issues_migrations();
+        for (id, table) in [
+            ("iss_0029_issue_creator_kind", ISSUE_TABLE),
+            ("iss_0030_issue_relation_creator_kind", ISSUE_RELATION_TABLE),
+        ] {
+            let migration = migrations
+                .0
+                .iter()
+                .find(|migration| migration.id == id)
+                .expect("creator-kind migration");
+            assert_eq!(migration.table, Some(table));
+            assert_eq!(migration.phase, MigrationPhase::Expand);
+            assert!(migration.ddl.contains("created_by_kind"));
+            assert!(migration.ddl.contains("'{actor,kind}'"));
+            assert!(!migration.ddl.contains("created_by_principal LIKE"));
+        }
     }
 
     #[test]
