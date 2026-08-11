@@ -537,4 +537,62 @@ describe.sequential("Git engineering lifecycle", () => {
     const mergedBlob = await systemClient.json(`${project.path}/blob/main/src/shipped.ts`);
     expect(mergedBlob.body).toMatchObject({ contents: "export const shipped = true;\n" });
   });
+
+  test("protects the branch a new repository actually calls home", async () => {
+    const trunkProject = new GitProject(uniqueName("system-trunk-default"), systemClient);
+    await trunkProject.create();
+    const trunkOid = (await trunkProject.writeFile(
+      "trunk",
+      "README.md",
+      "# A repository that begins on trunk\n",
+    )).commitOid;
+
+    const refs = await systemClient.json(`${trunkProject.path}/refs?limit=100`);
+    expect(array(refs.body.branches, "trunk repository branches")).toEqual([
+      expect.objectContaining({ name: "trunk", is_default: true, oid: trunkOid }),
+    ]);
+
+    const proposedOid = (await trunkProject.writeFile(
+      "feature/ship-from-trunk",
+      "src/shipped.ts",
+      "export const shippedFromTrunk = true;\n",
+      { startRef: "trunk" },
+    )).commitOid;
+    const opened = await systemClient.json(`${trunkProject.path}/prs`, {
+      method: "POST",
+      body: {
+        title: "Ship safely from the real default branch",
+        base_ref: "refs/heads/trunk",
+        head_ref: "refs/heads/feature/ship-from-trunk",
+        head_oid: proposedOid,
+        reviewers: [],
+      },
+      expectedStatus: 201,
+    });
+    const pullRequest = record(
+      record(opened.body.applied, "trunk PR receipt.applied").pr,
+      "trunk PR receipt.applied.pr",
+    );
+    const base = `${trunkProject.path}/prs/${Number(pullRequest.number)}`;
+
+    const checks = await systemClient.json(`${base}/checks`);
+    expect(checks.body).toMatchObject({
+      required_approvals: 1,
+      current_approvals: 0,
+      gate_admitted: false,
+    });
+
+    const refusedMerge = await systemClient.json(`${base}/merge`, {
+      method: "POST",
+      body: {},
+      expectedStatus: 409,
+    });
+    expect(refusedMerge.body).toMatchObject({
+      error: { code: "merge_blocked" },
+      checks: { required_approvals: 1, current_approvals: 0, gate_admitted: false },
+    });
+    expect((await systemClient.json(`${trunkProject.path}/refs?limit=100`)).body).toMatchObject({
+      default_branch: "trunk",
+    });
+  });
 });

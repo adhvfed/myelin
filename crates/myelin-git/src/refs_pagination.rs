@@ -386,6 +386,30 @@ impl DurableGitRepo {
         Ok(scan_refs(&repo, head_target, None, None, None, 0, WIRE_SCAN_LIMITS)?.summary)
     }
 
+    pub fn default_branch_ref(&self) -> Result<String, DurableError> {
+        let repo = self.open_git()?;
+        let head_target = read_head_target(&repo)?;
+        if let Some(target) = head_target.as_deref() {
+            if target.starts_with("refs/heads/") && direct_ref_has_target(&repo, target)? {
+                return Ok(target.to_string());
+            }
+        }
+        if direct_ref_has_target(&repo, "refs/heads/main")? {
+            return Ok("refs/heads/main".to_string());
+        }
+        let summary = scan_refs(
+            &repo,
+            head_target,
+            None,
+            None,
+            None,
+            0,
+            WIRE_SCAN_LIMITS,
+        )?
+        .summary;
+        Ok(format!("refs/heads/{}", summary.default_branch))
+    }
+
     pub fn refs_page(&self, request: RefsPageRequest) -> Result<RefsPage, RefsPageError> {
         if request.limit == 0 || request.limit > REFS_PAGE_MAX_LIMIT {
             return Err(RefsPageError::InvalidLimit {

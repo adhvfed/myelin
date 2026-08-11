@@ -85,9 +85,7 @@ impl DurableGitBackend {
         repo_slug: Option<&str>,
         records: Vec<PrRecord>,
     ) -> Vec<EnrichedPr> {
-        let config = self.prs.get_protection(loc).ok();
-        let config_readable = config.is_some();
-        let config = config.flatten();
+        let policy = self.repo_policy(loc).ok();
         let projected = self.projected_check_rows_for_records(loc, &records, principal);
         records
             .into_iter()
@@ -104,8 +102,10 @@ impl DurableGitBackend {
                     Ok(None) => true,
                     Err(_) => false,
                 };
-                let summary = if config_readable && checks_readable {
-                    let ruleset = effective_ruleset(config.as_ref(), &rec.base_ref);
+                let summary = if let (Some((config, default_ref)), true) =
+                    (policy.as_ref(), checks_readable)
+                {
+                    let ruleset = effective_ruleset(config.as_ref(), &rec.base_ref, default_ref);
                     rec.checks_summary(&ruleset)
                 } else {
                     ChecksSummary::unavailable()
@@ -129,12 +129,11 @@ impl DurableGitBackend {
         viewer: &str,
         records: Vec<PrCrossListRecord>,
     ) -> Vec<EnrichedPr> {
-        let mut configs = BTreeMap::new();
+        let mut policies = BTreeMap::new();
         let mut records_by_repo = BTreeMap::<String, Vec<PrRecord>>::new();
         for item in &records {
-            configs.entry(item.repo_slug.clone()).or_insert_with(|| {
-                self.prs
-                    .get_protection(&Self::loc(tenant, region, &item.repo_slug))
+            policies.entry(item.repo_slug.clone()).or_insert_with(|| {
+                self.repo_policy(&Self::loc(tenant, region, &item.repo_slug))
                     .ok()
             });
             records_by_repo
@@ -168,9 +167,10 @@ impl DurableGitBackend {
                     Some(Ok(None)) => true,
                     _ => false,
                 };
-                let summary = match (configs.get(&item.repo_slug), checks_readable) {
-                    (Some(Some(config)), true) => {
-                        let ruleset = effective_ruleset(config.as_ref(), &item.record.base_ref);
+                let summary = match (policies.get(&item.repo_slug), checks_readable) {
+                    (Some(Some((config, default_ref))), true) => {
+                        let ruleset =
+                            effective_ruleset(config.as_ref(), &item.record.base_ref, default_ref);
                         item.record.checks_summary(&ruleset)
                     }
                     _ => ChecksSummary::unavailable(),
@@ -334,7 +334,7 @@ impl DurableGitBackend {
         principal: &Principal,
     ) -> Result<Value, DurableError> {
         let record = self.record_with_projected_checks(loc, record, principal)?;
-        let ruleset = self.prs.effective_ruleset_for(loc, &record.base_ref)?;
+        let ruleset = self.effective_ruleset_for(loc, &record.base_ref)?;
         let required_contexts = canonical_required_context_tokens(&ruleset.required_contexts)?;
         let evaluation = evaluate_merge(&ruleset, &record)
             .map_err(|error| DurableError::Git(error.to_string()))?;

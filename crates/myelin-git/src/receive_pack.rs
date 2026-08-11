@@ -68,8 +68,10 @@ impl RefName {
             Ok(())
         }
     }
-    pub fn is_protected(&self) -> bool {
-        self.0 == "refs/heads/main" || self.0.starts_with("refs/heads/release/")
+    pub fn has_baseline_protection(&self, default_ref: &RefName) -> bool {
+        self == default_ref
+            || self.0 == "refs/heads/main"
+            || self.0.starts_with("refs/heads/release/")
     }
 }
 
@@ -283,6 +285,7 @@ pub struct PushPolicy {
     pub max_object_bytes: usize,
     pub secret_patterns: Vec<String>,
     pub protected_needs_human: bool,
+    pub default_ref: RefName,
     pub tenant: String,
 }
 
@@ -296,6 +299,7 @@ impl Default for PushPolicy {
                 ["-----BEGIN RSA ", "PRIVATE KEY"].concat(),
             ],
             protected_needs_human: true,
+            default_ref: RefName::new("refs/heads/main"),
             tenant: String::new(),
         }
     }
@@ -307,7 +311,7 @@ impl PushPolicy {
             return Err(RejectReason::PseudonymRequired);
         }
         for u in &push.updates {
-            if u.ref_name.is_protected() {
+            if u.ref_name.has_baseline_protection(&self.default_ref) {
                 if u.new_oid.is_zero() {
                     return Err(RejectReason::DeleteProtected {
                         ref_name: u.ref_name.clone(),
@@ -849,8 +853,19 @@ impl RefStore {
             }
         }
 
+        let default_ref = match &self.backing {
+            RefBacking::Memory { .. } => RefName::new("refs/heads/main"),
+            RefBacking::Disk { repo } => {
+                RefName::new(repo.default_branch_ref().map_err(|error| {
+                    OutboxError(format!(
+                        "read repository default branch for push policy: {error}"
+                    ))
+                })?)
+            }
+        };
         let policy = PushPolicy {
             tenant: self.ctx_base.tenant.0.clone(),
+            default_ref,
             ..PushPolicy::default()
         };
         if let Err(reason) = policy.evaluate(push) {
@@ -1719,6 +1734,78 @@ mod tests {
     }
 
     #[test]
+    fn durable_push_policy_protects_a_non_main_repository_default() {
+        let root = std::env::temp_dir().join(format!(
+            "myelin-default-branch-policy-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock after epoch")
+                .as_nanos()
+        ));
+        let loc = crate::core::RepoLoc::new("acme", "fr-par", "core");
+        let durable = Arc::new(
+            crate::durable::DurableGitStore::rooted(&root)
+                .create_repo(&loc)
+                .expect("create durable repo"),
+        );
+        let blob = durable.write_blob(b"default branch\n").expect("write blob");
+        let tree = durable
+            .write_tree(&[("README.md", &blob)])
+            .expect("write tree");
+        let first = durable
+            .write_commit(
+                &tree,
+                &[],
+                "establish trunk",
+                "anon-1@acme.noreply",
+                "anon-1@acme.noreply",
+            )
+            .expect("write first commit");
+        let second = durable
+            .write_commit(
+                &tree,
+                &[&first],
+                "advance trunk",
+                "anon-7@acme.noreply",
+                "anon-7@acme.noreply",
+            )
+            .expect("write second commit");
+        durable
+            .update_ref_cas(
+                "refs/heads/trunk",
+                None,
+                Some(&first),
+                "establish default",
+                "anon-1@acme.noreply",
+            )
+            .expect("create trunk");
+
+        let store = RefStore::open_durable(
+            Arc::clone(&durable),
+            "core",
+            ctx_base(),
+            OutboxStore::new(),
+            Arc::new(MonotonicMinter::new()),
+        );
+        let mut push = human_push("refs/heads/trunk", Oid::new(first.0), Oid::new(second.0));
+        push.pusher = Pusher::direct("anon-7@acme.noreply", true);
+
+        assert_eq!(
+            store
+                .receive(&push, &InMemoryObjectDb::new(), CrashPoint::None)
+                .expect("evaluate push"),
+            PushOutcome::Rejected(RejectReason::AgentNeedsHuman {
+                ref_name: RefName::new("refs/heads/trunk")
+            })
+        );
+
+        drop(store);
+        drop(durable);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_human_approved_agent_keeps_agent_authorship_without_being_refused() {
         let (store, _outbox) = store();
         let db = InMemoryObjectDb::new();
@@ -2507,15 +2594,18 @@ mod tests {
     }
 
     #[test]
-    fn protected_set_is_exactly_main_and_release() {
-        assert!(RefName::new("refs/heads/main").is_protected());
-        assert!(RefName::new("refs/heads/release/1.0").is_protected());
+    fn baseline_protection_follows_the_default_branch_and_keeps_release_lines_safe() {
+        let main = RefName::new("refs/heads/main");
+        let trunk = RefName::new("refs/heads/trunk");
+        assert!(main.has_baseline_protection(&main));
+        assert!(trunk.has_baseline_protection(&trunk));
+        assert!(RefName::new("refs/heads/release/1.0").has_baseline_protection(&trunk));
         assert!(
-            !RefName::new("refs/heads/feature").is_protected(),
+            !RefName::new("refs/heads/feature").has_baseline_protection(&trunk),
             "a feature ref is NOT protected"
         );
         assert!(
-            !RefName::new("refs/heads/mainline").is_protected(),
+            !RefName::new("refs/heads/mainline").has_baseline_protection(&main),
             "only exact `main` is protected"
         );
 
@@ -2550,6 +2640,7 @@ mod tests {
             max_object_bytes: 8,
             secret_patterns: vec![],
             protected_needs_human: true,
+            default_ref: RefName::new("refs/heads/main"),
             tenant: "acme".into(),
         };
         let at_limit = PushSession {

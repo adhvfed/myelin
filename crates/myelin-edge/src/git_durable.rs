@@ -691,6 +691,24 @@ impl DurableGitBackend {
         )
     }
 
+    pub(super) fn repo_policy(
+        &self,
+        loc: &RepoLoc,
+    ) -> Result<(Option<BranchProtectionConfig>, RefName), DurableError> {
+        let config = self.prs.get_protection(loc)?;
+        let default_ref = RefName::new(self.store.open_repo(loc)?.default_branch_ref()?);
+        Ok((config, default_ref))
+    }
+
+    pub(super) fn effective_ruleset_for(
+        &self,
+        loc: &RepoLoc,
+        base_ref: &str,
+    ) -> Result<BranchProtectionRuleset, DurableError> {
+        let (config, default_ref) = self.repo_policy(loc)?;
+        Ok(effective_ruleset(config.as_ref(), base_ref, &default_ref))
+    }
+
     pub fn create_repo(
         &self,
         tenant: &str,
@@ -1665,7 +1683,14 @@ impl DurableGitBackend {
 
         let loc = Self::loc(tenant, region, slug);
         let ref_name = RefName::new(full.clone());
-        self.admit_file_ref_update(&loc, principal, actor_is_agent, &ref_name, &prepared.commit)?;
+        self.admit_file_ref_update(
+            &repo,
+            &loc,
+            principal,
+            actor_is_agent,
+            &ref_name,
+            &prepared.commit,
+        )?;
 
         let ref_store = self.open_durable_refstore(repo.clone(), slug, tenant, region, principal);
         let expected_old = prior_target
@@ -1690,9 +1715,12 @@ impl DurableGitBackend {
             .receive(&push, &migration, CrashPoint::None)
             .map_err(|e| DurableError::Git(format!("ref-CAS: {e:?}")))?
         {
-            PushOutcome::Accepted { .. } => Ok(WebEditOutcome::Committed {
-                new_oid: prepared.commit.0,
-            }),
+            PushOutcome::Accepted { .. } => {
+                let _ = repo.heal_head_symref();
+                Ok(WebEditOutcome::Committed {
+                    new_oid: prepared.commit.0,
+                })
+            }
             PushOutcome::Rejected(RejectReason::NonFastForward { .. }) => {
                 Ok(WebEditOutcome::StaleBase {
                     current_oid: current_base,
@@ -1705,6 +1733,7 @@ impl DurableGitBackend {
 
     fn admit_file_ref_update(
         &self,
+        repo: &DurableGitRepo,
         loc: &RepoLoc,
         principal: &Principal,
         actor_is_agent: bool,
@@ -1716,7 +1745,8 @@ impl DurableGitBackend {
             .as_ref()
             .and_then(|config| config.resolve(&ref_name.0))
             .is_some();
-        if !is_configured && !ref_name.is_protected() {
+        let default_ref = RefName::new(repo.default_branch_ref()?);
+        if !is_configured && !ref_name.has_baseline_protection(&default_ref) {
             return Ok(());
         }
 
@@ -1735,7 +1765,7 @@ impl DurableGitBackend {
             false,
             false,
             pusher_has_protected_push,
-            &effective_ruleset(protection.as_ref(), &ref_name.0),
+            &effective_ruleset(protection.as_ref(), &ref_name.0, &default_ref),
             &GitOid(new_commit.0.clone()),
             &green,
             &fork_unendorsed,
@@ -3128,6 +3158,21 @@ impl DurableGitBackend {
                 ));
             }
         };
+        let default_ref = match repo.default_branch_ref() {
+            Ok(default_ref) => RefName::new(default_ref),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&qdir);
+                return Ok(report_status(
+                    "ok",
+                    &all_ng(
+                        &cmds,
+                        &format!(
+                            "rejected (default-branch policy unreadable - fail-closed): {error}"
+                        ),
+                    ),
+                ));
+            }
+        };
         let pusher_has_protected_push = self.repo_authz.authorize_repo_permission(
             principal,
             &loc,
@@ -3140,11 +3185,11 @@ impl DurableGitBackend {
                 .as_ref()
                 .and_then(|c| c.resolve(ref_str))
                 .is_some();
-            let is_protected = configured || u.ref_name.is_protected();
+            let is_protected = configured || u.ref_name.has_baseline_protection(&default_ref);
             if !is_protected {
                 continue;
             }
-            let ruleset = effective_ruleset(protection.as_ref(), ref_str);
+            let ruleset = effective_ruleset(protection.as_ref(), ref_str, &default_ref);
             protected_updates.push((index, ruleset.clone()));
             if self.checks.is_some() {
                 continue;

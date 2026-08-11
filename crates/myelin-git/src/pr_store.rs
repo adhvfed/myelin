@@ -56,11 +56,12 @@ impl BranchProtectionConfig {
 pub fn effective_ruleset(
     config: Option<&BranchProtectionConfig>,
     base_ref: &str,
+    default_ref: &RefName,
 ) -> BranchProtectionRuleset {
     if let Some(rs) = config.and_then(|c| c.resolve(base_ref)) {
         return rs.clone();
     }
-    if RefName::new(base_ref).is_protected() {
+    if RefName::new(base_ref).has_baseline_protection(default_ref) {
         return BranchProtectionRuleset {
             ref_pattern: base_ref.to_string(),
             required_contexts: Vec::new(),
@@ -803,9 +804,10 @@ impl<P: RepoPathResolver> DurablePrStore<P> {
         &self,
         repo: &RepoLoc,
         base_ref: &str,
+        default_ref: &RefName,
     ) -> Result<BranchProtectionRuleset, DurableError> {
         let config = self.get_protection(repo)?;
-        Ok(effective_ruleset(config.as_ref(), base_ref))
+        Ok(effective_ruleset(config.as_ref(), base_ref, default_ref))
     }
 
     pub fn put(&self, repo: &RepoLoc, rec: &PrRecord) -> Result<(), DurableError> {
@@ -1065,7 +1067,8 @@ pub fn merge_pr<P: RepoPathResolver>(
         .get(repo_loc, number)?
         .ok_or_else(|| DurableError::NotFound(format!("PR #{number}")))?;
 
-    let ruleset = store.effective_ruleset_for(repo_loc, &rec.base_ref)?;
+    let default_ref = RefName::new(repo.default_branch_ref()?);
+    let ruleset = store.effective_ruleset_for(repo_loc, &rec.base_ref, &default_ref)?;
 
     let eval = evaluate_merge(&ruleset, &rec).map_err(|e| DurableError::Git(e.to_string()))?;
     if !eval.admitted() {
@@ -1214,6 +1217,25 @@ mod tests {
         let outbox = OutboxStore::new();
         let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
         RefStore::open_durable(repo, "core", ctx_base(), outbox, minter)
+    }
+
+    #[test]
+    fn the_repository_default_branch_gets_the_baseline_review_policy() {
+        let trunk = RefName::new("refs/heads/trunk");
+
+        assert_eq!(
+            effective_ruleset(None, "refs/heads/trunk", &trunk).required_approvals,
+            1
+        );
+        assert_eq!(
+            effective_ruleset(None, "refs/heads/feature", &trunk).required_approvals,
+            0
+        );
+        assert_eq!(
+            effective_ruleset(None, "refs/heads/main", &trunk).required_approvals,
+            1,
+            "renaming the default branch must not silently relax an established main branch"
+        );
     }
 
     #[test]

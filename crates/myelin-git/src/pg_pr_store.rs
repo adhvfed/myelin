@@ -1624,7 +1624,9 @@ impl PgPrStore {
                 },
             );
         }
-        let ruleset = policy_store.effective_ruleset_for(target_loc, &record.base_ref)?;
+        let default_ref = RefName::new(target_repo.default_branch_ref()?);
+        let ruleset =
+            policy_store.effective_ruleset_for(target_loc, &record.base_ref, &default_ref)?;
 
         let source_ref = qualify_ref(&record.head_ref);
         let source_tip = source_repo.read_ref(&source_ref)?;
@@ -3623,7 +3625,11 @@ mod tests {
                         command_hash: projection_hash,
                         ctx: projection_ctx,
                         ruleset: projection_policy
-                            .effective_ruleset_for(&projection_loc, &projected_pr.base_ref)
+                            .effective_ruleset_for(
+                                &projection_loc,
+                                &projected_pr.base_ref,
+                                &RefName::new("refs/heads/main"),
+                            )
                             .unwrap(),
                         project_checks: true,
                     },
@@ -3961,7 +3967,11 @@ mod tests {
                         command_hash: hash.clone(),
                         ctx: ctx.clone(),
                         ruleset: policy_store
-                            .effective_ruleset_for(&loc, &opened.base_ref)
+                            .effective_ruleset_for(
+                                &loc,
+                                &opened.base_ref,
+                                &RefName::new("refs/heads/main"),
+                            )
                             .unwrap(),
                         project_checks: false,
                     },
