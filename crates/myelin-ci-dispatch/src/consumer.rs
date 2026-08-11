@@ -432,64 +432,78 @@ fn trigger_facts(ev: &EventEnvelope) -> Result<TriggerFacts, SkipReason> {
         SkipReason::InvalidProvenance(format!("invalid payload repository {repo:?}: {error}"))
     })?;
 
-    let (oid_field, source_ref, concurrency_group, pr_head_generation) =
-        if ev.type_.0 == myelin_git::events::GIT_REF_UPDATED {
-            let ref_name = p
-                .get("ref")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| SkipReason::MalformedPayload("missing `ref`".into()))?;
-            let ref_name = myelin_git::receive_pack::RefName::new(ref_name);
-            let ref_key =
-                myelin_git::receive_pack::GitRefEventKey::new(&repo, &ref_name).map_err(|_| {
-                    SkipReason::InvalidProvenance("invalid canonical Git ref event key".into())
-                })?;
-            validate_envelope_provenance(
-                ev,
-                &ref_key
-                    .subject(&ev.tenant.0)
-                    .map_err(|_| {
-                        SkipReason::InvalidProvenance("invalid canonical Git ref subject".into())
-                    })?
-                    .0,
-                &ref_key.aggregate().0,
-            )?;
-            ("new_oid", Some(ref_name.0.clone()), None, None)
-        } else {
-            let number = p
-                .get("number")
-                .and_then(|v| v.as_u64())
-                .filter(|number| *number > 0)
-                .ok_or_else(|| {
-                    SkipReason::InvalidProvenance("PR `number` must be a positive integer".into())
-                })?;
-            validate_envelope_provenance(
-                ev,
-                &format!("myelin://{}/git/pr/{repo}:{number}", ev.tenant.0),
-                &format!("git/pr/{repo}:{number}"),
-            )?;
-            let group = format!("pr:{repo}:{number}");
-            if group.len() > 512 {
-                return Err(SkipReason::InvalidProvenance(
-                    "PR concurrency identity exceeds 512 bytes".into(),
-                ));
-            }
-            if ev.schema_ver < myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2 {
-                return Err(SkipReason::InvalidProvenance(
-                    "PR head-trigger event did not pass the required schema upcaster".into(),
-                ));
-            }
-            let generation = p
-                .get("head_generation")
-                .and_then(|value| value.as_i64())
-                .filter(|generation| *generation > 0)
-                .ok_or_else(|| {
-                    SkipReason::InvalidProvenance(
-                        "PR `head_generation` must be a positive signed 64-bit integer".into(),
-                    )
-                })?;
-            ("head_oid", None, Some(group), Some(generation))
-        };
+    let (oid_field, source_ref, concurrency_group, pr_head_generation) = if ev.type_.0
+        == myelin_git::events::GIT_REF_UPDATED
+    {
+        let ref_name = p
+            .get("ref")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| SkipReason::MalformedPayload("missing `ref`".into()))?;
+        let ref_name = myelin_git::receive_pack::RefName::new(ref_name);
+        let ref_key =
+            myelin_git::receive_pack::GitRefEventKey::new(&repo, &ref_name).map_err(|_| {
+                SkipReason::InvalidProvenance("invalid canonical Git ref event key".into())
+            })?;
+        validate_envelope_provenance(
+            ev,
+            &ref_key
+                .subject(&ev.tenant.0)
+                .map_err(|_| {
+                    SkipReason::InvalidProvenance("invalid canonical Git ref subject".into())
+                })?
+                .0,
+            &ref_key.aggregate().0,
+        )?;
+        ("new_oid", Some(ref_name.0.clone()), None, None)
+    } else {
+        let number = p
+            .get("number")
+            .and_then(|v| v.as_u64())
+            .filter(|number| *number > 0)
+            .ok_or_else(|| {
+                SkipReason::InvalidProvenance("PR `number` must be a positive integer".into())
+            })?;
+        validate_envelope_provenance(
+            ev,
+            &format!("myelin://{}/git/pr/{repo}:{number}", ev.tenant.0),
+            &format!("git/pr/{repo}:{number}"),
+        )?;
+        let group = format!("pr:{repo}:{number}");
+        if group.len() > 512 {
+            return Err(SkipReason::InvalidProvenance(
+                "PR concurrency identity exceeds 512 bytes".into(),
+            ));
+        }
+        if ev.schema_ver < myelin_git::events::GIT_PR_HEAD_TRIGGER_SCHEMA_V2 {
+            return Err(SkipReason::InvalidProvenance(
+                "PR head-trigger event did not pass the required schema upcaster".into(),
+            ));
+        }
+        let generation = p
+            .get("head_generation")
+            .and_then(|value| value.as_i64())
+            .filter(|generation| *generation > 0)
+            .ok_or_else(|| {
+                SkipReason::InvalidProvenance(
+                    "PR `head_generation` must be a positive signed 64-bit integer".into(),
+                )
+            })?;
+        let base_ref = p
+            .get("base_ref")
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                SkipReason::InvalidProvenance("PR `base_ref` must name a canonical branch".into())
+            })?;
+        let base_ref = myelin_git::receive_pack::RefName::new(base_ref);
+        if !base_ref.0.starts_with("refs/heads/") || base_ref.validate().is_err() {
+            return Err(SkipReason::InvalidProvenance(
+                "PR `base_ref` must name a canonical branch".into(),
+            ));
+        }
+        ("head_oid", Some(base_ref.0), Some(group), Some(generation))
+    };
 
     let raw_oid = p
         .get(oid_field)
@@ -1120,6 +1134,8 @@ mod tests {
         ev.payload = serde_json::json!({
             "repo": "web",
             "number": 42,
+            "base_ref": "refs/heads/main",
+            "head_ref": "refs/heads/feature/ci",
             "head_oid": TEST_OID,
             "head_generation": 1,
         });
@@ -1657,6 +1673,17 @@ mod tests {
             pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
         invalid_number.payload["number"] = serde_json::json!(0);
         cases.push(invalid_number);
+        let mut missing_base_ref =
+            pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        missing_base_ref
+            .payload
+            .as_object_mut()
+            .unwrap()
+            .remove("base_ref");
+        cases.push(missing_base_ref);
+        let mut tag_base_ref = pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
+        tag_base_ref.payload["base_ref"] = serde_json::json!("refs/tags/release");
+        cases.push(tag_base_ref);
         let oversized_repo = "a".repeat(510);
         let mut oversized_group =
             pr_envelope(GIT_PR_OPENED, serde_json::json!({ "is_fork": false }));
@@ -2005,6 +2032,11 @@ mod tests {
         assert_eq!(armed.handoff.run_write.trust_tier, "untrusted_fork");
         assert_eq!(armed.handoff.run_write.trigger_kind, "pull_request");
         assert_eq!(
+            armed.reserve.source_ref.as_deref(),
+            Some("refs/heads/main"),
+            "a PR run carries its target branch into automation matching"
+        );
+        assert_eq!(
             armed.reserve.concurrency_group.as_deref(),
             Some("pr:web:42")
         );
@@ -2016,6 +2048,10 @@ mod tests {
             Some("pr:web:42")
         );
         assert_eq!(ci_run_insert_from_armed(&armed).pr_head_generation, Some(1));
+        assert_eq!(
+            ci_run_insert_from_armed(&armed).source_ref.as_deref(),
+            Some("refs/heads/main")
+        );
         for c in &armed.handoff.queued_checks {
             assert_eq!(
                 c.payload["trust_tier"], "untrusted_fork",

@@ -239,7 +239,8 @@ envelope fields such as `event.depth` and scalar payload fields such as `payload
 using `==`, `!=`, `<`, `<=`, `>`, `>=`, `AND`, `OR`, `NOT`, and parentheses. A missing or
 wrongly-typed field closes only that rule as a non-match; it cannot prevent another automation
 from seeing the event. `--branch main` remains concise sugar for
-`payload.source_ref == 'refs/heads/main'`.
+`payload.source_ref == 'refs/heads/main'`. CI runs keep that scope consistent: it is the pushed
+branch for push runs and the target branch for pull-request runs.
 
 Issue responses include a canonical `myelin://...` reference that can be passed directly to
 `chat ref`. The conversation keeps a live pointer to the issue rather than copying a stale

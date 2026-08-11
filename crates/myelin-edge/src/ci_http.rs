@@ -492,6 +492,7 @@ fn run_json(run: &CiRunSummary) -> Value {
         "run_id": run.run_id,
         "pipeline_id": run.pipeline_id,
         "repo_ref": run.repo_ref,
+        "source_ref": run.source_ref,
         "commit_oid": run.commit_oid,
         "trigger_kind": run.trigger_kind,
         "trust_tier": run.trust_tier,

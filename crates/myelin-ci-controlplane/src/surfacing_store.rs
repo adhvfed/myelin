@@ -26,6 +26,7 @@ SELECT
   candidate.run_id,
   candidate.pipeline_id,
   candidate.repo_ref,
+  candidate.source_ref,
   candidate.commit_oid,
   candidate.trigger_kind,
   candidate.trust_tier,
@@ -40,6 +41,7 @@ CROSS JOIN LATERAL (
     run_id AS sort_run_id,
     pipeline_id::text AS pipeline_id,
     repo_ref,
+    source_ref,
     commit_oid,
     trigger_kind,
     trust_tier,
@@ -85,6 +87,7 @@ SELECT
   run_id::text AS run_id,
   pipeline_id::text AS pipeline_id,
   repo_ref,
+  source_ref,
   commit_oid,
   trigger_kind,
   trust_tier,
@@ -292,6 +295,7 @@ pub struct CiRunSummary {
     pub run_id: String,
     pub pipeline_id: String,
     pub repo_ref: String,
+    pub source_ref: Option<String>,
     pub commit_oid: Option<String>,
     pub trigger_kind: String,
     pub trust_tier: String,
@@ -1010,6 +1014,7 @@ fn run_from_row(row: sqlx::postgres::PgRow) -> CiRunSummary {
         run_id: row.get("run_id"),
         pipeline_id: row.get("pipeline_id"),
         repo_ref: row.get("repo_ref"),
+        source_ref: row.get("source_ref"),
         commit_oid: row.get("commit_oid"),
         trigger_kind: row.get("trigger_kind"),
         trust_tier: row.get("trust_tier"),
@@ -1178,5 +1183,11 @@ mod tests {
         assert!(LIST_CI_RUNS_QUERY
             .contains("ORDER BY candidate.sort_created_at DESC, candidate.sort_run_id DESC"));
         assert!(!LIST_CI_RUNS_QUERY.to_ascii_lowercase().contains("offset"));
+    }
+
+    #[test]
+    fn branch_scope_is_visible_on_both_run_surfaces() {
+        assert!(LIST_CI_RUNS_QUERY.contains("candidate.source_ref"));
+        assert!(SELECT_CI_SURFACE_RUN_QUERY.contains("source_ref"));
     }
 }

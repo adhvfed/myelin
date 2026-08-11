@@ -14,6 +14,14 @@ image = "registry.example/test@sha256:ffeeddccbbaa000000000000000000000000000000
 command = ["true"]
 `;
 
+const pullRequestPipeline = `on = "pull_request"
+
+[[jobs]]
+name = "contract"
+image = "registry.example/test@sha256:ffeeddccbbaa0000000000000000000000000000000000000000000000000000"
+command = ["true"]
+`;
+
 describe.sequential("CI delivery lifecycle", () => {
   const slug = uniqueName("system-ci");
   const project = new GitProject(slug, systemClient);
@@ -50,6 +58,44 @@ describe.sequential("CI delivery lifecycle", () => {
       cost_settled: false,
     });
     expect(run.run_id).toMatch(/^[0-9a-f-]{36}$/);
+  });
+
+  test("keeps a pull request tied to the branch its automation protects", async () => {
+    const feature = uniqueName("feature/branch-scoped-ci");
+    const pullRequestCommit = (await project.updateFile(
+      feature,
+      ".myelin/ci.toml",
+      pullRequestPipeline,
+      { startRef: "main" },
+    )).commitOid;
+    await systemClient.json(`${project.path}/prs`, {
+      method: "POST",
+      body: {
+        title: "Exercise branch-scoped pull request CI",
+        base_ref: "refs/heads/main",
+        head_ref: `refs/heads/${feature}`,
+        head_oid: pullRequestCommit,
+        reviewers: [],
+      },
+      expectedStatus: 201,
+    });
+
+    const pullRequestRun = await eventually<JsonRecord>(
+      async () => {
+        const response = await systemClient.json("/v1/ci/runs?state=all&limit=100");
+        return array(response.body.items, "CI runs after opening a pull request")
+          .map((item) => record(item, "pull request CI run"))
+          .find((item) => item.repo_ref === repoRef && item.commit_oid === pullRequestCommit);
+      },
+      { description: "the pull request CI run to retain its target branch" },
+    );
+    expect(pullRequestRun).toMatchObject({
+      repo_ref: repoRef,
+      source_ref: "refs/heads/main",
+      commit_oid: pullRequestCommit,
+      trigger_kind: "pull_request",
+      state: "queued",
+    });
   });
 
   test("surfaces the queued run while local execution is intentionally disabled", async () => {

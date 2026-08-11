@@ -5,12 +5,14 @@ mod common;
 use common::with_schema_cleanup;
 use myelin_ci_controlplane::{
     ci_controlplane_hot_tables, ci_controlplane_migrations,
-    CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID,
-    CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID, CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID,
-    CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID, CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID,
-    CI_RUN_SOURCE_REF_MIGRATION_ID, CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID,
-    CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID,
-    CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID, CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID,
+    CI_JOB_QUEUE_CLAIM_AUTHORITY_MIGRATION_ID, CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
+    CI_RUN_BRANCH_SCOPE_EXPAND_MIGRATION_ID, CI_RUN_BRANCH_SCOPE_VALIDATE_MIGRATION_ID,
+    CI_RUN_CONCURRENCY_GROUP_MIGRATION_ID, CI_RUN_PR_HEAD_GENERATION_MIGRATION_ID,
+    CI_RUN_QUEUED_REGION_INDEX_MIGRATION_ID, CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID,
+    CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID, CI_RUN_SOURCE_REF_MIGRATION_ID,
+    CI_RUN_SURFACE_REPO_CREATED_INDEX_MIGRATION_ID, CI_SCHEDULER_CI_RUN_DISCOVERY_MIGRATION_ID,
+    CI_SCHEDULER_CI_WORKFLOW_DISCOVERY_MIGRATION_ID, CI_SCHEDULER_CLAIM_NONCE_GRANT_MIGRATION_ID,
+    CI_WORKFLOW_ACTIVE_REGION_INDEX_MIGRATION_ID,
 };
 use myelin_storage::{migration::HotTables, PgMigrator};
 use myelin_substrate::Migrations;
@@ -56,6 +58,9 @@ const NEW_SUB_MIGRATION_IDS: &[&str] = &[
     CI_RUN_SOURCE_REF_MIGRATION_ID,
     CI_RUN_SOURCE_REF_CONSTRAINT_MIGRATION_ID,
     CI_RUN_SOURCE_REF_CONSTRAINT_VALIDATE_MIGRATION_ID,
+    CI_RUN_BRANCH_SCOPE_EXPAND_MIGRATION_ID,
+    CI_RUN_BRANCH_SCOPE_VALIDATE_MIGRATION_ID,
+    CI_RUN_BRANCH_SCOPE_CONTRACT_MIGRATION_ID,
 ];
 
 fn old_sequence() -> Migrations {
@@ -218,10 +223,28 @@ async fn forward_upgrades_preserve_history_and_repair_intermediate_source_refs()
             .expect("the upgrade installs the named source-ref contract");
             assert!(validated, "the repaired contract is validated before boot");
             assert!(
-        definition.contains("trigger_kind = 'push'::text")
-            && definition.contains("^refs/heads/"),
-        "the named contract guards both trigger provenance and branch-ref shape: {definition}"
-    );
+                definition.contains("'push'::text")
+                    && definition.contains("'pull_request'::text")
+                    && definition.contains("^refs/heads/"),
+                "the named contract guards both CI trigger kinds and branch-ref shape: {definition}"
+            );
+
+            pool.execute(
+                "INSERT INTO ci_run (\
+                   tenant_id, region, run_id, project_id, pipeline_id, wf_run_id, source_ref, \
+                   definition_snapshot, trigger_kind, concurrency_group, pr_head_generation, \
+                   trust_tier, state, correlation_id\
+                 ) VALUES (\
+                   'upgrade-tenant', 'fr-par', '10000000-0000-0000-0000-000000000002', \
+                   '20000000-0000-0000-0000-000000000002', \
+                   '30000000-0000-0000-0000-000000000002', \
+                   '40000000-0000-0000-0000-000000000002', \
+                   'refs/heads/main', 'blake3:pr-snapshot', 'pull_request', 'pr:upgrade:2', 1, \
+                   'trusted', 'queued', 'upgrade-pr-branch-scope'\
+                 )",
+            )
+            .await
+            .expect("a pull request targeting main retains main as its automation branch scope");
 
             let rejected = pool
                 .execute(
