@@ -6,8 +6,8 @@ use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
 use crate::reserve_settle::{
-    CostEvent, MeteredUnit, MicroUsd, Reservation, ReservationState, ReserveError, RunId,
-    SettleError, SettleOutcome,
+    CostEvent, LedgerUnavailable, MeteredUnit, MicroUsd, Reservation, ReservationState,
+    ReserveError, RunId, SettleError, SettleOutcome,
 };
 
 pub const COST_LEDGER_MIGRATION: &str = "\
@@ -110,12 +110,12 @@ impl DurableCostLedger {
         self.provider.config().region.clone()
     }
 
-    fn block<T>(&self, fut: impl std::future::Future<Output = Result<T, ProviderError>>) -> T {
-        tokio::task::block_in_place(|| self.rt.block_on(fut)).unwrap_or_else(|e| {
-            panic!(
-                "FAIL-STATIC: durable cost ledger store fault (the cost row did not commit): {e}"
-            )
-        })
+    fn block<T>(
+        &self,
+        fut: impl std::future::Future<Output = Result<T, ProviderError>>,
+    ) -> Result<T, LedgerUnavailable> {
+        tokio::task::block_in_place(|| self.rt.block_on(fut))
+            .map_err(|error| LedgerUnavailable::new(error.to_string()))
     }
 
     pub fn reserve(
@@ -128,32 +128,32 @@ impl DurableCostLedger {
         let region = self.region();
         let tenant_s = tenant.0.clone();
         let run_s = run.0.clone();
-        let res: Result<Reservation, ReserveError> = self.block(self.provider.with_tenant_tx(
-            &tenant.0.clone(),
-            move |conn| {
-                let tenant = tenant;
-                let run = run;
-                Box::pin(async move {
-                    let exists: bool = sqlx::query_scalar(
-                        "SELECT EXISTS (SELECT 1 FROM cost_reservation \
+        self.block(
+            self.provider
+                .with_tenant_tx(&tenant.0.clone(), move |conn| {
+                    let tenant = tenant;
+                    let run = run;
+                    Box::pin(async move {
+                        let exists: bool = sqlx::query_scalar(
+                            "SELECT EXISTS (SELECT 1 FROM cost_reservation \
                          WHERE tenant_id = $1 AND region = $2 AND run_id = $3)",
-                    )
-                    .bind(&tenant_s)
-                    .bind(&region)
-                    .bind(&run_s)
-                    .fetch_one(&mut *conn)
-                    .await
-                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                    if exists {
-                        return Ok(Err(ReserveError::DuplicateReservation));
-                    }
-                    if available < amount {
-                        return Ok(Err(ReserveError::InsufficientBalance {
-                            requested: amount,
-                            available,
-                        }));
-                    }
-                    sqlx::query(
+                        )
+                        .bind(&tenant_s)
+                        .bind(&region)
+                        .bind(&run_s)
+                        .fetch_one(&mut *conn)
+                        .await
+                        .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
+                        if exists {
+                            return Ok(Err(ReserveError::DuplicateReservation));
+                        }
+                        if available < amount {
+                            return Ok(Err(ReserveError::InsufficientBalance {
+                                requested: amount,
+                                available,
+                            }));
+                        }
+                        sqlx::query(
                         "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state) \
                          VALUES ($1, $2, $3, $4, $5)",
                     )
@@ -165,16 +165,16 @@ impl DurableCostLedger {
                     .execute(&mut *conn)
                     .await
                     .map_err(|e| crate::pg::PgError::Query(e.to_string()))?;
-                    Ok(Ok(Reservation {
-                        tenant,
-                        run,
-                        reserved: amount,
-                        state: ReservationState::Reserved,
-                    }))
-                })
-            },
-        ));
-        res
+                        Ok(Ok(Reservation {
+                            tenant,
+                            run,
+                            reserved: amount,
+                            state: ReservationState::Reserved,
+                        }))
+                    })
+                }),
+        )
+        .map_err(ReserveError::StoreUnavailable)?
     }
 
     pub fn begin(&self, tenant: &TenantId, run: &RunId) -> Result<(), SettleError> {
@@ -184,6 +184,7 @@ impl DurableCostLedger {
         self.block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
             Box::pin(async move { begin_on_conn(conn, &tenant_s, &region, &run_s).await })
         }))
+        .map_err(SettleError::StoreUnavailable)?
     }
 
     pub async fn begin_in_tx(
@@ -211,6 +212,7 @@ impl DurableCostLedger {
         self.block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
             Box::pin(async move { settle_on_conn(conn, &tenant_s, &region, &run_s, &units).await })
         }))
+        .map_err(SettleError::StoreUnavailable)?
     }
 
     pub async fn settle_in_tx(
@@ -367,14 +369,23 @@ impl DurableCostLedger {
                 }
             })
         }))
+        .map_err(SettleError::StoreUnavailable)?
     }
 
-    pub fn state_of(&self, tenant: &TenantId, run: &RunId) -> Option<ReservationState> {
+    pub fn state_of(
+        &self,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<Option<ReservationState>, LedgerUnavailable> {
         self.reservation_of(tenant, run)
-            .map(|reservation| reservation.state)
+            .map(|reservation| reservation.map(|reservation| reservation.state))
     }
 
-    pub fn reservation_of(&self, tenant: &TenantId, run: &RunId) -> Option<Reservation> {
+    pub fn reservation_of(
+        &self,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<Option<Reservation>, LedgerUnavailable> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
         let run_s = run.0.clone();
@@ -412,24 +423,30 @@ impl DurableCostLedger {
     pub fn outstanding_reservations(&self, tenant: &TenantId) -> Result<MicroUsd, ReserveError> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
-        let sum: i64 = self.block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
-            Box::pin(async move {
-                sqlx::query_scalar(
-                    "SELECT COALESCE(SUM(reserved), 0)::bigint FROM cost_reservation \
+        let sum: i64 = self
+            .block(self.provider.with_tenant_tx(&tenant.0, move |conn| {
+                Box::pin(async move {
+                    sqlx::query_scalar(
+                        "SELECT COALESCE(SUM(reserved), 0)::bigint FROM cost_reservation \
                      WHERE tenant_id = $1 AND region = $2 \
                        AND state IN ('reserved', 'inflight')",
-                )
-                .bind(&tenant_s)
-                .bind(&region)
-                .fetch_one(&mut *conn)
-                .await
-                .map_err(|e| crate::pg::PgError::Query(e.to_string()))
-            })
-        }));
+                    )
+                    .bind(&tenant_s)
+                    .bind(&region)
+                    .fetch_one(&mut *conn)
+                    .await
+                    .map_err(|e| crate::pg::PgError::Query(e.to_string()))
+                })
+            }))
+            .map_err(ReserveError::StoreUnavailable)?;
         Ok(MicroUsd(sum as u64))
     }
 
-    pub fn cost_events_for(&self, tenant: &TenantId, run: &RunId) -> Vec<CostEvent> {
+    pub fn cost_events_for(
+        &self,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<Vec<CostEvent>, LedgerUnavailable> {
         let region = self.region();
         let tenant_s = tenant.0.clone();
         let run_s = run.0.clone();

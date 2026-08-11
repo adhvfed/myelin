@@ -168,14 +168,14 @@ fn ag_d11_runaway_mock_loop_stops_at_the_wallet_never_interrupting() {
         let run = RunId::new(format!("runaway-{i}"));
         assert_eq!(
             ledger.state_of(&tenant(), &run),
-            Some(ReservationState::Settled),
+            Ok(Some(ReservationState::Settled)),
             "completed run {i} settled cleanly"
         );
     }
     for i in 5..12u32 {
         let run = RunId::new(format!("runaway-{i}"));
         assert!(
-            ledger.state_of(&tenant(), &run).is_none(),
+            ledger.state_of(&tenant(), &run).unwrap().is_none(),
             "refused run {i} never reserved"
         );
     }
@@ -208,7 +208,7 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
         .expect("the live run is funded and dispatched");
     assert_eq!(
         ledger.state_of(&tenant(), &RunId::new("live")),
-        Some(ReservationState::InFlight)
+        Ok(Some(ReservationState::InFlight))
     );
 
     let brain = runaway_brain();
@@ -259,7 +259,7 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
 
     assert_eq!(
         ledger.state_of(&tenant(), &RunId::new("live")),
-        Some(ReservationState::InFlight),
+        Ok(Some(ReservationState::InFlight)),
         "the live run kept running - the runaway refusals never touched it"
     );
     assert_eq!(
@@ -271,7 +271,7 @@ fn ag_d11_a_live_in_flight_run_survives_an_exhausted_wallet() {
         .expect("the live run settles on its own completion");
     assert_eq!(
         ledger.state_of(&tenant(), &RunId::new("live")),
-        Some(ReservationState::Settled)
+        Ok(Some(ReservationState::Settled))
     );
 }
 

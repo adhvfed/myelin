@@ -1,12 +1,13 @@
 #![cfg(feature = "integration")]
 
 use myelin_config::MyelinConfig;
+use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError};
 use myelin_storage::encryption::SubjectId;
 use myelin_storage::migration::HotTables;
 use myelin_storage::reerase::PostRestoreErasureLedger;
 use myelin_storage::reerase_durable::{post_pit_durable_migrations, DurablePostPitLedger};
 use myelin_storage::reserve_settle::{
-    MeteredUnit, MicroUsd, ReservationState, RunId, SettleError,
+    CostLedger, MeteredUnit, MicroUsd, ReservationState, ReserveError, RunId, SettleError,
 };
 use myelin_storage::reserve_settle_durable::{
     reserve_settle_durable_migrations, DurableCostLedger,
@@ -138,11 +139,11 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     let cost2 = DurableCostLedger::new(app_provider().await);
     assert_eq!(
         cost2.state_of(&tenant, &run),
-        Some(ReservationState::Settled),
+        Ok(Some(ReservationState::Settled)),
         "the settled reservation survived reconstruction from a fresh pool"
     );
     assert_eq!(
-        cost2.cost_events_for(&tenant, &run).len(),
+        cost2.cost_events_for(&tenant, &run).unwrap().len(),
         2,
         "the durable cost events survived reconstruction"
     );
@@ -153,7 +154,7 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     assert_eq!(again.billed_total, MicroUsd(400));
     assert_eq!(again.refunded, MicroUsd(600));
     assert_eq!(
-        cost2.cost_events_for(&tenant, &run).len(),
+        cost2.cost_events_for(&tenant, &run).unwrap().len(),
         2,
         "a double-settle records NO further cost events on Pg (no double-charge)"
     );
@@ -164,7 +165,7 @@ async fn mr009b_w6b_storage_ledgers_durable() {
         Err(SettleError::UsageDivergence),
         "an acknowledgement-loss retry cannot alter durable metered units"
     );
-    assert_eq!(cost2.cost_events_for(&tenant, &run).len(), 2);
+    assert_eq!(cost2.cost_events_for(&tenant, &run).unwrap().len(), 2);
 
     assert_eq!(
         cost2.outstanding_reservations(&tenant),
@@ -266,10 +267,10 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     tx.rollback().await.expect("roll back settlement");
     assert_eq!(
         cost2.state_of(&tenant, &run_tx),
-        Some(ReservationState::InFlight),
+        Ok(Some(ReservationState::InFlight)),
         "caller rollback preserves the in-flight reservation"
     );
-    assert!(cost2.cost_events_for(&tenant, &run_tx).is_empty());
+    assert!(cost2.cost_events_for(&tenant, &run_tx).unwrap().is_empty());
 
     let mut tx = app.db_pool().begin().await.expect("begin commit proof tx");
     sqlx::query(
@@ -289,9 +290,9 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     assert_eq!(committed.billed_total, MicroUsd(250));
     assert_eq!(
         cost2.state_of(&tenant, &run_tx),
-        Some(ReservationState::Settled)
+        Ok(Some(ReservationState::Settled))
     );
-    assert_eq!(cost2.cost_events_for(&tenant, &run_tx).len(), 1);
+    assert_eq!(cost2.cost_events_for(&tenant, &run_tx).unwrap().len(), 1);
 
     let run_skip = RunId::new(format!("run-skip-{suffix}"));
     cost2
@@ -322,7 +323,7 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     tx.rollback().await.expect("roll back skip cancellation");
     assert_eq!(
         cost2.state_of(&tenant, &run_skip),
-        Some(ReservationState::Reserved)
+        Ok(Some(ReservationState::Reserved))
     );
 
     let mut tx = app.db_pool().begin().await.expect("begin skip commit tx");
@@ -347,7 +348,7 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     tx.commit().await.expect("commit skip cancellation");
     assert_eq!(
         cost2.state_of(&tenant, &run_skip),
-        Some(ReservationState::Cancelled)
+        Ok(Some(ReservationState::Cancelled))
     );
 
     let run_over = RunId::new(format!("run-over-{suffix}"));
@@ -395,7 +396,7 @@ async fn mr009b_w6b_storage_ledgers_durable() {
     );
     assert_eq!(
         cost2.state_of(&tenant, &run_live),
-        Some(ReservationState::InFlight),
+        Ok(Some(ReservationState::InFlight)),
         "the in-flight run is untouched"
     );
     assert_eq!(
@@ -466,5 +467,77 @@ async fn mr009b_w6b_storage_ledgers_durable() {
             .bind(&region)
             .execute(admin.db_pool())
             .await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unavailable_cost_ledger_refuses_work_without_crashing_the_worker() {
+    let Some(admin) = migrate_admin().await else {
+        return;
+    };
+    let app = app_provider().await;
+    let region = app.config().region.clone();
+    let tenant = TenantId(format!("01J0OUTAGE{}", uniq()));
+    let reserved_run = RunId::new("reserved-before-the-outage");
+    let refused_run = RunId::new("refused-during-the-outage");
+    let mut ledger = CostLedger::with_pg(app.clone());
+
+    ledger
+        .reserve(
+            tenant.clone(),
+            reserved_run.clone(),
+            MicroUsd(100),
+            MicroUsd(1_000),
+        )
+        .expect("the reservation is durable before the simulated outage");
+    app.db_pool().close().await;
+
+    assert!(matches!(
+        ledger.begin(&tenant, &reserved_run),
+        Err(SettleError::StoreUnavailable(_))
+    ));
+    assert!(matches!(
+        ledger.settle(&tenant, &reserved_run, &[]),
+        Err(SettleError::StoreUnavailable(_))
+    ));
+    assert!(matches!(
+        ledger.cancel_unstarted(&tenant, &reserved_run),
+        Err(SettleError::StoreUnavailable(_))
+    ));
+    assert!(ledger.reservation_of(&tenant, &reserved_run).is_err());
+    assert!(ledger.state_of(&tenant, &reserved_run).is_err());
+    assert!(ledger.cost_events_for(&tenant, &reserved_run).is_err());
+    assert!(matches!(
+        ledger.outstanding_reservations(&tenant),
+        Err(ReserveError::StoreUnavailable(_))
+    ));
+
+    let mut gate = AgentRunGate::new();
+    let refusal = gate
+        .dispatch(
+            &mut ledger,
+            tenant.clone(),
+            refused_run,
+            MicroUsd(100),
+            MicroUsd(1_000),
+        )
+        .expect_err("an unavailable ledger refuses the run instead of panicking");
+    assert!(matches!(refusal, DispatchError::StoreUnavailable(_)));
+    assert_eq!(gate.runs_dispatched(), 0, "the run never started");
+    assert_eq!(
+        gate.reserve_refusals(),
+        0,
+        "an outage is not misreported as an exhausted wallet"
+    );
+
+    for table in ["cost_event", "cost_reservation"] {
+        sqlx::query(&format!(
+            "DELETE FROM {table} WHERE tenant_id = $1 AND region = $2"
+        ))
+        .bind(&tenant.0)
+        .bind(&region)
+        .execute(admin.db_pool())
+        .await
+        .expect("clean the outage proof rows");
     }
 }

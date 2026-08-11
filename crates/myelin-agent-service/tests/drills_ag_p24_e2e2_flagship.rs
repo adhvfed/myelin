@@ -408,7 +408,7 @@ fn ag_p24_e2e2_flagship_green_end_to_end() {
     .with_fail_static_w(300);
     let day = 86_400i64;
     let dispatch_token_jti = identity
-        .mint_at_dispatch( 0,  (7 * day) as u64)
+        .mint_at_dispatch(0, (7 * day) as u64)
         .expect("the dispatch mint succeeds (the run starts attributed)")
         .jti
         .clone();
@@ -461,7 +461,7 @@ fn ag_p24_e2e2_flagship_green_end_to_end() {
             &tenant_guard,
             &endpoint,
             &mut budget,
-             BTreeSet::new(),
+            BTreeSet::new(),
             &mut signals,
         );
 
@@ -645,7 +645,10 @@ fn ag_p24_e2e2_flagship_green_end_to_end() {
         "RESERVE/SETTLE BALANCED: reserved (20) == billed (14) + refunded (6)"
     );
     assert_eq!(
-        ledger.cost_events_for(&tenant(), &storage_run).len(),
+        ledger
+            .cost_events_for(&tenant(), &storage_run)
+            .unwrap()
+            .len(),
         3,
         "EXACTLY one cost event per metered unit (3 effects → 3 events)"
     );
@@ -680,7 +683,10 @@ fn ag_p24_e2e2_exhausted_wallet_refuses_to_start() {
         "an exhausted wallet REFUSES to start the run (no balance → no run): {refused:?}"
     );
     assert!(
-        ledger.cost_events_for(&tenant(), &storage_run).is_empty(),
+        ledger
+            .cost_events_for(&tenant(), &storage_run)
+            .unwrap()
+            .is_empty(),
         "a refused dispatch wrote no cost events (the run never ran)"
     );
 }

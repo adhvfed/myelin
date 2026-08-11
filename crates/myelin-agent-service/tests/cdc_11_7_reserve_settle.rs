@@ -1,7 +1,5 @@
 use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError, RunKind};
-use myelin_storage::reserve_settle::{
-    CostLedger, MeteredUnit, MicroUsd, ReservationState, RunId,
-};
+use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MicroUsd, ReservationState, RunId};
 use myelin_tenancy::TenantId;
 
 fn tenant() -> TenantId {
@@ -25,7 +23,7 @@ fn consumer_reserve_at_dispatch_no_balance_no_run() {
     assert_eq!(handle.kind(), RunKind::AgentRun);
     assert_eq!(
         ledger.state_of(&tenant(), &RunId::new("run-funded")),
-        Some(ReservationState::InFlight)
+        Ok(Some(ReservationState::InFlight))
     );
 
     let err = gate
@@ -44,6 +42,7 @@ fn consumer_reserve_at_dispatch_no_balance_no_run() {
     assert!(
         ledger
             .state_of(&tenant(), &RunId::new("run-broke"))
+            .unwrap()
             .is_none(),
         "a refused run leaves NO reservation - it never started"
     );
@@ -98,7 +97,7 @@ fn consumer_settle_on_completion_one_event_per_unit_with_split() {
     );
     assert_eq!(
         ledger.state_of(&tenant(), &RunId::new("run-1")),
-        Some(ReservationState::Settled)
+        Ok(Some(ReservationState::Settled))
     );
 
     let zero = gate
@@ -148,7 +147,7 @@ fn consumer_relies_on_no_interrupt_path_for_in_flight_runs() {
     );
     assert_eq!(
         ledger.state_of(&tenant(), &RunId::new("live")),
-        Some(ReservationState::InFlight),
+        Ok(Some(ReservationState::InFlight)),
         "the run is untouched - still in-flight"
     );
     assert_eq!(
@@ -160,7 +159,7 @@ fn consumer_relies_on_no_interrupt_path_for_in_flight_runs() {
     handle.settle(&mut ledger, &[]).unwrap();
     assert_eq!(
         ledger.state_of(&tenant(), &RunId::new("live")),
-        Some(ReservationState::Settled)
+        Ok(Some(ReservationState::Settled))
     );
 }
 

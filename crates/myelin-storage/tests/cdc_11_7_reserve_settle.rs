@@ -1,6 +1,6 @@
 use myelin_storage::{
-    AgentRunGate, CostLedger, DispatchError, MeteredUnit, MicroUsd, ReservationState,
-    ReserveError, RunId, RunKind, SettleError,
+    AgentRunGate, CostLedger, DispatchError, MeteredUnit, MicroUsd, ReservationState, ReserveError,
+    RunId, RunKind, SettleError,
 };
 use myelin_tenancy::TenantId;
 
@@ -81,7 +81,7 @@ fn dispatch_refused_on_no_balance() {
         .expect_err("an unfunded dispatch is refused");
     assert!(matches!(err, ReserveError::InsufficientBalance { .. }));
     assert!(
-        dispatcher.ledger.state_of(&tenant, &run).is_none(),
+        dispatcher.ledger.state_of(&tenant, &run).unwrap().is_none(),
         "a refused dispatch leaves NO reservation - the run never started"
     );
 }
@@ -98,7 +98,7 @@ fn in_flight_run_is_never_interrupted() {
     assert!(err.is_err(), "an in-flight run is never cancelled");
     assert_eq!(
         dispatcher.ledger.state_of(&tenant, &run),
-        Some(ReservationState::InFlight)
+        Ok(Some(ReservationState::InFlight))
     );
     assert_eq!(
         dispatcher.ledger.inflight_interrupt_count(),
@@ -126,7 +126,7 @@ fn gate_fronts_every_run_reserve_then_settle_through_the_handle() {
     assert_eq!(handle.kind(), RunKind::AgentRun);
     assert_eq!(
         ledger.state_of(&tenant, &run),
-        Some(ReservationState::InFlight)
+        Ok(Some(ReservationState::InFlight))
     );
 
     let outcome = handle
@@ -162,7 +162,7 @@ fn gate_refuses_dispatch_on_no_balance_no_handle_minted() {
         .expect_err("an unfunded dispatch is refused");
     assert!(matches!(err, DispatchError::NoBalance { .. }));
     assert!(
-        ledger.state_of(&tenant, &run).is_none(),
+        ledger.state_of(&tenant, &run).unwrap().is_none(),
         "no handle, no reservation - the run never started"
     );
     assert_eq!(gate.reserve_refusals(), 1);

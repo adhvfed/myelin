@@ -218,12 +218,7 @@ pub fn run_e2e2_ci_flagship_slice() -> E2eArtifact {
     const ESTIMATE: u64 = 20;
     const WALLET: u64 = 100;
     let reservation = ledger
-        .reserve(
-            tenant(),
-            run.clone(),
-            MicroUsd(ESTIMATE),
-            MicroUsd(WALLET),
-        )
+        .reserve(tenant(), run.clone(), MicroUsd(ESTIMATE), MicroUsd(WALLET))
         .expect("a funded wallet reserves the CI run at dispatch (no balance → no run)");
     let reserved_estimate = reservation.reserved == MicroUsd(ESTIMATE);
     ledger
@@ -249,7 +244,9 @@ pub fn run_e2e2_ci_flagship_slice() -> E2eArtifact {
     let reserve_settle_balanced = reserved_estimate
         && billed == 14
         && billed + refunded == ESTIMATE
-        && ledger.cost_events_for(&tenant(), &run).len() == units.len()
+        && ledger
+            .cost_events_for(&tenant(), &run)
+            .is_ok_and(|events| events.len() == units.len())
         && ledger.inflight_interrupt_count() == 0;
     if !reserve_settle_balanced {
         leaks += 1;
@@ -414,7 +411,7 @@ mod tests {
             "reserved == billed + refunded"
         );
         assert_eq!(
-            ledger.cost_events_for(&tenant(), &run).len(),
+            ledger.cost_events_for(&tenant(), &run).unwrap().len(),
             2,
             "one cost event per unit"
         );

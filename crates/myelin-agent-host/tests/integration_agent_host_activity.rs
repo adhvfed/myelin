@@ -416,7 +416,9 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
     assert_eq!(provider_calls.load(Ordering::SeqCst), 1);
     assert_eq!(
         CostLedger::with_pg(app.clone()).state_of(&tenant, &RunId::new(run_id.clone())),
-        Some(myelin_storage::reserve_settle::ReservationState::Settled)
+        Ok(Some(
+            myelin_storage::reserve_settle::ReservationState::Settled
+        ))
     );
     let trace_tenant = tenant.0.clone();
     let trace_run = run_id.clone();
@@ -621,7 +623,7 @@ async fn an_expired_hosted_approval_settles_once_and_leaves_no_actionable_card()
     );
     assert_eq!(
         CostLedger::with_pg(app.clone()).state_of(&tenant, &cost_run),
-        Some(ReservationState::Settled),
+        Ok(Some(ReservationState::Settled)),
     );
     for target in agent_effect_approval_targets(&tenant, &region, &gate) {
         assert_eq!(

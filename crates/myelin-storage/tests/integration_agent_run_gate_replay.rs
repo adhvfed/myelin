@@ -73,7 +73,11 @@ async fn a_restarted_workflow_resumes_its_exact_cost_reservation() {
 
     assert_eq!(resumed.reserved(), MicroUsd(250_000));
     assert_eq!(
-        restarted_ledger.reservation_of(&tenant, &run).unwrap().state,
+        restarted_ledger
+            .reservation_of(&tenant, &run)
+            .unwrap()
+            .unwrap()
+            .state,
         ReservationState::InFlight,
         "the restart continued the original row instead of inventing another reservation",
     );

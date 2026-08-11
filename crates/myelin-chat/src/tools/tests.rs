@@ -191,7 +191,10 @@ fn no_balance_means_no_post_the_reserve_refuses() {
         ),
         "no balance → no post (the runaway self-limiter)"
     );
-    assert!(ledger.state_of(&tenant(), &RunId::new("run-1")).is_none());
+    assert!(ledger
+        .state_of(&tenant(), &RunId::new("run-1"))
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -199,14 +202,9 @@ fn a_funded_spend_bearing_post_reserves_then_settles_within_the_reserve() {
     let mut ledger = CostLedger::new();
     let estimate = PostCostEstimate(MicroUsd(50));
     let run = RunId::new("run-2");
-    let reservation = reserve_spend_bearing_post(
-        &mut ledger,
-        tenant(),
-        run.clone(),
-        estimate,
-        MicroUsd(100),
-    )
-    .expect("a funded post reserves");
+    let reservation =
+        reserve_spend_bearing_post(&mut ledger, tenant(), run.clone(), estimate, MicroUsd(100))
+            .expect("a funded post reserves");
     assert_eq!(reservation.reserved, MicroUsd(50));
 
     ledger.begin(&tenant(), &run).expect("begin");
@@ -247,6 +245,7 @@ fn dry_run_is_side_effect_free_the_ledger_is_unchanged() {
     let ledger = CostLedger::new();
     let before = ledger
         .cost_events_for(&tenant(), &RunId::new("run-3"))
+        .unwrap()
         .len();
 
     let plan = dry_run_chat_tools(CHAT_TOOL_NAMES);
@@ -256,6 +255,7 @@ fn dry_run_is_side_effect_free_the_ledger_is_unchanged() {
 
     let after = ledger
         .cost_events_for(&tenant(), &RunId::new("run-3"))
+        .unwrap()
         .len();
     assert_eq!(before, after, "a dry-run reserves/meters NOTHING");
 }

@@ -1,6 +1,6 @@
 use crate::reserve_settle::{
-    CostLedger, MeteredUnit, MicroUsd, ReservationState, ReserveError, RunId, SettleError,
-    SettleOutcome,
+    CostLedger, LedgerUnavailable, MeteredUnit, MicroUsd, ReservationState, ReserveError, RunId,
+    SettleError, SettleOutcome,
 };
 use myelin_tenancy::TenantId;
 
@@ -19,6 +19,7 @@ pub enum DispatchError {
     },
     AlreadyDispatched,
     AmountOverflow,
+    StoreUnavailable(LedgerUnavailable),
 }
 
 impl From<ReserveError> for DispatchError {
@@ -33,6 +34,7 @@ impl From<ReserveError> for DispatchError {
             },
             ReserveError::DuplicateReservation => DispatchError::AlreadyDispatched,
             ReserveError::AmountOverflow => DispatchError::AmountOverflow,
+            ReserveError::StoreUnavailable(error) => DispatchError::StoreUnavailable(error),
         }
     }
 }
@@ -56,6 +58,10 @@ impl core::fmt::Display for DispatchError {
             DispatchError::AmountOverflow => write!(
                 f,
                 "dispatch refused: integer minor-units arithmetic overflowed u64 (loud, never a silent wrap)"
+            ),
+            DispatchError::StoreUnavailable(error) => write!(
+                f,
+                "dispatch refused: {error}; the run was not started"
             ),
         }
     }
@@ -186,14 +192,21 @@ impl AgentRunGate {
         available: MicroUsd,
         admission: DispatchAdmission,
     ) -> Result<InFlightRun, DispatchError> {
-        let newly_reserved = match ledger.reserve(tenant.clone(), run.clone(), estimate, available) {
+        let newly_reserved = match ledger.reserve(tenant.clone(), run.clone(), estimate, available)
+        {
             Ok(_reservation) => true,
             Err(ReserveError::DuplicateReservation) if admission.may_resume() => {
-                let Some(existing) = ledger.reservation_of(&tenant, &run) else {
+                let Some(existing) = ledger
+                    .reservation_of(&tenant, &run)
+                    .map_err(DispatchError::StoreUnavailable)?
+                else {
                     return Err(DispatchError::AlreadyDispatched);
                 };
                 if existing.reserved != estimate
-                    || !matches!(existing.state, ReservationState::Reserved | ReservationState::InFlight)
+                    || !matches!(
+                        existing.state,
+                        ReservationState::Reserved | ReservationState::InFlight
+                    )
                 {
                     return Err(DispatchError::AlreadyDispatched);
                 }
@@ -212,6 +225,9 @@ impl AgentRunGate {
 
         match ledger.begin(&tenant, &run) {
             Ok(()) => {}
+            Err(SettleError::StoreUnavailable(error)) => {
+                return Err(DispatchError::StoreUnavailable(error));
+            }
             Err(_) => {
                 if newly_reserved {
                     let _ = ledger.cancel_unstarted(&tenant, &run);
@@ -286,7 +302,7 @@ mod tests {
         assert_eq!(handle.reserved(), MicroUsd(1_000));
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
-            Some(ReservationState::InFlight),
+            Ok(Some(ReservationState::InFlight)),
             "the dispatched run is in-flight"
         );
         assert_eq!(gate.runs_dispatched(), 1);
@@ -319,7 +335,11 @@ mod tests {
         assert_eq!(replay.reserved(), first.reserved());
         assert_eq!(gate.runs_dispatched(), 1, "replay is not a second dispatch");
         assert_eq!(
-            ledger.reservation_of(&tenant(), &run(1)).unwrap().reserved,
+            ledger
+                .reservation_of(&tenant(), &run(1))
+                .unwrap()
+                .unwrap()
+                .reserved,
             MicroUsd(1_000),
             "the original reservation remains the only reservation",
         );
@@ -348,7 +368,14 @@ mod tests {
             ),
             Err(DispatchError::AlreadyDispatched),
         );
-        assert_eq!(ledger.reservation_of(&tenant(), &run(1)).unwrap().reserved, MicroUsd(1_000));
+        assert_eq!(
+            ledger
+                .reservation_of(&tenant(), &run(1))
+                .unwrap()
+                .unwrap()
+                .reserved,
+            MicroUsd(1_000)
+        );
     }
 
     #[test]
@@ -372,7 +399,7 @@ mod tests {
             }
         );
         assert!(
-            ledger.state_of(&tenant(), &run(1)).is_none(),
+            ledger.state_of(&tenant(), &run(1)).unwrap().is_none(),
             "a refused dispatch leaves NO reservation - the run never started"
         );
         assert_eq!(gate.reserve_refusals(), 1);
@@ -418,7 +445,7 @@ mod tests {
         assert_eq!(outcome.refunded, MicroUsd(600));
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
-            Some(ReservationState::Settled)
+            Ok(Some(ReservationState::Settled))
         );
     }
 
@@ -441,7 +468,7 @@ mod tests {
         );
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
-            Some(ReservationState::InFlight),
+            Ok(Some(ReservationState::InFlight)),
             "the run is untouched - still in-flight"
         );
         assert_eq!(
@@ -452,7 +479,7 @@ mod tests {
         handle.settle(&mut ledger, &[]).unwrap();
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
-            Some(ReservationState::Settled)
+            Ok(Some(ReservationState::Settled))
         );
     }
 
@@ -471,16 +498,10 @@ mod tests {
             .expect("a funded scheduled job is fronted");
         assert_eq!(handle.kind(), RunKind::ScheduleAndRunJob);
         let err = gate
-            .schedule_and_run_job(
-                &mut ledger,
-                tenant(),
-                run(2),
-                MicroUsd(9_000),
-                MicroUsd(10),
-            )
+            .schedule_and_run_job(&mut ledger, tenant(), run(2), MicroUsd(9_000), MicroUsd(10))
             .expect_err("an over-budget scheduled job is refused");
         assert!(matches!(err, DispatchError::NoBalance { .. }));
-        assert!(ledger.state_of(&tenant(), &run(2)).is_none());
+        assert!(ledger.state_of(&tenant(), &run(2)).unwrap().is_none());
         assert_eq!(gate.reserve_refusals(), 1);
     }
 
@@ -574,7 +595,7 @@ mod tests {
                     spent = spent.checked_add(per_run).unwrap();
                     live_handles.push(handle);
                 }
-                Err(DispatchError::NoBalance { .. }) => {  }
+                Err(DispatchError::NoBalance { .. }) => {}
                 Err(other) => panic!("unexpected dispatch error: {other}"),
             }
         }
@@ -593,7 +614,7 @@ mod tests {
         for h in &live_handles {
             assert_eq!(
                 ledger.state_of(&tenant(), h.run()),
-                Some(ReservationState::InFlight),
+                Ok(Some(ReservationState::InFlight)),
                 "every funded run is still running - none was torn down"
             );
         }

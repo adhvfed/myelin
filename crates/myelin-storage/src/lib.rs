@@ -207,8 +207,8 @@ pub use reerase::{
 };
 pub use replicated_blob::{ReplicaTelemetry, ReplicatedBlobStore};
 pub use reserve_settle::{
-    CostEvent, CostLedger, MeteredUnit, Reservation, ReservationState, ReserveError,
-    ReserveSettleSignal, RunId, SettleError, SettleOutcome,
+    CostEvent, CostLedger, LedgerUnavailable, MeteredUnit, Reservation, ReservationState,
+    ReserveError, ReserveSettleSignal, RunId, SettleError, SettleOutcome,
 };
 pub use residency::{
     verify_region_pinning, RegionPinnedStore, RegionPinningAttestation, ResidencyStoreClass,

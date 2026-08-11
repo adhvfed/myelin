@@ -1,8 +1,8 @@
 use crate::engine::FlowTelemetry;
 use crate::wfctx::WfCtx;
 use myelin_storage::reserve_settle::{
-    CostLedger, MeteredUnit, MicroUsd, ReserveError, RunId as LedgerRunId, SettleError,
-    SettleOutcome,
+    CostLedger, LedgerUnavailable, MeteredUnit, MicroUsd, ReserveError, RunId as LedgerRunId,
+    SettleError, SettleOutcome,
 };
 use myelin_tenancy::TenantId;
 use std::sync::{Arc, Mutex};
@@ -39,6 +39,7 @@ pub enum BudgetError {
     NoSuchReservation,
     UsageDivergence,
     AmountOverflow,
+    StoreUnavailable(LedgerUnavailable),
 }
 
 impl core::fmt::Display for BudgetError {
@@ -67,6 +68,10 @@ impl core::fmt::Display for BudgetError {
             BudgetError::AmountOverflow => {
                 write!(f, "budget arithmetic overflowed u64 (loud, never a silent wrap)")
             }
+            BudgetError::StoreUnavailable(error) => write!(
+                f,
+                "budget operation refused: {error}; the dispatch did not advance"
+            ),
         }
     }
 }
@@ -85,6 +90,7 @@ impl From<ReserveError> for BudgetError {
             },
             ReserveError::DuplicateReservation => BudgetError::DuplicateReservation,
             ReserveError::AmountOverflow => BudgetError::AmountOverflow,
+            ReserveError::StoreUnavailable(error) => BudgetError::StoreUnavailable(error),
         }
     }
 }
@@ -95,6 +101,7 @@ impl From<SettleError> for BudgetError {
             SettleError::NoSuchReservation => BudgetError::NoSuchReservation,
             SettleError::UsageDivergence => BudgetError::UsageDivergence,
             SettleError::AmountOverflow => BudgetError::AmountOverflow,
+            SettleError::StoreUnavailable(error) => BudgetError::StoreUnavailable(error),
         }
     }
 }
@@ -185,7 +192,10 @@ impl BudgetGate {
         units: &[MeteredUnit],
     ) -> Result<BudgetSettle, BudgetError> {
         let mut g = self.lock();
-        let already_settled = g.ledger.state_of(tenant, run)
+        let already_settled = g
+            .ledger
+            .state_of(tenant, run)
+            .map_err(BudgetError::StoreUnavailable)?
             == Some(myelin_storage::reserve_settle::ReservationState::Settled);
         let outcome = g
             .ledger
@@ -211,8 +221,11 @@ impl BudgetGate {
         &self,
         tenant: &TenantId,
         run: &LedgerRunId,
-    ) -> Option<myelin_storage::reserve_settle::ReservationState> {
-        self.lock().ledger.state_of(tenant, run)
+    ) -> Result<Option<myelin_storage::reserve_settle::ReservationState>, BudgetError> {
+        self.lock()
+            .ledger
+            .state_of(tenant, run)
+            .map_err(BudgetError::StoreUnavailable)
     }
 
     pub fn inflight_interrupt_count(&self) -> u64 {
@@ -443,7 +456,7 @@ mod tests {
         );
         let lr = LedgerRunId::new("R1/merge.queue:0");
         assert!(
-            gate.state_of(&tenant(), &lr).is_none(),
+            gate.state_of(&tenant(), &lr).unwrap().is_none(),
             "a refused reserve writes no row"
         );
     }
@@ -472,7 +485,9 @@ mod tests {
         let lr = LedgerRunId::new("R1/merge.queue:0");
         assert_eq!(
             gate.state_of(&tenant(), &lr),
-            Some(myelin_storage::reserve_settle::ReservationState::Settled)
+            Ok(Some(
+                myelin_storage::reserve_settle::ReservationState::Settled
+            ))
         );
     }
 
@@ -665,11 +680,7 @@ mod tests {
                 .unwrap(),
             JobOutcome::Completed { .. }
         ));
-        assert_eq!(
-            gate.balance(),
-            MicroUsd(350),
-            "replay cannot double-refund"
-        );
+        assert_eq!(gate.balance(), MicroUsd(350), "replay cannot double-refund");
         assert_eq!(
             runner.calls.load(Ordering::SeqCst),
             1,
@@ -725,11 +736,7 @@ mod tests {
 
         let units = vec![unit("u", 40, 20)];
         gate.settle(&tenant(), &lr, &units).unwrap();
-        assert_eq!(
-            gate.balance(),
-            MicroUsd(940),
-            "refunded 40 once (900 + 40)"
-        );
+        assert_eq!(gate.balance(), MicroUsd(940), "refunded 40 once (900 + 40)");
         gate.settle(&tenant(), &lr, &units).unwrap();
         assert_eq!(
             gate.balance(),
@@ -844,8 +851,7 @@ mod tests {
         let outbox = OutboxStore::new();
         let journal = WfJournal::new();
         let telemetry = FlowTelemetry::new();
-        let gate =
-            BudgetGate::new(Wallet::new(MicroUsd(1_000))).with_telemetry(telemetry.clone());
+        let gate = BudgetGate::new(Wallet::new(MicroUsd(1_000))).with_telemetry(telemetry.clone());
 
         let mut ctx = begin_ctx(&outbox, journal, gate.clone());
         let err = ctx
@@ -869,7 +875,7 @@ mod tests {
         );
         assert_eq!(
             gate.state_of(&tenant(), &lr),
-            Some(ReservationState::Settled),
+            Ok(Some(ReservationState::Settled)),
             "the reservation settled on exhaustion - never left InFlight"
         );
         assert_eq!(
@@ -952,19 +958,19 @@ mod tests {
         gate.reserve(&tenant(), &lr, MicroUsd(100)).unwrap();
         assert_eq!(
             gate.state_of(&tenant(), &lr),
-            Some(ReservationState::Reserved),
+            Ok(Some(ReservationState::Reserved)),
             "before begin: Reserved (the one teardown-able state)"
         );
         gate.begin(&tenant(), &lr).unwrap();
         assert_eq!(
             gate.state_of(&tenant(), &lr),
-            Some(ReservationState::InFlight),
+            Ok(Some(ReservationState::InFlight)),
             "after begin: InFlight - from here there is NO teardown path (never interrupt)"
         );
         gate.begin(&tenant(), &lr).unwrap();
         assert_eq!(
             gate.state_of(&tenant(), &lr),
-            Some(ReservationState::InFlight)
+            Ok(Some(ReservationState::InFlight))
         );
     }
 

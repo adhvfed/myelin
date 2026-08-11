@@ -3,7 +3,9 @@
 use myelin_config::MyelinConfig;
 use myelin_flow::{BudgetGate, Wallet};
 use myelin_storage::migration::HotTables;
-use myelin_storage::reserve_settle::{MeteredUnit, MicroUsd, ReservationState, RunId as LedgerRunId};
+use myelin_storage::reserve_settle::{
+    MeteredUnit, MicroUsd, ReservationState, RunId as LedgerRunId,
+};
 use myelin_storage::reserve_settle_durable::reserve_settle_durable_migrations;
 use myelin_storage::SubstrateProvider;
 use myelin_tenancy::TenantId;
@@ -60,7 +62,8 @@ async fn w6b2_budget_gate_durable_reserve_settle_events_on_live_pg() {
         MicroUsd(4_000),
         "the wallet is debited by the reserved amount"
     );
-    gate.begin(&tenant, &run).expect("begin (durable) marks in-flight");
+    gate.begin(&tenant, &run)
+        .expect("begin (durable) marks in-flight");
 
     let units = vec![
         MeteredUnit {
@@ -92,14 +95,18 @@ async fn w6b2_budget_gate_durable_reserve_settle_events_on_live_pg() {
     );
     assert_eq!(
         gate.state_of(&tenant, &run),
-        Some(ReservationState::Settled)
+        Ok(Some(ReservationState::Settled))
     );
-    assert_eq!(gate.inflight_interrupt_count(), 0, "0 interrupts (structural)");
+    assert_eq!(
+        gate.inflight_interrupt_count(),
+        0,
+        "0 interrupts (structural)"
+    );
 
     let gate2 = BudgetGate::with_pg(Wallet::new(MicroUsd(5_000)), app_provider().await);
     assert_eq!(
         gate2.state_of(&tenant, &run),
-        Some(ReservationState::Settled),
+        Ok(Some(ReservationState::Settled)),
         "the settled reservation survived fresh-pool reconstruction"
     );
     let again = gate2

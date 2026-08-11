@@ -1,6 +1,6 @@
 use myelin_storage::agent_run_gate::{AgentRunGate, DispatchError, InFlightRun, RunKind};
 use myelin_storage::reserve_settle::{
-    CostLedger, MeteredUnit, MicroUsd, RunId, SettleError, SettleOutcome,
+    CostLedger, LedgerUnavailable, MeteredUnit, MicroUsd, RunId, SettleError, SettleOutcome,
 };
 use myelin_tenancy::TenantId;
 
@@ -40,6 +40,7 @@ pub enum SpendError {
     },
     AlreadyDispatched,
     AmountOverflow,
+    StoreUnavailable(LedgerUnavailable),
     Settle(SettleError),
 }
 
@@ -55,6 +56,7 @@ impl From<DispatchError> for SpendError {
             },
             DispatchError::AlreadyDispatched => SpendError::AlreadyDispatched,
             DispatchError::AmountOverflow => SpendError::AmountOverflow,
+            DispatchError::StoreUnavailable(error) => SpendError::StoreUnavailable(error),
         }
     }
 }
@@ -86,6 +88,10 @@ impl core::fmt::Display for SpendError {
                 f,
                 "spend-bearing Issues run refused: integer minor-units arithmetic overflowed (loud, \
                  never a silent wrap)"
+            ),
+            SpendError::StoreUnavailable(error) => write!(
+                f,
+                "spend-bearing Issues run refused: {error}; the run was not started"
             ),
             SpendError::Settle(e) => write!(f, "spend-bearing Issues run settle failed: {e}"),
         }
@@ -292,7 +298,7 @@ mod tests {
 
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
-            Some(ReservationState::Settled),
+            Ok(Some(ReservationState::Settled)),
             "a completed run settles"
         );
         assert_eq!(gate.runs_dispatched(), 1);
@@ -331,7 +337,7 @@ mod tests {
             "no balance → no start: the agent brain NEVER ran"
         );
         assert!(
-            ledger.state_of(&tenant(), &run(1)).is_none(),
+            ledger.state_of(&tenant(), &run(1)).unwrap().is_none(),
             "a refused run leaves NO reservation - it never started"
         );
         assert_eq!(gate.reserve_refusals(), 1);
@@ -354,7 +360,7 @@ mod tests {
             .expect("a funded run is dispatched");
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
-            Some(ReservationState::InFlight),
+            Ok(Some(ReservationState::InFlight)),
             "the dispatched run is in-flight"
         );
         assert!(
@@ -366,7 +372,7 @@ mod tests {
         assert_eq!(outcome.billed_total, MicroUsd(250));
         assert_eq!(
             ledger.state_of(&tenant(), &run(1)),
-            Some(ReservationState::Settled)
+            Ok(Some(ReservationState::Settled))
         );
     }
 
@@ -437,7 +443,7 @@ mod tests {
         let second = dispatched.settle(&mut ledger, &units(300, 100)).unwrap();
         assert_eq!(first, second, "a double-settle returns the same outcome");
         assert_eq!(
-            ledger.cost_events_for(&tenant(), &run(1)).len(),
+            ledger.cost_events_for(&tenant(), &run(1)).unwrap().len(),
             1,
             "no further cost events on the second settle (no double-charge)"
         );

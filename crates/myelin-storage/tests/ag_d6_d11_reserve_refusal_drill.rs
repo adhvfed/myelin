@@ -31,7 +31,7 @@ fn ag_d11_runaway_loop_stops_at_the_wallet() {
                 spent = spent.checked_add(per_run).unwrap();
                 live.push(handle);
             }
-            Err(DispatchError::NoBalance { .. }) => {  }
+            Err(DispatchError::NoBalance { .. }) => {}
             Err(other) => panic!("unexpected dispatch error: {other}"),
         }
     }
@@ -50,7 +50,7 @@ fn ag_d11_runaway_loop_stops_at_the_wallet() {
     for h in &live {
         assert_eq!(
             ledger.state_of(&tenant(), h.run()),
-            Some(ReservationState::InFlight),
+            Ok(Some(ReservationState::InFlight)),
             "every funded run is still running - none torn down by the refusals"
         );
     }
@@ -160,17 +160,11 @@ fn schedule_and_run_job_fronted_by_the_same_gate() {
     assert_eq!(handle.kind(), RunKind::ScheduleAndRunJob);
 
     let err = gate
-        .schedule_and_run_job(
-            &mut ledger,
-            tenant(),
-            run(2),
-            MicroUsd(9_000),
-            MicroUsd(50),
-        )
+        .schedule_and_run_job(&mut ledger, tenant(), run(2), MicroUsd(9_000), MicroUsd(50))
         .expect_err("an over-budget scheduled job is refused");
     assert!(matches!(err, DispatchError::NoBalance { .. }));
     assert!(
-        ledger.state_of(&tenant(), &run(2)).is_none(),
+        ledger.state_of(&tenant(), &run(2)).unwrap().is_none(),
         "the job was never scheduled"
     );
 
@@ -179,6 +173,6 @@ fn schedule_and_run_job_fronted_by_the_same_gate() {
     handle.settle(&mut ledger, &[]).unwrap();
     assert_eq!(
         ledger.state_of(&tenant(), &run(1)),
-        Some(ReservationState::Settled)
+        Ok(Some(ReservationState::Settled))
     );
 }

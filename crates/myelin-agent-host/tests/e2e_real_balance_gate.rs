@@ -134,6 +134,7 @@ fn insufficient_balance_is_refused_at_dispatch_run_never_starts() {
         wiring
             .ledger
             .state_of(&tenant, &RunId::new("Rrefuse-1"))
+            .unwrap()
             .is_none(),
         "a refused dispatch leaves NO reservation - the run never started"
     );

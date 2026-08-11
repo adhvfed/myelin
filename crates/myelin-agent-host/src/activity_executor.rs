@@ -271,8 +271,9 @@ impl HostedAgentRunExecutor for AgentHostActivityExecutor {
             return Err("hosted activity key belongs to a different run".into());
         }
         let mut ledger = CostLedger::with_pg(self.provider.clone());
-        if let Some(existing) =
-            ledger.reservation_of(&input.tenant, &CostRunId::new(input.run_id.clone()))
+        if let Some(existing) = ledger
+            .reservation_of(&input.tenant, &CostRunId::new(input.run_id.clone()))
+            .map_err(|error| format!("load hosted run cost reservation: {error}"))?
         {
             if existing.state == ReservationState::Settled
                 && existing.reserved.0 == input.budget_minor_units

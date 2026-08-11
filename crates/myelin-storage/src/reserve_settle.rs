@@ -4,6 +4,31 @@ use std::collections::HashMap;
 
 pub use crate::money::MicroUsd;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LedgerUnavailable {
+    detail: String,
+}
+
+impl LedgerUnavailable {
+    pub(crate) fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+
+    pub fn diagnostic(&self) -> &str {
+        &self.detail
+    }
+}
+
+impl core::fmt::Display for LedgerUnavailable {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the durable cost ledger is unavailable")
+    }
+}
+
+impl std::error::Error for LedgerUnavailable {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct RunId(pub String);
 
@@ -65,6 +90,7 @@ pub enum ReserveError {
     },
     DuplicateReservation,
     AmountOverflow,
+    StoreUnavailable(LedgerUnavailable),
 }
 
 impl core::fmt::Display for ReserveError {
@@ -88,6 +114,10 @@ impl core::fmt::Display for ReserveError {
                 f,
                 "reserve refused: integer micro-USD arithmetic overflowed u64 (loud, never a silent wrap)"
             ),
+            ReserveError::StoreUnavailable(error) => write!(
+                f,
+                "reserve refused: {error}; the run was not started"
+            ),
         }
     }
 }
@@ -99,6 +129,7 @@ pub enum SettleError {
     NoSuchReservation,
     UsageDivergence,
     AmountOverflow,
+    StoreUnavailable(LedgerUnavailable),
 }
 
 impl core::fmt::Display for SettleError {
@@ -117,6 +148,9 @@ impl core::fmt::Display for SettleError {
                 f,
                 "settle refused: integer micro-USD arithmetic overflowed u64"
             ),
+            SettleError::StoreUnavailable(error) => {
+                write!(f, "settle refused: {error}; no charge was invented")
+            }
         }
     }
 }
@@ -210,22 +244,35 @@ impl CostLedger {
         }
     }
 
-    pub fn state_of(&self, tenant: &TenantId, run: &RunId) -> Option<ReservationState> {
-        self.reservation_of(tenant, run).map(|reservation| reservation.state)
+    pub fn state_of(
+        &self,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<Option<ReservationState>, LedgerUnavailable> {
+        self.reservation_of(tenant, run)
+            .map(|reservation| reservation.map(|reservation| reservation.state))
     }
 
-    pub fn reservation_of(&self, tenant: &TenantId, run: &RunId) -> Option<Reservation> {
+    pub fn reservation_of(
+        &self,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<Option<Reservation>, LedgerUnavailable> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            CostBackend::Memory(m) => m.reservation_of(tenant, run),
+            CostBackend::Memory(m) => Ok(m.reservation_of(tenant, run)),
             CostBackend::Durable(d) => d.reservation_of(tenant, run),
         }
     }
 
-    pub fn cost_events_for(&self, tenant: &TenantId, run: &RunId) -> Vec<CostEvent> {
+    pub fn cost_events_for(
+        &self,
+        tenant: &TenantId,
+        run: &RunId,
+    ) -> Result<Vec<CostEvent>, LedgerUnavailable> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            CostBackend::Memory(m) => m.cost_events_for(tenant, run),
+            CostBackend::Memory(m) => Ok(m.cost_events_for(tenant, run)),
             CostBackend::Durable(d) => d.cost_events_for(tenant, run),
         }
     }
@@ -421,7 +468,8 @@ impl MemoryCostLedger {
     }
 
     pub fn state_of(&self, tenant: &TenantId, run: &RunId) -> Option<ReservationState> {
-        self.reservation_of(tenant, run).map(|reservation| reservation.state)
+        self.reservation_of(tenant, run)
+            .map(|reservation| reservation.state)
     }
 
     pub fn reservation_of(&self, tenant: &TenantId, run: &RunId) -> Option<Reservation> {
@@ -519,7 +567,7 @@ mod tests {
             }
         );
         assert!(
-            ledger.state_of(&tenant(), &run2).is_none(),
+            ledger.state_of(&tenant(), &run2).unwrap().is_none(),
             "a refused reserve writes NO row - the run never dispatched"
         );
     }
@@ -566,7 +614,7 @@ mod tests {
         let outcome = ledger.settle(&tenant(), &run(), &units).unwrap();
 
         assert_eq!(outcome.cost_events.len(), 2);
-        assert_eq!(ledger.cost_events_for(&tenant(), &run()).len(), 2);
+        assert_eq!(ledger.cost_events_for(&tenant(), &run()).unwrap().len(), 2);
 
         let e0 = &outcome.cost_events[0];
         assert_eq!(e0.wholesale, MicroUsd(120));
@@ -579,7 +627,7 @@ mod tests {
 
         assert_eq!(
             ledger.state_of(&tenant(), &run()),
-            Some(ReservationState::Settled)
+            Ok(Some(ReservationState::Settled))
         );
     }
 
@@ -620,7 +668,7 @@ mod tests {
         let second = ledger.settle(&tenant(), &run(), &units).unwrap();
         assert_eq!(first, second, "a re-settle returns the SAME outcome");
         assert_eq!(
-            ledger.cost_events_for(&tenant(), &run()).len(),
+            ledger.cost_events_for(&tenant(), &run()).unwrap().len(),
             1,
             "no further cost events on re-settle - no double-charge"
         );
@@ -638,7 +686,7 @@ mod tests {
             Err(SettleError::UsageDivergence),
             "ack-loss replay cannot change the recorded units"
         );
-        assert_eq!(ledger.cost_events_for(&tenant(), &run()).len(), 1);
+        assert_eq!(ledger.cost_events_for(&tenant(), &run()).unwrap().len(), 1);
     }
 
     #[test]
@@ -654,7 +702,7 @@ mod tests {
         assert_eq!(err, SettleError::NoSuchReservation);
         assert_eq!(
             ledger.state_of(&tenant(), &run()),
-            Some(ReservationState::InFlight)
+            Ok(Some(ReservationState::InFlight))
         );
         assert_eq!(
             ledger.inflight_interrupt_count(),
@@ -673,7 +721,7 @@ mod tests {
         assert_eq!(refund, MicroUsd(500), "the full reservation is refunded");
         assert_eq!(
             ledger.state_of(&tenant(), &run()),
-            Some(ReservationState::Cancelled)
+            Ok(Some(ReservationState::Cancelled))
         );
     }
 
@@ -739,6 +787,19 @@ mod tests {
         assert!(
             s.contains("never invents a charge"),
             "must be specific: {s}"
+        );
+
+        let outage = LedgerUnavailable::new("pool closed at postgres://secret-host/myelin");
+        assert_eq!(outage.to_string(), "the durable cost ledger is unavailable");
+        assert_eq!(
+            outage.diagnostic(),
+            "pool closed at postgres://secret-host/myelin"
+        );
+        assert!(
+            !ReserveError::StoreUnavailable(outage)
+                .to_string()
+                .contains("secret-host"),
+            "a user-facing refusal does not disclose provider details"
         );
     }
 
@@ -839,12 +900,7 @@ mod tests {
 
         let run_b = RunId::new("01J0RUN_B");
         ledger
-            .reserve(
-                tenant(),
-                run_b.clone(),
-                MicroUsd(1_000),
-                MicroUsd(9_000),
-            )
+            .reserve(tenant(), run_b.clone(), MicroUsd(1_000), MicroUsd(9_000))
             .unwrap();
         ledger.begin(&tenant(), &run_b).unwrap();
         let units_b = vec![MeteredUnit {
@@ -931,16 +987,16 @@ mod tests {
                 .unwrap();
         }
 
-        let events = ledger.cost_events_for(&tenant(), &run());
+        let events = ledger.cost_events_for(&tenant(), &run()).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].wholesale, MicroUsd(100));
-        assert_eq!(ledger.cost_events_for(&tenant(), &run_b).len(), 1);
+        assert_eq!(ledger.cost_events_for(&tenant(), &run_b).unwrap().len(), 1);
         assert_eq!(
-            ledger.cost_events_for(&tenant(), &run_b)[0].wholesale,
+            ledger.cost_events_for(&tenant(), &run_b).unwrap()[0].wholesale,
             MicroUsd(200)
         );
         assert_eq!(
-            ledger.cost_events_for(&other_tenant, &run())[0].wholesale,
+            ledger.cost_events_for(&other_tenant, &run()).unwrap()[0].wholesale,
             MicroUsd(300)
         );
     }
@@ -1000,10 +1056,7 @@ mod tests {
             Ok(MicroUsd(100)),
             "only THIS tenant's outstanding is summed"
         );
-        assert_eq!(
-            ledger.outstanding_reservations(&other),
-            Ok(MicroUsd(500))
-        );
+        assert_eq!(ledger.outstanding_reservations(&other), Ok(MicroUsd(500)));
         assert_eq!(
             ledger.outstanding_reservations(&TenantId::from_token("01J0EMPTY")),
             Ok(MicroUsd::ZERO)
@@ -1036,7 +1089,7 @@ mod tests {
             }
         );
         assert!(
-            ledger.state_of(&tenant(), &run2).is_none(),
+            ledger.state_of(&tenant(), &run2).unwrap().is_none(),
             "the refused second run wrote no reservation"
         );
 

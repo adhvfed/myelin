@@ -57,10 +57,12 @@ fn e2e_dispatch_reserve_complete_settle_balances_the_wallet() {
 
     assert_eq!(
         ledger.state_of(&tenant(), &run(1)),
-        Some(ReservationState::Settled),
+        Ok(Some(ReservationState::Settled)),
         "a completed run settles"
     );
-    let events = ledger.cost_events_for(&tenant(), &run(1));
+    let events = ledger
+        .cost_events_for(&tenant(), &run(1))
+        .expect("the in-memory cost ledger is available");
     assert_eq!(events.len(), 1, "exactly one cost event recorded");
     assert_eq!(events[0].wholesale, MicroUsd(250));
     assert_eq!(events[0].markup, MicroUsd(150));
@@ -100,7 +102,7 @@ fn no_balance_means_the_issues_run_never_starts() {
         "no balance → no start: the agent brain NEVER ran"
     );
     assert!(
-        ledger.state_of(&tenant(), &run(1)).is_none(),
+        ledger.state_of(&tenant(), &run(1)).unwrap().is_none(),
         "a refused run leaves NO reservation in the SHARED ledger"
     );
     assert_eq!(
