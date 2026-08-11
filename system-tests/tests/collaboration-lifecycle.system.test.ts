@@ -1466,6 +1466,40 @@ command = ["true"]
     });
   });
 
+  test("lets one retry key open pull requests in two repositories", async () => {
+    const firstProject = new GitProject(uniqueName("retry-scope-first"), systemClient);
+    const secondProject = new GitProject(uniqueName("retry-scope-second"), systemClient);
+    const retryKey = `open-pr-${randomUUID()}`;
+
+    for (const project of [firstProject, secondProject]) {
+      await project.create();
+      await project.writeFile("main", "README.md", `# ${project.slug}\n`);
+      const headOid = (await project.writeFile(
+        "feature/retry-scope",
+        "change.txt",
+        `A change for ${project.slug}.\n`,
+        { startRef: "main" },
+      )).commitOid;
+
+      const opened = await systemClient.json(`${project.path}/prs`, {
+        method: "POST",
+        body: {
+          title: `Change ${project.slug}`,
+          base_ref: "refs/heads/main",
+          head_ref: "refs/heads/feature/retry-scope",
+          head_oid: headOid,
+          reviewers: [],
+        },
+        idempotencyKey: retryKey,
+        expectedStatus: 201,
+      });
+      expect(opened.body).toMatchObject({
+        durable: true,
+        applied: { action: "git.pr.open", pr: { number: 1 } },
+      });
+    }
+  });
+
   test("moves an issue through authorization, discovery, and completion", async () => {
     const title = uniqueName("Ship the backend lifecycle suite");
     const proposed = await systemClient.json("/v1/issues", {

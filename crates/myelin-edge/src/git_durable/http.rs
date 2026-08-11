@@ -1298,7 +1298,7 @@ impl Handler for DOpenPr {
         } else {
             ctx.request.json_body()?
         };
-        let operation_id = self.be.request_operation_id(ctx.request)?;
+        let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let rec = self
             .be
             .open_pr_with_operation(
@@ -2552,7 +2552,7 @@ impl Handler for DPrReview {
             .get("verdict")
             .and_then(Value::as_str)
             .ok_or_else(|| EdgeError::BadRequest("review body missing `verdict`".into()))?;
-        let operation_id = self.be.request_operation_id(ctx.request)?;
+        let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let rec = self
             .be
             .submit_review_with_operation(
@@ -2582,7 +2582,7 @@ impl Handler for DEndorse {
         } else {
             ctx.request.json_body()?
         };
-        let operation_id = self.be.request_operation_id(ctx.request)?;
+        let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let rec = self
             .be
             .endorse_fork_ci_with_operation(
@@ -2607,7 +2607,7 @@ struct DMerge {
 }
 impl Handler for DMerge {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
-        let operation_id = self.be.request_operation_id(ctx.request)?;
+        let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let attempt = self
             .be
             .merge_with_operation(
@@ -2690,7 +2690,7 @@ struct DReportChecks {
 impl Handler for DReportChecks {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         let body = ctx.request.json_body()?;
-        let operation_id = self.be.request_operation_id(ctx.request)?;
+        let operation_id = self.be.request_operation_id(ctx.request, ctx.principal)?;
         let rec = self
             .be
             .report_checks_with_operation(
@@ -3484,8 +3484,7 @@ mod create_claim_tests {
             release_first_grant: Mutex::new(release_rx),
         });
         let backend = Arc::new(
-            DurableGitBackend::rooted_inmem_for_test(&root)
-                .with_repo_bootstrap(bootstrap.clone()),
+            DurableGitBackend::rooted_inmem_for_test(&root).with_repo_bootstrap(bootstrap.clone()),
         );
         let starting_line = Arc::new(Barrier::new(3));
 
@@ -3512,7 +3511,10 @@ mod create_claim_tests {
         );
         release_tx.send(()).unwrap();
 
-        let mut outcomes = vec![first.join().unwrap().unwrap(), second.join().unwrap().unwrap()];
+        let mut outcomes = vec![
+            first.join().unwrap().unwrap(),
+            second.join().unwrap().unwrap(),
+        ];
         outcomes.sort_unstable();
         assert_eq!(outcomes, vec![false, true]);
         assert_eq!(

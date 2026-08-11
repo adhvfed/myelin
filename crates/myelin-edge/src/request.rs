@@ -309,6 +309,18 @@ mod tests {
             request.stable_idempotency_nonce("svc:other").unwrap(),
             "one caller cannot collide with another caller's retry namespace"
         );
+        let another_route = EdgeRequest::new(
+            "POST",
+            "/v1/another-example",
+            "",
+            vec![("Idempotency-Key".into(), "retry/key:42".into())],
+            Vec::new(),
+        );
+        assert_ne!(
+            nonce,
+            another_route.stable_idempotency_nonce("svc:agent").unwrap(),
+            "the same public key remains local to one operation route"
+        );
 
         for key in ["", "contains space", "ø", &"x".repeat(129)] {
             let request = EdgeRequest::new(

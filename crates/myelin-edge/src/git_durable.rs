@@ -652,14 +652,16 @@ impl DurableGitBackend {
         PrOperationId::parse(&format!("internal-{}", self.minter.mint().0))
     }
 
-    fn request_operation_id(&self, request: &EdgeRequest) -> Result<PrOperationId, EdgeError> {
+    fn request_operation_id(
+        &self,
+        request: &EdgeRequest,
+        principal: &Principal,
+    ) -> Result<PrOperationId, EdgeError> {
         if self.pg_prs.is_none() {
             return self.fresh_operation_id().map_err(map_durable_err);
         }
-        let value = request.header("idempotency-key").ok_or_else(|| {
-            EdgeError::BadRequest("production PR writes require an `Idempotency-Key` header".into())
-        })?;
-        PrOperationId::parse(value)
+        let nonce = request.stable_idempotency_nonce(&principal.principal_id.0)?;
+        PrOperationId::parse(&nonce)
             .map_err(|_| EdgeError::BadRequest("invalid `Idempotency-Key` header".into()))
     }
 
