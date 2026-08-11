@@ -320,6 +320,7 @@ fn map_edge_error(error: EdgeError) -> DirectReadError {
         }
         EdgeError::Conflict(_)
         | EdgeError::PayloadTooLarge(_)
+        | EdgeError::TooManyRequests(_)
         | EdgeError::RequestTimeout(_)
         | EdgeError::Unavailable(_)
         | EdgeError::Internal(_) => DirectReadError::Unavailable,

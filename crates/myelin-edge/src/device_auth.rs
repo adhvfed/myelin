@@ -15,11 +15,14 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 
 pub const DEVICE_AUTHORIZATION_TTL_SECS: i64 = 10 * 60;
 pub const DEVICE_AUTHORIZATION_POLL_INTERVAL_SECS: u64 = 2;
+pub const DEVICE_AUTHORIZATION_MAX_OUTSTANDING: u64 = 2_048;
+pub const DEVICE_AUTHORIZATION_MAX_STARTS_PER_MINUTE: u64 = 300;
 pub const DEVICE_AUTHORIZATION_TABLE: &str = "auth_device_authorization";
 
 const SECRET_BYTES: usize = 32;
 const SECRET_B64URL_LEN: usize = 43;
 const USER_CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const DEVICE_AUTHORIZATION_RATE_WINDOW_SECS: i64 = 60;
 
 const DEVICE_AUTHORIZATION_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS auth_device_authorization (
@@ -120,6 +123,71 @@ pub(crate) enum ClaimOutcome {
     Invalid,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IssueOutcome {
+    Issued,
+    Collision,
+    Limited { retry_after_secs: u64 },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StartPolicy {
+    max_outstanding: u64,
+    max_starts_per_window: u64,
+    window_secs: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StartPressure {
+    outstanding: u64,
+    earliest_expiry: Option<i64>,
+    recent: u64,
+    earliest_recent_expiry: Option<i64>,
+}
+
+impl StartPolicy {
+    fn recent_expiry_floor(self, now_unix: i64) -> i64 {
+        now_unix
+            .saturating_add(DEVICE_AUTHORIZATION_TTL_SECS)
+            .saturating_sub(self.window_secs)
+    }
+
+    fn retry_after(self, pressure: StartPressure, now_unix: i64) -> Option<u64> {
+        if pressure.outstanding >= self.max_outstanding {
+            return Some(seconds_until(
+                pressure.earliest_expiry.unwrap_or(now_unix),
+                now_unix,
+            ));
+        }
+        if pressure.recent >= self.max_starts_per_window {
+            let recent_floor = self.recent_expiry_floor(now_unix);
+            return Some(seconds_until(
+                pressure.earliest_recent_expiry.unwrap_or(recent_floor),
+                recent_floor,
+            ));
+        }
+        None
+    }
+}
+
+impl StartPressure {
+    #[cfg(test)]
+    fn observe(&mut self, expires_at_unix: i64, recent_floor: i64) {
+        self.outstanding = self.outstanding.saturating_add(1);
+        self.earliest_expiry = earliest(self.earliest_expiry, expires_at_unix);
+        if expires_at_unix > recent_floor {
+            self.recent = self.recent.saturating_add(1);
+            self.earliest_recent_expiry = earliest(self.earliest_recent_expiry, expires_at_unix);
+        }
+    }
+}
+
+const PRODUCTION_START_POLICY: StartPolicy = StartPolicy {
+    max_outstanding: DEVICE_AUTHORIZATION_MAX_OUTSTANDING,
+    max_starts_per_window: DEVICE_AUTHORIZATION_MAX_STARTS_PER_MINUTE,
+    window_secs: DEVICE_AUTHORIZATION_RATE_WINDOW_SECS,
+};
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DeviceAuthorizationClaim {
     pub approval: DeviceApproval,
@@ -156,6 +224,7 @@ impl std::error::Error for DeviceAuthorizationStoreError {}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DeviceAuthorizationError {
     InvalidInput(&'static str),
+    RateLimited { retry_after_secs: u64 },
     Store(DeviceAuthorizationStoreError),
 }
 
@@ -163,6 +232,10 @@ impl core::fmt::Display for DeviceAuthorizationError {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::InvalidInput(message) => formatter.write_str(message),
+            Self::RateLimited { retry_after_secs } => write!(
+                formatter,
+                "device authorization start limit reached; retry after {retry_after_secs} seconds"
+            ),
             Self::Store(error) => error.fmt(formatter),
         }
     }
@@ -175,7 +248,8 @@ trait DeviceAuthorizationStore: Send + Sync {
         &self,
         authorization: PendingAuthorization,
         now_unix: i64,
-    ) -> Result<bool, DeviceAuthorizationStoreError>;
+        policy: StartPolicy,
+    ) -> Result<IssueOutcome, DeviceAuthorizationStoreError>;
 
     fn approve(
         &self,
@@ -204,7 +278,8 @@ impl DeviceAuthorizationStore for MemoryDeviceAuthorizationStore {
         &self,
         authorization: PendingAuthorization,
         now_unix: i64,
-    ) -> Result<bool, DeviceAuthorizationStoreError> {
+        policy: StartPolicy,
+    ) -> Result<IssueOutcome, DeviceAuthorizationStoreError> {
         let mut authorizations = self
             .authorizations
             .lock()
@@ -215,7 +290,18 @@ impl DeviceAuthorizationStore for MemoryDeviceAuthorizationStore {
                 .values()
                 .any(|stored| stored.pending.user_code_digest == authorization.user_code_digest)
         {
-            return Ok(false);
+            return Ok(IssueOutcome::Collision);
+        }
+        let recent_floor = policy.recent_expiry_floor(now_unix);
+        let mut pressure = StartPressure::default();
+        for expires_at_unix in authorizations
+            .values()
+            .map(|stored| stored.pending.expires_at_unix)
+        {
+            pressure.observe(expires_at_unix, recent_floor);
+        }
+        if let Some(retry_after_secs) = policy.retry_after(pressure, now_unix) {
+            return Ok(IssueOutcome::Limited { retry_after_secs });
         }
         authorizations.insert(
             authorization.device_digest,
@@ -224,7 +310,7 @@ impl DeviceAuthorizationStore for MemoryDeviceAuthorizationStore {
                 approval: None,
             },
         );
-        Ok(true)
+        Ok(IssueOutcome::Issued)
     }
 
     fn approve(
@@ -322,12 +408,20 @@ impl PgDeviceAuthorizationStore {
         &self,
         authorization: PendingAuthorization,
         now_unix: i64,
-    ) -> Result<bool, DeviceAuthorizationStoreError> {
+        policy: StartPolicy,
+    ) -> Result<IssueOutcome, DeviceAuthorizationStoreError> {
         let mut transaction = self
             .pool
             .begin()
             .await
             .map_err(DeviceAuthorizationStoreError::database)?;
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+               hashtextextended('myelin.edge.device-authorization.issue.v1', 0))",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(DeviceAuthorizationStoreError::database)?;
         // This table is a deliberately tenant-neutral, opaque login rendezvous. Expiry cleanup is
         // cross-scope but exposes no application data and is bounded to this one ephemeral table.
         sqlx::query("DELETE FROM auth_device_authorization WHERE expires_at_unix <= $1")
@@ -335,6 +429,31 @@ impl PgDeviceAuthorizationStore {
             .execute(&mut *transaction)
             .await
             .map_err(DeviceAuthorizationStoreError::database)?;
+        let recent_floor = policy.recent_expiry_floor(now_unix);
+        let pressure = sqlx::query(
+            "SELECT count(*)::bigint AS outstanding, min(expires_at_unix) AS earliest_expiry, \
+                    count(*) FILTER (WHERE expires_at_unix > $1)::bigint AS recent, \
+                    min(expires_at_unix) FILTER (WHERE expires_at_unix > $1) \
+                      AS earliest_recent_expiry \
+               FROM auth_device_authorization",
+        )
+        .bind(recent_floor)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(DeviceAuthorizationStoreError::database)?;
+        let pressure = StartPressure {
+            outstanding: count_from_row(&pressure, "outstanding")?,
+            earliest_expiry: pressure.get("earliest_expiry"),
+            recent: count_from_row(&pressure, "recent")?,
+            earliest_recent_expiry: pressure.get("earliest_recent_expiry"),
+        };
+        if let Some(retry_after_secs) = policy.retry_after(pressure, now_unix) {
+            transaction
+                .commit()
+                .await
+                .map_err(DeviceAuthorizationStoreError::database)?;
+            return Ok(IssueOutcome::Limited { retry_after_secs });
+        }
         let inserted = sqlx::query(
             "INSERT INTO auth_device_authorization \
              (device_digest, user_code_digest, verifier_challenge, expires_at_unix) \
@@ -353,7 +472,11 @@ impl PgDeviceAuthorizationStore {
             .commit()
             .await
             .map_err(DeviceAuthorizationStoreError::database)?;
-        Ok(inserted)
+        Ok(if inserted {
+            IssueOutcome::Issued
+        } else {
+            IssueOutcome::Collision
+        })
     }
 
     async fn approve_async(
@@ -530,8 +653,9 @@ impl DeviceAuthorizationStore for PgDeviceAuthorizationStore {
         &self,
         authorization: PendingAuthorization,
         now_unix: i64,
-    ) -> Result<bool, DeviceAuthorizationStoreError> {
-        self.drive(self.issue_async(authorization, now_unix))
+        policy: StartPolicy,
+    ) -> Result<IssueOutcome, DeviceAuthorizationStoreError> {
+        self.drive(self.issue_async(authorization, now_unix, policy))
     }
 
     fn approve(
@@ -607,11 +731,33 @@ fn bounded_identity_field(value: &str, max_bytes: usize) -> bool {
             .any(|character| character.is_control() || character.is_whitespace())
 }
 
+fn count_from_row(
+    row: &sqlx::postgres::PgRow,
+    column: &str,
+) -> Result<u64, DeviceAuthorizationStoreError> {
+    let count: i64 = row.get(column);
+    u64::try_from(count).map_err(|_| {
+        DeviceAuthorizationStoreError::corrupt(format!(
+            "device authorization {column} count is negative"
+        ))
+    })
+}
+
+#[cfg(test)]
+fn earliest(current: Option<i64>, candidate: i64) -> Option<i64> {
+    Some(current.map_or(candidate, |value| value.min(candidate)))
+}
+
+fn seconds_until(deadline_unix: i64, floor_unix: i64) -> u64 {
+    u64::try_from(deadline_unix.saturating_sub(floor_unix).max(1)).unwrap_or(u64::MAX)
+}
+
 #[derive(Clone)]
 pub struct DeviceAuthorizationBroker {
     store: Arc<dyn DeviceAuthorizationStore>,
     verification_uri: String,
     now: Arc<dyn Fn() -> i64 + Send + Sync>,
+    start_policy: StartPolicy,
 }
 
 impl DeviceAuthorizationBroker {
@@ -643,12 +789,31 @@ impl DeviceAuthorizationBroker {
             store,
             verification_uri,
             now: Arc::new(system_now_unix),
+            start_policy: PRODUCTION_START_POLICY,
         })
     }
 
     #[cfg(test)]
-    fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
+    pub(crate) fn with_clock(mut self, now: impl Fn() -> i64 + Send + Sync + 'static) -> Self {
         self.now = Arc::new(now);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_start_policy(
+        mut self,
+        max_outstanding: u64,
+        max_starts_per_window: u64,
+        window_secs: i64,
+    ) -> Self {
+        assert!(max_outstanding > 0);
+        assert!(max_starts_per_window > 0);
+        assert!((1..=DEVICE_AUTHORIZATION_TTL_SECS).contains(&window_secs));
+        self.start_policy = StartPolicy {
+            max_outstanding,
+            max_starts_per_window,
+            window_secs,
+        };
         self
     }
 
@@ -670,22 +835,28 @@ impl DeviceAuthorizationBroker {
                 verifier_challenge,
                 expires_at_unix: now_unix.saturating_add(DEVICE_AUTHORIZATION_TTL_SECS),
             };
-            if self
+            match self
                 .store
-                .issue(pending, now_unix)
+                .issue(pending, now_unix, self.start_policy)
                 .map_err(DeviceAuthorizationError::Store)?
             {
-                return Ok(DeviceAuthorizationStart {
-                    device_code,
-                    user_code: user_code.clone(),
-                    verification_uri: self.verification_uri.clone(),
-                    verification_uri_complete: format!(
-                        "{}?code={user_code}",
-                        self.verification_uri
-                    ),
-                    expires_in: DEVICE_AUTHORIZATION_TTL_SECS as u64,
-                    interval: DEVICE_AUTHORIZATION_POLL_INTERVAL_SECS,
-                });
+                IssueOutcome::Issued => {
+                    return Ok(DeviceAuthorizationStart {
+                        device_code,
+                        user_code: user_code.clone(),
+                        verification_uri: self.verification_uri.clone(),
+                        verification_uri_complete: format!(
+                            "{}?code={user_code}",
+                            self.verification_uri
+                        ),
+                        expires_in: DEVICE_AUTHORIZATION_TTL_SECS as u64,
+                        interval: DEVICE_AUTHORIZATION_POLL_INTERVAL_SECS,
+                    });
+                }
+                IssueOutcome::Collision => {}
+                IssueOutcome::Limited { retry_after_secs } => {
+                    return Err(DeviceAuthorizationError::RateLimited { retry_after_secs });
+                }
             }
         }
         Err(DeviceAuthorizationError::Store(
@@ -831,6 +1002,7 @@ mod tests {
     use super::*;
     use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
     use myelin_tenancy::{Region, TenantId};
+    use std::sync::atomic::{AtomicI64, Ordering};
 
     fn approval() -> DeviceApproval {
         DeviceApproval {
@@ -907,6 +1079,123 @@ mod tests {
             }),
             "a wrong verifier does not consume the authorization"
         );
+    }
+
+    #[test]
+    fn login_starts_are_rate_limited_and_have_a_hard_outstanding_bound() {
+        let now = Arc::new(AtomicI64::new(1_800_000_000));
+        let clock = now.clone();
+        let broker = DeviceAuthorizationBroker::memory("https://myelin.example/cli/auth")
+            .unwrap()
+            .with_clock(move || clock.load(Ordering::Relaxed))
+            .with_start_policy(2, 1, 60);
+        let challenge = challenge(&verifier());
+
+        broker.begin(&challenge).expect("the first CLI may begin");
+        assert_eq!(
+            broker.begin(&challenge),
+            Err(DeviceAuthorizationError::RateLimited {
+                retry_after_secs: 60,
+            }),
+            "a burst is told exactly when the rolling start window opens"
+        );
+
+        now.fetch_add(60, Ordering::Relaxed);
+        broker
+            .begin(&challenge)
+            .expect("another CLI may begin after the rate window");
+        now.fetch_add(60, Ordering::Relaxed);
+        assert_eq!(
+            broker.begin(&challenge),
+            Err(DeviceAuthorizationError::RateLimited {
+                retry_after_secs: 480,
+            }),
+            "old but unclaimed authorizations still count toward the hard row bound"
+        );
+
+        now.store(
+            1_800_000_000 + DEVICE_AUTHORIZATION_TTL_SECS,
+            Ordering::Relaxed,
+        );
+        broker
+            .begin(&challenge)
+            .expect("expiry releases capacity without operator cleanup");
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn postgres_start_capacity_is_shared_between_edge_instances() {
+        use sqlx::postgres::PgPoolOptions;
+
+        let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL for integration");
+        let pool = PgPoolOptions::new()
+            .max_connections(4)
+            .connect(&database_url)
+            .await
+            .expect("connect to the Edge runtime database");
+        let now_unix = system_now_unix();
+        let mut transaction = pool.begin().await.unwrap();
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(\
+               hashtextextended('myelin.edge.device-authorization.issue.v1', 0))",
+        )
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM auth_device_authorization WHERE expires_at_unix <= $1")
+            .bind(now_unix.saturating_add(5))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let baseline: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM auth_device_authorization")
+                .fetch_one(&mut *transaction)
+                .await
+                .unwrap();
+        transaction.commit().await.unwrap();
+
+        let capacity = u64::try_from(baseline).unwrap().saturating_add(1);
+        let runtime = Handle::current();
+        let broker = DeviceAuthorizationBroker::with_pg(
+            pool.clone(),
+            runtime.clone(),
+            "https://myelin.example/cli/auth",
+        )
+        .unwrap()
+        .with_start_policy(capacity, u64::MAX, 60);
+        let other_edge = DeviceAuthorizationBroker::with_pg(
+            pool.clone(),
+            runtime,
+            "https://myelin.example/cli/auth",
+        )
+        .unwrap()
+        .with_start_policy(capacity, u64::MAX, 60);
+        let challenge = challenge(&verifier());
+        let other_challenge = challenge.clone();
+        let first = tokio::task::spawn_blocking(move || broker.begin(&challenge));
+        let second = tokio::task::spawn_blocking(move || other_edge.begin(&other_challenge));
+        let outcomes = [first.await.unwrap(), second.await.unwrap()];
+
+        assert_eq!(outcomes.iter().filter(|outcome| outcome.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(
+                    outcome,
+                    Err(DeviceAuthorizationError::RateLimited { .. })
+                ))
+                .count(),
+            1,
+            "one shared capacity slot is granted once across independent brokers"
+        );
+
+        for started in outcomes.into_iter().flatten() {
+            sqlx::query("DELETE FROM auth_device_authorization WHERE device_digest = $1")
+                .bind(digest("device", &started.device_code).as_slice())
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
     }
 
     #[test]

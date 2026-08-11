@@ -403,9 +403,15 @@ fn bounded_auth_body(request: &EdgeRequest) -> Result<(), EdgeError> {
     Ok(())
 }
 
+const DEVICE_AUTHORIZATION_LIMIT_MESSAGE: &str =
+    "too many CLI login requests are waiting; retry shortly";
+
 fn map_device_authorization_error(error: DeviceAuthorizationError) -> EdgeError {
     match error {
         DeviceAuthorizationError::InvalidInput(message) => EdgeError::BadRequest(message.into()),
+        DeviceAuthorizationError::RateLimited { .. } => {
+            EdgeError::TooManyRequests(DEVICE_AUTHORIZATION_LIMIT_MESSAGE.into())
+        }
         DeviceAuthorizationError::Store(_) => {
             EdgeError::Unavailable("interactive CLI login state is temporarily unavailable".into())
         }
@@ -703,9 +709,18 @@ impl Gateway {
             .ok_or_else(|| {
                 EdgeError::BadRequest("device authorization body missing `code_challenge`".into())
             })?;
-        let started = broker
-            .begin(challenge)
-            .map_err(map_device_authorization_error)?;
+        let started = match broker.begin(challenge) {
+            Ok(started) => started,
+            Err(DeviceAuthorizationError::RateLimited { retry_after_secs }) => {
+                return Ok(no_store(
+                    EdgeResponse::error(&EdgeError::TooManyRequests(
+                        DEVICE_AUTHORIZATION_LIMIT_MESSAGE.into(),
+                    ))
+                    .with_header("retry-after", retry_after_secs.to_string()),
+                ));
+            }
+            Err(error) => return Err(map_device_authorization_error(error)),
+        };
         Ok(no_store(EdgeResponse::json(
             201,
             &json!({
@@ -1470,6 +1485,54 @@ mod tests {
         assert_eq!(b["providers"][0]["id"], "oidc");
         assert_eq!(b["providers"][0]["label"], "Single sign-on");
         assert_eq!(b["cli_login_enabled"], false);
+    }
+
+    #[test]
+    fn device_login_start_limit_is_a_retryable_public_429() {
+        use base64::Engine as _;
+
+        let broker = DeviceAuthorizationBroker::memory("https://myelin.example/cli/auth")
+            .unwrap()
+            .with_clock(|| 1_800_000_000)
+            .with_start_policy(1, 1, 60);
+        let gateway = Gateway::builder(authn_empty(), human_login(), Arc::new(AllowAll))
+            .with_device_authorization(broker)
+            .build();
+        let body = serde_json::to_vec(&json!({
+            "code_challenge": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([3_u8; 32]),
+        }))
+        .unwrap();
+
+        let first = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/device/authorization",
+            "",
+            vec![],
+            body.clone(),
+        ));
+        assert_eq!(first.status(), 201);
+
+        let limited = gateway.handle(EdgeRequest::new(
+            "POST",
+            "/v1/auth/device/authorization",
+            "",
+            vec![],
+            body,
+        ));
+        assert_eq!(limited.status(), 429);
+        assert_eq!(
+            limited.json_body().unwrap()["error"]["code"],
+            "too_many_requests"
+        );
+        let EdgeResponse::Bytes { headers, .. } = &limited else {
+            panic!("a device authorization response is JSON")
+        };
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("retry-after") && value == "600"
+        }));
+        assert!(headers.iter().any(|(name, value)| {
+            name.eq_ignore_ascii_case("cache-control") && value == "no-store"
+        }));
     }
 
     #[test]

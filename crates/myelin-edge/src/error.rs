@@ -9,6 +9,7 @@ pub enum EdgeError {
     Conflict(String),
     Unprocessable(String),
     PayloadTooLarge(String),
+    TooManyRequests(String),
     RequestTimeout(String),
     Unavailable(String),
     Internal(String),
@@ -24,6 +25,7 @@ impl EdgeError {
             EdgeError::Conflict(_) => 409,
             EdgeError::Unprocessable(_) => 422,
             EdgeError::PayloadTooLarge(_) => 413,
+            EdgeError::TooManyRequests(_) => 429,
             EdgeError::RequestTimeout(_) => 408,
             EdgeError::Unavailable(_) => 503,
             EdgeError::Internal(_) => 500,
@@ -39,6 +41,7 @@ impl EdgeError {
             EdgeError::Conflict(_) => "conflict",
             EdgeError::Unprocessable(_) => "unprocessable",
             EdgeError::PayloadTooLarge(_) => "payload_too_large",
+            EdgeError::TooManyRequests(_) => "too_many_requests",
             EdgeError::RequestTimeout(_) => "request_timeout",
             EdgeError::Unavailable(_) => "unavailable",
             EdgeError::Internal(_) => "internal",
@@ -55,6 +58,7 @@ impl EdgeError {
             | EdgeError::Conflict(m)
             | EdgeError::Unprocessable(m)
             | EdgeError::PayloadTooLarge(m)
+            | EdgeError::TooManyRequests(m)
             | EdgeError::RequestTimeout(m)
             | EdgeError::Unavailable(m) => m.clone(),
         }
@@ -69,6 +73,7 @@ impl EdgeError {
             | EdgeError::Conflict(m)
             | EdgeError::Unprocessable(m)
             | EdgeError::PayloadTooLarge(m)
+            | EdgeError::TooManyRequests(m)
             | EdgeError::RequestTimeout(m)
             | EdgeError::Unavailable(m)
             | EdgeError::Internal(m) => m,
@@ -114,6 +119,11 @@ mod tests {
         assert_eq!(
             EdgeError::PayloadTooLarge("x".into()).code(),
             "payload_too_large"
+        );
+        assert_eq!(EdgeError::TooManyRequests("x".into()).status(), 429);
+        assert_eq!(
+            EdgeError::TooManyRequests("x".into()).code(),
+            "too_many_requests"
         );
         assert_eq!(EdgeError::RequestTimeout("x".into()).status(), 408);
         assert_eq!(
