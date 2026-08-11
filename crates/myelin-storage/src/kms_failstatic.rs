@@ -50,12 +50,9 @@ pub enum KmsReadiness {
     NotReady,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum KmsReadResult {
-    Resolved {
-        handle: DekHandle,
-        degraded: bool,
-    },
+    Resolved { handle: DekHandle, degraded: bool },
     NotReady(KmsError),
 }
 

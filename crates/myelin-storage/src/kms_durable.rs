@@ -1,5 +1,6 @@
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use sqlx::Row;
+use zeroize::Zeroizing;
 
 use myelin_tenancy::{Region, TenantId};
 
@@ -99,8 +100,9 @@ impl From<PgError> for KmsDurableError {
 }
 
 pub fn seal_key_from_env() -> Result<SealKey, KmsDurableError> {
-    let raw = std::env::var(SEAL_KEY_ENV).map_err(|_| KmsDurableError::SealKeyMissing)?;
-    SealKey::from_encoded(&raw).map_err(KmsDurableError::SealKeyDecode)
+    let raw =
+        Zeroizing::new(std::env::var(SEAL_KEY_ENV).map_err(|_| KmsDurableError::SealKeyMissing)?);
+    SealKey::from_encoded(raw.as_str()).map_err(KmsDurableError::SealKeyDecode)
 }
 
 #[derive(Clone)]

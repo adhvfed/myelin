@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Mutex;
 
+use aes_gcm::aead::rand_core::RngCore;
 use aes_gcm::aead::{Aead, OsRng, Payload};
 use aes_gcm::{AeadCore, Aes256Gcm, Key, KeyInit, Nonce};
+use zeroize::{Zeroize, Zeroizing};
 
 use myelin_tenancy::{Region, TenantId};
 
@@ -99,19 +101,30 @@ impl fmt::Display for PiiKeyRef {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 struct RawKey([u8; KEY_LEN]);
 
 impl RawKey {
     fn generate() -> RawKey {
-        let key = Aes256Gcm::generate_key(OsRng);
         let mut bytes = [0u8; KEY_LEN];
-        bytes.copy_from_slice(key.as_slice());
+        OsRng.fill_bytes(&mut bytes);
         RawKey(bytes)
     }
 
     fn cipher(&self) -> Aes256Gcm {
         Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0))
+    }
+}
+
+impl Zeroize for RawKey {
+    fn zeroize(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+impl Drop for RawKey {
+    fn drop(&mut self) {
+        self.zeroize();
     }
 }
 
@@ -155,16 +168,17 @@ impl CellRoot {
     }
 
     fn unwrap_kek(&self, w: &WrappedKey) -> Option<RawKey> {
-        let plain = self
-            .root
-            .cipher()
-            .decrypt(Nonce::from_slice(&w.nonce), w.wrapped.as_slice())
-            .ok()?;
+        let plain = Zeroizing::new(
+            self.root
+                .cipher()
+                .decrypt(Nonce::from_slice(&w.nonce), w.wrapped.as_slice())
+                .ok()?,
+        );
         if plain.len() != KEY_LEN {
             return None;
         }
         let mut bytes = [0u8; KEY_LEN];
-        bytes.copy_from_slice(&plain);
+        bytes.copy_from_slice(plain.as_slice());
         Some(RawKey(bytes))
     }
 
@@ -183,25 +197,27 @@ impl CellRoot {
     }
 
     pub fn unseal(seal_key: &SealKey, sealed: &SealedRoot) -> Option<CellRoot> {
-        let plain = seal_key
-            .cipher()
-            .decrypt(
-                Nonce::from_slice(&sealed.nonce),
-                sealed.ciphertext.as_slice(),
-            )
-            .ok()?;
+        let plain = Zeroizing::new(
+            seal_key
+                .cipher()
+                .decrypt(
+                    Nonce::from_slice(&sealed.nonce),
+                    sealed.ciphertext.as_slice(),
+                )
+                .ok()?,
+        );
         if plain.len() != KEY_LEN {
             return None;
         }
         let mut bytes = [0u8; KEY_LEN];
-        bytes.copy_from_slice(&plain);
+        bytes.copy_from_slice(plain.as_slice());
         Some(CellRoot {
             root: RawKey(bytes),
         })
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct SealKey(RawKey);
 
 impl SealKey {
@@ -210,17 +226,18 @@ impl SealKey {
     }
 
     pub fn from_encoded(s: &str) -> Result<SealKey, SealKeyError> {
-        let decoded = hex::decode(s.trim()).map_err(|e| SealKeyError::Decode(e.to_string()))?;
+        let decoded =
+            Zeroizing::new(hex::decode(s.trim()).map_err(|e| SealKeyError::Decode(e.to_string()))?);
         if decoded.len() != KEY_LEN {
             return Err(SealKeyError::WrongLength(decoded.len()));
         }
         let mut bytes = [0u8; KEY_LEN];
-        bytes.copy_from_slice(&decoded);
+        bytes.copy_from_slice(decoded.as_slice());
         Ok(SealKey(RawKey(bytes)))
     }
 
-    pub fn derive_service_key(&self, context: &str) -> zeroize::Zeroizing<[u8; KEY_LEN]> {
-        zeroize::Zeroizing::new(blake3::derive_key(context, &self.0 .0))
+    pub fn derive_service_key(&self, context: &str) -> Zeroizing<[u8; KEY_LEN]> {
+        Zeroizing::new(blake3::derive_key(context, &self.0 .0))
     }
 
     fn cipher(&self) -> Aes256Gcm {
@@ -238,10 +255,15 @@ impl SealKey {
         (n, ct)
     }
 
-    pub fn open_bytes(&self, nonce: &[u8; NONCE_LEN], ciphertext: &[u8]) -> Option<Vec<u8>> {
+    pub fn open_bytes(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        ciphertext: &[u8],
+    ) -> Option<Zeroizing<Vec<u8>>> {
         self.cipher()
             .decrypt(Nonce::from_slice(nonce), ciphertext)
             .ok()
+            .map(Zeroizing::new)
     }
 }
 
@@ -317,7 +339,7 @@ pub struct WrappedDek {
     pub kek_epoch: u64,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct DekHandle {
     key: RawKey,
 }
@@ -631,18 +653,19 @@ impl KmsCore {
         drop(deks);
 
         let kek = self.open_kek(&kek_id)?;
-        let plain = kek
-            .cipher()
-            .decrypt(
-                Nonce::from_slice(&wrapped.nonce),
-                wrapped.wrapped.as_slice(),
-            )
-            .map_err(|_| KmsError::UnwrapFailed(dek_id.clone()))?;
+        let plain = Zeroizing::new(
+            kek.cipher()
+                .decrypt(
+                    Nonce::from_slice(&wrapped.nonce),
+                    wrapped.wrapped.as_slice(),
+                )
+                .map_err(|_| KmsError::UnwrapFailed(dek_id.clone()))?,
+        );
         if plain.len() != KEY_LEN {
             return Err(KmsError::UnwrapFailed(dek_id));
         }
         let mut bytes = [0u8; KEY_LEN];
-        bytes.copy_from_slice(&plain);
+        bytes.copy_from_slice(plain.as_slice());
         Ok(DekHandle { key: RawKey(bytes) })
     }
 
@@ -755,10 +778,13 @@ impl KmsCore {
     ) -> Result<DekHandle, KmsError> {
         let kek_id = KekId::new(tenant.clone(), region.clone());
         let kek = self.open_kek(&kek_id)?;
-        let plain = kek
-            .cipher()
-            .decrypt(Nonce::from_slice(&w.nonce), w.wrapped.as_slice())
-            .map_err(|_| KmsError::UnwrapFailed(DekId::new(tenant.clone(), KeyClass::Tenant)))?;
+        let plain = Zeroizing::new(
+            kek.cipher()
+                .decrypt(Nonce::from_slice(&w.nonce), w.wrapped.as_slice())
+                .map_err(|_| {
+                    KmsError::UnwrapFailed(DekId::new(tenant.clone(), KeyClass::Tenant))
+                })?,
+        );
         if plain.len() != KEY_LEN {
             return Err(KmsError::UnwrapFailed(DekId::new(
                 tenant.clone(),
@@ -766,7 +792,7 @@ impl KmsCore {
             )));
         }
         let mut bytes = [0u8; KEY_LEN];
-        bytes.copy_from_slice(&plain);
+        bytes.copy_from_slice(plain.as_slice());
         Ok(DekHandle { key: RawKey(bytes) })
     }
 }
@@ -1130,12 +1156,12 @@ mod tests {
         assert!(kms.destroy_kek(&kek_id), "a KEK was present to destroy");
 
         assert_eq!(
-            kms.resolve_dek(&tk, &region),
-            Err(KmsError::KekUnavailable(kek_id.clone()))
+            kms.resolve_dek(&tk, &region).expect_err("the KEK is gone"),
+            KmsError::KekUnavailable(kek_id.clone())
         );
         assert_eq!(
-            kms.resolve_dek(&sk, &region),
-            Err(KmsError::KekUnavailable(kek_id))
+            kms.resolve_dek(&sk, &region).expect_err("the KEK is gone"),
+            KmsError::KekUnavailable(kek_id)
         );
     }
 
@@ -1158,8 +1184,9 @@ mod tests {
         assert!(kms.destroy_dek(&s1_id), "subject DEK present to destroy");
 
         assert_eq!(
-            kms.resolve_dek(&s1, &region),
-            Err(KmsError::DekUnavailable(s1_id))
+            kms.resolve_dek(&s1, &region)
+                .expect_err("the subject DEK is gone"),
+            KmsError::DekUnavailable(s1_id)
         );
         assert!(
             kms.resolve_dek(&tk, &region).is_ok(),
@@ -1279,6 +1306,23 @@ mod tests {
             dbg.contains("CellRoot"),
             "the CellRoot wrapper is named: {dbg}"
         );
+    }
+
+    #[test]
+    fn plaintext_key_containers_zeroize_when_their_lifetime_ends() {
+        fn assert_zeroize<T: Zeroize>() {}
+
+        assert_zeroize::<RawKey>();
+        assert!(std::mem::needs_drop::<RawKey>());
+        assert!(std::mem::needs_drop::<CellRoot>());
+        assert!(std::mem::needs_drop::<SealKey>());
+        assert!(std::mem::needs_drop::<DekHandle>());
+
+        let seal = SealKey::from_bytes([7u8; KEY_LEN]);
+        let (nonce, ciphertext) = seal.seal_bytes(b"short-lived plaintext");
+        let plaintext = seal.open_bytes(&nonce, &ciphertext).expect("opens");
+        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+        assert_eq!(plaintext.as_slice(), b"short-lived plaintext");
     }
 
     #[test]
