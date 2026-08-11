@@ -47,7 +47,9 @@ fn cdc_11_8_ci_resolves_details_ref_step_anchor_to_exact_failing_bytes() {
     let tenant = TenantId("acme".into());
     let region = Region("fr-par".into());
     let engine = Arc::new(KmsEngine::new());
-    engine.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    engine
+        .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("seed the in-memory KEK");
 
     let mut ci = CiRunLogs::boot(tenant, region, engine, "run-42");
 

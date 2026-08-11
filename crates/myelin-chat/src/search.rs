@@ -564,7 +564,8 @@ mod tests {
         eng.ensure_kek(&KekId::new(
             TenantId("acme".into()),
             Region("fr-par".into()),
-        ));
+        ))
+        .expect("seed the in-memory KEK");
         let region = Region("fr-par".into());
 
         let platform = PlatformManaged::new(&eng, region.clone());

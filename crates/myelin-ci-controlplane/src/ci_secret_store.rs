@@ -298,7 +298,8 @@ impl DurableCiSecretStore {
         material: &[u8],
     ) -> Result<EncryptedColumn, CiSecretStoreError> {
         self.kms
-            .ensure_kek(&KekId::new(tenant.clone(), self.region.clone()));
+            .ensure_kek(&KekId::new(tenant.clone(), self.region.clone()))
+            .map_err(|_| CiSecretStoreError::Encrypt)?;
         ColumnCryptor::new(&self.kms, self.region.clone())
             .encrypt_with_aad(
                 tenant,

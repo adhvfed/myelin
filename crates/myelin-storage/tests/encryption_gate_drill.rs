@@ -63,7 +63,8 @@ fn gate_leg1_no_untagged_personal_data_fires_then_admits() {
 fn gate_leg2_and_3_classify_drives_key_choice_zero_plaintext_at_rest() {
     let tenant = TenantId("acme".into());
     let kms = Arc::new(KmsEngine::new());
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     let cryptor = ColumnCryptor::new(&kms, region());
 
     let subject_plain = b"alice.bio.free-text@example.test";

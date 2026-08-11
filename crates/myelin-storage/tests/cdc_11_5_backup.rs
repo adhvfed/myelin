@@ -50,7 +50,8 @@ fn ops_backup_job_archives_base_backs_and_snapshots_within_rpo() {
     let kms = KmsEngine::new();
     let tenant = TenantId("acme".into());
     let region = Region("eu-west".into());
-    kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&tenant, &region, KeyClass::Tenant).unwrap();
 
     let mut job = OpsBackupJob::boot(&kms);
@@ -104,7 +105,7 @@ fn ops_callers_backup_excludes_a_crypto_shredded_tenant() {
     let region = Region("eu-west".into());
     let gone = TenantId("offboarded".into());
     let gone_kek = KekId::new(gone.clone(), region.clone());
-    kms.ensure_kek(&gone_kek);
+    kms.ensure_kek(&gone_kek).expect("seed the in-memory KEK");
     kms.ensure_dek(&gone, &region, KeyClass::Tenant).unwrap();
 
     let job = OpsBackupJob::boot(&kms);

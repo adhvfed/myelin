@@ -100,7 +100,8 @@ fn restore_driver_re_erases_a_post_pit_subject_to_zero_resurrected() {
     let subject = SubjectId::new("u-erased-after-backup");
 
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     ColumnCryptor::new(&kms, region())
         .encrypt(
             &t,
@@ -153,7 +154,8 @@ fn the_gate_run_with_reerase_greens_a_re_erased_restore() {
     let t = tenant("acme");
     let subject = SubjectId::new("u-post-pit");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     ColumnCryptor::new(&kms, region())
         .encrypt(
             &t,
@@ -207,7 +209,8 @@ fn a_window_erasure_with_no_post_pit_coverage_is_refused_not_trusted_green() {
 
     let t = tenant("acme");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
 
     let ledger = ErasureLedger::new();
     ledger.record_erased_at(t.clone(), 140);

@@ -225,7 +225,8 @@ fn reachable_archiver(tail: u64) -> ContinuousArchiver {
 
 fn storage_kms_with_subject(subject: &SubjectId) -> KmsEngine {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(storage_tenant(), region()));
+    kms.ensure_kek(&KekId::new(storage_tenant(), region()))
+        .expect("seed the in-memory KEK");
     ColumnCryptor::new(&kms, region())
         .encrypt(
             &storage_tenant(),

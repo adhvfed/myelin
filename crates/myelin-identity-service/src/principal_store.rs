@@ -385,7 +385,7 @@ impl PrincipalStore {
         profile: &PrincipalProfile,
     ) -> Result<(PiiKeyRef, EncryptedProfile), PrincipalError> {
         let kek_id = myelin_storage::KekId::new(scope.tenant().clone(), scope.region().clone());
-        self.kms.ensure_kek(&kek_id);
+        self.kms.ensure_kek(&kek_id)?;
         let key_ref = self.kms.ensure_dek(
             scope.tenant(),
             scope.region(),

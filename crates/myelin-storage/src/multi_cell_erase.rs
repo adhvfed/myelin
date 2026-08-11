@@ -211,7 +211,8 @@ mod tests {
 
     fn cell_kms(tenant: &TenantId, subject: &SubjectId, plaintext: &[u8]) -> KmsEngine {
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(tenant.clone(), r()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), r()))
+            .expect("seed the in-memory KEK");
         let cryptor = ColumnCryptor::new(&kms, r());
         cryptor
             .encrypt(

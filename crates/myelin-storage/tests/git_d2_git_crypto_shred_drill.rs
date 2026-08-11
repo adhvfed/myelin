@@ -65,7 +65,8 @@ fn git_d2_storage_half_erase_commit_author_zero_recoverable_git_structures_resid
     let author = SubjectId::new("u-commit-author");
 
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     let cryptor = ColumnCryptor::new(&kms, region());
     let body_col = cryptor
         .encrypt(

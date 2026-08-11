@@ -28,7 +28,8 @@ fn minter() -> Arc<dyn IdMinter> {
 }
 
 fn mint_subject_dek(kms: &KmsEngine, subject: &str) -> EventsPiiKeyRef {
-    kms.ensure_kek(&KekId::new(tenant(), region()));
+    kms.ensure_kek(&KekId::new(tenant(), region()))
+        .expect("seed the in-memory KEK");
     let kref = kms
         .ensure_dek(&tenant(), &region(), KeyClass::Subject(subject.into()))
         .expect("mint subject DEK");

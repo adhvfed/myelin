@@ -47,7 +47,8 @@ fn acme_tiers() -> CellTenantTiers {
     blobs.insert(h("blob-90"));
     blobs.insert(h("blob-100"));
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(TenantId::from_token("acme"), region()));
+    kms.ensure_kek(&KekId::new(TenantId::from_token("acme"), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&TenantId::from_token("acme"), &region(), KeyClass::Tenant)
         .unwrap();
     CellTenantTiers {

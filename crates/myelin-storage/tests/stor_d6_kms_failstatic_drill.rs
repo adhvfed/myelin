@@ -46,7 +46,8 @@ const STATIC_MAX_SECS: u64 = 300;
 fn stor_d6_kms_outage_fails_static_then_not_ready_zero_fail_open() {
     let kms = KmsEngine::new();
     let (tenant, region) = (TenantId("acme".into()), Region("eu-west".into()));
-    kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("seed the in-memory KEK");
 
     const BATCH: usize = 16;
     let mut refs = Vec::with_capacity(BATCH);

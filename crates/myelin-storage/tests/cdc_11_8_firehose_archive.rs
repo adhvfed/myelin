@@ -49,7 +49,9 @@ fn cdc_11_8_non_ci_producer_seals_and_resolves_through_the_seam() {
     let tenant = TenantId("acme".into());
     let region = Region("fr-par".into());
     let engine = Arc::new(KmsEngine::new());
-    engine.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    engine
+        .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("seed the in-memory KEK");
 
     let mut svc = OpStreamArchiver::boot(tenant, region, engine, "oplog", "board:42");
 

@@ -51,7 +51,9 @@ mod tests {
 
     fn engine() -> KmsEngine {
         let engine = KmsEngine::new();
-        engine.ensure_kek(&KekId::new(tenant(), region()));
+        engine
+            .ensure_kek(&KekId::new(tenant(), region()))
+            .expect("seed the in-memory KEK");
         engine
     }
 

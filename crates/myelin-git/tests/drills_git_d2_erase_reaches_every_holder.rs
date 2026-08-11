@@ -100,7 +100,8 @@ impl WireExecutor for OkWire {
 fn git_d2_complete_erase_reaches_every_holder_residual_is_the_posture_backups_shredded() {
     let (t, r) = (tenant(), region());
     let eng = KmsEngine::new();
-    eng.ensure_kek(&KekId::new(t.clone(), r.clone()));
+    eng.ensure_kek(&KekId::new(t.clone(), r.clone()))
+        .expect("seed the in-memory KEK");
     eng.ensure_dek(&t, &r, KeyClass::Subject(SUBJECT.into()))
         .expect("subject dek");
     eng.ensure_dek(&t, &r, KeyClass::Blob).expect("blob dek");

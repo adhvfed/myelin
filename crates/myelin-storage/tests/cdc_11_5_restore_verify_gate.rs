@@ -39,7 +39,8 @@ impl CiDurabilityGate {
 fn ci_gate_caller_gets_a_green_artifact_on_a_whole_restore() {
     let t = tenant("acme");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(300);
     let objects = vec![RestoredObject::integral(b"obj".to_vec())];
@@ -75,7 +76,8 @@ fn ci_gate_caller_gets_a_green_artifact_on_a_whole_restore() {
 fn ci_gate_caller_fails_ci_on_a_corrupted_backup() {
     let t = tenant("acme");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(300);
     let missing = ContentHash::blake3(b"missing");
@@ -107,7 +109,8 @@ fn ci_gate_caller_fails_ci_on_a_corrupted_backup() {
 fn ci_gate_caller_fails_ci_on_a_resurrected_erased_subject() {
     let resurrected = tenant("erased");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(resurrected.clone(), region()));
+    kms.ensure_kek(&KekId::new(resurrected.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&resurrected, &region(), KeyClass::Tenant)
         .unwrap();
     let arch = reachable_archiver(300);

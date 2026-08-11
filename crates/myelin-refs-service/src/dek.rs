@@ -23,7 +23,7 @@ impl RefsDekPin {
 
     pub fn reserve(&self, tenant: &TenantId, region: &Region) -> Result<PiiKeyRef, KmsError> {
         self.kms
-            .ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+            .ensure_kek(&KekId::new(tenant.clone(), region.clone()))?;
         self.kms
             .ensure_dek(tenant, region, Self::tenant_dek_class())
     }
@@ -35,7 +35,7 @@ impl RefsDekPin {
         subject_id: &str,
     ) -> Result<PiiKeyRef, KmsError> {
         self.kms
-            .ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+            .ensure_kek(&KekId::new(tenant.clone(), region.clone()))?;
         self.kms
             .ensure_dek(tenant, region, Self::subject_dek_class(subject_id))
     }

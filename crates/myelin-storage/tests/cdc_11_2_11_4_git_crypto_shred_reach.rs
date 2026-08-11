@@ -53,7 +53,8 @@ impl ErasureLedgerSink for OrchestratorWiring {
 
 fn engine_with_subject_and_blob_dek(tenant: &TenantId, subject: &SubjectId) -> KmsEngine {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     let cryptor = ColumnCryptor::new(&kms, region());
     cryptor
         .encrypt(
@@ -114,7 +115,8 @@ fn cdc_git_reach_post_condition_is_verified_not_assumed() {
     let tenant = TenantId("acme".into());
     let subject = SubjectId::new("u-author");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&tenant, &region(), KeyClass::Blob)
         .expect("blob dek");
     let git_reach = GitCryptoShredReach::new(&kms, region());
@@ -131,7 +133,8 @@ fn cdc_subject_with_no_git_content_skips_the_reach_no_op() {
     let tenant = TenantId("acme".into());
     let subject = SubjectId::new("u-chat-only");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     let cryptor = ColumnCryptor::new(&kms, region());
     cryptor
         .encrypt(

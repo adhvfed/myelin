@@ -126,6 +126,11 @@ impl DurableKmsBacking {
         &self.cell_id
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn close_pool_for_test(&self) {
+        self.pool.close().await;
+    }
+
     pub async fn load_or_generate(&self, seal_key: &SealKey) -> Result<KmsEngine, KmsDurableError> {
         let root = match self.read_sealed_root().await? {
             Some(sealed) => CellRoot::unseal(seal_key, &sealed).ok_or_else(|| {
@@ -706,7 +711,7 @@ impl DurableKmsBacking {
     }
 
     pub async fn ensure_kek(&self, engine: &KmsEngine, id: &KekId) -> Result<u64, KmsDurableError> {
-        let epoch = engine.ensure_kek(id);
+        let epoch = engine.ensure_kek(id).map_err(KmsDurableError::Kms)?;
         self.persist_kek(engine, id).await?;
         Ok(epoch)
     }
@@ -866,37 +871,44 @@ impl DurableKms {
         }
     }
 
-    pub(crate) fn ensure_kek(&self, id: &KekId) -> u64 {
+    pub(crate) fn ensure_kek(&self, id: &KekId) -> Result<u64, KmsError> {
         if let Some(stored) = self
             .block(self.backing.read_kek(id))
-            .unwrap_or_else(|error| panic!("KMS DURABILITY FAILURE: cannot read KEK: {error}"))
+            .map_err(|error| KmsError::Durability(error.to_string()))?
         {
             self.core
                 .install_wrapped_kek(id.clone(), stored.nonce, stored.wrapped, stored.epoch);
-            return stored.epoch;
+            return Ok(stored.epoch);
         }
         self.core.destroy_kek(id);
         let (epoch, _) = self.core.ensure_kek_tracked(id);
         let candidate = self.core.export_kek(id).expect("fresh KEK is exportable");
         if let Err(error) = self.block(self.backing.insert_kek_if_absent(id, &candidate)) {
             self.core.destroy_kek(id);
-            panic!(
-                "KMS DURABILITY FAILURE (fail-static hard-down): freshly minted KEK for \
-                 tenant={} region={} could not be persisted to the durable store - the \
-                 in-memory mint was rolled back and the operation REFUSED (a KEK that does not \
-                 survive a restart is silent key loss, SI-006): {error}",
+            return Err(KmsError::Durability(format!(
+                "freshly minted KEK for tenant={} region={} could not be persisted; the \
+                 in-memory mint was rolled back: {error}",
                 id.tenant.as_str(),
                 id.region.as_str()
-            );
+            )));
         }
-        let winner = self
-            .block(self.backing.read_kek(id))
-            .unwrap_or_else(|error| panic!("KMS DURABILITY FAILURE: cannot reread KEK: {error}"))
-            .expect("inserted or concurrently won KEK must exist");
+        let winner = match self.block(self.backing.read_kek(id)) {
+            Ok(Some(winner)) => winner,
+            Ok(None) => {
+                self.core.destroy_kek(id);
+                return Err(KmsError::Durability(
+                    "inserted or concurrently won KEK vanished".into(),
+                ));
+            }
+            Err(error) => {
+                self.core.destroy_kek(id);
+                return Err(KmsError::Durability(error.to_string()));
+            }
+        };
         self.core
             .install_wrapped_kek(id.clone(), winner.nonce, winner.wrapped, winner.epoch);
         debug_assert_eq!(epoch, winner.epoch);
-        winner.epoch
+        Ok(winner.epoch)
     }
 
     pub(crate) fn ensure_dek(
@@ -906,7 +918,7 @@ impl DurableKms {
         class: KeyClass,
     ) -> Result<PiiKeyRef, KmsError> {
         let kek_id = KekId::new(tenant.clone(), region.clone());
-        self.ensure_kek(&kek_id);
+        self.ensure_kek(&kek_id)?;
         let dek_id = DekId::new(tenant.clone(), class.clone());
         if let Some((kek, dek, dek_epoch)) = self
             .block(self.backing.read_dek_material(&dek_id, region))
@@ -1021,7 +1033,7 @@ impl DurableKms {
         material: &[u8; KEY_LEN],
     ) -> Result<WrappedDek, KmsError> {
         let kek_id = KekId::new(tenant.clone(), region.clone());
-        self.ensure_kek(&kek_id);
+        self.ensure_kek(&kek_id)?;
         self.core.wrap_dek_material(tenant, region, material)
     }
 }

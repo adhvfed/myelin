@@ -52,7 +52,8 @@ impl ErasureLedgerSink for OrchestratorWiring {
 
 fn engine_with_subject_column(tenant: &TenantId, subject: &SubjectId) -> KmsEngine {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     let cryptor = ColumnCryptor::new(&kms, region());
     cryptor
         .encrypt(

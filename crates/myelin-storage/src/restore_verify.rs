@@ -467,7 +467,8 @@ mod tests {
 
     fn kms_with_tenant(t: &TenantId) -> KmsEngine {
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(t.clone(), region()));
+        kms.ensure_kek(&KekId::new(t.clone(), region()))
+            .expect("seed the in-memory KEK");
         kms.ensure_dek(t, &region(), KeyClass::Tenant).unwrap();
         kms
     }
@@ -696,9 +697,11 @@ mod tests {
         let live = tenant("live");
         let shredded = tenant("shredded");
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(live.clone(), region()));
+        kms.ensure_kek(&KekId::new(live.clone(), region()))
+            .expect("seed the in-memory KEK");
         kms.ensure_dek(&live, &region(), KeyClass::Tenant).unwrap();
-        kms.ensure_kek(&KekId::new(shredded.clone(), region()));
+        kms.ensure_kek(&KekId::new(shredded.clone(), region()))
+            .expect("seed the in-memory KEK");
         kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
             .unwrap();
         assert!(kms.destroy_kek(&KekId::new(shredded.clone(), region())));
@@ -805,8 +808,10 @@ mod tests {
     fn an_erasure_completed_at_or_before_the_pit_is_the_before_backup_case() {
         let shredded = tenant("erased-before-the-backup");
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(shredded.clone(), region()));
-        kms.ensure_dek(&shredded, &region(), KeyClass::Tenant).unwrap();
+        kms.ensure_kek(&KekId::new(shredded.clone(), region()))
+            .expect("seed the in-memory KEK");
+        kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
+            .unwrap();
         assert!(kms.destroy_kek(&KekId::new(shredded.clone(), region())));
         let arch = reachable_archiver(300);
         let objects: Vec<RestoredObject> = vec![];

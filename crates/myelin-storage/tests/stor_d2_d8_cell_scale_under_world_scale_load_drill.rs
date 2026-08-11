@@ -104,7 +104,8 @@ fn world_scale_load_across_cell(tenants: &[TenantId], base_requests: u64) -> u64
 
 fn verify_one_tenant_restore(tenant: &TenantId) -> u64 {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(tenant, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(300);
     let objects = vec![
@@ -235,7 +236,8 @@ fn stor_d1_cell_scale_one_corrupt_tenant_fails_the_gate() {
     use myelin_storage::{ContentHash, GateFailure};
     let tenant = TenantId("cell-tenant-00003".into());
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&tenant, &region(), KeyClass::Tenant)
         .unwrap();
     let arch = reachable_archiver(300);

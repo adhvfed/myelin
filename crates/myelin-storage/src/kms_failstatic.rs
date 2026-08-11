@@ -277,7 +277,8 @@ mod tests {
     fn provisioned() -> (KmsEngine, PiiKeyRef, Region) {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
-        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+            .expect("seed the in-memory KEK");
         let kr = kms
             .ensure_dek(&tenant, &region, KeyClass::Tenant)
             .expect("dek");

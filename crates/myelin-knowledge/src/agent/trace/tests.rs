@@ -219,7 +219,8 @@ fn engine_with_subject_trace_content(
     plaintext: &[u8],
 ) -> (KmsEngine, EncryptedColumn) {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant(), region()));
+    kms.ensure_kek(&KekId::new(tenant(), region()))
+        .expect("seed the in-memory KEK");
     let cryptor = ColumnCryptor::new(&kms, region());
     let sid = SubjectId::new(subject.principal.principal_id.0.clone());
     let col = cryptor

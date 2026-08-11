@@ -196,7 +196,9 @@ fn partial_membership_sees_only_granted_messages() {
 fn hyok_tenant_indexes_zero_message_bodies() {
     let engine = KmsEngine::new();
     let region = Region("fr-par".into());
-    engine.ensure_kek(&KekId::new(TenantId("acme".into()), region.clone()));
+    engine
+        .ensure_kek(&KekId::new(TenantId("acme".into()), region.clone()))
+        .expect("seed the in-memory KEK");
 
     let platform = PlatformManaged::new(&engine, region.clone());
     assert!(

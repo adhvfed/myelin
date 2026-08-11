@@ -69,7 +69,8 @@ fn reachable_archiver(tail: u64) -> ContinuousArchiver {
 
 fn restored_copy_with_resurrected_subject(t: &TenantId, subject: &SubjectId) -> KmsEngine {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     ColumnCryptor::new(&kms, region())
         .encrypt(
             t,

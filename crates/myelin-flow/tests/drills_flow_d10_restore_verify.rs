@@ -257,7 +257,8 @@ fn drill_flow_d10_cross_validates_storage_restore_at_one_point() {
     .unwrap();
 
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant(), region()));
+    kms.ensure_kek(&KekId::new(tenant(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&tenant(), &region(), KeyClass::Tenant)
         .unwrap();
 

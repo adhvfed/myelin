@@ -304,7 +304,9 @@ mod tests {
     #[test]
     fn can_derive_is_false_for_hyok_true_for_platform_and_byok() {
         let engine = KmsEngine::new();
-        engine.ensure_kek(&KekId::new(t("acme"), r("eu-west")));
+        engine
+            .ensure_kek(&KekId::new(t("acme"), r("eu-west")))
+            .expect("seed the in-memory KEK");
 
         let platform = PlatformManaged::new(&engine, r("eu-west"));
         let byok = Byok::new(&engine, r("eu-west"), "kms-customer://acme/k1");
@@ -327,7 +329,9 @@ mod tests {
     #[test]
     fn index_admission_refuses_hyok_by_construction() {
         let engine = KmsEngine::new();
-        engine.ensure_kek(&KekId::new(t("acme"), r("eu-west")));
+        engine
+            .ensure_kek(&KekId::new(t("acme"), r("eu-west")))
+            .expect("seed the in-memory KEK");
         let platform = PlatformManaged::new(&engine, r("eu-west"));
         let byok = Byok::new(&engine, r("eu-west"), "kms-customer://acme/k1");
         let hyok = Hyok::new(MockHyokKeyService::new());
@@ -346,7 +350,9 @@ mod tests {
     #[test]
     fn platform_origin_wraps_and_unwraps_through_the_engine() {
         let engine = KmsEngine::new();
-        engine.ensure_kek(&KekId::new(t("acme"), r("eu-west")));
+        engine
+            .ensure_kek(&KekId::new(t("acme"), r("eu-west")))
+            .expect("seed the in-memory KEK");
         let platform = PlatformManaged::new(&engine, r("eu-west"));
 
         let dek = Dek::generate();
@@ -362,7 +368,9 @@ mod tests {
     #[test]
     fn byok_wraps_under_the_customer_key_path() {
         let engine = KmsEngine::new();
-        engine.ensure_kek(&KekId::new(t("acme"), r("eu-west")));
+        engine
+            .ensure_kek(&KekId::new(t("acme"), r("eu-west")))
+            .expect("seed the in-memory KEK");
         let byok = Byok::new(&engine, r("eu-west"), "kms-customer://acme/master-key");
 
         assert_eq!(byok.customer_key_path(), "kms-customer://acme/master-key");
@@ -407,7 +415,9 @@ mod tests {
     #[test]
     fn wrap_unwrap_destroy_route_through_all_three_origins() {
         let engine = KmsEngine::new();
-        engine.ensure_kek(&KekId::new(t("acme"), r("eu-west")));
+        engine
+            .ensure_kek(&KekId::new(t("acme"), r("eu-west")))
+            .expect("seed the in-memory KEK");
 
         let platform = PlatformManaged::new(&engine, r("eu-west"));
         let byok = Byok::new(&engine, r("eu-west"), "kms-customer://acme/k");
@@ -427,7 +437,9 @@ mod tests {
     #[test]
     fn telemetry_reports_can_derive_per_origin() {
         let engine = KmsEngine::new();
-        engine.ensure_kek(&KekId::new(t("acme"), r("eu-west")));
+        engine
+            .ensure_kek(&KekId::new(t("acme"), r("eu-west")))
+            .expect("seed the in-memory KEK");
         let platform = PlatformManaged::new(&engine, r("eu-west"));
         let hyok = Hyok::new(MockHyokKeyService::new());
 

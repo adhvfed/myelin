@@ -109,7 +109,8 @@ impl<'a> StructuralErasureFloor<'a> {
 
     pub fn verify(&self, subject: &SubjectId, tenant: &TenantId) -> StructuralFloorReport {
         self.engine
-            .ensure_kek(&KekId::new(tenant.clone(), self.region.clone()));
+            .ensure_kek(&KekId::new(tenant.clone(), self.region.clone()))
+            .expect("ensure the tenant KEK");
         let key_ref = self
             .engine
             .ensure_dek(tenant, &self.region, KeyClass::Subject(subject.0.clone()))
@@ -191,7 +192,8 @@ mod tests {
     }
     fn engine_for(tenant: &TenantId) -> KmsEngine {
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(tenant.clone(), r()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), r()))
+            .expect("seed the in-memory KEK");
         kms
     }
 

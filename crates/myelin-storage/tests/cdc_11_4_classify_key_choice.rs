@@ -10,7 +10,8 @@ fn region() -> Region {
 
 fn engine(tenant: &TenantId) -> Arc<KmsEngine> {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     Arc::new(kms)
 }
 

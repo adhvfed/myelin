@@ -131,7 +131,8 @@ mod tests {
 
     fn engine_with_blob_dek(tenant: &TenantId) -> Arc<KmsEngine> {
         let kms = Arc::new(KmsEngine::new());
-        kms.ensure_kek(&KekId::new(tenant.clone(), r()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), r()))
+            .expect("seed the in-memory KEK");
         kms.ensure_dek(tenant, &r(), KeyClass::Blob)
             .expect("blob dek");
         kms

@@ -53,7 +53,8 @@ impl<'a> RestoreVerifyJob<'a> {
 fn restore_caller_lands_a_consistent_point() {
     let kms = KmsEngine::new();
     let t = tenant("acme");
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
 
     let job = RestoreVerifyJob::boot(&kms, 300);
@@ -144,8 +145,10 @@ fn restore_caller_does_not_resurrect_a_shredded_tenant() {
     let live = tenant("live");
     let shredded = tenant("shredded");
     let shredded_kek = KekId::new(shredded.clone(), region());
-    kms.ensure_kek(&KekId::new(live.clone(), region()));
-    kms.ensure_kek(&shredded_kek);
+    kms.ensure_kek(&KekId::new(live.clone(), region()))
+        .expect("seed the in-memory KEK");
+    kms.ensure_kek(&shredded_kek)
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&live, &region(), KeyClass::Tenant).unwrap();
     kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
         .unwrap();

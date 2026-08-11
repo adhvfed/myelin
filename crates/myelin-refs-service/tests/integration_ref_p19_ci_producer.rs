@@ -55,7 +55,8 @@ fn authz() -> Arc<FailStaticAuthz> {
 
 fn engine() -> Arc<KmsEngine> {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant(), region()));
+    kms.ensure_kek(&KekId::new(tenant(), region()))
+        .expect("seed the in-memory KEK");
     Arc::new(kms)
 }
 

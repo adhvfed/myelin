@@ -65,7 +65,8 @@ async fn ci_d3_erase_crypto_shreds_live_pii_and_pseudonymises_structure_survives
     let job_id = "66666666-6666-6666-6666-666666666666";
 
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("seed the in-memory KEK");
     let subj_key = kms
         .ensure_dek(&tenant, &region, KeyClass::Subject(subject.to_string()))
         .expect("seal the subject DEK live");

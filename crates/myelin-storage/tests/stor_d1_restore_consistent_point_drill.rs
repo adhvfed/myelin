@@ -50,7 +50,8 @@ fn to_harness_snapshot(report: &RestoreReport, present_blobs: &[ContentHash]) ->
 fn stor_d1_restore_lands_one_consistent_point() {
     let kms = KmsEngine::new();
     let t = TenantId("acme".into());
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
 
     let arch = reachable_archiver(300);

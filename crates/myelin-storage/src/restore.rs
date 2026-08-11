@@ -420,8 +420,9 @@ mod tests {
         let shredded = tenant("shredded");
         let live_kek = KekId::new(live.clone(), region_eu());
         let shredded_kek = KekId::new(shredded.clone(), region_eu());
-        kms.ensure_kek(&live_kek);
-        kms.ensure_kek(&shredded_kek);
+        kms.ensure_kek(&live_kek).expect("seed the in-memory KEK");
+        kms.ensure_kek(&shredded_kek)
+            .expect("seed the in-memory KEK");
         kms.ensure_dek(&live, &region_eu(), KeyClass::Tenant)
             .unwrap();
         kms.ensure_dek(&shredded, &region_eu(), KeyClass::Tenant)
@@ -468,7 +469,8 @@ mod tests {
         source.append(90, "r1").append(100, "r2");
         let kms = KmsEngine::new();
         let t = tenant("acme");
-        kms.ensure_kek(&KekId::new(t.clone(), region_eu()));
+        kms.ensure_kek(&KekId::new(t.clone(), region_eu()))
+            .expect("seed the in-memory KEK");
         kms.ensure_dek(&t, &region_eu(), KeyClass::Tenant).unwrap();
 
         let rows = vec![

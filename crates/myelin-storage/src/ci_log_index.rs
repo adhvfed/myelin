@@ -541,7 +541,8 @@ mod tests {
     }
     fn engine() -> std::sync::Arc<crate::kms::KmsEngine> {
         let kms = crate::kms::KmsEngine::new();
-        kms.ensure_kek(&KekId::new(tenant(), region()));
+        kms.ensure_kek(&KekId::new(tenant(), region()))
+            .expect("seed the in-memory KEK");
         std::sync::Arc::new(kms)
     }
     fn tier(run: &str) -> CiLogTier {

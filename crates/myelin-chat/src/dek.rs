@@ -42,7 +42,7 @@ pub fn encrypt_body(
     _kind: ChatFreeText,
     plaintext: &[u8],
 ) -> Result<EncryptedColumn, KeyChoiceError> {
-    engine.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    engine.ensure_kek(&KekId::new(tenant.clone(), region.clone()))?;
     let cryptor = ColumnCryptor::new(engine, region.clone());
     cryptor.encrypt(tenant, Some(author), &subject_dek_erasure(), plaintext)
 }

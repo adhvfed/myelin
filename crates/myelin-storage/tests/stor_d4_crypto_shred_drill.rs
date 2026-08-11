@@ -53,7 +53,8 @@ fn stor_d4_crypto_shred_erase_leaves_zero_recoverable_pii_in_backups() {
     let keep_b = SubjectId::new("u-keep-b");
 
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     let cryptor = ColumnCryptor::new(&kms, region());
 
     let seal = |subject: &SubjectId, pii: &[u8]| {
@@ -150,7 +151,8 @@ fn stor_d4_re_erase_after_a_restore_style_replay_stays_zero_recoverable() {
     let tenant = TenantId("beta".into());
     let subject = SubjectId::new("u-again");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     ColumnCryptor::new(&kms, region())
         .encrypt(
             &tenant,

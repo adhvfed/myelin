@@ -55,7 +55,8 @@ fn stor_d4_c1_erasing_a_subject_crypto_shreds_their_ci_log_zero_recoverable_in_b
     let keep = SubjectId::new("u-keep");
 
     let kms = Arc::new(KmsEngine::new());
-    kms.ensure_kek(&KekId::new(tenant(), region()));
+    kms.ensure_kek(&KekId::new(tenant(), region()))
+        .expect("seed the in-memory KEK");
 
     let tier = CiLogTier::with_tenant_dek("run-42", tenant(), region(), kms.clone());
 

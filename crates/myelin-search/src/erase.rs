@@ -639,7 +639,9 @@ mod tests {
             fn destroy(&self) {}
         }
         let engine = KmsEngine::new();
-        engine.ensure_kek(&KekId::new(tenant(), region()));
+        engine
+            .ensure_kek(&KekId::new(tenant(), region()))
+            .expect("seed the in-memory KEK");
         let platform = PlatformManaged::new(&engine, region());
         let byok = Byok::new(&engine, region(), "kms-customer://acme/k1");
         let hyok = Hyok::new(DenyAllHyok);

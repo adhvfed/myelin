@@ -52,9 +52,11 @@ fn stor_d1_restore_verify_gate_greens_a_whole_restore() {
     let live = tenant("acme");
     let erased = tenant("offboarded");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(live.clone(), region()));
+    kms.ensure_kek(&KekId::new(live.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&live, &region(), KeyClass::Tenant).unwrap();
-    kms.ensure_kek(&KekId::new(erased.clone(), region()));
+    kms.ensure_kek(&KekId::new(erased.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&erased, &region(), KeyClass::Tenant)
         .unwrap();
     assert!(kms.destroy_kek(&KekId::new(erased.clone(), region())));
@@ -167,7 +169,8 @@ fn stor_d1_restore_verify_gate_greens_a_whole_restore() {
 fn stor_d1_gate_fails_ci_on_a_corrupted_backup() {
     let t = tenant("acme");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(300);
     let present = RestoredObject::integral(b"present".to_vec());
@@ -210,7 +213,8 @@ fn stor_d1_gate_fails_ci_on_a_corrupted_backup() {
 fn stor_d1_gate_fails_ci_on_a_checksum_mismatch() {
     let t = tenant("acme");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(300);
     let address = ContentHash::blake3(b"good-bytes");
@@ -250,7 +254,8 @@ fn stor_d1_gate_fails_ci_on_a_checksum_mismatch() {
 fn stor_d1_gate_fails_ci_on_a_resurrected_erased_subject() {
     let resurrected = tenant("should-be-dead");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(resurrected.clone(), region()));
+    kms.ensure_kek(&KekId::new(resurrected.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&resurrected, &region(), KeyClass::Tenant)
         .unwrap();
     let arch = reachable_archiver(300);
@@ -284,7 +289,8 @@ fn stor_d1_gate_fails_ci_on_a_resurrected_erased_subject() {
 fn stor_d1_gate_is_loud_never_swallowed() {
     let t = tenant("acme");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(300);
     let address = ContentHash::blake3(b"good");

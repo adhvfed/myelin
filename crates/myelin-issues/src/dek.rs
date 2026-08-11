@@ -45,7 +45,7 @@ pub fn encrypt_free_text(
     _kind: IssueFreeText,
     plaintext: &[u8],
 ) -> Result<EncryptedColumn, KeyChoiceError> {
-    engine.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    engine.ensure_kek(&KekId::new(tenant.clone(), region.clone()))?;
     let cryptor = ColumnCryptor::new(engine, region.clone());
     cryptor.encrypt(tenant, Some(subject), &subject_dek_erasure(), plaintext)
 }

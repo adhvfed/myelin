@@ -39,7 +39,9 @@ fn cdc_11_4_c1_ci_keys_isolable_pii_per_subject_and_falls_back_per_tenant() {
     let tenant = TenantId("acme".into());
     let region = Region("fr-par".into());
     let engine = Arc::new(KmsEngine::new());
-    engine.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    engine
+        .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("seed the in-memory KEK");
 
     let mut ci = CiRunLogs::boot(tenant, region, engine, "run-7");
     let alice = SubjectId::new("u-alice");

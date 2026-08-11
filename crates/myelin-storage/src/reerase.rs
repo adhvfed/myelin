@@ -315,7 +315,8 @@ mod tests {
 
     fn engine_with_subject(tenant: &TenantId, subject: &SubjectId) -> KmsEngine {
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(tenant.clone(), r()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), r()))
+            .expect("seed the in-memory KEK");
         let cryptor = ColumnCryptor::new(&kms, r());
         cryptor
             .encrypt(

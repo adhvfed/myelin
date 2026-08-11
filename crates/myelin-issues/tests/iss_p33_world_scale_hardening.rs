@@ -282,7 +282,8 @@ fn reachable_archiver(tail: u64) -> ContinuousArchiver {
 
 fn verify_one_tenant_issues_restore(tenant: &TenantId) -> u64 {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(tenant, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(300);
     let objects = vec![
@@ -370,7 +371,8 @@ fn iss_p33_one_corrupt_object_fails_the_cell() {
     use myelin_storage::{ContentHash, GateFailure};
     let tenant = TenantId("iss-cell-tenant-00003".into());
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&tenant, &region(), KeyClass::Tenant)
         .unwrap();
     let arch = reachable_archiver(300);

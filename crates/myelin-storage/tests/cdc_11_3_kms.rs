@@ -10,7 +10,8 @@ struct EncryptedProfileStore<'a> {
 
 impl<'a> EncryptedProfileStore<'a> {
     fn boot(kms: &'a KmsEngine, tenant: TenantId, region: Region) -> Self {
-        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+            .expect("seed the in-memory KEK");
         EncryptedProfileStore {
             kms,
             tenant,

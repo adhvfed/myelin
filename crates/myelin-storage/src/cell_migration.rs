@@ -161,7 +161,8 @@ mod tests {
         let mut blobs = BlobPresence::new();
         blobs.insert(blob);
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(TenantId::from_token("acme"), region()));
+        kms.ensure_kek(&KekId::new(TenantId::from_token("acme"), region()))
+            .expect("seed the in-memory KEK");
         kms.ensure_dek(&TenantId::from_token("acme"), &region(), KeyClass::Tenant)
             .unwrap();
         CellTenantTiers {

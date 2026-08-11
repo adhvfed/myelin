@@ -42,10 +42,12 @@ impl IndexBuilder {
 #[test]
 fn cdc_11_3_index_builder_consults_can_derive_plaintext_index() {
     let engine = KmsEngine::new();
-    engine.ensure_kek(&KekId::new(
-        TenantId("acme".into()),
-        Region("eu-west".into()),
-    ));
+    engine
+        .ensure_kek(&KekId::new(
+            TenantId("acme".into()),
+            Region("eu-west".into()),
+        ))
+        .expect("seed the in-memory KEK");
 
     let platform = PlatformManaged::new(&engine, Region("eu-west".into()));
     let byok = Byok::new(&engine, Region("eu-west".into()), "kms-customer://acme/k1");
@@ -72,10 +74,12 @@ fn cdc_11_3_index_builder_consults_can_derive_plaintext_index() {
 #[test]
 fn cdc_11_3_byok_wraps_under_customer_path_full_capability() {
     let engine = KmsEngine::new();
-    engine.ensure_kek(&KekId::new(
-        TenantId("acme".into()),
-        Region("eu-west".into()),
-    ));
+    engine
+        .ensure_kek(&KekId::new(
+            TenantId("acme".into()),
+            Region("eu-west".into()),
+        ))
+        .expect("seed the in-memory KEK");
     let byok = Byok::new(
         &engine,
         Region("eu-west".into()),

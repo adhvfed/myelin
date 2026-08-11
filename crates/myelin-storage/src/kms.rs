@@ -440,8 +440,8 @@ impl fmt::Display for KmsError {
             ),
             KmsError::Durability(e) => write!(
                 f,
-                "KMS: durable write-through FAILED - the key operation was rolled back and refused \
-                 (a key that does not survive a restart is never handed out; SI-006): {e}"
+                "KMS: durable key operation FAILED and was refused (no unpersisted key material \
+                 is handed out; SI-006): {e}"
             ),
         }
     }
@@ -898,10 +898,10 @@ impl KmsEngine {
         }
     }
 
-    pub fn ensure_kek(&self, id: &KekId) -> u64 {
+    pub fn ensure_kek(&self, id: &KekId) -> Result<u64, KmsError> {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            KmsBackend::Memory(core) => core.ensure_kek(id),
+            KmsBackend::Memory(core) => Ok(core.ensure_kek(id)),
             KmsBackend::Durable(d) => d.ensure_kek(id),
         }
     }
@@ -1111,7 +1111,8 @@ mod tests {
     fn wrap_unwrap_round_trips_a_dek_under_a_kek() {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
-        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+            .expect("seed the in-memory KEK");
         let kr = kms
             .ensure_dek(&tenant, &region, KeyClass::Tenant)
             .expect("ensure dek");
@@ -1132,7 +1133,8 @@ mod tests {
     fn per_subject_dek_is_distinct_from_the_tenant_dek() {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
-        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+            .expect("seed the in-memory KEK");
         let tk = kms
             .ensure_dek(&tenant, &region, KeyClass::Tenant)
             .expect("tenant dek");
@@ -1155,7 +1157,7 @@ mod tests {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
         let kek_id = KekId::new(tenant.clone(), region.clone());
-        kms.ensure_kek(&kek_id);
+        kms.ensure_kek(&kek_id).expect("seed the in-memory KEK");
         let tk = kms
             .ensure_dek(&tenant, &region, KeyClass::Tenant)
             .expect("tenant dek");
@@ -1182,7 +1184,8 @@ mod tests {
     fn destroy_subject_dek_leaves_the_tenant_and_other_subjects_intact() {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
-        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+            .expect("seed the in-memory KEK");
         let tk = kms
             .ensure_dek(&tenant, &region, KeyClass::Tenant)
             .expect("tenant");
@@ -1216,7 +1219,7 @@ mod tests {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
         let kek_id = KekId::new(tenant.clone(), region.clone());
-        kms.ensure_kek(&kek_id);
+        kms.ensure_kek(&kek_id).expect("seed the in-memory KEK");
         let kr = kms
             .ensure_dek(&tenant, &region, KeyClass::Tenant)
             .expect("dek");
@@ -1266,8 +1269,10 @@ mod tests {
         let kms = KmsEngine::new();
         let (live, region) = (t("live-co"), r("eu-west"));
         let (dead, _) = (t("offboarded-co"), r("eu-west"));
-        kms.ensure_kek(&KekId::new(live.clone(), region.clone()));
-        kms.ensure_kek(&KekId::new(dead.clone(), region.clone()));
+        kms.ensure_kek(&KekId::new(live.clone(), region.clone()))
+            .expect("seed the live in-memory KEK");
+        kms.ensure_kek(&KekId::new(dead.clone(), region.clone()))
+            .expect("seed the doomed in-memory KEK");
         kms.ensure_dek(&live, &region, KeyClass::Tenant)
             .expect("live dek");
         kms.ensure_dek(&dead, &region, KeyClass::Tenant)
@@ -1427,8 +1432,10 @@ mod tests {
         let kms = KmsEngine::new();
         let (live, region) = (t("live-co"), r("eu-west"));
         let dead = t("offboarded-co");
-        kms.ensure_kek(&KekId::new(live.clone(), region.clone()));
-        kms.ensure_kek(&KekId::new(dead.clone(), region.clone()));
+        kms.ensure_kek(&KekId::new(live.clone(), region.clone()))
+            .expect("seed the live in-memory KEK");
+        kms.ensure_kek(&KekId::new(dead.clone(), region.clone()))
+            .expect("seed the doomed in-memory KEK");
         let kr = kms
             .ensure_dek(&live, &region, KeyClass::Tenant)
             .expect("live dek");
@@ -1472,7 +1479,8 @@ mod tests {
     fn debug_redacts_all_key_material() {
         let kms = KmsEngine::new();
         let (tenant, region) = (t("acme"), r("eu-west"));
-        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+            .expect("seed the in-memory KEK");
         let kr = kms
             .ensure_dek(&tenant, &region, KeyClass::Tenant)
             .expect("dek");

@@ -75,7 +75,8 @@ fn to_harness_snapshot(report: &RestoreReport, objects: &[RestoredObject]) -> Re
 fn ci_p27_restore_verify_greens_over_the_ci_stores_zero_loss() {
     let live = tenant("acme-ci");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(live.clone(), region()));
+    kms.ensure_kek(&KekId::new(live.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&live, &region(), KeyClass::Tenant).unwrap();
 
     let ci_event_log_offset: u64 = 300;
@@ -332,7 +333,8 @@ fn ci_p27_restore_verify_rpo_rto_within_bounds_for_the_ci_stores() {
 fn ci_p27_restore_verify_fails_ci_on_a_corrupted_ci_backup() {
     let t = tenant("acme-ci");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&t, &region(), KeyClass::Tenant).unwrap();
     let arch = reachable_archiver(500);
 

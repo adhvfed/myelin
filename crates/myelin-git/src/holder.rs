@@ -484,7 +484,8 @@ mod tests {
     fn engine_with_subject_and_git_keys() -> KmsEngine {
         let kms = KmsEngine::new();
         let (t, r) = (tenant(), region());
-        kms.ensure_kek(&KekId::new(t.clone(), r.clone()));
+        kms.ensure_kek(&KekId::new(t.clone(), r.clone()))
+            .expect("seed the in-memory KEK");
         kms.ensure_dek(&t, &r, KeyClass::Subject("p-opaque-ada".into()))
             .expect("subject dek");
         kms.ensure_dek(&t, &r, KeyClass::Blob).expect("blob dek");

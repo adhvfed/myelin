@@ -55,7 +55,8 @@ mod tests {
 
     fn engine_with_subject(tenant: &TenantId, subject: &str) -> (Arc<KmsEngine>, EventsPiiKeyRef) {
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+            .expect("seed the in-memory KEK");
         let kref = kms
             .ensure_dek(tenant, &region(), KeyClass::Subject(subject.into()))
             .expect("mint subject DEK");

@@ -503,8 +503,9 @@ mod tests {
         let shredded = tenant("shredded");
         let live_kek = KekId::new(live.clone(), region());
         let shredded_kek = KekId::new(shredded.clone(), region());
-        kms.ensure_kek(&live_kek);
-        kms.ensure_kek(&shredded_kek);
+        kms.ensure_kek(&live_kek).expect("seed the in-memory KEK");
+        kms.ensure_kek(&shredded_kek)
+            .expect("seed the in-memory KEK");
         kms.ensure_dek(&live, &region(), KeyClass::Tenant).unwrap();
         kms.ensure_dek(&shredded, &region(), KeyClass::Tenant)
             .unwrap();

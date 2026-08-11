@@ -2668,7 +2668,8 @@ fn seal_pr_record(
     let encoded = serde_json::to_vec(record)
         .map_err(|_| DurableError::Io("encode PR record failed".into()))?;
     ensure_pr_record_size(encoded.len())?;
-    kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .map_err(|_| DurableError::Io("PR free-text encryption failed".into()))?;
     let cryptor = ColumnCryptor::new(kms, region);
     let subject = SubjectId::new(record.author_subject_id.clone());
     let erasure = ErasureMethod::CryptoShred("subject_dek".into());

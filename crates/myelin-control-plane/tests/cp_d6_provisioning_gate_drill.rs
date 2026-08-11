@@ -50,7 +50,8 @@ fn reachable_archiver(tail: u64) -> ContinuousArchiver {
 
 fn live_kms() -> KmsEngine {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(TenantId::from_token("acme"), region()));
+    kms.ensure_kek(&KekId::new(TenantId::from_token("acme"), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(&TenantId::from_token("acme"), &region(), KeyClass::Tenant)
         .unwrap();
     kms
@@ -217,7 +218,8 @@ fn cp_d6_decommission_crypto_shreds_the_kek() {
 
     let tenant = TenantId::from_token("acme");
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     let key_ref = kms
         .ensure_dek(&tenant, &region(), KeyClass::Tenant)
         .unwrap();

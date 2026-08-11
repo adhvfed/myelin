@@ -278,7 +278,8 @@ mod tests {
     }
     fn engine_for(tenant: &TenantId) -> KmsEngine {
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(tenant.clone(), r()));
+        kms.ensure_kek(&KekId::new(tenant.clone(), r()))
+            .expect("seed the in-memory KEK");
         kms
     }
     fn arc_engine_for(tenant: &TenantId) -> std::sync::Arc<KmsEngine> {

@@ -419,7 +419,8 @@ mod tests {
 
     fn seeded_kms(footprint: &CiSubjectFootprint) -> KmsEngine {
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(tenant(), region()));
+        kms.ensure_kek(&KekId::new(tenant(), region()))
+            .expect("seed the in-memory KEK");
         for row in footprint.rows() {
             kms.ensure_dek(&tenant(), &region(), row.pii_key_ref.class.clone())
                 .expect("seal the DEK live");

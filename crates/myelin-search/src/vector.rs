@@ -521,7 +521,8 @@ mod tests {
         let kms = Arc::new(KmsEngine::new());
         let t = TenantId("acme".into());
         let r = Region("fr-par".into());
-        kms.ensure_kek(&KekId::new(t.clone(), r.clone()));
+        kms.ensure_kek(&KekId::new(t.clone(), r.clone()))
+            .expect("seed the in-memory KEK");
         let key_ref = kms
             .ensure_dek(&t, &r, myelin_storage::KeyClass::Tenant)
             .expect("dek");

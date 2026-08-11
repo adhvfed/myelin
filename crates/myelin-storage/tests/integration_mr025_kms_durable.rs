@@ -282,7 +282,9 @@ async fn keys_minted_through_the_default_sync_api_survive_engine_reconstruction(
         .await
         .expect("production boot: load_or_generate");
 
-    engine1.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    engine1
+        .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("tenant KEK via the plain sync API");
     let live_ref = engine1
         .ensure_dek(&tenant, &region, KeyClass::Tenant)
         .expect("tenant DEK via the plain sync API");
@@ -345,7 +347,9 @@ async fn running_processes_observe_key_creation_and_crypto_shred_without_restart
         .load_or_generate(&seal)
         .await
         .expect("a second process shares the sealed cell root");
-    writer.ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+    writer
+        .ensure_kek(&KekId::new(tenant.clone(), region.clone()))
+        .expect("the writer publishes the tenant KEK");
     let key_ref = writer
         .ensure_dek(&tenant, &region, KeyClass::Subject("u-live".into()))
         .expect("the writer creates and durably publishes the subject key");
@@ -529,7 +533,7 @@ async fn rotation_persists_kek_and_all_rewrapped_deks_atomically_and_survives_re
         .await
         .expect("production boot: load_or_generate");
     let kek_id = KekId::new(tenant.clone(), region.clone());
-    let mint_epoch = engine1.ensure_kek(&kek_id);
+    let mint_epoch = engine1.ensure_kek(&kek_id).expect("mint tenant KEK");
     let tenant_ref = engine1
         .ensure_dek(&tenant, &region, KeyClass::Tenant)
         .expect("tenant DEK");
@@ -594,6 +598,33 @@ async fn rotation_persists_kek_and_all_rewrapped_deks_atomically_and_survives_re
         "OK [5]: rotation persists the KEK + all re-wrapped DEK rows consistently (one PG tx) and \
          everything decrypts after restart."
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_database_outage_refuses_new_keys_without_taking_the_worker_down() {
+    let Some(provider) = admin_provider().await else {
+        return;
+    };
+    let suffix = uniq();
+    let cell = format!("cell-{suffix}");
+    let tenant = TenantId(format!("01J0DOWN{suffix}"));
+    let region = Region("eu-west".into());
+
+    let backing = DurableKmsBacking::new(provider.db_pool().clone(), &cell);
+    let engine = backing
+        .load_or_generate(&seal_k())
+        .await
+        .expect("the worker boots while its durable key store is healthy");
+    backing.close_pool_for_test().await;
+
+    let refusal = engine.ensure_dek(&tenant, &region, KeyClass::Tenant);
+    assert!(
+        matches!(refusal, Err(myelin_storage::KmsError::Durability(_))),
+        "an unavailable key store is a controlled refusal, never a worker panic: {refusal:?}"
+    );
+
+    cleanup(provider.db_pool(), &cell).await;
+    println!("OK [8]: a database outage refuses key provisioning and leaves the worker alive.");
 }
 
 async fn cleanup(pool: &sqlx::postgres::PgPool, cell: &str) {

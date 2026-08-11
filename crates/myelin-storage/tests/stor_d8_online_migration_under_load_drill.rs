@@ -81,7 +81,8 @@ fn reachable_archiver(tail: u64) -> ContinuousArchiver {
 
 fn kms_with_tenant(t: &TenantId) -> KmsEngine {
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(t.clone(), region()));
+    kms.ensure_kek(&KekId::new(t.clone(), region()))
+        .expect("seed the in-memory KEK");
     kms.ensure_dek(t, &region(), KeyClass::Tenant).unwrap();
     kms
 }

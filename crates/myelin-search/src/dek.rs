@@ -25,7 +25,7 @@ impl SearchDekPin {
 
     pub fn reserve(&self, tenant: &TenantId, region: &Region) -> Result<PiiKeyRef, KmsError> {
         self.kms
-            .ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+            .ensure_kek(&KekId::new(tenant.clone(), region.clone()))?;
         self.kms
             .ensure_dek(tenant, region, Self::tenant_index_dek_class())
     }
@@ -37,7 +37,7 @@ impl SearchDekPin {
         subject_id: &str,
     ) -> Result<PiiKeyRef, KmsError> {
         self.kms
-            .ensure_kek(&KekId::new(tenant.clone(), region.clone()));
+            .ensure_kek(&KekId::new(tenant.clone(), region.clone()))?;
         self.kms
             .ensure_dek(tenant, region, Self::subject_source_dek_class(subject_id))
     }
@@ -345,7 +345,9 @@ mod tests {
         }
 
         let engine = KmsEngine::new();
-        engine.ensure_kek(&KekId::new(t(), r()));
+        engine
+            .ensure_kek(&KekId::new(t(), r()))
+            .expect("seed the in-memory KEK");
         let platform = PlatformManaged::new(&engine, r());
         let byok = Byok::new(&engine, r(), "kms-customer://acme/k1");
         let hyok = Hyok::new(DenyAllHyok);

@@ -52,7 +52,8 @@ fn gd4_granularity_gate_zero_misrouted_classes_and_structural_floor_holds() {
 
     let tenant = TenantId("acme".into());
     let kms = KmsEngine::new();
-    kms.ensure_kek(&KekId::new(tenant.clone(), region()));
+    kms.ensure_kek(&KekId::new(tenant.clone(), region()))
+        .expect("seed the in-memory KEK");
     let floor = StructuralErasureFloor::new(&kms, region());
     let report = floor.verify(&SubjectId::new("u-structural"), &tenant);
     assert!(

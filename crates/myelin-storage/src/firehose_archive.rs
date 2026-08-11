@@ -378,7 +378,8 @@ mod tests {
     }
     fn engine() -> std::sync::Arc<KmsEngine> {
         let kms = KmsEngine::new();
-        kms.ensure_kek(&KekId::new(tenant(), region()));
+        kms.ensure_kek(&KekId::new(tenant(), region()))
+            .expect("seed the in-memory KEK");
         std::sync::Arc::new(kms)
     }
     fn archiver(engine: std::sync::Arc<KmsEngine>) -> FirehoseArchiver {
