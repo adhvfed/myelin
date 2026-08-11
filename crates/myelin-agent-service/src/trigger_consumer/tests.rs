@@ -317,7 +317,8 @@ fn exact_fanout_cap_is_allowed_and_one_more_is_refused_loudly() {
         (
             super::MAX_EVENT_BINDINGS as usize + 1,
             HandleOutcome::NonRetryable(myelin_events::Reason(
-                "event trigger fanout exceeds the 1000-binding safety bound".into(),
+                "durable event trigger capacity invariant exceeds the 1000-binding safety bound"
+                    .into(),
             )),
         ),
     ] {

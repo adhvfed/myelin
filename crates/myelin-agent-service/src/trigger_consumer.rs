@@ -4,10 +4,13 @@ use chrono::{DateTime, Utc};
 use myelin_events::{Backoff, EventEnvelope, EventHandler, HandleOutcome, Reason, SubjectPattern};
 use myelin_identity::SetExpr;
 use myelin_query::{EventMatcher, RelMembership};
-use myelin_storage::{DurableAgentTriggerBinding, ReserveAgentTriggerFiringOutcome};
+use myelin_storage::{
+    DurableAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
+    MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT,
+};
 
 pub const TRIGGER_CONSUMER_NAME: &str = "agent-governed-trigger";
-pub const MAX_EVENT_BINDINGS: u32 = 1_000;
+pub const MAX_EVENT_BINDINGS: u32 = MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT;
 
 pub trait TriggerBindingStore: Send + Sync {
     fn active_for_event(
@@ -88,7 +91,7 @@ impl GovernedTriggerConsumer {
             .map_err(|_| TriggerDeliveryError::Unavailable)?;
         if bindings.len() > MAX_EVENT_BINDINGS as usize {
             return Err(TriggerDeliveryError::Malformed(format!(
-                "event trigger fanout exceeds the {MAX_EVENT_BINDINGS}-binding safety bound"
+                "durable event trigger capacity invariant exceeds the {MAX_EVENT_BINDINGS}-binding safety bound"
             )));
         }
         let recorded_at = DateTime::parse_from_rfc3339(&event.recorded_at.0)

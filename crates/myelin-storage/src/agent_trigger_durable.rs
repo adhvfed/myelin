@@ -2,14 +2,16 @@ mod model;
 mod schema;
 
 pub use model::{
-    AgentTriggerApprovalDecision, AgentTriggerApprovalOutcome, AgentTriggerClaimRequest,
-    AgentTriggerFiringState, AgentTriggerLifecycleAction, AgentTriggerLifecycleOutcome,
-    AgentTriggerRunOutcome, AgentTriggerStartRequest, ChangeAgentTriggerApprovalOutcome,
-    ChangeAgentTriggerLifecycleOutcome, ClaimedAgentTriggerFiring,
-    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
-    NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome, ReservedAgentTriggerFiring,
-    StartAgentTriggerFiringOutcome, StartedAgentTriggerRun, TerminalizeAgentTriggerClaimOutcome,
-    MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    AgentTriggerApprovalDecision, AgentTriggerApprovalOutcome, AgentTriggerCapacityScope,
+    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerLifecycleAction,
+    AgentTriggerLifecycleOutcome, AgentTriggerRunOutcome, AgentTriggerStartRequest,
+    ChangeAgentTriggerApprovalOutcome, ChangeAgentTriggerLifecycleOutcome,
+    ClaimedAgentTriggerFiring, CreateAgentTriggerBindingOutcome, DurableAgentTriggerBinding,
+    DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
+    ReservedAgentTriggerFiring, StartAgentTriggerFiringOutcome, StartedAgentTriggerRun,
+    TerminalizeAgentTriggerClaimOutcome, MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT,
+    MAX_ACTIVE_AGENT_TRIGGERS_PER_OWNER_EVENT, MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
+    MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use schema::{
     agent_trigger_durable_migrations, agent_trigger_terminal_reason_migrations,
@@ -28,11 +30,41 @@ use crate::provider::{ProviderError, SubstrateProvider};
 #[derive(Clone)]
 pub struct DurableAgentTriggerBacking {
     provider: SubstrateProvider,
+    capacity: AgentTriggerCapacity,
+}
+
+#[derive(Clone, Copy)]
+struct AgentTriggerCapacity {
+    per_owner_event: u32,
+    per_event: u32,
 }
 
 impl DurableAgentTriggerBacking {
     pub fn new(provider: SubstrateProvider) -> Self {
-        Self { provider }
+        Self {
+            provider,
+            capacity: AgentTriggerCapacity {
+                per_owner_event: MAX_ACTIVE_AGENT_TRIGGERS_PER_OWNER_EVENT,
+                per_event: MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT,
+            },
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_capacity_for_test(
+        provider: SubstrateProvider,
+        per_owner_event: u32,
+        per_event: u32,
+    ) -> Self {
+        assert!(per_owner_event > 0);
+        assert!(per_owner_event <= per_event);
+        Self {
+            provider,
+            capacity: AgentTriggerCapacity {
+                per_owner_event,
+                per_event,
+            },
+        }
     }
 
     pub async fn create(
@@ -49,6 +81,7 @@ impl DurableAgentTriggerBacking {
         }
         let tenant = tenant.to_string();
         let region = self.provider.config().region.clone();
+        let capacity = self.capacity;
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
@@ -91,6 +124,36 @@ impl DurableAgentTriggerBacking {
                         return Ok(CreateAgentTriggerBindingOutcome::AgentUnavailable);
                     }
 
+                    lock_agent_trigger_capacity(conn, &tenant, &region, &proposal.event_type)
+                        .await?;
+                    if let Some(binding) = binding_for_nonce_on_connection(
+                        conn,
+                        &tenant,
+                        &region,
+                        &proposal.owner_principal_id,
+                        &proposal.client_nonce,
+                    )
+                    .await?
+                    {
+                        return Ok(if binding_matches(&binding, &proposal) {
+                            CreateAgentTriggerBindingOutcome::Replayed(binding)
+                        } else {
+                            CreateAgentTriggerBindingOutcome::Conflict
+                        });
+                    }
+                    if let Some(scope) = active_trigger_capacity_scope_on_connection(
+                        conn,
+                        &tenant,
+                        &region,
+                        &proposal.owner_principal_id,
+                        &proposal.event_type,
+                        capacity,
+                    )
+                    .await?
+                    {
+                        return Ok(CreateAgentTriggerBindingOutcome::CapacityReached(scope));
+                    }
+
                     let max_firings = i64::try_from(proposal.max_firings)
                         .map_err(|_| PgError::Query("trigger max_firings exceeds i64".into()))?;
                     let budget_minor_units = i64::try_from(proposal.budget_minor_units)
@@ -125,30 +188,22 @@ impl DurableAgentTriggerBacking {
                     .execute(&mut *conn)
                     .await
                     .map_err(query_error("create agent trigger binding"))?
-                    .rows_affected()
-                        == 1;
-                    let row = sqlx::query(
-                        "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
-                                event_type, matcher, task, delegation_caveats, \
-                                budget_minor_units, max_firings, \
-                                firings_used, max_causal_depth, require_no_personal_data, \
-                                require_human_approval, state, created_at \
-                           FROM agent_trigger_binding \
-                          WHERE tenant_id = $1 AND region = $2 \
-                            AND owner_principal_id = $3 AND client_nonce = $4",
+                    .rows_affected();
+                    let binding = binding_for_nonce_on_connection(
+                        conn,
+                        &tenant,
+                        &region,
+                        &proposal.owner_principal_id,
+                        &proposal.client_nonce,
                     )
-                    .bind(&tenant)
-                    .bind(&region)
-                    .bind(&proposal.owner_principal_id)
-                    .bind(&proposal.client_nonce)
-                    .fetch_one(&mut *conn)
-                    .await
-                    .map_err(query_error("load agent trigger binding"))?;
-                    let binding = binding_from_row(&row)?;
+                    .await?
+                    .ok_or_else(|| {
+                        PgError::Query("created agent trigger binding is unavailable".into())
+                    })?;
                     if !binding_matches(&binding, &proposal) {
                         return Ok(CreateAgentTriggerBindingOutcome::Conflict);
                     }
-                    Ok(if created {
+                    Ok(if created == 1 {
                         CreateAgentTriggerBindingOutcome::Created(binding)
                     } else {
                         CreateAgentTriggerBindingOutcome::Replayed(binding)
@@ -169,7 +224,8 @@ impl DurableAgentTriggerBacking {
         let event_type = event_type.to_string();
         // Consumers may ask for one row beyond their own fanout bound so they can
         // distinguish an exact-cap batch from an overflow without unbounded reads.
-        let limit = i64::from(limit.clamp(1, 1_001));
+        let limit =
+            i64::from(limit.clamp(1, MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT.saturating_add(1)));
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
@@ -359,6 +415,23 @@ impl DurableAgentTriggerBacking {
         };
         let target = action.target();
         if changed {
+            if action == AgentTriggerLifecycleAction::Resume
+                && binding.firings_used < binding.max_firings
+            {
+                lock_agent_trigger_capacity(conn, tenant, region, &binding.event_type).await?;
+                if let Some(scope) = active_trigger_capacity_scope_on_connection(
+                    conn,
+                    tenant,
+                    region,
+                    &binding.owner_principal_id,
+                    &binding.event_type,
+                    self.capacity,
+                )
+                .await?
+                {
+                    return Ok(ChangeAgentTriggerLifecycleOutcome::CapacityReached(scope));
+                }
+            }
             sqlx::query(
                 "UPDATE agent_trigger_binding SET state = $5 \
                   WHERE tenant_id = $1 AND region = $2 AND binding_id = $3 \
@@ -1010,6 +1083,90 @@ impl DurableAgentTriggerBacking {
     }
 }
 
+async fn lock_agent_trigger_capacity(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    event_type: &str,
+) -> Result<(), PgError> {
+    let capacity_key =
+        format!("agent-trigger-capacity\u{1f}{tenant}\u{1f}{region}\u{1f}{event_type}");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(capacity_key)
+        .execute(&mut *conn)
+        .await
+        .map_err(query_error("lock agent trigger capacity"))?;
+    Ok(())
+}
+
+async fn binding_for_nonce_on_connection(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    owner_principal_id: &str,
+    client_nonce: &str,
+) -> Result<Option<DurableAgentTriggerBinding>, PgError> {
+    let row = sqlx::query(
+        "SELECT binding_id, owner_principal_id, run_as_agent_id, client_nonce, \
+                event_type, matcher, task, delegation_caveats, \
+                budget_minor_units, max_firings, firings_used, max_causal_depth, \
+                require_no_personal_data, require_human_approval, state, created_at \
+           FROM agent_trigger_binding \
+          WHERE tenant_id = $1 AND region = $2 \
+            AND owner_principal_id = $3 AND client_nonce = $4",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(owner_principal_id)
+    .bind(client_nonce)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(query_error("load agent trigger binding by nonce"))?;
+    row.as_ref().map(binding_from_row).transpose()
+}
+
+async fn active_trigger_capacity_scope_on_connection(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    owner_principal_id: &str,
+    event_type: &str,
+    capacity: AgentTriggerCapacity,
+) -> Result<Option<AgentTriggerCapacityScope>, PgError> {
+    let (owner_count, event_count) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT count(*) FILTER (WHERE owner_principal_id = $4), count(*) \
+           FROM agent_trigger_binding \
+          WHERE tenant_id = $1 AND region = $2 AND event_type = $3 \
+            AND state = 'active' AND firings_used < max_firings",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(event_type)
+    .bind(owner_principal_id)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(query_error("count active agent trigger capacity"))?;
+    let owner_count = u64::try_from(owner_count)
+        .map_err(|_| PgError::Query("negative owner trigger capacity count".into()))?;
+    let event_count = u64::try_from(event_count)
+        .map_err(|_| PgError::Query("negative event trigger capacity count".into()))?;
+    Ok(capacity_scope(owner_count, event_count, capacity))
+}
+
+fn capacity_scope(
+    owner_count: u64,
+    event_count: u64,
+    capacity: AgentTriggerCapacity,
+) -> Option<AgentTriggerCapacityScope> {
+    if owner_count >= u64::from(capacity.per_owner_event) {
+        Some(AgentTriggerCapacityScope::OwnerEvent)
+    } else if event_count >= u64::from(capacity.per_event) {
+        Some(AgentTriggerCapacityScope::TenantEvent)
+    } else {
+        None
+    }
+}
+
 fn binding_matches(
     binding: &DurableAgentTriggerBinding,
     proposal: &NewAgentTriggerBinding,
@@ -1264,6 +1421,28 @@ fn row_error(column: &'static str) -> impl FnOnce(sqlx::Error) -> PgError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_capacity_reports_the_constraint_an_owner_can_act_on_first() {
+        let capacity = AgentTriggerCapacity {
+            per_owner_event: 2,
+            per_event: 3,
+        };
+
+        assert_eq!(capacity_scope(1, 2, capacity), None);
+        assert_eq!(
+            capacity_scope(2, 2, capacity),
+            Some(AgentTriggerCapacityScope::OwnerEvent)
+        );
+        assert_eq!(
+            capacity_scope(1, 3, capacity),
+            Some(AgentTriggerCapacityScope::TenantEvent)
+        );
+        assert_eq!(
+            capacity_scope(2, 3, capacity),
+            Some(AgentTriggerCapacityScope::OwnerEvent)
+        );
+    }
 
     #[test]
     fn trigger_lifecycle_has_idempotent_targets_and_irreversible_disablement() {

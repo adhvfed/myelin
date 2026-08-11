@@ -7,6 +7,20 @@ import { browserApprovedCliClient, uniqueName } from "../src/context.js";
 import { GitProject } from "../src/git-project.js";
 import { array, record, string } from "../src/json.js";
 
+async function mapInBatches<Input, Output>(
+  inputs: readonly Input[],
+  batchSize: number,
+  operation: (input: Input) => Promise<Output>,
+): Promise<Output[]> {
+  const outputs: Output[] = [];
+  for (let offset = 0; offset < inputs.length; offset += batchSize) {
+    outputs.push(
+      ...await Promise.all(inputs.slice(offset, offset + batchSize).map(operation)),
+    );
+  }
+  return outputs;
+}
+
 describe("automation delegation", () => {
   test("shares a founder's view only through one short-lived, auditable agent run", async () => {
     const founder = await browserApprovedCliClient();
@@ -139,4 +153,116 @@ describe("automation delegation", () => {
       .filter((item) => item.task === task);
     expect(matching).toEqual([expect.objectContaining({ id: trigger.id })]);
   });
+
+  test("keeps one owner from crowding every collaborator out of an event", async () => {
+    const founder = await browserApprovedCliClient();
+    const activated = await founder.json("/v1/agents", {
+      method: "POST",
+      body: {
+        name: uniqueName("capacity-companion"),
+        runtime: "hosted",
+        tools: ["issues.view"],
+      },
+      idempotencyKey: `capacity-agent-${randomUUID()}`,
+      expectedStatus: 201,
+    });
+    const agentId = string(record(activated.body.agent, "capacity companion").id, "agent id");
+    const eventType = `knowledge.row.capacity_${randomUUID().replaceAll("-", "")}_tested`;
+    const intent = {
+      event_type: eventType,
+      run_as_agent_id: agentId,
+      task: "Keep this event responsive to other people and their agents.",
+      budget_minor_units: 10_000,
+      max_firings: 1,
+      delegation_caveats: [],
+    };
+    const ownerLimit = 100;
+    const idempotencyKeys = Array.from(
+      { length: ownerLimit },
+      (_, slot) => `capacity-${slot}-${randomUUID()}`,
+    );
+    const replayKey = idempotencyKeys.at(0);
+    if (!replayKey) throw new Error("the owner capacity story needs at least one slot");
+    const triggerIds: string[] = [];
+
+    try {
+      const admitted = await mapInBatches(idempotencyKeys, 10, async (idempotencyKey) =>
+        founder.json("/v1/triggers", {
+          method: "POST",
+          body: intent,
+          idempotencyKey,
+          expectedStatus: 201,
+        })
+      );
+      for (const [index, response] of admitted.entries()) {
+        expect(response.body).toMatchObject({ created: true, durable: true });
+        triggerIds.push(string(
+          record(response.body.trigger, `automation in owner slot ${index + 1}`).id,
+          `automation id in owner slot ${index + 1}`,
+        ));
+      }
+      const firstTriggerId = triggerIds.at(0);
+      if (!firstTriggerId) throw new Error("the first admitted automation is missing");
+
+      const replayed = await founder.json("/v1/triggers", {
+        method: "POST",
+        body: intent,
+        idempotencyKey: replayKey,
+        expectedStatus: 200,
+      });
+      expect(replayed.body).toMatchObject({
+        created: false,
+        durable: true,
+        trigger: { id: firstTriggerId },
+      });
+
+      const crowdedOut = await founder.json("/v1/triggers", {
+        method: "POST",
+        body: intent,
+        idempotencyKey: `one-too-many-${randomUUID()}`,
+        expectedStatus: 409,
+      });
+      expect(crowdedOut.body).toMatchObject({
+        error: {
+          code: "conflict",
+          message:
+            "active automation limit reached for this event; pause or disable one of your automations before retrying",
+        },
+      });
+
+      await founder.json(`/v1/triggers/${encodeURIComponent(firstTriggerId)}/pause`, {
+        method: "POST",
+        body: {},
+      });
+      const replacement = await founder.json("/v1/triggers", {
+        method: "POST",
+        body: intent,
+        idempotencyKey: `replacement-${randomUUID()}`,
+        expectedStatus: 201,
+      });
+      triggerIds.push(string(
+        record(replacement.body.trigger, "replacement automation").id,
+        "replacement automation id",
+      ));
+
+      const cannotOverbookByResume = await founder.json(
+        `/v1/triggers/${encodeURIComponent(firstTriggerId)}/resume`,
+        { method: "POST", body: {}, expectedStatus: 409 },
+      );
+      expect(cannotOverbookByResume.body).toMatchObject({
+        error: {
+          code: "conflict",
+          message:
+            "active automation limit reached for this event; pause or disable one of your automations before retrying",
+        },
+      });
+    } finally {
+      await mapInBatches(triggerIds, 20, async (triggerId) =>
+        founder.json(`/v1/triggers/${encodeURIComponent(triggerId)}/disable`, {
+          method: "POST",
+          body: {},
+        })
+      );
+    }
+  }, 90_000);
 });

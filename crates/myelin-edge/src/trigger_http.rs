@@ -5,8 +5,8 @@ use myelin_identity_service::{AgentRegistryError, PgAgentRegistry};
 use myelin_notif::pg_inbox::{InboxReadScope, PgInboxStore};
 use myelin_query::{CmpOp, EventMatcher, Expr, Predicate, QueryAst};
 use myelin_storage::{
-    AgentTraceAvailability, AgentTriggerApprovalDecision, AgentTriggerFiringState,
-    AgentTriggerLifecycleAction, ChangeAgentTriggerApprovalOutcome,
+    AgentTraceAvailability, AgentTriggerApprovalDecision, AgentTriggerCapacityScope,
+    AgentTriggerFiringState, AgentTriggerLifecycleAction, ChangeAgentTriggerApprovalOutcome,
     ChangeAgentTriggerLifecycleOutcome, CreateAgentTriggerBindingOutcome, DurableAgentTraceStore,
     DurableAgentTriggerBacking, DurableAgentTriggerBinding, DurableAgentTriggerFiring,
     EraseAgentTraceOutcome, NewAgentTriggerBinding, SubstrateProvider,
@@ -107,6 +107,9 @@ impl Handler for TriggerCreateHandler {
         let (status, created, binding) = match outcome {
             CreateAgentTriggerBindingOutcome::Created(binding) => (201, true, binding),
             CreateAgentTriggerBindingOutcome::Replayed(binding) => (200, false, binding),
+            CreateAgentTriggerBindingOutcome::CapacityReached(scope) => {
+                return Err(trigger_capacity_error(scope))
+            }
             CreateAgentTriggerBindingOutcome::Conflict => {
                 return Err(EdgeError::Conflict(
                     "idempotency key was already used for a different trigger".into(),
@@ -398,6 +401,9 @@ impl Handler for TriggerLifecycleHandler {
             .map_err(|error| EdgeError::Internal(error.to_string()))?;
         let outcome = match outcome {
             ChangeAgentTriggerLifecycleOutcome::Complete(outcome) => outcome,
+            ChangeAgentTriggerLifecycleOutcome::CapacityReached(scope) => {
+                return Err(trigger_capacity_error(scope))
+            }
             ChangeAgentTriggerLifecycleOutcome::NotFound => {
                 return Err(EdgeError::NotFound("trigger not found".into()))
             }
@@ -629,6 +635,18 @@ fn map_agent_registry_error(error: AgentRegistryError) -> EdgeError {
             EdgeError::Unavailable("the run-as agent could not be verified".into())
         }
     }
+}
+
+fn trigger_capacity_error(scope: AgentTriggerCapacityScope) -> EdgeError {
+    let message = match scope {
+        AgentTriggerCapacityScope::OwnerEvent => {
+            "active automation limit reached for this event; pause or disable one of your automations before retrying"
+        }
+        AgentTriggerCapacityScope::TenantEvent => {
+            "tenant automation limit reached for this event; an owner must pause or disable an automation before retrying"
+        }
+    };
+    EdgeError::Conflict(message.into())
 }
 
 fn lifecycle_action_token(action: AgentTriggerLifecycleAction) -> &'static str {
@@ -953,6 +971,22 @@ mod tests {
             recorded_at: Timestamp("2026-08-10T08:00:01Z".into()),
             payload: json!({ "source_ref": source_ref }),
         }
+    }
+
+    #[test]
+    fn automation_capacity_conflicts_name_the_safe_next_action() {
+        assert_eq!(
+            trigger_capacity_error(AgentTriggerCapacityScope::OwnerEvent),
+            EdgeError::Conflict(
+                "active automation limit reached for this event; pause or disable one of your automations before retrying".into()
+            )
+        );
+        assert_eq!(
+            trigger_capacity_error(AgentTriggerCapacityScope::TenantEvent),
+            EdgeError::Conflict(
+                "tenant automation limit reached for this event; an owner must pause or disable an automation before retrying".into()
+            )
+        );
     }
 
     #[test]

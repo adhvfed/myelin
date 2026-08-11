@@ -5,6 +5,8 @@ use crate::pg::PgError;
 
 pub const MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS: u64 = 1;
 pub const MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS: u64 = 1_000_000_000_000;
+pub const MAX_ACTIVE_AGENT_TRIGGERS_PER_OWNER_EVENT: u32 = 100;
+pub const MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT: u32 = 1_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct NewAgentTriggerBinding {
@@ -48,9 +50,16 @@ pub struct DurableAgentTriggerBinding {
 pub enum CreateAgentTriggerBindingOutcome {
     Created(DurableAgentTriggerBinding),
     Replayed(DurableAgentTriggerBinding),
+    CapacityReached(AgentTriggerCapacityScope),
     Conflict,
     OwnerUnavailable,
     AgentUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentTriggerCapacityScope {
+    OwnerEvent,
+    TenantEvent,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -81,6 +90,7 @@ pub struct AgentTriggerLifecycleOutcome {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ChangeAgentTriggerLifecycleOutcome {
     Complete(Box<AgentTriggerLifecycleOutcome>),
+    CapacityReached(AgentTriggerCapacityScope),
     NotFound,
     InvalidTransition,
 }

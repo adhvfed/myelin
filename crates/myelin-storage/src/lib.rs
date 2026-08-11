@@ -228,9 +228,9 @@ pub use storage_surge::{
 
 pub use agent_trigger_durable::{
     agent_trigger_durable_migrations, agent_trigger_terminal_reason_migrations,
-    AgentTriggerApprovalDecision, AgentTriggerApprovalOutcome, AgentTriggerClaimRequest,
-    AgentTriggerFiringState, AgentTriggerLifecycleAction, AgentTriggerLifecycleOutcome,
-    AgentTriggerStartRequest, ChangeAgentTriggerApprovalOutcome,
+    AgentTriggerApprovalDecision, AgentTriggerApprovalOutcome, AgentTriggerCapacityScope,
+    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerLifecycleAction,
+    AgentTriggerLifecycleOutcome, AgentTriggerStartRequest, ChangeAgentTriggerApprovalOutcome,
     ChangeAgentTriggerLifecycleOutcome, ClaimedAgentTriggerFiring,
     CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, DurableAgentTriggerBinding,
     DurableAgentTriggerFiring, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
@@ -238,6 +238,7 @@ pub use agent_trigger_durable::{
     TerminalizeAgentTriggerClaimOutcome, AGENT_TRIGGER_APPROVAL_MIGRATION,
     AGENT_TRIGGER_BUDGET_MIGRATION, AGENT_TRIGGER_CLAIM_MIGRATION, AGENT_TRIGGER_MIGRATION,
     AGENT_TRIGGER_RLS_POLICY, AGENT_TRIGGER_RUN_MIGRATION, AGENT_TRIGGER_TERMINAL_REASON_MIGRATION,
+    MAX_ACTIVE_AGENT_TRIGGERS_PER_EVENT, MAX_ACTIVE_AGENT_TRIGGERS_PER_OWNER_EVENT,
     MAX_AGENT_TRIGGER_BUDGET_MINOR_UNITS, MIN_AGENT_TRIGGER_BUDGET_MINOR_UNITS,
 };
 pub use authz_projection_durable::{

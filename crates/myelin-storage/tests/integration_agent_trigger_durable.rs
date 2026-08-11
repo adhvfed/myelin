@@ -4,12 +4,12 @@ use myelin_config::MyelinConfig;
 use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus, RuntimeRef};
 use myelin_storage::migration::HotTables;
 use myelin_storage::{
-    all_durable_migrations, AgentTriggerApprovalDecision, AgentTriggerClaimRequest,
-    AgentTriggerFiringState, AgentTriggerLifecycleAction, AgentTriggerStartRequest,
-    ChangeAgentTriggerApprovalOutcome, ChangeAgentTriggerLifecycleOutcome,
-    CreateAgentTriggerBindingOutcome, DurableAgentTriggerBacking, NewAgentTriggerBinding,
-    ReserveAgentTriggerFiringOutcome, StartAgentTriggerFiringOutcome, SubstrateProvider,
-    TerminalizeAgentTriggerClaimOutcome,
+    all_durable_migrations, AgentTriggerApprovalDecision, AgentTriggerCapacityScope,
+    AgentTriggerClaimRequest, AgentTriggerFiringState, AgentTriggerLifecycleAction,
+    AgentTriggerStartRequest, ChangeAgentTriggerApprovalOutcome,
+    ChangeAgentTriggerLifecycleOutcome, CreateAgentTriggerBindingOutcome,
+    DurableAgentTriggerBacking, NewAgentTriggerBinding, ReserveAgentTriggerFiringOutcome,
+    StartAgentTriggerFiringOutcome, SubstrateProvider, TerminalizeAgentTriggerClaimOutcome,
 };
 use sqlx::types::chrono::Utc;
 use sqlx::types::Uuid;
@@ -92,6 +92,66 @@ async fn seed_people_and_agent(
         })
         .await
         .expect("seed one active human and the explicitly selected active agent");
+}
+
+async fn seed_agent_for_owner(
+    provider: &SubstrateProvider,
+    tenant: &str,
+    agent_id: Uuid,
+    owner: &str,
+    runtime_ref: &str,
+) {
+    let tenant = tenant.to_string();
+    let region = provider.config().region.clone();
+    let agent_kind = serde_json::to_string(&PrincipalKind::Agent {
+        runtime_ref: RuntimeRef(runtime_ref.into()),
+        on_behalf_of: Some(PrincipalId(owner.into())),
+    })
+    .unwrap();
+    let processor = serde_json::to_string(&DataRole::Processor).unwrap();
+    let active = serde_json::to_string(&PrincipalStatus::Active).unwrap();
+    let agent_principal = format!("agent:{agent_id}");
+    let owner = owner.to_string();
+    let runtime_ref = runtime_ref.to_string();
+    provider
+        .with_tenant_tx(&tenant.clone(), move |conn| {
+            Box::pin(async move {
+                sqlx::query(
+                    "INSERT INTO principal \
+                       (tenant_id, region, principal_id, kind, data_role, status) \
+                     VALUES ($1, $2, $3, $4, $5, $6)",
+                )
+                .bind(&tenant)
+                .bind(&region)
+                .bind(&agent_principal)
+                .bind(&agent_kind)
+                .bind(&processor)
+                .bind(&active)
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                sqlx::query(
+                    "INSERT INTO identity_agent \
+                       (tenant_id, region, agent_id, name, runtime_ref, created_by, client_nonce, \
+                        tools, grants, created_at) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, \
+                             ARRAY['issue.create'], ARRAY['issue.create'], clock_timestamp())",
+                )
+                .bind(&tenant)
+                .bind(&region)
+                .bind(agent_id)
+                .bind(format!("{owner}-automation"))
+                .bind(&runtime_ref)
+                .bind(&owner)
+                .bind(format!("agent-create-{owner}"))
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| myelin_storage::PgError::Query(error.to_string()))?;
+                Ok(())
+            })
+        })
+        .await
+        .expect("seed an active agent owned by the selected human");
 }
 
 async fn clean_tenant(provider: &SubstrateProvider, tenant: &str) {
@@ -747,6 +807,200 @@ async fn one_human_binding_wakes_one_named_agent_once_when_main_goes_red() {
     );
 
     clean_tenant(&app, &tenant).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn active_automation_capacity_is_fair_retry_safe_and_concurrency_fenced() {
+    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
+        Ok(provider) => provider,
+        Err(_) => {
+            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
+            return;
+        }
+    };
+    admin
+        .migrate_foundation()
+        .await
+        .expect("the event foundation is present");
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .expect("the governed trigger schema migrates with the durable platform");
+
+    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+        .await
+        .expect("open the constrained app provider");
+    let tenant = unique_tenant();
+    let founder_agent = Uuid::new_v4();
+    let reviewer_agent = Uuid::new_v4();
+    seed_people_and_agent(&app, &tenant, founder_agent, "hosted:luna").await;
+    seed_agent_for_owner(&app, &tenant, reviewer_agent, "reviewer", "hosted:luna").await;
+    let triggers = DurableAgentTriggerBacking::with_capacity_for_test(app.clone(), 2, 2);
+
+    let mut first = red_mainline_binding(founder_agent);
+    first.binding_id = Uuid::new_v4();
+    first.client_nonce = "founder-first-red-mainline".into();
+    let mut second = first.clone();
+    second.binding_id = Uuid::new_v4();
+    second.client_nonce = "founder-second-red-mainline".into();
+    assert!(matches!(
+        triggers.create(&tenant, first.clone()).await.unwrap(),
+        CreateAgentTriggerBindingOutcome::Created(_)
+    ));
+    assert!(matches!(
+        triggers.create(&tenant, second.clone()).await.unwrap(),
+        CreateAgentTriggerBindingOutcome::Created(_)
+    ));
+
+    let mut exact_retry = second.clone();
+    exact_retry.binding_id = Uuid::new_v4();
+    assert!(
+        matches!(
+            triggers.create(&tenant, exact_retry).await.unwrap(),
+            CreateAgentTriggerBindingOutcome::Replayed(_)
+        ),
+        "an exact retry still finds its durable result when the event is full"
+    );
+
+    let mut third_for_founder = first.clone();
+    third_for_founder.binding_id = Uuid::new_v4();
+    third_for_founder.client_nonce = "founder-third-red-mainline".into();
+    assert_eq!(
+        triggers.create(&tenant, third_for_founder).await.unwrap(),
+        CreateAgentTriggerBindingOutcome::CapacityReached(AgentTriggerCapacityScope::OwnerEvent),
+        "one owner cannot monopolize an event's automation capacity"
+    );
+
+    let mut first_for_reviewer = first.clone();
+    first_for_reviewer.binding_id = Uuid::new_v4();
+    first_for_reviewer.owner_principal_id = "reviewer".into();
+    first_for_reviewer.run_as_agent_id = reviewer_agent;
+    first_for_reviewer.client_nonce = "reviewer-first-red-mainline".into();
+    assert_eq!(
+        triggers
+            .create(&tenant, first_for_reviewer.clone())
+            .await
+            .unwrap(),
+        CreateAgentTriggerBindingOutcome::CapacityReached(AgentTriggerCapacityScope::TenantEvent),
+        "the shared event limit remains explicit even when this owner has room"
+    );
+
+    triggers
+        .change_lifecycle(
+            &tenant,
+            "founder",
+            first.binding_id,
+            AgentTriggerLifecycleAction::Pause,
+        )
+        .await
+        .expect("the founder makes room for a collaborator");
+    assert!(matches!(
+        triggers
+            .create(&tenant, first_for_reviewer.clone())
+            .await
+            .unwrap(),
+        CreateAgentTriggerBindingOutcome::Created(_)
+    ));
+    assert_eq!(
+        triggers
+            .change_lifecycle(
+                &tenant,
+                "founder",
+                first.binding_id,
+                AgentTriggerLifecycleAction::Resume,
+            )
+            .await
+            .unwrap(),
+        ChangeAgentTriggerLifecycleOutcome::CapacityReached(AgentTriggerCapacityScope::TenantEvent),
+        "resume cannot bypass the same capacity contract as creation"
+    );
+    triggers
+        .change_lifecycle(
+            &tenant,
+            "reviewer",
+            first_for_reviewer.binding_id,
+            AgentTriggerLifecycleAction::Pause,
+        )
+        .await
+        .expect("the reviewer makes room again");
+    assert!(matches!(
+        triggers
+            .change_lifecycle(
+                &tenant,
+                "founder",
+                first.binding_id,
+                AgentTriggerLifecycleAction::Resume,
+            )
+            .await
+            .unwrap(),
+        ChangeAgentTriggerLifecycleOutcome::Complete(ref outcome)
+            if outcome.changed && outcome.binding.state == "active"
+    ));
+    clean_tenant(&app, &tenant).await;
+
+    let concurrent_tenant = unique_tenant();
+    let concurrent_founder_agent = Uuid::new_v4();
+    let concurrent_reviewer_agent = Uuid::new_v4();
+    seed_people_and_agent(
+        &app,
+        &concurrent_tenant,
+        concurrent_founder_agent,
+        "hosted:luna",
+    )
+    .await;
+    seed_agent_for_owner(
+        &app,
+        &concurrent_tenant,
+        concurrent_reviewer_agent,
+        "reviewer",
+        "hosted:luna",
+    )
+    .await;
+    let one_slot = DurableAgentTriggerBacking::with_capacity_for_test(app.clone(), 1, 1);
+    let mut founder_race = red_mainline_binding(concurrent_founder_agent);
+    founder_race.binding_id = Uuid::new_v4();
+    founder_race.client_nonce = "founder-races-for-one-slot".into();
+    let mut reviewer_race = founder_race.clone();
+    reviewer_race.binding_id = Uuid::new_v4();
+    reviewer_race.owner_principal_id = "reviewer".into();
+    reviewer_race.run_as_agent_id = concurrent_reviewer_agent;
+    reviewer_race.client_nonce = "reviewer-races-for-one-slot".into();
+    let (founder_outcome, reviewer_outcome) = tokio::join!(
+        one_slot.create(&concurrent_tenant, founder_race),
+        one_slot.create(&concurrent_tenant, reviewer_race),
+    );
+    let outcomes = [founder_outcome.unwrap(), reviewer_outcome.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, CreateAgentTriggerBindingOutcome::Created(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(
+                    outcome,
+                    CreateAgentTriggerBindingOutcome::CapacityReached(
+                        AgentTriggerCapacityScope::TenantEvent
+                    )
+                )
+            })
+            .count(),
+        1,
+        "concurrent owners cannot overbook the last event slot"
+    );
+    assert_eq!(
+        one_slot
+            .active_for_event(&concurrent_tenant, "ci.run.failed", 10)
+            .await
+            .expect("the consumer sees the bounded result")
+            .len(),
+        1
+    );
+    clean_tenant(&app, &concurrent_tenant).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
