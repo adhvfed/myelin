@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock};
 
 use myelin_agent::{ToolDef, ToolDefValidationError};
 use myelin_tenancy::{ArtifactRef, TenantId};
@@ -29,11 +30,17 @@ impl std::error::Error for ToolCatalogueError {}
 
 #[derive(Clone, Debug)]
 pub struct PlatformToolCatalogue {
-    definitions: Vec<ToolDef>,
+    definitions: Arc<[ToolDef]>,
 }
 
 impl PlatformToolCatalogue {
     pub fn platform() -> Result<Self, ToolCatalogueError> {
+        static PLATFORM: OnceLock<Result<PlatformToolCatalogue, ToolCatalogueError>> =
+            OnceLock::new();
+        PLATFORM.get_or_init(Self::build_platform).clone()
+    }
+
+    fn build_platform() -> Result<Self, ToolCatalogueError> {
         let git_mcp = myelin_git::api::agent_tool_defs();
         let mcp_names = git_mcp
             .iter()
@@ -74,7 +81,7 @@ impl PlatformToolCatalogue {
             }
         }
         Ok(Self {
-            definitions: by_version.into_values().collect(),
+            definitions: by_version.into_values().collect::<Vec<_>>().into(),
         })
     }
 
@@ -155,6 +162,13 @@ mod tests {
         for definition in catalogue.definitions() {
             definition.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn the_platform_catalogue_is_built_and_validated_once_per_process() {
+        let first = PlatformToolCatalogue::platform().unwrap();
+        let second = PlatformToolCatalogue::platform().unwrap();
+        assert!(std::ptr::eq(first.definitions(), second.definitions()));
     }
 
     #[test]

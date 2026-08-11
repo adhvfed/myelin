@@ -211,7 +211,7 @@ pub struct SignalRouter {
     storm: StormControl,
     hot_cap: HotSubjectCap,
     ambient: crate::read_fanout::AmbientMarkerStore,
-    subjects: &'static [SubjectPattern],
+    subjects: Vec<SubjectPattern>,
 }
 
 #[derive(Clone)]
@@ -232,7 +232,7 @@ impl SignalRouter {
         inbox: InboxProjection,
         outbox: OutboxStore,
         minter: Arc<dyn IdMinter>,
-        subjects: &'static [SubjectPattern],
+        subjects: impl AsRef<[SubjectPattern]>,
     ) -> SignalRouter {
         SignalRouter {
             bound_tenant,
@@ -244,7 +244,7 @@ impl SignalRouter {
             storm: StormControl::new(),
             hot_cap: HotSubjectCap::new(),
             ambient: crate::read_fanout::AmbientMarkerStore::new(),
-            subjects,
+            subjects: subjects.as_ref().to_vec(),
         }
     }
 
@@ -255,7 +255,7 @@ impl SignalRouter {
         outbox: OutboxStore,
         minter: Arc<dyn IdMinter>,
         runtime: tokio::runtime::Handle,
-        subjects: &'static [SubjectPattern],
+        subjects: impl AsRef<[SubjectPattern]>,
     ) -> SignalRouter {
         let mut router = SignalRouter::new(
             bound_tenant,
@@ -598,8 +598,8 @@ fn notification_reason_of(signal_event: &EventEnvelope) -> Result<Reason, RouteE
 }
 
 impl EventHandler for SignalRouter {
-    fn subjects(&self) -> &'static [SubjectPattern] {
-        self.subjects
+    fn subjects(&self) -> &[SubjectPattern] {
+        &self.subjects
     }
 
     fn handle(&self, ev: &EventEnvelope, tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
@@ -631,8 +631,7 @@ pub fn build_router(
 ) -> Result<Consumer<SignalRouter>, SubscribeError> {
     let prefix = signal_subject_prefix(tenant)
         .ok_or_else(|| SubscribeError::WildcardSubject(format!("sig.{}.", tenant.0)))?;
-    let subjects: &'static [SubjectPattern] =
-        Box::leak(vec![SubjectPattern(prefix.clone())].into_boxed_slice());
+    let subjects = vec![SubjectPattern(prefix.clone())];
     let router = SignalRouter::new(
         tenant.clone(),
         inbox,
@@ -663,8 +662,7 @@ pub fn build_durable_router(
 ) -> Result<Consumer<SignalRouter>, SubscribeError> {
     let prefix = signal_subject_prefix(tenant)
         .ok_or_else(|| SubscribeError::WildcardSubject(format!("sig.{}.", tenant.0)))?;
-    let subjects: &'static [SubjectPattern] =
-        Box::leak(vec![SubjectPattern(prefix.clone())].into_boxed_slice());
+    let subjects = vec![SubjectPattern(prefix.clone())];
     let router = SignalRouter::new_durable(
         tenant.clone(),
         expected_region.into(),
@@ -1436,7 +1434,7 @@ mod tests {
             inbox.clone(),
             outbox.clone(),
             Arc::new(MonotonicMinter::new()),
-            Box::leak(vec![SubjectPattern("sig.acme.".into())].into_boxed_slice()),
+            [SubjectPattern("sig.acme.".into())],
         );
         router.hot_cap = HotSubjectCap::with_cap(5);
 

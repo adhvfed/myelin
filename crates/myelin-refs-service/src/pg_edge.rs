@@ -145,7 +145,7 @@ pub struct PgEdgeProjector {
     region: Region,
     store: PgEdgeStore,
     runtime: tokio::runtime::Handle,
-    subjects: &'static [SubjectPattern],
+    subjects: Vec<SubjectPattern>,
 }
 
 #[derive(Clone)]
@@ -160,7 +160,7 @@ impl PgEdgeProjector {
         region: Region,
         store: PgEdgeStore,
         runtime: tokio::runtime::Handle,
-        subjects: &'static [SubjectPattern],
+        subjects: Vec<SubjectPattern>,
     ) -> Self {
         Self {
             scope,
@@ -173,8 +173,8 @@ impl PgEdgeProjector {
 }
 
 impl EventHandler for PgEdgeProjector {
-    fn subjects(&self) -> &'static [SubjectPattern] {
-        self.subjects
+    fn subjects(&self) -> &[SubjectPattern] {
+        &self.subjects
     }
 
     fn handle(&self, event: &EventEnvelope, tx: &mut HandlerTx<'_>) -> HandleOutcome {
@@ -220,8 +220,7 @@ pub fn build_pg_edge_consumer(
     runtime: tokio::runtime::Handle,
 ) -> Result<Consumer<PgEdgeProjector>, SubscribeError> {
     let artifact_prefix = format!("myelin://{}/", tenant.0);
-    let subjects: &'static [SubjectPattern] =
-        Box::leak(vec![SubjectPattern(artifact_prefix.clone())].into_boxed_slice());
+    let subjects = vec![SubjectPattern(artifact_prefix.clone())];
     let projector = PgEdgeProjector::new(
         ProjectorScope::Tenant(tenant.clone()),
         region.clone(),
@@ -241,8 +240,7 @@ pub fn build_pg_cell_edge_consumer(
     runtime: tokio::runtime::Handle,
 ) -> Result<Consumer<PgEdgeProjector>, SubscribeError> {
     let artifact_prefix = "myelin://".to_string();
-    let subjects: &'static [SubjectPattern] =
-        Box::leak(vec![SubjectPattern(artifact_prefix.clone())].into_boxed_slice());
+    let subjects = vec![SubjectPattern(artifact_prefix.clone())];
     let projector = PgEdgeProjector::new(
         ProjectorScope::Cell(cell_id.to_string()),
         region.clone(),

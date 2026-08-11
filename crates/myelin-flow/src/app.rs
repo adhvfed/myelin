@@ -64,9 +64,7 @@ pub fn flow_app_spec_with_engine(
         lease_ttl_secs,
     )
     .with_timers(timers.clone());
-    let wheel = crate::timer::TimerWheel::new(
-        timers, journal, runs, telemetry, partition,  4_096,
-    );
+    let wheel = crate::timer::TimerWheel::new(timers, journal, runs, telemetry, partition, 4_096);
     let spec = flow_app_spec(config, outbox);
     (spec, dispatcher, wheel)
 }
@@ -78,8 +76,7 @@ pub fn flow_signal_consumer_reg(
 ) -> Result<myelin_substrate::ConsumerReg, myelin_events::SubscribeError> {
     use myelin_events::{consume, ConsumerName, ConsumerSpec, SubjectPattern};
     let prefix = format!("sig.{}.", tenant.0);
-    let subjects: &'static [SubjectPattern] =
-        Box::leak(vec![SubjectPattern(prefix.clone())].into_boxed_slice());
+    let subjects = vec![SubjectPattern(prefix.clone())];
     let consumer = crate::FlowSignalConsumer::new(executor, subjects);
     let runtime = consume(
         ConsumerSpec::new(

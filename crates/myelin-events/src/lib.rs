@@ -8,7 +8,6 @@ pub mod envelope;
 pub mod firehose;
 pub mod harness;
 pub mod holder;
-pub mod retention;
 #[cfg(feature = "nats")]
 pub mod nats;
 pub mod outbox;
@@ -17,6 +16,7 @@ pub mod reerase;
 pub mod reindex;
 pub mod relay;
 pub mod residency;
+pub mod retention;
 pub mod taxonomy;
 pub mod telemetry;
 pub mod upcast;
@@ -153,7 +153,7 @@ impl<'a> HandlerTx<'a> {
 }
 
 pub trait EventHandler {
-    fn subjects(&self) -> &'static [SubjectPattern];
+    fn subjects(&self) -> &[SubjectPattern];
     fn handle(&self, ev: &EventEnvelope, tx: &mut HandlerTx<'_>) -> HandleOutcome;
 }
 

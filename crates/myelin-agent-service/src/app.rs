@@ -48,18 +48,20 @@ fn agent_service_migrations() -> Migrations {
 }
 
 pub struct SkeletonDispatchConsumer {
-    subjects: &'static [SubjectPattern],
+    subjects: Vec<SubjectPattern>,
 }
 
 impl SkeletonDispatchConsumer {
-    pub fn new(subjects: &'static [SubjectPattern]) -> SkeletonDispatchConsumer {
-        SkeletonDispatchConsumer { subjects }
+    pub fn new(subjects: impl AsRef<[SubjectPattern]>) -> SkeletonDispatchConsumer {
+        SkeletonDispatchConsumer {
+            subjects: subjects.as_ref().to_vec(),
+        }
     }
 }
 
 impl EventHandler for SkeletonDispatchConsumer {
-    fn subjects(&self) -> &'static [SubjectPattern] {
-        self.subjects
+    fn subjects(&self) -> &[SubjectPattern] {
+        &self.subjects
     }
 
     fn handle(&self, _ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
@@ -89,8 +91,7 @@ pub fn agent_dispatch_consumer_reg(
 ) -> Result<myelin_substrate::ConsumerReg, myelin_events::SubscribeError> {
     use myelin_events::{consume, ConsumerName, ConsumerSpec};
     let prefix = format!("{AGENT_DISPATCH_SUBJECT_PREFIX}{}.", tenant.0);
-    let subjects: &'static [SubjectPattern] =
-        Box::leak(vec![SubjectPattern(prefix.clone())].into_boxed_slice());
+    let subjects = vec![SubjectPattern(prefix.clone())];
     let consumer = SkeletonDispatchConsumer::new(subjects);
     let runtime = consume(
         ConsumerSpec::new(
@@ -322,8 +323,7 @@ mod tests {
         use myelin_identity::{Principal, PrincipalId, PrincipalKind};
         use myelin_refs::ArtifactRef;
         use myelin_tenancy::{Region, TenantId};
-        let subjects: &'static [SubjectPattern] =
-            Box::leak(vec![SubjectPattern("agent.dispatch.acme.".into())].into_boxed_slice());
+        let subjects = [SubjectPattern("agent.dispatch.acme.".into())];
         let consumer = SkeletonDispatchConsumer::new(subjects);
         let tenant = TenantId("acme".into());
         let ev = EventEnvelope {

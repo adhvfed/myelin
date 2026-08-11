@@ -48,7 +48,7 @@ pub trait TriggerApprovalInbox: Send + Sync {
 pub struct GovernedTriggerConsumer {
     tenant: String,
     region: String,
-    subjects: &'static [SubjectPattern],
+    subjects: Vec<SubjectPattern>,
     store: Arc<dyn TriggerBindingStore>,
     visibility: Arc<dyn TriggerOwnerVisibility>,
     approvals: Arc<dyn TriggerApprovalInbox>,
@@ -63,8 +63,7 @@ impl GovernedTriggerConsumer {
         approvals: Arc<dyn TriggerApprovalInbox>,
     ) -> Self {
         let tenant = tenant.into();
-        let subjects =
-            Box::leak(vec![SubjectPattern(format!("myelin://{tenant}/"))].into_boxed_slice());
+        let subjects = vec![SubjectPattern(format!("myelin://{tenant}/"))];
         Self {
             tenant,
             region: region.into(),
@@ -146,8 +145,8 @@ impl GovernedTriggerConsumer {
 }
 
 impl EventHandler for GovernedTriggerConsumer {
-    fn subjects(&self) -> &'static [SubjectPattern] {
-        self.subjects
+    fn subjects(&self) -> &[SubjectPattern] {
+        &self.subjects
     }
 
     fn handle(

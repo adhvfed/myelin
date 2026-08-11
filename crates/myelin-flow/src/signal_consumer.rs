@@ -7,12 +7,15 @@ pub const SIGNAL_EVENT_TYPE: &str = "flow.signal.delivered";
 
 pub struct FlowSignalConsumer<E: DurableExecutor> {
     executor: E,
-    subjects: &'static [SubjectPattern],
+    subjects: Vec<SubjectPattern>,
 }
 
 impl<E: DurableExecutor> FlowSignalConsumer<E> {
-    pub fn new(executor: E, subjects: &'static [SubjectPattern]) -> Self {
-        Self { executor, subjects }
+    pub fn new(executor: E, subjects: impl AsRef<[SubjectPattern]>) -> Self {
+        Self {
+            executor,
+            subjects: subjects.as_ref().to_vec(),
+        }
     }
 
     fn deliver(&self, ev: &EventEnvelope) -> Result<crate::SignalOutcome, DeliverError> {
@@ -83,8 +86,8 @@ enum DeliverError {
 }
 
 impl<E: DurableExecutor + Send + Sync> EventHandler for FlowSignalConsumer<E> {
-    fn subjects(&self) -> &'static [SubjectPattern] {
-        self.subjects
+    fn subjects(&self) -> &[SubjectPattern] {
+        &self.subjects
     }
 
     fn handle(&self, ev: &EventEnvelope, _tx: &mut myelin_events::HandlerTx<'_>) -> HandleOutcome {
@@ -129,8 +132,8 @@ mod tests {
     fn minter() -> Arc<dyn IdMinter> {
         Arc::new(MonotonicMinter::new())
     }
-    fn subjects() -> &'static [SubjectPattern] {
-        Box::leak(vec![SubjectPattern("sig.acme.".into())].into_boxed_slice())
+    fn subjects() -> Vec<SubjectPattern> {
+        vec![SubjectPattern("sig.acme.".into())]
     }
 
     fn executor() -> FlowExecutor {
@@ -213,8 +216,14 @@ mod tests {
         let run = start_a_run(&ex);
         let consumer = FlowSignalConsumer::new(ex.clone(), subjects());
 
-        let first = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-1"), &mut myelin_events::HandlerTx::none());
-        let second = consumer.handle(&signal_event(&run, "job.done", "tok-1", "evt-2"), &mut myelin_events::HandlerTx::none());
+        let first = consumer.handle(
+            &signal_event(&run, "job.done", "tok-1", "evt-1"),
+            &mut myelin_events::HandlerTx::none(),
+        );
+        let second = consumer.handle(
+            &signal_event(&run, "job.done", "tok-1", "evt-2"),
+            &mut myelin_events::HandlerTx::none(),
+        );
         assert_eq!(first, HandleOutcome::Done);
         assert_eq!(
             second,
@@ -242,7 +251,10 @@ mod tests {
         let mut ev = signal_event(&run, "job.done", "tok-1", "evt-1");
         ev.payload = serde_json::json!({ "idem_key": "tok-1" });
         assert!(
-            matches!(consumer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::NonRetryable(_)),
+            matches!(
+                consumer.handle(&ev, &mut myelin_events::HandlerTx::none()),
+                HandleOutcome::NonRetryable(_)
+            ),
             "a malformed signal is non-retryable poison (dead-lettered, no silent drop)"
         );
         assert_eq!(
@@ -258,7 +270,10 @@ mod tests {
         let consumer = FlowSignalConsumer::new(ex.clone(), subjects());
         let ev = signal_event(&RunId("no-such-run".into()), "job.done", "tok-1", "evt-1");
         assert!(
-            matches!(consumer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::NonRetryable(_)),
+            matches!(
+                consumer.handle(&ev, &mut myelin_events::HandlerTx::none()),
+                HandleOutcome::NonRetryable(_)
+            ),
             "a signal to an unknown run is surfaced (dead-lettered), never silently swallowed"
         );
     }
