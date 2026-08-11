@@ -3,12 +3,13 @@ use crate::error::EdgeError;
 use crate::gateway::GatewayBuilder;
 use crate::request::EdgeResponse;
 use crate::Method;
-use myelin_events::{Actor, EventId, IdMinter, Timestamp};
+use myelin_events::{Actor, ArtifactRef, EventId, IdMinter, Timestamp};
 use myelin_identity::Principal;
 use myelin_knowledge::{
     decrypt_text, encrypt_text, event_actor_pseudonym, page_ref, pseudonymized_event_principal,
     KnowledgeBlockRecord, KnowledgePageError, KnowledgePageRecord, KnowledgePageStore,
-    KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage,
+    KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage, MAX_BLOCK_REFERENCES,
+    MAX_PAGE_REFERENCES,
 };
 use myelin_storage::encryption::KeyChoiceError;
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
@@ -26,6 +27,7 @@ const MAX_KNOWLEDGE_JSON_BYTES: usize = 320 * 1024;
 const MAX_TITLE_BYTES: usize = 512;
 const MAX_BLOCK_BYTES: usize = 64 * 1024;
 const MAX_DOCUMENT_BYTES: usize = 256 * 1024;
+const MAX_ARTIFACT_REF_BYTES: usize = 1024;
 const MAX_BLOCKS: usize = 500;
 const DEFAULT_PAGE_LIMIT: u32 = 50;
 const MAX_PAGE_LIMIT: u32 = 100;
@@ -164,6 +166,8 @@ struct BlockBody {
     #[serde(rename = "type")]
     block_type: String,
     markdown: String,
+    #[serde(default)]
+    references: Vec<String>,
     #[serde(default = "active_block_state")]
     state: String,
 }
@@ -225,6 +229,7 @@ impl Handler for PageCreateHandler {
                     )?,
                     block_id,
                     block_type: block_type.into(),
+                    references: Vec::new(),
                     created_by: viewer.clone(),
                     edited_by: viewer.clone(),
                 })
@@ -286,7 +291,7 @@ impl Handler for PageSaveHandler {
         let page_id = page_param(ctx)?.to_string();
         let body: SavePageBody = parse_body(&ctx.request.body)?;
         validate_title(&body.title)?;
-        validate_document(&body.blocks)?;
+        let validated_references = validate_document(ctx.principal, &body.blocks)?;
         let visibility = parse_visibility(&body.visibility)?;
         let viewer = self.api.viewer(ctx.principal);
         let current = self.api.drive(self.api.store().get_visible(
@@ -325,7 +330,7 @@ impl Handler for PageSaveHandler {
             .collect();
         let mut seen = HashSet::with_capacity(body.blocks.len());
         let mut blocks = Vec::with_capacity(body.blocks.len());
-        for draft in body.blocks {
+        for (draft, references) in body.blocks.into_iter().zip(validated_references) {
             let block_id = match draft.id {
                 Some(id) => {
                     validate_ulid(&id)?;
@@ -352,8 +357,10 @@ impl Handler for PageSaveHandler {
             let unchanged = if draft.state == "tombstoned" {
                 existing.is_some_and(|block| block.block_type == draft.block_type)
                     && visible_markdown.is_none()
+                    && existing.is_some_and(|block| block.references == references)
             } else {
                 visible_markdown.as_deref() == Some(draft.markdown.as_bytes())
+                    && existing.is_some_and(|block| block.references == references)
             };
             if unchanged {
                 blocks.push(
@@ -372,6 +379,7 @@ impl Handler for PageSaveHandler {
                     )?,
                     block_id,
                     block_type: draft.block_type,
+                    references,
                     created_by: existing
                         .map(|block| block.created_by.clone())
                         .unwrap_or_else(|| viewer.clone()),
@@ -574,22 +582,30 @@ fn client_nonce(
     }
 }
 
-fn validate_document(blocks: &[BlockBody]) -> Result<(), EdgeError> {
+fn validate_document(
+    principal: &Principal,
+    blocks: &[BlockBody],
+) -> Result<Vec<Vec<ArtifactRef>>, EdgeError> {
     if blocks.is_empty() || blocks.len() > MAX_BLOCKS {
         return Err(EdgeError::BadRequest(
             "Knowledge pages must contain between 1 and 500 blocks".into(),
         ));
     }
     let mut total = 0usize;
+    let mut total_references = 0usize;
+    let mut validated_references = Vec::with_capacity(blocks.len());
     for block in blocks {
         if !matches!(block.state.as_str(), "active" | "tombstoned") {
             return Err(EdgeError::BadRequest(
                 "Knowledge block state must be `active` or `tombstoned`".into(),
             ));
         }
-        if block.state == "tombstoned" && (block.id.is_none() || !block.markdown.is_empty()) {
+        if block.state == "tombstoned"
+            && (block.id.is_none() || !block.markdown.is_empty() || !block.references.is_empty())
+        {
             return Err(EdgeError::BadRequest(
-                "a tombstoned Knowledge block must retain its id and have no visible text".into(),
+                "a tombstoned Knowledge block must retain its id and have no visible content"
+                    .into(),
             ));
         }
         if block.markdown.len() > MAX_BLOCK_BYTES {
@@ -624,8 +640,57 @@ fn validate_document(blocks: &[BlockBody]) -> Result<(), EdgeError> {
                 "Knowledge block type is not in the shared content taxonomy".into(),
             ));
         }
+        if block.references.len() > MAX_BLOCK_REFERENCES {
+            return Err(EdgeError::BadRequest(format!(
+                "one Knowledge block may contain at most {MAX_BLOCK_REFERENCES} structured references"
+            )));
+        }
+        total_references = total_references.saturating_add(block.references.len());
+        if total_references > MAX_PAGE_REFERENCES {
+            return Err(EdgeError::BadRequest(format!(
+                "one Knowledge page may contain at most {MAX_PAGE_REFERENCES} structured references"
+            )));
+        }
+        if block
+            .markdown
+            .chars()
+            .filter(|character| *character == myelin_content::OBJ)
+            .count()
+            != block.references.len()
+        {
+            return Err(EdgeError::BadRequest(
+                "Knowledge markdown must contain one U+FFFC placeholder for each structured reference"
+                    .into(),
+            ));
+        }
+        let references = block
+            .references
+            .iter()
+            .map(|reference| {
+                if reference.len() > MAX_ARTIFACT_REF_BYTES {
+                    return Err(EdgeError::BadRequest(format!(
+                        "Knowledge ArtifactRef exceeds {MAX_ARTIFACT_REF_BYTES} bytes"
+                    )));
+                }
+                let parsed = myelin_refs::parse_scoped(reference).map_err(|error| {
+                    EdgeError::BadRequest(format!("invalid Knowledge ArtifactRef: {error}"))
+                })?;
+                if parsed.artifact_ref.0 != *reference {
+                    return Err(EdgeError::BadRequest(
+                        "Knowledge ArtifactRefs must use their canonical form".into(),
+                    ));
+                }
+                if parsed.tenant != principal.tenant {
+                    return Err(EdgeError::BadRequest(
+                        "Knowledge cannot store a cross-tenant ArtifactRef".into(),
+                    ));
+                }
+                Ok(parsed.artifact_ref)
+            })
+            .collect::<Result<Vec<_>, EdgeError>>()?;
+        validated_references.push(references);
     }
-    Ok(())
+    Ok(validated_references)
 }
 
 fn parse_visibility(value: &str) -> Result<KnowledgeVisibility, EdgeError> {
@@ -771,6 +836,7 @@ fn document_json(
                 "id": block.block_id,
                 "type": block.block_type,
                 "markdown": markdown.as_deref().unwrap_or(""),
+                "references": block.references.iter().map(|reference| reference.0.as_str()).collect::<Vec<_>>(),
                 "state": if markdown.is_some() { "active" } else { "tombstoned" },
                 "is_you": block.edited_by == viewer,
             }))
@@ -822,6 +888,15 @@ fn no_store(response: EdgeResponse) -> EdgeResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use myelin_identity::{PrincipalId, PrincipalKind};
+
+    fn principal() -> Principal {
+        Principal::stub(
+            PrincipalId("alice".into()),
+            PrincipalKind::Human,
+            TenantId("acme".into()),
+        )
+    }
 
     #[test]
     fn query_and_document_inputs_are_strict_and_bounded() {
@@ -831,14 +906,53 @@ mod tests {
         assert!(parse_page_query("offset=1").is_err());
         assert!(validate_title("Architecture decisions").is_ok());
         assert!(validate_title(" Architecture decisions").is_err());
-        assert!(validate_document(&[BlockBody {
+        assert!(validate_document(
+            &principal(),
+            &[BlockBody {
+                id: None,
+                block_type: "paragraph".into(),
+                markdown: "One render path".into(),
+                references: Vec::new(),
+                state: "active".into(),
+            }]
+        )
+        .is_ok());
+        assert!(validate_document(&principal(), &[]).is_err());
+    }
+
+    #[test]
+    fn structured_references_are_positional_canonical_and_tenant_scoped() {
+        let target = "myelin://acme/issue/issue/ENG-1";
+        let blocks = [BlockBody {
             id: None,
             block_type: "paragraph".into(),
-            markdown: "One render path".into(),
+            markdown: format!("Delivery work {}", myelin_content::OBJ),
+            references: vec![target.into()],
             state: "active".into(),
-        }])
-        .is_ok());
-        assert!(validate_document(&[]).is_err());
+        }];
+        assert_eq!(
+            validate_document(&principal(), &blocks).unwrap(),
+            vec![vec![ArtifactRef(target.into())]]
+        );
+
+        for (markdown, reference) in [
+            ("missing placeholder", target),
+            ("cross-tenant \u{fffc}", "myelin://other/issue/issue/ENG-1"),
+            ("malformed \u{fffc}", "ENG-1"),
+            (
+                "non-canonical \u{fffc}",
+                "myelin://acme/git/blob/deadbeef#L01-L2",
+            ),
+        ] {
+            let invalid = [BlockBody {
+                id: None,
+                block_type: "paragraph".into(),
+                markdown: markdown.into(),
+                references: vec![reference.into()],
+                state: "active".into(),
+            }];
+            assert!(validate_document(&principal(), &invalid).is_err());
+        }
     }
 
     #[test]

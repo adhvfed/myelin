@@ -40,6 +40,37 @@ async function awaitActiveIssue(title: string): Promise<JsonRecord> {
   );
 }
 
+async function awaitBacklink(
+  targetRef: string,
+  sourceRef: string,
+  relationName: string,
+): Promise<JsonRecord> {
+  return eventually<JsonRecord>(async () => {
+    const response = await systemClient.json(
+      `/v1/refs/backlinks?ref=${encodeURIComponent(targetRef)}`,
+    );
+    return array(response.body.items, `backlinks for ${targetRef}`)
+      .map((item) => record(item, "collaboration backlink"))
+      .find((item) => item.root_ref === sourceRef && item.relation === relationName);
+  }, { description: `${sourceRef} to become a ${relationName} backlink of ${targetRef}` });
+}
+
+async function awaitBacklinkGone(
+  targetRef: string,
+  sourceRef: string,
+  relationName: string,
+): Promise<void> {
+  await eventually<boolean>(async () => {
+    const response = await systemClient.json(
+      `/v1/refs/backlinks?ref=${encodeURIComponent(targetRef)}`,
+    );
+    const remains = array(response.body.items, `backlinks for ${targetRef}`)
+      .map((item) => record(item, "remaining collaboration backlink"))
+      .some((item) => item.root_ref === sourceRef && item.relation === relationName);
+    return remains ? undefined : true;
+  }, { description: `${relationName} between ${sourceRef} and ${targetRef} to disappear` });
+}
+
 describe("collaboration lifecycle", () => {
   test("reads red mainline CI and opens one governed issue without an integration API key", async () => {
     const founder = await browserApprovedCliClient();
@@ -1278,6 +1309,68 @@ command = ["true"]
     );
   });
 
+  test("lets a living document point to delivery work, then forget the link cleanly", async () => {
+    const issue = await awaitActiveIssue(uniqueName("Deliver the linked runbook"));
+    const issueRef = string(issue.ref, "linked delivery issue ref");
+    const title = uniqueName("Linked delivery runbook");
+    const created = await systemClient.json("/v1/knowledge/pages", {
+      method: "POST",
+      body: { title, template: "blank", visibility: "team" },
+      expectedStatus: 201,
+    });
+    const page = record(created.body.page, "linked knowledge page");
+    const pageId = string(page.id, "linked knowledge page id");
+    const pageRef = string(page.ref, "linked knowledge page ref");
+    const initialVersion = integer(page.version, "linked knowledge page version");
+
+    const linked = await systemClient.json(`/v1/knowledge/pages/${encodeURIComponent(pageId)}`, {
+      method: "PUT",
+      body: {
+        expected_version: initialVersion,
+        title,
+        visibility: "team",
+        blocks: [{
+          type: "paragraph",
+          markdown: "Follow the delivery issue ￼ through completion.",
+          references: [issueRef],
+        }],
+      },
+    });
+    const linkedPage = record(linked.body.page, "knowledge page with delivery link");
+    const linkedVersion = integer(linked.body.version, "linked knowledge version");
+    const linkedBlock = record(
+      array(linkedPage.blocks, "linked knowledge blocks")[0],
+      "linked knowledge block",
+    );
+    const linkedBlockId = string(linkedBlock.id, "linked knowledge block id");
+    const linkedBlockRef = `${pageRef}#b${linkedBlockId}`;
+    expect(linkedBlock).toMatchObject({ references: [issueRef] });
+    expect(await awaitBacklink(issueRef, pageRef, "links")).toMatchObject({
+      relation_class: "reference",
+      ref: linkedBlockRef,
+      target_ref: issueRef,
+    });
+
+    const unlinked = await systemClient.json(`/v1/knowledge/pages/${encodeURIComponent(pageId)}`, {
+      method: "PUT",
+      body: {
+        expected_version: linkedVersion,
+        title,
+        visibility: "team",
+        blocks: [{
+          id: linkedBlockId,
+          type: "paragraph",
+          markdown: "Delivery is complete; this runbook now stands on its own.",
+        }],
+      },
+    });
+    expect(unlinked.body).toMatchObject({
+      durable: true,
+      page: { blocks: [expect.objectContaining({ references: [] })] },
+    });
+    await awaitBacklinkGone(issueRef, pageRef, "links");
+  });
+
   test("moves an issue through authorization, discovery, and completion", async () => {
     const title = uniqueName("Ship the backend lifecycle suite");
     const proposed = await systemClient.json("/v1/issues", {
@@ -1382,18 +1475,6 @@ command = ["true"]
       expect.objectContaining({ id: relationId, target_ref: deliveryRef, relation: "blocks" }),
     ]);
 
-    const awaitBacklink = (targetRef: string, sourceRef: string, relationName: string) =>
-      eventually<JsonRecord>(async () => {
-        const response = await systemClient.json(
-          `/v1/refs/backlinks?ref=${encodeURIComponent(targetRef)}`,
-        );
-        return array(response.body.items, `backlinks for ${targetRef}`)
-          .map((item) => record(item, "issue dependency backlink"))
-          .find(
-            (item) => item.root_ref === sourceRef && item.relation === relationName,
-          );
-      }, { description: `${sourceRef} to become a ${relationName} backlink of ${targetRef}` });
-
     expect(await awaitBacklink(deliveryRef, planningRef, "blocks")).toMatchObject({
       relation_class: "lifecycle",
       target_ref: deliveryRef,
@@ -1408,17 +1489,6 @@ command = ["true"]
       { method: "DELETE" },
     );
     expect(removed.body).toMatchObject({ removed: true, durable: true });
-
-    const awaitBacklinkGone = (targetRef: string, sourceRef: string, relationName: string) =>
-      eventually<boolean>(async () => {
-        const response = await systemClient.json(
-          `/v1/refs/backlinks?ref=${encodeURIComponent(targetRef)}`,
-        );
-        const remains = array(response.body.items, `backlinks for ${targetRef}`)
-          .map((item) => record(item, "remaining issue dependency backlink"))
-          .some((item) => item.root_ref === sourceRef && item.relation === relationName);
-        return remains ? undefined : true;
-      }, { description: `${relationName} between the issues to disappear` });
 
     await awaitBacklinkGone(deliveryRef, planningRef, "blocks");
     await awaitBacklinkGone(planningRef, deliveryRef, "blocked_by");

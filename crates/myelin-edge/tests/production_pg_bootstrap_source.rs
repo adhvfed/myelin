@@ -154,9 +154,12 @@ fn production_edge_mounts_encrypted_durable_knowledge_pages() {
     assert!(store.contains("myelin_make_tenant_scoped"));
     assert_eq!(
         store.matches("PgRelay::co_commit_in_tx").count(),
-        2,
-        "create and save must each co-commit their domain event"
+        3,
+        "create and save co-commit their domain event, and reference changes share that transaction"
     );
+    assert!(store.contains("stored_reference_edges("));
+    assert!(store.contains("myelin_refs::EdgeChange::Created"));
+    assert!(store.contains("myelin_refs::EdgeChange::Removed"));
     assert!(!store.contains("title_plaintext"));
     assert!(!store.contains("body_plaintext"));
     assert!(authz.contains("requirement!(\"knowledge.pages.list\", \"knowledge.read\", OP_PAT)"));

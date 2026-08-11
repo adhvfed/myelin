@@ -90,26 +90,23 @@ pub use merge::{
     QueuedEdit, ReconcileResult, SimultaneousPresence, SoftLock, SoftLockTable,
     CAS_CONFLICT_RATE_METRIC,
 };
+pub use notif_resolve::KnowledgeRefResolver;
+pub use pg_page::{
+    knowledge_page_migrations, KnowledgeBlockRecord, KnowledgePageError, KnowledgePageRecord,
+    KnowledgePageStore, KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage,
+    EXPAND_KNOWLEDGE_BLOCK_REFERENCES_DDL, KNOWLEDGE_BLOCK_TABLE, KNOWLEDGE_PAGE_RECENT_INDEX,
+    KNOWLEDGE_PAGE_TABLE, MAX_BLOCK_REFERENCES, MAX_PAGE_REFERENCES,
+};
 pub use rebac_fragment::{
     block_read_fragment, database_row_read_fragment, field_view_permission,
     knowledge_read_fragment, page_read_fragment, page_read_override, row_reader_set_expr,
     space_read_fragment,
-};
-pub use subs::{
-    mint_block, mint_heading, register_knowledge_sub_kinds, KNOWLEDGE_OWNED_SUB_KINDS,
-    KNOWLEDGE_SUBSYSTEM,
 };
 pub use refs_glue::{
     edge_aggregate_key, emit_content_edges, emit_page_parent_set, emit_relation_edge,
     KnowledgeLifecycleRel, LadderRung, PageMeta, PageStore, ProjectError as RefsProjectError,
     Projected, Projector, SubAnchor, SubState, REFS_EDGE_CREATED, REL_CLASS_LIFECYCLE,
     REL_CLASS_REFERENCE,
-};
-pub use notif_resolve::KnowledgeRefResolver;
-pub use pg_page::{
-    knowledge_page_migrations, KnowledgeBlockRecord, KnowledgePageError, KnowledgePageRecord,
-    KnowledgePageStore, KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage,
-    KNOWLEDGE_BLOCK_TABLE, KNOWLEDGE_PAGE_RECENT_INDEX, KNOWLEDGE_PAGE_TABLE,
 };
 pub use replay::{KnowledgeReindexSource, REFS_EDGE_SNAPSHOT};
 pub use rollup::{
@@ -124,6 +121,10 @@ pub use search_feed::{
     KN_READ_PERMISSION, KN_SEARCH_OBJECT_TYPE,
 };
 pub use store::{knowledge_scope, knowledge_store_migrations, KnowledgeStore, KnowledgeTable};
+pub use subs::{
+    mint_block, mint_heading, register_knowledge_sub_kinds, KNOWLEDGE_OWNED_SUB_KINDS,
+    KNOWLEDGE_SUBSYSTEM,
+};
 pub use surge::{
     run_collab_surge, run_lexorank_storm, CollabShedReason, CollabShedRejection, CollabSurgeGate,
     CollabSurgeReport, LexoStormReport, COLLAB_SURGE_MULTIPLIER, FLEET_HARDWARE_FLOOR,

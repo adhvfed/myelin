@@ -6,18 +6,22 @@
 //! event committed in the same transaction as every mutation.
 
 use myelin_events::{
-    derive_envelope, Actor, AggregateKey, DataRole, EmitContext, EventDraft, EventId, EventType,
-    Timestamp, Visibility,
+    derive_envelope, Actor, AggregateKey, ArtifactRef, DataRole, EmitContext, EventDraft, EventId,
+    EventType, IdMinter, Timestamp, UlidMinter, Visibility,
 };
 use myelin_storage::encryption::EncryptedColumn;
 use myelin_storage::kms::PiiKeyRef;
 use myelin_tenancy::{Region, TenantId};
 use sqlx::postgres::{PgPool, PgRow};
 use sqlx::Row;
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 pub const KNOWLEDGE_PAGE_TABLE: &str = "knowledge_page";
 pub const KNOWLEDGE_BLOCK_TABLE: &str = "knowledge_block";
 pub const KNOWLEDGE_PAGE_RECENT_INDEX: &str = "knowledge_page_recent";
+pub const MAX_BLOCK_REFERENCES: usize = 32;
+pub const MAX_PAGE_REFERENCES: usize = 100;
 
 pub const KNOWLEDGE_PAGE_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS knowledge_page (
@@ -70,6 +74,9 @@ CREATE INDEX IF NOT EXISTS knowledge_block_page_order
     ON knowledge_block (tenant_id, region, page_id, ordinal);
 "#;
 
+pub const EXPAND_KNOWLEDGE_BLOCK_REFERENCES_DDL: &str =
+    "ALTER TABLE knowledge_block ADD COLUMN IF NOT EXISTS reference_refs text[];";
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KnowledgeVisibility {
     Private,
@@ -98,6 +105,7 @@ pub struct KnowledgeBlockRecord {
     pub block_id: String,
     pub block_type: String,
     pub inline: EncryptedColumn,
+    pub references: Vec<ArtifactRef>,
     pub created_by: String,
     pub edited_by: String,
 }
@@ -173,11 +181,19 @@ impl std::error::Error for KnowledgePageError {}
 #[derive(Clone)]
 pub struct KnowledgePageStore {
     pool: PgPool,
+    event_ids: Arc<dyn IdMinter>,
 }
 
 impl KnowledgePageStore {
     pub fn new(pool: PgPool) -> KnowledgePageStore {
-        KnowledgePageStore { pool }
+        KnowledgePageStore {
+            pool,
+            event_ids: Arc::new(UlidMinter::new()),
+        }
+    }
+
+    pub fn with_event_ids(pool: PgPool, event_ids: Arc<dyn IdMinter>) -> KnowledgePageStore {
+        KnowledgePageStore { pool, event_ids }
     }
 
     async fn begin_scoped(
@@ -210,7 +226,7 @@ impl KnowledgePageStore {
         occurred_at: Timestamp,
     ) -> Result<(String, bool), KnowledgePageError> {
         validate_space_key(&page.space_key)?;
-        validate_blocks(&page.blocks)?;
+        validate_blocks(&page.tenant, &page.blocks)?;
         let mut tx = self.begin_scoped(&page.tenant, &page.region).await?;
         let inserted = sqlx::query(
             "INSERT INTO knowledge_page (
@@ -257,7 +273,14 @@ impl KnowledgePageStore {
             return Ok((page_id, false));
         }
 
-        insert_blocks(&mut tx, &page.tenant, &page.region, &page.page_id, &page.blocks).await?;
+        insert_blocks(
+            &mut tx,
+            &page.tenant,
+            &page.region,
+            &page.page_id,
+            &page.blocks,
+        )
+        .await?;
         let event = page_event(
             &page.tenant,
             &page.region,
@@ -265,12 +288,28 @@ impl KnowledgePageStore {
             myelin_content::events::KNOWLEDGE_PAGE_CREATED,
             1,
             event_id,
-            actor,
-            occurred_at,
+            actor.clone(),
+            occurred_at.clone(),
         );
         myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut tx, &page.page_id, &event)
             .await
-            .map_err(|error| KnowledgePageError::Storage(format!("co-commit page create: {error}")))?;
+            .map_err(|error| {
+                KnowledgePageError::Storage(format!("co-commit page create: {error}"))
+            })?;
+        let references = reference_edges(&page.blocks);
+        co_commit_reference_changes(
+            &mut tx,
+            &page.tenant,
+            &page.region,
+            &page.page_id,
+            references.iter(),
+            myelin_refs::EdgeChange::Created,
+            &event,
+            &actor,
+            &occurred_at,
+            self.event_ids.as_ref(),
+        )
+        .await?;
         tx.commit()
             .await
             .map_err(storage("commit Knowledge page create"))?;
@@ -310,7 +349,10 @@ impl KnowledgePageStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(storage("list visible Knowledge pages"))?;
-        let pages = rows.iter().map(row_to_page).collect::<Result<Vec<_>, _>>()?;
+        let pages = rows
+            .iter()
+            .map(row_to_page)
+            .collect::<Result<Vec<_>, _>>()?;
         tx.commit()
             .await
             .map_err(storage("commit Knowledge page list"))?;
@@ -345,6 +387,7 @@ impl KnowledgePageStore {
         let mut page = row_to_page(&row)?;
         let rows = sqlx::query(
             "SELECT block_id, block_type, inline_key_ref, inline_nonce, inline_ciphertext,
+                    COALESCE(reference_refs, ARRAY[]::text[]) AS reference_refs,
                     created_by, edited_by
                FROM knowledge_block
               WHERE tenant_id = $1 AND region = $2 AND page_id = $3
@@ -358,7 +401,7 @@ impl KnowledgePageStore {
         .map_err(storage("read Knowledge page blocks"))?;
         page.blocks = rows
             .iter()
-            .map(row_to_block)
+            .map(|row| row_to_block(row, &page.tenant))
             .collect::<Result<Vec<_>, _>>()?;
         tx.commit()
             .await
@@ -373,7 +416,7 @@ impl KnowledgePageStore {
         actor: Actor,
         occurred_at: Timestamp,
     ) -> Result<i64, KnowledgePageError> {
-        validate_blocks(&page.blocks)?;
+        validate_blocks(&page.tenant, &page.blocks)?;
         if page.expected_version < 1 {
             return Err(KnowledgePageError::Invalid(
                 "expected version must be positive".into(),
@@ -417,12 +460,24 @@ impl KnowledgePageStore {
             .map_err(storage("read Knowledge save conflict"))?;
             return match current {
                 Some((version, owner)) if owner == page.owner => {
-                    Err(KnowledgePageError::Conflict { current_version: version })
+                    Err(KnowledgePageError::Conflict {
+                        current_version: version,
+                    })
                 }
                 _ => Err(KnowledgePageError::NotFound),
             };
         }
-        replace_blocks(&mut tx, &page.tenant, &page.region, &page.page_id, &page.blocks).await?;
+        let previous_references =
+            stored_reference_edges(&mut tx, &page.tenant, &page.region, &page.page_id).await?;
+        let next_references = reference_edges(&page.blocks);
+        replace_blocks(
+            &mut tx,
+            &page.tenant,
+            &page.region,
+            &page.page_id,
+            &page.blocks,
+        )
+        .await?;
         let event = page_event(
             &page.tenant,
             &page.region,
@@ -430,12 +485,40 @@ impl KnowledgePageStore {
             myelin_content::events::KNOWLEDGE_DOC_UPDATED,
             next_version,
             event_id,
-            actor,
-            occurred_at,
+            actor.clone(),
+            occurred_at.clone(),
         );
         myelin_storage::pgrelay::PgRelay::co_commit_in_tx(&mut tx, &page.page_id, &event)
             .await
-            .map_err(|error| KnowledgePageError::Storage(format!("co-commit page save: {error}")))?;
+            .map_err(|error| {
+                KnowledgePageError::Storage(format!("co-commit page save: {error}"))
+            })?;
+        co_commit_reference_changes(
+            &mut tx,
+            &page.tenant,
+            &page.region,
+            &page.page_id,
+            previous_references.difference(&next_references),
+            myelin_refs::EdgeChange::Removed,
+            &event,
+            &actor,
+            &occurred_at,
+            self.event_ids.as_ref(),
+        )
+        .await?;
+        co_commit_reference_changes(
+            &mut tx,
+            &page.tenant,
+            &page.region,
+            &page.page_id,
+            next_references.difference(&previous_references),
+            myelin_refs::EdgeChange::Created,
+            &event,
+            &actor,
+            &occurred_at,
+            self.event_ids.as_ref(),
+        )
+        .await?;
         tx.commit()
             .await
             .map_err(storage("commit Knowledge page save"))?;
@@ -454,20 +537,23 @@ async fn insert_blocks(
         sqlx::query(
             "INSERT INTO knowledge_block (
                tenant_id, region, page_id, block_id, ordinal, block_type,
-               inline_key_ref, inline_nonce, inline_ciphertext, created_by, edited_by
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+               inline_key_ref, inline_nonce, inline_ciphertext, reference_refs,
+               created_by, edited_by
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         )
         .bind(tenant)
         .bind(region)
         .bind(page_id)
         .bind(&block.block_id)
-        .bind(i32::try_from(ordinal).map_err(|_| {
-            KnowledgePageError::Invalid("too many blocks for one page".into())
-        })?)
+        .bind(
+            i32::try_from(ordinal)
+                .map_err(|_| KnowledgePageError::Invalid("too many blocks for one page".into()))?,
+        )
         .bind(&block.block_type)
         .bind(block.inline.key_ref.to_uri())
         .bind(block.inline.nonce.to_vec())
         .bind(&block.inline.ciphertext)
+        .bind(reference_strings(&block.references))
         .bind(&block.created_by)
         .bind(&block.edited_by)
         .execute(&mut **tx)
@@ -518,14 +604,16 @@ async fn replace_blocks(
         sqlx::query(
             "INSERT INTO knowledge_block (
                tenant_id, region, page_id, block_id, ordinal, block_type,
-               inline_key_ref, inline_nonce, inline_ciphertext, created_by, edited_by
-             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+               inline_key_ref, inline_nonce, inline_ciphertext, reference_refs,
+               created_by, edited_by
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
              ON CONFLICT (tenant_id, region, page_id, block_id) DO UPDATE SET
                ordinal = EXCLUDED.ordinal,
                block_type = EXCLUDED.block_type,
                inline_key_ref = EXCLUDED.inline_key_ref,
                inline_nonce = EXCLUDED.inline_nonce,
                inline_ciphertext = EXCLUDED.inline_ciphertext,
+               reference_refs = EXCLUDED.reference_refs,
                edited_by = EXCLUDED.edited_by,
                updated_at = now()",
         )
@@ -533,18 +621,114 @@ async fn replace_blocks(
         .bind(region)
         .bind(page_id)
         .bind(&block.block_id)
-        .bind(i32::try_from(ordinal).map_err(|_| {
-            KnowledgePageError::Invalid("too many blocks for one page".into())
-        })?)
+        .bind(
+            i32::try_from(ordinal)
+                .map_err(|_| KnowledgePageError::Invalid("too many blocks for one page".into()))?,
+        )
         .bind(&block.block_type)
         .bind(block.inline.key_ref.to_uri())
         .bind(block.inline.nonce.to_vec())
         .bind(&block.inline.ciphertext)
+        .bind(reference_strings(&block.references))
         .bind(&block.created_by)
         .bind(&block.edited_by)
         .execute(&mut **tx)
         .await
         .map_err(storage("upsert Knowledge block"))?;
+    }
+    Ok(())
+}
+
+fn reference_strings(references: &[ArtifactRef]) -> Vec<String> {
+    references
+        .iter()
+        .map(|reference| reference.0.clone())
+        .collect()
+}
+
+fn reference_edges(blocks: &[KnowledgeBlockRecord]) -> BTreeSet<(String, String)> {
+    blocks
+        .iter()
+        .flat_map(|block| {
+            block
+                .references
+                .iter()
+                .map(|reference| (block.block_id.clone(), reference.0.clone()))
+        })
+        .collect()
+}
+
+async fn stored_reference_edges(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    region: &str,
+    page_id: &str,
+) -> Result<BTreeSet<(String, String)>, KnowledgePageError> {
+    let rows = sqlx::query_as::<_, (String, Vec<String>)>(
+        "SELECT block_id, COALESCE(reference_refs, ARRAY[]::text[])
+           FROM knowledge_block
+          WHERE tenant_id = $1 AND region = $2 AND page_id = $3",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(page_id)
+    .fetch_all(&mut **tx)
+    .await
+    .map_err(storage("read Knowledge reference edges"))?;
+    let mut edges = BTreeSet::new();
+    for (block_id, targets) in rows {
+        for target in targets {
+            let target = parse_stored_reference(tenant, target)?;
+            edges.insert((block_id.clone(), target.0));
+        }
+    }
+    Ok(edges)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn co_commit_reference_changes<'a>(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    tenant: &str,
+    region: &str,
+    page_id: &str,
+    edges: impl IntoIterator<Item = &'a (String, String)>,
+    change: myelin_refs::EdgeChange,
+    content_event: &myelin_events::EventEnvelope,
+    actor: &Actor,
+    occurred_at: &Timestamp,
+    event_ids: &dyn IdMinter,
+) -> Result<(), KnowledgePageError> {
+    for (block_id, target) in edges {
+        let source = crate::block_ref(&TenantId(tenant.to_string()), page_id, block_id);
+        let target = ArtifactRef(target.clone());
+        let envelope = derive_envelope(
+            myelin_refs::reference_edge_draft(
+                &source,
+                &target,
+                myelin_refs::ReferenceRel::Links,
+                change,
+            ),
+            EmitContext {
+                event_id: event_ids.mint().into(),
+                tenant: TenantId(tenant.to_string()),
+                region: Region(region.to_string()),
+                actor: actor.clone(),
+                schema_ver: 1,
+                occurred_at: occurred_at.clone(),
+                recorded_at: occurred_at.clone(),
+                caused_by: None,
+            },
+            Some(content_event),
+        );
+        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
+            &mut **tx,
+            &envelope.aggregate.0,
+            &envelope,
+        )
+        .await
+        .map_err(|error| {
+            KnowledgePageError::Storage(format!("co-commit Knowledge reference edge: {error}"))
+        })?;
     }
     Ok(())
 }
@@ -567,14 +751,39 @@ fn row_to_page(row: &PgRow) -> Result<KnowledgePageRecord, KnowledgePageError> {
     })
 }
 
-fn row_to_block(row: &PgRow) -> Result<KnowledgeBlockRecord, KnowledgePageError> {
+fn row_to_block(row: &PgRow, tenant: &str) -> Result<KnowledgeBlockRecord, KnowledgePageError> {
+    let references = row
+        .get::<Vec<String>, _>("reference_refs")
+        .into_iter()
+        .map(|reference| parse_stored_reference(tenant, reference))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(KnowledgeBlockRecord {
         block_id: row.get("block_id"),
         block_type: row.get("block_type"),
         inline: encrypted_from_row(row, "inline_key_ref", "inline_nonce", "inline_ciphertext")?,
+        references,
         created_by: row.get("created_by"),
         edited_by: row.get("edited_by"),
     })
+}
+
+fn parse_stored_reference(
+    tenant: &str,
+    reference: String,
+) -> Result<ArtifactRef, KnowledgePageError> {
+    let parsed = myelin_refs::parse_scoped(&reference)
+        .map_err(|_| KnowledgePageError::Storage("stored Knowledge reference is invalid".into()))?;
+    if parsed.tenant.as_str() != tenant {
+        return Err(KnowledgePageError::Storage(
+            "stored Knowledge reference escaped its tenant".into(),
+        ));
+    }
+    if parsed.artifact_ref.0 != reference {
+        return Err(KnowledgePageError::Storage(
+            "stored Knowledge reference is not canonical".into(),
+        ));
+    }
+    Ok(parsed.artifact_ref)
 }
 
 fn encrypted_from_row(
@@ -583,8 +792,9 @@ fn encrypted_from_row(
     nonce_column: &str,
     ciphertext_column: &str,
 ) -> Result<EncryptedColumn, KnowledgePageError> {
-    let key_ref = PiiKeyRef::parse(row.get::<String, _>(key_column).as_str())
-        .ok_or_else(|| KnowledgePageError::Storage("stored encryption key reference is invalid".into()))?;
+    let key_ref = PiiKeyRef::parse(row.get::<String, _>(key_column).as_str()).ok_or_else(|| {
+        KnowledgePageError::Storage("stored encryption key reference is invalid".into())
+    })?;
     let nonce = row.get::<Vec<u8>, _>(nonce_column);
     let nonce = nonce
         .try_into()
@@ -610,13 +820,17 @@ fn validate_space_key(space_key: &str) -> Result<(), KnowledgePageError> {
     Ok(())
 }
 
-fn validate_blocks(blocks: &[KnowledgeBlockRecord]) -> Result<(), KnowledgePageError> {
+fn validate_blocks(
+    tenant: &str,
+    blocks: &[KnowledgeBlockRecord],
+) -> Result<(), KnowledgePageError> {
     if blocks.is_empty() || blocks.len() > 500 {
         return Err(KnowledgePageError::Invalid(
             "a page must contain between 1 and 500 blocks".into(),
         ));
     }
     let mut ids = std::collections::HashSet::with_capacity(blocks.len());
+    let mut reference_count = 0usize;
     for block in blocks {
         if block.block_id.len() != 26
             || !block
@@ -629,7 +843,9 @@ fn validate_blocks(blocks: &[KnowledgeBlockRecord]) -> Result<(), KnowledgePageE
             ));
         }
         if !ids.insert(&block.block_id) {
-            return Err(KnowledgePageError::Invalid("block ids must be unique".into()));
+            return Err(KnowledgePageError::Invalid(
+                "block ids must be unique".into(),
+            ));
         }
         if !matches!(
             block.block_type.as_str(),
@@ -646,6 +862,27 @@ fn validate_blocks(blocks: &[KnowledgeBlockRecord]) -> Result<(), KnowledgePageE
             return Err(KnowledgePageError::Invalid(
                 "block type is not in the shared content taxonomy".into(),
             ));
+        }
+        if block.references.len() > MAX_BLOCK_REFERENCES {
+            return Err(KnowledgePageError::Invalid(format!(
+                "a block may contain at most {MAX_BLOCK_REFERENCES} structured references"
+            )));
+        }
+        reference_count = reference_count.saturating_add(block.references.len());
+        if reference_count > MAX_PAGE_REFERENCES {
+            return Err(KnowledgePageError::Invalid(format!(
+                "a page may contain at most {MAX_PAGE_REFERENCES} structured references"
+            )));
+        }
+        for reference in &block.references {
+            let parsed = myelin_refs::parse_scoped(&reference.0).map_err(|error| {
+                KnowledgePageError::Invalid(format!("invalid structured reference: {error}"))
+            })?;
+            if parsed.tenant.as_str() != tenant || parsed.artifact_ref != *reference {
+                return Err(KnowledgePageError::Invalid(
+                    "structured references must be canonical and stay in the page tenant".into(),
+                ));
+            }
         }
     }
     Ok(())
@@ -693,7 +930,7 @@ fn storage(context: &'static str) -> impl FnOnce(sqlx::Error) -> KnowledgePageEr
 }
 
 pub fn knowledge_page_migrations() -> myelin_substrate::Migrations {
-    use myelin_substrate::{Migration, Migrations};
+    use myelin_substrate::{Migration, MigrationPhase, Migrations};
 
     let page = Box::leak(
         format!(
@@ -710,6 +947,12 @@ pub fn knowledge_page_migrations() -> myelin_substrate::Migrations {
     Migrations::of([
         Migration::plain_on("knowledge_web_0001_page", page, KNOWLEDGE_PAGE_TABLE),
         Migration::plain_on("knowledge_web_0002_block", block, KNOWLEDGE_BLOCK_TABLE),
+        Migration::phased(
+            "knowledge_web_0003_block_references",
+            EXPAND_KNOWLEDGE_BLOCK_REFERENCES_DDL,
+            MigrationPhase::Expand,
+            KNOWLEDGE_BLOCK_TABLE,
+        ),
     ])
 }
 
@@ -735,6 +978,7 @@ mod tests {
             block_id: id.into(),
             block_type: "paragraph".into(),
             inline: encrypted("psn:alice"),
+            references: Vec::new(),
             created_by: "psn:alice".into(),
             edited_by: "psn:alice".into(),
         }
@@ -743,18 +987,26 @@ mod tests {
     #[test]
     fn production_migrations_are_rls_scoped_and_indexed() {
         let migrations = knowledge_page_migrations();
-        assert_eq!(migrations.0.len(), 2);
+        assert_eq!(migrations.0.len(), 3);
         assert!(migrations.0[0].ddl.contains(KNOWLEDGE_PAGE_RECENT_INDEX));
         for (migration, table) in migrations
             .0
             .iter()
+            .take(2)
             .zip([KNOWLEDGE_PAGE_TABLE, KNOWLEDGE_BLOCK_TABLE])
         {
-            assert!(migration.ddl.contains(&format!("CREATE TABLE IF NOT EXISTS {table}")));
+            assert!(migration
+                .ddl
+                .contains(&format!("CREATE TABLE IF NOT EXISTS {table}")));
             assert!(migration
                 .ddl
                 .contains(&format!("myelin_make_tenant_scoped('{table}')")));
         }
+        assert_eq!(migrations.0[2].ddl, EXPAND_KNOWLEDGE_BLOCK_REFERENCES_DDL);
+        assert_eq!(
+            migrations.0[2].phase,
+            myelin_substrate::MigrationPhase::Expand
+        );
     }
 
     #[test]
@@ -762,10 +1014,50 @@ mod tests {
         let same = block("01J00000000000000000000000");
         assert!(validate_space_key("engineering").is_ok());
         assert!(validate_space_key("Engineering").is_err());
-        assert!(validate_blocks(&[same.clone()]).is_ok());
-        assert!(validate_blocks(&[same.clone(), same]).is_err());
+        assert!(validate_blocks("acme", &[same.clone()]).is_ok());
+        assert!(validate_blocks("acme", &[same.clone(), same]).is_err());
         let mut unknown = block("01J00000000000000000000001");
         unknown.block_type = "raw_html".into();
-        assert!(validate_blocks(&[unknown]).is_err());
+        assert!(validate_blocks("acme", &[unknown]).is_err());
+    }
+
+    #[test]
+    fn reference_edges_remember_the_block_that_authored_them() {
+        let mut first = block("01J00000000000000000000000");
+        first.references = vec![ArtifactRef("myelin://acme/issue/issue/ENG-1".into())];
+        let mut second = block("01J00000000000000000000001");
+        second.references = vec![
+            ArtifactRef("myelin://acme/issue/issue/ENG-1".into()),
+            ArtifactRef("myelin://acme/git/pr/42".into()),
+        ];
+
+        assert_eq!(
+            reference_edges(&[first, second]),
+            BTreeSet::from([
+                (
+                    "01J00000000000000000000000".into(),
+                    "myelin://acme/issue/issue/ENG-1".into(),
+                ),
+                (
+                    "01J00000000000000000000001".into(),
+                    "myelin://acme/git/pr/42".into(),
+                ),
+                (
+                    "01J00000000000000000000001".into(),
+                    "myelin://acme/issue/issue/ENG-1".into(),
+                ),
+            ])
+        );
+    }
+
+    #[test]
+    fn stored_references_are_canonical_and_tenant_scoped() {
+        let canonical = "myelin://acme/issue/issue/ENG-1".to_string();
+        assert_eq!(
+            parse_stored_reference("acme", canonical.clone()).unwrap(),
+            ArtifactRef(canonical)
+        );
+        assert!(parse_stored_reference("acme", "myelin://other/issue/issue/ENG-1".into()).is_err());
+        assert!(parse_stored_reference("acme", "not-a-ref".into()).is_err());
     }
 }
