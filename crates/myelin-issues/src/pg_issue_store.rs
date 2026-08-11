@@ -761,7 +761,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
                 created,
             }),
             CreationTxResult::Conflict => Err(IssueStoreError::Conflict(
-                "that durable creation identity is already bound to a different issue".into(),
+                "idempotency key was already used for a different issue".into(),
             )),
         }
     }
