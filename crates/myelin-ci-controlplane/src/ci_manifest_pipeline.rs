@@ -444,6 +444,7 @@ fn emit_terminal_facts(
     };
     let mut payload = serde_json::json!({
         "run": manifest.run_ref,
+        "repo_ref": manifest.repo_ref,
         "commit_oid": manifest.commit_oid,
     });
     if let Some(source_ref) = &manifest.source_ref {

@@ -303,6 +303,10 @@ fn dag_dispatches_roots_together_replays_out_of_order_completions_then_launches_
         "refs/heads/main",
         "an automation can match the branch that actually triggered this run"
     );
+    assert_eq!(
+        terminal.envelope.payload["repo_ref"], manifest.repo_ref,
+        "an automation can stay inside the repository that owns the run"
+    );
 
     let check_attempts: BTreeMap<String, u64> = outbox
         .committed_rows()

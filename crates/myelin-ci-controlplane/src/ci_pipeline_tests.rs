@@ -375,6 +375,10 @@ fn terminal_run_event_uses_the_canonical_run_ref_as_its_subject() {
         row.envelope.subject,
         ArtifactRef("myelin://acme/ci/run/run-7".into())
     );
+    assert_eq!(
+        row.envelope.payload["repo_ref"], "myelin://acme/git/repo/r1",
+        "the run fact carries enough repository identity for bounded automations"
+    );
 }
 
 #[test]

@@ -97,7 +97,7 @@ myelin agent retire 22222222-2222-2222-2222-222222222222 \
 
 myelin agent create "Mainline triage" --runtime hosted \
   --tool ci.read_run --tool issues.create --idempotency-key mainline-triage
-myelin automation create --event ci.run.failed --branch main \
+myelin automation create --event ci.run.failed --repo core --branch main \
   --run-as 33333333-3333-3333-3333-333333333333 \
   --task "Read the failed run and open one focused issue." \
   --budget-minor-units 250000 --max-firings 10 --require-human-approval \
@@ -190,10 +190,11 @@ Hosted agents use the same identity and tool catalogue, but Myelin owns their ex
 `automation` binds a canonical platform event to one hosted agent, a plain-language task, an
 integer minor-unit budget, optional delegation caveats, and safety gates. Each firing receives a
 short-lived run identity and reaches Git, CI, Issues, Chat, and Knowledge only through governed
-Myelin tools. Repeating `--caveat` with capabilities such as `issue.create` narrows which selected
-tools reach the model and the signed run identity; `--caveat repo:platform/api` additionally binds
-every Git read and mutation to that repository. Invalid or merely decorative caveats are refused
-when the automation is created. Owners can inspect durable firing history and outcomes, pause new
+Myelin tools. `--repo platform/api` keeps CI-run and Git-ref matching inside that repository and
+automatically binds every Git read and mutation to it as well. Repeating `--caveat` with
+capabilities such as `issue.create` further narrows which selected tools reach the model and the
+signed run identity. Invalid, conflicting, or merely decorative caveats are refused when the
+automation is created. Owners can inspect durable firing history and outcomes, pause new
 reservations for maintenance, resume them, or irreversibly disable an automation from either the
 CLI or the web Automations workspace. Disable atomically closes every unfinished firing and its
 workflow, releases unused run budget, rejects still-pending effects, and removes their approval
@@ -245,6 +246,8 @@ web/API and CLI output, including the event and time that exposed it. `--branch 
 concise sugar for the platform's canonical branch field. It matches `payload.ref` on Git-reference
 events and `payload.source_ref` on CI events. CI runs keep that scope consistent: it is the pushed
 branch for push runs and the target branch for pull-request runs.
+`--repo platform/api` similarly matches `payload.repo` on Git-reference events and the canonical
+`payload.repo_ref` on CI-run events while applying the same repository scope to the run identity.
 
 Issue responses include a canonical `myelin://...` reference that can be passed directly to
 `chat ref`. The conversation keeps a live pointer to the issue rather than copying a stale

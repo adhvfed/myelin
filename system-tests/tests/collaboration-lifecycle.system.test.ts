@@ -127,16 +127,18 @@ describe("collaboration lifecycle", () => {
     });
     expect(borrowedAgentTrigger.body).toMatchObject({ error: { code: "conflict" } });
 
+    const slug = uniqueName("triggered-ci");
     const triggerRetryKey = `trigger-${randomUUID()}`;
     const intent = {
       event_type: "ci.run.failed",
+      repository: slug,
       source_branch: "main",
       run_as_agent_id: agentId,
       task: "Find the failure, open an issue, and prepare the smallest safe fix.",
       budget_minor_units: 250_000,
       max_firings: 10,
       max_causal_depth: 4,
-      delegation_caveats: ["repo:core", "run.view", "issue.create"],
+      delegation_caveats: ["run.view", "issue.create"],
       require_human_approval: true,
     };
     const created = await founder.json("/v1/triggers", {
@@ -159,6 +161,11 @@ describe("collaboration lifecycle", () => {
       run_as_agent_id: agentId,
       event_type: "ci.run.failed",
       task: intent.task,
+      condition:
+        `event.type == 'ci.run.failed' AND ` +
+        `payload.repo_ref == 'myelin://${systemTestConfig.tenant}/git/repo/${slug}' AND ` +
+        `payload.source_ref == 'refs/heads/main'`,
+      delegation_caveats: ["run.view", "issue.create", `repo:${slug}`],
       budget_minor_units: 250_000,
       max_firings: 10,
       firings_used: 0,
@@ -192,7 +199,6 @@ describe("collaboration lifecycle", () => {
       run_as_agent_id: agentId,
     });
 
-    const slug = uniqueName("triggered-ci");
     const project = new GitProject(slug, systemClient);
     const repoRef = `myelin://${systemTestConfig.tenant}/git/repo/${slug}`;
     await project.create();
@@ -241,6 +247,7 @@ command = ["true"]
       recorded_at: now,
       payload: {
         run: `myelin://${systemTestConfig.tenant}/ci/run/${runId}`,
+        repo_ref: repoRef,
         commit_oid: commitOid,
         source_ref: "refs/heads/main",
         structured_failure: { failed_stage: "contract" },
@@ -248,7 +255,17 @@ command = ["true"]
     };
 
     const bus = await ExternalEventBus.connect(systemTestConfig.natsUrl);
+    const neighbourEventId = `ci-failed-neighbour-${randomUUID()}`;
     try {
+      expect((await bus.publish({
+        ...failedMainline,
+        event_id: neighbourEventId,
+        correlation_id: neighbourEventId,
+        payload: {
+          ...record(failedMainline.payload, "selected repository CI payload"),
+          repo_ref: `myelin://${systemTestConfig.tenant}/git/repo/a-neighbour`,
+        },
+      })).duplicate).toBe(false);
       expect((await bus.publish(failedMainline)).duplicate).toBe(false);
       expect((await bus.publish(failedMainline)).duplicate).toBe(true);
     } finally {
@@ -265,6 +282,13 @@ command = ["true"]
       firings_used: 1,
       state: "active",
     });
+    const scopedHistory = await founder.json(
+      `/v1/triggers/${encodeURIComponent(triggerId)}/firings?limit=100`,
+    );
+    expect(array(scopedHistory.body.items, "repository-scoped firing history"))
+      .not.toEqual(expect.arrayContaining([
+        expect.objectContaining({ event_id: neighbourEventId }),
+      ]));
 
     const awaitingApproval = await eventually<JsonRecord>(async () => {
       const response = await founder.json(

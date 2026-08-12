@@ -722,6 +722,8 @@ describe("the CLI authentication journey", () => {
         "create",
         "--event",
         "ci.run.failed",
+        "--repo",
+        "core",
         "--branch",
         "main",
         "--run-as",
@@ -734,8 +736,6 @@ describe("the CLI authentication journey", () => {
         "10",
         "--max-causal-depth",
         "4",
-        "--caveat",
-        "repo:core",
       );
       expect(createAutomation.exitCode, createAutomation.stderr).toBe(0);
       const automationEnvelope = record(
@@ -748,6 +748,11 @@ describe("the CLI authentication journey", () => {
       expect(automation).toMatchObject({
         run_as_agent_id: hostedAgentId,
         event_type: "ci.run.failed",
+        condition:
+          `event.type == 'ci.run.failed' AND ` +
+          `payload.repo_ref == 'myelin://${systemTestConfig.tenant}/git/repo/core' AND ` +
+          `payload.source_ref == 'refs/heads/main'`,
+        delegation_caveats: ["repo:core"],
         task: automationTask,
         budget_minor_units: 250000,
         max_firings: 10,
@@ -764,6 +769,8 @@ describe("the CLI authentication journey", () => {
         "create",
         "--event",
         "ci.run.failed",
+        "--repo",
+        "core",
         "--branch",
         "main",
         "--run-as",
@@ -776,8 +783,6 @@ describe("the CLI authentication journey", () => {
         "10",
         "--max-causal-depth",
         "4",
-        "--caveat",
-        "repo:core",
       );
       expect(replayAutomation.exitCode, replayAutomation.stderr).toBe(0);
       expect(JSON.parse(replayAutomation.stdout)).toMatchObject({

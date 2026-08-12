@@ -54,6 +54,8 @@ struct CreateTriggerBody {
     #[serde(default)]
     subject_type: Option<String>,
     #[serde(default)]
+    repository: Option<String>,
+    #[serde(default)]
     source_branch: Option<String>,
     #[serde(default)]
     filter: Option<String>,
@@ -90,7 +92,8 @@ impl Handler for TriggerCreateHandler {
                 "trigger creation accepts no query parameters".into(),
             ));
         }
-        let body = parse_create_body(&ctx.request.body)?;
+        let mut body = parse_create_body(&ctx.request.body)?;
+        bind_repository_caveat(&mut body)?;
         let agent = self
             .api
             .drive(self.api.agents.get(ctx.principal, &body.run_as_agent_id))?
@@ -622,6 +625,45 @@ fn validate_delegation_caveats(
     Ok(())
 }
 
+fn bind_repository_caveat(body: &mut CreateTriggerBody) -> Result<(), EdgeError> {
+    let Some(repository) = body.repository.as_deref() else {
+        return Ok(());
+    };
+    validate_repository_scope(repository)?;
+    let repository_caveat = format!("repo:{repository}");
+    if body
+        .delegation_caveats
+        .iter()
+        .filter(|caveat| caveat.starts_with("repo:"))
+        .any(|caveat| caveat != &repository_caveat)
+    {
+        return Err(EdgeError::BadRequest(
+            "repository scope and delegation repository caveat must name the same repository"
+                .into(),
+        ));
+    }
+    if !body
+        .delegation_caveats
+        .iter()
+        .any(|caveat| caveat == &repository_caveat)
+    {
+        body.delegation_caveats.push(repository_caveat);
+    }
+    Ok(())
+}
+
+fn validate_repository_scope(repository: &str) -> Result<(), EdgeError> {
+    if repository.len() <= 255
+        && myelin_git::gix_backend::validate_repo_slug(repository).is_ok()
+    {
+        Ok(())
+    } else {
+        Err(EdgeError::BadRequest(
+            "repository must be a bounded canonical repository slug".into(),
+        ))
+    }
+}
+
 fn map_agent_registry_error(error: AgentRegistryError) -> EdgeError {
     match error {
         AgentRegistryError::BadInput(reason) => EdgeError::BadRequest(reason),
@@ -693,8 +735,10 @@ fn create_proposal(
     }
 
     let matcher = compile_matcher(
+        &ctx.principal.tenant.0,
         &body.event_type,
         body.subject_type.as_deref(),
+        body.repository.as_deref(),
         body.source_branch.as_deref(),
         body.filter.as_deref(),
     )?;
@@ -730,8 +774,10 @@ fn validate_budget_minor_units(value: u64) -> Result<(), EdgeError> {
 }
 
 fn compile_matcher(
+    tenant: &str,
     event_type: &str,
     subject_type: Option<&str>,
+    repository: Option<&str>,
     source_branch: Option<&str>,
     filter: Option<&str>,
 ) -> Result<EventMatcher, EdgeError> {
@@ -747,6 +793,27 @@ fn compile_matcher(
         lhs: Expr::Var("event.type".into()),
         rhs: Expr::Lit(Literal::Str(event_type.into())),
     }];
+    if let Some(repository) = repository {
+        validate_repository_scope(repository)?;
+        let (field, value) = if event_type.starts_with("ci.run.") && subject_type == "run" {
+            (
+                "payload.repo_ref",
+                format!("myelin://{tenant}/git/repo/{repository}"),
+            )
+        } else if event_type == "git.ref.updated" && subject_type == "ref" {
+            ("payload.repo", repository.to_owned())
+        } else {
+            return Err(EdgeError::BadRequest(
+                "repository scope is supported for CI run and Git ref automations".into(),
+            ));
+        };
+        condition_sources.push(format!("{field} == {}", quote_query_string(&value)));
+        predicates.push(Predicate::Cmp {
+            op: CmpOp::Eq,
+            lhs: Expr::Var(field.into()),
+            rhs: Expr::Lit(Literal::Str(value)),
+        });
+    }
     if let Some(branch) = source_branch {
         let source_ref = match branch {
             branch if branch.starts_with("refs/heads/") => branch.to_owned(),
@@ -956,6 +1023,22 @@ mod tests {
         false
     }
 
+    fn compile_test_matcher(
+        event_type: &str,
+        subject_type: Option<&str>,
+        source_branch: Option<&str>,
+        filter: Option<&str>,
+    ) -> Result<EventMatcher, EdgeError> {
+        compile_matcher(
+            "acme",
+            event_type,
+            subject_type,
+            None,
+            source_branch,
+            filter,
+        )
+    }
+
     fn ci_event(event_type: &str, source_ref: &str) -> EventEnvelope {
         EventEnvelope {
             event_id: EventId("01K2FIREONCE".into()),
@@ -1002,7 +1085,7 @@ mod tests {
 
     #[test]
     fn red_mainline_trigger_is_exactly_red_and_exactly_mainline() {
-        let matcher = compile_matcher("ci.run.failed", None, Some("main"), None).unwrap();
+        let matcher = compile_test_matcher("ci.run.failed", None, Some("main"), None).unwrap();
 
         assert_eq!(
             matcher.matches(
@@ -1034,19 +1117,113 @@ mod tests {
     }
 
     #[test]
+    fn repository_scope_is_part_of_matching_and_tool_authority() {
+        let matcher = compile_matcher(
+            "acme",
+            "ci.run.failed",
+            None,
+            Some("platform/api"),
+            Some("main"),
+            None,
+        )
+        .unwrap();
+        let mut selected = ci_event("ci.run.failed", "refs/heads/main");
+        selected.payload["repo_ref"] = json!("myelin://acme/git/repo/platform/api");
+        let mut neighbour = selected.clone();
+        neighbour.payload["repo_ref"] = json!("myelin://acme/git/repo/platform/web");
+
+        assert_eq!(
+            matcher.matches(&selected, &SetExpr::All, &no_relation),
+            Ok(true),
+            "the selected repository's red mainline run wakes the agent"
+        );
+        assert_eq!(
+            matcher.matches(&neighbour, &SetExpr::All, &no_relation),
+            Ok(false),
+            "another repository cannot spend this automation's budget"
+        );
+        assert_eq!(
+            matcher.predicate().source(),
+            concat!(
+                "event.type == 'ci.run.failed' AND ",
+                "payload.repo_ref == 'myelin://acme/git/repo/platform/api' AND ",
+                "payload.source_ref == 'refs/heads/main'"
+            )
+        );
+
+        let mut body = parse_create_body(
+            br#"{
+            "event_type":"ci.run.failed",
+            "repository":"platform/api",
+            "run_as_agent_id":"20000000-0000-4000-8000-000000000002",
+            "task":"Triage the failure.",
+            "budget_minor_units":1,
+            "max_firings":1,
+            "delegation_caveats":["issue.create"]
+        }"#,
+        )
+        .unwrap();
+        bind_repository_caveat(&mut body).unwrap();
+        assert_eq!(
+            body.delegation_caveats,
+            vec!["issue.create", "repo:platform/api"],
+            "one choice scopes both event matching and delegated Git authority"
+        );
+    }
+
+    #[test]
+    fn repository_scope_refuses_ambiguous_or_unsupported_intent() {
+        let mut conflicting = parse_create_body(
+            br#"{
+            "event_type":"ci.run.failed",
+            "repository":"platform/api",
+            "run_as_agent_id":"20000000-0000-4000-8000-000000000002",
+            "task":"Triage the failure.",
+            "budget_minor_units":1,
+            "max_firings":1,
+            "delegation_caveats":["repo:platform/web"]
+        }"#,
+        )
+        .unwrap();
+        assert!(bind_repository_caveat(&mut conflicting).is_err());
+        assert!(compile_matcher(
+            "acme",
+            "issue.issue.updated",
+            None,
+            Some("platform/api"),
+            None,
+            None,
+        )
+        .is_err());
+        assert!(compile_matcher(
+            "acme",
+            "ci.run.failed",
+            None,
+            Some("../payroll"),
+            None,
+            None,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn branch_inputs_are_canonicalized_or_refused_before_persistence() {
         assert_eq!(
-            compile_matcher("ci.run.failed", None, Some("main"), None).unwrap(),
-            compile_matcher("ci.run.failed", None, Some("refs/heads/main"), None).unwrap(),
+            compile_test_matcher("ci.run.failed", None, Some("main"), None).unwrap(),
+            compile_test_matcher("ci.run.failed", None, Some("refs/heads/main"), None).unwrap(),
             "friendly and fully-qualified mainline names compile to one durable intent"
         );
-        assert!(compile_matcher("ci.run.failed", None, Some("refs/tags/release"), None).is_err());
-        assert!(compile_matcher("ci.run.failed", None, Some("feature/../main"), None).is_err());
+        assert!(
+            compile_test_matcher("ci.run.failed", None, Some("refs/tags/release"), None).is_err()
+        );
+        assert!(
+            compile_test_matcher("ci.run.failed", None, Some("feature/../main"), None).is_err()
+        );
     }
 
     #[test]
     fn a_git_ref_branch_filter_reads_the_git_ref_payload() {
-        let matcher = compile_matcher("git.ref.updated", None, Some("main"), None).unwrap();
+        let matcher = compile_test_matcher("git.ref.updated", None, Some("main"), None).unwrap();
         let mut event = ci_event("git.ref.updated", "unused");
         event.subject = ArtifactRef("myelin://acme/git/ref/core:refs%2Fheads%2Fmain".into());
         event.payload = json!({ "ref": "refs/heads/main" });
@@ -1064,23 +1241,23 @@ mod tests {
 
     #[test]
     fn event_names_share_the_platform_taxonomy_instead_of_a_trigger_only_dialect() {
-        assert!(compile_matcher("ci.result", Some("run"), None, None).is_ok());
-        assert!(compile_matcher("ci.result", None, None, None).is_err());
-        assert!(compile_matcher("CI.run.failed", None, None, None).is_err());
-        assert!(compile_matcher("unknown.run.failed", None, None, None).is_err());
+        assert!(compile_test_matcher("ci.result", Some("run"), None, None).is_ok());
+        assert!(compile_test_matcher("ci.result", None, None, None).is_err());
+        assert!(compile_test_matcher("CI.run.failed", None, None, None).is_err());
+        assert!(compile_test_matcher("unknown.run.failed", None, None, None).is_err());
     }
 
     #[test]
     fn matcher_subjects_follow_the_event_artifact_instead_of_silently_assuming_ci() {
-        let issue = compile_matcher("issue.issue.updated", None, None, None).unwrap();
+        let issue = compile_test_matcher("issue.issue.updated", None, None, None).unwrap();
         assert_eq!(issue.object_type().0, "issue");
-        assert!(compile_matcher("issue.issue.updated", Some("run"), None, None).is_err());
-        assert!(compile_matcher("ci.deployment.finished", None, None, None).is_err());
+        assert!(compile_test_matcher("issue.issue.updated", Some("run"), None, None).is_err());
+        assert!(compile_test_matcher("ci.deployment.finished", None, None, None).is_err());
     }
 
     #[test]
     fn one_bounded_query_language_filters_every_event_domain() {
-        let matcher = compile_matcher(
+        let matcher = compile_test_matcher(
             "issue.issue.updated",
             None,
             None,
@@ -1110,14 +1287,14 @@ mod tests {
             "operators can rediscover the complete effective condition"
         );
 
-        assert!(compile_matcher(
+        assert!(compile_test_matcher(
             "issue.issue.updated",
             None,
             None,
             Some(" payload.change_kind == 'ownership'")
         )
         .is_err());
-        assert!(compile_matcher(
+        assert!(compile_test_matcher(
             "issue.issue.updated",
             None,
             None,

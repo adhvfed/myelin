@@ -40,6 +40,7 @@ pub fn automation_dispatch(args: &[&str]) -> Result<EdgeCall, CliError> {
 struct CreateOptions<'a> {
     event_type: Option<&'a str>,
     subject_type: Option<&'a str>,
+    repository: Option<&'a str>,
     source_branch: Option<&'a str>,
     filter: Option<&'a str>,
     run_as_agent_id: Option<&'a str>,
@@ -64,6 +65,7 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
                 &mut index,
                 "--subject-type",
             )?,
+            "--repo" => singleton_value(&mut options.repository, args, &mut index, "--repo")?,
             "--branch" => {
                 singleton_value(&mut options.source_branch, args, &mut index, "--branch")?
             }
@@ -116,6 +118,9 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
         CliError::Usage("--event must be a canonical registered Myelin event name".into())
     })?;
     resolve_subject_type(event_type, options.subject_type)?;
+    if let Some(repository) = options.repository {
+        validate_repository_scope(event_type, repository)?;
+    }
     let run_as_agent_id = required(options.run_as_agent_id, "--run-as")?;
     require_automation_id("--run-as", run_as_agent_id)?;
     let task = required(options.task, "--task")?;
@@ -160,6 +165,9 @@ fn create_call(args: &[&str]) -> Result<EdgeCall, CliError> {
     });
     if let Some(branch) = options.source_branch {
         body["source_branch"] = json!(branch);
+    }
+    if let Some(repository) = options.repository {
+        body["repository"] = json!(repository);
     }
     if let Some(filter) = options.filter {
         body["filter"] = json!(filter);
@@ -456,6 +464,20 @@ fn validate_branch(branch: &str) -> Result<(), CliError> {
     Ok(())
 }
 
+fn validate_repository_scope(event_type: &str, repository: &str) -> Result<(), CliError> {
+    if repository.len() > 255 || myelin_git::gix_backend::validate_repo_slug(repository).is_err() {
+        return Err(CliError::Usage(
+            "--repo must be a bounded canonical repository slug".into(),
+        ));
+    }
+    if !event_type.starts_with("ci.run.") && event_type != "git.ref.updated" {
+        return Err(CliError::Usage(
+            "--repo is supported for CI run and Git ref automations".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn require_automation_id(label: &str, value: &str) -> Result<(), CliError> {
     if is_canonical_automation_id(value) {
         Ok(())
@@ -484,6 +506,8 @@ mod tests {
             "create",
             "--event",
             "ci.run.failed",
+            "--repo",
+            "platform/api",
             "--branch",
             "main",
             "--where",
@@ -510,6 +534,7 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(call.payload.as_ref().unwrap()).unwrap(),
             json!({
                 "event_type": "ci.run.failed",
+                "repository": "platform/api",
                 "source_branch": "main",
                 "filter": "payload.retryable == true",
                 "run_as_agent_id": AGENT,
@@ -560,6 +585,14 @@ mod tests {
 
         args.drain(3..5);
         assert!(automation_dispatch(&args).is_err());
+    }
+
+    #[test]
+    fn repository_scope_is_bounded_and_limited_to_repository_events() {
+        assert!(validate_repository_scope("ci.run.failed", "platform/api").is_ok());
+        assert!(validate_repository_scope("git.ref.updated", "platform/api").is_ok());
+        assert!(validate_repository_scope("ci.run.failed", "../payroll").is_err());
+        assert!(validate_repository_scope("issue.issue.updated", "platform/api").is_err());
     }
 
     #[test]

@@ -250,6 +250,7 @@ fn emit_run_terminal(
     };
     let mut payload = serde_json::json!({
         "run": facts.run_ref,
+        "repo_ref": facts.repo,
         "commit_oid": facts.commit_oid,
     });
     if let Some(stage) = failed_stage {

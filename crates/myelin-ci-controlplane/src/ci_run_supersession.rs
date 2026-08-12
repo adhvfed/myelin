@@ -61,6 +61,7 @@ struct QueueLifecycle {
 
 #[derive(Debug)]
 struct CancellationProvenance {
+    repo_ref: String,
     cause_event_id: String,
     correlation_id: String,
     caused_by: Option<String>,
@@ -1102,6 +1103,7 @@ async fn emit_stale_run_cancelled_on_conn(
         aggregate: AggregateKey(format!("ci/run/{run_ref}")),
         payload: serde_json::json!({
             "run": run_ref,
+            "repo_ref": &provenance.repo_ref,
             "reason": SUPERSEDED_REASON,
         }),
         data_role: DataRole::Controller,
@@ -1193,6 +1195,7 @@ async fn emit_cancelled_manifest_facts_on_conn(
         aggregate: AggregateKey(format!("ci/run/{}", manifest.run_ref)),
         payload: serde_json::json!({
             "run": manifest.run_ref,
+            "repo_ref": manifest.repo_ref,
             "commit_oid": manifest.commit_oid,
             "reason": SUPERSEDED_REASON,
         }),
@@ -1249,7 +1252,7 @@ async fn cancellation_provenance(
     run_id: &str,
 ) -> Result<CancellationProvenance, CiRunSupersessionError> {
     let row = sqlx::query(
-        "SELECT cause_event_id, correlation_id, caused_by, cause_depth, \
+        "SELECT repo_ref, cause_event_id, correlation_id, caused_by, cause_depth, \
                 to_char(finished_at AT TIME ZONE 'UTC', \
                         'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') AS finished_at, \
                 to_char(clock_timestamp() AT TIME ZONE 'UTC', \
@@ -1269,6 +1272,9 @@ async fn cancellation_provenance(
     ))?;
     let depth: i64 = row.get("cause_depth");
     Ok(CancellationProvenance {
+        repo_ref: row.get::<Option<String>, _>("repo_ref").ok_or(
+            CiRunSupersessionError::CorruptState("cancelled run lacks repository identity"),
+        )?,
         cause_event_id: row.get::<Option<String>, _>("cause_event_id").ok_or(
             CiRunSupersessionError::CorruptState("cancelled run lacks triggering event identity"),
         )?,
