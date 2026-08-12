@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 use super::RuntimePreparation;
 use super::{
     acquire_enabled_workspace, checkout_cleanup_plan, execute_cleanup_plan,
@@ -23,14 +23,13 @@ use crate::user_namespace::{
     CheckoutPreparationSession, UserNamespaceAllocator, UserNamespaceLease,
 };
 use crate::workspace_manager::WorkspaceManager;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 use crate::LaunchPermit;
 use crate::{
     CheckoutAuthorizationScope, JobSpec, PhaseAuthorization, RunTokenCredential, RunnerHooks,
     SandboxCancellation, SandboxOutputSink,
 };
 
-#[allow(dead_code)]
 pub(super) struct AcquiredCheckoutRuntime {
     workload_container_id: String,
     checkout_scope: CheckoutAuthorizationScope,
@@ -39,13 +38,11 @@ pub(super) struct AcquiredCheckoutRuntime {
     workload_cfg: OciConfig,
 }
 
-#[allow(dead_code)]
 pub(super) struct PreparedCheckoutRuntime {
     acquired: AcquiredCheckoutRuntime,
     prepared_checkout_evidence: PreparedCheckoutEvidence,
 }
 
-#[allow(dead_code)]
 impl AcquiredCheckoutRuntime {
     pub(super) fn acquire(
         spec: &JobSpec,
@@ -124,7 +121,6 @@ impl AcquiredCheckoutRuntime {
     }
 }
 
-#[allow(dead_code)]
 impl PreparedCheckoutRuntime {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn run_retained_workload(
@@ -273,7 +269,7 @@ impl PreparedCheckoutRuntime {
     }
 }
 
-#[allow(dead_code, clippy::result_large_err, clippy::too_many_arguments)]
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(super) fn run_checkout_preparation_v2(
     mut runtime: AcquiredCheckoutRuntime,
     spec: CheckoutPreparationSpec,
@@ -309,8 +305,7 @@ pub(super) fn run_checkout_preparation_v2(
     }
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
+#[cfg(all(test, feature = "test-support"))]
 impl PreparedCheckoutRuntime {
     #[allow(clippy::too_many_arguments, private_interfaces, private_bounds)]
     pub(crate) fn run_retained_workload_given<F>(
@@ -353,8 +348,7 @@ impl PreparedCheckoutRuntime {
     }
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
+#[cfg(all(test, feature = "test-support"))]
 impl AcquiredCheckoutRuntime {
     pub(crate) fn drive_session_for_tests(
         &mut self,

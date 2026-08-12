@@ -25,7 +25,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct CheckoutPreparationSpec {
     pub(super) expected_commit: ExpectedGitCommitId,
     pack: PrefetchedCheckoutPack,
@@ -33,7 +32,6 @@ pub(crate) struct CheckoutPreparationSpec {
 }
 
 impl CheckoutPreparationSpec {
-    #[allow(dead_code)]
     pub(crate) fn new(
         expected_commit: ExpectedGitCommitId,
         pack: PrefetchedCheckoutPack,
@@ -49,31 +47,16 @@ impl CheckoutPreparationSpec {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct PreparedCheckoutEvidence {
-    commit_hex: String,
-    tree_oid: String,
     cargo_lock_sha256_hex: String,
     preparation_usage: ResourceUsage,
 }
 
 impl PreparedCheckoutEvidence {
-    #[allow(dead_code)]
-    pub(crate) fn commit_hex(&self) -> &str {
-        &self.commit_hex
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn tree_oid(&self) -> &str {
-        &self.tree_oid
-    }
-
-    #[allow(dead_code)]
     pub(crate) fn cargo_lock_sha256_hex(&self) -> &str {
         &self.cargo_lock_sha256_hex
     }
 
-    #[allow(dead_code)]
     pub(crate) fn preparation_usage(&self) -> ResourceUsage {
         self.preparation_usage
     }
@@ -81,8 +64,6 @@ impl PreparedCheckoutEvidence {
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn for_tests(preparation_usage: ResourceUsage) -> Self {
         PreparedCheckoutEvidence {
-            commit_hex: "a".repeat(40),
-            tree_oid: "b".repeat(40),
             cargo_lock_sha256_hex: "c".repeat(64),
             preparation_usage,
         }
@@ -90,7 +71,6 @@ impl PreparedCheckoutEvidence {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) enum CheckoutPreparationError {
     Refused(String),
     Unreleasable {
@@ -109,7 +89,6 @@ pub(crate) enum CheckoutPreparationError {
 }
 
 impl CheckoutPreparationError {
-    #[allow(dead_code)]
     pub(crate) fn attempt_disposition(&self) -> PreparationAttemptDisposition {
         match self {
             Self::Refused(_) => PreparationAttemptDisposition::RefusedBeforeExecution {
@@ -233,7 +212,6 @@ impl std::fmt::Display for CheckoutPreparationError {
 
 impl std::error::Error for CheckoutPreparationError {}
 
-#[allow(dead_code)]
 const CHECKOUT_PREPARATION_SCRIPT: &str = "set -eu
 umask 077
 export HOME=/tmp
@@ -293,7 +271,6 @@ fi
 echo ok
 ";
 
-#[allow(dead_code)]
 fn parse_checkout_confirmation_line(
     stdout: &[u8],
     expected: &ExpectedGitCommitId,
@@ -332,7 +309,6 @@ fn parse_checkout_confirmation_line(
     Ok(tree.to_string())
 }
 
-#[allow(dead_code)]
 fn open_regular_file_no_follow(dir_fd: RawFd, name: &CString) -> io::Result<std::fs::File> {
     let fd = unsafe {
         libc::openat(
@@ -354,7 +330,6 @@ fn open_regular_file_no_follow(dir_fd: RawFd, name: &CString) -> io::Result<std:
     Ok(file)
 }
 
-#[allow(dead_code)]
 fn verify_workspace_head_no_follow(
     workspace_host_path: &Path,
     expected: &ExpectedGitCommitId,
@@ -534,7 +509,6 @@ fn verify_materialized_checkout_no_follow(
     result
 }
 
-#[allow(dead_code)]
 fn usage_from_runsc_outcome(mem_bytes: u64, o: &RunscOutcome) -> ResourceUsage {
     let wall_secs_ceil = o.wall.as_secs() + u64::from(o.wall.subsec_nanos() > 0);
     let cpu_seconds = o.cpu_seconds.filter(|c| *c > 0).unwrap_or(wall_secs_ceil);
@@ -544,26 +518,7 @@ fn usage_from_runsc_outcome(mem_bytes: u64, o: &RunscOutcome) -> ResourceUsage {
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn run_checkout_preparation(
-    lease: &mut UserNamespaceLease,
-    session: &mut CheckoutPreparationSession,
-    workspace: &ManagedWorkspace,
-    spec: CheckoutPreparationSpec,
-) -> Result<PreparedCheckoutEvidence, CheckoutPreparationError> {
-    run_checkout_preparation_inner(
-        lease,
-        session,
-        workspace,
-        spec,
-        LaunchPermit::immediate(),
-        &NEVER_CANCELLED,
-        None,
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(super) enum CheckoutCleanupPlan {
     DeleteWorkspaceThenReleaseUnused,
     DeleteWorkspaceThenReleasePrepared,
@@ -571,7 +526,6 @@ pub(super) enum CheckoutCleanupPlan {
     AbandonBoth,
 }
 
-#[allow(dead_code)]
 pub(super) fn checkout_cleanup_plan(disposition: CheckoutSessionCleanup) -> CheckoutCleanupPlan {
     match disposition {
         CheckoutSessionCleanup::NeverBound => CheckoutCleanupPlan::DeleteWorkspaceThenReleaseUnused,
@@ -583,7 +537,6 @@ pub(super) fn checkout_cleanup_plan(disposition: CheckoutSessionCleanup) -> Chec
     }
 }
 
-#[allow(dead_code)]
 pub(super) trait CheckoutCleanupExecutor {
     fn delete_workspace(&mut self) -> (bool, Vec<String>);
     fn release_unused(&mut self) -> Vec<String>;
@@ -592,7 +545,6 @@ pub(super) trait CheckoutCleanupExecutor {
     fn quarantine_lease(&mut self);
 }
 
-#[allow(dead_code)]
 pub(super) fn execute_cleanup_plan(
     plan: CheckoutCleanupPlan,
     executor: &mut dyn CheckoutCleanupExecutor,
@@ -641,7 +593,6 @@ pub(super) fn execute_cleanup_plan(
     diagnostics
 }
 
-#[allow(dead_code)]
 pub(super) struct RealCheckoutCleanupExecutor<'a> {
     pub(super) workspace: Option<ManagedWorkspace>,
     pub(super) lease: Option<UserNamespaceLease>,
@@ -649,7 +600,6 @@ pub(super) struct RealCheckoutCleanupExecutor<'a> {
     pub(super) workspace_manager: &'a WorkspaceManager,
 }
 
-#[allow(dead_code)]
 impl CheckoutCleanupExecutor for RealCheckoutCleanupExecutor<'_> {
     fn delete_workspace(&mut self) -> (bool, Vec<String>) {
         let workspace = self
@@ -699,7 +649,6 @@ impl CheckoutCleanupExecutor for RealCheckoutCleanupExecutor<'_> {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) enum RetainedWorkloadOutcome {
     Ran(Result<ContainerRun, RunFailure>),
     RunFailed {
@@ -720,7 +669,6 @@ pub(crate) enum RetainedWorkloadOutcome {
     },
 }
 
-#[allow(dead_code)]
 pub(super) fn resolve_checkout_preparation_permit(
     authorization: PhaseAuthorization,
     run_token: &RunTokenCredential,
@@ -732,7 +680,6 @@ pub(super) fn resolve_checkout_preparation_permit(
         .map_err(|error| CheckoutPreparationError::Refused(error.0))
 }
 
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_checkout_preparation_inner(
     lease: &mut UserNamespaceLease,
@@ -953,10 +900,8 @@ fn evaluate_checkout_finalization(
             usage,
         ));
     }
-    let tree_oid = match parse_checkout_confirmation_line(&outcome.stdout, expected_commit) {
-        Ok(tree) => tree,
-        Err(reason) => return Err(checkout_materialization_terminal_failed(reason, usage)),
-    };
+    parse_checkout_confirmation_line(&outcome.stdout, expected_commit)
+        .map_err(|reason| checkout_materialization_terminal_failed(reason, usage))?;
     let cargo_lock_sha256_hex =
         match verify_materialized_checkout_no_follow(workspace_host_path, expected_commit) {
             Ok(hex) => hex,
@@ -964,14 +909,11 @@ fn evaluate_checkout_finalization(
         };
 
     Ok(PreparedCheckoutEvidence {
-        commit_hex: expected_commit.as_str().to_string(),
-        tree_oid,
         cargo_lock_sha256_hex,
         preparation_usage: usage,
     })
 }
 
-#[allow(dead_code)]
 fn describe_run_primary(primary: &Result<RunscOutcome, RunFailure>) -> String {
     match primary {
         Ok(outcome) => format!(
@@ -2091,8 +2033,6 @@ mod tests {
             );
             let prepared_evidence =
                 result.expect("full agreement must mint PreparedCheckoutEvidence");
-            assert_eq!(prepared_evidence.commit_hex(), expected.as_str());
-            assert_eq!(prepared_evidence.tree_oid(), tree);
             let mut hasher = Sha256::new();
             hasher.update(b"# fake lockfile content\n");
             let expected_hex = hasher

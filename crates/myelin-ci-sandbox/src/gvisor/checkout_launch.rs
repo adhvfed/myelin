@@ -135,7 +135,7 @@ impl GvisorBackend {
         ) -> RetainedWorkloadOutcome,
     {
         use crate::checkout_orchestration::{
-            requeue_or_exhausted, route_after_disposal, CheckoutContinuationOutcome,
+            route_after_disposal, CheckoutContinuationOutcome,
             CheckoutOrchestrationError,
         };
         use crate::CheckoutPhase;
@@ -231,12 +231,17 @@ impl GvisorBackend {
                 classify_bound_workload_failure(authority, report_claim, failure),
             )),
             RetainedWorkloadOutcome::PermitRefused {
+                message,
                 disposal_diagnostics,
-                ..
             } => Ok(route_after_disposal(
                 disposal_diagnostics,
                 MATERIALIZATION,
-                requeue_or_exhausted(authority, report_claim, MATERIALIZATION),
+                crate::checkout_orchestration::requeue_or_exhausted_with_diagnostic(
+                    authority,
+                    report_claim,
+                    MATERIALIZATION,
+                    Some(message),
+                ),
             )),
             RetainedWorkloadOutcome::PhaseAuthorityFailed {
                 error,

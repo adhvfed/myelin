@@ -354,6 +354,15 @@ pub(crate) fn requeue_or_exhausted(
     claim: &PreparationReportClaim,
     phase: PreparationPhase,
 ) -> CheckoutContinuationOutcome {
+    requeue_or_exhausted_with_diagnostic(authority, claim, phase, None)
+}
+
+pub(crate) fn requeue_or_exhausted_with_diagnostic(
+    authority: &dyn AttemptAuthority,
+    claim: &PreparationReportClaim,
+    phase: PreparationPhase,
+    terminal_diagnostic: Option<String>,
+) -> CheckoutContinuationOutcome {
     if authority.should_requeue() {
         CheckoutContinuationOutcome::PreparationRetryable {
             claim: claim.clone(),
@@ -363,7 +372,7 @@ pub(crate) fn requeue_or_exhausted(
         CheckoutContinuationOutcome::PreparationTerminal {
             claim: claim.clone(),
             disposition: PreparationTerminalDisposition::AttemptsExhausted,
-            diagnostic: None,
+            diagnostic: terminal_diagnostic,
         }
     }
 }
@@ -769,6 +778,24 @@ mod tests {
             }
             other => panic!("expected an exhausted terminal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn exhausted_attempt_preserves_the_terminal_diagnostic() {
+        let outcome = requeue_or_exhausted_with_diagnostic(
+            &RecordingAuthority::new(false),
+            &report_claim(),
+            PreparationPhase::CheckoutMaterialization,
+            Some("workload launch permit was revoked".to_string()),
+        );
+        assert!(matches!(
+            outcome,
+            CheckoutContinuationOutcome::PreparationTerminal {
+                disposition: PreparationTerminalDisposition::AttemptsExhausted,
+                diagnostic: Some(ref diagnostic),
+                ..
+            } if diagnostic == "workload launch permit was revoked"
+        ));
     }
 
     #[test]
