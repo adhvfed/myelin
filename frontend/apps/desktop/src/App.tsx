@@ -1,11 +1,8 @@
 import { createResource, createSignal, Show, Suspense, type JSX } from "solid-js";
-// The shell wraps a minimal Solid page that uses the MR-016 design-system (<Icon>) + an MR-017
-// overlay (<Dialog>). The full app shell slots in here at MR-019; this proves the wrapping is real.
 import { Dialog, Icon } from "@myelin/design-system";
 import { coreInfo, renderMarkdown } from "./bridge";
 
-// A canonical markdown-subset string (the design-manual "bold" form). It round-trips through the
-// shared myelin-content path byte-for-byte, so this is a genuine "hello, shared myelin-content".
+// Sample content passed through the shared Rust renderer.
 const SAMPLE = "**hello, shared myelin-content**";
 
 export function App(): JSX.Element {

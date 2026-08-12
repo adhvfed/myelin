@@ -1,15 +1,10 @@
-// The Tauri Rust-core bridge (the load-bearing MR-018 proof, frontend side).
-//
-// Every function here `invoke`s a Tauri COMMAND implemented in `src-tauri`, whose Rust body
-// REUSES a Myelin crate (`myelin-content`'s frozen render path; `myelin-client`'s config). This
-// is the "one Rust core, three shells" seam: the native shell does not re-implement Myelin logic
-// in JS — it calls the same Rust crates the server uses, over the Tauri IPC boundary.
+// Tauri bridge to the shared Rust content and client crates.
 import { invoke } from "@tauri-apps/api/core";
 
 export const MAX_RENDER_MARKDOWN_BYTES = 64 * 1024;
 const utf8 = new TextEncoder();
 
-/** The result of round-tripping a markdown-subset string through the SHARED myelin-content path. */
+/** The result of round-tripping a markdown-subset string through myelin-content. */
 export interface RenderResult {
   /** The input markdown-subset string. */
   input: string;
@@ -21,9 +16,7 @@ export interface RenderResult {
 
 /**
  * Round-trip `md` through the Tauri Rust side, which calls `myelin_content::wasm::render_parse`
- * + `render_serialize` — the SAME single render path compiled into the server and the WASM
- * editor. The "hello, shared myelin-content" proof: the string is parsed + re-serialized by the
- * shared Rust crate, not by JS.
+ * + `render_serialize` in the shared Rust crate.
  */
 export async function renderMarkdown(md: string): Promise<RenderResult> {
   if (utf8.encode(md).byteLength > MAX_RENDER_MARKDOWN_BYTES) {
@@ -58,7 +51,7 @@ export interface CoreInfo {
   contentCorpusPassed: number;
   /** `myelin_content::corpus::corpus_pass_rate()` total count. */
   contentCorpusTotal: number;
-  /** `myelin_client::ResilientConfig::default().timeout_ms` — proves myelin-client links too. */
+  /** `myelin_client::ResilientConfig::default().timeout_ms`. */
   clientTimeoutMs: number;
 }
 

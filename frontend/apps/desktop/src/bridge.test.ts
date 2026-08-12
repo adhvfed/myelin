@@ -1,9 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// Mock the Tauri IPC boundary: in a test runner there is no native host, so we assert the bridge
-// shapes the `invoke` call correctly (command name + args) and passes the Rust result through. The
-// REAL myelin-content round-trip is proven on the Rust side (src-tauri unit test + the desktop
-// binary build); this test pins the JS↔Rust contract the shell relies on.
+// Mock Tauri IPC to verify command names, arguments, and result forwarding. Rust tests cover the
+// content round trip itself.
 const invoke = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({ invoke: (...args: unknown[]) => invoke(...args) }));
 

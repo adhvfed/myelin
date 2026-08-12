@@ -31,11 +31,8 @@ tauri-build = { version = "2", features = [] }
 tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# THE SHARED RUST CORE (the load-bearing MR-018 proof). The Tauri commands thinly call into
-# these — they do NOT re-implement the logic. myelin-content owns the frozen render path
-# (render_parse/render_serialize); myelin-client owns the resilient-client config. Both are
-# std-only/serde-only crates (no DB, no network at M0), so they link cleanly into the shell and
-# carry NO desktop-only dependency that would block a mobile target.
+# Shared Rust content and client logic used by the Tauri commands. These crates have no database,
+# network, or desktop-only dependencies.
 myelin-content = { path = "../../../../crates/myelin-content" }
 myelin-client = { path = "../../../../crates/myelin-client" }
 
