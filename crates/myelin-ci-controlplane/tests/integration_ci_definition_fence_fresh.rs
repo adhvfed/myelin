@@ -638,7 +638,7 @@ async fn a_fresh_volume_provisions_the_fence_and_completes_the_cutover_under_a_n
         "the fresh-database sentinel stays RETIRED - the cutover must not resurrect it to draining"
     );
     assert_eq!(v3.2, "active");
-    assert_eq!(v3.1, ci_manifest_pipeline_definition().code_hash());
+    assert_eq!(v3.1, ci_manifest_pipeline_definition().unwrap().code_hash());
 
     eprintln!("fresh-volume definition-fence drill: all assertions passed");
 }

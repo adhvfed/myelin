@@ -39,7 +39,8 @@ pub const MAX_CI_WORKFLOW_SCOPES_PER_PASS: usize = MAX_ACTIVE_CI_RUN_PAGE;
 pub const MAX_CI_WORKFLOW_DRIVES_PER_SCOPE: usize = 64;
 const CI_MANIFEST_PIPELINE_DEFINITION_V1_DOMAIN: &str = "myelin.ci.manifest-pipeline-definition.v1";
 
-pub fn ci_manifest_pipeline_definition() -> CiWorkflowDefinitionPin {
+pub fn ci_manifest_pipeline_definition() -> Result<CiWorkflowDefinitionPin, crate::PgCiStarterError>
+{
     let mut hasher = blake3::Hasher::new_derive_key(CI_MANIFEST_PIPELINE_DEFINITION_V1_DOMAIN);
     for source in [
         include_bytes!("ci_manifest_pipeline.rs").as_slice(),
@@ -52,7 +53,6 @@ pub fn ci_manifest_pipeline_definition() -> CiWorkflowDefinitionPin {
     }
     let code_hash = format!("blake3:{}", hasher.finalize().to_hex());
     CiWorkflowDefinitionPin::new(CI_MANIFEST_PIPELINE_VERSION, code_hash)
-        .expect("the embedded ci.pipeline definition pin is valid")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,7 +291,7 @@ impl CiProductionRuntimeFactory {
             region,
             ledger,
             rt,
-            definition: ci_manifest_pipeline_definition(),
+            definition: ci_manifest_pipeline_definition().map_err(|_| CiRuntimeCompositionError)?,
             backlog_probe_call: std::borrow::Cow::Borrowed(CI_PIPELINE_BACKLOG_PROBE_CALL),
             activation_readiness_probe: ActivationReadinessProbe::production(),
         })
@@ -882,8 +882,8 @@ mod tests {
 
     #[test]
     fn production_definition_pin_is_source_derived_and_stable_within_the_binary() {
-        let first = ci_manifest_pipeline_definition();
-        let second = ci_manifest_pipeline_definition();
+        let first = ci_manifest_pipeline_definition().unwrap();
+        let second = ci_manifest_pipeline_definition().unwrap();
         assert_eq!(first, second);
         assert_eq!(first.version(), CI_MANIFEST_PIPELINE_VERSION);
         assert!(first.code_hash().starts_with("blake3:"));

@@ -419,7 +419,11 @@ async fn a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v3_ad
              VALUES ('ci.pipeline', $1, $2, 'active') ON CONFLICT DO NOTHING",
                 )
                 .bind(CI_MANIFEST_PIPELINE_VERSION)
-                .bind(myelin_ci_controlplane::ci_manifest_pipeline_definition().code_hash())
+                .bind(
+                    myelin_ci_controlplane::ci_manifest_pipeline_definition()
+                        .unwrap()
+                        .code_hash(),
+                )
                 .execute(&mut *fence)
                 .await
                 .unwrap();
@@ -604,7 +608,9 @@ async fn the_cutover_is_idempotent_across_reboots_and_never_reactivates_v3() {
                 assert_eq!(status, "active");
                 assert_eq!(
                     hash,
-                    myelin_ci_controlplane::ci_manifest_pipeline_definition().code_hash()
+                    myelin_ci_controlplane::ci_manifest_pipeline_definition()
+                        .unwrap()
+                        .code_hash()
                 );
             })
             .await;

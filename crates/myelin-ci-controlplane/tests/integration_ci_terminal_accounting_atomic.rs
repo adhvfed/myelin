@@ -637,7 +637,7 @@ async fn run_reporter_scenario(
         .unwrap();
     let manifest_store =
         CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone()).unwrap();
-    let production_definition = ci_manifest_pipeline_definition();
+    let production_definition = ci_manifest_pipeline_definition().unwrap();
     let mut drive_manifest = manifest(
         &tenant.0,
         &region.0,
@@ -4188,7 +4188,7 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
 
             let manifest_store =
                 CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone()).unwrap();
-            let production_definition = ci_manifest_pipeline_definition();
+            let production_definition = ci_manifest_pipeline_definition().unwrap();
             let mut drive_manifest = manifest(
                 &tenant.0,
                 &region.0,
