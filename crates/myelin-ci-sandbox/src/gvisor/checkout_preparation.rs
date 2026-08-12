@@ -15,7 +15,7 @@ use crate::{
     ResourceUsage, RunTokenCredential, SandboxOutputSink,
 };
 use sha2::{Digest, Sha256};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::io;
 use std::io::Read;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -309,7 +309,7 @@ fn parse_checkout_confirmation_line(
     Ok(tree.to_string())
 }
 
-fn open_regular_file_no_follow(dir_fd: RawFd, name: &CString) -> io::Result<std::fs::File> {
+fn open_regular_file_no_follow(dir_fd: RawFd, name: &CStr) -> io::Result<std::fs::File> {
     let fd = unsafe {
         libc::openat(
             dir_fd,
@@ -349,11 +349,9 @@ fn verify_workspace_head_no_follow(
         ));
     }
     let workspace_fd = unsafe { OwnedFd::from_raw_fd(workspace_fd) };
-    let git_name = CString::new(".git").expect("no interior NUL");
-    let git_fd = crate::dirlock::open_dir_component_no_follow(workspace_fd.as_raw_fd(), &git_name)
+    let git_fd = crate::dirlock::open_dir_component_no_follow(workspace_fd.as_raw_fd(), c".git")
         .map_err(|e| format!(".git is not a real directory (or is a symlink): {e}"))?;
-    let head_name = CString::new("HEAD").expect("no interior NUL");
-    let mut head_file = open_regular_file_no_follow(git_fd.as_raw_fd(), &head_name)
+    let mut head_file = open_regular_file_no_follow(git_fd.as_raw_fd(), c"HEAD")
         .map_err(|e| format!(".git/HEAD is not a real regular file (or is a symlink): {e}"))?;
     let mut buf = Vec::new();
     std::io::Read::by_ref(&mut head_file)
@@ -396,10 +394,10 @@ fn hash_workspace_cargo_lock_no_follow(workspace_host_path: &Path) -> Result<Str
         ));
     }
     let workspace_fd = unsafe { OwnedFd::from_raw_fd(workspace_fd) };
-    let name = CString::new("Cargo.lock").expect("no interior NUL");
-    let mut file = open_regular_file_no_follow(workspace_fd.as_raw_fd(), &name).map_err(|e| {
-        format!("Cargo.lock is not present as a real regular file (or is a symlink): {e}")
-    })?;
+    let mut file =
+        open_regular_file_no_follow(workspace_fd.as_raw_fd(), c"Cargo.lock").map_err(|e| {
+            format!("Cargo.lock is not present as a real regular file (or is a symlink): {e}")
+        })?;
     let mut hasher = Sha256::new();
     let mut total: u64 = 0;
     let mut chunk = [0u8; 64 * 1024];
@@ -602,10 +600,15 @@ pub(super) struct RealCheckoutCleanupExecutor<'a> {
 
 impl CheckoutCleanupExecutor for RealCheckoutCleanupExecutor<'_> {
     fn delete_workspace(&mut self) -> (bool, Vec<String>) {
-        let workspace = self
-            .workspace
-            .take()
-            .expect("delete_workspace invoked once, with the workspace still held");
+        let Some(workspace) = self.workspace.take() else {
+            return (
+                false,
+                vec![
+                    "checkout cleanup could not prove workspace absence because no owned workspace remained"
+                        .to_string(),
+                ],
+            );
+        };
         match classify_workspace_deletion(self.workspace_manager.delete_workspace(workspace)) {
             WorkspaceDeletionOutcome::ProvenAbsent { diagnostic } => {
                 (true, diagnostic.into_iter().collect())
@@ -615,10 +618,12 @@ impl CheckoutCleanupExecutor for RealCheckoutCleanupExecutor<'_> {
     }
 
     fn release_unused(&mut self) -> Vec<String> {
-        let lease = self
-            .lease
-            .take()
-            .expect("release_unused invoked once, with the lease still held");
+        let Some(lease) = self.lease.take() else {
+            return vec![
+                "checkout cleanup could not release the unused userns lease because no owned lease remained"
+                    .to_string(),
+            ];
+        };
         match lease.release_unused() {
             Ok(()) => Vec::new(),
             Err(e) => vec![format!("releasing the unused userns lease failed: {e}")],
@@ -626,14 +631,12 @@ impl CheckoutCleanupExecutor for RealCheckoutCleanupExecutor<'_> {
     }
 
     fn release_prepared(&mut self) -> Vec<String> {
-        let session = self
-            .checkout_session
-            .take()
-            .expect("release_prepared invoked once, with the session still held");
-        let lease = self
-            .lease
-            .take()
-            .expect("release_prepared invoked once, with the lease still held");
+        let (Some(session), Some(lease)) = (self.checkout_session.take(), self.lease.take()) else {
+            return vec![
+                "checkout cleanup could not release the prepared userns lease because its session and lease were not both owned; any remaining capability was quarantined"
+                    .to_string(),
+            ];
+        };
         match session.release_prepared(lease) {
             Ok(()) => Vec::new(),
             Err(e) => vec![format!("releasing the prepared userns lease failed: {e}")],
