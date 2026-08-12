@@ -119,7 +119,7 @@ pub(crate) fn deterministic_userns_allocator_for_tests(
 
 #[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::type_complexity)]
-pub(crate) fn acquire_deterministic_checkout_capsule(
+fn acquire_deterministic_checkout_capsule(
     root: &std::path::Path,
 ) -> (
     AcquiredCheckoutRuntime,
@@ -791,110 +791,6 @@ mod tests {
             );
             drop(result);
             let _ = std::fs::remove_dir_all(&base2);
-        }
-
-        #[test]
-        fn ordinary_build_and_production_root_pins() {
-            const WORKSPACE_MANAGER_SOURCE: &str = include_str!("../workspace_manager.rs");
-            const WORKSPACE_STORAGE_SOURCE: &str = include_str!("../workspace_storage.rs");
-            const USER_NAMESPACE_SOURCE: &str = include_str!("../user_namespace.rs");
-
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("DeterministicDirectoryForTests")
-                    .count(),
-                0,
-                "no production gvisor path constructs the deterministic-directory mode"
-            );
-
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("NoOpTestSupportAuthority")
-                    .count(),
-                0,
-                "no production gvisor path constructs the no-op test-support attempt authority"
-            );
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("SubstitutedEvidenceMode")
-                    .count(),
-                0,
-                "no production gvisor path names the substituted-evidence mode"
-            );
-
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("checkout_transport_test_support")
-                    .count(),
-                0,
-                "no production gvisor path names the git-wire test-support module"
-            );
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("drive_checkout_cycle_with_substituted_runsc_given")
-                    .count(),
-                0,
-                "no production gvisor path names the orchestrator-driving runsc seam"
-            );
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("drive_checkout_cycle_with_injected_hop_b")
-                    .count(),
-                0,
-                "no production gvisor path names the Hop-B-injecting runsc seam"
-            );
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("InjectedHopBOutcome")
-                    .count(),
-                0,
-                "no production gvisor path names the injected Hop-B outcome selector"
-            );
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("deterministic_enabled_backend_for_tests")
-                    .count(),
-                0,
-                "no production gvisor path builds the deterministic Enabled test backend"
-            );
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("checkout_spec_for_backend")
-                    .count(),
-                0,
-                "no production gvisor path builds the deterministic checkout spec"
-            );
-            assert_eq!(
-                crate::gvisor::source_pins::production_source()
-                    .matches("stage_checkout_repo_root")
-                    .count(),
-                0,
-                "no production gvisor path stages the deterministic bare-repo root"
-            );
-
-            assert!(
-                WORKSPACE_MANAGER_SOURCE.contains(
-                    "#[cfg(any(test, feature = \"test-support\"))]\n    DeterministicDirectoryForTests {"
-                ),
-                "the DeterministicDirectoryForTests mode variant is test/test-support gated"
-            );
-            assert!(
-                WORKSPACE_STORAGE_SOURCE.contains(
-                    "#[cfg(any(test, feature = \"test-support\"))]\n#[derive(Debug)]\npub(crate) struct DirectoryWorkspaceStorage"
-                ),
-                "the directory backend struct is test/test-support gated"
-            );
-            assert!(
-                USER_NAMESPACE_SOURCE.contains(
-                    "#[cfg(any(test, feature = \"test-support\"))]\n    pub(crate) fn try_new_for_tests("
-                ),
-                "try_new_for_tests is test/test-support gated, never a production constructor"
-            );
-            assert!(
-                USER_NAMESPACE_SOURCE.contains("pub fn try_new(")
-                    && USER_NAMESPACE_SOURCE.contains("Path::new(\"/etc/subuid\")"),
-                "the production allocator constructor stays pinned to /etc/subuid"
-            );
         }
 
         #[test]

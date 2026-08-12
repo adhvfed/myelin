@@ -10,19 +10,19 @@ use crate::user_namespace::{CheckoutPreparationSession, UserNamespaceLease};
 use crate::{JobSpec, LaunchPermit, RunnerHooks, SandboxCancellation, SandboxOutputSink};
 
 #[allow(dead_code)]
-pub(crate) enum BoundWorkloadRefusal {
+pub(super) enum BoundWorkloadRefusal {
     PermitRefused(String),
     PrepModeMismatch(String),
 }
 
 #[allow(dead_code)]
-pub(crate) struct WorkloadRotatedSpec {
+pub(super) struct WorkloadRotatedSpec {
     spec: JobSpec,
 }
 
 impl WorkloadRotatedSpec {
     #[allow(dead_code)]
-    pub(crate) fn from_carrier(carrier: &WorkloadCredentialCarrier, base_spec: &JobSpec) -> Self {
+    pub(super) fn from_carrier(carrier: &WorkloadCredentialCarrier, base_spec: &JobSpec) -> Self {
         WorkloadRotatedSpec {
             spec: carrier.workload_local_spec(base_spec),
         }
@@ -40,11 +40,12 @@ impl WorkloadRotatedSpec {
         let permit = hooks
             .acquire_launch_permit(&self.spec)
             .map_err(|hook_error| BoundWorkloadRefusal::PermitRefused(hook_error.to_string()))?;
-        let expected_root_identity = revalidated_explicit_userns_root_identity().map_err(|reason| {
-            BoundWorkloadRefusal::PermitRefused(format!(
-                "runsc-root identity revalidation failed: {reason}"
-            ))
-        })?;
+        let expected_root_identity =
+            revalidated_explicit_userns_root_identity().map_err(|reason| {
+                BoundWorkloadRefusal::PermitRefused(format!(
+                    "runsc-root identity revalidation failed: {reason}"
+                ))
+            })?;
         let prep = RuntimePreparation::new(
             workload_cfg,
             RuntimeBinding::EnabledPrepared {
@@ -68,7 +69,7 @@ impl WorkloadRotatedSpec {
         private_interfaces,
         private_bounds
     )]
-    pub(crate) fn acquire_permit_and_run(
+    pub(super) fn acquire_permit_and_run(
         &self,
         hooks: &RunnerHooks,
         workload_cfg: &OciConfig,
@@ -83,7 +84,8 @@ impl WorkloadRotatedSpec {
         Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
         BoundWorkloadRefusal,
     > {
-        let (permit, prep) = self.acquire_permit_and_prep(hooks, workload_cfg, lease, session, bind_state)?;
+        let (permit, prep) =
+            self.acquire_permit_and_prep(hooks, workload_cfg, lease, session, bind_state)?;
         Ok(run_production_container_streaming(
             &self.spec,
             workload_cfg,
@@ -98,7 +100,7 @@ impl WorkloadRotatedSpec {
 
     #[cfg(any(test, feature = "test-support"))]
     #[allow(dead_code)]
-    pub(crate) fn acquire_launch_permit_for_test_support(
+    pub(super) fn acquire_launch_permit_for_test_support(
         &self,
         hooks: &RunnerHooks,
     ) -> Result<LaunchPermit, BoundWorkloadRefusal> {
@@ -114,7 +116,7 @@ impl WorkloadRotatedSpec {
         private_interfaces,
         private_bounds
     )]
-    pub(crate) fn acquire_permit_and_run_given<F>(
+    pub(super) fn acquire_permit_and_run_given<F>(
         &self,
         hooks: &RunnerHooks,
         workload_cfg: &OciConfig,
@@ -139,7 +141,8 @@ impl WorkloadRotatedSpec {
         )
             -> Result<RuntimeFinalization<Result<ContainerRun, RunFailure>>, RunFailure>,
     {
-        let (permit, prep) = self.acquire_permit_and_prep(hooks, workload_cfg, lease, session, bind_state)?;
+        let (permit, prep) =
+            self.acquire_permit_and_prep(hooks, workload_cfg, lease, session, bind_state)?;
         Ok(execute(
             &self.spec,
             workload_cfg,

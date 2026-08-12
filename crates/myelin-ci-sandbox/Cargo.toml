@@ -36,8 +36,6 @@ optional = true
 
 [dev-dependencies]
 serde_json.workspace = true
-syn = { workspace = true, features = ["full", "visit"] }
-proc-macro2 = { workspace = true }
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
 myelin-identity = { path = "../myelin-identity" }
 myelin-git = { path = "../myelin-git" }

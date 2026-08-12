@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[cfg(test)]
+use super::RuntimePreparation;
 use super::{
     acquire_enabled_workspace, checkout_cleanup_plan, execute_cleanup_plan,
     resolve_checkout_preparation_permit, run_checkout_preparation_inner,
@@ -9,8 +11,6 @@ use super::{
     LeaseBindState, OciConfig, PreparedCheckoutEvidence, RealCheckoutCleanupExecutor,
     RetainedWorkloadOutcome, RunFailure, RuntimeFinalization, WorkloadRotatedSpec,
 };
-#[cfg(test)]
-use super::RuntimePreparation;
 #[cfg(any(test, feature = "test-support"))]
 use super::{
     bind_prepared_lease_given, finalized_for_test_support, CgroupQuiescenceEvidence,
@@ -31,7 +31,7 @@ use crate::{
 };
 
 #[allow(dead_code)]
-pub(crate) struct AcquiredCheckoutRuntime {
+pub(super) struct AcquiredCheckoutRuntime {
     workload_container_id: String,
     checkout_scope: CheckoutAuthorizationScope,
     enabled_context: EnabledLaunchContext,
@@ -40,14 +40,14 @@ pub(crate) struct AcquiredCheckoutRuntime {
 }
 
 #[allow(dead_code)]
-pub(crate) struct PreparedCheckoutRuntime {
+pub(super) struct PreparedCheckoutRuntime {
     acquired: AcquiredCheckoutRuntime,
     prepared_checkout_evidence: PreparedCheckoutEvidence,
 }
 
 #[allow(dead_code)]
 impl AcquiredCheckoutRuntime {
-    pub(crate) fn acquire(
+    pub(super) fn acquire(
         spec: &JobSpec,
         profile: &HardeningProfile,
         absolute_rootfs: PathBuf,
@@ -104,7 +104,7 @@ impl AcquiredCheckoutRuntime {
         Ok(runtime)
     }
 
-    pub(crate) fn dispose_checkout_runtime(
+    pub(super) fn dispose_checkout_runtime(
         self,
         workspace_manager: &WorkspaceManager,
     ) -> Vec<String> {
@@ -127,7 +127,7 @@ impl AcquiredCheckoutRuntime {
 #[allow(dead_code)]
 impl PreparedCheckoutRuntime {
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn run_retained_workload(
+    pub(super) fn run_retained_workload(
         self,
         authority: &dyn AttemptAuthority,
         hooks: &RunnerHooks,
@@ -265,7 +265,7 @@ impl PreparedCheckoutRuntime {
         }
     }
 
-    pub(crate) fn dispose_checkout_runtime(
+    pub(super) fn dispose_checkout_runtime(
         self,
         workspace_manager: &WorkspaceManager,
     ) -> Vec<String> {
@@ -274,7 +274,7 @@ impl PreparedCheckoutRuntime {
 }
 
 #[allow(dead_code, clippy::result_large_err, clippy::too_many_arguments)]
-pub(crate) fn run_checkout_preparation_v2(
+pub(super) fn run_checkout_preparation_v2(
     mut runtime: AcquiredCheckoutRuntime,
     spec: CheckoutPreparationSpec,
     run_token: RunTokenCredential,

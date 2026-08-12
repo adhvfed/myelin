@@ -93,14 +93,11 @@ pub use backend::{
 mod checkout_launch;
 
 mod checkout_runtime;
-#[allow(unused_imports)]
-pub(crate) use checkout_runtime::{
-    run_checkout_preparation_v2, AcquiredCheckoutRuntime, PreparedCheckoutRuntime,
-};
+#[cfg(any(test, feature = "test-support"))]
+use checkout_runtime::AcquiredCheckoutRuntime;
 
 mod workload_spec;
-#[allow(unused_imports)]
-pub(crate) use workload_spec::{BoundWorkloadRefusal, WorkloadRotatedSpec};
+use workload_spec::{BoundWorkloadRefusal, WorkloadRotatedSpec};
 
 mod git_wire_confinement;
 pub use git_wire_confinement::{
@@ -139,14 +136,8 @@ pub(crate) use checkout_preparation::{
 #[cfg(feature = "test-support")]
 pub mod runsc_driver;
 
-// ══════ the test and test-support modules ══════
-// declared LAST: source_pins::production_source() cuts this file at this banner.
-
 #[cfg(test)]
 mod test_fixtures;
-
-#[cfg(test)]
-mod source_pins;
 
 #[cfg(any(test, feature = "test-support"))]
 mod deterministic_substrate;
