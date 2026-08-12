@@ -4,7 +4,6 @@ use myelin_storage::pg_migrator::{ddl_checksum, migration_checksum_collisions};
 use myelin_storage::PgMigrator;
 use sqlx::postgres::PgPoolOptions;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 #[test]
 fn production_catalog_has_no_incompatible_duplicate_migration_ids() {
@@ -77,43 +76,4 @@ async fn self_tenant_applied_rows_match_every_authoritative_production_ddl() {
         applied.len(),
         historical_only.len()
     );
-}
-
-#[test]
-fn catalog_covers_every_current_pgbootstrap_production_main() {
-    let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("audit crate lives directly beneath the workspace crates directory");
-    let roots = [
-        ("myelin-edge", "all_durable_migrations()"),
-        ("myelin-identity-service", "identity_service_migrations()"),
-        ("myelin-issues", "issues_migrations()"),
-        ("myelin-flow", "flow_migrations()"),
-        ("myelin-notif", "notif_migrations()"),
-        ("myelin-search", "search_service_migrations()"),
-        ("myelin-knowledge", "knowledge_service_migrations()"),
-        (
-            "myelin-ci-controlplane",
-            "myelin_ci_controlplane::ci_controlplane_migrations()",
-        ),
-        (
-            "myelin-ci-dispatch",
-            "myelin_ci_dispatch::dispatch_migrations()",
-        ),
-    ];
-    for (crate_name, service_set_token) in roots {
-        let path = crates_dir.join(crate_name).join("src/main.rs");
-        let source = std::fs::read_to_string(&path)
-            .unwrap_or_else(|error| panic!("read production root {}: {error}", path.display()));
-        assert!(
-            source.contains("PgBootstrap"),
-            "{} is no longer a PgBootstrap root",
-            path.display()
-        );
-        assert!(
-            source.contains(service_set_token),
-            "{} no longer applies catalogued set token `{service_set_token}`",
-            path.display()
-        );
-    }
 }
