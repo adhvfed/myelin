@@ -51,7 +51,10 @@ impl InMemoryCache {
 impl Cache for InMemoryCache {
     fn get(&self, tenant: &TenantId, key: &str) -> Result<Option<Vec<u8>>, CacheError> {
         let k = Self::ns_key(tenant, key);
-        let mut map = self.inner.lock().expect("cache mutex poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| CacheError("in-memory cache state is unavailable".into()))?;
         match map.get(&k) {
             Some(e) if e.expires_at > Instant::now() => Ok(Some(e.value.clone())),
             Some(_) => {
@@ -70,7 +73,10 @@ impl Cache for InMemoryCache {
         ttl: Duration,
     ) -> Result<(), CacheError> {
         let k = Self::ns_key(tenant, key);
-        let mut map = self.inner.lock().expect("cache mutex poisoned");
+        let mut map = self
+            .inner
+            .lock()
+            .map_err(|_| CacheError("in-memory cache state is unavailable".into()))?;
         map.insert(
             k,
             Entry {
@@ -83,7 +89,10 @@ impl Cache for InMemoryCache {
 
     fn delete(&self, tenant: &TenantId, key: &str) -> Result<(), CacheError> {
         let k = Self::ns_key(tenant, key);
-        self.inner.lock().expect("cache mutex poisoned").remove(&k);
+        self.inner
+            .lock()
+            .map_err(|_| CacheError("in-memory cache state is unavailable".into()))?
+            .remove(&k);
         Ok(())
     }
 }
@@ -133,5 +142,20 @@ mod tests {
             .unwrap();
         c.delete(&tenant("t1"), "k").unwrap();
         assert_eq!(c.get(&tenant("t1"), "k").unwrap(), None);
+    }
+
+    #[test]
+    fn poisoned_cache_state_is_a_typed_error() {
+        let cache = InMemoryCache::new();
+        let state = cache.inner.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = state.lock().unwrap();
+            panic!("poison the test cache");
+        });
+
+        assert_eq!(
+            cache.get(&tenant("t1"), "k").unwrap_err(),
+            CacheError("in-memory cache state is unavailable".into()),
+        );
     }
 }

@@ -433,7 +433,10 @@ impl AgentTraceWriter for InMemoryAgentTraceStore {
     ) -> Result<AgentTraceReceipt, AgentTraceError> {
         let artifact_ref = trace.artifact_ref(tenant)?;
         let key = (tenant.0.clone(), trace.run_id.clone());
-        let mut traces = self.traces.lock().expect("agent trace store lock");
+        let mut traces = self
+            .traces
+            .lock()
+            .map_err(|_| AgentTraceError::Storage("in-memory trace state is unavailable".into()))?;
         match traces.get(&key) {
             Some(existing) if existing == &trace => Ok(AgentTraceReceipt {
                 artifact_ref,
@@ -1607,6 +1610,21 @@ mod tests {
         assert_eq!(
             store.write(&tenant, trace("Rewritten.")).unwrap_err(),
             AgentTraceError::Conflict
+        );
+    }
+
+    #[test]
+    fn poisoned_trace_state_is_a_typed_storage_error() {
+        let tenant = TenantId("acme".into());
+        let store = InMemoryAgentTraceStore::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.traces.lock().unwrap();
+            panic!("poison the test trace store");
+        }));
+
+        assert_eq!(
+            store.write(&tenant, trace("Done.")).unwrap_err(),
+            AgentTraceError::Storage("in-memory trace state is unavailable".into()),
         );
     }
 

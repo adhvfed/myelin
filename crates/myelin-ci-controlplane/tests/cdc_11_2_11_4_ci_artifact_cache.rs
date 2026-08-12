@@ -27,14 +27,14 @@ fn ci_derived_fork_scope_writes_own_scope_and_is_refused_at_trusted() {
     cache
         .put(tier, &run_pr, &own_scope, "deps", b"fork-deps")
         .expect("fork writes its own scope (the two halves agree)");
-    assert!(cache.contains(&own_scope, "deps"));
+    assert!(cache.contains(&own_scope, "deps").unwrap());
 
     let refused = cache.put(tier, &run_pr, &CacheScope::Trusted, "deps", b"poison");
     assert!(matches!(
         refused,
         Err(CacheScopeError::ForkWriteToTrusted { .. })
     ));
-    assert!(!cache.contains(&CacheScope::Trusted, "deps"));
+    assert!(!cache.contains(&CacheScope::Trusted, "deps").unwrap());
 }
 
 #[test]
@@ -51,7 +51,7 @@ fn ci_derived_trusted_scope_writes_trusted_and_branch() {
     cache
         .put(tier, &pr, &scope, "deps", b"trusted-deps")
         .expect("trusted writes trusted");
-    assert!(cache.contains(&CacheScope::Trusted, "deps"));
+    assert!(cache.contains(&CacheScope::Trusted, "deps").unwrap());
 
     let branch = RunProvenance {
         trust_tier: "trusted".into(),

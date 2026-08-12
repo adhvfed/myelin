@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(outcome.fork_to_trusted_landings, 0);
         assert!(outcome.is_green(), "CI-D6: 0 fork→trusted writes");
         assert_eq!(cache.telemetry().cache_scope_violation(), 1);
-        assert!(!cache.contains(&CacheScope::Trusted, "build-cache"));
+        assert!(!cache.contains(&CacheScope::Trusted, "build-cache").unwrap());
     }
 
     #[test]

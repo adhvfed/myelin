@@ -58,6 +58,7 @@ pub enum CacheScopeError {
     },
     Blob(BlobError),
     LimitExceeded(&'static str),
+    StateUnavailable,
 }
 
 impl std::fmt::Display for CacheScopeError {
@@ -79,6 +80,7 @@ impl std::fmt::Display for CacheScopeError {
             CacheScopeError::LimitExceeded(kind) => {
                 write!(f, "CI cache {kind} limit exceeded")
             }
+            CacheScopeError::StateUnavailable => f.write_str("CI cache index state is unavailable"),
         }
     }
 }
@@ -176,7 +178,7 @@ impl<'b> CiCacheNamespace<'b> {
         let key = self.scope_key(scope, name);
         self.index
             .lock()
-            .expect("ci cache index mutex")
+            .map_err(|_| CacheScopeError::StateUnavailable)?
             .insert(key, hash.clone());
         Ok(hash)
     }
@@ -194,7 +196,10 @@ impl<'b> CiCacheNamespace<'b> {
         Self::validate_key_inputs(scope, name)?;
         let key = self.scope_key(scope, name);
         let hash = {
-            let index = self.index.lock().expect("ci cache index mutex");
+            let index = self
+                .index
+                .lock()
+                .map_err(|_| CacheScopeError::StateUnavailable)?;
             index.get(&key).cloned()
         };
         match hash {
@@ -206,15 +211,14 @@ impl<'b> CiCacheNamespace<'b> {
         }
     }
 
-    pub fn contains(&self, scope: &CacheScope, name: &str) -> bool {
-        if Self::validate_key_inputs(scope, name).is_err() {
-            return false;
-        }
+    pub fn contains(&self, scope: &CacheScope, name: &str) -> Result<bool, CacheScopeError> {
+        Self::validate_key_inputs(scope, name)?;
         let key = self.scope_key(scope, name);
-        self.index
+        Ok(self
+            .index
             .lock()
-            .expect("ci cache index mutex")
-            .contains_key(&key)
+            .map_err(|_| CacheScopeError::StateUnavailable)?
+            .contains_key(&key))
     }
 
     fn validate_key_inputs(scope: &CacheScope, name: &str) -> Result<(), CacheScopeError> {
@@ -260,7 +264,24 @@ mod tests {
             "a fork write to trusted must be REFUSED by the blob client, got {refused:?}"
         );
         assert_eq!(cache.telemetry().cache_scope_violation(), 1);
-        assert!(!cache.contains(&CacheScope::Trusted, "build-cache"));
+        assert!(!cache.contains(&CacheScope::Trusted, "build-cache").unwrap());
+    }
+
+    #[test]
+    fn poisoned_index_state_is_never_reported_as_a_cache_miss() {
+        let base = FsBlobStore::new();
+        let cache = CiCacheNamespace::over(tenant(), &base);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.index.lock().unwrap();
+            panic!("poison the test index");
+        }));
+
+        assert_eq!(
+            cache
+                .contains(&CacheScope::Trusted, "build-cache")
+                .unwrap_err(),
+            CacheScopeError::StateUnavailable,
+        );
     }
 
     #[test]
@@ -306,8 +327,8 @@ mod tests {
             Err(CacheScopeError::LimitExceeded("entry name"))
         );
 
-        assert!(cache.contains(&scope, "build-cache"));
-        assert!(!cache.contains(&CacheScope::Trusted, "build-cache"));
+        assert!(cache.contains(&scope, "build-cache").unwrap());
+        assert!(!cache.contains(&CacheScope::Trusted, "build-cache").unwrap());
         assert_eq!(cache.telemetry().cache_scope_violation(), 0);
         let got = cache
             .get(&scope, "build-cache")
@@ -411,7 +432,7 @@ mod tests {
             Err(CacheScopeError::ForkWriteToTrusted { .. })
         ));
         assert_eq!(cache.telemetry().cache_scope_violation(), 1);
-        assert!(!cache.contains(&other, "k"));
+        assert!(!cache.contains(&other, "k").unwrap());
     }
 
     #[test]

@@ -60,7 +60,7 @@ fn ci_d6_fork_cannot_poison_the_trusted_cache() {
     );
 
     assert_eq!(cache.telemetry().cache_scope_violation(), 4);
-    assert!(!cache.contains(&CacheScope::Trusted, "build-cache"));
+    assert!(!cache.contains(&CacheScope::Trusted, "build-cache").unwrap());
     let trusted_read = cache.get(&CacheScope::Trusted, "build-cache");
     assert!(
         matches!(trusted_read, Err(CacheScopeError::Miss { .. })),
