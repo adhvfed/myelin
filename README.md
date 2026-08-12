@@ -191,8 +191,9 @@ Selected read tools resolve projects, CI runs, issues, and Knowledge pages throu
 delegator's live Myelin permissions. An agent can discover a project's canonical reference,
 issue prefix, and default type without an operator putting opaque identifiers in its prompt, then
 create an issue from that reference while Myelin applies the project's owned defaults. Issue lists
-likewise return stable references that can be passed directly to `issues.view`. A selected
-`knowledge.link_work` tool can add one attributed,
+likewise return stable references that can be passed directly to `issues.view`, and Knowledge page
+lists feed their references directly into `knowledge.read_page`. A selected `knowledge.link_work`
+tool can add one attributed,
 retry-safe delivery link to a page the delegator owns. Both paths use canonical references without
 GitHub, Linear, or Notion keys.
 

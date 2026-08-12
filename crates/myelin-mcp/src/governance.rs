@@ -522,6 +522,15 @@ fn read_resource_ref(
     tool: &str,
     args: &serde_json::Value,
 ) -> Option<ArtifactRef> {
+    if let Some((field, subsystem, resource_type)) = match tool {
+        "issues.view" => Some(("issue_ref", "issue", "issue")),
+        "knowledge.read_page" => Some(("page_ref", "knowledge", "page")),
+        _ => None,
+    } {
+        if args.get(field).is_some() {
+            return canonical_read_resource_arg(scope, args, field, subsystem, resource_type);
+        }
+    }
     let (subsystem, resource_type, id) = match tool {
         "ci.read_run" | "ci.read_log" => ("ci", "run", args.get("run_id")?.as_str()?),
         "git.read_file" => ("git", "repo", args.get("repo")?.as_str()?),
@@ -535,6 +544,22 @@ fn read_resource_ref(
         "myelin://{}/{subsystem}/{resource_type}/{id}",
         scope.tenant().0
     )))
+}
+
+fn canonical_read_resource_arg(
+    scope: &TenantScope,
+    args: &serde_json::Value,
+    field: &str,
+    subsystem: &str,
+    resource_type: &str,
+) -> Option<ArtifactRef> {
+    let reference = args.get(field)?.as_str()?;
+    let parsed = myelin_refs::parse_scoped(reference).ok()?;
+    (parsed.tenant == *scope.tenant()
+        && parsed.subsystem == subsystem
+        && parsed.type_ == resource_type
+        && parsed.sub.is_none())
+    .then(|| ArtifactRef(reference.to_string()))
 }
 
 fn read_audit_target(resource_ref: Option<&ArtifactRef>) -> GovernanceAuditTarget<'_> {
@@ -1620,8 +1645,8 @@ mod security_tests {
 
     use super::{
         approval_card_ref, approval_contract_from_effect_key, approval_risk_summary,
-        git_merge_repo_from_effect_key, mcp_effect_key, mcp_effect_key_for_call, AuditPhase,
-        GateAuditMinter,
+        git_merge_repo_from_effect_key, mcp_effect_key, mcp_effect_key_for_call, read_resource_ref,
+        AuditPhase, GateAuditMinter,
     };
     use myelin_agent::McpApprovalContract;
 
@@ -1754,5 +1779,46 @@ mod security_tests {
             "mcp:v1:issues.close:blake3:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
         )
         .is_none());
+    }
+
+    #[test]
+    fn governed_reads_audit_the_resource_identity_the_agent_received() {
+        let principal = myelin_identity::Principal::stub(
+            myelin_identity::PrincipalId("agent:reader".into()),
+            myelin_identity::PrincipalKind::Service,
+            myelin_tenancy::TenantId::from_token("acme"),
+        );
+        let scope =
+            myelin_storage::TenantScope::from_verified_token(&principal, principal.region.clone());
+
+        let issue_ref = "myelin://acme/issue/issue/ENG-41";
+        assert_eq!(
+            read_resource_ref(
+                &scope,
+                "issues.view",
+                &serde_json::json!({"issue_ref": issue_ref})
+            ),
+            Some(myelin_tenancy::ArtifactRef(issue_ref.into()))
+        );
+        let page_ref = "myelin://acme/knowledge/page/01J00000000000000000000000";
+        assert_eq!(
+            read_resource_ref(
+                &scope,
+                "knowledge.read_page",
+                &serde_json::json!({"page_ref": page_ref})
+            ),
+            Some(myelin_tenancy::ArtifactRef(page_ref.into()))
+        );
+        assert_eq!(
+            read_resource_ref(
+                &scope,
+                "knowledge.read_page",
+                &serde_json::json!({
+                    "page_ref": "myelin://other/knowledge/page/01J00000000000000000000000"
+                })
+            ),
+            None,
+            "a foreign reference cannot become a local audit subject"
+        );
     }
 }

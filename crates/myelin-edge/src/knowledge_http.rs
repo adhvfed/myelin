@@ -107,6 +107,15 @@ impl DurableKnowledgeReadApi {
         ))?;
         document_json(&page, &viewer, self.kms.as_ref())
     }
+
+    pub fn read_page_ref(
+        &self,
+        principal: &Principal,
+        page_reference: &str,
+    ) -> Result<Value, EdgeError> {
+        let page_id = page_id_from_ref(principal, page_reference)?;
+        self.read_page(principal, &page_id)
+    }
 }
 
 #[derive(Clone)]
@@ -578,6 +587,22 @@ fn validate_ulid(value: &str) -> Result<(), EdgeError> {
     }
 }
 
+fn page_id_from_ref(principal: &Principal, page_reference: &str) -> Result<String, EdgeError> {
+    let parsed = myelin_refs::parse_scoped(page_reference)
+        .map_err(|error| EdgeError::BadRequest(format!("invalid page_ref: {error}")))?;
+    if parsed.tenant != principal.tenant
+        || parsed.subsystem != "knowledge"
+        || parsed.type_ != "page"
+        || parsed.sub.is_some()
+    {
+        return Err(EdgeError::BadRequest(
+            "page_ref must name a Knowledge page root in the current tenant".into(),
+        ));
+    }
+    validate_ulid(&parsed.id)?;
+    Ok(parsed.id)
+}
+
 fn validate_title(value: &str) -> Result<(), EdgeError> {
     if value.trim() == value
         && !value.is_empty()
@@ -957,6 +982,29 @@ mod tests {
         )
         .is_ok());
         assert!(validate_document(&principal(), &[]).is_err());
+    }
+
+    #[test]
+    fn page_references_are_rooted_in_the_callers_tenant() {
+        let page_id = "01J00000000000000000000000";
+        assert_eq!(
+            page_id_from_ref(
+                &principal(),
+                &format!("myelin://acme/knowledge/page/{page_id}")
+            ),
+            Ok(page_id.into())
+        );
+        for reference in [
+            format!("myelin://other/knowledge/page/{page_id}"),
+            format!("myelin://acme/knowledge/database/{page_id}"),
+            format!("myelin://acme/knowledge/page/{page_id}#b{page_id}"),
+            "not-a-reference".into(),
+        ] {
+            assert!(
+                page_id_from_ref(&principal(), &reference).is_err(),
+                "accepted {reference}"
+            );
+        }
     }
 
     #[test]

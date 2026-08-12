@@ -630,7 +630,7 @@ describe("the CLI authentication journey", () => {
             { name: "issues.view", version: 2 },
             { name: "knowledge.link_work", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
-            { name: "knowledge.read_page", version: 1 },
+            { name: "knowledge.read_page", version: 2 },
             { name: "projects.list", version: 1 },
           ],
           grants: expect.arrayContaining([
@@ -976,7 +976,7 @@ describe("the CLI authentication journey", () => {
             { name: "issues.view", version: 2 },
             { name: "knowledge.link_work", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
-            { name: "knowledge.read_page", version: 1 },
+            { name: "knowledge.read_page", version: 2 },
             { name: "projects.list", version: 1 },
           ],
           effective_grants: activated.agent.grants,
@@ -1150,7 +1150,7 @@ describe("the CLI authentication journey", () => {
       });
       expect(schemaFor("knowledge.read_page")).toMatchObject({
         type: "object",
-        required: ["page_id"],
+        required: ["page_ref"],
         additionalProperties: false,
       });
       expect(schemaFor("projects.list")).toMatchObject({
@@ -1720,24 +1720,24 @@ describe("the CLI authentication journey", () => {
       });
 
       const pageList = await askAgent(resumedRun, 5, "knowledge.list_pages", { limit: 10 });
-      expect(array(pageList.items, "agent-visible knowledge pages")).toEqual(
-        expect.arrayContaining([
-          expect.objectContaining({
-            id: knowledgePageId,
-            title: knowledgeTitle,
-            ref: `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`,
-          }),
-        ]),
-      );
+      const agentVisiblePage = array(pageList.items, "agent-visible knowledge pages")
+        .map((page, index) => record(page, `agent-visible knowledge page ${index}`))
+        .find((page) => page.id === knowledgePageId);
+      expect(agentVisiblePage).toMatchObject({
+        id: knowledgePageId,
+        title: knowledgeTitle,
+        ref: knowledgePageRef,
+      });
       expect(pageList.page).toMatchObject({ limit: 10 });
 
+      const agentVisiblePageRef = string(agentVisiblePage?.ref, "agent-visible Knowledge ref");
       const readPage = await askAgent(resumedRun, 6, "knowledge.read_page", {
-        page_id: knowledgePageId,
+        page_ref: agentVisiblePageRef,
       });
       expect(readPage).toMatchObject({
         id: knowledgePageId,
         title: knowledgeTitle,
-        ref: `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`,
+        ref: agentVisiblePageRef,
       });
       expect(array(readPage.blocks, "agent-visible knowledge blocks")).toEqual(
         expect.arrayContaining([

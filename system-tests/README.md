@@ -53,7 +53,8 @@ The suite is intentionally organized around externally visible contracts:
   them without exposing either secret, configures and operates external and hosted agents plus
   event-driven automations without integration keys, lets an agent discover a visible project's
   canonical reference and create work from it without an operator-supplied database ID, follows
-  listed issues by their canonical references, and binds native Git to exactly one profile,
+  listed issues and Knowledge pages by their canonical references, and binds native Git to exactly
+  one profile,
   carries an agent issue closure through a canonical human approval card and an exact lost-response
   retry, refuses an expired session before transport, and removes both OS-backed credentials on
   logout.

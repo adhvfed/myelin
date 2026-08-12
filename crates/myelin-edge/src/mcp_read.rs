@@ -153,13 +153,18 @@ impl DirectReadExecutor for McpReadExecutor {
                     .map_err(map_edge_error)
             }
             "knowledge.read_page" => {
-                exact_fields(arguments, &["page_id"], &["page_id"])?;
-                let page_id = required_string(arguments, "page_id")?;
-                self.knowledge
+                let knowledge = self
+                    .knowledge
                     .as_ref()
-                    .ok_or(DirectReadError::Unavailable)?
-                    .read_page(access_subject, page_id)
-                    .map_err(map_edge_error)
+                    .ok_or(DirectReadError::Unavailable)?;
+                match knowledge_page_target(arguments)? {
+                    KnowledgePageTarget::Reference(page_reference) => knowledge
+                        .read_page_ref(access_subject, page_reference)
+                        .map_err(map_edge_error),
+                    KnowledgePageTarget::LegacyId(page_id) => knowledge
+                        .read_page(access_subject, page_id)
+                        .map_err(map_edge_error),
+                }
             }
             "chat.list_conversations" => {
                 exact_fields(arguments, &[], &["limit", "cursor"])?;
@@ -275,6 +280,20 @@ fn issue_view_target(arguments: &Value) -> Result<IssueViewTarget<'_>, DirectRea
     }
     exact_fields(arguments, &["issue_id"], &["issue_id"])?;
     required_string(arguments, "issue_id").map(IssueViewTarget::LegacyId)
+}
+
+enum KnowledgePageTarget<'a> {
+    Reference(&'a str),
+    LegacyId(&'a str),
+}
+
+fn knowledge_page_target(arguments: &Value) -> Result<KnowledgePageTarget<'_>, DirectReadError> {
+    if arguments.get("page_ref").is_some() {
+        exact_fields(arguments, &["page_ref"], &["page_ref"])?;
+        return required_string(arguments, "page_ref").map(KnowledgePageTarget::Reference);
+    }
+    exact_fields(arguments, &["page_id"], &["page_id"])?;
+    required_string(arguments, "page_id").map(KnowledgePageTarget::LegacyId)
 }
 
 fn exact_fields(
@@ -436,6 +455,32 @@ mod tests {
         ] {
             assert!(
                 issue_view_target(&arguments).is_err(),
+                "accepted {arguments}"
+            );
+        }
+    }
+
+    #[test]
+    fn knowledge_read_accepts_one_versioned_identity_without_aliasing() {
+        assert!(matches!(
+            knowledge_page_target(
+                &json!({"page_ref":"myelin://acme/knowledge/page/01J00000000000000000000000"})
+            ),
+            Ok(KnowledgePageTarget::Reference(
+                "myelin://acme/knowledge/page/01J00000000000000000000000"
+            ))
+        ));
+        assert!(matches!(
+            knowledge_page_target(&json!({"page_id":"01J00000000000000000000000"})),
+            Ok(KnowledgePageTarget::LegacyId("01J00000000000000000000000"))
+        ));
+        for arguments in [
+            json!({}),
+            json!({"page_ref":"myelin://acme/knowledge/page/01J00000000000000000000000","page_id":"01J00000000000000000000000"}),
+            json!({"page_ref":"myelin://acme/knowledge/page/01J00000000000000000000000","tenant":"other"}),
+        ] {
+            assert!(
+                knowledge_page_target(&arguments).is_err(),
                 "accepted {arguments}"
             );
         }
