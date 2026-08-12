@@ -35,7 +35,7 @@ const comment = {
 };
 
 describe("issue mutation response decoders", () => {
-  const summary = { id: UUID, key: "MY-42", project_id: PROJECT };
+  const summary = { id: UUID, ref: "myelin://acme/issue/issue/MY-42", key: "MY-42", project_id: PROJECT };
   const issue = {
     ...summary,
     state: "Done",
@@ -63,6 +63,7 @@ describe("issue mutation response decoders", () => {
   it.each([
     { issue: summary, authorization: { status: "active", request_event_id: ULID } },
     { issue: { ...summary, id: "not-a-uuid" }, authorization: { status: "pending", request_event_id: ULID } },
+    { issue: { ...summary, ref: "myelin://acme/issue/issue/MY-41" }, authorization: { status: "pending", request_event_id: ULID } },
     { issue: summary, authorization: { status: "pending", request_event_id: ULID.toLowerCase() } },
   ])("rejects malformed create receipts %#", (value) => {
     expect(parseIssueCreateReceipt(value)).toBeNull();

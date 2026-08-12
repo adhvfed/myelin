@@ -1363,7 +1363,8 @@ const pagedClosedIssues = Array.from({ length: 50 }, (_, index) => {
   };
 });
 
-export const SEED_ISSUES = [...headlineIssues, ...pagedOpenIssues, ...pagedClosedIssues];
+export const SEED_ISSUES = [...headlineIssues, ...pagedOpenIssues, ...pagedClosedIssues]
+  .map((issue) => ({ ...issue, ref: `myelin://acme/issue/issue/${issue.key}` }));
 
 export function freshIssueFixtures() {
   return SEED_ISSUES.map((issue) => ({ ...issue }));

@@ -11,6 +11,7 @@ import type {
   PrListRowVM,
   PrVM,
 } from "./api";
+import { parseArtifactRef } from "./artifact-ref";
 
 type WireRecord = Record<string, unknown>;
 const utf8 = new TextEncoder();
@@ -67,8 +68,9 @@ function repo(value: unknown): value is string {
 }
 
 function prRef(value: unknown, number: number): value is string {
-  return bounded(value, 4 * 1024) &&
-    new RegExp(`^myelin://[^/]+/git/pr/[^/#]+:${number}$`).test(value);
+  const parsed = parseArtifactRef(value);
+  return parsed !== null && parsed.subsystem === "git" && parsed.type === "pr" &&
+    parsed.sub === null && parsed.id.endsWith(`:${number}`);
 }
 
 function checksSummary(value: unknown): ChecksSummaryVM | null {

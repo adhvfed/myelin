@@ -15,6 +15,14 @@ test("a signed-in engineer creates, edits, and resumes an encrypted durable Know
   const suffix = `${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
   const title = `EU service runbook ${suffix}`;
   const edited = `Confirm regional placement ${suffix}, then establish an incident lead.`;
+  const headers = { authorization: `Bearer ${token}`, "x-myelin-token-scheme": "agent" };
+  const companionResponse = await request.post(`${edgeUrl}/v1/knowledge/pages`, {
+    headers: { ...headers, "idempotency-key": randomUUID() },
+    data: { title: `Release evidence ${suffix}`, template: "blank", visibility: "team" },
+  });
+  const companionText = await companionResponse.text();
+  expect(companionResponse.status(), companionText).toBe(201);
+  const companion = (JSON.parse(companionText) as { page: { id: string; ref: string } }).page;
 
   await signIn(page);
   await navigateToApp(page, "/knowledge");
@@ -27,18 +35,37 @@ test("a signed-in engineer creates, edits, and resumes an encrypted durable Know
 
   const response = page.getByRole("textbox", { name: "Numbered list block 4" });
   await response.fill(edited);
+  await page.getByRole("button", { name: "Link related work" }).click();
+  await page.getByRole("textbox", { name: "Canonical Myelin reference" }).fill(companion.ref);
+  await page.getByRole("button", { name: "Add", exact: true }).click();
+  await expect(page.getByRole("link", { name: `Reference: Knowledge · ${companion.id.slice(-6)}` }))
+    .toHaveAttribute("href", `/knowledge?page=${companion.id}`);
   await expect(page.locator(".knowledge-save-state")).toHaveText("Saved", { timeout: 10_000 });
   await page.reload();
   await waitForAppHydration(page);
   await expect(page.getByRole("textbox", { name: "Page title" })).toHaveValue(title);
   await expect(page.getByRole("textbox", { name: "Numbered list block 4" })).toContainText(edited);
+  await expect(page.getByRole("link", { name: `Reference: Knowledge · ${companion.id.slice(-6)}` })).toBeVisible();
 
-  const pages = await request.get(`${edgeUrl}/v1/knowledge/pages?limit=100`, { headers: { authorization: `Bearer ${token}`, "x-myelin-token-scheme": "agent" } });
+  const pages = await request.get(`${edgeUrl}/v1/knowledge/pages?limit=100`, { headers });
   const pageText = await pages.text(); expect(pages.status(), pageText).toBe(200);
-  const created = (JSON.parse(pageText) as { items: Array<{ id: string; title: string; version: number }> }).items.find((item) => item.title === title);
+  const created = (JSON.parse(pageText) as { items: Array<{ id: string; ref: string; title: string; version: number }> }).items.find((item) => item.title === title);
   expect(created).toMatchObject({ title, version: 2 });
 
-  const document = await request.get(`${edgeUrl}/v1/knowledge/pages/${created!.id}`, { headers: { authorization: `Bearer ${token}`, "x-myelin-token-scheme": "agent" } });
+  const document = await request.get(`${edgeUrl}/v1/knowledge/pages/${created!.id}`, { headers });
   const documentText = await document.text(); expect(document.status(), documentText).toBe(200);
   expect(JSON.parse(documentText).page.blocks).toEqual(expect.arrayContaining([expect.objectContaining({ markdown: edited, state: "active" })]));
+  expect(JSON.parse(documentText).page.blocks).toEqual(expect.arrayContaining([
+    expect.objectContaining({ markdown: "Related work: \uFFFC", references: [companion.ref], state: "active" }),
+  ]));
+
+  await expect.poll(async () => {
+    const backlinks = await request.get(
+      `${edgeUrl}/v1/refs/backlinks?ref=${encodeURIComponent(companion.ref)}&limit=100`,
+      { headers },
+    );
+    if (!backlinks.ok()) return false;
+    const items = (JSON.parse(await backlinks.text()) as { items: Array<Record<string, unknown>> }).items;
+    return items.some((item) => item.root_ref === created!.ref && item.target_ref === companion.ref && item.relation === "links");
+  }, { message: "the related page should appear through the live reference projection" }).toBe(true);
 });

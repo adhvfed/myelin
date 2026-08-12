@@ -870,6 +870,7 @@ const server = createServer((req, res) => {
       const now = new Date(ISSUE_BASE_TIME_FOR_CREATE + number * 1_000).toISOString();
       const row = {
         id,
+        ref: `myelin://acme/issue/issue/${key}`,
         key,
         project_id: project.id,
         state: "Todo",
@@ -882,7 +883,7 @@ const server = createServer((req, res) => {
       const requestEventId = `01J${String(number).padStart(23, "0")}`;
       issueReceipts.set(requestEventId, { row, polls: 0, active: false });
       return send(res, 202, {
-        issue: { id, key, project_id: row.project_id },
+        issue: { id, ref: row.ref, key, project_id: row.project_id },
         authorization: { status: "pending", request_event_id: requestEventId },
       });
     });

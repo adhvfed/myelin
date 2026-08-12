@@ -15,6 +15,7 @@ import type {
   IssueVM,
   IssuesPage,
 } from "./issue-api";
+import { parseArtifactRef } from "./artifact-ref";
 
 type WireRecord = Record<string, unknown>;
 
@@ -64,11 +65,14 @@ function branchRef(value: unknown): value is string {
 
 function issueSummary(value: unknown): IssueCreateReceipt["issue"] | null {
   const input = record(value);
+  const reference = parseArtifactRef(input?.ref);
   if (!input || !canonicalUuid(input.id) || !canonicalUuid(input.project_id) ||
-      typeof input.key !== "string" || !/^[A-Z0-9]{2,10}-[1-9][0-9]{0,18}$/.test(input.key)) {
+      typeof input.key !== "string" || !/^[A-Z0-9]{2,10}-[1-9][0-9]{0,18}$/.test(input.key) ||
+      !reference || reference.sub !== null || reference.subsystem !== "issue" ||
+      reference.type !== "issue" || reference.id !== input.key) {
     return null;
   }
-  return { id: input.id, key: input.key, project_id: input.project_id };
+  return { id: input.id, ref: input.ref as string, key: input.key, project_id: input.project_id };
 }
 
 export function parseIssueCreateReceipt(value: unknown): IssueCreateReceipt | null {

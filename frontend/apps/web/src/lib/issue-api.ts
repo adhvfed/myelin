@@ -18,6 +18,7 @@ export type IssueStateCategory = "unstarted" | "started" | "completed" | "cancel
 
 export interface IssueVM {
   id: string;
+  ref: string;
   key: string;
   project_id: string;
   state: string;
@@ -34,7 +35,7 @@ export interface IssuesPage {
 }
 
 export interface IssueCreateReceipt {
-  issue: { id: string; key: string; project_id: string };
+  issue: { id: string; ref: string; key: string; project_id: string };
   authorization: { status: "pending"; request_event_id: string };
 }
 

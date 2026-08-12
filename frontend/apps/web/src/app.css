@@ -44,6 +44,28 @@ button {
   color: inherit;
 }
 
+.artifact-ref-copy {
+  min-height: 2rem;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding-inline: var(--space-2);
+  border: var(--hairline) solid var(--border);
+  border-radius: var(--radius-1);
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--fs-caption);
+  cursor: pointer;
+}
+
+.artifact-ref-copy:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.artifact-ref-copy:disabled { opacity: .55; cursor: not-allowed; }
+
 /* Full-viewport shells: dvh so mobile browser chrome (the retractable address bar) doesn't clip the
    fixed frame; the 100vh line before it is the fallback for engines without dvh (UX finding 7). */
 .app-shell {
@@ -1152,6 +1174,13 @@ a.issue-row:hover {
   margin-block-start: var(--space-1);
   font-size: var(--fs-h1);
   overflow-wrap: anywhere;
+}
+
+.issue-detail-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
 }
 
 .issue-detail-meta {

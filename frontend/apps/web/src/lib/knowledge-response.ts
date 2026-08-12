@@ -1,4 +1,5 @@
 import { BLOCK_TYPES, type BlockType, type EditorBlock } from "@myelin/design-system";
+import { isArtifactRef, parseArtifactRef } from "./artifact-ref";
 
 type WireRecord = Record<string, unknown>;
 const utf8 = new TextEncoder();
@@ -72,16 +73,14 @@ function cleanText(value: unknown, maximum: number, empty = false): value is str
     ![...value].some((character) => character === "\0");
 }
 
-function artifactRef(value: unknown): value is string {
-  return cleanText(value, 4 * 1024) && /^myelin:\/\/[^/]+\/[^/]+\/[^/]+\/[^#]+(?:#.+)?$/.test(value);
-}
-
 function pageRef(value: unknown, id: string): value is string {
-  return artifactRef(value) && new RegExp(`^myelin://[^/]+/knowledge/page/${id}$`).test(value);
+  const parsed = parseArtifactRef(value);
+  return parsed !== null && parsed.subsystem === "knowledge" && parsed.type === "page" &&
+    parsed.id === id && parsed.sub === null;
 }
 
 function references(value: unknown): string[] | null {
-  if (!Array.isArray(value) || value.length > 32 || !value.every(artifactRef)) return null;
+  if (!Array.isArray(value) || value.length > 32 || !value.every(isArtifactRef)) return null;
   return value as string[];
 }
 

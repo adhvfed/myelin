@@ -11,6 +11,7 @@ import {
 import { ErrorBoundary, Show, Suspense, createMemo, createSignal, onMount } from "solid-js";
 import { getIssue, issuesMutate, type IssueErrorKind, type IssueVM } from "~/lib/issue-api";
 import { isClosedCategory, issueErrorKind, issueTimestamp } from "~/lib/issue-view";
+import { CopyArtifactRef } from "~/components/CopyArtifactRef";
 
 export default function IssueDetail() {
   const params = useParams();
@@ -86,7 +87,10 @@ export default function IssueDetail() {
                   <code>{row().key}</code>
                   <h1 id="issue-detail-heading">{row().title}</h1>
                 </div>
-                <StatusPill kind="issue-state" category={row().state_category} label={row().state} />
+                <div class="issue-detail-heading-actions">
+                  <CopyArtifactRef reference={row().ref} />
+                  <StatusPill kind="issue-state" category={row().state_category} label={row().state} />
+                </div>
               </header>
 
               <dl class="issue-detail-meta">

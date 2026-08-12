@@ -16,6 +16,7 @@ import {
 function issue(id: string): IssueVM {
   return {
     id,
+    ref: `myelin://acme/issue/issue/MYL-${id}`,
     key: `MYL-${id}`,
     project_id: "20aee030-c7fa-4757-8243-700faf528690",
     state: "Todo",
@@ -85,7 +86,7 @@ describe("issue create and page state", () => {
     const statuses = [
       {
         status: "pending" as const,
-        issue: { id: "1", key: "MYL-1", project_id: "project" },
+        issue: { id: "1", ref: "myelin://acme/issue/issue/MYL-1", key: "MYL-1", project_id: "project" },
         retry_after_ms: 1_000,
       },
       { status: "active" as const, issue: issue("1") },
@@ -110,7 +111,7 @@ describe("issue create and page state", () => {
       "01REQUEST",
       async () => ({
         status: "pending",
-        issue: { id: "1", key: "MYL-1", project_id: "project" },
+        issue: { id: "1", ref: "myelin://acme/issue/issue/MYL-1", key: "MYL-1", project_id: "project" },
         retry_after_ms: 1_000,
       }),
       {
@@ -130,7 +131,7 @@ describe("issue create and page state", () => {
       async () => ++polls === 1
         ? {
             status: "pending",
-            issue: { id: "1", key: "MYL-1", project_id: "project" },
+            issue: { id: "1", ref: "myelin://acme/issue/issue/MYL-1", key: "MYL-1", project_id: "project" },
             retry_after_ms: Number.NaN,
           }
         : { status: "active", issue: issue("1") },
@@ -202,7 +203,7 @@ describe("issue create and page state", () => {
       "01REQUEST",
       async () => ({
         status: "pending",
-        issue: { id: "1", key: "MYL-1", project_id: "project" },
+        issue: { id: "1", ref: "myelin://acme/issue/issue/MYL-1", key: "MYL-1", project_id: "project" },
         retry_after_ms: 1_000,
       }),
       {

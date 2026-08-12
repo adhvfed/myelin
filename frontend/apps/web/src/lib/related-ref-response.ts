@@ -1,3 +1,7 @@
+import { isArtifactRef } from "./artifact-ref";
+
+export { isArtifactRef } from "./artifact-ref";
+
 export const RELATED_REFS_PAGE_LIMIT = 100;
 
 export interface RelatedRefItem {
@@ -40,12 +44,6 @@ function record(value: unknown): WireRecord | null {
 function exact(value: WireRecord, keys: readonly string[]): boolean {
   const expected = new Set(keys);
   return Object.keys(value).length === keys.length && Object.keys(value).every((key) => expected.has(key));
-}
-
-export function isArtifactRef(value: unknown): value is string {
-  return typeof value === "string" && utf8.encode(value).byteLength <= 4 * 1024 &&
-    /^myelin:\/\/[^/]+\/[^/]+\/[^/]+\/[^#]+(?:#.+)?$/.test(value) &&
-    ![...value].some((character) => character.charCodeAt(0) <= 0x20 || character.charCodeAt(0) === 0x7f);
 }
 
 function rootRef(value: unknown): value is string {

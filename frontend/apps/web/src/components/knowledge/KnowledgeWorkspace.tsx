@@ -2,6 +2,9 @@ import { BlockEditor, Icon, type EditorBlock } from "@myelin/design-system";
 import { A, useAction } from "@solidjs/router";
 import { createEffect, createSignal, onCleanup, Show, untrack } from "solid-js";
 import { knowledgeMutate, type KnowledgeErrorKind, type KnowledgePage, type KnowledgeVisibility } from "~/lib/knowledge-api";
+import { CopyArtifactRef } from "~/components/CopyArtifactRef";
+import { KnowledgeReferenceComposer } from "~/components/knowledge/KnowledgeReferenceComposer";
+import { artifactRefHref, artifactRefLabel } from "~/lib/artifact-ref";
 
 type KnowledgeEditorBlock = EditorBlock & { references?: string[] };
 
@@ -80,9 +83,19 @@ export function KnowledgeWorkspace(props: KnowledgeWorkspaceProps) {
     setVersion(latest.version); setError(null); setDirty(true);
   };
 
+  const references = () => blocks().flatMap((block) => block.references ?? []);
+  const addReference = (reference: string) => {
+    setBlocks((current) => [...current, {
+      type: "paragraph",
+      markdown: "Related work: \uFFFC",
+      references: [reference],
+    }]);
+    changed();
+  };
+
   return <article class="knowledge-workspace">
-    <header class="knowledge-page-toolbar"><A href="/knowledge" class="knowledge-mobile-back"><Icon name="chevron" /> Pages</A><div class="knowledge-page-meta"><span><Icon name={visibility() === "private" ? "human" : "team"} />{visibility() === "private" ? "Private" : "Team"}</span><span>v{version()}</span></div><div class="knowledge-save-state" role="status">{saving() ? "Saving…" : dirty() ? "Unsaved changes" : savedAt() ? "Saved" : "Up to date"}</div><Show when={props.page.can_edit}><button type="button" class="knowledge-button secondary" onClick={() => void save()} disabled={!dirty() || saving()}>Save now</button></Show></header>
+    <header class="knowledge-page-toolbar"><A href="/knowledge" class="knowledge-mobile-back"><Icon name="chevron" /> Pages</A><div class="knowledge-page-meta"><span><Icon name={visibility() === "private" ? "human" : "team"} />{visibility() === "private" ? "Private" : "Team"}</span><span>v{version()}</span></div><CopyArtifactRef reference={props.page.ref} /><div class="knowledge-save-state" role="status">{saving() ? "Saving…" : dirty() ? "Unsaved changes" : savedAt() ? "Saved" : "Up to date"}</div><Show when={props.page.can_edit}><button type="button" class="knowledge-button secondary" onClick={() => void save()} disabled={!dirty() || saving()}>Save now</button></Show></header>
     <Show when={error()}>{(kind) => <section class="knowledge-conflict" role="alert"><div><strong>{kind() === "conflict" ? "This page changed elsewhere" : "Save not confirmed"}</strong><p>{errorCopy(kind())}</p></div><Show when={kind() === "conflict"} fallback={<button type="button" class="knowledge-button secondary" onClick={() => void save()}>Retry</button>}><button type="button" class="knowledge-button secondary" onClick={() => void reloadLatest()}>Reload latest</button><button type="button" class="knowledge-button primary" onClick={() => void keepMine()}>Keep my draft</button></Show></section>}</Show>
-    <main class="knowledge-document"><input class="knowledge-title" aria-label="Page title" value={title()} maxlength={512} readonly={!props.page.can_edit || props.page.title_state === "tombstoned"} onInput={(event) => { setTitle(event.currentTarget.value); changed(); }} /><div class="knowledge-document-controls"><label>Visibility<select value={visibility()} disabled={!props.page.can_edit} onChange={(event) => { setVisibility(event.currentTarget.value as KnowledgeVisibility); changed(); }}><option value="private">Private</option><option value="team">Team</option></select></label><span>{blocks().length} block{blocks().length === 1 ? "" : "s"}</span></div><BlockEditor value={blocks()} readOnly={!props.page.can_edit} label={`Edit ${title()}`} onChange={(next) => { setBlocks(next); changed(); }} /></main>
+    <main class="knowledge-document"><input class="knowledge-title" aria-label="Page title" value={title()} maxlength={512} readonly={!props.page.can_edit || props.page.title_state === "tombstoned"} onInput={(event) => { setTitle(event.currentTarget.value); changed(); }} /><div class="knowledge-document-controls"><label>Visibility<select value={visibility()} disabled={!props.page.can_edit} onChange={(event) => { setVisibility(event.currentTarget.value as KnowledgeVisibility); changed(); }}><option value="private">Private</option><option value="team">Team</option></select></label><span>{blocks().length} block{blocks().length === 1 ? "" : "s"}</span><KnowledgeReferenceComposer pageRef={props.page.ref} references={references()} disabled={!props.page.can_edit} atCapacity={blocks().length >= 500 || references().length >= 100} onAdd={addReference} /></div><BlockEditor value={blocks()} readOnly={!props.page.can_edit} label={`Edit ${title()}`} referenceLabel={artifactRefLabel} referenceHref={artifactRefHref} onChange={(next) => { setBlocks(next); changed(); }} /></main>
   </article>;
 }

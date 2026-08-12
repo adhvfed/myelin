@@ -4,6 +4,7 @@ import { A } from "@solidjs/router";
 import { Icon, StatusPill } from "@myelin/design-system";
 import { fmtDate } from "~/lib/format";
 import type { PrVM } from "~/lib/api";
+import { CopyArtifactRef } from "~/components/CopyArtifactRef";
 
 export type PrTab = "overview" | "diff" | "checks" | "commits";
 
@@ -34,6 +35,7 @@ export function PrHeader(props: {
         <h1 id="pr-heading" style={{ "font-size": "var(--fs-h1)", margin: "0" }}>
           {title()} <span style={{ color: "var(--text-subtle)", "font-weight": "400" }}>#{props.pr.number}</span>
         </h1>
+        <CopyArtifactRef reference={props.pr.ref} />
       </div>
       <p style={{ color: "var(--text-muted)", margin: "0", "font-size": "var(--fs-caption)" }}>
         <code style={{ "font-family": "var(--font-mono)" }}>{props.pr.head_ref}</code>

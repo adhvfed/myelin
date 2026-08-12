@@ -139,7 +139,6 @@ function blockSignature(block: EditorBlock, readOnly: boolean): string {
 function renderBlock(
   element: HTMLElement,
   block: EditorBlock,
-  readOnly: boolean,
   labelFor: (reference: string) => string,
   hrefFor?: (reference: string) => string | undefined,
 ): void {
@@ -150,7 +149,7 @@ function renderBlock(
     if (part) fragment.append(document.createTextNode(part));
     const reference = references[index];
     if (index >= parts.length - 1 || reference === undefined) return;
-    const href = readOnly ? hrefFor?.(reference) : undefined;
+    const href = hrefFor?.(reference);
     const chip = href ? document.createElement("a") : document.createElement("span");
     if (href && chip instanceof HTMLAnchorElement) chip.href = href;
     chip.className = "block-editor-reference";
@@ -276,7 +275,7 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
       const signature = blockSignature(block, readOnly);
       if (element && (element.textContent !== block.markdown || lastEmitted.get(index) !== signature) &&
           (document.activeElement !== element || lastEmitted.get(index) !== signature)) {
-        renderBlock(element, block, readOnly, props.referenceLabel ?? ((reference) => reference), props.referenceHref);
+        renderBlock(element, block, props.referenceLabel ?? ((reference) => reference), props.referenceHref);
         lastEmitted.set(index, signature);
       }
     });
@@ -310,7 +309,6 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
                   renderBlock(
                     element,
                     block(),
-                    Boolean(props.readOnly),
                     props.referenceLabel ?? ((reference) => reference),
                     props.referenceHref,
                   );

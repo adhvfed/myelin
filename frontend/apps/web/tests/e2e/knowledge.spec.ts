@@ -32,11 +32,18 @@ test.describe("Knowledge workspace", () => {
     const responseBlock = page.getByRole("textbox", { name: "Numbered list block 4" });
     await expect(responseBlock).toContainText("Confirm the alert");
     await responseBlock.fill("Confirm the alert, open an incident topic, and assign an incident lead.");
+    await page.getByRole("button", { name: "Link related work" }).click();
+    await page.getByRole("textbox", { name: "Canonical Myelin reference" })
+      .fill("myelin://acme/issue/issue/MYL-102");
+    await page.getByRole("button", { name: "Add", exact: true }).click();
+    await expect(page.getByRole("link", { name: "Reference: MYL-102" }))
+      .toHaveAttribute("href", "/issues?state=all&key=MYL-102");
     const saveState = page.locator(".knowledge-save-state");
     await expect(saveState).toHaveText(/Saving|Saved|Up to date/, { timeout: 5_000 });
     await expect(saveState).toHaveText("Saved", { timeout: 10_000 });
     await page.reload();
     await expect(page.getByRole("textbox", { name: "Numbered list block 4" })).toContainText("open an incident topic");
+    await expect(page.getByRole("link", { name: "Reference: MYL-102" })).toBeVisible();
     await expect(page.getByText("Team", { exact: true }).first()).toBeVisible();
   });
 
