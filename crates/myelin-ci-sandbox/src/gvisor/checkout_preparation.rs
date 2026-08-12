@@ -770,12 +770,13 @@ pub(super) fn run_checkout_preparation_inner(
             UserNamespaceBindError::InvalidContainerId | UserNamespaceBindError::MarkerTooLarge => {
                 CheckoutPreparationError::Refused(format!("bind_preparation: {bind_error}"))
             }
-            UserNamespaceBindError::MarkerMismatch | UserNamespaceBindError::Poisoned => {
-                CheckoutPreparationError::Unreleasable {
-                    message: format!("bind_preparation: {bind_error}"),
-                    usage: None,
-                }
-            }
+            UserNamespaceBindError::MarkerMismatch
+            | UserNamespaceBindError::Poisoned
+            | UserNamespaceBindError::InvalidSessionState
+            | UserNamespaceBindError::LeaseMismatch => CheckoutPreparationError::Unreleasable {
+                message: format!("bind_preparation: {bind_error}"),
+                usage: None,
+            },
         });
     }
 

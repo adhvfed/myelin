@@ -415,6 +415,8 @@ pub enum UserNamespaceReleaseError {
     ProofDisagreesWithMarker,
     Poisoned,
     InternalInvariantViolated { reason: String },
+    InvalidSessionState,
+    LeaseMismatch,
 }
 
 impl std::fmt::Display for UserNamespaceReleaseError {
@@ -441,6 +443,13 @@ impl std::fmt::Display for UserNamespaceReleaseError {
             UserNamespaceReleaseError::InternalInvariantViolated { reason } => {
                 write!(f, "internal invariant violated while releasing: {reason}")
             }
+            UserNamespaceReleaseError::InvalidSessionState => {
+                write!(f, "the checkout session is not prepared for release")
+            }
+            UserNamespaceReleaseError::LeaseMismatch => write!(
+                f,
+                "the checkout session was asked to release a different userns lease"
+            ),
         }
     }
 }
@@ -453,6 +462,8 @@ pub(crate) enum PreparationConfirmationError {
     MarkerMismatch,
     ProofDisagreesWithMarker,
     Poisoned,
+    InvalidSessionState,
+    LeaseMismatch,
 }
 
 impl std::fmt::Display for PreparationConfirmationError {
@@ -474,6 +485,16 @@ impl std::fmt::Display for PreparationConfirmationError {
             PreparationConfirmationError::Poisoned => write!(
                 f,
                 "confirming preparation quiescence had an ambiguous outcome"
+            ),
+            PreparationConfirmationError::InvalidSessionState => {
+                write!(
+                    f,
+                    "the checkout session is not awaiting preparation confirmation"
+                )
+            }
+            PreparationConfirmationError::LeaseMismatch => write!(
+                f,
+                "the preparation proof was presented with a different userns lease"
             ),
         }
     }
@@ -918,6 +939,8 @@ pub enum UserNamespaceBindError {
     Poisoned,
     InvalidContainerId,
     MarkerTooLarge,
+    InvalidSessionState,
+    LeaseMismatch,
 }
 
 impl std::fmt::Display for UserNamespaceBindError {
@@ -938,6 +961,16 @@ impl std::fmt::Display for UserNamespaceBindError {
             UserNamespaceBindError::MarkerTooLarge => write!(
                 f,
                 "the serialized target marker would exceed the maximum marker size"
+            ),
+            UserNamespaceBindError::InvalidSessionState => {
+                write!(
+                    f,
+                    "the checkout session is not ready for this binding transition"
+                )
+            }
+            UserNamespaceBindError::LeaseMismatch => write!(
+                f,
+                "the checkout session was asked to bind a different userns lease"
             ),
         }
     }
@@ -1137,35 +1170,27 @@ impl UserNamespaceLease {
         let marker = read_and_verify_marker(self.shared.dir_fd(), &name)
             .ok()
             .and_then(|content| serde_json::from_str::<LeaseMarkerV2>(&content).ok());
-        let base_identity_matches = marker.as_ref().is_some_and(|marker| {
-            marker.schema_version == LEASE_MARKER_SCHEMA_V2
-                && marker.lease_nonce == self.lease_nonce
-                && marker.runner_instance_id == self.runner_instance_id
-                && marker.host_uid == self.host_uid
-                && marker.host_gid == self.host_gid
-        });
-        if !base_identity_matches {
-            self.released = true;
-            self.shared.poison(format!(
-                "confirming preparation quiescence for slot {} (host_uid={}): the durable marker \
-                 no longer matches this lease's own identity (schema/nonce/runner/host_uid/ \
-                 host_gid) - treating as a global-trust failure",
-                self.slot, self.host_uid
-            ));
-            return Err(PreparationConfirmationError::MarkerMismatch);
-        }
-        let Some(marker) = marker else {
-            unreachable!("base_identity_matches is only true when marker is Some");
+        let marker = match marker {
+            Some(marker)
+                if marker.schema_version == LEASE_MARKER_SCHEMA_V2
+                    && marker.lease_nonce == self.lease_nonce
+                    && marker.runner_instance_id == self.runner_instance_id
+                    && marker.host_uid == self.host_uid
+                    && marker.host_gid == self.host_gid =>
+            {
+                marker
+            }
+            _ => {
+                self.released = true;
+                self.shared.poison(format!(
+                    "confirming preparation quiescence for slot {} (host_uid={}): the durable marker \
+                     no longer matches this lease's own identity (schema/nonce/runner/host_uid/ \
+                     host_gid) - treating as a global-trust failure",
+                    self.slot, self.host_uid
+                ));
+                return Err(PreparationConfirmationError::MarkerMismatch);
+            }
         };
-        let phase_matches_proof = marker.phase
-            == LeasePhaseV2::PreparationBound {
-                container_id: proof.container_id.clone(),
-                runsc_root_identity: proof.runsc_root_identity,
-                cgroup_identity: proof.cgroup_identity,
-            };
-        if !phase_matches_proof {
-            return Err(PreparationConfirmationError::ProofDisagreesWithMarker);
-        }
         let (
             preparation_container_id,
             preparation_runsc_root_identity,
@@ -1175,8 +1200,13 @@ impl UserNamespaceLease {
                 container_id,
                 runsc_root_identity,
                 cgroup_identity,
-            } => (container_id.clone(), *runsc_root_identity, *cgroup_identity),
-            _ => unreachable!("phase_matches_proof only true for PreparationBound"),
+            } if container_id == &proof.container_id
+                && runsc_root_identity == &proof.runsc_root_identity
+                && cgroup_identity == &proof.cgroup_identity =>
+            {
+                (container_id.clone(), *runsc_root_identity, *cgroup_identity)
+            }
+            _ => return Err(PreparationConfirmationError::ProofDisagreesWithMarker),
         };
         let prepared_marker = LeaseMarkerV2 {
             phase: LeasePhaseV2::Prepared {
@@ -1587,12 +1617,9 @@ impl CheckoutPreparationSession {
         runsc_root_identity: (u64, u64),
         cgroup_identity: (u64, u64),
     ) -> Result<(), UserNamespaceBindError> {
-        assert_eq!(
-            self.state,
-            CheckoutPreparationSessionState::NotStarted,
-            "bind_preparation called out of order (session state was {:?})",
-            self.state
-        );
+        if self.state != CheckoutPreparationSessionState::NotStarted {
+            return Err(UserNamespaceBindError::InvalidSessionState);
+        }
         let lease_nonce = lease.lease_nonce;
         match lease.bind_preparation(container_id, runsc_root_identity, cgroup_identity) {
             Ok(()) => {
@@ -1614,16 +1641,11 @@ impl CheckoutPreparationSession {
         proof: PreparationQuiescenceProof,
     ) -> Result<(), PreparationConfirmationError> {
         let CheckoutPreparationSessionState::PreparationBound { lease_nonce } = self.state else {
-            panic!(
-                "confirm_prepared called out of order (session state was {:?})",
-                self.state
-            );
+            return Err(PreparationConfirmationError::InvalidSessionState);
         };
-        assert_eq!(
-            lease_nonce, lease.lease_nonce,
-            "confirm_prepared called with a lease different from the one this session was bound \
-             to by bind_preparation"
-        );
+        if lease_nonce != lease.lease_nonce {
+            return Err(PreparationConfirmationError::LeaseMismatch);
+        }
         match lease.confirm_prepared(proof) {
             Ok(()) => {
                 self.state = CheckoutPreparationSessionState::Prepared { lease_nonce };
@@ -1641,15 +1663,11 @@ impl CheckoutPreparationSession {
         lease: UserNamespaceLease,
     ) -> Result<(), UserNamespaceReleaseError> {
         let CheckoutPreparationSessionState::Prepared { lease_nonce } = self.state else {
-            panic!(
-                "release_prepared called out of order (session state was {:?})",
-                self.state
-            );
+            return Err(UserNamespaceReleaseError::InvalidSessionState);
         };
-        assert_eq!(
-            lease_nonce, lease.lease_nonce,
-            "release_prepared called with a lease different from the one this session was bound to"
-        );
+        if lease_nonce != lease.lease_nonce {
+            return Err(UserNamespaceReleaseError::LeaseMismatch);
+        }
         lease.release_prepared()
     }
 
@@ -1661,15 +1679,11 @@ impl CheckoutPreparationSession {
         cgroup_identity: (u64, u64),
     ) -> Result<WorkloadBindingIdentity, UserNamespaceBindError> {
         let CheckoutPreparationSessionState::Prepared { lease_nonce } = self.state else {
-            panic!(
-                "bind_workload called out of order (session state was {:?})",
-                self.state
-            );
+            return Err(UserNamespaceBindError::InvalidSessionState);
         };
-        assert_eq!(
-            lease_nonce, lease.lease_nonce,
-            "bind_workload called with a lease different from the one this session was bound to"
-        );
+        if lease_nonce != lease.lease_nonce {
+            return Err(UserNamespaceBindError::LeaseMismatch);
+        }
         match lease.bind_workload(container_id.clone(), runsc_root_identity, cgroup_identity) {
             Ok(()) => {
                 self.state = CheckoutPreparationSessionState::Done;
@@ -4172,11 +4186,11 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "confirm_prepared called with a lease different from the one")]
     fn checkout_preparation_session_confirm_prepared_refuses_a_substituted_lease() {
         let (allocator, base, _log) = new_allocator_for_test("session-cross-lease-confirm", 2, 2);
         let mut lease_a = allocator.lease().unwrap();
         let mut lease_b = allocator.lease().unwrap();
+        let nonce_a = lease_a.nonce_for_tests();
         let nonce_b = lease_b.nonce_for_tests();
         let mut session = CheckoutPreparationSession::new();
         session
@@ -4185,7 +4199,7 @@ mod tests {
         lease_b
             .bind_preparation("prep-b".to_string(), (2, 2), (2, 2))
             .expect("bind_preparation on lease_b must succeed");
-        let _ = session.confirm_prepared(
+        let result = session.confirm_prepared(
             &mut lease_b,
             PreparationQuiescenceProof::assert_for_tests(
                 nonce_b,
@@ -4194,11 +4208,32 @@ mod tests {
                 (2, 2),
             ),
         );
+        assert_eq!(result, Err(PreparationConfirmationError::LeaseMismatch));
+        session
+            .confirm_prepared(
+                &mut lease_a,
+                PreparationQuiescenceProof::assert_for_tests(
+                    nonce_a,
+                    "prep-a".to_string(),
+                    (1, 1),
+                    (1, 1),
+                ),
+            )
+            .expect("the session still owns lease_a after refusing lease_b");
+        session.release_prepared(lease_a).unwrap();
+        lease_b
+            .confirm_prepared(PreparationQuiescenceProof::assert_for_tests(
+                nonce_b,
+                "prep-b".to_string(),
+                (2, 2),
+                (2, 2),
+            ))
+            .unwrap();
+        lease_b.release_prepared().unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    #[should_panic(expected = "bind_workload called with a lease different from the one")]
     fn checkout_preparation_session_bind_workload_refuses_a_substituted_lease() {
         let (allocator, base, _log) = new_allocator_for_test("session-cross-lease-workload", 2, 2);
         let mut lease_a = allocator.lease().unwrap();
@@ -4231,7 +4266,22 @@ mod tests {
                 (2, 2),
             ))
             .expect("confirm_prepared on lease_b must succeed");
-        let _ = session.bind_workload(&mut lease_b, "workload".to_string(), (3, 3), (3, 3));
+        assert_eq!(
+            session.bind_workload(&mut lease_b, "workload".to_string(), (3, 3), (3, 3)),
+            Err(UserNamespaceBindError::LeaseMismatch)
+        );
+        session
+            .bind_workload(&mut lease_a, "workload-a".to_string(), (3, 3), (3, 3))
+            .expect("the session still owns lease_a after refusing lease_b");
+        lease_a
+            .release(UserNamespaceQuiescenceProof::assert_for_tests(
+                nonce_a,
+                "workload-a".to_string(),
+                (3, 3),
+                (3, 3),
+            ))
+            .unwrap();
+        lease_b.release_prepared().unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4305,26 +4355,40 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "bind_preparation called out of order")]
-    fn checkout_preparation_session_bind_preparation_twice_panics() {
+    fn checkout_preparation_session_refuses_a_second_preparation_bind() {
         let (allocator, base, _log) = new_allocator_for_test("session-bind-prep-twice", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let mut session = CheckoutPreparationSession::new();
         session
             .bind_preparation(&mut lease, "prep-1".to_string(), (1, 1), (1, 1))
             .expect("first bind_preparation must succeed");
-        let _ = session.bind_preparation(&mut lease, "prep-2".to_string(), (2, 2), (2, 2));
+        let nonce = lease.nonce_for_tests();
+        assert_eq!(
+            session.bind_preparation(&mut lease, "prep-2".to_string(), (2, 2), (2, 2)),
+            Err(UserNamespaceBindError::InvalidSessionState)
+        );
+        session
+            .confirm_prepared(
+                &mut lease,
+                PreparationQuiescenceProof::assert_for_tests(
+                    nonce,
+                    "prep-1".to_string(),
+                    (1, 1),
+                    (1, 1),
+                ),
+            )
+            .unwrap();
+        session.release_prepared(lease).unwrap();
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    #[should_panic(expected = "confirm_prepared called out of order")]
-    fn checkout_preparation_session_confirm_prepared_before_bind_preparation_panics() {
+    fn checkout_preparation_session_refuses_confirmation_before_binding() {
         let (allocator, base, _log) = new_allocator_for_test("session-confirm-too-early", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let nonce = lease.nonce_for_tests();
         let mut session = CheckoutPreparationSession::new();
-        let _ = session.confirm_prepared(
+        let result = session.confirm_prepared(
             &mut lease,
             PreparationQuiescenceProof::assert_for_tests(
                 nonce,
@@ -4333,16 +4397,24 @@ mod tests {
                 (2, 2),
             ),
         );
+        assert_eq!(
+            result,
+            Err(PreparationConfirmationError::InvalidSessionState)
+        );
+        release_for_tests(lease);
         let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
-    #[should_panic(expected = "bind_workload called out of order")]
-    fn checkout_preparation_session_bind_workload_before_prepared_panics() {
+    fn checkout_preparation_session_refuses_workload_before_preparation() {
         let (allocator, base, _log) = new_allocator_for_test("session-workload-too-early", 1, 1);
         let mut lease = allocator.lease().unwrap();
         let mut session = CheckoutPreparationSession::new();
-        let _ = session.bind_workload(&mut lease, "workload".to_string(), (1, 1), (2, 2));
+        assert_eq!(
+            session.bind_workload(&mut lease, "workload".to_string(), (1, 1), (2, 2)),
+            Err(UserNamespaceBindError::InvalidSessionState)
+        );
+        release_for_tests(lease);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -4394,7 +4466,7 @@ mod tests {
             "the SESSION must terminally abandon on ANY confirm_prepared failure, unlike the raw \
              lease API it wraps"
         );
-        let correct_proof_attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        assert_eq!(
             session.confirm_prepared(
                 &mut lease,
                 PreparationQuiescenceProof::assert_for_tests(
@@ -4403,11 +4475,9 @@ mod tests {
                     (1, 1),
                     (2, 2),
                 ),
-            )
-        }));
-        assert!(
-            correct_proof_attempt.is_err(),
-            "a later correct proof must never be able to advance a terminally abandoned session"
+            ),
+            Err(PreparationConfirmationError::InvalidSessionState),
+            "a later correct proof must never advance a terminally abandoned session"
         );
         drop(lease);
         assert!(

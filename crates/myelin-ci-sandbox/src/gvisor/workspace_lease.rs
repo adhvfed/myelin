@@ -488,9 +488,10 @@ fn bind_enabled_lease_given(
             *bind_state = match bind_error {
                 UserNamespaceBindError::InvalidContainerId
                 | UserNamespaceBindError::MarkerTooLarge => LeaseBindState::Allocated,
-                UserNamespaceBindError::MarkerMismatch | UserNamespaceBindError::Poisoned => {
-                    LeaseBindState::Unreleasable
-                }
+                UserNamespaceBindError::MarkerMismatch
+                | UserNamespaceBindError::Poisoned
+                | UserNamespaceBindError::InvalidSessionState
+                | UserNamespaceBindError::LeaseMismatch => LeaseBindState::Unreleasable,
             };
             Err(format!("durable lease bind failed: {bind_error}"))
         }
@@ -530,7 +531,9 @@ pub(super) fn bind_prepared_lease_given(
                     LeaseBindState::Allocated
                 }
                 crate::user_namespace::UserNamespaceBindError::MarkerMismatch
-                | crate::user_namespace::UserNamespaceBindError::Poisoned => {
+                | crate::user_namespace::UserNamespaceBindError::Poisoned
+                | crate::user_namespace::UserNamespaceBindError::InvalidSessionState
+                | crate::user_namespace::UserNamespaceBindError::LeaseMismatch => {
                     LeaseBindState::Unreleasable
                 }
             };
