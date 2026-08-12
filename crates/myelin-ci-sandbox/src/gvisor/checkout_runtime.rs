@@ -555,6 +555,7 @@ impl PreparedCheckoutRuntime {
             .enabled_context
             .workspace
             .host_path()
+            .unwrap()
             .to_path_buf();
         let used_at_workload_checkpoint = self
             .acquired

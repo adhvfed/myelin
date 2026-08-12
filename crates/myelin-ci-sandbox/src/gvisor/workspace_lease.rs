@@ -288,21 +288,27 @@ fn acquire_enabled_workspace_given(
             ));
         }
     };
-    let cfg = match OciConfig::from_spec(spec, profile).with_explicit_user_namespace_and_workspace(
-        lease.config(),
-        OciWorkspaceMount::from_managed_workspace(&workspace),
-        absolute_rootfs,
-    ) {
-        Ok(cfg) => cfg,
-        Err(reason) => {
-            let diagnostics =
-                delete_workspace_then_release_lease_if_absent(workspace, lease, delete_workspace);
-            return Err(AcquisitionFailure::from_rollback_diagnostics(
-                format!("building the explicit-userns workspace OCI layout failed: {reason}"),
-                diagnostics,
-            ));
-        }
-    };
+    let cfg =
+        match OciWorkspaceMount::from_managed_workspace(&workspace).and_then(|workspace_mount| {
+            OciConfig::from_spec(spec, profile).with_explicit_user_namespace_and_workspace(
+                lease.config(),
+                workspace_mount,
+                absolute_rootfs,
+            )
+        }) {
+            Ok(cfg) => cfg,
+            Err(reason) => {
+                let diagnostics = delete_workspace_then_release_lease_if_absent(
+                    workspace,
+                    lease,
+                    delete_workspace,
+                );
+                return Err(AcquisitionFailure::from_rollback_diagnostics(
+                    format!("building the explicit-userns workspace OCI layout failed: {reason}"),
+                    diagnostics,
+                ));
+            }
+        };
     Ok((
         cfg,
         EnabledLaunchContext {
@@ -633,7 +639,7 @@ mod tests {
                 capacity,
             )
             .expect("create_workspace must succeed against a real, privileged Btrfs backend");
-        let host_path = workspace.host_path().to_path_buf();
+        let host_path = workspace.host_path().unwrap().to_path_buf();
 
         let diagnostics = delete_workspace_then_release_lease_if_absent(workspace, lease, |w| {
             workspace_manager.delete_workspace(w).expect(
@@ -695,7 +701,7 @@ mod tests {
                 capacity,
             )
             .expect("create_workspace must succeed against a real, privileged Btrfs backend");
-        let host_path = workspace.host_path().to_path_buf();
+        let host_path = workspace.host_path().unwrap().to_path_buf();
 
         let diagnostics = delete_workspace_then_release_lease_if_absent(workspace, lease, |_w| {
             Err(DeleteWorkspaceError::Storage(
@@ -1142,7 +1148,7 @@ mod tests {
             runsc_root_identity,
             cgroup_identity,
         };
-        let host_path = context.workspace.host_path().to_path_buf();
+        let host_path = context.workspace.host_path().unwrap().to_path_buf();
         let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
             container_id.to_string(),
             RuntimeNamespaceQuiescence::ExplicitUserNamespace {
@@ -1222,7 +1228,7 @@ mod tests {
             runsc_root_identity,
             cgroup_identity,
         };
-        let host_path = context.workspace.host_path().to_path_buf();
+        let host_path = context.workspace.host_path().unwrap().to_path_buf();
 
         let diagnostics = cleanup_pre_bind_failure(context, &workspace_manager);
 

@@ -159,10 +159,13 @@ pub(crate) struct OciWorkspaceMount {
 impl OciWorkspaceMount {
     pub(crate) fn from_managed_workspace(
         workspace: &crate::workspace_manager::ManagedWorkspace,
-    ) -> Self {
-        OciWorkspaceMount {
-            host_source: workspace.host_path().to_path_buf(),
-        }
+    ) -> Result<Self, String> {
+        Ok(OciWorkspaceMount {
+            host_source: workspace
+                .host_path()
+                .map_err(|error| error.to_string())?
+                .to_path_buf(),
+        })
     }
 
     #[cfg(test)]

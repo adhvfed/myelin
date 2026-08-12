@@ -348,6 +348,24 @@ pub struct ManagedWorkspace {
     released: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceAccessError {
+    job_key: String,
+    capability: &'static str,
+}
+
+impl std::fmt::Display for WorkspaceAccessError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "managed workspace for job {:?} no longer owns its {} capability",
+            self.job_key, self.capability
+        )
+    }
+}
+
+impl std::error::Error for WorkspaceAccessError {}
+
 impl std::fmt::Debug for ManagedWorkspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ManagedWorkspace")
@@ -363,18 +381,24 @@ impl ManagedWorkspace {
         &self.job_key
     }
 
-    pub fn host_path(&self) -> &Path {
+    pub fn host_path(&self) -> Result<&Path, WorkspaceAccessError> {
         self.prepared
             .as_ref()
-            .expect("host_path() called after this workspace was already consumed by delete")
-            .host_path()
+            .ok_or_else(|| WorkspaceAccessError {
+                job_key: self.job_key.clone(),
+                capability: "prepared-storage",
+            })
+            .map(|prepared| prepared.host_path())
     }
 
-    pub fn capacity_bytes(&self) -> u64 {
+    pub fn capacity_bytes(&self) -> Result<u64, WorkspaceAccessError> {
         self.capacity
             .as_ref()
-            .expect("capacity_bytes() called after this workspace was already consumed by delete")
-            .bytes()
+            .ok_or_else(|| WorkspaceAccessError {
+                job_key: self.job_key.clone(),
+                capability: "capacity",
+            })
+            .map(CapacityLease::bytes)
     }
 
     #[cfg(test)]
@@ -1099,6 +1123,29 @@ mod tests {
     }
 
     #[test]
+    fn consumed_workspace_capabilities_are_typed_errors() {
+        let base = test_base("consumed-access");
+        let (sink, _incidents) = recording_sink();
+        let manager = WorkspaceManager::new_for_state_tests(&base, 100, sink).unwrap();
+        let workspace = ManagedWorkspace {
+            job_key: "job-consumed".into(),
+            prepared: None,
+            capacity: None,
+            shared: Arc::clone(&manager.shared),
+            released: true,
+        };
+
+        assert_eq!(
+            workspace.host_path().unwrap_err().to_string(),
+            "managed workspace for job \"job-consumed\" no longer owns its prepared-storage capability"
+        );
+        assert_eq!(
+            workspace.capacity_bytes().unwrap_err().to_string(),
+            "managed workspace for job \"job-consumed\" no longer owns its capacity capability"
+        );
+    }
+
+    #[test]
     fn abandoning_a_capacity_lease_poisons_the_manager_and_never_frees_its_bytes() {
         let base = test_base("capacity-abandon");
         let (sink, incidents) = recording_sink();
@@ -1472,7 +1519,7 @@ mod tests {
             .apply_create_result(state, "job-1", capacity, Ok(fake))
             .expect("an injected Ok outcome must succeed");
         assert_eq!(workspace.job_key(), "job-1");
-        assert_eq!(workspace.capacity_bytes(), 10);
+        assert_eq!(workspace.capacity_bytes().unwrap(), 10);
         assert!(manager.active_job_ids().contains("job-1"));
         assert!(manager.is_healthy());
         workspace.dismantle_for_tests();
@@ -1721,13 +1768,13 @@ mod tests {
         let workspace = manager
             .create_workspace("real-job", 8 << 20, euid, egid, capacity)
             .expect("create_workspace must succeed against a real, privileged Btrfs backend");
-        let host_path = workspace.host_path().to_path_buf();
+        let host_path = workspace.host_path().unwrap().to_path_buf();
         assert!(
             host_path.exists(),
             "the workspace must really exist on disk"
         );
         assert_eq!(workspace.job_key(), "real-job");
-        assert_eq!(workspace.capacity_bytes(), 8 << 20);
+        assert_eq!(workspace.capacity_bytes().unwrap(), 8 << 20);
         assert!(manager.active_job_ids().contains("real-job"));
         assert_eq!(manager.capacity_used_bytes(), 8 << 20);
 
@@ -1768,7 +1815,7 @@ mod tests {
         let workspace = manager
             .create_workspace("abandoned-job", 8 << 20, euid, egid, capacity)
             .expect("create_workspace must succeed against a real, privileged Btrfs backend");
-        let host_path = workspace.host_path().to_path_buf();
+        let host_path = workspace.host_path().unwrap().to_path_buf();
         drop(workspace);
 
         assert!(

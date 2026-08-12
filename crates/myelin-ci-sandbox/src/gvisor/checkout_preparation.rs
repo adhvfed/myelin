@@ -696,7 +696,8 @@ pub(super) fn run_checkout_preparation_inner(
     let bin = runsc_bin();
     let root_abs = verified_gvisor_git_rootfs().map_err(CheckoutPreparationError::Refused)?;
     let userns = lease.config();
-    let workspace_mount = OciWorkspaceMount::from_managed_workspace(workspace);
+    let workspace_mount = OciWorkspaceMount::from_managed_workspace(workspace)
+        .map_err(CheckoutPreparationError::Refused)?;
 
     let profile = HardeningProfile::for_execution(&spec.limits, &EgressPolicy::deny_all());
     profile
@@ -778,6 +779,10 @@ pub(super) fn run_checkout_preparation_inner(
         });
     }
 
+    let workspace_host_path = workspace
+        .host_path()
+        .map_err(|error| CheckoutPreparationError::Refused(error.to_string()))?
+        .to_path_buf();
     let timeout = Duration::from_secs(spec.limits.timeout_secs as u64);
     let (result, child_retirement) = run_and_capture(
         bin,
@@ -811,7 +816,7 @@ pub(super) fn run_checkout_preparation_inner(
         session,
         spec.limits.mem_bytes,
         &spec.expected_commit,
-        workspace.host_path(),
+        &workspace_host_path,
     );
     let _ = std::fs::remove_dir_all(&bundle_dir);
     outcome

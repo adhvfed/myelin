@@ -482,7 +482,7 @@ mod tests {
             let ws = wm
                 .create_workspace("job-t1", 1 << 20, 0, 0, cap)
                 .expect("create directory workspace");
-            let host = ws.host_path().to_path_buf();
+            let host = ws.host_path().unwrap().to_path_buf();
             assert!(host.is_dir(), "a fresh leaf directory exists");
             ws.checked_test_quota_write("checkout.sentinel", b"provenance")
                 .expect("the checked byte-accounted write succeeds under quota");
@@ -724,7 +724,7 @@ mod tests {
             let wm = deterministic_workspace_manager_for_tests(base.clone(), 1 << 30).unwrap();
             let cap = wm.acquire_capacity(1 << 20).unwrap();
             let ws = wm.create_workspace("job-t6", 1 << 20, 0, 0, cap).unwrap();
-            let host = ws.host_path().to_path_buf();
+            let host = ws.host_path().unwrap().to_path_buf();
             std::fs::remove_dir_all(&host).unwrap();
             std::fs::create_dir(&host).unwrap();
             let result = wm.delete_workspace(ws);
@@ -857,7 +857,7 @@ mod tests {
                 runsc_root_identity: root_id,
                 cgroup_identity: cgroup_id,
             };
-            let host = ctx.workspace.host_path().to_path_buf();
+            let host = ctx.workspace.host_path().unwrap().to_path_buf();
             std::fs::remove_dir_all(&host).unwrap();
             std::fs::create_dir(&host).unwrap();
             let evidence = RuntimeQuiescenceEvidence::assert_for_tests(
