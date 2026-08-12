@@ -205,9 +205,7 @@ impl GvisorBackend {
         }
 
         let guest_id = format!("runsc-gitwire-{}", job.idem_token.0);
-        self.live
-            .lock()
-            .unwrap()
+        crate::sync::lock_recovering_poison(&self.live)
             .insert(guest_id.clone(), RunscProc { child, bundle_dir });
 
         if let Err(error) = hooks.settle_completed(&job, &reserve, result.usage) {

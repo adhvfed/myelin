@@ -112,7 +112,7 @@ impl<R: SnapshotRestore> SnapshotPool<R> {
     }
 
     pub fn warm_up(&self, region: &Region, class: &RunnerClass) -> PoolStats {
-        let mut cells = self.cells.lock().unwrap();
+        let mut cells = crate::sync::lock_recovering_poison(&self.cells);
         let cell = cells.entry(Self::key(region, class)).or_default();
         cell.stats.target = self.target;
         while (cell.warm.len() as u32) < self.target {
@@ -139,7 +139,7 @@ impl<R: SnapshotRestore> SnapshotPool<R> {
     where
         C: FnOnce() -> Result<SandboxHandle, String>,
     {
-        let mut cells = self.cells.lock().unwrap();
+        let mut cells = crate::sync::lock_recovering_poison(&self.cells);
         let cell = cells.entry(Self::key(region, class)).or_default();
         cell.stats.target = self.target;
 
@@ -169,7 +169,7 @@ impl<R: SnapshotRestore> SnapshotPool<R> {
     }
 
     pub fn stats(&self, region: &Region, class: &RunnerClass) -> PoolStats {
-        let cells = self.cells.lock().unwrap();
+        let cells = crate::sync::lock_recovering_poison(&self.cells);
         cells
             .get(&Self::key(region, class))
             .map(|c| {

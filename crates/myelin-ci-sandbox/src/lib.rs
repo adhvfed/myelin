@@ -17,6 +17,7 @@ pub mod rootfs_overlay;
 pub mod runner;
 pub mod self_hosted;
 pub mod snapshot_pool;
+mod sync;
 pub mod user_namespace;
 mod workspace_intent;
 pub mod workspace_manager;

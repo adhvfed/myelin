@@ -302,9 +302,7 @@ impl FirecrackerBackend {
         } = run(spec, &profile, launch_permit).map_err(FcError::Vmm)?;
 
         let guest_id = format!("fc-{}", spec.idem_token.0);
-        self.live
-            .lock()
-            .unwrap()
+        crate::sync::lock_recovering_poison(&self.live)
             .insert(guest_id.clone(), GuestProc { child, cfg_path });
 
         if let Err(error) = hooks.settle_completed(spec, &reserve, result.usage) {
@@ -563,7 +561,7 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     fn kill(&self, h: &SandboxHandle) -> Result<(), Self::Error> {
-        let proc = self.live.lock().unwrap().remove(&h.guest_id);
+        let proc = crate::sync::lock_recovering_poison(&self.live).remove(&h.guest_id);
         if let Some(mut proc) = proc {
             let r = proc.child.kill();
             let _ = std::fs::remove_file(&proc.cfg_path);

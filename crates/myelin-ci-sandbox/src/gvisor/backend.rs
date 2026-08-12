@@ -667,9 +667,7 @@ impl GvisorBackend {
         };
 
         let guest_id = format!("runsc-{}", spec.idem_token.0);
-        self.live
-            .lock()
-            .unwrap()
+        crate::sync::lock_recovering_poison(&self.live)
             .insert(guest_id.clone(), RunscProc { child, bundle_dir });
 
         if let Err(error) = hooks.settle_completed(spec, &reserve, result.usage) {
@@ -924,7 +922,7 @@ impl SandboxBackend for GvisorBackend {
     }
 
     fn kill(&self, h: &SandboxHandle) -> Result<(), Self::Error> {
-        let proc = self.live.lock().unwrap().remove(&h.guest_id);
+        let proc = crate::sync::lock_recovering_poison(&self.live).remove(&h.guest_id);
         if let Some(mut proc) = proc {
             let r = proc.child.kill();
             if let Err(error) = std::fs::remove_dir_all(&proc.bundle_dir) {

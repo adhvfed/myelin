@@ -204,9 +204,7 @@ impl GvisorBackend {
                     run_error,
                 } = container_run;
                 let guest_id = format!("runsc-{}", spec.idem_token.0);
-                self.live
-                    .lock()
-                    .unwrap()
+                crate::sync::lock_recovering_poison(&self.live)
                     .insert(guest_id.clone(), RunscProc { child, bundle_dir });
                 Ok(CheckoutContinuationOutcome::WorkloadLaunched(
                     SandboxLaunch {
