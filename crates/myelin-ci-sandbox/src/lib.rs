@@ -941,13 +941,13 @@ enum AttributionHook {
 }
 
 pub struct LaunchPermit {
-    commit: Option<Box<dyn FnOnce() -> Result<LaunchOwnership, HookError> + Send>>,
+    commit: Box<dyn FnOnce() -> Result<LaunchOwnership, HookError> + Send>,
 }
 
 impl LaunchPermit {
     pub fn immediate() -> Self {
         Self {
-            commit: Some(Box::new(|| Ok(LaunchOwnership::immediate()))),
+            commit: Box::new(|| Ok(LaunchOwnership::immediate())),
         }
     }
 
@@ -955,14 +955,12 @@ impl LaunchPermit {
         commit: impl FnOnce() -> Result<LaunchOwnership, HookError> + Send + 'static,
     ) -> Self {
         Self {
-            commit: Some(Box::new(commit)),
+            commit: Box::new(commit),
         }
     }
 
-    pub fn commit(mut self) -> Result<LaunchOwnership, HookError> {
-        self.commit
-            .take()
-            .expect("launch permit commit is single-use")()
+    pub fn commit(self) -> Result<LaunchOwnership, HookError> {
+        (self.commit)()
     }
 
     pub fn commit_and_release(self) -> Result<(), HookError> {
@@ -972,13 +970,13 @@ impl LaunchPermit {
 
 #[must_use = "launch ownership must be released only at the sandbox exec boundary"]
 pub struct LaunchOwnership {
-    validate: Option<Box<dyn FnOnce() -> Result<ValidatedLaunchOwnership, HookError> + Send>>,
+    validate: Box<dyn FnOnce() -> Result<ValidatedLaunchOwnership, HookError> + Send>,
 }
 
 impl LaunchOwnership {
     pub fn immediate() -> Self {
         Self {
-            validate: Some(Box::new(|| Ok(ValidatedLaunchOwnership::immediate()))),
+            validate: Box::new(|| Ok(ValidatedLaunchOwnership::immediate())),
         }
     }
 
@@ -986,39 +984,35 @@ impl LaunchOwnership {
         validate: impl FnOnce() -> Result<ValidatedLaunchOwnership, HookError> + Send + 'static,
     ) -> Self {
         Self {
-            validate: Some(Box::new(validate)),
+            validate: Box::new(validate),
         }
     }
 
-    pub fn validate(mut self) -> Result<ValidatedLaunchOwnership, HookError> {
-        self.validate
-            .take()
-            .expect("launch ownership validation is single-use")()
+    pub fn validate(self) -> Result<ValidatedLaunchOwnership, HookError> {
+        (self.validate)()
     }
 }
 
 #[must_use = "validated launch ownership must be released after the sandbox gate opens"]
 pub struct ValidatedLaunchOwnership {
-    release: Option<Box<dyn FnOnce() -> Result<(), HookError> + Send>>,
+    release: Box<dyn FnOnce() -> Result<(), HookError> + Send>,
 }
 
 impl ValidatedLaunchOwnership {
     pub fn immediate() -> Self {
         Self {
-            release: Some(Box::new(|| Ok(()))),
+            release: Box::new(|| Ok(())),
         }
     }
 
     pub fn retained(release: impl FnOnce() -> Result<(), HookError> + Send + 'static) -> Self {
         Self {
-            release: Some(Box::new(release)),
+            release: Box::new(release),
         }
     }
 
-    pub fn release(mut self) -> Result<(), HookError> {
-        self.release
-            .take()
-            .expect("validated launch ownership release is single-use")()
+    pub fn release(self) -> Result<(), HookError> {
+        (self.release)()
     }
 }
 
