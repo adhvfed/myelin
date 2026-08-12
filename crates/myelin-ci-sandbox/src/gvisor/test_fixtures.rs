@@ -413,7 +413,6 @@ pub(super) struct FakeAttemptAuthority {
     fail_mint_phase: bool,
 }
 
-#[allow(dead_code)]
 impl FakeAttemptAuthority {
     pub(super) fn new(should_requeue: bool) -> Self {
         Self {
@@ -423,12 +422,14 @@ impl FakeAttemptAuthority {
             fail_mint_phase: false,
         }
     }
+    #[cfg(feature = "test-support")]
     pub(super) fn failing_begin_phase() -> Self {
         Self {
             fail_begin_phase: true,
             ..Self::new(true)
         }
     }
+    #[cfg(feature = "test-support")]
     pub(super) fn failing_mint_phase() -> Self {
         Self {
             fail_mint_phase: true,

@@ -42,7 +42,7 @@ impl Drop for NotStartedCapsuleGuard<'_> {
 }
 
 impl GvisorBackend {
-    #[allow(dead_code, clippy::too_many_arguments, clippy::result_large_err)]
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn launch_checkout_continuation(
         &self,
         spec: &JobSpec,
@@ -397,7 +397,7 @@ fn classify_bound_workload_failure(
 }
 
 impl GvisorBackend {
-    #[allow(dead_code, clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn launch_checkout_orchestrated_with(
         &self,
         spec: &JobSpec,

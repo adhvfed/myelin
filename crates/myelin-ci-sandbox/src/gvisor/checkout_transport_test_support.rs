@@ -1,6 +1,8 @@
 use super::git_wire_codec::pkt_line_encode;
 use super::*;
-use crate::{ImageRef, JobSpec, LaunchPermit, ResourceUsage, SandboxResult};
+use crate::{ImageRef, JobSpec, LaunchPermit};
+#[cfg(feature = "test-support")]
+use crate::{ResourceUsage, SandboxResult};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
@@ -80,6 +82,7 @@ impl RunscChild for FakeRunsc {
     }
 }
 
+#[cfg(feature = "test-support")]
 pub(crate) fn fake_git_wire_run(stdout: Vec<u8>, usage: ResourceUsage) -> ContainerRun {
     let bundle_dir = std::env::temp_dir().join(format!(
         "myelin-git-wire-test-support-bundle-{}-{}",

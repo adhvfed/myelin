@@ -612,6 +612,7 @@ impl PreparedCheckoutRuntime {
                 };
                 let evidence_root = match evidence_mode {
                     SubstitutedEvidenceMode::DerivedFromBind => bound_root,
+                    #[cfg(test)]
                     SubstitutedEvidenceMode::MismatchedRunscRoot => {
                         (bound_root.0 ^ 0xDEAD_BEEF, bound_root.1 ^ 0x0F0F)
                     }

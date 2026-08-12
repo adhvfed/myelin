@@ -252,6 +252,14 @@ fn drive_checkout_cycle_with_substituted_runsc(root: &std::path::Path) {
         "the checked Hop B sentinel write must succeed"
     );
     assert!(
+        observation.used_after_hopb >= sentinel.len() as u64,
+        "the post-checkout usage checkpoint must include the materialized sentinel"
+    );
+    assert_eq!(
+        observation.used_at_workload_checkpoint, observation.used_after_hopb,
+        "the workload checkpoint must observe the same materialized workspace bytes"
+    );
+    assert!(
         observation.mount_source_matched_workspace,
         "the retained OCI mount source must equal the capsule workspace host path"
     );

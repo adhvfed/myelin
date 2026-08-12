@@ -145,6 +145,5 @@ mod deterministic_substrate;
 pub(crate) use deterministic_substrate::*;
 
 #[cfg(any(test, feature = "test-support"))]
-#[allow(dead_code)]
 #[allow(private_interfaces)]
 pub mod checkout_transport_test_support;

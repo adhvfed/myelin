@@ -3,7 +3,6 @@ use crate::SandboxResult;
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct SubstitutedCheckoutObservation {
     pub(crate) hopb_write_ok: bool,
     pub(crate) used_after_hopb: u64,
@@ -159,9 +158,9 @@ fn acquire_deterministic_checkout_capsule(
 
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum SubstitutedEvidenceMode {
     DerivedFromBind,
+    #[cfg(test)]
     MismatchedRunscRoot,
 }
 
@@ -410,9 +409,8 @@ pub(crate) fn run_substituted_checkout_success(
     )
 }
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 #[allow(clippy::type_complexity)]
-#[allow(dead_code)]
 pub(crate) fn run_substituted_checkout_mismatched_evidence(
     root: &std::path::Path,
     sentinel_name: &str,
