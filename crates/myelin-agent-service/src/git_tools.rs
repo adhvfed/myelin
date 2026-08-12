@@ -196,7 +196,7 @@ mod tests {
         assert_eq!(
             mcp_defs
                 .iter()
-                .find(|d| d.name == "git.merge")
+                .find(|definition| definition.canonical_name() == "git.merge")
                 .unwrap()
                 .required_caps,
             git_merge_required_caps()
@@ -204,7 +204,7 @@ mod tests {
         assert_eq!(
             mcp_defs
                 .iter()
-                .find(|d| d.name == "git.open_pr")
+                .find(|definition| definition.canonical_name() == "git.open_pr")
                 .unwrap()
                 .required_caps,
             open_pr_required_caps()

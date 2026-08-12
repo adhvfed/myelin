@@ -453,7 +453,7 @@ fn flag_value(args: &[&str], flag: &str) -> Option<String> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AgentToolDef {
-    pub name: &'static str,
+    local_name: &'static str,
     pub input_schema: &'static str,
     pub requires_approval: bool,
     pub required_caps: &'static [&'static str],
@@ -461,14 +461,14 @@ pub struct AgentToolDef {
 }
 
 impl AgentToolDef {
+    pub fn canonical_name(&self) -> String {
+        format!("git.{}", self.local_name)
+    }
+
     pub fn to_tool_def(self) -> myelin_agent::ToolDef {
-        let (subsystem, name) = self
-            .name
-            .split_once('.')
-            .expect("the frozen Git agent catalogue uses dotted names");
         myelin_agent::ToolDef {
-            name: myelin_agent::ToolName(name.to_string()),
-            subsystem: subsystem.to_string(),
+            name: myelin_agent::ToolName(self.local_name.to_string()),
+            subsystem: "git".to_string(),
             version: 1,
             input_schema: self.input_schema.into(),
             required_caps: self
@@ -487,35 +487,35 @@ impl AgentToolDef {
 pub fn agent_tools() -> Vec<AgentToolDef> {
     vec![
         AgentToolDef {
-            name: "git.merge",
+            local_name: "merge",
             input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1}},"additionalProperties":false}"#,
             requires_approval: true,
             required_caps: &["pull_request.merge"],
             handler: Handler::MergeGate,
         },
         AgentToolDef {
-            name: "git.open_pr",
+            local_name: "open_pr",
             input_schema: r#"{"type":"object","required":["repo","title"],"properties":{"repo":{"type":"string","description":"the target repository slug; tenant and region come from the verified run token"},"title":{"type":"string"},"head_ref":{"type":"string"},"base_ref":{"type":"string"},"head_repo":{"type":"string"},"head_oid":{"type":"string"},"body_md":{"type":"string"},"draft":{"type":"boolean"},"reviewers":{"type":"array","items":{"type":"string"},"maxItems":100}},"additionalProperties":false}"#,
             requires_approval: false,
             required_caps: &["repo.push"],
             handler: Handler::Lifecycle,
         },
         AgentToolDef {
-            name: "git.write_file",
+            local_name: "write_file",
             input_schema: r#"{"type":"object","required":["repo","ref","path","contents","base_oid"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"ref":{"type":"string","description":"the branch to update or create"},"path":{"type":"string","minLength":1,"maxLength":4096},"contents":{"type":"string","maxLength":1048576},"base_oid":{"type":"string","description":"the blob OID read before editing; use an empty string only when the file does not exist"},"start_ref":{"type":"string","description":"the existing branch used as the first parent when creating ref"}},"additionalProperties":false}"#,
             requires_approval: false,
             required_caps: &["repo.push"],
             handler: Handler::ReceivePack,
         },
         AgentToolDef {
-            name: "git.submit_review",
+            local_name: "submit_review",
             input_schema: r#"{"type":"object","required":["repo","number","verdict"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1},"verdict":{"type":"string","enum":["approve","request_changes","comment"]}},"additionalProperties":false}"#,
             requires_approval: false,
             required_caps: &["pull_request.review"],
             handler: Handler::Lifecycle,
         },
         AgentToolDef {
-            name: "git.endorse_fork_ci",
+            local_name: "endorse_fork_ci",
             input_schema: r#"{"type":"object","required":["repo","number"],"properties":{"repo":{"type":"string","description":"the repository slug; tenant and region come from the verified run token"},"number":{"type":"integer","minimum":1},"contexts":{"type":"array","items":{"type":"string"}}},"additionalProperties":false}"#,
             requires_approval: false,
             required_caps: &["repo.approve_untrusted_ci"],

@@ -423,23 +423,29 @@ fn cli_is_loud_on_unknown_and_missing() {
 #[test]
 fn agent_tool_requires_approval_defaults_are_frozen() {
     let tools = agent_tools();
-    let merge = tools.iter().find(|t| t.name == "git.merge").unwrap();
+    let merge = tools
+        .iter()
+        .find(|tool| tool.canonical_name() == "git.merge")
+        .unwrap();
     assert!(
         merge.requires_approval,
         "git.merge MUST be HITL-gated (the only consequential git gate)"
     );
     assert_eq!(merge.handler, Handler::MergeGate);
 
-    let open_pr = tools.iter().find(|t| t.name == "git.open_pr").unwrap();
+    let open_pr = tools
+        .iter()
+        .find(|tool| tool.canonical_name() == "git.open_pr")
+        .unwrap();
     assert!(
         !open_pr.requires_approval,
         "open_pr is reversible → not HITL-gated"
     );
 
-    let gated: Vec<&str> = tools
+    let gated: Vec<String> = tools
         .iter()
         .filter(|t| t.requires_approval)
-        .map(|t| t.name)
+        .map(AgentToolDef::canonical_name)
         .collect();
     assert_eq!(
         gated,
@@ -468,7 +474,7 @@ fn agent_tool_schemas_describe_the_arguments_the_git_adapter_consumes() {
         .into_iter()
         .map(|tool| {
             (
-                tool.name,
+                tool.canonical_name(),
                 serde_json::from_str::<serde_json::Value>(tool.input_schema).unwrap(),
             )
         })

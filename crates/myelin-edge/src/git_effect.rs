@@ -76,7 +76,7 @@ impl GitEffectApi {
         }
         let def = myelin_git::api::agent_tools()
             .into_iter()
-            .find(|def| def.name == proposed_tool)
+            .find(|definition| definition.canonical_name() == proposed_tool)
             .ok_or_else(|| format!("unknown git tool `{proposed_tool}` at authority boundary"))?;
         if def.requires_approval && authority.approval != EffectApproval::HumanApproved {
             return Err(format!(
