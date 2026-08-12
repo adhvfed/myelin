@@ -25,9 +25,9 @@ pub const CARGO_VENDOR_SMOKE_LOCK_SHA256: &str =
 pub const ENV_GVISOR_CARGO_VENDOR: &str = "MYELIN_GVISOR_CARGO_VENDOR";
 
 pub const CARGO_VENDOR_WORKSPACE_TREE_SHA256: &str =
-    "af389585cc324121463feb8d1bd79779069e43d8656e09b628367e3528388a8b";
+    "609f58f8ffd2caa8191905c7168b9bb5b72705fc34fadebf0d11672d5fa2a992";
 pub const CARGO_VENDOR_WORKSPACE_LOCK_SHA256: &str =
-    "efcfbc27c6dc3d89118ef0b7317ffdaa06c6d3fd6654c64271d408ba0d567644";
+    "69daa225836d2b848846bbfce82f73fa5418f3594e5fa5be765ad0b55d138ce9";
 pub const ENV_GVISOR_CARGO_VENDOR_WORKSPACE: &str = "MYELIN_GVISOR_CARGO_VENDOR_WORKSPACE";
 
 pub fn cargo_vendor_smoke_reference() -> String {
@@ -146,16 +146,13 @@ impl VerifiedCargoVendor {
             ));
         }
 
-        let actual = GvisorAssetRegistry::verify_asset_tree(
-            fd_bound_root,
-            self.expected_owner_uid,
-        )
-        .map_err(|error| {
-            format!(
-                "could not re-verify fd-bound Cargo vendor asset {} before spawn: {error}",
-                self.path.display()
-            )
-        })?;
+        let actual = GvisorAssetRegistry::verify_asset_tree(fd_bound_root, self.expected_owner_uid)
+            .map_err(|error| {
+                format!(
+                    "could not re-verify fd-bound Cargo vendor asset {} before spawn: {error}",
+                    self.path.display()
+                )
+            })?;
         if actual != self.digest_hex {
             return Err(format!(
                 "Cargo vendor asset {} drifted before spawn: expected canonical-tree sha256:{}, computed sha256:{actual}",
@@ -183,20 +180,33 @@ impl VerifiedRootfs {
 
 #[derive(Debug)]
 pub enum AssetRegistryError {
-    UnknownImage { reference: String },
-    DuplicateReference { reference: String },
+    UnknownImage {
+        reference: String,
+    },
+    DuplicateReference {
+        reference: String,
+    },
     UnsupportedDigestAlgorithm {
         reference: String,
         algorithm: String,
     },
-    InvalidRootfsPath { rootfs: PathBuf, reason: String },
-    InvalidWorkspaceMountpoint { rootfs: PathBuf, reason: String },
+    InvalidRootfsPath {
+        rootfs: PathBuf,
+        reason: String,
+    },
+    InvalidWorkspaceMountpoint {
+        rootfs: PathBuf,
+        reason: String,
+    },
     DigestMismatch {
         reference: String,
         expected: String,
         actual: String,
     },
-    Hashing { rootfs: PathBuf, reason: String },
+    Hashing {
+        rootfs: PathBuf,
+        reason: String,
+    },
     GroupOrWorldWritable {
         rootfs: PathBuf,
         path: PathBuf,
@@ -208,7 +218,10 @@ pub enum AssetRegistryError {
         expected_uid: u32,
         actual_uid: u32,
     },
-    InvalidCargoVendor { root: PathBuf, reason: String },
+    InvalidCargoVendor {
+        root: PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for AssetRegistryError {
@@ -466,11 +479,15 @@ impl GvisorAssetRegistry {
                 .map_err(|error| invalid(format!("could not read {}: {error}", dir.display())))?;
             for entry in entries {
                 let entry = entry.map_err(|error| {
-                    invalid(format!("could not read an entry under {}: {error}", dir.display()))
+                    invalid(format!(
+                        "could not read an entry under {}: {error}",
+                        dir.display()
+                    ))
                 })?;
                 let path = entry.path();
-                let metadata = std::fs::symlink_metadata(&path)
-                    .map_err(|error| invalid(format!("could not stat {}: {error}", path.display())))?;
+                let metadata = std::fs::symlink_metadata(&path).map_err(|error| {
+                    invalid(format!("could not stat {}: {error}", path.display()))
+                })?;
                 let file_type = metadata.file_type();
                 if file_type.is_symlink() {
                     continue;
@@ -738,8 +755,10 @@ mod tests {
         let fixture = Fixture::new("accepted-symlink", b"real content");
         std::os::unix::fs::symlink("payload", fixture.dir.join("link")).unwrap();
         let digest = canonical_tar::canonical_tree_sha256_hex(&fixture.dir).unwrap();
-        let image =
-            ImageRef::pinned(format!("test.local/accepted-symlink-rootfs@sha256:{digest}")).unwrap();
+        let image = ImageRef::pinned(format!(
+            "test.local/accepted-symlink-rootfs@sha256:{digest}"
+        ))
+        .unwrap();
         GvisorAssetRegistry::from_bindings(vec![binding(image, &fixture.dir)])
             .expect("a 0o777 symlink must not refuse asset-registry construction");
     }
@@ -949,10 +968,7 @@ mod tests {
     #[test]
     fn unsupported_digest_algorithm_refuses_construction() {
         let fixture = Fixture::new("algo", b"irrelevant - never reaches the hasher");
-        let sha384_reference = format!(
-            "test.local/algo-rootfs@sha384:{}",
-            "a".repeat(96)
-        );
+        let sha384_reference = format!("test.local/algo-rootfs@sha384:{}", "a".repeat(96));
         let sha384_image = ImageRef::pinned(&sha384_reference).unwrap();
         assert!(
             sha384_image.digest_pinned(),
@@ -1067,8 +1083,10 @@ mod tests {
         let offending = root.join("vendor/itoa-1.0.15/lib.rs");
         fs::set_permissions(&offending, fs::Permissions::from_mode(0o640)).unwrap();
         let digest = canonical_tar::canonical_tree_sha256_hex(&root).unwrap();
-        let reference =
-            ImageRef::pinned(format!("test.local/cargo-vendor-nonreadable@sha256:{digest}")).unwrap();
+        let reference = ImageRef::pinned(format!(
+            "test.local/cargo-vendor-nonreadable@sha256:{digest}"
+        ))
+        .unwrap();
         let err = GvisorAssetRegistry::from_bindings_with_cargo_vendor(
             Vec::new(),
             vec![cargo_vendor_binding(reference, &root, &lock_sha256)],
