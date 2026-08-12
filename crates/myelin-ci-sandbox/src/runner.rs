@@ -816,9 +816,13 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                     message,
                 });
             }
-            outcome @ crate::SandboxCycleOutcome::PreparationTerminal { .. } => {
+            crate::SandboxCycleOutcome::PreparationTerminal {
+                claim,
+                disposition,
+                diagnostic,
+            } => {
                 if let Some(error) = stream_failure {
-                    return self.retry_preparation_after_log_failure(&job, &outcome, error);
+                    return self.retry_preparation_after_log_failure(&job, &claim, error);
                 }
                 if let Err(error) =
                     self.firehose
@@ -826,33 +830,23 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
                 {
                     return self.retry_preparation_after_log_failure(
                         &job,
-                        &outcome,
+                        &claim,
                         format!("durable log finish failed: {error}"),
                     );
                 }
-                return match self
-                    .report_preparation_outcome(&outcome)
-                    .map_err(RunnerError::ReportFailed)?
-                {
-                    PreparationOutcomeDispatch::Terminalized(signal_outcome) => {
-                        let diagnostic = match outcome {
-                            crate::SandboxCycleOutcome::PreparationTerminal {
-                                diagnostic, ..
-                            } => diagnostic,
-                            _ => unreachable!("the matched outcome is preparation-terminal"),
-                        };
-                        Ok(RunnerCycleOutcome::PreparationTerminal {
-                            job_id: job.job_id,
-                            run_id: job.run_id,
-                            signal_outcome,
-                            diagnostic,
-                        })
-                    }
-                    _ => unreachable!("a preparation-terminal outcome has one reporter route"),
-                };
+                let signal_outcome = self
+                    .reporter
+                    .report_preparation_terminal(&claim, disposition, diagnostic.as_deref())
+                    .map_err(RunnerError::ReportFailed)?;
+                return Ok(RunnerCycleOutcome::PreparationTerminal {
+                    job_id: job.job_id,
+                    run_id: job.run_id,
+                    signal_outcome,
+                    diagnostic,
+                });
             }
-            outcome @ crate::SandboxCycleOutcome::PreparationRetryable { .. } => {
-                return self.finish_preparation_retry(&job, &outcome);
+            crate::SandboxCycleOutcome::PreparationRetryable { claim, .. } => {
+                return self.finish_preparation_retry(&job, &claim);
             }
             crate::SandboxCycleOutcome::ReconciliationRequired {
                 phase,
@@ -945,13 +939,9 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
     fn retry_preparation_after_log_failure(
         &self,
         job: &QueuedJob,
-        terminal_outcome: &crate::SandboxCycleOutcome,
+        claim: &PreparationReportClaim,
         message: String,
     ) -> Result<RunnerCycleOutcome, RunnerError> {
-        let claim = match terminal_outcome {
-            crate::SandboxCycleOutcome::PreparationTerminal { claim, .. } => claim,
-            _ => unreachable!("only a preparation terminal can fail its terminal log flush"),
-        };
         match self.reporter.report_preparation_retry(claim) {
             Ok(PreparationRetryReport::Requeued) => Ok(RunnerCycleOutcome::PreparationRetryable {
                 job_id: job.job_id.clone(),
@@ -973,27 +963,23 @@ impl<'a, B: SandboxBackend, F: FirehoseSink, T: TerminalReporter, L: LeaseStore>
     fn finish_preparation_retry(
         &self,
         job: &QueuedJob,
-        outcome: &crate::SandboxCycleOutcome,
+        claim: &PreparationReportClaim,
     ) -> Result<RunnerCycleOutcome, RunnerError> {
         match self
-            .report_preparation_outcome(outcome)
+            .reporter
+            .report_preparation_retry(claim)
             .map_err(RunnerError::ReportFailed)?
         {
-            PreparationOutcomeDispatch::Retried(PreparationRetryReport::Requeued) => {
-                Ok(RunnerCycleOutcome::PreparationRetryable {
-                    job_id: job.job_id.clone(),
-                    report: PreparationRetryReport::Requeued,
-                })
-            }
-            PreparationOutcomeDispatch::Retried(PreparationRetryReport::NoOp) => {
-                Err(RunnerError::PreparationRoutingFailed {
-                    job_id: job.job_id.clone(),
-                    message:
-                        "preparation retry CAS returned no-op; claim state requires reconciliation"
-                            .into(),
-                })
-            }
-            _ => unreachable!("a preparation-retry outcome has one reporter route"),
+            PreparationRetryReport::Requeued => Ok(RunnerCycleOutcome::PreparationRetryable {
+                job_id: job.job_id.clone(),
+                report: PreparationRetryReport::Requeued,
+            }),
+            PreparationRetryReport::NoOp => Err(RunnerError::PreparationRoutingFailed {
+                job_id: job.job_id.clone(),
+                message:
+                    "preparation retry CAS returned no-op; claim state requires reconciliation"
+                        .into(),
+            }),
         }
     }
 
