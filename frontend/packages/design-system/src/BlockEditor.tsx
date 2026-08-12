@@ -11,6 +11,7 @@ export interface EditorBlock {
   id?: string;
   type: BlockType;
   markdown: string;
+  references?: string[];
   state?: "active" | "tombstoned";
 }
 
@@ -25,6 +26,8 @@ export interface BlockEditorProps {
   submitShortcut?: "enter" | "mod-enter";
   onEscape?: () => void;
   placeholder?: string;
+  referenceLabel?: (reference: string) => string;
+  referenceHref?: (reference: string) => string | undefined;
 }
 
 const TYPE_LABEL: Record<BlockType, string> = {
@@ -51,10 +54,31 @@ export function balanceInlineMarks(source: string): string {
 export function splitBlock(block: EditorBlock, offset: number): [EditorBlock, EditorBlock] {
   const before = balanceInlineMarks(block.markdown.slice(0, offset));
   const after = block.markdown.slice(offset);
+  const referencesBefore = block.markdown.slice(0, offset).split("\uFFFC").length - 1;
+  const references = block.references;
   return [
-    { ...block, markdown: before },
-    { type: block.type === "heading" ? "paragraph" : block.type, markdown: after },
+    {
+      ...block,
+      markdown: before,
+      ...(references === undefined ? {} : { references: references.slice(0, referencesBefore) }),
+    },
+    {
+      type: block.type === "heading" ? "paragraph" : block.type,
+      markdown: after,
+      ...(references === undefined ? {} : { references: references.slice(referencesBefore) }),
+    },
   ];
+}
+
+export function mergeBlocks(previous: EditorBlock, current: EditorBlock): EditorBlock {
+  const references = previous.references === undefined && current.references === undefined
+    ? undefined
+    : [...(previous.references ?? []), ...(current.references ?? [])];
+  return {
+    ...previous,
+    markdown: previous.markdown + current.markdown,
+    ...(references === undefined ? {} : { references }),
+  };
 }
 
 export function toggleInlineMark(source: string, start: number, end: number, mark: "**" | "__"): string {
@@ -105,6 +129,68 @@ function cleanEditableText(element: HTMLElement): string {
   return (element.innerText ?? element.textContent ?? "").replace(/\r/g, "").replace(/\n$/, "");
 }
 
+const REFERENCE_MARKER = "\uFFFC";
+const REFERENCE_SELECTOR = "[data-block-reference]";
+
+function blockSignature(block: EditorBlock, readOnly: boolean): string {
+  return JSON.stringify([block.markdown, block.references ?? null, readOnly]);
+}
+
+function renderBlock(
+  element: HTMLElement,
+  block: EditorBlock,
+  readOnly: boolean,
+  labelFor: (reference: string) => string,
+  hrefFor?: (reference: string) => string | undefined,
+): void {
+  const references = block.references ?? [];
+  const fragment = document.createDocumentFragment();
+  const parts = block.markdown.split(REFERENCE_MARKER);
+  parts.forEach((part, index) => {
+    if (part) fragment.append(document.createTextNode(part));
+    const reference = references[index];
+    if (index >= parts.length - 1 || reference === undefined) return;
+    const href = readOnly ? hrefFor?.(reference) : undefined;
+    const chip = href ? document.createElement("a") : document.createElement("span");
+    if (href && chip instanceof HTMLAnchorElement) chip.href = href;
+    chip.className = "block-editor-reference";
+    chip.dataset.blockReference = reference;
+    chip.dataset.label = labelFor(reference);
+    chip.title = reference;
+    chip.setAttribute("aria-label", `Reference: ${labelFor(reference)}`);
+    chip.contentEditable = "false";
+    chip.textContent = REFERENCE_MARKER;
+    fragment.append(chip);
+  });
+  element.replaceChildren(fragment);
+}
+
+function readBlock(element: HTMLElement): { markdown: string; references: string[] } {
+  const clone = element.cloneNode(true) as HTMLElement;
+  const references: string[] = [];
+
+  const text = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+  let node = text.nextNode();
+  while (node) {
+    if (!(node.parentElement?.closest(REFERENCE_SELECTOR))) {
+      node.textContent = node.textContent?.replaceAll(REFERENCE_MARKER, "") ?? "";
+    }
+    node = text.nextNode();
+  }
+
+  clone.querySelectorAll<HTMLElement>(REFERENCE_SELECTOR).forEach((chip) => {
+    const reference = chip.dataset.blockReference;
+    if (reference !== undefined) {
+      references.push(reference);
+      chip.replaceWith(document.createTextNode(REFERENCE_MARKER));
+    } else {
+      chip.remove();
+    }
+  });
+
+  return { markdown: cleanEditableText(clone), references };
+}
+
 export function BlockEditor(props: BlockEditorProps): JSX.Element {
   const [slashAt, setSlashAt] = createSignal<number | null>(null);
   const [composing, setComposing] = createSignal(false);
@@ -141,7 +227,7 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
     const caret = previous.markdown.length;
     props.onChange([
       ...props.value.slice(0, index - 1).map((item) => ({ ...item })),
-      { ...previous, markdown: previous.markdown + current.markdown },
+      mergeBlocks(previous, current),
       ...props.value.slice(index + 1).map((item) => ({ ...item })),
     ]);
     focusAt(index - 1, caret);
@@ -184,12 +270,14 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
   };
 
   createEffect(() => {
+    const readOnly = Boolean(props.readOnly);
     props.value.forEach((block, index) => {
       const element = elements.get(index);
-      if (element && element.textContent !== block.markdown &&
-          (document.activeElement !== element || lastEmitted.get(index) !== block.markdown)) {
-        element.textContent = block.markdown;
-        lastEmitted.set(index, block.markdown);
+      const signature = blockSignature(block, readOnly);
+      if (element && (element.textContent !== block.markdown || lastEmitted.get(index) !== signature) &&
+          (document.activeElement !== element || lastEmitted.get(index) !== signature)) {
+        renderBlock(element, block, readOnly, props.referenceLabel ?? ((reference) => reference), props.referenceHref);
+        lastEmitted.set(index, signature);
       }
     });
   });
@@ -219,7 +307,14 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
               <div
                 ref={(element) => {
                   elements.set(index, element);
-                  if (element.textContent !== block().markdown) element.textContent = block().markdown;
+                  renderBlock(
+                    element,
+                    block(),
+                    Boolean(props.readOnly),
+                    props.referenceLabel ?? ((reference) => reference),
+                    props.referenceHref,
+                  );
+                  lastEmitted.set(index, blockSignature(block(), Boolean(props.readOnly)));
                   if (props.focusOnMount && index === 0) queueMicrotask(() => element.focus());
                 }}
                 class="block-editor-input"
@@ -235,14 +330,24 @@ export function BlockEditor(props: BlockEditorProps): JSX.Element {
                 onCompositionStart={() => setComposing(true)}
                 onCompositionEnd={(event) => {
                   setComposing(false);
-                  update(index, { markdown: cleanEditableText(event.currentTarget) });
+                  const value = readBlock(event.currentTarget);
+                  const patch = block().references === undefined && value.references.length === 0
+                    ? { markdown: value.markdown }
+                    : value;
+                  const next = { ...block(), ...patch };
+                  lastEmitted.set(index, blockSignature(next, Boolean(props.readOnly)));
+                  update(index, patch);
                 }}
                 onInput={(event) => {
                   if (composing()) return;
-                  const markdown = cleanEditableText(event.currentTarget);
-                  lastEmitted.set(index, markdown);
-                  update(index, { markdown });
-                  setSlashAt(markdown === "/" ? index : null);
+                  const value = readBlock(event.currentTarget);
+                  const patch = block().references === undefined && value.references.length === 0
+                    ? { markdown: value.markdown }
+                    : value;
+                  const next = { ...block(), ...patch };
+                  lastEmitted.set(index, blockSignature(next, Boolean(props.readOnly)));
+                  update(index, patch);
+                  setSlashAt(value.markdown === "/" ? index : null);
                 }}
                 onKeyDown={(event) => keyDown(event, index)}
               />

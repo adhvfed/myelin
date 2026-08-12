@@ -3,6 +3,9 @@
 .block-editor-input { min-height: 1.75rem; padding: var(--space-1) var(--space-2); border-radius: var(--radius-1); outline: none; white-space: pre-wrap; overflow-wrap: anywhere; line-height: var(--lh-body); }
 .block-editor-input:focus { background: var(--surface-hover); box-shadow: inset 2px 0 0 var(--accent); }
 .block-editor-input:empty::before { content: attr(data-placeholder); color: var(--text-subtle); pointer-events: none; }
+.block-editor-reference { display: inline-flex; align-items: center; min-height: 1.5rem; margin-inline: .15rem; padding-inline: var(--space-2); border: var(--hairline) solid var(--border-strong); border-radius: 999px; background: var(--surface-selected); color: var(--text-primary); font-size: 0; font-weight: var(--weight-medium); line-height: 1; vertical-align: middle; white-space: nowrap; }
+.block-editor-reference::after { content: attr(data-label); font-size: var(--fs-caption); }
+a.block-editor-reference:hover { border-color: var(--accent); color: var(--accent); }
 .block-editor-row[data-block-type="heading"] .block-editor-input { font-size: var(--fs-h2); font-weight: var(--weight-semibold); line-height: 1.25; }
 .block-editor-row[data-block-type="bullet_list"] .block-editor-input::before { content: "• "; color: var(--text-muted); }
 .block-editor-row[data-block-type="ordered_list"] .block-editor-input::before { content: "1. "; color: var(--text-muted); }
