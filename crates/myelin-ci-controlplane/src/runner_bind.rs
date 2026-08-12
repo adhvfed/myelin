@@ -16,58 +16,46 @@ use myelin_ci_sandbox::{
 use myelin_storage::s3blob::S3BlobStore;
 use myelin_tenancy::{Region, TenantId};
 
-pub fn production_gvisor_registry() -> Arc<GvisorAssetRegistry> {
-    Arc::new(
-        GvisorAssetRegistry::from_bindings_with_cargo_vendor(
-            vec![
-                RootfsAssetBinding {
-                    image: ImageRef::pinned(format!(
-                        "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"
-                    ))
-                    .expect("the founder-pipeline image reference is a well-formed digest pin"),
-                    rootfs: resolved_gvisor_rootfs(),
-                },
-                RootfsAssetBinding {
-                    image: ImageRef::pinned(format!(
-                        "myelin.local/linux-rust-v1-rootfs@sha256:{LINUX_RUST_V1_ROOTFS_SHA256}"
-                    ))
-                    .expect("the linux-rust-v1 image reference is a well-formed digest pin"),
-                    rootfs: resolved_gvisor_rust_rootfs(),
-                },
-                RootfsAssetBinding {
-                    image: ImageRef::pinned(format!(
-                        "myelin.local/git-v1-rootfs@sha256:{GVISOR_GIT_ROOTFS_SHA256}"
-                    ))
-                    .expect("the git rootfs image reference is a well-formed digest pin"),
-                    rootfs: verified_gvisor_git_rootfs().expect(
-                        "the git rootfs and every fixed OCI mountpoint must verify before runner startup",
-                    ),
-                },
-            ],
-            vec![
-                CargoVendorAssetBinding {
-                    reference: ImageRef::pinned(format!(
-                        "myelin.local/cargo-vendor-smoke-v1@sha256:{CARGO_VENDOR_SMOKE_TREE_SHA256}"
-                    ))
-                    .expect("the Cargo vendor asset reference is a well-formed digest pin"),
-                    root: resolved_gvisor_cargo_vendor(),
-                    cargo_lock_sha256: CARGO_VENDOR_SMOKE_LOCK_SHA256.to_string(),
-                },
-                CargoVendorAssetBinding {
-                    reference: ImageRef::pinned(format!(
-                        "myelin.local/cargo-vendor-workspace-v1@sha256:{CARGO_VENDOR_WORKSPACE_TREE_SHA256}"
-                    ))
-                    .expect("the workspace Cargo vendor asset reference is a well-formed digest pin"),
-                    root: resolved_gvisor_cargo_vendor_workspace(),
-                    cargo_lock_sha256: CARGO_VENDOR_WORKSPACE_LOCK_SHA256.to_string(),
-                },
-            ],
-        )
-        .expect(
-            "production runner assets must verify at startup - a runner that cannot prove its own \
-             configured assets must refuse to start rather than launch jobs it cannot verify",
-        ),
+pub fn production_gvisor_registry() -> Result<Arc<GvisorAssetRegistry>, String> {
+    let image = |name: &str, digest: &str| {
+        ImageRef::pinned(format!("myelin.local/{name}@sha256:{digest}"))
+            .map_err(|error| format!("invalid production asset reference `{name}`: {error}"))
+    };
+    let git_rootfs = verified_gvisor_git_rootfs()
+        .map_err(|error| format!("verify production git rootfs: {error}"))?;
+    GvisorAssetRegistry::from_bindings_with_cargo_vendor(
+        vec![
+            RootfsAssetBinding {
+                image: image("linux-small-v1-rootfs", LINUX_SMALL_V1_ROOTFS_SHA256)?,
+                rootfs: resolved_gvisor_rootfs(),
+            },
+            RootfsAssetBinding {
+                image: image("linux-rust-v1-rootfs", LINUX_RUST_V1_ROOTFS_SHA256)?,
+                rootfs: resolved_gvisor_rust_rootfs(),
+            },
+            RootfsAssetBinding {
+                image: image("git-v1-rootfs", GVISOR_GIT_ROOTFS_SHA256)?,
+                rootfs: git_rootfs,
+            },
+        ],
+        vec![
+            CargoVendorAssetBinding {
+                reference: image("cargo-vendor-smoke-v1", CARGO_VENDOR_SMOKE_TREE_SHA256)?,
+                root: resolved_gvisor_cargo_vendor(),
+                cargo_lock_sha256: CARGO_VENDOR_SMOKE_LOCK_SHA256.to_string(),
+            },
+            CargoVendorAssetBinding {
+                reference: image(
+                    "cargo-vendor-workspace-v1",
+                    CARGO_VENDOR_WORKSPACE_TREE_SHA256,
+                )?,
+                root: resolved_gvisor_cargo_vendor_workspace(),
+                cargo_lock_sha256: CARGO_VENDOR_WORKSPACE_LOCK_SHA256.to_string(),
+            },
+        ],
     )
+    .map(Arc::new)
+    .map_err(|error| format!("verify production runner asset registry: {error}"))
 }
 
 use crate::ci_claim_token_issuer::LockedManifestCiJobTokenIssuer;
@@ -351,21 +339,6 @@ impl CiRunnerLoop {
         self
     }
 
-    pub fn spawn(self) -> std::thread::JoinHandle<CiRunnerLoopExit> {
-        std::thread::Builder::new()
-            .name("ci-runner".into())
-            .spawn(move || self.run())
-            .expect("spawn the ci-runner thread")
-    }
-
-    pub fn spawn_until_shutdown(
-        self,
-        shutdown: tokio::sync::watch::Receiver<bool>,
-    ) -> std::thread::JoinHandle<CiRunnerLoopExit> {
-        self.try_spawn_until_shutdown(shutdown)
-            .expect("spawn the shutdown-aware ci-runner thread")
-    }
-
     pub(crate) fn try_spawn_until_shutdown(
         self,
         shutdown: tokio::sync::watch::Receiver<bool>,
@@ -413,11 +386,18 @@ impl CiRunnerLoop {
                 eprintln!("ci-runner[{worker_id}]: GVISOR SECURITY INCIDENT: {message}");
             })
         };
-        let backend = match GvisorBackend::try_new(
-            production_gvisor_registry(),
-            gvisor_workspace_config,
-            incident_sink,
-        ) {
+        let registry = match production_gvisor_registry() {
+            Ok(registry) => registry,
+            Err(error) => {
+                eprintln!(
+                    "ci-runner[{worker_id}]: sandbox asset initialization FAILED (fail-closed, \
+                     no claim attempted): {error}"
+                );
+                return CiRunnerLoopExit::SandboxBackendInitializationFailed;
+            }
+        };
+        let backend = match GvisorBackend::try_new(registry, gvisor_workspace_config, incident_sink)
+        {
             Ok(backend) => backend.with_checkout_config(gvisor_checkout_config),
             Err(error) => {
                 eprintln!(
@@ -990,7 +970,7 @@ mod production_gvisor_registry_tests {
             return;
         }
 
-        let registry = production_gvisor_registry();
+        let registry = production_gvisor_registry().expect("production registry verifies");
 
         let small_image = ImageRef::pinned(format!(
             "myelin.local/linux-small-v1-rootfs@sha256:{LINUX_SMALL_V1_ROOTFS_SHA256}"

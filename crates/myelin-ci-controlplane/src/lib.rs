@@ -136,6 +136,7 @@ pub mod metering;
 pub mod migrations;
 pub mod permanent_gates;
 pub mod rebac_fragment;
+#[cfg(any(test, feature = "test-support"))]
 pub mod residency_drill;
 pub mod runner_bind;
 pub mod scheduler;
@@ -412,6 +413,7 @@ pub use floor_followons::{
 
 pub use surge::{CiDispatchShed, CiSurgeControls, CiSurgeGate, StarvationHistogram};
 
+#[cfg(any(test, feature = "test-support"))]
 pub use residency_drill::{
     drive_ci_d10_self_hosted_boundary, drive_ci_r3_residency, CellJob, CiD10Report, CiR3Report,
     CiStoreResidency,

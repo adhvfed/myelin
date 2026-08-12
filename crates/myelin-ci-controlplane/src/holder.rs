@@ -82,8 +82,14 @@ impl RestrictionFlag {
         RestrictionFlag::default()
     }
 
+    fn restricted(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.restricted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn set(&self, subject: &str, on: bool) {
-        let mut g = self.restricted.lock().expect("restriction flag poisoned");
+        let mut g = self.restricted();
         if on {
             g.insert(subject.to_string());
         } else {
@@ -92,10 +98,7 @@ impl RestrictionFlag {
     }
 
     pub fn is_restricted(&self, subject: &str) -> bool {
-        self.restricted
-            .lock()
-            .expect("restriction flag poisoned")
-            .contains(subject)
+        self.restricted().contains(subject)
     }
 }
 

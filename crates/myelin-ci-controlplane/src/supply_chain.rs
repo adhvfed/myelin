@@ -113,14 +113,7 @@ fn hex_encode(bytes: &[u8; 32]) -> String {
 }
 
 fn blake3_raw(bytes: &[u8]) -> [u8; 32] {
-    let hex = ContentHash::blake3(bytes).digest_hex;
-    let mut out = [0u8; 32];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
-            .expect("ContentHash::blake3 yields valid 64-hex");
-        *slot = byte;
-    }
-    out
+    *blake3::hash(bytes).as_bytes()
 }
 
 fn leaf_hash(entry_digest: &[u8; 32]) -> [u8; 32] {
