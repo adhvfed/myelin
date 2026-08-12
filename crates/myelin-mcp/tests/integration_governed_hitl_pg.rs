@@ -14,7 +14,6 @@ use myelin_identity_service::machine_auth::{Authority, MachineKind};
 use myelin_identity_service::mint::{RunTokenMinter, StructuralTokenSigner};
 use myelin_identity_service::revocation::RevocationStore;
 use myelin_identity_service::ResolvedDelegationPolicy;
-use myelin_mcp::governance::mcp_effect_key;
 use myelin_mcp::{
     CallOutcome, GateApproverPolicy, GovernedRouter, OutboxGovernanceAudit, RunPrincipal,
     ToolRegistry,
@@ -201,7 +200,11 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
     let expiry_run = "run:expiry-proof";
     let expiry_agent = "agent:mcp-expiry";
     let expiry_args = serde_json::json!({"repo":"alpha","number":99});
-    let expiry_effect = mcp_effect_key("git.merge", &expiry_args);
+    let expiry_effect = myelin_mcp::governance::mcp_effect_key_for_call(
+        "git.merge",
+        &expiry_args,
+        "expiry-proof-merge-99",
+    );
     let expiry_scope = TenantScope::from_verified_token(
         &principal("human:trigger", &tenant, &region, true),
         Region(region.clone()),

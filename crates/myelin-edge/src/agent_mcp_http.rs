@@ -471,6 +471,7 @@ impl Handler for AgentMcpHandler {
             scope: ctx.scope.clone(),
             principals: self.services.authority.principals.clone(),
             repos: self.services.resources.git.repo_authorizer().clone(),
+            issues: self.services.resources.issues.clone(),
         });
         let router = GovernedRouter::with_issued_run(
             self.services.authority.run_tokens.clone(),
@@ -675,6 +676,7 @@ struct CreatorApproverPolicy {
     scope: myelin_storage::TenantScope,
     principals: PrincipalStore,
     repos: Arc<dyn RepoAuthorizer>,
+    issues: DurableIssueMutationApi,
 }
 
 impl GateApproverPolicy for CreatorApproverPolicy {
@@ -685,13 +687,6 @@ impl GateApproverPolicy for CreatorApproverPolicy {
     ) -> Result<Vec<PrincipalId>, String> {
         let contract = McpApprovalContract::for_tool(tool)
             .ok_or_else(|| format!("tool `{tool}` has no registered Edge approval policy"))?;
-        let repo = match contract {
-            McpApprovalContract::GitMerge => args
-                .get("repo")
-                .and_then(serde_json::Value::as_str)
-                .filter(|repo| !repo.is_empty() && repo.len() <= 255)
-                .ok_or_else(|| "merge approval requires a bounded repository slug".to_string())?,
-        };
         let row = self
             .principals
             .try_get_principal(&self.scope, &self.creator_id)
@@ -709,12 +704,37 @@ impl GateApproverPolicy for CreatorApproverPolicy {
         );
         if !matches!(approver.kind, PrincipalKind::Human)
             || approver.status != PrincipalStatus::Active
-            || !self.repos.authorize_repo_permission(
-                &approver,
-                &RepoLoc::new(&approver.tenant.0, &approver.region.0, repo),
-                RepoPermission::ProtectedPush,
-            )
         {
+            return Ok(Vec::new());
+        }
+        let permitted = match contract {
+            McpApprovalContract::GitMerge => {
+                let repo = args
+                    .get("repo")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|repo| !repo.is_empty() && repo.len() <= 255)
+                    .ok_or_else(|| {
+                        "merge approval requires a bounded repository slug".to_string()
+                    })?;
+                self.repos.authorize_repo_permission(
+                    &approver,
+                    &RepoLoc::new(&approver.tenant.0, &approver.region.0, repo),
+                    RepoPermission::ProtectedPush,
+                )
+            }
+            McpApprovalContract::IssuesClose => {
+                let issue_ref = args
+                    .get("issue_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        "issue close approval requires a canonical issue_ref".to_string()
+                    })?;
+                self.issues
+                    .may_close_ref(&approver, issue_ref)
+                    .map_err(|error| format!("issue approver lookup unavailable: {error:?}"))?
+            }
+        };
+        if !permitted {
             return Ok(Vec::new());
         }
         Ok(vec![approver.principal_id])

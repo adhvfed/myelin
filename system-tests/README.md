@@ -52,7 +52,9 @@ The suite is intentionally organized around externally visible contracts:
 - `cli-authentication` approves two browser identities into named local contexts, switches between
   them without exposing either secret, configures and operates external and hosted agents plus
   event-driven automations without integration keys, binds native Git to exactly one profile,
-  refuses an expired session before transport, and removes both OS-backed credentials on logout.
+  carries an agent issue closure through a canonical human approval card and an exact lost-response
+  retry, refuses an expired session before transport, and removes both OS-backed credentials on
+  logout.
 - `automation-delegation` proves automation caveats are enforceable authority and that a
   short-lived agent can use its founder's repository visibility only through an audited MCP read,
   never by impersonating the founder at an ordinary product endpoint.

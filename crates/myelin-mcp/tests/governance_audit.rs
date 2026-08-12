@@ -245,6 +245,99 @@ fn issue_create_governance_has_a_durable_registered_taxonomy() {
 }
 
 #[test]
+fn issue_close_governance_records_the_whole_human_decision_lifecycle() {
+    let store = OutboxStore::new();
+    let audit = OutboxGovernanceAudit::new(store.clone(), Arc::new(MonotonicMinter::new()));
+    let actor = actor();
+    let scope = TenantScope::from_verified_token(&actor, actor.region.clone());
+    let run = RunId("run:issue-close".into());
+    let now = Timestamp("2026-07-18T00:00:00Z".into());
+    let gate_id = "hitl:issue-close";
+
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            target: GovernanceAuditTarget::Run,
+            tool: "issues.close",
+            jti: "jti:issue-close",
+            phase: AuditPhase::Attempt,
+            outcome: None,
+            now: &now,
+        })
+        .unwrap();
+    let gated = CallOutcome::Gated {
+        gate_id: gate_id.into(),
+        jti: "jti:issue-close".into(),
+    };
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            target: GovernanceAuditTarget::Run,
+            tool: "issues.close",
+            jti: "jti:issue-close",
+            phase: AuditPhase::Outcome,
+            outcome: Some(GovernanceAuditOutcome::Effect(&gated)),
+            now: &now,
+        })
+        .unwrap();
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            target: GovernanceAuditTarget::Gate(gate_id),
+            tool: "issues.close",
+            jti: "jti:issue-close",
+            phase: AuditPhase::Approved,
+            outcome: None,
+            now: &now,
+        })
+        .unwrap();
+    let applied = CallOutcome::Applied {
+        event_id: "issue.close:11111111-1111-1111-1111-111111111111".into(),
+        resource: None,
+        jti: "jti:issue-close".into(),
+    };
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            target: GovernanceAuditTarget::Run,
+            tool: "issues.close",
+            jti: "jti:issue-close",
+            phase: AuditPhase::Outcome,
+            outcome: Some(GovernanceAuditOutcome::Effect(&applied)),
+            now: &now,
+        })
+        .unwrap();
+
+    let rows = store.committed_rows();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.envelope.type_.0.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "issue.close.attempted",
+            "issue.close.gated",
+            "issue.close.approved",
+            "issue.close.applied",
+        ]
+    );
+    for row in rows {
+        assert!(
+            myelin_issues::events::ISSUE_CLOSE_GOVERNANCE_AUDIT_EVENT_TOKENS
+                .contains(&row.envelope.type_.0.as_str()),
+            "every Issue close decision event belongs to Issues' durable taxonomy"
+        );
+    }
+}
+
+#[test]
 fn knowledge_link_work_governance_has_a_durable_registered_taxonomy() {
     let store = OutboxStore::new();
     let audit = OutboxGovernanceAudit::new(store.clone(), Arc::new(MonotonicMinter::new()));

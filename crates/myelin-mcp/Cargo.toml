@@ -27,6 +27,7 @@ myelin-identity = { path = "../myelin-identity" }
 myelin-tenancy = { path = "../myelin-tenancy" }
 myelin-storage = { path = "../myelin-storage" }
 myelin-events = { path = "../myelin-events" }
+myelin-refs = { path = "../myelin-refs" }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 

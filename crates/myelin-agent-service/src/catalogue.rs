@@ -216,6 +216,7 @@ mod tests {
             "git.write_file",
             "ci.read_run",
             "ci.read_log",
+            "issues.close",
             "issues.list",
             "issues.view",
             "knowledge.list_pages",

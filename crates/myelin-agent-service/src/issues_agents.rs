@@ -104,11 +104,13 @@ pub fn assign_tool_def() -> ToolDef {
 }
 
 pub fn close_tool_def() -> ToolDef {
-    crud_tool_def(
+    let mut definition = crud_tool_def(
         CLOSE_TOOL,
         assign_required_caps(),
-        r#"{"type":"object","required":["issue"],"properties":{"issue":{"type":"string"},"reason":{"type":"string"}}}"#,
-    )
+        r#"{"type":"object","required":["issue_ref"],"properties":{"issue_ref":{"type":"string","pattern":"^myelin://[^/]+/issue/issue/[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$"}},"additionalProperties":false}"#,
+    );
+    definition.exposed_over_mcp = true;
+    definition
 }
 
 pub fn full_issues_tool_defs() -> Vec<ToolDef> {
@@ -322,8 +324,11 @@ mod tests {
             assert_eq!(d.version, ISSUES_TOOL_VERSION);
             assert_eq!(
                 d.exposed_over_mcp,
-                d.canonical_name() == "issues.create",
-                "only the implemented Issues create mutation is MCP-exposed"
+                matches!(
+                    d.canonical_name().as_str(),
+                    "issues.create" | "issues.close"
+                ),
+                "only the implemented Issues mutations are MCP-exposed"
             );
         }
     }
@@ -342,6 +347,21 @@ mod tests {
         assert_eq!(schema["properties"]["title"]["maxLength"], 512);
         assert!(schema["properties"].get("project").is_none());
         assert!(schema["properties"].get("type").is_none());
+    }
+
+    #[test]
+    fn close_accepts_one_canonical_issue_reference_and_requires_approval() {
+        let definition = close_tool_def();
+        let schema: serde_json::Value = serde_json::from_str(&definition.input_schema).unwrap();
+        assert_eq!(definition.canonical_name(), "issues.close");
+        assert!(definition.exposed_over_mcp);
+        assert!(definition.requires_approval);
+        assert_eq!(schema["required"], serde_json::json!(["issue_ref"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(
+            schema["properties"]["issue_ref"]["pattern"],
+            "^myelin://[^/]+/issue/issue/[A-Z][A-Z0-9]{1,9}-[1-9][0-9]*$"
+        );
     }
 
     #[test]

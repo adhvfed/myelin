@@ -72,6 +72,7 @@ async function askAgentToAct(
   tool: string,
   arguments_: JsonRecord,
   idempotencyKey: string = `system-${tool}-${randomUUID()}`,
+  approvalGateId?: string,
 ): Promise<JsonRecord> {
   const response = await systemClient.json(`/v1/agent-runs/${run.run.id}/mcp`, {
     method: "POST",
@@ -82,6 +83,7 @@ async function askAgentToAct(
       params: {
         name: tool,
         arguments: arguments_,
+        ...(approvalGateId === undefined ? {} : { approval: { gateId: approvalGateId } }),
         _meta: { "com.myelin/idempotencyKey": idempotencyKey },
       },
     },
@@ -99,6 +101,38 @@ async function askAgentToAct(
   const receipt = record(result.structuredContent, `${tool} MCP structured receipt`);
   expect(receipt).toMatchObject({ event_id: metadata.eventId });
   return receipt;
+}
+
+async function askAgentToRequestApproval(
+  run: AgentRunEnvelope,
+  id: number,
+  tool: string,
+  arguments_: JsonRecord,
+  idempotencyKey: string,
+): Promise<string> {
+  const response = await systemClient.json(`/v1/agent-runs/${run.run.id}/mcp`, {
+    method: "POST",
+    body: {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        name: tool,
+        arguments: arguments_,
+        _meta: { "com.myelin/idempotencyKey": idempotencyKey },
+      },
+    },
+    token: run.credential.token,
+    tokenScheme: "agent",
+    expectedStatus: 200,
+  });
+  const result = record(response.body.result, `${tool} approval result`);
+  expect(result).toMatchObject({
+    isError: false,
+    _meta: { tool, gateId: expect.any(String) },
+  });
+  expect(result.structuredContent).toBeUndefined();
+  return string(record(result._meta, `${tool} approval metadata`).gateId, `${tool} gate id`);
 }
 
 async function askAgentToBeDenied(
@@ -492,6 +526,7 @@ describe("the CLI authentication journey", () => {
           "git.merge",
           "ci.read_run",
           "ci.read_log",
+          "issues.close",
           "issues.create",
           "issues.list",
           "issues.view",
@@ -530,6 +565,8 @@ describe("the CLI authentication journey", () => {
         "git.read_file",
         "--tool",
         "git.search_code",
+        "--tool",
+        "issues.close",
         "--tool",
         "issues.create",
         "--tool",
@@ -584,6 +621,7 @@ describe("the CLI authentication journey", () => {
             { name: "git.read_file", version: 1 },
             { name: "git.search_code", version: 1 },
             { name: "git.write_file", version: 1 },
+            { name: "issues.close", version: 1 },
             { name: "issues.create", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
@@ -597,6 +635,7 @@ describe("the CLI authentication journey", () => {
             "chat.post",
             "edge.identity.read",
             "issue.create",
+            "issue.transition",
             "issue.view",
             "knowledge.edit",
             "knowledge.read",
@@ -622,6 +661,7 @@ describe("the CLI authentication journey", () => {
           "git.list_repositories",
           "git.read_file",
           "git.search_code",
+          "issues.close",
           "issues.create",
           "issues.list",
           "issues.view",
@@ -661,6 +701,8 @@ describe("the CLI authentication journey", () => {
         "git.read_file",
         "--tool",
         "git.search_code",
+        "--tool",
+        "issues.close",
         "--tool",
         "issues.create",
         "--tool",
@@ -920,6 +962,7 @@ describe("the CLI authentication journey", () => {
             { name: "git.read_file", version: 1 },
             { name: "git.search_code", version: 1 },
             { name: "git.write_file", version: 1 },
+            { name: "issues.close", version: 1 },
             { name: "issues.create", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
@@ -1011,6 +1054,7 @@ describe("the CLI authentication journey", () => {
         "git.read_file",
         "git.search_code",
         "git.write_file",
+        "issues.close",
         "issues.create",
         "issues.list",
         "issues.view",
@@ -1064,6 +1108,11 @@ describe("the CLI authentication journey", () => {
       expect(schemaFor("git.write_file")).toMatchObject({
         type: "object",
         required: ["repo", "ref", "path", "contents", "base_oid"],
+        additionalProperties: false,
+      });
+      expect(schemaFor("issues.close")).toMatchObject({
+        type: "object",
+        required: ["issue_ref"],
         additionalProperties: false,
       });
       expect(schemaFor("issues.create")).toMatchObject({
@@ -1178,6 +1227,7 @@ describe("the CLI authentication journey", () => {
         "git.read_file",
         "git.search_code",
         "git.write_file",
+        "issues.close",
         "issues.create",
         "issues.list",
         "issues.view",
@@ -1986,6 +2036,128 @@ describe("the CLI authentication journey", () => {
           "human-visible agent issue key",
         )}`,
       );
+
+      // Closing shared work is consequential, so the collaborator can propose the exact effect
+      // but cannot apply it. The creator sees one approval card addressed to the canonical issue;
+      // another human cannot decide it, and the issue remains open until the creator approves.
+      const agentIssueId = string(humanVisibleAgentIssue.id, "human-visible agent issue id");
+      const agentIssueCloseKey = `agent-issue-close-${randomUUID()}`;
+      const closeArguments = { issue_ref: agentIssueRef };
+      const issueCloseGateId = await askAgentToRequestApproval(
+        resumedRun,
+        30,
+        "issues.close",
+        closeArguments,
+        agentIssueCloseKey,
+      );
+
+      const issueBeforeApproval = await runCli(
+        configDirectory,
+        "--json",
+        "issue",
+        "view",
+        agentIssueId,
+      );
+      expect(issueBeforeApproval.exitCode, issueBeforeApproval.stderr).toBe(0);
+      expect(JSON.parse(issueBeforeApproval.stdout)).toMatchObject({
+        id: agentIssueId,
+        state_category: "unstarted",
+      });
+
+      const issueApprovalNotice = await eventually<JsonRecord>(
+        async () => {
+          const inbox = await systemClient.json("/v1/notif/inbox?view=all&limit=100", {
+            token: browserSession,
+            tokenScheme: "session",
+          });
+          return array(record(inbox.body, "founder inbox").items, "founder inbox items")
+            .map((item, index) => record(item, `founder inbox item ${index}`))
+            .find(
+              (item) =>
+                item.action !== null &&
+                record(item.action, "approval action").gate_id === issueCloseGateId,
+            );
+        },
+        { description: "the issue close approval to appear on the canonical issue" },
+      );
+      expect(issueApprovalNotice).toMatchObject({
+        subject: agentIssueRef,
+        action: {
+          kind: "agent_effect_approval",
+          gate_id: issueCloseGateId,
+          run_id: resumedRun.run.id,
+        },
+      });
+
+      await reviewerClient.json(
+        `/v1/agent-approvals/${encodeURIComponent(issueCloseGateId)}/decision`,
+        {
+          method: "POST",
+          body: { decision: "approve" },
+          idempotencyKey: `reviewer-issue-close-${randomUUID()}`,
+          expectedStatus: 403,
+        },
+      );
+      const approvedIssueClose = await systemClient.json(
+        `/v1/agent-approvals/${encodeURIComponent(issueCloseGateId)}/decision`,
+        {
+          method: "POST",
+          body: { decision: "approve" },
+          token: browserSession,
+          tokenScheme: "session",
+          idempotencyKey: `founder-issue-close-${randomUUID()}`,
+          expectedStatus: 200,
+        },
+      );
+      expect(approvedIssueClose.body).toMatchObject({
+        gate_id: issueCloseGateId,
+        run_id: resumedRun.run.id,
+        state: "approved",
+        changed: true,
+      });
+
+      const closedByAgent = await askAgentToAct(
+        resumedRun,
+        31,
+        "issues.close",
+        closeArguments,
+        agentIssueCloseKey,
+        issueCloseGateId,
+      );
+      const replayedAgentClose = await askAgentToAct(
+        resumedRun,
+        32,
+        "issues.close",
+        closeArguments,
+        agentIssueCloseKey,
+        issueCloseGateId,
+      );
+      expect(replayedAgentClose).toEqual(closedByAgent);
+      expect(closedByAgent).toMatchObject({
+        ref: agentIssueRef,
+        data: {
+          id: agentIssueId,
+          key: humanVisibleAgentIssue.key,
+          state: "Done",
+          state_category: "completed",
+        },
+      });
+
+      const issueAfterApproval = await runCli(
+        configDirectory,
+        "--json",
+        "issue",
+        "view",
+        agentIssueId,
+      );
+      expect(issueAfterApproval.exitCode, issueAfterApproval.stderr).toBe(0);
+      expect(JSON.parse(issueAfterApproval.stdout)).toMatchObject({
+        id: agentIssueId,
+        state: "Done",
+        state_category: "completed",
+        creator_kind: "agent",
+        created_by: publicIssueAuthor,
+      });
 
       // The collaborator can add context to the human-owned living spec through the same
       // governed surface. Myelin records an agent-authored encrypted block, while the founder's

@@ -168,6 +168,15 @@ impl GateRecord {
             && self.approval_consumed_at_unix.is_none()
             && matches!(self.decided_by.as_deref(), Some(d) if d != requester)
     }
+
+    pub fn authorizes_replay(&self, effect_id: &str, run_id: &str, requester: &str) -> bool {
+        self.state == GateState::Approved
+            && self.effect_id == effect_id
+            && self.run_id == run_id
+            && self.requested_by == requester
+            && self.approval_consumed_at_unix.is_some()
+            && matches!(self.decided_by.as_deref(), Some(d) if d != requester)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1757,6 +1766,13 @@ mod tests {
         );
         assert!(!store.fetch(&scope(), "gate:once").unwrap().authorizes(
             effect,
+            "mcp-run-1",
+            "agent:claude"
+        ));
+        let consumed = store.fetch(&scope(), "gate:once").unwrap();
+        assert!(consumed.authorizes_replay(effect, "mcp-run-1", "agent:claude"));
+        assert!(!consumed.authorizes_replay(
+            "gate:git.merge:myelin://acme/git/pr/41",
             "mcp-run-1",
             "agent:claude"
         ));

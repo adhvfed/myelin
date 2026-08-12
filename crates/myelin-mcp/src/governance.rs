@@ -462,6 +462,11 @@ fn audit_event_type(
         ("issues.create", "gated") => Ok(myelin_issues::events::ISSUE_CREATE_GATED),
         ("issues.create", "denied") => Ok(myelin_issues::events::ISSUE_CREATE_DENIED),
         ("issues.create", "indeterminate") => Ok(myelin_issues::events::ISSUE_CREATE_INDETERMINATE),
+        ("issues.close", "attempted") => Ok(myelin_issues::events::ISSUE_CLOSE_ATTEMPTED),
+        ("issues.close", "applied") => Ok(myelin_issues::events::ISSUE_CLOSE_APPLIED),
+        ("issues.close", "gated") => Ok(myelin_issues::events::ISSUE_CLOSE_GATED),
+        ("issues.close", "denied") => Ok(myelin_issues::events::ISSUE_CLOSE_DENIED),
+        ("issues.close", "indeterminate") => Ok(myelin_issues::events::ISSUE_CLOSE_INDETERMINATE),
         ("knowledge.link_work", "attempted") => {
             Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_ATTEMPTED)
         }
@@ -486,6 +491,12 @@ fn approval_audit_event_type(
             AuditPhase::Approved => Ok(myelin_git::events::GIT_MERGE_APPROVED),
             AuditPhase::Rejected => Ok(myelin_git::events::GIT_MERGE_REJECTED),
             AuditPhase::Expired => Ok(myelin_git::events::GIT_MERGE_EXPIRED),
+            _ => Err("invalid approval audit phase".into()),
+        },
+        McpApprovalContract::IssuesClose => match phase {
+            AuditPhase::Approved => Ok(myelin_issues::events::ISSUE_CLOSE_APPROVED),
+            AuditPhase::Rejected => Ok(myelin_issues::events::ISSUE_CLOSE_REJECTED),
+            AuditPhase::Expired => Ok(myelin_issues::events::ISSUE_CLOSE_EXPIRED),
             _ => Err("invalid approval audit phase".into()),
         },
     }
@@ -925,9 +936,14 @@ impl GovernedRouter {
             return self.record(tool.name(), CallOutcome::Denied { reason, jti }, now);
         }
 
-        let mut approval_to_consume = None;
+        enum ApprovalGrant {
+            NotRequired,
+            Consume(String),
+            Replay,
+        }
+        let mut approval_grant = ApprovalGrant::NotRequired;
         if tool.requires_approval() {
-            let effect_key = mcp_effect_key(tool.name(), args);
+            let effect_key = mcp_effect_key_for_call(tool.name(), args, idempotency_key);
             let expired = self.verdicts.borrow_mut().expire_due_for_effect(
                 &self.principal.scope,
                 &self.principal.run_id.0,
@@ -970,9 +986,9 @@ impl GovernedRouter {
                                 now,
                             );
                         }
-                        approval_to_consume = Some(record.gate_id);
+                        approval_grant = ApprovalGrant::Consume(record.gate_id);
                     }
-                    if approval_to_consume.is_none() {
+                    if matches!(&approval_grant, ApprovalGrant::NotRequired) {
                         if self
                             .audit_sink
                             .record(GovernanceAuditRecord {
@@ -1034,7 +1050,16 @@ impl GovernedRouter {
                                 &self.principal.agent_id.0,
                             ) =>
                         {
-                            approval_to_consume = Some(gid.to_string());
+                            approval_grant = ApprovalGrant::Consume(gid.to_string());
+                        }
+                        Some(rec)
+                            if rec.authorizes_replay(
+                                &effect_key,
+                                &self.principal.run_id.0,
+                                &self.principal.agent_id.0,
+                            ) =>
+                        {
+                            approval_grant = ApprovalGrant::Replay;
                         }
                         Some(rec)
                             if rec.state == GateState::Waiting
@@ -1098,12 +1123,12 @@ impl GovernedRouter {
                 now,
             );
         }
-        let approval = match approval_to_consume {
-            Some(gate_id) => {
+        let approval = match approval_grant {
+            ApprovalGrant::Consume(gate_id) => {
                 if let Err(error) = self.verdicts.borrow_mut().consume_approval(
                     &self.principal.scope,
                     &gate_id,
-                    &mcp_effect_key(tool.name(), args),
+                    &mcp_effect_key_for_call(tool.name(), args, idempotency_key),
                     &self.principal.run_id.0,
                     &self.principal.agent_id.0,
                     now_unix,
@@ -1119,7 +1144,8 @@ impl GovernedRouter {
                 }
                 EffectApproval::HumanApproved
             }
-            None => EffectApproval::NotRequired,
+            ApprovalGrant::Replay => EffectApproval::HumanApproved,
+            ApprovalGrant::NotRequired => EffectApproval::NotRequired,
         };
         let authority = EffectAuthority {
             run_token: token,
@@ -1368,6 +1394,9 @@ fn approval_card_ref(scope: &TenantScope, tool: &str, args: &serde_json::Value) 
             args.get("repo")?.as_str()?,
             args.get("number")?.as_u64()?,
         )),
+        McpApprovalContract::IssuesClose => {
+            canonical_issue_ref_arg(scope, args).map(str::to_string)
+        }
     }
 }
 
@@ -1385,7 +1414,29 @@ fn approval_risk_summary(tool: &str, args: &serde_json::Value) -> Vec<u8> {
             }
             _ => b"Merge a pull request".to_vec(),
         },
+        McpApprovalContract::IssuesClose => canonical_issue_ref_arg_for_any_tenant(args)
+            .and_then(|reference| myelin_refs::parse_scoped(reference).ok())
+            .map_or_else(
+                || b"Close an issue".to_vec(),
+                |parsed| format!("Close issue {}", parsed.id).into_bytes(),
+            ),
     }
+}
+
+fn canonical_issue_ref_arg<'a>(
+    scope: &TenantScope,
+    args: &'a serde_json::Value,
+) -> Option<&'a str> {
+    let reference = canonical_issue_ref_arg_for_any_tenant(args)?;
+    let parsed = myelin_refs::parse_scoped(reference).ok()?;
+    (parsed.tenant == *scope.tenant()).then_some(reference)
+}
+
+fn canonical_issue_ref_arg_for_any_tenant(args: &serde_json::Value) -> Option<&str> {
+    let reference = args.get("issue_ref")?.as_str()?;
+    let parsed = myelin_refs::parse_scoped(reference).ok()?;
+    (parsed.subsystem == "issue" && parsed.type_ == "issue" && parsed.sub.is_none())
+        .then_some(reference)
 }
 
 fn timestamp_to_unix(timestamp: &Timestamp) -> Result<i64, String> {
@@ -1395,11 +1446,33 @@ fn timestamp_to_unix(timestamp: &Timestamp) -> Result<i64, String> {
 }
 
 pub fn mcp_effect_key(tool: &str, args: &serde_json::Value) -> String {
-    let canonical = canonical_json(args);
-    let mut bound = Vec::with_capacity(tool.len() + 1 + canonical.to_string().len());
+    mcp_effect_key_from_material(tool, args, None)
+}
+
+pub fn mcp_effect_key_for_call(
+    tool: &str,
+    args: &serde_json::Value,
+    idempotency_key: &str,
+) -> String {
+    mcp_effect_key_from_material(tool, args, Some(idempotency_key))
+}
+
+fn mcp_effect_key_from_material(
+    tool: &str,
+    args: &serde_json::Value,
+    idempotency_key: Option<&str>,
+) -> String {
+    let canonical = canonical_json(args).to_string();
+    let mut bound = Vec::with_capacity(
+        tool.len() + 1 + canonical.len() + idempotency_key.map_or(0, str::len) + 1,
+    );
     bound.extend_from_slice(tool.as_bytes());
     bound.push(0);
-    bound.extend_from_slice(canonical.to_string().as_bytes());
+    bound.extend_from_slice(canonical.as_bytes());
+    if let Some(idempotency_key) = idempotency_key {
+        bound.push(0);
+        bound.extend_from_slice(idempotency_key.as_bytes());
+    }
     let digest = ContentHash::blake3(&bound).to_multihash_string();
     if tool == "git.merge" {
         if let Some(repo) = args
@@ -1438,7 +1511,20 @@ pub fn approval_contract_from_effect_key(effect_key: &str) -> Option<McpApproval
         McpApprovalContract::GitMerge => {
             git_merge_repo_from_effect_key(effect_key).map(|_| contract)
         }
+        McpApprovalContract::IssuesClose => {
+            valid_digest_effect_key(effect_key, contract.tool()).then_some(contract)
+        }
     }
+}
+
+fn valid_digest_effect_key(effect_key: &str, tool: &str) -> bool {
+    let Some(digest) = effect_key.strip_prefix(&format!("mcp:v1:{tool}:blake3:")) else {
+        return false;
+    };
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn canonical_json(value: &serde_json::Value) -> serde_json::Value {
@@ -1532,8 +1618,9 @@ mod security_tests {
     use myelin_events::IdMinter;
 
     use super::{
-        approval_contract_from_effect_key, git_merge_repo_from_effect_key, mcp_effect_key,
-        AuditPhase, GateAuditMinter,
+        approval_card_ref, approval_contract_from_effect_key, approval_risk_summary,
+        git_merge_repo_from_effect_key, mcp_effect_key, mcp_effect_key_for_call, AuditPhase,
+        GateAuditMinter,
     };
     use myelin_agent::McpApprovalContract;
 
@@ -1577,6 +1664,31 @@ mod security_tests {
             approval_contract_from_effect_key(&first),
             Some(McpApprovalContract::GitMerge)
         );
+        assert_eq!(
+            mcp_effect_key_for_call(
+                "git.merge",
+                &serde_json::json!({"repo":"team/alpha","number":7}),
+                "merge-7",
+            ),
+            mcp_effect_key_for_call(
+                "git.merge",
+                &serde_json::json!({"number":7,"repo":"team/alpha"}),
+                "merge-7",
+            ),
+        );
+        assert_ne!(
+            mcp_effect_key_for_call(
+                "git.merge",
+                &serde_json::json!({"repo":"team/alpha","number":7}),
+                "merge-7",
+            ),
+            mcp_effect_key_for_call(
+                "git.merge",
+                &serde_json::json!({"repo":"team/alpha","number":7}),
+                "merge-7-again",
+            ),
+            "approval identity distinguishes a retry from a new logical mutation"
+        );
 
         let huge = mcp_effect_key(
             "git.open_pr",
@@ -1604,6 +1716,42 @@ mod security_tests {
             "knowledge.publish",
             &serde_json::json!({"page":"roadmap"}),
         ))
+        .is_none());
+    }
+
+    #[test]
+    fn issue_close_gate_identity_and_card_bind_the_canonical_reference() {
+        let args = serde_json::json!({
+            "issue_ref": "myelin://acme/issue/issue/ENG-41",
+        });
+        let effect_key = mcp_effect_key("issues.close", &args);
+        assert_eq!(
+            approval_contract_from_effect_key(&effect_key),
+            Some(McpApprovalContract::IssuesClose)
+        );
+        let principal = myelin_identity::Principal::stub(
+            myelin_identity::PrincipalId("agent:closer".into()),
+            myelin_identity::PrincipalKind::Service,
+            myelin_tenancy::TenantId::from_token("acme"),
+        );
+        let scope =
+            myelin_storage::TenantScope::from_verified_token(&principal, principal.region.clone());
+        assert_eq!(
+            approval_card_ref(&scope, "issues.close", &args).as_deref(),
+            Some("myelin://acme/issue/issue/ENG-41")
+        );
+        assert_eq!(
+            approval_risk_summary("issues.close", &args),
+            b"Close issue ENG-41"
+        );
+
+        let foreign = serde_json::json!({
+            "issue_ref": "myelin://other/issue/issue/ENG-41",
+        });
+        assert!(approval_card_ref(&scope, "issues.close", &foreign).is_none());
+        assert!(approval_contract_from_effect_key(
+            "mcp:v1:issues.close:blake3:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        )
         .is_none());
     }
 }

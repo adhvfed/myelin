@@ -28,6 +28,25 @@ pub const ISSUE_CREATE_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
     ISSUE_CREATE_INDETERMINATE,
 ];
 
+pub const ISSUE_CLOSE_ATTEMPTED: &str = "issue.close.attempted";
+pub const ISSUE_CLOSE_APPLIED: &str = "issue.close.applied";
+pub const ISSUE_CLOSE_GATED: &str = "issue.close.gated";
+pub const ISSUE_CLOSE_DENIED: &str = "issue.close.denied";
+pub const ISSUE_CLOSE_INDETERMINATE: &str = "issue.close.indeterminate";
+pub const ISSUE_CLOSE_APPROVED: &str = "issue.close.approved";
+pub const ISSUE_CLOSE_REJECTED: &str = "issue.close.rejected";
+pub const ISSUE_CLOSE_EXPIRED: &str = "issue.close.expired";
+pub const ISSUE_CLOSE_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
+    ISSUE_CLOSE_ATTEMPTED,
+    ISSUE_CLOSE_APPLIED,
+    ISSUE_CLOSE_GATED,
+    ISSUE_CLOSE_DENIED,
+    ISSUE_CLOSE_INDETERMINATE,
+    ISSUE_CLOSE_APPROVED,
+    ISSUE_CLOSE_REJECTED,
+    ISSUE_CLOSE_EXPIRED,
+];
+
 pub const ISSUE_TRIAGED: &str = "issue.issue.triaged";
 pub const ISSUE_DUPLICATE_SUSPECTED: &str = "issue.issue.duplicate_suspected";
 pub const ISSUE_LABELLED_BY_AGENT: &str = "issue.issue.labelled_by_agent";
@@ -99,6 +118,14 @@ pub const ISSUE_EVENT_TOKENS: &[&str] = &[
     ISSUE_CREATE_GATED,
     ISSUE_CREATE_DENIED,
     ISSUE_CREATE_INDETERMINATE,
+    ISSUE_CLOSE_ATTEMPTED,
+    ISSUE_CLOSE_APPLIED,
+    ISSUE_CLOSE_GATED,
+    ISSUE_CLOSE_DENIED,
+    ISSUE_CLOSE_INDETERMINATE,
+    ISSUE_CLOSE_APPROVED,
+    ISSUE_CLOSE_REJECTED,
+    ISSUE_CLOSE_EXPIRED,
     ISSUE_TRIAGED,
     ISSUE_DUPLICATE_SUSPECTED,
     ISSUE_LABELLED_BY_AGENT,

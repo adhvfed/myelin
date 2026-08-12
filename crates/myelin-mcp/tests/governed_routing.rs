@@ -29,7 +29,7 @@ use myelin_identity_service::ResolvedDelegationPolicy;
 use myelin_storage::TenantScope;
 use myelin_tenancy::{Region, TenantId};
 
-use myelin_mcp::governance::{mcp_effect_key, SkeletonEffectApi};
+use myelin_mcp::governance::SkeletonEffectApi;
 use myelin_mcp::{
     AuditPhase, CallOutcome, DirectReadError, DirectReadExecutor, GateApproverPolicy,
     GovernanceAudit, GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter, McpServer,
@@ -1088,6 +1088,21 @@ fn approval_is_a_server_side_verdict_by_a_distinct_human_principal() {
             .is_some(),
         "the one-shot server verdict was consumed by the effect"
     );
+
+    let replayed = drive(&server, &[redrive.as_str()]);
+    assert_eq!(
+        replayed[0]["result"]["_meta"]["eventId"], applied[0]["result"]["_meta"]["eventId"],
+        "a lost response can replay the approved logical effect with its same caller key"
+    );
+
+    let different_retry_key = format!(
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"git.merge","arguments":{{"repo":"acme/web","number":7}},"approval":{{"gateId":"{gate_id}"}},"_meta":{{"com.myelin/idempotencyKey":"merge-7-again"}}}}}}"#
+    );
+    let refused = drive(&server, &[different_retry_key.as_str()]);
+    assert_eq!(
+        refused[0]["result"]["isError"], true,
+        "a consumed approval cannot authorize a new logical effect with identical arguments"
+    );
 }
 
 #[test]
@@ -1422,7 +1437,8 @@ fn expiry_audit_failure_is_fail_loud_after_state_commit_and_terminates_session()
 #[test]
 fn mcp_expiry_leaves_unrelated_shared_gate_untouched_and_audits_exact_gate() {
     let args = serde_json::json!({"repo":"alpha","number":77});
-    let exact_effect = mcp_effect_key("git.merge", &args);
+    let exact_effect =
+        myelin_mcp::governance::mcp_effect_key_for_call("git.merge", &args, "scope-expiry-1");
     let mut verdicts = HitlVerdictStore::new();
     let scope = TenantScope::from_verified_token(
         &human_principal("human:operator", "acme"),

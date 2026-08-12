@@ -212,6 +212,7 @@ mod tests {
                 "git.search_code",
                 "git.submit_review",
                 "git.write_file",
+                "issues.close",
                 "issues.create",
                 "issues.list",
                 "issues.view",
