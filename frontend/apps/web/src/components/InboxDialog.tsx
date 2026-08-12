@@ -101,7 +101,10 @@ export function InboxDialog(props: InboxDialogProps) {
           />
         </Match>
         <Match when={true}>
-          <div class="inbox-content" aria-busy={pending() !== null}>
+          <div
+            class="inbox-content"
+            aria-busy={pending() !== null || props.inbox.loadingMore()}
+          >
             <Show when={mutationError()}>
               {(message) => (
                 <p role="alert" class="inbox-mutation-error" data-testid="inbox-mutation-error">
@@ -160,9 +163,19 @@ export function InboxDialog(props: InboxDialogProps) {
               </For>
             </ul>
             <Show when={props.inbox.hasMore()}>
-              <p role="status" class="inbox-more">
-                More notifications are available. Pagination is not yet available in this panel.
-              </p>
+              <Show when={props.inbox.loadMoreError()}>
+                <p role="alert" class="inbox-mutation-error" data-testid="inbox-more-error">
+                  <Icon name="check-fail" /> We couldn&rsquo;t load more notifications. Trying again is safe.
+                </p>
+              </Show>
+              <button
+                type="button"
+                class="inbox-action"
+                disabled={pending() !== null || props.inbox.loadingMore()}
+                onClick={() => void props.inbox.loadMore()}
+              >
+                {props.inbox.loadingMore() ? "Loading more…" : "Load more"}
+              </button>
             </Show>
           </div>
         </Match>

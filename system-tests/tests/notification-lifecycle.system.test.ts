@@ -67,10 +67,37 @@ async function findInboxItem(
   client: SystemTestClient,
   subject: string,
 ): Promise<JsonRecord | undefined> {
-  const response = await client.json("/v1/notif/inbox?view=all&limit=100");
-  return array(response.body.items, "notification inbox items")
-    .map((item) => record(item, "notification inbox item"))
-    .find((item) => item.subject === subject);
+  let cursor: string | null = null;
+  const seenCursors = new Set<string>();
+  for (let page = 0; page < 100; page += 1) {
+    const current = await readInboxPage(client, cursor, 100);
+    const found = current.items.find((item) => item.subject === subject);
+    if (found !== undefined || current.nextCursor === null) return found;
+    if (seenCursors.has(current.nextCursor)) {
+      throw new Error("notification inbox repeated an opaque cursor");
+    }
+    seenCursors.add(current.nextCursor);
+    cursor = current.nextCursor;
+  }
+  throw new Error("notification inbox exceeded the bounded search");
+}
+
+async function readInboxPage(
+  client: SystemTestClient,
+  cursor: string | null,
+  limit: number,
+): Promise<{ items: JsonRecord[]; nextCursor: string | null }> {
+  const search = new URLSearchParams({ view: "all", limit: String(limit) });
+  if (cursor !== null) search.set("cursor", cursor);
+  const response = await client.json(`/v1/notif/inbox?${search.toString()}`);
+  const page = record(response.body.page, "notification page envelope");
+  return {
+    items: array(response.body.items, "notification inbox items")
+      .map((item) => record(item, "notification inbox item")),
+    nextCursor: page.next_cursor === null
+      ? null
+      : string(page.next_cursor, "notification page cursor"),
+  };
 }
 
 describe.sequential("notification delivery lifecycle", () => {
@@ -189,5 +216,43 @@ describe.sequential("notification delivery lifecycle", () => {
       { description: "the delivery ordered after the self-notification" },
     );
     expect(await findInboxItem(systemClient, selfSubject)).toBeUndefined();
+  });
+
+  test("walks the whole inbox without losing or repeating a notification", async () => {
+    const subjects = ["first", "second"].map(
+      (suffix) => `myelin://${systemTestConfig.tenant}/git/pr/${slug}:${uniqueName(suffix)}`,
+    );
+    for (const subject of subjects) {
+      await bus.publish(signalEnvelope({
+        actor: systemTestConfig.reviewerPrincipal,
+        recipient: systemTestConfig.principal,
+        dedupKey: uniqueName("page"),
+        subject,
+      }));
+    }
+    await eventually(async () => {
+      const found = await Promise.all(subjects.map((subject) => findInboxItem(systemClient, subject)));
+      return found.every((item) => item !== undefined) ? true : undefined;
+    }, { description: "both notifications to reach the durable inbox" });
+
+    const itemIds = new Set<string>();
+    const cursors = new Set<string>();
+    const foundSubjects = new Set<string>();
+    let cursor: string | null = null;
+    for (let page = 0; page < 500 && foundSubjects.size < subjects.length; page += 1) {
+      const current = await readInboxPage(systemClient, cursor, 1);
+      expect(current.items.length).toBeLessThanOrEqual(1);
+      for (const item of current.items) {
+        expect(itemIds.has(string(item.id, "paged notification id"))).toBe(false);
+        itemIds.add(string(item.id, "paged notification id"));
+        const subject = string(item.subject, "paged notification subject");
+        if (subjects.includes(subject)) foundSubjects.add(subject);
+      }
+      if (current.nextCursor === null) break;
+      cursor = current.nextCursor;
+      expect(cursors.has(cursor)).toBe(false);
+      cursors.add(cursor);
+    }
+    expect(foundSubjects).toEqual(new Set(subjects));
   });
 });

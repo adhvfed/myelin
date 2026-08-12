@@ -60,7 +60,7 @@ The suite is intentionally organized around externally visible contracts:
   one queued run. Fed disables the local sandbox runner, so this suite does not claim job execution.
 - `notification-lifecycle` publishes through the external JetStream boundary and verifies durable,
   recipient-scoped delivery, addressable inbox items, broker de-duplication, collapse, read state,
-  and self-suppression.
+  self-suppression, and complete duplicate-free traversal through opaque inbox cursors.
 - `api-contracts` checks strict inputs, resource identifiers, payload limits, notification inbox
   scoping, and public error envelopes.
 

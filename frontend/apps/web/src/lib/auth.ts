@@ -14,8 +14,8 @@ import {
   edgeWhoami,
   edgeWhoamiWithToken,
   isUnauthorized,
-  type EdgeWhoami,
 } from "../server/gateway";
+import type { EdgeWhoami } from "../server/gateway";
 import { beginOidcLogin, interactiveOidcConfigured } from "../server/oidc";
 import {
   DEV_ACCESS_TOKEN,
@@ -38,10 +38,8 @@ import {
 import { SESSION_ABSOLUTE_TTL_MS } from "../server/session-store";
 import {
   toAuthConfig,
-  type AuthConfig,
-  type AuthProvider,
-  type EdgeAuthConfig,
 } from "./auth-config";
+import type { AuthConfig, AuthProvider, EdgeAuthConfig } from "./auth-config";
 
 // Re-exported from the pure mapping module so existing importers (`../lib/auth`) are unchanged.
 export type { AuthConfig, AuthProvider };
@@ -159,7 +157,7 @@ export const getAuthConfig = query(async (): Promise<AuthConfig> => {
   try {
     edge = await edgeGetPublic<EdgeAuthConfig>("/v1/auth/config");
   } catch {
-    // Fail-closed render: no SSO, no dev seam. The login page still renders (honest "unavailable").
+    // Keep both SSO and development login disabled when config is unavailable.
     edge = { sso_configured: false, providers: [], dev_login_enabled: false };
   }
   // The mapping (dev-seam composition + the token-login edge flag) is the pure {@link toAuthConfig}.

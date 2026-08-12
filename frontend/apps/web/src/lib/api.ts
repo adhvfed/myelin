@@ -225,7 +225,7 @@ export interface CommitsPage {
     prev_cursor?: string | null;
     limit: number;
     offset?: number;
-    /** R3.4: honest position — range + page, NO fabricated total. */
+    /** Visible range and page; the API does not provide a total. */
     range?: { from: number; to: number };
   };
 }
@@ -262,8 +262,8 @@ export interface DiffHunkVM {
   lines: DiffLineVM[];
 }
 
-/** One changed file in a PR diff (PrDiffFile::to_json). A RESTRICTED file is NEVER in this list — the
- *  count-only disclosure lives on `PrDiffVM.restricted_files` (non-leak by construction). */
+/** One visible file in a PR diff. Restricted files contribute only to
+ * `PrDiffVM.restricted_files`. */
 export interface PrDiffFileVM {
   path: string;
   old_path: string | null;
@@ -279,8 +279,8 @@ export interface PrDiffFileVM {
   truncated: boolean;
 }
 
-/** The PR three-dot diff page (PrDiffVM::to_json) — `merge-base(base, head) … head`. `three_dot`
- *  false labels the two-dot floor; `restricted_files` is COUNT-ONLY (no paths cross the wire). */
+/** PR diff response. `three_dot` distinguishes merge-base and two-dot results;
+ * `restricted_files` contains a count, not paths. */
 export interface PrDiffVM {
   number: number;
   base_ref: string;
@@ -325,10 +325,7 @@ export interface CommitDiffVM {
   files: DiffFileVM[];
 }
 
-/** The durable PR record (DurableGitBackend::pr_json). R3.3 adds the overview header fields:
- *  `title`/`body_md` (the description via the ONE BlockEditor read path), `created_at` (the "opened …"
- *  date, Intl-formatted client-side; null on a legacy record), `commits_count` (the tab badge; null
- *  when the walk couldn't read; `commits_count_capped` = the count is `500+`). */
+/** Durable PR record returned by `DurableGitBackend::pr_json`. */
 export interface PrVM {
   number: number;
   pr_state: "draft" | "open" | "merged" | "closed";
@@ -387,7 +384,7 @@ export interface PrThreadVM {
   comments: PrCommentVM[];
 }
 
-/** One review batch (PrReviewVM). `advisory` = an agent review — it NEVER counts toward the gate. */
+/** One review batch. Advisory agent reviews do not count toward the gate. */
 export interface PrReviewVM {
   id: string;
   reviewer: PrincipalVM;
@@ -423,9 +420,7 @@ export interface PrChecksVM {
   durable: boolean;
 }
 
-/** The rolled-up checks posture for a PR list row (edge `checks_summary`; the ring stays reserved for
- *  the CI verdict trio). `verdict` is the load-bearing leak-free signal; the counts refine the label.
- *  `unavailable` = the projection could not be read (the row fails static — it still lists). */
+/** Rolled-up checks state for a PR list row. Counts refine the verdict label. */
 export interface ChecksSummaryVM {
   verdict: "pass" | "fail" | "running" | "none" | "unavailable";
   passing: number;
@@ -434,7 +429,7 @@ export interface ChecksSummaryVM {
 }
 
 /** One PR list row (DurableGitBackend::pr_list_row_json). `title` is `null` for a legacy record with
- *  no stored title — the UI renders `#number` (honest, never a fabricated title). `repo` is present
+ *  no stored title — the UI renders `#number`. `repo` is present
  *  only on the cross-repo front door (the repo chip). `updated_at` is unix seconds (formatted via
  *  Intl client-side, never hand-formatted). */
 export interface PrListRowVM {
@@ -471,8 +466,7 @@ export interface PrListPage {
 export type CiErrorKind = "bad-input" | "not-found" | "stale" | "unavailable" | "error";
 export const CI_ERR_PREFIX = "CI_ERR:";
 
-/** CI read errors carry only a dignified category across the server boundary; raw Edge storage or
- * authorization details never become browser copy. */
+/** CI errors expose only a category to the browser. */
 export class CiRouteError extends Error {
   readonly kind: CiErrorKind;
   constructor(kind: CiErrorKind) {
@@ -654,12 +648,18 @@ export const getCiLog = query(async (request: CiLogInput): Promise<CiLogRangeVM>
   });
 }, "ci-log");
 
-/** The first bounded page of the authenticated viewer's unified inbox. */
-export const getInbox = query(async (): Promise<InboxPage> => {
+/** One bounded page of the authenticated viewer's unified inbox. */
+export const getInbox = query(async (cursor: string | null = null): Promise<InboxPage> => {
   "use server";
+  if (cursor !== null && (typeof cursor !== "string" || cursor.length > 1_024 ||
+      !cursor.startsWith("ni1_") || /[\p{Cc}]/u.test(cursor))) {
+    throw new Error("INBOX_INVALID_CURSOR");
+  }
   try {
     return await inboxAuthed(async () => {
-      const page = parseInboxPage(await edgeGet("/v1/notif/inbox?view=all&limit=50"));
+      const search = new URLSearchParams({ view: "all", limit: "50" });
+      if (cursor !== null) search.set("cursor", cursor);
+      const page = parseInboxPage(await edgeGet(`/v1/notif/inbox?${search.toString()}`));
       if (!page) throw new Error("INBOX_INVALID_RESPONSE");
       return page;
     });
@@ -891,18 +891,13 @@ export const getCommit = query(
   "git-commit",
 );
 
-/** The "no access" sentinel — a `Pull` denial is the 0-leak 404 (indistinguishable from an absent
- *  repo, by design), surfaced here as the dignified "not available to you" state (never leaks whether
- *  PRs exist or their count). */
+/** A 404 sentinel that covers both absent repositories and withheld access. */
 export interface PrListRestricted {
   restricted: true;
 }
 export type PrListResult = PrListPage | PrListRestricted;
 
-/** The per-repo PR list (GET /v1/git/repos/{repo}/prs?state=&sort=&cursor=). Leak-free by the `Pull`
- *  object guard (`pull_request.view = parent_repo->pull`): a viewer who cannot pull gets the 0-leak
- *  404 the query surfaces as the "no access" state (a real transport failure still throws → the
- *  scoped error state). */
+/** Per-repository PR list. A 404 maps to the restricted sentinel; other failures propagate. */
 export const getRepoPrs = query(
   async (input: {
     repo: string;
@@ -926,8 +921,7 @@ export const getRepoPrs = query(
         if (!page) throw new RepoRouteError("error");
         return page;
       } catch (e) {
-        // A 0-leak 404 (no pull grant, or an absent repo) → the dignified no-access state; any other
-        // status still throws so the route renders the SCOPED error (never a raw err.message).
+        // A 404 covers both absent repositories and withheld access.
         if (e instanceof GatewayError && e.status === 404) return { restricted: true };
         throw e;
       }
@@ -1093,11 +1087,7 @@ export interface MergeOk {
 }
 export type MergeResult = MergeOk | MergeBlocked;
 
-/** The PR write ops (R3.3 G-8). ALL mutations route through ONE dispatching `action` — multiple
- *  sibling `action(...)`s in this module collided onto one server-fn under the vinxi bundler (each
- *  resolved to the first and returned null), so a single server function keyed by `op` is the robust
- *  shape. The server-RPC (`action`) is the proven path with request/session context (a bare
- *  `"use server"` function did not bind reliably here). */
+/** PR mutations share one action because Vinxi collides sibling actions in this module. */
 /** The union of every mutation's result (the caller narrows by `op`). */
 export type PrMutationResult =
   | { thread: PrThreadVM }

@@ -1,11 +1,8 @@
 import { test, expect, type Page, request as pwRequest } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 
-// R3.5 first-run flow — real-browser + axe proofs for the login states, the empty-tenant onboarding,
-// and the honest inbox. Drives the SAME single harness (dev edge + SolidStart) and uses the dev
-// edge's test-control seam (`POST /__test/config`, a dev-double-only route) to model a fresh empty
-// tenant + a dev-seam-off deployment. Every test resets that state in afterEach so the rest of the
-// serial suite (shell.spec, git-browse.spec, prs.spec) sees the default populated posture.
+// Browser coverage for login, empty-tenant onboarding, inbox, and accessibility. Tests configure
+// the local edge through `POST /__test/config` and restore its defaults after each case.
 
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 
@@ -15,6 +12,7 @@ async function setEdgeConfig(cfg: {
   whoamiUnavailable?: boolean;
   seedInboxAgentApproval?: boolean;
   inboxMutationUnavailable?: boolean;
+  inboxPagination?: boolean;
 }): Promise<void> {
   const ctx = await pwRequest.newContext();
   const res = await ctx.post(`${EDGE}/__test/config`, { data: cfg });
@@ -37,6 +35,7 @@ test.afterEach(async () => {
     whoamiUnavailable: false,
     seedInboxAgentApproval: false,
     inboxMutationUnavailable: false,
+    inboxPagination: false,
   });
 });
 
@@ -172,6 +171,28 @@ test.describe("R3.5 first-run — honest inbox", () => {
     await expect(dialog.getByRole("button", { name: "Approve" })).toHaveCount(0);
     await expect(dialog.getByTestId("inbox-mutation-error")).toHaveCount(0);
     await expectNoAxeViolations(page, "a recovered inbox approval");
+  });
+
+  test("loads the rest of a long inbox without replacing what is already visible", async ({ page }) => {
+    await setEdgeConfig({ inboxPagination: true });
+    await page.goto("/login");
+    await page.waitForLoadState("networkidle");
+    await page.getByTestId("dev-login").click();
+    await page.waitForURL("**/git/repos");
+
+    const inboxButton = page.getByRole("button", { name: /Inbox/ });
+    await expect(inboxButton).toHaveAttribute("aria-label", /1 unread notification/i);
+    await inboxButton.click();
+    const dialog = page.getByRole("dialog", { name: "Inbox" });
+    await expect(dialog).toContainText("myelin://acme/git/pr/myelin:42");
+    await expect(dialog).not.toContainText("myelin://acme/git/pr/myelin:43");
+
+    await dialog.getByRole("button", { name: "Load more" }).click();
+    await expect(dialog).toContainText("myelin://acme/git/pr/myelin:42");
+    await expect(dialog).toContainText("myelin://acme/git/pr/myelin:43");
+    await expect(dialog.getByRole("button", { name: "Load more" })).toHaveCount(0);
+    await expect(inboxButton).toHaveAttribute("aria-label", /2 unread notifications/i);
+    await expectNoAxeViolations(page, "a paged inbox");
   });
 });
 

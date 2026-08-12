@@ -1,15 +1,10 @@
-// THE DEV EDGE — a clearly-marked stand-in for the real `myelin-edge` binary (see dev-contract.mjs).
-//
-// It implements the SUBSET of the MR-014/015 edge HTTP contract the app shell exercises:
+// Local edge test double. It implements the subset of HTTP routes exercised by the web app:
 //   GET/POST /v1/git/repos  → summary catalogue / durable-shape repository creation (Bearer-auth)
 //   GET/POST /v1/projects   → authorized project catalogue / first-project creation
 //   GET  /v1/whoami         → the verified principal + scope (Bearer-auth)
 //   POST /v1/auth/refresh   → the single-refresh round-trip (returns a fresh access token, or 401)
 //   GET  /healthz           → liveness for the Playwright webServer
-// Auth is REAL in shape (Bearer required; a uniform oracle-free 401 `{error:{message}}` envelope on
-// failure); only the accepted token is the well-known DEV token (NOT production crypto). This is the
-// exact contract the SolidStart gateway client speaks — point the gateway at the real `edge` binary
-// instead (one env var) once the identity track can issue a human a capability token.
+// It uses the production request shapes with fixed development credentials.
 
 import { createServer } from "node:http";
 import {
@@ -67,10 +62,7 @@ import { KnowledgeFixtures, parseKnowledgeQuery } from "./knowledge-contract.mjs
 
 const PORT = Number(process.env.DEV_EDGE_PORT ?? 8787);
 
-// ── Mutable dev-double state (test-controllable, NEVER shipped) ──
-// The dev edge is a clearly-marked test double; a test-control seam on it is legitimate scaffolding
-// (it lets the first-run E2E model a fresh empty tenant + a dev-seam-off deployment against the SAME
-// single harness). Toggled via `POST /__test/config`; reset by the test in a finally.
+// Mutable state controlled by browser tests through `POST /__test/config`.
 const state = {
   // A fresh tenant has no repos yet — the first-run onboarding empty state.
   emptyRepos: process.env.DEV_EDGE_EMPTY_REPOS === "1",
@@ -93,8 +85,8 @@ const state = {
   whoamiUnavailable: false,
   inboxAgentApprovalState: null,
   inboxMutationUnavailable: false,
-  // Issues test controls: empty/projection-unavailable states and how many status reads precede
-  // activation. Two proves the UI renders a genuine pending interval before active.
+  inboxPagination: false,
+  // Issues test controls, including the number of status reads before activation.
   emptyIssues: false,
   onlyClosedIssues: false,
   issuesUnavailable: false,
@@ -363,7 +355,7 @@ const server = createServer((req, res) => {
   // the Bearer gate (reachable with no session), exactly like the real edge's built-in route.
   if (method === "GET" && path === "/v1/auth/config") {
     return send(res, 200, {
-      // The default real deployment has no IdP configured — the honest "SSO unavailable" render.
+      // Default to the unconfigured-SSO state.
       sso_configured: false,
       providers: [],
       dev_login_enabled: state.devLoginEnabled,
@@ -394,6 +386,9 @@ const server = createServer((req, res) => {
         }
         if (typeof body.inboxMutationUnavailable === "boolean") {
           state.inboxMutationUnavailable = body.inboxMutationUnavailable;
+        }
+        if (typeof body.inboxPagination === "boolean") {
+          state.inboxPagination = body.inboxPagination;
         }
         if (body.resetPrFixtures === true) {
           resetPrFixtures();
@@ -482,7 +477,7 @@ const server = createServer((req, res) => {
     return send(res, 401, unauthorizedEnvelope());
   }
 
-  // Every data route requires a valid Bearer (the auth floor). A missing/forged token → uniform 401.
+  // Every data route returns the same 401 for a missing or invalid bearer token.
   const authed = !state.forceUnauthorized && bearer(req) === DEV_ACCESS_TOKEN;
 
   if (method === "GET" && path === "/v1/chat/conversations") {
@@ -953,10 +948,13 @@ const server = createServer((req, res) => {
 
   if (method === "GET" && path === "/v1/notif/inbox") {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
-    if (url.search !== "?view=all&limit=50") {
+    const cursor = url.searchParams.get("cursor");
+    if (url.searchParams.get("view") !== "all" || url.searchParams.get("limit") !== "50" ||
+        [...url.searchParams.keys()].some((key) => !["view", "limit", "cursor"].includes(key)) ||
+        (cursor !== null && cursor !== "ni1_inbox-page-2")) {
       return send(res, 400, { error: { message: "invalid inbox request", code: "bad_request" } });
     }
-    const items = state.inboxAgentApprovalState === null ? [] : [{
+    const approvalItems = state.inboxAgentApprovalState === null ? [] : [{
       id: "notice-agent-effect-1",
       reason: "approval_requested",
       class: "direct",
@@ -974,7 +972,36 @@ const server = createServer((req, res) => {
         run_id: "hosted-run-42",
       },
     }];
-    return send(res, 200, { items, page: { next_cursor: null, limit: 50 } });
+    const pagedItems = cursor === "ni1_inbox-page-2" ? [{
+      id: "notice-page-2",
+      reason: "mentioned",
+      class: "direct",
+      subsystem: "git",
+      subject: "myelin://acme/git/pr/myelin:43",
+      subject_root: "myelin://acme/git/pr/myelin:43",
+      coalesce_count: 1,
+      state: "unread",
+      snooze_until: null,
+      occurred_at: "2026-08-10T17:59:00.000Z",
+      priority: 55,
+      action: null,
+    }] : [{
+      id: "notice-page-1",
+      reason: "mentioned",
+      class: "direct",
+      subsystem: "git",
+      subject: "myelin://acme/git/pr/myelin:42",
+      subject_root: "myelin://acme/git/pr/myelin:42",
+      coalesce_count: 1,
+      state: "unread",
+      snooze_until: null,
+      occurred_at: "2026-08-10T18:00:00.000Z",
+      priority: 55,
+      action: null,
+    }];
+    const items = state.inboxPagination ? pagedItems : approvalItems;
+    const nextCursor = state.inboxPagination && cursor === null ? "ni1_inbox-page-2" : null;
+    return send(res, 200, { items, page: { next_cursor: nextCursor, limit: 50 } });
   }
 
   if (
@@ -1167,10 +1194,7 @@ const server = createServer((req, res) => {
     return row ? send(res, 200, row) : send(res, 404, notFoundEnvelope("issue"));
   }
 
-  // R3.5 — the unified tenant firehose. The real edge emits typed repo.created/repo.pushed frames
-  // here; the dev double holds the stream OPEN (a keepalive comment) but emits none (the named floor),
-  // so the browser EventSource connects cleanly (no reconnect storm) and the manual Refresh is the
-  // fallback. Bearer-gated like every data route.
+  // Keep the authenticated SSE connection open without events so browser tests do not reconnect.
   if (method === "GET" && /^\/v1\/t\/[^/]+\/events$/.test(path)) {
     if (!authed) return send(res, 401, unauthorizedEnvelope());
     res.writeHead(200, {
