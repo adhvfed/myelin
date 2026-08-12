@@ -69,13 +69,9 @@ fn waiting(tenant_tag: &str, gate_id: &str, effect: &str) -> GateRecord {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_verdicts_survive_across_store_instances_with_distinct_approver_enforced() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("connect to the Postgres required by the durable HITL integration story");
     admin
         .migrate(&hitl_gate_durable_migrations(), &HotTables::none())
         .await
