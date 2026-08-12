@@ -12,7 +12,7 @@ use myelin_edge::{
     spawn_issue_authorization_reconciler, AgentMcpAuthority, AgentMcpResources, AgentMcpServices,
     AuthProvider, AuthPublicConfig, AuthenticatedActionPolicy, BootstrapParams,
     CheckBackedRepoAuthorizer, DeviceAuthorizationBroker, DurableChatMutationApi,
-    DurableChatReadApi, DurableCiReadApi, DurableGitBackend, DurableKnowledgeReadApi,
+    DurableChatReadApi, DurableCiReadApi, DurableGitBackend, DurableKnowledgeMutationApi,
     DurableRefsReadApi, Gateway, GitDatabaseProviders, IssueReconciliationConfig, Method,
     ReadinessCheck, ReadinessProbe, SecretCommand, SecretCommandError, SecretTarget,
     ShutdownOutcome, StoreBackedIssueAuthorizer, TupleRepoBootstrap, WhoamiHandler,
@@ -1237,7 +1237,7 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
                 git_backend.clone(),
                 mcp_ci,
                 issue_mutations,
-                DurableKnowledgeReadApi::new(
+                DurableKnowledgeMutationApi::new(
                     provider.db_pool().clone(),
                     handle.clone(),
                     kms.clone(),

@@ -84,7 +84,7 @@ myelin tool show ci.read_run
 myelin agent create "Review companion" --tool ci.read_run --tool git.open_pr \
   --tool git.list_repositories --tool git.search_code --tool git.read_file \
   --tool issues.list --tool issues.view \
-  --tool knowledge.list_pages --tool knowledge.read_page \
+  --tool knowledge.list_pages --tool knowledge.read_page --tool knowledge.link_work \
   --tool chat.list_conversations --tool chat.post --tool chat.read_messages \
   --idempotency-key review-companion
 myelin mcp serve --as 22222222-2222-2222-2222-222222222222
@@ -164,6 +164,8 @@ myelin doc page list
 myelin doc page create --title "Deployment runbook" --template runbook \
   --idempotency-key deployment-runbook
 myelin doc page get 01J...
+myelin doc page link 01J... myelin://acme/issue/issue/ENG-41 \
+  --note "Delivery is tracked by" --idempotency-key deployment-issue
 ```
 
 Each named profile bundles its Edge, tenant, region, optional project, and an opaque credential
@@ -186,7 +188,9 @@ protocol output, and closes it when the client disconnects. Suspending or retiri
 terminates every unfinished run atomically; resuming permits fresh work but never revives an old
 run. No provider API key or long-lived agent credential is created or copied through this flow.
 Selected read tools resolve CI runs, issues, and Knowledge pages through the human delegator's
-live Myelin permissions, returning canonical references without GitHub, Linear, or Notion keys.
+live Myelin permissions. A selected `knowledge.link_work` tool can add one attributed,
+retry-safe delivery link to a page the delegator owns. Both paths use canonical references without
+GitHub, Linear, or Notion keys.
 
 Hosted agents use the same identity and tool catalogue, but Myelin owns their execution. An
 `automation` binds a canonical platform event to one hosted agent, a plain-language task, an

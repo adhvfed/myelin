@@ -24,6 +24,7 @@ pub mod git_wire_http;
 pub mod issue_authz;
 pub mod issue_effect;
 pub mod issues_http;
+pub mod knowledge_effect;
 pub mod knowledge_http;
 pub mod mcp_read;
 pub mod notif_http;
@@ -97,7 +98,11 @@ pub use issues_http::{
     register_issues, DurableIssueMutationApi, DurableIssueReadApi, IssueCreateRequest,
     MAX_ISSUE_IMPORT_JSON_BYTES, MAX_ISSUE_IMPORT_RECORDS, MAX_ISSUE_JSON_BYTES,
 };
-pub use knowledge_http::{register_knowledge, DurableKnowledgeReadApi};
+pub use knowledge_effect::KnowledgeEffectApi;
+pub use knowledge_http::{
+    register_knowledge, DurableKnowledgeMutationApi, DurableKnowledgeReadApi, KnowledgeLinkOutcome,
+    KnowledgeLinkRequest,
+};
 pub use mcp_read::McpReadExecutor;
 pub use notif_http::register_notif;
 pub use privacy_http::register_privacy;

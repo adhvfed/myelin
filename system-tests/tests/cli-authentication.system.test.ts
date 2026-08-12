@@ -495,6 +495,7 @@ describe("the CLI authentication journey", () => {
           "issues.create",
           "issues.list",
           "issues.view",
+          "knowledge.link_work",
           "knowledge.list_pages",
           "knowledge.read_page",
           "chat.list_conversations",
@@ -535,6 +536,8 @@ describe("the CLI authentication journey", () => {
         "issues.list",
         "--tool",
         "issues.view",
+        "--tool",
+        "knowledge.link_work",
         "--tool",
         "knowledge.list_pages",
         "--tool",
@@ -584,6 +587,7 @@ describe("the CLI authentication journey", () => {
             { name: "issues.create", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
+            { name: "knowledge.link_work", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
             { name: "knowledge.read_page", version: 1 },
           ],
@@ -594,6 +598,7 @@ describe("the CLI authentication journey", () => {
             "edge.identity.read",
             "issue.create",
             "issue.view",
+            "knowledge.edit",
             "knowledge.read",
             "repo.pull",
             "repo.push",
@@ -620,6 +625,7 @@ describe("the CLI authentication journey", () => {
           "issues.create",
           "issues.list",
           "issues.view",
+          "knowledge.link_work",
           "knowledge.list_pages",
           "knowledge.read_page",
           "chat.list_conversations",
@@ -661,6 +667,8 @@ describe("the CLI authentication journey", () => {
         "issues.list",
         "--tool",
         "issues.view",
+        "--tool",
+        "knowledge.link_work",
         "--tool",
         "knowledge.list_pages",
         "--tool",
@@ -915,6 +923,7 @@ describe("the CLI authentication journey", () => {
             { name: "issues.create", version: 1 },
             { name: "issues.list", version: 1 },
             { name: "issues.view", version: 1 },
+            { name: "knowledge.link_work", version: 1 },
             { name: "knowledge.list_pages", version: 1 },
             { name: "knowledge.read_page", version: 1 },
           ],
@@ -1005,6 +1014,7 @@ describe("the CLI authentication journey", () => {
         "issues.create",
         "issues.list",
         "issues.view",
+        "knowledge.link_work",
         "knowledge.list_pages",
         "knowledge.read_page",
       ]);
@@ -1068,6 +1078,11 @@ describe("the CLI authentication journey", () => {
       expect(schemaFor("issues.view")).toMatchObject({
         type: "object",
         required: ["issue_id"],
+        additionalProperties: false,
+      });
+      expect(schemaFor("knowledge.link_work")).toMatchObject({
+        type: "object",
+        required: ["page_id", "reference"],
         additionalProperties: false,
       });
       expect(schemaFor("knowledge.list_pages")).toMatchObject({
@@ -1166,6 +1181,7 @@ describe("the CLI authentication journey", () => {
         "issues.create",
         "issues.list",
         "issues.view",
+        "knowledge.link_work",
         "knowledge.list_pages",
         "knowledge.read_page",
       ]);
@@ -1415,8 +1431,113 @@ describe("the CLI authentication journey", () => {
       const pageEnvelope = record(JSON.parse(contextualPage.stdout), "CLI knowledge page");
       const knowledgePage = record(pageEnvelope.page, "CLI knowledge document");
       const knowledgePageId = string(knowledgePage.id, "CLI knowledge page id");
+      const knowledgePageRef = `myelin://${systemTestConfig.tenant}/knowledge/page/${knowledgePageId}`;
+      const contextualIssueRef = `myelin://${systemTestConfig.tenant}/issue/issue/${issueKey}`;
       expect(pageEnvelope).toMatchObject({ created: true, durable: true });
-      expect(knowledgePage).toMatchObject({ title: knowledgeTitle, visibility: "team" });
+      expect(knowledgePage).toMatchObject({
+        title: knowledgeTitle,
+        visibility: "team",
+        ref: knowledgePageRef,
+      });
+
+      // A developer can connect the living spec to delivery work without downloading and
+      // replacing the document. The one retry identity names one block, so an ambiguous response
+      // can be repeated safely and a changed payload is refused instead of becoming a second link.
+      const humanKnowledgeLinkKey = `cli-context-link-${randomUUID()}`;
+      const linkedFromCli = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        humanKnowledgeLinkKey,
+        "doc",
+        "page",
+        "link",
+        knowledgePageId,
+        contextualIssueRef,
+        "--note",
+        "Delivery is tracked by",
+      );
+      expect(linkedFromCli.exitCode, linkedFromCli.stderr).toBe(0);
+      const humanLinkReceipt = record(
+        JSON.parse(linkedFromCli.stdout),
+        "CLI Knowledge link receipt",
+      );
+      const humanLinkBlockRef = string(humanLinkReceipt.block_ref, "CLI Knowledge block ref");
+      expect(humanLinkReceipt).toMatchObject({
+        linked: true,
+        durable: true,
+        page_id: knowledgePageId,
+        page_ref: knowledgePageRef,
+        version: 2,
+      });
+      expect(humanLinkBlockRef).toMatch(
+        new RegExp(`^${knowledgePageRef}#b[0-9A-HJKMNP-TV-Z]{26}$`),
+      );
+
+      const replayedCliLink = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        humanKnowledgeLinkKey,
+        "doc",
+        "page",
+        "link",
+        knowledgePageId,
+        contextualIssueRef,
+        "--note",
+        "Delivery is tracked by",
+      );
+      expect(replayedCliLink.exitCode, replayedCliLink.stderr).toBe(0);
+      expect(JSON.parse(replayedCliLink.stdout)).toEqual({
+        ...humanLinkReceipt,
+        linked: false,
+      });
+
+      const conflictingCliLink = await runCli(
+        configDirectory,
+        "--json",
+        "--idempotency-key",
+        humanKnowledgeLinkKey,
+        "doc",
+        "page",
+        "link",
+        knowledgePageId,
+        contextualIssueRef,
+        "--note",
+        "The same key cannot silently change this note",
+      );
+      expect(conflictingCliLink.exitCode).toBe(1);
+      expect(conflictingCliLink.stdout).toBe("");
+      expect(conflictingCliLink.stderr).toContain(
+        "idempotency key already identifies a different Knowledge link",
+      );
+
+      const pageAfterHumanLink = await runCli(
+        configDirectory,
+        "--json",
+        "doc",
+        "page",
+        "get",
+        knowledgePageId,
+      );
+      expect(pageAfterHumanLink.exitCode, pageAfterHumanLink.stderr).toBe(0);
+      expect(
+        array(
+          record(
+            record(JSON.parse(pageAfterHumanLink.stdout), "linked Knowledge envelope").page,
+            "linked Knowledge page",
+          ).blocks,
+          "linked Knowledge blocks",
+        ),
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            markdown: "Delivery is tracked by \u{FFFC}",
+            references: [contextualIssueRef],
+            is_you: true,
+          }),
+        ]),
+      );
 
       const chatChannel = `delivery-${randomUUID().replaceAll("-", "").slice(0, 8)}`;
       const chatTopic = uniqueName("Release coordination");
@@ -1864,6 +1985,116 @@ describe("the CLI authentication journey", () => {
           humanVisibleAgentIssue.key,
           "human-visible agent issue key",
         )}`,
+      );
+
+      // The collaborator can add context to the human-owned living spec through the same
+      // governed surface. Myelin records an agent-authored encrypted block, while the founder's
+      // live ownership remains the resource authority; neither identity is flattened into the
+      // other and retrying the logical effect cannot append a duplicate.
+      const agentKnowledgeLinkKey = `agent-knowledge-link-${randomUUID()}`;
+      const linkedByAgent = await askAgentToAct(
+        resumedRun,
+        20,
+        "knowledge.link_work",
+        {
+          page_id: knowledgePageId,
+          reference: agentPullRequestRef,
+          note: "Implementation is reviewed in",
+        },
+        agentKnowledgeLinkKey,
+      );
+      const replayedAgentKnowledgeLink = await askAgentToAct(
+        resumedRun,
+        21,
+        "knowledge.link_work",
+        {
+          page_id: knowledgePageId,
+          reference: agentPullRequestRef,
+          note: "Implementation is reviewed in",
+        },
+        agentKnowledgeLinkKey,
+      );
+      const linkedByAgentData = record(
+        linkedByAgent.data,
+        "agent Knowledge link receipt data",
+      );
+      expect(replayedAgentKnowledgeLink).toEqual({
+        ...linkedByAgent,
+        data: { ...linkedByAgentData, linked: false },
+      });
+      expect(linkedByAgent.ref).toMatch(
+        new RegExp(`^${knowledgePageRef}#b[0-9A-HJKMNP-TV-Z]{26}$`),
+      );
+      expect(linkedByAgentData).toMatchObject({
+        page_id: knowledgePageId,
+        page_ref: knowledgePageRef,
+        version: 3,
+        linked: true,
+      });
+
+      const pageAfterAgentLink = await runCli(
+        configDirectory,
+        "--json",
+        "doc",
+        "page",
+        "get",
+        knowledgePageId,
+      );
+      expect(pageAfterAgentLink.exitCode, pageAfterAgentLink.stderr).toBe(0);
+      const collaborativeBlocks = array(
+        record(
+          record(JSON.parse(pageAfterAgentLink.stdout), "collaborative Knowledge envelope").page,
+          "collaborative Knowledge page",
+        ).blocks,
+        "collaborative Knowledge blocks",
+      ).map((block, index) => record(block, `collaborative Knowledge block ${index}`));
+      expect(
+        collaborativeBlocks.filter((block) =>
+          array(block.references, "collaborative Knowledge references").includes(
+            agentPullRequestRef,
+          )
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          markdown: "Implementation is reviewed in \u{FFFC}",
+          references: [agentPullRequestRef],
+          is_you: false,
+        }),
+      ]);
+
+      const livingSpecContext = await eventually<JsonRecord>(
+        async () => {
+          const listed = await runCli(
+            configDirectory,
+            "--json",
+            "ref",
+            "links",
+            knowledgePageRef,
+          );
+          expect(listed.exitCode, listed.stderr).toBe(0);
+          const response = record(JSON.parse(listed.stdout), "living spec outgoing context");
+          const targets = array(response.items, "living spec context targets")
+            .map((item, index) => record(item, `living spec context target ${index}`));
+          return targets.some((item) => item.target_root_ref === contextualIssueRef)
+              && targets.some((item) => item.target_root_ref === agentPullRequestRef)
+            ? response
+            : undefined;
+        },
+        { description: "the living spec to lead to both human and agent delivery context" },
+      );
+      expect(array(livingSpecContext.items, "living spec outgoing context items")).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            source_root_ref: knowledgePageRef,
+            target_root_ref: contextualIssueRef,
+            relation: "links",
+          }),
+          expect.objectContaining({
+            source_root_ref: knowledgePageRef,
+            target_root_ref: agentPullRequestRef,
+            relation: "links",
+          }),
+        ]),
       );
 
       const agentChatMessage = `${uniqueName("Agent verified the release context")} \u{FFFC} \u{FFFC}`;

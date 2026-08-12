@@ -3111,6 +3111,7 @@ dependencies = [
  "myelin-chat",
  "myelin-ci-controlplane",
  "myelin-config",
+ "myelin-content",
  "myelin-edge",
  "myelin-events",
  "myelin-flow",

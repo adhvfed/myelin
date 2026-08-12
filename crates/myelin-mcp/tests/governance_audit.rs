@@ -243,3 +243,57 @@ fn issue_create_governance_has_a_durable_registered_taxonomy() {
         );
     }
 }
+
+#[test]
+fn knowledge_link_work_governance_has_a_durable_registered_taxonomy() {
+    let store = OutboxStore::new();
+    let audit = OutboxGovernanceAudit::new(store.clone(), Arc::new(MonotonicMinter::new()));
+    let actor = actor();
+    let scope = TenantScope::from_verified_token(&actor, actor.region.clone());
+    let run = RunId("run:knowledge-link-work".into());
+    let now = Timestamp("2026-07-18T00:00:00Z".into());
+
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            target: GovernanceAuditTarget::Run,
+            tool: "knowledge.link_work",
+            jti: "jti:knowledge-link-work",
+            phase: AuditPhase::Attempt,
+            outcome: None,
+            now: &now,
+        })
+        .unwrap();
+    let applied = CallOutcome::Applied {
+        event_id: "knowledge.link_work:block-1".into(),
+        resource: None,
+        jti: "jti:knowledge-link-work".into(),
+    };
+    audit
+        .record(GovernanceAuditRecord {
+            scope: &scope,
+            actor: &actor,
+            run_id: &run,
+            target: GovernanceAuditTarget::Run,
+            tool: "knowledge.link_work",
+            jti: "jti:knowledge-link-work",
+            phase: AuditPhase::Outcome,
+            outcome: Some(GovernanceAuditOutcome::Effect(&applied)),
+            now: &now,
+        })
+        .unwrap();
+
+    let rows = store.committed_rows();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].envelope.type_.0, "knowledge.link_work.attempted");
+    assert_eq!(rows[1].envelope.type_.0, "knowledge.link_work.applied");
+    for row in rows {
+        assert!(
+            myelin_content::events::KNOWLEDGE_GOVERNANCE_AUDIT_EVENT_TOKENS
+                .contains(&row.envelope.type_.0.as_str()),
+            "every Knowledge link governance event belongs to Knowledge's durable taxonomy"
+        );
+    }
+}

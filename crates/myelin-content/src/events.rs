@@ -45,6 +45,19 @@ pub const KNOWLEDGE_PAGE_SNAPSHOT: &str = "knowledge.page.snapshot";
 pub const KNOWLEDGE_BLOCK_SNAPSHOT: &str = "knowledge.block.snapshot";
 pub const KNOWLEDGE_ROW_SNAPSHOT: &str = "knowledge.row.snapshot";
 
+pub const KNOWLEDGE_LINK_WORK_ATTEMPTED: &str = "knowledge.link_work.attempted";
+pub const KNOWLEDGE_LINK_WORK_APPLIED: &str = "knowledge.link_work.applied";
+pub const KNOWLEDGE_LINK_WORK_GATED: &str = "knowledge.link_work.gated";
+pub const KNOWLEDGE_LINK_WORK_DENIED: &str = "knowledge.link_work.denied";
+pub const KNOWLEDGE_LINK_WORK_INDETERMINATE: &str = "knowledge.link_work.indeterminate";
+pub const KNOWLEDGE_GOVERNANCE_AUDIT_EVENT_TOKENS: &[&str] = &[
+    KNOWLEDGE_LINK_WORK_ATTEMPTED,
+    KNOWLEDGE_LINK_WORK_APPLIED,
+    KNOWLEDGE_LINK_WORK_GATED,
+    KNOWLEDGE_LINK_WORK_DENIED,
+    KNOWLEDGE_LINK_WORK_INDETERMINATE,
+];
+
 pub const KNOWLEDGE_DURABLE_TOKENS: &[&str] = &[
     KNOWLEDGE_PAGE_CREATED,
     KNOWLEDGE_PAGE_UPDATED,
@@ -84,6 +97,11 @@ pub const KNOWLEDGE_DURABLE_TOKENS: &[&str] = &[
     KNOWLEDGE_PAGE_SNAPSHOT,
     KNOWLEDGE_BLOCK_SNAPSHOT,
     KNOWLEDGE_ROW_SNAPSHOT,
+    KNOWLEDGE_LINK_WORK_ATTEMPTED,
+    KNOWLEDGE_LINK_WORK_APPLIED,
+    KNOWLEDGE_LINK_WORK_GATED,
+    KNOWLEDGE_LINK_WORK_DENIED,
+    KNOWLEDGE_LINK_WORK_INDETERMINATE,
 ];
 
 pub const KNOWLEDGE_BLOCK_OP: &str = "knowledge.block.op";
@@ -165,6 +183,13 @@ mod tests {
                 tok.starts_with("knowledge."),
                 "foreign-subsystem token `{tok}`"
             );
+        }
+    }
+
+    #[test]
+    fn governance_audit_events_are_durable_knowledge_events() {
+        for token in KNOWLEDGE_GOVERNANCE_AUDIT_EVENT_TOKENS {
+            assert!(KNOWLEDGE_DURABLE_TOKENS.contains(token));
         }
     }
 }

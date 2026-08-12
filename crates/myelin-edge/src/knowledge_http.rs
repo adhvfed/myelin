@@ -7,10 +7,10 @@ use crate::Method;
 use myelin_events::{Actor, ArtifactRef, EventId, IdMinter, Timestamp};
 use myelin_identity::Principal;
 use myelin_knowledge::{
-    decrypt_text, encrypt_text, event_actor_pseudonym, page_ref, pseudonymized_event_principal,
-    KnowledgeBlockRecord, KnowledgePageError, KnowledgePageRecord, KnowledgePageStore,
-    KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage, MAX_BLOCK_REFERENCES,
-    MAX_PAGE_REFERENCES,
+    block_ref, decrypt_text, encrypt_text, event_actor_pseudonym, page_ref,
+    pseudonymized_event_principal, KnowledgeBlockRecord, KnowledgePageError, KnowledgePageRecord,
+    KnowledgePageStore, KnowledgeVisibility, NewKnowledgePage, SaveKnowledgePage,
+    MAX_BLOCK_REFERENCES, MAX_PAGE_REFERENCES,
 };
 use myelin_storage::encryption::KeyChoiceError;
 use myelin_storage::encryption::{EncryptedColumn, SubjectId};
@@ -22,6 +22,11 @@ use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::runtime::Handle;
+
+mod link;
+
+use link::link_outcome_json;
+pub use link::{KnowledgeLinkOutcome, KnowledgeLinkRequest};
 
 const MAX_KNOWLEDGE_JSON_BYTES: usize = 320 * 1024;
 const MAX_TITLE_BYTES: usize = 512;
@@ -105,12 +110,23 @@ impl DurableKnowledgeReadApi {
 }
 
 #[derive(Clone)]
-struct DurableKnowledgeApi {
+pub struct DurableKnowledgeMutationApi {
     reads: DurableKnowledgeReadApi,
     ids: Arc<dyn IdMinter>,
 }
 
-impl DurableKnowledgeApi {
+impl DurableKnowledgeMutationApi {
+    pub fn new(pool: PgPool, runtime: Handle, kms: Arc<KmsEngine>) -> Self {
+        Self {
+            reads: DurableKnowledgeReadApi::new(pool, runtime, kms),
+            ids: Arc::new(myelin_events::UlidMinter::new()),
+        }
+    }
+
+    pub fn reads(&self) -> DurableKnowledgeReadApi {
+        self.reads.clone()
+    }
+
     fn drive<F, T>(&self, future: F) -> Result<T, EdgeError>
     where
         F: std::future::Future<Output = Result<T, KnowledgePageError>>,
@@ -185,7 +201,7 @@ impl Handler for PageListHandler {
 }
 
 struct PageCreateHandler {
-    api: DurableKnowledgeApi,
+    api: DurableKnowledgeMutationApi,
 }
 
 impl Handler for PageCreateHandler {
@@ -276,7 +292,7 @@ impl Handler for PageGetHandler {
 }
 
 struct PageSaveHandler {
-    api: DurableKnowledgeApi,
+    api: DurableKnowledgeMutationApi,
 }
 
 impl Handler for PageSaveHandler {
@@ -410,17 +426,40 @@ impl Handler for PageSaveHandler {
     }
 }
 
+struct PageLinkHandler {
+    api: DurableKnowledgeMutationApi,
+}
+
+impl Handler for PageLinkHandler {
+    fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
+        require_empty_query(ctx)?;
+        let page_id = page_param(ctx)?;
+        let body: KnowledgeLinkRequest = parse_body(&ctx.request.body)?;
+        let idempotency_key = ctx
+            .request
+            .stable_idempotency_nonce(&ctx.principal.principal_id.0)?;
+        let outcome = self.api.link_work(
+            ctx.principal,
+            ctx.principal,
+            page_id,
+            body,
+            &idempotency_key,
+        )?;
+        Ok(no_store(EdgeResponse::json(
+            if outcome.created { 201 } else { 200 },
+            &link_outcome_json(&outcome),
+        )))
+    }
+}
+
 pub fn register_knowledge(
     builder: GatewayBuilder,
     pool: PgPool,
     runtime: Handle,
     kms: Arc<KmsEngine>,
 ) -> GatewayBuilder {
-    let reads = DurableKnowledgeReadApi::new(pool, runtime, kms);
-    let api = DurableKnowledgeApi {
-        reads: reads.clone(),
-        ids: Arc::new(myelin_events::UlidMinter::new()),
-    };
+    let api = DurableKnowledgeMutationApi::new(pool, runtime, kms);
+    let reads = api.reads();
     builder
         .route(
             Method::Get,
@@ -444,7 +483,13 @@ pub fn register_knowledge(
             Method::Put,
             "/v1/knowledge/pages/{page}",
             "knowledge.page.save",
-            Arc::new(PageSaveHandler { api }),
+            Arc::new(PageSaveHandler { api: api.clone() }),
+        )
+        .route(
+            Method::Post,
+            "/v1/knowledge/pages/{page}/links",
+            "knowledge.page.link",
+            Arc::new(PageLinkHandler { api }),
         )
 }
 

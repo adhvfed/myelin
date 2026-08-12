@@ -16,10 +16,25 @@ pub(super) fn render_response(value: &Value) -> Option<String> {
     if let Some(page) = value.get("page") {
         return render_page_document(page);
     }
+    if let Some(link) = render_knowledge_link(value) {
+        return Some(format!("{link}\n"));
+    }
     value
         .get("message_id")
         .and_then(Value::as_str)
         .map(|id| format!("sent ({})\n", terminal_safe_single_line(id)))
+}
+
+fn render_knowledge_link(value: &Value) -> Option<String> {
+    if !value.get("durable")?.as_bool()? {
+        return None;
+    }
+    let linked = value.get("linked")?.as_bool()?;
+    let page_ref = terminal_safe_single_line(value.get("page_ref")?.as_str()?);
+    let block_ref = terminal_safe_single_line(value.get("block_ref")?.as_str()?);
+    let version = value.get("version")?.as_i64()?;
+    let action = if linked { "linked" } else { "already linked" };
+    Some(format!("{action} {block_ref} on {page_ref} (v{version})"))
 }
 
 pub(super) fn render_collection_header(value: &Value) -> Option<String> {
@@ -243,6 +258,28 @@ mod tests {
             output,
             format!("Runbook  [team]  v1  ({ID})\n  heading: Recovery\\nsteps\n")
         );
+    }
+
+    #[test]
+    fn knowledge_links_are_legible_and_honest_about_replays() {
+        let response = |linked| {
+            json!({
+                "linked": linked,
+                "durable": true,
+                "page_ref": format!("myelin://acme/knowledge/page/{ID}"),
+                "block_ref": format!("myelin://acme/knowledge/page/{ID}#b{ID}"),
+                "version": 2,
+            })
+        };
+        assert_eq!(
+            render_response(&response(true)).unwrap(),
+            format!(
+                "linked myelin://acme/knowledge/page/{ID}#b{ID} on myelin://acme/knowledge/page/{ID} (v2)\n"
+            )
+        );
+        assert!(render_response(&response(false))
+            .unwrap()
+            .starts_with("already linked "));
     }
 
     #[test]

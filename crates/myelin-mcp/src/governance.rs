@@ -462,6 +462,17 @@ fn audit_event_type(
         ("issues.create", "gated") => Ok(myelin_issues::events::ISSUE_CREATE_GATED),
         ("issues.create", "denied") => Ok(myelin_issues::events::ISSUE_CREATE_DENIED),
         ("issues.create", "indeterminate") => Ok(myelin_issues::events::ISSUE_CREATE_INDETERMINATE),
+        ("knowledge.link_work", "attempted") => {
+            Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_ATTEMPTED)
+        }
+        ("knowledge.link_work", "applied") => {
+            Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_APPLIED)
+        }
+        ("knowledge.link_work", "gated") => Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_GATED),
+        ("knowledge.link_work", "denied") => Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_DENIED),
+        ("knowledge.link_work", "indeterminate") => {
+            Ok(myelin_content::events::KNOWLEDGE_LINK_WORK_INDETERMINATE)
+        }
         _ => Err("governance audit refused an unregistered tool/outcome taxonomy".into()),
     }
 }

@@ -36,8 +36,8 @@ use crate::request::EdgeResponse;
 use crate::runtime::drive_edge_future;
 use crate::{
     ChatEffectApi, DurableChatMutationApi, DurableChatReadApi, DurableCiReadApi, DurableGitBackend,
-    DurableIssueMutationApi, DurableKnowledgeReadApi, GitEffectApi, IssueEffectApi,
-    McpReadExecutor, RoutedEffectApi,
+    DurableIssueMutationApi, DurableKnowledgeMutationApi, DurableKnowledgeReadApi, GitEffectApi,
+    IssueEffectApi, KnowledgeEffectApi, McpReadExecutor, RoutedEffectApi,
 };
 
 #[derive(Clone)]
@@ -76,6 +76,7 @@ pub struct AgentMcpResources {
     ci: DurableCiReadApi,
     issues: DurableIssueMutationApi,
     knowledge: DurableKnowledgeReadApi,
+    knowledge_mutations: DurableKnowledgeMutationApi,
     chat: DurableChatReadApi,
     chat_mutations: DurableChatMutationApi,
 }
@@ -85,7 +86,7 @@ impl AgentMcpResources {
         git: Arc<DurableGitBackend>,
         ci: DurableCiReadApi,
         issues: DurableIssueMutationApi,
-        knowledge: DurableKnowledgeReadApi,
+        knowledge: DurableKnowledgeMutationApi,
         chat: DurableChatReadApi,
         chat_mutations: DurableChatMutationApi,
     ) -> Self {
@@ -93,7 +94,8 @@ impl AgentMcpResources {
             git,
             ci,
             issues,
-            knowledge,
+            knowledge: knowledge.reads(),
+            knowledge_mutations: knowledge,
             chat,
             chat_mutations,
         }
@@ -447,6 +449,15 @@ impl Handler for AgentMcpHandler {
                     "issues",
                     Box::new(IssueEffectApi::new(
                         self.services.resources.issues.clone(),
+                        ctx.principal.clone(),
+                        delegator.clone(),
+                        self.services.authority.boundary.clone(),
+                    )) as Box<dyn myelin_agent::EffectApi>,
+                ),
+                (
+                    "knowledge",
+                    Box::new(KnowledgeEffectApi::new(
+                        self.services.resources.knowledge_mutations.clone(),
                         ctx.principal.clone(),
                         delegator.clone(),
                         self.services.authority.boundary.clone(),

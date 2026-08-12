@@ -50,6 +50,7 @@ pub fn requires_approval_default(subsystem: &str, tool: &str) -> bool {
         ("knowledge", "comment") => false,
         ("knowledge", "list_pages") => false,
         ("knowledge", "read_page") => false,
+        ("knowledge", "link_work") => false,
 
         ("chat", "post_message") => false,
         ("chat", "post") => false,
