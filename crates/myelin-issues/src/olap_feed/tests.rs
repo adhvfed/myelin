@@ -58,14 +58,17 @@ fn consumer() -> IssueOlapConsumer {
 fn zero_oltp_reads_from_the_analytics_path() {
     let c = consumer();
     assert_eq!(c.oltp_read_count(), 0, "0 OLTP reads before any feed");
-    let outcome = c.handle(&ev(
-        "e1",
-        events::ISSUE_TRANSITIONED,
-        "psn:alice",
-        "myelin://acme/issue/issue/ENG-1",
-        "issue:ENG-1",
-        serde_json::json!({ "category": "completed" }),
-    ), &mut myelin_events::HandlerTx::none());
+    let outcome = c.handle(
+        &ev(
+            "e1",
+            events::ISSUE_TRANSITIONED,
+            "psn:alice",
+            "myelin://acme/issue/issue/ENG-1",
+            "issue:ENG-1",
+            serde_json::json!({ "category": "completed" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     assert_eq!(outcome, HandleOutcome::Done);
     assert_eq!(
         c.oltp_read_count(),
@@ -90,8 +93,15 @@ fn consumer_is_idempotent_on_event_id() {
         "issue:ENG-1",
         serde_json::json!({}),
     );
-    assert_eq!(c.handle(&e, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
-    assert_eq!(c.handle(&e, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done, "redelivery is a no-op");
+    assert_eq!(
+        c.handle(&e, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done
+    );
+    assert_eq!(
+        c.handle(&e, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done,
+        "redelivery is a no-op"
+    );
     assert_eq!(c.doc_count(), 1, "exactly one projected doc");
 }
 
@@ -106,7 +116,11 @@ fn non_analytics_token_is_dropped() {
         "issue:ENG-1",
         serde_json::json!({}),
     );
-    assert_eq!(c.handle(&e, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done, "dropped, not an error");
+    assert_eq!(
+        c.handle(&e, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done,
+        "dropped, not an error"
+    );
     assert_eq!(c.doc_count(), 0, "a non-analytics token projects nothing");
     assert!(
         c.subjects().iter().all(|s| s.0 != "*"),
@@ -128,7 +142,10 @@ fn out_of_region_event_is_non_retryable_poison() {
     );
     e.region = Region("us-east".into());
     assert!(
-        matches!(c.handle(&e, &mut myelin_events::HandlerTx::none()), HandleOutcome::NonRetryable(_)),
+        matches!(
+            c.handle(&e, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::NonRetryable(_)
+        ),
         "an out-of-region event is poison (the residency boundary)"
     );
     assert_eq!(
@@ -143,14 +160,17 @@ fn restricted_subject_excluded_from_every_aggregate() {
     let flag = RestrictionFlag::new();
     let c = IssueOlapConsumer::new(region(), flag.clone());
     for (id, subj) in [("a1", "psn:alice"), ("a2", "psn:alice"), ("b1", "psn:bob")] {
-        c.handle(&ev(
-            id,
-            events::ISSUE_TRANSITIONED,
-            subj,
-            subj,
-            &format!("issue:{id}"),
-            serde_json::json!({ "category": "completed" }),
-        ), &mut myelin_events::HandlerTx::none());
+        c.handle(
+            &ev(
+                id,
+                events::ISSUE_TRANSITIONED,
+                subj,
+                subj,
+                &format!("issue:{id}"),
+                serde_json::json!({ "category": "completed" }),
+            ),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
     c.analytics(|a| {
         assert_eq!(a.velocity(), 3, "all three contribute unrestricted");
@@ -162,14 +182,17 @@ fn restricted_subject_excluded_from_every_aggregate() {
         );
     });
     flag.set("psn:alice", true);
-    c.handle(&ev(
-        "b1",
-        events::ISSUE_TRANSITIONED,
-        "psn:bob",
-        "psn:bob",
-        "issue:b1",
-        serde_json::json!({ "category": "completed" }),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "b1",
+            events::ISSUE_TRANSITIONED,
+            "psn:bob",
+            "psn:bob",
+            "issue:b1",
+            serde_json::json!({ "category": "completed" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| {
         assert_eq!(a.velocity(), 1, "alice's two rows excluded → only bob");
         assert_eq!(a.cfd().len(), 1, "only bob's CFD row survives");
@@ -187,34 +210,43 @@ fn restriction_lifts_subject_reappears() {
     let flag = RestrictionFlag::new();
     let c = IssueOlapConsumer::new(region(), flag.clone());
     for (id, subj) in [("a1", "psn:alice"), ("b1", "psn:bob")] {
-        c.handle(&ev(
-            id,
-            events::ISSUE_TRANSITIONED,
-            subj,
-            subj,
-            &format!("issue:{id}"),
-            serde_json::json!({ "category": "completed" }),
-        ), &mut myelin_events::HandlerTx::none());
+        c.handle(
+            &ev(
+                id,
+                events::ISSUE_TRANSITIONED,
+                subj,
+                subj,
+                &format!("issue:{id}"),
+                serde_json::json!({ "category": "completed" }),
+            ),
+            &mut myelin_events::HandlerTx::none(),
+        );
     }
     flag.set("psn:alice", true);
-    c.handle(&ev(
-        "a1",
-        events::ISSUE_TRANSITIONED,
-        "psn:alice",
-        "psn:alice",
-        "issue:a1",
-        serde_json::json!({ "category": "completed" }),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "a1",
+            events::ISSUE_TRANSITIONED,
+            "psn:alice",
+            "psn:alice",
+            "issue:a1",
+            serde_json::json!({ "category": "completed" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| assert_eq!(a.velocity(), 1, "alice withheld"));
     flag.set("psn:alice", false);
-    c.handle(&ev(
-        "a1",
-        events::ISSUE_TRANSITIONED,
-        "psn:alice",
-        "psn:alice",
-        "issue:a1",
-        serde_json::json!({ "category": "completed" }),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "a1",
+            events::ISSUE_TRANSITIONED,
+            "psn:alice",
+            "psn:alice",
+            "issue:a1",
+            serde_json::json!({ "category": "completed" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| {
         assert_eq!(
             a.velocity(),
@@ -227,30 +259,39 @@ fn restriction_lifts_subject_reappears() {
 #[test]
 fn sla_compliance_is_met_over_met_plus_breached() {
     let c = consumer();
-    c.handle(&ev(
-        "m1",
-        events::SLA_MET,
-        "psn:a",
-        "issue:1",
-        "issue:1",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
-    c.handle(&ev(
-        "m2",
-        events::SLA_MET,
-        "psn:b",
-        "issue:2",
-        "issue:2",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
-    c.handle(&ev(
-        "x1",
-        events::SLA_BREACHED,
-        "psn:c",
-        "issue:3",
-        "issue:3",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "m1",
+            events::SLA_MET,
+            "psn:a",
+            "issue:1",
+            "issue:1",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    c.handle(
+        &ev(
+            "m2",
+            events::SLA_MET,
+            "psn:b",
+            "issue:2",
+            "issue:2",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    c.handle(
+        &ev(
+            "x1",
+            events::SLA_BREACHED,
+            "psn:c",
+            "issue:3",
+            "issue:3",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| {
         assert_eq!(a.sla_sample_size(), 3, "three SLA outcomes contribute");
         let compliance = a.sla_compliance().expect("a compliance ratio");
@@ -264,23 +305,29 @@ fn sla_compliance_is_met_over_met_plus_breached() {
 #[test]
 fn sla_compliance_one_when_all_met_and_drops_on_breach() {
     let c = consumer();
-    c.handle(&ev(
-        "m1",
-        events::SLA_MET,
-        "psn:a",
-        "issue:1",
-        "issue:1",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "m1",
+            events::SLA_MET,
+            "psn:a",
+            "issue:1",
+            "issue:1",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| assert_eq!(a.sla_compliance(), Some(1.0), "all met → 1.0"));
-    c.handle(&ev(
-        "x1",
-        events::SLA_BREACHED,
-        "psn:b",
-        "issue:2",
-        "issue:2",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "x1",
+            events::SLA_BREACHED,
+            "psn:b",
+            "issue:2",
+            "issue:2",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| {
         assert_eq!(
             a.sla_compliance(),
@@ -293,14 +340,17 @@ fn sla_compliance_one_when_all_met_and_drops_on_breach() {
 #[test]
 fn sla_compliance_is_none_without_outcomes() {
     let c = consumer();
-    c.handle(&ev(
-        "t1",
-        events::ISSUE_TRANSITIONED,
-        "psn:a",
-        "issue:1",
-        "issue:1",
-        serde_json::json!({ "category": "started" }),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "t1",
+            events::ISSUE_TRANSITIONED,
+            "psn:a",
+            "issue:1",
+            "issue:1",
+            serde_json::json!({ "category": "started" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| {
         assert_eq!(a.sla_sample_size(), 0, "no SLA outcomes");
         assert_eq!(
@@ -315,22 +365,28 @@ fn sla_compliance_is_none_without_outcomes() {
 fn restricted_subject_excluded_from_sla_compliance() {
     let flag = RestrictionFlag::new();
     let c = IssueOlapConsumer::new(region(), flag.clone());
-    c.handle(&ev(
-        "m1",
-        events::SLA_MET,
-        "psn:alice",
-        "psn:alice",
-        "issue:1",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
-    c.handle(&ev(
-        "x1",
-        events::SLA_BREACHED,
-        "psn:bob",
-        "psn:bob",
-        "issue:2",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "m1",
+            events::SLA_MET,
+            "psn:alice",
+            "psn:alice",
+            "issue:1",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    c.handle(
+        &ev(
+            "x1",
+            events::SLA_BREACHED,
+            "psn:bob",
+            "psn:bob",
+            "issue:2",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| {
         assert_eq!(
             a.sla_compliance(),
@@ -339,14 +395,17 @@ fn restricted_subject_excluded_from_sla_compliance() {
         );
     });
     flag.set("psn:alice", true);
-    c.handle(&ev(
-        "m1",
-        events::SLA_MET,
-        "psn:alice",
-        "psn:alice",
-        "issue:1",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    c.handle(
+        &ev(
+            "m1",
+            events::SLA_MET,
+            "psn:alice",
+            "psn:alice",
+            "issue:1",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     c.analytics(|a| {
         assert_eq!(a.sla_sample_size(), 1, "only bob's SLA outcome contributes");
         assert_eq!(
@@ -365,22 +424,28 @@ fn restricted_subject_excluded_from_sla_compliance() {
 #[test]
 fn reindex_from_source_byte_matches_live() {
     let live = consumer();
-    live.handle(&ev(
-        "t1",
-        events::ISSUE_TRANSITIONED,
-        "psn:a",
-        "myelin://acme/issue/issue/ENG-1",
-        "myelin://acme/issue/issue/ENG-1",
-        serde_json::json!({ "category": "completed" }),
-    ), &mut myelin_events::HandlerTx::none());
-    live.handle(&ev(
-        "m1",
-        events::SLA_MET,
-        "psn:b",
-        "myelin://acme/issue/issue/ENG-2",
-        "myelin://acme/issue/issue/ENG-2",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    live.handle(
+        &ev(
+            "t1",
+            events::ISSUE_TRANSITIONED,
+            "psn:a",
+            "myelin://acme/issue/issue/ENG-1",
+            "myelin://acme/issue/issue/ENG-1",
+            serde_json::json!({ "category": "completed" }),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    live.handle(
+        &ev(
+            "m1",
+            events::SLA_MET,
+            "psn:b",
+            "myelin://acme/issue/issue/ENG-2",
+            "myelin://acme/issue/issue/ENG-2",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
 
     let mut source = IssueReindexSource::new();
     source.upsert(
@@ -471,31 +536,40 @@ fn erased_aggregate_skipped_on_reindex() {
 fn olap_feed_signal_is_green() {
     let flag = RestrictionFlag::new();
     let live = IssueOlapConsumer::new(region(), flag.clone());
-    live.handle(&ev(
-        "a1",
-        events::SLA_MET,
-        "psn:alice",
-        "psn:alice",
-        "issue:1",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
-    live.handle(&ev(
-        "b1",
-        events::SLA_MET,
-        "psn:bob",
-        "psn:bob",
-        "issue:2",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    live.handle(
+        &ev(
+            "a1",
+            events::SLA_MET,
+            "psn:alice",
+            "psn:alice",
+            "issue:1",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
+    live.handle(
+        &ev(
+            "b1",
+            events::SLA_MET,
+            "psn:bob",
+            "psn:bob",
+            "issue:2",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
     flag.set("psn:alice", true);
-    live.handle(&ev(
-        "a1",
-        events::SLA_MET,
-        "psn:alice",
-        "psn:alice",
-        "issue:1",
-        serde_json::json!({}),
-    ), &mut myelin_events::HandlerTx::none());
+    live.handle(
+        &ev(
+            "a1",
+            events::SLA_MET,
+            "psn:alice",
+            "psn:alice",
+            "issue:1",
+            serde_json::json!({}),
+        ),
+        &mut myelin_events::HandlerTx::none(),
+    );
 
     let leak = live.analytics(|a| a.leak_audit().restricted_subject_leak);
 

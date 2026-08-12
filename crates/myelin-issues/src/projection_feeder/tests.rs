@@ -215,8 +215,14 @@ fn subjects_whitelist_is_issue_updated_never_star() {
 fn handle_is_idempotent_on_event_id() {
     let feeder = ProjectionFeeder::new();
     let ev = updated_event("ev-1", "acme", "bug", &["severity"]);
-    assert_eq!(feeder.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
-    assert_eq!(feeder.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+    assert_eq!(
+        feeder.handle(&ev, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done
+    );
+    assert_eq!(
+        feeder.handle(&ev, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done
+    );
     assert!(!feeder.is_promoted(&FacetKey::new("acme", "bug", "severity")));
 }
 
@@ -244,7 +250,10 @@ fn handle_promotes_a_hot_facet_off_the_bus() {
     }
     assert!(!feeder.is_promoted(&facet), "not yet seen on the bus");
     assert_eq!(
-        feeder.handle(&updated_event("ev-3", "acme", "bug", &["severity"]), &mut myelin_events::HandlerTx::none()),
+        feeder.handle(
+            &updated_event("ev-3", "acme", "bug", &["severity"]),
+            &mut myelin_events::HandlerTx::none()
+        ),
         HandleOutcome::Done
     );
     assert!(
@@ -262,7 +271,10 @@ fn an_event_without_field_deltas_promotes_nothing() {
     let feeder = ProjectionFeeder::new();
     let mut ev = updated_event("ev-4", "acme", "bug", &[]);
     ev.payload = serde_json::json!({ "ref": "myelin://acme/issue/issue/ENG-1" });
-    assert_eq!(feeder.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+    assert_eq!(
+        feeder.handle(&ev, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done
+    );
     assert!(!feeder.is_promoted(&FacetKey::new("acme", "bug", "severity")));
 }
 

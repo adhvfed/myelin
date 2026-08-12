@@ -212,16 +212,7 @@ fn attachment_row_holds_zero_bytes_and_a_dek_pointer() {
     let bytes = b"a screenshot's PNG bytes that must NEVER touch the OLTP row";
     let subject = SubjectId("u42".into());
 
-    let pointer = attach(
-        &blob,
-        &tenant(),
-        &subject,
-        3,
-        "fr-par",
-        "image/png",
-        bytes,
-    )
-    .unwrap();
+    let pointer = attach(&blob, &tenant(), &subject, 3, "fr-par", "image/png", bytes).unwrap();
 
     assert_eq!(
         pointer.row_byte_count(),

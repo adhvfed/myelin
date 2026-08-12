@@ -3,12 +3,7 @@ pub use myelin_query::{
     order_key::{tiebreak, ConformanceStep, RankOp},
     parse_query,
     view::{FieldId, SortDir, SortSpec, ViewKind, ViewSpec},
-    CmpOp,
-    EvalContext,
-    Expr,
-    Predicate,
-    QueryAst,
-    CONFORMANCE_VECTOR,
+    CmpOp, EvalContext, Expr, Predicate, QueryAst, CONFORMANCE_VECTOR,
 };
 
 pub fn issues_replay_conformance_vector() -> Vec<String> {

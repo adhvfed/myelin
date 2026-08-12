@@ -384,10 +384,16 @@ fn handle_is_idempotent_on_event_id() {
     consumer.add_parent_edge(&child, &parent);
 
     let ev = updated_event("01J-1", &child.0);
-    assert_eq!(consumer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+    assert_eq!(
+        consumer.handle(&ev, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done
+    );
     assert_eq!(consumer.pending_recompute_count(), 1);
 
-    assert_eq!(consumer.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+    assert_eq!(
+        consumer.handle(&ev, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done
+    );
     assert_eq!(
         consumer.pending_recompute_count(),
         1,

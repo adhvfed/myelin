@@ -20,12 +20,8 @@ pub const VAR_ASSIGNEE: &str = "payload.assignee";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ArmableCondition {
     RemindWhenUnblocked,
-    PingWhenLeavesState {
-        x: String,
-    },
-    NotifyWhenAssignedToMe {
-        me: String,
-    },
+    PingWhenLeavesState { x: String },
+    NotifyWhenAssignedToMe { me: String },
     TellWhenSlaAtRisk,
     TellWhenInitiativeAtRisk,
 }

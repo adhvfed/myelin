@@ -191,9 +191,7 @@ struct PendingMutation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LocalMutationError {
-    AlreadyPending {
-        mutation_id: String,
-    },
+    AlreadyPending { mutation_id: String },
 }
 
 impl core::fmt::Display for LocalMutationError {

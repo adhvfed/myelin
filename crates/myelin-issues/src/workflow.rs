@@ -253,16 +253,9 @@ pub struct TransitionPlan {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransitionBlocked {
-    NoSuchTransition {
-        from: String,
-        to: String,
-    },
-    GuardFailed {
-        reason: String,
-    },
-    MissingRequiredField {
-        field: String,
-    },
+    NoSuchTransition { from: String, to: String },
+    GuardFailed { reason: String },
+    MissingRequiredField { field: String },
 }
 
 impl TransitionBlocked {
@@ -289,19 +282,10 @@ impl std::error::Error for TransitionBlocked {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WorkflowError {
-    Malformed {
-        reason: String,
-    },
-    UnknownCategory {
-        token: String,
-    },
-    UnknownState {
-        state: String,
-    },
-    DuplicateTransition {
-        from: String,
-        to: String,
-    },
+    Malformed { reason: String },
+    UnknownCategory { token: String },
+    UnknownState { state: String },
+    DuplicateTransition { from: String, to: String },
 }
 
 impl std::fmt::Display for WorkflowError {

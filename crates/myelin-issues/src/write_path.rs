@@ -29,22 +29,11 @@ pub struct IssueDraft {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MutationKind {
     Create(IssueDraft),
-    Update {
-        delta: Vec<u8>,
-    },
-    Transition {
-        from: String,
-        to: String,
-    },
-    Assign {
-        assignee_pseudonym: String,
-    },
-    Watch {
-        watcher_pseudonym: String,
-    },
-    ConfidentialGrant {
-        grantee_pseudonym: String,
-    },
+    Update { delta: Vec<u8> },
+    Transition { from: String, to: String },
+    Assign { assignee_pseudonym: String },
+    Watch { watcher_pseudonym: String },
+    ConfidentialGrant { grantee_pseudonym: String },
 }
 
 impl MutationKind {
@@ -1073,5 +1062,4 @@ mod tests {
             "nothing written when the key cannot be minted"
         );
     }
-
 }

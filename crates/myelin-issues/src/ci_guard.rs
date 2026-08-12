@@ -92,12 +92,8 @@ pub fn plan_ci_gated_transition(
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentTransitionOutcome {
-    Blocked {
-        block: TransitionBlocked,
-    },
-    WithheldForApproval {
-        plan: TransitionPlan,
-    },
+    Blocked { block: TransitionBlocked },
+    WithheldForApproval { plan: TransitionPlan },
 }
 
 impl AgentTransitionOutcome {

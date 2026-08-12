@@ -712,10 +712,16 @@ mod tests {
                 "trust_tier": "trusted",
             }),
         );
-        assert_eq!(consumer.handle(&e, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            consumer.handle(&e, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         let after_first = consumer.staged_count();
         assert_eq!(after_first, 1, "the merge staged one Link (the auto-close)");
-        assert_eq!(consumer.handle(&e, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+        assert_eq!(
+            consumer.handle(&e, &mut myelin_events::HandlerTx::none()),
+            HandleOutcome::Done
+        );
         assert_eq!(
             consumer.staged_count(),
             after_first,
