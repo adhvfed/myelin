@@ -281,13 +281,9 @@ fn call_read_run(server: &McpServer) -> Value {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn governed_ci_read_reverifies_the_run_token_at_the_durable_boundary() {
     let schema = schema_name();
-    let admin = match pool(&admin_url(), &schema).await {
-        Ok(pool) => pool,
-        Err(_) => {
-            eprintln!("SKIP: dev PostgreSQL is unreachable");
-            return;
-        }
-    };
+    let admin = pool(&admin_url(), &schema)
+        .await
+        .expect("connect to the Postgres required by the governed CI read story");
     setup_schema(&admin, &schema).await;
     with_schema_cleanup(&admin, &schema, || async {
         let app = pool(&app_url(), &schema)

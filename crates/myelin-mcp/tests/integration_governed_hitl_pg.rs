@@ -1,7 +1,8 @@
 #![cfg(feature = "integration")]
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 
 use myelin_agent::{EffectApi, EffectAuthority, EffectResult, ProposedEffect, RunCtx};
 use myelin_config::MyelinConfig;
@@ -19,7 +20,8 @@ use myelin_mcp::{
     ToolRegistry,
 };
 use myelin_storage::hitl_gate_durable::{
-    hitl_gate_durable_migrations, GateDecideError, GateRecord, GateState, HitlVerdictStore,
+    gate_ref_token, hitl_gate_durable_migrations, GateDecideError, GateRecord, GateState,
+    HitlVerdictStore,
 };
 use myelin_storage::{
     identity_durable_migrations, DurablePrincipalBacking, DurablePrincipalRow, HotTables,
@@ -27,8 +29,18 @@ use myelin_storage::{
 };
 use myelin_tenancy::{Region, TenantId};
 
-fn admin_config() -> MyelinConfig {
+fn test_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
+fn admin_config() -> MyelinConfig {
+    let mut config = test_config();
     config.database_url = config
         .database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
@@ -65,21 +77,52 @@ impl GateApproverPolicy for TestApprovers {
     }
 }
 
-struct CountingEffectApi(Arc<AtomicUsize>);
+#[derive(Default)]
+struct AppliedEffects {
+    count: AtomicUsize,
+    by_command: Mutex<HashMap<String, (ProposedEffect, myelin_agent::EventId)>>,
+}
+
+impl AppliedEffects {
+    fn count(&self) -> usize {
+        self.count.load(Ordering::SeqCst)
+    }
+}
+
+struct CountingEffectApi(Arc<AppliedEffects>);
 
 impl EffectApi for CountingEffectApi {
     fn apply(&self, _run: &RunCtx, _effect: ProposedEffect) -> EffectResult {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.0.count.fetch_add(1, Ordering::SeqCst);
         EffectResult::Applied(myelin_agent::EventId("event:counted".into()))
     }
 
     fn apply_authorized(
         &self,
-        run: &RunCtx,
-        _authority: &EffectAuthority,
+        _run: &RunCtx,
+        authority: &EffectAuthority,
         effect: ProposedEffect,
     ) -> EffectResult {
-        self.apply(run, effect)
+        let command = format!(
+            "{}\0{}\0{}",
+            authority.principal_id.0, authority.tool, authority.idempotency_key
+        );
+        let mut applied = self
+            .0
+            .by_command
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some((previous, event_id)) = applied.get(&command) {
+            return if previous == &effect {
+                EffectResult::Applied(event_id.clone())
+            } else {
+                EffectResult::Denied("idempotency key reused for a different effect".into())
+            };
+        }
+        let sequence = self.0.count.fetch_add(1, Ordering::SeqCst) + 1;
+        let event_id = myelin_agent::EventId(format!("event:counted:{sequence}"));
+        applied.insert(command, (effect, event_id.clone()));
+        EffectResult::Applied(event_id)
     }
 }
 
@@ -89,7 +132,7 @@ fn router(
     region: &str,
     run_id: &str,
     agent_id: &str,
-    applies: Arc<AtomicUsize>,
+    applies: Arc<AppliedEffects>,
 ) -> GovernedRouter {
     router_with_audit(
         provider,
@@ -108,7 +151,7 @@ fn router_with_audit(
     region: &str,
     run_id: &str,
     agent_id: &str,
-    applies: Arc<AtomicUsize>,
+    applies: Arc<AppliedEffects>,
     audit_store: OutboxStore,
 ) -> GovernedRouter {
     let s7 = RevocationStore::new();
@@ -160,13 +203,9 @@ fn router_with_audit(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev PostgreSQL is unreachable");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("connect to the Postgres required by the governed approval story");
     admin
         .migrate(&hitl_gate_durable_migrations(), &HotTables::none())
         .await
@@ -175,10 +214,10 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
         .expect("identity migration");
-    let app1 = SubstrateProvider::connect(MyelinConfig::dev(), 4)
+    let app1 = SubstrateProvider::connect(test_config(), 4)
         .await
         .expect("app provider one");
-    let app2 = SubstrateProvider::connect(MyelinConfig::dev(), 4)
+    let app2 = SubstrateProvider::connect(test_config(), 4)
         .await
         .expect("app provider two");
     let region = app1.config().region.clone();
@@ -195,7 +234,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
     let registry = ToolRegistry::with_git();
     let merge = registry.resolve("git.merge").unwrap();
     let now = Timestamp("2026-07-18T00:00:00Z".into());
-    let applies = Arc::new(AtomicUsize::new(0));
+    let applies = Arc::new(AppliedEffects::default());
 
     let expiry_run = "run:expiry-proof";
     let expiry_agent = "agent:mcp-expiry";
@@ -277,13 +316,10 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         GateState::Waiting,
         "MCP must not mutate a due gate owned by another shared producer"
     );
+    let exact_gate_ref = format!(":hitl-gate:{}", gate_ref_token(&exact_gate));
     assert!(expiry_audit.committed_rows().iter().any(|row| {
         row.envelope.type_.0 == "git.merge.expired"
-            && row
-                .envelope
-                .subject
-                .0
-                .ends_with(&format!("/hitl-gate/{exact_gate}"))
+            && row.envelope.subject.0.ends_with(&exact_gate_ref)
     }));
 
     let first = router(
@@ -342,7 +378,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
             CallOutcome::Denied { .. }
         ));
     }
-    assert_eq!(applies.load(Ordering::SeqCst), 0);
+    assert_eq!(applies.count(), 0);
     let restarted = router(
         app1.clone(),
         &tenant,
@@ -361,7 +397,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         ),
         CallOutcome::Applied { .. }
     ));
-    assert_eq!(applies.load(Ordering::SeqCst), 1);
+    assert_eq!(applies.count(), 1);
     assert!(matches!(
         router(
             app2.clone(),
@@ -378,7 +414,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
             &now,
             Some(&gate),
         ),
-        CallOutcome::Denied { .. }
+        CallOutcome::Applied { .. }
     ));
 
     let atomic_principal = format!("human:atomic-{suffix}");
@@ -406,7 +442,7 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
         "credential-link failure must roll back principal provisioning"
     );
     assert_eq!(
-        applies.load(Ordering::SeqCst),
+        applies.count(),
         1,
         "a consumed approval cannot mutate twice"
     );
@@ -467,8 +503,16 @@ async fn approve_reject_restart_and_tenant_isolation_hold_on_live_pg() {
             other => panic!("unexpected concurrent outcome: {other:?}"),
         }
     }
-    assert_eq!((applied, denied), (1, 1));
-    assert_eq!(applies.load(Ordering::SeqCst), 2);
+    assert_eq!(applied + denied, 2, "both racers reach a terminal outcome");
+    assert!(
+        applied >= 1,
+        "at least one racer receives the applied result"
+    );
+    assert_eq!(
+        applies.count(),
+        2,
+        "two exact retries of the concurrent command produce one additional mutation"
+    );
 
     let rejected_gate = match first.call(
         merge,
