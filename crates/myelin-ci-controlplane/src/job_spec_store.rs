@@ -1,5 +1,6 @@
 use myelin_ci_sandbox::{JobSpecTemplate, TrustTier};
 use myelin_storage::{with_tenant_tx, with_tenant_tx_error, PgError};
+use serde_json::Value;
 use sqlx::postgres::PgPool;
 use sqlx::types::Uuid;
 use sqlx::Row;
@@ -158,6 +159,87 @@ pub struct DispatchOutcome {
     pub spec_inserted: bool,
 }
 
+struct ExactDispatchIdentity {
+    tenant_id: String,
+    region: String,
+    job_id: Uuid,
+    run_id: Uuid,
+    run_id_text: String,
+    lane: &'static str,
+    labels: Vec<String>,
+    trust: &'static str,
+    concurrency_group: Option<String>,
+    fair_key: String,
+    idem_token: String,
+    stage: String,
+    claim_window_secs: i64,
+    reservation_write_version: Option<i16>,
+    spec: Value,
+}
+
+impl ExactDispatchIdentity {
+    fn from_request(
+        enqueue: &DurableEnqueue,
+        launch: &DurableCiJobLaunchTemplate,
+        stage: &str,
+    ) -> Result<Self, CiJobSpecStoreError> {
+        validate_dispatch(enqueue.trust_tier, Some(enqueue.claim_window_secs), launch)?;
+        if enqueue.stage != stage {
+            return Err(CiJobSpecStoreError::Db(
+                "durable dispatch stage differs between queue authority and spec identity".into(),
+            ));
+        }
+
+        Ok(Self {
+            tenant_id: enqueue.tenant_id.clone(),
+            region: enqueue.region.clone(),
+            job_id: parse_id_local("job_id", &enqueue.job_id)?,
+            run_id: parse_id_local("run_id", &enqueue.run_id)?,
+            run_id_text: enqueue.run_id.clone(),
+            lane: enqueue.lane.as_str(),
+            labels: enqueue.labels.clone(),
+            trust: trust_token(enqueue.trust_tier),
+            concurrency_group: enqueue.concurrency_group.clone(),
+            fair_key: enqueue.fair_key.clone(),
+            idem_token: enqueue.idem_token.clone(),
+            stage: stage.to_string(),
+            claim_window_secs: enqueue.claim_window_secs,
+            reservation_write_version: enqueue.reservation_write_version.value(),
+            spec: serde_json::to_value(launch)
+                .map_err(|error| CiJobSpecStoreError::SpecEncode(error.to_string()))?,
+        })
+    }
+
+    fn verify_persisted(&self, row: &sqlx::postgres::PgRow) -> Result<(), PgError> {
+        let exact = row.get::<Option<i64>, _>("queue_claim_window_secs")
+            == Some(self.claim_window_secs)
+            && row.get::<Option<i16>, _>("queue_reservation_write_version")
+                == self.reservation_write_version
+            && row.get::<String, _>("region") == self.region
+            && row.get::<String, _>("queue_job_id") == self.job_id.to_string()
+            && row.get::<String, _>("queue_run_id") == self.run_id.to_string()
+            && row.get::<String, _>("lane") == self.lane
+            && row.get::<Vec<String>, _>("labels") == self.labels
+            && row.get::<String, _>("trust_tier") == self.trust
+            && row.get::<Option<String>, _>("concurrency_group") == self.concurrency_group
+            && row.get::<String, _>("fair_key") == self.fair_key
+            && row.get::<String, _>("queue_idem_token") == self.idem_token
+            && row.get::<Option<String>, _>("queue_stage").as_deref() == Some(&self.stage)
+            && row.get::<String, _>("spec_region") == self.region
+            && row.get::<String, _>("spec_run_id") == self.run_id.to_string()
+            && row.get::<String, _>("spec_idem_token") == self.idem_token
+            && row.get::<Value, _>("spec") == self.spec
+            && row.get::<Option<String>, _>("spec_stage").as_deref() == Some(&self.stage);
+        if exact {
+            Ok(())
+        } else {
+            Err(PgError::Query(
+                "durable dispatch replay conflicts with the existing queue/spec identity".into(),
+            ))
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct CiJobSpecStore {
     pool: PgPool,
@@ -199,30 +281,7 @@ impl CiJobSpecStore {
         stage: &str,
         require_active_flow: bool,
     ) -> Result<DispatchOutcome, CiJobSpecStoreError> {
-        validate_dispatch(enq.trust_tier, Some(enq.claim_window_secs), launch)?;
-
-        let job_uuid = parse_id_local("job_id", &enq.job_id)?;
-        let run_uuid = parse_id_local("run_id", &enq.run_id)?;
-        let spec_json = serde_json::to_value(launch)
-            .map_err(|e| CiJobSpecStoreError::SpecEncode(e.to_string()))?;
-        let stage = stage.to_string();
-
-        let labels = enq.labels.clone();
-        let group = enq.concurrency_group.clone();
-        let lane = enq.lane.as_str();
-        let trust = trust_token(enq.trust_tier);
-        let tenant_id = enq.tenant_id.clone();
-        let region = enq.region.clone();
-        let fair_key = enq.fair_key.clone();
-        let idem = enq.idem_token.clone();
-        let workflow_run_id = enq.run_id.clone();
-        let claim_window_secs = enq.claim_window_secs;
-        let reservation_write_version = enq.reservation_write_version.value();
-        if enq.stage != stage {
-            return Err(CiJobSpecStoreError::Db(
-                "durable dispatch stage differs between queue authority and spec identity".into(),
-            ));
-        }
+        let identity = ExactDispatchIdentity::from_request(enq, launch, stage)?;
 
         let (enqueued, spec_inserted) =
             with_tenant_tx(&self.pool, &enq.tenant_id, &enq.region, move |conn| {
@@ -232,9 +291,9 @@ impl CiJobSpecStore {
                             "SELECT state FROM workflow_run \
                              WHERE tenant_id = $1 AND region = $2 AND run_id = $3 FOR UPDATE",
                         )
-                        .bind(&tenant_id)
-                        .bind(&region)
-                        .bind(&workflow_run_id)
+                        .bind(&identity.tenant_id)
+                        .bind(&identity.region)
+                        .bind(&identity.run_id_text)
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?;
@@ -245,36 +304,36 @@ impl CiJobSpecStore {
                         }
                     }
                     let jq_row = sqlx::query(INSERT_JOB_QUEUE_QUERY)
-                        .bind(&tenant_id)
-                        .bind(&region)
-                        .bind(job_uuid)
-                        .bind(run_uuid)
-                        .bind(lane)
-                        .bind(&labels)
-                        .bind(trust)
-                        .bind(group.as_deref())
-                        .bind(&fair_key)
-                        .bind(&idem)
-                        .bind(&stage)
-                        .bind(claim_window_secs)
-                        .bind(reservation_write_version)
+                        .bind(&identity.tenant_id)
+                        .bind(&identity.region)
+                        .bind(identity.job_id)
+                        .bind(identity.run_id)
+                        .bind(identity.lane)
+                        .bind(&identity.labels)
+                        .bind(identity.trust)
+                        .bind(identity.concurrency_group.as_deref())
+                        .bind(&identity.fair_key)
+                        .bind(&identity.idem_token)
+                        .bind(&identity.stage)
+                        .bind(identity.claim_window_secs)
+                        .bind(identity.reservation_write_version)
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?;
                     let spec_row = sqlx::query(INSERT_JOB_SPEC_QUERY)
-                        .bind(&tenant_id)
-                        .bind(&region)
-                        .bind(job_uuid)
-                        .bind(run_uuid)
-                        .bind(&idem)
-                        .bind(&spec_json)
-                        .bind(&stage)
+                        .bind(&identity.tenant_id)
+                        .bind(&identity.region)
+                        .bind(identity.job_id)
+                        .bind(identity.run_id)
+                        .bind(&identity.idem_token)
+                        .bind(&identity.spec)
+                        .bind(&identity.stage)
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?;
                     let exact = sqlx::query(SELECT_EXACT_DISPATCH_QUERY)
-                        .bind(&tenant_id)
-                        .bind(&idem)
+                        .bind(&identity.tenant_id)
+                        .bind(&identity.idem_token)
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|e| PgError::Query(e.to_string()))?
@@ -284,22 +343,7 @@ impl CiJobSpecStore {
                                     .into(),
                             )
                         })?;
-                    verify_exact_dispatch(
-                        &exact,
-                        &region,
-                        job_uuid,
-                        run_uuid,
-                        lane,
-                        &labels,
-                        trust,
-                        group.as_deref(),
-                        &fair_key,
-                        &idem,
-                        &stage,
-                        claim_window_secs,
-                        reservation_write_version,
-                        &spec_json,
-                    )?;
+                    identity.verify_persisted(&exact)?;
                     Ok((jq_row.is_some(), spec_row.is_some()))
                 })
             })
@@ -428,50 +472,6 @@ impl CiJobSpecStore {
             stage,
             reserve_handle: launch.spec.meter_to.reserve_id,
         }))
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn verify_exact_dispatch(
-    row: &sqlx::postgres::PgRow,
-    region: &str,
-    job_id: Uuid,
-    run_id: Uuid,
-    lane: &str,
-    labels: &[String],
-    trust: &str,
-    concurrency_group: Option<&str>,
-    fair_key: &str,
-    idem_token: &str,
-    stage: &str,
-    claim_window_secs: i64,
-    reservation_write_version: Option<i16>,
-    spec: &serde_json::Value,
-) -> Result<(), PgError> {
-    let exact = row.get::<Option<i64>, _>("queue_claim_window_secs") == Some(claim_window_secs)
-        && row.get::<Option<i16>, _>("queue_reservation_write_version")
-            == reservation_write_version
-        && row.get::<String, _>("region") == region
-        && row.get::<String, _>("queue_job_id") == job_id.to_string()
-        && row.get::<String, _>("queue_run_id") == run_id.to_string()
-        && row.get::<String, _>("lane") == lane
-        && row.get::<Vec<String>, _>("labels") == labels
-        && row.get::<String, _>("trust_tier") == trust
-        && row.get::<Option<String>, _>("concurrency_group").as_deref() == concurrency_group
-        && row.get::<String, _>("fair_key") == fair_key
-        && row.get::<String, _>("queue_idem_token") == idem_token
-        && row.get::<Option<String>, _>("queue_stage").as_deref() == Some(stage)
-        && row.get::<String, _>("spec_region") == region
-        && row.get::<String, _>("spec_run_id") == run_id.to_string()
-        && row.get::<String, _>("spec_idem_token") == idem_token
-        && row.get::<serde_json::Value, _>("spec") == *spec
-        && row.get::<Option<String>, _>("spec_stage").as_deref() == Some(stage);
-    if exact {
-        Ok(())
-    } else {
-        Err(PgError::Query(
-            "durable dispatch replay conflicts with the existing queue/spec identity".into(),
-        ))
     }
 }
 
