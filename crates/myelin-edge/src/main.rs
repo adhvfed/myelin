@@ -38,6 +38,7 @@ use std::{
     env::VarError,
     fs::OpenOptions,
     io::Write,
+    net::SocketAddr,
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -302,6 +303,9 @@ struct EdgeRuntimeConfig {
     git_root: Option<PathBuf>,
     git_wire: Option<GitWireRuntime>,
     public_base_url: Option<String>,
+    listen_addr: Option<String>,
+    dev_login_enabled: bool,
+    token_login_enabled: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -383,11 +387,32 @@ impl EdgeRuntimeConfig {
         } else {
             None
         };
+        let listen_addr = if serving {
+            Some(optional_runtime_value(
+                "MYELIN_EDGE_ADDR",
+                read("MYELIN_EDGE_ADDR"),
+                "127.0.0.1:8080",
+            )?)
+        } else {
+            None
+        };
+        let dev_login_requested = serving
+            && optional_runtime_switch("MYELIN_DEV_LOGIN", read("MYELIN_DEV_LOGIN"), false)?;
+        let dev_login_enabled = validated_dev_login(
+            dev_login_requested,
+            cfg!(debug_assertions),
+            listen_addr.as_deref(),
+        )?;
+        let token_login_enabled = serving
+            && optional_runtime_switch("MYELIN_TOKEN_LOGIN", read("MYELIN_TOKEN_LOGIN"), false)?;
         Ok(Self {
             cell_id,
             git_root,
             git_wire,
             public_base_url,
+            listen_addr,
+            dev_login_enabled,
+            token_login_enabled,
         })
     }
 }
@@ -523,6 +548,41 @@ fn optional_runtime_switch(
             _ => Err(format!("env var {name} must be `0` or `1`")),
         },
     }
+}
+
+fn optional_runtime_value(
+    name: &'static str,
+    value: Result<String, VarError>,
+    default: &'static str,
+) -> Result<String, String> {
+    match value {
+        Err(VarError::NotPresent) => Ok(default.into()),
+        Err(VarError::NotUnicode(_)) => Err(format!("env var {name} is not valid UTF-8")),
+        Ok(value) if value.trim().is_empty() => Err(format!("env var {name} must not be empty")),
+        Ok(value) => Ok(value.trim().into()),
+    }
+}
+
+fn validated_dev_login(
+    requested: bool,
+    debug_build: bool,
+    listen_addr: Option<&str>,
+) -> Result<bool, String> {
+    if !requested {
+        return Ok(false);
+    }
+    if !debug_build {
+        return Err("MYELIN_DEV_LOGIN=1 is available only in debug builds".into());
+    }
+    let loopback = listen_addr
+        .and_then(|value| value.parse::<SocketAddr>().ok())
+        .is_some_and(|addr| addr.ip().is_loopback());
+    if !loopback {
+        return Err(
+            "MYELIN_DEV_LOGIN=1 requires MYELIN_EDGE_ADDR to be a numeric loopback address".into(),
+        );
+    }
+    Ok(true)
 }
 
 fn runtime_config_or_exit(serving: bool) -> EdgeRuntimeConfig {
@@ -754,15 +814,8 @@ async fn main() {
     match args.first().map(String::as_str) {
         None => {
             let runtime = runtime_config_or_exit(true);
-            serve(
-                compose_core(runtime.cell_id).await,
-                runtime.git_root.expect("serving config carries a Git root"),
-                runtime.git_wire,
-                runtime
-                    .public_base_url
-                    .expect("serving config carries a public base URL"),
-            )
-            .await;
+            let core = compose_core(runtime.cell_id.clone()).await;
+            serve(core, runtime).await;
         }
         Some("bootstrap") => {
             let runtime = runtime_config_or_exit(false);
@@ -785,12 +838,19 @@ async fn main() {
     }
 }
 
-async fn serve(
-    core: ComposedCore,
-    git_root: PathBuf,
-    git_wire: Option<GitWireRuntime>,
-    public_base_url: String,
-) {
+async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
+    let EdgeRuntimeConfig {
+        cell_id: _,
+        git_root,
+        git_wire,
+        public_base_url,
+        listen_addr,
+        dev_login_enabled,
+        token_login_enabled,
+    } = runtime;
+    let git_root = git_root.expect("serving config carries a Git root");
+    let public_base_url = public_base_url.expect("serving config carries a public base URL");
+    let listen_addr = listen_addr.expect("serving config carries a listen address");
     let ComposedCore {
         provider,
         kms,
@@ -847,12 +907,6 @@ async fn serve(
         DurablePrincipalBacking::new(provider.clone()),
         handle.clone(),
     );
-    let dev_login_enabled = std::env::var("MYELIN_DEV_LOGIN")
-        .map(|v| v == "1")
-        .unwrap_or(false);
-    let token_login_enabled = std::env::var("MYELIN_TOKEN_LOGIN")
-        .map(|v| v == "1")
-        .unwrap_or(false);
     let device_authorization = std::env::var("MYELIN_WEB_PUBLIC_URL")
         .ok()
         .filter(|value| !value.trim().is_empty())
@@ -1211,17 +1265,16 @@ async fn serve(
     );
     let gateway = Arc::new(builder.build());
 
-    let addr = std::env::var("MYELIN_EDGE_ADDR").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
+    let listener = match tokio::net::TcpListener::bind(&listen_addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("edge: failed to bind {addr}: {e}");
+            eprintln!("edge: failed to bind {listen_addr}: {e}");
             std::process::exit(1);
         }
     };
     let issue_reconciler =
         spawn_issue_authorization_reconciler(issue_store, check, issue_reconciliation_config);
-    eprintln!("edge: listening on {addr}");
+    eprintln!("edge: listening on {listen_addr}");
     let git_shutdown_for_signal = git_shutdown.clone();
     let server_result = serve_edge_until_shutdown_with_probe(
         listener,
@@ -1736,6 +1789,9 @@ mod runtime_config_tests {
         assert_eq!(config.git_root, None);
         assert_eq!(config.git_wire, None);
         assert_eq!(config.public_base_url, None);
+        assert_eq!(config.listen_addr, None);
+        assert!(!config.dev_login_enabled);
+        assert!(!config.token_login_enabled);
     }
 
     #[test]
@@ -1768,6 +1824,27 @@ mod runtime_config_tests {
         assert_eq!(config.providers[0].id, "oidc");
         assert!(!config.dev_login_enabled);
         assert!(config.token_login_enabled);
+    }
+
+    #[test]
+    fn development_login_is_confined_to_debug_loopback_servers() {
+        assert_eq!(validated_dev_login(false, false, None), Ok(false));
+        assert_eq!(
+            validated_dev_login(true, false, Some("127.0.0.1:8080")).unwrap_err(),
+            "MYELIN_DEV_LOGIN=1 is available only in debug builds"
+        );
+        for public_bind in ["0.0.0.0:8080", "[::]:8080", "edge.internal:8080"] {
+            assert_eq!(
+                validated_dev_login(true, true, Some(public_bind)).unwrap_err(),
+                "MYELIN_DEV_LOGIN=1 requires MYELIN_EDGE_ADDR to be a numeric loopback address"
+            );
+        }
+        for loopback_bind in ["127.0.0.1:8080", "[::1]:8080"] {
+            assert_eq!(
+                validated_dev_login(true, true, Some(loopback_bind)),
+                Ok(true)
+            );
+        }
     }
 
     #[test]

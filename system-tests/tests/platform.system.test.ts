@@ -31,6 +31,7 @@ describe("running edge platform", () => {
       providers: [],
       dev_login_enabled: true,
       token_login_enabled: true,
+      cli_login_enabled: true,
     });
     expect(response.headers.get("cache-control")).toContain("no-store");
   });
