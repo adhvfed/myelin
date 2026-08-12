@@ -15,13 +15,13 @@ use myelin_ci_controlplane::{
     CiJobAccountingWriteVersion, CiJobPricingError, CiJobRuntimeAuthorityRequest,
     CiJobTokenRequest, CiManifestLaneV1, CiManifestLimitsV1, CiManifestSchedulingV1,
     CiManifestTrustTierV1, CiManifestWorkspaceV1, CiPipelineReporter, CiPipelineReporterFactory,
-    CiPipelineReporterRouter, CiRunFinalization,
-    CiRunFinalizationJob, CiRunFinalizationWrite, CiRunFinalizer, CiRunInsert, CiRunStoreError,
-    CiRunTerminalState, DurableCiJobAccounting, DurableCiRunFinalizer, DurableEnqueue,
-    DurableLeaseAdapter, GrantedCiJobV1, JobQueueReaper, Lane, ManifestBoundCiJobTokenAuthority,
-    PgCiRunSupersession, PreparationRetryOutcome, PricedCiJobUsage, CI_MANIFEST_PIPELINE_VERSION,
-    CI_RUNNER_EXECUTION_LEASE_TTL_SECS,
-    LINUX_SMALL_V1_RUNNER_LABELS, TIER_P_OPERATIONAL_PRICING_REVISION,
+    CiPipelineReporterRouter, CiRunFinalization, CiRunFinalizationJob, CiRunFinalizationWrite,
+    CiRunFinalizer, CiRunInsert, CiRunStoreError, CiRunTerminalState, DurableCiJobAccounting,
+    DurableCiRunFinalizer, DurableEnqueue, DurableLeaseAdapter, GrantedCiJobV1, JobQueueReaper,
+    Lane, ManifestBoundCiJobTokenAuthority, PgCiRunSupersession, PreparationRetryOutcome,
+    PricedCiJobUsage, TierPOperationalCiJobPricer, CI_MANIFEST_PIPELINE_VERSION,
+    CI_RUNNER_EXECUTION_LEASE_TTL_SECS, LINUX_SMALL_V1_RUNNER_LABELS,
+    TIER_P_OPERATIONAL_PRICING_REVISION,
 };
 use myelin_ci_sandbox::asset_registry::GvisorAssetRegistry;
 use myelin_ci_sandbox::gvisor::GvisorBackend;
@@ -30,8 +30,7 @@ use myelin_ci_sandbox::{
     CompletionSettlementOwner, CountingFirehose, ImageRef, JobKind, PreparationPhase,
     PreparationReportClaim, PreparationRetryReport, PreparationTerminalDisposition, ResourceUsage,
     RetryableAttemptCause, RetryableAttemptFailure, RetryableAttemptOutcome, RunnerAgent,
-    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec,
-    LINUX_SMALL_V1_ROOTFS_SHA256,
+    TerminalReport, TerminalReporter, TrustTier, WorkspaceSpec, LINUX_SMALL_V1_ROOTFS_SHA256,
 };
 use myelin_config::MyelinConfig;
 use myelin_events::{IdMinter, MonotonicMinter};
@@ -145,7 +144,9 @@ async fn wait_until_app_blocked_on_lock(observer: &PgPool, application_name: &st
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("the retry reporter never entered a lock wait on the queue row (finding-1 ordering broke)");
+    panic!(
+        "the retry reporter never entered a lock wait on the queue row (finding-1 ordering broke)"
+    );
 }
 
 #[derive(Clone)]
@@ -155,16 +156,54 @@ struct TestPricer {
 
 impl CiJobAccountingPricer for TestPricer {
     fn price(&self, usage: ResourceUsage) -> Result<PricedCiJobUsage, CiJobPricingError> {
-        let memory_gb_seconds = usage.mem_byte_seconds.div_ceil(1_073_741_824);
-        Ok(PricedCiJobUsage {
-            pricing_revision: TIER_P_OPERATIONAL_PRICING_REVISION.into(),
-            memory_gb_seconds,
-            cpu_wholesale: MicroUsd(usage.cpu_seconds),
-            cpu_markup: MicroUsd::ZERO,
-            memory_wholesale: MicroUsd(memory_gb_seconds + u64::from(!self.valid)),
-            memory_markup: MicroUsd::ZERO,
-        })
+        let mut priced = TierPOperationalCiJobPricer.price(usage)?;
+        if !self.valid {
+            priced.memory_wholesale = MicroUsd(priced.memory_wholesale.0.saturating_add(1));
+        }
+        Ok(priced)
     }
+}
+
+fn manifest_job_token_authority(manifest: &CiDriveManifestV1, job_index: usize) -> String {
+    let job = &manifest.jobs[job_index];
+    let snapshot_prefix = format!("myelin://{}/ci/artifact/snapshot-", manifest.tenant_id);
+    let source_snapshot_digest = manifest
+        .source_snapshot_ref
+        .strip_prefix(&snapshot_prefix)
+        .expect("the test manifest snapshot reference uses the canonical tenant prefix");
+    let trust_tier = match manifest.trust_tier {
+        CiManifestTrustTierV1::Trusted => "trusted",
+        CiManifestTrustTierV1::UntrustedFork => "untrusted_fork",
+        CiManifestTrustTierV1::SelfHosted => "self_hosted",
+    };
+
+    ManifestBoundCiJobTokenAuthority::handle_for(&CiJobRuntimeAuthorityRequest {
+        tenant_id: manifest.tenant_id.clone(),
+        region: manifest.region.clone(),
+        ci_run_id: manifest.ci_run_id.clone(),
+        wf_run_id: manifest.wf_run_id.clone(),
+        project_id: manifest.project_id.clone(),
+        job_id: job.job_id.clone(),
+        stage: job.stage.clone(),
+        concrete_name: job.name.clone(),
+        trigger_kind: "push".into(),
+        trust_tier: trust_tier.into(),
+        source_snapshot_digest: source_snapshot_digest.into(),
+        workflow_definition_version: manifest.workflow_definition_version,
+        workflow_code_hash: manifest.workflow_code_hash.clone(),
+        policy_revision: manifest.authority_policy_revision.clone(),
+        limits: job.limits.clone(),
+        reserve_id: Some(job.reserve_handle.clone()),
+        checkout_commit: Some(job.workspace.commit_oid.clone()),
+        checkout: derive_checkout_authorization_scope(
+            JobKind::Ci,
+            &WorkspaceSpec {
+                repo_ref: Some(job.workspace.repo_ref.clone()),
+                commit: Some(job.workspace.commit_oid.clone()),
+            },
+        )
+        .unwrap(),
+    })
 }
 
 fn manifest(
@@ -272,35 +311,7 @@ fn manifest(
             },
         ],
     };
-    let executable = &manifest.jobs[0];
-    manifest.jobs[0].token_authority_handle =
-        ManifestBoundCiJobTokenAuthority::handle_for(&CiJobRuntimeAuthorityRequest {
-            tenant_id: tenant.into(),
-            region: region.into(),
-            ci_run_id: ci_run.into(),
-            wf_run_id: wf_run.into(),
-            project_id: "55555555-5555-8555-8555-555555555555".into(),
-            job_id: executable.job_id.clone(),
-            stage: executable.stage.clone(),
-            concrete_name: executable.name.clone(),
-            trigger_kind: "push".into(),
-            trust_tier: "trusted".into(),
-            source_snapshot_digest: digest('a'),
-            workflow_definition_version: CI_MANIFEST_PIPELINE_VERSION,
-            workflow_code_hash: workflow_code_hash.into(),
-            policy_revision: "ci-policy:2026-07-21".into(),
-            limits: executable.limits.clone(),
-            reserve_id: Some(executable.reserve_handle.clone()),
-            checkout_commit: Some(executable.workspace.commit_oid.clone()),
-            checkout: derive_checkout_authorization_scope(
-                JobKind::Ci,
-                &WorkspaceSpec {
-                    repo_ref: Some(executable.workspace.repo_ref.clone()),
-                    commit: Some(executable.workspace.commit_oid.clone()),
-                },
-            )
-            .unwrap(),
-        });
+    manifest.jobs[0].token_authority_handle = manifest_job_token_authority(&manifest, 0);
     manifest
 }
 
@@ -405,14 +416,20 @@ const JOURNALED_PRELAUNCH_USAGE: ResourceUsage = ResourceUsage {
     cpu_seconds: 8,
     mem_byte_seconds: 5 * 1_073_741_824,
 };
+const TEST_RESERVATION_MICRO_USD: u64 = 1_000_000;
 
 fn expected_operational_settlement(usage: ResourceUsage) -> (i64, i64) {
-    let priced = usage
-        .cpu_seconds
-        .checked_add(usage.mem_byte_seconds.div_ceil(1_073_741_824))
+    let priced = TierPOperationalCiJobPricer.price(usage).unwrap();
+    let total = priced
+        .cpu_wholesale
+        .0
+        .checked_add(priced.memory_wholesale.0)
         .unwrap();
-    let billed = i64::try_from(priced.min(100)).unwrap();
-    (billed, 100 - billed)
+    let billed = total.min(TEST_RESERVATION_MICRO_USD);
+    (
+        i64::try_from(billed).unwrap(),
+        i64::try_from(TEST_RESERVATION_MICRO_USD - billed).unwrap(),
+    )
 }
 
 async fn seed_prelaunch_usage_mix(pool: &PgPool, seed: JournalSeed<'_>) {
@@ -631,6 +648,7 @@ async fn run_reporter_scenario(
         production_definition.code_hash(),
     );
     drive_manifest.jobs[0].reserve_handle = reserve_handle.clone();
+    drive_manifest.jobs[0].token_authority_handle = manifest_job_token_authority(&drive_manifest, 0);
             if supersession_wins_first
                 || retry_then_supersession
                 || verify_existing_via_supersession
@@ -662,11 +680,12 @@ async fn run_reporter_scenario(
 
     sqlx::query(
         "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
-         VALUES ($1, $2, $3, 100, 'inflight')",
+         VALUES ($1, $2, $3, $4, 'inflight')",
     )
     .bind(&tenant.0)
     .bind(&region.0)
     .bind(&reserve_handle)
+    .bind(i64::try_from(TEST_RESERVATION_MICRO_USD).unwrap())
     .execute(&pool)
     .await
     .unwrap();
@@ -3597,15 +3616,17 @@ async fn run_reporter_scenario(
         accounting.get::<String, _>("pricing_revision"),
         TIER_P_OPERATIONAL_PRICING_REVISION
     );
-            let expected_billed =
-                accounted_cpu + (accounted_memory + 1_073_741_823) / 1_073_741_824;
+    let (expected_billed, expected_refunded) = expected_operational_settlement(ResourceUsage {
+        cpu_seconds: u64::try_from(accounted_cpu).unwrap(),
+        mem_byte_seconds: u64::try_from(accounted_memory).unwrap(),
+    });
     assert_eq!(
         accounting.get::<i64, _>("billed_minor_units"),
         expected_billed
     );
     assert_eq!(
         accounting.get::<i64, _>("refunded_minor_units"),
-        100 - expected_billed
+        expected_refunded
     );
     assert!(accounting
         .get::<String, _>("completion_receipt")
@@ -3926,20 +3947,43 @@ async fn exhausted_terminal_requires_exactly_one_governing_policy_group() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preparation_terminal_through_the_region_router_reaches_the_durable_cas() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(false, false, false, true, false, Some("preparation_router_terminal"))
-        .await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_router_terminal"),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preparation_retry_through_the_region_router_reaches_the_durable_cas() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(false, false, false, true, false, Some("preparation_router_retry")).await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_router_retry"),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn preparation_retry_requeues_the_generation_without_touching_workload_retries() {
     let _migration_guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    run_reporter_scenario(false, false, false, true, false, Some("preparation_requeue")).await;
+    run_reporter_scenario(
+        false,
+        false,
+        false,
+        true,
+        false,
+        Some("preparation_requeue"),
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4055,71 +4099,71 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
         &cleanup_bootstrap,
         &schema_for_cleanup,
         move || async move {
-        let pool = isolated_pool(&schema).await;
-        PgMigrator::apply(&pool, &foundation_migrations())
-            .await
-            .unwrap();
-        PgMigrator::apply(&pool, &identity_durable_migrations())
-            .await
-            .unwrap();
-        PgMigrator::apply(&pool, &cell_root_durable_migrations())
-            .await
-            .unwrap();
-        PgMigrator::apply_validated(
-            &pool,
-            &flow_migrations(),
-            &HotTables::declare(["workflow_run"]),
-        )
-        .await
-        .unwrap();
-        PgMigrator::apply(&pool, &reserve_settle_durable_migrations())
-            .await
-            .unwrap();
-        common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
+            let pool = isolated_pool(&schema).await;
+            PgMigrator::apply(&pool, &foundation_migrations())
+                .await
+                .unwrap();
+            PgMigrator::apply(&pool, &identity_durable_migrations())
+                .await
+                .unwrap();
+            PgMigrator::apply(&pool, &cell_root_durable_migrations())
+                .await
+                .unwrap();
             PgMigrator::apply_validated(
                 &pool,
-                &ci_controlplane_migrations(),
-                &ci_controlplane_hot_tables(),
+                &flow_migrations(),
+                &HotTables::declare(["workflow_run"]),
             )
             .await
             .unwrap();
-        })
-        .await;
-
-        let tenant = TenantId::from_token("accounting-v2-tenant");
-        let region = Region::new("fr-par");
-        let wf_run = "41111111-1111-8111-8111-111111111111";
-        let ci_run = "42222222-2222-8222-8222-222222222222";
-        let job = "43333333-3333-8333-8333-333333333333";
-        let skipped_job = "47777777-7777-8777-8777-777777777777";
-        let v2_reserve_handle = format!("ci-reserve:v2:{ci_run}:batch:{job}:item");
-
-        let ci_runs = ci_run_store_factory(pool.clone());
-        ci_runs
-            .insert_ci_run(&CiRunInsert {
-                tenant_id: tenant.0.clone(),
-                region: region.0.clone(),
-                run_id: ci_run.into(),
-                project_id: "55555555-5555-8555-8555-555555555555".into(),
-                pipeline_id: "66666666-6666-8666-8666-666666666666".into(),
-                wf_run_id: wf_run.into(),
-                definition_snapshot: format!("blake3:{}", "a".repeat(64)),
-                trigger_kind: "push".into(),
-                concurrency_group: None,
-                pr_head_generation: None,
-                trust_tier: "trusted".into(),
-                state: "queued".into(),
-                correlation_id: "accounting-v2-live".into(),
-                cause_event_id: Some("trigger-accounting-v2-live".into()),
-                cause_depth: 0,
-                caused_by: None,
-                repo_ref: Some(format!("myelin://{}/git/repo/core", tenant.0)),
-                source_ref: Some("refs/heads/main".into()),
-                commit_oid: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
-                triggered_by: None,
+            PgMigrator::apply(&pool, &reserve_settle_durable_migrations())
+                .await
+                .unwrap();
+            common::with_fixture_migration_lock(&admin_url(), &pool, &schema, || async {
+                PgMigrator::apply_validated(
+                    &pool,
+                    &ci_controlplane_migrations(),
+                    &ci_controlplane_hot_tables(),
+                )
+                .await
+                .unwrap();
             })
-            .await
-            .unwrap();
+            .await;
+
+            let tenant = TenantId::from_token("accounting-v2-tenant");
+            let region = Region::new("fr-par");
+            let wf_run = "41111111-1111-8111-8111-111111111111";
+            let ci_run = "42222222-2222-8222-8222-222222222222";
+            let job = "43333333-3333-8333-8333-333333333333";
+            let skipped_job = "47777777-7777-8777-8777-777777777777";
+            let v2_reserve_handle = format!("ci-reserve:v2:{ci_run}:batch:{job}:item");
+
+            let ci_runs = ci_run_store_factory(pool.clone());
+            ci_runs
+                .insert_ci_run(&CiRunInsert {
+                    tenant_id: tenant.0.clone(),
+                    region: region.0.clone(),
+                    run_id: ci_run.into(),
+                    project_id: "55555555-5555-8555-8555-555555555555".into(),
+                    pipeline_id: "66666666-6666-8666-8666-666666666666".into(),
+                    wf_run_id: wf_run.into(),
+                    definition_snapshot: format!("blake3:{}", "a".repeat(64)),
+                    trigger_kind: "push".into(),
+                    concurrency_group: None,
+                    pr_head_generation: None,
+                    trust_tier: "trusted".into(),
+                    state: "queued".into(),
+                    correlation_id: "accounting-v2-live".into(),
+                    cause_event_id: Some("trigger-accounting-v2-live".into()),
+                    cause_depth: 0,
+                    caused_by: None,
+                    repo_ref: Some(format!("myelin://{}/git/repo/core", tenant.0)),
+                    source_ref: Some("refs/heads/main".into()),
+                    commit_oid: Some("deadbeef00deadbeef00deadbeef00deadbeef00".into()),
+                    triggered_by: None,
+                })
+                .await
+                .unwrap();
             sqlx::query(
                 "UPDATE ci_run SET state = 'running' WHERE tenant_id = $1 AND run_id = $2::uuid",
             )
@@ -4128,71 +4172,72 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO workflow_run (
+            sqlx::query(
+                "INSERT INTO workflow_run (
                tenant_id, region, run_id, wf_type, wf_version, input, state, correlation_id,
                depth, partition, idem_key
              ) VALUES ($1, $2, $3, 'ci.pipeline', 1, '[]'::jsonb, 'running', $3, 0, 0, \
                'accounting-v2-live')",
-        )
-        .bind(&tenant.0)
-        .bind(&region.0)
-        .bind(wf_run)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let manifest_store =
-            CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone()).unwrap();
-        let production_definition = ci_manifest_pipeline_definition();
-        let mut drive_manifest = manifest(
-            &tenant.0,
-            &region.0,
-            wf_run,
-            ci_run,
-            job,
-            skipped_job,
-            production_definition.code_hash(),
-        );
-        drive_manifest.jobs.truncate(1);
-        drive_manifest.check_attempts.remove("package");
-        drive_manifest.jobs[0].reserve_handle = v2_reserve_handle.clone();
-        manifest_store.insert(&drive_manifest).await.unwrap();
-
-        sqlx::query(
-            "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
-             VALUES ($1, $2, $3, 100, 'inflight')",
-        )
-        .bind(&tenant.0)
-        .bind(&region.0)
-        .bind(&v2_reserve_handle)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let mut config = MyelinConfig::dev();
-        config.database_url = scoped_url(&admin_url(), &schema);
-        config.region = region.0.clone();
-        let provider = SubstrateProvider::connect(config, 4).await.unwrap();
-        let ledger = DurableCostLedger::new(provider.clone());
-
-        let supersession = PgCiRunSupersession::new(
-            pool.clone(),
-            ledger.clone(),
-            tenant.clone(),
-            region.clone(),
-            tokio::runtime::Handle::current(),
-        )
-        .unwrap();
-        supersession
-            .cancel_running_for_test(ci_run, wf_run)
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .bind(wf_run)
+            .execute(&pool)
             .await
-            .expect(
-                "settle_cancelled_job must accept a v2-shaped reserve handle and reach real \
-                 settlement, not the pre-slice Settlement refusal",
-            );
+            .unwrap();
 
-        let accounting: (bool, i64, i64, i64, i64) = sqlx::query_as(
+            let manifest_store =
+                CiDriveManifestStore::new(pool.clone(), tenant.clone(), region.clone()).unwrap();
+            let production_definition = ci_manifest_pipeline_definition();
+            let mut drive_manifest = manifest(
+                &tenant.0,
+                &region.0,
+                wf_run,
+                ci_run,
+                job,
+                skipped_job,
+                production_definition.code_hash(),
+            );
+            drive_manifest.jobs.truncate(1);
+            drive_manifest.check_attempts.remove("package");
+            drive_manifest.jobs[0].reserve_handle = v2_reserve_handle.clone();
+            manifest_store.insert(&drive_manifest).await.unwrap();
+
+            sqlx::query(
+                "INSERT INTO cost_reservation (tenant_id, region, run_id, reserved, state)
+             VALUES ($1, $2, $3, $4, 'inflight')",
+            )
+            .bind(&tenant.0)
+            .bind(&region.0)
+            .bind(&v2_reserve_handle)
+            .bind(i64::try_from(TEST_RESERVATION_MICRO_USD).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let mut config = MyelinConfig::dev();
+            config.database_url = scoped_url(&admin_url(), &schema);
+            config.region = region.0.clone();
+            let provider = SubstrateProvider::connect(config, 4).await.unwrap();
+            let ledger = DurableCostLedger::new(provider.clone());
+
+            let supersession = PgCiRunSupersession::new(
+                pool.clone(),
+                ledger.clone(),
+                tenant.clone(),
+                region.clone(),
+                tokio::runtime::Handle::current(),
+            )
+            .unwrap();
+            supersession
+                .cancel_running_for_test(ci_run, wf_run)
+                .await
+                .expect(
+                    "settle_cancelled_job must accept a v2-shaped reserve handle and reach real \
+                 settlement, not the pre-slice Settlement refusal",
+                );
+
+            let accounting: (bool, i64, i64, i64, i64) = sqlx::query_as(
             "SELECT skipped, cpu_seconds, mem_byte_seconds, billed_minor_units, refunded_minor_units
              FROM ci_job_accounting WHERE job_id = $1::uuid",
         )
@@ -4200,31 +4245,37 @@ async fn a_cancelled_job_with_a_v2_reserve_handle_settles_like_v1() {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(
-            accounting,
-            (true, 0, 0, 0, 100),
-            "the never-launched v2-reserved job settles a full refund, same as the v1 shape"
-        );
-        let reservation_state: String =
-            sqlx::query_scalar("SELECT state FROM cost_reservation WHERE run_id = $1")
-                .bind(&v2_reserve_handle)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(reservation_state, "settled");
-        let cost_events: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM cost_event WHERE run_id = $1")
-                .bind(&v2_reserve_handle)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(cost_events, 2, "both metered units settle, exactly like v1");
+            assert_eq!(
+                accounting,
+                (
+                    true,
+                    0,
+                    0,
+                    0,
+                    i64::try_from(TEST_RESERVATION_MICRO_USD).unwrap()
+                ),
+                "the never-launched v2-reserved job settles a full refund, same as the v1 shape"
+            );
+            let reservation_state: String =
+                sqlx::query_scalar("SELECT state FROM cost_reservation WHERE run_id = $1")
+                    .bind(&v2_reserve_handle)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(reservation_state, "settled");
+            let cost_events: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM cost_event WHERE run_id = $1")
+                    .bind(&v2_reserve_handle)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(cost_events, 2, "both metered units settle, exactly like v1");
 
-        drop(pool);
-        bootstrap
-            .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
-            .await
-            .unwrap();
+            drop(pool);
+            bootstrap
+                .execute(format!("DROP SCHEMA IF EXISTS {schema} CASCADE").as_str())
+                .await
+                .unwrap();
         },
     )
     .await;
