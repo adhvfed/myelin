@@ -686,6 +686,14 @@ struct PrMutationCommand {
     emit_context: EmitContextBase,
 }
 
+struct PrCommandIdentity<'a> {
+    operation_id: &'a PrOperationId,
+    actor_subject_id: &'a str,
+    command_kind: &'a str,
+    payload_hash: &'a str,
+    expected_number: Option<i64>,
+}
+
 struct SealedPrRecord {
     record: serde_json::Value,
     title: EncryptedColumn,
@@ -1235,18 +1243,15 @@ impl PgPrStore {
                 .with_tenant_tx(&loc.tenant.clone(), move |conn| {
                     Box::pin(async move {
                         lock_operation(conn, &loc, &operation_id).await?;
-                        if let Some(replayed) = replay_command(
-                            conn,
-                            &loc,
-                            &operation_id,
-                            &actor_subject_id,
-                            "open",
-                            &payload_hash,
-                            None,
-                            &kms,
-                            &crypto_region,
-                        )
-                        .await?
+                        let command = PrCommandIdentity {
+                            operation_id: &operation_id,
+                            actor_subject_id: &actor_subject_id,
+                            command_kind: "open",
+                            payload_hash: &payload_hash,
+                            expected_number: None,
+                        };
+                        if let Some(replayed) =
+                            replay_command(conn, &loc, &command, &kms, &crypto_region).await?
                         {
                             return Ok(replayed);
                         }
@@ -1293,16 +1298,7 @@ impl PgPrStore {
                         .await
                         .map_err(|_| pg_query("insert PR"))?;
                         co_commit_event(conn, minter, ctx, &loc, &record, GIT_PR_OPENED, None).await?;
-                        record_command(
-                            conn,
-                            &loc,
-                            &operation_id,
-                            &actor_subject_id,
-                            "open",
-                            &payload_hash,
-                            &record,
-                        )
-                        .await?;
+                        record_command(conn, &loc, &command, &record).await?;
                         if abort_after_event {
                             return Err(myelin_storage::PgError::Query(
                                 "injected abort after PR event".into(),
@@ -1343,6 +1339,13 @@ impl PgPrStore {
                 .with_tenant_tx(&loc.tenant.clone(), move |conn| {
                     Box::pin(async move {
                         lock_operation(conn, &loc, &operation_id).await?;
+                        let command = PrCommandIdentity {
+                            operation_id: &operation_id,
+                            actor_subject_id: &actor_subject_id,
+                            command_kind,
+                            payload_hash: &payload_hash,
+                            expected_number: Some(number_db),
+                        };
                         let row = sqlx::query(&format!(
                             "SELECT {PR_RECORD_COLUMNS}, merge_intent FROM git_pr \
                              WHERE tenant_id=$1 AND region=$2 AND repo_slug=$3 AND number=$4 FOR UPDATE"
@@ -1355,18 +1358,8 @@ impl PgPrStore {
                         .await
                         .map_err(|_| pg_query("lock PR"))?
                         .ok_or_else(|| myelin_storage::PgError::Query(format!("PR #{number} not found")))?;
-                        if let Some(replayed) = replay_command(
-                            conn,
-                            &loc,
-                            &operation_id,
-                            &actor_subject_id,
-                            command_kind,
-                            &payload_hash,
-                            Some(number_db),
-                            &kms,
-                            &crypto_region,
-                        )
-                        .await?
+                        if let Some(replayed) =
+                            replay_command(conn, &loc, &command, &kms, &crypto_region).await?
                         {
                             return Ok(replayed);
                         }
@@ -1419,16 +1412,7 @@ impl PgPrStore {
                             None,
                         )
                         .await?;
-                        record_command(
-                            conn,
-                            &loc,
-                            &operation_id,
-                            &actor_subject_id,
-                            command_kind,
-                            &payload_hash,
-                            &record,
-                        )
-                        .await?;
+                        record_command(conn, &loc, &command, &record).await?;
                         Ok(record)
                     })
                 })
@@ -2437,15 +2421,10 @@ async fn lock_operation(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn replay_command(
     conn: &mut sqlx::PgConnection,
     loc: &RepoLoc,
-    operation_id: &PrOperationId,
-    actor_subject_id: &str,
-    command_kind: &str,
-    expected_hash: &str,
-    expected_number: Option<i64>,
+    command: &PrCommandIdentity<'_>,
     kms: &KmsEngine,
     region: &Region,
 ) -> Result<Option<PrRecord>, myelin_storage::PgError> {
@@ -2456,7 +2435,7 @@ async fn replay_command(
     )
     .bind(&loc.tenant)
     .bind(&loc.region)
-    .bind(operation_id.as_str())
+    .bind(command.operation_id.as_str())
     .fetch_optional(&mut *conn)
     .await
     .map_err(|_| myelin_storage::PgError::Query("PR command replay lookup failed".into()))?;
@@ -2480,9 +2459,9 @@ async fn replay_command(
     let stored_hash: String = row
         .try_get("payload_hash")
         .map_err(|_| myelin_storage::PgError::Query("PR command row malformed".into()))?;
-    if stored_actor != actor_subject_id
-        || stored_kind != command_kind
-        || stored_hash != expected_hash
+    if stored_actor != command.actor_subject_id
+        || stored_kind != command.command_kind
+        || stored_hash != command.payload_hash
     {
         return Err(myelin_storage::PgError::Query(
             "PR operation id was reused for a different command".into(),
@@ -2491,7 +2470,10 @@ async fn replay_command(
     let number: i64 = row
         .try_get("pr_number")
         .map_err(|_| myelin_storage::PgError::Query("PR command row malformed".into()))?;
-    if expected_number.is_some_and(|expected| expected != number) {
+    if command
+        .expected_number
+        .is_some_and(|expected| expected != number)
+    {
         return Err(myelin_storage::PgError::Query(
             "PR operation id was reused for a different command target".into(),
         ));
@@ -2544,14 +2526,21 @@ async fn replay_command(
 async fn record_command(
     conn: &mut sqlx::PgConnection,
     loc: &RepoLoc,
-    operation_id: &PrOperationId,
-    actor_subject_id: &str,
-    command_kind: &str,
-    payload_hash: &str,
+    command: &PrCommandIdentity<'_>,
     record: &PrRecord,
 ) -> Result<(), myelin_storage::PgError> {
     let result = command_projection(record)
         .map_err(|_| myelin_storage::PgError::Query("encode PR command result failed".into()))?;
+    let number = db_number(record.number)
+        .map_err(|_| myelin_storage::PgError::Query("PR command result number invalid".into()))?;
+    if command
+        .expected_number
+        .is_some_and(|expected| expected != number)
+    {
+        return Err(myelin_storage::PgError::Query(
+            "PR command target changed before persistence".into(),
+        ));
+    }
     sqlx::query(
         "INSERT INTO git_pr_command
          (tenant_id,region,repo_slug,operation_id,actor_subject_id,command_kind,payload_hash,pr_number,status,result)
@@ -2560,13 +2549,11 @@ async fn record_command(
     .bind(&loc.tenant)
     .bind(&loc.region)
     .bind(&loc.repo)
-    .bind(operation_id.as_str())
-    .bind(actor_subject_id)
-    .bind(command_kind)
-    .bind(payload_hash)
-    .bind(db_number(record.number).map_err(|_| {
-        myelin_storage::PgError::Query("PR command result number invalid".into())
-    })?)
+    .bind(command.operation_id.as_str())
+    .bind(command.actor_subject_id)
+    .bind(command.command_kind)
+    .bind(command.payload_hash)
+    .bind(number)
     .bind(result)
     .execute(&mut *conn)
     .await
