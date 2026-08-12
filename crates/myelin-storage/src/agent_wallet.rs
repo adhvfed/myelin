@@ -273,9 +273,10 @@ async fn credit_on_conn(
     kind: CreditKind,
     run_id: Option<&str>,
 ) -> Result<Result<MicroUsd, WalletError>, PgError> {
-    if !amount.fits_bigint() {
-        return Ok(Err(WalletError::AmountTooLarge));
-    }
+    let amount_bigint = match amount.to_bigint() {
+        Some(value) => value,
+        None => return Ok(Err(WalletError::AmountTooLarge)),
+    };
     ensure_wallet_row(conn, tenant_s, region).await?;
     let current = lock_balance(conn, tenant_s, region).await?;
 
@@ -287,9 +288,6 @@ async fn credit_on_conn(
         Some(v) => v,
         None => return Ok(Err(WalletError::BalanceOverflow)),
     };
-    let amount_bigint = amount
-        .to_bigint()
-        .expect("amount fits bigint (checked above)");
 
     sqlx::query(
         "INSERT INTO agent_wallet_ledger (tenant_id, region, kind, amount_micro, run_id) \
