@@ -70,7 +70,23 @@ pub enum TokenUsage {
 pub struct Command(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolResult(pub String);
+#[serde(untagged)]
+pub enum ToolResult {
+    Refused { refused: String },
+    Succeeded(String),
+}
+
+impl ToolResult {
+    pub fn content(&self) -> &str {
+        match self {
+            Self::Succeeded(content) | Self::Refused { refused: content } => content,
+        }
+    }
+
+    pub fn is_refused(&self) -> bool {
+        matches!(self, Self::Refused { .. })
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolOutcome {
@@ -500,7 +516,7 @@ mod tests {
 
     impl ToolHands for Mock {
         fn exec(&self, _cmd: Command) -> ToolResult {
-            ToolResult("sim:executed".into())
+            ToolResult::Succeeded("sim:executed".into())
         }
     }
 
@@ -599,7 +615,7 @@ mod tests {
         let m = Mock { catalogue: vec![] };
         assert_eq!(
             m.exec(Command("cargo test".into())),
-            ToolResult("sim:executed".into())
+            ToolResult::Succeeded("sim:executed".into())
         );
     }
 
@@ -714,5 +730,22 @@ mod tests {
         let rj = serde_json::to_string(&r).unwrap();
         let rb: EffectResult = serde_json::from_str(&rj).unwrap();
         assert_eq!(r, rb);
+
+        let success = ToolResult::Succeeded("created MYL-42".into());
+        assert_eq!(
+            serde_json::to_string(&success).unwrap(),
+            r#""created MYL-42""#
+        );
+        assert_eq!(
+            serde_json::from_str::<ToolResult>(r#""legacy result""#).unwrap(),
+            ToolResult::Succeeded("legacy result".into()),
+        );
+        let refusal = ToolResult::Refused {
+            refused: "project not found".into(),
+        };
+        assert_eq!(
+            serde_json::from_str::<ToolResult>(&serde_json::to_string(&refusal).unwrap()).unwrap(),
+            refusal,
+        );
     }
 }

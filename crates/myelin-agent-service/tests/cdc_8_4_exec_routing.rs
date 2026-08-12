@@ -175,7 +175,10 @@ fn fabric_exec_dispatches_kind_agent_job_through_the_four_guarantees() {
     };
     let hands = fabric_hands(&backend, working_hooks());
     let out = hands.exec(Command("cargo test".into()));
-    assert_eq!(out, myelin_agent::ToolResult("sandbox:fabric-guest".into()));
+    assert_eq!(
+        out,
+        myelin_agent::ToolResult::Succeeded("sandbox:fabric-guest".into())
+    );
     assert_eq!(
         *order.lock().unwrap(),
         vec!["isolation_floor", "reserve", "attribute", "settle"],
@@ -199,7 +202,7 @@ fn fabric_exec_refuses_to_start_on_exhausted_reserve_11_7() {
     let hands = fabric_hands(&backend, working_hooks());
     let out = hands.exec(Command("cargo test".into()));
     assert!(
-        out.0.starts_with("exec-refused:"),
+        out.is_refused() && out.content().starts_with("exec-refused:"),
         "refuse-to-start surfaces LOUD: {out:?}"
     );
     assert!(

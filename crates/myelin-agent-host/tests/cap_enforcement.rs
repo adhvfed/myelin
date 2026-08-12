@@ -118,7 +118,7 @@ impl ToolExecutor for FakeCheckReadExecutor {
             .get("commit")
             .and_then(|v| v.as_str())
             .unwrap();
-        Ok(ToolResult(format!(
+        Ok(ToolResult::Succeeded(format!(
             "check status for commit {commit} in repo {repo}: \
              ci/build = Success (run attempt 1, Trusted, cost_settled=true)"
         )))

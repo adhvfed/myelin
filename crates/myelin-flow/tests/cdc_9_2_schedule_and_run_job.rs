@@ -67,7 +67,7 @@ impl<H: ToolHands> JobRunner for UnifiedRunner<H> {
 struct SimHands;
 impl ToolHands for SimHands {
     fn exec(&self, cmd: Command) -> ToolResult {
-        ToolResult(format!("dispatched: {}", cmd.0))
+        ToolResult::Succeeded(format!("dispatched: {}", cmd.0))
     }
 }
 
@@ -134,7 +134,7 @@ fn provider_dispatches_into_the_runner_and_parks_consumer_sees_the_token() {
     let exec = runner.last_exec.lock().unwrap();
     assert_eq!(
         *exec,
-        Some(ToolResult(
+        Some(ToolResult::Succeeded(
             "dispatched: run ci target=pipeline://acme/ci/pr-7".into()
         )),
         "the dispatch reached the unified runner's ToolHands::exec (contract 8.4 consumed)"

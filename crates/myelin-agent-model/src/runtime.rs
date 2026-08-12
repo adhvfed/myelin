@@ -121,7 +121,8 @@ pub(crate) fn build_request(conv: &Conversation, max_output_tokens: Option<u32>)
                     .iter()
                     .map(|outcome| ToolCallResult {
                         id: outcome.call_id.0.clone(),
-                        content: outcome.result.0.clone(),
+                        content: outcome.result.content().to_string(),
+                        is_error: outcome.result.is_refused(),
                     })
                     .collect();
                 turns.push(ModelTurn::ToolResults(results));
@@ -287,7 +288,7 @@ mod tests {
             }])));
         conv.turns.push(Turn::ToolResults(vec![ToolOutcome {
             call_id: ToolCallId("call_abc".into()),
-            result: ToolResult("match at foo.rs:10".into()),
+            result: ToolResult::Succeeded("match at foo.rs:10".into()),
         }]));
 
         let request = build_request(&conv, Some(128));
@@ -303,6 +304,7 @@ mod tests {
                 assert_eq!(tool_calls[0].id, "call_abc");
                 assert_eq!(tool_calls[0].id, results[0].id);
                 assert_eq!(tool_calls[0].arguments, serde_json::json!({"q": "panic"}));
+                assert!(!results[0].is_error);
             }
             other => panic!("unexpected reconstruction: {other:?}"),
         }

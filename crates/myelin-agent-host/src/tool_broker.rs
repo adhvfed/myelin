@@ -265,9 +265,9 @@ fn parse_tool_result(response: &[u8], expected_call_id: &str) -> Result<ToolResu
         ));
     }
     if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        text = format!("The governed tool call was refused: {text}");
+        return Ok(ToolResult::Refused { refused: text });
     }
-    Ok(ToolResult(text))
+    Ok(ToolResult::Succeeded(text))
 }
 
 fn failed(reason: impl Into<String>) -> ToolExecError {
@@ -370,8 +370,8 @@ mod tests {
             },
         });
         let result = parse_tool_result(response.to_string().as_bytes(), "call-1").unwrap();
-        assert!(result.0.contains("refused"));
-        assert!(result.0.contains("denied"));
+        assert!(result.is_refused());
+        assert!(result.content().contains("denied"));
     }
 
     #[test]

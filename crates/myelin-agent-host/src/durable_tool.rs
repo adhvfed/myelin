@@ -112,7 +112,7 @@ impl ToolExecutor for DurableToolExecutor<'_> {
             )
             .map_err(journal_failed)?
         {
-            ToolEffectBegin::Completed(result) => return Ok(ToolResult(result)),
+            ToolEffectBegin::Completed(result) => return decode_result(&result),
             ToolEffectBegin::Unreplayable => {
                 return Err(journal_failed(ToolEffectError::Unreplayable));
             }
@@ -120,6 +120,8 @@ impl ToolExecutor for DurableToolExecutor<'_> {
         }
 
         let observed = self.inner.execute(context, definition, call)?;
+        let encoded = serde_json::to_string(&observed)
+            .map_err(|error| ToolExecError::Failed(format!("serialize tool result: {error}")))?;
         match self
             .journal
             .complete(
@@ -128,13 +130,20 @@ impl ToolExecutor for DurableToolExecutor<'_> {
                 context.effect_key,
                 &request_hash,
                 &self.requested_by,
-                &observed.0,
+                &encoded,
             )
             .map_err(journal_failed)?
         {
             ToolEffectCompletion::Applied => Ok(observed),
-            ToolEffectCompletion::Replayed(canonical) => Ok(ToolResult(canonical)),
+            ToolEffectCompletion::Replayed(canonical) => decode_result(&canonical),
         }
+    }
+}
+
+fn decode_result(stored: &str) -> Result<ToolResult, ToolExecError> {
+    match serde_json::from_str(stored) {
+        Ok(result) => Ok(result),
+        Err(_) => Ok(ToolResult::Succeeded(stored.to_string())),
     }
 }
 
@@ -329,7 +338,8 @@ mod tests {
     #[test]
     fn completed_effect_replays_exact_bytes_after_process_reconstruction() {
         let journal = Arc::new(MemoryJournal::default());
-        let first_process = ScriptedExecutor::with([Ok(ToolResult("first snapshot".into()))]);
+        let first_process =
+            ScriptedExecutor::with([Ok(ToolResult::Succeeded("first snapshot".into()))]);
         let first = DurableToolExecutor::with_journal(
             TenantId("acme".into()),
             "founder".into(),
@@ -339,12 +349,12 @@ mod tests {
 
         assert_eq!(
             first.execute(&context(), &definition(), &call("provider-a")),
-            Ok(ToolResult("first snapshot".into())),
+            Ok(ToolResult::Succeeded("first snapshot".into())),
         );
         assert_eq!(first_process.call_count(), 1);
 
         let restarted_process =
-            ScriptedExecutor::with([Ok(ToolResult("a changed snapshot".into()))]);
+            ScriptedExecutor::with([Ok(ToolResult::Succeeded("a changed snapshot".into()))]);
         let replay = DurableToolExecutor::with_journal(
             TenantId("acme".into()),
             "founder".into(),
@@ -353,7 +363,7 @@ mod tests {
         );
         assert_eq!(
             replay.execute(&context(), &definition(), &call("provider-b")),
-            Ok(ToolResult("first snapshot".into())),
+            Ok(ToolResult::Succeeded("first snapshot".into())),
             "replay returns the original observation even when the provider renames the call",
         );
         assert_eq!(
@@ -364,13 +374,50 @@ mod tests {
     }
 
     #[test]
+    fn governed_refusal_remains_a_refusal_after_process_reconstruction() {
+        let journal = Arc::new(MemoryJournal::default());
+        let first_process = ScriptedExecutor::with([Ok(ToolResult::Refused {
+            refused: "project is unavailable".into(),
+        })]);
+        let first = DurableToolExecutor::with_journal(
+            TenantId("acme".into()),
+            "founder".into(),
+            journal.clone(),
+            &first_process,
+        );
+
+        assert_eq!(
+            first.execute(&context(), &definition(), &call("provider-a")),
+            Ok(ToolResult::Refused {
+                refused: "project is unavailable".into(),
+            }),
+        );
+
+        let restarted_process =
+            ScriptedExecutor::with([Ok(ToolResult::Succeeded("should not escape".into()))]);
+        let replay = DurableToolExecutor::with_journal(
+            TenantId("acme".into()),
+            "founder".into(),
+            journal,
+            &restarted_process,
+        );
+        assert_eq!(
+            replay.execute(&context(), &definition(), &call("provider-b")),
+            Ok(ToolResult::Refused {
+                refused: "project is unavailable".into(),
+            }),
+        );
+        assert_eq!(restarted_process.call_count(), 0);
+    }
+
+    #[test]
     fn approval_wait_leaves_the_same_effect_retryable_then_caches_success() {
         let journal = Arc::new(MemoryJournal::default());
         let external = ScriptedExecutor::with([
             Err(ToolExecError::ApprovalRequired {
                 gate_id: "gate-1".into(),
             }),
-            Ok(ToolResult("merged once".into())),
+            Ok(ToolResult::Succeeded("merged once".into())),
         ]);
         let durable = DurableToolExecutor::with_journal(
             TenantId("acme".into()),
@@ -387,12 +434,12 @@ mod tests {
         );
         assert_eq!(
             durable.execute(&context(), &definition(), &call("provider-b")),
-            Ok(ToolResult("merged once".into())),
+            Ok(ToolResult::Succeeded("merged once".into())),
             "the approved retry keeps the original logical effect identity",
         );
         assert_eq!(
             durable.execute(&context(), &definition(), &call("provider-c")),
-            Ok(ToolResult("merged once".into())),
+            Ok(ToolResult::Succeeded("merged once".into())),
         );
         assert_eq!(
             external.call_count(),

@@ -19,6 +19,8 @@ pub struct ToolCallRequest {
 pub struct ToolCallResult {
     pub id: String,
     pub content: String,
+    #[serde(default)]
+    pub is_error: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

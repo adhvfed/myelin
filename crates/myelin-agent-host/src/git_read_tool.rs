@@ -137,7 +137,7 @@ impl ToolExecutor for GitCheckStatusReadExecutor {
         );
 
         *self.last_result.lock().expect("last_result lock") = Some(text.clone());
-        Ok(ToolResult(text))
+        Ok(ToolResult::Succeeded(text))
     }
 }
 

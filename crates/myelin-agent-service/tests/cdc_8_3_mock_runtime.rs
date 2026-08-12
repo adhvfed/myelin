@@ -26,7 +26,7 @@ fn call(name: &str) -> ToolCall {
 fn outcome(name: &str) -> ToolOutcome {
     ToolOutcome {
         call_id: ToolCallId(format!("call:{name}")),
-        result: ToolResult(format!("tool:{name}:result")),
+        result: ToolResult::Succeeded(format!("tool:{name}:result")),
     }
 }
 

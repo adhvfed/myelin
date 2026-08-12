@@ -123,7 +123,10 @@ impl ToolExecutor for MockToolExecutor {
         self.seen.lock().unwrap().push(call.clone());
         match self.scripted.lock().unwrap().pop_front() {
             Some(result) => result,
-            None => Ok(ToolResult(format!("mock-exec:{}:ok", call.name.0))),
+            None => Ok(ToolResult::Succeeded(format!(
+                "mock-exec:{}:ok",
+                call.name.0
+            ))),
         }
     }
 }
@@ -184,7 +187,7 @@ mod tests {
     #[test]
     fn mock_tool_executor_records_calls_and_replays_results() {
         let exec = MockToolExecutor::with_results([
-            Ok(ToolResult("first".into())),
+            Ok(ToolResult::Succeeded("first".into())),
             Err(ToolExecError::Failed("boom".into())),
         ]);
         let d = def("t");
@@ -192,7 +195,7 @@ mod tests {
         let context = context();
         assert_eq!(
             exec.execute(&context, &d, &call("t")),
-            Ok(ToolResult("first".into()))
+            Ok(ToolResult::Succeeded("first".into()))
         );
         assert_eq!(
             exec.execute(&context, &d, &call("t")),
@@ -200,7 +203,7 @@ mod tests {
         );
         assert_eq!(
             exec.execute(&context, &d, &call("search")),
-            Ok(ToolResult("mock-exec:search:ok".into()))
+            Ok(ToolResult::Succeeded("mock-exec:search:ok".into()))
         );
 
         assert_eq!(exec.call_count(), 3);

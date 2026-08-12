@@ -101,10 +101,15 @@ impl LunaClient {
                 }
                 ModelTurn::ToolResults(results) => {
                     for r in results {
+                        let content = if r.is_error {
+                            format!("The governed tool call was refused: {}", r.content)
+                        } else {
+                            r.content.clone()
+                        };
                         messages.push(json!({
                             "role": "tool",
                             "tool_call_id": r.id,
-                            "content": r.content,
+                            "content": content,
                         }));
                     }
                 }
@@ -334,6 +339,7 @@ mod tests {
                 ModelTurn::ToolResults(vec![ToolCallResult {
                     id: "call_1".into(),
                     content: "match at foo.rs:10".into(),
+                    is_error: false,
                 }]),
             ],
             tools: vec![ToolSpec {

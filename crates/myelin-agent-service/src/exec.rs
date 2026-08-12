@@ -181,7 +181,10 @@ impl<'a, B: SandboxBackend> SandboxToolHands<'a, B> {
             .launch(job.spec(), &self.hooks)
             .map_err(ExecError::Launch)?;
         self.backend.kill(&launch.handle).map_err(ExecError::Kill)?;
-        Ok(ToolResult(format!("sandbox:{}", launch.handle.guest_id)))
+        Ok(ToolResult::Succeeded(format!(
+            "sandbox:{}",
+            launch.handle.guest_id
+        )))
     }
 
     pub fn build_compute_job(
@@ -234,9 +237,13 @@ impl<B: SandboxBackend> ToolHands for SandboxToolHands<'_, B> {
         match self.build_compute_job(&def, &cmd) {
             Ok(job) => match self.dispatch_compute(&job) {
                 Ok(res) => res,
-                Err(e) => ToolResult(format!("exec-refused:{e}")),
+                Err(e) => ToolResult::Refused {
+                    refused: format!("exec-refused:{e}"),
+                },
             },
-            Err(e) => ToolResult(format!("exec-rejected:{e}")),
+            Err(e) => ToolResult::Refused {
+                refused: format!("exec-rejected:{e}"),
+            },
         }
     }
 }
@@ -659,7 +666,7 @@ mod tests {
         };
         let hands = hands(&backend, working_hooks());
         let out = hands.exec(Command("cargo test".into()));
-        assert_eq!(out, ToolResult("sandbox:agent-guest".into()));
+        assert_eq!(out, ToolResult::Succeeded("sandbox:agent-guest".into()));
         assert_eq!(
             *order.lock().unwrap(),
             vec!["isolation_floor", "reserve", "attribute", "settle"]
@@ -684,7 +691,7 @@ mod tests {
         let hands = hands(&backend, hooks);
         let out = hands.exec(Command("cargo test".into()));
         assert!(
-            out.0.starts_with("exec-refused:"),
+            out.is_refused() && out.content().starts_with("exec-refused:"),
             "a refused dispatch surfaces LOUD: {out:?}"
         );
         assert!(!order.lock().unwrap().contains(&"settle"));
@@ -706,7 +713,10 @@ mod tests {
         );
         let hands = hands(&backend, hooks);
         let out = hands.exec(Command("sh".into()));
-        assert!(out.0.starts_with("exec-refused:"), "{out:?}");
+        assert!(
+            out.is_refused() && out.content().starts_with("exec-refused:"),
+            "{out:?}"
+        );
         assert!(
             order.lock().unwrap().is_empty(),
             "no guarantee fired past the isolation floor"

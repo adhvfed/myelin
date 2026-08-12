@@ -1392,7 +1392,7 @@ mod tests {
         assert_eq!(submit_outcomes[0].call_id, ToolCallId("call:search".into()));
         assert_eq!(
             submit_outcomes[0].result,
-            ToolResult("mock-exec:search:ok".into()),
+            ToolResult::Succeeded("mock-exec:search:ok".into()),
             "the executor's result was threaded back, keyed to its call"
         );
         assert_eq!(submit_outcomes[1].call_id, ToolCallId("call:read".into()));

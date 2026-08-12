@@ -39,7 +39,7 @@ where
                     .iter()
                     .map(|call| ToolOutcome {
                         call_id: call.id.clone(),
-                        result: ToolResult(format!("tool:{}:result", call.name.0)),
+                        result: ToolResult::Succeeded(format!("tool:{}:result", call.name.0)),
                     })
                     .collect();
                 history.push_tool_results(results);

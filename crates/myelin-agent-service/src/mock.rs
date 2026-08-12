@@ -211,7 +211,7 @@ fn scripted_tool_results(calls: &[ToolCall]) -> Vec<ToolOutcome> {
         .iter()
         .map(|call| ToolOutcome {
             call_id: call.id.clone(),
-            result: ToolResult(format!("tool:{}:result", call.name.0)),
+            result: ToolResult::Succeeded(format!("tool:{}:result", call.name.0)),
         })
         .collect()
 }
@@ -274,7 +274,7 @@ mod tests {
     fn outcome(name: &str) -> ToolOutcome {
         ToolOutcome {
             call_id: ToolCallId(format!("call:{name}")),
-            result: ToolResult(format!("tool:{name}:result")),
+            result: ToolResult::Succeeded(format!("tool:{name}:result")),
         }
     }
 
@@ -330,7 +330,7 @@ mod tests {
         assert_eq!(model_turns_taken(&conv), 1, "one model turn → position 1");
         conv.turns.push(Turn::ToolResults(vec![ToolOutcome {
             call_id: ToolCallId("call:r".into()),
-            result: ToolResult("r".into()),
+            result: ToolResult::Succeeded("r".into()),
         }]));
         assert_eq!(
             model_turns_taken(&conv),

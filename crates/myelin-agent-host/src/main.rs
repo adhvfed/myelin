@@ -367,6 +367,10 @@ impl ModelClient for DeterministicDevelopmentModel {
             .iter()
             .filter(|turn| matches!(turn, ModelTurn::ToolResults(_)))
             .count();
+        let last_tool_refused = request.turns.iter().rev().find_map(|turn| match turn {
+            ModelTurn::ToolResults(results) => Some(results.iter().any(|result| result.is_error)),
+            _ => None,
+        });
         let reply = match (has_ci_triage_tools, has_merge_tool, tool_results) {
             (true, _, 0) => ModelReply::ToolCalls(vec![ToolCallRequest {
                 id: "read-triggering-ci-run".into(),
@@ -401,8 +405,16 @@ impl ModelClient for DeterministicDevelopmentModel {
                     arguments: serde_json::json!({ "repo": repo, "number": number }),
                 }])
             }
+            (false, true, _) if last_tool_refused == Some(true) => ModelReply::Final {
+                content: "The governed pull-request merge was refused; no merge was applied."
+                    .into(),
+            },
             (false, true, _) => ModelReply::Final {
                 content: "Applied the exact pull-request merge approved by a human.".into(),
+            },
+            (true, false, _) if last_tool_refused == Some(true) => ModelReply::Final {
+                content: "The governed issue creation was refused; no triage issue was opened."
+                    .into(),
             },
             (true, false, _) => ModelReply::Final {
                 content: "Read the failing CI run and opened one governed triage issue.".into(),
@@ -617,6 +629,7 @@ mod tests {
             .push(ModelTurn::ToolResults(vec![ToolCallResult {
                 id: "read-triggering-ci-run".into(),
                 content: "the contract job failed".into(),
+                is_error: false,
             }]));
 
         let response = development_model()
@@ -633,6 +646,37 @@ mod tests {
                     "title": "CI failure 65274e14-2e61-8bc9-e1a5-6345afea6ad6 needs triage",
                 }),
             }])
+        );
+    }
+
+    #[test]
+    fn the_development_model_never_reports_a_refused_mutation_as_completed() {
+        let mut request = request_with_tools(&["ci.read_run", "issues.create"]);
+        request
+            .turns
+            .push(ModelTurn::ToolResults(vec![ToolCallResult {
+                id: "read-triggering-ci-run".into(),
+                content: "the contract job failed".into(),
+                is_error: false,
+            }]));
+        request
+            .turns
+            .push(ModelTurn::ToolResults(vec![ToolCallResult {
+                id: "open-triage-issue".into(),
+                content: "project metadata is unavailable".into(),
+                is_error: true,
+            }]));
+
+        let response = development_model()
+            .complete(&request)
+            .expect("the explicit development model reports the governed outcome");
+
+        assert_eq!(
+            response.reply,
+            ModelReply::Final {
+                content: "The governed issue creation was refused; no triage issue was opened."
+                    .into(),
+            }
         );
     }
 }
