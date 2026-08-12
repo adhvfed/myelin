@@ -1,8 +1,5 @@
-// The ONE portal (overlays.md §0.1: "Portal-always to the document root"). Every overlay in this
-// package renders through THIS component, never in the triggering subtree — which forecloses the
-// "panel clipped by a transform/overflow:hidden ancestor / rendered inside the 240px sidebar" bug
-// class by construction. It is a thin, documented wrapper over Solid's `<Portal>` (mount =
-// document.body) so there is a single, greppable portal seam shared by all six primitives.
+// Render overlays at the document root so transformed or clipped trigger ancestors do not contain
+// the floating layer.
 
 import { Portal } from "solid-js/web";
 import type { JSX } from "solid-js";

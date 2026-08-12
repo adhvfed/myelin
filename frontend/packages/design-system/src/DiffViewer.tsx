@@ -1,17 +1,6 @@
-// DiffViewer — the R-17 §5.1 hard component (R3.2 · G-7), contributed DOWN into the design system as
-// the ONE diff/files-changed viewer. Consumers: PR diff (G-7), compare (G-4), commit detail (G-3) —
-// three surfaces, zero forks. Presentational + accessible by construction:
-//   • change kind is TEXT, never colour: every code cell carries a visually-hidden prefix
-//     ("added, new line 210: …" / "removed, old line 105: …" / "unchanged, line 104"); the +/− glyph
-//     is a visible TEXT channel (aria-hidden — the prefix already says it). Line numbers are announced.
-//   • the line grid is ONE tab stop (roving tabindex); j/k walk lines, F7/Shift-F7 walk CHANGES,
-//     n/p walk files, c comments the focused line, v marks viewed. Esc never traps; inline widgets
-//     (threads, composer) live in an always-present widget row (tab AFTER their line).
-//   • side-by-side + unified; unified-only under the caller's `forceUnified` (the <720px mobile rule).
-//   • binary/LFS/submodule rows never dump garbled text; deleted files collapse (never a red wall).
-// The table body is ONE flat `<For>` of precomputed single/fixed-arity rows (no conditional <tr>
-// siblings, no Show-branch swaps under <For>) so a dynamic re-render never trips the table reconciler.
-// Semantic tokens only (no hex); logical properties; the +/− colour only ever tints the glyph channel.
+// Shared diff viewer for PRs, comparisons, and commits. It supports unified and split layouts,
+// keyboard navigation, inline threads, and text labels for change types. The table body uses a flat,
+// fixed-arity row model to keep Solid's table reconciliation stable.
 import { For, Show, Switch, Match, createMemo, createSignal, onCleanup, onMount, mergeProps, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 
@@ -101,7 +90,7 @@ function splitRows(lines: DiffViewerLine[]): { left?: DiffViewerLine; right?: Di
   return rows;
 }
 
-/** The visually-hidden SR prefix — kind + the line number(s), as TEXT (never colour). */
+/** Visually hidden change type and line number. */
 function srPrefix(l: DiffViewerLine): string {
   if (l.origin === "+") return `added, new line ${l.new_no ?? "?"}: `;
   if (l.origin === "-") return `removed, old line ${l.old_no ?? "?"}: `;
@@ -169,7 +158,7 @@ export function ExpandContextControl(props: { cols: number; count?: number; onEx
   );
 }
 
-// ── flat row model: the whole table body is a stable list of these (no conditional siblings) ──
+// Flat row model: the table body has no conditional sibling rows.
 type DiffRow =
   | { t: "expand"; key: string; gapKey: string }
   | { t: "hunk"; key: string; header: string }
@@ -220,8 +209,8 @@ export function DiffViewer(rawProps: DiffViewerProps) {
   const view = (): "split" | "unified" => (props.forceUnified ? "unified" : props.view);
   const cols = () => (view() === "split" ? 4 : 3);
   const [focusKey, setFocusKey] = createSignal<string>("");
-  // `mounted` guards the ASYNC-DATA-dependent renders (line threads/composer + the ● marker): the
-  // thread data arrives from an async resource, so it must NOT render during SSR / the first hydration
+  // `mounted` guards async-data-dependent renders (line threads/composer + the marker): the
+  // thread data arrives from an async resource, so it must not render during SSR / the first hydration
   // pass (server has it, client's first paint doesn't → a hydration-key mismatch that crashes the
   // grid). It flips true after mount, so threads appear client-side without a mismatch.
   const [mounted, setMounted] = createSignal(false);
@@ -451,7 +440,7 @@ function DiffFileSection(props: SectionProps) {
   );
 }
 
-/** A gutter cell — the line number, announced (NOT aria-hidden). */
+/** A gutter cell whose line number is announced. */
 function Gutter(props: { no?: number | null }) {
   return (
     <td style={{ width: "3rem", "text-align": "end", "padding-inline": "var(--space-1)", color: "var(--text-subtle)", "user-select": "none", "border-inline-end": "var(--hairline) solid var(--border)", "vertical-align": "top" }}>
@@ -494,7 +483,7 @@ function CodeCell(props: {
   );
 }
 
-/** An ALWAYS-PRESENT widget row (thread + composer) beneath a line — stable row count (content is
+/** An always-present widget row (thread + composer) beneath a line keeps the row count stable (content is
  *  conditional INSIDE, never a conditional sibling <tr>, so a dynamic open/close never trips the
  *  table reconciler). A row with no thread/composer renders an empty, zero-height <tr>.
  *  `targets` is the set of (side,line) the row can host a widget for: unified rows carry ONE, split
@@ -502,12 +491,8 @@ function CodeCell(props: {
  *  opens its composer under the clicked side — never silently anchored to the new side only. */
 function WidgetRow(props: { cols: number; section: SectionProps; targets: { side: "old" | "new"; line: number }[] }) {
   const section = () => props.section;
-  // A row carries an optional OLD (left/deleted) and NEW (right/added) target. Two keying rules:
-  //   • THREADS are anchored by (path, line), side-agnostic — render per DISTINCT line, so a modified
-  //     row with old_no === new_no shows its thread ONCE, but old_no !== new_no shows both lines.
-  //   • COMPOSERS are side-keyed and self-gate on the exact (path, side, line) — render for EACH side
-  //     so a click on the deleted (old) cell opens the composer under the OLD side, not only the new.
-  // Explicit <Show> slots (not <For>) keep each call in a TRACKED scope so it re-runs when the
+  // Threads are keyed by path and line; composers also include the side. Explicit <Show> slots
+  // (not <For>) keep each call in a tracked scope so it re-runs when the
   // consumer's open-composer / thread signals change (a <For> callback is memoised and would not).
   const oldT = () => props.targets.find((t) => t.side === "old");
   const newT = () => props.targets.find((t) => t.side === "new");
@@ -519,7 +504,7 @@ function WidgetRow(props: { cols: number; section: SectionProps; targets: { side
     const ot = oldT();
     return nt && (!ot || ot.line !== nt.line) ? threadAt(nt) : undefined; // dedupe same-line sides
   };
-  // Dynamic JSX children (`{fn()}`) — each is its own TRACKED scope, so the composer re-renders when
+  // Each dynamic JSX child has its own tracked scope, so the composer re-renders when
   // the consumer's open-composer signal flips (a <Show>/<For> render-prop body is called once, not re-run).
   return (
     <tr data-diff-widget>
@@ -555,9 +540,9 @@ function UnifiedRow(props: { row: Extract<DiffRow, { t: "uline" }>; } & SectionP
 function SplitRow(props: { row: Extract<DiffRow, { t: "sline" }>; } & SectionProps) {
   const left = () => props.row.left;
   const right = () => props.row.right;
-  // Widget targets: a context row pairs the SAME line object on both sides (splitRows pushes
+  // A context row pairs the same line object on both sides (splitRows pushes
   // `{ left: l, right: l }`) → one target on the new side. A changed row has distinct old/new lines →
-  // a target for EACH side present, so a comment on the deleted (left) cell opens under the old side.
+  // a target for each side present, so a comment on the deleted (left) cell opens under the old side.
   const targets = (): { side: "old" | "new"; line: number }[] => {
     const l = left();
     const r = right();

@@ -2,7 +2,7 @@
 // Kept in lockstep with that sprite's <symbol id="..."> set + manifest.json. A typed union so a
 // typo in an icon name is a compile error, not a silent missing-glyph at runtime.
 // `download` was registered by R3.4 (repo-browsing) for the blob/large-file/binary Download
-// affordance — added through the pipeline (manifest + sprite), NOT drawn ad hoc; semantically
+// affordance, added through the manifest and sprite pipeline; semantically
 // distinct from `external-link` ("open raw").
 export const ICON_NAMES = [
   "agent", "approve", "branch", "channel", "check-fail", "check-pass",

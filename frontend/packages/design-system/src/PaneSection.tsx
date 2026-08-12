@@ -1,11 +1,4 @@
-// PaneSection — the labelled context-pane slot (R3.3, contributed DOWN). The W1 "the pane assembles
-// itself" contract made mechanical: a visible h3 label renders BEFORE the content, each slot fills
-// independently, a busy slot carries `aria-busy` + a structure-matching skeleton, and a slot that
-// FAILS fails ALONE (a system-blaming one-liner scoped to the slot — never the whole pane). Justified
-// as a primitive because issues/docs panes reuse this exact anatomy (NOTES §5.4).
-//
-// Landmarks: each slot is a <section aria-labelledby> with a visible heading, so an SR user jumps
-// slot-to-slot by heading (NOTES §4). Semantic tokens only.
+// Labelled context-pane section with independent loading and error states.
 import { ErrorBoundary, Show, createUniqueId, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 import { Skeleton } from "./Skeleton";
@@ -17,7 +10,7 @@ export interface PaneSectionProps {
   busy?: boolean;
   /** The skeleton's line count while busy. */
   skeletonRows?: number;
-  /** A scoped fail message if the slot's own render throws — fails ALONE, the pane stays live. */
+  /** A scoped failure message if this section throws. */
   failLabel?: string;
   children?: JSX.Element;
   style?: JSX.CSSProperties;

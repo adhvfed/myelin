@@ -1,5 +1,4 @@
-// StatusPill gate (R3.1 / DESIGN-MANUAL §3.1, WCAG 1.4.1): status is announced as TEXT (a visible
-// label + a title), never colour alone; the check-verdict label is derived from the counts.
+// Visible status labels and count-derived check verdicts.
 import { render, screen } from "@solidjs/testing-library";
 import { describe, it, expect } from "vitest";
 import { StatusPill, checkVerdictLabel } from "./StatusPill";

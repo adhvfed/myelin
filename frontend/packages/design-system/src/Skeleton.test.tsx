@@ -1,5 +1,4 @@
-// Skeleton gate (DESIGN-MANUAL §5.3/§6): a structure-matching loading placeholder that sets
-// aria-busy and announces through ONE debounced polite live region — never a spinner.
+// Skeleton rendering and debounced live-region behavior.
 import { render, screen } from "@solidjs/testing-library";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createSignal, Show } from "solid-js";

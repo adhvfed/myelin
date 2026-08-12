@@ -1,10 +1,5 @@
-// Tooltip — the tiny anchored label for icon-buttons and truncated text (overlays.md §6). Shows on
-// hover AND keyboard focus; NEVER takes or steals focus (overlays.md §6: "Tooltip never takes
-// focus"). role="tooltip" + the trigger's aria-describedby points at it. Dismissable (Escape),
-// hoverable + persistent (WCAG 2.2 1.4.13). Anchored through the shared `computePosition`.
-//
-// The trigger is supplied via a render prop so we can wire aria-describedby + the hover/focus
-// handlers ONTO the real interactive element (the gate asserts describedby lands on the trigger).
+// Anchored tooltip for hover and keyboard focus. The render prop attaches `aria-describedby` and
+// event handlers to the trigger without moving focus.
 
 import {
   Show,

@@ -1,12 +1,5 @@
-// Chip — the <ReferenceChip> design-system implementation (R3.3, contributed DOWN; the spec exists in
-// 02-components/reference-chip-and-unfurl, the component didn't). ONE inline reference affordance every
-// surface reaches for: a linked issue / CI run / doc / commit / agent slot rendered as a compact,
-// keyboard-reachable chip. The reference-chip state table (§5) is honoured HERE so no surface re-invents
-// the no-access / moved / outdated / cross-cell / degraded renders:
-//   • state === "no_access" | "tombstoned" → NO title is shown (nothing to leak — non-leak by
-//     construction; the label is a neutral "Restricted" / "Removed", supplied by the caller/backend).
-//   • the type glyph is TEXT-backed (a visible label always accompanies it — never colour/glyph alone).
-// Semantic tokens only; the accent is never used as text (a §3.1 hard rail).
+// Shared inline reference for issues, runs, docs, commits, messages, links, and agents. Withheld
+// references omit their title and render as neutral, non-link text.
 import { Show, mergeProps, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 import { type IconName } from "./icon-names";
@@ -30,7 +23,7 @@ export interface ChipProps {
   /** The visible label. For `no_access`/`tombstoned` this is a neutral collapsed label ("Restricted"). */
   label: string;
   state?: ChipState;
-  /** A status word rendered after the label ("failed" / "in progress") — TEXT, never colour alone. */
+  /** A visible status word rendered after the label ("failed" / "in progress"). */
   statusLabel?: string;
   /** The navigation target. Absent (or a withheld state) → the chip renders as a non-link span. */
   href?: string;
@@ -51,7 +44,7 @@ const TYPE_GLYPH: Record<ChipType, IconName> = {
   agent: "agent",
 };
 
-/** The small state pill's TEXT for a non-live reference (never colour alone). */
+/** The visible state label for a non-live reference. */
 function stateWord(state: ChipState): string | null {
   switch (state) {
     case "moved":

@@ -1,10 +1,4 @@
-// Overlay substrate core — the "get it right ONCE" mechanics (design-manual 02-components/overlays.md
-// §0: the four substrate mandates). Every overlay in this package composes from THIS module; none
-// re-implements focus-trap / scroll-lock / inert-background / the Escape stack. (overlays.md §10:
-// "the single substrate is the only defence" against per-feature overlays breaking these.)
-//
-// Framework-agnostic DOM helpers live here; the Solid binding that wires them to component lifecycle
-// is `createOverlay.ts`. Splitting them keeps this layer unit-testable and obviously single-source.
+// Framework-independent focus, scroll, inert-background, and stack utilities for overlays.
 
 /** The focusable-element selector (WAI-ARIA APG focus management). */
 const FOCUSABLE = [
@@ -18,9 +12,8 @@ const FOCUSABLE = [
 ].join(",");
 
 /**
- * The focusable descendants of `container`, in DOM order. Under jsdom there is no layout, so we do
- * NOT filter by visibility (offsetParent is always null); we filter by the attributes that matter
- * (disabled / tabindex=-1 / aria-hidden / inert), which is what the trap actually needs.
+ * Focusable descendants in DOM order. jsdom has no layout, so filtering uses element attributes
+ * rather than visibility.
  */
 export function getFocusable(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
@@ -60,11 +53,7 @@ export function trapFocus(e: KeyboardEvent, container: HTMLElement): void {
   }
 }
 
-// ---------------------------------------------------------------------------------------------------
-// Body scroll-lock with scrollbar-width compensation (overlays.md §0.3: "scroll-lock with
-// scrollbar-width compensation" — so the page doesn't jolt sideways when a modal opens). Refcounted
-// so nested modals (Confirm-over-Dialog) lock once and restore exactly once.
-// ---------------------------------------------------------------------------------------------------
+// Ref-counted body scroll lock with scrollbar-width compensation.
 let lockCount = 0;
 let savedOverflow = "";
 let savedPaddingRight = "";
@@ -93,13 +82,7 @@ export function unlockScroll(): void {
   }
 }
 
-// ---------------------------------------------------------------------------------------------------
-// Background inert (overlays.md §0.3 / §2: "Background is inert"). For a modal, every body child that
-// does NOT contain the overlay content is marked `inert` — which removes it from the tab order AND
-// the accessibility tree per the HTML spec, the modern single-attribute replacement for the
-// aria-hidden dance. Refcounted/stacked: each modal records exactly what IT hid and restores only
-// that, so nested modals unwind correctly.
-// ---------------------------------------------------------------------------------------------------
+// Mark background body children inert. Each modal restores only the nodes it changed.
 export function hideOthers(contentEl: HTMLElement): () => void {
   const hidden: HTMLElement[] = [];
   for (const child of Array.from(document.body.children)) {

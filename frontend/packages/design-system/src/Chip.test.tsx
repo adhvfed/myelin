@@ -1,6 +1,4 @@
-// Chip gate (R3.3 / reference-chip §5): a no-access reference withholds its title + renders as a
-// non-link span (non-leak by construction); a live reference with an href is a real link; the state
-// word is TEXT, never colour alone.
+// Reference visibility, link behavior, and visible state labels.
 import { fireEvent, render, screen } from "@solidjs/testing-library";
 import { describe, it, expect, vi } from "vitest";
 import { Chip } from "./Chip";

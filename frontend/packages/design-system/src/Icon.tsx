@@ -1,13 +1,5 @@
-// <Icon> — the Solid wrapper over the self-hosted strok sprite (no CDN; sovereignty/GDPR, doc 08).
-//
-// Renders <svg><use href="<sprite>#<name>"/></svg>. The glyph inherits `currentColor` (the sprite
-// strokes/fills are authored as currentColor), so an icon is colored by its text context via the
-// semantic tokens — never a hardcoded hex here.
-//
-// A11y model (binding, WAI-ARIA APG):
-//   - DECORATIVE (default): aria-hidden, no accessible name — the adjacent text carries meaning.
-//   - MEANINGFUL: pass `title`; the icon gets role="img" + aria-label so AT announces it.
-// This is the single decision point so no subsystem re-invents icon a11y.
+// Solid wrapper for the self-hosted SVG sprite. Icons inherit `currentColor` and are decorative by
+// default; passing `title` gives the icon an accessible name.
 
 import { splitProps, mergeProps, type JSX } from "solid-js";
 import type { IconName } from "./icon-names";

@@ -1,10 +1,5 @@
-// Substrate behaviours that the design EXERCISES but the original suite never ASSERTED (fe-ds finding
-// 6), plus the regression locks for the four cross-primitive fixes in this batch:
-//   • finding 1 — a modal's inert background must NOT silence the Toast layer stacked above it.
-//   • finding 3 — toggling a reactive dismiss flag mid-open must not churn the overlay.
-//   • finding 5 — a plain Dialog's default focus must not land on the Close (X).
-//   • the inert set/restore, topmost-only Escape, Menu Tab-close, Toast pause, padding compensation
-//     seams the finding calls out as untested.
+// Cross-overlay behavior: inert restoration, toast stacking, reactive dismissal, focus defaults,
+// topmost Escape, menu Tab handling, toast pause, and scroll-lock padding.
 import { render, screen, fireEvent } from "@solidjs/testing-library";
 import { createSignal } from "solid-js";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
@@ -55,7 +50,7 @@ describe("the Toast layer survives a modal's inert background (finding 1)", () =
     fireEvent.click(screen.getByRole("button", { name: "Notify" }));
 
     const region = screen.getByRole("region", { name: "Notifications" });
-    // The toast portal (a direct body child) is NOT inert even though a modal is open.
+    // Keep the toast portal active while a modal is open.
     let bodyChild: HTMLElement | null = region;
     while (bodyChild && bodyChild.parentElement !== document.body) bodyChild = bodyChild.parentElement;
     expect(bodyChild).toBeTruthy();

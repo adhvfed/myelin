@@ -1,7 +1,4 @@
-// Substrate gate: (1) the ONE z-index token scale orders the layers correctly (chrome < popover <
-// modal < toast) AND each overlay paints with its scale token (never a magic number); (2) the
-// gate BITES — a dialog missing its accessible name is caught by axe (proving the a11y gate is real,
-// not decorative); (3) nested overlays stack (Confirm-over-Dialog) and the stack tracks depth.
+// Overlay z-index ordering, accessibility checks, and nested stack depth.
 import { render, screen, fireEvent } from "@solidjs/testing-library";
 import { axe } from "vitest-axe";
 import { createSignal } from "solid-js";
@@ -80,7 +77,7 @@ describe("nested overlays (Confirm over Dialog)", () => {
 describe("the gate BITES (negative / red check)", () => {
   it("flags a dialog that is missing its accessible name", async () => {
     // A deliberately broken overlay — role=dialog + aria-modal but NO label. The substrate forbids
-    // this by construction (Dialog wires aria-labelledby); here we prove axe catches the violation
+    // Dialog normally wires aria-labelledby; this fixture verifies that axe catches its absence.
     // if a hand-rolled overlay skips it.
     render(() => (
       <div role="dialog" aria-modal="true">

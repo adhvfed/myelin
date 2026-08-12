@@ -1,15 +1,5 @@
-// StatusPill — the shared glyph+label status primitive (R3.1, contributed DOWN into the design
-// system per gate Q6). ONE pill that every status cell reaches for: the PR state (open/draft/merged/
-// closed), Issue state, and the checks-summary verdict (pass/fail/running/none/unavailable). Two hard rules from
-// DESIGN-MANUAL §3.1 / WCAG 1.4.1, enforced by construction here so no surface re-invents them:
-//   • **Status is TEXT, never colour alone** — every pill renders a visible label AND a `title`, and
-//     colour only ever tints the GLYPH (never the label, so a colour-blind or greyscale reader still
-//     reads the state).
-//   • **The verdict RING is reserved for the CI trio** — `check-verdict` uses the ring glyphs
-//     (check-pass/fail/pending); `pr-state` uses non-ring glyphs (pull-request/edit/merge/close), so
-//     the ring keeps meaning "a CI verdict", never a PR lifecycle state.
-//
-// Semantic tokens only; the accent is never used as text (a §3.1 hard rail).
+// Shared PR, issue, and check status treatment. Visible labels convey status without relying on
+// colour; ring glyphs are reserved for check verdicts.
 import { Match, Switch, type JSX } from "solid-js";
 import { Icon } from "./Icon";
 import { type IconName } from "./icon-names";
@@ -51,7 +41,6 @@ export interface IssueStatePillProps {
 
 export type StatusPillProps = PrStatePillProps | CheckVerdictPillProps | IssueStatePillProps;
 
-// ── pr-state: glyph tint per state; the label is always readable text ──
 const PR_STATE: Record<PrStateValue, { icon: IconName; label: string; glyph: string; labelColor: string }> = {
   open:   { icon: "pull-request", label: "Open",   glyph: "var(--success)",     labelColor: "var(--text-primary)" },
   draft:  { icon: "edit",         label: "Draft",  glyph: "var(--text-subtle)", labelColor: "var(--text-muted)" },
@@ -66,7 +55,7 @@ const ISSUE_STATE: Record<IssueStateCategory, { icon: IconName; glyph: string }>
   cancelled: { icon: "close", glyph: "var(--danger)" },
 };
 
-/** The verdict label — TEXT, derived from the counts so a reader never depends on colour. */
+/** Derive the visible verdict label from check counts. */
 export function checkVerdictLabel(value: CheckVerdictPillProps): string {
   const passing = value.passing ?? 0;
   const failing = value.failing ?? 0;

@@ -1,13 +1,5 @@
-// The ONE anchored-float positioner (overlays.md §9 / doc 10 §2: "a single helper clamps every
-// caret/anchor-positioned float … one source of truth, never copy-pasted (and drifting)"). Popover,
-// Menu and Tooltip all anchor through THIS function.
-//
-// BOUNDED — honest scope: this does basic vertical flip (place above the anchor when there isn't
-// room below) and viewport clamping (pull the right edge in to keep a gutter; clamp left to the
-// gutter). It does NOT do full collision-aware flipping on every axis, arrow/beak repositioning, or
-// scroll/resize re-tracking — those are DEFERRED to the later positioning hardening (a Floating-UI-
-// class helper) and are called out in the MR-017 report. It is sufficient and correct for the
-// keyboard/a11y gate; production polish on tight viewports is the deferred follow-up.
+// Shared anchor positioner for popovers, menus, and tooltips. It flips vertically and clamps to the
+// viewport, but does not handle horizontal flipping, arrows, or scroll/resize tracking.
 
 export type Placement = "bottom-start" | "bottom-end" | "top-start" | "top-end";
 

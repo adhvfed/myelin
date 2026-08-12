@@ -182,7 +182,7 @@ const FOUNDATION_RULES = `/* ===================================================
    ============================================================================ */
 *{box-sizing:border-box}
 
-/* ONE focus-ring token, every interactive element, every theme (R-17 M2). */
+/* Shared focus-ring treatment for interactive elements. */
 :where(a,button,input,select,textarea,[tabindex],
        [role="button"],[role="tab"],[role="option"],
        [role="menuitem"],[role="checkbox"],[role="switch"]):focus-visible{

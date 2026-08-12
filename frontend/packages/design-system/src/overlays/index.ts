@@ -1,5 +1,4 @@
-// Tier-1 overlay primitives (MR-017) — six hand-built Solid components sharing ONE substrate
-// (overlay-core + createOverlay + OverlayPortal + position). See overlays.md.
+// Overlay components share the same portal, positioning, focus, and dismissal utilities.
 export { Dialog, type DialogProps, type DialogSize } from "./Dialog";
 export { ConfirmDialog, type ConfirmDialogProps } from "./ConfirmDialog";
 export { Popover, type PopoverProps } from "./Popover";

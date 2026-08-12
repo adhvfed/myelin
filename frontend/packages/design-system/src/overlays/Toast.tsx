@@ -1,9 +1,5 @@
-// Toast — the transient corner notice + host of the undo affordance (overlays.md §7). A toast NEVER
-// steals focus (WCAG 4.1.3); AT is informed via a live region: role="status" (polite) for the vast
-// majority, role="alert" (assertive) only for genuinely time-critical/blocking events (danger).
-// Status is glyph + label, never colour alone (WCAG 1.4.1). Auto-timeout with pause-on-hover and
-// pause-on-focus; danger is persistent by default. F6 moves focus into the region so keyboard users
-// can reach an Undo (the documented hotkey, overlays.md §7).
+// Toast live region with optional undo. Timeouts pause on hover or focus, danger notices persist by
+// default, and F6 moves focus into the region.
 
 import {
   For,

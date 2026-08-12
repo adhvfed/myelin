@@ -1,14 +1,9 @@
-// A minimal styleguide proof: a Solid component that consumes ONLY semantic tokens (no primitive,
-// no hex in markup), renders, and re-skins across the 3 themes purely by flipping `data-theme` on a
-// wrapper — the parameterization model, demonstrated. This is the smoke target for the axe test.
-//
-// It is NOT a Tier-1 primitive (those are MR-017). It exists to prove the token + icon + a11y wiring.
+// Styleguide smoke target for theme tokens, icons, and accessibility.
 
 import { createSignal, For, type JSX } from "solid-js";
 import { Icon } from "../src/Icon";
 import { Z_INDEX, type ThemeName } from "../generated/tokens";
 
-// Every value here is a SEMANTIC var() — re-pointing tokens.json re-skins this with no edit.
 const card: JSX.CSSProperties = {
   background: "var(--surface-raised)",
   color: "var(--text-primary)",

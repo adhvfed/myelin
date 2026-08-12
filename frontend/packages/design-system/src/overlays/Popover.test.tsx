@@ -1,5 +1,4 @@
-// Popover gate: anchored non-modal surface. axe-clean open; Escape + outside-click dismiss with
-// return-focus; NON-modal proof (no scroll-lock); hovercard opens on focus (WCAG 1.4.13).
+// Popover accessibility, dismissal, focus return, scroll behavior, and hovercard activation.
 import { render, screen, fireEvent } from "@solidjs/testing-library";
 import { axe } from "vitest-axe";
 import { describe, it, expect } from "vitest";

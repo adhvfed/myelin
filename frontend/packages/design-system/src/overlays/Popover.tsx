@@ -1,11 +1,5 @@
-// Popover — the anchored, NON-MODAL floating surface (overlays.md §4): reference unfurl hovercard,
-// filter builder, date picker. Reuses the substrate (portal-to-root via OverlayPortal, Escape +
-// outside-click dismiss + return-focus via createOverlay) but DELIBERATELY does NOT trap focus or
-// lock scroll — it is non-modal (overlays.md §4: "Don't trap focus (it's non-modal)"). Anchored
-// through the shared `computePosition` helper.
-//
-// Two variants: "click" (interactive popover; focus moves in) and "hover" (hovercard; opens on hover
-// AND keyboard focus, is hoverable + persistent + Esc-dismissable — WCAG 2.2 1.4.13).
+// Non-modal anchored surface with click and hovercard variants. It supports Escape, outside-click,
+// and focus return without trapping focus or locking scroll.
 
 import {
   Show,
@@ -90,8 +84,7 @@ export function Popover(props: PopoverProps): JSX.Element {
       <button
         ref={trigger}
         type="button"
-        // Only the interactive click variant advertises a dialog popup. The hovercard is a non-modal
-        // informational surface, so it does NOT claim haspopup=dialog (fe-ds finding 7).
+        // Only the interactive click variant advertises a dialog popup.
         aria-haspopup={local.variant === "click" ? "dialog" : undefined}
         aria-expanded={open()}
         aria-controls={open() ? panelId : undefined}

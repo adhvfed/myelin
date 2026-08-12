@@ -51,11 +51,7 @@ export function createOverlay(opts: CreateOverlayOptions): void {
     const id = pushOverlay();
     const modal = opts.modal ?? false;
     const restoreFocus = opts.restoreFocus ?? true;
-    // The reactive dismiss flags are read at EVENT time inside the handlers below — NOT snapshotted
-    // here. Snapshotting subscribed this effect to e.g. Dialog's `() => dismissable`, so toggling it
-    // mid-open (a real pattern: freeze dismiss during an in-flight confirm) tore down + re-ran the
-    // whole setup — churning scroll-lock/inert and yanking initial focus back. Reading at event time
-    // keeps the flag reactive without re-running the effect.
+    // Read reactive dismiss flags inside event handlers so changing them does not rerun setup.
 
     // Record where focus came from BEFORE we move it, for the return-focus guarantee.
     const previouslyFocused = document.activeElement as HTMLElement | null;

@@ -71,11 +71,11 @@
   --border:#24272f;
   --border-strong:#3a3f47;
 
-  /* accent (IDENTITY) vs focus-ring (DERIVED, AA-safe, DISTINCT) */
+  /* identity accent and AA-safe focus ring */
   --accent:#5b8cff;         /* identity — 6.14:1 */
   --on-accent:#0c0d10;
   --accent-weak:#172238;
-  --focus-ring:#7ea6ff;     /* DERIVED — 8.13:1; THE focus/primary token */
+  --focus-ring:#7ea6ff;     /* 8.13:1 */
 
   /* functional status (always paired with glyph+label) */
   --success:#46b277;  --on-success:#0c0d10;  --success-subtle:#10231a;  /* 7.31:1 */
@@ -83,7 +83,7 @@
   --danger:#e0695c;   --on-danger:#0c0d10;   --danger-subtle:#27151a;   /* 5.87:1 */
   --info:#7ea6ff;     --on-info:#0c0d10;     --info-subtle:#172238;     /* 8.13:1 (=focus) */
 
-  /* reserved agent treatment (NOT a status colour) */
+  /* agent treatment, separate from status colours */
   --agent:#a99bf2;    --on-agent:#0c0d10;    --agent-subtle:#1c1830;    /* 8.01:1 */
 
   /* diff */
@@ -190,8 +190,7 @@
    ============================================================================ */
 *{box-sizing:border-box}
 
-/* ONE focus-ring token, every interactive element, every theme (R-17 M2).
-   Logical offset so RTL is correct by construction. */
+/* Shared focus-ring treatment for interactive elements. */
 :where(a,button,input,select,textarea,[tabindex],
        [role="button"],[role="tab"],[role="option"],
        [role="menuitem"],[role="checkbox"],[role="switch"]):focus-visible{

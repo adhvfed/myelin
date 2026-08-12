@@ -108,11 +108,11 @@ describe("Menu disabled items (APG: aria-disabled, not native disabled — findi
     const trigger = screen.getByRole("button", { name: /Actions/ });
     fireEvent.click(trigger);
 
-    // Both items are present in the menu (the disabled one is NOT dropped from the tree).
+    // Disabled items remain in the menu.
     const menuitems = screen.getAllByRole("menuitem");
     expect(menuitems).toHaveLength(2);
     const del_item = screen.getByRole("menuitem", { name: "Delete" });
-    // aria-disabled (perceivable) and NOT the native disabled attribute (which would remove it).
+    // aria-disabled preserves the item in the accessibility tree.
     expect(del_item.getAttribute("aria-disabled")).toBe("true");
     expect((del_item as HTMLButtonElement).disabled).toBe(false);
     // Clicking the disabled item does not fire its action.

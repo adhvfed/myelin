@@ -1,6 +1,4 @@
-// DiffViewer gate (R3.2 · G-7 · R-17 §5.1, WCAG 1.4.1): change kind is announced as TEXT with the
-// line number in the SR prefix (never colour alone); binary files never dump text; split + unified
-// both render; the line grid is one tab stop (roving tabindex).
+// Diff rendering, accessible line labels, binary handling, layouts, and keyboard navigation.
 import { fireEvent, render, screen } from "@solidjs/testing-library";
 import { describe, it, expect, vi } from "vitest";
 import { DiffViewer, type DiffViewerFile } from "./DiffViewer";
@@ -33,7 +31,7 @@ const modified: DiffViewerFile = {
 describe("DiffViewer — SR contract", () => {
   it("announces change kind + line number as TEXT (never colour alone)", () => {
     render(() => <DiffViewer files={[modified]} view="unified" />);
-    // The added line carries "added, new line 4:" as visually-hidden TEXT.
+    // The added line has a visually hidden change and line-number prefix.
     expect(screen.getByText(/added, new line 4:/)).toBeTruthy();
     expect(screen.getByText(/removed, old line 2:/)).toBeTruthy();
     expect(screen.getByText(/unchanged, line 1:/)).toBeTruthy();

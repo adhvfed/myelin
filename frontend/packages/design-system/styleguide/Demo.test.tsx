@@ -1,6 +1,4 @@
-// Axe a11y smoke — the binding-bar gate, applied to the one demo component (doc 08 §8). It proves
-// the wiring (render + jsdom + axe) that every Tier-1 primitive's test will reuse. A11y is PROVEN/
-// non-negotiable: we MEET the bar and gate it here, rather than importing it from a component lib.
+// Rendering and accessibility smoke test for the styleguide demo.
 import { render } from "@solidjs/testing-library";
 import { axe } from "vitest-axe";
 import { expect, it, describe } from "vitest";

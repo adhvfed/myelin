@@ -1,22 +1,9 @@
-// Skeleton — the system loading primitive (DESIGN-MANUAL §5.3 / §6 / §7). Loading is a
-// STRUCTURE-MATCHING skeleton, never a spinner (there is no spinner token in the system). Every
-// skeleton:
-//   • sets `aria-busy="true"` on its container, and
-//   • announces its start/finish through ONE debounced, page-shared polite live region.
-// The blocks are shimmer-free `--surface-hover` fills (Instrument direction: no decorative motion;
-// `prefers-reduced-motion` is honoured for free because there is no animation to remove).
-//
-// Structure-matching is the caller's job: pass `rows`/`rowHeight` for a simple list, or hand it a
-// bespoke `children` layout of <SkeletonBlock>s that mirrors the final surface's shape.
+// Loading skeleton with `aria-busy` and a debounced, page-shared polite announcement. Callers can
+// use row props or provide a custom layout that matches the loaded content.
 
 import { For, Show, onMount, onCleanup, mergeProps, type JSX } from "solid-js";
 
-// --------------------------------------------------------------------------------------------------
-// ONE debounced polite live region, shared by every skeleton on the page (DESIGN-MANUAL §6:
-// "announces via one debounced polite live region"). Module-level so N concurrent skeletons collapse
-// into a single "Loading…" → "Loaded" announcement rather than a chorus. Debounced so a sub-threshold
-// load (skeleton mounts and unmounts within the window) stays silent — no flash-of-announcement.
-// --------------------------------------------------------------------------------------------------
+// Module-level state combines concurrent skeletons and suppresses announcements for very short loads.
 const DEBOUNCE_MS = 150;
 
 let liveRegion: HTMLElement | undefined;

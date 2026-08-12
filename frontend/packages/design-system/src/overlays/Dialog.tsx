@@ -68,10 +68,7 @@ export function Dialog(props: DialogProps): JSX.Element {
     modal: true,
     closeOnEscape: () => local.dismissable,
     closeOnOutsidePointer: () => local.dismissable, // backdrop dismiss tracks the same flag
-    // Default initial focus prefers the first meaningful control in the BODY (or the panel container
-    // itself), NOT the header Close (X) — otherwise an immediate Enter/Space closes the dialog (APG
-    // fix, fe-ds finding 5). An explicit initialFocus (e.g. ConfirmDialog's safe action, the palette
-    // input) always wins.
+    // Prefer the first body control over the header Close button unless initialFocus is explicit.
     autoFocus: local.initialFocus ?? (() => (body ? (getFocusable(body)[0] ?? panel) : panel)),
   });
 

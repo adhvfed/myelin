@@ -1,8 +1,5 @@
-// ConfirmDialog — the small modal that gates IRREVERSIBLE / GDPR / agent-HITL actions (overlays.md
-// §3). A thin specialization of Dialog: it is the SAME modal substrate with role="alertdialog",
-// the consequence text wired to aria-describedby, and the binding house rule — DEFAULT FOCUS ON THE
-// SAFE ACTION (Cancel), never the destructive one (overlays.md §3, "don't default-focus the
-// destructive action"). Everything else (reversible actions) should prefer an undo-Toast instead.
+// Alert-dialog specialization for consequential actions. The description is announced and initial
+// focus stays on Cancel.
 
 import { createUniqueId, mergeProps, splitProps, Show, type JSX } from "solid-js";
 import { Dialog } from "./Dialog";
