@@ -485,16 +485,19 @@ impl CiRunStore {
         let has_more = items.len() > request.limit as usize;
         items.truncate(request.limit as usize);
         let next_cursor = if has_more {
-            items.last().map(|run| {
-                encode_cursor(
-                    &CiRunCursor {
-                        created_at: run.created_at.clone(),
-                        run_id: run.run_id.clone(),
-                    },
-                    scope,
-                    cursor_key,
-                )
-            })
+            items
+                .last()
+                .map(|run| {
+                    encode_cursor(
+                        &CiRunCursor {
+                            created_at: run.created_at.clone(),
+                            run_id: run.run_id.clone(),
+                        },
+                        scope,
+                        cursor_key,
+                    )
+                })
+                .transpose()?
         } else {
             None
         };
@@ -592,8 +595,7 @@ impl CiRunStore {
         let repo = expected_repo_ref.to_string();
         let query_run = run_id.clone();
         let query_job = job_id.clone();
-        let fetch_limit = i64::try_from(CI_LOG_SEGMENT_REF_MAX + 1)
-            .expect("CI log segment reference bound fits i64");
+        let fetch_limit = CI_LOG_SEGMENT_REF_MAX as i64 + 1;
         let result = with_tenant_repeatable_read_tx(self.pool(), tenant_id, region, move |conn| {
             Box::pin(async move {
                 let head = sqlx::query(SELECT_CI_LOG_ARCHIVE_HEAD_QUERY)
@@ -687,8 +689,7 @@ impl CiRunStore {
         let repo = expected_repo_ref.to_string();
         let query_run = run_id.clone();
         let query_job = job_id.clone();
-        let fetch_limit =
-            i64::try_from(CI_LOG_TAIL_BATCH_MAX).expect("CI log tail batch bound fits i64");
+        let fetch_limit = CI_LOG_TAIL_BATCH_MAX as i64;
         let has_explicit_cursor = last_cursor.is_some();
         let result = with_tenant_repeatable_read_tx(self.pool(), tenant_id, region, move |conn| {
             Box::pin(async move {
@@ -716,17 +717,12 @@ impl CiRunStore {
                         "CI log archive contains an invalid tail coordinate".into(),
                     ));
                 }
-                let floor_cursor = floor_sequence.map(|sequence| {
-                    u64::try_from(sequence)
-                        .expect("non-negative")
-                        .saturating_add(1)
-                });
-                let head_cursor = head_sequence.map(|sequence| {
-                    u64::try_from(sequence)
-                        .expect("non-negative")
-                        .saturating_add(1)
-                });
+                let floor_cursor = log_sequence_cursor(floor_sequence)?;
+                let head_cursor = log_sequence_cursor(head_sequence)?;
                 let resume_from = last_cursor.unwrap_or_else(|| head_cursor.unwrap_or(0));
+                let resume_from_db = i64::try_from(resume_from).map_err(|_| {
+                    PgError::Query("CI log resume cursor exceeds the storage range".into())
+                })?;
                 let cursor_in_window = floor_cursor
                     .is_none_or(|floor| resume_from.saturating_add(1) >= floor)
                     && head_cursor.is_none_or(|head| resume_from <= head)
@@ -737,7 +733,7 @@ impl CiRunStore {
                         .bind(&region_owned)
                         .bind(&query_run)
                         .bind(&query_job)
-                        .bind(i64::try_from(resume_from).expect("validated resume cursor"))
+                        .bind(resume_from_db)
                         .bind(fetch_limit)
                         .fetch_all(&mut *conn)
                         .await
@@ -751,7 +747,7 @@ impl CiRunStore {
                         .bind(&region_owned)
                         .bind(&query_run)
                         .bind(&query_job)
-                        .bind(i64::try_from(resume_from - 1).expect("validated predecessor cursor"))
+                        .bind(resume_from_db - 1)
                         .fetch_optional(&mut *conn)
                         .await
                         .map_err(|error| PgError::Query(error.to_string()))?
@@ -894,20 +890,42 @@ fn cursor_scope(
     scope
 }
 
-fn encode_cursor(cursor: &CiRunCursor, scope: [u8; CURSOR_SCOPE_BYTES], key: &[u8; 32]) -> String {
-    let run_id = Uuid::parse_str(&cursor.run_id).expect("stored CI run id is a UUID");
+fn encode_cursor(
+    cursor: &CiRunCursor,
+    scope: [u8; CURSOR_SCOPE_BYTES],
+    key: &[u8; 32],
+) -> Result<String, CiRunSurfaceError> {
+    let run_id = Uuid::parse_str(&cursor.run_id).map_err(|_| {
+        CiRunSurfaceError::Storage("CI run listing returned a malformed run id".into())
+    })?;
     let timestamp = cursor.created_at.as_bytes();
-    assert_eq!(
-        timestamp.len(),
-        CURSOR_TIMESTAMP_BYTES,
-        "database emits fixed microsecond UTC timestamps"
-    );
+    if !canonical_timestamp(&cursor.created_at) {
+        return Err(CiRunSurfaceError::Storage(
+            "CI run listing returned a malformed creation timestamp".into(),
+        ));
+    }
     let mut frame = Vec::with_capacity(CURSOR_FRAME_BYTES);
     frame.push(1);
     frame.extend_from_slice(timestamp);
     frame.extend_from_slice(run_id.as_bytes());
     frame.extend_from_slice(&cursor_tag(key, scope, timestamp, run_id.as_bytes()));
-    format!("{CI_RUN_CURSOR_PREFIX}{}", URL_SAFE_NO_PAD.encode(frame))
+    Ok(format!(
+        "{CI_RUN_CURSOR_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(frame)
+    ))
+}
+
+fn log_sequence_cursor(sequence: Option<i32>) -> Result<Option<u64>, PgError> {
+    sequence
+        .map(|sequence| {
+            u64::try_from(sequence)
+                .ok()
+                .and_then(|sequence| sequence.checked_add(1))
+                .ok_or_else(|| {
+                    PgError::Query("CI log archive contains an invalid tail sequence".into())
+                })
+        })
+        .transpose()
 }
 
 fn decode_cursor(
@@ -1068,7 +1086,7 @@ mod tests {
             created_at: "2026-07-24T12:34:56.123456Z".into(),
             run_id: "11111111-1111-4111-8111-111111111111".into(),
         };
-        let encoded = encode_cursor(&cursor, scope, &CURSOR_KEY);
+        let encoded = encode_cursor(&cursor, scope, &CURSOR_KEY).unwrap();
         assert!(encoded.starts_with(CI_RUN_CURSOR_PREFIX));
         assert_eq!(decode_cursor(&encoded, scope, &CURSOR_KEY).unwrap(), cursor);
         assert_eq!(
@@ -1113,7 +1131,7 @@ mod tests {
             created_at: "2026-07-24T12:34:56.123456Z".into(),
             run_id: "11111111-1111-4111-8111-111111111111".into(),
         };
-        let encoded = encode_cursor(&cursor, scope, &CURSOR_KEY);
+        let encoded = encode_cursor(&cursor, scope, &CURSOR_KEY).unwrap();
         let mut frame = URL_SAFE_NO_PAD
             .decode(encoded.strip_prefix(CI_RUN_CURSOR_PREFIX).unwrap())
             .unwrap();
@@ -1152,6 +1170,28 @@ mod tests {
         assert!(matches!(
             decode_cursor(&impossible, scope, &CURSOR_KEY),
             Err(CiRunSurfaceError::BadInput(_))
+        ));
+    }
+
+    #[test]
+    fn cursor_encoding_fails_closed_on_malformed_storage_coordinates() {
+        let scope = cursor_scope("acme", "eu-north", CiRunStateFilter::All, &refs());
+        let malformed_run = CiRunCursor {
+            created_at: "2026-07-24T12:34:56.123456Z".into(),
+            run_id: "not-a-uuid".into(),
+        };
+        assert!(matches!(
+            encode_cursor(&malformed_run, scope, &CURSOR_KEY),
+            Err(CiRunSurfaceError::Storage(_))
+        ));
+
+        let malformed_timestamp = CiRunCursor {
+            created_at: "1970-01-01T00:00:00Z".into(),
+            run_id: "11111111-1111-4111-8111-111111111111".into(),
+        };
+        assert!(matches!(
+            encode_cursor(&malformed_timestamp, scope, &CURSOR_KEY),
+            Err(CiRunSurfaceError::Storage(_))
         ));
     }
 

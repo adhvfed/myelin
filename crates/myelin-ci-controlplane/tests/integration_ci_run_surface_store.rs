@@ -79,6 +79,7 @@ async fn setup_schema(admin: &PgPool, schema: &str) {
         matches!(
             migration.id,
             "ci_0001_ci_run"
+                | "ci_0001e_ci_run_source_ref"
                 | "ci_0002_ci_job"
                 | "ci_0007_log_segment"
                 | "ci_0008_log_anchor"
