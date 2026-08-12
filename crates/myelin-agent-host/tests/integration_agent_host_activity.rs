@@ -1,3 +1,5 @@
+#![cfg(feature = "integration")]
+
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -59,14 +61,10 @@ fn unique(label: &str) -> String {
     )
 }
 
-async fn test_provider() -> Option<SubstrateProvider> {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn test_provider() -> SubstrateProvider {
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     HOST_SCHEMA_READY
         .get_or_init(|| async move {
             admin.migrate_foundation().await.unwrap();
@@ -86,11 +84,9 @@ async fn test_provider() -> Option<SubstrateProvider> {
                 .expect("grant the runtime role access to hosted approval cards");
         })
         .await;
-    Some(
-        SubstrateProvider::connect(app_config(), 8)
-            .await
-            .expect("open the constrained app provider"),
-    )
+    SubstrateProvider::connect(app_config(), 8)
+        .await
+        .expect("open the constrained app provider")
 }
 
 struct RefusingModelFactory {
@@ -378,9 +374,7 @@ async fn clean_terminal_approval_story(app: &SubstrateProvider, tenant: &TenantI
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_settled_agent_activity_replays_without_touching_the_model() {
-    let Some(app) = test_provider().await else {
-        return;
-    };
+    let app = test_provider().await;
     let tenant = TenantId(unique("hosted-activity"));
     let region = Region(app.config().region.clone());
     let run_id = unique("run");
@@ -475,9 +469,7 @@ async fn a_settled_agent_activity_replays_without_touching_the_model() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays_cleanly() {
-    let Some(app) = test_provider().await else {
-        return;
-    };
+    let app = test_provider().await;
     let tenant = TenantId(unique("hosted-execution"));
     let region = Region(app.config().region.clone());
     let founder = Principal::new(
@@ -701,9 +693,7 @@ async fn a_hosted_activity_uses_real_identity_wallet_and_cost_state_then_replays
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn terminal_hosted_approvals_settle_once_even_when_their_wake_signal_is_lost() {
-    let Some(app) = test_provider().await else {
-        return;
-    };
+    let app = test_provider().await;
     let tenant = TenantId(unique("hosted-expiry"));
     let region = Region(app.config().region.clone());
     let expired = stage_waiting_merge_approval(&app, &tenant, &region, "expired-run", 7).await;

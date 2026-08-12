@@ -1,3 +1,5 @@
+#![cfg(feature = "integration")]
+
 use std::sync::{Arc, Mutex};
 
 use myelin_agent_host::{
@@ -59,17 +61,10 @@ fn unique_tenant() -> TenantId {
     ))
 }
 
-async fn test_provider() -> Option<SubstrateProvider> {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(error) if std::env::var_os("MYELIN_TEST_DATABASE_URL").is_some() => {
-            panic!("the configured test Postgres must be reachable: {error}")
-        }
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn test_provider() -> SubstrateProvider {
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate_foundation()
         .await
@@ -78,11 +73,9 @@ async fn test_provider() -> Option<SubstrateProvider> {
         .migrate(&all_durable_migrations(), &HotTables::none())
         .await
         .expect("the governed trigger schema is present");
-    Some(
-        SubstrateProvider::connect(app_config(), 8)
-            .await
-            .expect("open the constrained app provider"),
-    )
+    SubstrateProvider::connect(app_config(), 8)
+        .await
+        .expect("open the constrained app provider")
 }
 
 async fn a_founder_has_one_hosted_agent(
@@ -431,9 +424,7 @@ impl HostedAgentRunExecutor for UnavailableHostedAgent {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
-    let Some(app) = test_provider().await else {
-        return;
-    };
+    let app = test_provider().await;
     let run = start_one_governed_hosted_run(&app).await;
     let work = &run.resolved_input;
 
@@ -523,9 +514,7 @@ async fn a_hosted_run_receives_only_the_work_its_founder_governed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn failed_hosted_work_releases_its_organization_budget_when_history_catches_up() {
-    let Some(app) = test_provider().await else {
-        return;
-    };
+    let app = test_provider().await;
     let run = start_one_governed_hosted_run(&app).await;
     let cost_run = CostRunId::new(run.run_id.clone());
     let mut ledger = CostLedger::with_pg(app.clone());
