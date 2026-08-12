@@ -2,11 +2,8 @@ import { test, expect, type Page, request as pwRequest } from "@playwright/test"
 import AxeBuilder from "@axe-core/playwright";
 import { DEV_ACCESS_TOKEN } from "../../dev-edge/dev-contract.mjs";
 
-// R4.0 operator-token login — real-browser proofs for the paste-your-bootstrap-token card. Drives the
-// SAME single harness (dev edge + SolidStart); flips the dev edge's `token_login_enabled` on via the
-// `POST /__test/config` control seam, then exercises the card. The dev edge's `/v1/whoami` verifies a
-// pasted Bearer (=== DEV_ACCESS_TOKEN), so paste→verify→session→/git/repos runs end-to-end here.
-// Every test resets `tokenLoginEnabled` off in afterEach so the rest of the serial suite is unchanged.
+// Browser coverage for operator-token login. Tests enable the method on the local edge and restore
+// the default configuration afterward.
 
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 
@@ -52,7 +49,7 @@ test.describe("R4.0 operator-token login", () => {
     const label = page.locator('label:has([data-testid="token-input"])');
     await expect(label).toBeVisible();
     await expect(label).toContainText(/operator token/i);
-    // Honest helper text names the source command and is referenced by aria-describedby.
+    // The helper names the source command and is referenced by aria-describedby.
     await expect(page.getByTestId("token-help")).toContainText(/edge bootstrap/i);
     await expect(input).toHaveAttribute("aria-describedby", /token-help/);
 
@@ -83,7 +80,7 @@ test.describe("R4.0 operator-token login", () => {
     await expect(err).toContainText(/invalid or expired/i);
     await expect(err).toContainText(/edge bootstrap/i);
     await expect(err).toContainText(/nothing's wrong on your end/i);
-    // The SSO-specific error copy must NOT be what we show for a token failure.
+    // Token failures must not use the SSO-specific error copy.
     await expect(err).not.toContainText(/identity provider/i);
     // The input flags itself invalid and points at the error message.
     await expect(page.getByTestId("token-input")).toHaveAttribute("aria-invalid", "true");

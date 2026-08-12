@@ -13,11 +13,8 @@ async function resetPrFixtures() {
   await context.dispose();
 }
 
-// R3.2 · G-7 — the PR diff / files-changed surface, driven in a real chromium against the dev-edge
-// contract. Proves: the three-dot diff renders (split + unified); a line comment posts to the R3.3
-// thread store and appears; a rebase-orphan shows the honest "outdated" pill (never a wrong line);
-// F7 walks changes; the W4 deep-link banner is honest; the binary row never dumps text; the commit
-// diff still renders on the shared DiffViewer; and every state is axe-clean.
+// Browser coverage for PR files: split/unified rendering, comments, stale anchors, keyboard
+// navigation, deep links, binary files, the shared commit viewer, and accessibility.
 
 async function expectNoAxeViolations(page: Page, context: string) {
   const results = await new AxeBuilder({ page })
@@ -56,7 +53,7 @@ test.describe("R3.2 PR diff / files-changed — real browser", () => {
     await expect(page.getByText(/let cap = self.limit.min\(100\)/)).toBeVisible();
     await expect(page.getByTestId("binary-row")).toContainText("Binary file");
 
-    // Change kind is announced as TEXT (SR prefix), not colour alone.
+    // The screen-reader prefix announces the change kind.
     await expect(page.getByText(/added, new line 2:/)).toBeAttached();
 
     await expectNoAxeViolations(page, "PR diff (split)");
@@ -124,10 +121,10 @@ test.describe("R3.2 PR diff / files-changed — real browser", () => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/4/diff");
     await page.waitForSelector("[data-rowkey]"); await page.waitForTimeout(600);
-    // Page 1: files 0–49 rendered; the honest "10 more files weren't rendered" + the paging link.
+    // Page 1 renders files 0–49 and reports the ten remaining files.
     await expect(page.getByText("src/paged/file_000.txt").first()).toBeVisible();
     await expect(page.getByTestId("load-remaining")).toContainText("10 more files weren't rendered");
-    // A page-2-only file is NOT present yet.
+    // A file from page 2 is absent until the next page loads.
     await expect(page.getByText("src/paged/file_055.txt")).toHaveCount(0);
     // Click the link → the cursor threads into getPrDiff and page 2 loads (files 50–59).
     await page.getByRole("link", { name: "Load remaining files" }).click();
@@ -164,7 +161,7 @@ test.describe("R3.2 PR diff / files-changed — real browser", () => {
 
   test("an honest deep-link banner appears for a stale ?line=", async ({ page }) => {
     await devLogin(page);
-    // A line that no longer exists in the diff → the honest "older head" banner (no nearest-line guess).
+    // A missing line reports an older head instead of selecting the nearest line.
     await page.goto("/git/repos/myelin/prs/1/diff?file=src/list_filter.rs&line=9999&side=new");
     await expect(page.getByTestId("deeplink-banner")).toContainText(/older head/);
   });

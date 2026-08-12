@@ -1,10 +1,8 @@
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 
-// R3.1 — the PR list + navigation front door, driven in a real cached chromium against the dev-edge
-// contract. The list renders the PrListRowVM rows; each screen is axe-clean and keyboard-navigable
-// (roving tabindex + Enter opens); the empty state teaches; the cross-repo front door shows both
-// buckets; a no-access repo is the dignified restricted state (never a leak).
+// Browser coverage for repository and cross-repository PR lists, including keyboard navigation,
+// empty and restricted states, and accessibility.
 
 async function expectNoAxeViolations(page: Page, context: string) {
   const results = await new AxeBuilder({ page })
@@ -34,10 +32,10 @@ test.describe("R3.1 PR list + navigation front door — real browser", () => {
     await expect(page.getByRole("heading", { name: "Pull requests", level: 1 })).toBeVisible();
     const rows = page.getByTestId("pr-row");
     await expect(rows.first()).toBeVisible();
-    // A real title row + the agent-authored row + the honest #number fallback (merged PR #39).
+    // Includes a titled row, an agent-authored row, and the #number fallback.
     await expect(page.getByText("R2.4 MCP HITL server-side verdicts")).toBeVisible();
     await expect(page.getByText("AuthzScanner: eliminate 2 residual reach-arounds")).toBeVisible();
-    // Status is TEXT (glyph+label), never colour-only.
+    // Status includes a visible label.
     await expect(page.getByTitle("State: Open").first()).toBeVisible();
     await expect(page.getByText("all passing").first()).toBeVisible();
     await expect(page.getByText("1 running").first()).toBeVisible();
@@ -65,7 +63,7 @@ test.describe("R3.1 PR list + navigation front door — real browser", () => {
     await page.goto("/git/repos/myelin/prs");
     await page.getByRole("tab", { name: /Merged/ }).click();
     await page.waitForURL("**/git/repos/myelin/prs?state=merged");
-    // The merged PR (#39, a legacy no-title record → the honest #number fallback).
+    // PR #39 is a legacy record with no title and uses the #number fallback.
     await expect(page.getByText("#39")).toBeVisible();
     await expect(page.getByText("merged green")).toBeVisible();
   });

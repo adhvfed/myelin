@@ -3,8 +3,7 @@ import AxeBuilder from "@axe-core/playwright";
 
 const APP = `http://localhost:${process.env.PORT ?? 3000}`;
 
-// A real-browser axe assertion on the live DOM (the thing jsdom couldn't do for the overlays). We scan
-// the rendered page against WCAG 2.0/2.1 A+AA tags; a violation fails the gate loudly.
+// Run axe against the browser DOM because overlay layout is not available in jsdom.
 async function expectNoAxeViolations(page: Page, context?: string) {
   const results = await new AxeBuilder({ page })
     .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa"])
@@ -103,7 +102,7 @@ test.describe("MR-019 app shell — real browser", () => {
     await expect(page.getByText("acme/myelin", { exact: true })).toBeVisible();
     await expect(page.getByText("The make-it-real spine.")).toHaveCount(0);
     await expect(page.getByText("/acme/eu-west/myelin.git")).toBeVisible();
-    // The empty-state repo (an unglamorous state served by the same envelope).
+    // The empty repository uses the same response envelope.
     await expect(page.getByText("acme/sandbox", { exact: true })).toBeVisible();
     await expect(page.getByText("empty · push to get started")).toBeVisible();
 
@@ -203,8 +202,7 @@ test.describe("MR-019 app shell — real browser", () => {
     await page.keyboard.press("ControlOrMeta+k");
     const search = page.getByRole("combobox", { name: /Search or run a command/ });
     await expect(search).toBeFocused();
-    // Manual must-ship #5: the palette input must NOT zero its outline inline — the shared
-    // zero-specificity :focus-visible ring must be able to paint on the flagship keyboard surface.
+    // The palette input must retain the shared focus-visible outline.
     expect(await search.evaluate((el) => (el as HTMLElement).style.outline)).toBe("");
     expect(await search.evaluate((el) => getComputedStyle(el).outlineWidth)).not.toBe("0px");
   });

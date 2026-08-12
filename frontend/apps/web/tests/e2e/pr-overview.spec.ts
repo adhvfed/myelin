@@ -68,7 +68,7 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/1");
 
-    // Header: the title (not the #number fallback) + the state pill (TEXT, not colour-only).
+    // The header uses the title and visible state label.
     await expect(page.getByRole("heading", { level: 1, name: /R3.3 PR overview \+ context pane/ })).toBeVisible();
     await expect(page.getByTitle("State: Open").first()).toBeVisible();
 
@@ -190,10 +190,10 @@ test.describe("R3.3 PR overview + context pane — real browser", () => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/3"); // PR #3's checks route 404s (fixture).
 
-    // The PR itself is fully rendered (title, discussion) — it is NOT "PR not available".
+    // The PR title and discussion remain available.
     await expect(page.getByRole("heading", { level: 1, name: /Checks-degrade fixture/ })).toBeVisible();
     await expect(page.getByTestId("discussion")).toBeVisible();
-    // The checks region degrades to a scoped "Checks unavailable"; the merge card degrades honestly.
+    // Checks and merge controls each show their scoped unavailable state.
     await expect(page.getByTestId("checks-unavailable")).toBeVisible();
     await expect(page.getByText(/Checks unavailable/)).toBeVisible();
     await expect(page.getByTestId("merge-degraded")).toBeVisible();

@@ -1,9 +1,8 @@
 import { test, expect, type Page } from "@playwright/test";
 import AxeBuilder from "@axe-core/playwright";
 
-// GT-004: the Git web UI browse surface + PR overview, driven in a REAL cached chromium against the
-// dev-edge contract. Each screen renders the genuine edge ViewModel JSON; each is axe-clean and
-// keyboard-navigable; a blocked merge shows WHY; the 401→/login floor still holds on a deep screen.
+// Browser coverage for repository browsing and the PR overview, including accessibility, keyboard
+// navigation, blocked merge details, and authentication redirects.
 // FRONTEND-CONTRACT: git-read-dev-edge-parity
 
 const C2 = "b2c3d4e5f60718293a4b5c6d7e8f900112233445";
@@ -42,7 +41,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
 
   test("repo list links into the repo home, which renders the RepoHome ViewModel", async ({ page }) => {
     await devLogin(page);
-    // Click through from the list (proves the link wiring), not a direct nav.
+    // Reach the page through the list link.
     await page.getByRole("link", { name: "acme/myelin", exact: true }).first().click();
     await page.waitForURL("**/git/repos/myelin");
 
@@ -131,7 +130,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await devLogin(page);
     await page.goto("/git/repos/myelin/prs/1");
 
-    // R3.3: the header is title-led (the fixture title) + the #number + the StatusPill (TEXT state).
+    // The header includes the title, PR number, and visible state label.
     await expect(page.getByRole("heading", { level: 1, name: /#1/ })).toBeVisible();
     await expect(page.getByTitle("State: Open").first()).toBeVisible();
     // The checks panel (required contexts) + the fork-trust X-1 badge.
@@ -169,7 +168,7 @@ test.describe("GT-004 Git web UI — real browser", () => {
     await expect(page.locator(".app-shell")).toHaveAttribute("data-shortcuts-ready", "true");
     const fileLink = page.getByTestId("repo-tree").getByRole("link", { name: "README.md" });
     // Locator.press focuses the semantic link and dispatches a real Enter key event. The resulting
-    // navigation is the user-observable proof; a programmatic focus assertion proves nothing more.
+    // Verify the resulting navigation rather than a transient focus state.
     await fileLink.press("Enter");
     await page.waitForURL("**/git/repos/myelin/blob/refs%2Fheads%2Fmain/README.md");
     await expect(page.getByTestId("blob-contents")).toBeVisible();

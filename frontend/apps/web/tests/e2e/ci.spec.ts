@@ -2,7 +2,7 @@ import { expect, request as pwRequest, test, type Page } from "@playwright/test"
 import AxeBuilder from "@axe-core/playwright";
 
 // FRONTEND-CONTRACT: ci-read-dev-edge-parity
-// Browser proof for the shared production-Rust/dev-edge CI read vectors.
+// Browser coverage for the shared CI read vectors.
 const EDGE = `http://127.0.0.1:${process.env.DEV_EDGE_PORT ?? 8787}`;
 const FAILED_RUN = "91000000-0000-4000-8000-000000000001";
 const RUNNING_RUN = "91000000-0000-4000-8000-000000000002";
