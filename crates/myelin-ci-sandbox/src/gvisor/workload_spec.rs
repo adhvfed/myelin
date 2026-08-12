@@ -9,19 +9,16 @@ use crate::checkout_orchestration::WorkloadCredentialCarrier;
 use crate::user_namespace::{CheckoutPreparationSession, UserNamespaceLease};
 use crate::{JobSpec, LaunchPermit, RunnerHooks, SandboxCancellation, SandboxOutputSink};
 
-#[allow(dead_code)]
 pub(super) enum BoundWorkloadRefusal {
     PermitRefused(String),
     PrepModeMismatch(String),
 }
 
-#[allow(dead_code)]
 pub(super) struct WorkloadRotatedSpec {
     spec: JobSpec,
 }
 
 impl WorkloadRotatedSpec {
-    #[allow(dead_code)]
     pub(super) fn from_carrier(carrier: &WorkloadCredentialCarrier, base_spec: &JobSpec) -> Self {
         WorkloadRotatedSpec {
             spec: carrier.workload_local_spec(base_spec),
@@ -65,7 +62,6 @@ impl WorkloadRotatedSpec {
 
     #[allow(
         clippy::too_many_arguments,
-        dead_code,
         private_interfaces,
         private_bounds
     )]
@@ -99,7 +95,6 @@ impl WorkloadRotatedSpec {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    #[allow(dead_code)]
     pub(super) fn acquire_launch_permit_for_test_support(
         &self,
         hooks: &RunnerHooks,
@@ -109,10 +104,9 @@ impl WorkloadRotatedSpec {
             .map_err(|hook_error| BoundWorkloadRefusal::PermitRefused(hook_error.to_string()))
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "test-support"))]
     #[allow(
         clippy::too_many_arguments,
-        dead_code,
         private_interfaces,
         private_bounds
     )]

@@ -44,13 +44,11 @@ pub(super) fn pkt_line_encode(payload: &str) -> Vec<u8> {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(super) struct ParsedAdvertisement {
     pub(super) directly_advertised: bool,
     pub(super) allows_reachable_want: bool,
 }
 
-#[allow(dead_code)]
 pub(super) fn parse_upload_pack_advertisement(
     response: &[u8],
     expected: &ExpectedGitCommitId,
@@ -143,12 +141,10 @@ pub(super) fn parse_upload_pack_advertisement(
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(super) struct ParsedCheckoutFetch {
     pub(super) shallow: bool,
 }
 
-#[allow(dead_code)]
 pub(super) fn parse_checkout_fetch_response(
     response: &[u8],
     expected: &ExpectedGitCommitId,
@@ -310,8 +306,7 @@ mod tests {
         let second = format!("{oid} refs/heads/other\n");
         let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
         let parsed =
-            parse_upload_pack_advertisement(&advertisement(&first, &[&second]), &expected)
-                .unwrap();
+            parse_upload_pack_advertisement(&advertisement(&first, &[&second]), &expected).unwrap();
         assert!(parsed.directly_advertised);
     }
 
@@ -350,8 +345,8 @@ mod tests {
             sha1_oid(0x77)
         );
         let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-        let err = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
-            .unwrap_err();
+        let err =
+            parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap_err();
         assert!(err.contains("object-format"));
     }
 
@@ -360,8 +355,8 @@ mod tests {
         let oid = sha1_oid(0x78);
         let first = format!("{} refs/heads/main\n", sha1_oid(0x79));
         let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-        let err = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
-            .unwrap_err();
+        let err =
+            parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap_err();
         assert!(err.contains("missing a capability section"));
     }
 
@@ -373,8 +368,8 @@ mod tests {
             sha1_oid(0x7b)
         );
         let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
-        let err = parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected)
-            .unwrap_err();
+        let err =
+            parse_upload_pack_advertisement(&advertisement(&first, &[]), &expected).unwrap_err();
         assert!(err.contains("does not advertise `shallow`"));
     }
 
@@ -399,8 +394,7 @@ mod tests {
         let pack = fake_pack(b"root-commit-pack-bytes");
         let response = fetch_response(&[], "NAK", &pack);
         let mut out = Vec::new();
-        let parsed =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap();
+        let parsed = parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap();
         assert!(!parsed.shallow);
         assert_eq!(out, pack);
     }
@@ -412,8 +406,7 @@ mod tests {
         let pack = fake_pack(b"shallow-pack-bytes");
         let response = fetch_response(&[format!("shallow {oid}\n")], "NAK", &pack);
         let mut out = Vec::new();
-        let parsed =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap();
+        let parsed = parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap();
         assert!(parsed.shallow);
         assert_eq!(out, pack);
     }
@@ -425,8 +418,7 @@ mod tests {
         let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
         let response = fetch_response(&[format!("shallow {other}\n")], "NAK", &fake_pack(b"x"));
         let mut out = Vec::new();
-        let err =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+        let err = parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
         assert!(err.contains("shallow boundary names"));
     }
 
@@ -440,8 +432,7 @@ mod tests {
             &fake_pack(b"x"),
         );
         let mut out = Vec::new();
-        let err =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+        let err = parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
         assert!(err.contains("duplicate"));
     }
 
@@ -451,8 +442,7 @@ mod tests {
         let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
         let response = fetch_response(&[format!("unshallow {oid}\n")], "NAK", &fake_pack(b"x"));
         let mut out = Vec::new();
-        let err =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+        let err = parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
         assert!(err.contains("unshallow"));
     }
 
@@ -466,8 +456,7 @@ mod tests {
             &fake_pack(b"x"),
         );
         let mut out = Vec::new();
-        let err =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+        let err = parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
         assert!(err.contains("not our ref"));
     }
 
@@ -477,8 +466,7 @@ mod tests {
         let expected = ExpectedGitCommitId::new(oid.clone(), GitObjectFormat::Sha1).unwrap();
         let response = fetch_response(&[], &format!("ACK {oid}"), &fake_pack(b"x"));
         let mut out = Vec::new();
-        let err =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+        let err = parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
         assert!(err.contains("expected a single NAK"));
     }
 
@@ -488,8 +476,7 @@ mod tests {
         let expected = ExpectedGitCommitId::new(oid, GitObjectFormat::Sha1).unwrap();
         let response = fetch_response(&[], "NAK", b"NOTAPACK...");
         let mut out = Vec::new();
-        let err =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+        let err = parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
         assert!(err.contains("PACK"));
     }
 
@@ -500,8 +487,7 @@ mod tests {
         let pack = fake_pack(&[0u8; 100]);
         let response = fetch_response(&[], "NAK", &pack);
         let mut out = Vec::new();
-        let err =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 10).unwrap_err();
+        let err = parse_checkout_fetch_response(&response, &expected, &mut out, 10).unwrap_err();
         assert!(err.contains("exceeds"));
     }
 
@@ -512,8 +498,7 @@ mod tests {
         let mut response = b"0000".to_vec();
         response.extend_from_slice(b"0000");
         let mut out = Vec::new();
-        let err =
-            parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
+        let err = parse_checkout_fetch_response(&response, &expected, &mut out, 4096).unwrap_err();
         assert!(err.contains("unexpected flush"));
     }
 }

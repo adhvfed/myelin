@@ -28,9 +28,15 @@ pub(super) struct RunscOutcome {
 
 #[derive(Debug)]
 pub(crate) enum RunFailure {
-    Uncommitted { message: String },
-    CommitOutcomeUnknown { message: String },
-    CommittedButNotExecuted { message: String },
+    Uncommitted {
+        message: String,
+    },
+    CommitOutcomeUnknown {
+        message: String,
+    },
+    CommittedButNotExecuted {
+        message: String,
+    },
     Executed {
         message: String,
         usage: ResourceUsage,
@@ -357,7 +363,6 @@ pub(super) struct RunCaptureOptions<'a> {
     pub(super) output: Option<StreamingOutput>,
 }
 
-#[allow(dead_code)]
 pub(super) enum StdinSource {
     Bytes(Vec<u8>),
     File(std::fs::File),

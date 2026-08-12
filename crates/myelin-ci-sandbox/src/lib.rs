@@ -753,7 +753,6 @@ pub trait SandboxBackend: Sync {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum SandboxCycleOutcome {
     WorkloadLaunched(SandboxLaunch),
     WorkloadRetryable {
@@ -889,7 +888,6 @@ pub struct CheckoutAuthorizationScope {
 }
 
 impl CheckoutAuthorizationScope {
-    #[allow(dead_code)]
     pub(crate) fn new(
         tenant: myelin_tenancy::TenantId,
         repo_ref: myelin_events::ArtifactRef,
@@ -1068,13 +1066,11 @@ impl RunnerHooks {
         self
     }
 
-    #[allow(dead_code)]
     pub fn with_parent_attempt_reservation(mut self, hook: ParentAttemptReserveHook) -> Self {
         self.parent_attempt_reserve = Some(hook);
         self
     }
 
-    #[allow(dead_code)]
     pub(crate) fn reserve_parent_attempt(
         &self,
         spec: &JobSpec,

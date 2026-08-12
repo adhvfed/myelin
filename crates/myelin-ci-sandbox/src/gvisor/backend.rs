@@ -74,9 +74,7 @@ pub struct GvisorCheckoutConfig(CheckoutConfigState);
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CheckoutConfigState {
     Disabled,
-    Enabled {
-        repo_root: PathBuf,
-    },
+    Enabled { repo_root: PathBuf },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -158,7 +156,6 @@ impl GvisorCheckoutConfig {
         }))
     }
 
-    #[allow(dead_code)]
     pub(crate) fn repo_root(&self) -> Option<&Path> {
         match &self.0 {
             CheckoutConfigState::Disabled => None,
@@ -209,8 +206,7 @@ pub struct ContainerRun {
 
 pub(super) struct JobGuestRoot {
     path: PathBuf,
-    #[allow(dead_code)]
-    overlay: Option<crate::rootfs_overlay::RootfsOverlay>,
+    _overlay: Option<crate::rootfs_overlay::RootfsOverlay>,
 }
 
 impl JobGuestRoot {
@@ -306,13 +302,11 @@ impl GvisorBackend {
         })
     }
 
-    #[allow(dead_code)]
     pub fn with_checkout_config(mut self, checkout: GvisorCheckoutConfig) -> GvisorBackend {
         self.checkout = checkout;
         self
     }
 
-    #[allow(dead_code)]
     pub fn with_rootfs_overlay_manager(
         mut self,
         manager: Arc<crate::rootfs_overlay::RootfsOverlayManager>,
@@ -329,7 +323,7 @@ impl GvisorBackend {
         match &self.rootfs_overlay {
             None => Ok(JobGuestRoot {
                 path: verified_rootfs.path().to_path_buf(),
-                overlay: None,
+                _overlay: None,
             }),
             Some(manager) => {
                 let workload_root = crate::rootfs_overlay::WorkloadRootPermissions::new(
@@ -343,7 +337,7 @@ impl GvisorBackend {
                     .map_err(|error| format!("create per-job rootfs overlay: {error}"))?;
                 Ok(JobGuestRoot {
                     path: overlay.path().to_path_buf(),
-                    overlay: Some(overlay),
+                    _overlay: Some(overlay),
                 })
             }
         }
@@ -692,7 +686,6 @@ impl GvisorBackend {
         })
     }
 
-    #[allow(dead_code)]
     pub(super) fn launch_compute_orchestrated_with<F>(
         &self,
         spec: &JobSpec,

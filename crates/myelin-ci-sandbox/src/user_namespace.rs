@@ -348,37 +348,14 @@ impl std::fmt::Display for UserNamespaceRefusal {
 
 #[derive(Debug)]
 pub enum UserNamespaceAllocatorError {
-    AlreadyLocked {
-        leases_dir: PathBuf,
-    },
-    LockFailed {
-        leases_dir: PathBuf,
-        reason: String,
-    },
-    SubordinateConfig {
-        path: PathBuf,
-        reason: String,
-    },
-    NoSubordinateEntry {
-        path: PathBuf,
-        uid: u32,
-    },
-    UnsafeLeasesDir {
-        leases_dir: PathBuf,
-        reason: String,
-    },
-    CorruptLeaseMarker {
-        path: PathBuf,
-        reason: String,
-    },
-    PrivilegedRunner {
-        euid: u32,
-        egid: u32,
-    },
-    PoolTooSmall {
-        pool_size: u32,
-        required: u32,
-    },
+    AlreadyLocked { leases_dir: PathBuf },
+    LockFailed { leases_dir: PathBuf, reason: String },
+    SubordinateConfig { path: PathBuf, reason: String },
+    NoSubordinateEntry { path: PathBuf, uid: u32 },
+    UnsafeLeasesDir { leases_dir: PathBuf, reason: String },
+    CorruptLeaseMarker { path: PathBuf, reason: String },
+    PrivilegedRunner { euid: u32, egid: u32 },
+    PoolTooSmall { pool_size: u32, required: u32 },
 }
 
 impl std::fmt::Display for UserNamespaceAllocatorError {
@@ -899,7 +876,6 @@ pub(crate) struct PreparationQuiescenceProof {
 }
 
 impl PreparationQuiescenceProof {
-    #[allow(dead_code)]
     pub(crate) fn from_runtime_evidence(
         lease: &UserNamespaceLease,
         evidence: &crate::gvisor::RuntimeQuiescenceEvidence,
@@ -1552,20 +1528,17 @@ impl Drop for UserNamespaceLease {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub(crate) struct CheckoutPreparationSession {
     state: CheckoutPreparationSessionState,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct WorkloadBindingIdentity {
     container_id: String,
     runsc_root_identity: (u64, u64),
     cgroup_identity: (u64, u64),
 }
 
-#[allow(dead_code)]
 impl WorkloadBindingIdentity {
     #[must_use]
     pub(crate) fn into_parts(self) -> (String, (u64, u64), (u64, u64)) {
@@ -1578,7 +1551,6 @@ impl WorkloadBindingIdentity {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 enum CheckoutPreparationSessionState {
     NotStarted,
     PreparationBound { lease_nonce: LeaseNonce },
@@ -1588,7 +1560,6 @@ enum CheckoutPreparationSessionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum CheckoutSessionCleanup {
     NeverBound,
     TeardownUnproven,
@@ -1597,7 +1568,6 @@ pub(crate) enum CheckoutSessionCleanup {
     Unreleasable,
 }
 
-#[allow(dead_code)]
 impl CheckoutPreparationSession {
     pub(crate) fn new() -> Self {
         CheckoutPreparationSession {
@@ -1738,7 +1708,6 @@ pub struct UserNamespaceAllocator {
     gid_start: u32,
     runner_uid: u32,
     runner_gid: u32,
-    #[allow(dead_code)]
     runner_instance_id: RunnerInstanceId,
     shared: Arc<SharedState>,
 }
@@ -1777,7 +1746,9 @@ impl UserNamespaceAllocator {
                 false,
                 incident_sink.clone(),
             ) {
-                Err(UserNamespaceAllocatorError::AlreadyLocked { .. }) if attempt < MAX_ATTEMPTS => {
+                Err(UserNamespaceAllocatorError::AlreadyLocked { .. })
+                    if attempt < MAX_ATTEMPTS =>
+                {
                     std::thread::sleep(std::time::Duration::from_millis(5));
                     continue;
                 }
@@ -2442,12 +2413,7 @@ mod tests {
         std::fs::create_dir_all(&base).unwrap();
         let subuid = base.join("subuid");
         std::fs::write(&subuid, "totally-not-our-uid:100000:65536\n").unwrap();
-        let result = parse_subordinate_range(
-            &subuid,
-             0,
-            Some("totally-not-our-uid"),
-            false,
-        );
+        let result = parse_subordinate_range(&subuid, 0, Some("totally-not-our-uid"), false);
         assert_eq!(
             result.unwrap(),
             SubordinateRange {
@@ -3517,7 +3483,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn open_dir_component_no_follow_refuses_a_symlinked_component() {
         let base = test_base("symlinked-ancestor");
         std::fs::create_dir_all(&base).unwrap();
@@ -3558,9 +3527,8 @@ mod tests {
         write_subordinate_file(&subuid, 100_000, 2);
         write_subordinate_file(&subgid, 200_000, 2);
         let (sink, _log) = recording_sink();
-        let result = UserNamespaceAllocator::try_new_for_tests(
-            leases_dir, &subuid, &subgid,  5, sink,
-        );
+        let result =
+            UserNamespaceAllocator::try_new_for_tests(leases_dir, &subuid, &subgid, 5, sink);
         assert_eq!(
             result.err().map(|e| matches!(
                 e,
