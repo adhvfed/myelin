@@ -142,7 +142,7 @@ impl IdentityService for StubId {
 }
 
 fn resolver(granted: bool) -> (GitRefResolver<StubId>, ArtifactRef) {
-    let pr_ref = git_pr_ref("acme", "repo7", 9);
+    let pr_ref = git_pr_ref("acme", "repo7", 9).unwrap();
     let mut store = ArtifactStore::new();
     let mut pr = PullRequest::open(
         9,
@@ -246,7 +246,7 @@ fn review_requests_is_a_filter_over_the_one_inbox() {
     assert_eq!(reason, Reason::ReviewRequested);
     assert_eq!(prefix, "git/");
 
-    let git_pr = git_pr_ref("acme", "repo7", 9);
+    let git_pr = git_pr_ref("acme", "repo7", 9).unwrap();
     assert!(
         matches_review_requests_view(Reason::ReviewRequested, &git_pr),
         "a git review-request matches"

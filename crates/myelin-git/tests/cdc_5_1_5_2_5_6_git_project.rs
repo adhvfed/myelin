@@ -16,11 +16,11 @@ use std::collections::HashSet;
 fn provider_canonical_keys() -> Vec<(ArtifactRef, &'static str)> {
     vec![
         (
-            git_pr_ref("acme", "payments", 1421),
+            git_pr_ref("acme", "payments", 1421).unwrap(),
             "myelin://acme/git/pr/payments:1421",
         ),
         (
-            git_commit_ref("acme", "payments", "blake3:deadbeefcafe"),
+            git_commit_ref("acme", "payments", "blake3:deadbeefcafe").unwrap(),
             "myelin://acme/git/commit/payments:blake3:deadbeefcafe",
         ),
     ]
@@ -152,8 +152,8 @@ fn viewer(id: &str) -> Principal {
 }
 
 fn seeded_projector(authorized: bool) -> (Projector<StubId>, ArtifactRef, ArtifactRef) {
-    let pr_ref = git_pr_ref("acme", "payments", 1421);
-    let commit_ref = git_commit_ref("acme", "payments", "blake3:deadbeefcafe");
+    let pr_ref = git_pr_ref("acme", "payments", 1421).unwrap();
+    let commit_ref = git_commit_ref("acme", "payments", "blake3:deadbeefcafe").unwrap();
     let mut store = ArtifactStore::new();
     let mut pr = PullRequest::open(
         1421,
@@ -181,7 +181,7 @@ fn seeded_projector(authorized: bool) -> (Projector<StubId>, ArtifactRef, Artifa
 
 #[test]
 fn provider_project_is_permission_first_deny_yields_a_tombstone_with_no_title() {
-    let (projector, pr_ref, _commit) = seeded_projector( false);
+    let (projector, pr_ref, _commit) = seeded_projector(false);
     let got = projector
         .project(&pr_ref, &viewer("mallory"), Zookie("z".into()))
         .unwrap();
@@ -203,7 +203,7 @@ fn consumer_render(projector: &Projector<StubId>, r: &ArtifactRef, v: &Principal
 
 #[test]
 fn consumer_reads_the_projection_for_an_authorized_viewer() {
-    let (projector, pr_ref, commit_ref) = seeded_projector( true);
+    let (projector, pr_ref, commit_ref) = seeded_projector(true);
     assert_eq!(
         consumer_render(&projector, &pr_ref, &viewer("alice")),
         "pr|open|Harden the retry path"
@@ -216,7 +216,7 @@ fn consumer_reads_the_projection_for_an_authorized_viewer() {
 
 #[test]
 fn consumer_gets_a_content_free_tombstone_for_an_unauthorized_viewer() {
-    let (projector, pr_ref, _commit) = seeded_projector( false);
+    let (projector, pr_ref, _commit) = seeded_projector(false);
     let rendered = consumer_render(&projector, &pr_ref, &viewer("mallory"));
     assert_eq!(
         rendered, "(not available)",

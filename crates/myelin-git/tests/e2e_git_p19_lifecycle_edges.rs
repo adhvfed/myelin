@@ -59,7 +59,7 @@ fn merged_event(source: &ArtifactRef) -> EventEnvelope {
 fn open_pr_with_closes_trailer_then_merge_emits_exactly_one_closes_edge() {
     let outbox = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-    let source = git_pr_ref("acme", "repo7", 42);
+    let source = git_pr_ref("acme", "repo7", 42).unwrap();
 
     let mut pr = PullRequest::open(
         42,
@@ -145,7 +145,7 @@ fn open_pr_with_closes_trailer_then_merge_emits_exactly_one_closes_edge() {
 fn aborted_merge_emits_zero_lifecycle_edges() {
     let outbox = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-    let source = git_pr_ref("acme", "repo7", 42);
+    let source = git_pr_ref("acme", "repo7", 42).unwrap();
     let closes = vec![ArtifactRef("myelin://acme/issue/issue/ENG-1".into())];
 
     {
@@ -166,7 +166,7 @@ fn aborted_merge_emits_zero_lifecycle_edges() {
 fn plain_merge_without_trailer_or_link_emits_zero_edges() {
     let outbox = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-    let source = git_pr_ref("acme", "repo7", 42);
+    let source = git_pr_ref("acme", "repo7", 42).unwrap();
 
     let message = "This closes a long-standing gap in the charge path, finally.";
     let keys = parse_closes_trailers(message).expect("bounded fixture");

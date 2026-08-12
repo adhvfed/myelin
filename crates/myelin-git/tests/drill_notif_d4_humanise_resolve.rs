@@ -41,7 +41,7 @@ fn strong(zk: &str) -> Consistency {
 }
 
 fn private_pr() -> (ArtifactRef, PullRequest) {
-    let pr_ref = git_pr_ref("acme", "repo7", 9);
+    let pr_ref = git_pr_ref("acme", "repo7", 9).unwrap();
     let mut pr = PullRequest::open(
         9,
         "refs/heads/main",

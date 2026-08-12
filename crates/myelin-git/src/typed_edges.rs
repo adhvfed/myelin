@@ -198,7 +198,7 @@ mod tests {
     use super::*;
 
     fn pr_source() -> ArtifactRef {
-        crate::project::git_pr_ref("acme", "repo7", 42)
+        crate::project::git_pr_ref("acme", "repo7", 42).unwrap()
     }
 
     fn issue(key: &str) -> ArtifactRef {
@@ -291,7 +291,7 @@ mod tests {
     fn each_linkage_yields_one_lifecycle_edge_with_correct_rel_and_target() {
         let src = pr_source();
         let closes = vec![issue("ENG-1"), issue("ENG-2")];
-        let relates = vec![crate::project::git_pr_ref("acme", "repo7", 7)];
+        let relates = vec![crate::project::git_pr_ref("acme", "repo7", 7).unwrap()];
         let edges = extract_lifecycle_edges(&src, &closes, &relates);
         assert_eq!(
             edges.len(),
@@ -311,7 +311,7 @@ mod tests {
         assert_eq!(edges[2].source, src);
         assert_eq!(
             edges[2].target,
-            crate::project::git_pr_ref("acme", "repo7", 7)
+            crate::project::git_pr_ref("acme", "repo7", 7).unwrap()
         );
     }
 

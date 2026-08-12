@@ -9,6 +9,39 @@ use crate::lifecycle::{PrState, PullRequest, Review, ReviewState, ReviewVerdict}
 
 pub const VIEW: &str = "view";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GitRefError {
+    InvalidComponent { component: &'static str },
+    Parse(myelin_refs::ParseError),
+}
+
+impl std::fmt::Display for GitRefError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            GitRefError::InvalidComponent { component } => write!(
+                f,
+                "git artifact reference component `{component}` is empty or contains a reserved `/` or `#` delimiter"
+            ),
+            GitRefError::Parse(error) => write!(f, "invalid git artifact reference: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for GitRefError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            GitRefError::InvalidComponent { .. } => None,
+            GitRefError::Parse(error) => Some(error),
+        }
+    }
+}
+
+impl From<myelin_refs::ParseError> for GitRefError {
+    fn from(error: myelin_refs::ParseError) -> Self {
+        GitRefError::Parse(error)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GitArtifactType {
     Pr,
@@ -43,11 +76,13 @@ fn classify(r: &ArtifactRef) -> Result<GitArtifactType, ProjectError> {
     }
 }
 
-pub fn git_pr_ref(tenant: &str, repo: &str, number: u64) -> ArtifactRef {
+pub fn git_pr_ref(tenant: &str, repo: &str, number: u64) -> Result<ArtifactRef, GitRefError> {
+    validate_ref_components(&[("tenant", tenant), ("repo", repo)])?;
     parse_git(&format!("myelin://{tenant}/git/pr/{repo}:{number}"))
 }
 
-pub fn git_commit_ref(tenant: &str, repo: &str, sha: &str) -> ArtifactRef {
+pub fn git_commit_ref(tenant: &str, repo: &str, sha: &str) -> Result<ArtifactRef, GitRefError> {
+    validate_ref_components(&[("tenant", tenant), ("repo", repo), ("sha", sha)])?;
     parse_git(&format!("myelin://{tenant}/git/commit/{repo}:{sha}"))
 }
 
@@ -56,18 +91,33 @@ pub fn git_review_ref(
     repo: &str,
     pr_number: u64,
     reviewer_pseudonym: &str,
-) -> ArtifactRef {
+) -> Result<ArtifactRef, GitRefError> {
+    validate_ref_components(&[
+        ("tenant", tenant),
+        ("repo", repo),
+        ("reviewer_pseudonym", reviewer_pseudonym),
+    ])?;
     parse_git(&format!(
         "myelin://{tenant}/git/review/{repo}:{pr_number}:{reviewer_pseudonym}"
     ))
 }
 
-pub fn git_repo_ref(tenant: &str, repo_id: &str) -> ArtifactRef {
+pub fn git_repo_ref(tenant: &str, repo_id: &str) -> Result<ArtifactRef, GitRefError> {
+    validate_ref_components(&[("tenant", tenant), ("repo_id", repo_id)])?;
     parse_git(&format!("myelin://{tenant}/git/repo/{repo_id}"))
 }
 
-fn parse_git(urn: &str) -> ArtifactRef {
-    myelin_refs::parse(urn).expect("git mints a grammatical canonical ArtifactRef (contract 5.1)")
+fn validate_ref_components(components: &[(&'static str, &str)]) -> Result<(), GitRefError> {
+    for (component, value) in components {
+        if value.is_empty() || value.contains(['/', '#']) {
+            return Err(GitRefError::InvalidComponent { component });
+        }
+    }
+    Ok(())
+}
+
+fn parse_git(urn: &str) -> Result<ArtifactRef, GitRefError> {
+    myelin_refs::parse(urn).map_err(GitRefError::from)
 }
 
 pub fn display_key(r: &ArtifactRef) -> Option<String> {
@@ -168,18 +218,10 @@ impl Projected {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectError {
-    NotAGitArtifact {
-        reference: String,
-    },
-    UnknownGitType {
-        ty: String,
-    },
-    NotFound {
-        reference: String,
-    },
-    BlobFloor {
-        reference: String,
-    },
+    NotAGitArtifact { reference: String },
+    UnknownGitType { ty: String },
+    NotFound { reference: String },
+    BlobFloor { reference: String },
 }
 
 impl std::fmt::Display for ProjectError {
@@ -311,8 +353,7 @@ impl<I: IdentityService> Projector<I> {
         let permission = Permission(VIEW.to_string());
         let decision = self.id.check(viewer, &permission, &acl_object, &at, None);
         match decision {
-            Ok(Decision::Allow) => {
-            }
+            Ok(Decision::Allow) => {}
             Ok(Decision::Deny) | Ok(Decision::Conditional) | Err(_) => {
                 return Ok(Projected::Tombstoned(Tombstone {
                     reason: TombstoneReason::Unauthorized,
@@ -650,20 +691,20 @@ mod tests {
 
     #[test]
     fn git_pr_and_commit_refs_round_trip_canonical_keys() {
-        let pr = git_pr_ref("acme", "repo7", 4291);
+        let pr = git_pr_ref("acme", "repo7", 4291).unwrap();
         assert_eq!(myelin_refs::format(&pr), "myelin://acme/git/pr/repo7:4291");
         assert_eq!(myelin_refs::parse(&myelin_refs::format(&pr)).unwrap(), pr);
 
-        let c = git_commit_ref("acme", "repo7", "blake3:deadbeefcafe0000");
+        let c = git_commit_ref("acme", "repo7", "blake3:deadbeefcafe0000").unwrap();
         assert_eq!(
             myelin_refs::format(&c),
             "myelin://acme/git/commit/repo7:blake3:deadbeefcafe0000"
         );
 
-        let repo = git_repo_ref("acme", "repo7");
+        let repo = git_repo_ref("acme", "repo7").unwrap();
         assert_eq!(myelin_refs::format(&repo), "myelin://acme/git/repo/repo7");
 
-        let rv = git_review_ref("acme", "repo7", 4291, "psn:bob");
+        let rv = git_review_ref("acme", "repo7", 4291, "psn:bob").unwrap();
         assert_eq!(
             myelin_refs::format(&rv),
             "myelin://acme/git/review/repo7:4291:psn:bob"
@@ -671,17 +712,40 @@ mod tests {
     }
 
     #[test]
+    fn git_ref_builders_reject_empty_and_scope_escaping_components() {
+        assert!(matches!(
+            git_pr_ref("acme", "", 42),
+            Err(GitRefError::InvalidComponent { component: "repo" })
+        ));
+        assert!(matches!(
+            git_repo_ref("acme/another-tenant", "repo7"),
+            Err(GitRefError::InvalidComponent {
+                component: "tenant"
+            })
+        ));
+        assert!(matches!(
+            git_review_ref("acme", "repo7", 42, "psn:bob#comment-injected"),
+            Err(GitRefError::InvalidComponent {
+                component: "reviewer_pseudonym"
+            })
+        ));
+    }
+
+    #[test]
     fn display_key_is_render_time_only_never_a_stored_scope() {
-        let pr = git_pr_ref("acme", "repo7", 1421);
+        let pr = git_pr_ref("acme", "repo7", 1421).unwrap();
         assert_eq!(display_key(&pr).as_deref(), Some("#1421"));
         assert!(myelin_refs::parse("#1421").is_err());
 
-        let c = git_commit_ref("acme", "repo7", "blake3:deadbeefcafef00d");
+        let c = git_commit_ref("acme", "repo7", "blake3:deadbeefcafef00d").unwrap();
         assert_eq!(display_key(&c).as_deref(), Some("deadbee"));
         assert!(myelin_refs::parse("deadbee").is_err());
 
-        assert_eq!(display_key(&git_repo_ref("acme", "r")), None);
-        assert_eq!(display_key(&git_review_ref("acme", "r", 1, "psn:x")), None);
+        assert_eq!(display_key(&git_repo_ref("acme", "r").unwrap()), None);
+        assert_eq!(
+            display_key(&git_review_ref("acme", "r", 1, "psn:x").unwrap()),
+            None
+        );
     }
 
     #[test]
@@ -695,7 +759,7 @@ mod tests {
 
     #[test]
     fn authorized_viewer_gets_the_pr_projection() {
-        let pr_ref = git_pr_ref("acme", "repo7", 42);
+        let pr_ref = git_pr_ref("acme", "repo7", 42).unwrap();
         let mut store = ArtifactStore::new();
         store.put_pr(
             &pr_ref,
@@ -724,7 +788,7 @@ mod tests {
 
     #[test]
     fn unauthorized_viewer_gets_a_tombstone_never_the_title() {
-        let pr_ref = git_pr_ref("acme", "repo7", 42);
+        let pr_ref = git_pr_ref("acme", "repo7", 42).unwrap();
         let mut store = ArtifactStore::new();
         store.put_pr(&pr_ref, a_pr(), GateOutcome::AllRequiredGreen, 2, 0);
         let p = Projector::new(StubId::new(), store);
@@ -747,7 +811,7 @@ mod tests {
 
     #[test]
     fn an_id_hiccup_fails_closed_to_a_tombstone() {
-        let pr_ref = git_pr_ref("acme", "repo7", 42);
+        let pr_ref = git_pr_ref("acme", "repo7", 42).unwrap();
         let mut store = ArtifactStore::new();
         store.put_pr(&pr_ref, a_pr(), GateOutcome::AllRequiredGreen, 0, 0);
         let id = StubId::new().allow_view(&pr_ref).with_hiccup();
@@ -763,7 +827,7 @@ mod tests {
 
     #[test]
     fn an_erased_artifact_projects_to_a_tombstone() {
-        let pr_ref = git_pr_ref("acme", "repo7", 42);
+        let pr_ref = git_pr_ref("acme", "repo7", 42).unwrap();
         let mut store = ArtifactStore::new();
         store.put_pr(&pr_ref, a_pr(), GateOutcome::AllRequiredGreen, 0, 0);
         store.mark_erased(&pr_ref);
@@ -784,7 +848,7 @@ mod tests {
 
     #[test]
     fn a_restricted_subject_projects_to_a_tombstone() {
-        let pr_ref = git_pr_ref("acme", "repo7", 42);
+        let pr_ref = git_pr_ref("acme", "repo7", 42).unwrap();
         let mut store = ArtifactStore::new();
         store.put_pr(&pr_ref, a_pr(), GateOutcome::AllRequiredGreen, 0, 0);
         store.mark_restricted(&pr_ref);
@@ -798,9 +862,9 @@ mod tests {
 
     #[test]
     fn project_commit_review_and_repo_for_authorized_viewer() {
-        let commit_ref = git_commit_ref("acme", "repo7", "blake3:deadbeefcafe");
-        let review_ref = git_review_ref("acme", "repo7", 42, "psn:bob");
-        let repo_ref = git_repo_ref("acme", "repo7");
+        let commit_ref = git_commit_ref("acme", "repo7", "blake3:deadbeefcafe").unwrap();
+        let review_ref = git_review_ref("acme", "repo7", 42, "psn:bob").unwrap();
+        let repo_ref = git_repo_ref("acme", "repo7").unwrap();
         let mut store = ArtifactStore::new();
         store.put_commit(
             &commit_ref,
@@ -849,7 +913,7 @@ mod tests {
 
     #[test]
     fn a_pr_comment_sub_anchor_projects_an_excerpt_and_inherits_the_parent_permission() {
-        let pr_ref = git_pr_ref("acme", "repo7", 42);
+        let pr_ref = git_pr_ref("acme", "repo7", 42).unwrap();
         let comment_ref =
             myelin_refs::mint(&pr_ref, myelin_refs::Sub::Comment("c9".into())).unwrap();
         let mut store = ArtifactStore::new();
@@ -868,7 +932,7 @@ mod tests {
 
     #[test]
     fn a_comment_sub_is_tombstoned_when_the_parent_pr_is_denied() {
-        let pr_ref = git_pr_ref("acme", "repo7", 42);
+        let pr_ref = git_pr_ref("acme", "repo7", 42).unwrap();
         let comment_ref =
             myelin_refs::mint(&pr_ref, myelin_refs::Sub::Comment("c9".into())).unwrap();
         let mut store = ArtifactStore::new();
@@ -892,7 +956,7 @@ mod tests {
 
     #[test]
     fn a_dangling_ref_is_not_found_not_a_tombstone() {
-        let pr_ref = git_pr_ref("acme", "repo7", 999);
+        let pr_ref = git_pr_ref("acme", "repo7", 999).unwrap();
         let p = Projector::new(StubId::new().allow_view(&pr_ref), ArtifactStore::new());
         assert!(matches!(
             p.project(&pr_ref, &viewer("alice"), z()),

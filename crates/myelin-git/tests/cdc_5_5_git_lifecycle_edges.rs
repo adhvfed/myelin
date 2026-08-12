@@ -130,7 +130,7 @@ fn issue(key: &str) -> ArtifactRef {
 fn git_closes_edge_mirrors_through_the_refs_consumer_forward_only() {
     let outbox = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-    let source = git_pr_ref("acme", "repo7", 42);
+    let source = git_pr_ref("acme", "repo7", 42).unwrap();
     let closes = vec![issue("ENG-1")];
 
     let ev = merged_event(&source);
@@ -165,8 +165,8 @@ fn git_closes_edge_mirrors_through_the_refs_consumer_forward_only() {
 fn git_relates_edge_mirrors_to_both_directions_through_the_refs_consumer() {
     let outbox = OutboxStore::new();
     let minter: Arc<dyn IdMinter> = Arc::new(MonotonicMinter::new());
-    let source = git_pr_ref("acme", "repo7", 42);
-    let linked = git_pr_ref("acme", "repo7", 7);
+    let source = git_pr_ref("acme", "repo7", 42).unwrap();
+    let linked = git_pr_ref("acme", "repo7", 7).unwrap();
 
     let ev = merged_event(&source);
     let mut tx = outbox.begin(Arc::clone(&minter), ctx_base());

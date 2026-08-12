@@ -237,7 +237,7 @@ mod tests {
     }
 
     fn private_pr_resolver(grant_view: bool) -> (GitRefResolver<StubId>, ArtifactRef) {
-        let pr_ref = git_pr_ref("acme", "repo7", 9);
+        let pr_ref = git_pr_ref("acme", "repo7", 9).unwrap();
         let mut store = ArtifactStore::new();
         store.put_pr(&pr_ref, secret_pr(), GateOutcome::AllRequiredGreen, 0, 0);
         let id = if grant_view {
@@ -380,7 +380,7 @@ mod tests {
         assert_eq!(reason, Reason::ReviewRequested);
         assert_eq!(prefix, "git/");
 
-        let git_pr = git_pr_ref("acme", "repo7", 9);
+        let git_pr = git_pr_ref("acme", "repo7", 9).unwrap();
         assert!(matches_review_requests_view(
             Reason::ReviewRequested,
             &git_pr

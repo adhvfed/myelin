@@ -124,7 +124,7 @@ fn viewer(id: &str) -> Principal {
 
 #[test]
 fn project_pr_authorized_gets_title_unauthorized_gets_tombstone_zero_leak() {
-    let pr_ref = git_pr_ref("acme", "payments", 1421);
+    let pr_ref = git_pr_ref("acme", "payments", 1421).unwrap();
     assert_eq!(
         myelin_refs::format(&pr_ref),
         "myelin://acme/git/pr/payments:1421",
