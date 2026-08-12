@@ -14,6 +14,16 @@ use myelin_storage::{
 };
 use myelin_tenancy::{Region, TenantId};
 
+fn test_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 fn admin_config(config: &MyelinConfig) -> MyelinConfig {
     let mut admin = config.clone();
     admin.database_url = admin
@@ -33,11 +43,11 @@ fn unique(label: &str) -> String {
     )
 }
 
-async fn providers() -> Option<(SubstrateProvider, SubstrateProvider)> {
-    let config = MyelinConfig::dev();
+async fn providers() -> (SubstrateProvider, SubstrateProvider) {
+    let config = test_config();
     let admin = SubstrateProvider::connect(admin_config(&config), 8)
         .await
-        .ok()?;
+        .expect("connect to the Postgres required by the agent registry stories");
     admin
         .migrate_foundation()
         .await
@@ -49,7 +59,7 @@ async fn providers() -> Option<(SubstrateProvider, SubstrateProvider)> {
     let app = SubstrateProvider::connect(config, 16)
         .await
         .expect("connect constrained app role");
-    Some((admin, app))
+    (admin, app)
 }
 
 fn human(tenant: &str, region: &str) -> Principal {
@@ -108,10 +118,7 @@ async fn cleanup(admin: &SubstrateProvider, tenant: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_human_activation_is_retry_safe_durable_and_ready_for_a_governed_run() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant = unique("converges");
     let region = app.config().region.clone();
     let actor = human(&tenant, &region);
@@ -195,7 +202,7 @@ async fn one_human_activation_is_retry_safe_durable_and_ready_for_a_governed_run
     assert_eq!(event_count, 1, "retries emit one durable activation event");
 
     let restarted = PgAgentRegistry::new(
-        SubstrateProvider::connect(MyelinConfig::dev(), 4)
+        SubstrateProvider::connect(test_config(), 4)
             .await
             .expect("fresh app pool"),
     );
@@ -211,10 +218,7 @@ async fn one_human_activation_is_retry_safe_durable_and_ready_for_a_governed_run
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_platform_managed_tenant_ceiling_learns_new_catalogue_grants_additively() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant = unique("platform-policy-upgrade");
     let region = app.config().region.clone();
     let actor = human(&tenant, &region);
@@ -271,10 +275,7 @@ async fn a_platform_managed_tenant_ceiling_learns_new_catalogue_grants_additivel
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_tenant_ceiling_refusal_leaves_no_half_activated_agent() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant = unique("ceiling");
     let region = app.config().region.clone();
     let actor = human(&tenant, &region);

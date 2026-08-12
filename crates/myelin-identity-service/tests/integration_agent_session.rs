@@ -15,6 +15,16 @@ use myelin_storage::migration::HotTables;
 use myelin_storage::{all_durable_migrations, KmsEngine, SubstrateProvider, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 
+fn test_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 fn admin_config(config: &MyelinConfig) -> MyelinConfig {
     let mut admin = config.clone();
     admin.database_url = admin
@@ -34,11 +44,11 @@ fn unique(label: &str) -> String {
     )
 }
 
-async fn providers() -> Option<(SubstrateProvider, SubstrateProvider)> {
-    let config = MyelinConfig::dev();
+async fn providers() -> (SubstrateProvider, SubstrateProvider) {
+    let config = test_config();
     let admin = SubstrateProvider::connect(admin_config(&config), 8)
         .await
-        .ok()?;
+        .expect("connect to the Postgres required by the agent session stories");
     admin
         .migrate_foundation()
         .await
@@ -50,7 +60,7 @@ async fn providers() -> Option<(SubstrateProvider, SubstrateProvider)> {
     let app = SubstrateProvider::connect(config, 16)
         .await
         .expect("connect constrained app role");
-    Some((admin, app))
+    (admin, app)
 }
 
 fn human(tenant: &str, region: &str) -> Principal {
@@ -133,10 +143,7 @@ fn lifecycle_request(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_click_starts_one_short_lived_agent_even_when_the_network_retries() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant = unique("one-run");
     let region = app.config().region.clone();
     let actor = human(&tenant, &region);
@@ -207,7 +214,7 @@ async fn one_click_starts_one_short_lived_agent_even_when_the_network_retries() 
         other => panic!("expected a snapshot-bound agent run, got {other:?}"),
     }
 
-    let restarted_provider = SubstrateProvider::connect(MyelinConfig::dev(), 4)
+    let restarted_provider = SubstrateProvider::connect(test_config(), 4)
         .await
         .expect("reconnect the runtime provider");
     let restarted_identity = StoreBackedCheck::with_pg(
@@ -372,10 +379,7 @@ async fn one_click_starts_one_short_lived_agent_even_when_the_network_retries() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_human_can_pause_and_retire_an_agent_without_leaving_a_live_run_behind() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant = unique("lifecycle");
     let region = app.config().region.clone();
     let actor = human(&tenant, &region);
