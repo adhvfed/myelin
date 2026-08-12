@@ -478,27 +478,16 @@ impl CiJobCredentialGenerationStore {
                         let jti =
                             crate::ci_identity_adapter::expected_phase_jti(&generation_id, issued)
                                 .map_err(|_| CiCredentialGenerationError::ExpiryOutOfRange)?;
-                        insert_generation(
-                            connection,
-                            &claim,
+                        let binding = CiPhaseCredentialBinding {
+                            binding_version: CI_PHASE_CREDENTIAL_BINDING_V1,
                             purpose,
-                            issued,
-                            expires,
-                            &generation_id,
-                            &jti,
-                        )
-                        .await?;
-                        (
-                            CiPhaseCredentialBinding {
-                                binding_version: CI_PHASE_CREDENTIAL_BINDING_V1,
-                                purpose,
-                                generation_id,
-                                jti,
-                                issued_at_epoch_secs: issued,
-                                expires_at_epoch_secs: expires,
-                            },
-                            CiCredentialGenerationOutcome::Applied,
-                        )
+                            generation_id,
+                            jti,
+                            issued_at_epoch_secs: issued,
+                            expires_at_epoch_secs: expires,
+                        };
+                        insert_generation(connection, &claim, &binding).await?;
+                        (binding, CiCredentialGenerationOutcome::Applied)
                     }
                 };
 
@@ -839,15 +828,10 @@ async fn phase_status(
     .map_err(map_sql_error)
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn insert_generation(
     connection: &mut sqlx::PgConnection,
     claim: &CiJobTokenRequest,
-    purpose: CiCredentialPurpose,
-    issued_at: i64,
-    expires_at: i64,
-    generation_id: &str,
-    jti: &str,
+    binding: &CiPhaseCredentialBinding,
 ) -> Result<(), CiCredentialGenerationError> {
     let inserted = sqlx::query(
         "INSERT INTO ci_job_credential_generation (
@@ -870,13 +854,13 @@ async fn insert_generation(
     .bind(&claim.claim_nonce)
     .bind(claim.claim_started_at_epoch_secs)
     .bind(claim.claim_expires_at_epoch_secs)
-    .bind(CI_PHASE_CREDENTIAL_BINDING_V1)
-    .bind(purpose.token())
-    .bind(purpose.ordinal())
-    .bind(issued_at)
-    .bind(expires_at)
-    .bind(generation_id)
-    .bind(jti)
+    .bind(binding.binding_version)
+    .bind(binding.purpose.token())
+    .bind(binding.purpose.ordinal())
+    .bind(binding.issued_at_epoch_secs)
+    .bind(binding.expires_at_epoch_secs)
+    .bind(&binding.generation_id)
+    .bind(&binding.jti)
     .execute(&mut *connection)
     .await
     .map_err(map_sql_error)?;
