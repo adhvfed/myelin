@@ -5,6 +5,7 @@ use sqlx::Row;
 use crate::migration::{Migration, Migrations};
 use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
+use crate::ACTIVE_PRINCIPAL_STATUS_JSON;
 
 pub const EXTERNAL_AGENT_RUN_MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS external_agent_run (
@@ -180,10 +181,6 @@ impl DurableExternalAgentRunBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
-                    let active_status = serde_json::to_string(
-                        &myelin_identity::PrincipalStatus::Active,
-                    )
-                    .expect("principal status serializes");
                     let status = sqlx::query_scalar::<_, String>(
                         "SELECT p.status FROM identity_agent a \
                            JOIN principal p ON p.tenant_id = a.tenant_id \
@@ -198,7 +195,7 @@ impl DurableExternalAgentRunBacking {
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("lock external agent before run claim"))?;
-                    if status.as_deref() != Some(active_status.as_str()) {
+                    if status.as_deref() != Some(ACTIVE_PRINCIPAL_STATUS_JSON) {
                         return Err(PgError::Query(
                             "external agent run claim refused an inactive or unknown agent".into(),
                         ));

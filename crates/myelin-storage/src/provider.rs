@@ -738,7 +738,10 @@ impl SubstrateProvider {
         backend::cache(Backend::Real, &self.config, rt)
     }
 
-    pub fn blob_store(&self, rt: tokio::runtime::Handle) -> Box<dyn BlobStore + Send + Sync> {
+    pub fn blob_store(
+        &self,
+        rt: tokio::runtime::Handle,
+    ) -> Result<Box<dyn BlobStore + Send + Sync>, backend::BackendError> {
         backend::blob_store(Backend::Real, &self.config, rt)
     }
 }

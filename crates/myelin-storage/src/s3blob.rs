@@ -120,13 +120,10 @@ impl S3BlobStore {
             .readiness
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if matches!(
-            state.last_error,
-            Some(S3ReadinessError::PermanentConfig | S3ReadinessError::PermanentAuth)
-        ) {
-            return Err(state
-                .last_error
-                .expect("matched a permanent readiness error"));
+        if let Some(error @ (S3ReadinessError::PermanentConfig | S3ReadinessError::PermanentAuth)) =
+            state.last_error
+        {
+            return Err(error);
         }
         if Instant::now() < state.next_probe {
             return state.last_error.map_or(Ok(()), Err);
@@ -347,20 +344,19 @@ fn classify_preflight_failure(
     failure: PreflightFailure,
     operation: PreflightOperation,
 ) -> S3ReadinessError {
-    let PreflightFailure::Service(status) = failure else {
-        return match failure {
-            PreflightFailure::Construction => S3ReadinessError::PermanentConfig,
-            PreflightFailure::Other => S3ReadinessError::Transient,
-            PreflightFailure::Service(_) => unreachable!(),
-        };
-    };
-    match status {
-        401 | 403 => S3ReadinessError::PermanentAuth,
-        301 | 307 | 400 => S3ReadinessError::PermanentConfig,
-        404 if matches!(operation, PreflightOperation::Put) => S3ReadinessError::PermanentConfig,
-        404 | 408 | 409 | 425 | 429 => S3ReadinessError::Transient,
-        400..=499 => S3ReadinessError::PermanentConfig,
-        _ => S3ReadinessError::Transient,
+    match failure {
+        PreflightFailure::Construction => S3ReadinessError::PermanentConfig,
+        PreflightFailure::Other => S3ReadinessError::Transient,
+        PreflightFailure::Service(status) => match status {
+            401 | 403 => S3ReadinessError::PermanentAuth,
+            301 | 307 | 400 => S3ReadinessError::PermanentConfig,
+            404 if matches!(operation, PreflightOperation::Put) => {
+                S3ReadinessError::PermanentConfig
+            }
+            404 | 408 | 409 | 425 | 429 => S3ReadinessError::Transient,
+            400..=499 => S3ReadinessError::PermanentConfig,
+            _ => S3ReadinessError::Transient,
+        },
     }
 }
 

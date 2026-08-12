@@ -602,7 +602,8 @@ async fn w7_3_blob_flip_survives_a_fresh_s3_store_reconstruction() {
         let payload = payload.clone();
         let handle = handle.clone();
         tokio::task::spawn_blocking(move || {
-            let store = blob_store(Backend::Real, &MyelinConfig::dev(), handle);
+            let store = blob_store(Backend::Real, &MyelinConfig::dev(), handle)
+                .expect("the real object-store backend is always available");
             store
                 .put(&tenant, &payload)
                 .expect("put through the durable Backend::Real seam")
@@ -616,7 +617,8 @@ async fn w7_3_blob_flip_survives_a_fresh_s3_store_reconstruction() {
         let hash = hash.clone();
         let handle = handle.clone();
         tokio::task::spawn_blocking(move || {
-            let fresh = blob_store(Backend::Real, &MyelinConfig::dev(), handle);
+            let fresh = blob_store(Backend::Real, &MyelinConfig::dev(), handle)
+                .expect("the real object-store backend is always available");
             fresh
                 .get(&tenant, &hash)
                 .expect("the bytes survived a FRESH store reconstruction (byte-durable, kill-9)")
@@ -637,7 +639,8 @@ async fn w7_3_blob_flip_survives_a_fresh_s3_store_reconstruction() {
     );
 
     let _ = tokio::task::spawn_blocking(move || {
-        let s = blob_store(Backend::Real, &MyelinConfig::dev(), handle);
+        let s = blob_store(Backend::Real, &MyelinConfig::dev(), handle)
+            .expect("the real object-store backend is always available");
         let _ = s.delete(&tenant, &hash);
     })
     .await;

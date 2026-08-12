@@ -7,6 +7,11 @@ use crate::pg::PgStore;
 use crate::pgrelay::PgRelay;
 use crate::provider::{ProviderError, SubstrateProvider};
 
+/// The JSON tokens persisted in `principal.kind` and `principal.status`.
+/// Changing either requires an explicit data migration, not an incidental serde rename.
+pub const HUMAN_PRINCIPAL_KIND_JSON: &str = r#""Human""#;
+pub const ACTIVE_PRINCIPAL_STATUS_JSON: &str = r#""Active""#;
+
 pub const PRINCIPAL_MIGRATION: &str = "\
 CREATE TABLE IF NOT EXISTS principal (
     tenant_id          text  NOT NULL,
@@ -619,7 +624,19 @@ fn principal_row_decode(error: sqlx::Error) -> crate::pg::PgError {
 
 #[cfg(test)]
 mod principal_decode_tests {
-    use super::decode_profile;
+    use super::{decode_profile, ACTIVE_PRINCIPAL_STATUS_JSON, HUMAN_PRINCIPAL_KIND_JSON};
+
+    #[test]
+    fn durable_principal_tokens_match_the_identity_wire_contract() {
+        assert_eq!(
+            serde_json::to_string(&myelin_identity::PrincipalKind::Human).unwrap(),
+            HUMAN_PRINCIPAL_KIND_JSON,
+        );
+        assert_eq!(
+            serde_json::to_string(&myelin_identity::PrincipalStatus::Active).unwrap(),
+            ACTIVE_PRINCIPAL_STATUS_JSON,
+        );
+    }
 
     #[test]
     fn encrypted_profile_columns_are_all_or_nothing() {

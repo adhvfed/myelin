@@ -13,20 +13,34 @@ pub enum Backend {
     Real,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BackendError {
+    TestOnlyBlobStoreUnavailable,
+}
+
+impl core::fmt::Display for BackendError {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::TestOnlyBlobStoreUnavailable => formatter.write_str(
+                "the in-memory blob store requires the `test-support` feature; production uses the real object store",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for BackendError {}
+
 pub fn blob_store(
     backend: Backend,
     cfg: &MyelinConfig,
     rt: tokio::runtime::Handle,
-) -> Box<dyn BlobStore + Send + Sync> {
+) -> Result<Box<dyn BlobStore + Send + Sync>, BackendError> {
     match backend {
         #[cfg(any(test, feature = "test-support"))]
-        Backend::InMemory => Box::new(FsBlobStore::new()),
+        Backend::InMemory => Ok(Box::new(FsBlobStore::new())),
         #[cfg(not(any(test, feature = "test-support")))]
-        Backend::InMemory => panic!(
-            "backend::blob_store(Backend::InMemory) requires the `test-support` feature - the fs \
-             FsBlobStore floor is a test double; production uses Backend::Real (S3BlobStore)"
-        ),
-        Backend::Real => Box::new(S3BlobStore::connect(&cfg.s3, rt)),
+        Backend::InMemory => Err(BackendError::TestOnlyBlobStoreUnavailable),
+        Backend::Real => Ok(Box::new(S3BlobStore::connect(&cfg.s3, rt))),
     }
 }
 

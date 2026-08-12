@@ -89,19 +89,17 @@ impl StorageLaneGate {
         let reserved = self.budget.human_lane_reservation.min(cap);
         let cur = self.tenants.get(tenant).copied().unwrap_or_default();
 
-        let admit = match class {
-            StorageLaneClass::Human => cur.total() < cap,
-            other => {
-                let non_human_budget = cap.saturating_sub(reserved);
-                let step = (non_human_budget / 8).max(1);
-                let ceiling = match other {
-                    StorageLaneClass::Speculative => non_human_budget.saturating_sub(2 * step),
-                    StorageLaneClass::BatchCi => non_human_budget.saturating_sub(step),
-                    StorageLaneClass::Agent => non_human_budget,
-                    StorageLaneClass::Human => unreachable!("human handled above"),
-                };
-                cur.non_human < ceiling && cur.total() < cap
-            }
+        let admit = if class == StorageLaneClass::Human {
+            cur.total() < cap
+        } else {
+            let non_human_budget = cap.saturating_sub(reserved);
+            let step = (non_human_budget / 8).max(1);
+            let ceiling = match class {
+                StorageLaneClass::Speculative => non_human_budget.saturating_sub(2 * step),
+                StorageLaneClass::BatchCi => non_human_budget.saturating_sub(step),
+                StorageLaneClass::Agent | StorageLaneClass::Human => non_human_budget,
+            };
+            cur.non_human < ceiling && cur.total() < cap
         };
 
         if admit {

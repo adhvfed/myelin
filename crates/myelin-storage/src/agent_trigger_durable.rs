@@ -30,6 +30,7 @@ use crate::pg::PgError;
 use crate::provider::{ProviderError, SubstrateProvider};
 use crate::reserve_settle::RunId as CostRunId;
 use crate::reserve_settle_durable::DurableCostLedger;
+use crate::{ACTIVE_PRINCIPAL_STATUS_JSON, HUMAN_PRINCIPAL_KIND_JSON};
 
 const FAILED_RUN_TERMINAL_REASON: &str =
     "agent run failed; retry it or inspect the hosted-agent service diagnostics";
@@ -95,10 +96,6 @@ impl DurableAgentTriggerBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
-                    let human = serde_json::to_string(&myelin_identity::PrincipalKind::Human)
-                        .expect("principal kind serializes");
-                    let active = serde_json::to_string(&myelin_identity::PrincipalStatus::Active)
-                        .expect("principal status serializes");
                     let owner = sqlx::query_as::<_, (String, String)>(
                         "SELECT kind, status FROM principal \
                           WHERE tenant_id = $1 AND region = $2 AND principal_id = $3 \
@@ -110,7 +107,9 @@ impl DurableAgentTriggerBacking {
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("verify trigger owner"))?;
-                    if !owner.is_some_and(|(kind, status)| kind == human && status == active) {
+                    if !owner.is_some_and(|(kind, status)| {
+                        kind == HUMAN_PRINCIPAL_KIND_JSON && status == ACTIVE_PRINCIPAL_STATUS_JSON
+                    }) {
                         return Ok(CreateAgentTriggerBindingOutcome::OwnerUnavailable);
                     }
 
@@ -130,7 +129,7 @@ impl DurableAgentTriggerBacking {
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("verify trigger run-as agent"))?;
-                    if agent_status.as_deref() != Some(active.as_str()) {
+                    if agent_status.as_deref() != Some(ACTIVE_PRINCIPAL_STATUS_JSON) {
                         return Ok(CreateAgentTriggerBindingOutcome::AgentUnavailable);
                     }
 
@@ -239,10 +238,6 @@ impl DurableAgentTriggerBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
-                    let human = serde_json::to_string(&myelin_identity::PrincipalKind::Human)
-                        .expect("principal kind serializes");
-                    let active = serde_json::to_string(&myelin_identity::PrincipalStatus::Active)
-                        .expect("principal status serializes");
                     let rows = sqlx::query(
                         "SELECT b.binding_id, b.owner_principal_id, b.run_as_agent_id, \
                                 b.client_nonce, b.event_type, b.matcher, b.task, \
@@ -268,8 +263,8 @@ impl DurableAgentTriggerBacking {
                     .bind(&tenant)
                     .bind(&region)
                     .bind(&event_type)
-                    .bind(&human)
-                    .bind(&active)
+                    .bind(HUMAN_PRINCIPAL_KIND_JSON)
+                    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
                     .bind(limit)
                     .fetch_all(&mut *conn)
                     .await
@@ -632,23 +627,19 @@ impl DurableAgentTriggerBacking {
                         return Ok(ReserveAgentTriggerFiringOutcome::AlreadyReserved(existing));
                     }
 
-                    let active = serde_json::to_string(&myelin_identity::PrincipalStatus::Active)
-                        .expect("principal status serializes");
-                    let human = serde_json::to_string(&myelin_identity::PrincipalKind::Human)
-                        .expect("principal kind serializes");
                     if row.try_get::<String, _>("state").map_err(row_error("state"))? != "active"
                         || row
                             .try_get::<String, _>("owner_kind")
                             .map_err(row_error("owner_kind"))?
-                            != human
+                            != HUMAN_PRINCIPAL_KIND_JSON
                         || row
                             .try_get::<String, _>("owner_status")
                             .map_err(row_error("owner_status"))?
-                            != active
+                            != ACTIVE_PRINCIPAL_STATUS_JSON
                         || row
                             .try_get::<String, _>("agent_status")
                             .map_err(row_error("agent_status"))?
-                            != active
+                            != ACTIVE_PRINCIPAL_STATUS_JSON
                     {
                         return Ok(ReserveAgentTriggerFiringOutcome::BindingUnavailable);
                     }
@@ -955,10 +946,6 @@ impl DurableAgentTriggerBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
-                    let active = serde_json::to_string(&myelin_identity::PrincipalStatus::Active)
-                        .expect("principal status serializes");
-                    let human = serde_json::to_string(&myelin_identity::PrincipalKind::Human)
-                        .expect("principal kind serializes");
                     let row = sqlx::query(
                         "WITH candidate AS (\
                             SELECT f.binding_id, f.event_id, b.owner_principal_id, \
@@ -1002,8 +989,8 @@ impl DurableAgentTriggerBacking {
                     .bind(&tenant)
                     .bind(&region)
                     .bind(&request.runtime_ref)
-                    .bind(&human)
-                    .bind(&active)
+                    .bind(HUMAN_PRINCIPAL_KIND_JSON)
+                    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
                     .bind(&request.worker_id)
                     .bind(i64::from(request.lease_seconds))
                     .fetch_optional(&mut *conn)
@@ -1141,10 +1128,6 @@ impl DurableAgentTriggerBacking {
         self.provider
             .with_tenant_tx(&tenant.clone(), move |conn| {
                 Box::pin(async move {
-                    let active = serde_json::to_string(&myelin_identity::PrincipalStatus::Active)
-                        .expect("principal status serializes");
-                    let human = serde_json::to_string(&myelin_identity::PrincipalKind::Human)
-                        .expect("principal kind serializes");
                     let row = sqlx::query(
                         "SELECT f.binding_id, f.event_id, f.event_type, f.event_envelope, f.run_id, \
                                 b.owner_principal_id, b.run_as_agent_id, b.task, \
@@ -1166,8 +1149,8 @@ impl DurableAgentTriggerBacking {
                     .bind(&tenant)
                     .bind(&region)
                     .bind(run_id)
-                    .bind(&human)
-                    .bind(&active)
+                    .bind(HUMAN_PRINCIPAL_KIND_JSON)
+                    .bind(ACTIVE_PRINCIPAL_STATUS_JSON)
                     .fetch_optional(&mut *conn)
                     .await
                     .map_err(query_error("load started governed agent run"))?;

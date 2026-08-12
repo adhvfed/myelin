@@ -1145,7 +1145,11 @@ async fn serve(core: ComposedCore, runtime: EdgeRuntimeConfig) {
         )
         .sse_route("/v1/t/{tenant}/events", "edge.events.subscribe", "edge");
     builder = register_git_durable(builder, git_backend.clone());
-    let ci_blobs: Arc<dyn BlobStore + Send + Sync> = Arc::from(provider.blob_store(handle.clone()));
+    let ci_blobs: Arc<dyn BlobStore + Send + Sync> =
+        Arc::from(provider.blob_store(handle.clone()).unwrap_or_else(|error| {
+            eprintln!("edge: object-store selection failed: {error}");
+            std::process::exit(1);
+        }));
     let ci_runs = myelin_ci_controlplane::CiRunStore::with_pg_surface_cursor_key(
         provider.db_pool().clone(),
         ci_surface_cursor_key,
