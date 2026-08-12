@@ -1,8 +1,7 @@
 use crate::wfctx::{WaitOutcome, WfCtx, WfError, WfResult};
 use myelin_events::check_seam::{CiOverall, CiResult};
 use myelin_events::{
-    AggregateKey, ArtifactRef as EvArtifactRef, DataRole, EventDraft, EventId, EventType,
-    Visibility,
+    AggregateKey, ArtifactRef as EvArtifactRef, DataRole, EventDraft, EventType, Visibility,
 };
 use myelin_refs::ArtifactRef;
 
@@ -74,12 +73,8 @@ pub fn humanise_dequeue_reason(cause: DequeueCause) -> String {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DequeueCause {
-    CiFailure {
-        failing: Vec<String>,
-    },
-    MissingRequiredContext {
-        missing: Vec<String>,
-    },
+    CiFailure { failing: Vec<String> },
+    MissingRequiredContext { missing: Vec<String> },
     CiVanished,
     MergeConflict,
 }
@@ -453,9 +448,6 @@ impl<'a> RealCiResultProducer<'a> {
         })
     }
 }
-
-#[allow(dead_code)]
-type EmittedEventId = EventId;
 
 #[cfg(test)]
 mod tests {

@@ -417,10 +417,19 @@ fn v4_receipt_and_result_summary_bind_the_closed_disposition() {
         "a historical v3 replay retains the exact legacy summary shape"
     );
     assert_eq!(
-        preparation_terminal_result_summary(
-            myelin_ci_sandbox::PreparationTerminalDisposition::TimedOut {
-                phase: myelin_ci_sandbox::PreparationPhase::CheckoutTransport,
-            }
+        terminal_result_summary(
+            &TerminalReport {
+                passed: false,
+                timed_out: true,
+                usage: input.usage,
+                result_refs: Vec::new(),
+            },
+            Some(CiJobTerminalDisposition::Preparation(
+                PreparationTerminalDisposition::TimedOut {
+                    phase: myelin_ci_sandbox::PreparationPhase::CheckoutTransport,
+                },
+            )),
+            None,
         ),
         serde_json::json!({
             "passed": false,
@@ -875,13 +884,25 @@ fn preparation_report_claim_round_trips_all_thirteen_token_request_fields() {
     assert_eq!(report_claim.wf_run_id, request.wf_run_id);
     assert_eq!(report_claim.ci_run_id, request.ci_run_id);
     assert_eq!(report_claim.job_id, request.job_id);
-    assert_eq!(report_claim.token_authority_handle, request.token_authority_handle);
+    assert_eq!(
+        report_claim.token_authority_handle,
+        request.token_authority_handle
+    );
     assert_eq!(report_claim.idem_token, request.idem_token);
     assert_eq!(report_claim.lease_owner, request.lease_owner);
     assert_eq!(report_claim.lease_epoch, request.lease_epoch);
     assert_eq!(report_claim.claim_nonce, request.claim_nonce);
-    assert_eq!(report_claim.claim_started_at_epoch_secs, request.claim_started_at_epoch_secs);
-    assert_eq!(report_claim.claim_expires_at_epoch_secs, request.claim_expires_at_epoch_secs);
+    assert_eq!(
+        report_claim.claim_started_at_epoch_secs,
+        request.claim_started_at_epoch_secs
+    );
+    assert_eq!(
+        report_claim.claim_expires_at_epoch_secs,
+        request.claim_expires_at_epoch_secs
+    );
     let back = token_request_from_preparation_report_claim(&report_claim);
-    assert_eq!(back, request, "the thirteen-field mapping is an exact round-trip");
+    assert_eq!(
+        back, request,
+        "the thirteen-field mapping is an exact round-trip"
+    );
 }

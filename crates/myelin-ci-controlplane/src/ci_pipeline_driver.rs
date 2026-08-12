@@ -1387,23 +1387,6 @@ fn terminal_result_summary(
     }
 }
 
-#[allow(dead_code)]
-pub(crate) fn preparation_terminal_result_summary(
-    disposition: myelin_ci_sandbox::PreparationTerminalDisposition,
-) -> serde_json::Value {
-    let timed_out = matches!(
-        disposition,
-        myelin_ci_sandbox::PreparationTerminalDisposition::TimedOut { .. }
-    );
-    let disposition = CiJobTerminalDisposition::Preparation(disposition);
-    serde_json::json!({
-        "passed": false,
-        "timed_out": timed_out,
-        "disposition": disposition.as_storage_token(),
-        "workload_started": false,
-    })
-}
-
 pub(crate) async fn close_cancelled_run_if_accounted(
     conn: &mut sqlx::PgConnection,
     accounting: &DurableCiJobAccounting,
