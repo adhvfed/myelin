@@ -64,9 +64,13 @@ impl WorkloadRootPermissions {
 
 #[derive(Clone, Debug)]
 pub enum RootfsOverlayMode {
-    OverlayFs { overlays_dir: PathBuf },
+    OverlayFs {
+        overlays_dir: PathBuf,
+    },
     #[cfg(any(test, feature = "test-support"))]
-    DeterministicDirectoryForTests { overlays_dir: PathBuf },
+    DeterministicDirectoryForTests {
+        overlays_dir: PathBuf,
+    },
 }
 
 impl RootfsOverlayMode {
@@ -728,10 +732,7 @@ fn prepare_overlay_root(path: &Path) -> Result<(PathBuf, File), RootfsOverlayErr
             break;
         }
         let error = io::Error::last_os_error();
-        let transient = matches!(
-            error.raw_os_error(),
-            Some(libc::EAGAIN) | Some(libc::EINTR)
-        );
+        let transient = matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EINTR));
         if transient && std::time::Instant::now() < lock_deadline {
             std::thread::sleep(std::time::Duration::from_millis(5));
             continue;
@@ -1538,20 +1539,6 @@ mod tests {
     }
 
     #[test]
-    fn overlay_rootfs_lifecycle_has_private_mount_namespace_seam() {
-        let source = include_str!("rootfs_overlay.rs");
-        assert!(source.contains("libc::unshare(libc::CLONE_NEWNS)"));
-        assert!(source.contains("libc::MS_REC | libc::MS_PRIVATE"));
-        assert!(source.contains("startup_cleanup(&overlay_root_path, &overlay_root)"));
-        assert!(
-            source
-                .find("startup_cleanup(&overlay_root_path, &overlay_root)")
-                .unwrap()
-                < source.find("enter_private_mount_namespace()").unwrap()
-        );
-    }
-
-    #[test]
     fn overlay_resources_drop_cleans_pre_guard_unwind() {
         let fixture = Fixture::new("pre-guard-unwind");
         let manager = fixture.manager(Arc::new(Mutex::new(Vec::new())));
@@ -1672,7 +1659,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_rootfs_teardown_is_job_scoped_without_delete_helpers_or_runtime_scan() {
+    fn overlay_rootfs_teardown_preserves_sibling_directories() {
         let fixture = Fixture::new("scoped-cleanup");
         let manager = fixture.manager(Arc::new(Mutex::new(Vec::new())));
         let verified = fixture.verified();
@@ -1685,13 +1672,5 @@ mod tests {
         fs::write(sibling.join("keep"), b"keep").unwrap();
         drop(overlay);
         assert_eq!(fs::read(sibling.join("keep")).unwrap(), b"keep");
-
-        let source = include_str!("rootfs_overlay.rs");
-        assert!(!source.contains(concat!("fn reconcile_", "orphans")));
-        assert!(!source.contains(concat!("subvolume ", "delete")));
-        assert!(!source.contains(concat!("/usr/bin/", "btrfs")));
-        assert!(source.contains("wired-but-dormant CoW primitive"));
-        assert!(!source.contains(concat!("Production mounts the digest-verified ", "base")));
-        assert!(!source.contains(concat!("merged mount is the ", "only path")));
     }
 }

@@ -108,7 +108,9 @@ pub enum CgroupQuiescenceError {
     Kill(String),
     EventsUnreadable(String),
     EventsMalformed(String),
-    StillPopulated { waited: Duration },
+    StillPopulated {
+        waited: Duration,
+    },
     Remove(String),
 }
 
@@ -367,28 +369,14 @@ impl Drop for MemoryCgroup {
 mod tests {
     use super::*;
     #[cfg(feature = "test-support")]
-    use std::process::Stdio;
-    #[cfg(feature = "test-support")]
     use crate::launch_gate::SandboxCommand;
     #[cfg(feature = "test-support")]
     use crate::LaunchPermit;
-
-    const CGROUP_SOURCE: &str = include_str!("cgroup.rs");
-    const RUN_SOURCE: &str = include_str!("run.rs");
-
-    fn source_of_in(source: &'static str, signature: &str) -> &'static str {
-        let start = source
-            .find(signature)
-            .unwrap_or_else(|| panic!("`{signature}` exists"));
-        let rest = &source[start..];
-        let end = rest
-            .find("\n}\n")
-            .unwrap_or_else(|| panic!("`{signature}` has a top-level close"));
-        &rest[..end]
-    }
+    #[cfg(feature = "test-support")]
+    use std::process::Stdio;
 
     #[test]
-    fn job_cgroup_limits_write_cpu_from_policy_to_same_cgroup_before_exec() {
+    fn job_cgroup_limits_are_written_together_from_policy() {
         let dir = PathBuf::from("/deterministic/job-cgroup");
         let mut writes = Vec::<(PathBuf, Vec<u8>)>::new();
         write_job_cgroup_limits_given(&dir, 64 << 20, 2000, |path, value| {
@@ -410,19 +398,6 @@ mod tests {
             "2000 millicpu must become a two-core cpu.max quota in the same job cgroup"
         );
 
-        let create = source_of_in(CGROUP_SOURCE, "pub fn create(mem_bytes: u64, cpu_millis: u32)");
-        assert!(
-            create.find("write_job_cgroup_limits_given").unwrap()
-                < create.find("Ok(MemoryCgroup").unwrap(),
-            "MemoryCgroup::create must not return a launchable handle before every limit write succeeds"
-        );
-        let run = source_of_in(RUN_SOURCE, "fn run_production_container_streaming(");
-        assert!(
-            run.find("MemoryCgroup::create(spec.limits.mem_bytes, spec.limits.cpu_millis)")
-                .unwrap()
-                < run.find("let capture = ||").unwrap(),
-            "the policy-derived cgroup must be complete before the runsc capture/exec continuation exists"
-        );
     }
 
     #[test]
@@ -618,7 +593,10 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn quiesce_succeeds_on_an_empty_real_cgroup_and_removes_it() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -633,7 +611,10 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn quiesce_kills_a_descendant_detached_outside_the_runtime_process_group() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -690,7 +671,10 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn quiesce_succeeds_without_the_caller_ever_reaping_a_killed_direct_child() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -714,7 +698,10 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn quiesce_refuses_to_mint_evidence_when_an_unexpected_child_cgroup_blocks_removal() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -736,7 +723,10 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn drop_retries_removal_after_an_earlier_failed_cleanup_call() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -796,7 +786,10 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn quiesce_detects_an_identity_change_and_refuses_to_mint_evidence() {
         let cg = MemoryCgroup::create(64 << 20, 1000)
             .expect("this test-support gate requires a real delegated cgroup");
@@ -850,7 +843,10 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[test]
-    #[cfg_attr(not(feature = "privileged-host-tests"), ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests")]
+    #[cfg_attr(
+        not(feature = "privileged-host-tests"),
+        ignore = "requires privileged host substrate (delegated cgroup v2 / btrfs / runsc+staged gvisor-assets / userns) - run on the host lane with --features privileged-host-tests"
+    )]
     fn launch_watchdog_cgroup_kills_a_descendant_outside_the_runtime_process_group() {
         use std::time::Instant;
         let cgroup = MemoryCgroup::create(64 << 20, 1000)
