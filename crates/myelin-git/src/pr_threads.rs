@@ -39,6 +39,41 @@ impl<T> CommandOutcome<T> {
 }
 
 #[derive(Clone, PartialEq, Eq)]
+pub struct CommentWrite {
+    author: ThreadPrincipal,
+    body_md: String,
+    operation_id: String,
+    now: i64,
+}
+
+impl CommentWrite {
+    pub fn new(
+        author: ThreadPrincipal,
+        body_md: impl Into<String>,
+        operation_nonce: &str,
+        now: i64,
+    ) -> Result<Self, DurableError> {
+        Ok(Self {
+            author,
+            body_md: validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?,
+            operation_id: operation_digest(operation_nonce)?,
+            now,
+        })
+    }
+}
+
+impl core::fmt::Debug for CommentWrite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("CommentWrite")
+            .field("author", &"<redacted>")
+            .field("body_md", &"<redacted>")
+            .field("operation_id", &self.operation_id)
+            .field("now", &self.now)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
 pub struct PendingCommentRequest {
     repo: RepoLoc,
     object_key: String,
@@ -57,16 +92,17 @@ impl PendingCommentRequest {
         object_key: impl Into<String>,
         review_id: impl Into<String>,
         anchor: Option<ThreadAnchor>,
-        author: ThreadPrincipal,
-        body_md: impl Into<String>,
-        operation_nonce: &str,
-        now: i64,
+        comment: CommentWrite,
     ) -> Result<Self, DurableError> {
         let object_key = object_key.into();
         let review_id = review_id.into();
-        let body_md = validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?;
+        let CommentWrite {
+            author,
+            body_md,
+            operation_id,
+            now,
+        } = comment;
         validate_review_target(&repo, &object_key, &review_id)?;
-        let operation_id = operation_digest(operation_nonce)?;
         let request_hash = pending_comment_request_hash(&review_id, &anchor, &author, &body_md)?;
         Ok(Self {
             repo,
@@ -635,13 +671,14 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         repo: &RepoLoc,
         object_key: &str,
         anchor: Option<ThreadAnchor>,
-        author: ThreadPrincipal,
-        body_md: impl Into<String>,
-        operation_nonce: &str,
-        now: i64,
+        comment: CommentWrite,
     ) -> Result<CommandOutcome<ThreadRecord>, DurableError> {
-        let body_md = validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?;
-        let operation_id = operation_digest(operation_nonce)?;
+        let CommentWrite {
+            author,
+            body_md,
+            operation_id,
+            now,
+        } = comment;
         let request_hash = thread_request_hash(&anchor, &author, &body_md)?;
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -709,13 +746,14 @@ impl<P: RepoPathResolver> DurablePrThreadStore<P> {
         repo: &RepoLoc,
         object_key: &str,
         thread_id: &str,
-        author: ThreadPrincipal,
-        body_md: impl Into<String>,
-        operation_nonce: &str,
-        now: i64,
+        comment: CommentWrite,
     ) -> Result<CommandOutcome<CommentRecord>, DurableError> {
-        let body_md = validate_markdown(body_md.into(), MAX_COMMENT_BODY_BYTES, "comment body")?;
-        let operation_id = operation_digest(operation_nonce)?;
+        let CommentWrite {
+            author,
+            body_md,
+            operation_id,
+            now,
+        } = comment;
         let request_hash = reply_request_hash(thread_id, &author, &body_md)?;
         let lock = self.subject_lock(repo, object_key)?;
         let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -1052,6 +1090,15 @@ mod tests {
         ThreadPrincipal::plain(PrincipalRole::Human, name)
     }
 
+    fn comment(
+        author: ThreadPrincipal,
+        body_md: impl Into<String>,
+        operation_nonce: &str,
+        now: i64,
+    ) -> CommentWrite {
+        CommentWrite::new(author, body_md, operation_nonce, now).unwrap()
+    }
+
     fn pending_comment(
         review_id: &str,
         author: ThreadPrincipal,
@@ -1063,10 +1110,7 @@ mod tests {
             KEY,
             review_id,
             None,
-            author,
-            body_md,
-            &format!("operation-{now}"),
-            now,
+            comment(author, body_md, &format!("operation-{now}"), now),
         )
         .unwrap()
     }
@@ -1088,10 +1132,12 @@ mod tests {
             KEY,
             "r-secret",
             None,
-            human("psn:secret-author@acme"),
-            "sensitive draft body",
-            "secret-operation",
-            1,
+            comment(
+                human("psn:secret-author@acme"),
+                "sensitive draft body",
+                "secret-operation",
+                1,
+            ),
         )
         .unwrap();
         let pending_debug = format!("{pending:?}");
@@ -1117,10 +1163,7 @@ mod tests {
             KEY,
             "r-1",
             None,
-            human("psn:r@acme"),
-            "draft",
-            "incomplete-target",
-            3,
+            comment(human("psn:r@acme"), "draft", "incomplete-target", 3),
         )
         .is_err());
         assert!(SubmitReviewRequest::new(
@@ -1133,11 +1176,7 @@ mod tests {
             4,
         )
         .is_err());
-        assert!(PendingCommentRequest::new(
-            loc(),
-            KEY,
-            "r-1",
-            None,
+        assert!(CommentWrite::new(
             human("psn:r@acme"),
             "x".repeat(MAX_COMMENT_BODY_BYTES + 1),
             "oversized-comment",
@@ -1183,10 +1222,7 @@ mod tests {
                 KEY,
                 &review.id,
                 None,
-                reviewer.clone(),
-                body,
-                "private-retry-key",
-                now,
+                comment(reviewer.clone(), body, "private-retry-key", now),
             )
             .unwrap()
         };
@@ -1240,10 +1276,7 @@ mod tests {
                 &loc(),
                 KEY,
                 None,
-                human("psn:a@acme"),
-                "first post",
-                "round-trip",
-                100,
+                comment(human("psn:a@acme"), "first post", "round-trip", 100),
             )
             .unwrap();
 
@@ -1266,10 +1299,12 @@ mod tests {
                 &loc(),
                 KEY,
                 None,
-                author.clone(),
-                "Can we make this invariant explicit?",
-                "private-thread-key",
-                100,
+                comment(
+                    author.clone(),
+                    "Can we make this invariant explicit?",
+                    "private-thread-key",
+                    100,
+                ),
             )
             .unwrap();
         let retried = store
@@ -1277,10 +1312,12 @@ mod tests {
                 &loc(),
                 KEY,
                 None,
-                author.clone(),
-                "Can we make this invariant explicit?",
-                "private-thread-key",
-                999,
+                comment(
+                    author.clone(),
+                    "Can we make this invariant explicit?",
+                    "private-thread-key",
+                    999,
+                ),
             )
             .unwrap();
         assert!(first.applied);
@@ -1291,10 +1328,12 @@ mod tests {
                 &loc(),
                 KEY,
                 None,
-                author.clone(),
-                "A different thread.",
-                "private-thread-key",
-                1_000,
+                comment(
+                    author.clone(),
+                    "A different thread.",
+                    "private-thread-key",
+                    1_000,
+                ),
             ),
             Err(DurableError::Conflict(_))
         ));
@@ -1304,10 +1343,12 @@ mod tests {
                 &loc(),
                 KEY,
                 &first.value.id,
-                author.clone(),
-                "Yes; the durable boundary is the right place.",
-                "private-reply-key",
-                101,
+                comment(
+                    author.clone(),
+                    "Yes; the durable boundary is the right place.",
+                    "private-reply-key",
+                    101,
+                ),
             )
             .unwrap();
         let retried_reply = DurablePrThreadStore::rooted(&root)
@@ -1315,10 +1356,12 @@ mod tests {
                 &loc(),
                 KEY,
                 &first.value.id,
-                author,
-                "Yes; the durable boundary is the right place.",
-                "private-reply-key",
-                1_001,
+                comment(
+                    author,
+                    "Yes; the durable boundary is the right place.",
+                    "private-reply-key",
+                    1_001,
+                ),
             )
             .unwrap();
         assert!(first_reply.applied);
@@ -1354,10 +1397,12 @@ mod tests {
                     &loc(),
                     KEY,
                     None,
-                    human(&format!("psn:writer-{writer}@acme")),
-                    format!("comment-{writer}"),
-                    &format!("writer-{writer}"),
-                    writer as i64,
+                    comment(
+                        human(&format!("psn:writer-{writer}@acme")),
+                        format!("comment-{writer}"),
+                        &format!("writer-{writer}"),
+                        writer as i64,
+                    ),
                 )
             }));
         }
@@ -1702,10 +1747,7 @@ mod tests {
                 &loc(),
                 KEY,
                 None,
-                human("psn:a@acme"),
-                "q?",
-                "resolve-thread",
-                1,
+                comment(human("psn:a@acme"), "q?", "resolve-thread", 1),
             )
             .unwrap()
             .value;
@@ -1740,10 +1782,7 @@ mod tests {
                 &loc(),
                 first,
                 None,
-                human("psn:a@acme"),
-                "private",
-                "filename-collision",
-                1,
+                comment(human("psn:a@acme"), "private", "filename-collision", 1),
             )
             .unwrap();
         let err = store

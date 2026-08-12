@@ -41,9 +41,9 @@ use myelin_git::pr_store::{
     PrListSort, PrListState, PrRecord, ReviewRecord, PR_LIST_OFFSET_MAX,
 };
 use myelin_git::pr_threads::{
-    AnchorSide, AnchorState, BatchVerdict, CommentRecord, CommentState, DurablePrThreadStore,
-    PendingCommentRequest, PrincipalRole, ReviewBatch, SubmitReviewRequest, ThreadAnchor,
-    ThreadPrincipal, ThreadRecord, ViewedThreads,
+    AnchorSide, AnchorState, BatchVerdict, CommentRecord, CommentState, CommentWrite,
+    DurablePrThreadStore, PendingCommentRequest, PrincipalRole, ReviewBatch, SubmitReviewRequest,
+    ThreadAnchor, ThreadPrincipal, ThreadRecord, ViewedThreads,
 };
 use myelin_git::receive_pack::{
     evaluate_protected_ref_push, CrashPoint, Oid as PushOid, ProposedRefUpdate, PushOutcome,

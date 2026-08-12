@@ -720,15 +720,11 @@ async fn co_commit_reference_changes<'a>(
             },
             Some(content_event),
         );
-        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(
-            &mut **tx,
-            &envelope.aggregate.0,
-            &envelope,
-        )
-        .await
-        .map_err(|error| {
-            KnowledgePageError::Storage(format!("co-commit Knowledge reference edge: {error}"))
-        })?;
+        myelin_storage::pgrelay::PgRelay::co_commit_in_tx(tx, &envelope.aggregate.0, &envelope)
+            .await
+            .map_err(|error| {
+                KnowledgePageError::Storage(format!("co-commit Knowledge reference edge: {error}"))
+            })?;
     }
     Ok(())
 }
@@ -1014,7 +1010,7 @@ mod tests {
         let same = block("01J00000000000000000000000");
         assert!(validate_space_key("engineering").is_ok());
         assert!(validate_space_key("Engineering").is_err());
-        assert!(validate_blocks("acme", &[same.clone()]).is_ok());
+        assert!(validate_blocks("acme", std::slice::from_ref(&same)).is_ok());
         assert!(validate_blocks("acme", &[same.clone(), same]).is_err());
         let mut unknown = block("01J00000000000000000000001");
         unknown.block_type = "raw_html".into();
