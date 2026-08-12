@@ -250,21 +250,19 @@ impl PgArtifactVisibility {
         let channel_ids = ids(&by_class, "chat", "channel");
         let page_ids = ids(&by_class, "knowledge", "page");
         let run_ids = ids(&by_class, "ci", "run");
-        let query_tenant = tenant.clone();
-        let query_region = region.clone();
+        let query = DatabaseVisibilityQuery {
+            tenant: tenant.clone(),
+            region: region.clone(),
+            subject,
+            viewer,
+            issue_keys,
+            message_ids,
+            channel_ids,
+            page_ids,
+            run_ids,
+        };
         let database_visible = with_tenant_tx(&self.pool, &tenant, &region, move |connection| {
-            Box::pin(read_database_visibility(
-                connection,
-                query_tenant,
-                query_region,
-                subject,
-                viewer,
-                issue_keys,
-                message_ids,
-                channel_ids,
-                page_ids,
-                run_ids,
-            ))
+            Box::pin(read_database_visibility(connection, query))
         })
         .await
         .map_err(|error| EdgeError::Internal(error.to_string()))?;
@@ -327,9 +325,7 @@ struct DatabaseVisibility {
     ci_repos: Vec<(String, String)>,
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn read_database_visibility(
-    connection: &mut PgConnection,
+struct DatabaseVisibilityQuery {
     tenant: String,
     region: String,
     subject: String,
@@ -339,7 +335,23 @@ async fn read_database_visibility(
     channel_ids: Vec<String>,
     page_ids: Vec<String>,
     run_ids: Vec<String>,
+}
+
+async fn read_database_visibility(
+    connection: &mut PgConnection,
+    query: DatabaseVisibilityQuery,
 ) -> Result<DatabaseVisibility, myelin_storage::PgError> {
+    let DatabaseVisibilityQuery {
+        tenant,
+        region,
+        subject,
+        viewer,
+        issue_keys,
+        message_ids,
+        channel_ids,
+        page_ids,
+        run_ids,
+    } = query;
     let mut result = DatabaseVisibility::default();
     let visible_issues = sqlx::query_scalar::<_, String>(
         "SELECT i.key
