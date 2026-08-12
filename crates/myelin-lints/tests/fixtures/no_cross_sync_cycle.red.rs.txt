@@ -1,8 +1,0 @@
-// RED fixture for `no-cross-sync-cycle` — the lint MUST reject this.
-// @identity-sink
-// Identity originates a SYNCHRONOUS outbound cross-service call — but Identity is the SINK of the
-// sync call graph (everyone may call it synchronously; it calls no one synchronously). A sync
-// call out of Identity makes a cycle possible (EI-02 §3).
-pub async fn notify_other_service(client: &SyncServiceClient) {
-    let _ = client.call_sync(build_request());
-}

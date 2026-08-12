@@ -41,7 +41,6 @@ myelin-identity-service = { path = "../myelin-identity-service", features = ["te
 myelin-flow = { path = "../myelin-flow" }
 myelin-gdpr-service = { path = "../myelin-gdpr-service" }
 myelin-harness = { path = "../myelin-harness" }
-myelin-lints = { path = "../myelin-lints" }
 
 [features]
 default = []

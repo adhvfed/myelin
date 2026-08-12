@@ -1,9 +1,0 @@
-// RED fixture for `flow-determinism` — the lint MUST reject this.
-// @workflow-body
-// A workflow body reads the raw clock and a raw RNG, bypassing the deterministic WfCtx surface:
-// replay diverges (the non-deterministic-replay bug class) (index 9.2, OQ-F).
-pub async fn approval_workflow(ctx: &mut WfCtx) {
-    let started = SystemTime::now();
-    let nonce = Uuid::new_v4();
-    let _ = (started, nonce);
-}

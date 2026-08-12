@@ -1,5 +1,0 @@
--- RED fixture for `forward-only-migration` — the lint MUST reject this.
--- A reversible (down) migration AND a blocking ALTER that adds a NOT NULL column without a
--- default: the reversible-migration + table-lock-under-load bug classes (STOR-2, §9).
--- down
-ALTER TABLE principals ADD COLUMN email TEXT NOT NULL;

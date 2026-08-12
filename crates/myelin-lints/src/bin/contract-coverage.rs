@@ -18,9 +18,7 @@ fn main() -> ExitCode {
 
     let index_path = arg_value(&args, "--index")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            root.join("contracts/contract-index.md")
-        });
+        .unwrap_or_else(|| root.join("contracts/contract-index.md"));
     let manifest_path = arg_value(&args, "--manifest")
         .map(PathBuf::from)
         .unwrap_or_else(|| root.join("contract-coverage.toml"));

@@ -48,8 +48,12 @@ pub struct FrontendContract {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CoverageError {
-    RowMissingFromManifest { row: RowId },
-    StaleManifestEntry { row: RowId },
+    RowMissingFromManifest {
+        row: RowId,
+    },
+    StaleManifestEntry {
+        row: RowId,
+    },
     CdcFileMissing {
         row: RowId,
         title: String,
@@ -60,8 +64,14 @@ pub enum CoverageError {
         title: String,
         file: String,
     },
-    CoveredWithNoCdc { row: RowId, title: String },
-    DeferredWithNoLandingPrompt { row: RowId, title: String },
+    CoveredWithNoCdc {
+        row: RowId,
+        title: String,
+    },
+    DeferredWithNoLandingPrompt {
+        row: RowId,
+        title: String,
+    },
 }
 
 impl fmt::Display for CoverageError {
@@ -706,11 +716,7 @@ landing = \"P-070\"\n";
                 cdc: vec!["empty.rs".into()],
             },
         }];
-        let cdc = FakeCdc(
-            [("empty.rs", "fn helper() {}")]
-                .into_iter()
-                .collect(),
-        );
+        let cdc = FakeCdc([("empty.rs", "fn helper() {}")].into_iter().collect());
         let report = scan(&rows(&["1.1"]), &manifest, &cdc);
         assert!(!report.is_green());
         assert!(matches!(

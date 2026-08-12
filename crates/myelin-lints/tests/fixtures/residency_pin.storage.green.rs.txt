@@ -1,7 +1,0 @@
-// GREEN fixture for `residency-pin` — the STORAGE-relevant slice (P-ST-04 / P-020). The lint MUST
-// admit this. A caller opens the real `myelin-storage` OLTP store with its `Region` PINNED on the
-// same construction statement — no global pool; the data stays inside its residency boundary
-// (ADR-11). This is the region-pinned write the lint admits.
-pub async fn open_tenant_store(config: OltpConfig, region: Region, minter: Arc<dyn IdMinter>) -> ColocatedOltp {
-    ColocatedOltp::open(config.region(region), minter).unwrap()
-}

@@ -44,7 +44,6 @@ myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
 myelin-knowledge = { path = ".", features = ["test-support"] }
 myelin-harness = { path = "../myelin-harness" }
-myelin-lints = { path = "../myelin-lints" }
 myelin-identity-service = { path = "../myelin-identity-service", features = ["test-support"] }
 myelin-agent-service = { path = "../myelin-agent-service" }
 myelin-agent = { path = "../myelin-agent" }

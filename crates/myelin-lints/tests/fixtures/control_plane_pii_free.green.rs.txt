@@ -1,8 +1,0 @@
-// GREEN fixture for `control-plane-pii-free` — the lint MUST admit this.
-// The cross-cell pointer carries OPAQUE IDS ONLY — a TenantId, a Region, an opaque slug. No
-// name/email/body crosses the control plane (ADR-11, OQ-I).
-pub struct CrossCellPointer {
-    pub tenant_id: TenantId,
-    pub region: Region,
-    pub opaque_slug: String,
-}

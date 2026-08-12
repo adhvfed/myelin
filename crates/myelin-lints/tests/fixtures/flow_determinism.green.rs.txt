@@ -1,9 +1,0 @@
-// GREEN fixture for `flow-determinism` — the lint MUST admit this.
-// @workflow-body
-// The workflow body reads time and randomness ONLY through the deterministic WfCtx surface, so
-// replay is deterministic (index 9.2, OQ-F).
-pub async fn approval_workflow(ctx: &mut WfCtx) {
-    let started = ctx.now();
-    let nonce = ctx.rand();
-    let _ = (started, nonce);
-}

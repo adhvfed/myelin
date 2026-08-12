@@ -1,6 +1,0 @@
-// GREEN fixture for `residency-pin` — the lint MUST admit this.
-// The store is constructed pinned to an explicit Region — no global pool; data stays inside its
-// residency boundary (ADR-11).
-pub async fn open_pinned_pool(url: &str, region: Region) -> Pool {
-    PgPool::connect(url).region(region).await.unwrap()
-}

@@ -33,7 +33,6 @@ zeroize = "1"
 [dev-dependencies]
 myelin-flow = { path = ".", features = ["test-support"] }
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
-myelin-lints = { path = "../myelin-lints" }
 myelin-identity = { path = "../myelin-identity" }
 myelin-harness = { path = "../myelin-harness" }
 myelin-events = { path = "../myelin-events", features = ["test-support"] }

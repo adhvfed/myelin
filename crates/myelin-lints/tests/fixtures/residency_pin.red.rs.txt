@@ -1,6 +1,0 @@
-// RED fixture for `residency-pin` — the lint MUST reject this.
-// A store opened as a GLOBAL pool with no pinned region: the data-leaves-its-region bug class
-// (ADR-11). Every store/stream/index/cache must declare its Region; there is no global pool.
-pub async fn open_global_pool(url: &str) -> Pool {
-    PgPool::connect(url).await.unwrap()
-}

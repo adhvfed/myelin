@@ -1,9 +1,0 @@
--- GREEN fixture for `forward-only-migration` — the STORAGE-relevant slice (P-ST-04 / P-020). The
--- lint MUST admit this. The SAME column change expressed as the online expand->backfill->contract
--- shape the storage migration runner (P-ST-05) admits: a NULLABLE column add (no blocking lock),
--- a concurrent index build, then a later forward migration backfills + constrains. There is no
--- reverse/rollback step (a rollback would be a NEW forward migration) and no in-place rewrite
--- (STOR-2, §9).
-ALTER TABLE principals ADD COLUMN email_v2 TEXT;
-CREATE INDEX CONCURRENTLY idx_principals_email_v2 ON principals (email_v2);
-UPDATE principals SET email_v2 = email WHERE email_v2 IS NULL;

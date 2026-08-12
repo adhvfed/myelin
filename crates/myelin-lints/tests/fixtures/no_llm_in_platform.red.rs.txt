@@ -1,8 +1,0 @@
-// RED fixture for `no-llm-in-platform` — the lint MUST reject this.
-// Platform code imports an LLM SDK and hard-codes a model name + prompt: the runtime must live
-// behind the AgentRuntime strategy seam so the platform is provider-agnostic (ADR-08.2, VISION 3).
-pub async fn call_model(input: &str) -> String {
-    let client = openai::Client::new(api_key());
-    let system_prompt = "You are a helpful assistant";
-    client.chat_completion(system_prompt, input).await
-}

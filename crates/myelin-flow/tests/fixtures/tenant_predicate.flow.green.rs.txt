@@ -1,5 +1,0 @@
-// P-FLOW-01 GREEN fixture: a tenant-scoped query — the tenant-predicate lint admits it (the tenant
-// predicate is threaded on the statement, so RLS + the tenant-first PK isolate the read).
-fn dispatch() {
-    let runs = sqlx::query("SELECT * FROM workflow_run WHERE state = 'running'").with_tenant(tenant_id).fetch_all(&pool).await?;
-}

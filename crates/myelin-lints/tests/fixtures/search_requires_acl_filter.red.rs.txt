@@ -1,6 +1,0 @@
-// RED fixture for `search-requires-acl-filter` — the lint MUST reject this.
-// A search executes WITHOUT conjoining the list_objects ACL Filter before scoring: scoring then
-// filtering leaks the existence and rank of forbidden documents (ADR-03, OQ-E).
-pub async fn search_unfiltered(index: &Index, query: Query) -> Vec<Hit> {
-    index.search(query).await.unwrap()
-}

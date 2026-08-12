@@ -44,7 +44,6 @@ myelin-identity-service = { path = "../myelin-identity-service", features = ["te
 myelin-events = { path = "../myelin-events", features = ["test-support"] }
 myelin-storage = { path = "../myelin-storage", features = ["test-support"] }
 myelin-ci-sandbox = { path = "../myelin-ci-sandbox", features = ["test-support"] }
-myelin-lints = { path = "../myelin-lints" }
 myelin-git = { path = "../myelin-git" }
 myelin-notif = { path = "../myelin-notif" }
 myelin-harness = { path = "../myelin-harness" }

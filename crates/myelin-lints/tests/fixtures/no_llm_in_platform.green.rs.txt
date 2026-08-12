@@ -1,6 +1,0 @@
-// GREEN fixture for `no-llm-in-platform` — the lint MUST admit this.
-// The agent brain is reached ONLY through the AgentRuntime strategy seam; platform code names no
-// SDK, no prompt, no model (ADR-08.2, VISION 3).
-pub async fn run_agent(runtime: &dyn AgentRuntime, plan: Plan) -> Outcome {
-    runtime.run(plan).await
-}

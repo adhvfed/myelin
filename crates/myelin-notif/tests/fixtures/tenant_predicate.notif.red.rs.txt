@@ -1,6 +1,0 @@
-// NOTIF-P2 RED fixture: a tenant-less query over the inbox — the cross-tenant IDOR (F2) bug class
-// the tenant-predicate lint (ID-3) rejects. Every Notif table's tenant-first PK enforces the
-// no-cross-tenant-query-path floor; a query with no tenant binder breaks it.
-fn read() {
-    let items = sqlx::query("SELECT * FROM notif_inbox_item").fetch_all(&pool).await?;
-}

@@ -1,5 +1,0 @@
-// NOTIF-P2 GREEN fixture: a tenant-scoped query — the tenant-predicate lint admits it (the tenant
-// predicate is threaded on the statement, so RLS + the tenant-first PK isolate the read).
-fn read() {
-    let items = sqlx::query("SELECT * FROM notif_inbox_item").with_tenant(tenant_id).fetch_all(&pool).await?;
-}

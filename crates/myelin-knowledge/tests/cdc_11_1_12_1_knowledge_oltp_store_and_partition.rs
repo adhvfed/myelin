@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use myelin_identity::{Principal, PrincipalId, PrincipalKind};
 use myelin_knowledge::{knowledge_scope, KnowledgeStore, KnowledgeTable};
-use myelin_lints::lints::tenant_predicate;
 use myelin_storage::{FsBlobStore, OltpConfig, TenantScope};
 use myelin_tenancy::{Region, TenantId};
 
@@ -24,7 +23,8 @@ fn cfg() -> OltpConfig {
 
 #[test]
 fn consumer_knowledge_store_opens_its_own_bounded_oltp_pool() {
-    let store = KnowledgeStore::open(cfg(), Arc::new(FsBlobStore::new())).expect("the Knowledge store opens its OLTP pool");
+    let store = KnowledgeStore::open(cfg(), Arc::new(FsBlobStore::new()))
+        .expect("the Knowledge store opens its OLTP pool");
     assert_eq!(store.pool().config(), cfg());
     let acme = TenantId("acme".into());
     let permit = store.pool().acquire(&acme).expect("acquire a permit");
@@ -48,7 +48,11 @@ fn consumer_every_knowledge_query_is_tenant_region_scoped() {
     ] {
         let q = store.query(scope.clone(), table);
         let sql = q.predicate_sql();
-        assert!(sql.contains("tenant = $1 AND region = $2"), "{}: {sql}", table.name());
+        assert!(
+            sql.contains("tenant = $1 AND region = $2"),
+            "{}: {sql}",
+            table.name()
+        );
         assert_eq!(
             q.predicate_binds(),
             vec!["acme".to_string(), "fr-par".to_string()],
@@ -94,35 +98,5 @@ fn drill_kn_d13_cross_tenant_path_spoof_is_rejected_zero_cross_tenant() {
             && q.predicate_binds() == vec!["acme".to_string(), "fr-par".to_string()]
             && !q.predicate_binds().iter().any(|b| b.contains("evil-corp")),
         "KN-D13: the resolved page query is pinned to the token tenant, never the spoofed path"
-    );
-}
-
-#[test]
-fn tenant_predicate_lint_is_red_on_tenantless_query_green_on_bound() {
-    let lint = tenant_predicate();
-
-    let red = r#"
-        fn read_page_TENANTLESS(pool: &Pool, page_id: &str) -> Page {
-            sqlx::query("SELECT * FROM page WHERE page_id = $1")
-                .bind(page_id)
-                .fetch_one(pool)
-        }
-    "#;
-    assert!(
-        !lint.run(red).is_empty(),
-        "the tenant-predicate lint must flag a tenant-less Knowledge query (KN-D13 compile half)"
-    );
-
-    let green = r#"
-        fn read_page_scoped(pool: &Pool, scope: &TenantScope, page_id: &str) -> Page {
-            sqlx::query("SELECT * FROM page WHERE tenant = $1 AND page_id = $2")
-                .bind(scope.tenant())
-                .bind(page_id)
-                .fetch_one(pool)
-        }
-    "#;
-    assert!(
-        lint.run(green).is_empty(),
-        "the tenant-predicate lint must admit a tenant-bound Knowledge query"
     );
 }

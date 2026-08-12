@@ -1,9 +1,0 @@
-// GREEN fixture for `no-cross-db` — the lint MUST admit this.
-// Depending on a sibling service's CONTRACT surface (its public types, traits, ids) is allowed;
-// it is the frozen glue-crate coupling, not a reach into the data layer.
-use myelin_identity::PrincipalId;
-use myelin_identity::CheckRequest;
-
-pub fn build_request(id: PrincipalId) -> CheckRequest {
-    CheckRequest::for_principal(id)
-}

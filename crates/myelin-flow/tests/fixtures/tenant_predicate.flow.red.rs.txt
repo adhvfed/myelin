@@ -1,6 +1,0 @@
-// P-FLOW-01 RED fixture: a tenant-less query over the workflow journal — the cross-tenant IDOR (F2)
-// bug class the tenant-predicate lint (ID-3) rejects. Every flow table's tenant-first PK enforces
-// the no-cross-tenant-query-path floor; a query with no tenant binder breaks it.
-fn dispatch() {
-    let runs = sqlx::query("SELECT * FROM workflow_run WHERE state = 'running'").fetch_all(&pool).await?;
-}

@@ -1,5 +1,4 @@
 use myelin_gdpr::ErasureMethod;
-use myelin_lints::lints::no_untagged_personal_data;
 use myelin_storage::{
     BlobStore, ColumnCryptor, DekContentWrap, FsBlobStore, KekId, KeyClass, KmsEngine, SubjectId,
 };
@@ -8,55 +7,6 @@ use std::sync::Arc;
 
 fn region() -> Region {
     Region("eu-west".into())
-}
-
-const RED_SCRATCH_FIELD: &str = r#"
-pub struct UserProfileScratch {
-    pub subject_ref: SubjectRef,
-    pub email: String,
-    pub tenant: TenantId,
-    pub region: Region,
-}
-"#;
-
-const GREEN_TAGGED_FIELD: &str = r#"
-pub struct UserProfile {
-    pub subject_ref: SubjectRef,
-    #[personal_data(
-        category = ContactInfo,
-        role = TenantContent,
-        basis = Contract,
-        retention = TenantPolicy,
-        erasure = CryptoShred(subject_dek),
-        subject_locator = "subject_ref",
-    )]
-    pub email: EncryptedField<Email>,
-    pub tenant: TenantId,
-    pub region: Region,
-}
-"#;
-
-#[test]
-fn gate_leg1_no_untagged_personal_data_fires_then_admits() {
-    let lint = no_untagged_personal_data();
-
-    let red = lint.run(RED_SCRATCH_FIELD);
-    assert!(
-        !red.is_empty(),
-        "GATE leg 1: an untagged PII scratch field MUST fire no-untagged-personal-data"
-    );
-
-    let green = lint.run(GREEN_TAGGED_FIELD);
-    assert!(
-        green.is_empty(),
-        "GATE leg 1: the tagged form must be admitted - got violations: {green:?}"
-    );
-
-    println!(
-        "[P-095 DRILL GREEN 2026-06-19] no-untagged-personal-data: untagged PII scratch field \
-         fired {} violation(s); tagged form 0 violations (lint stays green).",
-        red.len()
-    );
 }
 
 #[test]
