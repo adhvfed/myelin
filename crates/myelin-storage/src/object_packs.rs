@@ -140,8 +140,8 @@ pub fn place_repo_object_backed<B: BlobStore>(
     tier: &GitPackTier<ReplicatedBlobStore<B>>,
     repo: RepoId,
     placement: RepoGitPlacement,
-) {
-    tier.place_repo(repo, placement);
+) -> Result<(), GitPackError> {
+    tier.place_repo(repo, placement)
 }
 
 #[cfg(test)]
@@ -169,7 +169,8 @@ mod tests {
                 region: Region::new("fr-par"),
                 status: RepoPlacementStatus::Active,
             },
-        );
+        )
+        .expect("place object-tier test repository");
         (tier, repo)
     }
 
@@ -203,7 +204,10 @@ mod tests {
             .put_object(&repo, GitObjectKind::Blob, content)
             .expect("put through object tier");
 
-        let native = tier.native_addr_for_test(&repo, &address).expect("linked");
+        let native = tier
+            .native_addr_for_test(&repo, &address)
+            .expect("object index state")
+            .expect("linked");
         assert!(
             tier.blobs()
                 .corrupt_primary_for_drill(tier.tenant(), &native),
@@ -231,7 +235,10 @@ mod tests {
         let address = tier
             .put_object(&repo, GitObjectKind::Blob, content)
             .expect("put");
-        let native = tier.native_addr_for_test(&repo, &address).expect("linked");
+        let native = tier
+            .native_addr_for_test(&repo, &address)
+            .expect("object index state")
+            .expect("linked");
         assert!(tier.blobs().corrupt_all_for_drill(tier.tenant(), &native));
 
         match tier.get_object(&repo, &address) {

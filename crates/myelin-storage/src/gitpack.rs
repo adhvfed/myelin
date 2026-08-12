@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use myelin_tenancy::{Region, TenantId};
 
@@ -74,6 +74,8 @@ impl RepoId {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GitPackError {
     RepoNotPlaced { repo: RepoId },
+    StateUnavailable { state: &'static str },
+    GenerationExhausted,
     Blob(BlobError),
     Placement(PlacementError),
     ReadLimitExceeded { actual: usize, maximum: usize },
@@ -97,6 +99,12 @@ impl std::fmt::Display for GitPackError {
                  unregistered repo)",
                 repo.as_str()
             ),
+            GitPackError::StateUnavailable { state } => {
+                write!(f, "git pack tier {state} state is unavailable")
+            }
+            GitPackError::GenerationExhausted => {
+                f.write_str("git pack object generation is exhausted")
+            }
             GitPackError::Blob(e) => write!(f, "git pack tier blob error: {e}"),
             GitPackError::Placement(e) => write!(f, "git pack placement rejected: {e}"),
             GitPackError::ReadLimitExceeded { actual, maximum } => write!(
@@ -147,8 +155,13 @@ pub struct PackManifest {
 pub struct GitPackTier<B: BlobStore> {
     tenant: TenantId,
     blobs: B,
-    placements: Mutex<HashMap<RepoId, RepoGitPlacement>>,
-    sha_index: Mutex<HashMap<(RepoId, ContentHash), ContentHash>>,
+    state: Mutex<GitPackState>,
+}
+
+#[derive(Default)]
+struct GitPackState {
+    placements: HashMap<RepoId, RepoGitPlacement>,
+    sha_index: HashMap<(RepoId, ContentHash), ContentHash>,
 }
 
 impl<B: BlobStore> GitPackTier<B> {
@@ -156,8 +169,7 @@ impl<B: BlobStore> GitPackTier<B> {
         GitPackTier {
             tenant,
             blobs,
-            placements: Mutex::new(HashMap::new()),
-            sha_index: Mutex::new(HashMap::new()),
+            state: Mutex::new(GitPackState::default()),
         }
     }
 
@@ -169,19 +181,17 @@ impl<B: BlobStore> GitPackTier<B> {
         &self.blobs
     }
 
-    pub fn place_repo(&self, repo: RepoId, placement: RepoGitPlacement) {
-        self.placements
-            .lock()
-            .expect("placement mutex")
-            .insert(repo, placement);
+    pub fn place_repo(
+        &self,
+        repo: RepoId,
+        placement: RepoGitPlacement,
+    ) -> Result<(), GitPackError> {
+        self.state()?.placements.insert(repo, placement);
+        Ok(())
     }
 
-    pub fn placement_of(&self, repo: &RepoId) -> Option<RepoGitPlacement> {
-        self.placements
-            .lock()
-            .expect("placement mutex")
-            .get(repo)
-            .cloned()
+    pub fn placement_of(&self, repo: &RepoId) -> Result<Option<RepoGitPlacement>, GitPackError> {
+        Ok(self.state()?.placements.get(repo).cloned())
     }
 
     pub fn relocate(
@@ -190,8 +200,9 @@ impl<B: BlobStore> GitPackTier<B> {
         target_group: StorageGroup,
         target_region: &Region,
     ) -> Result<(), GitPackError> {
-        let mut placements = self.placements.lock().expect("placement mutex");
-        let placement = placements
+        let mut state = self.state()?;
+        let placement = state
+            .placements
             .get_mut(repo)
             .ok_or_else(|| GitPackError::RepoNotPlaced { repo: repo.clone() })?;
         if target_region != &placement.region {
@@ -215,7 +226,7 @@ impl<B: BlobStore> GitPackTier<B> {
         let address = git_object_address(kind, content);
         let framed = frame_git_object(kind, content);
         let native = self.blobs.put(&self.tenant, &framed)?;
-        self.link_sha_to_native(repo, &address, &native);
+        self.link_sha_to_native(repo, &address, &native)?;
         Ok(address)
     }
 
@@ -303,31 +314,35 @@ impl<B: BlobStore> GitPackTier<B> {
     }
 
     fn require_placed(&self, repo: &RepoId) -> Result<(), GitPackError> {
-        if self
-            .placements
-            .lock()
-            .expect("placement mutex")
-            .contains_key(repo)
-        {
+        if self.state()?.placements.contains_key(repo) {
             Ok(())
         } else {
             Err(GitPackError::RepoNotPlaced { repo: repo.clone() })
         }
     }
 
-    fn link_sha_to_native(&self, repo: &RepoId, sha: &ContentHash, native: &ContentHash) {
-        self.sha_index
-            .lock()
-            .expect("sha index mutex")
+    fn link_sha_to_native(
+        &self,
+        repo: &RepoId,
+        sha: &ContentHash,
+        native: &ContentHash,
+    ) -> Result<(), GitPackError> {
+        self.state()?
+            .sha_index
             .insert((repo.clone(), sha.clone()), native.clone());
+        Ok(())
     }
 
-    fn native_for_sha(&self, repo: &RepoId, sha: &ContentHash) -> Option<ContentHash> {
-        self.sha_index
-            .lock()
-            .expect("sha index mutex")
+    fn native_for_sha(
+        &self,
+        repo: &RepoId,
+        sha: &ContentHash,
+    ) -> Result<Option<ContentHash>, GitPackError> {
+        Ok(self
+            .state()?
+            .sha_index
             .get(&(repo.clone(), sha.clone()))
-            .cloned()
+            .cloned())
     }
 
     fn object_native_address_and_stored_len(
@@ -336,7 +351,7 @@ impl<B: BlobStore> GitPackTier<B> {
         address: &ContentHash,
     ) -> Result<(ContentHash, usize), GitPackError> {
         self.require_placed(repo)?;
-        let native = self.native_for_sha(repo, address).ok_or_else(|| {
+        let native = self.native_for_sha(repo, address)?.ok_or_else(|| {
             GitPackError::Blob(BlobError::NotFound {
                 tenant: self.tenant.clone(),
                 hash: address.clone(),
@@ -347,8 +362,20 @@ impl<B: BlobStore> GitPackTier<B> {
     }
 
     #[doc(hidden)]
-    pub fn native_addr_for_test(&self, repo: &RepoId, sha: &ContentHash) -> Option<ContentHash> {
+    pub fn native_addr_for_test(
+        &self,
+        repo: &RepoId,
+        sha: &ContentHash,
+    ) -> Result<Option<ContentHash>, GitPackError> {
         self.native_for_sha(repo, sha)
+    }
+
+    fn state(&self) -> Result<MutexGuard<'_, GitPackState>, GitPackError> {
+        self.state
+            .lock()
+            .map_err(|_| GitPackError::StateUnavailable {
+                state: "placement and object index",
+            })
     }
 }
 
@@ -388,7 +415,8 @@ mod tests {
                 region: Region::new("eu-west"),
                 status: RepoPlacementStatus::Active,
             },
-        );
+        )
+        .expect("place test repository");
         (tier, repo)
     }
 
@@ -437,11 +465,17 @@ mod tests {
     #[test]
     fn placement_of_returns_region_pinned_relocatable_placement() {
         let (tier, repo) = placed_tier();
-        let p = tier.placement_of(&repo).expect("placed");
+        let p = tier
+            .placement_of(&repo)
+            .expect("placement state")
+            .expect("placed");
         assert_eq!(p.group.as_str(), "pack-0");
         assert_eq!(p.region.as_str(), "eu-west");
         assert_eq!(p.status, RepoPlacementStatus::Active);
-        assert!(tier.placement_of(&RepoId::from_token("ghost")).is_none());
+        assert!(tier
+            .placement_of(&RepoId::from_token("ghost"))
+            .expect("placement state")
+            .is_none());
     }
 
     #[test]
@@ -459,7 +493,7 @@ mod tests {
         )
         .expect("a same-region relocation is admitted");
 
-        let p = tier.placement_of(&repo).unwrap();
+        let p = tier.placement_of(&repo).unwrap().unwrap();
         assert_eq!(p.group.as_str(), "pack-7", "only the stored group flipped");
         assert_eq!(
             p.region.as_str(),
@@ -497,7 +531,7 @@ mod tests {
             ),
             "{e}"
         );
-        let p = tier.placement_of(&repo).unwrap();
+        let p = tier.placement_of(&repo).unwrap().unwrap();
         assert_eq!(
             p.group.as_str(),
             "pack-0",
@@ -517,7 +551,10 @@ mod tests {
         assert_eq!(tier.get_object(&repo, &address).expect("clean"), content);
         assert_eq!(tier.blobs().telemetry().blob_integrity_fail(), 0);
 
-        let native = tier.native_for_sha(&repo, &address).expect("linked");
+        let native = tier
+            .native_for_sha(&repo, &address)
+            .expect("object index state")
+            .expect("linked");
         assert!(
             tier.blobs().corrupt_for_drill(&tenant(), &native),
             "object present to corrupt"
@@ -539,14 +576,16 @@ mod tests {
     fn corrupt_primary_recovers_from_replica() {
         let (primary, repo) = placed_tier();
         let replica = GitPackTier::new(tenant(), FsBlobStore::new());
-        replica.place_repo(
-            repo.clone(),
-            RepoGitPlacement {
-                group: StorageGroup::from_token("pack-0"),
-                region: Region::new("eu-west"),
-                status: RepoPlacementStatus::Active,
-            },
-        );
+        replica
+            .place_repo(
+                repo.clone(),
+                RepoGitPlacement {
+                    group: StorageGroup::from_token("pack-0"),
+                    region: Region::new("eu-west"),
+                    status: RepoPlacementStatus::Active,
+                },
+            )
+            .expect("place replica repository");
 
         let content = b"the authoritative object bytes";
         let address = primary
@@ -560,7 +599,7 @@ mod tests {
             "the same content has the same address on both backings"
         );
 
-        let native = primary.native_for_sha(&repo, &address).unwrap();
+        let native = primary.native_for_sha(&repo, &address).unwrap().unwrap();
         assert!(primary.blobs().corrupt_for_drill(&tenant(), &native));
 
         let recovered = primary
@@ -590,6 +629,29 @@ mod tests {
             tier.get_object(&ghost, &addr),
             Err(GitPackError::RepoNotPlaced { .. })
         ));
+    }
+
+    #[test]
+    fn unavailable_pack_state_is_not_reported_as_an_unplaced_repository() {
+        let (tier, repo) = placed_tier();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = tier.state.lock().unwrap();
+            panic!("poison the test pack state");
+        }));
+
+        assert_eq!(
+            tier.placement_of(&repo).unwrap_err(),
+            GitPackError::StateUnavailable {
+                state: "placement and object index",
+            }
+        );
+        assert_eq!(
+            tier.put_object(&repo, GitObjectKind::Blob, b"never written")
+                .unwrap_err(),
+            GitPackError::StateUnavailable {
+                state: "placement and object index",
+            }
+        );
     }
 
     #[test]

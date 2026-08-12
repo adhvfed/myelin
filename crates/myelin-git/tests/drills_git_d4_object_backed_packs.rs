@@ -20,6 +20,7 @@ fn object_backed_db(
         FsBlobStore::new(),
         vec![FsBlobStore::new(), FsBlobStore::new()],
     )
+    .expect("place object-backed drill repository")
 }
 
 #[test]
@@ -63,14 +64,17 @@ fn git_d4_acceleration_artifacts_ride_the_object_tier() {
     db.put_object(GitObjectKind::Commit, &Oid::new("tip-0"), b"commit bytes")
         .expect("put");
     for k in AccelKind::all() {
-        assert!(db.is_stale(k), "a missing {k:?} is stale (must be built)");
+        assert!(
+            db.is_stale(k).unwrap(),
+            "a missing {k:?} is stale (must be built)"
+        );
     }
 
     db.run_maintenance(|kind| format!("{kind:?}-on-object-tier").into_bytes())
         .expect("maintenance on the object tier");
     for k in AccelKind::all() {
         assert!(
-            !db.is_stale(k),
+            !db.is_stale(k).unwrap(),
             "after maintenance {k:?} is fresh on the object tier"
         );
     }

@@ -50,7 +50,8 @@ fn placed_object_tier() -> (GitPackTier<ReplicatedBlobStore<FsBlobStore>>, RepoI
             region: Region::new("fr-par"),
             status: RepoPlacementStatus::Active,
         },
-    );
+    )
+    .expect("place object-tier drill repository");
     (tier, repo)
 }
 
@@ -103,7 +104,10 @@ fn stor_d7_object_backed_packs_recover_corrupt_primary_from_replica() {
     assert_eq!(tier.get_object(&repo, &address).expect("clean"), content);
     assert_eq!(tier.blobs().telemetry().blob_recovered_from_replica(), 0);
 
-    let native = tier.native_addr_for_test(&repo, &address).expect("linked");
+    let native = tier
+        .native_addr_for_test(&repo, &address)
+        .expect("object index state")
+        .expect("linked");
     assert!(
         tier.blobs()
             .corrupt_primary_for_drill(tier.tenant(), &native),
@@ -131,7 +135,10 @@ fn stor_d7_object_backed_packs_all_copies_corrupt_is_refused() {
     let address = tier
         .put_object(&repo, GitObjectKind::Blob, content)
         .expect("put");
-    let native = tier.native_addr_for_test(&repo, &address).expect("linked");
+    let native = tier
+        .native_addr_for_test(&repo, &address)
+        .expect("object index state")
+        .expect("linked");
     assert!(tier.blobs().corrupt_all_for_drill(tier.tenant(), &native));
 
     match tier.get_object(&repo, &address) {
@@ -161,19 +168,24 @@ fn the_object_backed_tier_is_the_same_consumer_surface_backing_swap() {
         content
     );
     assert!(
-        object_tier.placement_of(&repo).is_some(),
+        object_tier
+            .placement_of(&repo)
+            .expect("placement state")
+            .is_some(),
         "placement_of is region-pinned + relocatable on the object backing"
     );
 
     let floor = GitPackTier::new(TenantId("acme".into()), FsBlobStore::new());
-    floor.place_repo(
-        repo.clone(),
-        RepoGitPlacement {
-            group: StorageGroup::from_token("pack-0"),
-            region: Region::new("fr-par"),
-            status: RepoPlacementStatus::Active,
-        },
-    );
+    floor
+        .place_repo(
+            repo.clone(),
+            RepoGitPlacement {
+                group: StorageGroup::from_token("pack-0"),
+                region: Region::new("fr-par"),
+                status: RepoPlacementStatus::Active,
+            },
+        )
+        .expect("place filesystem-floor repository");
     let floor_addr = floor
         .put_object(&repo, GitObjectKind::Commit, content)
         .expect("put_object (local-disk floor)");

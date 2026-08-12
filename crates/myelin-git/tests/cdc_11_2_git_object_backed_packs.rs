@@ -22,6 +22,7 @@ fn boot() -> PackObjectDb<ReplicatedBlobStore<FsBlobStore>> {
         FsBlobStore::new(),
         vec![FsBlobStore::new(), FsBlobStore::new()],
     )
+    .expect("place object-backed consumer repository")
 }
 
 #[test]

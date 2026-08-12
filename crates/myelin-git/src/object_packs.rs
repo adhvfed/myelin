@@ -13,10 +13,10 @@ pub fn object_backed_object_db<B: BlobStore>(
     placement: RepoGitPlacement,
     primary: B,
     replicas: Vec<B>,
-) -> PackObjectDb<myelin_storage::ReplicatedBlobStore<B>> {
+) -> Result<PackObjectDb<myelin_storage::ReplicatedBlobStore<B>>, GitPackError> {
     let tier = object_backed_pack_tier(tenant, primary, replicas);
-    place_repo_object_backed(&tier, repo.clone(), placement);
-    PackObjectDb::new(tier, repo)
+    place_repo_object_backed(&tier, repo.clone(), placement)?;
+    Ok(PackObjectDb::new(tier, repo))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +119,7 @@ mod tests {
             FsBlobStore::new(),
             vec![FsBlobStore::new(), FsBlobStore::new()],
         )
+        .expect("place object-backed repository")
     }
 
     #[test]
@@ -213,6 +214,7 @@ mod tests {
         let native = db
             .tier()
             .native_addr_for_test(db.repo(), &address)
+            .expect("object index state")
             .expect("linked");
         assert!(db
             .tier()
@@ -236,6 +238,7 @@ mod tests {
         let native = db
             .tier()
             .native_addr_for_test(db.repo(), &address)
+            .expect("object index state")
             .expect("linked");
         assert!(db
             .tier()

@@ -18,7 +18,8 @@ fn boot(tenant: &str, region: &str, repo: &str) -> PackObjectDb<FsBlobStore> {
             region: Region::new(region),
             status: RepoPlacementStatus::Active,
         },
-    );
+    )
+    .expect("place consumer test repository");
     PackObjectDb::new(tier, repo)
 }
 
@@ -32,7 +33,7 @@ fn git_consumer_persists_and_resolves_objects_through_the_trait() {
         .expect("put through the pack tier");
 
     assert!(address.to_multihash_string().starts_with("sha256:"));
-    assert_eq!(db.address_of(&oid), Some(address));
+    assert_eq!(db.address_of(&oid).unwrap(), Some(address));
     assert_eq!(db.read_object(&oid).expect("read"), content);
 }
 
@@ -69,7 +70,7 @@ fn receive_pack_migration_round_trips_byte_identical_through_the_consumer() {
 #[test]
 fn consumer_placement_is_region_pinned_relocatable_never_node_pinned() {
     let db = boot("acme", "fr-par", "web");
-    let placement = db.placement().expect("placed");
+    let placement = db.placement().expect("placement state").expect("placed");
     assert!(assert_relocatable_never_node_pinned(&placement).is_ok());
 
     let oid = Oid::new("deadc0de");
@@ -88,7 +89,7 @@ fn consumer_placement_is_region_pinned_relocatable_never_node_pinned() {
         .expect("same-region relocation admitted");
 
     assert_eq!(
-        db.address_of(&oid),
+        db.address_of(&oid).unwrap(),
         Some(addr_before),
         "relocation does not re-address an object"
     );

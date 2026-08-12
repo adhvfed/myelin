@@ -233,7 +233,8 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
                     region: Region::new(&cfg.s3.region),
                     status: RepoPlacementStatus::Active,
                 },
-            );
+            )
+            .expect("place S3-backed test repository");
             let address = tier
                 .put_object(&repo, GitObjectKind::Blob, &content)
                 .expect("put object");
@@ -245,6 +246,7 @@ async fn git_pack_tier_over_real_object_store_roundtrips_and_detects_corruption(
 
             let native = tier
                 .native_addr_for_test(&repo, &address)
+                .expect("object index state")
                 .expect("native addr");
             let dh = &native.digest_hex;
             let (fan, rest) = dh.split_at(2);
@@ -454,7 +456,8 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
                     region: Region::new(&primary_s3.region),
                     status: RepoPlacementStatus::Active,
                 },
-            );
+            )
+            .expect("place replicated S3 test repository");
 
             let address = tier
                 .put_object(&repo, GitObjectKind::Blob, &content)
@@ -467,6 +470,7 @@ async fn object_backed_git_packs_over_real_object_store_recover_corrupt_primary(
 
             let native = tier
                 .native_addr_for_test(&repo, &address)
+                .expect("object index state")
                 .expect("native addr");
             let dh = &native.digest_hex;
             let (fan, rest) = dh.split_at(2);

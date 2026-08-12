@@ -20,7 +20,8 @@ impl GitObjectStore {
                 region: Region::new(region),
                 status: RepoPlacementStatus::Active,
             },
-        );
+        )
+        .expect("place git-pack test repository");
         GitObjectStore { tier, repo }
     }
 

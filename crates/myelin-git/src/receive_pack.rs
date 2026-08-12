@@ -2762,7 +2762,8 @@ mod tests {
                 region: Region::new("fr-par"),
                 status: RepoPlacementStatus::Active,
             },
-        );
+        )
+        .expect("place receive-pack test repository");
         let object_db = PackObjectDb::new(tier, repo);
         let migration = PackTierMigration::new(&object_db);
 

@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use myelin_storage::{
     BlobStore, ContentHash, GitObjectKind, GitPackError, GitPackTier, RepoGitPlacement, RepoId,
@@ -10,12 +10,6 @@ use crate::receive_pack::{Oid, QuarantineMigration, QuarantineObject};
 
 const CLONE_MAX_TIPS: usize = 100_000;
 const CLONE_MAX_TOTAL_STORED_BYTES: usize = 1024 * 1024 * 1024;
-
-fn lock_state<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AccelKind {
@@ -47,9 +41,14 @@ pub struct AccelArtifact {
 pub struct PackObjectDb<B: BlobStore> {
     tier: GitPackTier<B>,
     repo: RepoId,
-    oid_index: Mutex<BTreeMap<String, ContentHash>>,
-    generation: Mutex<u64>,
-    accel: Mutex<BTreeMap<AccelKind, AccelArtifact>>,
+    state: Mutex<PackObjectState>,
+}
+
+#[derive(Default)]
+struct PackObjectState {
+    oid_index: BTreeMap<String, ContentHash>,
+    generation: u64,
+    accel: BTreeMap<AccelKind, AccelArtifact>,
 }
 
 impl<B: BlobStore> PackObjectDb<B> {
@@ -57,9 +56,7 @@ impl<B: BlobStore> PackObjectDb<B> {
         Self {
             tier,
             repo,
-            oid_index: Mutex::new(BTreeMap::new()),
-            generation: Mutex::new(0),
-            accel: Mutex::new(BTreeMap::new()),
+            state: Mutex::new(PackObjectState::default()),
         }
     }
 
@@ -71,12 +68,12 @@ impl<B: BlobStore> PackObjectDb<B> {
         &self.repo
     }
 
-    pub fn placement(&self) -> Option<RepoGitPlacement> {
+    pub fn placement(&self) -> Result<Option<RepoGitPlacement>, GitPackError> {
         self.tier.placement_of(&self.repo)
     }
 
-    pub fn generation(&self) -> u64 {
-        *lock_state(&self.generation)
+    pub fn generation(&self) -> Result<u64, GitPackError> {
+        Ok(self.state()?.generation)
     }
 
     pub fn put_object(
@@ -86,8 +83,13 @@ impl<B: BlobStore> PackObjectDb<B> {
         content: &[u8],
     ) -> Result<ContentHash, GitPackError> {
         let address = self.tier.put_object(&self.repo, kind, content)?;
-        lock_state(&self.oid_index).insert(oid.0.clone(), address.clone());
-        *lock_state(&self.generation) += 1;
+        let mut state = self.state()?;
+        let next_generation = state
+            .generation
+            .checked_add(1)
+            .ok_or(GitPackError::GenerationExhausted)?;
+        state.oid_index.insert(oid.0.clone(), address.clone());
+        state.generation = next_generation;
         Ok(address)
     }
 
@@ -101,7 +103,7 @@ impl<B: BlobStore> PackObjectDb<B> {
         maximum_stored_bytes: usize,
     ) -> Result<Vec<u8>, GitPackError> {
         let address = self
-            .address_of(oid)
+            .address_of(oid)?
             .ok_or_else(|| GitPackError::RepoNotPlaced {
                 repo: self.repo.clone(),
             })?;
@@ -109,8 +111,8 @@ impl<B: BlobStore> PackObjectDb<B> {
             .get_object_bounded(&self.repo, &address, maximum_stored_bytes)
     }
 
-    pub fn address_of(&self, oid: &Oid) -> Option<ContentHash> {
-        lock_state(&self.oid_index).get(&oid.0).cloned()
+    pub fn address_of(&self, oid: &Oid) -> Result<Option<ContentHash>, GitPackError> {
+        Ok(self.state()?.oid_index.get(&oid.0).cloned())
     }
 
     pub fn record_maintenance(
@@ -119,11 +121,12 @@ impl<B: BlobStore> PackObjectDb<B> {
         artifact_bytes: &[u8],
     ) -> Result<AccelArtifact, GitPackError> {
         let manifest = self.tier.put_pack(&self.repo, artifact_bytes, Vec::new())?;
+        let mut state = self.state()?;
         let artifact = AccelArtifact {
             blob: manifest.pack_hash,
-            fresh_at_fence: self.generation(),
+            fresh_at_fence: state.generation,
         };
-        lock_state(&self.accel).insert(kind, artifact.clone());
+        state.accel.insert(kind, artifact.clone());
         Ok(artifact)
     }
 
@@ -138,15 +141,16 @@ impl<B: BlobStore> PackObjectDb<B> {
         Ok(())
     }
 
-    pub fn is_stale(&self, kind: AccelKind) -> bool {
-        match lock_state(&self.accel).get(&kind) {
+    pub fn is_stale(&self, kind: AccelKind) -> Result<bool, GitPackError> {
+        let state = self.state()?;
+        Ok(match state.accel.get(&kind) {
             None => true,
-            Some(a) => a.fresh_at_fence < self.generation(),
-        }
+            Some(a) => a.fresh_at_fence < state.generation,
+        })
     }
 
-    pub fn accel_artifact(&self, kind: AccelKind) -> Option<AccelArtifact> {
-        lock_state(&self.accel).get(&kind).cloned()
+    pub fn accel_artifact(&self, kind: AccelKind) -> Result<Option<AccelArtifact>, GitPackError> {
+        Ok(self.state()?.accel.get(&kind).cloned())
     }
 
     pub fn serve_clone(&self, tips: &[Oid]) -> Result<Vec<(Oid, Vec<u8>)>, GitPackError> {
@@ -174,7 +178,7 @@ impl<B: BlobStore> PackObjectDb<B> {
         let mut total_stored_bytes = 0usize;
         for oid in tips {
             let address = self
-                .address_of(oid)
+                .address_of(oid)?
                 .ok_or_else(|| GitPackError::RepoNotPlaced {
                     repo: self.repo.clone(),
                 })?;
@@ -204,6 +208,14 @@ impl<B: BlobStore> PackObjectDb<B> {
             out.push((oid.clone(), bytes));
         }
         Ok(out)
+    }
+
+    fn state(&self) -> Result<MutexGuard<'_, PackObjectState>, GitPackError> {
+        self.state
+            .lock()
+            .map_err(|_| GitPackError::StateUnavailable {
+                state: "object database",
+            })
     }
 }
 
@@ -281,7 +293,8 @@ mod tests {
                 region: Region::new("fr-par"),
                 status: RepoPlacementStatus::Active,
             },
-        );
+        )
+        .expect("place pack-tier test repository");
         PackObjectDb::new(tier, repo)
     }
 
@@ -296,7 +309,26 @@ mod tests {
         assert!(address.to_multihash_string().starts_with("sha256:"));
 
         assert_eq!(db.read_object(&oid).expect("read"), content);
-        assert_eq!(db.address_of(&oid), Some(address));
+        assert_eq!(db.address_of(&oid).unwrap(), Some(address));
+    }
+
+    #[test]
+    fn unavailable_object_database_state_never_looks_like_a_missing_object() {
+        let db = placed_db();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = db.state.lock().unwrap();
+            panic!("poison the test object database");
+        }));
+
+        let unavailable = GitPackError::StateUnavailable {
+            state: "object database",
+        };
+        assert_eq!(
+            db.address_of(&Oid::new("missing")).unwrap_err(),
+            unavailable
+        );
+        assert_eq!(db.generation().unwrap_err(), unavailable);
+        assert_eq!(db.is_stale(AccelKind::Midx).unwrap_err(), unavailable);
     }
 
     #[test]
@@ -398,6 +430,7 @@ mod tests {
         let native = db
             .tier()
             .native_addr_for_test(&db.repo, &address)
+            .expect("object index state")
             .expect("linked native address");
         assert!(db
             .tier()
@@ -420,31 +453,34 @@ mod tests {
     fn ref_update_marks_accel_stale_and_maintenance_refreshes_the_fence() {
         let db = placed_db();
         for k in AccelKind::all() {
-            assert!(db.is_stale(k), "a missing {k:?} is stale (must be built)");
+            assert!(
+                db.is_stale(k).unwrap(),
+                "a missing {k:?} is stale (must be built)"
+            );
         }
 
         db.run_maintenance(|kind| format!("{kind:?}-artifact-bytes").into_bytes())
             .expect("maintenance");
         for k in AccelKind::all() {
-            assert!(!db.is_stale(k), "after maintenance {k:?} is fresh");
-            let a = db.accel_artifact(k).expect("built");
+            assert!(!db.is_stale(k).unwrap(), "after maintenance {k:?} is fresh");
+            let a = db.accel_artifact(k).unwrap().expect("built");
             assert_eq!(
                 a.fresh_at_fence,
-                db.generation(),
+                db.generation().unwrap(),
                 "fresh at the current generation"
             );
         }
 
-        let gen_before = db.generation();
+        let gen_before = db.generation().unwrap();
         db.put_object(GitObjectKind::Commit, &Oid::new("newtip"), b"new commit")
             .expect("put");
         assert!(
-            db.generation() > gen_before,
+            db.generation().unwrap() > gen_before,
             "a push advances the object-DB generation"
         );
         for k in AccelKind::all() {
             assert!(
-                db.is_stale(k),
+                db.is_stale(k).unwrap(),
                 "the ref-update burst marked {k:?} stale (the §8 signal)"
             );
         }
@@ -452,7 +488,7 @@ mod tests {
         db.run_maintenance(|kind| format!("{kind:?}-refreshed").into_bytes())
             .expect("maintenance re-run");
         for k in AccelKind::all() {
-            assert!(!db.is_stale(k), "maintenance refreshed {k:?}");
+            assert!(!db.is_stale(k).unwrap(), "maintenance refreshed {k:?}");
         }
     }
 
@@ -499,6 +535,7 @@ mod tests {
 
         let after = db
             .accel_artifact(AccelKind::CommitGraph)
+            .expect("object database state")
             .expect("still present");
         assert_eq!(
             after.blob, artifact.blob,
@@ -545,7 +582,7 @@ mod tests {
     #[test]
     fn residency_pin_lint_green_on_live_pack_placement() {
         let db = placed_db();
-        let placement = db.placement().expect("placed");
+        let placement = db.placement().expect("placement state").expect("placed");
         assert!(
             assert_relocatable_never_node_pinned(&placement).is_ok(),
             "the residency-pin lint is green on the live pack placement"

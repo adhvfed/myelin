@@ -12,7 +12,8 @@ fn place(tier: &GitPackTier<FsBlobStore>, repo: &RepoId) {
             region: Region::new("eu-west"),
             status: RepoPlacementStatus::Active,
         },
-    );
+    )
+    .expect("place integrity-drill repository");
 }
 
 #[test]
@@ -51,6 +52,7 @@ fn stor_d7_corrupt_git_pack_object_is_detected_recovered_zero_silent_serve() {
     for (address, original) in &addresses {
         let native = primary
             .native_addr_for_test(&repo, address)
+            .expect("object index state")
             .expect("linked native address");
         assert!(
             primary.blobs().corrupt_for_drill(&tenant, &native),
@@ -92,7 +94,7 @@ fn stor_d7_corrupt_git_pack_object_is_detected_recovered_zero_silent_serve() {
         replica
             .put_object(&repo, GitObjectKind::Blob, extra)
             .expect("replica put");
-        let native = primary.native_addr_for_test(&repo, &a).unwrap();
+        let native = primary.native_addr_for_test(&repo, &a).unwrap().unwrap();
         assert!(primary.blobs().corrupt_for_drill(&tenant, &native));
         let recovered = primary
             .get_object_with_recovery(&repo, &a, &replica)

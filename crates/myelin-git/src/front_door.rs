@@ -38,7 +38,9 @@ pub struct GitRequest {
 }
 
 pub trait PlacementResolver {
-    fn placement_of(&self, repo: &RepoId) -> Option<RepoGitPlacement>;
+    type Error: std::fmt::Display;
+
+    fn placement_of(&self, repo: &RepoId) -> Result<Option<RepoGitPlacement>, Self::Error>;
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -59,6 +61,9 @@ pub enum FrontDoorError {
     },
     NoPlacement {
         repo: String,
+    },
+    PlacementUnavailable {
+        detail: String,
     },
     RepoOffboarding {
         repo: String,
@@ -104,6 +109,10 @@ impl std::fmt::Display for FrontDoorError {
                 f,
                 "front door: placement_of(`{repo}`) found no placement - repo not hosted here \
                  (fail-closed; never fabricate a placement)"
+            ),
+            FrontDoorError::PlacementUnavailable { detail } => write!(
+                f,
+                "front door: placement dependency unavailable ({detail}) - fail-closed"
             ),
             FrontDoorError::RepoOffboarding { repo } => write!(
                 f,
@@ -170,8 +179,8 @@ impl<I: IdentityService, P: PlacementResolver, C: GitCore> FrontDoor<I, P, C> {
 
     pub fn readiness(&self, probe: &Credential, probe_repo: &RepoId) -> bool {
         let id_reachable = self.id.authenticate(probe).is_ok();
-        let _ = self.placement.placement_of(probe_repo);
-        id_reachable
+        let placement_reachable = self.placement.placement_of(probe_repo).is_ok();
+        id_reachable && placement_reachable
     }
 
     pub fn route(&self, req: &GitRequest) -> Result<WireOutput, FrontDoorError> {
@@ -246,12 +255,15 @@ impl<I: IdentityService, P: PlacementResolver, C: GitCore> FrontDoor<I, P, C> {
         }
 
         let repo_id = RepoId::from_token(repo_placement_key(&token_tenant, &req.url_repo));
-        let placement =
-            self.placement
-                .placement_of(&repo_id)
-                .ok_or_else(|| FrontDoorError::NoPlacement {
-                    repo: req.url_repo.clone(),
-                })?;
+        let placement = self
+            .placement
+            .placement_of(&repo_id)
+            .map_err(|error| FrontDoorError::PlacementUnavailable {
+                detail: error.to_string(),
+            })?
+            .ok_or_else(|| FrontDoorError::NoPlacement {
+                repo: req.url_repo.clone(),
+            })?;
         if placement.status == RepoPlacementStatus::Offboarding {
             return Err(FrontDoorError::RepoOffboarding {
                 repo: req.url_repo.clone(),
@@ -482,14 +494,27 @@ mod tests {
         }
     }
     impl PlacementResolver for StubPlacement {
-        fn placement_of(&self, repo: &RepoId) -> Option<RepoGitPlacement> {
-            self.placements
+        type Error = std::convert::Infallible;
+
+        fn placement_of(&self, repo: &RepoId) -> Result<Option<RepoGitPlacement>, Self::Error> {
+            Ok(self
+                .placements
                 .get(repo.as_str())
                 .map(|(region, status)| RepoGitPlacement {
                     group: myelin_storage::gitpack::StorageGroup::from_token("g1"),
                     region: Region(region.clone()),
                     status: *status,
-                })
+                }))
+        }
+    }
+
+    struct UnavailablePlacement;
+
+    impl PlacementResolver for UnavailablePlacement {
+        type Error = &'static str;
+
+        fn placement_of(&self, _repo: &RepoId) -> Result<Option<RepoGitPlacement>, Self::Error> {
+            Err("placement state is unavailable")
         }
     }
 
@@ -828,7 +853,7 @@ mod tests {
     }
 
     #[test]
-    fn liveness_is_always_up_readiness_gates_on_id() {
+    fn liveness_is_always_up_and_readiness_gates_on_dependencies() {
         let id = StubId::new().with_principal("probe:p", "sys", PrincipalStatus::Active);
         let placement = StubPlacement::new();
         let d = door(id, placement, RecCore::new(), "fr-par");
@@ -850,6 +875,43 @@ mod tests {
         assert!(
             !d2.readiness(&cred("probe", "p"), &RepoId::from_token("sys/_probe")),
             "Id unreachable → not ready"
+        );
+
+        let id = StubId::new().with_principal("probe:p", "sys", PrincipalStatus::Active);
+        let d3 = FrontDoor::new(
+            id,
+            UnavailablePlacement,
+            RecCore::new(),
+            Region("fr-par".into()),
+        );
+        assert!(
+            !d3.readiness(&cred("probe", "p"), &RepoId::from_token("sys/_probe")),
+            "placement state unavailable → not ready"
+        );
+    }
+
+    #[test]
+    fn placement_failure_is_not_reported_as_an_absent_repository() {
+        let id = StubId::new().with_principal("ssh:k", "acme", PrincipalStatus::Active);
+        let door = FrontDoor::new(
+            id,
+            UnavailablePlacement,
+            RecCore::new(),
+            Region("fr-par".into()),
+        );
+        let request = GitRequest {
+            credential: cred("ssh", "k"),
+            url_tenant: "acme".into(),
+            url_repo: "widgets".into(),
+            action: GitAction::Fetch,
+            body: Vec::new(),
+        };
+
+        assert_eq!(
+            door.authorize(&request).unwrap_err(),
+            FrontDoorError::PlacementUnavailable {
+                detail: "placement state is unavailable".into(),
+            }
         );
     }
 

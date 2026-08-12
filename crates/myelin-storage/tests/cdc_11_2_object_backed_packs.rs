@@ -19,7 +19,8 @@ impl<B: BlobStore> GitObjectStore<B> {
                 region: Region::new(region),
                 status: RepoPlacementStatus::Active,
             },
-        );
+        )
+        .expect("place object-backed test repository");
         GitObjectStore { tier, repo }
     }
 

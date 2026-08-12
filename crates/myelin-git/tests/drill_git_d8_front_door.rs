@@ -139,7 +139,9 @@ struct TierPlacement {
 }
 
 impl PlacementResolver for TierPlacement {
-    fn placement_of(&self, repo: &RepoId) -> Option<RepoGitPlacement> {
+    type Error = myelin_storage::GitPackError;
+
+    fn placement_of(&self, repo: &RepoId) -> Result<Option<RepoGitPlacement>, Self::Error> {
         self.tier.placement_of(repo)
     }
 }
@@ -154,7 +156,8 @@ fn placed_tier(tenant: &str, placements: &[(&str, &str, RepoPlacementStatus)]) -
                 region: Region::new(*region),
                 status: *status,
             },
-        );
+        )
+        .expect("place front-door test repository");
     }
     TierPlacement { tier }
 }
