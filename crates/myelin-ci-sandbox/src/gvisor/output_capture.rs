@@ -1,5 +1,5 @@
 use super::*;
-use crate::launch_gate::{DirectChildRetirement, SandboxCommand, SpawnPhase};
+use crate::launch_gate::{DirectChildRetirement, SandboxCommand, SpawnFailure};
 use crate::redaction::RedactionPlan;
 use crate::user_namespace::RunscInvocationMode;
 use crate::{
@@ -176,20 +176,42 @@ fn run_and_capture_impl(
             })?;
     }
     let mut child = sandbox_command.spawn().map_err(|spawn_failure| {
-        let message = format!("spawn runsc: {}", spawn_failure.message());
-        *child_retirement = spawn_failure.child_retirement().clone();
-        match spawn_failure.phase() {
-            SpawnPhase::Uncommitted => RunFailure::uncommitted(message),
-            SpawnPhase::CommitOutcomeUnknown => RunFailure::commit_outcome_unknown(message),
-            SpawnPhase::CommittedButNotExecuted => RunFailure::committed_but_not_executed(message),
-            SpawnPhase::Executed => {
-                let elapsed = spawn_failure
-                    .executed_at()
-                    .expect("Executed phase always carries executed_at")
-                    .elapsed();
-                RunFailure::executed(message, executed_fallback_usage(mem_bytes, elapsed, None))
-            }
-        }
+        let (failure, retirement) = match spawn_failure {
+            SpawnFailure::Uncommitted {
+                message,
+                child_retirement,
+            } => (
+                RunFailure::uncommitted(format!("spawn runsc: {message}")),
+                child_retirement,
+            ),
+            SpawnFailure::CommitOutcomeUnknown {
+                message,
+                child_retirement,
+            } => (
+                RunFailure::commit_outcome_unknown(format!("spawn runsc: {message}")),
+                child_retirement,
+            ),
+            SpawnFailure::CommittedButNotExecuted {
+                message,
+                child_retirement,
+            } => (
+                RunFailure::committed_but_not_executed(format!("spawn runsc: {message}")),
+                child_retirement,
+            ),
+            SpawnFailure::Executed {
+                message,
+                executed_at,
+                child_retirement,
+            } => (
+                RunFailure::executed(
+                    format!("spawn runsc: {message}"),
+                    executed_fallback_usage(mem_bytes, executed_at.elapsed(), None),
+                ),
+                child_retirement,
+            ),
+        };
+        *child_retirement = retirement;
+        failure
     })?;
 
     let executed_at = child.executed_at();

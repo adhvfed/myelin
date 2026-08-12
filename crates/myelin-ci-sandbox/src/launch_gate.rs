@@ -317,6 +317,7 @@ impl DirectChildRetirement {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SpawnPhase {
     Uncommitted,
@@ -326,28 +327,37 @@ pub(crate) enum SpawnPhase {
 }
 
 #[derive(Debug)]
-pub(crate) struct SpawnFailure {
-    phase: SpawnPhase,
-    message: String,
-    executed_at: Option<Instant>,
-    child_retirement: DirectChildRetirement,
+pub(crate) enum SpawnFailure {
+    Uncommitted {
+        message: String,
+        child_retirement: DirectChildRetirement,
+    },
+    CommitOutcomeUnknown {
+        message: String,
+        child_retirement: DirectChildRetirement,
+    },
+    CommittedButNotExecuted {
+        message: String,
+        child_retirement: DirectChildRetirement,
+    },
+    Executed {
+        message: String,
+        executed_at: Instant,
+        child_retirement: DirectChildRetirement,
+    },
 }
 
 impl SpawnFailure {
     fn uncommitted(message: String, child_retirement: DirectChildRetirement) -> Self {
-        Self {
-            phase: SpawnPhase::Uncommitted,
+        Self::Uncommitted {
             message,
-            executed_at: None,
             child_retirement,
         }
     }
 
     fn commit_outcome_unknown(message: String, child_retirement: DirectChildRetirement) -> Self {
-        Self {
-            phase: SpawnPhase::CommitOutcomeUnknown,
+        Self::CommitOutcomeUnknown {
             message,
-            executed_at: None,
             child_retirement,
         }
     }
@@ -356,10 +366,8 @@ impl SpawnFailure {
         message: String,
         child_retirement: DirectChildRetirement,
     ) -> Self {
-        Self {
-            phase: SpawnPhase::CommittedButNotExecuted,
+        Self::CommittedButNotExecuted {
             message,
-            executed_at: None,
             child_retirement,
         }
     }
@@ -369,34 +377,44 @@ impl SpawnFailure {
         executed_at: Instant,
         child_retirement: DirectChildRetirement,
     ) -> Self {
-        Self {
-            phase: SpawnPhase::Executed,
+        Self::Executed {
             message,
-            executed_at: Some(executed_at),
+            executed_at,
             child_retirement,
         }
     }
 
-    pub(crate) fn phase(&self) -> SpawnPhase {
-        self.phase
+    #[cfg(test)]
+    fn phase(&self) -> SpawnPhase {
+        match self {
+            SpawnFailure::Uncommitted { .. } => SpawnPhase::Uncommitted,
+            SpawnFailure::CommitOutcomeUnknown { .. } => SpawnPhase::CommitOutcomeUnknown,
+            SpawnFailure::CommittedButNotExecuted { .. } => SpawnPhase::CommittedButNotExecuted,
+            SpawnFailure::Executed { .. } => SpawnPhase::Executed,
+        }
     }
 
     pub(crate) fn message(&self) -> &str {
-        &self.message
+        match self {
+            SpawnFailure::Uncommitted { message, .. }
+            | SpawnFailure::CommitOutcomeUnknown { message, .. }
+            | SpawnFailure::CommittedButNotExecuted { message, .. }
+            | SpawnFailure::Executed { message, .. } => message,
+        }
     }
 
-    pub(crate) fn executed_at(&self) -> Option<Instant> {
-        self.executed_at
-    }
-
-    pub(crate) fn child_retirement(&self) -> &DirectChildRetirement {
-        &self.child_retirement
+    #[cfg(test)]
+    fn executed_at(&self) -> Option<Instant> {
+        match self {
+            SpawnFailure::Executed { executed_at, .. } => Some(*executed_at),
+            _ => None,
+        }
     }
 }
 
 impl std::fmt::Display for SpawnFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{}", self.message())
     }
 }
 
