@@ -1289,6 +1289,7 @@ impl DurableGitBackend {
         &self,
         request: AgentFileWrite<'_>,
     ) -> Result<String, DurableError> {
+        let request_hash = file_write_request_hash(&request);
         let AgentFileWrite {
             target,
             gitref,
@@ -1315,16 +1316,6 @@ impl DurableGitBackend {
             )));
         }
         let full_ref = branch_ref(gitref);
-        let request_hash = file_write_request_hash(
-            tenant,
-            &actor.principal_id.0,
-            slug,
-            &full_ref,
-            path,
-            expected_base,
-            contents,
-            start_ref,
-        );
         let operation_trailer = format!("Myelin-Operation: {}", operation_id.digest());
         let request_trailer = format!("Myelin-Request: {request_hash}");
         let loc = Self::loc(tenant, region, slug);
@@ -1613,31 +1604,30 @@ impl DurableGitBackend {
         operation_id: &PrOperationId,
     ) -> Result<PrRecord, DurableError> {
         self.open_pr_for_actor_with_operation(
-            tenant,
-            region,
-            slug,
+            RepoActorContext::new(tenant, region, slug, principal),
             body,
-            principal,
             principal,
             operation_id,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     /// Opens a PR attributed to `actor`, using `authorization_basis` only to read its source.
     ///
     /// Agent effects deliberately keep these principals separate: delegation conveys authority,
     /// but never changes who performed the mutation.
     pub(crate) fn open_pr_for_actor_with_operation(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
+        target: RepoActorContext<'_>,
         body: &Value,
-        actor: &Principal,
         authorization_basis: &Principal,
         operation_id: &PrOperationId,
     ) -> Result<PrRecord, DurableError> {
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal: actor,
+        } = target;
         if actor.tenant.0 != tenant
             || actor.region.0 != region
             || authorization_basis.tenant != actor.tenant
@@ -2158,27 +2148,25 @@ impl DurableGitBackend {
     ) -> Result<PrRecord, DurableError> {
         let operation_id = self.fresh_operation_id()?;
         self.report_checks_with_operation(
-            tenant,
-            region,
-            slug,
-            number,
-            principal,
+            RepoActorContext::new(tenant, region, slug, principal).for_pr(number),
             body,
             &operation_id,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn report_checks_with_operation(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
-        principal: &Principal,
+        target: PrActorContext<'_>,
         body: &Value,
         operation_id: &PrOperationId,
     ) -> Result<PrRecord, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         if !matches!(principal.kind, PrincipalKind::Service) {
             return Err(DurableError::Forbidden(format!(
                 "git.checks.report is a CI-producer capability: principal `{}` (kind {:?}) is not a CI \
@@ -2236,27 +2224,25 @@ impl DurableGitBackend {
     ) -> Result<PrRecord, DurableError> {
         let operation_id = self.fresh_operation_id()?;
         self.submit_review_with_operation(
-            tenant,
-            region,
-            slug,
-            number,
+            RepoActorContext::new(tenant, region, slug, principal).for_pr(number),
             verdict,
-            principal,
             &operation_id,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn submit_review_with_operation(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
+        target: PrActorContext<'_>,
         verdict: &str,
-        principal: &Principal,
         operation_id: &PrOperationId,
     ) -> Result<PrRecord, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         let v = match verdict {
             "approve" => ReviewVerdict::Approve,
@@ -2292,27 +2278,25 @@ impl DurableGitBackend {
     ) -> Result<PrRecord, DurableError> {
         let operation_id = self.fresh_operation_id()?;
         self.endorse_fork_ci_with_operation(
-            tenant,
-            region,
-            slug,
-            number,
+            RepoActorContext::new(tenant, region, slug, principal).for_pr(number),
             body,
-            principal,
             &operation_id,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn endorse_fork_ci_with_operation(
         &self,
-        tenant: &str,
-        region: &str,
-        slug: &str,
-        number: u64,
+        target: PrActorContext<'_>,
         body: &Value,
-        principal: &Principal,
         operation_id: &PrOperationId,
     ) -> Result<PrRecord, DurableError> {
+        let PrActorContext { repo, number } = target;
+        let RepoActorContext {
+            tenant,
+            region,
+            slug,
+            principal,
+        } = repo;
         let loc = Self::loc(tenant, region, slug);
         let rec = self
             .pr_get(&loc, number, principal)?

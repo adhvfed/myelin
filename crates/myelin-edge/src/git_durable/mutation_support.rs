@@ -66,28 +66,19 @@ pub(super) fn branch_ref(gitref: &str) -> String {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn file_write_request_hash(
-    tenant: &str,
-    actor: &str,
-    repo: &str,
-    gitref: &str,
-    path: &str,
-    expected_base: &str,
-    contents: &str,
-    start_ref: Option<&str>,
-) -> String {
+pub(super) fn file_write_request_hash(request: &AgentFileWrite<'_>) -> String {
+    let full_ref = branch_ref(request.gitref);
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"myelin.git.file-write-request.v1\0");
     for part in [
-        tenant,
-        actor,
-        repo,
-        gitref,
-        path,
-        expected_base,
-        contents,
-        start_ref.unwrap_or(""),
+        request.target.tenant,
+        request.target.principal.principal_id.0.as_str(),
+        request.target.slug,
+        full_ref.as_str(),
+        request.path,
+        request.expected_base,
+        request.contents,
+        request.start_ref.unwrap_or(""),
     ] {
         hasher.update(&(part.len() as u64).to_be_bytes());
         hasher.update(part.as_bytes());

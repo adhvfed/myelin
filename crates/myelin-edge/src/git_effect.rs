@@ -170,11 +170,8 @@ impl GitEffectApi {
                     return denied;
                 }
                 match self.backend.open_pr_for_actor_with_operation(
-                    t,
-                    r,
-                    repo,
+                    RepoActorContext::new(t, r, repo, &self.principal),
                     args,
-                    &self.principal,
                     &self.delegator,
                     operation_id,
                 ) {
@@ -206,12 +203,8 @@ impl GitEffectApi {
                 }
                 let verdict = str_arg(args, "verdict").unwrap_or("comment");
                 match self.backend.submit_review_with_operation(
-                    t,
-                    r,
-                    repo,
-                    number,
+                    RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
                     verdict,
-                    &self.principal,
                     operation_id,
                 ) {
                     Ok(rec) => applied(
@@ -231,12 +224,8 @@ impl GitEffectApi {
                     return denied;
                 }
                 match self.backend.endorse_fork_ci_with_operation(
-                    t,
-                    r,
-                    repo,
-                    number,
+                    RepoActorContext::new(t, r, repo, &self.principal).for_pr(number),
                     args,
-                    &self.principal,
                     operation_id,
                 ) {
                     Ok(rec) => applied(

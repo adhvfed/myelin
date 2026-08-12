@@ -2570,12 +2570,14 @@ impl Handler for DPrReview {
         let rec = self
             .be
             .submit_review_with_operation(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 verdict,
-                ctx.principal,
                 &operation_id,
             )
             .map_err(map_durable_err)?;
@@ -2600,12 +2602,14 @@ impl Handler for DEndorse {
         let rec = self
             .be
             .endorse_fork_ci_with_operation(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 &body,
-                ctx.principal,
                 &operation_id,
             )
             .map_err(map_durable_err)?;
@@ -2708,11 +2712,13 @@ impl Handler for DReportChecks {
         let rec = self
             .be
             .report_checks_with_operation(
-                tenant_of(ctx),
-                region_of(ctx),
-                param(ctx, "repo")?,
-                num_param(ctx, "n")?,
-                ctx.principal,
+                RepoActorContext::new(
+                    tenant_of(ctx),
+                    region_of(ctx),
+                    param(ctx, "repo")?,
+                    ctx.principal,
+                )
+                .for_pr(num_param(ctx, "n")?),
                 &body,
                 &operation_id,
             )
