@@ -47,7 +47,9 @@ pub fn mint_comment(
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommentAnchor {
-    Block { block_id: BlockId },
+    Block {
+        block_id: BlockId,
+    },
     Range {
         block_id: BlockId,
         start: usize,

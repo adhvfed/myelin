@@ -186,7 +186,7 @@ fn reserve_settle_bookends_the_run() {
 
 #[test]
 fn kn_d11_chained_drill_emits_a_green_receipt() {
-    let mut run = KnowledgeAgentRun::begin(attribution(),  100);
+    let mut run = KnowledgeAgentRun::begin(attribution(), 100);
 
     let draft_op = run
         .propose(
@@ -260,7 +260,7 @@ fn kn_d11_chained_drill_emits_a_green_receipt() {
         "still exactly two applied ops - the double-click did NOT double-apply"
     );
 
-    let receipt = run.seal( 1_718_000_000_000);
+    let receipt = run.seal(1_718_000_000_000);
     assert!(
         receipt.is_green(),
         "KN-D11 is green: 0 ungoverned/0 pre-approval/0 double-apply, ≥1 applied - {receipt:?}"

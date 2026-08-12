@@ -176,11 +176,7 @@ mod tests {
 
     #[test]
     fn direct_block_override_removes_an_inheriting_reader() {
-        let resolved = page_read_override(
-            &["alice", "bob"],
-            &[],
-            &["alice"],
-        );
+        let resolved = page_read_override(&["alice", "bob"], &[], &["alice"]);
         assert!(
             !resolved.contains("alice"),
             "the - direct_block override removes the inheriting alice"
@@ -193,11 +189,7 @@ mod tests {
 
     #[test]
     fn direct_reader_adds_a_sub_page() {
-        let resolved = page_read_override(
-            &["alice"],
-            &["carol"],
-            &[],
-        );
+        let resolved = page_read_override(&["alice"], &["carol"], &[]);
         assert!(
             resolved.contains("carol"),
             "the + direct_reader arm adds carol"
@@ -207,11 +199,7 @@ mod tests {
 
     #[test]
     fn direct_block_overrides_even_a_direct_grant() {
-        let resolved = page_read_override(
-            &[],
-            &["mallory"],
-            &["mallory"],
-        );
+        let resolved = page_read_override(&[], &["mallory"], &["mallory"]);
         assert!(
             !resolved.contains("mallory"),
             "the - direct_block exclusion is applied last → it overrides even a direct_reader grant"

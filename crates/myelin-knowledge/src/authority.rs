@@ -84,12 +84,8 @@ impl AclZookieTable {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RejectReason {
-    PermissionDenied {
-        page_id: String,
-    },
-    SchemaViolation {
-        detail: String,
-    },
+    PermissionDenied { page_id: String },
+    SchemaViolation { detail: String },
 }
 
 impl std::fmt::Display for RejectReason {
@@ -297,8 +293,7 @@ impl<S: IdentityService> OpAuthorizer<S> {
             .identity
             .check(&op.actor, &permission, &op.object, &at, None);
         match decision {
-            Ok(Decision::Allow) => {
-            }
+            Ok(Decision::Allow) => {}
             _ => {
                 self.counter.record_zookie_rejection();
                 return OpDecision::Rejected(RejectReason::PermissionDenied {

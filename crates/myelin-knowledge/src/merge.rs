@@ -21,9 +21,7 @@ impl BlockState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CasOutcome {
     Committed(BlockState),
-    Conflict {
-        current: BlockState,
-    },
+    Conflict { current: BlockState },
 }
 
 impl CasOutcome {
@@ -168,9 +166,7 @@ pub struct SoftLockTable {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SoftLock {
     Acquired,
-    Held {
-        by: String,
-    },
+    Held { by: String },
 }
 
 impl SoftLockTable {

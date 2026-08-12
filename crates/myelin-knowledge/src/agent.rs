@@ -99,9 +99,7 @@ impl AgentEditAttribution {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditAuthor {
-    Human {
-        author_pseudonym: String,
-    },
+    Human { author_pseudonym: String },
     Agent(AgentEditAttribution),
 }
 

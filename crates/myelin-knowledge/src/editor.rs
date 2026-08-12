@@ -44,8 +44,13 @@ pub enum EditOp {
         offset: usize,
         text: String,
     },
-    SplitBlock { block: usize, offset: usize },
-    AppendBlock { md: String },
+    SplitBlock {
+        block: usize,
+        offset: usize,
+    },
+    AppendBlock {
+        md: String,
+    },
 }
 
 impl EditOp {
@@ -63,9 +68,7 @@ impl EditOp {
                 block,
                 offset,
                 text,
-            } => {
-                format!("it\t{block}\t{offset}\t{text}").into_bytes()
-            }
+            } => format!("it\t{block}\t{offset}\t{text}").into_bytes(),
             EditOp::SplitBlock { block, offset } => format!("sb\t{block}\t{offset}").into_bytes(),
             EditOp::AppendBlock { md } => format!("ab\t{md}").into_bytes(),
         }

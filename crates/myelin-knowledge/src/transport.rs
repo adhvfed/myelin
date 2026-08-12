@@ -218,9 +218,7 @@ pub enum Connected {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TransportError {
     OverBroadScope(String),
-    Unauthorized {
-        page_id: String,
-    },
+    Unauthorized { page_id: String },
 }
 
 impl core::fmt::Display for TransportError {

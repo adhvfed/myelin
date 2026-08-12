@@ -6,12 +6,12 @@ use myelin_search::{
     SearchProjection, VectorQuery, KN_PAGE_TYPE,
 };
 
+pub use myelin_search::block_subdoc_projection;
 pub use myelin_search::{
     kn_db_row_index_spec, kn_index_specs, kn_page_index_spec, page_search_projection,
     register_kn_index_specs, FACET_ARTIFACT_REF, FACET_EMBED, FACET_MENTION, KN_DB_ROW_TYPE,
     KN_SUBSYSTEM,
 };
-pub use myelin_search::block_subdoc_projection;
 
 pub const KN_SEARCH_OBJECT_TYPE: &str = KN_PAGE_TYPE;
 
@@ -22,16 +22,14 @@ pub fn feed_project(
 ) -> SearchProjection {
     match grain {
         FeedGrain::Page => page_search_projection(blocks, lang),
-        FeedGrain::SignificantBlock => {
-            match blocks.first() {
-                Some(block) => block_subdoc_projection(block, lang),
-                None => SearchProjection {
-                    text: String::new(),
-                    fields: std::collections::BTreeMap::new(),
-                    lang: lang.map(|s| s.to_string()),
-                },
-            }
-        }
+        FeedGrain::SignificantBlock => match blocks.first() {
+            Some(block) => block_subdoc_projection(block, lang),
+            None => SearchProjection {
+                text: String::new(),
+                fields: std::collections::BTreeMap::new(),
+                lang: lang.map(|s| s.to_string()),
+            },
+        },
     }
 }
 

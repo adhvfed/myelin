@@ -42,14 +42,8 @@ pub fn content_address(materialized: &[u8]) -> ContentHash {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CompactionError {
-    BeyondHead {
-        requested: u64,
-        head: u64,
-    },
-    UnreconstructableGap {
-        target: u64,
-        lowest_available: u64,
-    },
+    BeyondHead { requested: u64, head: u64 },
+    UnreconstructableGap { target: u64, lowest_available: u64 },
     Blob(String),
 }
 

@@ -67,10 +67,7 @@ enum RollupOutcome {
 pub enum FormulaExpr {
     Lit(Literal),
     Prop(FieldId),
-    Rollup {
-        func: RollupFn,
-        target: FieldId,
-    },
+    Rollup { func: RollupFn, target: FieldId },
     FormulaRef(FieldId),
     Add(Box<FormulaExpr>, Box<FormulaExpr>),
     Sub(Box<FormulaExpr>, Box<FormulaExpr>),
@@ -131,14 +128,8 @@ pub struct FormulaField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FormulaSchemaError {
     DuplicateField(String),
-    TooLarge {
-        field: String,
-        nodes: usize,
-    },
-    TooDeep {
-        field: String,
-        depth: usize,
-    },
+    TooLarge { field: String, nodes: usize },
+    TooDeep { field: String, depth: usize },
 }
 
 impl std::fmt::Display for FormulaSchemaError {
