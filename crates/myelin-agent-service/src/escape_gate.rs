@@ -282,7 +282,9 @@ mod tests {
 
     #[test]
     fn admit_from_the_real_json_artifact_form() {
-        let json = green_attestation().to_json();
+        let json = green_attestation()
+            .to_json()
+            .expect("the test attestation serializes");
         let gate = AgentExecGate::admit_from_json(&json, &prod_id())
             .expect("the green JSON artifact admits");
         assert_eq!(gate.backend_id().corpus_version, CORPUS_VERSION);
