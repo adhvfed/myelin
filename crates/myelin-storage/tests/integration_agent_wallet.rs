@@ -2,12 +2,22 @@
 
 use myelin_config::MyelinConfig;
 use myelin_storage::agent_wallet::{
-    agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind,
-    DebitOutcome, MicroUsd, WalletError,
+    agent_wallet_charge_migrations, agent_wallet_migrations, AgentWallet, CreditKind, DebitOutcome,
+    MicroUsd, WalletError,
 };
 use myelin_storage::migration::HotTables;
 use myelin_storage::SubstrateProvider;
 use myelin_tenancy::TenantId;
+
+fn app_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
 
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
     let mut c = cfg.clone();
@@ -28,14 +38,10 @@ fn uniq() -> String {
     )
 }
 
-async fn migrate_admin() -> Option<SubstrateProvider> {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn migrate_admin() -> SubstrateProvider {
+    let admin = SubstrateProvider::connect(admin_config(&app_config()), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate(&agent_wallet_migrations(), &HotTables::none())
         .await
@@ -44,23 +50,25 @@ async fn migrate_admin() -> Option<SubstrateProvider> {
         .migrate(&agent_wallet_charge_migrations(), &HotTables::none())
         .await
         .expect("apply replay-safe charge keys (0095)");
-    Some(admin)
+    admin
 }
 
 async fn app_provider() -> SubstrateProvider {
-    SubstrateProvider::connect(MyelinConfig::dev(), 6)
+    SubstrateProvider::connect(app_config(), 6)
         .await
         .expect("connect app role")
 }
 
 async fn ledger_sum(pool: &sqlx::PgPool, tenant: &str, region: &str) -> i64 {
     let mut tx = pool.begin().await.expect("begin ledger-sum tx");
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
-        .bind(tenant)
-        .bind(region)
-        .execute(&mut *tx)
-        .await
-        .expect("scope ledger-sum tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope ledger-sum tx");
     let sum: Option<i64> = sqlx::query_scalar(
         "SELECT COALESCE(SUM(CASE WHEN kind = 'debit' THEN -amount_micro ELSE amount_micro END), 0)::bigint \
          FROM agent_wallet_ledger WHERE tenant_id = $1 AND region = $2",
@@ -76,12 +84,14 @@ async fn ledger_sum(pool: &sqlx::PgPool, tenant: &str, region: &str) -> i64 {
 
 async fn ledger_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str) -> i64 {
     let mut tx = pool.begin().await.expect("begin count tx");
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
-        .bind(tenant)
-        .bind(region)
-        .execute(&mut *tx)
-        .await
-        .expect("scope count tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(tenant)
+    .bind(region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope count tx");
     let n: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM agent_wallet_ledger WHERE tenant_id = $1 AND region = $2",
     )
@@ -96,9 +106,7 @@ async fn ledger_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str) -> i6
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_wallet_charges_each_model_turn_once() {
-    let Some(_admin) = migrate_admin().await else {
-        return;
-    };
+    let _admin = migrate_admin().await;
     let app = app_provider().await;
     let region = app.config().region.clone();
     let suffix = uniq();
@@ -122,7 +130,11 @@ async fn agent_wallet_charges_each_model_turn_once() {
         Ok(DebitOutcome::Replayed(MicroUsd(500))),
         "workflow replay recognizes the same logical charge",
     );
-    assert_eq!(wallet.balance(&tenant), MicroUsd(500), "replay spends nothing");
+    assert_eq!(
+        wallet.balance(&tenant),
+        MicroUsd(500),
+        "replay spends nothing"
+    );
     assert_eq!(
         ledger_row_count(app.db_pool(), &tenant.0, &region).await,
         rows_after_first_charge,
@@ -154,9 +166,7 @@ async fn agent_wallet_charges_each_model_turn_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn agent_wallet_durable_contract() {
-    let Some(admin) = migrate_admin().await else {
-        return;
-    };
+    let admin = migrate_admin().await;
     let app = app_provider().await;
     let region = app.config().region.clone();
     let suffix = uniq();
@@ -178,7 +188,12 @@ async fn agent_wallet_durable_contract() {
     assert_eq!(after_debit, MicroUsd(4_998_766));
 
     let after_refund = wallet
-        .credit(&tenant, MicroUsd(1_000), CreditKind::Refund, Some(&format!("run-{suffix}")))
+        .credit(
+            &tenant,
+            MicroUsd(1_000),
+            CreditKind::Refund,
+            Some(&format!("run-{suffix}")),
+        )
         .expect("refund credits");
     assert_eq!(after_refund, MicroUsd(4_999_766));
 
@@ -208,7 +223,11 @@ async fn agent_wallet_durable_contract() {
     let before = wallet2.balance(&tenant);
     let rows_before = ledger_row_count(app.db_pool(), &tenant.0, &region).await;
     let err = wallet2
-        .debit(&tenant, MicroUsd(999_999_999), &format!("run-broke-{suffix}"))
+        .debit(
+            &tenant,
+            MicroUsd(999_999_999),
+            &format!("run-broke-{suffix}"),
+        )
         .expect_err("an over-balance debit is refused");
     assert_eq!(
         err,
@@ -217,7 +236,11 @@ async fn agent_wallet_durable_contract() {
             available: before,
         }
     );
-    assert_eq!(wallet2.balance(&tenant), before, "balance unchanged by a refused debit");
+    assert_eq!(
+        wallet2.balance(&tenant),
+        before,
+        "balance unchanged by a refused debit"
+    );
     assert_eq!(
         ledger_row_count(app.db_pool(), &tenant.0, &region).await,
         rows_before,
@@ -266,51 +289,74 @@ async fn agent_wallet_durable_contract() {
         "only the one successful near-ceiling topup is recorded",
     );
 
-    let mut tx = admin.db_pool().begin().await.expect("begin owner mutate tx");
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
-        .bind(&tenant.0)
-        .bind(&region)
-        .execute(&mut *tx)
+    let mut tx = admin
+        .db_pool()
+        .begin()
         .await
-        .expect("scope owner mutate tx");
+        .expect("begin owner mutate tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(&tenant.0)
+    .bind(&region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope owner mutate tx");
     let upd = sqlx::query("UPDATE agent_wallet_ledger SET amount_micro = 0 WHERE tenant_id = $1")
         .bind(&tenant.0)
         .execute(&mut *tx)
         .await;
     assert!(
-        upd.as_ref().err().map(|e| e.to_string()).unwrap_or_default().contains("immutable"),
+        upd.as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+            .contains("immutable"),
         "UPDATE on agent_wallet_ledger must RAISE 'immutable' (owner/trigger): {upd:?}"
     );
     tx.rollback().await.ok();
 
-    let mut tx = admin.db_pool().begin().await.expect("begin owner delete tx");
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
-        .bind(&tenant.0)
-        .bind(&region)
-        .execute(&mut *tx)
+    let mut tx = admin
+        .db_pool()
+        .begin()
         .await
-        .expect("scope owner delete tx");
+        .expect("begin owner delete tx");
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(&tenant.0)
+    .bind(&region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope owner delete tx");
     let del = sqlx::query("DELETE FROM agent_wallet_ledger WHERE tenant_id = $1")
         .bind(&tenant.0)
         .execute(&mut *tx)
         .await;
     assert!(
-        del.as_ref().err().map(|e| e.to_string()).unwrap_or_default().contains("immutable"),
+        del.as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default()
+            .contains("immutable"),
         "DELETE on agent_wallet_ledger must RAISE 'immutable' (owner/trigger): {del:?}"
     );
     tx.rollback().await.ok();
 
     let mut tx = app.db_pool().begin().await.expect("begin app mutate tx");
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
-        .bind(&tenant.0)
-        .bind(&region)
-        .execute(&mut *tx)
-        .await
-        .expect("scope app mutate tx");
-    let app_upd = sqlx::query("UPDATE agent_wallet_ledger SET amount_micro = 0 WHERE tenant_id = $1")
-        .bind(&tenant.0)
-        .execute(&mut *tx)
-        .await;
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
+    )
+    .bind(&tenant.0)
+    .bind(&region)
+    .execute(&mut *tx)
+    .await
+    .expect("scope app mutate tx");
+    let app_upd =
+        sqlx::query("UPDATE agent_wallet_ledger SET amount_micro = 0 WHERE tenant_id = $1")
+            .bind(&tenant.0)
+            .execute(&mut *tx)
+            .await;
     assert!(
         app_upd.is_err(),
         "the app role must NOT be able to UPDATE agent_wallet_ledger (REVOKE + trigger)"
@@ -330,19 +376,20 @@ async fn agent_wallet_durable_contract() {
     );
 
     let mut tx = app.db_pool().begin().await.expect("begin RLS tx");
-    sqlx::query("SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)")
-        .bind(&other.0)
-        .bind(&region)
-        .execute(&mut *tx)
-        .await
-        .expect("scope RLS tx as `other`");
-    let visible: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM agent_wallet_ledger WHERE tenant_id = $1",
+    sqlx::query(
+        "SELECT set_config('myelin.tenant_id', $1, true), set_config('myelin.region', $2, true)",
     )
-    .bind(&tenant.0)
-    .fetch_one(&mut *tx)
+    .bind(&other.0)
+    .bind(&region)
+    .execute(&mut *tx)
     .await
-    .expect("count cross-tenant rows");
+    .expect("scope RLS tx as `other`");
+    let visible: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM agent_wallet_ledger WHERE tenant_id = $1")
+            .bind(&tenant.0)
+            .fetch_one(&mut *tx)
+            .await
+            .expect("count cross-tenant rows");
     assert_eq!(
         visible, 0,
         "RLS hides `tenant`'s ledger rows from a session scoped to `other`"
