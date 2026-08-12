@@ -8,9 +8,8 @@ use std::sync::Mutex;
 use myelin_ci_sandbox::{
     derive_checkout_authorization_scope, CompletionClaim, CompletionSettlementOwner, IdemToken,
     JobKind, JobSpec as SandboxJobSpec, PreparationPhase, PreparationReportClaim,
-    PreparationRetryReport,
-    PreparationTerminalDisposition, ResourceUsage, RetryableAttemptCause, RetryableAttemptFailure,
-    RetryableAttemptOutcome, TerminalReport, TerminalReporter,
+    PreparationRetryReport, PreparationTerminalDisposition, ResourceUsage, RetryableAttemptCause,
+    RetryableAttemptFailure, RetryableAttemptOutcome, TerminalReport, TerminalReporter,
 };
 #[cfg(any(test, feature = "test-support"))]
 use myelin_ci_sandbox::{
@@ -65,12 +64,12 @@ use crate::job_queue_store::{
     CiJobQueueStore, ClaimConsumeOutcome, ClaimConsumeSpec, DurableEnqueue,
     PreparationClaimConsumeSpec, PreparationRequeueOutcome, PreparationRequeueSpec,
 };
+use crate::job_schedule::JobScheduleTerms;
 use crate::job_spec_store::{
     CiJobSpecStore, CiJobSpecStoreError, ClaimedDispatchIdentity, DurableCiJobLaunchTemplate,
     MAX_JOB_TIMEOUT_SECS,
 };
 use crate::metering::{CostEventRow, CostKind, Meter};
-use crate::schedule_and_run_job::JobScheduleTerms;
 #[cfg(any(test, feature = "test-support"))]
 use crate::scheduler::Lane;
 
@@ -168,10 +167,9 @@ fn build_dispatch_parts(
         idem_token: flow_spec.idem_token.clone(),
         stage: flow_spec.target.clone(),
         claim_window_secs,
-        reservation_write_version:
-            crate::ReservationWriteVersionMarker::derive_from_reserve_handle(
-                &spec.meter_to.reserve_id,
-            ),
+        reservation_write_version: crate::ReservationWriteVersionMarker::derive_from_reserve_handle(
+            &spec.meter_to.reserve_id,
+        ),
     };
     Ok((enq, spec))
 }
@@ -1332,11 +1330,7 @@ async fn settle_ci_job_surface_on_conn(
     } else {
         "failed"
     };
-    let summary = terminal_result_summary(
-        surface.report,
-        surface.disposition,
-        surface.diagnostic,
-    );
+    let summary = terminal_result_summary(surface.report, surface.disposition, surface.diagnostic);
     let state_predicate = if preparation {
         "state IN ('queued','leased') OR (state=$5 AND result_summary=$6)"
     } else {
@@ -1787,8 +1781,11 @@ impl CiPipelineReporter {
                             }
                             PreparationTerminalDisposition::Failed { .. }
                             | PreparationTerminalDisposition::TimedOut { .. } => {
-                                CiJobQueueStore::consume_preparation_claim_on_conn(conn, consume_spec)
-                                    .await?
+                                CiJobQueueStore::consume_preparation_claim_on_conn(
+                                    conn,
+                                    consume_spec,
+                                )
+                                .await?
                             }
                         };
                         if claim_outcome == ClaimConsumeOutcome::Refused {
@@ -1867,7 +1864,10 @@ impl CiPipelineReporter {
         claim: &CiJobTokenRequest,
     ) -> Result<PreparationRetryOutcome, ExecutorError> {
         claim.validate().map_err(|error| {
-            ExecutorError::InvalidInput(format!("ci.pipeline preparation retry refused: {}", error.0))
+            ExecutorError::InvalidInput(format!(
+                "ci.pipeline preparation retry refused: {}",
+                error.0
+            ))
         })?;
         if claim.tenant_id != self.tenant.0 || claim.region != self.region {
             return Err(ExecutorError::InvalidInput(
@@ -1934,8 +1934,12 @@ impl CiPipelineReporter {
                             return Err(CompletionTxError::Refused);
                         }
                         if let PreparationRetryGate::NotLive =
-                            verify_preparation_retry_permitted_on_conn(conn, &claim, &reserve_handle)
-                                .await?
+                            verify_preparation_retry_permitted_on_conn(
+                                conn,
+                                &claim,
+                                &reserve_handle,
+                            )
+                            .await?
                         {
                             return Ok(PreparationRequeueOutcome::NoOp);
                         }
