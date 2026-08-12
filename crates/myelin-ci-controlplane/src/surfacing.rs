@@ -320,6 +320,12 @@ impl AuthzVisibleIndex {
         AuthzVisibleIndex::default()
     }
 
+    fn visible(&self) -> std::sync::MutexGuard<'_, VisibleMap> {
+        self.visible
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     pub fn grant(
         &self,
         tenant: &TenantId,
@@ -334,7 +340,7 @@ impl AuthzVisibleIndex {
             subject.into(),
             relation.into(),
         );
-        let mut v = self.visible.lock().unwrap();
+        let mut v = self.visible();
         let set = v.entry(key).or_default();
         if !set.iter().any(|o| o == object_id) {
             set.push(object_id.into());
@@ -355,7 +361,7 @@ impl AuthzVisibleIndex {
             subject.into(),
             relation.into(),
         );
-        if let Some(set) = self.visible.lock().unwrap().get_mut(&key) {
+        if let Some(set) = self.visible().get_mut(&key) {
             set.retain(|o| o != object_id);
         }
     }
@@ -418,9 +424,7 @@ impl AuthzVisibleIndex {
                 relation.to_string(),
             );
             return self
-                .visible
-                .lock()
-                .unwrap()
+                .visible()
                 .get(&key)
                 .map(|set| set.iter().any(|o| o == candidate))
                 .unwrap_or(false);
