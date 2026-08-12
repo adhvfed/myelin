@@ -729,10 +729,17 @@ fn validate_plan(plan: &ResolvedRunPlanV1) -> Result<(), RunPlanError> {
     while let Some(name) = ready.pop_first() {
         visited += 1;
         for dependent in dependents.get(name).into_iter().flatten() {
-            let degree = indegree
-                .get_mut(dependent)
-                .expect("dependent names were validated above");
-            *degree -= 1;
+            let Some(degree) = indegree.get_mut(dependent) else {
+                return invalid(format!(
+                    "job dependency graph lost validated job `{dependent}`"
+                ));
+            };
+            let Some(next_degree) = degree.checked_sub(1) else {
+                return invalid(format!(
+                    "job dependency graph counted duplicate edge to `{dependent}`"
+                ));
+            };
+            *degree = next_degree;
             if *degree == 0 {
                 ready.insert(dependent);
             }

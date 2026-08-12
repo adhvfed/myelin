@@ -633,8 +633,11 @@ fn replay_v2_batch(
             }
         }
     }
-    let (revision, max_parent_attempts) =
-        descriptor.expect("durable_v2 is non-empty, checked by the caller");
+    let Some((revision, max_parent_attempts)) = descriptor else {
+        return Err(refused(
+            "operational reservation v2 replay has no durable authority rows",
+        ));
+    };
     let reconstructed_policy = CiAttemptBudgetPolicy::new(revision, max_parent_attempts);
 
     let requests: Vec<CiJobRuntimeAuthorityRequest> =
@@ -1304,7 +1307,7 @@ impl CiAttemptBudgetPolicy {
     pub fn production() -> Self {
         Self {
             revision: CiAttemptBudgetRevision::V1,
-            max_parent_attempts: NonZeroU32::new(5).expect("5 is nonzero"),
+            max_parent_attempts: NonZeroU32::MIN.saturating_add(4),
         }
     }
 

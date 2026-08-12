@@ -929,8 +929,7 @@ fn validate_claim_authority(
     let topology_ceiling = if authority.checkout.is_some() {
         crate::ci_claim_window::MAX_CI_JOB_CLAIM_WINDOW_SECS
     } else {
-        u64::try_from(crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS)
-            .expect("the execution-lease bound is positive")
+        crate::runner_bind::CI_RUNNER_EXECUTION_LEASE_TTL_SECS_U64
     };
     if claim_lifetime > topology_ceiling {
         return Err(refused(

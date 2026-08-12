@@ -83,7 +83,8 @@ use crate::{
     LogPipelineSink,
 };
 
-pub const CI_RUNNER_EXECUTION_LEASE_TTL_SECS: i64 = MAX_JOB_TIMEOUT_SECS as i64 + 600;
+pub const CI_RUNNER_EXECUTION_LEASE_TTL_SECS_U64: u64 = MAX_JOB_TIMEOUT_SECS as u64 + 600;
+pub const CI_RUNNER_EXECUTION_LEASE_TTL_SECS: i64 = CI_RUNNER_EXECUTION_LEASE_TTL_SECS_U64 as i64;
 
 pub type JobSpecResolver = Arc<dyn Fn(&LeasedJob) -> Result<JobSpec, String> + Send + Sync>;
 

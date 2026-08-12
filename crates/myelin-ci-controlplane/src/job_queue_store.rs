@@ -288,10 +288,11 @@ pub(crate) struct RetainedCiJobLaunch {
 
 impl RetainedCiJobLaunch {
     pub(crate) async fn validate(&mut self) -> Result<(), JobQueueStoreError> {
-        let connection = self
-            .connection
-            .as_mut()
-            .expect("launch ownership validates one database session");
+        let Some(connection) = self.connection.as_mut() else {
+            return Err(JobQueueStoreError::Db(
+                "launch ownership has no retained database session".into(),
+            ));
+        };
         // @tenant-cross-scope: this inspects only the current PostgreSQL session's advisory-lock
         let owned: bool = sqlx::query_scalar(
             "SELECT EXISTS (
@@ -321,10 +322,11 @@ impl RetainedCiJobLaunch {
     }
 
     pub(crate) async fn release(mut self) -> Result<(), JobQueueStoreError> {
-        let mut connection = self
-            .connection
-            .take()
-            .expect("launch ownership releases one database session");
+        let Some(mut connection) = self.connection.take() else {
+            return Err(JobQueueStoreError::Db(
+                "launch ownership has no retained database session to release".into(),
+            ));
+        };
         // @tenant-cross-scope: this releases one PostgreSQL session advisory lock by its derived
         let released: bool = sqlx::query_scalar(
             "SELECT pg_advisory_unlock($1) /* tenant_id generation verified by launch CAS */",

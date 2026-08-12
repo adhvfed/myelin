@@ -515,7 +515,7 @@ impl PgCiPipelineStarter {
             .await
             .map_err(|error| PgCiStarterError::Database(format!("begin: {error}")))?;
         scope_transaction(&mut transaction, &self.tenant, &self.region).await?;
-        if let Some((group, _)) = pr_supersession_identity(&candidate.record) {
+        if let Some((group, _)) = pr_supersession_identity(&candidate.record)? {
             self.supersession()?
                 .lock_group_on_conn(&mut transaction, group)
                 .await
@@ -542,7 +542,7 @@ impl PgCiPipelineStarter {
             ));
         }
         validate_candidate(&self.tenant, &self.region, &locked)?;
-        if let Some((group, generation)) = pr_supersession_identity(&locked.record) {
+        if let Some((group, generation)) = pr_supersession_identity(&locked.record)? {
             let supersession = self.supersession()?;
             if supersession
                 .classify_on_conn(&mut transaction, &locked.record.run_id, group, generation)
@@ -686,7 +686,7 @@ impl PgCiPipelineStarter {
                 "queued-to-running compare-and-set affected no row".into(),
             ));
         }
-        if let Some((group, generation)) = pr_supersession_identity(&record) {
+        if let Some((group, generation)) = pr_supersession_identity(&record)? {
             self.supersession()?
                 .cancel_older_on_conn(&mut transaction, &record.run_id, group, generation)
                 .await
@@ -728,7 +728,7 @@ impl PgCiPipelineStarter {
         &self,
         candidate: &StarterCandidate,
     ) -> Result<Option<StartQueuedOutcome>, PgCiStarterError> {
-        let Some((group, generation)) = pr_supersession_identity(&candidate.record) else {
+        let Some((group, generation)) = pr_supersession_identity(&candidate.record)? else {
             return Ok(None);
         };
         let supersession = self.supersession()?;
@@ -801,16 +801,16 @@ impl PgCiPipelineStarter {
     }
 }
 
-fn pr_supersession_identity(record: &CiRunRecord) -> Option<(&str, Option<i64>)> {
-    (record.trigger_kind == "pull_request").then(|| {
-        (
-            record
-                .concurrency_group
-                .as_deref()
-                .expect("validated pull-request run has a concurrency group"),
-            record.pr_head_generation,
-        )
-    })
+fn pr_supersession_identity(
+    record: &CiRunRecord,
+) -> Result<Option<(&str, Option<i64>)>, PgCiStarterError> {
+    if record.trigger_kind != "pull_request" {
+        return Ok(None);
+    }
+    let group = record.concurrency_group.as_deref().ok_or_else(|| {
+        PgCiStarterError::CorruptRun("pull-request run lacks durable supersession authority".into())
+    })?;
+    Ok(Some((group, record.pr_head_generation)))
 }
 
 async fn emit_initial_checks(
