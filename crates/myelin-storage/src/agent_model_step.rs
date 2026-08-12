@@ -177,17 +177,16 @@ impl AgentModelStepStore {
         let kms = self.kms.clone();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
-                begin_on_connection(
-                    connection,
-                    &tenant_s,
-                    &region,
-                    &run_id,
-                    &step_key,
-                    &request_hash,
-                    &requested_by,
-                    &kms,
-                )
-                .await
+                let context = JournalPayloadContext {
+                    tenant: &tenant_s,
+                    region: &region,
+                    run_id: &run_id,
+                    position_key: &step_key,
+                    request_hash: &request_hash,
+                    requested_by: &requested_by,
+                    kind: JournalPayloadKind::ModelResponse,
+                };
+                begin_on_connection(connection, &context, &kms).await
             })
         }))?
     }
@@ -217,18 +216,16 @@ impl AgentModelStepStore {
         let kms = self.kms.clone();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
-                complete_on_connection(
-                    connection,
-                    &tenant_s,
-                    &region,
-                    &run_id,
-                    &step_key,
-                    &request_hash,
-                    &requested_by,
-                    &response,
-                    &kms,
-                )
-                .await
+                let context = JournalPayloadContext {
+                    tenant: &tenant_s,
+                    region: &region,
+                    run_id: &run_id,
+                    position_key: &step_key,
+                    request_hash: &request_hash,
+                    requested_by: &requested_by,
+                    kind: JournalPayloadKind::ModelResponse,
+                };
+                complete_on_connection(connection, &context, &response, &kms).await
             })
         }))?
     }
@@ -267,15 +264,18 @@ fn validate_identity(
 
 async fn begin_on_connection(
     connection: &mut sqlx::PgConnection,
-    tenant: &str,
-    region: &str,
-    run_id: &str,
-    step_key: &str,
-    request_hash: &str,
-    requested_by: &str,
+    context: &JournalPayloadContext<'_>,
     kms: &KmsEngine,
 ) -> Result<Result<ModelStepBegin, ModelStepError>, PgError> {
-    match agent_subject_status(connection, tenant, region, requested_by, kms).await? {
+    match agent_subject_status(
+        connection,
+        context.tenant,
+        context.region,
+        context.requested_by,
+        kms,
+    )
+    .await?
+    {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ModelStepError::Erased))
@@ -287,12 +287,12 @@ async fn begin_on_connection(
            (tenant_id, region, run_id, step_key, request_hash, requested_by, state)
          VALUES ($1, $2, $3, $4, $5, $6, 'started') ON CONFLICT DO NOTHING",
     )
-    .bind(tenant)
-    .bind(region)
-    .bind(run_id)
-    .bind(step_key)
-    .bind(request_hash)
-    .bind(requested_by)
+    .bind(context.tenant)
+    .bind(context.region)
+    .bind(context.run_id)
+    .bind(context.position_key)
+    .bind(context.request_hash)
+    .bind(context.requested_by)
     .execute(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -305,16 +305,16 @@ async fn begin_on_connection(
                 response_ciphertext FROM agent_model_step
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4",
     )
-    .bind(tenant)
-    .bind(region)
-    .bind(run_id)
-    .bind(step_key)
+    .bind(context.tenant)
+    .bind(context.region)
+    .bind(context.run_id)
+    .bind(context.position_key)
     .fetch_one(&mut *connection)
     .await
     .map_err(store_query)?;
     let stored_hash: String = row.try_get("request_hash").map_err(store_query)?;
     let stored_subject: String = row.try_get("requested_by").map_err(store_query)?;
-    if stored_hash != request_hash || stored_subject != requested_by {
+    if stored_hash != context.request_hash || stored_subject != context.requested_by {
         return Ok(Err(ModelStepError::Conflict));
     }
     match row
@@ -324,37 +324,28 @@ async fn begin_on_connection(
     {
         "started" => Ok(Ok(ModelStepBegin::InDoubt)),
         "redacted" => Ok(Ok(ModelStepBegin::Unreplayable)),
-        "completed" => model_response_from_row(
-            &row,
-            kms,
-            &JournalPayloadContext {
-                tenant,
-                region,
-                run_id,
-                position_key: step_key,
-                request_hash,
-                requested_by,
-                kind: JournalPayloadKind::ModelResponse,
-            },
-        )
-        .map(ModelStepBegin::Completed)
-        .map(Ok),
+        "completed" => model_response_from_row(&row, kms, context)
+            .map(ModelStepBegin::Completed)
+            .map(Ok),
         _ => Err(PgError::Query("model step has an invalid state".into())),
     }
 }
 
 async fn complete_on_connection(
     connection: &mut sqlx::PgConnection,
-    tenant: &str,
-    region: &str,
-    run_id: &str,
-    step_key: &str,
-    request_hash: &str,
-    requested_by: &str,
+    context: &JournalPayloadContext<'_>,
     response: &Value,
     kms: &KmsEngine,
 ) -> Result<Result<ModelStepCompletion, ModelStepError>, PgError> {
-    match agent_subject_status(connection, tenant, region, requested_by, kms).await? {
+    match agent_subject_status(
+        connection,
+        context.tenant,
+        context.region,
+        context.requested_by,
+        kms,
+    )
+    .await?
+    {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ModelStepError::Erased))
@@ -366,10 +357,10 @@ async fn complete_on_connection(
                 response_ciphertext FROM agent_model_step
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4 FOR UPDATE",
     )
-    .bind(tenant)
-    .bind(region)
-    .bind(run_id)
-    .bind(step_key)
+    .bind(context.tenant)
+    .bind(context.region)
+    .bind(context.run_id)
+    .bind(context.position_key)
     .fetch_optional(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -378,24 +369,12 @@ async fn complete_on_connection(
     };
     let stored_hash: String = row.try_get("request_hash").map_err(store_query)?;
     let stored_subject: String = row.try_get("requested_by").map_err(store_query)?;
-    if stored_hash != request_hash || stored_subject != requested_by {
+    if stored_hash != context.request_hash || stored_subject != context.requested_by {
         return Ok(Err(ModelStepError::Conflict));
     }
     let state: String = row.try_get("state").map_err(store_query)?;
     if state == "completed" {
-        let stored = model_response_from_row(
-            &row,
-            kms,
-            &JournalPayloadContext {
-                tenant,
-                region,
-                run_id,
-                position_key: step_key,
-                request_hash,
-                requested_by,
-                kind: JournalPayloadKind::ModelResponse,
-            },
-        )?;
+        let stored = model_response_from_row(&row, kms, context)?;
         return Ok(if stored == *response {
             Ok(ModelStepCompletion::Replayed)
         } else {
@@ -408,19 +387,7 @@ async fn complete_on_connection(
 
     let plaintext = serde_json::to_vec(response)
         .map_err(|_| PgError::Query("model response failed canonical serialization".into()))?;
-    let sealed = seal_journal_payload(
-        kms,
-        &JournalPayloadContext {
-            tenant,
-            region,
-            run_id,
-            position_key: step_key,
-            request_hash,
-            requested_by,
-            kind: JournalPayloadKind::ModelResponse,
-        },
-        &plaintext,
-    )?;
+    let sealed = seal_journal_payload(kms, context, &plaintext)?;
 
     sqlx::query(
         "UPDATE agent_model_step \
@@ -428,10 +395,10 @@ async fn complete_on_connection(
                 response_nonce = $6, response_ciphertext = $7, completed_at = now()
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND step_key = $4",
     )
-    .bind(tenant)
-    .bind(region)
-    .bind(run_id)
-    .bind(step_key)
+    .bind(context.tenant)
+    .bind(context.region)
+    .bind(context.run_id)
+    .bind(context.position_key)
     .bind(sealed.key_ref.to_uri())
     .bind(sealed.nonce.as_slice())
     .bind(sealed.ciphertext)

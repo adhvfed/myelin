@@ -165,17 +165,16 @@ impl AgentToolEffectStore {
         let kms = self.kms.clone();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
-                begin_on_connection(
-                    connection,
-                    &tenant_id,
-                    &region,
-                    &run_id,
-                    &effect_key,
-                    &request_hash,
-                    &requested_by,
-                    &kms,
-                )
-                .await
+                let context = JournalPayloadContext {
+                    tenant: &tenant_id,
+                    region: &region,
+                    run_id: &run_id,
+                    position_key: &effect_key,
+                    request_hash: &request_hash,
+                    requested_by: &requested_by,
+                    kind: JournalPayloadKind::ToolResult,
+                };
+                begin_on_connection(connection, &context, &kms).await
             })
         }))?
     }
@@ -205,18 +204,16 @@ impl AgentToolEffectStore {
         let kms = self.kms.clone();
         self.block(self.provider.with_tenant_tx(&tenant.0, move |connection| {
             Box::pin(async move {
-                complete_on_connection(
-                    connection,
-                    &tenant_id,
-                    &region,
-                    &run_id,
-                    &effect_key,
-                    &request_hash,
-                    &requested_by,
-                    &result,
-                    &kms,
-                )
-                .await
+                let context = JournalPayloadContext {
+                    tenant: &tenant_id,
+                    region: &region,
+                    run_id: &run_id,
+                    position_key: &effect_key,
+                    request_hash: &request_hash,
+                    requested_by: &requested_by,
+                    kind: JournalPayloadKind::ToolResult,
+                };
+                complete_on_connection(connection, &context, &result, &kms).await
             })
         }))?
     }
@@ -266,15 +263,18 @@ fn validate_identity(
 
 async fn begin_on_connection(
     connection: &mut sqlx::PgConnection,
-    tenant: &str,
-    region: &str,
-    run_id: &str,
-    effect_key: &str,
-    request_hash: &str,
-    requested_by: &str,
+    context: &JournalPayloadContext<'_>,
     kms: &KmsEngine,
 ) -> Result<Result<ToolEffectBegin, ToolEffectError>, PgError> {
-    match agent_subject_status(connection, tenant, region, requested_by, kms).await? {
+    match agent_subject_status(
+        connection,
+        context.tenant,
+        context.region,
+        context.requested_by,
+        kms,
+    )
+    .await?
+    {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ToolEffectError::Erased))
@@ -286,12 +286,12 @@ async fn begin_on_connection(
            (tenant_id, region, run_id, effect_key, request_hash, requested_by, state)
          VALUES ($1, $2, $3, $4, $5, $6, 'started') ON CONFLICT DO NOTHING",
     )
-    .bind(tenant)
-    .bind(region)
-    .bind(run_id)
-    .bind(effect_key)
-    .bind(request_hash)
-    .bind(requested_by)
+    .bind(context.tenant)
+    .bind(context.region)
+    .bind(context.run_id)
+    .bind(context.position_key)
+    .bind(context.request_hash)
+    .bind(context.requested_by)
     .execute(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -304,21 +304,21 @@ async fn begin_on_connection(
                 result_ciphertext FROM agent_tool_effect
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_key = $4",
     )
-    .bind(tenant)
-    .bind(region)
-    .bind(run_id)
-    .bind(effect_key)
+    .bind(context.tenant)
+    .bind(context.region)
+    .bind(context.run_id)
+    .bind(context.position_key)
     .fetch_one(&mut *connection)
     .await
     .map_err(store_query)?;
     if row
         .try_get::<String, _>("request_hash")
         .map_err(store_query)?
-        != request_hash
+        != context.request_hash
         || row
             .try_get::<String, _>("requested_by")
             .map_err(store_query)?
-            != requested_by
+            != context.requested_by
     {
         return Ok(Err(ToolEffectError::Conflict));
     }
@@ -329,37 +329,28 @@ async fn begin_on_connection(
     {
         "started" => Ok(Ok(ToolEffectBegin::Execute)),
         "redacted" => Ok(Ok(ToolEffectBegin::Unreplayable)),
-        "completed" => tool_result_from_row(
-            &row,
-            kms,
-            &JournalPayloadContext {
-                tenant,
-                region,
-                run_id,
-                position_key: effect_key,
-                request_hash,
-                requested_by,
-                kind: JournalPayloadKind::ToolResult,
-            },
-        )
-        .map(ToolEffectBegin::Completed)
-        .map(Ok),
+        "completed" => tool_result_from_row(&row, kms, context)
+            .map(ToolEffectBegin::Completed)
+            .map(Ok),
         _ => Err(PgError::Query("tool effect has an invalid state".into())),
     }
 }
 
 async fn complete_on_connection(
     connection: &mut sqlx::PgConnection,
-    tenant: &str,
-    region: &str,
-    run_id: &str,
-    effect_key: &str,
-    request_hash: &str,
-    requested_by: &str,
+    context: &JournalPayloadContext<'_>,
     result: &str,
     kms: &KmsEngine,
 ) -> Result<Result<ToolEffectCompletion, ToolEffectError>, PgError> {
-    match agent_subject_status(connection, tenant, region, requested_by, kms).await? {
+    match agent_subject_status(
+        connection,
+        context.tenant,
+        context.region,
+        context.requested_by,
+        kms,
+    )
+    .await?
+    {
         AgentSubjectStatus::Active => {}
         AgentSubjectStatus::Erasing | AgentSubjectStatus::Erased => {
             return Ok(Err(ToolEffectError::Erased))
@@ -371,10 +362,10 @@ async fn complete_on_connection(
                 result_ciphertext FROM agent_tool_effect
          WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_key = $4 FOR UPDATE",
     )
-    .bind(tenant)
-    .bind(region)
-    .bind(run_id)
-    .bind(effect_key)
+    .bind(context.tenant)
+    .bind(context.region)
+    .bind(context.run_id)
+    .bind(context.position_key)
     .fetch_optional(&mut *connection)
     .await
     .map_err(store_query)?;
@@ -384,11 +375,11 @@ async fn complete_on_connection(
     if row
         .try_get::<String, _>("request_hash")
         .map_err(store_query)?
-        != request_hash
+        != context.request_hash
         || row
             .try_get::<String, _>("requested_by")
             .map_err(store_query)?
-            != requested_by
+            != context.requested_by
     {
         return Ok(Err(ToolEffectError::Conflict));
     }
@@ -398,45 +389,21 @@ async fn complete_on_connection(
         .as_str()
     {
         "completed" => {
-            let stored = tool_result_from_row(
-                &row,
-                kms,
-                &JournalPayloadContext {
-                    tenant,
-                    region,
-                    run_id,
-                    position_key: effect_key,
-                    request_hash,
-                    requested_by,
-                    kind: JournalPayloadKind::ToolResult,
-                },
-            )?;
+            let stored = tool_result_from_row(&row, kms, context)?;
             Ok(Ok(ToolEffectCompletion::Replayed(stored)))
         }
         "started" => {
-            let sealed = seal_journal_payload(
-                kms,
-                &JournalPayloadContext {
-                    tenant,
-                    region,
-                    run_id,
-                    position_key: effect_key,
-                    request_hash,
-                    requested_by,
-                    kind: JournalPayloadKind::ToolResult,
-                },
-                result.as_bytes(),
-            )?;
+            let sealed = seal_journal_payload(kms, context, result.as_bytes())?;
             sqlx::query(
                 "UPDATE agent_tool_effect
                     SET state = 'completed', result_text = NULL, result_key_ref = $5, \
                         result_nonce = $6, result_ciphertext = $7, completed_at = now()
                   WHERE tenant_id = $1 AND region = $2 AND run_id = $3 AND effect_key = $4",
             )
-            .bind(tenant)
-            .bind(region)
-            .bind(run_id)
-            .bind(effect_key)
+            .bind(context.tenant)
+            .bind(context.region)
+            .bind(context.run_id)
+            .bind(context.position_key)
             .bind(sealed.key_ref.to_uri())
             .bind(sealed.nonce.as_slice())
             .bind(sealed.ciphertext)
