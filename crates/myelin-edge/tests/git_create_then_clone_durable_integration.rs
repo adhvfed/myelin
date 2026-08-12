@@ -19,6 +19,16 @@ use myelin_storage::{
 use myelin_substrate::FailStaticThreshold;
 use myelin_tenancy::{Region, TenantId};
 
+fn test_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
     let mut c = cfg.clone();
     c.database_url = c
@@ -81,13 +91,9 @@ fn principal(id: &str, tenant: &str, region: &str) -> Principal {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_bootstrap_grant_admits_creator_via_a_separate_check_store() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(&test_config()), 4)
+        .await
+        .expect("connect to the Postgres required by the durable repository bootstrap story");
     admin
         .migrate(&identity_durable_migrations(), &HotTables::none())
         .await
@@ -97,13 +103,9 @@ async fn durable_bootstrap_grant_admits_creator_via_a_separate_check_store() {
         .await
         .expect("foundation (outbox) migration");
 
-    let app = match SubstrateProvider::connect(MyelinConfig::dev(), 6).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let app = SubstrateProvider::connect(test_config(), 6)
+        .await
+        .expect("connect to the app-role Postgres required by the repository bootstrap story");
     let region = app.config().region.clone();
     let handle = tokio::runtime::Handle::current();
     let suffix = uniq();
