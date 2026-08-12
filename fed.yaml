@@ -343,7 +343,8 @@ services:
       token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_DEV_TENANT" --region fr-par
       --principal developer --display-name "Myelin Developer"
-      --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
+      --issues-project 20aee030-c7fa-4757-8243-700faf528690
+      --issues-type 7d457754-f6a1-4cd8-8738-21751570b627 --issues-prefix MYL --ttl-days 1)";
       test -n "$token";
       export MYELIN_DEV_ACCESS_TOKEN="$token";
       exec pnpm --dir frontend --filter @myelin/web exec vinxi dev --host 127.0.0.1'
@@ -424,13 +425,17 @@ scripts:
       token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_SYSTEM_TEST_TENANT" --region "$MYELIN_SYSTEM_TEST_REGION"
       --principal "$MYELIN_SYSTEM_TEST_PRINCIPAL" --display-name "System Test"
-      --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
+      --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT"
+      --issues-type "$MYELIN_SYSTEM_TEST_ISSUES_TYPE"
+      --issues-prefix "$MYELIN_SYSTEM_TEST_ISSUES_PREFIX" --ttl-days 1)";
       test -n "$token";
       export MYELIN_SYSTEM_TEST_TOKEN="$token";
       reviewer_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_SYSTEM_TEST_TENANT" --region "$MYELIN_SYSTEM_TEST_REGION"
       --principal "$MYELIN_SYSTEM_TEST_REVIEWER_PRINCIPAL" --display-name "System Reviewer"
-      --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
+      --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT"
+      --issues-type "$MYELIN_SYSTEM_TEST_ISSUES_TYPE"
+      --issues-prefix "$MYELIN_SYSTEM_TEST_ISSUES_PREFIX" --ttl-days 1)";
       test -n "$reviewer_token";
       export MYELIN_SYSTEM_TEST_REVIEWER_TOKEN="$reviewer_token";
       privacy_principal="privacy-system-test-$(date +%s)-$$";
@@ -438,7 +443,9 @@ scripts:
       privacy_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_SYSTEM_TEST_TENANT" --region "$MYELIN_SYSTEM_TEST_REGION"
       --principal "$privacy_principal" --display-name "Privacy System Test"
-      --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT" --ttl-days 1)";
+      --issues-project "$MYELIN_SYSTEM_TEST_ISSUES_PROJECT"
+      --issues-type "$MYELIN_SYSTEM_TEST_ISSUES_TYPE"
+      --issues-prefix "$MYELIN_SYSTEM_TEST_ISSUES_PREFIX" --ttl-days 1)";
       test -n "$privacy_token";
       export MYELIN_SYSTEM_TEST_PRIVACY_TOKEN="$privacy_token";
       pnpm --dir system-tests install --frozen-lockfile;
@@ -468,7 +475,8 @@ scripts:
       browser_token="$(cargo run --quiet -p myelin-edge --bin edge -- bootstrap
       --tenant "$MYELIN_BROWSER_TENANT" --region fr-par
       --principal "$MYELIN_BROWSER_PRINCIPAL" --display-name "Myelin Developer"
-      --issues-project 20aee030-c7fa-4757-8243-700faf528690 --ttl-days 1)";
+      --issues-project 20aee030-c7fa-4757-8243-700faf528690
+      --issues-type 7d457754-f6a1-4cd8-8738-21751570b627 --issues-prefix MYL --ttl-days 1)";
       test -n "$browser_token";
       export MYELIN_BROWSER_EDGE_TOKEN="$browser_token";
       pnpm --dir frontend --filter @myelin/web exec playwright test

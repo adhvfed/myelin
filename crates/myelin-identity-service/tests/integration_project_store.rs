@@ -299,3 +299,63 @@ async fn project_creation_co_commits_its_creator_grant_and_retry_identity() {
         .await
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn operator_bootstrap_registers_existing_project_metadata_once() {
+    let config = test_config();
+    let admin = SubstrateProvider::connect(admin_config(&config), 4)
+        .await
+        .expect("connect to the Postgres required by operator bootstrap");
+    admin.migrate_foundation().await.unwrap();
+    admin
+        .migrate(&all_durable_migrations(), &HotTables::none())
+        .await
+        .unwrap();
+    let app = SubstrateProvider::connect(config, 6)
+        .await
+        .expect("connect constrained runtime role");
+    let region = app.config().region.clone();
+    let tenant = format!("project-bootstrap-{}", unique());
+    let founder = actor(&tenant, &region);
+    let store = PgProjectStore::new(app);
+    let project_id = "11111111-1111-4111-8111-111111111111";
+    let issue_type_id = "22222222-2222-4222-8222-222222222222";
+
+    let first = store
+        .ensure_existing_project_metadata(
+            &founder,
+            project_id,
+            "Imported engineering",
+            "BOOT",
+            issue_type_id,
+        )
+        .await
+        .expect("bootstrap makes a reference-only project usable by current issue tools");
+    assert!(first.registered);
+    assert_eq!(first.project.id, project_id);
+    assert_eq!(first.project.default_issue_type_id, issue_type_id);
+
+    let replay = store
+        .ensure_existing_project_metadata(
+            &founder,
+            project_id,
+            "Imported engineering",
+            "BOOT",
+            issue_type_id,
+        )
+        .await
+        .expect("repeating operator bootstrap preserves the original project");
+    assert!(!replay.registered);
+    assert_eq!(replay.project, first.project);
+
+    let changed_contract = store
+        .ensure_existing_project_metadata(
+            &founder,
+            project_id,
+            "Imported engineering",
+            "BOOT",
+            "33333333-3333-4333-8333-333333333333",
+        )
+        .await;
+    assert!(matches!(changed_contract, Err(ProjectError::Conflict(_))));
+}

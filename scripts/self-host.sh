@@ -19,7 +19,9 @@
 #   ./scripts/self-host.sh bootstrap -- <flags>
 #                                          run `edge bootstrap <flags>` over the self-host env, e.g.
 #                                            ./scripts/self-host.sh bootstrap -- --tenant acme --principal founder \
-#                                              --issues-project 20aee030-c7fa-4757-8243-700faf528690
+#                                              --issues-project 20aee030-c7fa-4757-8243-700faf528690 \
+#                                              --issues-type 7d457754-f6a1-4cd8-8738-21751570b627 \
+#                                              --issues-prefix MYL
 #                                          prints the capability token to STDOUT (nothing else)
 #   printf '%s' "$SECRET" | ./scripts/self-host.sh secret -- <operation> <flags>
 #                                          run authenticated `edge secret ...`; secret material for
@@ -528,7 +530,10 @@ case "${cmd}" in
       fi
     done
     if [[ "${has_issues_project}" == "0" ]]; then
-      set -- "$@" --issues-project "${MYELIN_SELF_HOST_ISSUES_PROJECT}"
+      set -- "$@" \
+        --issues-project "${MYELIN_SELF_HOST_ISSUES_PROJECT}" \
+        --issues-type "${MYELIN_SELF_HOST_ISSUES_TYPE}" \
+        --issues-prefix "${MYELIN_SELF_HOST_ISSUES_PREFIX}"
     fi
     echo "self-host: minting an operator token (edge bootstrap $*) — the token prints to STDOUT" >&2
     exec cargo run --quiet -p myelin-edge --bin edge -- bootstrap "$@"

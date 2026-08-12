@@ -63,6 +63,12 @@ pub struct ProjectCreation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectMetadataRegistration {
+    pub project: Project,
+    pub registered: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectError {
     BadInput(String),
     NotFound,
@@ -214,6 +220,98 @@ impl PgProjectStore {
         }
     }
 
+    pub async fn ensure_existing_project_metadata(
+        &self,
+        actor: &Principal,
+        project_id: &str,
+        name: &str,
+        issue_prefix: &str,
+        default_issue_type_id: &str,
+    ) -> Result<ProjectMetadataRegistration, ProjectError> {
+        self.require_local_region(actor)?;
+        let project_id = parse_canonical_uuid(project_id, "project id")?;
+        let default_issue_type_id =
+            parse_canonical_uuid(default_issue_type_id, "default issue type id")?;
+        let client_nonce = format!("existing-project:{project_id}");
+        let proposal = NewProject {
+            name: name.to_string(),
+            issue_prefix: issue_prefix.to_string(),
+            client_nonce: client_nonce.clone(),
+        };
+        validate_new_project(&proposal)?;
+
+        let tenant = actor.tenant.0.clone();
+        let region = actor.region.0.clone();
+        let actor_id = actor.principal_id.0.clone();
+        let name = name.to_string();
+        let issue_prefix = issue_prefix.to_string();
+        let created_at = Utc::now();
+        let outcome = self
+            .provider
+            .with_tenant_tx(&tenant.clone(), move |conn| {
+                Box::pin(async move {
+                    let inserted = sqlx::query(
+                        "INSERT INTO identity_project (\
+                           tenant_id, region, project_id, name, issue_prefix, \
+                           default_issue_type_id, created_by, client_nonce, created_at\
+                         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
+                         ON CONFLICT DO NOTHING \
+                         RETURNING project_id, name, issue_prefix, default_issue_type_id, \
+                                   created_by, created_at",
+                    )
+                    .bind(&tenant)
+                    .bind(&region)
+                    .bind(project_id)
+                    .bind(&name)
+                    .bind(&issue_prefix)
+                    .bind(default_issue_type_id)
+                    .bind(&actor_id)
+                    .bind(&client_nonce)
+                    .bind(created_at)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(query_error("register existing project metadata"))?;
+                    if let Some(row) = inserted {
+                        return Ok(ProjectMetadataTx::Registered(project_from_row(&row)?));
+                    }
+                    Ok(
+                        match project_by_id(conn, &tenant, &region, project_id).await? {
+                            Some(project) => ProjectMetadataTx::Existing(project),
+                            None => ProjectMetadataTx::Conflict,
+                        },
+                    )
+                })
+            })
+            .await
+            .map_err(|error| ProjectError::Storage(error.to_string()))?;
+
+        let (project, registered) = match outcome {
+            ProjectMetadataTx::Registered(project) => (project, true),
+            ProjectMetadataTx::Existing(project)
+                if project.name == proposal.name
+                    && project.issue_prefix == proposal.issue_prefix
+                    && project.default_issue_type_id == default_issue_type_id.to_string() =>
+            {
+                (project, false)
+            }
+            ProjectMetadataTx::Existing(_) => {
+                return Err(ProjectError::Conflict(
+                    "the existing project metadata differs from the bootstrap contract".into(),
+                ))
+            }
+            ProjectMetadataTx::Conflict => {
+                return Err(ProjectError::Conflict(format!(
+                    "issue prefix `{}` is already assigned to another project",
+                    proposal.issue_prefix
+                )))
+            }
+        };
+        Ok(ProjectMetadataRegistration {
+            project,
+            registered,
+        })
+    }
+
     pub async fn get(&self, actor: &Principal, project_id: &str) -> Result<Project, ProjectError> {
         self.require_local_region(actor)?;
         let project_id = parse_project_id(project_id)?;
@@ -304,6 +402,32 @@ enum CreateTx {
     Created(Project),
     Existing(Project),
     PrefixConflict,
+}
+
+enum ProjectMetadataTx {
+    Registered(Project),
+    Existing(Project),
+    Conflict,
+}
+
+async fn project_by_id(
+    conn: &mut sqlx::PgConnection,
+    tenant: &str,
+    region: &str,
+    project_id: Uuid,
+) -> Result<Option<Project>, PgError> {
+    let row = sqlx::query(
+        "SELECT project_id, name, issue_prefix, default_issue_type_id, created_by, created_at \
+           FROM identity_project \
+          WHERE tenant_id = $1 AND region = $2 AND project_id = $3",
+    )
+    .bind(tenant)
+    .bind(region)
+    .bind(project_id)
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(query_error("read identity project"))?;
+    row.as_ref().map(project_from_row).transpose()
 }
 
 async fn project_by_nonce(
@@ -441,12 +565,16 @@ fn project_created_event(
 }
 
 fn parse_project_id(value: &str) -> Result<Uuid, ProjectError> {
+    parse_canonical_uuid(value, "project id")
+}
+
+fn parse_canonical_uuid(value: &str, field: &str) -> Result<Uuid, ProjectError> {
     let parsed = Uuid::parse_str(value)
-        .map_err(|_| ProjectError::BadInput("project id must be a canonical UUID".into()))?;
+        .map_err(|_| ProjectError::BadInput(format!("{field} must be a canonical UUID")))?;
     if parsed.to_string() != value {
-        return Err(ProjectError::BadInput(
-            "project id must be a canonical UUID".into(),
-        ));
+        return Err(ProjectError::BadInput(format!(
+            "{field} must be a canonical UUID"
+        )));
     }
     Ok(parsed)
 }

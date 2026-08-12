@@ -19,7 +19,8 @@ use myelin_edge::{
 };
 use myelin_events::{OutboxStore, Timestamp};
 use myelin_identity::{
-    AuthzError, Credential, FragmentAdmit, Principal, PrincipalId, PrincipalKind, RevokeTarget,
+    AuthzError, Credential, DataRole, FragmentAdmit, Principal, PrincipalId, PrincipalKind,
+    PrincipalStatus, RevokeTarget,
 };
 use myelin_identity_service::{
     CapabilityAuthenticator, CellTokenAuthority, DpopReplayGuard, HumanSsoAuthenticator, JwkSet,
@@ -1351,6 +1352,14 @@ async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
         eprintln!("edge bootstrap: --issues-project must be a canonical lowercase UUID");
         std::process::exit(2);
     }
+    let issues_type = required_flag(args, "--issues-type");
+    if !myelin_issues::api::is_canonical_uuid(&issues_type) {
+        eprintln!("edge bootstrap: --issues-type must be a canonical lowercase UUID");
+        std::process::exit(2);
+    }
+    let issues_prefix = required_flag(args, "--issues-prefix");
+    let issues_project_name =
+        flag(args, "--issues-project-name").unwrap_or_else(|| "Default project".into());
     let display_name = flag(args, "--display-name");
     let region = flag(args, "--region").unwrap_or_else(default_region);
     let ttl_days: u32 = flag(args, "--ttl-days")
@@ -1387,6 +1396,28 @@ async fn operator_bootstrap(core: ComposedCore, args: &[String]) {
         eprintln!("edge bootstrap: {e}");
         std::process::exit(1);
     });
+
+    let actor = Principal::new(
+        TenantId(outcome.tenant.clone()),
+        Region(outcome.region.clone()),
+        PrincipalId(outcome.principal_id.clone()),
+        PrincipalKind::Human,
+        DataRole::Controller,
+        PrincipalStatus::Active,
+    );
+    myelin_identity_service::PgProjectStore::new(provider.clone())
+        .ensure_existing_project_metadata(
+            &actor,
+            &issues_project,
+            &issues_project_name,
+            &issues_prefix,
+            &issues_type,
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("edge bootstrap: project metadata registration failed: {error}");
+            std::process::exit(1);
+        });
 
     println!("{}", outcome.token);
     eprintln!("edge bootstrap: minted an operator capability token");
