@@ -73,6 +73,38 @@ impl GovernedRun {
     }
 }
 
+pub struct IssuedGovernedRun {
+    principal: GovernedRun,
+    token: RunToken,
+    effective_grants: BTreeSet<String>,
+}
+
+impl IssuedGovernedRun {
+    pub fn new(
+        principal: GovernedRun,
+        token: RunToken,
+        effective_grants: impl IntoIterator<Item = String>,
+    ) -> Result<Self, String> {
+        principal.validate()?;
+        if token.token.is_empty() || token.jti.is_empty() {
+            return Err("issued governed run requires a non-empty bearer and token id".into());
+        }
+        let effective_grants = effective_grants.into_iter().collect::<BTreeSet<_>>();
+        if effective_grants.is_empty()
+            || effective_grants.iter().any(|grant| {
+                grant.is_empty() || grant.len() > 255 || grant.contains(char::is_whitespace)
+            })
+        {
+            return Err("issued governed run requires bounded effective grants".into());
+        }
+        Ok(Self {
+            principal,
+            token,
+            effective_grants,
+        })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CallOutcome {
     Applied {
@@ -618,43 +650,33 @@ impl GovernedRouter {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub fn with_issued_run(
         minter: RunTokenMinter,
-        principal: GovernedRun,
-        run_token: RunToken,
-        effective_grants: impl IntoIterator<Item = String>,
+        issued: IssuedGovernedRun,
         effect_api: Box<dyn EffectApi>,
         verdicts: HitlVerdictStore,
         approver_policy: Arc<dyn GateApproverPolicy>,
         audit_sink: Arc<dyn GovernanceAudit>,
-    ) -> Result<GovernedRouter, String> {
-        principal.validate()?;
-        if run_token.token.is_empty() || run_token.jti.is_empty() {
-            return Err("issued governed run requires a non-empty bearer and token id".into());
-        }
-        let effective_grants = effective_grants.into_iter().collect::<BTreeSet<_>>();
-        if effective_grants.is_empty()
-            || effective_grants.iter().any(|grant| {
-                grant.is_empty() || grant.len() > 255 || grant.contains(char::is_whitespace)
-            })
-        {
-            return Err("issued governed run requires bounded effective grants".into());
-        }
-        Ok(GovernedRouter {
+    ) -> GovernedRouter {
+        let IssuedGovernedRun {
+            principal,
+            token,
+            effective_grants,
+        } = issued;
+        GovernedRouter {
             minter,
             principal,
             minting_principal: None,
             effect_api,
             state: RefCell::new(RunState {
-                token: Some(run_token),
+                token: Some(token),
                 effective_grants,
                 ..RunState::default()
             }),
             verdicts: RefCell::new(verdicts),
             approver_policy,
             audit_sink,
-        })
+        }
     }
 
     pub fn minter(&self) -> &RunTokenMinter {

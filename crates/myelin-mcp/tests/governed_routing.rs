@@ -32,8 +32,9 @@ use myelin_tenancy::{Region, TenantId};
 use myelin_mcp::governance::SkeletonEffectApi;
 use myelin_mcp::{
     AuditPhase, CallOutcome, DirectReadError, DirectReadExecutor, GateApproverPolicy,
-    GovernanceAudit, GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter, McpServer,
-    OutboxGovernanceAudit, ReadAuthorization, RunPrincipal, ToolRegistry,
+    GovernanceAudit, GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter,
+    IssuedGovernedRun, McpServer, OutboxGovernanceAudit, ReadAuthorization, RunPrincipal,
+    ToolRegistry,
 };
 use myelin_storage::hitl_gate_durable::{
     gate_ref_token, GateDecideError, GateRecord, GateState, HitlVerdictStore,
@@ -554,9 +555,12 @@ fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection(
     let issued_token = minting_router.current_token().unwrap();
     let router = GovernedRouter::with_issued_run(
         minting_router.minter().clone(),
-        minting_router.principal().clone(),
-        issued_token.clone(),
-        ["repo.push".into(), "run.view".into()],
+        IssuedGovernedRun::new(
+            minting_router.principal().clone(),
+            issued_token.clone(),
+            ["repo.push".into(), "run.view".into()],
+        )
+        .unwrap(),
         Box::new(SkeletonEffectApi::new()),
         HitlVerdictStore::new(),
         Arc::new(TestApprovers(vec![PrincipalId("human:operator".into())])),
@@ -564,8 +568,7 @@ fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection(
             OutboxStore::new(),
             Arc::new(MonotonicMinter::new()),
         )),
-    )
-    .unwrap();
+    );
     assert_eq!(
         router.current_token(),
         Some(issued_token),
@@ -593,6 +596,28 @@ fn an_edge_issued_run_uses_its_existing_identity_and_exact_activation_selection(
         .map(|tool| tool["name"].as_str().unwrap())
         .collect::<Vec<_>>();
     assert_eq!(names, ["ci.read_run", "git.open_pr"]);
+}
+
+#[test]
+fn an_edge_issued_run_binds_identity_bearer_and_grants_before_routing() {
+    let minting_router = ci_read_router(&["run.view"]);
+    minting_router
+        .permitted_tool_names(&ToolRegistry::with_git_and_ci_reads().unwrap(), &now())
+        .unwrap();
+    let principal = minting_router.principal().clone();
+    let token = minting_router.current_token().unwrap();
+
+    assert!(IssuedGovernedRun::new(principal.clone(), token.clone(), Vec::new()).is_err());
+    assert!(IssuedGovernedRun::new(
+        principal.clone(),
+        token.clone(),
+        ["run.view with whitespace".into()],
+    )
+    .is_err());
+
+    let mut missing_bearer = token;
+    missing_bearer.token.clear();
+    assert!(IssuedGovernedRun::new(principal, missing_bearer, ["run.view".into()]).is_err());
 }
 
 #[test]

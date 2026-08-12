@@ -17,7 +17,7 @@ use myelin_identity_service::{
 use myelin_mcp::{
     approval_contract_from_effect_key, AuditPhase, GateApproverPolicy, GateAuditMinter,
     GovernanceAudit, GovernanceAuditRecord, GovernanceAuditTarget, GovernedRouter, GovernedRun,
-    McpServer, OutboxGovernanceAudit, ToolRegistry, MAX_FRAME_BYTES,
+    IssuedGovernedRun, McpServer, OutboxGovernanceAudit, ToolRegistry, MAX_FRAME_BYTES,
 };
 use myelin_notif::pg_inbox::PgInboxStore;
 use myelin_notif::{agent_effect_approval_targets, pending_agent_effect_approval};
@@ -479,15 +479,17 @@ impl Handler for AgentMcpHandler {
         });
         let router = GovernedRouter::with_issued_run(
             self.services.authority.run_tokens.clone(),
-            principal,
-            run_token,
-            capability.effective_authority.grants().map(str::to_string),
+            IssuedGovernedRun::new(
+                principal,
+                run_token,
+                capability.effective_authority.grants().map(str::to_string),
+            )
+            .map_err(EdgeError::Unavailable)?,
             effect_api,
             HitlVerdictStore::with_pg(self.services.provider.clone()),
             approvers,
             self.services.audit.clone(),
-        )
-        .map_err(EdgeError::Unavailable)?;
+        );
         let reads = Arc::new(
             McpReadExecutor::new(
                 self.services.resources.ci.clone(),
