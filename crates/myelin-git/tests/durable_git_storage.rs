@@ -350,12 +350,20 @@ fn path_traversal_cross_tenant_breakout_is_rejected_on_read_and_write() {
     assert!(root.join("tenant-a/fr-par/secret.git").is_dir());
     assert!(root.join("tenant-b/fr-par/mine.git").is_dir());
     let b_dir = root.join("tenant-b/fr-par");
-    let entries: Vec<String> = std::fs::read_dir(&b_dir)
+    let mut directories: Vec<String> = std::fs::read_dir(&b_dir)
         .unwrap()
-        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            entry
+                .file_type()
+                .unwrap()
+                .is_dir()
+                .then(|| entry.file_name().to_string_lossy().to_string())
+        })
         .collect();
+    directories.sort();
     assert_eq!(
-        entries,
+        directories,
         vec!["mine.git".to_string()],
         "no smuggled dir under tenant-b"
     );
