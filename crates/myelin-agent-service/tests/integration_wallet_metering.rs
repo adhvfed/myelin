@@ -19,6 +19,16 @@ use myelin_storage::SubstrateProvider;
 use myelin_tenancy::{Region, TenantId};
 use std::sync::Arc;
 
+fn app_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 #[derive(Default)]
 struct ProviderMinter;
 impl RunTokenMinter for ProviderMinter {
@@ -139,19 +149,15 @@ fn uniq() -> String {
     )
 }
 
-async fn migrate_admin() -> Option<SubstrateProvider> {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return None;
-        }
-    };
+async fn migrate_admin() -> SubstrateProvider {
+    let admin = SubstrateProvider::connect(admin_config(&app_config()), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate(&agent_wallet_migrations(), &HotTables::none())
         .await
         .expect("apply the agent-wallet migration (0080)");
-    Some(admin)
+    admin
 }
 
 async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id: &str) -> i64 {
@@ -180,10 +186,8 @@ async fn debit_row_count(pool: &sqlx::PgPool, tenant: &str, region: &str, run_id
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metered_run_debits_the_durable_wallet_per_turn() {
-    let Some(_admin) = migrate_admin().await else {
-        return;
-    };
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 6)
+    let _admin = migrate_admin().await;
+    let app = SubstrateProvider::connect(app_config(), 6)
         .await
         .expect("connect app role");
     let region_s = app.config().region.clone();
@@ -261,10 +265,8 @@ async fn metered_run_debits_the_durable_wallet_per_turn() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn metered_run_dry_durable_wallet_halts_gracefully() {
-    let Some(_admin) = migrate_admin().await else {
-        return;
-    };
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 6)
+    let _admin = migrate_admin().await;
+    let app = SubstrateProvider::connect(app_config(), 6)
         .await
         .expect("connect app role");
     let region_s = app.config().region.clone();

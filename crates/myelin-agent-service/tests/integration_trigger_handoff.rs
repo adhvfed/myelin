@@ -22,8 +22,18 @@ use sqlx::types::chrono::Utc;
 use sqlx::types::Uuid;
 use sqlx::Row;
 
-fn admin_config() -> MyelinConfig {
+fn app_config() -> MyelinConfig {
     let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
+fn admin_config() -> MyelinConfig {
+    let mut config = app_config();
     config.database_url = config
         .database_url
         .replace("myelin_app:myelin_app_pw", "myelin_admin:myelin_dev_pw");
@@ -132,13 +142,9 @@ fn failed_main_event(tenant: &TenantId, region: &str) -> EventEnvelope {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn one_red_build_becomes_one_durable_agent_workflow() {
-    let admin = match SubstrateProvider::connect(admin_config(), 4).await {
-        Ok(provider) => provider,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(), 4)
+        .await
+        .expect("integration tests require the configured Postgres backend");
     admin
         .migrate_foundation()
         .await
@@ -155,7 +161,7 @@ async fn one_red_build_becomes_one_durable_agent_workflow() {
         .await
         .expect("the durable workflow schema is present");
 
-    let app = SubstrateProvider::connect(MyelinConfig::dev(), 8)
+    let app = SubstrateProvider::connect(app_config(), 8)
         .await
         .expect("open the constrained app provider");
     let tenant = unique_tenant();
