@@ -68,7 +68,14 @@ pub fn preflight_explicit_userns_helpers(helper_dir: &Path) -> Result<(), String
     crate::dirlock::verify_ancestors_not_writable_by_us(helper_dir).map_err(|reason| {
         format!("{helper_dir:?}'s ancestor chain is not safely anchored: {reason}")
     })?;
-    for helper in ["newuidmap", "newgidmap"] {
+    const NEWUIDMAP_CAP_SETUID_EP: &[u8] =
+        b"\x01\x00\x00\x02\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    const NEWGIDMAP_CAP_SETGID_EP: &[u8] =
+        b"\x01\x00\x00\x02\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
+    for (helper, expected_file_capability) in [
+        ("newuidmap", NEWUIDMAP_CAP_SETUID_EP),
+        ("newgidmap", NEWGIDMAP_CAP_SETGID_EP),
+    ] {
         let path = helper_dir.join(helper);
         let meta = std::fs::symlink_metadata(&path).map_err(|e| format!("stat {path:?}: {e}"))?;
         if meta.file_type().is_symlink() {
@@ -95,15 +102,6 @@ pub fn preflight_explicit_userns_helpers(helper_dir: &Path) -> Result<(), String
                 meta.mode() & 0o777
             ));
         }
-        const NEWUIDMAP_CAP_SETUID_EP: &[u8] =
-            b"\x01\x00\x00\x02\x80\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-        const NEWGIDMAP_CAP_SETGID_EP: &[u8] =
-            b"\x01\x00\x00\x02\x40\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00";
-        let expected_file_capability = match helper {
-            "newuidmap" => NEWUIDMAP_CAP_SETUID_EP,
-            "newgidmap" => NEWGIDMAP_CAP_SETGID_EP,
-            _ => unreachable!("the helper list above is closed"),
-        };
         verify_helper_security_capability_xattr(&path, expected_file_capability)?;
         let path_c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
             .map_err(|e| format!("{path:?} contains an interior NUL: {e}"))?;

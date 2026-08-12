@@ -90,7 +90,10 @@ pub fn canonical_tree_sha256(dir: &Path) -> io::Result<[u8; 32]> {
         Err(
             AssetTreeVerificationError::GroupOrWorldWritable { .. }
             | AssetTreeVerificationError::UnexpectedOwner { .. },
-        ) => unreachable!("no asset metadata policy is requested by the generic hasher"),
+        ) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "generic canonical tree hashing unexpectedly applied an asset metadata policy",
+        )),
     }
 }
 

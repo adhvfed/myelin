@@ -201,13 +201,10 @@ pub enum WorkspaceProvisionError {
 }
 
 impl WorkspaceProvisionError {
-    pub fn into_workspace_after_invariant_violation(self) -> ManagedWorkspace {
+    pub fn into_workspace_after_invariant_violation(self) -> Result<ManagedWorkspace, Self> {
         match self {
-            WorkspaceProvisionError::InternalInvariantViolated { workspace, .. } => *workspace,
-            WorkspaceProvisionError::Refused(_) | WorkspaceProvisionError::Storage(_) => panic!(
-                "only WorkspaceProvisionError::InternalInvariantViolated carries a \
-                 ManagedWorkspace back"
-            ),
+            WorkspaceProvisionError::InternalInvariantViolated { workspace, .. } => Ok(*workspace),
+            other => Err(other),
         }
     }
 }
@@ -880,14 +877,10 @@ pub enum DeleteWorkspaceError {
 }
 
 impl DeleteWorkspaceError {
-    pub fn into_workspace(self) -> ManagedWorkspace {
+    pub fn into_workspace(self) -> Result<ManagedWorkspace, Self> {
         match self {
-            DeleteWorkspaceError::WrongManager { workspace } => workspace,
-            DeleteWorkspaceError::Storage(_)
-            | DeleteWorkspaceError::InternalInvariantViolated { .. } => panic!(
-                "only DeleteWorkspaceError::WrongManager carries a recoverable ManagedWorkspace \
-                 back - every other variant means it was already consumed internally"
-            ),
+            DeleteWorkspaceError::WrongManager { workspace } => Ok(workspace),
+            other => Err(other),
         }
     }
 }
@@ -935,9 +928,12 @@ fn open_enabled_backend(
                     .map_err(WorkspaceManagerError::Storage)?,
             ))
         }
-        WorkspaceStorageMode::Disabled => unreachable!(
-            "open_enabled_backend is only called for an enabled mode (Disabled returns earlier)"
-        ),
+        WorkspaceStorageMode::Disabled => {
+            Err(WorkspaceManagerError::Storage(WorkspaceStorageError::Io {
+                path: base_dir.to_path_buf(),
+                reason: "disabled workspace mode has no storage backend".into(),
+            }))
+        }
     }
 }
 
@@ -1642,7 +1638,7 @@ mod tests {
         ));
         let error = result.unwrap_err();
         assert!(error.to_string().contains("job-1"));
-        let workspace = error.into_workspace_after_invariant_violation();
+        let workspace = error.into_workspace_after_invariant_violation().unwrap();
         assert_eq!(
             manager.capacity_used_bytes(),
             10,

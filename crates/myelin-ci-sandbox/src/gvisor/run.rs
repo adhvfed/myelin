@@ -105,21 +105,18 @@ pub(super) fn run_production_container_streaming(
                 Err(message) => Err(message),
             }
         }
-        binding => {
-            let enabled = match binding {
-                RuntimeBinding::Rootless => None,
-                RuntimeBinding::Enabled {
-                    expected_root_identity,
-                    context,
-                } => Some((
-                    &mut context.lease,
-                    &mut context.bind_state,
-                    *expected_root_identity,
-                )),
-                RuntimeBinding::EnabledPrepared { .. } => {
-                    unreachable!("EnabledPrepared is handled in the arm above")
-                }
-            };
+        RuntimeBinding::Rootless => {
+            bind_then_continue(None, container_id, cgroup.identity(), revalidate, capture)
+        }
+        RuntimeBinding::Enabled {
+            expected_root_identity,
+            context,
+        } => {
+            let enabled = Some((
+                &mut context.lease,
+                &mut context.bind_state,
+                *expected_root_identity,
+            ));
             bind_then_continue(
                 enabled,
                 container_id,
@@ -213,8 +210,9 @@ impl BundleCleanupGuard {
 impl Drop for BundleCleanupGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.cleanup()
-                .unwrap_or_else(|error| panic!("fail-closed secret bundle cleanup: {error}"));
+            if let Err(error) = self.cleanup() {
+                eprintln!("[sandbox cleanup incident] {error}");
+            }
         }
     }
 }
