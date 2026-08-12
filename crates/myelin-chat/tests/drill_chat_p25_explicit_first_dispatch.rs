@@ -226,7 +226,7 @@ fn ag_d4_is_green_before_any_chat_agent_dispatch() {
 #[test]
 fn a_casual_mention_notifies_zero_auto_spawn() {
     assert_eq!(
-        dispatch_disposition_class(CHAT_MESSAGE_MENTIONED,  false),
+        dispatch_disposition_class(CHAT_MESSAGE_MENTIONED, false),
         DispatchOutcome::NotifyOnly,
         "a casual @agent mention notifies - it does NOT auto-spawn a costed run (CHAT-1)"
     );
@@ -269,7 +269,7 @@ fn an_explicit_action_reserves_mints_and_routes_through_effect_api_against_the_m
     let mut ledger = CostLedger::new();
 
     assert_eq!(
-        dispatch_disposition_class(CHAT_REACTION_ADDED,  true),
+        dispatch_disposition_class(CHAT_REACTION_ADDED, true),
         DispatchOutcome::WouldDispatch
     );
 

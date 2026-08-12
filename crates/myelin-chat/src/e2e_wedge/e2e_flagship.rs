@@ -183,9 +183,9 @@ pub fn run_e2e_2_chat_flagship() -> ChatE2eArtifact {
     let fx = FlagshipEffectApi;
     let leaks: u64 = 0;
 
-    let mention_class = dispatch_disposition_class(CHAT_MESSAGE_MENTIONED,  true);
+    let mention_class = dispatch_disposition_class(CHAT_MESSAGE_MENTIONED, true);
     let mention_is_notify_only = mention_class == DispatchOutcome::NotifyOnly;
-    let triage_class = dispatch_disposition_class(CHAT_REACTION_ADDED,  true);
+    let triage_class = dispatch_disposition_class(CHAT_REACTION_ADDED, true);
     let triage_would_dispatch = triage_class == DispatchOutcome::WouldDispatch;
 
     let mut ledger = CostLedger::new();

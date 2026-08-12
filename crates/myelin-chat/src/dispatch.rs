@@ -18,7 +18,9 @@ pub const L3_AUTO_SPAWN_ABSENCE: &str =
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Disposition {
     NotifiedInbox,
-    Dispatched { run_token_jti: String },
+    Dispatched {
+        run_token_jti: String,
+    },
     NoBalanceRefused {
         requested: MicroUsd,
         available: MicroUsd,
@@ -83,7 +85,7 @@ pub fn dispatch_explicit<Id: IdentityService, Fx: EffectApi>(
                 None,
             );
         }
-        Ok(_reservation) => {  }
+        Ok(_reservation) => {}
     }
 
     let id_run = IdRunId(run_id.to_string());

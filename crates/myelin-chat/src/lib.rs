@@ -59,9 +59,9 @@ pub use dispatch::{
     no_auto_spawn_path_is_wired, reserve_gate, AgentProvenance, DispatchOutcome, Disposition,
     L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
 };
-pub use e2e_wedge::ChatE2eArtifact;
 #[cfg(any(test, feature = "test-support"))]
 pub use e2e_wedge::run_chat_e2e_wedge;
+pub use e2e_wedge::ChatE2eArtifact;
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseReport, ChatErasureCascade, StoreReceipt,
     CHAT_ERASE_CASCADE_TOKEN,
@@ -119,6 +119,8 @@ pub use search::{
     FACET_CREATED_AT, FACET_EMBED, FACET_KIND, FACET_MENTION, FACET_THREAD_ROOT, FT_BODY_FIELD,
     MESSAGE_ACL_OBJECT_TYPE, MESSAGE_READ_PERMISSION, MESSAGE_TYPE,
 };
+#[cfg(any(test, feature = "test-support"))]
+pub use store::MemHotTier;
 pub use store::{
     chat_cold_blob_store_parity, emit_erased_tombstone, AuthorKind, ColdBlobParityVerdict,
     ColdSegments, ConversationId, Message, MessageId, MessageState, MessageStore,
@@ -126,8 +128,6 @@ pub use store::{
     TombstoneReason, UlidSource, SCYLLA_HOT_TIER_PROMOTED, SCYLLA_PROMOTION_LANDING,
     SCYLLA_PROMOTION_TRIGGER,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use store::MemHotTier;
 pub use unfurl::{
     filter_candidates_by_class, precompute_visibility_class, AuthzVisibleIndex, Card,
     LadderOutcome, LoweredFilter, Projection, RefsResolvePort, Tombstone as UnfurlTombstone,

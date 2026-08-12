@@ -118,7 +118,7 @@ impl EffectApi for ApplyingEffectApi {
 #[test]
 fn cdc_a_casual_mention_consumes_no_cost_contracts() {
     assert_eq!(
-        dispatch_disposition_class(CHAT_MESSAGE_MENTIONED,  false),
+        dispatch_disposition_class(CHAT_MESSAGE_MENTIONED, false),
         DispatchOutcome::NotifyOnly,
         "8.6 CONSUMER: a casual @agent mention notifies - no auto-spawn"
     );
@@ -134,7 +134,7 @@ fn cdc_a_casual_mention_consumes_no_cost_contracts() {
 #[test]
 fn cdc_an_explicit_run_consumes_reserve_mint_and_effect_api() {
     assert_eq!(
-        dispatch_disposition_class(CHAT_REACTION_ADDED,  true),
+        dispatch_disposition_class(CHAT_REACTION_ADDED, true),
         DispatchOutcome::WouldDispatch,
         "8.6 CONSUMER: a deliberate explicit action dispatches"
     );

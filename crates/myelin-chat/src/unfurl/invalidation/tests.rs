@@ -180,9 +180,15 @@ fn handler_is_idempotent_and_always_done() {
     let invalidator = UnfurlInvalidator::new(cache.clone());
     let ev = envelope("issue.issue.updated", ISSUE_REF);
 
-    assert_eq!(invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+    assert_eq!(
+        invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done
+    );
     assert!(!cache.contains(&issue_ref()));
-    assert_eq!(invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()), HandleOutcome::Done);
+    assert_eq!(
+        invalidator.handle(&ev, &mut myelin_events::HandlerTx::none()),
+        HandleOutcome::Done
+    );
 }
 
 #[test]

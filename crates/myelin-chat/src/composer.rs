@@ -236,13 +236,8 @@ pub struct EditRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditOutcome {
-    Applied {
-        new_seq: i32,
-    },
-    Rejected {
-        expected: i32,
-        current_seq: i32,
-    },
+    Applied { new_seq: i32 },
+    Rejected { expected: i32, current_seq: i32 },
     NotFound,
     StoreFault(String),
 }

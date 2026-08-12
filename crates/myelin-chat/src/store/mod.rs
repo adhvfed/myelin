@@ -10,9 +10,9 @@ use myelin_events::{
     AggregateKey, DataRole, EventDraft, EventType, OutboxTransaction, OutboxTx as OutboxTxTrait,
     Visibility,
 };
-use myelin_storage::{BlobStore, ContentHash};
 #[cfg(any(test, feature = "test-support"))]
 use myelin_storage::FsBlobStore;
+use myelin_storage::{BlobStore, ContentHash};
 use myelin_tenancy::TenantId;
 
 use crate::events::CHAT_MESSAGE_ERASED;

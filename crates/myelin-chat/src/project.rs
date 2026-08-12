@@ -77,15 +77,9 @@ impl Projected {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProjectError {
-    NotChat {
-        subsystem: String,
-    },
-    UnknownChatType {
-        ty: String,
-    },
-    Malformed {
-        reference: String,
-    },
+    NotChat { subsystem: String },
+    UnknownChatType { ty: String },
+    Malformed { reference: String },
 }
 
 impl core::fmt::Display for ProjectError {
@@ -217,7 +211,7 @@ impl<I: IdentityService> Projector<I> {
         };
         let permission = Permission(permissions::READ.to_string());
         match self.id.check(viewer, &permission, &object, &at, None) {
-            Ok(Decision::Allow) => {  }
+            Ok(Decision::Allow) => {}
             Ok(Decision::Deny) | Ok(Decision::Conditional) | Err(_) => {
                 return Ok(Projected::Tombstoned(Tombstone {
                     reason: TombstoneReason::Denied,

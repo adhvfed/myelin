@@ -24,10 +24,7 @@ pub mod permissions {
 pub enum MembershipError {
     NotFound(String),
     TupleWrite(String),
-    Denied {
-        permission: String,
-        channel: String,
-    },
+    Denied { permission: String, channel: String },
     Emit(String),
     Store(String),
 }

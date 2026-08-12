@@ -215,12 +215,7 @@ fn cdc_4_9_message_view_inherits_parent_channel_read() {
 #[test]
 fn cdc_4_9_watcher_is_read_fanout_not_a_read_grant() {
     let s = scope("acme");
-    let svc = provider(
-        &s,
-        &[
-            add("channel:secret", "watcher", "p:dave"),
-        ],
-    );
+    let svc = provider(&s, &[add("channel:secret", "watcher", "p:dave")]);
     for def in chat_fragment_defs_rich() {
         assert!(matches!(
             svc.admit_fragment_def(&def),

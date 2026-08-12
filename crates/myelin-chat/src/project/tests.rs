@@ -39,11 +39,9 @@ fn thread_ref() -> ArtifactRef {
 
 #[test]
 fn foreign_commit_check_subanchors_preserve_their_canonical_opaque_body() {
-    let check = ArtifactRef(
-        "myelin://acme/chat/channel/C-board#commit-deadbeef/check-build".into(),
-    );
-    let result =
-        ArtifactRef("myelin://acme/chat/channel/C-board#commit-deadbeef/ci-result".into());
+    let check =
+        ArtifactRef("myelin://acme/chat/channel/C-board#commit-deadbeef/check-build".into());
+    let result = ArtifactRef("myelin://acme/chat/channel/C-board#commit-deadbeef/ci-result".into());
     assert_eq!(
         sub_opaque(&check).as_deref(),
         Some("commit-deadbeef/check-build")

@@ -179,7 +179,9 @@ pub enum ResumeView {
         message_id: String,
         final_text: String,
     },
-    InProgress { resume_from_seq: u64 },
+    InProgress {
+        resume_from_seq: u64,
+    },
 }
 
 pub fn resume_view(session: &StreamSession) -> ResumeView {

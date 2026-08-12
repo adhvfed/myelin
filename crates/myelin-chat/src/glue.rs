@@ -136,10 +136,8 @@ pub enum FanoutClass {
     ReadFanout,
 }
 
-const CHAT_WRITE_FANOUT_TOKENS: &[&str] = &[
-    CHAT_MESSAGE_MENTIONED,
-    crate::events::CHAT_THREAD_REPLIED,
-];
+const CHAT_WRITE_FANOUT_TOKENS: &[&str] =
+    &[CHAT_MESSAGE_MENTIONED, crate::events::CHAT_THREAD_REPLIED];
 
 pub fn fanout_class(token: &str) -> Option<FanoutClass> {
     if CHAT_WRITE_FANOUT_TOKENS.contains(&token) {

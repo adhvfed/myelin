@@ -61,7 +61,7 @@ fn casual_agent_mention_notifies_does_not_spawn_a_costed_run() {
     gate.credit(&tenant(), 100);
     let mut tier = DispatchTier::new(RecordingTarget::new(), gate);
 
-    let class = agent_dispatch_class(CHAT_MESSAGE_MENTIONED,  false);
+    let class = agent_dispatch_class(CHAT_MESSAGE_MENTIONED, false);
     assert_eq!(class, AgentDispatchClass::NotifyOnly);
     let trigger = match class {
         AgentDispatchClass::NotifyOnly => TriggerKind::Mention,
@@ -113,7 +113,7 @@ fn an_explicit_action_dispatches_a_costed_run_through_the_reserve_gate() {
     gate.credit(&tenant(), 5);
     let mut tier = DispatchTier::new(RecordingTarget::new(), gate);
 
-    let class = agent_dispatch_class(CHAT_REACTION_ADDED,  true);
+    let class = agent_dispatch_class(CHAT_REACTION_ADDED, true);
     assert_eq!(class, AgentDispatchClass::ExplicitDispatch);
     let req = DispatchRequest {
         event: chat_trigger("psn:alice", "myelin://acme/chat/message/M2"),
