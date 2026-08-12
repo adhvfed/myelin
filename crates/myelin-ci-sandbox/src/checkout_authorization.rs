@@ -20,26 +20,6 @@ impl CheckoutPhase {
     }
 }
 
-#[derive(Debug)]
-#[allow(dead_code)]
-pub(crate) struct CheckoutAuthorizationProof {
-    scope: CheckoutAuthorizationScope,
-    run_token_jti: String,
-}
-
-impl CheckoutAuthorizationProof {
-    #[allow(dead_code)]
-    pub(crate) fn scope(&self) -> &CheckoutAuthorizationScope {
-        &self.scope
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn run_token_jti(&self) -> &str {
-        &self.run_token_jti
-    }
-}
-
-#[allow(dead_code)]
 pub(crate) struct PhaseAuthorization {
     scope: CheckoutAuthorizationScope,
     run_token_jti: String,
@@ -60,19 +40,8 @@ impl std::fmt::Debug for PhaseAuthorization {
 }
 
 impl PhaseAuthorization {
-    #[allow(dead_code)]
-    pub(crate) fn phase(&self) -> CheckoutPhase {
-        self.phase
-    }
-
-    #[allow(dead_code)]
     pub(crate) fn generation_id(&self) -> &str {
         &self.generation_id
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn run_token_jti(&self) -> &str {
-        &self.run_token_jti
     }
 
     fn verify_provenance(
@@ -102,7 +71,6 @@ impl PhaseAuthorization {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn into_transport_permit(
         self,
         expected_phase: CheckoutPhase,
@@ -141,7 +109,6 @@ impl PhaseAuthorization {
         Ok(self.permit)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn into_preparation_permit_for_scope(
         self,
         run_token: &RunTokenCredential,
@@ -179,29 +146,6 @@ impl PhaseAuthorization {
 }
 
 impl RunnerHooks {
-    #[allow(dead_code)]
-    pub(crate) fn authorize_checkout(
-        &self,
-        spec: &JobSpec,
-        scope: CheckoutAuthorizationScope,
-    ) -> Result<CheckoutAuthorizationProof, HookError> {
-        match &self.checkout_authorization {
-            Some(hook) => {
-                hook(spec, &scope)?;
-                Ok(CheckoutAuthorizationProof {
-                    scope,
-                    run_token_jti: spec.run_token.jti.clone(),
-                })
-            }
-            None => Err(HookError(
-                "checkout-bearing job requires a configured checkout-authorization hook, but \
-                 none was provided"
-                    .to_string(),
-            )),
-        }
-    }
-
-    #[allow(dead_code)]
     pub(crate) fn authorize_checkout_phase(
         &self,
         spec: &JobSpec,

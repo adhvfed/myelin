@@ -36,7 +36,6 @@ pub(crate) struct ExpectedGitCommitId {
 }
 
 impl ExpectedGitCommitId {
-    #[allow(dead_code)]
     pub(crate) fn new(hex: impl Into<String>, format: GitObjectFormat) -> Result<Self, String> {
         let hex = hex.into();
         if hex.len() != format.hex_width() {
@@ -87,14 +86,12 @@ impl ExpectedGitCommitId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum WorkspaceIntent {
     Compute,
     Checkout(ValidatedCheckoutRequest),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) struct ValidatedCheckoutRequest {
     artifact_ref: myelin_events::ArtifactRef,
     tenant: myelin_tenancy::TenantId,
@@ -103,27 +100,6 @@ pub(crate) struct ValidatedCheckoutRequest {
 }
 
 impl ValidatedCheckoutRequest {
-    #[allow(dead_code)]
-    pub(crate) fn artifact_ref(&self) -> &myelin_events::ArtifactRef {
-        &self.artifact_ref
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn tenant(&self) -> &myelin_tenancy::TenantId {
-        &self.tenant
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn repo_id(&self) -> &str {
-        &self.repo_id
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn commit(&self) -> &ExpectedGitCommitId {
-        &self.commit
-    }
-
-    #[allow(dead_code)]
     pub(crate) fn to_authorization_scope(&self) -> crate::CheckoutAuthorizationScope {
         crate::CheckoutAuthorizationScope::new(
             self.tenant.clone(),
@@ -135,7 +111,6 @@ impl ValidatedCheckoutRequest {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn derive_workspace_intent(
     kind: JobKind,
     workspace: &crate::WorkspaceSpec,
@@ -255,11 +230,11 @@ mod tests {
         let WorkspaceIntent::Checkout(request) = intent else {
             panic!("expected Checkout");
         };
-        assert_eq!(request.tenant().0, "acme");
-        assert_eq!(request.repo_id(), "widgets");
-        assert_eq!(request.commit().as_str(), oid);
-        assert_eq!(request.commit().format(), GitObjectFormat::Sha1);
-        assert_eq!(request.artifact_ref().0, "myelin://acme/git/repo/widgets");
+        assert_eq!(request.tenant.0, "acme");
+        assert_eq!(request.repo_id, "widgets");
+        assert_eq!(request.commit.as_str(), oid);
+        assert_eq!(request.commit.format(), GitObjectFormat::Sha1);
+        assert_eq!(request.artifact_ref.0, "myelin://acme/git/repo/widgets");
 
         let scope = request.to_authorization_scope();
         assert_eq!(scope.tenant().0, "acme");
@@ -280,7 +255,7 @@ mod tests {
         let WorkspaceIntent::Checkout(request) = intent else {
             panic!("expected Checkout");
         };
-        assert_eq!(request.commit().format(), GitObjectFormat::Sha256);
+        assert_eq!(request.commit.format(), GitObjectFormat::Sha256);
     }
 
     #[test]

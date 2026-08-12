@@ -85,7 +85,6 @@ pub fn ci_runner_hooks(
     let begin = lifecycle.clone();
     let verify = lifecycle.clone();
     let release = lifecycle;
-    let checkout_authorizer = launch_authorizer.clone();
     RunnerHooks::new_with_launch_fence(
         CompletionSettlementOwner::TerminalReporter,
         Box::new(move |spec| begin.begin(spec)),
@@ -100,9 +99,6 @@ pub fn ci_runner_hooks(
                 .map_err(|_| HookError("mandatory sandbox isolation profile is unavailable".into()))
         }),
     )
-    .with_checkout_authorization(Box::new(move |spec, scope| {
-        checkout_authorizer.authorize_checkout(spec, scope)
-    }))
 }
 
 pub struct CiRunnerV2Wiring {
@@ -180,7 +176,6 @@ fn ci_runner_v2_hooks(
     let begin = lifecycle.clone();
     let verify = lifecycle.clone();
     let release = lifecycle;
-    let checkout_authorizer = launch_authorizer.clone();
     let phase_authorizer = launch_authorizer.clone();
     let workload_authorizer = launch_authorizer;
     RunnerHooks::new_with_launch_fence(
@@ -197,9 +192,6 @@ fn ci_runner_v2_hooks(
                 .map_err(|_| HookError("mandatory sandbox isolation profile is unavailable".into()))
         }),
     )
-    .with_checkout_authorization(Box::new(move |spec, scope| {
-        checkout_authorizer.authorize_checkout(spec, scope)
-    }))
     .with_checkout_phase_authorization(Box::new(move |spec, scope, phase| match phase {
         CheckoutPhase::Advertise => {
             phase_authorizer.authorize_checkout_advertise_retained(spec, scope)
@@ -824,42 +816,43 @@ pub async fn ci_runner_identity_authorities(
         myelin_tenancy::Region(region),
         rt.clone(),
     ));
-    let secrets = optional_secret_resolver(if let Ok(kms) =
-        DurableKmsBacking::new(provider.db_pool().clone(), cell_id)
-        .load_or_generate(seal_key)
-        .await
-    {
-        let kms = Arc::new(kms);
-        let secret_identity = Arc::new(StoreBackedCheck::with_pg(
-            provider.clone(),
-            kms.clone(),
-            cell,
-            rt.clone(),
-        ));
-        let fragment_available = secret_identity
-            .admit_ci_fragment()
-            .into_iter()
-            .all(|result| !matches!(result, myelin_identity::FragmentAdmit::Rejected { .. }));
-        if fragment_available {
-            Some(crate::durable_ci_job_secret_resolver(
-                Arc::new(crate::DurableCiSecretStore::with_pg(
-                    provider.db_pool().clone(),
-                    kms,
-                    myelin_tenancy::Region(provider.config().region.clone()),
-                    rt,
-                )),
-                secret_identity,
-                myelin_identity::Consistency {
-                    at_least: myelin_identity::Zookie(String::new()),
-                    mode: myelin_identity::ConsistencyMode::Strong,
-                },
-            ))
+    let secrets = optional_secret_resolver(
+        if let Ok(kms) = DurableKmsBacking::new(provider.db_pool().clone(), cell_id)
+            .load_or_generate(seal_key)
+            .await
+        {
+            let kms = Arc::new(kms);
+            let secret_identity = Arc::new(StoreBackedCheck::with_pg(
+                provider.clone(),
+                kms.clone(),
+                cell,
+                rt.clone(),
+            ));
+            let fragment_available = secret_identity
+                .admit_ci_fragment()
+                .into_iter()
+                .all(|result| !matches!(result, myelin_identity::FragmentAdmit::Rejected { .. }));
+            if fragment_available {
+                Some(crate::durable_ci_job_secret_resolver(
+                    Arc::new(crate::DurableCiSecretStore::with_pg(
+                        provider.db_pool().clone(),
+                        kms,
+                        myelin_tenancy::Region(provider.config().region.clone()),
+                        rt,
+                    )),
+                    secret_identity,
+                    myelin_identity::Consistency {
+                        at_least: myelin_identity::Zookie(String::new()),
+                        mode: myelin_identity::ConsistencyMode::Strong,
+                    },
+                ))
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    });
+        },
+    );
 
     Ok(CiRunnerIdentityAuthorities {
         token_issuer,

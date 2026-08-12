@@ -3,9 +3,8 @@ use crate::runner::{
     PreparationAttemptDisposition, PreparationPhase, PreparationTerminalDisposition,
 };
 use crate::{
-    CheckoutAuthorizationProof, HookError, IdemToken, JobSpec, LaunchPermit, MeterTarget,
-    PhaseAuthorization, ResourceLimits, ResourceUsage, RunTokenCredential, RunnerHooks,
-    SandboxBackend, SandboxResult,
+    HookError, IdemToken, JobSpec, LaunchPermit, MeterTarget, PhaseAuthorization, ResourceLimits,
+    ResourceUsage, RunTokenCredential, RunnerHooks, SandboxBackend, SandboxResult,
 };
 use std::io;
 use std::io::{Seek, Write};
@@ -227,7 +226,9 @@ impl ParentAttemptCheckoutTransportOutcome {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) enum CheckoutTransportError {
-    Refused { message: String },
+    Refused {
+        message: String,
+    },
     Failed {
         message: String,
         usage: ResourceUsage,
@@ -701,82 +702,7 @@ fn synthetic_parent_attempt_idem_token(label: &str) -> IdemToken {
     IdemToken(format!("checkout-transport-{label}-{}", unique_suffix()))
 }
 
-enum TransportAuthority<'a> {
-    LegacyClaimBound {
-        proof: CheckoutAuthorizationProof,
-    },
-    PhaseBound {
-        advertise: PhaseAuthorization,
-        fetch: &'a mut dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>,
-    },
-}
-
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn fetch_checkout_pack_within_parent_attempt(
-    root: &Path,
-    tenant: &str,
-    region: &str,
-    repo: &str,
-    expected: &ExpectedGitCommitId,
-    limits: ResourceLimits,
-    run_token: RunTokenCredential,
-    proof: CheckoutAuthorizationProof,
-    cancellation: &AtomicBool,
-    lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
-) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
-    fetch_checkout_pack_within_parent_attempt_given(
-        root,
-        tenant,
-        region,
-        repo,
-        expected,
-        limits,
-        run_token,
-        proof,
-        cancellation,
-        lease_checkpoint,
-        &|job, cfg, stdin, rootfs, cancellation, permit| {
-            run_git_wire_container_raw(job, cfg, stdin, rootfs, cancellation, permit)
-        },
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(crate) fn fetch_checkout_pack_within_parent_attempt_v2(
-    root: &Path,
-    tenant: &str,
-    region: &str,
-    repo: &str,
-    expected: &ExpectedGitCommitId,
-    limits: ResourceLimits,
-    advertise_credential: RunTokenCredential,
-    advertise: PhaseAuthorization,
-    fetch: &mut dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>,
-    cancellation: &AtomicBool,
-    lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
-) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
-    fetch_checkout_pack_within_parent_attempt_v2_given(
-        root,
-        tenant,
-        region,
-        repo,
-        expected,
-        limits,
-        advertise_credential,
-        advertise,
-        fetch,
-        cancellation,
-        lease_checkpoint,
-        &|job, cfg, stdin, rootfs, cancellation, permit| {
-            run_git_wire_container_raw(job, cfg, stdin, rootfs, cancellation, permit)
-        },
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 pub(super) fn fetch_checkout_pack_within_parent_attempt_v2_given(
     root: &Path,
     tenant: &str,
@@ -799,81 +725,8 @@ pub(super) fn fetch_checkout_pack_within_parent_attempt_v2_given(
         expected,
         limits,
         advertise_credential,
-        TransportAuthority::PhaseBound { advertise, fetch },
-        cancellation,
-        lease_checkpoint,
-        execute,
-    )
-}
-
-#[allow(dead_code)]
-fn verify_transport_proof_against_request(
-    proof: &CheckoutAuthorizationProof,
-    run_token: &RunTokenCredential,
-    tenant: &str,
-    repo: &str,
-    expected: &ExpectedGitCommitId,
-) -> Result<(), String> {
-    if proof.run_token_jti() != run_token.jti {
-        return Err(format!(
-            "checkout authorization proof was minted against run-token jti {:?}, but this \
-             transport is running under jti {:?} -- refusing before any spawn",
-            proof.run_token_jti(),
-            run_token.jti
-        ));
-    }
-    let scope = proof.scope();
-    if scope.tenant().0 != tenant {
-        return Err(format!(
-            "checkout authorization proof was minted for tenant {:?}, but this transport is \
-             requesting tenant {tenant:?}",
-            scope.tenant().0
-        ));
-    }
-    if scope.repo_id() != repo {
-        return Err(format!(
-            "checkout authorization proof was minted for repo {:?}, but this transport is \
-             requesting repo {repo:?}",
-            scope.repo_id()
-        ));
-    }
-    if scope.commit_hex() != expected.as_str() || scope.commit_format() != expected.format() {
-        return Err(format!(
-            "checkout authorization proof was minted for commit {:?} ({:?}), but this transport \
-             is requesting {:?} ({:?})",
-            scope.commit_hex(),
-            scope.commit_format(),
-            expected.as_str(),
-            expected.format()
-        ));
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
-pub(super) fn fetch_checkout_pack_within_parent_attempt_given(
-    root: &Path,
-    tenant: &str,
-    region: &str,
-    repo: &str,
-    expected: &ExpectedGitCommitId,
-    limits: ResourceLimits,
-    run_token: RunTokenCredential,
-    proof: CheckoutAuthorizationProof,
-    cancellation: &AtomicBool,
-    lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
-    execute: GitWireHopExecutor,
-) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
-    fetch_checkout_pack_within_parent_attempt_inner(
-        root,
-        tenant,
-        region,
-        repo,
-        expected,
-        limits,
-        run_token,
-        TransportAuthority::LegacyClaimBound { proof },
+        advertise,
+        fetch,
         cancellation,
         lease_checkpoint,
         execute,
@@ -881,7 +734,6 @@ pub(super) fn fetch_checkout_pack_within_parent_attempt_given(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)]
 fn fetch_checkout_pack_within_parent_attempt_inner(
     root: &Path,
     tenant: &str,
@@ -890,31 +742,22 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
     expected: &ExpectedGitCommitId,
     limits: ResourceLimits,
     run_token: RunTokenCredential,
-    authority: TransportAuthority<'_>,
+    advertise: PhaseAuthorization,
+    fetch: &mut dyn FnMut() -> Result<(RunTokenCredential, PhaseAuthorization), HookError>,
     cancellation: &AtomicBool,
     lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
     execute: GitWireHopExecutor,
 ) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
-    let (advertise_generation, advertise_permit, mut fetch_source) = match authority {
-        TransportAuthority::LegacyClaimBound { proof } => {
-            verify_transport_proof_against_request(&proof, &run_token, tenant, repo, expected)
-                .map_err(|message| CheckoutTransportError::Refused { message })?;
-            (None, LaunchPermit::immediate(), None)
-        }
-        TransportAuthority::PhaseBound { advertise, fetch } => {
-            let generation = advertise.generation_id().to_owned();
-            let permit = advertise
-                .into_transport_permit(
-                    crate::CheckoutPhase::Advertise,
-                    &run_token,
-                    tenant,
-                    repo,
-                    expected,
-                )
-                .map_err(|error| CheckoutTransportError::Refused { message: error.0 })?;
-            (Some(generation), permit, Some(fetch))
-        }
-    };
+    let advertise_generation = advertise.generation_id().to_owned();
+    let advertise_permit = advertise
+        .into_transport_permit(
+            crate::CheckoutPhase::Advertise,
+            &run_token,
+            tenant,
+            repo,
+            expected,
+        )
+        .map_err(|error| CheckoutTransportError::Refused { message: error.0 })?;
 
     let zero = ResourceUsage {
         cpu_seconds: 0,
@@ -999,29 +842,29 @@ fn fetch_checkout_pack_within_parent_attempt_inner(
         })?;
     }
 
-    let (fetch_run_token, fetch_permit) = match fetch_source.as_mut() {
-        None => (run_token, LaunchPermit::immediate()),
-        Some(provider) => {
-            let (credential, authorization) = provider().map_err(|error| {
-                checkout_transport_retryable(
-                    format!("mint fetch-phase credential: {}", error.0),
-                    usage_after_advertise,
-                )
-            })?;
-            if advertise_generation.as_deref() == Some(authorization.generation_id()) {
-                return Err(checkout_transport_retryable(
-                    "the fetch-phase authorization names the SAME durable generation as the \
-                     advertisement -- the successor generation was never appended"
-                        .to_string(),
-                    usage_after_advertise,
-                ));
-            }
-            let permit = authorization
-                .into_transport_permit(crate::CheckoutPhase::Fetch, &credential, tenant, repo, expected)
-                .map_err(|error| checkout_transport_retryable(error.0, usage_after_advertise))?;
-            (credential, permit)
-        }
-    };
+    let (fetch_run_token, fetch_authorization) = fetch().map_err(|error| {
+        checkout_transport_retryable(
+            format!("mint fetch-phase credential: {}", error.0),
+            usage_after_advertise,
+        )
+    })?;
+    if advertise_generation == fetch_authorization.generation_id() {
+        return Err(checkout_transport_retryable(
+            "the fetch-phase authorization names the SAME durable generation as the \
+             advertisement -- the successor generation was never appended"
+                .to_string(),
+            usage_after_advertise,
+        ));
+    }
+    let fetch_permit = fetch_authorization
+        .into_transport_permit(
+            crate::CheckoutPhase::Fetch,
+            &fetch_run_token,
+            tenant,
+            repo,
+            expected,
+        )
+        .map_err(|error| checkout_transport_retryable(error.0, usage_after_advertise))?;
 
     let mut fetch_argv = allow_reachable;
     fetch_argv.extend(["upload-pack".to_string(), "--stateless-rpc".to_string()]);
@@ -1238,29 +1081,33 @@ mod tests {
             )
         }
 
-        fn minted_proof_for(
-            scope: CheckoutAuthorizationScope,
-            jti: &str,
-        ) -> CheckoutAuthorizationProof {
-            let hooks = ok_hooks().with_checkout_authorization(Box::new(|_spec, _scope| Ok(())));
-            let job = JobSpec::new(
-                JobKind::Ci,
-                fixture_image(),
-                vec!["true".to_string()],
-                vec![],
-                vec![],
-                EgressPolicy::deny_all(),
-                checkout_limits(),
-                WorkspaceSpec::default(),
-                TrustTier::Trusted,
-                RunTokenCredential::new("bearer", jti, 300).unwrap(),
-                MeterTarget {
-                    reserve_id: "r".to_string(),
-                },
-                IdemToken("idem-mint".to_string()),
-            )
-            .unwrap();
-            hooks.authorize_checkout(&job, scope).unwrap()
+        struct TestPhaseAuthority {
+            advertise: PhaseAuthorization,
+            fetch: (RunTokenCredential, PhaseAuthorization),
+        }
+
+        fn minted_proof_for(scope: CheckoutAuthorizationScope, jti: &str) -> TestPhaseAuthority {
+            let advertise = minted_phase_authorization(
+                scope.clone(),
+                jti,
+                crate::CheckoutPhase::Advertise,
+                &generation_id_for(crate::CheckoutPhase::Advertise),
+                Ok(()),
+            );
+            let fetch_jti = format!("{jti}:fetch");
+            let fetch_credential =
+                RunTokenCredential::new("bearer", fetch_jti.clone(), 300).unwrap();
+            let fetch = minted_phase_authorization(
+                scope,
+                &fetch_jti,
+                crate::CheckoutPhase::Fetch,
+                &generation_id_for(crate::CheckoutPhase::Fetch),
+                Ok(()),
+            );
+            TestPhaseAuthority {
+                advertise,
+                fetch: (fetch_credential, fetch),
+            }
         }
 
         fn minted_phase_authorization(
@@ -1309,6 +1156,43 @@ mod tests {
                 crate::CheckoutPhase::Materialization => 'm',
             };
             format!("ci-credential:v1:{}", seed.to_string().repeat(64))
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn fetch_checkout_pack_within_parent_attempt_given(
+            root: &Path,
+            tenant: &str,
+            region: &str,
+            repo: &str,
+            expected: &ExpectedGitCommitId,
+            limits: ResourceLimits,
+            advertise_credential: RunTokenCredential,
+            authority: TestPhaseAuthority,
+            cancellation: &AtomicBool,
+            lease_checkpoint: Option<&dyn crate::PreparationLeaseCheckpoint>,
+            execute: GitWireHopExecutor,
+        ) -> Result<ParentAttemptCheckoutTransportOutcome, CheckoutTransportError> {
+            let TestPhaseAuthority { advertise, fetch } = authority;
+            let mut fetch = Some(fetch);
+            let mut provide_fetch = || {
+                fetch.take().ok_or_else(|| {
+                    HookError("test fetch credential provider was called twice".to_string())
+                })
+            };
+            fetch_checkout_pack_within_parent_attempt_v2_given(
+                root,
+                tenant,
+                region,
+                repo,
+                expected,
+                limits,
+                advertise_credential,
+                advertise,
+                &mut provide_fetch,
+                cancellation,
+                lease_checkpoint,
+                execute,
+            )
         }
 
         fn fake_hop_container_run(stdout: Vec<u8>, usage: ResourceUsage) -> ContainerRun {

@@ -19,7 +19,6 @@ pub(crate) fn rotate_spec_for_generation(
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct PhaseCredentialCarrier {
     credential: RunTokenCredential,
     authorization_context: RunTokenAuthorizationContext,
@@ -27,7 +26,6 @@ pub struct PhaseCredentialCarrier {
 }
 
 impl PhaseCredentialCarrier {
-    #[allow(dead_code)]
     pub fn new(
         credential: RunTokenCredential,
         authorization_context: RunTokenAuthorizationContext,
@@ -40,22 +38,18 @@ impl PhaseCredentialCarrier {
         }
     }
 
-    #[allow(dead_code)]
     pub fn credential(&self) -> &RunTokenCredential {
         &self.credential
     }
 
-    #[allow(dead_code)]
     pub fn authorization_context(&self) -> &RunTokenAuthorizationContext {
         &self.authorization_context
     }
 
-    #[allow(dead_code)]
     pub fn generation_id(&self) -> &str {
         &self.generation_id
     }
 
-    #[allow(dead_code)]
     pub(crate) fn phase_local_spec(&self, base: &JobSpec) -> JobSpec {
         rotate_spec_for_generation(
             base,
@@ -64,14 +58,12 @@ impl PhaseCredentialCarrier {
         )
     }
 
-    #[allow(dead_code)]
     pub fn into_credential(self) -> RunTokenCredential {
         self.credential
     }
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct WorkloadCredentialCarrier {
     credential: RunTokenCredential,
     authorization_context: RunTokenAuthorizationContext,
@@ -79,7 +71,6 @@ pub struct WorkloadCredentialCarrier {
 }
 
 impl WorkloadCredentialCarrier {
-    #[allow(dead_code)]
     pub fn new(
         credential: RunTokenCredential,
         authorization_context: RunTokenAuthorizationContext,
@@ -92,17 +83,14 @@ impl WorkloadCredentialCarrier {
         }
     }
 
-    #[allow(dead_code)]
     pub fn generation_id(&self) -> &str {
         &self.generation_id
     }
 
-    #[allow(dead_code)]
     pub fn credential(&self) -> &RunTokenCredential {
         &self.credential
     }
 
-    #[allow(dead_code)]
     pub(crate) fn workload_local_spec(&self, base: &JobSpec) -> JobSpec {
         rotate_spec_for_generation(
             base,
@@ -123,7 +111,6 @@ impl std::fmt::Display for AttemptAuthorityError {
 
 impl std::error::Error for AttemptAuthorityError {}
 
-#[allow(dead_code)]
 pub(crate) fn authorize_phase_generation(
     hooks: &crate::RunnerHooks,
     base_spec: &JobSpec,
@@ -132,8 +119,12 @@ pub(crate) fn authorize_phase_generation(
     carrier: PhaseCredentialCarrier,
 ) -> Result<(RunTokenCredential, crate::PhaseAuthorization), crate::HookError> {
     let phase_spec = carrier.phase_local_spec(base_spec);
-    let authorization =
-        hooks.authorize_checkout_phase(&phase_spec, scope.clone(), phase, carrier.generation_id())?;
+    let authorization = hooks.authorize_checkout_phase(
+        &phase_spec,
+        scope.clone(),
+        phase,
+        carrier.generation_id(),
+    )?;
     Ok((carrier.into_credential(), authorization))
 }
 
@@ -155,9 +146,7 @@ pub trait AttemptAuthority: Send + Sync {
         phase: CheckoutPhase,
     ) -> Result<PhaseCredentialCarrier, AttemptAuthorityError>;
 
-    fn mint_workload_credential(
-        &self,
-    ) -> Result<WorkloadCredentialCarrier, AttemptAuthorityError>;
+    fn mint_workload_credential(&self) -> Result<WorkloadCredentialCarrier, AttemptAuthorityError>;
 
     fn should_requeue(&self) -> bool;
 }
@@ -214,7 +203,6 @@ impl From<crate::HookError> for CheckoutOrchestrationError {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum CheckoutContinuationOutcome {
     WorkloadLaunched(SandboxLaunch),
     WorkloadRetryable {
@@ -239,7 +227,6 @@ pub enum CheckoutContinuationOutcome {
     },
 }
 
-#[allow(dead_code)]
 pub(crate) fn route_preparation_disposition(
     authority: &dyn AttemptAuthority,
     claim: &PreparationReportClaim,
@@ -287,7 +274,6 @@ pub(crate) fn route_preparation_disposition(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn route_after_disposal(
     disposal_diagnostics: Vec<String>,
     phase: PreparationPhase,
@@ -305,7 +291,6 @@ pub(crate) fn route_after_disposal(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn resolve_hop_b_failure(
     authority: &dyn AttemptAuthority,
     claim: &PreparationReportClaim,
@@ -314,8 +299,7 @@ pub(crate) fn resolve_hop_b_failure(
     diagnostic: Option<String>,
     disposal_diagnostics: Vec<String>,
 ) -> Result<CheckoutContinuationOutcome, AttemptAuthorityError> {
-    let routed =
-        route_preparation_disposition(authority, claim, disposition, usage, diagnostic)?;
+    let routed = route_preparation_disposition(authority, claim, disposition, usage, diagnostic)?;
     if disposal_diagnostics.is_empty() {
         Ok(routed)
     } else {
@@ -328,7 +312,6 @@ pub(crate) fn resolve_hop_b_failure(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn route_post_acquisition_authority_failure(
     authority: &dyn AttemptAuthority,
     claim: &PreparationReportClaim,
@@ -366,7 +349,6 @@ pub(crate) fn route_post_acquisition_authority_failure(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn requeue_or_exhausted(
     authority: &dyn AttemptAuthority,
     claim: &PreparationReportClaim,
@@ -386,7 +368,6 @@ pub(crate) fn requeue_or_exhausted(
     }
 }
 
-#[allow(dead_code)]
 fn terminal_phase(disposition: PreparationTerminalDisposition) -> PreparationPhase {
     match disposition {
         PreparationTerminalDisposition::Failed { phase }
@@ -609,7 +590,10 @@ mod tests {
             Ok(crate::LaunchPermit::immediate())
         }));
         let base = crate::checkout_job_spec_for_tests();
-        assert_eq!(base.run_token.jti, "advertise-jti", "the base carries the advertise generation");
+        assert_eq!(
+            base.run_token.jti, "advertise-jti",
+            "the base carries the advertise generation"
+        );
         let scope = crate::derive_checkout_authorization_scope(base.kind, &base.workspace)
             .expect("scope derives")
             .expect("checkout-bearing");
@@ -619,7 +603,7 @@ mod tests {
             carrier_context.clone(),
             "gen-fetch",
         );
-        let (credential, authorization) =
+        let (credential, _authorization) =
             authorize_phase_generation(&hooks, &base, &scope, CheckoutPhase::Fetch, carrier)
                 .expect("authorizes");
         let (seen_jti, seen_ctx) = seen.lock().unwrap().clone().expect("the hook was invoked");
@@ -633,7 +617,6 @@ mod tests {
             "the phase hook must be handed the rotated authorization context, not the advertise base's"
         );
         assert_eq!(credential.jti, "fetch-jti-xyz");
-        assert_eq!(authorization.run_token_jti(), "fetch-jti-xyz");
     }
 
     #[test]
@@ -682,7 +665,10 @@ mod tests {
             vec![],
         )
         .expect("routes");
-        assert_eq!(authority.ops(), vec!["complete:CheckoutMaterialization:4:4"]);
+        assert_eq!(
+            authority.ops(),
+            vec!["complete:CheckoutMaterialization:4:4"]
+        );
         assert!(matches!(
             outcome,
             CheckoutContinuationOutcome::PreparationTerminal { .. }
@@ -692,7 +678,8 @@ mod tests {
     #[test]
     fn post_acquisition_authority_failure_routing_matrix() {
         let authority = RecordingAuthority::new(true);
-        let out = route_post_acquisition_authority_failure(&authority, &report_claim(), vec![], false);
+        let out =
+            route_post_acquisition_authority_failure(&authority, &report_claim(), vec![], false);
         assert!(authority.ops().is_empty(), "no begun phase to complete");
         assert!(matches!(
             out,
@@ -700,16 +687,24 @@ mod tests {
         ));
 
         let authority = RecordingAuthority::new(true);
-        let out = route_post_acquisition_authority_failure(&authority, &report_claim(), vec![], true);
-        assert_eq!(authority.ops(), vec!["complete:CheckoutMaterialization:0:0"]);
+        let out =
+            route_post_acquisition_authority_failure(&authority, &report_claim(), vec![], true);
+        assert_eq!(
+            authority.ops(),
+            vec!["complete:CheckoutMaterialization:0:0"]
+        );
         assert!(matches!(
             out,
             CheckoutContinuationOutcome::PreparationRetryable { .. }
         ));
 
         let authority = RecordingAuthority::new(false);
-        let out = route_post_acquisition_authority_failure(&authority, &report_claim(), vec![], true);
-        assert_eq!(authority.ops(), vec!["complete:CheckoutMaterialization:0:0"]);
+        let out =
+            route_post_acquisition_authority_failure(&authority, &report_claim(), vec![], true);
+        assert_eq!(
+            authority.ops(),
+            vec!["complete:CheckoutMaterialization:0:0"]
+        );
         assert!(matches!(
             out,
             CheckoutContinuationOutcome::PreparationTerminal {
@@ -743,7 +738,10 @@ mod tests {
             PreparationPhase::CheckoutTransport,
         );
         match requeued {
-            CheckoutContinuationOutcome::PreparationRetryable { claim: carried, phase } => {
+            CheckoutContinuationOutcome::PreparationRetryable {
+                claim: carried,
+                phase,
+            } => {
                 assert_eq!(carried, claim, "the retry outcome carries the exact claim");
                 assert_eq!(phase, PreparationPhase::CheckoutTransport);
             }
@@ -760,8 +758,14 @@ mod tests {
                 disposition,
                 ..
             } => {
-                assert_eq!(carried, claim, "the exhausted terminal carries the exact claim");
-                assert_eq!(disposition, PreparationTerminalDisposition::AttemptsExhausted);
+                assert_eq!(
+                    carried, claim,
+                    "the exhausted terminal carries the exact claim"
+                );
+                assert_eq!(
+                    disposition,
+                    PreparationTerminalDisposition::AttemptsExhausted
+                );
             }
             other => panic!("expected an exhausted terminal, got {other:?}"),
         }
@@ -805,7 +809,10 @@ mod tests {
             None,
         )
         .expect("routes");
-        assert_eq!(authority.ops(), vec!["complete:CheckoutMaterialization:3:3"]);
+        assert_eq!(
+            authority.ops(),
+            vec!["complete:CheckoutMaterialization:3:3"]
+        );
         assert!(matches!(
             outcome,
             CheckoutContinuationOutcome::PreparationTerminal {
@@ -874,7 +881,10 @@ mod tests {
             None,
         )
         .expect("routes");
-        assert_eq!(authority.ops(), vec!["complete:CheckoutMaterialization:11:13"]);
+        assert_eq!(
+            authority.ops(),
+            vec!["complete:CheckoutMaterialization:11:13"]
+        );
         assert!(matches!(
             outcome,
             CheckoutContinuationOutcome::PreparationRetryable {
@@ -933,11 +943,7 @@ mod tests {
                 ..
             }
         ));
-        let ok = route_after_disposal(
-            vec![],
-            PreparationPhase::CheckoutMaterialization,
-            clean,
-        );
+        let ok = route_after_disposal(vec![], PreparationPhase::CheckoutMaterialization, clean);
         assert!(matches!(
             ok,
             CheckoutContinuationOutcome::PreparationRetryable { .. }

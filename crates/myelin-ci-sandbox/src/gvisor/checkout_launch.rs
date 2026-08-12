@@ -217,33 +217,27 @@ impl GvisorBackend {
                     },
                 ))
             }
-            RetainedWorkloadOutcome::Ran(Err(run_failure)) => {
-                Ok(classify_bound_workload_failure(
-                    authority,
-                    report_claim,
-                    run_failure,
-                ))
-            }
+            RetainedWorkloadOutcome::Ran(Err(run_failure)) => Ok(classify_bound_workload_failure(
+                authority,
+                report_claim,
+                run_failure,
+            )),
             RetainedWorkloadOutcome::RunFailed {
                 failure,
                 disposal_diagnostics,
-            } => {
-                Ok(route_after_disposal(
-                    disposal_diagnostics,
-                    MATERIALIZATION,
-                    classify_bound_workload_failure(authority, report_claim, failure),
-                ))
-            }
+            } => Ok(route_after_disposal(
+                disposal_diagnostics,
+                MATERIALIZATION,
+                classify_bound_workload_failure(authority, report_claim, failure),
+            )),
             RetainedWorkloadOutcome::PermitRefused {
                 disposal_diagnostics,
                 ..
-            } => {
-                Ok(route_after_disposal(
-                    disposal_diagnostics,
-                    MATERIALIZATION,
-                    requeue_or_exhausted(authority, report_claim, MATERIALIZATION),
-                ))
-            }
+            } => Ok(route_after_disposal(
+                disposal_diagnostics,
+                MATERIALIZATION,
+                requeue_or_exhausted(authority, report_claim, MATERIALIZATION),
+            )),
             RetainedWorkloadOutcome::PhaseAuthorityFailed {
                 error,
                 disposal_diagnostics,
@@ -1215,7 +1209,6 @@ mod tests {
 
         fn admitting_hooks() -> RunnerHooks {
             ok_hooks()
-                .with_checkout_authorization(Box::new(|_spec, _scope| Ok(())))
                 .with_checkout_phase_authorization(Box::new(|_spec, _scope, _phase| {
                     Ok(LaunchPermit::immediate())
                 }))

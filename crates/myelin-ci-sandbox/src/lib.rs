@@ -11,9 +11,7 @@ pub mod hardening;
 mod launch_gate;
 pub mod notif_rules;
 pub mod redaction;
-pub use redaction::{
-    ResolvedJobSecrets, ResolvedSecretEnv, SecretInjectionError,
-};
+pub use redaction::{ResolvedJobSecrets, ResolvedSecretEnv, SecretInjectionError};
 pub mod replay;
 pub mod rootfs_overlay;
 pub mod runner;
@@ -63,8 +61,8 @@ pub use asset_registry::{
     select_registered_cargo_vendor, AssetRegistryError, CargoVendorAssetBinding,
     GvisorAssetRegistry, RootfsAssetBinding, VerifiedCargoVendor, VerifiedRootfs,
     CARGO_VENDOR_SMOKE_LOCK_SHA256, CARGO_VENDOR_SMOKE_TREE_SHA256,
-    CARGO_VENDOR_WORKSPACE_LOCK_SHA256, CARGO_VENDOR_WORKSPACE_TREE_SHA256, ENV_GVISOR_CARGO_VENDOR,
-    ENV_GVISOR_CARGO_VENDOR_WORKSPACE,
+    CARGO_VENDOR_WORKSPACE_LOCK_SHA256, CARGO_VENDOR_WORKSPACE_TREE_SHA256,
+    ENV_GVISOR_CARGO_VENDOR, ENV_GVISOR_CARGO_VENDOR_WORKSPACE,
 };
 pub use canonical_tar::canonical_tree_sha256_hex;
 pub use gvisor::{
@@ -388,9 +386,7 @@ pub struct IdemToken(pub String);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SpecError {
-    UndigestedImage {
-        reference: String,
-    },
+    UndigestedImage { reference: String },
     NoPidsMax,
     NoTimeout,
 }
@@ -859,7 +855,6 @@ pub struct RunnerHooks {
     settle: SettleHook,
     attribute: AttributionHook,
     isolation_floor: IsolationFloorHook,
-    checkout_authorization: Option<CheckoutAuthorizationHook>,
     checkout_phase_authorization: Option<CheckoutPhaseAuthorizationHook>,
     parent_attempt_reserve: Option<ParentAttemptReserveHook>,
 }
@@ -932,20 +927,14 @@ impl CheckoutAuthorizationScope {
     }
 }
 
-pub type CheckoutAuthorizationHook =
-    Box<dyn Fn(&JobSpec, &CheckoutAuthorizationScope) -> Result<(), HookError> + Send + Sync>;
-
 pub type CheckoutPhaseAuthorizationHook = Box<
     dyn Fn(&JobSpec, &CheckoutAuthorizationScope, CheckoutPhase) -> Result<LaunchPermit, HookError>
         + Send
         + Sync,
 >;
 
-#[allow(unused_imports)]
-pub(crate) use checkout_authorization::CheckoutAuthorizationProof;
-#[allow(unused_imports)]
-pub(crate) use checkout_authorization::PhaseAuthorization;
 pub use checkout_authorization::CheckoutPhase;
+pub(crate) use checkout_authorization::PhaseAuthorization;
 
 enum AttributionHook {
     Immediate(AttributeHook),
@@ -1048,7 +1037,6 @@ impl RunnerHooks {
             settle,
             attribute: AttributionHook::Immediate(attribute),
             isolation_floor,
-            checkout_authorization: None,
             checkout_phase_authorization: None,
             parent_attempt_reserve: None,
         }
@@ -1067,19 +1055,11 @@ impl RunnerHooks {
             settle,
             attribute: AttributionHook::Fenced(attribute),
             isolation_floor,
-            checkout_authorization: None,
             checkout_phase_authorization: None,
             parent_attempt_reserve: None,
         }
     }
 
-    #[allow(dead_code)]
-    pub fn with_checkout_authorization(mut self, hook: CheckoutAuthorizationHook) -> Self {
-        self.checkout_authorization = Some(hook);
-        self
-    }
-
-    #[allow(dead_code)]
     pub fn with_checkout_phase_authorization(
         mut self,
         hook: CheckoutPhaseAuthorizationHook,
@@ -1681,61 +1661,6 @@ mod tests {
         assert!(derive_checkout_authorization_scope(JobKind::Ci, &mixed).is_err());
     }
 
-    fn checkout_scope() -> CheckoutAuthorizationScope {
-        CheckoutAuthorizationScope::new(
-            myelin_tenancy::TenantId("acme".to_string()),
-            myelin_events::ArtifactRef("myelin://acme/git/repo/widgets".to_string()),
-            "widgets".to_string(),
-            "a".repeat(40),
-            GitObjectFormat::Sha1,
-        )
-    }
-
-    #[test]
-    fn authorize_checkout_refuses_when_no_hook_is_configured() {
-        let hooks = test_hooks();
-        let err = hooks
-            .authorize_checkout(&ci_spec(), checkout_scope())
-            .unwrap_err();
-        assert!(err.0.contains("no hook was configured") || err.0.contains("none was provided"));
-    }
-
-    #[test]
-    fn authorize_checkout_mints_a_proof_carrying_the_exact_scope_on_success() {
-        let hooks = test_hooks().with_checkout_authorization(Box::new(|_spec, _scope| Ok(())));
-        let proof = hooks
-            .authorize_checkout(&ci_spec(), checkout_scope())
-            .expect("configured hook returning Ok must mint a proof");
-        assert_eq!(proof.scope(), &checkout_scope());
-        assert_eq!(proof.run_token_jti(), "jti-1");
-    }
-
-    #[test]
-    fn authorize_checkout_propagates_the_hook_error_and_mints_no_proof() {
-        let hooks = test_hooks()
-            .with_checkout_authorization(Box::new(|_spec, _scope| {
-                Err(HookError("repo not authorized for this claim".to_string()))
-            }));
-        let err = hooks
-            .authorize_checkout(&ci_spec(), checkout_scope())
-            .unwrap_err();
-        assert_eq!(err.0, "repo not authorized for this claim");
-    }
-
-    #[test]
-    fn authorize_checkout_hands_the_hook_the_exact_scope_it_was_given() {
-        let seen = Arc::new(std::sync::Mutex::new(None));
-        let seen_in_hook = Arc::clone(&seen);
-        let hooks = test_hooks().with_checkout_authorization(Box::new(move |_spec, scope| {
-            *seen_in_hook.lock().unwrap() = Some(scope.clone());
-            Ok(())
-        }));
-        hooks
-            .authorize_checkout(&ci_spec(), checkout_scope())
-            .expect("must succeed");
-        assert_eq!(seen.lock().unwrap().as_ref(), Some(&checkout_scope()));
-    }
-
     #[test]
     fn sandbox_backend_launch_drives_the_four_guarantee_hooks() {
         let backend = NoopBackend;
@@ -1823,7 +1748,10 @@ mod tests {
                 claim: claim(),
                 phase: PreparationPhase::CheckoutTransport,
             }),
-            SandboxCycleOutcome::PreparationRetryable { phase: PreparationPhase::CheckoutTransport, .. }
+            SandboxCycleOutcome::PreparationRetryable {
+                phase: PreparationPhase::CheckoutTransport,
+                ..
+            }
         ));
         assert!(matches!(
             SandboxCycleOutcome::from(Cco::ReconciliationRequired {
