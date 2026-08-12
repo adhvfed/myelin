@@ -725,6 +725,7 @@ impl KmsCore {
         deks.remove(id).is_some()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn backup_snapshot(&self) -> Vec<(DekId, WrappedDek)> {
         let keks = self.keks.lock().expect("KMS keks poisoned");
         let deks = self.deks.lock().expect("KMS deks poisoned");
@@ -734,6 +735,7 @@ impl KmsCore {
             .collect()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub fn backup_snapshot_durable(&self, seal_key: &SealKey) -> KmsDurableSnapshot {
         let keks = self.keks.lock().expect("KMS keks poisoned");
         let deks = self.deks.lock().expect("KMS deks poisoned");
@@ -981,10 +983,10 @@ impl KmsEngine {
         }
     }
 
-    pub fn backup_snapshot_durable(&self, seal_key: &SealKey) -> KmsDurableSnapshot {
+    pub fn backup_snapshot_durable(&self, _seal_key: &SealKey) -> KmsDurableSnapshot {
         match &self.backend {
             #[cfg(any(test, feature = "test-support"))]
-            KmsBackend::Memory(core) => core.backup_snapshot_durable(seal_key),
+            KmsBackend::Memory(core) => core.backup_snapshot_durable(_seal_key),
             KmsBackend::Durable(durable) => durable.backup_snapshot_durable(),
         }
     }
