@@ -10,6 +10,16 @@ use myelin_storage::reserve_settle_durable::reserve_settle_durable_migrations;
 use myelin_storage::SubstrateProvider;
 use myelin_tenancy::TenantId;
 
+fn test_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
     let mut c = cfg.clone();
     c.database_url = c
@@ -30,20 +40,16 @@ fn uniq() -> String {
 }
 
 async fn app_provider() -> SubstrateProvider {
-    SubstrateProvider::connect(MyelinConfig::dev(), 6)
+    SubstrateProvider::connect(test_config(), 6)
         .await
-        .expect("connect app role")
+        .expect("connect to the app-role Postgres required by the durable budget story")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn w6b2_budget_gate_durable_reserve_settle_events_on_live_pg() {
-    let admin = match SubstrateProvider::connect(admin_config(&MyelinConfig::dev()), 4).await {
-        Ok(p) => p,
-        Err(_) => {
-            eprintln!("SKIP: dev Postgres unreachable (is the docker stack up?)");
-            return;
-        }
-    };
+    let admin = SubstrateProvider::connect(admin_config(&test_config()), 4)
+        .await
+        .expect("connect to the Postgres required by the durable budget integration story");
     admin
         .migrate(&reserve_settle_durable_migrations(), &HotTables::none())
         .await
