@@ -627,6 +627,65 @@ pub enum PrMutation {
     Touch,
 }
 
+impl PrMutation {
+    fn command_kind(&self) -> &'static str {
+        match self {
+            Self::ReportChecks { .. } => "report-checks",
+            Self::SubmitReview(_) => "submit-review",
+            Self::EndorseContexts(_) => "endorse-contexts",
+            Self::Touch => "touch",
+        }
+    }
+
+    fn event_type(&self) -> &'static str {
+        match self {
+            Self::SubmitReview(_) => GIT_REVIEW_SUBMITTED,
+            Self::ReportChecks { .. } | Self::EndorseContexts(_) | Self::Touch => GIT_PR_UPDATED,
+        }
+    }
+
+    pub fn apply_to(self, record: &mut PrRecord) {
+        match self {
+            Self::ReportChecks {
+                green_contexts,
+                fork_unendorsed_contexts,
+                codeowner_review_satisfied,
+                outstanding_conversations,
+            } => {
+                if let Some(value) = green_contexts {
+                    record.green_contexts = value;
+                }
+                if let Some(value) = fork_unendorsed_contexts {
+                    record.fork_unendorsed_contexts = value;
+                }
+                if let Some(value) = codeowner_review_satisfied {
+                    record.codeowner_review_satisfied = value;
+                }
+                if let Some(value) = outstanding_conversations {
+                    record.outstanding_conversations = value;
+                }
+            }
+            Self::SubmitReview(review) => record.reviews.push(review),
+            Self::EndorseContexts(contexts) => {
+                for context in contexts {
+                    if !record.endorsed_contexts.contains(&context) {
+                        record.endorsed_contexts.push(context);
+                    }
+                }
+            }
+            Self::Touch => {}
+        }
+        record.updated_at = Some(now_unix());
+    }
+}
+
+struct PrMutationCommand {
+    operation_id: PrOperationId,
+    actor_subject_id: String,
+    payload_hash: String,
+    emit_context: EmitContextBase,
+}
+
 struct SealedPrRecord {
     record: serde_json::Value,
     title: EncryptedColumn,
@@ -1257,25 +1316,24 @@ impl PgPrStore {
         .map_err(pg_error)
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn mutate<F>(
+    fn mutate(
         &self,
         scope: &TenantScope,
         repo: &str,
         number: u64,
-        operation_id: PrOperationId,
-        actor_subject_id: String,
-        command_kind: &'static str,
-        command_hash: String,
-        ctx: EmitContextBase,
-        event_type: &'static str,
-        mutation: F,
-    ) -> Result<PrRecord, DurableError>
-    where
-        F: FnOnce(&mut PrRecord) -> Result<(), DurableError> + Send + 'static,
-    {
+        command: PrMutationCommand,
+        mutation: PrMutation,
+    ) -> Result<PrRecord, DurableError> {
         let loc = self.scoped_loc(scope, repo)?;
         let number_db = db_number(number)?;
+        let command_kind = mutation.command_kind();
+        let event_type = mutation.event_type();
+        let PrMutationCommand {
+            operation_id,
+            actor_subject_id,
+            payload_hash,
+            emit_context,
+        } = command;
         let provider = self.provider.clone();
         let minter = self.minter.clone();
         let kms = self.kms.clone();
@@ -1303,7 +1361,7 @@ impl PgPrStore {
                             &operation_id,
                             &actor_subject_id,
                             command_kind,
-                            &command_hash,
+                            &payload_hash,
                             Some(number_db),
                             &kms,
                             &crypto_region,
@@ -1322,7 +1380,7 @@ impl PgPrStore {
                         }
                         let mut record = decode_record(&kms, &crypto_region, &loc.tenant, row)
                             .map_err(|_| pg_query("decode PR"))?;
-                        mutation(&mut record).map_err(|_| pg_query("apply PR mutation"))?;
+                        mutation.apply_to(&mut record);
                         let sealed = seal_pr_record(
                             &kms,
                             crypto_region.clone(),
@@ -1351,14 +1409,23 @@ impl PgPrStore {
                         .execute(&mut *conn)
                         .await
                         .map_err(|_| pg_query("update PR"))?;
-                        co_commit_event(conn, minter, ctx, &loc, &record, event_type, None).await?;
+                        co_commit_event(
+                            conn,
+                            minter,
+                            emit_context,
+                            &loc,
+                            &record,
+                            event_type,
+                            None,
+                        )
+                        .await?;
                         record_command(
                             conn,
                             &loc,
                             &operation_id,
                             &actor_subject_id,
                             command_kind,
-                            &command_hash,
+                            &payload_hash,
                             &record,
                         )
                         .await?;
@@ -1380,58 +1447,19 @@ impl PgPrStore {
         principal: &Principal,
     ) -> Result<PrRecord, DurableError> {
         let actor_subject_id = normalized_subject_id(principal)?;
-        let (command_kind, event_type) = match &mutation {
-            PrMutation::ReportChecks { .. } => ("report-checks", GIT_PR_UPDATED),
-            PrMutation::SubmitReview(_) => ("submit-review", GIT_REVIEW_SUBMITTED),
-            PrMutation::EndorseContexts(_) => ("endorse-contexts", GIT_PR_UPDATED),
-            PrMutation::Touch => ("touch", GIT_PR_UPDATED),
-        };
-        let command_hash = payload_hash(&(number, &mutation))?;
-        let ctx = self.emit_context(scope, principal)?;
+        let payload_hash = payload_hash(&(number, &mutation))?;
+        let emit_context = self.emit_context(scope, principal)?;
         self.mutate(
             scope,
             repo,
             number,
-            operation_id.clone(),
-            actor_subject_id,
-            command_kind,
-            command_hash,
-            ctx,
-            event_type,
-            move |record| {
-                match mutation {
-                    PrMutation::ReportChecks {
-                        green_contexts,
-                        fork_unendorsed_contexts,
-                        codeowner_review_satisfied,
-                        outstanding_conversations,
-                    } => {
-                        if let Some(value) = green_contexts {
-                            record.green_contexts = value;
-                        }
-                        if let Some(value) = fork_unendorsed_contexts {
-                            record.fork_unendorsed_contexts = value;
-                        }
-                        if let Some(value) = codeowner_review_satisfied {
-                            record.codeowner_review_satisfied = value;
-                        }
-                        if let Some(value) = outstanding_conversations {
-                            record.outstanding_conversations = value;
-                        }
-                    }
-                    PrMutation::SubmitReview(review) => record.reviews.push(review),
-                    PrMutation::EndorseContexts(contexts) => {
-                        for context in contexts {
-                            if !record.endorsed_contexts.contains(&context) {
-                                record.endorsed_contexts.push(context);
-                            }
-                        }
-                    }
-                    PrMutation::Touch => {}
-                }
-                record.updated_at = Some(now_unix());
-                Ok(())
+            PrMutationCommand {
+                operation_id: operation_id.clone(),
+                actor_subject_id,
+                payload_hash,
+                emit_context,
             },
+            mutation,
         )
     }
 
