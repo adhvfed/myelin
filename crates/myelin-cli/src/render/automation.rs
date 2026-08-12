@@ -470,6 +470,28 @@ mod tests {
                 "  reason:invalid trigger claim: envelope identity mismatch",
             )
         );
+
+        let failed = render_item(&json!({
+            "event_id": "ci-failed-provider",
+            "event_type": "ci.run.failed",
+            "trigger_ref": format!("myelin://acme/identity/trigger/{AUTOMATION}"),
+            "state": "terminal",
+            "run_id": "33333333-3333-4333-8333-333333333333",
+            "run_ref": "myelin://acme/agent/run/33333333-3333-4333-8333-333333333333",
+            "outcome": "failed",
+            "result_state": null,
+            "terminal_reason":
+                "agent run failed; retry it or inspect the hosted-agent service diagnostics",
+        }))
+        .unwrap();
+        assert_eq!(
+            failed,
+            concat!(
+                "✗ failed  ci-failed-provider  ",
+                "myelin://acme/agent/run/33333333-3333-4333-8333-333333333333",
+                "  reason:agent run failed; retry it or inspect the hosted-agent service diagnostics",
+            )
+        );
     }
 
     #[test]

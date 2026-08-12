@@ -178,6 +178,22 @@ function approval(value: unknown): AutomationApprovalVM | null {
   return row as unknown as AutomationApprovalVM;
 }
 
+function coherentFiringRun(row: WireRecord, triggerTenant: string): boolean {
+  const hasRun = row.run_id !== null;
+  const hasRunReference = row.run_ref !== null;
+  if (hasRun !== hasRunReference) return false;
+  if (hasRun && (!isAutomationId(row.run_id) ||
+      referencePart(row.run_ref, "agent", "run", row.run_id) !== triggerTenant)) return false;
+
+  const terminal = row.state === "terminal";
+  const hasOutcome = row.outcome !== null;
+  if (hasOutcome && (!terminal || !hasRun)) return false;
+  if (terminal && hasRun && !hasOutcome) return false;
+  if (row.result_state !== null && row.outcome !== "succeeded") return false;
+  if (row.terminal_reason !== null && (!terminal || row.outcome === "succeeded")) return false;
+  return true;
+}
+
 function firing(value: unknown): AutomationFiringVM | null {
   const row = record(value);
   const triggerId = typeof row?.trigger_ref === "string" ? row.trigger_ref.split("/").at(-1) : null;
@@ -187,21 +203,16 @@ function firing(value: unknown): AutomationFiringVM | null {
     "trigger",
     triggerId,
   );
-  const runTenant = row?.run_id === null ? null : referencePart(row?.run_ref, "agent", "run", row?.run_id);
   if (!row || !exact(row, [
     "event_id", "event_type", "trigger_ref", "state", "run_id", "run_ref", "outcome",
     "result_state", "terminal_reason", "approval", "created_at",
   ]) || !text(row.event_id, 255) || !text(row.event_type, 255) || !triggerTenant ||
       !isAutomationId(triggerId) ||
       !["queued", "awaiting_approval", "claimed", "started", "terminal"].includes(row.state as string) ||
-      (row.run_id !== null && !isAutomationId(row.run_id)) ||
-      (row.run_ref !== null && runTenant !== triggerTenant) ||
-      (row.run_id === null && row.run_ref !== null) ||
       (row.outcome !== null && !["succeeded", "failed", "terminated", "nondeterministic"].includes(row.outcome as string)) ||
       (row.result_state !== null && !["available", "erased"].includes(row.result_state as string)) ||
-      (row.result_state !== null && row.run_id === null) ||
       (row.terminal_reason !== null && !text(row.terminal_reason, 1_024, true)) ||
-      (row.terminal_reason !== null && (row.state !== "terminal" || row.run_id !== null)) ||
+      !coherentFiringRun(row, triggerTenant) ||
       (row.approval !== null && approval(row.approval) === null) || !timestamp(row.created_at)) return null;
   return row as unknown as AutomationFiringVM;
 }

@@ -132,8 +132,32 @@ describe("automation response decoding", () => {
       page: { next_cursor: null, limit: 25 },
     })).toEqual({ items: [poison], page: { next_cursor: null, limit: 25 } });
     expect(parseAutomationFiringPage({
-      items: [{ ...firing, terminal_reason: "cannot accompany a completed run" }],
+      items: [{ ...firing, terminal_reason: "cannot accompany a successful run" }],
       page: { next_cursor: null, limit: 25 },
     })).toBeNull();
+  });
+
+  it("keeps safe failure guidance attached to the run that failed", () => {
+    const failed = {
+      ...firing,
+      outcome: "failed",
+      result_state: null,
+      terminal_reason: "agent run failed; retry it or inspect the hosted-agent service diagnostics",
+    };
+    expect(parseAutomationFiringPage({
+      items: [failed],
+      page: { next_cursor: null, limit: 25 },
+    })).toEqual({ items: [failed], page: { next_cursor: null, limit: 25 } });
+
+    for (const incoherent of [
+      { ...failed, run_ref: null },
+      { ...failed, state: "started" },
+      { ...failed, result_state: "available" },
+    ]) {
+      expect(parseAutomationFiringPage({
+        items: [incoherent],
+        page: { next_cursor: null, limit: 25 },
+      })).toBeNull();
+    }
   });
 });
