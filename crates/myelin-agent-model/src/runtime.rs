@@ -48,7 +48,7 @@ impl AgentRuntime for LlmAgentRuntime {
             Ok(report) => report.outcome,
             Err(e) => StepOutcome::Submit(Submission(format!(
                 "agent runtime error (fail-closed, run aborted): {}",
-                runtime_step_error(&e),
+                e.runtime_step_error(),
             ))),
         }
     }
@@ -61,20 +61,8 @@ impl MeteredRuntime for LlmAgentRuntime {
                 outcome: report.outcome,
                 usage: map_usage(report.usage),
             }),
-            Err(error) => Err(runtime_step_error(&error)),
+            Err(error) => Err(error.runtime_step_error()),
         }
-    }
-}
-
-fn runtime_step_error(error: &ModelError) -> RuntimeStepError {
-    match error {
-        ModelError::MissingApiKey => RuntimeStepError::Misconfigured,
-        ModelError::Transport(_) => RuntimeStepError::Unavailable,
-        ModelError::Http { status, .. } => RuntimeStepError::Rejected {
-            status: Some(*status),
-        },
-        ModelError::Parse(_) => RuntimeStepError::InvalidResponse,
-        ModelError::UnsafeReplay(_) => RuntimeStepError::UnsafeReplay,
     }
 }
 

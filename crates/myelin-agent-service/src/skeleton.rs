@@ -257,6 +257,24 @@ pub enum SkeletonError {
     },
 }
 
+impl SkeletonError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::DispatchRefused(_) => "dispatch_refused",
+            Self::MintFailed(_) => "run_token_mint_failed",
+            Self::CoCommit(_) => "co_commit_failed",
+            Self::ToolValidationRejected(_) => "tool_validation_rejected",
+            Self::ToolExecFailed(_) => "tool_execution_failed",
+            Self::ApprovalRequired { .. } => "approval_required",
+            Self::MaxTurnsExhausted { .. } => "max_turns_exhausted",
+            Self::WalletSpendCapReached { .. } => "wallet_spend_cap_reached",
+            Self::RuntimeStepFailed { error, .. } => error.code(),
+            Self::MeteringUsageNotReported { .. } => "metering_usage_not_reported",
+            Self::MeteringOverflow { .. } => "metering_overflow",
+        }
+    }
+}
+
 impl core::fmt::Display for SkeletonError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
@@ -1125,6 +1143,29 @@ mod tests {
         assert!(
             !refused.is_empty(),
             "the error message is non-empty (kills fmt -> Ok(default))"
+        );
+    }
+
+    #[test]
+    fn skeleton_failures_have_stable_operator_codes() {
+        assert_eq!(
+            SkeletonError::ToolExecFailed("upstream detail".into()).code(),
+            "tool_execution_failed",
+        );
+        assert_eq!(
+            SkeletonError::RuntimeStepFailed {
+                run_id: "Rprovider".into(),
+                error: RuntimeStepError::Rejected { status: Some(503) },
+            }
+            .code(),
+            "runtime_rejected",
+        );
+        assert_eq!(
+            SkeletonError::MeteringUsageNotReported {
+                run_id: "Runreported".into(),
+            }
+            .code(),
+            "metering_usage_not_reported",
         );
     }
 

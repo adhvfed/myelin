@@ -156,6 +156,15 @@ pub enum AgentHostError {
     Identity(String),
 }
 
+impl AgentHostError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Run(error) => error.code(),
+            Self::Identity(_) => "identity_unavailable",
+        }
+    }
+}
+
 impl core::fmt::Display for AgentHostError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

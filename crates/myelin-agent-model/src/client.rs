@@ -1,3 +1,4 @@
+use myelin_agent::RuntimeStepError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,6 +68,20 @@ pub enum ModelError {
     Http { status: u16, body: String },
     Parse(String),
     UnsafeReplay(String),
+}
+
+impl ModelError {
+    pub fn runtime_step_error(&self) -> RuntimeStepError {
+        match self {
+            Self::MissingApiKey => RuntimeStepError::Misconfigured,
+            Self::Transport(_) => RuntimeStepError::Unavailable,
+            Self::Http { status, .. } => RuntimeStepError::Rejected {
+                status: Some(*status),
+            },
+            Self::Parse(_) => RuntimeStepError::InvalidResponse,
+            Self::UnsafeReplay(_) => RuntimeStepError::UnsafeReplay,
+        }
+    }
 }
 
 impl core::fmt::Display for ModelError {
