@@ -535,8 +535,8 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     use myelin_git::durable::DurableGitStore;
     use myelin_git::pg_pr_store::{MergeIntent, PrOperationId};
     use myelin_git::receive_pack::{
-        CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome, PushSession,
-        Pusher, RefName, RefStore,
+        CrashPoint, InMemoryObjectDb, Oid as PushOid, ProposedRefUpdate, PushOutcome,
+        PushProvenance, PushSession, Pusher, RefName, RefStore,
     };
     use myelin_storage::{
         all_durable_migrations, DurableCellRow, DurableLocalTenantRow, DurablePlacementBacking,
@@ -604,6 +604,8 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
         .expect("production PG Git backend")
         .with_repo_authorizer(Arc::new(
             GrantBackedRepos::new()
+                .grant_write("human:operator", &live_tenant, &slug)
+                .grant_write("human:operator", &live_tenant, &other_slug)
                 .grant_write("agent:claude", &live_tenant, &slug)
                 .grant_write("agent:claude", &live_tenant, &other_slug),
         )),
@@ -770,7 +772,10 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     assert!(
         cross_repo_value["result"]["_meta"]["reason"]
             .as_str()
-            .is_some_and(|reason| reason.contains("operation id conflicts with durable state")),
+            .is_some_and(|reason| {
+                reason.contains("idempotency key")
+                    && reason.contains("different pull request operation")
+            }),
         "a valid second-repository request must reach the durable operation ledger: {cross_repo_value}"
     );
     let actor = agent_principal_in("agent:claude", &live_tenant, REGION);
@@ -875,7 +880,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     .await
     .unwrap();
     let updated_events: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM outbox WHERE aggregate=$1 AND envelope->>'type_'='git.pr.updated'",
+        "SELECT count(*) FROM outbox WHERE aggregate=$1 AND envelope->>'type_'='git.review.submitted'",
     )
     .bind(&aggregate)
     .fetch_one(&admin)
@@ -958,6 +963,7 @@ async fn response_lost_retry_is_exactly_once_for_open_review_and_events() {
     let intent = MergeIntent {
         operation_id: merge_operation.digest().into(),
         actor_subject_id: actor.principal_id.0.clone(),
+        ref_update_provenance: PushProvenance::HumanApprovedAgent,
         base_ref: "refs/heads/main".into(),
         expected_old_oid: base.0.clone(),
         head_oid: head.0.clone(),
