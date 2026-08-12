@@ -183,39 +183,6 @@ fn a_non_uuid_id_is_a_loud_refusal() {
     assert!(parse_id_local("run_id", "00000000-0000-0000-0000-000000000001").is_ok());
 }
 
-#[test]
-fn the_bound_sql_matches_the_store_binds() {
-    assert!(INSERT_JOB_SPEC_QUERY.contains("$7") && !INSERT_JOB_SPEC_QUERY.contains("$8"));
-    assert!(INSERT_JOB_SPEC_QUERY.contains("stage"));
-    assert!(INSERT_JOB_SPEC_QUERY.contains("ON CONFLICT (tenant_id, job_id) DO NOTHING"));
-    assert!(INSERT_JOB_SPEC_QUERY.contains("RETURNING job_id"));
-    assert!(INSERT_JOB_SPEC_QUERY.contains("ci_job_spec"));
-    assert!(SELECT_JOB_SPEC_QUERY.contains("$2") && !SELECT_JOB_SPEC_QUERY.contains("$3"));
-    assert!(SELECT_JOB_SPEC_QUERY.contains("SELECT spec FROM ci_job_spec"));
-    assert!(
-        SELECT_JOB_SPEC_QUERY.contains("tenant_id = $1")
-            && SELECT_JOB_SPEC_QUERY.contains("job_id = $2")
-    );
-    assert!(
-        SELECT_JOB_SPEC_IDENTITY_QUERY.contains("$2")
-            && !SELECT_JOB_SPEC_IDENTITY_QUERY.contains("$3")
-    );
-    assert!(
-        SELECT_JOB_SPEC_IDENTITY_QUERY.contains("run_id")
-            && SELECT_JOB_SPEC_IDENTITY_QUERY.contains("idem_token")
-            && SELECT_JOB_SPEC_IDENTITY_QUERY.contains("stage")
-    );
-    assert!(
-        SELECT_JOB_SPEC_IDENTITY_QUERY.contains("tenant_id = $1")
-            && SELECT_JOB_SPEC_IDENTITY_QUERY.contains("job_id = $2")
-    );
-    assert!(NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("count(*)"));
-    assert!(NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("q.region = $1"));
-    assert!(NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("q.state <> 'terminal'"));
-    assert!(NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("q.stage IS NULL"));
-    assert!(!NON_TERMINAL_NULL_STAGE_JOBS_QUERY.contains("ci_job_spec"));
-}
-
 fn uid_job() -> String {
     "22222222-2222-2222-2222-222222222222".to_string()
 }

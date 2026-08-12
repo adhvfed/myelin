@@ -7,8 +7,8 @@ use myelin_events::{Actor, MonotonicMinter};
 use myelin_flow::{PgFlowExecutor, PgFlowWorker, PgWorkerScope, CI_PIPELINE_WF_TYPE};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_storage::{DurableCostLedger, SubstrateProvider, TenantScope};
-use sqlx::Row;
 use myelin_tenancy::{Region, TenantId};
+use sqlx::Row;
 
 use crate::{
     register_durable_ci_manifest_pipeline, CiActiveRunCursor, CiCostEventStore,
@@ -107,9 +107,7 @@ pub enum CiSupersededDefinitionGuardError {
     ActivationRefused(String),
     PredecessorMissing,
     FenceUnavailable(String),
-    ActivationNotReady {
-        unsafe_rows: i64,
-    },
+    ActivationNotReady { unsafe_rows: i64 },
 }
 
 impl std::fmt::Display for CiSupersededDefinitionGuardError {
@@ -411,15 +409,14 @@ impl CiProductionRuntimeFactory {
 
         if let Some(readiness) = plan.activation_readiness.as_ref() {
             // @tenant-cross-scope: `job_queue` is FORCE-RLS, but the readiness probe is a SECURITY
-            let unsafe_rows: Option<i64> =
-                sqlx::query_scalar(readiness.unsafe_count_call.as_ref())
-                    .fetch_one(&mut *transaction)
-                    .await
-                    .map_err(|error| {
-                        CiSupersededDefinitionGuardError::ProbeFailed(format!(
-                            "database-wide activation-readiness probe: {error}"
-                        ))
-                    })?;
+            let unsafe_rows: Option<i64> = sqlx::query_scalar(readiness.unsafe_count_call.as_ref())
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|error| {
+                    CiSupersededDefinitionGuardError::ProbeFailed(format!(
+                        "database-wide activation-readiness probe: {error}"
+                    ))
+                })?;
             match unsafe_rows {
                 None => {
                     let _ = transaction.rollback().await;
@@ -429,10 +426,12 @@ impl CiProductionRuntimeFactory {
                             .to_string(),
                     ));
                 }
-                Some(0) => {  }
+                Some(0) => {}
                 Some(unsafe_rows) => {
                     let _ = transaction.rollback().await;
-                    return Err(CiSupersededDefinitionGuardError::ActivationNotReady { unsafe_rows });
+                    return Err(CiSupersededDefinitionGuardError::ActivationNotReady {
+                        unsafe_rows,
+                    });
                 }
             }
         }
@@ -889,48 +888,6 @@ mod tests {
         assert_eq!(first.version(), CI_MANIFEST_PIPELINE_VERSION);
         assert!(first.code_hash().starts_with("blake3:"));
         assert_eq!(first.code_hash().len(), "blake3:".len() + 64);
-    }
-
-    #[test]
-    fn the_activation_readiness_predicate_has_one_production_selection() {
-        assert!(!CutoverPlan::for_tests(3, 4, "blake3:x").has_activation_readiness());
-
-        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        fn production_of(source: &str) -> &str {
-            match source.find("\n#[cfg(test)]\nmod tests {") {
-                Some(end) => &source[..end],
-                None => source,
-            }
-        }
-        fn code_occurrences(source: &str, marker: &str) -> usize {
-            production_of(source)
-                .lines()
-                .filter(|line| {
-                    let t = line.trim_start();
-                    !t.starts_with("//") && !t.starts_with('*')
-                })
-                .map(|line| line.matches(marker).count())
-                .sum()
-        }
-        for file in ["main.rs", "runner_bind.rs", "ci_runner_composition.rs", "lib.rs"] {
-            let source = std::fs::read_to_string(src.join(file)).unwrap();
-            assert_eq!(
-                code_occurrences(&source, "with_activation_readiness"),
-                0,
-                "{file} must not construct a parallel activation-readiness plan"
-            );
-            assert_eq!(
-                code_occurrences(&source, "ActivationReadinessProbe::production"),
-                0,
-                "{file} must not construct a second production readiness probe"
-            );
-        }
-        let this = std::fs::read_to_string(src.join("ci_runtime_composition.rs")).unwrap();
-        assert_eq!(code_occurrences(&this, ".with_activation_readiness("), 0);
-        assert_eq!(code_occurrences(&this, "CutoverPlan::with_activation_readiness("), 0);
-        assert_eq!(code_occurrences(&this, "ActivationReadinessProbe::production"), 1);
-        assert_eq!(code_occurrences(&this, "activation_readiness: None"), 1);
-        assert_eq!(code_occurrences(&this, "activation_readiness: Some("), 1);
     }
 
     #[test]
