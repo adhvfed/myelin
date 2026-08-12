@@ -71,7 +71,7 @@ fn bounded_pool_saturation_fast_fails_and_signals() {
     let _a2 = pool.acquire(&TenantId("acme".into())).unwrap();
     let _b1 = pool.acquire(&TenantId("beta".into())).unwrap();
     let _b2 = pool.acquire(&TenantId("beta".into())).unwrap();
-    assert_eq!(pool.in_flight(), 4);
+    assert_eq!(pool.in_flight().unwrap(), 4);
 
     let rejected = pool.acquire(&TenantId("gamma".into()));
     assert!(
@@ -82,7 +82,7 @@ fn bounded_pool_saturation_fast_fails_and_signals() {
     signals.set_labelled(
         SignalName::PoolSaturation,
         vec![myelin_harness::telemetry::Label::new("pool", "oltp")],
-        pool.saturation_rejections() as i64,
+        pool.saturation_rejections().unwrap() as i64,
     );
     signals
         .assert_labelled(
@@ -96,6 +96,6 @@ fn bounded_pool_saturation_fast_fails_and_signals() {
         "[P-007 DRILL GREEN 2026-06-19] bounded-pool: max_pool_size=4, filled=4, \
          next acquire → PoolSaturated (fast-fail, not blocked), \
          PoolSaturation{{pool=oltp}} rejections={} (>= 1)",
-        pool.saturation_rejections()
+        pool.saturation_rejections().unwrap()
     );
 }

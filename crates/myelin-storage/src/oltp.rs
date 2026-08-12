@@ -36,6 +36,7 @@ pub enum OltpError {
     InvalidConfig(&'static str),
     PoolSaturated,
     TenantInFlightCapExceeded,
+    StateUnavailable,
 }
 
 impl core::fmt::Display for OltpError {
@@ -50,6 +51,7 @@ impl core::fmt::Display for OltpError {
                 f,
                 "per-tenant in-flight cap exceeded - request rejected (noisy-neighbour bound)"
             ),
+            OltpError::StateUnavailable => f.write_str("OLTP pool state is unavailable"),
         }
     }
 }
@@ -88,14 +90,14 @@ impl OltpPool {
     }
 
     pub fn acquire(&self, tenant: &TenantId) -> Result<PermitGuard, OltpError> {
-        let mut state = self.state.lock().expect("OLTP pool mutex poisoned");
+        let mut state = self.state.lock().map_err(|_| OltpError::StateUnavailable)?;
         let tenant_in_flight = state.per_tenant_in_flight.get(tenant).copied().unwrap_or(0);
         if tenant_in_flight >= self.config.per_tenant_in_flight_cap {
-            state.saturation_rejections += 1;
+            state.saturation_rejections = state.saturation_rejections.saturating_add(1);
             return Err(OltpError::TenantInFlightCapExceeded);
         }
         if state.global_in_flight >= self.config.max_pool_size {
-            state.saturation_rejections += 1;
+            state.saturation_rejections = state.saturation_rejections.saturating_add(1);
             return Err(OltpError::PoolSaturated);
         }
         state.global_in_flight += 1;
@@ -110,18 +112,20 @@ impl OltpPool {
         })
     }
 
-    pub fn in_flight(&self) -> u32 {
-        self.state
+    pub fn in_flight(&self) -> Result<u32, OltpError> {
+        Ok(self
+            .state
             .lock()
-            .expect("OLTP pool mutex poisoned")
-            .global_in_flight
+            .map_err(|_| OltpError::StateUnavailable)?
+            .global_in_flight)
     }
 
-    pub fn saturation_rejections(&self) -> u64 {
-        self.state
+    pub fn saturation_rejections(&self) -> Result<u64, OltpError> {
+        Ok(self
+            .state
             .lock()
-            .expect("OLTP pool mutex poisoned")
-            .saturation_rejections
+            .map_err(|_| OltpError::StateUnavailable)?
+            .saturation_rejections)
     }
 }
 
@@ -138,7 +142,10 @@ impl Drop for PermitGuard {
             return;
         }
         self.released = true;
-        let mut state = self.state.lock().expect("OLTP pool mutex poisoned");
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         state.global_in_flight = state.global_in_flight.saturating_sub(1);
         if let Some(n) = state.per_tenant_in_flight.get_mut(&self.tenant) {
             *n = n.saturating_sub(1);
@@ -210,13 +217,13 @@ mod tests {
     #[test]
     fn acquire_and_release_accounts_permits() {
         let pool = OltpPool::open(cfg()).unwrap();
-        assert_eq!(pool.in_flight(), 0);
+        assert_eq!(pool.in_flight().unwrap(), 0);
         {
             let _g = pool.acquire(&t("acme")).unwrap();
-            assert_eq!(pool.in_flight(), 1);
+            assert_eq!(pool.in_flight().unwrap(), 1);
         }
         assert_eq!(
-            pool.in_flight(),
+            pool.in_flight().unwrap(),
             0,
             "dropping the guard releases the permit"
         );
@@ -229,11 +236,11 @@ mod tests {
         let _a2 = pool.acquire(&t("acme")).unwrap();
         let _b1 = pool.acquire(&t("beta")).unwrap();
         let _b2 = pool.acquire(&t("beta")).unwrap();
-        assert_eq!(pool.in_flight(), 4);
+        assert_eq!(pool.in_flight().unwrap(), 4);
         let rejected = pool.acquire(&t("gamma"));
         assert!(matches!(rejected, Err(OltpError::PoolSaturated)));
         assert_eq!(
-            pool.saturation_rejections(),
+            pool.saturation_rejections().unwrap(),
             1,
             "the PoolSaturation signal fired"
         );
@@ -250,7 +257,7 @@ mod tests {
             Err(OltpError::TenantInFlightCapExceeded)
         ));
         let _b1 = pool.acquire(&t("beta")).unwrap();
-        assert_eq!(pool.in_flight(), 3);
+        assert_eq!(pool.in_flight().unwrap(), 3);
     }
 
     #[test]
@@ -261,6 +268,30 @@ mod tests {
         assert!(pool.acquire(&t("acme")).is_err());
         drop(a1);
         let _a3 = pool.acquire(&t("acme")).unwrap();
-        assert_eq!(pool.in_flight(), 2);
+        assert_eq!(pool.in_flight().unwrap(), 2);
+    }
+
+    #[test]
+    fn poisoned_pool_state_fails_closed_without_panicking_during_guard_drop() {
+        let pool = OltpPool::open(cfg()).unwrap();
+        let permit = pool.acquire(&t("acme")).unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = pool.state.lock().unwrap();
+            panic!("poison the test OLTP pool");
+        }));
+
+        assert_eq!(
+            pool.acquire(&t("beta")).unwrap_err(),
+            OltpError::StateUnavailable
+        );
+        assert_eq!(pool.in_flight().unwrap_err(), OltpError::StateUnavailable);
+        assert_eq!(
+            pool.saturation_rejections().unwrap_err(),
+            OltpError::StateUnavailable
+        );
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(permit))).is_ok(),
+            "dropping a permit while unwinding must not cause a second panic"
+        );
     }
 }

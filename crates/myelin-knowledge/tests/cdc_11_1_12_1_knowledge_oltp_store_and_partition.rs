@@ -28,10 +28,10 @@ fn consumer_knowledge_store_opens_its_own_bounded_oltp_pool() {
     assert_eq!(store.pool().config(), cfg());
     let acme = TenantId("acme".into());
     let permit = store.pool().acquire(&acme).expect("acquire a permit");
-    assert_eq!(store.pool().in_flight(), 1);
+    assert_eq!(store.pool().in_flight().unwrap(), 1);
     drop(permit);
     assert_eq!(
-        store.pool().in_flight(),
+        store.pool().in_flight().unwrap(),
         0,
         "dropping the permit releases it"
     );
