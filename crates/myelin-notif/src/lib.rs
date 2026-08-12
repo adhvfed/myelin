@@ -384,11 +384,6 @@ mod tests {
             "the Signal-consumer router is the NOTIF-P3 floor"
         );
         assert_eq!(
-            spec.migrations.0.len(),
-            10,
-            "the nine-table data model plus the durable-read index are wired"
-        );
-        assert_eq!(
             spec.migrations,
             migrations::migrations(),
             "the AppSpec wires the NOTIF-P2 set"
@@ -411,11 +406,7 @@ mod tests {
             "the Signal-consumer router is registered for each homed tenant (the seam is wired)"
         );
         assert_eq!(spec.name, SERVICE_NAME);
-        assert_eq!(
-            spec.migrations.0.len(),
-            10,
-            "the NOTIF-P2 data model and durable-read index are wired"
-        );
+        assert_eq!(spec.migrations, migrations::migrations());
         let handle = boot(spec).expect("the router-wired notif spec boots under the harness");
         assert_eq!(
             handle.surfaces(),

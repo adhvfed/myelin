@@ -213,16 +213,18 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
         "the tenant-wide collapse key cannot move an inbox row across residency regions"
     );
 
+    let mut critical_b = upsert(
+        &tenant,
+        &region,
+        "crit-b",
+        recipient,
+        Reason::ApprovalRequested,
+        Class::Critical,
+        "dedup-crit-b",
+    );
+    critical_b.occurred_at = "2026-07-22T12:00:01Z".into();
     for row in [
-        upsert(
-            &tenant,
-            &region,
-            "crit-b",
-            recipient,
-            Reason::ApprovalRequested,
-            Class::Critical,
-            "dedup-crit-b",
-        ),
+        critical_b,
         upsert(
             &tenant,
             &region,
@@ -268,9 +270,35 @@ async fn durable_inbox_collapses_pages_and_survives_a_new_store_instance() {
             .iter()
             .map(|item| item.item.item_id.as_str())
             .collect::<Vec<_>>(),
-        ["crit-a", "crit-b"]
+        ["crit-b", "crit-a"],
+        "within one priority band the newest work must be visible first"
     );
-    assert_eq!(first.items[0].item.coalesce_count, 2);
+    assert_eq!(first.items[1].item.coalesce_count, 2);
+
+    let newest_critical = store
+        .list(&InboxReadRequest {
+            scope: scope.clone(),
+            filter: InboxFilter::all(),
+            limit: 1,
+            cursor: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(newest_critical.items[0].item.item_id, "crit-b");
+    let older_critical = store
+        .list(&InboxReadRequest {
+            scope: scope.clone(),
+            filter: InboxFilter::all(),
+            limit: 1,
+            cursor: newest_critical.next_cursor,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        older_critical.items[0].item.item_id, "crit-a",
+        "the recency cursor must neither skip nor repeat work within one priority band"
+    );
+
     let second = store
         .list(&InboxReadRequest {
             scope: scope.clone(),

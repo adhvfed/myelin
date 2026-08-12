@@ -320,10 +320,13 @@ fn model_factory_for(mode: &str) -> Result<Arc<dyn HostedModelFactory>, String> 
 
 #[cfg(any(test, feature = "deterministic-development-model"))]
 fn deterministic_development_model_factory() -> Result<Arc<dyn HostedModelFactory>, String> {
+    let project_id = required_development_project_id()?;
     eprintln!(
         "hosted-agent-worker: using explicit deterministic development model; no provider call will be made"
     );
-    Ok(Arc::new(DeterministicDevelopmentModelFactory))
+    Ok(Arc::new(DeterministicDevelopmentModelFactory {
+        project_id,
+    }))
 }
 
 #[cfg(not(any(test, feature = "deterministic-development-model")))]
@@ -334,17 +337,23 @@ fn deterministic_development_model_factory() -> Result<Arc<dyn HostedModelFactor
 }
 
 #[cfg(any(test, feature = "deterministic-development-model"))]
-struct DeterministicDevelopmentModelFactory;
+struct DeterministicDevelopmentModelFactory {
+    project_id: String,
+}
 
 #[cfg(any(test, feature = "deterministic-development-model"))]
 impl HostedModelFactory for DeterministicDevelopmentModelFactory {
     fn client(&self) -> Result<Box<dyn ModelClient + Send + Sync>, ModelError> {
-        Ok(Box::new(DeterministicDevelopmentModel))
+        Ok(Box::new(DeterministicDevelopmentModel {
+            project_id: self.project_id.clone(),
+        }))
     }
 }
 
 #[cfg(any(test, feature = "deterministic-development-model"))]
-struct DeterministicDevelopmentModel;
+struct DeterministicDevelopmentModel {
+    project_id: String,
+}
 
 #[cfg(any(test, feature = "deterministic-development-model"))]
 impl ModelClient for DeterministicDevelopmentModel {
@@ -363,22 +372,27 @@ impl ModelClient for DeterministicDevelopmentModel {
                 id: "read-triggering-ci-run".into(),
                 name: "ci.read_run".into(),
                 arguments: serde_json::json!({
-                    "run_id": triggering_ci_run_id(request)?,
+                    "run_id": triggering_ci_run(request)?.run_id,
                 }),
             }]),
-            (true, _, 1) => ModelReply::ToolCalls(vec![ToolCallRequest {
-                id: "open-triage-issue".into(),
-                name: "issues.create".into(),
-                arguments: serde_json::json!({
-                    "project_id": required_development_value("MYELIN_ISSUES_PROJECT")?,
-                    "type_id": required_development_value("MYELIN_ISSUES_TYPE")?,
-                    "prefix": required_development_value("MYELIN_ISSUES_PREFIX")?,
-                    "title": format!(
-                        "CI failure {} needs triage",
-                        triggering_ci_run_id(request)?
-                    ),
-                }),
-            }]),
+            (true, _, 1) => {
+                let triggering_run = triggering_ci_run(request)?;
+                ModelReply::ToolCalls(vec![ToolCallRequest {
+                    id: "open-triage-issue".into(),
+                    name: "issues.create".into(),
+                    arguments: serde_json::json!({
+                        "project_ref": format!(
+                            "myelin://{}/identity/project/{}",
+                            triggering_run.tenant,
+                            self.project_id,
+                        ),
+                        "title": format!(
+                            "CI failure {} needs triage",
+                            triggering_run.run_id,
+                        ),
+                    }),
+                }])
+            }
             (false, true, 0) => {
                 let (repo, number) = triggering_merge_target(request)?;
                 ModelReply::ToolCalls(vec![ToolCallRequest {
@@ -452,7 +466,13 @@ fn triggering_merge_target(request: &ModelRequest) -> Result<(String, u64), Mode
 }
 
 #[cfg(any(test, feature = "deterministic-development-model"))]
-fn triggering_ci_run_id(request: &ModelRequest) -> Result<String, ModelError> {
+struct TriggeringCiRun {
+    tenant: String,
+    run_id: String,
+}
+
+#[cfg(any(test, feature = "deterministic-development-model"))]
+fn triggering_ci_run(request: &ModelRequest) -> Result<TriggeringCiRun, ModelError> {
     let prompt = request
         .turns
         .iter()
@@ -461,31 +481,45 @@ fn triggering_ci_run_id(request: &ModelRequest) -> Result<String, ModelError> {
             _ => None,
         })
         .ok_or_else(|| ModelError::Parse("development run has no user prompt".into()))?;
-    let marker = "/ci/run/";
-    let start = prompt
+    let marker = "Trigger: ci.run.failed on ";
+    let artifact = prompt
         .find(marker)
-        .map(|index| index + marker.len())
+        .map(|index| &prompt[index + marker.len()..])
+        .and_then(|remainder| remainder.lines().next())
         .ok_or_else(|| ModelError::Parse("development trigger has no CI run reference".into()))?;
-    let run_id = prompt[start..]
-        .chars()
-        .take_while(|character| character.is_ascii_hexdigit() || *character == '-')
-        .collect::<String>();
-    let parsed = uuid::Uuid::parse_str(&run_id)
+    let parsed = myelin_refs::parse_scoped(artifact)
+        .map_err(|_| ModelError::Parse("development trigger CI run is not canonical".into()))?;
+    if parsed.subsystem != "ci" || parsed.type_ != "run" || parsed.sub.is_some() {
+        return Err(ModelError::Parse(
+            "development trigger does not name a CI run root".into(),
+        ));
+    }
+    let run_id = uuid::Uuid::parse_str(&parsed.id)
         .map_err(|_| ModelError::Parse("development trigger CI run is not a UUID".into()))?;
-    if parsed.to_string() != run_id {
+    if run_id.to_string() != parsed.id {
         return Err(ModelError::Parse(
             "development trigger CI run is not canonical".into(),
         ));
     }
-    Ok(run_id)
+    Ok(TriggeringCiRun {
+        tenant: parsed.tenant.0,
+        run_id: parsed.id,
+    })
 }
 
 #[cfg(any(test, feature = "deterministic-development-model"))]
-fn required_development_value(name: &str) -> Result<String, ModelError> {
-    std::env::var(name)
+fn required_development_project_id() -> Result<String, String> {
+    let name = "MYELIN_ISSUES_PROJECT";
+    let value = std::env::var(name)
         .ok()
         .filter(|value| !value.is_empty() && !value.contains("{{"))
-        .ok_or_else(|| ModelError::Parse(format!("development model requires {name}")))
+        .ok_or_else(|| format!("development model requires {name}"))?;
+    let parsed = uuid::Uuid::parse_str(&value)
+        .map_err(|_| format!("{name} must be a canonical project UUID"))?;
+    if parsed.to_string() != value {
+        return Err(format!("{name} must be a canonical project UUID"));
+    }
+    Ok(value)
 }
 
 fn required_cell_id() -> Result<String, &'static str> {
@@ -533,12 +567,20 @@ async fn shutdown_signal() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use myelin_agent_model::ToolSpec;
+    use myelin_agent_model::{ToolCallResult, ToolSpec};
+
+    const PROJECT_ID: &str = "20aee030-c7fa-4757-8243-700faf528690";
+
+    fn development_model() -> DeterministicDevelopmentModel {
+        DeterministicDevelopmentModel {
+            project_id: PROJECT_ID.into(),
+        }
+    }
 
     fn request_with_tools(names: &[&str]) -> ModelRequest {
         ModelRequest {
             turns: vec![ModelTurn::User {
-                content: "Triage one build failure.".into(),
+                content: "Find the failure.\n\nTrigger: ci.run.failed on myelin://acme/ci/run/65274e14-2e61-8bc9-e1a5-6345afea6ad6\nEvent payload: {}".into(),
             }],
             tools: names
                 .iter()
@@ -554,7 +596,7 @@ mod tests {
 
     #[test]
     fn the_development_model_never_claims_actions_hidden_by_delegation() {
-        let response = DeterministicDevelopmentModel
+        let response = development_model()
             .complete(&request_with_tools(&["issues.create"]))
             .expect("the explicit development model responds without provider I/O");
 
@@ -564,6 +606,33 @@ mod tests {
                 content: "The delegated tools do not match a scripted development workflow; no action was taken."
                     .into(),
             }
+        );
+    }
+
+    #[test]
+    fn the_development_model_uses_the_canonical_issue_create_contract() {
+        let mut request = request_with_tools(&["ci.read_run", "issues.create"]);
+        request
+            .turns
+            .push(ModelTurn::ToolResults(vec![ToolCallResult {
+                id: "read-triggering-ci-run".into(),
+                content: "the contract job failed".into(),
+            }]));
+
+        let response = development_model()
+            .complete(&request)
+            .expect("the explicit development model can propose its second step");
+
+        assert_eq!(
+            response.reply,
+            ModelReply::ToolCalls(vec![ToolCallRequest {
+                id: "open-triage-issue".into(),
+                name: "issues.create".into(),
+                arguments: serde_json::json!({
+                    "project_ref": format!("myelin://acme/identity/project/{PROJECT_ID}"),
+                    "title": "CI failure 65274e14-2e61-8bc9-e1a5-6345afea6ad6 needs triage",
+                }),
+            }])
         );
     }
 }

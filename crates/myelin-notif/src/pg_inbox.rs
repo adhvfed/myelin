@@ -23,9 +23,9 @@ const MAX_CURSOR_FRAME_BYTES: usize = 768;
 const MAX_KEY_BYTES: usize = 512;
 const MAX_TEMPLATE_ARGS: usize = 32;
 const MAX_TEMPLATE_ARGS_JSON_BYTES: usize = 16 * 1024;
-const CURSOR_VERSION: u8 = 1;
-const CURSOR_PREFIX: &str = "ni1_";
-const SORT_ID: &str = "base-priority-desc:item-id-asc:v1";
+const CURSOR_VERSION: u8 = 2;
+const CURSOR_PREFIX: &str = "ni2_";
+const SORT_ID: &str = "base-priority-desc:occurred-at-desc:item-id-asc:v2";
 
 const UPSERT_SQL: &str = "INSERT INTO notif_inbox_item (
  tenant_id, region, item_id, recipient, subject, subject_root, reason, class, origin_event,
@@ -567,6 +567,7 @@ struct CursorFrame {
     scope: String,
     limit: u16,
     priority: u8,
+    occurred_at: DateTime<Utc>,
     item_id: String,
 }
 
@@ -596,19 +597,22 @@ fn valid_item_id(value: &str) -> bool {
 
 fn encode_cursor(
     request: &InboxReadRequest,
-    priority: u8,
-    item_id: &str,
+    item: &DurableInboxItem,
 ) -> Result<String, PgInboxError> {
-    if !valid_cursor_item_id(item_id) || !valid_cursor_priority(priority) {
+    if !valid_cursor_item_id(&item.item.item_id) || !valid_cursor_priority(item.priority) {
         return Err(PgInboxError::CorruptStoredRow);
     }
+    let occurred_at = DateTime::parse_from_rfc3339(&item.occurred_at)
+        .map_err(|_| PgInboxError::CorruptStoredRow)?
+        .with_timezone(&Utc);
     let frame = CursorFrame {
         version: CURSOR_VERSION,
         sort: SORT_ID.into(),
         scope: cursor_scope(request),
         limit: request.limit,
-        priority,
-        item_id: item_id.into(),
+        priority: item.priority,
+        occurred_at,
+        item_id: item.item.item_id.clone(),
     };
     let bytes = serde_json::to_vec(&frame).map_err(|_| PgInboxError::MalformedCursor)?;
     if bytes.len() > MAX_CURSOR_FRAME_BYTES {
@@ -720,7 +724,7 @@ async fn list_on_conn(
         .collect::<Result<Vec<_>, _>>()?;
     let next_cursor = if has_more {
         let last = items.last().ok_or(PgInboxError::CorruptStoredRow)?;
-        Some(encode_cursor(request, last.priority, &last.item.item_id)?)
+        Some(encode_cursor(request, last)?)
     } else {
         None
     };
@@ -783,13 +787,17 @@ fn build_list_query<'a>(
         query.push(INBOX_PRIORITY_CASE_SQL);
         query.push(") = ");
         query.push_bind(i16::from(cursor.priority));
+        query.push(" AND (occurred_at < ");
+        query.push_bind(cursor.occurred_at);
+        query.push(" OR (occurred_at = ");
+        query.push_bind(cursor.occurred_at);
         query.push(" AND item_id > ");
         query.push_bind(&cursor.item_id);
-        query.push("))");
+        query.push("))))");
     }
     query.push(" ORDER BY (");
     query.push(INBOX_PRIORITY_CASE_SQL);
-    query.push(") DESC, item_id ASC LIMIT ");
+    query.push(") DESC, occurred_at DESC, item_id ASC LIMIT ");
     query.push_bind(i64::from(request.limit) + 1);
     query
 }
@@ -1046,12 +1054,33 @@ mod tests {
         }
     }
 
+    fn cursor_item(priority: u8, item_id: &str, occurred_at: &str) -> DurableInboxItem {
+        let input = upsert_input();
+        DurableInboxItem {
+            item: RoutedInboxItem {
+                item_id: item_id.into(),
+                ..input.item
+            },
+            subject_root: input.subject_root,
+            template_key: input.template_key,
+            template_args: input.template_args,
+            occurred_at: occurred_at.into(),
+            dek_ref: input.dek_ref,
+            priority,
+        }
+    }
+
     #[test]
     fn cursor_round_trip_is_bound_to_scope_filter_limit_and_sort() {
         let base = request(25, InboxFilter::git_review_requests());
-        let token = encode_cursor(&base, 70, "itm-7").unwrap();
+        let item = cursor_item(70, "itm-7", "2026-07-22T12:00:00Z");
+        let token = encode_cursor(&base, &item).unwrap();
         let decoded = decode_cursor(&token, &base).unwrap();
         assert_eq!(decoded.priority, 70);
+        assert_eq!(
+            decoded.occurred_at,
+            "2026-07-22T12:00:00Z".parse::<DateTime<Utc>>().unwrap()
+        );
         assert_eq!(decoded.item_id, "itm-7");
 
         let mut other = base.clone();
@@ -1081,25 +1110,27 @@ mod tests {
                 Err(PgInboxError::InvalidLimit)
             );
         }
-        for token in ["", "ni1_", "offset:20", "ni1_not-base64!"] {
+        for token in ["", "ni2_", "offset:20", "ni2_not-base64!"] {
             assert_eq!(
                 decode_cursor(token, &request(10, InboxFilter::all())),
                 Err(PgInboxError::MalformedCursor)
             );
         }
-        let oversized = format!("ni1_{}", "A".repeat(MAX_CURSOR_BYTES));
+        let oversized = format!("ni2_{}", "A".repeat(MAX_CURSOR_BYTES));
         assert_eq!(
             decode_cursor(&oversized, &request(10, InboxFilter::all())),
             Err(PgInboxError::MalformedCursor)
         );
-        assert_eq!(
-            encode_cursor(&request(10, InboxFilter::all()), 71, "itm-7"),
-            Err(PgInboxError::CorruptStoredRow)
-        );
-        assert_eq!(
-            encode_cursor(&request(10, InboxFilter::all()), 70, "itm\n7"),
-            Err(PgInboxError::CorruptStoredRow)
-        );
+        for item in [
+            cursor_item(71, "itm-7", "2026-07-22T12:00:00Z"),
+            cursor_item(70, "itm\n7", "2026-07-22T12:00:00Z"),
+            cursor_item(70, "itm-7", "not-a-timestamp"),
+        ] {
+            assert_eq!(
+                encode_cursor(&request(10, InboxFilter::all()), &item),
+                Err(PgInboxError::CorruptStoredRow)
+            );
+        }
     }
 
     #[test]
@@ -1158,6 +1189,7 @@ mod tests {
             scope: cursor_scope(&request),
             limit: request.limit,
             priority: 70,
+            occurred_at: "2026-07-22T12:00:00Z".parse().unwrap(),
             item_id: "itm-7".into(),
         };
         for sql in [
@@ -1168,7 +1200,7 @@ mod tests {
             assert!(sql.contains(" AND region = "));
             assert!(sql.contains(" AND recipient = "));
             assert!(sql.contains(" ORDER BY ("));
-            assert!(sql.contains(") DESC, item_id ASC LIMIT "));
+            assert!(sql.contains(") DESC, occurred_at DESC, item_id ASC LIMIT "));
             assert!(sql.contains("octet_length(template_args_json::text) <= 16384"));
             assert!(!sql.to_ascii_uppercase().contains("OFFSET"));
         }
@@ -1225,7 +1257,7 @@ mod tests {
                 "{reason:?}"
             );
             assert_eq!(
-                crate::migrations::INBOX_KEYSET_INDEX_DDL
+                crate::migrations::INBOX_RECENCY_KEYSET_INDEX_DDL
                     .matches(&arm)
                     .count(),
                 1,
@@ -1233,6 +1265,8 @@ mod tests {
             );
         }
         assert!(UPSERT_SQL.contains("ON CONFLICT (tenant_id, recipient, dedup_key)"));
+        assert!(crate::migrations::INBOX_RECENCY_KEYSET_INDEX_DDL
+            .contains("DESC, occurred_at DESC, item_id ASC"));
         assert!(!UPSERT_SQL.contains("OFFSET"));
     }
 }

@@ -55,6 +55,19 @@ WHEN 'comments' THEN 55 WHEN 'watched' THEN 35 WHEN 'state_changed' THEN 35 \
 WHEN 'thread_watched' THEN 35 WHEN 'blocked' THEN 35 WHEN 'unblocked' THEN 35 \
 WHEN 'fyi' THEN 15 ELSE NULL END) DESC, item_id ASC)";
 
+pub const INBOX_RECENCY_KEYSET_INDEX_MIGRATION_ID: &str =
+    "notif_0011_inbox_recipient_recency_keyset";
+pub const INBOX_RECENCY_KEYSET_INDEX_DDL: &str = "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
+notif_inbox_recipient_recency_keyset ON notif_inbox_item \
+(tenant_id, region, recipient, \
+(CASE reason \
+WHEN 'approval_requested' THEN 90 WHEN 'escalated' THEN 90 WHEN 'sla' THEN 90 \
+WHEN 'review_requested' THEN 70 WHEN 'assigned' THEN 70 WHEN 'mentioned' THEN 70 \
+WHEN 'shared' THEN 70 WHEN 'replied' THEN 55 WHEN 'agent_proposal' THEN 55 \
+WHEN 'comments' THEN 55 WHEN 'watched' THEN 35 WHEN 'state_changed' THEN 35 \
+WHEN 'thread_watched' THEN 35 WHEN 'blocked' THEN 35 WHEN 'unblocked' THEN 35 \
+WHEN 'fyi' THEN 15 ELSE NULL END) DESC, occurred_at DESC, item_id ASC)";
+
 pub const NOTIF_PREF_DDL: &str = "\
 CREATE TABLE notif_pref (\
   tenant_id text NOT NULL, \
@@ -211,6 +224,12 @@ pub fn migrations() -> Migrations {
         MigrationPhase::Expand,
         "notif_inbox_item",
     ));
+    migrations.push(Migration::phased(
+        INBOX_RECENCY_KEYSET_INDEX_MIGRATION_ID,
+        INBOX_RECENCY_KEYSET_INDEX_DDL,
+        MigrationPhase::Expand,
+        "notif_inbox_item",
+    ));
     Migrations::of(migrations)
 }
 
@@ -228,8 +247,8 @@ mod tests {
         let migrations = migrations();
         assert_eq!(
             migrations.0.len(),
-            10,
-            "nine tables plus the additive inbox keyset index"
+            11,
+            "nine tables plus two additive inbox keyset indexes"
         );
         let mut runner = MigrationRunner::new();
         runner
@@ -248,8 +267,9 @@ mod tests {
                 "notif_0008_humanise_template",
                 "notif_0009_mute",
                 "notif_0010_inbox_recipient_keyset",
+                "notif_0011_inbox_recipient_recency_keyset",
             ],
-            "9 tables + 1 online index, in order - 0 backward migration"
+            "9 tables + 2 online indexes, in order - 0 backward migration"
         );
     }
 
