@@ -418,6 +418,17 @@ fn map_device_authorization_error(error: DeviceAuthorizationError) -> EdgeError 
     }
 }
 
+fn device_approval_response(outcome: ApprovalOutcome) -> Result<EdgeResponse, EdgeError> {
+    match outcome {
+        ApprovalOutcome::Approved | ApprovalOutcome::AlreadyApproved => Ok(no_store(
+            EdgeResponse::json(200, &json!({ "approved": true })),
+        )),
+        ApprovalOutcome::Expired | ApprovalOutcome::NotFound => Err(EdgeError::NotFound(
+            "that CLI login request was not found or has expired; start again from the CLI".into(),
+        )),
+    }
+}
+
 fn no_store(response: EdgeResponse) -> EdgeResponse {
     response
         .with_header("cache-control", "no-store")
@@ -781,20 +792,10 @@ impl Gateway {
             authority,
             source_expires_at_unix: identity.capability().expires_at_unix,
         };
-        match broker
+        let outcome = broker
             .approve(user_code, approval)
-            .map_err(map_device_authorization_error)?
-        {
-            ApprovalOutcome::Approved | ApprovalOutcome::AlreadyApproved => Ok(no_store(
-                EdgeResponse::json(200, &json!({ "approved": true })),
-            )),
-            ApprovalOutcome::Expired => Err(EdgeError::NotFound(
-                "that CLI login request has expired; start again from the CLI".into(),
-            )),
-            ApprovalOutcome::NotFound => Err(EdgeError::NotFound(
-                "that CLI login request was not found".into(),
-            )),
-        }
+            .map_err(map_device_authorization_error)?;
+        device_approval_response(outcome)
     }
 
     fn claim_device_authorization(&self, req: &EdgeRequest) -> Result<EdgeResponse, EdgeError> {
@@ -1533,6 +1534,23 @@ mod tests {
         assert!(headers.iter().any(|(name, value)| {
             name.eq_ignore_ascii_case("cache-control") && value == "no-store"
         }));
+    }
+
+    #[test]
+    fn device_approval_does_not_reveal_whether_a_code_used_to_exist() {
+        let Err(expired) = device_approval_response(ApprovalOutcome::Expired) else {
+            panic!("an expired code must be absent")
+        };
+        let Err(unknown) = device_approval_response(ApprovalOutcome::NotFound) else {
+            panic!("an unknown code must be absent")
+        };
+
+        assert_eq!(expired, unknown);
+        assert_eq!(expired.status(), 404);
+        assert_eq!(
+            expired.client_message(),
+            "that CLI login request was not found or has expired; start again from the CLI",
+        );
     }
 
     #[test]
