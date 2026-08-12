@@ -210,7 +210,13 @@ fn ag_d4_ci_t1_reconfirmed_zero_escapes_on_the_production_runner_image() {
     let dir = attestation_dir();
     std::fs::create_dir_all(&dir).expect("create attestation dir");
     let artifact_path = dir.join(format!("prod-image-{date}.json"));
-    std::fs::write(&artifact_path, attestation.to_json()).expect("write prod-image attestation");
+    std::fs::write(
+        &artifact_path,
+        attestation
+            .to_json()
+            .expect("serialize prod-image attestation"),
+    )
+    .expect("write prod-image attestation");
 
     println!("{}", attestation.green_line());
     println!(

@@ -375,8 +375,8 @@ impl EscapeAttestation {
         )
     }
 
-    pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("EscapeAttestation is always serializable")
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
     }
 }
 
@@ -648,7 +648,7 @@ mod tests {
             .any(|r| r.contains("CI-P27") || r.contains("P-348")));
         assert!(att.green_line().starts_with("[AG-D4 GREEN]"));
         assert!(att.green_line().contains("total-escapes=0"));
-        let json = att.to_json();
+        let json = att.to_json().unwrap();
         let back: EscapeAttestation = serde_json::from_str(&json).unwrap();
         assert_eq!(att, back);
     }

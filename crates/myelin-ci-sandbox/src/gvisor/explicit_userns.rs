@@ -385,14 +385,17 @@ pub fn preflight_explicit_userns_policy(
         runsc_root: runsc_root.to_path_buf(),
         runsc_root_identity,
     };
-    if EXPLICIT_USERNS_POLICY.set(policy.clone()).is_err() {
-        let already = EXPLICIT_USERNS_POLICY
-            .get()
-            .expect("set() just failed, so the cell must already be initialized");
-        if already != &policy {
+    if let Err(rejected) = EXPLICIT_USERNS_POLICY.set(policy) {
+        let Some(already) = EXPLICIT_USERNS_POLICY.get() else {
+            return Err(
+                "explicit-userns policy initialization raced without retaining either policy"
+                    .into(),
+            );
+        };
+        if already != &rejected {
             return Err(format!(
                 "explicit-userns policy already installed as {already:?}, which disagrees with \
-                 this preflight's {policy:?} - refusing rather than leaving some callers on a \
+                 this preflight's {rejected:?} - refusing rather than leaving some callers on a \
                  stale policy"
             ));
         }

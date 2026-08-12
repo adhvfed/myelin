@@ -181,9 +181,12 @@ fn visit_dir_sorted(root: &Path, current_abs: &Path, out: &mut Vec<Entry>) -> io
 
     for (_bare_name, abs) in children {
         let meta = fs::symlink_metadata(&abs)?;
-        let rel = abs
-            .strip_prefix(root)
-            .expect("child path is always under root");
+        let rel = abs.strip_prefix(root).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("directory walk escaped its canonical root: {error}"),
+            )
+        })?;
         let mut archive_name = b"./".to_vec();
         archive_name.extend_from_slice(rel.as_os_str().as_bytes());
         let is_dir = meta.file_type().is_dir();

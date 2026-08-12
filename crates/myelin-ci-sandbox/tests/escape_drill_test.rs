@@ -191,7 +191,11 @@ fn ag_d4_ci_t1_hard_escape_gate_zero_escapes_on_a_real_kernel() {
     let dir = attestation_dir();
     std::fs::create_dir_all(&dir).expect("create attestation dir");
     let artifact_path = dir.join(format!("{date}.json"));
-    std::fs::write(&artifact_path, attestation.to_json()).expect("write attestation artifact");
+    std::fs::write(
+        &artifact_path,
+        attestation.to_json().expect("serialize attestation"),
+    )
+    .expect("write attestation artifact");
 
     println!("{}", attestation.green_line());
     println!(

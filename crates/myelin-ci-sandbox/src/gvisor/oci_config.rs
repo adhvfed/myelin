@@ -629,10 +629,11 @@ impl OciConfig {
             "{:?}",
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
         )
-        .expect("writing JSON into a String cannot fail");
+        .map_err(|_| "format the fixed OCI PATH environment entry".to_string())?;
         for e in &self.extra_env {
             env_json.push_str(", ");
-            write!(&mut *env_json, "{e:?}").expect("writing JSON into a String cannot fail");
+            write!(&mut *env_json, "{e:?}")
+                .map_err(|_| "format an OCI environment entry".to_string())?;
         }
         let has_cargo_vendor = self.has_cargo_vendor();
         let cargo_home_tmpfs_bytes = if has_cargo_vendor {

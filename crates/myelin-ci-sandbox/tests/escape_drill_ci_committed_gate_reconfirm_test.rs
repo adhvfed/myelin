@@ -211,7 +211,11 @@ fn ag_d4_ci_t1_committed_gate_reconfirmed_zero_escapes_on_the_prod_runner_image(
     let dir = attestation_dir();
     std::fs::create_dir_all(&dir).expect("create attestation dir");
     let artifact_path = dir.join(format!("ci-p27-reconfirm-{date}.json"));
-    std::fs::write(&artifact_path, attestation.to_json()).expect("write CI-P27 attestation");
+    std::fs::write(
+        &artifact_path,
+        attestation.to_json().expect("serialize CI-P27 attestation"),
+    )
+    .expect("write CI-P27 attestation");
 
     println!("{}", attestation.green_line());
     println!(

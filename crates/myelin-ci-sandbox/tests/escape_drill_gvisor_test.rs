@@ -208,8 +208,11 @@ fn ag_d4_ci_t1_escape_gate_re_runs_green_on_the_gvisor_backend() {
     let dir = attestation_dir();
     std::fs::create_dir_all(&dir).expect("create attestation dir");
     let artifact_path = dir.join(format!("{date}-gvisor.json"));
-    std::fs::write(&artifact_path, attestation.to_json())
-        .expect("write gVisor attestation artifact");
+    std::fs::write(
+        &artifact_path,
+        attestation.to_json().expect("serialize gVisor attestation"),
+    )
+    .expect("write gVisor attestation artifact");
 
     println!("{}", attestation.green_line());
     println!(

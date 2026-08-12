@@ -91,9 +91,11 @@ pub fn resolve_bare_repo_path(
     for piece in &pieces {
         path.push(piece);
     }
-    let last = pieces
-        .last()
-        .expect("validate_wire_repo_slug returns ≥1 piece or errors");
+    let Some(last) = pieces.last() else {
+        return Err(WireError::Path(
+            "validated repository slug unexpectedly had no path components".into(),
+        ));
+    };
     path.set_file_name(format!("{last}.git"));
     Ok(path)
 }

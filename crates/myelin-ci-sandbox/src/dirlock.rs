@@ -86,10 +86,9 @@ pub(crate) fn verify_ancestors_not_writable_by_us(dir: &Path) -> Result<(), Stri
         );
     }
 
-    let root_c = CString::new("/").unwrap();
     let root_fd = unsafe {
         libc::open(
-            root_c.as_ptr(),
+            c"/".as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
@@ -137,11 +136,10 @@ pub(crate) fn check_ancestor_not_owned_or_writable(
              process rename/replace anything beneath it"
         ));
     }
-    let empty = CString::new("").unwrap();
     let rc = unsafe {
         libc::faccessat(
             fd.as_raw_fd(),
-            empty.as_ptr(),
+            c"".as_ptr(),
             libc::W_OK,
             libc::AT_EACCESS | libc::AT_EMPTY_PATH,
         )

@@ -80,13 +80,13 @@ pub fn preflight_gvisor_runner_host(runsc: &Path, rootfs: &Path) -> Result<(), S
             "MYELIN_RUNSC_BIN did not identify itself as runsc".to_string()
         }
     })?;
-    if RESOLVED_RUNSC_BIN.set(runsc.clone()).is_err() {
-        let already_cached = RESOLVED_RUNSC_BIN
-            .get()
-            .expect("set() just failed, so the cell must already be initialized");
-        if already_cached != &runsc {
+    if let Err(rejected) = RESOLVED_RUNSC_BIN.set(runsc.clone()) {
+        let Some(already_cached) = RESOLVED_RUNSC_BIN.get() else {
+            return Err("runsc path initialization raced without retaining either path".into());
+        };
+        if already_cached != &rejected {
             return Err(format!(
-                "MYELIN_RUNSC_BIN preflight validated {runsc:?}, but {already_cached:?} was \
+                "MYELIN_RUNSC_BIN preflight validated {rejected:?}, but {already_cached:?} was \
                  already cached by an earlier resolution - refusing rather than leaving launches \
                  on a stale, unvalidated binary"
             ));
