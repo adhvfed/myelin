@@ -502,6 +502,7 @@ async fn a_push_runs_a_real_pipeline_end_to_end() {
             run_ref: format!("myelin://{tenant}/ci/run/{run_uuid}"),
             run_attempt: 1,
             trust_tier: record.trust_tier.clone(),
+            started_at: "2026-07-17T00:00:00Z".into(),
             merge_idem_token: format!("merge:{run_uuid}"),
         },
     };
@@ -837,6 +838,7 @@ async fn arm_and_dispatch(
             run_ref: format!("myelin://{tenant}/ci/run/{run_uuid}"),
             run_attempt: 1,
             trust_tier: record.trust_tier.clone(),
+            started_at: "2026-07-17T00:00:00Z".into(),
             merge_idem_token: format!("merge:{run_uuid}"),
         },
     };

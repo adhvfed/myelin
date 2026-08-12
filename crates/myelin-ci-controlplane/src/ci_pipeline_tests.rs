@@ -65,6 +65,7 @@ fn facts() -> CheckFacts {
         run_ref: "myelin://acme/ci/run/run-7".into(),
         run_attempt: 1,
         trust_tier: "trusted".into(),
+        started_at: "2026-06-22T23:59:00Z".into(),
         merge_idem_token: "merge-attempt-7".into(),
     }
 }
@@ -86,6 +87,33 @@ fn job_run() -> PipelineRun {
             )),
         ],
         contexts: vec!["build".into(), "test".into()],
+        facts: facts(),
+    }
+}
+
+fn build_then_approve_deploy_run() -> PipelineRun {
+    PipelineRun {
+        stages: vec![
+            PipelineStage::job(CiStage::new(
+                "build",
+                "pipeline://acme/ci/run-7#build",
+                MicroUsd(0),
+                Some(3600),
+            )),
+            PipelineStage::gate(CiStage::new(
+                "deploy-approval",
+                "gate://acme/ci/run-7#deploy",
+                MicroUsd(0),
+                Some(86_400),
+            )),
+            PipelineStage::job(CiStage::new(
+                "deploy",
+                "pipeline://acme/ci/run-7#deploy",
+                MicroUsd(0),
+                Some(3600),
+            )),
+        ],
+        contexts: vec!["build".into(), "deploy".into()],
         facts: facts(),
     }
 }
@@ -341,6 +369,14 @@ fn a_terminal_check_fact_decodes_to_the_frozen_git_checkstatus_shape() {
     );
     assert_eq!(payload["run_attempt"], 1, "the monotonic supersession key");
     assert_eq!(
+        payload["started_at"], "2026-06-22T23:59:00Z",
+        "the check keeps the durable run's actual start time"
+    );
+    assert_eq!(
+        payload["completed_at"], "2026-06-23T00:00:00Z",
+        "the check completes on the workflow's replay-stable clock"
+    );
+    assert_eq!(
         payload["cost_settled"], false,
         "terminal but not settled until CI-P17's reserve/settle bookend closes (X-1 cost gate)"
     );
@@ -482,6 +518,64 @@ fn a_denied_gate_rejects_the_deploy_and_never_dispatches_the_gated_stage() {
     assert!(
         !types.contains(&CI_RUN_SUCCEEDED.to_string()),
         "a rejected deploy never succeeds"
+    );
+}
+
+#[test]
+fn a_gate_between_jobs_waits_in_place_then_runs_the_work_that_follows() {
+    let outbox = OutboxStore::new();
+    let signals = SignalStore::new();
+    let timers = TimerStore::new();
+    let runner = RecordingRunner::default();
+
+    let run = build_then_approve_deploy_run();
+
+    deliver_done(&signals, &stage_token(0), "build", true);
+    deliver_approval(&signals, "deploy-approval", true);
+    deliver_done(
+        &signals,
+        &job_idem_token("run-7", &format!("{CI_PIPELINE_WF_TYPE}:3")),
+        "deploy",
+        true,
+    );
+
+    let mut ctx = begin(&outbox, signals, timers, 1000);
+    let verdict = run_ci_pipeline_body(&mut ctx, &run, &runner)
+        .expect("build, approval, and deploy form one declared sequence");
+
+    assert_eq!(
+        verdict,
+        RunVerdict::Succeeded {
+            stages_completed: 2
+        }
+    );
+    assert_eq!(
+        runner.count(),
+        2,
+        "both jobs ran, with the approval consumed between them"
+    );
+}
+
+#[test]
+fn a_gate_between_jobs_parks_before_dispatching_the_work_that_follows() {
+    let outbox = OutboxStore::new();
+    let signals = SignalStore::new();
+    let timers = TimerStore::new();
+    let runner = RecordingRunner::default();
+
+    let run = build_then_approve_deploy_run();
+
+    deliver_done(&signals, &stage_token(0), "build", true);
+
+    let mut ctx = begin(&outbox, signals, timers, 1000);
+    let verdict = run_ci_pipeline_body(&mut ctx, &run, &runner)
+        .expect("the completed build reaches the approval wait");
+
+    assert_eq!(verdict, RunVerdict::Parked);
+    assert_eq!(
+        runner.count(),
+        1,
+        "deploy stays undispatched until a human approves it"
     );
 }
 

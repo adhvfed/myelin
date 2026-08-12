@@ -103,6 +103,7 @@ fn ci_run(merge_idem_token: &str, trust_tier: &str) -> PipelineRun {
             run_ref: format!("myelin://acme/ci/run/{CI_RUN}"),
             run_attempt: 1,
             trust_tier: trust_tier.into(),
+            started_at: "2026-06-23T00:00:00Z".into(),
             merge_idem_token: merge_idem_token.into(),
         },
     }

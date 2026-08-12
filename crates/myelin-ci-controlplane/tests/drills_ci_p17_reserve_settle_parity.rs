@@ -127,6 +127,7 @@ fn ci_d5_ci_pipeline_body_refuses_when_shared_wallet_exhausted_by_agent() {
             run_ref: "myelin://acme/ci/run/9".into(),
             run_attempt: 0,
             trust_tier: "trusted".into(),
+            started_at: "2026-06-23T00:00:00Z".into(),
             merge_idem_token: "merge-attempt-9".into(),
         },
     };

@@ -47,6 +47,7 @@ fn facts() -> CheckFacts {
         run_ref: "myelin://acme/ci/run/pr-7".into(),
         run_attempt: 1,
         trust_tier: "trusted".into(),
+        started_at: "2026-06-23T00:00:00Z".into(),
         merge_idem_token: "merge-attempt-pr-7".into(),
     }
 }

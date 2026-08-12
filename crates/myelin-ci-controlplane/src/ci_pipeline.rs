@@ -40,20 +40,15 @@ pub struct CheckFacts {
     pub run_ref: String,
     pub run_attempt: u32,
     pub trust_tier: String,
+    pub started_at: String,
     pub merge_idem_token: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunVerdict {
-    Succeeded {
-        stages_completed: usize,
-    },
-    Failed {
-        stage: String,
-    },
-    Rejected {
-        stage: String,
-    },
+    Succeeded { stages_completed: usize },
+    Failed { stage: String },
+    Rejected { stage: String },
     Parked,
 }
 
@@ -112,7 +107,12 @@ pub fn structured_failure(
     }
 }
 
-fn terminal_check_status(facts: &CheckFacts, context: &str, success: bool) -> serde_json::Value {
+fn terminal_check_status(
+    facts: &CheckFacts,
+    context: &str,
+    success: bool,
+    completed_at: &str,
+) -> serde_json::Value {
     let state = if success {
         crate::check_emitter::CheckState::Success
     } else {
@@ -125,8 +125,8 @@ fn terminal_check_status(facts: &CheckFacts, context: &str, success: bool) -> se
         run_ref: facts.run_ref.clone(),
         run_attempt: facts.run_attempt,
         trust_tier: crate::check_emitter::TrustTier::from_stamp(&facts.trust_tier),
-        started_at: "1970-01-01T00:00:00Z".to_string(),
-        completed_at: Some("1970-01-01T00:00:00Z".to_string()),
+        started_at: facts.started_at.clone(),
+        completed_at: Some(completed_at.to_owned()),
     };
     crate::check_emitter::check_status_payload(
         &emit_ctx,
@@ -155,54 +155,41 @@ pub fn run_ci_pipeline_body<R>(
 where
     R: JobRunner,
 {
-    for stage in &run.stages {
-        if !stage.gate {
-            break;
-        }
-        match gate_stage(ctx, &stage.engine.name, stage.engine.timeout_secs)? {
-            GateOutcome::Approved => {  }
-            GateOutcome::Rejected => {
-                emit_deployment_rejected(ctx, &run.facts, &stage.engine.name)?;
-                return Ok(RunVerdict::Rejected {
-                    stage: stage.engine.name.clone(),
-                });
+    let mut stages = run.stages.iter().peekable();
+    let mut stages_completed = 0;
+
+    while let Some(stage) = stages.next() {
+        if stage.gate {
+            match gate_stage(ctx, &stage.engine.name, stage.engine.timeout_secs)? {
+                GateOutcome::Approved => continue,
+                GateOutcome::Rejected => {
+                    emit_deployment_rejected(ctx, &run.facts, &stage.engine.name)?;
+                    return Ok(RunVerdict::Rejected {
+                        stage: stage.engine.name.clone(),
+                    });
+                }
+                GateOutcome::Parked => return Ok(RunVerdict::Parked),
             }
-            GateOutcome::Parked => return Ok(RunVerdict::Parked),
+        }
+
+        let mut jobs = vec![stage.engine.clone()];
+        while let Some(stage) = stages.next_if(|stage| !stage.gate) {
+            jobs.push(stage.engine.clone());
+        }
+        match ctx.run_ci_pipeline(&CiPipelineSpec::new(jobs), runner)? {
+            PipelineOutcome::Succeeded {
+                stages_completed: completed,
+            } => stages_completed += completed,
+            PipelineOutcome::Failed { stage } | PipelineOutcome::TimedOut { stage } => {
+                emit_terminal_outcome(ctx, run, false, Some(&stage))?;
+                return Ok(RunVerdict::Failed { stage });
+            }
+            PipelineOutcome::Parked => return Ok(RunVerdict::Parked),
         }
     }
 
-    let engine_spec = CiPipelineSpec::new(
-        run.stages
-            .iter()
-            .filter(|s| !s.gate)
-            .map(|s| s.engine.clone())
-            .collect(),
-    );
-    let outcome = ctx.run_ci_pipeline(&engine_spec, runner)?;
-
-    match outcome {
-        PipelineOutcome::Succeeded { stages_completed } => {
-            emit_terminal_checks(ctx, &run.facts, &run.contexts, true)?;
-            emit_run_terminal(ctx, &run.facts, true, None)?;
-            emit_ci_result(ctx, &run.facts, &run.contexts, true)?;
-            Ok(RunVerdict::Succeeded { stages_completed })
-        }
-        PipelineOutcome::Failed { stage } => {
-            emit_terminal_checks(ctx, &run.facts, &run.contexts, false)?;
-            emit_run_terminal(ctx, &run.facts, false, Some(&stage))?;
-            emit_ci_result(ctx, &run.facts, &run.contexts, false)?;
-            Ok(RunVerdict::Failed { stage })
-        }
-        PipelineOutcome::TimedOut { stage } => {
-            emit_terminal_checks(ctx, &run.facts, &run.contexts, false)?;
-            emit_run_terminal(ctx, &run.facts, false, Some(&stage))?;
-            emit_ci_result(ctx, &run.facts, &run.contexts, false)?;
-            Ok(RunVerdict::Failed { stage })
-        }
-        PipelineOutcome::Parked => {
-            Ok(RunVerdict::Parked)
-        }
-    }
+    emit_terminal_outcome(ctx, run, true, None)?;
+    Ok(RunVerdict::Succeeded { stages_completed })
 }
 
 fn gate_stage(ctx: &mut WfCtx, stage: &str, window_secs: Option<i64>) -> WfResult<GateOutcome> {
@@ -228,13 +215,26 @@ fn emit_terminal_checks(
     facts: &CheckFacts,
     contexts: &[String],
     success: bool,
+    completed_at: &str,
 ) -> WfResult<()> {
     for context in contexts {
-        let status = terminal_check_status(facts, context, success);
+        let status = terminal_check_status(facts, context, success, completed_at);
         let draft = check_updated_draft(&facts.repo, &facts.commit_oid, context, status);
         ctx.emit(draft, None)?;
     }
     Ok(())
+}
+
+fn emit_terminal_outcome(
+    ctx: &mut WfCtx,
+    run: &PipelineRun,
+    success: bool,
+    failed_stage: Option<&str>,
+) -> WfResult<()> {
+    let completed_at = ctx.now();
+    emit_terminal_checks(ctx, &run.facts, &run.contexts, success, &completed_at)?;
+    emit_run_terminal(ctx, &run.facts, success, failed_stage)?;
+    emit_ci_result(ctx, &run.facts, &run.contexts, success)
 }
 
 fn emit_run_terminal(
