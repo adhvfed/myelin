@@ -2706,12 +2706,10 @@ dependencies = [
  "myelin-notif",
  "myelin-refs",
  "myelin-tenancy",
- "proc-macro2",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
- "syn",
  "tokio",
  "zeroize",
 ]
