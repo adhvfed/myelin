@@ -11,6 +11,12 @@ use crate::receive_pack::{Oid, QuarantineMigration, QuarantineObject};
 const CLONE_MAX_TIPS: usize = 100_000;
 const CLONE_MAX_TOTAL_STORED_BYTES: usize = 1024 * 1024 * 1024;
 
+fn lock_state<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AccelKind {
     CommitGraph,
@@ -70,7 +76,7 @@ impl<B: BlobStore> PackObjectDb<B> {
     }
 
     pub fn generation(&self) -> u64 {
-        *self.generation.lock().expect("generation mutex")
+        *lock_state(&self.generation)
     }
 
     pub fn put_object(
@@ -80,11 +86,8 @@ impl<B: BlobStore> PackObjectDb<B> {
         content: &[u8],
     ) -> Result<ContentHash, GitPackError> {
         let address = self.tier.put_object(&self.repo, kind, content)?;
-        self.oid_index
-            .lock()
-            .expect("oid index mutex")
-            .insert(oid.0.clone(), address.clone());
-        *self.generation.lock().expect("generation mutex") += 1;
+        lock_state(&self.oid_index).insert(oid.0.clone(), address.clone());
+        *lock_state(&self.generation) += 1;
         Ok(address)
     }
 
@@ -107,11 +110,7 @@ impl<B: BlobStore> PackObjectDb<B> {
     }
 
     pub fn address_of(&self, oid: &Oid) -> Option<ContentHash> {
-        self.oid_index
-            .lock()
-            .expect("oid index mutex")
-            .get(&oid.0)
-            .cloned()
+        lock_state(&self.oid_index).get(&oid.0).cloned()
     }
 
     pub fn record_maintenance(
@@ -124,10 +123,7 @@ impl<B: BlobStore> PackObjectDb<B> {
             blob: manifest.pack_hash,
             fresh_at_fence: self.generation(),
         };
-        self.accel
-            .lock()
-            .expect("accel mutex")
-            .insert(kind, artifact.clone());
+        lock_state(&self.accel).insert(kind, artifact.clone());
         Ok(artifact)
     }
 
@@ -143,14 +139,14 @@ impl<B: BlobStore> PackObjectDb<B> {
     }
 
     pub fn is_stale(&self, kind: AccelKind) -> bool {
-        match self.accel.lock().expect("accel mutex").get(&kind) {
+        match lock_state(&self.accel).get(&kind) {
             None => true,
             Some(a) => a.fresh_at_fence < self.generation(),
         }
     }
 
     pub fn accel_artifact(&self, kind: AccelKind) -> Option<AccelArtifact> {
-        self.accel.lock().expect("accel mutex").get(&kind).cloned()
+        lock_state(&self.accel).get(&kind).cloned()
     }
 
     pub fn serve_clone(&self, tips: &[Oid]) -> Result<Vec<(Oid, Vec<u8>)>, GitPackError> {
@@ -189,12 +185,12 @@ impl<B: BlobStore> PackObjectDb<B> {
                     maximum: maximum_stored_bytes_per_object,
                 });
             }
-            total_stored_bytes = total_stored_bytes
-                .checked_add(stored_bytes)
-                .ok_or(GitPackError::ReadLimitExceeded {
+            total_stored_bytes = total_stored_bytes.checked_add(stored_bytes).ok_or(
+                GitPackError::ReadLimitExceeded {
                     actual: usize::MAX,
                     maximum: maximum_total_stored_bytes,
-                })?;
+                },
+            )?;
             if total_stored_bytes > maximum_total_stored_bytes {
                 return Err(GitPackError::ReadLimitExceeded {
                     actual: total_stored_bytes,
@@ -353,8 +349,7 @@ mod tests {
             .tier()
             .object_stored_len(db.repo(), &first_address)
             .expect("first metadata")
-            + db
-                .tier()
+            + db.tier()
                 .object_stored_len(db.repo(), &second_address)
                 .expect("second metadata");
 
@@ -364,12 +359,8 @@ mod tests {
                 .len(),
             2
         );
-        assert!(db
-            .serve_clone_bounded(&tips, 1, 64, stored_total)
-            .is_err());
-        assert!(db
-            .serve_clone_bounded(&tips, 2, 1, stored_total)
-            .is_err());
+        assert!(db.serve_clone_bounded(&tips, 1, 64, stored_total).is_err());
+        assert!(db.serve_clone_bounded(&tips, 2, 1, stored_total).is_err());
         assert!(db
             .serve_clone_bounded(&tips, 2, 64, stored_total - 1)
             .is_err());
