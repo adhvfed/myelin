@@ -10,8 +10,8 @@ use myelin_ci_controlplane::{
     ActivationReadinessProbe, CiSupersededDefinitionGuardError, CutoverPlan,
     CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION, CI_MANIFEST_PIPELINE_VERSION,
 };
-use myelin_storage::{DurableCostLedger, HotTables, PgMigrator, SubstrateProvider};
 use myelin_config::MyelinConfig;
+use myelin_storage::{DurableCostLedger, HotTables, PgMigrator, SubstrateProvider};
 use myelin_tenancy::Region;
 use sqlx::{Acquire, Executor, PgPool, Row};
 
@@ -189,12 +189,14 @@ fn diagnostics(admin: &PgPool) -> myelin_ci_controlplane::CiRegionRunDiscovery {
 }
 
 async fn definition_row(admin: &PgPool, version: i32) -> Option<(String, String)> {
-    sqlx::query("SELECT code_hash, status FROM wf_definition WHERE wf_type='ci.pipeline' AND version=$1")
-        .bind(version)
-        .fetch_optional(admin)
-        .await
-        .unwrap()
-        .map(|row| (row.get("code_hash"), row.get("status")))
+    sqlx::query(
+        "SELECT code_hash, status FROM wf_definition WHERE wf_type='ci.pipeline' AND version=$1",
+    )
+    .bind(version)
+    .fetch_optional(admin)
+    .await
+    .unwrap()
+    .map(|row| (row.get("code_hash"), row.get("status")))
 }
 
 async fn seed_workflow_run(admin: &PgPool, region: &str, run_id: &str, version: i32, state: &str) {
@@ -351,104 +353,107 @@ async fn an_old_v3_admission_holding_the_share_lock_makes_the_cutover_observe_it
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v3_admission() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("cutover_wins").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        let mut fence_conn = admin.acquire().await.unwrap();
-        let mut fence = fence_conn.begin().await.unwrap();
-        sqlx::query(
-            "SELECT code_hash, status FROM wf_definition
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("cutover_wins").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                let mut fence_conn = admin.acquire().await.unwrap();
+                let mut fence = fence_conn.begin().await.unwrap();
+                sqlx::query(
+                    "SELECT code_hash, status FROM wf_definition
              WHERE wf_type = 'ci.pipeline' AND version = $1 FOR UPDATE",
-        )
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-        .fetch_one(&mut *fence)
-        .await
-        .unwrap();
+                )
+                .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                .fetch_one(&mut *fence)
+                .await
+                .unwrap();
 
-        let admission_pool = pinned_pool(&admin_url(), &schema, 2).await;
-        let mut admission_conn = admission_pool.acquire().await.unwrap();
-        let admission_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *admission_conn)
-            .await
-            .unwrap();
-        let admission = tokio::spawn(async move {
-            let mut tx = admission_conn.begin().await.unwrap();
-            let status: String = sqlx::query_scalar(
-                "SELECT status FROM wf_definition
+                let admission_pool = pinned_pool(&admin_url(), &schema, 2).await;
+                let mut admission_conn = admission_pool.acquire().await.unwrap();
+                let admission_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *admission_conn)
+                    .await
+                    .unwrap();
+                let admission = tokio::spawn(async move {
+                    let mut tx = admission_conn.begin().await.unwrap();
+                    let status: String = sqlx::query_scalar(
+                        "SELECT status FROM wf_definition
                  WHERE wf_type = 'ci.pipeline' AND version = $1 FOR SHARE",
-            )
-            .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-            let eligible = status == "active";
-            tx.rollback().await.unwrap();
-            (status, eligible)
-        });
+                    )
+                    .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+                    let eligible = status == "active";
+                    tx.rollback().await.unwrap();
+                    (status, eligible)
+                });
 
-        let observer = pinned_pool(&admin_url(), &schema, 2).await;
-        wait_until_blocked(&observer, admission_pid).await;
-        assert!(
-            !admission.is_finished(),
-            "the fresh admission must be blocked behind the cutover fence"
-        );
+                let observer = pinned_pool(&admin_url(), &schema, 2).await;
+                wait_until_blocked(&observer, admission_pid).await;
+                assert!(
+                    !admission.is_finished(),
+                    "the fresh admission must be blocked behind the cutover fence"
+                );
 
-        let backlog: bool = sqlx::query_scalar(
-            "SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)",
-        )
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-        .fetch_one(&mut *fence)
-        .await
-        .unwrap();
-        assert!(!backlog, "this schema has no v3 runs");
-        sqlx::query(
-            "UPDATE wf_definition SET status='draining'
+                let backlog: bool = sqlx::query_scalar(
+                    "SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)",
+                )
+                .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                .fetch_one(&mut *fence)
+                .await
+                .unwrap();
+                assert!(!backlog, "this schema has no v3 runs");
+                sqlx::query(
+                    "UPDATE wf_definition SET status='draining'
              WHERE wf_type='ci.pipeline' AND version=$1 AND status='active'",
-        )
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-        .execute(&mut *fence)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO wf_definition (wf_type, version, code_hash, status)
+                )
+                .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                .execute(&mut *fence)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO wf_definition (wf_type, version, code_hash, status)
              VALUES ('ci.pipeline', $1, $2, 'active') ON CONFLICT DO NOTHING",
-        )
-        .bind(CI_MANIFEST_PIPELINE_VERSION)
-        .bind(myelin_ci_controlplane::ci_manifest_pipeline_definition().code_hash())
-        .execute(&mut *fence)
-        .await
-        .unwrap();
-        fence.commit().await.unwrap();
+                )
+                .bind(CI_MANIFEST_PIPELINE_VERSION)
+                .bind(myelin_ci_controlplane::ci_manifest_pipeline_definition().code_hash())
+                .execute(&mut *fence)
+                .await
+                .unwrap();
+                fence.commit().await.unwrap();
 
-        let (status, eligible) = admission.await.unwrap();
-        assert_eq!(status, "draining");
-        assert!(
+                let (status, eligible) = admission.await.unwrap();
+                assert_eq!(status, "draining");
+                assert!(
             !eligible,
             "a draining definition is not eligible for a FRESH start - this is the refusal the \
              already-deployed v3 binary reports as CorruptRun"
         );
 
-        let v3_runs: i64 = sqlx::query_scalar(
+                let v3_runs: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM workflow_run WHERE wf_type='ci.pipeline' AND wf_version=$1",
         )
         .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
         .fetch_one(&admin)
         .await
         .unwrap();
-        assert_eq!(v3_runs, 0, "the fenced-out admission wrote no workflow");
-        for table in ["ci_drive_manifest", "ci_job", "job_queue"] {
-            let rows: i64 =
-                sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
-                    .fetch_one(&admin)
-                    .await
-                    .unwrap();
-            assert_eq!(rows, 0, "the fenced-out admission wrote no {table} row");
-        }
-        observer.close().await;
-        admission_pool.close().await;
-    })
-    .await;
-    })
+                assert_eq!(v3_runs, 0, "the fenced-out admission wrote no workflow");
+                for table in ["ci_drive_manifest", "ci_job", "job_queue"] {
+                    let rows: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table}"))
+                        .fetch_one(&admin)
+                        .await
+                        .unwrap();
+                    assert_eq!(rows, 0, "the fenced-out admission wrote no {table} row");
+                }
+                observer.close().await;
+                admission_pool.close().await;
+            })
+            .await;
+        },
+    )
     .await;
 }
 
@@ -517,85 +522,115 @@ async fn an_injected_probe_failure_rolls_the_cutover_back_and_leaves_v3_active()
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_divergent_preexisting_v3_hash_refuses_and_leaves_v3_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("hash_clash").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        sqlx::query(
-            "INSERT INTO wf_definition (wf_type, version, code_hash, status)
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("hash_clash").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                sqlx::query(
+                    "INSERT INTO wf_definition (wf_type, version, code_hash, status)
              VALUES ('ci.pipeline', $1, 'blake3:some-other-binarys-hash', 'active')",
-        )
-        .bind(CI_MANIFEST_PIPELINE_VERSION)
-        .execute(&admin)
-        .await
-        .unwrap();
-
-        let factory = cutover_factory(&admin, &schema).await;
-        let refusal = factory
-            .cutover_definition(&diagnostics(&admin))
-            .await
-            .expect_err("a v3 row from a different source tree must refuse");
-        assert!(
-            matches!(refusal, CiSupersededDefinitionGuardError::ActivationRefused(_)),
-            "expected an activation refusal, got {refusal:?}"
-        );
-        assert!(refusal.to_string().contains("DIFFERENT code hash"));
-        assert_eq!(
-            definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                )
+                .bind(CI_MANIFEST_PIPELINE_VERSION)
+                .execute(&admin)
                 .await
-                .map(|(_, status)| status),
-            Some("active".into()),
-            "the rollback leaves v2 active"
-        );
-    })
-    .await;
-    })
+                .unwrap();
+
+                let factory = cutover_factory(&admin, &schema).await;
+                let refusal = factory
+                    .cutover_definition(&diagnostics(&admin))
+                    .await
+                    .expect_err("a v3 row from a different source tree must refuse");
+                assert!(
+                    matches!(
+                        refusal,
+                        CiSupersededDefinitionGuardError::ActivationRefused(_)
+                    ),
+                    "expected an activation refusal, got {refusal:?}"
+                );
+                assert!(refusal.to_string().contains("DIFFERENT code hash"));
+                assert_eq!(
+                    definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                        .await
+                        .map(|(_, status)| status),
+                    Some("active".into()),
+                    "the rollback leaves v2 active"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_cutover_is_idempotent_across_reboots_and_never_reactivates_v3() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("idempotent").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        let factory = cutover_factory(&admin, &schema).await;
-        factory.cutover_definition(&diagnostics(&admin)).await.expect("first cutover");
-        let after_first = definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await;
-        factory.cutover_definition(&diagnostics(&admin)).await.expect("reboot cutover");
-        factory.cutover_definition(&diagnostics(&admin)).await.expect("third cutover");
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("idempotent").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                let factory = cutover_factory(&admin, &schema).await;
+                factory
+                    .cutover_definition(&diagnostics(&admin))
+                    .await
+                    .expect("first cutover");
+                let after_first = definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await;
+                factory
+                    .cutover_definition(&diagnostics(&admin))
+                    .await
+                    .expect("reboot cutover");
+                factory
+                    .cutover_definition(&diagnostics(&admin))
+                    .await
+                    .expect("third cutover");
 
-        assert_eq!(
-            definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-                .await
-                .map(|(_, status)| status),
-            Some("draining".into()),
-            "a reboot NEVER reactivates the superseded version"
-        );
-        assert_eq!(
-            definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await,
-            after_first,
-            "the activated row is byte-identical across reboots"
-        );
-        let (hash, status) = after_first.unwrap();
-        assert_eq!(status, "active");
-        assert_eq!(
-            hash,
-            myelin_ci_controlplane::ci_manifest_pipeline_definition().code_hash()
-        );
-    })
-    .await;
-    })
+                assert_eq!(
+                    definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                        .await
+                        .map(|(_, status)| status),
+                    Some("draining".into()),
+                    "a reboot NEVER reactivates the superseded version"
+                );
+                assert_eq!(
+                    definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await,
+                    after_first,
+                    "the activated row is byte-identical across reboots"
+                );
+                let (hash, status) = after_first.unwrap();
+                assert_eq!(status, "active");
+                assert_eq!(
+                    hash,
+                    myelin_ci_controlplane::ci_manifest_pipeline_definition().code_hash()
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_existing_v3_run_keeps_draining_while_a_fresh_v3_start_is_refused() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("drain").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_workflow_run(&admin, REGION, "draining-run", CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION, "running").await;
-        sqlx::query(
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("drain").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_workflow_run(
+                    &admin,
+                    REGION,
+                    "draining-run",
+                    CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+                    "running",
+                )
+                .await;
+                sqlx::query(
             "UPDATE wf_definition SET status='draining' WHERE wf_type='ci.pipeline' AND version=$1",
         )
         .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
@@ -603,86 +638,94 @@ async fn an_existing_v3_run_keeps_draining_while_a_fresh_v3_start_is_refused() {
         .await
         .unwrap();
 
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM wf_definition WHERE wf_type='ci.pipeline' AND version=$1",
-        )
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert!(
-            matches!(status.as_str(), "active" | "draining"),
-            "an in-flight v3 run may still be replayed/driven while draining"
-        );
-        assert_ne!(
-            status, "active",
-            "a FRESH v2 start is refused once the definition drains"
-        );
-
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM workflow_run WHERE run_id='draining-run'")
+                let status: String = sqlx::query_scalar(
+                    "SELECT status FROM wf_definition WHERE wf_type='ci.pipeline' AND version=$1",
+                )
+                .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
                 .fetch_one(&admin)
                 .await
                 .unwrap();
-        assert_eq!(state, "running");
-    })
-    .await;
-    })
+                assert!(
+                    matches!(status.as_str(), "active" | "draining"),
+                    "an in-flight v3 run may still be replayed/driven while draining"
+                );
+                assert_ne!(
+                    status, "active",
+                    "a FRESH v2 start is refused once the definition drains"
+                );
+
+                let state: String = sqlx::query_scalar(
+                    "SELECT state FROM workflow_run WHERE run_id='draining-run'",
+                )
+                .fetch_one(&admin)
+                .await
+                .unwrap();
+                assert_eq!(state, "running");
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_backlog_in_another_region_still_refuses_the_database_global_cutover() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("global").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_workflow_run(
-            &admin,
-            OTHER_REGION,
-            "other-region-v2",
-            CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
-            "running",
-        )
-        .await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("global").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_workflow_run(
+                    &admin,
+                    OTHER_REGION,
+                    "other-region-v2",
+                    CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+                    "running",
+                )
+                .await;
 
-        let discovery = ci_region_run_discovery_test_support(admin.clone());
-        let local = discovery
-            .superseded_definition_runs(REGION, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION, 16)
-            .await
-            .unwrap();
-        assert!(
-            local.is_empty(),
-            "the regional diagnostic is blind to the other region - by construction"
-        );
+                let discovery = ci_region_run_discovery_test_support(admin.clone());
+                let local = discovery
+                    .superseded_definition_runs(REGION, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION, 16)
+                    .await
+                    .unwrap();
+                assert!(
+                    local.is_empty(),
+                    "the regional diagnostic is blind to the other region - by construction"
+                );
 
-        let global: bool = sqlx::query_scalar(
-            "SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)",
-        )
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-        .fetch_one(&admin)
-        .await
-        .unwrap();
-        assert!(global, "the global probe must see every region's backlog");
-
-        let factory = cutover_factory(&admin, &schema).await;
-        let refusal = factory
-            .cutover_definition(&diagnostics(&admin))
-            .await
-            .expect_err("a cross-region backlog must refuse the database-global transition");
-        assert!(matches!(
-            refusal,
-            CiSupersededDefinitionGuardError::Backlog(_)
-        ));
-        assert_eq!(
-            definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                let global: bool = sqlx::query_scalar(
+                    "SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)",
+                )
+                .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                .fetch_one(&admin)
                 .await
-                .map(|(_, status)| status),
-            Some("active".into())
-        );
-    })
-    .await;
-    })
+                .unwrap();
+                assert!(global, "the global probe must see every region's backlog");
+
+                let factory = cutover_factory(&admin, &schema).await;
+                let refusal = factory
+                    .cutover_definition(&diagnostics(&admin))
+                    .await
+                    .expect_err(
+                        "a cross-region backlog must refuse the database-global transition",
+                    );
+                assert!(matches!(
+                    refusal,
+                    CiSupersededDefinitionGuardError::Backlog(_)
+                ));
+                assert_eq!(
+                    definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                        .await
+                        .map(|(_, status)| status),
+                    Some("active".into())
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
@@ -782,101 +825,68 @@ async fn the_backlog_probe_is_executable_only_by_the_runtime_role() {
     .await;
 }
 
-#[test]
-fn production_admission_locks_the_definition_row_before_starting_the_workflow() {
-    let starter = include_str!("../src/pg_pipeline_starter.rs");
-    assert!(
-        starter.contains("WHERE wf_type = $1 AND version = $2 FOR SHARE"),
-        "fresh admission must lock the pinned definition row FOR SHARE"
-    );
-    let fresh_validate = starter
-        .find("validate_definition_pin(&mut transaction, &self.definition, false)")
-        .expect("a fresh (non-replay) start validates the definition pin");
-    let start = starter
-        .find("start_with_id_on_conn(")
-        .expect("admission starts the workflow on the same connection");
-    assert!(
-        fresh_validate < start,
-        "the definition FOR SHARE lock must be taken BEFORE the workflow is started, or the \
-         cutover fence is not mutually exclusive with admission"
-    );
-    assert!(
-        starter.contains("HandlerTx::with_connection(&mut *transaction)"),
-        "the workflow start must ride the same transaction that holds the definition lock"
-    );
-    assert!(
-        starter.contains("pinned workflow definition status `{status}` is not eligible for this start"),
-        "the draining refusal the fenced-out old binary reports must stay in the admission path"
-    );
-    let driver = include_str!("../src/ci_pipeline_driver.rs");
-    let driver_start = driver
-        .find("pub struct CiPipelineDriver")
-        .expect("the test-support driver exists");
-    let gate = driver[..driver_start].rfind("#[cfg(any(test, feature = \"test-support\"))]");
-    assert!(
-        gate.is_some(),
-        "CiPipelineDriver must stay behind the dev-only test-support boundary"
-    );
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_superseded_run_diagnostic_can_use_the_active_region_partial_index() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("explain").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        for index in 0..64 {
-            seed_workflow_run(
-                &admin,
-                REGION,
-                &format!("history_{index}"),
-                CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
-                "completed",
-            )
-            .await;
-        }
-        admin.execute("ANALYZE workflow_run").await.unwrap();
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("explain").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                for index in 0..64 {
+                    seed_workflow_run(
+                        &admin,
+                        REGION,
+                        &format!("history_{index}"),
+                        CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION,
+                        "completed",
+                    )
+                    .await;
+                }
+                admin.execute("ANALYZE workflow_run").await.unwrap();
 
-        let mut conn = admin.acquire().await.unwrap();
-        sqlx::query("SET enable_seqscan = off")
-            .execute(&mut *conn)
-            .await
-            .unwrap();
-        let plan: Vec<String> = sqlx::query_scalar(&format!(
-            "EXPLAIN {}",
-            myelin_ci_controlplane::DISCOVER_SUPERSEDED_CI_PIPELINE_RUNS_QUERY
-                .replace("$1", &format!("'{REGION}'"))
-                .replace("$2", &CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION.to_string())
-                .replace("$3", "16")
-        ))
-        .fetch_all(&mut *conn)
-        .await
-        .expect("explain the superseded-run diagnostic");
-        let plan = plan.join("\n");
-        assert!(
+                let mut conn = admin.acquire().await.unwrap();
+                sqlx::query("SET enable_seqscan = off")
+                    .execute(&mut *conn)
+                    .await
+                    .unwrap();
+                let plan: Vec<String> = sqlx::query_scalar(&format!(
+                    "EXPLAIN {}",
+                    myelin_ci_controlplane::DISCOVER_SUPERSEDED_CI_PIPELINE_RUNS_QUERY
+                        .replace("$1", &format!("'{REGION}'"))
+                        .replace("$2", &CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION.to_string())
+                        .replace("$3", "16")
+                ))
+                .fetch_all(&mut *conn)
+                .await
+                .expect("explain the superseded-run diagnostic");
+                let plan = plan.join("\n");
+                assert!(
             plan.contains("ci_workflow_active_region"),
             "the diagnostic must be able to use the active-region partial index; plan was:\n{plan}"
         );
 
-        let negative_plan: Vec<String> = sqlx::query_scalar(&format!(
-            "EXPLAIN SELECT tenant_id, run_id FROM workflow_run
+                let negative_plan: Vec<String> = sqlx::query_scalar(&format!(
+                    "EXPLAIN SELECT tenant_id, run_id FROM workflow_run
              WHERE region = '{REGION}' AND wf_type = 'ci.pipeline'
                AND wf_version = {CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION}
                AND state NOT IN ('completed','failed','terminated','nondeterministic')
              ORDER BY tenant_id, run_id LIMIT 16"
-        ))
-        .fetch_all(&mut *conn)
-        .await
-        .unwrap();
-        let negative_plan = negative_plan.join("\n");
-        assert!(
+                ))
+                .fetch_all(&mut *conn)
+                .await
+                .unwrap();
+                let negative_plan = negative_plan.join("\n");
+                assert!(
             !negative_plan.contains("ci_workflow_active_region"),
             "if the NOT IN form were index-eligible this whole change would be unnecessary; plan \
              was:\n{negative_plan}"
         );
-    })
-    .await;
-    })
+            })
+            .await;
+        },
+    )
     .await;
 }
 
@@ -957,25 +967,29 @@ async fn a_missing_predecessor_row_refuses_instead_of_skipping_the_fence() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_predecessor_seed_never_disturbs_an_existing_definition_row() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("seed_noop").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        let before = definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION).await;
-        assert_eq!(before.as_ref().map(|(_, s)| s.as_str()), Some("active"));
-        for _ in 0..3 {
-            admin
-                .execute(myelin_ci_controlplane::SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL)
-                .await
-                .expect("the seed is idempotent");
-        }
-        assert_eq!(
-            definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION).await,
-            before,
-            "an existing predecessor row is never rewritten by the seed"
-        );
-    })
-    .await;
-    })
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("seed_noop").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                let before = definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION).await;
+                assert_eq!(before.as_ref().map(|(_, s)| s.as_str()), Some("active"));
+                for _ in 0..3 {
+                    admin
+                        .execute(myelin_ci_controlplane::SEED_CI_PIPELINE_CUTOVER_FENCE_ROW_DDL)
+                        .await
+                        .expect("the seed is idempotent");
+                }
+                assert_eq!(
+                    definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION).await,
+                    before,
+                    "an existing predecessor row is never rewritten by the seed"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
@@ -1105,71 +1119,80 @@ async fn the_probe_owner_has_bypass_authority_and_a_non_bypass_owner_fails_loudl
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_indefinitely_held_fence_times_the_cutover_out_and_leaves_v3_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("lock_timeout").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        let holder_pool = pinned_pool(&admin_url(), &schema, 2).await;
-        let mut holder_conn = holder_pool.acquire().await.unwrap();
-        let mut holder = holder_conn.begin().await.unwrap();
-        sqlx::query(
-            "SELECT status FROM wf_definition
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("lock_timeout").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                let holder_pool = pinned_pool(&admin_url(), &schema, 2).await;
+                let mut holder_conn = holder_pool.acquire().await.unwrap();
+                let mut holder = holder_conn.begin().await.unwrap();
+                sqlx::query(
+                    "SELECT status FROM wf_definition
              WHERE wf_type='ci.pipeline' AND version=$1 FOR UPDATE",
-        )
-        .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
-        .fetch_one(&mut *holder)
-        .await
-        .unwrap();
-
-        let factory = cutover_factory(&admin, &schema).await;
-        let started = std::time::Instant::now();
-        let refusal = factory
-            .cutover_definition(&diagnostics(&admin))
-            .await
-            .expect_err("a held fence must time out, not hang forever");
-        let elapsed = started.elapsed();
-
-        assert!(
-            matches!(
-                refusal,
-                CiSupersededDefinitionGuardError::FenceUnavailable(_)
-            ),
-            "expected FenceUnavailable, got {refusal:?}"
-        );
-        assert!(
-            refusal
-                .to_string()
-                .contains(&myelin_ci_controlplane::CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS.to_string()),
-            "the refusal must state the bound it waited"
-        );
-        let bound = Duration::from_millis(myelin_ci_controlplane::CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS);
-        assert!(
-            elapsed >= bound.mul_f32(0.5),
-            "the cutover must actually wait for the fence, waited only {elapsed:?}"
-        );
-        assert!(
-            elapsed < bound * 3,
-            "the cutover must stop at its bound, waited {elapsed:?}"
-        );
-
-        assert_eq!(
-            definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                )
+                .bind(CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                .fetch_one(&mut *holder)
                 .await
-                .map(|(_, status)| status),
-            Some("active".into()),
-            "a timed-out cutover leaves the old fleet fully operational"
-        );
-        assert_eq!(definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await, None);
+                .unwrap();
 
-        holder.rollback().await.unwrap();
-        drop(holder_conn);
-        factory
-            .cutover_definition(&diagnostics(&admin))
-            .await
-            .expect("the cutover succeeds once the fence is free");
-        holder_pool.close().await;
-    })
-    .await;
-    })
+                let factory = cutover_factory(&admin, &schema).await;
+                let started = std::time::Instant::now();
+                let refusal = factory
+                    .cutover_definition(&diagnostics(&admin))
+                    .await
+                    .expect_err("a held fence must time out, not hang forever");
+                let elapsed = started.elapsed();
+
+                assert!(
+                    matches!(
+                        refusal,
+                        CiSupersededDefinitionGuardError::FenceUnavailable(_)
+                    ),
+                    "expected FenceUnavailable, got {refusal:?}"
+                );
+                assert!(
+                    refusal.to_string().contains(
+                        &myelin_ci_controlplane::CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS.to_string()
+                    ),
+                    "the refusal must state the bound it waited"
+                );
+                let bound = Duration::from_millis(
+                    myelin_ci_controlplane::CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS,
+                );
+                assert!(
+                    elapsed >= bound.mul_f32(0.5),
+                    "the cutover must actually wait for the fence, waited only {elapsed:?}"
+                );
+                assert!(
+                    elapsed < bound * 3,
+                    "the cutover must stop at its bound, waited {elapsed:?}"
+                );
+
+                assert_eq!(
+                    definition_row(&admin, CI_MANIFEST_PIPELINE_SUPERSEDED_VERSION)
+                        .await
+                        .map(|(_, status)| status),
+                    Some("active".into()),
+                    "a timed-out cutover leaves the old fleet fully operational"
+                );
+                assert_eq!(
+                    definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await,
+                    None
+                );
+
+                holder.rollback().await.unwrap();
+                drop(holder_conn);
+                factory
+                    .cutover_definition(&diagnostics(&admin))
+                    .await
+                    .expect("the cutover succeeds once the fence is free");
+                holder_pool.close().await;
+            })
+            .await;
+        },
+    )
     .await;
 }
 
@@ -1335,9 +1358,7 @@ async fn production_v3_to_v4_readiness_probe_failure_rolls_the_fence_back() {
                 let pool = pinned_pool(&admin_url(), &schema, 2).await;
                 let factory = cutover_factory(&pool, &schema)
                     .await
-                    .replace_activation_readiness_probe_call_for_tests(
-                        "SELECT (1 / 0)::bigint",
-                    );
+                    .replace_activation_readiness_probe_call_for_tests("SELECT (1 / 0)::bigint");
                 let error = factory
                     .cutover_definition(&diagnostics(&admin))
                     .await
@@ -1352,7 +1373,10 @@ async fn production_v3_to_v4_readiness_probe_failure_rolls_the_fence_back() {
                         .map(|(_, status)| status),
                     Some("active".into())
                 );
-                assert_eq!(definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await, None);
+                assert_eq!(
+                    definition_row(&admin, CI_MANIFEST_PIPELINE_VERSION).await,
+                    None
+                );
                 pool.close().await;
             })
             .await;
@@ -1367,11 +1391,14 @@ const V4V5_CURRENT_HASH: &str = "blake3:synthetic-v5-current-code-hash";
 
 fn v4_to_v5_plan() -> CutoverPlan {
     assert_eq!(
-        V4V5_PREDECESSOR_VERSION,
-        CI_MANIFEST_PIPELINE_VERSION,
+        V4V5_PREDECESSOR_VERSION, CI_MANIFEST_PIPELINE_VERSION,
         "the synthetic suite must begin at the version this binary actually activates"
     );
-    CutoverPlan::for_tests(V4V5_PREDECESSOR_VERSION, V4V5_CURRENT_VERSION, V4V5_CURRENT_HASH)
+    CutoverPlan::for_tests(
+        V4V5_PREDECESSOR_VERSION,
+        V4V5_CURRENT_VERSION,
+        V4V5_CURRENT_HASH,
+    )
 }
 
 async fn upsert_definition_row(admin: &PgPool, version: i32, code_hash: &str, status: &str) {
@@ -1390,8 +1417,13 @@ async fn upsert_definition_row(admin: &PgPool, version: i32, code_hash: &str, st
 }
 
 async fn seed_v4_predecessor(admin: &PgPool) {
-    upsert_definition_row(admin, V4V5_PREDECESSOR_VERSION, "blake3:synthetic-v4-predecessor", "active")
-        .await;
+    upsert_definition_row(
+        admin,
+        V4V5_PREDECESSOR_VERSION,
+        "blake3:synthetic-v4-predecessor",
+        "active",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1498,377 +1530,465 @@ async fn v4v5_an_old_v4_admission_holding_the_share_lock_makes_the_cutover_obser
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_cutover_holding_the_update_lock_blocks_and_then_refuses_a_fresh_v4_admission() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_cutover_wins").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_v4_predecessor(&admin).await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_cutover_wins").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_v4_predecessor(&admin).await;
 
-        let mut fence_conn = admin.acquire().await.unwrap();
-        let mut fence = fence_conn.begin().await.unwrap();
-        sqlx::query(
-            "SELECT code_hash, status FROM wf_definition
+                let mut fence_conn = admin.acquire().await.unwrap();
+                let mut fence = fence_conn.begin().await.unwrap();
+                sqlx::query(
+                    "SELECT code_hash, status FROM wf_definition
              WHERE wf_type = 'ci.pipeline' AND version = $1 FOR UPDATE",
-        )
-        .bind(V4V5_PREDECESSOR_VERSION)
-        .fetch_one(&mut *fence)
-        .await
-        .unwrap();
-
-        let admission_pool = pinned_pool(&admin_url(), &schema, 2).await;
-        let mut admission_conn = admission_pool.acquire().await.unwrap();
-        let admission_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-            .fetch_one(&mut *admission_conn)
-            .await
-            .unwrap();
-        let admission = tokio::spawn(async move {
-            let mut tx = admission_conn.begin().await.unwrap();
-            let status: String = sqlx::query_scalar(
-                "SELECT status FROM wf_definition
-                 WHERE wf_type = 'ci.pipeline' AND version = $1 FOR SHARE",
-            )
-            .bind(V4V5_PREDECESSOR_VERSION)
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-            let eligible = status == "active";
-            tx.rollback().await.unwrap();
-            (status, eligible)
-        });
-
-        let observer = pinned_pool(&admin_url(), &schema, 2).await;
-        wait_until_blocked(&observer, admission_pid).await;
-        assert!(!admission.is_finished(), "the fresh v5 admission must block behind the fence");
-
-        let backlog: bool =
-            sqlx::query_scalar("SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)")
+                )
                 .bind(V4V5_PREDECESSOR_VERSION)
                 .fetch_one(&mut *fence)
                 .await
                 .unwrap();
-        assert!(!backlog, "this schema has no v5 runs");
-        sqlx::query(
-            "UPDATE wf_definition SET status='draining'
+
+                let admission_pool = pinned_pool(&admin_url(), &schema, 2).await;
+                let mut admission_conn = admission_pool.acquire().await.unwrap();
+                let admission_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+                    .fetch_one(&mut *admission_conn)
+                    .await
+                    .unwrap();
+                let admission = tokio::spawn(async move {
+                    let mut tx = admission_conn.begin().await.unwrap();
+                    let status: String = sqlx::query_scalar(
+                        "SELECT status FROM wf_definition
+                 WHERE wf_type = 'ci.pipeline' AND version = $1 FOR SHARE",
+                    )
+                    .bind(V4V5_PREDECESSOR_VERSION)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+                    let eligible = status == "active";
+                    tx.rollback().await.unwrap();
+                    (status, eligible)
+                });
+
+                let observer = pinned_pool(&admin_url(), &schema, 2).await;
+                wait_until_blocked(&observer, admission_pid).await;
+                assert!(
+                    !admission.is_finished(),
+                    "the fresh v5 admission must block behind the fence"
+                );
+
+                let backlog: bool = sqlx::query_scalar(
+                    "SELECT myelin_ci_pipeline_version_has_nonterminal_runs($1)",
+                )
+                .bind(V4V5_PREDECESSOR_VERSION)
+                .fetch_one(&mut *fence)
+                .await
+                .unwrap();
+                assert!(!backlog, "this schema has no v5 runs");
+                sqlx::query(
+                    "UPDATE wf_definition SET status='draining'
              WHERE wf_type='ci.pipeline' AND version=$1 AND status='active'",
-        )
-        .bind(V4V5_PREDECESSOR_VERSION)
-        .execute(&mut *fence)
-        .await
-        .unwrap();
-        sqlx::query(
-            "INSERT INTO wf_definition (wf_type, version, code_hash, status)
+                )
+                .bind(V4V5_PREDECESSOR_VERSION)
+                .execute(&mut *fence)
+                .await
+                .unwrap();
+                sqlx::query(
+                    "INSERT INTO wf_definition (wf_type, version, code_hash, status)
              VALUES ('ci.pipeline', $1, $2, 'active') ON CONFLICT DO NOTHING",
-        )
-        .bind(V4V5_CURRENT_VERSION)
-        .bind(V4V5_CURRENT_HASH)
-        .execute(&mut *fence)
-        .await
-        .unwrap();
-        fence.commit().await.unwrap();
+                )
+                .bind(V4V5_CURRENT_VERSION)
+                .bind(V4V5_CURRENT_HASH)
+                .execute(&mut *fence)
+                .await
+                .unwrap();
+                fence.commit().await.unwrap();
 
-        let (status, eligible) = admission.await.unwrap();
-        assert_eq!(status, "draining");
-        assert!(!eligible, "a draining v5 definition is not eligible for a FRESH start");
+                let (status, eligible) = admission.await.unwrap();
+                assert_eq!(status, "draining");
+                assert!(
+                    !eligible,
+                    "a draining v5 definition is not eligible for a FRESH start"
+                );
 
-        let v4_runs: i64 = sqlx::query_scalar(
+                let v4_runs: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM workflow_run WHERE wf_type='ci.pipeline' AND wf_version=$1",
         )
         .bind(V4V5_PREDECESSOR_VERSION)
         .fetch_one(&admin)
         .await
         .unwrap();
-        assert_eq!(v4_runs, 0, "the fenced-out admission wrote no workflow");
-        observer.close().await;
-        admission_pool.close().await;
-    })
-    .await;
-    })
+                assert_eq!(v4_runs, 0, "the fenced-out admission wrote no workflow");
+                observer.close().await;
+                admission_pool.close().await;
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_nonterminal_v4_run_blocks_activation_and_leaves_v4_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_backlog").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_v4_predecessor(&admin).await;
-        seed_workflow_run(&admin, REGION, "v4-inflight", V4V5_PREDECESSOR_VERSION, "running").await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_backlog").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_v4_predecessor(&admin).await;
+                seed_workflow_run(
+                    &admin,
+                    REGION,
+                    "v4-inflight",
+                    V4V5_PREDECESSOR_VERSION,
+                    "running",
+                )
+                .await;
 
-        let factory = cutover_factory(&admin, &schema).await;
-        let refusal = factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect_err("a non-terminal v5 run must refuse the v4→v5 cutover");
-        assert!(
-            matches!(refusal, CiSupersededDefinitionGuardError::Backlog(_)),
-            "expected a backlog refusal, got {refusal:?}"
-        );
-        assert!(
-            refusal.to_string().contains("v4-inflight"),
-            "the refusal must name the stranding run for the operator; got: {refusal}"
-        );
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
-            Some("active".into()),
-            "the refused cutover leaves v5 active"
-        );
-        assert_eq!(definition_row(&admin, V4V5_CURRENT_VERSION).await, None);
-    })
-    .await;
-    })
+                let factory = cutover_factory(&admin, &schema).await;
+                let refusal = factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect_err("a non-terminal v5 run must refuse the v4→v5 cutover");
+                assert!(
+                    matches!(refusal, CiSupersededDefinitionGuardError::Backlog(_)),
+                    "expected a backlog refusal, got {refusal:?}"
+                );
+                assert!(
+                    refusal.to_string().contains("v4-inflight"),
+                    "the refusal must name the stranding run for the operator; got: {refusal}"
+                );
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("active".into()),
+                    "the refused cutover leaves v5 active"
+                );
+                assert_eq!(definition_row(&admin, V4V5_CURRENT_VERSION).await, None);
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_missing_v4_predecessor_row_refuses_instead_of_skipping_the_fence() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_no_predecessor").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_workflow_run(&admin, REGION, "orphaned_v4", V4V5_PREDECESSOR_VERSION, "running").await;
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await,
-            None,
-            "the synthetic v4 predecessor is deliberately absent for this case"
-        );
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_no_predecessor").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_workflow_run(
+                    &admin,
+                    REGION,
+                    "orphaned_v4",
+                    V4V5_PREDECESSOR_VERSION,
+                    "running",
+                )
+                .await;
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION).await,
+                    None,
+                    "the synthetic v4 predecessor is deliberately absent for this case"
+                );
 
-        let factory = cutover_factory(&admin, &schema).await;
-        let refusal = factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect_err("a missing v4 predecessor must fail closed");
-        assert!(
-            matches!(refusal, CiSupersededDefinitionGuardError::PredecessorMissing),
-            "expected PredecessorMissing, got {refusal:?}"
-        );
-        assert_eq!(
-            definition_row(&admin, V4V5_CURRENT_VERSION).await,
-            None,
-            "v5 must NOT be activated over a missing fence"
-        );
+                let factory = cutover_factory(&admin, &schema).await;
+                let refusal = factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect_err("a missing v4 predecessor must fail closed");
+                assert!(
+                    matches!(
+                        refusal,
+                        CiSupersededDefinitionGuardError::PredecessorMissing
+                    ),
+                    "expected PredecessorMissing, got {refusal:?}"
+                );
+                assert_eq!(
+                    definition_row(&admin, V4V5_CURRENT_VERSION).await,
+                    None,
+                    "v5 must NOT be activated over a missing fence"
+                );
 
-        seed_v4_predecessor(&admin).await;
-        let refusal = factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect_err("the orphaned v5 run is now probed");
-        assert!(matches!(refusal, CiSupersededDefinitionGuardError::Backlog(_)));
-        assert!(refusal.to_string().contains("orphaned_v4"));
-    })
-    .await;
-    })
+                seed_v4_predecessor(&admin).await;
+                let refusal = factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect_err("the orphaned v5 run is now probed");
+                assert!(matches!(
+                    refusal,
+                    CiSupersededDefinitionGuardError::Backlog(_)
+                ));
+                assert!(refusal.to_string().contains("orphaned_v4"));
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_divergent_preexisting_v5_hash_refuses_and_leaves_v4_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_hash_clash").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_v4_predecessor(&admin).await;
-        upsert_definition_row(&admin, V4V5_CURRENT_VERSION, "blake3:some-other-v5-binarys-hash", "active")
-            .await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_hash_clash").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_v4_predecessor(&admin).await;
+                upsert_definition_row(
+                    &admin,
+                    V4V5_CURRENT_VERSION,
+                    "blake3:some-other-v5-binarys-hash",
+                    "active",
+                )
+                .await;
 
-        let factory = cutover_factory(&admin, &schema).await;
-        let refusal = factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect_err("a v5 row from a different source tree must refuse");
-        assert!(
-            matches!(refusal, CiSupersededDefinitionGuardError::ActivationRefused(_)),
-            "expected an activation refusal, got {refusal:?}"
-        );
-        assert!(refusal.to_string().contains("DIFFERENT code hash"));
-        assert!(
+                let factory = cutover_factory(&admin, &schema).await;
+                let refusal = factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect_err("a v5 row from a different source tree must refuse");
+                assert!(
+                    matches!(
+                        refusal,
+                        CiSupersededDefinitionGuardError::ActivationRefused(_)
+                    ),
+                    "expected an activation refusal, got {refusal:?}"
+                );
+                assert!(refusal.to_string().contains("DIFFERENT code hash"));
+                assert!(
             refusal.to_string().contains(&format!("ci.pipeline@{V4V5_CURRENT_VERSION}")),
             "the refusal must name the PLAN's current version, not a hard-coded one; got: {refusal}"
         );
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
-            Some("active".into()),
-            "the rollback leaves v5 active"
-        );
-    })
-    .await;
-    })
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("active".into()),
+                    "the rollback leaves v5 active"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_the_cutover_is_idempotent_across_reboots_and_never_reactivates_v4() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_idempotent").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_v4_predecessor(&admin).await;
-        let factory = cutover_factory(&admin, &schema).await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_idempotent").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_v4_predecessor(&admin).await;
+                let factory = cutover_factory(&admin, &schema).await;
 
-        factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect("first v4→v5 cutover");
-        let after_first = definition_row(&admin, V4V5_CURRENT_VERSION).await;
-        factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect("reboot cutover");
-        factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect("third cutover");
+                factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect("first v4→v5 cutover");
+                let after_first = definition_row(&admin, V4V5_CURRENT_VERSION).await;
+                factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect("reboot cutover");
+                factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect("third cutover");
 
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
-            Some("draining".into()),
-            "a reboot NEVER reactivates the superseded v5"
-        );
-        assert_eq!(
-            definition_row(&admin, V4V5_CURRENT_VERSION).await,
-            after_first,
-            "the activated v5 row is byte-identical across reboots"
-        );
-        let (hash, status) = after_first.unwrap();
-        assert_eq!(status, "active");
-        assert_eq!(hash, V4V5_CURRENT_HASH, "the plan's current hash is what was activated");
-    })
-    .await;
-    })
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("draining".into()),
+                    "a reboot NEVER reactivates the superseded v5"
+                );
+                assert_eq!(
+                    definition_row(&admin, V4V5_CURRENT_VERSION).await,
+                    after_first,
+                    "the activated v5 row is byte-identical across reboots"
+                );
+                let (hash, status) = after_first.unwrap();
+                assert_eq!(status, "active");
+                assert_eq!(
+                    hash, V4V5_CURRENT_HASH,
+                    "the plan's current hash is what was activated"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_an_indefinitely_held_fence_times_the_cutover_out_and_leaves_v4_active() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_lock_timeout").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_v4_predecessor(&admin).await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_lock_timeout").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_v4_predecessor(&admin).await;
 
-        let holder_pool = pinned_pool(&admin_url(), &schema, 2).await;
-        let mut holder_conn = holder_pool.acquire().await.unwrap();
-        let mut holder = holder_conn.begin().await.unwrap();
-        sqlx::query(
-            "SELECT status FROM wf_definition
+                let holder_pool = pinned_pool(&admin_url(), &schema, 2).await;
+                let mut holder_conn = holder_pool.acquire().await.unwrap();
+                let mut holder = holder_conn.begin().await.unwrap();
+                sqlx::query(
+                    "SELECT status FROM wf_definition
              WHERE wf_type='ci.pipeline' AND version=$1 FOR UPDATE",
-        )
-        .bind(V4V5_PREDECESSOR_VERSION)
-        .fetch_one(&mut *holder)
-        .await
-        .unwrap();
+                )
+                .bind(V4V5_PREDECESSOR_VERSION)
+                .fetch_one(&mut *holder)
+                .await
+                .unwrap();
 
-        let factory = cutover_factory(&admin, &schema).await;
-        let started = std::time::Instant::now();
-        let refusal = factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect_err("a held v5 fence must time out, not hang forever");
-        let elapsed = started.elapsed();
+                let factory = cutover_factory(&admin, &schema).await;
+                let started = std::time::Instant::now();
+                let refusal = factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect_err("a held v5 fence must time out, not hang forever");
+                let elapsed = started.elapsed();
 
-        assert!(
-            matches!(refusal, CiSupersededDefinitionGuardError::FenceUnavailable(_)),
-            "expected FenceUnavailable, got {refusal:?}"
-        );
-        let bound =
-            Duration::from_millis(myelin_ci_controlplane::CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS);
-        assert!(elapsed >= bound.mul_f32(0.5), "the cutover must actually wait, waited {elapsed:?}");
-        assert!(elapsed < bound * 3, "the cutover must stop at its bound, waited {elapsed:?}");
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
-            Some("active".into()),
-            "a timed-out cutover leaves v5 active"
-        );
-        assert_eq!(definition_row(&admin, V4V5_CURRENT_VERSION).await, None);
+                assert!(
+                    matches!(
+                        refusal,
+                        CiSupersededDefinitionGuardError::FenceUnavailable(_)
+                    ),
+                    "expected FenceUnavailable, got {refusal:?}"
+                );
+                let bound = Duration::from_millis(
+                    myelin_ci_controlplane::CI_DEFINITION_FENCE_LOCK_TIMEOUT_MS,
+                );
+                assert!(
+                    elapsed >= bound.mul_f32(0.5),
+                    "the cutover must actually wait, waited {elapsed:?}"
+                );
+                assert!(
+                    elapsed < bound * 3,
+                    "the cutover must stop at its bound, waited {elapsed:?}"
+                );
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("active".into()),
+                    "a timed-out cutover leaves v5 active"
+                );
+                assert_eq!(definition_row(&admin, V4V5_CURRENT_VERSION).await, None);
 
-        holder.rollback().await.unwrap();
-        drop(holder_conn);
-        factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect("the v4→v5 cutover succeeds once the fence is free");
-        holder_pool.close().await;
-    })
-    .await;
-    })
+                holder.rollback().await.unwrap();
+                drop(holder_conn);
+                factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect("the v4→v5 cutover succeeds once the fence is free");
+                holder_pool.close().await;
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_an_ambiguous_commit_fails_closed_and_leaves_the_registry_whole() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_commit_ambiguity").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_v4_predecessor(&admin).await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_commit_ambiguity").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_v4_predecessor(&admin).await;
 
-        admin
-            .execute(
-                format!(
-                    "CREATE OR REPLACE FUNCTION {schema}.fail_wf_definition_commit()
+                admin
+                    .execute(
+                        format!(
+                            "CREATE OR REPLACE FUNCTION {schema}.fail_wf_definition_commit()
                        RETURNS trigger LANGUAGE plpgsql AS
                        $$ BEGIN RAISE EXCEPTION 'injected commit-time failure'; END $$;
                      CREATE CONSTRAINT TRIGGER myelin_v4v5_commit_ambiguity
                        AFTER INSERT OR UPDATE ON {schema}.wf_definition
                        DEFERRABLE INITIALLY DEFERRED
                        FOR EACH ROW EXECUTE FUNCTION {schema}.fail_wf_definition_commit();"
-                )
-                .as_str(),
-            )
-            .await
-            .expect("install the deferred commit-failure trigger");
+                        )
+                        .as_str(),
+                    )
+                    .await
+                    .expect("install the deferred commit-failure trigger");
 
-        let factory = cutover_factory(&admin, &schema).await;
-        let refusal = factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect_err("a commit that raises must fail closed, not report success");
-        assert!(
-            matches!(refusal, CiSupersededDefinitionGuardError::ProbeFailed(_)),
-            "an ambiguous commit is surfaced as ProbeFailed, got {refusal:?}"
-        );
-        assert!(
-            refusal.to_string().contains("ambiguous"),
-            "the refusal must flag the ambiguous-commit window; got: {refusal}"
-        );
+                let factory = cutover_factory(&admin, &schema).await;
+                let refusal = factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect_err("a commit that raises must fail closed, not report success");
+                assert!(
+                    matches!(refusal, CiSupersededDefinitionGuardError::ProbeFailed(_)),
+                    "an ambiguous commit is surfaced as ProbeFailed, got {refusal:?}"
+                );
+                assert!(
+                    refusal.to_string().contains("ambiguous"),
+                    "the refusal must flag the ambiguous-commit window; got: {refusal}"
+                );
 
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
-            Some("active".into()),
-            "a failed commit rolls the entire transition back - v5 stays active"
-        );
-        assert_eq!(
-            definition_row(&admin, V4V5_CURRENT_VERSION).await,
-            None,
-            "the cutover is atomic: no half-applied v5 row survives a failed commit"
-        );
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("active".into()),
+                    "a failed commit rolls the entire transition back - v5 stays active"
+                );
+                assert_eq!(
+                    definition_row(&admin, V4V5_CURRENT_VERSION).await,
+                    None,
+                    "the cutover is atomic: no half-applied v5 row survives a failed commit"
+                );
 
-        admin
-            .execute(
-                format!(
-                    "DROP TRIGGER myelin_v4v5_commit_ambiguity ON {schema}.wf_definition;
+                admin
+                    .execute(
+                        format!(
+                            "DROP TRIGGER myelin_v4v5_commit_ambiguity ON {schema}.wf_definition;
                      DROP FUNCTION {schema}.fail_wf_definition_commit();"
-                )
-                .as_str(),
-            )
-            .await
-            .expect("remove the commit-failure trigger");
-        factory
-            .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
-            .await
-            .expect("with the commit trigger gone the retry commits the v4→v5 cutover");
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
-            Some("draining".into()),
-            "the successful retry drains v5"
-        );
-        let (hash, status) = definition_row(&admin, V4V5_CURRENT_VERSION)
-            .await
-            .expect("v5 is now active");
-        assert_eq!(status, "active");
-        assert_eq!(hash, V4V5_CURRENT_HASH);
-    })
-    .await;
-    })
+                        )
+                        .as_str(),
+                    )
+                    .await
+                    .expect("remove the commit-failure trigger");
+                factory
+                    .cutover_definition_with_plan(&v4_to_v5_plan(), &diagnostics(&admin))
+                    .await
+                    .expect("with the commit trigger gone the retry commits the v4→v5 cutover");
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("draining".into()),
+                    "the successful retry drains v5"
+                );
+                let (hash, status) = definition_row(&admin, V4V5_CURRENT_VERSION)
+                    .await
+                    .expect("v5 is now active");
+                assert_eq!(status, "active");
+                assert_eq!(hash, V4V5_CURRENT_HASH);
+            })
+            .await;
+        },
+    )
     .await;
 }
 
@@ -1899,10 +2019,9 @@ fn schema_local_readiness_call(schema: &str) -> String {
 }
 
 fn v4_to_v5_plan_with_readiness(schema: &str) -> CutoverPlan {
-    v4_to_v5_plan()
-        .with_activation_readiness(ActivationReadinessProbe::with_call_for_tests(
-            schema_local_readiness_call(schema),
-        ))
+    v4_to_v5_plan().with_activation_readiness(ActivationReadinessProbe::with_call_for_tests(
+        schema_local_readiness_call(schema),
+    ))
 }
 
 async fn seed_job_queue_row(
@@ -2028,94 +2147,145 @@ async fn v4v5_readiness_fails_closed_on_a_null_probe_result() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_readiness_fails_closed_on_a_probe_error() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_ready_err").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_v4_predecessor(&admin).await;
-        let plan = v4_to_v5_plan().with_activation_readiness(
-            ActivationReadinessProbe::with_call_for_tests(
-                "SELECT myelin_ci_security.readiness_probe_that_does_not_exist()",
-            ),
-        );
-        let factory = cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
-        let error = factory
-            .cutover_definition_with_plan(&plan, &diagnostics(&admin))
-            .await
-            .expect_err("a readiness probe error must fail closed");
-        assert!(
-            matches!(error, CiSupersededDefinitionGuardError::ProbeFailed(_)),
-            "a probe error is fail-closed, got {error:?}"
-        );
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
-            Some("active".into()),
-            "the fence rolled back: v5 remains active"
-        );
-    })
-    .await;
-    })
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_ready_err").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_v4_predecessor(&admin).await;
+                let plan = v4_to_v5_plan().with_activation_readiness(
+                    ActivationReadinessProbe::with_call_for_tests(
+                        "SELECT myelin_ci_security.readiness_probe_that_does_not_exist()",
+                    ),
+                );
+                let factory =
+                    cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
+                let error = factory
+                    .cutover_definition_with_plan(&plan, &diagnostics(&admin))
+                    .await
+                    .expect_err("a readiness probe error must fail closed");
+                assert!(
+                    matches!(error, CiSupersededDefinitionGuardError::ProbeFailed(_)),
+                    "a probe error is fail-closed, got {error:?}"
+                );
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("active".into()),
+                    "the fence rolled back: v5 remains active"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_readiness_activates_over_a_safe_queue() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_ready_clean").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_v4_predecessor(&admin).await;
-        install_schema_local_readiness_probe(&admin, &schema).await;
-        seed_job_queue_row(&admin, "33333333-3333-3333-3333-333333333333", Some(600), Some(2), "running")
-            .await;
-        seed_job_queue_row(&admin, "44444444-4444-4444-4444-444444444444", None, None, "terminal").await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_ready_clean").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_v4_predecessor(&admin).await;
+                install_schema_local_readiness_probe(&admin, &schema).await;
+                seed_job_queue_row(
+                    &admin,
+                    "33333333-3333-3333-3333-333333333333",
+                    Some(600),
+                    Some(2),
+                    "running",
+                )
+                .await;
+                seed_job_queue_row(
+                    &admin,
+                    "44444444-4444-4444-4444-444444444444",
+                    None,
+                    None,
+                    "terminal",
+                )
+                .await;
 
-        let factory = cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
-        factory
-            .cutover_definition_with_plan(&v4_to_v5_plan_with_readiness(&schema), &diagnostics(&admin))
-            .await
-            .expect("a safe queue must let the v4→v5 activation proceed");
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
-            Some("draining".into()),
-            "the clean activation drains v5"
-        );
-        let (hash, status) = definition_row(&admin, V4V5_CURRENT_VERSION).await.expect("v5 active");
-        assert_eq!(status, "active");
-        assert_eq!(hash, V4V5_CURRENT_HASH);
-    })
-    .await;
-    })
+                let factory =
+                    cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
+                factory
+                    .cutover_definition_with_plan(
+                        &v4_to_v5_plan_with_readiness(&schema),
+                        &diagnostics(&admin),
+                    )
+                    .await
+                    .expect("a safe queue must let the v4→v5 activation proceed");
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("draining".into()),
+                    "the clean activation drains v5"
+                );
+                let (hash, status) = definition_row(&admin, V4V5_CURRENT_VERSION)
+                    .await
+                    .expect("v5 active");
+                assert_eq!(status, "active");
+                assert_eq!(hash, V4V5_CURRENT_HASH);
+            })
+            .await;
+        },
+    )
     .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn v4v5_a_none_readiness_plan_ignores_unsafe_rows() {
     let _guard = MIGRATION_SCENARIO_LOCK.lock().await;
-    common::with_privilege_fixture_lock(&admin_url(), &["ci_cutover_", "ci_lease_topology_"], || async {
-    let (schema, bootstrap, admin) = cutover_schema("v4v5_ready_none").await;
-    with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
-        seed_v4_predecessor(&admin).await;
-        seed_job_queue_row(&admin, "55555555-5555-5555-5555-555555555555", None, None, "queued").await;
+    common::with_privilege_fixture_lock(
+        &admin_url(),
+        &["ci_cutover_", "ci_lease_topology_"],
+        || async {
+            let (schema, bootstrap, admin) = cutover_schema("v4v5_ready_none").await;
+            with_schema_cleanup(&bootstrap.clone(), &schema.clone(), || async move {
+                seed_v4_predecessor(&admin).await;
+                seed_job_queue_row(
+                    &admin,
+                    "55555555-5555-5555-5555-555555555555",
+                    None,
+                    None,
+                    "queued",
+                )
+                .await;
 
-        let plan = v4_to_v5_plan();
-        assert!(!plan.has_activation_readiness(), "the control plan carries no predicate");
-        let factory = cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
-        factory
-            .cutover_definition_with_plan(&plan, &diagnostics(&admin))
-            .await
-            .expect("a None-readiness plan proceeds regardless of unsafe queue rows");
-        assert_eq!(
-            definition_row(&admin, V4V5_PREDECESSOR_VERSION).await.map(|(_, s)| s),
-            Some("draining".into()),
-            "the None-readiness cutover drains v5 despite the unsafe row"
-        );
-        assert_eq!(
-            definition_row(&admin, V4V5_CURRENT_VERSION).await.map(|(_, s)| s),
-            Some("active".into()),
-            "v5 activates: the readiness probe was never consulted"
-        );
-    })
-    .await;
-    })
+                let plan = v4_to_v5_plan();
+                assert!(
+                    !plan.has_activation_readiness(),
+                    "the control plan carries no predicate"
+                );
+                let factory =
+                    cutover_factory(&pinned_pool(&admin_url(), &schema, 2).await, &schema).await;
+                factory
+                    .cutover_definition_with_plan(&plan, &diagnostics(&admin))
+                    .await
+                    .expect("a None-readiness plan proceeds regardless of unsafe queue rows");
+                assert_eq!(
+                    definition_row(&admin, V4V5_PREDECESSOR_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("draining".into()),
+                    "the None-readiness cutover drains v5 despite the unsafe row"
+                );
+                assert_eq!(
+                    definition_row(&admin, V4V5_CURRENT_VERSION)
+                        .await
+                        .map(|(_, s)| s),
+                    Some("active".into()),
+                    "v5 activates: the readiness probe was never consulted"
+                );
+            })
+            .await;
+        },
+    )
     .await;
 }

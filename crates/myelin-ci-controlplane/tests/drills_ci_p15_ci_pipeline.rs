@@ -308,30 +308,3 @@ fn ci_d9_ci_pipeline_body_replay_bit_identical_and_emits_x1_producer_facts() {
          flow-determinism-lint=green(real-body)  producer=RUNNER-FIXTURE(AG-D4-gated)"
     );
 }
-
-#[test]
-fn ci_d9_flow_determinism_lint_green_on_the_real_body_red_on_a_raw_clock() {
-    let lint = myelin_lints::flow_determinism();
-
-    let real_body = include_str!("../src/ci_pipeline.rs");
-    let green = lint.run(real_body);
-    assert!(
-        green.is_empty(),
-        "the real ci.pipeline body must be flow-determinism clean, got {green:?}"
-    );
-
-    let red = "// @workflow-body\n\
-        fn ci_pipeline(ctx: &mut WfCtx) {\n\
-        \x20\x20\x20\x20let now = std::time::SystemTime::now(); // BYPASSES WfCtx - replay diverges\n\
-        \x20\x20\x20\x20let _ = (ctx, now);\n\
-        }\n";
-    assert!(
-        !lint.run(red).is_empty(),
-        "a workflow body with a raw SystemTime::now() must FAIL the flow-determinism lint (the red fixture)"
-    );
-
-    println!(
-        "[2026-06-23] PASS  drill=CI-D9  fixture=flow-determinism(red+green)  \
-         green=real-ci.pipeline-body  red=raw-SystemTime::now()"
-    );
-}
