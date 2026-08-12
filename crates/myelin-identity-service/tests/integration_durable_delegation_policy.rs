@@ -15,6 +15,16 @@ use myelin_storage::{
 };
 use myelin_tenancy::{Region, TenantId};
 
+fn test_config() -> MyelinConfig {
+    let mut config = MyelinConfig::dev();
+    if let Ok(database_url) = std::env::var("MYELIN_TEST_DATABASE_URL") {
+        if !database_url.trim().is_empty() {
+            config.database_url = database_url;
+        }
+    }
+    config
+}
+
 fn admin_config(cfg: &MyelinConfig) -> MyelinConfig {
     let mut admin = cfg.clone();
     admin.database_url = admin
@@ -34,11 +44,11 @@ fn unique(label: &str) -> String {
     )
 }
 
-async fn providers() -> Option<(SubstrateProvider, SubstrateProvider)> {
-    let cfg = MyelinConfig::dev();
+async fn providers() -> (SubstrateProvider, SubstrateProvider) {
+    let cfg = test_config();
     let admin = SubstrateProvider::connect(admin_config(&cfg), 8)
         .await
-        .ok()?;
+        .expect("connect to the Postgres required by the delegation policy stories");
     admin
         .migrate(&delegation_policy_durable_migrations(), &HotTables::none())
         .await
@@ -46,7 +56,7 @@ async fn providers() -> Option<(SubstrateProvider, SubstrateProvider)> {
     let app = SubstrateProvider::connect(cfg, 16)
         .await
         .expect("connect constrained app role");
-    Some((admin, app))
+    (admin, app)
 }
 
 fn principals(tenant: &str, region: &str) -> (TenantScope, Principal, Principal) {
@@ -150,10 +160,7 @@ async fn cleanup(admin: &SubstrateProvider, tenant: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn snapshot_survives_a_fresh_pool_and_same_run_is_idempotent() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant = unique("restart");
     let region = app.config().region.clone();
     let (scope, agent, actor) = principals(&tenant, &region);
@@ -166,7 +173,7 @@ async fn snapshot_survives_a_fresh_pool_and_same_run_is_idempotent() {
         .expect("first snapshot");
     drop(source);
 
-    let fresh_app = SubstrateProvider::connect(MyelinConfig::dev(), 4)
+    let fresh_app = SubstrateProvider::connect(test_config(), 4)
         .await
         .expect("fresh pool after process-shaped restart");
     let restarted = DelegationPolicySource::with_pg(DurableDelegationPolicyBacking::new(fresh_app));
@@ -181,10 +188,7 @@ async fn snapshot_survives_a_fresh_pool_and_same_run_is_idempotent() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn missing_cross_tenant_and_cross_region_inputs_fail_closed() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant_a = unique("isolation-a");
     let tenant_b = unique("isolation-b");
     let region = app.config().region.clone();
@@ -225,10 +229,7 @@ async fn missing_cross_tenant_and_cross_region_inputs_fail_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn updates_never_grow_an_existing_run_and_revocation_denies() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant = unique("stale");
     let region = app.config().region.clone();
     let (scope, agent, actor) = principals(&tenant, &region);
@@ -302,10 +303,7 @@ async fn updates_never_grow_an_existing_run_and_revocation_denies() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shared_tenant_policy_supports_two_agents_and_two_actors() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant = unique("multi-pair");
     let region = app.config().region.clone();
     let source = DelegationPolicySource::with_pg(DurableDelegationPolicyBacking::new(app));
@@ -369,10 +367,7 @@ async fn shared_tenant_policy_supports_two_agents_and_two_actors() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_update_and_resolution_never_observe_a_torn_bundle() {
-    let Some((admin, app)) = providers().await else {
-        eprintln!("SKIP: dev PostgreSQL unavailable");
-        return;
-    };
+    let (admin, app) = providers().await;
     let tenant = unique("concurrent");
     let region = app.config().region.clone();
     let (scope, agent, actor) = principals(&tenant, &region);
