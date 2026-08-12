@@ -423,3 +423,17 @@ fn the_buffered_index_rows_carry_the_cell_region_and_no_bytes() {
         "the row points at the blob, never the bytes"
     );
 }
+
+#[test]
+fn malformed_run_coordinates_are_refused_without_mutating_log_state() {
+    let mut p = pipeline(1 << 20, 1);
+    let invalid = LogCoord::new("", "job-1", "step-1");
+
+    assert!(matches!(
+        p.ship_line(&invalid, "untrusted output"),
+        Err(LogPipelineError::InvalidScope(_))
+    ));
+    assert!(p.segment_rows().is_empty());
+    assert!(p.anchor_rows().is_empty());
+    assert!(p.drain_pointers().is_empty());
+}

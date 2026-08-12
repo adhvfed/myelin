@@ -215,8 +215,8 @@ pub use crypto_shred_erase::{
 
 pub use log_pipeline::{
     AnchorStatus, CoalesceBudget, CrossRegionLogWrite, LogAnchorRow, LogAvailablePointer, LogCoord,
-    LogPipeline, LogSegmentRow, LogWritePin, SealThreshold, SecretRedactor, CI_LOG_STREAM,
-    INSERT_LOG_SEGMENT_QUERY, REDACTION_MARKER, UPSERT_LOG_ANCHOR_QUERY,
+    LogPipeline, LogPipelineError, LogSegmentRow, LogWritePin, SealThreshold, SecretRedactor,
+    CI_LOG_STREAM, INSERT_LOG_SEGMENT_QUERY, REDACTION_MARKER, UPSERT_LOG_ANCHOR_QUERY,
 };
 
 pub use log_sink::{

@@ -32,6 +32,48 @@ impl std::fmt::Display for CrossRegionLogWrite {
 impl std::error::Error for CrossRegionLogWrite {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LogPipelineError {
+    CrossRegion(CrossRegionLogWrite),
+    InvalidScope(FirehoseError),
+    MissingStream { run_id: String, job_id: String },
+}
+
+impl std::fmt::Display for LogPipelineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LogPipelineError::CrossRegion(error) => error.fmt(f),
+            LogPipelineError::InvalidScope(error) => error.fmt(f),
+            LogPipelineError::MissingStream { run_id, job_id } => write!(
+                f,
+                "CI log stream state is missing for run `{run_id}` and job `{job_id}`"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for LogPipelineError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LogPipelineError::CrossRegion(error) => Some(error),
+            LogPipelineError::InvalidScope(error) => Some(error),
+            LogPipelineError::MissingStream { .. } => None,
+        }
+    }
+}
+
+impl From<CrossRegionLogWrite> for LogPipelineError {
+    fn from(error: CrossRegionLogWrite) -> Self {
+        LogPipelineError::CrossRegion(error)
+    }
+}
+
+impl From<FirehoseError> for LogPipelineError {
+    fn from(error: FirehoseError) -> Self {
+        LogPipelineError::InvalidScope(error)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogWritePin {
     tenant_id: String,
     cell_region: Region,
@@ -382,16 +424,12 @@ impl<B: BlobStore> LogPipeline<B> {
         );
     }
 
-    pub fn ship_line(&mut self, coord: &LogCoord, line: &str) -> Result<u64, CrossRegionLogWrite> {
+    pub fn ship_line(&mut self, coord: &LogCoord, line: &str) -> Result<u64, LogPipelineError> {
         let redacted = self.redactor.redact(line);
         self.ship_redacted_bytes(coord, redacted.as_bytes())
     }
 
-    pub fn ship_frame(
-        &mut self,
-        coord: &LogCoord,
-        frame: &[u8],
-    ) -> Result<u64, CrossRegionLogWrite> {
+    pub fn ship_frame(&mut self, coord: &LogCoord, frame: &[u8]) -> Result<u64, LogPipelineError> {
         debug_assert!(
             self.redactor.is_empty(),
             "boundary-redacted frames require the empty defence-in-depth redactor"
@@ -403,12 +441,10 @@ impl<B: BlobStore> LogPipeline<B> {
         &mut self,
         coord: &LogCoord,
         bytes: &[u8],
-    ) -> Result<u64, CrossRegionLogWrite> {
+    ) -> Result<u64, LogPipelineError> {
         let len = bytes.len() as i64;
 
-        let scope = coord
-            .firehose_scope()
-            .expect("run:<id> is a bounded firehose scope (opaque run id)");
+        let scope = coord.firehose_scope()?;
         let key = (coord.run_id.clone(), coord.job_id.clone());
 
         let (frame_offset, frame_payload) = {
@@ -436,7 +472,10 @@ impl<B: BlobStore> LogPipeline<B> {
             let st = self
                 .streams
                 .get_mut(&key)
-                .expect("stream state opened above");
+                .ok_or_else(|| LogPipelineError::MissingStream {
+                    run_id: coord.run_id.clone(),
+                    job_id: coord.job_id.clone(),
+                })?;
             if st.open_segment.is_empty() {
                 st.open_segment_start = st.next_offset;
             }
@@ -451,10 +490,10 @@ impl<B: BlobStore> LogPipeline<B> {
             self.seal_open_segment(coord)?;
         }
 
-        let crossed = {
-            let st = self.streams.get(&key).expect("stream state");
-            st.bytes_since_pointer >= self.coalesce.bytes_per_pointer
-        };
+        let crossed = self
+            .streams
+            .get(&key)
+            .is_some_and(|state| state.bytes_since_pointer >= self.coalesce.bytes_per_pointer);
         if crossed {
             self.emit_coalesced_pointer(coord, None)?;
         }
@@ -491,7 +530,7 @@ impl<B: BlobStore> LogPipeline<B> {
         &mut self,
         coord: &LogCoord,
         status: AnchorStatus,
-    ) -> Result<(), CrossRegionLogWrite> {
+    ) -> Result<(), LogPipelineError> {
         self.write_pin.admit_log_write(&self.region)?;
         let end = self
             .streams
@@ -527,7 +566,7 @@ impl<B: BlobStore> LogPipeline<B> {
     pub fn seal_open_segment(
         &mut self,
         coord: &LogCoord,
-    ) -> Result<Option<String>, CrossRegionLogWrite> {
+    ) -> Result<Option<String>, LogPipelineError> {
         let key = (coord.run_id.clone(), coord.job_id.clone());
         let (bytes, seg_start, seg_end, seg_seq) = {
             let Some(st) = self.streams.get_mut(&key) else {
@@ -572,11 +611,17 @@ impl<B: BlobStore> LogPipeline<B> {
         &mut self,
         coord: &LogCoord,
         segment_ref: Option<String>,
-    ) -> Result<(), CrossRegionLogWrite> {
+    ) -> Result<(), LogPipelineError> {
         self.write_pin.admit_log_write(&self.region)?;
         let key = (coord.run_id.clone(), coord.job_id.clone());
         let (range_start, range_end) = {
-            let st = self.streams.get_mut(&key).expect("stream state");
+            let st = self
+                .streams
+                .get_mut(&key)
+                .ok_or_else(|| LogPipelineError::MissingStream {
+                    run_id: coord.run_id.clone(),
+                    job_id: coord.job_id.clone(),
+                })?;
             let start = st.last_pointer_offset;
             let end = st.next_offset;
             st.last_pointer_offset = end;
@@ -600,7 +645,7 @@ impl<B: BlobStore> LogPipeline<B> {
         run_id: &str,
         job_id: &str,
         step_id: &str,
-    ) -> Result<(), CrossRegionLogWrite> {
+    ) -> Result<(), LogPipelineError> {
         let coord = LogCoord::new(run_id, job_id, step_id);
         self.seal_open_segment(&coord)?;
         Ok(())
