@@ -10,10 +10,12 @@ pub const EDGE_INBOUND_KEYSET_MIGRATION_ID: &str = "refs_0002_inbound_keyset";
 pub const EDGE_REGION_IDENTITY_INDEX_MIGRATION_ID: &str = "refs_0003_region_identity_index";
 pub const EDGE_REGION_SEMANTICS_INDEX_MIGRATION_ID: &str = "refs_0004_region_semantics_index";
 pub const EDGE_REGION_IDENTITY_CONTRACT_MIGRATION_ID: &str = "refs_0005_region_identity_contract";
+pub const EDGE_OUTBOUND_KEYSET_MIGRATION_ID: &str = "refs_0006_outbound_keyset";
 
 pub const EDGE_INBOUND_INDEX: &str = "edge_inbound";
 pub const EDGE_INBOUND_KEYSET_INDEX: &str = "edge_inbound_keyset";
 pub const EDGE_OUTBOUND_INDEX: &str = "edge_outbound";
+pub const EDGE_OUTBOUND_KEYSET_INDEX: &str = "edge_outbound_keyset";
 pub const EDGE_BY_REL_INDEX: &str = "edge_by_rel";
 
 pub const CREATE_EDGE_TABLE_DDL: &str = "\
@@ -55,6 +57,10 @@ pub const CREATE_EDGE_INDEXES_DDL: &[(&str, &str)] = &[
 pub const CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL: &str =
     "CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_inbound_keyset \
      ON edge (tenant_id, region, target_root, edge_id) WHERE NOT tombstoned";
+
+pub const CREATE_EDGE_OUTBOUND_KEYSET_INDEX_DDL: &str =
+    "CREATE INDEX CONCURRENTLY IF NOT EXISTS edge_outbound_keyset \
+     ON edge (tenant_id, region, source_root, edge_id) WHERE NOT tombstoned";
 
 pub const CREATE_EDGE_REGION_IDENTITY_INDEX_DDL: &str =
     "CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS edge_region_identity \
@@ -111,6 +117,12 @@ pub fn edge_table_migrations() -> Migrations {
             EDGE_REGION_IDENTITY_CONTRACT_MIGRATION_ID,
             CONTRACT_EDGE_REGION_IDENTITY_DDL,
             MigrationPhase::Contract,
+            EDGE_TABLE,
+        ),
+        Migration::phased(
+            EDGE_OUTBOUND_KEYSET_MIGRATION_ID,
+            CREATE_EDGE_OUTBOUND_KEYSET_INDEX_DDL,
+            MigrationPhase::Expand,
             EDGE_TABLE,
         ),
     ])
@@ -225,12 +237,14 @@ mod tests {
         }
         assert!(CREATE_EDGE_INBOUND_KEYSET_INDEX_DDL
             .contains("ON edge (tenant_id, region, target_root, edge_id)"));
+        assert!(CREATE_EDGE_OUTBOUND_KEYSET_INDEX_DDL
+            .contains("ON edge (tenant_id, region, source_root, edge_id)"));
     }
 
     #[test]
     fn the_edge_migration_is_forward_only() {
         let migrations = edge_table_migrations();
-        assert_eq!(migrations.0.len(), 5);
+        assert_eq!(migrations.0.len(), 6);
         let m = &migrations.0[0];
         assert_eq!(m.id, EDGE_MIGRATION_ID);
         assert_eq!(m.table, Some(EDGE_TABLE));
@@ -290,6 +304,14 @@ mod tests {
             .ddl
             .contains("UNIQUE USING INDEX edge_region_semantics"));
         assert!(edge_ddl_is_forward_only(contract.ddl));
+
+        let outbound_keyset = &migrations.0[5];
+        assert_eq!(outbound_keyset.id, EDGE_OUTBOUND_KEYSET_MIGRATION_ID);
+        assert_eq!(outbound_keyset.phase, MigrationPhase::Expand);
+        assert!(outbound_keyset
+            .ddl
+            .contains("tenant_id, region, source_root, edge_id"));
+        assert!(outbound_keyset.ddl.contains("WHERE NOT tombstoned"));
     }
 
     #[test]
@@ -308,6 +330,7 @@ mod tests {
                 EDGE_REGION_IDENTITY_INDEX_MIGRATION_ID,
                 EDGE_REGION_SEMANTICS_INDEX_MIGRATION_ID,
                 EDGE_REGION_IDENTITY_CONTRACT_MIGRATION_ID,
+                EDGE_OUTBOUND_KEYSET_MIGRATION_ID,
             ],
             "the runner applied the edge schema, online indexes, and regional identity contract"
         );

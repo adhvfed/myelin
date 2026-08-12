@@ -32,7 +32,7 @@ impl PgEdgeStore {
         region: &Region,
         target_root: &myelin_events::ArtifactRef,
         limit: u32,
-    ) -> Result<Vec<StoredBacklink>, myelin_storage::PgError> {
+    ) -> Result<Vec<StoredEdge>, myelin_storage::PgError> {
         self.inbound_live_after(tenant, region, target_root, None, limit)
             .await
     }
@@ -44,32 +44,76 @@ impl PgEdgeStore {
         target_root: &myelin_events::ArtifactRef,
         after_edge_id: Option<&str>,
         limit: u32,
-    ) -> Result<Vec<StoredBacklink>, myelin_storage::PgError> {
+    ) -> Result<Vec<StoredEdge>, myelin_storage::PgError> {
+        self.live_edges_after(
+            tenant,
+            region,
+            target_root,
+            after_edge_id,
+            limit,
+            EdgeDirection::Inbound,
+        )
+        .await
+    }
+
+    pub async fn outbound_live_after(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        source_root: &myelin_events::ArtifactRef,
+        after_edge_id: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<StoredEdge>, myelin_storage::PgError> {
+        self.live_edges_after(
+            tenant,
+            region,
+            source_root,
+            after_edge_id,
+            limit,
+            EdgeDirection::Outbound,
+        )
+        .await
+    }
+
+    async fn live_edges_after(
+        &self,
+        tenant: &TenantId,
+        region: &Region,
+        root: &myelin_events::ArtifactRef,
+        after_edge_id: Option<&str>,
+        limit: u32,
+        direction: EdgeDirection,
+    ) -> Result<Vec<StoredEdge>, myelin_storage::PgError> {
         let scope_tenant = tenant.0.clone();
         let scope_region = region.0.clone();
         let tenant_id = scope_tenant.clone();
         let region_id = scope_region.clone();
-        let target = target_root.0.clone();
+        let root = root.0.clone();
         let after_edge_id = after_edge_id.map(str::to_string);
+        let query = direction.query();
+        let action = direction.action();
         myelin_storage::with_tenant_tx(
             &self.pool,
             &scope_tenant,
             &scope_region,
             move |connection| {
                 Box::pin(async move {
-                    sqlx::query_as::<_, (String, String, String, String, String, String, String, String)>(
-                        "SELECT edge_id, source, source_root, target, target_root, rel, rel_class, \
-                                origin_actor
-                           FROM edge
-                          WHERE tenant_id = $1 AND region = $2 AND target_root = $3
-                            AND NOT tombstoned
-                            AND ($4::text IS NULL OR edge_id > $4)
-                          ORDER BY edge_id
-                          LIMIT $5",
-                    )
+                    sqlx::query_as::<
+                        _,
+                        (
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                            String,
+                        ),
+                    >(query)
                     .bind(tenant_id)
                     .bind(region_id)
-                    .bind(target)
+                    .bind(root)
                     .bind(after_edge_id)
                     .bind(i64::from(limit))
                     .fetch_all(connection)
@@ -86,7 +130,7 @@ impl PgEdgeStore {
                                     rel,
                                     rel_class,
                                     origin_actor,
-                                )| StoredBacklink {
+                                )| StoredEdge {
                                     edge_id,
                                     source,
                                     source_root,
@@ -99,11 +143,7 @@ impl PgEdgeStore {
                             )
                             .collect()
                     })
-                    .map_err(|error| {
-                        myelin_storage::PgError::Query(format!(
-                            "read live inbound reference edges: {error}"
-                        ))
-                    })
+                    .map_err(|error| myelin_storage::PgError::Query(format!("{action}: {error}")))
                 })
             },
         )
@@ -127,8 +167,48 @@ impl PgEdgeStore {
     }
 }
 
+#[derive(Clone, Copy)]
+enum EdgeDirection {
+    Inbound,
+    Outbound,
+}
+
+impl EdgeDirection {
+    fn query(self) -> &'static str {
+        match self {
+            Self::Inbound => {
+                "SELECT edge_id, source, source_root, target, target_root, rel, rel_class, \
+                        origin_actor
+                   FROM edge
+                  WHERE tenant_id = $1 AND region = $2 AND target_root = $3
+                    AND NOT tombstoned
+                    AND ($4::text IS NULL OR edge_id > $4)
+                  ORDER BY edge_id
+                  LIMIT $5"
+            }
+            Self::Outbound => {
+                "SELECT edge_id, source, source_root, target, target_root, rel, rel_class, \
+                        origin_actor
+                   FROM edge
+                  WHERE tenant_id = $1 AND region = $2 AND source_root = $3
+                    AND NOT tombstoned
+                    AND ($4::text IS NULL OR edge_id > $4)
+                  ORDER BY edge_id
+                  LIMIT $5"
+            }
+        }
+    }
+
+    fn action(self) -> &'static str {
+        match self {
+            Self::Inbound => "read live inbound reference edges",
+            Self::Outbound => "read live outbound reference edges",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StoredBacklink {
+pub struct StoredEdge {
     pub edge_id: String,
     pub source: String,
     pub source_root: String,

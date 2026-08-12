@@ -521,6 +521,48 @@ async fn a_hot_reference_can_be_read_forward_without_rescanning_or_duplicates() 
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn an_artifact_can_page_the_links_it_makes_without_rescanning() {
+    let story = ProjectorHarness::start("outbound-keyset").await;
+    let source = ArtifactRef(format!("myelin://{}/git/pr/platform:42", story.tenant.0));
+    for sequence in 1..=3 {
+        let target = story.issue(&format!("ENG-{sequence}"));
+        let event = story.event(
+            &format!("refs-outbound-{sequence}-{}", std::process::id()),
+            "refs.edge.created",
+            &format!("2026-08-10T00:00:0{sequence}Z"),
+            &source,
+            &target,
+            "closes",
+            "lifecycle",
+        );
+        assert_eq!(story.deliver(&event), Delivered::Acked);
+    }
+
+    let graph = PgEdgeStore::new(story.app.clone());
+    let first = graph
+        .outbound_live_after(&story.tenant, &story.region, &source, None, 2)
+        .await
+        .expect("read the first bounded page of links");
+    assert_eq!(first.len(), 2);
+    assert!(first[0].edge_id < first[1].edge_id);
+
+    let second = graph
+        .outbound_live_after(
+            &story.tenant,
+            &story.region,
+            &source,
+            Some(&first[1].edge_id),
+            2,
+        )
+        .await
+        .expect("continue strictly after the first page of links");
+    assert_eq!(second.len(), 1);
+    assert!(second[0].edge_id > first[1].edge_id);
+
+    story.clean_up().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_same_link_can_live_in_two_regions_and_disappear_from_only_one() {
     let story = ProjectorHarness::start("regional-identity").await;
     let second_region = Region("us-east".into());

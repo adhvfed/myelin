@@ -4,7 +4,7 @@ use std::sync::Arc;
 use myelin_chat::store::pg_conversation::visible_public_conversations_cte;
 use myelin_identity::Principal;
 use myelin_refs::{parse_scoped, strip_sub, ArtifactRef, ParsedArtifactRef};
-use myelin_refs_service::{PgEdgeStore, StoredBacklink};
+use myelin_refs_service::{PgEdgeStore, StoredEdge};
 use myelin_storage::with_tenant_tx;
 use percent_encoding::percent_decode_str;
 use serde_json::{json, Value};
@@ -56,6 +56,27 @@ impl DurableRefsReadApi {
         limit: usize,
         cursor: Option<&str>,
     ) -> Result<Value, EdgeError> {
+        self.related(principal, reference, limit, cursor, EdgeDirection::Inbound)
+    }
+
+    pub fn links(
+        &self,
+        principal: &Principal,
+        reference: &str,
+        limit: usize,
+        cursor: Option<&str>,
+    ) -> Result<Value, EdgeError> {
+        self.related(principal, reference, limit, cursor, EdgeDirection::Outbound)
+    }
+
+    fn related(
+        &self,
+        principal: &Principal,
+        reference: &str,
+        limit: usize,
+        cursor: Option<&str>,
+        direction: EdgeDirection,
+    ) -> Result<Value, EdgeError> {
         let parsed = parse_scoped(reference)
             .map_err(|error| EdgeError::BadRequest(format!("invalid reference: {error}")))?;
         if parsed.tenant != principal.tenant {
@@ -72,31 +93,46 @@ impl DurableRefsReadApi {
                 return Err(EdgeError::NotFound("reference not found".into()));
             }
 
-            let candidates = self
-                .graph
-                .inbound_live_after(
-                    &principal.tenant,
-                    &principal.region,
-                    &target_root,
-                    cursor,
-                    MAX_AUTHORIZATION_SCAN + 1,
-                )
-                .await
-                .map_err(|error| EdgeError::Internal(error.to_string()))?;
+            let candidates = match direction {
+                EdgeDirection::Inbound => {
+                    self.graph
+                        .inbound_live_after(
+                            &principal.tenant,
+                            &principal.region,
+                            &target_root,
+                            cursor,
+                            MAX_AUTHORIZATION_SCAN + 1,
+                        )
+                        .await
+                }
+                EdgeDirection::Outbound => {
+                    self.graph
+                        .outbound_live_after(
+                            &principal.tenant,
+                            &principal.region,
+                            &target_root,
+                            cursor,
+                            MAX_AUTHORIZATION_SCAN + 1,
+                        )
+                        .await
+                }
+            }
+            .map_err(|error| EdgeError::Internal(error.to_string()))?;
             let scan_has_more = candidates.len() > MAX_AUTHORIZATION_SCAN as usize;
             let mut candidates = candidates;
             candidates.truncate(MAX_AUTHORIZATION_SCAN as usize);
 
             let roots = candidates
                 .iter()
-                .map(|edge| ArtifactRef(edge.source_root.clone()))
+                .map(|edge| ArtifactRef(direction.related_root(edge).to_string()))
                 .collect::<Vec<_>>();
             let visible = self.visibility.readable_roots(principal, &roots).await?;
-            let page = paginate_authorized_scan(candidates, &visible, limit, scan_has_more);
+            let page =
+                paginate_authorized_scan(candidates, &visible, limit, scan_has_more, direction);
             let items = page
                 .items
                 .into_iter()
-                .map(backlink_json)
+                .map(|edge| edge_json(edge, direction))
                 .collect::<Vec<_>>();
             Ok(json!({
                 "ref": parsed.artifact_ref.0,
@@ -108,21 +144,44 @@ impl DurableRefsReadApi {
     }
 }
 
-struct AuthorizedBacklinkPage {
-    items: Vec<StoredBacklink>,
+#[derive(Clone, Copy)]
+enum EdgeDirection {
+    Inbound,
+    Outbound,
+}
+
+impl EdgeDirection {
+    fn related_ref<'a>(self, edge: &'a StoredEdge) -> &'a str {
+        match self {
+            Self::Inbound => &edge.source,
+            Self::Outbound => &edge.target,
+        }
+    }
+
+    fn related_root<'a>(self, edge: &'a StoredEdge) -> &'a str {
+        match self {
+            Self::Inbound => &edge.source_root,
+            Self::Outbound => &edge.target_root,
+        }
+    }
+}
+
+struct AuthorizedEdgePage {
+    items: Vec<StoredEdge>,
     next_cursor: Option<String>,
 }
 
 fn paginate_authorized_scan(
-    candidates: Vec<StoredBacklink>,
+    candidates: Vec<StoredEdge>,
     visible_roots: &BTreeSet<String>,
     limit: usize,
     scan_has_more: bool,
-) -> AuthorizedBacklinkPage {
+    direction: EdgeDirection,
+) -> AuthorizedEdgePage {
     let scanned_through = candidates.last().map(|edge| edge.edge_id.clone());
     let mut items = candidates
         .into_iter()
-        .filter(|edge| visible_roots.contains(&edge.source_root))
+        .filter(|edge| visible_roots.contains(direction.related_root(edge)))
         .collect::<Vec<_>>();
     let authorized_has_more = items.len() > limit;
     items.truncate(limit);
@@ -133,13 +192,17 @@ fn paginate_authorized_scan(
     } else {
         None
     };
-    AuthorizedBacklinkPage { items, next_cursor }
+    AuthorizedEdgePage { items, next_cursor }
 }
 
-fn backlink_json(edge: StoredBacklink) -> Value {
+fn edge_json(edge: StoredEdge, direction: EdgeDirection) -> Value {
+    let related_ref = direction.related_ref(&edge).to_string();
+    let related_root = direction.related_root(&edge).to_string();
     json!({
-        "ref": edge.source,
-        "root_ref": edge.source_root,
+        "ref": related_ref,
+        "root_ref": related_root,
+        "source_ref": edge.source,
+        "source_root_ref": edge.source_root,
         "target_ref": edge.target,
         "target_root_ref": edge.target_root,
         "relation": edge.rel,
@@ -471,11 +534,12 @@ fn parse_query(query: &str) -> Result<(String, usize, Option<String>), EdgeError
     Ok((reference, limit.unwrap_or(DEFAULT_BACKLINK_LIMIT), cursor))
 }
 
-struct BacklinksHandler {
+struct RelatedRefsHandler {
     api: DurableRefsReadApi,
+    direction: EdgeDirection,
 }
 
-impl Handler for BacklinksHandler {
+impl Handler for RelatedRefsHandler {
     fn handle(&self, ctx: &HandlerCtx<'_>) -> Result<EdgeResponse, EdgeError> {
         if !ctx.request.body.is_empty() {
             return Err(EdgeError::BadRequest(
@@ -483,36 +547,53 @@ impl Handler for BacklinksHandler {
             ));
         }
         let (reference, limit, cursor) = parse_query(&ctx.request.query)?;
-        Ok(EdgeResponse::json(
-            200,
-            &self
-                .api
-                .backlinks(ctx.principal, &reference, limit, cursor.as_deref())?,
-        )
-        .with_header("Cache-Control", "no-store"))
+        let response = match self.direction {
+            EdgeDirection::Inbound => {
+                self.api
+                    .backlinks(ctx.principal, &reference, limit, cursor.as_deref())?
+            }
+            EdgeDirection::Outbound => {
+                self.api
+                    .links(ctx.principal, &reference, limit, cursor.as_deref())?
+            }
+        };
+        Ok(EdgeResponse::json(200, &response).with_header("Cache-Control", "no-store"))
     }
 }
 
 pub fn register_refs(builder: GatewayBuilder, api: DurableRefsReadApi) -> GatewayBuilder {
-    builder.route(
-        Method::Get,
-        "/v1/refs/backlinks",
-        "refs.backlinks.list",
-        Arc::new(BacklinksHandler { api }),
-    )
+    builder
+        .route(
+            Method::Get,
+            "/v1/refs/backlinks",
+            "refs.backlinks.list",
+            Arc::new(RelatedRefsHandler {
+                api: api.clone(),
+                direction: EdgeDirection::Inbound,
+            }),
+        )
+        .route(
+            Method::Get,
+            "/v1/refs/links",
+            "refs.links.list",
+            Arc::new(RelatedRefsHandler {
+                api,
+                direction: EdgeDirection::Outbound,
+            }),
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn backlink(edge_id: &str, source_root: &str) -> StoredBacklink {
-        StoredBacklink {
+    fn edge(edge_id: &str, source_root: &str, target_root: &str) -> StoredEdge {
+        StoredEdge {
             edge_id: edge_id.into(),
             source: source_root.into(),
             source_root: source_root.into(),
-            target: "myelin://acme/issue/issue/ENG-41".into(),
-            target_root: "myelin://acme/issue/issue/ENG-41".into(),
+            target: target_root.into(),
+            target_root: target_root.into(),
             rel: "links".into(),
             rel_class: "reference".into(),
             origin_actor: "psn:alice".into(),
@@ -588,14 +669,31 @@ mod tests {
         ]);
         let first = paginate_authorized_scan(
             vec![
-                backlink("01", "myelin://acme/knowledge/page/hidden"),
-                backlink("02", "myelin://acme/knowledge/page/visible-1"),
-                backlink("03", "myelin://acme/knowledge/page/visible-2"),
-                backlink("04", "myelin://acme/knowledge/page/visible-3"),
+                edge(
+                    "01",
+                    "myelin://acme/knowledge/page/hidden",
+                    "myelin://acme/issue/issue/ENG-41",
+                ),
+                edge(
+                    "02",
+                    "myelin://acme/knowledge/page/visible-1",
+                    "myelin://acme/issue/issue/ENG-41",
+                ),
+                edge(
+                    "03",
+                    "myelin://acme/knowledge/page/visible-2",
+                    "myelin://acme/issue/issue/ENG-41",
+                ),
+                edge(
+                    "04",
+                    "myelin://acme/knowledge/page/visible-3",
+                    "myelin://acme/issue/issue/ENG-41",
+                ),
             ],
             &visible,
             2,
             false,
+            EdgeDirection::Inbound,
         );
         assert_eq!(
             first
@@ -608,10 +706,15 @@ mod tests {
         assert_eq!(first.next_cursor.as_deref(), Some("03"));
 
         let second = paginate_authorized_scan(
-            vec![backlink("04", "myelin://acme/knowledge/page/visible-3")],
+            vec![edge(
+                "04",
+                "myelin://acme/knowledge/page/visible-3",
+                "myelin://acme/issue/issue/ENG-41",
+            )],
             &visible,
             2,
             false,
+            EdgeDirection::Inbound,
         );
         assert_eq!(second.items[0].edge_id, "04");
         assert_eq!(second.next_cursor, None);
@@ -621,14 +724,58 @@ mod tests {
     fn an_empty_authorized_page_still_advances_its_bounded_scan() {
         let page = paginate_authorized_scan(
             vec![
-                backlink("01", "myelin://acme/knowledge/page/hidden-1"),
-                backlink("02", "myelin://acme/knowledge/page/hidden-2"),
+                edge(
+                    "01",
+                    "myelin://acme/knowledge/page/hidden-1",
+                    "myelin://acme/issue/issue/ENG-41",
+                ),
+                edge(
+                    "02",
+                    "myelin://acme/knowledge/page/hidden-2",
+                    "myelin://acme/issue/issue/ENG-41",
+                ),
             ],
             &BTreeSet::new(),
             2,
             true,
+            EdgeDirection::Inbound,
         );
         assert!(page.items.is_empty());
         assert_eq!(page.next_cursor.as_deref(), Some("02"));
+    }
+
+    #[test]
+    fn outgoing_pages_authorize_targets_not_the_already_authorized_source() {
+        let visible = BTreeSet::from(["myelin://acme/issue/issue/ENG-42".into()]);
+        let page = paginate_authorized_scan(
+            vec![
+                edge(
+                    "01",
+                    "myelin://acme/git/pr/platform:7",
+                    "myelin://acme/issue/issue/SECRET-1",
+                ),
+                edge(
+                    "02",
+                    "myelin://acme/git/pr/platform:7",
+                    "myelin://acme/issue/issue/ENG-42",
+                ),
+            ],
+            &visible,
+            10,
+            false,
+            EdgeDirection::Outbound,
+        );
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].target_root,
+            "myelin://acme/issue/issue/ENG-42"
+        );
+        let rendered = edge_json(
+            page.items.into_iter().next().unwrap(),
+            EdgeDirection::Outbound,
+        );
+        assert_eq!(rendered["ref"], "myelin://acme/issue/issue/ENG-42");
+        assert_eq!(rendered["root_ref"], "myelin://acme/issue/issue/ENG-42");
     }
 }
