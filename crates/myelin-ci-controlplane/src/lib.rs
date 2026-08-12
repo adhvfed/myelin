@@ -153,7 +153,8 @@ pub use ci_pipeline::{CheckFacts, PipelineRun, PipelineStage, RunVerdict, CI_PIP
 
 pub use check_emitter::{
     assemble_check_status, check_status_payload, details_ref, summary_for, CheckAttemptCounter,
-    CheckEmitContext, CheckProvider, CheckState, CostPosture, TrustTier, BUMP_CHECK_ATTEMPT_SQL,
+    CheckEmitContext, CheckProvider, CheckState, CheckStatusUpdate, CostPosture, TrustTier,
+    BUMP_CHECK_ATTEMPT_SQL,
 };
 
 pub use ci_result_signal::{CiResultSignal, RollupDelivery};

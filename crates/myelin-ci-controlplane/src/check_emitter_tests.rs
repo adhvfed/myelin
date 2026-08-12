@@ -84,12 +84,7 @@ fn assembled_payload_carries_every_frozen_5_9_field() {
     let ctx = emit_ctx(2, Some("2026-06-23T00:01:00Z"));
     let p = check_status_payload(
         &ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::Success,
-        true,
-        CostPosture::Settled,
-        None,
+        &CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::Success).settled(),
     );
 
     assert_eq!(p["tenant"], "acme");
@@ -122,12 +117,9 @@ fn summary_is_a_humanised_ref_never_a_raw_string() {
     let ctx = emit_ctx(1, Some("2026-06-23T00:01:00Z"));
     let p = check_status_payload(
         &ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::Failure,
-        true,
-        CostPosture::Settled,
-        Some(3),
+        &CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::Failure)
+            .settled()
+            .failed_at_step(3),
     );
 
     assert!(
@@ -162,12 +154,7 @@ fn cost_settled_flips_only_on_settle() {
 
     let unsettled = check_status_payload(
         &ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::Success,
-        true,
-        CostPosture::Unsettled,
-        None,
+        &CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::Success),
     );
     assert_eq!(unsettled["state"], "success", "terminal verdict");
     assert_eq!(
@@ -177,12 +164,7 @@ fn cost_settled_flips_only_on_settle() {
 
     let settled = check_status_payload(
         &ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::Success,
-        true,
-        CostPosture::Settled,
-        None,
+        &CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::Success).settled(),
     );
     assert_eq!(
         settled["cost_settled"], true,
@@ -201,12 +183,7 @@ fn trust_tier_is_stamped_from_provenance_fork_never_endorsed() {
 
     let p = check_status_payload(
         &ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::Success,
-        true,
-        CostPosture::Settled,
-        None,
+        &CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::Success).settled(),
     );
     assert_eq!(p["state"], "success", "the fork's success is recorded");
     assert_eq!(
@@ -252,12 +229,7 @@ fn assembled_draft_rides_the_frozen_envelope_grammar() {
     let ctx = emit_ctx(1, Some("2026-06-23T00:01:00Z"));
     let draft = assemble_check_status(
         &ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::Success,
-        true,
-        CostPosture::Settled,
-        None,
+        &CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::Success).settled(),
     );
     assert_eq!(draft.type_.0, "ci.check.updated", "the X-1 token (2.9)");
     assert_eq!(
@@ -282,12 +254,7 @@ fn a_pending_fact_carries_no_completed_at() {
     let ctx = emit_ctx(1, None);
     let p = check_status_payload(
         &ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::InProgress,
-        true,
-        CostPosture::Unsettled,
-        None,
+        &CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::InProgress),
     );
     assert_eq!(p["state"], "in_progress");
     assert!(

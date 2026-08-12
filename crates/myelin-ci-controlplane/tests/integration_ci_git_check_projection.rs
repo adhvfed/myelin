@@ -1,7 +1,8 @@
 #![cfg(feature = "integration")]
 
 use myelin_ci_controlplane::{
-    assemble_check_status, CheckEmitContext, CheckProvider, CheckState, CostPosture, TrustTier,
+    assemble_check_status, CheckEmitContext, CheckProvider, CheckState, CheckStatusUpdate,
+    CostPosture, TrustTier,
 };
 use myelin_events::{
     Actor, CorrelationId, DedupLedger, Delivered, EventDraft, EventEnvelope, EventId, Message,
@@ -109,17 +110,10 @@ fn check_event(
     state: CheckState,
     cost: CostPosture,
 ) -> EventEnvelope {
+    let status = CheckStatusUpdate::required(CheckProvider::Ci, "build", state).with_cost(cost);
     envelope(
         event_id,
-        assemble_check_status(
-            &producer_context(attempt),
-            CheckProvider::Ci,
-            "build",
-            state,
-            true,
-            cost,
-            None,
-        ),
+        assemble_check_status(&producer_context(attempt), &status),
     )
 }
 

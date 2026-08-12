@@ -133,23 +133,14 @@ impl VersionedCiDefinition {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolveError {
     EmptyDefinition,
-    FloatingTag {
-        job: String,
-        reference: String,
-    },
+    FloatingTag { job: String, reference: String },
     DuplicateJob(String),
-    UnknownNeed {
-        job: String,
-        need: String,
-    },
+    UnknownNeed { job: String, need: String },
     SelfNeed(String),
     DuplicateNeed { job: String, need: String },
     Cyclic,
     BlobWrite(myelin_storage::BlobError),
-    MatrixTooLarge {
-        count: usize,
-        cap: usize,
-    },
+    MatrixTooLarge { count: usize, cap: usize },
     InvalidPlan(String),
     ConcreteNameCollision(String),
     CargoVendorLockMissing,
@@ -644,15 +635,12 @@ pub fn reserve_and_start(
                 started_at: facts.started_at.clone(),
                 completed_at: None,
             };
-            let check_status = myelin_ci_controlplane::check_status_payload(
-                &emit_context,
+            let status = myelin_ci_controlplane::CheckStatusUpdate::required(
                 myelin_ci_controlplane::CheckProvider::Ci,
                 &ctx.name,
                 myelin_ci_controlplane::CheckState::Queued,
-                true,
-                myelin_ci_controlplane::CostPosture::Unsettled,
-                None,
             );
+            let check_status = myelin_ci_controlplane::check_status_payload(&emit_context, &status);
             EventDraft {
                 type_: EventType(myelin_ci_sandbox::events::CI_CHECK_UPDATED.to_string()),
                 subject: check_subject(&facts.repo_ref, &facts.commit_oid, &ctx.name),

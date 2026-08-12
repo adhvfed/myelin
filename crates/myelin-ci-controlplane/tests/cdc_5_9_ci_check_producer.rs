@@ -1,5 +1,5 @@
 use myelin_ci_controlplane::{
-    check_status_payload, CheckEmitContext, CheckProvider, CheckState, CostPosture, TrustTier,
+    check_status_payload, CheckEmitContext, CheckProvider, CheckState, CheckStatusUpdate, TrustTier,
 };
 use myelin_git::check_status::{
     CheckProvider as GitProvider, CheckState as GitState, CheckStatusConsumer, TrustTier as GitTier,
@@ -26,12 +26,7 @@ fn ci_producer_payload_decodes_into_git_frozen_checkstatus() {
     let ctx = emit_ctx(2, TrustTier::Trusted);
     let payload = check_status_payload(
         &ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::Success,
-        true,
-        CostPosture::Settled,
-        None,
+        &CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::Success).settled(),
     );
 
     let fact = CheckStatusConsumer::decode(&payload)
@@ -75,12 +70,7 @@ fn ci_producer_stamps_untrusted_fork_git_decodes_it_faithfully() {
     let ctx = emit_ctx(1, TrustTier::UntrustedFork);
     let payload = check_status_payload(
         &ctx,
-        CheckProvider::Ci,
-        "test",
-        CheckState::Success,
-        true,
-        CostPosture::Settled,
-        None,
+        &CheckStatusUpdate::required(CheckProvider::Ci, "test", CheckState::Success).settled(),
     );
     let fact = CheckStatusConsumer::decode(&payload).expect("decodes");
     assert_eq!(
@@ -100,12 +90,8 @@ fn ci_producer_failure_fact_decodes_with_step_anchor_and_unsettled() {
     let ctx = emit_ctx(3, TrustTier::Trusted);
     let payload = check_status_payload(
         &ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::Failure,
-        true,
-        CostPosture::Unsettled,
-        Some(7),
+        &CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::Failure)
+            .failed_at_step(7),
     );
     let fact = CheckStatusConsumer::decode(&payload).expect("decodes");
     assert_eq!(fact.state, GitState::Failure);

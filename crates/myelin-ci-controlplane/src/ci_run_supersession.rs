@@ -1156,15 +1156,14 @@ async fn emit_cancelled_manifest_facts_on_conn(
             started_at: manifest.started_at.clone(),
             completed_at: Some(provenance.finished_at.clone()),
         };
-        let draft = crate::check_emitter::assemble_check_status(
-            &emit_context,
+        let status = crate::check_emitter::CheckStatusUpdate::new(
             crate::check_emitter::CheckProvider::Ci,
             context,
             crate::check_emitter::CheckState::Cancelled,
             required,
-            cost,
-            None,
-        );
+        )
+        .with_cost(cost);
+        let draft = crate::check_emitter::assemble_check_status(&emit_context, &status);
         co_commit_fact(
             conn,
             tenant,

@@ -128,15 +128,12 @@ fn terminal_check_status(
         started_at: facts.started_at.clone(),
         completed_at: Some(completed_at.to_owned()),
     };
-    crate::check_emitter::check_status_payload(
-        &emit_ctx,
+    let status = crate::check_emitter::CheckStatusUpdate::required(
         crate::check_emitter::CheckProvider::Ci,
         context,
         state,
-        true,
-        crate::check_emitter::CostPosture::Unsettled,
-        None,
-    )
+    );
+    crate::check_emitter::check_status_payload(&emit_ctx, &status)
 }
 
 fn tenant_of(run_ref: &str) -> String {

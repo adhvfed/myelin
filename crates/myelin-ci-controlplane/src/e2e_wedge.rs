@@ -16,8 +16,8 @@ use myelin_identity::{
 use myelin_storage::blob::ContentHash;
 
 use crate::check_emitter::{
-    assemble_check_status, details_ref, CheckEmitContext, CheckProvider, CheckState, CostPosture,
-    TrustTier,
+    assemble_check_status, details_ref, CheckEmitContext, CheckProvider, CheckState,
+    CheckStatusUpdate, TrustTier,
 };
 use crate::deployment::{DeployGate, DeployGateOutcome};
 use crate::surfacing::{
@@ -224,24 +224,13 @@ pub fn run_e2e1_pr_context_pane() -> E2eArtifact {
         started_at: "2026-06-25T00:00:00Z".to_string(),
         completed_at: Some("2026-06-25T00:01:00Z".to_string()),
     };
-    let _build_ok = assemble_check_status(
-        &emit_ctx,
-        CheckProvider::Ci,
-        "build",
-        CheckState::Success,
-        true,
-        CostPosture::Settled,
-        None,
-    );
-    let test_fail = assemble_check_status(
-        &emit_ctx,
-        CheckProvider::Ci,
-        "test",
-        CheckState::Failure,
-        true,
-        CostPosture::Settled,
-        Some(E2E1_FAIL_STEP),
-    );
+    let build_status =
+        CheckStatusUpdate::required(CheckProvider::Ci, "build", CheckState::Success).settled();
+    let _build_ok = assemble_check_status(&emit_ctx, &build_status);
+    let test_status = CheckStatusUpdate::required(CheckProvider::Ci, "test", CheckState::Failure)
+        .settled()
+        .failed_at_step(E2E1_FAIL_STEP);
+    let test_fail = assemble_check_status(&emit_ctx, &test_status);
     let expected_anchor = details_ref(&run_ref.0, CheckState::Failure, Some(E2E1_FAIL_STEP));
     let anchor_present = test_fail
         .payload

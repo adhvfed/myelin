@@ -10,8 +10,8 @@ use myelin_storage::reserve_settle::{CostLedger, MeteredUnit, MicroUsd, RunId as
 use myelin_tenancy::{Region, TenantId};
 
 use crate::check_emitter::{
-    assemble_check_status, details_ref, CheckEmitContext, CheckProvider, CheckState, CostPosture,
-    TrustTier as CheckTrustTier,
+    assemble_check_status, details_ref, CheckEmitContext, CheckProvider, CheckState,
+    CheckStatusUpdate, TrustTier as CheckTrustTier,
 };
 use crate::ci_pipeline::structured_failure;
 use crate::ci_result_signal::{CiResultSignal, RollupDelivery};
@@ -114,15 +114,10 @@ pub fn run_e2e2_ci_flagship_slice() -> E2eArtifact {
         started_at: "2026-06-25T00:00:00Z".to_string(),
         completed_at: Some("2026-06-25T00:01:00Z".to_string()),
     };
-    let fail_check = assemble_check_status(
-        &fail_ctx,
-        CheckProvider::Ci,
-        CONTEXT,
-        CheckState::Failure,
-        true,
-        CostPosture::Settled,
-        Some(FAILED_STEP),
-    );
+    let fail_status = CheckStatusUpdate::required(CheckProvider::Ci, CONTEXT, CheckState::Failure)
+        .settled()
+        .failed_at_step(FAILED_STEP);
+    let fail_check = assemble_check_status(&fail_ctx, &fail_status);
     let expected_anchor = details_ref(FAIL_RUN, CheckState::Failure, Some(FAILED_STEP));
     let fail_check_state =
         fail_check.payload.get("state").and_then(|v| v.as_str()) == Some("failure");
@@ -165,15 +160,9 @@ pub fn run_e2e2_ci_flagship_slice() -> E2eArtifact {
         started_at: "2026-06-25T00:00:00Z".to_string(),
         completed_at: Some("2026-06-25T00:02:00Z".to_string()),
     };
-    let green_check = assemble_check_status(
-        &fix_ctx,
-        CheckProvider::Ci,
-        CONTEXT,
-        CheckState::Success,
-        true,
-        CostPosture::Settled,
-        None,
-    );
+    let green_status =
+        CheckStatusUpdate::required(CheckProvider::Ci, CONTEXT, CheckState::Success).settled();
+    let green_check = assemble_check_status(&fix_ctx, &green_status);
     let fix_greens = green_check
         .payload
         .get("state")

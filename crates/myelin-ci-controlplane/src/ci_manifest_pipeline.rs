@@ -14,7 +14,7 @@ use myelin_tenancy::{Region, TenantId};
 use sqlx::PgPool;
 
 use crate::check_emitter::{
-    check_status_payload, CheckEmitContext, CheckProvider, CheckState, CostPosture, TrustTier,
+    check_status_payload, CheckEmitContext, CheckProvider, CheckState, CheckStatusUpdate, TrustTier,
 };
 use crate::ci_drive_manifest::{
     CiDriveManifestError, CiDriveManifestStore, CiDriveManifestV1, CiManifestTrustTierV1,
@@ -422,15 +422,8 @@ fn emit_terminal_facts(
             started_at: manifest.started_at.clone(),
             completed_at: Some(completed_at.to_owned()),
         };
-        let payload = check_status_payload(
-            &emit_context,
-            CheckProvider::Ci,
-            context,
-            state,
-            required,
-            CostPosture::Settled,
-            None,
-        );
+        let status = CheckStatusUpdate::new(CheckProvider::Ci, context, state, required).settled();
+        let payload = check_status_payload(&emit_context, &status);
         ctx.emit(
             check_updated_draft(&manifest.repo_ref, &manifest.commit_oid, context, payload),
             None,

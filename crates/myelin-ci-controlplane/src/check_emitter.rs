@@ -130,6 +130,67 @@ impl CostPosture {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckStatusUpdate {
+    provider: CheckProvider,
+    context: String,
+    state: CheckState,
+    required: bool,
+    cost: CostPosture,
+    failed_step: Option<u32>,
+}
+
+impl CheckStatusUpdate {
+    pub fn new(
+        provider: CheckProvider,
+        context: impl Into<String>,
+        state: CheckState,
+        required: bool,
+    ) -> Self {
+        Self {
+            provider,
+            context: context.into(),
+            state,
+            required,
+            cost: CostPosture::Unsettled,
+            failed_step: None,
+        }
+    }
+
+    pub fn required(
+        provider: CheckProvider,
+        context: impl Into<String>,
+        state: CheckState,
+    ) -> Self {
+        Self::new(provider, context, state, true)
+    }
+
+    pub fn optional(
+        provider: CheckProvider,
+        context: impl Into<String>,
+        state: CheckState,
+    ) -> Self {
+        Self::new(provider, context, state, false)
+    }
+
+    #[must_use]
+    pub fn with_cost(mut self, cost: CostPosture) -> Self {
+        self.cost = cost;
+        self
+    }
+
+    #[must_use]
+    pub fn settled(self) -> Self {
+        self.with_cost(CostPosture::Settled)
+    }
+
+    #[must_use]
+    pub fn failed_at_step(mut self, step: u32) -> Self {
+        self.failed_step = Some(step);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckEmitContext {
     pub tenant: String,
     pub repo: String,
@@ -165,47 +226,32 @@ pub fn details_ref(run_ref: &str, state: CheckState, fail_step: Option<u32>) -> 
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn check_status_payload(
     ctx: &CheckEmitContext,
-    provider: CheckProvider,
-    context: &str,
-    state: CheckState,
-    required: bool,
-    cost: CostPosture,
-    fail_step: Option<u32>,
+    update: &CheckStatusUpdate,
 ) -> serde_json::Value {
-    let (template_key, args) = summary_for(state, context);
+    let (template_key, args) = summary_for(update.state, &update.context);
     serde_json::json!({
         "tenant": ctx.tenant,
         "repo": ctx.repo,
         "commit_oid": ctx.commit_oid,
-        "context": { "provider": provider.token(), "name": context },
-        "state": state.token(),
-        "required": required,
+        "context": { "provider": update.provider.token(), "name": update.context },
+        "state": update.state.token(),
+        "required": update.required,
         "run": ctx.run_ref,
         "run_attempt": ctx.run_attempt,
         "trust_tier": ctx.trust_tier.token(),
-        "details_ref": details_ref(&ctx.run_ref, state, fail_step),
+        "details_ref": details_ref(&ctx.run_ref, update.state, update.failed_step),
         "summary": { "template_key": template_key, "args": args },
         "started_at": ctx.started_at,
         "completed_at": ctx.completed_at,
-        "cost_settled": cost.is_settled(),
+        "cost_settled": update.cost.is_settled(),
     })
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn assemble_check_status(
-    ctx: &CheckEmitContext,
-    provider: CheckProvider,
-    context: &str,
-    state: CheckState,
-    required: bool,
-    cost: CostPosture,
-    fail_step: Option<u32>,
-) -> EventDraft {
-    let payload = check_status_payload(ctx, provider, context, state, required, cost, fail_step);
-    check_updated_draft(&ctx.repo, &ctx.commit_oid, context, payload)
+pub fn assemble_check_status(ctx: &CheckEmitContext, update: &CheckStatusUpdate) -> EventDraft {
+    let payload = check_status_payload(ctx, update);
+    check_updated_draft(&ctx.repo, &ctx.commit_oid, &update.context, payload)
 }
 
 #[cfg(test)]

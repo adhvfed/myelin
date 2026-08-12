@@ -3,6 +3,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use myelin_ci_sandbox::gvisor::{
+    CARGO_SOURCE_REPLACE_ENV, CARGO_VENDOR_DIRECTORY_ENV, ENV_CARGO_VENDOR_ASSET,
+    OCI_CARGO_VENDOR_MOUNT,
+};
 use myelin_events::{
     derive_envelope_from_persisted_cause, Actor, CausedBy, CorrelationId, EmitContext, EventId,
     HandlerTx, IdMinter, PersistedEventCause, Timestamp,
@@ -13,10 +17,6 @@ use myelin_refs::ArtifactRef;
 use myelin_storage::pgrelay::PgRelay;
 use myelin_storage::{BlobStore, ContentHash, DurableCostLedger};
 use myelin_tenancy::{Region, TenantId};
-use myelin_ci_sandbox::gvisor::{
-    CARGO_SOURCE_REPLACE_ENV, CARGO_VENDOR_DIRECTORY_ENV, ENV_CARGO_VENDOR_ASSET,
-    OCI_CARGO_VENDOR_MOUNT,
-};
 use sqlx::{PgPool, Row};
 
 use crate::ci_drive_manifest::{
@@ -856,15 +856,12 @@ async fn emit_initial_checks(
             started_at: manifest.started_at.clone(),
             completed_at: None,
         };
-        let draft = crate::check_emitter::assemble_check_status(
-            &emit_context,
+        let status = crate::check_emitter::CheckStatusUpdate::required(
             crate::check_emitter::CheckProvider::Ci,
             context,
             crate::check_emitter::CheckState::InProgress,
-            true,
-            crate::check_emitter::CostPosture::Unsettled,
-            None,
         );
+        let draft = crate::check_emitter::assemble_check_status(&emit_context, &status);
         let timestamp = Timestamp(emitted_at.clone());
         let envelope = derive_envelope_from_persisted_cause(
             draft,
@@ -1489,8 +1486,7 @@ fn granted_jobs_v2(
             }
             if job.build.is_some() && !grant.egress_allow.is_empty() {
                 return Err(PgCiStarterError::LaunchAuthority(CiLaunchAuthorityError(
-                    "a structured Cargo build requires an empty egress grant (network=none)"
-                        .into(),
+                    "a structured Cargo build requires an empty egress grant (network=none)".into(),
                 )));
             }
             let mut needs = expected
@@ -1545,10 +1541,7 @@ fn platform_owned_execution(
     let mut env = granted_env.clone();
     env.insert("CARGO_HOME".into(), PLATFORM_CARGO_HOME.into());
     env.insert("CARGO_NET_OFFLINE".into(), "true".into());
-    env.insert(
-        CARGO_SOURCE_REPLACE_ENV.into(),
-        "vendored".into(),
-    );
+    env.insert(CARGO_SOURCE_REPLACE_ENV.into(), "vendored".into());
     env.insert(
         CARGO_VENDOR_DIRECTORY_ENV.into(),
         OCI_CARGO_VENDOR_MOUNT.into(),
@@ -2505,10 +2498,7 @@ mod tests {
         let build = &jobs[0];
         assert_eq!(build.env.get("CARGO_HOME").unwrap(), "/tmp/cargo-home");
         assert_eq!(build.env.get("CARGO_NET_OFFLINE").unwrap(), "true");
-        assert_eq!(
-            build.env.get(CARGO_SOURCE_REPLACE_ENV).unwrap(),
-            "vendored"
-        );
+        assert_eq!(build.env.get(CARGO_SOURCE_REPLACE_ENV).unwrap(), "vendored");
         assert_eq!(
             build.env.get(CARGO_VENDOR_DIRECTORY_ENV).unwrap(),
             OCI_CARGO_VENDOR_MOUNT
