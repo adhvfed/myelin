@@ -11,7 +11,6 @@ pub mod cross_cell_rollup;
 pub mod declares;
 pub mod dek;
 #[cfg(any(test, feature = "test-support"))]
-pub mod e2e_flagship;
 pub mod e2e_lineage;
 pub mod e2e_wedge;
 pub mod events;
@@ -230,9 +229,6 @@ pub use agent_spend::{
 pub use e2e_wedge::{
     run_e2e_1_pr_pane, run_issues_e2e_wedge, IssuesE2eArtifact, E2E_SCENARIO, FRESHNESS_BUDGET_SECS,
 };
-
-#[cfg(any(test, feature = "test-support"))]
-pub use e2e_flagship::{run_e2e_2_issues_flagship, CLOSE_CARD_ID, E2E_FLAGSHIP_SCENARIO};
 
 pub use e2e_lineage::{
     lineage_audit_anchor, run_e2e_3_lineage, run_issues_e2e_3, E2E_LINEAGE_SCENARIO,
