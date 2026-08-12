@@ -452,9 +452,10 @@ fn a_writer_uses_a_feature_branch_without_crossing_repository_administration() {
         br#"{"base_oid":"","contents":"dev notes\n"}"#,
     );
     assert_eq!(
-        st, 403,
-        "a push-only writer cannot web-edit the protected default branch: {v}"
+        st, 409,
+        "the writer is authorized, but branch protection blocks a direct default-branch edit: {v}"
     );
+    assert_eq!(v["error"]["code"], "conflict");
     let (st, v) = h.call(
         "subj-dev",
         "POST",
