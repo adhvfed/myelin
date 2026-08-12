@@ -183,6 +183,45 @@ impl DurableIssueMutationApi {
             .map_err(map_store_error)
     }
 
+    pub fn close_issue(
+        &self,
+        actor: &myelin_identity::Principal,
+        authorized_viewer: &myelin_identity::Principal,
+        issue_id: &str,
+    ) -> Result<StoredIssue, EdgeError> {
+        self.drive(self.store.close_as(actor, authorized_viewer, issue_id))
+            .map_err(map_store_error)
+    }
+
+    pub fn close_issue_ref(
+        &self,
+        actor: &myelin_identity::Principal,
+        authorized_viewer: &myelin_identity::Principal,
+        issue_ref: &str,
+    ) -> Result<StoredIssue, EdgeError> {
+        let key = issue_key_from_ref(authorized_viewer, issue_ref)?;
+        let issue_id = self
+            .drive(self.store.resolve_id_by_key(authorized_viewer, &key))
+            .map_err(map_store_error)?;
+        self.close_issue(actor, authorized_viewer, &issue_id)
+    }
+
+    pub fn may_close_ref(
+        &self,
+        authorized_viewer: &myelin_identity::Principal,
+        issue_ref: &str,
+    ) -> Result<bool, EdgeError> {
+        let key = issue_key_from_ref(authorized_viewer, issue_ref)?;
+        let issue_id = match self.drive(self.store.resolve_id_by_key(authorized_viewer, &key)) {
+            Ok(issue_id) => issue_id,
+            Err(IssueStoreError::NotFound) => return Ok(false),
+            Err(error) => return Err(map_store_error(error)),
+        };
+        Ok(self
+            .authorizer
+            .may_access(authorized_viewer, &issue_id, IssuePermission::Close))
+    }
+
     fn drive<F, T>(&self, future: F) -> Result<T, IssueStoreError>
     where
         F: std::future::Future<Output = Result<T, IssueStoreError>>,
@@ -362,6 +401,24 @@ fn issue_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
         ));
     }
     Ok(value)
+}
+
+fn issue_key_from_ref(
+    principal: &myelin_identity::Principal,
+    issue_ref: &str,
+) -> Result<String, EdgeError> {
+    let parsed = myelin_refs::parse_scoped(issue_ref)
+        .map_err(|error| EdgeError::BadRequest(format!("invalid issue_ref: {error}")))?;
+    if parsed.tenant != principal.tenant
+        || parsed.subsystem != "issue"
+        || parsed.type_ != "issue"
+        || parsed.sub.is_some()
+    {
+        return Err(EdgeError::BadRequest(
+            "issue_ref must name an issue root in the current tenant".into(),
+        ));
+    }
+    Ok(parsed.id)
 }
 
 fn relation_param<'a>(ctx: &'a HandlerCtx<'_>) -> Result<&'a str, EdgeError> {
@@ -643,10 +700,7 @@ impl Handler for IssueCloseHandler {
             }
         }
         let id = issue_param(ctx)?;
-        let issue = self
-            .api
-            .drive(self.api.store.close(ctx.principal, id))
-            .map_err(map_store_error)?;
+        let issue = self.api.close_issue(ctx.principal, ctx.principal, id)?;
         Ok(no_store(EdgeResponse::json(
             200,
             &issue_json(&ctx.principal.tenant.0, &issue),
@@ -882,6 +936,33 @@ mod tests {
             canonical_issue_ref("acme-eu", "ENG-41"),
             "myelin://acme-eu/issue/issue/ENG-41"
         );
+    }
+
+    #[test]
+    fn agent_issue_refs_are_rooted_in_the_authorizing_humans_tenant() {
+        let principal = myelin_identity::Principal::new(
+            myelin_tenancy::TenantId::from_token("acme-eu"),
+            myelin_tenancy::Region::new("fr-par"),
+            myelin_identity::PrincipalId("human:ada".into()),
+            myelin_identity::PrincipalKind::Human,
+            myelin_identity::DataRole::Controller,
+            myelin_identity::PrincipalStatus::Active,
+        );
+        assert_eq!(
+            issue_key_from_ref(&principal, "myelin://acme-eu/issue/issue/ENG-41").unwrap(),
+            "ENG-41"
+        );
+        for refused in [
+            "ENG-41",
+            "myelin://other/issue/issue/ENG-41",
+            "myelin://acme-eu/git/repo/ENG-41",
+            "myelin://acme-eu/issue/issue/ENG-41#comment-7",
+        ] {
+            assert!(
+                issue_key_from_ref(&principal, refused).is_err(),
+                "accepted `{refused}`"
+            );
+        }
     }
 
     #[test]

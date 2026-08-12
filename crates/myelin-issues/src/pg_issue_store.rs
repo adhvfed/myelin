@@ -1107,6 +1107,41 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         decode_row(&self.kms, &principal.region, row)
     }
 
+    pub async fn resolve_id_by_key(
+        &self,
+        principal: &Principal,
+        issue_key: &str,
+    ) -> Result<String, IssueStoreError> {
+        validate_issue_key(issue_key)?;
+        let scope = self.scope(principal)?;
+        let tenant_id = scope.tenant().0.clone();
+        let region = scope.region().0.clone();
+        let key = issue_key.to_string();
+        self.provider
+            .with_tenant_tx(&tenant_id.clone(), move |conn| {
+                Box::pin(async move {
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT i.id FROM issue i \
+                         JOIN issue_authz_binding b \
+                           ON b.tenant_id = i.tenant_id AND b.region = i.region \
+                              AND b.issue_id = i.id AND b.state = 'active' \
+                         WHERE i.tenant_id = $1 AND i.region = $2 AND i.key = $3 \
+                           AND i.deleted_at IS NULL",
+                    )
+                    .bind(&tenant_id)
+                    .bind(&region)
+                    .bind(&key)
+                    .fetch_optional(&mut *conn)
+                    .await
+                    .map_err(|error| myelin_storage::PgError::Query(error.to_string()))
+                })
+            })
+            .await
+            .map_err(|error| IssueStoreError::Storage(error.to_string()))?
+            .map(|id| id.to_string())
+            .ok_or(IssueStoreError::NotFound)
+    }
+
     pub async fn authorization_status(
         &self,
         principal: &Principal,
@@ -1765,17 +1800,31 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
         principal: &Principal,
         issue_id: &str,
     ) -> Result<StoredIssue, IssueStoreError> {
-        let scope = self.scope(principal)?;
+        self.close_as(principal, principal, issue_id).await
+    }
+
+    pub async fn close_as(
+        &self,
+        actor: &Principal,
+        authorized_viewer: &Principal,
+        issue_id: &str,
+    ) -> Result<StoredIssue, IssueStoreError> {
+        let scope = self.scope(actor)?;
+        if self.scope(authorized_viewer)? != scope {
+            return Err(IssueStoreError::BadInput(
+                "issue actor and authorized viewer must share one tenant and region".into(),
+            ));
+        }
         let id = parse_uuid("issue_id", issue_id)?;
         if !self
             .authorizer
-            .may_access(principal, issue_id, IssuePermission::Close)
+            .may_access(authorized_viewer, issue_id, IssuePermission::Close)
         {
             return Err(IssueStoreError::NotFound);
         }
         let tenant_id = scope.tenant().0.clone();
         let region = scope.region().0.clone();
-        let actor = principal.clone();
+        let actor = actor.clone();
         let closed_event_id: EventId = self.minter.mint().into();
         let row = self
             .provider
@@ -1825,7 +1874,7 @@ impl<A: IssueAuthorizer> PgIssueStore<A> {
             .await
             .map_err(|e| IssueStoreError::Storage(e.to_string()))?
             .ok_or(IssueStoreError::NotFound)?;
-        decode_row(&self.kms, &principal.region, row)
+        decode_row(&self.kms, &authorized_viewer.region, row)
     }
 }
 
@@ -2528,6 +2577,29 @@ fn validate_create(proposal: &CreateIssue) -> Result<(), IssueStoreError> {
     Ok(())
 }
 
+fn validate_issue_key(issue_key: &str) -> Result<(), IssueStoreError> {
+    let Some((prefix, sequence)) = issue_key.rsplit_once('-') else {
+        return Err(IssueStoreError::BadInput(
+            "issue key must use the canonical PROJECT-123 form".into(),
+        ));
+    };
+    if prefix.len() < 2
+        || prefix.len() > 10
+        || !prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        || sequence.is_empty()
+        || sequence.starts_with('0')
+        || !sequence.bytes().all(|byte| byte.is_ascii_digit())
+        || sequence.parse::<u64>().is_err()
+    {
+        return Err(IssueStoreError::BadInput(
+            "issue key must use the canonical PROJECT-123 form".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn title_dek_subject(principal: &Principal) -> String {
     match &principal.kind {
         PrincipalKind::Agent {
@@ -2678,6 +2750,25 @@ mod tests {
         bad = valid;
         bad.project_id = "path-tenant-smuggling".into();
         assert!(validate_create(&bad).is_err());
+    }
+
+    #[test]
+    fn durable_issue_keys_have_one_unambiguous_address_form() {
+        for valid in ["ENG-1", "PLATFORM9-42", "AB-18446744073709551615"] {
+            assert!(validate_issue_key(valid).is_ok(), "refused `{valid}`");
+        }
+        for invalid in [
+            "ENG",
+            "E-1",
+            "eng-1",
+            "ENG-0",
+            "ENG-01",
+            "ENG--1",
+            "ENG-18446744073709551616",
+            "PLATFORM999-1",
+        ] {
+            assert!(validate_issue_key(invalid).is_err(), "accepted `{invalid}`");
+        }
     }
 
     #[test]

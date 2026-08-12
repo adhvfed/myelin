@@ -261,7 +261,7 @@ fn production_edge_owns_the_durable_issue_saga_worker_without_an_in_memory_fallb
     assert!(routes.contains("self.store.list(principal, request)"));
     assert!(routes.contains(".create_idempotent_from_intent("));
     assert!(routes.contains("self.store.view(principal, issue_id)"));
-    assert!(routes.contains("self.api.store.close(ctx.principal, id)"));
+    assert!(routes.contains("self.api.close_issue(ctx.principal, ctx.principal, id)"));
     assert!(routes.contains("/v1/issues/{issue}/relations"));
     assert!(routes.contains("/v1/issues/{issue}/relations/{relation}"));
     assert!(routes.contains("IssuePermission::View"));
