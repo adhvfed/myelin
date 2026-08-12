@@ -7,6 +7,7 @@ pub mod conversation;
 pub mod cross_org;
 pub mod dek;
 pub mod dispatch;
+#[cfg(any(test, feature = "test-support"))]
 pub mod e2e_wedge;
 pub mod erase;
 pub mod events;
@@ -60,8 +61,7 @@ pub use dispatch::{
     L3_AUTO_SPAWN_ABSENCE, PROVENANCE_AUDIT_LINK_KIND,
 };
 #[cfg(any(test, feature = "test-support"))]
-pub use e2e_wedge::run_chat_e2e_wedge;
-pub use e2e_wedge::ChatE2eArtifact;
+pub use e2e_wedge::{run_chat_e2e_wedge, ChatE2eArtifact};
 pub use erase::{
     aggregate_receipt, is_body_unrecoverable, ChatEraseReport, ChatErasureCascade, StoreReceipt,
     CHAT_ERASE_CASCADE_TOKEN,
