@@ -1,7 +1,10 @@
-use myelin_edge::{register_git, serve_edge, AllowAll, Gateway, GitEdgeState, Method, WhoamiHandler};
+use myelin_edge::{
+    register_git, serve_edge, AllowAll, Gateway, GitEdgeState, Method, WhoamiHandler,
+};
 use myelin_identity::{DataRole, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
-    CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator, PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
+    CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
+    PasetoCapabilityVerifier, PrincipalStore, RevocationStore,
 };
 use myelin_storage::{KmsEngine, TenantScope};
 use myelin_tenancy::{Region, TenantId};
@@ -15,12 +18,19 @@ const REGION: &str = "eu-west";
 const SCHEME: &str = "agent";
 
 fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
 }
 
 fn admin_scope(tenant: &str) -> TenantScope {
     TenantScope::from_verified_token(
-        &myelin_identity::Principal::stub(PrincipalId("admin".into()), PrincipalKind::Human, TenantId(tenant.into())),
+        &myelin_identity::Principal::stub(
+            PrincipalId("admin".into()),
+            PrincipalKind::Human,
+            TenantId(tenant.into()),
+        ),
         Region(REGION.into()),
     )
 }
@@ -52,10 +62,17 @@ fn build() -> (Arc<Gateway>, CellTokenAuthority) {
         Arc::new(PasetoCapabilityVerifier::new(cell.trust_anchor())),
         RevocationStore::new(),
     ));
-    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(Arc::new(KmsEngine::new()))));
+    let human_login = Arc::new(HumanSsoAuthenticator::production(PrincipalStore::new(
+        Arc::new(KmsEngine::new()),
+    )));
 
     let git_state = Arc::new(GitEdgeState::new().seed_demo("acme"));
-    let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(Method::Get, "/v1/whoami", "edge.whoami", Arc::new(WhoamiHandler));
+    let mut builder = Gateway::builder(authn, human_login, Arc::new(AllowAll)).route(
+        Method::Get,
+        "/v1/whoami",
+        "edge.whoami",
+        Arc::new(WhoamiHandler),
+    );
     builder = register_git(builder, git_state);
     (Arc::new(builder.build()), cell)
 }
@@ -88,7 +105,10 @@ fn run_cli(edge: &str, token: Option<&str>, args: &[&str]) -> (i32, String, Stri
     let mut cmd = Command::new(bin);
     cmd.env("MYELIN_EDGE", edge)
         .env("MYELIN_TOKEN_SCHEME", SCHEME)
-        .env("MYELIN_CONFIG_DIR", std::env::temp_dir().join("myelin-cli-it-empty"));
+        .env(
+            "MYELIN_CONFIG_DIR",
+            std::env::temp_dir().join("myelin-cli-it-empty"),
+        );
     match token {
         Some(t) => {
             cmd.env("MYELIN_TOKEN", t);
@@ -154,8 +174,14 @@ async fn missing_token_is_a_clean_unauthenticated_error() {
 
     let (code, _stdout, stderr) = run_cli(&edge, None, &["git", "repo", "list"]);
     assert_eq!(code, 3, "no token → exit 3");
-    assert!(stderr.to_lowercase().contains("not authenticated"), "stderr={stderr}");
-    assert!(stderr.contains("login"), "the hint points at `myelin login`");
+    assert!(
+        stderr.to_lowercase().contains("not authenticated"),
+        "stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("login"),
+        "the hint points at `myelin login`"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -167,8 +193,14 @@ async fn whoami_renders_the_verified_principal() {
 
     let (code, stdout, stderr) = run_cli(&edge, Some(&token), &["whoami"]);
     assert_eq!(code, 0, "stderr={stderr}");
-    assert!(stdout.contains("svc:agent"), "the verified principal id; got {stdout}");
-    assert!(stdout.contains("tenant=acme"), "the tenant is the verified token's; got {stdout}");
+    assert!(
+        stdout.contains("svc:agent"),
+        "the verified principal id; got {stdout}"
+    );
+    assert!(
+        stdout.contains("tenant=acme"),
+        "the tenant is the verified token's; got {stdout}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -179,10 +211,16 @@ async fn the_token_is_never_echoed_to_stdout_or_stderr() {
     let token = mint(&cell, "acme", "jti-secret");
 
     let (_c, out, err) = run_cli(&edge, Some(&token), &["git", "repo", "list"]);
-    assert!(!out.contains(&token) && !err.contains(&token), "token never appears on success");
+    assert!(
+        !out.contains(&token) && !err.contains(&token),
+        "token never appears on success"
+    );
 
     let (_c2, out2, err2) = run_cli(&edge, Some(&token), &["git", "frobnicate"]);
-    assert!(!out2.contains(&token) && !err2.contains(&token), "token never appears on an error");
+    assert!(
+        !out2.contains(&token) && !err2.contains(&token),
+        "token never appears on an error"
+    );
 }
 
 #[test]
@@ -198,5 +236,8 @@ fn issues_malformed_input_is_a_local_usage_exit() {
     assert!(stdout.is_empty());
     assert!(stderr.contains("malformed limit"), "stderr={stderr}");
     assert!(!stderr.contains(token));
-    assert!(!stderr.contains("could not reach"), "parsing precedes transport");
+    assert!(
+        !stderr.contains("could not reach"),
+        "parsing precedes transport"
+    );
 }

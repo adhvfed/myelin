@@ -1,8 +1,8 @@
+use myelin_cli::config::EdgeConfig;
+use myelin_cli::dispatch::{EdgeCall, HttpMethod, RetryPolicy};
 use myelin_edge::{
     register_git_durable, serve_edge, AllowAll, DurableGitBackend, Gateway, Method, WhoamiHandler,
 };
-use myelin_cli::config::EdgeConfig;
-use myelin_cli::dispatch::{EdgeCall, HttpMethod, RetryPolicy};
 use myelin_identity::{DataRole, Principal, PrincipalId, PrincipalKind, PrincipalStatus};
 use myelin_identity_service::{
     CapabilityAuthenticator, CapabilityMintSpec, CellTokenAuthority, HumanSsoAuthenticator,
@@ -158,7 +158,11 @@ async fn code_search_preserves_query_bytes_and_returns_durable_matches() {
         method: HttpMethod::Post,
         path: "/v1/git/repos".into(),
         query: None,
-        payload: Some(serde_json::json!({ "slug": "searchable" }).to_string().into_bytes()),
+        payload: Some(
+            serde_json::json!({ "slug": "searchable" })
+                .to_string()
+                .into_bytes(),
+        ),
         idempotency_key: Some("test-search-create".into()),
         retry_policy: RetryPolicy::CallerKeyRequired,
     };
@@ -185,20 +189,22 @@ async fn code_search_preserves_query_bytes_and_returns_durable_matches() {
     let (code, stdout, stderr) = run_cli(
         &edge,
         &token,
-        &[
-            "git",
-            "search",
-            "code",
-            phrase,
-            "--repo",
-            "searchable",
-        ],
+        &["git", "search", "code", phrase, "--repo", "searchable"],
     );
 
     assert_eq!(code, 0, "durable search succeeds; stderr={stderr}");
-    assert!(stderr.is_empty(), "successful search has no stderr: {stderr}");
-    assert!(stdout.contains("searchable:README.md:2"), "match location is rendered: {stdout}");
-    assert!(stdout.contains(phrase), "the matching excerpt is rendered: {stdout}");
+    assert!(
+        stderr.is_empty(),
+        "successful search has no stderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("searchable:README.md:2"),
+        "match location is rendered: {stdout}"
+    );
+    assert!(
+        stdout.contains(phrase),
+        "the matching excerpt is rendered: {stdout}"
+    );
     assert!(
         !stderr.contains("bad_request"),
         "query bytes were not reinterpreted"
