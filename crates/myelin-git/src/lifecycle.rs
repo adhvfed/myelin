@@ -280,9 +280,7 @@ pub struct MergeContext {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RulesetOutcome {
     Satisfied,
-    Blocked {
-        reasons: Vec<BlockReason>,
-    },
+    Blocked { reasons: Vec<BlockReason> },
 }
 
 impl RulesetOutcome {
@@ -294,10 +292,7 @@ impl RulesetOutcome {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum BlockReason {
     MissingRequiredContext(String),
-    InsufficientApprovals {
-        have: u32,
-        need: u32,
-    },
+    InsufficientApprovals { have: u32, need: u32 },
     CodeownerReviewMissing,
     BlockingReview,
     OutstandingConversations(u32),
@@ -388,7 +383,7 @@ impl CodeOwners {
             let mut tokens = line.split_whitespace();
             let pattern = tokens
                 .next()
-                .expect("a non-empty trimmed line has a first token")
+                .ok_or(CodeOwnersError::NoOwners(line_no))?
                 .to_string();
             let owners: Vec<String> = tokens.map(|t| t.to_string()).collect();
             if owners.is_empty() {
@@ -612,7 +607,7 @@ mod tests {
     fn merge_refuses_an_unsatisfied_gate_zero_unprotected_merges() {
         let mut pr = a_pr(false);
         assert_eq!(
-            pr.transition(PrTransition::Merge,  false),
+            pr.transition(PrTransition::Merge, false),
             Err(LifecycleError::MergeGateNotSatisfied)
         );
         assert_eq!(
@@ -927,7 +922,7 @@ mod tests {
     #[test]
     fn codeowners_resolves_to_code_owner_relation_tuples_4_9() {
         let co = CodeOwners::parse(FIXTURE).unwrap();
-        let deltas = co.resolve( 7);
+        let deltas = co.resolve(7);
         assert_eq!(deltas.len(), 5);
         for d in &deltas {
             match d {

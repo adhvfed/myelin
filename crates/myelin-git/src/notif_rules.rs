@@ -24,16 +24,17 @@ pub const GIT_MENTIONED_RULE: &str = "git.mentioned";
 
 pub const GIT_WATCHED_RULE: &str = "git.watched";
 
+fn review_requested_rule() -> Result<NotifRule, myelin_notif::DefineRuleError> {
+    define_notif_rule(
+        Reason::ReviewRequested,
+        DedupTpl("git-review:{subject}".into()),
+        Class::Direct,
+    )
+}
+
 pub fn git_notif_rules() -> Result<Vec<(&'static str, NotifRule)>, myelin_notif::DefineRuleError> {
     Ok(vec![
-        (
-            GIT_REVIEW_REQUESTED_RULE,
-            define_notif_rule(
-                Reason::ReviewRequested,
-                DedupTpl("git-review:{subject}".into()),
-                Class::Direct,
-            )?,
-        ),
+        (GIT_REVIEW_REQUESTED_RULE, review_requested_rule()?),
         (
             GIT_MENTIONED_RULE,
             define_notif_rule(
@@ -68,11 +69,8 @@ pub(crate) fn review_request_opened_signal_drafts(
     repo: &str,
     record: &PrRecord,
     recorded_at: &str,
-) -> Result<Vec<EventDraft>, myelin_notif::DefineRuleError> {
-    let rule = git_notif_rules()?
-        .into_iter()
-        .find_map(|(key, rule)| (key == GIT_REVIEW_REQUESTED_RULE).then_some(rule))
-        .expect("Git's review-request rule is part of its frozen notification set");
+) -> Result<Vec<EventDraft>, ReviewSignalError> {
+    let rule = review_requested_rule()?;
     let subject = ArtifactRef(format!(
         "myelin://{}/git/pr/{repo}:{}",
         tenant.0, record.number
@@ -90,7 +88,7 @@ pub(crate) fn review_request_opened_signal_drafts(
             &review.reviewer_pseudonym,
             recorded_at,
             SignalState::Open,
-        ) {
+        )? {
             drafts.push(draft);
         }
     }
@@ -103,11 +101,8 @@ pub(crate) fn review_request_resolved_signal_draft(
     repo: &str,
     record: &PrRecord,
     recorded_at: &str,
-) -> Result<Option<EventDraft>, myelin_notif::DefineRuleError> {
-    let rule = git_notif_rules()?
-        .into_iter()
-        .find_map(|(key, rule)| (key == GIT_REVIEW_REQUESTED_RULE).then_some(rule))
-        .expect("Git's review-request rule is part of its frozen notification set");
+) -> Result<Option<EventDraft>, ReviewSignalError> {
+    let rule = review_requested_rule()?;
     let Some(review) = record
         .reviews
         .last()
@@ -119,7 +114,7 @@ pub(crate) fn review_request_resolved_signal_draft(
         "myelin://{}/git/pr/{repo}:{}",
         tenant.0, record.number
     ));
-    Ok(review_request_signal_draft(
+    review_request_signal_draft(
         tenant,
         region,
         &rule,
@@ -127,7 +122,36 @@ pub(crate) fn review_request_resolved_signal_draft(
         &review.reviewer_pseudonym,
         recorded_at,
         SignalState::Resolved,
-    ))
+    )
+}
+
+#[derive(Debug)]
+pub(crate) enum ReviewSignalError {
+    Rule(myelin_notif::DefineRuleError),
+    Encode(serde_json::Error),
+}
+
+impl std::fmt::Display for ReviewSignalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rule(error) => write!(f, "define review notification rule: {error}"),
+            Self::Encode(error) => write!(f, "encode review notification signal: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ReviewSignalError {}
+
+impl From<myelin_notif::DefineRuleError> for ReviewSignalError {
+    fn from(error: myelin_notif::DefineRuleError) -> Self {
+        Self::Rule(error)
+    }
+}
+
+impl From<serde_json::Error> for ReviewSignalError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Encode(error)
+    }
 }
 
 fn review_request_signal_draft(
@@ -138,10 +162,12 @@ fn review_request_signal_draft(
     reviewer_pseudonym: &str,
     recorded_at: &str,
     state: SignalState,
-) -> Option<EventDraft> {
-    let handle = PseudonymHandle::parse(reviewer_pseudonym)?;
+) -> Result<Option<EventDraft>, ReviewSignalError> {
+    let Some(handle) = PseudonymHandle::parse(reviewer_pseudonym) else {
+        return Ok(None);
+    };
     if handle.tenant() != tenant.0 {
-        return None;
+        return Ok(None);
     }
     let recipient_id = handle.pseudonym();
     let dedup_key = rule.dedup_key(recipient_id, subject);
@@ -165,12 +191,10 @@ fn review_request_signal_draft(
         PrincipalStatus::Active,
     );
     let aggregate_id = &blake3::hash(dedup_key.as_bytes()).to_hex()[..32];
-    let mut payload =
-        serde_json::to_value(signal).expect("the closed Signal wire shape is serializable");
+    let mut payload = serde_json::to_value(signal)?;
     payload["mentions"] = serde_json::json!([{ "Mention": recipient }]);
-    payload["notification_reason"] = serde_json::to_value(rule.reason)
-        .expect("the closed notification reason vocabulary is serializable");
-    Some(EventDraft {
+    payload["notification_reason"] = serde_json::to_value(rule.reason)?;
+    Ok(Some(EventDraft {
         type_: EventType(
             match state {
                 SignalState::Open => "signal.opened",
@@ -190,7 +214,7 @@ fn review_request_signal_draft(
         visibility: Visibility::Internal,
         contains_personal_data: false,
         pii_key_ref: None,
-    })
+    }))
 }
 
 pub const GIT_WATCHER_RELATION: &str = myelin_notif::WATCHER_RELATION;

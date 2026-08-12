@@ -186,7 +186,6 @@ impl PgCheckStatusProjection {
         fact: &CheckStatus,
     ) -> Result<StoreApplyOutcome, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let tenant_id = &fact.tenant.0;
 
         // @tenant-cross-scope: consumer_dedup is consumer-internal event identity, not tenant data.
         let dedup = sqlx::query(&format!(
@@ -203,65 +202,7 @@ impl PgCheckStatusProjection {
             return Ok(StoreApplyOutcome::DuplicateEvent);
         }
 
-        lock_check_admission(
-            &mut tx,
-            &fact.tenant.0,
-            region,
-            &fact.repo.0,
-            &fact.commit_oid.0,
-        )
-        .await?;
-
-        let provider = match fact.context.provider {
-            crate::check_status::CheckProvider::Ci => "ci",
-            crate::check_status::CheckProvider::External => "external",
-        };
-        let state = state_str(fact.state);
-        let trust = trust_str(fact.trust_tier);
-        let summary_args = serde_json::to_value(&fact.summary.args)
-            .expect("BTreeMap<String,String> always serialises to a JSON object");
-
-        let upsert = sqlx::query(&format!(
-            "INSERT INTO {table} (tenant_id, region, repo_ref, commit_oid, context_provider, \
-                context_name, state, required, run_ref, run_attempt, trust_tier, details_ref, \
-                summary_key, summary_args, cost_settled, started_at, completed_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) \
-             ON CONFLICT (tenant_id, region, repo_ref, commit_oid, context_provider, context_name) \
-             DO UPDATE SET \
-               state = EXCLUDED.state, run_ref = EXCLUDED.run_ref, run_attempt = EXCLUDED.run_attempt, \
-               required = EXCLUDED.required, \
-               trust_tier = EXCLUDED.trust_tier, details_ref = EXCLUDED.details_ref, \
-               summary_key = EXCLUDED.summary_key, summary_args = EXCLUDED.summary_args, \
-               cost_settled = EXCLUDED.cost_settled, started_at = EXCLUDED.started_at, \
-               completed_at = EXCLUDED.completed_at \
-             WHERE EXCLUDED.run_attempt >= {table}.run_attempt",
-            table = self.table
-        ))
-        .bind(tenant_id)
-        .bind(region)
-        .bind(&fact.repo.0)
-        .bind(&fact.commit_oid.0)
-        .bind(provider)
-        .bind(&fact.context.name)
-        .bind(state)
-        .bind(fact.required)
-        .bind(&fact.run.0)
-        .bind(i64::from(fact.run_attempt))
-        .bind(trust)
-        .bind(&fact.details_ref.0)
-        .bind(&fact.summary.template_key)
-        .bind(&summary_args)
-        .bind(fact.cost_settled)
-        .bind(&fact.started_at.0)
-        .bind(fact.completed_at.as_ref().map(|timestamp| &timestamp.0))
-        .execute(&mut *tx)
-        .await?;
-
-        let outcome = if upsert.rows_affected() == 0 {
-            StoreApplyOutcome::DroppedStale
-        } else {
-            StoreApplyOutcome::Superseded
-        };
+        let outcome = apply_projection_in_tx(&self.table, &mut tx, region, fact).await?;
         tx.commit().await?;
         Ok(outcome)
     }
@@ -528,7 +469,7 @@ async fn apply_projection_in_tx(
         crate::check_status::CheckProvider::External => "external",
     };
     let summary_args = serde_json::to_value(&fact.summary.args)
-        .expect("BTreeMap<String,String> always serialises to a JSON object");
+        .map_err(|error| sqlx::Error::Encode(Box::new(error)))?;
     let upsert = sqlx::query(&format!(
         "INSERT INTO {table} (tenant_id,region,repo_ref,commit_oid,context_provider,context_name,\
              state,required,run_ref,run_attempt,trust_tier,details_ref,summary_key,summary_args,\
